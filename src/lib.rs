@@ -100,6 +100,10 @@ pub mod js {
         pub fn domains(&self) -> Result<String, JsError> {
             json(&self.0.domains())
         }
+        /// Errors here are ordinary JavaScript `Error`s the app can catch —
+        /// not a wasm abort. With `panic = abort` a limit breach that reached
+        /// the store would take the whole SDK down with it, so `Db` screens
+        /// first and returns this instead.
         pub fn put(&mut self, domain: &str, f: &str) -> Result<String, JsError> {
             json(&self.0.put(domain, &fields(f)?).map_err(err)?)
         }

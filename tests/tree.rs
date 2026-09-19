@@ -4,6 +4,7 @@
 //!
 //! `cargo test --test tree -- --nocapture` prints the measurements.
 
+use craftworks_sdk::id::from_hex;
 use craftworks_sdk::store::{sorted_edits, Edit};
 use craftworks_sdk::tree_store::{value_block_id, Options};
 use craftworks_sdk::*;
@@ -411,4 +412,66 @@ fn cost_against_the_reference_store() {
         rate(scattered_put),
         rate(scattered_put) / rate(tree_put)
     );
+}
+
+/// A record too large for the tree must come back as an ERROR the app can
+/// handle, not as a stop. `Store` has no error channel and the wasm build is
+/// `panic = abort`, so a limit breach that reached the store would take the
+/// whole SDK down with it — `Db` screens first, which is what makes the
+/// `unreachable!` in `TreeStore` an honest claim rather than a hope.
+#[test]
+fn an_oversize_record_is_refused_and_the_database_still_works() {
+    use craftworks_sdk::id::SystemEnv;
+    use freenet_prolly::node::MAX_VALUE;
+    use serde_json::{json, Map, Value as J};
+
+    let schema: craftworks_sdk::Schema = serde_json::from_value(json!({
+        "type": "Note",
+        "fields": [{"name": "body", "kind": "text", "required": true}]
+    }))
+    .unwrap();
+    let obj = |v: J| -> Map<String, J> { v.as_object().unwrap().clone() };
+
+    let mut d = Db::new(TreeStore::new(), SystemEnv, *b"dev1");
+    d.define("notes", &schema).unwrap();
+    let ok = d.put("notes", &obj(json!({"body": "small"}))).unwrap();
+    let (root, stats) = (d.store().root(), d.store().stats());
+
+    let huge = "x".repeat(MAX_VALUE + 1024);
+    let err = d
+        .put("notes", &obj(json!({ "body": huge })))
+        .expect_err("a record over the limit must be refused, not stored");
+    assert!(err.contains(&MAX_VALUE.to_string()), "{err}");
+    assert!(
+        err.contains("file") || err.contains("blob"),
+        "the message must say what to do instead: {err}"
+    );
+
+    // Nothing moved.
+    assert_eq!(d.store().root(), root, "a refused write moved the root");
+    assert_eq!(
+        d.store().stats(),
+        stats,
+        "a refused write changed the store"
+    );
+
+    // And the database still works afterwards.
+    let after = d.put("notes", &obj(json!({"body": "still here"}))).unwrap();
+    assert_ne!(d.store().root(), root);
+    assert_eq!(d.count("notes").unwrap(), 2);
+    assert!(d
+        .get("notes", &from_hex(&ok.id).unwrap())
+        .unwrap()
+        .is_some());
+    assert!(d
+        .get("notes", &from_hex(&after.id).unwrap())
+        .unwrap()
+        .is_some());
+
+    // The largest legal record IS stored, so the refusal is the size and not
+    // the screen refusing everything large.
+    let big = "y".repeat(MAX_VALUE - 512);
+    d.put("notes", &obj(json!({ "body": big })))
+        .expect("a record just under the limit must be stored");
+    assert_eq!(d.count("notes").unwrap(), 3);
 }

@@ -214,8 +214,12 @@ impl Store for TreeStore {
             Err(freenet_prolly::apply::ApplyError::Read(e)) => Self::impossible(e),
             // A refused batch emits nothing and changes nothing, so leaving the
             // store exactly as it was is not cleanup — it is what already
-            // happened. The SDK screens its own keys and values, so reaching
-            // here means the SDK let through something it should not have.
+            // happened.
+            //
+            // `Store` has no error channel, so this cannot be reported; see the
+            // trait's doc. `Db::write` screens every key and value against these
+            // same limits before a store is touched and returns an error the app
+            // can handle, so reaching here means something bypassed it.
             Err(e) => unreachable!("the SDK built a batch the tree refuses: {e:?}"),
         };
         self.absorb(emitted);

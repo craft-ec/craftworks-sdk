@@ -8,6 +8,7 @@ use crate::id::{self, Env, IdGen, RKey};
 use crate::record;
 use crate::schema::Schema;
 use crate::store::{sorted_edits, Edit, Store};
+use freenet_prolly::node::{MAX_KEY, MAX_VALUE};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -105,8 +106,34 @@ impl<S: Store, E: Env> Db<S, E> {
     /// Sorting and last-write-wins happen here, in the SDK: a batch is a
     /// sequence the caller wrote in order and the store takes a set, so it is
     /// the caller that knows which of two writes to a key is the later one.
-    fn write(&mut self, edits: Vec<(Vec<u8>, Edit)>) {
+    ///
+    /// **This is where the SDK screens what it sends a store.** Every key and
+    /// value the app can reach the store through passes here, including keys the
+    /// SDK derives rather than takes (index terms are built from a record's
+    /// contents, so an app can produce a long one without ever writing it). A
+    /// store is allowed to treat a limit breach as a bug and stop — see
+    /// [`Store`] — so the app has to be told before, in a way it can handle.
+    fn write(&mut self, edits: Vec<(Vec<u8>, Edit)>) -> Result<()> {
+        for (key, edit) in &edits {
+            if key.len() > MAX_KEY {
+                return Err(format!(
+                    "key is {} bytes and the limit is {MAX_KEY}",
+                    key.len()
+                ));
+            }
+            if let Edit::Put(v) = edit {
+                if v.len() > MAX_VALUE {
+                    return Err(format!(
+                        "record is {} bytes and the limit is {MAX_VALUE}; \
+                         store content this large as a file or a blob and keep a \
+                         reference to it in the record",
+                        v.len()
+                    ));
+                }
+            }
+        }
         self.store.apply_batch(&sorted_edits(edits));
+        Ok(())
     }
 
     pub fn env_mut(&mut self) -> &mut E {
@@ -121,8 +148,7 @@ impl<S: Store, E: Env> Db<S, E> {
             old.allows(schema)?;
         }
         let bytes = serde_json::to_vec(schema).map_err(|e| e.to_string())?;
-        self.write(vec![(schema_key(domain), Edit::Put(bytes))]);
-        Ok(())
+        self.write(vec![(schema_key(domain), Edit::Put(bytes))])
     }
 
     pub fn schema(&self, domain: &str) -> Option<Schema> {
@@ -151,7 +177,7 @@ impl<S: Store, E: Env> Db<S, E> {
         let rkey = self.ids.next(&mut self.env);
         let now = id::created_ms(&rkey);
         let bytes = record::encode(&schema, fields, now, now, &self.author)?;
-        self.write(vec![(record_key(domain, &rkey), Edit::Put(bytes.clone()))]);
+        self.write(vec![(record_key(domain, &rkey), Edit::Put(bytes.clone()))])?;
         self.read(&schema, &rkey, &bytes)
     }
 
@@ -176,7 +202,7 @@ impl<S: Store, E: Env> Db<S, E> {
         // `updated` never runs backwards, even if the clock does.
         let updated = self.env.now_ms().max(d.updated);
         let bytes = record::encode(&schema, &d.fields, d.created, updated, &d.author)?;
-        self.write(vec![(key, Edit::Put(bytes.clone()))]);
+        self.write(vec![(key, Edit::Put(bytes.clone()))])?;
         self.read(&schema, rkey, &bytes)
     }
 
@@ -192,7 +218,7 @@ impl<S: Store, E: Env> Db<S, E> {
         check_domain(domain)?;
         let key = record_key(domain, rkey);
         let existed = self.store.get(&key).is_some();
-        self.write(vec![(key, Edit::Delete)]);
+        self.write(vec![(key, Edit::Delete)])?;
         Ok(existed)
     }
 
@@ -239,5 +265,48 @@ impl<S: Store, E: Env> Db<S, E> {
             updated: d.updated,
             fields: d.fields,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MemStore;
+
+    /// The key screen guards DERIVED keys. Nothing an app can write today
+    /// produces one — a record key is a 1-byte tag, a domain of at most 32, a
+    /// separator and a 16-byte id — but index terms will be built from a
+    /// record's contents (the first 64 B of a term plus a hash of the rest), so
+    /// an app will be able to produce a long one without ever writing it. The
+    /// screen is tested where it lives, at the funnel every write goes through.
+    #[test]
+    fn a_key_past_the_trees_limit_is_refused_before_the_store_is_touched() {
+        struct Panics;
+        impl Store for Panics {
+            fn get(&self, _: &[u8]) -> Option<Vec<u8>> {
+                None
+            }
+            fn put(&mut self, _: &[u8], _: &[u8]) {
+                panic!("the store must not be reached")
+            }
+            fn delete(&mut self, _: &[u8]) -> bool {
+                panic!("the store must not be reached")
+            }
+            fn scan(&self, _: &[u8], _: &[u8], _: bool, _: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+                Vec::new()
+            }
+            fn apply_batch(&mut self, _: &[(Vec<u8>, Edit)]) {
+                panic!("the store must not be reached")
+            }
+        }
+        let mut d = Db::new(Panics, crate::id::SystemEnv, *b"dev1");
+        let long = vec![b'k'; MAX_KEY + 1];
+        let e = d.write(vec![(long, Edit::Put(b"v".to_vec()))]).unwrap_err();
+        assert!(e.contains(&MAX_KEY.to_string()), "{e}");
+        // The longest legal key is accepted — so the refusal is the length and
+        // not the screen refusing everything.
+        let mut d = Db::new(MemStore::default(), crate::id::SystemEnv, *b"dev1");
+        d.write(vec![(vec![b'k'; MAX_KEY], Edit::Put(b"v".to_vec()))])
+            .unwrap();
     }
 }

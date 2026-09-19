@@ -12,6 +12,16 @@ pub enum Edit {
     Delete,
 }
 
+/// A sorted byte map.
+///
+/// **An implementation may treat an input it cannot represent as a bug and
+/// stop.** A store has no error channel — `put` returns nothing — so a key or
+/// value past what the underlying structure allows cannot be reported, and
+/// failing quietly would be worse than failing loudly. Screening is
+/// [`Db`](crate::Db)'s job: it checks every key and value against the tree's
+/// limits before a store is touched, and returns an error the app can handle.
+/// That division is deliberate, and it is why [`TreeStore`](crate::TreeStore)
+/// may panic where a limit is breached.
 pub trait Store {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn put(&mut self, key: &[u8], value: &[u8]);

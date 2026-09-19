@@ -80,3 +80,30 @@ console.log("ok collection through JS");
   assert.notStrictEqual(a.root(), before, "a write moves it");
   assert.strictEqual(a.root(), a.root(), "and reading it does not");
 }
+
+// A record too large for the tree must come back as an ordinary Error the app
+// can catch. The wasm build is `panic = abort`, so if the limit breach reached
+// the store it would take the whole SDK down — and everything after this point
+// would be unreachable rather than failing.
+{
+  const t = new sdk.Db();
+  t.define("notes", { type: "Note", fields: [{ name: "body", kind: "text", required: true }] });
+  t.put("notes", { body: "small" });
+  const root = t.root(), stats = t.stats();
+
+  const huge = "x".repeat(256 * 1024 + 1024);
+  let caught = null;
+  try { t.put("notes", { body: huge }); } catch (e) { caught = e; }
+  assert.ok(caught instanceof Error, "a limit breach must throw a normal Error");
+  assert.ok(!(caught instanceof WebAssembly.RuntimeError), "not a wasm abort");
+  assert.match(caught.message, /262144/, "the message names the limit");
+  assert.match(caught.message, /file|blob/, "and says what to do instead");
+
+  // Nothing moved, and the database still works.
+  assert.strictEqual(t.root(), root);
+  assert.deepStrictEqual(t.stats(), stats);
+  const after = t.put("notes", { body: "still here" });
+  assert.strictEqual(t.count("notes"), 2);
+  assert.deepStrictEqual(t.get("notes", after.id).fields, { body: "still here" });
+  assert.notStrictEqual(t.root(), root);
+}
