@@ -62,6 +62,7 @@ dependencies = [
 name = "craftworks-sdk"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "freenet-prolly",
  "getrandom",
  "js-sys",
@@ -79,6 +80,7 @@ checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 [[package]]
 name = "freenet-prolly"
 version = "0.1.0"
+source = "git+https://github.com/craft-ec/freenet-prolly?rev=ebbc34f#ebbc34fba8403798dba153219137562745e5d8b7"
 dependencies = [
  "blake3",
 ]
