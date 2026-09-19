@@ -7,4 +7,7 @@ cargo build --release --target wasm32-unknown-unknown
 wasm=target/wasm32-unknown-unknown/release/craftworks_sdk.wasm
 wasm-bindgen --target web    --out-dir pkg/web  "$wasm"
 wasm-bindgen --target nodejs --out-dir pkg/node "$wasm"
+cp js/wrap.js js/index.js pkg/web/
+# wasm-bindgen emits CommonJS for node; say so, since this package is ESM.
+echo '{"type":"commonjs"}' > pkg/node/package.json
 echo "pkg/web $(wc -c < pkg/web/craftworks_sdk_bg.wasm | tr -d ' ') B"
