@@ -66,6 +66,29 @@ pub mod js {
         crate::ContentHash::of(bytes).to_string()
     }
 
+    /// Read a block id back from its text form, split into its parts:
+    /// `{ tag, hex, id }` — the kind's name, the 64 hex characters, and the
+    /// canonical text.
+    ///
+    /// The half that makes a self-describing id worth having: an id says what
+    /// it is so the RECEIVER can check it, and here the receiver is
+    /// JavaScript. Without this, anything that wants the tag and the hex apart
+    /// splits the string itself and quietly owns a copy of the format.
+    ///
+    /// Throws an ordinary `Error` for anything that is not a block id —
+    /// including a content hash, which is the mistake worth naming — with the
+    /// message the Rust parser produces. Never a wasm abort: with
+    /// `panic = abort` a bad id from a paste box would take the SDK down.
+    #[wasm_bindgen(js_name = parseBlockId)]
+    pub fn parse_block_id(text: &str) -> Result<String, JsError> {
+        let id: crate::BlockId = text.parse().map_err(err)?;
+        json(&serde_json::json!({
+            "tag": id.tag(),
+            "hex": crate::hex(&id.hash()),
+            "id": id.to_string(),
+        }))
+    }
+
     fn err(e: impl std::fmt::Display) -> JsError {
         JsError::new(&e.to_string())
     }
