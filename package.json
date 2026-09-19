@@ -1,0 +1,6 @@
+{
+  "name": "craftworks-sdk",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node tests/js/cid.test.cjs && node tests/js/collection.test.mjs" }
+}
