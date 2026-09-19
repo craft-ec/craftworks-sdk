@@ -53,7 +53,7 @@ console.log("ok collection through JS");
   const t = new sdk.Db();
   t.define("notes", { type: "Note", fields: [{ name: "body", kind: "text", required: true }] });
   const empty = t.root();
-  assert.match(empty, /^[0-9a-f]{64}$/, "the root is a 32-byte hash in hex");
+  assert.match(empty, /^node:[0-9a-f]{64}$/, "the root is a tagged tree-node block id");
   assert.deepStrictEqual(Object.keys(t.stats()).sort(), ["blocks", "bytes", "height"]);
   assert.strictEqual(t.stats().height, 1, "a small tree is one leaf");
 

@@ -5,6 +5,7 @@
 //! Every capability is written once in Rust and exposed to JavaScript from
 //! [`js`], so the builder and apps get it the phase it lands.
 
+pub mod blockid;
 pub mod db;
 pub mod id;
 pub mod record;
@@ -12,6 +13,7 @@ pub mod schema;
 pub mod store;
 pub mod tree_store;
 
+pub use blockid::{BlockId, ContentHash, IdError};
 pub use db::{Db, Record, Scan};
 pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
@@ -24,22 +26,11 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Content id of `bytes`: `BLAKE3(bytes)`, the form apps and links use.
-///
-/// NOT a Block's network key. A block is addressed by `BLAKE3(kind ‖ body)`
-/// (`freenet_prolly::block_id`), so the same bytes have a different id as a
-/// stored block than they do here. Frozen in `tests/vectors.txt` and shared
-/// with the JS surface, so this is what it has always meant — but the two being
-/// different things with one name is worth settling before apps put either in a
-/// link.
-pub fn cid(bytes: &[u8]) -> Cid {
-    *blake3::hash(bytes).as_bytes()
-}
-
-/// [`cid`] as hex.
-pub fn cid_hex(bytes: &[u8]) -> String {
-    hex(&cid(bytes))
-}
+// `cid` and `cid_hex` were here, returning `BLAKE3(bytes)` under a name that
+// reads like an address. Nothing in this crate called them — the tree makes its
+// own ids through `freenet_prolly::block_id` — so the only thing they did was
+// offer apps a 32-byte value that looks like a block id and fetches nothing.
+// They are now [`ContentHash`] and [`BlockId`], which are different types.
 
 #[cfg(target_arch = "wasm32")]
 pub mod js {
@@ -55,10 +46,24 @@ pub mod js {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    /// Content id of `bytes`, as hex.
-    #[wasm_bindgen(js_name = cidHex)]
-    pub fn cid_hex(bytes: &[u8]) -> String {
-        crate::cid_hex(bytes)
+    /// The id of a block of opaque bytes holding `bytes` — `raw:<64 hex>`.
+    /// This is what addresses those bytes on the network, and the only kind of
+    /// id an app is given.
+    #[wasm_bindgen(js_name = blockId)]
+    pub fn block_id(bytes: &[u8]) -> String {
+        crate::BlockId::raw(bytes).to_string()
+    }
+
+    /// `BLAKE3(bytes)` as `hash:<64 hex>` — the hash of some bytes, which
+    /// addresses nothing.
+    ///
+    /// Deliberately NOT re-exported by `js/wrap.js`: apps get block ids. It
+    /// stays on the raw module because the frozen vectors are checked from
+    /// JavaScript, and a binding that mangles bytes has to fail that check in
+    /// both languages.
+    #[wasm_bindgen(js_name = contentHash)]
+    pub fn content_hash(bytes: &[u8]) -> String {
+        crate::ContentHash::of(bytes).to_string()
     }
 
     fn err(e: impl std::fmt::Display) -> JsError {
@@ -148,11 +153,16 @@ pub mod js {
                     .map_err(err)?,
             )
         }
-        /// The tree's root hash, as hex. The whole database in 32 bytes: it
-        /// changes with every write and is the same for any two databases
-        /// holding the same records, whatever order they were written in.
+        /// The tree's root, as `node:<64 hex>`. The whole database in 32
+        /// bytes: it changes with every write and is the same for any two
+        /// databases holding the same records, whatever order they were
+        /// written in.
+        ///
+        /// Tagged, because a root IS a block id — it names the tree's top node
+        /// — and it is the one id this surface hands out most.
         pub fn root(&self) -> String {
-            crate::hex(&self.0.store().root())
+            crate::BlockId::from_parts(freenet_prolly::kind::TREE_NODE, self.0.store().root())
+                .to_string()
         }
 
         /// Blocks held, bytes held, and the tree's height.
@@ -177,19 +187,47 @@ pub mod js {
 
 #[cfg(test)]
 mod tests {
-    /// The same vectors are checked from JavaScript (`tests/js/cid.test.cjs`), so a
-    /// binding that mangles bytes on the way in or out cannot pass both.
+    use super::{BlockId, ContentHash};
+
+    fn bytes(input: &str) -> Vec<u8> {
+        (0..input.len() / 2)
+            .map(|i| u8::from_str_radix(&input[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The same vectors are checked from JavaScript (`tests/js/ids.test.cjs`), so
+    /// a binding that mangles bytes on the way in or out cannot pass both.
+    ///
+    /// The file is unchanged by this rename: these are the same numbers they
+    /// always were, now under the name that says what they are. The block ids
+    /// beside them are new, and are what apps actually get.
     #[test]
-    fn cid_vectors_hold_in_rust() {
+    fn the_frozen_vectors_hold_in_rust() {
         let mut n = 0;
         for line in include_str!("../tests/vectors.txt").lines() {
             let (input, want) = line.split_once(' ').unwrap();
-            let bytes: Vec<u8> = (0..input.len() / 2)
-                .map(|i| u8::from_str_radix(&input[i * 2..i * 2 + 2], 16).unwrap())
-                .collect();
-            assert_eq!(super::cid_hex(&bytes), want, "input {input}");
+            assert_eq!(
+                super::hex(&ContentHash::of(&bytes(input)).bytes()),
+                want,
+                "input {input}"
+            );
             n += 1;
         }
         assert!(n >= 4, "only {n} vectors");
+
+        let mut m = 0;
+        for line in include_str!("../tests/block_vectors.txt").lines() {
+            let mut it = line.split(' ');
+            let (tag, input, want) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+            let b = bytes(input);
+            let id = match tag {
+                "raw" => BlockId::raw(&b),
+                "node" => BlockId::node(&b),
+                t => panic!("unknown tag {t}"),
+            };
+            assert_eq!(id.to_string(), want, "input {input}");
+            m += 1;
+        }
+        assert!(m >= 4, "only {m} block vectors");
     }
 }

@@ -22,5 +22,8 @@ export function wrap(raw) {
     root() { return this.#db.root(); }
     stats() { return JSON.parse(this.#db.stats()); }
   }
-  return { version: raw.version, cidHex: raw.cidHex, Db };
+  // `blockId` and nothing beside it: an app is given ids that ADDRESS
+  // something. The raw module also exposes `contentHash` (plain BLAKE3, which
+  // fetches nothing) for the frozen vectors; it is not part of this surface.
+  return { version: raw.version, blockId: raw.blockId, Db };
 }
