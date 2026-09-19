@@ -6,5 +6,17 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "App-facing SDK. Every substrate capability is exposed here the phase it lands."
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 freenet-prolly = { path = "../freenet-prolly" }
+
+# The JS surface exists only in the wasm build. The version is pinned to the
+# wasm-bindgen CLI: the two must match exactly.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.128"
+
+[profile.release]
+opt-level = "s"
+lto = true
