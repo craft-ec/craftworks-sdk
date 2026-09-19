@@ -1,0 +1,10 @@
+[package]
+name = "craftworks-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "App-facing SDK. Every substrate capability is exposed here the phase it lands."
+
+[dependencies]
+freenet-prolly = { path = "../freenet-prolly" }
