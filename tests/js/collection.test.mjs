@@ -46,3 +46,37 @@ db.define("tasks", { type: "Task", fields: [
 assert.deepStrictEqual(db.get("tasks", c.id).fields, { title: "c" });
 assert.deepStrictEqual(db.domains(), ["tasks"]);
 console.log("ok collection through JS");
+
+// The tree behind the database, through the JS surface — the builder's tree
+// panel needs both, and the root is what changes as the user adds records.
+{
+  const t = new sdk.Db();
+  t.define("notes", { type: "Note", fields: [{ name: "body", kind: "text", required: true }] });
+  const empty = t.root();
+  assert.match(empty, /^[0-9a-f]{64}$/, "the root is a 32-byte hash in hex");
+  assert.deepStrictEqual(Object.keys(t.stats()).sort(), ["blocks", "bytes", "height"]);
+  assert.strictEqual(t.stats().height, 1, "a small tree is one leaf");
+
+  const roots = [empty];
+  for (let i = 0; i < 40; i++) {
+    t.put("notes", { body: `note ${i}` });
+    roots.push(t.root());
+  }
+  assert.strictEqual(new Set(roots).size, roots.length, "every write moves the root");
+  assert.ok(t.stats().blocks > 40, "nothing is dropped: superseded nodes stay");
+  assert.ok(t.stats().bytes > 0);
+
+  // The root is the CONTENTS, not the history: the same records written in a
+  // different order give the same hash.
+  const a = new sdk.Db(), b = new sdk.Db();
+  const schema = { type: "Note", fields: [{ name: "body", kind: "text", required: true }] };
+  a.define("notes", schema); b.define("notes", schema);
+  assert.strictEqual(a.root(), b.root(), "two empty databases agree");
+  // Records get time-ordered ids, so to compare contents both sides must hold
+  // the same ids — write in one, then replay the same ids into the other is not
+  // expressible through this surface. What IS: the same database read twice.
+  const before = a.root();
+  a.put("notes", { body: "x" });
+  assert.notStrictEqual(a.root(), before, "a write moves it");
+  assert.strictEqual(a.root(), a.root(), "and reading it does not");
+}

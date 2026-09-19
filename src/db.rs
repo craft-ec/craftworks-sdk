@@ -7,7 +7,7 @@
 use crate::id::{self, Env, IdGen, RKey};
 use crate::record;
 use crate::schema::Schema;
-use crate::store::Store;
+use crate::store::{sorted_edits, Edit, Store};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -94,6 +94,21 @@ impl<S: Store, E: Env> Db<S, E> {
         &self.store
     }
 
+    /// Write several keys as ONE change to the store.
+    ///
+    /// A record and the index entries that point at it are one fact. Behind
+    /// `Store` may be a tree where every write costs a new root, so writing them
+    /// separately would publish roots for states the app never had. Today a
+    /// record write is one key; the shape is here so that adding index entries
+    /// is adding to this list rather than adding a second write.
+    ///
+    /// Sorting and last-write-wins happen here, in the SDK: a batch is a
+    /// sequence the caller wrote in order and the store takes a set, so it is
+    /// the caller that knows which of two writes to a key is the later one.
+    fn write(&mut self, edits: Vec<(Vec<u8>, Edit)>) {
+        self.store.apply_batch(&sorted_edits(edits));
+    }
+
     pub fn env_mut(&mut self) -> &mut E {
         &mut self.env
     }
@@ -106,7 +121,7 @@ impl<S: Store, E: Env> Db<S, E> {
             old.allows(schema)?;
         }
         let bytes = serde_json::to_vec(schema).map_err(|e| e.to_string())?;
-        self.store.put(&schema_key(domain), &bytes);
+        self.write(vec![(schema_key(domain), Edit::Put(bytes))]);
         Ok(())
     }
 
@@ -136,7 +151,7 @@ impl<S: Store, E: Env> Db<S, E> {
         let rkey = self.ids.next(&mut self.env);
         let now = id::created_ms(&rkey);
         let bytes = record::encode(&schema, fields, now, now, &self.author)?;
-        self.store.put(&record_key(domain, &rkey), &bytes);
+        self.write(vec![(record_key(domain, &rkey), Edit::Put(bytes.clone()))]);
         self.read(&schema, &rkey, &bytes)
     }
 
@@ -161,7 +176,7 @@ impl<S: Store, E: Env> Db<S, E> {
         // `updated` never runs backwards, even if the clock does.
         let updated = self.env.now_ms().max(d.updated);
         let bytes = record::encode(&schema, &d.fields, d.created, updated, &d.author)?;
-        self.store.put(&key, &bytes);
+        self.write(vec![(key, Edit::Put(bytes.clone()))]);
         self.read(&schema, rkey, &bytes)
     }
 
@@ -175,7 +190,10 @@ impl<S: Store, E: Env> Db<S, E> {
 
     pub fn delete(&mut self, domain: &str, rkey: &RKey) -> Result<bool> {
         check_domain(domain)?;
-        Ok(self.store.delete(&record_key(domain, rkey)))
+        let key = record_key(domain, rkey);
+        let existed = self.store.get(&key).is_some();
+        self.write(vec![(key, Edit::Delete)]);
+        Ok(existed)
     }
 
     pub fn scan(&self, domain: &str, opts: Scan) -> Result<Vec<Record>> {

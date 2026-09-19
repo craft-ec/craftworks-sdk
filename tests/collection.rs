@@ -197,6 +197,10 @@ fn crud_scan_update_delete_on_the_sorted_store() {
 fn the_same_suite_passes_on_an_unrelated_store() {
     suite::<VecStore>();
 }
+#[test]
+fn the_same_suite_passes_on_the_real_tree() {
+    suite::<TreeStore>();
+}
 
 #[test]
 fn writes_that_violate_the_schema_are_refused() {

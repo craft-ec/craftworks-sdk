@@ -18,6 +18,9 @@ export function wrap(raw) {
       return JSON.parse(this.#db.scan(domain, reverse, limit, after));
     }
     count(domain) { return this.#db.count(domain); }
+    // The tree behind the database: its root hash, and what it holds.
+    root() { return this.#db.root(); }
+    stats() { return JSON.parse(this.#db.stats()); }
   }
   return { version: raw.version, cidHex: raw.cidHex, Db };
 }

@@ -10,7 +10,10 @@ description = "App-facing SDK. Every substrate capability is exposed here the ph
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-freenet-prolly = { path = "../freenet-prolly" }
+# Pinned by revision, not by path: this repo must build for anyone who checks
+# it out, and the tree's format decides what an app's data looks like.
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "ebbc34f" }
+blake3 = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
