@@ -11,11 +11,13 @@
 //! into a silently wrong answer.
 
 use crate::store::{sorted_edits, Edit, Store};
-use freenet_prolly::apply::{apply, Edit as TreeEdit};
-use freenet_prolly::node::{Node, Value, MAX_INLINE};
-use freenet_prolly::range::{range, value_bytes, Range};
-use freenet_prolly::store::{Blocks, MemBlocks, ReadError};
-use freenet_prolly::{block_id, build::TreeBuilder, kind, read::get, Cid};
+use freenet_prolly::apply::{apply_into, Edit as TreeEdit};
+use freenet_prolly::build::init;
+use freenet_prolly::node::{Node, Value};
+use freenet_prolly::range::{range, read_value, Range};
+use freenet_prolly::read::{get, height};
+use freenet_prolly::store::{Blocks, BlocksMut, MemBlocks, ReadError};
+use freenet_prolly::Cid;
 use std::ops::Bound;
 
 /// What a store holds, for the builder's tree panel and for tests.
@@ -45,10 +47,37 @@ impl Default for Options {
     }
 }
 
+/// Where a store's blocks go.
+///
+/// The library writes emitted blocks through [`BlocksMut`], so the negative
+/// control lives here rather than in a step the store can skip: a sink that
+/// drops the blocks of values too large to inline. That is the one mistake a
+/// hand-written absorb loop makes, and it has to stay expressible or nothing
+/// proves the suite would catch it.
+#[derive(Default)]
+struct Kept {
+    inner: MemBlocks,
+    drop_value_blocks: bool,
+}
+
+impl Blocks for Kept {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        self.inner.get(cid)
+    }
+}
+
+impl BlocksMut for Kept {
+    fn insert_block(&mut self, cid: Cid, bytes: &[u8]) {
+        if self.drop_value_blocks && Node::parse(bytes).is_err() {
+            return;
+        }
+        self.inner.insert(cid, bytes);
+    }
+}
+
 pub struct TreeStore {
-    blocks: MemBlocks,
+    blocks: Kept,
     root: Cid,
-    opts: Options,
 }
 
 impl Default for TreeStore {
@@ -63,12 +92,12 @@ impl TreeStore {
     }
 
     pub fn with_options(opts: Options) -> Self {
-        // The empty tree is one empty leaf, and it has an id like any other.
-        let mut blocks = MemBlocks::default();
-        let root = TreeBuilder::new(|c, b: &[u8]| blocks.insert(c, b))
-            .finish()
-            .expect("an empty tree always builds");
-        TreeStore { blocks, root, opts }
+        let mut blocks = Kept {
+            drop_value_blocks: !opts.keep_value_blocks,
+            ..Kept::default()
+        };
+        let root = init(&mut blocks);
+        TreeStore { blocks, root }
     }
 
     /// The tree's root hash. This is the whole contents in 32 bytes: two stores
@@ -79,40 +108,18 @@ impl TreeStore {
     }
 
     pub fn stats(&self) -> Stats {
-        let height = Node::parse(self.blocks.get(&self.root).expect("the root is held"))
-            .map(|n| n.level() as usize + 1)
-            .unwrap_or(0);
         Stats {
-            blocks: self.blocks.0.len(),
-            bytes: self.blocks.0.values().map(Vec::len).sum(),
-            height,
+            blocks: self.blocks.inner.0.len(),
+            bytes: self.blocks.inner.0.values().map(Vec::len).sum(),
+            height: height(&self.blocks, &self.root).unwrap_or_else(|e| Self::impossible(e)),
         }
     }
 
-    /// Nothing is ever removed: superseded nodes stay. `apply` reports which
-    /// ones it replaced, but that is a hint for a store that wants to collect
-    /// them, not permission to drop history.
-    fn absorb(&mut self, emitted: Vec<(Cid, Vec<u8>)>) {
-        for (c, b) in emitted {
-            let is_node = Node::parse(&b).is_ok();
-            if is_node || self.opts.keep_value_blocks {
-                self.blocks.insert(c, &b);
-            }
-        }
-    }
-
-    fn value_of(v: &[u8]) -> TreeEdit {
-        TreeEdit::Put(v.to_vec())
-    }
-
-    /// The bytes of a value, wherever the tree decided to put it.
+    /// The bytes of a value, wherever the format put it.
     fn materialise(&self, v: Value<'_>) -> Vec<u8> {
-        match v {
-            Value::Inline(b) => b.to_vec(),
-            Value::Ref { cid, len } => match value_bytes(&self.blocks, &cid, len) {
-                Ok(b) => b.to_vec(),
-                Err(e) => Self::impossible(e),
-            },
+        match read_value(&self.blocks, v) {
+            Ok(b) => b.to_vec(),
+            Err(e) => Self::impossible(e),
         }
     }
 
@@ -200,16 +207,16 @@ impl Store for TreeStore {
                 (
                     k,
                     match e {
-                        Edit::Put(v) => Self::value_of(&v),
+                        Edit::Put(v) => TreeEdit::Put(v),
                         Edit::Delete => TreeEdit::Delete,
                     },
                 )
             })
             .collect();
-        let mut emitted = Vec::new();
-        let applied = match apply(&self.blocks, &self.root, &batch, |c, b| {
-            emitted.push((c, b.to_vec()))
-        }) {
+        // `apply_into` writes every emitted block back; nothing is ever removed,
+        // so superseded nodes stay. `replaced` is a hint for a store that wants
+        // to collect them, not permission to drop history.
+        let applied = match apply_into(&mut self.blocks, &self.root, &batch) {
             Ok(a) => a,
             Err(freenet_prolly::apply::ApplyError::Read(e)) => Self::impossible(e),
             // A refused batch emits nothing and changes nothing, so leaving the
@@ -222,14 +229,6 @@ impl Store for TreeStore {
             // can handle, so reaching here means something bypassed it.
             Err(e) => unreachable!("the SDK built a batch the tree refuses: {e:?}"),
         };
-        self.absorb(emitted);
         self.root = applied.root;
     }
-}
-
-/// The id a value of these bytes would have if the tree stored it in its own
-/// block. Values at or below [`MAX_INLINE`] live inside their leaf and have no
-/// block of their own.
-pub fn value_block_id(bytes: &[u8]) -> Option<Cid> {
-    (bytes.len() > MAX_INLINE).then(|| block_id(kind::RAW, bytes))
 }

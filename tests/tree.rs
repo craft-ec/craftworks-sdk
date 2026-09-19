@@ -6,10 +6,10 @@
 
 use craftworks_sdk::id::from_hex;
 use craftworks_sdk::store::{sorted_edits, Edit};
-use craftworks_sdk::tree_store::{value_block_id, Options};
+use craftworks_sdk::tree_store::Options;
 use craftworks_sdk::*;
 use freenet_prolly::build::TreeBuilder;
-use freenet_prolly::node::{Value, MAX_INLINE};
+use freenet_prolly::node::MAX_INLINE;
 use std::collections::BTreeMap;
 
 type Map = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -27,18 +27,15 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
 /// The oracle: build the same contents from scratch. A prolly tree's shape is a
 /// pure function of its contents, so this is what the root MUST be however the
 /// store got there.
+///
+/// It pushes RAW BYTES, so the inline-or-reference choice is made by the
+/// library's own rule — the same call the store makes. An oracle that restated
+/// the rule could drift from it, and then this whole file would be comparing
+/// two implementations of one mistake.
 fn built_from_scratch(m: &Map) -> Cid {
     let mut t = TreeBuilder::new(|_, _: &[u8]| {});
     for (k, v) in m {
-        let value = if v.len() <= MAX_INLINE {
-            Value::Inline(v)
-        } else {
-            Value::Ref {
-                cid: value_block_id(v).expect("over the inline cap"),
-                len: v.len() as u32,
-            }
-        };
-        t.push(k, value).unwrap();
+        t.push_bytes(k, v).unwrap();
     }
     t.finish().unwrap()
 }
