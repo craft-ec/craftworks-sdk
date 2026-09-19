@@ -25,5 +25,9 @@ export function wrap(raw) {
   // `blockId` and nothing beside it: an app is given ids that ADDRESS
   // something. The raw module also exposes `contentHash` (plain BLAKE3, which
   // fetches nothing) for the frozen vectors; it is not part of this surface.
-  return { version: raw.version, blockId: raw.blockId, Db };
+  // `parseBlockId` is the other half of `blockId`: an id is self-describing so
+  // that whoever RECEIVES it can check it. It throws on anything that is not a
+  // block id, so callers that merely want to test a string should catch.
+  const parseBlockId = (text) => JSON.parse(raw.parseBlockId(text));
+  return { version: raw.version, blockId: raw.blockId, parseBlockId, Db };
 }
