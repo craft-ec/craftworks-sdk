@@ -4,7 +4,7 @@
 //! interesting cases are all about what it says when it does not know — which
 //! is why most of these tests are about absence rather than about values.
 
-use craftworks_sdk::copy::{Copy, RolledBack, Visible};
+use craftworks_sdk::copy::{Copy, Refused, RolledBack, Visible};
 
 fn v(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
@@ -82,7 +82,8 @@ fn two_abutting_loads_cover_the_span_between_them() {
 #[test]
 fn a_pending_write_shows_on_top_of_base_and_says_it_is_pending() {
     let mut c = loaded();
-    c.write(b"a/1", Some(v("mine")), 1, 0);
+    c.write(b"a/1", Some(v("mine")), 1, 0)
+        .expect("under the cap");
 
     let seen = c.get(b"a/1").expect("loaded");
     assert_eq!(seen.value(), Some(&b"mine"[..]));
@@ -101,8 +102,10 @@ fn a_pending_write_shows_on_top_of_base_and_says_it_is_pending() {
 #[test]
 fn the_last_pending_write_is_what_shows_and_the_ones_under_it_survive() {
     let mut c = loaded();
-    c.write(b"a/1", Some(v("first")), 1, 0);
-    c.write(b"a/1", Some(v("second")), 2, 0);
+    c.write(b"a/1", Some(v("first")), 1, 0)
+        .expect("under the cap");
+    c.write(b"a/1", Some(v("second")), 2, 0)
+        .expect("under the cap");
     assert_eq!(c.get(b"a/1").unwrap().value(), Some(&b"second"[..]));
 
     // The FIRST publishes. The second is still pending and still on top —
@@ -123,12 +126,13 @@ fn the_last_pending_write_is_what_shows_and_the_ones_under_it_survive() {
 #[test]
 fn a_failed_write_invalidates_every_later_write_on_that_key() {
     let mut c = loaded();
-    c.write(b"a/1", Some(v("w1")), 1, 0);
-    c.write(b"a/1", Some(v("w2")), 2, 0);
-    c.write(b"a/1", Some(v("w3")), 3, 0);
+    c.write(b"a/1", Some(v("w1")), 1, 0).expect("under the cap");
+    c.write(b"a/1", Some(v("w2")), 2, 0).expect("under the cap");
+    c.write(b"a/1", Some(v("w3")), 3, 0).expect("under the cap");
     c.queued(3);
     // A write on ANOTHER key, which must survive.
-    c.write(b"a/2", Some(v("elsewhere")), 4, 0);
+    c.write(b"a/2", Some(v("elsewhere")), 4, 0)
+        .expect("under the cap");
 
     let told = c.failed(1);
     assert_eq!(
@@ -161,15 +165,15 @@ fn a_failed_write_invalidates_every_later_write_on_that_key() {
 #[test]
 fn rolling_back_only_the_failed_write_leaves_a_fabricated_value() {
     let mut c = loaded();
-    c.write(b"a/1", Some(v("w1")), 1, 0);
-    c.write(b"a/1", Some(v("w2")), 2, 0);
+    c.write(b"a/1", Some(v("w1")), 1, 0).expect("under the cap");
+    c.write(b"a/1", Some(v("w2")), 2, 0).expect("under the cap");
 
     // Simulate the narrow rollback by publishing nothing and removing only
     // w1's effect the way a one-entry design would: drop w1, keep w2.
     // Done through the real API by failing w1 and re-applying w2, which is
     // exactly the state the rejected design would have left.
     c.failed(1);
-    c.write(b"a/1", Some(v("w2")), 2, 0);
+    c.write(b"a/1", Some(v("w2")), 2, 0).expect("under the cap");
 
     assert_eq!(
         c.get(b"a/1").unwrap().value(),
@@ -188,7 +192,8 @@ fn rolling_back_only_the_failed_write_leaves_a_fabricated_value() {
 #[test]
 fn a_delta_moves_base_leaves_pending_on_top_and_signals_once() {
     let mut c = loaded();
-    c.write(b"a/1", Some(v("mine")), 1, 0);
+    c.write(b"a/1", Some(v("mine")), 1, 0)
+        .expect("under the cap");
 
     let told = c.apply_delta(
         vec![
@@ -239,7 +244,8 @@ fn a_delta_with_no_pending_writes_signals_nothing() {
 fn a_pending_write_with_no_verdict_times_out_and_rolls_back() {
     let mut c = loaded();
     c.pending_timeout_ms = 1_000;
-    c.write(b"a/1", Some(v("phantom")), 1, 0);
+    c.write(b"a/1", Some(v("phantom")), 1, 0)
+        .expect("under the cap");
 
     // Before the timeout: still showing, still pending.
     let told = c.time_out(999);
@@ -265,7 +271,8 @@ fn a_pending_write_with_no_verdict_times_out_and_rolls_back() {
 fn with_the_timeout_off_the_phantom_survives_for_ever() {
     let mut c = loaded();
     c.pending_timeout_ms = u64::MAX;
-    c.write(b"a/1", Some(v("phantom")), 1, 0);
+    c.write(b"a/1", Some(v("phantom")), 1, 0)
+        .expect("under the cap");
 
     // A year later.
     let told = c.time_out(365 * 24 * 60 * 60 * 1000);
@@ -334,7 +341,8 @@ fn eviction_keeps_it_under_the_cap_and_never_drops_a_pending_write() {
     // A pending write is not a cache entry — it is something the app is
     // waiting on, and evicting it would show a row reverting for a reason
     // nobody can see.
-    c.write(b"r0/0", Some(v("mine")), 1, 0);
+    c.write(b"r0/0", Some(v("mine")), 1, 0)
+        .expect("under the cap");
     for i in 4..8u32 {
         let lo = format!("r{i}/");
         let hi = format!("r{i}0");
@@ -352,4 +360,103 @@ fn eviction_keeps_it_under_the_cap_and_never_drops_a_pending_write() {
         vec![1],
         "eviction dropped a write the app is still waiting on"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pending is the only unbounded thing left, so it has its own cap.
+// ---------------------------------------------------------------------------
+
+/// At the write cap a write is REFUSED, by name, and leaves no trace.
+#[test]
+fn past_the_pending_cap_a_write_is_refused_and_changes_nothing() {
+    let mut c = loaded();
+    c.max_pending = 3;
+    for i in 0..3u64 {
+        c.write(format!("a/{i}").as_bytes(), Some(v("x")), i, 0)
+            .expect("under the cap");
+    }
+    assert_eq!(c.pending().0, 3);
+
+    let before = c.get(b"a/9");
+    let refused = c.write(b"a/9", Some(v("over")), 9, 0).unwrap_err();
+    assert_eq!(
+        refused,
+        Refused::TooManyPending { cap: 3 },
+        "the refusal must name WHICH cap it hit"
+    );
+    assert!(
+        refused.to_string().contains("waiting for an answer"),
+        "unhelpful refusal: {refused}"
+    );
+
+    // NO TRACE. A write half-applied and then reported refused is worse than
+    // either outcome: the app is told nothing happened while something did.
+    assert_eq!(
+        c.get(b"a/9"),
+        before,
+        "the refused write left something behind"
+    );
+    assert_eq!(
+        c.pending(),
+        (3, c.pending().1),
+        "the refused write was counted"
+    );
+    assert!(!c.pending_ids().contains(&9));
+}
+
+/// THE CONTROL: one under the cap goes through, so the refusal above is the
+/// cap firing rather than writes failing generally.
+#[test]
+fn below_the_pending_cap_nothing_changes() {
+    let mut c = loaded();
+    c.max_pending = 3;
+    for i in 0..2u64 {
+        c.write(format!("a/{i}").as_bytes(), Some(v("x")), i, 0)
+            .expect("under the cap");
+    }
+    c.write(b"a/2", Some(v("third")), 2, 0)
+        .expect("the third write is AT the cap, not over it");
+    assert_eq!(c.pending().0, 3);
+    assert_eq!(c.get(b"a/2").unwrap().value(), Some(&b"third"[..]));
+}
+
+/// The BYTE cap fires on its own, where the write cap would not have.
+///
+/// A count is not a byte budget — ten writes of a megabyte are not ten small
+/// ones — so the two bounds are tested where each is the tighter one. A cap
+/// only ever reached through the other is a cap nobody has tested.
+#[test]
+fn the_byte_cap_refuses_where_the_write_cap_would_not_have() {
+    let mut c = loaded();
+    c.max_pending = 1000;
+    c.max_pending_bytes = 100;
+
+    c.write(b"a/1", Some(vec![b'x'; 60]), 1, 0)
+        .expect("under both caps");
+    let refused = c.write(b"a/2", Some(vec![b'x'; 60]), 2, 0).unwrap_err();
+    assert_eq!(
+        refused,
+        Refused::TooManyPendingBytes { cap: 100 },
+        "two writes is nowhere near the WRITE cap of 1000, so this must be \
+         the byte cap or the byte cap is unreachable"
+    );
+    assert_eq!(c.pending().0, 1, "the refused write was counted anyway");
+}
+
+/// Settling a write gives its room back.
+#[test]
+fn a_settled_write_frees_its_place_at_the_cap() {
+    let mut c = loaded();
+    c.max_pending = 2;
+    c.write(b"a/1", Some(v("a")), 1, 0).expect("under the cap");
+    c.write(b"a/2", Some(v("b")), 2, 0).expect("under the cap");
+    assert!(c.write(b"a/3", Some(v("c")), 3, 0).is_err());
+
+    c.published(1);
+    c.write(b"a/3", Some(v("c")), 3, 0)
+        .expect("a published write must give its place back");
+
+    c.failed(2);
+    c.write(b"a/4", Some(v("d")), 4, 0)
+        .expect("a failed write must give its place back too");
 }
