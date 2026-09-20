@@ -67,7 +67,10 @@ impl Default for Store {
 macro_rules! stepped {
     ($e:expr, $ev:expr) => {{
         let out = $e.step($ev);
-        $crate::common::Store::default().absorb(&out);
+        // Into the engine's OWN store: a test that builds an engine over an
+        // isolated store would otherwise absorb into the thread's, and every
+        // block it emitted would be unreadable to the engine that emitted it.
+        $e.blocks().absorb(&out);
         out
     }};
 }

@@ -338,6 +338,15 @@ pub struct Params {
     pub max_accept_age: u64,
     /// Off = the control: writes fold for ever behind a stuck commit.
     pub bound_accept_age: bool,
+    /// Whether the context carries the commit in flight.
+    ///
+    /// Always true in production. It exists as a CONTROL: a both-modes test
+    /// asserts Live and Rehydrate agree, and an assertion that two runs agree
+    /// is worth nothing until something can make them disagree. Turning this
+    /// off leaves one field out of the context, which is exactly the defect
+    /// class the comparison is there to catch, and the control asserts the
+    /// run really does diverge.
+    pub context_carries_pending: bool,
     /// Emit the head as soon as the commit is planned, without waiting for
     /// its packs to be read back. The control for (c): a head that names a
     /// root whose blocks are not all there is a tree no reader can walk, and
@@ -370,6 +379,7 @@ impl Default for Params {
             count_descent: false,
             max_accept_age: 64,
             bound_accept_age: true,
+            context_carries_pending: true,
             head_before_packs: false,
         }
     }
@@ -1827,7 +1837,11 @@ impl<B: Blocks> Engine<B> {
             published_root: self.published_root,
             root: self.root,
             next_seq: self.next_seq,
-            pending: self.pending.clone(),
+            pending: if self.params.context_carries_pending {
+                self.pending.clone()
+            } else {
+                None
+            },
             owed_groups: self.owed.keys().copied().collect(),
             parked: self
                 .reads

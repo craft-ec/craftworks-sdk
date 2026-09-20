@@ -10,7 +10,7 @@ use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod common;
-use common::Store;
+use common::{Harness, Mode, Store};
 
 fn w(n: u64) -> WriteId {
     WriteId(n)
@@ -32,7 +32,7 @@ fn put(k: &str, v: &[u8]) -> (Vec<u8>, Op) {
 }
 
 /// The states reported for each write, in the order they were reported.
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq, Debug)]
 struct Seen(BTreeMap<(ClientId, WriteId), Vec<State>>);
 
 impl Seen {
@@ -293,6 +293,156 @@ fn a_write_during_a_commit_is_refused_and_leaves_no_trace() {
     );
 }
 
+/// One seed of the interleaving sweep, driven in one mode.
+///
+/// Split out of the test so the SAME interleaving runs both ways. The rng is
+/// seeded per call, so the two modes see an identical sequence of writes,
+/// failures, duplicates and strangers -- the only difference is whether the
+/// engine survives between steps.
+struct SweepSeed {
+    published: Cid,
+    expected: Cid,
+    seen: Seen,
+    live: Vec<(u64, u64)>,
+    pack_failures: usize,
+    direct_failures: usize,
+    directs: usize,
+    retries: usize,
+    max_context: usize,
+}
+
+fn sweep_seed(mode: Mode, params: Params, seed: u64) -> SweepSeed {
+    let mut r = rng(seed);
+    // A store of its own: two modes over one store would let the second read
+    // blocks the first put, and a rehydrate that only works because the OTHER
+    // run left its blocks behind has proved nothing.
+    let mut h = Harness::new(mode, params, Store::fresh());
+    let mut seen = Seen::default();
+    let mut records: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut live: Vec<(u64, u64)> = Vec::new();
+    let mut next_id = 0u64;
+    let mut pack_failures = 0usize;
+    let mut direct_failures = 0usize;
+    let mut directs = 0usize;
+    let mut retries_seen = 0usize;
+
+    for _round in 0..6 {
+        // A batch of writes, sometimes overwriting earlier keys.
+        let n = 1 + (r() % 4) as usize;
+        let mut ops = Vec::new();
+        for _ in 0..n {
+            let k = format!("k/{:04}", r() % 40).into_bytes();
+            // Most values ride in the pack; one in eight is over
+            // `max_packed_value` and is PUT on its own. Every value used to be
+            // under 2 KiB against a 64 KiB threshold, so the direct branch --
+            // the one whose failure leaves a commit with an outstanding put
+            // that is not in any pack -- was never entered by this sweep at
+            // all, and `direct_failures` below is the floor that says so.
+            let big = r().is_multiple_of(8);
+            let len = if big {
+                params.max_packed_value + 1 + (r() % 4096) as usize
+            } else {
+                1 + (r() % 2000) as usize
+            };
+            let v = vec![(r() % 251) as u8; len];
+            records.insert(k.clone(), v.clone());
+            ops.push((k, Op::Put(v)));
+        }
+        next_id += 1;
+        let client = 1 + (r() % 2);
+        let out = h.step(write(client, next_id, ops));
+        seen.absorb(&out);
+        live.push((client, next_id));
+
+        // Answer whatever is outstanding, in a shuffled order, with
+        // duplicates and strangers mixed in.
+        let mut pending = ids(&out);
+        for i in (1..pending.len()).rev() {
+            pending.swap(i, (r() % (i as u64 + 1)) as usize);
+        }
+        let packs: BTreeSet<Cid> = pack_ids(&out).into_iter().collect();
+        directs += ids(&out).iter().filter(|i| !packs.contains(*i)).count();
+        let mut queue: Vec<Cid> = Vec::new();
+        for id in &pending {
+            // A failure first, at a position the seed chooses.
+            if r().is_multiple_of(3) {
+                let again = h.step(Event::PutFailed(*id));
+                seen.absorb(&again);
+                // A failed put MUST produce a retry, or the commit waits
+                // for ever on something that already failed.
+                assert!(
+                    !again.is_empty(),
+                    "seed {seed} ({mode:?}): PutFailed re-emitted nothing, so \
+                     the commit can never complete"
+                );
+                if packs.contains(id) {
+                    pack_failures += 1;
+                } else {
+                    direct_failures += 1;
+                }
+                retries_seen += 1;
+                queue.extend(ids(&again));
+            }
+            queue.push(*id);
+            if r().is_multiple_of(4) {
+                queue.push(*id); // a duplicate confirmation
+            }
+            if r().is_multiple_of(5) {
+                // A confirmation for a block nothing is waiting on.
+                queue.push([(r() % 251) as u8; 32]);
+            }
+        }
+        for id in queue {
+            let out = h.step(Event::PutConfirmed(id));
+            seen.absorb(&out);
+            if let Some((seq, _, _)) = head_of(&out) {
+                let out = h.step(Event::HeadConfirmed(seq));
+                seen.absorb(&out);
+                // A published commit can open the next one.
+                let mut more = ids(&out);
+                for i in (1..more.len()).rev() {
+                    more.swap(i, (r() % (i as u64 + 1)) as usize);
+                }
+                for id in more {
+                    let out = h.step(Event::PutConfirmed(id));
+                    seen.absorb(&out);
+                    if let Some((seq, _, _)) = head_of(&out) {
+                        let out = h.step(Event::HeadConfirmed(seq));
+                        seen.absorb(&out);
+                    }
+                }
+            }
+        }
+    }
+
+    // Drain anything still in flight so every write can settle.
+    for _ in 0..8 {
+        let out = h.step(Event::Tick(1000));
+        seen.absorb(&out);
+    }
+
+    SweepSeed {
+        published: h.published_root(),
+        expected: rebuild(&records),
+        seen,
+        live,
+        pack_failures,
+        direct_failures,
+        directs,
+        retries: retries_seen,
+        max_context: h.max_context,
+    }
+}
+
+/// Every interleaving publishes the root a rebuild produces -- and it does so
+/// whether the engine survives between steps or is rebuilt from its context
+/// each time.
+///
+/// The delegate is the rehydrating case: a fresh wasm instance, and a fresh
+/// linear memory, on every message. Running the sweep only in `Live` tested
+/// the one mode production never uses. Both modes run the same interleaving
+/// and must agree with each other AND with a rebuild -- three-way, because
+/// two runs that agree on the wrong answer agree just as loudly.
 #[test]
 fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     // Counted across the whole sweep and asserted at the end. A failure
@@ -302,124 +452,55 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     // first time because it confirmed every id it had failed, regardless of
     // whether the retry produced anything.
     let mut pack_failures = 0usize;
+    let mut direct_failures = 0usize;
+    let mut directs = 0usize;
     let mut retries_seen = 0usize;
+    let mut max_context = 0usize;
     for seed in 1..=24u64 {
-        let mut r = rng(seed);
-        let mut e = Engine::new(Params::default(), Store::default());
-        let mut seen = Seen::default();
-        let mut records: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        let mut live: Vec<(u64, u64)> = Vec::new();
-        let mut next_id = 0u64;
+        let l = sweep_seed(Mode::Live, Params::default(), seed);
+        let d = sweep_seed(Mode::Rehydrate, Params::default(), seed);
 
-        for round in 0..6 {
-            // A batch of writes, sometimes overwriting earlier keys.
-            let n = 1 + (r() % 4) as usize;
-            let mut ops = Vec::new();
-            for _ in 0..n {
-                let k = format!("k/{:04}", r() % 40).into_bytes();
-                let v = vec![(r() % 251) as u8; 1 + (r() % 2000) as usize];
-                records.insert(k.clone(), v.clone());
-                ops.push((k, Op::Put(v)));
-            }
-            next_id += 1;
-            let client = 1 + (r() % 2);
-            let out = stepped!(e, write(client, next_id, ops));
-            seen.absorb(&out);
-            live.push((client, next_id));
-
-            // Answer whatever is outstanding, in a shuffled order, with
-            // duplicates and strangers mixed in.
-            let mut pending = ids(&out);
-            for i in (1..pending.len()).rev() {
-                pending.swap(i, (r() % (i as u64 + 1)) as usize);
-            }
-            let packs: BTreeSet<Cid> = pack_ids(&out).into_iter().collect();
-            let mut queue: Vec<Cid> = Vec::new();
-            for id in &pending {
-                // A failure first, at a position the seed chooses.
-                if r().is_multiple_of(3) {
-                    let again = stepped!(e, Event::PutFailed(*id));
-                    seen.absorb(&again);
-                    // A failed put MUST produce a retry, or the commit waits
-                    // for ever on something that already failed.
-                    assert!(
-                        !again.is_empty(),
-                        "seed {seed}: PutFailed re-emitted nothing, so the \
-                         commit can never complete"
-                    );
-                    if packs.contains(id) {
-                        pack_failures += 1;
-                    }
-                    retries_seen += 1;
-                    queue.extend(ids(&again));
-                }
-                queue.push(*id);
-                if r().is_multiple_of(4) {
-                    queue.push(*id); // a duplicate confirmation
-                }
-                if r().is_multiple_of(5) {
-                    // A confirmation for a block nothing is waiting on.
-                    queue.push([(r() % 251) as u8; 32]);
-                }
-            }
-            for id in queue {
-                let out = stepped!(e, Event::PutConfirmed(id));
-                seen.absorb(&out);
-                if let Some((seq, _, _)) = head_of(&out) {
-                    let out = stepped!(e, Event::HeadConfirmed(seq));
-                    seen.absorb(&out);
-                    // A published commit can open the next one.
-                    let mut more = ids(&out);
-                    for i in (1..more.len()).rev() {
-                        more.swap(i, (r() % (i as u64 + 1)) as usize);
-                    }
-                    for id in more {
-                        let out = stepped!(e, Event::PutConfirmed(id));
-                        seen.absorb(&out);
-                        if let Some((seq, _, _)) = head_of(&out) {
-                            let out = stepped!(e, Event::HeadConfirmed(seq));
-                            seen.absorb(&out);
-                        }
-                    }
-                }
-            }
-            let _ = round;
-        }
-
-        // Drain anything still in flight so every write can settle.
-        for _ in 0..8 {
-            let out = stepped!(e, Event::Tick(1000));
-            seen.absorb(&out);
-        }
-
-        if e.published_root() != rebuild(&records) {
-            println!(
-                "seed {seed}: warm root matches rebuild? {}  published==warm? {}",
-                e.root() == rebuild(&records),
-                e.published_root() == e.root()
-            );
-        }
         assert_eq!(
-            e.published_root(),
-            rebuild(&records),
-            "seed {seed}: the published root is not the root a rebuild produces"
+            l.published, d.published,
+            "seed {seed}: an engine rebuilt from its context between every \
+             step published a different root from one that survived, so \
+             something the pipeline needs is not in the context"
         );
-        // And no write was silently dropped, or reported an impossible life.
-        for (client, id) in &live {
-            let states = seen.of(*client, *id);
-            assert!(
-                !states.is_empty(),
-                "seed {seed}: write {id} was never reported at all"
-            );
-            assert!(
-                valid_sequence(states),
-                "seed {seed}: write {id} reported an impossible sequence: {states:?}"
+        for s in [&l, &d] {
+            assert_eq!(
+                s.published, s.expected,
+                "seed {seed}: the published root is not the root a rebuild \
+                 produces"
             );
         }
-        println!(
-            "  seed {seed:2}: {} records, root matches a rebuild",
-            records.len()
+        // And no write was silently dropped, or reported an impossible life.
+        for s in [&l, &d] {
+            for (client, id) in &s.live {
+                let states = s.seen.of(*client, *id);
+                assert!(
+                    !states.is_empty(),
+                    "seed {seed}: write {id} was never reported at all"
+                );
+                assert!(
+                    valid_sequence(states),
+                    "seed {seed}: write {id} reported an impossible sequence: \
+                     {states:?}"
+                );
+            }
+        }
+        // The states themselves must agree too: a rehydrate that reaches the
+        // right root while telling a client something different is still a
+        // bug the root comparison cannot see.
+        assert_eq!(
+            l.seen, d.seen,
+            "seed {seed}: the two modes reported different write states"
         );
+        pack_failures += l.pack_failures + d.pack_failures;
+        direct_failures += l.direct_failures + d.direct_failures;
+        directs += l.directs + d.directs;
+        retries_seen += l.retries + d.retries;
+        max_context = max_context.max(d.max_context);
+        println!("  seed {seed:2}: both modes match a rebuild");
     }
     // Without this the sweep can inject failures that never land on a pack and
     // report green over a branch it never entered.
@@ -428,7 +509,61 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
         "{retries_seen} put failures were injected and NONE hit a pack: the \
          pack retry path was not exercised"
     );
-    println!("  {retries_seen} injected failures, {pack_failures} of them on packs");
+    // The other half of the same floor. A pack retry and a direct-block retry
+    // are different branches, and a sweep whose values are all small emits no
+    // direct block to fail -- which is what this one did until the fixture
+    // above was widened.
+    assert!(
+        directs > 0,
+        "the sweep emitted no direct PutBlock at all, so no value exceeded \
+         max_packed_value and the pack/direct split was never taken"
+    );
+    assert!(
+        direct_failures > 0,
+        "{directs} direct block puts were emitted and NONE was failed: the \
+         direct retry path was not exercised"
+    );
+    println!(
+        "  {retries_seen} injected failures: {pack_failures} on packs, \
+         {direct_failures} on direct blocks (of {directs} emitted); largest \
+         context {max_context} B"
+    );
+}
+
+/// The control for the sweep above: leave one field out of the context, and
+/// the two modes must stop agreeing.
+///
+/// `context_carries_pending: false` drops the commit in flight. Everything
+/// else is identical. Without this, "Live and Rehydrate agree" would hold
+/// just as well over an engine that kept its state in a global, or a Harness
+/// whose rehydrate mode quietly did nothing -- the assertion would be
+/// measuring the harness, not the context.
+#[test]
+fn dropping_one_context_field_makes_the_two_modes_disagree() {
+    let blind = Params {
+        context_carries_pending: false,
+        ..Params::default()
+    };
+    let mut diverged = 0usize;
+    for seed in 1..=24u64 {
+        let good = sweep_seed(Mode::Live, Params::default(), seed);
+        let blinded = std::panic::catch_unwind(move || sweep_seed(Mode::Rehydrate, blind, seed));
+        // Either the run falls over (a retry that re-emits nothing is itself
+        // the forgotten commit showing) or it finishes at the wrong root.
+        // Both are divergence; neither is agreement.
+        match blinded {
+            Err(_) => diverged += 1,
+            Ok(b) if b.published != good.published => diverged += 1,
+            Ok(_) => {}
+        }
+    }
+    assert_eq!(
+        diverged, 24,
+        "only {diverged} of 24 seeds noticed that the in-flight commit was \
+         left out of the context, so the both-modes comparison does not see \
+         a field going missing"
+    );
+    println!("  control: all 24 seeds diverged with one context field dropped");
 }
 
 /// Drive one write all the way to published, confirming in order.
