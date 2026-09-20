@@ -52,7 +52,19 @@ fn body_of(name: &str) -> String {
     let end = rest
         .find("\n    }\n")
         .unwrap_or_else(|| panic!("could not find the end of `{name}`"));
-    rest[..end].to_string()
+    // COMMENTS STRIPPED. This gate asks what the CODE does, and the comments
+    // around it name the very things it looks for — a warning not to reach
+    // past the store to `copy.time_out` contains `copy.time_out`. Checking the
+    // raw text made a method fail its own gate for explaining itself, and
+    // would equally let a method pass by mentioning the right call in prose.
+    rest[..end]
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -102,6 +114,62 @@ fn control_the_reader_finds_real_bodies() {
     assert!(
         MUST_DECIDE.len() >= 8,
         "the list has shrunk; a method dropped from it is a method nothing checks"
+    );
+}
+
+/// **THE PAGE'S TICK REACHES THE STORE'S TICK.**
+///
+/// `Session::tick` called `self.db.store_mut().copy.time_out(now)` — straight
+/// to the COPY, which rolls back writes that waited too long and does nothing
+/// else. Everything else `CachedStore::tick` does therefore never ran on a
+/// page, and what it does besides rolling back is drain the OUTBOX: the
+/// writes the engine refused with `Busy` while a commit was in flight, which
+/// nothing else re-sends (sdk#106).
+///
+/// So that backstop was dead here the day it was written, and no JavaScript
+/// test could see it: they drive a FAKE session, and a fake has whatever
+/// methods the test gives it. Same gap as the parking in sdk#90 — the
+/// decision moved somewhere testable and nothing checked the call site still
+/// asked for it — so this is the same answer.
+///
+/// Reaching past a type's own entry point to one of its fields is the shape
+/// to watch: the copy IS a field of the store, and touching it directly
+/// skipped every decision the store makes around it.
+#[test]
+fn the_page_tick_goes_through_the_store_tick() {
+    let body = body_of("tick");
+    assert!(
+        body.contains("store_mut().tick()"),
+        "`Session::tick` does not call the store's own tick. Whatever it calls \
+         instead, everything `CachedStore::tick` decides — draining the outbox \
+         of writes the engine refused `Busy`, which nothing else re-sends — \
+         does not happen on a page."
+    );
+    assert!(
+        !body.contains("copy.time_out"),
+        "`Session::tick` reaches past the store to `copy.time_out`. That rolls \
+         back and nothing else: it was how the outbox backstop came to be dead \
+         on every page while its own test passed."
+    );
+}
+
+/// THE CONTROL: the reader can tell the two apart.
+///
+/// Without it, a `body_of` that returned an empty string would satisfy both
+/// assertions above — the first by not finding the absence it checks for, and
+/// the second by finding nothing at all. An empty body passes a `!contains`.
+#[test]
+fn control_the_tick_body_is_really_read() {
+    let body = body_of("tick");
+    assert!(
+        body.len() > 80,
+        "the body read for `tick` is {} bytes; the reader is broken, not the code",
+        body.len()
+    );
+    assert!(
+        body.contains("send_tick"),
+        "the body read for `tick` does not send the delegate the time, so it is \
+         not the method this gate thinks it is"
     );
 }
 
