@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# THE CANONICAL GATE: run what this repo actually checks with, once.
+#
+# # Why this exists
+#
+# The commands lived in README prose and in habit, and a habit is a second
+# hand-written expression of a fact — which §19 says disagrees eventually. It
+# did: `cargo test` at the root covers the ROOT PACKAGE ONLY, and a run of it
+# reported "175 tests passing" into the bodies of #99 and #100, both merged,
+# silently omitting eight workspace members including `testkit` — the crate
+# whose tests had just been added. Nothing failed and nothing warned. The only
+# tell was a count that did not MOVE.
+#
+# So the cargo invocation here is DERIVED from the workspace, never restated.
+# A hand-written list of members would be the same defect wearing a new name:
+# correct the day it is written, silently short the day someone adds a crate.
+#
+# # What it refuses to do
+#
+# - **Skip.** A step that cannot run is a FAILURE with its reason. A gate that
+#   skips what it cannot do reports success for work it did not check.
+# - **Print only a verdict.** It prints what it RAN and the COUNTS, because a
+#   gate whose output nobody reads can quietly start checking nothing, and the
+#   number is the only thing that shows it did.
+# - **Start with no room.** Disk has hit 8.4 GiB twice in one night here, and
+#   an ENOSPC inside a gate voids the run rather than failing it honestly.
+#
+# # If you add to this: two traps it has already hit
+#
+# - **macOS ships bash 3.2.** No associative arrays (`declare -A`), no `${x^^}`,
+#   no `mapfile`. The baseline lookup below is a `grep` function for that
+#   reason and not for style.
+# - **`$?` after a PIPELINE is the LAST command's status.**
+#   `out=$(cmd | tail -1); rc=$?` reads tail's, which is always 0, so a failing
+#   step passes in silence. Capture the output, take `rc` from the command
+#   itself, and pipe afterwards — the shape used for `fixture-gate` below.
+
+set -uo pipefail
+cd "$(dirname "$0")"
+
+RED=""; GREEN=""; OFF=""
+if [ -t 1 ]; then RED=$'\033[31m'; GREEN=$'\033[32m'; OFF=$'\033[0m'; fi
+fail() { echo "${RED}gate: $*${OFF}" >&2; FAILED=1; }
+step() { echo; echo "── $* ──"; }
+FAILED=0
+BASELINE=gate.baseline
+
+# ---------------------------------------------------------------- disk ----
+# Before anything, because the failure it prevents is the one that does not
+# look like a failure.
+MIN_GIB=5
+free_gib=$(df -g . 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -z "$free_gib" ]; then
+  # BSD df -g is macOS; fall back to POSIX blocks.
+  free_gib=$(df -k . | awk 'NR==2 {printf "%d", $4/1048576}')
+fi
+echo "gate: ${free_gib} GiB free"
+if [ "$free_gib" -lt "$MIN_GIB" ]; then
+  echo "${RED}gate: under ${MIN_GIB} GiB free — refusing to start.${OFF}" >&2
+  echo "An ENOSPC inside a build voids the run rather than failing it honestly," >&2
+  echo "and a voided run reads as a passing one." >&2
+  exit 1
+fi
+
+# ----------------------------------------------------------- members ----
+# From cargo, which is the only thing that cannot be out of date.
+need() { command -v "$1" >/dev/null || { echo "${RED}gate: no $1 — cannot run, and will not skip${OFF}" >&2; exit 1; }; }
+need cargo
+need node
+need npm
+
+MEMBERS=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+  | python3 -c 'import json,sys; print("\n".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"])))')
+if [ -z "$MEMBERS" ]; then
+  echo "${RED}gate: cargo metadata named no packages — cannot derive what to test${OFF}" >&2
+  exit 1
+fi
+echo "gate: $(echo "$MEMBERS" | wc -l | tr -d ' ') workspace members, from cargo metadata"
+
+# Members that legitimately have NO host tests, and why. Not a list of
+# exceptions to tidy up later: each line is a claim a reviewer can check.
+no_host_tests() {
+  case "$1" in
+    # A `cdylib` for wasm32, loaded into a node. There is no host binary to
+    # test; what it answers is answered by RUNNING it, which `probe` does.
+    probe-delegate) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------------- tests ----
+step "cargo test, per member"
+declare -a NAMES COUNTS
+total=0
+for m in $MEMBERS; do
+  out=$(cargo test -p "$m" --no-fail-fast 2>&1)
+  rc=$?
+  n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
+  if [ $rc -ne 0 ]; then
+    fail "cargo test -p $m FAILED"
+    echo "$out" | grep -E "^(error|test result: FAILED|---- )" | head -5 >&2
+  fi
+  if [ "$n" -eq 0 ] && ! no_host_tests "$m"; then
+    fail "$m has NO tests and no reason recorded — add tests, or add it to \
+no_host_tests() WITH its reason. An uncovered member is what this gate is for."
+  fi
+  NAMES+=("$m"); COUNTS+=("$n")
+  total=$((total + n))
+done
+
+# ------------------------------------------------------------ clippy ----
+step "cargo clippy --workspace --all-targets -- -D warnings"
+if ! cargo clippy --workspace --all-targets -- -D warnings > /tmp/gate-clippy.$$ 2>&1; then
+  fail "clippy failed"
+  grep -E "^(error|warning)" /tmp/gate-clippy.$$ | head -8 >&2
+fi
+clippy_warnings=$(grep -cE "^(warning|error)" /tmp/gate-clippy.$$ || true)
+rm -f /tmp/gate-clippy.$$
+
+# --------------------------------------------------------------- npm ----
+step "npm test"
+js_ok=0
+if [ ! -f pkg/web/craftworks_sdk_bg.wasm ]; then
+  # NOT a skip. Four JS tests read the built package, and a gate that passed
+  # over them would certify a package nobody built.
+  fail "pkg/web is not built — run ./build.sh first. npm test checks the \
+BUILT package, so passing over it would certify something that does not exist."
+else
+  if ! npm test > /tmp/gate-npm.$$ 2>&1; then
+    fail "npm test failed"
+    grep -E "FAIL|Error" /tmp/gate-npm.$$ | head -8 >&2
+  fi
+  js_ok=$(grep -c "^  ok " /tmp/gate-npm.$$ || true)
+  rm -f /tmp/gate-npm.$$
+fi
+
+# ------------------------------------------------------ fixture gate ----
+step "fixture-gate.sh"
+[ -x ./fixture-gate.sh ] || { fail "fixture-gate.sh is missing or not executable"; }
+fixture_out=$(./fixture-gate.sh 2>&1)
+fixture_rc=$?
+fixture_line=$(echo "$fixture_out" | tail -1)
+[ $fixture_rc -ne 0 ] && fail "fixture-gate failed: $fixture_line"
+
+# ----------------------------------------------------------- summary ----
+# WHAT IT RAN and the COUNTS, not a verdict on its own.
+step "summary"
+printf "%-18s %8s %8s\n" "member" "tests" "vs base"
+moved=0
+# A lookup, not an associative array: macOS ships bash 3.2, which has none.
+base_for() { [ -f "$BASELINE" ] && grep -E "^$1=" "$BASELINE" 2>/dev/null | head -1 | cut -d= -f2; }
+for i in "${!NAMES[@]}"; do
+  m=${NAMES[$i]}; n=${COUNTS[$i]}
+  b=$(base_for "$m")
+  if [ -z "$b" ]; then
+    printf "%-18s %8s %8s\n" "$m" "$n" "NEW"
+    fail "$m is not in $BASELINE — record it with ./gate.sh --accept"
+    moved=1
+  else
+    d=$((n - b))
+    mark=""
+    [ $d -gt 0 ] && mark="+$d" || mark="$d"
+    [ $d -eq 0 ] && mark="—"
+    printf "%-18s %8s %8s\n" "$m" "$n" "$mark"
+    if [ $d -lt 0 ]; then
+      fail "$m LOST $((-d)) test(s). A count that falls is a test that stopped \
+running, which is the state this gate exists to make impossible to publish."
+      moved=1
+    elif [ $d -gt 0 ]; then
+      moved=1
+    fi
+  fi
+done
+# Members recorded but gone. A baseline that outlives its crate is a line
+# nobody checks, which is how a stale expectation survives.
+if [ -f "$BASELINE" ]; then
+  while IFS='=' read -r k _; do
+    [ -n "$k" ] || continue
+    echo "$MEMBERS" | grep -qx "$k" || fail "$k is in $BASELINE but is no longer a workspace member"
+  done < "$BASELINE"
+fi
+
+echo
+echo "ran: cargo test per member ($total passing), clippy --workspace --all-targets -D warnings ($clippy_warnings warnings), npm test ($js_ok ok), fixture-gate ($fixture_line)"
+
+if [ "${1-}" = "--accept" ]; then
+  : > "$BASELINE"
+  for i in "${!NAMES[@]}"; do echo "${NAMES[$i]}=${COUNTS[$i]}" >> "$BASELINE"; done
+  echo "gate: recorded ${#NAMES[@]} member counts in $BASELINE"
+  exit 0
+fi
+
+if [ "$moved" -gt 0 ] && [ "$FAILED" -eq 0 ]; then
+  fail "counts moved UP — record the ground you gained with ./gate.sh --accept"
+fi
+
+if [ "$moved" -eq 0 ] && [ "$FAILED" -eq 0 ]; then
+  # THE OTHER HALF, and the half that caught the defect this gate is for: a
+  # count that does not move when you meant to add a test is a test that is
+  # not being run. The gate cannot know your intent, so it says the sentence.
+  echo "gate: no count moved. If you added a test, IT IS NOT BEING RUN — that"
+  echo "      is exactly how 175 got published while testkit's tests sat out."
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "${RED}gate: FAILED${OFF}" >&2
+  exit 1
+fi
+echo "${GREEN}gate: ok${OFF}"
