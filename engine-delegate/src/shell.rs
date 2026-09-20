@@ -68,6 +68,23 @@ pub struct Outbound {
     /// Counted, not silent: a client that never sent `Install` would
     /// otherwise see its write accepted and then nothing at all.
     pub refused_no_code: usize,
+    /// Bytes this call handed to the node in `Op::Put`.
+    ///
+    /// Counted where the delegate already knows them, which is the only place
+    /// they can be known honestly. Six external instruments failed to infer a
+    /// PUT's cost from outside (freenet-contracts#39): an interface carries
+    /// the whole machine, a per-process counter carries the node's own
+    /// traffic, and a rate counter's baseline varies by more than the signal.
+    /// The lesson was that the counter belongs inside the thing being
+    /// measured.
+    ///
+    /// It is NOT what the node then sends peer-to-peer — only the node can
+    /// count that. It is what this delegate offered it.
+    pub put_bytes: usize,
+    /// Node operations issued this call, by kind, so a reader can tell a call
+    /// that wrote from one that only looked.
+    pub gets: usize,
+    pub puts: usize,
     /// Effects still waiting at the end of the call, and therefore LOST.
     ///
     /// The scheduler does not survive the call — nothing in a delegate does
@@ -539,6 +556,19 @@ impl<B: Blocks> Shell<B> {
         out.stranded = sched.ready_len() + sched.held_len();
         out.awaiting = self.awaiting.len();
         out.read_back_hits = self.read_back_hits;
+        // Counted from the ops actually leaving this call, not from a running
+        // total kept beside them — a second account of the same facts is what
+        // disagreed with the per-key record in the harness.
+        for op in &out.ops {
+            match op {
+                crate::schedule::Op::Put { bytes, .. } => {
+                    out.puts += 1;
+                    out.put_bytes += bytes.len();
+                }
+                crate::schedule::Op::Get { .. } => out.gets += 1,
+                _ => {}
+            }
+        }
         out
     }
 

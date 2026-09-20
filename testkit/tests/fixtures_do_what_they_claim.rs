@@ -87,3 +87,105 @@ fn the_unprobed_constructor_is_the_awkward_one() {
     assert_eq!(probed.puts(), 0);
     assert_eq!(bare.puts(), 0);
 }
+
+/// The per-call node-op counts are the SHELL's, recorded on the client side.
+///
+/// They are counted where the delegate already knows them, which is the only
+/// place they can be known honestly: six external instruments failed to infer
+/// a PUT's cost from outside (freenet-contracts#39), because an interface
+/// carries the whole machine and a rate counter's baseline varies by more than
+/// the signal. The counter belongs inside the thing being measured — and the
+/// RING belongs to the client, never to the delegate's context or its secret
+/// store.
+#[test]
+fn a_call_reports_the_bytes_it_handed_to_the_node() {
+    use instrument::{vocab::Key, Event};
+
+    let mut node = Node::new();
+    let _ = node.step(Vec::new());
+
+    // Whatever the call did, the recording's BytesOut must equal the bytes the
+    // shell actually put — asserted against the events rather than against a
+    // second tally, because a second tally is what disagrees.
+    let from_events: u64 = node
+        .recording()
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            Event::Counter { entry, .. } if entry.key == Key::BytesOut => Some(entry.value),
+            _ => None,
+        })
+        .sum();
+    // Two views of the same value agreeing. Kept — it would catch the
+    // accessor and the recording drifting apart — but it CANNOT catch the
+    // measurement being wrong: zero equals zero. The core dev zeroed
+    // `put_bytes += bytes.len()` and this stayed green.
+    assert_eq!(
+        node.put_bytes(),
+        from_events,
+        "the accessor and the recording are the same number: {}",
+        node.line()
+    );
+
+    // The expectation that makes it falsifiable, computed from what this node
+    // ACTUALLY RECEIVED rather than from the shell's own tally.
+    assert_eq!(
+        node.put_bytes(),
+        node.bytes_handed_to_this_node(),
+        "the shell's count must equal the bytes this node was handed: {}",
+        node.dump("byte count")
+    );
+
+    // Stranded must be zero — it is recorded rather than asserted inside the
+    // shell so a non-zero one is visible without arithmetic, and this is where
+    // it is checked.
+    let stranded: u64 = node
+        .recording()
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            Event::Counter { entry, .. } if entry.key == Key::Stranded => Some(entry.value),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        stranded,
+        0,
+        "effects left queued when a call ended are LOST: {}",
+        node.dump("stranded")
+    );
+}
+
+/// A call that ACTUALLY WRITES, so the byte count has something to be wrong
+/// about.
+///
+/// The test above drives an empty call, where the shell hands the node nothing
+/// and every count is zero — so zeroing the measurement left it green. A cost
+/// counter needs a case where the number is NOT zero and an expectation
+/// computed without the code under test.
+#[test]
+fn the_byte_count_is_pinned_to_what_the_node_actually_received() {
+    let mut node = Node::new();
+    let _ = node.client(&protocol::Request::Write {
+        write_id: 1,
+        ops: vec![protocol::Op::Put(b"k".to_vec(), vec![7u8; 900])],
+    });
+
+    let handed = node.bytes_handed_to_this_node();
+    assert!(
+        handed > 0,
+        "the fixture must actually hand the node blocks, or this proves nothing: {}",
+        node.line()
+    );
+    assert_eq!(
+        node.put_bytes(),
+        handed,
+        "the shell's count must equal what this node received: {}",
+        node.dump("byte count")
+    );
+    assert!(
+        node.blocks_handed_to_this_node() > 0,
+        "and blocks, not just bytes: {}",
+        node.line()
+    );
+}

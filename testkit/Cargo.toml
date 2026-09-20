@@ -7,10 +7,11 @@ description = "The probed fixtures. The only supported way to build the thing un
 
 [dependencies]
 engine = { path = "../engine" }
+protocol = { path = "../protocol" }
 engine-delegate = { path = "../engine-delegate" }
 craftworks-sdk = { path = ".." }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
-instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "9967896" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "631241b" }
 
 [dev-dependencies]
-instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "9967896" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "631241b" }
