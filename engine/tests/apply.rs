@@ -1,0 +1,364 @@
+//! A write onto a tree path the node does not hold (craftworks-sdk#32).
+//!
+//! A delegate reads the tree through a SYNC host call that returns what the
+//! node happens to hold at that instant (F14), and that call registers no
+//! demand (F33). So an apply can stop on a cold block with nothing wrong: the
+//! engine must fetch it and run the apply again, not tell the client its write
+//! failed.
+
+use engine::read::{ReadResult, ReqId};
+use engine::{ClientId, Effect, Event, Op, Params, State, WriteId};
+use freenet_prolly::store::{Blocks, MemBlocks};
+use freenet_prolly::Cid;
+use std::collections::BTreeMap;
+
+mod common;
+use common::{rebuild, tree, Harness, Mode, Store};
+
+/// A tree of `n` keys, and every block in it.
+fn fixture(n: u32) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks) {
+    let records: BTreeMap<Vec<u8>, Vec<u8>> = (0..n)
+        .map(|i| (format!("k/{i:05}").into_bytes(), vec![(i % 251) as u8; 40]))
+        .collect();
+    let (root, all) = tree(&records);
+    (records, root, all)
+}
+
+fn started(mode: Mode, params: Params, store: Store, root: Cid) -> Harness {
+    let mut h = Harness::new(mode, params, store);
+    let _ = h.step(Event::Start {
+        key: engine::KeySource::SecretStore,
+        epochs: vec![engine::Epoch(1)],
+    });
+    let _ = h.step(Event::HeadRead {
+        epoch: engine::Epoch(1),
+        seq: 1,
+        root,
+    });
+    h
+}
+
+fn fetches(fx: &[Effect]) -> Vec<Cid> {
+    fx.iter()
+        .filter_map(|f| match f {
+            Effect::FetchBlock { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn states(fx: &[Effect]) -> Vec<State> {
+    fx.iter()
+        .filter_map(|f| match f {
+            Effect::Notify { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect()
+}
+
+fn write_one(key: &str, val: &[u8]) -> Event {
+    Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops: vec![(key.as_bytes().to_vec(), Op::Put(val.to_vec()))],
+    }
+}
+
+/// A write onto a cold path is parked, fetched for, and applies.
+///
+/// The regression: this reported `Failed`, which says *this edit is not in
+/// the tree and never will be*. It was a transient miss, and a client acting
+/// on that word gives up on a write one fetch away from landing.
+///
+/// The control is the SAME write against a warm store: it must ask for
+/// nothing and be accepted in one step. Without it, "the cold write was
+/// parked" would read identically if every write were parked.
+#[test]
+fn a_write_onto_a_cold_path_is_parked_and_then_applies() {
+    for mode in [Mode::Live, Mode::Rehydrate] {
+        let (mut records, root, all) = fixture(400);
+
+        // --- the control: a warm store ---
+        let warm = Store::fresh();
+        for (id, bytes) in all.0.iter() {
+            warm.put(*id, bytes);
+        }
+        let mut hw = started(mode, Params::default(), warm, root);
+        let out = hw.step(write_one("k/00100", b"warm"));
+        assert!(
+            fetches(&out).is_empty(),
+            "{mode:?}: a write against a store holding the whole tree asked \
+             for {} block(s), so parking is not what the cold case shows",
+            fetches(&out).len()
+        );
+        assert_eq!(
+            states(&out).first(),
+            Some(&State::Accepted),
+            "{mode:?}: a warm write was not accepted in one step"
+        );
+
+        // --- the case: only the root is held ---
+        let cold = Store::fresh();
+        cold.put(root, all.get(&root).expect("the root"));
+        let mut h = started(mode, Params::default(), cold.clone(), root);
+
+        let out = h.step(write_one("k/00100", b"cold"));
+        assert!(
+            !fetches(&out).is_empty(),
+            "{mode:?}: a write onto a path the node does not hold asked for \
+             nothing"
+        );
+        assert!(
+            states(&out).is_empty(),
+            "{mode:?}: a parked write was told {:?} before it had applied",
+            states(&out)
+        );
+
+        // Feed it what it asks for, one block at a time, until it applies.
+        let mut queue = fetches(&out);
+        let mut rounds = 0;
+        let mut accepted = false;
+        let mut delivered = 0usize;
+        while let Some(id) = queue.pop() {
+            rounds += 1;
+            assert!(rounds < 1000, "{mode:?}: the parked write never settled");
+            let bytes = all.get(&id).expect("the fixture holds every block");
+            cold.put(id, bytes);
+            delivered += 1;
+            let out = h.step(Event::BlockArrived {
+                id,
+                bytes: bytes.to_vec(),
+            });
+            queue.extend(fetches(&out));
+            if states(&out).contains(&State::Accepted) {
+                accepted = true;
+                break;
+            }
+        }
+        assert!(
+            accepted,
+            "{mode:?}: the parked write was fed every block it asked for and \
+             was never accepted"
+        );
+        // It read a PATH, not the tree: 400 keys is several levels, and a
+        // write that pulled the whole thing would be hundreds of blocks.
+        assert!(
+            delivered < 20,
+            "{mode:?}: the parked write pulled {delivered} blocks to apply one \
+             key, which is a whole-tree walk rather than a path"
+        );
+
+        records.insert(b"k/00100".to_vec(), b"cold".to_vec());
+        assert_eq!(
+            h.root(),
+            rebuild(&records),
+            "{mode:?}: the parked write applied to the wrong tree"
+        );
+        println!("  {mode:?}: cold write parked, {delivered} blocks, then applied");
+    }
+}
+
+/// A write whose blocks never arrive is refused, not left waiting.
+///
+/// The bound is on ROUNDS, not on misses: this drives it with misses, and the
+/// sibling assertion is that nothing was applied — `Failed` is only honest
+/// when the edit really is not in the tree.
+#[test]
+fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
+    // Two different bounds. One run stopping at its bound could be a
+    // coincidence of the fixture's depth; two runs each stopping at their own
+    // shows the bound is the thing doing it.
+    for (mode, rounds_allowed) in [(Mode::Live, 8u32), (Mode::Rehydrate, 3)] {
+        let params = Params {
+            max_apply_rounds: rounds_allowed,
+            ..Params::default()
+        };
+        let (_, root, all) = fixture(400);
+        let cold = Store::fresh();
+        cold.put(root, all.get(&root).expect("the root"));
+        let mut h = started(mode, params, cold, root);
+        let before = h.root();
+
+        let mut queue = fetches(&h.step(write_one("k/00100", b"never")));
+        assert!(!queue.is_empty(), "{mode:?}: the write asked for nothing");
+        let mut asked = 1u32;
+        let mut failed = 0usize;
+        while let Some(id) = queue.pop() {
+            let out = h.step(Event::BlockMissed(id));
+            failed += states(&out).iter().filter(|s| **s == State::Failed).count();
+            let next = fetches(&out);
+            if next.is_empty() {
+                break;
+            }
+            asked += 1;
+            assert!(
+                asked <= rounds_allowed,
+                "{mode:?}: the write has been re-asked {asked} times against a \
+                 bound of {rounds_allowed}"
+            );
+            queue = next;
+        }
+        assert_eq!(
+            failed, 1,
+            "{mode:?}: a write that could never apply was reported Failed \
+             {failed} times; a client needs exactly one answer"
+        );
+        assert_eq!(
+            h.root(),
+            before,
+            "{mode:?}: the write was reported Failed and changed the tree \
+             anyway, so a client that re-submits applies it twice"
+        );
+        // The control for the bound: it stopped where the bound put it, not
+        // on the first miss and not at some fixed depth of its own.
+        assert_eq!(
+            asked, rounds_allowed,
+            "{mode:?}: the write was refused after {asked} round(s) against a \
+             bound of {rounds_allowed}, so the bound is not what stops it"
+        );
+        println!("  {mode:?}: refused after {asked} rounds, tree unchanged");
+    }
+}
+
+/// A second write while one is parked is refused, and leaves no trace.
+#[test]
+fn a_second_write_while_one_is_parked_is_refused() {
+    let (records, root, all) = fixture(400);
+    let cold = Store::fresh();
+    cold.put(root, all.get(&root).expect("the root"));
+    let mut h = started(Mode::Rehydrate, Params::default(), cold, root);
+
+    let out = h.step(write_one("k/00100", b"first"));
+    assert!(!fetches(&out).is_empty(), "the first write did not park");
+
+    let out = h.step(Event::Write {
+        client: ClientId(2),
+        write_id: WriteId(2),
+        ops: vec![(b"k/00200".to_vec(), Op::Put(b"second".to_vec()))],
+    });
+    assert_eq!(
+        states(&out),
+        vec![State::Busy],
+        "a write arriving while one is parked was not refused"
+    );
+    assert_eq!(
+        h.root(),
+        rebuild(&records),
+        "the refused write changed the tree, so it was applied AND refused"
+    );
+    println!("  a second write while one is parked: Busy, tree untouched");
+}
+
+/// A write too big to carry in the context is refused rather than parked.
+///
+/// The parked write's ops ride in the context, which the platform caps at
+/// 400 KiB. Parking one that does not fit would produce a context that cannot
+/// be written, and the failure would surface at `to_context` — after the
+/// client had been told nothing at all.
+#[test]
+fn a_write_too_big_to_park_is_refused_while_a_smaller_one_parks() {
+    let (_, root, all) = fixture(400);
+    let cap = 4096usize;
+    let params = Params {
+        max_parked_write_bytes: cap,
+        ..Params::default()
+    };
+    let mut refused = None;
+    let mut parked = None;
+    for (label, len) in [("over", cap + 1), ("under", cap / 2)] {
+        let cold = Store::fresh();
+        cold.put(root, all.get(&root).expect("the root"));
+        let mut h = started(Mode::Rehydrate, params, cold, root);
+        let out = h.step(write_one("k/00100", &vec![7u8; len]));
+        if label == "over" {
+            refused = Some((states(&out), fetches(&out).len()));
+        } else {
+            parked = Some((states(&out), fetches(&out).len()));
+        }
+    }
+    let (over_states, over_fetches) = refused.expect("ran");
+    let (under_states, under_fetches) = parked.expect("ran");
+    assert_eq!(
+        over_states,
+        vec![State::Busy],
+        "a write over the parking cap was not refused"
+    );
+    assert_eq!(over_fetches, 0, "a refused write asked for blocks anyway");
+    // The control: the cap is what refused it, not the cold path.
+    assert!(
+        under_states.is_empty() && under_fetches > 0,
+        "a write UNDER the same cap, onto the same cold path, was not parked \
+         ({under_states:?}, {under_fetches} fetches) — so the cap is not what \
+         refused the larger one"
+    );
+    println!("  over the cap: Busy with 0 fetches; under it: parked with {under_fetches}");
+}
+
+/// A parked write and a parked read wait on the same block, and both are
+/// answered by its one arrival.
+#[test]
+fn one_arrival_answers_both_a_parked_read_and_a_parked_write() {
+    let (_, root, all) = fixture(400);
+    let cold = Store::fresh();
+    cold.put(root, all.get(&root).expect("the root"));
+    let mut h = started(Mode::Rehydrate, Params::default(), cold.clone(), root);
+
+    // A read of the key the write is about to touch: both descend the same
+    // path, so they stop on the same block.
+    let r = h.step(Event::Get {
+        client: ClientId(1),
+        req_id: ReqId(1),
+        key: b"k/00100".to_vec(),
+    });
+    let w = h.step(write_one("k/00100", b"both"));
+    let shared: Vec<Cid> = fetches(&r)
+        .into_iter()
+        .filter(|i| fetches(&w).contains(i))
+        .collect();
+    assert!(
+        !shared.is_empty(),
+        "the read and the write stopped on different blocks, so this test is \
+         not about one arrival answering two waiters"
+    );
+
+    let mut queue = shared;
+    let (mut answered, mut accepted) = (false, false);
+    let mut guard = 0;
+    while let Some(id) = queue.pop() {
+        guard += 1;
+        assert!(guard < 1000, "neither waiter settled");
+        let bytes = all.get(&id).expect("held");
+        cold.put(id, bytes);
+        let out = h.step(Event::BlockArrived {
+            id,
+            bytes: bytes.to_vec(),
+        });
+        queue.extend(fetches(&out));
+        if states(&out).contains(&State::Accepted) {
+            accepted = true;
+        }
+        if out.iter().any(|f| {
+            matches!(
+                f,
+                Effect::Reply {
+                    result: ReadResult::Value(_),
+                    ..
+                }
+            )
+        }) {
+            answered = true;
+        }
+        if answered && accepted {
+            break;
+        }
+    }
+    assert!(
+        answered,
+        "the read was never answered: the write's arrivals swallowed it"
+    );
+    assert!(
+        accepted,
+        "the write never applied: the read's arrivals swallowed it"
+    );
+    println!("  one block stream answered a parked read and a parked write");
+}

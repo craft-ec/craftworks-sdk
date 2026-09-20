@@ -12,8 +12,10 @@
 
 #![allow(dead_code)]
 
-use engine::{Effect, Engine, Event, Params};
+use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId};
+use freenet_prolly::build::TreeBuilder;
 use freenet_prolly::store::Blocks;
+use freenet_prolly::store::MemBlocks;
 use freenet_prolly::Cid;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -225,4 +227,94 @@ impl Harness {
                 .published_root(),
         }
     }
+}
+
+/// A writer engine holding everything, and the blocks it produced.
+///
+/// A reader is given NONE of them: it starts from a published root and must
+/// fetch its way to an answer, which is the situation a cold reader is
+/// actually in.
+///
+/// Built by driving a real engine, so the fixture is the tree this code
+/// actually writes rather than one a second builder agrees it should be.
+pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
+    // The writer gets a store of ITS OWN. Sharing the thread's store would put
+    // the whole tree where the reader can see it, and every "cold" read below
+    // would be a warm one — which is exactly what happened: five tests failed
+    // with "0 fetches" because nothing was ever cold.
+    let ws = Store::fresh();
+    let mut w = Engine::new(Params::default(), ws.clone());
+    let ops: Vec<(Vec<u8>, Op)> = records
+        .iter()
+        .map(|(k, v)| (k.clone(), Op::Put(v.clone())))
+        .collect();
+    let mut queue = {
+        let out = w.step(Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops,
+        });
+        ws.absorb(&out);
+        out
+    };
+    let mut all = MemBlocks::default();
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the writer did not settle");
+        match f {
+            Effect::PutPack { id, bytes, .. } => {
+                // A pack is a TRANSPORT. What the network ends up holding is
+                // the blocks inside it, under their own ids — that is the
+                // whole point of the format, and a fixture that kept only the
+                // pack would model a network no reader could read.
+                for (mid, mbytes) in engine::pack::members(&bytes) {
+                    all.insert(mid, &mbytes);
+                }
+                all.insert(id, &bytes);
+                let o = w.step(Event::PutConfirmed(id));
+                ws.absorb(&o);
+                queue.extend(o);
+            }
+            Effect::PutBlock { id, bytes, .. } => {
+                all.insert(id, &bytes);
+                let o = w.step(Event::PutConfirmed(id));
+                ws.absorb(&o);
+                queue.extend(o);
+            }
+            Effect::UpdateHead { seq, .. } => {
+                let o = w.step(Event::HeadConfirmed(seq));
+                ws.absorb(&o);
+                queue.extend(o);
+            }
+            Effect::PutParity { id, bytes, .. } => {
+                all.insert(id, &bytes);
+                let o = w.step(Event::PutConfirmed(id));
+                ws.absorb(&o);
+                queue.extend(o);
+            }
+            Effect::Notify {
+                state: State::Published,
+                ..
+            } => {}
+            _ => {}
+        }
+    }
+    (w.published_root(), all)
+}
+
+/// The root a from-scratch build of the same records produces.
+///
+/// This is the oracle that matters: the pipeline may reorder, fold, retry and
+/// coalesce as much as it likes, and the tree it ends up naming must be the
+/// one the library would have built from the final records in one pass. It is
+/// the INDEPENDENT side of the differential -- `tree` above descends from the
+/// engine, and two sides that both did would only prove the engine agrees
+/// with itself.
+pub fn rebuild(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> Cid {
+    let mut t = TreeBuilder::new(|_, _: &[u8]| {});
+    for (k, v) in records {
+        t.push_bytes(k, v).unwrap();
+    }
+    t.finish().unwrap()
 }

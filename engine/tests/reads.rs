@@ -6,7 +6,7 @@
 //! property that differential cannot see.
 
 use engine::read::{ReadResult, ReqId, Via};
-use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId};
+use engine::{ClientId, Effect, Engine, Event, Params};
 use freenet_prolly::range::Range;
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 mod common;
-use common::Store;
+use common::{tree, Store};
 
 fn rng(seed: u64) -> impl FnMut() -> u64 {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -24,77 +24,6 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
         s ^= s << 17;
         s
     }
-}
-
-/// A writer engine holding everything, and the blocks it produced.
-///
-/// The reader is given NONE of them: it starts from a published root and must
-/// fetch its way to an answer, which is the situation a cold reader is
-/// actually in.
-fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
-    // The writer gets a store of ITS OWN. Sharing the thread's store would put
-    // the whole tree where the reader can see it, and every "cold" read below
-    // would be a warm one — which is exactly what happened: five tests failed
-    // with "0 fetches" because nothing was ever cold.
-    let ws = Store::fresh();
-    let mut w = Engine::new(Params::default(), ws.clone());
-    let ops: Vec<(Vec<u8>, Op)> = records
-        .iter()
-        .map(|(k, v)| (k.clone(), Op::Put(v.clone())))
-        .collect();
-    let mut queue = {
-        let out = w.step(Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops,
-        });
-        ws.absorb(&out);
-        out
-    };
-    let mut all = MemBlocks::default();
-    let mut guard = 0;
-    while let Some(f) = queue.pop() {
-        guard += 1;
-        assert!(guard < 100_000, "the writer did not settle");
-        match f {
-            Effect::PutPack { id, bytes, .. } => {
-                // A pack is a TRANSPORT. What the network ends up holding is
-                // the blocks inside it, under their own ids — that is the
-                // whole point of the format, and a fixture that kept only the
-                // pack would model a network no reader could read.
-                for (mid, mbytes) in engine::pack::members(&bytes) {
-                    all.insert(mid, &mbytes);
-                }
-                all.insert(id, &bytes);
-                let o = w.step(Event::PutConfirmed(id));
-                ws.absorb(&o);
-                queue.extend(o);
-            }
-            Effect::PutBlock { id, bytes, .. } => {
-                all.insert(id, &bytes);
-                let o = w.step(Event::PutConfirmed(id));
-                ws.absorb(&o);
-                queue.extend(o);
-            }
-            Effect::UpdateHead { seq, .. } => {
-                let o = w.step(Event::HeadConfirmed(seq));
-                ws.absorb(&o);
-                queue.extend(o);
-            }
-            Effect::PutParity { id, bytes, .. } => {
-                all.insert(id, &bytes);
-                let o = w.step(Event::PutConfirmed(id));
-                ws.absorb(&o);
-                queue.extend(o);
-            }
-            Effect::Notify {
-                state: State::Published,
-                ..
-            } => {}
-            _ => {}
-        }
-    }
-    (w.published_root(), all)
 }
 
 /// A reader that has published the same root but holds no blocks.

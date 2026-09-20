@@ -5,12 +5,11 @@
 //! interleaving a live network produces once a week is an ordinary test here.
 
 use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId};
-use freenet_prolly::build::TreeBuilder;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod common;
-use common::{Harness, Mode, Store};
+use common::{rebuild, Harness, Mode, Store};
 
 fn w(n: u64) -> WriteId {
     WriteId(n)
@@ -113,19 +112,6 @@ fn head_of(effects: &[Effect]) -> Option<(u64, Cid, Vec<Cid>)> {
         Effect::UpdateHead { seq, root, after } => Some((*seq, *root, after.clone())),
         _ => None,
     })
-}
-
-/// The root a from-scratch build of the same records produces.
-///
-/// This is the oracle that matters: the pipeline may reorder, fold, retry and
-/// coalesce as much as it likes, and the tree it ends up naming must be the
-/// one the library would have built from the final records in one pass.
-fn rebuild(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> Cid {
-    let mut t = TreeBuilder::new(|_, _: &[u8]| {});
-    for (k, v) in records {
-        t.push_bytes(k, v).unwrap();
-    }
-    t.finish().unwrap()
 }
 
 fn rng(seed: u64) -> impl FnMut() -> u64 {
