@@ -26,6 +26,18 @@
 //! every log line. Real keys are sdk#14 and phase 6, a passkey-derived device
 //! key that never leaves keycraft, and **nothing here may be reused as that
 //! path.**
+//!
+//! # LOOPBACK ONLY
+//!
+//! Provisioning installs code and hands over a signing key. It is only ever
+//! done against a node on this machine — [`crate::ws_url`] refuses anything
+//! else — and the acks it rests on are that node's own word about its own
+//! store. Against a node somebody else runs, an ack is unauthenticated and
+//! "the contract is installed" would be a stranger's claim.
+//!
+//! Which steps are CONFIRMED and which merely acknowledged is stated per step
+//! by [`Step::confirmed_by_asking`], because the two are different promises
+//! and a caller deserves to know which one it has.
 
 use crate::AckKind;
 
@@ -64,15 +76,35 @@ impl Step {
         Step::Key,
     ];
 
-    /// Which ack answers this step, so a reply can be matched to what asked
-    /// for it rather than to whatever arrived next.
-    pub fn expects(self) -> AckKind {
-        match self {
-            Step::Delegate => AckKind::Registered,
-            Step::BlockContract | Step::RegisterContract => AckKind::Put,
-            // The engine answers a key over the delegate, not the client API.
-            Step::Key => AckKind::Ok,
+    /// Does this ack answer THIS step, for the thing this step actually sent?
+    ///
+    /// **Matched by NAME, never by kind alone.** Both contract steps send a
+    /// `Put` and get a `Put` back, so kind alone let a duplicate ack of the
+    /// first contract complete the second — a run reporting a contract
+    /// installed that had never been sent. The node names what it is
+    /// answering; this compares it.
+    ///
+    /// `named` is what this step put on the wire: the delegate's key, or the
+    /// contract instance id.
+    pub fn answered_by(self, named: &str, ack: &AckKind) -> bool {
+        match (self, ack) {
+            (Step::Delegate, AckKind::Registered(k)) => k == named,
+            (Step::BlockContract | Step::RegisterContract, AckKind::Put(k)) => k == named,
+            // The key is proved by asking, not by an ack — see `Confirmed`.
+            (Step::Key, AckKind::Ok) => true,
+            _ => false,
         }
+    }
+
+    /// Whether this step's completion is CONFIRMED or merely acknowledged.
+    ///
+    /// Stated per step, because the two are different promises and a caller
+    /// deserves to know which it has. `Identity` proves the delegate is
+    /// registered and the engine has a key — it answers, which an unregistered
+    /// delegate cannot. The contract puts rest on the node's ack, which on
+    /// loopback is the node's own word about its own store.
+    pub fn confirmed_by_asking(self) -> bool {
+        matches!(self, Step::Delegate | Step::Key)
     }
 }
 
@@ -111,13 +143,24 @@ impl Provisioned {
 /// registered because a contract went in.
 pub struct Provisioner {
     at: usize,
-    waiting: bool,
+    /// What the step in flight PUT on the wire, so its ack can be matched to
+    /// it rather than to whatever arrived next.
+    in_flight: Option<(Step, String, u64)>,
     done: Provisioned,
-    /// Steps the caller said are already in place, so they are not redone.
     known: Vec<Step>,
-    /// Acks that did not match what was asked for. Counted, because a node
-    /// answering something nobody asked is worth seeing rather than ignoring.
+    /// Acks that did not answer the step in flight. Counted: a node answering
+    /// something nobody asked for is worth seeing.
     pub unexpected: usize,
+    /// How long a step may go unanswered before it is reported stalled.
+    ///
+    /// Acks can take a minute or never arrive at all (F20), so a provisioner
+    /// with no clock waits for ever on the first one that goes missing — and
+    /// the page shows nothing while it does.
+    pub stall_after_ms: u64,
+    /// The step that stalled, if one has.
+    stalled: Option<Step>,
+    /// Why the run stopped, in the node's own words. Display only.
+    refused: Option<(Step, String)>,
 }
 
 impl Default for Provisioner {
@@ -130,10 +173,13 @@ impl Provisioner {
     pub fn new() -> Provisioner {
         Provisioner {
             at: 0,
-            waiting: false,
+            in_flight: None,
             done: Provisioned::default(),
             known: Vec::new(),
             unexpected: 0,
+            stall_after_ms: 30_000,
+            stalled: None,
+            refused: None,
         }
     }
 
@@ -149,66 +195,120 @@ impl Provisioner {
         }
     }
 
-    /// The next step to perform, or `None` when there is nothing to do.
+    /// The next step to perform.
     ///
-    /// Returns `None` while a step is in flight: one at a time.
+    /// Takes no clock: the moment a step went out is recorded by [`sent`], by
+    /// the caller that actually sent it. A time passed here would be the time
+    /// the step was CHOSEN, and a stall is measured from when it left.
+    ///
+    /// [`sent`]: Provisioner::sent
+    ///
+    /// Returns `None` while a step is in flight: one at a time, because the
+    /// node answers on one connection and a second outstanding step would make
+    /// the two acks tell-apart-able only by name — which is why the name is
+    /// carried, but one at a time is still the simpler guarantee.
     pub fn next_step(&mut self) -> Option<Step> {
-        if self.waiting {
+        if self.in_flight.is_some() {
             return None;
         }
         while self.at < Step::ALL.len() {
             let step = Step::ALL[self.at];
             if self.known.contains(&step) {
-                // Recorded as ALREADY THERE rather than skipped silently —
-                // a run that says nothing about a step is a run that cannot
-                // be checked for completeness.
                 self.done.steps.push((step, Did::AlreadyThere));
                 self.at += 1;
                 continue;
             }
-            self.waiting = true;
             return Some(step);
         }
         None
     }
 
+    /// Record what the page actually sent for the step it just took.
+    ///
+    /// Separate from `next_step` because only the caller knows the key: it
+    /// framed the request.
+    pub fn sent(&mut self, step: Step, named: &str, now_ms: u64) {
+        self.in_flight = Some((step, named.to_string(), now_ms));
+        self.stalled = None;
+    }
+
     /// An ack arrived.
     ///
-    /// Matched against what the step EXPECTS. An ack of the wrong kind does
-    /// not advance anything: it is counted and the step stays in flight,
-    /// because believing it would record an install that did not happen.
-    pub fn on_ack(&mut self, kind: AckKind) {
-        if !self.waiting {
+    /// It completes the step in flight only if it ANSWERS it — same step, same
+    /// name. Anything else is counted and changes nothing, because believing
+    /// it records an install that did not happen.
+    pub fn on_ack(&mut self, ack: &AckKind) {
+        let Some((step, named, _)) = self.in_flight.clone() else {
             self.unexpected += 1;
             return;
-        }
-        let step = Step::ALL[self.at];
-        if kind != step.expects() {
+        };
+        if !step.answered_by(&named, ack) {
             self.unexpected += 1;
             return;
         }
         self.done.steps.push((step, Did::Installed));
         self.at += 1;
-        self.waiting = false;
+        self.in_flight = None;
     }
 
-    /// The node refused the step in flight.
+    /// Nothing has answered for too long.
+    ///
+    /// Returns the stalled step the first time it notices. The step stays in
+    /// flight and may be RE-ISSUED — every step here is idempotent, which is
+    /// exactly the property that makes a re-issue safe and exactly the
+    /// property that made matching acks by kind dangerous.
+    pub fn tick(&mut self, now_ms: u64) -> Option<Step> {
+        let (step, _, at) = self.in_flight.as_ref()?;
+        if now_ms.saturating_sub(*at) < self.stall_after_ms {
+            return None;
+        }
+        if self.stalled == Some(*step) {
+            return None;
+        }
+        self.stalled = Some(*step);
+        Some(*step)
+    }
+
+    /// Send the stalled step again. Safe because every step is idempotent.
+    pub fn reissue(&mut self) -> Option<Step> {
+        let (step, _, _) = self.in_flight.as_ref()?;
+        let step = *step;
+        self.in_flight = None;
+        self.stalled = None;
+        Some(step)
+    }
+
+    pub fn stalled(&self) -> Option<Step> {
+        self.stalled
+    }
+
+    /// The node refused the step in flight, in its own words.
     ///
     /// Provisioning STOPS. The steps are ordered because each depends on the
     /// last, so carrying on would install a contract for a delegate that is
-    /// not there — and the failure would surface at the first write, a long
-    /// way from here.
-    pub fn on_refused(&mut self) {
-        self.waiting = false;
+    /// not there — and the failure would surface at the first write.
+    ///
+    /// `said` is kept for DISPLAY only. It is the node's wording, so nothing
+    /// branches on it: see [`crate::Refused`].
+    pub fn on_refused(&mut self, said: &str) {
+        let step = self.in_flight.as_ref().map(|(s, _, _)| *s);
+        if let Some(step) = step {
+            self.refused = Some((step, said.to_string()));
+        }
+        self.in_flight = None;
         self.at = Step::ALL.len();
     }
 
-    /// What has been done so far.
+    /// Which step was refused, and what the node said. Display only.
+    pub fn refused(&self) -> Option<(Step, &str)> {
+        self.refused.as_ref().map(|(s, w)| (*s, w.as_str()))
+    }
+
     pub fn result(&self) -> &Provisioned {
         &self.done
     }
 
     pub fn in_flight(&self) -> bool {
-        self.waiting
+        self.in_flight.is_some()
     }
 }

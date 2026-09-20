@@ -146,16 +146,30 @@ pub enum Incoming {
     Partial,
 }
 
-/// Which request an [`Incoming::Ack`] answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which request an [`Incoming::Ack`] answers — and WHICH ONE.
+///
+/// **Every ack that can name what it answers, does.** The first version had a
+/// bare `Put`, so two contract installs both expected `Put` and either one's
+/// ack completed the other: a duplicate acknowledgement of the FIRST contract
+/// advanced the SECOND, and the run reported a contract installed that had
+/// never been sent. "One step in flight" does not help, because the ack that
+/// arrives need not be this step's.
+///
+/// The node names them: `DelegateResponse` carries a `DelegateKey`
+/// (`client_events.rs:773`), `PutResponse` and `SubscribeResponse` carry a
+/// `ContractKey`. Pairing by position when the answer names itself is the
+/// defect; carrying the name is the fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckKind {
-    /// A delegate was registered.
-    Registered,
-    /// A contract was put.
-    Put,
-    /// A subscription was taken.
-    Subscribed,
-    /// Something that needed no answer succeeded.
+    /// A delegate was registered, and which.
+    Registered(String),
+    /// A contract was put, and which.
+    Put(String),
+    /// A subscription was taken, and on what.
+    Subscribed(String),
+    /// Something that needed no answer succeeded. Names nothing because there
+    /// is nothing to name — and a step must not rely on this one to identify
+    /// itself.
     Ok,
 }
 
@@ -364,7 +378,7 @@ fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
 fn classify(r: HostResponse) -> Incoming {
     use freenet_stdlib::client_api::ContractResponse;
     match r {
-        HostResponse::DelegateResponse { values, .. } => {
+        HostResponse::DelegateResponse { key, values } => {
             let mut out: Vec<Vec<u8>> = Vec::new();
             for v in values {
                 if let OutboundDelegateMsg::ApplicationMessage(m) = v {
@@ -376,7 +390,7 @@ fn classify(r: HostResponse) -> Incoming {
                 // node ACKNOWLEDGING — RegisterDelegate answers this way. The
                 // first version called it unusable, which turned the ordinary
                 // reply to the first message of every session into an error.
-                Incoming::Ack(AckKind::Registered)
+                Incoming::Ack(AckKind::Registered(key.to_string()))
             } else {
                 Incoming::EngineBytes(out)
             }
@@ -386,11 +400,11 @@ fn classify(r: HostResponse) -> Incoming {
                 key: key.to_string(),
             }
         }
-        HostResponse::ContractResponse(ContractResponse::PutResponse { .. }) => {
-            Incoming::Ack(AckKind::Put)
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+            Incoming::Ack(AckKind::Put(key.to_string()))
         }
-        HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. }) => {
-            Incoming::Ack(AckKind::Subscribed)
+        HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, .. }) => {
+            Incoming::Ack(AckKind::Subscribed(key.to_string()))
         }
         HostResponse::Ok => Incoming::Ack(AckKind::Ok),
         // A kind this build has no use for. NAMED, so a failure says which:
