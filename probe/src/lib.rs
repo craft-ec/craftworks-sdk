@@ -358,7 +358,12 @@ mod tests {
             .parent()
             .expect("the workspace root is the probe's parent");
         let mut checked = 0usize;
-        for pkg in ["engine", "craftworks-sdk"] {
+        // `protocol` is here too, and for a sharper reason than the others:
+        // it is carried by BOTH wasm binaries — the delegate's and the
+        // browser SDK's — so a dependency added to it is one every one of
+        // them pays for, on a download every new node makes.
+        const GUARDED: [&str; 3] = ["engine", "craftworks-sdk", "protocol"];
+        for pkg in GUARDED {
             let out = std::process::Command::new(env!("CARGO"))
                 .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
                 .current_dir(root)
@@ -387,9 +392,14 @@ mod tests {
             }
             checked += 1;
         }
+        // Derived from the list, not written as a number: the last time
+        // this was a literal, adding a package to the list made the gate
+        // fail on its own floor rather than on anything it guards.
         assert_eq!(
-            checked, 2,
-            "only {checked} package(s) were checked; both must be"
+            checked,
+            GUARDED.len(),
+            "only {checked} of {} guarded package(s) were checked",
+            GUARDED.len()
         );
     }
 }

@@ -45,7 +45,7 @@ bincode = "1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
-members = ["engine", "engine-delegate", "probe-delegate", "probe"]
+members = ["engine", "engine-delegate", "probe-delegate", "probe", "protocol"]
 
 [profile.release]
 opt-level = "s"
