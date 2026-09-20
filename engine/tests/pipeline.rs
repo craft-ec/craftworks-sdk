@@ -174,13 +174,16 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
         packs.iter().copied().collect::<BTreeSet<_>>(),
         "UpdateHead does not name every block it depends on"
     );
-    assert_eq!(seen.of(1, 1), &[State::Accepted, State::Durable]);
+    // No state between Accepted and Published: what the head does not name
+    // was never published, so nothing before the head moves can be promised
+    // to survive a restart.
+    assert_eq!(seen.of(1, 1), &[State::Accepted]);
 
     let out = e.step(Event::HeadConfirmed(seq));
     seen.absorb(&out);
     assert_eq!(
         seen.of(1, 1),
-        &[State::Accepted, State::Durable, State::Published],
+        &[State::Accepted, State::Published],
         "states must arrive once each, in order"
     );
 }

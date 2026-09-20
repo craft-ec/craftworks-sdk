@@ -55,8 +55,14 @@ pub enum Op {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum State {
     Accepted,
-    Durable,
     Published,
+    /// This engine has never heard of that write.
+    ///
+    /// After a restart, what the head does not name was never published and
+    /// is gone. A client holding the id in its outbox is TOLD so, and
+    /// re-submits. Silence would leave it waiting on a write nobody will ever
+    /// finish — which is the one outcome a client cannot recover from.
+    Lost,
     ParityComplete,
     Failed,
     /// Refused without being accepted: the backlog is full.
@@ -105,6 +111,51 @@ pub enum Event {
     /// A bounded attempt ended without an answer. Not a failure of the read:
     /// the next attempt is issued, until the budget runs out.
     BlockMissed(Cid),
+
+    // ---- recovery ----
+    /// A new engine value, holding only its device key and the epoch table.
+    ///
+    /// Where the authority came from is STATED here, never inferred: an
+    /// engine that invented its own would be a second writer for the same
+    /// device (sdk#14).
+    Start {
+        key: KeySource,
+        /// Code epochs to try, newest first. An engine's own head may still
+        /// sit under the previous epoch after an upgrade.
+        epochs: Vec<Epoch>,
+    },
+    HeadRead {
+        epoch: Epoch,
+        seq: u64,
+        root: Cid,
+    },
+    /// No head under any epoch: a brand-new device, empty tree, seq 0.
+    HeadMissing,
+    /// Another engine holds this device key and is ahead. The loser re-reads
+    /// and rebases; it never publishes a fork.
+    HeadConflict {
+        seq: u64,
+        root: Cid,
+    },
+    /// A client asking after a write it still holds in its outbox.
+    AskWrite {
+        client: ClientId,
+        write_id: WriteId,
+    },
+}
+
+/// Which code epoch a head was written under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Epoch(pub u32);
+
+/// Where this engine's authority came from.
+///
+/// Stated at `Start` and never inferred. The engine does not mint authority:
+/// it is handed some, or it has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySource {
+    SecretStore,
+    Reissued,
 }
 
 /// A group's three parity ids. The unit redundancy comes in: three blocks are
@@ -160,6 +211,10 @@ pub enum Effect {
         levels_done: usize,
         levels_total: usize,
     },
+
+    // ---- recovery ----
+    /// Read this device's own head, under this epoch.
+    ReadHead { epoch: Epoch },
 }
 
 /// Everything tunable, in one place, so nothing downstream reads a literal.
@@ -222,6 +277,24 @@ pub struct Params {
     /// Count the nodes a descent would touch. It is a second walk, for the
     /// cost gate and nothing else, so it is off unless a test asks.
     pub count_descent: bool,
+    /// Ticks a write may sit merely ACCEPTED — in memory, in no commit —
+    /// before the engine stops promising anything about it.
+    ///
+    /// `accepted` survives a refresh and not a restart, so it is exposure,
+    /// and exposure has to be bounded rather than journalled: only the head
+    /// makes anything findable, and a write not yet in a commit is not on its
+    /// way to a head. One commit is in flight at a time, so a write arriving
+    /// behind a commit that cannot publish would otherwise wait for ever.
+    /// At T it is reported `Failed`, which is a reply the SDK can re-submit
+    /// from its outbox — unlike silence.
+    pub max_accept_age: u64,
+    /// Off = the control: writes fold for ever behind a stuck commit.
+    pub bound_accept_age: bool,
+    /// Emit the head as soon as the commit is planned, without waiting for
+    /// its packs to be read back. The control for (c): a head that names a
+    /// root whose blocks are not all there is a tree no reader can walk, and
+    /// a crash in that window leaves one behind for ever.
+    pub head_before_packs: bool,
 }
 
 impl Default for Params {
@@ -244,6 +317,9 @@ impl Default for Params {
             fetch_greedily: false,
             pin_parked_reads: true,
             count_descent: false,
+            max_accept_age: 64,
+            bound_accept_age: true,
+            head_before_packs: false,
         }
     }
 }
@@ -322,6 +398,14 @@ pub struct Engine {
     /// "swap one for two" without drifting. `ParityComplete` is a state of the
     /// WRITE — reported once, when this set empties.
     parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<ParityIds>>,
+    /// When the oldest write not yet in a commit was accepted.
+    folded_since: Option<u64>,
+    /// Where this engine's authority came from, as STATED at `Start`.
+    key: Option<KeySource>,
+    /// Epochs still to try when looking for this device's head.
+    epochs: Vec<Epoch>,
+    head_epoch: Option<Epoch>,
+    recovered: bool,
     /// Notifications raised while applying a write — a group superseded part
     /// way through — collected here so `on_write` can return them with the
     /// rest rather than dropping them.
@@ -395,6 +479,11 @@ impl Engine {
             owed: BTreeMap::new(),
             in_flight_parity: BTreeMap::new(),
             parity_waiting: BTreeMap::new(),
+            folded_since: None,
+            key: None,
+            epochs: Vec::new(),
+            head_epoch: None,
+            recovered: false,
             pending_notifications: Vec::new(),
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
@@ -461,7 +550,121 @@ impl Engine {
             Event::Preload { client, roots } => self.on_preload(client, roots),
             Event::BlockArrived { id, bytes } => self.on_arrived(id, bytes),
             Event::BlockMissed(id) => self.on_missed(id),
+            Event::Start { key, epochs } => self.on_start(key, epochs),
+            Event::HeadRead { epoch, seq, root } => self.on_head_read(epoch, seq, root),
+            Event::HeadMissing => self.on_head_missing(),
+            Event::HeadConflict { seq, root } => self.on_head_conflict(seq, root),
+            Event::AskWrite { client, write_id } => self.on_ask(client, write_id),
         }
+    }
+
+    /// A new engine value, holding only its device key.
+    ///
+    /// NOTHING IS REPLAYED. What the head does not name was never published:
+    /// a pack's key is its content hash, so an engine that restarts with only
+    /// its device key cannot enumerate packs its head does not name, and a
+    /// separate journal would not remove the crash window — it would move it,
+    /// at a PUT and a read-back on every commit. So the head is the journal,
+    /// and recovery is reading it.
+    fn on_start(&mut self, key: KeySource, epochs: Vec<Epoch>) -> Vec<Effect> {
+        self.key = Some(key);
+        self.epochs = epochs;
+        self.recovered = false;
+        // Newest epoch first: this engine's own head may still sit under the
+        // previous one after an upgrade, and the first write after recovery
+        // goes to the current one either way.
+        match self.epochs.first().copied() {
+            Some(epoch) => vec![Effect::ReadHead { epoch }],
+            None => self.on_head_missing(),
+        }
+    }
+
+    fn on_head_read(&mut self, epoch: Epoch, seq: u64, root: Cid) -> Vec<Effect> {
+        self.head_epoch = Some(epoch);
+        self.adopt(seq, root);
+        self.recovered = true;
+        // The tree is not walked here. Reads warm it lazily (slice 2), which
+        // is also what makes a restart cheap: the engine is usable the moment
+        // it knows its root.
+        Vec::new()
+    }
+
+    /// No head under the newest epoch: try the one before it, and only when
+    /// they are exhausted is this a device that has never written.
+    fn on_head_missing(&mut self) -> Vec<Effect> {
+        if !self.epochs.is_empty() {
+            self.epochs.remove(0);
+        }
+        if let Some(epoch) = self.epochs.first().copied() {
+            return vec![Effect::ReadHead { epoch }];
+        }
+        let mut blocks = MemBlocks::default();
+        let root = init(&mut blocks);
+        self.blocks = blocks;
+        self.warm_bytes = 0;
+        self.adopt(0, root);
+        self.recovered = true;
+        Vec::new()
+    }
+
+    /// Another engine holds this device key and is ahead.
+    ///
+    /// The Register refuses the lower or equal seq, so the loser here is the
+    /// one that must give way: it takes the winner's head and rebases what it
+    /// had accepted on top. It never publishes a fork — there is only ever one
+    /// head, and the writes that were in flight are re-applied to the tree
+    /// that won.
+    fn on_head_conflict(&mut self, seq: u64, root: Cid) -> Vec<Effect> {
+        let rebasing: Vec<(ClientId, WriteId)> = self
+            .pending
+            .take()
+            .map(|c| c.writes)
+            .into_iter()
+            .flatten()
+            .chain(std::mem::take(&mut self.folded))
+            .collect();
+        self.folded_bytes = 0;
+        self.folded_since = None;
+        self.unpublished.clear();
+        self.coded_since_commit.clear();
+        self.adopt(seq, root);
+
+        // The writes are not silently dropped and not silently re-applied:
+        // their EDITS are gone with the commit that never published, so the
+        // clients are told, and re-submit against the head that won.
+        rebasing
+            .into_iter()
+            .map(|(client, write_id)| Effect::Notify {
+                client,
+                write_id,
+                state: State::Lost,
+            })
+            .collect()
+    }
+
+    /// A client asking after a write this engine has never heard of.
+    fn on_ask(&mut self, client: ClientId, write_id: WriteId) -> Vec<Effect> {
+        let known = self.folded.iter().any(|(_, w)| *w == write_id)
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|c| c.writes.iter().any(|(_, w)| *w == write_id))
+            || self.parity_waiting.keys().any(|(_, w)| *w == write_id);
+        if known {
+            return Vec::new();
+        }
+        vec![Effect::Notify {
+            client,
+            write_id,
+            state: State::Lost,
+        }]
+    }
+
+    fn adopt(&mut self, seq: u64, root: Cid) {
+        self.root = root;
+        self.published_root = root;
+        self.published_seq = seq;
+        self.next_seq = seq + 1;
     }
 
     /// Try a read, reply if it is answerable now, park it if it is not.
@@ -662,6 +865,7 @@ impl Engine {
         out.extend(std::mem::take(&mut self.pending_notifications));
         self.folded.push((client, write_id));
         self.folded_bytes += size;
+        self.folded_since.get_or_insert(self.now);
         if self.pending.is_none() {
             let to_ship = self.take_unpublished();
             out.extend(self.start_commit(to_ship));
@@ -883,6 +1087,7 @@ impl Engine {
         let seq = self.next_seq;
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
+        self.folded_since = None;
 
         // Big values do not ride in a pack: one PUT each, and the pack stays
         // within a size the network is willing to move.
@@ -968,6 +1173,7 @@ impl Engine {
     }
 
     fn on_confirmed(&mut self, id: Cid) -> Vec<Effect> {
+        let head_early = self.params.head_before_packs;
         let mut out = Vec::new();
         // A parity block landing: the group it belongs to is that much closer
         // to having redundancy.
@@ -989,21 +1195,20 @@ impl Engine {
         if !c.data.contains(&id) || !c.confirmed.insert(id) {
             return out;
         }
-        if c.confirmed.len() < c.data.len() || c.head_sent {
+        if c.head_sent || (!head_early && c.confirmed.len() < c.data.len()) {
             return out;
         }
-        // Every block of this commit has been READ BACK from our own node, so
-        // the writes in it survive a restart. Only now may the head move: a
-        // head naming a root whose blocks are not all there is a tree readers
-        // cannot walk.
+        // Every block of this commit has been READ BACK from our own node.
+        // Only now may the head move: a head naming a root whose blocks are
+        // not all there is a tree readers cannot walk.
+        //
+        // No state is reported here. `Durable` used to be, and it promised a
+        // recovery nobody can perform: a pack's key is its content hash, so a
+        // restarted engine holding only its device key cannot enumerate packs
+        // its head does not name. Only the HEAD makes anything findable, so
+        // the head is the journal and `published` is the first state that
+        // survives a restart.
         c.head_sent = true;
-        for (client, write_id) in &c.writes {
-            out.push(Effect::Notify {
-                client: *client,
-                write_id: *write_id,
-                state: State::Durable,
-            });
-        }
         out.push(Effect::UpdateHead {
             seq: c.seq,
             root: c.root,
@@ -1137,13 +1342,54 @@ impl Engine {
 
     fn on_tick(&mut self, now: u64) -> Vec<Effect> {
         self.now = now;
+        let mut out = self.age_out_accepted(now);
         if !self.params.coalesce_parity {
-            return Vec::new();
+            return out;
         }
         let age = self.params.parity_age;
         // A group that did not change this tick has settled; one that keeps
         // changing goes out anyway once it has been unprotected long enough.
-        self.emit_parity(move |o: &Owed| o.last_changed < now || now.saturating_sub(o.since) >= age)
+        out.extend(self.emit_parity(move |o: &Owed| {
+            o.last_changed < now || now.saturating_sub(o.since) >= age
+        }));
+        out
+    }
+
+    /// Stop promising anything about a write that has sat merely accepted too
+    /// long.
+    ///
+    /// If nothing is in flight the answer is simply to commit it, and that
+    /// happens first. What this bounds is the other case: a commit that
+    /// cannot publish, with writes folding behind it. Those writes are told
+    /// `Failed` so a client can re-submit them, because the alternative is an
+    /// unbounded number of writes the engine has promised nothing about and
+    /// said nothing about either.
+    fn age_out_accepted(&mut self, now: u64) -> Vec<Effect> {
+        // Nothing in flight and something waiting: commit it rather than age
+        // it out. This is the case a failed commit leaves behind.
+        if self.pending.is_none() && !self.folded.is_empty() {
+            let to_ship = self.take_unpublished();
+            return self.start_commit(to_ship);
+        }
+        if !self.params.bound_accept_age {
+            return Vec::new();
+        }
+        let Some(since) = self.folded_since else {
+            return Vec::new();
+        };
+        if now.saturating_sub(since) < self.params.max_accept_age {
+            return Vec::new();
+        }
+        let aged = std::mem::take(&mut self.folded);
+        self.folded_bytes = 0;
+        self.folded_since = None;
+        aged.into_iter()
+            .map(|(client, write_id)| Effect::Notify {
+                client,
+                write_id,
+                state: State::Failed,
+            })
+            .collect()
     }
 
     fn emit_parity(&mut self, want: impl Fn(&Owed) -> bool) -> Vec<Effect> {
