@@ -218,7 +218,19 @@ async fn main() -> Result<()> {
             println!("node: using the node already at {ws} (not spawning one)");
             None
         }
-        None => Some(Node::spawn(port, &dir)?),
+        None => {
+            // PROBE_NET spawns an ISOLATED network-mode node instead: the
+            // only kind that answers a delegate-write question, and the kind
+            // a live acceptance run needs. It joins nothing.
+            let m = if std::env::var("PROBE_NET").is_ok() {
+                probe::node::Mode::IsolatedNetwork {
+                    network_port: port + 20000,
+                }
+            } else {
+                probe::node::Mode::Local
+            };
+            Some(Node::spawn_in(port, &dir, m)?)
+        }
     };
     let ws_url = match (&existing, &node) {
         (Some(ws), _) => ws.clone(),
@@ -228,9 +240,14 @@ async fn main() -> Result<()> {
     // A node this probe spawned is `local local` by construction. A borrowed
     // one must be DECLARED, and an undeclared one is not assumed to be the
     // convenient case.
-    let mode = match &existing {
-        None => "local".to_string(),
-        Some(_) => std::env::var("PROBE_MODE").unwrap_or_else(|_| "unstated".into()),
+    let mode = match (&existing, &node) {
+        // Read off the node this probe actually started, not off the request:
+        // the two can differ, and the one that matters is what is running.
+        (None, Some(n)) => match n.mode {
+            probe::node::Mode::Local => "local".to_string(),
+            probe::node::Mode::IsolatedNetwork { .. } => "network".to_string(),
+        },
+        _ => std::env::var("PROBE_MODE").unwrap_or_else(|_| "unstated".into()),
     };
     println!("node: mode = {mode}");
     println!(
@@ -565,6 +582,69 @@ async fn main() -> Result<()> {
             "(8b) INCONCLUSIVE — the control GET failed too, so this says \
              nothing about the delegate PUT"
         ),
+    }
+
+    // ---- (9) does a delegate-written state SURVIVE a node restart? ----
+    //
+    // The hosting cache is in-memory interest state; the contract store is
+    // not. So "hosted" and "still there tomorrow" are different questions,
+    // and a state that is hosted now may be readable-but-unhosted, or gone,
+    // after a restart. Only a node this probe started can be restarted.
+    match node.as_mut() {
+        None => println!(
+            "(9) NOT ASKED: this probe did not spawn the node, and it \
+             restarts only its own"
+        ),
+        Some(n) => {
+            println!("(9) restarting the node...");
+            drop(client);
+            n.restart()?;
+            let (stream, _) = tokio_tungstenite::connect_async(n.ws()).await?;
+            let mut client = WebApi::start(stream);
+            // The delegate registration does not survive; the secrets and the
+            // contract store do. Re-register so the sync read can be asked.
+            let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &DelegateCode::from(wasm.clone()),
+                &Parameters::from(vec![]),
+            ))));
+            let _ = timeout(
+                STEP,
+                client.send(ClientRequest::DelegateOp(
+                    DelegateRequest::RegisterDelegate {
+                        delegate,
+                        cipher: [0u8; 32],
+                        nonce: [0u8; 24],
+                    },
+                )),
+            )
+            .await;
+            let _ = timeout(Duration::from_secs(2), client.recv()).await;
+
+            let said = ask(&mut client, &key, &Ask::ReadState { id: id8 }).await?;
+            let sync_after = matches!(said, Some(Said::State { len: Some(_), .. }));
+            let get_after = get_ok(&mut client, &c8.key().clone()).await;
+            // The control: the CLIENT-put state, through the same restart.
+            // Without it, "gone" would not distinguish a delegate-written
+            // state being dropped from the node losing everything.
+            let control_after = get_ok(&mut client, &container.key().clone()).await;
+            println!("(9) after restart — delegate-put: sync read {sync_after}, GET {get_after}");
+            println!("(9) after restart — client-put  (control): GET {control_after}");
+            match (control_after, get_after) {
+                (true, true) => println!(
+                    "(9) a delegate-written state survives a restart, like a \
+                     client-written one"
+                ),
+                (true, false) => println!(
+                    "(9) a delegate-written state does NOT survive a restart \
+                     while a client-written one does — they are not on the \
+                     same footing"
+                ),
+                (false, _) => println!(
+                    "(9) INCONCLUSIVE — the control did not survive either, so \
+                     this says nothing about the delegate-written one"
+                ),
+            }
+        }
     }
 
     println!("done");
