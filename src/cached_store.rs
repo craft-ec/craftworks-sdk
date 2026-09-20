@@ -17,7 +17,7 @@
 
 use crate::copy::{Copy, Refused};
 use crate::engine_client::Client;
-use crate::store::{Delta, Edit, Read, Reads, Store, StoreError};
+use crate::store::{Delta, Edit, Read, Reads, RowState, Store, StoreError};
 use protocol::Request;
 
 /// Reads from the copy; writes to the pump and, optimistically, to the copy.
@@ -28,6 +28,14 @@ pub struct CachedStore {
     /// Writes refused by the copy's own bound, so a caller that did not check
     /// the return can still find out. Drained.
     pub refused: Vec<(u64, Refused)>,
+    /// Keys whose last write was rolled back.
+    ///
+    /// Kept because the fact outlives the pending entry: the moment a write
+    /// is rolled back it stops being pending, and a row asking afterwards
+    /// would be told `Clean` — "saved" — about a write that never landed.
+    /// That is the worst answer available, so the key is remembered until
+    /// something is written to it again.
+    rolled_back: std::collections::BTreeSet<Vec<u8>>,
     /// The clock, handed in for the same reason the traces' is: this crate
     /// compiles to wasm and to a host binary and must not reach for one.
     now_ms: Box<dyn Fn() -> u64>,
@@ -40,6 +48,7 @@ impl CachedStore {
             client: Client::new(),
             next_write_id: 1,
             refused: Vec::new(),
+            rolled_back: std::collections::BTreeSet::new(),
             now_ms,
         }
     }
@@ -95,7 +104,10 @@ impl CachedStore {
     /// Roll back anything that has waited too long for a verdict.
     pub fn tick(&mut self) -> crate::copy::Told {
         let now = (self.now_ms)();
-        self.copy.time_out(now)
+        let told = self.copy.time_out(now);
+        self.rolled_back
+            .extend(told.rolled_back_keys.iter().cloned());
+        told
     }
 
     fn submit(&mut self, edits: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
@@ -108,6 +120,11 @@ impl CachedStore {
         // made: sending it while showing nothing would put the row and the
         // network permanently out of step with no way to notice.
         for (k, v) in &edits {
+            // A key being written again is no longer a key whose last write
+            // was rolled back. Clearing it here rather than on success is
+            // deliberate: from this moment the row has something in flight
+            // to report, which is a truer answer than the old failure.
+            self.rolled_back.remove(k);
             if let Err(why) = self.copy.write(k, v.clone(), write_id, now) {
                 self.refused.push((write_id, why));
                 // Anything already applied for this write comes back off, so a
@@ -164,6 +181,24 @@ impl Store for CachedStore {
 }
 
 impl Reads for CachedStore {
+    /// What this key's own write is doing, from the local copy.
+    ///
+    /// `Unknown` when the key is not loaded — **never `Clean`**. "I have not
+    /// looked" is not "there is nothing in flight", and a row that said
+    /// "saved" about a write it cannot see is the exact failure `NOT_LOADED`
+    /// exists to prevent, one layer up.
+    fn row_state(&self, key: &[u8]) -> RowState {
+        if self.rolled_back.contains(key) {
+            return RowState::RolledBack;
+        }
+        match self.copy.get(key) {
+            None => RowState::Unknown,
+            Some(crate::copy::Visible::Clean(_)) => RowState::Clean,
+            Some(crate::copy::Visible::Queued(_, _)) => RowState::Queued,
+            Some(crate::copy::Visible::Pending(_, _)) => RowState::Pending,
+        }
+    }
+
     fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
         match self.copy.get(key) {
             Some(v) => Ok(v.value().map(|b| b.to_vec())),
