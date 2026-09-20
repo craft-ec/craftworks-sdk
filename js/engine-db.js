@@ -82,6 +82,16 @@ export function engineDb(handle) {
   // Bindings this app is showing, by domain, so a head move can re-run them.
   const bound = new Map();   // domain -> Set<callback>
 
+  // EVERY binding on a domain, live or not. Distinct from `bound`, which is
+  // only the LIVE ones — a plain binding takes out no watch, and that is the
+  // whole cost difference between them. But a plain binding must still see
+  // its own client's writes: `live` decides whether somebody ELSE'S change
+  // reaches you, never whether your own does.
+  const mine = new Map();    // domain -> Set<binding.reload>
+
+  /** This client changed `domain` itself: re-run every binding on it. */
+  const touched = domain => { for (const r of mine.get(domain) ?? []) r(); };
+
   /**
    * The head moved: re-run the bindings the SESSION says are stale.
    *
@@ -95,9 +105,9 @@ export function engineDb(handle) {
    * wearing a different name.
    */
   const reloadStale = () => {
-    let stale;
-    try { stale = JSON.parse(session.take_stale()); } catch (_) { return; }
-    for (const domain of stale) for (const cb of bound.get(domain) ?? []) cb();
+    let changed;
+    try { changed = JSON.parse(session.take_stale()); } catch (_) { return; }
+    for (const domain of changed) for (const cb of bound.get(domain) ?? []) cb();
   };
 
   /** Wait for the load this read is parked on. */
@@ -173,13 +183,26 @@ export function engineDb(handle) {
       try { return session.define(domain, JSON.stringify(schema)); } catch (e) { rethrow(e); }
     },
     async put(domain, fields) {
-      try { return JSON.parse(session.put(domain, JSON.stringify(fields))); } catch (e) { rethrow(e); }
+      let r;
+      try { r = JSON.parse(session.put(domain, JSON.stringify(fields))); } catch (e) { rethrow(e); }
+      // A person's OWN write shows at once. It changes `base + pending` and
+      // not the root, so nothing else would tell this binding — and a row
+      // that appeared only after the network confirmed it would make the
+      // optimistic copy pointless.
+      touched(domain);
+      return r;
     },
     async update(domain, id, patch) {
-      try { return JSON.parse(session.update(domain, id, JSON.stringify(patch))); } catch (e) { rethrow(e); }
+      let r;
+      try { r = JSON.parse(session.update(domain, id, JSON.stringify(patch))); } catch (e) { rethrow(e); }
+      touched(domain);
+      return r;
     },
     async delete(domain, id) {
-      try { return session.delete(domain, id); } catch (e) { rethrow(e); }
+      let r;
+      try { r = session.delete(domain, id); } catch (e) { rethrow(e); }
+      touched(domain);
+      return r;
     },
 
     // ---- reads: a NOT_LOADED queues a load, waits for it, asks once more ----
@@ -218,22 +241,45 @@ export function engineDb(handle) {
         // every identity change would re-render for ever otherwise.
         getSnapshot: () => rows,
         subscribe: cb => { listeners.add(cb); return () => listeners.delete(cb); },
+        /**
+         * Bring the rows up to date.
+         *
+         * It ASKS. The first version compared the copy's root and returned
+         * early when it had not moved — and the copy's root moves only when a
+         * delta or a page arrives, so a reload that only read could never
+         * show anything new. Nothing sent `ChangesSince`, so the root never
+         * moved, and a tab that made no write could never see another's.
+         *
+         * The answer comes back through `drain`, which re-runs this binding
+         * if the delta moved anything. So this returns whether the ROWS THIS
+         * CLIENT CAN SEE changed — which includes its own pending writes,
+         * because those are visible before any engine has confirmed them.
+         */
         async reload() {
-          // The root first: a reload with nothing to do reads nothing.
-          const r = self.root();
-          if (r && r === root) return false;
+          session.refresh_domain(domain);
           const next = await self.scan(domain);
-          root = r;
+          root = self.root();
           if (same(rows, next)) return false;
           rows = next;
           for (const cb of listeners) cb();
           return true;
         },
       };
-      // A live binding is re-run when the SESSION says this domain is stale.
-      // A plain one takes out no watch at all, which is the whole cost
-      // difference between them.
-      if (live) b.stop = self.watch(domain, () => { b.reload(); });
+      // Its own client's writes reach it whatever `live` says.
+      const rerun = () => { b.reload(); };
+      if (!mine.has(domain)) mine.set(domain, new Set());
+      mine.get(domain).add(rerun);
+
+      // A LIVE binding is additionally re-run when the session says this
+      // domain is stale — that is, when somebody else changed it. A plain one
+      // takes out no watch at all, which is the whole cost difference.
+      const unwatch = live ? self.watch(domain, rerun) : null;
+      b.stop = () => {
+        unwatch?.();
+        const set = mine.get(domain);
+        set?.delete(rerun);
+        if (set && set.size === 0) mine.delete(domain);
+      };
       b.reload();
       return b;
     },
