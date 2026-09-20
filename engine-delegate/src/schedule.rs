@@ -21,9 +21,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// What one `process()` return is allowed to carry.
 ///
-/// Defaults are the live limits as measured (F15, F21), and are parameters
-/// because they are the node's numbers and not the engine's: a node that
-/// raises them should not need a change here, only a different value.
+/// Defaults are the live limits as measured, and are parameters because they
+/// are the node's numbers and not the engine's: a node that raises them
+/// should not need a change here, only a different value.
+///
+/// `max_puts` is the same number as the core's `max_commit_blocks`, and that
+/// is not a coincidence — a pack's bytes do not survive the call that made
+/// them, so a commit goes out in one return or not at all. 128 is the
+/// largest k measured to work (k = 1..128, each acknowledged, zero errors);
+/// the node never refused, so this is where the search stopped rather than
+/// where the limit is.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_gets: usize,
@@ -34,7 +41,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_gets: 4,
-            max_puts: 8,
+            max_puts: 128,
         }
     }
 }

@@ -399,11 +399,24 @@ pub struct Params {
     pub max_parked_reads: usize,
     /// Blocks one commit may name.
     ///
-    /// The commit's bookkeeping carries a Cid for every block it is waiting
-    /// on, about 60 B each in the context (measured). `max_backlog` bounds a
-    /// commit in BYTES, which says nothing about how many blocks those bytes
-    /// become: eight megabytes of small values is thousands of them, and the
-    /// context would not fit. This is the bound that closes the arithmetic.
+    /// TWO bounds meet here and they are one number.
+    ///
+    /// The context: a commit's bookkeeping carries a Cid per block it waits
+    /// on, ~54 B each (measured), and `max_backlog` bounds a commit in BYTES
+    /// which says nothing about how many blocks those bytes become.
+    ///
+    /// The PLATFORM: a pack's bytes exist only in the return that made them
+    /// (`Commit::packs` is `#[serde(skip)]`, deliberately — a pack is the
+    /// largest thing the engine touches and the context is 400 KiB), so the
+    /// shell cannot hold a put back for the next entry. Whatever a commit
+    /// emits must go out in ONE `process()` return.
+    ///
+    /// 128 is the largest k MEASURED to work: k = 1..128 PUTs from one
+    /// return, each acknowledged, zero errors, on a private network-mode
+    /// node. The limit was NOT reached — 128 is where the search stopped,
+    /// not where the node refused. F21's "8" was a probe's `--max-k` default
+    /// that had been read as a platform constant; this is a measurement, and
+    /// it stays a measurement rather than becoming the next inherited number.
     pub max_commit_blocks: usize,
     /// Blocks one call may read while recomputing owed parity.
     ///
@@ -448,7 +461,7 @@ impl Default for Params {
             max_apply_rounds: 32,
             max_parked_write_bytes: 128 * 1024,
             max_parked_reads: 1000,
-            max_commit_blocks: 2048,
+            max_commit_blocks: 128,
             max_parity_scan_blocks: 512,
             head_before_packs: false,
         }

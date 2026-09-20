@@ -883,6 +883,13 @@ fn a_single_key_write_parses_nodes_in_proportion_to_depth() {
     let measure = |whole: bool| -> usize {
         let mut e = common::new_store_params(Params {
             whole_tree_supersede_scan: whole,
+            // The 10,000-key SEED below is a fixture, not a live commit. The
+            // commit cap exists because a pack's bytes do not survive the
+            // `process()` return that made them, and nothing here returns;
+            // capping the seed would mean this test could only ever measure
+            // a tree one commit deep, which is the opposite of what it is
+            // for. The single-key write it then measures IS under the cap.
+            max_commit_blocks: usize::MAX,
             ..Params::default()
         });
         let mut seen = Seen::default();
