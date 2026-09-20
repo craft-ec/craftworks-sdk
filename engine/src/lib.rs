@@ -26,6 +26,52 @@
 //! have no redundancy. That is *absent redundancy, not an error*
 //! (ARCHITECTURE §7): a keeper's repair and the writer's late put are the same
 //! bytes under the same id, so nothing has to be flagged, only done.
+//!
+//! # THE RULE FOR ADDING ANYTHING HERE
+//!
+//! **Every call is a rehydration. State that only matters ACROSS calls has to
+//! be IN the context, or it does not exist.**
+//!
+//! This engine reads as an ordinary long-lived state machine, and in its own
+//! tests it is one — a `Vec<Effect>` is driven to completion in a single
+//! process. In production it never is. A delegate gets a fresh linear memory
+//! on every `process()` call (F32); the engine is rebuilt from
+//! [`Engine::from_context_or_new`] and thrown away at the end of the call,
+//! and the only thing that survives is what [`Engine::to_context`] wrote.
+//!
+//! So a field is not "state the engine keeps". It is state the engine keeps
+//! *for the rest of this call*, unless the context carries it. The failure
+//! mode is silent by construction: the field holds its default at the top of
+//! every call, the code reads it, takes the early return, and reports
+//! nothing.
+//!
+//! Four defects of exactly this shape have been found, and all four were
+//! invisible to every test in `engine/tests/` because those tests drive one
+//! process:
+//!
+//! * `in_flight_since` (sdk#81) — the stall timer. `None` at the top of every
+//!   call but the one that started the commit, so `Stalled` could never be
+//!   reported at all;
+//! * `told_stalled` (sdk#81) — which writes had been told. Without it the
+//!   notice repeats on every tick, which is noise a caller learns to ignore;
+//! * `in_flight_parity` (sdk#83) — the map from a parity block to its group.
+//!   The ack arrives in a LATER call, so no group ever settled and the same
+//!   three blocks went out on every tick for ever;
+//! * the delegate scheduler's `confirmed` set (sdk#83) — not engine state,
+//!   but the same rule one layer out. It learns what the node holds from
+//!   acks in THIS call, so a `PutParity` gated `after: [published_root]` was
+//!   held on a dependency nothing would confirm, and dropped. Every call.
+//!
+//! The question to ask of any new field, effect dependency or deadline:
+//! **what does this hold at the top of a call that did not create it, and is
+//! that the right answer?** If the honest answer is "whatever it defaults
+//! to", either carry it — and bump `CONTEXT_VERSION` — or derive it from
+//! something already carried, which is better: two copies of one fact can
+//! disagree, and a derived one cannot. `Owed::sent` is derived from
+//! `in_flight_parity` for that reason rather than carried beside it.
+//!
+//! And the test has to span calls. An assertion that passes on an engine
+//! driven straight through proves nothing about this.
 
 use freenet_prolly::apply::{apply_with, ApplyError, Edit as TreeEdit, Options as ApplyOptions};
 use freenet_prolly::chunk::empty_leaf;

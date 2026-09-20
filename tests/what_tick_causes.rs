@@ -394,3 +394,45 @@ fn the_stall_timer_costs_almost_nothing() {
          the budget: the stall timer is not what costs, but something is"
     );
 }
+
+/// **THE ENGINE'S DEADLINES ARE COUNTS OF `protocol::TICK_MS`.**
+///
+/// `parity_age` is 32 and `max_accept_age` is 64, and they read as 32 and 64
+/// SECONDS only because the page quantises its clock at a second. Move
+/// `TICK_MS` and every deadline in the engine rescales at once, silently,
+/// with nothing failing — 64 would become 64 of whatever the new quantum is.
+///
+/// Two crates, no shared dependency (`engine` does not depend on `protocol`),
+/// so nothing but this can hold them together. It is a tripwire, not a
+/// calculation: it does not say what the right numbers are, only that
+/// changing one side without the other is a decision somebody has to make
+/// rather than a default they can walk past.
+#[test]
+fn the_engine_s_bounds_are_stated_in_the_page_s_unit() {
+    let p = engine::Params::default();
+    assert_eq!(
+        protocol::TICK_MS,
+        1_000,
+        "TICK_MS moved. `parity_age` ({}) and `max_accept_age` ({}) are COUNTS \
+         of it, so they now mean {} and {} of the new quantum rather than the \
+         seconds their docs claim. Convert them in the same commit, or say in \
+         `Params` what the unit is now — and then update this test to the new \
+         pair.",
+        p.parity_age,
+        p.max_accept_age,
+        p.parity_age,
+        p.max_accept_age
+    );
+    // The seconds those two numbers are asserted to mean, spelled out so the
+    // failure above can name them.
+    assert_eq!(
+        p.parity_age * protocol::TICK_MS / 1_000,
+        32,
+        "parity_age is documented as 32 seconds"
+    );
+    assert_eq!(
+        p.max_accept_age * protocol::TICK_MS / 1_000,
+        64,
+        "max_accept_age is documented as 64 seconds"
+    );
+}

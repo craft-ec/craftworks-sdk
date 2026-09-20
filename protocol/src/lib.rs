@@ -706,8 +706,51 @@ fn classify(e: &bincode::Error) -> Dropped {
 /// # And the quantum is what the engine's bounds are in
 ///
 /// `Params::parity_age` and `Params::max_accept_age` are counts of this
-/// unit. At `TICK_MS = 1000` they read as seconds, which is why they can
-/// stay the plain numbers they are.
+/// unit. **At `TICK_MS = 1000` they read as seconds, and only then.** They
+/// are plain small numbers because of this constant, so moving it rescales
+/// every deadline in the engine at once: 32 and 64 become 32 and 64 of
+/// whatever the new quantum is, silently, with nothing failing. Anyone
+/// changing it converts those params in the same commit, or states in
+/// `Params` what the new unit is.
+///
+/// # A CLIENT'S clock, and what that client can do with it
+///
+/// The engine has no clock of its own, so this is not a client HELPING with
+/// the time — it is the only time there is. A client therefore decides WHEN
+/// the engine acts, and the honest way to read the guarantee is: a delegate
+/// trusts the wall clock of whoever is connected to it.
+///
+/// That is fine for the case this is built for — a person's own node, driven
+/// by their own tabs. It is worth writing down what it means when it is not.
+///
+/// A client that lies about the time can:
+///
+/// * **make deadlines fire early**, by sending a number far in the future.
+///   Owed parity goes out before it has coalesced, and a commit in flight is
+///   reported `Stalled` sooner than it deserves. Both cost work, and neither
+///   is wrong about the DATA;
+/// * **make deadlines not fire**, by sending a number that never advances.
+///   Owed parity waits and a stuck commit is never called stalled. This is
+///   exactly the state before anything sent time at all, so it is a denial
+///   of the deadlines, not a corruption.
+///
+/// It cannot:
+///
+/// * **change what is written.** Time decides WHEN, never WHAT: every effect
+///   a tick produces is one the engine already owed, computed from the tree
+///   and not from the number. `Tick` carries no keys, no values and no root;
+/// * **move a deadline backwards for somebody else in a way that loses
+///   data.** `now` going down makes things look young again — work is
+///   delayed, not undone — and the age comparisons saturate rather than
+///   wrap;
+/// * **be told apart from an honest client by the engine**, which is the
+///   actual limit: a delegate's context is shared by every connection (F47),
+///   so the LAST tick wins and there is nowhere to record whose it was.
+///
+/// The bound that matters, then, is on who may connect to a node's delegate,
+/// not on what this field says. A shared delegate whose clients are not all
+/// trusted needs the time to come from somewhere they do not control, and
+/// nothing here provides that.
 pub const TICK_MS: u64 = 1_000;
 
 /// The wall clock in the unit [`Request::Tick`] carries.
