@@ -302,3 +302,48 @@ fn the_shell_works_when_rebuilt_from_its_context_between_every_call() {
     );
     println!("  rebuilt from context on every call: {guard} calls, states {every_state:?}");
 }
+
+/// A write before `Install` is refused, and COUNTED, not left hanging.
+///
+/// A delegate cannot fabricate a contract — it has no way to produce wasm —
+/// so the code must arrive from outside. Until it has, a PUT is one the node
+/// would refuse anyway; dropping it here is the same outcome without the
+/// round trip. What must not happen is silence: a client that never sent
+/// `Install` would otherwise see its write accepted and then nothing.
+#[test]
+fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
+    let store = Store::default();
+    let mut without: Shell<Store> =
+        Shell::resume_with(&[], Params::default(), store.clone(), false);
+    let out = without.handle(vec![Inbound::Client(write_req())]);
+    assert_eq!(
+        states(&out.replies).first(),
+        Some(&State::Accepted),
+        "the write was not even accepted"
+    );
+    assert!(
+        !out.ops
+            .iter()
+            .any(|o| matches!(o, engine_delegate::schedule::Op::Put { .. })),
+        "a put was built with no contract code to build it from"
+    );
+    assert!(
+        out.refused_no_code > 0,
+        "the put was dropped without being counted, so a client that never \
+         sent Install sees its write accepted and then nothing at all"
+    );
+
+    // The control: the same write with the code on hand DOES put. Otherwise
+    // this test would pass over a shell that never puts anything.
+    let mut with: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
+    let out = with.handle(vec![Inbound::Client(write_req())]);
+    assert!(
+        out.ops
+            .iter()
+            .any(|o| matches!(o, engine_delegate::schedule::Op::Put { .. })),
+        "the same write did not put even WITH the code, so the refusal above \
+         is not the missing code doing it"
+    );
+    assert_eq!(out.refused_no_code, 0);
+    println!("  no code: write accepted, put refused and counted; with code: put issued");
+}

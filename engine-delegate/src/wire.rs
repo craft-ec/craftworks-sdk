@@ -12,6 +12,15 @@ use freenet_prolly::Cid;
 /// What a client asks the engine to do.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Request {
+    /// Give the delegate the contract code it will write with.
+    ///
+    /// A delegate CANNOT fabricate a contract — it has no way to produce
+    /// wasm — so the code must arrive from outside, once, and be kept. It
+    /// goes in the SECRET store rather than the context: secrets are on disk
+    /// and survive a node restart (measured), while the context is process
+    /// memory with a ten-minute TTL. Code that had to be re-sent after every
+    /// restart would make the delegate useless exactly when it is left alone.
+    Install { block_code: Vec<u8> },
     /// Begin. The shell answers by reading the head.
     Start { epochs: Vec<u32> },
     Write {

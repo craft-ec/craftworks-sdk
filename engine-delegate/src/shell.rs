@@ -48,6 +48,11 @@ pub enum Inbound {
 pub struct Outbound {
     pub ops: Vec<Op>,
     pub replies: Vec<Vec<u8>>,
+    /// Puts dropped because the delegate has no contract code yet.
+    ///
+    /// Counted, not silent: a client that never sent `Install` would
+    /// otherwise see its write accepted and then nothing at all.
+    pub refused_no_code: usize,
     /// Effects still waiting at the end of the call, and therefore LOST.
     ///
     /// The scheduler does not survive the call — nothing in a delegate does
@@ -84,6 +89,14 @@ pub struct Shell<B: Blocks> {
     pub engine: Engine<B>,
     awaiting: BTreeSet<Cid>,
     head: Option<(u64, Cid)>,
+    /// Bytes of contract code this call was asked to install, if any.
+    pub installed: Option<usize>,
+    /// Whether the delegate has the contract code it writes with.
+    ///
+    /// Supplied by the entry point from the secret store, because only the
+    /// entry point has one. Kept as a bool rather than the bytes: the shell
+    /// decides WHETHER a put can be built, and the entry point builds it.
+    has_code: bool,
     pub limits: Limits,
 }
 
@@ -95,6 +108,11 @@ impl<B: Blocks> Shell<B> {
     /// in flight `Lost`. So an unreadable context is a fresh start, not an
     /// error — and never a panic, because the bytes come from outside.
     pub fn resume(ctx: &[u8], params: Params, blocks: B) -> Self {
+        Self::resume_with(ctx, params, blocks, true)
+    }
+
+    /// As `resume`, saying whether the contract code is on hand.
+    pub fn resume_with(ctx: &[u8], params: Params, blocks: B, has_code: bool) -> Self {
         let carried: Option<Carried> = bincode::deserialize(ctx).ok();
         // A context the shell cannot read and one the ENGINE refuses are the
         // same outcome: start fresh. Never a panic — these bytes come from
@@ -115,6 +133,8 @@ impl<B: Blocks> Shell<B> {
             // it did not resume, so they go with it.
             awaiting: if resumed { awaiting } else { BTreeSet::new() },
             head: if resumed { head } else { None },
+            installed: None,
+            has_code,
             limits: Limits::default(),
         }
     }
@@ -172,6 +192,16 @@ impl<B: Blocks> Shell<B> {
         }
 
         out.ops = sched.take(self.limits);
+        // No code, no put. A delegate cannot fabricate a contract, so a PUT
+        // before `Install` is one the node would refuse anyway. Refusing it
+        // HERE reports it — `refused_no_code` — where letting it go would
+        // spend a round trip to be told the same thing, and the commit would
+        // then wait on a confirmation that is never coming.
+        if !self.has_code {
+            let before = out.ops.len();
+            out.ops.retain(|o| !matches!(o, Op::Put { .. }));
+            out.refused_no_code = before - out.ops.len();
+        }
         // A head that is going out now is one to read back later. Recorded
         // HERE, where it is known to have been issued — recording it when the
         // core emitted it would remember a head the scheduler was still
@@ -187,6 +217,13 @@ impl<B: Blocks> Shell<B> {
 
     fn on_request(&mut self, r: Request) -> Vec<Effect> {
         let ev = match r {
+            // Handled by the entry point, which is the only place with a
+            // secret store. The shell records that it was asked, so a caller
+            // can tell "installed" from "the message never arrived".
+            Request::Install { block_code } => {
+                self.installed = Some(block_code.len());
+                return Vec::new();
+            }
             Request::Start { epochs } => Event::Start {
                 // The device key: sdk#14 decides where it comes from. Until
                 // then the engine is told where it BELIEVES the key came

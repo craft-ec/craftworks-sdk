@@ -54,12 +54,25 @@ impl DelegateInterface for EngineDelegate {
             _ => Inbound::Other,
         };
 
-        let (out, saved) = {
+        let code = ctx.get_secret(BLOCK_CODE);
+        let (out, saved, installing) = {
             let blocks = NodeBlocks::new(ctx);
-            let mut shell = Shell::resume(&carried, Params::default(), blocks);
+            let mut shell = Shell::resume_with(&carried, Params::default(), blocks, code.is_some());
             let out = shell.handle(vec![msg]);
-            (out, shell.to_context())
+            (out, shell.to_context(), shell.installed)
         };
+        // The install is the one thing the shell cannot do itself: only the
+        // entry point has a secret store. Done AFTER the blocks are dropped,
+        // since writing a secret needs the ctx mutably.
+        if installing.is_some() {
+            if let InboundDelegateMsg::ApplicationMessage(m) = &inbound {
+                if let Some(crate::wire::Request::Install { block_code }) =
+                    crate::wire::request(m.payload.as_ref())
+                {
+                    ctx.set_secret(BLOCK_CODE, &block_code);
+                }
+            }
+        }
 
         // A context that cannot be written is not an error to report: the
         // next call starts fresh, re-reads the head, and reports whatever was
@@ -79,15 +92,17 @@ impl DelegateInterface for EngineDelegate {
                 }
                 Op::Put { id, bytes } => {
                     let _ = id;
+                    let Some(code) = code.clone() else {
+                        // The shell already dropped these; belt and braces.
+                        continue;
+                    };
                     // The contract carrying a block: its parameters are the
                     // hash of the state, which is what makes the id the block
                     // id the engine asked for.
                     let params = Parameters::from(blake3_of(&bytes));
-                    let container =
-                        ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
-                            std::sync::Arc::new(ContractCode::from(block_code())),
-                            params,
-                        )));
+                    let container = ContractContainer::from(ContractWasmAPIVersion::V1(
+                        WrappedContract::new(std::sync::Arc::new(ContractCode::from(code)), params),
+                    ));
                     msgs.push(OutboundDelegateMsg::PutContractRequest(
                         PutContractRequest::new(
                             container,
@@ -110,15 +125,14 @@ impl DelegateInterface for EngineDelegate {
     }
 }
 
-/// The Block contract's code, supplied by whoever registers the delegate.
+/// Where the Block contract's code is kept.
 ///
-/// A delegate cannot fabricate a contract, so the code must come from
-/// outside. Until the registration path carries it (slice 4's live run), this
-/// is empty and a PUT built on it is refused by the node — which is the
-/// honest failure: better a refusal than a contract nobody can validate.
-fn block_code() -> Vec<u8> {
-    Vec::new()
-}
+/// The SECRET store, not the context: secrets are on disk and survive a node
+/// restart (measured), while the context is process memory with a ten-minute
+/// TTL. Code that had to be re-sent after every restart would make the
+/// delegate useless exactly when it is left alone, which is the case it
+/// exists for.
+const BLOCK_CODE: &[u8] = b"block_contract_code";
 
 fn blake3_of(bytes: &[u8]) -> Vec<u8> {
     freenet_prolly::block_id(freenet_prolly::kind::RAW, bytes).to_vec()
