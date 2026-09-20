@@ -202,6 +202,25 @@ impl Node {
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");
 
+        // What this call handed to the node, counted by the shell itself and
+        // recorded HERE — the client side holds the ring, never the delegate
+        // (its context budget belongs to the commit in flight, and its secret
+        // store's quota is shared with key material).
+        for (key, value) in [
+            (Key::BytesOut, out.put_bytes as u64),
+            (Key::Ops, (out.puts + out.gets) as u64),
+            (Key::Effects, out.effects as u64),
+            (Key::Awaiting, out.awaiting as u64),
+            (Key::ReadBack, out.read_back_hits as u64),
+            (Key::Stranded, out.stranded as u64),
+        ] {
+            self.rec.event(Event::Counter {
+                site: NODE,
+                op,
+                entry: Entry { key, value },
+            });
+        }
+
         // What the rehydration cost, per call. The context is a 400 KiB budget
         // shared with in-flight commit state (F31), so a fixture that could not
         // show it growing would hide the thing most likely to go wrong.
@@ -256,6 +275,19 @@ impl Node {
     /// trait the code under test holds has no read-back.
     pub fn recording(&self) -> instrument::Recording<'_> {
         self.rec.recording()
+    }
+
+    /// Bytes this node handed to the delegate's node ops, and the ops counted,
+    /// read back from the RECORDING rather than from a tally kept beside it.
+    pub fn put_bytes(&self) -> u64 {
+        self.recording()
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Counter { entry, .. } if entry.key == Key::BytesOut => Some(entry.value),
+                _ => None,
+            })
+            .sum()
     }
 
     /// The context size after the last call — the budget most likely to be

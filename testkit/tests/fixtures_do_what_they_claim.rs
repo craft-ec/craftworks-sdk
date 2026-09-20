@@ -87,3 +87,58 @@ fn the_unprobed_constructor_is_the_awkward_one() {
     assert_eq!(probed.puts(), 0);
     assert_eq!(bare.puts(), 0);
 }
+
+/// The per-call node-op counts are the SHELL's, recorded on the client side.
+///
+/// They are counted where the delegate already knows them, which is the only
+/// place they can be known honestly: six external instruments failed to infer
+/// a PUT's cost from outside (freenet-contracts#39), because an interface
+/// carries the whole machine and a rate counter's baseline varies by more than
+/// the signal. The counter belongs inside the thing being measured — and the
+/// RING belongs to the client, never to the delegate's context or its secret
+/// store.
+#[test]
+fn a_call_reports_the_bytes_it_handed_to_the_node() {
+    use instrument::{vocab::Key, Event};
+
+    let mut node = Node::new();
+    let _ = node.step(Vec::new());
+
+    // Whatever the call did, the recording's BytesOut must equal the bytes the
+    // shell actually put — asserted against the events rather than against a
+    // second tally, because a second tally is what disagrees.
+    let from_events: u64 = node
+        .recording()
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            Event::Counter { entry, .. } if entry.key == Key::BytesOut => Some(entry.value),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        node.put_bytes(),
+        from_events,
+        "the accessor and the recording are the same number: {}",
+        node.line()
+    );
+
+    // Stranded must be zero — it is recorded rather than asserted inside the
+    // shell so a non-zero one is visible without arithmetic, and this is where
+    // it is checked.
+    let stranded: u64 = node
+        .recording()
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            Event::Counter { entry, .. } if entry.key == Key::Stranded => Some(entry.value),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        stranded,
+        0,
+        "effects left queued when a call ended are LOST: {}",
+        node.dump("stranded")
+    );
+}
