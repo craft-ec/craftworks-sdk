@@ -34,24 +34,37 @@ fn contracts_repo() -> Option<PathBuf> {
     if beside.join("block/Cargo.toml").is_file() {
         return Some(beside);
     }
-    // In a worktree: find the checkout this one belongs to.
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(manifest)
-        .args(["rev-parse", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let common = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim().to_string());
+    // In a worktree, find the checkout this one belongs to — by READING, not
+    // by asking git.
+    //
+    // A worktree's `.git` is a file holding `gitdir: <main>/.git/worktrees/<name>`.
+    // Parsing it needs no subprocess, and that matters here: the main checkout
+    // is shared with other sessions, and a `git` invocation against a
+    // repository someone else is merging in can fail for reasons that have
+    // nothing to do with the pin. This gate failed that way twice, which for a
+    // gate is the worst failure mode — it cried wolf about a skew that did not
+    // exist, and a gate people learn to re-run is a gate people learn to
+    // ignore.
+    let gitdir = std::fs::read_to_string(manifest.join(".git")).ok()?;
+    let common = PathBuf::from(gitdir.trim().strip_prefix("gitdir:")?.trim());
     let common = if common.is_absolute() {
         common
     } else {
         manifest.join(common)
     };
-    // <main repo>/.git → <main repo> → its sibling.
-    let main = common.parent()?;
+    // <main>/.git/worktrees/<name> → walk up to the checkout that owns it.
+    let main = common
+        .ancestors()
+        .find(|p| {
+            p.join("block/Cargo.toml").is_file() || p.file_name().is_some_and(|n| n == ".git")
+        })
+        .and_then(|p| {
+            if p.file_name().is_some_and(|n| n == ".git") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        })?;
     let beside = main.join("../freenet-contracts");
     beside.join("block/Cargo.toml").is_file().then_some(beside)
 }

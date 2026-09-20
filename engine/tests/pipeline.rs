@@ -784,3 +784,102 @@ fn impossible_params_are_refused_where_they_are_set() {
     };
     let _ = Engine::new(ok);
 }
+
+/// A write whose group is re-coded before its parity goes out waits for the
+/// NEW coding, not for the one that was abandoned.
+///
+/// `ParityComplete` means *every group that currently covers what this write
+/// changed has its parity on the network*. It must never mean *nothing is
+/// outstanding under this write's name*: when a later write re-codes a group,
+/// the earlier write's data has not gone anywhere — it now sits in the newer
+/// coding, whose parity is not out either. Reporting completion there tells a
+/// client that redundancy exists for its data when none does, and a client
+/// that believes it has no reason ever to check again.
+///
+/// The control is the old behaviour, and it runs: with the transfer off, A is
+/// reported complete while B's parity is still owed.
+#[test]
+fn a_write_whose_group_is_re_coded_waits_for_the_new_coding() {
+    let big = |b: u8| vec![b; 1500];
+    let seed: Vec<(Vec<u8>, Op)> = (0..24u32)
+        .map(|i| (format!("k/{i:03}").into_bytes(), Op::Put(big(i as u8))))
+        .collect();
+
+    // Returns: was A complete before B's parity was confirmed, and how many
+    // ParityComplete notifications A got in total.
+    let run = |transfer: bool| -> (bool, usize) {
+        let mut e = Engine::new(Params {
+            transfer_superseded_waiters: transfer,
+            ..Params::default()
+        });
+        let mut seen = Seen::default();
+        commit(&mut e, &mut seen, write(1, 1, seed.clone()));
+
+        // A: touches one key. Its commit codes the group holding it.
+        let a = commit(
+            &mut e,
+            &mut seen,
+            write(1, 2, vec![put("k/005", &big(0xAA))]),
+        );
+        assert!(
+            parity_puts(&a).is_empty(),
+            "A's parity went out immediately, so it was never superseded and \
+             this test is about nothing"
+        );
+        // B: re-codes the SAME group, before any parity has been put.
+        let b = commit(
+            &mut e,
+            &mut seen,
+            write(1, 3, vec![put("k/005", &big(0xBB))]),
+        );
+        let _ = b;
+
+        let a_done_early = seen.of(1, 2).contains(&State::ParityComplete);
+
+        // Now let the parity go out and be confirmed.
+        let mut queue: Vec<Effect> = Vec::new();
+        for t in 1..=4 {
+            let out = e.step(Event::Tick(t));
+            seen.absorb(&out);
+            queue.extend(out);
+        }
+        let mut guard = 0;
+        while let Some(f) = queue.pop() {
+            guard += 1;
+            assert!(guard < 5_000, "the run did not settle");
+            if let Effect::PutParity { id, .. } = f {
+                let out = e.step(Event::PutConfirmed(id));
+                seen.absorb(&out);
+                queue.extend(out);
+            }
+        }
+        let total = seen
+            .of(1, 2)
+            .iter()
+            .filter(|s| **s == State::ParityComplete)
+            .count();
+        (a_done_early, total)
+    };
+
+    let (early_with_transfer, total_with_transfer) = run(true);
+    let (early_without, _) = run(false);
+
+    assert!(
+        !early_with_transfer,
+        "A was reported ParityComplete while the group covering its data had \
+         no parity on the network"
+    );
+    assert_eq!(
+        total_with_transfer, 1,
+        "A must reach ParityComplete exactly once, after the coding that now \
+         covers it is confirmed"
+    );
+    // The control: without the transfer, A completes early. If this does not
+    // happen the two runs are the same run and the assertion above is idle.
+    assert!(
+        early_without,
+        "the control did not complete A early, so it is not the old behaviour \
+         and proves nothing about the new one"
+    );
+    println!("  with transfer: A completes once, after the new coding; control completes it early");
+}

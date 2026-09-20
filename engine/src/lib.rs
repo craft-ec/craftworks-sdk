@@ -133,6 +133,11 @@ pub struct Params {
     /// to the tree's size on every write. Kept as the control for the cost
     /// bound — a bound nothing can blow is not a bound.
     pub whole_tree_supersede_scan: bool,
+    /// Move a superseded group's waiters onto the groups that replaced it.
+    /// Off, a write whose group is re-coded is reported `ParityComplete`
+    /// immediately — which is the control, and a false durability claim: its
+    /// data now sits in a coding whose parity is not on the network.
+    pub transfer_superseded_waiters: bool,
 }
 
 impl Default for Params {
@@ -144,6 +149,7 @@ impl Default for Params {
             parity_age: 32,
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
+            transfer_superseded_waiters: true,
         }
     }
 }
@@ -215,14 +221,13 @@ pub struct Engine {
     owed: BTreeMap<ParityIds, Owed>,
     /// Parity blocks emitted and awaiting confirmation, back to their group.
     in_flight_parity: BTreeMap<Cid, ParityIds>,
-    /// Which writes are waiting on which group, so ParityComplete is reported
-    /// to the right writes.
-    parity_owners: BTreeMap<ParityIds, Vec<(ClientId, WriteId)>>,
-    /// How many of its own commit's groups each write is still waiting on.
-    /// ParityComplete is a state of the WRITE, so it is reported once, when
-    /// this reaches zero — not once per group, which for a 4,000-key write
-    /// was seven notifications for one write id.
-    parity_left: BTreeMap<(ClientId, WriteId), usize>,
+    /// The groups each write is still waiting on.
+    ///
+    /// A SET and not a count, because a superseded group is replaced by the
+    /// groups that now cover the same members, and a count cannot express
+    /// "swap one for two" without drifting. `ParityComplete` is a state of the
+    /// WRITE — reported once, when this set empties.
+    parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<ParityIds>>,
     /// Notifications raised while applying a write — a group superseded part
     /// way through — collected here so `on_write` can return them with the
     /// rest rather than dropping them.
@@ -233,6 +238,14 @@ pub struct Engine {
     /// afterwards is the same answer computed again, more expensively and
     /// with a chance of disagreeing.
     unpublished: Vec<(Cid, Vec<u8>)>,
+    /// Groups CODED since the last commit shipped.
+    ///
+    /// Not "everything currently owed": that includes groups an earlier
+    /// commit coded and has not yet put, and waiting on those makes a write's
+    /// `ParityComplete` depend on redundancy for data it never touched. It
+    /// also hides a superseded group behind the others, so the write never
+    /// notices the one covering ITS data was replaced.
+    coded_since_commit: BTreeSet<ParityIds>,
     /// Nodes parsed on the write path. A cost counter, not a statistic: the
     /// whole point of the diff walk is that this stays proportional to the
     /// tree's DEPTH, and a test that does not measure it would not notice the
@@ -279,10 +292,10 @@ impl Engine {
             folded_bytes: 0,
             owed: BTreeMap::new(),
             in_flight_parity: BTreeMap::new(),
-            parity_owners: BTreeMap::new(),
-            parity_left: BTreeMap::new(),
+            parity_waiting: BTreeMap::new(),
             pending_notifications: Vec::new(),
             unpublished: Vec::new(),
+            coded_since_commit: BTreeSet::new(),
             nodes_parsed: 0,
             now: 0,
         }
@@ -535,16 +548,17 @@ impl Engine {
             .filter(|(key, o)| !o.sent && gone.contains(&key[0]))
             .map(|(key, _)| *key)
             .collect();
+        // What now covers the members those groups held.
+        let replacements: BTreeSet<ParityIds> = by_group.keys().copied().collect();
         for key in dropped {
             self.owed.remove(&key);
-            // Anyone waiting on it is waiting on a put that will now never
-            // happen. Settling here is what stops a superseded group from
-            // silently withholding a write's last state.
-            let n = self.settle_group(key);
+            self.coded_since_commit.remove(&key);
+            let n = self.transfer_waiters(key, &replacements);
             self.pending_notifications.extend(n);
         }
 
         for (key, blocks) in by_group {
+            self.coded_since_commit.insert(key);
             let e = self.owed.entry(key).or_insert(Owed {
                 blocks: blocks.clone(),
                 last_changed: now,
@@ -569,22 +583,61 @@ impl Engine {
     /// happen, on purpose.
     fn settle_group(&mut self, group: ParityIds) -> Vec<Effect> {
         let mut out = Vec::new();
-        let Some(owners) = self.parity_owners.remove(&group) else {
-            return out;
-        };
-        for w in owners {
-            let Some(left) = self.parity_left.get_mut(&w) else {
-                continue;
-            };
-            *left = left.saturating_sub(1);
-            if *left == 0 {
-                self.parity_left.remove(&w);
-                out.push(Effect::Notify {
-                    client: w.0,
-                    write_id: w.1,
-                    state: State::ParityComplete,
-                });
+        let mut done: Vec<(ClientId, WriteId)> = Vec::new();
+        for (w, waiting) in self.parity_waiting.iter_mut() {
+            if waiting.remove(&group) && waiting.is_empty() {
+                done.push(*w);
             }
+        }
+        for w in done {
+            self.parity_waiting.remove(&w);
+            out.push(Effect::Notify {
+                client: w.0,
+                write_id: w.1,
+                state: State::ParityComplete,
+            });
+        }
+        out
+    }
+
+    /// A group was re-coded before its parity went out. The write that is
+    /// waiting on it must now wait on whatever covers those members INSTEAD.
+    ///
+    /// Not settled. The write's data did not go away — it sits in the newer
+    /// coding, whose parity is not on the network either, so reporting
+    /// `ParityComplete` here would tell a client that redundancy exists for
+    /// its data when none does. `ParityComplete` means *every group that
+    /// currently covers what this write changed has its parity on the
+    /// network*, never *nothing is outstanding under this write's name*.
+    ///
+    /// The transfer is deliberately generous: every group the superseding
+    /// write coded, not an attempt to work out which one inherited these
+    /// members. Over-waiting delays a notification; a false completion is a
+    /// durability claim that is not true.
+    fn transfer_waiters(&mut self, from: ParityIds, to: &BTreeSet<ParityIds>) -> Vec<Effect> {
+        if !self.params.transfer_superseded_waiters {
+            return self.settle_group(from);
+        }
+        let mut out = Vec::new();
+        let mut done: Vec<(ClientId, WriteId)> = Vec::new();
+        for (w, waiting) in self.parity_waiting.iter_mut() {
+            if !waiting.remove(&from) {
+                continue;
+            }
+            waiting.extend(to.iter().copied());
+            // Nothing covers those members any more — the write was a delete,
+            // or what it wrote is gone. There is no redundancy left to owe.
+            if waiting.is_empty() {
+                done.push(*w);
+            }
+        }
+        for w in done {
+            self.parity_waiting.remove(&w);
+            out.push(Effect::Notify {
+                client: w.0,
+                write_id: w.1,
+                state: State::ParityComplete,
+            });
         }
         out
     }
@@ -660,12 +713,9 @@ impl Engine {
             });
         }
 
-        // The groups this commit is responsible for: everything still owed
-        // when it shipped. A write waits on these and on nothing else.
-        let groups: BTreeSet<ParityIds> = self.owed.keys().copied().collect();
-        for w in &writes {
-            self.parity_left.insert(*w, groups.len());
-        }
+        // The groups this commit CODED. A write waits on these and on nothing
+        // else.
+        let groups = std::mem::take(&mut self.coded_since_commit);
         self.next_seq += 1;
         self.pending = Some(Commit {
             seq,
@@ -791,24 +841,30 @@ impl Engine {
         // Only the groups THIS commit coded. Assigning every currently-owed
         // group to it would make a write wait on redundancy for data it never
         // touched, coded by a commit it has nothing to do with.
-        for key in &c.groups {
-            self.parity_owners
-                .entry(*key)
-                .or_default()
-                .extend(c.writes.iter().copied());
-        }
-        // A commit that coded no groups — a small write with no referenced
-        // values — owes nothing, so its writes are parity-complete as soon as
-        // they are published. Waiting for a group that does not exist is how
-        // a state gets skipped without `failed`.
+        //
+        // Groups already confirmed between the commit shipping and its head
+        // landing are not waited on: `owed` no longer holds them.
+        let still: BTreeSet<ParityIds> = c
+            .groups
+            .iter()
+            .filter(|g| self.owed.contains_key(*g))
+            .copied()
+            .collect();
         for w in &c.writes {
-            if self.parity_left.get(w).copied().unwrap_or(0) == 0 {
-                self.parity_left.remove(w);
+            if still.is_empty() {
+                // A commit that coded no groups — a small write with no
+                // referenced values — owes nothing, so its writes are
+                // parity-complete as soon as they are published. Waiting for a
+                // group that does not exist is how a state gets skipped
+                // without `failed`.
+                self.parity_waiting.remove(w);
                 out.push(Effect::Notify {
                     client: w.0,
                     write_id: w.1,
                     state: State::ParityComplete,
                 });
+            } else {
+                self.parity_waiting.insert(*w, still.clone());
             }
         }
         // Coalescing off is the control: put each group's parity the moment
