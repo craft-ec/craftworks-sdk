@@ -10,18 +10,44 @@ import { engineDb } from "./engine-db.js";
 export function wrap(raw) {
   class Db {
     #db = new raw.Db();
-    define(domain, schema) { this.#db.define(domain, JSON.stringify(schema)); }
-    schema(domain) { return JSON.parse(this.#db.schema(domain)); }
-    domains() { return JSON.parse(this.#db.domains()); }
-    put(domain, fields) { return JSON.parse(this.#db.put(domain, JSON.stringify(fields))); }
-    update(domain, id, patch) { return JSON.parse(this.#db.update(domain, id, JSON.stringify(patch))); }
-    get(domain, id) { return JSON.parse(this.#db.get(domain, id)); }
-    delete(domain, id) { return this.#db.delete(domain, id); }
-    scan(domain, { reverse = false, limit = 0, after = "" } = {}) {
+
+    // ---- ASYNC, ALL OF THEM, AND ON PURPOSE ----
+    //
+    // Every one of these answers IN HAND: this database is in the tab, so
+    // nothing here waits for anything. They are `async` so that the two
+    // backends answer the same SHAPE.
+    //
+    // The promise this surface makes is "an app that awaits its reads works
+    // on both", and it was not true. The engine-backed database reads over
+    // the network, so its reads return promises; these returned values. An
+    // app written against this one and then published got a Promise where it
+    // expected an object — and a Promise is truthy, so it passes an
+    // `if (!schema)` guard and arrives at `schema.fields.map` as
+    // `undefined.map`.
+    //
+    // What that cost, measured against a real node (sdk#87): four defects in
+    // the builder, three of which replaced the entire app with an exception
+    // string while the button said "Published", and one of which printed
+    // "— [object Promise] records" to a person — a wrong number, no crash, so
+    // nothing would ever have reported it.
+    //
+    // Awaiting a value already in hand is free. Being unable to tell which
+    // backend you have from the shape of an answer is the whole point.
+    async define(domain, schema) { this.#db.define(domain, JSON.stringify(schema)); }
+    async schema(domain) { return JSON.parse(this.#db.schema(domain)); }
+    async domains() { return JSON.parse(this.#db.domains()); }
+    async put(domain, fields) { return JSON.parse(this.#db.put(domain, JSON.stringify(fields))); }
+    async update(domain, id, patch) { return JSON.parse(this.#db.update(domain, id, JSON.stringify(patch))); }
+    async get(domain, id) { return JSON.parse(this.#db.get(domain, id)); }
+    async delete(domain, id) { return this.#db.delete(domain, id); }
+    async scan(domain, { reverse = false, limit = 0, after = "" } = {}) {
       return JSON.parse(this.#db.scan(domain, reverse, limit, after));
     }
-    count(domain) { return this.#db.count(domain); }
-    // The tree behind the database: its root hash, and what it holds.
+    async count(domain) { return this.#db.count(domain); }
+    // SYNCHRONOUS on both backends, and that is not an oversight. A root is
+    // a value this client already holds, and `stats` describes what THIS TAB
+    // has — which is why the engine-backed one answers null for the figures
+    // that describe the tree on the node rather than waiting to ask it.
     root() { return this.#db.root(); }
     stats() { return JSON.parse(this.#db.stats()); }
 
@@ -62,7 +88,11 @@ export function wrap(raw) {
       // a changing subscribe re-subscribes on every render.
       this.subscribe = this.subscribe.bind(this);
       this.getSnapshot = this.getSnapshot.bind(this);
-      this.reload();
+      // NOT populated here. The engine-backed binding starts empty and fills
+      // on its first `reload`, and a caller that could skip the reload on one
+      // backend and not the other is the same trap one level up: it would
+      // work in the builder's preview and show an empty table the moment the
+      // project was published.
     }
     get live() { return this.#live; }
     // The rows, as the same array until they change.
@@ -73,10 +103,9 @@ export function wrap(raw) {
     subscribe(cb) { this.#listeners.add(cb); return () => this.#listeners.delete(cb); }
     // Bring the rows up to date. Cheap when nothing moved: the tree's root is
     // compared first, so a reload with nothing to do reads nothing.
-    reload() {
+    async reload() {
       const root = this.#db.root();
-      if (root === this.#root) return false;
-      const rows = this.#db.scan(this.#domain);
+      const rows = await this.#db.scan(this.#domain);
       this.#root = root;
       if (same(this.#rows, rows)) return false;
       this.#rows = rows;
