@@ -986,10 +986,10 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
     // nothing because nothing re-descends. Measured separately each looked
     // inert — the same shape as a new guard hiding the guards behind it, seen
     // from the other side. So the control turns both off.
-    let count = |broken: bool, unrelated: usize| -> usize {
+    let count = |mode: Mode, broken: bool, unrelated: usize| -> usize {
         let store = Store::fresh();
         let mut h = Harness::new(
-            Mode::Rehydrate,
+            mode,
             Params {
                 redescend_on_entry: broken,
                 dedupe_in_flight: !broken,
@@ -1028,8 +1028,22 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
         fetches
     };
 
-    let quiet = count(false, 0);
-    let busy = count(false, 20);
+    // BOTH MODES, and they must agree. The bookkeeping that makes this bound
+    // hold — which reads are parked and which blocks are already asked for —
+    // has to come out of the CONTEXT. A version living in memory would pass
+    // in `Live` and fail only here, which is the one place this design is
+    // weak, so the numbers are taken in both and compared.
+    let quiet = count(Mode::Rehydrate, false, 0);
+    let busy = count(Mode::Rehydrate, false, 20);
+    let quiet_live = count(Mode::Live, false, 0);
+    let busy_live = count(Mode::Live, false, 20);
+    assert_eq!(
+        (quiet, busy),
+        (quiet_live, busy_live),
+        "the two modes disagree: re-hydrating changed what a read costs, so \
+         some of what makes this bound hold is living in memory rather than \
+         in the context"
+    );
     assert_eq!(
         quiet, busy,
         "a read cost {busy} fetches on a busy node and {quiet} on a quiet one: \
@@ -1038,7 +1052,12 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
 
     // The control, and it RUNS: an engine that re-drives every parked read on
     // every entry pays for the node being busy.
-    let control = count(true, 20);
+    let control = count(Mode::Rehydrate, true, 20);
+    let control_live = count(Mode::Live, true, 20);
+    assert_eq!(
+        control, control_live,
+        "the control behaves differently in the two modes"
+    );
     assert!(
         control > quiet,
         "the control still cost {control} fetches against {quiet}: it is not \
@@ -1046,6 +1065,6 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
     );
     println!(
         "  {quiet} fetch(es) on a quiet node, {busy} on a busy one, \
-         {control} with both off"
+         {control} with both off (identical in Live and Rehydrate)"
     );
 }
