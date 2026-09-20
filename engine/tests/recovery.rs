@@ -436,78 +436,207 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
     println!("  control: a head written early names {missing} block(s) nobody has");
 }
 
-/// (e): a write never sits merely `accepted` for ever.
+/// (e): a write never sits merely `accepted` in silence — and a stalled
+/// write still gets saved.
 ///
 /// `accepted` survives a refresh and not a restart, so it is exposure. With
-/// one commit in flight at a time, a write arriving behind a commit that
-/// cannot publish would wait for ever — and the client would hear nothing,
-/// which is the one outcome it cannot recover from. At T it is told `Failed`
-/// and re-submits.
+/// one commit in flight, a write arriving behind a commit that cannot publish
+/// would wait unheard. At T it is told `Stalled`: still held, not saved, not
+/// moving.
+///
+/// `Stalled` is NOT `Failed`, and the difference is the whole point. The
+/// edit is still in the tree and ships with the next commit, so reporting
+/// `Failed` would be a false statement with consequences — the client
+/// re-submits, the original publishes anyway, and a write someone else made
+/// in between is overwritten by the re-submission. So this asserts both
+/// halves: the notice arrives, and the write still reaches `Published`.
 #[test]
-fn a_write_never_sits_accepted_for_ever() {
+fn a_stalled_write_is_reported_once_and_still_reaches_published() {
     let t = 8u64;
-    let run = |bound: bool| -> (usize, usize) {
-        let net = Network::default();
-        let mut e = boot(
-            &net,
-            Params {
-                max_accept_age: t,
-                bound_accept_age: bound,
-                ..Params::default()
-            },
-        );
-        // The first write opens a commit that is never confirmed: the network
-        // is not answering.
-        let _ = e.step(Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-        });
-        // Writes keep arriving behind it.
-        let mut failed = 0;
-        let mut accepted = 0;
-        for n in 2..=12u64 {
-            for f in e.step(Event::Write {
-                client: ClientId(1),
-                write_id: WriteId(n),
-                ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
-            }) {
-                if let Effect::Notify { state, .. } = f {
-                    match state {
-                        State::Accepted => accepted += 1,
-                        State::Failed => failed += 1,
-                        _ => {}
-                    }
-                }
+    let mut net = Network::default();
+    let mut e = boot(
+        &net,
+        Params {
+            max_accept_age: t,
+            ..Params::default()
+        },
+    );
+
+    // Write 1 opens a commit. Its puts are held back, so it cannot publish.
+    let first = e.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+    });
+    let held: Vec<(Cid, Vec<u8>)> = first
+        .iter()
+        .filter_map(|f| match f {
+            Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
+                Some((*id, bytes.clone()))
             }
-            for f in e.step(Event::Tick(n * 2)) {
-                if let Effect::Notify {
-                    state: State::Failed,
-                    ..
-                } = f
-                {
-                    failed += 1;
-                }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !held.is_empty(),
+        "the first commit shipped nothing to hold back"
+    );
+
+    // Writes 2..6 fold behind it.
+    let mut seen: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
+    let absorb = |seen: &mut BTreeMap<WriteId, Vec<State>>, fx: &[Effect]| {
+        for f in fx {
+            if let Effect::Notify {
+                write_id, state, ..
+            } = f
+            {
+                seen.entry(*write_id).or_default().push(*state);
             }
         }
-        (accepted, failed)
     };
+    absorb(&mut seen, &first);
+    for n in 2..=6u64 {
+        let out = e.step(Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(n),
+            ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
+        });
+        absorb(&mut seen, &out);
+    }
+    // Time passes with the commit stuck.
+    for tick in 1..=(t * 3) {
+        let out = e.step(Event::Tick(tick));
+        absorb(&mut seen, &out);
+    }
 
-    let (accepted, failed) = run(true);
-    assert_eq!(accepted, 11, "every write should have been accepted first");
-    assert!(
-        failed > 0,
-        "writes folded behind a stuck commit for {t}+ ticks and none was ever \
-         reported Failed: the client is left waiting on a write nobody will \
-         finish"
+    for n in 2..=6u64 {
+        let states = seen.get(&WriteId(n)).cloned().unwrap_or_default();
+        assert!(
+            states.contains(&State::Stalled),
+            "write {n} sat accepted for {}+ ticks and was never reported Stalled: {states:?}",
+            t * 3
+        );
+        assert_eq!(
+            states.iter().filter(|s| **s == State::Stalled).count(),
+            1,
+            "write {n} was told Stalled more than once; a notice repeated every \
+             tick is one a caller learns to ignore"
+        );
+        assert!(
+            !states.contains(&State::Failed),
+            "write {n} was reported Failed while its edit is still in the tree"
+        );
+    }
+
+    // Now the network answers, and the stalled writes get saved.
+    let mut queue = first;
+    for (id, bytes) in &held {
+        net.confirm(*id, bytes);
+    }
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the unblocked commit did not settle");
+        match f {
+            Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
+                net.confirm(id, &bytes);
+                let out = e.step(Event::PutConfirmed(id));
+                absorb(&mut seen, &out);
+                queue.extend(out);
+            }
+            Effect::UpdateHead { seq, root, .. } => {
+                net.head = Some((seq, root));
+                let out = e.step(Event::HeadConfirmed(seq));
+                absorb(&mut seen, &out);
+                queue.extend(out);
+            }
+            _ => {}
+        }
+    }
+
+    for n in 2..=6u64 {
+        let states = seen.get(&WriteId(n)).cloned().unwrap_or_default();
+        assert!(
+            states.contains(&State::Published),
+            "write {n} was told Stalled and never reached Published: {states:?}. \
+             A stalled write is still held and still gets saved — that is what \
+             makes the notice honest"
+        );
+        assert!(
+            valid_sequence(&states),
+            "write {n} reported an impossible sequence: {states:?}"
+        );
+    }
+
+    // The control: with the bound off, nobody is told anything.
+    let net2 = Network::default();
+    let mut e2 = boot(
+        &net2,
+        Params {
+            max_accept_age: t,
+            bound_accept_age: false,
+            ..Params::default()
+        },
     );
-    let (_, failed_without) = run(false);
+    let mut stalled = 0;
+    let _ = e2.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+    });
+    for n in 2..=6u64 {
+        let _ = e2.step(Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(n),
+            ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
+        });
+    }
+    for tick in 1..=(t * 3) {
+        for f in e2.step(Event::Tick(tick)) {
+            if let Effect::Notify {
+                state: State::Stalled,
+                ..
+            } = f
+            {
+                stalled += 1;
+            }
+        }
+    }
     assert_eq!(
-        failed_without, 0,
-        "the control reported {failed_without} failures, so the bound is not \
+        stalled, 0,
+        "the control reported {stalled} Stalled notice(s), so the bound is not \
          what produces them"
     );
-    println!("  bounded: {failed} write(s) aged out; control: {failed_without}");
+    println!("  five writes stalled once each and all reached Published; control: 0 notices");
+}
+
+/// Is this a sequence a write can legally report?
+///
+/// A prefix of `accepted (stalled)? published parity-complete`, or a terminal
+/// (`failed` / `lost` / `busy`) with nothing after it. Written out rather than
+/// derived from the enum's order, because the legal ORDER is a rule about the
+/// protocol and the enum's order is an implementation detail that happens to
+/// agree with it today.
+fn valid_sequence(states: &[State]) -> bool {
+    const HAPPY: [State; 4] = [
+        State::Accepted,
+        State::Stalled,
+        State::Published,
+        State::ParityComplete,
+    ];
+    let mut at = 0usize;
+    for (i, s) in states.iter().enumerate() {
+        if matches!(s, State::Failed | State::Lost | State::Busy) {
+            // Terminal: nothing may follow it.
+            return i + 1 == states.len();
+        }
+        // Must advance through the happy path, skipping the optional Stalled.
+        match HAPPY[at..].iter().position(|h| h == s) {
+            Some(k) => at += k + 1,
+            None => return false,
+        }
+    }
+    true
 }
 
 /// An engine's own head may sit under the PREVIOUS code epoch after an
@@ -642,4 +771,58 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
          for ever on a commit that will never publish"
     );
     println!("  conflict: loser adopts the winner's head, both writes reported Lost");
+}
+
+/// A write whose edit is still in the tree is never reported `Failed`.
+///
+/// `Failed` is terminal and means *this edit is not in the tree and never
+/// will be*. Reporting it for a write that is merely blocked tells a client
+/// to re-submit while the original is still on its way: the edit lands twice,
+/// and a write someone else made in between is overwritten by the
+/// re-submission. Kept as a regression test because the engine did exactly
+/// this, and nothing else in the suite could see it.
+#[test]
+fn a_write_still_in_the_tree_is_never_reported_failed() {
+    let net = Network::default();
+    let mut e = boot(
+        &net,
+        Params {
+            max_accept_age: 4,
+            ..Params::default()
+        },
+    );
+    // Write 1 opens a commit the network never confirms.
+    let _ = e.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+    });
+    // Write 2 folds behind it.
+    let _ = e.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(2),
+        ops: vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))],
+    });
+    let mut failed = false;
+    for t in 1..=20u64 {
+        for f in e.step(Event::Tick(t)) {
+            if let Effect::Notify {
+                write_id: WriteId(2),
+                state: State::Failed,
+                ..
+            } = f
+            {
+                failed = true;
+            }
+        }
+    }
+    let in_tree = freenet_prolly::read::get(e.warm_for_test(), &e.root(), b"b")
+        .ok()
+        .flatten()
+        .is_some();
+    println!("PROBE reported Failed = {failed}; edit still in the tree = {in_tree}");
+    assert!(
+        !(failed && in_tree),
+        "a write was reported Failed while its edit is still in the tree and will publish"
+    );
 }

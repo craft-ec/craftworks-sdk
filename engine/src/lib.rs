@@ -55,17 +55,30 @@ pub enum Op {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum State {
     Accepted,
+    /// Still held, not yet saved, and the engine cannot publish it right now.
+    ///
+    /// NON-TERMINAL, and reported once. The write is still tracked, its edit
+    /// is still in the tree, and it reaches `Published` normally when the
+    /// commit blocking it confirms. It tells a caller that "saving..." has
+    /// stopped being routine -- not that anything has been given up.
+    ///
+    /// It exists because reporting `Failed` here was a FALSE statement: the
+    /// edit stayed in the tree and published with the next commit, so a
+    /// client that re-submitted would apply it twice, and could overwrite a
+    /// newer write someone else made in between.
+    Stalled,
     Published,
-    /// This engine has never heard of that write.
+    ParityComplete,
+    /// TERMINAL: this edit is not in the tree and never will be.
+    Failed,
+    /// TERMINAL: this engine has never heard of that write.
     ///
     /// After a restart, what the head does not name was never published and
     /// is gone. A client holding the id in its outbox is TOLD so, and
     /// re-submits. Silence would leave it waiting on a write nobody will ever
-    /// finish — which is the one outcome a client cannot recover from.
+    /// finish -- the one outcome a client cannot recover from.
     Lost,
-    ParityComplete,
-    Failed,
-    /// Refused without being accepted: the backlog is full.
+    /// TERMINAL: refused without being accepted; the backlog is full.
     Busy,
 }
 
@@ -400,6 +413,8 @@ pub struct Engine {
     parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<ParityIds>>,
     /// When the oldest write not yet in a commit was accepted.
     folded_since: Option<u64>,
+    /// Writes already told they are stalled, so the notice is sent once.
+    told_stalled: BTreeSet<(ClientId, WriteId)>,
     /// Where this engine's authority came from, as STATED at `Start`.
     key: Option<KeySource>,
     /// Epochs still to try when looking for this device's head.
@@ -480,6 +495,7 @@ impl Engine {
             in_flight_parity: BTreeMap::new(),
             parity_waiting: BTreeMap::new(),
             folded_since: None,
+            told_stalled: BTreeSet::new(),
             key: None,
             epochs: Vec::new(),
             head_epoch: None,
@@ -1088,6 +1104,11 @@ impl Engine {
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
         self.folded_since = None;
+        // In a commit now, so no longer stalled: if it stalls again later that
+        // is a new fact and deserves a new notice.
+        for w in &writes {
+            self.told_stalled.remove(w);
+        }
 
         // Big values do not ride in a pack: one PUT each, and the pack stays
         // within a size the network is willing to move.
@@ -1355,18 +1376,22 @@ impl Engine {
         out
     }
 
-    /// Stop promising anything about a write that has sat merely accepted too
-    /// long.
+    /// Say so when a write has sat merely accepted too long.
     ///
-    /// If nothing is in flight the answer is simply to commit it, and that
-    /// happens first. What this bounds is the other case: a commit that
-    /// cannot publish, with writes folding behind it. Those writes are told
-    /// `Failed` so a client can re-submit them, because the alternative is an
-    /// unbounded number of writes the engine has promised nothing about and
-    /// said nothing about either.
+    /// If nothing is in flight the answer is to commit it, and that happens
+    /// first. What this reports is the other case: a commit that cannot
+    /// publish, with writes folding behind it.
+    ///
+    /// They are NOT dropped. Their edits are in the tree and will ship with
+    /// the next commit, so telling a client `Failed` would be a false
+    /// statement with teeth: the client re-submits, the original publishes
+    /// anyway, and a write someone else made in between is overwritten by the
+    /// re-submission. `Stalled` says what is true -- still held, not saved,
+    /// not moving. Memory stays bounded by the backlog refusing NEW writes
+    /// with `Busy`, never by forgetting ones already accepted.
     fn age_out_accepted(&mut self, now: u64) -> Vec<Effect> {
-        // Nothing in flight and something waiting: commit it rather than age
-        // it out. This is the case a failed commit leaves behind.
+        // Nothing in flight and something waiting: commit it rather than
+        // report it. This is the case a failed commit leaves behind.
         if self.pending.is_none() && !self.folded.is_empty() {
             let to_ship = self.take_unpublished();
             return self.start_commit(to_ship);
@@ -1380,16 +1405,20 @@ impl Engine {
         if now.saturating_sub(since) < self.params.max_accept_age {
             return Vec::new();
         }
-        let aged = std::mem::take(&mut self.folded);
-        self.folded_bytes = 0;
-        self.folded_since = None;
-        aged.into_iter()
-            .map(|(client, write_id)| Effect::Notify {
-                client,
-                write_id,
-                state: State::Failed,
-            })
-            .collect()
+        // Once per write: a notice repeated every tick is noise a caller
+        // learns to ignore, and this one matters.
+        let folded = self.folded.clone();
+        let mut out = Vec::new();
+        for w in folded {
+            if self.told_stalled.insert(w) {
+                out.push(Effect::Notify {
+                    client: w.0,
+                    write_id: w.1,
+                    state: State::Stalled,
+                });
+            }
+        }
+        out
     }
 
     fn emit_parity(&mut self, want: impl Fn(&Owed) -> bool) -> Vec<Effect> {
@@ -1682,6 +1711,11 @@ impl Engine {
     pub fn adopt_root_for_test(&mut self, root: Cid) {
         self.root = root;
         self.published_root = root;
+    }
+
+    /// The warm blocks, so a test can read the tree the engine is holding.
+    pub fn warm_for_test(&self) -> &MemBlocks {
+        &self.blocks
     }
 
     /// Fetches emitted, for the cost gate.
