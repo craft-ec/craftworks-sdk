@@ -296,6 +296,20 @@ export function engineDb(handle) {
         /**
          * `{ state, why, code }` — `loading`, `ready` or `unreachable`.
          *
+         * # A BINDING'S OBSERVABLE STATE IS ROWS **AND** STATUS
+         *
+         * A comparison over rows alone misses a transition. Twice now:
+         *
+         * * a row whose write state moved `PENDING` -> `CLEAN` changes
+         *   neither `id` nor `updated`, so the snapshot comparison said
+         *   "the same rows" and a person watched "saving" for seventy
+         *   seconds over data that was already on the network (sdk#96);
+         * * a range going from `unreachable` to readable-and-empty is a
+         *   different screen with identical rows, so anything watching only
+         *   the rows leaves the error on screen for ever.
+         *
+         * Anything deciding whether a binding changed must read both.
+         *
          * Read it beside `getSnapshot()`: no rows with `ready` is an empty
          * range, and no rows with `unreachable` is a range nobody could read.
          * `why` is the SDK's own sentence, and `code` its stable code, so a
