@@ -1,0 +1,23 @@
+[package]
+name = "engine-delegate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The engine, hosted in a Freenet delegate: translation and scheduling, no policy."
+
+[lib]
+# cdylib for the wasm the node loads; rlib so the scheduler can be unit-tested
+# natively, with no wasm and no node. The scheduler is where the platform's
+# per-call limits live, and they are the part most worth testing directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+engine = { path = "../engine" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+
+[features]
+# The `#[delegate]` macro emits the exported entry point only behind this, and
+# it must be declared HERE. Without it the crate compiles to a module with no
+# exports and no imports — and an import gate run against that passes over
+# nothing at all.
+default = []
