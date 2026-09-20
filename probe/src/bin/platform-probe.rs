@@ -23,11 +23,27 @@ use tokio::time::timeout;
 /// dropped message rather than a silent wrong answer.
 #[derive(Debug, Serialize, Deserialize)]
 enum Ask {
-    ReadState { id: [u8; 32] },
-    SetSecret { key: Vec<u8>, len: usize },
-    GetSecret { key: Vec<u8> },
+    ReadState {
+        id: [u8; 32],
+    },
+    SetSecret {
+        key: Vec<u8>,
+        len: usize,
+    },
+    GetSecret {
+        key: Vec<u8>,
+    },
     Nothing,
-    PutState { code: Vec<u8>, state: Vec<u8> },
+    LastPut,
+    PutState {
+        code: Vec<u8>,
+        // The delegate's own enum has this field. It was missing here, so
+        // every Q8 message failed to deserialize on the far side and was
+        // DROPPED — the exact failure the note above predicts, and the
+        // reason Q8's earlier answer meant nothing.
+        params: Vec<u8>,
+        state: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,9 +60,80 @@ enum Said {
         calls_in_memory: u32,
         calls_in_context: u32,
     },
+    Put {
+        emitted: bool,
+    },
+    PutResult {
+        ok: Option<bool>,
+        err: String,
+    },
 }
 
 const STEP: Duration = Duration::from_secs(10);
+
+/// Collect any delegate replies that arrive on their own over `ms`.
+///
+/// A `PutContractResponse` reaches the delegate as its own inbound message,
+/// so its reply is not the answer to any `ask` -- it turns up out of band or
+/// not at all, and "not at all" is itself the finding.
+async fn drain_said(client: &mut WebApi, ms: u64) -> Vec<Said> {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let mut out = Vec::new();
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, client.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
+                for v in values {
+                    if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                        if let Ok(s) = bincode::deserialize::<Said>(m.payload.as_slice()) {
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Does a client GET for `key` come back with a state?
+///
+/// On a node with no peers this is the hosting question: a GET the node
+/// cannot serve locally has nowhere else to ask.
+async fn get_ok(client: &mut WebApi, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+    let id = *key.id();
+    if timeout(
+        STEP,
+        client.send(ClientRequest::ContractOp(
+            freenet_stdlib::client_api::ContractRequest::Get {
+                key: id,
+                return_contract_code: false,
+                // Both off: a subscribe would REGISTER interest and make the
+                // very thing being measured true.
+                subscribe: false,
+                blocking_subscribe: false,
+            },
+        )),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    let deadline = Instant::now() + STEP;
+    while Instant::now() < deadline {
+        match timeout(STEP, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::GetResponse { state, .. },
+            ))) => return !state.as_ref().is_empty(),
+            Ok(Ok(_)) => continue,
+            _ => return false,
+        }
+    }
+    false
+}
 
 async fn ask(client: &mut WebApi, key: &DelegateKey, a: &Ask) -> Result<Option<Said>> {
     let payload = bincode::serialize(a)?;
@@ -324,6 +411,8 @@ async fn main() -> Result<()> {
         .as_bytes()
         .try_into()
         .expect("32-byte instance id");
+    println!("(8) delegate-put contract key: {}", c8.key());
+    println!("(8) client-put  contract key: {}", container.key());
     let before = ask(&mut client, &key, &Ask::ReadState { id: id8 }).await?;
     println!("(8) before the delegate PUT, sync read sees it: {before:?}");
     let ran = ask(
@@ -331,19 +420,78 @@ async fn main() -> Result<()> {
         &key,
         &Ask::PutState {
             code: code_bytes.clone(),
+            params: p8.clone(),
             state: s8.clone(),
         },
     )
     .await?;
+    assert!(
+        ran.is_some(),
+        "(8) the delegate answered nothing: the Ask shape does not match its \
+         own enum, so the message was dropped and Q8 measured nothing"
+    );
     println!("(8) the delegate ran and built the request: {ran:?}");
+    // Drained FIRST. Every sync-read poll below is an `ask`, which consumes
+    // whatever is waiting on the socket -- so a response that arrived early
+    // would have been eaten and counted as "never came".
+    let spontaneous = drain_said(&mut client, 2000).await;
+    println!("(8a) delegate replies that arrived on their own: {spontaneous:?}");
+    let mut sync_ok = false;
     for ms in [50u64, 200, 500, 1000, 3000] {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         let said = ask(&mut client, &key, &Ask::ReadState { id: id8 }).await?;
-        let got = matches!(said, Some(Said::State { len: Some(_), .. }));
-        println!("(8)   +{ms} ms after the delegate PUT: sync read sees it = {got}");
-        if got {
+        sync_ok = matches!(said, Some(Said::State { len: Some(_), .. }));
+        println!(
+            "(8)   +{ms} ms after the delegate PUT: sync read sees it = {got}",
+            got = sync_ok
+        );
+        if sync_ok {
             break;
         }
+    }
+    // The node's own verdict, rather than an inference from what is readable
+    // afterwards. "Not readable" has two causes -- refused, or accepted and
+    // not visible -- and only this tells them apart.
+    let verdict = ask(&mut client, &key, &Ask::LastPut).await?;
+    println!("(8a) the node's verdict on the delegate PUT: {verdict:?}");
+    println!("(8a) sync-readable on the next call: {sync_ok}");
+
+    // ---- (8b) is it HOSTED? ----
+    //
+    // Source says no: a delegate PUT goes to
+    // `executor().upsert_contract_state_deferrable(...)` and never reaches
+    // `register_local_hosting`, whose only production caller is the client
+    // PUT operation. A GET for a held key is served locally only if
+    // `has_local_interest` — hosting, a local client, or a downstream
+    // subscriber — and a delegate PUT creates none of those.
+    //
+    // On a node with no peers that is decidable: a GET that cannot be served
+    // locally has nowhere to go. The CONTROL is the same GET for the contract
+    // put through the CLIENT path in (1), which does register hosting. Without
+    // it, a failing GET would say nothing — it could just mean GETs do not
+    // work on a solo node.
+    let control = get_ok(&mut client, &container.key().clone()).await;
+    let subject = get_ok(&mut client, &c8.key().clone()).await;
+    println!("(8b) GET of the CLIENT-put contract  (control): {control}");
+    println!("(8b) GET of the DELEGATE-put contract        : {subject}");
+    match (control, subject, sync_ok) {
+        (true, true, _) => {
+            println!("(8b) hosted: YES — a delegate PUT is served locally like a client PUT")
+        }
+        (true, false, true) => println!(
+            "(8b) hosted: NO — the bytes ARE local (8a said yes) but the node \
+             does not host them, so a later GET leaves the machine"
+        ),
+        (true, false, false) => println!(
+            "(8) a delegate PUT DID NOTHING OBSERVABLE on this build: emitted \
+             by the delegate, no PutContractResponse by either channel, not \
+             sync-readable, not gettable — while a client PUT in this same \
+             run was sync-readable at t+0 ms and is gettable"
+        ),
+        (false, _, _) => println!(
+            "(8b) INCONCLUSIVE — the control GET failed too, so this says \
+             nothing about the delegate PUT"
+        ),
     }
 
     println!("done");
