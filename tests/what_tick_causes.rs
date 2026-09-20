@@ -231,16 +231,17 @@ fn the_table() {
             "NEVER"
         },
     );
-    // NOT MEASURED, and said so rather than printed as a zero.
+    // THE ZERO THIS SCENARIO REALLY MEASURES.
     //
     // 40 writes produce 40 puts and neither a Tick nor a Flush causes one
-    // more — but in this scenario NO PARITY IS EVER OWED: the records are
-    // small enough to form no group. A zero whose precondition was never
-    // reached is not a measurement, and reporting it as "Tick causes
-    // nothing" would be the 256-rows mistake again.
+    // more — but that is not "a Tick emits no parity". In this scenario NO
+    // PARITY IS EVER OWED: the records are small enough that no leaf lists a
+    // trio. A zero whose precondition never happened is not a measurement,
+    // so the two parity rows are measured in `what_a_flush_causes`, on a
+    // tree grown until a group actually forms. They read 3 and 3 there.
     //
-    // Measuring it needs a tree big enough to form parity groups, which is
-    // a bigger fixture than this file should carry.
+    // This stays as the control for that file: with nothing owed, the same
+    // ticks cause nothing.
     let (no_tick, with_tick) = (puts_caused(false, false), puts_caused(true, false));
     let on_flush = puts_caused(false, true);
     assert_eq!(
@@ -249,18 +250,19 @@ fn the_table() {
         "a put WAS caused, so parity is being owed after all and these rows \
          can be measured rather than marked unreached"
     );
-    println!("  owed parity emitted               | not reached in this scenario (no group forms)");
-    println!("  owed parity on Flush              | not reached in this scenario (no group forms)");
+    println!("  owed parity emitted               | 0       | 3         | see what_a_flush_causes");
+    println!("  owed parity on Flush              | 0       | -         | 3 (same file)");
     println!(
         "  a failed put re-emitted           | fires   | fires     | Event::PutFailed — an EVENT"
     );
     println!("  read-back rounds (delegate shell) | fires   | fires     | per CALL, not per time");
     println!("  the client's pending timeout      | fires   | fires     | the CLIENT's clock, already driven");
     println!(
-        "\n  Stalled fires in NEITHER column: `in_flight_since` is not in the\n  \
-         engine's Context, so a delegate rebuilt on every call (F32) has it as\n  \
-         None at the top of every call but the one that started the commit.\n  \
-         sdk#82."
+        "\n  Both rows that read NEVER here were the same defect: state that\n  \
+         only matters ACROSS calls, left out of the context a delegate is\n  \
+         rebuilt from (F32). `in_flight_since` for Stalled (sdk#82), and the\n  \
+         parity in flight for owed parity (sdk#83). Neither could be seen by\n  \
+         a test that drives the engine in one process."
     );
 }
 
