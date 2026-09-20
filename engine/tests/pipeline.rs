@@ -63,6 +63,16 @@ fn ids(effects: &[Effect]) -> Vec<Cid> {
         .collect()
 }
 
+fn pack_ids(effects: &[Effect]) -> Vec<Cid> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::PutPack { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
 fn head_of(effects: &[Effect]) -> Option<(u64, Cid, Vec<Cid>)> {
     effects.iter().find_map(|e| match e {
         Effect::UpdateHead { seq, root, after } => Some((*seq, *root, after.clone())),
@@ -85,8 +95,10 @@ fn rebuild(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> Cid {
 
 /// Drive a commit from its puts to `published`, confirming in the given order.
 fn settle(e: &mut Engine, seen: &mut Seen, effects: Vec<Effect>, order: &[usize]) -> Vec<Effect> {
+    // The caller has already absorbed `effects`; absorbing them again would
+    // record every notification in them twice and make "once per state" read
+    // as a duplicate.
     let mut all = effects.clone();
-    seen.absorb(&effects);
     let pending = ids(&effects);
     for i in order {
         let out = e.step(Event::PutConfirmed(pending[*i]));
@@ -205,11 +217,24 @@ fn writes_from_two_clients_fold_into_one_commit_and_all_reach_published() {
     let _ = settle(&mut e, &mut seen, out, &(0..n2).collect::<Vec<_>>());
 
     for (client, id) in [(1, 1), (1, 2), (2, 3), (2, 4)] {
+        let states = seen.of(client, id);
+        assert!(
+            states.contains(&State::Published),
+            "client {client} write {id} did not reach published: {states:?}"
+        );
+        // Each state at most once, and never backwards. A write that reports
+        // Durable twice is a write whose caller cannot tell a retry from
+        // progress.
+        let mut sorted = states.to_vec();
+        sorted.dedup();
         assert_eq!(
-            seen.of(client, id).last(),
-            Some(&State::Published),
-            "client {client} write {id} did not reach published: {:?}",
-            seen.of(client, id)
+            sorted.len(),
+            states.len(),
+            "client {client} write {id} repeated a state: {states:?}"
+        );
+        assert!(
+            states.windows(2).all(|w| w[0] < w[1]),
+            "client {client} write {id} went backwards: {states:?}"
         );
     }
 }
@@ -237,6 +262,14 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
 /// failure is reproducible from the output alone.
 #[test]
 fn any_interleaving_publishes_the_root_a_rebuild_produces() {
+    // Counted across the whole sweep and asserted at the end. A failure
+    // injected into a value block exercises a different branch from one
+    // injected into a PACK, and only the pack branch could leave a commit with
+    // nothing outstanding and no retry. This sweep missed that defect the
+    // first time because it confirmed every id it had failed, regardless of
+    // whether the retry produced anything.
+    let mut pack_failures = 0usize;
+    let mut retries_seen = 0usize;
     for seed in 1..=24u64 {
         let mut r = rng(seed);
         let mut e = Engine::default();
@@ -267,12 +300,24 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
             for i in (1..pending.len()).rev() {
                 pending.swap(i, (r() % (i as u64 + 1)) as usize);
             }
+            let packs: BTreeSet<Cid> = pack_ids(&out).into_iter().collect();
             let mut queue: Vec<Cid> = Vec::new();
             for id in &pending {
                 // A failure first, at a position the seed chooses.
                 if r().is_multiple_of(3) {
                     let again = e.step(Event::PutFailed(*id));
                     seen.absorb(&again);
+                    // A failed put MUST produce a retry, or the commit waits
+                    // for ever on something that already failed.
+                    assert!(
+                        !again.is_empty(),
+                        "seed {seed}: PutFailed re-emitted nothing, so the \
+                         commit can never complete"
+                    );
+                    if packs.contains(id) {
+                        pack_failures += 1;
+                    }
+                    retries_seen += 1;
                     queue.extend(ids(&again));
                 }
                 queue.push(*id);
@@ -350,6 +395,14 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
             records.len()
         );
     }
+    // Without this the sweep can inject failures that never land on a pack and
+    // report green over a branch it never entered.
+    assert!(
+        pack_failures > 0,
+        "{retries_seen} put failures were injected and NONE hit a pack: the \
+         pack retry path was not exercised"
+    );
+    println!("  {retries_seen} injected failures, {pack_failures} of them on packs");
 }
 
 /// Drive one write all the way to published, confirming in order.
@@ -647,4 +700,87 @@ fn a_full_backlog_refuses_a_write_without_applying_it() {
         ids(&out).is_empty(),
         "a refused write put blocks on the network"
     );
+}
+
+/// The write path is proportional to the tree's DEPTH, not to its size.
+///
+/// This is a correctness property of the delegate, not a nicety: a delegate
+/// call is bounded at 5 s, and the version of this engine that scanned the
+/// whole tree for superseded groups would have parsed on the order of 10^5
+/// nodes per keystroke at a million keys. It was correct, and it passed every
+/// other test in this file.
+///
+/// The bound is stated against the tree's depth with room to spare, and the
+/// whole-tree scan is kept as a parameter so the control can blow it. A bound
+/// nothing can exceed is not a bound.
+#[test]
+fn a_single_key_write_parses_nodes_in_proportion_to_depth() {
+    let seed: Vec<(Vec<u8>, Op)> = (0..10_000u32)
+        .map(|i| {
+            (
+                format!("k/{i:06}").into_bytes(),
+                Op::Put(vec![(i % 251) as u8; 60]),
+            )
+        })
+        .collect();
+
+    let measure = |whole: bool| -> usize {
+        let mut e = Engine::new(Params {
+            whole_tree_supersede_scan: whole,
+            ..Params::default()
+        });
+        let mut seen = Seen::default();
+        commit(&mut e, &mut seen, write(1, 1, seed.clone()));
+        // Measure ONE key changing, on a tree that is already large.
+        e.reset_cost();
+        let _ = e.step(write(1, 2, vec![put("k/005000", b"changed")]));
+        e.nodes_parsed()
+    };
+
+    let diff_walk = measure(false);
+    let whole_tree = measure(true);
+
+    // A 10k-key tree is 3 levels; 8 per level is generous and still nowhere
+    // near a scan.
+    const DEPTH: usize = 3;
+    const PER_LEVEL: usize = 8;
+    assert!(
+        diff_walk <= DEPTH * PER_LEVEL,
+        "a one-key write parsed {diff_walk} nodes on a 10,000-key tree; the \
+         walk is not following only what changed"
+    );
+    assert!(
+        whole_tree > DEPTH * PER_LEVEL * 4,
+        "the control parsed only {whole_tree} nodes, so it is not the \
+         whole-tree scan and this bound is not being tested against anything"
+    );
+    println!("  one-key write: {diff_walk} nodes parsed (whole-tree control: {whole_tree})");
+}
+
+/// Settings a caller can choose must not panic the core three steps later.
+///
+/// `max_packed_value` above `max_pack` describes a value that must ride in a
+/// pack and cannot fit in one. The planner met that as an `unreachable!`,
+/// far from the setting that caused it and with nothing in the message
+/// pointing back at it.
+#[test]
+fn impossible_params_are_refused_where_they_are_set() {
+    let bad = Params {
+        max_pack: 4096,
+        max_packed_value: 8192,
+        ..Params::default()
+    };
+    let panicked = std::panic::catch_unwind(move || Engine::new(bad));
+    assert!(
+        panicked.is_err(),
+        "a pack size smaller than the values that must fit in it was accepted"
+    );
+    // And the pair that only just fits is accepted, so the refusal is the
+    // relationship and not a blanket rejection of small packs.
+    let ok = Params {
+        max_pack: 4096,
+        max_packed_value: 4096 - 11,
+        ..Params::default()
+    };
+    let _ = Engine::new(ok);
 }
