@@ -677,3 +677,150 @@ fn owed_parity_survives_a_rehydration_and_is_still_put() {
         put.len()
     );
 }
+
+/// A damaged context is REFUSED, not decoded into a plausible engine.
+///
+/// The context comes back from outside: a node's cache, as bytes, with no
+/// guarantee beyond their length. A version check plus `bincode::deserialize`
+/// is not enough, and this is the measurement that says so — core dev's probe
+/// overwrote every 8-byte window of a valid context with a large integer and
+/// **656 of 876 damaged contexts were ACCEPTED**. No panic and no runaway
+/// allocation, which is why nothing else caught it: the engine came back in
+/// whatever state the damage described, and since the context carries the
+/// `(seq, root)` of the commit in flight, it could then emit `UpdateHead`
+/// naming a root nobody has.
+///
+/// Refusal is free in this design — an engine with no context starts from its
+/// head and reports its in-flight writes `Lost` — so the bar is exact: accept
+/// only what this build wrote, byte for byte.
+#[test]
+fn a_damaged_context_is_refused_without_panicking_or_allocating_the_world() {
+    let store = Store::default();
+    let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
+    let ops: Vec<(Vec<u8>, Op)> = (0..200)
+        .map(|i| (format!("k{i:04}").into_bytes(), Op::Put(vec![7u8; 100])))
+        .collect();
+    let _ = e.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops,
+    });
+    let good = e.to_context().expect("context");
+
+    let (mut refused, mut accepted) = (0usize, 0usize);
+    for at in 0..good.len().saturating_sub(8) {
+        for fill in [u64::MAX, 3_000_000_000u64] {
+            let mut bad = good.clone();
+            bad[at..at + 8].copy_from_slice(&fill.to_le_bytes());
+            match Engine::from_context(&bad, Params::default(), store.clone()) {
+                Ok(_) => accepted += 1,
+                Err(_) => refused += 1,
+            }
+        }
+    }
+    // Truncations and the empty context: neither may panic.
+    let mut short = 0usize;
+    for cut in 0..good.len() {
+        if Engine::from_context(&good[..cut], Params::default(), store.clone()).is_err() {
+            short += 1;
+        }
+    }
+    assert!(
+        Engine::from_context(&[], Params::default(), store.clone()).is_err(),
+        "an empty context was accepted"
+    );
+
+    println!("  {} B context: {refused} damaged refused, {accepted} accepted, {short} truncations refused", good.len());
+    assert_eq!(
+        accepted, 0,
+        "{accepted} damaged context(s) were accepted and re-hydrated an \
+         engine in whatever state the damage described"
+    );
+    assert_eq!(
+        short,
+        good.len(),
+        "a truncated context was accepted: every prefix of a valid context is \
+         a context this build did not write"
+    );
+    // The probe must have RUN. Without this, `accepted == 0` is also what a
+    // zero-length context would report.
+    assert!(
+        refused > 800,
+        "only {refused} damaged context(s) were tried, so this is not the \
+         sweep the number above claims"
+    );
+    // ...and the undamaged one still round-trips, or the refusal is just a
+    // decoder that says no to everything.
+    assert!(
+        Engine::from_context(&good, Params::default(), store.clone()).is_ok(),
+        "the UNDAMAGED context was refused too"
+    );
+}
+
+/// A refused context costs a restart, not correctness.
+///
+/// This is the other half of refusing: it is only free if what follows is
+/// right. The engine starts from `Start`, re-reads its head, and answers a
+/// client asking about the write that was in flight with `Lost` — the word
+/// that leaves the client holding a write it can safely re-submit.
+#[test]
+fn a_refused_context_recovers_from_the_head_and_reports_the_write_lost() {
+    let mut store = Store::default();
+    let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
+    let out = e.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops: vec![(b"k".to_vec(), Op::Put(vec![5u8; 40]))],
+    });
+    store.absorb(&out);
+    let good = e.to_context().expect("context");
+    let published = e.published_root();
+
+    // One byte of the body, flipped. Nothing else about it is wrong.
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    assert!(
+        Engine::from_context(&bad, Params::default(), store.clone()).is_err(),
+        "a one-bit change to the body was accepted"
+    );
+
+    // So the delegate starts fresh, as it must.
+    let mut e2: Engine<Store> = Engine::new(Params::default(), store.clone());
+    let out = e2.step(Event::Start {
+        key: engine::KeySource::SecretStore,
+        epochs: vec![engine::Epoch(1)],
+    });
+    assert!(
+        out.iter().any(|f| matches!(f, Effect::ReadHead { .. })),
+        "a fresh engine did not re-read its head, so a refused context loses \
+         the tree as well as the bookkeeping"
+    );
+    let _ = e2.step(Event::HeadRead {
+        epoch: engine::Epoch(1),
+        seq: 1,
+        root: published,
+    });
+    assert_eq!(
+        e2.published_root(),
+        published,
+        "the recovered engine did not take the head it was given"
+    );
+
+    let out = e2.step(Event::AskWrite {
+        client: ClientId(1),
+        write_id: WriteId(1),
+    });
+    assert_eq!(
+        out.iter()
+            .filter_map(|f| match f {
+                Effect::Notify { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![engine::State::Lost],
+        "a client asking about the write in flight when the context was \
+         refused was not told Lost, so it cannot know whether to re-submit"
+    );
+    println!("  refused context: fresh start, head re-read, write reported Lost");
+}

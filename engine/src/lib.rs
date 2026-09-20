@@ -2210,6 +2210,47 @@ struct Context {
 /// The version this build writes. Bumped when the shape changes.
 const CONTEXT_VERSION: u16 = 1;
 
+/// What a context this build wrote begins with.
+///
+/// The context comes back from OUTSIDE the engine -- from a node's cache, as
+/// bytes, with no guarantee beyond their length. Anything that is not
+/// byte-for-byte what this build wrote must be refused, and refusal is FREE
+/// here: an engine with no context is correct, it starts from its head and
+/// reports its in-flight writes `Lost`. A context that is merely PLAUSIBLE is
+/// the dangerous one -- it carries the (seq, root) of a commit in flight, so
+/// an engine re-hydrated from a damaged one can emit `UpdateHead` naming a
+/// root nobody has.
+const CONTEXT_MAGIC: [u8; 4] = *b"CWE1";
+
+/// magic + version + checksum, before the encoded body.
+const CONTEXT_HEADER: usize = 4 + 2 + 8;
+
+/// The first 8 bytes of BLAKE3 over the encoded body.
+///
+/// Truncated because this defends against DAMAGE, not against an adversary
+/// who can also rewrite the checksum: the node's context cache is not a trust
+/// boundary the engine can police, and a full 32 bytes would buy nothing a
+/// version check and a fresh start do not already give.
+fn context_checksum(body: &[u8]) -> [u8; 8] {
+    let h = blake3::hash(body);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&h.as_bytes()[..8]);
+    out
+}
+
+/// Encoding options shared by both directions.
+///
+/// `with_fixint_encoding` because that is what `bincode::serialize` does and
+/// the two must agree. `with_limit` makes the allocation bound STRUCTURAL: a
+/// damaged length field cannot ask the decoder for more than the context
+/// budget, whatever today's types happen to make reachable.
+fn context_opts(limit: usize) -> impl bincode::Options {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(limit as u64)
+}
+
 /// Why a context could not be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextError {
@@ -2256,11 +2297,20 @@ impl<B: Blocks> Engine<B> {
             head_epoch: self.head_epoch,
             parked_write: self.parked_write.clone(),
         };
-        let bytes = bincode::serialize(&c).map_err(|_| ContextError::Unreadable)?;
-        if bytes.len() > self.params.max_context_bytes {
-            return Err(ContextError::TooLarge(bytes.len()));
+        use bincode::Options;
+        let body = context_opts(self.params.max_context_bytes)
+            .serialize(&c)
+            .map_err(|_| ContextError::Unreadable)?;
+        let total = CONTEXT_HEADER + body.len();
+        if total > self.params.max_context_bytes {
+            return Err(ContextError::TooLarge(total));
         }
-        Ok(bytes)
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&CONTEXT_MAGIC);
+        out.extend_from_slice(&CONTEXT_VERSION.to_le_bytes());
+        out.extend_from_slice(&context_checksum(&body));
+        out.extend_from_slice(&body);
+        Ok(out)
     }
 
     /// Rebuild an engine from what the last call carried.
@@ -2270,7 +2320,32 @@ impl<B: Blocks> Engine<B> {
     /// refusal is not a disaster — the caller starts from `Start` and reads
     /// its head, which is the only authority anyway.
     pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
-        let c: Context = bincode::deserialize(bytes).map_err(|_| ContextError::Unreadable)?;
+        use bincode::Options;
+        // Every check below happens BEFORE the decoder sees a byte of the
+        // body. A decoder that refuses malformed input is not the same thing
+        // as one that refuses input this build did not write: bincode read
+        // 656 of 876 single-window corruptions as a perfectly good context
+        // and handed back an engine in whatever state the damage described.
+        if bytes.len() < CONTEXT_HEADER || bytes.len() > params.max_context_bytes {
+            return Err(ContextError::Unreadable);
+        }
+        if bytes[..4] != CONTEXT_MAGIC {
+            return Err(ContextError::Unreadable);
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != CONTEXT_VERSION {
+            return Err(ContextError::Unreadable);
+        }
+        let body = &bytes[CONTEXT_HEADER..];
+        if bytes[6..CONTEXT_HEADER] != context_checksum(body) {
+            return Err(ContextError::Unreadable);
+        }
+        let c: Context = context_opts(params.max_context_bytes)
+            .deserialize(body)
+            .map_err(|_| ContextError::Unreadable)?;
+        // Kept as well as the header's: two independent statements of the
+        // same fact cost two bytes and catch a build that changed the shape
+        // without changing the constant.
         if c.version != CONTEXT_VERSION {
             return Err(ContextError::Unreadable);
         }
