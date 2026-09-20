@@ -1,0 +1,9 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Platform probes against a pinned Freenet: the import gate, and the delegate experiments."
+
+[dependencies]
+anyhow = "1"

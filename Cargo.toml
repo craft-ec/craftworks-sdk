@@ -30,7 +30,7 @@ getrandom = { version = "0.2", features = ["js"] }
 # for it to be unable to reach them. It does not depend on this crate; a core
 # that can call the SDK is a core that will.
 [workspace]
-members = ["engine"]
+members = ["engine", "probe-delegate", "probe"]
 
 [profile.release]
 opt-level = "s"

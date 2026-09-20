@@ -1,0 +1,25 @@
+[package]
+name = "probe-delegate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Answers platform questions about a Freenet delegate. Not shipped."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[features]
+# The `#[delegate]` macro only emits the exported entry point when this is on,
+# and it must be declared HERE, not in the stdlib. Without it the crate
+# compiles to a module with no exports and no imports — and an import gate run
+# against that passes over nothing at all, which is how this was found.
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+# The macro also probes a `trace` cfg. Declaring it keeps `-D warnings` clean
+# without turning anything on.
+trace = ["freenet-stdlib/trace"]
