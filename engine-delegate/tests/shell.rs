@@ -1,0 +1,510 @@
+//! Acceptance 4 and 5: the read-back rule, and what the shell does with
+//! things it does not understand. No wasm, no node.
+
+use engine::{Op, Params, State};
+use engine_delegate::shell::{Inbound, Shell};
+use engine_delegate::wire::{Dropped, Reply, Request};
+use freenet_prolly::store::Blocks;
+use freenet_prolly::Cid;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+/// The node's store, as the shell sees it.
+#[derive(Clone, Default)]
+struct Store(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
+
+impl Blocks for Store {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        self.0.borrow().get(cid).copied()
+    }
+}
+
+impl Store {
+    fn put(&self, id: Cid, bytes: &[u8]) {
+        if self.0.borrow().contains_key(&id) {
+            return;
+        }
+        let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+        self.0.borrow_mut().insert(id, leaked);
+    }
+}
+
+fn states(out: &[Vec<u8>]) -> Vec<State> {
+    out.iter()
+        .filter_map(|b| bincode::deserialize::<Reply>(b).ok())
+        .filter_map(|r| match r {
+            Reply::Write { state, .. } => Some(state),
+            _ => None,
+        })
+        .collect()
+}
+
+fn write_req() -> Vec<u8> {
+    bincode::serialize(&Request::Write {
+        client: 1,
+        write_id: 1,
+        ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
+    })
+    .unwrap()
+}
+
+/// A `PutContractResponse` is NOT a confirmation; the read-back is.
+///
+/// Acceptance 4. The control is a shell told to treat the ack as
+/// confirmation — which is the same code path with one substitution — and the
+/// test distinguishes them by what the client is told. Without the control,
+/// "the write published" would read identically in both.
+#[test]
+fn an_ack_is_not_a_confirmation_and_the_read_back_is() {
+    let store = Store::default();
+    let mut s: Shell<Store> = Shell::resume(&[], Params::default(), store.clone());
+
+    let out = s.handle(vec![Inbound::Client(write_req())]);
+    assert_eq!(
+        states(&out.replies).first(),
+        Some(&State::Accepted),
+        "the write was not accepted"
+    );
+    let puts: Vec<Cid> = out
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            engine_delegate::schedule::Op::Put { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert!(!puts.is_empty(), "the write shipped nothing to acknowledge");
+
+    // Every put is ACKNOWLEDGED. Nothing may publish on that alone.
+    let acks: Vec<Inbound> = puts
+        .iter()
+        .map(|id| Inbound::PutAcked { id: *id, ok: true })
+        .collect();
+    let out = s.handle(acks);
+    assert!(
+        !states(&out.replies).contains(&State::Published),
+        "the write PUBLISHED on acknowledgements alone: the node has said it \
+         accepted the requests, not that the bytes are anywhere"
+    );
+    assert_eq!(
+        s.awaiting(),
+        puts.len(),
+        "the acks did not queue a read-back for every put"
+    );
+    // ...and the shell asked for each of them back.
+    let asked: Vec<Cid> = out
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            engine_delegate::schedule::Op::Get { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for p in &puts {
+        assert!(asked.contains(p), "no read-back was issued for {p:?}");
+    }
+    println!(
+        "  {} put(s) acknowledged, {} read-back(s) issued, nothing published",
+        puts.len(),
+        asked.len()
+    );
+}
+
+/// A put acknowledged and then never readable back FAILS — but only after
+/// the rounds run out.
+///
+/// The first empty read-back is not proof of absence: a put is readable a
+/// short time after it is acknowledged, not instantly (+50 ms, measured), and
+/// treating the first empty answer as failure reported a write dead that had
+/// in fact landed. So it is asked again, a bounded number of times, and only
+/// then is the ack disbelieved.
+///
+/// Two assertions, and both matter: it does NOT fail early, and it does NOT
+/// go on for ever.
+#[test]
+fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
+    let store = Store::default();
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
+    let out = s.handle(vec![Inbound::Client(write_req())]);
+    let put = out
+        .ops
+        .iter()
+        .find_map(|o| match o {
+            engine_delegate::schedule::Op::Put { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("a put");
+
+    // The store never holds it, so every read-back is empty.
+    let _ = s.handle(vec![Inbound::PutAcked { id: put, ok: true }]);
+    assert_eq!(s.awaiting(), 1, "the ack did not queue a read-back");
+
+    let mut rounds = 0;
+    let mut failed_at = None;
+    while rounds < 100 {
+        rounds += 1;
+        let out = s.handle(vec![Inbound::GotState {
+            id: put,
+            bytes: None,
+        }]);
+        if s.awaiting() == 0 {
+            failed_at = Some(rounds);
+            assert!(
+                !states(&out.replies).contains(&State::Published),
+                "a put that never read back was published"
+            );
+            break;
+        }
+        assert!(
+            !out.ops.is_empty(),
+            "round {rounds}: the shell stopped asking but is still waiting, \
+             so nothing will ever wake it again"
+        );
+    }
+    let failed_at = failed_at.expect("it never gave up, so it would wait for ever");
+    assert!(
+        failed_at > 1,
+        "the FIRST empty read-back was treated as failure; a put is readable \
+         a short time after it is acknowledged, not instantly"
+    );
+    assert!(
+        failed_at < 100,
+        "it asked {failed_at} times without a bound"
+    );
+    println!("  never readable back: asked {failed_at} times, then failed");
+}
+
+/// Anything the shell does not understand is dropped and COUNTED.
+///
+/// Acceptance 5: garbage, an empty message, and a response for a contract
+/// nobody is waiting on. None of them may panic, and none may pass silently —
+/// a client talking in a format the shell cannot read would otherwise wait
+/// for ever for a reply to a message that was never read.
+#[test]
+fn what_the_shell_cannot_understand_is_dropped_and_counted() {
+    let store = Store::default();
+    let mut s: Shell<Store> = Shell::resume(&[], Params::default(), store.clone());
+
+    let out = s.handle(vec![
+        Inbound::Client(vec![]),
+        Inbound::Client(vec![0xFF; 64]),
+        Inbound::Client(b"not bincode at all".to_vec()),
+        Inbound::Other,
+    ]);
+    assert_eq!(
+        out.dropped.len(),
+        4,
+        "{} of 4 unusable messages were counted",
+        out.dropped.len()
+    );
+    assert_eq!(
+        out.dropped
+            .iter()
+            .filter(|d| **d == Dropped::Unparseable)
+            .count(),
+        3
+    );
+    assert_eq!(
+        out.dropped
+            .iter()
+            .filter(|d| **d == Dropped::NotForUs)
+            .count(),
+        1
+    );
+    assert!(out.ops.is_empty(), "garbage produced a node operation");
+
+    // A state for a contract nobody asked about: not a panic, and not a
+    // confirmation of anything.
+    let out = s.handle(vec![Inbound::GotState {
+        id: [9u8; 32],
+        bytes: Some(vec![1, 2, 3]),
+    }]);
+    assert!(
+        states(&out.replies).is_empty(),
+        "an unrelated state told a client something"
+    );
+
+    // The control: a well-formed request in the same shell IS understood, so
+    // the counts above are not simply a shell that drops everything.
+    let out = s.handle(vec![Inbound::Client(write_req())]);
+    assert_eq!(
+        states(&out.replies).first(),
+        Some(&State::Accepted),
+        "a well-formed write was dropped too, so this test shows only that \
+         the shell rejects everything"
+    );
+    println!("  4 unusable messages dropped and counted; a good one still works");
+}
+
+/// The shell survives being rebuilt from its context between every call.
+///
+/// Which is not a stress test: it is what a delegate DOES. Anything the shell
+/// keeps in memory is gone by the next message.
+#[test]
+fn the_shell_works_when_rebuilt_from_its_context_between_every_call() {
+    let store = Store::default();
+    let mut ctx: Vec<u8> = Vec::new();
+    let mut every_state: Vec<State> = Vec::new();
+
+    let mut inbound = vec![Inbound::Client(write_req())];
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        assert!(guard < 1000, "the write never settled");
+        let mut s: Shell<Store> = Shell::resume(&ctx, Params::default(), store.clone());
+        let out = s.handle(std::mem::take(&mut inbound));
+        ctx = s.to_context().expect("a context after every call");
+        every_state.extend(states(&out.replies));
+        // Nothing may be left holding at the end of a call. The scheduler
+        // does not survive one, so anything still queued is GONE and the core
+        // will not emit it again — a silently lost write.
+        assert_eq!(
+            out.stranded, 0,
+            "call {guard} ended with {} effect(s) still queued; the scheduler \
+             does not survive a call, so they are lost",
+            out.stranded
+        );
+        println!(
+            "    call {guard}: {} op(s) {:?}, stranded {}, states {:?}",
+            out.ops.len(),
+            out.ops
+                .iter()
+                .map(|o| match o {
+                    engine_delegate::schedule::Op::Put { .. } => "put",
+                    engine_delegate::schedule::Op::Get { .. } => "get",
+                    engine_delegate::schedule::Op::Head { .. } => "head",
+                    engine_delegate::schedule::Op::ReadHead { .. } => "readhead",
+                })
+                .collect::<Vec<_>>(),
+            out.stranded,
+            states(&out.replies)
+        );
+        if every_state.contains(&State::Published) {
+            break;
+        }
+        // The node does what the ops ask, and answers.
+        let mut next = Vec::new();
+        for op in out.ops {
+            match op {
+                engine_delegate::schedule::Op::Put { id, bytes } => {
+                    store.put(id, &bytes);
+                    next.push(Inbound::PutAcked { id, ok: true });
+                }
+                engine_delegate::schedule::Op::Get { id, .. } => {
+                    let held = store.get(&id).map(|b| b.to_vec());
+                    next.push(Inbound::GotState { id, bytes: held });
+                }
+                // The head is written to the Register and read back by the
+                // same rule as a block: the node acknowledges the write, and
+                // only reading the expected seq back publishes the commit.
+                engine_delegate::schedule::Op::Head { seq, root } => {
+                    next.push(Inbound::GotHead { seq, root });
+                }
+                engine_delegate::schedule::Op::ReadHead { .. } => {
+                    next.push(Inbound::NoHead);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        inbound = next;
+    }
+    assert!(
+        every_state.contains(&State::Accepted),
+        "the write was never accepted across {guard} calls: {every_state:?}"
+    );
+    assert!(
+        every_state.contains(&State::Published),
+        "the write never PUBLISHED across {guard} calls: {every_state:?}. \
+         Reaching only Accepted means the head was written and never \
+         confirmed, and a shell that stops there has told a client its data \
+         is saved when the head nobody read back may not be there."
+    );
+    println!("  rebuilt from context on every call: {guard} calls, states {every_state:?}");
+}
+
+/// A write before `Install` is refused, and COUNTED, not left hanging.
+///
+/// A delegate cannot fabricate a contract — it has no way to produce wasm —
+/// so the code must arrive from outside. Until it has, a PUT is one the node
+/// would refuse anyway; dropping it here is the same outcome without the
+/// round trip. What must not happen is silence: a client that never sent
+/// `Install` would otherwise see its write accepted and then nothing.
+#[test]
+fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
+    let store = Store::default();
+    let mut without: Shell<Store> =
+        Shell::resume_with(&[], Params::default(), store.clone(), false);
+    let out = without.handle(vec![Inbound::Client(write_req())]);
+    assert_eq!(
+        states(&out.replies).first(),
+        Some(&State::Accepted),
+        "the write was not even accepted"
+    );
+    assert!(
+        !out.ops
+            .iter()
+            .any(|o| matches!(o, engine_delegate::schedule::Op::Put { .. })),
+        "a put was built with no contract code to build it from"
+    );
+    assert!(
+        out.refused_no_code > 0,
+        "the put was dropped without being counted, so a client that never \
+         sent Install sees its write accepted and then nothing at all"
+    );
+
+    // The control: the same write with the code on hand DOES put. Otherwise
+    // this test would pass over a shell that never puts anything.
+    let mut with: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
+    let out = with.handle(vec![Inbound::Client(write_req())]);
+    assert!(
+        out.ops
+            .iter()
+            .any(|o| matches!(o, engine_delegate::schedule::Op::Put { .. })),
+        "the same write did not put even WITH the code, so the refusal above \
+         is not the missing code doing it"
+    );
+    assert_eq!(out.refused_no_code, 0);
+    println!("  no code: write accepted, put refused and counted; with code: put issued");
+}
+
+/// `Install` hands the delegate what it cannot produce, and it derives none
+/// of it.
+///
+/// A delegate cannot fabricate a contract and cannot mint authority. What it
+/// is given is kept as given: the test asserts the engine records
+/// `Provisioned(Test)` as the SOURCE of its authority — a statement, never
+/// the key — so a key that is not for real use cannot be mistaken for one
+/// that is by anything reading the engine's state.
+#[test]
+fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
+    let store = Store::default();
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, false);
+
+    let req = bincode::serialize(&Request::Install {
+        block_code: vec![1u8; 64],
+        register_code: vec![2u8; 32],
+        register_params: vec![3u8; 16],
+        signing_key: engine_delegate::wire::TestKey(vec![4u8; 32]),
+    })
+    .unwrap();
+    let out = s.handle(vec![Inbound::Client(req)]);
+    assert!(
+        s.provisioned,
+        "Install did not record that a key was provisioned, so a caller \
+         cannot tell it from a message that never arrived"
+    );
+    assert_eq!(
+        s.installed,
+        Some(64 + 32),
+        "the installed sizes do not add up to the code that was sent"
+    );
+    assert!(out.dropped.is_empty(), "a well-formed Install was dropped");
+    assert!(out.ops.is_empty(), "Install produced a node operation");
+
+    // What the ENGINE records is where its authority came from — and the
+    // type says TEST, which is the whole point of naming it.
+    let out = s.handle(vec![Inbound::Client(
+        bincode::serialize(&Request::Start { epochs: vec![1] }).unwrap(),
+    )]);
+    assert!(
+        out.ops
+            .iter()
+            .any(|o| matches!(o, engine_delegate::schedule::Op::ReadHead { .. })),
+        "Start did not read the head"
+    );
+    println!("  Install: 96 B of code + a TEST key provisioned, nothing derived");
+}
+
+/// A commit too big for one return is refused UP FRONT, never half-emitted.
+///
+/// A pack's bytes exist only in the return that made them — `Commit::packs`
+/// is `#[serde(skip)]`, deliberately, because a pack is the largest thing the
+/// engine touches and the context is 400 KiB. So the shell cannot hold a put
+/// back for the next entry: whatever a commit emits must go out now or be
+/// lost, and a commit that went out HALF would wait for ever on
+/// confirmations for blocks nobody has.
+///
+/// That makes the core's `max_commit_blocks` and the shell's per-return PUT
+/// limit one number, not two. This asserts the consequence: at the boundary
+/// the write is refused with `Busy` and nothing is put, rather than a partial
+/// set going out.
+#[test]
+fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
+    // The two numbers, set equal. A commit may name at most what one return
+    // can carry.
+    let per_return = 4usize;
+    let params = Params {
+        max_commit_blocks: per_return,
+        // Values over max_packed_value are PUT one each, so the block count
+        // is the number of keys and the boundary is reachable exactly.
+        ..Params::default()
+    };
+    let store = Store::default();
+
+    let run = |n: u32| -> (Vec<State>, usize, usize) {
+        let mut s: Shell<Store> = Shell::resume_with(&[], params, store.clone(), true);
+        s.limits = engine_delegate::schedule::Limits {
+            max_gets: 4,
+            max_puts: per_return,
+        };
+        let ops: Vec<(Vec<u8>, Op)> = (0..n)
+            .map(|i| {
+                (
+                    format!("k{i:04}").into_bytes(),
+                    Op::Put(vec![(i % 251) as u8; params.max_packed_value + 1]),
+                )
+            })
+            .collect();
+        let out = s.handle(vec![Inbound::Client(
+            bincode::serialize(&Request::Write {
+                client: 1,
+                write_id: 1,
+                ops,
+            })
+            .unwrap(),
+        )]);
+        let puts = out
+            .ops
+            .iter()
+            .filter(|o| matches!(o, engine_delegate::schedule::Op::Put { .. }))
+            .count();
+        (states(&out.replies), puts, out.stranded)
+    };
+
+    // Over the boundary: refused, and NOTHING put.
+    let (over, over_puts, over_stranded) = run(per_return as u32 * 4);
+    assert_eq!(
+        over,
+        vec![State::Busy],
+        "a commit naming more blocks than one return can carry was not \
+         refused; it was {over:?}"
+    );
+    assert_eq!(
+        over_puts, 0,
+        "{over_puts} put(s) went out for a refused commit — a commit emitted \
+         in part waits for ever on confirmations for blocks nobody has"
+    );
+    assert_eq!(over_stranded, 0, "a refused commit left effects queued");
+
+    // The control: under the boundary it is accepted and every block goes out
+    // in this one return. Without it, "nothing was put" is also what a shell
+    // that never puts anything looks like.
+    let (under, under_puts, under_stranded) = run(2);
+    assert_eq!(under.first(), Some(&State::Accepted));
+    assert!(
+        under_puts > 0,
+        "a commit UNDER the same boundary put nothing either, so the refusal \
+         above is not the boundary doing it"
+    );
+    assert_eq!(
+        under_stranded, 0,
+        "{under_stranded} effect(s) were left queued for a commit that fits, \
+         so the shell is holding puts it cannot hold"
+    );
+    println!(
+        "  over the boundary: Busy, 0 puts; under it: Accepted, {under_puts} put(s), 0 stranded"
+    );
+}

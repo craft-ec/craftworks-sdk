@@ -442,58 +442,76 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     let mut directs = 0usize;
     let mut retries_seen = 0usize;
     let mut max_context = 0usize;
-    for seed in 1..=24u64 {
-        let l = sweep_seed(Mode::Live, Params::default(), seed);
-        let d = sweep_seed(Mode::Rehydrate, Params::default(), seed);
+    // BOTH write paths. Phase 3 ships members only; Phase 4 (#39) turns the
+    // pack back on, and the format has to keep working until then — a sweep
+    // over one of them would let the other rot with nothing to say so.
+    for (arm, params) in [
+        ("members", Params::default()),
+        (
+            "packed",
+            Params {
+                pack_on_write: true,
+                ..Params::default()
+            },
+        ),
+    ] {
+        for seed in 1..=24u64 {
+            let l = sweep_seed(Mode::Live, params, seed);
+            let d = sweep_seed(Mode::Rehydrate, params, seed);
 
-        assert_eq!(
-            l.published, d.published,
-            "seed {seed}: an engine rebuilt from its context between every \
+            assert_eq!(
+                l.published, d.published,
+                "seed {seed}: an engine rebuilt from its context between every \
              step published a different root from one that survived, so \
              something the pipeline needs is not in the context"
-        );
-        for s in [&l, &d] {
-            assert_eq!(
-                s.published, s.expected,
-                "seed {seed}: the published root is not the root a rebuild \
-                 produces"
             );
-        }
-        // And no write was silently dropped, or reported an impossible life.
-        for s in [&l, &d] {
-            for (client, id) in &s.live {
-                let states = s.seen.of(*client, *id);
-                assert!(
-                    !states.is_empty(),
-                    "seed {seed}: write {id} was never reported at all"
-                );
-                assert!(
-                    valid_sequence(states),
-                    "seed {seed}: write {id} reported an impossible sequence: \
-                     {states:?}"
+            for s in [&l, &d] {
+                assert_eq!(
+                    s.published, s.expected,
+                    "seed {seed}: the published root is not the root a rebuild \
+                 produces"
                 );
             }
+            // And no write was silently dropped, or reported an impossible life.
+            for s in [&l, &d] {
+                for (client, id) in &s.live {
+                    let states = s.seen.of(*client, *id);
+                    assert!(
+                        !states.is_empty(),
+                        "seed {seed}: write {id} was never reported at all"
+                    );
+                    assert!(
+                        valid_sequence(states),
+                        "seed {seed}: write {id} reported an impossible sequence: \
+                     {states:?}"
+                    );
+                }
+            }
+            // The states themselves must agree too: a rehydrate that reaches the
+            // right root while telling a client something different is still a
+            // bug the root comparison cannot see.
+            assert_eq!(
+                l.seen, d.seen,
+                "seed {seed}: the two modes reported different write states"
+            );
+            pack_failures += l.pack_failures + d.pack_failures;
+            direct_failures += l.direct_failures + d.direct_failures;
+            directs += l.directs + d.directs;
+            retries_seen += l.retries + d.retries;
+            max_context = max_context.max(d.max_context);
+            println!("  {arm} seed {seed:2}: both modes match a rebuild");
         }
-        // The states themselves must agree too: a rehydrate that reaches the
-        // right root while telling a client something different is still a
-        // bug the root comparison cannot see.
-        assert_eq!(
-            l.seen, d.seen,
-            "seed {seed}: the two modes reported different write states"
-        );
-        pack_failures += l.pack_failures + d.pack_failures;
-        direct_failures += l.direct_failures + d.direct_failures;
-        directs += l.directs + d.directs;
-        retries_seen += l.retries + d.retries;
-        max_context = max_context.max(d.max_context);
-        println!("  seed {seed:2}: both modes match a rebuild");
     }
     // Without this the sweep can inject failures that never land on a pack and
     // report green over a branch it never entered.
+    // The pack arm must have hit the pack path. With packing off the write
+    // path this counts zero for the members arm, which is correct and is why
+    // the sweep runs both.
     assert!(
         pack_failures > 0,
-        "{retries_seen} put failures were injected and NONE hit a pack: the \
-         pack retry path was not exercised"
+        "{retries_seen} put failures were injected and NONE hit a pack across \
+         BOTH arms: the pack retry path was not exercised, and Phase 4 is \
+         where it comes back"
     );
     // The other half of the same floor. A pack retry and a direct-block retry
     // are different branches, and a sweep whose values are all small emits no
@@ -711,8 +729,10 @@ fn a_group_written_continuously_is_still_protected_within_the_age_bound() {
 fn an_opaque_value_passes_through_untouched() {
     let mut e = common::new_store_params(Params {
         // Small enough that the large value takes its own PUT, so both paths
-        // are exercised in one test.
+        // are exercised in one test — which needs the pack path ON, since
+        // Phase 3 leaves it off and there would otherwise be only one path.
         max_packed_value: 4096,
+        pack_on_write: true,
         ..Params::default()
     });
     let mut seen = Seen::default();
@@ -883,6 +903,13 @@ fn a_single_key_write_parses_nodes_in_proportion_to_depth() {
     let measure = |whole: bool| -> usize {
         let mut e = common::new_store_params(Params {
             whole_tree_supersede_scan: whole,
+            // The 10,000-key SEED below is a fixture, not a live commit. The
+            // commit cap exists because a pack's bytes do not survive the
+            // `process()` return that made them, and nothing here returns;
+            // capping the seed would mean this test could only ever measure
+            // a tree one commit deep, which is the opposite of what it is
+            // for. The single-key write it then measures IS under the cap.
+            max_commit_blocks: usize::MAX,
             ..Params::default()
         });
         let mut seen = Seen::default();
@@ -1038,4 +1065,130 @@ fn a_write_whose_group_is_re_coded_waits_for_the_new_coding() {
          and proves nothing about the new one"
     );
     println!("  with transfer: A completes once, after the new coding; control completes it early");
+}
+
+/// The page-closed promise, with no clock at all.
+///
+/// `Tick` arrives only from a connected client (W4: the released node fires
+/// no wake-ups), so once the tab closes nothing will ever ask the engine to
+/// get on with it. Everything the promise covers must therefore be
+/// event-driven — a commit in flight advances on its own confirmations — or
+/// must happen on `Flush`, which the shell sends on disconnect.
+///
+/// So this drives writes, sends `Flush`, and then NEVER sends a tick. Every
+/// write must still reach `Published` and `ParityComplete`.
+///
+/// The control is the same run with no `Flush`: owed parity stays owed for
+/// ever, and the test sees it. Without that, "parity was complete" would
+/// read identically in a build where `Flush` did nothing.
+#[test]
+fn after_a_disconnect_every_write_publishes_and_its_parity_is_put_without_a_tick() {
+    let run = |flush: bool| -> (Seen, usize, usize) {
+        let store = Store::fresh();
+        let mut e = Engine::new(
+            Params {
+                coalesce_parity: true,
+                ..Params::default()
+            },
+            store.clone(),
+        );
+        let mut seen = Seen::default();
+        // Values by reference, so the leaves carry parity over them.
+        let mut queue = Vec::new();
+        for n in 1..=3u64 {
+            let ops: Vec<(Vec<u8>, Op)> = (0..16u32)
+                .map(|i| {
+                    (
+                        format!("k/{n}/{i:04}").into_bytes(),
+                        Op::Put(vec![(i % 251) as u8; 1400]),
+                    )
+                })
+                .collect();
+            let out = stepped!(e, write(1, n, ops));
+            seen.absorb(&out);
+            queue.extend(out.clone());
+            // Drive this commit to published before the next write, since one
+            // commit at a time means the next would otherwise be refused.
+            let mut guard = 0;
+            while let Some(f) = queue.pop() {
+                guard += 1;
+                assert!(guard < 100_000, "the commit did not settle");
+                let o = match &f {
+                    Effect::PutPack { id, .. }
+                    | Effect::PutBlock { id, .. }
+                    | Effect::PutParity { id, .. } => stepped!(e, Event::PutConfirmed(*id)),
+                    Effect::UpdateHead { seq, .. } => stepped!(e, Event::HeadConfirmed(*seq)),
+                    _ => Vec::new(),
+                };
+                seen.absorb(&o);
+                queue.extend(o);
+            }
+        }
+
+        // The client goes away. No tick is sent here, or ever.
+        if flush {
+            let out = stepped!(e, Event::Flush);
+            seen.absorb(&out);
+            queue.extend(out);
+        }
+        let mut guard = 0;
+        let mut parity_put = 0usize;
+        while let Some(f) = queue.pop() {
+            guard += 1;
+            assert!(guard < 100_000, "the flush did not settle");
+            let o = match &f {
+                Effect::PutParity { id, .. } => {
+                    parity_put += 1;
+                    stepped!(e, Event::PutConfirmed(*id))
+                }
+                Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => {
+                    stepped!(e, Event::PutConfirmed(*id))
+                }
+                Effect::UpdateHead { seq, .. } => stepped!(e, Event::HeadConfirmed(*seq)),
+                _ => Vec::new(),
+            };
+            seen.absorb(&o);
+            queue.extend(o);
+        }
+        (seen, parity_put, e.owed_groups())
+    };
+
+    let (seen, put, _) = run(true);
+    for n in 1..=3u64 {
+        let states = seen.of(1, n);
+        assert!(
+            states.contains(&State::Published),
+            "write {n} did not publish after a disconnect: {states:?}"
+        );
+        assert!(
+            states.contains(&State::ParityComplete),
+            "write {n} published but its parity was never complete, and no \
+             tick is ever coming: {states:?}"
+        );
+        assert!(
+            valid_sequence(states),
+            "write {n} reported an impossible sequence: {states:?}"
+        );
+    }
+    assert!(
+        put > 0,
+        "Flush put no parity at all, so ParityComplete above says nothing"
+    );
+
+    // The control: no Flush, no tick, and the parity stays owed.
+    let (control, control_put, _) = run(false);
+    let complete = (1..=3u64)
+        .filter(|n| control.of(1, *n).contains(&State::ParityComplete))
+        .count();
+    assert_eq!(
+        control_put, 0,
+        "the control put {control_put} parity block(s) without a Flush or a \
+         tick, so Flush is not what puts them"
+    );
+    assert_eq!(
+        complete, 0,
+        "{complete} write(s) reached ParityComplete with no Flush and no \
+         tick, so the test cannot tell a working Flush from a no-op"
+    );
+    println!("  disconnect, no ticks ever: 3 writes published, {put} parity block(s) put (control without Flush: {control_put})");
 }

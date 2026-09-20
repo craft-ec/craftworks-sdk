@@ -14,10 +14,13 @@
 //!
 //! | state | promise |
 //! |---|---|
-//! | `Accepted` | in the engine's memory. Survives a tab close, NOT a node restart. |
-//! | `Stalled` | still held, not saved, and not moving. Non-terminal. |
+//! | `Accepted` | applied to the tree, not yet shipped. Survives a tab close, NOT a node restart. |
+//! | `Stalled` | the commit carrying it cannot publish, and is not moving. Non-terminal, reported once. |
 //! | `Published` | packs read back, THEN the head read back. Survives a restart, and what a UI may call "saved". |
 //! | `ParityComplete` | the redundancy the new nodes promise actually exists. |
+//! | `Busy` | TERMINAL, and nothing was applied: a commit was already in flight, or a cap was reached. The client still holds the write and may re-submit it. |
+//! | `Failed` | TERMINAL. The edit is NOT in the tree and never will be, so a re-submit applies it once. Never reported for a write whose edit IS in the tree. |
+//! | `Lost` | TERMINAL. The commit carrying it will not publish and the engine no longer has it; the client is the only thing that does. |
 //!
 //! Between `Published` and `ParityComplete` the tree is correct and its groups
 //! have no redundancy. That is *absent redundancy, not an error*
@@ -56,7 +59,9 @@ pub enum Op {
 }
 
 /// How far along a write is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum State {
     Accepted,
     /// Still held, not yet saved, and the engine cannot publish it right now.
@@ -102,6 +107,14 @@ pub enum Event {
     PutFailed(Cid),
     HeadConfirmed(u64),
     Tick(u64),
+    /// The client has gone. Ship what is waiting; there will be no more ticks.
+    ///
+    /// The shell sends this on disconnect. `Tick` comes only from a connected
+    /// client (W4: the node fires no wake-ups), so nothing the page-closed
+    /// promise depends on may need one — a commit in flight advances on its
+    /// confirmations, and everything else that a tick would have got round to
+    /// happens here instead.
+    Flush,
 
     // ---- the read path ----
     Get {
@@ -171,10 +184,30 @@ pub struct Epoch(pub u32);
 ///
 /// Stated at `Start` and never inferred. The engine does not mint authority:
 /// it is handed some, or it has none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeySource {
     SecretStore,
     Reissued,
+    /// Handed in from outside and kept in the secret store, unmodified.
+    ///
+    /// The delegate derives NOTHING: it is given a key and it uses that key.
+    /// Where a real device key comes from is sdk#14's, and this is the
+    /// parameter that lets it slot in without the shell changing — the shell
+    /// only ever knows that it was handed one.
+    ///
+    /// Today the only provisioner is a test harness, which generates a fresh
+    /// key per run and removes it afterwards. `Test` says so IN THE TYPE, so
+    /// a key that is not for real use cannot be mistaken for one that is by
+    /// anything reading this.
+    Provisioned(Provisioned),
+}
+
+/// Who provisioned a key, and whether it is real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Provisioned {
+    /// Generated for one run by a driver, and removed at the end of it.
+    /// Never read from disk, never a real key.
+    Test,
 }
 
 /// A group's three parity ids. The unit redundancy comes in: three blocks are
@@ -247,6 +280,17 @@ pub struct Params {
     pub max_pack: usize,
     /// A value at or under this rides inside a pack; above it, its own PUT.
     pub max_packed_value: usize,
+    /// Whether a commit ships a PACK as well as its blocks.
+    ///
+    /// FALSE in Phase 3, and the reason is arithmetic rather than taste: a
+    /// pack is transient, so the network holds pack + members either way and
+    /// the pack only moves who pays. With no keepers, that is the writer
+    /// both times.
+    ///
+    /// Kept as a parameter, not deleted, because Phase 4 turns it back on
+    /// with the other half in place — keepers putting the members, and reads
+    /// resolving through the head's packs.
+    pub pack_on_write: bool,
     /// Accepted-but-not-durable bytes beyond which a `Write` is refused. A
     /// queue with no bound is a queue that eventually eats the node.
     pub max_backlog: usize,
@@ -366,11 +410,24 @@ pub struct Params {
     pub max_parked_reads: usize,
     /// Blocks one commit may name.
     ///
-    /// The commit's bookkeeping carries a Cid for every block it is waiting
-    /// on, about 60 B each in the context (measured). `max_backlog` bounds a
-    /// commit in BYTES, which says nothing about how many blocks those bytes
-    /// become: eight megabytes of small values is thousands of them, and the
-    /// context would not fit. This is the bound that closes the arithmetic.
+    /// TWO bounds meet here and they are one number.
+    ///
+    /// The context: a commit's bookkeeping carries a Cid per block it waits
+    /// on, ~54 B each (measured), and `max_backlog` bounds a commit in BYTES
+    /// which says nothing about how many blocks those bytes become.
+    ///
+    /// The PLATFORM: a pack's bytes exist only in the return that made them
+    /// (`Commit::packs` is `#[serde(skip)]`, deliberately — a pack is the
+    /// largest thing the engine touches and the context is 400 KiB), so the
+    /// shell cannot hold a put back for the next entry. Whatever a commit
+    /// emits must go out in ONE `process()` return.
+    ///
+    /// 128 is the largest k MEASURED to work: k = 1..128 PUTs from one
+    /// return, each acknowledged, zero errors, on a private network-mode
+    /// node. The limit was NOT reached — 128 is where the search stopped,
+    /// not where the node refused. F21's "8" was a probe's `--max-k` default
+    /// that had been read as a platform constant; this is a measurement, and
+    /// it stays a measurement rather than becoming the next inherited number.
     pub max_commit_blocks: usize,
     /// Blocks one call may read while recomputing owed parity.
     ///
@@ -391,6 +448,7 @@ impl Default for Params {
         Params {
             max_pack: 1024 * 1024,
             max_packed_value: 64 * 1024,
+            pack_on_write: false,
             max_backlog: 8 * 1024 * 1024,
             parity_age: 32,
             coalesce_parity: true,
@@ -415,7 +473,7 @@ impl Default for Params {
             max_apply_rounds: 32,
             max_parked_write_bytes: 128 * 1024,
             max_parked_reads: 1000,
-            max_commit_blocks: 2048,
+            max_commit_blocks: 128,
             max_parity_scan_blocks: 512,
             head_before_packs: false,
         }
@@ -729,6 +787,7 @@ impl<B: Blocks> Engine<B> {
             Event::PutFailed(id) => self.on_failed(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
             Event::Tick(now) => self.on_tick(now),
+            Event::Flush => self.on_flush(),
             Event::Get {
                 client,
                 req_id,
@@ -1521,11 +1580,29 @@ impl<B: Blocks> Engine<B> {
             self.told_stalled.remove(w);
         }
 
-        // Big values do not ride in a pack: one PUT each, and the pack stays
-        // within a size the network is willing to move.
-        let (packable, direct): (Vec<_>, Vec<_>) = emitted
-            .into_iter()
-            .partition(|(_, b)| b.len() <= self.params.max_packed_value);
+        // PHASE 3 WRITES MEMBERS, NOT PACKS.
+        //
+        // A pack is a transport and it is inherently TRANSIENT: a head names
+        // at most a few, and one leaves the network as soon as it is
+        // unpacked. So the total is always pack PLUS members — a pack only
+        // changes WHO pays for the members, and with no keepers in Phase 3
+        // the writer pays for them anyway. Sending both cost ~188 KiB per
+        // commit for a pack nothing reads.
+        //
+        // What makes members-only need no new read path is F35: a delegate's
+        // own PUT is HOSTED, so a member it wrote is readable at its own key.
+        //
+        // The pack FORMAT stays — kind, pack.rs, its vectors — because Phase
+        // 4 (#39) is where it earns its place: the writer puts the pack only,
+        // keepers put the members, and reads resolve through the head's
+        // packs. This is the write path, not the format.
+        let (packable, direct): (Vec<_>, Vec<_>) = if self.params.pack_on_write {
+            emitted
+                .into_iter()
+                .partition(|(_, b)| b.len() <= self.params.max_packed_value)
+        } else {
+            (Vec::new(), emitted)
+        };
 
         let manifest = pack::Manifest {
             prev_seq: self.published_seq,
@@ -1564,8 +1641,12 @@ impl<B: Blocks> Engine<B> {
             current.push((pack::member_kind(&b), b));
         }
         // A commit that emitted nothing packable still ships its manifest: the
-        // journal entry is the point, not the payload.
-        packs.push(current);
+        // journal entry is the point, not the payload. With packing off the
+        // write path there is no pack at all — the head IS the journal, and
+        // a manifest nobody will read is bytes nobody should pay for.
+        if self.params.pack_on_write {
+            packs.push(current);
+        }
 
         let mut pack_bodies: BTreeMap<Cid, Vec<u8>> = BTreeMap::new();
         for members in packs {
@@ -1769,6 +1850,30 @@ impl<B: Blocks> Engine<B> {
             .into_iter()
             .filter(|(c, _)| seen.insert(*c))
             .collect()
+    }
+
+    /// The client is going away: do now what a tick would eventually do.
+    ///
+    /// There is no clock. `Tick` arrives only from a connected client, so
+    /// once the tab closes nothing else will ever ask the engine to get on
+    /// with it — and everything the page-closed promise covers must therefore
+    /// be event-driven or happen HERE.
+    ///
+    /// Two things. Start a commit for anything applied but not yet shipped,
+    /// and put ALL owed parity regardless of age: coalescing trades a little
+    /// redundancy-latency for fewer puts while someone is watching, and there
+    /// is nothing left to coalesce WITH once they are gone. A commit already
+    /// in flight is left alone; it advances on its own confirmations, which
+    /// is exactly the part that does not need a clock.
+    fn on_flush(&mut self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if self.pending.is_none() && !self.unpublished.is_empty() {
+            let to_ship = self.take_unpublished();
+            out.extend(self.start_commit(to_ship));
+        }
+        // Every group, whatever its age and whether or not it settled.
+        out.extend(self.emit_parity(|_| true));
+        out
     }
 
     fn on_tick(&mut self, now: u64) -> Vec<Effect> {
@@ -2319,7 +2424,31 @@ impl<B: Blocks> Engine<B> {
     /// may be from another version, truncated, or nothing to do with us. A
     /// refusal is not a disaster — the caller starts from `Start` and reads
     /// its head, which is the only authority anyway.
-    pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
+    /// Resume from a context, or start fresh if it cannot be used.
+    ///
+    /// The pair `from_context(...).unwrap_or_else(|_| Engine::new(...))` does
+    /// not compile: `from_context` consumes `blocks`, so a caller cannot
+    /// reach for them again on the error arm. That shape pushed one caller
+    /// into an `unreachable!()`, which is a PANIC on a path a damaged context
+    /// reaches — and a delegate that panics on input is one a malformed
+    /// context can take down. So the fallback lives here, where the blocks
+    /// are still in hand.
+    ///
+    /// The bool says which happened. A caller that wants to report "this
+    /// engine started from nothing" needs it, and inferring it from a state
+    /// that merely looks fresh would be a guess.
+    pub fn from_context_or_new(bytes: &[u8], params: Params, blocks: B) -> (Self, bool) {
+        match Self::read_context(bytes, params) {
+            Some(c) => (Self::hydrate(c, params, blocks), true),
+            None => (Engine::new(params, blocks), false),
+        }
+    }
+
+    /// Read and VERIFY a context, without needing the blocks.
+    ///
+    /// Split out so a caller can fall back to a fresh engine without having
+    /// already given its blocks away.
+    fn read_context(bytes: &[u8], params: Params) -> Option<Context> {
         use bincode::Options;
         // Every check below happens BEFORE the decoder sees a byte of the
         // body. A decoder that refuses malformed input is not the same thing
@@ -2327,28 +2456,33 @@ impl<B: Blocks> Engine<B> {
         // 656 of 876 single-window corruptions as a perfectly good context
         // and handed back an engine in whatever state the damage described.
         if bytes.len() < CONTEXT_HEADER || bytes.len() > params.max_context_bytes {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         if bytes[..4] != CONTEXT_MAGIC {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
         if version != CONTEXT_VERSION {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         let body = &bytes[CONTEXT_HEADER..];
         if bytes[6..CONTEXT_HEADER] != context_checksum(body) {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         let c: Context = context_opts(params.max_context_bytes)
             .deserialize(body)
-            .map_err(|_| ContextError::Unreadable)?;
+            .ok()?;
         // Kept as well as the header's: two independent statements of the
         // same fact cost two bytes and catch a build that changed the shape
         // without changing the constant.
         if c.version != CONTEXT_VERSION {
-            return Err(ContextError::Unreadable);
+            return None;
         }
+        Some(c)
+    }
+
+    /// Build an engine from a context already verified by `read_context`.
+    fn hydrate(c: Context, params: Params, blocks: B) -> Self {
         let mut e = Engine::new(params, blocks);
         e.published_seq = c.published_seq;
         e.published_root = c.published_root;
@@ -2385,6 +2519,13 @@ impl<B: Blocks> Engine<B> {
         for (w, gs) in c.parity_waiting {
             e.parity_waiting.insert(w, gs.into_iter().collect());
         }
-        Ok(e)
+        e
+    }
+
+    pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
+        match Self::read_context(bytes, params) {
+            Some(c) => Ok(Self::hydrate(c, params, blocks)),
+            None => Err(ContextError::Unreadable),
+        }
     }
 }

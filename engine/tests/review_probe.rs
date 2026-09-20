@@ -8,7 +8,16 @@ fn put(k: String, v: Vec<u8>) -> (Vec<u8>, Op) {
 
 #[test]
 fn a_failed_pack_put_is_re_emitted() {
-    let mut e = Engine::new(Params::default(), Store::default());
+    let mut e = Engine::new(
+        Params {
+            // This test is ABOUT the pack path, which Phase 3 leaves off the
+            // write path and Phase 4 (#39) turns back on. The format and its
+            // handling stay tested either way.
+            pack_on_write: true,
+            ..Params::default()
+        },
+        Store::default(),
+    );
     let fx = stepped!(
         e,
         Event::Write {
@@ -37,7 +46,16 @@ fn a_failed_pack_put_is_re_emitted() {
 
 #[test]
 fn parity_complete_fires_once_per_write() {
-    let mut e = Engine::new(Params::default(), Store::default());
+    let mut e = Engine::new(
+        Params {
+            // This test is ABOUT the pack path, which Phase 3 leaves off the
+            // write path and Phase 4 (#39) turns back on. The format and its
+            // handling stay tested either way.
+            pack_on_write: true,
+            ..Params::default()
+        },
+        Store::default(),
+    );
     let ops: Vec<_> = (0..4000)
         .map(|i| put(format!("key-{i:06}"), vec![7u8; 40]))
         .collect();

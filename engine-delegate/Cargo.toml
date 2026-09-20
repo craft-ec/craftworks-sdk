@@ -1,0 +1,38 @@
+[package]
+name = "engine-delegate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The engine, hosted in a Freenet delegate: translation and scheduling, no policy."
+
+[lib]
+# cdylib for the wasm the node loads; rlib so the scheduler can be unit-tested
+# natively, with no wasm and no node. The scheduler is where the platform's
+# per-call limits live, and they are the part most worth testing directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+engine = { path = "../engine" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+# Signing a Register record. Pinned exactly and default-features off for the
+# same reason the Register contract pins it: `default-features = false`
+# selects the full `S < L` scalar check over the legacy three-bit one, and a
+# signature this delegate makes has to verify under the contract that will
+# check it.
+ed25519-dalek = { version = "=2.2.0", default-features = false }
+blake3 = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[features]
+# The `#[delegate]` macro emits the exported entry point only behind this, and
+# it must be declared HERE, not in the stdlib. Without it the crate compiles
+# to a module with no exports and no imports — and an import gate run against
+# that passes over nothing at all, which is how it was found the first time.
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+# The macro also probes a `trace` cfg. Declaring it keeps `-D warnings` clean
+# without turning anything on.
+trace = ["freenet-stdlib/trace"]
+

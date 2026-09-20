@@ -38,7 +38,7 @@ pub enum Via {
 }
 
 /// What a read came back with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReadResult {
     /// The value, or its absence. Absence is an answer.
     Value(Option<Vec<u8>>),

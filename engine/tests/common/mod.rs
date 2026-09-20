@@ -243,7 +243,24 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
     // would be a warm one — which is exactly what happened: five tests failed
     // with "0 fetches" because nothing was ever cold.
     let ws = Store::fresh();
-    let mut w = Engine::new(Params::default(), ws.clone());
+    // The fixture writer is not subject to `max_commit_blocks`.
+    //
+    // That cap exists because a pack's bytes do not survive the `process()`
+    // return that made them, so a live commit must fit in ONE return. This
+    // writer has no returns: it builds a tree in process, to BE the fixture
+    // the tests then read. Capping it would mean no test could use a tree
+    // bigger than one live commit, which is the opposite of what a read test
+    // wants — a deep tree is the whole point.
+    //
+    // A bulk import on a real node is the same shape and gets the same
+    // answer the cap gives: split it, which is the client's outbox's job.
+    let mut w = Engine::new(
+        Params {
+            max_commit_blocks: usize::MAX,
+            ..Params::default()
+        },
+        ws.clone(),
+    );
     let ops: Vec<(Vec<u8>, Op)> = records
         .iter()
         .map(|(k, v)| (k.clone(), Op::Put(v.clone())))
