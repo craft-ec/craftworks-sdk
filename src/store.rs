@@ -27,6 +27,14 @@ pub enum StoreError {
     Unavailable,
     /// The connection to the engine produced nothing usable.
     NoAnswer,
+    /// This range has never been loaded, so nothing here knows what is in it.
+    ///
+    /// **Not "empty".** The two are one byte apart in a reply and a world
+    /// apart in what an app does with them: told "empty" it draws an empty
+    /// list and stops. Told this, it reloads. A cache that answered the first
+    /// for the second would make every unbound range look like missing data,
+    /// with nothing on screen to say so.
+    NotLoaded,
 }
 
 impl std::fmt::Display for StoreError {
@@ -37,6 +45,9 @@ impl std::fmt::Display for StoreError {
                  the key may well exist",
             ),
             StoreError::NoAnswer => f.write_str("the engine did not answer"),
+            StoreError::NotLoaded => f.write_str(
+                "this range has not been loaded yet — reload it; it is not known to be empty",
+            ),
         }
     }
 }

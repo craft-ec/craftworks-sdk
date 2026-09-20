@@ -21,6 +21,59 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rustc-env=SDK_BUILD_REV={}", rev());
     println!("cargo:rustc-env=SDK_PROLLY_REV={}", prolly_rev());
+    // The contract hashes this build provisions with, COPIED from the
+    // contracts build — never re-hashed here. A consumer that re-hashes the
+    // files matches only while its algorithm and its notion of the canonical
+    // wasm stay byte-identical to the one script that builds them, and shows
+    // an authoritative-looking number that matches nothing when they drift.
+    // `hashes.toml` says so itself, and this obeys it.
+    let (block, register, rev) = contract_hashes();
+    println!("cargo:rustc-env=SDK_BLOCK_HASH={block}");
+    println!("cargo:rustc-env=SDK_REGISTER_HASH={register}");
+    println!("cargo:rustc-env=SDK_CONTRACTS_REV={rev}");
+}
+
+/// `(block, register, rev)` as the contracts build recorded them.
+///
+/// `unknown` where the checkout cannot be found — a deliberate value, like
+/// `rev`'s: a build that cannot name what it provisions with is exactly what
+/// the versions panel exists to surface, and a plausible-looking default would
+/// hide it.
+fn contract_hashes() -> (String, String, String) {
+    let unknown = || {
+        (
+            "unknown".to_string(),
+            "unknown".to_string(),
+            "unknown".to_string(),
+        )
+    };
+    let Some(repo) = contracts_repo() else {
+        return unknown();
+    };
+    let path = repo.join("build/hashes.toml");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return unknown();
+    };
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                (k.trim() == name).then(|| v.trim().trim_matches('"').to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    (field("block"), field("register"), field("rev"))
+}
+
+/// The contracts checkout beside this one, if there is one.
+fn contracts_repo() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("CRAFTWORKS_CONTRACTS") {
+        return Some(PathBuf::from(p));
+    }
+    let beside = Path::new(env!("CARGO_MANIFEST_DIR")).join("../freenet-contracts");
+    beside.join("build/hashes.toml").is_file().then_some(beside)
 }
 
 /// The commit this build came from, or `unknown` when nothing can say.
