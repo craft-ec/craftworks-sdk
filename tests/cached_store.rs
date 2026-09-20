@@ -217,3 +217,86 @@ fn a_delta_with_nothing_loaded_says_not_loaded_rather_than_naming_a_zero_root() 
         })
     );
 }
+
+/// **THE TIME A PAGE SENDS IS THE WALL CLOCK, QUANTISED — not a count of
+/// timer firings.**
+///
+/// The unit is a decision with two consequences, and both are measured here:
+///
+/// * `Params::parity_age` and `Params::max_accept_age` are counts of it, so
+///   an engine bound of 32 means 32 of whatever this sends;
+/// * a delegate's context is shared by EVERY connection (F47), so two tabs
+///   must send the same number for the same instant. They do here, because
+///   they are reading one clock rather than counting their own events.
+#[test]
+fn a_tick_carries_the_wall_clock_in_the_protocol_s_unit() {
+    let mut s = store();
+    s.send_tick(1_700_000_123_456);
+    let out = s.take_outbound();
+    assert_eq!(out.len(), 1, "one tick, one frame");
+
+    let want = protocol::tick_of(1_700_000_123_456);
+    match protocol::decode_request(&out[0]) {
+        protocol::Incoming::Ok(protocol::Envelope {
+            body: protocol::Request::Tick { now },
+            ..
+        }) => assert_eq!(
+            now, want,
+            "the page quantised the clock its own way. `tick_of` is the one \
+             place that decides, so a page and a test cannot pick two units"
+        ),
+        other => panic!("send_tick queued {other:?}, so the delegate is told no time at all"),
+    }
+
+    // TWO TABS, ONE INSTANT, ONE NUMBER. The delegate cannot tell them apart
+    // and must not need to.
+    let mut a = store();
+    let mut b = store();
+    a.send_tick(1_700_000_123_456);
+    b.send_tick(1_700_000_123_999);
+    assert_eq!(
+        a.take_outbound(),
+        b.take_outbound(),
+        "two tabs reading the same second sent different times. A delegate's \
+         context is shared by every connection (F47), so the lower one would \
+         make everything look young again and the deadlines would never fire"
+    );
+}
+
+/// A CONTROL for the quantum: two instants a tick apart are NOT the same.
+///
+/// Without it, `tick_of` returning a constant would satisfy the agreement
+/// test above perfectly — every tab would agree, on a clock that never moves,
+/// and no deadline would ever be reached.
+#[test]
+fn control_a_later_tick_is_a_later_number() {
+    let mut early = store();
+    let mut late = store();
+    early.send_tick(1_700_000_000_000);
+    late.send_tick(1_700_000_000_000 + protocol::TICK_MS);
+    assert_ne!(
+        early.take_outbound(),
+        late.take_outbound(),
+        "a whole tick apart and the same number: the clock does not advance"
+    );
+}
+
+/// **A FLUSH IS WHAT A CLOSING PAGE SAYS**, and it must be a frame.
+#[test]
+fn a_flush_is_queued_as_a_frame() {
+    let mut s = store();
+    s.send_flush();
+    let out = s.take_outbound();
+    assert_eq!(out.len(), 1, "one flush, one frame");
+    assert!(
+        matches!(
+            protocol::decode_request(&out[0]),
+            protocol::Incoming::Ok(protocol::Envelope {
+                body: protocol::Request::Flush,
+                ..
+            })
+        ),
+        "send_flush queued something else, so a tab going away ships nothing \
+         and the engine waits for a tick that will never come"
+    );
+}

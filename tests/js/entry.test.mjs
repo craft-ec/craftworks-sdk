@@ -49,7 +49,16 @@ function fakeRaw() {
     take_loads() { const o = ended; ended = []; return JSON.stringify(o); },
     provisioned: () => true, refused: () => "", exhausted: () => false,
     unusable: () => "[]",
-    tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }),
+    // A DISTINCTIVE RATE. 1000 would pass whether the page asked the session
+    // or wrote a literal; 7777 can only come from having asked.
+    tick_ms: () => 7777,
+    ticks: 0,
+    flushes: 0,
+    tick() {
+      session.ticks += 1;
+      return JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 });
+    },
+    flush() { session.flushes += 1; },
     scan() {
       asks += 1;
       if (loaded) return JSON.stringify([{ id: "a" }]);
@@ -106,7 +115,7 @@ await t("a COLD SCAN resolves through sdk.open() and nothing else", async () => 
     connect: (session, { onEvent }) => {
       // Deliver one message, the way a socket would.
       setTimeout(() => { session.on_inbound(new Uint8Array()); onEvent({ kind: "message" }); }, 5);
-      return { close() {} };
+      return { close() {}, pump() {} };
     },
     setInterval: () => 1,
     clearInterval: () => {},
@@ -140,7 +149,16 @@ function watchingRaw() {
     take_progress: () => "[]", take_loads: () => "[]",
     provisioned: () => true, refused: () => "", exhausted: () => false,
     unusable: () => "[]",
-    tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }),
+    // A DISTINCTIVE RATE. 1000 would pass whether the page asked the session
+    // or wrote a literal; 7777 can only come from having asked.
+    tick_ms: () => 7777,
+    ticks: 0,
+    flushes: 0,
+    tick() {
+      session.ticks += 1;
+      return JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 });
+    },
+    flush() { session.flushes += 1; },
     bind: d => bound.add(d),
     unbind: d => bound.delete(d),
     take_stale() { const s = stale; stale = []; return JSON.stringify(s); },
@@ -171,7 +189,7 @@ await t("**a HeadChanged for OUR head re-runs a bound scan, with no app call**",
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: (session, { onEvent }) => {
       deliver = key => { session.on_inbound(key); onEvent({ kind: "message" }); };
-      return { close() {} };
+      return { close() {}, pump() {} };
     },
     setInterval: () => 1, clearInterval: () => {},
   });
@@ -199,7 +217,7 @@ await t("THE CONTROL: a notification for SOMEBODY ELSE'S contract re-runs nothin
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: (session, { onEvent }) => {
       deliver = key => { session.on_inbound(key); onEvent({ kind: "message" }); };
-      return { close() {} };
+      return { close() {}, pump() {} };
     },
     setInterval: () => 1, clearInterval: () => {},
   });
@@ -222,6 +240,151 @@ await t("liveMode reaches an app THROUGH THE ENTRY", () => {
   // notified or polling.
   const sdk = wrap(watchingRaw());
   assert.equal(typeof sdk.open, "function");
+});
+
+// ---------------------------------------------------------------------------
+// TIME, AND THE LAST THING A PAGE SAYS.
+//
+// The delegate has no clock (F32). Every deadline it holds — owed parity
+// going out, a stuck commit reported `Stalled` — happens only because a
+// connected page told it what time it is, and a page that closes stops
+// telling it anything at all.
+//
+// Both were built on the engine side and reachable from neither: the page's
+// `tick()` did its OWN housekeeping and sent the delegate nothing, and no
+// page anywhere sent `Flush`. These go through the entry, because that is
+// where the two ends meet.
+// ---------------------------------------------------------------------------
+
+/** A page harness: a driveable clock, a recording socket, a lifecycle. */
+function pageOf(raw, extra = {}) {
+  const clock = { body: null, stopped: false };
+  const win = new Map(), doc = new Map();
+  const conn = { pumps: 0, closed: false };
+  const opts = {
+    port: 17509,
+    fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
+    connect: () => ({ close() { conn.closed = true; }, pump() { conn.pumps += 1; } }),
+    setInterval: (fn, ms) => { clock.body = fn; clock.ms = ms; return 1; },
+    clearInterval: () => { clock.stopped = true; clock.body = null; },
+    addEventListener: (name, fn) => win.set(name, fn),
+    removeEventListener: name => win.delete(name),
+    documentOf: {
+      visibilityState: "visible",
+      addEventListener: (name, fn) => doc.set(name, fn),
+      removeEventListener: name => doc.delete(name),
+    },
+    ...extra,
+  };
+  return { opts, clock, conn, win, doc, session: raw.__session };
+}
+
+await t("the tick RATE comes from the session, not from a literal in the page", async () => {
+  const raw = fakeRaw();
+  const page = pageOf(raw);
+  const { close } = await wrap(raw).open(page.opts);
+
+  assert.equal(page.clock.ms, raw.__session.tick_ms(),
+    "the page picked its own rate. The number the page sends time at and the " +
+    "number the engine's deadlines are counted in are the same number, and a " +
+    "literal here goes on being right until the day the other side moves");
+  close();
+});
+
+await t("**every tick PUMPS, so the time actually leaves the page**", async () => {
+  const raw = fakeRaw();
+  const page = pageOf(raw);
+  const { close } = await wrap(raw).open(page.opts);
+  const pumpsBefore = page.conn.pumps;
+
+  page.clock.body();
+
+  assert.equal(raw.__session.ticks, 1, "the timer did not tick the session at all");
+  assert.ok(page.conn.pumps > pumpsBefore,
+    "the tick queued a frame and nothing sent it. The socket pumps on open " +
+    "and on a message, and a tick produces neither — so on the quiet " +
+    "connection where a stuck commit actually lives, the time would sit in " +
+    "the outbox for ever");
+  close();
+});
+
+await t("a closed page stops sending time", async () => {
+  const raw = fakeRaw();
+  const page = pageOf(raw);
+  const { close } = await wrap(raw).open(page.opts);
+  page.clock.body();
+  const after = raw.__session.ticks;
+
+  close();
+
+  assert.ok(page.clock.stopped, "the interval was left running on a closed page");
+  assert.equal(page.clock.body, null, "there is still a timer body to fire");
+  assert.equal(raw.__session.ticks, after, "it ticked after being closed");
+  assert.ok(page.conn.closed, "the socket was left open");
+});
+
+await t("**a page being HIDDEN flushes, and the frame is pumped in the same task**", async () => {
+  const raw = fakeRaw();
+  const page = pageOf(raw);
+  const { close } = await wrap(raw).open(page.opts);
+  const pumpsBefore = page.conn.pumps;
+
+  page.opts.documentOf.visibilityState = "hidden";
+  page.doc.get("visibilitychange")();
+
+  assert.equal(raw.__session.flushes, 1,
+    "a tab going into the background sent no Flush. It also stops ticking, " +
+    "so whatever the engine was holding back to coalesce sits unwritten " +
+    "until somebody opens the app again");
+  assert.ok(page.conn.pumps > pumpsBefore,
+    "the Flush was queued and not sent. A page being hidden may not get a " +
+    "second task");
+  close();
+});
+
+await t("THE CONTROL: a page becoming VISIBLE flushes nothing", async () => {
+  // Without this, a `visibilitychange` handler that flushed unconditionally
+  // would pass the test above — and would ship everything the engine was
+  // coalescing every time somebody switched back to the tab, which is the
+  // opposite of what coalescing is for.
+  const raw = fakeRaw();
+  const page = pageOf(raw);
+  const { close } = await wrap(raw).open(page.opts);
+
+  page.opts.documentOf.visibilityState = "visible";
+  page.doc.get("visibilitychange")();
+
+  assert.equal(raw.__session.flushes, 0, "it flushed on the tab coming BACK");
+  close();
+});
+
+await t("pagehide flushes too, because visibilitychange alone is not enough", async () => {
+  // A page can be discarded from the background without a second
+  // `visibilitychange`, and on a real navigation away `pagehide` is what
+  // fires. Both are wired; a Flush is idempotent, so the cost of the
+  // overlap is a frame the engine answers with nothing to do.
+  const raw = fakeRaw();
+  const page = pageOf(raw);
+  const { close } = await wrap(raw).open(page.opts);
+
+  page.win.get("pagehide")();
+
+  assert.equal(raw.__session.flushes, 1, "nothing is listening for pagehide");
+  close();
+});
+
+await t("and closing flushes, while the socket can still carry it", async () => {
+  const raw = fakeRaw();
+  const page = pageOf(raw);
+  const { close } = await wrap(raw).open(page.opts);
+
+  close();
+
+  assert.equal(raw.__session.flushes, 1,
+    "close() shut the socket without shipping what was waiting — the one " +
+    "moment the frame could still be sent");
+  assert.equal(page.doc.size, 0, "the lifecycle listeners outlived the page");
+  assert.equal(page.win.size, 0, "the window listeners outlived the page");
 });
 
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");

@@ -53,6 +53,12 @@ const TRANSPORT_ONLY: &[&str] = &[
     "refused",
     "reconnected",
     "tick",
+    // TIME, AND THE END OF A PAGE. Both are things a page SENDS to the
+    // delegate — a `Tick` frame and a `Flush` frame — and an in-memory store
+    // has no delegate to tell. `tick_ms` is how often to send the first,
+    // read from `protocol` so the page and the engine hold one number.
+    "flush",
+    "tick_ms",
     // The engine-backed surface's own additions: there is no engine to
     // preload from, or to trace, behind the in-memory one.
     "preload",

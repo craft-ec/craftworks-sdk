@@ -45,7 +45,12 @@ export async function openSession(Session, {
   // skip saying which.
   port,
   artefacts = null,
-  tickMs = 1000,
+  // NO LITERAL. The rate comes from the session, which reads it from
+  // `protocol`, because the page sends the time and the engine's deadlines
+  // are counted in that unit — a 1000 written here would go on being right
+  // until the day the other side moved. `null` means "ask the session";
+  // a test passes a number.
+  tickMs = null,
   onEvent = () => {},
   // Injected so the wiring can be tested without a node and without a
   // browser. A test that could only run against a real socket would not run,
@@ -54,6 +59,13 @@ export async function openSession(Session, {
   fetch: fetchWith = (typeof fetch === "function" ? fetch : null),
   setInterval: everyMs = setInterval,
   clearInterval: stopEvery = clearInterval,
+  // The page lifecycle, injected for the same reason the timer is: the
+  // wiring is the part that must not be taken on trust, and a test that
+  // needed a real browser tab to close would not run.
+  addEventListener: onWindow = (typeof addEventListener === "function" ? addEventListener : null),
+  removeEventListener: offWindow = (typeof removeEventListener === "function" ? removeEventListener : null),
+  // What a page reads to know it is being hidden rather than shown.
+  documentOf = (typeof document === "object" ? document : null),
 } = {}) {
   const session = new Session(port);
 
@@ -101,7 +113,53 @@ export async function openSession(Session, {
     // the reads parked on it are woken with a fact rather than left hanging.
     // Nothing else exercises this path: every other route delivers a message.
     drainReads();
-  }, tickMs);
+    // AND THE FRAME HAS TO LEAVE.
+    //
+    // `session.tick()` QUEUES a `Tick` for the delegate; `pump` is the only
+    // thing that puts bytes on the socket, and the socket otherwise pumps on
+    // open and on a message. A tick on an idle connection produces neither,
+    // so without this the time the page generates every second would sit in
+    // the outbox until something else happened to send — which, on the quiet
+    // connection where a stuck commit actually lives, is nothing.
+    conn.pump();
+  }, tickMs ?? session.tick_ms());
+
+  // THE LAST THING THIS PAGE SAYS.
+  //
+  // A tab that goes away stops ticking, and the engine coalesces on the
+  // assumption that another tick is coming. Owed parity would sit unwritten
+  // until somebody opened the app again — which, for the tab that made the
+  // writes, may be never.
+  //
+  // Both events, because neither is reliable alone: `pagehide` is what fires
+  // on a real navigation away and on mobile, `visibilitychange` is what fires
+  // when a tab is backgrounded or the phone is locked, and a page can be
+  // discarded from the background without ever firing the first. A `Flush`
+  // is idempotent, so firing both costs one frame the engine answers with
+  // nothing to do.
+  //
+  // `flush()` only QUEUES the frame; `pump` is what puts it on the socket,
+  // and it has to happen in the same task — a page being unloaded gets no
+  // second one.
+  const flush = () => {
+    session.flush();
+    conn.pump();
+  };
+  const onHide = () => { if (documentOf?.visibilityState === "hidden") flush(); };
+  const listeners = [];
+  if (onWindow) {
+    onWindow("pagehide", flush);
+    listeners.push(["pagehide", flush]);
+    // On the DOCUMENT: `visibilitychange` does not fire on `window` in every
+    // browser, and a listener nothing calls is the failure this whole file
+    // exists to avoid.
+    if (documentOf?.addEventListener) {
+      documentOf.addEventListener("visibilitychange", onHide);
+    } else {
+      onWindow("visibilitychange", onHide);
+      listeners.push(["visibilitychange", onHide]);
+    }
+  }
 
   return {
     session,
@@ -117,7 +175,18 @@ export async function openSession(Session, {
     // waits for ever — which is why `open()` exists and why a page should
     // not be wiring this by hand.
     onReadsWake: fn => { drainReads = fn; },
-    close: () => { stopEvery(timer); conn.close(); },
+    /// Ship what is waiting, now. Wired to the page lifecycle above; exposed
+    /// because an app that knows it is finishing can say so sooner.
+    flush,
+    close: () => {
+      // FLUSH BEFORE THE SOCKET GOES. A close is a page saying it is done,
+      // and it is the one moment the frame can still be sent.
+      flush();
+      stopEvery(timer);
+      if (offWindow) for (const [name, fn] of listeners) offWindow(name, fn);
+      documentOf?.removeEventListener?.("visibilitychange", onHide);
+      conn.close();
+    },
   };
 }
 

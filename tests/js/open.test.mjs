@@ -52,6 +52,8 @@ function fakeSession({ deliverAfterMs = null } = {}) {
     refused: () => "",
     exhausted: () => false,
     pendingDelivery: false,
+    tick_ms: () => 7777,
+    flush() {},
     // The TICK. This is where a load nobody answered is given up on — in the
     // real session, `loads.time_out`.
     tick() {
@@ -85,7 +87,7 @@ function fakeSession({ deliverAfterMs = null } = {}) {
 function fakeConnect(onEventRef) {
   return (session, { onEvent }) => {
     onEventRef.deliver = () => { session.on_inbound(new Uint8Array()); onEvent({ kind: "message" }); };
-    return { close() {} };
+    return { close() {}, pump() {} };
   };
 }
 

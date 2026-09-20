@@ -99,6 +99,32 @@ impl CachedStore {
         self.client.take_outbound()
     }
 
+    /// GIVE THE DELEGATE THE TIME.
+    ///
+    /// Nothing else does. A delegate has no clock of its own (F32), so every
+    /// deadline it holds — owed parity going out, a stuck commit reported
+    /// `Stalled` — happens only because a connected client said what time it
+    /// is. Without this the page ticked ITSELF (rolling back its own
+    /// unanswered writes, timing out its own loads) and the delegate was
+    /// never told anything at all.
+    ///
+    /// `now_ms` is the wall clock; [`protocol::tick_of`] is what quantises
+    /// it, in one place, so two callers cannot pick two units.
+    pub fn send_tick(&mut self, now_ms: u64) {
+        self.client.send(&Request::Tick {
+            now: protocol::tick_of(now_ms),
+        });
+    }
+
+    /// The page is going away: ship what is waiting.
+    ///
+    /// A tab that closes sends no more ticks, so anything the engine was
+    /// waiting to coalesce would sit unwritten until somebody opened the app
+    /// again. This is the last thing a page says.
+    pub fn send_flush(&mut self) {
+        self.client.send(&Request::Flush);
+    }
+
     /// A message arrived from the node.
     ///
     /// **This is what takes a write OUT of the pending list**, and for a

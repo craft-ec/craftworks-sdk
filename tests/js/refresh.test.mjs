@@ -36,6 +36,8 @@ function engineRaw() {
     take_progress: () => "[]", take_loads: () => "[]",
     provisioned: () => true, refused: () => "", exhausted: () => false, unusable: () => "[]",
     tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }),
+    tick_ms: () => 7777,
+    flush() {},
     bind: d => bound.add(d),
     unbind: d => bound.delete(d),
     // THE ENGINE ONLY ANSWERS A QUESTION IT WAS ASKED.
@@ -82,7 +84,7 @@ async function openDb(raw) {
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: (_s, { onEvent }) => {
       deliver = () => onEvent({ kind: "message" });
-      return { close() {} };
+      return { close() {}, pump() {} };
     },
     setInterval: () => 1, clearInterval: () => {},
   });
