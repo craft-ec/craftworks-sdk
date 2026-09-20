@@ -190,3 +190,30 @@ fn the_local_copy_cannot_diff_and_asks_for_a_full_reload() {
         Ok(Delta::FullReloadRequired { new_root: root(1) })
     );
 }
+
+/// With nothing loaded there is no root to name, and it says so.
+///
+/// The first version answered with thirty-two zero bytes — a root-shaped value
+/// that is not a root. A caller would have recorded it as where it stands and
+/// asked for deltas against it for ever, and every one of those would come
+/// back `FullReloadRequired` with the same fake root: a loop that looks like
+/// work. `NotLoaded` is what `root()` already says, and it is true.
+#[test]
+fn a_delta_with_nothing_loaded_says_not_loaded_rather_than_naming_a_zero_root() {
+    use craftworks_sdk::Delta;
+    let mut s = store();
+    assert_eq!(Reads::root(&mut s), Err(StoreError::NotLoaded));
+    let answer = Reads::changes_since(&mut s, root(0), b"a/", b"b/", 100);
+    assert_eq!(
+        answer,
+        Err(StoreError::NotLoaded),
+        "a delta over an unloaded copy answered {answer:?} — a root of zeroes \
+         is a value a caller would keep"
+    );
+    assert_ne!(
+        answer,
+        Ok(Delta::FullReloadRequired {
+            new_root: [0u8; 32]
+        })
+    );
+}

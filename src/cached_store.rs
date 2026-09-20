@@ -208,8 +208,14 @@ impl Reads for CachedStore {
         // which is the same recovery it would do against an engine whose old
         // root has been evicted. The engine's own `ChangesSince` is what a
         // delta actually comes from; this is the local fallback.
+        //
+        // With NOTHING loaded there is no root to name, and the first version
+        // answered with thirty-two zero bytes — a root-shaped value that is
+        // not a root. A caller would have recorded it as where it stands and
+        // asked for a delta against it for ever. `NotLoaded` is the same
+        // answer `root()` already gives, and it is the true one.
         Ok(Delta::FullReloadRequired {
-            new_root: self.copy.root().unwrap_or([0u8; 32]),
+            new_root: self.copy.root().ok_or(StoreError::NotLoaded)?,
         })
     }
 }

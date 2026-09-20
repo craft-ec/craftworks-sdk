@@ -196,13 +196,30 @@ pub mod js {
             Engine(crate::CachedStore::new(Box::new(|| js_now_ms())))
         }
 
-        /// Requests to send, oldest first. Drained.
-        pub fn take_outbound(&mut self) -> Vec<js_sys::Uint8Array> {
+        /// Requests waiting to go out, oldest first — WITHOUT giving them up.
+        ///
+        /// A socket's send can fail, so the host looks, sends what it can, and
+        /// says how many with `sent`. The draining form exists for hosts whose
+        /// send cannot fail and would silently lose a batch here: a write made
+        /// before the socket is open is the ordinary start-up path, not an
+        /// edge case.
+        pub fn outbound(&self) -> Vec<js_sys::Uint8Array> {
             self.0
-                .take_outbound()
+                .client
+                .outbound()
                 .iter()
                 .map(|b| js_sys::Uint8Array::from(&b[..]))
                 .collect()
+        }
+
+        /// The first `n` of `outbound()` went out.
+        pub fn sent(&mut self, n: usize) {
+            self.0.client.sent(n);
+        }
+
+        /// How many requests are still waiting to be sent.
+        pub fn outbound_len(&self) -> usize {
+            self.0.client.outbound().len()
         }
 
         /// A message arrived. Decoding is exact and anything unusable is

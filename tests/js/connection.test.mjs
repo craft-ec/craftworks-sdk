@@ -1,0 +1,204 @@
+// The socket wrapper, against a fake WebSocket.
+//
+// The defect this file exists for: the first version took the engine's whole
+// outbound queue and broke out of the send loop when the socket refused, so
+// everything taken and not sent was dropped. Its own comment said the engine
+// still had them — it did not, because the take had already happened. A write
+// made before `onopen` is the ORDINARY start of a session, so the normal path
+// lost its first write silently.
+//
+// Every test here runs the real `connect()` over a fake socket whose open/close
+// the test controls. The engine is faked too, and deliberately: what is under
+// test is the wrapper's contract with the engine — take nothing you cannot
+// send, confirm exactly what went, in order — and a real engine would make the
+// assertions about queue contents harder to read without making them stronger.
+
+import assert from "node:assert/strict";
+import { connect } from "../../js/connection.js";
+
+/** A WebSocket the test opens, closes and reads. */
+class FakeSocket {
+  static last = null;
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;           // CONNECTING
+    this.sent = [];
+    this.throwOnSend = false;
+    FakeSocket.last = this;
+  }
+  send(bytes) {
+    if (this.throwOnSend) throw new Error("socket went away mid-batch");
+    this.sent.push(bytes);
+  }
+  close() { this.readyState = 3; this.onclose?.(); }
+  /** The node accepted the connection. */
+  open() { this.readyState = 1; this.onopen?.(); }
+  /** It went away without warning. */
+  drop() { this.readyState = 3; this.onclose?.(); }
+}
+
+/** An engine that only models the outbound queue. */
+function fakeEngine(items = []) {
+  let queue = [...items];
+  return {
+    outbound: () => [...queue],
+    sent: n => { queue = queue.slice(n); },
+    outbound_len: () => queue.length,
+    on_inbound: () => {},
+    queue: () => [...queue],
+    push: x => queue.push(x),
+  };
+}
+
+/**
+ * Run `fn` with the fake socket installed globally.
+ *
+ * AWAITS it before restoring. The first version restored in a `finally`,
+ * which runs the moment `fn` returns its promise — so anything the test did
+ * on a timer (a reconnect, which is the only way to observe one) constructed
+ * a REAL WebSocket and the assertions read the wrong object. The test failed
+ * for a reason that had nothing to do with the code it was testing.
+ */
+const withGlobalSocket = async fn => {
+  const had = globalThis.WebSocket;
+  globalThis.WebSocket = FakeSocket;
+  try { return await fn(); } finally { globalThis.WebSocket = had; }
+};
+
+// ---------------------------------------------------------------------------
+// A closed socket loses NOTHING.
+// ---------------------------------------------------------------------------
+await withGlobalSocket(async () => {
+  const engine = fakeEngine(["a", "b", "c"]);
+  const conn = connect(engine, { url: "ws://x" });
+  const sock = FakeSocket.last;
+
+  // The socket has not opened yet — the ordinary start of every session.
+  conn.pump();
+  assert.deepEqual(sock.sent, [], "a closed socket sent something");
+  assert.deepEqual(
+    engine.queue(), ["a", "b", "c"],
+    "the engine lost requests it never got to send — this is the defect, and " +
+    "the ordinary path is a write made before onopen",
+  );
+
+  // Now it opens: everything goes, in order, once.
+  sock.open();
+  assert.deepEqual(sock.sent, ["a", "b", "c"], "order or completeness lost on open");
+  assert.deepEqual(engine.queue(), [], "the engine still holds what was sent");
+  conn.close();
+  console.log("ok connection: a closed socket loses nothing");
+});
+
+// ---------------------------------------------------------------------------
+// A close PART WAY THROUGH a batch loses nothing, and keeps the order.
+// ---------------------------------------------------------------------------
+await withGlobalSocket(async () => {
+  const engine = fakeEngine(["a", "b", "c", "d"]);
+  const conn = connect(engine, { url: "ws://x" });
+  const sock = FakeSocket.last;
+  sock.open();
+  assert.deepEqual(sock.sent, ["a", "b", "c", "d"]);
+
+  // More work arrives, and the socket dies on the second of it.
+  engine.push("e");
+  engine.push("f");
+  engine.push("g");
+  let n = 0;
+  const realSend = sock.send.bind(sock);
+  sock.send = bytes => { if (n++ === 1) throw new Error("gone"); realSend(bytes); };
+  conn.pump();
+
+  assert.deepEqual(sock.sent.slice(4), ["e"], "the first of the batch should have gone");
+  assert.deepEqual(
+    engine.queue(), ["f", "g"],
+    "a mid-batch failure must leave exactly the unsent remainder, in order",
+  );
+
+  // The socket comes back; the remainder goes, still in order.
+  sock.send = realSend;
+  conn.pump();
+  assert.deepEqual(engine.queue(), []);
+  assert.deepEqual(sock.sent.slice(4), ["e", "f", "g"], "order was not preserved across the failure");
+  conn.close();
+  console.log("ok connection: a mid-batch failure loses nothing and keeps the order");
+});
+
+// ---------------------------------------------------------------------------
+// THE CONTROL: the shape the first version used fails these.
+//
+// Not a comment claiming the old code was wrong — the old code, run.
+// ---------------------------------------------------------------------------
+{
+  const engine = fakeEngine(["a", "b", "c"]);
+  // `take_outbound` + break, which is what the first version did.
+  const takeOutbound = () => { const q = engine.queue(); engine.sent(q.length); return q; };
+  const sock = { readyState: 0, sent: [] };
+  const send = b => { if (sock.readyState !== 1) return false; sock.sent.push(b); return true; };
+  for (const bytes of takeOutbound()) { if (!send(bytes)) break; }
+
+  assert.deepEqual(sock.sent, [], "the control sent something with the socket closed");
+  assert.deepEqual(
+    engine.queue(), [],
+    "the control did NOT lose the queue, so the tests above are not " +
+    "demonstrating what the fix prevents",
+  );
+  console.log("ok connection CONTROL: the take-and-break shape loses the whole queue");
+}
+
+// ---------------------------------------------------------------------------
+// A reconnect re-asserts what was being watched.
+// ---------------------------------------------------------------------------
+await withGlobalSocket(async () => {
+  const seen = [];
+  const engine = fakeEngine([]);
+  const conn = connect(engine, { url: "ws://x", onEvent: e => seen.push(e.kind) });
+  FakeSocket.last.open();
+  conn.subscribeHead("head-1");
+  conn.subscribeHead("head-2");
+  assert.deepEqual(conn.watching, ["head-1", "head-2"]);
+
+  const before = seen.filter(k => k === "head-watch-pending").length;
+  FakeSocket.last.drop();
+  // The wrapper reconnects on a timer; drive it by opening the next socket.
+  await new Promise(ok => setTimeout(ok, 400));
+  {
+    FakeSocket.last.open();
+    const after = seen.filter(k => k === "head-watch-pending").length;
+    assert.ok(
+      after > before,
+      "a reconnect did not re-assert the watched heads; the node's copy can be " +
+      "evicted with nobody told, so a client that never re-asserts goes quiet " +
+      "for ever with no way to notice",
+    );
+    assert.deepEqual(conn.watching, ["head-1", "head-2"], "the intention was lost");
+    conn.close();
+    console.log("ok connection: a reconnect re-asserts every watched head");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// It does not claim to have subscribed when it cannot.
+// ---------------------------------------------------------------------------
+await withGlobalSocket(async () => {
+  const seen = [];
+  const engine = fakeEngine([]);
+  const conn = connect(engine, { url: "ws://x", onEvent: e => seen.push(e) });
+  const sock = FakeSocket.last;
+  sock.open();
+  const before = sock.sent.length;
+
+  const ok = conn.subscribeHead("head-1");
+  assert.equal(ok, false, "subscribeHead claimed to have subscribed");
+  assert.equal(
+    sock.sent.length, before,
+    "a frame was put on the socket for a client-API request this side cannot " +
+    "encode — the first version invented one, and nothing would have accepted it",
+  );
+  assert.ok(
+    seen.some(e => e.kind === "head-watch-pending" && e.why),
+    "the caller was not told that nothing is subscribed, or not told why",
+  );
+  conn.close();
+  console.log("ok connection: it reports that it cannot subscribe rather than guessing a frame");
+});
