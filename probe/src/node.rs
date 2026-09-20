@@ -35,21 +35,39 @@ impl Node {
         for sub in ["data", "config", "log"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
+        // The node takes `--log-level`, NOT `RUST_LOG`: setting RUST_LOG in
+        // this process changes nothing there, which is how an earlier attempt
+        // to read the node's own account of a delegate PUT came back empty
+        // and looked like "the node said nothing".
+        let mut args: Vec<String> = vec![
+            "local".into(),
+            "local".into(),
+            "--ws-api-port".into(),
+            port.to_string(),
+            "--data-dir".into(),
+            dir.join("data").to_string_lossy().into_owned(),
+            "--config-dir".into(),
+            dir.join("config").to_string_lossy().into_owned(),
+            "--log-dir".into(),
+            dir.join("log").to_string_lossy().into_owned(),
+        ];
+        if let Ok(level) = std::env::var("PROBE_LOG_LEVEL") {
+            args.push("--log-level".into());
+            args.push(level);
+        }
         let child = Command::new("freenet")
-            .args([
-                "local",
-                "local",
-                "--ws-api-port",
-                &port.to_string(),
-                "--data-dir",
-                &dir.join("data").to_string_lossy(),
-                "--config-dir",
-                &dir.join("config").to_string_lossy(),
-                "--log-dir",
-                &dir.join("log").to_string_lossy(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .args(&args)
+            // Captured to the temp tree rather than discarded: the node's
+            // FILE log carries no DEBUG lines even at `--log-level debug`, so
+            // the only place its own account of a delegate PUT can be is the
+            // console. Discarding it is why an earlier attempt concluded "the
+            // node said nothing" when nobody had looked where it speaks.
+            .stdout(Stdio::from(std::fs::File::create(
+                dir.join("log/console.out"),
+            )?))
+            .stderr(Stdio::from(std::fs::File::create(
+                dir.join("log/console.err"),
+            )?))
             .spawn()
             .context("spawning `freenet local local` — is the binary on PATH?")?;
         let mut n = Node {

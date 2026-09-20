@@ -109,6 +109,9 @@ fn ctx_put(ctx: &mut DelegateCtx, calls: u32, verdict: u8, err: &str) {
     ctx.write(&out);
 }
 
+/// Where the last delegate PUT's verdict is kept.
+const PUT_VERDICT: &[u8] = b"put_verdict";
+
 struct Probe;
 
 #[delegate]
@@ -123,9 +126,20 @@ impl DelegateInterface for Probe {
         // message. Recorded in the context, which is the only thing that
         // survives to the call that asks for it.
         if let InboundDelegateMsg::PutContractResponse(r) = &inbound {
+            // Recorded in a SECRET, not the context.
+            //
+            // This is the whole finding of the differential against F21's
+            // working probe: a context write made during THIS invocation does
+            // not survive to the next client call, because the node calls the
+            // delegate with a response as an INNER run whose context does not
+            // come back. Secrets do survive -- measured here in (5), across a
+            // node restart -- so the known-working instrument records there,
+            // and reading the verdict out of the context reported `None` for
+            // a response that had in fact arrived.
             let (calls, _, _) = ctx_get(ctx);
             let said = match &r.result {
                 Ok(()) => {
+                    ctx.set_secret(PUT_VERDICT, &[1]);
                     ctx_put(ctx, calls, 1, "");
                     Said::PutResult {
                         ok: Some(true),
@@ -133,6 +147,9 @@ impl DelegateInterface for Probe {
                     }
                 }
                 Err(e) => {
+                    let mut v = vec![2u8];
+                    v.extend_from_slice(e.as_bytes());
+                    ctx.set_secret(PUT_VERDICT, &v);
                     ctx_put(ctx, calls, 2, e);
                     Said::PutResult {
                         ok: Some(false),
@@ -224,14 +241,26 @@ impl DelegateInterface for Probe {
                 ]);
             }
             Ask::LastPut => {
-                let (_, verdict, err) = ctx_get(ctx);
-                Said::PutResult {
-                    ok: match verdict {
-                        1 => Some(true),
-                        2 => Some(false),
-                        _ => None,
+                // The secret first: it is the one that survives an inner
+                // invocation. The context is read too, and the driver prints
+                // both, because the DIFFERENCE between them is the platform
+                // fact -- a response recorded in a context that is then thrown
+                // away looks exactly like a response that never came.
+                let from_secret = ctx.get_secret(PUT_VERDICT);
+                let (_, ctx_verdict, ctx_err) = ctx_get(ctx);
+                match from_secret {
+                    Some(v) => Said::PutResult {
+                        ok: Some(v.first() == Some(&1)),
+                        err: String::from_utf8_lossy(v.get(1..).unwrap_or(&[])).into_owned(),
                     },
-                    err,
+                    None => Said::PutResult {
+                        ok: match ctx_verdict {
+                            1 => Some(true),
+                            2 => Some(false),
+                            _ => None,
+                        },
+                        err: ctx_err,
+                    },
                 }
             }
             Ask::Nothing => {

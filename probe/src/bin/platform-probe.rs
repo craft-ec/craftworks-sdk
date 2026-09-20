@@ -206,10 +206,27 @@ async fn main() -> Result<()> {
         "node: spawning on 127.0.0.1:{port} (temp tree {})",
         dir.display()
     );
-    let node = Node::spawn(port, &dir)?;
-    let (stream, _) = tokio_tungstenite::connect_async(node.ws())
+    // PROBE_WS points at a node this probe did NOT spawn, so the same
+    // questions can be asked of a node in a different MODE. It exists because
+    // `freenet local local` and `freenet network` answer question 8
+    // differently, and one probe that can address both is how that was
+    // established rather than argued.
+    let existing = std::env::var("PROBE_WS").ok();
+    let node = match &existing {
+        Some(ws) => {
+            println!("node: using the node already at {ws} (not spawning one)");
+            None
+        }
+        None => Some(Node::spawn(port, &dir)?),
+    };
+    let ws_url = match (&existing, &node) {
+        (Some(ws), _) => ws.clone(),
+        (None, Some(n)) => n.ws(),
+        _ => unreachable!("one of the two is always set"),
+    };
+    let (stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
-        .context("connecting to the node just spawned")?;
+        .context("connecting to the node")?;
     let mut client = WebApi::start(stream);
 
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
@@ -280,12 +297,26 @@ async fn main() -> Result<()> {
         println!("(5) secret {len} B: set {set_ms:?} {set:?} | get {get_ms:?} {got:?}");
     }
 
-    println!("(5) restarting the node to see whether secrets survive...");
-    drop(client);
+    // Only a node this probe spawned may be restarted. Against a borrowed
+    // one the question is not asked, and says so: a skipped measurement that
+    // prints nothing is one a reader counts as answered.
     let mut node = node;
-    node.restart()?;
-    let (stream, _) = tokio_tungstenite::connect_async(node.ws()).await?;
-    let mut client = WebApi::start(stream);
+    let mut client = match node.as_mut() {
+        Some(n) => {
+            println!("(5) restarting the node to see whether secrets survive...");
+            drop(client);
+            n.restart()?;
+            let (stream, _) = tokio_tungstenite::connect_async(n.ws()).await?;
+            WebApi::start(stream)
+        }
+        None => {
+            println!(
+                "(5) NOT ASKED: this probe did not spawn the node, and it \
+                 restarts only its own"
+            );
+            client
+        }
+    };
     // A restarted node has forgotten the delegate registration, not the secret.
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
         &DelegateCode::from(wasm.clone()),
