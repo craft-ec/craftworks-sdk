@@ -558,16 +558,17 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
         "{} nodes parsed for a {depth}-level lookup",
         e.nodes_parsed()
     );
-    // The control: a reader that fetches ahead blows the bound. Without it,
-    // "≤ depth + 1" could be true of an implementation that fetched nothing
-    // useful at all.
+    // CONTROL 1: a reader that fetches ahead. It asks for a whole level
+    // where the descent needs one block, which is what keeps "≤ depth" from
+    // being true of an implementation that fetched nothing useful.
     let (mut greedy, gstore) = reader(
         root,
         Params {
-            refetch_held: true,
+            fetch_ahead: true,
             ..Params::default()
         },
     );
+
     let first = stepped!(greedy, get(1, 10, &key));
     let _ = settle(&mut greedy, &gstore, &all, first);
     assert!(
@@ -956,4 +957,95 @@ fn a_tight_warm_set_answers_every_read_instead_of_looping() {
          stops the livelock and this test proves nothing about it"
     );
     println!("  control: with pinning off, the same read never answers");
+}
+
+/// A cold lookup costs one fetch per level however many times the engine is
+/// ENTERED while it waits.
+///
+/// This is the bound the re-hydrated design makes necessary, and it cannot be
+/// seen in `Live` mode. A re-hydrated engine re-descends from the head on
+/// every entry and reaches the same missing block each time; the only thing
+/// stopping it re-asking is the in-flight set the CONTEXT carries. A field in
+/// memory would hide the defect entirely, which is why this runs in
+/// `Rehydrate`.
+///
+/// The control is that set turned off: every unrelated event — another
+/// client's read, a tick, some other block landing — re-emits the same fetch,
+/// and the cost grows with how busy the node is rather than with the depth of
+/// the tree.
+#[test]
+fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
+    use common::{Harness, Mode};
+
+    let (_, root, all) = fixture(2_000);
+    let key = b"k/01000".to_vec();
+
+    // TWO mechanisms protect this bound, and each MASKS the other when
+    // tested alone: re-descending on every entry emits nothing because the
+    // in-flight set suppresses it, and dropping the in-flight set costs
+    // nothing because nothing re-descends. Measured separately each looked
+    // inert — the same shape as a new guard hiding the guards behind it, seen
+    // from the other side. So the control turns both off.
+    let count = |broken: bool, unrelated: usize| -> usize {
+        let store = Store::fresh();
+        let mut h = Harness::new(
+            Mode::Rehydrate,
+            Params {
+                redescend_on_entry: broken,
+                dedupe_in_flight: !broken,
+                ..Params::default()
+            },
+            store.clone(),
+        );
+        // A recovered engine learns its root from its head, which is also the
+        // only way to give the harness a root: it re-hydrates every step, so
+        // nothing set on a value in memory would survive.
+        store.put(root, all.get(&root).expect("the root"));
+        let _ = h.step(Event::Start {
+            key: engine::KeySource::SecretStore,
+            epochs: vec![engine::Epoch(1)],
+        });
+        let _ = h.step(Event::HeadRead {
+            epoch: engine::Epoch(1),
+            seq: 1,
+            root,
+        });
+        let mut e_root = h.step(Event::Get {
+            client: ClientId(1),
+            req_id: ReqId(1),
+            key: key.clone(),
+        });
+        let mut fetches = fetch_ids(&e_root).len();
+        // Now drive unrelated events while the fetch is outstanding. None of
+        // them has anything to do with this read.
+        for i in 0..unrelated {
+            let out = h.step(Event::Tick(i as u64 + 1));
+            fetches += fetch_ids(&out).len();
+            let out = h.step(Event::BlockMissed([0xAAu8; 32]));
+            fetches += fetch_ids(&out).len();
+        }
+        e_root.clear();
+        fetches
+    };
+
+    let quiet = count(false, 0);
+    let busy = count(false, 20);
+    assert_eq!(
+        quiet, busy,
+        "a read cost {busy} fetches on a busy node and {quiet} on a quiet one: \
+         the cost depends on how often the engine is entered, not on the tree"
+    );
+
+    // The control, and it RUNS: an engine that re-drives every parked read on
+    // every entry pays for the node being busy.
+    let control = count(true, 20);
+    assert!(
+        control > quiet,
+        "the control still cost {control} fetches against {quiet}: it is not \
+         re-asking, and this bound is not being tested against anything"
+    );
+    println!(
+        "  {quiet} fetch(es) on a quiet node, {busy} on a busy one, \
+         {control} with both off"
+    );
 }

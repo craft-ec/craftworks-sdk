@@ -280,10 +280,35 @@ pub struct Params {
     pub preload_roots: usize,
     pub preload_blocks: usize,
     pub preload_bytes: usize,
-    /// Ask again for blocks the node already holds — a plausible
-    /// implementation, and the control for the read cost bound. A bound no
-    /// implementation can exceed is not a bound.
+    /// Ask again for blocks the node already holds.
+    ///
+    /// Kept, but it is NOT a control for the cost bound and must not be sold
+    /// as one: fetches come from `Need`, and `Need` only ever names blocks
+    /// that are missing, so there is nothing already-held to re-ask for. It
+    /// measured 3 fetches against a bound of 4 — inert.
     pub refetch_held: bool,
+    /// Remember which blocks are already requested, across calls.
+    ///
+    /// Carried in the context, and it does suppress a duplicate fetch when two
+    /// READS want the same block. It is NOT what stops a waiting read
+    /// re-asking on every entry — nothing re-descends a parked read except
+    /// its own block arriving — so it is not a control for the cost bound,
+    /// and measuring it as one gives the same number either way.
+    pub dedupe_in_flight: bool,
+    /// Re-drive every parked read on every entry.
+    ///
+    /// The plausible wrong implementation, and the honest control for "a cold
+    /// lookup costs the same however often the engine is entered": it is the
+    /// SIMPLER thing to write — resume everything and let each read work out
+    /// whether it can progress — and it makes the cost grow with how busy the
+    /// node is rather than with the depth of the tree.
+    pub redescend_on_entry: bool,
+    /// On a miss, also ask for every child of every branch already readable.
+    ///
+    /// A plausible "fetch ahead" a reader might write, and the control that
+    /// keeps the depth bound honest: it asks for a level where the descent
+    /// needs one block.
+    pub fetch_ahead: bool,
     /// The context budget. The platform caps a delegate's context at exactly
     /// 400 KiB (`DelegateContext::MAX_SIZE` = 4096*10*10), so this sits below
     /// it with headroom: exceeding the platform's cap is a refusal the engine
@@ -329,6 +354,9 @@ impl Default for Params {
             preload_blocks: 256,
             preload_bytes: 4 * 1024 * 1024,
             refetch_held: false,
+            dedupe_in_flight: true,
+            redescend_on_entry: false,
+            fetch_ahead: false,
             max_context_bytes: 320 * 1024,
             count_descent: false,
             max_accept_age: 64,
@@ -570,6 +598,21 @@ impl<B: Blocks> Engine<B> {
     }
 
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
+        if self.params.redescend_on_entry {
+            // The control: every entry re-drives every parked read, whether
+            // or not anything it waits on has changed.
+            let parked: Vec<read::ReqId> = self.reads.parked.keys().copied().collect();
+            let mut out = Vec::new();
+            for r in parked {
+                out.extend(self.drive(r));
+            }
+            out.extend(self.step_inner(event));
+            return out;
+        }
+        self.step_inner(event)
+    }
+
+    fn step_inner(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Write {
                 client,
@@ -795,8 +838,46 @@ impl<B: Blocks> Engine<B> {
                     ids.retain(|id| self.blocks.get(id).is_none());
                 }
                 let cap = self.params.max_fetch_per_round;
+                if self.params.fetch_ahead {
+                    // Everything the readable branches name, whether or not
+                    // this descent needs it.
+                    let mut ahead: Vec<Cid> = Vec::new();
+                    let mut stack = vec![p.root];
+                    let mut seen: BTreeSet<Cid> = BTreeSet::new();
+                    while let Some(cid) = stack.pop() {
+                        if !seen.insert(cid) || ahead.len() > 128 {
+                            continue;
+                        }
+                        let Some(bytes) = self.blocks.get(&cid) else {
+                            continue;
+                        };
+                        let Ok(n) = Node::parse(bytes) else { continue };
+                        if !n.is_leaf() {
+                            for i in 0..n.len() {
+                                let c = n.child(i).0;
+                                ahead.push(c);
+                                stack.push(c);
+                            }
+                        }
+                    }
+                    ids.extend(ahead);
+                    // The ahead ids go through the same already-held filter as
+                    // the rest: without it the control re-asks for what just
+                    // arrived and never settles, which is a hang rather than a
+                    // cost and measures nothing.
+                    if !self.params.refetch_held {
+                        ids.retain(|id| self.blocks.get(id).is_none());
+                    }
+                }
                 for id in ids.into_iter().take(cap) {
-                    if self.reads.want(id, req_id, self.params.share_fetches) {
+                    // The waiter is ALWAYS recorded — that is what wakes the
+                    // read when the block lands, and skipping it would make
+                    // the control a hang rather than a cost. What the control
+                    // turns off is only the SUPPRESSION: with dedupe off the
+                    // fetch is emitted again every time the engine re-descends
+                    // and finds the same block missing.
+                    let first = self.reads.want(id, req_id, self.params.share_fetches);
+                    if first || !self.params.dedupe_in_flight {
                         let attempt = *self.reads.attempts.entry(id).or_insert(0);
                         let via = self
                             .reads
