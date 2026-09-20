@@ -137,14 +137,16 @@ fn stalled_reported(with_tick: bool) -> bool {
     node.deaf = true; // the commit can never publish
     let mut seen = node.states(&write(1));
 
-    if with_tick {
-        // WELL past `max_accept_age` (64 by default).
-        seen.extend(node.states(&protocol::Request::Tick { now: 10_000 }));
-    } else {
-        // The same number of calls, so the two arms differ ONLY in whether
-        // time was sent. Without this the comparison is between one call and
-        // two, and the shell advances per call.
-        seen.extend(node.states(&protocol::Request::AskWrite { write_id: 1 }));
+    // MANY CALLS between the write and the verdict. That is the shape the
+    // defect hid in: everything worked inside one call, and a stuck commit
+    // spans many by definition. Both arms make the SAME number of calls, so
+    // they differ only in whether time was sent.
+    for i in 1..=5u64 {
+        if with_tick {
+            seen.extend(node.states(&protocol::Request::Tick { now: i * 1_000 }));
+        } else {
+            seen.extend(node.states(&protocol::Request::AskWrite { write_id: 1 }));
+        }
     }
     if std::env::var("DIAG").is_ok() {
         println!("    with_tick={with_tick}: states seen = {seen:?}");
@@ -152,40 +154,37 @@ fn stalled_reported(with_tick: bool) -> bool {
     seen.contains(&protocol::WriteState::Stalled)
 }
 
-/// **MEASURED DEFECT: `Stalled` can never be reported by a delegate.**
+/// **A stuck commit is reported `Stalled` — across many calls.**
 ///
-/// It fires in NEITHER column — not without a tick, and not with one well
-/// past `max_accept_age`. The cause is in `engine/src/lib.rs`:
+/// It could not be, before sdk#81: `age_out_accepted` returns early unless
+/// `in_flight_since` is `Some`, and that field was not in `Context`. A
+/// delegate is rebuilt from its context on every call (F32), so the state
+/// measuring HOW LONG something had been stuck was `None` at the top of
+/// every call but the one that started the commit — and a stuck commit spans
+/// many calls by definition.
 ///
-/// * `age_out_accepted` returns early unless `self.in_flight_since` is
-///   `Some`, and that field is set when a commit starts;
-/// * `struct Context` — everything that survives a call — carries `pending`
-///   but **not `in_flight_since`, and not `told_stalled`**;
-/// * a delegate is rebuilt from its context on every call (F32), so
-///   `in_flight_since` is `None` at the top of every call that is not the one
-///   that started the commit.
-///
-/// So the state that measures HOW LONG something has been stuck is the one
-/// thing that does not survive — and a commit that is stuck spans many calls
-/// by definition. The mechanism can only work inside a single call, which is
-/// the one situation it is not for.
-///
-/// `told_stalled` is missing for the same reason, so even once the first
-/// problem is fixed the "report it once" guard would not hold across calls
-/// either. The first defect hides the second.
-///
-/// Recorded as sdk#82. This test asserts WHAT IS TRUE TODAY so the suite is
-/// honest and green; it inverts when the defect is fixed, which is the point.
+/// Both arms make the same number of calls. The shell advances per call, so
+/// a comparison between one call and several would not be about time at all.
 #[test]
-fn stalled_is_unreachable_in_a_delegate_today() {
+fn a_stuck_commit_is_reported_stalled_after_the_bound() {
     assert!(
-        !stalled_reported(true),
-        "Stalled now fires with a Tick — the defect is fixed, and this test \
-         should become the positive assertion it was written as (sdk#82)"
+        stalled_reported(true),
+        "a commit stuck well past max_accept_age across five calls was never \
+         reported Stalled: nothing would ever tell a person their write is \
+         held, not saved, and not moving"
     );
+}
+
+/// THE CONTROL: with no time sent, it is never reported.
+///
+/// Without this, a `Stalled` that fired on any call at all would pass the
+/// test above and the behaviour would not be about time.
+#[test]
+fn control_without_time_a_stuck_commit_is_never_stalled() {
     assert!(
         !stalled_reported(false),
-        "Stalled fired with no tick at all"
+        "Stalled was reported with no Tick at all, so it does not depend on \
+         time and the table is wrong about it"
     );
 }
 
@@ -262,5 +261,134 @@ fn the_table() {
          engine's Context, so a delegate rebuilt on every call (F32) has it as\n  \
          None at the top of every call but the one that started the commit.\n  \
          sdk#82."
+    );
+}
+
+/// **Reported ONCE across calls, not on every tick.**
+///
+/// That is what `told_stalled` is for, and it is only worth anything in the
+/// multi-call shape: within one call there is nothing to repeat. It had to
+/// move into the context alongside `in_flight_since` — left behind, the
+/// notice would arrive on every tick for as long as the commit is stuck,
+/// which is noise a caller learns to ignore, and this one matters.
+#[test]
+fn stalled_is_reported_once_not_on_every_tick() {
+    let mut node = Node::new();
+    node.client(&protocol::Request::Identity);
+    node.deaf = true;
+    node.states(&write(1));
+
+    let mut stalls = 0;
+    for i in 1..=6u64 {
+        stalls += node
+            .states(&protocol::Request::Tick { now: i * 1_000 })
+            .iter()
+            .filter(|s| **s == protocol::WriteState::Stalled)
+            .count();
+    }
+    assert_eq!(
+        stalls, 1,
+        "a stuck commit was reported Stalled {stalls} times over six ticks; \
+         a notice repeated every tick is one a caller learns to ignore"
+    );
+}
+
+/// A commit that PUBLISHES in time is never called stalled.
+///
+/// Without this, an `age_out_accepted` that reported every write would pass
+/// the tests above and mark healthy writes as stuck.
+#[test]
+fn control_a_commit_that_publishes_is_never_stalled() {
+    let mut node = Node::new();
+    node.client(&protocol::Request::Identity);
+    // NOT deaf: the puts are acknowledged and the commit publishes.
+    let mut seen = node.states(&write(1));
+    for i in 1..=6u64 {
+        seen.extend(node.states(&protocol::Request::Tick { now: i * 1_000 }));
+    }
+    assert!(
+        !seen.contains(&protocol::WriteState::Stalled),
+        "a commit that published was reported Stalled: {seen:?}"
+    );
+}
+
+/// A context written by the PREVIOUS version is refused, and the engine
+/// starts fresh.
+///
+/// Refused rather than read: bincode reads the fields it is asked for, so a
+/// v2 context would decode into the v3 shape as something nobody chose. The
+/// version is what stops it, and a refused context is a fresh start — which
+/// is always safe, because the head is the journal.
+///
+/// Driven at the ENGINE's own level. The first version of this fed it the
+/// SHELL's context — a different wrapper entirely — so the engine refused it
+/// for the wrong reason and the test passed while proving nothing. Its
+/// control is what caught that.
+#[test]
+fn a_context_from_the_previous_version_is_refused() {
+    let mut e: engine::Engine<Store> =
+        engine::Engine::new(engine::Params::default(), Store::default());
+    let _ = e.step(engine::Event::Start {
+        key: engine::KeySource::Provisioned(engine::Provisioned::Test),
+        epochs: vec![],
+    });
+    let ctx = e.to_context().expect("a context");
+
+    // THE CONTROL FIRST: this build's own context IS accepted, so a refusal
+    // below is about the version rather than about everything being refused.
+    let (_, recovered) =
+        engine::Engine::from_context_or_new(&ctx, engine::Params::default(), Store::default());
+    assert!(
+        recovered,
+        "a context this build just wrote was refused, so the refusal below \
+         would say nothing about versions"
+    );
+
+    // The version sits at bytes [4..6], after the magic.
+    let mut old = ctx.clone();
+    old[4] = 2;
+    old[5] = 0;
+    let (_, recovered) =
+        engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
+    assert!(
+        !recovered,
+        "a context from the previous version was ACCEPTED and read into the \
+         new shape; bincode would have filled the new fields with whatever \
+         followed"
+    );
+
+    // And a DAMAGED context of the current version is still refused, which
+    // is the door the checksum guards rather than the version.
+    let mut damaged = ctx.clone();
+    let n = damaged.len();
+    damaged[n - 1] ^= 0xFF;
+    let (_, recovered) =
+        engine::Engine::from_context_or_new(&damaged, engine::Params::default(), Store::default());
+    assert!(!recovered, "a damaged context was accepted");
+}
+
+/// What the two new fields cost, against the delegate's 400 KiB.
+#[test]
+fn the_stall_timer_costs_almost_nothing() {
+    let mut node = Node::new();
+    node.client(&protocol::Request::Identity);
+    node.deaf = true;
+    node.states(&write(1));
+    node.states(&protocol::Request::Tick { now: 10_000 });
+
+    let held = node.ctx.len();
+    const BUDGET: usize = 409_600;
+    println!("  context with a stuck commit and a stall notice: {held} B of {BUDGET} B");
+    assert!(
+        held < BUDGET,
+        "the context is {held} B, over the delegate's {BUDGET} B budget"
+    );
+    // `in_flight_since` is 8 bytes plus a discriminant; `told_stalled` is one
+    // (ClientId, WriteId) per stuck write and is emptied when a commit
+    // publishes. Neither scales with the tree.
+    assert!(
+        held < BUDGET / 4,
+        "a context holding ONE stuck write is already {held} B, a quarter of \
+         the budget: the stall timer is not what costs, but something is"
     );
 }
