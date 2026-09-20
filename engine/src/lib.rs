@@ -15,8 +15,8 @@
 //! | state | promise |
 //! |---|---|
 //! | `Accepted` | in the engine's memory. Survives a tab close, NOT a node restart. |
-//! | `Durable` | its pack read back from our own node. Survives a restart. What a UI may call "saved". |
-//! | `Published` | the head read back. Other readers can find it. |
+//! | `Stalled` | still held, not saved, and not moving. Non-terminal. |
+//! | `Published` | packs read back, THEN the head read back. Survives a restart, and what a UI may call "saved". |
 //! | `ParityComplete` | the redundancy the new nodes promise actually exists. |
 //!
 //! Between `Published` and `ParityComplete` the tree is correct and its groups
