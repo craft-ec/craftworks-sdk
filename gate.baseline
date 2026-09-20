@@ -5,5 +5,5 @@ probe=5
 probe-delegate=0
 protocol=26
 testkit=10
-web=5
+web=7
 wire=33

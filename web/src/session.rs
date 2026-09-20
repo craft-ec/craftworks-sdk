@@ -1139,7 +1139,20 @@ impl Session {
         // stuck commit was never reported `Stalled`, on a page that was
         // ticking a thousand times a minute.
         self.db.store_mut().send_tick(now);
-        let told = self.db.store_mut().copy.time_out(now);
+        // THROUGH THE STORE'S OWN TICK, not straight to the copy.
+        //
+        // This called `copy.time_out(now)` directly, which does the rolling
+        // back and nothing else — so everything else `CachedStore::tick` does
+        // never ran on a page. What it does besides rolling back is drain the
+        // OUTBOX: the queue of writes the engine refused with `Busy` while a
+        // commit was in flight, which nothing else re-sends (sdk#106).
+        //
+        // That backstop exists because notifications are lossy (F39), and it
+        // was dead here the day it was written. Reaching past a type's own
+        // entry point to one of its fields is how: the copy is a field, and
+        // calling it directly skipped every decision the store makes around
+        // it.
+        let told = self.db.store_mut().tick();
         // A LOCAL change is a change too: a write that rolled back moves the
         // rows a component is showing, and the component finds out the same
         // way it finds out about anybody else's.
