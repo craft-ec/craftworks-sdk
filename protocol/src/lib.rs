@@ -102,7 +102,32 @@ pub enum Request {
     Tick {
         now: u64,
     },
+    /// Give the engine what it cannot produce for itself.
+    ///
+    /// A delegate cannot fabricate a contract — it has no way to produce wasm
+    /// — and it cannot mint authority. These arrive once and are kept in the
+    /// node's secret store, which survives a restart where the context does
+    /// not.
+    ///
+    /// APPENDED, at the end of v1's vocabulary. A variant's position is its
+    /// wire tag, so this is the only place a new request can go without
+    /// renumbering the ones before it and silently turning old messages into
+    /// different new ones. The recorded v1 session is what proves it did not.
+    Install {
+        block_code: Vec<u8>,
+        register_code: Vec<u8>,
+        register_params: Vec<u8>,
+        /// TEST ONLY today: generated per run by a driver, never read from
+        /// disk. A named type rather than bare bytes, because the danger is
+        /// not that a test key leaks — it is that a REAL one arrives here
+        /// and nothing notices.
+        signing_key: TestKey,
+    },
 }
+
+/// A signing key that is not a real one, and says so in its own type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestKey(pub Vec<u8>);
 
 /// One end of a range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +192,46 @@ pub enum Reply {
     Dropped {
         reason: Dropped,
     },
+    /// What one engine call DID. Appended to v1.
+    ///
+    /// Part of the protocol rather than a side channel, because an engine
+    /// hosted in a delegate has no log anyone can read and the node prints
+    /// nothing about it — so without this, five different breaks in the
+    /// write path all present as the same thing: a write that stops at
+    /// `Accepted`. Every field is a count the engine already had, and it
+    /// found all five.
+    Call {
+        saw: Saw,
+        /// Effects the core returned.
+        effects: u32,
+        /// Node operations issued.
+        ops: u32,
+        /// Blocks put and not yet read back.
+        awaiting: u32,
+        /// Puts confirmed by reading them back.
+        read_back: u32,
+        /// Effects still queued at the end of the call, and therefore LOST.
+        /// Must be zero.
+        stranded: u32,
+        /// Inbound messages this build could not use.
+        dropped: u32,
+        /// What the head bump cost, by route: a PUT carries the contract's
+        /// CODE, an UPDATE names it by id.
+        head_put: u32,
+        head_update: u32,
+        /// What the node said, when it said anything.
+        note: String,
+    },
+}
+
+/// What kind of message woke an engine call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Saw {
+    Client,
+    GetResponse,
+    PutResponse,
+    UpdateResponse,
+    Other,
 }
 
 /// The states a write moves through, as a client sees them.
@@ -217,6 +282,9 @@ pub enum Dropped {
     TooLarge,
     /// A response about something nobody asked for.
     Unexpected,
+    /// A message kind this side has no use for. Appended, like everything
+    /// else: a variant's position is its wire tag.
+    NotForUs,
 }
 
 /// The largest message this build will decode.

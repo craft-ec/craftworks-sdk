@@ -1,11 +1,11 @@
 //! Acceptance 4 and 5: the read-back rule, and what the shell does with
 //! things it does not understand. No wasm, no node.
 
-use engine::{Op, Params, State};
+use engine::Params;
 use engine_delegate::shell::{Inbound, Shell};
-use engine_delegate::wire::{Dropped, Reply, Request};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
+use protocol::{Dropped, Reply, Request, WriteState};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -30,23 +30,24 @@ impl Store {
     }
 }
 
-fn states(out: &[Vec<u8>]) -> Vec<State> {
+fn states(out: &[Vec<u8>]) -> Vec<WriteState> {
     out.iter()
-        .filter_map(|b| bincode::deserialize::<Reply>(b).ok())
+        .filter_map(|b| protocol::decode_reply(b).ok())
         .filter_map(|r| match r {
-            Reply::Write { state, .. } => Some(state),
+            Reply::WriteState { state, .. } => Some(state),
             _ => None,
         })
         .collect()
 }
 
 fn write_req() -> Vec<u8> {
-    bincode::serialize(&Request::Write {
-        client: 1,
-        write_id: 1,
-        ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
-    })
-    .unwrap()
+    protocol::encode_request(
+        protocol::CURRENT,
+        &Request::Write {
+            write_id: 1,
+            ops: vec![protocol::Op::Put(b"k".to_vec(), vec![3u8; 40])],
+        },
+    )
 }
 
 /// A `PutContractResponse` is NOT a confirmation; the read-back is.
@@ -63,7 +64,7 @@ fn an_ack_is_not_a_confirmation_and_the_read_back_is() {
     let out = s.handle(vec![Inbound::Client(write_req())]);
     assert_eq!(
         states(&out.replies).first(),
-        Some(&State::Accepted),
+        Some(&WriteState::Accepted),
         "the write was not accepted"
     );
     let puts: Vec<Cid> = out
@@ -83,7 +84,7 @@ fn an_ack_is_not_a_confirmation_and_the_read_back_is() {
         .collect();
     let out = s.handle(acks);
     assert!(
-        !states(&out.replies).contains(&State::Published),
+        !states(&out.replies).contains(&WriteState::Published),
         "the write PUBLISHED on acknowledgements alone: the node has said it \
          accepted the requests, not that the bytes are anywhere"
     );
@@ -151,7 +152,7 @@ fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
         if s.awaiting() == 0 {
             failed_at = Some(rounds);
             assert!(
-                !states(&out.replies).contains(&State::Published),
+                !states(&out.replies).contains(&WriteState::Published),
                 "a put that never read back was published"
             );
             break;
@@ -184,15 +185,18 @@ fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
 /// same thing.
 #[test]
 fn a_message_with_trailing_bytes_is_refused_rather_than_half_read() {
-    let good = bincode::serialize(&Request::Flush).unwrap();
+    let good = protocol::encode_request(protocol::CURRENT, &Request::Flush);
     assert!(
-        engine_delegate::wire::request(&good).is_some(),
+        matches!(protocol::decode_request(&good), protocol::Incoming::Ok(_)),
         "a well-formed Flush was refused, so the check below shows nothing"
     );
     let mut trailing = good.clone();
     trailing.extend_from_slice(b"and then some");
     assert!(
-        engine_delegate::wire::request(&trailing).is_none(),
+        !matches!(
+            protocol::decode_request(&trailing),
+            protocol::Incoming::Ok(_)
+        ),
         "a request with {} trailing byte(s) was accepted; its prefix was read \
          as a whole message, which is how one message becomes another",
         trailing.len() - good.len()
@@ -265,7 +269,7 @@ fn what_the_shell_cannot_understand_is_dropped_and_counted() {
     let out = s.handle(vec![Inbound::Client(write_req())]);
     assert_eq!(
         states(&out.replies).first(),
-        Some(&State::Accepted),
+        Some(&WriteState::Accepted),
         "a well-formed write was dropped too, so this test shows only that \
          the shell rejects everything"
     );
@@ -280,7 +284,7 @@ fn what_the_shell_cannot_understand_is_dropped_and_counted() {
 fn the_shell_works_when_rebuilt_from_its_context_between_every_call() {
     let store = Store::default();
     let mut ctx: Vec<u8> = Vec::new();
-    let mut every_state: Vec<State> = Vec::new();
+    let mut every_state: Vec<WriteState> = Vec::new();
 
     let mut inbound = vec![Inbound::Client(write_req())];
     let mut guard = 0;
@@ -315,7 +319,7 @@ fn the_shell_works_when_rebuilt_from_its_context_between_every_call() {
             out.stranded,
             states(&out.replies)
         );
-        if every_state.contains(&State::Published) {
+        if every_state.contains(&WriteState::Published) {
             break;
         }
         // The node does what the ops ask, and answers.
@@ -347,11 +351,11 @@ fn the_shell_works_when_rebuilt_from_its_context_between_every_call() {
         inbound = next;
     }
     assert!(
-        every_state.contains(&State::Accepted),
+        every_state.contains(&WriteState::Accepted),
         "the write was never accepted across {guard} calls: {every_state:?}"
     );
     assert!(
-        every_state.contains(&State::Published),
+        every_state.contains(&WriteState::Published),
         "the write never PUBLISHED across {guard} calls: {every_state:?}. \
          Reaching only Accepted means the head was written and never \
          confirmed, and a shell that stops there has told a client its data \
@@ -375,7 +379,7 @@ fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
     let out = without.handle(vec![Inbound::Client(write_req())]);
     assert_eq!(
         states(&out.replies).first(),
-        Some(&State::Accepted),
+        Some(&WriteState::Accepted),
         "the write was not even accepted"
     );
     assert!(
@@ -418,13 +422,15 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
     let store = Store::default();
     let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, false);
 
-    let req = bincode::serialize(&Request::Install {
-        block_code: vec![1u8; 64],
-        register_code: vec![2u8; 32],
-        register_params: vec![3u8; 16],
-        signing_key: engine_delegate::wire::TestKey(vec![4u8; 32]),
-    })
-    .unwrap();
+    let req = protocol::encode_request(
+        protocol::CURRENT,
+        &Request::Install {
+            block_code: vec![1u8; 64],
+            register_code: vec![2u8; 32],
+            register_params: vec![3u8; 16],
+            signing_key: protocol::TestKey(vec![4u8; 32]),
+        },
+    );
     let out = s.handle(vec![Inbound::Client(req)]);
     assert!(
         s.provisioned,
@@ -441,9 +447,10 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
 
     // What the ENGINE records is where its authority came from — and the
     // type says TEST, which is the whole point of naming it.
-    let out = s.handle(vec![Inbound::Client(
-        bincode::serialize(&Request::Start { epochs: vec![1] }).unwrap(),
-    )]);
+    let out = s.handle(vec![Inbound::Client(protocol::encode_request(
+        protocol::CURRENT,
+        &Request::Identity,
+    ))]);
     assert!(
         out.ops
             .iter()
@@ -479,28 +486,24 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     };
     let store = Store::default();
 
-    let run = |n: u32| -> (Vec<State>, usize, usize) {
+    let run = |n: u32| -> (Vec<WriteState>, usize, usize) {
         let mut s: Shell<Store> = Shell::resume_with(&[], params, store.clone(), true);
         s.limits = engine_delegate::schedule::Limits {
             max_gets: 4,
             max_puts: per_return,
         };
-        let ops: Vec<(Vec<u8>, Op)> = (0..n)
+        let ops: Vec<protocol::Op> = (0..n)
             .map(|i| {
-                (
+                protocol::Op::Put(
                     format!("k{i:04}").into_bytes(),
-                    Op::Put(vec![(i % 251) as u8; params.max_packed_value + 1]),
+                    vec![(i % 251) as u8; params.max_packed_value + 1],
                 )
             })
             .collect();
-        let out = s.handle(vec![Inbound::Client(
-            bincode::serialize(&Request::Write {
-                client: 1,
-                write_id: 1,
-                ops,
-            })
-            .unwrap(),
-        )]);
+        let out = s.handle(vec![Inbound::Client(protocol::encode_request(
+            protocol::CURRENT,
+            &Request::Write { write_id: 1, ops },
+        ))]);
         let puts = out
             .ops
             .iter()
@@ -513,7 +516,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     let (over, over_puts, over_stranded) = run(per_return as u32 * 4);
     assert_eq!(
         over,
-        vec![State::Busy],
+        vec![WriteState::Busy],
         "a commit naming more blocks than one return can carry was not \
          refused; it was {over:?}"
     );
@@ -528,7 +531,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     // in this one return. Without it, "nothing was put" is also what a shell
     // that never puts anything looks like.
     let (under, under_puts, under_stranded) = run(2);
-    assert_eq!(under.first(), Some(&State::Accepted));
+    assert_eq!(under.first(), Some(&WriteState::Accepted));
     assert!(
         under_puts > 0,
         "a commit UNDER the same boundary put nothing either, so the refusal \

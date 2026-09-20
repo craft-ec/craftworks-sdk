@@ -17,5 +17,6 @@ serde = { version = "1", features = ["derive"] }
 # and signs with the same key type. A dependency of the DRIVER only: nothing
 # here reaches the delegate's wasm.
 engine-delegate = { path = "../engine-delegate", default-features = false }
+protocol = { path = "../protocol" }
 engine = { path = "../engine" }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }

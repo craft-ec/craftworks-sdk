@@ -453,6 +453,7 @@ dependencies = [
  "engine",
  "freenet-prolly",
  "freenet-stdlib",
+ "protocol",
  "serde",
 ]
 
@@ -1013,6 +1014,7 @@ dependencies = [
  "engine",
  "engine-delegate",
  "freenet-stdlib",
+ "protocol",
  "serde",
  "tokio",
  "tokio-tungstenite",

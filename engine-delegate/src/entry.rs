@@ -96,11 +96,11 @@ impl DelegateInterface for EngineDelegate {
         let mut node_said = String::new();
         let mut trace = String::new();
         let saw = match &inbound {
-            InboundDelegateMsg::ApplicationMessage(_) => crate::wire::Saw::Client,
-            InboundDelegateMsg::GetContractResponse(_) => crate::wire::Saw::GetResponse,
-            InboundDelegateMsg::PutContractResponse(_) => crate::wire::Saw::PutResponse,
-            InboundDelegateMsg::UpdateContractResponse(_) => crate::wire::Saw::UpdateResponse,
-            _ => crate::wire::Saw::Other,
+            InboundDelegateMsg::ApplicationMessage(_) => protocol::Saw::Client,
+            InboundDelegateMsg::GetContractResponse(_) => protocol::Saw::GetResponse,
+            InboundDelegateMsg::PutContractResponse(_) => protocol::Saw::PutResponse,
+            InboundDelegateMsg::UpdateContractResponse(_) => protocol::Saw::UpdateResponse,
+            _ => protocol::Saw::Other,
         };
         // What block a response is about, if this is one and the pairing was
         // remembered. Read before the shell is built, because the shell needs
@@ -238,12 +238,16 @@ impl DelegateInterface for EngineDelegate {
         // since writing a secret needs the ctx mutably.
         if installing.is_some() {
             if let InboundDelegateMsg::ApplicationMessage(m) = &inbound {
-                if let Some(crate::wire::Request::Install {
-                    block_code,
-                    register_code,
-                    register_params,
-                    signing_key,
-                }) = crate::wire::request(m.payload.as_ref())
+                if let protocol::Incoming::Ok(protocol::Envelope {
+                    body:
+                        protocol::Request::Install {
+                            block_code,
+                            register_code,
+                            register_params,
+                            signing_key,
+                        },
+                    ..
+                }) = protocol::decode_request(m.payload.as_ref())
                 {
                     ctx.set_secret(BLOCK_CODE, &block_code);
                     ctx.set_secret(REGISTER_CODE, &register_code);
@@ -444,17 +448,19 @@ impl DelegateInterface for EngineDelegate {
         // What this call did, always. A delegate has no log anyone can read,
         // so a break anywhere in the chain is otherwise indistinguishable
         // from any other break.
-        let note = crate::wire::reply(&crate::wire::Reply::Call {
+        let note = protocol::encode_reply(&protocol::Reply::Call {
             saw,
-            ops: msgs.len(),
-            stranded: out.stranded,
-            no_code: out.refused_no_code,
-            dropped: out.dropped.len() + unknown_kind + refused_pack,
-            awaiting: out.awaiting,
-            head_put: head_put_bytes,
-            head_update: head_update_bytes,
-            read_back: out.read_back_hits,
-            effects: out.effects,
+            ops: msgs.len() as u32,
+            stranded: out.stranded as u32,
+            // `refused_no_code` folds in here: from outside, a put the shell
+            // would not build and a message it could not read are the same
+            // thing — something that did not happen, counted.
+            dropped: (out.dropped.len() + unknown_kind + refused_pack + out.refused_no_code) as u32,
+            awaiting: out.awaiting as u32,
+            head_put: head_put_bytes as u32,
+            head_update: head_update_bytes as u32,
+            read_back: out.read_back_hits as u32,
+            effects: out.effects as u32,
             note: if node_said.is_empty() {
                 trace
             } else {
