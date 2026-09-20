@@ -181,6 +181,9 @@ pub enum KeySource {
 /// one group's protection and are worth nothing separately.
 pub type ParityIds = [Cid; 3];
 
+/// A parity group's three blocks, as `(id, bytes)`.
+type ParityBlocks = Vec<(Cid, Vec<u8>)>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     PutPack {
@@ -369,6 +372,13 @@ pub struct Params {
     /// become: eight megabytes of small values is thousands of them, and the
     /// context would not fit. This is the bound that closes the arithmetic.
     pub max_commit_blocks: usize,
+    /// Blocks one call may read while recomputing owed parity.
+    ///
+    /// The context carries owed groups as IDS, so a rehydrated engine has to
+    /// find the node that lists them before it can code anything — a walk of
+    /// the tree, which is a READ and must be bounded like one. What it does
+    /// not finish this call, it finishes on the next: the groups stay owed.
+    pub max_parity_scan_blocks: usize,
     /// Emit the head as soon as the commit is planned, without waiting for
     /// its packs to be read back. The control for (c): a head that names a
     /// root whose blocks are not all there is a tree no reader can walk, and
@@ -406,6 +416,7 @@ impl Default for Params {
             max_parked_write_bytes: 128 * 1024,
             max_parked_reads: 1000,
             max_commit_blocks: 2048,
+            max_parity_scan_blocks: 512,
             head_before_packs: false,
         }
     }
@@ -1816,12 +1827,119 @@ impl<B: Blocks> Engine<B> {
         out
     }
 
+    /// Recover the BYTES behind owed groups the context carried as ids only.
+    ///
+    /// Parity is a pure function of a group's members, so the same group
+    /// gives the same three blocks under the same three ids whoever computes
+    /// them. What the context cannot carry is which NODE lists a given trio,
+    /// and that is found by walking the tree — so this is a READ, and it is
+    /// bounded and resumable like one. Blocks it could not read are fetched
+    /// and the groups stay owed; the next call picks up where this stopped.
+    ///
+    /// Without it a rehydrated engine marked every owed group sent and put
+    /// nothing behind it. In production EVERY call is a rehydration, so that
+    /// was not an edge case: it was all of them, and the redundancy the tree
+    /// promised was silently never written.
+    fn recompute_owed(&mut self) -> Vec<Effect> {
+        let wanted: BTreeSet<ParityIds> = self
+            .owed
+            .iter()
+            .filter(|(_, o)| !o.sent && o.blocks.is_empty())
+            .map(|(k, _)| *k)
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut found: Vec<(ParityIds, ParityBlocks)> = Vec::new();
+        let mut need: BTreeSet<Cid> = BTreeSet::new();
+        let mut left = self.params.max_parity_scan_blocks;
+        {
+            let source = self.source();
+            let mut stack = vec![self.root];
+            let mut seen: BTreeSet<Cid> = BTreeSet::new();
+            let mut still: BTreeSet<ParityIds> = wanted.clone();
+            while let Some(cid) = stack.pop() {
+                if still.is_empty() || left == 0 {
+                    break;
+                }
+                if !seen.insert(cid) {
+                    continue;
+                }
+                let Some(bytes) = source.get(&cid) else {
+                    // The walk stopped here. Ask for it; the group stays owed
+                    // and the next call resumes from a warmer tree.
+                    need.insert(cid);
+                    continue;
+                };
+                left -= 1;
+                let Ok(node) = Node::parse(bytes) else {
+                    continue;
+                };
+                // Does this node list any trio still wanted?
+                let lists: Vec<Cid> = node.parity().collect();
+                let here: BTreeSet<ParityIds> = lists
+                    .chunks_exact(3)
+                    .map(|t| [t[0], t[1], t[2]])
+                    .filter(|k| still.contains(k))
+                    .collect();
+                if !here.is_empty() {
+                    match freenet_prolly::parity::blocks_of(&node, &source) {
+                        Some(all) => {
+                            // Matched by the ids the coding PRODUCES, not by
+                            // position: a group is identified by its three
+                            // parity ids, and checking them makes the match
+                            // self-verifying rather than order-dependent.
+                            for trio in all.chunks_exact(3) {
+                                let key: ParityIds = [trio[0].0, trio[1].0, trio[2].0];
+                                if still.remove(&key) {
+                                    found.push((key, trio.to_vec()));
+                                }
+                            }
+                        }
+                        None => {
+                            // A member is not held. Parity over a member whose
+                            // bytes nobody has is parity over nothing, so ask
+                            // for the members and leave the group owed.
+                            for (_, members) in freenet_prolly::parity::group_members(&node) {
+                                for m in members {
+                                    if source.get(&m).is_none() {
+                                        need.insert(m);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !node.is_leaf() {
+                    for i in 0..node.len() {
+                        stack.push(node.child(i).0);
+                    }
+                }
+            }
+        }
+        for (key, blocks) in found {
+            if let Some(o) = self.owed.get_mut(&key) {
+                o.blocks = blocks;
+            }
+        }
+        need.into_iter()
+            .map(|id| Effect::FetchBlock {
+                id,
+                via: read::Via::Direct,
+                attempt: 1,
+            })
+            .collect()
+    }
+
     fn emit_parity(&mut self, want: impl Fn(&Owed) -> bool) -> Vec<Effect> {
-        let mut out = Vec::new();
+        // A rehydrated engine owes groups it has no bytes for. Recover them
+        // before deciding what to send, or every group would be marked sent
+        // with nothing behind it.
+        let mut out = self.recompute_owed();
         let keys: Vec<ParityIds> = self
             .owed
             .iter()
-            .filter(|(_, o)| !o.sent && want(o))
+            .filter(|(_, o)| !o.sent && !o.blocks.is_empty() && want(o))
             .map(|(k, _)| *k)
             .collect();
         for key in keys {
@@ -1830,6 +1948,7 @@ impl<B: Blocks> Engine<B> {
                 o.sent = true;
                 o.blocks.clone()
             };
+            debug_assert!(!blocks.is_empty(), "filtered above");
             for (id, bytes) in blocks {
                 self.in_flight_parity.insert(id, key);
                 out.push(Effect::PutParity {

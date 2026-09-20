@@ -555,3 +555,125 @@ fn no_global_state_in_the_engine() {
     );
     println!("  {files} engine source file(s), {lines} lines, no globals (pattern verified on {hits} test-only hit(s))");
 }
+
+/// Owed parity survives a rehydration, and is actually PUT.
+///
+/// The context carries owed groups as ids with no bytes, because parity is a
+/// pure function of its members and the bytes can be recomputed from the
+/// node's blocks. "Can be" is the claim this checks.
+#[test]
+fn owed_parity_survives_a_rehydration_and_is_still_put() {
+    let p = Params {
+        coalesce_parity: true,
+        ..Params::default()
+    };
+    let mut store = Store::default();
+    let mut e = Engine::new(p, store.clone());
+
+    // Values by reference, so leaves carry parity over them.
+    let ops: Vec<(Vec<u8>, Op)> = (0..64u32)
+        .map(|i| {
+            (
+                format!("k/{i:05}").into_bytes(),
+                Op::Put(vec![(i % 251) as u8; 1400]),
+            )
+        })
+        .collect();
+    let mut queue = e.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops,
+    });
+    store.absorb(&queue);
+    let mut live: Vec<Effect> = Vec::new();
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the commit did not settle");
+        let out = match &f {
+            Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => {
+                e.step(Event::PutConfirmed(*id))
+            }
+            Effect::UpdateHead { seq, .. } => e.step(Event::HeadConfirmed(*seq)),
+            _ => Vec::new(),
+        };
+        store.absorb(&out);
+        live.extend(out.clone());
+        queue.extend(out);
+    }
+    let owed = e.owed_groups();
+    assert!(
+        owed > 0,
+        "the commit left no parity owed, so there is nothing for a \
+         rehydration to carry"
+    );
+    let _ = &live;
+
+    // Round-trip the context FIRST, so both engines start from the same owed
+    // set, then drive the live one to get the oracle.
+    let ctx = e.to_context().expect("a context");
+    let mut live_parity: Vec<Cid> = Vec::new();
+    for t in 1..=(p.parity_age * 3) {
+        for f in e.step(Event::Tick(t)) {
+            if let Effect::PutParity { id, .. } = f {
+                live_parity.push(id);
+            }
+        }
+    }
+    live_parity.sort();
+    // The oracle must exist. Guarded behind an `if !live_parity.is_empty()`,
+    // the comparison below would be skipped silently whenever the live engine
+    // happened to put nothing — which is the case it most needs to catch.
+    assert_eq!(
+        live_parity.len(),
+        owed * 3,
+        "the live engine put {} parity block(s) for {owed} owed group(s), so \
+         there is no oracle to compare the rehydrated one against",
+        live_parity.len()
+    );
+
+    // The same context, in an engine that never saw the commit.
+    let mut e2 = Engine::from_context(&ctx, p, store.clone()).expect("its own context");
+    assert_eq!(
+        e2.owed_groups(),
+        owed,
+        "the rehydrated engine does not owe the same groups"
+    );
+
+    // Drive it past the parity age, the way a live engine flushes.
+    let mut put: Vec<Cid> = Vec::new();
+    for t in 1..=(p.parity_age * 3) {
+        for f in e2.step(Event::Tick(t)) {
+            if let Effect::PutParity { id, .. } = f {
+                put.push(id);
+            }
+        }
+    }
+    assert!(
+        !put.is_empty(),
+        "a rehydrated engine owing {owed} parity group(s) put NONE of them: \
+         the bytes are not in the context and nothing recomputes them, so the \
+         groups are marked sent and the redundancy is silently lost"
+    );
+    put.sort();
+    assert_eq!(
+        put.len(),
+        owed * 3,
+        "{owed} group(s) owed, {} parity block(s) put: a group is three \
+         blocks, so this is not one per group",
+        put.len()
+    );
+    // The recomputed blocks are the SAME blocks, by id. Parity is a pure
+    // function of its members, and this is the assertion that says so rather
+    // than the comment.
+    assert_eq!(
+        put, live_parity,
+        "the rehydrated engine put different parity from the live one for \
+         the same groups"
+    );
+    println!(
+        "  {owed} group(s) owed across a rehydration, {} parity block(s) put, \
+         ids identical to the live engine's",
+        put.len()
+    );
+}

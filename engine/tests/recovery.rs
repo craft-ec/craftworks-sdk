@@ -1083,3 +1083,136 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
         );
     }
 }
+
+/// Recomputing owed parity is a READ: bounded, resumable, and it ends.
+///
+/// The context carries owed groups as ids, so a rehydrated engine must walk
+/// the tree to find the node that lists a trio before it can code anything.
+/// A walk reads blocks, and the node may not hold them — F33: a sync read
+/// does not refresh hosting, so a block used on one call can be gone on the
+/// next. The walk must therefore ask for what it cannot read and stop, not
+/// spin and not give up.
+#[test]
+fn recomputing_owed_parity_is_bounded_and_resumes() {
+    let params = Params {
+        coalesce_parity: true,
+        ..Params::default()
+    };
+    let mut net = Network::default();
+    let mut e = boot(&net, params);
+
+    // Values by reference, so leaves carry parity over them.
+    let ops: Vec<(Vec<u8>, Op)> = (0..64u32)
+        .map(|i| {
+            (
+                format!("k/{i:05}").into_bytes(),
+                Op::Put(vec![(i % 251) as u8; 1400]),
+            )
+        })
+        .collect();
+    let mut queue = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops,
+        }
+    );
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the commit did not settle");
+        match f {
+            Effect::PutPack { id, bytes, .. }
+            | Effect::PutBlock { id, bytes, .. }
+            | Effect::PutParity { id, bytes, .. } => {
+                net.confirm(id, &bytes);
+                queue.extend(stepped!(e, Event::PutConfirmed(id)));
+            }
+            Effect::UpdateHead { seq, root, .. } => {
+                net.head = Some((seq, root));
+                queue.extend(stepped!(e, Event::HeadConfirmed(seq)));
+            }
+            _ => {}
+        }
+    }
+    let owed = e.owed_groups();
+    assert!(owed > 0, "the commit left no parity owed");
+    let ctx = e.to_context().expect("a context");
+
+    // The node has evicted everything but the root. The rehydrated engine
+    // must ask, not hang and not silently drop the groups.
+    let store = Store::default();
+    let cold = Store::fresh();
+    cold.put(
+        e.published_root(),
+        store.get(&e.published_root()).expect("the root"),
+    );
+    let mut e2 = Engine::from_context(&ctx, params, cold.clone()).expect("its own context");
+    assert_eq!(e2.owed_groups(), owed, "the groups did not survive");
+
+    let mut asked: BTreeSet<Cid> = BTreeSet::new();
+    let mut put = 0usize;
+    let mut calls = 0usize;
+    for t in 1..=(params.parity_age * 8) {
+        calls += 1;
+        let out = e2.step(Event::Tick(t));
+        for f in &out {
+            match f {
+                Effect::FetchBlock { id, .. } => {
+                    asked.insert(*id);
+                }
+                Effect::PutParity { .. } => put += 1,
+                _ => {}
+            }
+        }
+        // Serve what it asked for, one call's worth at a time, exactly as a
+        // node would: put it where the engine reads, THEN tell it.
+        for f in out {
+            if let Effect::FetchBlock { id, .. } = f {
+                if let Some(bytes) = store.get(&id) {
+                    cold.put(id, bytes);
+                    let more = e2.step(Event::BlockArrived {
+                        id,
+                        bytes: bytes.to_vec(),
+                    });
+                    for f in &more {
+                        if let Effect::PutParity { .. } = f {
+                            put += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if put == owed * 3 {
+            // Every group is out. `owed_groups()` still counts them -- a sent
+            // group stays in the map so a later commit can supersede it -- so
+            // the stopping condition is what was PUT, not what is listed.
+            break;
+        }
+    }
+
+    assert!(
+        !asked.is_empty(),
+        "the recompute read nothing at all from a node holding only the root, \
+         so it is not walking the tree"
+    );
+    assert_eq!(
+        put,
+        owed * 3,
+        "{owed} group(s) owed and {put} parity block(s) put after resuming; a \
+         group is three blocks"
+    );
+    // Bounded: it did not read the whole tree over and over to get there.
+    assert!(
+        asked.len() <= params.max_parity_scan_blocks,
+        "the recompute asked for {} block(s) against a scan bound of {}",
+        asked.len(),
+        params.max_parity_scan_blocks
+    );
+    println!(
+        "  owed parity recomputed cold: {} block(s) asked for over {calls} \
+         call(s), all {put} parity block(s) put",
+        asked.len()
+    );
+}
