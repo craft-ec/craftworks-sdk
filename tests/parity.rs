@@ -11,7 +11,7 @@
 //! This file asks it directly, walking every block a store holds — including
 //! the superseded nodes, which stay and which a reader can still be handed.
 
-use craftworks_sdk::store::{Edit, Store};
+use craftworks_sdk::store::{Edit, Reads, Store};
 use craftworks_sdk::{Db, TreeStore};
 use freenet_prolly::boundary::check_node;
 use freenet_prolly::node::{Node, MAX_INLINE};
@@ -115,7 +115,10 @@ fn nodes_holding_referenced_values_are_accepted_too() {
     let mut r = rng(11);
     for i in 0..60u64 {
         let want = vec![(r() % 251) as u8; MAX_INLINE + 1 + (r() % 2048) as usize];
-        assert_eq!(store.get(format!("big/{i:06}").as_bytes()), Ok(Some(want)));
+        assert_eq!(
+            Reads::get(&mut store, format!("big/{i:06}").as_bytes()),
+            Ok(Some(want))
+        );
     }
     println!("checked {nodes} nodes over {others} referenced value blocks");
 }

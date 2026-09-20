@@ -5,6 +5,7 @@
 //! Every capability is written once in Rust and exposed to JavaScript from
 //! [`js`], so the builder and apps get it the phase it lands.
 
+pub mod binding;
 pub mod blockid;
 pub mod db;
 pub mod id;
@@ -14,13 +15,14 @@ pub mod store;
 pub mod tree_store;
 
 mod engine_store;
+pub use binding::{Binding, LiveMode, Reloads};
 pub use blockid::{BlockId, ContentHash, IdError};
 pub use db::{Db, Record, Scan};
 pub use engine_store::{EngineStore, Event as EngineEvent, Page, Transport};
 pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use schema::{Field, Kind, Schema};
-pub use store::{Edit, MemStore, Read, Store, StoreError};
+pub use store::{Delta, Edit, MemStore, Read, Reads, Store, StoreError};
 pub use tree_store::{OwedGroup, OwedParity, Stats, TreeStore};
 
 /// The tree format tag every node carries, from the library that writes them.
@@ -167,10 +169,10 @@ pub mod js {
             let s: Schema = serde_json::from_str(schema).map_err(err)?;
             self.0.define(domain, &s).map_err(err)
         }
-        pub fn schema(&self, domain: &str) -> Result<String, JsError> {
+        pub fn schema(&mut self, domain: &str) -> Result<String, JsError> {
             json(&self.0.schema(domain).map_err(err)?)
         }
-        pub fn domains(&self) -> Result<String, JsError> {
+        pub fn domains(&mut self) -> Result<String, JsError> {
             json(&self.0.domains().map_err(err)?)
         }
         /// Errors here are ordinary JavaScript `Error`s the app can catch —
@@ -188,7 +190,7 @@ pub mod js {
                     .map_err(err)?,
             )
         }
-        pub fn get(&self, domain: &str, id: &str) -> Result<String, JsError> {
+        pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsError> {
             json(&self.0.get(domain, &rkey(id)?).map_err(err)?)
         }
         pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsError> {
@@ -196,7 +198,7 @@ pub mod js {
         }
         /// `after` is a record id or the empty string.
         pub fn scan(
-            &self,
+            &mut self,
             domain: &str,
             reverse: bool,
             limit: usize,
@@ -241,7 +243,7 @@ pub mod js {
             }))
         }
 
-        pub fn count(&self, domain: &str) -> Result<usize, JsError> {
+        pub fn count(&mut self, domain: &str) -> Result<usize, JsError> {
             self.0.count(domain).map_err(err)
         }
     }

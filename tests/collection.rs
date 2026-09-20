@@ -22,9 +22,6 @@ impl Env for FakeEnv {
 #[derive(Default)]
 struct VecStore(Vec<(Vec<u8>, Vec<u8>)>);
 impl Store for VecStore {
-    fn get(&self, k: &[u8]) -> craftworks_sdk::Read<Option<Vec<u8>>> {
-        Ok(self.0.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()))
-    }
     fn put(&mut self, k: &[u8], v: &[u8]) {
         self.delete(k);
         self.0.push((k.to_vec(), v.to_vec()));
@@ -34,8 +31,14 @@ impl Store for VecStore {
         self.0.retain(|(x, _)| x != k);
         self.0.len() != n
     }
+}
+
+impl craftworks_sdk::Reads for VecStore {
+    fn get(&mut self, k: &[u8]) -> craftworks_sdk::Read<Option<Vec<u8>>> {
+        Ok(self.0.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()))
+    }
     fn scan(
-        &self,
+        &mut self,
         lo: &[u8],
         hi: &[u8],
         reverse: bool,
@@ -54,6 +57,29 @@ impl Store for VecStore {
         r.truncate(limit);
         Ok(r)
     }
+    fn root(&mut self) -> craftworks_sdk::Read<[u8; 32]> {
+        let mut v = self.0.clone();
+        v.sort();
+        let mut h = blake3::Hasher::new();
+        for (k, val) in &v {
+            h.update(&(k.len() as u64).to_le_bytes());
+            h.update(k);
+            h.update(&(val.len() as u64).to_le_bytes());
+            h.update(val);
+        }
+        Ok(*h.finalize().as_bytes())
+    }
+    fn changes_since(
+        &mut self,
+        _from: [u8; 32],
+        _lo: &[u8],
+        _hi: &[u8],
+        _max: u32,
+    ) -> craftworks_sdk::Read<craftworks_sdk::Delta> {
+        Ok(craftworks_sdk::Delta::FullReloadRequired {
+            new_root: self.root()?,
+        })
+    }
 }
 
 fn task_schema() -> Schema {
@@ -67,13 +93,13 @@ fn task_schema() -> Schema {
 fn obj(v: Value) -> Map<String, Value> {
     v.as_object().unwrap().clone()
 }
-fn db<S: Store + Default>() -> Db<S, FakeEnv> {
+fn db<S: Store + craftworks_sdk::Reads + Default>() -> Db<S, FakeEnv> {
     let mut d = Db::new(S::default(), FakeEnv { now: 1_000, n: 1 }, *b"dev1");
     d.define("tasks", &task_schema()).unwrap();
     d
 }
 
-fn suite<S: Store + Default>() {
+fn suite<S: Store + craftworks_sdk::Reads + Default>() {
     // create / read
     let mut d = db::<S>();
     let a = d
@@ -189,7 +215,7 @@ fn suite<S: Store + Default>() {
     assert_eq!(d.domains().unwrap(), ["task", "tasks", "tasks2"]);
 }
 
-fn d_set_now<S: Store>(d: &mut Db<S, FakeEnv>, now: u64) {
+fn d_set_now<S: Store + craftworks_sdk::Reads>(d: &mut Db<S, FakeEnv>, now: u64) {
     // FakeEnv is reachable only through Db; rebuild around the same store is
     // overkill, so tests advance time through this helper.
     d.env_mut().now = now;
@@ -351,9 +377,11 @@ fn keys_follow_the_architecture_keyspace() {
     // id = 8 B ms timestamp ‖ 4 B device ‖ 4 B tail
     assert_eq!(&id[..8], &1_000u64.to_be_bytes());
     assert_eq!(&id[8..12], b"dev1");
-    assert!(d.store().get(&key).unwrap().is_some());
+    assert!(Reads::get(d.store_mut(), &key).unwrap().is_some());
     assert!(
-        d.store().get(b"\x00schema\x00tasks").unwrap().is_some(),
+        Reads::get(d.store_mut(), b"\x00schema\x00tasks")
+            .unwrap()
+            .is_some(),
         "the schema lives in the store, in the system range"
     );
 }

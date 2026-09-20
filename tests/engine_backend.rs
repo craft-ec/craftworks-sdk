@@ -124,7 +124,7 @@ fn a_write_through_the_sdk_is_readable_through_the_sdk() {
     let mut db = started(0);
     db.put(b"k/one", b"first");
     assert_eq!(
-        db.read_mut(b"k/one").as_deref(),
+        db.read_mut(b"k/one").unwrap().as_deref(),
         Some(&b"first"[..]),
         "a write the SDK made is not readable through the same engine"
     );
@@ -150,7 +150,9 @@ fn writes_refused_busy_still_arrive_through_the_sdk() {
     );
     for i in 0..4u32 {
         assert_eq!(
-            db.read_mut(format!("k/{i:02}").as_bytes()).as_deref(),
+            db.read_mut(format!("k/{i:02}").as_bytes())
+                .unwrap()
+                .as_deref(),
             Some(format!("v{i}").as_bytes()),
             "k/{i:02} did not survive being refused Busy"
         );
@@ -171,7 +173,7 @@ fn a_range_reads_back_every_row_in_order_and_both_ways() {
         db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes());
     }
 
-    let rows = db.list(Bound::Unbounded, Bound::Unbounded, false);
+    let rows = db.list(Bound::Unbounded, Bound::Unbounded, false).unwrap();
     let keys: Vec<String> = rows
         .iter()
         .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
@@ -182,7 +184,7 @@ fn a_range_reads_back_every_row_in_order_and_both_ways() {
         "a forward range did not return every row in order"
     );
 
-    let back = db.list(Bound::Unbounded, Bound::Unbounded, true);
+    let back = db.list(Bound::Unbounded, Bound::Unbounded, true).unwrap();
     let back_keys: Vec<String> = back
         .iter()
         .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
@@ -195,11 +197,13 @@ fn a_range_reads_back_every_row_in_order_and_both_ways() {
     );
 
     // A bounded range.
-    let some = db.list(
-        Bound::Included(b"k/03".to_vec()),
-        Bound::Excluded(b"k/07".to_vec()),
-        false,
-    );
+    let some = db
+        .list(
+            Bound::Included(b"k/03".to_vec()),
+            Bound::Excluded(b"k/07".to_vec()),
+            false,
+        )
+        .unwrap();
     assert_eq!(
         some.len(),
         4,
@@ -222,7 +226,9 @@ fn an_oversized_page_request_is_clamped_and_says_so() {
         db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes());
     }
     let asked = 100_000u32;
-    let p = db.page(Bound::Unbounded, Bound::Unbounded, false, None, asked);
+    let p = db
+        .page(Bound::Unbounded, Bound::Unbounded, false, None, asked)
+        .unwrap();
     assert!(
         p.page_size_used < asked,
         "a request for {asked} rows reported {} as used, so nothing was \
@@ -232,7 +238,9 @@ fn an_oversized_page_request_is_clamped_and_says_so() {
     assert!(p.page_size_used > 0);
     // The control: a SMALL request is not clamped, so the clamp is the size
     // doing it rather than a constant reply.
-    let small = db.page(Bound::Unbounded, Bound::Unbounded, false, None, 3);
+    let small = db
+        .page(Bound::Unbounded, Bound::Unbounded, false, None, 3)
+        .unwrap();
     assert_eq!(
         small.page_size_used, 3,
         "a request for 3 rows was also clamped, so the report is not about \
@@ -253,53 +261,100 @@ fn an_oversized_page_request_is_clamped_and_says_so() {
     );
 }
 
-/// The two `&self` reads REFUSE, and the refusal is a value.
+/// One surface, both backends: `Reads` over the engine answers what `Reads`
+/// over the in-memory tree answers.
 ///
-/// `Store::get` and `Store::scan` take `&self`; an exchange with the engine
-/// needs `&mut`. Neither may panic: both are public, both are reachable, and
-/// with `panic = abort` a panic in the browser is a dead wasm instance rather
-/// than something an app can catch.
+/// This replaces a pair of tests that asserted the `&self` reads REFUSED by
+/// name. They described a door that no longer exists: reads take `&mut self`
+/// now, on every backend, so there is nothing to refuse and nothing for a
+/// caller to reach through by mistake. Keeping tests that assert a refusal
+/// would have been keeping tests that assert an implementation detail was
+/// still wrong in the same way.
 ///
-/// The control is the point of the test. The same store, through the doors
-/// that work, produces the row — so the refusal is the door being wrong and
-/// not the store being empty. Without it, `Err` over an empty store and `Err`
-/// over a full one read identically, and the test would keep passing if the
-/// engine had never received the write at all.
+/// What is worth pinning is what the change bought: an app written against
+/// this trait does not change when it moves from memory onto a node.
 #[test]
-fn the_self_reads_refuse_by_name_rather_than_panicking() {
-    // Aliased: this file already has a `Store` — the node's block store.
-    use craftworks_sdk::{Store as SdkStore, StoreError};
-    let mut db = started(0);
-    db.put(b"k/one", b"first");
+fn the_engine_and_the_memory_backend_answer_the_same_reads() {
+    use craftworks_sdk::{MemStore, Reads, Store as SdkStore};
+    let mut engine = started(0);
+    let mut mem = MemStore::default();
 
-    // The control: the data IS there, through the doors that take `&mut`.
-    assert_eq!(
-        db.read_mut(b"k/one").as_deref(),
-        Some(&b"first"[..]),
-        "the row is not in the engine, so a refusal below proves nothing"
-    );
-    assert_eq!(
-        db.list(Bound::Unbounded, Bound::Unbounded, false),
-        vec![(b"k/one".to_vec(), b"first".to_vec())],
-        "the range is not readable, so a refused scan below proves nothing"
-    );
+    for i in 0..12u32 {
+        let (k, v) = (format!("k/{i:02}"), format!("v{i}"));
+        SdkStore::put(&mut engine, k.as_bytes(), v.as_bytes());
+        SdkStore::put(&mut mem, k.as_bytes(), v.as_bytes());
+    }
 
-    // And the same reads through `&self` are refused, by name.
+    for i in 0..14u32 {
+        let k = format!("k/{i:02}");
+        assert_eq!(
+            Reads::get(&mut engine, k.as_bytes()),
+            Reads::get(&mut mem, k.as_bytes()),
+            "the two backends disagree about {k}"
+        );
+    }
     assert_eq!(
-        SdkStore::get(&db, b"k/one"),
-        Err(StoreError::NeedsRoundTrip),
-        "a `&self` get answered instead of refusing"
+        Reads::scan(&mut engine, b"k/03", b"k/07", false, usize::MAX),
+        Reads::scan(&mut mem, b"k/03", b"k/07", false, usize::MAX),
+        "the two backends disagree about a bounded range"
     );
+    // The control: they are not agreeing by both being empty.
     assert_eq!(
-        SdkStore::scan(&db, b"", b"\xff", false, usize::MAX),
-        Err(StoreError::NeedsRoundTrip),
-        "a `&self` scan answered instead of refusing"
+        Reads::scan(&mut mem, b"k/03", b"k/07", false, usize::MAX)
+            .unwrap()
+            .len(),
+        4,
+        "the fixture produced no rows, so the agreement above is vacuous"
     );
+    // And a root is a root on both, which is what a binding compares.
+    assert!(Reads::root(&mut engine).is_ok());
+    assert!(Reads::root(&mut mem).is_ok());
+}
 
-    // The refusal says what to do about it, not just that it happened.
-    let msg = StoreError::NeedsRoundTrip.to_string();
-    assert!(msg.contains("round trip"), "unhelpful refusal: {msg}");
-    println!("  &self get -> {msg}");
+/// A read the engine COULD NOT ANSWER is not an absent key.
+///
+/// The two are one byte apart in a reply and a world apart in what an app
+/// does with them: `Ok(None)` means "this key does not exist", and an app
+/// shows an empty page or writes over the top. The error means "ask again".
+#[test]
+fn an_unanswerable_read_is_an_error_and_not_an_absence() {
+    use craftworks_sdk::{Reads, StoreError};
+    /// A transport that answers every read `Unavailable`, which is what an
+    /// engine says when a block it needs is not to be had.
+    struct Unreachable;
+    impl Transport for Unreachable {
+        fn exchange(&mut self, request: &[u8]) -> Vec<Vec<u8>> {
+            match protocol::decode_request(request) {
+                protocol::Incoming::Ok(env) => match env.body {
+                    protocol::Request::Get { req_id, .. }
+                    | protocol::Request::Range { req_id, .. } => {
+                        vec![protocol::encode_reply(&protocol::Reply::Unavailable {
+                            req_id,
+                            blocked_on: [7u8; 32],
+                        })]
+                    }
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            }
+        }
+    }
+    let mut db = EngineStore::new(Unreachable);
+    assert_eq!(
+        Reads::get(&mut db, b"k/one"),
+        Err(StoreError::Unavailable),
+        "an unanswerable read came back as an absent key; an app told that \
+         will show nothing and believe it"
+    );
+    assert_eq!(
+        Reads::scan(&mut db, b"a", b"z", false, 10),
+        Err(StoreError::Unavailable),
+        "an unanswerable range came back EMPTY, which is a wrong answer with \
+         exactly the shape of a right one"
+    );
+    let msg = StoreError::Unavailable.to_string();
+    assert!(msg.contains("may well exist"), "unhelpful: {msg}");
+    println!("  unanswerable read -> {msg}");
 }
 
 /// A fixed clock and a fixed stream, so nothing here depends on the machine.
@@ -314,33 +369,38 @@ impl craftworks_sdk::Env for FixedEnv {
     }
 }
 
-/// And a `Db` over that store reports the refusal instead of dying.
+/// A `Db` over the engine store READS, and its reads are round trips.
 ///
-/// This is the shape the reason has: `Db` is what the JS surface wraps, and
-/// with `panic = abort` an abort there takes the whole SDK instance with it,
-/// so an app cannot catch it, retry, or say anything to the person using it.
-/// An `Err` it can. The refusal has to survive the whole way out, not just
-/// exist at the trait.
+/// This replaces a test that asserted every `Db` read came back as a refusal.
+/// That was the right test for the shape it described and the shape is gone:
+/// `Db`'s reads take `&mut self` now, on both backends, so the thing worth
+/// pinning is that they WORK — a record written through `Db` over an engine
+/// is a record `Db` reads back.
 #[test]
-fn a_db_over_the_engine_store_returns_the_refusal_rather_than_aborting() {
-    use craftworks_sdk::{Db, Scan};
-    let db = Db::new(started(0), FixedEnv(7), [0; 4]);
+fn a_db_over_the_engine_store_reads_what_it_wrote() {
+    use craftworks_sdk::{Db, Scan, Schema};
+    let mut db = Db::new(started(0), FixedEnv(7), [0; 4]);
+    let schema: Schema = serde_json::from_value(serde_json::json!({
+        "type": "Task",
+        "fields": [{"name": "title", "kind": "text", "required": true}],
+    }))
+    .expect("a schema");
+    db.define("tasks", &schema).expect("define");
 
-    // Every `&self` read `Db` offers, through the two adapters.
-    let e = db.schema("tasks").unwrap_err();
-    assert!(e.contains("round trip"), "schema: {e}");
-    let e = db.domains().unwrap_err();
-    assert!(e.contains("round trip"), "domains: {e}");
-    let e = db
-        .get(
-            "tasks",
-            &craftworks_sdk::id::from_hex(&"0".repeat(32)).unwrap(),
-        )
-        .unwrap_err();
-    assert!(e.contains("round trip"), "get: {e}");
-    let e = db.scan("tasks", Scan::default()).unwrap_err();
-    assert!(e.contains("round trip"), "scan: {e}");
-    let e = db.count("tasks").unwrap_err();
-    assert!(e.contains("round trip"), "count: {e}");
-    println!("  Db over the engine store: {e}");
+    let mut fields = serde_json::Map::new();
+    fields.insert("title".into(), serde_json::json!("write it down"));
+    let rec = db.put("tasks", &fields).expect("put");
+
+    let id = craftworks_sdk::id::from_hex(&rec.id).expect("an id");
+    let got = db.get("tasks", &id).expect("get").expect("the record");
+    assert_eq!(
+        got.fields.get("title"),
+        Some(&serde_json::json!("write it down")),
+        "a record written through Db over an engine did not read back"
+    );
+    assert_eq!(db.count("tasks").expect("count"), 1);
+    assert_eq!(db.scan("tasks", Scan::default()).expect("scan").len(), 1);
+    assert_eq!(db.domains().expect("domains"), ["tasks"]);
+    assert!(db.schema("tasks").expect("schema").is_some());
+    println!("  Db over the engine store: define, put, get, scan, count, domains");
 }
