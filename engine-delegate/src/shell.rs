@@ -68,6 +68,12 @@ pub struct Outbound {
     /// Counted, not silent: a client that never sent `Install` would
     /// otherwise see its write accepted and then nothing at all.
     pub refused_no_code: usize,
+    /// The highest protocol version a client spoke this call.
+    ///
+    /// Zero when no client message arrived — a tick, or a node answer — and a
+    /// v2-only message is not sent then either. Silence is not consent to a
+    /// format.
+    pub client_version: u16,
     /// Bytes this call handed to the node in `Op::Put`.
     ///
     /// Counted where the delegate already knows them, which is the only place
@@ -216,6 +222,12 @@ fn ctx_opts() -> impl bincode::Options {
 
 pub struct Shell<B: Blocks> {
     pub engine: Engine<B>,
+    /// The highest protocol version a client has spoken this call.
+    ///
+    /// Not persisted in the context: it is a property of THIS call's inbound
+    /// messages, and a version remembered from a previous call would be a
+    /// guess about who is talking now.
+    client_version: u16,
     awaiting: BTreeMap<Cid, u32>,
     head: Option<(u64, Cid)>,
     head_exists: bool,
@@ -336,6 +348,7 @@ impl<B: Blocks> Shell<B> {
         };
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         Shell {
+            client_version: 0,
             engine,
             // Ids to read back belong to a commit the engine no longer has if
             // it did not resume, so they go with it.
@@ -412,7 +425,14 @@ impl<B: Blocks> Shell<B> {
             self.attribute(&msg);
             let effects = match msg {
                 Inbound::Client(bytes) => match crate::serve::serve(&bytes) {
-                    crate::serve::Served::Do(r) => self.on_protocol(r),
+                    crate::serve::Served::Do(r, v) => {
+                        // The highest version any client has spoken this call.
+                        // A v2-only message goes out only if someone asked in
+                        // v2; a v1 client is never sent one, so its decoder
+                        // never has to refuse one.
+                        self.client_version = self.client_version.max(v);
+                        self.on_protocol(r)
+                    }
                     // A version this build does not serve, or bytes it cannot
                     // read. Either way the client is ANSWERED: it is the one
                     // waiting, and a refusal it can act on beats a silence it
@@ -553,6 +573,7 @@ impl<B: Blocks> Shell<B> {
         for r in std::mem::take(&mut self.trace) {
             out.replies.push(protocol::encode_reply(&r));
         }
+        out.client_version = self.client_version;
         out.stranded = sched.ready_len() + sched.held_len();
         out.awaiting = self.awaiting.len();
         out.read_back_hits = self.read_back_hits;
@@ -1049,7 +1070,7 @@ impl<B: Blocks> Shell<B> {
             return;
         }
         let Inbound::Client(bytes) = msg else { return };
-        let crate::serve::Served::Do(r) = crate::serve::serve(bytes) else {
+        let crate::serve::Served::Do(r, _) = crate::serve::serve(bytes) else {
             return;
         };
         let (of, began) = match &r {

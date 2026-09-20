@@ -189,3 +189,48 @@ fn the_byte_count_is_pinned_to_what_the_node_actually_received() {
         node.line()
     );
 }
+
+/// The shell DETECTS which version a client spoke, and does not assume one.
+///
+/// This is the input to the gate that decides whether a v2-only message may be
+/// sent (`entry.rs`: `if out.client_version >= 2`). A reply carries no version
+/// of its own — there is no envelope on the reply side — so the envelope the
+/// client sent on the way IN is the only thing that knows what the far side
+/// can read. Dropping it, which `serve()` used to do, is exactly what would
+/// let a v2-only message reach a v1 reader.
+///
+/// The other half — that an unknown variant is REFUSED rather than misread if
+/// one ever does arrive — is proved in `protocol/tests/mixed_versions.rs`.
+#[test]
+fn the_shell_detects_the_version_a_client_spoke() {
+    let write = || protocol::Request::Write {
+        write_id: 1,
+        ops: vec![protocol::Op::Put(b"k".to_vec(), vec![7u8; 900])],
+    };
+
+    let mut v2 = Node::new();
+    let _ = v2.step(vec![engine_delegate::shell::Inbound::Client(
+        protocol::encode_request(protocol::CURRENT, &write()),
+    )]);
+    assert_eq!(
+        v2.detected_client_version(),
+        2,
+        "a client speaking the current version must be detected as such"
+    );
+
+    let mut v1 = Node::new();
+    let _ = v1.step(vec![engine_delegate::shell::Inbound::Client(
+        protocol::encode_request(1, &write()),
+    )]);
+    assert_eq!(
+        v1.detected_client_version(),
+        1,
+        "a v1 client must be detected as v1, not assumed to be current"
+    );
+
+    // And silence is not consent to a format: a call with no client message at
+    // all detects nothing, so a v2-only message is not sent then either.
+    let mut quiet = Node::new();
+    let _ = quiet.step(Vec::new());
+    assert_eq!(quiet.detected_client_version(), 0);
+}

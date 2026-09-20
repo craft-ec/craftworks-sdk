@@ -253,6 +253,11 @@ impl Client {
                     self.traces.record(of, depth, what, n, t);
                 }
             }
+            // A diagnostic, not an answer to anything. It is RECORDED above
+            // and must not reach the reply queue: a caller draining replies is
+            // looking for the answer to its request, and an extra message in
+            // that queue is a reply to somebody else's question.
+            Reply::CallBytes { .. } => {}
             // A version this build does not serve. Counted, and the client is
             // told: a silence here is a UI that waits for ever.
             Reply::Unsupported { .. } => {
@@ -280,6 +285,29 @@ impl Client {
         use instrument::{vocab::Key, Entry, Event, OpId, Probe, Site};
         const CALL: Site = Site::of("sdk::delegate::call");
 
+        // The node-op counts, from their own message.
+        if let Reply::CallBytes {
+            put_bytes,
+            puts,
+            gets,
+        } = reply
+        {
+            let Some(rec) = &self.rec else {
+                self.unrecorded_calls += 1;
+                return;
+            };
+            for (key, value) in [
+                (Key::BytesOut, *put_bytes),
+                (Key::Ops, (*puts as u64) + (*gets as u64)),
+            ] {
+                rec.event(Event::Counter {
+                    site: CALL,
+                    op: OpId::NONE,
+                    entry: Entry { key, value },
+                });
+            }
+            return;
+        }
         let Reply::Call {
             effects,
             ops,

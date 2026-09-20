@@ -128,6 +128,20 @@ pub struct Node {
     calls: u32,
     /// Ids put on the last call, so the fixture can acknowledge them.
     last_put_ids: Vec<Cid>,
+    /// The protocol version the shell DETECTED on the last call.
+    ///
+    /// The input to the gate that decides whether a v2-only message may be
+    /// sent. A reply carries no version of its own, so this — read from the
+    /// envelope the client sent on the way in — is the only thing that knows
+    /// what the far side can read.
+    client_version: u16,
+    /// Every reply the shell produced, in order.
+    ///
+    /// `step` returns the BLOCKS to feed back as acknowledgements, so the
+    /// replies had nowhere to go and were dropped. A fixture that silently
+    /// discards half of what the thing under test produces can only test the
+    /// other half.
+    replies: Vec<Vec<u8>>,
     /// Every block this node actually took from the shell, in order.
     ///
     /// Kept so a test can compute what the call SHOULD have counted from a
@@ -155,6 +169,8 @@ impl Node {
             rec: Recorder::with_capacity(1 << 14),
             calls: 0,
             last_put_ids: Vec::new(),
+            client_version: 0,
+            replies: Vec::new(),
             handed: Vec::new(),
         }
     }
@@ -210,6 +226,8 @@ impl Node {
         );
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");
+        self.replies.extend(out.replies.iter().cloned());
+        self.client_version = out.client_version;
 
         // What this call handed to the node, counted by the shell itself and
         // recorded HERE — the client side holds the ring, never the delegate
@@ -322,6 +340,20 @@ impl Node {
                 _ => None,
             })
             .sum()
+    }
+
+    /// The version the shell detected on the last call. Zero when no client
+    /// message arrived — a tick, or a node answer.
+    pub fn detected_client_version(&self) -> u16 {
+        self.client_version
+    }
+
+    /// Every reply the shell has produced, decoded.
+    pub fn replies(&self) -> Vec<protocol::Reply> {
+        self.replies
+            .iter()
+            .filter_map(|b| protocol::decode_reply(b).ok())
+            .collect()
     }
 
     /// What this node actually received, summed independently of the shell's
