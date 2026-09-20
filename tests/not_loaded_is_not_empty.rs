@@ -13,7 +13,7 @@
 use craftworks_sdk::{CachedStore, Db, DbError, Scan, SystemEnv};
 
 fn store() -> CachedStore {
-    CachedStore::new(Box::new(|| 0))
+    testkit::cached_store().0
 }
 
 fn db(store: CachedStore) -> Db<CachedStore, SystemEnv> {
