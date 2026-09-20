@@ -56,6 +56,14 @@ pub enum LiveMode {
     Notified,
     /// Wanted notifications, did not get them. The backstop is doing the work.
     Polled,
+    /// A CLIENT subscription to the tree's head contract is in place.
+    ///
+    /// The only mechanism that reaches a connection which made no write: an
+    /// engine-originated push returns to whoever invoked the delegate, so it
+    /// cannot (F40). Still not a guarantee — the node drops notifications
+    /// when its channel is full and can evict a subscription silently — which
+    /// is why the tick backstop stays underneath it.
+    HeadSubscribed,
 }
 
 /// What a reload did. Reported so "it updated" and "it updated cheaply" are
@@ -207,6 +215,13 @@ impl Binding {
         } else {
             LiveMode::Polled
         };
+    }
+
+    /// Record how this binding is being kept current.
+    pub fn note_mode(&mut self, mode: LiveMode) {
+        if self.live {
+            self.mode = mode;
+        }
     }
 
     /// The engine could not, or would not, keep notifying this range.

@@ -437,6 +437,78 @@ async fn main() -> Result<()> {
         other => bail!("the backstop did not find the write: {other:?}"),
     }
 
+    // ---- SLICE 6b: the CLIENT subscription to the head contract ----
+    //
+    // #45 established that an engine-originated push returns to whoever
+    // invoked the delegate and never reaches a watcher (F40). The platform's
+    // own push path is this one: a CLIENT subscription to a contract receives
+    // UpdateNotifications. The head Register IS the tree — its value is
+    // (seq, root) — so "the head moved" is "the tree moved".
+    //
+    // The watcher's tick is DISABLED for this section: it sends nothing, asks
+    // for nothing, and must still be told.
+    //
+    // THE CONTROL FIRST, and it costs nothing because the state it needs
+    // already exists: write 3 landed a moment ago while the watcher held NO
+    // client subscription, and nothing was pushed to it. Confirm that
+    // explicitly rather than inferring it from the `Changed` section — an
+    // assertion that the notifier works is worth nothing beside a connection
+    // that would have been told anyway.
+    match wait_head_update(&mut second, Instant::now() + Duration::from_secs(3)).await {
+        None => println!(
+            "head:  CONTROL — with no client subscription the watcher was pushed \
+             NOTHING for a commit that had already landed"
+        ),
+        Some(n) => bail!(
+            "the watcher was pushed {n} update(s) WITHOUT holding a client \
+             subscription, so the notifier below is not what is doing the work"
+        ),
+    }
+
+    timeout(
+        STEP,
+        second.send(ClientRequest::ContractOp(
+            freenet_stdlib::client_api::ContractRequest::Subscribe {
+                key: head_id,
+                summary: None,
+            },
+        )),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("subscribing to the head contract timed out"))??;
+    match wait_subscribed(&mut second, Instant::now() + Duration::from_secs(5)).await {
+        true => println!("head:  the WATCHER holds a client subscription to the head contract"),
+        false => bail!(
+            "the node did not confirm a client subscription to the head \
+             contract, so anything below would be measuring the backstop"
+        ),
+    }
+
+    // A writes. The watcher sends NOTHING.
+    let fourth_key = b"live/four".to_vec();
+    send(
+        &mut client,
+        &dkey,
+        &Request::Write {
+            write_id: 4,
+            ops: vec![protocol::Op::Put(fourth_key.clone(), vec![0x44u8; 64])],
+        },
+    )
+    .await?;
+
+    let pushed = wait_head_update(&mut second, Instant::now() + Duration::from_secs(20)).await;
+    match pushed {
+        Some(n) => println!(
+            "head:  the WATCHER was pushed {n} head update(s) WITHOUT ticking — \
+             this is the notifier a second tab runs on"
+        ),
+        None => bail!(
+            "the watcher holds a client subscription to the head contract and \
+             a commit moved it, and nothing was pushed within 20s. The live \
+             notifier does not work; a binding would be on its tick alone."
+        ),
+    }
+
     // ---- the page-closed promise: Flush, close, reopen, read back ----
     send(&mut client, &dkey, &Request::Flush).await?;
     let _ = timeout(Duration::from_secs(2), client.recv()).await;
@@ -456,6 +528,49 @@ async fn main() -> Result<()> {
     println!("budget: {:?} of {BUDGET:?} used", started.elapsed());
     println!("done");
     Ok(())
+}
+
+/// Did the node confirm a CLIENT subscription?
+async fn wait_subscribed(client: &mut WebApi, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left.min(STEP), client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::SubscribeResponse { .. },
+            ))) => return true,
+            Ok(Ok(_)) => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Wait for the node to PUSH an update for a subscribed contract.
+///
+/// Nothing is sent on this connection while waiting. That is the whole point:
+/// a push that only arrives because the watcher asked for something is not a
+/// push, it is a reply, and #45 showed the difference matters.
+async fn wait_head_update(client: &mut WebApi, deadline: Instant) -> Option<usize> {
+    let mut n = 0;
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left.min(Duration::from_secs(2)), client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(
+                freenet_stdlib::client_api::ContractResponse::UpdateNotification { key, .. },
+            ))) => {
+                n += 1;
+                println!("  pushed: UpdateNotification for {key}");
+                return Some(n);
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => {
+                println!("  pushed: connection error {e}");
+                return None;
+            }
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 /// Whether a subscribe was taken.
