@@ -28,6 +28,20 @@ allow() {
     testkit/src/lib.rs) return 0 ;;
     # Tests OF a constructor are about the constructor.
     tests/cached_store.rs) return 0 ;;
+    # NEEDS A NODE testkit's fixture does not have yet.
+    #
+    # `testkit::Node::step` answers `Op::Put` and nothing else: no `Get`, no
+    # `Head`, no `ReadHead`, and it does not feed its own answers back. That
+    # is right for what it was built for — counting puts across calls — and it
+    # cannot serve this file, which needs a delegate that reads its head on
+    # `Identity` and then serves a `Range` request, because a COLD write is
+    # defined by there being nothing loaded to read.
+    #
+    # Migrating this means giving testkit a full-node fixture, which
+    # `refresh_native.rs` and `two_clients.rs` are also hand-rolling today. It
+    # is worth doing once, deliberately, rather than by widening the put-only
+    # one underneath its existing callers (sdk#88 owns that crate).
+    tests/cold_write_native.rs) return 0 ;;
     *) return 1 ;;
   esac
 }
