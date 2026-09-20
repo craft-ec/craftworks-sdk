@@ -116,11 +116,24 @@ fn a_call_reports_the_bytes_it_handed_to_the_node() {
             _ => None,
         })
         .sum();
+    // Two views of the same value agreeing. Kept — it would catch the
+    // accessor and the recording drifting apart — but it CANNOT catch the
+    // measurement being wrong: zero equals zero. The core dev zeroed
+    // `put_bytes += bytes.len()` and this stayed green.
     assert_eq!(
         node.put_bytes(),
         from_events,
         "the accessor and the recording are the same number: {}",
         node.line()
+    );
+
+    // The expectation that makes it falsifiable, computed from what this node
+    // ACTUALLY RECEIVED rather than from the shell's own tally.
+    assert_eq!(
+        node.put_bytes(),
+        node.bytes_handed_to_this_node(),
+        "the shell's count must equal the bytes this node was handed: {}",
+        node.dump("byte count")
     );
 
     // Stranded must be zero — it is recorded rather than asserted inside the
@@ -140,5 +153,39 @@ fn a_call_reports_the_bytes_it_handed_to_the_node() {
         0,
         "effects left queued when a call ended are LOST: {}",
         node.dump("stranded")
+    );
+}
+
+/// A call that ACTUALLY WRITES, so the byte count has something to be wrong
+/// about.
+///
+/// The test above drives an empty call, where the shell hands the node nothing
+/// and every count is zero — so zeroing the measurement left it green. A cost
+/// counter needs a case where the number is NOT zero and an expectation
+/// computed without the code under test.
+#[test]
+fn the_byte_count_is_pinned_to_what_the_node_actually_received() {
+    let mut node = Node::new();
+    let _ = node.client(&protocol::Request::Write {
+        write_id: 1,
+        ops: vec![protocol::Op::Put(b"k".to_vec(), vec![7u8; 900])],
+    });
+
+    let handed = node.bytes_handed_to_this_node();
+    assert!(
+        handed > 0,
+        "the fixture must actually hand the node blocks, or this proves nothing: {}",
+        node.line()
+    );
+    assert_eq!(
+        node.put_bytes(),
+        handed,
+        "the shell's count must equal what this node received: {}",
+        node.dump("byte count")
+    );
+    assert!(
+        node.blocks_handed_to_this_node() > 0,
+        "and blocks, not just bytes: {}",
+        node.line()
     );
 }

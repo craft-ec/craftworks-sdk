@@ -126,6 +126,14 @@ pub struct Node {
     puts: usize,
     rec: Recorder,
     calls: u32,
+    /// Ids put on the last call, so the fixture can acknowledge them.
+    last_put_ids: Vec<Cid>,
+    /// Every block this node actually took from the shell, in order.
+    ///
+    /// Kept so a test can compute what the call SHOULD have counted from a
+    /// different path than the shell's own tally. A cost counter checked only
+    /// against another view of itself is unfalsifiable: zero equals zero.
+    handed: Vec<Vec<u8>>,
 }
 
 impl Default for Node {
@@ -146,6 +154,8 @@ impl Node {
             puts: 0,
             rec: Recorder::with_capacity(1 << 14),
             calls: 0,
+            last_put_ids: Vec::new(),
+            handed: Vec::new(),
         }
     }
 
@@ -191,7 +201,6 @@ impl Node {
                 value: self.clock.now_ms(),
             },
         });
-        let before = self.ctx.len();
 
         let mut shell: Shell<Store> = Shell::resume_with(
             &self.ctx,
@@ -221,18 +230,18 @@ impl Node {
             });
         }
 
-        // What the rehydration cost, per call. The context is a 400 KiB budget
-        // shared with in-flight commit state (F31), so a fixture that could not
-        // show it growing would hide the thing most likely to go wrong.
-        self.rec.event(Event::Counter {
-            site: NODE,
-            op,
-            entry: Entry {
-                key: Key::BytesOut,
-                value: self.ctx.len() as u64,
-            },
-        });
-        let _ = before;
+        // What the rehydration cost is NOT recorded as BytesOut.
+        //
+        // It was, and that was a defect of exactly the kind this crate exists
+        // to prevent: the context's length and the bytes handed to the node
+        // are different quantities, and putting both under one key made
+        // `put_bytes()` the sum of two unrelated things. It read 191 for a
+        // call that handed the node nothing. Two meanings under one key is the
+        // same hazard as two methods a letter apart, and it is invisible until
+        // something asks the number to equal an independently computed one.
+        //
+        // The context size is available as `context_len()`, which cannot be
+        // confused with a byte count on the wire.
 
         let mut next = Vec::new();
         for o in out.ops {
@@ -249,6 +258,8 @@ impl Node {
                 if self.deaf {
                     continue;
                 }
+                self.last_put_ids.push(id);
+                self.handed.push(bytes.clone());
                 self.store.put(id, &bytes);
                 next.push(bytes);
             }
@@ -259,6 +270,29 @@ impl Node {
             outcome: Outcome::Ok,
         });
         next
+    }
+
+    /// Send a client request and drive the node's answers back in until it
+    /// settles.
+    ///
+    /// The multi-call part is the point. A write is not one call: the shell
+    /// issues puts, the node acknowledges them on a LATER call, and the
+    /// read-back lands later still. That span is exactly what a one-process
+    /// driver cannot see.
+    pub fn client(&mut self, r: &protocol::Request) -> Vec<Vec<u8>> {
+        let frame = protocol::encode_request(protocol::CURRENT, r);
+        let mut out = self.step(vec![Inbound::Client(frame)]);
+        for _ in 0..6 {
+            let acks: Vec<Inbound> = std::mem::take(&mut self.last_put_ids)
+                .into_iter()
+                .map(|id| Inbound::PutAcked { id, ok: true })
+                .collect();
+            if acks.is_empty() {
+                break;
+            }
+            out.extend(self.step(acks));
+        }
+        out
     }
 
     /// The straight-through driver, kept and named so that using it is a
@@ -288,6 +322,18 @@ impl Node {
                 _ => None,
             })
             .sum()
+    }
+
+    /// What this node actually received, summed independently of the shell's
+    /// own count. The expectation a cost counter needs in order to be
+    /// falsifiable.
+    pub fn bytes_handed_to_this_node(&self) -> u64 {
+        self.handed.iter().map(|b| b.len() as u64).sum()
+    }
+
+    /// How many blocks this node received.
+    pub fn blocks_handed_to_this_node(&self) -> usize {
+        self.handed.len()
     }
 
     /// The context size after the last call — the budget most likely to be
