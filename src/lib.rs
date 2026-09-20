@@ -19,7 +19,7 @@ pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use schema::{Field, Kind, Schema};
 pub use store::{Edit, MemStore, Store};
-pub use tree_store::{Stats, TreeStore};
+pub use tree_store::{OwedGroup, OwedParity, Stats, TreeStore};
 
 /// The tree format tag every node carries, from the library that writes them.
 ///
