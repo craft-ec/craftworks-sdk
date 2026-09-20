@@ -79,7 +79,7 @@ fn control_without_a_verdict_the_copy_fills_up_and_refuses() {
 #[test]
 fn a_row_goes_pending_then_clean_through_the_reply_path() {
     let mut s = store();
-    let key = b"d\0note\0000001".to_vec();
+    let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
     assert_eq!(s.row_state(&key), RowState::Pending);
@@ -98,7 +98,7 @@ fn a_row_goes_pending_then_clean_through_the_reply_path() {
 #[test]
 fn busy_puts_the_row_back_in_the_queue() {
     let mut s = store();
-    let key = b"d\0note\0000001".to_vec();
+    let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
     s.on_inbound(&verdict(id, WriteState::Busy));
@@ -109,7 +109,7 @@ fn busy_puts_the_row_back_in_the_queue() {
 #[test]
 fn a_failed_verdict_gives_the_row_rolled_back() {
     let mut s = store();
-    let key = b"d\0note\0000001".to_vec();
+    let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
     s.on_inbound(&verdict(id, WriteState::Failed));
@@ -127,7 +127,7 @@ fn a_failed_verdict_gives_the_row_rolled_back() {
 #[test]
 fn a_verdict_for_an_unknown_write_changes_nothing_and_is_counted() {
     let mut s = store();
-    let key = b"d\0note\0000001".to_vec();
+    let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
     assert_eq!(s.row_state(&key), RowState::Pending);
@@ -158,7 +158,7 @@ fn a_verdict_for_an_unknown_write_changes_nothing_and_is_counted() {
 #[test]
 fn a_duplicate_published_is_harmless() {
     let mut s = store();
-    let key = b"d\0note\0000001".to_vec();
+    let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
     s.on_inbound(&verdict(id, WriteState::Published));
