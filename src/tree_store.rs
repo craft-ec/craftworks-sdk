@@ -19,7 +19,7 @@ use freenet_prolly::read::{get, height};
 use freenet_prolly::rs::PARITY;
 use freenet_prolly::store::{Blocks, BlocksMut, MemBlocks, ReadError};
 use freenet_prolly::Cid;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 /// One group's owed redundancy: the three parity blocks and the members they
@@ -107,6 +107,12 @@ pub struct Options {
     /// for [`TreeStore::owed_parity`] turns it off, so that assertion is known
     /// to be capable of failing.
     pub track_owed_parity: bool,
+    /// Drop the debt for groups the current tree no longer lists. With this
+    /// off the owed map only GROWS: a re-coded group's superseded trio stays
+    /// owed for ever, and a writer draining the map puts parity for groups
+    /// that are not in the tree. That is the negative control for
+    /// [`TreeStore::owed_groups`], and it is a real state the code was in.
+    pub prune_superseded_parity: bool,
 }
 
 impl Default for Options {
@@ -114,6 +120,7 @@ impl Default for Options {
         Options {
             keep_value_blocks: true,
             track_owed_parity: true,
+            prune_superseded_parity: true,
         }
     }
 }
@@ -162,6 +169,7 @@ pub struct TreeStore {
     /// recode, because a correction needs the old parity to correct.
     owed: BTreeMap<Cid, Vec<u8>>,
     track_owed: bool,
+    prune_superseded: bool,
 }
 
 impl Default for TreeStore {
@@ -186,6 +194,7 @@ impl TreeStore {
             root,
             owed: BTreeMap::new(),
             track_owed: opts.track_owed_parity,
+            prune_superseded: opts.prune_superseded_parity,
         }
     }
 
@@ -235,6 +244,61 @@ impl TreeStore {
         self.owed.iter().map(|(c, b)| (c, b.as_slice()))
     }
 
+    /// The nodes of the CURRENT tree.
+    ///
+    /// Superseded nodes are never deleted -- another tree may still use them,
+    /// and a reader can still be handed one -- so "every node this store
+    /// holds" is not the same question as "what this tree promises". The debt
+    /// is about the current tree: parity for a group no longer reachable from
+    /// the root protects bytes no reader will ask for, and putting it is a PUT
+    /// bought for nothing.
+    fn live_nodes(&self) -> Vec<Vec<u8>> {
+        let mut seen: BTreeSet<Cid> = BTreeSet::new();
+        let mut out = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(cid) = stack.pop() {
+            if !seen.insert(cid) {
+                continue;
+            }
+            let Some(bytes) = self.blocks.get(&cid) else {
+                continue;
+            };
+            let Ok(node) = Node::parse(bytes) else {
+                continue;
+            };
+            if !node.is_leaf() {
+                for i in 0..node.len() {
+                    stack.push(node.child(i).0);
+                }
+            }
+            out.push(bytes.to_vec());
+        }
+        out
+    }
+
+    /// Every parity id the current tree lists.
+    fn live_parity(&self) -> BTreeSet<Cid> {
+        let mut out = BTreeSet::new();
+        for bytes in self.live_nodes() {
+            if let Ok(n) = Node::parse(&bytes) {
+                out.extend(n.parity());
+            }
+        }
+        out
+    }
+
+    /// Drop the debt for groups the current tree no longer lists.
+    ///
+    /// A group re-coded by a later write is SUPERSEDED: its members moved on,
+    /// and its parity is redundancy for a version of the tree nobody will read.
+    /// Without this the map only grows, and a writer draining it puts parity
+    /// for groups that are not in the tree -- which is the same failure as
+    /// reporting a block no node lists, arriving one write later.
+    fn prune_owed(&mut self) {
+        let live = self.live_parity();
+        self.owed.retain(|cid, _| live.contains(cid));
+    }
+
     /// The owed parity as GROUPS: what each set of three blocks protects.
     ///
     /// Three parity blocks are not three independent things — they are one
@@ -249,8 +313,8 @@ impl TreeStore {
     /// a group.
     pub fn owed_groups(&self) -> Vec<OwedGroup> {
         let mut out = Vec::new();
-        for (_, bytes) in self.blocks() {
-            let Ok(node) = Node::parse(bytes) else {
+        for bytes in self.live_nodes() {
+            let Ok(node) = Node::parse(&bytes) else {
                 continue;
             };
             let ids: Vec<Cid> = node.parity().collect();
@@ -412,6 +476,11 @@ impl Store for TreeStore {
         // already on the network.
         if self.track_owed {
             self.owed.extend(applied.parity);
+            // Newest wins: this write may have re-coded a group whose parity
+            // was still owed, and the superseded trio must never be put.
+            if self.prune_superseded {
+                self.prune_owed();
+            }
         }
     }
 }
