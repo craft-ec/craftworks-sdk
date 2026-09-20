@@ -95,19 +95,12 @@ pub struct Session {
     watching: bool,
     /// Domains this page has bound, so a head move can name what is stale.
     bound: std::collections::BTreeSet<String>,
-    /// The root this client last saw, PER BOUND DOMAIN.
+    /// Asking what changed, and which answer belongs to which domain.
     ///
-    /// **The client owns this, not the engine** — which is what makes a
-    /// missed notification recoverable: however many were dropped, the gap
-    /// closes in one `ChangesSince`.
-    seen: std::collections::BTreeMap<String, [u8; 32]>,
-    /// Refreshes in flight, by request id, so an answer knows its domain.
-    refreshing: std::collections::BTreeMap<u64, String>,
-    /// Domains whose ROWS changed, drained by the page. Distinct from
-    /// `bound`: a head move makes a domain worth ASKING about, and this says
-    /// the answer actually moved something.
-    changed: std::collections::BTreeSet<String>,
-    next_refresh: u64,
+    /// In the SDK, not here, so it can be tested against a real engine
+    /// rather than through a fake session written in JavaScript — which
+    /// compiles this file and runs none of it.
+    refresh: craftworks_sdk::Refresh,
     /// When the subscribe request went out, so an unanswered one does not sit
     /// at "asked" for ever.
     asked_at_ms: u64,
@@ -171,10 +164,7 @@ impl Session {
             watching: false,
             head_moved: false,
             bound: std::collections::BTreeSet::new(),
-            seen: std::collections::BTreeMap::new(),
-            refreshing: std::collections::BTreeMap::new(),
-            changed: std::collections::BTreeSet::new(),
-            next_refresh: REFRESH_REQ_BASE,
+            refresh: craftworks_sdk::Refresh::new(),
             asked_at_ms: 0,
             watch_refused: String::new(),
         })
@@ -499,10 +489,8 @@ impl Session {
                 self.refresh(&d);
             }
         }
-        let changed: Vec<&String> = self.changed.iter().collect();
-        let out = serde_json::to_string(&changed).unwrap_or_else(|_| "[]".into());
-        self.changed.clear();
-        out
+        let changed = self.refresh.take_changed();
+        serde_json::to_string(&changed).unwrap_or_else(|_| "[]".into())
     }
 
     /// Ask what changed in a domain since this client last saw it.
@@ -519,89 +507,68 @@ impl Session {
     /// notification recoverable: however many were dropped, the gap closes in
     /// one call.
     fn refresh(&mut self, domain: &str) {
-        // One in flight per domain. Several notifications about one domain is
-        // the ordinary case, and a request each would multiply a busy tree's
-        // traffic by how often it is written to.
-        if self.refreshing.values().any(|d| d == domain) {
-            return;
-        }
         let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(domain);
-        let from = self.seen.get(domain).copied().unwrap_or([0u8; 32]);
-        let req_id = self.next_refresh;
-        self.next_refresh += 1;
-        self.refreshing.insert(req_id, domain.to_string());
-        self.db
-            .store_mut()
-            .client
-            .send(&protocol::Request::ChangesSince {
-                req_id,
-                from,
-                lo: protocol::Bound::Included(lo),
-                hi: protocol::Bound::Excluded(hi),
-                max_entries: protocol::MAX_PAGE_ENTRIES,
-            });
+        if let Some(req) = self.refresh.ask(domain, &lo, &hi) {
+            self.db.store_mut().client.send(&req);
+        }
     }
 
     /// Local movement: rolled-back writes, in the domains that are bound.
     ///
     /// A component re-renders on its OWN write through the same drain as on
-    /// somebody else's. Without this a put changes `base ⊕ pending` but not
+    /// somebody else's. Without this a put changes `base + pending` but not
     /// the root, so a bound component would not re-render on its own write
     /// nor when it went PENDING -> CLEAN.
     fn note_local(&mut self, told: &craftworks_sdk::Told) {
-        let touched: Vec<Vec<u8>> = told
+        let bound: Vec<(String, Vec<u8>, Vec<u8>)> = self
+            .bound
+            .iter()
+            .map(|d| {
+                let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(d);
+                (d.clone(), lo, hi)
+            })
+            .collect();
+        let keys = told
             .rolled_back_keys
             .iter()
-            .chain(told.moved_under_pending.iter())
-            .cloned()
-            .collect();
-        if touched.is_empty() {
-            return;
-        }
-        let domains: Vec<String> = self.bound.iter().cloned().collect();
-        for d in domains {
-            let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(&d);
-            if touched.iter().any(|k| k[..] >= lo[..] && k[..] < hi[..]) {
-                self.changed.insert(d);
-            }
-        }
+            .chain(told.moved_under_pending.iter());
+        self.refresh.note_local(keys, |k| {
+            bound
+                .iter()
+                .find(|(_, lo, hi)| k >= &lo[..] && k < &hi[..])
+                .map(|(d, _, _)| d.clone())
+        });
     }
 
-    /// A delta arrived: apply it, and say whether anything actually moved.
+    /// A delta arrived: apply it through the copy.
     fn on_delta(
         &mut self,
         req_id: u64,
         changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         new_root: [u8; 32],
     ) {
-        let Some(domain) = self.refreshing.remove(&req_id) else {
-            // An answer to a question this session did not ask. Applying it
-            // would move the copy's root on a stranger's say-so.
-            self.foreign_notifications += 1;
-            return;
-        };
-        let moved = !changes.is_empty();
-        self.db.store_mut().on_delta(changes, new_root);
-        self.seen.insert(domain.clone(), new_root);
-        // Only if something MOVED. A binding re-run on an empty delta would
-        // re-render every screen on every notification about anything.
-        if moved {
-            self.changed.insert(domain);
+        match self.refresh.on_delta(req_id, changes, new_root) {
+            craftworks_sdk::Answer::Delta {
+                changes, new_root, ..
+            } => {
+                self.db.store_mut().on_delta(changes, new_root);
+            }
+            craftworks_sdk::Answer::NotOurs => self.foreign_notifications += 1,
+            craftworks_sdk::Answer::Reload { .. } => {}
         }
     }
 
     /// The engine could not compute a delta: load the range again.
     fn on_full_reload(&mut self, req_id: u64) {
-        let Some(domain) = self.refreshing.remove(&req_id) else {
+        let craftworks_sdk::Answer::Reload { domain } = self.refresh.on_full_reload(req_id) else {
             self.foreign_notifications += 1;
             return;
         };
         let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(&domain);
-        // FORGOTTEN, then re-requested through `Loads` — ticketed and
-        // bounded like any other load. The copy must not keep answering from
-        // a range the engine has just said it cannot reconcile.
+        // FORGOTTEN, then re-requested through `Loads` -- ticketed and bounded
+        // like any other load. The copy must not keep answering from a range
+        // the engine has just said it cannot reconcile.
         self.db.store_mut().copy.forget(&lo, &hi);
-        self.seen.remove(&domain);
         if let Some((id, send)) = self.loads.want(&lo, &hi, crate::js_now_ms()) {
             if send {
                 self.db
@@ -610,16 +577,8 @@ impl Session {
                     .send(&craftworks_sdk::Loads::range_request(id, &lo, &hi, None));
             }
         }
-        // The rows a component holds are now known to be stale, whatever the
-        // reload turns up.
-        self.changed.insert(domain);
     }
 
-    /// Ask about a domain now, whatever the head has done.
-    ///
-    /// What a binding's own `reload()` calls. A read alone cannot refresh:
-    /// the copy answers a loaded range from cache and never says NOT_LOADED,
-    /// so nothing would be re-requested.
     pub fn refresh_domain(&mut self, domain: &str) {
         self.refresh(domain);
     }
@@ -1151,9 +1110,6 @@ impl Session {
 /// a subscription it does not have. The tick keeps the data right either way,
 /// which is why this can be short.
 const WATCH_ANSWER_MS: u64 = 10_000;
-
-/// The request ids a refresh uses, kept away from the app's and preload's.
-const REFRESH_REQ_BASE: u64 = 1 << 40;
 
 /// The request ids preload uses, kept away from the app's own.
 const PRELOAD_REQ_BASE: u64 = 1 << 32;
