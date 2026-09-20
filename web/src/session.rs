@@ -216,6 +216,7 @@ impl Session {
                             head_writable,
                             head_root,
                             head_id,
+                            head_seq,
                             ..
                         }) => {
                             // Which contract the head IS. Without it a tab
@@ -232,6 +233,10 @@ impl Session {
                             // filed under the wrong root would make a stale
                             // range look current.
                             self.head_root = head_root;
+                            // The newest head this client has heard of, from
+                            // anywhere. A load that finishes behind it is not
+                            // recorded.
+                            self.loads.note_seq(head_seq);
                             self.plan.on_identity(head_writable);
                             self.note_progress();
                         }
@@ -246,8 +251,9 @@ impl Session {
                             req_id,
                             entries,
                             cursor,
+                            at,
                             ..
-                        }) => self.on_page(req_id, entries, cursor),
+                        }) => self.on_page(req_id, entries, cursor, at),
                         // A read the engine could not answer. The range is
                         // NOT recorded as loaded: an empty page here would
                         // say "this range is empty", which is a wrong answer
@@ -257,8 +263,12 @@ impl Session {
                             req_id,
                             changes,
                             new_root,
+                            at,
                             ..
-                        }) => self.on_delta(req_id, changes, new_root),
+                        }) => {
+                            self.loads.note_seq(at.seq);
+                            self.on_delta(req_id, changes, new_root)
+                        }
                         // The delta could not be computed. The interval is
                         // forgotten and re-requested in full, through the
                         // ordinary load path so it is bounded and ticketed
@@ -394,8 +404,14 @@ impl Session {
     }
 
     /// A page of a load arrived.
-    fn on_page(&mut self, req_id: u64, entries: Vec<(Vec<u8>, Vec<u8>)>, cursor: Option<Vec<u8>>) {
-        match self.loads.on_page(req_id, entries, cursor) {
+    fn on_page(
+        &mut self,
+        req_id: u64,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        cursor: Option<Vec<u8>>,
+        at: protocol::At,
+    ) {
+        match self.loads.on_page(req_id, entries, cursor, at) {
             craftworks_sdk::loads::Page::More { lo, hi, after } => {
                 // Not exhausted. Ask for the rest under the SAME ticket, so
                 // the read parked on it waits for the whole range rather than
@@ -413,6 +429,17 @@ impl Session {
             craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
                 let root = self.head_root;
                 self.db.store_mut().on_page(&lo, &hi, rows, root);
+            }
+            // The tree moved under this load, or it finished behind what
+            // this client already knows. Ask again from the top: what was
+            // gathered is half from one tree and half from another.
+            craftworks_sdk::loads::Page::Restart { lo, hi } => {
+                self.db
+                    .store_mut()
+                    .client
+                    .send(&craftworks_sdk::Loads::range_request(
+                        req_id, &lo, &hi, None,
+                    ));
             }
             craftworks_sdk::loads::Page::Nothing => {}
         }

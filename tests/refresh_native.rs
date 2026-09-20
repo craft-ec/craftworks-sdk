@@ -19,6 +19,13 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+/// One head for every page: these tests do not move the tree, and a
+/// constant says so rather than leaving it to be inferred.
+const AT: protocol::At = protocol::At {
+    seq: 1,
+    root: [1u8; 32],
+};
+
 #[derive(Clone, Default)]
 struct Node(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
 
@@ -210,7 +217,7 @@ impl Client {
                     ..
                 }) = protocol::decode_reply(&reply)
                 {
-                    match loads.on_page(req_id, entries, cursor) {
+                    match loads.on_page(req_id, entries, cursor, AT) {
                         craftworks_sdk::loads::Page::More { lo, hi, after } => {
                             pending = Some(Loads::range_request(req_id, &lo, &hi, Some(after)));
                         }
@@ -219,6 +226,11 @@ impl Client {
                                 println!("    load complete: {} row(s)", rows.len());
                             }
                             self.store.on_page(&lo, &hi, rows, [0u8; 32]);
+                        }
+                        // The tree moved under this load: ask again from
+                        // the top of the range.
+                        craftworks_sdk::loads::Page::Restart { lo, hi } => {
+                            pending = Some(Loads::range_request(req_id, &lo, &hi, None));
                         }
                         craftworks_sdk::loads::Page::Nothing => {}
                     }

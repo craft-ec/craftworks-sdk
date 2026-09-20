@@ -41,6 +41,9 @@ pub enum Page {
         hi: Vec<u8>,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    /// The tree moved under this load, or it finished behind what this
+    /// client already knows. Ask again from the top of the range.
+    Restart { lo: Vec<u8>, hi: Vec<u8> },
     /// Nothing to do: the load ended, or there was no such load.
     Nothing,
 }
@@ -50,6 +53,13 @@ struct Load {
     hi: Vec<u8>,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
     at_ms: u64,
+    /// The head the FIRST page of this load was read at. Every later page
+    /// must match it, or the range would be stitched from two trees.
+    at: Option<protocol::At>,
+    /// How many times this load has been restarted because the tree moved
+    /// under it. Bounded: a range somebody is writing to continuously would
+    /// otherwise restart for ever.
+    restarts: u32,
 }
 
 pub struct Loads {
@@ -60,6 +70,19 @@ pub struct Loads {
     /// ENDED rather than recorded short: recorded short, later reads would
     /// be answered "empty" with confidence.
     pub max_rows: usize,
+    /// How many times a load may restart because the tree moved under it.
+    ///
+    /// One delegate context serves every tab (F47), so another tab writing
+    /// between two pages is ordinary. Restarting is right; restarting for
+    /// ever is not, so a range under continuous write ends `Unavailable`
+    /// rather than spinning.
+    pub max_restarts: u32,
+    /// The highest head seq this client has seen anywhere.
+    ///
+    /// A completed load read at an OLDER seq is not recorded: it would move
+    /// the copy backwards, and a reader would be answered confidently from a
+    /// tree that has already been superseded.
+    known_seq: u64,
     /// How long a load may go unanswered. An unbounded wait is a spinner
     /// that never stops; the node's own tail can be ~60 s (F20), so this is
     /// a bound on the WAIT and not a claim about the network.
@@ -89,6 +112,8 @@ impl Loads {
             ended: Vec::new(),
             next: 1,
             max_rows: 50_000,
+            max_restarts: 8,
+            known_seq: 0,
             budget_ms: 30_000,
             done: std::collections::BTreeSet::new(),
         }
@@ -120,6 +145,8 @@ impl Loads {
                 hi: hi.to_vec(),
                 rows: Vec::new(),
                 at_ms: now_ms,
+                at: None,
+                restarts: 0,
             },
         );
         Some((id, true))
@@ -134,18 +161,61 @@ impl Loads {
         self.done.clear();
     }
 
+    /// The highest head seq this client knows about, from anywhere.
+    ///
+    /// Told, not inferred: `Identity` and every `Delta` name one, and a load
+    /// is judged against the newest thing this client has heard rather than
+    /// against its own history.
+    pub fn note_seq(&mut self, seq: u64) {
+        self.known_seq = self.known_seq.max(seq);
+    }
+
+    pub fn known_seq(&self) -> u64 {
+        self.known_seq
+    }
+
     pub fn on_page(
         &mut self,
         id: u64,
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         cursor: Option<Vec<u8>>,
+        at: protocol::At,
     ) -> Page {
+        self.note_seq(at.seq);
+        let max_restarts = self.max_restarts;
+        let known_seq = self.known_seq;
         let Some(load) = self.open.get_mut(&id) else {
             // A page for a load nobody is waiting on: a duplicate, or one
             // that already timed out. Applying it would record a range as
             // loaded on the strength of an answer whose question is gone.
             return Page::Nothing;
         };
+        // THE TREE MOVED UNDER THIS LOAD.
+        //
+        // Every page must have been read at the same head, or what is
+        // assembled is a range stitched from two trees — rows from before a
+        // write and rows from after it, recorded as one coherent snapshot.
+        // One delegate context serves every tab (F47), so this is ordinary.
+        match load.at {
+            None => load.at = Some(at),
+            Some(first) if first.root != at.root => {
+                load.restarts += 1;
+                if load.restarts > max_restarts {
+                    // Under continuous write. Ending is honest; restarting
+                    // for ever is a page that never fills and never says why.
+                    self.open.remove(&id);
+                    self.ended.push((id, Ended::Unavailable));
+                    return Page::Nothing;
+                }
+                // Throw away what was gathered: half of it is from the old
+                // tree. Start again from the top of the range.
+                let (lo, hi) = (load.lo.clone(), load.hi.clone());
+                load.rows.clear();
+                load.at = None;
+                return Page::Restart { lo, hi };
+            }
+            Some(_) => {}
+        }
         load.rows.extend(entries);
         if load.rows.len() > self.max_rows {
             self.open.remove(&id);
@@ -159,6 +229,24 @@ impl Loads {
                 after,
             };
         }
+        // A load that finished at an OLDER head than this client already
+        // knows about would move the copy backwards. Not recorded; asked
+        // again, bounded by the same restart budget.
+        let finished_at = load.at.unwrap_or(at);
+        if finished_at.seq < known_seq {
+            let load = self.open.get_mut(&id).expect("checked above");
+            load.restarts += 1;
+            if load.restarts > max_restarts {
+                self.open.remove(&id);
+                self.ended.push((id, Ended::Unavailable));
+                return Page::Nothing;
+            }
+            let (lo, hi) = (load.lo.clone(), load.hi.clone());
+            load.rows.clear();
+            load.at = None;
+            return Page::Restart { lo, hi };
+        }
+
         let load = self.open.remove(&id).expect("checked above");
         self.ended.push((id, Ended::Loaded));
         self.done.insert((load.lo.clone(), load.hi.clone()));

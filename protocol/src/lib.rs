@@ -196,6 +196,22 @@ pub enum TraceOf {
     Read(u64),
 }
 
+/// WHICH HEAD AN ANSWER WAS READ AT.
+///
+/// Carried by every reply that hands over data or names where the tree
+/// stands, so a client can tell whether two answers describe the same tree.
+///
+/// **`seq` is what orders them; `root` is what identifies one.** Roots are
+/// content hashes and have no order at all — "is this newer" cannot be asked
+/// of two roots, only of two seqs — so a client compares seq to decide
+/// staleness and root to decide sameness. A design that compared roots would
+/// look like it worked until two of them arrived out of order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct At {
+    pub seq: u64,
+    pub root: [u8; 32],
+}
+
 /// The most entries one page of a range may hold.
 ///
 /// **A caller that wants a full page asks for THIS**, never `0` and never a
@@ -300,6 +316,14 @@ pub enum Reply {
         cursor: Option<Vec<u8>>,
         /// What the engine actually used, which may be less than asked.
         max_entries: u32,
+        /// The head this page was read at.
+        ///
+        /// Without it a page is rows and nothing else, and a range assembled
+        /// from several pages can be STITCHED FROM TWO TREES without anyone
+        /// being able to tell. One delegate context serves every tab (F47),
+        /// so another tab writing between page 1 and page 2 is ordinary, not
+        /// rare.
+        at: At,
     },
     /// How far along a write is.
     WriteState {
@@ -373,6 +397,8 @@ pub enum Reply {
     /// What changed since the root the client named. Appended to v1.
     Delta {
         req_id: u64,
+        /// The head these changes bring the reader to.
+        at: At,
         /// `None` as a value is a REMOVAL, not an empty value. A client told
         /// an empty value keeps a key the writer deleted.
         changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -390,6 +416,8 @@ pub enum Reply {
     FullReloadRequired {
         req_id: u64,
         new_root: [u8; 32],
+        /// The head the reader should expect to reach by loading again.
+        at: At,
     },
     /// A subscribe was taken, or refused and why. Appended to v1.
     Subscribed {

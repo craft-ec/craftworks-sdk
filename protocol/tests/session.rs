@@ -106,6 +106,10 @@ fn v1_session() -> Session {
         ],
         cursor: Some(b"k/two".to_vec()),
         max_entries: 25,
+        at: protocol::At {
+            seq: 3,
+            root: [0x3C; 32],
+        },
     });
     recv(Reply::Unavailable {
         req_id: 12,
