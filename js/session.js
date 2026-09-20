@@ -38,17 +38,58 @@ export const SHIPPED_ARTEFACTS = {
 export async function shippedArtefacts(
   fetchWith = typeof fetch === "function" ? fetch : null,
   base = import.meta.url,
+  {
+    /**
+     * The web contract that HOLDS the artefacts, if there is one.
+     *
+     * An app that names this carries none of the four files itself: they are
+     * published ONCE on the network and every app points at the same bytes
+     * (§19, sdk#108). ~1.7 MB out of every published app.
+     *
+     * Not baked in at SDK build time, because the key does not exist until
+     * somebody publishes the artefacts — whoever publishes an app knows it
+     * and passes it here.
+     */
+    artefactsKey = null,
+    /** The origin serving this page; the artefacts contract is on the same node. */
+    origin = typeof location === "object" ? location.origin : null,
+  } = {},
 ) {
   const url = new URL("./artefacts.json", base).href;
   const r = await fetchWith(url);
   if (!r.ok) throw new Error(`could not fetch ${url}: ${r.status}`);
   const m = await r.json();
+  // WHERE THE SAME BYTES CAN BE GOT, in the order to try.
+  //
+  // The hash is the identity, so a second source costs nothing in trust: it
+  // cannot serve anything different, because anything different does not
+  // hash to this. What it buys is that one unavailable source does not kill
+  // every app at once — which is the coupling a single hardcoded artefacts
+  // contract would otherwise introduce.
+  //
+  // The contract first when there is one, because that is the copy shared by
+  // every app on the node and therefore the one most likely to be cached
+  // already. The file beside this module second, which is what a development
+  // build has and a published app does not — so for a published app it is a
+  // 404 that costs one request and is skipped.
+  //
+  // NO CIRCULARITY: `/v1/contract/web/<key>/<file>` is a plain HTTP GET to
+  // the node already serving this page. It resolves no Block contract, so it
+  // needs none of the four artefacts to fetch the four artefacts.
+  const sources = (file) => {
+    const out = [];
+    if (artefactsKey && origin) {
+      out.push(`${origin}/v1/contract/web/${artefactsKey}/${file}`);
+    }
+    out.push(new URL("./" + file, base).href);
+    return out;
+  };
   const at = name => {
     const e = m[name];
     if (!e || !e.sha256 || !e.file) {
       throw new Error(`artefacts.json has no usable ${name} entry`);
     }
-    return { url: new URL("./" + e.file, base).href, sha256: e.sha256 };
+    return { urls: sources(e.file), sha256: e.sha256 };
   };
   return {
     delegate: at("delegate"),

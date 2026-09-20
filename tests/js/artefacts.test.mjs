@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { shippedArtefacts } from "../../js/session.js";
 import { artefactBytes, allArtefactBytes, CACHE_NAME } from "../../js/artefacts.js";
 
 let failures = 0;
@@ -233,6 +234,169 @@ await t("the manifest's hashes ARE the shipped files", async () => {
     checked += 1;
   }
   assert.equal(checked, 4, "every artefact must be checked, not some of them");
+});
+
+// ---------------------------------------------------------------------------
+// ONE HASH, SEVERAL PLACES TO GET IT.
+//
+// An app that named ONE source for its artefacts is dead whenever that source
+// is unavailable — and if every app names the same one, every app is dead
+// together. The hash is the identity, so a second source costs nothing in
+// trust: it cannot serve anything different, because anything different does
+// not hash to this.
+// ---------------------------------------------------------------------------
+
+await t("**the first source that VERIFIES wins, not the first that answers**", async () => {
+  const good = new Uint8Array([1, 2, 3]);
+  const sha256 = await sha(good);
+  const asked = [];
+  const fetchWith = async url => {
+    asked.push(url);
+    // A source that answers 200 with the WRONG bytes. It must not end the
+    // search: a wrong artefact is not a smaller one.
+    if (url === "a") return new Response(new Uint8Array([9, 9, 9]));
+    if (url === "b") return new Response(good);
+    return new Response("", { status: 404 });
+  };
+  const bytes = await artefactBytes(
+    { urls: ["a", "b"], sha256 },
+    { fetch: fetchWith, caches: null, subtle: crypto.subtle },
+  );
+  assert.deepEqual([...bytes], [...good], "it took the bytes that did not verify");
+  assert.deepEqual(asked, ["a", "b"], "it stopped at the first source that merely answered");
+});
+
+await t("a source that is DOWN is skipped, not fatal", async () => {
+  const good = new Uint8Array([4, 5, 6]);
+  const sha256 = await sha(good);
+  const fetchWith = async url => {
+    if (url === "down") throw new Error("connection refused");
+    return new Response(good);
+  };
+  const bytes = await artefactBytes(
+    { urls: ["down", "up"], sha256 },
+    { fetch: fetchWith, caches: null, subtle: crypto.subtle },
+  );
+  assert.deepEqual([...bytes], [...good], "one unreachable source killed the lot");
+});
+
+await t("**a total failure names the artefact AND what each source did**", async () => {
+  // An app that will not open is the symptom a person reports, so the first
+  // thing they can send must identify the block and say what was tried.
+  const sha256 = await sha(new Uint8Array([7]));
+  const fetchWith = async url => {
+    if (url === "missing") return new Response("", { status: 404 });
+    return new Response(new Uint8Array([8]));      // wrong bytes
+  };
+  await assert.rejects(
+    () => artefactBytes({ urls: ["missing", "wrong"], sha256 }, { fetch: fetchWith, caches: null, subtle: crypto.subtle }),
+    e => {
+      assert.match(e.message, new RegExp(sha256), "the message does not name WHICH artefact");
+      assert.match(e.message, /missing: 404/, "it does not say what the first source did");
+      assert.match(e.message, /wrong: does not hash/, "it does not say what the second source did");
+      return true;
+    },
+  );
+});
+
+await t("THE CONTROL: a single `url` still works, unchanged", async () => {
+  // Every existing caller passes one url. If the list form had replaced it
+  // rather than joined it, they would all fail — and this is the shape the
+  // manifest still produces today.
+  const good = new Uint8Array([1]);
+  const sha256 = await sha(good);
+  const bytes = await artefactBytes(
+    { url: "only", sha256 },
+    { fetch: async () => new Response(good), caches: null, subtle: crypto.subtle },
+  );
+  assert.deepEqual([...bytes], [...good]);
+});
+
+await t("THE CONTROL: no url at all is refused, not silently empty", async () => {
+  await assert.rejects(
+    () => artefactBytes({ sha256: "abc" }, { fetch: async () => new Response(new Uint8Array()), caches: null, subtle: crypto.subtle }),
+    /no url to fetch it from/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// AN APP NAMES ITS ARTEFACTS AND CARRIES NONE OF THEM (§19, sdk#108).
+// ---------------------------------------------------------------------------
+
+const MANIFEST = JSON.stringify({
+  delegate: { file: "engine_delegate.wasm", sha256: "d".repeat(64), bytes: 1 },
+  block: { file: "block.wasm", sha256: "b".repeat(64), bytes: 1 },
+  register: { file: "register.wasm", sha256: "r".repeat(64), bytes: 1 },
+  sdk: { file: "craftworks_sdk_bg.wasm", sha256: "5".repeat(64), bytes: 1 },
+});
+
+const manifestFetch = async url =>
+  url.endsWith("artefacts.json")
+    ? new Response(MANIFEST)
+    : new Response("", { status: 404 });
+
+await t("**an app that names a contract key points at it FIRST**", async () => {
+  const spec = await shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {
+    artefactsKey: "ARTEFACTS",
+    origin: "https://node",
+  });
+  assert.deepEqual(spec.delegate.urls, [
+    "https://node/v1/contract/web/ARTEFACTS/engine_delegate.wasm",
+    "https://node/v1/contract/web/theapp/sdk/engine_delegate.wasm",
+  ], "the shared copy is not tried first, or the local one is not kept as a fallback");
+  assert.equal(spec.delegate.sha256, "d".repeat(64), "the hash from the manifest is gone");
+});
+
+await t("THE CONTROL: with no key, it is the local file and nothing else", async () => {
+  // The development path, and what every existing caller gets. If naming a
+  // contract had REPLACED the local file rather than joined it, a build with
+  // no published artefacts would resolve nothing.
+  const spec = await shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {});
+  assert.deepEqual(spec.block.urls, ["https://node/v1/contract/web/theapp/sdk/block.wasm"]);
+});
+
+await t("**NO CIRCULARITY: resolving the artefacts consumes none of them**", async () => {
+  // A bootstrap route is only interesting if it bootstraps from NOTHING.
+  // Every url is a plain HTTP GET to the node already serving the page; none
+  // of them resolves a Block contract, which would need `block.wasm` — one
+  // of the very four being fetched.
+  const asked = [];
+  const spec = await shippedArtefacts(
+    async url => { asked.push(url); return manifestFetch(url); },
+    "https://node/v1/contract/web/theapp/sdk/session.js",
+    { artefactsKey: "ARTEFACTS", origin: "https://node" },
+  );
+  assert.deepEqual(asked, ["https://node/v1/contract/web/theapp/sdk/artefacts.json"],
+    "reading the manifest itself fetched something other than the manifest");
+  for (const [name, e] of Object.entries(spec)) {
+    for (const u of e.urls) {
+      assert.match(u, /^https:\/\/node\/v1\/contract\/web\//,
+        `${name} is fetched from ${u}, which is not a plain GET to this node`);
+    }
+  }
+});
+
+await t("**THE CONTROL THAT MATTERS: bytes that do not match the named hash are REFUSED**", async () => {
+  // The acceptance names this one specifically. A shared artefact is only
+  // safe because the hash is checked — an app must not load something
+  // unverified, it must not load at all.
+  const sha256 = await sha(new Uint8Array([1, 2, 3]));
+  await assert.rejects(
+    () =>
+      artefactBytes(
+        { urls: ["https://node/v1/contract/web/ARTEFACTS/engine_delegate.wasm"], sha256 },
+        {
+          fetch: async () => new Response(new Uint8Array([9, 9, 9])),
+          caches: null,
+          subtle: crypto.subtle,
+        },
+      ),
+    e => {
+      assert.match(e.message, /does not hash/, "it did not say the bytes failed verification");
+      assert.match(e.message, new RegExp(sha256), "it did not name the artefact");
+      return true;
+    },
+  );
 });
 
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall ok\n");
