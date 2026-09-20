@@ -151,3 +151,32 @@ pub fn member_kind(bytes: &[u8]) -> u8 {
         kind::RAW
     }
 }
+
+/// The members of a pack body, as `(id, bytes)`.
+///
+/// Returns what it can read and stops at the first thing that does not parse:
+/// a pack from a stranger is bytes, not a promise, and the caller
+/// hash-checks every member anyway.
+pub fn members(body: &[u8]) -> Vec<(Cid, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Some((head, mut rest)) = body.split_at_checked(PACK_HEADER) else {
+        return out;
+    };
+    if &head[..4] != PACK_MAGIC {
+        return out;
+    }
+    let count = u16::from_le_bytes([head[4], head[5]]) as usize;
+    for _ in 0..count {
+        let Some((h, tail)) = rest.split_at_checked(5) else {
+            return out;
+        };
+        let k = h[0];
+        let len = u32::from_le_bytes([h[1], h[2], h[3], h[4]]) as usize;
+        let Some((bytes, tail)) = tail.split_at_checked(len) else {
+            return out;
+        };
+        rest = tail;
+        out.push((freenet_prolly::block_id(k, bytes), bytes.to_vec()));
+    }
+    out
+}

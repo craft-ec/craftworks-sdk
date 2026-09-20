@@ -32,6 +32,7 @@ use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod pack;
+pub mod read;
 
 /// Which client a write came from. Two tabs are two clients.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,7 +63,10 @@ pub enum State {
     Busy,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Event` is not `Eq`: a scan carries a `Range`, whose bounds are
+// `Bound<Vec<u8>>` and which the library does not make `Eq`. Tests compare
+// what an event PRODUCES, which is what matters.
+#[derive(Clone, Debug)]
 pub enum Event {
     Write {
         client: ClientId,
@@ -75,6 +79,32 @@ pub enum Event {
     PutFailed(Cid),
     HeadConfirmed(u64),
     Tick(u64),
+
+    // ---- the read path ----
+    Get {
+        client: ClientId,
+        req_id: read::ReqId,
+        key: Vec<u8>,
+    },
+    Scan {
+        client: ClientId,
+        req_id: read::ReqId,
+        range: Box<freenet_prolly::range::Range>,
+    },
+    /// Advisory: bring these roots' blocks nearer, within the budget. It may
+    /// make later reads SOONER; it may never make them more or wider.
+    Preload {
+        client: ClientId,
+        roots: Vec<Cid>,
+    },
+    /// A fetched block came back. Hash-checked before it is believed.
+    BlockArrived {
+        id: Cid,
+        bytes: Vec<u8>,
+    },
+    /// A bounded attempt ended without an answer. Not a failure of the read:
+    /// the next attempt is issued, until the budget runs out.
+    BlockMissed(Cid),
 }
 
 /// A group's three parity ids. The unit redundancy comes in: three blocks are
@@ -110,6 +140,26 @@ pub enum Effect {
         write_id: WriteId,
         state: State,
     },
+
+    // ---- the read path ----
+    FetchBlock {
+        id: Cid,
+        via: read::Via,
+        /// Which try this is. The shell may race or widen on a later attempt;
+        /// the core only says the earlier one did not answer.
+        attempt: u32,
+    },
+    Reply {
+        client: ClientId,
+        req_id: read::ReqId,
+        result: read::ReadResult,
+    },
+    Progress {
+        client: ClientId,
+        req_id: read::ReqId,
+        levels_done: usize,
+        levels_total: usize,
+    },
 }
 
 /// Everything tunable, in one place, so nothing downstream reads a literal.
@@ -138,6 +188,31 @@ pub struct Params {
     /// immediately — which is the control, and a false durability claim: its
     /// data now sits in a coding whose parity is not on the network.
     pub transfer_superseded_waiters: bool,
+
+    // ---- the read path ----
+    /// How many blocks one attempt may ask for. `Page::need` can name the
+    /// whole remainder of a range, and asking for all of it is how one scan
+    /// becomes an unbounded fan-out. This is a bound on the CORE's appetite,
+    /// not a batch size: the shell still decides how many it issues at once.
+    pub max_fetch_per_round: usize,
+    /// How many times a block is asked for before the read is answered
+    /// `Unavailable`. Attempts are RE-ISSUED, not waited on (ARCHITECTURE §7).
+    pub max_attempts: u32,
+    /// Two requests needing one block share its fetch. Off = the control.
+    pub share_fetches: bool,
+    /// Bytes the warm set may hold. Eviction never drops a block a parked
+    /// read or an unpublished commit still needs.
+    pub max_warm_bytes: usize,
+    /// Ceilings on an advisory preload: roots, blocks, bytes. A preload may
+    /// make reads SOONER, never more or wider, so a hostile manifest costs
+    /// the budget and not what it asked for.
+    pub preload_roots: usize,
+    pub preload_blocks: usize,
+    pub preload_bytes: usize,
+    /// On a miss, also ask for every block the warm nodes name — a plausible
+    /// "fetch ahead" a reader might write, and the control for the cost
+    /// bound. A bound no implementation can exceed is not a bound.
+    pub fetch_greedily: bool,
 }
 
 impl Default for Params {
@@ -150,6 +225,14 @@ impl Default for Params {
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
             transfer_superseded_waiters: true,
+            max_fetch_per_round: 8,
+            max_attempts: 3,
+            share_fetches: true,
+            max_warm_bytes: 64 * 1024 * 1024,
+            preload_roots: 4,
+            preload_blocks: 256,
+            preload_bytes: 4 * 1024 * 1024,
+            fetch_greedily: false,
         }
     }
 }
@@ -246,6 +329,8 @@ pub struct Engine {
     /// also hides a superseded group behind the others, so the write never
     /// notices the one covering ITS data was replaced.
     coded_since_commit: BTreeSet<ParityIds>,
+    /// Everything the read path is waiting on.
+    reads: read::Reads,
     /// Nodes parsed on the write path. A cost counter, not a statistic: the
     /// whole point of the diff walk is that this stays proportional to the
     /// tree's DEPTH, and a test that does not measure it would not notice the
@@ -296,6 +381,7 @@ impl Engine {
             pending_notifications: Vec::new(),
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
+            reads: read::Reads::default(),
             nodes_parsed: 0,
             now: 0,
         }
@@ -342,7 +428,136 @@ impl Engine {
             Event::PutFailed(id) => self.on_failed(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
             Event::Tick(now) => self.on_tick(now),
+            Event::Get {
+                client,
+                req_id,
+                key,
+            } => self.on_read(client, req_id, read::Want::Get(key)),
+            Event::Scan {
+                client,
+                req_id,
+                range,
+            } => self.on_read(client, req_id, read::Want::Scan(range)),
+            Event::Preload { client, roots } => self.on_preload(client, roots),
+            Event::BlockArrived { id, bytes } => self.on_arrived(id, bytes),
+            Event::BlockMissed(id) => self.on_missed(id),
         }
+    }
+
+    /// Try a read, reply if it is answerable now, park it if it is not.
+    ///
+    /// Rule 1: a warm hit replies in the same `step`, with no other effect. A
+    /// read that is already answerable must not cost a round trip, because
+    /// most reads in a live app are answerable.
+    fn on_read(&mut self, client: ClientId, req_id: read::ReqId, want: read::Want) -> Vec<Effect> {
+        let root = self.published_root;
+        self.reads.parked.insert(
+            req_id,
+            read::Parked {
+                client,
+                want,
+                root,
+                levels_done: 0,
+            },
+        );
+        self.drive(req_id)
+    }
+
+    /// Advance one parked read as far as what is warm allows.
+    fn drive(&mut self, req_id: read::ReqId) -> Vec<Effect> {
+        let Some(p) = self.reads.parked.get(&req_id).cloned() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match read::attempt(
+            &self.blocks,
+            &self.params,
+            &p.want,
+            &p.root,
+            &mut self.nodes_parsed,
+        ) {
+            read::Attempt::Done(result) => {
+                self.reads.parked.remove(&req_id);
+                self.forget_waiting(req_id);
+                out.push(Effect::Reply {
+                    client: p.client,
+                    req_id,
+                    result,
+                });
+            }
+            read::Attempt::Broken(cid) => {
+                // The tree names a block whose content is not that block. No
+                // number of fetches fixes it, and answering "absent" would be
+                // a wrong answer rather than a missing one.
+                self.reads.parked.remove(&req_id);
+                self.forget_waiting(req_id);
+                out.push(Effect::Reply {
+                    client: p.client,
+                    req_id,
+                    result: read::ReadResult::Unavailable(cid),
+                });
+            }
+            read::Attempt::Need(ids) => {
+                if let Some(q) = self.reads.parked.get_mut(&req_id) {
+                    q.levels_done += 1;
+                }
+                let levels_done = self.reads.parked.get(&req_id).map_or(0, |q| q.levels_done);
+                out.push(Effect::Progress {
+                    client: p.client,
+                    req_id,
+                    levels_done,
+                    // Not known until the walk ends; one more than what is
+                    // done is the honest floor rather than a guessed height.
+                    levels_total: levels_done + 1,
+                });
+                let mut ids = ids;
+                if self.params.fetch_greedily {
+                    // Everything any warm node names, whether or not this read
+                    // needs it.
+                    let named: Vec<Cid> = self
+                        .blocks
+                        .0
+                        .values()
+                        .filter_map(|b| Node::parse(b).ok())
+                        .filter(|n| !n.is_leaf())
+                        .flat_map(|n| (0..n.len()).map(move |i| n.child(i).0).collect::<Vec<_>>())
+                        .collect();
+                    // Capped, or the control never terminates and measures
+                    // nothing. It still blows the bound many times over.
+                    ids.extend(named.into_iter().take(64));
+                }
+                // Never ask for what is already here. `Page::need` can name
+                // blocks a previous round already brought in, and a reader
+                // that re-fetches them makes no progress at all.
+                ids.retain(|id| self.blocks.get(id).is_none());
+                let cap = if self.params.fetch_greedily {
+                    usize::MAX
+                } else {
+                    self.params.max_fetch_per_round
+                };
+                for id in ids.into_iter().take(cap) {
+                    if self.reads.want(id, req_id, self.params.share_fetches) {
+                        let attempt = *self.reads.attempts.entry(id).or_insert(0);
+                        let via = self
+                            .reads
+                            .in_pack
+                            .get(&id)
+                            .copied()
+                            .map_or(read::Via::Direct, read::Via::Pack);
+                        self.reads.fetches += 1;
+                        out.push(Effect::FetchBlock { id, via, attempt });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn forget_waiting(&mut self, req_id: read::ReqId) {
+        self.reads.waiting.retain(|_, reqs| {
+            reqs.remove(&req_id);
+            !reqs.is_empty()
+        });
     }
 
     fn on_write(
@@ -940,4 +1155,186 @@ impl Engine {
 
 fn kind_raw() -> u8 {
     freenet_prolly::kind::RAW
+}
+
+impl Engine {
+    /// A fetched block came back.
+    ///
+    /// Rule 3: hash-checked against the id it was asked for BEFORE it touches
+    /// the warm tree. A block that fails is treated exactly as a miss — it is
+    /// not cached, not parsed, and not an error the caller sees, because a
+    /// node that sends rubbish must not be able to break a reader that asked
+    /// for something real.
+    fn on_arrived(&mut self, id: Cid, bytes: Vec<u8>) -> Vec<Effect> {
+        if !read::matches_id(&id, &bytes) {
+            return self.on_missed(id);
+        }
+        let mut landed: Vec<Cid> = vec![id];
+        // A pack carries many blocks, and one fetch of it can answer several
+        // parked reads at once. Its members are checked the same way: a pack
+        // is a transport, and the blocks inside are the same blocks with the
+        // same ids.
+        if freenet_prolly::block_id(pack::PACK_KIND, &bytes) == id {
+            for (mid, mbytes) in pack::members(&bytes) {
+                if read::matches_id(&mid, &mbytes) {
+                    self.remember(mid, &mbytes);
+                    self.reads.in_pack.insert(mid, id);
+                    landed.push(mid);
+                }
+            }
+        } else {
+            self.remember(id, &bytes);
+        }
+
+        let mut woken: BTreeSet<read::ReqId> = BTreeSet::new();
+        for l in landed {
+            self.reads.attempts.remove(&l);
+            if let Some(reqs) = self.reads.waiting.remove(&l) {
+                woken.extend(reqs);
+            }
+        }
+        let mut out = Vec::new();
+        for req in woken {
+            out.extend(self.drive(req));
+        }
+        out
+    }
+
+    /// An attempt ended without an answer.
+    ///
+    /// Rule 5: re-issued, not waited on. Only when the budget runs out does
+    /// the read get an answer — `Unavailable`, which is a reply. A read that
+    /// never answers is indistinguishable from a wedged node, and the caller
+    /// can do nothing about either.
+    fn on_missed(&mut self, id: Cid) -> Vec<Effect> {
+        let Some(reqs) = self.reads.waiting.get(&id).cloned() else {
+            return Vec::new();
+        };
+        let attempt = self.reads.attempts.entry(id).or_insert(0);
+        *attempt += 1;
+        let attempt = *attempt;
+        if attempt < self.params.max_attempts {
+            let via = self
+                .reads
+                .in_pack
+                .get(&id)
+                .copied()
+                .map_or(read::Via::Direct, read::Via::Pack);
+            self.reads.fetches += 1;
+            return vec![Effect::FetchBlock { id, via, attempt }];
+        }
+        // Out of attempts. Everyone waiting on this block is told, once.
+        self.reads.waiting.remove(&id);
+        self.reads.attempts.remove(&id);
+        let mut out = Vec::new();
+        for req in reqs {
+            if let Some(p) = self.reads.parked.remove(&req) {
+                self.forget_waiting(req);
+                out.push(Effect::Reply {
+                    client: p.client,
+                    req_id: req,
+                    result: read::ReadResult::Unavailable(id),
+                });
+            }
+        }
+        out
+    }
+
+    /// Rule 7: preload is advisory and budgeted.
+    ///
+    /// It may make a later read SOONER; it may never make one more or wider.
+    /// So it is truncated to the budget rather than refused, and it only
+    /// walks roots this session already holds — a manifest naming a million
+    /// roots costs the budget, not the manifest.
+    fn on_preload(&mut self, _client: ClientId, roots: Vec<Cid>) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let mut blocks = 0usize;
+        for root in roots.into_iter().take(self.params.preload_roots) {
+            // Only over a root the session already holds: a preload is a hint
+            // about what is already ours, not an invitation to fetch a
+            // stranger's tree.
+            if self.blocks.get(&root).is_none() {
+                continue;
+            }
+            let mut stack = vec![root];
+            while let Some(cid) = stack.pop() {
+                if blocks >= self.params.preload_blocks {
+                    return out;
+                }
+                let Some(b) = self.blocks.get(&cid) else {
+                    // Not held: this is what a preload is FOR.
+                    if self.reads.waiting.contains_key(&cid) {
+                        continue;
+                    }
+                    blocks += 1;
+                    self.reads.fetches += 1;
+                    out.push(Effect::FetchBlock {
+                        id: cid,
+                        via: read::Via::Direct,
+                        attempt: 0,
+                    });
+                    continue;
+                };
+                self.nodes_parsed += 1;
+                let Ok(n) = Node::parse(b) else { continue };
+                if !n.is_leaf() {
+                    for i in 0..n.len() {
+                        stack.push(n.child(i).0);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Put a block in the warm set, within its bound.
+    ///
+    /// Rule 8: eviction never drops a block a parked read or an unpublished
+    /// commit still needs — evicting those would turn a bounded cache into a
+    /// cause of the very fetches it exists to avoid, and could lose a block
+    /// that exists nowhere else yet.
+    fn remember(&mut self, id: Cid, bytes: &[u8]) {
+        self.blocks.insert(id, bytes);
+        let mut held: usize = self.blocks.0.values().map(Vec::len).sum();
+        if held <= self.params.max_warm_bytes {
+            return;
+        }
+        let pinned: BTreeSet<Cid> = self
+            .unpublished
+            .iter()
+            .map(|(c, _)| *c)
+            .chain(self.reads.parked.values().map(|p| p.root))
+            .chain(std::iter::once(self.root))
+            .chain(std::iter::once(self.published_root))
+            .collect();
+        let victims: Vec<Cid> = self
+            .blocks
+            .0
+            .keys()
+            .copied()
+            .filter(|c| !pinned.contains(c))
+            .collect();
+        for v in victims {
+            if held <= self.params.max_warm_bytes {
+                break;
+            }
+            if let Some(b) = self.blocks.0.remove(&v) {
+                held -= b.len();
+            }
+        }
+    }
+
+    /// Start from a published root this engine did not write.
+    ///
+    /// What a cold reader has: a head, and nothing else. Only for tests — a
+    /// real engine learns its root by reading its own head.
+    pub fn adopt_root_for_test(&mut self, root: Cid) {
+        self.root = root;
+        self.published_root = root;
+    }
+
+    /// Fetches emitted, for the cost gate.
+    pub fn fetches(&self) -> usize {
+        self.reads.fetches
+    }
 }

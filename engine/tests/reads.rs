@@ -1,0 +1,715 @@
+//! Acceptance for the read path (craftworks-sdk#27).
+//!
+//! The gate is the differential: whatever order blocks arrive in, whatever
+//! strangers and duplicates and misses arrive with them, a read answers what
+//! a direct lookup in a fully-held tree answers. Everything else here is a
+//! property that differential cannot see.
+
+use engine::read::{ReadResult, ReqId, Via};
+use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId};
+use freenet_prolly::range::Range;
+use freenet_prolly::store::{Blocks, MemBlocks};
+use freenet_prolly::Cid;
+use std::collections::BTreeMap;
+use std::ops::Bound;
+
+fn rng(seed: u64) -> impl FnMut() -> u64 {
+    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    }
+}
+
+/// A writer engine holding everything, and the blocks it produced.
+///
+/// The reader is given NONE of them: it starts from a published root and must
+/// fetch its way to an answer, which is the situation a cold reader is
+/// actually in.
+fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
+    let mut w = Engine::default();
+    let ops: Vec<(Vec<u8>, Op)> = records
+        .iter()
+        .map(|(k, v)| (k.clone(), Op::Put(v.clone())))
+        .collect();
+    let mut queue = w.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops,
+    });
+    let mut all = MemBlocks::default();
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the writer did not settle");
+        match f {
+            Effect::PutPack { id, bytes, .. } => {
+                // A pack is a TRANSPORT. What the network ends up holding is
+                // the blocks inside it, under their own ids — that is the
+                // whole point of the format, and a fixture that kept only the
+                // pack would model a network no reader could read.
+                for (mid, mbytes) in engine::pack::members(&bytes) {
+                    all.insert(mid, &mbytes);
+                }
+                all.insert(id, &bytes);
+                queue.extend(w.step(Event::PutConfirmed(id)));
+            }
+            Effect::PutBlock { id, bytes, .. } => {
+                all.insert(id, &bytes);
+                queue.extend(w.step(Event::PutConfirmed(id)));
+            }
+            Effect::UpdateHead { seq, .. } => queue.extend(w.step(Event::HeadConfirmed(seq))),
+            Effect::PutParity { id, bytes, .. } => {
+                all.insert(id, &bytes);
+                queue.extend(w.step(Event::PutConfirmed(id)));
+            }
+            Effect::Notify {
+                state: State::Published,
+                ..
+            } => {}
+            _ => {}
+        }
+    }
+    (w.published_root(), all)
+}
+
+/// A reader that has published the same root but holds no blocks.
+fn reader(root: Cid, params: Params) -> Engine {
+    let mut e = Engine::new(params);
+    e.adopt_root_for_test(root);
+    e
+}
+
+fn replies(effects: &[Effect]) -> Vec<(ReqId, ReadResult)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Reply { req_id, result, .. } => Some((*req_id, result.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn fetch_ids(effects: &[Effect]) -> Vec<(Cid, Via, u32)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::FetchBlock { id, via, attempt } => Some((*id, *via, *attempt)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn get(client: u64, req: u64, key: &[u8]) -> Event {
+    Event::Get {
+        client: ClientId(client),
+        req_id: ReqId(req),
+        key: key.to_vec(),
+    }
+}
+
+/// The oracle: what the tree actually holds, read with everything present.
+fn direct(all: &MemBlocks, root: &Cid, key: &[u8]) -> Option<Vec<u8>> {
+    match freenet_prolly::read::get(all, root, key) {
+        Ok(Some(freenet_prolly::node::Value::Inline(b))) => Some(b.to_vec()),
+        Ok(Some(freenet_prolly::node::Value::Ref { cid, .. })) => all.get(&cid).map(<[u8]>::to_vec),
+        Ok(None) => None,
+        Err(e) => panic!("the oracle could not read its own tree: {e:?}"),
+    }
+}
+
+/// THE GATE. Cold reads answer what a fully-held tree answers, through
+/// arbitrary arrival orders, duplicates, strangers and misses.
+///
+/// A read path has many chances to answer confidently and wrongly: resume at
+/// the wrong level, cache a block under the wrong id, treat a miss as an
+/// absence. All of them show up here as an answer that differs from the
+/// oracle — including "absent", which is an answer and not a non-answer.
+#[test]
+fn cold_reads_answer_what_a_fully_held_tree_answers() {
+    let mut cold_lookups = 0usize;
+    for seed in 1..=16u64 {
+        let mut r = rng(seed);
+        let mut records: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for i in 0..600u32 {
+            let v = if r().is_multiple_of(4) {
+                // Over MAX_INLINE, so the value is a block of its own and the
+                // read has to fetch it separately from the leaf.
+                vec![(i % 251) as u8; 1400]
+            } else {
+                vec![(i % 251) as u8; 20]
+            };
+            records.insert(format!("k/{i:05}").into_bytes(), v);
+        }
+        let (root, all) = tree(&records);
+        let mut e = reader(root, Params::default());
+
+        // A mix of keys that exist and keys that do not.
+        let keys: Vec<Vec<u8>> = records.keys().cloned().collect();
+        let mut asked: Vec<(ReqId, Vec<u8>)> = Vec::new();
+        let mut queue: Vec<Effect> = Vec::new();
+        for n in 0..12u64 {
+            let key = if r().is_multiple_of(5) {
+                format!("absent/{}", r() % 1000).into_bytes()
+            } else {
+                keys[(r() % keys.len() as u64) as usize].clone()
+            };
+            let req = ReqId(n);
+            asked.push((req, key.clone()));
+            queue.extend(e.step(get(1, n, &key)));
+        }
+
+        // Answer fetches in a shuffled order, with duplicates, strangers and
+        // the occasional miss.
+        let mut answered: BTreeMap<ReqId, ReadResult> = BTreeMap::new();
+        let mut guard = 0;
+        while !queue.is_empty() {
+            guard += 1;
+            assert!(guard < 200_000, "seed {seed}: the read did not settle");
+            let i = (r() % queue.len() as u64) as usize;
+            let f = queue.remove(i);
+            match f {
+                Effect::FetchBlock { id, .. } => {
+                    let out = if r().is_multiple_of(7) {
+                        // A bounded attempt that did not answer. The core must
+                        // re-issue, not give up and not hang.
+                        e.step(Event::BlockMissed(id))
+                    } else if let Some(bytes) = all.get(&id) {
+                        let bytes = bytes.to_vec();
+                        let mut out = e.step(Event::BlockArrived {
+                            id,
+                            bytes: bytes.clone(),
+                        });
+                        if r().is_multiple_of(6) {
+                            // The same block again: normal on a network.
+                            out.extend(e.step(Event::BlockArrived { id, bytes }));
+                        }
+                        out
+                    } else {
+                        e.step(Event::BlockMissed(id))
+                    };
+                    queue.extend(out);
+                }
+                Effect::Reply { req_id, result, .. } => {
+                    answered.insert(req_id, result);
+                }
+                _ => {}
+            }
+            if r().is_multiple_of(9) {
+                // A block nobody asked for.
+                let junk = vec![(r() % 251) as u8; 40];
+                queue.extend(e.step(Event::BlockArrived {
+                    id: [(r() % 251) as u8; 32],
+                    bytes: junk,
+                }));
+            }
+        }
+
+        for (req, key) in &asked {
+            let got = answered
+                .get(req)
+                .unwrap_or_else(|| panic!("seed {seed}: {req:?} was never answered"));
+            match got {
+                ReadResult::Value(v) => {
+                    assert_eq!(
+                        v,
+                        &direct(&all, &root, key),
+                        "seed {seed}: a cold read answered differently from a \
+                         fully-held tree"
+                    );
+                    cold_lookups += 1;
+                }
+                // Allowed: the harness injects misses, and exhausting the
+                // attempt budget is a REPLY. What is not allowed is silence,
+                // and that is asserted above.
+                ReadResult::Unavailable(_) => {}
+                other => panic!("seed {seed}: a Get was answered with {other:?}"),
+            }
+        }
+    }
+    // A floor, so a run where every read happened to be answered Unavailable
+    // cannot read as a pass.
+    assert!(
+        cold_lookups >= 100,
+        "only {cold_lookups} cold lookups actually produced a value; the \
+         differential compared almost nothing"
+    );
+    println!("  {cold_lookups} cold lookups matched a fully-held tree");
+}
+
+/// A fixture with a named key and its tree.
+fn fixture(n: u32) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks) {
+    let records: BTreeMap<Vec<u8>, Vec<u8>> = (0..n)
+        .map(|i| {
+            (
+                format!("k/{i:05}").into_bytes(),
+                vec![(i % 251) as u8; if i.is_multiple_of(3) { 1400 } else { 24 }],
+            )
+        })
+        .collect();
+    let (root, all) = tree(&records);
+    (records, root, all)
+}
+
+/// Feed a reader every block, so it is fully warm.
+fn warm_all(e: &mut Engine, all: &MemBlocks) {
+    for (id, bytes) in all.0.iter() {
+        let _ = e.step(Event::BlockArrived {
+            id: *id,
+            bytes: bytes.clone(),
+        });
+    }
+}
+
+/// Drive a reader until it answers, serving from `all`.
+fn settle(e: &mut Engine, all: &MemBlocks, first: Vec<Effect>) -> Vec<(ReqId, ReadResult)> {
+    let mut queue = first;
+    let mut out = Vec::new();
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the read did not settle");
+        match f {
+            Effect::FetchBlock { id, .. } => {
+                let ev = match all.get(&id) {
+                    Some(b) => Event::BlockArrived {
+                        id,
+                        bytes: b.to_vec(),
+                    },
+                    None => Event::BlockMissed(id),
+                };
+                queue.extend(e.step(ev));
+            }
+            Effect::Reply { req_id, result, .. } => out.push((req_id, result)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Each state a reader can be in is named and tested, not left to a sweep to
+/// wander into.
+///
+/// A sweep reaches these eventually and says nothing about which it reached;
+/// a named test says which one broke.
+#[test]
+fn every_warmth_state_answers_the_same() {
+    let (records, root, all) = fixture(400);
+    let key = b"k/00123".to_vec();
+    let want = direct(&all, &root, &key);
+    assert!(want.is_some(), "the fixture key must exist");
+
+    // 1. Fully warm: rule 1 — the reply is in the same step, with no fetch.
+    let mut e = reader(root, Params::default());
+    warm_all(&mut e, &all);
+    let out = e.step(get(1, 1, &key));
+    assert!(
+        fetch_ids(&out).is_empty(),
+        "a warm hit asked the network for something"
+    );
+    assert_eq!(
+        replies(&out),
+        vec![(ReqId(1), ReadResult::Value(want.clone()))]
+    );
+
+    // 2. Fully cold.
+    let mut e = reader(root, Params::default());
+    let first = e.step(get(1, 2, &key));
+    let got = settle(&mut e, &all, first);
+    assert_eq!(got, vec![(ReqId(2), ReadResult::Value(want.clone()))]);
+
+    // 3. Path warm, leaf cold: everything but the leaf holding the key.
+    let mut e = reader(root, Params::default());
+    let leaf = leaf_for(&all, &root, &key);
+    // Withholding the leaf is not enough: a PACK containing it warms it just
+    // as well, which is the whole point of packs. A fixture that fed the pack
+    // would call this state "leaf cold" while the leaf was warm, and the
+    // "exactly one fetch" assertion below is what caught that.
+    for (id, bytes) in all.0.iter() {
+        let carries_leaf =
+            *id == leaf || engine::pack::members(bytes).iter().any(|(m, _)| *m == leaf);
+        if !carries_leaf {
+            let _ = e.step(Event::BlockArrived {
+                id: *id,
+                bytes: bytes.clone(),
+            });
+        }
+    }
+    let first = e.step(get(1, 3, &key));
+    assert_eq!(
+        fetch_ids(&first).len(),
+        1,
+        "with only the leaf missing, exactly one block should be wanted"
+    );
+    assert_eq!(fetch_ids(&first)[0].0, leaf);
+    let got = settle(&mut e, &all, first);
+    assert_eq!(got, vec![(ReqId(3), ReadResult::Value(want.clone()))]);
+
+    // 4. Leaf warm via a PACK, branch cold. The pack carries the leaf, so one
+    //    fetch of it answers what several reads were parked on.
+    let mut e = reader(root, Params::default());
+    let pack = all
+        .0
+        .iter()
+        .find(|(id, bytes)| {
+            freenet_prolly::block_id(engine::pack::PACK_KIND, bytes) == **id
+                && engine::pack::members(bytes).iter().any(|(m, _)| *m == leaf)
+        })
+        .map(|(id, bytes)| (*id, bytes.clone()));
+    if let Some((pid, pbytes)) = pack {
+        let _ = e.step(Event::BlockArrived {
+            id: pid,
+            bytes: pbytes,
+        });
+        let first = e.step(get(1, 4, &key));
+        let got = settle(&mut e, &all, first);
+        assert_eq!(got, vec![(ReqId(4), ReadResult::Value(want.clone()))]);
+    }
+    let _ = records;
+    println!("  warm / cold / leaf-cold / pack-warm all answer alike");
+}
+
+/// The leaf that holds `key`, found with everything present.
+fn leaf_for(all: &MemBlocks, root: &Cid, key: &[u8]) -> Cid {
+    let mut cur = *root;
+    loop {
+        let bytes = all.get(&cur).expect("held");
+        let node = freenet_prolly::node::Node::parse(bytes).expect("a node");
+        if node.is_leaf() {
+            return cur;
+        }
+        let i = match node.search(key) {
+            Ok(i) => i,
+            Err(0) => return cur,
+            Err(i) => i - 1,
+        };
+        cur = node.child(i).0;
+    }
+}
+
+/// A block whose content is not what was asked for is refused, not cached.
+///
+/// This is the one that decides whether a content-addressed store is
+/// content-addressed. If a wrong block is kept under the id that was wanted,
+/// every later read of that key is answered wrongly, for as long as it stays
+/// warm — and it was a stranger on the network who decided so.
+#[test]
+fn a_block_that_is_not_what_was_asked_for_is_refused() {
+    let (_, root, all) = fixture(400);
+    let key = b"k/00123".to_vec();
+    let want = direct(&all, &root, &key);
+
+    // Right id, wrong bytes; right bytes under a different id; and a leaf
+    // where the descent wants a branch.
+    let leaf = leaf_for(&all, &root, &key);
+    let leaf_bytes = all.get(&leaf).expect("held").to_vec();
+
+    for (name, make) in [
+        ("wrong bytes under the right id", 0u8),
+        ("right bytes under a different id", 1),
+        ("a leaf where a branch is expected", 2),
+    ] {
+        let mut e = reader(root, Params::default());
+        let first = e.step(get(1, 7, &key));
+        let asked = fetch_ids(&first);
+        assert_eq!(asked.len(), 1, "{name}: expected one fetch to poison");
+        let id = asked[0].0;
+
+        let bytes = match make {
+            0 => vec![0xEEu8; 64],
+            1 => all
+                .0
+                .values()
+                .find(|b| **b != leaf_bytes)
+                .cloned()
+                .expect("another block"),
+            _ => leaf_bytes.clone(),
+        };
+        let out = e.step(Event::BlockArrived { id, bytes });
+
+        // The read must still SUCCEED once the network serves the truth.
+        //
+        // Answering `Unavailable` here would be a poisoned block costing a
+        // reader its answer: one node sending rubbish is not a reason to stop
+        // asking. And it is what separates the engine's check from the
+        // library's — freenet-prolly refuses a mismatched block when it
+        // PARSES one, which ends the read; the engine refuses it on ARRIVAL,
+        // which turns it into another attempt. Allowing `Unavailable` here
+        // let a mutant that skips the check survive this test.
+        let got = settle(&mut e, &all, out);
+        let answer = got
+            .iter()
+            .find(|(r, _)| *r == ReqId(7))
+            .map(|(_, res)| res.clone())
+            .unwrap_or_else(|| panic!("{name}: the read was never answered"));
+        assert_eq!(
+            answer,
+            ReadResult::Value(want.clone()),
+            "{name}: a poisoned block cost the reader its answer"
+        );
+    }
+    println!("  three hostile blocks refused, and none of them stuck");
+}
+
+/// A point lookup on a cold tree costs one block per level, not a scan.
+#[test]
+fn a_cold_point_lookup_costs_one_block_per_level() {
+    let (_, root, all) = fixture(10_000);
+    let key = b"k/05000".to_vec();
+
+    let depth = {
+        let mut d = 0;
+        let mut cur = root;
+        loop {
+            let bytes = all.get(&cur).expect("held");
+            let n = freenet_prolly::node::Node::parse(bytes).expect("node");
+            d += 1;
+            if n.is_leaf() {
+                break d;
+            }
+            let i = match n.search(&key) {
+                Ok(i) => i,
+                Err(0) => break d,
+                Err(i) => i - 1,
+            };
+            cur = n.child(i).0;
+        }
+    };
+
+    let mut e = reader(root, Params::default());
+    e.reset_cost();
+    let first = e.step(get(1, 9, &key));
+    let got = settle(&mut e, &all, first);
+    assert!(
+        matches!(got.first(), Some((_, ReadResult::Value(Some(_))))),
+        "the lookup did not find the key: {got:?}"
+    );
+    // One fetch per level, plus at most one for a value stored by reference.
+    assert!(
+        e.fetches() <= depth + 1,
+        "a cold point lookup on a 10,000-key tree fetched {} blocks for a \
+         tree {depth} levels deep",
+        e.fetches()
+    );
+    // Parses are per attempt, and there is one attempt per level, so the
+    // bound is quadratic in depth at worst — still nothing like a scan.
+    assert!(
+        e.nodes_parsed() <= depth * (depth + 2),
+        "{} nodes parsed for a {depth}-level lookup",
+        e.nodes_parsed()
+    );
+    // The control: a reader that fetches ahead blows the bound. Without it,
+    // "≤ depth + 1" could be true of an implementation that fetched nothing
+    // useful at all.
+    let mut greedy = reader(
+        root,
+        Params {
+            fetch_greedily: true,
+            ..Params::default()
+        },
+    );
+    let first = greedy.step(get(1, 10, &key));
+    let _ = settle(&mut greedy, &all, first);
+    assert!(
+        greedy.fetches() > depth + 1,
+        "the greedy control fetched only {} blocks, so it does not blow the \
+         bound and proves nothing about it",
+        greedy.fetches()
+    );
+
+    println!(
+        "  cold lookup: {} fetches, {} node parses, tree {depth} levels deep \
+         (greedy control: {} fetches)",
+        e.fetches(),
+        e.nodes_parsed(),
+        greedy.fetches()
+    );
+}
+
+/// Two reads waiting on one block pay for one fetch.
+#[test]
+fn requests_waiting_on_one_block_share_its_fetch() {
+    let (_, root, _all) = fixture(400);
+    let key = b"k/00123".to_vec();
+
+    let count = |share: bool| -> usize {
+        let mut e = reader(
+            root,
+            Params {
+                share_fetches: share,
+                ..Params::default()
+            },
+        );
+        let mut n = 0;
+        for req in 0..5u64 {
+            n += fetch_ids(&e.step(get(1, req, &key))).len();
+        }
+        n
+    };
+
+    let shared = count(true);
+    let each = count(false);
+    assert_eq!(
+        shared, 1,
+        "five reads of one cold key emitted {shared} fetches"
+    );
+    assert_eq!(
+        each, 5,
+        "with sharing off the control emitted {each} fetches, so it is not a \
+         control for sharing"
+    );
+    println!("  five readers, one fetch (control: {each})");
+}
+
+/// A preload manifest naming a million roots costs the budget, not the
+/// manifest.
+#[test]
+fn a_hostile_preload_costs_the_budget() {
+    let (_, root, all) = fixture(2_000);
+    let mut e = reader(root, Params::default());
+    // The session holds this root and nothing else.
+    e.step(Event::BlockArrived {
+        id: root,
+        bytes: all.get(&root).expect("held").to_vec(),
+    });
+    e.reset_cost();
+
+    let mut roots: Vec<Cid> = (0..1_000_000u32).map(|i| [(i % 251) as u8; 32]).collect();
+    roots.insert(0, root);
+    let out = e.step(Event::Preload {
+        client: ClientId(1),
+        roots,
+    });
+    let p = Params::default();
+    assert!(
+        fetch_ids(&out).len() <= p.preload_blocks,
+        "a preload of a million roots asked for {} blocks",
+        fetch_ids(&out).len()
+    );
+    assert!(
+        e.nodes_parsed() <= p.preload_blocks * 2,
+        "a preload of a million roots parsed {} nodes",
+        e.nodes_parsed()
+    );
+    println!(
+        "  preload of 10^6 roots: {} fetches, {} parses",
+        fetch_ids(&out).len(),
+        e.nodes_parsed()
+    );
+}
+
+/// A range pages in both directions, and every feed pages newest-first.
+#[test]
+fn a_range_pages_in_both_directions() {
+    let (records, root, all) = fixture(300);
+    let keys: Vec<Vec<u8>> = records.keys().cloned().collect();
+
+    for reverse in [false, true] {
+        let mut e = reader(root, Params::default());
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        for page in 0..20 {
+            let r = Range {
+                lo: Bound::Unbounded,
+                hi: Bound::Unbounded,
+                reverse,
+                after: after.clone(),
+                max_entries: 25,
+                max_bytes: 1 << 20,
+            };
+            let first = e.step(Event::Scan {
+                client: ClientId(1),
+                req_id: ReqId(page),
+                range: Box::new(r),
+            });
+            let got = settle(&mut e, &all, first);
+            let Some((
+                _,
+                ReadResult::Page {
+                    entries,
+                    cursor,
+                    complete,
+                },
+            )) = got.first()
+            else {
+                panic!("reverse={reverse}: page {page} was answered {got:?}");
+            };
+            seen.extend(entries.iter().map(|(k, _)| k.clone()));
+            after = cursor.clone();
+            if *complete || after.is_none() {
+                break;
+            }
+        }
+        let mut want = keys.clone();
+        if reverse {
+            want.reverse();
+        }
+        assert_eq!(
+            seen, want,
+            "reverse={reverse}: paging did not visit every key in scan order"
+        );
+    }
+    println!("  both directions page every key in order");
+}
+
+/// No sequence of read events makes the core panic.
+#[test]
+fn no_read_sequence_panics() {
+    let (_, root, all) = fixture(500);
+    let ids: Vec<Cid> = all.0.keys().copied().collect();
+    let mut cases = 0;
+    for seed in 1..=20u64 {
+        let mut r = rng(seed);
+        let mut e = reader(
+            root,
+            Params {
+                max_attempts: 2,
+                max_warm_bytes: 32 * 1024,
+                ..Params::default()
+            },
+        );
+        for _ in 0..80 {
+            let ev = match r() % 6 {
+                0 => get(
+                    1 + r() % 3,
+                    r() % 10,
+                    format!("k/{:05}", r() % 600).as_bytes(),
+                ),
+                1 => Event::Scan {
+                    client: ClientId(1),
+                    req_id: ReqId(r() % 10),
+                    range: Box::new(Range {
+                        lo: Bound::Unbounded,
+                        hi: Bound::Unbounded,
+                        reverse: r().is_multiple_of(2),
+                        after: None,
+                        max_entries: (r() % 40) as usize,
+                        max_bytes: 1 << 16,
+                    }),
+                },
+                2 => {
+                    let id = ids[(r() % ids.len() as u64) as usize];
+                    Event::BlockArrived {
+                        id,
+                        bytes: all.get(&id).expect("held").to_vec(),
+                    }
+                }
+                3 => Event::BlockArrived {
+                    id: [(r() % 251) as u8; 32],
+                    bytes: vec![(r() % 251) as u8; (r() % 200) as usize],
+                },
+                4 => Event::BlockMissed(ids[(r() % ids.len() as u64) as usize]),
+                _ => Event::Preload {
+                    client: ClientId(1),
+                    roots: vec![root, [(r() % 251) as u8; 32]],
+                },
+            };
+            let _ = e.step(ev);
+            cases += 1;
+        }
+    }
+    assert!(cases >= 1500, "only {cases} events were driven");
+    println!("  {cases} read events across 20 seeds, no panic");
+}
