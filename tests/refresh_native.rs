@@ -12,12 +12,7 @@
 //! context, the same node underneath.
 
 use craftworks_sdk::{Answer, CachedStore, Loads, Refresh, Store as _};
-use engine_delegate::shell::{Inbound, Shell, StoreFacts};
-use freenet_prolly::store::Blocks;
-use freenet_prolly::Cid;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
+use engine_delegate::shell::Inbound;
 
 /// One head for every page: these tests do not move the tree, and a
 /// constant says so rather than leaving it to be inferred.
@@ -26,112 +21,10 @@ const AT: protocol::At = protocol::At {
     root: [1u8; 32],
 };
 
-#[derive(Clone, Default)]
-struct Node(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
-
-impl Blocks for Node {
-    fn get(&self, cid: &Cid) -> Option<&[u8]> {
-        self.0.borrow().get(cid).copied()
-    }
-}
-
-impl Node {
-    fn put(&self, id: Cid, bytes: &[u8]) {
-        if self.0.borrow().contains_key(&id) {
-            return;
-        }
-        let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
-        self.0.borrow_mut().insert(id, leaked);
-    }
-}
-
-/// The head Register, shared by both clients, as the node holds it.
-#[derive(Clone, Default)]
-struct Head(Rc<RefCell<Option<(u64, Cid)>>>);
-
-/// THE DELEGATE, as a node has it: ONE of them.
-///
-/// Two tabs on one node invoke the same delegate — same code, same
-/// parameters, so the same key — and it is rebuilt from its context on every
-/// call (F32). MEASURED: two separate websocket connections to one node
-/// share that context. `probe/src/bin/two-connections.rs` counts calls in the
-/// context and connection B's first call continued connection A's count
-/// (6 after A reached 5), with A's next call seeing 7, while `calls_in_memory`
-/// stayed 1 on both as the control requires.
-///
-/// So two tabs are served by ONE engine state, and `Conn` is shared.
-#[derive(Clone)]
-struct Conn(Rc<RefCell<ConnState>>);
-
-struct ConnState {
-    node: Node,
-    head: Head,
-    ctx: Vec<u8>,
-}
-
-impl Conn {
-    fn new(node: &Node, head: &Head) -> Conn {
-        Conn(Rc::new(RefCell::new(ConnState {
-            node: node.clone(),
-            head: head.clone(),
-            ctx: Vec::new(),
-        })))
-    }
-
-    fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
-        let (ctx, node) = {
-            let s = self.0.borrow();
-            (s.ctx.clone(), s.node.clone())
-        };
-        let mut shell: Shell<Node> = Shell::resume_with(
-            &ctx,
-            engine::Params::default(),
-            node,
-            StoreFacts::provisioned(),
-        );
-        let out = shell.handle(inbound);
-        self.0.borrow_mut().ctx = shell.to_context().expect("a context after every call");
-        let mut next = Vec::new();
-        for op in out.ops {
-            match op {
-                engine_delegate::schedule::Op::Put { id, bytes } => {
-                    self.0.borrow().node.put(id, &bytes);
-                    next.push(Inbound::PutAcked { id, ok: true });
-                }
-                engine_delegate::schedule::Op::Get { id, .. } => {
-                    let held = self.0.borrow().node.get(&id).map(|b| b.to_vec());
-                    next.push(Inbound::GotState { id, bytes: held });
-                }
-                engine_delegate::schedule::Op::Head { seq, root } => {
-                    let head = self.0.borrow().head.clone();
-                    let mut h = head.0.borrow_mut();
-                    if h.is_none_or(|(s, _)| seq > s) {
-                        *h = Some((seq, root));
-                    }
-                    let (seq, root) = h.expect("just written");
-                    drop(h);
-                    next.push(Inbound::GotHead { seq, root });
-                }
-                engine_delegate::schedule::Op::ReadHead { .. } => {
-                    match *self.0.borrow().head.0.borrow() {
-                        Some((seq, root)) => next.push(Inbound::GotHead { seq, root }),
-                        None => next.push(Inbound::NoHead),
-                    }
-                }
-            }
-        }
-        let mut replies = out.replies;
-        if !next.is_empty() {
-            replies.extend(self.step(next));
-        }
-        replies
-    }
-}
-
 /// A client: a `CachedStore` whose traffic crosses a real engine.
 struct Client {
     store: CachedStore,
-    conn: Conn,
+    conn: testkit::Conn,
     /// Every `ChangesSince` this client sent. The measurement.
     asks: usize,
 }
@@ -155,16 +48,16 @@ fn key(n: u32) -> Vec<u8> {
 
 impl Client {
     /// A client with its OWN delegate context: a second DEVICE.
-    fn new(node: &Node, head: &Head) -> Client {
-        Client::on(Conn::new(node, head))
+    fn new(node: &testkit::FullNode) -> Client {
+        Client::on(node.connect())
     }
 
     /// A client sharing a delegate context: a second TAB on one node.
-    fn tab(conn: Conn) -> Client {
+    fn tab(conn: testkit::Conn) -> Client {
         Client::on(conn)
     }
 
-    fn on(conn: Conn) -> Client {
+    fn on(conn: testkit::Conn) -> Client {
         let mut c = Client {
             store: testkit::cached_store().0,
             conn,
@@ -359,9 +252,9 @@ impl Client {
 #[test]
 #[ignore = "TWO DEVICES, not two tabs: an engine does not adopt a head it did not write (sdk#78, phase 6)"]
 fn a_second_device_does_not_see_the_first_ones_write() {
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = Client::new(&node, &head); // its OWN context
-    let mut b = Client::new(&node, &head); // and its own
+    let node = testkit::FullNode::new();
+    let mut a = Client::new(&node); // its OWN context
+    let mut b = Client::new(&node); // and its own
 
     b.load();
     assert_eq!(b.rows(), 0);
@@ -384,9 +277,9 @@ fn a_second_device_does_not_see_the_first_ones_write() {
 /// itself — and the whole point is that reading alone never can.
 #[test]
 fn control_a_client_that_never_asks_sees_nothing_new() {
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = Client::new(&node, &head);
-    let mut b = Client::new(&node, &head);
+    let node = testkit::FullNode::new();
+    let mut a = Client::new(&node);
+    let mut b = Client::new(&node);
 
     b.load();
     assert_eq!(b.rows(), 0);
@@ -409,8 +302,8 @@ fn control_a_client_that_never_asks_sees_nothing_new() {
 /// connections. Measured, not assumed — see `Conn`.
 #[test]
 fn two_tabs_on_one_node_see_each_others_writes() {
-    let (node, head) = (Node::default(), Head::default());
-    let conn = Conn::new(&node, &head);
+    let node = testkit::FullNode::new();
+    let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn.clone());
 
@@ -441,8 +334,8 @@ fn two_tabs_on_one_node_see_each_others_writes() {
 /// THE CONTROL for the tab case: without asking, B sees nothing.
 #[test]
 fn control_a_tab_that_never_asks_sees_nothing_new() {
-    let (node, head) = (Node::default(), Head::default());
-    let conn = Conn::new(&node, &head);
+    let node = testkit::FullNode::new();
+    let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn.clone());
 

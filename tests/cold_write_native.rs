@@ -21,90 +21,12 @@
 //! is nothing loaded to read.
 
 use craftworks_sdk::{decide, CachedStore, Loads, Outcome};
-use engine_delegate::shell::{Inbound, Shell, StoreFacts};
-use freenet_prolly::store::Blocks;
-use freenet_prolly::Cid;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
+use engine_delegate::shell::Inbound;
 
 const AT: protocol::At = protocol::At {
     seq: 1,
     root: [1u8; 32],
 };
-
-#[derive(Clone, Default)]
-struct Node(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
-
-impl Blocks for Node {
-    fn get(&self, cid: &Cid) -> Option<&[u8]> {
-        self.0.borrow().get(cid).copied()
-    }
-}
-
-impl Node {
-    fn put(&self, id: Cid, bytes: &[u8]) {
-        if self.0.borrow().contains_key(&id) {
-            return;
-        }
-        let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
-        self.0.borrow_mut().insert(id, leaked);
-    }
-}
-
-#[derive(Clone, Default)]
-struct Head(Rc<RefCell<Option<(u64, Cid)>>>);
-
-/// The delegate, rebuilt from its context on every call (F32).
-struct Conn {
-    node: Node,
-    head: Head,
-    ctx: Vec<u8>,
-}
-
-impl Conn {
-    fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
-        let mut shell: Shell<Node> = Shell::resume_with(
-            &self.ctx,
-            engine::Params::default(),
-            self.node.clone(),
-            StoreFacts::provisioned(),
-        );
-        let out = shell.handle(inbound);
-        self.ctx = shell.to_context().expect("a context after every call");
-        let mut next = Vec::new();
-        for op in out.ops {
-            match op {
-                engine_delegate::schedule::Op::Put { id, bytes } => {
-                    self.node.put(id, &bytes);
-                    next.push(Inbound::PutAcked { id, ok: true });
-                }
-                engine_delegate::schedule::Op::Get { id, .. } => {
-                    let held = self.node.get(&id).map(|b| b.to_vec());
-                    next.push(Inbound::GotState { id, bytes: held });
-                }
-                engine_delegate::schedule::Op::Head { seq, root } => {
-                    let mut h = self.head.0.borrow_mut();
-                    if h.is_none_or(|(s, _)| seq > s) {
-                        *h = Some((seq, root));
-                    }
-                    let (seq, root) = h.expect("just written");
-                    drop(h);
-                    next.push(Inbound::GotHead { seq, root });
-                }
-                engine_delegate::schedule::Op::ReadHead { .. } => match *self.head.0.borrow() {
-                    Some((seq, root)) => next.push(Inbound::GotHead { seq, root }),
-                    None => next.push(Inbound::NoHead),
-                },
-            }
-        }
-        let mut replies = out.replies;
-        if !next.is_empty() {
-            replies.extend(self.step(next));
-        }
-        replies
-    }
-}
 
 type Db = craftworks_sdk::Db<CachedStore, craftworks_sdk::SystemEnv>;
 
@@ -112,7 +34,7 @@ type Db = craftworks_sdk::Db<CachedStore, craftworks_sdk::SystemEnv>;
 struct Page {
     db: Db,
     loads: Loads,
-    conn: Conn,
+    conn: testkit::Conn,
     /// Range requests this page has sent. The measurement: a parked call must
     /// ASK for what it is waiting on, or the wait is for ever.
     requests: usize,
@@ -127,11 +49,7 @@ impl Page {
                 [7u8; 4],
             ),
             loads: Loads::new(),
-            conn: Conn {
-                node: Node::default(),
-                head: Head::default(),
-                ctx: Vec::new(),
-            },
+            conn: testkit::FullNode::new().connect(),
             requests: 0,
         };
         // START THE ENGINE, exactly as a session does: `Identity` is what

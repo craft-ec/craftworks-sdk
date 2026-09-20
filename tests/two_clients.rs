@@ -12,107 +12,11 @@
 //! be evicted at the cap without anyone being told. The backstop is what makes
 //! a binding correct, and it has its own test here.
 
-use craftworks_sdk::{Binding, EngineStore, LiveMode, Store as _, Transport};
-use engine_delegate::shell::{Inbound, Shell, StoreFacts};
-use freenet_prolly::store::Blocks;
-use freenet_prolly::Cid;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use craftworks_sdk::{Binding, EngineStore, LiveMode, Store as _};
 use std::rc::Rc;
 
-/// The node's block store, shared by both clients.
-#[derive(Clone, Default)]
-struct Node(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
-
-impl Blocks for Node {
-    fn get(&self, cid: &Cid) -> Option<&[u8]> {
-        self.0.borrow().get(cid).copied()
-    }
-}
-
-impl Node {
-    fn put(&self, id: Cid, bytes: &[u8]) {
-        if self.0.borrow().contains_key(&id) {
-            return;
-        }
-        let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
-        self.0.borrow_mut().insert(id, leaked);
-    }
-}
-
-/// The head Register, as the node holds it: one per key, shared.
-#[derive(Clone, Default)]
-struct Head(Rc<RefCell<Option<(u64, Cid)>>>);
-
-/// One client's connection: its own delegate context over the shared node.
-struct Conn {
-    node: Node,
-    head: Head,
-    ctx: Vec<u8>,
-}
-
-impl Conn {
-    fn new(node: Node, head: Head) -> Conn {
-        Conn {
-            node,
-            head,
-            ctx: Vec::new(),
-        }
-    }
-
-    fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
-        let mut shell: Shell<Node> = Shell::resume_with(
-            &self.ctx,
-            engine::Params::default(),
-            self.node.clone(),
-            StoreFacts::provisioned(),
-        );
-        let out = shell.handle(inbound);
-        self.ctx = shell.to_context().expect("a context after every call");
-        assert_eq!(out.stranded, 0, "the shell stranded effects");
-        let mut next = Vec::new();
-        for op in out.ops {
-            match op {
-                engine_delegate::schedule::Op::Put { id, bytes } => {
-                    self.node.put(id, &bytes);
-                    next.push(Inbound::PutAcked { id, ok: true });
-                }
-                engine_delegate::schedule::Op::Get { id, .. } => {
-                    let held = self.node.get(&id).map(|b| b.to_vec());
-                    next.push(Inbound::GotState { id, bytes: held });
-                }
-                engine_delegate::schedule::Op::Head { seq, root } => {
-                    // The node's Register takes the higher seq, as it does.
-                    let mut h = self.head.0.borrow_mut();
-                    if h.is_none_or(|(s, _)| seq > s) {
-                        *h = Some((seq, root));
-                    }
-                    let (seq, root) = h.expect("just written");
-                    drop(h);
-                    next.push(Inbound::GotHead { seq, root });
-                }
-                engine_delegate::schedule::Op::ReadHead { .. } => match *self.head.0.borrow() {
-                    Some((seq, root)) => next.push(Inbound::GotHead { seq, root }),
-                    None => next.push(Inbound::NoHead),
-                },
-            }
-        }
-        let mut replies = out.replies;
-        if !next.is_empty() {
-            replies.extend(self.step(next));
-        }
-        replies
-    }
-}
-
-impl Transport for Conn {
-    fn exchange(&mut self, request: &[u8]) -> Vec<Vec<u8>> {
-        self.step(vec![Inbound::Client(request.to_vec())])
-    }
-}
-
-fn client(node: &Node, head: &Head) -> EngineStore<Conn> {
-    let mut s = EngineStore::new(Conn::new(node.clone(), head.clone()));
+fn client(node: &testkit::FullNode) -> EngineStore<testkit::Conn> {
+    let mut s = EngineStore::new(node.connect());
     s.identity().expect("the engine answers who it is");
     s
 }
@@ -123,7 +27,7 @@ fn client(node: &Node, head: &Head) -> EngineStore<Conn> {
 /// `Changed` is a TRIGGER, and what it triggers is the same reload the
 /// backstop does. One code path means the rarely-exercised one is the one
 /// that runs all the time.
-fn pump(store: &mut EngineStore<Conn>, b: &mut Binding) -> usize {
+fn pump(store: &mut EngineStore<testkit::Conn>, b: &mut Binding) -> usize {
     let mut woken = 0;
     for e in store.take_events() {
         if let craftworks_sdk::EngineEvent::Changed { sub_id, .. } = e {
@@ -148,9 +52,9 @@ fn keys(b: &Binding) -> Vec<String> {
 /// A writes; B's list changes, and B never asked.
 #[test]
 fn a_write_on_one_client_updates_the_others_list_without_polling() {
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = client(&node, &head);
-    let mut b = client(&node, &head);
+    let node = testkit::FullNode::new();
+    let mut a = client(&node);
+    let mut b = client(&node);
 
     // A seeds the list.
     a.put(b"list/01", b"first");
@@ -202,9 +106,9 @@ fn a_write_on_one_client_updates_the_others_list_without_polling() {
 /// in a passing notification test would reveal.
 #[test]
 fn a_non_live_binding_takes_no_subscription_and_is_still_correct() {
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = client(&node, &head);
-    let mut b = client(&node, &head);
+    let node = testkit::FullNode::new();
+    let mut a = client(&node);
+    let mut b = client(&node);
 
     a.put(b"list/01", b"first");
 
@@ -243,9 +147,9 @@ fn a_non_live_binding_takes_no_subscription_and_is_still_correct() {
 /// more.
 #[test]
 fn a_live_binding_that_is_never_told_still_catches_up_on_its_tick() {
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = client(&node, &head);
-    let mut b = client(&node, &head);
+    let node = testkit::FullNode::new();
+    let mut a = client(&node);
+    let mut b = client(&node);
 
     a.put(b"list/01", b"first");
     let mut view = Binding::new(b"list/", b"list0", true);
@@ -281,9 +185,9 @@ fn a_live_binding_that_is_never_told_still_catches_up_on_its_tick() {
 /// number that decides whether it is affordable at all.
 #[test]
 fn the_backstops_quiet_tick_reads_nothing() {
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = client(&node, &head);
-    let mut b = client(&node, &head);
+    let node = testkit::FullNode::new();
+    let mut a = client(&node);
+    let mut b = client(&node);
     for i in 0..8u32 {
         a.put(format!("list/{i:02}").as_bytes(), b"v");
     }
@@ -338,8 +242,8 @@ fn the_backstops_quiet_tick_reads_nothing() {
 #[test]
 fn a_cold_writes_trace_shows_every_hop_and_the_client_times_it() {
     use protocol::{Step, TraceOf};
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = client(&node, &head);
+    let node = testkit::FullNode::new();
+    let mut a = client(&node);
 
     // A clock the test drives: one millisecond per reading, so an assertion
     // about a duration is an assertion about the number of hops rather than
@@ -404,8 +308,8 @@ fn a_cold_writes_trace_shows_every_hop_and_the_client_times_it() {
 #[test]
 fn nothing_is_traced_until_a_client_asks() {
     use protocol::TraceOf;
-    let (node, head) = (Node::default(), Head::default());
-    let mut a = client(&node, &head);
+    let node = testkit::FullNode::new();
+    let mut a = client(&node);
     a.put(b"list/01", b"first");
     assert!(
         a.trace(TraceOf::Write(1)).is_none(),
