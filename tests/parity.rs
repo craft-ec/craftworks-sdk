@@ -243,14 +243,34 @@ fn the_owed_parity_is_exactly_what_the_nodes_list() {
 fn owed_is_exactly_what_is_listed(store: &TreeStore, door: &str) {
     use std::collections::HashSet;
 
-    // Every parity id any node in the store lists. Superseded nodes included:
-    // they stay, and a reader can still be handed one.
+    // Every parity id the CURRENT tree lists. Superseded nodes are not
+    // included: they stay in the store, and a reader can still be handed one,
+    // but their groups' members have moved on — parity for them protects bytes
+    // nobody will ask for, and a writer that put it would pay for redundancy
+    // over a version of the tree nobody reads.
+    //
+    // Walked here from the root rather than asked of the store, so this and
+    // the store's own notion of "live" cannot share a mistake.
     let mut listed: HashSet<[u8; 32]> = HashSet::new();
     let mut nodes = 0;
-    for (_, bytes) in store.blocks() {
-        if let Ok(n) = Node::parse(bytes) {
-            nodes += 1;
-            listed.extend(n.parity());
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut stack = vec![store.root()];
+    while let Some(cid) = stack.pop() {
+        if !seen.insert(cid) {
+            continue;
+        }
+        let Some(bytes) = store.blocks().find(|(c, _)| **c == cid).map(|(_, b)| b) else {
+            continue;
+        };
+        let Ok(n) = Node::parse(bytes) else {
+            continue;
+        };
+        nodes += 1;
+        listed.extend(n.parity());
+        if !n.is_leaf() {
+            for i in 0..n.len() {
+                stack.push(n.child(i).0);
+            }
         }
     }
     assert!(nodes > 0, "{door}: no nodes to check");
@@ -468,4 +488,90 @@ fn taking_the_owed_parity_empties_it_and_every_door_agrees() {
         "the Db door coded no parity, so it was not tested"
     );
     owed_is_exactly_what_is_listed(db.store(), "Db::put");
+}
+
+/// Two writes touching one group leave ONE trio owed for it, not two.
+///
+/// Parity is a pure function of a group's members. When a later write
+/// re-codes a group, the trio coded for the earlier members is SUPERSEDED:
+/// it is redundancy for a version of the tree nobody will read. Keeping it
+/// owed means a writer draining the debt pays a PUT for every intermediate
+/// state of every hot key — which on a key written often is most of the
+/// writing it does.
+///
+/// The control runs. `prune_superseded_parity: false` is the state this
+/// store was actually in: the map only grew, and `owed_groups()` scanned
+/// every node it held, superseded ones included. The control asserts it
+/// really does keep both trios, so "one trio" is not one because nothing was
+/// coded at all.
+#[test]
+fn a_re_coded_group_leaves_one_trio_owed_not_two() {
+    use craftworks_sdk::tree_store::Options;
+
+    let big = |b: u8| vec![b; 1500];
+    let seed: Vec<(Vec<u8>, Edit)> = (0..24u32)
+        .map(|i| (format!("k/{i:03}").into_bytes(), Edit::Put(big(i as u8))))
+        .collect();
+
+    // Measured on the map a writer DRAINS -- `owed_parity()` / `take_owed()` --
+    // not on `owed_groups()`. The two surfaces fail differently and were fixed
+    // differently: `owed_groups()` derives from the nodes and so was always
+    // filtered to the live tree once it walked from the root, while the map is
+    // what actually hands blocks to a writer, and nothing dropped a superseded
+    // trio from it. Asserting on the filtered view would have shown both modes
+    // agreeing and reported the leak as fixed.
+    let owed_after_rewrites = |prune: bool| -> (usize, usize, usize) {
+        let mut store = TreeStore::with_options(Options {
+            prune_superseded_parity: prune,
+            ..Options::default()
+        });
+        store.apply_batch(&seed);
+        let after_seed = store.owed_parity();
+        // Rewrite ONE key twice: the group holding it is re-coded each time.
+        for v in [0xAAu8, 0xBB] {
+            store.apply_batch(&[(b"k/005".to_vec(), Edit::Put(big(v)))]);
+        }
+        (after_seed, store.owed_parity(), store.owed_groups().len())
+    };
+
+    let (seeded, pruned, groups_pruned) = owed_after_rewrites(true);
+    let (seeded_ctl, kept, groups_kept) = owed_after_rewrites(false);
+
+    assert!(
+        seeded > 0,
+        "the fixture coded no parity, so this tests nothing"
+    );
+    assert_eq!(
+        seeded, seeded_ctl,
+        "the two runs did not start from the same debt"
+    );
+    assert!(
+        kept > pruned,
+        "pruning changed nothing: {kept} block(s) owed either way, so either \
+         no group was re-coded or superseded trios are not being dropped"
+    );
+    // Two rewrites, one group re-coded each time: two trios superseded.
+    assert_eq!(
+        kept - pruned,
+        6,
+        "two rewrites should supersede exactly two trios (6 blocks); \
+         {} block(s) were left behind",
+        kept - pruned
+    );
+    // And every block still owed belongs to a group the tree lists.
+    assert_eq!(
+        pruned,
+        groups_pruned * 3,
+        "the map holds {pruned} block(s) but the tree lists {groups_pruned} \
+         group(s): some debt belongs to no live group"
+    );
+    assert!(
+        groups_kept * 3 < kept,
+        "the control's map should hold MORE than its live groups account for, \
+         or it is not leaking and is no control"
+    );
+    println!(
+        "  owed after seed {seeded} blocks, after two rewrites {pruned} \
+         (control keeps {kept} for the same {groups_kept} live group(s))"
+    );
 }
