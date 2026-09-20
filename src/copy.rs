@@ -254,6 +254,37 @@ impl Copy {
         }
     }
 
+    /// Stop answering for `[lo, hi)`: it is no longer known.
+    ///
+    /// For the case where the engine says it CANNOT compute a delta. The
+    /// range must then stop being answered from cache — a copy that kept
+    /// serving it would answer confidently from a version the engine has
+    /// just said it cannot reconcile. Told nothing, the next read says
+    /// `NotLoaded` and the range is fetched in full, which is the honest
+    /// outcome.
+    ///
+    /// PENDING WRITES SURVIVE. They are this client's own, not the engine's
+    /// account of anything, and dropping them would silently discard writes a
+    /// person made and can still see.
+    pub fn forget(&mut self, lo: &[u8], hi: &[u8]) {
+        let doomed: Vec<Vec<u8>> = self
+            .keys
+            .range(lo.to_vec()..hi.to_vec())
+            .filter(|(_, e)| e.pending.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in doomed {
+            if let Some(e) = self.keys.remove(&k) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(e.base.as_ref().map_or(0, |v| v.len()));
+            }
+        }
+        // And the interval itself: "loaded" is the claim that must go.
+        self.loaded
+            .retain(|(l, h)| !(l.as_slice() >= lo && h.as_slice() <= hi));
+    }
+
     /// Rows in `[lo, hi)`, or `None` if any of that range was never loaded.
     pub fn range(&self, lo: &[u8], hi: &[u8]) -> Option<Vec<(Vec<u8>, Visible)>> {
         if !self.range_loaded(lo, hi) {

@@ -95,6 +95,12 @@ pub struct Session {
     watching: bool,
     /// Domains this page has bound, so a head move can name what is stale.
     bound: std::collections::BTreeSet<String>,
+    /// Asking what changed, and which answer belongs to which domain.
+    ///
+    /// In the SDK, not here, so it can be tested against a real engine
+    /// rather than through a fake session written in JavaScript — which
+    /// compiles this file and runs none of it.
+    refresh: craftworks_sdk::Refresh,
     /// When the subscribe request went out, so an unanswered one does not sit
     /// at "asked" for ever.
     asked_at_ms: u64,
@@ -158,6 +164,7 @@ impl Session {
             watching: false,
             head_moved: false,
             bound: std::collections::BTreeSet::new(),
+            refresh: craftworks_sdk::Refresh::new(),
             asked_at_ms: 0,
             watch_refused: String::new(),
         })
@@ -245,6 +252,22 @@ impl Session {
                         // NOT recorded as loaded: an empty page here would
                         // say "this range is empty", which is a wrong answer
                         // wearing the shape of a right one.
+                        // WHAT CHANGED since this client last looked.
+                        Ok(protocol::Reply::Delta {
+                            req_id,
+                            changes,
+                            new_root,
+                            ..
+                        }) => self.on_delta(req_id, changes, new_root),
+                        // The delta could not be computed. The interval is
+                        // forgotten and re-requested in full, through the
+                        // ordinary load path so it is bounded and ticketed
+                        // like any other — NOT applied as if it were a delta,
+                        // which would record a range as current on the
+                        // strength of an answer that said it could not say.
+                        Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => {
+                            self.on_full_reload(req_id)
+                        }
                         Ok(protocol::Reply::Unavailable { req_id, .. }) => {
                             self.loads.on_unavailable(req_id)
                         }
@@ -457,11 +480,107 @@ impl Session {
     /// tick re-reads the root regardless — and a spurious one costs a reload.
     /// What it is NOT is a root: nothing here goes into the copy.
     pub fn take_stale(&mut self) -> String {
-        if !std::mem::take(&mut self.head_moved) {
-            return "[]".into();
+        if std::mem::take(&mut self.head_moved) {
+            // The head moved, so every bound domain is worth ASKING about.
+            // Asking is not the same as having changed: what a binding
+            // re-runs on is the ANSWER, which arrives as a `Delta`.
+            let domains: Vec<String> = self.bound.iter().cloned().collect();
+            for d in domains {
+                self.refresh(&d);
+            }
         }
-        let stale: Vec<&String> = self.bound.iter().collect();
-        serde_json::to_string(&stale).unwrap_or_else(|_| "[]".into())
+        let changed = self.refresh.take_changed();
+        serde_json::to_string(&changed).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Ask what changed in a domain since this client last saw it.
+    ///
+    /// **This is the refresh path, and for a while there was none.** A
+    /// binding's `reload` read the LOCAL COPY, whose root moves only when a
+    /// delta or a page arrives — and nothing sent `ChangesSince`, so the root
+    /// never moved, `reload` always answered "nothing changed", and a tab
+    /// that made no write could never see another's. The engine had the
+    /// mechanism, `CachedStore::on_delta` had the mechanism, and no line
+    /// joined them.
+    ///
+    /// The client sends the root IT last saw. That is what makes a missed
+    /// notification recoverable: however many were dropped, the gap closes in
+    /// one call.
+    fn refresh(&mut self, domain: &str) {
+        let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(domain);
+        if let Some(req) = self.refresh.ask(domain, &lo, &hi) {
+            self.db.store_mut().client.send(&req);
+        }
+    }
+
+    /// Local movement: rolled-back writes, in the domains that are bound.
+    ///
+    /// A component re-renders on its OWN write through the same drain as on
+    /// somebody else's. Without this a put changes `base + pending` but not
+    /// the root, so a bound component would not re-render on its own write
+    /// nor when it went PENDING -> CLEAN.
+    fn note_local(&mut self, told: &craftworks_sdk::Told) {
+        let bound: Vec<(String, Vec<u8>, Vec<u8>)> = self
+            .bound
+            .iter()
+            .map(|d| {
+                let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(d);
+                (d.clone(), lo, hi)
+            })
+            .collect();
+        let keys = told
+            .rolled_back_keys
+            .iter()
+            .chain(told.moved_under_pending.iter());
+        self.refresh.note_local(keys, |k| {
+            bound
+                .iter()
+                .find(|(_, lo, hi)| k >= &lo[..] && k < &hi[..])
+                .map(|(d, _, _)| d.clone())
+        });
+    }
+
+    /// A delta arrived: apply it through the copy.
+    fn on_delta(
+        &mut self,
+        req_id: u64,
+        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        new_root: [u8; 32],
+    ) {
+        match self.refresh.on_delta(req_id, changes, new_root) {
+            craftworks_sdk::Answer::Delta {
+                changes, new_root, ..
+            } => {
+                self.db.store_mut().on_delta(changes, new_root);
+            }
+            craftworks_sdk::Answer::NotOurs => self.foreign_notifications += 1,
+            craftworks_sdk::Answer::Reload { .. } => {}
+        }
+    }
+
+    /// The engine could not compute a delta: load the range again.
+    fn on_full_reload(&mut self, req_id: u64) {
+        let craftworks_sdk::Answer::Reload { domain } = self.refresh.on_full_reload(req_id) else {
+            self.foreign_notifications += 1;
+            return;
+        };
+        let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(&domain);
+        // FORGOTTEN, then re-requested through `Loads` -- ticketed and bounded
+        // like any other load. The copy must not keep answering from a range
+        // the engine has just said it cannot reconcile.
+        self.db.store_mut().copy.forget(&lo, &hi);
+        if let Some((id, send)) = self.loads.want(&lo, &hi, crate::js_now_ms()) {
+            if send {
+                self.db
+                    .store_mut()
+                    .client
+                    .send(&craftworks_sdk::Loads::range_request(id, &lo, &hi, None));
+            }
+        }
+    }
+
+    pub fn refresh_domain(&mut self, domain: &str) {
+        self.refresh(domain);
     }
 
     /// A domain this page is showing, so a head move can name it.
@@ -967,6 +1086,10 @@ impl Session {
     pub fn tick(&mut self) -> String {
         let now = crate::js_now_ms();
         let told = self.db.store_mut().copy.time_out(now);
+        // A LOCAL change is a change too: a write that rolled back moves the
+        // rows a component is showing, and the component finds out the same
+        // way it finds out about anybody else's.
+        self.note_local(&told);
         let stalled = self.plan.tick(now);
         // A load nobody answered ends as UNAVAILABLE rather than waiting for
         // ever. The read parked on it gets a fact; a page can show it.

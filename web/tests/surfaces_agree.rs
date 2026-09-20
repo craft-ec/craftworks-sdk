@@ -75,6 +75,10 @@ const TRANSPORT_ONLY: &[&str] = &[
     "take_stale",
     "bind",
     "unbind",
+    // Ask the engine what changed in a domain since this client last looked.
+    // An in-memory store IS the tree: nothing can have changed in it that
+    // this client did not do, so there is nothing to ask.
+    "refresh_domain",
 ];
 
 #[test]

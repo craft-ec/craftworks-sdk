@@ -41,6 +41,15 @@ const rethrow = e => {
   throw e;
 };
 
+/** Are these the same rows? By id and `updated`, as the in-memory one does. */
+const same = (a, b) => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id || a[i].updated !== b[i].updated) return false;
+  }
+  return true;
+};
+
 export function engineDb(handle) {
   // Either the object `openSession` returns, or a bare session. The wrapper
   // is what knows when a message arrived, so when there is one this registers
@@ -73,6 +82,16 @@ export function engineDb(handle) {
   // Bindings this app is showing, by domain, so a head move can re-run them.
   const bound = new Map();   // domain -> Set<callback>
 
+  // EVERY binding on a domain, live or not. Distinct from `bound`, which is
+  // only the LIVE ones — a plain binding takes out no watch, and that is the
+  // whole cost difference between them. But a plain binding must still see
+  // its own client's writes: `live` decides whether somebody ELSE'S change
+  // reaches you, never whether your own does.
+  const mine = new Map();    // domain -> Set<binding.reload>
+
+  /** This client changed `domain` itself: re-run every binding on it. */
+  const touched = domain => { for (const r of mine.get(domain) ?? []) r(); };
+
   /**
    * The head moved: re-run the bindings the SESSION says are stale.
    *
@@ -86,9 +105,9 @@ export function engineDb(handle) {
    * wearing a different name.
    */
   const reloadStale = () => {
-    let stale;
-    try { stale = JSON.parse(session.take_stale()); } catch (_) { return; }
-    for (const domain of stale) for (const cb of bound.get(domain) ?? []) cb();
+    let changed;
+    try { changed = JSON.parse(session.take_stale()); } catch (_) { return; }
+    for (const domain of changed) for (const cb of bound.get(domain) ?? []) cb();
   };
 
   /** Wait for the load this read is parked on. */
@@ -157,19 +176,33 @@ export function engineDb(handle) {
     }
   };
 
-  return {
+  // Named so `bind` can reach the surface it is part of.
+  const self = {
     // ---- writes: no reload can help, so they are not retried ----
     async define(domain, schema) {
       try { return session.define(domain, JSON.stringify(schema)); } catch (e) { rethrow(e); }
     },
     async put(domain, fields) {
-      try { return JSON.parse(session.put(domain, JSON.stringify(fields))); } catch (e) { rethrow(e); }
+      let r;
+      try { r = JSON.parse(session.put(domain, JSON.stringify(fields))); } catch (e) { rethrow(e); }
+      // A person's OWN write shows at once. It changes `base + pending` and
+      // not the root, so nothing else would tell this binding — and a row
+      // that appeared only after the network confirmed it would make the
+      // optimistic copy pointless.
+      touched(domain);
+      return r;
     },
     async update(domain, id, patch) {
-      try { return JSON.parse(session.update(domain, id, JSON.stringify(patch))); } catch (e) { rethrow(e); }
+      let r;
+      try { r = JSON.parse(session.update(domain, id, JSON.stringify(patch))); } catch (e) { rethrow(e); }
+      touched(domain);
+      return r;
     },
     async delete(domain, id) {
-      try { return session.delete(domain, id); } catch (e) { rethrow(e); }
+      let r;
+      try { r = session.delete(domain, id); } catch (e) { rethrow(e); }
+      touched(domain);
+      return r;
     },
 
     // ---- reads: a NOT_LOADED queues a load, waits for it, asks once more ----
@@ -179,6 +212,77 @@ export function engineDb(handle) {
     count:   d       => once(() => session.count(d)),
     scan: (domain, { reverse = false, limit = 0, after = "" } = {}) =>
       once(() => JSON.parse(session.scan(domain, reverse, limit, after))),
+
+    /**
+     * A BINDING: one domain, as a component consumes it.
+     *
+     * The same shape the in-memory `Db` gives — `subscribe`, a referentially
+     * stable `getSnapshot`, an awaited `reload` — because "Publish switches
+     * the backend and the app code does not change" has to be true of the
+     * object a component actually holds, not only of the database it came
+     * from.
+     *
+     * It was NOT true. `engineDb` had no `bind` at all, so a published
+     * project threw `db.bind is not a function` the moment it rendered. The
+     * surface gate did not see it: that compares the two WASM objects, and
+     * `bind` lives on the JavaScript wrapper.
+     *
+     * `live` is the only difference, and it is a declaration, not a mode: a
+     * live binding is re-run when the head moves, a plain one when it is
+     * reloaded. Both have the same snapshot and the same subscribe, so
+     * flipping it never changes the component.
+     */
+    bind(domain, { live = false } = {}) {
+      let rows = [], root = null;
+      const listeners = new Set();
+      const b = {
+        get live() { return live; },
+        // The SAME array until the rows change: a caller re-rendering on
+        // every identity change would re-render for ever otherwise.
+        getSnapshot: () => rows,
+        subscribe: cb => { listeners.add(cb); return () => listeners.delete(cb); },
+        /**
+         * Bring the rows up to date.
+         *
+         * It ASKS. The first version compared the copy's root and returned
+         * early when it had not moved — and the copy's root moves only when a
+         * delta or a page arrives, so a reload that only read could never
+         * show anything new. Nothing sent `ChangesSince`, so the root never
+         * moved, and a tab that made no write could never see another's.
+         *
+         * The answer comes back through `drain`, which re-runs this binding
+         * if the delta moved anything. So this returns whether the ROWS THIS
+         * CLIENT CAN SEE changed — which includes its own pending writes,
+         * because those are visible before any engine has confirmed them.
+         */
+        async reload() {
+          session.refresh_domain(domain);
+          const next = await self.scan(domain);
+          root = self.root();
+          if (same(rows, next)) return false;
+          rows = next;
+          for (const cb of listeners) cb();
+          return true;
+        },
+      };
+      // Its own client's writes reach it whatever `live` says.
+      const rerun = () => { b.reload(); };
+      if (!mine.has(domain)) mine.set(domain, new Set());
+      mine.get(domain).add(rerun);
+
+      // A LIVE binding is additionally re-run when the session says this
+      // domain is stale — that is, when somebody else changed it. A plain one
+      // takes out no watch at all, which is the whole cost difference.
+      const unwatch = live ? self.watch(domain, rerun) : null;
+      b.stop = () => {
+        unwatch?.();
+        const set = mine.get(domain);
+        set?.delete(rerun);
+        if (set && set.size === 0) mine.delete(domain);
+      };
+      b.reload();
+      return b;
+    },
 
     /**
      * Watch a domain: `cb` runs when the head moves and this domain is
@@ -244,4 +348,5 @@ export function engineDb(handle) {
     trace: () => JSON.parse(session.trace()),
     traceOn: on => session.trace_on(on),
   };
+  return self;
 }
