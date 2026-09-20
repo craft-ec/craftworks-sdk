@@ -364,6 +364,44 @@ impl Session {
         }
     }
 
+    /// A WRITE THAT HAD TO READ BEFORE IT COULD APPLY.
+    ///
+    /// Every write in this file reads first: `define` reads the existing
+    /// schema to check the new one against it, and `put`, `update` and
+    /// `delete` all go through `need_schema`. `update` and `delete` read the
+    /// record as well. So all four can fail with `NotLoaded`, and that
+    /// failure means **"I could not read what I needed in order to apply
+    /// this"** — never "this write is invalid".
+    ///
+    /// The difference is the whole bug. Unparked, `define` returned a
+    /// TICKETLESS `NotLoaded` that nothing could retry, and a published app
+    /// was left with a form on screen, a button saying Published, and every
+    /// put refused with `domain has no schema; define it first` — for ever,
+    /// because the next mount ran the same cold define. Measured against a
+    /// real node: 120 of 120 writes refused (sdk#89).
+    ///
+    /// # Retrying cannot double-apply
+    ///
+    /// In `Db`, every one of these reads happens BEFORE the single
+    /// `self.write(...)` that mutates, and `write` either applies the whole
+    /// edit or fails having applied none of it. A `NotLoaded` from any of
+    /// them therefore leaves the tree untouched, so asking again once the
+    /// range is loaded repeats the attempt rather than the effect.
+    ///
+    /// This is `answer`'s sibling and deliberately not `answer` itself: a
+    /// write's return type is its own (`()`, `bool`, a `Record`), and
+    /// serializing it to a string here would change four wasm signatures to
+    /// share one helper.
+    fn applied<T>(&mut self, r: Result<T, DbError>) -> Result<T, JsValue> {
+        match r {
+            Ok(v) => {
+                self.loads.read_succeeded();
+                Ok(v)
+            }
+            Err(e) => Err(self.park(e)),
+        }
+    }
+
     /// Queue the load a `NotLoaded` needs, and return the error with its
     /// ticket on it.
     ///
@@ -884,7 +922,8 @@ impl Session {
     pub fn define(&mut self, domain: &str, schema: &str) -> Result<(), JsValue> {
         let s: craftworks_sdk::Schema =
             serde_json::from_str(schema).map_err(|e| db_err(&DbError::Refused(e.to_string())))?;
-        self.db.define(domain, &s).map_err(|e| db_err(&e))
+        let r = self.db.define(domain, &s);
+        self.applied(r)
     }
 
     pub fn schema(&mut self, domain: &str) -> Result<String, JsValue> {
@@ -899,13 +938,15 @@ impl Session {
 
     pub fn put(&mut self, domain: &str, fields: &str) -> Result<String, JsValue> {
         let f = fields_of(fields)?;
-        as_json(self.db.put(domain, &f))
+        let r = self.db.put(domain, &f);
+        json_of(self.applied(r)?)
     }
 
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
         let p = fields_of(patch)?;
         let k = rkey_of(id)?;
-        as_json(self.db.update(domain, &k, &p))
+        let r = self.db.update(domain, &k, &p);
+        json_of(self.applied(r)?)
     }
 
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
@@ -916,7 +957,8 @@ impl Session {
 
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
         let k = rkey_of(id)?;
-        self.db.delete(domain, &k).map_err(|e| db_err(&e))
+        let r = self.db.delete(domain, &k);
+        self.applied(r)
     }
 
     /// `after` is a record id or the empty string.
@@ -1189,6 +1231,14 @@ fn db_err(e: &DbError) -> JsValue {
     let _ = js_sys::Reflect::set(&o, &"message".into(), &e.to_string().into());
     let _ = js_sys::Reflect::set(&o, &"transient".into(), &e.is_transient().into());
     o.into()
+}
+
+/// Serialize a value already recovered from its `Result`.
+///
+/// `as_json` takes the `Result` and so decides what a failure MEANS; a write
+/// that reads has already had that decided by `applied`, which parks it.
+fn json_of<T: serde::Serialize>(v: T) -> Result<String, JsValue> {
+    serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
 }
 
 fn as_json<T: serde::Serialize>(r: Result<T, DbError>) -> Result<String, JsValue> {
