@@ -632,36 +632,60 @@ impl Session {
         }
     }
 
-    /// Load the ranges an app names on open, before it asks for them.
+    /// Load the DOMAINS an app names on open, before it asks for them.
     ///
-    /// The manifest is `[[lo, hi], ...]` as JSON. Each pair becomes one
-    /// range request on the pump; the answers arrive at the normal door and
-    /// land in the local copy, so a read that would have been `NOT_LOADED`
-    /// is answered from memory instead.
+    /// `manifest` is `["tasks", "notes"]` as JSON. Each domain becomes one
+    /// range request on the pump; the answers land in the local copy, so a
+    /// read that would have been `NOT_LOADED` is answered from memory.
     ///
-    /// Bounded, because it comes from a project file a person edits: a
-    /// manifest naming thousands of ranges would queue thousands of requests
-    /// before the first frame. Refused whole rather than truncated — a
-    /// silently shortened preload is a page that is mysteriously slow.
+    /// **Domains, not key ranges.** What a range is, is this crate's
+    /// business: a caller that built one would be encoding the key layout,
+    /// which is the thing this boundary exists to hide and which could then
+    /// never change without breaking every app that had hard-coded it.
+    ///
+    /// A domain that is NOT DEFINED is refused, not skipped. A manifest
+    /// naming a domain that does not exist is a project file that has
+    /// drifted, and quietly skipping it makes the page mysteriously slow
+    /// instead of telling anybody it is wrong.
+    ///
+    /// Bounded, because it comes from a file a person edits — and refused
+    /// WHOLE rather than truncated, because a silently shortened preload is
+    /// a page that is mysteriously slow for a different reason.
     pub fn preload(&mut self, manifest: &str) -> Result<usize, JsValue> {
-        const MAX_RANGES: usize = 64;
-        let ranges: Vec<(String, String)> = serde_json::from_str(manifest)
+        const MAX_DOMAINS: usize = 64;
+        let domains: Vec<String> = serde_json::from_str(manifest)
             .map_err(|e| db_err(&DbError::Refused(format!("preload manifest: {e}"))))?;
-        if ranges.len() > MAX_RANGES {
+        if domains.len() > MAX_DOMAINS {
             return Err(db_err(&DbError::TooLarge(format!(
-                "preload names {} ranges and the limit is {MAX_RANGES}",
-                ranges.len()
+                "preload names {} domains and the limit is {MAX_DOMAINS}",
+                domains.len()
             ))));
         }
-        for (i, (lo, hi)) in ranges.iter().enumerate() {
-            self.db.store_mut().request_range(
-                PRELOAD_REQ_BASE + i as u64,
-                lo.as_bytes(),
-                hi.as_bytes(),
-                0,
-            );
+        // CHECKED BEFORE ANYTHING IS SENT, so a manifest with one bad name
+        // does not leave half its ranges requested and half refused — the
+        // caller would have no way to tell which half.
+        for d in &domains {
+            match self.db.schema(d) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(db_err(&DbError::NotDefined(format!(
+                        "preload names `{d}`, which this project does not define"
+                    ))))
+                }
+                // The schema itself is not loaded yet. Not an error and not a
+                // reason to refuse the manifest: reading it is exactly what
+                // opening the project is about to do.
+                Err(e) if e.code() == "NOT_LOADED" => {}
+                Err(e) => return Err(db_err(&e)),
+            }
         }
-        Ok(ranges.len())
+        for (i, d) in domains.iter().enumerate() {
+            let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(d);
+            self.db
+                .store_mut()
+                .request_range(PRELOAD_REQ_BASE + i as u64, &lo, &hi, 0);
+        }
+        Ok(domains.len())
     }
 
     /// The call tree of the last operation, in the instrument VOCABULARY.
