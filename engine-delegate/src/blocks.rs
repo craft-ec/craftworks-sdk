@@ -24,12 +24,30 @@ use std::collections::BTreeMap;
 /// The cache is also what keeps a descent honest: without it, reading one
 /// node twice in a call could give two different answers, and the tree would
 /// appear to change under the apply.
+/// The contract instance a block lives in.
+///
+/// A block's cid is the Block contract's PARAMS — `blake3(kind ‖ body)` — and
+/// the instance id is derived by the node from the code AND the params, so
+/// the two are different 32-byte values.
+pub fn contract_for(code: &[u8], cid: &Cid) -> [u8; 32] {
+    use freenet_stdlib::prelude::*;
+    let c = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(code.to_vec())),
+        Parameters::from(cid.to_vec()),
+    )));
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&c.key().id().as_bytes()[..32]);
+    out
+}
+
 pub struct NodeBlocks<'a> {
     /// Borrowed immutably: `get_contract_state` takes `&self`, so the ctx is
     /// still free to be written at the end of the call. A `&mut` here would
     /// hold the borrow for the shell's whole lifetime and leave nowhere to
     /// save the context from.
     ctx: &'a DelegateCtx,
+    /// The Block contract's code, needed to name the contract a block is in.
+    code: Option<Vec<u8>>,
     seen: RefCell<BTreeMap<Cid, Option<&'static [u8]>>>,
     /// Sync reads made, so a call can report what it cost.
     reads: RefCell<usize>,
@@ -37,8 +55,13 @@ pub struct NodeBlocks<'a> {
 
 impl<'a> NodeBlocks<'a> {
     pub fn new(ctx: &'a DelegateCtx) -> Self {
+        Self::with_code(ctx, None)
+    }
+
+    pub fn with_code(ctx: &'a DelegateCtx, code: Option<Vec<u8>>) -> Self {
         NodeBlocks {
             ctx,
+            code,
             seen: RefCell::new(BTreeMap::new()),
             reads: RefCell::new(0),
         }
@@ -55,11 +78,23 @@ impl Blocks for NodeBlocks<'_> {
             return *hit;
         }
         *self.reads.borrow_mut() += 1;
-        // The Block contract's parameters are the hash of its state, so a
-        // block's id IS its contract instance id. That equality is what lets
-        // the engine name a block and the node find a contract.
-        let got = self.ctx.get_contract_state(cid);
-        let leaked: Option<&'static [u8]> = got.map(|v| &*Box::leak(v.into_boxed_slice()));
+        // The engine names a BLOCK; the node names a CONTRACT. A block's cid
+        // is that contract's PARAMS, so the instance id is derived from the
+        // cid and the Block code together — never the cid itself. Passing the
+        // cid straight in asks for a contract that does not exist, and the
+        // node answers None to every block for ever: the engine then sees a
+        // tree it cannot read, which is indistinguishable from a node that
+        // holds nothing.
+        let Some(code) = self.code.as_deref() else {
+            self.seen.borrow_mut().insert(*cid, None);
+            return None;
+        };
+        let got = self.ctx.get_contract_state(&contract_for(code, cid));
+        // The contract's state is `kind ‖ body`; the engine wants the body.
+        let leaked: Option<&'static [u8]> = got.and_then(|v| {
+            let body = v.get(1..)?.to_vec();
+            Some(&*Box::leak(body.into_boxed_slice()) as &'static [u8])
+        });
         self.seen.borrow_mut().insert(*cid, leaked);
         leaked
     }

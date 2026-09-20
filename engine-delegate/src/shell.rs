@@ -19,7 +19,7 @@ use engine::read::Via;
 use engine::{Effect, Engine, Event, KeySource, Params};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// What arrived this call.
 #[derive(Debug)]
@@ -30,6 +30,14 @@ pub enum Inbound {
     GotState { id: Cid, bytes: Option<Vec<u8>> },
     /// A PUT was ACKNOWLEDGED. This is not a confirmation of anything.
     PutAcked { id: Cid, ok: bool },
+    /// The head's own PUT was acknowledged.
+    ///
+    /// Not a confirmation, by the same rule as a block: the head is read back
+    /// before the commit publishes. It arrives as a PutContractResponse like
+    /// any other, and only the entry point can tell that the contract it
+    /// names is the Register — so it says so here rather than leaving the
+    /// shell to treat the head as a block it has never heard of.
+    HeadAcked { ok: bool },
     /// The head Register was read, and holds this.
     ///
     /// The same read-back rule as a block: writing the head is acknowledged,
@@ -48,6 +56,12 @@ pub enum Inbound {
 pub struct Outbound {
     pub ops: Vec<Op>,
     pub replies: Vec<Vec<u8>>,
+    /// Blocks put and not yet read back, at the end of the call.
+    pub awaiting: usize,
+    /// Puts confirmed by reading them back.
+    pub read_back_hits: usize,
+    /// Effects the core returned this call, before scheduling.
+    pub effects: usize,
     /// Puts dropped because the delegate has no contract code yet.
     ///
     /// Counted, not silent: a client that never sent `Install` would
@@ -72,10 +86,19 @@ pub struct Outbound {
 /// here needs to carry bytes.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ShellState {
-    /// Put, acknowledged, and not yet read back.
-    awaiting: Vec<Cid>,
+    /// Put, acknowledged, and not yet read back, with the rounds spent.
+    awaiting: Vec<(Cid, u32)>,
     /// A head written and not yet read back, with the root it named.
     head: Option<(u64, Cid)>,
+    /// Contract id -> the block id the engine knows it by, for requests that
+    /// are still out.
+    ///
+    /// A request is issued in one call and answered in the NEXT, and a
+    /// response names the contract while the engine named the block. Nothing
+    /// can recover one from the other — the contract id is a hash of the code
+    /// AND the params — so the pairing is remembered. Bounded, because an
+    /// unbounded map of them is a context that grows with traffic.
+    outstanding: Vec<(Cid, Cid)>,
 }
 
 /// The whole shell context: the engine's, and the shell's own.
@@ -85,14 +108,23 @@ struct Carried {
     shell: ShellState,
 }
 
+/// How many times a put is asked back for before its ack is disbelieved.
+///
+/// A put is readable a short time after it is acknowledged, not instantly, so
+/// the first empty answer means "not yet" far more often than "never".
+const MAX_READ_BACK_ROUNDS: u32 = 12;
+
 pub struct Shell<B: Blocks> {
     pub engine: Engine<B>,
-    awaiting: BTreeSet<Cid>,
+    awaiting: BTreeMap<Cid, u32>,
     head: Option<(u64, Cid)>,
+    outstanding: Vec<(Cid, Cid)>,
     /// Bytes of contract code this call was asked to install, if any.
     pub installed: Option<usize>,
     /// Whether a signing key has been provisioned this call.
     pub provisioned: bool,
+    /// Puts confirmed by a read-back this call.
+    pub read_back_hits: usize,
     /// Whether the delegate has the contract code it writes with.
     ///
     /// Supplied by the entry point from the secret store, because only the
@@ -120,23 +152,26 @@ impl<B: Blocks> Shell<B> {
         // same outcome: start fresh. Never a panic — these bytes come from
         // the node's cache, and a delegate a malformed context can take down
         // is one anybody can take down.
-        let (engine_ctx, awaiting, head) = match carried {
+        let (engine_ctx, awaiting, head, outstanding) = match carried {
             Some(c) => (
                 c.engine,
                 c.shell.awaiting.into_iter().collect(),
                 c.shell.head,
+                c.shell.outstanding,
             ),
-            None => (Vec::new(), BTreeSet::new(), None),
+            None => (Vec::new(), BTreeMap::new(), None, Vec::new()),
         };
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         Shell {
             engine,
             // Ids to read back belong to a commit the engine no longer has if
             // it did not resume, so they go with it.
-            awaiting: if resumed { awaiting } else { BTreeSet::new() },
+            awaiting: if resumed { awaiting } else { BTreeMap::new() },
             head: if resumed { head } else { None },
+            outstanding: if resumed { outstanding } else { Vec::new() },
             installed: None,
             provisioned: false,
+            read_back_hits: 0,
             has_code,
             limits: Limits::default(),
         }
@@ -147,8 +182,9 @@ impl<B: Blocks> Shell<B> {
         bincode::serialize(&Carried {
             engine,
             shell: ShellState {
-                awaiting: self.awaiting.iter().copied().collect(),
+                awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
                 head: self.head,
+                outstanding: self.outstanding.clone(),
             },
         })
         .ok()
@@ -179,6 +215,7 @@ impl<B: Blocks> Shell<B> {
                     self.on_got(id, bytes, &mut sched)
                 }
                 Inbound::PutAcked { id, ok } => self.on_acked(id, ok, &mut sched),
+                Inbound::HeadAcked { ok } => self.on_head_acked(ok, &mut sched),
                 Inbound::GotHead { seq, root } => self.on_head(Some((seq, root))),
                 Inbound::NoHead => self.on_head(None),
                 Inbound::Other => {
@@ -191,6 +228,7 @@ impl<B: Blocks> Shell<B> {
             // a node response — which is all of them after `Accepted`, so a
             // write published and the client was never told.
             self.reply_from(&effects, &mut out);
+            out.effects += effects.len();
             sched.offer(effects);
         }
 
@@ -215,6 +253,8 @@ impl<B: Blocks> Shell<B> {
             }
         }
         out.stranded = sched.ready_len() + sched.held_len();
+        out.awaiting = self.awaiting.len();
+        out.read_back_hits = self.read_back_hits;
         out
     }
 
@@ -278,42 +318,111 @@ impl<B: Blocks> Shell<B> {
     /// READ BACK this id, its arrival is what makes the put durable enough to
     /// call confirmed. Either way the bytes are a block the core may be
     /// waiting on, so they also become `BlockArrived`.
-    fn on_got(&mut self, id: Cid, bytes: Option<Vec<u8>>, _s: &mut Scheduler) -> Vec<Effect> {
+    fn on_got(&mut self, id: Cid, bytes: Option<Vec<u8>>, s: &mut Scheduler) -> Vec<Effect> {
         let mut effects = Vec::new();
         match bytes {
             Some(b) => {
-                if self.awaiting.remove(&id) {
+                if self.awaiting.remove(&id).is_some() {
                     // THE read-back. Only this produces PutConfirmed.
+                    s.confirm(id);
                     effects.extend(self.engine.step(Event::PutConfirmed(id)));
                 }
                 effects.extend(self.engine.step(Event::BlockArrived { id, bytes: b }));
             }
             None => {
-                if self.awaiting.contains(&id) {
-                    // Put, acknowledged, and not there. The ack was not a
-                    // promise and this is the proof.
+                // The sync read again before believing a miss: a GET that
+                // came back empty and a node that does not hold it are
+                // different claims, and only the second one matters.
+                if self.awaiting.contains_key(&id) && self.engine.blocks().get(&id).is_some() {
                     self.awaiting.remove(&id);
-                    effects.extend(self.engine.step(Event::PutFailed(id)));
-                } else {
-                    effects.extend(self.engine.step(Event::BlockMissed(id)));
+                    self.read_back_hits += 1;
+                    s.confirm(id);
+                    return self.engine.step(Event::PutConfirmed(id));
+                }
+                match self.awaiting.get(&id).copied() {
+                    // An empty read-back is NOT proof the bytes are absent.
+                    //
+                    // The node acknowledged the put, and a put is readable a
+                    // short time later rather than instantly — measured at
+                    // +50 ms, and asked for here at +0. Treating the first
+                    // empty answer as a failure reported a write dead that
+                    // had in fact landed, which is the same false statement
+                    // `Failed` exists to avoid, arrived at from the other
+                    // side.
+                    //
+                    // So it is ASKED AGAIN, a bounded number of times. The
+                    // bound counts ROUNDS, not misses, for the usual reason:
+                    // every round here is a completed request.
+                    Some(rounds) if rounds + 1 < MAX_READ_BACK_ROUNDS => {
+                        self.awaiting.insert(id, rounds + 1);
+                        s.offer(vec![Effect::FetchBlock {
+                            id,
+                            via: Via::Direct,
+                            attempt: rounds + 2,
+                        }]);
+                    }
+                    // Out of rounds. NOW the ack is disbelieved.
+                    Some(_) => {
+                        self.awaiting.remove(&id);
+                        effects.extend(self.engine.step(Event::PutFailed(id)));
+                    }
+                    None => effects.extend(self.engine.step(Event::BlockMissed(id))),
                 }
             }
         }
         effects
     }
 
-    /// A PUT was acknowledged. Ask for it back; do not believe it.
+    /// A PUT was acknowledged. Read it back; do not believe the ack.
+    ///
+    /// The read-back is the SYNC read (F14), not a GET. It asks the node what
+    /// it holds right now, costs no round trip, and is the same call the
+    /// engine reads the tree through — so a block that answers it is a block
+    /// the engine can actually use, which is the property `Published` is
+    /// supposed to mean. A delegate-originated GET was the first attempt and
+    /// came back empty twelve times for a put the node had accepted without
+    /// complaint.
+    ///
+    /// If the sync read misses, the block may simply not be visible YET, so a
+    /// GET is issued as well — it fetches, and it also wakes this delegate
+    /// again, which nothing else will do once the client stops talking.
     fn on_acked(&mut self, id: Cid, ok: bool, s: &mut Scheduler) -> Vec<Effect> {
         if !ok {
             return self.engine.step(Event::PutFailed(id));
         }
-        self.awaiting.insert(id);
-        // The read-back GET is a shell operation: the core did not ask for
-        // this block and must not be told it is being fetched.
+        if self.engine.blocks().get(&id).is_some() {
+            self.read_back_hits += 1;
+            // The SCHEDULER must hear this too. It starts every call knowing
+            // nothing, so an effect that depends on this block — the head
+            // bump does — would be held and then lost with the call. The
+            // engine emits the head in the very step this confirmation is
+            // delivered, so the two must happen in that order, here.
+            s.confirm(id);
+            return self.engine.step(Event::PutConfirmed(id));
+        }
+        self.awaiting.insert(id, 0);
         s.offer(vec![Effect::FetchBlock {
             id,
             via: Via::Direct,
             attempt: 1,
+        }]);
+        Vec::new()
+    }
+
+    /// The head was acknowledged: now read it back.
+    ///
+    /// A `ReadHead` effect, so the read goes out the same way the engine's
+    /// own first read does and the entry point needs no second path for it.
+    fn on_head_acked(&mut self, ok: bool, s: &mut Scheduler) -> Vec<Effect> {
+        if !ok {
+            // The head did not even reach the node. The commit is not
+            // published and the engine is told nothing it could act on: the
+            // next entry re-reads the head and finds the old one.
+            self.head = None;
+            return Vec::new();
+        }
+        s.offer(vec![Effect::ReadHead {
+            epoch: wire::epoch(1),
         }]);
         Vec::new()
     }
@@ -375,5 +484,43 @@ impl<B: Blocks> Shell<B> {
     /// Ids put and not yet read back.
     pub fn awaiting(&self) -> usize {
         self.awaiting.len()
+    }
+
+    /// A request went out for `block` under contract id `contract`.
+    ///
+    /// Bounded at 64: enough for several calls' worth of outstanding
+    /// requests, and a cap rather than a hope. Dropping the oldest costs a
+    /// re-fetch, which the read path already handles; growing without a cap
+    /// costs the context, which nothing handles.
+    pub fn note_request(&mut self, contract: Cid, block: Cid) {
+        if self.outstanding.iter().any(|(c, _)| *c == contract) {
+            return;
+        }
+        if self.outstanding.len() >= 64 {
+            self.outstanding.remove(0);
+        }
+        self.outstanding.push((contract, block));
+    }
+
+    /// Which block a response for `contract` is about, read straight out of
+    /// a context without building an engine.
+    ///
+    /// The entry point needs this BEFORE it can build the message the shell
+    /// is given, and building a shell to ask would mean building one twice.
+    pub fn peek_block_for(ctx: &[u8], contract: &Cid) -> Option<Cid> {
+        let c: Carried = bincode::deserialize(ctx).ok()?;
+        c.shell
+            .outstanding
+            .iter()
+            .find(|(k, _)| k == contract)
+            .map(|(_, b)| *b)
+    }
+
+    /// Which block a response for `contract` is about.
+    pub fn block_for(&self, contract: &Cid) -> Option<Cid> {
+        self.outstanding
+            .iter()
+            .find(|(c, _)| c == contract)
+            .map(|(_, b)| *b)
     }
 }

@@ -111,15 +111,21 @@ fn an_ack_is_not_a_confirmation_and_the_read_back_is() {
     );
 }
 
-/// A put that is acknowledged and then NOT there fails, rather than hanging.
+/// A put acknowledged and then never readable back FAILS — but only after
+/// the rounds run out.
 ///
-/// This is the case the read-back exists for. The ack said yes; the GET says
-/// the bytes are not on the node. A shell that believed the ack would have
-/// told the client `Published` and the data would simply be missing.
+/// The first empty read-back is not proof of absence: a put is readable a
+/// short time after it is acknowledged, not instantly (+50 ms, measured), and
+/// treating the first empty answer as failure reported a write dead that had
+/// in fact landed. So it is asked again, a bounded number of times, and only
+/// then is the ack disbelieved.
+///
+/// Two assertions, and both matter: it does NOT fail early, and it does NOT
+/// go on for ever.
 #[test]
-fn a_put_acknowledged_but_not_readable_back_is_a_failure_not_a_publish() {
+fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
     let store = Store::default();
-    let mut s: Shell<Store> = Shell::resume(&[], Params::default(), store.clone());
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
     let out = s.handle(vec![Inbound::Client(write_req())]);
     let put = out
         .ops
@@ -130,27 +136,43 @@ fn a_put_acknowledged_but_not_readable_back_is_a_failure_not_a_publish() {
         })
         .expect("a put");
 
+    // The store never holds it, so every read-back is empty.
     let _ = s.handle(vec![Inbound::PutAcked { id: put, ok: true }]);
-    assert_eq!(s.awaiting(), 1);
-    // The read-back comes back empty.
-    let out = s.handle(vec![Inbound::GotState {
-        id: put,
-        bytes: None,
-    }]);
+    assert_eq!(s.awaiting(), 1, "the ack did not queue a read-back");
+
+    let mut rounds = 0;
+    let mut failed_at = None;
+    while rounds < 100 {
+        rounds += 1;
+        let out = s.handle(vec![Inbound::GotState {
+            id: put,
+            bytes: None,
+        }]);
+        if s.awaiting() == 0 {
+            failed_at = Some(rounds);
+            assert!(
+                !states(&out.replies).contains(&State::Published),
+                "a put that never read back was published"
+            );
+            break;
+        }
+        assert!(
+            !out.ops.is_empty(),
+            "round {rounds}: the shell stopped asking but is still waiting, \
+             so nothing will ever wake it again"
+        );
+    }
+    let failed_at = failed_at.expect("it never gave up, so it would wait for ever");
     assert!(
-        !states(&out.replies).contains(&State::Published),
-        "a put whose read-back found nothing was treated as published"
+        failed_at > 1,
+        "the FIRST empty read-back was treated as failure; a put is readable \
+         a short time after it is acknowledged, not instantly"
     );
-    assert_eq!(s.awaiting(), 0, "the read-back is still outstanding");
-    // The core re-emitted it, which is what a failed put must produce.
     assert!(
-        !out.ops.is_empty(),
-        "a failed read-back produced no retry, so the commit waits for ever"
+        failed_at < 100,
+        "it asked {failed_at} times without a bound"
     );
-    println!(
-        "  ack + empty read-back: not published, {} op(s) re-emitted",
-        out.ops.len()
-    );
+    println!("  never readable back: asked {failed_at} times, then failed");
 }
 
 /// Anything the shell does not understand is dropped and COUNTED.

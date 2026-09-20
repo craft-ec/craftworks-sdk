@@ -60,6 +60,15 @@ pub enum Request {
     AskWrite { client: u64, write_id: u64 },
 }
 
+/// What kind of message a call was woken by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Saw {
+    Client,
+    GetResponse,
+    PutResponse,
+    Other,
+}
+
 /// A signing key that is not a real one, and says so in its own type.
 ///
 /// A plain `Vec<u8>` would let a real key be passed to this path by mistake
@@ -82,6 +91,36 @@ pub enum Reply {
         client: u64,
         req_id: u64,
         result: ReadResult,
+    },
+    /// What one `process()` call did.
+    ///
+    /// Not decoration: a delegate is invisible from outside — it has no log a
+    /// client can read and the node prints nothing about it — so without this
+    /// the only observable is whether the thing a caller wanted happened, and
+    /// a break anywhere in the chain looks the same from the outside. Every
+    /// field is a count the shell already had.
+    Call {
+        /// What the shell was asked to do this call.
+        saw: Saw,
+        /// Node operations issued.
+        ops: usize,
+        /// Effects still queued at the end, and therefore LOST.
+        stranded: usize,
+        /// Puts dropped for want of contract code.
+        no_code: usize,
+        /// Inbound messages the shell could not use.
+        dropped: usize,
+        /// Blocks put and not yet read back.
+        awaiting: usize,
+        /// Puts confirmed by reading them back this call.
+        read_back: usize,
+        /// Effects the CORE returned this call.
+        effects: usize,
+        /// What the node said, when it said anything; otherwise what this
+        /// call did that is worth a word. Labelled at the point it is
+        /// printed, because "the node said" and "the shell noticed" are
+        /// different claims and only one of them is evidence about the node.
+        note: String,
     },
     /// Counted, not silent: what arrived that the shell could not use.
     ///

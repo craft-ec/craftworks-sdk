@@ -13,3 +13,9 @@ tokio-tungstenite = "0.27"
 bincode = "1"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
+# The live write run drives the engine delegate, so it speaks its wire format
+# and signs with the same key type. A dependency of the DRIVER only: nothing
+# here reaches the delegate's wasm.
+engine-delegate = { path = "../engine-delegate", default-features = false }
+engine = { path = "../engine" }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }

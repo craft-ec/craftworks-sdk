@@ -117,3 +117,30 @@ pub fn head_state(
     out.extend_from_slice(&sig.to_bytes());
     Ok(out)
 }
+
+/// Read `(seq, value)` out of an encoded Register state.
+///
+/// The seq is taken from the RECORD, never assumed to be the one that was
+/// written: a different seq there is another writer's head, which is a
+/// conflict and not a confirmation. This does NOT verify the signature —
+/// the contract did that before the node stored it, and re-checking here
+/// would be this copy of the format deciding whether the authority was right.
+pub fn head_of(state: &[u8]) -> Option<(u64, [u8; 32])> {
+    let rest = state.strip_prefix(MAGIC)?;
+    let (&flags, rest) = rest.split_first()?;
+    if flags & FLAG_RECORD == 0 {
+        return None;
+    }
+    let (_terminal, rest) = rest.split_first()?;
+    let (seq, rest) = rest.split_at_checked(8)?;
+    let seq = u64::from_le_bytes(seq.try_into().ok()?);
+    let (vlen, rest) = rest.split_at_checked(2)?;
+    let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
+    if vlen > MAX_VALUE {
+        return None;
+    }
+    let value = rest.get(..vlen)?;
+    // A head's value IS a root cid: anything else is not one of ours.
+    let root: [u8; 32] = value.try_into().ok()?;
+    Some((seq, root))
+}
