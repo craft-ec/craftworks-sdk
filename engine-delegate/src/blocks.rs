@@ -25,16 +25,20 @@ use std::collections::BTreeMap;
 /// node twice in a call could give two different answers, and the tree would
 /// appear to change under the apply.
 pub struct NodeBlocks<'a> {
-    ctx: RefCell<&'a mut DelegateCtx>,
+    /// Borrowed immutably: `get_contract_state` takes `&self`, so the ctx is
+    /// still free to be written at the end of the call. A `&mut` here would
+    /// hold the borrow for the shell's whole lifetime and leave nowhere to
+    /// save the context from.
+    ctx: &'a DelegateCtx,
     seen: RefCell<BTreeMap<Cid, Option<&'static [u8]>>>,
     /// Sync reads made, so a call can report what it cost.
     reads: RefCell<usize>,
 }
 
 impl<'a> NodeBlocks<'a> {
-    pub fn new(ctx: &'a mut DelegateCtx) -> Self {
+    pub fn new(ctx: &'a DelegateCtx) -> Self {
         NodeBlocks {
-            ctx: RefCell::new(ctx),
+            ctx,
             seen: RefCell::new(BTreeMap::new()),
             reads: RefCell::new(0),
         }
@@ -54,7 +58,7 @@ impl Blocks for NodeBlocks<'_> {
         // The Block contract's parameters are the hash of its state, so a
         // block's id IS its contract instance id. That equality is what lets
         // the engine name a block and the node find a contract.
-        let got = self.ctx.borrow_mut().get_contract_state(cid);
+        let got = self.ctx.get_contract_state(cid);
         let leaked: Option<&'static [u8]> = got.map(|v| &*Box::leak(v.into_boxed_slice()));
         self.seen.borrow_mut().insert(*cid, leaked);
         leaked

@@ -12,6 +12,7 @@
 //! and not a different design.
 
 pub mod blocks;
+mod entry;
 pub mod schedule;
 pub mod shell;
 pub mod wire;
