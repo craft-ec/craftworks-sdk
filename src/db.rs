@@ -22,6 +22,26 @@ pub struct Record {
     pub created: u64,
     pub updated: u64,
     pub fields: Map<String, Value>,
+    /// What THIS record's own write is doing.
+    ///
+    /// Metadata on the row, never a field: it describes the record rather
+    /// than being part of it, and a schema that had to declare it would make
+    /// every app's data shape depend on how it happened to be stored.
+    ///
+    /// Over the in-memory store this is always `Clean`, which is the truth —
+    /// a write there is applied the moment it is made, so there is never one
+    /// in flight to report.
+    #[serde(rename = "state", serialize_with = "ser_state")]
+    pub state: crate::store::RowState,
+}
+
+fn ser_state<S: serde::Serializer>(
+    s: &crate::store::RowState,
+    ser: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    // The stable CODE, never the Rust variant name: a row branches on this,
+    // and a rename would change behaviour silently.
+    ser.serialize_str(s.code())
 }
 
 #[derive(Default, Clone, Copy)]
@@ -338,8 +358,9 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let rkey = self.ids.next(&mut self.env);
         let now = id::created_ms(&rkey);
         let bytes = record::encode(&schema, fields, now, now, &self.author)?;
-        self.write(vec![(record_key(domain, &rkey), Edit::Put(bytes.clone()))])?;
-        self.read(&schema, &rkey, &bytes)
+        let key = record_key(domain, &rkey);
+        self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
+        self.read(&schema, &rkey, &key, &bytes)
     }
 
     /// Merge `patch` over the record; a `null` value removes that field.
@@ -363,14 +384,15 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         // `updated` never runs backwards, even if the clock does.
         let updated = self.env.now_ms().max(d.updated);
         let bytes = record::encode(&schema, &d.fields, d.created, updated, &d.author)?;
-        self.write(vec![(key, Edit::Put(bytes.clone()))])?;
-        self.read(&schema, rkey, &bytes)
+        self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
+        self.read(&schema, rkey, &key, &bytes)
     }
 
     pub fn get(&mut self, domain: &str, rkey: &RKey) -> Result<Option<Record>> {
         let schema = self.need_schema(domain)?;
-        match self.get_key(&record_key(domain, rkey))? {
-            Some(b) => self.read(&schema, rkey, &b).map(Some),
+        let key = record_key(domain, rkey);
+        match self.get_key(&key)? {
+            Some(b) => self.read(&schema, rkey, &key, &b).map(Some),
             None => Ok(None),
         }
     }
@@ -406,7 +428,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                 let rkey: RKey = k[p.len()..]
                     .try_into()
                     .map_err(|_| "corrupt record key".to_string())?;
-                self.read(&schema, &rkey, v)
+                self.read(&schema, &rkey, k, v)
             })
             .collect()
     }
@@ -443,13 +465,18 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             .map_err(|e| DbError::from_store(e, lo, hi))
     }
 
-    fn read(&self, schema: &Schema, rkey: &RKey, bytes: &[u8]) -> Result<Record> {
+    /// Build a record, asking the store what this row's own write is doing.
+    ///
+    /// The KEY is passed rather than recomputed from the domain, so a caller
+    /// cannot ask about a different row than the one it decoded.
+    fn read(&self, schema: &Schema, rkey: &RKey, key: &[u8], bytes: &[u8]) -> Result<Record> {
         let d = record::decode(schema, bytes)?;
         Ok(Record {
             id: id::to_hex(rkey),
             created: d.created,
             updated: d.updated,
             fields: d.fields,
+            state: self.store.row_state(key),
         })
     }
 }

@@ -87,8 +87,68 @@ pub enum Delta {
 /// `&mut self` says so in the type, and it says so for every backend, which
 /// is what lets one surface sit over both: the in-memory store implements
 /// this trivially and an app does not change when it moves onto a node.
+/// What a record's OWN write is doing.
+///
+/// A fixed set of codes and never prose: a row branches on this to decide
+/// whether it may say "saved", and a caller that matched on a message would
+/// change behaviour the first time anybody reworded it, silently.
+///
+/// The distinction a person actually needs is the middle one. "Saving",
+/// "saved here but not yet on the network" and "on the network" are three
+/// different facts, and somebody deciding whether it is safe to close the tab
+/// needs the second told apart from the third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowState {
+    /// No pending write: this is what the engine last said.
+    #[default]
+    Clean,
+    /// Written here and not sent yet — the engine was busy with another.
+    Queued,
+    /// Sent and accepted, not yet published. **Closing the tab now loses it.**
+    Pending,
+    /// A write that was rolled back: it failed, or nothing ever answered it.
+    RolledBack,
+    /// This client has not loaded the key, so it cannot say.
+    ///
+    /// **Not `Clean`.** "I have not looked" is not "there is nothing in
+    /// flight", and a row that said "saved" about a write it cannot see is
+    /// the exact failure `NOT_LOADED` exists to prevent, one layer up.
+    Unknown,
+}
+
+impl RowState {
+    /// The stable code that crosses the boundary.
+    pub fn code(self) -> &'static str {
+        match self {
+            RowState::Clean => "CLEAN",
+            RowState::Queued => "QUEUED",
+            RowState::Pending => "PENDING",
+            RowState::RolledBack => "ROLLED_BACK",
+            RowState::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// Whether a row showing this value may claim to be saved.
+    ///
+    /// An invariant, not a convenience: a row showing an unacknowledged value
+    /// must SAY so.
+    pub fn is_settled(self) -> bool {
+        self == RowState::Clean
+    }
+}
+
 pub trait Reads {
     fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>>;
+
+    /// What this key's own write is doing.
+    ///
+    /// The default is `Clean`, which is the truth for a store that IS the
+    /// tree: an in-memory write is applied the moment it is made, so there is
+    /// never a write in flight to report. A store that talks to a node
+    /// overrides this, because for it the question has a real answer.
+    fn row_state(&self, _key: &[u8]) -> RowState {
+        RowState::Clean
+    }
 
     /// Entries with `lo <= key < hi`, ascending, or descending if `reverse`;
     /// at most `limit`.

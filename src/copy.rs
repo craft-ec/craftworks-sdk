@@ -136,6 +136,13 @@ pub enum RolledBack {
 pub struct Told {
     /// Writes that are no longer pending and did not land.
     pub rolled_back: Vec<(u64, RolledBack)>,
+    /// The KEYS those writes touched.
+    ///
+    /// Carried separately because a row asks "what is MY write doing" and a
+    /// write id cannot answer that — a row would have to have remembered
+    /// which id carried it, which is bookkeeping every caller would have to
+    /// repeat and get right.
+    pub rolled_back_keys: Vec<Vec<u8>>,
     /// Keys where a delta moved BASE while a write was pending on them.
     ///
     /// Not preventable here — the pending write may have been computed from
@@ -491,10 +498,11 @@ impl Copy {
     /// value on screen that was never anywhere.
     pub fn failed(&mut self, write_id: u64) -> Told {
         let mut told = Told::default();
-        for e in self.keys.values_mut() {
+        for (key, e) in self.keys.iter_mut() {
             let Some(i) = e.pending.iter().position(|w| w.write_id == write_id) else {
                 continue;
             };
+            told.rolled_back_keys.push(key.clone());
             for (n, w) in e.pending.iter().enumerate().skip(i) {
                 told.rolled_back.push((
                     w.write_id,
@@ -515,7 +523,7 @@ impl Copy {
     pub fn time_out(&mut self, now_ms: u64) -> Told {
         let mut told = Told::default();
         let timeout = self.pending_timeout_ms;
-        for e in self.keys.values_mut() {
+        for (key, e) in self.keys.iter_mut() {
             let Some(i) = e
                 .pending
                 .iter()
@@ -523,6 +531,7 @@ impl Copy {
             else {
                 continue;
             };
+            told.rolled_back_keys.push(key.clone());
             // As `failed`: everything behind the timed-out write goes too,
             // for the same reason.
             for (n, w) in e.pending.iter().enumerate().skip(i) {
