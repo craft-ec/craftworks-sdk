@@ -67,6 +67,28 @@ pub struct Session {
     /// SDK, not here, so it can be tested on a machine rather than only in a
     /// tab — which is what the first version of this recovery could not be.
     loads: craftworks_sdk::Loads,
+    /// The head's contract instance id, once `Identity` has named it.
+    ///
+    /// Zero until then, and zero for ever on a delegate that is not
+    /// provisioned — there is no head to subscribe to.
+    head_id: [u8; 32],
+    /// The head's id as the node NAMES it, so a notification can be matched.
+    head_named: String,
+    /// Whether this connection has asked the node to watch the head.
+    ///
+    /// Reset on reconnect, not remembered: the node's copy of a subscription
+    /// outlives the engine's context and can be evicted at its cap without
+    /// anyone being told (F39), so a new connection asks again. Re-asking is
+    /// idempotent at the node, so it costs nothing when nothing was lost.
+    subscribed: bool,
+    /// The head moved. Set by a notification, drained by the page.
+    ///
+    /// A HINT and never an authority: a fabricated one costs a reload, and a
+    /// reload can change nothing that the data does not verify. A SUPPRESSED
+    /// one costs nothing at all, because the tick re-reads the root anyway —
+    /// which is what makes being told an accelerator rather than the
+    /// mechanism.
+    head_moved: bool,
     /// The root the engine last reported standing on.
     ///
     /// A page is recorded against the root it was read at, and a page
@@ -110,6 +132,10 @@ impl Session {
             reported: 0,
             loads: craftworks_sdk::Loads::new(),
             head_root: [0u8; 32],
+            head_id: [0u8; 32],
+            head_named: String::new(),
+            subscribed: false,
+            head_moved: false,
         })
     }
 
@@ -126,6 +152,7 @@ impl Session {
     /// every session.
     pub fn outbound(&mut self) -> Vec<js_sys::Uint8Array> {
         self.advance();
+        self.watch_head();
         self.envelope_engine_requests();
         self.out
             .iter()
@@ -157,8 +184,19 @@ impl Session {
                         Ok(protocol::Reply::Identity {
                             head_writable,
                             head_root,
+                            head_id,
                             ..
                         }) => {
+                            // Which contract the head IS. Without it a tab
+                            // that made no write can only poll: an
+                            // engine-originated push returns to whoever
+                            // invoked the delegate (F40).
+                            self.head_id = head_id;
+                            self.head_named = if head_id == [0u8; 32] {
+                                String::new()
+                            } else {
+                                wire::contract_id(head_id).to_string()
+                            };
                             // The root pages are recorded against. A page
                             // filed under the wrong root would make a stale
                             // range look current.
@@ -198,10 +236,25 @@ impl Session {
                 // is an input from a stranger.
                 self.plan.on_refused(&why.said);
             }
-            Incoming::HeadChanged { .. } => {
-                // A HINT. What it triggers is the same reload a tick does, so
-                // a fabricated one costs a reload and can change nothing on
-                // screen that the data does not verify.
+            Incoming::HeadChanged { key } => {
+                // ONLY for the head this session asked to watch.
+                //
+                // A notification names a contract, and the node chooses what
+                // it sends. Acting on any of them would let one unasked-for
+                // message make a page reload for ever. This is still a HINT
+                // even when it matches — what it triggers is the reload a
+                // tick would do anyway — but a hint about somebody else's
+                // contract is not even that.
+                // Compared as the node NAMES it. The engine reports a head
+                // as 32 bytes and the client API names contracts as strings;
+                // rendering ours the same way is the only comparison that is
+                // about the same thing.
+                if self.subscribed && !self.head_named.is_empty() && key == self.head_named {
+                    self.head_moved = true;
+                } else {
+                    self.unusable
+                        .push("a head notification arrived for a contract this session is not watching".into());
+                }
             }
             Incoming::Unusable(why) => self.unusable.push(format!("{why:?}")),
             Incoming::Partial => {}
@@ -333,6 +386,45 @@ impl Session {
     /// request rather than one each.
     pub fn loads_in_flight(&self) -> usize {
         self.loads.in_flight()
+    }
+
+    /// Ask the node to tell us when the head moves.
+    ///
+    /// Once per connection, and only once there IS a head: an unprovisioned
+    /// delegate has no Register to name.
+    fn watch_head(&mut self) {
+        if self.subscribed || self.head_id == [0u8; 32] || !self.plan.provisioned() {
+            return;
+        }
+        let id = wire::contract_id(self.head_id);
+        let stream = self.next_stream();
+        match wire::frame_subscribe(id, stream) {
+            Ok(frames) => {
+                self.out.extend(frames);
+                self.subscribed = true;
+            }
+            Err(e) => self
+                .unusable
+                .push(format!("could not ask to watch the head: {e}")),
+        }
+    }
+
+    /// Whether the head moved since this was last asked. Drains.
+    ///
+    /// The page reloads its bindings on a `true`. It is a hint, so a missed
+    /// one costs nothing — the tick re-reads the root regardless — and a
+    /// spurious one costs a reload.
+    pub fn take_head_moved(&mut self) -> bool {
+        std::mem::take(&mut self.head_moved)
+    }
+
+    /// Is this session being TOLD about its head, or is it polling?
+    ///
+    /// Reported rather than assumed: a page that believed it was notified
+    /// while it was actually polling is the failure this exists to make
+    /// impossible.
+    pub fn watching_head(&self) -> bool {
+        self.subscribed
     }
 
     /// Take the next provisioning step, if there is one and nothing is in
@@ -519,6 +611,11 @@ impl Session {
     /// may have been sent before the socket dropped and arrive on the new one.
     pub fn reconnected(&mut self) {
         self.frames.reset();
+        // The node's copy of a subscription outlives the engine's context and
+        // can be evicted at its cap without anyone being told (F39), so this
+        // connection asks again. Idempotent at the node, so it costs nothing
+        // when nothing was lost.
+        self.subscribed = false;
     }
 
     // ---- the data surface -------------------------------------------

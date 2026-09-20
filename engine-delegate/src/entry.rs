@@ -309,6 +309,7 @@ impl DelegateInterface for EngineDelegate {
                 blocks,
                 code.is_some(),
                 writable,
+                head_id.unwrap_or_default(),
             );
             let out = shell.handle(vec![msg]);
             head_exists = shell.head_exists();
@@ -511,6 +512,7 @@ impl DelegateInterface for EngineDelegate {
                     blocks,
                     code.is_some(),
                     writable,
+                    head_id.unwrap_or_default(),
                 );
                 for (contract, block) in &asked {
                     shell.note_request(*contract, *block);
@@ -535,6 +537,7 @@ impl DelegateInterface for EngineDelegate {
                     blocks,
                     code.is_some(),
                     writable,
+                    head_id.unwrap_or_default(),
                 );
                 let more = shell.handle(vec![Inbound::NoHead]);
                 (more, shell.to_context())

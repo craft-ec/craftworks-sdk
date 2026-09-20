@@ -229,6 +229,9 @@ pub struct Shell<B: Blocks> {
     /// An `Install` arrived at a delegate that already has everything, and
     /// was refused. Answered this call; never carried in the context.
     already_installed: bool,
+    /// The head's contract instance id, as the entry point derived it this
+    /// call. Reported by `Identity`; zero when there is no Register to name.
+    head_id: [u8; 32],
     pub limits: Limits,
     /// Whether this session wants a call tree.
     ///
@@ -255,7 +258,7 @@ impl<B: Blocks> Shell<B> {
     /// in flight `Lost`. So an unreadable context is a fresh start, not an
     /// error — and never a panic, because the bytes come from outside.
     pub fn resume(ctx: &[u8], params: Params, blocks: B) -> Self {
-        Self::resume_with(ctx, params, blocks, true, true)
+        Self::resume_with(ctx, params, blocks, true, true, [0u8; 32])
     }
 
     /// As `resume`, saying whether the contract code is on hand and whether
@@ -269,6 +272,7 @@ impl<B: Blocks> Shell<B> {
         blocks: B,
         has_code: bool,
         head_writable: bool,
+        head_id: [u8; 32],
     ) -> Self {
         let carried: Option<Carried> = ctx_opts().deserialize(ctx).ok();
         // A context the shell cannot read and one the ENGINE refuses are the
@@ -306,6 +310,7 @@ impl<B: Blocks> Shell<B> {
             has_code,
             head_writable,
             already_installed: false,
+            head_id,
             limits: Limits::default(),
             tracing: if resumed { tracing } else { false },
             trace: Vec::new(),
@@ -424,6 +429,7 @@ impl<B: Blocks> Shell<B> {
                     // up and empty", and re-installing costs the signing key
                     // and with it every head written under the old one.
                     head_writable: self.head_writable,
+                    head_id: self.head_id,
                 }));
         }
         if self.already_installed {
