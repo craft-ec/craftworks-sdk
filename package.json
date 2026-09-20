@@ -2,5 +2,7 @@
   "name": "craftworks-sdk",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node tests/js/ids.test.cjs && node tests/js/collection.test.mjs" }
+  "scripts": {
+    "test": "node tests/js/ids.test.cjs && node tests/js/collection.test.mjs && node tests/js/build-info.test.mjs"
+  }
 }
