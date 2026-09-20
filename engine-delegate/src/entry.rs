@@ -218,11 +218,19 @@ impl DelegateInterface for EngineDelegate {
         };
 
         let code = ctx.get_secret(BLOCK_CODE);
-        let head_exists = Shell::<NodeBlocks>::peek_head_exists(&carried);
+        // Derived from what the node says THIS call, never carried: a
+        // remembered "the Register exists" dies with the node, and the first
+        // commit after a restart then re-CREATES one that is already there —
+        // 152,542 B for a fact the very next head read states (F38).
+        //
+        // The shell learns it from a HeadRead during this call, so it is read
+        // back out of the shell AFTER handling rather than before.
+        let head_exists;
         let (out, saved, installing) = {
             let blocks = NodeBlocks::with_code(ctx, code.clone());
             let mut shell = Shell::resume_with(&carried, Params::default(), blocks, code.is_some());
             let out = shell.handle(vec![msg]);
+            head_exists = shell.head_exists();
             (out, shell.to_context(), shell.installed)
         };
         // The install is the one thing the shell cannot do itself: only the
@@ -264,6 +272,9 @@ impl DelegateInterface for EngineDelegate {
         let mut no_head = false;
         // Blocks whose id does not hash their own bytes under any kind.
         let mut unknown_kind = 0usize;
+        // Packs this shell refused. Counted, so a core that starts emitting
+        // them again is visible rather than silently ignored.
+        let mut refused_pack = 0usize;
         // What the head bump cost this call, by route. Reported rather than
         // asserted: the saving is a measurement and belongs in the output.
         let mut head_put_bytes = 0usize;
@@ -292,48 +303,23 @@ impl DelegateInterface for EngineDelegate {
                         unknown_kind += 1;
                         continue;
                     };
-                    // A PACK is a TRANSPORT, and nothing on the node
-                    // unpacks one: a reader asks for a MEMBER by its own id,
-                    // and a member that exists only inside a pack is a block
-                    // the engine cannot read back. That is what happened —
-                    // the write published and the very next read of it
-                    // answered `Unavailable(root)`.
+                    // PHASE 3 SHIPS NO PACK, and this REFUSES one rather
+                    // than quietly coping with it.
                     //
-                    // The pack was never about a per-call PUT limit. It
-                    // exists because a contract's CODE rides every put at
-                    // every hop (F18/F28), so one large put beats several
-                    // small ones on every axis (F30) — ~190 KiB as one pack
-                    // against ~2 MB as individual puts, for a 17-block
-                    // commit.
+                    // The core does not emit PutPack on the write path
+                    // (`pack_on_write: false`), so a pack arriving here means
+                    // the core and the shell disagree about the phase. An
+                    // unpack arm would handle that silently and go untested
+                    // until #39 — unreachable code with no test is worse than
+                    // a gap with a name.
                     //
-                    // It is off the WRITE path in Phase 3 all the same,
-                    // because a pack is transient: a head names only a few
-                    // and one leaves as soon as it is unpacked, so the
-                    // network holds pack AND members either way and the pack
-                    // only moves who pays for the members. With no keepers
-                    // yet, that is the writer both times — as built, ~188 KiB
-                    // per commit for a pack nothing reads. Phase 4 (#39) puts
-                    // it back with the other half: the writer puts the pack
-                    // only, keepers put the members, reads resolve through
-                    // the head's packs.
-                    //
-                    // This arm stays for a commit that DOES ship a pack.
+                    // #39 is where the pack comes back, with the half that
+                    // makes it pay: the writer puts the pack ONLY, keepers
+                    // put the members, and reads resolve through the head's
+                    // packs. Wiring the read side is that slice's work.
                     if state[0] == 6 {
-                        for (mid, mbytes) in engine::pack::members(&bytes) {
-                            let Some(mstate) = block_state(&mid, &mbytes) else {
-                                unknown_kind += 1;
-                                continue;
-                            };
-                            let mc = block_contract(&code, &mid);
-                            asked.push((id32(mc.key().id()), mid));
-                            msgs.push(OutboundDelegateMsg::PutContractRequest(
-                                PutContractRequest::new(
-                                    mc,
-                                    WrappedState::new(mstate),
-                                    RelatedContracts::default(),
-                                ),
-                            ));
-                        }
+                        refused_pack += 1;
+                        continue;
                     }
                     let c = block_contract(&code, &id);
                     asked.push((id32(c.key().id()), id));
@@ -463,7 +449,7 @@ impl DelegateInterface for EngineDelegate {
             ops: msgs.len(),
             stranded: out.stranded,
             no_code: out.refused_no_code,
-            dropped: out.dropped.len() + unknown_kind,
+            dropped: out.dropped.len() + unknown_kind + refused_pack,
             awaiting: out.awaiting,
             head_put: head_put_bytes,
             head_update: head_update_bytes,

@@ -91,14 +91,6 @@ struct ShellState {
     awaiting: Vec<(Cid, u32)>,
     /// A head written and not yet read back, with the root it named.
     head: Option<(u64, Cid)>,
-    /// Whether the head Register is known to EXIST on the node.
-    ///
-    /// The first bump has to create it, and creating a contract means
-    /// carrying its code. Every bump after that is an update to a contract
-    /// the node already has, and an update names it by id alone — which is
-    /// the difference between shipping ~157 KiB of register.wasm per commit
-    /// and shipping the record.
-    head_exists: bool,
     /// Contract id -> the block id the engine knows it by, for requests that
     /// are still out.
     ///
@@ -182,10 +174,6 @@ impl<B: Blocks> Shell<B> {
             ),
             None => (Vec::new(), BTreeMap::new(), None, Vec::new()),
         };
-        let head_exists = ctx_opts()
-            .deserialize::<Carried>(ctx)
-            .map(|c| c.shell.head_exists)
-            .unwrap_or(false);
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         Shell {
             engine,
@@ -193,10 +181,9 @@ impl<B: Blocks> Shell<B> {
             // it did not resume, so they go with it.
             awaiting: if resumed { awaiting } else { BTreeMap::new() },
             head: if resumed { head } else { None },
-            // NOT reset with the engine: the Register exists on the node
-            // whether or not this engine remembers writing it, and claiming
-            // otherwise would make the next bump ship the code again.
-            head_exists,
+            // Starts false every call and is set by what the node SAYS this
+            // call — a read of the head, or its absence. Nothing carries it.
+            head_exists: false,
             outstanding: if resumed { outstanding } else { Vec::new() },
             installed: None,
             provisioned: false,
@@ -208,13 +195,14 @@ impl<B: Blocks> Shell<B> {
 
     pub fn to_context(&self) -> Option<Vec<u8>> {
         let engine = self.engine.to_context().ok()?;
+        // #41's exact encoding, with slice 5's `head_exists` gone: it is
+        // derived from the engine's published seq, not carried.
         ctx_opts()
             .serialize(&Carried {
                 engine,
                 shell: ShellState {
                     awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
                     head: self.head,
-                    head_exists: self.head_exists,
                     outstanding: self.outstanding.clone(),
                 },
             })
@@ -517,23 +505,24 @@ impl<B: Blocks> Shell<B> {
         }
     }
 
-    /// Whether the head Register exists, read straight out of a context.
-    ///
-    /// The entry point needs it while BUILDING the outbound messages, which
-    /// is after the shell that produced them has been dropped.
-    pub fn peek_head_exists(ctx: &[u8]) -> bool {
-        ctx_opts()
-            .deserialize::<Carried>(ctx)
-            .map(|c| c.shell.head_exists)
-            .unwrap_or(false)
-    }
-
     /// Does the head Register already exist on the node?
     ///
-    /// A bump that creates it must carry the Register's code; one that
-    /// updates it names the contract by id alone.
+    /// DERIVED from the engine's published seq, which is 0 only when no head
+    /// exists anywhere for this key — a fresh start re-reads the head before
+    /// anything else and adopts whatever is there, so a seq above 0 means
+    /// something published one.
+    ///
+    /// Deriving it from `HeadRead` alone was wrong and the live run caught
+    /// it: the fact is stated on the call that READS the head, and a later
+    /// commit's bump happens on a call where nothing read it — so the second
+    /// write re-CREATED the Register and paid 152,542 B again (F38). Reading
+    /// it out of state the engine already carries for its own reasons is
+    /// both derived and always available.
+    ///
+    /// `self.head_exists` still records a head READ or CONFIRMED this call,
+    /// for the case where the seq has not been adopted yet.
     pub fn head_exists(&self) -> bool {
-        self.head_exists
+        self.head_exists || self.engine.published_seq() > 0
     }
 
     /// Ids put and not yet read back.

@@ -737,6 +737,15 @@ impl<B: Blocks> Engine<B> {
     }
 
     /// The root other readers can see.
+    /// The seq of the head this engine has published, or 0 if it has none.
+    ///
+    /// 0 means no head exists ANYWHERE for this key — not merely that this
+    /// engine has not written one — because a fresh start re-reads the head
+    /// before anything else and adopts whatever is there.
+    pub fn published_seq(&self) -> u64 {
+        self.published_seq
+    }
+
     pub fn published_root(&self) -> Cid {
         self.published_root
     }
