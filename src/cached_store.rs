@@ -164,12 +164,18 @@ impl CachedStore {
             W::Accepted => self.copy.submitted(write_id),
             // The engine is busy with another commit; this one has not gone.
             W::Busy => self.copy.queued(write_id),
-            // On the network. THIS is what clears it.
-            W::Published | W::ParityComplete => self.copy.published(write_id),
+            // On the network. THIS is what clears it — and it is also the
+            // moment the engine has room again, so the next queued write goes.
+            W::Published | W::ParityComplete => {
+                self.copy.published(write_id);
+                self.drain_queued();
+            }
             // Terminal and not applied. The edit is not in the tree.
             W::Failed | W::Lost => {
                 let told = self.copy.failed(write_id);
                 self.rolled_back.extend(told.rolled_back_keys);
+                // The commit that was in flight is over, however it ended.
+                self.drain_queued();
             }
             // Still in flight, and said so rather than silently.
             W::Stalled => {}
@@ -185,8 +191,61 @@ impl CachedStore {
         self.unknown_verdicts
     }
 
+    /// SEND THE NEXT QUEUED WRITE, if there is one.
+    ///
+    /// The engine takes ONE COMMIT AT A TIME and refuses a write that arrives
+    /// while one is in flight — `Busy`, terminal, nothing applied, with the
+    /// engine's own comment saying why: *"Buffering belongs to the client,
+    /// which has a page and an outbox; the delegate has neither."*
+    ///
+    /// This is that outbox, and it did not exist. `Busy` set a flag and
+    /// nothing ever re-sent, so a burst of writes was accepted into the copy,
+    /// refused by the engine, and left sitting until `time_out` rolled them
+    /// back — at which point THE ROWS VANISHED FROM THE SCREEN. Measured on a
+    /// real node: 20 writes in 10 ms, 10 published, 12 frozen at `PENDING`
+    /// for 30 seconds and gone by 70 (sdk#106).
+    ///
+    /// One at a time, oldest first. The engine has room for exactly one, and
+    /// writes must land in the order they were made — a later edit to a key
+    /// arriving first would leave the network holding the older value. A
+    /// write refused again simply stays queued for the next opportunity.
+    pub fn drain_queued(&mut self) {
+        // Only when the engine can take it: with a write still awaiting a
+        // verdict, another would be refused again and the re-send would be
+        // pure traffic.
+        if self.copy.pending().0 > self.copy.queued_count() {
+            return;
+        }
+        let Some((write_id, edits)) = self.copy.oldest_queued() else {
+            return;
+        };
+        // The SAME write_id. A new one would make the engine's verdict about
+        // a write this copy no longer knows, and the row would never clear.
+        self.copy.submitted(write_id);
+        self.client.send(&Request::Write {
+            write_id,
+            ops: edits
+                .into_iter()
+                .map(|(k, v)| match v {
+                    Some(v) => protocol::Op::Put(k, v),
+                    None => protocol::Op::Delete(k),
+                })
+                .collect(),
+        });
+    }
+
+    /// How many writes are waiting for the engine to have room.
+    pub fn queued_count(&self) -> usize {
+        self.copy.queued_count()
+    }
+
     /// Roll back anything that has waited too long for a verdict.
+    ///
+    /// Also the BACKSTOP for the outbox: notifications are lossy (F39), so a
+    /// `Published` that never arrived would otherwise leave the queue stopped
+    /// for ever. The tick costs one check when there is nothing queued.
     pub fn tick(&mut self) -> crate::copy::Told {
+        self.drain_queued();
         let now = (self.now_ms)();
         let told = self.copy.time_out(now);
         self.rolled_back
