@@ -53,6 +53,38 @@ impl Seen {
     }
 }
 
+/// Is this a sequence a write can legally report?
+///
+/// A prefix of `accepted (stalled)? published parity-complete`, or a terminal
+/// (`failed` / `lost` / `busy`) with nothing after it. Each state at most
+/// once: a caller that is told `Published` twice cannot tell a retry from
+/// progress.
+///
+/// Written out rather than derived from the enum's declaration order, because
+/// the legal ORDER is a rule about the protocol and the enum's order is an
+/// implementation detail that happens to agree with it today. It is also what
+/// catches the shape that was wrong here before: `Failed` followed by
+/// `Published`, which is two contradictory answers to one question.
+pub fn valid_sequence(states: &[State]) -> bool {
+    const HAPPY: [State; 4] = [
+        State::Accepted,
+        State::Stalled,
+        State::Published,
+        State::ParityComplete,
+    ];
+    let mut at = 0usize;
+    for (i, s) in states.iter().enumerate() {
+        if matches!(s, State::Failed | State::Lost | State::Busy) {
+            return i + 1 == states.len();
+        }
+        match HAPPY[at..].iter().position(|h| h == s) {
+            Some(k) => at += k + 1,
+            None => return false,
+        }
+    }
+    true
+}
+
 fn ids(effects: &[Effect]) -> Vec<Cid> {
     effects
         .iter()
@@ -174,13 +206,16 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
         packs.iter().copied().collect::<BTreeSet<_>>(),
         "UpdateHead does not name every block it depends on"
     );
-    assert_eq!(seen.of(1, 1), &[State::Accepted, State::Durable]);
+    // No state between Accepted and Published: what the head does not name
+    // was never published, so nothing before the head moves can be promised
+    // to survive a restart.
+    assert_eq!(seen.of(1, 1), &[State::Accepted]);
 
     let out = e.step(Event::HeadConfirmed(seq));
     seen.absorb(&out);
     assert_eq!(
         seen.of(1, 1),
-        &[State::Accepted, State::Durable, State::Published],
+        &[State::Accepted, State::Published],
         "states must arrive once each, in order"
     );
 }
@@ -371,24 +406,17 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
             rebuild(&records),
             "seed {seed}: the published root is not the root a rebuild produces"
         );
-        // And no write was silently dropped.
+        // And no write was silently dropped, or reported an impossible life.
         for (client, id) in &live {
             let states = seen.of(*client, *id);
             assert!(
                 !states.is_empty(),
                 "seed {seed}: write {id} was never reported at all"
             );
-            // Monotone: a state never goes backwards.
-            let mut last = None;
-            for s in states {
-                if let Some(p) = last {
-                    assert!(
-                        *s >= p,
-                        "seed {seed}: write {id} went {p:?} -> {s:?}, backwards"
-                    );
-                }
-                last = Some(*s);
-            }
+            assert!(
+                valid_sequence(states),
+                "seed {seed}: write {id} reported an impossible sequence: {states:?}"
+            );
         }
         println!(
             "  seed {seed:2}: {} records, root matches a rebuild",
