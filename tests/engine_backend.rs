@@ -117,6 +117,23 @@ fn started(busy_for: usize) -> EngineStore<Loop> {
     s
 }
 
+mod support;
+use support::chaos::Chaos;
+
+/// The same engine, behind a connection that reorders and duplicates.
+fn rough(busy_for: usize, seed: u64) -> EngineStore<Chaos<Loop>> {
+    let mut s = EngineStore::new(Chaos::new(Loop::new(busy_for), seed));
+    s.identity().expect("the engine answers who it is");
+    s
+}
+
+/// The same engine, behind a connection that perturbs NOTHING. The control.
+fn calm(busy_for: usize) -> EngineStore<Chaos<Loop>> {
+    let mut s = EngineStore::new(Chaos::calm(Loop::new(busy_for)));
+    s.identity().expect("the engine answers who it is");
+    s
+}
+
 /// A write through the SDK reaches the engine and reads back.
 #[test]
 fn a_write_through_the_sdk_is_readable_through_the_sdk() {
@@ -403,4 +420,122 @@ fn a_db_over_the_engine_store_reads_what_it_wrote() {
     assert_eq!(db.domains().expect("domains"), ["tasks"]);
     assert!(db.schema("tasks").expect("schema").is_some());
     println!("  Db over the engine store: define, put, get, scan, count, domains");
+}
+
+// ---------------------------------------------------------------------------
+// The same state machine, behind a connection that misbehaves.
+//
+// This is the half of the pump that justifies it: one client, driven by a
+// test, by the live driver and by a browser, so what a test exercises is what
+// a socket runs. A test transport that only ever delivers replies in order,
+// once each, exercises none of what a socket does.
+// ---------------------------------------------------------------------------
+
+/// Writes and reads survive reordering and duplication, and the CONTROL shows
+/// the perturbation is real.
+#[test]
+fn the_client_survives_a_connection_that_reorders_and_duplicates() {
+    use craftworks_sdk::Reads;
+    for seed in [1u64, 7, 99, 12345] {
+        let mut db = rough(0, seed);
+        for i in 0..8u32 {
+            craftworks_sdk::Store::put(
+                &mut db,
+                format!("k/{i:02}").as_bytes(),
+                format!("v{i}").as_bytes(),
+            );
+        }
+        for i in 0..8u32 {
+            let k = format!("k/{i:02}");
+            assert_eq!(
+                Reads::get(&mut db, k.as_bytes()).unwrap().as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "seed {seed}: {k} did not read back through a rough connection"
+            );
+        }
+        let rows = Reads::scan(&mut db, b"k/", b"k0", false, usize::MAX).unwrap();
+        assert_eq!(rows.len(), 8, "seed {seed}: a range came back short");
+
+        // The perturbation ACTUALLY HAPPENED. Without this the test is a
+        // wrapper that forwards and a claim about tolerance nobody measured.
+        let seen = db.transport().seen;
+        assert!(
+            seen.reordered > 0 && seen.duplicated > 0,
+            "seed {seed}: nothing was perturbed ({seen:?}), so this run says \
+             nothing about tolerating a real connection"
+        );
+        println!("  seed {seed}: {seen:?}");
+    }
+}
+
+/// THE CONTROL: the same wrapper with every arm off perturbs nothing.
+#[test]
+fn the_chaos_wrapper_with_every_arm_off_changes_nothing() {
+    use craftworks_sdk::Reads;
+    let mut db = calm(0);
+    craftworks_sdk::Store::put(&mut db, b"k/one", b"first");
+    assert_eq!(
+        Reads::get(&mut db, b"k/one").unwrap().as_deref(),
+        Some(&b"first"[..])
+    );
+    let seen = db.transport().seen;
+    assert_eq!(
+        (seen.reordered, seen.duplicated, seen.dropped),
+        (0, 0, 0),
+        "the wrapper perturbed a stream it was told to leave alone: {seen:?}"
+    );
+    assert!(
+        seen.delivered > 0,
+        "nothing went through the wrapper at all"
+    );
+}
+
+/// A dropped reply does not hang: the read is ANSWERED, one way or another.
+///
+/// A client that waits for something never coming is a UI that never settles,
+/// and on this platform replies really are dropped — the node's notification
+/// channel drops when full (F39).
+#[test]
+fn a_dropped_reply_is_answered_rather_than_waited_on() {
+    use craftworks_sdk::{Reads, StoreError};
+    let mut db = EngineStore::new(Chaos::dropping(Loop::new(0), 42, 1));
+    // EVERY reply dropped: the harshest case, and the one that must not hang.
+    let answer = Reads::get(&mut db, b"k/one");
+    assert_eq!(
+        answer,
+        Err(StoreError::NoAnswer),
+        "a read whose replies were all dropped came back {answer:?} — it must \
+         be answered, and it must not be answered with a value nobody sent"
+    );
+    let seen = db.transport().seen;
+    assert!(seen.dropped > 0, "nothing was dropped: {seen:?}");
+    assert_eq!(seen.delivered, 0, "something got through: {seen:?}");
+}
+
+/// Messages the client cannot use are counted, by reason, never ignored.
+#[test]
+fn an_unreadable_message_is_counted_and_not_silently_ignored() {
+    let mut db = started(0);
+    let before = db.dropped().len();
+    // A prefix that parses is NOT a message: the wire refuses trailing bytes
+    // for the same reason a decoder that accepts a prefix turns a wrapped
+    // value into its wrapper's first variant.
+    let mut damaged = protocol::encode_reply(&protocol::Reply::Value {
+        req_id: 0,
+        value: None,
+    });
+    damaged.push(0xFF);
+    db.client().on_inbound(&damaged);
+    db.client().on_inbound(b"not a message at all");
+    let now = db.dropped();
+    assert_eq!(
+        now.len() - before,
+        2,
+        "unreadable messages were not counted: {now:?}"
+    );
+    assert!(
+        now.contains(&protocol::Dropped::TrailingBytes),
+        "a prefix with bytes after it was not reported as such: {now:?}"
+    );
+    println!("  dropped: {now:?}");
 }
