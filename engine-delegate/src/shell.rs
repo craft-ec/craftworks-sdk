@@ -91,6 +91,20 @@ struct ShellState {
     awaiting: Vec<(Cid, u32)>,
     /// A head written and not yet read back, with the root it named.
     head: Option<(u64, Cid)>,
+    /// Whether this session asked for a call tree.
+    #[serde(default)]
+    tracing: bool,
+    /// The operation the next call's steps belong to, unless that call names
+    /// a new one.
+    ///
+    /// CARRIED, and it has to be: a delegate gets a fresh memory every call,
+    /// and most of a write's life happens in calls driven by node responses
+    /// with no client request to name them. Without this the head bump — the
+    /// step whose absence is the commonest way a write silently stops — was
+    /// attributed to nothing and dropped, which the trace test caught by
+    /// asking for exactly that step.
+    #[serde(default)]
+    tracing_of: Option<protocol::TraceOf>,
     /// Contract id -> the block id the engine knows it by, for requests that
     /// are still out.
     ///
@@ -122,11 +136,39 @@ const MAX_PAGE_ENTRIES: usize = 256;
 /// small ones and only one of them fits.
 const MAX_PAGE_BYTES: usize = 512 * 1024;
 
+/// The most trace steps one call may emit. See `Shell::step`.
+const MAX_STEPS: usize = 64;
+
 /// How many times a put is asked back for before its ack is disbelieved.
 ///
 /// A put is readable a short time after it is acknowledged, not instantly, so
 /// the first empty answer means "not yet" far more often than "never".
 const MAX_READ_BACK_ROUNDS: u32 = 12;
+
+/// A write state as its WIRE tag, so a trace step carries the same number the
+/// client would see in a `WriteState` rather than a second encoding of it.
+fn state_tag(s: State) -> u64 {
+    match s {
+        State::Accepted => 0,
+        State::Stalled => 1,
+        State::Published => 2,
+        State::ParityComplete => 3,
+        State::Busy => 4,
+        State::Failed => 5,
+        State::Lost => 6,
+    }
+}
+
+/// How many rows a read's answer carried.
+fn rows_in(r: &engine::read::ReadResult) -> u64 {
+    use engine::read::ReadResult as R;
+    match r {
+        R::Value(v) => v.is_some() as u64,
+        R::Page { entries, .. } => entries.len() as u64,
+        R::Delta { changes, .. } => changes.len() as u64,
+        R::FullReloadRequired { .. } | R::Unavailable(_) | R::OutOfWarmSpace => 0,
+    }
+}
 
 /// The engine's ids, from the protocol's plain numbers.
 fn as_client(n: u64) -> engine::ClientId {
@@ -179,6 +221,21 @@ pub struct Shell<B: Blocks> {
     /// decides WHETHER a put can be built, and the entry point builds it.
     has_code: bool,
     pub limits: Limits,
+    /// Whether this session wants a call tree.
+    ///
+    /// Carried in the context, because a client turns it on once and the
+    /// calls it wants to see are the LATER ones — a flag that lived only in
+    /// this call's memory would be off again by the time anything happened.
+    tracing: bool,
+    /// Steps emitted this call, in order.
+    trace: Vec<protocol::Reply>,
+    /// Which operation the steps of this call belong to.
+    ///
+    /// Set by a client request, and otherwise learnt from the writes the
+    /// engine notified about — a call driven by a node response has no
+    /// request to name it, and attributing those to nothing would leave the
+    /// whole middle of a write untraced, which is the part that breaks.
+    tracing_of: Option<protocol::TraceOf>,
 }
 
 impl<B: Blocks> Shell<B> {
@@ -199,14 +256,16 @@ impl<B: Blocks> Shell<B> {
         // same outcome: start fresh. Never a panic — these bytes come from
         // the node's cache, and a delegate a malformed context can take down
         // is one anybody can take down.
-        let (engine_ctx, awaiting, head, outstanding) = match carried {
+        let (engine_ctx, awaiting, head, outstanding, tracing, tracing_of) = match carried {
             Some(c) => (
                 c.engine,
                 c.shell.awaiting.into_iter().collect(),
                 c.shell.head,
                 c.shell.outstanding,
+                c.shell.tracing,
+                c.shell.tracing_of,
             ),
-            None => (Vec::new(), BTreeMap::new(), None, Vec::new()),
+            None => (Vec::new(), BTreeMap::new(), None, Vec::new(), false, None),
         };
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         Shell {
@@ -227,6 +286,9 @@ impl<B: Blocks> Shell<B> {
             page_clamp: BTreeMap::new(),
             has_code,
             limits: Limits::default(),
+            tracing: if resumed { tracing } else { false },
+            trace: Vec::new(),
+            tracing_of: if resumed { tracing_of } else { None },
         }
     }
 
@@ -241,6 +303,8 @@ impl<B: Blocks> Shell<B> {
                     awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
                     head: self.head,
                     outstanding: self.outstanding.clone(),
+                    tracing: self.tracing,
+                    tracing_of: self.tracing_of,
                 },
             })
             .ok()
@@ -252,6 +316,9 @@ impl<B: Blocks> Shell<B> {
         let mut sched = Scheduler::default();
 
         for msg in inbound {
+            // Attribution BEFORE the work, so the steps the work produces
+            // have somewhere to go.
+            self.attribute(&msg);
             let effects = match msg {
                 Inbound::Client(bytes) => match crate::serve::serve(&bytes) {
                     crate::serve::Served::Do(r) => self.on_protocol(r),
@@ -289,6 +356,30 @@ impl<B: Blocks> Shell<B> {
             // a node response — which is all of them after `Accepted`, so a
             // write published and the client was never told.
             self.reply_from(&effects, &mut out);
+            // What the core DID, as it did it. A delegate has no log anyone
+            // can read, so without this a break anywhere in the chain looks
+            // like every other break: a write that stops at `Accepted`.
+            self.step(1, protocol::Step::Effects, effects.len() as u64);
+            for f in &effects {
+                match f {
+                    Effect::Notify {
+                        write_id, state, ..
+                    } => {
+                        // The operation is named HERE as well as at the
+                        // request, because a call driven by a node response
+                        // has no request to name it — and that is most of a
+                        // write's life.
+                        self.tracing_of = Some(protocol::TraceOf::Write(write_id.0));
+                        self.step(2, protocol::Step::Reached, state_tag(*state));
+                    }
+                    Effect::Reply { req_id, result, .. } => {
+                        self.tracing_of = Some(protocol::TraceOf::Read(req_id.0));
+                        self.step(2, protocol::Step::Reached, rows_in(result));
+                    }
+                    Effect::FetchBlock { .. } => self.step(2, protocol::Step::Fetch, 1),
+                    _ => {}
+                }
+            }
             out.effects += effects.len();
             sched.offer(effects);
         }
@@ -334,10 +425,54 @@ impl<B: Blocks> Shell<B> {
                 self.head = Some((*seq, *root));
             }
         }
+        // The node operations this call actually issued, counted after the
+        // scheduler has decided which go out — the effects above say what the
+        // core wanted, and these say what left.
+        let puts = out
+            .ops
+            .iter()
+            .filter(|o| matches!(o, Op::Put { .. }))
+            .count();
+        if puts > 0 {
+            self.step(1, protocol::Step::Put, puts as u64);
+        }
+        for op in &out.ops {
+            if let Op::Head { seq, .. } = op {
+                self.step(1, protocol::Step::Head, *seq);
+            }
+        }
+        if self.read_back_hits > 0 {
+            self.step(1, protocol::Step::ReadBack, self.read_back_hits as u64);
+        }
+        for r in std::mem::take(&mut self.trace) {
+            out.replies.push(protocol::encode_reply(&r));
+        }
         out.stranded = sched.ready_len() + sched.held_len();
         out.awaiting = self.awaiting.len();
         out.read_back_hits = self.read_back_hits;
         out
+    }
+
+    /// The most steps one call may emit.
+    ///
+    /// A trace is diagnostics riding the same connection as the data, so it
+    /// is bounded like anything else on that wire. A call that produced more
+    /// than this emits the first `MAX_STEPS` — the beginning of a call tree
+    /// is where the shape is, and a truncated beginning beats a complete
+    /// middle nobody can see the start of.
+    fn step(&mut self, depth: u8, what: protocol::Step, n: u64) {
+        if !self.tracing || self.trace.len() >= MAX_STEPS {
+            return;
+        }
+        let Some(of) = self.tracing_of else {
+            // A step with nothing to attribute it to is a line in a log. The
+            // whole point of a call TREE is that every step belongs to an
+            // operation, so one that does not is dropped rather than emitted
+            // under a made-up id.
+            return;
+        };
+        self.trace
+            .push(protocol::Reply::Step { of, depth, what, n });
     }
 
     /// A versioned protocol request.
@@ -348,6 +483,17 @@ impl<B: Blocks> Shell<B> {
     /// drift apart.
     fn on_protocol(&mut self, r: protocol::Request) -> Vec<Effect> {
         use protocol::Request as P;
+        // ONE conversion, used by every arm that takes a range. Three arms
+        // take one now; three copies of this would be three places for the
+        // bounds to be read differently.
+        fn bound(b: protocol::Bound) -> std::ops::Bound<Vec<u8>> {
+            use std::ops::Bound as B;
+            match b {
+                protocol::Bound::Unbounded => B::Unbounded,
+                protocol::Bound::Included(k) => B::Included(k),
+                protocol::Bound::Excluded(k) => B::Excluded(k),
+            }
+        }
         let ev = match r {
             P::Identity => {
                 // Identity is also how a session BEGINS. There is no separate
@@ -396,12 +542,6 @@ impl<B: Blocks> Shell<B> {
                 after,
                 max_entries,
             } => {
-                use std::ops::Bound as B;
-                let bound = |b: protocol::Bound| match b {
-                    protocol::Bound::Unbounded => B::Unbounded,
-                    protocol::Bound::Included(k) => B::Included(k),
-                    protocol::Bound::Excluded(k) => B::Excluded(k),
-                };
                 // CLAMPED here, and the clamp is reported back rather than
                 // applied silently: a caller that asked for a thousand rows
                 // and got a hundred needs to know the page it holds is not
@@ -422,11 +562,55 @@ impl<B: Blocks> Shell<B> {
                     }),
                 }
             }
-            // Preload and Subscribe are v1 vocabulary this shell does not
-            // serve yet (slice 6, with observability). Answered as such
+            P::Preload { roots } => Event::Preload {
+                client: as_client(1),
+                // Fixed-width ids off the wire. A root is 32 bytes; anything
+                // else is not one, and the engine's budget bounds how many of
+                // them are walked.
+                roots: roots.into_iter().collect(),
+            },
+            P::SubscribeRange { sub_id, lo, hi } => Event::SubscribeRange {
+                client: as_client(1),
+                sub_id,
+                range: engine::subs::SubRange {
+                    lo: bound(lo),
+                    hi: bound(hi),
+                },
+            },
+            // The ENGINE's copy only. The node has no unsubscribe, so a
+            // delegate goes on being woken for contracts its engine has
+            // forgotten — which is ordinary, not an error, and is why nothing
+            // here treats an unknown wake-up as one. Writing a release path
+            // that silently does nothing at the node would be worse than
+            // having none.
+            P::Unsubscribe { sub_id } => Event::Unsubscribe {
+                client: as_client(1),
+                sub_id,
+            },
+            P::ChangesSince {
+                req_id,
+                from,
+                lo,
+                hi,
+                max_entries,
+            } => Event::ChangesSince {
+                client: as_client(1),
+                req_id: as_req_id(req_id),
+                from,
+                range: engine::subs::SubRange {
+                    lo: bound(lo),
+                    hi: bound(hi),
+                },
+                max_entries: max_entries as usize,
+            },
+            // Still v1 vocabulary this shell does not serve. Answered as such
             // rather than silently ignored: a client that asked and heard
             // nothing cannot tell "not implemented" from "lost".
-            P::Preload { .. } | P::Subscribe { .. } => {
+            P::Trace { on } => {
+                self.tracing = on;
+                return Vec::new();
+            }
+            P::Subscribe { .. } => {
                 self.unserved.push(0);
                 return Vec::new();
             }
@@ -643,11 +827,88 @@ impl<B: Blocks> Shell<B> {
                         req_id: req_id.0,
                         blocked_on: [0u8; 32],
                     },
+                    engine::read::ReadResult::Delta {
+                        changes,
+                        cursor,
+                        new_root,
+                    } => protocol::Reply::Delta {
+                        req_id: req_id.0,
+                        changes: changes.clone(),
+                        cursor: cursor.clone(),
+                        new_root: *new_root,
+                    },
+                    engine::read::ReadResult::FullReloadRequired { new_root } => {
+                        protocol::Reply::FullReloadRequired {
+                            req_id: req_id.0,
+                            new_root: *new_root,
+                        }
+                    }
+                },
+                // A subscribed range moved. PUSHED — no client asked for this
+                // message, which is the whole point of it.
+                Effect::Changed {
+                    sub_id,
+                    new_root,
+                    seq,
+                    why,
+                    ..
+                } => protocol::Reply::Changed {
+                    sub_id: *sub_id,
+                    new_root: *new_root,
+                    seq: *seq,
+                    why: match why {
+                        engine::subs::Why::Diffed => protocol::Why::Diffed,
+                        engine::subs::Why::BlockMissing => protocol::Why::BlockMissing,
+                        engine::subs::Why::Budgeted => protocol::Why::Budgeted,
+                        engine::subs::Why::Stale => protocol::Why::Stale,
+                    },
+                },
+                // A subscribe was taken or refused. Answered either way: a
+                // client that believes it is subscribed and is not waits for
+                // ever, and nothing it can see would tell it so.
+                Effect::Subscribed {
+                    sub_id, accepted, ..
+                } => protocol::Reply::Subscribed {
+                    sub_id: *sub_id,
+                    accepted: match accepted {
+                        engine::subs::Accepted::Yes => protocol::Accepted::Yes,
+                        engine::subs::Accepted::Full => protocol::Accepted::Full,
+                        engine::subs::Accepted::TooWide => protocol::Accepted::TooWide,
+                    },
                 },
                 _ => continue,
             };
             out.replies.push(protocol::encode_reply(&r));
         }
+    }
+
+    /// Which operation the steps of this call belong to.
+    ///
+    /// A client request names itself. A node response does not, so the
+    /// previous call's operation stands until an effect names a new one —
+    /// which is right, because a node response IS the continuation of the
+    /// operation that issued the op it answers.
+    fn attribute(&mut self, msg: &Inbound) {
+        if !self.tracing {
+            return;
+        }
+        let Inbound::Client(bytes) = msg else { return };
+        let crate::serve::Served::Do(r) = crate::serve::serve(bytes) else {
+            return;
+        };
+        let (of, began) = match &r {
+            protocol::Request::Write { write_id, ops } => {
+                (protocol::TraceOf::Write(*write_id), ops.len() as u64)
+            }
+            protocol::Request::Get { req_id, .. }
+            | protocol::Request::Range { req_id, .. }
+            | protocol::Request::ChangesSince { req_id, .. } => {
+                (protocol::TraceOf::Read(*req_id), 0)
+            }
+            _ => return,
+        };
+        self.tracing_of = Some(of);
+        self.step(0, protocol::Step::Began, began);
     }
 
     /// Does the head Register already exist on the node?

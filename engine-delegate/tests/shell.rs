@@ -546,3 +546,159 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
         "  over the boundary: Busy, 0 puts; under it: Accepted, {under_puts} put(s), 0 stranded"
     );
 }
+
+/// A subscription survives the shell, and a commit pushes `Changed` on the
+/// wire — no client request in sight.
+///
+/// The shell rebuilds from its context on every call, which is what a delegate
+/// does, so this also pins that the subscription is CARRIED: an engine that
+/// held subscriptions only in memory would pass every in-process test and lose
+/// every subscription on the first call boundary, which is every call.
+#[test]
+fn a_subscribed_range_is_pushed_a_changed_across_the_context() {
+    let store = Store::default();
+    let mut ctx: Vec<u8> = Vec::new();
+
+    // One call: subscribe.
+    let mut s: Shell<Store> = Shell::resume(&ctx, Params::default(), store.clone());
+    let out = s.handle(vec![Inbound::Client(protocol::encode_request(
+        protocol::CURRENT,
+        &Request::SubscribeRange {
+            sub_id: 7,
+            lo: protocol::Bound::Included(b"k".to_vec()),
+            hi: protocol::Bound::Unbounded,
+        },
+    ))]);
+    let accepted: Vec<protocol::Accepted> = out
+        .replies
+        .iter()
+        .filter_map(|b| protocol::decode_reply(b).ok())
+        .filter_map(|r| match r {
+            Reply::Subscribed { accepted, .. } => Some(accepted),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        accepted,
+        [protocol::Accepted::Yes],
+        "the subscribe was not answered; a client that is not told cannot \
+         tell 'subscribed' from 'lost'"
+    );
+    ctx = s.to_context().expect("a context");
+
+    // Later calls: a whole write, driven to its head being confirmed. The
+    // shell is rebuilt from the context each time, as a delegate's is.
+    let mut changed: Vec<protocol::Reply> = Vec::new();
+    let mut inbound = vec![Inbound::Client(write_req())];
+    for _ in 0..24 {
+        let mut s: Shell<Store> = Shell::resume(&ctx, Params::default(), store.clone());
+        let out = s.handle(std::mem::take(&mut inbound));
+        ctx = s.to_context().expect("a context after every call");
+        assert_eq!(out.stranded, 0, "the shell stranded effects");
+        for b in &out.replies {
+            if let Ok(r @ Reply::Changed { .. }) = protocol::decode_reply(b) {
+                changed.push(r);
+            }
+        }
+        // The node does what the ops asked.
+        for op in out.ops {
+            match op {
+                engine_delegate::schedule::Op::Put { id, bytes } => {
+                    store.put(id, &bytes);
+                    inbound.push(Inbound::PutAcked { id, ok: true });
+                }
+                engine_delegate::schedule::Op::Get { id, .. } => {
+                    let held = store.get(&id).map(|b| b.to_vec());
+                    inbound.push(Inbound::GotState { id, bytes: held });
+                }
+                engine_delegate::schedule::Op::Head { seq, root } => {
+                    inbound.push(Inbound::GotHead { seq, root })
+                }
+                engine_delegate::schedule::Op::ReadHead { .. } => inbound.push(Inbound::NoHead),
+            }
+        }
+        if inbound.is_empty() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        changed.len(),
+        1,
+        "expected exactly one Changed pushed for one commit, got {changed:?}"
+    );
+    match &changed[0] {
+        Reply::Changed {
+            sub_id, why, seq, ..
+        } => {
+            assert_eq!(*sub_id, 7, "the push named a subscription nobody took");
+            assert_eq!(
+                *why,
+                protocol::Why::Diffed,
+                "the engine held the whole tree, so it must have COMPARED it \
+                 rather than guessing"
+            );
+            assert!(*seq > 0, "the push named seq 0");
+        }
+        other => panic!("not a Changed: {other:?}"),
+    }
+    println!("  one commit -> one Changed pushed, across {} calls", 24);
+}
+
+/// A key OUTSIDE the subscribed range pushes nothing.
+///
+/// Its control is the test above: the same shell, the same commit machinery,
+/// a range that DOES contain the key, pushing exactly one. Without that pair,
+/// silence here would equally be the output of a push path that never works.
+#[test]
+fn a_commit_outside_the_subscribed_range_pushes_nothing() {
+    let store = Store::default();
+    let mut s: Shell<Store> = Shell::resume(&[], Params::default(), store.clone());
+    let out = s.handle(vec![Inbound::Client(protocol::encode_request(
+        protocol::CURRENT,
+        &Request::SubscribeRange {
+            sub_id: 7,
+            // `write_req` writes the key "k"; this range starts after it.
+            lo: protocol::Bound::Included(b"zzz".to_vec()),
+            hi: protocol::Bound::Unbounded,
+        },
+    ))]);
+    assert!(!out.replies.is_empty(), "the subscribe was not answered");
+    let mut ctx = s.to_context().expect("a context");
+
+    let mut changed = 0usize;
+    let mut inbound = vec![Inbound::Client(write_req())];
+    for _ in 0..24 {
+        let mut s: Shell<Store> = Shell::resume(&ctx, Params::default(), store.clone());
+        let out = s.handle(std::mem::take(&mut inbound));
+        ctx = s.to_context().expect("a context");
+        for b in &out.replies {
+            if let Ok(Reply::Changed { .. }) = protocol::decode_reply(b) {
+                changed += 1;
+            }
+        }
+        for op in out.ops {
+            match op {
+                engine_delegate::schedule::Op::Put { id, bytes } => {
+                    store.put(id, &bytes);
+                    inbound.push(Inbound::PutAcked { id, ok: true });
+                }
+                engine_delegate::schedule::Op::Get { id, .. } => {
+                    let held = store.get(&id).map(|b| b.to_vec());
+                    inbound.push(Inbound::GotState { id, bytes: held });
+                }
+                engine_delegate::schedule::Op::Head { seq, root } => {
+                    inbound.push(Inbound::GotHead { seq, root })
+                }
+                engine_delegate::schedule::Op::ReadHead { .. } => inbound.push(Inbound::NoHead),
+            }
+        }
+        if inbound.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        changed, 0,
+        "a commit outside the subscribed range pushed {changed} notification(s)"
+    );
+}

@@ -123,6 +123,75 @@ pub enum Request {
         /// and nothing notices.
         signing_key: TestKey,
     },
+    /// Tell me when anything in this KEY RANGE changes.
+    ///
+    /// **For live data only.** A subscription costs context, a diff on every
+    /// root move and a push the client must handle, continuously, and it is
+    /// worth that only where the data changes while someone is looking and
+    /// the change is small against what it changed. Ordinary data is read
+    /// when it is wanted and is correct then; subscribing to it spends a slot
+    /// the live data needed. Nothing above this layer takes a subscription
+    /// out on a client's behalf.
+    ///
+    /// A separate request from [`Request::Subscribe`] rather than a field
+    /// added to it. A variant's position is its wire tag and its FIELDS are
+    /// its body, so adding `lo`/`hi` to `Subscribe` would leave the tag alone
+    /// and change what follows it — a v1 client's `Subscribe` would decode as
+    /// a range subscription over whatever the next bytes happened to be. The
+    /// recorded v1 session is what proves this did not happen.
+    SubscribeRange {
+        /// CLIENT-chosen, so `Unsubscribe` and every `Changed` name the same
+        /// subscription without the client having to learn an id the engine
+        /// invented.
+        sub_id: u64,
+        lo: Bound,
+        hi: Bound,
+    },
+    /// Stop telling me. Unknown ids are not an error: a client dropping a
+    /// subscription it already lost should not have to find out first.
+    Unsubscribe {
+        sub_id: u64,
+    },
+    /// Emit a call tree as operations happen, or stop.
+    ///
+    /// **Asked for in advance, never afterwards.** A delegate gets a fresh
+    /// linear memory on every call (F32), so there is nothing to ask about
+    /// once an operation is over — a trace held until it finished is a trace
+    /// that does not survive the thing it describes. So a client turns
+    /// emission ON and the steps arrive as they happen; assembling them into
+    /// a tree, and timing them, is the client's job.
+    Trace {
+        on: bool,
+    },
+    /// What changed in this range since the root I last saw?
+    ///
+    /// **No subscription is involved.** A delta is a capability of the tree,
+    /// available to any reader holding a root: an ordinary reload uses it, and
+    /// a binding that is not live uses it too. Being TOLD is the separate,
+    /// declared thing, and all it does is trigger this sooner.
+    ///
+    /// **Per TREE.** A view assembled over several device trees is NOT the
+    /// union of their per-tree deltas — a tombstone in one tree can REVEAL an
+    /// older value in another, which no per-tree diff mentions. Phase 3 has
+    /// one tree per identity; this is stated so nothing later assumes the
+    /// union is valid.
+    ChangesSince {
+        req_id: u64,
+        /// The root the CLIENT last saw. The client owns this, not the
+        /// engine — which is what makes a missed notification recoverable:
+        /// the gap closes in one call however many were dropped.
+        from: [u8; 32],
+        lo: Bound,
+        hi: Bound,
+        max_entries: u32,
+    },
+}
+
+/// Which id space a trace question is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraceOf {
+    Write(u64),
+    Read(u64),
 }
 
 /// A signing key that is not a real one, and says so in its own type.
@@ -222,6 +291,132 @@ pub enum Reply {
         /// What the node said, when it said anything.
         note: String,
     },
+    /// Something in a subscribed range changed. Appended to v1.
+    ///
+    /// PUSHED, not answered: no client asked for this message, which is the
+    /// whole point — a list that refreshes itself is a list nobody polls for.
+    Changed {
+        sub_id: u64,
+        /// Where the tree is NOW. That is all.
+        ///
+        /// No key list and no previous root. The CLIENT owns "the last root I
+        /// saw" and passes it to [`Request::ChangesSince`], which is what
+        /// makes a dropped notification self-healing: the next one, or the
+        /// client's own backstop, diffs across the whole gap in one call.
+        ///
+        /// It matters because delivery is lossy by construction — the node's
+        /// notification channel drops when full, and a subscription can be
+        /// evicted without anyone being told — so a client that missed some is
+        /// the ORDINARY case. A payload here would also raise the drop rate
+        /// for every other subscriber, to save a round trip that is local.
+        new_root: [u8; 32],
+        seq: u64,
+        /// How the engine knows. See [`Why`].
+        why: Why,
+    },
+    /// What changed since the root the client named. Appended to v1.
+    Delta {
+        req_id: u64,
+        /// `None` as a value is a REMOVAL, not an empty value. A client told
+        /// an empty value keeps a key the writer deleted.
+        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        cursor: Option<Vec<u8>>,
+        /// Where the client now stands, if it applies these.
+        new_root: [u8; 32],
+    },
+    /// The delta could not be computed; read the range in full instead.
+    ///
+    /// **A defined answer, not an error.** The old root's blocks may be gone
+    /// — superseded, holding no demand, evicted — and for a client that was
+    /// away a while that is ordinary rather than a failure. Naming the
+    /// fallback here means the degraded path is one thing that gets tested,
+    /// instead of something every caller re-invents.
+    FullReloadRequired {
+        req_id: u64,
+        new_root: [u8; 32],
+    },
+    /// A subscribe was taken, or refused and why. Appended to v1.
+    Subscribed {
+        sub_id: u64,
+        accepted: Accepted,
+    },
+    /// One step of an operation's call tree. Appended to v1.
+    ///
+    /// Emitted INCREMENTALLY, as it happens — never accumulated and sent at
+    /// the end. A delegate gets a fresh linear memory every call (F32), so a
+    /// tree held in memory until an operation finishes is a tree that does
+    /// not survive the operation it describes.
+    ///
+    /// There is no duration here. The engine has no clock — it is sans-IO by
+    /// construction — and a number it invented would be worse than none.
+    /// The CLIENT stamps each step as it arrives.
+    Step {
+        /// Which operation this belongs to.
+        of: TraceOf,
+        /// Depth in the tree: 0 is the operation itself.
+        depth: u8,
+        /// What this step is. A short fixed vocabulary, not free text: a
+        /// trace a client has to parse English out of is a log.
+        what: Step,
+        /// A count whose meaning depends on `what` — blocks, bytes, rows.
+        n: u64,
+    },
+}
+
+/// Why a subscriber was told something changed.
+///
+/// Distinct facts, never merged. Re-reading is correct on any of them, but a
+/// client deciding whether to back off has to know which it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Why {
+    /// The trees were compared over this range and they differ. A finding.
+    Diffed,
+    /// A block the comparison needed was not held. DURABLE — the old root's
+    /// blocks may be gone for good — so repetition means the range goes
+    /// `Stale` rather than notifying for ever.
+    BlockMissing,
+    /// The comparison was not attempted within this call's budget.
+    /// TRANSIENT: retry promptly, do not back off.
+    Budgeted,
+    /// The engine has STOPPED comparing this range and is saying so once.
+    /// Reload the range to retry; a declared degradation beats a silent one.
+    Stale,
+}
+
+/// What came of a subscribe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Accepted {
+    Yes,
+    /// The engine is at its own cap. The client still holds the intention and
+    /// may try again once it drops one.
+    Full,
+    /// A bound longer than the engine will hold. Refused rather than trimmed:
+    /// a silently narrowed range watches something the client did not ask for.
+    TooWide,
+}
+
+/// One kind of step in an operation's call tree.
+///
+/// APPEND ONLY, like everything else on this wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Step {
+    /// The operation began. `n` = how many edits, or 0 for a read.
+    Began,
+    /// The core returned effects. `n` = how many.
+    Effects,
+    /// Blocks were put. `n` = how many.
+    Put,
+    /// A put was read back and found. `n` = how many.
+    ReadBack,
+    /// The head was written. `n` = the seq.
+    Head,
+    /// The head was read back at the seq it was written at.
+    HeadConfirmed,
+    /// The operation reached a state a client can see. `n` = the
+    /// [`WriteState`] as its wire tag, or rows for a read.
+    Reached,
+    /// Blocks were fetched. `n` = how many.
+    Fetch,
 }
 
 /// What kind of message woke an engine call.

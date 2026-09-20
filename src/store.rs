@@ -18,23 +18,25 @@ pub enum Edit {
 /// deliberate: a write is screened by [`Db`](crate::Db) before it reaches a
 /// store, but whether a read can be answered at all is a property of the
 /// store, and only the store knows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
-    /// This store's data is on the other side of a connection, so a read is a
-    /// round trip and cannot be served from `&self`.
+    /// The engine could not answer: a block it needed was not to be had.
     ///
-    /// Not a failure of the read — a statement that this caller asked through
-    /// the wrong door. The engine backend answers reads through its own
-    /// `&mut self` methods.
-    NeedsRoundTrip,
+    /// Not "the key does not exist" — that is `Ok(None)`, and the two are
+    /// different facts an app acts on differently.
+    Unavailable,
+    /// The connection to the engine produced nothing usable.
+    NoAnswer,
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StoreError::NeedsRoundTrip => {
-                f.write_str("this store's reads are round trips and cannot be served synchronously")
-            }
+            StoreError::Unavailable => f.write_str(
+                "the engine could not reach a block this read needed; \
+                 the key may well exist",
+            ),
+            StoreError::NoAnswer => f.write_str("the engine did not answer"),
         }
     }
 }
@@ -43,9 +45,82 @@ impl std::error::Error for StoreError {}
 
 pub type Read<T> = std::result::Result<T, StoreError>;
 
-/// A sorted byte map.
+/// What a delta answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delta {
+    /// The changes, and where they bring the reader to. `None` as a value is
+    /// a REMOVAL, not an empty value.
+    Changes {
+        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        cursor: Option<Vec<u8>>,
+        new_root: [u8; 32],
+    },
+    /// The delta could not be computed; read the range in full.
+    ///
+    /// A defined outcome rather than an error: the root the reader was
+    /// standing on may simply be gone, which is ordinary for a reader that
+    /// was away a while.
+    FullReloadRequired { new_root: [u8; 32] },
+}
+
+/// Reading, which for some stores is a ROUND TRIP.
 ///
-/// **An implementation may treat a WRITE it cannot represent as a bug and
+/// Separate from [`Store`], and taking `&mut self`, and both are the same
+/// decision. An engine-backed store's data is on the other side of a
+/// connection: a read is an operation with a duration, not an accessor. A
+/// `&self` read would have to hide interior mutability — making a network
+/// round trip look free — or answer `None`, which says the key does not
+/// exist, or panic, which in a browser with `panic = abort` is a dead wasm
+/// instance rather than something an app can catch.
+///
+/// `&mut self` says so in the type, and it says so for every backend, which
+/// is what lets one surface sit over both: the in-memory store implements
+/// this trivially and an app does not change when it moves onto a node.
+pub trait Reads {
+    fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>>;
+
+    /// Entries with `lo <= key < hi`, ascending, or descending if `reverse`;
+    /// at most `limit`.
+    fn scan(
+        &mut self,
+        lo: &[u8],
+        hi: &[u8],
+        reverse: bool,
+        limit: usize,
+    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// The root this store is currently standing on.
+    ///
+    /// What a reader passes back to [`Reads::changes_since`]. An in-memory
+    /// store has one too — its tree has a root like any other — so a binding
+    /// written against this works unchanged on both backends.
+    fn root(&mut self) -> Read<[u8; 32]>;
+
+    /// What changed in `[lo, hi)` since `from`.
+    ///
+    /// **Per TREE.** A view assembled over several device trees is NOT the
+    /// union of their per-tree deltas: a tombstone in one tree can REVEAL an
+    /// older value in another, which no per-tree diff mentions. Phase 3 has
+    /// one tree per identity; this is stated so nothing later assumes the
+    /// union is valid.
+    ///
+    /// No subscription is involved. A delta is a capability of the tree,
+    /// available to any reader holding a root — a plain reload uses it.
+    fn changes_since(
+        &mut self,
+        from: [u8; 32],
+        lo: &[u8],
+        hi: &[u8],
+        max_entries: u32,
+    ) -> Read<Delta>;
+}
+
+/// A sorted byte map: the WRITE half.
+///
+/// Reading lives in [`Reads`], because for some stores a read is a round trip
+/// and that has to be visible in the type rather than hidden behind `&self`.
+///
+/// **An implementation may treat a write it cannot represent as a bug and
 /// stop.** A write has no error channel — `put` returns nothing — so a key or
 /// value past what the underlying structure allows cannot be reported, and
 /// failing quietly would be worse than failing loudly. Screening is
@@ -53,26 +128,10 @@ pub type Read<T> = std::result::Result<T, StoreError>;
 /// limits before a store is touched, and returns an error the app can handle.
 /// That division is deliberate, and it is why [`TreeStore`](crate::TreeStore)
 /// may panic where a limit is breached.
-///
-/// **A READ may fail, and must never panic.** A store whose data is remote
-/// cannot answer from `&self`, and the honest answer to that is
-/// [`StoreError::NeedsRoundTrip`] — not `None`, which says the key does not
-/// exist, and not a panic, which in a browser is a dead wasm instance rather
-/// than something an app can catch.
 pub trait Store {
-    fn get(&self, key: &[u8]) -> Read<Option<Vec<u8>>>;
     fn put(&mut self, key: &[u8], value: &[u8]);
     /// Returns whether the key existed.
     fn delete(&mut self, key: &[u8]) -> bool;
-    /// Entries with `lo <= key < hi`, ascending, or descending if `reverse`;
-    /// at most `limit`.
-    fn scan(
-        &self,
-        lo: &[u8],
-        hi: &[u8],
-        reverse: bool,
-        limit: usize,
-    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Apply several edits as ONE change.
     ///
@@ -115,17 +174,20 @@ pub fn sorted_edits(edits: Vec<(Vec<u8>, Edit)>) -> Vec<(Vec<u8>, Edit)> {
 pub struct MemStore(BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl Store for MemStore {
-    fn get(&self, key: &[u8]) -> Read<Option<Vec<u8>>> {
-        Ok(self.0.get(key).cloned())
-    }
     fn put(&mut self, key: &[u8], value: &[u8]) {
         self.0.insert(key.to_vec(), value.to_vec());
     }
     fn delete(&mut self, key: &[u8]) -> bool {
         self.0.remove(key).is_some()
     }
+}
+
+impl Reads for MemStore {
+    fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
+        Ok(self.0.get(key).cloned())
+    }
     fn scan(
-        &self,
+        &mut self,
         lo: &[u8],
         hi: &[u8],
         reverse: bool,
@@ -142,6 +204,41 @@ impl Store for MemStore {
             r.rev().take(limit).collect()
         } else {
             r.take(limit).collect()
+        })
+    }
+    /// A hash of the whole map.
+    ///
+    /// Not a prolly root, and it does not have to be: what a root is FOR here
+    /// is answering "is this the same content I last saw", and a content hash
+    /// answers that exactly. It means a binding over the in-memory store
+    /// behaves like one over a tree — including reloading when it should —
+    /// rather than working only on the backend it was tested against.
+    fn root(&mut self) -> Read<[u8; 32]> {
+        let mut h = blake3::Hasher::new();
+        for (k, v) in &self.0 {
+            h.update(&(k.len() as u64).to_le_bytes());
+            h.update(k);
+            h.update(&(v.len() as u64).to_le_bytes());
+            h.update(v);
+        }
+        Ok(*h.finalize().as_bytes())
+    }
+    /// The in-memory store keeps no history, so it cannot diff two roots.
+    ///
+    /// It says so with the DEFINED answer rather than an error, which is the
+    /// point of that answer existing: a binding does the same thing here as
+    /// it does against an engine whose old root has been evicted, so the
+    /// reload path is exercised on both backends instead of only the one
+    /// that is harder to test.
+    fn changes_since(
+        &mut self,
+        _from: [u8; 32],
+        _lo: &[u8],
+        _hi: &[u8],
+        _max_entries: u32,
+    ) -> Read<Delta> {
+        Ok(Delta::FullReloadRequired {
+            new_root: self.root()?,
         })
     }
 }

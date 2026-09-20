@@ -342,6 +342,101 @@ async fn main() -> Result<()> {
         None => bail!("a range over the new connection returned no page at all"),
     }
 
+    // ---- SLICE 6: a subscription, and where a push actually lands ----
+    //
+    // The second connection asks to be told when `live/` changes, then the
+    // FIRST writes. What is being established is not only "a notification
+    // exists" but WHICH CONNECTION it reaches — a delegate's output goes back
+    // to whoever invoked it, and whether a push can reach a connection that
+    // did not is a property of the platform, not of this engine. It is
+    // measured here rather than assumed, and reported either way.
+    send(
+        &mut second,
+        &dkey,
+        &Request::SubscribeRange {
+            sub_id: 7,
+            lo: protocol::Bound::Included(b"live/".to_vec()),
+            hi: protocol::Bound::Excluded(b"live0".to_vec()),
+        },
+    )
+    .await?;
+    match read_subscribed(&mut second, deadline).await {
+        Some(protocol::Accepted::Yes) => {
+            println!("sub:   the engine took a subscription over the SECOND connection")
+        }
+        Some(other) => bail!("the engine refused the subscription: {other:?}"),
+        None => {
+            bail!("the subscribe was never answered, so a client cannot tell subscribed from lost")
+        }
+    }
+
+    // The first connection writes into the subscribed range.
+    let third_key = b"live/three".to_vec();
+    send(
+        &mut client,
+        &dkey,
+        &Request::Write {
+            write_id: 3,
+            ops: vec![protocol::Op::Put(third_key.clone(), vec![0x33u8; 64])],
+        },
+    )
+    .await?;
+    let on_writer = drain_changed(&mut client, Instant::now() + STEP).await;
+
+    // And the second connection, which asked for it, turns over WITHOUT
+    // asking for the data — a Tick is the cheapest message that is not a
+    // request for anything.
+    send(&mut second, &dkey, &Request::Tick { now: 1 }).await?;
+    let on_watcher = drain_changed(&mut second, Instant::now() + STEP).await;
+
+    println!(
+        "sub:   Changed seen on the WRITER's connection: {on_writer:?}; on the WATCHER's: {on_watcher:?}"
+    );
+    if on_writer.is_empty() && on_watcher.is_empty() {
+        bail!(
+            "a commit landed inside a subscribed range and NO connection saw a \
+             Changed at all — the notification path is not wired"
+        );
+    }
+    // Whichever connection it landed on, the fact under test is that the
+    // engine produced exactly one per commit and named the range's own
+    // subscription.
+    let all: Vec<u64> = on_writer.iter().chain(on_watcher.iter()).copied().collect();
+    if all.iter().any(|s| *s != 7) {
+        bail!("a Changed named a subscription nobody took: {all:?}");
+    }
+    if all.len() != 1 {
+        bail!("one commit produced {} notifications: {all:?}", all.len());
+    }
+    if on_watcher.is_empty() {
+        println!(
+            "  NOTE: the push reached the WRITER's connection, not the watcher's. A \
+             delegate's output returns to whoever invoked it, so a notification is \
+             delivered on whatever exchange is in flight — which is why a live \
+             binding's correctness rests on its backstop and not on being told."
+        );
+    }
+
+    // The BACKSTOP, which is what makes a binding correct either way: the
+    // watcher re-reads the head and finds the newer root.
+    send(&mut second, &dkey, &Request::Identity).await?;
+    let _ = timeout(Duration::from_secs(3), second.recv()).await;
+    send(
+        &mut second,
+        &dkey,
+        &Request::Get {
+            req_id: 9,
+            key: third_key.clone(),
+        },
+    )
+    .await?;
+    match read_value(&mut second, deadline).await {
+        Some(v) if v.len() == 64 => {
+            println!("back:  the watcher read the new row on its own re-read (the backstop)")
+        }
+        other => bail!("the backstop did not find the write: {other:?}"),
+    }
+
     // ---- the page-closed promise: Flush, close, reopen, read back ----
     send(&mut client, &dkey, &Request::Flush).await?;
     let _ = timeout(Duration::from_secs(2), client.recv()).await;
@@ -361,6 +456,58 @@ async fn main() -> Result<()> {
     println!("budget: {:?} of {BUDGET:?} used", started.elapsed());
     println!("done");
     Ok(())
+}
+
+/// Whether a subscribe was taken.
+async fn read_subscribed(client: &mut WebApi, deadline: Instant) -> Option<protocol::Accepted> {
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left.min(STEP), client.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
+                for v in values {
+                    if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                        if let Ok(Reply::Subscribed { accepted, .. }) =
+                            protocol::decode_reply(&m.payload.to_vec())
+                        {
+                            return Some(accepted);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Every `Changed` this connection has been handed, until the deadline.
+///
+/// Drains rather than waits for one: a push arrives on whatever exchange is
+/// in flight, so "did anything arrive here" is the question, and a function
+/// that returned on the first one could not answer "how many".
+async fn drain_changed(client: &mut WebApi, deadline: Instant) -> Vec<u64> {
+    let mut out = Vec::new();
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left.min(Duration::from_millis(400)), client.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
+                for v in values {
+                    if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                        if let Ok(Reply::Changed { sub_id, why, .. }) =
+                            protocol::decode_reply(&m.payload.to_vec())
+                        {
+                            println!("  changed: sub {sub_id} why {why:?}");
+                            out.push(sub_id);
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    out
 }
 
 /// One page of a range, and the page size the engine actually used.

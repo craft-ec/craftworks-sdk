@@ -499,10 +499,11 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
 /// here would otherwise go unscanned for ever.
 #[test]
 fn no_global_state_in_the_engine() {
-    const SOURCES: [(&str, &str); 3] = [
+    const SOURCES: [(&str, &str); 4] = [
         ("src/lib.rs", include_str!("../src/lib.rs")),
         ("src/read.rs", include_str!("../src/read.rs")),
         ("src/pack.rs", include_str!("../src/pack.rs")),
+        ("src/subs.rs", include_str!("../src/subs.rs")),
     ];
     let pattern = [
         "static ",

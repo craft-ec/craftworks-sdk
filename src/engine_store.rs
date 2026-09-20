@@ -17,7 +17,8 @@
 //!    when the engine has the write, because that is when a subsequent read
 //!    through the same engine will see it.
 
-use crate::store::{Edit, Read, Store, StoreError};
+use crate::store::{Delta, Edit, Read, Reads, Store, StoreError};
+use crate::trace::{Trace, Traces};
 use protocol::outbox::{Lost, Outbox, PreImage};
 use protocol::{Reply, Request, WriteState};
 
@@ -52,6 +53,18 @@ pub enum Event {
     Conflict { write_id: u64, keys: Vec<Vec<u8>> },
     /// A write will never be applied and re-submitting would not help.
     Failed { write_id: u64 },
+    /// Something in a subscribed range changed. An ACCELERATOR: a binding
+    /// that never heard this would still be correct, on its backstop.
+    Changed {
+        sub_id: u64,
+        new_root: [u8; 32],
+        why: protocol::Why,
+    },
+    /// The engine has stopped comparing a range. Reload it to retry.
+    ///
+    /// Surfaced rather than swallowed: a binding whose notifications quietly
+    /// stopped looks exactly like one whose data quietly stopped changing.
+    Stale { sub_id: u64 },
 }
 
 pub struct EngineStore<T: Transport> {
@@ -63,6 +76,11 @@ pub struct EngineStore<T: Transport> {
     /// How many times the outbox re-sent something. Reported, so "it worked"
     /// and "it worked first time" are distinguishable.
     pub resubmits: u64,
+    /// Call trees, when tracing is on.
+    traces: Traces,
+    /// The client's clock, as a function, because this crate compiles to wasm
+    /// and to a host binary and must not reach for one of its own.
+    now_ms: Option<Box<dyn Fn() -> u64>>,
 }
 
 impl<T: Transport> EngineStore<T> {
@@ -73,16 +91,117 @@ impl<T: Transport> EngineStore<T> {
             next_write_id: 1,
             events: Vec::new(),
             resubmits: 0,
+            traces: Traces::default(),
+            now_ms: None,
         }
     }
 
+    /// Turn the call tree on, with the clock the app already uses.
+    ///
+    /// The clock is HANDED IN. The engine has none — it is sans-IO, which is
+    /// what makes it testable — so every duration in a trace is the client's
+    /// own measurement of its own wait, which is the number an app cares
+    /// about anyway.
+    pub fn trace_on(&mut self, now_ms: Box<dyn Fn() -> u64>) {
+        self.now_ms = Some(now_ms);
+        let _ = self.ask(&Request::Trace { on: true });
+    }
+
+    pub fn trace_off(&mut self) {
+        let _ = self.ask(&Request::Trace { on: false });
+        self.now_ms = None;
+    }
+
+    /// The call tree for one operation, if it was traced.
+    pub fn trace(&self, of: protocol::TraceOf) -> Option<&Trace> {
+        self.traces.of(of)
+    }
+
+    /// Send one request and take its replies, harvesting anything PUSHED.
+    ///
+    /// A `Changed` arrives on whatever exchange happens to be in flight — no
+    /// client asked for it, so it belongs to no particular request. Harvesting
+    /// here means every call drains them, rather than only a call that thought
+    /// to look; a notification that arrives on the exchange for an unrelated
+    /// read is the ordinary case, not a special one.
     fn ask(&mut self, r: &Request) -> Vec<Reply> {
         let bytes = protocol::encode_request(protocol::CURRENT, r);
-        self.transport
+        let replies: Vec<Reply> = self
+            .transport
             .exchange(&bytes)
             .iter()
             .filter_map(|b| protocol::decode_reply(b).ok())
-            .collect()
+            .collect();
+        let mut out = Vec::with_capacity(replies.len());
+        for reply in replies {
+            match reply {
+                Reply::Changed {
+                    sub_id,
+                    new_root,
+                    why,
+                    ..
+                } => {
+                    if why == protocol::Why::Stale {
+                        self.events.push(Event::Stale { sub_id });
+                    }
+                    self.events.push(Event::Changed {
+                        sub_id,
+                        new_root,
+                        why,
+                    });
+                }
+                Reply::Step { of, depth, what, n } => {
+                    // Stamped as it LANDS. There is no other honest moment:
+                    // the engine has no clock, so the only time anyone can
+                    // measure is the client's own wait.
+                    if let Some(now) = &self.now_ms {
+                        let t = now();
+                        self.traces.record(of, depth, what, n, t);
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// Ask to be told when a range changes.
+    ///
+    /// The engine may refuse — it has a cap, and the node beneath it has one
+    /// it does not control. The answer says which, because a client that
+    /// believes it is subscribed and is not waits for ever, and nothing it
+    /// can see would tell it so.
+    ///
+    /// There is no release path and that is deliberate: the platform has no
+    /// unsubscribe, so an `unsubscribe` here would drop the ENGINE's copy
+    /// while the node went on waking the delegate. `forget_subscription` says
+    /// what it actually does.
+    pub fn subscribe_range(&mut self, sub_id: u64, lo: &[u8], hi: &[u8]) -> Option<bool> {
+        for r in self.ask(&Request::SubscribeRange {
+            sub_id,
+            lo: protocol::Bound::Included(lo.to_vec()),
+            hi: protocol::Bound::Excluded(hi.to_vec()),
+        }) {
+            if let Reply::Subscribed { accepted, .. } = r {
+                return Some(accepted == protocol::Accepted::Yes);
+            }
+        }
+        None
+    }
+
+    /// Drop the ENGINE's copy of a subscription.
+    ///
+    /// Named for what it does. It does not and cannot release the node's: the
+    /// platform has no unsubscribe, so the delegate goes on being woken for
+    /// contracts its engine has forgotten. That is ordinary, and calling this
+    /// `unsubscribe` would promise something nothing here can deliver.
+    pub fn forget_subscription(&mut self, sub_id: u64) {
+        let _ = self.ask(&Request::Unsubscribe { sub_id });
+    }
+
+    /// Take the events that have accumulated. Drained, never dropped.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
     }
 
     /// Hash a value as the outbox compares them.
@@ -111,7 +230,11 @@ impl<T: Transport> EngineStore<T> {
         let pre: Vec<(Vec<u8>, Option<PreImage>)> = keys
             .iter()
             .map(|k| {
-                let now = self.read(k);
+                // A read that could not be answered gives NO pre-image, which
+                // the outbox treats as "I cannot compare" rather than as "it
+                // was absent" — so a Lost write over an unreadable key is a
+                // reported conflict, never a silent overwrite.
+                let now = self.read(k).ok().flatten();
                 (k.clone(), Self::pre(now.as_deref()))
             })
             .collect();
@@ -145,7 +268,10 @@ impl<T: Transport> EngineStore<T> {
                         WriteState::Lost => {
                             let current: std::collections::BTreeMap<Vec<u8>, Option<PreImage>> =
                                 keys.iter()
-                                    .map(|k| (k.clone(), Self::pre(self.read(k).as_deref())))
+                                    .map(|k| {
+                                        let v = self.read(k).ok().flatten();
+                                        (k.clone(), Self::pre(v.as_deref()))
+                                    })
                                     .collect();
                             match self
                                 .outbox
@@ -179,35 +305,40 @@ impl<T: Transport> EngineStore<T> {
         }
     }
 
-    fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+    fn read(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
         let replies = self.ask(&Request::Get {
             req_id: 0,
             key: key.to_vec(),
         });
         for r in replies {
             match r {
-                Reply::Value { value, .. } => return value,
+                Reply::Value { value, .. } => return Ok(value),
                 // A read the engine could not answer is NOT an absent key.
-                // Returning `None` would tell the caller the key does not
-                // exist, which is a different and wrong fact.
-                Reply::Unavailable { .. } => return None,
+                // `Ok(None)` would tell the caller the key does not exist,
+                // which is a different and wrong fact, and the caller would
+                // act on it — showing an empty list, or writing over
+                // something. The error says "ask again", which is the truth.
+                Reply::Unavailable { .. } => return Err(StoreError::Unavailable),
                 _ => {}
             }
         }
-        None
+        Err(StoreError::NoAnswer)
     }
 
-    /// Ask the engine who it is, and where its head is.
-    pub fn identity(&mut self) -> Option<(String, u64)> {
+    /// Ask the engine who it is, where its head is, and what root it stands on.
+    pub fn identity(&mut self) -> Read<(String, u64, [u8; 32])> {
         for r in self.ask(&Request::Identity) {
             if let Reply::Identity {
-                engine, head_seq, ..
+                engine,
+                head_seq,
+                head_root,
+                ..
             } = r
             {
-                return Some((engine, head_seq));
+                return Ok((engine, head_seq, head_root));
             }
         }
-        None
+        Err(StoreError::NoAnswer)
     }
 
     /// The tab is closing.
@@ -222,40 +353,17 @@ impl<T: Transport> EngineStore<T> {
 }
 
 impl<T: Transport> Store for EngineStore<T> {
-    fn get(&self, _key: &[u8]) -> Read<Option<Vec<u8>>> {
-        // `Store::get` takes `&self` and an exchange needs `&mut`. Hiding
-        // interior mutability here would make a round trip look free, and
-        // answering `None` would say the key does not exist — a different
-        // and wrong fact. So the read is refused, by name.
-        //
-        // Refused and not panicked: this is public and reachable, and with
-        // `panic = abort` a panic in the browser is a dead wasm instance
-        // rather than something an app can catch. Reads that can be answered
-        // go through `read_mut` and `page`.
-        Err(StoreError::NeedsRoundTrip)
-    }
-
     fn put(&mut self, key: &[u8], value: &[u8]) {
         self.submit(vec![protocol::Op::Put(key.to_vec(), value.to_vec())]);
     }
 
     fn delete(&mut self, key: &[u8]) -> bool {
-        let existed = self.read(key).is_some();
+        // A read that FAILED is not a key that was absent. Reported as "did
+        // not exist" here would be a lie the caller acts on; the write still
+        // goes, because deleting a key is right whether or not it was there.
+        let existed = matches!(self.read(key), Ok(Some(_)));
         self.submit(vec![protocol::Op::Delete(key.to_vec())]);
         existed
-    }
-
-    fn scan(
-        &self,
-        _lo: &[u8],
-        _hi: &[u8],
-        _reverse: bool,
-        _limit: usize,
-    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
-        // As `get`. An empty Vec would say the range is empty, which is a
-        // wrong answer with the same shape as a right one. `page` and `list`
-        // are the doors that work.
-        Err(StoreError::NeedsRoundTrip)
     }
 
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) {
@@ -273,12 +381,108 @@ impl<T: Transport> Store for EngineStore<T> {
     }
 }
 
-impl<T: Transport> EngineStore<T> {
-    /// A read, which is a round trip.
-    pub fn read_mut(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+/// Reads, which here are round trips — and say so by taking `&mut self`.
+///
+/// There is no `&self` read on this type to get wrong. The earlier shape had
+/// one that refused by name, which was better than panicking and still worse
+/// than this: a door that exists only to turn callers away is a door, and
+/// someone eventually walks through it.
+impl<T: Transport> Reads for EngineStore<T> {
+    fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
         self.read(key)
     }
 
+    fn scan(
+        &mut self,
+        lo: &[u8],
+        hi: &[u8],
+        reverse: bool,
+        limit: usize,
+    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
+        if lo >= hi || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        // Bounded by PAGES, not by rows: a range that keeps producing pages
+        // is a tree being written to faster than it is read, and returning
+        // what has been collected beats never returning.
+        for _ in 0..64 {
+            let p = self.page(
+                protocol::Bound::Included(lo.to_vec()),
+                protocol::Bound::Excluded(hi.to_vec()),
+                reverse,
+                after.clone(),
+                256,
+            )?;
+            let done = p.cursor.is_none() || p.entries.is_empty();
+            for e in p.entries {
+                if out.len() == limit {
+                    return Ok(out);
+                }
+                out.push(e);
+            }
+            if done {
+                break;
+            }
+            after = p.cursor;
+        }
+        Ok(out)
+    }
+
+    fn root(&mut self) -> Read<[u8; 32]> {
+        self.identity().map(|(_, _, root)| root)
+    }
+
+    fn changes_since(
+        &mut self,
+        from: [u8; 32],
+        lo: &[u8],
+        hi: &[u8],
+        max_entries: u32,
+    ) -> Read<Delta> {
+        let replies = self.ask(&Request::ChangesSince {
+            req_id: 0,
+            from,
+            lo: protocol::Bound::Included(lo.to_vec()),
+            hi: protocol::Bound::Excluded(hi.to_vec()),
+            max_entries,
+        });
+        for r in replies {
+            match r {
+                Reply::Delta {
+                    changes,
+                    cursor,
+                    new_root,
+                    ..
+                } => {
+                    return Ok(Delta::Changes {
+                        changes,
+                        cursor,
+                        new_root,
+                    })
+                }
+                Reply::FullReloadRequired { new_root, .. } => {
+                    return Ok(Delta::FullReloadRequired { new_root })
+                }
+                // A delta is never answered `Unavailable` by an engine that
+                // understands the request — `FullReloadRequired` is its
+                // degraded answer. One from an OLDER engine is treated the
+                // same way a client should treat any delta it cannot get: do
+                // the full read.
+                Reply::Unavailable { .. } => {
+                    return Ok(Delta::FullReloadRequired {
+                        new_root: self.root()?,
+                    })
+                }
+                _ => {}
+            }
+        }
+        Err(StoreError::NoAnswer)
+    }
+}
+
+impl<T: Transport> EngineStore<T> {
     /// One page of a range.
     ///
     /// Returns the rows and a cursor. The cursor is a KEY, not an offset: an
@@ -295,7 +499,7 @@ impl<T: Transport> EngineStore<T> {
         reverse: bool,
         after: Option<Vec<u8>>,
         max_entries: u32,
-    ) -> Page {
+    ) -> Read<Page> {
         let replies = self.ask(&Request::Range {
             req_id: 0,
             lo,
@@ -312,17 +516,19 @@ impl<T: Transport> EngineStore<T> {
                     max_entries: used,
                     ..
                 } => {
-                    return Page {
+                    return Ok(Page {
                         entries,
                         cursor,
                         page_size_used: used,
-                    }
+                    })
                 }
-                Reply::Unavailable { .. } => return Page::default(),
+                // An empty page here would say "the range is empty", which is
+                // a wrong answer wearing the shape of a right one.
+                Reply::Unavailable { .. } => return Err(StoreError::Unavailable),
                 _ => {}
             }
         }
-        Page::default()
+        Err(StoreError::NoAnswer)
     }
 
     /// Every row of a range, a page at a time.
@@ -335,11 +541,11 @@ impl<T: Transport> EngineStore<T> {
         lo: protocol::Bound,
         hi: protocol::Bound,
         reverse: bool,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
         let mut after: Option<Vec<u8>> = None;
         for _ in 0..64 {
-            let p = self.page(lo.clone(), hi.clone(), reverse, after.clone(), 256);
+            let p = self.page(lo.clone(), hi.clone(), reverse, after.clone(), 256)?;
             let done = p.cursor.is_none() || p.entries.is_empty();
             out.extend(p.entries);
             if done {
@@ -347,6 +553,12 @@ impl<T: Transport> EngineStore<T> {
             }
             after = p.cursor;
         }
-        out
+        Ok(out)
+    }
+
+    /// A read, which is a round trip. Kept as an inherent method because the
+    /// live driver and the tests reach for it by name.
+    pub fn read_mut(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
+        self.read(key)
     }
 }

@@ -10,7 +10,7 @@
 //! Papering over it would turn "this store forgot to keep a block it emitted"
 //! into a silently wrong answer.
 
-use crate::store::{sorted_edits, Edit, Read, Store};
+use crate::store::{sorted_edits, Delta, Edit, Read, Reads, Store};
 use freenet_prolly::apply::{apply_into, Edit as TreeEdit};
 use freenet_prolly::build::init;
 use freenet_prolly::node::{Node, Value};
@@ -395,10 +395,6 @@ impl TreeStore {
 }
 
 impl Store for TreeStore {
-    fn get(&self, key: &[u8]) -> Read<Option<Vec<u8>>> {
-        Ok(self.lookup(key))
-    }
-
     fn put(&mut self, key: &[u8], value: &[u8]) {
         self.apply_batch(&[(key.to_vec(), Edit::Put(value.to_vec()))]);
     }
@@ -407,48 +403,6 @@ impl Store for TreeStore {
         let existed = self.lookup(key).is_some();
         self.apply_batch(&[(key.to_vec(), Edit::Delete)]);
         existed
-    }
-
-    fn scan(
-        &self,
-        lo: &[u8],
-        hi: &[u8],
-        reverse: bool,
-        limit: usize,
-    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
-        if lo >= hi || limit == 0 {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        let mut req = Range {
-            lo: Bound::Included(lo.to_vec()),
-            hi: Bound::Excluded(hi.to_vec()),
-            reverse,
-            after: None,
-            // One page unless the caller wants more than a page holds.
-            max_entries: limit.min(4096),
-            max_bytes: usize::MAX,
-        };
-        loop {
-            let page = match range(&self.blocks, &self.root, &req) {
-                Ok(p) => p,
-                Err(freenet_prolly::range::RangeError::Read(e)) => Self::impossible(e),
-                Err(e) => unreachable!("the SDK asked for an impossible range: {e:?}"),
-            };
-            for (k, v) in &page.entries {
-                if out.len() == limit {
-                    break;
-                }
-                out.push((k.clone(), self.materialise(*v)));
-            }
-            let (next, finished) = (page.next.clone(), page.finished());
-            debug_assert!(page.need.is_empty(), "in memory nothing can be missing");
-            drop(page);
-            if finished || out.len() == limit {
-                return Ok(out);
-            }
-            req.after = next;
-        }
     }
 
     /// One `apply`, so a record and everything written with it become one new
@@ -498,6 +452,104 @@ impl Store for TreeStore {
             if self.prune_superseded {
                 self.prune_owed();
             }
+        }
+    }
+}
+
+impl Reads for TreeStore {
+    fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
+        Ok(self.lookup(key))
+    }
+
+    fn scan(
+        &mut self,
+        lo: &[u8],
+        hi: &[u8],
+        reverse: bool,
+        limit: usize,
+    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
+        if lo >= hi || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut req = Range {
+            lo: Bound::Included(lo.to_vec()),
+            hi: Bound::Excluded(hi.to_vec()),
+            reverse,
+            after: None,
+            // One page unless the caller wants more than a page holds.
+            max_entries: limit.min(4096),
+            max_bytes: usize::MAX,
+        };
+        loop {
+            let page = match range(&self.blocks, &self.root, &req) {
+                Ok(p) => p,
+                Err(freenet_prolly::range::RangeError::Read(e)) => Self::impossible(e),
+                Err(e) => unreachable!("the SDK asked for an impossible range: {e:?}"),
+            };
+            for (k, v) in &page.entries {
+                if out.len() == limit {
+                    break;
+                }
+                out.push((k.clone(), self.materialise(*v)));
+            }
+            let (next, finished) = (page.next.clone(), page.finished());
+            debug_assert!(page.need.is_empty(), "in memory nothing can be missing");
+            drop(page);
+            if finished || out.len() == limit {
+                return Ok(out);
+            }
+            req.after = next;
+        }
+    }
+
+    fn root(&mut self) -> Read<[u8; 32]> {
+        Ok(TreeStore::root(self))
+    }
+
+    /// The in-memory tree keeps every block it has ever written, so it CAN
+    /// diff two of its own roots — and does, through the same library call
+    /// the engine uses. A binding's delta path is therefore exercised on this
+    /// backend too, rather than only against a node.
+    fn changes_since(
+        &mut self,
+        from: [u8; 32],
+        lo: &[u8],
+        hi: &[u8],
+        max_entries: u32,
+    ) -> Read<Delta> {
+        let now = TreeStore::root(self);
+        let r = Range {
+            lo: Bound::Included(lo.to_vec()),
+            hi: Bound::Excluded(hi.to_vec()),
+            reverse: false,
+            after: None,
+            max_entries: max_entries.max(1) as usize,
+            max_bytes: usize::MAX,
+        };
+        match freenet_prolly::diff::diff(&self.blocks, &from, &now, &r, None) {
+            Ok(page) if page.need.is_empty() => {
+                let cursor = page.next.as_ref().map(|n| n.after.clone());
+                let changes = page
+                    .changes
+                    .into_iter()
+                    .map(|c| match c {
+                        freenet_prolly::diff::Change::Added { key, new }
+                        | freenet_prolly::diff::Change::Changed { key, new, .. } => {
+                            (key, Some(self.materialise(new)))
+                        }
+                        freenet_prolly::diff::Change::Removed { key, .. } => (key, None),
+                    })
+                    .collect();
+                Ok(Delta::Changes {
+                    changes,
+                    cursor,
+                    new_root: now,
+                })
+            }
+            // A root this store never held, or one whose blocks it cannot
+            // reach. The defined answer, not an error.
+            _ => Ok(Delta::FullReloadRequired { new_root: now }),
         }
     }
 }

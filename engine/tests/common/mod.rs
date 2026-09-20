@@ -38,6 +38,7 @@ thread_local! {
 struct Inner {
     blocks: Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>,
     forgotten: Rc<RefCell<std::collections::BTreeSet<Cid>>>,
+    reads: Rc<std::cell::Cell<usize>>,
 }
 
 #[derive(Clone)]
@@ -45,6 +46,10 @@ pub struct Store {
     inner: Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>,
     /// Blocks this store pretends not to have, for the forgetful case.
     forgotten: Rc<RefCell<std::collections::BTreeSet<Cid>>>,
+    /// Every `Blocks::get`, counted. A cost claim about a walk that is
+    /// supposed to read NOTHING can only be checked by something that would
+    /// see it if it read one block.
+    reads: Rc<std::cell::Cell<usize>>,
 }
 
 impl Default for Store {
@@ -52,6 +57,7 @@ impl Default for Store {
         THREAD_STORE.with(|i| Store {
             inner: i.blocks.clone(),
             forgotten: i.forgotten.clone(),
+            reads: i.reads.clone(),
         })
     }
 }
@@ -88,12 +94,22 @@ impl Store {
         Store {
             inner: Rc::new(RefCell::new(BTreeMap::new())),
             forgotten: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            reads: Rc::new(std::cell::Cell::new(0)),
         }
+    }
+
+    /// Blocks handed out since this store was made.
+    pub fn reads(&self) -> usize {
+        self.reads.get()
     }
 }
 
 impl Blocks for Store {
     fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        // Counted BEFORE the forgotten check: an ASK is a read whether or not
+        // the store chooses to answer it, and counting only the hits would
+        // make a walk over blocks nobody holds look free.
+        self.reads.set(self.reads.get() + 1);
         if self.forgotten.borrow().contains(cid) {
             return None;
         }

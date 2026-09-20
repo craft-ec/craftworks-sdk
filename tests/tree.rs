@@ -56,7 +56,7 @@ fn value(r: &mut impl FnMut() -> u64) -> Vec<u8> {
 }
 
 /// Random op sequences against the reference, checking everything after each op.
-fn differential(seed: u64, ops: usize, store: &mut impl Store) -> Map {
+fn differential(seed: u64, ops: usize, store: &mut (impl Store + Reads)) -> Map {
     let mut r = rng(seed);
     let mut want = Map::new();
     let mut mem = MemStore::default();
@@ -81,8 +81,8 @@ fn differential(seed: u64, ops: usize, store: &mut impl Store) -> Map {
                 let limit = 1 + (r() % 20) as usize;
                 for reverse in [false, true] {
                     assert_eq!(
-                        store.scan(&lo, &hi, reverse, limit),
-                        mem.scan(&lo, &hi, reverse, limit),
+                        Reads::scan(store, &lo, &hi, reverse, limit),
+                        Reads::scan(&mut mem, &lo, &hi, reverse, limit),
                         "op {n}: scan disagreed"
                     );
                 }
@@ -91,8 +91,8 @@ fn differential(seed: u64, ops: usize, store: &mut impl Store) -> Map {
         // Every key, every op — reads must agree the whole way, not at the end.
         for j in 0..60 {
             assert_eq!(
-                store.get(&key(j)),
-                mem.get(&key(j)),
+                Reads::get(store, &key(j)),
+                Reads::get(&mut mem, &key(j)),
                 "op {n}: get disagreed"
             );
         }
@@ -199,7 +199,11 @@ fn a_batch_equals_the_same_edits_one_at_a_time() {
             "round {round}: {n} edits as a batch gave a different root"
         );
         for i in 0..40u64 {
-            assert_eq!(batched.get(&key(i)), singly.get(&key(i)), "round {round}");
+            assert_eq!(
+                Reads::get(&mut batched, &key(i)),
+                Reads::get(&mut singly, &key(i)),
+                "round {round}"
+            );
         }
     }
 }
@@ -225,13 +229,20 @@ fn the_sdk_sorts_and_dedupes_before_the_tree_sees_a_batch() {
 
     let mut t = TreeStore::new();
     t.apply_batch(&edits);
-    assert_eq!(t.get(&key(1)).unwrap().as_deref(), Some(&b"early"[..]));
-    assert_eq!(t.get(&key(5)), Ok(None), "the delete was last");
+    assert_eq!(
+        Reads::get(&mut t, &key(1)).unwrap().as_deref(),
+        Some(&b"early"[..])
+    );
+    assert_eq!(Reads::get(&mut t, &key(5)), Ok(None), "the delete was last");
     // And the same batch offered to the reference store agrees.
     let mut m = MemStore::default();
     m.apply_batch(&edits);
     for i in [1u64, 3, 5] {
-        assert_eq!(t.get(&key(i)), m.get(&key(i)), "key {i}");
+        assert_eq!(
+            Reads::get(&mut t, &key(i)),
+            Reads::get(&mut m, &key(i)),
+            "key {i}"
+        );
     }
 }
 
@@ -261,7 +272,7 @@ fn a_refused_batch_changes_nothing() {
     assert_eq!(t.root(), before_root, "the root moved on a refused batch");
     assert_eq!(t.stats(), before_stats, "blocks changed on a refused batch");
     assert_eq!(
-        t.get(&key(1)).unwrap().as_deref(),
+        Reads::get(&mut t, &key(1)).unwrap().as_deref(),
         Some(&b"v"[..]),
         "and no edit landed"
     );

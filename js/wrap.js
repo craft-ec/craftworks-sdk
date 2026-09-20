@@ -21,6 +21,77 @@ export function wrap(raw) {
     // The tree behind the database: its root hash, and what it holds.
     root() { return this.#db.root(); }
     stats() { return JSON.parse(this.#db.stats()); }
+
+    // A BINDING: one domain, as a component consumes it.
+    //
+    //   const tasks = db.bind("tasks");
+    //   const rows = useSyncExternalStore(tasks.subscribe, tasks.getSnapshot);
+    //
+    // That is the whole integration with React, and the same object is a
+    // Svelte store (`subscribe` returning an unsubscribe) and drives a Vue
+    // ref. No adapter, because the shape a framework wants IS this shape.
+    //
+    // `live` is the app author's declaration that this data changes while
+    // someone is looking at it — a feed, a presence list, a document two
+    // people have open. Default FALSE, and it is the only thing it changes:
+    // a non-live binding has the same getSnapshot, the same subscribe and the
+    // same reload, and takes out no subscription anywhere. Flipping it never
+    // changes the component.
+    //
+    // Do not set it on ordinary data. A subscription is a standing cost paid
+    // continuously, and it is worth it only where being told sooner is worth
+    // something — data read once and shown is correct when it is read.
+    bind(domain, { live = false } = {}) { return new Binding(this, domain, live); }
+  }
+
+  // One domain's rows, with a referentially STABLE snapshot.
+  //
+  // The stability is the contract, not a nicety: useSyncExternalStore
+  // re-renders whenever getSnapshot() is not the same object as last time, so
+  // a binding that rebuilt its array on every call would re-render on every
+  // render for ever, whatever the data did. The array is replaced only when
+  // the rows differ.
+  class Binding {
+    #db; #domain; #live; #rows = []; #listeners = new Set(); #root = null;
+    constructor(db, domain, live) {
+      this.#db = db; this.#domain = domain; this.#live = live;
+      // Bound once, so React sees the SAME function identity across renders;
+      // a changing subscribe re-subscribes on every render.
+      this.subscribe = this.subscribe.bind(this);
+      this.getSnapshot = this.getSnapshot.bind(this);
+      this.reload();
+    }
+    get live() { return this.#live; }
+    // The rows, as the same array until they change.
+    getSnapshot() { return this.#rows; }
+    // subscribe(cb) -> unsubscribe. A NON-live binding takes one too: the
+    // callback fires when these rows change, which is what the component
+    // needs to know, and no subscription is taken out anywhere.
+    subscribe(cb) { this.#listeners.add(cb); return () => this.#listeners.delete(cb); }
+    // Bring the rows up to date. Cheap when nothing moved: the tree's root is
+    // compared first, so a reload with nothing to do reads nothing.
+    reload() {
+      const root = this.#db.root();
+      if (root === this.#root) return false;
+      const rows = this.#db.scan(this.#domain);
+      this.#root = root;
+      if (same(this.#rows, rows)) return false;
+      this.#rows = rows;
+      for (const cb of this.#listeners) cb();
+      return true;
+    }
+  }
+
+  // Are these the same rows? Compared by id and updated stamp rather than
+  // deeply: a record's contents cannot change without its `updated` moving,
+  // and a deep compare of a long list on every reload is the cost this is
+  // trying to avoid.
+  function same(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i].id !== b[i].id || a[i].updated !== b[i].updated) return false;
+    }
+    return true;
   }
   // `blockId` and nothing beside it: an app is given ids that ADDRESS
   // something. The raw module also exposes `contentHash` (plain BLAKE3, which

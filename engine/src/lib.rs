@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod pack;
 pub mod read;
+pub mod subs;
 
 /// Which client a write came from. Two tabs are two clients.
 #[derive(
@@ -127,6 +128,25 @@ pub enum Event {
         req_id: read::ReqId,
         range: Box<freenet_prolly::range::Range>,
     },
+    /// What changed in this range since the root the reader last saw?
+    ///
+    /// **No subscription is involved, and that is the point.** A delta is a
+    /// capability of the TREE — equal ids mean equal subtrees, so the
+    /// difference between two roots costs the changes and not the size — and
+    /// it is available to any reader holding a root, live or not. An ordinary
+    /// reload uses it: the client remembers the root it last read at and asks
+    /// only for what moved.
+    ///
+    /// Being TOLD that something changed is the separate, declared thing. It
+    /// triggers this; it is not required for it.
+    ChangesSince {
+        client: ClientId,
+        req_id: read::ReqId,
+        /// The root the reader is standing on.
+        from: Cid,
+        range: subs::SubRange,
+        max_entries: usize,
+    },
     /// Advisory: bring these roots' blocks nearer, within the budget. It may
     /// make later reads SOONER; it may never make them more or wider.
     Preload {
@@ -171,6 +191,25 @@ pub enum Event {
     AskWrite {
         client: ClientId,
         write_id: WriteId,
+    },
+
+    // ---- subscriptions ----
+    /// Tell me when anything between these keys changes.
+    SubscribeRange {
+        client: ClientId,
+        sub_id: u64,
+        range: subs::SubRange,
+    },
+    Unsubscribe {
+        client: ClientId,
+        sub_id: u64,
+    },
+    /// This client is gone. Everything it was watching goes with it.
+    ///
+    /// Separate from `Flush`, which is about shipping work: a tab that closed
+    /// still has writes worth publishing, and none worth notifying.
+    ClientGone {
+        client: ClientId,
     },
 }
 
@@ -270,6 +309,38 @@ pub enum Effect {
     // ---- recovery ----
     /// Read this device's own head, under this epoch.
     ReadHead { epoch: Epoch },
+
+    // ---- subscriptions ----
+    /// A subscribe was taken, or refused and WHY.
+    ///
+    /// Answered either way. A client that believes it is subscribed and is
+    /// not waits for ever for a notification nobody is going to send, and
+    /// there is nothing in what it can see that would tell it so.
+    Subscribed {
+        client: ClientId,
+        sub_id: u64,
+        accepted: subs::Accepted,
+    },
+    /// Something in a subscribed range changed.
+    ///
+    /// **The new root ONLY.** No key list, no previous root. The CLIENT owns
+    /// "the last root I saw" and passes it to `ChangesSince`, and that is what
+    /// makes a dropped notification self-healing: the next one, or the
+    /// client's own backstop, diffs across the whole gap in a single call. An
+    /// engine that carried the previous root would be asserting where the
+    /// client stood, and it does not know — the client may have missed three.
+    ///
+    /// Delivery is lossy by construction (the node's notification channel
+    /// drops when full, and a subscription can be evicted without telling
+    /// anyone), so "the client missed some" is the ordinary case rather than
+    /// the exceptional one, and the design has to be right for it.
+    Changed {
+        client: ClientId,
+        sub_id: u64,
+        new_root: Cid,
+        seq: u64,
+        why: subs::Why,
+    },
 }
 
 /// Everything tunable, in one place, so nothing downstream reads a literal.
@@ -441,6 +512,47 @@ pub struct Params {
     /// root whose blocks are not all there is a tree no reader can walk, and
     /// a crash in that window leaves one behind for ever.
     pub head_before_packs: bool,
+
+    // ---- subscriptions ----
+    /// Standing range subscriptions this engine will hold at once.
+    ///
+    /// They live in the 400 KiB context beside everything else, so this is a
+    /// slice of the same budget the reads and the in-flight commit come out
+    /// of. Over it a subscribe is REFUSED and the client told — a subscriber
+    /// that thinks it is watching and is not waits for ever, and nothing it
+    /// can see would tell it otherwise.
+    pub max_subscriptions: usize,
+    /// The longest bound a subscription may carry.
+    ///
+    /// The bounds are client-chosen byte strings. Without this one
+    /// subscription is an allocation whose size the sender picks — which is
+    /// the thing the wire's `MAX_MESSAGE` exists to prevent, one layer in.
+    pub max_sub_key: usize,
+    /// Consecutive `BlockMissing` answers after which a subscribed range is
+    /// declared `Stale` and stops being compared.
+    ///
+    /// A missing block on the OLD root is usually durable — superseded,
+    /// unpinned, evicted — so a range in that state would otherwise notify on
+    /// every commit for ever with a `why` the client can do nothing about. It
+    /// is told once and then left quiet; a reload re-subscribes and resets it.
+    /// A declared degradation beats an undeclared storm.
+    pub stale_after_missing: u32,
+    /// Changes one delta page may carry.
+    ///
+    /// A delta is a READ and is bounded like one. Unbounded, "what changed
+    /// since the root I saw a week ago" is the whole tree, held in memory at
+    /// once, in a delegate with 400 KiB of context and one 5-second call.
+    pub max_delta_entries: usize,
+    /// Answer every subscriber on every root move without comparing the
+    /// trees.
+    ///
+    /// OFF. Two jobs. It is the CONTROL for the range filter — with it on, a
+    /// commit that touched nothing a subscriber watches still notifies it, so
+    /// a test asserting "no notification for an untouched range" has
+    /// something that can make it fail. And it is the shape a DOWNGRADE takes:
+    /// an engine under pressure that stops comparing still tells its
+    /// subscribers, honestly, that it did not look.
+    pub notify_without_diff: bool,
 }
 
 impl Default for Params {
@@ -476,6 +588,11 @@ impl Default for Params {
             max_commit_blocks: 128,
             max_parity_scan_blocks: 512,
             head_before_packs: false,
+            stale_after_missing: 3,
+            max_delta_entries: 256,
+            max_subscriptions: 32,
+            max_sub_key: 256,
+            notify_without_diff: false,
         }
     }
 }
@@ -673,6 +790,8 @@ pub struct Engine<B: Blocks> {
     coded_since_commit: BTreeSet<ParityIds>,
     /// Everything the read path is waiting on.
     reads: read::Reads,
+    /// Who is watching which range.
+    subs: subs::Subs,
     /// Nodes parsed on the write path. A cost counter, not a statistic: the
     /// whole point of the diff walk is that this stays proportional to the
     /// tree's DEPTH, and a test that does not measure it would not notice the
@@ -726,6 +845,7 @@ impl<B: Blocks> Engine<B> {
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
             reads: read::Reads::default(),
+            subs: subs::Subs::default(),
             nodes_parsed: 0,
             now: 0,
         }
@@ -811,7 +931,52 @@ impl<B: Blocks> Engine<B> {
                 req_id,
                 read::Want::Scan(Box::new(range.as_ref().into())),
             ),
+            Event::ChangesSince {
+                client,
+                req_id,
+                from,
+                range,
+                max_entries,
+            } => self.on_read(
+                client,
+                req_id,
+                read::Want::Delta(Box::new(read::DeltaSpec {
+                    from,
+                    lo: range.lo,
+                    hi: range.hi,
+                    // Clamped here, where the engine's own appetite is
+                    // decided. A caller asking for a million changes is
+                    // asking the engine to hold a million changes.
+                    max_entries: max_entries.clamp(1, self.params.max_delta_entries),
+                })),
+            ),
             Event::Preload { client, roots } => self.on_preload(client, roots),
+            Event::SubscribeRange {
+                client,
+                sub_id,
+                range,
+            } => {
+                let accepted = self.subs.add(
+                    client,
+                    sub_id,
+                    range,
+                    self.params.max_subscriptions,
+                    self.params.max_sub_key,
+                );
+                vec![Effect::Subscribed {
+                    client,
+                    sub_id,
+                    accepted,
+                }]
+            }
+            Event::Unsubscribe { client, sub_id } => {
+                self.subs.remove(client, sub_id);
+                Vec::new()
+            }
+            Event::ClientGone { client } => {
+                self.subs.drop_client(client);
+                Vec::new()
+            }
             Event::BlockArrived { id, bytes } => self.on_arrived(id, bytes),
             Event::BlockMissed(id) => self.on_missed(id),
             Event::Start { key, epochs } => self.on_start(key, epochs),
@@ -845,12 +1010,15 @@ impl<B: Blocks> Engine<B> {
 
     fn on_head_read(&mut self, epoch: Epoch, seq: u64, root: Cid) -> Vec<Effect> {
         self.head_epoch = Some(epoch);
-        self.adopt(seq, root);
+        let changed = self.adopt(seq, root);
         self.recovered = true;
         // The tree is not walked here. Reads warm it lazily (slice 2), which
         // is also what makes a restart cheap: the engine is usable the moment
         // it knows its root.
-        Vec::new()
+        //
+        // This is the path a SECOND client learns on: its own engine never
+        // wrote anything, it re-read the head, and the root moved.
+        changed
     }
 
     /// No head under the newest epoch: try the one before it, and only when
@@ -864,9 +1032,9 @@ impl<B: Blocks> Engine<B> {
         }
         // A device with no head starts from the empty tree. Its root is a
         // constant, not something to fetch.
-        self.adopt(0, self.empty.cid);
+        let changed = self.adopt(0, self.empty.cid);
         self.recovered = true;
-        Vec::new()
+        changed
     }
 
     /// Another engine holds this device key and is ahead.
@@ -889,19 +1057,21 @@ impl<B: Blocks> Engine<B> {
         self.in_flight_since = None;
         self.unpublished.clear();
         self.coded_since_commit.clear();
-        self.adopt(seq, root);
+        let mut out = self.adopt(seq, root);
 
         // The writes are not silently dropped and not silently re-applied:
         // their EDITS are gone with the commit that never published, so the
         // clients are told, and re-submit against the head that won.
-        rebasing
-            .into_iter()
-            .map(|(client, write_id)| Effect::Notify {
-                client,
-                write_id,
-                state: State::Lost,
-            })
-            .collect()
+        out.extend(
+            rebasing
+                .into_iter()
+                .map(|(client, write_id)| Effect::Notify {
+                    client,
+                    write_id,
+                    state: State::Lost,
+                }),
+        );
+        out
     }
 
     /// A client asking after a write this engine has never heard of.
@@ -922,11 +1092,112 @@ impl<B: Blocks> Engine<B> {
         }]
     }
 
-    fn adopt(&mut self, seq: u64, root: Cid) {
+    /// Take a root as the published one, and tell whoever was watching.
+    ///
+    /// The notification is INSIDE this rather than beside each caller. Every
+    /// way the published root can move goes through here or through a commit
+    /// landing, and a subscriber that heard about only some of them would
+    /// miss exactly the changes another writer made — which is most of what a
+    /// second tab is for. Making it structural means a fourth caller added
+    /// later cannot forget.
+    #[must_use = "a root move that tells nobody is a subscription that misses it"]
+    fn adopt(&mut self, seq: u64, root: Cid) -> Vec<Effect> {
+        let was = self.published_root;
         self.root = root;
         self.published_root = root;
         self.published_seq = seq;
         self.next_seq = seq + 1;
+        self.notify_subs(was)
+    }
+
+    /// Tell every subscriber whose range a root move touched.
+    ///
+    /// Called wherever `published_root` moves, with the root it moved FROM.
+    /// There are exactly two such places — this engine's own commit landing,
+    /// and a head read adopting someone else's root — and a subscriber that
+    /// only hears about the first would miss every change another writer
+    /// made, which is most of what a second tab is for.
+    ///
+    /// `a == b` reads nothing, so calling this on a move that moved nothing
+    /// is free rather than merely harmless.
+    fn notify_subs(&mut self, from: Cid) -> Vec<Effect> {
+        if self.subs.is_empty() {
+            return Vec::new();
+        }
+        let to = self.published_root;
+        let seq = self.published_seq;
+        let stale_after = self.params.stale_after_missing;
+        if self.params.notify_without_diff {
+            // The CONTROL. Every subscriber hears about every move, with no
+            // comparison at all — which is what the range filter is supposed
+            // to improve on, and a filter nothing can make fail is not a
+            // filter. `Unknown` is the honest `why`: nothing was compared.
+            if from == to {
+                return Vec::new();
+            }
+            return self
+                .subs
+                .touched_without_diff(&from, &to)
+                .into_iter()
+                .map(|(client, sub_id, why)| Effect::Changed {
+                    client,
+                    sub_id,
+                    new_root: to,
+                    seq,
+                    why,
+                })
+                .collect();
+        }
+        // Through `source()`, not `blocks`, and the shell test is what found
+        // it. A brand-new device's root is the EMPTY LEAF, which is a constant
+        // of the format that nothing on the network holds until the first
+        // commit publishes it — so a diff from it against the node's store
+        // alone stops immediately on a block that is not missing at all. Every
+        // subscriber then got a spurious `BlockMissing` on the very first
+        // commit, on any range, including ranges the commit came nowhere near.
+        //
+        // The fields are disjoint, so this is a borrow split rather than a
+        // clone: `source()` reads `blocks` and `empty`, `touched` mutates
+        // `subs`.
+        let Engine {
+            subs,
+            blocks,
+            empty,
+            ..
+        } = self;
+        let source = WithEmptyLeaf {
+            inner: blocks,
+            empty_cid: empty.cid,
+            empty_bytes: &empty.bytes,
+        };
+        subs.touched(&source, &from, &to, stale_after)
+            .into_iter()
+            .map(|(client, sub_id, why)| Effect::Changed {
+                client,
+                sub_id,
+                new_root: to,
+                seq,
+                why,
+            })
+            .collect()
+    }
+
+    /// What a read that has GIVEN UP answers.
+    ///
+    /// One place, because there are four ways a read ends without an answer
+    /// and a delta must come out of all of them saying the same thing. Its
+    /// degraded answer is `FullReloadRequired` — a defined outcome the client
+    /// acts on by doing a plain range read — rather than `Unavailable`, which
+    /// is a failure the client would have to invent a recovery for. The old
+    /// root's blocks being gone is ORDINARY for a reader that was away, so
+    /// the path that handles it has to be the ordinary one.
+    fn gave_up(&self, want: &read::Want, blocked: Cid) -> read::ReadResult {
+        match want {
+            read::Want::Delta(_) => read::ReadResult::FullReloadRequired {
+                new_root: self.published_root,
+            },
+            _ => read::ReadResult::Unavailable(blocked),
+        }
     }
 
     /// Try a read, reply if it is answerable now, park it if it is not.
@@ -963,7 +1234,12 @@ impl<B: Blocks> Engine<B> {
                     _ => None,
                 })
                 .unwrap_or(root);
-            self.reads.parked.remove(&req_id);
+            let result = self
+                .reads
+                .parked
+                .remove(&req_id)
+                .map(|p| self.gave_up(&p.want, blocked))
+                .unwrap_or(read::ReadResult::Unavailable(blocked));
             self.forget_waiting(req_id);
             // A reply, not silence. The caller can retry when the burst
             // clears; a read that is simply dropped leaves it waiting for an
@@ -971,7 +1247,7 @@ impl<B: Blocks> Engine<B> {
             return vec![Effect::Reply {
                 client,
                 req_id,
-                result: read::ReadResult::Unavailable(blocked),
+                result,
             }];
         }
         out
@@ -1005,12 +1281,13 @@ impl<B: Blocks> Engine<B> {
                 // The tree names a block whose content is not that block. No
                 // number of fetches fixes it, and answering "absent" would be
                 // a wrong answer rather than a missing one.
+                let result = self.gave_up(&p.want, cid);
                 self.reads.parked.remove(&req_id);
                 self.forget_waiting(req_id);
                 out.push(Effect::Reply {
                     client: p.client,
                     req_id,
-                    result: read::ReadResult::Unavailable(cid),
+                    result,
                 });
             }
             read::Attempt::Need(ids) => {
@@ -1025,13 +1302,14 @@ impl<B: Blocks> Engine<B> {
                     q.rounds > self.params.max_read_rounds
                 };
                 if over {
+                    let blocked = ids.first().copied().unwrap_or(p.root);
+                    let result = self.gave_up(&p.want, blocked);
                     self.reads.parked.remove(&req_id);
                     self.forget_waiting(req_id);
-                    let blocked = ids.first().copied().unwrap_or(p.root);
                     return vec![Effect::Reply {
                         client: p.client,
                         req_id,
-                        result: read::ReadResult::Unavailable(blocked),
+                        result,
                     }];
                 }
                 let levels_done = self.reads.parked.get(&req_id).map_or(0, |q| q.levels_done);
@@ -1792,8 +2070,12 @@ impl<B: Blocks> Engine<B> {
             return out;
         }
         let c = self.pending.take().expect("checked");
+        let was = self.published_root;
         self.published_seq = c.seq;
         self.published_root = c.root;
+        // ONE per commit: this runs where the head is confirmed, which
+        // happens once per commit, rather than per write or per block.
+        out.extend(self.notify_subs(was));
         for (client, write_id) in &c.writes {
             out.push(Effect::Notify {
                 client: *client,
@@ -2197,11 +2479,12 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         for req in reqs {
             if let Some(p) = self.reads.parked.remove(&req) {
+                let result = self.gave_up(&p.want, id);
                 self.forget_waiting(req);
                 out.push(Effect::Reply {
                     client: p.client,
                     req_id: req,
-                    result: read::ReadResult::Unavailable(id),
+                    result,
                 });
             }
         }
@@ -2319,10 +2602,18 @@ struct Context {
     /// place client bytes ride in the context, which is why there is at most
     /// one and why `max_parked_write_bytes` bounds it.
     parked_write: Option<ParkedWrite>,
+    /// Standing range subscriptions. Bounded by `max_subscriptions` and
+    /// `max_sub_key`, because this is a slice of the same 400 KiB.
+    subs: subs::Subs,
 }
 
 /// The version this build writes. Bumped when the shape changes.
-const CONTEXT_VERSION: u16 = 1;
+///
+/// 2: subscriptions joined the context. A v1 context decodes to a DIFFERENT
+/// shape rather than failing — bincode reads the fields it was asked for —
+/// so the version is what refuses it, and a refused context is a fresh start
+/// rather than an engine in a state nobody chose.
+const CONTEXT_VERSION: u16 = 2;
 
 /// What a context this build wrote begins with.
 ///
@@ -2410,6 +2701,7 @@ impl<B: Blocks> Engine<B> {
                 .collect(),
             head_epoch: self.head_epoch,
             parked_write: self.parked_write.clone(),
+            subs: self.subs.clone(),
         };
         use bincode::Options;
         let body = context_opts(self.params.max_context_bytes)
@@ -2495,6 +2787,7 @@ impl<B: Blocks> Engine<B> {
         let mut e = Engine::new(params, blocks);
         e.published_seq = c.published_seq;
         e.published_root = c.published_root;
+        e.subs = c.subs;
         e.root = c.root;
         e.next_seq = c.next_seq;
         e.pending = c.pending;
