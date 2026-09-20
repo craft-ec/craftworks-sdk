@@ -14,10 +14,13 @@
 //!
 //! | state | promise |
 //! |---|---|
-//! | `Accepted` | in the engine's memory. Survives a tab close, NOT a node restart. |
-//! | `Stalled` | still held, not saved, and not moving. Non-terminal. |
+//! | `Accepted` | applied to the tree, not yet shipped. Survives a tab close, NOT a node restart. |
+//! | `Stalled` | the commit carrying it cannot publish, and is not moving. Non-terminal, reported once. |
 //! | `Published` | packs read back, THEN the head read back. Survives a restart, and what a UI may call "saved". |
 //! | `ParityComplete` | the redundancy the new nodes promise actually exists. |
+//! | `Busy` | TERMINAL, and nothing was applied: a commit was already in flight, or a cap was reached. The client still holds the write and may re-submit it. |
+//! | `Failed` | TERMINAL. The edit is NOT in the tree and never will be, so a re-submit applies it once. Never reported for a write whose edit IS in the tree. |
+//! | `Lost` | TERMINAL. The commit carrying it will not publish and the engine no longer has it; the client is the only thing that does. |
 //!
 //! Between `Published` and `ParityComplete` the tree is correct and its groups
 //! have no redundancy. That is *absent redundancy, not an error*
@@ -102,6 +105,14 @@ pub enum Event {
     PutFailed(Cid),
     HeadConfirmed(u64),
     Tick(u64),
+    /// The client has gone. Ship what is waiting; there will be no more ticks.
+    ///
+    /// The shell sends this on disconnect. `Tick` comes only from a connected
+    /// client (W4: the node fires no wake-ups), so nothing the page-closed
+    /// promise depends on may need one — a commit in flight advances on its
+    /// confirmations, and everything else that a tick would have got round to
+    /// happens here instead.
+    Flush,
 
     // ---- the read path ----
     Get {
@@ -729,6 +740,7 @@ impl<B: Blocks> Engine<B> {
             Event::PutFailed(id) => self.on_failed(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
             Event::Tick(now) => self.on_tick(now),
+            Event::Flush => self.on_flush(),
             Event::Get {
                 client,
                 req_id,
@@ -1769,6 +1781,30 @@ impl<B: Blocks> Engine<B> {
             .into_iter()
             .filter(|(c, _)| seen.insert(*c))
             .collect()
+    }
+
+    /// The client is going away: do now what a tick would eventually do.
+    ///
+    /// There is no clock. `Tick` arrives only from a connected client, so
+    /// once the tab closes nothing else will ever ask the engine to get on
+    /// with it — and everything the page-closed promise covers must therefore
+    /// be event-driven or happen HERE.
+    ///
+    /// Two things. Start a commit for anything applied but not yet shipped,
+    /// and put ALL owed parity regardless of age: coalescing trades a little
+    /// redundancy-latency for fewer puts while someone is watching, and there
+    /// is nothing left to coalesce WITH once they are gone. A commit already
+    /// in flight is left alone; it advances on its own confirmations, which
+    /// is exactly the part that does not need a clock.
+    fn on_flush(&mut self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if self.pending.is_none() && !self.unpublished.is_empty() {
+            let to_ship = self.take_unpublished();
+            out.extend(self.start_commit(to_ship));
+        }
+        // Every group, whatever its age and whether or not it settled.
+        out.extend(self.emit_parity(|_| true));
+        out
     }
 
     fn on_tick(&mut self, now: u64) -> Vec<Effect> {

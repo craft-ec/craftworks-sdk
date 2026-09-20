@@ -1039,3 +1039,129 @@ fn a_write_whose_group_is_re_coded_waits_for_the_new_coding() {
     );
     println!("  with transfer: A completes once, after the new coding; control completes it early");
 }
+
+/// The page-closed promise, with no clock at all.
+///
+/// `Tick` arrives only from a connected client (W4: the released node fires
+/// no wake-ups), so once the tab closes nothing will ever ask the engine to
+/// get on with it. Everything the promise covers must therefore be
+/// event-driven — a commit in flight advances on its own confirmations — or
+/// must happen on `Flush`, which the shell sends on disconnect.
+///
+/// So this drives writes, sends `Flush`, and then NEVER sends a tick. Every
+/// write must still reach `Published` and `ParityComplete`.
+///
+/// The control is the same run with no `Flush`: owed parity stays owed for
+/// ever, and the test sees it. Without that, "parity was complete" would
+/// read identically in a build where `Flush` did nothing.
+#[test]
+fn after_a_disconnect_every_write_publishes_and_its_parity_is_put_without_a_tick() {
+    let run = |flush: bool| -> (Seen, usize, usize) {
+        let store = Store::fresh();
+        let mut e = Engine::new(
+            Params {
+                coalesce_parity: true,
+                ..Params::default()
+            },
+            store.clone(),
+        );
+        let mut seen = Seen::default();
+        // Values by reference, so the leaves carry parity over them.
+        let mut queue = Vec::new();
+        for n in 1..=3u64 {
+            let ops: Vec<(Vec<u8>, Op)> = (0..16u32)
+                .map(|i| {
+                    (
+                        format!("k/{n}/{i:04}").into_bytes(),
+                        Op::Put(vec![(i % 251) as u8; 1400]),
+                    )
+                })
+                .collect();
+            let out = stepped!(e, write(1, n, ops));
+            seen.absorb(&out);
+            queue.extend(out.clone());
+            // Drive this commit to published before the next write, since one
+            // commit at a time means the next would otherwise be refused.
+            let mut guard = 0;
+            while let Some(f) = queue.pop() {
+                guard += 1;
+                assert!(guard < 100_000, "the commit did not settle");
+                let o = match &f {
+                    Effect::PutPack { id, .. }
+                    | Effect::PutBlock { id, .. }
+                    | Effect::PutParity { id, .. } => stepped!(e, Event::PutConfirmed(*id)),
+                    Effect::UpdateHead { seq, .. } => stepped!(e, Event::HeadConfirmed(*seq)),
+                    _ => Vec::new(),
+                };
+                seen.absorb(&o);
+                queue.extend(o);
+            }
+        }
+
+        // The client goes away. No tick is sent here, or ever.
+        if flush {
+            let out = stepped!(e, Event::Flush);
+            seen.absorb(&out);
+            queue.extend(out);
+        }
+        let mut guard = 0;
+        let mut parity_put = 0usize;
+        while let Some(f) = queue.pop() {
+            guard += 1;
+            assert!(guard < 100_000, "the flush did not settle");
+            let o = match &f {
+                Effect::PutParity { id, .. } => {
+                    parity_put += 1;
+                    stepped!(e, Event::PutConfirmed(*id))
+                }
+                Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => {
+                    stepped!(e, Event::PutConfirmed(*id))
+                }
+                Effect::UpdateHead { seq, .. } => stepped!(e, Event::HeadConfirmed(*seq)),
+                _ => Vec::new(),
+            };
+            seen.absorb(&o);
+            queue.extend(o);
+        }
+        (seen, parity_put, e.owed_groups())
+    };
+
+    let (seen, put, _) = run(true);
+    for n in 1..=3u64 {
+        let states = seen.of(1, n);
+        assert!(
+            states.contains(&State::Published),
+            "write {n} did not publish after a disconnect: {states:?}"
+        );
+        assert!(
+            states.contains(&State::ParityComplete),
+            "write {n} published but its parity was never complete, and no \
+             tick is ever coming: {states:?}"
+        );
+        assert!(
+            valid_sequence(states),
+            "write {n} reported an impossible sequence: {states:?}"
+        );
+    }
+    assert!(
+        put > 0,
+        "Flush put no parity at all, so ParityComplete above says nothing"
+    );
+
+    // The control: no Flush, no tick, and the parity stays owed.
+    let (control, control_put, _) = run(false);
+    let complete = (1..=3u64)
+        .filter(|n| control.of(1, *n).contains(&State::ParityComplete))
+        .count();
+    assert_eq!(
+        control_put, 0,
+        "the control put {control_put} parity block(s) without a Flush or a \
+         tick, so Flush is not what puts them"
+    );
+    assert_eq!(
+        complete, 0,
+        "{complete} write(s) reached ParityComplete with no Flush and no \
+         tick, so the test cannot tell a working Flush from a no-op"
+    );
+    println!("  disconnect, no ticks ever: 3 writes published, {put} parity block(s) put (control without Flush: {control_put})");
+}
