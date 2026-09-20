@@ -225,8 +225,8 @@ fn the_sdk_sorts_and_dedupes_before_the_tree_sees_a_batch() {
 
     let mut t = TreeStore::new();
     t.apply_batch(&edits);
-    assert_eq!(t.get(&key(1)).as_deref(), Some(&b"early"[..]));
-    assert_eq!(t.get(&key(5)), None, "the delete was last");
+    assert_eq!(t.get(&key(1)).unwrap().as_deref(), Some(&b"early"[..]));
+    assert_eq!(t.get(&key(5)), Ok(None), "the delete was last");
     // And the same batch offered to the reference store agrees.
     let mut m = MemStore::default();
     m.apply_batch(&edits);
@@ -261,7 +261,7 @@ fn a_refused_batch_changes_nothing() {
     assert_eq!(t.root(), before_root, "the root moved on a refused batch");
     assert_eq!(t.stats(), before_stats, "blocks changed on a refused batch");
     assert_eq!(
-        t.get(&key(1)).as_deref(),
+        t.get(&key(1)).unwrap().as_deref(),
         Some(&b"v"[..]),
         "and no edit landed"
     );
@@ -361,10 +361,16 @@ fn cost_against_the_reference_store() {
 
     let (lo, hi) = (key(0), key(N));
     let tree_scan = time(|| {
-        assert_eq!(tree.scan(&lo, &hi, false, usize::MAX).len(), N as usize);
+        assert_eq!(
+            tree.scan(&lo, &hi, false, usize::MAX).unwrap().len(),
+            N as usize
+        );
     });
     let mem_scan = time(|| {
-        assert_eq!(mem.scan(&lo, &hi, false, usize::MAX).len(), N as usize);
+        assert_eq!(
+            mem.scan(&lo, &hi, false, usize::MAX).unwrap().len(),
+            N as usize
+        );
     });
 
     // One batch of the same size, which is what a real write path does.

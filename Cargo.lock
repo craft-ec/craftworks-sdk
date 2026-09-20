@@ -222,9 +222,12 @@ dependencies = [
  "bincode",
  "blake3",
  "ed25519-dalek",
+ "engine",
+ "engine-delegate",
  "freenet-prolly",
  "getrandom 0.2.17",
  "js-sys",
+ "protocol",
  "serde",
  "serde_json",
  "wasm-bindgen",
@@ -453,6 +456,7 @@ dependencies = [
  "engine",
  "freenet-prolly",
  "freenet-stdlib",
+ "protocol",
  "serde",
 ]
 
@@ -1013,6 +1017,7 @@ dependencies = [
  "engine",
  "engine-delegate",
  "freenet-stdlib",
+ "protocol",
  "serde",
  "tokio",
  "tokio-tungstenite",
@@ -1034,6 +1039,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "protocol"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
 ]
 
 [[package]]

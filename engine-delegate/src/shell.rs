@@ -14,12 +14,12 @@
 //! `PutConfirmed`.
 
 use crate::schedule::{Limits, Op, Scheduler};
-use crate::wire::{self, Dropped, Reply, Request};
 use bincode::Options;
 use engine::read::Via;
-use engine::{Effect, Engine, Event, KeySource, Params};
+use engine::{Effect, Engine, Event, KeySource, Params, State};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
+use protocol::Dropped;
 use std::collections::BTreeMap;
 
 /// What arrived this call.
@@ -91,14 +91,6 @@ struct ShellState {
     awaiting: Vec<(Cid, u32)>,
     /// A head written and not yet read back, with the root it named.
     head: Option<(u64, Cid)>,
-    /// Whether the head Register is known to EXIST on the node.
-    ///
-    /// The first bump has to create it, and creating a contract means
-    /// carrying its code. Every bump after that is an update to a contract
-    /// the node already has, and an update names it by id alone — which is
-    /// the difference between shipping ~157 KiB of register.wasm per commit
-    /// and shipping the record.
-    head_exists: bool,
     /// Contract id -> the block id the engine knows it by, for requests that
     /// are still out.
     ///
@@ -117,11 +109,38 @@ struct Carried {
     shell: ShellState,
 }
 
+/// The most rows one page may carry, whatever a caller asks for.
+///
+/// A page crosses a delegate's 5-second call and a client's socket, and a
+/// caller is free to ask for more than either will bear. Clamping is not a
+/// refusal — the cursor means the rest is one more call away — but it IS
+/// reported, because a short page read as the end of a range silently
+/// truncates whatever the caller was listing.
+const MAX_PAGE_ENTRIES: usize = 256;
+
+/// And a byte ceiling, because 256 large values is a different size from 256
+/// small ones and only one of them fits.
+const MAX_PAGE_BYTES: usize = 512 * 1024;
+
 /// How many times a put is asked back for before its ack is disbelieved.
 ///
 /// A put is readable a short time after it is acknowledged, not instantly, so
 /// the first empty answer means "not yet" far more often than "never".
 const MAX_READ_BACK_ROUNDS: u32 = 12;
+
+/// The engine's ids, from the protocol's plain numbers.
+fn as_client(n: u64) -> engine::ClientId {
+    engine::ClientId(n)
+}
+fn as_write_id(n: u64) -> engine::WriteId {
+    engine::WriteId(n)
+}
+fn as_req_id(n: u64) -> engine::read::ReqId {
+    engine::read::ReqId(n)
+}
+fn as_epoch(n: u32) -> engine::Epoch {
+    engine::Epoch(n)
+}
 
 /// The shell's own context, encoded exactly.
 ///
@@ -146,6 +165,13 @@ pub struct Shell<B: Blocks> {
     pub provisioned: bool,
     /// Puts confirmed by a read-back this call.
     pub read_back_hits: usize,
+    /// The client asked who it is talking to.
+    pub identity: bool,
+    /// Requests in the protocol's vocabulary that this shell does not serve
+    /// yet. Answered, never ignored.
+    pub unserved: Vec<u64>,
+    /// The page size actually used, per request, so the reply can say so.
+    page_clamp: BTreeMap<u64, u32>,
     /// Whether the delegate has the contract code it writes with.
     ///
     /// Supplied by the entry point from the secret store, because only the
@@ -182,10 +208,6 @@ impl<B: Blocks> Shell<B> {
             ),
             None => (Vec::new(), BTreeMap::new(), None, Vec::new()),
         };
-        let head_exists = ctx_opts()
-            .deserialize::<Carried>(ctx)
-            .map(|c| c.shell.head_exists)
-            .unwrap_or(false);
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         Shell {
             engine,
@@ -193,14 +215,16 @@ impl<B: Blocks> Shell<B> {
             // it did not resume, so they go with it.
             awaiting: if resumed { awaiting } else { BTreeMap::new() },
             head: if resumed { head } else { None },
-            // NOT reset with the engine: the Register exists on the node
-            // whether or not this engine remembers writing it, and claiming
-            // otherwise would make the next bump ship the code again.
-            head_exists,
+            // Starts false every call and is set by what the node SAYS this
+            // call — a read of the head, or its absence. Nothing carries it.
+            head_exists: false,
             outstanding: if resumed { outstanding } else { Vec::new() },
             installed: None,
             provisioned: false,
             read_back_hits: 0,
+            identity: false,
+            unserved: Vec::new(),
+            page_clamp: BTreeMap::new(),
             has_code,
             limits: Limits::default(),
         }
@@ -208,13 +232,14 @@ impl<B: Blocks> Shell<B> {
 
     pub fn to_context(&self) -> Option<Vec<u8>> {
         let engine = self.engine.to_context().ok()?;
+        // #41's exact encoding, with slice 5's `head_exists` gone: it is
+        // derived from the engine's published seq, not carried.
         ctx_opts()
             .serialize(&Carried {
                 engine,
                 shell: ShellState {
                     awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
                     head: self.head,
-                    head_exists: self.head_exists,
                     outstanding: self.outstanding.clone(),
                 },
             })
@@ -228,9 +253,14 @@ impl<B: Blocks> Shell<B> {
 
         for msg in inbound {
             let effects = match msg {
-                Inbound::Client(bytes) => match wire::request(&bytes) {
-                    Some(r) => self.on_request(r),
-                    None => {
+                Inbound::Client(bytes) => match crate::serve::serve(&bytes) {
+                    crate::serve::Served::Do(r) => self.on_protocol(r),
+                    // A version this build does not serve, or bytes it cannot
+                    // read. Either way the client is ANSWERED: it is the one
+                    // waiting, and a refusal it can act on beats a silence it
+                    // cannot.
+                    crate::serve::Served::Answer(reply) => {
+                        out.replies.push(protocol::encode_reply(&reply));
                         out.dropped.push(Dropped::Unparseable);
                         Vec::new()
                     }
@@ -263,6 +293,27 @@ impl<B: Blocks> Shell<B> {
             sched.offer(effects);
         }
 
+        // Answer the protocol requests that produce no engine event.
+        if self.identity {
+            self.identity = false;
+            out.replies
+                .push(protocol::encode_reply(&protocol::Reply::Identity {
+                    engine: concat!("craftworks-engine/", env!("CARGO_PKG_VERSION")).into(),
+                    // WHERE the authority came from. Never the key.
+                    key_source: "Provisioned(Test)".into(),
+                    head_seq: self.engine.published_seq(),
+                    head_root: self.engine.published_root(),
+                }));
+        }
+        for req_id in std::mem::take(&mut self.unserved) {
+            // Named, not silent. A client that asked and heard nothing cannot
+            // tell "this build does not serve that yet" from "lost".
+            out.replies
+                .push(protocol::encode_reply(&protocol::Reply::Unavailable {
+                    req_id,
+                    blocked_on: [0u8; 32],
+                }));
+        }
         out.ops = sched.take(self.limits);
         // No code, no put. A delegate cannot fabricate a contract, so a PUT
         // before `Install` is one the node would refuse anyway. Refusing it
@@ -289,56 +340,110 @@ impl<B: Blocks> Shell<B> {
         out
     }
 
-    fn on_request(&mut self, r: Request) -> Vec<Effect> {
+    /// A versioned protocol request.
+    ///
+    /// The translation is deliberately shallow: the protocol's vocabulary and
+    /// the core's are close because they describe the same thing, and a
+    /// mapping layer that "improved" one into the other is where the two
+    /// drift apart.
+    fn on_protocol(&mut self, r: protocol::Request) -> Vec<Effect> {
+        use protocol::Request as P;
         let ev = match r {
-            // Handled by the entry point, which is the only place with a
-            // secret store. The shell records that it was asked, so a caller
-            // can tell "installed" from "the message never arrived".
-            Request::Install {
+            P::Identity => {
+                // Identity is also how a session BEGINS. There is no separate
+                // `start` in the protocol and there should not be: answering
+                // "where is your head" requires reading it, so the engine is
+                // started here and the head read goes out with this call.
+                //
+                // The answer carries the head as known RIGHT NOW — 0 on a
+                // brand-new engine that has never published, the real seq on
+                // a rehydrated one, since a rehydrated engine carries its
+                // published seq in its context. A client that wants the
+                // freshest asks again after the read lands.
+                self.identity = true;
+                Event::Start {
+                    key: KeySource::Provisioned(engine::Provisioned::Test),
+                    epochs: vec![as_epoch(1)],
+                }
+            }
+            P::Get { req_id, key } => Event::Get {
+                client: as_client(1),
+                req_id: as_req_id(req_id),
+                key,
+            },
+            P::Write { write_id, ops } => Event::Write {
+                client: as_client(1),
+                write_id: as_write_id(write_id),
+                ops: ops
+                    .into_iter()
+                    .map(|o| match o {
+                        protocol::Op::Put(k, v) => (k, engine::Op::Put(v)),
+                        protocol::Op::Delete(k) => (k, engine::Op::Delete),
+                    })
+                    .collect(),
+            },
+            P::AskWrite { write_id } => Event::AskWrite {
+                client: as_client(1),
+                write_id: as_write_id(write_id),
+            },
+            P::Tick { now } => Event::Tick(now),
+            P::Flush => Event::Flush,
+            P::Range {
+                req_id,
+                lo,
+                hi,
+                reverse,
+                after,
+                max_entries,
+            } => {
+                use std::ops::Bound as B;
+                let bound = |b: protocol::Bound| match b {
+                    protocol::Bound::Unbounded => B::Unbounded,
+                    protocol::Bound::Included(k) => B::Included(k),
+                    protocol::Bound::Excluded(k) => B::Excluded(k),
+                };
+                // CLAMPED here, and the clamp is reported back rather than
+                // applied silently: a caller that asked for a thousand rows
+                // and got a hundred needs to know the page it holds is not
+                // the page it asked for, or it will read the short answer as
+                // the end of the range.
+                let clamped = (max_entries as usize).clamp(1, MAX_PAGE_ENTRIES);
+                self.page_clamp.insert(req_id, clamped as u32);
+                Event::Scan {
+                    client: as_client(1),
+                    req_id: as_req_id(req_id),
+                    range: Box::new(freenet_prolly::range::Range {
+                        lo: bound(lo),
+                        hi: bound(hi),
+                        reverse,
+                        after,
+                        max_entries: clamped,
+                        max_bytes: MAX_PAGE_BYTES,
+                    }),
+                }
+            }
+            // Preload and Subscribe are v1 vocabulary this shell does not
+            // serve yet (slice 6, with observability). Answered as such
+            // rather than silently ignored: a client that asked and heard
+            // nothing cannot tell "not implemented" from "lost".
+            P::Preload { .. } | P::Subscribe { .. } => {
+                self.unserved.push(0);
+                return Vec::new();
+            }
+            P::Install {
                 block_code,
                 register_code,
                 signing_key,
                 ..
             } => {
+                // Handled by the entry point, which is the only place with a
+                // secret store. The shell records that it was asked, so a
+                // caller can tell "installed" from "never arrived".
                 self.installed = Some(block_code.len() + register_code.len());
-                // Recorded, never derived from. What the engine is told is
-                // WHERE its authority came from, which is a statement it
-                // keeps; the key itself never reaches the core.
                 let _ = &signing_key;
                 self.provisioned = true;
                 return Vec::new();
             }
-            Request::Start { epochs } => Event::Start {
-                // What the engine records is WHERE its authority came from,
-                // never the key. Today the only provisioner is a test
-                // harness, and the type says so.
-                key: KeySource::Provisioned(engine::Provisioned::Test),
-                epochs: epochs.into_iter().map(wire::epoch).collect(),
-            },
-            Request::Write {
-                client,
-                write_id,
-                ops,
-            } => Event::Write {
-                client: wire::client(client),
-                write_id: wire::write_id(write_id),
-                ops,
-            },
-            Request::Get {
-                client,
-                req_id,
-                key,
-            } => Event::Get {
-                client: wire::client(client),
-                req_id: wire::req_id(req_id),
-                key,
-            },
-            Request::Tick { now } => Event::Tick(now),
-            Request::Flush => Event::Flush,
-            Request::AskWrite { client, write_id } => Event::AskWrite {
-                client: wire::client(client),
-                write_id: wire::write_id(write_id),
-            },
         };
         self.engine.step(ev)
     }
@@ -452,9 +557,7 @@ impl<B: Blocks> Shell<B> {
             self.head = None;
             return Vec::new();
         }
-        s.offer(vec![Effect::ReadHead {
-            epoch: wire::epoch(1),
-        }]);
+        s.offer(vec![Effect::ReadHead { epoch: as_epoch(1) }]);
         Vec::new()
     }
 
@@ -481,7 +584,7 @@ impl<B: Blocks> Shell<B> {
                 // Reading one is proof it is there.
                 self.head_exists = true;
                 self.engine.step(Event::HeadRead {
-                    epoch: wire::epoch(1),
+                    epoch: as_epoch(1),
                     seq,
                     root,
                 })
@@ -490,50 +593,81 @@ impl<B: Blocks> Shell<B> {
         }
     }
 
+    /// Turn what the core emitted for a CLIENT into protocol replies.
+    ///
+    /// The engine's states map one-to-one onto the protocol's, deliberately:
+    /// a client that is told `Busy` has to know it may re-submit, and a
+    /// translation that blurred that into "an error" would leave the outbox
+    /// with nothing to act on.
     fn reply_from(&self, effects: &[Effect], out: &mut Outbound) {
+        use protocol::WriteState as W;
         for f in effects {
             let r = match f {
                 Effect::Notify {
-                    client,
-                    write_id,
-                    state,
-                } => Reply::Write {
-                    client: client.0,
+                    write_id, state, ..
+                } => protocol::Reply::WriteState {
                     write_id: write_id.0,
-                    state: *state,
+                    state: match state {
+                        State::Accepted => W::Accepted,
+                        State::Stalled => W::Stalled,
+                        State::Published => W::Published,
+                        State::ParityComplete => W::ParityComplete,
+                        State::Busy => W::Busy,
+                        State::Failed => W::Failed,
+                        State::Lost => W::Lost,
+                    },
                 },
-                Effect::Reply {
-                    client,
-                    req_id,
-                    result,
-                } => Reply::Read {
-                    client: client.0,
-                    req_id: req_id.0,
-                    result: result.clone(),
+                Effect::Reply { req_id, result, .. } => match result {
+                    engine::read::ReadResult::Value(v) => protocol::Reply::Value {
+                        req_id: req_id.0,
+                        value: v.clone(),
+                    },
+                    engine::read::ReadResult::Page {
+                        entries, cursor, ..
+                    } => protocol::Reply::Page {
+                        req_id: req_id.0,
+                        entries: entries.clone(),
+                        cursor: cursor.clone(),
+                        // What was USED, not what was asked for.
+                        max_entries: self
+                            .page_clamp
+                            .get(&req_id.0)
+                            .copied()
+                            .unwrap_or(entries.len() as u32),
+                    },
+                    engine::read::ReadResult::Unavailable(cid) => protocol::Reply::Unavailable {
+                        req_id: req_id.0,
+                        blocked_on: *cid,
+                    },
+                    engine::read::ReadResult::OutOfWarmSpace => protocol::Reply::Unavailable {
+                        req_id: req_id.0,
+                        blocked_on: [0u8; 32],
+                    },
                 },
                 _ => continue,
             };
-            out.replies.push(wire::reply(&r));
+            out.replies.push(protocol::encode_reply(&r));
         }
-    }
-
-    /// Whether the head Register exists, read straight out of a context.
-    ///
-    /// The entry point needs it while BUILDING the outbound messages, which
-    /// is after the shell that produced them has been dropped.
-    pub fn peek_head_exists(ctx: &[u8]) -> bool {
-        ctx_opts()
-            .deserialize::<Carried>(ctx)
-            .map(|c| c.shell.head_exists)
-            .unwrap_or(false)
     }
 
     /// Does the head Register already exist on the node?
     ///
-    /// A bump that creates it must carry the Register's code; one that
-    /// updates it names the contract by id alone.
+    /// DERIVED from the engine's published seq, which is 0 only when no head
+    /// exists anywhere for this key — a fresh start re-reads the head before
+    /// anything else and adopts whatever is there, so a seq above 0 means
+    /// something published one.
+    ///
+    /// Deriving it from `HeadRead` alone was wrong and the live run caught
+    /// it: the fact is stated on the call that READS the head, and a later
+    /// commit's bump happens on a call where nothing read it — so the second
+    /// write re-CREATED the Register and paid 152,542 B again (F38). Reading
+    /// it out of state the engine already carries for its own reasons is
+    /// both derived and always available.
+    ///
+    /// `self.head_exists` still records a head READ or CONFIRMED this call,
+    /// for the case where the seq has not been adopted yet.
     pub fn head_exists(&self) -> bool {
-        self.head_exists
+        self.head_exists || self.engine.published_seq() > 0
     }
 
     /// Ids put and not yet read back.

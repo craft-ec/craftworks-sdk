@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 engine = { path = "../engine" }
+protocol = { path = "../protocol" }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 freenet-stdlib = { version = "0.10.0", features = ["contract"] }
 # Signing a Register record. Pinned exactly and default-features off for the
@@ -36,3 +37,6 @@ freenet-main-delegate = []
 # without turning anything on.
 trace = ["freenet-stdlib/trace"]
 
+
+[dev-dependencies]
+protocol = { path = "../protocol" }

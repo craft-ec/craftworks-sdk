@@ -144,32 +144,40 @@ impl<S: Store, E: Env> Db<S, E> {
     pub fn define(&mut self, domain: &str, schema: &Schema) -> Result<()> {
         check_domain(domain)?;
         schema.check()?;
-        if let Some(old) = self.schema(domain) {
+        if let Some(old) = self.schema(domain)? {
             old.allows(schema)?;
         }
         let bytes = serde_json::to_vec(schema).map_err(|e| e.to_string())?;
         self.write(vec![(schema_key(domain), Edit::Put(bytes))])
     }
 
-    pub fn schema(&self, domain: &str) -> Option<Schema> {
-        serde_json::from_slice(&self.store.get(&schema_key(domain))?).ok()
+    /// The domain's schema, or `None` if it has none.
+    ///
+    /// Fallible because the READ is: a store whose data is remote cannot
+    /// answer from `&self`, and saying "no schema" when the truth is "could
+    /// not look" would make an app define a domain that already exists.
+    pub fn schema(&self, domain: &str) -> Result<Option<Schema>> {
+        match self.get_key(&schema_key(domain))? {
+            Some(b) => Ok(serde_json::from_slice(&b).ok()),
+            None => Ok(None),
+        }
     }
 
     fn need_schema(&self, domain: &str) -> Result<Schema> {
         check_domain(domain)?;
-        self.schema(domain)
+        self.schema(domain)?
             .ok_or_else(|| format!("domain `{domain}` has no schema; define it first"))
     }
 
-    pub fn domains(&self) -> Vec<String> {
+    pub fn domains(&self) -> Result<Vec<String>> {
         let lo = schema_key("");
         let mut hi = lo.clone();
         *hi.last_mut().unwrap() = 1;
-        self.store
-            .scan(&lo, &hi, false, usize::MAX)
+        Ok(self
+            .scan_keys(&lo, &hi, false, usize::MAX)?
             .into_iter()
             .filter_map(|(k, _)| String::from_utf8(k[lo.len()..].to_vec()).ok())
-            .collect()
+            .collect())
     }
 
     pub fn put(&mut self, domain: &str, fields: &Map<String, Value>) -> Result<Record> {
@@ -190,7 +198,7 @@ impl<S: Store, E: Env> Db<S, E> {
     ) -> Result<Record> {
         let schema = self.need_schema(domain)?;
         let key = record_key(domain, rkey);
-        let old = self.store.get(&key).ok_or("no such record")?;
+        let old = self.get_key(&key)?.ok_or("no such record")?;
         let mut d = record::decode(&schema, &old)?;
         for (k, v) in patch {
             if v.is_null() {
@@ -208,7 +216,7 @@ impl<S: Store, E: Env> Db<S, E> {
 
     pub fn get(&self, domain: &str, rkey: &RKey) -> Result<Option<Record>> {
         let schema = self.need_schema(domain)?;
-        match self.store.get(&record_key(domain, rkey)) {
+        match self.get_key(&record_key(domain, rkey))? {
             Some(b) => self.read(&schema, rkey, &b).map(Some),
             None => Ok(None),
         }
@@ -217,7 +225,7 @@ impl<S: Store, E: Env> Db<S, E> {
     pub fn delete(&mut self, domain: &str, rkey: &RKey) -> Result<bool> {
         check_domain(domain)?;
         let key = record_key(domain, rkey);
-        let existed = self.store.get(&key).is_some();
+        let existed = self.get_key(&key)?.is_some();
         self.write(vec![(key, Edit::Delete)])?;
         Ok(existed)
     }
@@ -239,8 +247,7 @@ impl<S: Store, E: Env> Db<S, E> {
         } else {
             opts.limit
         };
-        self.store
-            .scan(&lo, &hi, opts.reverse, limit)
+        self.scan_keys(&lo, &hi, opts.reverse, limit)?
             .iter()
             .map(|(k, v)| {
                 let rkey: RKey = k[p.len()..]
@@ -254,7 +261,28 @@ impl<S: Store, E: Env> Db<S, E> {
     pub fn count(&self, domain: &str) -> Result<usize> {
         check_domain(domain)?;
         let p = prefix(domain);
-        Ok(self.store.scan(&p, &upper(&p), false, usize::MAX).len())
+        Ok(self.scan_keys(&p, &upper(&p), false, usize::MAX)?.len())
+    }
+
+    /// A store read, with the store's own refusal turned into `Db`'s error.
+    ///
+    /// Every `&self` read in `Db` goes through these two, so there is one
+    /// place where a store that cannot answer synchronously becomes something
+    /// an app can catch rather than something that kills the instance.
+    fn get_key(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.store.get(key).map_err(|e| e.to_string())
+    }
+
+    fn scan_keys(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.store
+            .scan(lo, hi, reverse, limit)
+            .map_err(|e| e.to_string())
     }
 
     fn read(&self, schema: &Schema, rkey: &RKey, bytes: &[u8]) -> Result<Record> {
@@ -283,8 +311,8 @@ mod tests {
     fn a_key_past_the_trees_limit_is_refused_before_the_store_is_touched() {
         struct Panics;
         impl Store for Panics {
-            fn get(&self, _: &[u8]) -> Option<Vec<u8>> {
-                None
+            fn get(&self, _: &[u8]) -> crate::store::Read<Option<Vec<u8>>> {
+                Ok(None)
             }
             fn put(&mut self, _: &[u8], _: &[u8]) {
                 panic!("the store must not be reached")
@@ -292,8 +320,14 @@ mod tests {
             fn delete(&mut self, _: &[u8]) -> bool {
                 panic!("the store must not be reached")
             }
-            fn scan(&self, _: &[u8], _: &[u8], _: bool, _: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-                Vec::new()
+            fn scan(
+                &self,
+                _: &[u8],
+                _: &[u8],
+                _: bool,
+                _: usize,
+            ) -> crate::store::Read<Vec<(Vec<u8>, Vec<u8>)>> {
+                Ok(Vec::new())
             }
             fn apply_batch(&mut self, _: &[(Vec<u8>, Edit)]) {
                 panic!("the store must not be reached")

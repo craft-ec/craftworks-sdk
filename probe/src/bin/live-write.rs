@@ -16,11 +16,11 @@
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
-use engine::State;
-use engine_delegate::wire::{Reply, Request, TestKey};
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse, WebApi};
 use freenet_stdlib::prelude::*;
 use probe::node::{Mode, Node, TempTree};
+use protocol::WriteState as State;
+use protocol::{Reply, Request, TestKey};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
@@ -38,7 +38,7 @@ async fn connect(ws: &str) -> Result<WebApi> {
 }
 
 async fn send(client: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()> {
-    let payload = bincode::serialize(r)?;
+    let payload = protocol::encode_request(protocol::CURRENT, r);
     timeout(
         STEP,
         client.send(ClientRequest::DelegateOp(
@@ -66,8 +66,8 @@ async fn until(client: &mut WebApi, want: State, deadline: Instant) -> (bool, Ve
                 for v in values {
                     if let OutboundDelegateMsg::ApplicationMessage(m) = v {
                         let owned = m.payload.to_vec();
-                        match bincode::deserialize::<Reply>(&owned) {
-                            Ok(Reply::Write { state, .. }) => {
+                        match protocol::decode_reply(&owned) {
+                            Ok(Reply::WriteState { state, .. }) => {
                                 seen.push(state);
                                 if state == want {
                                     return (true, seen);
@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
     )
     .await?;
     let _ = timeout(Duration::from_secs(2), client.recv()).await;
-    send(&mut client, &dkey, &Request::Start { epochs: vec![1] }).await?;
+    send(&mut client, &dkey, &Request::Identity).await?;
     let _ = timeout(Duration::from_secs(3), client.recv()).await;
 
     // ---- ONE write ----
@@ -235,9 +235,8 @@ async fn main() -> Result<()> {
         &mut client,
         &dkey,
         &Request::Write {
-            client: 1,
             write_id: 1,
-            ops: vec![(key.clone(), engine::Op::Put(value.clone()))],
+            ops: vec![protocol::Op::Put(key.clone(), value.clone())],
         },
     )
     .await?;
@@ -261,9 +260,8 @@ async fn main() -> Result<()> {
         &mut client,
         &dkey,
         &Request::Write {
-            client: 1,
             write_id: 2,
-            ops: vec![(key2.clone(), engine::Op::Put(vec![0x5Bu8; 200]))],
+            ops: vec![protocol::Op::Put(key2.clone(), vec![0x5Bu8; 200])],
         },
     )
     .await?;
@@ -288,13 +286,12 @@ async fn main() -> Result<()> {
 
     // ---- the value, over a SECOND independent connection ----
     let mut second = connect(&node.ws()).await?;
-    send(&mut second, &dkey, &Request::Start { epochs: vec![1] }).await?;
+    send(&mut second, &dkey, &Request::Identity).await?;
     let _ = timeout(Duration::from_secs(3), second.recv()).await;
     send(
         &mut second,
         &dkey,
         &Request::Get {
-            client: 2,
             req_id: 1,
             key: key.clone(),
         },
@@ -311,6 +308,40 @@ async fn main() -> Result<()> {
         None => bail!("the value was not readable over a second connection"),
     }
 
+    // ---- a LIST over the new connection, as a table component does ----
+    //
+    // Two writes are in the tree by now, so a range must return both, in
+    // order, over a connection that did not make them.
+    send(
+        &mut second,
+        &dkey,
+        &Request::Range {
+            req_id: 2,
+            lo: protocol::Bound::Unbounded,
+            hi: protocol::Bound::Unbounded,
+            reverse: false,
+            after: None,
+            max_entries: 100_000,
+        },
+    )
+    .await?;
+    match read_page(&mut second, deadline).await {
+        Some((rows, used)) => {
+            let keys: Vec<String> = rows
+                .iter()
+                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+                .collect();
+            if keys.len() < 2 {
+                bail!("a list over the new connection returned {keys:?}, not both writes");
+            }
+            println!("  list:  {keys:?} over the SECOND connection (page size used {used})");
+            if used >= 100_000 {
+                bail!("the engine reported {used} as the page size it used, so nothing clamped");
+            }
+        }
+        None => bail!("a range over the new connection returned no page at all"),
+    }
+
     // ---- the page-closed promise: Flush, close, reopen, read back ----
     send(&mut client, &dkey, &Request::Flush).await?;
     let _ = timeout(Duration::from_secs(2), client.recv()).await;
@@ -319,18 +350,9 @@ async fn main() -> Result<()> {
     println!("client: Flush sent, both connections closed");
 
     let mut reopened = connect(&node.ws()).await?;
-    send(&mut reopened, &dkey, &Request::Start { epochs: vec![1] }).await?;
+    send(&mut reopened, &dkey, &Request::Identity).await?;
     let _ = timeout(Duration::from_secs(3), reopened.recv()).await;
-    send(
-        &mut reopened,
-        &dkey,
-        &Request::Get {
-            client: 3,
-            req_id: 1,
-            key,
-        },
-    )
-    .await?;
+    send(&mut reopened, &dkey, &Request::Get { req_id: 1, key }).await?;
     match read_value(&mut reopened, deadline).await {
         Some(v) if v == value => println!("read:  still readable after closing and reopening"),
         other => bail!("after reopening, the value read back as {other:?}"),
@@ -341,6 +363,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// One page of a range, and the page size the engine actually used.
+async fn read_page(
+    client: &mut WebApi,
+    deadline: Instant,
+) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, u32)> {
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left.min(STEP), client.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
+                for v in values {
+                    if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                        let owned = m.payload.to_vec();
+                        match protocol::decode_reply(&owned) {
+                            Ok(Reply::Page {
+                                entries,
+                                max_entries,
+                                ..
+                            }) => return Some((entries, max_entries)),
+                            Ok(Reply::Unavailable { .. }) => return None,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
 async fn read_value(client: &mut WebApi, deadline: Instant) -> Option<Vec<u8>> {
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -349,12 +402,10 @@ async fn read_value(client: &mut WebApi, deadline: Instant) -> Option<Vec<u8>> {
                 for v in values {
                     if let OutboundDelegateMsg::ApplicationMessage(m) = v {
                         let owned = m.payload.to_vec();
-                        match bincode::deserialize::<Reply>(&owned) {
-                            Ok(Reply::Read { result, .. }) => {
-                                if let engine::read::ReadResult::Value(v) = result {
-                                    return v;
-                                }
-                                println!("  read: answered {result:?}");
+                        match protocol::decode_reply(&owned) {
+                            Ok(Reply::Value { value, .. }) => return value,
+                            Ok(Reply::Unavailable { blocked_on, .. }) => {
+                                println!("  read: Unavailable({})", hex8(&blocked_on));
                                 return None;
                             }
                             Ok(Reply::Call {

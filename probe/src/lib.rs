@@ -354,11 +354,24 @@ mod tests {
     #[test]
     fn the_probes_client_stack_is_not_a_dependency_of_the_engine_or_the_sdk() {
         const FORBIDDEN: [&str; 4] = ["freenet-stdlib", "tokio-tungstenite", "tokio", "anyhow"];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        // The RUNNING directory, not the building one. Cargo runs a test
+        // binary with its cwd at the package root, which is true of the tree
+        // being tested; `CARGO_MANIFEST_DIR` is baked in at build time, so a
+        // binary served from a shared `CARGO_TARGET_DIR` names whichever
+        // worktree built it — and pointing `cargo tree` at a worktree that no
+        // longer exists fails the gate on a missing directory rather than on
+        // a dependency.
+        let here = std::env::current_dir().expect("a working directory");
+        let root = here
             .parent()
             .expect("the workspace root is the probe's parent");
         let mut checked = 0usize;
-        for pkg in ["engine", "craftworks-sdk"] {
+        // `protocol` is here too, and for a sharper reason than the others:
+        // it is carried by BOTH wasm binaries — the delegate's and the
+        // browser SDK's — so a dependency added to it is one every one of
+        // them pays for, on a download every new node makes.
+        const GUARDED: [&str; 3] = ["engine", "craftworks-sdk", "protocol"];
+        for pkg in GUARDED {
             let out = std::process::Command::new(env!("CARGO"))
                 .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
                 .current_dir(root)
@@ -387,9 +400,14 @@ mod tests {
             }
             checked += 1;
         }
+        // Derived from the list, not written as a number: the last time
+        // this was a literal, adding a package to the list made the gate
+        // fail on its own floor rather than on anything it guards.
         assert_eq!(
-            checked, 2,
-            "only {checked} package(s) were checked; both must be"
+            checked,
+            GUARDED.len(),
+            "only {checked} of {} guarded package(s) were checked",
+            GUARDED.len()
         );
     }
 }
