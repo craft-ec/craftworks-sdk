@@ -322,7 +322,18 @@ fn stats_describe_the_tree() {
 /// Record keys are rkeys, which are time-ordered, so every record write is an
 /// APPEND. That is measured separately from writes scattered across the
 /// keyspace: they are different costs, and appending is the one the SDK does.
+///
+/// **Ignored by default: run it with `--release`.**
+///
+///     cargo test --release --test tree -- --ignored --nocapture
+///
+/// Not for speed — for honesty. This prints RATES, and a rate measured in a
+/// debug build is not a rate: the same body runs about 150x slower there, so
+/// the numbers it would publish from `cargo test` are wrong by two orders of
+/// magnitude while looking exactly as authoritative. It also cost the default
+/// suite 143 of its 145 seconds, which is what made anyone look.
 #[test]
+#[ignore = "a measurement: run with --release, or the rates it prints are not rates"]
 fn cost_against_the_reference_store() {
     const N: u64 = 10_000;
     let mut r = rng(4);

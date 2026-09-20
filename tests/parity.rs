@@ -50,22 +50,45 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
     }
 }
 
+/// Enough entries to force several levels, so BRANCHES are checked and not
+/// only a single leaf — the split rule is about interiors. Chosen as the
+/// smallest that clears the node floor below with room to spare: the suite ran
+/// for minutes in a debug build, and a fixture that is bigger than the property
+/// it demonstrates is paid for on every run by everyone.
+const ENTRIES: u64 = 2000;
+
 #[test]
 fn every_node_a_tall_tree_holds_would_be_accepted_by_a_host() {
     let mut store = TreeStore::new();
     let mut r = rng(7);
-    // Enough entries to force several levels, so branches are checked and not
-    // only a single leaf — the split rule is about interiors.
-    for i in 0..4000u64 {
-        let v = vec![(r() % 251) as u8; 24 + (r() % 400) as usize];
-        store.put(format!("k/{i:08}").as_bytes(), &v);
-    }
+    // Written as ONE batch, not entry by entry. Entry by entry the store also
+    // accumulates a superseded node per write, which multiplies the work by the
+    // number of entries without adding a single new SHAPE — and it took this
+    // suite to minutes in a debug build. The history case has its own test
+    // below, where the superseded nodes are the point.
+    let batch: Vec<(Vec<u8>, Edit)> = (0..ENTRIES)
+        .map(|i| {
+            let v = vec![(r() % 251) as u8; 24 + (r() % 400) as usize];
+            (format!("k/{i:08}").into_bytes(), Edit::Put(v))
+        })
+        .collect();
+    store.apply_batch(&batch);
+
+    // The property the fixture exists for is DEPTH: the split rule is about
+    // interiors, so a run that only ever saw leaves would pass while saying
+    // nothing. Asserted on the height rather than on the entry count, because
+    // the entry count is a proxy that the tree library is free to change.
+    let h = store.stats().height;
+    assert!(
+        h >= 3,
+        "the fixture must have branches above branches, got height {h}"
+    );
     let (nodes, others) = every_node_passes(&store);
     assert!(
         nodes > 20,
         "a tall tree must hold many nodes, found {nodes}"
     );
-    println!("checked {nodes} nodes ({others} value blocks) — all accepted");
+    println!("height {h}: checked {nodes} nodes ({others} value blocks) — all accepted");
 }
 
 #[test]
@@ -76,7 +99,7 @@ fn nodes_holding_referenced_values_are_accepted_too() {
     // parity the host demands.
     let mut store = TreeStore::new();
     let mut r = rng(11);
-    for i in 0..200u64 {
+    for i in 0..60u64 {
         let big = vec![(r() % 251) as u8; MAX_INLINE + 1 + (r() % 2048) as usize];
         store.put(format!("big/{i:06}").as_bytes(), &big);
     }
@@ -90,7 +113,7 @@ fn nodes_holding_referenced_values_are_accepted_too() {
     // passes the host's check while its value block is gone is a tree that
     // validates and cannot be read.
     let mut r = rng(11);
-    for i in 0..200u64 {
+    for i in 0..60u64 {
         let want = vec![(r() % 251) as u8; MAX_INLINE + 1 + (r() % 2048) as usize];
         assert_eq!(store.get(format!("big/{i:06}").as_bytes()), Some(want));
     }
@@ -104,14 +127,14 @@ fn deletes_and_rewrites_leave_no_refusable_node_behind() {
     // current root would never see it.
     let mut store = TreeStore::new();
     let mut r = rng(13);
-    for i in 0..1500u64 {
+    for i in 0..500u64 {
         store.put(format!("k/{i:08}").as_bytes(), &[(r() % 251) as u8; 40]);
     }
     let mut batch: Vec<(Vec<u8>, Edit)> = Vec::new();
-    for i in (0..1500u64).step_by(3) {
+    for i in (0..500u64).step_by(3) {
         batch.push((format!("k/{i:08}").into_bytes(), Edit::Delete));
     }
-    for i in (1..1500u64).step_by(7) {
+    for i in (1..500u64).step_by(7) {
         batch.push((format!("k/{i:08}").into_bytes(), Edit::Put(vec![9u8; 900])));
     }
     store.apply_batch(&batch);
@@ -151,7 +174,7 @@ fn a_database_built_through_the_public_api_writes_acceptable_nodes() {
         .unwrap(),
     )
     .expect("the schema is valid");
-    for i in 0..1200usize {
+    for i in 0..400usize {
         let fields: Map<String, Value> = serde_json::from_value(json!({
             "title": format!("t{i}"),
             "body": "x".repeat(200 + i % 900),
