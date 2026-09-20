@@ -93,6 +93,13 @@ pub struct Session {
     /// page that believed it was being notified while it was actually
     /// polling is the failure `LiveMode` exists to make impossible.
     watching: bool,
+    /// Domains this page has bound, so a head move can name what is stale.
+    bound: std::collections::BTreeSet<String>,
+    /// When the subscribe request went out, so an unanswered one does not sit
+    /// at "asked" for ever.
+    asked_at_ms: u64,
+    /// The node refused to watch the head, in its own words. Display only.
+    watch_refused: String,
     /// The head moved. Set by a notification, drained by the page.
     ///
     /// A HINT and never an authority: a fabricated one costs a reload, and a
@@ -150,6 +157,9 @@ impl Session {
             foreign_notifications: 0,
             watching: false,
             head_moved: false,
+            bound: std::collections::BTreeSet::new(),
+            asked_at_ms: 0,
+            watch_refused: String::new(),
         })
     }
 
@@ -428,6 +438,7 @@ impl Session {
             Ok(frames) => {
                 self.out.extend(frames);
                 self.subscribed = true;
+                self.asked_at_ms = crate::js_now_ms();
             }
             Err(e) => self
                 .unusable
@@ -435,13 +446,34 @@ impl Session {
         }
     }
 
-    /// Whether the head moved since this was last asked. Drains.
+    /// Which bound domains are stale, because the head moved. Drains.
     ///
-    /// The page reloads its bindings on a `true`. It is a hint, so a missed
-    /// one costs nothing — the tick re-reads the root regardless — and a
-    /// spurious one costs a reload.
-    pub fn take_head_moved(&mut self) -> bool {
-        std::mem::take(&mut self.head_moved)
+    /// **Rust decides which, not the page.** A page that reloaded
+    /// "everything" on every notification would turn one write anywhere into
+    /// a full refetch of every screen; one that guessed would miss the domain
+    /// that changed. The session knows which domains have been bound.
+    ///
+    /// The head moving is a HINT. A missed notification costs nothing — the
+    /// tick re-reads the root regardless — and a spurious one costs a reload.
+    /// What it is NOT is a root: nothing here goes into the copy.
+    pub fn take_stale(&mut self) -> String {
+        if !std::mem::take(&mut self.head_moved) {
+            return "[]".into();
+        }
+        let stale: Vec<&String> = self.bound.iter().collect();
+        serde_json::to_string(&stale).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// A domain this page is showing, so a head move can name it.
+    ///
+    /// Recorded by the session rather than tracked in JS, because deciding
+    /// what to reload is a decision.
+    pub fn bind(&mut self, domain: &str) {
+        self.bound.insert(domain.to_string());
+    }
+
+    pub fn unbind(&mut self, domain: &str) {
+        self.bound.remove(domain);
     }
 
     /// How this session actually finds out that the head moved.
@@ -452,21 +484,42 @@ impl Session {
     /// shows which one a component really has, so a binding that silently
     /// fell back to polling cannot look like one that did not.
     pub fn live_mode(&self) -> String {
+        let waited = crate::js_now_ms().saturating_sub(self.asked_at_ms);
+        let tick = " The tick keeps the data right meanwhile.";
         let (mode, why) = if self.watching {
-            ("HeadSubscribed", "")
+            ("HeadSubscribed", String::new())
+        } else if !self.watch_refused.is_empty() {
+            let said = &self.watch_refused;
+            (
+                "Polled",
+                format!("the node refused to watch the head: {said}.{tick}"),
+            )
         } else if !self.plan.provisioned() {
             (
                 "Polled",
-                "this node is not provisioned, so there is no head to watch",
+                "this node is not provisioned, so there is no head to watch".to_string(),
             )
         } else if self.head_id == [0u8; 32] {
-            ("Polled", "the engine has not named a head contract yet")
+            (
+                "Polled",
+                "the engine has not named a head contract yet".to_string(),
+            )
+        } else if self.subscribed && waited > WATCH_ANSWER_MS {
+            // ASKED AND NEVER ANSWERED. Without this it sits at "asked" for
+            // ever and a page shows a subscription it does not have.
+            (
+                "Polled",
+                format!("asked to watch the head and the node never answered.{tick}"),
+            )
         } else if self.subscribed {
-            ("Polled", "the node has not accepted the subscription yet")
+            (
+                "Polled",
+                "the node has not accepted the subscription yet".to_string(),
+            )
         } else {
             (
                 "Polled",
-                "no subscription has been asked for on this connection",
+                "no subscription has been asked for on this connection".to_string(),
             )
         };
         serde_json::json!({
@@ -926,6 +979,14 @@ impl Session {
         .to_string()
     }
 }
+
+/// How long a subscribe request may go unanswered before this session says
+/// it is polling.
+///
+/// Not a claim about the network: a bound on the WAIT, so a page never shows
+/// a subscription it does not have. The tick keeps the data right either way,
+/// which is why this can be short.
+const WATCH_ANSWER_MS: u64 = 10_000;
 
 /// The request ids preload uses, kept away from the app's own.
 const PRELOAD_REQ_BASE: u64 = 1 << 32;

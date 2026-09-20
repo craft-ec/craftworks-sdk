@@ -68,7 +68,28 @@ export function engineDb(handle) {
   };
 
   // Woken by the page, on the task that handled the message.
-  handle.onReadsWake?.(() => drain());
+  handle.onReadsWake?.(() => { drain(); reloadStale(); });
+
+  // Bindings this app is showing, by domain, so a head move can re-run them.
+  const bound = new Map();   // domain -> Set<callback>
+
+  /**
+   * The head moved: re-run the bindings the SESSION says are stale.
+   *
+   * Which ones is Rust's decision, not this file's. Reloading "everything"
+   * would turn one write anywhere into a full refetch of every screen, and
+   * guessing would miss the domain that changed.
+   *
+   * This is what makes LIVE mean anything. Without it a HeadChanged set a
+   * flag nothing read, and a tab that made no write found out on its tick —
+   * so the live arm of an acceptance would have been the tick's number
+   * wearing a different name.
+   */
+  const reloadStale = () => {
+    let stale;
+    try { stale = JSON.parse(session.take_stale()); } catch (_) { return; }
+    for (const domain of stale) for (const cb of bound.get(domain) ?? []) cb();
+  };
 
   /** Wait for the load this read is parked on. */
   const waitFor = ticket =>
@@ -159,10 +180,35 @@ export function engineDb(handle) {
     scan: (domain, { reverse = false, limit = 0, after = "" } = {}) =>
       once(() => JSON.parse(session.scan(domain, reverse, limit, after))),
 
+    /**
+     * Watch a domain: `cb` runs when the head moves and this domain is
+     * stale. Returns an unsubscribe.
+     *
+     * The session is TOLD which domains are bound, because it is the thing
+     * that decides what a head move makes stale.
+     */
+    watch(domain, cb) {
+      if (!bound.has(domain)) { bound.set(domain, new Set()); session.bind(domain); }
+      bound.get(domain).add(cb);
+      return () => {
+        const cbs = bound.get(domain);
+        cbs?.delete(cb);
+        if (cbs && cbs.size === 0) { bound.delete(domain); session.unbind(domain); }
+      };
+    },
+
+    /**
+     * How this session finds out the head moved — and when it is polling,
+     * WHY. A page that believed it was being notified while it was polling
+     * is the failure this exists to prevent.
+     */
+    liveMode: () => JSON.parse(session.live_mode()),
+
     // THE PAGE CALLS THIS after handing a message to the session, and after
-    // each tick. It is how a parked read learns its load is done. Without it
-    // every read that missed the cache waits for ever.
-    drain,
+    // each tick. It is how a parked read learns its load is done, and how a
+    // stale binding learns the head moved. Without it every read that missed
+    // the cache waits for ever.
+    drain: () => { drain(); reloadStale(); },
 
     // The tree's root, or "" when this client cannot state one. EMPTY is not
     // a zero root: a zero root reads as a real, empty database.

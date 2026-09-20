@@ -6,7 +6,7 @@
 //! covers and the part that cannot be made to answer `Busy` on demand.
 
 use craftworks_sdk::{EngineStore, Transport};
-use engine_delegate::shell::{Inbound, Shell};
+use engine_delegate::shell::{Inbound, Shell, StoreFacts};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use protocol::{Bound, WriteState};
@@ -58,9 +58,7 @@ impl Loop {
             &self.ctx,
             engine::Params::default(),
             self.store.clone(),
-            true,
-            true,
-            [0u8; 32],
+            StoreFacts::provisioned(),
         );
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");

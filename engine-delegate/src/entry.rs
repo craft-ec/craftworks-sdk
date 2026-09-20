@@ -8,7 +8,7 @@
 
 use crate::blocks::NodeBlocks;
 use crate::schedule::Op;
-use crate::shell::{Inbound, Shell};
+use crate::shell::{Inbound, Shell, StoreFacts};
 use engine::Params;
 use freenet_stdlib::prelude::*;
 
@@ -307,9 +307,11 @@ impl DelegateInterface for EngineDelegate {
                 &carried,
                 Params::default(),
                 blocks,
-                code.is_some(),
-                writable,
-                head_id.unwrap_or_default(),
+                StoreFacts {
+                    has_code: code.is_some(),
+                    head_writable: writable,
+                    head_id: head_id.unwrap_or_default(),
+                },
             );
             let out = shell.handle(vec![msg]);
             head_exists = shell.head_exists();
@@ -510,9 +512,11 @@ impl DelegateInterface for EngineDelegate {
                     &carried2,
                     Params::default(),
                     blocks,
-                    code.is_some(),
-                    writable,
-                    head_id.unwrap_or_default(),
+                    StoreFacts {
+                        has_code: code.is_some(),
+                        head_writable: writable,
+                        head_id: head_id.unwrap_or_default(),
+                    },
                 );
                 for (contract, block) in &asked {
                     shell.note_request(*contract, *block);
@@ -535,9 +539,11 @@ impl DelegateInterface for EngineDelegate {
                     &carried2,
                     Params::default(),
                     blocks,
-                    code.is_some(),
-                    writable,
-                    head_id.unwrap_or_default(),
+                    StoreFacts {
+                        has_code: code.is_some(),
+                        head_writable: writable,
+                        head_id: head_id.unwrap_or_default(),
+                    },
                 );
                 let more = shell.handle(vec![Inbound::NoHead]);
                 (more, shell.to_context())

@@ -250,6 +250,35 @@ pub struct Shell<B: Blocks> {
     tracing_of: Option<protocol::TraceOf>,
 }
 
+/// What the SECRET STORE holds, as the entry point found it this call.
+///
+/// A struct and not three positional arguments. `has_code` and
+/// `head_writable` are adjacent booleans: swapped, they compile, they type-
+/// check, and the delegate then reports itself provisioned when it is not —
+/// which is the failure `head_writable` was added to prevent. A field name
+/// at each call site is the cheapest thing that makes a swap impossible.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoreFacts {
+    /// The Block contract's code is in the store.
+    pub has_code: bool,
+    /// Everything a head write needs is there: code AND params AND key.
+    pub head_writable: bool,
+    /// The head's contract instance id, or zero when there is no Register.
+    pub head_id: [u8; 32],
+}
+
+impl StoreFacts {
+    /// A delegate that is fully set up, for tests about ENGINE behaviour
+    /// where provisioning is not the subject.
+    pub fn provisioned() -> StoreFacts {
+        StoreFacts {
+            has_code: true,
+            head_writable: true,
+            head_id: [0u8; 32],
+        }
+    }
+}
+
 impl<B: Blocks> Shell<B> {
     /// Rebuild from the context, or start fresh if it cannot be read.
     ///
@@ -258,7 +287,7 @@ impl<B: Blocks> Shell<B> {
     /// in flight `Lost`. So an unreadable context is a fresh start, not an
     /// error — and never a panic, because the bytes come from outside.
     pub fn resume(ctx: &[u8], params: Params, blocks: B) -> Self {
-        Self::resume_with(ctx, params, blocks, true, true, [0u8; 32])
+        Self::resume_with(ctx, params, blocks, StoreFacts::provisioned())
     }
 
     /// As `resume`, saying whether the contract code is on hand and whether
@@ -266,14 +295,12 @@ impl<B: Blocks> Shell<B> {
     /// it is the constructor for tests about engine behaviour, where the
     /// delegate is taken as already set up. The entry point, which is the
     /// only caller that can actually look, reads both from the store.
-    pub fn resume_with(
-        ctx: &[u8],
-        params: Params,
-        blocks: B,
-        has_code: bool,
-        head_writable: bool,
-        head_id: [u8; 32],
-    ) -> Self {
+    pub fn resume_with(ctx: &[u8], params: Params, blocks: B, store: StoreFacts) -> Self {
+        let StoreFacts {
+            has_code,
+            head_writable,
+            head_id,
+        } = store;
         let carried: Option<Carried> = ctx_opts().deserialize(ctx).ok();
         // A context the shell cannot read and one the ENGINE refuses are the
         // same outcome: start fresh. Never a panic — these bytes come from

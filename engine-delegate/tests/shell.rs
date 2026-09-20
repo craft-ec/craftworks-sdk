@@ -2,7 +2,7 @@
 //! things it does not understand. No wasm, no node.
 
 use engine::Params;
-use engine_delegate::shell::{Inbound, Shell};
+use engine_delegate::shell::{Inbound, Shell, StoreFacts};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use protocol::{Dropped, Reply, Request, WriteState};
@@ -126,8 +126,16 @@ fn an_ack_is_not_a_confirmation_and_the_read_back_is() {
 #[test]
 fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
     let store = Store::default();
-    let mut s: Shell<Store> =
-        Shell::resume_with(&[], Params::default(), store, true, true, [0u8; 32]);
+    let mut s: Shell<Store> = Shell::resume_with(
+        &[],
+        Params::default(),
+        store,
+        StoreFacts {
+            has_code: true,
+            head_writable: true,
+            head_id: [0u8; 32],
+        },
+    );
     let out = s.handle(vec![Inbound::Client(write_req())]);
     let put = out
         .ops
@@ -205,8 +213,16 @@ fn a_message_with_trailing_bytes_is_refused_rather_than_half_read() {
 
     // ...and the shell drops it rather than acting on the prefix.
     let store = Store::default();
-    let mut s: Shell<Store> =
-        Shell::resume_with(&[], Params::default(), store, true, true, [0u8; 32]);
+    let mut s: Shell<Store> = Shell::resume_with(
+        &[],
+        Params::default(),
+        store,
+        StoreFacts {
+            has_code: true,
+            head_writable: true,
+            head_id: [0u8; 32],
+        },
+    );
     let out = s.handle(vec![Inbound::Client(trailing)]);
     assert_eq!(
         out.dropped.len(),
@@ -380,9 +396,11 @@ fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
         &[],
         Params::default(),
         store.clone(),
-        false,
-        true,
-        [0u8; 32],
+        StoreFacts {
+            has_code: false,
+            head_writable: true,
+            head_id: [0u8; 32],
+        },
     );
     let out = without.handle(vec![Inbound::Client(write_req())]);
     assert_eq!(
@@ -404,8 +422,16 @@ fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
 
     // The control: the same write with the code on hand DOES put. Otherwise
     // this test would pass over a shell that never puts anything.
-    let mut with: Shell<Store> =
-        Shell::resume_with(&[], Params::default(), store, true, true, [0u8; 32]);
+    let mut with: Shell<Store> = Shell::resume_with(
+        &[],
+        Params::default(),
+        store,
+        StoreFacts {
+            has_code: true,
+            head_writable: true,
+            head_id: [0u8; 32],
+        },
+    );
     let out = with.handle(vec![Inbound::Client(write_req())]);
     assert!(
         out.ops
@@ -432,8 +458,16 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
     // NOT yet provisioned — which is the only state in which an install does
     // anything. A delegate that already has a key refuses one, and that is
     // asserted by its own test.
-    let mut s: Shell<Store> =
-        Shell::resume_with(&[], Params::default(), store, false, false, [0u8; 32]);
+    let mut s: Shell<Store> = Shell::resume_with(
+        &[],
+        Params::default(),
+        store,
+        StoreFacts {
+            has_code: false,
+            head_writable: false,
+            head_id: [0u8; 32],
+        },
+    );
 
     let req = protocol::encode_request(
         protocol::CURRENT,
@@ -501,7 +535,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
 
     let run = |n: u32| -> (Vec<WriteState>, usize, usize) {
         let mut s: Shell<Store> =
-            Shell::resume_with(&[], params, store.clone(), true, true, [0u8; 32]);
+            Shell::resume_with(&[], params, store.clone(), StoreFacts::provisioned());
         s.limits = engine_delegate::schedule::Limits {
             max_gets: 4,
             max_puts: per_return,
@@ -735,9 +769,11 @@ fn identity_reports_whether_a_head_can_be_written_both_ways() {
             &[],
             Params::default(),
             Store::default(),
-            true,
-            store_can_sign,
-            [0u8; 32],
+            StoreFacts {
+                has_code: true,
+                head_writable: store_can_sign,
+                head_id: [0u8; 32],
+            },
         );
         let out = s.handle(vec![Inbound::Client(protocol::encode_request(
             1,
@@ -787,9 +823,11 @@ fn an_install_at_a_provisioned_delegate_changes_nothing_and_says_so() {
             &[],
             Params::default(),
             Store::default(),
-            true,
-            already_provisioned,
-            [0u8; 32],
+            StoreFacts {
+                has_code: true,
+                head_writable: already_provisioned,
+                head_id: [0u8; 32],
+            },
         );
         let out = s.handle(vec![Inbound::Client(protocol::encode_request(
             1,
@@ -850,9 +888,11 @@ fn identity_names_the_head_contract_when_there_is_one() {
             &[],
             Params::default(),
             Store::default(),
-            true,
-            head_id != [0u8; 32],
-            head_id,
+            StoreFacts {
+                has_code: true,
+                head_writable: head_id != [0u8; 32],
+                head_id,
+            },
         );
         let out = s.handle(vec![Inbound::Client(protocol::encode_request(
             1,

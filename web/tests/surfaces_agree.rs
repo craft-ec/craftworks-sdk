@@ -68,7 +68,13 @@ const TRANSPORT_ONLY: &[&str] = &[
     // to be notified by — its data cannot change under it — so there is
     // nothing for these to report there.
     "live_mode",
-    "take_head_moved",
+    // Which domains a head move made stale, and which domains are bound so
+    // it can name them. An in-memory store has no head on a node and nothing
+    // to be notified by — its data cannot change under it — so there is
+    // nothing for these to report there.
+    "take_stale",
+    "bind",
+    "unbind",
 ];
 
 #[test]
