@@ -467,6 +467,11 @@ fn an_oversize_record_is_refused_and_the_database_still_works() {
     let err = d
         .put("notes", &obj(json!({ "body": huge })))
         .expect_err("a record over the limit must be refused, not stored");
+    // The CODE is what an app branches on: no reload makes a record smaller,
+    // so this must not look transient.
+    assert_eq!(err.code(), "TOO_LARGE");
+    assert!(!err.is_transient());
+    let err = err.to_string();
     assert!(err.contains(&MAX_VALUE.to_string()), "{err}");
     assert!(
         err.contains("file") || err.contains("blob"),

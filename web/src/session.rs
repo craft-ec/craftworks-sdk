@@ -17,7 +17,7 @@
 //! reply is usable at all — is in Rust, where it is tested against a transport
 //! that reorders, duplicates and drops, and against a node.
 
-use craftworks_sdk::CachedStore;
+use craftworks_sdk::{CachedStore, DbError, SystemEnv};
 use wasm_bindgen::prelude::*;
 use wire::provision::{Provisioner, Step};
 use wire::{AckKind, DelegateKey, Incoming, Reassembler};
@@ -36,7 +36,11 @@ struct Artefacts {
 /// Everything one page-to-node connection needs.
 #[wasm_bindgen]
 pub struct Session {
-    store: CachedStore,
+    /// The database AND the store it reads through. One object, because a
+    /// page has one connection and one tree: `Db` owns its store, and the
+    /// pump reaches it through `store_mut()` rather than through a second
+    /// handle that could drift out of step with it.
+    db: craftworks_sdk::Db<CachedStore, SystemEnv>,
     frames: Reassembler,
     plan: Provisioner,
     /// Frames waiting to go out. WIRE frames, already enveloped — the page
@@ -70,12 +74,18 @@ impl Session {
     /// node's own word about its own store.
     #[wasm_bindgen(constructor)]
     pub fn new(port: u16) -> Result<Session, JsError> {
+        let mut device = [0u8; 4];
+        let _ = getrandom::getrandom(&mut device);
         // Built here so the URL's `encodingProtocol=native` cannot be lost by
         // a page assembling its own: the node falls back to a different
         // encoding without it and says nothing that names the cause.
         wire::ws_url("127.0.0.1", port).map_err(|e| JsError::new(&e))?;
         Ok(Session {
-            store: CachedStore::new(Box::new(crate::js_now_ms)),
+            db: craftworks_sdk::Db::new(
+                CachedStore::new(Box::new(crate::js_now_ms)),
+                SystemEnv,
+                device,
+            ),
             frames: Reassembler::new(),
             plan: Provisioner::new(),
             out: Vec::new(),
@@ -143,7 +153,7 @@ impl Session {
                         }
                         _ => {}
                     }
-                    self.store.on_inbound(&m);
+                    self.db.store_mut().on_inbound(&m);
                 }
             }
             Incoming::Ack(kind) => self.on_ack(kind),
@@ -267,7 +277,7 @@ impl Session {
         let Some(key) = self.delegate.clone() else {
             return;
         };
-        for bytes in self.store.take_outbound() {
+        for bytes in self.db.store_mut().take_outbound() {
             let stream = self.next_stream();
             match wire::frame_engine_request(&key, bytes, stream) {
                 Ok(frames) => self.out.extend(frames),
@@ -369,10 +379,214 @@ impl Session {
         self.frames.reset();
     }
 
+    // ---- the data surface -------------------------------------------
+    //
+    // The SAME method names the in-memory `Db` has, so "Publish switches the
+    // backend and the app code does not change" is a fact rather than an
+    // intention. `tests/surfaces_agree.rs` fails if either side grows a
+    // method the other lacks.
+    //
+    // Errors cross as `{ code, message }` with a code from a FIXED list.
+    // An app must be able to tell "read me again" from "you are wrong", and
+    // the only alternative to a code is matching on the text of a message —
+    // which breaks the first time anybody rewords it, and breaks silently.
+    // Nothing downstream branches on the message.
+
+    pub fn define(&mut self, domain: &str, schema: &str) -> Result<(), JsValue> {
+        let s: craftworks_sdk::Schema =
+            serde_json::from_str(schema).map_err(|e| db_err(&DbError::Refused(e.to_string())))?;
+        self.db.define(domain, &s).map_err(|e| db_err(&e))
+    }
+
+    pub fn schema(&mut self, domain: &str) -> Result<String, JsValue> {
+        as_json(self.db.schema(domain))
+    }
+
+    pub fn domains(&mut self) -> Result<String, JsValue> {
+        as_json(self.db.domains())
+    }
+
+    pub fn put(&mut self, domain: &str, fields: &str) -> Result<String, JsValue> {
+        let f = fields_of(fields)?;
+        as_json(self.db.put(domain, &f))
+    }
+
+    pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
+        let p = fields_of(patch)?;
+        let k = rkey_of(id)?;
+        as_json(self.db.update(domain, &k, &p))
+    }
+
+    pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
+        let k = rkey_of(id)?;
+        as_json(self.db.get(domain, &k))
+    }
+
+    pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
+        let k = rkey_of(id)?;
+        self.db.delete(domain, &k).map_err(|e| db_err(&e))
+    }
+
+    /// `after` is a record id or the empty string.
+    pub fn scan(
+        &mut self,
+        domain: &str,
+        reverse: bool,
+        limit: usize,
+        after: &str,
+    ) -> Result<String, JsValue> {
+        let after = if after.is_empty() {
+            None
+        } else {
+            Some(rkey_of(after)?)
+        };
+        as_json(self.db.scan(
+            domain,
+            craftworks_sdk::Scan {
+                reverse,
+                limit,
+                after,
+            },
+        ))
+    }
+
+    /// What this client HOLDS — not what the tree contains.
+    ///
+    /// The in-memory store can answer `blocks`/`bytes`/`height` because it
+    /// IS the tree. This one holds a copy of the ranges the app has bound, on
+    /// a node that holds the rest, so those three are **`null` and not 0**.
+    /// Zero would render as a real, empty database — the same
+    /// not-loaded-versus-empty confusion this whole layer exists to prevent,
+    /// arriving through a statistics panel instead of a read.
+    ///
+    /// The numbers that ARE this client's own are reported beside them.
+    pub fn stats(&mut self) -> Result<String, JsValue> {
+        let (n_pending, pending_bytes) = self.db.store_mut().copy.pending();
+        let held = self.db.store_mut().copy.bytes();
+        as_json::<serde_json::Value>(Ok(serde_json::json!({
+            // Properties of the TREE, which lives on the node.
+            "blocks": serde_json::Value::Null,
+            "bytes": serde_json::Value::Null,
+            "height": serde_json::Value::Null,
+            // Properties of THIS CLIENT, which are the ones it can state.
+            "heldBytes": held,
+            "pendingWrites": n_pending,
+            "pendingBytes": pending_bytes,
+        })))
+    }
+
+    pub fn count(&mut self, domain: &str) -> Result<usize, JsValue> {
+        self.db.count(domain).map_err(|e| db_err(&e))
+    }
+
+    /// The tree's root, as `node:<64 hex>`.
+    pub fn root(&mut self) -> String {
+        match craftworks_sdk::Reads::root(self.db.store_mut()) {
+            Ok(root) => craftworks_sdk::BlockId::from_parts(freenet_prolly::kind::TREE_NODE, root)
+                .to_string(),
+            // EMPTY, never a zero root. A store that cannot state its root
+            // has not got one yet; a zero root renders as a real tree that
+            // happens to be empty, which is the same NotLoaded-vs-empty
+            // confusion one layer up.
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Load the ranges an app names on open, before it asks for them.
+    ///
+    /// The manifest is `[[lo, hi], ...]` as JSON. Each pair becomes one
+    /// range request on the pump; the answers arrive at the normal door and
+    /// land in the local copy, so a read that would have been `NOT_LOADED`
+    /// is answered from memory instead.
+    ///
+    /// Bounded, because it comes from a project file a person edits: a
+    /// manifest naming thousands of ranges would queue thousands of requests
+    /// before the first frame. Refused whole rather than truncated — a
+    /// silently shortened preload is a page that is mysteriously slow.
+    pub fn preload(&mut self, manifest: &str) -> Result<usize, JsValue> {
+        const MAX_RANGES: usize = 64;
+        let ranges: Vec<(String, String)> = serde_json::from_str(manifest)
+            .map_err(|e| db_err(&DbError::Refused(format!("preload manifest: {e}"))))?;
+        if ranges.len() > MAX_RANGES {
+            return Err(db_err(&DbError::TooLarge(format!(
+                "preload names {} ranges and the limit is {MAX_RANGES}",
+                ranges.len()
+            ))));
+        }
+        for (i, (lo, hi)) in ranges.iter().enumerate() {
+            self.db.store_mut().request_range(
+                PRELOAD_REQ_BASE + i as u64,
+                lo.as_bytes(),
+                hi.as_bytes(),
+                0,
+            );
+        }
+        Ok(ranges.len())
+    }
+
+    /// The call tree of the last operation, in the instrument VOCABULARY.
+    ///
+    /// **No user content crosses this.** Not a key, not a value, not a domain
+    /// name — only the fixed event fields the instrument defines. The same
+    /// recording ships in a user's app and is what a support bundle is made
+    /// of, so a site that emitted anything derived from a person's data would
+    /// put it in every bundle, and no grep would find it.
+    pub fn trace(&mut self) -> String {
+        // The LAST write this session issued. `next_write_id` is the one the
+        // next write will carry, so the last issued is one below it — and
+        // before any write has been made there is nothing to trace.
+        let next = self.db.store_mut().next_write_id();
+        if next <= 1 {
+            return "null".into();
+        }
+        let of = protocol::TraceOf::Write(next - 1);
+        let Some(t) = self.db.store_mut().client.trace(of) else {
+            return "null".into();
+        };
+        // Serialised FIELD BY FIELD, never derived.
+        //
+        // `Trace` is the SDK's own type and a derive would carry whatever is
+        // added to it later straight across this boundary. The same recording
+        // ships in a user's app and is what a support bundle is made of, so
+        // what crosses is enumerated here: a step's NAME from the fixed
+        // `protocol::Step` list, its depth, its count, and a coarse offset.
+        // No key, no value, no domain name.
+        let steps: Vec<serde_json::Value> = t
+            .steps
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "step": format!("{:?}", s.what),
+                    "depth": s.depth,
+                    "n": s.n,
+                    "atMs": s.at_ms,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "steps": steps,
+            "totalMs": t.total_ms,
+            "truncated": t.truncated,
+        })
+        .to_string()
+    }
+
+    /// Turn tracing on or off. A parameter, not a rebuild.
+    pub fn trace_on(&mut self, on: bool) {
+        if on {
+            self.db
+                .store_mut()
+                .client
+                .trace_on(Box::new(crate::js_now_ms));
+        } else {
+            self.db.store_mut().client.trace_off();
+        }
+    }
+
     /// The client's timer: roll back writes with no verdict, notice stalls.
     pub fn tick(&mut self) -> String {
         let now = crate::js_now_ms();
-        let told = self.store.copy.time_out(now);
+        let told = self.db.store_mut().copy.time_out(now);
         let stalled = self.plan.tick(now);
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
@@ -380,4 +594,32 @@ impl Session {
         })
         .to_string()
     }
+}
+
+/// The request ids preload uses, kept away from the app's own.
+const PRELOAD_REQ_BASE: u64 = 1 << 32;
+
+/// A `DbError` as JavaScript sees it: a stable `code` and a message that is
+/// for a person to read, never for code to branch on.
+fn db_err(e: &DbError) -> JsValue {
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&o, &"code".into(), &e.code().into());
+    let _ = js_sys::Reflect::set(&o, &"message".into(), &e.to_string().into());
+    let _ = js_sys::Reflect::set(&o, &"transient".into(), &e.is_transient().into());
+    o.into()
+}
+
+fn as_json<T: serde::Serialize>(r: Result<T, DbError>) -> Result<String, JsValue> {
+    let v = r.map_err(|e| db_err(&e))?;
+    serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
+}
+
+fn fields_of(s: &str) -> Result<serde_json::Map<String, serde_json::Value>, JsValue> {
+    serde_json::from_str(s)
+        .map_err(|e| db_err(&DbError::Refused(format!("fields must be an object: {e}"))))
+}
+
+fn rkey_of(id: &str) -> Result<craftworks_sdk::id::RKey, JsValue> {
+    craftworks_sdk::id::from_hex(id)
+        .ok_or_else(|| db_err(&DbError::Refused(format!("`{id}` is not a record id"))))
 }

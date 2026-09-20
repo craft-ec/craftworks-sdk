@@ -12,7 +12,7 @@
 //! and not a different design.
 
 pub mod blocks;
-mod entry;
+pub mod entry;
 pub mod register;
 pub mod schedule;
 pub mod serve;
