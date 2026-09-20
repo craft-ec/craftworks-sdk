@@ -11,45 +11,29 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     });
     let wasm = std::fs::read(&path)?;
-    let all = probe::imports(&wasm).map_err(anyhow::Error::msg)?;
-    let bad = probe::not_defined(&wasm).map_err(anyhow::Error::msg)?;
-    let delegate_imports: Vec<_> = all
-        .iter()
-        .filter(|(m, _)| m.starts_with("freenet_delegate"))
-        .collect();
-    println!(
-        "{path}: {} import(s), {} from freenet_delegate*",
-        all.len(),
-        delegate_imports.len()
-    );
-    for (m, f) in &delegate_imports {
-        println!("  {m}::{f}");
-    }
-    // An unwired delegate compiles to a module with NO imports, and a
-    // subset check passes over it happily. Demand at least the context
-    // functions, which every delegate the macro wires up will import.
-    if delegate_imports.is_empty() {
-        anyhow::bail!(
-            "{path} imports no delegate host functions at all. That is what an \
-             UNWIRED delegate looks like — check the crate declares the \
-             `freenet-main-delegate` feature — and a subset check passes over \
-             it without complaint."
-        );
-    }
-    if bad.is_empty() {
-        println!(
-            "ok: every delegate import is one of the {} the node defines",
-            probe::DEFINED_BY_NODE.len()
-        );
-        Ok(())
-    } else {
-        for b in &bad {
-            println!("REFUSED: {b} is not defined by the pinned node");
+    // ONE call. Both halves of the gate are inside it, because they are not
+    // independent: the subset check is vacuous over a module with no imports,
+    // so a caller running only that half reports a clean pass over an unwired
+    // delegate.
+    match probe::check(&wasm) {
+        Ok(c) => {
+            println!(
+                "{path}: {} import(s), {} from freenet_delegate*",
+                c.total,
+                c.delegate.len()
+            );
+            for (m, f) in &c.delegate {
+                println!("  {m}::{f}");
+            }
+            println!(
+                "ok: every delegate import is one of the {} the node defines",
+                probe::DEFINED_BY_NODE.len()
+            );
+            Ok(())
         }
-        anyhow::bail!(
-            "{} import(s) the node does not define: the delegate would fail to \
-             INSTANTIATE, for every message, not only when it reached the call",
-            bad.len()
-        )
+        Err(e) => {
+            println!("REFUSED {path}: {e}");
+            anyhow::bail!("{path}: {e}")
+        }
     }
 }
