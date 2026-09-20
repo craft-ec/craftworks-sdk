@@ -39,6 +39,10 @@ getrandom = { version = "0.2", features = ["js"] }
 [dev-dependencies]
 wasmi = "0.32"
 bincode = "1"
+# Signing Register records, for the corpus the artefact gate freezes. A
+# dev-dependency: `--edges normal` is what the boundary gate walks, so this
+# never reaches the SDK's own tree.
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
 members = ["engine", "engine-delegate", "probe-delegate", "probe"]

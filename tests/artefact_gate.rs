@@ -181,7 +181,7 @@ fn write_arm_cases() -> Vec<Case> {
     // Keys wide enough that the tree is several levels deep, so branch nodes
     // and leaf nodes are both represented.
     for i in 0..4000u32 {
-        b.push_bytes(format!("k/{i:06}").as_bytes(), &vec![(i % 251) as u8; 200])
+        b.push_bytes(format!("k/{i:06}").as_bytes(), &[(i % 251) as u8; 200])
             .expect("push");
     }
     let root = b.finish().expect("finish");
@@ -204,8 +204,7 @@ fn write_arm_cases() -> Vec<Case> {
     );
     // Every distinct node the builder produced, capped so the arm stays a
     // gate and not a benchmark. The largest is always included.
-    let mut nodes: Vec<(usize, Vec<u8>)> =
-        sink.0.iter().map(|(_, b)| (b.len(), b.to_vec())).collect();
+    let mut nodes: Vec<(usize, Vec<u8>)> = sink.0.values().map(|b| (b.len(), b.to_vec())).collect();
     nodes.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
     for (n, bytes) in nodes.iter().take(24) {
         let what: &'static str = if *n == biggest {
@@ -268,4 +267,397 @@ fn every_block_this_sdk_writes_is_accepted_by_the_released_contract() {
          byte over MAX_NODE) refused",
         cases.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The corpus: what released contracts ACCEPTED, frozen.
+// ---------------------------------------------------------------------------
+
+use support::corpus::{self, Entry};
+
+/// Where the frozen corpus lives, in THIS repository.
+///
+/// In-tree on purpose. The epochs that vouched for it are needed to MAKE it
+/// and never to check it, so the gate depends on a file it owns rather than
+/// on another repository's build directory being present and current.
+fn corpus_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/accepted.bin")
+}
+
+/// The epoch wasms, for REGENERATION only.
+fn epochs_dir() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("CRAFTWORKS_EPOCHS") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let repo = contracts_repo()?;
+    let beside = repo.join("../freenet-harness/build/epochs");
+    beside.join("block-A.wasm").is_file().then_some(beside)
+}
+
+/// Build candidates, offer them to EVERY epoch, keep what all of them took.
+///
+/// Run by hand, never as a gate:
+///
+/// ```text
+/// cargo test -p craftworks-sdk --test artefact_gate -- --ignored regenerate
+/// ```
+///
+/// It is `#[ignore]` because it needs artefacts from another repository and
+/// WRITES to this one. The gate it feeds needs neither.
+#[test]
+#[ignore = "regenerates the frozen corpus; needs the epoch wasms"]
+fn regenerate_the_corpus() {
+    let dir = epochs_dir().expect(
+        "cannot find the epoch wasms. Set CRAFTWORKS_EPOCHS to the directory \
+         holding block-A.wasm, block-B.wasm, register-A.wasm, register-B.wasm.",
+    );
+    let load = |name: &str| -> (String, Contract) {
+        let bytes = std::fs::read(dir.join(name)).unwrap_or_else(|e| {
+            panic!("reading {name}: {e}");
+        });
+        let short = blake3::hash(&bytes); // only for the message below
+        let _ = short;
+        let sha = sha256_short(&bytes);
+        (
+            sha,
+            Contract::load(&bytes).unwrap_or_else(|e| panic!("{name}: {e}")),
+        )
+    };
+    let mut block_epochs = [load("block-A.wasm"), load("block-B.wasm")];
+    let mut register_epochs = [load("register-A.wasm"), load("register-B.wasm")];
+    println!(
+        "  block epochs:    {}",
+        block_epochs
+            .iter()
+            .map(|(h, _)| h.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "  register epochs: {}",
+        register_epochs
+            .iter()
+            .map(|(h, _)| h.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut kept: Vec<Entry> = Vec::new();
+    let mut offered = 0usize;
+    let mut partial = 0usize;
+    // (shape, body length, the epochs that took it) — written out beside the
+    // corpus, because WHICH epochs disagree and about WHAT is a fact about
+    // the released contracts and belongs in the repository, not in a console
+    // line nobody sees again.
+    let mut provenance: Vec<(String, usize, Vec<String>)> = Vec::new();
+
+    // --- blocks ---
+    for case in write_arm_cases() {
+        offered += 1;
+        let params = case.params();
+        let mut accepted_by = Vec::new();
+        for (hash, c) in block_epochs.iter_mut() {
+            match c.validate(&params, &case.state) {
+                Verdict::Valid => accepted_by.push(hash.clone()),
+                Verdict::Invalid => {}
+                other => panic!("block epoch {hash} broke on {}: {other:?}", case.what),
+            }
+        }
+        // ONLY what every epoch took. An entry one epoch refused is not
+        // evidence about what the network accepts; it is evidence the epochs
+        // disagree, which is a different finding and not this corpus's job.
+        if case.state[0] == freenet_prolly::kind::TREE_NODE {
+            let body = &case.state[1..];
+            let shape = match freenet_prolly::node::Node::parse(body) {
+                Ok(n) if n.is_leaf() => "leaf",
+                Ok(_) => "branch",
+                Err(_) => "unparseable",
+            };
+            provenance.push((shape.to_string(), case.state.len() - 1, accepted_by.clone()));
+        }
+        if accepted_by.len() == block_epochs.len() {
+            kept.push(Entry {
+                contract: "block".into(),
+                epochs: accepted_by,
+                what: case.what.to_string(),
+                params,
+                state: case.state,
+            });
+        } else if !accepted_by.is_empty() {
+            // The epochs DISAGREE about these bytes. Named, not counted: a
+            // case one released contract takes and another refuses is a fact
+            // about the epochs, and burying it in a tally is how it stays
+            // unnoticed.
+            partial += 1;
+        }
+    }
+
+    // --- register head records ---
+    for (what, params, state) in register_cases() {
+        offered += 1;
+        let mut accepted_by = Vec::new();
+        for (hash, c) in register_epochs.iter_mut() {
+            match c.validate(&params, &state) {
+                Verdict::Valid => accepted_by.push(hash.clone()),
+                Verdict::Invalid => {}
+                other => panic!("register epoch {hash} broke on {what}: {other:?}"),
+            }
+        }
+        if accepted_by.len() == register_epochs.len() {
+            kept.push(Entry {
+                contract: "register".into(),
+                epochs: accepted_by,
+                what: what.to_string(),
+                params,
+                state,
+            });
+        } else if !accepted_by.is_empty() {
+            partial += 1;
+        }
+    }
+
+    assert!(
+        kept.iter().any(|e| e.contract == "block"),
+        "no block was accepted by every epoch, so the corpus would have no \
+         block arm at all"
+    );
+    assert!(
+        kept.iter().any(|e| e.contract == "register"),
+        "no register record was accepted by every epoch"
+    );
+
+    let path = corpus_path();
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+    std::fs::write(&path, corpus::encode(&kept)).expect("writing the corpus");
+
+    // What each epoch took, by node shape. A disagreement between released
+    // contracts is the most interesting thing this generator can find, and
+    // burying it in a tally is how it stays unnoticed.
+    let mut by_shape: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for (shape, _len, eps) in &provenance {
+        let key = (shape.clone(), eps.join("+"));
+        *by_shape.entry(key).or_default() += 1;
+    }
+    let mut note = String::new();
+    note.push_str("# Which released epochs accepted what\n\n");
+    note.push_str("Written by `regenerate_the_corpus`. Only entries EVERY epoch\n");
+    note.push_str("accepted are frozen in accepted.bin; this records the rest,\n");
+    note.push_str("because a case one released contract takes and another refuses\n");
+    note.push_str("is a fact about the epochs and not a rounding error.\n\n");
+    for ((shape, eps), n) in &by_shape {
+        note.push_str(&format!("- {n:3} x {shape:<8} accepted by: {eps}\n"));
+    }
+    std::fs::write(path.parent().expect("a parent").join("epochs.md"), note)
+        .expect("writing the provenance note");
+    println!(
+        "  wrote {} entries of {offered} offered ({partial} accepted by some \
+         epochs but not all, and therefore NOT frozen) to {}",
+        kept.len(),
+        path.display()
+    );
+}
+
+fn sha256_short(bytes: &[u8]) -> String {
+    // The epochs are named by sha256 in hashes.toml, so the corpus names them
+    // the same way — a corpus that identified an epoch differently from the
+    // table everyone else reads would be one nobody could cross-check.
+    use std::process::Command;
+    let tmp = std::env::temp_dir().join(format!("epoch-{}.wasm", std::process::id()));
+    std::fs::write(&tmp, bytes).expect("temp");
+    let out = Command::new("shasum")
+        .args(["-a", "256", tmp.to_str().expect("path")])
+        .output()
+        .expect("shasum");
+    let _ = std::fs::remove_file(&tmp);
+    String::from_utf8_lossy(&out.stdout)
+        .chars()
+        .take(16)
+        .collect()
+}
+
+/// Head records for the Register corpus, signed here.
+///
+/// The Register's mode 0 is a single writer, which is what a device's own
+/// head is. Each case is a `(what, params, state)` on a boundary: the
+/// smallest value, a root-sized one, and the largest a record may carry.
+fn register_cases() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    // A fixed key, so regenerating the corpus twice gives the same bytes and
+    // a diff on it means something changed rather than that it was re-run.
+    let sk = SigningKey::from_bytes(&[11u8; 32]);
+    let vk = sk.verifying_key();
+    let mut params = Vec::from(*b"RG01");
+    params.push(0u8);
+    params.extend_from_slice(&vk.to_bytes());
+    params.extend_from_slice(b"head");
+    let params_hash: [u8; 32] = *blake3::hash(&params).as_bytes();
+
+    let mut out = Vec::new();
+    for (what, seq, value) in [
+        ("register: a one-byte value", 1u64, [0x01u8; 1].to_vec()),
+        ("register: a root-sized value", 2, [0x5Au8; 32].to_vec()),
+        ("register: at MAX_VALUE", 3, vec![0x77u8; 4096]),
+    ] {
+        let value_hash: [u8; 32] = *blake3::hash(&value).as_bytes();
+        let mut msg = Vec::from(*b"RG01-sig");
+        msg.extend_from_slice(&params_hash);
+        msg.push(0u8); // not terminal
+        msg.extend_from_slice(&seq.to_le_bytes());
+        msg.extend_from_slice(&value_hash);
+        let sig = sk.sign(&msg).to_bytes();
+
+        let mut state = Vec::from(*b"RG01");
+        state.push(0b01); // a record, no equivocation evidence
+        state.push(0u8); // not terminal
+        state.extend_from_slice(&seq.to_le_bytes());
+        state.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        state.extend_from_slice(&value);
+        state.extend_from_slice(&sig);
+        out.push((what, params.clone(), state));
+    }
+    out
+}
+
+/// Everything a released contract accepted still PARSES with this prolly.
+///
+/// The other half of the rule, and it pulls the other way: the write arm says
+/// a newer writer may not emit what the contract refuses; this says a newer
+/// PARSER may not refuse what a contract already accepted. Data on the
+/// network was written under an older epoch and a reader that tightened
+/// cannot read it — a failure that shows up as missing data, long after the
+/// change that caused it.
+///
+/// Stated once, for whoever changes prolly next: **a newer prolly may only
+/// LOOSEN its parser, and may never LOOSEN its writer, relative to the
+/// released contract.**
+#[test]
+fn every_block_a_released_epoch_accepted_still_parses() {
+    let path = corpus_path();
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "the frozen corpus at {} could not be read ({e}). It is committed \
+             to this repository, so this is not a missing dependency — it is a \
+             gate with nothing to check, which is not a pass. Regenerate with \
+             `cargo test --test artefact_gate -- --ignored regenerate`.",
+            path.display()
+        )
+    });
+    let entries = corpus::decode(&bytes).expect("the corpus must decode");
+
+    let mut blocks = 0usize;
+    let mut registers = 0usize;
+    for e in &entries {
+        assert!(
+            !e.epochs.is_empty(),
+            "corpus entry {:?} names no epoch that accepted it, so it is not \
+             evidence of anything",
+            e.what
+        );
+        match e.contract.as_str() {
+            "block" => {
+                // The params ARE the block's id, so this checks the identity
+                // as well as the shape: a parser that read the bytes but
+                // disagreed about what they hash to would still be one that
+                // cannot find them.
+                assert_eq!(
+                    blake3::hash(&e.state).as_bytes().as_slice(),
+                    e.params.as_slice(),
+                    "corpus entry {:?}: its state no longer hashes to its \
+                     params, so the corpus file is damaged",
+                    e.what
+                );
+                let kind = e.state[0];
+                let body = &e.state[1..];
+                if kind == freenet_prolly::kind::TREE_NODE {
+                    freenet_prolly::node::Node::parse(body).unwrap_or_else(|err| {
+                        panic!(
+                            "THIS PROLLY CANNOT PARSE a node that epochs {:?} \
+                             accepted ({:?}, {} B): {err:?}. A parser that \
+                             tightened cannot read data already on the \
+                             network.",
+                            e.epochs,
+                            e.what,
+                            body.len()
+                        )
+                    });
+                }
+                blocks += 1;
+            }
+            "register" => {
+                let (seq, _value) = parse_head(&e.state).unwrap_or_else(|| {
+                    panic!(
+                        "this build cannot read a head record that epochs {:?} \
+                         accepted ({:?})",
+                        e.epochs, e.what
+                    )
+                });
+                assert!(seq > 0, "a head at seq 0 is not one of ours");
+                registers += 1;
+            }
+            other => panic!("corpus entry names an unknown contract {other:?}"),
+        }
+    }
+
+    assert!(
+        blocks >= 8,
+        "the corpus holds only {blocks} block(s); a green arm over almost \
+         nothing reads exactly like a green arm over the format"
+    );
+    assert!(
+        registers >= 3,
+        "the corpus holds only {registers} register record(s)"
+    );
+
+    // The control, and it must EXECUTE: a corpus entry with one byte flipped
+    // must FAIL. Without it, "everything parsed" is also what a parser that
+    // accepts anything looks like — and a corpus of bytes nobody checks is a
+    // file, not a gate.
+    let mut refused = 0usize;
+    let mut tried = 0usize;
+    for e in entries.iter().filter(|e| e.contract == "block") {
+        let kind = e.state[0];
+        if kind != freenet_prolly::kind::TREE_NODE {
+            continue;
+        }
+        tried += 1;
+        // A byte inside the node's header, where the format has structure to
+        // disagree with. Flipping a byte in a value's payload would often be
+        // legal, and a control that passes for that reason is not one.
+        let mut damaged = e.state[1..].to_vec();
+        damaged[1] ^= 0xFF;
+        if freenet_prolly::node::Node::parse(&damaged).is_err() {
+            refused += 1;
+        }
+    }
+    assert!(
+        tried > 0,
+        "no node in the corpus to damage, so no control ran"
+    );
+    assert_eq!(
+        refused, tried,
+        "only {refused} of {tried} damaged nodes were refused, so the parser \
+         accepts bytes it should not and the arm above proves nothing"
+    );
+
+    println!(
+        "  corpus arm: {blocks} block(s) and {registers} head record(s) \
+         accepted by released epochs still parse; {refused}/{tried} damaged \
+         nodes refused"
+    );
+}
+
+/// Read `(seq, value)` out of an encoded Register state.
+fn parse_head(state: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let rest = state.strip_prefix(b"RG01")?;
+    let (&flags, rest) = rest.split_first()?;
+    if flags & 0b01 == 0 {
+        return None;
+    }
+    let (_terminal, rest) = rest.split_first()?;
+    let (seq, rest) = rest.split_at_checked(8)?;
+    let seq = u64::from_le_bytes(seq.try_into().ok()?);
+    let (vlen, rest) = rest.split_at_checked(2)?;
+    let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
+    Some((seq, rest.get(..vlen)?.to_vec()))
 }

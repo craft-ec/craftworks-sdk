@@ -147,13 +147,44 @@ pub enum Dropped {
     NotForUs,
 }
 
+/// Encoding options for every message on this wire.
+///
+/// `bincode::deserialize` ACCEPTS TRAILING BYTES: it decodes the type it was
+/// asked for and ignores the rest. That is not a tolerance, it is a way for
+/// one message to be read as another — a wrapped value decoded as its
+/// wrapper returns the wrapper's first variant and throws away the part that
+/// carries the answer, and every message then decodes to the same thing.
+/// It happened: a contract's `Result<ValidateResult, _>` read as a bare
+/// `ValidateResult` reported EVERY state valid, including one whose hash did
+/// not match its key.
+///
+/// So the decoder here is exact. `with_fixint_encoding` because that is what
+/// `bincode::serialize` does and the two must agree; no
+/// `allow_trailing_bytes`, so a message with anything after it is refused
+/// rather than half-read.
+fn wire_opts() -> impl bincode::Options {
+    use bincode::Options;
+    bincode::DefaultOptions::new().with_fixint_encoding()
+}
+
 /// Decode a client request. `None` is a drop, never a panic.
+///
+/// Exact: a payload with trailing bytes is NOT this build's message, and
+/// reading its prefix would be guessing at what a stranger meant.
 pub fn request(bytes: &[u8]) -> Option<Request> {
-    bincode::deserialize(bytes).ok()
+    use bincode::Options;
+    wire_opts().deserialize(bytes).ok()
+}
+
+/// Decode a reply. Same rule, from the other side of the wire.
+pub fn parse_reply(bytes: &[u8]) -> Option<Reply> {
+    use bincode::Options;
+    wire_opts().deserialize(bytes).ok()
 }
 
 pub fn reply(r: &Reply) -> Vec<u8> {
-    bincode::serialize(r).unwrap_or_default()
+    use bincode::Options;
+    wire_opts().serialize(r).unwrap_or_default()
 }
 
 /// The engine's ids, from the wire's plain numbers.
