@@ -232,6 +232,14 @@ pub enum Reply {
         key_source: String,
         head_seq: u64,
         head_root: [u8; 32],
+        /// Whether this delegate can sign and publish a head — i.e. whether
+        /// it has been provisioned.
+        ///
+        /// PRESENCE ONLY: it says that a key is there, never which, and
+        /// nothing derived from it. A page reads this to decide whether to
+        /// install; `false` with a non-zero `head_seq` cannot happen and
+        /// would mean the store lost a secret the engine had already used.
+        head_writable: bool,
     },
     Value {
         req_id: u64,

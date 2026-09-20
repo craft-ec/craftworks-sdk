@@ -220,6 +220,10 @@ pub struct Shell<B: Blocks> {
     /// entry point has one. Kept as a bool rather than the bytes: the shell
     /// decides WHETHER a put can be built, and the entry point builds it.
     has_code: bool,
+    /// Whether the secret store holds everything a head write needs, as read
+    /// at the start of this call. Reported by `Identity`, never derived here
+    /// — the store is the authority and it lives outside the shell.
+    head_writable: bool,
     pub limits: Limits,
     /// Whether this session wants a call tree.
     ///
@@ -246,11 +250,21 @@ impl<B: Blocks> Shell<B> {
     /// in flight `Lost`. So an unreadable context is a fresh start, not an
     /// error — and never a panic, because the bytes come from outside.
     pub fn resume(ctx: &[u8], params: Params, blocks: B) -> Self {
-        Self::resume_with(ctx, params, blocks, true)
+        Self::resume_with(ctx, params, blocks, true, true)
     }
 
-    /// As `resume`, saying whether the contract code is on hand.
-    pub fn resume_with(ctx: &[u8], params: Params, blocks: B, has_code: bool) -> Self {
+    /// As `resume`, saying whether the contract code is on hand and whether
+    /// the secret store can sign a head. `resume` answers `true` to both:
+    /// it is the constructor for tests about engine behaviour, where the
+    /// delegate is taken as already set up. The entry point, which is the
+    /// only caller that can actually look, reads both from the store.
+    pub fn resume_with(
+        ctx: &[u8],
+        params: Params,
+        blocks: B,
+        has_code: bool,
+        head_writable: bool,
+    ) -> Self {
         let carried: Option<Carried> = ctx_opts().deserialize(ctx).ok();
         // A context the shell cannot read and one the ENGINE refuses are the
         // same outcome: start fresh. Never a panic — these bytes come from
@@ -285,6 +299,7 @@ impl<B: Blocks> Shell<B> {
             unserved: Vec::new(),
             page_clamp: BTreeMap::new(),
             has_code,
+            head_writable,
             limits: Limits::default(),
             tracing: if resumed { tracing } else { false },
             trace: Vec::new(),
@@ -394,6 +409,15 @@ impl<B: Blocks> Shell<B> {
                     key_source: "Provisioned(Test)".into(),
                     head_seq: self.engine.published_seq(),
                     head_root: self.engine.published_root(),
+                    // The page's provisioning decision rests on this. An
+                    // unprovisioned delegate answers `Identity` with a seq of
+                    // 0 and a zero root — INDISTINGUISHABLE from a healthy
+                    // engine that has simply never been written to, while it
+                    // silently drops every head op it is given. Without this
+                    // field a page cannot tell "set me up" from "already set
+                    // up and empty", and re-installing costs the signing key
+                    // and with it every head written under the old one.
+                    head_writable: self.head_writable,
                 }));
         }
         for req_id in std::mem::take(&mut self.unserved) {

@@ -59,6 +59,7 @@ impl Loop {
             engine::Params::default(),
             self.store.clone(),
             true,
+            true,
         );
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");

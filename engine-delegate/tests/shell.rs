@@ -126,7 +126,7 @@ fn an_ack_is_not_a_confirmation_and_the_read_back_is() {
 #[test]
 fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
     let store = Store::default();
-    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true, true);
     let out = s.handle(vec![Inbound::Client(write_req())]);
     let put = out
         .ops
@@ -204,7 +204,7 @@ fn a_message_with_trailing_bytes_is_refused_rather_than_half_read() {
 
     // ...and the shell drops it rather than acting on the prefix.
     let store = Store::default();
-    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true, true);
     let out = s.handle(vec![Inbound::Client(trailing)]);
     assert_eq!(
         out.dropped.len(),
@@ -375,7 +375,7 @@ fn the_shell_works_when_rebuilt_from_its_context_between_every_call() {
 fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
     let store = Store::default();
     let mut without: Shell<Store> =
-        Shell::resume_with(&[], Params::default(), store.clone(), false);
+        Shell::resume_with(&[], Params::default(), store.clone(), false, true);
     let out = without.handle(vec![Inbound::Client(write_req())]);
     assert_eq!(
         states(&out.replies).first(),
@@ -396,7 +396,7 @@ fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
 
     // The control: the same write with the code on hand DOES put. Otherwise
     // this test would pass over a shell that never puts anything.
-    let mut with: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
+    let mut with: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true, true);
     let out = with.handle(vec![Inbound::Client(write_req())]);
     assert!(
         out.ops
@@ -420,7 +420,7 @@ fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
 #[test]
 fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
     let store = Store::default();
-    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, false);
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, false, true);
 
     let req = protocol::encode_request(
         protocol::CURRENT,
@@ -487,7 +487,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     let store = Store::default();
 
     let run = |n: u32| -> (Vec<WriteState>, usize, usize) {
-        let mut s: Shell<Store> = Shell::resume_with(&[], params, store.clone(), true);
+        let mut s: Shell<Store> = Shell::resume_with(&[], params, store.clone(), true, true);
         s.limits = engine_delegate::schedule::Limits {
             max_gets: 4,
             max_puts: per_return,
@@ -700,5 +700,51 @@ fn a_commit_outside_the_subscribed_range_pushes_nothing() {
     assert_eq!(
         changed, 0,
         "a commit outside the subscribed range pushed {changed} notification(s)"
+    );
+}
+
+/// `Identity` reports whether the delegate can actually write a head.
+///
+/// **Both arms, because the whole value of the field is that it DIFFERS.**
+/// An unprovisioned delegate answers `Identity` with a seq of 0 and a zero
+/// root — byte-identical to a healthy engine nobody has written to yet —
+/// while silently dropping every head op it is handed. A page that cannot
+/// tell those apart either never provisions, and loses every write, or
+/// provisions on every load, which mints a fresh signing key and orphans the
+/// head written under the old one.
+///
+/// A single-arm test here would pass against a field hardcoded to `true`.
+#[test]
+fn identity_reports_whether_a_head_can_be_written_both_ways() {
+    fn head_writable_of(store_can_sign: bool) -> bool {
+        let mut s: Shell<Store> = Shell::resume_with(
+            &[],
+            Params::default(),
+            Store::default(),
+            true,
+            store_can_sign,
+        );
+        let out = s.handle(vec![Inbound::Client(protocol::encode_request(
+            1,
+            &protocol::Request::Identity,
+        ))]);
+        out.replies
+            .iter()
+            .filter_map(|b| protocol::decode_reply(b).ok())
+            .find_map(|r| match r {
+                protocol::Reply::Identity { head_writable, .. } => Some(head_writable),
+                _ => None,
+            })
+            .expect("Identity answers")
+    }
+
+    assert!(
+        head_writable_of(true),
+        "a provisioned delegate reported it cannot write a head"
+    );
+    assert!(
+        !head_writable_of(false),
+        "an UNPROVISIONED delegate reported it can write a head; a page \
+         believing this never provisions and every write is dropped"
     );
 }

@@ -14,7 +14,7 @@ wasm=target/wasm32-unknown-unknown/release/web.wasm
 # repo and has no business renaming the file the builder loads.
 wasm-bindgen --target web    --out-name craftworks_sdk --out-dir pkg/web  "$wasm"
 wasm-bindgen --target nodejs --out-name craftworks_sdk --out-dir pkg/node "$wasm"
-cp js/wrap.js js/index.js js/connection.js pkg/web/
+cp js/wrap.js js/index.js js/connection.js js/session.js pkg/web/
 
 # THE ARTEFACTS THE SDK PROVISIONS WITH.
 #

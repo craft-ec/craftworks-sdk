@@ -66,6 +66,7 @@ impl Conn {
             engine::Params::default(),
             self.node.clone(),
             true,
+            true,
         );
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");
