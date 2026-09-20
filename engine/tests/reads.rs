@@ -98,10 +98,15 @@ fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
 }
 
 /// A reader that has published the same root but holds no blocks.
-fn reader(root: Cid, params: Params) -> Engine<Store> {
-    let mut e = Engine::new(params, Store::default());
+fn reader(root: Cid, params: Params) -> (Engine<Store>, Store) {
+    // A store of its OWN. Sharing one between a test's cases means warming
+    // for the first leaves the second unable to be cold — which is how
+    // "leaf cold" stopped being cold and three tests started passing for the
+    // wrong reason.
+    let store = Store::fresh();
+    let mut e = Engine::new(params, store.clone());
     e.adopt_root_for_test(root);
-    e
+    (e, store)
 }
 
 fn replies(effects: &[Effect]) -> Vec<(ReqId, ReadResult)> {
@@ -166,7 +171,7 @@ fn cold_reads_answer_what_a_fully_held_tree_answers() {
             records.insert(format!("k/{i:05}").into_bytes(), v);
         }
         let (root, all) = tree(&records);
-        let mut e = reader(root, Params::default());
+        let (mut e, store) = reader(root, Params::default());
 
         // A mix of keys that exist and keys that do not.
         let keys: Vec<Vec<u8>> = records.keys().cloned().collect();
@@ -282,21 +287,25 @@ fn fixture(n: u32) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks) {
 }
 
 /// Feed a reader every block, so it is fully warm.
-fn warm_all(_e: &mut Engine<Store>, all: &MemBlocks) {
+fn warm_all(store: &Store, all: &MemBlocks) {
     // Warming means the NODE holds the blocks. Telling the engine
     // `BlockArrived` does not: the engine stores nothing, so the only thing
     // that makes a block readable is putting it where the engine reads from.
     // Seven read tests failed on this — "a warm hit asked the network for
     // something" — because feeding the engine used to be the same as filling
     // its store, and is not any more.
-    let store = Store::default();
     for (id, bytes) in all.0.iter() {
         store.put(*id, bytes);
     }
 }
 
 /// Drive a reader until it answers, serving from `all`.
-fn settle(e: &mut Engine<Store>, all: &MemBlocks, first: Vec<Effect>) -> Vec<(ReqId, ReadResult)> {
+fn settle(
+    e: &mut Engine<Store>,
+    store: &Store,
+    all: &MemBlocks,
+    first: Vec<Effect>,
+) -> Vec<(ReqId, ReadResult)> {
     let mut queue = first;
     let mut out = Vec::new();
     let mut guard = 0;
@@ -309,7 +318,7 @@ fn settle(e: &mut Engine<Store>, all: &MemBlocks, first: Vec<Effect>) -> Vec<(Re
                 // then is the engine told. The engine keeps nothing itself.
                 let ev = match all.get(&id) {
                     Some(b) => {
-                        Store::default().put(id, b);
+                        store.put(id, b);
                         Event::BlockArrived {
                             id,
                             bytes: b.to_vec(),
@@ -339,8 +348,8 @@ fn every_warmth_state_answers_the_same() {
     assert!(want.is_some(), "the fixture key must exist");
 
     // 1. Fully warm: rule 1 — the reply is in the same step, with no fetch.
-    let mut e = reader(root, Params::default());
-    warm_all(&mut e, &all);
+    let (mut e, store) = reader(root, Params::default());
+    warm_all(&store, &all);
     let out = stepped!(e, get(1, 1, &key));
     assert!(
         fetch_ids(&out).is_empty(),
@@ -352,13 +361,13 @@ fn every_warmth_state_answers_the_same() {
     );
 
     // 2. Fully cold.
-    let mut e = reader(root, Params::default());
+    let (mut e, store) = reader(root, Params::default());
     let first = stepped!(e, get(1, 2, &key));
-    let got = settle(&mut e, &all, first);
+    let got = settle(&mut e, &store, &all, first);
     assert_eq!(got, vec![(ReqId(2), ReadResult::Value(want.clone()))]);
 
     // 3. Path warm, leaf cold: everything but the leaf holding the key.
-    let mut e = reader(root, Params::default());
+    let (mut e, store) = reader(root, Params::default());
     let leaf = leaf_for(&all, &root, &key);
     // Withholding the leaf is not enough: a PACK containing it warms it just
     // as well, which is the whole point of packs. A fixture that fed the pack
@@ -384,12 +393,12 @@ fn every_warmth_state_answers_the_same() {
         "with only the leaf missing, exactly one block should be wanted"
     );
     assert_eq!(fetch_ids(&first)[0].0, leaf);
-    let got = settle(&mut e, &all, first);
+    let got = settle(&mut e, &store, &all, first);
     assert_eq!(got, vec![(ReqId(3), ReadResult::Value(want.clone()))]);
 
     // 4. Leaf warm via a PACK, branch cold. The pack carries the leaf, so one
     //    fetch of it answers what several reads were parked on.
-    let mut e = reader(root, Params::default());
+    let (mut e, store) = reader(root, Params::default());
     let pack = all
         .0
         .iter()
@@ -407,7 +416,7 @@ fn every_warmth_state_answers_the_same() {
             }
         );
         let first = stepped!(e, get(1, 4, &key));
-        let got = settle(&mut e, &all, first);
+        let got = settle(&mut e, &store, &all, first);
         assert_eq!(got, vec![(ReqId(4), ReadResult::Value(want.clone()))]);
     }
     let _ = records;
@@ -454,7 +463,7 @@ fn a_block_that_is_not_what_was_asked_for_is_refused() {
         ("right bytes under a different id", 1),
         ("a leaf where a branch is expected", 2),
     ] {
-        let mut e = reader(root, Params::default());
+        let (mut e, store) = reader(root, Params::default());
         let first = stepped!(e, get(1, 7, &key));
         let asked = fetch_ids(&first);
         assert_eq!(asked.len(), 1, "{name}: expected one fetch to poison");
@@ -481,7 +490,7 @@ fn a_block_that_is_not_what_was_asked_for_is_refused() {
         // PARSES one, which ends the read; the engine refuses it on ARRIVAL,
         // which turns it into another attempt. Allowing `Unavailable` here
         // let a mutant that skips the check survive this test.
-        let got = settle(&mut e, &all, out);
+        let got = settle(&mut e, &store, &all, out);
         let answer = got
             .iter()
             .find(|(r, _)| *r == ReqId(7))
@@ -521,7 +530,7 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
         }
     };
 
-    let mut e = reader(
+    let (mut e, store) = reader(
         root,
         Params {
             count_descent: true,
@@ -530,7 +539,7 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
     );
     e.reset_cost();
     let first = stepped!(e, get(1, 9, &key));
-    let got = settle(&mut e, &all, first);
+    let got = settle(&mut e, &store, &all, first);
     assert!(
         matches!(got.first(), Some((_, ReadResult::Value(Some(_))))),
         "the lookup did not find the key: {got:?}"
@@ -552,7 +561,7 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
     // The control: a reader that fetches ahead blows the bound. Without it,
     // "≤ depth + 1" could be true of an implementation that fetched nothing
     // useful at all.
-    let mut greedy = reader(
+    let (mut greedy, gstore) = reader(
         root,
         Params {
             refetch_held: true,
@@ -560,7 +569,7 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
         },
     );
     let first = stepped!(greedy, get(1, 10, &key));
-    let _ = settle(&mut greedy, &all, first);
+    let _ = settle(&mut greedy, &gstore, &all, first);
     assert!(
         greedy.fetches() > depth + 1,
         "the greedy control fetched only {} blocks, so it does not blow the \
@@ -584,7 +593,7 @@ fn requests_waiting_on_one_block_share_its_fetch() {
     let key = b"k/00123".to_vec();
 
     let count = |share: bool| -> usize {
-        let mut e = reader(
+        let (mut e, store) = reader(
             root,
             Params {
                 share_fetches: share,
@@ -617,7 +626,7 @@ fn requests_waiting_on_one_block_share_its_fetch() {
 #[test]
 fn a_hostile_preload_costs_the_budget() {
     let (_, root, all) = fixture(2_000);
-    let mut e = reader(root, Params::default());
+    let (mut e, store) = reader(root, Params::default());
     // The session holds this root and nothing else.
     stepped!(
         e,
@@ -662,7 +671,7 @@ fn a_range_pages_in_both_directions() {
     let keys: Vec<Vec<u8>> = records.keys().cloned().collect();
 
     for reverse in [false, true] {
-        let mut e = reader(root, Params::default());
+        let (mut e, store) = reader(root, Params::default());
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut after: Option<Vec<u8>> = None;
         for page in 0..20 {
@@ -682,7 +691,7 @@ fn a_range_pages_in_both_directions() {
                     range: Box::new(r),
                 }
             );
-            let got = settle(&mut e, &all, first);
+            let got = settle(&mut e, &store, &all, first);
             let Some((
                 _,
                 ReadResult::Page {
@@ -729,7 +738,7 @@ fn no_read_sequence_panics_and_every_read_answers() {
         let mut outstanding: std::collections::BTreeSet<ReqId> = Default::default();
         let mut pending: Vec<Effect> = Vec::new();
         let mut r = rng(seed);
-        let mut e = reader(
+        let (mut e, store) = reader(
             root,
             Params {
                 max_attempts: 2,
@@ -842,6 +851,7 @@ fn no_read_sequence_panics_and_every_read_answers() {
 /// delegate spins out its 5 s slice on one key.
 fn settle_bounded(
     e: &mut Engine<Store>,
+    store: &Store,
     all: &MemBlocks,
     first: Vec<Effect>,
     budget: usize,
@@ -860,7 +870,7 @@ fn settle_bounded(
                 // then is the engine told. The engine keeps nothing itself.
                 let ev = match all.get(&id) {
                     Some(b) => {
-                        Store::default().put(id, b);
+                        store.put(id, b);
                         Event::BlockArrived {
                             id,
                             bytes: b.to_vec(),
@@ -891,7 +901,7 @@ fn a_tight_warm_set_answers_every_read_instead_of_looping() {
     const BUDGET: usize = 20_000;
 
     for warm in [8 * 1024usize, 16 * 1024, 32 * 1024, 64 * 1024] {
-        let mut e = reader(
+        let (mut e, store) = reader(
             root,
             Params {
                 max_context_bytes: 320 * 1024,
@@ -901,7 +911,7 @@ fn a_tight_warm_set_answers_every_read_instead_of_looping() {
         let (mut ok, mut no_space, mut other) = (0, 0, 0);
         for (i, (k, v)) in records.iter().enumerate().filter(|(i, _)| i % 500 == 0) {
             let first = stepped!(e, get(1, i as u64, k));
-            let got = settle_bounded(&mut e, &all, first, BUDGET).unwrap_or_else(|n| {
+            let got = settle_bounded(&mut e, &store, &all, first, BUDGET).unwrap_or_else(|n| {
                 panic!("warm={warm}: a read took {n} steps and had not answered")
             });
             match got.first().map(|(_, r)| r.clone()) {
@@ -931,7 +941,7 @@ fn a_tight_warm_set_answers_every_read_instead_of_looping() {
     // The control, and it RUNS: with pinning off the same read does not
     // finish inside a budget many times what it needs.
     let key = records.keys().next().expect("a key").clone();
-    let mut e = reader(
+    let (mut e, store) = reader(
         root,
         Params {
             max_context_bytes: 8 * 1024,
@@ -941,7 +951,7 @@ fn a_tight_warm_set_answers_every_read_instead_of_looping() {
     );
     let first = stepped!(e, get(1, 99, &key));
     assert!(
-        settle_bounded(&mut e, &all, first, BUDGET).is_err(),
+        settle_bounded(&mut e, &store, &all, first, BUDGET).is_err(),
         "with pinning off the read still finished, so pinning is not what \
          stops the livelock and this test proves nothing about it"
     );
