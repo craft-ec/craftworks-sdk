@@ -274,7 +274,9 @@ impl Session {
             self.db
                 .store_mut()
                 .client
-                .send(&craftworks_sdk::Loads::range_request(req_id, &lo, &hi, None));
+                .send(&craftworks_sdk::Loads::range_request(
+                    req_id, &lo, &hi, None,
+                ));
         }
         db_err_waiting(&e, Some(req_id))
     }

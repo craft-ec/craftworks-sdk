@@ -15,7 +15,7 @@
 //! `Loads::range_request`, against a real `Shell` over an in-memory store —
 //! and counts the `Request::Range` messages that actually crossed.
 
-use craftworks_sdk::store::{Reads, Store as _};
+use craftworks_sdk::store::Store as _;
 use craftworks_sdk::{CachedStore, Loads};
 use engine_delegate::shell::{Inbound, Shell};
 use freenet_prolly::store::Blocks;
@@ -140,7 +140,7 @@ fn round_trips_to_load(rows: usize) -> (usize, usize) {
     let (lo, hi) = (b"d\0note\0".to_vec(), b"d\0note\x01".to_vec());
     let (id, _) = loads.want(&lo, &hi, 0).expect("a fresh span");
 
-    let mut send = |s: &mut CachedStore, req: &protocol::Request, node: &mut Node| {
+    let send = |s: &mut CachedStore, req: &protocol::Request, node: &mut Node| {
         s.client.send(req);
         let mut replies = Vec::new();
         for frame in s.take_outbound() {
@@ -193,7 +193,8 @@ fn a_domain_of_300_rows_loads_in_two_round_trips() {
          about a different range than the one this test names"
     );
     assert_eq!(
-        trips, 2,
+        trips,
+        2,
         "a 300-row domain took {trips} round trips. At ~15 ms per delegate \
          call that is {} ms of waiting for data that fits in two pages",
         trips * 15
@@ -240,11 +241,12 @@ fn control_asking_with_zero_costs_one_round_trip_per_row() {
         let mut done = true;
         for frame in store.take_outbound() {
             for reply in node.exchange(&frame) {
-                if let Ok(protocol::Reply::Page { cursor, .. }) = protocol::decode_reply(&reply) {
-                    if let Some(c) = cursor {
-                        after = Some(c);
-                        done = false;
-                    }
+                if let Ok(protocol::Reply::Page {
+                    cursor: Some(c), ..
+                }) = protocol::decode_reply(&reply)
+                {
+                    after = Some(c);
+                    done = false;
                 }
             }
         }
@@ -275,16 +277,14 @@ fn the_page_constant_is_not_clamped_down_by_the_real_shell() {
     let mut node = Node::new();
     let mut store = CachedStore::new(Box::new(|| 0));
     // One row is enough: the reply reports the page size the shell USED.
-    store.put(b"d\0note\0000001", b"v");
+    store.put(b"d\x00note\x00000001", b"v");
     for frame in store.take_outbound() {
         for reply in node.exchange(&frame) {
             store.on_inbound(&reply);
         }
     }
     let (lo, hi) = (b"d\0note\0".to_vec(), b"d\0note\x01".to_vec());
-    store
-        .client
-        .send(&Loads::range_request(1, &lo, &hi, None));
+    store.client.send(&Loads::range_request(1, &lo, &hi, None));
     let mut used = None;
     for frame in store.take_outbound() {
         for reply in node.exchange(&frame) {
