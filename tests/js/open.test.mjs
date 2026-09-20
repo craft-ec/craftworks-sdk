@@ -102,6 +102,7 @@ await t("a page that calls only open() and scan() resolves a COLD read", async (
   const ref = {};
   const clock = fakeClock();
   const { db } = await open(function () { return session; }, {
+    port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
     clearInterval: clock.clearInterval,
@@ -120,6 +121,7 @@ await t("A DEAD SOCKET rejects UNAVAILABLE through the TICK path", async () => {
   const ref = {};
   const clock = fakeClock();
   const { db } = await open(function () { return session; }, {
+    port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
     clearInterval: clock.clearInterval,
@@ -142,6 +144,7 @@ await t("THE CONTROL: the same setup WITH a message resolves", async () => {
   const ref = {};
   const clock = fakeClock();
   const { db } = await open(function () { return session; }, {
+    port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
     clearInterval: clock.clearInterval,
@@ -158,6 +161,7 @@ await t("open() hands back a db WITHOUT the page ever seeing drain", async () =>
   const ref = {};
   const clock = fakeClock();
   const handle = await open(function () { return session; }, {
+    port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
     clearInterval: clock.clearInterval,
@@ -167,6 +171,37 @@ await t("open() hands back a db WITHOUT the page ever seeing drain", async () =>
   // The db still HAS drain — `engineDb` is exported for tests that drive the
   // parts — but a page using open() never has to call it.
   assert.equal(typeof handle.db.drain, "function");
+});
+
+await t("**open() REFUSES to pick a port for you**", async () => {
+  // Publishing installs a delegate and hands it a signing key, so which node
+  // receives one is a decision. A default makes it by accident — and it did:
+  // a screenshot run in the builder, meant to capture "there is no node
+  // running", connected to a node that was listening on the default port and
+  // began provisioning it.
+  //
+  // Not a refusal LIST. A person's own app targets their own node on
+  // whatever port it uses; nobody just gets to skip saying which.
+  for (const port of [undefined, 0, -1, 70000, "7509", null]) {
+    await assert.rejects(
+      () => open(function () { return fakeSession(); }, { port, connect: () => ({ close() {} }) }),
+      e => { assert.match(e.message, /needs a port/); return true; },
+      `port ${JSON.stringify(port)} was accepted`);
+  }
+});
+
+await t("THE CONTROL: a named port is accepted", async () => {
+  // Without it, an `open` that refused every port would pass the test above
+  // and nothing could ever connect.
+  const session = fakeSession({ deliverAfterMs: 0 });
+  const clock = fakeClock();
+  const handle = await open(function () { return session; }, {
+    port: 17509,
+    connect: fakeConnect({}),
+    setInterval: clock.setInterval,
+    clearInterval: clock.clearInterval,
+  });
+  assert.ok(handle.db, "a named port was refused");
 });
 
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");

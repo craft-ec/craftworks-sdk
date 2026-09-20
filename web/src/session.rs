@@ -265,10 +265,15 @@ impl Session {
             return db_err(&e);
         };
         if send {
-            // `max_entries` 0 = the engine's own page size. Paging is followed
-            // to the end, because the copy records `[lo, hi)` as loaded and
-            // that is only true once the range is exhausted.
-            self.db.store_mut().request_range(req_id, &lo, &hi, 0);
+            // A FULL PAGE, by the shared constant. `0` reads like "no
+            // limit" and is not one: the shell clamps it to ONE entry, so a
+            // range of N rows would load in N round trips of a single row.
+            // Paging is still followed to the end, because the copy records
+            // `[lo, hi)` as loaded and that is only true once the range is
+            // exhausted — this decides how many trips that takes.
+            self.db
+                .store_mut()
+                .request_range(req_id, &lo, &hi, protocol::MAX_PAGE_ENTRIES);
         }
         db_err_waiting(&e, Some(req_id))
     }
@@ -286,7 +291,7 @@ impl Session {
                     hi: protocol::Bound::Excluded(hi),
                     reverse: false,
                     after: Some(after),
-                    max_entries: 0,
+                    max_entries: protocol::MAX_PAGE_ENTRIES,
                 });
             }
             craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
@@ -681,9 +686,12 @@ impl Session {
         }
         for (i, d) in domains.iter().enumerate() {
             let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(d);
-            self.db
-                .store_mut()
-                .request_range(PRELOAD_REQ_BASE + i as u64, &lo, &hi, 0);
+            self.db.store_mut().request_range(
+                PRELOAD_REQ_BASE + i as u64,
+                &lo,
+                &hi,
+                protocol::MAX_PAGE_ENTRIES,
+            );
         }
         Ok(domains.len())
     }

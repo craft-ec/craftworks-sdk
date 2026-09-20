@@ -98,6 +98,7 @@ await t("a COLD SCAN resolves through sdk.open() and nothing else", async () => 
 
   // Exactly what a page does: one call, then read.
   const { db, close } = await sdk.open({
+    port: 17509,   // NAMED. There is no default port, deliberately.
     // The artefacts are FETCHED by default — `wrap` binds this build's own,
     // which is the point. Here the fetch is faked, because the test is about
     // reachability and not about a web server.

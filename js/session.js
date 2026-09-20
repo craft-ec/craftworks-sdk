@@ -34,7 +34,16 @@ export const SHIPPED_ARTEFACTS = {
  * answers, because the delegate is asked rather than assumed.
  */
 export async function openSession(Session, {
-  port = 7509,
+  // NO DEFAULT. Publishing installs a delegate and hands it a signing key,
+  // so which node receives one is a decision, and a default makes it by
+  // accident — it already did: a screenshot run in the builder, meant to
+  // capture "there is no node running", connected to a node that was
+  // listening on the default port and began provisioning it.
+  //
+  // This is not a refusal list. A person's own app legitimately targets
+  // their own node, whatever port it is on. It is only that nobody gets to
+  // skip saying which.
+  port,
   artefacts = null,
   tickMs = 1000,
   onEvent = () => {},
@@ -129,6 +138,11 @@ export async function openSession(Session, {
  * driving the parts separately is the whole point.
  */
 export async function open(Session, opts = {}) {
+  if (!Number.isInteger(opts.port) || opts.port <= 0 || opts.port > 65535) {
+    throw new Error(
+      "open() needs a port: which node this connects to is a decision, and " +
+      "a default would eventually make it by accident");
+  }
   const handle = await openSession(Session, opts);
   // Registers its own wake-up with the handle. The page never sees `drain`.
   const db = engineDb(handle);
