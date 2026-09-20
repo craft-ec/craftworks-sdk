@@ -18,6 +18,7 @@
 //!    through the same engine will see it.
 
 use crate::store::{Delta, Edit, Read, Reads, Store, StoreError};
+use crate::trace::{Trace, Traces};
 use protocol::outbox::{Lost, Outbox, PreImage};
 use protocol::{Reply, Request, WriteState};
 
@@ -75,6 +76,11 @@ pub struct EngineStore<T: Transport> {
     /// How many times the outbox re-sent something. Reported, so "it worked"
     /// and "it worked first time" are distinguishable.
     pub resubmits: u64,
+    /// Call trees, when tracing is on.
+    traces: Traces,
+    /// The client's clock, as a function, because this crate compiles to wasm
+    /// and to a host binary and must not reach for one of its own.
+    now_ms: Option<Box<dyn Fn() -> u64>>,
 }
 
 impl<T: Transport> EngineStore<T> {
@@ -85,7 +91,30 @@ impl<T: Transport> EngineStore<T> {
             next_write_id: 1,
             events: Vec::new(),
             resubmits: 0,
+            traces: Traces::default(),
+            now_ms: None,
         }
+    }
+
+    /// Turn the call tree on, with the clock the app already uses.
+    ///
+    /// The clock is HANDED IN. The engine has none — it is sans-IO, which is
+    /// what makes it testable — so every duration in a trace is the client's
+    /// own measurement of its own wait, which is the number an app cares
+    /// about anyway.
+    pub fn trace_on(&mut self, now_ms: Box<dyn Fn() -> u64>) {
+        self.now_ms = Some(now_ms);
+        let _ = self.ask(&Request::Trace { on: true });
+    }
+
+    pub fn trace_off(&mut self) {
+        let _ = self.ask(&Request::Trace { on: false });
+        self.now_ms = None;
+    }
+
+    /// The call tree for one operation, if it was traced.
+    pub fn trace(&self, of: protocol::TraceOf) -> Option<&Trace> {
+        self.traces.of(of)
     }
 
     /// Send one request and take its replies, harvesting anything PUSHED.
@@ -120,6 +149,15 @@ impl<T: Transport> EngineStore<T> {
                         new_root,
                         why,
                     });
+                }
+                Reply::Step { of, depth, what, n } => {
+                    // Stamped as it LANDS. There is no other honest moment:
+                    // the engine has no clock, so the only time anyone can
+                    // measure is the client's own wait.
+                    if let Some(now) = &self.now_ms {
+                        let t = now();
+                        self.traces.record(of, depth, what, n, t);
+                    }
                 }
                 other => out.push(other),
             }

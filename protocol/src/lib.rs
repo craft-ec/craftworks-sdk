@@ -152,12 +152,16 @@ pub enum Request {
     Unsubscribe {
         sub_id: u64,
     },
-    /// What happened during the operation that carried this id?
+    /// Emit a call tree as operations happen, or stop.
     ///
-    /// A `write_id` or a `req_id` — they are separate spaces, so which one
-    /// is being asked about is stated rather than guessed.
-    AskTrace {
-        of: TraceOf,
+    /// **Asked for in advance, never afterwards.** A delegate gets a fresh
+    /// linear memory on every call (F32), so there is nothing to ask about
+    /// once an operation is over — a trace held until it finished is a trace
+    /// that does not survive the thing it describes. So a client turns
+    /// emission ON and the steps arrive as they happen; assembling them into
+    /// a tree, and timing them, is the client's job.
+    Trace {
+        on: bool,
     },
     /// What changed in this range since the root I last saw?
     ///

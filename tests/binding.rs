@@ -202,6 +202,11 @@ fn a_reload_uses_the_delta_where_it_can_and_the_full_read_where_it_cannot() {
     let mut mem = MemStore::default();
     let mut a = Binding::new(b"a/", b"b/", false);
     let mut b = Binding::new(b"a/", b"b/", false);
+    // 40 rows is well under the threshold, so ask for the delta explicitly:
+    // this test is about the two PATHS agreeing, not about which one a
+    // 40-row binding picks. That choice has its own test.
+    a.delta_above(0);
+    b.delta_above(0);
 
     for i in 0..40u32 {
         put(&mut tree, &format!("a/{i:03}"), "seed");
@@ -310,6 +315,7 @@ fn a_delta_that_does_not_fit_in_one_page_is_not_applied_in_part() {
         s.0.put(format!("a/{i:03}").as_bytes(), b"seed");
     }
     let mut b = Binding::new(b"a/", b"b/", false);
+    b.delta_above(0);
     b.reload(&mut s).expect("reload");
 
     s.0.put(b"a/000", b"real");
@@ -330,4 +336,53 @@ fn a_delta_that_does_not_fit_in_one_page_is_not_applied_in_part() {
         "a paged delta was counted as served by delta"
     );
     assert!(b.reloads.full >= 1, "it did not fall back to the full read");
+}
+
+/// A narrow range re-READS; a wide one diffs. Both sides of the threshold.
+///
+/// This is the one place a cost measurement turns into a branch, so it is
+/// tested at both ends rather than at the one that happens to be true today.
+/// The numbers behind it are in `DELTA_WORTH_IT_ABOVE`, and they are the
+/// reason the branch leans the way it does: on a range a few blocks wide a
+/// diff walks two trees to save reading one.
+#[test]
+fn a_narrow_range_re_reads_and_a_wide_one_takes_the_delta() {
+    let mut store = TreeStore::new();
+    for i in 0..200u32 {
+        put(&mut store, &format!("a/{i:04}"), "seed");
+    }
+
+    // Below the threshold: re-read.
+    let mut narrow = Binding::new(b"a/", b"b/", false);
+    narrow.delta_above(1000);
+    narrow.reload(&mut store).expect("first");
+    put(&mut store, "a/0007", "moved");
+    narrow.reload(&mut store).expect("second");
+    assert_eq!(
+        (narrow.reloads.by_delta, narrow.reloads.full),
+        (0, 2),
+        "a range under the threshold took a delta: {:?}",
+        narrow.reloads
+    );
+
+    // Above it: diff. Same store, same change, same rows.
+    let mut wide = Binding::new(b"a/", b"b/", false);
+    wide.delta_above(10);
+    wide.reload(&mut store).expect("first");
+    put(&mut store, "a/0008", "moved");
+    wide.reload(&mut store).expect("second");
+    assert_eq!(
+        (wide.reloads.by_delta, wide.reloads.full),
+        (1, 1),
+        "a range over the threshold did not take a delta: {:?}",
+        wide.reloads
+    );
+
+    // And both arrive at the same rows, which is the part that matters.
+    narrow.reload(&mut store).expect("catch up");
+    assert_eq!(
+        keys(&narrow),
+        keys(&wide),
+        "the two paths disagree about the rows"
+    );
 }

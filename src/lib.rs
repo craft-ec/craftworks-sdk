@@ -12,6 +12,7 @@ pub mod id;
 pub mod record;
 pub mod schema;
 pub mod store;
+pub mod trace;
 pub mod tree_store;
 
 mod engine_store;
@@ -23,6 +24,7 @@ pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use schema::{Field, Kind, Schema};
 pub use store::{Delta, Edit, MemStore, Read, Reads, Store, StoreError};
+pub use trace::{Stamped, Trace, Traces};
 pub use tree_store::{OwedGroup, OwedParity, Stats, TreeStore};
 
 /// The tree format tag every node carries, from the library that writes them.

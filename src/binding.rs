@@ -73,6 +73,27 @@ pub struct Reloads {
 
 type Rows = std::rc::Rc<Vec<(Vec<u8>, Vec<u8>)>>;
 
+/// Rows at or below which a reload re-READS instead of diffing.
+///
+/// A cost fact, measured rather than assumed, and it cuts the other way from
+/// the obvious one: **a delta is not free and on a narrow range it is the
+/// more expensive of the two.** A diff walks a path down BOTH trees, so a
+/// range already only a few blocks wide has nothing for it to skip. Measured
+/// on one cold reader over one store (`engine/tests/subscriptions.rs`):
+///
+/// | rows | changes | delta reads | full re-read |
+/// |---|---|---|---|
+/// | 256 | 1 | 4 | 4 |
+/// | 256 | 3 | 6 | 4 |
+/// | 8,000 | 3 | 8 | 53 |
+///
+/// So the threshold is in ROWS the binding last held, which is what it
+/// actually knows. A parameter, not a constant, because it is a property of
+/// how wide a block is and that is the tree's business rather than this
+/// file's — and because a number nobody can change is a number nobody can
+/// check.
+pub const DELTA_WORTH_IT_ABOVE: usize = 512;
+
 /// One range, as a component sees it.
 pub struct Binding {
     lo: Vec<u8>,
@@ -86,6 +107,9 @@ pub struct Binding {
     at: Option<[u8; 32]>,
     rows: Rows,
     mode: LiveMode,
+    /// Above this many rows, a reload asks for the delta; at or below it, a
+    /// re-read is cheaper. See [`DELTA_WORTH_IT_ABOVE`].
+    delta_above: usize,
     /// Called when `rows` is replaced. Framework-facing.
     listeners: Vec<(u64, Box<dyn Fn()>)>,
     next_listener: u64,
@@ -105,6 +129,7 @@ impl Binding {
             sub_id: None,
             at: None,
             rows: std::rc::Rc::new(Vec::new()),
+            delta_above: DELTA_WORTH_IT_ABOVE,
             mode: if live {
                 // Not `Notified`: nothing has accepted a subscription yet.
                 // Claiming it here would be the silent-downgrade failure in
@@ -117,6 +142,16 @@ impl Binding {
             next_listener: 1,
             reloads: Reloads::default(),
         }
+    }
+
+    /// Change where the delta stops being worth taking.
+    ///
+    /// 0 makes every reload ask for a delta; `usize::MAX` makes none of them.
+    /// Both ends exist so a test can drive the decision rather than infer it
+    /// from a number that happens to sit on one side.
+    pub fn delta_above(&mut self, rows: usize) -> &mut Self {
+        self.delta_above = rows;
+        self
     }
 
     pub fn is_live(&self) -> bool {
@@ -198,6 +233,12 @@ impl Binding {
             // Nothing seen yet: there is no delta to take, only the range.
             return self.full(store, now);
         };
+        if self.rows.len() <= self.delta_above {
+            // Narrow enough that the diff costs more than the read. Not an
+            // optimisation of the delta path — a decision not to take it,
+            // because on a range this size it is the slower of the two.
+            return self.full(store, now);
+        }
         match store.changes_since(from, &self.lo, &self.hi, 1024)? {
             Delta::Changes {
                 changes,

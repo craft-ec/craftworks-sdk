@@ -107,3 +107,61 @@ console.log("ok collection through JS");
   assert.deepStrictEqual(t.get("notes", after.id).fields, { body: "still here" });
   assert.notStrictEqual(t.root(), root);
 }
+
+// ---------------------------------------------------------------------------
+// A binding is an external store: the shape React, Vue and Svelte consume.
+// ---------------------------------------------------------------------------
+
+{
+  const db = new sdk.Db();
+  db.define("notes", { type: "Note", fields: [{ name: "body", kind: "text", required: true }] });
+  db.put("notes", { body: "first" });
+
+  const notes = db.bind("notes");
+  assert.strictEqual(notes.live, false, "a binding is not live unless asked");
+  assert.strictEqual(notes.getSnapshot().length, 1);
+
+  // THE CONTRACT: the same object until the rows change. A new array here
+  // makes useSyncExternalStore re-render on every render, for ever.
+  const first = notes.getSnapshot();
+  assert.strictEqual(notes.getSnapshot(), first, "getSnapshot is not stable");
+  notes.reload();
+  assert.strictEqual(notes.getSnapshot(), first, "a no-op reload replaced the snapshot");
+
+  // A write to a DIFFERENT domain moves the tree's root, so the binding does
+  // look — and must not replace the snapshot, because its rows are the same.
+  db.define("other", { type: "Other", fields: [{ name: "x", kind: "text", required: true }] });
+  db.put("other", { x: "elsewhere" });
+  notes.reload();
+  assert.strictEqual(
+    notes.getSnapshot(), first,
+    "a change in another domain replaced the snapshot, which re-renders every component watching an untouched one",
+  );
+
+  // subscribe(cb) -> unsubscribe, and it fires exactly once per change.
+  let fired = 0;
+  const off = notes.subscribe(() => { fired += 1; });
+  db.put("other", { x: "still elsewhere" });
+  notes.reload();
+  assert.strictEqual(fired, 0, "the listener fired for an untouched domain");
+
+  // THE CONTROL: a change in THIS domain must replace it and must fire.
+  db.put("notes", { body: "second" });
+  notes.reload();
+  assert.notStrictEqual(notes.getSnapshot(), first, "a real change did not replace the snapshot");
+  assert.strictEqual(fired, 1, "expected exactly one notification");
+  assert.strictEqual(notes.getSnapshot().length, 2);
+
+  off();
+  db.put("notes", { body: "third" });
+  notes.reload();
+  assert.strictEqual(fired, 1, "a cancelled listener still fired");
+
+  // React calls these as bare functions; they must survive being detached.
+  const { subscribe, getSnapshot } = notes;
+  assert.strictEqual(getSnapshot().length, 3, "getSnapshot is not bound");
+  const off2 = subscribe(() => {});
+  off2();
+
+  console.log("ok binding as an external store");
+}

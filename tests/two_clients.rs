@@ -323,3 +323,107 @@ fn the_backstops_quiet_tick_reads_nothing() {
         "a quiet tick read the range"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Observability: the call tree.
+// ---------------------------------------------------------------------------
+
+/// A cold write's trace names every hop, and its clock is the CLIENT's.
+///
+/// The engine has no clock — it is sans-IO, which is what makes it testable —
+/// so a duration it reported would be invented. Every stamp here is the
+/// client's own measurement of its own wait, and the test supplies a clock
+/// that ticks once per call so the numbers are checkable rather than merely
+/// plausible.
+#[test]
+fn a_cold_writes_trace_shows_every_hop_and_the_client_times_it() {
+    use protocol::{Step, TraceOf};
+    let (node, head) = (Node::default(), Head::default());
+    let mut a = client(&node, &head);
+
+    // A clock the test drives: one millisecond per reading, so an assertion
+    // about a duration is an assertion about the number of hops rather than
+    // about how fast this machine happens to be.
+    let ticks = Rc::new(std::cell::Cell::new(0u64));
+    let t = ticks.clone();
+    a.trace_on(Box::new(move || {
+        t.set(t.get() + 1);
+        t.get()
+    }));
+
+    a.put(b"list/01", b"first");
+
+    let tr = a
+        .trace(TraceOf::Write(1))
+        .expect("the write produced no trace at all");
+    let whats: Vec<Step> = tr.steps.iter().map(|s| s.what).collect();
+    println!("{}", tr.render());
+
+    assert_eq!(
+        whats.first(),
+        Some(&Step::Began),
+        "the tree does not start at the operation: {whats:?}"
+    );
+    for want in [Step::Effects, Step::Put, Step::Head, Step::Reached] {
+        assert!(
+            whats.contains(&want),
+            "a cold write's trace never mentions {want:?}; the hop it names \
+             is exactly the one that would be invisible when it breaks: \
+             {whats:?}"
+        );
+    }
+    assert!(
+        !tr.truncated,
+        "the trace was truncated, so its shape is not the write's shape"
+    );
+
+    // The stamps are the CLIENT's, monotonic, and the total is the last one.
+    let mut last = 0;
+    for s in &tr.steps {
+        assert!(s.at_ms >= last, "the stamps ran backwards: {:?}", tr.steps);
+        last = s.at_ms;
+    }
+    assert_eq!(tr.total_ms, last, "the total is not the last stamp");
+    assert!(
+        tr.total_ms > 0,
+        "every step landed at the same instant, so the clock was never read"
+    );
+    println!(
+        "  {} steps, client-observed total {}ms over {} clock reads",
+        tr.steps.len(),
+        tr.total_ms,
+        ticks.get()
+    );
+}
+
+/// THE CONTROL: with tracing off, nothing is emitted at all.
+///
+/// Without this, the test above would equally describe an engine that traces
+/// unconditionally — which is a cost every client pays whether it asked or
+/// not, on a connection the data shares.
+#[test]
+fn nothing_is_traced_until_a_client_asks() {
+    use protocol::TraceOf;
+    let (node, head) = (Node::default(), Head::default());
+    let mut a = client(&node, &head);
+    a.put(b"list/01", b"first");
+    assert!(
+        a.trace(TraceOf::Write(1)).is_none(),
+        "the engine emitted a call tree nobody asked for"
+    );
+
+    // And turning it on works on the NEXT operation, not retroactively —
+    // there is nothing to look back at, which is the honest limit of a
+    // delegate that gets a fresh memory every call.
+    a.trace_on(Box::new(|| 1));
+    assert!(
+        a.trace(TraceOf::Write(1)).is_none(),
+        "turning tracing on invented a trace for an operation that had \
+         already finished"
+    );
+    a.put(b"list/02", b"second");
+    assert!(
+        a.trace(TraceOf::Write(2)).is_some(),
+        "tracing was turned on and the next write still produced nothing"
+    );
+}
