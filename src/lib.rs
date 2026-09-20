@@ -11,6 +11,7 @@ pub mod cached_store;
 pub mod copy;
 pub mod db;
 pub mod engine_client;
+pub mod expected;
 pub mod id;
 pub mod live;
 pub mod loads;
