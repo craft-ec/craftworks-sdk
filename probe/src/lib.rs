@@ -342,72 +342,132 @@ mod tests {
         assert_eq!(c.delegate[0].1, DEFINED_BY_NODE[0]);
     }
 
-    /// The probe's Freenet client stack must never reach the engine or the SDK.
+    /// **A positive allowlist over EVERY workspace crate.**
     ///
-    /// `probe` links freenet-stdlib with `net`, tokio and a websocket client.
-    /// The engine is a sans-IO state machine compiled INTO a delegate: if any
-    /// of that arrived in its tree it would be linked into the wasm, and the
-    /// first sign would be a delegate that no longer instantiates — a long way
-    /// from the edit that caused it. One shared workspace makes this a
-    /// one-line-in-a-Cargo.toml mistake, so it is asserted rather than
-    /// remembered.
+    /// `freenet-stdlib` — and the client stack that comes with it — may appear
+    /// in a crate's normal-edge closure only if that crate is named here.
+    ///
+    /// Stated over every crate rather than as a list of the ones we remembered,
+    /// and that is the whole difference. The previous version guarded three
+    /// named packages, so a new sibling crate was unprotected BY DEFAULT: the
+    /// gate would have stayed green while the thing it exists to prevent
+    /// happened next door. Enumerating what to check is the failure mode of
+    /// every path-enumerating manifest.
+    ///
+    /// Why it matters at all: the engine is a sans-IO state machine compiled
+    /// INTO a delegate. If the client stack reached it, it would be linked
+    /// into the wasm and the first sign would be a delegate that no longer
+    /// instantiates — a long way from the edit that caused it.
     #[test]
-    fn the_probes_client_stack_is_not_a_dependency_of_the_engine_or_the_sdk() {
+    fn only_allowlisted_crates_may_know_freenets_client_api() {
         const FORBIDDEN: [&str; 4] = ["freenet-stdlib", "tokio-tungstenite", "tokio", "anyhow"];
-        // The RUNNING directory, not the building one. Cargo runs a test
-        // binary with its cwd at the package root, which is true of the tree
-        // being tested; `CARGO_MANIFEST_DIR` is baked in at build time, so a
-        // binary served from a shared `CARGO_TARGET_DIR` names whichever
-        // worktree built it — and pointing `cargo tree` at a worktree that no
-        // longer exists fails the gate on a missing directory rather than on
-        // a dependency.
+        /// The crates whose JOB is to talk to the platform.
+        ///
+        /// `wire` frames the client API; `probe` drives live nodes; the
+        /// delegates are compiled by the node itself and link the guest side.
+        const ALLOWED: [&str; 4] = ["wire", "probe", "probe-delegate", "engine-delegate"];
+
+        // The RUNNING directory, not the building one: `CARGO_MANIFEST_DIR` is
+        // baked in at build time, so a binary served from a shared target dir
+        // names whichever worktree built it, and pointing cargo at a worktree
+        // that no longer exists fails the gate on a missing directory rather
+        // than on a dependency.
         let here = std::env::current_dir().expect("a working directory");
         let root = here
             .parent()
             .expect("the workspace root is the probe's parent");
-        let mut checked = 0usize;
-        // `protocol` is here too, and for a sharper reason than the others:
-        // it is carried by BOTH wasm binaries — the delegate's and the
-        // browser SDK's — so a dependency added to it is one every one of
-        // them pays for, on a download every new node makes.
-        const GUARDED: [&str; 3] = ["engine", "craftworks-sdk", "protocol"];
-        for pkg in GUARDED {
+
+        // EVERY member, from cargo itself — not a list in this file, which is
+        // exactly what went wrong before.
+        //
+        // `cargo tree --workspace --depth 0` rather than `cargo metadata`: the
+        // first version parsed metadata's JSON by splitting on `"name":"`, and
+        // every package object also lists its DEPENDENCIES by name — so the
+        // member list was polluted with `anyhow` and the gate failed claiming
+        // `anyhow` was in `anyhow`'s own closure. It failed loudly, which is
+        // the only reason that was a nuisance rather than a gate quietly
+        // checking the wrong set.
+        let out = std::process::Command::new(env!("CARGO"))
+            .args(["tree", "--workspace", "--depth", "0", "--prefix", "none"])
+            .current_dir(root)
+            .output()
+            .expect("cargo tree must run: a gate that cannot check has not checked");
+        assert!(
+            out.status.success(),
+            "cargo tree failed, so NOTHING was checked: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let members: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|n| !n.is_empty())
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert!(
+            members.len() >= 5,
+            "cargo named {} workspace member(s), fewer than this workspace has \
+             — the gate would be checking almost nothing: {members:?}",
+            members.len()
+        );
+
+        // An allowlisted name that no longer exists is a FAILURE. Otherwise
+        // the list rots into permission for a crate nobody can find, and the
+        // gate degrades silently into one that checks less every year.
+        for a in ALLOWED {
+            assert!(
+                members.iter().any(|m| m == a),
+                "the allowlist names `{a}`, which is not a member of this \
+                 workspace any more. Remove it: an allowlist entry for a crate \
+                 that does not exist is permission nobody is using and nobody \
+                 is checking."
+            );
+        }
+
+        let mut checked = Vec::new();
+        for pkg in &members {
+            if ALLOWED.contains(&pkg.as_str()) {
+                continue;
+            }
             let out = std::process::Command::new(env!("CARGO"))
                 .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
                 .current_dir(root)
                 .output()
                 .expect("cargo tree must run: a gate that cannot check has not checked");
-            // Not a skip. A tree that could not be produced is a tree nobody
-            // has looked at, and in a log that reads exactly like a clean one.
             assert!(
                 out.status.success(),
-                "cargo tree -p {pkg} failed, so the dependency was NOT checked:\n{}",
+                "cargo tree failed for {pkg}, so it was NOT checked: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let tree = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                tree.lines().filter(|l| !l.trim().is_empty()).count() > 1,
-                "cargo tree -p {pkg} printed almost nothing, so this asserts \
-                 nothing about its dependencies"
-            );
             for f in FORBIDDEN {
                 assert!(
                     !tree.lines().any(|l| l.split_whitespace().next() == Some(f)),
-                    "{f} is in {pkg}'s dependency tree. The engine is compiled \
-                     into a delegate; the probe's client stack must not follow \
-                     it there."
+                    "`{f}` is in `{pkg}`'s normal dependency closure, and `{pkg}` \
+                     is not on the allowlist. Either it belongs there — say so, \
+                     with the reason — or this is the mistake the gate exists \
+                     for: one line in a Cargo.toml putting the client stack \
+                     somewhere it gets compiled into a delegate."
                 );
             }
-            checked += 1;
+            checked.push(pkg.clone());
         }
-        // Derived from the list, not written as a number: the last time
-        // this was a literal, adding a package to the list made the gate
-        // fail on its own floor rather than on anything it guards.
-        assert_eq!(
-            checked,
-            GUARDED.len(),
-            "only {checked} of {} guarded package(s) were checked",
-            GUARDED.len()
+
+        // PRINTED on success, not only on failure. A gate whose output nobody
+        // reads is one that can quietly start checking nothing, and the count
+        // is the only thing that would say so.
+        println!(
+            "  checked {} crate(s) against {} forbidden name(s): {}",
+            checked.len(),
+            FORBIDDEN.len(),
+            checked.join(", ")
+        );
+        println!("  allowlisted (not checked): {}", ALLOWED.join(", "));
+        assert!(
+            !checked.is_empty(),
+            "every workspace member is allowlisted, so this gate checked nothing"
         );
     }
 }
