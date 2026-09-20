@@ -32,10 +32,27 @@ pub mod session;
 ///
 /// A list, not a number: "the current version" is what a protocol says right
 /// before it drops an old client. Serving several is the normal state.
-pub const KNOWN: &[u16] = &[1];
+pub const KNOWN: &[u16] = &[1, 2];
 
 /// The version this build SPEAKS when it starts a conversation.
-pub const CURRENT: u16 = 1;
+///
+/// v2 adds [`Reply::CallBytes`]. It is a new VARIANT, not a new field on an
+/// existing message, so a v1 reader meeting it fails to decode and counts
+/// `Dropped::Unparseable` rather than reading it as something else — which is
+/// what appending a field would have done.
+///
+/// # What a reader does with a version it does not know
+///
+/// A REQUEST carries its version and is answered [`Reply::Unsupported`] with
+/// the list this build serves, so a newer client can fall back rather than
+/// wait.
+///
+/// A REPLY carries no version — there is no envelope on the reply side — so
+/// the only protection a reply has is its variant tag. That is why a new
+/// message is added as a variant and never as a field, and why the delegate
+/// sends v2-only messages ONLY to a client that said it speaks v2. A v1
+/// client is never sent one at all, so its decoder never has to refuse one.
+pub const CURRENT: u16 = 2;
 
 /// A client's message, with its version on the front.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +465,33 @@ pub enum Reply {
         what: Step,
         /// A count whose meaning depends on `what` — blocks, bytes, rows.
         n: u64,
+    },
+    /// What one call handed to the NODE, in bytes and ops.
+    ///
+    /// A new VARIANT rather than new fields on [`Reply::Call`], and the
+    /// difference is the whole safety argument. Appending a field changes an
+    /// existing variant: a reader that does not know about it does not error,
+    /// it reads a DIFFERENT MESSAGE — the same class of silent
+    /// re-interpretation as a data file whose meaning changed while every
+    /// field stayed where it was. Appending a variant gives it a new wire tag,
+    /// and a reader that does not know that tag FAILS to decode, which is
+    /// counted as `Dropped::Unparseable` rather than believed.
+    ///
+    /// So this needs no version bump, and per this file's own rule it must
+    /// not: a version is for changing an existing message, not for adding one.
+    ///
+    /// The counts are the delegate's own, from the ops actually leaving the
+    /// call. `put_bytes` is what this delegate OFFERED the node — never what
+    /// the node then sends peer-to-peer, which only the node can count (six
+    /// external instruments failed to infer it, freenet-contracts#39).
+    CallBytes {
+        /// Bytes handed to the node in `Op::Put` this call.
+        put_bytes: u64,
+        /// Puts issued.
+        puts: u32,
+        /// Gets issued, so a reader can tell a call that wrote from one that
+        /// only looked.
+        gets: u32,
     },
 }
 

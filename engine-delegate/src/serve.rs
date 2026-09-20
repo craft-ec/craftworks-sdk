@@ -14,15 +14,22 @@ use protocol::{Incoming, Reply, Request};
 /// does not serve gets an ANSWER naming what it does serve. Silence leaves
 /// the client waiting; a guess leaves it wrong.
 pub enum Served {
-    /// A request this build understands.
-    Do(Request),
+    /// A request this build understands, and the version the CLIENT spoke.
+    ///
+    /// The version is carried, not discarded, because it is the only thing
+    /// that says what the client can read back. A reply carries no version of
+    /// its own — there is no envelope on the reply side — so "may I send this
+    /// message?" can only be answered from what the client said on the way in.
+    /// Dropping it here is what would make a v2-only message reach a v1
+    /// reader.
+    Do(Request, u16),
     /// Answer with this and do nothing else.
     Answer(Reply),
 }
 
 pub fn serve(bytes: &[u8]) -> Served {
     match protocol::decode_request(bytes) {
-        Incoming::Ok(env) => Served::Do(env.body),
+        Incoming::Ok(env) => Served::Do(env.body, env.version),
         Incoming::Unsupported(got) => Served::Answer(Reply::Unsupported {
             got,
             known: protocol::KNOWN.to_vec(),

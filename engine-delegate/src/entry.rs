@@ -587,6 +587,31 @@ impl DelegateInterface for EngineDelegate {
         msgs.push(OutboundDelegateMsg::ApplicationMessage(
             ApplicationMessage::new(note).processed(true),
         ));
+        // What this call handed to the NODE — and ONLY to a client that said
+        // it speaks v2.
+        //
+        // The version is DETECTED, from the envelope the client sent on the
+        // way in, never assumed. A reply carries no version of its own, so
+        // this is the only place that knows what the far side can read. A
+        // client that spoke v1, or a call with no client message at all (a
+        // tick, a node answer), is not sent it: silence is not consent to a
+        // format.
+        //
+        // Emitted HERE, beside the per-call report it belongs with, rather
+        // than in the shell's reply stream. Putting it there added a message
+        // to every call, and the chaos test found it immediately: a caller
+        // draining replies is looking for the answer to ITS request, and an
+        // extra message in that queue is a reply to somebody else's question.
+        if out.client_version >= 2 {
+            let bytes = protocol::encode_reply(&protocol::Reply::CallBytes {
+                put_bytes: out.put_bytes as u64,
+                puts: out.puts as u32,
+                gets: out.gets as u32,
+            });
+            msgs.push(OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(bytes).processed(true),
+            ));
+        }
         Ok(msgs)
     }
 }
