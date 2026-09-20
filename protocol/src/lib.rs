@@ -251,6 +251,21 @@ pub struct At {
 ///
 /// So `0` means "the engine decides", it is not what a loader should send,
 /// and this constant is what it should send instead.
+///
+/// # It also bounds a PROOF (sdk#15)
+///
+/// `max_entries` comes off the wire, and `verify_range`'s cost-to-refuse bound
+/// is `2 * height + max_entries` blocks. So the number a caller sends decides
+/// how much a CHECKER must hash to discover it was lied to — the hostile-cost
+/// shape, where the asker pays nothing and the checker pays everything. An
+/// unclamped 60,000-entry request licenses a ~60,000-block proof.
+///
+/// At 256 entries that is at most ~266 blocks, so under 4.5 MiB hashed against
+/// the 16 KiB node limit — an amount a phone can afford to refuse. The bound
+/// is therefore not only about round trips: **raising this constant raises
+/// what a hostile peer can make a client compute**, and that has to be part of
+/// the decision, not discovered afterwards by whoever adds the first
+/// proof-backed reader.
 pub const MAX_PAGE_ENTRIES: u32 = 256;
 
 /// A signing key that is not a real one, and says so in its own type.
