@@ -226,6 +226,7 @@ dependencies = [
  "engine-delegate",
  "freenet-prolly",
  "getrandom 0.2.17",
+ "instrument 0.1.0 (git+https://github.com/craft-ec/craftworks-instrument?rev=631241b)",
  "js-sys",
  "protocol",
  "serde",
@@ -781,6 +782,11 @@ name = "indexmap-nostd"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e04e2fd2b8188ea827b32ef11de88377086d690286ab35747ef7f9bf3ccb590"
+
+[[package]]
+name = "instrument"
+version = "0.1.0"
+source = "git+https://github.com/craft-ec/craftworks-instrument?rev=631241b#631241b50292616abede5108863fcc56c82277af"
 
 [[package]]
 name = "instrument"
@@ -1468,7 +1474,7 @@ dependencies = [
  "engine",
  "engine-delegate",
  "freenet-prolly",
- "instrument",
+ "instrument 0.1.0 (git+https://github.com/craft-ec/craftworks-instrument?rev=9967896)",
 ]
 
 [[package]]
