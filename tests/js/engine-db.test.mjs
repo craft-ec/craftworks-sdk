@@ -13,9 +13,35 @@ import { readFileSync } from "node:fs";
 import { engineDb, DbError } from "../../js/engine-db.js";
 
 let failures = 0;
+
+/**
+ * Every test gets a DEADLINE.
+ *
+ * The failure this exists for is not slowness. A wrapper that retries without
+ * a bound does not fail — it HANGS, and a suite with no deadline cannot tell
+ * that apart from a slow machine: it simply never finishes, and in CI that
+ * reads as a stuck runner rather than as a broken retry.
+ *
+ * Found by mutation: removing the ticket check from `once` (so a NOT_LOADED
+ * with nothing to wait on is retried for ever) wedged this file instead of
+ * failing it. Retries and bounds are most of what this file tests, so a
+ * missing bound has to be a FAILING test.
+ */
+const DEADLINE_MS = 5_000;
 const t = async (name, fn) => {
-  try { await fn(); process.stdout.write(`  ok  ${name}\n`); }
+  let timer;
+  try {
+    await Promise.race([
+      fn(),
+      new Promise((_, bad) => {
+        timer = setTimeout(() => bad(new Error(
+          `did not finish within ${DEADLINE_MS}ms — a retry with no bound hangs rather than failing`)), DEADLINE_MS);
+      }),
+    ]);
+    process.stdout.write(`  ok  ${name}\n`);
+  }
   catch (e) { failures += 1; process.stdout.write(`  FAIL ${name}\n    ${e.stack?.split("\n")[0] ?? e}\n`); }
+  finally { clearTimeout(timer); }
 };
 
 /**
@@ -58,6 +84,12 @@ const lateSession = ({ afterMs = 20, rows = [{ id: "a" }], fail = false } = {}) 
       throw e;
     },
     put() { return s.scan(); },
+    // A COLD DEFINE. It reads the existing schema before it can check the new
+    // one against it, so until that range is loaded it fails exactly as a
+    // read does — with a ticket.
+    define(domain = "tasks") { s.scan(domain); return undefined; },
+    update(domain = "tasks") { return s.scan(domain); },
+    delete(domain = "tasks") { s.scan(domain); return true; },
     take_loads() { const out = ended; ended = []; return JSON.stringify(out); },
     pump: () => {},
   };
@@ -128,12 +160,136 @@ await t("an error a load cannot fix is NOT waited on", async () => {
   assert.equal(asks, 1, "a TOO_LARGE was retried; no load makes a record smaller");
 });
 
-await t("a WRITE is never retried, whatever it says", async () => {
-  const s = lateSession({ afterMs: 5 });
+// ---------------------------------------------------------------------------
+// A WRITE THAT COULD NOT READ IS NOT AN INVALID WRITE.
+//
+// This block replaces a test that asserted the opposite — "a WRITE is never
+// retried, whatever it says" — whose stated fear was that a retried write can
+// be applied twice. That fear is answered rather than ignored: in `Db` every
+// read a write makes happens BEFORE the single write that mutates, and that
+// write applies the whole edit or none of it. A NOT_LOADED therefore leaves
+// the tree untouched, so asking again repeats the attempt and not the effect.
+//
+// What the old rule cost (sdk#89): a cold `define` returned a ticketless
+// NOT_LOADED that nothing could retry, and a published app kept a form on
+// screen, a button saying "Published", and refused every write with `domain
+// has no schema; define it first` — permanently, because the next mount ran
+// the same cold define. Measured against a real node: 120 of 120 refused.
+// ---------------------------------------------------------------------------
+
+await t("**a COLD DEFINE succeeds, with no preload**", async () => {
+  // The user-visible bug, as a test. Nothing warms the range first: the
+  // define itself queues the load, waits for it, and asks once more.
+  const s = lateSession({ afterMs: 20 });
   const db = engineDb(s);
   s.pump = db.drain;
-  await assert.rejects(() => db.put("tasks", {}), e => e.code === "NOT_LOADED");
-  assert.equal(s.asks(), 1, "a write was re-sent; a retried write can be applied twice");
+  await db.define("tasks", { type: "Task", fields: [] });
+  assert.equal(s.asks(), 2, "the define did not ask exactly twice");
+  assert.equal(s.requests(), 1, "it issued more than one request for one range");
+});
+
+await t("a cold PUT, UPDATE and DELETE do the same — they all read first", async () => {
+  // `need_schema` is on all three paths, so none of them is a special case.
+  for (const [name, call] of [
+    ["put", db => db.put("tasks", {})],
+    ["update", db => db.update("tasks", "a", {})],
+    ["delete", db => db.delete("tasks", "a")],
+  ]) {
+    const s = lateSession({ afterMs: 10 });
+    const db = engineDb(s);
+    s.pump = db.drain;
+    await call(db);
+    assert.equal(s.asks(), 2, `a cold ${name} did not wait for the range it needed`);
+  }
+});
+
+await t("a load that never answers ends the write UNAVAILABLE, bounded", async () => {
+  // Not a hang and not an infinite retry: the load ENDS, having failed, and
+  // the write is told so.
+  const s = lateSession({ afterMs: 10, fail: true });
+  const db = engineDb(s);
+  s.pump = db.drain;
+  await assert.rejects(
+    () => db.define("tasks", { type: "Task", fields: [] }),
+    e => e.code === "UNAVAILABLE",
+    "a define whose range never loaded did not end UNAVAILABLE");
+  assert.ok(s.asks() <= 2, `it asked ${s.asks()} times for a range that was never going to load`);
+});
+
+await t("THE CONTROL: an INVALID write is still refused, and NOT retried", async () => {
+  // The half of the old rule that was right, kept. Without this, routing
+  // writes through the retry would look correct while quietly re-sending a
+  // write that no load can ever make valid.
+  // IT CARRIES A TICKET. That is the whole point of the control: with no
+  // ticket the retry stops for a second reason, and the test would pass
+  // whether or not the wrapper still checks the code at all. Found by
+  // mutation — deleting the code check left this green.
+  let asks = 0;
+  const s = {
+    define() {
+      asks += 1;
+      const e = new Error("field `title` must be text");
+      e.code = "REFUSED";
+      e.transient = false;
+      e.wait = 1;              // something TO wait on, deliberately
+      throw e;
+    },
+    take_loads: () => JSON.stringify([{ id: 1, ok: true, code: "LOADED" }]),
+  };
+  const db = engineDb(s);
+  s.pump = db.drain;
+  await assert.rejects(() => db.define("tasks", { type: "Task", fields: [] }), e => e.code === "REFUSED");
+  assert.equal(asks, 1,
+    "an invalid write was re-sent although its code says no load can help; " +
+    "the wrapper is deciding on the ticket rather than on what went wrong");
+});
+
+await t("and the retry is BOUNDED even when every attempt hands back a ticket", async () => {
+  // A session that always says "not loaded, wait for this" and always
+  // completes the load — progress on every hop, and never an answer. Nothing
+  // but MAX_HOPS stops it.
+  //
+  // Without this, removing the hop bound was caught by no test at all: the
+  // other fakes stop issuing NOT_LOADED once loaded, so the loop ends for a
+  // reason that has nothing to do with the bound.
+  let asks = 0, ticket = 0;
+  const ended = [];
+  const s = {
+    define() {
+      asks += 1;
+      ticket += 1;
+      const t = ticket;
+      setTimeout(() => { ended.push({ id: t, ok: true, code: "LOADED" }); s.pump(); }, 1);
+      const e = new Error("not loaded");
+      e.code = "NOT_LOADED"; e.transient = true; e.wait = t;
+      throw e;
+    },
+    take_loads() { const out = ended.splice(0); return JSON.stringify(out); },
+    pump: () => {},
+  };
+  const db = engineDb(s);
+  s.pump = db.drain;
+  await assert.rejects(
+    () => db.define("tasks", { type: "Task", fields: [] }),
+    e => e.code === "NOT_LOADED",
+    "a write that is always told to wait never gave up");
+  assert.ok(asks <= 10,
+    `it asked ${asks} times; the hop bound is what stops a chain that makes ` +
+    "progress for ever, and an unbounded one hangs rather than fails");
+});
+
+await t("THE CONTROL: a ticketless NOT_LOADED on a write still surfaces", async () => {
+  // `park` hands back no ticket when the span was already loaded and the read
+  // still cannot be answered — asking again would answer identically. The
+  // write must be told, not sent round.
+  let asks = 0;
+  const s = {
+    define() { asks += 1; const e = new Error("not loaded"); e.code = "NOT_LOADED"; e.transient = true; throw e; },
+    take_loads: () => "[]",
+  };
+  const db = engineDb(s);
+  await assert.rejects(() => db.define("tasks", { type: "Task", fields: [] }), e => e.code === "NOT_LOADED");
+  assert.equal(asks, 1, "a write with no ticket to wait on was retried anyway");
 });
 
 await t("nothing in the wrapper branches on a message, or waits on a timer", () => {

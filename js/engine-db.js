@@ -178,13 +178,36 @@ export function engineDb(handle) {
 
   // Named so `bind` can reach the surface it is part of.
   const self = {
-    // ---- writes: no reload can help, so they are not retried ----
+    // ---- writes: a REFUSAL is final, but "I could not read" is not ----
+    //
+    // These used to say "no reload can help, so they are not retried", and
+    // that conflated two different failures. A write can fail because it is
+    // invalid — a bad schema, a field of the wrong type, a domain that does
+    // not exist — and no amount of loading changes that. It can also fail
+    // because it had to READ something in order to apply itself and that
+    // range was not loaded, which is the one case a load fixes.
+    //
+    // Every write here reads first: `define` reads the existing schema to
+    // check the new one against it, and all of them go through `need_schema`.
+    // So they take the SAME bounded path a read takes — `once` retries only
+    // a ticketed NOT_LOADED, at most MAX_HOPS times, and a span already
+    // loaded comes back with no ticket and is rethrown rather than asked
+    // again.
+    //
+    // What the old heading cost (sdk#89): a cold `define` returned a
+    // ticketless NOT_LOADED, so a published app kept a form on screen, a
+    // button saying Published, and refused every write with `domain has no
+    // schema; define it first` — permanently, because the next mount ran the
+    // same cold define. 120 of 120 writes refused against a real node.
+    //
+    // Retrying cannot double-apply: in `Db` every one of these reads happens
+    // before the single write that mutates, so a NOT_LOADED leaves the tree
+    // untouched and asking again repeats the attempt, not the effect.
     async define(domain, schema) {
-      try { return session.define(domain, JSON.stringify(schema)); } catch (e) { rethrow(e); }
+      return once(() => session.define(domain, JSON.stringify(schema)));
     },
     async put(domain, fields) {
-      let r;
-      try { r = JSON.parse(session.put(domain, JSON.stringify(fields))); } catch (e) { rethrow(e); }
+      const r = await once(() => JSON.parse(session.put(domain, JSON.stringify(fields))));
       // A person's OWN write shows at once. It changes `base + pending` and
       // not the root, so nothing else would tell this binding — and a row
       // that appeared only after the network confirmed it would make the
@@ -193,14 +216,12 @@ export function engineDb(handle) {
       return r;
     },
     async update(domain, id, patch) {
-      let r;
-      try { r = JSON.parse(session.update(domain, id, JSON.stringify(patch))); } catch (e) { rethrow(e); }
+      const r = await once(() => JSON.parse(session.update(domain, id, JSON.stringify(patch))));
       touched(domain);
       return r;
     },
     async delete(domain, id) {
-      let r;
-      try { r = session.delete(domain, id); } catch (e) { rethrow(e); }
+      const r = await once(() => session.delete(domain, id));
       touched(domain);
       return r;
     },
