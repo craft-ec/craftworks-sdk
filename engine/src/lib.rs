@@ -737,19 +737,36 @@ struct WithEmptyLeaf<'a, B: Blocks> {
     inner: &'a B,
     empty_cid: Cid,
     empty_bytes: &'a [u8],
+    /// Blocks handed to the engine THIS CALL and not yet visible through
+    /// `inner` (sdk#34).
+    ///
+    /// A `BlockArrived` event carries the block's bytes. Until now they were
+    /// checked and dropped, because the node that served them also holds them,
+    /// so the next call could read them back through `Blocks`. That is true of
+    /// a node that RETAINS. A node is free not to — a sync read does not
+    /// refresh hosting (F33) — and then the bytes the engine was handed are
+    /// the only copy in existence, and it had thrown them away.
+    ///
+    /// So they are used for the rest of THIS call and then dropped. Nothing is
+    /// stored: this map never reaches the context, and the next call starts
+    /// without it.
+    arrived: &'a BTreeMap<Cid, Vec<u8>>,
 }
 
 impl<B: Blocks> Blocks for WithEmptyLeaf<'_, B> {
     fn get(&self, cid: &Cid) -> Option<&[u8]> {
         // The real source first: once the leaf is published the node's copy is
         // the one to use, and it is byte-identical anyway.
-        self.inner.get(cid).or_else(|| {
-            if *cid == self.empty_cid {
-                Some(self.empty_bytes)
-            } else {
-                None
-            }
-        })
+        self.inner
+            .get(cid)
+            .or_else(|| self.arrived.get(cid).map(|b| b.as_slice()))
+            .or_else(|| {
+                if *cid == self.empty_cid {
+                    Some(self.empty_bytes)
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -763,6 +780,9 @@ pub struct Engine<B: Blocks> {
     /// the next one. What it can do is ASK — and on a node that is the
     /// synchronous local read (F14), which sees what this node already holds.
     blocks: B,
+    /// Blocks handed to this engine during the CURRENT call, and dropped when
+    /// it ends (sdk#34). Never in the context — see [`WithEmptyLeaf::arrived`].
+    arrived: BTreeMap<Cid, Vec<u8>>,
     params: Params,
     /// The warm tree: every block this engine has written. In slice 1 it is
     /// also the only place they exist, because there is no node yet.
@@ -870,6 +890,7 @@ impl<B: Blocks> Engine<B> {
             params,
             empty,
             blocks,
+            arrived: BTreeMap::new(),
             root,
             published_seq: 0,
             published_root: root,
@@ -1215,6 +1236,7 @@ impl<B: Blocks> Engine<B> {
             inner: blocks,
             empty_cid: empty.cid,
             empty_bytes: &empty.bytes,
+            arrived: &BTreeMap::new(),
         };
         subs.touched(&source, &from, &to, stale_after)
             .into_iter()
@@ -1259,6 +1281,7 @@ impl<B: Blocks> Engine<B> {
                 client,
                 want,
                 root,
+                frontier: None,
                 levels_done: 0,
                 rounds: 0,
                 held: BTreeSet::from([root]),
@@ -1308,11 +1331,23 @@ impl<B: Blocks> Engine<B> {
         // The counter is taken OUT for the call: `source()` borrows the
         // engine, and a cost counter is not worth an interior-mutability cell.
         let mut parsed = self.nodes_parsed;
+        // Continue from the deepest node this read reached, not from the root
+        // (sdk#34). A read that starts over needs every upper level again, so
+        // a node evicting what it serves can make it impossible rather than
+        // merely slow.
+        let start = p.frontier.unwrap_or(p.root);
         let outcome = {
             let source = self.source();
-            read::attempt(&source, &self.params, &p.want, &p.root, &mut parsed)
+            read::attempt(&source, &self.params, &p.want, &start, &mut parsed)
         };
         self.nodes_parsed = parsed;
+        // Only a missing CHILD is a resume point; see `Attempt::NeedFrom`.
+        // Read from a borrow, so the two Need shapes can share one arm below
+        // rather than needing a branch that cannot happen.
+        let advance_to = match &outcome {
+            read::Attempt::NeedFrom { node, .. } => Some(*node),
+            _ => None,
+        };
         match outcome {
             read::Attempt::Done(result) => {
                 self.reads.parked.remove(&req_id);
@@ -1336,7 +1371,7 @@ impl<B: Blocks> Engine<B> {
                     result,
                 });
             }
-            read::Attempt::Need(ids) => {
+            read::Attempt::Need(ids) | read::Attempt::NeedFrom { ids, .. } => {
                 // A round that asks for something is a round: if the read has
                 // made too many without finishing, it ENDS. The node may be
                 // evicting what it serves faster than the descent can use it,
@@ -1345,6 +1380,9 @@ impl<B: Blocks> Engine<B> {
                     let q = self.reads.parked.get_mut(&req_id).expect("parked");
                     q.levels_done += 1;
                     q.rounds += 1;
+                    if let Some(node) = advance_to {
+                        q.frontier = Some(node);
+                    }
                     q.rounds > self.params.max_read_rounds
                 };
                 if over {
@@ -1523,6 +1561,7 @@ impl<B: Blocks> Engine<B> {
             inner: &self.blocks,
             empty_cid: self.empty.cid,
             empty_bytes: &self.empty.bytes,
+            arrived: &self.arrived,
         };
         let applied = match apply_with(
             ApplyOptions::default(),
@@ -2473,6 +2512,19 @@ impl<B: Blocks> Engine<B> {
             }
         }
 
+        // The bytes just handed over, usable for the rest of this call. A
+        // node that evicts what it serves leaves these as the only copy, and
+        // a read that must re-read them through `Blocks` next call cannot
+        // finish at all (sdk#34).
+        self.arrived.insert(id, bytes.clone());
+        if freenet_prolly::block_id(pack::PACK_KIND, &bytes) == id {
+            for (mid, mbytes) in pack::members(&bytes) {
+                if read::matches_id(&mid, &mbytes) {
+                    self.arrived.insert(mid, mbytes.to_vec());
+                }
+            }
+        }
+
         let mut woken: BTreeSet<read::ReqId> = BTreeSet::new();
         for l in &landed {
             self.reads.attempts.remove(l);
@@ -2497,6 +2549,9 @@ impl<B: Blocks> Engine<B> {
         for l in &landed {
             out.extend(self.resume_parked_write(*l));
         }
+        // The call is over for these: the engine owns no block bytes across
+        // calls, and this is what keeps that true.
+        self.arrived.clear();
         out
     }
 
@@ -2636,6 +2691,7 @@ impl<B: Blocks> Engine<B> {
             inner: &self.blocks,
             empty_cid: self.empty.cid,
             empty_bytes: &self.empty.bytes,
+            arrived: &self.arrived,
         }
     }
 
