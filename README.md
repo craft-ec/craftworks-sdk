@@ -5,7 +5,7 @@ JavaScript the phase it lands: `collection` (1) · `identity` `query` `subscribe
 `inbox` `edge` `stream` (6) · `cap` (8) · `file` `blob` (9) · `ledger` (10).
 
     ./build.sh                     # → pkg/web (ES module) and pkg/node (CommonJS)
-    cargo test                     # Rust side of the shared vectors
+    cargo test --workspace         # Rust side of the shared vectors, and the engine
     npm test                       # the same behaviour through JavaScript
 
 ## Collections

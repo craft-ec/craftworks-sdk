@@ -25,6 +25,13 @@ wasm-bindgen = "=0.2.128"
 js-sys = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 
+# The engine is a separate crate, not a module, because its whole claim is that
+# it has no I/O, no clock and no randomness — and the way to KEEP that true is
+# for it to be unable to reach them. It does not depend on this crate; a core
+# that can call the SDK is a core that will.
+[workspace]
+members = ["engine"]
+
 [profile.release]
 opt-level = "s"
 lto = true
