@@ -65,3 +65,22 @@ own gate, which builds the way a consumer builds:
 **Do not carry this into a contract.** Baking a rev into a wasm changes that
 wasm's hash on every commit. That is free here, because this wasm is not
 addressed by its hash — but a contract's wasm hash is part of its network key.
+
+## The tree library pin
+
+`freenet-prolly` is pinned by revision in `Cargo.toml`, and that revision must be
+**the one the Block contract validates with**. A node written under one version
+of the split rule and checked under another is refused by every host — and no
+test inside this repo can see that, because both sides of those tests are the
+same library. `tests/prolly_pin.rs` compares the two repositories' pins directly;
+it is the only gate here that can.
+
+Changing the pin moves every root hash. `tests/rootvec.rs` pins the root of a
+fixed dataset so that movement is visible, and `tests/root_vector.txt` is the
+value. When it fails, that is not a number to update on its own: every root
+written under the old format now names something no reader will find.
+
+| pin | fixture root |
+|---|---|
+| `afcada3` (before the parity rule) | `358d4094f3a2caede057d0601e98a92d2807d0a7aca88c3aa353e607d7c2a51c` |
+| `e2756c8` (parity) | `e9d30de0e61ca4c54282e83cffed9b6d03bfa20df6b6f40ef0d75d8566719081` |

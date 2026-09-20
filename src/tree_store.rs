@@ -115,6 +115,17 @@ impl TreeStore {
         }
     }
 
+    /// Every block this store holds, as (id, bytes).
+    ///
+    /// A store nobody can walk is a store nobody can check. The parity rule
+    /// (freenet-prolly#19) is a property of each NODE, and the only way to know
+    /// that the nodes this SDK writes satisfy it is to look at all of them —
+    /// including the superseded ones, which stay, and which a reader can still
+    /// be handed.
+    pub fn blocks(&self) -> impl Iterator<Item = (&Cid, &[u8])> {
+        self.blocks.inner.0.iter().map(|(c, b)| (c, b.as_slice()))
+    }
+
     /// The bytes of a value, wherever the format put it.
     fn materialise(&self, v: Value<'_>) -> Vec<u8> {
         match read_value(&self.blocks, v) {
