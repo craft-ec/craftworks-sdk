@@ -367,6 +367,27 @@ impl<B: Blocks> Shell<B> {
     pub fn handle(&mut self, inbound: Vec<Inbound>) -> Outbound {
         let mut out = Outbound::default();
         let mut sched = Scheduler::default();
+        // WHAT THE NODE CONFIRMED BEFORE THIS CALL EXISTED.
+        //
+        // The scheduler learns what the node holds from acks, and it is built
+        // fresh every call — a delegate gets a new linear memory each time
+        // (F32), so an ack from last call is not in it. An op held on a
+        // dependency confirmed in an EARLIER call is therefore held on
+        // something nothing in this call will ever confirm, and it is dropped
+        // when the call ends.
+        //
+        // Owed parity is exactly that op: it goes out `after` the published
+        // root. The published root is confirmed BY DEFINITION — it is a root
+        // whose head the node acknowledged, and a head is only bumped once
+        // its commit's blocks have landed — so seeding it is a statement of
+        // what already happened, not a relaxation of the gate.
+        //
+        // Measured before this line existed: a group stayed owed across three
+        // ticks and a Flush, its three parity puts held and dropped every
+        // call. The redundancy the tree promises was never written at all.
+        if self.engine.published_seq() > 0 {
+            sched.confirm(self.engine.published_root());
+        }
 
         for msg in inbound {
             // Attribution BEFORE the work, so the steps the work produces

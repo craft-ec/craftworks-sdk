@@ -101,6 +101,10 @@ pub enum Request {
     /// The client is going away. Ship what is waiting.
     Flush,
     /// Time, from a connected client. It may decide WHEN, never WHAT.
+    ///
+    /// `now` is **whole seconds since the Unix epoch** — the wall clock
+    /// quantised by [`TICK_MS`], not a count of how many times a timer
+    /// fired. See [`TICK_MS`] for why the distinction is the whole design.
     Tick {
         now: u64,
     },
@@ -672,4 +676,43 @@ fn classify(e: &bincode::Error) -> Dropped {
         _ if e.to_string().contains("Slice had bytes remaining") => Dropped::TrailingBytes,
         _ => Dropped::Unparseable,
     }
+}
+
+/// How often a connected page sends [`Request::Tick`], in milliseconds.
+///
+/// # What a tick IS
+///
+/// The engine has no clock (F32: a delegate gets a fresh linear memory every
+/// call, and nothing in it advances time). Every deadline it has — when owed
+/// parity goes out, when a stuck commit is called `Stalled` — is measured
+/// against the number a client last sent, and against nothing else.
+///
+/// So the number's MEANING is a decision, and there were two candidates:
+///
+/// * **How many times my timer fired.** Rejected. A browser throttles a
+///   background tab's timers to as little as one a minute, so N ticks would
+///   mean anywhere from N seconds to N minutes — the deadline would stretch
+///   silently with the thing least worth trusting. Worse, a delegate's
+///   context is shared by EVERY connection (F47): a second tab opening would
+///   send 1, 2, 3 while the first was at 4000, and `now` would jump
+///   backwards, making everything look young again.
+///
+/// * **The wall clock, quantised.** What this is. `now` is
+///   `Date.now() / TICK_MS` — whole seconds since the epoch. Two tabs on one
+///   node agree exactly, because they are reading the same clock rather than
+///   counting their own events, and a throttled tab sends the right number
+///   late instead of a wrong number on time.
+///
+/// # And the quantum is what the engine's bounds are in
+///
+/// `Params::parity_age` and `Params::max_accept_age` are counts of this
+/// unit. At `TICK_MS = 1000` they read as seconds, which is why they can
+/// stay the plain numbers they are.
+pub const TICK_MS: u64 = 1_000;
+
+/// The wall clock in the unit [`Request::Tick`] carries.
+///
+/// One function so a page cannot quantise it one way and a test another.
+pub const fn tick_of(now_ms: u64) -> u64 {
+    now_ms / TICK_MS
 }

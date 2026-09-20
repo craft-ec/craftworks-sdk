@@ -2032,6 +2032,25 @@ impl<B: Blocks> Engine<B> {
                     }];
                 }
             }
+            // The bytes are not on hand. A rehydrated engine carries owed
+            // groups as IDS, so this is the ordinary case, not an edge one:
+            // a parity put that fails in a later call than the one that sent
+            // it lands here every time.
+            //
+            // The group stops being in flight — which is the truth, the put
+            // failed — so the next `emit_parity` recomputes its blocks and
+            // sends the whole trio again. Leaving the ids in flight instead
+            // would leave the group permanently `sent` with nothing behind
+            // it: never retried, never settled, owed for ever.
+            //
+            // All three go, not just this one. `sent` is derived from what is
+            // in flight, so a group with two ids still listed would stay sent
+            // and the retry would never happen. Re-putting a parity block
+            // that already landed costs a put; the ids and bytes are the
+            // same, so it cannot make the network disagree with itself.
+            for member in group {
+                self.in_flight_parity.remove(&member);
+            }
             return Vec::new();
         }
         let Some(c) = self.pending.as_ref() else {
@@ -2605,6 +2624,21 @@ struct Context {
     /// engine recomputes them from the node's blocks and puts the same bytes
     /// under the same ids. Idempotent by construction.
     owed_groups: Vec<ParityIds>,
+    /// PARITY BLOCKS ALREADY PUT AND NOT YET CONFIRMED.
+    ///
+    /// The ids only: a parity id belongs to exactly one group, and the group
+    /// IS its three ids, so the map from id to group is rebuilt by looking
+    /// the id up among the owed groups rather than carried twice. A group
+    /// with anything in flight is still owed by construction — it leaves
+    /// `owed` only when its last parity block confirms — so the lookup can
+    /// never miss.
+    ///
+    /// Carried for the reason `in_flight_since` is: the ack arrives in a
+    /// LATER call, and an engine rebuilt without this could not say which
+    /// group the confirmed block belonged to. The group then never settled,
+    /// stayed owed for ever, and was re-coded and re-put on every single
+    /// tick — measured in `what_a_flush_causes`.
+    in_flight_parity: Vec<Cid>,
     parked: Vec<(read::ReqId, read::Parked)>,
     waiting: Vec<(Cid, Vec<read::ReqId>)>,
     attempts: Vec<(Cid, u32)>,
@@ -2640,6 +2674,10 @@ struct Context {
 
 /// The version this build writes. Bumped when the shape changes.
 ///
+/// 4: the parity in flight joined it — without it a confirmed parity block
+/// could not be attributed to its group, so no group ever settled and every
+/// tick re-put the same three blocks for ever (sdk#83).
+///
 /// 3: the stall timer joined it — `in_flight_since` and `told_stalled`.
 /// Without them `Stalled` could never be reported (sdk#81): the state that
 /// measures how long a commit has been stuck did not survive the call.
@@ -2648,7 +2686,7 @@ struct Context {
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 3;
+const CONTEXT_VERSION: u16 = 4;
 
 /// What a context this build wrote begins with.
 ///
@@ -2716,6 +2754,7 @@ impl<B: Blocks> Engine<B> {
                 None
             },
             owed_groups: self.owed.keys().copied().collect(),
+            in_flight_parity: self.in_flight_parity.keys().copied().collect(),
             parked: self
                 .reads
                 .parked
@@ -2847,16 +2886,28 @@ impl<B: Blocks> Engine<B> {
         // on demand from the node's blocks, which is sound because parity is a
         // pure function of its members: the same group gives the same three
         // blocks under the same three ids, whoever computes them.
+        let in_flight: BTreeSet<Cid> = c.in_flight_parity.into_iter().collect();
         for key in c.owed_groups {
+            // `sent` is not a field of its own: a group has been sent exactly
+            // when one of its parity blocks is still in flight. Deriving it
+            // means the two cannot disagree — a carried `sent` with nothing
+            // in flight would be a group that never re-sends and never
+            // settles.
+            let sent = key.iter().any(|id| in_flight.contains(id));
             e.owed.insert(
                 key,
                 Owed {
                     blocks: Vec::new(),
                     last_changed: 0,
                     since: 0,
-                    sent: false,
+                    sent,
                 },
             );
+            for id in key {
+                if in_flight.contains(&id) {
+                    e.in_flight_parity.insert(id, key);
+                }
+            }
         }
         for (r, p) in c.parked {
             e.reads.parked.insert(r, p);

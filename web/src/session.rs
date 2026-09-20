@@ -1112,6 +1112,16 @@ impl Session {
     /// The client's timer: roll back writes with no verdict, notice stalls.
     pub fn tick(&mut self) -> String {
         let now = crate::js_now_ms();
+        // FIRST: TELL THE DELEGATE THE TIME.
+        //
+        // Everything below this line is the PAGE's own housekeeping — its
+        // copies, its loads, its rolled-back writes. None of it reaches the
+        // delegate, and for a while nothing did: the delegate has no clock
+        // (F32), so a deadline it holds fires only when a connected client
+        // says what time it is. Owed parity was therefore never put and a
+        // stuck commit was never reported `Stalled`, on a page that was
+        // ticking a thousand times a minute.
+        self.db.store_mut().send_tick(now);
         let told = self.db.store_mut().copy.time_out(now);
         // A LOCAL change is a change too: a write that rolled back moves the
         // rows a component is showing, and the component finds out the same
@@ -1127,6 +1137,36 @@ impl Session {
             "loadsInFlight": self.loads.in_flight(),
         })
         .to_string()
+    }
+
+    /// THE LAST THING A PAGE SAYS.
+    ///
+    /// A tab that goes away stops sending ticks, so whatever the engine was
+    /// holding back to coalesce — owed parity, an applied write not yet in a
+    /// commit — would sit unwritten until somebody opened the app again.
+    /// This asks for all of it now.
+    ///
+    /// Called on `visibilitychange` to hidden and on `pagehide`, which is
+    /// the closest a browser comes to telling a page it is ending: there is
+    /// no event that reliably fires on close, and `beforeunload` does not
+    /// fire on mobile at all. Both may fire, and both may fire more than
+    /// once; a `Flush` is idempotent, so the cost of the extra ones is a
+    /// frame the engine answers with nothing to do.
+    ///
+    /// The frame still has to LEAVE, which is the page's job: the caller
+    /// pumps the socket after this, and a page that is already gone did what
+    /// it could.
+    pub fn flush(&mut self) {
+        self.db.store_mut().send_flush();
+    }
+
+    /// How often a page should call [`Session::tick`], in milliseconds.
+    ///
+    /// From `protocol`, so the page that sends the time and the engine whose
+    /// bounds are counted in it cannot hold two different numbers. A page
+    /// that hard-coded 1000 would go on being right until the day this moved.
+    pub fn tick_ms(&self) -> u32 {
+        protocol::TICK_MS as u32
     }
 }
 
