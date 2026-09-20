@@ -197,10 +197,11 @@ async fn main() -> Result<()> {
     });
     let wasm = std::fs::read(&wasm_path).context("reading the probe delegate")?;
     // The delegate must be one this node will load at all.
-    let bad = probe::not_defined(&wasm).map_err(anyhow::Error::msg)?;
-    if !bad.is_empty() {
-        bail!("the probe delegate imports {bad:?}, which the node refuses at instantiation");
-    }
+    // The same one call the import gate makes. Using `not_defined` alone
+    // here checked only the subset half, so this probe would have loaded an
+    // unwired delegate and reported every question against a module with no
+    // entry point.
+    probe::check(&wasm).map_err(|e| anyhow::anyhow!("the probe delegate is refused: {e}"))?;
 
     println!(
         "node: spawning on 127.0.0.1:{port} (temp tree {})",
@@ -224,6 +225,22 @@ async fn main() -> Result<()> {
         (None, Some(n)) => n.ws(),
         _ => unreachable!("one of the two is always set"),
     };
+    // A node this probe spawned is `local local` by construction. A borrowed
+    // one must be DECLARED, and an undeclared one is not assumed to be the
+    // convenient case.
+    let mode = match &existing {
+        None => "local".to_string(),
+        Some(_) => std::env::var("PROBE_MODE").unwrap_or_else(|_| "unstated".into()),
+    };
+    println!("node: mode = {mode}");
+    println!(
+        "note: every answer below was produced by a node in {mode} mode. \
+         Question 8 is MEASURED to differ between modes -- a delegate PUT is \
+         silently dropped in local mode and works in network mode -- so it is \
+         refused outside network mode. The other questions have NOT been \
+         compared across modes, so treat a local-mode answer to any of them \
+         as unconfirmed rather than as a platform fact."
+    );
     let (stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .context("connecting to the node")?;
@@ -441,10 +458,6 @@ async fn main() -> Result<()> {
     // A node this probe spawned is `local local` by construction. A borrowed
     // one must be declared, and an undeclared one is not assumed to be the
     // convenient case.
-    let mode = match &existing {
-        None => "local".to_string(),
-        Some(_) => std::env::var("PROBE_MODE").unwrap_or_else(|_| "unstated".into()),
-    };
     if mode != "network" {
         println!(
             "(8) NOT ASKED: this node is {}, and a delegate PUT is only \
