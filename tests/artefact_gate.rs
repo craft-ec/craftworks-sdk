@@ -218,7 +218,21 @@ fn write_arm_cases() -> Vec<Case> {
     cases
 }
 
-/// Everything this SDK's prolly writes is accepted by the released contract.
+/// Everything this SDK's prolly writes is accepted by the CURRENT contract.
+///
+/// The current one, and deliberately not every epoch.
+///
+/// READABLE under every epoch, WRITABLE under the current one. New writes go
+/// to the current epoch only (§3), so a writer has to satisfy that one; the
+/// corpus arm is what keeps older epochs' data readable. Conflating the two
+/// would make the epoch table read as "we must stay writable under
+/// everything ever released", which is a promise nobody made and which the
+/// upgrade procedure exists precisely to avoid having to keep.
+///
+/// `tests/corpus/epochs.md` records the difference this distinction is about:
+/// epoch 21ae7e73 predates the parity rule and refuses any branch that lists
+/// parity ids — which is every branch this SDK writes. So this SDK cannot
+/// write a tree deeper than a leaf under that epoch, and does not have to.
 #[test]
 fn every_block_this_sdk_writes_is_accepted_by_the_released_contract() {
     let mut c = Contract::load(&block_wasm()).expect("the released block.wasm must load");
@@ -660,4 +674,57 @@ fn parse_head(state: &[u8]) -> Option<(u64, Vec<u8>)> {
     let (vlen, rest) = rest.split_at_checked(2)?;
     let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
     Some((seq, rest.get(..vlen)?.to_vec()))
+}
+
+/// Writable under the CURRENT epoch; readable under every epoch.
+///
+/// Two different obligations, and the corpus table invites conflating them.
+/// This states the split in an assertion so it cannot be read the other way:
+/// the corpus (what must stay READABLE) is allowed to contain entries whose
+/// epoch lists differ, while the write arm targets one contract — the one in
+/// the contracts build, which is the current epoch.
+#[test]
+fn the_write_arm_targets_the_current_epoch_only() {
+    // The contract the write arm validates against IS the current build.
+    let current = block_wasm();
+    let repo = contracts_repo().expect("the contracts checkout");
+    let named = std::fs::read_to_string(repo.join("build/hashes.toml"))
+        .expect("build/hashes.toml, written by the contracts build");
+    // hashes.toml records what that build produced. Reading it here is not a
+    // gate on the hash — `released.toml`'s own note is emphatic that nothing
+    // should gate on a hash table — it is a check that the wasm the write arm
+    // loaded is the one that build wrote, rather than a stale file.
+    let want = named
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("block = \"sha256:"))
+        .map(|v| v.trim_end_matches('"').to_string())
+        .expect("hashes.toml names a block hash");
+    let got = sha256_short(&current);
+    assert!(
+        want.starts_with(&got),
+        "the write arm validated against a block.wasm ({got}...) that is not \
+         the one the contracts build produced ({}...). A stale artefact reads \
+         exactly like a passing gate.",
+        &want[..16.min(want.len())]
+    );
+
+    // And the corpus is the OTHER obligation. It may hold entries accepted by
+    // epochs the write arm does not target — that is the point of it.
+    let entries =
+        corpus::decode(&std::fs::read(corpus_path()).expect("the corpus")).expect("decodes");
+    let epoch_names: std::collections::BTreeSet<&str> = entries
+        .iter()
+        .flat_map(|e| e.epochs.iter().map(|s| s.as_str()))
+        .collect();
+    assert!(
+        epoch_names.len() >= 2,
+        "the corpus names {} epoch(s); with only one there is nothing to be \
+         readable-across and the distinction this test draws is empty",
+        epoch_names.len()
+    );
+    println!(
+        "  writable under the current epoch ({got}...); readable across {} \
+         epochs in the corpus",
+        epoch_names.len()
+    );
 }
