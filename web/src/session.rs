@@ -67,6 +67,47 @@ pub struct Session {
     /// SDK, not here, so it can be tested on a machine rather than only in a
     /// tab — which is what the first version of this recovery could not be.
     loads: craftworks_sdk::Loads,
+    /// The head's contract instance id, once `Identity` has named it.
+    ///
+    /// Zero until then, and zero for ever on a delegate that is not
+    /// provisioned — there is no head to subscribe to.
+    head_id: [u8; 32],
+    /// The head's id as the node NAMES it, so a notification can be matched.
+    head_named: String,
+    /// Head notifications for a contract this session is not watching.
+    ///
+    /// COUNTED, not described. The node chooses what it sends, and a page
+    /// that reacted to any of them would reload on somebody else's contract.
+    /// A count is also the thing that says whether it is happening at all.
+    foreign_notifications: usize,
+    /// Whether this connection has ASKED the node to watch the head.
+    ///
+    /// Reset on reconnect, not remembered: the node's copy of a subscription
+    /// outlives the engine's context and can be evicted at its cap without
+    /// anyone being told (F39), so a new connection asks again. Re-asking is
+    /// idempotent at the node, so it costs nothing when nothing was lost.
+    subscribed: bool,
+    /// Whether the node ACCEPTED it.
+    ///
+    /// Distinct from having asked, and the distinction is the whole point: a
+    /// page that believed it was being notified while it was actually
+    /// polling is the failure `LiveMode` exists to make impossible.
+    watching: bool,
+    /// Domains this page has bound, so a head move can name what is stale.
+    bound: std::collections::BTreeSet<String>,
+    /// When the subscribe request went out, so an unanswered one does not sit
+    /// at "asked" for ever.
+    asked_at_ms: u64,
+    /// The node refused to watch the head, in its own words. Display only.
+    watch_refused: String,
+    /// The head moved. Set by a notification, drained by the page.
+    ///
+    /// A HINT and never an authority: a fabricated one costs a reload, and a
+    /// reload can change nothing that the data does not verify. A SUPPRESSED
+    /// one costs nothing at all, because the tick re-reads the root anyway —
+    /// which is what makes being told an accelerator rather than the
+    /// mechanism.
+    head_moved: bool,
     /// The root the engine last reported standing on.
     ///
     /// A page is recorded against the root it was read at, and a page
@@ -110,6 +151,15 @@ impl Session {
             reported: 0,
             loads: craftworks_sdk::Loads::new(),
             head_root: [0u8; 32],
+            head_id: [0u8; 32],
+            head_named: String::new(),
+            subscribed: false,
+            foreign_notifications: 0,
+            watching: false,
+            head_moved: false,
+            bound: std::collections::BTreeSet::new(),
+            asked_at_ms: 0,
+            watch_refused: String::new(),
         })
     }
 
@@ -126,6 +176,7 @@ impl Session {
     /// every session.
     pub fn outbound(&mut self) -> Vec<js_sys::Uint8Array> {
         self.advance();
+        self.watch_head();
         self.envelope_engine_requests();
         self.out
             .iter()
@@ -157,8 +208,19 @@ impl Session {
                         Ok(protocol::Reply::Identity {
                             head_writable,
                             head_root,
+                            head_id,
                             ..
                         }) => {
+                            // Which contract the head IS. Without it a tab
+                            // that made no write can only poll: an
+                            // engine-originated push returns to whoever
+                            // invoked the delegate (F40).
+                            self.head_id = head_id;
+                            self.head_named = if head_id == [0u8; 32] {
+                                String::new()
+                            } else {
+                                wire::contract_id(head_id).to_string()
+                            };
                             // The root pages are recorded against. A page
                             // filed under the wrong root would make a stale
                             // range look current.
@@ -198,10 +260,24 @@ impl Session {
                 // is an input from a stranger.
                 self.plan.on_refused(&why.said);
             }
-            Incoming::HeadChanged { .. } => {
-                // A HINT. What it triggers is the same reload a tick does, so
-                // a fabricated one costs a reload and can change nothing on
-                // screen that the data does not verify.
+            Incoming::HeadChanged { key } => {
+                // ONLY for the head this session asked to watch.
+                //
+                // A notification names a contract, and the node chooses what
+                // it sends. Acting on any of them would let one unasked-for
+                // message make a page reload for ever. This is still a HINT
+                // even when it matches — what it triggers is the reload a
+                // tick would do anyway — but a hint about somebody else's
+                // contract is not even that.
+                // Compared as the node NAMES it. The engine reports a head
+                // as 32 bytes and the client API names contracts as strings;
+                // rendering ours the same way is the only comparison that is
+                // about the same thing.
+                if self.subscribed && !self.head_named.is_empty() && key == self.head_named {
+                    self.head_moved = true;
+                } else {
+                    self.foreign_notifications += 1;
+                }
             }
             Incoming::Unusable(why) => self.unusable.push(format!("{why:?}")),
             Incoming::Partial => {}
@@ -209,6 +285,19 @@ impl Session {
     }
 
     fn on_ack(&mut self, kind: AckKind) {
+        // The subscribe ack is matched by the KEY IT NAMES, never by
+        // position. Both acks arrive on one connection with no correlation
+        // id, so pairing by order would let a delegate registration confirm
+        // a subscription that was never accepted — which is harness#38's
+        // shape, and it has already been made once in this file.
+        if let AckKind::Subscribed(key) = &kind {
+            if *key == self.head_named && !self.head_named.is_empty() {
+                self.watching = true;
+            } else {
+                self.foreign_notifications += 1;
+            }
+            return;
+        }
         self.plan.on_ack(&kind);
         self.note_progress();
     }
@@ -333,6 +422,112 @@ impl Session {
     /// request rather than one each.
     pub fn loads_in_flight(&self) -> usize {
         self.loads.in_flight()
+    }
+
+    /// Ask the node to tell us when the head moves.
+    ///
+    /// Once per connection, and only once there IS a head: an unprovisioned
+    /// delegate has no Register to name.
+    fn watch_head(&mut self) {
+        if self.subscribed || self.head_id == [0u8; 32] || !self.plan.provisioned() {
+            return;
+        }
+        let id = wire::contract_id(self.head_id);
+        let stream = self.next_stream();
+        match wire::frame_subscribe(id, stream) {
+            Ok(frames) => {
+                self.out.extend(frames);
+                self.subscribed = true;
+                self.asked_at_ms = crate::js_now_ms();
+            }
+            Err(e) => self
+                .unusable
+                .push(format!("could not ask to watch the head: {e}")),
+        }
+    }
+
+    /// Which bound domains are stale, because the head moved. Drains.
+    ///
+    /// **Rust decides which, not the page.** A page that reloaded
+    /// "everything" on every notification would turn one write anywhere into
+    /// a full refetch of every screen; one that guessed would miss the domain
+    /// that changed. The session knows which domains have been bound.
+    ///
+    /// The head moving is a HINT. A missed notification costs nothing — the
+    /// tick re-reads the root regardless — and a spurious one costs a reload.
+    /// What it is NOT is a root: nothing here goes into the copy.
+    pub fn take_stale(&mut self) -> String {
+        if !std::mem::take(&mut self.head_moved) {
+            return "[]".into();
+        }
+        let stale: Vec<&String> = self.bound.iter().collect();
+        serde_json::to_string(&stale).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// A domain this page is showing, so a head move can name it.
+    ///
+    /// Recorded by the session rather than tracked in JS, because deciding
+    /// what to reload is a decision.
+    pub fn bind(&mut self, domain: &str) {
+        self.bound.insert(domain.to_string());
+    }
+
+    pub fn unbind(&mut self, domain: &str) {
+        self.bound.remove(domain);
+    }
+
+    /// How this session actually finds out that the head moved.
+    ///
+    /// REPORTED, never assumed. `HeadSubscribed` only after the node has
+    /// ACCEPTED the subscription — asking is not being answered — and
+    /// `Polled` says, in words, why it is not: the LIVE switch in a builder
+    /// shows which one a component really has, so a binding that silently
+    /// fell back to polling cannot look like one that did not.
+    pub fn live_mode(&self) -> String {
+        let waited = crate::js_now_ms().saturating_sub(self.asked_at_ms);
+        let tick = " The tick keeps the data right meanwhile.";
+        let (mode, why) = if self.watching {
+            ("HeadSubscribed", String::new())
+        } else if !self.watch_refused.is_empty() {
+            let said = &self.watch_refused;
+            (
+                "Polled",
+                format!("the node refused to watch the head: {said}.{tick}"),
+            )
+        } else if !self.plan.provisioned() {
+            (
+                "Polled",
+                "this node is not provisioned, so there is no head to watch".to_string(),
+            )
+        } else if self.head_id == [0u8; 32] {
+            (
+                "Polled",
+                "the engine has not named a head contract yet".to_string(),
+            )
+        } else if self.subscribed && waited > WATCH_ANSWER_MS {
+            // ASKED AND NEVER ANSWERED. Without this it sits at "asked" for
+            // ever and a page shows a subscription it does not have.
+            (
+                "Polled",
+                format!("asked to watch the head and the node never answered.{tick}"),
+            )
+        } else if self.subscribed {
+            (
+                "Polled",
+                "the node has not accepted the subscription yet".to_string(),
+            )
+        } else {
+            (
+                "Polled",
+                "no subscription has been asked for on this connection".to_string(),
+            )
+        };
+        serde_json::json!({
+            "mode": mode,
+            "why": why,
+            "foreignNotifications": self.foreign_notifications,
+        })
+        .to_string()
     }
 
     /// Take the next provisioning step, if there is one and nothing is in
@@ -519,6 +714,12 @@ impl Session {
     /// may have been sent before the socket dropped and arrive on the new one.
     pub fn reconnected(&mut self) {
         self.frames.reset();
+        // The node's copy of a subscription outlives the engine's context and
+        // can be evicted at its cap without anyone being told (F39), so this
+        // connection asks again. Idempotent at the node, so it costs nothing
+        // when nothing was lost.
+        self.subscribed = false;
+        self.watching = false;
     }
 
     // ---- the data surface -------------------------------------------
@@ -778,6 +979,14 @@ impl Session {
         .to_string()
     }
 }
+
+/// How long a subscribe request may go unanswered before this session says
+/// it is polling.
+///
+/// Not a claim about the network: a bound on the WAIT, so a page never shows
+/// a subscription it does not have. The tick keeps the data right either way,
+/// which is why this can be short.
+const WATCH_ANSWER_MS: u64 = 10_000;
 
 /// The request ids preload uses, kept away from the app's own.
 const PRELOAD_REQ_BASE: u64 = 1 << 32;

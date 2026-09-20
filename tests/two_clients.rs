@@ -13,7 +13,7 @@
 //! a binding correct, and it has its own test here.
 
 use craftworks_sdk::{Binding, EngineStore, LiveMode, Store as _, Transport};
-use engine_delegate::shell::{Inbound, Shell};
+use engine_delegate::shell::{Inbound, Shell, StoreFacts};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::cell::RefCell;
@@ -65,8 +65,7 @@ impl Conn {
             &self.ctx,
             engine::Params::default(),
             self.node.clone(),
-            true,
-            true,
+            StoreFacts::provisioned(),
         );
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");

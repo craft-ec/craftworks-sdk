@@ -262,6 +262,15 @@ pub fn frame_engine_request(
     frame_delegate_op(key, &Parameters::from(vec![]), payload, stream_id)
 }
 
+/// A contract's instance id, from the 32 bytes that name it.
+///
+/// So a caller can hold one without depending on freenet itself — the same
+/// reason `DelegateKey` is re-exported. The engine reports a head as 32
+/// bytes; this is what turns those into something the client API will accept.
+pub fn contract_id(bytes: [u8; 32]) -> ContractInstanceId {
+    ContractInstanceId::new(bytes)
+}
+
 /// Frame a client-API subscription to a contract.
 ///
 /// This is the notifier that reaches a connection which made no write: an

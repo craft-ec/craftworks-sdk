@@ -72,6 +72,7 @@ fn v1_session() -> Session {
         head_seq: 2,
         head_root: [0xAB; 32],
         head_writable: true,
+        head_id: [0xCD; 32],
     });
     recv(Reply::WriteState {
         write_id: 1,

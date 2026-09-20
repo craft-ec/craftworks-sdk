@@ -158,13 +158,13 @@ await withGlobalSocket(async () => {
   conn.subscribeHead("head-2");
   assert.deepEqual(conn.watching, ["head-1", "head-2"]);
 
-  const before = seen.filter(k => k === "head-watch-pending").length;
+  const before = seen.filter(k => k === "head-watch-recorded").length;
   FakeSocket.last.drop();
   // The wrapper reconnects on a timer; drive it by opening the next socket.
   await new Promise(ok => setTimeout(ok, 400));
   {
     FakeSocket.last.open();
-    const after = seen.filter(k => k === "head-watch-pending").length;
+    const after = seen.filter(k => k === "head-watch-recorded").length;
     assert.ok(
       after > before,
       "a reconnect did not re-assert the watched heads; the node's copy can be " +
@@ -178,7 +178,16 @@ await withGlobalSocket(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// It does not claim to have subscribed when it cannot.
+// THIS FILE NEVER INVENTS A FRAME.
+//
+// The encoder exists now and it is in Rust: `wire` frames the subscribe, the
+// session decides when to send one, and the bytes arrive through the ordinary
+// outbound queue. What must stay true is that this file does not put a
+// client-API request on the socket by itself — the first version invented one
+// (`JSON.stringify({subscribe, delegate})`) on a socket carrying the native
+// encoding, and nothing would have accepted it. The failure would have been a
+// subscription that silently never existed, which from inside an app is
+// indistinguishable from a tree that stopped changing.
 // ---------------------------------------------------------------------------
 await withGlobalSocket(async () => {
   const seen = [];
@@ -189,16 +198,17 @@ await withGlobalSocket(async () => {
   const before = sock.sent.length;
 
   const ok = conn.subscribeHead("head-1");
-  assert.equal(ok, false, "subscribeHead claimed to have subscribed");
+  assert.equal(ok, true, "it did not record the intention to watch a head");
   assert.equal(
     sock.sent.length, before,
-    "a frame was put on the socket for a client-API request this side cannot " +
-    "encode — the first version invented one, and nothing would have accepted it",
+    "a frame was put on the socket by this file. The subscribe bytes come " +
+    "from Rust, through outbound(), like every other request",
   );
   assert.ok(
-    seen.some(e => e.kind === "head-watch-pending" && e.why),
-    "the caller was not told that nothing is subscribed, or not told why",
+    seen.some(e => e.kind === "head-watch-recorded" && e.head === "head-1"),
+    "the caller was not told which head is being watched",
   );
+  assert.deepEqual(conn.watching, ["head-1"]);
   conn.close();
-  console.log("ok connection: it reports that it cannot subscribe rather than guessing a frame");
+  console.log("ok connection: it records a head to watch and invents no frame");
 });

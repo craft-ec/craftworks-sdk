@@ -103,17 +103,23 @@ export function connect(engine, { url, delegateKey, onEvent = () => {} } = {}) {
    * a subscription that silently never existed — which is indistinguishable,
    * from inside the app, from a tree that simply stopped changing.
    *
-   * So the intention is RECORDED and the fact that nothing is subscribed is
-   * reported, rather than a frame being guessed. What is missing is a
-   * client-API encoder on this side; the Rust half of the notifier is built
-   * and tested (sdk#46). Where that encoder lives is a decision, not work:
-   * the SDK's boundary gate keeps `freenet-stdlib` out of its normal
-   * dependencies on purpose.
+   * THE ENCODER NOW EXISTS AND IT IS IN RUST. `wire` frames the subscribe,
+   * the session decides when to send one, and the bytes arrive here through
+   * the ordinary outbound queue like everything else. So this file does not
+   * subscribe to anything: it moves bytes, and the decision about which
+   * contract to watch, and whether the node accepted, belongs where every
+   * other decision does.
+   *
+   * What remains here is the RE-ASSERTION on reconnect, which is a property
+   * of this socket rather than of the engine: the node's copy of a
+   * subscription outlives the engine's context and can be evicted at its cap
+   * without anyone being told (F39). The session is told the connection is
+   * new and asks again.
    */
   const subscribeHead = head => {
     watched.add(head);
-    onEvent({ kind: "head-watch-pending", head, why: "no client-API encoder on this side yet" });
-    return false;
+    onEvent({ kind: "head-watch-recorded", head });
+    return true;
   };
 
   open();

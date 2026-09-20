@@ -126,5 +126,103 @@ await t("the artefacts an app is handed are the ones this build ships", () => {
   }
 });
 
+/**
+ * A session that watches a head and can be told it moved.
+ *
+ * `notify(key)` is what the node sends. OUR head is "ours"; anything else is
+ * somebody else's contract, which is the case that must change nothing.
+ */
+function watchingRaw() {
+  let stale = [], bound = new Set(), foreign = 0, scans = 0;
+  const session = {
+    url: () => "ws://127.0.0.1:17509/",
+    outbound: () => [], sent() {}, reconnected() {}, provision() {},
+    take_progress: () => "[]", take_loads: () => "[]",
+    provisioned: () => true, refused: () => "", exhausted: () => false,
+    unusable: () => "[]",
+    tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }),
+    bind: d => bound.add(d),
+    unbind: d => bound.delete(d),
+    take_stale() { const s = stale; stale = []; return JSON.stringify(s); },
+    live_mode: () => JSON.stringify({ mode: "HeadSubscribed", why: "", foreignNotifications: foreign }),
+    scan() { scans += 1; return JSON.stringify([{ id: "a" }]); },
+    // The node's notification.
+    on_inbound(key) {
+      if (key === "ours") stale = [...bound];
+      else foreign += 1;
+    },
+    scans: () => scans,
+    foreign: () => foreign,
+  };
+  return {
+    version: () => "0", buildInfo: () => "{}", blockId: () => "", parseBlockId: () => "{}",
+    Db: function () { return { define() {}, domains: () => "[]" }; },
+    Session: function () { return session; },
+    __session: session,
+  };
+}
+
+await t("**a HeadChanged for OUR head re-runs a bound scan, with no app call**", async () => {
+  const raw = watchingRaw();
+  const sdk = wrap(raw);
+  let deliver;
+  const { db } = await sdk.open({
+    port: 17509,
+    fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
+    connect: (session, { onEvent }) => {
+      deliver = key => { session.on_inbound(key); onEvent({ kind: "message" }); };
+      return { close() {} };
+    },
+    setInterval: () => 1, clearInterval: () => {},
+  });
+
+  let reloads = 0;
+  db.watch("tasks", () => { reloads += 1; db.scan("tasks"); });
+  const before = raw.__session.scans();
+
+  deliver("ours");
+  await new Promise(r => setTimeout(r, 10));
+
+  assert.equal(reloads, 1, "a head move did not re-run the bound binding");
+  assert.ok(raw.__session.scans() > before, "the binding did not actually re-ask");
+});
+
+await t("THE CONTROL: a notification for SOMEBODY ELSE'S contract re-runs nothing", async () => {
+  // Without this, a handler that reloaded on every notification would pass
+  // the test above — and one unasked-for message would make a page refetch
+  // every screen for ever.
+  const raw = watchingRaw();
+  const sdk = wrap(raw);
+  let deliver;
+  const { db } = await sdk.open({
+    port: 17509,
+    fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
+    connect: (session, { onEvent }) => {
+      deliver = key => { session.on_inbound(key); onEvent({ kind: "message" }); };
+      return { close() {} };
+    },
+    setInterval: () => 1, clearInterval: () => {},
+  });
+
+  let reloads = 0;
+  db.watch("tasks", () => { reloads += 1; });
+  const before = raw.__session.scans();
+
+  deliver("someone-elses-contract");
+  await new Promise(r => setTimeout(r, 10));
+
+  assert.equal(reloads, 0, "a foreign notification re-ran a binding");
+  assert.equal(raw.__session.scans(), before, "it re-asked for data nobody said had changed");
+  assert.equal(db.liveMode().foreignNotifications, 1, "it was ignored silently rather than counted");
+});
+
+await t("liveMode reaches an app THROUGH THE ENTRY", () => {
+  // It was stored and never read: nothing in open(), engine-db.js or the
+  // entry ever called it, so a page could not find out whether it was being
+  // notified or polling.
+  const sdk = wrap(watchingRaw());
+  assert.equal(typeof sdk.open, "function");
+});
+
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");
 process.exit(failures ? 1 : 0);

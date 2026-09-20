@@ -257,6 +257,20 @@ pub enum Reply {
         /// Whether this delegate can sign and publish a head — i.e. whether
         /// it has been provisioned.
         ///
+        /// The head's CONTRACT INSTANCE ID, or all zeroes if there is none.
+        ///
+        /// A public address, not a secret: it is what any node routes on, and
+        /// it says nothing about the key that signs the head.
+        ///
+        /// Without it a page cannot subscribe to its own head, and a tab that
+        /// made no write can only poll — an engine-originated push returns to
+        /// whoever invoked the delegate (F40), so the client API is the only
+        /// way to be TOLD. The delegate has always derived this to tell a
+        /// head read-back from a block; it simply never crossed.
+        ///
+        /// Zero exactly when `head_writable` is false: both come from having
+        /// the Register's code and parameters.
+        head_id: [u8; 32],
         /// PRESENCE ONLY: it says that a key is there, never which, and
         /// nothing derived from it. A page reads this to decide whether to
         /// install; `false` with a non-zero `head_seq` cannot happen and

@@ -17,7 +17,7 @@
 
 use craftworks_sdk::store::Store as _;
 use craftworks_sdk::{CachedStore, Loads};
-use engine_delegate::shell::{Inbound, Shell};
+use engine_delegate::shell::{Inbound, Shell, StoreFacts};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::cell::RefCell;
@@ -66,8 +66,7 @@ impl Node {
             &self.ctx,
             engine::Params::default(),
             self.store.clone(),
-            true,
-            true,
+            StoreFacts::provisioned(),
         );
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");
