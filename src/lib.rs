@@ -7,6 +7,7 @@
 
 pub mod binding;
 pub mod blockid;
+pub mod copy;
 pub mod db;
 pub mod engine_client;
 pub mod id;
@@ -20,6 +21,7 @@ pub mod tree_store;
 mod engine_store;
 pub use binding::{Binding, LiveMode, Reloads};
 pub use blockid::{BlockId, ContentHash, IdError};
+pub use copy::{Copy as LocalCopy, PendingWrite, RolledBack, Told, Visible};
 pub use db::{Db, Record, Scan};
 pub use engine_client::{Client, Event as EngineEvent};
 pub use engine_store::{EngineStore, Page, Transport};
