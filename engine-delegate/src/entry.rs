@@ -122,9 +122,41 @@ impl DelegateInterface for EngineDelegate {
                         ),
                     ));
                 }
-                // The head lives in the Register contract, which slice 4's
-                // live run wires up; until then it is not emitted here.
-                Op::Head { .. } | Op::ReadHead { .. } => {}
+                // The head is a Register record, and writing it means
+                // SIGNING it. Everything needed was provisioned by `Install`
+                // and none of it is derived here.
+                Op::Head { seq, root } => {
+                    let (Some(rc), Some(rp), Some(sk)) = (
+                        ctx.get_secret(REGISTER_CODE),
+                        ctx.get_secret(REGISTER_PARAMS),
+                        ctx.get_secret(SIGNING_KEY),
+                    ) else {
+                        continue;
+                    };
+                    // A head this delegate cannot sign is one the contract
+                    // would refuse on arrival, and the commit would then wait
+                    // for a confirmation that is never coming. Dropping it
+                    // here reaches the same place without the round trip.
+                    let Ok(state) = crate::register::head_state(&rp, &sk, seq, &root) else {
+                        continue;
+                    };
+                    let container =
+                        ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+                            std::sync::Arc::new(ContractCode::from(rc)),
+                            Parameters::from(rp),
+                        )));
+                    msgs.push(OutboundDelegateMsg::PutContractRequest(
+                        PutContractRequest::new(
+                            container,
+                            WrappedState::new(state),
+                            RelatedContracts::default(),
+                        ),
+                    ));
+                }
+                // The head Register is read by its own key, which the shell
+                // asks for through `Op::Get` on that contract; a bare
+                // ReadHead has no block to name.
+                Op::ReadHead { .. } => {}
             }
         }
         for r in out.replies {

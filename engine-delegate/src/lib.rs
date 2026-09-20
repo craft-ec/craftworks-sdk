@@ -13,6 +13,7 @@
 
 pub mod blocks;
 mod entry;
+pub mod register;
 pub mod schedule;
 pub mod shell;
 pub mod wire;
