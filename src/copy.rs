@@ -59,6 +59,11 @@ pub struct PendingWrite {
     pub declared_base: Option<[u8; 32]>,
 }
 
+/// A write waiting to be sent again: its id, and all of its edits.
+///
+/// `None` for a value is a DELETE, as it is in [`PendingWrite`].
+pub type QueuedWrite = (u64, Vec<(Vec<u8>, Option<Vec<u8>>)>);
+
 /// What a key looks like to a component right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Visible {
@@ -629,6 +634,56 @@ impl Copy {
     }
 
     /// Write ids still waiting on a verdict.
+    /// THE OLDEST QUEUED WRITE, with everything needed to send it again.
+    ///
+    /// A write the engine answered `Busy` is one it refused and did not
+    /// apply — "the client still holds the write and may re-submit it". This
+    /// is the client holding it. Nothing re-sent them, so they sat here until
+    /// `time_out` rolled them back and their rows vanished from the screen
+    /// (sdk#106).
+    ///
+    /// ONE, and the oldest, because the engine takes one commit at a time and
+    /// because writes must land in the order they were made: a later edit to
+    /// the same key arriving first would leave the network holding the older
+    /// value. Ordered by `write_id`, which is issued in that order.
+    ///
+    /// All the edits of that write together — a multi-key write is all or
+    /// nothing on the wire as it is in the copy.
+    pub fn oldest_queued(&self) -> Option<QueuedWrite> {
+        let mut best: Option<u64> = None;
+        for e in self.keys.values() {
+            for w in &e.pending {
+                if w.queued && best.is_none_or(|b| w.write_id < b) {
+                    best = Some(w.write_id);
+                }
+            }
+        }
+        let id = best?;
+        let mut edits: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        for (k, e) in &self.keys {
+            for w in &e.pending {
+                if w.write_id == id {
+                    edits.push((k.clone(), w.value.clone()));
+                }
+            }
+        }
+        edits.sort_by(|a, b| a.0.cmp(&b.0));
+        Some((id, edits))
+    }
+
+    /// How many writes are waiting to be sent again.
+    pub fn queued_count(&self) -> usize {
+        let mut ids = std::collections::BTreeSet::new();
+        for e in self.keys.values() {
+            for w in &e.pending {
+                if w.queued {
+                    ids.insert(w.write_id);
+                }
+            }
+        }
+        ids.len()
+    }
+
     pub fn pending_ids(&self) -> Vec<u64> {
         let mut v: Vec<u64> = self
             .keys

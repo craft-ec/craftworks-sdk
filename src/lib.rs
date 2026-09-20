@@ -39,7 +39,7 @@ pub const CONTRACTS_REV: &str = env!("SDK_CONTRACTS_REV");
 
 pub use blockid::{BlockId, ContentHash, IdError};
 pub use cached_store::CachedStore;
-pub use copy::{Copy as LocalCopy, PendingWrite, Refused, RolledBack, Told, Visible};
+pub use copy::{Copy as LocalCopy, PendingWrite, QueuedWrite, Refused, RolledBack, Told, Visible};
 pub use db::{Db, DbError, Record, Scan};
 pub use engine_client::{Client, Event as EngineEvent};
 pub use engine_store::{EngineStore, Page, Transport};
