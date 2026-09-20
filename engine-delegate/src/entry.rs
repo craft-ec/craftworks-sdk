@@ -99,6 +99,7 @@ impl DelegateInterface for EngineDelegate {
             InboundDelegateMsg::ApplicationMessage(_) => crate::wire::Saw::Client,
             InboundDelegateMsg::GetContractResponse(_) => crate::wire::Saw::GetResponse,
             InboundDelegateMsg::PutContractResponse(_) => crate::wire::Saw::PutResponse,
+            InboundDelegateMsg::UpdateContractResponse(_) => crate::wire::Saw::UpdateResponse,
             _ => crate::wire::Saw::Other,
         };
         // What block a response is about, if this is one and the pairing was
@@ -161,6 +162,17 @@ impl DelegateInterface for EngineDelegate {
                     }
                 }
             }
+            // The head's ack when the bump was an UPDATE. Same meaning as
+            // the PUT one: accepted, not confirmed — the head is still read
+            // back before the commit publishes.
+            InboundDelegateMsg::UpdateContractResponse(r) => {
+                if let Err(e) = &r.result {
+                    node_said = e.clone();
+                }
+                Inbound::HeadAcked {
+                    ok: r.result.is_ok(),
+                }
+            }
             // The HEAD's own ack. It arrives as a PutContractResponse like
             // any other, and only this point can tell that the contract it
             // names is the Register — the shell would otherwise try to read
@@ -206,6 +218,7 @@ impl DelegateInterface for EngineDelegate {
         };
 
         let code = ctx.get_secret(BLOCK_CODE);
+        let head_exists = Shell::<NodeBlocks>::peek_head_exists(&carried);
         let (out, saved, installing) = {
             let blocks = NodeBlocks::with_code(ctx, code.clone());
             let mut shell = Shell::resume_with(&carried, Params::default(), blocks, code.is_some());
@@ -251,6 +264,10 @@ impl DelegateInterface for EngineDelegate {
         let mut no_head = false;
         // Blocks whose id does not hash their own bytes under any kind.
         let mut unknown_kind = 0usize;
+        // What the head bump cost this call, by route. Reported rather than
+        // asserted: the saving is a measurement and belongs in the output.
+        let mut head_put_bytes = 0usize;
+        let mut head_update_bytes = 0usize;
         // contract id -> the block id the engine knows it by.
         let mut asked: Vec<([u8; 32], [u8; 32])> = Vec::new();
         for op in out.ops {
@@ -275,18 +292,32 @@ impl DelegateInterface for EngineDelegate {
                         unknown_kind += 1;
                         continue;
                     };
-                    // A PACK is a TRANSPORT, and nothing on the node unpacks
-                    // one. What a reader asks for is a MEMBER, by its own id,
+                    // A PACK is a TRANSPORT, and nothing on the node
+                    // unpacks one: a reader asks for a MEMBER by its own id,
                     // and a member that exists only inside a pack is a block
-                    // the engine cannot read back — which is exactly what
-                    // happened: the write published and the very next read of
-                    // it answered `Unavailable(root)`.
+                    // the engine cannot read back. That is what happened —
+                    // the write published and the very next read of it
+                    // answered `Unavailable(root)`.
                     //
-                    // So the members are put under their own ids. The pack
-                    // existed to beat a low per-call PUT limit, and that
-                    // limit turned out not to exist — 64 PUTs from one
-                    // process() return are accepted, measured — so unpacking
-                    // here costs nothing the pack was buying.
+                    // The pack was never about a per-call PUT limit. It
+                    // exists because a contract's CODE rides every put at
+                    // every hop (F18/F28), so one large put beats several
+                    // small ones on every axis (F30) — ~190 KiB as one pack
+                    // against ~2 MB as individual puts, for a 17-block
+                    // commit.
+                    //
+                    // It is off the WRITE path in Phase 3 all the same,
+                    // because a pack is transient: a head names only a few
+                    // and one leaves as soon as it is unpacked, so the
+                    // network holds pack AND members either way and the pack
+                    // only moves who pays for the members. With no keepers
+                    // yet, that is the writer both times — as built, ~188 KiB
+                    // per commit for a pack nothing reads. Phase 4 (#39) puts
+                    // it back with the other half: the writer puts the pack
+                    // only, keepers put the members, reads resolve through
+                    // the head's packs.
+                    //
+                    // This arm stays for a commit that DOES ship a pack.
                     if state[0] == 6 {
                         for (mid, mbytes) in engine::pack::members(&bytes) {
                             let Some(mstate) = block_state(&mid, &mbytes) else {
@@ -332,18 +363,41 @@ impl DelegateInterface for EngineDelegate {
                     let Ok(state) = crate::register::head_state(&rp, &sk, seq, &root) else {
                         continue;
                     };
-                    let container =
-                        ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
-                            std::sync::Arc::new(ContractCode::from(rc)),
-                            Parameters::from(rp),
-                        )));
-                    msgs.push(OutboundDelegateMsg::PutContractRequest(
-                        PutContractRequest::new(
-                            container,
-                            WrappedState::new(state),
-                            RelatedContracts::default(),
-                        ),
-                    ));
+                    // CREATE once, UPDATE thereafter.
+                    //
+                    // A PUT carries the contract's CODE, and code rides every
+                    // put at every hop (F18/F28). The Register's wasm is
+                    // ~157 KiB, which for a small commit is more than half
+                    // the uplink — spent re-sending code the node already
+                    // has. An update names the contract by id alone.
+                    //
+                    // The first bump has no choice: the contract does not
+                    // exist until something creates it, and creating it is
+                    // what carries the code.
+                    if head_exists {
+                        head_update_bytes += state.len();
+                        msgs.push(OutboundDelegateMsg::UpdateContractRequest(
+                            UpdateContractRequest::new(
+                                ContractInstanceId::new(head_id.unwrap_or_default()),
+                                UpdateData::State(State::from(state)),
+                            ),
+                        ));
+                    } else {
+                        let container = ContractContainer::from(ContractWasmAPIVersion::V1(
+                            WrappedContract::new(
+                                std::sync::Arc::new(ContractCode::from(rc.clone())),
+                                Parameters::from(rp),
+                            ),
+                        ));
+                        head_put_bytes += rc.len() + state.len();
+                        msgs.push(OutboundDelegateMsg::PutContractRequest(
+                            PutContractRequest::new(
+                                container,
+                                WrappedState::new(state),
+                                RelatedContracts::default(),
+                            ),
+                        ));
+                    }
                 }
                 // Read the head: a GET of the Register this delegate was
                 // told holds it. Without a Register it cannot be asked for,
@@ -411,6 +465,8 @@ impl DelegateInterface for EngineDelegate {
             no_code: out.refused_no_code,
             dropped: out.dropped.len() + unknown_kind,
             awaiting: out.awaiting,
+            head_put: head_put_bytes,
+            head_update: head_update_bytes,
             read_back: out.read_back_hits,
             effects: out.effects,
             note: if node_said.is_empty() {

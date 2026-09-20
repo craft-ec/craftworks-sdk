@@ -381,6 +381,7 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
             // everything and the window this control exists to open is never
             // open — which is what the assertion below caught.
             max_packed_value: 512,
+            pack_on_write: true,
             ..Params::default()
         },
     );

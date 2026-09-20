@@ -280,6 +280,17 @@ pub struct Params {
     pub max_pack: usize,
     /// A value at or under this rides inside a pack; above it, its own PUT.
     pub max_packed_value: usize,
+    /// Whether a commit ships a PACK as well as its blocks.
+    ///
+    /// FALSE in Phase 3, and the reason is arithmetic rather than taste: a
+    /// pack is transient, so the network holds pack + members either way and
+    /// the pack only moves who pays. With no keepers, that is the writer
+    /// both times.
+    ///
+    /// Kept as a parameter, not deleted, because Phase 4 turns it back on
+    /// with the other half in place — keepers putting the members, and reads
+    /// resolving through the head's packs.
+    pub pack_on_write: bool,
     /// Accepted-but-not-durable bytes beyond which a `Write` is refused. A
     /// queue with no bound is a queue that eventually eats the node.
     pub max_backlog: usize,
@@ -437,6 +448,7 @@ impl Default for Params {
         Params {
             max_pack: 1024 * 1024,
             max_packed_value: 64 * 1024,
+            pack_on_write: false,
             max_backlog: 8 * 1024 * 1024,
             parity_age: 32,
             coalesce_parity: true,
@@ -1568,11 +1580,29 @@ impl<B: Blocks> Engine<B> {
             self.told_stalled.remove(w);
         }
 
-        // Big values do not ride in a pack: one PUT each, and the pack stays
-        // within a size the network is willing to move.
-        let (packable, direct): (Vec<_>, Vec<_>) = emitted
-            .into_iter()
-            .partition(|(_, b)| b.len() <= self.params.max_packed_value);
+        // PHASE 3 WRITES MEMBERS, NOT PACKS.
+        //
+        // A pack is a transport and it is inherently TRANSIENT: a head names
+        // at most a few, and one leaves the network as soon as it is
+        // unpacked. So the total is always pack PLUS members — a pack only
+        // changes WHO pays for the members, and with no keepers in Phase 3
+        // the writer pays for them anyway. Sending both cost ~188 KiB per
+        // commit for a pack nothing reads.
+        //
+        // What makes members-only need no new read path is F35: a delegate's
+        // own PUT is HOSTED, so a member it wrote is readable at its own key.
+        //
+        // The pack FORMAT stays — kind, pack.rs, its vectors — because Phase
+        // 4 (#39) is where it earns its place: the writer puts the pack only,
+        // keepers put the members, and reads resolve through the head's
+        // packs. This is the write path, not the format.
+        let (packable, direct): (Vec<_>, Vec<_>) = if self.params.pack_on_write {
+            emitted
+                .into_iter()
+                .partition(|(_, b)| b.len() <= self.params.max_packed_value)
+        } else {
+            (Vec::new(), emitted)
+        };
 
         let manifest = pack::Manifest {
             prev_seq: self.published_seq,
@@ -1611,8 +1641,12 @@ impl<B: Blocks> Engine<B> {
             current.push((pack::member_kind(&b), b));
         }
         // A commit that emitted nothing packable still ships its manifest: the
-        // journal entry is the point, not the payload.
-        packs.push(current);
+        // journal entry is the point, not the payload. With packing off the
+        // write path there is no pack at all — the head IS the journal, and
+        // a manifest nobody will read is bytes nobody should pay for.
+        if self.params.pack_on_write {
+            packs.push(current);
+        }
 
         let mut pack_bodies: BTreeMap<Cid, Vec<u8>> = BTreeMap::new();
         for members in packs {

@@ -91,7 +91,14 @@ fn the_empty_leaf_is_the_only_block_the_core_knows_and_it_hashes_to_its_id() {
 #[test]
 fn a_context_round_trips_and_refuses_what_it_cannot_read() {
     let mut store = Store::default();
-    let mut e = Engine::new(Params::default(), store.clone());
+    // ABOUT the pack path: the property is that a pack's BYTES never ride in
+    // the context. Phase 3 leaves packing off the write path, so this turns
+    // it on to have a pack to look for at all.
+    let packed = Params {
+        pack_on_write: true,
+        ..Params::default()
+    };
+    let mut e = Engine::new(packed, store.clone());
     let out = e.step(Event::Write {
         client: ClientId(1),
         write_id: WriteId(1),
@@ -111,8 +118,8 @@ fn a_context_round_trips_and_refuses_what_it_cannot_read() {
 
     let bytes = e.to_context().expect("a context");
     let root = e.root();
-    let back = Engine::from_context(&bytes, Params::default(), store.clone())
-        .expect("its own context reads back");
+    let back =
+        Engine::from_context(&bytes, packed, store.clone()).expect("its own context reads back");
     assert_eq!(back.root(), root, "the root did not survive the round trip");
 
     // Garbage, truncation and a wrong version are REFUSED, never a panic:
@@ -124,7 +131,7 @@ fn a_context_round_trips_and_refuses_what_it_cannot_read() {
         bytes[..bytes.len() / 2].to_vec(),
     ] {
         assert!(
-            Engine::from_context(&bad, Params::default(), store.clone()).is_err(),
+            Engine::from_context(&bad, packed, store.clone()).is_err(),
             "a context of {} byte(s) was accepted",
             bad.len()
         );

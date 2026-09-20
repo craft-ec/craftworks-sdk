@@ -442,58 +442,76 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     let mut directs = 0usize;
     let mut retries_seen = 0usize;
     let mut max_context = 0usize;
-    for seed in 1..=24u64 {
-        let l = sweep_seed(Mode::Live, Params::default(), seed);
-        let d = sweep_seed(Mode::Rehydrate, Params::default(), seed);
+    // BOTH write paths. Phase 3 ships members only; Phase 4 (#39) turns the
+    // pack back on, and the format has to keep working until then — a sweep
+    // over one of them would let the other rot with nothing to say so.
+    for (arm, params) in [
+        ("members", Params::default()),
+        (
+            "packed",
+            Params {
+                pack_on_write: true,
+                ..Params::default()
+            },
+        ),
+    ] {
+        for seed in 1..=24u64 {
+            let l = sweep_seed(Mode::Live, params, seed);
+            let d = sweep_seed(Mode::Rehydrate, params, seed);
 
-        assert_eq!(
-            l.published, d.published,
-            "seed {seed}: an engine rebuilt from its context between every \
+            assert_eq!(
+                l.published, d.published,
+                "seed {seed}: an engine rebuilt from its context between every \
              step published a different root from one that survived, so \
              something the pipeline needs is not in the context"
-        );
-        for s in [&l, &d] {
-            assert_eq!(
-                s.published, s.expected,
-                "seed {seed}: the published root is not the root a rebuild \
-                 produces"
             );
-        }
-        // And no write was silently dropped, or reported an impossible life.
-        for s in [&l, &d] {
-            for (client, id) in &s.live {
-                let states = s.seen.of(*client, *id);
-                assert!(
-                    !states.is_empty(),
-                    "seed {seed}: write {id} was never reported at all"
-                );
-                assert!(
-                    valid_sequence(states),
-                    "seed {seed}: write {id} reported an impossible sequence: \
-                     {states:?}"
+            for s in [&l, &d] {
+                assert_eq!(
+                    s.published, s.expected,
+                    "seed {seed}: the published root is not the root a rebuild \
+                 produces"
                 );
             }
+            // And no write was silently dropped, or reported an impossible life.
+            for s in [&l, &d] {
+                for (client, id) in &s.live {
+                    let states = s.seen.of(*client, *id);
+                    assert!(
+                        !states.is_empty(),
+                        "seed {seed}: write {id} was never reported at all"
+                    );
+                    assert!(
+                        valid_sequence(states),
+                        "seed {seed}: write {id} reported an impossible sequence: \
+                     {states:?}"
+                    );
+                }
+            }
+            // The states themselves must agree too: a rehydrate that reaches the
+            // right root while telling a client something different is still a
+            // bug the root comparison cannot see.
+            assert_eq!(
+                l.seen, d.seen,
+                "seed {seed}: the two modes reported different write states"
+            );
+            pack_failures += l.pack_failures + d.pack_failures;
+            direct_failures += l.direct_failures + d.direct_failures;
+            directs += l.directs + d.directs;
+            retries_seen += l.retries + d.retries;
+            max_context = max_context.max(d.max_context);
+            println!("  {arm} seed {seed:2}: both modes match a rebuild");
         }
-        // The states themselves must agree too: a rehydrate that reaches the
-        // right root while telling a client something different is still a
-        // bug the root comparison cannot see.
-        assert_eq!(
-            l.seen, d.seen,
-            "seed {seed}: the two modes reported different write states"
-        );
-        pack_failures += l.pack_failures + d.pack_failures;
-        direct_failures += l.direct_failures + d.direct_failures;
-        directs += l.directs + d.directs;
-        retries_seen += l.retries + d.retries;
-        max_context = max_context.max(d.max_context);
-        println!("  seed {seed:2}: both modes match a rebuild");
     }
     // Without this the sweep can inject failures that never land on a pack and
     // report green over a branch it never entered.
+    // The pack arm must have hit the pack path. With packing off the write
+    // path this counts zero for the members arm, which is correct and is why
+    // the sweep runs both.
     assert!(
         pack_failures > 0,
-        "{retries_seen} put failures were injected and NONE hit a pack: the \
-         pack retry path was not exercised"
+        "{retries_seen} put failures were injected and NONE hit a pack across \
+         BOTH arms: the pack retry path was not exercised, and Phase 4 is \
+         where it comes back"
     );
     // The other half of the same floor. A pack retry and a direct-block retry
     // are different branches, and a sweep whose values are all small emits no
@@ -711,8 +729,10 @@ fn a_group_written_continuously_is_still_protected_within_the_age_bound() {
 fn an_opaque_value_passes_through_untouched() {
     let mut e = common::new_store_params(Params {
         // Small enough that the large value takes its own PUT, so both paths
-        // are exercised in one test.
+        // are exercised in one test — which needs the pack path ON, since
+        // Phase 3 leaves it off and there would otherwise be only one path.
         max_packed_value: 4096,
+        pack_on_write: true,
         ..Params::default()
     });
     let mut seen = Seen::default();

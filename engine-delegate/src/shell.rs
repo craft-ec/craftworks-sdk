@@ -90,6 +90,14 @@ struct ShellState {
     awaiting: Vec<(Cid, u32)>,
     /// A head written and not yet read back, with the root it named.
     head: Option<(u64, Cid)>,
+    /// Whether the head Register is known to EXIST on the node.
+    ///
+    /// The first bump has to create it, and creating a contract means
+    /// carrying its code. Every bump after that is an update to a contract
+    /// the node already has, and an update names it by id alone — which is
+    /// the difference between shipping ~157 KiB of register.wasm per commit
+    /// and shipping the record.
+    head_exists: bool,
     /// Contract id -> the block id the engine knows it by, for requests that
     /// are still out.
     ///
@@ -118,6 +126,7 @@ pub struct Shell<B: Blocks> {
     pub engine: Engine<B>,
     awaiting: BTreeMap<Cid, u32>,
     head: Option<(u64, Cid)>,
+    head_exists: bool,
     outstanding: Vec<(Cid, Cid)>,
     /// Bytes of contract code this call was asked to install, if any.
     pub installed: Option<usize>,
@@ -161,6 +170,9 @@ impl<B: Blocks> Shell<B> {
             ),
             None => (Vec::new(), BTreeMap::new(), None, Vec::new()),
         };
+        let head_exists = bincode::deserialize::<Carried>(ctx)
+            .map(|c| c.shell.head_exists)
+            .unwrap_or(false);
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         Shell {
             engine,
@@ -168,6 +180,10 @@ impl<B: Blocks> Shell<B> {
             // it did not resume, so they go with it.
             awaiting: if resumed { awaiting } else { BTreeMap::new() },
             head: if resumed { head } else { None },
+            // NOT reset with the engine: the Register exists on the node
+            // whether or not this engine remembers writing it, and claiming
+            // otherwise would make the next bump ship the code again.
+            head_exists,
             outstanding: if resumed { outstanding } else { Vec::new() },
             installed: None,
             provisioned: false,
@@ -184,6 +200,7 @@ impl<B: Blocks> Shell<B> {
             shell: ShellState {
                 awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
                 head: self.head,
+                head_exists: self.head_exists,
                 outstanding: self.outstanding.clone(),
             },
         })
@@ -438,6 +455,7 @@ impl<B: Blocks> Shell<B> {
         match (self.head.take(), got) {
             (Some((want, _)), Some((seq, root))) => {
                 if seq == want {
+                    self.head_exists = true;
                     self.engine.step(Event::HeadConfirmed(seq))
                 } else {
                     self.engine.step(Event::HeadConflict { seq, root })
@@ -445,11 +463,15 @@ impl<B: Blocks> Shell<B> {
             }
             // Written, and not there. The ack was not a promise.
             (Some(_), None) => Vec::new(),
-            (None, Some((seq, root))) => self.engine.step(Event::HeadRead {
-                epoch: wire::epoch(1),
-                seq,
-                root,
-            }),
+            (None, Some((seq, root))) => {
+                // Reading one is proof it is there.
+                self.head_exists = true;
+                self.engine.step(Event::HeadRead {
+                    epoch: wire::epoch(1),
+                    seq,
+                    root,
+                })
+            }
             (None, None) => self.engine.step(Event::HeadMissing),
         }
     }
@@ -479,6 +501,24 @@ impl<B: Blocks> Shell<B> {
             };
             out.replies.push(wire::reply(&r));
         }
+    }
+
+    /// Whether the head Register exists, read straight out of a context.
+    ///
+    /// The entry point needs it while BUILDING the outbound messages, which
+    /// is after the shell that produced them has been dropped.
+    pub fn peek_head_exists(ctx: &[u8]) -> bool {
+        bincode::deserialize::<Carried>(ctx)
+            .map(|c| c.shell.head_exists)
+            .unwrap_or(false)
+    }
+
+    /// Does the head Register already exist on the node?
+    ///
+    /// A bump that creates it must carry the Register's code; one that
+    /// updates it names the contract by id alone.
+    pub fn head_exists(&self) -> bool {
+        self.head_exists
     }
 
     /// Ids put and not yet read back.

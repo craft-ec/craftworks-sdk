@@ -81,10 +81,17 @@ async fn until(client: &mut WebApi, want: State, deadline: Instant) -> (bool, Ve
                                 awaiting,
                                 read_back,
                                 effects,
+                                head_put,
+                                head_update,
                                 note,
                                 ..
                             }) => println!(
-                                "  call: saw {saw:?} effects {effects} ops {ops} awaiting {awaiting} read_back {read_back} stranded {stranded} dropped {dropped}{}",
+                                "  call: saw {saw:?} effects {effects} ops {ops} awaiting {awaiting} read_back {read_back} stranded {stranded} dropped {dropped}{}{}",
+                                if head_put + head_update == 0 {
+                                    String::new()
+                                } else {
+                                    format!("  head: PUT {head_put} B / UPDATE {head_update} B")
+                                },
                                 if note.is_empty() { String::new() } else { format!("  | {note}") }
                             ),
                             _ => {}
@@ -241,6 +248,33 @@ async fn main() -> Result<()> {
         bail!("the write did not reach Published within the budget: {states:?}");
     }
     println!("write: accepted -> published in {took:?}  (one run, one node, one machine)");
+
+    // ---- a SECOND write, so the head bump can be compared ----
+    //
+    // The first bump has to CREATE the Register, and creating a contract
+    // carries its code. Every bump after that updates a contract the node
+    // already has. One write can only ever show the expensive route, and a
+    // measurement of the cheap one is the point.
+    let key2 = b"live/two".to_vec();
+    let t2 = Instant::now();
+    send(
+        &mut client,
+        &dkey,
+        &Request::Write {
+            client: 1,
+            write_id: 2,
+            ops: vec![(key2.clone(), engine::Op::Put(vec![0x5Bu8; 200]))],
+        },
+    )
+    .await?;
+    let (published2, states2) = until(&mut client, State::Published, deadline).await;
+    if !published2 {
+        bail!("the second write did not publish: {states2:?}");
+    }
+    println!(
+        "write2: accepted -> published in {:?} (the head was UPDATED, not re-created)",
+        t2.elapsed()
+    );
 
     // ---- the head really moved ----
     let head_state = get_state(&mut client, head_id).await;

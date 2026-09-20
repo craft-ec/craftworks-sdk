@@ -66,6 +66,7 @@ pub enum Saw {
     Client,
     GetResponse,
     PutResponse,
+    UpdateResponse,
     Other,
 }
 
@@ -112,6 +113,11 @@ pub enum Reply {
         dropped: usize,
         /// Blocks put and not yet read back.
         awaiting: usize,
+        /// Bytes the head bump cost, by route. A PUT carries the Register's
+        /// CODE (~157 KiB) as well as the record; an UPDATE carries only the
+        /// record, because the node already has the contract.
+        head_put: usize,
+        head_update: usize,
         /// Puts confirmed by reading them back this call.
         read_back: usize,
         /// Effects the CORE returned this call.
