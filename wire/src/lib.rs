@@ -40,6 +40,34 @@
 //!   "Refused: bad key → ask the person to re-enter their passphrase" is a
 //!   phishing channel delivered through the protocol.
 
+//! # The node's version is not on this wire
+//!
+//! Checked at the deciding lines of `freenet-stdlib` 0.10.0, because the right
+//! response to a version skew is to REFUSE rather than to misread — and
+//! refusing requires knowing.
+//!
+//! * `HostResponse` (`client_api/client_events.rs:771`) — `ContractResponse`,
+//!   `DelegateResponse`, `QueryResponse`, `Ok`, `StreamChunk`, `StreamHeader`.
+//!   No version.
+//! * `QueryResponse` (`:812`) — `ConnectedPeers`, `NetworkDebug`,
+//!   `NodeDiagnostics`, `NeighborHosting`. No version.
+//! * `NodeInfo` (`:856`), the richest node-describing struct the API has —
+//!   `peer_id`, `is_gateway`, `location`, `listening_address`,
+//!   `uptime_seconds`. **No version field.**
+//! * `NodeQuery` (`:901`) — nothing that asks for one.
+//!
+//! **So there is nothing to detect and nothing to refuse on, and no
+//! negotiation is designed here.** The binary reports its version on its own
+//! command line (`freenet --version`), which a page cannot reach.
+//!
+//! What follows for us: the version this build was written against is pinned
+//! in `Cargo.toml` and belongs in the versions panel and the diagnostic bundle
+//! as ENVIRONMENT, not as something checked at runtime. And the dangerous
+//! skew is named so nobody later infers safety from silence: **a bump where
+//! most variants still decode and one has changed** would present as ordinary
+//! traffic with one thing quietly wrong. Compatibility must never be inferred
+//! from "the first message parsed".
+
 #![forbid(unsafe_code)]
 
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
@@ -58,8 +86,15 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// What arrived, once it has been understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
-    /// Bytes for the engine — our protocol, inside their envelope.
-    EngineBytes(Vec<u8>),
+    /// Messages for the engine — our protocol, inside their envelope.
+    ///
+    /// A LIST, because one `DelegateResponse` can carry several application
+    /// messages and each is its own message. The first version concatenated
+    /// them into one buffer, which the exact decoder then refused as
+    /// `TrailingBytes` — correctly: a run of messages is not a message, and
+    /// a decoder that accepted the prefix would have read the first one and
+    /// thrown the rest away.
+    EngineBytes(Vec<Vec<u8>>),
     /// A subscribed contract changed.
     ///
     /// **A HINT, never an authority.** See the module docs: a root from the
@@ -119,8 +154,11 @@ pub enum Unusable {
     TooLarge,
     /// Not decodable as a `HostResponse` at all.
     Unparseable,
-    /// Decoded, but a kind this side has no use for.
-    NotForUs,
+    /// Decoded, but a kind this side has no use for. NAMED: a diagnostic
+    /// that says only "not for us" costs a second run to find out which.
+    UnknownKind(&'static str),
+    /// The node's own error reply. A message, not a failure to read one.
+    NodeSaidNo,
     /// A chunked message whose shape this build refuses — too many chunks,
     /// an index outside its own total, or too many streams at once.
     BadStream,
@@ -220,7 +258,7 @@ pub fn unframe(r: &mut Reassembler, bytes: &[u8]) -> Incoming {
     let decoded = match Reassembler::decode(bytes) {
         Ok(d) => d,
         // A node's own error reply is a MESSAGE, not a failure to read one.
-        Err(Unusable::NotForUs) => {
+        Err(Unusable::NodeSaidNo) => {
             return Incoming::Refused(Refused {
                 said: "the node refused the request".into(),
             })
@@ -250,14 +288,18 @@ fn classify(r: HostResponse) -> Incoming {
     use freenet_stdlib::client_api::ContractResponse;
     match r {
         HostResponse::DelegateResponse { values, .. } => {
-            let mut out = Vec::new();
+            let mut out: Vec<Vec<u8>> = Vec::new();
             for v in values {
                 if let OutboundDelegateMsg::ApplicationMessage(m) = v {
-                    out.extend_from_slice(m.payload.as_ref());
+                    out.push(m.payload.to_vec());
                 }
             }
             if out.is_empty() {
-                Incoming::Unusable(Unusable::NotForUs)
+                // A delegate response carrying no application message is the
+                // node ACKNOWLEDGING — RegisterDelegate answers this way. The
+                // first version called it unusable, which turned the ordinary
+                // reply to the first message of every session into an error.
+                Incoming::Ack
             } else {
                 Incoming::EngineBytes(out)
             }
@@ -270,7 +312,26 @@ fn classify(r: HostResponse) -> Incoming {
         HostResponse::ContractResponse(ContractResponse::PutResponse { .. })
         | HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. })
         | HostResponse::Ok => Incoming::Ack,
-        _ => Incoming::Unusable(Unusable::NotForUs),
+        // A kind this build has no use for. NAMED, so a failure says which:
+        // the first run of the live driver reported `NotForUs` and could have
+        // meant either "the node refused" or "a variant we do not handle",
+        // and those want opposite responses.
+        other => Incoming::Unusable(Unusable::UnknownKind(kind_of(&other))),
+    }
+}
+
+/// The variant's own name, for a diagnostic that does not need a second run.
+fn kind_of(r: &HostResponse) -> &'static str {
+    use freenet_stdlib::client_api::ContractResponse as C;
+    match r {
+        HostResponse::ContractResponse(C::GetResponse { .. }) => "ContractResponse::GetResponse",
+        HostResponse::ContractResponse(C::UpdateResponse { .. }) => {
+            "ContractResponse::UpdateResponse"
+        }
+        HostResponse::ContractResponse(_) => "ContractResponse(other)",
+        HostResponse::DelegateResponse { .. } => "DelegateResponse",
+        HostResponse::Ok => "Ok",
+        _ => "another kind",
     }
 }
 

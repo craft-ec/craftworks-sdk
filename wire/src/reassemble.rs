@@ -160,7 +160,7 @@ impl Reassembler {
             Ok(Ok(r)) => Ok(r),
             // The node said no. That is a message, not a failure to read one —
             // the caller turns it into `Refused`.
-            Ok(Err(_)) => Err(Unusable::NotForUs),
+            Ok(Err(_)) => Err(Unusable::NodeSaidNo),
             Err(_) => Err(Unusable::Unparseable),
         }
     }

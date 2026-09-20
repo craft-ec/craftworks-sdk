@@ -11,6 +11,7 @@ freenet-stdlib = { version = "0.10.0", features = ["net"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 bincode = "1"
+futures = "0.3"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 # The live write run drives the engine delegate, so it speaks its wire format
@@ -18,5 +19,8 @@ serde = { version = "1", features = ["derive"] }
 # here reaches the delegate's wasm.
 engine-delegate = { path = "../engine-delegate", default-features = false }
 protocol = { path = "../protocol" }
+# The live round trip sends the EXACT bytes the browser will send, which is
+# the whole reason the framing lives in a crate instead of in JavaScript.
+wire = { path = "../wire" }
 engine = { path = "../engine" }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
