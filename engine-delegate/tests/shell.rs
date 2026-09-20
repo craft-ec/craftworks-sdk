@@ -420,7 +420,10 @@ fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
 #[test]
 fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
     let store = Store::default();
-    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, false, true);
+    // NOT yet provisioned — which is the only state in which an install does
+    // anything. A delegate that already has a key refuses one, and that is
+    // asserted by its own test.
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, false, false);
 
     let req = protocol::encode_request(
         protocol::CURRENT,
@@ -746,5 +749,74 @@ fn identity_reports_whether_a_head_can_be_written_both_ways() {
         !head_writable_of(false),
         "an UNPROVISIONED delegate reported it can write a head; a page \
          believing this never provisions and every write is dropped"
+    );
+}
+
+/// **FIRST WRITER WINS.** An `Install` at a provisioned delegate changes
+/// nothing and says so.
+///
+/// `Install` overwrites the signing key, and the Register instance is derived
+/// from a keyset, so a second install mints a second key, moves the head's
+/// contract id and orphans everything written under the first. A client that
+/// asks before installing does not prevent it: two tabs opened together on a
+/// fresh node both find it unprovisioned and both install, a re-issue after a
+/// stall installs again, an older page knows nothing of the rule, and any web
+/// page at all can send one message. The delegate is the only place that sees
+/// them all, so the guard is here.
+///
+/// The observable effects are that `installed` stays `None` — which is what
+/// the entry point keys its `set_secret` calls off, so nothing is written —
+/// and that the caller is told `AlreadyInstalled` rather than being left to
+/// infer silence.
+#[test]
+fn an_install_at_a_provisioned_delegate_changes_nothing_and_says_so() {
+    fn install_into(already_provisioned: bool) -> (Option<usize>, Vec<protocol::Reply>) {
+        let mut s: Shell<Store> = Shell::resume_with(
+            &[],
+            Params::default(),
+            Store::default(),
+            true,
+            already_provisioned,
+        );
+        let out = s.handle(vec![Inbound::Client(protocol::encode_request(
+            1,
+            &protocol::Request::Install {
+                block_code: vec![0xB1; 8],
+                register_code: vec![0x8E; 8],
+                register_params: vec![0x01; 4],
+                signing_key: protocol::TestKey(vec![0x77; 32]),
+            },
+        ))]);
+        let replies = out
+            .replies
+            .iter()
+            .filter_map(|b| protocol::decode_reply(b).ok())
+            .collect();
+        (s.installed, replies)
+    }
+
+    // ALREADY PROVISIONED: nothing is handed to the entry point to write.
+    let (installed, replies) = install_into(true);
+    assert_eq!(
+        installed, None,
+        "a second Install reached the secret store; it would replace the \
+         signing key and orphan every head written under the first"
+    );
+    assert!(
+        replies.contains(&protocol::Reply::AlreadyInstalled),
+        "the caller was not told the install was refused: {replies:?}"
+    );
+
+    // THE NEGATIVE CONTROL. On the same path, an UNPROVISIONED delegate does
+    // install — without this the assertions above would pass against a
+    // delegate that refuses every install there has ever been.
+    let (installed, replies) = install_into(false);
+    assert!(
+        installed.is_some(),
+        "the control did not install, so the test above proves nothing"
+    );
+    assert!(
+        !replies.contains(&protocol::Reply::AlreadyInstalled),
+        "a first install was reported as already installed"
     );
 }

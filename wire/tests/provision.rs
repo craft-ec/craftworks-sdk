@@ -264,3 +264,87 @@ fn the_steps_say_which_of_them_are_confirmed_rather_than_acknowledged() {
     assert!(Step::Delegate.confirmed_by_asking());
     assert!(Step::Install.confirmed_by_asking());
 }
+
+/// **TWO TABS, ONE KEY.**
+///
+/// Two tabs opened together on a fresh node both ask, both hear "not
+/// provisioned", and both install. That is not a client bug to be tidied
+/// away — it is what concurrency means, and it is why the delegate refuses
+/// the second rather than relying on anybody asking first.
+///
+/// This drives two provisioners against ONE node, interleaved so both have
+/// asked before either installs. The node accepts the first install and
+/// answers `AlreadyInstalled` to every later one. Exactly one key is minted,
+/// and neither run claims to have installed it twice.
+#[test]
+fn two_tabs_racing_on_a_fresh_node_end_with_one_key() {
+    /// The delegate's secret store, as the guard sees it.
+    struct Node {
+        keys: Vec<u8>,
+    }
+    impl Node {
+        /// `true` once something has been installed — what `Identity`
+        /// reports as `head_writable`.
+        fn writable(&self) -> bool {
+            !self.keys.is_empty()
+        }
+        /// Returns whether THIS install took. First writer wins.
+        fn install(&mut self, key: u8) -> bool {
+            if self.writable() {
+                return false;
+            }
+            self.keys.push(key);
+            true
+        }
+    }
+
+    let mut node = Node { keys: Vec::new() };
+    let mut a = Provisioner::new();
+    let mut b = Provisioner::new();
+    a.already_registered();
+    b.already_registered();
+
+    // Both ask FIRST, before either installs — the shape that makes the race
+    // real. Asking one after the other would let B see A's work and the test
+    // would prove nothing.
+    for (p, key) in [(&mut a, 0xAAu8), (&mut b, 0xBBu8)] {
+        assert_eq!(p.next_step(), Some(Step::Ask));
+        p.sent(Step::Ask, DELEGATE, 0);
+        p.on_identity(node.writable());
+        let _ = key;
+    }
+
+    // Now both install, into the same node.
+    for (p, key) in [(&mut a, 0xAAu8), (&mut b, 0xBBu8)] {
+        assert_eq!(
+            p.next_step(),
+            Some(Step::Install),
+            "a tab that heard 'not provisioned' did not try to install"
+        );
+        p.sent(Step::Install, DELEGATE, 10);
+        if !node.install(key) {
+            p.on_already_installed();
+        }
+    }
+
+    assert_eq!(node.keys, vec![0xAA], "more than one key was minted");
+
+    // Both confirm by asking, and both end provisioned.
+    for p in [&mut a, &mut b] {
+        assert_eq!(p.next_step(), Some(Step::Ask));
+        p.sent(Step::Ask, DELEGATE, 20);
+        p.on_identity(node.writable());
+        assert!(p.provisioned());
+        assert_eq!(p.next_step(), None);
+    }
+
+    // A installed; B did not, and does not say it did.
+    assert!(!a.lost_the_race());
+    assert_eq!(a.result().did(Step::Install), Some(Did::Installed));
+    assert!(b.lost_the_race());
+    assert_eq!(
+        b.result().did(Step::Install),
+        Some(Did::AlreadyThere),
+        "the tab that lost the race reported installing something"
+    );
+}

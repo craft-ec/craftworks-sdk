@@ -129,11 +129,19 @@ impl Session {
                     // it is the delegate's own report about its own secret
                     // store rather than an acknowledgement that a message
                     // arrived.
-                    if let Ok(protocol::Reply::Identity { head_writable, .. }) =
-                        protocol::decode_reply(&m)
-                    {
-                        self.plan.on_identity(head_writable);
-                        self.note_progress();
+                    match protocol::decode_reply(&m) {
+                        Ok(protocol::Reply::Identity { head_writable, .. }) => {
+                            self.plan.on_identity(head_writable);
+                            self.note_progress();
+                        }
+                        // Another writer got there first. The ordinary
+                        // outcome of two tabs opened together, not an error:
+                        // the plan goes on to the confirming Ask and simply
+                        // stops claiming an install it did not make.
+                        Ok(protocol::Reply::AlreadyInstalled) => {
+                            self.plan.on_already_installed();
+                        }
+                        _ => {}
                     }
                     self.store.on_inbound(&m);
                 }

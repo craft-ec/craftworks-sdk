@@ -241,6 +241,18 @@ pub enum Reply {
         /// would mean the store lost a secret the engine had already used.
         head_writable: bool,
     },
+    /// `Install` arrived at a delegate that is already provisioned, and
+    /// NOTHING was changed.
+    ///
+    /// The ordinary outcome of a race, not an error. Two tabs opened together
+    /// on a fresh node both find it unprovisioned and both install; the first
+    /// one to arrive wins and the second is told this. Were the second to
+    /// overwrite, it would mint a second signing key, move the head's
+    /// contract id, and orphan everything the first had already written.
+    ///
+    /// Replacing a key or the contract code is the hand-over design in
+    /// sdk#14, and is never a blind overwrite.
+    AlreadyInstalled,
     Value {
         req_id: u64,
         value: Option<Vec<u8>>,

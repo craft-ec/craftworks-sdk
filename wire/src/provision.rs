@@ -160,6 +160,12 @@ pub struct Provisioner {
     writable: Option<bool>,
     /// How many `Install`s have gone out.
     installs: usize,
+    /// One of them was refused: the delegate already had everything, and
+    /// changed nothing. The ORDINARY outcome of a race — two tabs opened
+    /// together on a fresh node both find it unprovisioned and both install,
+    /// and exactly one of them wins. Recorded so the run does not claim to
+    /// have installed what it did not.
+    lost_the_race: bool,
     /// The cap on them. An `Install` produces no reply, so a delegate that
     /// accepts one and stays unwritable would otherwise loop Ask→Install for
     /// ever, each pass costing the contract code. Two attempts, then the run
@@ -198,6 +204,7 @@ impl Provisioner {
             registered: false,
             writable: None,
             installs: 0,
+            lost_the_race: false,
             max_installs: 2,
             exhausted: false,
             in_flight: None,
@@ -298,6 +305,23 @@ impl Provisioner {
         self.in_flight = None;
     }
 
+    /// The delegate refused our `Install`: it already had everything.
+    ///
+    /// Not an error and not a stall. Provisioning carries straight on to the
+    /// confirming `Ask`, which is where "is it actually usable" was always
+    /// decided — the only thing that changes is that this run must not report
+    /// an install it did not make.
+    pub fn on_already_installed(&mut self) {
+        self.lost_the_race = true;
+        self.writable = None;
+    }
+
+    /// Whether an `Install` of ours was refused because another writer had
+    /// already provisioned this delegate.
+    pub fn lost_the_race(&self) -> bool {
+        self.lost_the_race
+    }
+
     /// The delegate answered `Identity`.
     ///
     /// `head_writable` is the delegate's own report that it holds everything
@@ -319,7 +343,9 @@ impl Provisioner {
         self.writable = Some(head_writable);
         if head_writable && self.did(Step::Install).is_none() {
             // Installed just now, or already there before this run started.
-            let did = if self.installs > 0 {
+            // An install we SENT but that was refused did not install
+            // anything, so the run must not claim it did.
+            let did = if self.installs > 0 && !self.lost_the_race {
                 Did::Installed
             } else {
                 Did::AlreadyThere
