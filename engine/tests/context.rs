@@ -476,18 +476,27 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
 /// test can observe that, because the test harness IS the single process the
 /// defect needs; so this reads the source.
 ///
-/// The test's own hazard is that it greps nothing: a renamed directory, a
-/// moved file, a pattern that matches no line. So it counts what it read and
-/// fails if the count is zero, and it proves the pattern matches by finding
-/// the store's own deliberate `thread_local!` in the test support file.
+/// The source is EMBEDDED, not read from disk. Reading it needed
+/// `CARGO_MANIFEST_DIR`, which `env!` bakes in at COMPILE time — and this
+/// workspace shares one `CARGO_TARGET_DIR` across git worktrees, so a cached
+/// test binary can carry a path belonging to a checkout that no longer
+/// exists. This gate then failed with `NotFound` on a tree whose engine was
+/// perfectly clean, which for a gate is the worst outcome: one that cries
+/// wolf is one people learn to re-run and then to ignore. `include_str!`
+/// resolves relative to THIS file at compile time and embeds the bytes, so
+/// the gate reads the exact source its own binary was built from and touches
+/// no filesystem at all.
+///
+/// Completeness is the other half, and it is checked against the directory
+/// when the directory happens to be readable: a module added and not listed
+/// here would otherwise go unscanned for ever.
 #[test]
 fn no_global_state_in_the_engine() {
-    use std::path::Path;
-
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = 0usize;
-    let mut lines = 0usize;
-    let mut found: Vec<String> = Vec::new();
+    const SOURCES: [(&str, &str); 3] = [
+        ("src/lib.rs", include_str!("../src/lib.rs")),
+        ("src/read.rs", include_str!("../src/read.rs")),
+        ("src/pack.rs", include_str!("../src/pack.rs")),
+    ];
     let pattern = [
         "static ",
         "thread_local!",
@@ -496,41 +505,26 @@ fn no_global_state_in_the_engine() {
         "OnceCell",
     ];
 
-    let mut stack = vec![src.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("the engine's src must be readable") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                stack.push(path);
+    let mut lines = 0usize;
+    let mut found: Vec<String> = Vec::new();
+    for (name, text) in SOURCES {
+        for (n, line) in text.lines().enumerate() {
+            lines += 1;
+            let code = line.trim_start();
+            // `const` is fine: it is inlined, not stored.
+            if code.starts_with("//") || code.starts_with("pub const") || code.starts_with("const")
+            {
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            files += 1;
-            let text = std::fs::read_to_string(&path).expect("a .rs file must read");
-            for (n, line) in text.lines().enumerate() {
-                lines += 1;
-                let code = line.trim_start();
-                // `const` is fine: it is inlined, not stored.
-                if code.starts_with("//")
-                    || code.starts_with("pub const")
-                    || code.starts_with("const")
-                {
-                    continue;
-                }
-                if pattern.iter().any(|p| code.contains(p)) {
-                    found.push(format!("{}:{}: {}", path.display(), n + 1, code));
-                }
+            if pattern.iter().any(|p| code.contains(p)) {
+                found.push(format!("{name}:{}: {code}", n + 1));
             }
         }
     }
 
     assert!(
-        files > 0 && lines > 100,
-        "the scan read {files} file(s) and {lines} line(s) of engine source, \
-         so it checked nothing: the path {} is wrong",
-        src.display()
+        lines > 100,
+        "the scan read {lines} line(s) of engine source, so it checked nothing"
     );
     assert!(
         found.is_empty(),
@@ -539,11 +533,10 @@ fn no_global_state_in_the_engine() {
         found.join("\n")
     );
 
-    // The pattern really matches: the test store's own thread_local! is
-    // deliberate, is test-only, and is found by the same scan.
-    let support = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/mod.rs");
-    let text = std::fs::read_to_string(&support).expect("the test support file");
-    let hits = text
+    // The pattern really matches: this file's own store has a deliberate,
+    // test-only `thread_local!`, and the same scan finds it.
+    let support = include_str!("common/mod.rs");
+    let hits = support
         .lines()
         .filter(|l| pattern.iter().any(|p| l.trim_start().contains(p)))
         .count();
@@ -553,7 +546,45 @@ fn no_global_state_in_the_engine() {
          one on purpose — so the pattern matches nothing and the clean result \
          above means nothing"
     );
-    println!("  {files} engine source file(s), {lines} lines, no globals (pattern verified on {hits} test-only hit(s))");
+
+    // Completeness, when the directory can be read. Not a skip that passes:
+    // if the directory IS there and holds a module this test does not list,
+    // that module is unscanned and this fails.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            let on_disk: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".rs"))
+                .collect();
+            let listed: Vec<&str> = SOURCES
+                .iter()
+                .map(|(n, _)| n.trim_start_matches("src/"))
+                .collect();
+            for f in &on_disk {
+                assert!(
+                    listed.contains(&f.as_str()),
+                    "engine/src/{f} exists and this gate does not scan it: add \
+                     it to SOURCES"
+                );
+            }
+            println!(
+                "  {} embedded file(s), {lines} lines, no globals (pattern \
+                 verified on {hits} test-only hit(s); {} file(s) on disk, all \
+                 listed)",
+                SOURCES.len(),
+                on_disk.len()
+            );
+        }
+        Err(e) => println!(
+            "  {} embedded file(s), {lines} lines, no globals (pattern \
+             verified on {hits} test-only hit(s); the src directory was not \
+             readable -- {e} -- so completeness was not re-checked, but every \
+             listed file WAS scanned)",
+            SOURCES.len()
+        ),
+    }
 }
 
 /// Owed parity survives a rehydration, and is actually PUT.

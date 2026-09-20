@@ -30,6 +30,13 @@ pub enum Ask {
     GetSecret { key: Vec<u8> },
     /// Nothing at all: the floor for what a call costs.
     Nothing,
+    /// What the node said about the last `PutContractRequest`.
+    ///
+    /// The node answers a delegate PUT with a `PutContractResponse` carrying
+    /// its verdict. Dropping it left "the state is not readable afterwards"
+    /// with two possible causes -- refused, or accepted and not visible --
+    /// and no way to tell them apart. This reads the node's own word for it.
+    LastPut,
     /// Emit a PutContractRequest and see whether the engine's own writes end
     /// up hosted — the question source could not settle (Q8). The CODE comes
     /// from the driver because a delegate cannot fabricate a contract.
@@ -59,7 +66,51 @@ pub enum Said {
         /// Calls recorded in the context, which does persist between calls.
         calls_in_context: u32,
     },
+    /// The delegate built and emitted a `PutContractRequest`.
+    ///
+    /// It says only that THIS side ran: whether the node accepted the put is
+    /// a separate question the driver asks by reading the state back. Without
+    /// it a delegate that answers nothing at all is indistinguishable from a
+    /// message the node dropped, which is how Q8's first answer came to mean
+    /// nothing.
+    Put {
+        emitted: bool,
+    },
+    /// The node's verdict on the last delegate PUT, as it gave it.
+    PutResult {
+        /// `None` = no response has arrived yet.
+        ok: Option<bool>,
+        err: String,
+    },
 }
+
+/// The context, as this delegate lays it out.
+///
+/// `[0..4]` the call counter, `[4]` the last put's verdict
+/// (0 none / 1 ok / 2 error), `[5..]` the error text. One layout in one place
+/// because two arms write it and a disagreement between them would look like
+/// a node that answered something it did not.
+fn ctx_get(ctx: &mut DelegateCtx) -> (u32, u8, String) {
+    let b = ctx.read().to_vec();
+    let calls = u32::from_le_bytes(b.first_chunk::<4>().copied().unwrap_or([0; 4]));
+    let verdict = b.get(4).copied().unwrap_or(0);
+    let err = b
+        .get(5..)
+        .map(|e| String::from_utf8_lossy(e).into_owned())
+        .unwrap_or_default();
+    (calls, verdict, err)
+}
+
+fn ctx_put(ctx: &mut DelegateCtx, calls: u32, verdict: u8, err: &str) {
+    let mut out = Vec::with_capacity(5 + err.len());
+    out.extend_from_slice(&calls.to_le_bytes());
+    out.push(verdict);
+    out.extend_from_slice(err.as_bytes());
+    ctx.write(&out);
+}
+
+/// Where the last delegate PUT's verdict is kept.
+const PUT_VERDICT: &[u8] = b"put_verdict";
 
 struct Probe;
 
@@ -71,6 +122,51 @@ impl DelegateInterface for Probe {
         _origin: Option<MessageOrigin>,
         inbound: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+        // The node's verdict on a delegate PUT arrives as its own inbound
+        // message. Recorded in the context, which is the only thing that
+        // survives to the call that asks for it.
+        if let InboundDelegateMsg::PutContractResponse(r) = &inbound {
+            // Recorded in a SECRET, not the context.
+            //
+            // This is the whole finding of the differential against F21's
+            // working probe: a context write made during THIS invocation does
+            // not survive to the next client call, because the node calls the
+            // delegate with a response as an INNER run whose context does not
+            // come back. Secrets do survive -- measured here in (5), across a
+            // node restart -- so the known-working instrument records there,
+            // and reading the verdict out of the context reported `None` for
+            // a response that had in fact arrived.
+            let (calls, _, _) = ctx_get(ctx);
+            let said = match &r.result {
+                Ok(()) => {
+                    ctx.set_secret(PUT_VERDICT, &[1]);
+                    ctx_put(ctx, calls, 1, "");
+                    Said::PutResult {
+                        ok: Some(true),
+                        err: String::new(),
+                    }
+                }
+                Err(e) => {
+                    let mut v = vec![2u8];
+                    v.extend_from_slice(e.as_bytes());
+                    ctx.set_secret(PUT_VERDICT, &v);
+                    ctx_put(ctx, calls, 2, e);
+                    Said::PutResult {
+                        ok: Some(false),
+                        err: e.clone(),
+                    }
+                }
+            };
+            // Answered OUT OF BAND as well as recorded. The context write
+            // alone cannot distinguish "the node never called us with a
+            // response" from "it did, and the write did not survive an inner
+            // invocation" — and those are different facts about the platform.
+            let payload =
+                bincode::serialize(&said).map_err(|e| DelegateError::Other(e.to_string()))?;
+            return Ok(vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload).processed(true),
+            )]);
+        }
         let InboundDelegateMsg::ApplicationMessage(msg) = inbound else {
             return Ok(vec![]);
         };
@@ -132,15 +228,47 @@ impl DelegateInterface for Probe {
                     WrappedState::new(state),
                     RelatedContracts::default(),
                 );
-                return Ok(vec![OutboundDelegateMsg::PutContractRequest(req)]);
+                // BOTH: the request for the node, and a reply for the driver.
+                // A delegate that emits only the request cannot be told apart
+                // from one whose message never arrived.
+                let payload = bincode::serialize(&Said::Put { emitted: true })
+                    .map_err(|e| DelegateError::Other(e.to_string()))?;
+                return Ok(vec![
+                    OutboundDelegateMsg::PutContractRequest(req),
+                    OutboundDelegateMsg::ApplicationMessage(
+                        ApplicationMessage::new(payload).processed(true),
+                    ),
+                ]);
+            }
+            Ask::LastPut => {
+                // The secret first: it is the one that survives an inner
+                // invocation. The context is read too, and the driver prints
+                // both, because the DIFFERENCE between them is the platform
+                // fact -- a response recorded in a context that is then thrown
+                // away looks exactly like a response that never came.
+                let from_secret = ctx.get_secret(PUT_VERDICT);
+                let (_, ctx_verdict, ctx_err) = ctx_get(ctx);
+                match from_secret {
+                    Some(v) => Said::PutResult {
+                        ok: Some(v.first() == Some(&1)),
+                        err: String::from_utf8_lossy(v.get(1..).unwrap_or(&[])).into_owned(),
+                    },
+                    None => Said::PutResult {
+                        ok: match ctx_verdict {
+                            1 => Some(true),
+                            2 => Some(false),
+                            _ => None,
+                        },
+                        err: ctx_err,
+                    },
+                }
             }
             Ask::Nothing => {
                 // The context is the only thing that persists between calls,
                 // so the count lives there.
-                let mut n =
-                    u32::from_le_bytes(ctx.read().first_chunk::<4>().copied().unwrap_or([0; 4]));
+                let (mut n, v, e) = ctx_get(ctx);
                 n += 1;
-                ctx.write(&n.to_le_bytes());
+                ctx_put(ctx, n, v, &e);
                 Said::Nothing {
                     calls_in_memory: in_memory,
                     calls_in_context: n,
