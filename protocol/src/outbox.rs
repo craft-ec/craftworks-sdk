@@ -19,11 +19,47 @@
 
 use crate::{Request, WriteState};
 
+/// What a key looked like when a write was made against it.
+///
+/// A HASH, not the bytes. The outbox may hold many writes and a page has a
+/// budget; keeping every pre-image would make the outbox as large as the
+/// data it is waiting to send. A hash is enough to answer the only question
+/// asked of it — did this change underneath us — and cannot be mistaken for
+/// a value to write back.
+pub type PreImage = [u8; 32];
+
+/// What the outbox decided about a `Lost` write, with no one asked.
+///
+/// `Lost` means the commit carrying a write will not publish and the engine
+/// no longer has it. Something has to happen next, and "the app decides" is
+/// not an answer: these run unattended, and an app that must decide either
+/// prompts a person or picks blindly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lost {
+    /// Every key is as the write expected, so it is sent again — silently,
+    /// in order, exactly once, exactly like `Busy`.
+    Resubmitted,
+    /// At least one key moved underneath it. The NEWER value stands and
+    /// nothing is re-applied.
+    ///
+    /// The app MAY surface this ("your edit from before the restart was not
+    /// applied"). It must never be a retry prompt: the decision is already
+    /// made, and this is a notification of it.
+    Conflict { write_id: u64, keys: Vec<Vec<u8>> },
+}
+
 /// A write the app made, waiting its turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     pub write_id: u64,
     pub ops: Vec<crate::Op>,
+    /// What each key the write touches looked like when it was submitted.
+    ///
+    /// `None` for a key that did not exist. Recorded at SUBMIT time, because
+    /// that is the state the app made its edit against — reading it later
+    /// would compare against whatever happened since, which is the thing
+    /// being tested for.
+    pub pre: Vec<(Vec<u8>, Option<PreImage>)>,
     /// How many times it has been sent. For reporting, never for giving up:
     /// the outbox does not decide a write is hopeless, the engine does.
     pub attempts: u32,
@@ -60,6 +96,24 @@ impl Outbox {
         Outbox::default()
     }
 
+    /// The app made a write, recording what each key looked like.
+    pub fn push_against(
+        &mut self,
+        write_id: u64,
+        ops: Vec<crate::Op>,
+        pre: Vec<(Vec<u8>, Option<PreImage>)>,
+    ) {
+        if self.queue.iter().any(|p| p.write_id == write_id) || self.done.contains(&write_id) {
+            return;
+        }
+        self.queue.push(Pending {
+            write_id,
+            ops,
+            pre,
+            attempts: 0,
+        });
+    }
+
     /// The app made a write.
     pub fn push(&mut self, write_id: u64, ops: Vec<crate::Op>) {
         // An id already queued is the same write, not a second one: the app
@@ -70,8 +124,55 @@ impl Outbox {
         self.queue.push(Pending {
             write_id,
             ops,
+            pre: Vec::new(),
             attempts: 0,
         });
+    }
+
+    /// A write came back `Lost`. Decide what happens, without asking anyone.
+    ///
+    /// ALL-OR-NOTHING per write: if ANY key the write touches has moved, none
+    /// of it is re-applied. A write is one edit the app made, and applying
+    /// half of it produces a state the app never asked for and cannot reason
+    /// about — worse than applying none, because none is a state it already
+    /// knows how to describe.
+    ///
+    /// `current` answers "what is this key's hash now?", `None` for absent.
+    pub fn settle_lost(
+        &mut self,
+        write_id: u64,
+        current: impl Fn(&[u8]) -> Option<PreImage>,
+    ) -> Lost {
+        if self.in_flight == Some(write_id) {
+            self.in_flight = None;
+        }
+        let Some(at) = self.queue.iter().position(|p| p.write_id == write_id) else {
+            return Lost::Conflict {
+                write_id,
+                keys: Vec::new(),
+            };
+        };
+        let moved: Vec<Vec<u8>> = self.queue[at]
+            .pre
+            .iter()
+            .filter(|(k, was)| current(k) != *was)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if moved.is_empty() {
+            // Nothing changed underneath it, so re-applying it lands exactly
+            // the edit the app made against exactly the state it made it
+            // against. Silent, because there is nothing for anyone to decide.
+            self.requeued += 1;
+            return Lost::Resubmitted;
+        }
+        // Someone else's newer value stands. Dropping this write is the
+        // decision — not a step towards one.
+        let p = self.queue.remove(at);
+        self.done.push(p.write_id);
+        Lost::Conflict {
+            write_id,
+            keys: moved,
+        }
     }
 
     /// The next write to send, if the engine is free.
@@ -106,6 +207,13 @@ impl Outbox {
         let Some(at) = at else {
             return Settled::Unknown;
         };
+        // `Lost` is not decided here: it needs to know what the keys look
+        // like NOW, which this cannot see. `settle_lost` is where it goes,
+        // and routing it here instead would drop it as terminal.
+        debug_assert!(
+            state != WriteState::Lost,
+            "a Lost write goes to settle_lost, which can compare pre-images"
+        );
         if state.should_resubmit() {
             // Stays where it is, at the FRONT of its order. Moving it to the
             // back would let a later write overtake it, and two edits to one
