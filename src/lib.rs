@@ -8,6 +8,7 @@
 pub mod binding;
 pub mod blockid;
 pub mod db;
+pub mod engine_client;
 pub mod id;
 pub mod live;
 pub mod record;
@@ -20,7 +21,8 @@ mod engine_store;
 pub use binding::{Binding, LiveMode, Reloads};
 pub use blockid::{BlockId, ContentHash, IdError};
 pub use db::{Db, Record, Scan};
-pub use engine_store::{EngineStore, Event as EngineEvent, Page, Transport};
+pub use engine_client::{Client, Event as EngineEvent};
+pub use engine_store::{EngineStore, Page, Transport};
 pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use live::{HeadId, HeadWatch, Recorder, Trees};

@@ -17,21 +17,54 @@
 //!    when the engine has the write, because that is when a subsequent read
 //!    through the same engine will see it.
 
+use crate::engine_client::Client;
+pub use crate::engine_client::Event;
 use crate::store::{Delta, Edit, Read, Reads, Store, StoreError};
-use crate::trace::{Trace, Traces};
+use crate::trace::Trace;
 use protocol::outbox::{Lost, Outbox, PreImage};
 use protocol::{Reply, Request, WriteState};
 
-/// How bytes get to the engine and back.
+/// A host that can send a request and wait for its replies.
 ///
-/// One call, one exchange: send a request, receive whatever replies came of
-/// it. A websocket in a browser, a direct call in a test. The SDK does not
-/// care which, and keeping it a trait is what lets the whole write path be
-/// tested with no node at all.
+/// **A blocking host, and only a blocking host.** A Rust test, the live
+/// driver, a native client — anywhere a caller may sit still until an answer
+/// comes back. A browser is NOT one of these: there is no blocking receive on
+/// its main thread, which is why the state machine lives in
+/// [`Client`](crate::engine_client::Client) and this is only one way to drive
+/// it. [`EngineStore`] is the blocking driver; a browser drives the same
+/// `Client` from its own event loop.
 pub trait Transport {
-    /// Send one encoded request; return the encoded replies it produced.
+    /// Send one encoded request; return whatever came back.
+    ///
+    /// Replies for OTHER requests, and pushes that answer nothing, may come
+    /// back here too — the client routes by content, not by position, so a
+    /// host that returns everything it has is doing the right thing.
     fn exchange(&mut self, request: &[u8]) -> Vec<Vec<u8>>;
+
+    /// Receive without sending.
+    ///
+    /// **The chaos transport is what made this necessary**, and it was a real
+    /// gap rather than a test artefact. `exchange` alone encodes an assumption
+    /// a connection does not keep: that the answer to a request arrives during
+    /// that request's own round trip. Hold one reply back — which is all
+    /// reordering IS — and a driver with no way to simply receive concludes
+    /// the engine never answered. The first browser connection would have hit
+    /// it, and the symptom would have been `NoAnswer` from a node that had
+    /// replied.
+    ///
+    /// Defaulted to nothing, so a transport whose exchange really is a
+    /// complete round trip needs no ceremony.
+    fn poll(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
+
+/// Rounds the blocking driver will move bytes in one call.
+///
+/// A bound on the DRIVER, not on the protocol: a transport that answered every
+/// request with another request would spin here for ever, and this runs on a
+/// thread somebody is waiting on.
+const MAX_PUMP_ROUNDS: usize = 64;
 
 /// One page of a range, and how to continue it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,57 +76,49 @@ pub struct Page {
     pub page_size_used: u32,
 }
 
-/// What happened that an app might want to know about.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
-    /// A write from before a restart was not applied, because someone else
-    /// changed a key it touched. The newer value stands.
-    ///
-    /// Surfaced, never a prompt: the decision is already made.
-    Conflict { write_id: u64, keys: Vec<Vec<u8>> },
-    /// A write will never be applied and re-submitting would not help.
-    Failed { write_id: u64 },
-    /// Something in a subscribed range changed. An ACCELERATOR: a binding
-    /// that never heard this would still be correct, on its backstop.
-    Changed {
-        sub_id: u64,
-        new_root: [u8; 32],
-        why: protocol::Why,
-    },
-    /// The engine has stopped comparing a range. Reload it to retry.
-    ///
-    /// Surfaced rather than swallowed: a binding whose notifications quietly
-    /// stopped looks exactly like one whose data quietly stopped changing.
-    Stale { sub_id: u64 },
-}
-
+/// The blocking driver: a [`Client`] plus a [`Transport`] that can wait.
+///
+/// Holds no protocol knowledge of its own. Every byte in or out goes through
+/// the client, so what a test exercises here is exactly what a browser runs.
 pub struct EngineStore<T: Transport> {
     transport: T,
+    client: Client,
     outbox: Outbox,
     next_write_id: u64,
-    /// Things the app may want to hear about. Drained, never dropped.
-    pub events: Vec<Event>,
     /// How many times the outbox re-sent something. Reported, so "it worked"
     /// and "it worked first time" are distinguishable.
     pub resubmits: u64,
-    /// Call trees, when tracing is on.
-    traces: Traces,
-    /// The client's clock, as a function, because this crate compiles to wasm
-    /// and to a host binary and must not reach for one of its own.
-    now_ms: Option<Box<dyn Fn() -> u64>>,
 }
 
 impl<T: Transport> EngineStore<T> {
     pub fn new(transport: T) -> EngineStore<T> {
         EngineStore {
             transport,
+            client: Client::new(),
             outbox: Outbox::new(),
             next_write_id: 1,
-            events: Vec::new(),
             resubmits: 0,
-            traces: Traces::default(),
-            now_ms: None,
         }
+    }
+
+    /// The state machine underneath. Exposed so a host can reach the pump.
+    pub fn client(&mut self) -> &mut Client {
+        &mut self.client
+    }
+
+    /// Events the app may want. Drained, never dropped.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        self.client.take_events()
+    }
+
+    /// Messages this build could not use, by reason.
+    pub fn dropped(&self) -> &[protocol::Dropped] {
+        &self.client.dropped
+    }
+
+    /// The transport, so a test can ask what it did to the stream.
+    pub fn transport(&self) -> &T {
+        &self.transport
     }
 
     /// Turn the call tree on, with the clock the app already uses.
@@ -103,66 +128,68 @@ impl<T: Transport> EngineStore<T> {
     /// own measurement of its own wait, which is the number an app cares
     /// about anyway.
     pub fn trace_on(&mut self, now_ms: Box<dyn Fn() -> u64>) {
-        self.now_ms = Some(now_ms);
-        let _ = self.ask(&Request::Trace { on: true });
+        self.client.trace_on(now_ms);
+        self.pump();
     }
 
     pub fn trace_off(&mut self) {
-        let _ = self.ask(&Request::Trace { on: false });
-        self.now_ms = None;
+        self.client.trace_off();
+        self.pump();
     }
 
     /// The call tree for one operation, if it was traced.
     pub fn trace(&self, of: protocol::TraceOf) -> Option<&Trace> {
-        self.traces.of(of)
+        self.client.trace(of)
     }
 
-    /// Send one request and take its replies, harvesting anything PUSHED.
+    /// Send one request and wait for what came of it.
     ///
-    /// A `Changed` arrives on whatever exchange happens to be in flight — no
-    /// client asked for it, so it belongs to no particular request. Harvesting
-    /// here means every call drains them, rather than only a call that thought
-    /// to look; a notification that arrives on the exchange for an unrelated
-    /// read is the ordinary case, not a special one.
+    /// The whole of this driver: queue it on the client, move the bytes, hand
+    /// back what the client decoded. Nothing about the protocol happens here —
+    /// pushes were routed to events and traces inside the client, on the way
+    /// past, so a caller waiting on a read never has to know a notification
+    /// exists.
     fn ask(&mut self, r: &Request) -> Vec<Reply> {
-        let bytes = protocol::encode_request(protocol::CURRENT, r);
-        let replies: Vec<Reply> = self
-            .transport
-            .exchange(&bytes)
-            .iter()
-            .filter_map(|b| protocol::decode_reply(b).ok())
-            .collect();
-        let mut out = Vec::with_capacity(replies.len());
-        for reply in replies {
-            match reply {
-                Reply::Changed {
-                    sub_id,
-                    new_root,
-                    why,
-                    ..
-                } => {
-                    if why == protocol::Why::Stale {
-                        self.events.push(Event::Stale { sub_id });
-                    }
-                    self.events.push(Event::Changed {
-                        sub_id,
-                        new_root,
-                        why,
-                    });
-                }
-                Reply::Step { of, depth, what, n } => {
-                    // Stamped as it LANDS. There is no other honest moment:
-                    // the engine has no clock, so the only time anyone can
-                    // measure is the client's own wait.
-                    if let Some(now) = &self.now_ms {
-                        let t = now();
-                        self.traces.record(of, depth, what, n, t);
-                    }
-                }
-                other => out.push(other),
+        self.client.send(r);
+        for _ in 0..MAX_PUMP_ROUNDS {
+            self.pump();
+            if self.client.has_replies() {
+                break;
+            }
+            // Nothing yet. A connection may answer a request on a LATER
+            // round — that is what a reordered stream is — so receive again
+            // rather than concluding silence. Bounded: a node that never
+            // answers must produce an answer here anyway, because a caller
+            // waiting for ever is a UI that never settles.
+            let more = self.transport.poll();
+            if more.is_empty() {
+                break;
+            }
+            for b in more {
+                self.client.on_inbound(&b);
             }
         }
-        out
+        self.client.drain_replies()
+    }
+
+    /// Move whatever is waiting, in both directions.
+    ///
+    /// BOUNDED. A transport that answers a request with another request would
+    /// otherwise spin here, and this is called from a UI thread: "eventually"
+    /// there means "never, visibly". What is not moved this round is still
+    /// queued for the next call.
+    fn pump(&mut self) {
+        for _ in 0..MAX_PUMP_ROUNDS {
+            let out = self.client.take_outbound();
+            if out.is_empty() {
+                return;
+            }
+            for bytes in out {
+                for reply in self.transport.exchange(&bytes) {
+                    self.client.on_inbound(&reply);
+                }
+            }
+        }
     }
 
     /// Ask to be told when a range changes.
@@ -197,11 +224,6 @@ impl<T: Transport> EngineStore<T> {
     /// `unsubscribe` would promise something nothing here can deliver.
     pub fn forget_subscription(&mut self, sub_id: u64) {
         let _ = self.ask(&Request::Unsubscribe { sub_id });
-    }
-
-    /// Take the events that have accumulated. Drained, never dropped.
-    pub fn take_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
     }
 
     /// Hash a value as the outbox compares them.
@@ -279,13 +301,13 @@ impl<T: Transport> EngineStore<T> {
                             {
                                 Lost::Resubmitted => self.resubmits += 1,
                                 Lost::Conflict { write_id, keys } => {
-                                    self.events.push(Event::Conflict { write_id, keys })
+                                    self.client.events.push(Event::Conflict { write_id, keys })
                                 }
                             }
                         }
                         WriteState::Failed => {
                             self.outbox.settle(id, state);
-                            self.events.push(Event::Failed { write_id: id });
+                            self.client.events.push(Event::Failed { write_id: id });
                         }
                         other => {
                             if other == WriteState::Busy {

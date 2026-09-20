@@ -1,4 +1,5 @@
-//! Shared support for the artefact gate.
+//! Shared support for the tests.
 
+pub mod chaos;
 pub mod contract;
 pub mod corpus;
