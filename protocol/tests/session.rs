@@ -3,6 +3,17 @@
 use protocol::session::{replay, Line, Session};
 use protocol::*;
 
+/// The frozen session, compiled INTO this test binary.
+///
+/// Not read from a path at run time. `CARGO_MANIFEST_DIR` is baked in when the
+/// binary is built, so a test binary served from a shared `CARGO_TARGET_DIR`
+/// carries whichever worktree built it — and once that worktree is gone the
+/// gate fails on a missing file having checked nothing. Embedding the bytes
+/// binds the fixture to the build instead of to the filesystem.
+const FIXTURE: &[u8] = include_bytes!("fixtures/v1-session.bin");
+
+/// Where the recorder WRITES. Only the `#[ignore]`d recorder uses this, and it
+/// is run deliberately, from the worktree it is meant to update.
 fn fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1-session.bin")
 }
@@ -132,13 +143,10 @@ fn record_the_v1_session() {
 /// having proved nothing.
 #[test]
 fn the_recorded_v1_session_replays() {
-    let bytes = std::fs::read(fixture_path()).unwrap_or_else(|e| {
-        panic!(
-            "the recorded v1 session could not be read ({e}). It is committed \
-             to this repository, so this is a gate with nothing to check, \
-             which is not a pass."
-        )
-    });
+    // The bytes this gate checks. Empty would be a gate with nothing to
+    // check, which is not a pass.
+    assert!(!FIXTURE.is_empty(), "the recorded v1 session is empty");
+    let bytes = FIXTURE.to_vec();
     let s = Session::decode(&bytes).expect("the fixture must decode");
     let r = replay(&s);
 
@@ -181,7 +189,7 @@ fn the_recorded_v1_session_replays() {
 /// serve. The difference is the whole reason the version is on the front.
 #[test]
 fn one_byte_of_the_version_makes_a_recorded_line_unsupported() {
-    let bytes = std::fs::read(fixture_path()).expect("the fixture");
+    let bytes = FIXTURE.to_vec();
     let s = Session::decode(&bytes).expect("decodes");
 
     let mut damaged = s.clone();

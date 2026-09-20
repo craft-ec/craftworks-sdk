@@ -354,7 +354,15 @@ mod tests {
     #[test]
     fn the_probes_client_stack_is_not_a_dependency_of_the_engine_or_the_sdk() {
         const FORBIDDEN: [&str; 4] = ["freenet-stdlib", "tokio-tungstenite", "tokio", "anyhow"];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        // The RUNNING directory, not the building one. Cargo runs a test
+        // binary with its cwd at the package root, which is true of the tree
+        // being tested; `CARGO_MANIFEST_DIR` is baked in at build time, so a
+        // binary served from a shared `CARGO_TARGET_DIR` names whichever
+        // worktree built it — and pointing `cargo tree` at a worktree that no
+        // longer exists fails the gate on a missing directory rather than on
+        // a dependency.
+        let here = std::env::current_dir().expect("a working directory");
+        let root = here
             .parent()
             .expect("the workspace root is the probe's parent");
         let mut checked = 0usize;
