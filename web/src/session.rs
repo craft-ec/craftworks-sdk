@@ -353,15 +353,28 @@ impl Session {
     /// A read's answer, with a `NotLoaded` turned into a real request and a
     /// ticket to wait on.
     fn answer<T: serde::Serialize>(&mut self, r: Result<T, DbError>) -> Result<String, JsValue> {
-        match r {
-            Ok(v) => {
-                // The chain this read was walking is finished; the next read
-                // starts its own.
-                self.loads.read_succeeded();
+        match self.decide(r) {
+            craftworks_sdk::Outcome::Done(v) => {
                 serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
             }
-            Err(e) => Err(self.park(e)),
+            craftworks_sdk::Outcome::Wait(e, t) => Err(db_err_waiting(&e, Some(t))),
+            craftworks_sdk::Outcome::Told(e) => Err(db_err(&e)),
         }
+    }
+
+    /// THE DECISION, which lives in the SDK so something native can run it.
+    ///
+    /// This type is `#[wasm_bindgen]` in a `cdylib`: nothing native can build
+    /// one, so a test that reached this method could only be a fake session
+    /// written in JavaScript — which compiles this file and runs none of it.
+    ///
+    /// Measured: with the recovery inline here, the sdk#89 defect could be
+    /// put back — `define` returning a ticketless `NotLoaded` — and the whole
+    /// suite stayed green. `craftworks_sdk::parking` carries it now, and
+    /// `tests/cold_write_native.rs` drives it against a real `Shell`.
+    fn decide<T>(&mut self, r: Result<T, DbError>) -> craftworks_sdk::Outcome<T> {
+        let now = crate::js_now_ms();
+        craftworks_sdk::decide(&mut self.loads, self.db.store_mut(), r, now)
     }
 
     /// A WRITE THAT HAD TO READ BEFORE IT COULD APPLY.
@@ -391,54 +404,14 @@ impl Session {
     /// This is `answer`'s sibling and deliberately not `answer` itself: a
     /// write's return type is its own (`()`, `bool`, a `Record`), and
     /// serializing it to a string here would change four wasm signatures to
-    /// share one helper.
-    fn applied<T>(&mut self, r: Result<T, DbError>) -> Result<T, JsValue> {
-        match r {
-            Ok(v) => {
-                self.loads.read_succeeded();
-                Ok(v)
-            }
-            Err(e) => Err(self.park(e)),
+    /// share one helper. `count` takes it for the same reason — it is a read,
+    /// but a read that answers a `usize`.
+    fn decided<T>(&mut self, r: Result<T, DbError>) -> Result<T, JsValue> {
+        match self.decide(r) {
+            craftworks_sdk::Outcome::Done(v) => Ok(v),
+            craftworks_sdk::Outcome::Wait(e, t) => Err(db_err_waiting(&e, Some(t))),
+            craftworks_sdk::Outcome::Told(e) => Err(db_err(&e)),
         }
-    }
-
-    /// Queue the load a `NotLoaded` needs, and return the error with its
-    /// ticket on it.
-    ///
-    /// **This is the whole of the recovery, and it used to be a comment.**
-    /// The first version of the wrapper answered a `NotLoaded` by awaiting a
-    /// resolved promise and asking again — which asks again in a microtask,
-    /// before any websocket message can possibly have arrived, and after
-    /// having requested nothing at all. Every read outside a preload manifest
-    /// rejected, always, and the test passed because its fake scripted the
-    /// second call to succeed.
-    fn park(&mut self, e: DbError) -> JsValue {
-        let Some((lo, hi)) = e.needs() else {
-            return db_err(&e);
-        };
-        let (lo, hi) = (lo.to_vec(), hi.to_vec());
-
-        let Some((req_id, send)) = self.loads.want(&lo, &hi, crate::js_now_ms()) else {
-            // This span was loaded already and the read still cannot be
-            // answered. Loading it again would answer exactly as it did the
-            // first time, so the caller is told instead of sent round.
-            return db_err(&e);
-        };
-        if send {
-            // A FULL PAGE, by the shared constant. `0` reads like "no
-            // limit" and is not one: the shell clamps it to ONE entry, so a
-            // range of N rows would load in N round trips of a single row.
-            // Paging is still followed to the end, because the copy records
-            // `[lo, hi)` as loaded and that is only true once the range is
-            // exhausted — this decides how many trips that takes.
-            self.db
-                .store_mut()
-                .client
-                .send(&craftworks_sdk::Loads::range_request(
-                    req_id, &lo, &hi, None,
-                ));
-        }
-        db_err_waiting(&e, Some(req_id))
     }
 
     /// A page of a load arrived.
@@ -923,7 +896,7 @@ impl Session {
         let s: craftworks_sdk::Schema =
             serde_json::from_str(schema).map_err(|e| db_err(&DbError::Refused(e.to_string())))?;
         let r = self.db.define(domain, &s);
-        self.applied(r)
+        self.decided(r)
     }
 
     pub fn schema(&mut self, domain: &str) -> Result<String, JsValue> {
@@ -939,14 +912,14 @@ impl Session {
     pub fn put(&mut self, domain: &str, fields: &str) -> Result<String, JsValue> {
         let f = fields_of(fields)?;
         let r = self.db.put(domain, &f);
-        json_of(self.applied(r)?)
+        json_of(self.decided(r)?)
     }
 
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
         let p = fields_of(patch)?;
         let k = rkey_of(id)?;
         let r = self.db.update(domain, &k, &p);
-        json_of(self.applied(r)?)
+        json_of(self.decided(r)?)
     }
 
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
@@ -958,7 +931,7 @@ impl Session {
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
         let k = rkey_of(id)?;
         let r = self.db.delete(domain, &k);
-        self.applied(r)
+        self.decided(r)
     }
 
     /// `after` is a record id or the empty string.
@@ -1011,10 +984,12 @@ impl Session {
     }
 
     pub fn count(&mut self, domain: &str) -> Result<usize, JsValue> {
-        match self.db.count(domain) {
-            Ok(n) => Ok(n),
-            Err(e) => Err(self.park(e)),
-        }
+        // A READ that keeps its own type rather than a JSON string, so it
+        // takes `decided` like the writes do. Before this it called a private
+        // `park` directly and never told `Loads` the chain had SUCCEEDED, so
+        // a count that worked left the done-set standing for the next call.
+        let r = self.db.count(domain);
+        self.decided(r)
     }
 
     /// The tree's root, as `node:<64 hex>`.
@@ -1236,7 +1211,7 @@ fn db_err(e: &DbError) -> JsValue {
 /// Serialize a value already recovered from its `Result`.
 ///
 /// `as_json` takes the `Result` and so decides what a failure MEANS; a write
-/// that reads has already had that decided by `applied`, which parks it.
+/// that reads has already had that decided by `decided`, which parks it.
 fn json_of<T: serde::Serialize>(v: T) -> Result<String, JsValue> {
     serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
 }
