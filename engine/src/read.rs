@@ -120,6 +120,15 @@ pub(crate) struct Parked {
     pub want: Want,
     pub root: Cid,
     pub levels_done: usize,
+    /// Fetch rounds this read has made without finishing.
+    ///
+    /// The bound has to be PER REQUEST, not per block. A per-block attempt
+    /// counter counts FAILURES, and when the node serves a block and then
+    /// evicts it before the next call — which it may, because a sync read
+    /// does not refresh hosting — every attempt SUCCEEDS and the counter
+    /// never trips. The read then re-descends for ever, making progress on
+    /// paper and none in fact.
+    pub rounds: u32,
     /// Every block this read has been handed, PINNED until it replies.
     ///
     /// A read re-descends from the root on each resume, so it needs the whole

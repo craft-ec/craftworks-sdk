@@ -377,13 +377,10 @@ fn every_warmth_state_answers_the_same() {
         let carries_leaf =
             *id == leaf || engine::pack::members(bytes).iter().any(|(m, _)| *m == leaf);
         if !carries_leaf {
-            let _ = stepped!(
-                e,
-                Event::BlockArrived {
-                    id: *id,
-                    bytes: bytes.clone(),
-                }
-            );
+            // Into the STORE. Telling the engine `BlockArrived` no longer
+            // makes a block readable — it keeps none — so warming means
+            // putting blocks where it reads from.
+            store.put(*id, bytes);
         }
     }
     let first = stepped!(e, get(1, 3, &key));
@@ -408,13 +405,11 @@ fn every_warmth_state_answers_the_same() {
         })
         .map(|(id, bytes)| (*id, bytes.clone()));
     if let Some((pid, pbytes)) = pack {
-        let _ = stepped!(
-            e,
-            Event::BlockArrived {
-                id: pid,
-                bytes: pbytes,
-            }
-        );
+        // The node unpacks what it receives; the store does the same.
+        for (mid, mbytes) in engine::pack::members(&pbytes) {
+            store.put(mid, &mbytes);
+        }
+        store.put(pid, &pbytes);
         let first = stepped!(e, get(1, 4, &key));
         let got = settle(&mut e, &store, &all, first);
         assert_eq!(got, vec![(ReqId(4), ReadResult::Value(want.clone()))]);
@@ -888,91 +883,96 @@ fn settle_bounded(
     Ok(out)
 }
 
-/// A warm set too small for a read's path ENDS the read; it never loops.
+/// A store that FORGETS between steps still answers every read — bounded, and
+/// with a reply.
 ///
-/// Every block a parked read has been handed is pinned until it replies,
-/// because the read re-descends from the root each time it resumes. Without
-/// that, eviction takes the path the read just paid for, the read asks again,
-/// the fetch SUCCEEDS — so the attempt budget never trips — and nothing ever
-/// ends. A livelock is worse than a crash: it burns the delegate's whole
-/// slice and reports nothing at all.
+/// This is the livelock lesson in its new home. The old engine held a warm
+/// set, and a tight bound on it evicted the path a read had just paid for:
+/// the read asked again, the fetch SUCCEEDED so the attempt budget never
+/// tripped, and nothing ever ended. That machinery is gone — the core holds
+/// no blocks — but the HAZARD is not, and it is now the platform's: a sync
+/// read does not refresh hosting (F33), so a block a descent read on one call
+/// can be evicted before the next.
+///
+/// So the property is the same and the mechanism is different: whatever the
+/// node forgets, a read ends in a REPLY. Never a loop, and never silence.
 #[test]
-fn a_tight_warm_set_answers_every_read_instead_of_looping() {
-    let (records, root, all) = fixture(10_000);
+fn a_forgetful_store_still_answers_every_read() {
+    use common::{Harness, Mode};
+
+    let (records, root, all) = fixture(2_000);
+    let keys: Vec<Vec<u8>> = records.keys().cloned().collect();
     const BUDGET: usize = 20_000;
 
-    for warm in [8 * 1024usize, 16 * 1024, 32 * 1024, 64 * 1024] {
-        let (mut e, store) = reader(
+    for forget_every in [0usize, 1, 3] {
+        let store = Store::fresh();
+        let mut h = Harness::new(Mode::Rehydrate, Params::default(), store.clone());
+        store.put(root, all.get(&root).expect("the root"));
+        let _ = h.step(Event::Start {
+            key: engine::KeySource::SecretStore,
+            epochs: vec![engine::Epoch(1)],
+        });
+        let _ = h.step(Event::HeadRead {
+            epoch: engine::Epoch(1),
+            seq: 1,
             root,
-            Params {
-                max_context_bytes: 320 * 1024,
-                ..Params::default()
-            },
-        );
-        let (mut ok, mut no_space, mut other) = (0, 0, 0);
-        for (i, (k, v)) in records.iter().enumerate().filter(|(i, _)| i % 500 == 0) {
-            let first = stepped!(e, get(1, i as u64, k));
-            let got = settle_bounded(&mut e, &store, &all, first, BUDGET).unwrap_or_else(|n| {
-                panic!("warm={warm}: a read took {n} steps and had not answered")
+        });
+
+        let (mut answered, mut unavailable) = (0, 0);
+        for (n, key) in keys.iter().step_by(400).enumerate() {
+            let mut queue = h.step(Event::Get {
+                client: ClientId(1),
+                req_id: ReqId(n as u64),
+                key: key.clone(),
             });
-            match got.first().map(|(_, r)| r.clone()) {
-                Some(ReadResult::Value(Some(x))) if &x == v => ok += 1,
-                // Honest: this read needs more at once than the bound allows.
-                Some(ReadResult::OutOfWarmSpace) => no_space += 1,
-                _ => other += 1,
+            let mut steps = 0;
+            let mut served = 0usize;
+            while let Some(f) = queue.pop() {
+                steps += 1;
+                assert!(
+                    steps < BUDGET,
+                    "forget_every={forget_every}: a read took {steps} steps and \
+                     had not answered"
+                );
+                match f {
+                    Effect::FetchBlock { id, .. } => {
+                        let ev = match all.get(&id) {
+                            Some(b) => {
+                                store.put(id, b);
+                                served += 1;
+                                // The node evicts what it just served, as it
+                                // may: using a block through the sync read
+                                // does not refresh its hosting.
+                                if forget_every > 0 && served.is_multiple_of(forget_every) {
+                                    store.forget(id);
+                                }
+                                Event::BlockArrived {
+                                    id,
+                                    bytes: b.to_vec(),
+                                }
+                            }
+                            None => Event::BlockMissed(id),
+                        };
+                        queue.extend(h.step(ev));
+                    }
+                    Effect::Reply { result, .. } => match result {
+                        ReadResult::Value(_) => answered += 1,
+                        ReadResult::Unavailable(_) | ReadResult::OutOfWarmSpace => unavailable += 1,
+                        other => panic!("a Get was answered with {other:?}"),
+                    },
+                    _ => {}
+                }
             }
         }
-        // Whatever the bound, every read ANSWERED, and none answered wrongly.
         assert_eq!(
-            other, 0,
-            "warm={warm}: {other} read(s) answered with something other than \
-             the value or OutOfWarmSpace"
+            answered + unavailable,
+            keys.iter().step_by(400).count(),
+            "forget_every={forget_every}: not every read was answered"
         );
-        assert_eq!(ok + no_space, 20, "warm={warm}: not every read answered");
-        if warm >= 16 * 1024 {
-            assert_eq!(
-                ok, 20,
-                "warm={warm}: {no_space} read(s) ran out of warm space at a \
-                 bound that holds a whole path"
-            );
-        }
-        println!("  warm={warm}: {ok} answered, {no_space} out of space");
+        println!("  forget every {forget_every}: {answered} answered, {unavailable} unavailable");
     }
-
-    // The control, and it RUNS: with pinning off the same read does not
-    // finish inside a budget many times what it needs.
-    let key = records.keys().next().expect("a key").clone();
-    let (mut e, store) = reader(
-        root,
-        Params {
-            max_context_bytes: 8 * 1024,
-            refetch_held: false,
-            ..Params::default()
-        },
-    );
-    let first = stepped!(e, get(1, 99, &key));
-    assert!(
-        settle_bounded(&mut e, &store, &all, first, BUDGET).is_err(),
-        "with pinning off the read still finished, so pinning is not what \
-         stops the livelock and this test proves nothing about it"
-    );
-    println!("  control: with pinning off, the same read never answers");
 }
 
-/// A cold lookup costs one fetch per level however many times the engine is
-/// ENTERED while it waits.
-///
-/// This is the bound the re-hydrated design makes necessary, and it cannot be
-/// seen in `Live` mode. A re-hydrated engine re-descends from the head on
-/// every entry and reaches the same missing block each time; the only thing
-/// stopping it re-asking is the in-flight set the CONTEXT carries. A field in
-/// memory would hide the defect entirely, which is why this runs in
-/// `Rehydrate`.
-///
-/// The control is that set turned off: every unrelated event — another
-/// client's read, a tick, some other block landing — re-emits the same fetch,
-/// and the cost grows with how busy the node is rather than with the depth of
-/// the tree.
 #[test]
 fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
     use common::{Harness, Mode};

@@ -272,6 +272,14 @@ pub struct Params {
     /// How many times a block is asked for before the read is answered
     /// `Unavailable`. Attempts are RE-ISSUED, not waited on (ARCHITECTURE §7).
     pub max_attempts: u32,
+    /// Fetch rounds one read may make before it is answered `Unavailable`.
+    ///
+    /// Bounds the read itself, which `max_attempts` cannot: that counts a
+    /// BLOCK's failures, and a node that serves a block and then evicts it
+    /// produces an endless series of successes. Generous enough that a deep
+    /// tree on a slow node finishes, small enough that a read cannot spin for
+    /// a whole delegate slice.
+    pub max_read_rounds: u32,
     /// Two requests needing one block share its fetch. Off = the control.
     pub share_fetches: bool,
     /// Ceilings on an advisory preload: roots, blocks, bytes. A preload may
@@ -349,6 +357,7 @@ impl Default for Params {
             transfer_superseded_waiters: true,
             max_fetch_per_round: 8,
             max_attempts: 3,
+            max_read_rounds: 64,
             share_fetches: true,
             preload_roots: 4,
             preload_blocks: 256,
@@ -769,6 +778,7 @@ impl<B: Blocks> Engine<B> {
                 want,
                 root,
                 levels_done: 0,
+                rounds: 0,
                 held: BTreeSet::from([root]),
             },
         );
@@ -812,8 +822,25 @@ impl<B: Blocks> Engine<B> {
                 });
             }
             read::Attempt::Need(ids) => {
-                if let Some(q) = self.reads.parked.get_mut(&req_id) {
+                // A round that asks for something is a round: if the read has
+                // made too many without finishing, it ENDS. The node may be
+                // evicting what it serves faster than the descent can use it,
+                // and a read that cannot finish must say so rather than spin.
+                let over = {
+                    let q = self.reads.parked.get_mut(&req_id).expect("parked");
                     q.levels_done += 1;
+                    q.rounds += 1;
+                    q.rounds > self.params.max_read_rounds
+                };
+                if over {
+                    self.reads.parked.remove(&req_id);
+                    self.forget_waiting(req_id);
+                    let blocked = ids.first().copied().unwrap_or(p.root);
+                    return vec![Effect::Reply {
+                        client: p.client,
+                        req_id,
+                        result: read::ReadResult::Unavailable(blocked),
+                    }];
                 }
                 let levels_done = self.reads.parked.get(&req_id).map_or(0, |q| q.levels_done);
                 out.push(Effect::Progress {
