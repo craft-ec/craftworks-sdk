@@ -40,6 +40,11 @@ getrandom = { version = "0.2", features = ["js"] }
 # small validations, where speed is worth nothing and not needing a C
 # toolchain to run a gate is worth a lot.
 [dev-dependencies]
+# A dev-dependency cycle, and a legitimate one: testkit depends on this crate
+# for the types it wraps, and this crate's TESTS depend on testkit for the
+# fixtures. Cargo allows exactly this for test-support crates, because the
+# cycle exists only in the test build, never in the library's own graph.
+testkit = { path = "testkit" }
 engine = { path = "engine" }
 engine-delegate = { path = "engine-delegate", default-features = false }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
@@ -51,7 +56,7 @@ bincode = "1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
-members = ["engine", "engine-delegate", "probe-delegate", "probe", "protocol", "web", "wire"]
+members = ["engine", "engine-delegate", "probe-delegate", "probe", "protocol", "testkit", "web", "wire"]
 
 [profile.release]
 opt-level = "s"

@@ -18,7 +18,7 @@ use craftworks_sdk::CachedStore;
 use protocol::WriteState;
 
 fn store() -> CachedStore {
-    let mut s = CachedStore::new(Box::new(|| 0));
+    let (mut s, _clock) = testkit::cached_store();
     // Everything loaded and empty, so reads are answered rather than refused.
     s.on_page(b"", &[0xFFu8; 64], Vec::new(), [0u8; 32]);
     s

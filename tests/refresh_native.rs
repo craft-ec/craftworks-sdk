@@ -166,7 +166,7 @@ impl Client {
 
     fn on(conn: Conn) -> Client {
         let mut c = Client {
-            store: CachedStore::new(Box::new(|| 0)),
+            store: testkit::cached_store().0,
             conn,
             asks: 0,
         };

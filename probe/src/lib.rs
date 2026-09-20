@@ -365,7 +365,7 @@ mod tests {
         ///
         /// `wire` frames the client API; `probe` drives live nodes; the
         /// delegates are compiled by the node itself and link the guest side.
-        const ALLOWED: [&str; 5] = [
+        const ALLOWED: [&str; 6] = [
             "wire",
             // The browser build LINKS the core to the framing, which is its
             // whole job — and it is the reason `craftworks-sdk` can stay OFF
@@ -375,6 +375,17 @@ mod tests {
             "probe",
             "probe-delegate",
             "engine-delegate",
+            // The test fixtures. It wraps `Shell`, so it cannot avoid
+            // `engine-delegate` and inherits the client stack through it.
+            //
+            // This is an excuse, and the gate's own note says excusing a crate
+            // is the wrong answer when restructuring is available. It is not
+            // available here — a fixture that wraps the shell must depend on
+            // the shell — so the excuse is made SAFE instead, by the assertion
+            // below: `testkit` must never appear in any other member's NORMAL
+            // closure. It may be a dev-dependency of anything and a real
+            // dependency of nothing, which is what keeps it out of a delegate.
+            "testkit",
         ];
 
         // The RUNNING directory, not the building one: `CARGO_MANIFEST_DIR` is
@@ -433,6 +444,38 @@ mod tests {
                  workspace any more. Remove it: an allowlist entry for a crate \
                  that does not exist is permission nobody is using and nobody \
                  is checking."
+            );
+        }
+
+        // Adding `testkit` to the allowlist above would be a hole if anything
+        // could then depend on it for real. So: it is allowed to carry the
+        // client stack ONLY because nothing ships it. That is asserted, not
+        // assumed — an allowlist entry whose justification is not checked is
+        // just a comment.
+        for pkg in &members {
+            if pkg == "testkit" {
+                continue;
+            }
+            let out = std::process::Command::new(env!("CARGO"))
+                .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
+                .current_dir(root)
+                .output()
+                .expect("cargo tree must run: a gate that cannot check has not checked");
+            assert!(
+                out.status.success(),
+                "cargo tree failed for {pkg}, so the testkit check did NOT run: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let tree = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                !tree
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some("testkit")),
+                "`testkit` is in `{pkg}`'s NORMAL dependency closure. It is on the \
+                 client-API allowlist only because it is test support that nothing \
+                 ships — a real dependency on it would carry the client stack into \
+                 {pkg} with the allowlist's blessing, which is precisely the hole \
+                 the allowlist is supposed not to open. Make it a dev-dependency."
             );
         }
 

@@ -1,0 +1,16 @@
+[package]
+name = "testkit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The probed fixtures. The only supported way to build the thing under test."
+
+[dependencies]
+engine = { path = "../engine" }
+engine-delegate = { path = "../engine-delegate" }
+craftworks-sdk = { path = ".." }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "9967896" }
+
+[dev-dependencies]
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "9967896" }
