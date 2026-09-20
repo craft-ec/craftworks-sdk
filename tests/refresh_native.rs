@@ -42,36 +42,62 @@ impl Node {
 #[derive(Clone, Default)]
 struct Head(Rc<RefCell<Option<(u64, Cid)>>>);
 
-/// One client: its own delegate context over the shared node.
-struct Conn {
+/// THE DELEGATE, as a node has it: ONE of them.
+///
+/// Two tabs on one node invoke the same delegate — same code, same
+/// parameters, so the same key — and it is rebuilt from its context on every
+/// call (F32). MEASURED: two separate websocket connections to one node
+/// share that context. `probe/src/bin/two-connections.rs` counts calls in the
+/// context and connection B's first call continued connection A's count
+/// (6 after A reached 5), with A's next call seeing 7, while `calls_in_memory`
+/// stayed 1 on both as the control requires.
+///
+/// So two tabs are served by ONE engine state, and `Conn` is shared.
+#[derive(Clone)]
+struct Conn(Rc<RefCell<ConnState>>);
+
+struct ConnState {
     node: Node,
     head: Head,
     ctx: Vec<u8>,
 }
 
 impl Conn {
+    fn new(node: &Node, head: &Head) -> Conn {
+        Conn(Rc::new(RefCell::new(ConnState {
+            node: node.clone(),
+            head: head.clone(),
+            ctx: Vec::new(),
+        })))
+    }
+
     fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
+        let (ctx, node) = {
+            let s = self.0.borrow();
+            (s.ctx.clone(), s.node.clone())
+        };
         let mut shell: Shell<Node> = Shell::resume_with(
-            &self.ctx,
+            &ctx,
             engine::Params::default(),
-            self.node.clone(),
+            node,
             StoreFacts::provisioned(),
         );
         let out = shell.handle(inbound);
-        self.ctx = shell.to_context().expect("a context after every call");
+        self.0.borrow_mut().ctx = shell.to_context().expect("a context after every call");
         let mut next = Vec::new();
         for op in out.ops {
             match op {
                 engine_delegate::schedule::Op::Put { id, bytes } => {
-                    self.node.put(id, &bytes);
+                    self.0.borrow().node.put(id, &bytes);
                     next.push(Inbound::PutAcked { id, ok: true });
                 }
                 engine_delegate::schedule::Op::Get { id, .. } => {
-                    let held = self.node.get(&id).map(|b| b.to_vec());
+                    let held = self.0.borrow().node.get(&id).map(|b| b.to_vec());
                     next.push(Inbound::GotState { id, bytes: held });
                 }
                 engine_delegate::schedule::Op::Head { seq, root } => {
-                    let mut h = self.head.0.borrow_mut();
+                    let head = self.0.borrow().head.clone();
+                    let mut h = head.0.borrow_mut();
                     if h.is_none_or(|(s, _)| seq > s) {
                         *h = Some((seq, root));
                     }
@@ -79,10 +105,12 @@ impl Conn {
                     drop(h);
                     next.push(Inbound::GotHead { seq, root });
                 }
-                engine_delegate::schedule::Op::ReadHead { .. } => match *self.head.0.borrow() {
-                    Some((seq, root)) => next.push(Inbound::GotHead { seq, root }),
-                    None => next.push(Inbound::NoHead),
-                },
+                engine_delegate::schedule::Op::ReadHead { .. } => {
+                    match *self.0.borrow().head.0.borrow() {
+                        Some((seq, root)) => next.push(Inbound::GotHead { seq, root }),
+                        None => next.push(Inbound::NoHead),
+                    }
+                }
             }
         }
         let mut replies = out.replies;
@@ -119,14 +147,20 @@ fn key(n: u32) -> Vec<u8> {
 }
 
 impl Client {
+    /// A client with its OWN delegate context: a second DEVICE.
     fn new(node: &Node, head: &Head) -> Client {
+        Client::on(Conn::new(node, head))
+    }
+
+    /// A client sharing a delegate context: a second TAB on one node.
+    fn tab(conn: Conn) -> Client {
+        Client::on(conn)
+    }
+
+    fn on(conn: Conn) -> Client {
         let mut c = Client {
             store: CachedStore::new(Box::new(|| 0)),
-            conn: Conn {
-                node: node.clone(),
-                head: head.clone(),
-                ctx: Vec::new(),
-            },
+            conn,
             asks: 0,
         };
         // START THE ENGINE. `Identity` is also how a session begins: answering
@@ -257,71 +291,78 @@ impl Client {
     }
 }
 
-/// **B, WHICH WROTE NOTHING, SEES A'S ROW — BY ASKING.**
+/// **TWO DEVICES: the second does NOT see the first's write.** Ignored, and
+/// it is not a phase-3 defect.
 ///
-/// # THIS TEST DOES NOT PASS, AND IT IS IGNORED RATHER THAN DELETED
+/// Each client here has its OWN delegate context, which is what two DEVICES
+/// are: two nodes, two delegates, two engine states. It is not what two tabs
+/// are — that was MEASURED (`probe/src/bin/two-connections.rs`) and two
+/// connections to one node share one context, which is why
+/// `two_tabs_on_one_node_see_each_others_writes` passes.
 ///
-/// What was measured, with the harness printing every reply:
+/// What this measures, with every reply printed:
 ///
-/// * B asks `ChangesSince` from the root it last saw, which is all zeroes
-///   because it has never been told one.
+/// * B asks `ChangesSince` from the root it last saw — all zeroes, having
+///   never been told one.
 /// * The engine answers **`FullReloadRequired`** with a real, non-zero
-///   `new_root` — correct: it cannot diff from a root it does not know.
-/// * The handler forgets the interval and re-requests it through `Loads`.
-/// * **The re-load returns 0 rows**, though the engine has just named the
+///   `new_root`. Correct: it cannot diff from a root it does not know.
+/// * The re-load returns **0 rows**, though the engine has just named the
 ///   root at which A's row exists.
 ///
-/// So B's engine answers a range read from the root it STANDS on, and
-/// nothing in the browser path makes it adopt a newer one. `Request::Tick`
-/// was tried and did not change the outcome. The engine does emit
-/// `Effect::ReadHead`, so it is not that the head is never read — it is that
-/// reading it does not move what a subsequent `Range` is answered from, or
-/// not by this route.
+/// So an engine answers a range read from the root it STANDS on, and nothing
+/// makes it adopt a newer head IT DID NOT WRITE. `Request::Tick` was tried
+/// and changed nothing.
 ///
-/// Whether that is a harness gap or a real defect I have NOT established,
-/// and I am not going to keep re-running it until it goes green. It is the
-/// same question the `Tick`/`Flush` work is about — a delegate has no clock,
-/// so anything that should happen "later" happens only when something sends
-/// it time — and it is load-bearing for the two-tab acceptance: this is
-/// exactly what tab B is.
+/// That is a real design item and it is multi-device (sdk#78, phase 6), not
+/// this phase. The hard half is the case where the adopting engine holds
+/// unpublished writes of its own.
 ///
-/// The control below PASSES and is the half that is already worth having: a
-/// client that never asks sees nothing, so reading alone can never refresh.
+/// Kept rather than deleted, because it is the measurement.
+/// **TWO DEVICES: the second does NOT see the first's write.**
 ///
-/// The path a real second tab is on: its own engine, the same node. B starts
-/// and loads BEFORE A writes, which is what makes the test mean anything —
-/// B's engine then holds an older head, and nothing but asking can close the
-/// gap. A client that happened to start afterwards would see the row through
-/// its first read and prove nothing about refreshing.
+/// Ignored, and it is NOT a phase-3 defect.
+///
+/// Each client here has its OWN delegate context, which is what two DEVICES
+/// are: two nodes, two delegates, two engine states. It is not what two tabs
+/// are — that was MEASURED (`probe/src/bin/two-connections.rs`): two
+/// connections to one node share one context, which is why
+/// `two_tabs_on_one_node_see_each_others_writes` passes.
+///
+/// What this measures, with every reply printed:
+///
+/// * B asks `ChangesSince` from the root it last saw — all zeroes, having
+///   never been told one.
+/// * The engine answers **`FullReloadRequired`** with a real, non-zero
+///   `new_root`. Correct: it cannot diff from a root it does not know.
+/// * The re-load returns **0 rows**, though the engine has just named the
+///   root at which A's row exists.
+///
+/// So an engine answers a range read from the root it STANDS on, and nothing
+/// makes it adopt a newer head IT DID NOT WRITE. `Request::Tick` was tried
+/// and changed nothing. That is a real design item, and it is multi-device
+/// (sdk#78, phase 6). The hard half is the case where the adopting engine
+/// holds unpublished writes of its own.
+///
+/// Kept rather than deleted, because it IS the measurement.
 #[test]
-#[ignore = "OPEN FINDING: B's engine does not adopt a newer head — see the comment"]
-fn a_silent_client_sees_the_other_ones_write_by_asking() {
+#[ignore = "TWO DEVICES, not two tabs: an engine does not adopt a head it did not write (sdk#78, phase 6)"]
+fn a_second_device_does_not_see_the_first_ones_write() {
     let (node, head) = (Node::default(), Head::default());
-    let mut a = Client::new(&node, &head);
-    let mut b = Client::new(&node, &head);
+    let mut a = Client::new(&node, &head); // its OWN context
+    let mut b = Client::new(&node, &head); // and its own
 
     b.load();
-    assert_eq!(b.rows(), 0, "the domain should start empty");
-    let asks_before = b.asks;
-
+    assert_eq!(b.rows(), 0);
     a.write(&key(1), b"first");
 
-    // B is told the head moved, and asks what changed since the root it last
-    // saw. Nothing else happens to B.
     let mut r = Refresh::new();
-    b.tick(); // the engine re-reads its head
-    let changed = b.refresh(&mut r);
+    b.tick();
+    let _ = b.refresh(&mut r);
 
-    assert!(b.asks > asks_before, "B did not send ChangesSince");
-    assert_eq!(
-        changed,
-        vec!["note".to_string()],
-        "the delta did not report the domain as moved, so no binding would re-run"
-    );
     assert_eq!(
         b.rows(),
         1,
-        "B asked, was answered, and still cannot see the row A wrote"
+        "the second device never adopted the head the first wrote"
     );
 }
 
@@ -347,6 +388,60 @@ fn control_a_client_that_never_asks_sees_nothing_new() {
         0,
         "B saw a row without asking for it, so the test above proves nothing \
          about asking"
+    );
+}
+
+/// **TWO TABS: B, WHICH WROTE NOTHING, SEES A'S ROW BY ASKING.**
+///
+/// The shape a node actually gives them: one delegate, ONE context, two
+/// connections. Measured, not assumed — see `Conn`.
+#[test]
+fn two_tabs_on_one_node_see_each_others_writes() {
+    let (node, head) = (Node::default(), Head::default());
+    let conn = Conn::new(&node, &head);
+    let mut a = Client::tab(conn.clone());
+    let mut b = Client::tab(conn.clone());
+
+    b.load();
+    assert_eq!(b.rows(), 0, "the domain should start empty");
+    let asks_before = b.asks;
+
+    a.write(&key(1), b"first");
+
+    // B is told the head moved and asks what changed. Nothing else happens
+    // to B: it made no write and issued no read of its own.
+    let mut r = Refresh::new();
+    let changed = b.refresh(&mut r);
+
+    assert!(b.asks > asks_before, "B did not send ChangesSince");
+    assert_eq!(
+        b.rows(),
+        1,
+        "B asked, was answered, and still cannot see the row A wrote"
+    );
+    assert_eq!(
+        changed,
+        vec!["note".to_string()],
+        "the answer did not report the domain as moved, so no binding would re-run"
+    );
+}
+
+/// THE CONTROL for the tab case: without asking, B sees nothing.
+#[test]
+fn control_a_tab_that_never_asks_sees_nothing_new() {
+    let (node, head) = (Node::default(), Head::default());
+    let conn = Conn::new(&node, &head);
+    let mut a = Client::tab(conn.clone());
+    let mut b = Client::tab(conn.clone());
+
+    b.load();
+    a.write(&key(1), b"first");
+    b.pump(); // B turns its connection over; it never ASKS
+
+    assert_eq!(
+        b.rows(),
+        0,
+        "B saw a row without asking, so the test above proves nothing about asking"
     );
 }
 
