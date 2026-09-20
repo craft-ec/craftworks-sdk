@@ -243,6 +243,14 @@ fn a_proof_costs_about_what_locating_the_key_costs() {
     let locate = expected(&store, &root, Op::Get(key));
     let proof = expected(&store, &root, Op::Proof(key));
 
+    // Equality alone would hold if both were zero, which is the shape the
+    // instrument audit was held for: an assertion that two things AGREE says
+    // nothing until one of them is pinned to a real value.
+    assert!(
+        locate.blocks > 1 && locate.bytes > 0,
+        "the path through a tree with branches is more than one node: {locate:?}"
+    );
+
     // A proof IS the root-to-leaf path, so it touches the same nodes.
     assert_eq!(proof.blocks, locate.blocks);
     assert_eq!(proof.bytes, locate.bytes);
