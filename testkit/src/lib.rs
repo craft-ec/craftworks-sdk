@@ -33,6 +33,9 @@
 //! test holds returns unit and has no read-back, so a probe can never become
 //! an input.
 
+pub mod full_node;
+pub use full_node::{Conn, DumpConnOnPanic, FullNode, Served};
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;

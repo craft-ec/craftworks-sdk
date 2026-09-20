@@ -5,7 +5,7 @@
 //! defect invisible again, which is the failure this crate exists to end.
 
 use instrument::Record;
-use testkit::{Clock, DumpOnPanic, Node};
+use testkit::{Clock, DumpOnPanic, Node, Served};
 
 /// The clock MOVES. The thing it replaces — `Box::new(|| 0)`, written by hand
 /// in six files — could not, and nothing in the SDK's tests could observe time
@@ -233,4 +233,145 @@ fn the_shell_detects_the_version_a_client_spoke() {
     let mut quiet = Node::new();
     let _ = quiet.step(Vec::new());
     assert_eq!(quiet.detected_client_version(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The full-node fixture (sdk#94)
+// ---------------------------------------------------------------------------
+
+fn a_write(n: u64) -> protocol::Request {
+    protocol::Request::Write {
+        write_id: n,
+        ops: vec![protocol::Op::Put(
+            format!("k/{n:06}").into_bytes(),
+            vec![(n % 251) as u8; 512],
+        )],
+    }
+}
+
+/// THE test that decides whether this fixture is worth having.
+///
+/// A full-node fixture that only ever served puts would be the put-only
+/// fixture wearing a new name, and no assertion about a reply's CONTENT can
+/// tell the difference — a test can pass while three of the four op kinds are
+/// silently dropped, which is exactly the state that made three files
+/// hand-roll their own node.
+///
+/// So this counts the kinds. A put-only fixture scores 1 and fails on the
+/// first assertion below.
+#[test]
+fn the_full_node_answers_more_than_puts() {
+    let node = testkit::FullNode::new();
+
+    // A write drives Put, Head and ReadHead.
+    let mut w = node.connect();
+    w.client(&protocol::Request::Identity);
+    for i in 1..=4 {
+        w.client(&a_write(i));
+    }
+
+    assert!(w.served(Served::Put) > 0, "no put was served");
+    assert!(
+        w.served(Served::Head) > 0,
+        "the head was never written: a commit that never publishes looks like \
+         a write that worked"
+    );
+    assert!(
+        w.served(Served::ReadHead) > 0,
+        "the head was never read back"
+    );
+    assert!(
+        w.kinds_served() >= 3,
+        "a writer drove only {} kind(s) — a put-only fixture scores 1, and \
+         that is the thing this fixture exists not to be",
+        w.kinds_served()
+    );
+
+    // `Op::Get` is the one a writer never drives: the delegate reads blocks
+    // the node HOLDS straight through, and only ASKS for one it does not have.
+    // That is the cold case — a head naming a root nobody holds.
+    let cold = testkit::FullNode::new();
+    cold.set_head(1, [9u8; 32]);
+    let mut r = cold.connect();
+    r.client(&protocol::Request::Identity);
+    r.client(&protocol::Request::Get {
+        req_id: 1,
+        key: b"anything".to_vec(),
+    });
+
+    assert!(
+        r.served(Served::Get) > 0,
+        "the block was not held and the node was never asked for it: a cold \
+         read that silently answers nothing is the defect, not the test"
+    );
+    assert!(
+        r.replies()
+            .iter()
+            .any(|x| matches!(x, protocol::Reply::Unavailable { .. })),
+        "a missing root must come back as Unavailable, naming what it is \
+         blocked on: {:?}",
+        r.replies()
+    );
+
+    // All four, across the two shapes. The put-only fixture serves one.
+    assert_eq!(
+        w.served(Served::Get) + r.served(Served::Get),
+        r.served(Served::Get),
+        "sanity: only the cold reader should drive a Get"
+    );
+}
+
+/// One node, two clients: what one writes, the other reads.
+///
+/// The shape `tests/two_clients.rs` needed. Each connection keeps its own
+/// delegate context; the blocks and the head are the node's.
+#[test]
+fn two_connections_share_one_node() {
+    let node = testkit::FullNode::new();
+    let mut a = node.connect();
+    let mut b = node.connect();
+
+    a.client(&protocol::Request::Identity);
+    a.client(&a_write(1));
+    let head_after_write = node.head();
+    assert!(head_after_write.is_some(), "the writer published a head");
+
+    b.client(&protocol::Request::Identity);
+    b.client(&protocol::Request::Get {
+        req_id: 7,
+        key: b"k/000001".to_vec(),
+    });
+
+    let found = b.replies().iter().any(
+        |x| matches!(x, protocol::Reply::Value { req_id: 7, value: Some(v) } if v.len() == 512),
+    );
+    assert!(
+        found,
+        "the second client did not see the first client's write: {:?}",
+        b.replies()
+    );
+
+    // Separate contexts, one node.
+    assert!(a.context_len() > 0 && b.context_len() > 0);
+    assert_eq!(b.served(Served::Put), 0, "the reader wrote nothing");
+}
+
+/// The full node REHYDRATES too.
+///
+/// The put-only fixture's headline property, and it would be quietly lost by a
+/// second fixture that kept a shell alive across calls.
+#[test]
+fn the_full_node_rebuilds_the_shell_from_its_context() {
+    let node = testkit::FullNode::new();
+    let mut c = node.connect();
+    c.client(&protocol::Request::Identity);
+    let after_first = c.context_len();
+    assert!(
+        after_first > 0,
+        "nothing was carried between calls, so nothing can be lost between \
+         them either — which is the defect class this fixture exists to see"
+    );
+
+    c.client(&a_write(1));
+    assert!(node.blocks() > 0, "the write reached the node's store");
 }
