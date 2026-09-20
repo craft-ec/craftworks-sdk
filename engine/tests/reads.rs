@@ -205,6 +205,9 @@ fn cold_reads_answer_what_a_fully_held_tree_answers() {
                         stepped!(e, Event::BlockMissed(id))
                     } else if let Some(bytes) = all.get(&id) {
                         let bytes = bytes.to_vec();
+                        // Put, THEN tell: the engine keeps no block bytes of
+                        // its own, so an arrival it cannot read is not one.
+                        store.put(id, &bytes);
                         let mut out = stepped!(
                             e,
                             Event::BlockArrived {
@@ -588,8 +591,10 @@ fn requests_waiting_on_one_block_share_its_fetch() {
     let (_, root, _all) = fixture(400);
     let key = b"k/00123".to_vec();
 
+    // No block is ever delivered here: the count is of the fetches the first
+    // step asks for, so the store stays empty on purpose.
     let count = |share: bool| -> usize {
-        let (mut e, store) = reader(
+        let (mut e, _store) = reader(
             root,
             Params {
                 share_fetches: share,
@@ -623,12 +628,17 @@ fn requests_waiting_on_one_block_share_its_fetch() {
 fn a_hostile_preload_costs_the_budget() {
     let (_, root, all) = fixture(2_000);
     let (mut e, store) = reader(root, Params::default());
-    // The session holds this root and nothing else.
+    // The session holds this root and nothing else -- in the STORE, which is
+    // where the engine reads. Telling it about a block it cannot then read
+    // makes the preload start by fetching the root, and the budget assertion
+    // below would pass over a preload that never descended at all.
+    let root_bytes = all.get(&root).expect("held").to_vec();
+    store.put(root, &root_bytes);
     stepped!(
         e,
         Event::BlockArrived {
             id: root,
-            bytes: all.get(&root).expect("held").to_vec(),
+            bytes: root_bytes,
         }
     );
     e.reset_cost();
@@ -809,11 +819,17 @@ fn no_read_sequence_panics_and_every_read_answers() {
             assert!(steps < 50_000, "seed {seed}: the drain did not finish");
             match f {
                 Effect::FetchBlock { id, .. } => {
+                    // The node puts it, THEN tells the engine. Telling alone
+                    // makes no block readable — the engine keeps none — so a
+                    // drain that only tells re-asks for ever.
                     let ev = match all.get(&id) {
-                        Some(b) => Event::BlockArrived {
-                            id,
-                            bytes: b.to_vec(),
-                        },
+                        Some(b) => {
+                            store.put(id, b);
+                            Event::BlockArrived {
+                                id,
+                                bytes: b.to_vec(),
+                            }
+                        }
                         None => Event::BlockMissed(id),
                     };
                     queue.extend(stepped!(e, ev));
@@ -839,63 +855,6 @@ fn no_read_sequence_panics_and_every_read_answers() {
     println!("  {cases} read events across 20 seeds, no panic and no read left unanswered");
 }
 
-/// Drive a read to an answer within a STEP budget, so a read that never
-/// answers is a failure rather than a hang.
-///
-/// `no_read_sequence_panics` cannot see this: a read that loops for ever
-/// never panics, and a sweep that only asks "did it panic" is green while the
-/// delegate spins out its 5 s slice on one key.
-fn settle_bounded(
-    e: &mut Engine<Store>,
-    store: &Store,
-    all: &MemBlocks,
-    first: Vec<Effect>,
-    budget: usize,
-) -> Result<Vec<(ReqId, ReadResult)>, usize> {
-    let mut queue = first;
-    let mut out = Vec::new();
-    let mut steps = 0;
-    while let Some(f) = queue.pop() {
-        steps += 1;
-        if steps > budget {
-            return Err(steps);
-        }
-        match f {
-            Effect::FetchBlock { id, .. } => {
-                // What a node does: the GET populates its store, and only
-                // then is the engine told. The engine keeps nothing itself.
-                let ev = match all.get(&id) {
-                    Some(b) => {
-                        store.put(id, b);
-                        Event::BlockArrived {
-                            id,
-                            bytes: b.to_vec(),
-                        }
-                    }
-                    None => Event::BlockMissed(id),
-                };
-                queue.extend(stepped!(e, ev));
-            }
-            Effect::Reply { req_id, result, .. } => out.push((req_id, result)),
-            _ => {}
-        }
-    }
-    Ok(out)
-}
-
-/// A store that FORGETS between steps still answers every read — bounded, and
-/// with a reply.
-///
-/// This is the livelock lesson in its new home. The old engine held a warm
-/// set, and a tight bound on it evicted the path a read had just paid for:
-/// the read asked again, the fetch SUCCEEDED so the attempt budget never
-/// tripped, and nothing ever ended. That machinery is gone — the core holds
-/// no blocks — but the HAZARD is not, and it is now the platform's: a sync
-/// read does not refresh hosting (F33), so a block a descent read on one call
-/// can be evicted before the next.
-///
-/// So the property is the same and the mechanism is different: whatever the
-/// node forgets, a read ends in a REPLY. Never a loop, and never silence.
 #[test]
 fn a_forgetful_store_still_answers_every_read() {
     use common::{Harness, Mode};

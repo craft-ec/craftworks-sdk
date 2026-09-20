@@ -98,6 +98,11 @@ impl Blocks for Store {
 
 impl Store {
     pub fn put(&self, id: Cid, bytes: &[u8]) {
+        // Re-putting the same block is normal on a network, and the leak is
+        // per call, so dedupe: a fuzz loop puts the same id thousands of times.
+        if self.inner.borrow().contains_key(&id) {
+            return;
+        }
         let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
         self.inner.borrow_mut().insert(id, leaked);
     }

@@ -489,8 +489,14 @@ pub struct Engine<B: Blocks> {
     /// "swap one for two" without drifting. `ParityComplete` is a state of the
     /// WRITE — reported once, when this set empties.
     parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<ParityIds>>,
-    /// When the oldest write not yet in a commit was accepted.
-    folded_since: Option<u64>,
+    /// When the commit now in flight was started.
+    ///
+    /// It used to be "when the oldest write not yet in a commit was
+    /// accepted", back when writes folded behind an open commit. Under one
+    /// commit at a time nothing waits outside a commit — a write arriving
+    /// behind one is refused — so the write left sitting `Accepted` is the
+    /// in-flight commit's own, and this is the clock for it.
+    in_flight_since: Option<u64>,
     /// Writes already told they are stalled, so the notice is sent once.
     told_stalled: BTreeSet<(ClientId, WriteId)>,
     /// Where this engine's authority came from, as STATED at `Start`.
@@ -561,7 +567,7 @@ impl<B: Blocks> Engine<B> {
             owed: BTreeMap::new(),
             in_flight_parity: BTreeMap::new(),
             parity_waiting: BTreeMap::new(),
-            folded_since: None,
+            in_flight_since: None,
             told_stalled: BTreeSet::new(),
             key: None,
             epochs: Vec::new(),
@@ -721,7 +727,7 @@ impl<B: Blocks> Engine<B> {
             .chain(std::mem::take(&mut self.folded))
             .collect();
         self.folded_bytes = 0;
-        self.folded_since = None;
+        self.in_flight_since = None;
         self.unpublished.clear();
         self.coded_since_commit.clear();
         self.adopt(seq, root);
@@ -1028,11 +1034,12 @@ impl<B: Blocks> Engine<B> {
         out.extend(std::mem::take(&mut self.pending_notifications));
         self.folded.push((client, write_id));
         self.folded_bytes += size;
-        self.folded_since.get_or_insert(self.now);
-        if self.pending.is_none() {
-            let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship));
-        }
+        // `folded` is a handoff, not a queue: nothing reached here unless
+        // `pending` was none, so `start_commit` drains it in this same call
+        // and it is empty at every point an event can observe.
+        debug_assert!(self.pending.is_none());
+        let to_ship = self.take_unpublished();
+        out.extend(self.start_commit(to_ship));
         out
     }
 
@@ -1250,7 +1257,7 @@ impl<B: Blocks> Engine<B> {
         let seq = self.next_seq;
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
-        self.folded_since = None;
+        self.in_flight_since = Some(self.now);
         // In a commit now, so no longer stalled: if it stalls again later that
         // is a new fact and deserves a new notice.
         for w in &writes {
@@ -1482,11 +1489,10 @@ impl<B: Blocks> Engine<B> {
         if !self.params.coalesce_parity {
             out.extend(self.emit_parity(|_| true));
         }
-        // Whatever arrived while this commit was in flight becomes the next.
-        if !self.folded.is_empty() {
-            let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship));
-        }
+        // Nothing arrived while this commit was in flight: under one commit
+        // at a time such a write was refused, not held. There is no follow-on
+        // commit to start here.
+        debug_assert!(self.folded.is_empty());
         out
     }
 
@@ -1525,38 +1531,34 @@ impl<B: Blocks> Engine<B> {
 
     /// Say so when a write has sat merely accepted too long.
     ///
-    /// If nothing is in flight the answer is to commit it, and that happens
-    /// first. What this reports is the other case: a commit that cannot
-    /// publish, with writes folding behind it.
+    /// What this reports is a commit that cannot publish, with its own writes
+    /// sitting `Accepted` and nothing moving.
     ///
-    /// They are NOT dropped. Their edits are in the tree and will ship with
-    /// the next commit, so telling a client `Failed` would be a false
+    /// They are NOT dropped. Their edits are in the tree and publish when the
+    /// commit confirms, so telling a client `Failed` would be a false
     /// statement with teeth: the client re-submits, the original publishes
     /// anyway, and a write someone else made in between is overwritten by the
     /// re-submission. `Stalled` says what is true -- still held, not saved,
-    /// not moving. Memory stays bounded by the backlog refusing NEW writes
-    /// with `Busy`, never by forgetting ones already accepted.
+    /// not moving. Memory stays bounded by NEW writes being refused with
+    /// `Busy`, never by forgetting ones already accepted.
     fn age_out_accepted(&mut self, now: u64) -> Vec<Effect> {
-        // Nothing in flight and something waiting: commit it rather than
-        // report it. This is the case a failed commit leaves behind.
-        if self.pending.is_none() && !self.folded.is_empty() {
-            let to_ship = self.take_unpublished();
-            return self.start_commit(to_ship);
-        }
         if !self.params.bound_accept_age {
             return Vec::new();
         }
-        let Some(since) = self.folded_since else {
+        let Some(since) = self.in_flight_since else {
             return Vec::new();
         };
         if now.saturating_sub(since) < self.params.max_accept_age {
             return Vec::new();
         }
+        let Some(commit) = self.pending.as_ref() else {
+            return Vec::new();
+        };
         // Once per write: a notice repeated every tick is noise a caller
         // learns to ignore, and this one matters.
-        let folded = self.folded.clone();
+        let writes = commit.writes.clone();
         let mut out = Vec::new();
-        for w in folded {
+        for w in writes {
             if self.told_stalled.insert(w) {
                 out.push(Effect::Notify {
                     client: w.0,

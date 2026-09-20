@@ -455,21 +455,25 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
 }
 
 /// (e): a write never sits merely `accepted` in silence — and a stalled
-/// write still gets saved.
+/// write still gets saved, while a refused one leaves no trace.
 ///
-/// `accepted` survives a refresh and not a restart, so it is exposure. With
-/// one commit in flight, a write arriving behind a commit that cannot publish
-/// would wait unheard. At T it is told `Stalled`: still held, not saved, not
-/// moving.
+/// `accepted` survives a refresh and not a restart, so it is exposure. A
+/// commit that cannot publish leaves its own write sitting accepted, and at
+/// T that write is told `Stalled`: still held, not saved, not moving.
 ///
 /// `Stalled` is NOT `Failed`, and the difference is the whole point. The
-/// edit is still in the tree and ships with the next commit, so reporting
+/// edit is still in the tree and ships when the commit confirms, so reporting
 /// `Failed` would be a false statement with consequences — the client
 /// re-submits, the original publishes anyway, and a write someone else made
-/// in between is overwritten by the re-submission. So this asserts both
-/// halves: the notice arrives, and the write still reaches `Published`.
+/// in between is overwritten by the re-submission.
+///
+/// Writes arriving BEHIND it are the other half, and under one-commit-at-a-
+/// time they are refused rather than folded. `Busy` is terminal and must
+/// leave nothing behind: this asserts the published tree contains write 1's
+/// key and none of theirs, because a write both applied and refused is the
+/// double-apply hazard `Stalled` exists to avoid, wearing the other mask.
 #[test]
-fn a_stalled_write_is_reported_once_and_still_reaches_published() {
+fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
     let t = 8u64;
     let mut net = Network::default();
     let mut e = boot(
@@ -503,7 +507,7 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         "the first commit shipped nothing to hold back"
     );
 
-    // Writes 2..6 fold behind it.
+    // Writes 2..6 arrive behind it.
     let mut seen: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
     let absorb = |seen: &mut BTreeMap<WriteId, Vec<State>>, fx: &[Effect]| {
         for f in fx {
@@ -527,32 +531,53 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         );
         absorb(&mut seen, &out);
     }
+    // Each of them was answered in the step that submitted it. Not eventually,
+    // and not by a tick: a caller that got no reply has nothing to wait on.
+    for n in 2..=6u64 {
+        assert_eq!(
+            seen.get(&WriteId(n)).map(Vec::as_slice),
+            Some([State::Busy].as_slice()),
+            "write {n} arrived behind an open commit and was not refused in \
+             the same step"
+        );
+    }
+
     // Time passes with the commit stuck.
     for tick in 1..=(t * 3) {
         let out = stepped!(e, Event::Tick(tick));
         absorb(&mut seen, &out);
     }
 
+    // Write 1 is the one that is genuinely held: it was accepted, its edit is
+    // in the tree, and it cannot publish. That is what `Stalled` describes.
+    let one = seen.get(&WriteId(1)).cloned().unwrap_or_default();
+    assert!(
+        one.contains(&State::Stalled),
+        "write 1 sat accepted for {}+ ticks and was never reported Stalled: \
+         {one:?}",
+        t * 3
+    );
+    assert_eq!(
+        one.iter().filter(|s| **s == State::Stalled).count(),
+        1,
+        "write 1 was told Stalled more than once; a notice repeated every \
+         tick is one a caller learns to ignore"
+    );
+    assert!(
+        !one.contains(&State::Failed),
+        "write 1 was reported Failed while its edit is still in the tree"
+    );
+    // A refused write is not a stalled one, and a tick must not change its
+    // mind: `Busy` is terminal.
     for n in 2..=6u64 {
-        let states = seen.get(&WriteId(n)).cloned().unwrap_or_default();
-        assert!(
-            states.contains(&State::Stalled),
-            "write {n} sat accepted for {}+ ticks and was never reported Stalled: {states:?}",
-            t * 3
-        );
         assert_eq!(
-            states.iter().filter(|s| **s == State::Stalled).count(),
-            1,
-            "write {n} was told Stalled more than once; a notice repeated every \
-             tick is one a caller learns to ignore"
-        );
-        assert!(
-            !states.contains(&State::Failed),
-            "write {n} was reported Failed while its edit is still in the tree"
+            seen.get(&WriteId(n)).map(Vec::as_slice),
+            Some([State::Busy].as_slice()),
+            "write {n} was refused and then told something else as well"
         );
     }
 
-    // Now the network answers, and the stalled writes get saved.
+    // Now the network answers, and the stalled write gets saved.
     let mut queue = first;
     for (id, bytes) in &held {
         net.confirm(*id, bytes);
@@ -578,19 +603,41 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         }
     }
 
-    for n in 2..=6u64 {
-        let states = seen.get(&WriteId(n)).cloned().unwrap_or_default();
-        assert!(
-            states.contains(&State::Published),
-            "write {n} was told Stalled and never reached Published: {states:?}. \
-             A stalled write is still held and still gets saved — that is what \
-             makes the notice honest"
-        );
-        assert!(
-            valid_sequence(&states),
-            "write {n} reported an impossible sequence: {states:?}"
-        );
-    }
+    let one = seen.get(&WriteId(1)).cloned().unwrap_or_default();
+    assert!(
+        one.contains(&State::Published),
+        "write 1 was told Stalled and never reached Published: {one:?}. A \
+         stalled write is still held and still gets saved — that is what \
+         makes the notice honest"
+    );
+    assert!(
+        valid_sequence(&one),
+        "write 1 reported an impossible sequence: {one:?}"
+    );
+
+    // The refused writes left NO trace. Compared against a tree built from
+    // write 1's key alone: if any of k2..k6 had been applied and refused, the
+    // roots differ, and a re-submitting client would apply it twice.
+    let mut only_one: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    only_one.insert(b"a".to_vec(), vec![1u8; 40]);
+    let (_, published) = net.head.expect("the commit never published a head");
+    assert_eq!(
+        published,
+        rebuild(&only_one),
+        "the published tree is not write 1's edit alone, so a write that was \
+         told Busy was applied anyway"
+    );
+    // ...and the comparison is sensitive: a tree that DID contain a refused
+    // key has a different root. Without this, the assertion above would pass
+    // just as well if `rebuild` returned a constant.
+    let mut with_k2 = only_one.clone();
+    with_k2.insert(b"k2".to_vec(), vec![2u8; 40]);
+    assert_ne!(
+        rebuild(&with_k2),
+        published,
+        "the root comparison cannot tell a refused write's key apart, so it \
+         proves nothing"
+    );
 
     // The control: with the bound off, nobody is told anything.
     let net2 = Network::default();
@@ -611,16 +658,6 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
             ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
         }
     );
-    for n in 2..=6u64 {
-        let _ = stepped!(
-            e2,
-            Event::Write {
-                client: ClientId(1),
-                write_id: WriteId(n),
-                ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
-            }
-        );
-    }
     for tick in 1..=(t * 3) {
         for f in stepped!(e2, Event::Tick(tick)) {
             if let Effect::Notify {
@@ -637,7 +674,10 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         "the control reported {stalled} Stalled notice(s), so the bound is not \
          what produces them"
     );
-    println!("  five writes stalled once each and all reached Published; control: 0 notices");
+    println!(
+        "  write 1 stalled once and published; writes 2-6 refused once each \
+         and left no key behind; control: 0 notices"
+    );
 }
 
 /// Is this a sequence a write can legally report?
@@ -754,29 +794,47 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
 /// history under the same key. Its in-flight writes are reported `Lost`,
 /// because their commit is not going to publish and the client is the only
 /// thing that still has them.
+///
+/// `Lost` is owed to exactly the writes the engine ACCEPTED. A write refused
+/// with `Busy` was already answered and is already the client's problem;
+/// telling it `Lost` as well would be a second terminal state for one write,
+/// and a client tracking states would see its write end twice. So the
+/// expected set is read off the accept notices rather than written out, and
+/// the refused write is asserted to stay at the one answer it got.
 #[test]
 fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
     let net = Network::default();
     let mut e = boot(&net, Params::default());
     let before = e.published_root();
 
-    let _ = stepped!(
-        e,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops: vec![(b"mine".to_vec(), Op::Put(vec![1u8; 40]))],
+    let mut answers: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
+    for (n, key) in [(1u64, &b"mine"[..]), (2, &b"also-mine"[..])] {
+        for f in stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(n),
+                ops: vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))],
+            }
+        ) {
+            if let Effect::Notify {
+                write_id, state, ..
+            } = f
+            {
+                answers.entry(write_id).or_default().push(state);
+            }
         }
-    );
-    let _ = stepped!(
-        e,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(2),
-            ops: vec![(b"also-mine".to_vec(), Op::Put(vec![2u8; 40]))],
-        }
-    );
+    }
     assert_ne!(e.root(), before, "the writes did not reach the warm tree");
+    let accepted: Vec<WriteId> = answers
+        .iter()
+        .filter(|(_, st)| st.contains(&State::Accepted))
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(
+        !accepted.is_empty(),
+        "no write was accepted, so there is nothing this test can lose and          the Lost assertion below would hold over the empty set"
+    );
 
     // The other engine got there first.
     let theirs: BTreeMap<Vec<u8>, Vec<u8>> = (0..30u32)
@@ -813,12 +871,32 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
         })
         .collect();
     assert_eq!(
-        lost,
-        vec![WriteId(1), WriteId(2)],
-        "the in-flight writes were not reported Lost, so a client would wait \
-         for ever on a commit that will never publish"
+        lost, accepted,
+        "Lost was not reported for exactly the writes the engine accepted, so \
+         either a client waits for ever on a commit that will never publish, \
+         or a write it already answered ends a second time"
     );
-    println!("  conflict: loser adopts the winner's head, both writes reported Lost");
+    for (w, st) in &answers {
+        if st.contains(&State::Accepted) {
+            continue;
+        }
+        assert_eq!(
+            st.as_slice(),
+            [State::Busy].as_slice(),
+            "{w:?} was refused and then told something else as well"
+        );
+        assert!(
+            !lost.contains(w),
+            "{w:?} was refused with Busy and reported Lost too: one write, \
+             two terminal states"
+        );
+    }
+    let refused = answers.len() - accepted.len();
+    println!(
+        "  conflict: loser adopts the winner's head; {} accepted write(s) \
+         reported Lost, {refused} refused one(s) left alone",
+        accepted.len()
+    );
 }
 
 /// A write whose edit is still in the tree is never reported `Failed`.
