@@ -41,6 +41,15 @@ const rethrow = e => {
   throw e;
 };
 
+/** Are these the same rows? By id and `updated`, as the in-memory one does. */
+const same = (a, b) => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id || a[i].updated !== b[i].updated) return false;
+  }
+  return true;
+};
+
 export function engineDb(handle) {
   // Either the object `openSession` returns, or a bare session. The wrapper
   // is what knows when a message arrived, so when there is one this registers
@@ -157,7 +166,8 @@ export function engineDb(handle) {
     }
   };
 
-  return {
+  // Named so `bind` can reach the surface it is part of.
+  const self = {
     // ---- writes: no reload can help, so they are not retried ----
     async define(domain, schema) {
       try { return session.define(domain, JSON.stringify(schema)); } catch (e) { rethrow(e); }
@@ -179,6 +189,54 @@ export function engineDb(handle) {
     count:   d       => once(() => session.count(d)),
     scan: (domain, { reverse = false, limit = 0, after = "" } = {}) =>
       once(() => JSON.parse(session.scan(domain, reverse, limit, after))),
+
+    /**
+     * A BINDING: one domain, as a component consumes it.
+     *
+     * The same shape the in-memory `Db` gives — `subscribe`, a referentially
+     * stable `getSnapshot`, an awaited `reload` — because "Publish switches
+     * the backend and the app code does not change" has to be true of the
+     * object a component actually holds, not only of the database it came
+     * from.
+     *
+     * It was NOT true. `engineDb` had no `bind` at all, so a published
+     * project threw `db.bind is not a function` the moment it rendered. The
+     * surface gate did not see it: that compares the two WASM objects, and
+     * `bind` lives on the JavaScript wrapper.
+     *
+     * `live` is the only difference, and it is a declaration, not a mode: a
+     * live binding is re-run when the head moves, a plain one when it is
+     * reloaded. Both have the same snapshot and the same subscribe, so
+     * flipping it never changes the component.
+     */
+    bind(domain, { live = false } = {}) {
+      let rows = [], root = null;
+      const listeners = new Set();
+      const b = {
+        get live() { return live; },
+        // The SAME array until the rows change: a caller re-rendering on
+        // every identity change would re-render for ever otherwise.
+        getSnapshot: () => rows,
+        subscribe: cb => { listeners.add(cb); return () => listeners.delete(cb); },
+        async reload() {
+          // The root first: a reload with nothing to do reads nothing.
+          const r = self.root();
+          if (r && r === root) return false;
+          const next = await self.scan(domain);
+          root = r;
+          if (same(rows, next)) return false;
+          rows = next;
+          for (const cb of listeners) cb();
+          return true;
+        },
+      };
+      // A live binding is re-run when the SESSION says this domain is stale.
+      // A plain one takes out no watch at all, which is the whole cost
+      // difference between them.
+      if (live) b.stop = self.watch(domain, () => { b.reload(); });
+      b.reload();
+      return b;
+    },
 
     /**
      * Watch a domain: `cb` runs when the head moves and this domain is
@@ -244,4 +302,5 @@ export function engineDb(handle) {
     trace: () => JSON.parse(session.trace()),
     traceOn: on => session.trace_on(on),
   };
+  return self;
 }
