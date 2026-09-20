@@ -36,6 +36,8 @@ pub struct CachedStore {
     /// That is the worst answer available, so the key is remembered until
     /// something is written to it again.
     rolled_back: std::collections::BTreeSet<Vec<u8>>,
+    /// Verdicts for writes this client never issued.
+    unknown_verdicts: usize,
     /// The clock, handed in for the same reason the traces' is: this crate
     /// compiles to wasm and to a host binary and must not reach for one.
     now_ms: Box<dyn Fn() -> u64>,
@@ -49,6 +51,7 @@ impl CachedStore {
             next_write_id: 1,
             refused: Vec::new(),
             rolled_back: std::collections::BTreeSet::new(),
+            unknown_verdicts: 0,
             now_ms,
         }
     }
@@ -97,8 +100,63 @@ impl CachedStore {
     }
 
     /// A message arrived from the node.
+    ///
+    /// **This is what takes a write OUT of the pending list**, and for a
+    /// while nothing did. A write entered the copy as pending and stayed
+    /// there: at `max_pending` the copy began refusing writes and the app
+    /// could make no more, every row reported `PENDING` for ever so none
+    /// could say "saved", and `tick` eventually rolled them all back as
+    /// `Unknown` — every write a person made turning into "not applied".
+    ///
+    /// Found by writing 300 records and asserting that 300 arrived: 256 did,
+    /// and 44 were refused. For every state a thing can enter, there has to
+    /// be named code that takes it out.
     pub fn on_inbound(&mut self, bytes: &[u8]) {
+        if let Ok(protocol::Reply::WriteState { write_id, state }) = protocol::decode_reply(bytes) {
+            self.on_write_state(write_id, state);
+        }
         self.client.on_inbound(bytes);
+    }
+
+    /// Move a write through the copy, as the engine reports it.
+    ///
+    /// Exhaustive on purpose: a new `WriteState` has to be classified here
+    /// rather than silently leaving a write pending for ever, which is the
+    /// failure this function exists to fix.
+    fn on_write_state(&mut self, write_id: u64, state: protocol::WriteState) {
+        use protocol::WriteState as W;
+        // A verdict for a write this client never issued. The node chose the
+        // id, so believing it would let one message clear or fail somebody
+        // else's write. Counted rather than applied.
+        if !self.copy.pending_ids().contains(&write_id) {
+            self.unknown_verdicts += 1;
+            return;
+        }
+        match state {
+            // Taken by the engine, not yet on the network. Closing the tab
+            // now still loses it, and the row says so.
+            W::Accepted => self.copy.submitted(write_id),
+            // The engine is busy with another commit; this one has not gone.
+            W::Busy => self.copy.queued(write_id),
+            // On the network. THIS is what clears it.
+            W::Published | W::ParityComplete => self.copy.published(write_id),
+            // Terminal and not applied. The edit is not in the tree.
+            W::Failed | W::Lost => {
+                let told = self.copy.failed(write_id);
+                self.rolled_back.extend(told.rolled_back_keys);
+            }
+            // Still in flight, and said so rather than silently.
+            W::Stalled => {}
+        }
+    }
+
+    /// Verdicts for writes this client never issued.
+    ///
+    /// Counted, because a node answering about a write nobody made is worth
+    /// seeing — and because a silent drop here would hide the case where the
+    /// copy and the engine disagree about which writes exist.
+    pub fn unknown_verdicts(&self) -> usize {
+        self.unknown_verdicts
     }
 
     /// Roll back anything that has waited too long for a verdict.
