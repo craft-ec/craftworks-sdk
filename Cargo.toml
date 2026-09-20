@@ -17,6 +17,7 @@ blake3 = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
+protocol = { path = "protocol" }
 
 # The JS surface exists only in the wasm build. The version is pinned to the
 # wasm-bindgen CLI: the two must match exactly.
@@ -37,6 +38,9 @@ getrandom = { version = "0.2", features = ["js"] }
 # small validations, where speed is worth nothing and not needing a C
 # toolchain to run a gate is worth a lot.
 [dev-dependencies]
+engine = { path = "engine" }
+engine-delegate = { path = "engine-delegate", default-features = false }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 wasmi = "0.32"
 bincode = "1"
 # Signing Register records, for the corpus the artefact gate freezes. A

@@ -109,6 +109,19 @@ struct Carried {
     shell: ShellState,
 }
 
+/// The most rows one page may carry, whatever a caller asks for.
+///
+/// A page crosses a delegate's 5-second call and a client's socket, and a
+/// caller is free to ask for more than either will bear. Clamping is not a
+/// refusal — the cursor means the rest is one more call away — but it IS
+/// reported, because a short page read as the end of a range silently
+/// truncates whatever the caller was listing.
+const MAX_PAGE_ENTRIES: usize = 256;
+
+/// And a byte ceiling, because 256 large values is a different size from 256
+/// small ones and only one of them fits.
+const MAX_PAGE_BYTES: usize = 512 * 1024;
+
 /// How many times a put is asked back for before its ack is disbelieved.
 ///
 /// A put is readable a short time after it is acknowledged, not instantly, so
@@ -157,6 +170,8 @@ pub struct Shell<B: Blocks> {
     /// Requests in the protocol's vocabulary that this shell does not serve
     /// yet. Answered, never ignored.
     pub unserved: Vec<u64>,
+    /// The page size actually used, per request, so the reply can say so.
+    page_clamp: BTreeMap<u64, u32>,
     /// Whether the delegate has the contract code it writes with.
     ///
     /// Supplied by the entry point from the secret store, because only the
@@ -209,6 +224,7 @@ impl<B: Blocks> Shell<B> {
             read_back_hits: 0,
             identity: false,
             unserved: Vec::new(),
+            page_clamp: BTreeMap::new(),
             has_code,
             limits: Limits::default(),
         }
@@ -372,14 +388,44 @@ impl<B: Blocks> Shell<B> {
             },
             P::Tick { now } => Event::Tick(now),
             P::Flush => Event::Flush,
-            // Range, Preload and Subscribe are v1 vocabulary the shell does
-            // not serve YET. Answered as such rather than silently ignored:
-            // a client that asked and heard nothing cannot tell "not
-            // implemented" from "lost".
-            P::Range { req_id, .. } => {
-                self.unserved.push(req_id);
-                return Vec::new();
+            P::Range {
+                req_id,
+                lo,
+                hi,
+                reverse,
+                after,
+                max_entries,
+            } => {
+                use std::ops::Bound as B;
+                let bound = |b: protocol::Bound| match b {
+                    protocol::Bound::Unbounded => B::Unbounded,
+                    protocol::Bound::Included(k) => B::Included(k),
+                    protocol::Bound::Excluded(k) => B::Excluded(k),
+                };
+                // CLAMPED here, and the clamp is reported back rather than
+                // applied silently: a caller that asked for a thousand rows
+                // and got a hundred needs to know the page it holds is not
+                // the page it asked for, or it will read the short answer as
+                // the end of the range.
+                let clamped = (max_entries as usize).clamp(1, MAX_PAGE_ENTRIES);
+                self.page_clamp.insert(req_id, clamped as u32);
+                Event::Scan {
+                    client: as_client(1),
+                    req_id: as_req_id(req_id),
+                    range: Box::new(freenet_prolly::range::Range {
+                        lo: bound(lo),
+                        hi: bound(hi),
+                        reverse,
+                        after,
+                        max_entries: clamped,
+                        max_bytes: MAX_PAGE_BYTES,
+                    }),
+                }
             }
+            // Preload and Subscribe are v1 vocabulary this shell does not
+            // serve yet (slice 6, with observability). Answered as such
+            // rather than silently ignored: a client that asked and heard
+            // nothing cannot tell "not implemented" from "lost".
             P::Preload { .. } | P::Subscribe { .. } => {
                 self.unserved.push(0);
                 return Vec::new();
@@ -582,7 +628,12 @@ impl<B: Blocks> Shell<B> {
                         req_id: req_id.0,
                         entries: entries.clone(),
                         cursor: cursor.clone(),
-                        max_entries: entries.len() as u32,
+                        // What was USED, not what was asked for.
+                        max_entries: self
+                            .page_clamp
+                            .get(&req_id.0)
+                            .copied()
+                            .unwrap_or(entries.len() as u32),
                     },
                     engine::read::ReadResult::Unavailable(cid) => protocol::Reply::Unavailable {
                         req_id: req_id.0,
