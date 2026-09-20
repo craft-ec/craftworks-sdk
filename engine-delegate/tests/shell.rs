@@ -395,3 +395,94 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
     );
     println!("  Install: 96 B of code + a TEST key provisioned, nothing derived");
 }
+
+/// A commit too big for one return is refused UP FRONT, never half-emitted.
+///
+/// A pack's bytes exist only in the return that made them — `Commit::packs`
+/// is `#[serde(skip)]`, deliberately, because a pack is the largest thing the
+/// engine touches and the context is 400 KiB. So the shell cannot hold a put
+/// back for the next entry: whatever a commit emits must go out now or be
+/// lost, and a commit that went out HALF would wait for ever on
+/// confirmations for blocks nobody has.
+///
+/// That makes the core's `max_commit_blocks` and the shell's per-return PUT
+/// limit one number, not two. This asserts the consequence: at the boundary
+/// the write is refused with `Busy` and nothing is put, rather than a partial
+/// set going out.
+#[test]
+fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
+    // The two numbers, set equal. A commit may name at most what one return
+    // can carry.
+    let per_return = 4usize;
+    let params = Params {
+        max_commit_blocks: per_return,
+        // Values over max_packed_value are PUT one each, so the block count
+        // is the number of keys and the boundary is reachable exactly.
+        ..Params::default()
+    };
+    let store = Store::default();
+
+    let run = |n: u32| -> (Vec<State>, usize, usize) {
+        let mut s: Shell<Store> = Shell::resume_with(&[], params, store.clone(), true);
+        s.limits = engine_delegate::schedule::Limits {
+            max_gets: 4,
+            max_puts: per_return,
+        };
+        let ops: Vec<(Vec<u8>, Op)> = (0..n)
+            .map(|i| {
+                (
+                    format!("k{i:04}").into_bytes(),
+                    Op::Put(vec![(i % 251) as u8; params.max_packed_value + 1]),
+                )
+            })
+            .collect();
+        let out = s.handle(vec![Inbound::Client(
+            bincode::serialize(&Request::Write {
+                client: 1,
+                write_id: 1,
+                ops,
+            })
+            .unwrap(),
+        )]);
+        let puts = out
+            .ops
+            .iter()
+            .filter(|o| matches!(o, engine_delegate::schedule::Op::Put { .. }))
+            .count();
+        (states(&out.replies), puts, out.stranded)
+    };
+
+    // Over the boundary: refused, and NOTHING put.
+    let (over, over_puts, over_stranded) = run(per_return as u32 * 4);
+    assert_eq!(
+        over,
+        vec![State::Busy],
+        "a commit naming more blocks than one return can carry was not \
+         refused; it was {over:?}"
+    );
+    assert_eq!(
+        over_puts, 0,
+        "{over_puts} put(s) went out for a refused commit — a commit emitted \
+         in part waits for ever on confirmations for blocks nobody has"
+    );
+    assert_eq!(over_stranded, 0, "a refused commit left effects queued");
+
+    // The control: under the boundary it is accepted and every block goes out
+    // in this one return. Without it, "nothing was put" is also what a shell
+    // that never puts anything looks like.
+    let (under, under_puts, under_stranded) = run(2);
+    assert_eq!(under.first(), Some(&State::Accepted));
+    assert!(
+        under_puts > 0,
+        "a commit UNDER the same boundary put nothing either, so the refusal \
+         above is not the boundary doing it"
+    );
+    assert_eq!(
+        under_stranded, 0,
+        "{under_stranded} effect(s) were left queued for a commit that fits, \
+         so the shell is holding puts it cannot hold"
+    );
+    println!(
+        "  over the boundary: Busy, 0 puts; under it: Accepted, {under_puts} put(s), 0 stranded"
+    );
+}
