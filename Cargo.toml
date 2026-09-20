@@ -7,7 +7,9 @@ publish = false
 description = "App-facing SDK. Every substrate capability is exposed here the phase it lands."
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# rlib ONLY. The cdylib is the `web` crate, which links this to `wire`; the
+# core stays a library the boundary gate checks rather than one it excuses.
+crate-type = ["rlib"]
 
 [dependencies]
 # Pinned by revision, not by path: this repo must build for anyone who checks
@@ -49,7 +51,7 @@ bincode = "1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
-members = ["engine", "engine-delegate", "probe-delegate", "probe", "protocol", "wire"]
+members = ["engine", "engine-delegate", "probe-delegate", "probe", "protocol", "web", "wire"]
 
 [profile.release]
 opt-level = "s"
