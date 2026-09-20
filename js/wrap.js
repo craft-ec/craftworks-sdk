@@ -1,4 +1,4 @@
-import { openSession, SHIPPED_ARTEFACTS } from "./session.js";
+import { openSession, open as openWith, SHIPPED_ARTEFACTS } from "./session.js";
 import { engineDb } from "./engine-db.js";
 
 // Plain-object API over the wasm surface. `raw` is the wasm-bindgen module.
@@ -122,9 +122,21 @@ export function wrap(raw) {
     blockId: raw.blockId,
     parseBlockId,
     Db,
-    Session: raw.Session,
-    openSession,
-    engineDb,
+    // THE ONE CALL AN APP MAKES.
+    //
+    //   const { db } = await sdk.open();
+    //
+    // Bound to this build's `Session` and its own shipped artefacts, so an
+    // app cannot pair the wrong ones. `open` wires message -> on_inbound ->
+    // drain and tick -> drain itself; an app that wired those by hand has a
+    // screen that never fills the first time it forgets one, and nothing
+    // that says why.
+    open: (opts = {}) => openWith(raw.Session, { artefacts: SHIPPED_ARTEFACTS, ...opts }),
     SHIPPED_ARTEFACTS,
+    // The halves, for tests that drive the parts and for a host running its
+    // own loop. NOT app-facing: handing an app the two things it can wire
+    // wrongly, beside the one call it cannot, is how the wiring gets done by
+    // hand and gets done wrong.
+    internals: { Session: raw.Session, openSession, engineDb },
   };
 }
