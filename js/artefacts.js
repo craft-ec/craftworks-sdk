@@ -1,0 +1,137 @@
+// Fetching the SDK's wasm artefacts ONCE per node, not once per app.
+//
+// Every app on a node is a path on the SAME origin — freenet serves web
+// contracts from `/v1/contract/web/<key>/` — so they share one storage
+// partition. Measured: an app at one path reads what an app at another path
+// stored, with no fetch at all (sdk#5).
+//
+// That is what makes sharing possible. What makes it HAPPEN is caching by
+// CONTENT HASH rather than by URL: two apps shipping their own copy of the
+// same bytes have two URLs and would download twice, but they have one hash.
+//
+// # Why not the HTTP cache
+//
+// Because it does not work here, measured rather than assumed. The node
+// serves web-contract files through `ServeFile` and sends no `cache-control`,
+// no `etag` and no `last-modified`; with no directive the browser re-fetches,
+// and a second app downloaded the whole 474,463 B again. An `immutable`
+// header would fix it and is exactly true of a content-addressed URL — but
+// that header belongs to the node, not to us. This route needs none.
+//
+// # A CACHE ENTRY IS A CLAIM UNTIL ITS HASH MATCHES
+//
+// This is the whole safety argument, not a nicety. The HTTP cache is
+// poison-resistant by accident: the browser fills it from the response it
+// fetched. A cache the SDK writes is one that ANY script on that origin can
+// write, and the bytes are a wasm module every app on that origin then runs.
+//
+// So: bytes are hashed and compared before they are used, coming out of the
+// cache and coming off the network. A mismatch is DISCARDED and re-fetched —
+// never repaired in place, never used once "just this time", and never left
+// behind for the next app to retry.
+//
+// # Storage is allowed to fail
+//
+// Private browsing, a refused quota, an eviction mid-session: every call into
+// the Cache API can throw, and an app that breaks in a private window is a
+// bug a person reports rather than a test catches. So every storage touch is
+// best-effort — a failure degrades to fetching, which is exactly what the
+// code did before there was a cache.
+
+/** Where cached artefacts live. One name, so every app finds the same ones. */
+export const CACHE_NAME = "craftworks-artefacts";
+
+const hex = bytes =>
+  [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, "0")).join("");
+
+/** Storage may throw for reasons that are not this app's fault. */
+async function best(effort, fallback = null) {
+  try {
+    return await effort();
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * The bytes for one artefact: from the shared cache if they are there AND
+ * correct, otherwise fetched, checked, and left there for the next app.
+ *
+ * `caches` and `fetch` are injected so the wiring can be tested without a
+ * browser — the same reason `openSession` injects them. `caches: null` turns
+ * the cache OFF, which is the control proving the cache is what avoids the
+ * second fetch rather than something else in the environment.
+ */
+export async function artefactBytes(
+  { url, sha256 },
+  {
+    fetch: fetchWith = typeof fetch === "function" ? fetch : null,
+    caches: cacheStorage = typeof caches === "object" ? caches : null,
+    subtle = typeof crypto === "object" ? crypto.subtle : null,
+  } = {},
+) {
+  if (!sha256) {
+    // Without a hash nothing can be verified and nothing may be shared: a
+    // cache keyed by a name nobody checks is worse than no cache at all.
+    throw new Error(`artefact ${url} has no sha256; refusing to cache it`);
+  }
+  const key = `/artefact/${sha256}`;
+  const box = cacheStorage ? await best(() => cacheStorage.open(CACHE_NAME)) : null;
+
+  if (box) {
+    const hit = await best(() => box.match(key));
+    if (hit) {
+      const claimed = await best(async () => new Uint8Array(await hit.arrayBuffer()));
+      if (claimed && (await matches(claimed, sha256, subtle))) return claimed;
+      // Present and WRONG, or unreadable. Drop it rather than serve it, and
+      // fall through to a fetch: the cache is shared, so a bad entry is not
+      // necessarily one this app put there.
+      await best(() => box.delete(key));
+    }
+  }
+
+  const res = await fetchWith(url);
+  if (!res.ok) throw new Error(`could not fetch ${url}: ${res.status}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (!(await matches(bytes, sha256, subtle))) {
+    // Never installed, never cached. A wrong artefact is not a smaller one.
+    throw new Error(
+      `${url} does not hash to ${sha256}: refusing to install it or cache it`,
+    );
+  }
+  // Storing is the OPTIONAL part: a full or refused cache costs the next app
+  // a fetch, which is what it would have paid anyway.
+  if (box) await best(() => box.put(key, new Response(bytes)));
+  return bytes;
+}
+
+async function matches(bytes, sha256, subtle) {
+  if (!subtle) throw new Error("no crypto.subtle: cannot verify an artefact");
+  const got = await best(async () => hex(await subtle.digest("SHA-256", bytes)));
+  return got === sha256;
+}
+
+/**
+ * All three, in parallel and awaited together.
+ *
+ * A partial set is not a smaller provisioning, it is one that installs a
+ * delegate it cannot then give contract code to — so one failure fails the
+ * lot rather than leaving a half-provisioned node.
+ *
+ * **The delegate is always fetched, never named by key.** `DelegateRequest`
+ * has only `RegisterDelegate { delegate: DelegateContainer, … }`,
+ * `ApplicationMessages` and `UnregisterDelegate` — there is no request that
+ * fetches delegate code from the network, so its bytes must come from the
+ * page. It shares the cache like the others; it just has nowhere else to come
+ * from on a miss.
+ */
+export async function allArtefactBytes(spec, deps = {}) {
+  const names = ["delegate", "block", "register"];
+  const out = await Promise.all(
+    names.map(n => {
+      if (!spec[n]) throw new Error(`no ${n} artefact in the manifest`);
+      return artefactBytes(spec[n], deps);
+    }),
+  );
+  return Object.fromEntries(names.map((n, i) => [n, out[i]]));
+}

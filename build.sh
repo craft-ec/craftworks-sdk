@@ -14,7 +14,7 @@ wasm=target/wasm32-unknown-unknown/release/web.wasm
 # repo and has no business renaming the file the builder loads.
 wasm-bindgen --target web    --out-name craftworks_sdk --out-dir pkg/web  "$wasm"
 wasm-bindgen --target nodejs --out-name craftworks_sdk --out-dir pkg/node "$wasm"
-cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js pkg/web/
+cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js pkg/web/
 
 # EVERY MODULE THE ENTRY CAN REACH IS IN THE PACKAGE.
 #
@@ -59,12 +59,31 @@ cp "$contracts/build/block.wasm" "$contracts/build/register.wasm" pkg/web/
 # contain its own digest — and the CONTRACT hashes are in `buildInfo()`,
 # copied from `hashes.toml` by `build.rs`. This file carries the one that is
 # left, beside the bytes it describes.
-delegate_hash=$(shasum -a 256 pkg/web/engine_delegate.wasm | cut -d' ' -f1)
+# EVERY artefact's hash, not only the delegate's (sdk#5).
+#
+# The hashes are what the shared cache is keyed by and what each artefact is
+# CHECKED against before it is used, so they are not documentation: an app
+# that cannot name the hash cannot share the bytes, and an app that does not
+# check it runs whatever the cache holds. Computed from the files as shipped,
+# so the manifest is byte-identical to the build by construction rather than
+# by someone remembering to update it.
+hash_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+size_of() { wc -c < "$1" | tr -d ' '; }
+delegate_hash=$(hash_of pkg/web/engine_delegate.wasm)
+block_hash=$(hash_of pkg/web/block.wasm)
+register_hash=$(hash_of pkg/web/register.wasm)
+sdk_hash=$(hash_of pkg/web/craftworks_sdk_bg.wasm)
 cat > pkg/web/artefacts.json <<JSON
 {
   "delegate": { "file": "engine_delegate.wasm", "sha256": "$delegate_hash",
-                "bytes": $(wc -c < pkg/web/engine_delegate.wasm | tr -d ' ') },
-  "note": "contract hashes are in buildInfo(), copied from the contracts build"
+                "bytes": $(size_of pkg/web/engine_delegate.wasm) },
+  "block":    { "file": "block.wasm",           "sha256": "$block_hash",
+                "bytes": $(size_of pkg/web/block.wasm) },
+  "register": { "file": "register.wasm",        "sha256": "$register_hash",
+                "bytes": $(size_of pkg/web/register.wasm) },
+  "sdk":      { "file": "craftworks_sdk_bg.wasm", "sha256": "$sdk_hash",
+                "bytes": $(size_of pkg/web/craftworks_sdk_bg.wasm) },
+  "note": "hashes key the shared artefact cache and are verified before use (sdk#5)"
 }
 JSON
 # wasm-bindgen emits CommonJS for node; say so, since this package is ESM.
