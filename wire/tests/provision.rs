@@ -6,154 +6,154 @@
 use wire::provision::{Did, Provisioner, Step};
 use wire::AckKind;
 
-/// The name each step puts on the wire, as a test stands in for it.
-fn named(step: Step) -> &'static str {
-    match step {
-        Step::Delegate => "delegate-key",
-        Step::BlockContract => "block-contract-id",
-        Step::RegisterContract => "register-contract-id",
-        Step::Key => "",
-    }
-}
+const DELEGATE: &str = "delegate-key";
 
-fn ack_for(step: Step) -> AckKind {
-    match step {
-        Step::Delegate => AckKind::Registered(named(step).into()),
-        Step::BlockContract | Step::RegisterContract => AckKind::Put(named(step).into()),
-        Step::Key => AckKind::Ok,
-    }
-}
-
-/// Run a clean provisioning to completion.
-fn run(p: &mut Provisioner) -> Vec<Step> {
+/// Drive a run to completion, with the delegate answering `Identity` from a
+/// store this harness keeps. `writable` is what the store says at the start.
+fn run(p: &mut Provisioner, mut writable: bool) -> Vec<Step> {
     let mut order = Vec::new();
     let mut now = 0u64;
     while let Some(step) = p.next_step() {
         order.push(step);
-        p.sent(step, named(step), now);
+        p.sent(step, DELEGATE, now);
         now += 10;
-        p.on_ack(&ack_for(step));
+        match step {
+            Step::Delegate => p.on_ack(&AckKind::Registered(DELEGATE.into())),
+            Step::Ask => p.on_identity(writable),
+            // A real delegate that accepts an Install can sign afterwards.
+            Step::Install => writable = true,
+        }
+        assert!(order.len() < 12, "provisioning did not converge: {order:?}");
     }
     order
 }
 
 #[test]
-fn a_fresh_node_gets_every_step_in_order() {
+fn a_fresh_node_is_registered_asked_installed_and_asked_again() {
     let mut p = Provisioner::new();
+    let order = run(&mut p, false);
     assert_eq!(
-        run(&mut p),
-        Step::ALL,
-        "the steps did not run in their order"
+        order,
+        vec![Step::Delegate, Step::Ask, Step::Install, Step::Ask]
     );
-    assert!(p.result().complete(), "a step went unaccounted for");
+    assert!(p.provisioned());
+    assert!(p.result().complete());
+    assert_eq!(p.result().did(Step::Install), Some(Did::Installed));
+    assert!(p.result().changed_anything());
+    assert_eq!(p.unexpected, 0);
+}
+
+/// **THE DEFECT THIS STEP SET EXISTS FOR.**
+///
+/// `Install` writes `SIGNING_KEY` unconditionally, and the Register instance
+/// is derived from a keyset — so installing over a delegate that is already
+/// provisioned mints a new key, moves the head's contract id, and orphans
+/// every head written under the old one. The previous plan ran the install on
+/// every page load, so it would have lost the data on every reload while
+/// reporting success.
+///
+/// A reload must therefore ASK and then stop.
+#[test]
+fn a_provisioned_delegate_is_asked_and_never_installed_over() {
+    let mut p = Provisioner::new();
+    let order = run(&mut p, true);
+
+    assert!(
+        !order.contains(&Step::Install),
+        "installed over a provisioned delegate: {order:?}"
+    );
+    assert_eq!(order, vec![Step::Delegate, Step::Ask]);
+    assert!(p.provisioned());
+    assert!(p.result().complete());
+    assert_eq!(p.result().did(Step::Install), Some(Did::AlreadyThere));
+    // The delegate itself WAS registered by this run, so something did
+    // change — just not the thing that would have cost the key.
     assert!(p.result().changed_anything());
 }
 
-/// A RELOAD does almost nothing, which is the case that matters most.
+/// THE NEGATIVE CONTROL for the test above: with the store answering `false`,
+/// the very same code path DOES install.
+///
+/// Without this, `a_provisioned_delegate_is_asked_and_never_installed_over`
+/// would keep passing if `Install` were removed from the plan entirely.
 #[test]
-fn a_reload_redoes_nothing_and_says_so() {
+fn control_an_unprovisioned_delegate_is_installed() {
     let mut p = Provisioner::new();
-    for s in Step::ALL {
-        p.already(s);
-    }
-    assert_eq!(
-        p.next_step(),
-        None,
-        "a fully provisioned node had work to do"
+    let order = run(&mut p, false);
+    assert!(
+        order.contains(&Step::Install),
+        "the control did not reach Install, so the test above proves nothing"
     );
-    assert!(p.result().complete());
+}
+
+/// A reload that kept the delegate skips the 721 KB and asks.
+#[test]
+fn a_reload_skips_the_delegate_and_asks() {
+    let mut p = Provisioner::new();
+    p.already_registered();
+    let order = run(&mut p, true);
+    assert_eq!(order, vec![Step::Ask]);
+    assert_eq!(p.result().did(Step::Delegate), Some(Did::AlreadyThere));
+    assert!(p.provisioned());
     assert!(
         !p.result().changed_anything(),
-        "a reload reported that it changed something"
+        "a reload reported a change it did not make"
     );
 }
 
+/// Answering `Identity` at all proves the delegate is registered — so a page
+/// may ask first and learn it never needed to register.
 #[test]
-fn only_the_missing_steps_are_done() {
+fn an_answer_to_identity_proves_the_delegate_is_registered() {
     let mut p = Provisioner::new();
-    p.already(Step::Delegate);
-    p.already(Step::BlockContract);
-    assert_eq!(run(&mut p), vec![Step::RegisterContract, Step::Key]);
+    p.on_identity(true);
     assert_eq!(p.result().did(Step::Delegate), Some(Did::AlreadyThere));
-    assert!(p.result().complete());
+    assert!(p.provisioned());
+    assert_eq!(p.next_step(), None);
 }
 
-/// **THE DEFECT.** A duplicate ack for an EARLIER step must not complete a
-/// later one.
-///
-/// Both contract steps send a `Put` and get a `Put` back. Matching on the KIND
-/// alone meant a second acknowledgement of the Block contract — which a node
-/// may send, and a hostile one certainly may — completed the Register step,
-/// and the run reported a contract installed that had never been sent.
-///
-/// "One step in flight" does not help: the ack that arrives need not be this
-/// step's. The node names what it answers; the fix is to read the name.
-#[test]
-fn a_duplicate_ack_for_an_earlier_step_cannot_complete_a_later_one() {
-    let mut p = Provisioner::new();
-    p.already(Step::Delegate);
-
-    // Block goes out and is acknowledged.
-    let step = p.next_step().expect("block");
-    assert_eq!(step, Step::BlockContract);
-    p.sent(step, named(step), 0);
-    p.on_ack(&AckKind::Put(named(Step::BlockContract).into()));
-    assert_eq!(p.result().did(Step::BlockContract), Some(Did::Installed));
-
-    // Register goes out. The node then answers BLOCK's put a second time.
-    let step = p.next_step().expect("register");
-    assert_eq!(step, Step::RegisterContract);
-    p.sent(step, named(step), 10);
-    p.on_ack(&AckKind::Put(named(Step::BlockContract).into()));
-
-    assert_eq!(
-        p.result().did(Step::RegisterContract),
-        None,
-        "a duplicate ack for the BLOCK contract completed the REGISTER step — \
-         the run would report a contract installed that was never sent"
-    );
-    assert!(p.in_flight(), "the register step stopped being in flight");
-    assert_eq!(p.unexpected, 1, "the stray ack was not counted");
-
-    // THE CONTROL: its OWN ack does complete it, so the refusal above is
-    // about the name and not about acks being ignored.
-    p.on_ack(&AckKind::Put(named(Step::RegisterContract).into()));
-    assert_eq!(p.result().did(Step::RegisterContract), Some(Did::Installed));
-}
-
-/// The same, for the delegate: another delegate's registration is not ours.
+/// An ack naming another delegate is not ours.
 #[test]
 fn an_ack_naming_another_delegate_does_not_complete_ours() {
     let mut p = Provisioner::new();
-    let step = p.next_step().expect("delegate");
-    p.sent(step, "our-delegate", 0);
-    p.on_ack(&AckKind::Registered("somebody-elses-delegate".into()));
-    assert_eq!(p.result().did(Step::Delegate), None);
+    assert_eq!(p.next_step(), Some(Step::Delegate));
+    p.sent(Step::Delegate, DELEGATE, 0);
+
+    p.on_ack(&AckKind::Registered("someone-elses-delegate".into()));
     assert_eq!(p.unexpected, 1);
-    p.on_ack(&AckKind::Registered("our-delegate".into()));
+    assert_eq!(p.result().did(Step::Delegate), None);
+
+    // THE CONTROL: our own name does complete it, so the refusal above is
+    // about the name and not about acks being ignored.
+    p.on_ack(&AckKind::Registered(DELEGATE.into()));
     assert_eq!(p.result().did(Step::Delegate), Some(Did::Installed));
+}
+
+/// An ack of the wrong KIND for the step in flight is not ours either.
+#[test]
+fn an_ack_of_another_kind_does_not_complete_the_step_in_flight() {
+    let mut p = Provisioner::new();
+    p.next_step();
+    p.sent(Step::Delegate, DELEGATE, 0);
+    p.on_ack(&AckKind::Put(DELEGATE.into()));
+    assert_eq!(p.unexpected, 1);
+    assert_eq!(p.result().did(Step::Delegate), None);
 }
 
 #[test]
 fn only_one_step_is_ever_in_flight() {
     let mut p = Provisioner::new();
-    let first = p.next_step().expect("a first step");
-    p.sent(first, named(first), 0);
-    assert_eq!(
-        p.next_step(),
-        None,
-        "a second step was handed out while {first:?} was unanswered"
-    );
-    p.on_ack(&ack_for(first));
-    assert!(p.next_step().is_some());
+    let first = p.next_step().unwrap();
+    p.sent(first, DELEGATE, 0);
+    assert_eq!(p.next_step(), None, "a second step went out unanswered");
+    assert!(p.in_flight());
 }
 
 #[test]
 fn an_ack_with_nothing_in_flight_is_counted() {
     let mut p = Provisioner::new();
-    p.on_ack(&AckKind::Ok);
+    p.on_ack(&AckKind::Registered(DELEGATE.into()));
     assert_eq!(p.unexpected, 1);
-    assert!(p.result().steps.is_empty());
 }
 
 /// A step nobody answers is reported STALLED, and may be sent again.
@@ -164,67 +164,187 @@ fn an_ack_with_nothing_in_flight_is_counted() {
 #[test]
 fn a_step_nobody_answers_is_reported_stalled_and_can_be_reissued() {
     let mut p = Provisioner::new();
-    p.stall_after_ms = 1_000;
-    let step = p.next_step().expect("a step");
-    p.sent(step, named(step), 0);
+    let step = p.next_step().unwrap();
+    p.sent(step, DELEGATE, 0);
 
-    assert_eq!(p.tick(999), None, "reported stalled before its time");
-    assert_eq!(p.tick(1_000), Some(step), "never reported the stall");
-    assert_eq!(
-        p.tick(5_000),
-        None,
-        "reported the same stall twice; a page would show it repeatedly"
-    );
+    assert_eq!(p.tick(p.stall_after_ms - 1), None);
+    assert_eq!(p.tick(p.stall_after_ms + 1), Some(step));
+    // Reported ONCE, not on every tick.
+    assert_eq!(p.tick(p.stall_after_ms + 2), None);
     assert_eq!(p.stalled(), Some(step));
 
-    // RE-ISSUED, which is safe only because every step is idempotent — the
-    // same property that made matching acks by kind dangerous.
     assert_eq!(p.reissue(), Some(step));
     assert!(!p.in_flight());
-    assert_eq!(p.next_step(), Some(step), "the step was not re-offered");
+    assert_eq!(p.next_step(), Some(step));
 }
 
 /// THE CONTROL for the stall clock: a step that IS answered never stalls.
 #[test]
 fn an_answered_step_never_stalls() {
     let mut p = Provisioner::new();
-    p.stall_after_ms = 1_000;
-    let step = p.next_step().expect("a step");
-    p.sent(step, named(step), 0);
-    p.on_ack(&ack_for(step));
-    assert_eq!(
-        p.tick(1_000_000),
-        None,
-        "a step that was answered was reported stalled a long time later"
-    );
+    let step = p.next_step().unwrap();
+    p.sent(step, DELEGATE, 0);
+    p.on_ack(&AckKind::Registered(DELEGATE.into()));
+    assert_eq!(p.tick(p.stall_after_ms * 10), None);
     assert_eq!(p.stalled(), None);
+}
+
+/// `Install` is answered by NOTHING, so it must not sit in flight waiting out
+/// the stall timeout on every provisioning run.
+#[test]
+fn install_does_not_wait_for_an_ack_it_will_never_get() {
+    let mut p = Provisioner::new();
+    p.already_registered();
+    p.next_step();
+    p.sent(Step::Ask, DELEGATE, 0);
+    p.on_identity(false);
+
+    assert_eq!(p.next_step(), Some(Step::Install));
+    p.sent(Step::Install, DELEGATE, 10);
+    assert!(
+        !p.in_flight(),
+        "Install is waiting for an ack that never comes"
+    );
+    assert_eq!(p.tick(p.stall_after_ms * 10), None);
+    // It goes straight back to asking, which is what confirms it.
+    assert_eq!(p.next_step(), Some(Step::Ask));
+}
+
+/// A delegate that accepts installs and stays unwritable must STOP.
+///
+/// `Install` carries the contract code, so an unbounded Ask→Install loop
+/// spends the uplink for ever and silently. The run reports itself exhausted
+/// instead — which is a different fact from stalled (nothing answered) and
+/// from refused (the node said no): here everything was accepted and the
+/// delegate still cannot sign.
+#[test]
+fn a_delegate_that_never_becomes_writable_stops_instead_of_looping() {
+    let mut p = Provisioner::new();
+    p.already_registered();
+    let mut installs = 0;
+    let mut steps = 0;
+    while let Some(step) = p.next_step() {
+        p.sent(step, DELEGATE, 0);
+        if step == Step::Ask {
+            p.on_identity(false);
+        } else {
+            installs += 1;
+        }
+        steps += 1;
+        assert!(steps < 20, "provisioning looped");
+    }
+    assert_eq!(installs, p.max_installs);
+    assert!(p.exhausted());
+    assert!(!p.provisioned());
+    assert!(!p.result().complete());
 }
 
 /// A refusal stops the run and keeps what the node said, for display.
 #[test]
 fn a_refusal_stops_the_run_and_keeps_the_nodes_words() {
     let mut p = Provisioner::new();
-    let step = p.next_step().expect("a step");
-    p.sent(step, named(step), 0);
-    p.on_refused("the delegate code was rejected");
+    let step = p.next_step().unwrap();
+    p.sent(step, DELEGATE, 0);
+    p.on_refused("delegate code rejected");
 
-    assert_eq!(p.next_step(), None, "it carried on after a refusal");
+    assert_eq!(p.refused(), Some((step, "delegate code rejected")));
+    assert_eq!(p.next_step(), None, "the run carried on past a refusal");
     assert!(!p.result().complete());
-    let (at, said) = p.refused().expect("the refusal was not kept");
-    assert_eq!(at, step);
-    assert_eq!(said, "the delegate code was rejected");
+    assert!(!p.provisioned());
 }
 
 /// Which steps are CONFIRMED and which rest on an ack is STATED.
 ///
-/// They are different promises. `Identity` proves the delegate is registered
-/// and the engine has a key — an unregistered delegate cannot answer it. The
-/// contract puts rest on the node's own word about its own store, which is
-/// why provisioning is loopback-only.
+/// Both steps that change anything are confirmed by asking: `Identity` cannot
+/// be answered by an unregistered delegate, and `head_writable` is the
+/// delegate's report about its own store rather than an acknowledgement that
+/// a message arrived.
 #[test]
 fn the_steps_say_which_of_them_are_confirmed_rather_than_acknowledged() {
     assert!(Step::Delegate.confirmed_by_asking());
-    assert!(Step::Key.confirmed_by_asking());
-    assert!(!Step::BlockContract.confirmed_by_asking());
-    assert!(!Step::RegisterContract.confirmed_by_asking());
+    assert!(Step::Install.confirmed_by_asking());
+}
+
+/// **TWO TABS, ONE KEY.**
+///
+/// Two tabs opened together on a fresh node both ask, both hear "not
+/// provisioned", and both install. That is not a client bug to be tidied
+/// away — it is what concurrency means, and it is why the delegate refuses
+/// the second rather than relying on anybody asking first.
+///
+/// This drives two provisioners against ONE node, interleaved so both have
+/// asked before either installs. The node accepts the first install and
+/// answers `AlreadyInstalled` to every later one. Exactly one key is minted,
+/// and neither run claims to have installed it twice.
+#[test]
+fn two_tabs_racing_on_a_fresh_node_end_with_one_key() {
+    /// The delegate's secret store, as the guard sees it.
+    struct Node {
+        keys: Vec<u8>,
+    }
+    impl Node {
+        /// `true` once something has been installed — what `Identity`
+        /// reports as `head_writable`.
+        fn writable(&self) -> bool {
+            !self.keys.is_empty()
+        }
+        /// Returns whether THIS install took. First writer wins.
+        fn install(&mut self, key: u8) -> bool {
+            if self.writable() {
+                return false;
+            }
+            self.keys.push(key);
+            true
+        }
+    }
+
+    let mut node = Node { keys: Vec::new() };
+    let mut a = Provisioner::new();
+    let mut b = Provisioner::new();
+    a.already_registered();
+    b.already_registered();
+
+    // Both ask FIRST, before either installs — the shape that makes the race
+    // real. Asking one after the other would let B see A's work and the test
+    // would prove nothing.
+    for (p, key) in [(&mut a, 0xAAu8), (&mut b, 0xBBu8)] {
+        assert_eq!(p.next_step(), Some(Step::Ask));
+        p.sent(Step::Ask, DELEGATE, 0);
+        p.on_identity(node.writable());
+        let _ = key;
+    }
+
+    // Now both install, into the same node.
+    for (p, key) in [(&mut a, 0xAAu8), (&mut b, 0xBBu8)] {
+        assert_eq!(
+            p.next_step(),
+            Some(Step::Install),
+            "a tab that heard 'not provisioned' did not try to install"
+        );
+        p.sent(Step::Install, DELEGATE, 10);
+        if !node.install(key) {
+            p.on_already_installed();
+        }
+    }
+
+    assert_eq!(node.keys, vec![0xAA], "more than one key was minted");
+
+    // Both confirm by asking, and both end provisioned.
+    for p in [&mut a, &mut b] {
+        assert_eq!(p.next_step(), Some(Step::Ask));
+        p.sent(Step::Ask, DELEGATE, 20);
+        p.on_identity(node.writable());
+        assert!(p.provisioned());
+        assert_eq!(p.next_step(), None);
+    }
+
+    // A installed; B did not, and does not say it did.
+    assert!(!a.lost_the_race());
+    assert_eq!(a.result().did(Step::Install), Some(Did::Installed));
+    assert!(b.lost_the_race());
+    assert_eq!(
+        b.result().did(Step::Install),
+        Some(Did::AlreadyThere),
+        "the tab that lost the race reported installing something"
+    );
 }

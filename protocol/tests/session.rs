@@ -71,6 +71,7 @@ fn v1_session() -> Session {
         key_source: "Provisioned(Test)".into(),
         head_seq: 2,
         head_root: [0xAB; 32],
+        head_writable: true,
     });
     recv(Reply::WriteState {
         write_id: 1,

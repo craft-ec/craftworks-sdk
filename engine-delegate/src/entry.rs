@@ -55,6 +55,29 @@ fn block_contract(code: &[u8], params: &[u8; 32]) -> ContractContainer {
     )))
 }
 
+/// Everything a head write needs, present in the secret store.
+///
+/// Two callers ask this: `Op::Head`, to decide whether a head can be signed
+/// at all, and `Reply::Identity`, to tell a page whether it still has to
+/// provision. **They are the same question and must not be allowed to
+/// drift.** Were the reported answer `BLOCK_CODE` while the drop tested the
+/// signing triple, a partly-installed delegate would report itself ready and
+/// then silently drop every head — which is precisely the failure the report
+/// exists to prevent. One function, both callers.
+///
+/// Presence only. The key itself never leaves the store and nothing derived
+/// from it is ever reported.
+fn head_writable(ctx: &DelegateCtx) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    match (
+        ctx.get_secret(REGISTER_CODE),
+        ctx.get_secret(REGISTER_PARAMS),
+        ctx.get_secret(SIGNING_KEY),
+    ) {
+        (Some(rc), Some(rp), Some(sk)) => Some((rc, rp, sk)),
+        _ => None,
+    }
+}
+
 fn id32(k: &ContractInstanceId) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&k.as_bytes()[..32]);
@@ -218,6 +241,12 @@ impl DelegateInterface for EngineDelegate {
         };
 
         let code = ctx.get_secret(BLOCK_CODE);
+        // Read from the store at the START of this call, which is what a page
+        // asking `Identity` needs: the state a PREVIOUS call's `Install` left
+        // behind. An `Install` arriving in this call writes its secrets after
+        // the shell has already answered, and reports itself through
+        // `installed` rather than through this.
+        let writable = head_writable(ctx).is_some();
         // Derived from what the node says THIS call, never carried: a
         // remembered "the Register exists" dies with the node, and the first
         // commit after a restart then re-CREATES one that is already there —
@@ -228,7 +257,13 @@ impl DelegateInterface for EngineDelegate {
         let head_exists;
         let (out, saved, installing) = {
             let blocks = NodeBlocks::with_code(ctx, code.clone());
-            let mut shell = Shell::resume_with(&carried, Params::default(), blocks, code.is_some());
+            let mut shell = Shell::resume_with(
+                &carried,
+                Params::default(),
+                blocks,
+                code.is_some(),
+                writable,
+            );
             let out = shell.handle(vec![msg]);
             head_exists = shell.head_exists();
             (out, shell.to_context(), shell.installed)
@@ -339,11 +374,7 @@ impl DelegateInterface for EngineDelegate {
                 // SIGNING it. Everything needed was provisioned by `Install`
                 // and none of it is derived here.
                 Op::Head { seq, root } => {
-                    let (Some(rc), Some(rp), Some(sk)) = (
-                        ctx.get_secret(REGISTER_CODE),
-                        ctx.get_secret(REGISTER_PARAMS),
-                        ctx.get_secret(SIGNING_KEY),
-                    ) else {
+                    let Some((rc, rp, sk)) = head_writable(ctx) else {
                         continue;
                     };
                     // A head this delegate cannot sign is one the contract
@@ -407,8 +438,13 @@ impl DelegateInterface for EngineDelegate {
         if !asked.is_empty() {
             let saved3 = {
                 let blocks = NodeBlocks::with_code(ctx, code.clone());
-                let mut shell =
-                    Shell::resume_with(&carried2, Params::default(), blocks, code.is_some());
+                let mut shell = Shell::resume_with(
+                    &carried2,
+                    Params::default(),
+                    blocks,
+                    code.is_some(),
+                    writable,
+                );
                 for (contract, block) in &asked {
                     shell.note_request(*contract, *block);
                 }
@@ -426,8 +462,13 @@ impl DelegateInterface for EngineDelegate {
             // shell, so the answer goes through the same path a node's would.
             let (more, saved2) = {
                 let blocks = NodeBlocks::with_code(ctx, code.clone());
-                let mut shell =
-                    Shell::resume_with(&carried2, Params::default(), blocks, code.is_some());
+                let mut shell = Shell::resume_with(
+                    &carried2,
+                    Params::default(),
+                    blocks,
+                    code.is_some(),
+                    writable,
+                );
                 let more = shell.handle(vec![Inbound::NoHead]);
                 (more, shell.to_context())
             };

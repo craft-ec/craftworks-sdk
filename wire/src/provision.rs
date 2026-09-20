@@ -53,58 +53,65 @@ pub enum Did {
 
 /// The steps, in the order they must happen.
 ///
-/// An order, not a set: the delegate has to exist before it can be told about
-/// contracts, and the engine has to have a key before it can sign a head.
+/// An order, not a set: the delegate has to exist before it can be asked
+/// anything, and it has to be asked before installing over it is safe.
+///
+/// **There is no contract-PUT step, and there was never a wire exchange for
+/// one.** An earlier plan had the page put the Block and Register contracts
+/// itself. It does not: the delegate is handed their CODE by `Install` and
+/// mints the containers itself, at the moment it has something to store
+/// (`engine-delegate/src/entry.rs`). Modelling a client-side put invented two
+/// acks the node never sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     /// The engine delegate, ~721 KB — the one that is always chunked.
     Delegate,
-    /// The Block contract, which the tree's nodes are stored under.
-    BlockContract,
-    /// The Register contract, which holds the head.
-    RegisterContract,
-    /// A signing key, minted only if the engine says it has none.
-    Key,
+    /// Ask the delegate what it already has.
+    ///
+    /// The only step that READS, and the reason the others are safe. An
+    /// unprovisioned delegate answers `Identity` with a seq of 0 and a zero
+    /// root, which is byte-identical to a healthy engine nobody has written
+    /// to yet — so `head_writable` is what separates them.
+    Ask,
+    /// Hand over the contract code, the Register's parameters, and a freshly
+    /// minted signing key.
+    ///
+    /// **Taken only when `Ask` said the delegate cannot write a head.**
+    /// `Install` overwrites `SIGNING_KEY` unconditionally, and the Register
+    /// instance is derived from a keyset — so installing over a provisioned
+    /// delegate mints a new key, changes the head's contract id, and orphans
+    /// everything written under the old one. Running it on every page load,
+    /// which was the previous plan, would have lost the data on every reload
+    /// while reporting success.
+    Install,
 }
 
 impl Step {
-    /// Every step, in order.
-    pub const ALL: [Step; 4] = [
-        Step::Delegate,
-        Step::BlockContract,
-        Step::RegisterContract,
-        Step::Key,
-    ];
-
     /// Does this ack answer THIS step, for the thing this step actually sent?
     ///
-    /// **Matched by NAME, never by kind alone.** Both contract steps send a
-    /// `Put` and get a `Put` back, so kind alone let a duplicate ack of the
-    /// first contract complete the second — a run reporting a contract
-    /// installed that had never been sent. The node names what it is
-    /// answering; this compares it.
+    /// **Matched by NAME, never by kind alone** — a duplicate ack of one step
+    /// completed the next when only the kind was compared, reporting an
+    /// artefact installed that had never been sent.
     ///
-    /// `named` is what this step put on the wire: the delegate's key, or the
-    /// contract instance id.
+    /// Only `Delegate` is answered by an ack at all. `Ask` is answered by a
+    /// `Reply::Identity` ([`Provisioner::on_identity`]), and `Install`
+    /// produces no reply of its own — it is confirmed by the `Ask` that
+    /// follows it, which is a stronger fact than an echo would be.
     pub fn answered_by(self, named: &str, ack: &AckKind) -> bool {
         match (self, ack) {
             (Step::Delegate, AckKind::Registered(k)) => k == named,
-            (Step::BlockContract | Step::RegisterContract, AckKind::Put(k)) => k == named,
-            // The key is proved by asking, not by an ack — see `Confirmed`.
-            (Step::Key, AckKind::Ok) => true,
             _ => false,
         }
     }
 
     /// Whether this step's completion is CONFIRMED or merely acknowledged.
     ///
-    /// Stated per step, because the two are different promises and a caller
-    /// deserves to know which it has. `Identity` proves the delegate is
-    /// registered and the engine has a key — it answers, which an unregistered
-    /// delegate cannot. The contract puts rest on the node's ack, which on
-    /// loopback is the node's own word about its own store.
+    /// `Identity` proves the delegate is registered and says whether it can
+    /// sign a head — an unregistered delegate cannot answer at all. So both
+    /// of the steps that change anything are confirmed by asking, and
+    /// provisioning never rests on a node's word about its own store.
     pub fn confirmed_by_asking(self) -> bool {
-        matches!(self, Step::Delegate | Step::Key)
+        matches!(self, Step::Delegate | Step::Install)
     }
 }
 
@@ -128,7 +135,7 @@ impl Provisioned {
     /// Every step accounted for. A run that quietly skipped one would leave a
     /// node that half works, and the failure would appear at the first write.
     pub fn complete(&self) -> bool {
-        Step::ALL.iter().all(|s| self.did(*s).is_some())
+        self.did(Step::Delegate).is_some() && self.did(Step::Install).is_some()
     }
 }
 
@@ -142,12 +149,34 @@ impl Provisioned {
 /// matching the wrong ack to the wrong step would report a delegate
 /// registered because a contract went in.
 pub struct Provisioner {
-    at: usize,
+    /// The delegate is registered. Set by its ack, or by [`already`].
+    ///
+    /// [`already`]: Provisioner::already
+    registered: bool,
+    /// What the last `Ask` answered, or `None` when nothing has been asked
+    /// since the last thing that could have changed it. This is the whole
+    /// state machine: `None` means ask, `Some(false)` means install,
+    /// `Some(true)` means done.
+    writable: Option<bool>,
+    /// How many `Install`s have gone out.
+    installs: usize,
+    /// One of them was refused: the delegate already had everything, and
+    /// changed nothing. The ORDINARY outcome of a race — two tabs opened
+    /// together on a fresh node both find it unprovisioned and both install,
+    /// and exactly one of them wins. Recorded so the run does not claim to
+    /// have installed what it did not.
+    lost_the_race: bool,
+    /// The cap on them. An `Install` produces no reply, so a delegate that
+    /// accepts one and stays unwritable would otherwise loop Ask→Install for
+    /// ever, each pass costing the contract code. Two attempts, then the run
+    /// reports itself stuck rather than spending the uplink silently.
+    pub max_installs: usize,
+    /// Every step was taken that could be, and it is still not writable.
+    exhausted: bool,
     /// What the step in flight PUT on the wire, so its ack can be matched to
     /// it rather than to whatever arrived next.
     in_flight: Option<(Step, String, u64)>,
     done: Provisioned,
-    known: Vec<Step>,
     /// Acks that did not answer the step in flight. Counted: a node answering
     /// something nobody asked for is worth seeing.
     pub unexpected: usize,
@@ -172,10 +201,14 @@ impl Default for Provisioner {
 impl Provisioner {
     pub fn new() -> Provisioner {
         Provisioner {
-            at: 0,
+            registered: false,
+            writable: None,
+            installs: 0,
+            lost_the_race: false,
+            max_installs: 2,
+            exhausted: false,
             in_flight: None,
             done: Provisioned::default(),
-            known: Vec::new(),
             unexpected: 0,
             stall_after_ms: 30_000,
             stalled: None,
@@ -183,15 +216,17 @@ impl Provisioner {
         }
     }
 
-    /// Tell it what is already in place — from `Identity`, or from a previous
-    /// run in the same session.
+    /// Tell it the delegate is already registered — from a previous run in
+    /// this same session.
     ///
-    /// This is what makes a reload cheap: a page that reconnects has usually
-    /// provisioned everything already, and re-registering a 721 KB delegate
-    /// on every reload would be the whole cost of opening a tab.
-    pub fn already(&mut self, step: Step) {
-        if !self.known.contains(&step) {
-            self.known.push(step);
+    /// This is what makes a reload cheap: re-registering a 721 KB delegate on
+    /// every reload would be most of the cost of opening a tab. It is only
+    /// ever said of `Delegate`; whether the delegate is PROVISIONED is never
+    /// asserted from memory, because the delegate itself will say.
+    pub fn already_registered(&mut self) {
+        if !self.registered {
+            self.registered = true;
+            self.done.steps.push((Step::Delegate, Did::AlreadyThere));
         }
     }
 
@@ -208,19 +243,27 @@ impl Provisioner {
     /// the two acks tell-apart-able only by name — which is why the name is
     /// carried, but one at a time is still the simpler guarantee.
     pub fn next_step(&mut self) -> Option<Step> {
-        if self.in_flight.is_some() {
+        if self.in_flight.is_some() || self.refused.is_some() || self.exhausted {
             return None;
         }
-        while self.at < Step::ALL.len() {
-            let step = Step::ALL[self.at];
-            if self.known.contains(&step) {
-                self.done.steps.push((step, Did::AlreadyThere));
-                self.at += 1;
-                continue;
-            }
-            return Some(step);
+        if !self.registered {
+            return Some(Step::Delegate);
         }
-        None
+        match self.writable {
+            // Nothing has been asked since the last change: ask.
+            None => Some(Step::Ask),
+            // It answered, and it cannot write a head.
+            Some(false) => {
+                if self.installs < self.max_installs {
+                    Some(Step::Install)
+                } else {
+                    self.exhausted = true;
+                    None
+                }
+            }
+            // Provisioned. Nothing left to do, and nothing to re-send.
+            Some(true) => None,
+        }
     }
 
     /// Record what the page actually sent for the step it just took.
@@ -228,6 +271,16 @@ impl Provisioner {
     /// Separate from `next_step` because only the caller knows the key: it
     /// framed the request.
     pub fn sent(&mut self, step: Step, named: &str, now_ms: u64) {
+        if step == Step::Install {
+            // `Install` is answered by nothing. Putting it in flight would
+            // wait out the stall timeout on every single provisioning run.
+            // It is confirmed by the `Ask` that follows — so what this
+            // records is that the question must be put again.
+            self.installs += 1;
+            self.writable = None;
+            self.stalled = None;
+            return;
+        }
         self.in_flight = Some((step, named.to_string(), now_ms));
         self.stalled = None;
     }
@@ -246,9 +299,59 @@ impl Provisioner {
             self.unexpected += 1;
             return;
         }
+        debug_assert_eq!(step, Step::Delegate, "only Delegate is answered by an ack");
+        self.registered = true;
         self.done.steps.push((step, Did::Installed));
-        self.at += 1;
         self.in_flight = None;
+    }
+
+    /// The delegate refused our `Install`: it already had everything.
+    ///
+    /// Not an error and not a stall. Provisioning carries straight on to the
+    /// confirming `Ask`, which is where "is it actually usable" was always
+    /// decided — the only thing that changes is that this run must not report
+    /// an install it did not make.
+    pub fn on_already_installed(&mut self) {
+        self.lost_the_race = true;
+        self.writable = None;
+    }
+
+    /// Whether an `Install` of ours was refused because another writer had
+    /// already provisioned this delegate.
+    pub fn lost_the_race(&self) -> bool {
+        self.lost_the_race
+    }
+
+    /// The delegate answered `Identity`.
+    ///
+    /// `head_writable` is the delegate's own report that it holds everything
+    /// a head write needs. It is the ONLY thing that completes provisioning,
+    /// and it is a fact about the store rather than an acknowledgement that a
+    /// message was received.
+    ///
+    /// Answering at all also proves the delegate is registered, so a session
+    /// that reconnects can ask first and skip the 721 KB.
+    pub fn on_identity(&mut self, head_writable: bool) {
+        if matches!(self.in_flight, Some((Step::Ask, _, _))) {
+            self.in_flight = None;
+            self.stalled = None;
+        }
+        if !self.registered {
+            self.registered = true;
+            self.done.steps.push((Step::Delegate, Did::AlreadyThere));
+        }
+        self.writable = Some(head_writable);
+        if head_writable && self.did(Step::Install).is_none() {
+            // Installed just now, or already there before this run started.
+            // An install we SENT but that was refused did not install
+            // anything, so the run must not claim it did.
+            let did = if self.installs > 0 && !self.lost_the_race {
+                Did::Installed
+            } else {
+                Did::AlreadyThere
+            };
+            self.done.steps.push((Step::Install, did));
+        }
     }
 
     /// Nothing has answered for too long.
@@ -296,12 +399,29 @@ impl Provisioner {
             self.refused = Some((step, said.to_string()));
         }
         self.in_flight = None;
-        self.at = Step::ALL.len();
+        self.exhausted = true;
     }
 
     /// Which step was refused, and what the node said. Display only.
     pub fn refused(&self) -> Option<(Step, &str)> {
         self.refused.as_ref().map(|(s, w)| (*s, w.as_str()))
+    }
+
+    /// What a step did, if it is done. Delegates to the result.
+    pub fn did(&self, step: Step) -> Option<Did> {
+        self.done.did(step)
+    }
+
+    /// Provisioning is finished and the delegate says so.
+    pub fn provisioned(&self) -> bool {
+        self.writable == Some(true)
+    }
+
+    /// Every step was taken and it is STILL not writable. Distinct from
+    /// stalled (nothing answered) and refused (the node said no): here the
+    /// node accepted everything and the delegate still cannot sign.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
     }
 
     pub fn result(&self) -> &Provisioned {

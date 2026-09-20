@@ -75,6 +75,9 @@ use freenet_stdlib::prelude::*;
 
 pub mod provision;
 pub mod reassemble;
+/// The delegate's identity, so a caller can hold one without depending on
+/// freenet itself. Opaque everywhere outside this crate.
+pub use freenet_stdlib::prelude::DelegateKey;
 pub use provision::{Did, Provisioned, Step};
 pub use reassemble::Reassembler;
 
@@ -244,6 +247,21 @@ pub fn frame_delegate_op(
     frames(&req, stream_id)
 }
 
+/// Frame an engine message to a delegate registered with empty parameters.
+///
+/// The parameters are part of what the delegate's key is DERIVED from, so
+/// addressing it with different ones names a delegate that was never
+/// registered. `delegate_from_code` registers with empty parameters and this
+/// addresses with empty parameters; keeping the pair in one file is what
+/// stops them drifting apart.
+pub fn frame_engine_request(
+    key: &DelegateKey,
+    payload: Vec<u8>,
+    stream_id: u32,
+) -> Result<Vec<Vec<u8>>, String> {
+    frame_delegate_op(key, &Parameters::from(vec![]), payload, stream_id)
+}
+
 /// Frame a client-API subscription to a contract.
 ///
 /// This is the notifier that reaches a connection which made no write: an
@@ -272,6 +290,40 @@ pub fn frame_put(
     });
     frames(&req, stream_id)
 }
+
+/// The delegate, and the key the node will know it by, from its wasm.
+///
+/// Both come from the same bytes and the key is DERIVED — a caller that
+/// carried a key alongside the code could hold one that names a different
+/// build, and would then address requests to a delegate that is not the one
+/// it registered.
+pub fn delegate_from_code(wasm: &[u8]) -> (DelegateContainer, DelegateKey) {
+    let d = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+        &DelegateCode::from(wasm.to_vec()),
+        &Parameters::from(vec![]),
+    ))));
+    let key = d.key().clone();
+    (d, key)
+}
+
+/// The Register contract's parameters for a head signed by `verifying_key`.
+///
+/// **One copy.** The format is `RG01`, a version byte, the 32-byte verifying
+/// key, then the record's name — and the contract INSTANCE is derived from
+/// it, so a caller that lays the bytes out differently addresses a different
+/// contract and finds an empty head rather than an error. It was written out
+/// by hand in the live driver and would have been written out again in the
+/// page; a second copy is a silent fork of an id.
+pub fn register_params(verifying_key: &[u8; 32], name: &[u8]) -> Vec<u8> {
+    let mut p = Vec::from(*b"RG01");
+    p.push(0u8);
+    p.extend_from_slice(verifying_key);
+    p.extend_from_slice(name);
+    p
+}
+
+/// The name the head record is kept under.
+pub const HEAD_NAME: &[u8] = b"head";
 
 /// Frame a delegate registration. This is the one that is always chunked.
 pub fn frame_register_delegate(

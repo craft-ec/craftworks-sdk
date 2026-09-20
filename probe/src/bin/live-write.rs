@@ -173,11 +173,7 @@ async fn main() -> Result<()> {
     )?;
     let mut client = connect(&node.ws()).await?;
 
-    let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
-        &DelegateCode::from(wasm.clone()),
-        &Parameters::from(vec![]),
-    ))));
-    let dkey = delegate.key().clone();
+    let (delegate, dkey) = wire::delegate_from_code(&wasm);
     timeout(
         STEP,
         client.send(ClientRequest::DelegateOp(
@@ -199,10 +195,9 @@ async fn main() -> Result<()> {
     getrandom(&mut seed);
     let sk = SigningKey::from_bytes(&seed);
     let vk = sk.verifying_key();
-    let mut register_params = Vec::from(*b"RG01");
-    register_params.push(0u8);
-    register_params.extend_from_slice(&vk.to_bytes());
-    register_params.extend_from_slice(b"head");
+    // From `wire`, not laid out here: the contract INSTANCE is derived from
+    // these bytes, so a second copy of the layout is a silent fork of an id.
+    let register_params = wire::register_params(&vk.to_bytes(), wire::HEAD_NAME);
     println!("key: TEST signing key generated for this run only (never from disk)");
 
     let head = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(

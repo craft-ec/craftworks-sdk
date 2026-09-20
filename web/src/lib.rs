@@ -15,10 +15,13 @@
 //! Empty off wasm. This crate exists to be a browser artefact; building it for
 //! the host would pull `wasm-bindgen` into a place it has no business being,
 //! and the `cfg` says that rather than a comment claiming it.
-#![cfg(target_arch = "wasm32")]
-
+//!
 //! The JavaScript surface. Thin: no logic lives here. Structured values cross
 //! the boundary as JSON strings; `js/wrap.js` gives apps plain objects.
+#![cfg(target_arch = "wasm32")]
+
+pub mod session;
+
 use craftworks_sdk::{id, Scan, Schema, SystemEnv, TreeStore};
 use serde_json::{Map, Value};
 use wasm_bindgen::prelude::*;
@@ -144,7 +147,7 @@ impl Engine {
     pub fn new() -> Engine {
         // The clock is the HOST's. The SDK compiles to wasm and to a host
         // binary and must not reach for one of its own.
-        Engine(craftworks_sdk::CachedStore::new(Box::new(|| js_now_ms())))
+        Engine(craftworks_sdk::CachedStore::new(Box::new(js_now_ms)))
     }
 
     /// Requests waiting to go out, oldest first — WITHOUT giving them up.

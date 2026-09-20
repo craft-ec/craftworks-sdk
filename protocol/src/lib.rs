@@ -232,7 +232,27 @@ pub enum Reply {
         key_source: String,
         head_seq: u64,
         head_root: [u8; 32],
+        /// Whether this delegate can sign and publish a head — i.e. whether
+        /// it has been provisioned.
+        ///
+        /// PRESENCE ONLY: it says that a key is there, never which, and
+        /// nothing derived from it. A page reads this to decide whether to
+        /// install; `false` with a non-zero `head_seq` cannot happen and
+        /// would mean the store lost a secret the engine had already used.
+        head_writable: bool,
     },
+    /// `Install` arrived at a delegate that is already provisioned, and
+    /// NOTHING was changed.
+    ///
+    /// The ordinary outcome of a race, not an error. Two tabs opened together
+    /// on a fresh node both find it unprovisioned and both install; the first
+    /// one to arrive wins and the second is told this. Were the second to
+    /// overwrite, it would mint a second signing key, move the head's
+    /// contract id, and orphan everything the first had already written.
+    ///
+    /// Replacing a key or the contract code is the hand-over design in
+    /// sdk#14, and is never a blind overwrite.
+    AlreadyInstalled,
     Value {
         req_id: u64,
         value: Option<Vec<u8>>,
