@@ -205,6 +205,32 @@ impl Loads {
         self.open.len()
     }
 
+    /// The request that loads `[lo, hi)`, continuing after `after`.
+    ///
+    /// **The only place a loader's page size is chosen.** It used to be
+    /// picked at each call site, and both sites picked `0` — which the shell
+    /// clamps to ONE ENTRY, so a range of N rows loaded in N round trips.
+    /// A test could assert the constant and still not notice, because
+    /// asserting a parameter is not the same as counting what crossed.
+    ///
+    /// One function, so there is one thing to get right and one thing to
+    /// test.
+    pub fn range_request(
+        req_id: u64,
+        lo: &[u8],
+        hi: &[u8],
+        after: Option<Vec<u8>>,
+    ) -> protocol::Request {
+        protocol::Request::Range {
+            req_id,
+            lo: protocol::Bound::Included(lo.to_vec()),
+            hi: protocol::Bound::Excluded(hi.to_vec()),
+            reverse: false,
+            after,
+            max_entries: protocol::MAX_PAGE_ENTRIES,
+        }
+    }
+
     /// The range a ticket is for. For a caller that must re-send it.
     pub fn range_of(&self, id: u64) -> Option<(&[u8], &[u8])> {
         self.open.get(&id).map(|l| (&l.lo[..], &l.hi[..]))

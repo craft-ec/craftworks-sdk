@@ -265,10 +265,18 @@ impl Session {
             return db_err(&e);
         };
         if send {
-            // `max_entries` 0 = the engine's own page size. Paging is followed
-            // to the end, because the copy records `[lo, hi)` as loaded and
-            // that is only true once the range is exhausted.
-            self.db.store_mut().request_range(req_id, &lo, &hi, 0);
+            // A FULL PAGE, by the shared constant. `0` reads like "no
+            // limit" and is not one: the shell clamps it to ONE entry, so a
+            // range of N rows would load in N round trips of a single row.
+            // Paging is still followed to the end, because the copy records
+            // `[lo, hi)` as loaded and that is only true once the range is
+            // exhausted — this decides how many trips that takes.
+            self.db
+                .store_mut()
+                .client
+                .send(&craftworks_sdk::Loads::range_request(
+                    req_id, &lo, &hi, None,
+                ));
         }
         db_err_waiting(&e, Some(req_id))
     }
@@ -280,14 +288,15 @@ impl Session {
                 // Not exhausted. Ask for the rest under the SAME ticket, so
                 // the read parked on it waits for the whole range rather than
                 // being woken by a part of it.
-                self.db.store_mut().client.send(&protocol::Request::Range {
-                    req_id,
-                    lo: protocol::Bound::Included(lo),
-                    hi: protocol::Bound::Excluded(hi),
-                    reverse: false,
-                    after: Some(after),
-                    max_entries: 0,
-                });
+                self.db
+                    .store_mut()
+                    .client
+                    .send(&craftworks_sdk::Loads::range_request(
+                        req_id,
+                        &lo,
+                        &hi,
+                        Some(after),
+                    ));
             }
             craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
                 let root = self.head_root;
@@ -683,7 +692,13 @@ impl Session {
             let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(d);
             self.db
                 .store_mut()
-                .request_range(PRELOAD_REQ_BASE + i as u64, &lo, &hi, 0);
+                .client
+                .send(&craftworks_sdk::Loads::range_request(
+                    PRELOAD_REQ_BASE + i as u64,
+                    &lo,
+                    &hi,
+                    None,
+                ));
         }
         Ok(domains.len())
     }

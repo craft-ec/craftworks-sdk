@@ -75,6 +75,8 @@ pub enum Request {
         reverse: bool,
         /// Continue AFTER this key. `None` starts at the end `reverse` picks.
         after: Option<Vec<u8>>,
+        /// How many entries one page may hold. See [`MAX_PAGE_ENTRIES`].
+        ///
         /// Clamped by the engine, which reports what it used.
         max_entries: u32,
     },
@@ -193,6 +195,26 @@ pub enum TraceOf {
     Write(u64),
     Read(u64),
 }
+
+/// The most entries one page of a range may hold.
+///
+/// **A caller that wants a full page asks for THIS**, never `0` and never a
+/// literal. A literal in a client goes stale the moment the engine's own
+/// limit moves, and the two then disagree about what a full page is.
+///
+/// # `0` is not "no limit"
+///
+/// It reads like one, and it is not. The delegate shell clamps a request with
+/// `clamp(1, MAX_PAGE_ENTRIES)`, so `0` becomes **one entry** — a range of N
+/// rows then loads in N round trips of a single row each, which at roughly
+/// 15 ms per delegate call (F32) is fifteen seconds for a thousand rows.
+/// Correct, and crawling. The engine reached through other paths treats it as
+/// unlimited instead, so the two readers disagree, and a caller cannot be
+/// right about a value two readers interpret differently.
+///
+/// So `0` means "the engine decides", it is not what a loader should send,
+/// and this constant is what it should send instead.
+pub const MAX_PAGE_ENTRIES: u32 = 256;
 
 /// A signing key that is not a real one, and says so in its own type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -130,7 +130,9 @@ struct Carried {
 /// refusal — the cursor means the rest is one more call away — but it IS
 /// reported, because a short page read as the end of a range silently
 /// truncates whatever the caller was listing.
-const MAX_PAGE_ENTRIES: usize = 256;
+/// The page limit, from `protocol`, so the client that ASKS and the engine
+/// that answers cannot hold two different numbers.
+const MAX_PAGE_ENTRIES: usize = protocol::MAX_PAGE_ENTRIES as usize;
 
 /// And a byte ceiling, because 256 large values is a different size from 256
 /// small ones and only one of them fits.
