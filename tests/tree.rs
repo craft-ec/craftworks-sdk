@@ -275,6 +275,7 @@ fn a_refused_batch_changes_nothing() {
 fn a_store_that_drops_value_blocks_fails() {
     let mut lossy = TreeStore::with_options(Options {
         keep_value_blocks: false,
+        ..Options::default()
     });
     let broke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         differential(1, 200, &mut lossy);

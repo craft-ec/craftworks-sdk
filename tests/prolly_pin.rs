@@ -14,10 +14,46 @@
 
 use std::path::{Path, PathBuf};
 
-fn contracts_repo() -> PathBuf {
-    std::env::var("CRAFTWORKS_CONTRACTS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../freenet-contracts"))
+/// Where the sibling `freenet-contracts` checkout is.
+///
+/// `CARGO_MANIFEST_DIR/..` is not enough. Reviews and parallel work happen in a
+/// `git worktree` under a session's own temp dir, and from there the sibling
+/// repo is not beside the manifest — so this gate found nothing, printed
+/// SKIPPED and passed, in exactly the situation it exists for. It was caught
+/// by running it by hand with `CRAFTWORKS_CONTRACTS` set, which is not a thing
+/// anyone remembers to do.
+///
+/// So the main checkout is asked for by name: `git rev-parse --git-common-dir`
+/// resolves to the ORIGINAL repository's `.git` from inside any worktree of it.
+fn contracts_repo() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CRAFTWORKS_CONTRACTS") {
+        return Some(PathBuf::from(p));
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let beside = manifest.join("../freenet-contracts");
+    if beside.join("block/Cargo.toml").is_file() {
+        return Some(beside);
+    }
+    // In a worktree: find the checkout this one belongs to.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(manifest)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim().to_string());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        manifest.join(common)
+    };
+    // <main repo>/.git → <main repo> → its sibling.
+    let main = common.parent()?;
+    let beside = main.join("../freenet-contracts");
+    beside.join("block/Cargo.toml").is_file().then_some(beside)
 }
 
 /// `freenet-prolly = { git = "…", rev = "abcdef1" }` → `abcdef1`.
@@ -39,17 +75,22 @@ fn pinned_rev(manifest: &str) -> Option<String> {
 #[test]
 fn the_sdk_pins_the_tree_library_the_block_contract_pins() {
     let mine = pinned_rev(include_str!("../Cargo.toml")).expect("this crate pins freenet-prolly");
-    let block = contracts_repo().join("block/Cargo.toml");
-    let Ok(text) = std::fs::read_to_string(&block) else {
-        // Absent sibling repo: say so loudly rather than pass quietly. A gate
-        // that silently does nothing when its subject is missing is a gate that
-        // reports green for the wrong reason.
-        println!(
-            "SKIPPED: {} not found — set CRAFTWORKS_CONTRACTS to check the pin agreement",
-            block.display()
+    // A gate has three outcomes, and "could not check" is not one of them: in
+    // any log anyone reads it is indistinguishable from "checked, fine". This
+    // used to print SKIPPED and return green, which is how a real skew reached
+    // a PR whose suite was entirely green.
+    let Some(repo) = contracts_repo() else {
+        panic!(
+            "cannot find the freenet-contracts checkout, so the pin agreement \
+             was NOT checked. Set CRAFTWORKS_CONTRACTS to its path. This is a \
+             failure and not a skip: the skew this gate exists for is invisible \
+             to every other test in this repo, because both sides of those \
+             tests are the same library."
         );
-        return;
     };
+    let block = repo.join("block/Cargo.toml");
+    let text = std::fs::read_to_string(&block)
+        .unwrap_or_else(|e| panic!("{} could not be read: {e}", block.display()));
     let theirs = pinned_rev(&text).expect("the Block contract pins freenet-prolly");
     assert_eq!(
         mine, theirs,

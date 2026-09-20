@@ -16,9 +16,72 @@ use freenet_prolly::build::init;
 use freenet_prolly::node::{Node, Value};
 use freenet_prolly::range::{range, read_value, Range};
 use freenet_prolly::read::{get, height};
+use freenet_prolly::rs::PARITY;
 use freenet_prolly::store::{Blocks, BlocksMut, MemBlocks, ReadError};
 use freenet_prolly::Cid;
+use std::collections::BTreeMap;
 use std::ops::Bound;
+
+/// One group's owed redundancy: the three parity blocks and the members they
+/// protect.
+///
+/// The unit an engine works in. Three parity blocks are one group's
+/// redundancy and are only worth anything together, so "how much is owed" is
+/// answered in groups as well as in blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwedGroup {
+    /// The three parity block ids, in the order the node lists them.
+    pub parity: [Cid; PARITY],
+    /// The blocks this group's parity covers.
+    pub members: Vec<Cid>,
+}
+
+/// Parity blocks a write coded that have not been published: a debt, not a
+/// value.
+///
+/// `#[must_use]` because the whole point is that they cannot go missing
+/// quietly. A node lists its parity ids the moment it is written; if the bytes
+/// are never put, the tree still looks complete — same root, same ids, every
+/// reader satisfied — and the redundancy simply does not exist. Nothing
+/// downstream can detect it. So the type refuses to be dropped without a word.
+///
+/// [`OwedParity::forget`] is the way to say "yes, really, discard these", and
+/// it is spelled as a deliberate act rather than a `let _ =`.
+#[must_use = "these parity blocks have not been put: dropping them loses the \
+              redundancy the tree already promises. Put them, or call \
+              `forget()` to say that is intended"]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwedParity {
+    blocks: Vec<(Cid, Vec<u8>)>,
+}
+
+impl OwedParity {
+    /// How many blocks are owed.
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// The blocks, to be PUT after the head.
+    pub fn into_blocks(self) -> Vec<(Cid, Vec<u8>)> {
+        self.blocks
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Cid, &[u8])> {
+        self.blocks.iter().map(|(c, b)| (c, b.as_slice()))
+    }
+
+    /// Discard the debt on purpose.
+    ///
+    /// For a caller that is throwing the tree away too — a test, a scratch
+    /// build, an oracle. It exists so that discarding is something someone
+    /// wrote down, rather than the default that happens when nobody thinks
+    /// about it.
+    pub fn forget(self) {}
+}
 
 /// What a store holds, for the builder's tree panel and for tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,12 +100,20 @@ pub struct Options {
     /// over 1 KiB can be written and never read back — which is what the
     /// negative control proves the suite would catch.
     pub keep_value_blocks: bool,
+    /// Record the parity blocks each write codes. With this off the store
+    /// writes nodes listing parity ids and keeps none of the bytes — the tree
+    /// looks identical and has no redundancy behind it, which is the state
+    /// this SDK was in before the library reported them at all. The control
+    /// for [`TreeStore::owed_parity`] turns it off, so that assertion is known
+    /// to be capable of failing.
+    pub track_owed_parity: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             keep_value_blocks: true,
+            track_owed_parity: true,
         }
     }
 }
@@ -78,6 +149,19 @@ impl BlocksMut for Kept {
 pub struct TreeStore {
     blocks: Kept,
     root: Cid,
+    /// Parity blocks this store has been handed and has NOT published.
+    ///
+    /// Kept apart from `blocks` on purpose. A node lists its parity ids as soon
+    /// as it is written, but the bytes behind them are separate blocks that a
+    /// commit puts AFTER the head (ARCHITECTURE §7) — so until they are out,
+    /// that group has no redundancy, and folding them in here would record a
+    /// debt as though it were paid. In memory the distinction costs nothing and
+    /// buys the one number a caller needs: how much redundancy it still owes.
+    ///
+    /// A later edit to a group whose parity was never put falls back to a full
+    /// recode, because a correction needs the old parity to correct.
+    owed: BTreeMap<Cid, Vec<u8>>,
+    track_owed: bool,
 }
 
 impl Default for TreeStore {
@@ -97,7 +181,12 @@ impl TreeStore {
             ..Kept::default()
         };
         let root = init(&mut blocks);
-        TreeStore { blocks, root }
+        TreeStore {
+            blocks,
+            root,
+            owed: BTreeMap::new(),
+            track_owed: opts.track_owed_parity,
+        }
     }
 
     /// The tree's root hash. This is the whole contents in 32 bytes: two stores
@@ -124,6 +213,82 @@ impl TreeStore {
     /// be handed.
     pub fn blocks(&self) -> impl Iterator<Item = (&Cid, &[u8])> {
         self.blocks.inner.0.iter().map(|(c, b)| (c, b.as_slice()))
+    }
+
+    /// How many parity blocks this store holds but has not published.
+    ///
+    /// Zero means every group of the current tree has its redundancy out —
+    /// which, for this in-memory store, is true only of a store nothing has
+    /// been written to, since nothing here ever publishes. The number is what a
+    /// networked store would work down, and what a panel shows as the tree's
+    /// unpaid durability.
+    pub fn owed_parity(&self) -> usize {
+        self.owed.len()
+    }
+
+    /// The owed parity blocks themselves, as `(id, bytes)`.
+    ///
+    /// What a commit puts after the head. Ordered by id so two stores holding
+    /// the same debt hand it over in the same order. This BORROWS: the store
+    /// still owes them afterwards, which is why it is safe to ignore.
+    pub fn owed(&self) -> impl Iterator<Item = (&Cid, &[u8])> {
+        self.owed.iter().map(|(c, b)| (c, b.as_slice()))
+    }
+
+    /// The owed parity as GROUPS: what each set of three blocks protects.
+    ///
+    /// Three parity blocks are not three independent things — they are one
+    /// group's redundancy, and they are only worth anything together. An
+    /// engine putting them needs to know which members each set covers, so it
+    /// can say what is still unprotected when a PUT fails partway.
+    ///
+    /// Derived from the nodes rather than recorded alongside, because the node
+    /// is where the grouping is DEFINED: reading it back the way a checker
+    /// reads it means the store cannot drift from the format. A group whose
+    /// three ids are not all owed is not reported — partial redundancy is not
+    /// a group.
+    pub fn owed_groups(&self) -> Vec<OwedGroup> {
+        let mut out = Vec::new();
+        for (_, bytes) in self.blocks() {
+            let Ok(node) = Node::parse(bytes) else {
+                continue;
+            };
+            let ids: Vec<Cid> = node.parity().collect();
+            let groups = freenet_prolly::parity::group_members(&node);
+            if ids.len() != groups.len() * PARITY {
+                // A node whose parity count disagrees with its grouping should
+                // never have been stored; it is not this function's job to
+                // guess what it meant.
+                continue;
+            }
+            for (i, (_, members)) in groups.into_iter().enumerate() {
+                let trio = [ids[i * PARITY], ids[i * PARITY + 1], ids[i * PARITY + 2]];
+                if !trio.iter().all(|c| self.owed.contains_key(c)) {
+                    continue;
+                }
+                out.push(OwedGroup {
+                    parity: trio,
+                    members,
+                });
+            }
+        }
+        out.sort_by_key(|g| g.parity[0]);
+        out.dedup_by_key(|g| g.parity[0]);
+        out
+    }
+
+    /// Take the debt, leaving the store owing nothing.
+    ///
+    /// The store stops tracking these the moment they leave, so dropping the
+    /// returned value drops the only record that they were owed — the tree
+    /// keeps listing the ids and nothing anywhere knows the bytes were never
+    /// put. That is the failure this whole change exists to prevent, so
+    /// [`OwedParity`] is `#[must_use]`: ignoring it is a compile warning, not
+    /// a silent loss of redundancy.
+    pub fn take_owed(&mut self) -> OwedParity {
+        OwedParity {
+            blocks: std::mem::take(&mut self.owed).into_iter().collect(),
+        }
     }
 
     /// The bytes of a value, wherever the format put it.
@@ -241,5 +406,12 @@ impl Store for TreeStore {
             Err(e) => unreachable!("the SDK built a batch the tree refuses: {e:?}"),
         };
         self.root = applied.root;
+        // The parity this write CODED, kept as a debt rather than published.
+        // `apply` reports only groups it coded: one whose parity was already
+        // out is not re-reported, so this never grows by a block that is
+        // already on the network.
+        if self.track_owed {
+            self.owed.extend(applied.parity);
+        }
     }
 }

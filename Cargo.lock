@@ -80,7 +80,7 @@ checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 [[package]]
 name = "freenet-prolly"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=e2756c8#e2756c850b49994086d2b8b59bb67569d37acc71"
+source = "git+https://github.com/craft-ec/freenet-prolly?rev=9764b86#9764b86b07f2bebc8e1d5b5f2c28d4f3b0f91d94"
 dependencies = [
  "blake3",
 ]
