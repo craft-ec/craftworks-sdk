@@ -24,6 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod outbox;
 pub mod record;
 
 /// The versions this build can serve.
