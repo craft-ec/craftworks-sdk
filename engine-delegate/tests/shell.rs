@@ -175,6 +175,41 @@ fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
     println!("  never readable back: asked {failed_at} times, then failed");
 }
 
+/// A message with TRAILING BYTES is refused, not half-read.
+///
+/// `bincode::deserialize` decodes the type it was asked for and ignores the
+/// rest, so a longer message reads as a shorter one and the difference is
+/// silent. That is how a wrapped value gets read as its wrapper: the answer
+/// is in the part that was thrown away, and every message decodes to the
+/// same thing.
+#[test]
+fn a_message_with_trailing_bytes_is_refused_rather_than_half_read() {
+    let good = bincode::serialize(&Request::Flush).unwrap();
+    assert!(
+        engine_delegate::wire::request(&good).is_some(),
+        "a well-formed Flush was refused, so the check below shows nothing"
+    );
+    let mut trailing = good.clone();
+    trailing.extend_from_slice(b"and then some");
+    assert!(
+        engine_delegate::wire::request(&trailing).is_none(),
+        "a request with {} trailing byte(s) was accepted; its prefix was read \
+         as a whole message, which is how one message becomes another",
+        trailing.len() - good.len()
+    );
+
+    // ...and the shell drops it rather than acting on the prefix.
+    let store = Store::default();
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, true);
+    let out = s.handle(vec![Inbound::Client(trailing)]);
+    assert_eq!(
+        out.dropped.len(),
+        1,
+        "the trailing-byte message was not counted"
+    );
+    assert!(out.ops.is_empty(), "it produced a node operation anyway");
+}
+
 /// Anything the shell does not understand is dropped and COUNTED.
 ///
 /// Acceptance 5: garbage, an empty message, and a response for a contract

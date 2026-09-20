@@ -29,6 +29,21 @@ getrandom = { version = "0.2", features = ["js"] }
 # it has no I/O, no clock and no randomness — and the way to KEEP that true is
 # for it to be unable to reach them. It does not depend on this crate; a core
 # that can call the SDK is a core that will.
+# A wasm interpreter, for the ARTEFACT gate only.
+#
+# The gate validates blocks this SDK's prolly WRITES through the contract's
+# real `block.wasm` — the same bytes the network runs, not a Rust copy of its
+# rules. A pure-Rust interpreter rather than a JIT: this runs a few hundred
+# small validations, where speed is worth nothing and not needing a C
+# toolchain to run a gate is worth a lot.
+[dev-dependencies]
+wasmi = "0.32"
+bincode = "1"
+# Signing Register records, for the corpus the artefact gate freezes. A
+# dev-dependency: `--edges normal` is what the boundary gate walks, so this
+# never reaches the SDK's own tree.
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
+
 [workspace]
 members = ["engine", "engine-delegate", "probe-delegate", "probe"]
 

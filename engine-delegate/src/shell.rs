@@ -15,6 +15,7 @@
 
 use crate::schedule::{Limits, Op, Scheduler};
 use crate::wire::{self, Dropped, Reply, Request};
+use bincode::Options;
 use engine::read::Via;
 use engine::{Effect, Engine, Event, KeySource, Params};
 use freenet_prolly::store::Blocks;
@@ -122,6 +123,17 @@ struct Carried {
 /// the first empty answer means "not yet" far more often than "never".
 const MAX_READ_BACK_ROUNDS: u32 = 12;
 
+/// The shell's own context, encoded exactly.
+///
+/// Trailing bytes are refused for the same reason the wire refuses them: a
+/// context that is not byte-for-byte what this build wrote is not this
+/// build's context, and half-reading one produces a shell in a state nobody
+/// chose.
+fn ctx_opts() -> impl bincode::Options {
+    use bincode::Options;
+    bincode::DefaultOptions::new().with_fixint_encoding()
+}
+
 pub struct Shell<B: Blocks> {
     pub engine: Engine<B>,
     awaiting: BTreeMap<Cid, u32>,
@@ -156,7 +168,7 @@ impl<B: Blocks> Shell<B> {
 
     /// As `resume`, saying whether the contract code is on hand.
     pub fn resume_with(ctx: &[u8], params: Params, blocks: B, has_code: bool) -> Self {
-        let carried: Option<Carried> = bincode::deserialize(ctx).ok();
+        let carried: Option<Carried> = ctx_opts().deserialize(ctx).ok();
         // A context the shell cannot read and one the ENGINE refuses are the
         // same outcome: start fresh. Never a panic — these bytes come from
         // the node's cache, and a delegate a malformed context can take down
@@ -170,7 +182,8 @@ impl<B: Blocks> Shell<B> {
             ),
             None => (Vec::new(), BTreeMap::new(), None, Vec::new()),
         };
-        let head_exists = bincode::deserialize::<Carried>(ctx)
+        let head_exists = ctx_opts()
+            .deserialize::<Carried>(ctx)
             .map(|c| c.shell.head_exists)
             .unwrap_or(false);
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
@@ -195,16 +208,17 @@ impl<B: Blocks> Shell<B> {
 
     pub fn to_context(&self) -> Option<Vec<u8>> {
         let engine = self.engine.to_context().ok()?;
-        bincode::serialize(&Carried {
-            engine,
-            shell: ShellState {
-                awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
-                head: self.head,
-                head_exists: self.head_exists,
-                outstanding: self.outstanding.clone(),
-            },
-        })
-        .ok()
+        ctx_opts()
+            .serialize(&Carried {
+                engine,
+                shell: ShellState {
+                    awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
+                    head: self.head,
+                    head_exists: self.head_exists,
+                    outstanding: self.outstanding.clone(),
+                },
+            })
+            .ok()
     }
 
     /// One call: everything that arrived, everything that leaves.
@@ -508,7 +522,8 @@ impl<B: Blocks> Shell<B> {
     /// The entry point needs it while BUILDING the outbound messages, which
     /// is after the shell that produced them has been dropped.
     pub fn peek_head_exists(ctx: &[u8]) -> bool {
-        bincode::deserialize::<Carried>(ctx)
+        ctx_opts()
+            .deserialize::<Carried>(ctx)
             .map(|c| c.shell.head_exists)
             .unwrap_or(false)
     }
@@ -548,7 +563,7 @@ impl<B: Blocks> Shell<B> {
     /// The entry point needs this BEFORE it can build the message the shell
     /// is given, and building a shell to ask would mean building one twice.
     pub fn peek_block_for(ctx: &[u8], contract: &Cid) -> Option<Cid> {
-        let c: Carried = bincode::deserialize(ctx).ok()?;
+        let c: Carried = ctx_opts().deserialize(ctx).ok()?;
         c.shell
             .outstanding
             .iter()
