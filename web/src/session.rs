@@ -63,6 +63,18 @@ pub struct Session {
     unusable: Vec<String>,
     /// How many of the plan's completed steps have been reported.
     reported: usize,
+    /// Ranges asked for and not yet answered. The bookkeeping lives in the
+    /// SDK, not here, so it can be tested on a machine rather than only in a
+    /// tab — which is what the first version of this recovery could not be.
+    loads: craftworks_sdk::Loads,
+    /// The root the engine last reported standing on.
+    ///
+    /// A page is recorded against the root it was read at, and a page
+    /// recorded against the wrong root would make a stale range look current.
+    /// Zero until `Identity` has answered, and a load that completes before
+    /// then is still recorded against zero — which is what a brand-new engine
+    /// actually stands on.
+    head_root: [u8; 32],
 }
 
 #[wasm_bindgen]
@@ -96,6 +108,8 @@ impl Session {
             progress: Vec::new(),
             unusable: Vec::new(),
             reported: 0,
+            loads: craftworks_sdk::Loads::new(),
+            head_root: [0u8; 32],
         })
     }
 
@@ -140,7 +154,15 @@ impl Session {
                     // store rather than an acknowledgement that a message
                     // arrived.
                     match protocol::decode_reply(&m) {
-                        Ok(protocol::Reply::Identity { head_writable, .. }) => {
+                        Ok(protocol::Reply::Identity {
+                            head_writable,
+                            head_root,
+                            ..
+                        }) => {
+                            // The root pages are recorded against. A page
+                            // filed under the wrong root would make a stale
+                            // range look current.
+                            self.head_root = head_root;
                             self.plan.on_identity(head_writable);
                             self.note_progress();
                         }
@@ -150,6 +172,19 @@ impl Session {
                         // stops claiming an install it did not make.
                         Ok(protocol::Reply::AlreadyInstalled) => {
                             self.plan.on_already_installed();
+                        }
+                        Ok(protocol::Reply::Page {
+                            req_id,
+                            entries,
+                            cursor,
+                            ..
+                        }) => self.on_page(req_id, entries, cursor),
+                        // A read the engine could not answer. The range is
+                        // NOT recorded as loaded: an empty page here would
+                        // say "this range is empty", which is a wrong answer
+                        // wearing the shape of a right one.
+                        Ok(protocol::Reply::Unavailable { req_id, .. }) => {
+                            self.loads.on_unavailable(req_id)
                         }
                         _ => {}
                     }
@@ -191,6 +226,104 @@ impl Session {
             self.progress.push((step, true));
             self.reported += 1;
         }
+    }
+
+    /// A read's answer, with a `NotLoaded` turned into a real request and a
+    /// ticket to wait on.
+    fn answer<T: serde::Serialize>(&mut self, r: Result<T, DbError>) -> Result<String, JsValue> {
+        match r {
+            Ok(v) => {
+                // The chain this read was walking is finished; the next read
+                // starts its own.
+                self.loads.read_succeeded();
+                serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
+            }
+            Err(e) => Err(self.park(e)),
+        }
+    }
+
+    /// Queue the load a `NotLoaded` needs, and return the error with its
+    /// ticket on it.
+    ///
+    /// **This is the whole of the recovery, and it used to be a comment.**
+    /// The first version of the wrapper answered a `NotLoaded` by awaiting a
+    /// resolved promise and asking again — which asks again in a microtask,
+    /// before any websocket message can possibly have arrived, and after
+    /// having requested nothing at all. Every read outside a preload manifest
+    /// rejected, always, and the test passed because its fake scripted the
+    /// second call to succeed.
+    fn park(&mut self, e: DbError) -> JsValue {
+        let Some((lo, hi)) = e.needs() else {
+            return db_err(&e);
+        };
+        let (lo, hi) = (lo.to_vec(), hi.to_vec());
+
+        let Some((req_id, send)) = self.loads.want(&lo, &hi, crate::js_now_ms()) else {
+            // This span was loaded already and the read still cannot be
+            // answered. Loading it again would answer exactly as it did the
+            // first time, so the caller is told instead of sent round.
+            return db_err(&e);
+        };
+        if send {
+            // `max_entries` 0 = the engine's own page size. Paging is followed
+            // to the end, because the copy records `[lo, hi)` as loaded and
+            // that is only true once the range is exhausted.
+            self.db.store_mut().request_range(req_id, &lo, &hi, 0);
+        }
+        db_err_waiting(&e, Some(req_id))
+    }
+
+    /// A page of a load arrived.
+    fn on_page(&mut self, req_id: u64, entries: Vec<(Vec<u8>, Vec<u8>)>, cursor: Option<Vec<u8>>) {
+        match self.loads.on_page(req_id, entries, cursor) {
+            craftworks_sdk::loads::Page::More { lo, hi, after } => {
+                // Not exhausted. Ask for the rest under the SAME ticket, so
+                // the read parked on it waits for the whole range rather than
+                // being woken by a part of it.
+                self.db.store_mut().client.send(&protocol::Request::Range {
+                    req_id,
+                    lo: protocol::Bound::Included(lo),
+                    hi: protocol::Bound::Excluded(hi),
+                    reverse: false,
+                    after: Some(after),
+                    max_entries: 0,
+                });
+            }
+            craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
+                let root = self.head_root;
+                self.db.store_mut().on_page(&lo, &hi, rows, root);
+            }
+            craftworks_sdk::loads::Page::Nothing => {}
+        }
+    }
+
+    /// Loads that ended since this was last asked, as JSON.
+    ///
+    /// The page resolves its parked reads from THIS, called when a message
+    /// arrives. Never a timer: a timer either spins or answers late, and
+    /// neither of those is a fact about the data.
+    pub fn take_loads(&mut self) -> String {
+        let out: Vec<serde_json::Value> = self
+            .loads
+            .take_ended()
+            .into_iter()
+            .map(|(id, how)| {
+                let ok = how == craftworks_sdk::Ended::Loaded;
+                serde_json::json!({
+                    "id": id,
+                    "ok": ok,
+                    "code": if ok { "LOADED" } else { "UNAVAILABLE" },
+                })
+            })
+            .collect();
+        serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// How many ranges are being loaded right now. For a page to show, and
+    /// for a test to assert that concurrent reads of one range issue ONE
+    /// request rather than one each.
+    pub fn loads_in_flight(&self) -> usize {
+        self.loads.in_flight()
     }
 
     /// Take the next provisioning step, if there is one and nothing is in
@@ -399,11 +532,13 @@ impl Session {
     }
 
     pub fn schema(&mut self, domain: &str) -> Result<String, JsValue> {
-        as_json(self.db.schema(domain))
+        let r = self.db.schema(domain);
+        self.answer(r)
     }
 
     pub fn domains(&mut self) -> Result<String, JsValue> {
-        as_json(self.db.domains())
+        let r = self.db.domains();
+        self.answer(r)
     }
 
     pub fn put(&mut self, domain: &str, fields: &str) -> Result<String, JsValue> {
@@ -419,7 +554,8 @@ impl Session {
 
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
         let k = rkey_of(id)?;
-        as_json(self.db.get(domain, &k))
+        let r = self.db.get(domain, &k);
+        self.answer(r)
     }
 
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
@@ -440,14 +576,15 @@ impl Session {
         } else {
             Some(rkey_of(after)?)
         };
-        as_json(self.db.scan(
+        let r = self.db.scan(
             domain,
             craftworks_sdk::Scan {
                 reverse,
                 limit,
                 after,
             },
-        ))
+        );
+        self.answer(r)
     }
 
     /// What this client HOLDS — not what the tree contains.
@@ -476,7 +613,10 @@ impl Session {
     }
 
     pub fn count(&mut self, domain: &str) -> Result<usize, JsValue> {
-        self.db.count(domain).map_err(|e| db_err(&e))
+        match self.db.count(domain) {
+            Ok(n) => Ok(n),
+            Err(e) => Err(self.park(e)),
+        }
     }
 
     /// The tree's root, as `node:<64 hex>`.
@@ -588,9 +728,13 @@ impl Session {
         let now = crate::js_now_ms();
         let told = self.db.store_mut().copy.time_out(now);
         let stalled = self.plan.tick(now);
+        // A load nobody answered ends as UNAVAILABLE rather than waiting for
+        // ever. The read parked on it gets a fact; a page can show it.
+        self.loads.time_out(now);
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
             "stalled": stalled.map(|s| format!("{s:?}")),
+            "loadsInFlight": self.loads.in_flight(),
         })
         .to_string()
     }
@@ -612,6 +756,18 @@ fn db_err(e: &DbError) -> JsValue {
 fn as_json<T: serde::Serialize>(r: Result<T, DbError>) -> Result<String, JsValue> {
     let v = r.map_err(|e| db_err(&e))?;
     serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
+}
+
+/// A `DbError` as JavaScript sees it, plus the ticket to wait on.
+fn db_err_waiting(e: &DbError, wait: Option<u64>) -> JsValue {
+    let o = db_err(e);
+    if let Some(w) = wait {
+        // The load this read is parked on. The page resolves the promise
+        // when the session reports this ticket ended — from the EVENT of the
+        // answer arriving, never from a timer.
+        let _ = js_sys::Reflect::set(&o, &"wait".into(), &JsValue::from_f64(w as f64));
+    }
+    o
 }
 
 fn fields_of(s: &str) -> Result<serde_json::Map<String, serde_json::Value>, JsValue> {

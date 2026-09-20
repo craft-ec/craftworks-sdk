@@ -1,100 +1,151 @@
-// The engine-backed database wrapper: promises, stable codes, one re-ask.
+// The engine-backed database wrapper: promises, stable codes, and a read that
+// actually waits for the data.
 //
-// No wasm and no socket. The wrapper's whole job is to move JSON and resolve
-// promises, so a fake session that throws what Rust throws exercises all of
-// it — and does so on any machine, which is what makes it a gate.
+// No wasm and no socket. The fake session behaves the way the real one does —
+// a NOT_LOADED carries a TICKET, the data arrives on a LATER TASK, and the
+// ticket is only reported ended once it has. That last part is the whole
+// point: the first version of this wrapper awaited a resolved promise and
+// asked again in a microtask, before any message could have arrived, and its
+// test passed because the fake scripted the second call to succeed.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { engineDb, DbError } from "../../js/engine-db.js";
 
 let failures = 0;
-const test = (name, fn) => {
-  try { fn(); process.stdout.write(`  ok  ${name}\n`); }
-  catch (e) { failures += 1; process.stdout.write(`  FAIL ${name}\n    ${e.message}\n`); }
-};
-const atest = async (name, fn) => {
+const t = async (name, fn) => {
   try { await fn(); process.stdout.write(`  ok  ${name}\n`); }
-  catch (e) { failures += 1; process.stdout.write(`  FAIL ${name}\n    ${e.message}\n`); }
+  catch (e) { failures += 1; process.stdout.write(`  FAIL ${name}\n    ${e.stack?.split("\n")[0] ?? e}\n`); }
 };
 
-/// A session that throws the codes Rust throws, `plan` answers in order.
-const fake = plan => {
-  let calls = 0;
-  return {
-    calls: () => calls,
-    scan() {
-      const step = plan[Math.min(calls, plan.length - 1)];
-      calls += 1;
-      if (step.throw) throw step.throw;
-      return JSON.stringify(step.rows);
+/**
+ * A session whose data ARRIVES LATER.
+ *
+ * `afterMs` is when the load completes. Until then the read throws
+ * NOT_LOADED with a ticket, exactly as the Rust side does, and `take_loads`
+ * reports nothing. A wrapper that re-asks without waiting sees the second
+ * NOT_LOADED and fails — which is the behaviour the old test could not see.
+ */
+const lateSession = ({ afterMs = 20, rows = [{ id: "a" }], fail = false } = {}) => {
+  let loaded = false;
+  let asks = 0;
+  let requests = 0;
+  let ended = [];
+  let nextTicket = 1;
+  const byRange = new Map();
+  const s = {
+    asks: () => asks,
+    requests: () => requests,
+    scan(domain = "tasks") {
+      asks += 1;
+      if (loaded) return JSON.stringify(rows);
+      // ONE request per range, as the session does.
+      let ticket = byRange.get(domain);
+      if (ticket === undefined) {
+        ticket = nextTicket++;
+        byRange.set(domain, ticket);
+        requests += 1;
+        setTimeout(() => {
+          loaded = !fail;
+          ended.push({ id: ticket, ok: !fail, code: fail ? "UNAVAILABLE" : "LOADED" });
+          s.pump();               // the page, woken by a message arriving
+        }, afterMs);
+      }
+      const e = new Error("not loaded");
+      e.code = "NOT_LOADED";
+      e.transient = true;
+      e.wait = ticket;
+      throw e;
     },
-    put() {
-      const step = plan[Math.min(calls, plan.length - 1)];
-      calls += 1;
-      if (step.throw) throw step.throw;
-      return JSON.stringify(step.rows);
-    },
+    put() { return s.scan(); },
+    take_loads() { const out = ended; ended = []; return JSON.stringify(out); },
+    pump: () => {},
   };
+  return s;
 };
 
-const notLoaded = { code: "NOT_LOADED", message: "not loaded yet", transient: true };
-const tooLarge = { code: "TOO_LARGE", message: "over the limit", transient: false };
-
-await atest("a NOT_LOADED read reloads and asks again, once", async () => {
-  const s = fake([{ throw: notLoaded }, { rows: [{ id: "a" }] }]);
+await t("a read waits for the data and then answers — TWO asks, one request", async () => {
+  const s = lateSession({ afterMs: 20 });
   const db = engineDb(s);
+  s.pump = db.drain;
   const rows = await db.scan("tasks");
   assert.deepEqual(rows, [{ id: "a" }]);
-  assert.equal(s.calls(), 2, "it did not re-ask exactly once");
+  assert.equal(s.asks(), 2, "the read did not ask exactly twice");
+  assert.equal(s.requests(), 1, "the read issued more than one request for one range");
 });
 
-await atest("a read that is STILL not loaded throws rather than spinning", async () => {
-  const s = fake([{ throw: notLoaded }]);
+await t("CONCURRENT reads of one unloaded range issue ONE request", async () => {
+  const s = lateSession({ afterMs: 20 });
   const db = engineDb(s);
-  await assert.rejects(() => db.scan("tasks"), e => {
-    assert.ok(e instanceof DbError, "not a DbError");
-    assert.equal(e.code, "NOT_LOADED");
-    return true;
-  });
-  assert.equal(s.calls(), 2, "it asked more than twice; a missing range must not spin");
+  s.pump = db.drain;
+  const all = await Promise.all([db.scan("tasks"), db.scan("tasks"), db.scan("tasks")]);
+  for (const rows of all) assert.deepEqual(rows, [{ id: "a" }]);
+  assert.equal(s.requests(), 1,
+    "three components reading one range asked the node three times; that multiplies every first paint");
 });
 
-await atest("THE CONTROL: a read that succeeds first time is not retried", async () => {
-  const s = fake([{ rows: [] }]);
+await t("THE CONTROL: a loaded read asks ONCE and requests nothing", async () => {
+  const s = lateSession({ afterMs: 0 });
   const db = engineDb(s);
+  s.pump = db.drain;
+  await db.scan("tasks");                     // warm it
+  const asksBefore = s.asks(), reqBefore = s.requests();
   const rows = await db.scan("tasks");
-  assert.deepEqual(rows, []);
-  assert.equal(s.calls(), 1, "a successful read was asked twice");
+  assert.deepEqual(rows, [{ id: "a" }]);
+  assert.equal(s.asks() - asksBefore, 1, "a loaded read asked twice");
+  assert.equal(s.requests() - reqBefore, 0,
+    "a loaded read requested a range it already had; without this the test above proves nothing");
 });
 
-await atest("an error that a reload cannot fix is NOT retried", async () => {
-  const s = fake([{ throw: tooLarge }]);
+await t("a load that ENDS without delivering rejects — it is not 'not yet'", async () => {
+  const s = lateSession({ afterMs: 10, fail: true });
   const db = engineDb(s);
+  s.pump = db.drain;
   await assert.rejects(() => db.scan("tasks"), e => {
-    assert.equal(e.code, "TOO_LARGE");
-    assert.equal(e.transient, false);
+    assert.ok(e instanceof DbError);
+    assert.equal(e.code, "UNAVAILABLE");
     return true;
   });
-  assert.equal(s.calls(), 1, "a TOO_LARGE was retried; no reload can make a record smaller");
 });
 
-await atest("a WRITE is never retried, whatever it says", async () => {
-  const s = fake([{ throw: notLoaded }, { rows: { id: "a" } }]);
+await t("a NOT_LOADED with no ticket rejects rather than hanging", async () => {
+  const s = {
+    scan() { const e = new Error("x"); e.code = "NOT_LOADED"; throw e; },
+    take_loads: () => "[]",
+  };
   const db = engineDb(s);
-  await assert.rejects(() => db.put("tasks", {}), e => e.code === "NOT_LOADED");
-  assert.equal(s.calls(), 1, "a write was re-sent; a retried write can be applied twice");
+  await assert.rejects(() => db.scan("tasks"), e => e.code === "NOT_LOADED");
 });
 
-test("nothing in the wrapper branches on a message", () => {
+await t("an error a load cannot fix is NOT waited on", async () => {
+  let asks = 0;
+  const s = {
+    scan() { asks += 1; const e = new Error("too big"); e.code = "TOO_LARGE"; e.transient = false; throw e; },
+    take_loads: () => "[]",
+  };
+  const db = engineDb(s);
+  await assert.rejects(() => db.scan("tasks"), e => e.code === "TOO_LARGE");
+  assert.equal(asks, 1, "a TOO_LARGE was retried; no load makes a record smaller");
+});
+
+await t("a WRITE is never retried, whatever it says", async () => {
+  const s = lateSession({ afterMs: 5 });
+  const db = engineDb(s);
+  s.pump = db.drain;
+  await assert.rejects(() => db.put("tasks", {}), e => e.code === "NOT_LOADED");
+  assert.equal(s.asks(), 1, "a write was re-sent; a retried write can be applied twice");
+});
+
+await t("nothing in the wrapper branches on a message, or waits on a timer", () => {
   const src = readFileSync(new URL("../../js/engine-db.js", import.meta.url), "utf8");
-  // A message is prose. Branching on it changes behaviour when someone
-  // rewords it, and changes it silently.
-  const bad = src.split("\n").filter(l =>
-    /\.message\s*(===|==|!==|!=)/.test(l) ||
-    /\.message\.(includes|startsWith|match|indexOf)/.test(l));
-  assert.deepEqual(bad, [], `these lines branch on a message:\n${bad.join("\n")}`);
-  // And it really does branch on the code, so the check above is not vacuous.
+  const code = src.split("\n").filter(l => !l.trim().startsWith("//"));
+  const onMessage = code.filter(l =>
+    /\.message\s*(===|==|!==|!=)/.test(l) || /\.message\.(includes|startsWith|match|indexOf)/.test(l));
+  assert.deepEqual(onMessage, [], `these branch on a message:\n${onMessage.join("\n")}`);
+  // A timer here would either spin or answer late, and neither is a fact
+  // about the data. The wake-up is an event.
+  const timers = code.filter(l => /setTimeout|setInterval|Promise\.resolve\(\)/.test(l));
+  assert.deepEqual(timers, [], `these wait on a clock instead of on the answer:\n${timers.join("\n")}`);
   assert.ok(/\.code\s*!==\s*"NOT_LOADED"/.test(src), "the wrapper does not branch on a code at all");
 });
 

@@ -58,6 +58,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     "preload",
     "trace",
     "trace_on",
+    // How a parked read learns its range arrived. An in-memory store has no
+    // range that has not arrived, so there is nothing for these to report
+    // there — they are connection mechanics, not data.
+    "take_loads",
+    "loads_in_flight",
 ];
 
 #[test]

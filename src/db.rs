@@ -56,8 +56,18 @@ pub struct Db<S: Store + Reads, E: Env> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbError {
     /// The store has not loaded the range this read needed. **Not empty.**
-    /// Reload and ask again.
-    NotLoaded,
+    ///
+    /// Carries the SPAN the read actually needed, because the caller's whole
+    /// recovery is to load it — and an error that says "something was not
+    /// loaded" without saying what leaves the caller to guess a range, which
+    /// is how a recovery becomes either a spin or a full download.
+    ///
+    /// The span is the read's OWN span and nothing wider: `[key, key+1)` for
+    /// a get, `[lo, hi)` for a scan. Widening it to the whole domain would
+    /// make one `get` fetch every record in it, which is the page-freezing
+    /// version of being helpful; the loaded-interval bookkeeping means a
+    /// later, wider read asks for whatever is still missing.
+    NotLoaded { lo: Vec<u8>, hi: Vec<u8> },
     /// The store could not reach a block this read needed. The key may well
     /// exist — this is not an absence either.
     Unavailable,
@@ -83,7 +93,7 @@ impl DbError {
     /// here, and the compiler says so.
     pub fn code(&self) -> &'static str {
         match self {
-            DbError::NotLoaded => "NOT_LOADED",
+            DbError::NotLoaded { .. } => "NOT_LOADED",
             DbError::Unavailable => "UNAVAILABLE",
             DbError::TooLarge(_) => "TOO_LARGE",
             DbError::NotDefined(_) => "NOT_DEFINED",
@@ -94,14 +104,14 @@ impl DbError {
     /// Whether a RELOAD is the recovery. The only two that a reload can fix
     /// are the two that are about reaching data rather than about the ask.
     pub fn is_transient(&self) -> bool {
-        matches!(self, DbError::NotLoaded | DbError::Unavailable)
+        matches!(self, DbError::NotLoaded { .. } | DbError::Unavailable)
     }
 }
 
 impl std::fmt::Display for DbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DbError::NotLoaded => f.write_str(
+            DbError::NotLoaded { .. } => f.write_str(
                 "this range has not been loaded yet — reload it; it is not known to be empty",
             ),
             DbError::Unavailable => f.write_str(
@@ -128,15 +138,27 @@ impl From<&str> for DbError {
     }
 }
 
-impl From<StoreError> for DbError {
-    /// The one mapping that matters, kept exhaustive so a new `StoreError`
-    /// has to be classified here rather than falling into `Refused` and
-    /// quietly becoming un-recoverable.
-    fn from(e: StoreError) -> Self {
+impl DbError {
+    /// A store's refusal, told which span the read was for.
+    ///
+    /// Kept exhaustive so a new `StoreError` has to be classified here rather
+    /// than falling into `Refused` and quietly becoming un-recoverable.
+    fn from_store(e: StoreError, lo: &[u8], hi: &[u8]) -> Self {
         match e {
-            StoreError::NotLoaded => DbError::NotLoaded,
+            StoreError::NotLoaded => DbError::NotLoaded {
+                lo: lo.to_vec(),
+                hi: hi.to_vec(),
+            },
             StoreError::Unavailable => DbError::Unavailable,
             StoreError::NoAnswer => DbError::Refused(e.to_string()),
+        }
+    }
+
+    /// The span a `NotLoaded` needs loaded, if that is what this is.
+    pub fn needs(&self) -> Option<(&[u8], &[u8])> {
+        match self {
+            DbError::NotLoaded { lo, hi } => Some((lo, hi)),
+            _ => None,
         }
     }
 }
@@ -155,6 +177,13 @@ fn check_domain(d: &str) -> Result<()> {
             "domain `{d}` must be 1–{MAX_DOMAIN} of a-z 0-9 _ - ."
         )))
     }
+}
+
+/// The smallest key strictly greater than `k`.
+fn succ(k: &[u8]) -> Vec<u8> {
+    let mut out = k.to_vec();
+    out.push(0);
+    out
 }
 
 fn prefix(domain: &str) -> Vec<u8> {
@@ -377,7 +406,12 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// place where a store that cannot answer synchronously becomes something
     /// an app can catch rather than something that kills the instance.
     fn get_key(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.store.get(key).map_err(DbError::from)
+        // The span for a single key is that key alone. `succ` is the
+        // smallest key strictly after it, so `[key, succ)` contains exactly
+        // one key and the loaded-interval bookkeeping stays exact.
+        self.store
+            .get(key)
+            .map_err(|e| DbError::from_store(e, key, &succ(key)))
     }
 
     fn scan_keys(
@@ -389,7 +423,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.store
             .scan(lo, hi, reverse, limit)
-            .map_err(DbError::from)
+            .map_err(|e| DbError::from_store(e, lo, hi))
     }
 
     fn read(&self, schema: &Schema, rkey: &RKey, bytes: &[u8]) -> Result<Record> {
@@ -460,7 +494,11 @@ mod tests {
         let mut d = Db::new(Panics, crate::id::SystemEnv, *b"dev1");
         let long = vec![b'k'; MAX_KEY + 1];
         let e = d.write(vec![(long, Edit::Put(b"v".to_vec()))]).unwrap_err();
-        assert_eq!(e.code(), "TOO_LARGE", "a key over the limit must carry the code an app branches on, not only a message");
+        assert_eq!(
+            e.code(),
+            "TOO_LARGE",
+            "a key over the limit must carry the code an app branches on, not only a message"
+        );
         assert!(e.to_string().contains(&MAX_KEY.to_string()), "{e}");
         // The longest legal key is accepted — so the refusal is the length and
         // not the screen refusing everything.
