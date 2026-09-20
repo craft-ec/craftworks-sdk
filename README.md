@@ -5,8 +5,19 @@ JavaScript the phase it lands: `collection` (1) · `identity` `query` `subscribe
 `inbox` `edge` `stream` (6) · `cap` (8) · `file` `blob` (9) · `ledger` (10).
 
     ./build.sh                     # → pkg/web (ES module) and pkg/node (CommonJS)
-    cargo test --workspace         # Rust side of the shared vectors, and the engine
-    npm test                       # the same behaviour through JavaScript
+    ./gate.sh                      # EVERYTHING this repo checks with, once
+
+`gate.sh` is the canonical check, and it is the only place the commands are
+written down. It derives what to test from the workspace itself, so a crate
+added later is covered without anyone remembering; it prints what it RAN and
+the per-member counts, not just a verdict; and a step it cannot run is a
+failure with its reason, never a skip.
+
+This block used to list the commands instead, and that is exactly how a run of
+plain `cargo test` — which covers the ROOT PACKAGE ONLY — reported 175 tests
+into two merged pull requests while eight workspace members sat out. The real
+number is 358. Nothing failed and nothing warned; the only tell was a count
+that did not move.
 
 ## Collections
 
