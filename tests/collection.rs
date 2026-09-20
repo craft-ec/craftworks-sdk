@@ -195,6 +195,7 @@ fn suite<S: Store + craftworks_sdk::Reads + Default>() {
     assert!(d
         .update("tasks", &ib, &obj(json!({"title": null})))
         .unwrap_err()
+        .to_string()
         .contains("required"));
 
     // delete
@@ -237,7 +238,8 @@ fn the_same_suite_passes_on_the_real_tree() {
 #[test]
 fn writes_that_violate_the_schema_are_refused() {
     let mut d = db::<MemStore>();
-    let err = |d: &mut Db<MemStore, FakeEnv>, v: Value| d.put("tasks", &obj(v)).unwrap_err();
+    let err =
+        |d: &mut Db<MemStore, FakeEnv>, v: Value| d.put("tasks", &obj(v)).unwrap_err().to_string();
     assert!(err(&mut d, json!({"done": true})).contains("`title` is required"));
     assert!(err(&mut d, json!({"title": 7})).contains("must be text"));
     assert!(err(&mut d, json!({"title": "t", "priority": "high"})).contains("must be int"));
@@ -245,10 +247,12 @@ fn writes_that_violate_the_schema_are_refused() {
     assert!(d
         .put("nope", &obj(json!({"title": "t"})))
         .unwrap_err()
+        .to_string()
         .contains("no schema"));
     assert!(d
         .put("Bad Domain", &obj(json!({})))
         .unwrap_err()
+        .to_string()
         .contains("domain"));
     assert_eq!(
         d.count("tasks").unwrap(),
@@ -292,24 +296,28 @@ fn schemas_only_grow_so_old_records_stay_valid() {
     assert!(d
         .define("tasks", &required)
         .unwrap_err()
+        .to_string()
         .contains("cannot be required"));
     let mut retyped = v2.clone();
     retyped.fields[1].kind = Kind::Int;
     assert!(d
         .define("tasks", &retyped)
         .unwrap_err()
+        .to_string()
         .contains("only appended"));
     let mut dropped = v2.clone();
     dropped.fields.remove(0);
     assert!(d
         .define("tasks", &dropped)
         .unwrap_err()
+        .to_string()
         .contains("only appended"));
     let mut renamed = v2.clone();
     renamed.type_name = "Todo".into();
     assert!(d
         .define("tasks", &renamed)
         .unwrap_err()
+        .to_string()
         .contains("cannot become"));
     assert_eq!(
         d.schema("tasks").unwrap().unwrap(),

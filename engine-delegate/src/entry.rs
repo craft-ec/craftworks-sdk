@@ -55,6 +55,52 @@ fn block_contract(code: &[u8], params: &[u8; 32]) -> ContractContainer {
     )))
 }
 
+/// What the store already holds, as an `Install` finds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Held {
+    pub block_code: bool,
+    pub register_code: bool,
+    pub register_params: bool,
+    pub signing_key: bool,
+}
+
+/// Which secrets an `Install` writes, given what is already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Writes {
+    pub block_code: bool,
+    pub register_code: bool,
+    pub register_params: bool,
+    pub signing_key: bool,
+}
+
+/// **`SIGNING_KEY` is never overwritten once present.**
+///
+/// It is the one secret that cannot be re-derived. The contract codes and the
+/// Register's parameters can all be sent again — they are public bytes, and
+/// an install that replaces them with the same thing costs nothing. The key
+/// cannot: replacing it moves the head's contract id and orphans everything
+/// signed with the old one, and nobody kept a copy.
+///
+/// The first-writer-wins guard in the shell tests `head_writable`, which is
+/// code AND params AND key. So a store holding a KEY but missing a code
+/// secret reads as "not writable" and an `Install` is allowed through — and
+/// it would replace exactly the secret that matters. That state is
+/// unreachable today ONLY because the entry point writes the key LAST, which
+/// is a property of the write order three lines apart and not a decision
+/// anybody recorded. Recorded here: an install over a partial store fills
+/// what is missing and KEEPS the key.
+pub fn install_writes(held: Held) -> Writes {
+    Writes {
+        // Public bytes. Re-writing them is free and makes a partial store
+        // whole.
+        block_code: true,
+        register_code: true,
+        register_params: true,
+        // The one that cannot be re-derived.
+        signing_key: !held.signing_key,
+    }
+}
+
 /// Everything a head write needs, present in the secret store.
 ///
 /// Two callers ask this: `Op::Head`, to decide whether a head can be signed
@@ -284,14 +330,35 @@ impl DelegateInterface for EngineDelegate {
                     ..
                 }) = protocol::decode_request(m.payload.as_ref())
                 {
-                    ctx.set_secret(BLOCK_CODE, &block_code);
-                    ctx.set_secret(REGISTER_CODE, &register_code);
-                    ctx.set_secret(REGISTER_PARAMS, &register_params);
+                    // WRITE ORDER IS LOAD-BEARING, and no longer only
+                    // implicitly: the key goes LAST, so a store that holds a
+                    // key always holds the codes too. `install_writes` states
+                    // the rule that used to rest on these three lines being
+                    // in this order.
+                    let held = Held {
+                        block_code: ctx.get_secret(BLOCK_CODE).is_some(),
+                        register_code: ctx.get_secret(REGISTER_CODE).is_some(),
+                        register_params: ctx.get_secret(REGISTER_PARAMS).is_some(),
+                        signing_key: ctx.get_secret(SIGNING_KEY).is_some(),
+                    };
+                    let writes = install_writes(held);
+                    if writes.block_code {
+                        ctx.set_secret(BLOCK_CODE, &block_code);
+                    }
+                    if writes.register_code {
+                        ctx.set_secret(REGISTER_CODE, &register_code);
+                    }
+                    if writes.register_params {
+                        ctx.set_secret(REGISTER_PARAMS, &register_params);
+                    }
                     // The signing key. Stored as given and never derived
                     // from; the delegate's only use for it is to sign a
                     // Register record, and today it is a key a driver made
-                    // for one run and will remove afterwards.
-                    ctx.set_secret(SIGNING_KEY, &signing_key.0);
+                    // for one run and will remove afterwards. NEVER replaced
+                    // once present — see `install_writes`.
+                    if writes.signing_key {
+                        ctx.set_secret(SIGNING_KEY, &signing_key.0);
+                    }
                 }
             }
         }
