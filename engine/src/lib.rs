@@ -24,10 +24,10 @@
 //! (ARCHITECTURE §7): a keeper's repair and the writer's late put are the same
 //! bytes under the same id, so nothing has to be flagged, only done.
 
-use freenet_prolly::apply::{apply_with, Edit as TreeEdit, Options as ApplyOptions};
-use freenet_prolly::build::init;
+use freenet_prolly::apply::{apply_with, ApplyError, Edit as TreeEdit, Options as ApplyOptions};
+use freenet_prolly::chunk::empty_leaf;
 use freenet_prolly::node::Node;
-use freenet_prolly::store::{Blocks, MemBlocks};
+use freenet_prolly::store::{Blocks, ReadError};
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,17 +35,21 @@ pub mod pack;
 pub mod read;
 
 /// Which client a write came from. Two tabs are two clients.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ClientId(pub u64);
 
 /// The client's own id for a write. Echoed in every state change, so a caller
 /// never has to guess which of its writes a notification is about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct WriteId(pub u64);
 
 /// What a client asked for. Mirrors the tree's own edit vocabulary; the engine
 /// never looks inside a value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     Put(Vec<u8>),
     Delete,
@@ -158,7 +162,9 @@ pub enum Event {
 }
 
 /// Which code epoch a head was written under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Epoch(pub u32);
 
 /// Where this engine's authority came from.
@@ -174,6 +180,9 @@ pub enum KeySource {
 /// A group's three parity ids. The unit redundancy comes in: three blocks are
 /// one group's protection and are worth nothing separately.
 pub type ParityIds = [Cid; 3];
+
+/// A parity group's three blocks, as `(id, bytes)`.
+type ParityBlocks = Vec<(Cid, Vec<u8>)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -266,27 +275,56 @@ pub struct Params {
     /// How many times a block is asked for before the read is answered
     /// `Unavailable`. Attempts are RE-ISSUED, not waited on (ARCHITECTURE §7).
     pub max_attempts: u32,
+    /// Fetch rounds one read may make before it is answered `Unavailable`.
+    ///
+    /// Bounds the read itself, which `max_attempts` cannot: that counts a
+    /// BLOCK's failures, and a node that serves a block and then evicts it
+    /// produces an endless series of successes. Generous enough that a deep
+    /// tree on a slow node finishes, small enough that a read cannot spin for
+    /// a whole delegate slice.
+    pub max_read_rounds: u32,
     /// Two requests needing one block share its fetch. Off = the control.
     pub share_fetches: bool,
-    /// Bytes the warm set may hold. Eviction never drops a block a parked
-    /// read or an unpublished commit still needs.
-    pub max_warm_bytes: usize,
     /// Ceilings on an advisory preload: roots, blocks, bytes. A preload may
     /// make reads SOONER, never more or wider, so a hostile manifest costs
     /// the budget and not what it asked for.
     pub preload_roots: usize,
     pub preload_blocks: usize,
     pub preload_bytes: usize,
-    /// On a miss, also ask for every block the warm nodes name — a plausible
-    /// "fetch ahead" a reader might write, and the control for the cost
-    /// bound. A bound no implementation can exceed is not a bound.
-    pub fetch_greedily: bool,
-    /// Pin every block a parked read has been handed, until it replies. Off
-    /// is the control, and the state this engine was in: a tight warm set
-    /// evicts the path a read just paid for, the read re-fetches it, the
-    /// fetch SUCCEEDS so the attempt budget never trips, and nothing ever
-    /// ends.
-    pub pin_parked_reads: bool,
+    /// Ask again for blocks the node already holds.
+    ///
+    /// Kept, but it is NOT a control for the cost bound and must not be sold
+    /// as one: fetches come from `Need`, and `Need` only ever names blocks
+    /// that are missing, so there is nothing already-held to re-ask for. It
+    /// measured 3 fetches against a bound of 4 — inert.
+    pub refetch_held: bool,
+    /// Remember which blocks are already requested, across calls.
+    ///
+    /// Carried in the context, and it does suppress a duplicate fetch when two
+    /// READS want the same block. It is NOT what stops a waiting read
+    /// re-asking on every entry — nothing re-descends a parked read except
+    /// its own block arriving — so it is not a control for the cost bound,
+    /// and measuring it as one gives the same number either way.
+    pub dedupe_in_flight: bool,
+    /// Re-drive every parked read on every entry.
+    ///
+    /// The plausible wrong implementation, and the honest control for "a cold
+    /// lookup costs the same however often the engine is entered": it is the
+    /// SIMPLER thing to write — resume everything and let each read work out
+    /// whether it can progress — and it makes the cost grow with how busy the
+    /// node is rather than with the depth of the tree.
+    pub redescend_on_entry: bool,
+    /// On a miss, also ask for every child of every branch already readable.
+    ///
+    /// A plausible "fetch ahead" a reader might write, and the control that
+    /// keeps the depth bound honest: it asks for a level where the descent
+    /// needs one block.
+    pub fetch_ahead: bool,
+    /// The context budget. The platform caps a delegate's context at exactly
+    /// 400 KiB (`DelegateContext::MAX_SIZE` = 4096*10*10), so this sits below
+    /// it with headroom: exceeding the platform's cap is a refusal the engine
+    /// never sees coming, and exceeding its own is a `Busy` it can report.
+    pub max_context_bytes: usize,
     /// Count the nodes a descent would touch. It is a second walk, for the
     /// cost gate and nothing else, so it is off unless a test asks.
     pub count_descent: bool,
@@ -303,6 +341,44 @@ pub struct Params {
     pub max_accept_age: u64,
     /// Off = the control: writes fold for ever behind a stuck commit.
     pub bound_accept_age: bool,
+    /// Whether the context carries the commit in flight.
+    ///
+    /// Always true in production. It exists as a CONTROL: a both-modes test
+    /// asserts Live and Rehydrate agree, and an assertion that two runs agree
+    /// is worth nothing until something can make them disagree. Turning this
+    /// off leaves one field out of the context, which is exactly the defect
+    /// class the comparison is there to catch, and the control asserts the
+    /// run really does diverge.
+    pub context_carries_pending: bool,
+    /// Rounds a write may spend waiting for a cold tree path before it is
+    /// refused. Each round is one fetch-and-retry of the whole apply.
+    pub max_apply_rounds: u32,
+    /// Largest write that may be parked. Its ops ride in the context, so this
+    /// is a slice of the 400 KiB the platform allows.
+    pub max_parked_write_bytes: usize,
+    /// How many reads may be waiting on the network at once.
+    ///
+    /// Each costs the context about 130 B, measured. Unbounded, ten thousand
+    /// of them make a 1.3 MB context -- three times what the platform will
+    /// store -- and `to_context` then fails, which loses the IN-FLIGHT COMMIT
+    /// as well. A read burst must not be able to destroy a write, so reads
+    /// get a slice of the budget and are refused at its edge.
+    pub max_parked_reads: usize,
+    /// Blocks one commit may name.
+    ///
+    /// The commit's bookkeeping carries a Cid for every block it is waiting
+    /// on, about 60 B each in the context (measured). `max_backlog` bounds a
+    /// commit in BYTES, which says nothing about how many blocks those bytes
+    /// become: eight megabytes of small values is thousands of them, and the
+    /// context would not fit. This is the bound that closes the arithmetic.
+    pub max_commit_blocks: usize,
+    /// Blocks one call may read while recomputing owed parity.
+    ///
+    /// The context carries owed groups as IDS, so a rehydrated engine has to
+    /// find the node that lists them before it can code anything — a walk of
+    /// the tree, which is a READ and must be bounded like one. What it does
+    /// not finish this call, it finishes on the next: the groups stay owed.
+    pub max_parity_scan_blocks: usize,
     /// Emit the head as soon as the commit is planned, without waiting for
     /// its packs to be read back. The control for (c): a head that names a
     /// root whose blocks are not all there is a tree no reader can walk, and
@@ -322,16 +398,25 @@ impl Default for Params {
             transfer_superseded_waiters: true,
             max_fetch_per_round: 8,
             max_attempts: 3,
+            max_read_rounds: 64,
             share_fetches: true,
-            max_warm_bytes: 64 * 1024 * 1024,
             preload_roots: 4,
             preload_blocks: 256,
             preload_bytes: 4 * 1024 * 1024,
-            fetch_greedily: false,
-            pin_parked_reads: true,
+            refetch_held: false,
+            dedupe_in_flight: true,
+            redescend_on_entry: false,
+            fetch_ahead: false,
+            max_context_bytes: 320 * 1024,
             count_descent: false,
             max_accept_age: 64,
             bound_accept_age: true,
+            context_carries_pending: true,
+            max_apply_rounds: 32,
+            max_parked_write_bytes: 128 * 1024,
+            max_parked_reads: 1000,
+            max_commit_blocks: 2048,
+            max_parity_scan_blocks: 512,
             head_before_packs: false,
         }
     }
@@ -354,17 +439,58 @@ struct Owed {
     sent: bool,
 }
 
+/// A write whose apply stopped on a block the node does not hold.
+///
+/// The tree is a persistent structure over content-addressed blocks, so an
+/// apply reads the path it is about to rewrite. A delegate reads through a
+/// SYNC host call that returns what the node happens to hold right now (F14),
+/// and that call does not register demand (F33) -- so a path can simply be
+/// cold, with nothing wrong and nothing to blame.
+///
+/// Reporting `Failed` there was a false statement about a transient miss: it
+/// tells a client its edit will never be in the tree, when fetching one block
+/// would have applied it. So the write is PARKED with its ops, the blocks are
+/// fetched, and the apply runs again from the start -- it is a pure function
+/// of (root, ops), so re-running it costs reads and cannot produce a
+/// different tree.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ParkedWrite {
+    client: ClientId,
+    write_id: WriteId,
+    /// The ops AS GIVEN. Not the sorted batch: the last-writer-wins collapse
+    /// is part of the apply and is redone each round, so what is carried is
+    /// the client's own request and nothing derived from it.
+    ops: Vec<(Vec<u8>, Op)>,
+    /// The root the apply started from. A write parked across a head change
+    /// is stale: its edits belong to a tree that is no longer current.
+    root: Cid,
+    /// Rounds spent waiting. Bounded, because the node may simply not have
+    /// the block: F14 reads what is held and registers no demand, so "fetch
+    /// and try again" can be true for ever.
+    rounds: u32,
+    /// Blocks this write is waiting on, so an arrival for something else does
+    /// not re-run the apply.
+    needs: BTreeSet<Cid>,
+    /// Bytes of the ops, for the backlog bound.
+    bytes: usize,
+}
+
 /// A commit in flight: one apply, one head bump.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Commit {
     seq: u64,
     root: Cid,
     /// Pack and block ids this commit must land before its head may move.
     data: BTreeSet<Cid>,
-    /// The pack BODIES, kept so a failed pack can be sent again. A pack is
-    /// not a block of the tree and is nowhere else: without this, a failed
-    /// pack put re-emitted nothing and the commit stalled for ever, waiting
-    /// for a confirmation for something that had already failed.
+    /// The pack bodies, for THIS call only.
+    ///
+    /// A pack is never carried in the context — it is the largest thing the
+    /// engine touches and the context is 400 KiB. So a pack that fails within
+    /// the call that made it is re-sent from here; one that fails after the
+    /// engine has been re-hydrated cannot be, and the commit's writes are
+    /// reported `Failed` instead. That is TRUE now in a way it was not
+    /// before: the core holds no tree, so nothing of that write is anywhere.
+    #[serde(skip)]
     packs: BTreeMap<Cid, Vec<u8>>,
     /// The parity groups this commit coded. A write is parity-complete when
     /// none of ITS commit's groups is still owed — not when some later
@@ -379,11 +505,46 @@ struct Commit {
 }
 
 /// The write pipeline.
-pub struct Engine {
+/// A block source that also answers for the EMPTY LEAF.
+///
+/// A brand-new device's tree is one empty leaf, and until its first commit is
+/// published nothing on the network holds it. That is not a block the engine
+/// "keeps": `empty_leaf()` is a pure function of the format, so knowing it is
+/// knowing a constant, the same way the engine knows what a pack header looks
+/// like. Everything else goes to the real source.
+struct WithEmptyLeaf<'a, B: Blocks> {
+    inner: &'a B,
+    empty_cid: Cid,
+    empty_bytes: &'a [u8],
+}
+
+impl<B: Blocks> Blocks for WithEmptyLeaf<'_, B> {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        // The real source first: once the leaf is published the node's copy is
+        // the one to use, and it is byte-identical anyway.
+        self.inner.get(cid).or_else(|| {
+            if *cid == self.empty_cid {
+                Some(self.empty_bytes)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+pub struct Engine<B: Blocks> {
+    /// The empty leaf, which a device with no head has as its root and which
+    /// nothing on the network holds until the first commit publishes it.
+    /// A constant of the format, not a cache.
+    empty: freenet_prolly::chunk::Closed,
+    /// Where blocks come from. The core owns NO block bytes: a delegate's
+    /// memory is fresh on every call, so anything it "kept" would be gone by
+    /// the next one. What it can do is ASK — and on a node that is the
+    /// synchronous local read (F14), which sees what this node already holds.
+    blocks: B,
     params: Params,
     /// The warm tree: every block this engine has written. In slice 1 it is
     /// also the only place they exist, because there is no node yet.
-    blocks: MemBlocks,
     root: Cid,
     /// The last head the network has confirmed, and its root. Recovery starts
     /// from here, never from the warm tree.
@@ -411,8 +572,21 @@ pub struct Engine {
     /// "swap one for two" without drifting. `ParityComplete` is a state of the
     /// WRITE — reported once, when this set empties.
     parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<ParityIds>>,
-    /// When the oldest write not yet in a commit was accepted.
-    folded_since: Option<u64>,
+    /// A write whose tree path is not held, waiting for the blocks it needs.
+    ///
+    /// At most ONE, and it costs the context its ops. That is affordable only
+    /// because one commit at a time already means a second write is refused:
+    /// a queue of parked writes would put an unbounded number of client values
+    /// in a 400 KiB context.
+    parked_write: Option<ParkedWrite>,
+    /// When the commit now in flight was started.
+    ///
+    /// It used to be "when the oldest write not yet in a commit was
+    /// accepted", back when writes folded behind an open commit. Under one
+    /// commit at a time nothing waits outside a commit — a write arriving
+    /// behind one is refused — so the write left sitting `Accepted` is the
+    /// in-flight commit's own, and this is the clock for it.
+    in_flight_since: Option<u64>,
     /// Writes already told they are stalled, so the notice is sent once.
     told_stalled: BTreeSet<(ClientId, WriteId)>,
     /// Where this engine's authority came from, as STATED at `Start`.
@@ -441,12 +615,6 @@ pub struct Engine {
     coded_since_commit: BTreeSet<ParityIds>,
     /// Everything the read path is waiting on.
     reads: read::Reads,
-    /// Bytes held warm, kept as a RUNNING total. Re-summing every block on
-    /// every arrival is O(n) per block and so O(n^2) to warm a tree.
-    warm_bytes: usize,
-    /// When each warm block was last written or delivered, for LRU eviction.
-    last_used: BTreeMap<Cid, u64>,
-    use_clock: u64,
     /// Nodes parsed on the write path. A cost counter, not a statistic: the
     /// whole point of the diff walk is that this stays proportional to the
     /// tree's DEPTH, and a test that does not measure it would not notice the
@@ -455,19 +623,13 @@ pub struct Engine {
     now: u64,
 }
 
-impl Default for Engine {
-    fn default() -> Self {
-        Engine::new(Params::default())
-    }
-}
-
-impl Engine {
+impl<B: Blocks> Engine<B> {
     /// Anything a caller can set must not be able to panic the core later.
     /// `max_packed_value` above `max_pack` describes a value that must ride in
     /// a pack and cannot fit in one; the planner would reach an `unreachable!`
     /// three steps away, where nothing points back at the setting that caused
     /// it. Refused here instead, naming both numbers.
-    pub fn new(params: Params) -> Self {
+    pub fn new(params: Params, blocks: B) -> Self {
         assert!(
             params.max_packed_value + pack::member_cost(0) + pack::PACK_HEADER <= params.max_pack,
             "max_packed_value ({}) cannot fit in a pack of max_pack ({}): a value \
@@ -479,10 +641,11 @@ impl Engine {
             params.max_pack > pack::PACK_HEADER,
             "max_pack holds no members"
         );
-        let mut blocks = MemBlocks::default();
-        let root = init(&mut blocks);
+        let empty = empty_leaf();
+        let root = empty.cid;
         Engine {
             params,
+            empty,
             blocks,
             root,
             published_seq: 0,
@@ -494,7 +657,8 @@ impl Engine {
             owed: BTreeMap::new(),
             in_flight_parity: BTreeMap::new(),
             parity_waiting: BTreeMap::new(),
-            folded_since: None,
+            in_flight_since: None,
+            parked_write: None,
             told_stalled: BTreeSet::new(),
             key: None,
             epochs: Vec::new(),
@@ -504,9 +668,6 @@ impl Engine {
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
             reads: read::Reads::default(),
-            warm_bytes: 0,
-            last_used: BTreeMap::new(),
-            use_clock: 0,
             nodes_parsed: 0,
             now: 0,
         }
@@ -543,6 +704,21 @@ impl Engine {
     }
 
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
+        if self.params.redescend_on_entry {
+            // The control: every entry re-drives every parked read, whether
+            // or not anything it waits on has changed.
+            let parked: Vec<read::ReqId> = self.reads.parked.keys().copied().collect();
+            let mut out = Vec::new();
+            for r in parked {
+                out.extend(self.drive(r));
+            }
+            out.extend(self.step_inner(event));
+            return out;
+        }
+        self.step_inner(event)
+    }
+
+    fn step_inner(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Write {
                 client,
@@ -562,7 +738,11 @@ impl Engine {
                 client,
                 req_id,
                 range,
-            } => self.on_read(client, req_id, read::Want::Scan(range)),
+            } => self.on_read(
+                client,
+                req_id,
+                read::Want::Scan(Box::new(range.as_ref().into())),
+            ),
             Event::Preload { client, roots } => self.on_preload(client, roots),
             Event::BlockArrived { id, bytes } => self.on_arrived(id, bytes),
             Event::BlockMissed(id) => self.on_missed(id),
@@ -614,11 +794,9 @@ impl Engine {
         if let Some(epoch) = self.epochs.first().copied() {
             return vec![Effect::ReadHead { epoch }];
         }
-        let mut blocks = MemBlocks::default();
-        let root = init(&mut blocks);
-        self.blocks = blocks;
-        self.warm_bytes = 0;
-        self.adopt(0, root);
+        // A device with no head starts from the empty tree. Its root is a
+        // constant, not something to fetch.
+        self.adopt(0, self.empty.cid);
         self.recovered = true;
         Vec::new()
     }
@@ -640,7 +818,7 @@ impl Engine {
             .chain(std::mem::take(&mut self.folded))
             .collect();
         self.folded_bytes = 0;
-        self.folded_since = None;
+        self.in_flight_since = None;
         self.unpublished.clear();
         self.coded_since_commit.clear();
         self.adopt(seq, root);
@@ -697,10 +875,38 @@ impl Engine {
                 want,
                 root,
                 levels_done: 0,
+                rounds: 0,
                 held: BTreeSet::from([root]),
             },
         );
-        self.drive(req_id)
+        let out = self.drive(req_id);
+        // The cap is checked AFTER the attempt, not before it. A read the
+        // node can already answer is parked and unparked within this call and
+        // costs the context nothing, so refusing it at the door would refuse
+        // the cheap case to protect a budget it never touches. What is
+        // bounded is the reads still WAITING when the call ends.
+        if self.reads.parked.len() > self.params.max_parked_reads
+            && self.reads.parked.contains_key(&req_id)
+        {
+            let blocked = out
+                .iter()
+                .find_map(|f| match f {
+                    Effect::FetchBlock { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or(root);
+            self.reads.parked.remove(&req_id);
+            self.forget_waiting(req_id);
+            // A reply, not silence. The caller can retry when the burst
+            // clears; a read that is simply dropped leaves it waiting for an
+            // answer that is never coming.
+            return vec![Effect::Reply {
+                client,
+                req_id,
+                result: read::ReadResult::Unavailable(blocked),
+            }];
+        }
+        out
     }
 
     /// Advance one parked read as far as what is warm allows.
@@ -709,13 +915,15 @@ impl Engine {
             return Vec::new();
         };
         let mut out = Vec::new();
-        match read::attempt(
-            &self.blocks,
-            &self.params,
-            &p.want,
-            &p.root,
-            &mut self.nodes_parsed,
-        ) {
+        // The counter is taken OUT for the call: `source()` borrows the
+        // engine, and a cost counter is not worth an interior-mutability cell.
+        let mut parsed = self.nodes_parsed;
+        let outcome = {
+            let source = self.source();
+            read::attempt(&source, &self.params, &p.want, &p.root, &mut parsed)
+        };
+        self.nodes_parsed = parsed;
+        match outcome {
             read::Attempt::Done(result) => {
                 self.reads.parked.remove(&req_id);
                 self.forget_waiting(req_id);
@@ -738,8 +946,25 @@ impl Engine {
                 });
             }
             read::Attempt::Need(ids) => {
-                if let Some(q) = self.reads.parked.get_mut(&req_id) {
+                // A round that asks for something is a round: if the read has
+                // made too many without finishing, it ENDS. The node may be
+                // evicting what it serves faster than the descent can use it,
+                // and a read that cannot finish must say so rather than spin.
+                let over = {
+                    let q = self.reads.parked.get_mut(&req_id).expect("parked");
                     q.levels_done += 1;
+                    q.rounds += 1;
+                    q.rounds > self.params.max_read_rounds
+                };
+                if over {
+                    self.reads.parked.remove(&req_id);
+                    self.forget_waiting(req_id);
+                    let blocked = ids.first().copied().unwrap_or(p.root);
+                    return vec![Effect::Reply {
+                        client: p.client,
+                        req_id,
+                        result: read::ReadResult::Unavailable(blocked),
+                    }];
                 }
                 let levels_done = self.reads.parked.get(&req_id).map_or(0, |q| q.levels_done);
                 out.push(Effect::Progress {
@@ -751,32 +976,59 @@ impl Engine {
                     levels_total: levels_done + 1,
                 });
                 let mut ids = ids;
-                if self.params.fetch_greedily {
-                    // Everything any warm node names, whether or not this read
-                    // needs it.
-                    let named: Vec<Cid> = self
-                        .blocks
-                        .0
-                        .values()
-                        .filter_map(|b| Node::parse(b).ok())
-                        .filter(|n| !n.is_leaf())
-                        .flat_map(|n| (0..n.len()).map(move |i| n.child(i).0).collect::<Vec<_>>())
-                        .collect();
-                    // Capped, or the control never terminates and measures
-                    // nothing. It still blows the bound many times over.
-                    ids.extend(named.into_iter().take(64));
+                // Never ask for what the node already holds. `Page::need` can
+                // name blocks an earlier round brought in, and a reader that
+                // re-fetches them makes no progress at all.
+                //
+                // `refetch_held` is the control for the cost bound: with it on
+                // the engine asks again for everything, which is a plausible
+                // implementation and blows the bound many times over. The old
+                // control enumerated the whole warm set, which a core that
+                // owns no blocks cannot do.
+                if !self.params.refetch_held {
+                    ids.retain(|id| self.blocks.get(id).is_none());
                 }
-                // Never ask for what is already here. `Page::need` can name
-                // blocks a previous round already brought in, and a reader
-                // that re-fetches them makes no progress at all.
-                ids.retain(|id| self.blocks.get(id).is_none());
-                let cap = if self.params.fetch_greedily {
-                    usize::MAX
-                } else {
-                    self.params.max_fetch_per_round
-                };
+                let cap = self.params.max_fetch_per_round;
+                if self.params.fetch_ahead {
+                    // Everything the readable branches name, whether or not
+                    // this descent needs it.
+                    let mut ahead: Vec<Cid> = Vec::new();
+                    let mut stack = vec![p.root];
+                    let mut seen: BTreeSet<Cid> = BTreeSet::new();
+                    while let Some(cid) = stack.pop() {
+                        if !seen.insert(cid) || ahead.len() > 128 {
+                            continue;
+                        }
+                        let Some(bytes) = self.blocks.get(&cid) else {
+                            continue;
+                        };
+                        let Ok(n) = Node::parse(bytes) else { continue };
+                        if !n.is_leaf() {
+                            for i in 0..n.len() {
+                                let c = n.child(i).0;
+                                ahead.push(c);
+                                stack.push(c);
+                            }
+                        }
+                    }
+                    ids.extend(ahead);
+                    // The ahead ids go through the same already-held filter as
+                    // the rest: without it the control re-asks for what just
+                    // arrived and never settles, which is a hang rather than a
+                    // cost and measures nothing.
+                    if !self.params.refetch_held {
+                        ids.retain(|id| self.blocks.get(id).is_none());
+                    }
+                }
                 for id in ids.into_iter().take(cap) {
-                    if self.reads.want(id, req_id, self.params.share_fetches) {
+                    // The waiter is ALWAYS recorded — that is what wakes the
+                    // read when the block lands, and skipping it would make
+                    // the control a hang rather than a cost. What the control
+                    // turns off is only the SUPPRESSION: with dedupe off the
+                    // fetch is emitted again every time the engine re-descends
+                    // and finds the same block missing.
+                    let first = self.reads.want(id, req_id, self.params.share_fetches);
+                    if first || !self.params.dedupe_in_flight {
                         let attempt = *self.reads.attempts.entry(id).or_insert(0);
                         let via = self
                             .reads
@@ -810,9 +1062,23 @@ impl Engine {
             .iter()
             .map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 })
             .sum();
-        // Refused BEFORE it is applied. A write answered Busy must leave no
-        // trace: the client will send it again, and a half-applied write that
-        // was also refused is the worst of both.
+        // ONE COMMIT AT A TIME. A write arriving while a commit is in flight
+        // is REFUSED, not folded.
+        //
+        // Folding needed the write's blocks to survive until the next commit,
+        // and there is nowhere to put them: the core keeps no blocks and the
+        // context must not carry a pack. Buffering belongs to the client,
+        // which has a page and an outbox; the delegate has neither. `Busy`
+        // says so, and leaves no trace — a write both applied and refused is
+        // the worst of both.
+        if self.pending.is_some() || self.parked_write.is_some() {
+            return vec![Effect::Notify {
+                client,
+                write_id,
+                state: State::Busy,
+            }];
+        }
+        // Refused BEFORE it is applied, for the same reason.
         if self.backlog() + size > self.params.max_backlog {
             return vec![Effect::Notify {
                 client,
@@ -821,6 +1087,22 @@ impl Engine {
             }];
         }
 
+        self.apply_write(client, write_id, ops, size)
+    }
+
+    /// Apply a write to the tree, parking it if the path is not held.
+    ///
+    /// Called from `on_write` and again from `resume_parked_write` on every
+    /// round. Nothing is retained between rounds but the ops, because the
+    /// apply is a pure function of (root, ops): re-running it reads blocks
+    /// again and produces the same tree.
+    fn apply_write(
+        &mut self,
+        client: ClientId,
+        write_id: WriteId,
+        ops: Vec<(Vec<u8>, Op)>,
+        size: usize,
+    ) -> Vec<Effect> {
         // The tree takes a SET in key order; the client wrote a SEQUENCE. Two
         // ops on one key in a batch are the client changing its mind, so the
         // LAST wins — the SDK's rule, and the one a caller who wrote `put`
@@ -829,12 +1111,12 @@ impl Engine {
         // different tree; the differential against a from-scratch rebuild is
         // what caught it.
         let batch: Vec<(Vec<u8>, TreeEdit)> = ops
-            .into_iter()
+            .iter()
             .map(|(k, o)| {
                 (
-                    k,
+                    k.clone(),
                     match o {
-                        Op::Put(v) => TreeEdit::Put(v),
+                        Op::Put(v) => TreeEdit::Put(v.clone()),
                         Op::Delete => TreeEdit::Delete,
                     },
                 )
@@ -845,28 +1127,56 @@ impl Engine {
 
         let old_root = self.root;
         let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
+        let source = WithEmptyLeaf {
+            inner: &self.blocks,
+            empty_cid: self.empty.cid,
+            empty_bytes: &self.empty.bytes,
+        };
         let applied = match apply_with(
             ApplyOptions::default(),
-            &self.blocks,
+            &source,
             &self.root,
             &batch,
             |c, b: &[u8]| emitted.push((c, b.to_vec())),
         ) {
             Ok(a) => a,
+            // The path is not held. Nothing is wrong: park the write, fetch
+            // what it asked for, and run the apply again when it arrives.
+            Err(ApplyError::Read(ReadError::Need(need))) => {
+                return self.park_write(client, write_id, ops, size, need)
+            }
             // The SDK screens keys and values before a write reaches here, so
             // a refusal means something bypassed it. It is reported, not
-            // hidden, and nothing is applied.
+            // hidden, and nothing is applied. `Failed` is the honest word
+            // here and only here: the edit is NOT in the tree, so a client
+            // that re-submits is not applying it twice.
             Err(_) => {
+                self.parked_write = None;
                 return vec![Effect::Notify {
                     client,
                     write_id,
                     state: State::Failed,
-                }]
+                }];
             }
         };
-        for (c, b) in &emitted {
-            self.blocks.insert(*c, b);
+        // Refused AFTER the apply and BEFORE anything is kept. The apply is a
+        // pure function that wrote to a local sink, so discarding it costs
+        // the work and nothing else — and the count is not knowable before
+        // running it. Nothing below this line has happened yet, so the write
+        // leaves no trace, which is what `Busy` promises.
+        if emitted.len() > self.params.max_commit_blocks {
+            self.parked_write = None;
+            return vec![Effect::Notify {
+                client,
+                write_id,
+                state: State::Busy,
+            }];
         }
+        // It applied, so it is no longer parked.
+        self.parked_write = None;
+        // The blocks are NOT kept. A delegate's memory is fresh on every call,
+        // so anything retained here is gone by the next one; they are emitted
+        // in this same step and read back from the node afterwards.
         self.root = applied.root;
         self.record_owed(old_root, &applied.parity, &emitted);
         // What this commit, or the next one, must ship. Collected here because
@@ -881,16 +1191,117 @@ impl Engine {
         out.extend(std::mem::take(&mut self.pending_notifications));
         self.folded.push((client, write_id));
         self.folded_bytes += size;
-        self.folded_since.get_or_insert(self.now);
-        if self.pending.is_none() {
-            let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship));
-        }
+        // `folded` is a handoff, not a queue: nothing reached here unless
+        // `pending` was none, so `start_commit` drains it in this same call
+        // and it is empty at every point an event can observe.
+        debug_assert!(self.pending.is_none());
+        let to_ship = self.take_unpublished();
+        out.extend(self.start_commit(to_ship));
         out
     }
 
+    /// Park a write whose path is cold, and ask for what it needs.
+    ///
+    /// The bound is on ROUNDS, not on failures: an arrival that lets the
+    /// apply get one level deeper and stop again is a SUCCESS, and a bound
+    /// that counts only misses would never stop a descent that makes progress
+    /// for ever. A tree this engine wrote is bounded in depth, but the root
+    /// it was handed is not necessarily one it wrote.
+    fn park_write(
+        &mut self,
+        client: ClientId,
+        write_id: WriteId,
+        ops: Vec<(Vec<u8>, Op)>,
+        size: usize,
+        need: Vec<Cid>,
+    ) -> Vec<Effect> {
+        let rounds = self.parked_write.as_ref().map_or(0, |p| p.rounds) + 1;
+        if rounds > self.params.max_apply_rounds {
+            // Nothing was applied, so `Failed` is true: the client still has
+            // the write and re-submitting it applies it once.
+            self.parked_write = None;
+            return vec![Effect::Notify {
+                client,
+                write_id,
+                state: State::Failed,
+            }];
+        }
+        // The ops ride in the context until the write applies. A batch too
+        // big to carry is refused now rather than parked and lost at the next
+        // call, when `to_context` would be the thing that failed.
+        //
+        // Measured on the SERIALIZED ops, not on `size`. `size` is the payload
+        // -- keys plus values -- and a batch of 130,000 one-byte keys has a
+        // payload of 128 KiB and a serialized cost of megabytes, so a payload
+        // cap would have let exactly the state through that it exists to
+        // refuse. Serializing here is the park path, which is rare.
+        let parked_cost = bincode::serialized_size(&ops).unwrap_or(u64::MAX) as usize;
+        if parked_cost > self.params.max_parked_write_bytes {
+            self.parked_write = None;
+            return vec![Effect::Notify {
+                client,
+                write_id,
+                state: State::Busy,
+            }];
+        }
+        let needs: BTreeSet<Cid> = need.iter().copied().collect();
+        let out = needs
+            .iter()
+            .map(|id| Effect::FetchBlock {
+                id: *id,
+                via: read::Via::Direct,
+                attempt: rounds,
+            })
+            .collect();
+        self.parked_write = Some(ParkedWrite {
+            client,
+            write_id,
+            ops,
+            root: self.root,
+            rounds,
+            needs,
+            bytes: size,
+        });
+        out
+    }
+
+    /// A block arrived: if the parked write was waiting on it, apply again.
+    ///
+    /// Only on a block it actually asked for. An engine that re-ran the apply
+    /// on every arrival would redo the whole descent for each of a commit's
+    /// own confirmations, and the cost of a cold write would be the number of
+    /// blocks moving on the node rather than the depth of the tree.
+    fn resume_parked_write(&mut self, id: Cid) -> Vec<Effect> {
+        let Some(p) = self.parked_write.as_mut() else {
+            return Vec::new();
+        };
+        if !p.needs.remove(&id) {
+            return Vec::new();
+        }
+        if !p.needs.is_empty() {
+            // Still waiting on the rest of this round's blocks. Running now
+            // would spend a round to stop at the very next one.
+            return Vec::new();
+        }
+        let p = self.parked_write.as_ref().expect("checked").clone();
+        if p.root != self.root {
+            // The tree moved under it. Its edits were computed against a root
+            // that is no longer current, and applying them now would be a
+            // write to a tree the client never saw.
+            self.parked_write = None;
+            return vec![Effect::Notify {
+                client: p.client,
+                write_id: p.write_id,
+                state: State::Failed,
+            }];
+        }
+        self.apply_write(p.client, p.write_id, p.ops, p.bytes)
+    }
+
     fn backlog(&self) -> usize {
-        self.folded_bytes + self.pending.as_ref().map_or(0, |c| c.bytes)
+        self.folded_bytes
+            + self.pending.as_ref().map_or(0, |c| c.bytes)
+            + self.parked_write.as_ref().map_or(0, |p| p.bytes)
     }
 
     /// Record what a commit coded, newest wins.
@@ -1103,7 +1514,7 @@ impl Engine {
         let seq = self.next_seq;
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
-        self.folded_since = None;
+        self.in_flight_since = Some(self.now);
         // In a commit now, so no longer stalled: if it stalls again later that
         // is a new fact and deserves a new notice.
         for w in &writes {
@@ -1335,11 +1746,10 @@ impl Engine {
         if !self.params.coalesce_parity {
             out.extend(self.emit_parity(|_| true));
         }
-        // Whatever arrived while this commit was in flight becomes the next.
-        if !self.folded.is_empty() {
-            let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship));
-        }
+        // Nothing arrived while this commit was in flight: under one commit
+        // at a time such a write was refused, not held. There is no follow-on
+        // commit to start here.
+        debug_assert!(self.folded.is_empty());
         out
     }
 
@@ -1378,38 +1788,34 @@ impl Engine {
 
     /// Say so when a write has sat merely accepted too long.
     ///
-    /// If nothing is in flight the answer is to commit it, and that happens
-    /// first. What this reports is the other case: a commit that cannot
-    /// publish, with writes folding behind it.
+    /// What this reports is a commit that cannot publish, with its own writes
+    /// sitting `Accepted` and nothing moving.
     ///
-    /// They are NOT dropped. Their edits are in the tree and will ship with
-    /// the next commit, so telling a client `Failed` would be a false
+    /// They are NOT dropped. Their edits are in the tree and publish when the
+    /// commit confirms, so telling a client `Failed` would be a false
     /// statement with teeth: the client re-submits, the original publishes
     /// anyway, and a write someone else made in between is overwritten by the
     /// re-submission. `Stalled` says what is true -- still held, not saved,
-    /// not moving. Memory stays bounded by the backlog refusing NEW writes
-    /// with `Busy`, never by forgetting ones already accepted.
+    /// not moving. Memory stays bounded by NEW writes being refused with
+    /// `Busy`, never by forgetting ones already accepted.
     fn age_out_accepted(&mut self, now: u64) -> Vec<Effect> {
-        // Nothing in flight and something waiting: commit it rather than
-        // report it. This is the case a failed commit leaves behind.
-        if self.pending.is_none() && !self.folded.is_empty() {
-            let to_ship = self.take_unpublished();
-            return self.start_commit(to_ship);
-        }
         if !self.params.bound_accept_age {
             return Vec::new();
         }
-        let Some(since) = self.folded_since else {
+        let Some(since) = self.in_flight_since else {
             return Vec::new();
         };
         if now.saturating_sub(since) < self.params.max_accept_age {
             return Vec::new();
         }
+        let Some(commit) = self.pending.as_ref() else {
+            return Vec::new();
+        };
         // Once per write: a notice repeated every tick is noise a caller
         // learns to ignore, and this one matters.
-        let folded = self.folded.clone();
+        let writes = commit.writes.clone();
         let mut out = Vec::new();
-        for w in folded {
+        for w in writes {
             if self.told_stalled.insert(w) {
                 out.push(Effect::Notify {
                     client: w.0,
@@ -1421,12 +1827,119 @@ impl Engine {
         out
     }
 
+    /// Recover the BYTES behind owed groups the context carried as ids only.
+    ///
+    /// Parity is a pure function of a group's members, so the same group
+    /// gives the same three blocks under the same three ids whoever computes
+    /// them. What the context cannot carry is which NODE lists a given trio,
+    /// and that is found by walking the tree — so this is a READ, and it is
+    /// bounded and resumable like one. Blocks it could not read are fetched
+    /// and the groups stay owed; the next call picks up where this stopped.
+    ///
+    /// Without it a rehydrated engine marked every owed group sent and put
+    /// nothing behind it. In production EVERY call is a rehydration, so that
+    /// was not an edge case: it was all of them, and the redundancy the tree
+    /// promised was silently never written.
+    fn recompute_owed(&mut self) -> Vec<Effect> {
+        let wanted: BTreeSet<ParityIds> = self
+            .owed
+            .iter()
+            .filter(|(_, o)| !o.sent && o.blocks.is_empty())
+            .map(|(k, _)| *k)
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut found: Vec<(ParityIds, ParityBlocks)> = Vec::new();
+        let mut need: BTreeSet<Cid> = BTreeSet::new();
+        let mut left = self.params.max_parity_scan_blocks;
+        {
+            let source = self.source();
+            let mut stack = vec![self.root];
+            let mut seen: BTreeSet<Cid> = BTreeSet::new();
+            let mut still: BTreeSet<ParityIds> = wanted.clone();
+            while let Some(cid) = stack.pop() {
+                if still.is_empty() || left == 0 {
+                    break;
+                }
+                if !seen.insert(cid) {
+                    continue;
+                }
+                let Some(bytes) = source.get(&cid) else {
+                    // The walk stopped here. Ask for it; the group stays owed
+                    // and the next call resumes from a warmer tree.
+                    need.insert(cid);
+                    continue;
+                };
+                left -= 1;
+                let Ok(node) = Node::parse(bytes) else {
+                    continue;
+                };
+                // Does this node list any trio still wanted?
+                let lists: Vec<Cid> = node.parity().collect();
+                let here: BTreeSet<ParityIds> = lists
+                    .chunks_exact(3)
+                    .map(|t| [t[0], t[1], t[2]])
+                    .filter(|k| still.contains(k))
+                    .collect();
+                if !here.is_empty() {
+                    match freenet_prolly::parity::blocks_of(&node, &source) {
+                        Some(all) => {
+                            // Matched by the ids the coding PRODUCES, not by
+                            // position: a group is identified by its three
+                            // parity ids, and checking them makes the match
+                            // self-verifying rather than order-dependent.
+                            for trio in all.chunks_exact(3) {
+                                let key: ParityIds = [trio[0].0, trio[1].0, trio[2].0];
+                                if still.remove(&key) {
+                                    found.push((key, trio.to_vec()));
+                                }
+                            }
+                        }
+                        None => {
+                            // A member is not held. Parity over a member whose
+                            // bytes nobody has is parity over nothing, so ask
+                            // for the members and leave the group owed.
+                            for (_, members) in freenet_prolly::parity::group_members(&node) {
+                                for m in members {
+                                    if source.get(&m).is_none() {
+                                        need.insert(m);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !node.is_leaf() {
+                    for i in 0..node.len() {
+                        stack.push(node.child(i).0);
+                    }
+                }
+            }
+        }
+        for (key, blocks) in found {
+            if let Some(o) = self.owed.get_mut(&key) {
+                o.blocks = blocks;
+            }
+        }
+        need.into_iter()
+            .map(|id| Effect::FetchBlock {
+                id,
+                via: read::Via::Direct,
+                attempt: 1,
+            })
+            .collect()
+    }
+
     fn emit_parity(&mut self, want: impl Fn(&Owed) -> bool) -> Vec<Effect> {
-        let mut out = Vec::new();
+        // A rehydrated engine owes groups it has no bytes for. Recover them
+        // before deciding what to send, or every group would be marked sent
+        // with nothing behind it.
+        let mut out = self.recompute_owed();
         let keys: Vec<ParityIds> = self
             .owed
             .iter()
-            .filter(|(_, o)| !o.sent && want(o))
+            .filter(|(_, o)| !o.sent && !o.blocks.is_empty() && want(o))
             .map(|(k, _)| *k)
             .collect();
         for key in keys {
@@ -1435,6 +1948,7 @@ impl Engine {
                 o.sent = true;
                 o.blocks.clone()
             };
+            debug_assert!(!blocks.is_empty(), "filtered above");
             for (id, bytes) in blocks {
                 self.in_flight_parity.insert(id, key);
                 out.push(Effect::PutParity {
@@ -1453,7 +1967,7 @@ fn kind_raw() -> u8 {
     freenet_prolly::kind::RAW
 }
 
-impl Engine {
+impl<B: Blocks> Engine<B> {
     /// A fetched block came back.
     ///
     /// Rule 3: hash-checked against the id it was asked for BEFORE it touches
@@ -1471,17 +1985,19 @@ impl Engine {
         // parked reads at once. Its members are checked the same way: a pack
         // is a transport, and the blocks inside are the same blocks with the
         // same ids.
+        //
+        // The engine does not STORE any of it. The node holds what it fetched
+        // (a GET populates its store), and the engine reads through `Blocks`
+        // on the next call. All this does is check what arrived and wake
+        // whoever was waiting — the checking still matters, because a block
+        // that is not what was asked for must not be treated as an answer.
         if freenet_prolly::block_id(pack::PACK_KIND, &bytes) == id {
             for (mid, mbytes) in pack::members(&bytes) {
                 if read::matches_id(&mid, &mbytes) {
-                    out.extend(self.remember(mid, &mbytes));
                     self.reads.in_pack.insert(mid, id);
                     landed.push(mid);
                 }
             }
-        } else {
-            let n = self.remember(id, &bytes);
-            out.extend(n);
         }
 
         let mut woken: BTreeSet<read::ReqId> = BTreeSet::new();
@@ -1502,6 +2018,12 @@ impl Engine {
             // A read answered by eviction above is gone; driving it is a no-op.
             out.extend(self.drive(req));
         }
+        // A write parked on a cold path takes the same arrivals, including a
+        // block that came inside a pack: the node holds a pack's members
+        // under their own ids, so the apply can read them.
+        for l in &landed {
+            out.extend(self.resume_parked_write(*l));
+        }
         out
     }
 
@@ -1512,6 +2034,33 @@ impl Engine {
     /// never answers is indistinguishable from a wedged node, and the caller
     /// can do nothing about either.
     fn on_missed(&mut self, id: Cid) -> Vec<Effect> {
+        // A miss is the round the parked write spent. Re-ask rather than wait:
+        // the same block may be held by the time the next call runs, and the
+        // round bound is what stops this, not the node's willingness to answer.
+        //
+        // `parked_write` is deliberately NOT cleared first: `park_write` reads
+        // the round count off it, so clearing would reset the count on every
+        // miss and the bound would never be reached.
+        let mut out = Vec::new();
+        if let Some(p) = self.parked_write.clone() {
+            if p.needs.contains(&id) {
+                out.extend(self.park_write(
+                    p.client,
+                    p.write_id,
+                    p.ops,
+                    p.bytes,
+                    p.needs.into_iter().collect(),
+                ));
+            }
+        }
+        // ...and the read path still gets the miss: one block can be the one a
+        // parked READ is waiting on as well, and an early return would leave
+        // that read waiting on an attempt that already came back.
+        out.extend(self.on_missed_read(id));
+        out
+    }
+
+    fn on_missed_read(&mut self, id: Cid) -> Vec<Effect> {
         let Some(reqs) = self.reads.waiting.get(&id).cloned() else {
             return Vec::new();
         };
@@ -1592,118 +2141,6 @@ impl Engine {
         out
     }
 
-    /// Put a block in the warm set, within its bound.
-    ///
-    /// Rule 8: eviction never drops a block a parked read or an unpublished
-    /// commit still needs — evicting those would turn a bounded cache into a
-    /// cause of the very fetches it exists to avoid, and could lose a block
-    /// that exists nowhere else yet.
-    fn remember(&mut self, id: Cid, bytes: &[u8]) -> Vec<Effect> {
-        if self.blocks.get(&id).is_none() {
-            self.warm_bytes += bytes.len();
-        }
-        self.blocks.insert(id, bytes);
-        self.use_clock += 1;
-        self.last_used.insert(id, self.use_clock);
-        if self.warm_bytes <= self.params.max_warm_bytes {
-            return Vec::new();
-        }
-
-        // What must not be evicted. Every block a parked read has been HANDED,
-        // not just its root: a read re-descends from the root on each resume,
-        // so dropping any of the path sends it back for a block it just had —
-        // and that fetch succeeds, so the attempt budget never trips and the
-        // read never ends.
-        let mut pinned: BTreeSet<Cid> = self.unpublished.iter().map(|(c, _)| *c).collect();
-        pinned.insert(self.root);
-        pinned.insert(self.published_root);
-        if self.params.pin_parked_reads {
-            for p in self.reads.parked.values() {
-                pinned.extend(p.held.iter().copied());
-            }
-        } else {
-            for p in self.reads.parked.values() {
-                pinned.insert(p.root);
-            }
-        }
-
-        // Least recently USED first. Eviction in id order is eviction by
-        // BLAKE3, which is to say at random, and the block that just arrived
-        // is as likely a victim as any other.
-        let mut victims: Vec<(u64, Cid)> = self
-            .blocks
-            .0
-            .keys()
-            .filter(|c| !pinned.contains(*c))
-            .map(|c| (self.last_used.get(c).copied().unwrap_or(0), *c))
-            .collect();
-        victims.sort_unstable();
-        for (_, v) in victims {
-            if self.warm_bytes <= self.params.max_warm_bytes {
-                break;
-            }
-            if let Some(b) = self.blocks.0.remove(&v) {
-                self.warm_bytes -= b.len();
-                self.last_used.remove(&v);
-            }
-        }
-        if self.warm_bytes <= self.params.max_warm_bytes {
-            return Vec::new();
-        }
-
-        // Still over, with nothing left to drop: what the parked reads need at
-        // once does not fit. They are ANSWERED rather than left to evict each
-        // other's paths for ever. The largest goes first, and only as many as
-        // it takes.
-        let mut by_size: Vec<(usize, read::ReqId)> = self
-            .reads
-            .parked
-            .iter()
-            .map(|(r, p)| (p.held.len(), *r))
-            .collect();
-        by_size.sort_unstable_by(|a, b| b.cmp(a));
-        let mut out = Vec::new();
-        for (_, req) in by_size {
-            if self.warm_bytes <= self.params.max_warm_bytes {
-                break;
-            }
-            let Some(p) = self.reads.parked.remove(&req) else {
-                continue;
-            };
-            self.forget_waiting(req);
-            out.push(Effect::Reply {
-                client: p.client,
-                req_id: req,
-                result: read::ReadResult::OutOfWarmSpace,
-            });
-            // Its pins are released; drop what is now unpinned.
-            let mut pinned: BTreeSet<Cid> = self.unpublished.iter().map(|(c, _)| *c).collect();
-            pinned.insert(self.root);
-            pinned.insert(self.published_root);
-            for q in self.reads.parked.values() {
-                pinned.extend(q.held.iter().copied());
-            }
-            let mut victims: Vec<(u64, Cid)> = self
-                .blocks
-                .0
-                .keys()
-                .filter(|c| !pinned.contains(*c))
-                .map(|c| (self.last_used.get(c).copied().unwrap_or(0), *c))
-                .collect();
-            victims.sort_unstable();
-            for (_, v) in victims {
-                if self.warm_bytes <= self.params.max_warm_bytes {
-                    break;
-                }
-                if let Some(b) = self.blocks.0.remove(&v) {
-                    self.warm_bytes -= b.len();
-                    self.last_used.remove(&v);
-                }
-            }
-        }
-        out
-    }
-
     /// Start from a published root this engine did not write.
     ///
     /// What a cold reader has: a head, and nothing else. Only for tests — a
@@ -1713,13 +2150,241 @@ impl Engine {
         self.published_root = root;
     }
 
-    /// The warm blocks, so a test can read the tree the engine is holding.
-    pub fn warm_for_test(&self) -> &MemBlocks {
+    /// The block source this engine reads through.
+    pub fn blocks(&self) -> &B {
         &self.blocks
+    }
+
+    /// What the engine reads through: the node, plus the one constant it can
+    /// answer for itself.
+    fn source(&self) -> WithEmptyLeaf<'_, B> {
+        WithEmptyLeaf {
+            inner: &self.blocks,
+            empty_cid: self.empty.cid,
+            empty_bytes: &self.empty.bytes,
+        }
     }
 
     /// Fetches emitted, for the cost gate.
     pub fn fetches(&self) -> usize {
         self.reads.fetches
+    }
+}
+
+/// Everything that must survive a `process()` call.
+///
+/// The delegate's memory is fresh every time, so this is the ONLY thing the
+/// engine carries forward — and it has 400 KiB to do it in (F32). So what is
+/// here is bookkeeping, never payload: ids, sequence numbers, and what each
+/// client is waiting on. No block bytes, and above all no PACK: a pack is the
+/// largest thing the engine touches and would blow the budget on its own.
+///
+/// Versioned, because a delegate upgrade meets a context written by the
+/// previous code. A context whose version is not understood is REFUSED, and
+/// the engine starts from its head instead — which is always safe, because
+/// the head is the journal.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Context {
+    version: u16,
+    published_seq: u64,
+    published_root: Cid,
+    root: Cid,
+    next_seq: u64,
+    pending: Option<Commit>,
+    /// Groups whose parity is owed, by their ids. The BYTES are not here:
+    /// parity is a pure function of a group's members, so a re-hydrated
+    /// engine recomputes them from the node's blocks and puts the same bytes
+    /// under the same ids. Idempotent by construction.
+    owed_groups: Vec<ParityIds>,
+    parked: Vec<(read::ReqId, read::Parked)>,
+    waiting: Vec<(Cid, Vec<read::ReqId>)>,
+    attempts: Vec<(Cid, u32)>,
+    parity_waiting: Vec<((ClientId, WriteId), Vec<ParityIds>)>,
+    head_epoch: Option<Epoch>,
+    /// The write waiting on a cold tree path, ops and all. It is the one
+    /// place client bytes ride in the context, which is why there is at most
+    /// one and why `max_parked_write_bytes` bounds it.
+    parked_write: Option<ParkedWrite>,
+}
+
+/// The version this build writes. Bumped when the shape changes.
+const CONTEXT_VERSION: u16 = 1;
+
+/// What a context this build wrote begins with.
+///
+/// The context comes back from OUTSIDE the engine -- from a node's cache, as
+/// bytes, with no guarantee beyond their length. Anything that is not
+/// byte-for-byte what this build wrote must be refused, and refusal is FREE
+/// here: an engine with no context is correct, it starts from its head and
+/// reports its in-flight writes `Lost`. A context that is merely PLAUSIBLE is
+/// the dangerous one -- it carries the (seq, root) of a commit in flight, so
+/// an engine re-hydrated from a damaged one can emit `UpdateHead` naming a
+/// root nobody has.
+const CONTEXT_MAGIC: [u8; 4] = *b"CWE1";
+
+/// magic + version + checksum, before the encoded body.
+const CONTEXT_HEADER: usize = 4 + 2 + 8;
+
+/// The first 8 bytes of BLAKE3 over the encoded body.
+///
+/// Truncated because this defends against DAMAGE, not against an adversary
+/// who can also rewrite the checksum: the node's context cache is not a trust
+/// boundary the engine can police, and a full 32 bytes would buy nothing a
+/// version check and a fresh start do not already give.
+fn context_checksum(body: &[u8]) -> [u8; 8] {
+    let h = blake3::hash(body);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&h.as_bytes()[..8]);
+    out
+}
+
+/// Encoding options shared by both directions.
+///
+/// `with_fixint_encoding` because that is what `bincode::serialize` does and
+/// the two must agree. `with_limit` makes the allocation bound STRUCTURAL: a
+/// damaged length field cannot ask the decoder for more than the context
+/// budget, whatever today's types happen to make reachable.
+fn context_opts(limit: usize) -> impl bincode::Options {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(limit as u64)
+}
+
+/// Why a context could not be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextError {
+    /// Not something this build can read — a different version, or not a
+    /// context at all. Never a panic: the bytes come from outside.
+    Unreadable,
+    /// Bigger than the budget allows.
+    TooLarge(usize),
+}
+
+impl<B: Blocks> Engine<B> {
+    /// What this engine must carry to its next call.
+    pub fn to_context(&self) -> Result<Vec<u8>, ContextError> {
+        let c = Context {
+            version: CONTEXT_VERSION,
+            published_seq: self.published_seq,
+            published_root: self.published_root,
+            root: self.root,
+            next_seq: self.next_seq,
+            pending: if self.params.context_carries_pending {
+                self.pending.clone()
+            } else {
+                None
+            },
+            owed_groups: self.owed.keys().copied().collect(),
+            parked: self
+                .reads
+                .parked
+                .iter()
+                .map(|(r, p)| (*r, p.clone()))
+                .collect(),
+            waiting: self
+                .reads
+                .waiting
+                .iter()
+                .map(|(c, r)| (*c, r.iter().copied().collect()))
+                .collect(),
+            attempts: self.reads.attempts.iter().map(|(c, n)| (*c, *n)).collect(),
+            parity_waiting: self
+                .parity_waiting
+                .iter()
+                .map(|(w, g)| (*w, g.iter().copied().collect()))
+                .collect(),
+            head_epoch: self.head_epoch,
+            parked_write: self.parked_write.clone(),
+        };
+        use bincode::Options;
+        let body = context_opts(self.params.max_context_bytes)
+            .serialize(&c)
+            .map_err(|_| ContextError::Unreadable)?;
+        let total = CONTEXT_HEADER + body.len();
+        if total > self.params.max_context_bytes {
+            return Err(ContextError::TooLarge(total));
+        }
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&CONTEXT_MAGIC);
+        out.extend_from_slice(&CONTEXT_VERSION.to_le_bytes());
+        out.extend_from_slice(&context_checksum(&body));
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Rebuild an engine from what the last call carried.
+    ///
+    /// Refuses rather than panics: these bytes come from outside this call and
+    /// may be from another version, truncated, or nothing to do with us. A
+    /// refusal is not a disaster — the caller starts from `Start` and reads
+    /// its head, which is the only authority anyway.
+    pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
+        use bincode::Options;
+        // Every check below happens BEFORE the decoder sees a byte of the
+        // body. A decoder that refuses malformed input is not the same thing
+        // as one that refuses input this build did not write: bincode read
+        // 656 of 876 single-window corruptions as a perfectly good context
+        // and handed back an engine in whatever state the damage described.
+        if bytes.len() < CONTEXT_HEADER || bytes.len() > params.max_context_bytes {
+            return Err(ContextError::Unreadable);
+        }
+        if bytes[..4] != CONTEXT_MAGIC {
+            return Err(ContextError::Unreadable);
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != CONTEXT_VERSION {
+            return Err(ContextError::Unreadable);
+        }
+        let body = &bytes[CONTEXT_HEADER..];
+        if bytes[6..CONTEXT_HEADER] != context_checksum(body) {
+            return Err(ContextError::Unreadable);
+        }
+        let c: Context = context_opts(params.max_context_bytes)
+            .deserialize(body)
+            .map_err(|_| ContextError::Unreadable)?;
+        // Kept as well as the header's: two independent statements of the
+        // same fact cost two bytes and catch a build that changed the shape
+        // without changing the constant.
+        if c.version != CONTEXT_VERSION {
+            return Err(ContextError::Unreadable);
+        }
+        let mut e = Engine::new(params, blocks);
+        e.published_seq = c.published_seq;
+        e.published_root = c.published_root;
+        e.root = c.root;
+        e.next_seq = c.next_seq;
+        e.pending = c.pending;
+        e.head_epoch = c.head_epoch;
+        e.parked_write = c.parked_write;
+        e.recovered = true;
+        // The owed groups come back as ids with no bytes. They are recomputed
+        // on demand from the node's blocks, which is sound because parity is a
+        // pure function of its members: the same group gives the same three
+        // blocks under the same three ids, whoever computes them.
+        for key in c.owed_groups {
+            e.owed.insert(
+                key,
+                Owed {
+                    blocks: Vec::new(),
+                    last_changed: 0,
+                    since: 0,
+                    sent: false,
+                },
+            );
+        }
+        for (r, p) in c.parked {
+            e.reads.parked.insert(r, p);
+        }
+        for (cid, reqs) in c.waiting {
+            e.reads.waiting.insert(cid, reqs.into_iter().collect());
+        }
+        for (cid, n) in c.attempts {
+            e.reads.attempts.insert(cid, n);
+        }
+        for (w, gs) in c.parity_waiting {
+            e.parity_waiting.insert(w, gs.into_iter().collect());
+        }
+        Ok(e)
     }
 }

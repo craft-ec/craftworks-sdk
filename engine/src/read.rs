@@ -17,12 +17,14 @@ use crate::{ClientId, Params};
 use freenet_prolly::node::Value;
 use freenet_prolly::range::{range_with, Options as RangeOptions, PageEnd, Range, RangeError};
 use freenet_prolly::read::get;
-use freenet_prolly::store::{Blocks, MemBlocks, ReadError};
+use freenet_prolly::store::{Blocks, ReadError};
 use freenet_prolly::{block_id, kind, Cid};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A client's own id for a read, echoed in its reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ReqId(pub u64);
 
 /// How a block is being fetched.
@@ -63,18 +65,70 @@ pub enum ReadResult {
 }
 
 /// What a client asked for, kept so the request can be retried as blocks land.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Want {
     Get(Vec<u8>),
-    Scan(Box<Range>),
+    Scan(Box<ScanSpec>),
 }
 
-#[derive(Clone, Debug)]
+/// A scan, in the engine's OWN representation.
+///
+/// `freenet_prolly::range::Range` is the library's type and is not encodable;
+/// the context is a wire format that leaves this process, so what goes into it
+/// has to be the engine's, converted at the boundary. Mirroring the fields
+/// rather than wrapping keeps the conversion total — a field added to `Range`
+/// is a compile error here, not a silently dropped bound.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScanSpec {
+    pub lo: std::ops::Bound<Vec<u8>>,
+    pub hi: std::ops::Bound<Vec<u8>>,
+    pub reverse: bool,
+    pub after: Option<Vec<u8>>,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+impl From<&ScanSpec> for Range {
+    fn from(s: &ScanSpec) -> Range {
+        Range {
+            lo: s.lo.clone(),
+            hi: s.hi.clone(),
+            reverse: s.reverse,
+            after: s.after.clone(),
+            max_entries: s.max_entries,
+            max_bytes: s.max_bytes,
+        }
+    }
+}
+
+impl From<&Range> for ScanSpec {
+    fn from(r: &Range) -> ScanSpec {
+        ScanSpec {
+            lo: r.lo.clone(),
+            hi: r.hi.clone(),
+            reverse: r.reverse,
+            after: r.after.clone(),
+            max_entries: r.max_entries,
+            max_bytes: r.max_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Parked {
     pub client: ClientId,
     pub want: Want,
     pub root: Cid,
     pub levels_done: usize,
+    /// Fetch rounds this read has made without finishing.
+    ///
+    /// The bound has to be PER REQUEST, not per block. A per-block attempt
+    /// counter counts FAILURES, and when the node serves a block and then
+    /// evicts it before the next call — which it may, because a sync read
+    /// does not refresh hosting — every attempt SUCCEEDS and the counter
+    /// never trips. The read then re-descends for ever, making progress on
+    /// paper and none in fact.
+    pub rounds: u32,
     /// Every block this read has been handed, PINNED until it replies.
     ///
     /// A read re-descends from the root on each resume, so it needs the whole
@@ -133,8 +187,8 @@ pub(crate) enum Attempt {
     Broken(Cid),
 }
 
-pub(crate) fn attempt(
-    blocks: &MemBlocks,
+pub(crate) fn attempt<B: Blocks>(
+    blocks: &B,
     params: &Params,
     want: &Want,
     root: &Cid,
@@ -163,9 +217,10 @@ pub(crate) fn attempt(
                 }
             }
         }
-        Want::Scan(r) => {
+        Want::Scan(spec) => {
             let opts = RangeOptions::default();
-            match range_with(opts, blocks, root, r) {
+            let r: Range = spec.as_ref().into();
+            match range_with(opts, blocks, root, &r) {
                 Ok(page) => {
                     if !page.need.is_empty() && page.end == PageEnd::Blocked {
                         // Only the blocks it actually stopped on, bounded by
@@ -227,7 +282,7 @@ pub(crate) fn attempt(
 /// Only called once the value's block is known to be warm: the callers above
 /// turn a missing one into a fetch, because defaulting it to empty would
 /// answer a question wrongly rather than not answering it.
-fn materialise(blocks: &MemBlocks, v: Value<'_>) -> Vec<u8> {
+fn materialise<B: Blocks>(blocks: &B, v: Value<'_>) -> Vec<u8> {
     match v {
         Value::Inline(b) => b.to_vec(),
         Value::Ref { cid, .. } => blocks
@@ -245,7 +300,7 @@ fn materialise(blocks: &MemBlocks, v: Value<'_>) -> Vec<u8> {
 /// what this module exists not to do — so this walks the same path only to
 /// count it, and if it ever disagreed with the real descent the cost number
 /// would be wrong while every answer stayed right.
-fn count_nodes(blocks: &MemBlocks, root: &Cid, key: &[u8], out: &mut usize) {
+fn count_nodes<B: Blocks>(blocks: &B, root: &Cid, key: &[u8], out: &mut usize) {
     let mut cur = *root;
     while let Some(bytes) = blocks.get(&cur) {
         let Ok(node) = freenet_prolly::node::Node::parse(bytes) else {

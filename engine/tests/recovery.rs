@@ -15,6 +15,9 @@ use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod common;
+use common::Store;
+
 /// What the network kept. Only what was CONFIRMED is here: a put that was
 /// emitted and not confirmed is exactly what a crash loses.
 #[derive(Default, Clone)]
@@ -54,12 +57,15 @@ const CUTS: [Cut; 6] = [
     Cut::MidParity,
 ];
 
-fn boot(net: &Network, params: Params) -> Engine {
-    let mut e = Engine::new(params);
-    let out = e.step(Event::Start {
-        key: KeySource::SecretStore,
-        epochs: vec![Epoch(2), Epoch(1)],
-    });
+fn boot(net: &Network, params: Params) -> Engine<Store> {
+    let mut e = Engine::new(params, Store::default());
+    let out = stepped!(
+        e,
+        Event::Start {
+            key: KeySource::SecretStore,
+            epochs: vec![Epoch(2), Epoch(1)],
+        }
+    );
     // Answer whatever head reads it asks for.
     let mut queue = out;
     while let Some(f) = queue.pop() {
@@ -73,19 +79,22 @@ fn boot(net: &Network, params: Params) -> Engine {
                 },
                 _ => Event::HeadMissing,
             };
-            queue.extend(e.step(ev));
+            queue.extend(stepped!(e, ev));
         }
     }
     e
 }
 
 /// Give a recovered engine the blocks the network kept, as a read would.
-fn warm_from(e: &mut Engine, net: &Network) {
+fn warm_from(e: &mut Engine<Store>, net: &Network) {
     for (id, bytes) in net.blocks.0.iter() {
-        let _ = e.step(Event::BlockArrived {
-            id: *id,
-            bytes: bytes.clone(),
-        });
+        let _ = stepped!(
+            e,
+            Event::BlockArrived {
+                id: *id,
+                bytes: bytes.clone(),
+            }
+        );
     }
 }
 
@@ -132,11 +141,14 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
 
             next_write += 1;
             let wid = WriteId(next_write);
-            let mut queue = e.step(Event::Write {
-                client: ClientId(1),
-                write_id: wid,
-                ops,
-            });
+            let mut queue = stepped!(
+                e,
+                Event::Write {
+                    client: ClientId(1),
+                    write_id: wid,
+                    ops,
+                }
+            );
             accepted_only.insert(wid);
 
             if cutting && *cut == Cut::AfterAccept {
@@ -154,7 +166,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                 match f {
                     Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
                         net.confirm(id, &bytes);
-                        let out = e.step(Event::PutConfirmed(id));
+                        let out = stepped!(e, Event::PutConfirmed(id));
                         packs_confirmed += 1;
                         if cutting && *cut == Cut::AfterSomePacks && packs_confirmed == 1 {
                             dropped = true;
@@ -182,7 +194,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             break;
                         }
                         net.head = Some((seq, root));
-                        queue.extend(e.step(Event::HeadConfirmed(seq)));
+                        queue.extend(stepped!(e, Event::HeadConfirmed(seq)));
                         if cutting && *cut == Cut::AfterHeadConfirmed {
                             published.extend(will_publish.iter().cloned());
                             accepted_only.remove(&wid);
@@ -199,7 +211,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             let mut parity: Vec<(Cid, Vec<u8>)> = Vec::new();
                             for _ in 0..3 {
                                 clock += 1;
-                                for f in e.step(Event::Tick(clock)) {
+                                for f in stepped!(e, Event::Tick(clock)) {
                                     if let Effect::PutParity { id, bytes, .. } = f {
                                         parity.push((id, bytes));
                                     }
@@ -216,7 +228,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             // must still read.
                             for (id, bytes) in parity.iter().take(parity.len() / 2) {
                                 net.confirm(*id, bytes);
-                                let _ = e.step(Event::PutConfirmed(*id));
+                                let _ = stepped!(e, Event::PutConfirmed(*id));
                             }
                             dropped = true;
                             break;
@@ -224,7 +236,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                     }
                     Effect::PutParity { id, bytes, .. } => {
                         net.confirm(id, &bytes);
-                        queue.extend(e.step(Event::PutConfirmed(id)));
+                        queue.extend(stepped!(e, Event::PutConfirmed(id)));
                     }
                     Effect::Notify {
                         write_id,
@@ -241,11 +253,11 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
             if !dropped {
                 for _ in 0..4 {
                     clock += 1;
-                    let out = e.step(Event::Tick(clock));
+                    let out = stepped!(e, Event::Tick(clock));
                     for f in out {
                         if let Effect::PutParity { id, bytes, .. } = f {
                             net.confirm(id, &bytes);
-                            let _ = e.step(Event::PutConfirmed(id));
+                            let _ = stepped!(e, Event::PutConfirmed(id));
                         }
                     }
                 }
@@ -309,10 +321,13 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
 
         // (d) an accepted-only write is answered Lost, never silence.
         for wid in &accepted_only {
-            let out = e.step(Event::AskWrite {
-                client: ClientId(1),
-                write_id: *wid,
-            });
+            let out = stepped!(
+                e,
+                Event::AskWrite {
+                    client: ClientId(1),
+                    write_id: *wid,
+                }
+            );
             assert!(
                 out.iter().any(|f| matches!(
                     f,
@@ -377,11 +392,14 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
             )
         })
         .collect();
-    let mut queue = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-    });
+    let mut queue = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops,
+        }
+    );
 
     // Confirm ONE put, then take whatever head the engine offers.
     let mut confirmed_one = false;
@@ -395,7 +413,7 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
                 if !confirmed_one {
                     net.confirm(id, &bytes);
                     confirmed_one = true;
-                    queue.extend(e.step(Event::PutConfirmed(id)));
+                    queue.extend(stepped!(e, Event::PutConfirmed(id)));
                 }
             }
             Effect::UpdateHead { seq, root, .. } => {
@@ -437,21 +455,25 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
 }
 
 /// (e): a write never sits merely `accepted` in silence — and a stalled
-/// write still gets saved.
+/// write still gets saved, while a refused one leaves no trace.
 ///
-/// `accepted` survives a refresh and not a restart, so it is exposure. With
-/// one commit in flight, a write arriving behind a commit that cannot publish
-/// would wait unheard. At T it is told `Stalled`: still held, not saved, not
-/// moving.
+/// `accepted` survives a refresh and not a restart, so it is exposure. A
+/// commit that cannot publish leaves its own write sitting accepted, and at
+/// T that write is told `Stalled`: still held, not saved, not moving.
 ///
 /// `Stalled` is NOT `Failed`, and the difference is the whole point. The
-/// edit is still in the tree and ships with the next commit, so reporting
+/// edit is still in the tree and ships when the commit confirms, so reporting
 /// `Failed` would be a false statement with consequences — the client
 /// re-submits, the original publishes anyway, and a write someone else made
-/// in between is overwritten by the re-submission. So this asserts both
-/// halves: the notice arrives, and the write still reaches `Published`.
+/// in between is overwritten by the re-submission.
+///
+/// Writes arriving BEHIND it are the other half, and under one-commit-at-a-
+/// time they are refused rather than folded. `Busy` is terminal and must
+/// leave nothing behind: this asserts the published tree contains write 1's
+/// key and none of theirs, because a write both applied and refused is the
+/// double-apply hazard `Stalled` exists to avoid, wearing the other mask.
 #[test]
-fn a_stalled_write_is_reported_once_and_still_reaches_published() {
+fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
     let t = 8u64;
     let mut net = Network::default();
     let mut e = boot(
@@ -463,11 +485,14 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
     );
 
     // Write 1 opens a commit. Its puts are held back, so it cannot publish.
-    let first = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
+    let first = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+        }
+    );
     let held: Vec<(Cid, Vec<u8>)> = first
         .iter()
         .filter_map(|f| match f {
@@ -482,7 +507,7 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         "the first commit shipped nothing to hold back"
     );
 
-    // Writes 2..6 fold behind it.
+    // Writes 2..6 arrive behind it.
     let mut seen: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
     let absorb = |seen: &mut BTreeMap<WriteId, Vec<State>>, fx: &[Effect]| {
         for f in fx {
@@ -496,39 +521,63 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
     };
     absorb(&mut seen, &first);
     for n in 2..=6u64 {
-        let out = e.step(Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(n),
-            ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
-        });
+        let out = stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(n),
+                ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
+            }
+        );
         absorb(&mut seen, &out);
     }
+    // Each of them was answered in the step that submitted it. Not eventually,
+    // and not by a tick: a caller that got no reply has nothing to wait on.
+    for n in 2..=6u64 {
+        assert_eq!(
+            seen.get(&WriteId(n)).map(Vec::as_slice),
+            Some([State::Busy].as_slice()),
+            "write {n} arrived behind an open commit and was not refused in \
+             the same step"
+        );
+    }
+
     // Time passes with the commit stuck.
     for tick in 1..=(t * 3) {
-        let out = e.step(Event::Tick(tick));
+        let out = stepped!(e, Event::Tick(tick));
         absorb(&mut seen, &out);
     }
 
+    // Write 1 is the one that is genuinely held: it was accepted, its edit is
+    // in the tree, and it cannot publish. That is what `Stalled` describes.
+    let one = seen.get(&WriteId(1)).cloned().unwrap_or_default();
+    assert!(
+        one.contains(&State::Stalled),
+        "write 1 sat accepted for {}+ ticks and was never reported Stalled: \
+         {one:?}",
+        t * 3
+    );
+    assert_eq!(
+        one.iter().filter(|s| **s == State::Stalled).count(),
+        1,
+        "write 1 was told Stalled more than once; a notice repeated every \
+         tick is one a caller learns to ignore"
+    );
+    assert!(
+        !one.contains(&State::Failed),
+        "write 1 was reported Failed while its edit is still in the tree"
+    );
+    // A refused write is not a stalled one, and a tick must not change its
+    // mind: `Busy` is terminal.
     for n in 2..=6u64 {
-        let states = seen.get(&WriteId(n)).cloned().unwrap_or_default();
-        assert!(
-            states.contains(&State::Stalled),
-            "write {n} sat accepted for {}+ ticks and was never reported Stalled: {states:?}",
-            t * 3
-        );
         assert_eq!(
-            states.iter().filter(|s| **s == State::Stalled).count(),
-            1,
-            "write {n} was told Stalled more than once; a notice repeated every \
-             tick is one a caller learns to ignore"
-        );
-        assert!(
-            !states.contains(&State::Failed),
-            "write {n} was reported Failed while its edit is still in the tree"
+            seen.get(&WriteId(n)).map(Vec::as_slice),
+            Some([State::Busy].as_slice()),
+            "write {n} was refused and then told something else as well"
         );
     }
 
-    // Now the network answers, and the stalled writes get saved.
+    // Now the network answers, and the stalled write gets saved.
     let mut queue = first;
     for (id, bytes) in &held {
         net.confirm(*id, bytes);
@@ -540,13 +589,13 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         match f {
             Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
                 net.confirm(id, &bytes);
-                let out = e.step(Event::PutConfirmed(id));
+                let out = stepped!(e, Event::PutConfirmed(id));
                 absorb(&mut seen, &out);
                 queue.extend(out);
             }
             Effect::UpdateHead { seq, root, .. } => {
                 net.head = Some((seq, root));
-                let out = e.step(Event::HeadConfirmed(seq));
+                let out = stepped!(e, Event::HeadConfirmed(seq));
                 absorb(&mut seen, &out);
                 queue.extend(out);
             }
@@ -554,19 +603,41 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         }
     }
 
-    for n in 2..=6u64 {
-        let states = seen.get(&WriteId(n)).cloned().unwrap_or_default();
-        assert!(
-            states.contains(&State::Published),
-            "write {n} was told Stalled and never reached Published: {states:?}. \
-             A stalled write is still held and still gets saved — that is what \
-             makes the notice honest"
-        );
-        assert!(
-            valid_sequence(&states),
-            "write {n} reported an impossible sequence: {states:?}"
-        );
-    }
+    let one = seen.get(&WriteId(1)).cloned().unwrap_or_default();
+    assert!(
+        one.contains(&State::Published),
+        "write 1 was told Stalled and never reached Published: {one:?}. A \
+         stalled write is still held and still gets saved — that is what \
+         makes the notice honest"
+    );
+    assert!(
+        valid_sequence(&one),
+        "write 1 reported an impossible sequence: {one:?}"
+    );
+
+    // The refused writes left NO trace. Compared against a tree built from
+    // write 1's key alone: if any of k2..k6 had been applied and refused, the
+    // roots differ, and a re-submitting client would apply it twice.
+    let mut only_one: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    only_one.insert(b"a".to_vec(), vec![1u8; 40]);
+    let (_, published) = net.head.expect("the commit never published a head");
+    assert_eq!(
+        published,
+        rebuild(&only_one),
+        "the published tree is not write 1's edit alone, so a write that was \
+         told Busy was applied anyway"
+    );
+    // ...and the comparison is sensitive: a tree that DID contain a refused
+    // key has a different root. Without this, the assertion above would pass
+    // just as well if `rebuild` returned a constant.
+    let mut with_k2 = only_one.clone();
+    with_k2.insert(b"k2".to_vec(), vec![2u8; 40]);
+    assert_ne!(
+        rebuild(&with_k2),
+        published,
+        "the root comparison cannot tell a refused write's key apart, so it \
+         proves nothing"
+    );
 
     // The control: with the bound off, nobody is told anything.
     let net2 = Network::default();
@@ -579,20 +650,16 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         },
     );
     let mut stalled = 0;
-    let _ = e2.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
-    for n in 2..=6u64 {
-        let _ = e2.step(Event::Write {
+    let _ = stepped!(
+        e2,
+        Event::Write {
             client: ClientId(1),
-            write_id: WriteId(n),
-            ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
-        });
-    }
+            write_id: WriteId(1),
+            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+        }
+    );
     for tick in 1..=(t * 3) {
-        for f in e2.step(Event::Tick(tick)) {
+        for f in stepped!(e2, Event::Tick(tick)) {
             if let Effect::Notify {
                 state: State::Stalled,
                 ..
@@ -607,7 +674,10 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         "the control reported {stalled} Stalled notice(s), so the bound is not \
          what produces them"
     );
-    println!("  five writes stalled once each and all reached Published; control: 0 notices");
+    println!(
+        "  write 1 stalled once and published; writes 2-6 refused once each \
+         and left no key behind; control: 0 notices"
+    );
 }
 
 /// Is this a sequence a write can legally report?
@@ -647,11 +717,14 @@ fn valid_sequence(states: &[State]) -> bool {
 /// worst possible recovery, because it looks like a successful one.
 #[test]
 fn recovery_finds_a_head_left_under_the_previous_epoch() {
-    let mut e = Engine::default();
-    let out = e.step(Event::Start {
-        key: KeySource::SecretStore,
-        epochs: vec![Epoch(2), Epoch(1)],
-    });
+    let mut e = Engine::new(Params::default(), Store::default());
+    let out = stepped!(
+        e,
+        Event::Start {
+            key: KeySource::SecretStore,
+            epochs: vec![Epoch(2), Epoch(1)],
+        }
+    );
     assert_eq!(
         out.iter()
             .filter_map(|f| match f {
@@ -664,7 +737,7 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
     );
 
     // Nothing under the current epoch.
-    let out = e.step(Event::HeadMissing);
+    let out = stepped!(e, Event::HeadMissing);
     assert_eq!(
         out.iter()
             .filter_map(|f| match f {
@@ -681,11 +754,14 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
         .map(|i| (format!("k{i:03}").into_bytes(), vec![7u8; 30]))
         .collect();
     let root = rebuild(&records);
-    let out = e.step(Event::HeadRead {
-        epoch: Epoch(1),
-        seq: 41,
-        root,
-    });
+    let out = stepped!(
+        e,
+        Event::HeadRead {
+            epoch: Epoch(1),
+            seq: 41,
+            root,
+        }
+    );
     assert!(
         out.is_empty(),
         "recovery walks nothing: reads warm it lazily"
@@ -693,12 +769,15 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
     assert_eq!(e.published_root(), root, "the recovered root is the head's");
 
     // And a device that has never written gets an empty tree, not a panic.
-    let mut fresh = Engine::default();
-    let _ = fresh.step(Event::Start {
-        key: KeySource::Reissued,
-        epochs: vec![Epoch(2)],
-    });
-    let out = fresh.step(Event::HeadMissing);
+    let mut fresh = Engine::new(Params::default(), Store::default());
+    let _ = stepped!(
+        fresh,
+        Event::Start {
+            key: KeySource::Reissued,
+            epochs: vec![Epoch(2)],
+        }
+    );
+    let out = stepped!(fresh, Event::HeadMissing);
     assert!(out.is_empty(), "a brand-new device has nothing left to ask");
     assert_eq!(
         fresh.published_root(),
@@ -715,33 +794,60 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
 /// history under the same key. Its in-flight writes are reported `Lost`,
 /// because their commit is not going to publish and the client is the only
 /// thing that still has them.
+///
+/// `Lost` is owed to exactly the writes the engine ACCEPTED. A write refused
+/// with `Busy` was already answered and is already the client's problem;
+/// telling it `Lost` as well would be a second terminal state for one write,
+/// and a client tracking states would see its write end twice. So the
+/// expected set is read off the accept notices rather than written out, and
+/// the refused write is asserted to stay at the one answer it got.
 #[test]
 fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
     let net = Network::default();
     let mut e = boot(&net, Params::default());
     let before = e.published_root();
 
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"mine".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(2),
-        ops: vec![(b"also-mine".to_vec(), Op::Put(vec![2u8; 40]))],
-    });
+    let mut answers: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
+    for (n, key) in [(1u64, &b"mine"[..]), (2, &b"also-mine"[..])] {
+        for f in stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(n),
+                ops: vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))],
+            }
+        ) {
+            if let Effect::Notify {
+                write_id, state, ..
+            } = f
+            {
+                answers.entry(write_id).or_default().push(state);
+            }
+        }
+    }
     assert_ne!(e.root(), before, "the writes did not reach the warm tree");
+    let accepted: Vec<WriteId> = answers
+        .iter()
+        .filter(|(_, st)| st.contains(&State::Accepted))
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(
+        !accepted.is_empty(),
+        "no write was accepted, so there is nothing this test can lose and          the Lost assertion below would hold over the empty set"
+    );
 
     // The other engine got there first.
     let theirs: BTreeMap<Vec<u8>, Vec<u8>> = (0..30u32)
         .map(|i| (format!("theirs{i:02}").into_bytes(), vec![9u8; 30]))
         .collect();
     let winner = rebuild(&theirs);
-    let out = e.step(Event::HeadConflict {
-        seq: 99,
-        root: winner,
-    });
+    let out = stepped!(
+        e,
+        Event::HeadConflict {
+            seq: 99,
+            root: winner,
+        }
+    );
 
     assert_eq!(
         e.published_root(),
@@ -765,12 +871,32 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
         })
         .collect();
     assert_eq!(
-        lost,
-        vec![WriteId(1), WriteId(2)],
-        "the in-flight writes were not reported Lost, so a client would wait \
-         for ever on a commit that will never publish"
+        lost, accepted,
+        "Lost was not reported for exactly the writes the engine accepted, so \
+         either a client waits for ever on a commit that will never publish, \
+         or a write it already answered ends a second time"
     );
-    println!("  conflict: loser adopts the winner's head, both writes reported Lost");
+    for (w, st) in &answers {
+        if st.contains(&State::Accepted) {
+            continue;
+        }
+        assert_eq!(
+            st.as_slice(),
+            [State::Busy].as_slice(),
+            "{w:?} was refused and then told something else as well"
+        );
+        assert!(
+            !lost.contains(w),
+            "{w:?} was refused with Busy and reported Lost too: one write, \
+             two terminal states"
+        );
+    }
+    let refused = answers.len() - accepted.len();
+    println!(
+        "  conflict: loser adopts the winner's head; {} accepted write(s) \
+         reported Lost, {refused} refused one(s) left alone",
+        accepted.len()
+    );
 }
 
 /// A write whose edit is still in the tree is never reported `Failed`.
@@ -792,20 +918,26 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
         },
     );
     // Write 1 opens a commit the network never confirms.
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
+    let _ = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+        }
+    );
     // Write 2 folds behind it.
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(2),
-        ops: vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))],
-    });
+    let _ = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(2),
+            ops: vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))],
+        }
+    );
     let mut failed = false;
     for t in 1..=20u64 {
-        for f in e.step(Event::Tick(t)) {
+        for f in stepped!(e, Event::Tick(t)) {
             if let Effect::Notify {
                 write_id: WriteId(2),
                 state: State::Failed,
@@ -816,7 +948,7 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
             }
         }
     }
-    let in_tree = freenet_prolly::read::get(e.warm_for_test(), &e.root(), b"b")
+    let in_tree = freenet_prolly::read::get(e.blocks(), &e.root(), b"b")
         .ok()
         .flatten()
         .is_some();
@@ -824,5 +956,263 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
     assert!(
         !(failed && in_tree),
         "a write was reported Failed while its edit is still in the tree and will publish"
+    );
+}
+
+/// The context is lost while a head is in flight, and a client can still find
+/// out what happened to its write.
+///
+/// The context cache is an in-process `DashMap` with a 10-minute TTL, never
+/// written to disk: a node restart loses it outright, and so does ten idle
+/// minutes. The engine that comes back has no memory of the write at all.
+///
+/// So the answer cannot come from the engine's memory — it has none — and it
+/// must not be a guess. It comes from re-reading the HEAD, which is the one
+/// durable record, and from `AskWrite`, which says `Lost` for a write the
+/// engine does not know: honest, and the only word that leaves the client
+/// holding a write it can safely re-submit.
+///
+/// Both halves are asserted, because they differ in what a re-submit does:
+///   (a) the head LANDED — re-submitting is a no-op against the same tree;
+///   (b) it did NOT — re-submitting reproduces exactly the intended tree.
+#[test]
+fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
+    for landed in [true, false] {
+        let mut net = Network::default();
+        let mut e = boot(&net, Params::default());
+        let before = e.published_root();
+
+        // A write, driven until the head is emitted but no further.
+        let out = stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(1),
+                ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
+            }
+        );
+        let mut queue = out;
+        let mut head = None;
+        let mut guard = 0;
+        while let Some(f) = queue.pop() {
+            guard += 1;
+            assert!(guard < 100_000, "the commit did not reach a head");
+            match f {
+                Effect::PutPack { id, bytes, .. }
+                | Effect::PutBlock { id, bytes, .. }
+                | Effect::PutParity { id, bytes, .. } => {
+                    net.confirm(id, &bytes);
+                    queue.extend(stepped!(e, Event::PutConfirmed(id)));
+                }
+                Effect::UpdateHead { seq, root, .. } => {
+                    head = Some((seq, root));
+                    // Deliberately NOT confirmed: this is the window.
+                }
+                _ => {}
+            }
+        }
+        let (seq, root) = head.expect("the commit never emitted a head");
+        let intended = root;
+        assert_ne!(intended, before, "the write did not change the tree");
+
+        // The head either landed on the Register or it did not. Either way
+        // the context is gone: DROP the engine.
+        if landed {
+            net.head = Some((seq, root));
+        }
+        drop(e);
+
+        // A fresh engine, with nothing but what the network holds.
+        let mut e = boot(&net, Params::default());
+        assert_eq!(
+            e.published_root(),
+            if landed { intended } else { before },
+            "landed={landed}: the recovered engine did not take the head the \
+             Register actually holds"
+        );
+
+        // The client asks. It gets an answer, and the answer is Lost: the
+        // engine has no record, and saying anything else would be a guess.
+        let out = stepped!(
+            e,
+            Event::AskWrite {
+                client: ClientId(1),
+                write_id: WriteId(1),
+            }
+        );
+        assert_eq!(
+            out.iter()
+                .filter_map(|f| match f {
+                    Effect::Notify { state, .. } => Some(*state),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![State::Lost],
+            "landed={landed}: a client asking about a write the engine has no \
+             record of was not told Lost, so it cannot know whether to \
+             re-submit"
+        );
+
+        // And re-submitting is safe in both worlds. The write is the same
+        // ops, so the tree it produces is the intended one either way — that
+        // is what makes `Lost` a word a client can act on.
+        warm_from(&mut e, &net);
+        let _ = stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(2),
+                ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
+            }
+        );
+        assert_eq!(
+            e.root(),
+            intended,
+            "landed={landed}: re-submitting the lost write produced a \
+             different tree from the one the lost commit would have published"
+        );
+        println!(
+            "  head {}: recovered at {}, write reported Lost, re-submit \
+             reproduces the intended tree",
+            if landed { "landed" } else { "did NOT land" },
+            if landed {
+                "the new root"
+            } else {
+                "the old root"
+            }
+        );
+    }
+}
+
+/// Recomputing owed parity is a READ: bounded, resumable, and it ends.
+///
+/// The context carries owed groups as ids, so a rehydrated engine must walk
+/// the tree to find the node that lists a trio before it can code anything.
+/// A walk reads blocks, and the node may not hold them — F33: a sync read
+/// does not refresh hosting, so a block used on one call can be gone on the
+/// next. The walk must therefore ask for what it cannot read and stop, not
+/// spin and not give up.
+#[test]
+fn recomputing_owed_parity_is_bounded_and_resumes() {
+    let params = Params {
+        coalesce_parity: true,
+        ..Params::default()
+    };
+    let mut net = Network::default();
+    let mut e = boot(&net, params);
+
+    // Values by reference, so leaves carry parity over them.
+    let ops: Vec<(Vec<u8>, Op)> = (0..64u32)
+        .map(|i| {
+            (
+                format!("k/{i:05}").into_bytes(),
+                Op::Put(vec![(i % 251) as u8; 1400]),
+            )
+        })
+        .collect();
+    let mut queue = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops,
+        }
+    );
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the commit did not settle");
+        match f {
+            Effect::PutPack { id, bytes, .. }
+            | Effect::PutBlock { id, bytes, .. }
+            | Effect::PutParity { id, bytes, .. } => {
+                net.confirm(id, &bytes);
+                queue.extend(stepped!(e, Event::PutConfirmed(id)));
+            }
+            Effect::UpdateHead { seq, root, .. } => {
+                net.head = Some((seq, root));
+                queue.extend(stepped!(e, Event::HeadConfirmed(seq)));
+            }
+            _ => {}
+        }
+    }
+    let owed = e.owed_groups();
+    assert!(owed > 0, "the commit left no parity owed");
+    let ctx = e.to_context().expect("a context");
+
+    // The node has evicted everything but the root. The rehydrated engine
+    // must ask, not hang and not silently drop the groups.
+    let store = Store::default();
+    let cold = Store::fresh();
+    cold.put(
+        e.published_root(),
+        store.get(&e.published_root()).expect("the root"),
+    );
+    let mut e2 = Engine::from_context(&ctx, params, cold.clone()).expect("its own context");
+    assert_eq!(e2.owed_groups(), owed, "the groups did not survive");
+
+    let mut asked: BTreeSet<Cid> = BTreeSet::new();
+    let mut put = 0usize;
+    let mut calls = 0usize;
+    for t in 1..=(params.parity_age * 8) {
+        calls += 1;
+        let out = e2.step(Event::Tick(t));
+        for f in &out {
+            match f {
+                Effect::FetchBlock { id, .. } => {
+                    asked.insert(*id);
+                }
+                Effect::PutParity { .. } => put += 1,
+                _ => {}
+            }
+        }
+        // Serve what it asked for, one call's worth at a time, exactly as a
+        // node would: put it where the engine reads, THEN tell it.
+        for f in out {
+            if let Effect::FetchBlock { id, .. } = f {
+                if let Some(bytes) = store.get(&id) {
+                    cold.put(id, bytes);
+                    let more = e2.step(Event::BlockArrived {
+                        id,
+                        bytes: bytes.to_vec(),
+                    });
+                    for f in &more {
+                        if let Effect::PutParity { .. } = f {
+                            put += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if put == owed * 3 {
+            // Every group is out. `owed_groups()` still counts them -- a sent
+            // group stays in the map so a later commit can supersede it -- so
+            // the stopping condition is what was PUT, not what is listed.
+            break;
+        }
+    }
+
+    assert!(
+        !asked.is_empty(),
+        "the recompute read nothing at all from a node holding only the root, \
+         so it is not walking the tree"
+    );
+    assert_eq!(
+        put,
+        owed * 3,
+        "{owed} group(s) owed and {put} parity block(s) put after resuming; a \
+         group is three blocks"
+    );
+    // Bounded: it did not read the whole tree over and over to get there.
+    assert!(
+        asked.len() <= params.max_parity_scan_blocks,
+        "the recompute asked for {} block(s) against a scan bound of {}",
+        asked.len(),
+        params.max_parity_scan_blocks
+    );
+    println!(
+        "  owed parity recomputed cold: {} block(s) asked for over {calls} \
+         call(s), all {put} parity block(s) put",
+        asked.len()
     );
 }

@@ -5,9 +5,11 @@
 //! interleaving a live network produces once a week is an ordinary test here.
 
 use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId};
-use freenet_prolly::build::TreeBuilder;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
+
+mod common;
+use common::{rebuild, Harness, Mode, Store};
 
 fn w(n: u64) -> WriteId {
     WriteId(n)
@@ -29,7 +31,7 @@ fn put(k: &str, v: &[u8]) -> (Vec<u8>, Op) {
 }
 
 /// The states reported for each write, in the order they were reported.
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq, Debug)]
 struct Seen(BTreeMap<(ClientId, WriteId), Vec<State>>);
 
 impl Seen {
@@ -112,32 +114,34 @@ fn head_of(effects: &[Effect]) -> Option<(u64, Cid, Vec<Cid>)> {
     })
 }
 
-/// The root a from-scratch build of the same records produces.
-///
-/// This is the oracle that matters: the pipeline may reorder, fold, retry and
-/// coalesce as much as it likes, and the tree it ends up naming must be the
-/// one the library would have built from the final records in one pass.
-fn rebuild(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> Cid {
-    let mut t = TreeBuilder::new(|_, _: &[u8]| {});
-    for (k, v) in records {
-        t.push_bytes(k, v).unwrap();
+fn rng(seed: u64) -> impl FnMut() -> u64 {
+    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
     }
-    t.finish().unwrap()
 }
 
 /// Drive a commit from its puts to `published`, confirming in the given order.
-fn settle(e: &mut Engine, seen: &mut Seen, effects: Vec<Effect>, order: &[usize]) -> Vec<Effect> {
+fn settle(
+    e: &mut Engine<Store>,
+    seen: &mut Seen,
+    effects: Vec<Effect>,
+    order: &[usize],
+) -> Vec<Effect> {
     // The caller has already absorbed `effects`; absorbing them again would
     // record every notification in them twice and make "once per state" read
     // as a duplicate.
     let mut all = effects.clone();
     let pending = ids(&effects);
     for i in order {
-        let out = e.step(Event::PutConfirmed(pending[*i]));
+        let out = stepped!(e, Event::PutConfirmed(pending[*i]));
         seen.absorb(&out);
         all.extend(out.clone());
         if let Some((seq, _, _)) = head_of(&out) {
-            let out = e.step(Event::HeadConfirmed(seq));
+            let out = stepped!(e, Event::HeadConfirmed(seq));
             seen.absorb(&out);
             all.extend(out);
         }
@@ -152,20 +156,23 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
     // runs zero times and the test cannot tell a head that waits from one
     // that does not -- measured: a mutant emitting the head on the first
     // confirmation survived this test until the fixture was widened.
-    let mut e = Engine::new(Params {
+    let mut e = common::new_store_params(Params {
         max_packed_value: 1024,
         ..Params::default()
     });
     let mut seen = Seen::default();
 
-    let out = e.step(write(
-        1,
-        1,
-        vec![
-            (b"a".to_vec(), Op::Put(vec![1u8; 4000])),
-            (b"b".to_vec(), Op::Put(vec![2u8; 4000])),
-        ],
-    ));
+    let out = stepped!(
+        e,
+        write(
+            1,
+            1,
+            vec![
+                (b"a".to_vec(), Op::Put(vec![1u8; 4000])),
+                (b"b".to_vec(), Op::Put(vec![2u8; 4000])),
+            ],
+        )
+    );
     seen.absorb(&out);
     assert_eq!(
         seen.of(1, 1),
@@ -186,14 +193,14 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
 
     // Confirm all but one: still no head.
     for id in &packs[..packs.len() - 1] {
-        let out = e.step(Event::PutConfirmed(*id));
+        let out = stepped!(e, Event::PutConfirmed(*id));
         seen.absorb(&out);
         assert!(
             head_of(&out).is_none(),
             "the head moved while a pack was still unconfirmed"
         );
     }
-    let out = e.step(Event::PutConfirmed(packs[packs.len() - 1]));
+    let out = stepped!(e, Event::PutConfirmed(packs[packs.len() - 1]));
     seen.absorb(&out);
     let (seq, root, after) = head_of(&out).expect("the head must move once every pack is in");
     assert_eq!(seq, 1);
@@ -211,7 +218,7 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
     // to survive a restart.
     assert_eq!(seen.of(1, 1), &[State::Accepted]);
 
-    let out = e.step(Event::HeadConfirmed(seq));
+    let out = stepped!(e, Event::HeadConfirmed(seq));
     seen.absorb(&out);
     assert_eq!(
         seen.of(1, 1),
@@ -221,80 +228,207 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
 }
 
 #[test]
-fn writes_from_two_clients_fold_into_one_commit_and_all_reach_published() {
-    let mut e = Engine::default();
+fn a_write_during_a_commit_is_refused_and_leaves_no_trace() {
+    // One commit at a time. Folding needed the folded write's blocks to
+    // survive until the next commit, and the core keeps no blocks — so a
+    // write that arrives mid-commit is REFUSED rather than quietly carried.
+    // Buffering is the client's job: it has a page and an outbox, and the
+    // delegate has neither.
+    let mut e = common::new_store_params(Params::default());
     let mut seen = Seen::default();
 
-    // The first write opens a commit; the next three arrive while it is in
-    // flight and must fold into the NEXT one, each keeping its own id.
-    let first = e.step(write(1, 1, vec![put("k/1", b"one")]));
+    let first = stepped!(e, write(1, 1, vec![put("k/1", b"one")]));
     seen.absorb(&first);
-    for (client, id, key) in [(1u64, 2u64, "k/2"), (2, 3, "k/3"), (2, 4, "k/4")] {
-        let out = e.step(write(client, id, vec![put(key, b"v")]));
+    assert!(!ids(&first).is_empty(), "the first write shipped nothing");
+    let root_after_first = e.root();
+
+    for (client, id, key) in [(1u64, 2u64, "k/2"), (2, 3, "k/3")] {
+        let out = stepped!(e, write(client, id, vec![put(key, b"v")]));
         seen.absorb(&out);
         assert_eq!(
-            ids(&out).len(),
-            0,
-            "a write during a commit opened a second commit"
+            seen.of(client, id),
+            &[State::Busy],
+            "a write during a commit was not refused"
         );
-    }
-
-    let n = ids(&first).len();
-    let all = settle(&mut e, &mut seen, first, &(0..n).collect::<Vec<_>>());
-    // The second commit was opened when the first was published.
-    let second = ids(&all);
-    assert!(!second.is_empty(), "the folded writes never shipped");
-    let out: Vec<Effect> = all
-        .into_iter()
-        .filter(|e| matches!(e, Effect::PutPack { .. } | Effect::PutBlock { .. }))
-        .collect();
-    let n2 = ids(&out).len();
-    let _ = settle(&mut e, &mut seen, out, &(0..n2).collect::<Vec<_>>());
-
-    for (client, id) in [(1, 1), (1, 2), (2, 3), (2, 4)] {
-        let states = seen.of(client, id);
         assert!(
-            states.contains(&State::Published),
-            "client {client} write {id} did not reach published: {states:?}"
+            ids(&out).is_empty(),
+            "a refused write put blocks on the network"
         );
-        // Each state at most once, and never backwards. A write that reports
-        // Durable twice is a write whose caller cannot tell a retry from
-        // progress.
-        let mut sorted = states.to_vec();
-        sorted.dedup();
         assert_eq!(
-            sorted.len(),
-            states.len(),
-            "client {client} write {id} repeated a state: {states:?}"
+            e.root(),
+            root_after_first,
+            "a refused write changed the tree anyway: it left a trace"
         );
-        assert!(
-            states.windows(2).all(|w| w[0] < w[1]),
-            "client {client} write {id} went backwards: {states:?}"
-        );
+    }
+
+    // The first write still completes normally.
+    let n = ids(&first).len();
+    let _ = settle(&mut e, &mut seen, first, &(0..n).collect::<Vec<_>>());
+    assert!(
+        seen.of(1, 1).contains(&State::Published),
+        "the in-flight write did not publish: {:?}",
+        seen.of(1, 1)
+    );
+    // And once it has, the next write is accepted.
+    let out = stepped!(e, write(1, 4, vec![put("k/4", b"after")]));
+    seen.absorb(&out);
+    assert_eq!(
+        seen.of(1, 4).first(),
+        Some(&State::Accepted),
+        "a write after the commit published was still refused"
+    );
+}
+
+/// One seed of the interleaving sweep, driven in one mode.
+///
+/// Split out of the test so the SAME interleaving runs both ways. The rng is
+/// seeded per call, so the two modes see an identical sequence of writes,
+/// failures, duplicates and strangers -- the only difference is whether the
+/// engine survives between steps.
+struct SweepSeed {
+    published: Cid,
+    expected: Cid,
+    seen: Seen,
+    live: Vec<(u64, u64)>,
+    pack_failures: usize,
+    direct_failures: usize,
+    directs: usize,
+    retries: usize,
+    max_context: usize,
+}
+
+fn sweep_seed(mode: Mode, params: Params, seed: u64) -> SweepSeed {
+    let mut r = rng(seed);
+    // A store of its own: two modes over one store would let the second read
+    // blocks the first put, and a rehydrate that only works because the OTHER
+    // run left its blocks behind has proved nothing.
+    let mut h = Harness::new(mode, params, Store::fresh());
+    let mut seen = Seen::default();
+    let mut records: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut live: Vec<(u64, u64)> = Vec::new();
+    let mut next_id = 0u64;
+    let mut pack_failures = 0usize;
+    let mut direct_failures = 0usize;
+    let mut directs = 0usize;
+    let mut retries_seen = 0usize;
+
+    for _round in 0..6 {
+        // A batch of writes, sometimes overwriting earlier keys.
+        let n = 1 + (r() % 4) as usize;
+        let mut ops = Vec::new();
+        for _ in 0..n {
+            let k = format!("k/{:04}", r() % 40).into_bytes();
+            // Most values ride in the pack; one in eight is over
+            // `max_packed_value` and is PUT on its own. Every value used to be
+            // under 2 KiB against a 64 KiB threshold, so the direct branch --
+            // the one whose failure leaves a commit with an outstanding put
+            // that is not in any pack -- was never entered by this sweep at
+            // all, and `direct_failures` below is the floor that says so.
+            let big = r().is_multiple_of(8);
+            let len = if big {
+                params.max_packed_value + 1 + (r() % 4096) as usize
+            } else {
+                1 + (r() % 2000) as usize
+            };
+            let v = vec![(r() % 251) as u8; len];
+            records.insert(k.clone(), v.clone());
+            ops.push((k, Op::Put(v)));
+        }
+        next_id += 1;
+        let client = 1 + (r() % 2);
+        let out = h.step(write(client, next_id, ops));
+        seen.absorb(&out);
+        live.push((client, next_id));
+
+        // Answer whatever is outstanding, in a shuffled order, with
+        // duplicates and strangers mixed in.
+        let mut pending = ids(&out);
+        for i in (1..pending.len()).rev() {
+            pending.swap(i, (r() % (i as u64 + 1)) as usize);
+        }
+        let packs: BTreeSet<Cid> = pack_ids(&out).into_iter().collect();
+        directs += ids(&out).iter().filter(|i| !packs.contains(*i)).count();
+        let mut queue: Vec<Cid> = Vec::new();
+        for id in &pending {
+            // A failure first, at a position the seed chooses.
+            if r().is_multiple_of(3) {
+                let again = h.step(Event::PutFailed(*id));
+                seen.absorb(&again);
+                // A failed put MUST produce a retry, or the commit waits
+                // for ever on something that already failed.
+                assert!(
+                    !again.is_empty(),
+                    "seed {seed} ({mode:?}): PutFailed re-emitted nothing, so \
+                     the commit can never complete"
+                );
+                if packs.contains(id) {
+                    pack_failures += 1;
+                } else {
+                    direct_failures += 1;
+                }
+                retries_seen += 1;
+                queue.extend(ids(&again));
+            }
+            queue.push(*id);
+            if r().is_multiple_of(4) {
+                queue.push(*id); // a duplicate confirmation
+            }
+            if r().is_multiple_of(5) {
+                // A confirmation for a block nothing is waiting on.
+                queue.push([(r() % 251) as u8; 32]);
+            }
+        }
+        for id in queue {
+            let out = h.step(Event::PutConfirmed(id));
+            seen.absorb(&out);
+            if let Some((seq, _, _)) = head_of(&out) {
+                let out = h.step(Event::HeadConfirmed(seq));
+                seen.absorb(&out);
+                // A published commit can open the next one.
+                let mut more = ids(&out);
+                for i in (1..more.len()).rev() {
+                    more.swap(i, (r() % (i as u64 + 1)) as usize);
+                }
+                for id in more {
+                    let out = h.step(Event::PutConfirmed(id));
+                    seen.absorb(&out);
+                    if let Some((seq, _, _)) = head_of(&out) {
+                        let out = h.step(Event::HeadConfirmed(seq));
+                        seen.absorb(&out);
+                    }
+                }
+            }
+        }
+    }
+
+    // Drain anything still in flight so every write can settle.
+    for _ in 0..8 {
+        let out = h.step(Event::Tick(1000));
+        seen.absorb(&out);
+    }
+
+    SweepSeed {
+        published: h.published_root(),
+        expected: rebuild(&records),
+        seen,
+        live,
+        pack_failures,
+        direct_failures,
+        directs,
+        retries: retries_seen,
+        max_context: h.max_context,
     }
 }
 
-fn rng(seed: u64) -> impl FnMut() -> u64 {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        s
-    }
-}
-
-/// The differential: whatever order the network answers in, the root the
-/// pipeline publishes is the root a from-scratch build produces.
+/// Every interleaving publishes the root a rebuild produces -- and it does so
+/// whether the engine survives between steps or is rebuilt from its context
+/// each time.
 ///
-/// This is the gate. Everything else here checks that the engine says the
-/// right things; this checks that the tree it names is the right tree. A
-/// pipeline that folds, retries and coalesces has many chances to lose or
-/// double-apply a write, and all of them show up here as a different root.
-///
-/// Confirmations arrive shuffled, twice, and for ids nothing is waiting on;
-/// some puts fail first and must be re-emitted. The seed is printed, so a
-/// failure is reproducible from the output alone.
+/// The delegate is the rehydrating case: a fresh wasm instance, and a fresh
+/// linear memory, on every message. Running the sweep only in `Live` tested
+/// the one mode production never uses. Both modes run the same interleaving
+/// and must agree with each other AND with a rebuild -- three-way, because
+/// two runs that agree on the wrong answer agree just as loudly.
 #[test]
 fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     // Counted across the whole sweep and asserted at the end. A failure
@@ -304,124 +438,55 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     // first time because it confirmed every id it had failed, regardless of
     // whether the retry produced anything.
     let mut pack_failures = 0usize;
+    let mut direct_failures = 0usize;
+    let mut directs = 0usize;
     let mut retries_seen = 0usize;
+    let mut max_context = 0usize;
     for seed in 1..=24u64 {
-        let mut r = rng(seed);
-        let mut e = Engine::default();
-        let mut seen = Seen::default();
-        let mut records: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        let mut live: Vec<(u64, u64)> = Vec::new();
-        let mut next_id = 0u64;
+        let l = sweep_seed(Mode::Live, Params::default(), seed);
+        let d = sweep_seed(Mode::Rehydrate, Params::default(), seed);
 
-        for round in 0..6 {
-            // A batch of writes, sometimes overwriting earlier keys.
-            let n = 1 + (r() % 4) as usize;
-            let mut ops = Vec::new();
-            for _ in 0..n {
-                let k = format!("k/{:04}", r() % 40).into_bytes();
-                let v = vec![(r() % 251) as u8; 1 + (r() % 2000) as usize];
-                records.insert(k.clone(), v.clone());
-                ops.push((k, Op::Put(v)));
-            }
-            next_id += 1;
-            let client = 1 + (r() % 2);
-            let out = e.step(write(client, next_id, ops));
-            seen.absorb(&out);
-            live.push((client, next_id));
-
-            // Answer whatever is outstanding, in a shuffled order, with
-            // duplicates and strangers mixed in.
-            let mut pending = ids(&out);
-            for i in (1..pending.len()).rev() {
-                pending.swap(i, (r() % (i as u64 + 1)) as usize);
-            }
-            let packs: BTreeSet<Cid> = pack_ids(&out).into_iter().collect();
-            let mut queue: Vec<Cid> = Vec::new();
-            for id in &pending {
-                // A failure first, at a position the seed chooses.
-                if r().is_multiple_of(3) {
-                    let again = e.step(Event::PutFailed(*id));
-                    seen.absorb(&again);
-                    // A failed put MUST produce a retry, or the commit waits
-                    // for ever on something that already failed.
-                    assert!(
-                        !again.is_empty(),
-                        "seed {seed}: PutFailed re-emitted nothing, so the \
-                         commit can never complete"
-                    );
-                    if packs.contains(id) {
-                        pack_failures += 1;
-                    }
-                    retries_seen += 1;
-                    queue.extend(ids(&again));
-                }
-                queue.push(*id);
-                if r().is_multiple_of(4) {
-                    queue.push(*id); // a duplicate confirmation
-                }
-                if r().is_multiple_of(5) {
-                    // A confirmation for a block nothing is waiting on.
-                    queue.push([(r() % 251) as u8; 32]);
-                }
-            }
-            for id in queue {
-                let out = e.step(Event::PutConfirmed(id));
-                seen.absorb(&out);
-                if let Some((seq, _, _)) = head_of(&out) {
-                    let out = e.step(Event::HeadConfirmed(seq));
-                    seen.absorb(&out);
-                    // A published commit can open the next one.
-                    let mut more = ids(&out);
-                    for i in (1..more.len()).rev() {
-                        more.swap(i, (r() % (i as u64 + 1)) as usize);
-                    }
-                    for id in more {
-                        let out = e.step(Event::PutConfirmed(id));
-                        seen.absorb(&out);
-                        if let Some((seq, _, _)) = head_of(&out) {
-                            let out = e.step(Event::HeadConfirmed(seq));
-                            seen.absorb(&out);
-                        }
-                    }
-                }
-            }
-            let _ = round;
-        }
-
-        // Drain anything still in flight so every write can settle.
-        for _ in 0..8 {
-            let out = e.step(Event::Tick(1000));
-            seen.absorb(&out);
-        }
-
-        if e.published_root() != rebuild(&records) {
-            println!(
-                "seed {seed}: warm root matches rebuild? {}  published==warm? {}",
-                e.root() == rebuild(&records),
-                e.published_root() == e.root()
-            );
-        }
         assert_eq!(
-            e.published_root(),
-            rebuild(&records),
-            "seed {seed}: the published root is not the root a rebuild produces"
+            l.published, d.published,
+            "seed {seed}: an engine rebuilt from its context between every \
+             step published a different root from one that survived, so \
+             something the pipeline needs is not in the context"
         );
-        // And no write was silently dropped, or reported an impossible life.
-        for (client, id) in &live {
-            let states = seen.of(*client, *id);
-            assert!(
-                !states.is_empty(),
-                "seed {seed}: write {id} was never reported at all"
-            );
-            assert!(
-                valid_sequence(states),
-                "seed {seed}: write {id} reported an impossible sequence: {states:?}"
+        for s in [&l, &d] {
+            assert_eq!(
+                s.published, s.expected,
+                "seed {seed}: the published root is not the root a rebuild \
+                 produces"
             );
         }
-        println!(
-            "  seed {seed:2}: {} records, root matches a rebuild",
-            records.len()
+        // And no write was silently dropped, or reported an impossible life.
+        for s in [&l, &d] {
+            for (client, id) in &s.live {
+                let states = s.seen.of(*client, *id);
+                assert!(
+                    !states.is_empty(),
+                    "seed {seed}: write {id} was never reported at all"
+                );
+                assert!(
+                    valid_sequence(states),
+                    "seed {seed}: write {id} reported an impossible sequence: \
+                     {states:?}"
+                );
+            }
+        }
+        // The states themselves must agree too: a rehydrate that reaches the
+        // right root while telling a client something different is still a
+        // bug the root comparison cannot see.
+        assert_eq!(
+            l.seen, d.seen,
+            "seed {seed}: the two modes reported different write states"
         );
+        pack_failures += l.pack_failures + d.pack_failures;
+        direct_failures += l.direct_failures + d.direct_failures;
+        directs += l.directs + d.directs;
+        retries_seen += l.retries + d.retries;
+        max_context = max_context.max(d.max_context);
+        println!("  seed {seed:2}: both modes match a rebuild");
     }
     // Without this the sweep can inject failures that never land on a pack and
     // report green over a branch it never entered.
@@ -430,20 +495,74 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
         "{retries_seen} put failures were injected and NONE hit a pack: the \
          pack retry path was not exercised"
     );
-    println!("  {retries_seen} injected failures, {pack_failures} of them on packs");
+    // The other half of the same floor. A pack retry and a direct-block retry
+    // are different branches, and a sweep whose values are all small emits no
+    // direct block to fail -- which is what this one did until the fixture
+    // above was widened.
+    assert!(
+        directs > 0,
+        "the sweep emitted no direct PutBlock at all, so no value exceeded \
+         max_packed_value and the pack/direct split was never taken"
+    );
+    assert!(
+        direct_failures > 0,
+        "{directs} direct block puts were emitted and NONE was failed: the \
+         direct retry path was not exercised"
+    );
+    println!(
+        "  {retries_seen} injected failures: {pack_failures} on packs, \
+         {direct_failures} on direct blocks (of {directs} emitted); largest \
+         context {max_context} B"
+    );
+}
+
+/// The control for the sweep above: leave one field out of the context, and
+/// the two modes must stop agreeing.
+///
+/// `context_carries_pending: false` drops the commit in flight. Everything
+/// else is identical. Without this, "Live and Rehydrate agree" would hold
+/// just as well over an engine that kept its state in a global, or a Harness
+/// whose rehydrate mode quietly did nothing -- the assertion would be
+/// measuring the harness, not the context.
+#[test]
+fn dropping_one_context_field_makes_the_two_modes_disagree() {
+    let blind = Params {
+        context_carries_pending: false,
+        ..Params::default()
+    };
+    let mut diverged = 0usize;
+    for seed in 1..=24u64 {
+        let good = sweep_seed(Mode::Live, Params::default(), seed);
+        let blinded = std::panic::catch_unwind(move || sweep_seed(Mode::Rehydrate, blind, seed));
+        // Either the run falls over (a retry that re-emits nothing is itself
+        // the forgotten commit showing) or it finishes at the wrong root.
+        // Both are divergence; neither is agreement.
+        match blinded {
+            Err(_) => diverged += 1,
+            Ok(b) if b.published != good.published => diverged += 1,
+            Ok(_) => {}
+        }
+    }
+    assert_eq!(
+        diverged, 24,
+        "only {diverged} of 24 seeds noticed that the in-flight commit was \
+         left out of the context, so the both-modes comparison does not see \
+         a field going missing"
+    );
+    println!("  control: all 24 seeds diverged with one context field dropped");
 }
 
 /// Drive one write all the way to published, confirming in order.
-fn commit(e: &mut Engine, seen: &mut Seen, ev: Event) -> Vec<Effect> {
-    let out = e.step(ev);
+fn commit(e: &mut Engine<Store>, seen: &mut Seen, ev: Event) -> Vec<Effect> {
+    let out = stepped!(e, ev);
     seen.absorb(&out);
     let mut all = out.clone();
     for id in ids(&out) {
-        let o = e.step(Event::PutConfirmed(id));
+        let o = stepped!(e, Event::PutConfirmed(id));
         seen.absorb(&o);
         all.extend(o.clone());
         if let Some((seq, _, _)) = head_of(&o) {
-            let o = e.step(Event::HeadConfirmed(seq));
+            let o = stepped!(e, Event::HeadConfirmed(seq));
             seen.absorb(&o);
             all.extend(o);
         }
@@ -482,7 +601,7 @@ fn two_commits_touching_one_group_put_its_parity_once() {
         .collect();
 
     let count = |coalesce: bool| -> usize {
-        let mut e = Engine::new(Params {
+        let mut e = common::new_store_params(Params {
             coalesce_parity: coalesce,
             ..Params::default()
         });
@@ -514,7 +633,7 @@ fn two_commits_touching_one_group_put_its_parity_once() {
         // still moving. Both modes are given the same ticks, so neither is
         // measured over a shorter window than the other.
         for t in 1..=3 {
-            let out = e.step(Event::Tick(t));
+            let out = stepped!(e, Event::Tick(t));
             seen.absorb(&out);
             n += parity_puts(&out).len();
         }
@@ -549,7 +668,7 @@ fn two_commits_touching_one_group_put_its_parity_once() {
 #[test]
 fn a_group_written_continuously_is_still_protected_within_the_age_bound() {
     let age = 5u64;
-    let mut e = Engine::new(Params {
+    let mut e = common::new_store_params(Params {
         parity_age: age,
         ..Params::default()
     });
@@ -569,7 +688,7 @@ fn a_group_written_continuously_is_still_protected_within_the_age_bound() {
             write(1, 100 + t, vec![put("k/005", &big(t as u8))]),
         );
         emitted += parity_puts(&out).len();
-        let out = e.step(Event::Tick(t));
+        let out = stepped!(e, Event::Tick(t));
         seen.absorb(&out);
         emitted += parity_puts(&out).len();
     }
@@ -590,7 +709,7 @@ fn a_group_written_continuously_is_still_protected_within_the_age_bound() {
 /// PUT.
 #[test]
 fn an_opaque_value_passes_through_untouched() {
-    let mut e = Engine::new(Params {
+    let mut e = common::new_store_params(Params {
         // Small enough that the large value takes its own PUT, so both paths
         // are exercised in one test.
         max_packed_value: 4096,
@@ -602,14 +721,17 @@ fn an_opaque_value_passes_through_untouched() {
         .collect();
     let small: Vec<u8> = (0..2000u32).map(|i| (i ^ 0x5a) as u8).collect();
 
-    let out = e.step(write(
-        1,
-        1,
-        vec![
-            (b"sealed".to_vec(), Op::Put(sealed.clone())),
-            (b"small".to_vec(), Op::Put(small.clone())),
-        ],
-    ));
+    let out = stepped!(
+        e,
+        write(
+            1,
+            1,
+            vec![
+                (b"sealed".to_vec(), Op::Put(sealed.clone())),
+                (b"small".to_vec(), Op::Put(small.clone())),
+            ],
+        )
+    );
     seen.absorb(&out);
 
     let direct: Vec<&Vec<u8>> = out
@@ -648,7 +770,7 @@ fn no_event_sequence_panics() {
     let mut cases = 0;
     for seed in 1..=40u64 {
         let mut r = rng(seed);
-        let mut e = Engine::new(Params {
+        let mut e = common::new_store_params(Params {
             max_backlog: 4096,
             parity_age: 2,
             ..Params::default()
@@ -673,7 +795,7 @@ fn no_event_sequence_panics() {
                 3 => Event::HeadConfirmed(r() % 8),
                 _ => Event::Tick(r() % 16),
             };
-            let out = e.step(ev);
+            let out = stepped!(e, ev);
             known.extend(ids(&out));
             for (_, id) in parity_puts(&out) {
                 known.push(id);
@@ -703,16 +825,22 @@ fn pick(r: &mut impl FnMut() -> u64, known: &[Cid]) -> Cid {
 /// and refused is the worst of both.
 #[test]
 fn a_full_backlog_refuses_a_write_without_applying_it() {
-    let mut e = Engine::new(Params {
+    let mut e = common::new_store_params(Params {
         max_backlog: 4000,
         ..Params::default()
     });
     let mut seen = Seen::default();
-    let out = e.step(write(1, 1, vec![(b"a".to_vec(), Op::Put(vec![1u8; 3000]))]));
+    let out = stepped!(
+        e,
+        write(1, 1, vec![(b"a".to_vec(), Op::Put(vec![1u8; 3000]))])
+    );
     seen.absorb(&out);
     let root_before = e.root();
 
-    let out = e.step(write(1, 2, vec![(b"b".to_vec(), Op::Put(vec![2u8; 3000]))]));
+    let out = stepped!(
+        e,
+        write(1, 2, vec![(b"b".to_vec(), Op::Put(vec![2u8; 3000]))])
+    );
     seen.absorb(&out);
     assert_eq!(
         seen.of(1, 2),
@@ -753,7 +881,7 @@ fn a_single_key_write_parses_nodes_in_proportion_to_depth() {
         .collect();
 
     let measure = |whole: bool| -> usize {
-        let mut e = Engine::new(Params {
+        let mut e = common::new_store_params(Params {
             whole_tree_supersede_scan: whole,
             ..Params::default()
         });
@@ -761,7 +889,7 @@ fn a_single_key_write_parses_nodes_in_proportion_to_depth() {
         commit(&mut e, &mut seen, write(1, 1, seed.clone()));
         // Measure ONE key changing, on a tree that is already large.
         e.reset_cost();
-        let _ = e.step(write(1, 2, vec![put("k/005000", b"changed")]));
+        let _ = stepped!(e, write(1, 2, vec![put("k/005000", b"changed")]));
         e.nodes_parsed()
     };
 
@@ -798,7 +926,7 @@ fn impossible_params_are_refused_where_they_are_set() {
         max_packed_value: 8192,
         ..Params::default()
     };
-    let panicked = std::panic::catch_unwind(move || Engine::new(bad));
+    let panicked = std::panic::catch_unwind(move || Engine::new(bad, Store::default()));
     assert!(
         panicked.is_err(),
         "a pack size smaller than the values that must fit in it was accepted"
@@ -810,7 +938,7 @@ fn impossible_params_are_refused_where_they_are_set() {
         max_packed_value: 4096 - 11,
         ..Params::default()
     };
-    let _ = Engine::new(ok);
+    let _ = Engine::new(ok, Store::default());
 }
 
 /// A write whose group is re-coded before its parity goes out waits for the
@@ -836,7 +964,7 @@ fn a_write_whose_group_is_re_coded_waits_for_the_new_coding() {
     // Returns: was A complete before B's parity was confirmed, and how many
     // ParityComplete notifications A got in total.
     let run = |transfer: bool| -> (bool, usize) {
-        let mut e = Engine::new(Params {
+        let mut e = common::new_store_params(Params {
             transfer_superseded_waiters: transfer,
             ..Params::default()
         });
@@ -867,7 +995,7 @@ fn a_write_whose_group_is_re_coded_waits_for_the_new_coding() {
         // Now let the parity go out and be confirmed.
         let mut queue: Vec<Effect> = Vec::new();
         for t in 1..=4 {
-            let out = e.step(Event::Tick(t));
+            let out = stepped!(e, Event::Tick(t));
             seen.absorb(&out);
             queue.extend(out);
         }
@@ -876,7 +1004,7 @@ fn a_write_whose_group_is_re_coded_waits_for_the_new_coding() {
             guard += 1;
             assert!(guard < 5_000, "the run did not settle");
             if let Effect::PutParity { id, .. } = f {
-                let out = e.step(Event::PutConfirmed(id));
+                let out = stepped!(e, Event::PutConfirmed(id));
                 seen.absorb(&out);
                 queue.extend(out);
             }
