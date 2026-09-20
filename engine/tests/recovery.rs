@@ -15,6 +15,9 @@ use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod common;
+use common::Store;
+
 /// What the network kept. Only what was CONFIRMED is here: a put that was
 /// emitted and not confirmed is exactly what a crash loses.
 #[derive(Default, Clone)]
@@ -54,12 +57,15 @@ const CUTS: [Cut; 6] = [
     Cut::MidParity,
 ];
 
-fn boot(net: &Network, params: Params) -> Engine {
-    let mut e = Engine::new(params);
-    let out = e.step(Event::Start {
-        key: KeySource::SecretStore,
-        epochs: vec![Epoch(2), Epoch(1)],
-    });
+fn boot(net: &Network, params: Params) -> Engine<Store> {
+    let mut e = Engine::new(params, Store::default());
+    let out = stepped!(
+        e,
+        Event::Start {
+            key: KeySource::SecretStore,
+            epochs: vec![Epoch(2), Epoch(1)],
+        }
+    );
     // Answer whatever head reads it asks for.
     let mut queue = out;
     while let Some(f) = queue.pop() {
@@ -73,19 +79,22 @@ fn boot(net: &Network, params: Params) -> Engine {
                 },
                 _ => Event::HeadMissing,
             };
-            queue.extend(e.step(ev));
+            queue.extend(stepped!(e, ev));
         }
     }
     e
 }
 
 /// Give a recovered engine the blocks the network kept, as a read would.
-fn warm_from(e: &mut Engine, net: &Network) {
+fn warm_from(e: &mut Engine<Store>, net: &Network) {
     for (id, bytes) in net.blocks.0.iter() {
-        let _ = e.step(Event::BlockArrived {
-            id: *id,
-            bytes: bytes.clone(),
-        });
+        let _ = stepped!(
+            e,
+            Event::BlockArrived {
+                id: *id,
+                bytes: bytes.clone(),
+            }
+        );
     }
 }
 
@@ -132,11 +141,14 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
 
             next_write += 1;
             let wid = WriteId(next_write);
-            let mut queue = e.step(Event::Write {
-                client: ClientId(1),
-                write_id: wid,
-                ops,
-            });
+            let mut queue = stepped!(
+                e,
+                Event::Write {
+                    client: ClientId(1),
+                    write_id: wid,
+                    ops,
+                }
+            );
             accepted_only.insert(wid);
 
             if cutting && *cut == Cut::AfterAccept {
@@ -154,7 +166,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                 match f {
                     Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
                         net.confirm(id, &bytes);
-                        let out = e.step(Event::PutConfirmed(id));
+                        let out = stepped!(e, Event::PutConfirmed(id));
                         packs_confirmed += 1;
                         if cutting && *cut == Cut::AfterSomePacks && packs_confirmed == 1 {
                             dropped = true;
@@ -182,7 +194,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             break;
                         }
                         net.head = Some((seq, root));
-                        queue.extend(e.step(Event::HeadConfirmed(seq)));
+                        queue.extend(stepped!(e, Event::HeadConfirmed(seq)));
                         if cutting && *cut == Cut::AfterHeadConfirmed {
                             published.extend(will_publish.iter().cloned());
                             accepted_only.remove(&wid);
@@ -199,7 +211,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             let mut parity: Vec<(Cid, Vec<u8>)> = Vec::new();
                             for _ in 0..3 {
                                 clock += 1;
-                                for f in e.step(Event::Tick(clock)) {
+                                for f in stepped!(e, Event::Tick(clock)) {
                                     if let Effect::PutParity { id, bytes, .. } = f {
                                         parity.push((id, bytes));
                                     }
@@ -216,7 +228,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             // must still read.
                             for (id, bytes) in parity.iter().take(parity.len() / 2) {
                                 net.confirm(*id, bytes);
-                                let _ = e.step(Event::PutConfirmed(*id));
+                                let _ = stepped!(e, Event::PutConfirmed(*id));
                             }
                             dropped = true;
                             break;
@@ -224,7 +236,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                     }
                     Effect::PutParity { id, bytes, .. } => {
                         net.confirm(id, &bytes);
-                        queue.extend(e.step(Event::PutConfirmed(id)));
+                        queue.extend(stepped!(e, Event::PutConfirmed(id)));
                     }
                     Effect::Notify {
                         write_id,
@@ -241,11 +253,11 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
             if !dropped {
                 for _ in 0..4 {
                     clock += 1;
-                    let out = e.step(Event::Tick(clock));
+                    let out = stepped!(e, Event::Tick(clock));
                     for f in out {
                         if let Effect::PutParity { id, bytes, .. } = f {
                             net.confirm(id, &bytes);
-                            let _ = e.step(Event::PutConfirmed(id));
+                            let _ = stepped!(e, Event::PutConfirmed(id));
                         }
                     }
                 }
@@ -309,10 +321,13 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
 
         // (d) an accepted-only write is answered Lost, never silence.
         for wid in &accepted_only {
-            let out = e.step(Event::AskWrite {
-                client: ClientId(1),
-                write_id: *wid,
-            });
+            let out = stepped!(
+                e,
+                Event::AskWrite {
+                    client: ClientId(1),
+                    write_id: *wid,
+                }
+            );
             assert!(
                 out.iter().any(|f| matches!(
                     f,
@@ -377,11 +392,14 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
             )
         })
         .collect();
-    let mut queue = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-    });
+    let mut queue = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops,
+        }
+    );
 
     // Confirm ONE put, then take whatever head the engine offers.
     let mut confirmed_one = false;
@@ -395,7 +413,7 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
                 if !confirmed_one {
                     net.confirm(id, &bytes);
                     confirmed_one = true;
-                    queue.extend(e.step(Event::PutConfirmed(id)));
+                    queue.extend(stepped!(e, Event::PutConfirmed(id)));
                 }
             }
             Effect::UpdateHead { seq, root, .. } => {
@@ -463,11 +481,14 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
     );
 
     // Write 1 opens a commit. Its puts are held back, so it cannot publish.
-    let first = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
+    let first = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+        }
+    );
     let held: Vec<(Cid, Vec<u8>)> = first
         .iter()
         .filter_map(|f| match f {
@@ -496,16 +517,19 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
     };
     absorb(&mut seen, &first);
     for n in 2..=6u64 {
-        let out = e.step(Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(n),
-            ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
-        });
+        let out = stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(n),
+                ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
+            }
+        );
         absorb(&mut seen, &out);
     }
     // Time passes with the commit stuck.
     for tick in 1..=(t * 3) {
-        let out = e.step(Event::Tick(tick));
+        let out = stepped!(e, Event::Tick(tick));
         absorb(&mut seen, &out);
     }
 
@@ -540,13 +564,13 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         match f {
             Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
                 net.confirm(id, &bytes);
-                let out = e.step(Event::PutConfirmed(id));
+                let out = stepped!(e, Event::PutConfirmed(id));
                 absorb(&mut seen, &out);
                 queue.extend(out);
             }
             Effect::UpdateHead { seq, root, .. } => {
                 net.head = Some((seq, root));
-                let out = e.step(Event::HeadConfirmed(seq));
+                let out = stepped!(e, Event::HeadConfirmed(seq));
                 absorb(&mut seen, &out);
                 queue.extend(out);
             }
@@ -579,20 +603,26 @@ fn a_stalled_write_is_reported_once_and_still_reaches_published() {
         },
     );
     let mut stalled = 0;
-    let _ = e2.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
-    for n in 2..=6u64 {
-        let _ = e2.step(Event::Write {
+    let _ = stepped!(
+        e2,
+        Event::Write {
             client: ClientId(1),
-            write_id: WriteId(n),
-            ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
-        });
+            write_id: WriteId(1),
+            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+        }
+    );
+    for n in 2..=6u64 {
+        let _ = stepped!(
+            e2,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(n),
+                ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
+            }
+        );
     }
     for tick in 1..=(t * 3) {
-        for f in e2.step(Event::Tick(tick)) {
+        for f in stepped!(e2, Event::Tick(tick)) {
             if let Effect::Notify {
                 state: State::Stalled,
                 ..
@@ -647,11 +677,14 @@ fn valid_sequence(states: &[State]) -> bool {
 /// worst possible recovery, because it looks like a successful one.
 #[test]
 fn recovery_finds_a_head_left_under_the_previous_epoch() {
-    let mut e = Engine::default();
-    let out = e.step(Event::Start {
-        key: KeySource::SecretStore,
-        epochs: vec![Epoch(2), Epoch(1)],
-    });
+    let mut e = Engine::new(Params::default(), Store::default());
+    let out = stepped!(
+        e,
+        Event::Start {
+            key: KeySource::SecretStore,
+            epochs: vec![Epoch(2), Epoch(1)],
+        }
+    );
     assert_eq!(
         out.iter()
             .filter_map(|f| match f {
@@ -664,7 +697,7 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
     );
 
     // Nothing under the current epoch.
-    let out = e.step(Event::HeadMissing);
+    let out = stepped!(e, Event::HeadMissing);
     assert_eq!(
         out.iter()
             .filter_map(|f| match f {
@@ -681,11 +714,14 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
         .map(|i| (format!("k{i:03}").into_bytes(), vec![7u8; 30]))
         .collect();
     let root = rebuild(&records);
-    let out = e.step(Event::HeadRead {
-        epoch: Epoch(1),
-        seq: 41,
-        root,
-    });
+    let out = stepped!(
+        e,
+        Event::HeadRead {
+            epoch: Epoch(1),
+            seq: 41,
+            root,
+        }
+    );
     assert!(
         out.is_empty(),
         "recovery walks nothing: reads warm it lazily"
@@ -693,12 +729,15 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
     assert_eq!(e.published_root(), root, "the recovered root is the head's");
 
     // And a device that has never written gets an empty tree, not a panic.
-    let mut fresh = Engine::default();
-    let _ = fresh.step(Event::Start {
-        key: KeySource::Reissued,
-        epochs: vec![Epoch(2)],
-    });
-    let out = fresh.step(Event::HeadMissing);
+    let mut fresh = Engine::new(Params::default(), Store::default());
+    let _ = stepped!(
+        fresh,
+        Event::Start {
+            key: KeySource::Reissued,
+            epochs: vec![Epoch(2)],
+        }
+    );
+    let out = stepped!(fresh, Event::HeadMissing);
     assert!(out.is_empty(), "a brand-new device has nothing left to ask");
     assert_eq!(
         fresh.published_root(),
@@ -721,16 +760,22 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
     let mut e = boot(&net, Params::default());
     let before = e.published_root();
 
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"mine".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(2),
-        ops: vec![(b"also-mine".to_vec(), Op::Put(vec![2u8; 40]))],
-    });
+    let _ = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops: vec![(b"mine".to_vec(), Op::Put(vec![1u8; 40]))],
+        }
+    );
+    let _ = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(2),
+            ops: vec![(b"also-mine".to_vec(), Op::Put(vec![2u8; 40]))],
+        }
+    );
     assert_ne!(e.root(), before, "the writes did not reach the warm tree");
 
     // The other engine got there first.
@@ -738,10 +783,13 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
         .map(|i| (format!("theirs{i:02}").into_bytes(), vec![9u8; 30]))
         .collect();
     let winner = rebuild(&theirs);
-    let out = e.step(Event::HeadConflict {
-        seq: 99,
-        root: winner,
-    });
+    let out = stepped!(
+        e,
+        Event::HeadConflict {
+            seq: 99,
+            root: winner,
+        }
+    );
 
     assert_eq!(
         e.published_root(),
@@ -792,20 +840,26 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
         },
     );
     // Write 1 opens a commit the network never confirms.
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-    });
+    let _ = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+        }
+    );
     // Write 2 folds behind it.
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(2),
-        ops: vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))],
-    });
+    let _ = stepped!(
+        e,
+        Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(2),
+            ops: vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))],
+        }
+    );
     let mut failed = false;
     for t in 1..=20u64 {
-        for f in e.step(Event::Tick(t)) {
+        for f in stepped!(e, Event::Tick(t)) {
             if let Effect::Notify {
                 write_id: WriteId(2),
                 state: State::Failed,
@@ -816,7 +870,7 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
             }
         }
     }
-    let in_tree = freenet_prolly::read::get(e.warm_for_test(), &e.root(), b"b")
+    let in_tree = freenet_prolly::read::get(e.blocks(), &e.root(), b"b")
         .ok()
         .flatten()
         .is_some();

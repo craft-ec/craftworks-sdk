@@ -830,9 +830,23 @@ impl<B: Blocks> Engine<B> {
             .iter()
             .map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 })
             .sum();
-        // Refused BEFORE it is applied. A write answered Busy must leave no
-        // trace: the client will send it again, and a half-applied write that
-        // was also refused is the worst of both.
+        // ONE COMMIT AT A TIME. A write arriving while a commit is in flight
+        // is REFUSED, not folded.
+        //
+        // Folding needed the write's blocks to survive until the next commit,
+        // and there is nowhere to put them: the core keeps no blocks and the
+        // context must not carry a pack. Buffering belongs to the client,
+        // which has a page and an outbox; the delegate has neither. `Busy`
+        // says so, and leaves no trace — a write both applied and refused is
+        // the worst of both.
+        if self.pending.is_some() {
+            return vec![Effect::Notify {
+                client,
+                write_id,
+                state: State::Busy,
+            }];
+        }
+        // Refused BEFORE it is applied, for the same reason.
         if self.backlog() + size > self.params.max_backlog {
             return vec![Effect::Notify {
                 client,

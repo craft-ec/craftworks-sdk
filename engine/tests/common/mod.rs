@@ -1,0 +1,220 @@
+//! The node's block store, as a test sees it.
+//!
+//! `Blocks::get` hands out `Option<&[u8]>` tied to `&self`, so a store that
+//! can be written to WHILE an engine holds it cannot hand out borrows of
+//! anything it might later move. This one keeps each block's bytes at a fixed
+//! address for the lifetime of the process and hands out `&'static [u8]`.
+//!
+//! That is a leak, and it is deliberate and test-only: a test process writes a
+//! bounded number of blocks and then exits. The alternative is threading a
+//! lifetime through every engine and harness, which would shape the production
+//! type around a convenience of the tests.
+
+#![allow(dead_code)]
+
+use engine::{Effect, Engine, Event, Params};
+use freenet_prolly::store::Blocks;
+use freenet_prolly::Cid;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+thread_local! {
+    /// One store per test thread.
+    ///
+    /// `Store::default()` hands back a handle to it, so a test and the engine
+    /// it built share the node's blocks without the test threading a value
+    /// through every helper. Thread-local, so tests running in parallel do
+    /// not see each other's blocks — the isolation a global would lose.
+    ///
+    /// This is test scaffolding. The engine itself has no global state, which
+    /// `no_global_state_in_the_engine` asserts.
+    static THREAD_STORE: Inner = Inner::default();
+}
+
+#[derive(Clone, Default)]
+struct Inner {
+    blocks: Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>,
+    forgotten: Rc<RefCell<std::collections::BTreeSet<Cid>>>,
+}
+
+#[derive(Clone)]
+pub struct Store {
+    inner: Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>,
+    /// Blocks this store pretends not to have, for the forgetful case.
+    forgotten: Rc<RefCell<std::collections::BTreeSet<Cid>>>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        THREAD_STORE.with(|i| Store {
+            inner: i.blocks.clone(),
+            forgotten: i.forgotten.clone(),
+        })
+    }
+}
+
+/// Step the engine and let the node absorb what it emitted.
+///
+/// The engine keeps no blocks, so a test that only calls `step` leaves the
+/// tree nowhere: the next call reads through `Blocks` and finds nothing. On a
+/// real node the puts land and the node holds them; here the store does it.
+/// Every converted test goes through this rather than `step` directly.
+/// A macro rather than a function so it works whether the engine is an owned
+/// binding or a `&mut` parameter — the call sites are both, and a function
+/// would need each one to spell its own borrow.
+#[macro_export]
+macro_rules! stepped {
+    ($e:expr, $ev:expr) => {{
+        let out = $e.step($ev);
+        $crate::common::Store::default().absorb(&out);
+        out
+    }};
+}
+
+/// `Engine::new` with the thread's store, so a converted test reads as it did.
+pub fn new_store_params(params: Params) -> Engine<Store> {
+    Engine::new(params, Store::default())
+}
+
+impl Store {
+    /// A store of its very own, for a test that wants two.
+    pub fn fresh() -> Self {
+        Store {
+            inner: Rc::new(RefCell::new(BTreeMap::new())),
+            forgotten: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+        }
+    }
+}
+
+impl Blocks for Store {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        if self.forgotten.borrow().contains(cid) {
+            return None;
+        }
+        self.inner.borrow().get(cid).copied()
+    }
+}
+
+impl Store {
+    pub fn put(&self, id: Cid, bytes: &[u8]) {
+        let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+        self.inner.borrow_mut().insert(id, leaked);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Absorb what a commit emitted, the way a node does once its puts land.
+    ///
+    /// A pack is unpacked: what the node ends up holding is the blocks inside
+    /// it, under their own ids, which is the whole point of the format.
+    pub fn absorb(&self, effects: &[Effect]) {
+        for f in effects {
+            match f {
+                Effect::PutPack { id, bytes, .. } => {
+                    for (mid, mbytes) in engine::pack::members(bytes) {
+                        self.put(mid, &mbytes);
+                    }
+                    self.put(*id, bytes);
+                }
+                Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } => {
+                    self.put(*id, bytes);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Forget a block: the node evicted it.
+    ///
+    /// F33: a sync read does NOT refresh hosting, so a block a descent read on
+    /// one call can be gone on the next, and nothing the engine does prevents
+    /// it. A store that cannot express that cannot test for it.
+    pub fn forget(&self, cid: Cid) {
+        self.forgotten.borrow_mut().insert(cid);
+    }
+
+    pub fn remember(&self, cid: &Cid) {
+        self.forgotten.borrow_mut().remove(cid);
+    }
+}
+
+/// How the harness drives the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// One engine value for the whole run — how slices 1-3 were written.
+    Live,
+    /// The engine is DROPPED and rebuilt from its context between every step,
+    /// which is what a delegate actually does. Both modes must agree.
+    Rehydrate,
+}
+
+/// An engine driven in one of the two modes, so a test can be written once.
+pub struct Harness {
+    mode: Mode,
+    params: Params,
+    pub store: Store,
+    live: Option<Engine<Store>>,
+    ctx: Vec<u8>,
+    /// Contexts written, and the largest seen — the budget's own evidence.
+    pub max_context: usize,
+}
+
+impl Harness {
+    pub fn new(mode: Mode, params: Params, store: Store) -> Self {
+        let e = Engine::new(params, store.clone());
+        let ctx = e.to_context().expect("a fresh engine has a context");
+        Harness {
+            mode,
+            params,
+            store,
+            live: (mode == Mode::Live).then_some(e),
+            ctx,
+            max_context: 0,
+        }
+    }
+
+    pub fn step(&mut self, ev: Event) -> Vec<Effect> {
+        let out = match self.mode {
+            Mode::Live => self.live.as_mut().expect("a live engine").step(ev),
+            Mode::Rehydrate => {
+                let mut e = Engine::from_context(&self.ctx, self.params, self.store.clone())
+                    .expect("the engine's own context must read back");
+                let out = e.step(ev);
+                self.ctx = e.to_context().expect("a context after every step");
+                self.max_context = self.max_context.max(self.ctx.len());
+                out
+            }
+        };
+        // The node holds what the commit put, whichever mode this is.
+        self.store.absorb(&out);
+        out
+    }
+
+    /// The root the engine would report. In rehydrate mode that means
+    /// rebuilding it, which is the point: nothing is remembered outside the
+    /// context.
+    pub fn root(&self) -> Cid {
+        match self.mode {
+            Mode::Live => self.live.as_ref().expect("a live engine").root(),
+            Mode::Rehydrate => Engine::from_context(&self.ctx, self.params, self.store.clone())
+                .expect("its own context")
+                .root(),
+        }
+    }
+
+    pub fn published_root(&self) -> Cid {
+        match self.mode {
+            Mode::Live => self.live.as_ref().expect("a live engine").published_root(),
+            Mode::Rehydrate => Engine::from_context(&self.ctx, self.params, self.store.clone())
+                .expect("its own context")
+                .published_root(),
+        }
+    }
+}

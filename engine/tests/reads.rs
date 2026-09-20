@@ -13,6 +13,9 @@ use freenet_prolly::Cid;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
+mod common;
+use common::Store;
+
 fn rng(seed: u64) -> impl FnMut() -> u64 {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     move || {
@@ -29,16 +32,25 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
 /// fetch its way to an answer, which is the situation a cold reader is
 /// actually in.
 fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
-    let mut w = Engine::default();
+    // The writer gets a store of ITS OWN. Sharing the thread's store would put
+    // the whole tree where the reader can see it, and every "cold" read below
+    // would be a warm one — which is exactly what happened: five tests failed
+    // with "0 fetches" because nothing was ever cold.
+    let ws = Store::fresh();
+    let mut w = Engine::new(Params::default(), ws.clone());
     let ops: Vec<(Vec<u8>, Op)> = records
         .iter()
         .map(|(k, v)| (k.clone(), Op::Put(v.clone())))
         .collect();
-    let mut queue = w.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-    });
+    let mut queue = {
+        let out = w.step(Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops,
+        });
+        ws.absorb(&out);
+        out
+    };
     let mut all = MemBlocks::default();
     let mut guard = 0;
     while let Some(f) = queue.pop() {
@@ -54,16 +66,26 @@ fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
                     all.insert(mid, &mbytes);
                 }
                 all.insert(id, &bytes);
-                queue.extend(w.step(Event::PutConfirmed(id)));
+                let o = w.step(Event::PutConfirmed(id));
+                ws.absorb(&o);
+                queue.extend(o);
             }
             Effect::PutBlock { id, bytes, .. } => {
                 all.insert(id, &bytes);
-                queue.extend(w.step(Event::PutConfirmed(id)));
+                let o = w.step(Event::PutConfirmed(id));
+                ws.absorb(&o);
+                queue.extend(o);
             }
-            Effect::UpdateHead { seq, .. } => queue.extend(w.step(Event::HeadConfirmed(seq))),
+            Effect::UpdateHead { seq, .. } => {
+                let o = w.step(Event::HeadConfirmed(seq));
+                ws.absorb(&o);
+                queue.extend(o);
+            }
             Effect::PutParity { id, bytes, .. } => {
                 all.insert(id, &bytes);
-                queue.extend(w.step(Event::PutConfirmed(id)));
+                let o = w.step(Event::PutConfirmed(id));
+                ws.absorb(&o);
+                queue.extend(o);
             }
             Effect::Notify {
                 state: State::Published,
@@ -76,8 +98,8 @@ fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
 }
 
 /// A reader that has published the same root but holds no blocks.
-fn reader(root: Cid, params: Params) -> Engine {
-    let mut e = Engine::new(params);
+fn reader(root: Cid, params: Params) -> Engine<Store> {
+    let mut e = Engine::new(params, Store::default());
     e.adopt_root_for_test(root);
     e
 }
@@ -158,7 +180,7 @@ fn cold_reads_answer_what_a_fully_held_tree_answers() {
             };
             let req = ReqId(n);
             asked.push((req, key.clone()));
-            queue.extend(e.step(get(1, n, &key)));
+            queue.extend(stepped!(e, get(1, n, &key)));
         }
 
         // Answer fetches in a shuffled order, with duplicates, strangers and
@@ -175,20 +197,23 @@ fn cold_reads_answer_what_a_fully_held_tree_answers() {
                     let out = if r().is_multiple_of(7) {
                         // A bounded attempt that did not answer. The core must
                         // re-issue, not give up and not hang.
-                        e.step(Event::BlockMissed(id))
+                        stepped!(e, Event::BlockMissed(id))
                     } else if let Some(bytes) = all.get(&id) {
                         let bytes = bytes.to_vec();
-                        let mut out = e.step(Event::BlockArrived {
-                            id,
-                            bytes: bytes.clone(),
-                        });
+                        let mut out = stepped!(
+                            e,
+                            Event::BlockArrived {
+                                id,
+                                bytes: bytes.clone(),
+                            }
+                        );
                         if r().is_multiple_of(6) {
                             // The same block again: normal on a network.
-                            out.extend(e.step(Event::BlockArrived { id, bytes }));
+                            out.extend(stepped!(e, Event::BlockArrived { id, bytes }));
                         }
                         out
                     } else {
-                        e.step(Event::BlockMissed(id))
+                        stepped!(e, Event::BlockMissed(id))
                     };
                     queue.extend(out);
                 }
@@ -200,10 +225,13 @@ fn cold_reads_answer_what_a_fully_held_tree_answers() {
             if r().is_multiple_of(9) {
                 // A block nobody asked for.
                 let junk = vec![(r() % 251) as u8; 40];
-                queue.extend(e.step(Event::BlockArrived {
-                    id: [(r() % 251) as u8; 32],
-                    bytes: junk,
-                }));
+                queue.extend(stepped!(
+                    e,
+                    Event::BlockArrived {
+                        id: [(r() % 251) as u8; 32],
+                        bytes: junk,
+                    }
+                ));
             }
         }
 
@@ -254,17 +282,21 @@ fn fixture(n: u32) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks) {
 }
 
 /// Feed a reader every block, so it is fully warm.
-fn warm_all(e: &mut Engine, all: &MemBlocks) {
+fn warm_all(_e: &mut Engine<Store>, all: &MemBlocks) {
+    // Warming means the NODE holds the blocks. Telling the engine
+    // `BlockArrived` does not: the engine stores nothing, so the only thing
+    // that makes a block readable is putting it where the engine reads from.
+    // Seven read tests failed on this — "a warm hit asked the network for
+    // something" — because feeding the engine used to be the same as filling
+    // its store, and is not any more.
+    let store = Store::default();
     for (id, bytes) in all.0.iter() {
-        let _ = e.step(Event::BlockArrived {
-            id: *id,
-            bytes: bytes.clone(),
-        });
+        store.put(*id, bytes);
     }
 }
 
 /// Drive a reader until it answers, serving from `all`.
-fn settle(e: &mut Engine, all: &MemBlocks, first: Vec<Effect>) -> Vec<(ReqId, ReadResult)> {
+fn settle(e: &mut Engine<Store>, all: &MemBlocks, first: Vec<Effect>) -> Vec<(ReqId, ReadResult)> {
     let mut queue = first;
     let mut out = Vec::new();
     let mut guard = 0;
@@ -273,14 +305,19 @@ fn settle(e: &mut Engine, all: &MemBlocks, first: Vec<Effect>) -> Vec<(ReqId, Re
         assert!(guard < 100_000, "the read did not settle");
         match f {
             Effect::FetchBlock { id, .. } => {
+                // What a node does: the GET populates its store, and only
+                // then is the engine told. The engine keeps nothing itself.
                 let ev = match all.get(&id) {
-                    Some(b) => Event::BlockArrived {
-                        id,
-                        bytes: b.to_vec(),
-                    },
+                    Some(b) => {
+                        Store::default().put(id, b);
+                        Event::BlockArrived {
+                            id,
+                            bytes: b.to_vec(),
+                        }
+                    }
                     None => Event::BlockMissed(id),
                 };
-                queue.extend(e.step(ev));
+                queue.extend(stepped!(e, ev));
             }
             Effect::Reply { req_id, result, .. } => out.push((req_id, result)),
             _ => {}
@@ -304,7 +341,7 @@ fn every_warmth_state_answers_the_same() {
     // 1. Fully warm: rule 1 — the reply is in the same step, with no fetch.
     let mut e = reader(root, Params::default());
     warm_all(&mut e, &all);
-    let out = e.step(get(1, 1, &key));
+    let out = stepped!(e, get(1, 1, &key));
     assert!(
         fetch_ids(&out).is_empty(),
         "a warm hit asked the network for something"
@@ -316,7 +353,7 @@ fn every_warmth_state_answers_the_same() {
 
     // 2. Fully cold.
     let mut e = reader(root, Params::default());
-    let first = e.step(get(1, 2, &key));
+    let first = stepped!(e, get(1, 2, &key));
     let got = settle(&mut e, &all, first);
     assert_eq!(got, vec![(ReqId(2), ReadResult::Value(want.clone()))]);
 
@@ -331,13 +368,16 @@ fn every_warmth_state_answers_the_same() {
         let carries_leaf =
             *id == leaf || engine::pack::members(bytes).iter().any(|(m, _)| *m == leaf);
         if !carries_leaf {
-            let _ = e.step(Event::BlockArrived {
-                id: *id,
-                bytes: bytes.clone(),
-            });
+            let _ = stepped!(
+                e,
+                Event::BlockArrived {
+                    id: *id,
+                    bytes: bytes.clone(),
+                }
+            );
         }
     }
-    let first = e.step(get(1, 3, &key));
+    let first = stepped!(e, get(1, 3, &key));
     assert_eq!(
         fetch_ids(&first).len(),
         1,
@@ -359,11 +399,14 @@ fn every_warmth_state_answers_the_same() {
         })
         .map(|(id, bytes)| (*id, bytes.clone()));
     if let Some((pid, pbytes)) = pack {
-        let _ = e.step(Event::BlockArrived {
-            id: pid,
-            bytes: pbytes,
-        });
-        let first = e.step(get(1, 4, &key));
+        let _ = stepped!(
+            e,
+            Event::BlockArrived {
+                id: pid,
+                bytes: pbytes,
+            }
+        );
+        let first = stepped!(e, get(1, 4, &key));
         let got = settle(&mut e, &all, first);
         assert_eq!(got, vec![(ReqId(4), ReadResult::Value(want.clone()))]);
     }
@@ -412,7 +455,7 @@ fn a_block_that_is_not_what_was_asked_for_is_refused() {
         ("a leaf where a branch is expected", 2),
     ] {
         let mut e = reader(root, Params::default());
-        let first = e.step(get(1, 7, &key));
+        let first = stepped!(e, get(1, 7, &key));
         let asked = fetch_ids(&first);
         assert_eq!(asked.len(), 1, "{name}: expected one fetch to poison");
         let id = asked[0].0;
@@ -427,7 +470,7 @@ fn a_block_that_is_not_what_was_asked_for_is_refused() {
                 .expect("another block"),
             _ => leaf_bytes.clone(),
         };
-        let out = e.step(Event::BlockArrived { id, bytes });
+        let out = stepped!(e, Event::BlockArrived { id, bytes });
 
         // The read must still SUCCEED once the network serves the truth.
         //
@@ -486,7 +529,7 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
         },
     );
     e.reset_cost();
-    let first = e.step(get(1, 9, &key));
+    let first = stepped!(e, get(1, 9, &key));
     let got = settle(&mut e, &all, first);
     assert!(
         matches!(got.first(), Some((_, ReadResult::Value(Some(_))))),
@@ -512,11 +555,11 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
     let mut greedy = reader(
         root,
         Params {
-            fetch_greedily: true,
+            refetch_held: true,
             ..Params::default()
         },
     );
-    let first = greedy.step(get(1, 10, &key));
+    let first = stepped!(greedy, get(1, 10, &key));
     let _ = settle(&mut greedy, &all, first);
     assert!(
         greedy.fetches() > depth + 1,
@@ -550,7 +593,7 @@ fn requests_waiting_on_one_block_share_its_fetch() {
         );
         let mut n = 0;
         for req in 0..5u64 {
-            n += fetch_ids(&e.step(get(1, req, &key))).len();
+            n += fetch_ids(&stepped!(e, get(1, req, &key))).len();
         }
         n
     };
@@ -576,18 +619,24 @@ fn a_hostile_preload_costs_the_budget() {
     let (_, root, all) = fixture(2_000);
     let mut e = reader(root, Params::default());
     // The session holds this root and nothing else.
-    e.step(Event::BlockArrived {
-        id: root,
-        bytes: all.get(&root).expect("held").to_vec(),
-    });
+    stepped!(
+        e,
+        Event::BlockArrived {
+            id: root,
+            bytes: all.get(&root).expect("held").to_vec(),
+        }
+    );
     e.reset_cost();
 
     let mut roots: Vec<Cid> = (0..1_000_000u32).map(|i| [(i % 251) as u8; 32]).collect();
     roots.insert(0, root);
-    let out = e.step(Event::Preload {
-        client: ClientId(1),
-        roots,
-    });
+    let out = stepped!(
+        e,
+        Event::Preload {
+            client: ClientId(1),
+            roots,
+        }
+    );
     let p = Params::default();
     assert!(
         fetch_ids(&out).len() <= p.preload_blocks,
@@ -625,11 +674,14 @@ fn a_range_pages_in_both_directions() {
                 max_entries: 25,
                 max_bytes: 1 << 20,
             };
-            let first = e.step(Event::Scan {
-                client: ClientId(1),
-                req_id: ReqId(page),
-                range: Box::new(r),
-            });
+            let first = stepped!(
+                e,
+                Event::Scan {
+                    client: ClientId(1),
+                    req_id: ReqId(page),
+                    range: Box::new(r),
+                }
+            );
             let got = settle(&mut e, &all, first);
             let Some((
                 _,
@@ -681,7 +733,7 @@ fn no_read_sequence_panics_and_every_read_answers() {
             root,
             Params {
                 max_attempts: 2,
-                max_warm_bytes: 32 * 1024,
+                max_context_bytes: 32 * 1024,
                 ..Params::default()
             },
         );
@@ -726,7 +778,7 @@ fn no_read_sequence_panics_and_every_read_answers() {
                 Event::Get { req_id, .. } | Event::Scan { req_id, .. } => Some(*req_id),
                 _ => None,
             };
-            let out = e.step(ev);
+            let out = stepped!(e, ev);
             for (r, _) in replies(&out) {
                 outstanding.remove(&r);
             }
@@ -759,7 +811,7 @@ fn no_read_sequence_panics_and_every_read_answers() {
                         },
                         None => Event::BlockMissed(id),
                     };
-                    queue.extend(e.step(ev));
+                    queue.extend(stepped!(e, ev));
                 }
                 Effect::Reply { req_id, .. } => {
                     outstanding.remove(&req_id);
@@ -789,7 +841,7 @@ fn no_read_sequence_panics_and_every_read_answers() {
 /// never panics, and a sweep that only asks "did it panic" is green while the
 /// delegate spins out its 5 s slice on one key.
 fn settle_bounded(
-    e: &mut Engine,
+    e: &mut Engine<Store>,
     all: &MemBlocks,
     first: Vec<Effect>,
     budget: usize,
@@ -804,14 +856,19 @@ fn settle_bounded(
         }
         match f {
             Effect::FetchBlock { id, .. } => {
+                // What a node does: the GET populates its store, and only
+                // then is the engine told. The engine keeps nothing itself.
                 let ev = match all.get(&id) {
-                    Some(b) => Event::BlockArrived {
-                        id,
-                        bytes: b.to_vec(),
-                    },
+                    Some(b) => {
+                        Store::default().put(id, b);
+                        Event::BlockArrived {
+                            id,
+                            bytes: b.to_vec(),
+                        }
+                    }
                     None => Event::BlockMissed(id),
                 };
-                queue.extend(e.step(ev));
+                queue.extend(stepped!(e, ev));
             }
             Effect::Reply { req_id, result, .. } => out.push((req_id, result)),
             _ => {}
@@ -837,13 +894,13 @@ fn a_tight_warm_set_answers_every_read_instead_of_looping() {
         let mut e = reader(
             root,
             Params {
-                max_warm_bytes: warm,
+                max_context_bytes: 320 * 1024,
                 ..Params::default()
             },
         );
         let (mut ok, mut no_space, mut other) = (0, 0, 0);
         for (i, (k, v)) in records.iter().enumerate().filter(|(i, _)| i % 500 == 0) {
-            let first = e.step(get(1, i as u64, k));
+            let first = stepped!(e, get(1, i as u64, k));
             let got = settle_bounded(&mut e, &all, first, BUDGET).unwrap_or_else(|n| {
                 panic!("warm={warm}: a read took {n} steps and had not answered")
             });
@@ -877,12 +934,12 @@ fn a_tight_warm_set_answers_every_read_instead_of_looping() {
     let mut e = reader(
         root,
         Params {
-            max_warm_bytes: 8 * 1024,
-            pin_parked_reads: false,
+            max_context_bytes: 8 * 1024,
+            refetch_held: false,
             ..Params::default()
         },
     );
-    let first = e.step(get(1, 99, &key));
+    let first = stepped!(e, get(1, 99, &key));
     assert!(
         settle_bounded(&mut e, &all, first, BUDGET).is_err(),
         "with pinning off the read still finished, so pinning is not what \
