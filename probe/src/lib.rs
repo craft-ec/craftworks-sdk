@@ -1,5 +1,7 @@
 //! Checks a delegate's wasm against the host functions a pinned node defines.
 
+pub mod node;
+
 /// Every delegate host function freenet 0.2.135 registers in its linker.
 ///
 /// Taken from the REGISTRATIONS in `wasm_runtime/engine/wasmtime_engine.rs`,

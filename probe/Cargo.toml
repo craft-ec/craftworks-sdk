@@ -7,3 +7,9 @@ description = "Platform probes against a pinned Freenet: the import gate, and th
 
 [dependencies]
 anyhow = "1"
+freenet-stdlib = { version = "0.10.0", features = ["net"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+bincode = "1"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }

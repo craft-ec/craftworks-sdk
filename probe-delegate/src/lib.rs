@@ -33,7 +33,11 @@ pub enum Ask {
     /// Emit a PutContractRequest and see whether the engine's own writes end
     /// up hosted — the question source could not settle (Q8). The CODE comes
     /// from the driver because a delegate cannot fabricate a contract.
-    PutState { code: Vec<u8>, state: Vec<u8> },
+    PutState {
+        code: Vec<u8>,
+        params: Vec<u8>,
+        state: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,13 +110,22 @@ impl DelegateInterface for Probe {
                     len: got.map(|v| v.len()),
                 }
             }
-            Ask::PutState { code, state } => {
+            Ask::PutState {
+                code,
+                params,
+                state,
+            } => {
                 // The delegate has no host function that writes contract
                 // state — those were removed — so a write is a MESSAGE.
                 let container =
                     ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
                         std::sync::Arc::new(ContractCode::from(code)),
-                        vec![].into(),
+                        // The PARAMS matter: the Block contract validates
+                        // `params == blake3(state)`, so an empty-params
+                        // container is a state the node correctly refuses —
+                        // which looked exactly like "a delegate PUT never
+                        // lands" until this probe was fixed.
+                        Parameters::from(params),
                     )));
                 let req = PutContractRequest::new(
                     container,
