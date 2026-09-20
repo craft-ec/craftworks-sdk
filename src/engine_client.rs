@@ -76,6 +76,20 @@ pub struct Client {
     /// ever for an answer to a message nobody understood, and the only symptom
     /// would be a UI that never settles.
     pub dropped: Vec<Dropped>,
+    /// The diagnostics ring. THE CLIENT HOLDS IT.
+    ///
+    /// Never the delegate's context — that budget belongs to the commit in
+    /// flight (F31) — and never its secret store, whose quota is shared with
+    /// KEY MATERIAL: a full diagnostic buffer must not be able to break key
+    /// storage. The delegate reports per call and the report rides out; the
+    /// recording lives here.
+    ///
+    /// `None` until a client attaches one, and calls that arrive meanwhile are
+    /// COUNTED as a gap rather than silently missing — a bundle that looks
+    /// continuous when it is not is worse than one that admits a hole.
+    rec: Option<instrument::SyncRecorder>,
+    /// Per-call reports that arrived with no recorder attached.
+    unrecorded_calls: u64,
     traces: Traces,
     /// The client's clock, as a function, because this crate compiles to wasm
     /// and to a host binary and must not reach for one of its own.
@@ -97,6 +111,55 @@ impl Client {
             dropped: Vec::new(),
             traces: Traces::default(),
             now_ms: None,
+            rec: None,
+            unrecorded_calls: 0,
+        }
+    }
+
+    /// Attach the diagnostics ring.
+    ///
+    /// Bounded: it DROPS when full and counts the drop, never grows and never
+    /// panics. An unbounded buffer is a leak in a long-lived page, and a probe
+    /// that panics turns a passing test — or a working app — into a failure,
+    /// which is the worst kind of behaviour change.
+    pub fn record_into(&mut self, capacity: usize) {
+        self.rec = Some(instrument::SyncRecorder::with_capacity(capacity));
+    }
+
+    /// The recording, for a support bundle or a test. A SEPARATE handle: the
+    /// trait the recording code holds returns unit and has no read-back, so a
+    /// probe can never become an input.
+    pub fn recording(&self) -> Option<instrument::SyncRecording<'_>> {
+        self.rec.as_ref().map(|r| r.recording())
+    }
+
+    /// Per-call reports that arrived before a ring was attached.
+    ///
+    /// A bundle that omitted these would look continuous across a hole. It is
+    /// better to say "there are N calls I did not see" than to present a
+    /// gapless story that is not one.
+    pub fn unrecorded_calls(&self) -> u64 {
+        self.unrecorded_calls
+    }
+
+    /// The tail of the recording, for a failure or a support bundle.
+    pub fn dump(&self, what: &'static str) -> String {
+        match &self.rec {
+            Some(r) => {
+                let mut s = instrument::dump::render(&r.recording(), what, 40);
+                if self.unrecorded_calls > 0 {
+                    s.push_str(&format!(
+                        "   NOTE: {} call(s) arrived before a recorder was attached and are \
+                         NOT in this recording.\n",
+                        self.unrecorded_calls
+                    ));
+                }
+                s
+            }
+            None => format!(
+                "no recording attached; {} call report(s) went unrecorded\n",
+                self.unrecorded_calls
+            ),
         }
     }
 
@@ -159,10 +222,12 @@ impl Client {
         let reply = match protocol::decode_reply(bytes) {
             Ok(r) => r,
             Err(why) => {
+                self.record_drop(why);
                 self.dropped.push(why);
                 return;
             }
         };
+        self.record_reply(&reply);
         match reply {
             Reply::Changed {
                 sub_id,
@@ -190,9 +255,94 @@ impl Client {
             }
             // A version this build does not serve. Counted, and the client is
             // told: a silence here is a UI that waits for ever.
-            Reply::Unsupported { .. } => self.dropped.push(Dropped::NotForUs),
+            Reply::Unsupported { .. } => {
+                self.record_drop(Dropped::NotForUs);
+                self.dropped.push(Dropped::NotForUs)
+            }
             other => self.replies.push(other),
         }
+    }
+
+    /// Record a per-call report. The counts the engine already had, and
+    /// nothing else.
+    ///
+    /// `Reply::Call` exists because a delegate prints nothing and the node says
+    /// nothing about it, so five different breaks in the write path all
+    /// presented as one symptom — a write that stops at `Accepted`. Until now
+    /// the engine emitted it and nothing read it, which means a page had no
+    /// answer to "why did my write stop".
+    ///
+    /// Every field here is a NUMBER the engine computed. No key, no value, no
+    /// domain name: this recording ships as the production support tool, so
+    /// the rule is vocabulary, not type — `domain = "medical"` is a category
+    /// and no grep for a key format would find it.
+    fn record_reply(&mut self, reply: &Reply) {
+        use instrument::{vocab::Key, Entry, Event, OpId, Probe, Site};
+        const CALL: Site = Site::of("sdk::delegate::call");
+
+        let Reply::Call {
+            effects,
+            ops,
+            awaiting,
+            read_back,
+            stranded,
+            dropped,
+            ..
+        } = reply
+        else {
+            return;
+        };
+        let Some(rec) = &self.rec else {
+            // No ring attached. COUNTED, so a bundle cannot look continuous
+            // across the hole.
+            self.unrecorded_calls += 1;
+            return;
+        };
+        for (key, value) in [
+            (Key::Effects, *effects as u64),
+            (Key::Ops, *ops as u64),
+            (Key::Awaiting, *awaiting as u64),
+            (Key::ReadBack, *read_back as u64),
+            (Key::Stranded, *stranded as u64),
+            (Key::DroppedMsgs, *dropped as u64),
+        ] {
+            rec.event(Event::Counter {
+                site: CALL,
+                op: OpId::NONE,
+                entry: Entry { key, value },
+            });
+        }
+    }
+
+    /// Record why a message was discarded, as a vocabulary value.
+    fn record_drop(&mut self, why: Dropped) {
+        use instrument::{
+            vocab::{DropReason, Key},
+            Entry, Event, OpId, Probe, Site,
+        };
+        const DROP: Site = Site::of("sdk::client::dropped");
+        let Some(rec) = &self.rec else {
+            return;
+        };
+        // The protocol's reason mapped onto the instrument's closed one. Both
+        // are closed lists on purpose: a free-text reason is the easiest place
+        // for user data to arrive by accident, and this one crosses into a
+        // support bundle.
+        let reason = match why {
+            Dropped::Unparseable => DropReason::Unparseable,
+            Dropped::TrailingBytes => DropReason::TrailingBytes,
+            Dropped::TooLarge => DropReason::TooLarge,
+            Dropped::Unexpected => DropReason::Unexpected,
+            Dropped::NotForUs => DropReason::NotForUs,
+        };
+        rec.event(Event::Counter {
+            site: DROP,
+            op: OpId::NONE,
+            entry: Entry {
+                key: Key::DroppedMsgs,
+                value: reason.code(),
+            },
+        });
     }
 
     /// The replies that have arrived since this was last called.
