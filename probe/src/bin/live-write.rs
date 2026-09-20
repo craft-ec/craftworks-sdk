@@ -308,6 +308,40 @@ async fn main() -> Result<()> {
         None => bail!("the value was not readable over a second connection"),
     }
 
+    // ---- a LIST over the new connection, as a table component does ----
+    //
+    // Two writes are in the tree by now, so a range must return both, in
+    // order, over a connection that did not make them.
+    send(
+        &mut second,
+        &dkey,
+        &Request::Range {
+            req_id: 2,
+            lo: protocol::Bound::Unbounded,
+            hi: protocol::Bound::Unbounded,
+            reverse: false,
+            after: None,
+            max_entries: 100_000,
+        },
+    )
+    .await?;
+    match read_page(&mut second, deadline).await {
+        Some((rows, used)) => {
+            let keys: Vec<String> = rows
+                .iter()
+                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+                .collect();
+            if keys.len() < 2 {
+                bail!("a list over the new connection returned {keys:?}, not both writes");
+            }
+            println!("  list:  {keys:?} over the SECOND connection (page size used {used})");
+            if used >= 100_000 {
+                bail!("the engine reported {used} as the page size it used, so nothing clamped");
+            }
+        }
+        None => bail!("a range over the new connection returned no page at all"),
+    }
+
     // ---- the page-closed promise: Flush, close, reopen, read back ----
     send(&mut client, &dkey, &Request::Flush).await?;
     let _ = timeout(Duration::from_secs(2), client.recv()).await;
@@ -327,6 +361,37 @@ async fn main() -> Result<()> {
     println!("budget: {:?} of {BUDGET:?} used", started.elapsed());
     println!("done");
     Ok(())
+}
+
+/// One page of a range, and the page size the engine actually used.
+async fn read_page(
+    client: &mut WebApi,
+    deadline: Instant,
+) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, u32)> {
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left.min(STEP), client.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
+                for v in values {
+                    if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                        let owned = m.payload.to_vec();
+                        match protocol::decode_reply(&owned) {
+                            Ok(Reply::Page {
+                                entries,
+                                max_entries,
+                                ..
+                            }) => return Some((entries, max_entries)),
+                            Ok(Reply::Unavailable { .. }) => return None,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => continue,
+            _ => return None,
+        }
+    }
+    None
 }
 
 async fn read_value(client: &mut WebApi, deadline: Instant) -> Option<Vec<u8>> {
