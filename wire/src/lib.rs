@@ -73,7 +73,9 @@
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 
+pub mod provision;
 pub mod reassemble;
+pub use provision::{Did, Provisioned, Step};
 pub use reassemble::Reassembler;
 
 /// The largest single frame this build will decode before looking inside.

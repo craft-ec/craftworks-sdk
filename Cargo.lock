@@ -1779,6 +1779,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "web"
+version = "0.1.0"
+dependencies = [
+ "craftworks-sdk",
+ "freenet-prolly",
+ "getrandom 0.2.17",
+ "js-sys",
+ "protocol",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wire",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"

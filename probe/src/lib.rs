@@ -365,7 +365,17 @@ mod tests {
         ///
         /// `wire` frames the client API; `probe` drives live nodes; the
         /// delegates are compiled by the node itself and link the guest side.
-        const ALLOWED: [&str; 4] = ["wire", "probe", "probe-delegate", "engine-delegate"];
+        const ALLOWED: [&str; 5] = [
+            "wire",
+            // The browser build LINKS the core to the framing, which is its
+            // whole job — and it is the reason `craftworks-sdk` can stay OFF
+            // this list. Splitting the cdylib out is what kept the core on the
+            // checked side rather than making it a crate the gate excuses.
+            "web",
+            "probe",
+            "probe-delegate",
+            "engine-delegate",
+        ];
 
         // The RUNNING directory, not the building one: `CARGO_MANIFEST_DIR` is
         // baked in at build time, so a binary served from a shared target dir
@@ -468,6 +478,16 @@ mod tests {
         assert!(
             !checked.is_empty(),
             "every workspace member is allowlisted, so this gate checked nothing"
+        );
+        // The CORE specifically. The point of splitting the cdylib into `web`
+        // was to keep `craftworks-sdk` on the checked side; if it ever drifts
+        // onto the allowlist the gate would still print a healthy-looking line
+        // while the thing the split was FOR had quietly stopped being true.
+        assert!(
+            checked.iter().any(|c| c == "craftworks-sdk"),
+            "`craftworks-sdk` is not among the checked crates. The core must \
+             never be allowlisted: the browser build is a separate crate \
+             precisely so the core stays checked."
         );
     }
 }

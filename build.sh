@@ -3,10 +3,17 @@
 # pkg/node (CommonJS, for tests).
 set -euo pipefail
 cd "$(dirname "$0")"
-cargo build --release --target wasm32-unknown-unknown
-wasm=target/wasm32-unknown-unknown/release/craftworks_sdk.wasm
-wasm-bindgen --target web    --out-dir pkg/web  "$wasm"
-wasm-bindgen --target nodejs --out-dir pkg/node "$wasm"
+# The BROWSER build is the `web` crate: the core plus the framing. The core
+# itself is an rlib, so it stays a crate the boundary gate checks rather than
+# one it has to excuse.
+cargo build --release -p web --target wasm32-unknown-unknown
+wasm=target/wasm32-unknown-unknown/release/web.wasm
+# `--out-name`, so the artefact keeps the name every consumer already
+# imports. The cdylib moved from `craftworks-sdk` to `web` to keep the core on
+# the checked side of the boundary gate; that is a layout decision inside this
+# repo and has no business renaming the file the builder loads.
+wasm-bindgen --target web    --out-name craftworks_sdk --out-dir pkg/web  "$wasm"
+wasm-bindgen --target nodejs --out-name craftworks_sdk --out-dir pkg/node "$wasm"
 cp js/wrap.js js/index.js js/connection.js pkg/web/
 
 # THE ARTEFACTS THE SDK PROVISIONS WITH.
