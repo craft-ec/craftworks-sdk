@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node tests/js/ids.test.cjs && node tests/js/collection.test.mjs && node tests/js/build-info.test.mjs && node tests/js/connection.test.mjs && node tests/js/engine-db.test.mjs"
+    "test": "node tests/js/ids.test.cjs && node tests/js/collection.test.mjs && node tests/js/build-info.test.mjs && node tests/js/connection.test.mjs && node tests/js/engine-db.test.mjs && node tests/js/open.test.mjs && node tests/js/entry.test.mjs"
   }
 }
