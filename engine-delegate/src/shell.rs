@@ -348,6 +348,17 @@ impl<B: Blocks> Shell<B> {
     /// drift apart.
     fn on_protocol(&mut self, r: protocol::Request) -> Vec<Effect> {
         use protocol::Request as P;
+        // ONE conversion, used by every arm that takes a range. Three arms
+        // take one now; three copies of this would be three places for the
+        // bounds to be read differently.
+        fn bound(b: protocol::Bound) -> std::ops::Bound<Vec<u8>> {
+            use std::ops::Bound as B;
+            match b {
+                protocol::Bound::Unbounded => B::Unbounded,
+                protocol::Bound::Included(k) => B::Included(k),
+                protocol::Bound::Excluded(k) => B::Excluded(k),
+            }
+        }
         let ev = match r {
             P::Identity => {
                 // Identity is also how a session BEGINS. There is no separate
@@ -396,12 +407,6 @@ impl<B: Blocks> Shell<B> {
                 after,
                 max_entries,
             } => {
-                use std::ops::Bound as B;
-                let bound = |b: protocol::Bound| match b {
-                    protocol::Bound::Unbounded => B::Unbounded,
-                    protocol::Bound::Included(k) => B::Included(k),
-                    protocol::Bound::Excluded(k) => B::Excluded(k),
-                };
                 // CLAMPED here, and the clamp is reported back rather than
                 // applied silently: a caller that asked for a thousand rows
                 // and got a hundred needs to know the page it holds is not
@@ -422,11 +427,51 @@ impl<B: Blocks> Shell<B> {
                     }),
                 }
             }
-            // Preload and Subscribe are v1 vocabulary this shell does not
-            // serve yet (slice 6, with observability). Answered as such
+            P::Preload { roots } => Event::Preload {
+                client: as_client(1),
+                // Fixed-width ids off the wire. A root is 32 bytes; anything
+                // else is not one, and the engine's budget bounds how many of
+                // them are walked.
+                roots: roots.into_iter().collect(),
+            },
+            P::SubscribeRange { sub_id, lo, hi } => Event::SubscribeRange {
+                client: as_client(1),
+                sub_id,
+                range: engine::subs::SubRange {
+                    lo: bound(lo),
+                    hi: bound(hi),
+                },
+            },
+            // The ENGINE's copy only. The node has no unsubscribe, so a
+            // delegate goes on being woken for contracts its engine has
+            // forgotten — which is ordinary, not an error, and is why nothing
+            // here treats an unknown wake-up as one. Writing a release path
+            // that silently does nothing at the node would be worse than
+            // having none.
+            P::Unsubscribe { sub_id } => Event::Unsubscribe {
+                client: as_client(1),
+                sub_id,
+            },
+            P::ChangesSince {
+                req_id,
+                from,
+                lo,
+                hi,
+                max_entries,
+            } => Event::ChangesSince {
+                client: as_client(1),
+                req_id: as_req_id(req_id),
+                from,
+                range: engine::subs::SubRange {
+                    lo: bound(lo),
+                    hi: bound(hi),
+                },
+                max_entries: max_entries as usize,
+            },
+            // Still v1 vocabulary this shell does not serve. Answered as such
             // rather than silently ignored: a client that asked and heard
             // nothing cannot tell "not implemented" from "lost".
-            P::Preload { .. } | P::Subscribe { .. } => {
+            P::Subscribe { .. } | P::AskTrace { .. } => {
                 self.unserved.push(0);
                 return Vec::new();
             }
@@ -642,6 +687,54 @@ impl<B: Blocks> Shell<B> {
                     engine::read::ReadResult::OutOfWarmSpace => protocol::Reply::Unavailable {
                         req_id: req_id.0,
                         blocked_on: [0u8; 32],
+                    },
+                    engine::read::ReadResult::Delta {
+                        changes,
+                        cursor,
+                        new_root,
+                    } => protocol::Reply::Delta {
+                        req_id: req_id.0,
+                        changes: changes.clone(),
+                        cursor: cursor.clone(),
+                        new_root: *new_root,
+                    },
+                    engine::read::ReadResult::FullReloadRequired { new_root } => {
+                        protocol::Reply::FullReloadRequired {
+                            req_id: req_id.0,
+                            new_root: *new_root,
+                        }
+                    }
+                },
+                // A subscribed range moved. PUSHED — no client asked for this
+                // message, which is the whole point of it.
+                Effect::Changed {
+                    sub_id,
+                    new_root,
+                    seq,
+                    why,
+                    ..
+                } => protocol::Reply::Changed {
+                    sub_id: *sub_id,
+                    new_root: *new_root,
+                    seq: *seq,
+                    why: match why {
+                        engine::subs::Why::Diffed => protocol::Why::Diffed,
+                        engine::subs::Why::BlockMissing => protocol::Why::BlockMissing,
+                        engine::subs::Why::Budgeted => protocol::Why::Budgeted,
+                        engine::subs::Why::Stale => protocol::Why::Stale,
+                    },
+                },
+                // A subscribe was taken or refused. Answered either way: a
+                // client that believes it is subscribed and is not waits for
+                // ever, and nothing it can see would tell it so.
+                Effect::Subscribed {
+                    sub_id, accepted, ..
+                } => protocol::Reply::Subscribed {
+                    sub_id: *sub_id,
+                    accepted: match accepted {
+                        engine::subs::Accepted::Yes => protocol::Accepted::Yes,
+                        engine::subs::Accepted::Full => protocol::Accepted::Full,
+                        engine::subs::Accepted::TooWide => protocol::Accepted::TooWide,
                     },
                 },
                 _ => continue,

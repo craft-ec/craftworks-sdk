@@ -49,6 +49,29 @@ pub enum ReadResult {
         cursor: Option<Vec<u8>>,
         complete: bool,
     },
+    /// What changed in a range between two roots.
+    ///
+    /// `None` as a value is a REMOVAL, not an empty value: a reader told an
+    /// empty value keeps a key the writer deleted.
+    Delta {
+        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        /// Continue after this key. `None` means the delta is complete.
+        cursor: Option<Vec<u8>>,
+        /// The root the changes bring the reader TO. Carried so the client can
+        /// record where it now stands without a second question, and so two
+        /// deltas answered across a moving tree cannot be mistaken for one.
+        new_root: Cid,
+    },
+    /// The delta cannot be computed, and a full range read is the answer.
+    ///
+    /// **Not an error, and this is a decision rather than a convenience.** The
+    /// old root's blocks may simply be gone — superseded, holding no demand,
+    /// evicted — and that is an ORDINARY outcome for a reader that was away
+    /// long enough, not a failure of anything. An error here would make every
+    /// caller invent the same fallback, and some of them would invent it
+    /// wrongly or not at all; saying what to do instead makes the degraded
+    /// path the one that gets tested.
+    FullReloadRequired { new_root: Cid },
     /// A block could not be had within the attempt budget. A REPLY, not a
     /// hang: a read that never answers is indistinguishable from a wedged
     /// node, and the caller can do nothing about either.
@@ -69,6 +92,35 @@ pub enum ReadResult {
 pub(crate) enum Want {
     Get(Vec<u8>),
     Scan(Box<ScanSpec>),
+    /// What changed in a range between a root the reader last saw and the
+    /// root now.
+    ///
+    /// **Per TREE.** A delta is the difference between two roots of ONE tree.
+    /// A view assembled over several device trees is NOT the union of their
+    /// per-tree deltas — a tombstone in one tree can REVEAL an older value in
+    /// another, which no per-tree diff mentions because nothing in that tree
+    /// changed. Phase 3 has one tree per identity so the distinction does not
+    /// bite yet; it is stated here so that nothing later assumes the union is
+    /// valid.
+    ///
+    /// A READ like the other two, and deliberately so: it descends, it can
+    /// find a block missing, and it must then park and resume when the block
+    /// lands. Answering a delta from whatever happened to be warm would give
+    /// a SHORTER list of changes than the truth — which is a wrong answer
+    /// shaped exactly like a right one, and the reader would apply it and
+    /// believe it was up to date.
+    Delta(Box<DeltaSpec>),
+}
+
+/// A delta request, in the engine's own encodable representation.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DeltaSpec {
+    /// The root the reader last saw. Where it is standing, not where it wants
+    /// to be.
+    pub from: Cid,
+    pub lo: std::ops::Bound<Vec<u8>>,
+    pub hi: std::ops::Bound<Vec<u8>>,
+    pub max_entries: usize,
 }
 
 /// A scan, in the engine's OWN representation.
@@ -215,6 +267,94 @@ pub(crate) fn attempt<B: Blocks>(
                 Err(ReadError::Corrupt(cid, _)) | Err(ReadError::Mismatch(cid)) => {
                     Attempt::Broken(cid)
                 }
+            }
+        }
+        Want::Delta(spec) => {
+            let r = Range {
+                lo: spec.lo.clone(),
+                hi: spec.hi.clone(),
+                reverse: false,
+                after: None,
+                max_entries: spec.max_entries,
+                max_bytes: usize::MAX,
+            };
+            match freenet_prolly::diff::diff(blocks, &spec.from, root, &r, None) {
+                Ok(page) => {
+                    if !page.need.is_empty() {
+                        // The diff stopped on blocks it does not hold. Its
+                        // change list is "what was found BEFORE it stopped",
+                        // which is not the answer to the question, so it is
+                        // not returned as one.
+                        return Attempt::Need(
+                            page.need
+                                .into_iter()
+                                .take(params.max_fetch_per_round)
+                                .collect(),
+                        );
+                    }
+                    // A changed entry whose value lives in its own block is
+                    // the same hazard as in a scan: materialising what is not
+                    // warm yields an EMPTY value for a key that has one.
+                    let missing: Vec<Cid> = page
+                        .changes
+                        .iter()
+                        .filter_map(|c| match c {
+                            freenet_prolly::diff::Change::Added { new, .. }
+                            | freenet_prolly::diff::Change::Changed { new, .. } => match new {
+                                Value::Ref { cid, .. } if blocks.get(cid).is_none() => Some(*cid),
+                                _ => None,
+                            },
+                            freenet_prolly::diff::Change::Removed { .. } => None,
+                        })
+                        .collect();
+                    if !missing.is_empty() {
+                        return Attempt::Need(
+                            missing
+                                .into_iter()
+                                .take(params.max_fetch_per_round)
+                                .collect(),
+                        );
+                    }
+                    let next = page.next.as_ref().map(|n| n.after.clone());
+                    let changes = page
+                        .changes
+                        .into_iter()
+                        .map(|c| match c {
+                            freenet_prolly::diff::Change::Added { key, new } => {
+                                (key, Some(materialise(blocks, new)))
+                            }
+                            freenet_prolly::diff::Change::Changed { key, new, .. } => {
+                                (key, Some(materialise(blocks, new)))
+                            }
+                            // A removal carries no value. `None` IS the
+                            // change — a reader that dropped the key is
+                            // correct, and one told an empty value is not.
+                            freenet_prolly::diff::Change::Removed { key, .. } => (key, None),
+                        })
+                        .collect();
+                    Attempt::Done(ReadResult::Delta {
+                        changes,
+                        cursor: next,
+                        new_root: *root,
+                    })
+                }
+                Err(freenet_prolly::diff::DiffError::Read(ReadError::Need(ids))) => {
+                    Attempt::Need(ids)
+                }
+                Err(freenet_prolly::diff::DiffError::Read(ReadError::Corrupt(cid, _)))
+                | Err(freenet_prolly::diff::DiffError::Read(ReadError::Mismatch(cid))) => {
+                    Attempt::Broken(cid)
+                }
+                // A resume token from another pair of roots, or an
+                // instruction a diff has no answer for. Neither is a missing
+                // block, so neither is fixed by fetching: it is an empty,
+                // complete delta rather than a retry for ever.
+                // A resume token from another pair of roots, or an
+                // instruction a diff has no answer for. Neither is fixed by
+                // fetching, and an EMPTY delta would tell the reader it is up
+                // to date when nobody checked — so it is sent to the full
+                // read, which is always correct.
+                Err(_) => Attempt::Done(ReadResult::FullReloadRequired { new_root: *root }),
             }
         }
         Want::Scan(spec) => {
