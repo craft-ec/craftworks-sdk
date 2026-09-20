@@ -417,6 +417,26 @@ pub enum Step {
     Reached,
     /// Blocks were fetched. `n` = how many.
     Fetch,
+
+    // ---- the SDK's own boundaries ----
+    //
+    // ONE event vocabulary, so a test's dump, the harness's tables,
+    // `db.trace` and the builder's viewer all read the same words. These are
+    // recorded client-side rather than sent by the engine, and they are here
+    // rather than in a second enum for exactly that reason: a trace that
+    // stops at the wire is a trace that cannot show why a binding did not
+    // update.
+    /// A client subscription to a tree's HEAD contract was asked for.
+    /// `n` = 1 if it was accepted.
+    HeadWatch,
+    /// The node pushed "this head moved". `n` = how many bindings it woke.
+    HeadMoved,
+    /// A binding reloaded. `n` = rows it now holds.
+    Reloaded,
+    /// A binding looked and nothing had moved. `n` = 0.
+    Quiet,
+    /// A live binding lost its notifier and is on the backstop alone.
+    Downgraded,
 }
 
 /// What kind of message woke an engine call.
