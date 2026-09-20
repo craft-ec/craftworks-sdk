@@ -353,6 +353,22 @@ pub struct Params {
     /// Largest write that may be parked. Its ops ride in the context, so this
     /// is a slice of the 400 KiB the platform allows.
     pub max_parked_write_bytes: usize,
+    /// How many reads may be waiting on the network at once.
+    ///
+    /// Each costs the context about 130 B, measured. Unbounded, ten thousand
+    /// of them make a 1.3 MB context -- three times what the platform will
+    /// store -- and `to_context` then fails, which loses the IN-FLIGHT COMMIT
+    /// as well. A read burst must not be able to destroy a write, so reads
+    /// get a slice of the budget and are refused at its edge.
+    pub max_parked_reads: usize,
+    /// Blocks one commit may name.
+    ///
+    /// The commit's bookkeeping carries a Cid for every block it is waiting
+    /// on, about 60 B each in the context (measured). `max_backlog` bounds a
+    /// commit in BYTES, which says nothing about how many blocks those bytes
+    /// become: eight megabytes of small values is thousands of them, and the
+    /// context would not fit. This is the bound that closes the arithmetic.
+    pub max_commit_blocks: usize,
     /// Emit the head as soon as the commit is planned, without waiting for
     /// its packs to be read back. The control for (c): a head that names a
     /// root whose blocks are not all there is a tree no reader can walk, and
@@ -388,6 +404,8 @@ impl Default for Params {
             context_carries_pending: true,
             max_apply_rounds: 32,
             max_parked_write_bytes: 128 * 1024,
+            max_parked_reads: 1000,
+            max_commit_blocks: 2048,
             head_before_packs: false,
         }
     }
@@ -850,7 +868,34 @@ impl<B: Blocks> Engine<B> {
                 held: BTreeSet::from([root]),
             },
         );
-        self.drive(req_id)
+        let out = self.drive(req_id);
+        // The cap is checked AFTER the attempt, not before it. A read the
+        // node can already answer is parked and unparked within this call and
+        // costs the context nothing, so refusing it at the door would refuse
+        // the cheap case to protect a budget it never touches. What is
+        // bounded is the reads still WAITING when the call ends.
+        if self.reads.parked.len() > self.params.max_parked_reads
+            && self.reads.parked.contains_key(&req_id)
+        {
+            let blocked = out
+                .iter()
+                .find_map(|f| match f {
+                    Effect::FetchBlock { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or(root);
+            self.reads.parked.remove(&req_id);
+            self.forget_waiting(req_id);
+            // A reply, not silence. The caller can retry when the burst
+            // clears; a read that is simply dropped leaves it waiting for an
+            // answer that is never coming.
+            return vec![Effect::Reply {
+                client,
+                req_id,
+                result: read::ReadResult::Unavailable(blocked),
+            }];
+        }
+        out
     }
 
     /// Advance one parked read as far as what is warm allows.
@@ -1103,6 +1148,19 @@ impl<B: Blocks> Engine<B> {
                 }];
             }
         };
+        // Refused AFTER the apply and BEFORE anything is kept. The apply is a
+        // pure function that wrote to a local sink, so discarding it costs
+        // the work and nothing else — and the count is not knowable before
+        // running it. Nothing below this line has happened yet, so the write
+        // leaves no trace, which is what `Busy` promises.
+        if emitted.len() > self.params.max_commit_blocks {
+            self.parked_write = None;
+            return vec![Effect::Notify {
+                client,
+                write_id,
+                state: State::Busy,
+            }];
+        }
         // It applied, so it is no longer parked.
         self.parked_write = None;
         // The blocks are NOT kept. A delegate's memory is fresh on every call,
@@ -1160,7 +1218,14 @@ impl<B: Blocks> Engine<B> {
         // The ops ride in the context until the write applies. A batch too
         // big to carry is refused now rather than parked and lost at the next
         // call, when `to_context` would be the thing that failed.
-        if size > self.params.max_parked_write_bytes {
+        //
+        // Measured on the SERIALIZED ops, not on `size`. `size` is the payload
+        // -- keys plus values -- and a batch of 130,000 one-byte keys has a
+        // payload of 128 KiB and a serialized cost of megabytes, so a payload
+        // cap would have let exactly the state through that it exists to
+        // refuse. Serializing here is the park path, which is rare.
+        let parked_cost = bincode::serialized_size(&ops).unwrap_or(u64::MAX) as usize;
+        if parked_cost > self.params.max_parked_write_bytes {
             self.parked_write = None;
             return vec![Effect::Notify {
                 client,

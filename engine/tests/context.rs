@@ -169,3 +169,300 @@ fn a_context_round_trips_and_refuses_what_it_cannot_read() {
         bytes.len()
     );
 }
+
+/// What the context actually costs, for the shapes that can grow.
+///
+/// Numbers, not adjectives: the platform gives a delegate 400 KiB of context
+/// (`DelegateContext::MAX_SIZE` = 4096*10*10), and every cap in `Params` is a
+/// slice of that. This prints the measured size of each shape so the caps can
+/// be read against something, and asserts the ones that must stay small.
+#[test]
+fn the_context_costs_what_it_is_budgeted() {
+    const PLATFORM: usize = 4096 * 10 * 10;
+    let p = Params::default();
+
+    // Idle: a started engine with a head and nothing in flight.
+    let mut store = Store::default();
+    let mut e = Engine::new(p, store.clone());
+    let _ = e.step(Event::Start {
+        key: engine::KeySource::SecretStore,
+        epochs: vec![engine::Epoch(1)],
+    });
+    let idle = e.to_context().expect("idle").len();
+
+    // One commit in flight over ~1 MiB of values. This is the shape that
+    // grows with the SIZE of a write: the commit's bookkeeping names every
+    // block it is waiting on, one Cid each.
+    //
+    // The values are over `max_packed_value`, so each is PUT on its own. A
+    // first attempt used 4 KiB values, and the whole megabyte rode in ONE
+    // pack -- one id in the bookkeeping, and a number that said nothing about
+    // per-block cost. The `blocks > 10` floor below is what caught it.
+    let mut e = Engine::new(p, store.clone());
+    let ops: Vec<(Vec<u8>, Op)> = (0..16u32)
+        .map(|i| {
+            (
+                format!("k/{i:05}").into_bytes(),
+                Op::Put(vec![(i % 251) as u8; p.max_packed_value + 1]),
+            )
+        })
+        .collect();
+    let out = e.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops,
+    });
+    store.absorb(&out);
+    let in_flight = e.to_context().expect("in flight").len();
+    let blocks = out
+        .iter()
+        .filter(|f| {
+            matches!(
+                f,
+                Effect::PutPack { .. } | Effect::PutBlock { .. } | Effect::PutParity { .. }
+            )
+        })
+        .count();
+
+    println!("  idle:                      {idle:6} B");
+    println!("  ~1 MiB commit in flight:   {in_flight:6} B  ({blocks} blocks)");
+    println!(
+        "  ...per block:              {:6} B",
+        (in_flight - idle) / blocks.max(1)
+    );
+    println!("  platform limit:            {PLATFORM:6} B");
+    println!("  max_context_bytes:         {:6} B", p.max_context_bytes);
+
+    assert!(
+        idle < 1024,
+        "an idle engine carries {idle} B of context; it holds a head and \
+         nothing else"
+    );
+    assert!(
+        p.max_context_bytes < PLATFORM,
+        "max_context_bytes ({}) leaves no headroom under the platform's {PLATFORM} B",
+        p.max_context_bytes
+    );
+    // The point of printing `blocks`: if a 1 MiB write produced two blocks,
+    // the in-flight number would be small for a reason that says nothing
+    // about the shape this is measuring.
+    assert!(
+        blocks > 10,
+        "a 1 MiB write produced only {blocks} block(s), so this does not \
+         measure a commit's per-block bookkeeping"
+    );
+    assert!(
+        in_flight < p.max_context_bytes,
+        "a 1 MiB commit's context is {in_flight} B, over the {} B budget",
+        p.max_context_bytes
+    );
+}
+/// Every shape at its cap still fits the budget, and a burst past a cap is
+/// answered rather than allowed to destroy the context.
+///
+/// The measured costs: an idle engine is 125 B, a parked read about 131 B,
+/// and a commit's bookkeeping about 60 B per block in flight. Unbounded, ten
+/// thousand parked reads make a 1.31 MB context — over three times the
+/// platform's 400 KiB — and `to_context` then fails, taking the IN-FLIGHT
+/// COMMIT with it. A read burst must not be able to destroy a write.
+///
+/// The shapes are measured APART and summed, because they cannot be built
+/// together: a commit needs a tree path it can read, and a parked read is one
+/// that could not read the tree. Summing is the conservative direction. A
+/// parked write and a pending commit are genuinely exclusive — a write is
+/// refused while either is set — so the worst case is reads plus the LARGER
+/// of those two, and the arithmetic below says so rather than assuming it.
+#[test]
+fn the_budget_holds_with_every_shape_at_its_cap() {
+    let p = Params::default();
+    let store = Store::default();
+    let idle = {
+        let mut e = Engine::new(p, store.clone());
+        let _ = e.step(Event::Start {
+            key: engine::KeySource::SecretStore,
+            epochs: vec![engine::Epoch(1)],
+        });
+        e.to_context().expect("idle").len()
+    };
+
+    // --- reads at their cap, and a burst well past it ---
+    let mut e = Engine::new(p, store.clone());
+    let _ = e.step(Event::Start {
+        key: engine::KeySource::SecretStore,
+        epochs: vec![engine::Epoch(1)],
+    });
+    // A root the store does not hold, so every read parks rather than being
+    // answered from the empty tree.
+    let _ = e.step(Event::HeadRead {
+        epoch: engine::Epoch(1),
+        seq: 1,
+        root: [7u8; 32],
+    });
+    let burst = p.max_parked_reads * 10;
+    let mut refused = 0usize;
+    for i in 0..burst {
+        let out = e.step(Event::Get {
+            client: ClientId(1),
+            req_id: engine::read::ReqId(i as u64),
+            key: format!("k/{i:09}").into_bytes(),
+        });
+        if out.iter().any(|f| {
+            matches!(
+                f,
+                Effect::Reply {
+                    result: engine::read::ReadResult::Unavailable(_),
+                    ..
+                }
+            )
+        }) {
+            refused += 1;
+        }
+    }
+    let reads = e.to_context().expect("the cap must keep it writable").len();
+    assert_eq!(
+        refused,
+        burst - p.max_parked_reads,
+        "{refused} of {burst} reads were refused; every read past the cap \
+         owes the caller an answer, and none before it may be refused"
+    );
+
+    // --- a commit at the block cap, measured on a tree that can be read ---
+    // Against the empty tree, so the apply succeeds and a commit really does
+    // open. An earlier version measured this on the fake root above: the
+    // apply stopped on a cold block, no commit opened, and "a commit fits
+    // beside the reads" was asserted over a context with no commit in it.
+    let mut e2 = Engine::new(p, store.clone());
+    let _ = e2.step(Event::Start {
+        key: engine::KeySource::SecretStore,
+        epochs: vec![engine::Epoch(1)],
+    });
+    // Values over max_packed_value are PUT one each, so the block count is
+    // the number of keys and the cap is reachable without 8 MiB of data.
+    let n = 64u32;
+    let ops: Vec<(Vec<u8>, Op)> = (0..n)
+        .map(|i| {
+            (
+                format!("w/{i:05}").into_bytes(),
+                Op::Put(vec![(i % 251) as u8; p.max_packed_value + 1]),
+            )
+        })
+        .collect();
+    let out = e2.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops,
+    });
+    let commit_blocks = out
+        .iter()
+        .filter(|f| matches!(f, Effect::PutPack { .. } | Effect::PutBlock { .. }))
+        .count();
+    assert!(
+        commit_blocks >= n as usize,
+        "the commit named {commit_blocks} block(s) for {n} oversized values, \
+         so this does not measure per-block bookkeeping"
+    );
+    let commit = e2.to_context().expect("a commit in flight").len();
+    let per_block = (commit - idle) / commit_blocks;
+    // What the cap costs, at the per-block rate this just measured.
+    let commit_worst = idle + per_block * p.max_commit_blocks;
+    let write_worst = idle + p.max_parked_write_bytes;
+    let worst = reads + commit_worst.max(write_worst);
+
+    println!("  idle:                        {idle:6} B");
+    println!(
+        "  {:4} parked reads (the cap):  {reads:6} B",
+        p.max_parked_reads
+    );
+    println!("  commit of {commit_blocks:3} blocks:        {commit:6} B  ({per_block} B/block)");
+    println!(
+        "  commit at its cap ({:4}):    {commit_worst:6} B",
+        p.max_commit_blocks
+    );
+    println!("  parked write at its cap:     {write_worst:6} B");
+    println!("  WORST CASE:                  {worst:6} B");
+    println!("  budget:                      {:6} B", p.max_context_bytes);
+    println!("  platform:                    {:6} B", 4096 * 10 * 10);
+
+    assert!(
+        worst < p.max_context_bytes,
+        "every shape at its cap costs {worst} B, over the {} B budget: the \
+         caps do not add up and a legal state cannot be written",
+        p.max_context_bytes
+    );
+    // ...and the test is near the thing it claims to check. Without this,
+    // caps of 1 would pass it.
+    assert!(
+        worst > p.max_context_bytes / 2,
+        "the worst case is {worst} B against a {} B budget, so this asserts \
+         almost nothing about the caps",
+        p.max_context_bytes
+    );
+}
+
+/// The commit block cap refuses the write, and leaves no trace.
+#[test]
+fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
+    let cap = 8usize;
+    let p = Params {
+        max_commit_blocks: cap,
+        ..Params::default()
+    };
+    let store = Store::default();
+    let big = |n: u32| -> Vec<(Vec<u8>, Op)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("w/{i:05}").into_bytes(),
+                    Op::Put(vec![(i % 251) as u8; p.max_packed_value + 1]),
+                )
+            })
+            .collect()
+    };
+    let run = |ops: Vec<(Vec<u8>, Op)>| -> (Vec<Effect>, Cid, Cid) {
+        let mut e = Engine::new(p, store.clone());
+        let _ = e.step(Event::Start {
+            key: engine::KeySource::SecretStore,
+            epochs: vec![engine::Epoch(1)],
+        });
+        let before = e.root();
+        let out = e.step(Event::Write {
+            client: ClientId(1),
+            write_id: WriteId(1),
+            ops,
+        });
+        let after = e.root();
+        (out, before, after)
+    };
+
+    let (out, before, after) = run(big(cap as u32 * 4));
+    assert!(
+        out.iter().any(|f| matches!(
+            f,
+            Effect::Notify {
+                state: engine::State::Busy,
+                ..
+            }
+        )),
+        "a write naming more than {cap} blocks was not refused"
+    );
+    assert_eq!(
+        before, after,
+        "the refused write changed the tree, so it was applied AND refused"
+    );
+
+    // The control: a write UNDER the cap, otherwise identical, is accepted.
+    let (out, before, after) = run(big(2));
+    assert!(
+        out.iter().any(|f| matches!(
+            f,
+            Effect::Notify {
+                state: engine::State::Accepted,
+                ..
+            }
+        )),
+        "a write under the same cap was refused too, so the cap is not what \
+         refused the larger one"
+    );
+    assert_ne!(before, after, "the accepted write did not reach the tree");
+    println!("  over the block cap: Busy, tree untouched; under it: Accepted");
+}

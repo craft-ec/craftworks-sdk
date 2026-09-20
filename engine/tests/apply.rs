@@ -362,3 +362,52 @@ fn one_arrival_answers_both_a_parked_read_and_a_parked_write() {
     );
     println!("  one block stream answered a parked read and a parked write");
 }
+
+/// A parked write is capped on what it COSTS the context, not on its payload.
+///
+/// The cap was on payload bytes — keys plus values — and a batch of many tiny
+/// ops has a small payload and a large serialized cost. Under a 128 KiB
+/// payload cap, 130,000 one-byte keys weigh 128 KiB of payload and megabytes
+/// of context, which is exactly the state the cap exists to refuse.
+#[test]
+fn a_parked_write_of_many_tiny_ops_is_capped_on_what_it_costs() {
+    let cap = 16 * 1024usize;
+    let params = Params {
+        max_parked_write_bytes: cap,
+        ..Params::default()
+    };
+    let (_, root, all) = fixture(400);
+    let cold = Store::fresh();
+    cold.put(root, all.get(&root).expect("the root"));
+    let mut h = started(Mode::Rehydrate, params, cold, root);
+
+    // Payload well under the cap; serialized cost well over it. Each op is a
+    // 6-byte key and a 1-byte value: 7 B of payload, ~25 B encoded.
+    let n = cap / 8;
+    let ops: Vec<(Vec<u8>, Op)> = (0..n)
+        .map(|i| (format!("t{i:05}").into_bytes(), Op::Put(vec![1u8])))
+        .collect();
+    let payload: usize = ops
+        .iter()
+        .map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 })
+        .sum();
+    assert!(
+        payload < cap,
+        "the fixture's payload is {payload} B, over the {cap} B cap: it would \
+         be refused by a payload cap too, and would not show the difference"
+    );
+
+    let out = h.step(Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(1),
+        ops,
+    });
+    assert_eq!(
+        states(&out),
+        vec![State::Busy],
+        "a write whose payload is {payload} B (under the {cap} B cap) but \
+         whose context cost is far over it was parked anyway"
+    );
+    assert_eq!(fetches(&out).len(), 0, "a refused write asked for blocks");
+    println!("  {n} tiny ops: {payload} B of payload, refused on context cost");
+}
