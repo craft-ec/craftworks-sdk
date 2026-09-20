@@ -41,7 +41,11 @@ const rethrow = e => {
   throw e;
 };
 
-export function engineDb(session) {
+export function engineDb(handle) {
+  // Either the object `openSession` returns, or a bare session. The wrapper
+  // is what knows when a message arrived, so when there is one this registers
+  // with it and a parked read is woken by the answer rather than by a clock.
+  const session = handle.session ?? handle;
   // Reads parked on a load, by ticket id. Resolved when the SESSION says the
   // load ended — which happens on the task that handles the websocket
   // message, not on a timer and not in a microtask.
@@ -62,6 +66,9 @@ export function engineDb(session) {
       for (const w of waiters) (ok ? w.resolve : w.reject)(code);
     }
   };
+
+  // Woken by the page, on the task that handled the message.
+  handle.onReadsWake?.(() => drain());
 
   /** Wait for the load this read is parked on. */
   const waitFor = ticket =>

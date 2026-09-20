@@ -1,3 +1,6 @@
+import { openSession, SHIPPED_ARTEFACTS } from "./session.js";
+import { engineDb } from "./engine-db.js";
+
 // Plain-object API over the wasm surface. `raw` is the wasm-bindgen module.
 //
 //   const db = new sdk.Db();
@@ -106,5 +109,22 @@ export function wrap(raw) {
   // a default: a value this file invented would be a version display that can
   // be confidently wrong, which is worse than none.
   const buildInfo = () => JSON.parse(raw.buildInfo());
-  return { version: raw.version, buildInfo, blockId: raw.blockId, parseBlockId, Db };
+  // The ENGINE-BACKED path, beside the in-memory one. An app uses `Db`
+  // until it is published and the same methods afterwards; the SDK's own
+  // `surfaces_agree` gate fails if the two ever differ.
+  //
+  // Exposed from here rather than imported directly by an app, so there is
+  // ONE place that knows how the SDK is assembled — the same reason `load`
+  // exists.
+  return {
+    version: raw.version,
+    buildInfo,
+    blockId: raw.blockId,
+    parseBlockId,
+    Db,
+    Session: raw.Session,
+    openSession,
+    engineDb,
+    SHIPPED_ARTEFACTS,
+  };
 }
