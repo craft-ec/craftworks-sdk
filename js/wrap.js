@@ -29,5 +29,11 @@ export function wrap(raw) {
   // that whoever RECEIVES it can check it. It throws on anything that is not a
   // block id, so callers that merely want to test a string should catch.
   const parseBlockId = (text) => JSON.parse(raw.parseBlockId(text));
-  return { version: raw.version, blockId: raw.blockId, parseBlockId, Db };
+  // What this build IS: { version, rev, prollyRev, formatTag }. Every field is
+  // baked into the wasm, so a caller that pins a revision can check that the
+  // bytes it loaded came from the revision it asked for. Nothing here supplies
+  // a default: a value this file invented would be a version display that can
+  // be confidently wrong, which is worse than none.
+  const buildInfo = () => JSON.parse(raw.buildInfo());
+  return { version: raw.version, buildInfo, blockId: raw.blockId, parseBlockId, Db };
 }

@@ -21,6 +21,24 @@ pub use schema::{Field, Kind, Schema};
 pub use store::{Edit, MemStore, Store};
 pub use tree_store::{Stats, TreeStore};
 
+/// The tree format tag every node carries, from the library that writes them.
+///
+/// Read from `freenet_prolly` rather than written down here. A tag this crate
+/// spelled itself would keep reporting `PT01` the day the library moved on,
+/// which is precisely the drift a version panel exists to catch.
+pub fn format_tag() -> &'static str {
+    // `MAGIC` is four ASCII bytes by construction, asserted below.
+    std::str::from_utf8(freenet_prolly::node::MAGIC).expect("the format tag is ASCII")
+}
+
+/// The commit this build came from, as `build.rs` stamped it. `unknown` when
+/// nothing could say — which a consumer must treat as a mismatch, not as an
+/// absence.
+pub const BUILD_REV: &str = env!("SDK_BUILD_REV");
+
+/// The `freenet-prolly` revision this build LINKS, from `Cargo.lock`.
+pub const PROLLY_REV: &str = env!("SDK_PROLLY_REV");
+
 /// Lower-case hex of `bytes`.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -44,6 +62,31 @@ pub mod js {
     #[wasm_bindgen]
     pub fn version() -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// What this build IS, as JSON: `{version, rev, prollyRev, formatTag}`.
+    ///
+    /// The point of it is `rev`. A consumer that pins an SDK revision and copies
+    /// the built wasm into its own tree has, until now, had no way to check that
+    /// the bytes it copied came from the revision it asked for — a stale copy
+    /// and a fresh one are indistinguishable. `rev` is baked from the SOURCE by
+    /// `build.rs` (see that file for why it must not be passed in), so a
+    /// consumer can compare it against the rev it recorded and find out.
+    ///
+    /// `formatTag` is read from the linked tree library rather than spelled
+    /// here: a tag this crate wrote down could drift from the tag the trees
+    /// actually carry, which is the failure it exists to make visible.
+    #[wasm_bindgen(js_name = buildInfo)]
+    pub fn build_info() -> String {
+        let mut m = Map::new();
+        m.insert("version".into(), Value::from(env!("CARGO_PKG_VERSION")));
+        m.insert("rev".into(), Value::from(env!("SDK_BUILD_REV")));
+        m.insert("prollyRev".into(), Value::from(env!("SDK_PROLLY_REV")));
+        m.insert(
+            "formatTag".into(),
+            Value::from(crate::format_tag().to_string()),
+        );
+        Value::Object(m).to_string()
     }
 
     /// The id of a block of opaque bytes holding `bytes` — `raw:<64 hex>`.
