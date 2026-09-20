@@ -17,7 +17,7 @@ use crate::{ClientId, Params};
 use freenet_prolly::node::Value;
 use freenet_prolly::range::{range_with, Options as RangeOptions, PageEnd, Range, RangeError};
 use freenet_prolly::read::get;
-use freenet_prolly::store::{Blocks, MemBlocks, ReadError};
+use freenet_prolly::store::{Blocks, ReadError};
 use freenet_prolly::{block_id, kind, Cid};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -133,8 +133,8 @@ pub(crate) enum Attempt {
     Broken(Cid),
 }
 
-pub(crate) fn attempt(
-    blocks: &MemBlocks,
+pub(crate) fn attempt<B: Blocks>(
+    blocks: &B,
     params: &Params,
     want: &Want,
     root: &Cid,
@@ -227,7 +227,7 @@ pub(crate) fn attempt(
 /// Only called once the value's block is known to be warm: the callers above
 /// turn a missing one into a fetch, because defaulting it to empty would
 /// answer a question wrongly rather than not answering it.
-fn materialise(blocks: &MemBlocks, v: Value<'_>) -> Vec<u8> {
+fn materialise<B: Blocks>(blocks: &B, v: Value<'_>) -> Vec<u8> {
     match v {
         Value::Inline(b) => b.to_vec(),
         Value::Ref { cid, .. } => blocks
@@ -245,7 +245,7 @@ fn materialise(blocks: &MemBlocks, v: Value<'_>) -> Vec<u8> {
 /// what this module exists not to do — so this walks the same path only to
 /// count it, and if it ever disagreed with the real descent the cost number
 /// would be wrong while every answer stayed right.
-fn count_nodes(blocks: &MemBlocks, root: &Cid, key: &[u8], out: &mut usize) {
+fn count_nodes<B: Blocks>(blocks: &B, root: &Cid, key: &[u8], out: &mut usize) {
     let mut cur = *root;
     while let Some(bytes) = blocks.get(&cur) {
         let Ok(node) = freenet_prolly::node::Node::parse(bytes) else {

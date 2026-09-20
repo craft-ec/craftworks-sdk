@@ -25,9 +25,9 @@
 //! bytes under the same id, so nothing has to be flagged, only done.
 
 use freenet_prolly::apply::{apply_with, Edit as TreeEdit, Options as ApplyOptions};
-use freenet_prolly::build::init;
+use freenet_prolly::chunk::empty_leaf;
 use freenet_prolly::node::Node;
-use freenet_prolly::store::{Blocks, MemBlocks};
+use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -268,25 +268,16 @@ pub struct Params {
     pub max_attempts: u32,
     /// Two requests needing one block share its fetch. Off = the control.
     pub share_fetches: bool,
-    /// Bytes the warm set may hold. Eviction never drops a block a parked
-    /// read or an unpublished commit still needs.
-    pub max_warm_bytes: usize,
     /// Ceilings on an advisory preload: roots, blocks, bytes. A preload may
     /// make reads SOONER, never more or wider, so a hostile manifest costs
     /// the budget and not what it asked for.
     pub preload_roots: usize,
     pub preload_blocks: usize,
     pub preload_bytes: usize,
-    /// On a miss, also ask for every block the warm nodes name — a plausible
-    /// "fetch ahead" a reader might write, and the control for the cost
-    /// bound. A bound no implementation can exceed is not a bound.
-    pub fetch_greedily: bool,
-    /// Pin every block a parked read has been handed, until it replies. Off
-    /// is the control, and the state this engine was in: a tight warm set
-    /// evicts the path a read just paid for, the read re-fetches it, the
-    /// fetch SUCCEEDS so the attempt budget never trips, and nothing ever
-    /// ends.
-    pub pin_parked_reads: bool,
+    /// Ask again for blocks the node already holds — a plausible
+    /// implementation, and the control for the read cost bound. A bound no
+    /// implementation can exceed is not a bound.
+    pub refetch_held: bool,
     /// Count the nodes a descent would touch. It is a second walk, for the
     /// cost gate and nothing else, so it is off unless a test asks.
     pub count_descent: bool,
@@ -323,12 +314,10 @@ impl Default for Params {
             max_fetch_per_round: 8,
             max_attempts: 3,
             share_fetches: true,
-            max_warm_bytes: 64 * 1024 * 1024,
             preload_roots: 4,
             preload_blocks: 256,
             preload_bytes: 4 * 1024 * 1024,
-            fetch_greedily: false,
-            pin_parked_reads: true,
+            refetch_held: false,
             count_descent: false,
             max_accept_age: 64,
             bound_accept_age: true,
@@ -379,11 +368,46 @@ struct Commit {
 }
 
 /// The write pipeline.
-pub struct Engine {
+/// A block source that also answers for the EMPTY LEAF.
+///
+/// A brand-new device's tree is one empty leaf, and until its first commit is
+/// published nothing on the network holds it. That is not a block the engine
+/// "keeps": `empty_leaf()` is a pure function of the format, so knowing it is
+/// knowing a constant, the same way the engine knows what a pack header looks
+/// like. Everything else goes to the real source.
+struct WithEmptyLeaf<'a, B: Blocks> {
+    inner: &'a B,
+    empty_cid: Cid,
+    empty_bytes: &'a [u8],
+}
+
+impl<B: Blocks> Blocks for WithEmptyLeaf<'_, B> {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        // The real source first: once the leaf is published the node's copy is
+        // the one to use, and it is byte-identical anyway.
+        self.inner.get(cid).or_else(|| {
+            if *cid == self.empty_cid {
+                Some(self.empty_bytes)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+pub struct Engine<B: Blocks> {
+    /// The empty leaf, which a device with no head has as its root and which
+    /// nothing on the network holds until the first commit publishes it.
+    /// A constant of the format, not a cache.
+    empty: freenet_prolly::chunk::Closed,
+    /// Where blocks come from. The core owns NO block bytes: a delegate's
+    /// memory is fresh on every call, so anything it "kept" would be gone by
+    /// the next one. What it can do is ASK — and on a node that is the
+    /// synchronous local read (F14), which sees what this node already holds.
+    blocks: B,
     params: Params,
     /// The warm tree: every block this engine has written. In slice 1 it is
     /// also the only place they exist, because there is no node yet.
-    blocks: MemBlocks,
     root: Cid,
     /// The last head the network has confirmed, and its root. Recovery starts
     /// from here, never from the warm tree.
@@ -441,12 +465,6 @@ pub struct Engine {
     coded_since_commit: BTreeSet<ParityIds>,
     /// Everything the read path is waiting on.
     reads: read::Reads,
-    /// Bytes held warm, kept as a RUNNING total. Re-summing every block on
-    /// every arrival is O(n) per block and so O(n^2) to warm a tree.
-    warm_bytes: usize,
-    /// When each warm block was last written or delivered, for LRU eviction.
-    last_used: BTreeMap<Cid, u64>,
-    use_clock: u64,
     /// Nodes parsed on the write path. A cost counter, not a statistic: the
     /// whole point of the diff walk is that this stays proportional to the
     /// tree's DEPTH, and a test that does not measure it would not notice the
@@ -455,19 +473,13 @@ pub struct Engine {
     now: u64,
 }
 
-impl Default for Engine {
-    fn default() -> Self {
-        Engine::new(Params::default())
-    }
-}
-
-impl Engine {
+impl<B: Blocks> Engine<B> {
     /// Anything a caller can set must not be able to panic the core later.
     /// `max_packed_value` above `max_pack` describes a value that must ride in
     /// a pack and cannot fit in one; the planner would reach an `unreachable!`
     /// three steps away, where nothing points back at the setting that caused
     /// it. Refused here instead, naming both numbers.
-    pub fn new(params: Params) -> Self {
+    pub fn new(params: Params, blocks: B) -> Self {
         assert!(
             params.max_packed_value + pack::member_cost(0) + pack::PACK_HEADER <= params.max_pack,
             "max_packed_value ({}) cannot fit in a pack of max_pack ({}): a value \
@@ -479,10 +491,11 @@ impl Engine {
             params.max_pack > pack::PACK_HEADER,
             "max_pack holds no members"
         );
-        let mut blocks = MemBlocks::default();
-        let root = init(&mut blocks);
+        let empty = empty_leaf();
+        let root = empty.cid;
         Engine {
             params,
+            empty,
             blocks,
             root,
             published_seq: 0,
@@ -504,9 +517,6 @@ impl Engine {
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
             reads: read::Reads::default(),
-            warm_bytes: 0,
-            last_used: BTreeMap::new(),
-            use_clock: 0,
             nodes_parsed: 0,
             now: 0,
         }
@@ -614,11 +624,9 @@ impl Engine {
         if let Some(epoch) = self.epochs.first().copied() {
             return vec![Effect::ReadHead { epoch }];
         }
-        let mut blocks = MemBlocks::default();
-        let root = init(&mut blocks);
-        self.blocks = blocks;
-        self.warm_bytes = 0;
-        self.adopt(0, root);
+        // A device with no head starts from the empty tree. Its root is a
+        // constant, not something to fetch.
+        self.adopt(0, self.empty.cid);
         self.recovered = true;
         Vec::new()
     }
@@ -709,13 +717,15 @@ impl Engine {
             return Vec::new();
         };
         let mut out = Vec::new();
-        match read::attempt(
-            &self.blocks,
-            &self.params,
-            &p.want,
-            &p.root,
-            &mut self.nodes_parsed,
-        ) {
+        // The counter is taken OUT for the call: `source()` borrows the
+        // engine, and a cost counter is not worth an interior-mutability cell.
+        let mut parsed = self.nodes_parsed;
+        let outcome = {
+            let source = self.source();
+            read::attempt(&source, &self.params, &p.want, &p.root, &mut parsed)
+        };
+        self.nodes_parsed = parsed;
+        match outcome {
             read::Attempt::Done(result) => {
                 self.reads.parked.remove(&req_id);
                 self.forget_waiting(req_id);
@@ -751,30 +761,19 @@ impl Engine {
                     levels_total: levels_done + 1,
                 });
                 let mut ids = ids;
-                if self.params.fetch_greedily {
-                    // Everything any warm node names, whether or not this read
-                    // needs it.
-                    let named: Vec<Cid> = self
-                        .blocks
-                        .0
-                        .values()
-                        .filter_map(|b| Node::parse(b).ok())
-                        .filter(|n| !n.is_leaf())
-                        .flat_map(|n| (0..n.len()).map(move |i| n.child(i).0).collect::<Vec<_>>())
-                        .collect();
-                    // Capped, or the control never terminates and measures
-                    // nothing. It still blows the bound many times over.
-                    ids.extend(named.into_iter().take(64));
+                // Never ask for what the node already holds. `Page::need` can
+                // name blocks an earlier round brought in, and a reader that
+                // re-fetches them makes no progress at all.
+                //
+                // `refetch_held` is the control for the cost bound: with it on
+                // the engine asks again for everything, which is a plausible
+                // implementation and blows the bound many times over. The old
+                // control enumerated the whole warm set, which a core that
+                // owns no blocks cannot do.
+                if !self.params.refetch_held {
+                    ids.retain(|id| self.blocks.get(id).is_none());
                 }
-                // Never ask for what is already here. `Page::need` can name
-                // blocks a previous round already brought in, and a reader
-                // that re-fetches them makes no progress at all.
-                ids.retain(|id| self.blocks.get(id).is_none());
-                let cap = if self.params.fetch_greedily {
-                    usize::MAX
-                } else {
-                    self.params.max_fetch_per_round
-                };
+                let cap = self.params.max_fetch_per_round;
                 for id in ids.into_iter().take(cap) {
                     if self.reads.want(id, req_id, self.params.share_fetches) {
                         let attempt = *self.reads.attempts.entry(id).or_insert(0);
@@ -845,9 +844,14 @@ impl Engine {
 
         let old_root = self.root;
         let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
+        let source = WithEmptyLeaf {
+            inner: &self.blocks,
+            empty_cid: self.empty.cid,
+            empty_bytes: &self.empty.bytes,
+        };
         let applied = match apply_with(
             ApplyOptions::default(),
-            &self.blocks,
+            &source,
             &self.root,
             &batch,
             |c, b: &[u8]| emitted.push((c, b.to_vec())),
@@ -864,9 +868,9 @@ impl Engine {
                 }]
             }
         };
-        for (c, b) in &emitted {
-            self.blocks.insert(*c, b);
-        }
+        // The blocks are NOT kept. A delegate's memory is fresh on every call,
+        // so anything retained here is gone by the next one; they are emitted
+        // in this same step and read back from the node afterwards.
         self.root = applied.root;
         self.record_owed(old_root, &applied.parity, &emitted);
         // What this commit, or the next one, must ship. Collected here because
@@ -1453,7 +1457,7 @@ fn kind_raw() -> u8 {
     freenet_prolly::kind::RAW
 }
 
-impl Engine {
+impl<B: Blocks> Engine<B> {
     /// A fetched block came back.
     ///
     /// Rule 3: hash-checked against the id it was asked for BEFORE it touches
@@ -1471,17 +1475,19 @@ impl Engine {
         // parked reads at once. Its members are checked the same way: a pack
         // is a transport, and the blocks inside are the same blocks with the
         // same ids.
+        //
+        // The engine does not STORE any of it. The node holds what it fetched
+        // (a GET populates its store), and the engine reads through `Blocks`
+        // on the next call. All this does is check what arrived and wake
+        // whoever was waiting — the checking still matters, because a block
+        // that is not what was asked for must not be treated as an answer.
         if freenet_prolly::block_id(pack::PACK_KIND, &bytes) == id {
             for (mid, mbytes) in pack::members(&bytes) {
                 if read::matches_id(&mid, &mbytes) {
-                    out.extend(self.remember(mid, &mbytes));
                     self.reads.in_pack.insert(mid, id);
                     landed.push(mid);
                 }
             }
-        } else {
-            let n = self.remember(id, &bytes);
-            out.extend(n);
         }
 
         let mut woken: BTreeSet<read::ReqId> = BTreeSet::new();
@@ -1592,118 +1598,6 @@ impl Engine {
         out
     }
 
-    /// Put a block in the warm set, within its bound.
-    ///
-    /// Rule 8: eviction never drops a block a parked read or an unpublished
-    /// commit still needs — evicting those would turn a bounded cache into a
-    /// cause of the very fetches it exists to avoid, and could lose a block
-    /// that exists nowhere else yet.
-    fn remember(&mut self, id: Cid, bytes: &[u8]) -> Vec<Effect> {
-        if self.blocks.get(&id).is_none() {
-            self.warm_bytes += bytes.len();
-        }
-        self.blocks.insert(id, bytes);
-        self.use_clock += 1;
-        self.last_used.insert(id, self.use_clock);
-        if self.warm_bytes <= self.params.max_warm_bytes {
-            return Vec::new();
-        }
-
-        // What must not be evicted. Every block a parked read has been HANDED,
-        // not just its root: a read re-descends from the root on each resume,
-        // so dropping any of the path sends it back for a block it just had —
-        // and that fetch succeeds, so the attempt budget never trips and the
-        // read never ends.
-        let mut pinned: BTreeSet<Cid> = self.unpublished.iter().map(|(c, _)| *c).collect();
-        pinned.insert(self.root);
-        pinned.insert(self.published_root);
-        if self.params.pin_parked_reads {
-            for p in self.reads.parked.values() {
-                pinned.extend(p.held.iter().copied());
-            }
-        } else {
-            for p in self.reads.parked.values() {
-                pinned.insert(p.root);
-            }
-        }
-
-        // Least recently USED first. Eviction in id order is eviction by
-        // BLAKE3, which is to say at random, and the block that just arrived
-        // is as likely a victim as any other.
-        let mut victims: Vec<(u64, Cid)> = self
-            .blocks
-            .0
-            .keys()
-            .filter(|c| !pinned.contains(*c))
-            .map(|c| (self.last_used.get(c).copied().unwrap_or(0), *c))
-            .collect();
-        victims.sort_unstable();
-        for (_, v) in victims {
-            if self.warm_bytes <= self.params.max_warm_bytes {
-                break;
-            }
-            if let Some(b) = self.blocks.0.remove(&v) {
-                self.warm_bytes -= b.len();
-                self.last_used.remove(&v);
-            }
-        }
-        if self.warm_bytes <= self.params.max_warm_bytes {
-            return Vec::new();
-        }
-
-        // Still over, with nothing left to drop: what the parked reads need at
-        // once does not fit. They are ANSWERED rather than left to evict each
-        // other's paths for ever. The largest goes first, and only as many as
-        // it takes.
-        let mut by_size: Vec<(usize, read::ReqId)> = self
-            .reads
-            .parked
-            .iter()
-            .map(|(r, p)| (p.held.len(), *r))
-            .collect();
-        by_size.sort_unstable_by(|a, b| b.cmp(a));
-        let mut out = Vec::new();
-        for (_, req) in by_size {
-            if self.warm_bytes <= self.params.max_warm_bytes {
-                break;
-            }
-            let Some(p) = self.reads.parked.remove(&req) else {
-                continue;
-            };
-            self.forget_waiting(req);
-            out.push(Effect::Reply {
-                client: p.client,
-                req_id: req,
-                result: read::ReadResult::OutOfWarmSpace,
-            });
-            // Its pins are released; drop what is now unpinned.
-            let mut pinned: BTreeSet<Cid> = self.unpublished.iter().map(|(c, _)| *c).collect();
-            pinned.insert(self.root);
-            pinned.insert(self.published_root);
-            for q in self.reads.parked.values() {
-                pinned.extend(q.held.iter().copied());
-            }
-            let mut victims: Vec<(u64, Cid)> = self
-                .blocks
-                .0
-                .keys()
-                .filter(|c| !pinned.contains(*c))
-                .map(|c| (self.last_used.get(c).copied().unwrap_or(0), *c))
-                .collect();
-            victims.sort_unstable();
-            for (_, v) in victims {
-                if self.warm_bytes <= self.params.max_warm_bytes {
-                    break;
-                }
-                if let Some(b) = self.blocks.0.remove(&v) {
-                    self.warm_bytes -= b.len();
-                    self.last_used.remove(&v);
-                }
-            }
-        }
-        out
-    }
-
     /// Start from a published root this engine did not write.
     ///
     /// What a cold reader has: a head, and nothing else. Only for tests — a
@@ -1713,9 +1607,19 @@ impl Engine {
         self.published_root = root;
     }
 
-    /// The warm blocks, so a test can read the tree the engine is holding.
-    pub fn warm_for_test(&self) -> &MemBlocks {
+    /// The block source this engine reads through.
+    pub fn blocks(&self) -> &B {
         &self.blocks
+    }
+
+    /// What the engine reads through: the node, plus the one constant it can
+    /// answer for itself.
+    fn source(&self) -> WithEmptyLeaf<'_, B> {
+        WithEmptyLeaf {
+            inner: &self.blocks,
+            empty_cid: self.empty.cid,
+            empty_bytes: &self.empty.bytes,
+        }
     }
 
     /// Fetches emitted, for the cost gate.
