@@ -24,7 +24,9 @@
 //!
 //! Three things, and no decisions:
 //!
-//! 1. Send whatever [`Client::take_outbound`] hands it.
+//! 1. Send whatever the client has waiting — [`Client::take_outbound`] where
+//!    a send cannot fail, or [`Client::outbound`] + [`Client::sent`] where it
+//!    can, which is any socket.
 //! 2. Feed every message that arrives to [`Client::on_inbound`].
 //! 3. Look at [`Client::drain_replies`] for answers.
 //!
@@ -104,9 +106,39 @@ impl Client {
             .push(protocol::encode_request(protocol::CURRENT, r));
     }
 
-    /// Everything waiting to be sent, in order. Drained.
+    /// Everything waiting to be sent, in order. **Drained.**
+    ///
+    /// For a host whose send CANNOT FAIL — the blocking driver, where
+    /// `exchange` either returns replies or panics. A host whose send can fail
+    /// must use [`Client::outbound`] and [`Client::sent`] instead, or it will
+    /// lose whatever it could not get out: this hands the queue over, and
+    /// nothing hands it back.
     pub fn take_outbound(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.outbound)
+    }
+
+    /// Everything waiting to be sent, WITHOUT giving it up.
+    ///
+    /// For a host whose send can fail — a socket. Look at the queue, send what
+    /// you can, then tell the client how many left with [`Client::sent`].
+    /// Nothing is lost when a send fails part-way, and the order is the order
+    /// the client chose.
+    ///
+    /// The alternative — take the queue and hand back what did not go — needs
+    /// the returned items re-queued at the FRONT, and a host that got that
+    /// backwards would reorder writes in a way nothing downstream could
+    /// detect. This shape has no such corner.
+    pub fn outbound(&self) -> &[Vec<u8>] {
+        &self.outbound
+    }
+
+    /// The first `n` of [`Client::outbound`] went out. Drop them.
+    ///
+    /// `n` beyond what is queued is clamped rather than refused: a host that
+    /// miscounts is a bug, and panicking in a browser with `panic = abort`
+    /// would take the whole SDK instance down for it.
+    pub fn sent(&mut self, n: usize) {
+        self.outbound.drain(..n.min(self.outbound.len()));
     }
 
     pub fn outbound_len(&self) -> usize {

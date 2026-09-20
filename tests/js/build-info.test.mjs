@@ -17,8 +17,8 @@ const info = sdk.buildInfo();
 // ---- shape -----------------------------------------------------------------
 assert.deepStrictEqual(
   Object.keys(info).sort(),
-  ["formatTag", "prollyRev", "rev", "version"],
-  "buildInfo has exactly these four fields",
+  ["blockHash", "contractsRev", "formatTag", "prollyRev", "registerHash", "rev", "version"],
+  "buildInfo has exactly these fields",
 );
 
 // ---- version: the crate's own -----------------------------------------------
@@ -58,6 +58,32 @@ const lock = readFileSync(new URL("../../Cargo.lock", import.meta.url), "utf8");
 const block = lock.split("[[package]]").find(p => /name = "freenet-prolly"/.test(p));
 const locked = /source = "[^"]*#([0-9a-f]+)"/.exec(block)[1].slice(0, 7);
 assert.strictEqual(info.prollyRev, locked, "prollyRev is the rev Cargo.lock resolved");
+
+// ---- the contracts this build PROVISIONS with --------------------------------
+//
+// Provenance again, and a sharper case of it: these hashes are COPIED from the
+// contracts build, never computed here. `hashes.toml` says why in its own
+// header — a consumer that re-hashes matches only while its algorithm and its
+// notion of the canonical wasm stay byte-identical to the one script that
+// builds them, and shows an authoritative-looking number that matches nothing
+// when they drift. So this test reads the same file and compares, rather than
+// hashing `pkg/web/block.wasm` and agreeing with itself.
+const contracts = process.env.CRAFTWORKS_CONTRACTS ?? new URL("../../../freenet-contracts", import.meta.url).pathname;
+let hashes = null;
+try { hashes = readFileSync(`${contracts}/build/hashes.toml`, "utf8"); } catch (_) {}
+if (hashes) {
+  const field = n => new RegExp(`^${n}\\s*=\\s*"([^"]+)"`, "m").exec(hashes)?.[1];
+  assert.strictEqual(info.blockHash, field("block"), "blockHash is the one the contracts build recorded");
+  assert.strictEqual(info.registerHash, field("register"), "registerHash likewise");
+  assert.strictEqual(info.contractsRev, field("rev"), "contractsRev likewise");
+} else {
+  // NOT a silent skip. A build that cannot name what it provisions with is
+  // the case the versions panel exists to surface, so the value must SAY it
+  // could not be read rather than looking like a hash.
+  assert.strictEqual(info.blockHash, "unknown", "no contracts build, so this must say unknown");
+  assert.strictEqual(info.registerHash, "unknown");
+  console.log("  (no contracts checkout: asserted the honest `unknown` instead)");
+}
 
 // ---- formatTag: from the linked tree library ---------------------------------
 assert.strictEqual(info.formatTag, "PT01");

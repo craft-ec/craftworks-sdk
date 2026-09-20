@@ -7,6 +7,7 @@
 
 pub mod binding;
 pub mod blockid;
+pub mod cached_store;
 pub mod copy;
 pub mod db;
 pub mod engine_client;
@@ -21,6 +22,7 @@ pub mod tree_store;
 mod engine_store;
 pub use binding::{Binding, LiveMode, Reloads};
 pub use blockid::{BlockId, ContentHash, IdError};
+pub use cached_store::CachedStore;
 pub use copy::{Copy as LocalCopy, PendingWrite, Refused, RolledBack, Told, Visible};
 pub use db::{Db, Record, Scan};
 pub use engine_client::{Client, Event as EngineEvent};
@@ -98,6 +100,19 @@ pub mod js {
             "formatTag".into(),
             Value::from(crate::format_tag().to_string()),
         );
+        // What this build PROVISIONS with. Copied from the contracts build,
+        // never re-hashed here — the number that matters is the one Freenet
+        // keys the contract by, and only the script that built the wasm can
+        // say it without drifting.
+        m.insert("blockHash".into(), Value::from(env!("SDK_BLOCK_HASH")));
+        m.insert(
+            "registerHash".into(),
+            Value::from(env!("SDK_REGISTER_HASH")),
+        );
+        m.insert(
+            "contractsRev".into(),
+            Value::from(env!("SDK_CONTRACTS_REV")),
+        );
         Value::Object(m).to_string()
     }
 
@@ -158,6 +173,111 @@ pub mod js {
     }
     fn json<T: serde::Serialize>(v: &T) -> Result<String, JsError> {
         serde_json::to_string(v).map_err(err)
+    }
+
+    /// The engine, as a browser drives it: bytes in, bytes out, nothing else.
+    ///
+    /// **Deliberately dumb, and that is the design.** Everything that DECIDES
+    /// — the outbox, the `Lost` policy, retry, the pending cap, the local
+    /// copy's rollback — is in Rust, where it is tested against a transport
+    /// that reorders, duplicates and drops. The JavaScript around this owns a
+    /// socket and nothing more: send what `takeOutbound` gives it, hand back
+    /// what arrives. A decision that leaked out here would be one nothing
+    /// tests.
+    #[wasm_bindgen]
+    pub struct Engine(crate::CachedStore);
+
+    #[wasm_bindgen]
+    impl Engine {
+        #[wasm_bindgen(constructor)]
+        pub fn new() -> Engine {
+            // The clock is the HOST's. The SDK compiles to wasm and to a host
+            // binary and must not reach for one of its own.
+            Engine(crate::CachedStore::new(Box::new(|| js_now_ms())))
+        }
+
+        /// Requests waiting to go out, oldest first — WITHOUT giving them up.
+        ///
+        /// A socket's send can fail, so the host looks, sends what it can, and
+        /// says how many with `sent`. The draining form exists for hosts whose
+        /// send cannot fail and would silently lose a batch here: a write made
+        /// before the socket is open is the ordinary start-up path, not an
+        /// edge case.
+        pub fn outbound(&self) -> Vec<js_sys::Uint8Array> {
+            self.0
+                .client
+                .outbound()
+                .iter()
+                .map(|b| js_sys::Uint8Array::from(&b[..]))
+                .collect()
+        }
+
+        /// The first `n` of `outbound()` went out.
+        pub fn sent(&mut self, n: usize) {
+            self.0.client.sent(n);
+        }
+
+        /// How many requests are still waiting to be sent.
+        pub fn outbound_len(&self) -> usize {
+            self.0.client.outbound().len()
+        }
+
+        /// A message arrived. Decoding is exact and anything unusable is
+        /// COUNTED, not ignored — at this boundary as at every other.
+        pub fn on_inbound(&mut self, bytes: &[u8]) {
+            self.0.on_inbound(bytes);
+        }
+
+        /// Messages this build could not use, by reason, as JSON.
+        pub fn dropped(&self) -> String {
+            serde_json::to_string(
+                &self
+                    .0
+                    .client
+                    .dropped
+                    .iter()
+                    .map(|d| format!("{d:?}"))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".into())
+        }
+
+        /// Ask for `[lo, hi)`. The answer arrives through `on_inbound`.
+        pub fn request_range(&mut self, req_id: u64, lo: &str, hi: &str, max_entries: u32) {
+            self.0
+                .request_range(req_id, lo.as_bytes(), hi.as_bytes(), max_entries);
+        }
+
+        /// Roll back anything that has waited too long for a verdict, and say
+        /// what went. Without this a write lost with the engine's context
+        /// leaves one tab showing a value no other tab will ever see.
+        pub fn tick(&mut self) -> String {
+            let told = self.0.tick();
+            serde_json::json!({
+                "rolledBack": told.rolled_back.iter()
+                    .map(|(id, why)| serde_json::json!({"writeId": id, "why": format!("{why:?}")}))
+                    .collect::<Vec<_>>(),
+                "movedUnderPending": told.moved_under_pending.len(),
+            })
+            .to_string()
+        }
+
+        /// Pending writes held, and their bytes: `[count, bytes]`.
+        pub fn pending(&self) -> Vec<u32> {
+            let (n, b) = self.0.copy.pending();
+            vec![n as u32, b as u32]
+        }
+    }
+
+    impl Default for Engine {
+        fn default() -> Self {
+            Engine::new()
+        }
+    }
+
+    /// The host's clock, through the platform's own `Date.now`.
+    fn js_now_ms() -> u64 {
+        js_sys::Date::now() as u64
     }
 
     /// A database on the real prolly tree, in memory. The same surface will sit
