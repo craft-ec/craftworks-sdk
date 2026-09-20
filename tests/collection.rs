@@ -22,8 +22,8 @@ impl Env for FakeEnv {
 #[derive(Default)]
 struct VecStore(Vec<(Vec<u8>, Vec<u8>)>);
 impl Store for VecStore {
-    fn get(&self, k: &[u8]) -> Option<Vec<u8>> {
-        self.0.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone())
+    fn get(&self, k: &[u8]) -> craftworks_sdk::Read<Option<Vec<u8>>> {
+        Ok(self.0.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()))
     }
     fn put(&mut self, k: &[u8], v: &[u8]) {
         self.delete(k);
@@ -34,7 +34,13 @@ impl Store for VecStore {
         self.0.retain(|(x, _)| x != k);
         self.0.len() != n
     }
-    fn scan(&self, lo: &[u8], hi: &[u8], reverse: bool, limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        reverse: bool,
+        limit: usize,
+    ) -> craftworks_sdk::Read<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut r: Vec<_> = self
             .0
             .iter()
@@ -46,7 +52,7 @@ impl Store for VecStore {
             r.reverse();
         }
         r.truncate(limit);
-        r
+        Ok(r)
     }
 }
 
@@ -180,7 +186,7 @@ fn suite<S: Store + Default>() {
     d.put("task", &obj(json!({"title": "x"}))).unwrap();
     d.put("tasks2", &obj(json!({"title": "y"}))).unwrap();
     assert_eq!(d.count("tasks").unwrap(), 2);
-    assert_eq!(d.domains(), ["task", "tasks", "tasks2"]);
+    assert_eq!(d.domains().unwrap(), ["task", "tasks", "tasks2"]);
 }
 
 fn d_set_now<S: Store>(d: &mut Db<S, FakeEnv>, now: u64) {
@@ -280,7 +286,7 @@ fn schemas_only_grow_so_old_records_stay_valid() {
         .unwrap_err()
         .contains("cannot become"));
     assert_eq!(
-        d.schema("tasks").unwrap(),
+        d.schema("tasks").unwrap().unwrap(),
         v2,
         "a refused schema must not be stored"
     );
@@ -345,9 +351,9 @@ fn keys_follow_the_architecture_keyspace() {
     // id = 8 B ms timestamp ‖ 4 B device ‖ 4 B tail
     assert_eq!(&id[..8], &1_000u64.to_be_bytes());
     assert_eq!(&id[8..12], b"dev1");
-    assert!(d.store().get(&key).is_some());
+    assert!(d.store().get(&key).unwrap().is_some());
     assert!(
-        d.store().get(b"\x00schema\x00tasks").is_some(),
+        d.store().get(b"\x00schema\x00tasks").unwrap().is_some(),
         "the schema lives in the store, in the system range"
     );
 }

@@ -10,7 +10,7 @@
 //! Papering over it would turn "this store forgot to keep a block it emitted"
 //! into a silently wrong answer.
 
-use crate::store::{sorted_edits, Edit, Store};
+use crate::store::{sorted_edits, Edit, Read, Store};
 use freenet_prolly::apply::{apply_into, Edit as TreeEdit};
 use freenet_prolly::build::init;
 use freenet_prolly::node::{Node, Value};
@@ -380,12 +380,23 @@ impl TreeStore {
     }
 }
 
-impl Store for TreeStore {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+impl TreeStore {
+    /// The read, which for this store is local and cannot need a round trip.
+    ///
+    /// The trait's `get` wraps this. `delete` calls it directly, so that a
+    /// `Result` no caller of this store can ever see `Err` on does not have to
+    /// be unwrapped on a write path.
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
         match get(&self.blocks, &self.root, key) {
             Ok(v) => v.map(|v| self.materialise(v)),
             Err(e) => Self::impossible(e),
         }
+    }
+}
+
+impl Store for TreeStore {
+    fn get(&self, key: &[u8]) -> Read<Option<Vec<u8>>> {
+        Ok(self.lookup(key))
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
@@ -393,14 +404,20 @@ impl Store for TreeStore {
     }
 
     fn delete(&mut self, key: &[u8]) -> bool {
-        let existed = self.get(key).is_some();
+        let existed = self.lookup(key).is_some();
         self.apply_batch(&[(key.to_vec(), Edit::Delete)]);
         existed
     }
 
-    fn scan(&self, lo: &[u8], hi: &[u8], reverse: bool, limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan(
+        &self,
+        lo: &[u8],
+        hi: &[u8],
+        reverse: bool,
+        limit: usize,
+    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
         if lo >= hi || limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut out = Vec::new();
         let mut req = Range {
@@ -428,7 +445,7 @@ impl Store for TreeStore {
             debug_assert!(page.need.is_empty(), "in memory nothing can be missing");
             drop(page);
             if finished || out.len() == limit {
-                return out;
+                return Ok(out);
             }
             req.after = next;
         }

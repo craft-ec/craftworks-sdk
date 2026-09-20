@@ -17,7 +17,7 @@
 //!    when the engine has the write, because that is when a subsequent read
 //!    through the same engine will see it.
 
-use crate::store::{Edit, Store};
+use crate::store::{Edit, Read, Store, StoreError};
 use protocol::outbox::{Lost, Outbox, PreImage};
 use protocol::{Reply, Request, WriteState};
 
@@ -222,13 +222,17 @@ impl<T: Transport> EngineStore<T> {
 }
 
 impl<T: Transport> Store for EngineStore<T> {
-    fn get(&self, _key: &[u8]) -> Option<Vec<u8>> {
-        // `Store::get` takes `&self` and an exchange needs `&mut`. Rather
-        // than hide interior mutability — which would make a read look free
-        // when it is a round trip — the engine backend's reads go through
-        // `read_mut`, and `Db` uses that. Returning None here would be a
-        // wrong answer, so it is unreachable instead.
-        unreachable!("EngineStore reads go through read_mut: a read is a round trip")
+    fn get(&self, _key: &[u8]) -> Read<Option<Vec<u8>>> {
+        // `Store::get` takes `&self` and an exchange needs `&mut`. Hiding
+        // interior mutability here would make a round trip look free, and
+        // answering `None` would say the key does not exist — a different
+        // and wrong fact. So the read is refused, by name.
+        //
+        // Refused and not panicked: this is public and reachable, and with
+        // `panic = abort` a panic in the browser is a dead wasm instance
+        // rather than something an app can catch. Reads that can be answered
+        // go through `read_mut` and `page`.
+        Err(StoreError::NeedsRoundTrip)
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
@@ -247,8 +251,11 @@ impl<T: Transport> Store for EngineStore<T> {
         _hi: &[u8],
         _reverse: bool,
         _limit: usize,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
-        unreachable!("EngineStore scans go through scan_mut: a scan is a round trip")
+    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
+        // As `get`. An empty Vec would say the range is empty, which is a
+        // wrong answer with the same shape as a right one. `page` and `list`
+        // are the doors that work.
+        Err(StoreError::NeedsRoundTrip)
     }
 
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) {

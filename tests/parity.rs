@@ -115,7 +115,7 @@ fn nodes_holding_referenced_values_are_accepted_too() {
     let mut r = rng(11);
     for i in 0..60u64 {
         let want = vec![(r() % 251) as u8; MAX_INLINE + 1 + (r() % 2048) as usize];
-        assert_eq!(store.get(format!("big/{i:06}").as_bytes()), Some(want));
+        assert_eq!(store.get(format!("big/{i:06}").as_bytes()), Ok(Some(want)));
     }
     println!("checked {nodes} nodes over {others} referenced value blocks");
 }

@@ -252,3 +252,95 @@ fn an_oversized_page_request_is_clamped_and_says_so() {
         p.page_size_used
     );
 }
+
+/// The two `&self` reads REFUSE, and the refusal is a value.
+///
+/// `Store::get` and `Store::scan` take `&self`; an exchange with the engine
+/// needs `&mut`. Neither may panic: both are public, both are reachable, and
+/// with `panic = abort` a panic in the browser is a dead wasm instance rather
+/// than something an app can catch.
+///
+/// The control is the point of the test. The same store, through the doors
+/// that work, produces the row — so the refusal is the door being wrong and
+/// not the store being empty. Without it, `Err` over an empty store and `Err`
+/// over a full one read identically, and the test would keep passing if the
+/// engine had never received the write at all.
+#[test]
+fn the_self_reads_refuse_by_name_rather_than_panicking() {
+    // Aliased: this file already has a `Store` — the node's block store.
+    use craftworks_sdk::{Store as SdkStore, StoreError};
+    let mut db = started(0);
+    db.put(b"k/one", b"first");
+
+    // The control: the data IS there, through the doors that take `&mut`.
+    assert_eq!(
+        db.read_mut(b"k/one").as_deref(),
+        Some(&b"first"[..]),
+        "the row is not in the engine, so a refusal below proves nothing"
+    );
+    assert_eq!(
+        db.list(Bound::Unbounded, Bound::Unbounded, false),
+        vec![(b"k/one".to_vec(), b"first".to_vec())],
+        "the range is not readable, so a refused scan below proves nothing"
+    );
+
+    // And the same reads through `&self` are refused, by name.
+    assert_eq!(
+        SdkStore::get(&db, b"k/one"),
+        Err(StoreError::NeedsRoundTrip),
+        "a `&self` get answered instead of refusing"
+    );
+    assert_eq!(
+        SdkStore::scan(&db, b"", b"\xff", false, usize::MAX),
+        Err(StoreError::NeedsRoundTrip),
+        "a `&self` scan answered instead of refusing"
+    );
+
+    // The refusal says what to do about it, not just that it happened.
+    let msg = StoreError::NeedsRoundTrip.to_string();
+    assert!(msg.contains("round trip"), "unhelpful refusal: {msg}");
+    println!("  &self get -> {msg}");
+}
+
+/// A fixed clock and a fixed stream, so nothing here depends on the machine.
+struct FixedEnv(u32);
+impl craftworks_sdk::Env for FixedEnv {
+    fn now_ms(&mut self) -> u64 {
+        1_700_000_000_000
+    }
+    fn rand32(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.0
+    }
+}
+
+/// And a `Db` over that store reports the refusal instead of dying.
+///
+/// This is the shape the reason has: `Db` is what the JS surface wraps, and
+/// with `panic = abort` an abort there takes the whole SDK instance with it,
+/// so an app cannot catch it, retry, or say anything to the person using it.
+/// An `Err` it can. The refusal has to survive the whole way out, not just
+/// exist at the trait.
+#[test]
+fn a_db_over_the_engine_store_returns_the_refusal_rather_than_aborting() {
+    use craftworks_sdk::{Db, Scan};
+    let db = Db::new(started(0), FixedEnv(7), [0; 4]);
+
+    // Every `&self` read `Db` offers, through the two adapters.
+    let e = db.schema("tasks").unwrap_err();
+    assert!(e.contains("round trip"), "schema: {e}");
+    let e = db.domains().unwrap_err();
+    assert!(e.contains("round trip"), "domains: {e}");
+    let e = db
+        .get(
+            "tasks",
+            &craftworks_sdk::id::from_hex(&"0".repeat(32)).unwrap(),
+        )
+        .unwrap_err();
+    assert!(e.contains("round trip"), "get: {e}");
+    let e = db.scan("tasks", Scan::default()).unwrap_err();
+    assert!(e.contains("round trip"), "scan: {e}");
+    let e = db.count("tasks").unwrap_err();
+    assert!(e.contains("round trip"), "count: {e}");
+    println!("  Db over the engine store: {e}");
+}

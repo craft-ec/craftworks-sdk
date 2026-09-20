@@ -20,7 +20,7 @@ pub use engine_store::{EngineStore, Event as EngineEvent, Page, Transport};
 pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use schema::{Field, Kind, Schema};
-pub use store::{Edit, MemStore, Store};
+pub use store::{Edit, MemStore, Read, Store, StoreError};
 pub use tree_store::{OwedGroup, OwedParity, Stats, TreeStore};
 
 /// The tree format tag every node carries, from the library that writes them.
@@ -168,10 +168,10 @@ pub mod js {
             self.0.define(domain, &s).map_err(err)
         }
         pub fn schema(&self, domain: &str) -> Result<String, JsError> {
-            json(&self.0.schema(domain))
+            json(&self.0.schema(domain).map_err(err)?)
         }
         pub fn domains(&self) -> Result<String, JsError> {
-            json(&self.0.domains())
+            json(&self.0.domains().map_err(err)?)
         }
         /// Errors here are ordinary JavaScript `Error`s the app can catch —
         /// not a wasm abort. With `panic = abort` a limit breach that reached
