@@ -74,13 +74,25 @@ pub struct Session {
     head_id: [u8; 32],
     /// The head's id as the node NAMES it, so a notification can be matched.
     head_named: String,
-    /// Whether this connection has asked the node to watch the head.
+    /// Head notifications for a contract this session is not watching.
+    ///
+    /// COUNTED, not described. The node chooses what it sends, and a page
+    /// that reacted to any of them would reload on somebody else's contract.
+    /// A count is also the thing that says whether it is happening at all.
+    foreign_notifications: usize,
+    /// Whether this connection has ASKED the node to watch the head.
     ///
     /// Reset on reconnect, not remembered: the node's copy of a subscription
     /// outlives the engine's context and can be evicted at its cap without
     /// anyone being told (F39), so a new connection asks again. Re-asking is
     /// idempotent at the node, so it costs nothing when nothing was lost.
     subscribed: bool,
+    /// Whether the node ACCEPTED it.
+    ///
+    /// Distinct from having asked, and the distinction is the whole point: a
+    /// page that believed it was being notified while it was actually
+    /// polling is the failure `LiveMode` exists to make impossible.
+    watching: bool,
     /// The head moved. Set by a notification, drained by the page.
     ///
     /// A HINT and never an authority: a fabricated one costs a reload, and a
@@ -135,6 +147,8 @@ impl Session {
             head_id: [0u8; 32],
             head_named: String::new(),
             subscribed: false,
+            foreign_notifications: 0,
+            watching: false,
             head_moved: false,
         })
     }
@@ -252,8 +266,7 @@ impl Session {
                 if self.subscribed && !self.head_named.is_empty() && key == self.head_named {
                     self.head_moved = true;
                 } else {
-                    self.unusable
-                        .push("a head notification arrived for a contract this session is not watching".into());
+                    self.foreign_notifications += 1;
                 }
             }
             Incoming::Unusable(why) => self.unusable.push(format!("{why:?}")),
@@ -262,6 +275,19 @@ impl Session {
     }
 
     fn on_ack(&mut self, kind: AckKind) {
+        // The subscribe ack is matched by the KEY IT NAMES, never by
+        // position. Both acks arrive on one connection with no correlation
+        // id, so pairing by order would let a delegate registration confirm
+        // a subscription that was never accepted — which is harness#38's
+        // shape, and it has already been made once in this file.
+        if let AckKind::Subscribed(key) = &kind {
+            if *key == self.head_named && !self.head_named.is_empty() {
+                self.watching = true;
+            } else {
+                self.foreign_notifications += 1;
+            }
+            return;
+        }
         self.plan.on_ack(&kind);
         self.note_progress();
     }
@@ -418,13 +444,37 @@ impl Session {
         std::mem::take(&mut self.head_moved)
     }
 
-    /// Is this session being TOLD about its head, or is it polling?
+    /// How this session actually finds out that the head moved.
     ///
-    /// Reported rather than assumed: a page that believed it was notified
-    /// while it was actually polling is the failure this exists to make
-    /// impossible.
-    pub fn watching_head(&self) -> bool {
-        self.subscribed
+    /// REPORTED, never assumed. `HeadSubscribed` only after the node has
+    /// ACCEPTED the subscription — asking is not being answered — and
+    /// `Polled` says, in words, why it is not: the LIVE switch in a builder
+    /// shows which one a component really has, so a binding that silently
+    /// fell back to polling cannot look like one that did not.
+    pub fn live_mode(&self) -> String {
+        let (mode, why) = if self.watching {
+            ("HeadSubscribed", "")
+        } else if !self.plan.provisioned() {
+            (
+                "Polled",
+                "this node is not provisioned, so there is no head to watch",
+            )
+        } else if self.head_id == [0u8; 32] {
+            ("Polled", "the engine has not named a head contract yet")
+        } else if self.subscribed {
+            ("Polled", "the node has not accepted the subscription yet")
+        } else {
+            (
+                "Polled",
+                "no subscription has been asked for on this connection",
+            )
+        };
+        serde_json::json!({
+            "mode": mode,
+            "why": why,
+            "foreignNotifications": self.foreign_notifications,
+        })
+        .to_string()
     }
 
     /// Take the next provisioning step, if there is one and nothing is in
@@ -616,6 +666,7 @@ impl Session {
         // connection asks again. Idempotent at the node, so it costs nothing
         // when nothing was lost.
         self.subscribed = false;
+        self.watching = false;
     }
 
     // ---- the data surface -------------------------------------------

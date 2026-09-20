@@ -63,6 +63,12 @@ const TRANSPORT_ONLY: &[&str] = &[
     // there — they are connection mechanics, not data.
     "take_loads",
     "loads_in_flight",
+    // How this session finds out the head moved, and whether it is being
+    // TOLD or polling. An in-memory store has no head on a node and nothing
+    // to be notified by — its data cannot change under it — so there is
+    // nothing for these to report there.
+    "live_mode",
+    "take_head_moved",
 ];
 
 #[test]

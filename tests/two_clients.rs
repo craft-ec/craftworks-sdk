@@ -67,6 +67,7 @@ impl Conn {
             self.node.clone(),
             true,
             true,
+            [0u8; 32],
         );
         let out = shell.handle(inbound);
         self.ctx = shell.to_context().expect("a context after every call");
