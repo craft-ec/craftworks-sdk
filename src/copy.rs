@@ -83,6 +83,34 @@ impl Visible {
     }
 }
 
+/// Why a write was refused before it was applied anywhere.
+///
+/// Refused, not queued and not dropped. `Busy` already means "nothing was
+/// applied, it is still yours, try again" and this is the same fact for a
+/// different reason — so it reaches the app as an answer it can act on rather
+/// than as a write that quietly never happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// More pending writes than this client will hold.
+    TooManyPending { cap: usize },
+    /// More pending BYTES than this client will hold. A count is not a byte
+    /// budget: ten writes of a megabyte are not ten small ones.
+    TooManyPendingBytes { cap: usize },
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::TooManyPending { cap } => {
+                write!(f, "{cap} writes are already waiting for an answer")
+            }
+            Refused::TooManyPendingBytes { cap } => {
+                write!(f, "{cap} bytes of writes are already waiting for an answer")
+            }
+        }
+    }
+}
+
 /// Why a pending write was rolled back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RolledBack {
@@ -144,6 +172,18 @@ pub struct Copy {
     pub max_bytes: usize,
     /// No verdict within this many milliseconds ⇒ `Unknown`, roll back.
     pub pending_timeout_ms: u64,
+    /// Pending writes this client will hold at once.
+    ///
+    /// Eviction deliberately never drops a pending write — it is not a cache
+    /// entry, it is something the app is waiting on — which left pending as
+    /// the only unbounded thing here. An app in a loop, or one whose engine
+    /// has stopped answering, would accumulate them with nothing to stop it.
+    pub max_pending: usize,
+    /// And the same bound in BYTES, because a count is not a byte budget.
+    pub max_pending_bytes: usize,
+    /// Bytes currently held by pending writes.
+    pending_bytes: usize,
+    pending_count: usize,
 }
 
 impl Default for Copy {
@@ -161,6 +201,10 @@ impl Copy {
             bytes: 0,
             max_bytes: 8 * 1024 * 1024,
             pending_timeout_ms: 60_000,
+            max_pending: 256,
+            max_pending_bytes: 4 * 1024 * 1024,
+            pending_bytes: 0,
+            pending_count: 0,
         }
     }
 
@@ -334,8 +378,32 @@ impl Copy {
         }
     }
 
-    /// A local write, applied optimistically.
-    pub fn write(&mut self, key: &[u8], value: Option<Vec<u8>>, write_id: u64, at_ms: u64) {
+    /// A local write, applied optimistically — or REFUSED.
+    ///
+    /// The refusal leaves no trace. A write that is half-applied and then
+    /// reported refused is worse than either outcome on its own: the app is
+    /// told nothing happened while something did.
+    pub fn write(
+        &mut self,
+        key: &[u8],
+        value: Option<Vec<u8>>,
+        write_id: u64,
+        at_ms: u64,
+    ) -> Result<(), Refused> {
+        let size = value.as_ref().map_or(0, |v| v.len()) + key.len();
+        // Checked BEFORE anything is touched, and both bounds separately —
+        // a cap that is only ever reached through the other one is a cap
+        // nobody has tested.
+        if self.pending_count >= self.max_pending {
+            return Err(Refused::TooManyPending {
+                cap: self.max_pending,
+            });
+        }
+        if self.pending_bytes + size > self.max_pending_bytes {
+            return Err(Refused::TooManyPendingBytes {
+                cap: self.max_pending_bytes,
+            });
+        }
         self.keys
             .entry(key.to_vec())
             .or_default()
@@ -347,6 +415,29 @@ impl Copy {
                 at_ms,
                 declared_base: None,
             });
+        self.pending_count += 1;
+        self.pending_bytes += size;
+        Ok(())
+    }
+
+    /// Pending writes held, and the bytes they hold.
+    pub fn pending(&self) -> (usize, usize) {
+        (self.pending_count, self.pending_bytes)
+    }
+
+    /// Recount what pending holds. Called wherever entries leave.
+    fn recount_pending(&mut self) {
+        self.pending_count = self.keys.values().map(|e| e.pending.len()).sum();
+        self.pending_bytes = self
+            .keys
+            .iter()
+            .map(|(k, e)| {
+                e.pending
+                    .iter()
+                    .map(|w| w.value.as_ref().map_or(0, |v| v.len()) + k.len())
+                    .sum::<usize>()
+            })
+            .sum();
     }
 
     /// The engine answered `Busy`: the write is ours still, and not submitted.
@@ -389,6 +480,7 @@ impl Copy {
             self.keys.remove(&k);
         }
         self.recount();
+        self.recount_pending();
     }
 
     /// The engine refused this write — and with it every LATER write on the
@@ -485,6 +577,7 @@ impl Copy {
         self.keys
             .retain(|_, e| e.base.is_some() || !e.pending.is_empty());
         self.recount();
+        self.recount_pending();
     }
 
     fn recount(&mut self) {
