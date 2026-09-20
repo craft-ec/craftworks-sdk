@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod outbox;
 pub mod record;
+pub mod session;
 
 /// The versions this build can serve.
 ///
