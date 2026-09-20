@@ -2194,6 +2194,18 @@ impl<B: Blocks> Engine<B> {
     /// re-submission. `Stalled` says what is true -- still held, not saved,
     /// not moving. Memory stays bounded by NEW writes being refused with
     /// `Busy`, never by forgetting ones already accepted.
+    /// # What the age is measured AGAINST
+    ///
+    /// A delegate has no clock. `now` is whatever the last `Tick` carried,
+    /// and `in_flight_since` is the `now` of the tick current when the commit
+    /// started. So "how long" is measured in the time the OUTSIDE has sent,
+    /// and nothing else.
+    ///
+    /// If no tick has ever arrived, both are 0 and the difference is 0: a
+    /// commit CANNOT BE STALLED YET, however long it has really been sitting.
+    /// That is the honest answer rather than a guess — the engine has not
+    /// been told that any time has passed, and inventing some would make the
+    /// report a fiction with teeth.
     fn age_out_accepted(&mut self, now: u64) -> Vec<Effect> {
         if !self.params.bound_accept_age {
             return Vec::new();
@@ -2605,15 +2617,38 @@ struct Context {
     /// Standing range subscriptions. Bounded by `max_subscriptions` and
     /// `max_sub_key`, because this is a slice of the same 400 KiB.
     subs: subs::Subs,
+    /// WHEN THE COMMIT IN FLIGHT STARTED, in the engine's own terms.
+    ///
+    /// Carried because a delegate is rebuilt from its context on every call
+    /// (F32), and this is the state that measures HOW LONG something has
+    /// been stuck. Left out, it was `None` at the top of every call but the
+    /// one that started the commit — so `age_out_accepted` returned early
+    /// every time and `Stalled` could never be reported at all. A stuck
+    /// commit spans many calls by definition; that is the whole situation it
+    /// is for.
+    ///
+    /// 8 bytes, and only while a commit is in flight.
+    in_flight_since: Option<u64>,
+    /// Which writes have already been told `Stalled`.
+    ///
+    /// Carried for the same reason, and it is why both had to move together:
+    /// without it the notice would be repeated on every tick, which is noise
+    /// a caller learns to ignore — and this one matters. It only has anything
+    /// in it while a commit is stuck, and it is emptied when one publishes.
+    told_stalled: Vec<(ClientId, WriteId)>,
 }
 
 /// The version this build writes. Bumped when the shape changes.
+///
+/// 3: the stall timer joined it — `in_flight_since` and `told_stalled`.
+/// Without them `Stalled` could never be reported (sdk#81): the state that
+/// measures how long a commit has been stuck did not survive the call.
 ///
 /// 2: subscriptions joined the context. A v1 context decodes to a DIFFERENT
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 2;
+const CONTEXT_VERSION: u16 = 3;
 
 /// What a context this build wrote begins with.
 ///
@@ -2702,6 +2737,18 @@ impl<B: Blocks> Engine<B> {
             head_epoch: self.head_epoch,
             parked_write: self.parked_write.clone(),
             subs: self.subs.clone(),
+            // Only meaningful alongside the commit itself: a timer for a
+            // commit that was not carried would measure the age of nothing.
+            in_flight_since: if self.params.context_carries_pending {
+                self.in_flight_since
+            } else {
+                None
+            },
+            told_stalled: if self.params.context_carries_pending {
+                self.told_stalled.iter().copied().collect()
+            } else {
+                Vec::new()
+            },
         };
         use bincode::Options;
         let body = context_opts(self.params.max_context_bytes)
@@ -2793,6 +2840,8 @@ impl<B: Blocks> Engine<B> {
         e.pending = c.pending;
         e.head_epoch = c.head_epoch;
         e.parked_write = c.parked_write;
+        e.in_flight_since = c.in_flight_since;
+        e.told_stalled = c.told_stalled.into_iter().collect();
         e.recovered = true;
         // The owed groups come back as ids with no bytes. They are recomputed
         // on demand from the node's blocks, which is sound because parity is a
