@@ -271,9 +271,37 @@ export function engineDb(handle) {
      */
     bind(domain, { live = false } = {}) {
       let rows = [], root = null;
+      // WHAT THIS BINDING LAST MANAGED TO DO.
+      //
+      // A component holds a binding and reads `getSnapshot()`. Until now that
+      // was all it could learn, so an empty array meant BOTH "the range was
+      // read and holds nothing" and "the range could not be reached" — and a
+      // component has no way to tell them apart.
+      //
+      // That distinction is the architecture's whole character: absence is
+      // never provable (§3), a cold far read is seconds (F43), and the layers
+      // underneath were built at real cost to keep the two apart —
+      // `NotLoaded` is not empty (sdk#54, #63). A binding that flattens them
+      // is the last place it can be lost, and an app saying "No records yet"
+      // over a tree it merely could not reach wastes every honest answer
+      // beneath it.
+      //
+      // `loading` until the first reload finishes, then `ready` or
+      // `unreachable`. Empty is not a state here: it is `ready` with no rows,
+      // which is exactly what makes it PROVABLE.
+      let status = { state: "loading", why: "", code: "" };
       const listeners = new Set();
       const b = {
         get live() { return live; },
+        /**
+         * `{ state, why, code }` — `loading`, `ready` or `unreachable`.
+         *
+         * Read it beside `getSnapshot()`: no rows with `ready` is an empty
+         * range, and no rows with `unreachable` is a range nobody could read.
+         * `why` is the SDK's own sentence, and `code` its stable code, so a
+         * caller can show the first and branch on the second.
+         */
+        status: () => status,
         // The SAME array until the rows change: a caller re-rendering on
         // every identity change would re-render for ever otherwise.
         getSnapshot: () => rows,
@@ -294,15 +322,45 @@ export function engineDb(handle) {
          */
         async reload() {
           session.refresh_domain(domain);
-          const next = await self.scan(domain);
+          let next;
+          try {
+            next = await self.scan(domain);
+          } catch (e) {
+            // UNREACHABLE IS AN ANSWER, not an exception to swallow.
+            //
+            // This rejected, and its own caller — `rerun`, below — called it
+            // without awaiting, so the rejection was unhandled and the
+            // component was told nothing at all. It kept whatever rows it had
+            // and no one could see that the read had failed.
+            const was = status.state;
+            status = {
+              state: "unreachable",
+              why: String(e?.message ?? e),
+              code: String(e?.code ?? ""),
+            };
+            if (was !== "unreachable") for (const cb of listeners) cb();
+            return false;
+          }
           root = self.root();
-          if (same(rows, next)) return false;
+          const was = status.state;
+          status = { state: "ready", why: "", code: "" };
+          if (same(rows, next)) {
+            // The ROWS did not change but the STATE may have: a range that
+            // was unreachable and is now readable-and-empty is a different
+            // screen, and a component that only watched the rows would never
+            // redraw.
+            if (was !== "ready") for (const cb of listeners) cb();
+            return was !== "ready";
+          }
           rows = next;
           for (const cb of listeners) cb();
           return true;
         },
       };
       // Its own client's writes reach it whatever `live` says.
+      // The rejection is handled INSIDE `reload` now, which records it as a
+      // state rather than throwing. This stays deliberately fire-and-forget:
+      // it is called from a notification, and there is nobody to await it.
       const rerun = () => { b.reload(); };
       if (!mine.has(domain)) mine.set(domain, new Set());
       mine.get(domain).add(rerun);

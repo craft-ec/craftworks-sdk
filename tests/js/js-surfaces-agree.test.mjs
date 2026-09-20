@@ -273,6 +273,104 @@ await t("THE CONTROL: a reload that changes NOTHING keeps the same snapshot", ()
   });
 });
 
+// ---------------------------------------------------------------------------
+// UNREACHABLE IS NOT EMPTY, and a component must be able to tell.
+//
+// A component holds a binding and reads `getSnapshot()`. An empty array meant
+// BOTH "the range was read and holds nothing" and "the range could not be
+// reached" — and the second is not a smaller version of the first. Absence is
+// never provable (§3); the layers underneath were built at real cost to keep
+// `NotLoaded` apart from empty (sdk#54, #63); and a binding that flattens
+// them is the LAST place that distinction can be lost.
+// ---------------------------------------------------------------------------
+
+const scanning = answer => ({
+  ...fakeSession().session,
+  scan: answer,
+  root: () => "node:r",
+});
+
+await t("**a range that cannot be read is `unreachable`, not empty**", async () => {
+  const db = engineDb({
+    session: scanning(() => {
+      const e = new Error("the range this read needed could not be loaded");
+      e.code = "UNAVAILABLE";
+      throw e;
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+
+  assert.deepEqual(b.getSnapshot(), [], "there are no rows either way — that is the problem");
+  assert.equal(b.status().state, "unreachable",
+    "a range nobody could read reports the same state as one that is empty, so a " +
+    "component renders `No records yet` over a tree it merely could not reach");
+  assert.equal(b.status().code, "UNAVAILABLE", "the code a caller would branch on is gone");
+  assert.match(b.status().why, /could not be loaded/, "the sentence a person would read is gone");
+});
+
+await t("THE CONTROL: a range that IS empty says so, and is not unreachable", async () => {
+  // Without this, a binding that reported `unreachable` whenever it had no
+  // rows would pass the test above — and an app would claim it could not
+  // reach a domain that is simply empty, which is the same lie reversed.
+  const db = engineDb({ session: scanning(() => "[]") });
+  const b = db.bind("notes");
+  await b.reload();
+  assert.deepEqual(b.getSnapshot(), []);
+  assert.equal(b.status().state, "ready",
+    "an empty range was reported unreachable; emptiness IS provable once the range was read");
+});
+
+await t("a binding is `loading` until its first reload finishes", async () => {
+  const db = engineDb({ session: scanning(() => "[]") });
+  const b = db.bind("notes");
+  assert.equal(b.status().state, "loading",
+    "a binding claims to know something before it has read anything");
+  await b.reload();
+  assert.equal(b.status().state, "ready");
+});
+
+await t("**the state changing is itself a change, even when the rows do not**", async () => {
+  // A range that was unreachable and is now readable-and-empty is a different
+  // screen with the same rows. A binding that only told its listeners when
+  // the ROWS changed would leave the component showing the error for ever.
+  let fail = true;
+  const db = engineDb({
+    session: scanning(() => {
+      if (fail) {
+        const e = new Error("no"); e.code = "UNAVAILABLE"; throw e;
+      }
+      return "[]";
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+  assert.equal(b.status().state, "unreachable");
+
+  let told = 0;
+  b.subscribe(() => { told += 1; });
+  fail = false;
+  await b.reload();
+
+  assert.equal(b.status().state, "ready", "it never recovered");
+  assert.deepEqual(b.getSnapshot(), [], "the rows are the same — no rows, either way");
+  assert.equal(told, 1,
+    "nobody was told the range became readable, because only the rows are watched. " +
+    "The component would show `unreachable` over a range it can now read.");
+});
+
+await t("THE CONTROL: both surfaces answer `status`, so an app cannot tell them apart", async () => {
+  // The in-memory database is in the tab and a range there is never
+  // unreachable — but a component that branched on `status()` EXISTING would
+  // work in a preview and throw the moment the project was published.
+  const memory = new (wrap(fakeRaw()).Db)();
+  const b = memory.bind("notes");
+  assert.equal(typeof b.status, "function", "the in-memory binding has no status()");
+  assert.equal(b.status().state, "loading", "it claims to know something before reading");
+  await b.reload();
+  assert.equal(b.status().state, "ready");
+});
+
 await t("a BINDING from the engine has the shape a component holds", () => {
   const b = engineDb(fakeSession()).bind("tasks", { live: false });
   for (const m of ["getSnapshot", "subscribe", "reload"]) {

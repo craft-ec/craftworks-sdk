@@ -82,6 +82,12 @@ export function wrap(raw) {
   // the rows differ.
   class Binding {
     #db; #domain; #live; #rows = []; #listeners = new Set(); #root = null;
+    // The same shape the engine-backed binding answers. This database is in
+    // the tab, so a range is never unreachable here — but an app must not be
+    // able to tell which backend it has from what a call returns (sdk#87),
+    // and a component that branched on `status()` existing would work in a
+    // preview and throw once published.
+    #status = { state: "loading", why: "", code: "" };
     constructor(db, domain, live) {
       this.#db = db; this.#domain = domain; this.#live = live;
       // Bound once, so React sees the SAME function identity across renders;
@@ -97,6 +103,15 @@ export function wrap(raw) {
     get live() { return this.#live; }
     // The rows, as the same array until they change.
     getSnapshot() { return this.#rows; }
+    /**
+     * `{ state, why, code }` — `loading`, then `ready`.
+     *
+     * Never `unreachable`: this database is in the tab, so a range that was
+     * read and holds nothing is EMPTY and provably so. That is the whole
+     * point of the distinction — see the engine-backed binding, where the
+     * third state is real.
+     */
+    status() { return this.#status; }
     // subscribe(cb) -> unsubscribe. A NON-live binding takes one too: the
     // callback fires when these rows change, which is what the component
     // needs to know, and no subscription is taken out anywhere.
@@ -107,6 +122,15 @@ export function wrap(raw) {
       const root = this.#db.root();
       const rows = await this.#db.scan(this.#domain);
       this.#root = root;
+      const was = this.#status.state;
+      this.#status = { state: "ready", why: "", code: "" };
+      if (was !== "ready" && same(this.#rows, rows)) {
+        // Rows unchanged, STATE changed: the first load of an empty domain
+        // moves `loading` to `ready`, and a component watching only the rows
+        // would sit on "loading" for ever.
+        for (const cb of this.#listeners) cb();
+        return true;
+      }
       if (same(this.#rows, rows)) return false;
       this.#rows = rows;
       for (const cb of this.#listeners) cb();
