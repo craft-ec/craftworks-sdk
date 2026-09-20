@@ -94,13 +94,6 @@ fn cold_read(source: &MemBlocks, root: &Cid, key: &[u8], node: Node) -> (u64, u6
             return (*store.reads.borrow(), *store.bytes.borrow(), entries, false);
         }
 
-        // A forgetting node drops what it served on the PREVIOUS entry.
-        if node == Node::Forgetting {
-            for cid in served.drain(..) {
-                store.forget(&cid);
-            }
-        }
-
         match get(&store, root, key) {
             Ok(found) => {
                 return (
@@ -111,6 +104,18 @@ fn cold_read(source: &MemBlocks, root: &Cid, key: &[u8], node: Node) -> (u64, u6
                 )
             }
             Err(ReadError::Need(cids)) => {
+                // A forgetting node retains only the block it most recently
+                // served: what it handed over before that is already gone. The
+                // eviction therefore happens HERE, when the next block is
+                // served, not at the top of the call — because a delegate has
+                // the arriving block's bytes in the call they arrive in, and a
+                // model that took them away first would be deciding the answer
+                // rather than measuring it.
+                if node == Node::Forgetting {
+                    for cid in served.drain(..) {
+                        store.forget(&cid);
+                    }
+                }
                 let mut progressed = false;
                 for cid in cids {
                     if let Some(b) = source.get(&cid) {
@@ -123,6 +128,61 @@ fn cold_read(source: &MemBlocks, root: &Cid, key: &[u8], node: Node) -> (u64, u6
                     // Nothing could be fetched: this is the Unavailable case.
                     return (*store.reads.borrow(), *store.bytes.borrow(), entries, false);
                 }
+            }
+            Err(e) => panic!("unexpected read error: {e:?}"),
+        }
+    }
+}
+
+/// The same read, CONTINUING from the deepest block it reached.
+///
+/// The whole change: on `Need`, the missing cid becomes the point the next
+/// attempt starts from, instead of starting at the root again. `get` already
+/// takes the cid to start at, so this needs no new entry point in the tree
+/// library — it needs the caller to remember ONE cid.
+fn cold_read_with_frontier(
+    source: &MemBlocks,
+    root: &Cid,
+    key: &[u8],
+    node: Node,
+) -> (u64, u64, u32, bool) {
+    let store = Counting::empty();
+    let mut frontier = *root;
+    let mut entries = 0u32;
+    let mut served: Vec<Cid> = Vec::new();
+
+    loop {
+        entries += 1;
+        if entries > 64 {
+            return (*store.reads.borrow(), *store.bytes.borrow(), entries, false);
+        }
+        match get(&store, &frontier, key) {
+            Ok(found) => {
+                return (
+                    *store.reads.borrow(),
+                    *store.bytes.borrow(),
+                    entries,
+                    found.is_some(),
+                )
+            }
+            Err(ReadError::Need(cids)) => {
+                let Some(next) = cids.first().copied() else {
+                    return (*store.reads.borrow(), *store.bytes.borrow(), entries, false);
+                };
+                let Some(bytes) = source.get(&next) else {
+                    return (*store.reads.borrow(), *store.bytes.borrow(), entries, false);
+                };
+                // Same eviction rule as the re-descending arm: only the most
+                // recently served block survives.
+                if node == Node::Forgetting {
+                    for cid in served.drain(..) {
+                        store.forget(&cid);
+                    }
+                }
+                store.put(next, bytes.to_vec());
+                served.push(next);
+                // The block that just arrived is where the next attempt starts.
+                frontier = next;
             }
             Err(e) => panic!("unexpected read error: {e:?}"),
         }
@@ -265,4 +325,64 @@ fn what_the_re_descent_costs() {
         a_reads > d_blocks,
         "re-descending must cost more reads than one descent"
     );
+}
+
+/// THE ACCEPTANCE ROW (sdk#34): a node that keeps nothing still answers.
+///
+/// Ruled to be built for IMPOSSIBILITY, not speed. The re-descending read
+/// cannot complete against a node that drops a block right after serving it,
+/// because what it needs next is gone before it is used. Continuing from the
+/// block that just arrived uses every block at the moment it arrives, so the
+/// same node answers.
+///
+/// The ratio rows are reported beside it and are NOT the case for this change.
+#[test]
+fn continuing_from_the_frontier_answers_a_node_that_keeps_nothing() {
+    for size in [2_000usize, 20_000, 160_000] {
+        let (source, root, keys) = tree(size);
+        let height = freenet_prolly::read::height(&source, &root).unwrap();
+        let step = (keys.len() / 12).max(1);
+
+        let (mut redescend_ok, mut frontier_ok, mut sampled) = (0, 0, 0);
+        let (mut d_blocks, mut f_reads, mut r_reads) = (0.0f64, 0.0f64, 0.0f64);
+
+        for key in keys.iter().step_by(step) {
+            sampled += 1;
+            let want = expected(&source, &root, Op::Get(key));
+            d_blocks += want.blocks as f64;
+
+            // THE CONTROL: the un-fixed path must still fail this row.
+            let (rr, _, _, r_ok) = cold_read(&source, &root, key, Node::Forgetting);
+            if r_ok {
+                redescend_ok += 1;
+            }
+            r_reads += rr as f64;
+
+            let (fr, _, _, f_ok) = cold_read_with_frontier(&source, &root, key, Node::Forgetting);
+            if f_ok {
+                frontier_ok += 1;
+            }
+            f_reads += fr as f64;
+        }
+
+        println!(
+            "{size:>7} entries  height {height}  FORGETTING node: re-descending answered \
+             {redescend_ok}/{sampled}, frontier answered {frontier_ok}/{sampled}  \
+             (reads: derived {:.1}, re-descending {:.1}, frontier {:.1})",
+            d_blocks / sampled as f64,
+            r_reads / sampled as f64,
+            f_reads / sampled as f64
+        );
+
+        assert_eq!(
+            redescend_ok, 0,
+            "the CONTROL stopped failing: the un-fixed path answered a node \
+             that keeps nothing, so this test no longer shows what it claims"
+        );
+        assert_eq!(
+            frontier_ok, sampled,
+            "the acceptance row: every read must be answered by a node that \
+             keeps nothing"
+        );
+    }
 }

@@ -171,6 +171,29 @@ pub(crate) struct Parked {
     pub client: ClientId,
     pub want: Want,
     pub root: Cid,
+    /// The deepest NODE this read has actually reached, if any (sdk#34).
+    ///
+    /// The next attempt continues from here instead of walking from the root
+    /// again. `None` means "start at the root" — which is what a context
+    /// written before this field existed decodes to, and what a range still
+    /// does.
+    ///
+    /// **Why one cid is enough for a point read.** A descent is a single path,
+    /// so its position IS a point. A SCAN's position is a path, not a point,
+    /// and a stack is a different trade — so ranges keep re-descending until
+    /// that trade is made deliberately.
+    ///
+    /// **Why continuing does not weaken the chain.** The id being waited on
+    /// came from a parent the engine had already verified, and the arriving
+    /// block is checked against that id before it is parsed
+    /// ([`matches_id`]). The verification is transitive across calls because
+    /// what the context carries is an id that was trusted when it was written
+    /// down.
+    ///
+    /// **Snapshot consistency is untouched.** `root` is still fixed when the
+    /// read parks, and the frontier is a node of that same tree, so a head
+    /// that moves underneath changes nothing about what this read answers.
+    pub frontier: Option<Cid>,
     pub levels_done: usize,
     /// Fetch rounds this read has made without finishing.
     ///
@@ -235,6 +258,17 @@ impl Reads {
 pub(crate) enum Attempt {
     Done(ReadResult),
     Need(Vec<Cid>),
+    /// Blocks are needed AND the next attempt may continue from `node`.
+    ///
+    /// Separate from [`Attempt::Need`] because not every missing block is a
+    /// place to resume from. A missing VALUE block is named by a leaf that has
+    /// already been reached, and it is a raw block, not a node — resuming
+    /// "from" it would hand the descent something that does not parse as a
+    /// tree node. Only a missing CHILD is a resume point.
+    NeedFrom {
+        ids: Vec<Cid>,
+        node: Cid,
+    },
     /// The tree is damaged in a way no fetch can fix.
     Broken(Cid),
 }
@@ -263,7 +297,12 @@ pub(crate) fn attempt<B: Blocks>(
                     Attempt::Need(vec![cid])
                 }
                 Ok(v) => Attempt::Done(ReadResult::Value(v.map(|v| materialise(blocks, v)))),
-                Err(ReadError::Need(ids)) => Attempt::Need(ids),
+                Err(ReadError::Need(ids)) => match ids.first().copied() {
+                    // The missing child is where the descent stopped, so it is
+                    // where the next one starts.
+                    Some(node) => Attempt::NeedFrom { ids, node },
+                    None => Attempt::Need(ids),
+                },
                 Err(ReadError::Corrupt(cid, _)) | Err(ReadError::Mismatch(cid)) => {
                     Attempt::Broken(cid)
                 }

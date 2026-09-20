@@ -784,11 +784,40 @@ fn no_read_sequence_panics_and_every_read_answers() {
     println!("  {cases} read events across 20 seeds, no panic and no read left unanswered");
 }
 
+/// A value over `MAX_INLINE` lives in its own block, so reading it needs the
+/// LEAF (to learn the reference) and the VALUE BLOCK — at the same moment.
+///
+/// The fixture stores 1400 bytes on every third key, so these are the sampled
+/// keys whose value is a reference.
+fn value_is_a_reference(key: &[u8]) -> bool {
+    let n: u32 = std::str::from_utf8(&key[2..])
+        .expect("k/NNNNN")
+        .parse()
+        .expect("a number");
+    n.is_multiple_of(3)
+}
+
 #[test]
 fn a_forgetful_store_still_answers_every_read() {
+    forgetful(2_000, false);
+}
+
+/// The same, with the ROOT evicted too.
+///
+/// The case above pre-seeds the root and never takes it away, so a re-descent
+/// costs almost nothing: the root is always there, and only the level that
+/// just arrived is needed. That is not "a node that keeps NOTHING" — it is a
+/// node that keeps the root. This one keeps nothing at all, which is what
+/// makes the difference between starting over and continuing observable.
+#[test]
+fn a_store_that_keeps_nothing_at_all_still_answers() {
+    forgetful(2_000, true);
+}
+
+fn forgetful(records_in_tree: u32, evict_root: bool) {
     use common::{Harness, Mode};
 
-    let (records, root, all) = fixture(2_000);
+    let (records, root, all) = fixture(records_in_tree);
     let keys: Vec<Vec<u8>> = records.keys().cloned().collect();
     const BUDGET: usize = 20_000;
 
@@ -806,7 +835,13 @@ fn a_forgetful_store_still_answers_every_read() {
             root,
         });
 
+        if evict_root {
+            // A node that retains nothing does not retain the root either.
+            store.forget(root);
+        }
+
         let (mut answered, mut unavailable) = (0, 0);
+        let mut unanswered_keys: Vec<Vec<u8>> = Vec::new();
         for (n, key) in keys.iter().step_by(400).enumerate() {
             let mut queue = h.step(Event::Get {
                 client: ClientId(1),
@@ -845,7 +880,10 @@ fn a_forgetful_store_still_answers_every_read() {
                     }
                     Effect::Reply { result, .. } => match result {
                         ReadResult::Value(_) => answered += 1,
-                        ReadResult::Unavailable(_) | ReadResult::OutOfWarmSpace => unavailable += 1,
+                        ReadResult::Unavailable(_) | ReadResult::OutOfWarmSpace => {
+                            unavailable += 1;
+                            unanswered_keys.push(key.clone());
+                        }
                         other => panic!("a Get was answered with {other:?}"),
                     },
                     _ => {}
@@ -857,7 +895,59 @@ fn a_forgetful_store_still_answers_every_read() {
             keys.iter().step_by(400).count(),
             "forget_every={forget_every}: not every read was answered"
         );
-        println!("  forget every {forget_every}: {answered} answered, {unavailable} unavailable");
+        println!(
+            "  {records_in_tree} records, forget every {forget_every}: \
+             {answered} answered, {unavailable} unavailable"
+        );
+
+        // THE ACCEPTANCE ROW (sdk#34). Printed since #32; asserted now.
+        //
+        // `forget every 1` is a node that drops a block the instant after
+        // serving it, which it may: a sync read does not refresh hosting
+        // (F33), and there has been no TTL floor since 2026-07-08. Every read
+        // used to be Unavailable, because a read that re-descends from the
+        // root needs the whole path again and the path is gone. Continuing
+        // from the block that just arrived uses each block at the moment it
+        // arrives, so the same node answers.
+        //
+        // EXCEPT for a value stored BY REFERENCE. That read needs the leaf and
+        // the value block AT THE SAME MOMENT — the leaf to learn the
+        // reference, the block to have the bytes — and a node that retains
+        // nothing serves one of them per call while the engine holds no block
+        // bytes across calls (F32). One cid of carried state cannot express
+        // it, so it is NAMED here rather than quietly tolerated.
+        for key in &unanswered_keys {
+            assert!(
+                value_is_a_reference(key),
+                "forget_every={forget_every}: {} went unanswered, and its value \
+                 is INLINE — so this is not the by-reference limit, it is a \
+                 regression in the frontier",
+                String::from_utf8_lossy(key)
+            );
+        }
+        if forget_every != 1 {
+            assert_eq!(
+                unavailable, 0,
+                "forget_every={forget_every}: a node that retains anything at \
+                 all must answer every read"
+            );
+        } else {
+            let inline = keys
+                .iter()
+                .step_by(400)
+                .filter(|k| !value_is_a_reference(k))
+                .count();
+            assert_eq!(
+                answered, inline,
+                "the acceptance row: every INLINE read must be answered by a \
+                 node that keeps nothing"
+            );
+            assert!(
+                answered > 0,
+                "a row where nothing is answered passes the check above \
+                 vacuously if `inline` is ever zero"
+            );
+        }
     }
 }
 
