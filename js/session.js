@@ -8,6 +8,7 @@
 
 import { connect } from "./connection.js";
 import { engineDb } from "./engine-db.js";
+import { allArtefactBytes } from "./artefacts.js";
 
 /**
  * The artefacts as `build.sh` ships them, beside this file.
@@ -21,6 +22,41 @@ export const SHIPPED_ARTEFACTS = {
   block: new URL("./block.wasm", import.meta.url).href,
   register: new URL("./register.wasm", import.meta.url).href,
 };
+
+/**
+ * The shipped artefacts WITH their hashes, read from `artefacts.json`.
+ *
+ * The hashed form is what can be SHARED: every app on a node is a path on one
+ * origin, so an artefact cached under its content hash by one app is found by
+ * the next without a download (sdk#5). A bare URL cannot be shared, because
+ * two apps shipping identical bytes have two URLs and no way to know they
+ * match — and it cannot be verified either.
+ *
+ * `SHIPPED_ARTEFACTS` stays as plain URLs for callers that pass them
+ * straight through; this is the form to prefer.
+ */
+export async function shippedArtefacts(
+  fetchWith = typeof fetch === "function" ? fetch : null,
+  base = import.meta.url,
+) {
+  const url = new URL("./artefacts.json", base).href;
+  const r = await fetchWith(url);
+  if (!r.ok) throw new Error(`could not fetch ${url}: ${r.status}`);
+  const m = await r.json();
+  const at = name => {
+    const e = m[name];
+    if (!e || !e.sha256 || !e.file) {
+      throw new Error(`artefacts.json has no usable ${name} entry`);
+    }
+    return { url: new URL("./" + e.file, base).href, sha256: e.sha256 };
+  };
+  return {
+    delegate: at("delegate"),
+    block: at("block"),
+    register: at("register"),
+    sdk: at("sdk"),
+  };
+}
 
 /**
  * Open a session against a node on THIS machine, provisioning it if needed.
@@ -73,13 +109,30 @@ export async function openSession(Session, {
     // Fetched in parallel and awaited TOGETHER: a partial set is not a
     // smaller provisioning, it is one that installs a delegate it cannot
     // then give contract code to.
-    const [delegate, block, register] = await Promise.all(
-      [artefacts.delegate, artefacts.block, artefacts.register].map(async url => {
-        const r = await fetchWith(url);
-        if (!r.ok) throw new Error(`could not fetch ${url}: ${r.status}`);
-        return new Uint8Array(await r.arrayBuffer());
-      }),
+    // TWO SHAPES, and the difference is whether the bytes can be shared.
+    //
+    // `{ url, sha256 }` goes through the content-addressed cache: verified
+    // before use, and found without a download by the next app on this node.
+    // A bare URL string is fetched per app, unverified and unshared — kept
+    // because callers pass `SHIPPED_ARTEFACTS` straight through, and because
+    // a caller who has no hash must not get a cache entry nobody can check.
+    const hashed = ["delegate", "block", "register"].every(
+      k => artefacts[k] && typeof artefacts[k] === "object" && artefacts[k].sha256,
     );
+    let delegate, block, register;
+    if (hashed) {
+      ({ delegate, block, register } = await allArtefactBytes(artefacts, {
+        fetch: fetchWith,
+      }));
+    } else {
+      [delegate, block, register] = await Promise.all(
+        [artefacts.delegate, artefacts.block, artefacts.register].map(async url => {
+          const r = await fetchWith(url);
+          if (!r.ok) throw new Error(`could not fetch ${url}: ${r.status}`);
+          return new Uint8Array(await r.arrayBuffer());
+        }),
+      );
+    }
     session.provision(delegate, block, register);
   }
 
