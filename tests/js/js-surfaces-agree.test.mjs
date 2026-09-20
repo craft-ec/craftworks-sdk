@@ -31,8 +31,17 @@ import { engineDb } from "../../js/engine-db.js";
 import { wrap } from "../../js/wrap.js";
 
 let failures = 0;
-const t = (name, fn) => {
-  try { fn(); process.stdout.write(`  ok  ${name}\n`); }
+/**
+ * AWAITED. It was not, and an async test's rejection was swallowed: the
+ * helper wrote `ok` and moved on while the assertions were still pending.
+ *
+ * Found by mutation — the state-comparison test below reported `ok` against
+ * code with the fix REMOVED, which is a test that cannot fail. Every call is
+ * awaited now, so a synchronous test is unaffected and an async one is
+ * actually run.
+ */
+const t = async (name, fn) => {
+  try { await fn(); process.stdout.write(`  ok  ${name}\n`); }
   catch (e) { failures += 1; process.stdout.write(`  FAIL ${name}\n    ${e.message}\n`); }
 };
 
@@ -57,6 +66,7 @@ const fakeSession = () => ({
     preload: () => 0, trace: () => "null", trace_on: () => undefined,
     take_loads: () => "[]", take_stale: () => "[]", live_mode: () => "{}",
     bind: () => undefined, unbind: () => undefined,
+    refresh_domain: () => undefined, take_stale: () => "[]",
   },
 });
 
@@ -76,7 +86,7 @@ const surfaceOf = o => {
 /** On the engine side only: there is no engine behind the in-memory one. */
 const ENGINE_ONLY = new Set(["preload", "trace", "traceOn", "watch", "liveMode", "drain"]);
 
-t("**the engine-backed db offers every method the in-memory one does**", () => {
+await t("**the engine-backed db offers every method the in-memory one does**", () => {
   const memory = surfaceOf(wrap(fakeRaw()).Db.prototype ?? new (wrap(fakeRaw()).Db)());
   const engine = surfaceOf(engineDb(fakeSession()));
 
@@ -88,7 +98,7 @@ t("**the engine-backed db offers every method the in-memory one does**", () => {
     "project threw `db.bind is not a function` on its first render.");
 });
 
-t("THE CONTROL: the reader really does find methods", () => {
+await t("THE CONTROL: the reader really does find methods", () => {
   // Without this, a `surfaceOf` that returned an empty set would make the
   // test above pass against any two objects at all.
   const engine = surfaceOf(engineDb(fakeSession()));
@@ -97,7 +107,7 @@ t("THE CONTROL: the reader really does find methods", () => {
   }
 });
 
-t("and the engine side's extras are declared, not accidental", () => {
+await t("and the engine side's extras are declared, not accidental", () => {
   const memory = surfaceOf(wrap(fakeRaw()).Db.prototype ?? new (wrap(fakeRaw()).Db)());
   const engine = surfaceOf(engineDb(fakeSession()));
   const extra = [...engine].filter(m => !memory.has(m) && !ENGINE_ONLY.has(m));
@@ -139,7 +149,7 @@ const shapeOf = (obj, name) => {
   }
 };
 
-t("**both surfaces answer the same SHAPE, not just the same names**", () => {
+await t("**both surfaces answer the same SHAPE, not just the same names**", () => {
   const memory = new (wrap(fakeRaw()).Db)();
   const engine = engineDb(fakeSession());
   const shared = [...surfaceOf(memory)].filter(m => surfaceOf(engine).has(m)).sort();
@@ -168,7 +178,7 @@ t("**both surfaces answer the same SHAPE, not just the same names**", () => {
   console.log(`      ${shared.length} shared methods, all compared by shape`);
 });
 
-t("THE CONTROL: a method that is sync on one side and async on the other FAILS", () => {
+await t("THE CONTROL: a method that is sync on one side and async on the other FAILS", () => {
   // Without this, a `shapeOf` that returned the same kind for everything —
   // a broken thenable check, an early return — would report perfect agreement
   // over two surfaces that agree about nothing.
@@ -184,7 +194,7 @@ t("THE CONTROL: a method that is sync on one side and async on the other FAILS",
   assert.notEqual(a.kind, b.kind, "a sync-vs-async pair was not detected as a difference");
 });
 
-t("THE CONTROL: the shape reader is not simply calling everything a promise", () => {
+await t("THE CONTROL: the shape reader is not simply calling everything a promise", () => {
   // `root` and `stats` are synchronous on BOTH: a root is a value this client
   // already holds. If the reader called them promises, the gate above would
   // pass by agreeing on the wrong answer everywhere.
@@ -195,7 +205,75 @@ t("THE CONTROL: the shape reader is not simply calling everything a promise", ()
   }
 });
 
-t("a BINDING from the engine has the shape a component holds", () => {
+// ---------------------------------------------------------------------------
+// A WRITE REACHING THE NETWORK IS A CHANGE THE SCREEN MUST SEE.
+// ---------------------------------------------------------------------------
+
+/**
+ * A row whose STATE moved, and nothing else.
+ *
+ * `PENDING -> CLEAN` is what happens when a write reaches the network. It
+ * changes neither `id` nor `updated` — `updated` is the record's own
+ * timestamp, and a write state is not a content change — so a snapshot
+ * comparison of those two says "the same rows" and the component never
+ * re-renders.
+ *
+ * MEASURED against a real node: a row sat on screen saying "saving" for 70
+ * seconds while `db.scan()` returned it CLEAN the whole time. The data was
+ * published within a second. Only the screen was wrong, which is the worst
+ * version of this: a person is told their data is unsaved when it is safely
+ * on the network, and closing the tab then feels like losing it.
+ */
+const ROW = (state) => ({ id: "a", updated: 7, fields: { t: "x" }, state });
+
+await t("**a row whose write STATE changed is a new snapshot, on the engine side**", async () => {
+  let state = "PENDING";
+  const session = {
+    ...fakeSession().session,
+    scan: () => JSON.stringify([ROW(state)]),
+    root: () => "node:same",
+  };
+  const db = engineDb({ session });
+  const b = db.bind("notes");
+  await b.reload();
+  const first = b.getSnapshot();
+  assert.equal(first[0].state, "PENDING");
+
+  let told = 0;
+  b.subscribe(() => { told += 1; });
+  state = "CLEAN";                      // the write reached the network
+  await b.reload();
+
+  assert.notEqual(b.getSnapshot(), first,
+    "the snapshot was not replaced when the row's write state changed, so a " +
+    "component holding it renders `saving` for ever over data that is safely " +
+    "on the network");
+  assert.equal(b.getSnapshot()[0].state, "CLEAN", "the new snapshot has the old state");
+  assert.equal(told, 1, "nobody was told, so nothing re-renders");
+});
+
+await t("THE CONTROL: a reload that changes NOTHING keeps the same snapshot", () => {
+  // The referential stability this comparison exists for. Without this, a
+  // `same` that always returned false would pass the test above and make
+  // useSyncExternalStore re-render on every render, for ever.
+  const session = {
+    ...fakeSession().session,
+    scan: () => JSON.stringify([ROW("CLEAN")]),
+    root: () => "node:same",
+  };
+  const db = engineDb({ session });
+  const b = db.bind("notes");
+  return b.reload().then(async () => {
+    const first = b.getSnapshot();
+    let told = 0;
+    b.subscribe(() => { told += 1; });
+    await b.reload();
+    assert.equal(b.getSnapshot(), first, "an unchanged reload replaced the snapshot");
+    assert.equal(told, 0, "an unchanged reload told a listener");
+  });
+});
+
+await t("a BINDING from the engine has the shape a component holds", () => {
   const b = engineDb(fakeSession()).bind("tasks", { live: false });
   for (const m of ["getSnapshot", "subscribe", "reload"]) {
     assert.equal(typeof b[m], "function", `a binding has no ${m}`);

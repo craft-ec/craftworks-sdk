@@ -41,11 +41,27 @@ const rethrow = e => {
   throw e;
 };
 
-/** Are these the same rows? By id and `updated`, as the in-memory one does. */
+/** Are these the same rows? By id, `updated` AND `state` — see below. */
 const same = (a, b) => {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
-    if (a[i].id !== b[i].id || a[i].updated !== b[i].updated) return false;
+    // `state` TOO, and it is not an optimisation detail.
+    //
+    // A write moves PENDING -> CLEAN when it reaches the network, and that
+    // changes neither `id` nor `updated` — `updated` is the record's own
+    // timestamp and a write state is not a content change. So a comparison
+    // of those two alone says "the same rows", the snapshot is not replaced,
+    // no listener fires, and the component never re-renders.
+    //
+    // MEASURED against a real node: a row sat on screen saying "saving" for
+    // 70 seconds while `db.scan()` returned it CLEAN the whole time. The data
+    // was safely published within a second; only the screen was wrong, which
+    // is the worst version of this — a person watching a spinner is told
+    // their data is unsaved when it is on the network, and closing the tab
+    // then feels like losing it.
+    if (a[i].id !== b[i].id || a[i].updated !== b[i].updated || a[i].state !== b[i].state) {
+      return false;
+    }
   }
   return true;
 };
