@@ -16,6 +16,22 @@ wasm-bindgen --target web    --out-name craftworks_sdk --out-dir pkg/web  "$wasm
 wasm-bindgen --target nodejs --out-name craftworks_sdk --out-dir pkg/node "$wasm"
 cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js pkg/web/
 
+# EVERY MODULE THE ENTRY CAN REACH IS IN THE PACKAGE.
+#
+# Computed by following the imports, never by trusting the list above. A list
+# is correct on the day it is written and silently wrong on the day someone
+# adds a module — which has happened twice: `wrap.js` gained `session.js` and
+# `engine-db.js`, this line went on copying the older set, and nothing failed.
+# The symptom was ERR_MODULE_NOT_FOUND in a browser, at run time, in another
+# repository.
+#
+# It FAILS the build rather than warning. A package that cannot be imported is
+# not a package.
+node tools/reachable.mjs pkg/web/index.js pkg/web > /tmp/reach.$$ || {
+  echo "pkg/web is not closed under its own imports — see above" >&2; rm -f /tmp/reach.$$; exit 1; }
+echo "pkg/web: $(wc -l < /tmp/reach.$$ | tr -d ' ') modules reachable from index.js, all present"
+rm -f /tmp/reach.$$
+
 # THE ARTEFACTS THE SDK PROVISIONS WITH.
 #
 # Shipped here so a browser page can register a delegate and install contracts

@@ -173,9 +173,24 @@ export function engineDb(handle) {
 
     // ---- what only the engine-backed one has ----
 
-    // Load the ranges this project names on open, before anything asks for
-    // them, so a first read is answered from memory.
-    preload: manifest => session.preload(JSON.stringify(manifest)),
+    // Load the DOMAINS this project names on open, before anything asks for
+    // them, so a first read is answered from memory rather than from a round
+    // trip.
+    //
+    //   await db.preload(["tasks", "notes"]);
+    //
+    // Domains, not key ranges: what a range is, is the SDK's business. A
+    // caller that built one would be encoding the key layout, and a layout
+    // baked into apps could never change afterwards.
+    //
+    // A domain this project does not define is REFUSED, and refused before
+    // anything is sent — a manifest naming a domain that has drifted out of
+    // the project is wrong, and skipping it quietly makes the page
+    // mysteriously slow instead of saying so.
+    preload: domains => {
+      try { return session.preload(JSON.stringify(domains)); }
+      catch (e) { rethrow(e); }
+    },
 
     // The call tree of the last write, in the instrument's fixed vocabulary.
     // No key, value or domain name crosses this — the same recording ships in

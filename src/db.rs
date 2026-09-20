@@ -211,6 +211,23 @@ fn upper(p: &[u8]) -> Vec<u8> {
 }
 
 impl<S: Store + Reads, E: Env> Db<S, E> {
+    /// Every key a domain's records live under, as `[lo, hi)`.
+    ///
+    /// The ONE place that turns a name into a range. A caller that built this
+    /// itself would be encoding the key layout — which is the thing this
+    /// boundary exists to hide, and which could then never change without
+    /// breaking every caller that had hard-coded it.
+    ///
+    /// It takes no `&self` because it is a property of the layout and not of
+    /// any particular database, and it does not check that the domain is
+    /// DEFINED: that is a question about this database's contents, and the
+    /// caller that needs it asks separately.
+    pub fn domain_range(domain: &str) -> (Vec<u8>, Vec<u8>) {
+        let lo = prefix(domain);
+        let hi = upper(&lo);
+        (lo, hi)
+    }
+
     pub fn new(store: S, env: E, device: [u8; 4]) -> Self {
         Db {
             store,
