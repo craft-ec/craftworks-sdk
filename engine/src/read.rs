@@ -51,6 +51,15 @@ pub enum ReadResult {
     /// hang: a read that never answers is indistinguishable from a wedged
     /// node, and the caller can do nothing about either.
     Unavailable(Cid),
+    /// This read needs to hold more at once than the warm bound allows.
+    ///
+    /// Distinct from `Unavailable`, which means the network would not answer.
+    /// Here the network answered and the engine cannot keep what it was
+    /// given — a caller can act on that (raise the bound, narrow the query),
+    /// and could do nothing about the other. It is a reply either way: the
+    /// alternative is evicting what the read needs and asking for it again
+    /// for ever.
+    OutOfWarmSpace,
 }
 
 /// What a client asked for, kept so the request can be retried as blocks land.
@@ -66,6 +75,14 @@ pub(crate) struct Parked {
     pub want: Want,
     pub root: Cid,
     pub levels_done: usize,
+    /// Every block this read has been handed, PINNED until it replies.
+    ///
+    /// A read re-descends from the root on each resume, so it needs the whole
+    /// path it has already paid for. Evicting any of it sends the read back
+    /// for a block it just had — and because that fetch SUCCEEDS, the attempt
+    /// budget never trips and nothing ever ends. A tight warm set turned a
+    /// cold read into a livelock exactly that way.
+    pub held: BTreeSet<Cid>,
 }
 
 /// The read side of the engine's state.
@@ -125,7 +142,9 @@ pub(crate) fn attempt(
 ) -> Attempt {
     match want {
         Want::Get(key) => {
-            count_nodes(blocks, root, key, nodes_parsed);
+            if params.count_descent {
+                count_nodes(blocks, root, key, nodes_parsed);
+            }
             match get(blocks, root, key) {
                 // A value stored by REFERENCE is a block of its own, and the
                 // descent that found the leaf does not fetch it. Answering

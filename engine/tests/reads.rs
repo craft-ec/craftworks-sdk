@@ -478,7 +478,13 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
         }
     };
 
-    let mut e = reader(root, Params::default());
+    let mut e = reader(
+        root,
+        Params {
+            count_descent: true,
+            ..Params::default()
+        },
+    );
     e.reset_cost();
     let first = e.step(get(1, 9, &key));
     let got = settle(&mut e, &all, first);
@@ -654,13 +660,22 @@ fn a_range_pages_in_both_directions() {
     println!("  both directions page every key in order");
 }
 
-/// No sequence of read events makes the core panic.
+/// No sequence of read events makes the core panic — AND every read that was
+/// issued is answered.
+///
+/// The second half is not decoration. A read that never answers does not
+/// panic, so a sweep asking only "did it crash" is green while the delegate
+/// spends its whole 5 s slice on one key and reports nothing. That is exactly
+/// how the warm-set livelock got past this sweep.
 #[test]
-fn no_read_sequence_panics() {
+fn no_read_sequence_panics_and_every_read_answers() {
     let (_, root, all) = fixture(500);
     let ids: Vec<Cid> = all.0.keys().copied().collect();
     let mut cases = 0;
+    let mut answered_seeds = 0;
     for seed in 1..=20u64 {
+        let mut outstanding: std::collections::BTreeSet<ReqId> = Default::default();
+        let mut pending: Vec<Effect> = Vec::new();
         let mut r = rng(seed);
         let mut e = reader(
             root,
@@ -706,10 +721,172 @@ fn no_read_sequence_panics() {
                     roots: vec![root, [(r() % 251) as u8; 32]],
                 },
             };
-            let _ = e.step(ev);
+            let issued = matches!(ev, Event::Get { .. } | Event::Scan { .. });
+            let req = match &ev {
+                Event::Get { req_id, .. } | Event::Scan { req_id, .. } => Some(*req_id),
+                _ => None,
+            };
+            let out = e.step(ev);
+            for (r, _) in replies(&out) {
+                outstanding.remove(&r);
+            }
+            if issued {
+                if let Some(r) = req {
+                    outstanding.insert(r);
+                }
+            }
+            // The fetches a read asked for are kept, and served in the drain.
+            // Dropping them would leave every parked read waiting on an answer
+            // the harness never gave — which is the harness failing to answer,
+            // not the engine failing to.
+            pending.extend(out);
             cases += 1;
         }
+
+        // Drain: serve what is still wanted, within a step budget. What is
+        // left outstanding after that is a read that never answers.
+        let mut queue: Vec<Effect> = std::mem::take(&mut pending);
+        let mut steps = 0;
+        while let Some(f) = queue.pop() {
+            steps += 1;
+            assert!(steps < 50_000, "seed {seed}: the drain did not finish");
+            match f {
+                Effect::FetchBlock { id, .. } => {
+                    let ev = match all.get(&id) {
+                        Some(b) => Event::BlockArrived {
+                            id,
+                            bytes: b.to_vec(),
+                        },
+                        None => Event::BlockMissed(id),
+                    };
+                    queue.extend(e.step(ev));
+                }
+                Effect::Reply { req_id, .. } => {
+                    outstanding.remove(&req_id);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            outstanding.is_empty(),
+            "seed {seed}: {} read(s) were never answered: {outstanding:?}",
+            outstanding.len()
+        );
+        answered_seeds += 1;
     }
     assert!(cases >= 1500, "only {cases} events were driven");
-    println!("  {cases} read events across 20 seeds, no panic");
+    assert_eq!(
+        answered_seeds, 20,
+        "not every seed reached the answered check"
+    );
+    println!("  {cases} read events across 20 seeds, no panic and no read left unanswered");
+}
+
+/// Drive a read to an answer within a STEP budget, so a read that never
+/// answers is a failure rather than a hang.
+///
+/// `no_read_sequence_panics` cannot see this: a read that loops for ever
+/// never panics, and a sweep that only asks "did it panic" is green while the
+/// delegate spins out its 5 s slice on one key.
+fn settle_bounded(
+    e: &mut Engine,
+    all: &MemBlocks,
+    first: Vec<Effect>,
+    budget: usize,
+) -> Result<Vec<(ReqId, ReadResult)>, usize> {
+    let mut queue = first;
+    let mut out = Vec::new();
+    let mut steps = 0;
+    while let Some(f) = queue.pop() {
+        steps += 1;
+        if steps > budget {
+            return Err(steps);
+        }
+        match f {
+            Effect::FetchBlock { id, .. } => {
+                let ev = match all.get(&id) {
+                    Some(b) => Event::BlockArrived {
+                        id,
+                        bytes: b.to_vec(),
+                    },
+                    None => Event::BlockMissed(id),
+                };
+                queue.extend(e.step(ev));
+            }
+            Effect::Reply { req_id, result, .. } => out.push((req_id, result)),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// A warm set too small for a read's path ENDS the read; it never loops.
+///
+/// Every block a parked read has been handed is pinned until it replies,
+/// because the read re-descends from the root each time it resumes. Without
+/// that, eviction takes the path the read just paid for, the read asks again,
+/// the fetch SUCCEEDS — so the attempt budget never trips — and nothing ever
+/// ends. A livelock is worse than a crash: it burns the delegate's whole
+/// slice and reports nothing at all.
+#[test]
+fn a_tight_warm_set_answers_every_read_instead_of_looping() {
+    let (records, root, all) = fixture(10_000);
+    const BUDGET: usize = 20_000;
+
+    for warm in [8 * 1024usize, 16 * 1024, 32 * 1024, 64 * 1024] {
+        let mut e = reader(
+            root,
+            Params {
+                max_warm_bytes: warm,
+                ..Params::default()
+            },
+        );
+        let (mut ok, mut no_space, mut other) = (0, 0, 0);
+        for (i, (k, v)) in records.iter().enumerate().filter(|(i, _)| i % 500 == 0) {
+            let first = e.step(get(1, i as u64, k));
+            let got = settle_bounded(&mut e, &all, first, BUDGET).unwrap_or_else(|n| {
+                panic!("warm={warm}: a read took {n} steps and had not answered")
+            });
+            match got.first().map(|(_, r)| r.clone()) {
+                Some(ReadResult::Value(Some(x))) if &x == v => ok += 1,
+                // Honest: this read needs more at once than the bound allows.
+                Some(ReadResult::OutOfWarmSpace) => no_space += 1,
+                _ => other += 1,
+            }
+        }
+        // Whatever the bound, every read ANSWERED, and none answered wrongly.
+        assert_eq!(
+            other, 0,
+            "warm={warm}: {other} read(s) answered with something other than \
+             the value or OutOfWarmSpace"
+        );
+        assert_eq!(ok + no_space, 20, "warm={warm}: not every read answered");
+        if warm >= 16 * 1024 {
+            assert_eq!(
+                ok, 20,
+                "warm={warm}: {no_space} read(s) ran out of warm space at a \
+                 bound that holds a whole path"
+            );
+        }
+        println!("  warm={warm}: {ok} answered, {no_space} out of space");
+    }
+
+    // The control, and it RUNS: with pinning off the same read does not
+    // finish inside a budget many times what it needs.
+    let key = records.keys().next().expect("a key").clone();
+    let mut e = reader(
+        root,
+        Params {
+            max_warm_bytes: 8 * 1024,
+            pin_parked_reads: false,
+            ..Params::default()
+        },
+    );
+    let first = e.step(get(1, 99, &key));
+    assert!(
+        settle_bounded(&mut e, &all, first, BUDGET).is_err(),
+        "with pinning off the read still finished, so pinning is not what \
+         stops the livelock and this test proves nothing about it"
+    );
+    println!("  control: with pinning off, the same read never answers");
 }

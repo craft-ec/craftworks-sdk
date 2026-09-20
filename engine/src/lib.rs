@@ -213,6 +213,15 @@ pub struct Params {
     /// "fetch ahead" a reader might write, and the control for the cost
     /// bound. A bound no implementation can exceed is not a bound.
     pub fetch_greedily: bool,
+    /// Pin every block a parked read has been handed, until it replies. Off
+    /// is the control, and the state this engine was in: a tight warm set
+    /// evicts the path a read just paid for, the read re-fetches it, the
+    /// fetch SUCCEEDS so the attempt budget never trips, and nothing ever
+    /// ends.
+    pub pin_parked_reads: bool,
+    /// Count the nodes a descent would touch. It is a second walk, for the
+    /// cost gate and nothing else, so it is off unless a test asks.
+    pub count_descent: bool,
 }
 
 impl Default for Params {
@@ -233,6 +242,8 @@ impl Default for Params {
             preload_blocks: 256,
             preload_bytes: 4 * 1024 * 1024,
             fetch_greedily: false,
+            pin_parked_reads: true,
+            count_descent: false,
         }
     }
 }
@@ -331,6 +342,12 @@ pub struct Engine {
     coded_since_commit: BTreeSet<ParityIds>,
     /// Everything the read path is waiting on.
     reads: read::Reads,
+    /// Bytes held warm, kept as a RUNNING total. Re-summing every block on
+    /// every arrival is O(n) per block and so O(n^2) to warm a tree.
+    warm_bytes: usize,
+    /// When each warm block was last written or delivered, for LRU eviction.
+    last_used: BTreeMap<Cid, u64>,
+    use_clock: u64,
     /// Nodes parsed on the write path. A cost counter, not a statistic: the
     /// whole point of the diff walk is that this stays proportional to the
     /// tree's DEPTH, and a test that does not measure it would not notice the
@@ -382,6 +399,9 @@ impl Engine {
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
             reads: read::Reads::default(),
+            warm_bytes: 0,
+            last_used: BTreeMap::new(),
+            use_clock: 0,
             nodes_parsed: 0,
             now: 0,
         }
@@ -458,6 +478,7 @@ impl Engine {
                 want,
                 root,
                 levels_done: 0,
+                held: BTreeSet::from([root]),
             },
         );
         self.drive(req_id)
@@ -1169,6 +1190,7 @@ impl Engine {
         if !read::matches_id(&id, &bytes) {
             return self.on_missed(id);
         }
+        let mut out = Vec::new();
         let mut landed: Vec<Cid> = vec![id];
         // A pack carries many blocks, and one fetch of it can answer several
         // parked reads at once. Its members are checked the same way: a pack
@@ -1177,24 +1199,32 @@ impl Engine {
         if freenet_prolly::block_id(pack::PACK_KIND, &bytes) == id {
             for (mid, mbytes) in pack::members(&bytes) {
                 if read::matches_id(&mid, &mbytes) {
-                    self.remember(mid, &mbytes);
+                    out.extend(self.remember(mid, &mbytes));
                     self.reads.in_pack.insert(mid, id);
                     landed.push(mid);
                 }
             }
         } else {
-            self.remember(id, &bytes);
+            let n = self.remember(id, &bytes);
+            out.extend(n);
         }
 
         let mut woken: BTreeSet<read::ReqId> = BTreeSet::new();
-        for l in landed {
-            self.reads.attempts.remove(&l);
-            if let Some(reqs) = self.reads.waiting.remove(&l) {
+        for l in &landed {
+            self.reads.attempts.remove(l);
+            if let Some(reqs) = self.reads.waiting.remove(l) {
+                for r in &reqs {
+                    // Pinned for as long as this read is parked: it will
+                    // re-descend through this block on its next attempt.
+                    if let Some(p) = self.reads.parked.get_mut(r) {
+                        p.held.extend(landed.iter().copied());
+                    }
+                }
                 woken.extend(reqs);
             }
         }
-        let mut out = Vec::new();
         for req in woken {
+            // A read answered by eviction above is gone; driving it is a no-op.
             out.extend(self.drive(req));
         }
         out
@@ -1293,35 +1323,110 @@ impl Engine {
     /// commit still needs — evicting those would turn a bounded cache into a
     /// cause of the very fetches it exists to avoid, and could lose a block
     /// that exists nowhere else yet.
-    fn remember(&mut self, id: Cid, bytes: &[u8]) {
-        self.blocks.insert(id, bytes);
-        let mut held: usize = self.blocks.0.values().map(Vec::len).sum();
-        if held <= self.params.max_warm_bytes {
-            return;
+    fn remember(&mut self, id: Cid, bytes: &[u8]) -> Vec<Effect> {
+        if self.blocks.get(&id).is_none() {
+            self.warm_bytes += bytes.len();
         }
-        let pinned: BTreeSet<Cid> = self
-            .unpublished
-            .iter()
-            .map(|(c, _)| *c)
-            .chain(self.reads.parked.values().map(|p| p.root))
-            .chain(std::iter::once(self.root))
-            .chain(std::iter::once(self.published_root))
-            .collect();
-        let victims: Vec<Cid> = self
+        self.blocks.insert(id, bytes);
+        self.use_clock += 1;
+        self.last_used.insert(id, self.use_clock);
+        if self.warm_bytes <= self.params.max_warm_bytes {
+            return Vec::new();
+        }
+
+        // What must not be evicted. Every block a parked read has been HANDED,
+        // not just its root: a read re-descends from the root on each resume,
+        // so dropping any of the path sends it back for a block it just had —
+        // and that fetch succeeds, so the attempt budget never trips and the
+        // read never ends.
+        let mut pinned: BTreeSet<Cid> = self.unpublished.iter().map(|(c, _)| *c).collect();
+        pinned.insert(self.root);
+        pinned.insert(self.published_root);
+        if self.params.pin_parked_reads {
+            for p in self.reads.parked.values() {
+                pinned.extend(p.held.iter().copied());
+            }
+        } else {
+            for p in self.reads.parked.values() {
+                pinned.insert(p.root);
+            }
+        }
+
+        // Least recently USED first. Eviction in id order is eviction by
+        // BLAKE3, which is to say at random, and the block that just arrived
+        // is as likely a victim as any other.
+        let mut victims: Vec<(u64, Cid)> = self
             .blocks
             .0
             .keys()
-            .copied()
-            .filter(|c| !pinned.contains(c))
+            .filter(|c| !pinned.contains(*c))
+            .map(|c| (self.last_used.get(c).copied().unwrap_or(0), *c))
             .collect();
-        for v in victims {
-            if held <= self.params.max_warm_bytes {
+        victims.sort_unstable();
+        for (_, v) in victims {
+            if self.warm_bytes <= self.params.max_warm_bytes {
                 break;
             }
             if let Some(b) = self.blocks.0.remove(&v) {
-                held -= b.len();
+                self.warm_bytes -= b.len();
+                self.last_used.remove(&v);
             }
         }
+        if self.warm_bytes <= self.params.max_warm_bytes {
+            return Vec::new();
+        }
+
+        // Still over, with nothing left to drop: what the parked reads need at
+        // once does not fit. They are ANSWERED rather than left to evict each
+        // other's paths for ever. The largest goes first, and only as many as
+        // it takes.
+        let mut by_size: Vec<(usize, read::ReqId)> = self
+            .reads
+            .parked
+            .iter()
+            .map(|(r, p)| (p.held.len(), *r))
+            .collect();
+        by_size.sort_unstable_by(|a, b| b.cmp(a));
+        let mut out = Vec::new();
+        for (_, req) in by_size {
+            if self.warm_bytes <= self.params.max_warm_bytes {
+                break;
+            }
+            let Some(p) = self.reads.parked.remove(&req) else {
+                continue;
+            };
+            self.forget_waiting(req);
+            out.push(Effect::Reply {
+                client: p.client,
+                req_id: req,
+                result: read::ReadResult::OutOfWarmSpace,
+            });
+            // Its pins are released; drop what is now unpinned.
+            let mut pinned: BTreeSet<Cid> = self.unpublished.iter().map(|(c, _)| *c).collect();
+            pinned.insert(self.root);
+            pinned.insert(self.published_root);
+            for q in self.reads.parked.values() {
+                pinned.extend(q.held.iter().copied());
+            }
+            let mut victims: Vec<(u64, Cid)> = self
+                .blocks
+                .0
+                .keys()
+                .filter(|c| !pinned.contains(*c))
+                .map(|c| (self.last_used.get(c).copied().unwrap_or(0), *c))
+                .collect();
+            victims.sort_unstable();
+            for (_, v) in victims {
+                if self.warm_bytes <= self.params.max_warm_bytes {
+                    break;
+                }
+                if let Some(b) = self.blocks.0.remove(&v) {
+                    self.warm_bytes -= b.len();
+                    self.last_used.remove(&v);
+                }
+            }
+        }
+        out
     }
 
     /// Start from a published root this engine did not write.
