@@ -429,6 +429,35 @@ async fn main() -> Result<()> {
     }
 
     // ---- (8) does a DELEGATE-originated PUT end up hosted and readable? ----
+    //
+    // NOT ASKED on a local-mode node. Measured: on `freenet local local` a
+    // delegate PUT is never acknowledged, is not readable and is not served,
+    // while the SAME probe against a network-mode node on the same machine
+    // gets yes to all three -- and F21's own probe reports put=0/k here and
+    // k/k there. So the local answer is not a NO, it is a node that does not
+    // answer, and printing NO would have put a false platform fact in a log
+    // that reads exactly like a real one. It already did, for one report.
+    //
+    // A node this probe spawned is `local local` by construction. A borrowed
+    // one must be declared, and an undeclared one is not assumed to be the
+    // convenient case.
+    let mode = match &existing {
+        None => "local".to_string(),
+        Some(_) => std::env::var("PROBE_MODE").unwrap_or_else(|_| "unstated".into()),
+    };
+    if mode != "network" {
+        println!(
+            "(8) NOT ASKED: this node is {}, and a delegate PUT is only \
+             answered by a node in NETWORK mode. Point PROBE_WS at one and \
+             set PROBE_MODE=network.",
+            match mode.as_str() {
+                "local" => "in local mode",
+                _ => "of an unstated mode",
+            }
+        );
+        println!("done");
+        return Ok(());
+    }
     let mut s8 = vec![0u8];
     s8.extend_from_slice(b"probe-q8-delegate-put");
     let p8: Vec<u8> = blake3::hash(&s8).as_bytes().to_vec();
