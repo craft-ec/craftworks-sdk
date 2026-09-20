@@ -85,8 +85,16 @@ impl Reassembler {
         if total == 0 || total > MAX_TOTAL_CHUNKS || index >= total {
             return Err(Unusable::BadStream);
         }
-        if data.len() > crate::MAX_FRAME {
-            return Err(Unusable::TooLarge);
+        // A chunk larger than the sender's OWN chunk size is not a chunk.
+        // Bounding it by `MAX_FRAME` instead — sixteen times larger — is what
+        // let one stream hold about a gigabyte.
+        if data.len() > crate::MAX_CHUNK {
+            return Err(Unusable::BadStream);
+        }
+        // Refuse on the DECLARATION, before any of it arrives. `total` is the
+        // sender's number and it says how big the message will be.
+        if (total as usize).saturating_mul(crate::MAX_CHUNK) > crate::MAX_REASSEMBLED {
+            return Err(Unusable::BadStream);
         }
 
         let at = match self.streams.iter().position(|s| s.id == id) {
@@ -131,7 +139,20 @@ impl Reassembler {
         // in the one crate whose claim is that a stranger's bytes can never
         // cause one. Found by the byte-cap test, which is the only case where
         // an eviction and an insert happen in the same call.
-        while self.bytes > self.max_bytes && self.streams.len() > 1 {
+        // A stream that has grown past what this client will ever reassemble
+        // is dropped AT THIS CHUNK rather than when it completes — the point
+        // of a bound is that the bytes are never held.
+        if self.streams[at].bytes > crate::MAX_REASSEMBLED {
+            let s = self.streams.remove(at);
+            self.bytes -= s.bytes;
+            return Err(Unusable::BadStream);
+        }
+
+        // And the whole buffer is bounded, INCLUDING when there is only one
+        // stream in it. The first version said `streams.len() > 1`, so a lone
+        // sender met no bound at all — and the test that was supposed to
+        // cover this used four streams, which is exactly why it passed.
+        while self.bytes > self.max_bytes && !self.streams.is_empty() {
             self.drop_oldest();
         }
 

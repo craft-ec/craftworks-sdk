@@ -5,6 +5,7 @@
 //! picked, and this crate compiles to wasm with `panic = abort`, where a panic
 //! is a dead instance rather than an error an app can catch.
 
+use freenet_stdlib::client_api::streaming::MAX_CONCURRENT_STREAMS;
 use wire::{unframe, Incoming, Reassembler, Unusable};
 
 fn r() -> Reassembler {
@@ -140,7 +141,23 @@ fn abandoned_streams_never_wedge_reassembly() {
     for id in 0..9u32 {
         assert_eq!(rs.chunk(id, 0, 2, vec![id as u8; 10]), Ok(None));
     }
-    // A new stream still works, which is the whole point.
+    // THE COUNT IS BOUNDED, and this is the assertion the test was missing.
+    //
+    // It used to check only that a fresh stream could still complete — which
+    // is true whether or not anything bounds the count, because nothing
+    // REFUSES a new stream; they would simply accumulate. Mutation found it:
+    // disabling the slot eviction left the test green. What the guard
+    // actually does is keep the number of half-finished streams from growing
+    // without limit, so that is what is asserted.
+    assert!(
+        rs.in_flight() <= MAX_CONCURRENT_STREAMS,
+        "nine abandoned streams left {} in flight against a cap of {}",
+        rs.in_flight(),
+        MAX_CONCURRENT_STREAMS
+    );
+
+    // And a new stream still works, which is what the bound is FOR: without
+    // it the oldest would never go and a browser would accumulate them.
     assert_eq!(rs.chunk(100, 0, 2, b"aa".to_vec()), Ok(None));
     assert_eq!(
         rs.chunk(100, 1, 2, b"AA".to_vec()),
@@ -218,10 +235,169 @@ fn no_refusal_may_ever_lead_to_a_credential_prompt() {
 /// opens and then never understands anything.
 #[test]
 fn the_url_asks_for_the_encoding_this_crate_actually_speaks() {
-    let url = wire::ws_url("127.0.0.1", 7711);
+    let url = wire::ws_url("127.0.0.1", 7711).expect("loopback is allowed");
     assert!(
         url.contains("encodingProtocol=native"),
         "the URL does not ask for native encoding: {url}"
     );
     assert!(url.starts_with("ws://127.0.0.1:7711/"), "{url}");
+}
+
+/// A cleartext URL is only ever built for loopback.
+///
+/// `ws://` to another machine would put every request, every reply and the
+/// shape of a whole session on the wire in the clear. Whether we ever do that,
+/// and over what, is a decision nobody has taken — and until they have,
+/// BUILDING the URL is how it happens by accident.
+#[test]
+fn a_cleartext_url_is_refused_for_anything_but_loopback() {
+    for host in ["example.com", "10.0.0.5", "203.0.113.1", "node.local"] {
+        let got = wire::ws_url(host, 7711);
+        assert!(
+            got.is_err(),
+            "built a cleartext ws:// URL for `{host}`: {got:?}"
+        );
+    }
+    // The control: loopback still works, in each spelling a person uses.
+    for host in ["127.0.0.1", "localhost", "::1"] {
+        assert!(
+            wire::ws_url(host, 7711).is_ok(),
+            "refused loopback host `{host}`, which is the only one anything \
+             can currently reach"
+        );
+    }
+}
+
+/// The same node error means the same thing at BOTH doors.
+///
+/// It arrives unchunked, or reassembled from chunks. The first version
+/// decoded those on different arms, so one fact got two answers depending on
+/// a transport detail the SENDER picks — and a sender that wanted the softer
+/// one only had to chunk.
+#[test]
+fn a_node_error_means_the_same_thing_chunked_or_not() {
+    // A `HostResponse` that is the node's own error: `Err` inside the result.
+    let err: Result<wire::_test::Host, wire::_test::Err> = Err(wire::_test::client_error("no"));
+    let bytes = bincode::serialize(&err).expect("encodes");
+
+    // Door one: straight in.
+    let mut a = r();
+    let direct = unframe(&mut a, &bytes);
+    assert!(
+        matches!(direct, Incoming::Refused(_)),
+        "unchunked, a node error came back {direct:?}"
+    );
+
+    // Door two: the same bytes, arriving as one complete chunk.
+    let mut b = r();
+    let whole = b
+        .chunk(1, 0, 1, bytes.clone())
+        .expect("a single-chunk stream")
+        .expect("completes at once");
+    let reassembled = wire::_test::classify_for_test(&whole);
+    assert!(
+        matches!(reassembled, Incoming::Refused(_)),
+        "reassembled, the same node error came back {reassembled:?} — one \
+         fact must not get two answers because of how it was carried"
+    );
+}
+
+/// ONE stream may not hold what it likes.
+///
+/// **This is the case the first byte-cap test missed, and it missed it for a
+/// reason worth writing down.** That test used FOUR streams, so it exercised
+/// the eviction path — and eviction was guarded by `streams.len() > 1`, which
+/// is precisely the condition a single stream never meets. The bound looked
+/// tested and a lone sender was unbounded: chunks were bounded by `MAX_FRAME`
+/// (4 MiB) rather than by stdlib's own `CHUNK_SIZE` (256 KiB), so one stream
+/// could hold 256 × 4 MiB ≈ 1 GiB in a browser tab — for a message `decode`
+/// would then refuse as `TooLarge` anyway.
+#[test]
+fn one_stream_alone_is_bounded_too() {
+    let mut rs = r();
+    rs.max_bytes = 16 * 1024 * 1024;
+
+    // A chunk bigger than the sender's own chunk size is not a chunk.
+    assert_eq!(
+        rs.chunk(1, 0, 8, vec![0u8; wire::MAX_CHUNK + 1]),
+        Err(Unusable::BadStream),
+        "a chunk larger than CHUNK_SIZE was accepted, which is how one stream \
+         holds gigabytes"
+    );
+
+    // And a lone stream feeding legal-sized chunks is still bounded.
+    let mut sent = 0usize;
+    for i in 0..200u32 {
+        match rs.chunk(2, i, 200, vec![0u8; wire::MAX_CHUNK]) {
+            Ok(_) => sent += 1,
+            Err(_) => break,
+        }
+        assert!(
+            rs.bytes() <= rs.max_bytes,
+            "ONE stream held {} B against a cap of {} B after {} chunk(s)",
+            rs.bytes(),
+            rs.max_bytes,
+            sent
+        );
+    }
+    assert!(
+        rs.bytes() <= rs.max_bytes,
+        "one stream ended holding {} B against a cap of {} B",
+        rs.bytes(),
+        rs.max_bytes
+    );
+}
+
+/// A message whose DECLARED size cannot be legitimate is refused at chunk 0,
+/// before a single byte of it is held.
+#[test]
+fn an_impossible_total_is_refused_before_any_of_it_arrives() {
+    let mut rs = r();
+    // 256 chunks is stdlib's cap and ~64 MiB; nothing this client asks for
+    // comes back that large, so it is refused on the declaration alone.
+    let too_many = (wire::MAX_REASSEMBLED / wire::MAX_CHUNK + 2) as u32;
+    assert_eq!(
+        rs.chunk(1, 0, too_many, vec![0u8; 16]),
+        Err(Unusable::BadStream),
+        "a total declaring more than this client will ever reassemble was \
+         accepted, so the bytes arrive before anything objects"
+    );
+    assert_eq!(rs.bytes(), 0);
+    assert_eq!(rs.in_flight(), 0);
+}
+
+/// EVICTION still has something to do, and this is the test that reaches it.
+///
+/// **Found by re-running the mutants after adding the per-stream bound.**
+/// "Never drop the oldest" SURVIVED: the new declaration and per-stream caps
+/// catch a single greedy stream long before the buffer's own byte cap is
+/// reached, so nothing in the suite exercised eviction any more. A guard that
+/// no test can reach is a guard that can be deleted with the suite green.
+///
+/// The case eviction is actually for is MANY streams, each individually
+/// legitimate, together over the buffer's cap — a node answering several
+/// requests at once while one of them stalls.
+#[test]
+fn many_legitimate_streams_together_still_force_eviction() {
+    let mut rs = r();
+    rs.max_bytes = 1024 * 1024; // 1 MiB
+
+    // Eight streams — stdlib's concurrent cap — each sending ONE legal chunk
+    // of 256 KiB. Individually fine; together 2 MiB, twice the buffer's cap.
+    for id in 0..8u32 {
+        let _ = rs.chunk(id, 0, 4, vec![b'x'; wire::MAX_CHUNK]);
+        assert!(
+            rs.bytes() <= rs.max_bytes,
+            "after stream {id} the buffer held {} B against a cap of {} B — \
+             eviction did not fire, and every one of these chunks is legal on \
+             its own, so nothing else would stop them",
+            rs.bytes(),
+            rs.max_bytes
+        );
+    }
+    assert!(
+        rs.in_flight() < 8,
+        "all eight streams survived a 1 MiB cap holding 2 MiB, so nothing was \
+         evicted"
+    );
 }

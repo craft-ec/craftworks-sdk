@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     println!("node:  isolated NETWORK mode on 127.0.0.1:{port} (pid recorded by the harness)");
     let _ = &node;
 
-    let url = wire::ws_url("127.0.0.1", port);
+    let url = wire::ws_url("127.0.0.1", port).map_err(|e| anyhow::anyhow!(e))?;
     println!("url:   {url}");
 
     // ---- 1 + 2: a CHUNKED RegisterDelegate, which is the first thing any
@@ -131,7 +131,9 @@ async fn main() -> Result<()> {
     let mut ra = Reassembler::new();
     send_frames(&mut a, frames).await?;
     match next(&mut a, &mut ra, deadline).await {
-        Some(Incoming::Ack) => println!("reg:   the node accepted a CHUNKED registration"),
+        Some(Incoming::Ack(kind)) => {
+            println!("reg:   the node accepted a CHUNKED registration ({kind:?})")
+        }
         other => bail!("the chunked registration was answered {other:?}"),
     }
 

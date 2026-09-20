@@ -15,3 +15,7 @@ freenet-stdlib = { version = "0.10.0", features = ["net"] }
 bincode = "1"
 
 [dev-dependencies]
+bincode = "1"
+# The tests assert against stdlib's OWN caps rather than restating them: a
+# number copied here would agree with itself while the real bound moved.
+freenet-stdlib = { version = "0.10.0", features = ["net"] }

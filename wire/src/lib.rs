@@ -79,9 +79,34 @@ pub use reassemble::Reassembler;
 /// The largest single frame this build will decode before looking inside.
 ///
 /// A bound BEFORE the decoder sees anything, so a length field cannot ask for
-/// an allocation the sender chooses. Matches the protocol crate's own ceiling
-/// in spirit and is checked here because this is the outermost door.
+/// an allocation the sender chooses. It is the outermost door.
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
+
+/// The largest CHUNK this build will hold.
+///
+/// stdlib's own `CHUNK_SIZE`: a chunk larger than the size the sender's own
+/// chunker produces is not a chunk, it is somebody claiming to be one. The
+/// first version bounded a chunk by [`MAX_FRAME`] instead, which is sixteen
+/// times larger — and that, with an eviction rule that could never fire for a
+/// single stream, let one sender hold about a gigabyte in a browser tab.
+pub const MAX_CHUNK: usize = freenet_stdlib::client_api::streaming::CHUNK_SIZE;
+
+/// The largest message this build will REASSEMBLE.
+///
+/// Chosen from the largest legitimate reply rather than from what the format
+/// allows, which is the difference between a bound and a formality.
+///
+/// The biggest thing this client actually receives is an engine reply, and
+/// those are bounded by `protocol::MAX_MESSAGE` — 4 MiB — before the engine
+/// will encode one. Doubling it leaves room for the client-API envelope and
+/// for an engine that grows its own ceiling once without this becoming the
+/// thing that breaks.
+///
+/// stdlib's cap is 256 chunks ≈ 64 MiB, sized for a 50 MiB contract STATE.
+/// This client never asks for one: it talks to a delegate, and contract state
+/// reaches it as engine replies. So the tighter number is the true one, and
+/// using theirs would be accepting a bound for a case we do not have.
+pub const MAX_REASSEMBLED: usize = 8 * 1024 * 1024;
 
 /// What arrived, once it has been understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,19 +125,36 @@ pub enum Incoming {
     /// **A HINT, never an authority.** See the module docs: a root from the
     /// node means "look", not "this is where the tree is".
     HeadChanged { key: String },
-    /// The node accepted a request.
+    /// The node accepted a request, and WHICH.
     ///
     /// **An ack is not durability.** A write becomes published by being READ
     /// BACK, never by being acknowledged — and through a gateway that is a
     /// trust requirement and not only a timing one: an ack is unauthenticated,
     /// so a hostile node could acknowledge a write it never made.
-    Ack,
+    ///
+    /// The kind is for diagnostics and for `provision()`, which needs to tell
+    /// "the delegate registered" from "the contract went in" while doing both
+    /// in one session.
+    Ack(AckKind),
     /// The node refused. The reason is the NODE's word; see [`Refused`].
     Refused(Refused),
     /// Not something this build can use. Counted, never silently dropped.
     Unusable(Unusable),
     /// A chunk of a larger message; nothing to hand on yet.
     Partial,
+}
+
+/// Which request an [`Incoming::Ack`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckKind {
+    /// A delegate was registered.
+    Registered,
+    /// A contract was put.
+    Put,
+    /// A subscription was taken.
+    Subscribed,
+    /// Something that needed no answer succeeded.
+    Ok,
 }
 
 /// A refusal, as the node worded it.
@@ -236,8 +278,26 @@ pub fn frame_register_delegate(
 /// — and therefore everything here — speaks bincode. Built in Rust rather
 /// than assembled in JavaScript for exactly that reason: it is a protocol
 /// fact, and the first version of the page's socket omitted it.
-pub fn ws_url(host: &str, port: u16) -> String {
-    format!("ws://{host}:{port}/v1/contract/command?encodingProtocol=native")
+/// Refuses a host that is not loopback, because `ws://` is cleartext.
+///
+/// Reaching a node on another machine over an unencrypted socket would put
+/// every request and every reply — and the traffic pattern of a person's whole
+/// session — on the wire in the clear. Whether that ever happens, and over
+/// what, is a decision nobody has taken; until they have, building the URL is
+/// how it happens by accident. A refusal here is a compile-time-shaped
+/// problem rather than a silent downgrade.
+pub fn ws_url(host: &str, port: u16) -> Result<String, String> {
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
+    if !loopback {
+        return Err(format!(
+            "refusing to build a cleartext ws:// URL for `{host}`: only \
+             loopback is allowed until transport security for a remote node \
+             has been decided"
+        ));
+    }
+    Ok(format!(
+        "ws://{host}:{port}/v1/contract/command?encodingProtocol=native"
+    ))
 }
 
 /// Understand one frame from the node.
@@ -255,15 +315,9 @@ pub fn unframe(r: &mut Reassembler, bytes: &[u8]) -> Incoming {
     }
     // A chunk first: a `StreamChunk` is a valid `HostResponse`, so decoding
     // has to happen before the shape is known.
-    let decoded = match Reassembler::decode(bytes) {
+    let decoded = match decode_one(bytes) {
         Ok(d) => d,
-        // A node's own error reply is a MESSAGE, not a failure to read one.
-        Err(Unusable::NodeSaidNo) => {
-            return Incoming::Refused(Refused {
-                said: "the node refused the request".into(),
-            })
-        }
-        Err(why) => return Incoming::Unusable(why),
+        Err(other) => return other,
     };
     let whole = match decoded {
         HostResponse::StreamChunk {
@@ -273,15 +327,36 @@ pub fn unframe(r: &mut Reassembler, bytes: &[u8]) -> Incoming {
             data,
         } => match r.chunk(stream_id, index, total, data.to_vec()) {
             Ok(None) => return Incoming::Partial,
-            Ok(Some(bytes)) => match Reassembler::decode(&bytes) {
+            // THE SAME FUNCTION, because this is the same check at a second
+            // door. The first version decoded here with a different arm, so a
+            // node error arriving UNCHUNKED became `Refused` and the identical
+            // error arriving CHUNKED became `Unusable` — one fact, two
+            // answers, decided by a detail of transport the sender picks.
+            Ok(Some(bytes)) => match decode_one(&bytes) {
                 Ok(d) => d,
-                Err(why) => return Incoming::Unusable(why),
+                Err(other) => return other,
             },
             Err(why) => return Incoming::Unusable(why),
         },
         other => other,
     };
     classify(whole)
+}
+
+/// Decode one complete message, turning a node's own error into the message
+/// it is.
+///
+/// One function, called at BOTH doors — unchunked and reassembled — so the
+/// same bytes cannot mean two different things depending on how they arrived.
+fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
+    match Reassembler::decode(bytes) {
+        Ok(d) => Ok(d),
+        // A node's own error reply is a MESSAGE, not a failure to read one.
+        Err(Unusable::NodeSaidNo) => Err(Incoming::Refused(Refused {
+            said: "the node refused the request".into(),
+        })),
+        Err(why) => Err(Incoming::Unusable(why)),
+    }
 }
 
 fn classify(r: HostResponse) -> Incoming {
@@ -299,7 +374,7 @@ fn classify(r: HostResponse) -> Incoming {
                 // node ACKNOWLEDGING — RegisterDelegate answers this way. The
                 // first version called it unusable, which turned the ordinary
                 // reply to the first message of every session into an error.
-                Incoming::Ack
+                Incoming::Ack(AckKind::Registered)
             } else {
                 Incoming::EngineBytes(out)
             }
@@ -309,9 +384,13 @@ fn classify(r: HostResponse) -> Incoming {
                 key: key.to_string(),
             }
         }
-        HostResponse::ContractResponse(ContractResponse::PutResponse { .. })
-        | HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. })
-        | HostResponse::Ok => Incoming::Ack,
+        HostResponse::ContractResponse(ContractResponse::PutResponse { .. }) => {
+            Incoming::Ack(AckKind::Put)
+        }
+        HostResponse::ContractResponse(ContractResponse::SubscribeResponse { .. }) => {
+            Incoming::Ack(AckKind::Subscribed)
+        }
+        HostResponse::Ok => Incoming::Ack(AckKind::Ok),
         // A kind this build has no use for. NAMED, so a failure says which:
         // the first run of the live driver reported `NotForUs` and could have
         // meant either "the node refused" or "a variant we do not handle",
@@ -350,4 +429,29 @@ fn frames(req: &ClientRequest<'static>, stream_id: u32) -> Result<Vec<Vec<u8>>, 
         .iter()
         .map(|c| bincode::serialize(c).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Handles for tests that need to build what a node would send.
+///
+/// Not a general surface: the alternative is a test that constructs the bytes
+/// by hand and agrees with its own idea of the format, which is the drift this
+/// crate exists to prevent.
+#[doc(hidden)]
+pub mod _test {
+    pub use freenet_stdlib::client_api::ClientError as Err;
+    pub use freenet_stdlib::client_api::HostResponse as Host;
+
+    pub fn client_error(msg: &str) -> Err {
+        Err::from(freenet_stdlib::client_api::ErrorKind::Unhandled {
+            cause: msg.to_string().into(),
+        })
+    }
+
+    /// Run a COMPLETE message through the same path a reassembled one takes.
+    pub fn classify_for_test(bytes: &[u8]) -> super::Incoming {
+        match super::decode_one(bytes) {
+            Ok(d) => super::classify(d),
+            Err(other) => other,
+        }
+    }
 }
