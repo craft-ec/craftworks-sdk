@@ -59,7 +59,9 @@ pub enum Op {
 }
 
 /// How far along a write is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum State {
     Accepted,
     /// Still held, not yet saved, and the engine cannot publish it right now.
@@ -2355,7 +2357,31 @@ impl<B: Blocks> Engine<B> {
     /// may be from another version, truncated, or nothing to do with us. A
     /// refusal is not a disaster — the caller starts from `Start` and reads
     /// its head, which is the only authority anyway.
-    pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
+    /// Resume from a context, or start fresh if it cannot be used.
+    ///
+    /// The pair `from_context(...).unwrap_or_else(|_| Engine::new(...))` does
+    /// not compile: `from_context` consumes `blocks`, so a caller cannot
+    /// reach for them again on the error arm. That shape pushed one caller
+    /// into an `unreachable!()`, which is a PANIC on a path a damaged context
+    /// reaches — and a delegate that panics on input is one a malformed
+    /// context can take down. So the fallback lives here, where the blocks
+    /// are still in hand.
+    ///
+    /// The bool says which happened. A caller that wants to report "this
+    /// engine started from nothing" needs it, and inferring it from a state
+    /// that merely looks fresh would be a guess.
+    pub fn from_context_or_new(bytes: &[u8], params: Params, blocks: B) -> (Self, bool) {
+        match Self::read_context(bytes, params) {
+            Some(c) => (Self::hydrate(c, params, blocks), true),
+            None => (Engine::new(params, blocks), false),
+        }
+    }
+
+    /// Read and VERIFY a context, without needing the blocks.
+    ///
+    /// Split out so a caller can fall back to a fresh engine without having
+    /// already given its blocks away.
+    fn read_context(bytes: &[u8], params: Params) -> Option<Context> {
         use bincode::Options;
         // Every check below happens BEFORE the decoder sees a byte of the
         // body. A decoder that refuses malformed input is not the same thing
@@ -2363,28 +2389,33 @@ impl<B: Blocks> Engine<B> {
         // 656 of 876 single-window corruptions as a perfectly good context
         // and handed back an engine in whatever state the damage described.
         if bytes.len() < CONTEXT_HEADER || bytes.len() > params.max_context_bytes {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         if bytes[..4] != CONTEXT_MAGIC {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
         if version != CONTEXT_VERSION {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         let body = &bytes[CONTEXT_HEADER..];
         if bytes[6..CONTEXT_HEADER] != context_checksum(body) {
-            return Err(ContextError::Unreadable);
+            return None;
         }
         let c: Context = context_opts(params.max_context_bytes)
             .deserialize(body)
-            .map_err(|_| ContextError::Unreadable)?;
+            .ok()?;
         // Kept as well as the header's: two independent statements of the
         // same fact cost two bytes and catch a build that changed the shape
         // without changing the constant.
         if c.version != CONTEXT_VERSION {
-            return Err(ContextError::Unreadable);
+            return None;
         }
+        Some(c)
+    }
+
+    /// Build an engine from a context already verified by `read_context`.
+    fn hydrate(c: Context, params: Params, blocks: B) -> Self {
         let mut e = Engine::new(params, blocks);
         e.published_seq = c.published_seq;
         e.published_root = c.published_root;
@@ -2421,6 +2452,13 @@ impl<B: Blocks> Engine<B> {
         for (w, gs) in c.parity_waiting {
             e.parity_waiting.insert(w, gs.into_iter().collect());
         }
-        Ok(e)
+        e
+    }
+
+    pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
+        match Self::read_context(bytes, params) {
+            Some(c) => Ok(Self::hydrate(c, params, blocks)),
+            None => Err(ContextError::Unreadable),
+        }
     }
 }

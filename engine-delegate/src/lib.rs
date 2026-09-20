@@ -11,4 +11,7 @@
 //! [`schedule::Limits`] where a node that changes them is a different value
 //! and not a different design.
 
+pub mod blocks;
 pub mod schedule;
+pub mod shell;
+pub mod wire;

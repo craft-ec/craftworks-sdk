@@ -353,8 +353,11 @@ dependencies = [
 name = "engine-delegate"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "engine",
  "freenet-prolly",
+ "freenet-stdlib",
+ "serde",
 ]
 
 [[package]]
