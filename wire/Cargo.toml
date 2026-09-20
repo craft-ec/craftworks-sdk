@@ -1,0 +1,17 @@
+[package]
+name = "wire"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The one place allowed to know freenet's client API. Pure framing, no I/O."
+
+[dependencies]
+# The ONLY crate in this workspace that may depend on this, besides the
+# delegates and the probe. The boundary gate states that as an allowlist over
+# every workspace crate, so a new sibling is protected by default rather than
+# by having been remembered.
+freenet-stdlib = { version = "0.10.0", features = ["net"] }
+bincode = "1"
+
+[dev-dependencies]
