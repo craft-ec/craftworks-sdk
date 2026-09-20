@@ -184,10 +184,30 @@ pub struct Epoch(pub u32);
 ///
 /// Stated at `Start` and never inferred. The engine does not mint authority:
 /// it is handed some, or it has none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeySource {
     SecretStore,
     Reissued,
+    /// Handed in from outside and kept in the secret store, unmodified.
+    ///
+    /// The delegate derives NOTHING: it is given a key and it uses that key.
+    /// Where a real device key comes from is sdk#14's, and this is the
+    /// parameter that lets it slot in without the shell changing — the shell
+    /// only ever knows that it was handed one.
+    ///
+    /// Today the only provisioner is a test harness, which generates a fresh
+    /// key per run and removes it afterwards. `Test` says so IN THE TYPE, so
+    /// a key that is not for real use cannot be mistaken for one that is by
+    /// anything reading this.
+    Provisioned(Provisioned),
+}
+
+/// Who provisioned a key, and whether it is real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Provisioned {
+    /// Generated for one run by a driver, and removed at the end of it.
+    /// Never read from disk, never a real key.
+    Test,
 }
 
 /// A group's three parity ids. The unit redundancy comes in: three blocks are

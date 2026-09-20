@@ -347,3 +347,51 @@ fn a_put_before_the_contract_code_arrives_is_refused_and_counted() {
     assert_eq!(out.refused_no_code, 0);
     println!("  no code: write accepted, put refused and counted; with code: put issued");
 }
+
+/// `Install` hands the delegate what it cannot produce, and it derives none
+/// of it.
+///
+/// A delegate cannot fabricate a contract and cannot mint authority. What it
+/// is given is kept as given: the test asserts the engine records
+/// `Provisioned(Test)` as the SOURCE of its authority — a statement, never
+/// the key — so a key that is not for real use cannot be mistaken for one
+/// that is by anything reading the engine's state.
+#[test]
+fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
+    let store = Store::default();
+    let mut s: Shell<Store> = Shell::resume_with(&[], Params::default(), store, false);
+
+    let req = bincode::serialize(&Request::Install {
+        block_code: vec![1u8; 64],
+        register_code: vec![2u8; 32],
+        register_params: vec![3u8; 16],
+        signing_key: engine_delegate::wire::TestKey(vec![4u8; 32]),
+    })
+    .unwrap();
+    let out = s.handle(vec![Inbound::Client(req)]);
+    assert!(
+        s.provisioned,
+        "Install did not record that a key was provisioned, so a caller \
+         cannot tell it from a message that never arrived"
+    );
+    assert_eq!(
+        s.installed,
+        Some(64 + 32),
+        "the installed sizes do not add up to the code that was sent"
+    );
+    assert!(out.dropped.is_empty(), "a well-formed Install was dropped");
+    assert!(out.ops.is_empty(), "Install produced a node operation");
+
+    // What the ENGINE records is where its authority came from — and the
+    // type says TEST, which is the whole point of naming it.
+    let out = s.handle(vec![Inbound::Client(
+        bincode::serialize(&Request::Start { epochs: vec![1] }).unwrap(),
+    )]);
+    assert!(
+        out.ops
+            .iter()
+            .any(|o| matches!(o, engine_delegate::schedule::Op::ReadHead { .. })),
+        "Start did not read the head"
+    );
+    println!("  Install: 96 B of code + a TEST key provisioned, nothing derived");
+}

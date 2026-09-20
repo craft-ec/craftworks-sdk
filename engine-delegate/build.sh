@@ -16,11 +16,28 @@ cd "$(dirname "$0")/.."
 env -u CARGO_TARGET_DIR cargo build -p engine-delegate --release --target wasm32-unknown-unknown
 env -u CARGO_TARGET_DIR cargo build -p probe --release --bin import-gate
 
-wasm=target/wasm32-unknown-unknown/release/engine_delegate.wasm
+raw=target/wasm32-unknown-unknown/release/engine_delegate.wasm
+wasm=target/wasm32-unknown-unknown/release/engine_delegate.stripped.wasm
 gate=target/release/import-gate
 
+# Strip the custom sections. 40% of this artefact is the `name` section --
+# debug symbols -- and it is fetched from the network by every node that ever
+# loads the delegate, so it is 391 KB each of them pays for symbol names
+# nobody reads: a delegate's panics do not reach a developer's backtrace.
+#
+# Stripped is what is GATED and what ships. Gating the unstripped one and
+# shipping the stripped one would be checking a different artefact from the
+# one that runs.
+if command -v wasm-tools > /dev/null; then
+  wasm-tools strip --all "$raw" -o "$wasm"
+else
+  echo "note: wasm-tools not found — shipping unstripped, ~40% larger" >&2
+  cp "$raw" "$wasm"
+fi
+
+before=$(wc -c < "$raw" | tr -d ' ')
 size=$(wc -c < "$wasm" | tr -d ' ')
-echo "engine-delegate: ${size} B"
+echo "engine-delegate: ${size} B stripped (${before} B before)"
 
 # Both halves: an unwired delegate (no imports at all) and an import the node
 # does not define. The binary refuses on either.

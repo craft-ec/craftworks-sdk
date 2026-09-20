@@ -66,10 +66,21 @@ impl DelegateInterface for EngineDelegate {
         // since writing a secret needs the ctx mutably.
         if installing.is_some() {
             if let InboundDelegateMsg::ApplicationMessage(m) = &inbound {
-                if let Some(crate::wire::Request::Install { block_code }) =
-                    crate::wire::request(m.payload.as_ref())
+                if let Some(crate::wire::Request::Install {
+                    block_code,
+                    register_code,
+                    register_params,
+                    signing_key,
+                }) = crate::wire::request(m.payload.as_ref())
                 {
                     ctx.set_secret(BLOCK_CODE, &block_code);
+                    ctx.set_secret(REGISTER_CODE, &register_code);
+                    ctx.set_secret(REGISTER_PARAMS, &register_params);
+                    // The signing key. Stored as given and never derived
+                    // from; the delegate's only use for it is to sign a
+                    // Register record, and today it is a key a driver made
+                    // for one run and will remove afterwards.
+                    ctx.set_secret(SIGNING_KEY, &signing_key.0);
                 }
             }
         }
@@ -133,6 +144,13 @@ impl DelegateInterface for EngineDelegate {
 /// delegate useless exactly when it is left alone, which is the case it
 /// exists for.
 const BLOCK_CODE: &[u8] = b"block_contract_code";
+/// The Register contract's code, and the keyset its instance is created
+/// under. Both supplied, neither derived.
+const REGISTER_CODE: &[u8] = b"register_contract_code";
+const REGISTER_PARAMS: &[u8] = b"register_contract_params";
+/// The device signing key, as handed in. TEST ONLY today — generated per run
+/// by the driver, never read from disk, removed at the end of the run.
+const SIGNING_KEY: &[u8] = b"device_signing_key";
 
 fn blake3_of(bytes: &[u8]) -> Vec<u8> {
     freenet_prolly::block_id(freenet_prolly::kind::RAW, bytes).to_vec()

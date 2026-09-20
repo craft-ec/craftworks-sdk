@@ -12,15 +12,32 @@ use freenet_prolly::Cid;
 /// What a client asks the engine to do.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Request {
-    /// Give the delegate the contract code it will write with.
+    /// Give the delegate everything it cannot produce for itself.
     ///
-    /// A delegate CANNOT fabricate a contract — it has no way to produce
-    /// wasm — so the code must arrive from outside, once, and be kept. It
-    /// goes in the SECRET store rather than the context: secrets are on disk
-    /// and survive a node restart (measured), while the context is process
-    /// memory with a ten-minute TTL. Code that had to be re-sent after every
-    /// restart would make the delegate useless exactly when it is left alone.
-    Install { block_code: Vec<u8> },
+    /// A delegate cannot fabricate a contract — it has no way to produce
+    /// wasm — and it cannot mint authority. Three things therefore arrive
+    /// from outside, once, and are kept in the SECRET store: secrets are on
+    /// disk and survive a node restart (measured), while the context is
+    /// process memory with a ten-minute TTL. Anything that had to be re-sent
+    /// after every restart would make the delegate useless exactly when it is
+    /// left alone, which is the case it exists for.
+    ///
+    /// The delegate DERIVES NOTHING from any of it. A Register record must be
+    /// signed, so writing a head at all needs a signing key; where a real
+    /// device key comes from is sdk#14's question, and `KeySource` is the
+    /// parameter that lets its answer slot in without the shell changing.
+    Install {
+        /// The Block contract, which carries the engine's blocks.
+        block_code: Vec<u8>,
+        /// The Register contract, which carries the head.
+        register_code: Vec<u8>,
+        /// The Register's parameters: the writer keyset it is created under.
+        /// Supplied, never derived.
+        register_params: Vec<u8>,
+        /// The device signing key. TEST ONLY today: generated per run by the
+        /// driver, never read from disk, removed at the end of the run.
+        signing_key: TestKey,
+    },
     /// Begin. The shell answers by reading the head.
     Start { epochs: Vec<u32> },
     Write {
@@ -42,6 +59,16 @@ pub enum Request {
     /// record, which is the word that lets a client safely re-submit.
     AskWrite { client: u64, write_id: u64 },
 }
+
+/// A signing key that is not a real one, and says so in its own type.
+///
+/// A plain `Vec<u8>` would let a real key be passed to this path by mistake
+/// and nothing would notice. Naming it makes the log line, the wire format
+/// and every function signature that touches it say TEST — which is the
+/// point: the danger is not that a test key leaks, it is that a real one
+/// arrives here.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct TestKey(pub Vec<u8>);
 
 /// What the shell tells a client.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

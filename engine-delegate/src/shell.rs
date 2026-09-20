@@ -91,6 +91,8 @@ pub struct Shell<B: Blocks> {
     head: Option<(u64, Cid)>,
     /// Bytes of contract code this call was asked to install, if any.
     pub installed: Option<usize>,
+    /// Whether a signing key has been provisioned this call.
+    pub provisioned: bool,
     /// Whether the delegate has the contract code it writes with.
     ///
     /// Supplied by the entry point from the secret store, because only the
@@ -134,6 +136,7 @@ impl<B: Blocks> Shell<B> {
             awaiting: if resumed { awaiting } else { BTreeSet::new() },
             head: if resumed { head } else { None },
             installed: None,
+            provisioned: false,
             has_code,
             limits: Limits::default(),
         }
@@ -220,15 +223,25 @@ impl<B: Blocks> Shell<B> {
             // Handled by the entry point, which is the only place with a
             // secret store. The shell records that it was asked, so a caller
             // can tell "installed" from "the message never arrived".
-            Request::Install { block_code } => {
-                self.installed = Some(block_code.len());
+            Request::Install {
+                block_code,
+                register_code,
+                signing_key,
+                ..
+            } => {
+                self.installed = Some(block_code.len() + register_code.len());
+                // Recorded, never derived from. What the engine is told is
+                // WHERE its authority came from, which is a statement it
+                // keeps; the key itself never reaches the core.
+                let _ = &signing_key;
+                self.provisioned = true;
                 return Vec::new();
             }
             Request::Start { epochs } => Event::Start {
-                // The device key: sdk#14 decides where it comes from. Until
-                // then the engine is told where it BELIEVES the key came
-                // from, which is a statement it records and never a secret.
-                key: KeySource::SecretStore,
+                // What the engine records is WHERE its authority came from,
+                // never the key. Today the only provisioner is a test
+                // harness, and the type says so.
+                key: KeySource::Provisioned(engine::Provisioned::Test),
                 epochs: epochs.into_iter().map(wire::epoch).collect(),
             },
             Request::Write {
