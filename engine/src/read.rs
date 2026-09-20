@@ -22,7 +22,9 @@ use freenet_prolly::{block_id, kind, Cid};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A client's own id for a read, echoed in its reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ReqId(pub u64);
 
 /// How a block is being fetched.
@@ -63,13 +65,56 @@ pub enum ReadResult {
 }
 
 /// What a client asked for, kept so the request can be retried as blocks land.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Want {
     Get(Vec<u8>),
-    Scan(Box<Range>),
+    Scan(Box<ScanSpec>),
 }
 
-#[derive(Clone, Debug)]
+/// A scan, in the engine's OWN representation.
+///
+/// `freenet_prolly::range::Range` is the library's type and is not encodable;
+/// the context is a wire format that leaves this process, so what goes into it
+/// has to be the engine's, converted at the boundary. Mirroring the fields
+/// rather than wrapping keeps the conversion total — a field added to `Range`
+/// is a compile error here, not a silently dropped bound.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScanSpec {
+    pub lo: std::ops::Bound<Vec<u8>>,
+    pub hi: std::ops::Bound<Vec<u8>>,
+    pub reverse: bool,
+    pub after: Option<Vec<u8>>,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+impl From<&ScanSpec> for Range {
+    fn from(s: &ScanSpec) -> Range {
+        Range {
+            lo: s.lo.clone(),
+            hi: s.hi.clone(),
+            reverse: s.reverse,
+            after: s.after.clone(),
+            max_entries: s.max_entries,
+            max_bytes: s.max_bytes,
+        }
+    }
+}
+
+impl From<&Range> for ScanSpec {
+    fn from(r: &Range) -> ScanSpec {
+        ScanSpec {
+            lo: r.lo.clone(),
+            hi: r.hi.clone(),
+            reverse: r.reverse,
+            after: r.after.clone(),
+            max_entries: r.max_entries,
+            max_bytes: r.max_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Parked {
     pub client: ClientId,
     pub want: Want,
@@ -163,9 +208,10 @@ pub(crate) fn attempt<B: Blocks>(
                 }
             }
         }
-        Want::Scan(r) => {
+        Want::Scan(spec) => {
             let opts = RangeOptions::default();
-            match range_with(opts, blocks, root, r) {
+            let r: Range = spec.as_ref().into();
+            match range_with(opts, blocks, root, &r) {
                 Ok(page) => {
                     if !page.need.is_empty() && page.end == PageEnd::Blocked {
                         // Only the blocks it actually stopped on, bounded by

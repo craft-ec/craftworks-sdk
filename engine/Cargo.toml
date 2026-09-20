@@ -8,3 +8,8 @@ description = "The write pipeline as a pure state machine: no I/O, no clock, no 
 
 [dependencies]
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+# The context is a wire format: it leaves this process and comes back. serde
+# gives it a decoder that REFUSES malformed bytes instead of trusting them,
+# which a hand-rolled one would have to earn test by test.
+serde = { version = "1", features = ["derive"] }
+bincode = "1"

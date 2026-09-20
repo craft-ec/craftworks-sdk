@@ -35,12 +35,16 @@ pub mod pack;
 pub mod read;
 
 /// Which client a write came from. Two tabs are two clients.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ClientId(pub u64);
 
 /// The client's own id for a write. Echoed in every state change, so a caller
 /// never has to guess which of its writes a notification is about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct WriteId(pub u64);
 
 /// What a client asked for. Mirrors the tree's own edit vocabulary; the engine
@@ -158,7 +162,9 @@ pub enum Event {
 }
 
 /// Which code epoch a head was written under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Epoch(pub u32);
 
 /// Where this engine's authority came from.
@@ -278,6 +284,11 @@ pub struct Params {
     /// implementation, and the control for the read cost bound. A bound no
     /// implementation can exceed is not a bound.
     pub refetch_held: bool,
+    /// The context budget. The platform caps a delegate's context at exactly
+    /// 400 KiB (`DelegateContext::MAX_SIZE` = 4096*10*10), so this sits below
+    /// it with headroom: exceeding the platform's cap is a refusal the engine
+    /// never sees coming, and exceeding its own is a `Busy` it can report.
+    pub max_context_bytes: usize,
     /// Count the nodes a descent would touch. It is a second walk, for the
     /// cost gate and nothing else, so it is off unless a test asks.
     pub count_descent: bool,
@@ -318,6 +329,7 @@ impl Default for Params {
             preload_blocks: 256,
             preload_bytes: 4 * 1024 * 1024,
             refetch_held: false,
+            max_context_bytes: 320 * 1024,
             count_descent: false,
             max_accept_age: 64,
             bound_accept_age: true,
@@ -344,16 +356,21 @@ struct Owed {
 }
 
 /// A commit in flight: one apply, one head bump.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Commit {
     seq: u64,
     root: Cid,
     /// Pack and block ids this commit must land before its head may move.
     data: BTreeSet<Cid>,
-    /// The pack BODIES, kept so a failed pack can be sent again. A pack is
-    /// not a block of the tree and is nowhere else: without this, a failed
-    /// pack put re-emitted nothing and the commit stalled for ever, waiting
-    /// for a confirmation for something that had already failed.
+    /// The pack bodies, for THIS call only.
+    ///
+    /// A pack is never carried in the context — it is the largest thing the
+    /// engine touches and the context is 400 KiB. So a pack that fails within
+    /// the call that made it is re-sent from here; one that fails after the
+    /// engine has been re-hydrated cannot be, and the commit's writes are
+    /// reported `Failed` instead. That is TRUE now in a way it was not
+    /// before: the core holds no tree, so nothing of that write is anywhere.
+    #[serde(skip)]
     packs: BTreeMap<Cid, Vec<u8>>,
     /// The parity groups this commit coded. A write is parity-complete when
     /// none of ITS commit's groups is still owed — not when some later
@@ -572,7 +589,11 @@ impl<B: Blocks> Engine<B> {
                 client,
                 req_id,
                 range,
-            } => self.on_read(client, req_id, read::Want::Scan(range)),
+            } => self.on_read(
+                client,
+                req_id,
+                read::Want::Scan(Box::new(range.as_ref().into())),
+            ),
             Event::Preload { client, roots } => self.on_preload(client, roots),
             Event::BlockArrived { id, bytes } => self.on_arrived(id, bytes),
             Event::BlockMissed(id) => self.on_missed(id),
@@ -1625,5 +1646,138 @@ impl<B: Blocks> Engine<B> {
     /// Fetches emitted, for the cost gate.
     pub fn fetches(&self) -> usize {
         self.reads.fetches
+    }
+}
+
+/// Everything that must survive a `process()` call.
+///
+/// The delegate's memory is fresh every time, so this is the ONLY thing the
+/// engine carries forward — and it has 400 KiB to do it in (F32). So what is
+/// here is bookkeeping, never payload: ids, sequence numbers, and what each
+/// client is waiting on. No block bytes, and above all no PACK: a pack is the
+/// largest thing the engine touches and would blow the budget on its own.
+///
+/// Versioned, because a delegate upgrade meets a context written by the
+/// previous code. A context whose version is not understood is REFUSED, and
+/// the engine starts from its head instead — which is always safe, because
+/// the head is the journal.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Context {
+    version: u16,
+    published_seq: u64,
+    published_root: Cid,
+    root: Cid,
+    next_seq: u64,
+    pending: Option<Commit>,
+    /// Groups whose parity is owed, by their ids. The BYTES are not here:
+    /// parity is a pure function of a group's members, so a re-hydrated
+    /// engine recomputes them from the node's blocks and puts the same bytes
+    /// under the same ids. Idempotent by construction.
+    owed_groups: Vec<ParityIds>,
+    parked: Vec<(read::ReqId, read::Parked)>,
+    waiting: Vec<(Cid, Vec<read::ReqId>)>,
+    attempts: Vec<(Cid, u32)>,
+    parity_waiting: Vec<((ClientId, WriteId), Vec<ParityIds>)>,
+    head_epoch: Option<Epoch>,
+}
+
+/// The version this build writes. Bumped when the shape changes.
+const CONTEXT_VERSION: u16 = 1;
+
+/// Why a context could not be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextError {
+    /// Not something this build can read — a different version, or not a
+    /// context at all. Never a panic: the bytes come from outside.
+    Unreadable,
+    /// Bigger than the budget allows.
+    TooLarge(usize),
+}
+
+impl<B: Blocks> Engine<B> {
+    /// What this engine must carry to its next call.
+    pub fn to_context(&self) -> Result<Vec<u8>, ContextError> {
+        let c = Context {
+            version: CONTEXT_VERSION,
+            published_seq: self.published_seq,
+            published_root: self.published_root,
+            root: self.root,
+            next_seq: self.next_seq,
+            pending: self.pending.clone(),
+            owed_groups: self.owed.keys().copied().collect(),
+            parked: self
+                .reads
+                .parked
+                .iter()
+                .map(|(r, p)| (*r, p.clone()))
+                .collect(),
+            waiting: self
+                .reads
+                .waiting
+                .iter()
+                .map(|(c, r)| (*c, r.iter().copied().collect()))
+                .collect(),
+            attempts: self.reads.attempts.iter().map(|(c, n)| (*c, *n)).collect(),
+            parity_waiting: self
+                .parity_waiting
+                .iter()
+                .map(|(w, g)| (*w, g.iter().copied().collect()))
+                .collect(),
+            head_epoch: self.head_epoch,
+        };
+        let bytes = bincode::serialize(&c).map_err(|_| ContextError::Unreadable)?;
+        if bytes.len() > self.params.max_context_bytes {
+            return Err(ContextError::TooLarge(bytes.len()));
+        }
+        Ok(bytes)
+    }
+
+    /// Rebuild an engine from what the last call carried.
+    ///
+    /// Refuses rather than panics: these bytes come from outside this call and
+    /// may be from another version, truncated, or nothing to do with us. A
+    /// refusal is not a disaster — the caller starts from `Start` and reads
+    /// its head, which is the only authority anyway.
+    pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
+        let c: Context = bincode::deserialize(bytes).map_err(|_| ContextError::Unreadable)?;
+        if c.version != CONTEXT_VERSION {
+            return Err(ContextError::Unreadable);
+        }
+        let mut e = Engine::new(params, blocks);
+        e.published_seq = c.published_seq;
+        e.published_root = c.published_root;
+        e.root = c.root;
+        e.next_seq = c.next_seq;
+        e.pending = c.pending;
+        e.head_epoch = c.head_epoch;
+        e.recovered = true;
+        // The owed groups come back as ids with no bytes. They are recomputed
+        // on demand from the node's blocks, which is sound because parity is a
+        // pure function of its members: the same group gives the same three
+        // blocks under the same three ids, whoever computes them.
+        for key in c.owed_groups {
+            e.owed.insert(
+                key,
+                Owed {
+                    blocks: Vec::new(),
+                    last_changed: 0,
+                    since: 0,
+                    sent: false,
+                },
+            );
+        }
+        for (r, p) in c.parked {
+            e.reads.parked.insert(r, p);
+        }
+        for (cid, reqs) in c.waiting {
+            e.reads.waiting.insert(cid, reqs.into_iter().collect());
+        }
+        for (cid, n) in c.attempts {
+            e.reads.attempts.insert(cid, n);
+        }
+        for (w, gs) in c.parity_waiting {
+            e.parity_waiting.insert(w, gs.into_iter().collect());
+        }
+        Ok(e)
     }
 }
