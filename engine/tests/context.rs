@@ -466,3 +466,92 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
     assert_ne!(before, after, "the accepted write did not reach the tree");
     println!("  over the block cap: Busy, tree untouched; under it: Accepted");
 }
+
+/// The engine keeps nothing outside its context.
+///
+/// A delegate gets a fresh wasm instance, and a fresh linear memory, on every
+/// `inbound_app_message`. A `static mut`, a `thread_local!`, a `lazy_static`
+/// or a `OnceLock` in the engine would work perfectly in every test here — one
+/// process, one memory — and silently hold nothing at all in production. No
+/// test can observe that, because the test harness IS the single process the
+/// defect needs; so this reads the source.
+///
+/// The test's own hazard is that it greps nothing: a renamed directory, a
+/// moved file, a pattern that matches no line. So it counts what it read and
+/// fails if the count is zero, and it proves the pattern matches by finding
+/// the store's own deliberate `thread_local!` in the test support file.
+#[test]
+fn no_global_state_in_the_engine() {
+    use std::path::Path;
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = 0usize;
+    let mut lines = 0usize;
+    let mut found: Vec<String> = Vec::new();
+    let pattern = [
+        "static ",
+        "thread_local!",
+        "lazy_static!",
+        "OnceLock",
+        "OnceCell",
+    ];
+
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the engine's src must be readable") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            files += 1;
+            let text = std::fs::read_to_string(&path).expect("a .rs file must read");
+            for (n, line) in text.lines().enumerate() {
+                lines += 1;
+                let code = line.trim_start();
+                // `const` is fine: it is inlined, not stored.
+                if code.starts_with("//")
+                    || code.starts_with("pub const")
+                    || code.starts_with("const")
+                {
+                    continue;
+                }
+                if pattern.iter().any(|p| code.contains(p)) {
+                    found.push(format!("{}:{}: {}", path.display(), n + 1, code));
+                }
+            }
+        }
+    }
+
+    assert!(
+        files > 0 && lines > 100,
+        "the scan read {files} file(s) and {lines} line(s) of engine source, \
+         so it checked nothing: the path {} is wrong",
+        src.display()
+    );
+    assert!(
+        found.is_empty(),
+        "the engine holds state outside its context, which a delegate's fresh \
+         linear memory throws away on every call:\n{}",
+        found.join("\n")
+    );
+
+    // The pattern really matches: the test store's own thread_local! is
+    // deliberate, is test-only, and is found by the same scan.
+    let support = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/mod.rs");
+    let text = std::fs::read_to_string(&support).expect("the test support file");
+    let hits = text
+        .lines()
+        .filter(|l| pattern.iter().any(|p| l.trim_start().contains(p)))
+        .count();
+    assert!(
+        hits > 0,
+        "the scan found no global in tests/common/mod.rs either, which HAS \
+         one on purpose — so the pattern matches nothing and the clean result \
+         above means nothing"
+    );
+    println!("  {files} engine source file(s), {lines} lines, no globals (pattern verified on {hits} test-only hit(s))");
+}

@@ -958,3 +958,128 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
         "a write was reported Failed while its edit is still in the tree and will publish"
     );
 }
+
+/// The context is lost while a head is in flight, and a client can still find
+/// out what happened to its write.
+///
+/// The context cache is an in-process `DashMap` with a 10-minute TTL, never
+/// written to disk: a node restart loses it outright, and so does ten idle
+/// minutes. The engine that comes back has no memory of the write at all.
+///
+/// So the answer cannot come from the engine's memory — it has none — and it
+/// must not be a guess. It comes from re-reading the HEAD, which is the one
+/// durable record, and from `AskWrite`, which says `Lost` for a write the
+/// engine does not know: honest, and the only word that leaves the client
+/// holding a write it can safely re-submit.
+///
+/// Both halves are asserted, because they differ in what a re-submit does:
+///   (a) the head LANDED — re-submitting is a no-op against the same tree;
+///   (b) it did NOT — re-submitting reproduces exactly the intended tree.
+#[test]
+fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
+    for landed in [true, false] {
+        let mut net = Network::default();
+        let mut e = boot(&net, Params::default());
+        let before = e.published_root();
+
+        // A write, driven until the head is emitted but no further.
+        let out = stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(1),
+                ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
+            }
+        );
+        let mut queue = out;
+        let mut head = None;
+        let mut guard = 0;
+        while let Some(f) = queue.pop() {
+            guard += 1;
+            assert!(guard < 100_000, "the commit did not reach a head");
+            match f {
+                Effect::PutPack { id, bytes, .. }
+                | Effect::PutBlock { id, bytes, .. }
+                | Effect::PutParity { id, bytes, .. } => {
+                    net.confirm(id, &bytes);
+                    queue.extend(stepped!(e, Event::PutConfirmed(id)));
+                }
+                Effect::UpdateHead { seq, root, .. } => {
+                    head = Some((seq, root));
+                    // Deliberately NOT confirmed: this is the window.
+                }
+                _ => {}
+            }
+        }
+        let (seq, root) = head.expect("the commit never emitted a head");
+        let intended = root;
+        assert_ne!(intended, before, "the write did not change the tree");
+
+        // The head either landed on the Register or it did not. Either way
+        // the context is gone: DROP the engine.
+        if landed {
+            net.head = Some((seq, root));
+        }
+        drop(e);
+
+        // A fresh engine, with nothing but what the network holds.
+        let mut e = boot(&net, Params::default());
+        assert_eq!(
+            e.published_root(),
+            if landed { intended } else { before },
+            "landed={landed}: the recovered engine did not take the head the \
+             Register actually holds"
+        );
+
+        // The client asks. It gets an answer, and the answer is Lost: the
+        // engine has no record, and saying anything else would be a guess.
+        let out = stepped!(
+            e,
+            Event::AskWrite {
+                client: ClientId(1),
+                write_id: WriteId(1),
+            }
+        );
+        assert_eq!(
+            out.iter()
+                .filter_map(|f| match f {
+                    Effect::Notify { state, .. } => Some(*state),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![State::Lost],
+            "landed={landed}: a client asking about a write the engine has no \
+             record of was not told Lost, so it cannot know whether to \
+             re-submit"
+        );
+
+        // And re-submitting is safe in both worlds. The write is the same
+        // ops, so the tree it produces is the intended one either way — that
+        // is what makes `Lost` a word a client can act on.
+        warm_from(&mut e, &net);
+        let _ = stepped!(
+            e,
+            Event::Write {
+                client: ClientId(1),
+                write_id: WriteId(2),
+                ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
+            }
+        );
+        assert_eq!(
+            e.root(),
+            intended,
+            "landed={landed}: re-submitting the lost write produced a \
+             different tree from the one the lost commit would have published"
+        );
+        println!(
+            "  head {}: recovered at {}, write reported Lost, re-submit \
+             reproduces the intended tree",
+            if landed { "landed" } else { "did NOT land" },
+            if landed {
+                "the new root"
+            } else {
+                "the old root"
+            }
+        );
+    }
+}
