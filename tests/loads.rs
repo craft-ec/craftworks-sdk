@@ -8,6 +8,13 @@
 
 use craftworks_sdk::loads::{Ended, Loads, Page};
 
+/// One head for every page: these tests do not move the tree, and a
+/// constant says so rather than leaving it to be inferred.
+const AT: protocol::At = protocol::At {
+    seq: 1,
+    root: [1u8; 32],
+};
+
 fn rows(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     (0..n).map(|i| (vec![i as u8], vec![0u8])).collect()
 }
@@ -21,7 +28,7 @@ fn a_range_is_requested_and_completed() {
     assert!(send, "the first want of a range did not ask for it");
     assert_eq!(l.in_flight(), 1);
 
-    match l.on_page(id, rows(3), None) {
+    match l.on_page(id, rows(3), None, AT) {
         Page::Complete { lo, hi, rows } => {
             assert_eq!(lo, b"a/".to_vec());
             assert_eq!(hi, b"a0".to_vec());
@@ -85,7 +92,7 @@ fn a_paged_range_is_recorded_only_once_it_is_exhausted() {
     let mut l = Loads::new();
     let (id, _) = l.want(b"a/", b"a0", 0).expect("a fresh span is wanted");
 
-    match l.on_page(id, rows(2), Some(b"a/k".to_vec())) {
+    match l.on_page(id, rows(2), Some(b"a/k".to_vec()), AT) {
         Page::More { after, lo, hi } => {
             assert_eq!(after, b"a/k".to_vec());
             assert_eq!((lo, hi), (b"a/".to_vec(), b"a0".to_vec()));
@@ -97,7 +104,7 @@ fn a_paged_range_is_recorded_only_once_it_is_exhausted() {
         "the read was woken by a PART of the range it asked for"
     );
 
-    match l.on_page(id, rows(2), None) {
+    match l.on_page(id, rows(2), None, AT) {
         Page::Complete { rows, .. } => assert_eq!(rows.len(), 4, "the earlier page was dropped"),
         other => panic!("expected Complete, got {other:?}"),
     }
@@ -129,7 +136,7 @@ fn control_an_answered_load_never_times_out() {
     let mut l = Loads::new();
     l.budget_ms = 1_000;
     let (id, _) = l.want(b"a/", b"a0", 0).expect("a fresh span is wanted");
-    l.on_page(id, rows(1), None);
+    l.on_page(id, rows(1), None, AT);
     assert_eq!(l.take_ended(), vec![(id, Ended::Loaded)]);
     assert!(
         l.time_out(10_000).is_empty(),
@@ -150,7 +157,7 @@ fn an_unavailable_reply_ends_the_ticket_and_records_nothing() {
     assert_eq!(l.take_ended(), vec![(id, Ended::Unavailable)]);
     assert_eq!(l.in_flight(), 0);
     // And a page arriving afterwards changes nothing.
-    assert_eq!(l.on_page(id, rows(3), None), Page::Nothing);
+    assert_eq!(l.on_page(id, rows(3), None, AT), Page::Nothing);
     assert!(l.take_ended().is_empty());
 }
 
@@ -161,7 +168,10 @@ fn a_range_too_large_to_hold_ends_rather_than_being_recorded_short() {
     let mut l = Loads::new();
     l.max_rows = 4;
     let (id, _) = l.want(b"a/", b"a0", 0).expect("a fresh span is wanted");
-    assert_eq!(l.on_page(id, rows(5), Some(b"a/k".to_vec())), Page::Nothing);
+    assert_eq!(
+        l.on_page(id, rows(5), Some(b"a/k".to_vec()), AT),
+        Page::Nothing
+    );
     assert_eq!(
         l.take_ended(),
         vec![(id, Ended::Unavailable)],
@@ -174,7 +184,7 @@ fn a_range_too_large_to_hold_ends_rather_than_being_recorded_short() {
 #[test]
 fn a_page_for_an_unknown_load_is_ignored() {
     let mut l = Loads::new();
-    assert_eq!(l.on_page(999, rows(3), None), Page::Nothing);
+    assert_eq!(l.on_page(999, rows(3), None, AT), Page::Nothing);
     assert!(l.take_ended().is_empty());
 }
 
@@ -191,7 +201,7 @@ fn a_page_for_an_unknown_load_is_ignored() {
 fn a_span_already_loaded_is_not_wanted_again() {
     let mut l = Loads::new();
     let (id, _) = l.want(b"a/", b"a0", 0).expect("a fresh span");
-    l.on_page(id, rows(1), None);
+    l.on_page(id, rows(1), None, AT);
     let _ = l.take_ended();
 
     assert_eq!(
@@ -214,7 +224,7 @@ fn control_a_chain_of_different_spans_keeps_going() {
     let (a, _) = l
         .want(b"note/#", b"note/#\0", 0)
         .expect("the schema's span");
-    l.on_page(a, rows(1), None);
+    l.on_page(a, rows(1), None, AT);
     let _ = l.take_ended();
     // hop 2: the rows. A DIFFERENT span, so it proceeds.
     let b = l.want(b"note/", b"note0", 1);
@@ -233,7 +243,7 @@ fn control_a_chain_of_different_spans_keeps_going() {
 fn a_successful_read_clears_the_chain() {
     let mut l = Loads::new();
     let (id, _) = l.want(b"a/", b"a0", 0).expect("a fresh span");
-    l.on_page(id, rows(1), None);
+    l.on_page(id, rows(1), None, AT);
     let _ = l.take_ended();
     assert_eq!(l.want(b"a/", b"a0", 1), None);
 

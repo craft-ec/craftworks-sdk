@@ -890,49 +890,65 @@ impl<B: Blocks> Shell<B> {
                         State::Lost => W::Lost,
                     },
                 },
-                Effect::Reply { req_id, result, .. } => match result {
-                    engine::read::ReadResult::Value(v) => protocol::Reply::Value {
-                        req_id: req_id.0,
-                        value: v.clone(),
-                    },
-                    engine::read::ReadResult::Page {
-                        entries, cursor, ..
-                    } => protocol::Reply::Page {
-                        req_id: req_id.0,
-                        entries: entries.clone(),
-                        cursor: cursor.clone(),
-                        // What was USED, not what was asked for.
-                        max_entries: self
-                            .page_clamp
-                            .get(&req_id.0)
-                            .copied()
-                            .unwrap_or(entries.len() as u32),
-                    },
-                    engine::read::ReadResult::Unavailable(cid) => protocol::Reply::Unavailable {
-                        req_id: req_id.0,
-                        blocked_on: *cid,
-                    },
-                    engine::read::ReadResult::OutOfWarmSpace => protocol::Reply::Unavailable {
-                        req_id: req_id.0,
-                        blocked_on: [0u8; 32],
-                    },
-                    engine::read::ReadResult::Delta {
-                        changes,
-                        cursor,
-                        new_root,
-                    } => protocol::Reply::Delta {
-                        req_id: req_id.0,
-                        changes: changes.clone(),
-                        cursor: cursor.clone(),
-                        new_root: *new_root,
-                    },
-                    engine::read::ReadResult::FullReloadRequired { new_root } => {
-                        protocol::Reply::FullReloadRequired {
+                Effect::Reply { req_id, result, .. } => {
+                    // WHERE THIS ENGINE STANDS, as it answers.
+                    //
+                    // Taken once, here, so every answer in this call reports the
+                    // same head — two answers from one call describing two trees
+                    // would be the very confusion `At` exists to remove.
+                    let at = protocol::At {
+                        seq: self.engine.published_seq(),
+                        root: self.engine.published_root(),
+                    };
+                    match result {
+                        engine::read::ReadResult::Value(v) => protocol::Reply::Value {
                             req_id: req_id.0,
+                            value: v.clone(),
+                        },
+                        engine::read::ReadResult::Page {
+                            entries, cursor, ..
+                        } => protocol::Reply::Page {
+                            req_id: req_id.0,
+                            entries: entries.clone(),
+                            cursor: cursor.clone(),
+                            // What was USED, not what was asked for.
+                            max_entries: self
+                                .page_clamp
+                                .get(&req_id.0)
+                                .copied()
+                                .unwrap_or(entries.len() as u32),
+                            at,
+                        },
+                        engine::read::ReadResult::Unavailable(cid) => {
+                            protocol::Reply::Unavailable {
+                                req_id: req_id.0,
+                                blocked_on: *cid,
+                            }
+                        }
+                        engine::read::ReadResult::OutOfWarmSpace => protocol::Reply::Unavailable {
+                            req_id: req_id.0,
+                            blocked_on: [0u8; 32],
+                        },
+                        engine::read::ReadResult::Delta {
+                            changes,
+                            cursor,
+                            new_root,
+                        } => protocol::Reply::Delta {
+                            req_id: req_id.0,
+                            changes: changes.clone(),
+                            cursor: cursor.clone(),
                             new_root: *new_root,
+                            at,
+                        },
+                        engine::read::ReadResult::FullReloadRequired { new_root } => {
+                            protocol::Reply::FullReloadRequired {
+                                req_id: req_id.0,
+                                new_root: *new_root,
+                                at,
+                            }
                         }
                     }
-                },
+                }
                 // A subscribed range moved. PUSHED — no client asked for this
                 // message, which is the whole point of it.
                 Effect::Changed {
