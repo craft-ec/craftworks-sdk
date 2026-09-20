@@ -9,6 +9,22 @@
 // the Rust one compared the wrong pair of objects, and no JavaScript one
 // existed. "Publish switches the backend and the app code does not change"
 // has to be true of the object a component actually holds.
+//
+// AND THE NAME IS NOT THE SURFACE. This file then compared names only, and
+// the very next instance of the same failure walked straight through it: the
+// engine-backed `schema` and `count` are ASYNC — they read over the network —
+// and the in-memory ones answered values. An app got a Promise where it
+// expected an object, and a Promise is truthy, so it passed an
+// `if (!schema)` guard and arrived at `schema.fields.map` as `undefined.map`.
+//
+// Measured against a real node (sdk#87): four defects in the builder, three
+// of which replaced the whole app with an exception string while the button
+// said "Published", and one of which printed "— [object Promise] records" to
+// a person — a wrong number, no crash, nothing would have reported it.
+//
+// So the second gate below compares what each method ANSWERS WITH: a promise
+// or a value. An app must not be able to tell which backend it has from the
+// shape of an answer.
 
 import assert from "node:assert/strict";
 import { engineDb } from "../../js/engine-db.js";
@@ -89,6 +105,94 @@ t("and the engine side's extras are declared, not accidental", () => {
     extra, [],
     `the engine surface grew ${extra.join(", ")}, which an app on an unpublished ` +
     "project would not have. Add them to the in-memory one, or to ENGINE_ONLY with a reason.");
+});
+
+// ---------------------------------------------------------------------------
+// SHAPE, not just name.
+// ---------------------------------------------------------------------------
+
+/** Plausible arguments, so every method can actually be called. */
+const ARGS = {
+  define: ["d", { type: "T", fields: [] }],
+  schema: ["d"], domains: [], count: ["d"], get: ["d", "x"], delete: ["d", "x"],
+  put: ["d", {}], update: ["d", "x", {}], scan: ["d"],
+  root: [], stats: [], bind: ["d"],
+};
+
+/** Is this a promise? The only question the two surfaces must agree on. */
+const isThenable = v => typeof v?.then === "function";
+
+/**
+ * What a method answers with, or why it could not be asked.
+ *
+ * A method that THROWS is reported as such rather than skipped: "could not
+ * check" is a third outcome, and in a log it is indistinguishable from a pass.
+ */
+const shapeOf = (obj, name) => {
+  if (!(name in ARGS)) return { kind: "no-args-known" };
+  try {
+    const v = obj[name](...ARGS[name]);
+    if (isThenable(v)) v.catch(() => {});      // nothing here awaits; do not warn
+    return { kind: isThenable(v) ? "promise" : "value" };
+  } catch (e) {
+    return { kind: "threw", why: String(e?.message ?? e) };
+  }
+};
+
+t("**both surfaces answer the same SHAPE, not just the same names**", () => {
+  const memory = new (wrap(fakeRaw()).Db)();
+  const engine = engineDb(fakeSession());
+  const shared = [...surfaceOf(memory)].filter(m => surfaceOf(engine).has(m)).sort();
+
+  const differ = [], unchecked = [];
+  for (const name of shared) {
+    const a = shapeOf(memory, name), b = shapeOf(engine, name);
+    if (a.kind === "no-args-known") { unchecked.push(name); continue; }
+    if (a.kind === "threw" || b.kind === "threw") {
+      unchecked.push(`${name} (threw: ${a.why ?? b.why})`);
+      continue;
+    }
+    if (a.kind !== b.kind) differ.push(`${name}: in-memory ${a.kind}, engine ${b.kind}`);
+  }
+
+  assert.deepEqual(differ, [],
+    "an app can tell which backend it has from the shape of an answer:\n  " +
+    differ.join("\n  ") +
+    "\nA caller written against one breaks on the other, and a Promise is " +
+    "truthy — so it passes a falsy guard and fails later, somewhere else.");
+  assert.deepEqual(unchecked, [],
+    `these could not be compared at all: ${unchecked.join(", ")}. ` +
+    "A method this gate cannot ask is a method it does not check, and in a " +
+    "green log that is indistinguishable from one it checked. Give it " +
+    "arguments in ARGS, or say why it is exempt.");
+  console.log(`      ${shared.length} shared methods, all compared by shape`);
+});
+
+t("THE CONTROL: a method that is sync on one side and async on the other FAILS", () => {
+  // Without this, a `shapeOf` that returned the same kind for everything —
+  // a broken thenable check, an early return — would report perfect agreement
+  // over two surfaces that agree about nothing.
+  const memory = new (wrap(fakeRaw()).Db)();
+  const engine = engineDb(fakeSession());
+  // `count` is async on both. Make the in-memory one answer a value.
+  const patched = Object.create(memory);
+  patched.count = () => 0;
+
+  const a = shapeOf(patched, "count"), b = shapeOf(engine, "count");
+  assert.equal(a.kind, "value", "the control did not actually make it synchronous");
+  assert.equal(b.kind, "promise", "the engine side is not async, so there is nothing to detect");
+  assert.notEqual(a.kind, b.kind, "a sync-vs-async pair was not detected as a difference");
+});
+
+t("THE CONTROL: the shape reader is not simply calling everything a promise", () => {
+  // `root` and `stats` are synchronous on BOTH: a root is a value this client
+  // already holds. If the reader called them promises, the gate above would
+  // pass by agreeing on the wrong answer everywhere.
+  const memory = new (wrap(fakeRaw()).Db)();
+  for (const name of ["root", "stats"]) {
+    assert.equal(shapeOf(memory, name).kind, "value",
+      `${name} was read as a promise; the reader cannot tell the two apart`);
+  }
 });
 
 t("a BINDING from the engine has the shape a component holds", () => {
