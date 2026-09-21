@@ -458,7 +458,8 @@ impl Client {
             | Dropped::WrongWriteShape
             | Dropped::NestedAck
             | Dropped::NeedsV5Envelope
-            | Dropped::AckSessionMismatch => DropReason::Unparseable,
+            | Dropped::AckSessionMismatch
+            | Dropped::NeedsSession => DropReason::Unparseable,
         };
         rec.event(Event::Counter {
             site: DROP,

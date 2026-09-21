@@ -53,7 +53,7 @@ fn answer(node: &Store, ops: Vec<engine_delegate::schedule::Op>) -> Vec<Inbound>
 }
 
 fn frame(r: &Request) -> Inbound {
-    Inbound::Client(protocol::encode_request(protocol::CURRENT, r).expect("encodes"))
+    Inbound::Client(protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(0x5e55_1017), r).expect("encodes"))
 }
 
 /// What each call told, by request: `w<id>` a write state, `r<id>` a read's
@@ -61,7 +61,8 @@ fn frame(r: &Request) -> Inbound {
 fn heard(replies: &[Vec<u8>], into: &mut BTreeMap<String, Vec<String>>) {
     for b in replies {
         match protocol::decode_reply(b) {
-            Ok(Reply::WriteState { write_id, state }) => into
+            // Both shapes: this client is sessioned (sdk#194).
+            Ok(Reply::WriteState { write_id, state } | Reply::SessionWriteState { write_id, state, .. }) => into
                 .entry(format!("w{write_id}"))
                 .or_default()
                 .push(format!("{state:?}")),
@@ -419,10 +420,8 @@ fn a_lost_commit_leaves_no_read_backs_in_the_shell() {
             .any(|r| {
                 matches!(
                     r,
-                    Reply::WriteState {
-                        write_id: 1,
-                        state: protocol::WriteState::Lost
-                    }
+                    Reply::WriteState { write_id: 1, state: protocol::WriteState::Lost }
+                        | Reply::SessionWriteState { write_id: 1, state: protocol::WriteState::Lost, .. }
                 )
             });
         if lost {

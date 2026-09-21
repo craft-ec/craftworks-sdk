@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
 
     // ---- 3: an engine request reaches the delegate and answers ----
     let ask =
-        protocol::encode_request(protocol::CURRENT, &protocol::Request::Identity).expect("encodes");
+        protocol::encode_session_request(protocol::CURRENT, probe_session(), &protocol::Request::Identity).expect("encodes");
     let frames = wire::frame_delegate_op(&dkey, &Parameters::from(vec![]), ask, 2)
         .map_err(|e| anyhow::anyhow!("framing DelegateOp: {e}"))?;
     send_frames(&mut a, frames).await?;
@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
     let mut b = open(&bare).await?;
     let mut rb = Reassembler::new();
     let ask =
-        protocol::encode_request(protocol::CURRENT, &protocol::Request::Identity).expect("encodes");
+        protocol::encode_session_request(protocol::CURRENT, probe_session(), &protocol::Request::Identity).expect("encodes");
     let frames = wire::frame_delegate_op(&dkey, &Parameters::from(vec![]), ask, 3)
         .map_err(|e| anyhow::anyhow!("framing: {e}"))?;
     send_frames(&mut b, frames).await?;
@@ -196,4 +196,11 @@ async fn main() -> Result<()> {
     println!("budget: {:?} of {BUDGET:?} used", started.elapsed());
     println!("done");
     Ok(())
+}
+
+/// This probe's session: sessioned, as every app is. It passed `CURRENT` to
+/// the session-less encoder, which clamped it to v3 on the LEGACY session —
+/// the one path no app takes (craftworks-sdk#194).
+fn probe_session() -> u64 {
+    protocol::mint_session(0x9E37_79B9_7F4A_7C15 ^ std::process::id() as u64)
 }

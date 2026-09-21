@@ -71,7 +71,7 @@ async fn connect(ws: &str) -> Result<WebApi> {
     Ok(WebApi::start(stream))
 }
 async fn send(client: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()> {
-    let payload = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
+    let payload = protocol::encode_session_request(protocol::CURRENT, probe_session(), r).expect("encodes");
     timeout(STEP, client.send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
         key: key.clone(), params: vec![].into(),
         inbound: vec![InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload))] })))
@@ -91,7 +91,7 @@ async fn hear(client: &mut WebApi, t0: Instant, window: Duration) -> Vec<(u128, 
                         Ok(Reply::Page { req_id, entries, cursor, .. }) => format!("PAGE req {req_id}: {} rows, first {:?}, more: {}", entries.len(),
                             entries.first().map(|(k, _)| String::from_utf8_lossy(k).into_owned()), cursor.is_some()),
                         Ok(Reply::Unavailable { req_id, .. }) => format!("UNAVAILABLE req {req_id}"),
-                        Ok(Reply::WriteState { write_id, state }) => format!("w{write_id}: {state:?}"),
+                        Ok(Reply::WriteState { write_id, state } | Reply::SessionWriteState { write_id, state, .. }) => format!("w{write_id}: {state:?}"),
                         Ok(Reply::Call { saw, ops, stranded, effects, dropped, note, .. }) => format!("call saw {saw:?}: effects {effects} ops {ops} dropped {dropped}{} STRANDED {stranded}", if note.is_empty() { String::new() } else { format!(" note {note:?}") }),
                         Ok(Reply::Identity { head_seq, .. }) => format!("identity: head seq {head_seq}"),
                         Ok(_) => continue, Err(e) => format!("undecodable reply: {e:?}") };
@@ -283,3 +283,10 @@ fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 /// Throwaway randomness for TEST keys only: the OS's, read from /dev/urandom.
 fn seed(buf: &mut [u8]) { use std::io::Read; std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).expect("/dev/urandom"); }
+
+/// This probe's session: sessioned, as every app is. It passed `CURRENT` to
+/// the session-less encoder, which clamped it to v3 on the LEGACY session —
+/// the one path no app takes (craftworks-sdk#194).
+fn probe_session() -> u64 {
+    protocol::mint_session(0x9E37_79B9_7F4A_7C15 ^ std::process::id() as u64)
+}

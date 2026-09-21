@@ -90,7 +90,7 @@ fn a_v1_request_is_still_understood_after_the_bump() {
 /// And a version nobody serves is still answered rather than guessed at.
 #[test]
 fn an_unserved_version_is_still_refused_with_the_list() {
-    let mut future = encode_request(protocol::CURRENT, &Request::Flush).expect("encodes");
+    let mut future = protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(0x5e55_1017), &Request::Flush).expect("encodes");
     future[0] = 99;
     match decode_request(&future) {
         Incoming::Unsupported(v) => assert_eq!(v, 99),
@@ -231,7 +231,7 @@ fn a_request_over_the_limit_is_an_error_not_an_empty_frame() {
         )],
     };
     assert_eq!(
-        encode_request(protocol::CURRENT, &huge),
+        protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(0x5e55_1017), &huge),
         Err(Dropped::TooLarge)
     );
     assert!(protocol::request_len(protocol::CURRENT, &huge) > protocol::MAX_MESSAGE as u64);

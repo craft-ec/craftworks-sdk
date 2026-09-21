@@ -46,7 +46,7 @@ async fn send_bytes(client: &mut WebApi, key: &DelegateKey, payload: Vec<u8>) ->
     Ok(())
 }
 async fn send(client: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()> {
-    send_bytes(client, key, protocol::encode_request(protocol::CURRENT, r).expect("encodes")).await
+    send_bytes(client, key, protocol::encode_session_request(protocol::CURRENT, probe_session(), r).expect("encodes")).await
 }
 /// Everything the store has decided to send, sent. Returns how many frames.
 async fn pump(client: &mut WebApi, key: &DelegateKey, store: &mut CachedStore) -> Result<usize> {
@@ -197,4 +197,11 @@ async fn main() -> Result<()> {
     if got as u64 != rows - refused_rows { red.push(format!("read back {got} of the {} rows the copy accepted", rows - refused_rows)); }
     if refused_by_copy.iter().any(|(_, w)| !w.starts_with("TooManyPending")) { red.push(format!("refused by the copy for another reason: {refused_by_copy:?}")); }
     if red.is_empty() { println!("VERDICT: GREEN"); Ok(()) } else { for r in &red { println!("RED: {r}"); } bail!("{} check(s) red", red.len()) }
+}
+
+/// This probe's session: sessioned, as every app is. It passed `CURRENT` to
+/// the session-less encoder, which clamped it to v3 on the LEGACY session —
+/// the one path no app takes (craftworks-sdk#194).
+fn probe_session() -> u64 {
+    protocol::mint_session(0x9E37_79B9_7F4A_7C15 ^ std::process::id() as u64)
 }

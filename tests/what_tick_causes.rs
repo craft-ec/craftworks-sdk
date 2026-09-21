@@ -101,7 +101,7 @@ impl Node {
     }
 
     fn client(&mut self, r: &protocol::Request) -> Vec<protocol::Reply> {
-        let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
+        let frame = protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(0x5e55_1017), r).expect("encodes");
         self.step(vec![Inbound::Client(frame)])
             .iter()
             .filter_map(|b| protocol::decode_reply(b).ok())
@@ -112,7 +112,9 @@ impl Node {
         self.client(r)
             .into_iter()
             .filter_map(|x| match x {
-                protocol::Reply::WriteState { state, .. } => Some(state),
+                // Both shapes: a sessioned client (sdk#194) is told
+                // `SessionWriteState`, a legacy one `WriteState`.
+                protocol::Reply::WriteState { state, .. } | protocol::Reply::SessionWriteState { state, .. } => Some(state),
                 _ => None,
             })
             .collect()
