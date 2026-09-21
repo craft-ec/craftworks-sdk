@@ -4,7 +4,7 @@
 //! `0x01 ‖ domain ‖ 0x00 ‖ rkey(16)` for records, `0x00 "schema" 0x00 domain` for
 //! a domain's schema — so the schema travels with the data it types.
 
-use crate::id::{self, Env, IdGen, RKey};
+use crate::id::{self, Env, IdGen, Loc, RKey};
 use crate::record;
 use crate::schema::Schema;
 use crate::store::{sorted_edits, Edit, Reads, Store, StoreError};
@@ -212,10 +212,34 @@ fn prefix(domain: &str) -> Vec<u8> {
     k.push(0);
     k
 }
-pub fn record_key(domain: &str, id: &RKey) -> Vec<u8> {
+/// `T_RECORD | domain | 0 | [parent] | rkey`.
+///
+/// The parent, when there is one, sits BEFORE the rkey, which is the whole
+/// point: it makes every child of one parent a contiguous band, so reading
+/// them is a bounded prefix scan instead of a scan of the domain filtered by
+/// a field (craftworks-sdk#122).
+pub fn record_key(domain: &str, at: impl Into<Loc>) -> Vec<u8> {
+    let loc = at.into();
     let mut k = prefix(domain);
-    k.extend_from_slice(id);
+    if let Some(parent) = &loc.parent {
+        k.extend_from_slice(parent);
+    }
+    k.extend_from_slice(&loc.rkey);
     k
+}
+
+/// Every key under `parent` in `domain`, as a half-open range.
+fn parent_span(domain: &str, parent: &RKey) -> (Vec<u8>, Vec<u8>) {
+    let mut lo = prefix(domain);
+    lo.extend_from_slice(parent);
+    // The band is exactly the 16-byte rkeys following this prefix, so the end
+    // is the prefix with a 16-byte all-ones tail exceeded -- simplest correct
+    // form is to bump the prefix itself.
+    let mut hi = lo.clone();
+    for b in hi.iter_mut().rev() {
+        if *b == 0xff { *b = 0; } else { *b += 1; break; }
+    }
+    (lo, hi)
 }
 fn schema_key(domain: &str) -> Vec<u8> {
     let mut k = vec![T_SYSTEM];
@@ -223,6 +247,33 @@ fn schema_key(domain: &str) -> Vec<u8> {
     k.extend_from_slice(domain.as_bytes());
     k
 }
+/// Split a stored key back into the parent (if the domain has one) and rkey.
+fn loc_of_key(schema: &Schema, p: &[u8], k: &[u8]) -> Result<Loc> {
+    let tail = &k[p.len()..];
+    let want = if schema.parent.is_some() { 32 } else { 16 };
+    if tail.len() != want {
+        return Err(DbError::from("corrupt record key".to_string()));
+    }
+    Ok(if schema.parent.is_some() {
+        Loc::under(tail[..16].try_into().unwrap(), tail[16..].try_into().unwrap())
+    } else {
+        Loc::bare(tail.try_into().unwrap())
+    })
+}
+
+/// The parent a record declares, read from the field the schema names.
+fn parent_of(schema: &Schema, fields: &Map<String, Value>) -> Result<Option<RKey>> {
+    let Some(pf) = &schema.parent else { return Ok(None) };
+    let v = fields.get(pf).and_then(|v| v.as_str()).ok_or_else(|| {
+        DbError::Refused(format!("`{pf}` names this record's parent and is required"))
+    })?;
+    id::from_hex(v).map(Some).ok_or_else(|| {
+        DbError::Refused(format!(
+            "`{pf}` must be a record id (32 hex characters); got `{v}`"
+        ))
+    })
+}
+
 /// The smallest key greater than every key starting with `p` (p ends in 0x00).
 fn upper(p: &[u8]) -> Vec<u8> {
     let mut h = p.to_vec();
@@ -356,24 +407,43 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     pub fn put(&mut self, domain: &str, fields: &Map<String, Value>) -> Result<Record> {
         let schema = self.need_schema(domain)?;
         let rkey = self.ids.next(&mut self.env);
+        // The rkey stays SDK-minted. The caller chooses only the PARENT, which
+        // is what keeps an app from encoding the key layout -- it names an
+        // intent, and the SDK still owns what a key is.
+        let loc = Loc { parent: parent_of(&schema, fields)?, rkey };
         let now = id::created_ms(&rkey);
         let bytes = record::encode(&schema, fields, now, now, &self.author)?;
-        let key = record_key(domain, &rkey);
+        let key = record_key(domain, loc);
         self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
-        self.read(&schema, &rkey, &key, &bytes)
+        self.read(&schema, &loc, &key, &bytes)
     }
 
     /// Merge `patch` over the record; a `null` value removes that field.
     pub fn update(
         &mut self,
         domain: &str,
-        rkey: &RKey,
+        at: impl Into<Loc>,
         patch: &Map<String, Value>,
     ) -> Result<Record> {
         let schema = self.need_schema(domain)?;
-        let key = record_key(domain, rkey);
+        let loc = self.locate(&schema, domain, at)?;
+        let key = record_key(domain, loc);
         let old = self.get_key(&key)?.ok_or("no such record")?;
         let mut d = record::decode(&schema, &old)?;
+        // The parent decides the KEY, so a patch that moved it would leave the
+        // record filed under its old parent while claiming the new one. A
+        // re-parent is a delete and a write, and it is not this call.
+        if let Some(pf) = &schema.parent {
+            if let Some(v) = patch.get(pf) {
+                if v != d.fields.get(pf).unwrap_or(&Value::Null) {
+                    return Err(DbError::Refused(format!(
+                        "`{pf}` is this domain's parent and decides the record's \
+                         key; changing it here would leave the record filed under \
+                         the old one"
+                    )));
+                }
+            }
+        }
         for (k, v) in patch {
             if v.is_null() {
                 d.fields.remove(k);
@@ -385,21 +455,24 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let updated = self.env.now_ms().max(d.updated);
         let bytes = record::encode(&schema, &d.fields, d.created, updated, &d.author)?;
         self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
-        self.read(&schema, rkey, &key, &bytes)
+        self.read(&schema, &loc, &key, &bytes)
     }
 
-    pub fn get(&mut self, domain: &str, rkey: &RKey) -> Result<Option<Record>> {
+    pub fn get(&mut self, domain: &str, at: impl Into<Loc>) -> Result<Option<Record>> {
         let schema = self.need_schema(domain)?;
-        let key = record_key(domain, rkey);
+        let loc = self.locate(&schema, domain, at)?;
+        let key = record_key(domain, loc);
         match self.get_key(&key)? {
-            Some(b) => self.read(&schema, rkey, &key, &b).map(Some),
+            Some(b) => self.read(&schema, &loc, &key, &b).map(Some),
             None => Ok(None),
         }
     }
 
-    pub fn delete(&mut self, domain: &str, rkey: &RKey) -> Result<bool> {
+    pub fn delete(&mut self, domain: &str, at: impl Into<Loc>) -> Result<bool> {
         check_domain(domain)?;
-        let key = record_key(domain, rkey);
+        let schema = self.need_schema(domain)?;
+        let loc = self.locate(&schema, domain, at)?;
+        let key = record_key(domain, loc);
         let existed = self.get_key(&key)?.is_some();
         self.write(vec![(key, Edit::Delete)])?;
         Ok(existed)
@@ -410,7 +483,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let p = prefix(domain);
         let (mut lo, mut hi) = (p.clone(), upper(&p));
         if let Some(a) = opts.after {
-            let k = record_key(domain, &a);
+            let k = record_key(domain, Loc::bare(a));
             if opts.reverse {
                 hi = k;
             } else {
@@ -425,12 +498,65 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         self.scan_keys(&lo, &hi, opts.reverse, limit)?
             .iter()
             .map(|(k, v)| {
-                let rkey: RKey = k[p.len()..]
-                    .try_into()
-                    .map_err(|_| "corrupt record key".to_string())?;
-                self.read(&schema, &rkey, k, v)
+                let loc = loc_of_key(&schema, &p, k)?;
+                self.read(&schema, &loc, k, v)
             })
             .collect()
+    }
+
+    /// THE CHILDREN OF ONE PARENT, as a bounded read.
+    ///
+    /// The app names the parent; it never builds a range. What the range IS
+    /// stays the SDK's business, which is the same rule `Session::preload`
+    /// keeps — a caller that built one would be encoding the key layout.
+    ///
+    /// The cost is the size of THIS parent's band. It does not grow with the
+    /// number of records under other parents, which is the whole difference
+    /// from the scan-and-filter this replaces (craftworks-sdk#122).
+    pub fn children(&mut self, domain: &str, parent: &RKey, opts: Scan) -> Result<Vec<Record>> {
+        let schema = self.need_schema(domain)?;
+        let pf = schema.parent.clone().ok_or_else(|| {
+            DbError::Refused(format!(
+                "domain `{domain}` does not declare a parent, so it has no \
+                 children to read: records in it are keyed by their own id alone"
+            ))
+        })?;
+        let _ = pf;
+        let p = prefix(domain);
+        let (mut lo, mut hi) = parent_span(domain, parent);
+        if let Some(a) = opts.after {
+            let k = record_key(domain, Loc::under(*parent, a));
+            if opts.reverse { hi = k; } else { lo = [k, vec![0]].concat(); }
+        }
+        let limit = if opts.limit == 0 { usize::MAX } else { opts.limit };
+        self.scan_keys(&lo, &hi, opts.reverse, limit)?
+            .iter()
+            .map(|(k, v)| {
+                let loc = loc_of_key(&schema, &p, k)?;
+                self.read(&schema, &loc, k, v)
+            })
+            .collect()
+    }
+
+    /// Resolve what a caller handed us into a full location, or refuse.
+    ///
+    /// A bare rkey in a parent-keyed domain cannot address anything: the key
+    /// needs the parent. Building one without it would read a key that cannot
+    /// exist and answer `None` -- a WRONG ANSWER rather than an error, and the
+    /// app would report "no such record" about one sitting right there.
+    fn locate(&self, schema: &Schema, domain: &str, at: impl Into<Loc>) -> Result<Loc> {
+        let loc = at.into();
+        match (&schema.parent, &loc.parent) {
+            (Some(pf), None) => Err(DbError::Refused(format!(
+                "domain `{domain}` keys its records under `{pf}`, so a record id \
+                 alone cannot address one -- use the full id, which carries both"
+            ))),
+            (None, Some(_)) => Err(DbError::Refused(format!(
+                "domain `{domain}` does not key its records under a parent, but \
+                 this id carries one"
+            ))),
+            _ => Ok(loc),
+        }
     }
 
     pub fn count(&mut self, domain: &str) -> Result<usize> {
@@ -469,10 +595,10 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     ///
     /// The KEY is passed rather than recomputed from the domain, so a caller
     /// cannot ask about a different row than the one it decoded.
-    fn read(&self, schema: &Schema, rkey: &RKey, key: &[u8], bytes: &[u8]) -> Result<Record> {
+    fn read(&self, schema: &Schema, loc: &Loc, key: &[u8], bytes: &[u8]) -> Result<Record> {
         let d = record::decode(schema, bytes)?;
         Ok(Record {
-            id: id::to_hex(rkey),
+            id: id::loc_to_hex(loc),
             created: d.created,
             updated: d.updated,
             fields: d.fields,

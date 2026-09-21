@@ -61,18 +61,18 @@ fn a_record_reports_its_own_write_both_before_and_after_it_lands() {
     // gone and nothing has answered" — and the row says which.
     d.store_mut().copy.queued(write_id);
     assert_eq!(
-        d.get("note", &id).expect("get").expect("there").state,
+        d.get("note", id).expect("get").expect("there").state,
         RowState::Queued,
         "a write the engine has not taken yet is reported as if it had"
     );
     d.store_mut().copy.submitted(write_id);
     assert_eq!(
-        d.get("note", &id).expect("get").expect("there").state,
+        d.get("note", id).expect("get").expect("there").state,
         RowState::Pending
     );
 
     d.store_mut().copy.published(write_id);
-    let after = d.get("note", &id).expect("get").expect("there");
+    let after = d.get("note", id).expect("get").expect("there");
     assert_eq!(after.state, RowState::Clean);
     assert!(
         after.state.is_settled(),

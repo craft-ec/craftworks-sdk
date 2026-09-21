@@ -117,7 +117,7 @@ fn suite<S: Store + craftworks_sdk::Reads + Default>() {
     );
     // ids strictly increase even though the clock never moved
     assert!(ia < ib && ib < ic, "ids must sort in creation order");
-    assert_eq!(d.get("tasks", &ib).unwrap().unwrap(), b);
+    assert_eq!(d.get("tasks", ib).unwrap().unwrap(), b);
     assert_eq!(d.count("tasks").unwrap(), 3);
 
     // scan: order, reverse, limit, paging
@@ -187,21 +187,21 @@ fn suite<S: Store + craftworks_sdk::Reads + Default>() {
     // update merges, null removes, created is kept, updated moves
     d_set_now(&mut d, 5_000);
     let u = d
-        .update("tasks", &ib, &obj(json!({"done": true, "priority": null})))
+        .update("tasks", ib, &obj(json!({"done": true, "priority": null})))
         .unwrap();
     assert_eq!(u.fields, obj(json!({"title": "b", "done": true})));
     assert_eq!((u.created, u.updated), (b.created, 5_000));
     // an update may not break the schema either
     assert!(d
-        .update("tasks", &ib, &obj(json!({"title": null})))
+        .update("tasks", ib, &obj(json!({"title": null})))
         .unwrap_err()
         .to_string()
         .contains("required"));
 
     // delete
-    assert!(d.delete("tasks", &ia).unwrap());
-    assert!(!d.delete("tasks", &ia).unwrap());
-    assert_eq!(d.get("tasks", &ia).unwrap(), None);
+    assert!(d.delete("tasks", ia).unwrap());
+    assert!(!d.delete("tasks", ia).unwrap());
+    assert_eq!(d.get("tasks", ia).unwrap(), None);
     assert_eq!(
         titles(d.scan("tasks", Scan::default()).unwrap()),
         ["b", "c"]
@@ -279,11 +279,11 @@ fn schemas_only_grow_so_old_records_stay_valid() {
     d.define("tasks", &v2).unwrap();
     // the old record reads under the new schema with no migration…
     assert_eq!(
-        d.get("tasks", &id).unwrap().unwrap().fields,
+        d.get("tasks", id).unwrap().unwrap().fields,
         obj(json!({"title": "written before"}))
     );
     // …and can take the new field
-    let u = d.update("tasks", &id, &obj(json!({"due": 99}))).unwrap();
+    let u = d.update("tasks", id, &obj(json!({"due": 99}))).unwrap();
     assert_eq!(u.fields["due"], json!(99));
 
     // anything but appending optional fields is refused
@@ -379,7 +379,7 @@ fn keys_follow_the_architecture_keyspace() {
     let mut d = db::<MemStore>();
     let r = d.put("tasks", &obj(json!({"title": "k"}))).unwrap();
     let id = from_hex(&r.id).unwrap();
-    let key = db::record_key("tasks", &id);
+    let key = db::record_key("tasks", id);
     assert_eq!(&key[..7], b"\x01tasks\x00");
     assert_eq!(&key[7..], &id);
     // id = 8 B ms timestamp ‖ 4 B device ‖ 4 B tail

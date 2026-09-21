@@ -409,7 +409,7 @@ fn a_db_over_the_engine_store_reads_what_it_wrote() {
     let rec = db.put("tasks", &fields).expect("put");
 
     let id = craftworks_sdk::id::from_hex(&rec.id).expect("an id");
-    let got = db.get("tasks", &id).expect("get").expect("the record");
+    let got = db.get("tasks", id).expect("get").expect("the record");
     assert_eq!(
         got.fields.get("title"),
         Some(&serde_json::json!("write it down")),
