@@ -100,9 +100,9 @@ fn tree(n: u32) -> (TreeStore, Vec<u8>, Vec<u8>) {
             (k, Edit::Put(vec![1u8; 40]))
         })
         .collect();
-    s.apply_batch(&edits);
+    s.apply_batch(&edits).expect("the store took the write");
     // Neighbours on both sides, so the range's edges fall inside nodes.
-    s.apply_batch(&[(b"\x01bi\x00zz".to_vec(), Edit::Put(b"x".to_vec())), (b"\x01bigger\x00a".to_vec(), Edit::Put(b"x".to_vec()))]);
+    s.apply_batch(&[(b"\x01bi\x00zz".to_vec(), Edit::Put(b"x".to_vec())), (b"\x01bigger\x00a".to_vec(), Edit::Put(b"x".to_vec()))]).expect("the store took the write");
     (s, lo, hi)
 }
 

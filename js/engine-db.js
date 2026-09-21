@@ -17,19 +17,25 @@
 /// An error from the database, carrying the STABLE code Rust chose.
 ///
 /// `code` is from a fixed list — NOT_LOADED, UNAVAILABLE, TOO_LARGE,
-/// NOT_DEFINED, REFUSED. `message` is for a person to read.
+/// NOT_DEFINED, REFUSED, and for a write the store refused before making it
+/// (sdk#180): NO_ROOM, NO_ROOM_BYTES, TOO_LARGE_TO_SEND, NO_SESSION.
+/// `message` is for a person to read.
 ///
 /// **Nothing in this file, and nothing in an app, branches on `message`.**
 /// A message is prose; rewording it would change behaviour, and it would
 /// change it silently.
 export class DbError extends Error {
-  constructor({ code, message, transient }) {
+  constructor({ code, message, transient, retryable = false, cap }) {
     super(message);
     this.name = "DbError";
     this.code = code;
     // Whether a RELOAD is the recovery. Rust decides this, not the caller,
     // and not a list of codes kept in sync by hand over here.
     this.transient = transient;
+    // Whether the SAME write, made again after the node confirms earlier
+    // ones, may succeed — a NO_ROOM. Rust decides this too (sdk#180).
+    this.retryable = retryable;
+    if (cap !== undefined) this.cap = cap;
   }
 }
 

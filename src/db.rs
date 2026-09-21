@@ -121,6 +121,12 @@ pub enum DbError {
     NotDefined(String),
     /// Anything else the caller could have got right, in words.
     Refused(String),
+    /// The STORE refused this write before applying it anywhere — no room
+    /// for another unconfirmed write, no session, too large to send
+    /// (craftworks-sdk#180). NOTHING WAS WRITTEN: not in the copy, not on the
+    /// wire. Each reason has its own code, because each asks something
+    /// different of the caller — wait, reload, split.
+    WriteRefused(crate::copy::Refused),
 }
 
 impl DbError {
@@ -141,6 +147,38 @@ impl DbError {
             DbError::TooLarge(_) => "TOO_LARGE",
             DbError::NotDefined(_) => "NOT_DEFINED",
             DbError::Refused(_) => "REFUSED",
+            DbError::WriteRefused(r) => match r {
+                crate::copy::Refused::TooManyPending { .. } => "NO_ROOM",
+                crate::copy::Refused::TooManyPendingBytes { .. } => "NO_ROOM_BYTES",
+                crate::copy::Refused::TooLargeToSend { .. } => "TOO_LARGE_TO_SEND",
+                crate::copy::Refused::TooLarge { .. } => "TOO_LARGE",
+                crate::copy::Refused::NoSession => "NO_SESSION",
+            },
+        }
+    }
+
+    /// Whether the SAME write, made again once the node has confirmed earlier
+    /// ones, may succeed: the copy's room frees as confirmations arrive. Not
+    /// a reload — the recovery is to wait for a confirmation and retry.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            DbError::WriteRefused(
+                crate::copy::Refused::TooManyPending { .. }
+                    | crate::copy::Refused::TooManyPendingBytes { .. }
+            )
+        )
+    }
+
+    /// The bound a `NO_ROOM` refusal met: how many writes, or bytes, the
+    /// copy holds unconfirmed.
+    pub fn cap(&self) -> Option<usize> {
+        match self {
+            DbError::WriteRefused(
+                crate::copy::Refused::TooManyPending { cap }
+                | crate::copy::Refused::TooManyPendingBytes { cap },
+            ) => Some(*cap),
+            _ => None,
         }
     }
 
@@ -161,6 +199,7 @@ impl std::fmt::Display for DbError {
                 "the engine could not reach a block this read needed; the key may well exist",
             ),
             DbError::TooLarge(m) | DbError::NotDefined(m) | DbError::Refused(m) => f.write_str(m),
+            DbError::WriteRefused(r) => write!(f, "not written: {r}"),
         }
     }
 }
@@ -437,8 +476,12 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                 }
             }
         }
-        self.store.apply_batch(&sorted_edits(edits));
-        Ok(())
+        // THE REFUSAL IS THE ANSWER (sdk#180). A write the store refused was
+        // not made; answering `Created` for it told the caller its data was
+        // written when it had been dropped.
+        self.store
+            .apply_batch(&sorted_edits(edits))
+            .map_err(DbError::WriteRefused)
     }
 
     pub fn env_mut(&mut self) -> &mut E {
@@ -802,7 +845,7 @@ mod tests {
             fn delete(&mut self, _: &[u8]) -> bool {
                 panic!("the store must not be reached")
             }
-            fn apply_batch(&mut self, _: &[(Vec<u8>, Edit)]) {
+            fn apply_batch(&mut self, _: &[(Vec<u8>, Edit)]) -> std::result::Result<(), crate::copy::Refused> {
                 panic!("the store must not be reached")
             }
         }

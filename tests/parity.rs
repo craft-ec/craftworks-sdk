@@ -72,7 +72,7 @@ fn every_node_a_tall_tree_holds_would_be_accepted_by_a_host() {
             (format!("k/{i:08}").into_bytes(), Edit::Put(v))
         })
         .collect();
-    store.apply_batch(&batch);
+    store.apply_batch(&batch).expect("the store took the write");
 
     // The property the fixture exists for is DEPTH: the split rule is about
     // interiors, so a run that only ever saw leaves would pass while saying
@@ -140,7 +140,7 @@ fn deletes_and_rewrites_leave_no_refusable_node_behind() {
     for i in (1..500u64).step_by(7) {
         batch.push((format!("k/{i:08}").into_bytes(), Edit::Put(vec![9u8; 900])));
     }
-    store.apply_batch(&batch);
+    store.apply_batch(&batch).expect("the store took the write");
     let (nodes, _) = every_node_passes(&store);
     println!("checked {nodes} nodes across the whole history of edits");
 }
@@ -225,7 +225,7 @@ fn the_owed_parity_is_exactly_what_the_nodes_list() {
             })
             .collect();
         writes += edits.len();
-        store.apply_batch(&edits);
+        store.apply_batch(&edits).expect("the store took the write");
     }
     assert!(writes > 0, "the fixture must write something");
     assert!(
@@ -376,13 +376,13 @@ fn a_store_that_drops_its_parity_writes_the_same_tree_and_owes_nothing() {
         .collect();
 
     let mut tracked = TreeStore::new();
-    tracked.apply_batch(&edits);
+    tracked.apply_batch(&edits).expect("the store took the write");
 
     let mut dropped = TreeStore::with_options(Options {
         track_owed_parity: false,
         ..Options::default()
     });
-    dropped.apply_batch(&edits);
+    dropped.apply_batch(&edits).expect("the store took the write");
 
     // The same tree. The parity IDS are in the nodes either way; only the bytes
     // behind them differ, and a root hash cannot tell you that.
@@ -434,7 +434,7 @@ fn taking_the_owed_parity_empties_it_and_every_door_agrees() {
         .collect();
 
     let mut direct = TreeStore::new();
-    direct.apply_batch(&edits);
+    direct.apply_batch(&edits).expect("the store took the write");
     let owed_direct = direct.owed_parity();
     assert!(owed_direct > 0, "the fixture codes no parity");
 
@@ -528,11 +528,11 @@ fn a_re_coded_group_leaves_one_trio_owed_not_two() {
             prune_superseded_parity: prune,
             ..Options::default()
         });
-        store.apply_batch(&seed);
+        store.apply_batch(&seed).expect("the store took the write");
         let after_seed = store.owed_parity();
         // Rewrite ONE key twice: the group holding it is re-coded each time.
         for v in [0xAAu8, 0xBB] {
-            store.apply_batch(&[(b"k/005".to_vec(), Edit::Put(big(v)))]);
+            store.apply_batch(&[(b"k/005".to_vec(), Edit::Put(big(v)))]).expect("the store took the write");
         }
         (after_seed, store.owed_parity(), store.owed_groups().len())
     };

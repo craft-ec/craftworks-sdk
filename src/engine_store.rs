@@ -388,7 +388,7 @@ impl<T: Transport> Store for EngineStore<T> {
         existed
     }
 
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) {
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
         // ONE write, so the engine applies them as one commit — which is what
         // makes a record and its index entries one fact rather than several.
         self.submit(
@@ -400,6 +400,8 @@ impl<T: Transport> Store for EngineStore<T> {
                 })
                 .collect(),
         );
+        // Its outbox holds every write it is given; it refuses none.
+        Ok(())
     }
 }
 

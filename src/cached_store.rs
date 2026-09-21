@@ -352,7 +352,9 @@ impl CachedStore {
         told
     }
 
-    fn submit(&mut self, edits: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+    /// Make a write: into the copy, then onto the wire — or REFUSED, before
+    /// anything is held, and the refusal returned (craftworks-sdk#180).
+    fn submit(&mut self, edits: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<(), Refused> {
         let write_id = self.next_write_id;
         self.next_write_id += 1;
         let now = (self.now_ms)();
@@ -370,8 +372,7 @@ impl CachedStore {
         // NO SESSION, NO WRITE (sdk#146): refused by name, before anything is
         // held, rather than sent under a number another tab shares.
         if self.client.session().is_none() {
-            self.refused.push((write_id, crate::copy::Refused::NoSession));
-            return;
+            return Err(self.refuse(write_id, Refused::NoSession));
         }
 
         // WILL IT FIT ON THE WIRE? Asked before the copy holds anything. The
@@ -382,14 +383,13 @@ impl CachedStore {
         // window -- and was then rolled back (craftworks-sdk#136, measured).
         let bytes = protocol::request_len(protocol::CURRENT, &request);
         if bytes > protocol::MAX_MESSAGE as u64 {
-            self.refused.push((
+            return Err(self.refuse(
                 write_id,
-                crate::copy::Refused::TooLargeToSend {
+                Refused::TooLargeToSend {
                     bytes,
                     limit: protocol::MAX_MESSAGE,
                 },
             ));
-            return;
         }
 
         // Applied to the copy FIRST, and only sent if the copy took it. A
@@ -403,15 +403,22 @@ impl CachedStore {
             // to report, which is a truer answer than the old failure.
             self.rolled_back.remove(k);
             if let Err(why) = self.copy.write(k, v.clone(), write_id, now) {
-                self.refused.push((write_id, why));
                 // Anything already applied for this write comes back off, so a
                 // multi-key write is all or nothing in the copy as well as on
                 // the wire.
                 self.copy.failed(write_id);
-                return;
+                return Err(self.refuse(write_id, why));
             }
         }
         self.dispatch(write_id, request);
+        Ok(())
+    }
+
+    /// A refusal, counted for diagnostics AND handed back. The list is a
+    /// count a support bundle can show; what the caller acts on is the return.
+    fn refuse(&mut self, write_id: u64, why: Refused) -> Refused {
+        self.refused.push((write_id, why));
+        why
     }
 
     /// The write id the next write will carry, so a caller can watch for it.
@@ -421,8 +428,10 @@ impl CachedStore {
 }
 
 impl Store for CachedStore {
+    // `put` and `delete` have no error channel: a refusal here reaches only
+    // `refused`. `Db` writes through `apply_batch`, which returns it.
     fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.submit(vec![(key.to_vec(), Some(value.to_vec()))]);
+        let _ = self.submit(vec![(key.to_vec(), Some(value.to_vec()))]);
     }
 
     fn delete(&mut self, key: &[u8]) -> bool {
@@ -430,11 +439,11 @@ impl Store for CachedStore {
         // `false` — not because it was absent, but because nothing here knows;
         // the delete still goes, which is right either way.
         let existed = matches!(self.copy.get(key), Some(v) if v.value().is_some());
-        self.submit(vec![(key.to_vec(), None)]);
+        let _ = self.submit(vec![(key.to_vec(), None)]);
         existed
     }
 
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) {
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
         // ONE write, so the engine applies them as one commit.
         self.submit(
             edits
@@ -444,7 +453,7 @@ impl Store for CachedStore {
                     Edit::Delete => (k.clone(), None),
                 })
                 .collect(),
-        );
+        )
     }
 }
 
