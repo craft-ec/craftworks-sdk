@@ -93,6 +93,10 @@ impl FullNode {
             served: BTreeMap::new(),
             replies: Vec::new(),
             handed: Vec::new(),
+            // THE REAL NODE'S SHAPE BY DEFAULT (sdk#150). Answers handed back
+            // together are the special case, and a test that wants them says so.
+            one_answer_per_call: true,
+            max_stranded: 0,
         })))
     }
 
@@ -124,6 +128,14 @@ struct ConnState {
     served: BTreeMap<Served, usize>,
     replies: Vec<Vec<u8>>,
     handed: Vec<Vec<u8>>,
+    /// Deliver the node's answers ONE PER CALL, as a real node does (each
+    /// `PutResponse` / `GetResponse` is its own delegate call). The default
+    /// hands a call's answers back together in one call, so no commit ever
+    /// spans calls -- and a real node's stranded head was invisible to every
+    /// native test (sdk#150).
+    one_answer_per_call: bool,
+    /// The largest `stranded` any call reported. Must stay 0.
+    max_stranded: usize,
 }
 
 /// One client's connection: its own context over a shared node.
@@ -138,6 +150,24 @@ impl Conn {
     /// Returns every reply the shell produced along the way.
     pub fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
         self.step_bounded(inbound, 0)
+    }
+
+    /// Deliver the node's answers one per call, as a real node does -- the
+    /// DEFAULT. See `ConnState::one_answer_per_call`.
+    pub fn one_answer_per_call(&self) {
+        self.0.borrow_mut().one_answer_per_call = true;
+    }
+
+    /// Hand a call's answers back together in one call -- the old fixture
+    /// shape, which no real node produces. For a control only.
+    pub fn answers_together(&self) {
+        self.0.borrow_mut().one_answer_per_call = false;
+    }
+
+    /// The largest number of effects any call left stranded -- lost at the
+    /// end of that call. The shell's own doc says it must never be non-zero.
+    pub fn max_stranded(&self) -> usize {
+        self.0.borrow().max_stranded
     }
 
     fn step_bounded(&mut self, inbound: Vec<Inbound>, depth: usize) -> Vec<Vec<u8>> {
@@ -176,6 +206,7 @@ impl Conn {
         {
             let mut s = self.0.borrow_mut();
             s.ctx = shell.to_context().expect("a context after every call");
+            s.max_stranded = s.max_stranded.max(out.stranded);
             s.replies.extend(out.replies.iter().cloned());
             for (key, value) in [
                 (Key::BytesOut, out.put_bytes as u64),
@@ -253,7 +284,11 @@ impl Conn {
         });
 
         let mut replies = out.replies;
-        if !next.is_empty() {
+        if self.0.borrow().one_answer_per_call {
+            for answer in next {
+                replies.extend(self.step_bounded(vec![answer], depth + 1));
+            }
+        } else if !next.is_empty() {
             replies.extend(self.step_bounded(next, depth + 1));
         }
         replies

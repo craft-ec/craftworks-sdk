@@ -976,6 +976,16 @@ impl<B: Blocks> Engine<B> {
         self.published_seq
     }
 
+    /// Blocks of the commit in flight that this engine has already seen
+    /// confirmed ON THE NODE -- carried in the context, so true at the top of
+    /// a call that did not see the confirmation (sdk#150). The head bump is
+    /// emitted only once every one of them is here, naming them as `after`.
+    pub fn confirmed_in_flight(&self) -> impl Iterator<Item = Cid> + '_ {
+        self.pending
+            .iter()
+            .flat_map(|c| c.confirmed.iter().copied())
+    }
+
     pub fn published_root(&self) -> Cid {
         self.published_root
     }
