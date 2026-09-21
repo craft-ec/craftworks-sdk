@@ -41,9 +41,30 @@ cd "$(dirname "$0")"
 RED=""; GREEN=""; OFF=""
 if [ -t 1 ]; then RED=$'\033[31m'; GREEN=$'\033[32m'; OFF=$'\033[0m'; fi
 fail() { echo "${RED}gate: $*${OFF}" >&2; FAILED=1; }
+# A STEP that failed, as distinct from a count that moved. `--accept` records
+# a run's counts only when no step failed: a partial run's counts are what it
+# reached, not what the tree holds (sdk#159).
+step_fail() { STEP_FAILED=1; fail "$@"; }
 step() { echo; echo "── $* ──"; }
 FAILED=0
+STEP_FAILED=0
 BASELINE=gate.baseline
+
+# `--accept [--accept-loss MEMBER]...`: see tools/gate-accept.sh.
+ACCEPT=0
+ACCEPT_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --accept) ACCEPT=1; shift ;;
+    --accept-loss)
+      [ $# -ge 2 ] || { echo "gate: --accept-loss needs a member name" >&2; exit 2; }
+      ACCEPT_ARGS+=(--accept-loss "$2"); shift 2 ;;
+    *) echo "gate: unknown argument \`$1\`" >&2; exit 2 ;;
+  esac
+done
+if [ ${#ACCEPT_ARGS[@]} -gt 0 ] && [ $ACCEPT -eq 0 ]; then
+  echo "gate: --accept-loss only means something with --accept" >&2; exit 2
+fi
 
 # ---------------------------------------------------------------- disk ----
 # Before anything, because the failure it prevents is the one that does not
@@ -97,11 +118,11 @@ for m in $MEMBERS; do
   rc=$?
   n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
   if [ $rc -ne 0 ]; then
-    fail "cargo test -p $m FAILED"
+    step_fail "cargo test -p $m FAILED"
     echo "$out" | grep -E "^(error|test result: FAILED|---- )" | head -5 >&2
   fi
   if [ "$n" -eq 0 ] && ! no_host_tests "$m"; then
-    fail "$m has NO tests and no reason recorded — add tests, or add it to \
+    step_fail "$m has NO tests and no reason recorded — add tests, or add it to \
 no_host_tests() WITH its reason. An uncovered member is what this gate is for."
   fi
   NAMES+=("$m"); COUNTS+=("$n")
@@ -111,7 +132,7 @@ done
 # ------------------------------------------------------------ clippy ----
 step "cargo clippy --workspace --all-targets -- -D warnings"
 if ! cargo clippy --workspace --all-targets -- -D warnings > /tmp/gate-clippy.$$ 2>&1; then
-  fail "clippy failed"
+  step_fail "clippy failed"
   grep -E "^(error|warning)" /tmp/gate-clippy.$$ | head -8 >&2
 fi
 clippy_warnings=$(grep -cE "^(warning|error)" /tmp/gate-clippy.$$ || true)
@@ -123,11 +144,11 @@ js_ok=0
 if [ ! -f pkg/web/craftworks_sdk_bg.wasm ]; then
   # NOT a skip. Four JS tests read the built package, and a gate that passed
   # over them would certify a package nobody built.
-  fail "pkg/web is not built — run ./build.sh first. npm test checks the \
+  step_fail "pkg/web is not built — run ./build.sh first. npm test checks the \
 BUILT package, so passing over it would certify something that does not exist."
 else
   if ! npm test > /tmp/gate-npm.$$ 2>&1; then
-    fail "npm test failed"
+    step_fail "npm test failed"
     grep -E "FAIL|Error" /tmp/gate-npm.$$ | head -8 >&2
   fi
   js_ok=$(grep -c "^  ok " /tmp/gate-npm.$$ || true)
@@ -142,18 +163,18 @@ else
   #
   # So it is refused here rather than left to the comparison below: the
   # comparison answers "did it change", and this answers "did it run".
-  [ "$js_ok" -eq 0 ] && fail "npm test reported ZERO passing tests. A filter \
+  [ "$js_ok" -eq 0 ] && step_fail "npm test reported ZERO passing tests. A filter \
 that matches nothing exits 0 and prints a success line, so this is a run that \
 checked nothing rather than a suite that passed."
 fi
 
 # ------------------------------------------------------ fixture gate ----
 step "fixture-gate.sh"
-[ -x ./fixture-gate.sh ] || { fail "fixture-gate.sh is missing or not executable"; }
+[ -x ./fixture-gate.sh ] || { step_fail "fixture-gate.sh is missing or not executable"; }
 fixture_out=$(./fixture-gate.sh 2>&1)
 fixture_rc=$?
 fixture_line=$(echo "$fixture_out" | tail -1)
-[ $fixture_rc -ne 0 ] && fail "fixture-gate failed: $fixture_line"
+[ $fixture_rc -ne 0 ] && step_fail "fixture-gate failed: $fixture_line"
 
 # ----------------------------------------------------------- summary ----
 # WHAT IT RAN and the COUNTS, not a verdict on its own.
@@ -227,12 +248,14 @@ echo "ran: cargo test per member ($total passing, ${#NAMES[@]} members vs baseli
 clippy --workspace --all-targets -D warnings ($clippy_warnings warnings), \
 npm test ($js_ok ok vs baseline ${js_base:-none}), fixture-gate ($fixture_line)"
 
-if [ "${1-}" = "--accept" ]; then
-  : > "$BASELINE"
-  for i in "${!NAMES[@]}"; do echo "${NAMES[$i]}=${COUNTS[$i]}" >> "$BASELINE"; done
-  echo "npm=$js_ok" >> "$BASELINE"
-  echo "gate: recorded ${#NAMES[@]} member counts and npm=$js_ok in $BASELINE"
-  exit 0
+if [ $ACCEPT -eq 1 ]; then
+  counts_file=$(mktemp)
+  for i in "${!NAMES[@]}"; do echo "${NAMES[$i]}=${COUNTS[$i]}" >> "$counts_file"; done
+  echo "npm=$js_ok" >> "$counts_file"
+  ./tools/gate-accept.sh "$BASELINE" "$STEP_FAILED" "$counts_file" ${ACCEPT_ARGS[@]+"${ACCEPT_ARGS[@]}"}
+  rc=$?
+  rm -f "$counts_file"
+  exit $rc
 fi
 
 if [ "$moved" -gt 0 ] && [ "$FAILED" -eq 0 ]; then
