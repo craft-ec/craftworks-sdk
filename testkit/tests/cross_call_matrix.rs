@@ -647,6 +647,18 @@ fn w3_parked_then_refused(mode: Mode) -> Cell {
             break;
         }
     }
+    // A cold write whose path needs more than one request's GETs waits for
+    // its client to ask after it -- the continuation (sdk#174). The outbox
+    // asks while it has heard nothing, a bounded number of times.
+    for _ in 0..8 {
+        if !st.is_empty() {
+            break;
+        }
+        // Under the WRITER's session: a write is known to its own session.
+        let replies = send(&mut c, mode, &Request::AskWrite { write_id: 1 });
+        st.extend(states_of(&replies, 1));
+        all.extend(replies);
+    }
     if !mode.cold {
         return Cell::NotReached("a warm node never parks".into());
     }
@@ -857,21 +869,9 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
         "one-per-call+cold+evicting",
         "eviction ping-pong (cycle)",
     ),
-    // The parked write's fetches strand: `park_write` asks for its whole
-    // path, which `max_fetch_per_round` does not bound (the limits PR). The verdict's
-    // VERSION is no longer a reason: sdk#146 carries it with the write, and
-    // engine-delegate's `a_write_refused_after_a_park_is_told_in_its_clients_
-    // version_whoever_else_speaks` proves it with the GET limit lifted.
-    (
-        "W3 parked write refused, told why",
-        "one-per-call+cold",
-        "parked write's fetches stranded: park_write asks for its whole path, which max_fetch_per_round does not bound -- sdk#150's LIMITS PR owns it",
-    ),
-    (
-        "W3 parked write refused, told why",
-        "one-per-call+cold+two-sessions",
-        "parked write's fetches stranded: park_write asks for its whole path, which max_fetch_per_round does not bound -- sdk#150's LIMITS PR owns it",
-    ),
+    // THE PARKED WRITE'S STRAND is fixed (sdk#174): it asks for one fetch
+    // round at a time and, past one request's GETs, waits for its client to
+    // ask after it (AskWrite). W3's cells are green.
     // The flush asks for more parity than one return carries. Since PR 3 an
     // ask that strands is asked again after `reask_after` ticks, so this is
     // no longer a LOSS -- but a strand is still a strand, and the engine
