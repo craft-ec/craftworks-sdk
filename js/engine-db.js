@@ -259,6 +259,11 @@ export function engineDb(handle) {
     count:   d       => once(() => session.count(d)),
     scan: (domain, { reverse = false, limit = 0, after = "" } = {}) =>
       once(() => JSON.parse(session.scan(domain, reverse, limit, after))),
+    // The children of one parent, bounded to that parent's band. Goes through
+    // `once` like every other read, so a cold band queues a load and retries
+    // rather than answering an empty list (craftworks-sdk#122).
+    children: (domain, parent, { reverse = false, limit = 0, after = "" } = {}) =>
+      once(() => JSON.parse(session.children(domain, parent, reverse, limit, after))),
 
     /**
      * A BINDING: one domain, as a component consumes it.

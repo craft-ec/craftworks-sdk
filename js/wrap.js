@@ -43,6 +43,17 @@ export function wrap(raw) {
     async scan(domain, { reverse = false, limit = 0, after = "" } = {}) {
       return JSON.parse(this.#db.scan(domain, reverse, limit, after));
     }
+    /**
+     * The children of one parent, as a bounded read.
+     *
+     * The app names the PARENT; it never builds a key range. The cost is this
+     * parent's band and does not grow with the records under other parents,
+     * which is the whole difference from a scan filtered by a field
+     * (craftworks-sdk#122).
+     */
+    async children(domain, parent, { reverse = false, limit = 0, after = "" } = {}) {
+      return JSON.parse(this.#db.children(domain, parent, reverse, limit, after));
+    }
     async count(domain) { return this.#db.count(domain); }
     // SYNCHRONOUS on both backends, and that is not an oversight. A root is
     // a value this client already holds, and `stats` describes what THIS TAB
