@@ -1212,6 +1212,7 @@ impl<B: Blocks> Engine<B> {
     ///      re-derivable from the tree today (sdk#181), so it is bounded where
     ///      it grows -- past its cap a write's parity is left uncoded
     ///      (`record_owed`) -- and never forgotten here.
+    ///
     /// If none of that fits it, `to_context` fails -- a bug, reported loudly
     /// by the host, never a silent `None`.
     fn keep_saveable(&mut self) -> Vec<Effect> {

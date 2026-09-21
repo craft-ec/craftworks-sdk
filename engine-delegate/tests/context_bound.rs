@@ -11,7 +11,7 @@ use engine::Params;
 use engine_delegate::shell::{Inbound, Shell, StoreFacts};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
-use protocol::{Reply, Request, WriteState};
+use protocol::{Reply, Request};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
