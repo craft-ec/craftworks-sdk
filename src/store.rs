@@ -196,6 +196,23 @@ pub trait Reads {
         limit: usize,
     ) -> Read<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// How many entries lie in `[lo, hi)` (craftworks-sdk#123).
+    ///
+    /// By default it enumerates — right for a store with no tree behind it
+    /// (`MemStore` is a map; a copy holds rows, not nodes). A store that HAS
+    /// the tree answers from the aggregate every node already carries, in
+    /// O(height) node reads rather than one per entry.
+    ///
+    /// **Per TREE, never per view.** Per-tree counts must never be summed into
+    /// an overlay's count: a key on two device trees counts twice, and a
+    /// delete in one can reveal an older value in another.
+    ///
+    /// A count that could not be answered is an ERROR (`NotLoaded`), never 0:
+    /// "I have not looked" is not "there is nothing there".
+    fn count(&mut self, lo: &[u8], hi: &[u8]) -> Read<u64> {
+        Ok(self.scan(lo, hi, false, usize::MAX)?.len() as u64)
+    }
+
     /// The root this store is currently standing on.
     ///
     /// What a reader passes back to [`Reads::changes_since`]. An in-memory

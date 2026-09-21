@@ -136,10 +136,18 @@ impl Default for Options {
 struct Kept {
     inner: MemBlocks,
     drop_value_blocks: bool,
+    /// Block reads, for a COST assertion (`TreeStore::block_reads`): how many
+    /// nodes a count or a scan actually touched. A counter, never an input.
+    reads: std::cell::Cell<u64>,
+    /// The distinct blocks among those reads: what a COLD store would have to
+    /// fetch, which is the cost that matters (a re-read is a cache hit).
+    read_ids: std::cell::RefCell<std::collections::BTreeSet<Cid>>,
 }
 
 impl Blocks for Kept {
     fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        self.reads.set(self.reads.get() + 1);
+        self.read_ids.borrow_mut().insert(*cid);
         self.inner.get(cid)
     }
 }
@@ -203,6 +211,19 @@ impl TreeStore {
     /// written in.
     pub fn root(&self) -> Cid {
         self.root
+    }
+
+    /// Blocks read since this store was made — what a cost test asserts on
+    /// (a count must be O(height), not one read per entry: sdk#123). Read-only
+    /// and never an input to anything the store decides.
+    pub fn block_reads(&self) -> u64 {
+        self.blocks.reads.get()
+    }
+
+    /// The DISTINCT blocks read since the last call, and forget them — what a
+    /// cold store would have fetched for the work in between.
+    pub fn take_distinct_block_reads(&self) -> usize {
+        std::mem::take(&mut *self.blocks.read_ids.borrow_mut()).len()
     }
 
     pub fn stats(&self) -> Stats {
@@ -459,6 +480,33 @@ impl Store for TreeStore {
 impl Reads for TreeStore {
     fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
         Ok(self.lookup(key))
+    }
+
+    /// From the tree's own aggregate: O(height) node reads, however many
+    /// entries the range holds (craftworks-sdk#123). An edge leaf is counted
+    /// entry by entry and only wholly-inside subtrees contribute their
+    /// recorded count, so the answer is exactly the entries in range — what
+    /// the enumerating default returns.
+    ///
+    /// `Claimed`, not `Verified`: this is the reader's OWN tree, so the writer
+    /// whose recorded counts it trusts is itself. Only the count is used;
+    /// `bytes` is logical and is not a storage size.
+    fn count(&mut self, lo: &[u8], hi: &[u8]) -> Read<u64> {
+        if lo >= hi {
+            return Ok(0);
+        }
+        // A FRESH range: one carrying a limit, `after` or `reverse` is refused
+        // by `aggregate`, rather than quietly answered as a page's count.
+        let r = Range {
+            lo: Bound::Included(lo.to_vec()),
+            hi: Bound::Excluded(hi.to_vec()),
+            ..Range::default()
+        };
+        match freenet_prolly::aggregate::aggregate(&self.blocks, &self.root, &r) {
+            Ok(c) => Ok(c.agg().count),
+            Err(freenet_prolly::aggregate::AggError::Read(e)) => Self::impossible(e),
+            Err(e) => unreachable!("the SDK asked for a count of a range that is not whole: {e:?}"),
+        }
     }
 
     fn scan(

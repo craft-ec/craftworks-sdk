@@ -675,10 +675,19 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         }
     }
 
+    /// How many records the domain holds — from the store's `count`, which a
+    /// store with the tree answers in O(height) node reads (craftworks-sdk#123).
+    /// It used to enumerate every key and value in the domain to return a
+    /// number every node already carries.
     pub fn count(&mut self, domain: &str) -> Result<usize> {
         check_domain(domain)?;
         let p = prefix(domain);
-        Ok(self.scan_keys(&p, &upper(&p), false, usize::MAX)?.len())
+        let hi = upper(&p);
+        let n = self
+            .store
+            .count(&p, &hi)
+            .map_err(|e| DbError::from_store(e, &p, &hi))?;
+        Ok(n as usize)
     }
 
     /// A store read, with the store's own refusal turned into `Db`'s error.
