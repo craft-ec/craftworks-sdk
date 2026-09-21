@@ -22,6 +22,10 @@ pub mod schema;
 pub mod store;
 pub mod trace;
 pub mod tree_store;
+/// The client's write path from WRITE-PATH.md revision 3 — structure only,
+/// behind the OFF feature `write-path-v5` (build step 3).
+#[cfg(feature = "write-path-v5")]
+pub mod write_path;
 
 mod engine_store;
 pub use binding::{Binding, LiveMode, Reloads};
