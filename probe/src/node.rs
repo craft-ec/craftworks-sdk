@@ -40,11 +40,111 @@ pub enum Mode {
     IsolatedNetwork { network_port: u16 },
 }
 
+/// FLAGS EVERY PROBE NODE RUNS WITH, whatever its mode.
+///
+/// `--disable-auto-update`: our test nodes are pinned to the release the
+/// WORKAROUNDS register is gated on. A bare `freenet network`/`local` run polls
+/// for releases, and the day a newer one is published it EXITS with code 42
+/// mid-test whenever the poll is not rate-limited (measured, 2026-09-21: every
+/// L3 run whose node logged "Update 0.2.136 was detected" was red, and every
+/// run whose poll was rate-limited was not). A version bump is the register's
+/// process, never a test node's own.
+pub const NODE_FLAGS: &[&str] = &["--disable-auto-update"];
+
+/// The command line a probe node is started with. A function, so a test can
+/// read it without spawning anything.
+pub fn node_args(port: u16, dir: &Path, mode: Mode) -> Vec<String> {
+    let mut args: Vec<String> = match mode {
+        Mode::Local => vec!["local".into(), "local".into()],
+        Mode::IsolatedNetwork { network_port } => {
+            vec![
+                "network".into(),
+                "--is-gateway".into(),
+                "--skip-load-from-network".into(),
+                // Loopback on both the listen and the advertised address:
+                // a gateway that advertises 127.0.0.1 is reachable only
+                // from this machine, and with no gateway entries and no
+                // index fetch it dials nothing.
+                "--network-address".into(),
+                "127.0.0.1".into(),
+                "--network-port".into(),
+                network_port.to_string(),
+                "--public-network-address".into(),
+                "127.0.0.1".into(),
+                "--public-network-port".into(),
+                network_port.to_string(),
+                "--ws-api-address".into(),
+                "127.0.0.1".into(),
+            ]
+        }
+    };
+    args.extend([
+        "--ws-api-port".to_string(),
+        port.to_string(),
+        "--data-dir".into(),
+        dir.join("data").to_string_lossy().into_owned(),
+        "--config-dir".into(),
+        dir.join("config").to_string_lossy().into_owned(),
+        "--log-dir".into(),
+        dir.join("log").to_string_lossy().into_owned(),
+    ]);
+    if let Ok(level) = std::env::var("PROBE_LOG_LEVEL") {
+        args.push("--log-level".into());
+        args.push(level);
+    }
+    args.extend(NODE_FLAGS.iter().map(|f| f.to_string()));
+    args
+}
+
+/// The command line of a PRIVATE network-mode node that is not the lone
+/// gateway `node_args` makes -- live-cold-read's two nodes, one joined to the
+/// other through `extra`. Built HERE so it carries the same three dirs and
+/// the same NODE_FLAGS: a probe that assembled its own could forget one.
+pub fn private_network_args(ws: u16, net: u16, dir: &Path, extra: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "network".into(),
+        "--skip-load-from-network".into(),
+        "--network-address".into(),
+        "127.0.0.1".into(),
+        "--network-port".into(),
+        net.to_string(),
+        "--ws-api-address".into(),
+        "127.0.0.1".into(),
+        "--ws-api-port".into(),
+        ws.to_string(),
+        "--data-dir".into(),
+        dir.join("data").to_string_lossy().into_owned(),
+        "--config-dir".into(),
+        dir.join("config").to_string_lossy().into_owned(),
+        "--log-dir".into(),
+        dir.join("log").to_string_lossy().into_owned(),
+    ];
+    args.extend(extra.iter().cloned());
+    args.extend(NODE_FLAGS.iter().map(|f| f.to_string()));
+    args
+}
+
 pub struct Node {
     child: Option<Child>,
     pub port: u16,
     pub mode: Mode,
     dir: PathBuf,
+    /// The command line it was started with -- what `restart` starts again.
+    args: Vec<String>,
+}
+
+/// THE refusal that keeps every probe off the owner's nodes (sdk#199): a port
+/// in `RESERVED`, or one something already listens on, is refused by name.
+/// Every door that starts a node asks it, for every port, BEFORE anything is
+/// created.
+fn refuse(port: u16, what: &str) -> Result<()> {
+    if RESERVED.contains(&port) {
+        bail!("{what} {port} belongs to someone else's node; refusing to use it");
+    }
+    if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        bail!("something is already listening on {port}; refusing to share it");
+    }
+    Ok(())
 }
 
 impl Node {
@@ -53,67 +153,42 @@ impl Node {
     }
 
     pub fn spawn_in(port: u16, dir: &Path, mode: Mode) -> Result<Self> {
-        if RESERVED.contains(&port) {
-            bail!("port {port} belongs to someone else's node; refusing to use it");
-        }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            bail!("something is already listening on {port}; refusing to share it");
-        }
+        refuse(port, "port")?;
         // The network port too — BEFORE anything is created or spawned. It was
         // checked after the directories were made, so a refused network port
         // left a tree behind.
         if let Mode::IsolatedNetwork { network_port } = mode {
-            if RESERVED.contains(&network_port) {
-                bail!("network port {network_port} belongs to someone else's node");
-            }
-            if TcpStream::connect(("127.0.0.1", network_port)).is_ok() {
-                bail!("something is already listening on {network_port}");
-            }
-        }
-        for sub in ["data", "config", "log"] {
-            std::fs::create_dir_all(dir.join(sub))?;
+            refuse(network_port, "network port")?;
         }
         // The node takes `--log-level`, NOT `RUST_LOG`: setting RUST_LOG in
         // this process changes nothing there, which is how an earlier attempt
         // to read the node's own account of a delegate PUT came back empty
         // and looked like "the node said nothing".
-        let mut args: Vec<String> = match mode {
-            Mode::Local => vec!["local".into(), "local".into()],
-            Mode::IsolatedNetwork { network_port } => {
-                vec![
-                    "network".into(),
-                    "--is-gateway".into(),
-                    "--skip-load-from-network".into(),
-                    // Loopback on both the listen and the advertised address:
-                    // a gateway that advertises 127.0.0.1 is reachable only
-                    // from this machine, and with no gateway entries and no
-                    // index fetch it dials nothing.
-                    "--network-address".into(),
-                    "127.0.0.1".into(),
-                    "--network-port".into(),
-                    network_port.to_string(),
-                    "--public-network-address".into(),
-                    "127.0.0.1".into(),
-                    "--public-network-port".into(),
-                    network_port.to_string(),
-                    "--ws-api-address".into(),
-                    "127.0.0.1".into(),
-                ]
-            }
-        };
-        args.extend([
-            "--ws-api-port".to_string(),
-            port.to_string(),
-            "--data-dir".into(),
-            dir.join("data").to_string_lossy().into_owned(),
-            "--config-dir".into(),
-            dir.join("config").to_string_lossy().into_owned(),
-            "--log-dir".into(),
-            dir.join("log").to_string_lossy().into_owned(),
-        ]);
-        if let Ok(level) = std::env::var("PROBE_LOG_LEVEL") {
-            args.push("--log-level".into());
-            args.push(level);
+        Self::start(port, dir, mode, node_args(port, dir, mode))
+    }
+
+    /// A PRIVATE network-mode node that is not the lone gateway `spawn_in`
+    /// makes: live-cold-read's two nodes, one joined to the other through
+    /// `extra`. Through the SAME door: both ports refused by `refuse` before
+    /// anything is created, the command line from `private_network_args` (its
+    /// dirs, NODE_FLAGS). A probe's own copy of the refusal was the line that
+    /// keeps probes off the owner's node, untested (sdk#208 review).
+    pub fn spawn_private_network(ws: u16, net: u16, dir: &Path, extra: &[String]) -> Result<Self> {
+        refuse(ws, "port")?;
+        refuse(net, "network port")?;
+        Self::start(
+            ws,
+            dir,
+            Mode::IsolatedNetwork { network_port: net },
+            private_network_args(ws, net, dir, extra),
+        )
+    }
+
+    /// Create the node's tree and start it with `args`; ready or an error.
+    /// Callers have refused their ports already.
+    fn start(port: u16, dir: &Path, mode: Mode, args: Vec<String>) -> Result<Self> {
+        for sub in ["data", "config", "log"] {
+            std::fs::create_dir_all(dir.join(sub))?;
         }
         let child = Command::new("freenet")
             .args(&args)
@@ -129,18 +204,30 @@ impl Node {
                 dir.join("log/console.err"),
             )?))
             .spawn()
-            .context("spawning `freenet local local` — is the binary on PATH?")?;
+            .context("spawning `freenet` — is the binary on PATH?")?;
         let mut n = Node {
             child: Some(child),
             port,
             mode,
             dir: dir.to_path_buf(),
+            args,
         };
         n.wait_ready()?;
         Ok(n)
     }
 
     fn wait_ready(&mut self) -> Result<()> {
+        // Never PROBE the owner's port either. `refuse` keeps every door off
+        // it; this keeps a door that lost its refusal -- a mutant under test,
+        // or a future edit -- from connecting to the owner's node to ask
+        // whether "it" is ready (a mutant run did, sdk#208: TCP only, nothing
+        // sent). Refused by the same words, so a test sees the same reason.
+        if RESERVED.contains(&self.port) {
+            bail!(
+                "port {} belongs to someone else's node; refusing to probe it",
+                self.port
+            );
+        }
         let deadline = Instant::now() + BOOT;
         while Instant::now() < deadline {
             if let Some(c) = self.child.as_mut() {
@@ -178,7 +265,9 @@ impl Node {
         let port = self.port;
         let mode = self.mode;
         self.stop();
-        let mut fresh = Node::spawn_in(port, &dir, mode)?;
+        // Its OWN command line, so a private node joined through `extra`
+        // comes back joined, not as the lone gateway its mode also describes.
+        let mut fresh = Node::start(port, &dir, mode, self.args.clone())?;
         self.child = fresh.child.take();
         Ok(())
     }
