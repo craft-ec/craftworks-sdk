@@ -17,7 +17,8 @@
 //! Outcomes: GREEN; STALLED N s, RECOVERED (a cold read waited past 30 s and then came back whole -- F52's heal);
 //! RED (not answered within the 100 s window, answered wrong, or stranded).
 //!
-//! L3_LONG_WINDOW=1 (default off): TEST 1 listens 130 s per request instead of 100, a request still unanswered at
+//! L3_LONG_WINDOW=1 (default off): TESTs 2 and 3 listen until their pages (up to 130 s) instead of a fixed 30 s,
+//! their page times judged with TEST 1's; TEST 1 listens 130 s per request instead of 100, a request still unanswered at
 //! 60 s is marked (and listened to and ticked on), and the moment its page arrives is recorded. Afterwards both nodes are kept alive a further 100 s (listening, no new
 //! requests), so a node bound that ends at +60..+90 s has spoken before anything is killed. KEEP_LOGS is required.
 //! It exists because every bound the node has on a stuck GET (stream claim 60 s, op TTL 60 s, park budget 75 s,
@@ -66,13 +67,8 @@ fn free(port: u16) -> Result<()> {
 fn spawn(dir: &Path, ws: u16, net: u16, extra: &[String]) -> Result<Live> {
     free(ws)?; free(net)?;
     for sub in ["data", "config", "log"] { std::fs::create_dir_all(dir.join(sub))?; }
-    let mut args: Vec<String> = vec!["network".into(), "--skip-load-from-network".into(),
-        "--network-address".into(), "127.0.0.1".into(), "--network-port".into(), net.to_string(),
-        "--ws-api-address".into(), "127.0.0.1".into(), "--ws-api-port".into(), ws.to_string(),
-        "--data-dir".into(), dir.join("data").to_string_lossy().into_owned(),
-        "--config-dir".into(), dir.join("config").to_string_lossy().into_owned(),
-        "--log-dir".into(), dir.join("log").to_string_lossy().into_owned()];
-    args.extend(extra.iter().cloned());
+    // Built by probe::node, the ONE place a test node's command line is made (its dirs, NODE_FLAGS).
+    let args = probe::node::private_network_args(ws, net, dir, extra);
     let child = Command::new("freenet").args(&args)
         .stdout(Stdio::from(std::fs::File::create(dir.join("log/console.out"))?))
         .stderr(Stdio::from(std::fs::File::create(dir.join("log/console.err"))?))
@@ -174,6 +170,10 @@ async fn main() -> Result<()> {
 
     let root = std::env::temp_dir().join(format!("live-cold-read-{}", std::process::id()));
     let _tree = TempTree(root.clone());
+    // Declared AFTER the temp tree, so it drops FIRST: the node logs are copied on EVERY exit, an early `?`
+    // included. Six L3 reds ended on "comm channel between client/host closed" with no trace; the next ones,
+    // kept, named the cause in the nodes' own words (a test node exiting on a release's update check).
+    let _keep = KeepLogs(root.clone());
     // A's transport key: THROWAWAY, made here, hex on disk as the node expects, gone with the temp tree.
     let mut secret = [0u8; 32]; seed(&mut secret);
     let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(secret).to_bytes();
@@ -235,7 +235,12 @@ async fn main() -> Result<()> {
     println!("\nTEST 2  tab 1 asks Range a/ (60 rows, cold) as req 1; tab 2 asks NOTHING. Who hears the Page?");
     let t0 = Instant::now();
     send(&mut t1, &dkey_b, &range(1, "a/", 256)).await?;
-    let (h1, h2) = tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN));
+    // LONG MODE: TESTs 2 and 3 are cold reads too, and a stall lands on them as well (L3 runs 6/15/16 went
+    // silent here and healed at 61.0-61.3 s): they listen until their page, up to the long window, and the
+    // time it took is judged with TEST 1's. Otherwise the fixed 30 s listen, as ruled for these warm paths.
+    let (h1, h2) = if long { hear_both_until(&mut t1, &mut t2, t0, read_window, &[(1, 1)]).await }
+                   else { tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN)) };
+    let t2_page_ms = page_ms(&h1, 1);
     let (s2a, _) = show("tab 1 (the asker)", &h1); let (s2b, _) = show("tab 2 (silent)", &h2);
     let rows_of = |h: &[(u128, String)], req: u64| -> usize { h.iter().filter_map(|(_, l)| l.strip_prefix(&format!("PAGE req {req}: "))?.split(' ').next()?.parse::<usize>().ok()).sum() };
     let t2_rows = rows_of(&h1, 1);
@@ -245,7 +250,9 @@ async fn main() -> Result<()> {
     let t0 = Instant::now();
     send(&mut t1, &dkey_b, &range(7, "b/", 256)).await?;
     send(&mut t2, &dkey_b, &range(7, "c/", 256)).await?;
-    let (h1, h2) = tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN));
+    let (h1, h2) = if long { hear_both_until(&mut t1, &mut t2, t0, read_window, &[(1, 7), (2, 7)]).await }
+                   else { tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN)) };
+    let t3_page_ms = (page_ms(&h1, 7), page_ms(&h2, 7));
     // Judged: each tab hears 60 rows of ITS OWN prefix. It is also the cell that decides whether sdk#166 is live.
     let (s3a, _) = show("tab 1 (asked b/)", &h1); let (s3b, _) = show("tab 2 (asked c/)", &h2);
     let first_of = |h: &[(u128, String)]| -> Option<String> { h.iter().find_map(|(_, l)| l.strip_prefix("PAGE req 7: ").map(|x| x.to_string())) };
@@ -262,6 +269,12 @@ async fn main() -> Result<()> {
     println!("    TEST 1 t0 = unix {} ms", now_ms());
     // (req, ms after ITS send that its answer came, or None) -- the long mode's measurement.
     let mut answered: Vec<(u64, Option<u128>)> = Vec::new();
+    if long {
+        // TESTs 2 and 3's cold reads, judged for time with TEST 1's (req ids 1 and 7 are theirs).
+        answered.push((1, t2_page_ms));
+        answered.push((7, t3_page_ms.0));
+        answered.push((7, t3_page_ms.1));
+    }
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     loop {
         let mut r = range(req, "w/", 256); if let Request::Range { after: a, .. } = &mut r { *a = after.clone(); }
@@ -308,11 +321,7 @@ async fn main() -> Result<()> {
 
     println!("\ndone in {:.1} s (budget {} s). Nodes are killed by their handles; temp tree removed.", started.elapsed().as_secs_f32(), budget.as_secs());
     drop(node_b); drop(node_a);
-    if let Ok(keep) = std::env::var("KEEP_LOGS") {
-        for n in ["a", "b"] { let _ = std::fs::create_dir_all(format!("{keep}/{n}"));
-            if let Ok(rd) = std::fs::read_dir(root.join(n).join("log")) { for f in rd.flatten() { let _ = std::fs::copy(f.path(), format!("{keep}/{n}/{}", f.file_name().to_string_lossy())); } } }
-        println!("node logs copied to {keep}");
-    }
+    if let Ok(keep) = std::env::var("KEEP_LOGS") { copy_logs(&root, &keep); println!("node logs copied to {keep}"); }
     // THE VERDICT, now that there is a green to protect (sdk#150's read limit).
     let mut red: Vec<String> = Vec::new();
     // NOT ANSWERED is judged apart from ANSWERED WRONG, so a node that stops serving the delegate and an engine that
@@ -359,6 +368,24 @@ impl Gate {
     }
 }
 
+/// When a request's page came, in ms since `t0` of its test -- or `None`.
+fn page_ms(h: &[(u128, String)], req: u64) -> Option<u128> {
+    h.iter().find(|(_, l)| l.starts_with(&format!("PAGE req {req}:"))).map(|(ms, _)| *ms)
+}
+
+/// Both tabs listen, in 1 s slices, until every (tab, req) in `want` has its page -- or `window` is over.
+/// Tab 2 listens exactly as long as tab 1: TEST 2 asks who ELSE hears a reply, and that needs the same ears.
+async fn hear_both_until(t1: &mut WebApi, t2: &mut WebApi, t0: Instant, window: Duration, want: &[(u8, u64)]) -> (Vec<(u128, String)>, Vec<(u128, String)>) {
+    let (mut h1, mut h2) = (Vec::new(), Vec::new());
+    let end = Instant::now() + window;
+    while Instant::now() < end {
+        let (a, b) = tokio::join!(hear(t1, t0, Duration::from_secs(1)), hear(t2, t0, Duration::from_secs(1)));
+        h1.extend(a); h2.extend(b);
+        if want.iter().all(|(tab, req)| page_ms(if *tab == 1 { &h1 } else { &h2 }, *req).is_some()) { break; }
+    }
+    (h1, h2)
+}
+
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 /// Throwaway randomness for TEST keys only: the OS's, read from /dev/urandom.
@@ -369,4 +396,12 @@ fn seed(buf: &mut [u8]) { use std::io::Read; std::fs::File::open("/dev/urandom")
 /// the one path no app takes (craftworks-sdk#194).
 fn probe_session() -> u64 {
     protocol::mint_session(0x9E37_79B9_7F4A_7C15 ^ std::process::id() as u64)
+}
+
+/// Copies both nodes' logs to KEEP_LOGS when dropped -- on every exit, not only the one that reaches the end.
+struct KeepLogs(std::path::PathBuf);
+impl Drop for KeepLogs { fn drop(&mut self) { if let Ok(keep) = std::env::var("KEEP_LOGS") { copy_logs(&self.0, &keep); } } }
+fn copy_logs(root: &Path, keep: &str) {
+    for n in ["a", "b"] { let _ = std::fs::create_dir_all(format!("{keep}/{n}"));
+        if let Ok(rd) = std::fs::read_dir(root.join(n).join("log")) { for f in rd.flatten() { let _ = std::fs::copy(f.path(), format!("{keep}/{n}/{}", f.file_name().to_string_lossy())); } } }
 }

@@ -40,6 +40,90 @@ pub enum Mode {
     IsolatedNetwork { network_port: u16 },
 }
 
+/// FLAGS EVERY PROBE NODE RUNS WITH, whatever its mode.
+///
+/// `--disable-auto-update`: our test nodes are pinned to the release the
+/// WORKAROUNDS register is gated on. A bare `freenet network`/`local` run polls
+/// for releases, and the day a newer one is published it EXITS with code 42
+/// mid-test whenever the poll is not rate-limited (measured, 2026-09-21: every
+/// L3 run whose node logged "Update 0.2.136 was detected" was red, and every
+/// run whose poll was rate-limited was not). A version bump is the register's
+/// process, never a test node's own.
+pub const NODE_FLAGS: &[&str] = &["--disable-auto-update"];
+
+/// The command line a probe node is started with. A function, so a test can
+/// read it without spawning anything.
+pub fn node_args(port: u16, dir: &Path, mode: Mode) -> Vec<String> {
+    let mut args: Vec<String> = match mode {
+        Mode::Local => vec!["local".into(), "local".into()],
+        Mode::IsolatedNetwork { network_port } => {
+            vec![
+                "network".into(),
+                "--is-gateway".into(),
+                "--skip-load-from-network".into(),
+                // Loopback on both the listen and the advertised address:
+                // a gateway that advertises 127.0.0.1 is reachable only
+                // from this machine, and with no gateway entries and no
+                // index fetch it dials nothing.
+                "--network-address".into(),
+                "127.0.0.1".into(),
+                "--network-port".into(),
+                network_port.to_string(),
+                "--public-network-address".into(),
+                "127.0.0.1".into(),
+                "--public-network-port".into(),
+                network_port.to_string(),
+                "--ws-api-address".into(),
+                "127.0.0.1".into(),
+            ]
+        }
+    };
+    args.extend([
+        "--ws-api-port".to_string(),
+        port.to_string(),
+        "--data-dir".into(),
+        dir.join("data").to_string_lossy().into_owned(),
+        "--config-dir".into(),
+        dir.join("config").to_string_lossy().into_owned(),
+        "--log-dir".into(),
+        dir.join("log").to_string_lossy().into_owned(),
+    ]);
+    if let Ok(level) = std::env::var("PROBE_LOG_LEVEL") {
+        args.push("--log-level".into());
+        args.push(level);
+    }
+    args.extend(NODE_FLAGS.iter().map(|f| f.to_string()));
+    args
+}
+
+/// The command line of a PRIVATE network-mode node that is not the lone
+/// gateway `node_args` makes -- live-cold-read's two nodes, one joined to the
+/// other through `extra`. Built HERE so it carries the same three dirs and
+/// the same NODE_FLAGS: a probe that assembled its own could forget one.
+pub fn private_network_args(ws: u16, net: u16, dir: &Path, extra: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "network".into(),
+        "--skip-load-from-network".into(),
+        "--network-address".into(),
+        "127.0.0.1".into(),
+        "--network-port".into(),
+        net.to_string(),
+        "--ws-api-address".into(),
+        "127.0.0.1".into(),
+        "--ws-api-port".into(),
+        ws.to_string(),
+        "--data-dir".into(),
+        dir.join("data").to_string_lossy().into_owned(),
+        "--config-dir".into(),
+        dir.join("config").to_string_lossy().into_owned(),
+        "--log-dir".into(),
+        dir.join("log").to_string_lossy().into_owned(),
+    ];
+    args.extend(extra.iter().cloned());
+    args.extend(NODE_FLAGS.iter().map(|f| f.to_string()));
+    args
+}
+
 pub struct Node {
     child: Option<Child>,
     pub port: u16,
@@ -77,44 +161,7 @@ impl Node {
         // this process changes nothing there, which is how an earlier attempt
         // to read the node's own account of a delegate PUT came back empty
         // and looked like "the node said nothing".
-        let mut args: Vec<String> = match mode {
-            Mode::Local => vec!["local".into(), "local".into()],
-            Mode::IsolatedNetwork { network_port } => {
-                vec![
-                    "network".into(),
-                    "--is-gateway".into(),
-                    "--skip-load-from-network".into(),
-                    // Loopback on both the listen and the advertised address:
-                    // a gateway that advertises 127.0.0.1 is reachable only
-                    // from this machine, and with no gateway entries and no
-                    // index fetch it dials nothing.
-                    "--network-address".into(),
-                    "127.0.0.1".into(),
-                    "--network-port".into(),
-                    network_port.to_string(),
-                    "--public-network-address".into(),
-                    "127.0.0.1".into(),
-                    "--public-network-port".into(),
-                    network_port.to_string(),
-                    "--ws-api-address".into(),
-                    "127.0.0.1".into(),
-                ]
-            }
-        };
-        args.extend([
-            "--ws-api-port".to_string(),
-            port.to_string(),
-            "--data-dir".into(),
-            dir.join("data").to_string_lossy().into_owned(),
-            "--config-dir".into(),
-            dir.join("config").to_string_lossy().into_owned(),
-            "--log-dir".into(),
-            dir.join("log").to_string_lossy().into_owned(),
-        ]);
-        if let Ok(level) = std::env::var("PROBE_LOG_LEVEL") {
-            args.push("--log-level".into());
-            args.push(level);
-        }
+        let args = node_args(port, dir, mode);
         let child = Command::new("freenet")
             .args(&args)
             // Captured to the temp tree rather than discarded: the node's
