@@ -61,7 +61,7 @@ async fn send(client: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()>
         .ok()
         .and_then(|x| x.parse().ok())
         .unwrap_or(protocol::CURRENT);
-    let payload = protocol::encode_request(v, r);
+    let payload = protocol::encode_request(v, r).expect("encodes");
     timeout(
         STEP,
         client.send(ClientRequest::DelegateOp(

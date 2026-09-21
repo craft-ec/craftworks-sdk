@@ -42,10 +42,9 @@ fn a_commit_spanning_calls_publishes_and_strands_nothing() {
     let node = FullNode::new();
     let mut c = node.connect();
     c.one_answer_per_call();
-    let _ = c.step(vec![Inbound::Client(protocol::encode_request(
-        protocol::CURRENT,
-        &Request::Identity,
-    ))]);
+    let _ = c.step(vec![Inbound::Client(
+        protocol::encode_request(protocol::CURRENT, &Request::Identity).expect("encodes"),
+    )]);
     let st = states(&c.client(&two_block_write()));
     println!(
         "one answer per call: {st:?}, max stranded {}",
@@ -69,10 +68,9 @@ fn control_the_same_write_publishes_when_answers_arrive_together() {
     let node = FullNode::new();
     let mut c = node.connect();
     c.answers_together();
-    let _ = c.step(vec![Inbound::Client(protocol::encode_request(
-        protocol::CURRENT,
-        &Request::Identity,
-    ))]);
+    let _ = c.step(vec![Inbound::Client(
+        protocol::encode_request(protocol::CURRENT, &Request::Identity).expect("encodes"),
+    )]);
     let st = states(&c.client(&two_block_write()));
     assert!(st.contains(&WriteState::Published), "{st:?}");
     assert_eq!(c.max_stranded(), 0);
