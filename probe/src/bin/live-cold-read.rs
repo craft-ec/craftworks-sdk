@@ -28,11 +28,9 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse, WebApi};
 use freenet_stdlib::prelude::*;
-use probe::node::{TempTree, RESERVED};
+use probe::node::{Node, TempTree};
 use protocol::{Bound, Reply, Request, TestKey};
-use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
@@ -52,36 +50,9 @@ const LONG_BUDGET: Duration = Duration::from_secs(720);
 
 fn long_window() -> bool { std::env::var("L3_LONG_WINDOW").is_ok_and(|v| v == "1") }
 
-struct Live { child: Option<Child>, ws: u16 }
-impl Live {
-    fn url(&self) -> String { format!("ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native", self.ws) }
-}
-impl Drop for Live { fn drop(&mut self) { if let Some(mut c) = self.child.take() { let _ = c.kill(); let _ = c.wait(); } } }
-
-fn free(port: u16) -> Result<()> {
-    if RESERVED.contains(&port) { bail!("port {port} belongs to someone else's node; refusing"); }
-    if TcpStream::connect(("127.0.0.1", port)).is_ok() { bail!("something is already listening on {port}; refusing to share it"); }
-    Ok(())
-}
-
-fn spawn(dir: &Path, ws: u16, net: u16, extra: &[String]) -> Result<Live> {
-    free(ws)?; free(net)?;
-    for sub in ["data", "config", "log"] { std::fs::create_dir_all(dir.join(sub))?; }
-    // Built by probe::node, the ONE place a test node's command line is made (its dirs, NODE_FLAGS).
-    let args = probe::node::private_network_args(ws, net, dir, extra);
-    let child = Command::new("freenet").args(&args)
-        .stdout(Stdio::from(std::fs::File::create(dir.join("log/console.out"))?))
-        .stderr(Stdio::from(std::fs::File::create(dir.join("log/console.err"))?))
-        .spawn().context("spawning freenet")?;
-    let mut live = Live { child: Some(child), ws };
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while Instant::now() < deadline {
-        if let Some(c) = live.child.as_mut() { if let Ok(Some(st)) = c.try_wait() { bail!("a node exited before it was ready ({st})"); } }
-        if TcpStream::connect(("127.0.0.1", ws)).is_ok() { std::thread::sleep(Duration::from_millis(400)); return Ok(live); }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    bail!("a node did not accept connections within 45 s")
-}
+/// Both nodes start through `probe::node`'s ONE door: the owner's ports refused before anything is created (the
+/// tested refusal, sdk#199), the command line with its dirs and NODE_FLAGS, killed by their handles on drop.
+fn spawn(dir: &Path, ws: u16, net: u16, extra: &[String]) -> Result<Node> { Node::spawn_private_network(ws, net, dir, extra) }
 
 async fn connect(ws: &str) -> Result<WebApi> {
     let (stream, _) = tokio_tungstenite::connect_async(ws).await.context("connecting")?;
@@ -191,7 +162,7 @@ async fn main() -> Result<()> {
     println!("key: ONE TEST signing key for this run, installed on BOTH delegates so B reads the head A wrote");
 
     // ---- A writes: w/ (300 rows, the wide read), a/ b/ c/ (60 rows each) ----
-    let mut ca = connect(&node_a.url()).await?;
+    let mut ca = connect(&node_a.ws()).await?;
     let dkey = register_and_install(&mut ca, &wasm, &block, &register, &params, &sk).await?;
     send(&mut ca, &dkey, &Request::Identity).await?; let _ = hear(&mut ca, started, Duration::from_secs(2)).await;
     let mut rows: Vec<(String, u32)> = (0..300).map(|i| ("w".to_string(), i)).collect();
@@ -222,7 +193,7 @@ async fn main() -> Result<()> {
     println!("setup: A published {published} rows in {} writes ({:.1} s)", rows.chunks(40).count(), started.elapsed().as_secs_f32());
 
     // ---- B: two tabs, the SAME delegate code, the SAME test key ----
-    let mut t1 = connect(&node_b.url()).await?; let mut t2 = connect(&node_b.url()).await?;
+    let mut t1 = connect(&node_b.ws()).await?; let mut t2 = connect(&node_b.ws()).await?;
     let dkey_b = register_and_install(&mut t1, &wasm, &block, &register, &params, &sk).await?;
     send(&mut t1, &dkey_b, &Request::Identity).await?;
     let id1 = hear(&mut t1, started, Duration::from_secs(8)).await;
@@ -260,7 +231,7 @@ async fn main() -> Result<()> {
 
     // ---- TEST 1: the wide cold read ----
     println!("\nTEST 1  tab 1 asks Range w/ (300 rows, cold, wider than one return's 4 GETs), paging 256 at a time.");
-    let mut t1 = connect(&node_b.url()).await?;   // a FRESH connection: nothing from the tests above is in its way
+    let mut t1 = connect(&node_b.ws()).await?;   // a FRESH connection: nothing from the tests above is in its way
     let mut g1 = Gate::default();
     send(&mut t1, &dkey_b, &Request::Identity).await?; g1.sent(); let idw = hear(&mut t1, started, Duration::from_secs(3)).await; g1.heard(&idw);
     println!("    fresh connection: {:?}", idw.iter().filter(|(_, l)| l.starts_with("identity")).map(|(_, l)| l.clone()).next_back());

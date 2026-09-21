@@ -129,6 +129,22 @@ pub struct Node {
     pub port: u16,
     pub mode: Mode,
     dir: PathBuf,
+    /// The command line it was started with -- what `restart` starts again.
+    args: Vec<String>,
+}
+
+/// THE refusal that keeps every probe off the owner's nodes (sdk#199): a port
+/// in `RESERVED`, or one something already listens on, is refused by name.
+/// Every door that starts a node asks it, for every port, BEFORE anything is
+/// created.
+fn refuse(port: u16, what: &str) -> Result<()> {
+    if RESERVED.contains(&port) {
+        bail!("{what} {port} belongs to someone else's node; refusing to use it");
+    }
+    if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        bail!("something is already listening on {port}; refusing to share it");
+    }
+    Ok(())
 }
 
 impl Node {
@@ -137,31 +153,43 @@ impl Node {
     }
 
     pub fn spawn_in(port: u16, dir: &Path, mode: Mode) -> Result<Self> {
-        if RESERVED.contains(&port) {
-            bail!("port {port} belongs to someone else's node; refusing to use it");
-        }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            bail!("something is already listening on {port}; refusing to share it");
-        }
+        refuse(port, "port")?;
         // The network port too — BEFORE anything is created or spawned. It was
         // checked after the directories were made, so a refused network port
         // left a tree behind.
         if let Mode::IsolatedNetwork { network_port } = mode {
-            if RESERVED.contains(&network_port) {
-                bail!("network port {network_port} belongs to someone else's node");
-            }
-            if TcpStream::connect(("127.0.0.1", network_port)).is_ok() {
-                bail!("something is already listening on {network_port}");
-            }
-        }
-        for sub in ["data", "config", "log"] {
-            std::fs::create_dir_all(dir.join(sub))?;
+            refuse(network_port, "network port")?;
         }
         // The node takes `--log-level`, NOT `RUST_LOG`: setting RUST_LOG in
         // this process changes nothing there, which is how an earlier attempt
         // to read the node's own account of a delegate PUT came back empty
         // and looked like "the node said nothing".
-        let args = node_args(port, dir, mode);
+        Self::start(port, dir, mode, node_args(port, dir, mode))
+    }
+
+    /// A PRIVATE network-mode node that is not the lone gateway `spawn_in`
+    /// makes: live-cold-read's two nodes, one joined to the other through
+    /// `extra`. Through the SAME door: both ports refused by `refuse` before
+    /// anything is created, the command line from `private_network_args` (its
+    /// dirs, NODE_FLAGS). A probe's own copy of the refusal was the line that
+    /// keeps probes off the owner's node, untested (sdk#208 review).
+    pub fn spawn_private_network(ws: u16, net: u16, dir: &Path, extra: &[String]) -> Result<Self> {
+        refuse(ws, "port")?;
+        refuse(net, "network port")?;
+        Self::start(
+            ws,
+            dir,
+            Mode::IsolatedNetwork { network_port: net },
+            private_network_args(ws, net, dir, extra),
+        )
+    }
+
+    /// Create the node's tree and start it with `args`; ready or an error.
+    /// Callers have refused their ports already.
+    fn start(port: u16, dir: &Path, mode: Mode, args: Vec<String>) -> Result<Self> {
+        for sub in ["data", "config", "log"] {
+            std::fs::create_dir_all(dir.join(sub))?;
+        }
         let child = Command::new("freenet")
             .args(&args)
             // Captured to the temp tree rather than discarded: the node's
@@ -176,18 +204,30 @@ impl Node {
                 dir.join("log/console.err"),
             )?))
             .spawn()
-            .context("spawning `freenet local local` — is the binary on PATH?")?;
+            .context("spawning `freenet` — is the binary on PATH?")?;
         let mut n = Node {
             child: Some(child),
             port,
             mode,
             dir: dir.to_path_buf(),
+            args,
         };
         n.wait_ready()?;
         Ok(n)
     }
 
     fn wait_ready(&mut self) -> Result<()> {
+        // Never PROBE the owner's port either. `refuse` keeps every door off
+        // it; this keeps a door that lost its refusal -- a mutant under test,
+        // or a future edit -- from connecting to the owner's node to ask
+        // whether "it" is ready (a mutant run did, sdk#208: TCP only, nothing
+        // sent). Refused by the same words, so a test sees the same reason.
+        if RESERVED.contains(&self.port) {
+            bail!(
+                "port {} belongs to someone else's node; refusing to probe it",
+                self.port
+            );
+        }
         let deadline = Instant::now() + BOOT;
         while Instant::now() < deadline {
             if let Some(c) = self.child.as_mut() {
@@ -225,7 +265,9 @@ impl Node {
         let port = self.port;
         let mode = self.mode;
         self.stop();
-        let mut fresh = Node::spawn_in(port, &dir, mode)?;
+        // Its OWN command line, so a private node joined through `extra`
+        // comes back joined, not as the lone gateway its mode also describes.
+        let mut fresh = Node::start(port, &dir, mode, self.args.clone())?;
         self.child = fresh.child.take();
         Ok(())
     }
