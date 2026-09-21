@@ -346,6 +346,10 @@ fn w5_parity_overflow(mode: Mode) -> Cell {
     Cell::Green
 }
 
+/// A workload: its name, the function that runs one cell, and the modes it
+/// runs under.
+type Workload = (&'static str, fn(Mode) -> Cell, Vec<Mode>);
+
 /// The cells red on the code as it stands, each with the defect it shows.
 const KNOWN_RED: &[(&str, &str, &str)] = &[
     // THE HEAD BUMP: held on blocks an EARLIER call confirmed, stranded, never
@@ -411,7 +415,7 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
 
 #[test]
 fn every_workload_under_every_mode() {
-    let workloads: [(&str, fn(Mode) -> Cell, Vec<Mode>); 5] = [
+    let workloads: [Workload; 5] = [
         (
             "W1 multi-block commit publishes",
             w1_multi_block_commit,
