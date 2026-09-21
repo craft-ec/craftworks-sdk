@@ -48,6 +48,12 @@ pub enum Inbound {
     GotHead { seq: u64, root: Cid },
     /// The head Register holds nothing.
     NoHead,
+    /// A PUT was acknowledged, named by its CONTRACT id, as the node names
+    /// it. The shell finds the block it is about (`block_for_contract`).
+    PutAckedContract { contract: Cid, ok: bool },
+    /// A GET found nothing, named by its CONTRACT id. A HIT needs no such
+    /// variant: the block id is computed from the state that came back.
+    MissedContract { contract: Cid },
     /// Anything else the node hands a delegate.
     Other,
 }
@@ -131,15 +137,6 @@ struct ShellState {
     /// asking for exactly that step.
     #[serde(default)]
     tracing_of: Option<protocol::TraceOf>,
-    /// Contract id -> the block id the engine knows it by, for requests that
-    /// are still out.
-    ///
-    /// A request is issued in one call and answered in the NEXT, and a
-    /// response names the contract while the engine named the block. Nothing
-    /// can recover one from the other — the contract id is a hash of the code
-    /// AND the params — so the pairing is remembered. Bounded, because an
-    /// unbounded map of them is a context that grows with traffic.
-    outstanding: Vec<(Cid, Cid)>,
 }
 
 /// The whole shell context: the engine's, and the shell's own.
@@ -273,6 +270,9 @@ fn ctx_opts() -> impl bincode::Options {
     bincode::DefaultOptions::new().with_fixint_encoding()
 }
 
+/// How a host derives a block's contract id (`Shell::contract_of`).
+pub type ContractOf = Box<dyn Fn(&Cid) -> Cid>;
+
 pub struct Shell<B: Blocks> {
     pub engine: Engine<B>,
     /// The highest protocol version a client has spoken this call.
@@ -284,7 +284,13 @@ pub struct Shell<B: Blocks> {
     awaiting: BTreeMap<Cid, u32>,
     head: Option<(u64, Cid)>,
     head_exists: bool,
-    outstanding: Vec<(Cid, Cid)>,
+    /// How a block's CONTRACT id is derived, set by the host that knows the
+    /// Block contract's code (sdk#150). An answer from the node names the
+    /// contract; the block it is about is found by deriving the contract id
+    /// of each block this shell and its engine are WAITING ON -- so nothing
+    /// maps "what went out", and nothing can be evicted from a map. Unset,
+    /// answers are taken to name the block itself (the native fixtures).
+    pub contract_of: Option<ContractOf>,
     /// Bytes of contract code this call was asked to install, if any.
     pub installed: Option<usize>,
     /// Whether a signing key has been provisioned this call.
@@ -392,16 +398,15 @@ impl<B: Blocks> Shell<B> {
         // same outcome: start fresh. Never a panic — these bytes come from
         // the node's cache, and a delegate a malformed context can take down
         // is one anybody can take down.
-        let (engine_ctx, awaiting, head, outstanding, tracing, tracing_of) = match carried {
+        let (engine_ctx, awaiting, head, tracing, tracing_of) = match carried {
             Some(c) => (
                 c.engine,
                 c.shell.awaiting.into_iter().collect(),
                 c.shell.head,
-                c.shell.outstanding,
                 c.shell.tracing,
                 c.shell.tracing_of,
             ),
-            None => (Vec::new(), BTreeMap::new(), None, Vec::new(), false, None),
+            None => (Vec::new(), BTreeMap::new(), None, false, None),
         };
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         check_limits(&params, Limits::default());
@@ -415,7 +420,7 @@ impl<B: Blocks> Shell<B> {
             // Starts false every call and is set by what the node SAYS this
             // call — a read of the head, or its absence. Nothing carries it.
             head_exists: false,
-            outstanding: if resumed { outstanding } else { Vec::new() },
+            contract_of: None,
             installed: None,
             provisioned: false,
             read_back_hits: 0,
@@ -444,7 +449,6 @@ impl<B: Blocks> Shell<B> {
                 shell: ShellState {
                     awaiting: self.awaiting.iter().map(|(c, n)| (*c, *n)).collect(),
                     head: self.head,
-                    outstanding: self.outstanding.clone(),
                     tracing: self.tracing,
                     tracing_of: self.tracing_of,
                 },
@@ -497,6 +501,30 @@ impl<B: Blocks> Shell<B> {
             // Attribution BEFORE the work, so the steps the work produces
             // have somewhere to go.
             self.attribute(&msg);
+            // An answer naming a CONTRACT is matched to its block first. One
+            // that matches nothing this shell waits on is dropped as
+            // `Unexpected`, never passed on under the contract's id: taken
+            // for a block, an ack was read back as one and a miss was
+            // reported against nothing (sdk#150).
+            let msg = match msg {
+                Inbound::PutAckedContract { contract, ok } => {
+                    match self.block_for_contract(&contract) {
+                        Some(id) => Inbound::PutAcked { id, ok },
+                        None => {
+                            out.dropped.push(Dropped::Unexpected);
+                            continue;
+                        }
+                    }
+                }
+                Inbound::MissedContract { contract } => match self.block_for_contract(&contract) {
+                    Some(id) => Inbound::GotState { id, bytes: None },
+                    None => {
+                        out.dropped.push(Dropped::Unexpected);
+                        continue;
+                    }
+                },
+                other => other,
+            };
             let effects = match msg {
                 Inbound::Client(bytes) => match crate::serve::serve(&bytes) {
                     crate::serve::Served::Do(r, v, session) => {
@@ -536,6 +564,8 @@ impl<B: Blocks> Shell<B> {
                     out.dropped.push(Dropped::NotForUs);
                     Vec::new()
                 }
+                // Matched to a block (or dropped) above, before this match.
+                Inbound::PutAckedContract { .. } | Inbound::MissedContract { .. } => Vec::new(),
             };
             // EVERY effect, whatever produced it. Converting only the ones a
             // client REQUEST produced dropped every notification arising from
@@ -1221,41 +1251,23 @@ impl<B: Blocks> Shell<B> {
         self.awaiting.len()
     }
 
-    /// A request went out for `block` under contract id `contract`.
+    /// Which block an answer naming `contract` is about: the block this
+    /// shell or its engine is waiting on whose contract id it is.
     ///
-    /// Bounded at 64: enough for several calls' worth of outstanding
-    /// requests, and a cap rather than a hope. Dropping the oldest costs a
-    /// re-fetch, which the read path already handles; growing without a cap
-    /// costs the context, which nothing handles.
-    pub fn note_request(&mut self, contract: Cid, block: Cid) {
-        if self.outstanding.iter().any(|(c, _)| *c == contract) {
-            return;
-        }
-        if self.outstanding.len() >= 64 {
-            self.outstanding.remove(0);
-        }
-        self.outstanding.push((contract, block));
-    }
-
-    /// Which block a response for `contract` is about, read straight out of
-    /// a context without building an engine.
-    ///
-    /// The entry point needs this BEFORE it can build the message the shell
-    /// is given, and building a shell to ask would mean building one twice.
-    pub fn peek_block_for(ctx: &[u8], contract: &Cid) -> Option<Cid> {
-        let c: Carried = ctx_opts().deserialize(ctx).ok()?;
-        c.shell
-            .outstanding
-            .iter()
-            .find(|(k, _)| k == contract)
-            .map(|(_, b)| *b)
-    }
-
-    /// Which block a response for `contract` is about.
-    pub fn block_for(&self, contract: &Cid) -> Option<Cid> {
-        self.outstanding
-            .iter()
-            .find(|(c, _)| c == contract)
-            .map(|(_, b)| *b)
+    /// Derived over what is actually outstanding -- the engine's
+    /// `waiting_on` and this shell's read-backs -- never looked up in a map
+    /// of what went out. The map this replaced held 64 entries while one
+    /// return carries 128 puts, so a commit of more than 64 blocks evicted
+    /// its own pairings; each unpaired ack was taken for a block, read back
+    /// as one, and the commit never published (sdk#150, executed).
+    pub fn block_for_contract(&self, contract: &Cid) -> Option<Cid> {
+        let Some(derive) = &self.contract_of else {
+            return Some(*contract);
+        };
+        self.engine
+            .waiting_on()
+            .into_iter()
+            .chain(self.awaiting.keys().copied())
+            .find(|b| derive(b) == *contract)
     }
 }

@@ -52,6 +52,9 @@ struct Mode {
     /// that has not reloaded since an upgrade — sends a tick of its own
     /// through the same delegate.
     two_sessions: bool,
+    /// Answers name the CONTRACT, as a real node's do, and the shell matches
+    /// them to the blocks it is waiting on (sdk#150 PR 4).
+    contract: bool,
 }
 
 impl Mode {
@@ -74,6 +77,9 @@ impl Mode {
         if self.two_sessions {
             p.push("two-sessions")
         }
+        if self.contract {
+            p.push("contract")
+        }
         p.join("+")
     }
 }
@@ -84,6 +90,7 @@ const BATCH: Mode = Mode {
     evicting: false,
     real_ticks: false,
     two_sessions: false,
+    contract: false,
 };
 const APC: Mode = Mode {
     one_per_call: true,
@@ -146,6 +153,9 @@ fn connect(node: &FullNode, mode: Mode) -> Conn {
         c.one_answer_per_call();
     } else {
         c.answers_together();
+    }
+    if mode.contract {
+        c.pair_by_contract();
     }
     c
 }
@@ -265,6 +275,69 @@ fn w1_multi_block_commit(mode: Mode) -> Cell {
     }
     if !st.contains(&WriteState::Published) {
         return Cell::Red(format!("never published: told {st:?}"));
+    }
+    Cell::Green
+}
+
+/// W6: one commit of MORE THAN 64 BLOCKS publishes -- 100 distinct 2 KiB
+/// values, each its own block. Under `+contract` the answers name contracts:
+/// the shell's pairing map held 64 while a return carries 128 puts, so such
+/// a commit evicted its own pairings, read an ack back as a block, and never
+/// published (sdk#150, executed: 36 GETs, 24 stranded, Stalled).
+fn w6_over_64_blocks(mode: Mode) -> Cell {
+    use testkit::full_node::Served;
+    let node = node_for(mode);
+    let mut c = connect(&node, mode);
+    c.client(&Request::Identity);
+    let before = c.served(Served::Put);
+    let ops: Vec<Op> = (0..100u64)
+        .map(|i| {
+            Op::Put(
+                format!("k/wide/{i:04}").into_bytes(),
+                value(60_000 + i, 2048),
+            )
+        })
+        .collect();
+    // Re-sent on Busy, the way the outbox does. On a cold node a write this
+    // size is over `max_parked_write_bytes`, so it is declined while its path
+    // is fetched -- ONE block per re-send, since the apply stops at the first
+    // missing one (measured: 40 re-sends for this tree). That cost is
+    // sdk#174's continuation, not this cell's claim; the count is printed.
+    let mut st = Vec::new();
+    let mut sends = 0;
+    for _ in 0..64 {
+        sends += 1;
+        let got = states_of(
+            &c.client(&Request::Write {
+                write_id: 1,
+                ops: ops.clone(),
+            }),
+            1,
+        );
+        let busy = got.last() == Some(&WriteState::Busy);
+        st.extend(got);
+        if !busy {
+            break;
+        }
+    }
+    if mode.cold {
+        println!(
+            "    (W6 {}: {sends} send(s) before the write applied)",
+            mode.name()
+        );
+    }
+    st.retain(|s| *s != WriteState::Busy);
+    let puts = c.served(Served::Put) - before;
+    if let Some(why) = every_call(&mut c) {
+        return Cell::Red(format!("{why}; {puts} PUTs; told {st:?}"));
+    }
+    if puts <= 64 {
+        return Cell::NotReached(format!(
+            "the commit put {puts} blocks, not more than 64; told {st:?}"
+        ));
+    }
+    if !st.contains(&WriteState::Published) {
+        return Cell::Red(format!("never published ({puts} PUTs): told {st:?}"));
     }
     Cell::Green
 }
@@ -652,7 +725,7 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
 
 #[test]
 fn every_workload_under_every_mode() {
-    let workloads: [Workload; 7] = [
+    let workloads: [Workload; 8] = [
         (
             "W1 multi-block commit publishes",
             w1_multi_block_commit,
@@ -666,6 +739,10 @@ fn every_workload_under_every_mode() {
                 Mode { cold: true, ..APC },
                 Mode {
                     two_sessions: true,
+                    ..APC
+                },
+                Mode {
+                    contract: true,
                     ..APC
                 },
             ],
@@ -718,6 +795,19 @@ fn every_workload_under_every_mode() {
             "W5 parity wider than one return",
             w5_parity_overflow,
             vec![APC],
+        ),
+        (
+            "W6 one commit of more than 64 blocks",
+            w6_over_64_blocks,
+            vec![
+                BATCH,
+                APC,
+                Mode { cold: true, ..APC },
+                Mode {
+                    contract: true,
+                    ..APC
+                },
+            ],
         ),
         (
             "W7 a write that emits zero blocks",

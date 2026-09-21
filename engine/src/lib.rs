@@ -1027,6 +1027,29 @@ impl<B: Blocks> Engine<B> {
     /// confirmed ON THE NODE -- carried in the context, so true at the top of
     /// a call that did not see the confirmation (sdk#150). The head bump is
     /// emitted only once every one of them is here, naming them as `after`.
+    /// Every block this engine is waiting on the NODE to answer about: the
+    /// commit's unconfirmed data, the blocks parked reads wait on, the parked
+    /// write's path, and owed parity not yet confirmed (sdk#150).
+    ///
+    /// Derived, never recorded. An answer names a CONTRACT, and the host
+    /// matches it back to a block by deriving each of these blocks' contract
+    /// ids -- so no map of "what went out" is carried, and nothing that was
+    /// asked for can be evicted from one.
+    pub fn waiting_on(&self) -> BTreeSet<Cid> {
+        let mut w: BTreeSet<Cid> = BTreeSet::new();
+        if let Some(c) = &self.pending {
+            w.extend(c.data.difference(&c.confirmed).copied());
+        }
+        w.extend(self.reads.waiting.keys().copied());
+        if let Some(p) = &self.parked_write {
+            w.extend(p.needs.iter().copied());
+        }
+        for key in self.owed.keys() {
+            w.extend(key.iter().filter(|id| !self.parity_confirmed.contains(*id)));
+        }
+        w
+    }
+
     pub fn confirmed_in_flight(&self) -> impl Iterator<Item = Cid> + '_ {
         self.pending
             .iter()

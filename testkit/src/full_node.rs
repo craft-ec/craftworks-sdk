@@ -130,6 +130,7 @@ impl FullNode {
             // together are the special case, and a test that wants them says
             // so with `answers_together`.
             one_answer_per_call: true,
+            pair_by_contract: false,
             hold: false,
             held: VecDeque::new(),
             max_stranded: 0,
@@ -173,6 +174,10 @@ struct ConnState {
     /// default here, so no existing test changes meaning; the cross-call
     /// matrix turns it on (sdk#150).
     one_answer_per_call: bool,
+    /// Answer PUTs and missed GETs under the CONTRACT id, as a real node
+    /// does, and let the shell match them back (sdk#150). A hit needs no
+    /// matching: the block id is computed from the state that came back.
+    pair_by_contract: bool,
     /// HOLD the node's answers instead of delivering them: they queue until
     /// the test releases them, one per call, so a tick can land while a
     /// commit is in flight.
@@ -204,6 +209,11 @@ impl Conn {
     /// Returns every reply the shell produced along the way.
     pub fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
         self.step_bounded(inbound, 0)
+    }
+
+    /// Answer under CONTRACT ids, as a real node does (see the field).
+    pub fn pair_by_contract(&self) {
+        self.0.borrow_mut().pair_by_contract = true;
     }
 
     /// Deliver the node's answers one per call, as a real node does -- the
@@ -301,6 +311,10 @@ impl Conn {
         // did not put in the context is gone by the next line (F32).
         let mut shell: Shell<Store> =
             Shell::resume_with(&ctx, params, store, StoreFacts::provisioned());
+        let paired = self.0.borrow().pair_by_contract;
+        if paired {
+            shell.contract_of = Some(Box::new(contract_of));
+        }
         let out = shell.handle(inbound);
 
         {
@@ -367,7 +381,14 @@ impl Conn {
                         }
                     }
                     self.0.borrow_mut().handed.push(bytes);
-                    next.push(Inbound::PutAcked { id, ok: true });
+                    next.push(if paired {
+                        Inbound::PutAckedContract {
+                            contract: contract_of(&id),
+                            ok: true,
+                        }
+                    } else {
+                        Inbound::PutAcked { id, ok: true }
+                    });
                 }
                 engine_delegate::schedule::Op::Get { id, .. } => {
                     self.record(Served::Get);
@@ -388,7 +409,12 @@ impl Conn {
                             None => n.store.get(&id).map(|b| b.to_vec()),
                         }
                     };
-                    next.push(Inbound::GotState { id, bytes: held });
+                    next.push(match (paired, held) {
+                        (true, None) => Inbound::MissedContract {
+                            contract: contract_of(&id),
+                        },
+                        (_, held) => Inbound::GotState { id, bytes: held },
+                    });
                 }
                 engine_delegate::schedule::Op::Head { seq, root } => {
                     self.record(Served::Head);
@@ -558,4 +584,14 @@ impl Drop for DumpConnOnPanic<'_> {
             eprintln!("{}", self.conn.dump(self.what));
         }
     }
+}
+
+/// A stand-in for "the contract id of this block": distinct from the block
+/// id, as the real one is (the Block contract's code hashed with the block id
+/// as params), and cheap. What it must be for the test is exactly what the
+/// real derivation is -- a function the shell can compute from the block.
+fn contract_of(id: &Cid) -> Cid {
+    // A hash of the id under a kind byte no block uses: distinct from every
+    // block id, and a function of this one.
+    freenet_prolly::block_id(0xC0, id)
 }
