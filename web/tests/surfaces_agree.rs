@@ -88,6 +88,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     // An in-memory store IS the tree: nothing can have changed in it that
     // this client did not do, so there is nothing to ask.
     "refresh_domain",
+    // Writes made and not yet PUBLISHED, for the page's unsaved-changes
+    // guard (sdk#163). An in-memory store is not waiting on a network: it has
+    // nothing "not yet published", only everything, lost with the tab — a
+    // different fact the page states differently ("in this tab only").
+    "unsaved_writes",
 ];
 
 #[test]

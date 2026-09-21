@@ -1049,6 +1049,14 @@ impl Session {
     /// arriving through a statistics panel instead of a read.
     ///
     /// The numbers that ARE this client's own are reported beside them.
+    /// Writes made here and not yet PUBLISHED, held ones included
+    /// (craftworks-sdk#163): what the page's unsaved-changes guard and its
+    /// "saving N…" count. Not `Accepted` — an accepted write can still be
+    /// lost with the tab.
+    pub fn unsaved_writes(&self) -> usize {
+        self.db.store().unsaved_writes()
+    }
+
     pub fn stats(&mut self) -> Result<String, JsValue> {
         let (n_pending, pending_bytes) = self.db.store_mut().copy.pending();
         let held = self.db.store_mut().copy.bytes();

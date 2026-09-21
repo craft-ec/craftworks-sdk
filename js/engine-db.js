@@ -141,8 +141,15 @@ export function engineDb(handle) {
   // reaches you, never whether your own does.
   const mine = new Map();    // domain -> Set<binding.reload>
 
-  /** This client changed `domain` itself: re-run every binding on it. */
-  const touched = domain => { for (const r of mine.get(domain) ?? []) r(); };
+  /**
+   * This client changed `domain` itself: re-run every binding on it — and
+   * tell the page a write was made, so its unsaved-changes guard is armed at
+   * once rather than at the next message (craftworks-sdk#163).
+   */
+  const touched = domain => {
+    handle.wrote?.();
+    for (const r of mine.get(domain) ?? []) r();
+  };
 
   /**
    * The head moved: re-run the bindings the SESSION says are stale.

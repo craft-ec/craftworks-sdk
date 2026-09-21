@@ -192,6 +192,42 @@ export async function openSession(Session, {
     session.provision(delegate, block, register);
   }
 
+  // THE UNSAVED-CHANGES GUARD (craftworks-sdk#163).
+  //
+  // A write is safe from a closing tab only once it is PUBLISHED. Until then
+  // — sent, accepted, or HELD by the outbox's window, which the node has
+  // never seen — closing the tab loses it. So while any write is unsaved the
+  // page asks the browser's standard "leave site?" question, and the moment
+  // the last one publishes it stops asking. Registered only while needed: a
+  // `beforeunload` listener left on a page with nothing to lose costs it the
+  // back/forward cache and asks a question with no reason behind it.
+  //
+  // And the page is told the count as it changes — `{ kind: "saving", count }`
+  // — so it can say "saving N…" until the count is 0, never "saved" at
+  // `Accepted`.
+  const onBeforeUnload = e => {
+    e.preventDefault?.();
+    // The legacy form some browsers still need to show the prompt.
+    e.returnValue = "";
+    return "";
+  };
+  let guarded = false;
+  let saving = 0;
+  const guard = () => {
+    const n = session.unsaved_writes();
+    if (n > 0 && !guarded && onWindow) {
+      onWindow("beforeunload", onBeforeUnload);
+      guarded = true;
+    } else if (n === 0 && guarded) {
+      offWindow?.("beforeunload", onBeforeUnload);
+      guarded = false;
+    }
+    if (n !== saving) {
+      saving = n;
+      onEvent({ kind: "saving", count: n });
+    }
+  };
+
   const conn = connectWith(session, {
     url: session.url(),
     onEvent: e => {
@@ -202,7 +238,7 @@ export async function openSession(Session, {
       // A message arrived and has been handed to the session: any load it
       // completed can now wake the reads parked on it. On the task that
       // handled the message, not on a timer.
-      if (e.kind === "message") drainReads();
+      if (e.kind === "message") { drainReads(); guard(); }
       onEvent(e);
     },
   });
@@ -222,6 +258,8 @@ export async function openSession(Session, {
     // the reads parked on it are woken with a fact rather than left hanging.
     // Nothing else exercises this path: every other route delivers a message.
     drainReads();
+    // A write rolled back at its timeout is no longer unsaved either.
+    guard();
     // AND THE FRAME HAS TO LEAVE.
     //
     // `session.tick()` QUEUES a `Tick` for the delegate; `pump` is the only
@@ -256,6 +294,7 @@ export async function openSession(Session, {
   };
   const onHide = () => { if (documentOf?.visibilityState === "hidden") flush(); };
   const listeners = [];
+
   if (onWindow) {
     onWindow("pagehide", flush);
     listeners.push(["pagehide", flush]);
@@ -284,6 +323,11 @@ export async function openSession(Session, {
     // waits for ever — which is why `open()` exists and why a page should
     // not be wiring this by hand.
     onReadsWake: fn => { drainReads = fn; },
+    // `engineDb` calls this after every write it makes, so the guard is
+    // armed in the same task as the write — not at the next message.
+    wrote: guard,
+    /// Writes made here and not yet published, held ones included.
+    unsaved: () => session.unsaved_writes(),
     /// Ship what is waiting, now. Wired to the page lifecycle above; exposed
     /// because an app that knows it is finishing can say so sooner.
     flush,
@@ -293,6 +337,7 @@ export async function openSession(Session, {
       flush();
       stopEvery(timer);
       if (offWindow) for (const [name, fn] of listeners) offWindow(name, fn);
+      if (guarded) { offWindow?.("beforeunload", onBeforeUnload); guarded = false; }
       documentOf?.removeEventListener?.("visibilitychange", onHide);
       conn.close();
     },

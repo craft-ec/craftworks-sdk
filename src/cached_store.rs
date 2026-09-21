@@ -123,6 +123,16 @@ impl CachedStore {
         self.held.len()
     }
 
+    /// Writes this page has MADE and the network does not have yet: every
+    /// write not yet `Published` — sent, Accepted, queued, and HELD by the
+    /// window alike (craftworks-sdk#163). What a closing tab loses. The page's
+    /// unsaved-changes guard and its "saving N…" read this, so it must count
+    /// the writes the node has never seen: with the window full, 84 of a
+    /// 100-row save are held and only 16 are anywhere else.
+    pub fn unsaved_writes(&self) -> usize {
+        self.copy.pending_writes()
+    }
+
     /// Queue the request that loads `[lo, hi)`. The host pumps; the answer
     /// arrives at [`CachedStore::on_page`].
     pub fn request_range(&mut self, req_id: u64, lo: &[u8], hi: &[u8], max_entries: u32) {
