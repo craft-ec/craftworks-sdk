@@ -807,6 +807,14 @@ impl<B: Blocks> Shell<B> {
             }
         }
         let ev = match r {
+            // v5's write (craftworks-sdk#183). Cannot arrive: decode refuses it
+            // below v5, and `serve` answers every v5 frame `Unsupported` until
+            // the engine implements the order rule (build step 2). NOT a panic
+            // if it ever does — a panic in a delegate closes the engine.
+            P::WriteFrom { .. } => {
+                debug_assert!(false, "a WriteFrom reached the shell: serve must answer v5 Unsupported until step 2");
+                return Vec::new();
+            }
             P::Identity => {
                 // Identity is also how a session BEGINS. There is no separate
                 // `start` in the protocol and there should not be: answering

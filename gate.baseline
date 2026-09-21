@@ -1,9 +1,9 @@
 craftworks-sdk=290
 engine=107
-engine-delegate=40
+engine-delegate=42
 probe=5
 probe-delegate=0
-protocol=35
+protocol=49
 testkit=15
 web=11
 wire=33
