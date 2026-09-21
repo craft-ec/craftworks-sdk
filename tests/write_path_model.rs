@@ -444,7 +444,16 @@ impl Model {
     fn tick(&mut self, i: usize) {
         self.fell_at_node[i] = false; // the tick refills after its own rollbacks
         let now = self.clock.now_ms();
-        self.stores[i].send_tick(now);
+        // At most one unanswered tick per session (sdk#174): what the gate
+        // withheld, and what it gave up on, are situations the sweep must
+        // show it reaches.
+        let forgotten = self.stores[i].client.ticks.forgotten;
+        if !self.stores[i].send_tick(now) {
+            self.saw.insert("a tick withheld (one unanswered)");
+        }
+        if self.stores[i].client.ticks.forgotten > forgotten {
+            self.saw.insert("a tick forgotten after FORGET_MS");
+        }
         let queued_before = self.queued[i].clone();
         let mut timed_out = Vec::new();
         self.ends_across(i, |m| {
@@ -870,6 +879,8 @@ const COVERAGE: &[&str] = &[
     "a request refused past 101 (F51)",
     "a request refused while parked (F50)",
     "the node parked",
+    "a tick withheld (one unanswered)",
+    "a tick forgotten after FORGET_MS",
     "a context lost with no commit",
     "a context lost with a commit taken, not landed",
     "a context lost AFTER a head PUT",
@@ -995,21 +1006,23 @@ fn show(seed: u64, cfg: Config) -> String {
 /// ParityComplete for a write it no longer holds (its own fix PR).
 const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
     // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
-    ("FALSE ROLLBACK", "Busy, then applied after a later write", 13, "sdk#183"),
-    ("FALSE ROLLBACK", "its Published went to the other session", 871, "sdk#184"),
-    ("FALSE ROLLBACK", "its verdict was dropped", 827, "sdk#183"),
-    ("FALSE ROLLBACK", "left the client after it was rolled back", 706, "sdk#183"),
+    // Re-pinned for sdk#174's tick gate: fewer tick frames in the node's queue
+    // shifts timing; no class new, none gone (the per-pair table is in that commit).
+    ("FALSE ROLLBACK", "Busy, then applied after a later write", 9, "sdk#183"),
+    ("FALSE ROLLBACK", "its Published went to the other session", 872, "sdk#184"),
+    ("FALSE ROLLBACK", "its verdict was dropped", 847, "sdk#183"),
+    ("FALSE ROLLBACK", "left the client after it was rolled back", 714, "sdk#183"),
     ("FALSE ROLLBACK", "rolled back behind another write of its keys", 894, "sdk#183"),
-    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 179, "sdk#183"),
-    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 437, "sdk#183"),
+    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 176, "sdk#183"),
+    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 428, "sdk#183"),
     ("FALSE ROLLBACK", "timed out while its commit was in flight", 3, "sdk#183"),
     ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 4, "sdk#183"),
-    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 20, "sdk#183"),
+    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 23, "sdk#183"),
     ("LATE VERDICT", "", 1000, "the ParityComplete client fix (its own PR)"),
-    ("STALE CLOCK", "Busy", 292, "sdk#183"),
-    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 246, "sdk#183"),
-    ("W5 NOT REFILLED AFTER A FALL", "", 297, "sdk#183"),
-    ("W6 COPY LIES", "", 494, "sdk#183"),
+    ("STALE CLOCK", "Busy", 300, "sdk#183"),
+    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 237, "sdk#183"),
+    ("W5 NOT REFILLED AFTER A FALL", "", 303, "sdk#183"),
+    ("W6 COPY LIES", "", 503, "sdk#183"),
 ];
 
 #[test]
@@ -1069,7 +1082,8 @@ fn tripwire(seed: u64, cfg: Config, class: &str, tag: &str, issue: &str) {
 /// write of the same session had landed — the older value lands last.
 #[test]
 fn known_red_busy_reorder_k_old_after_k_new() {
-    tripwire(5, TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
+    // Seed 9 since sdk#174 (was 5): the first seed that still finds it.
+    tripwire(9, TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
 }
 
 /// A Busy'd write, queued at the client with its original clock, never
@@ -1116,7 +1130,8 @@ fn known_red_the_window_is_not_refilled_after_a_fall() {
 /// W6 at rest: the copy shows a value the node does not have.
 #[test]
 fn known_red_the_copy_lies_at_rest() {
-    tripwire(1, TODAY, "W6 COPY LIES", "", "sdk#183");
+    // Seed 2 since sdk#174 (was 1): the first seed that still finds it.
+    tripwire(2, TODAY, "W6 COPY LIES", "", "sdk#183");
 }
 
 /// THE HARNESS'S OWN CHECK — not a finding about today's client, which
