@@ -356,15 +356,15 @@ fn a_context_from_the_previous_version_is_refused() {
     );
 
     // The version sits at bytes [4..6], after the magic. The PREVIOUS one is
-    // 8: sdk#162's 9 says whether a commit's parity was left uncoded, a
-    // shape a v8 context would decode into as nonsense.
+    // 9: sdk#174's 10 counts a parked read's and a parked write's GETs, a
+    // shape a v9 context would decode into as nonsense.
     assert_eq!(
         u16::from_le_bytes([ctx[4], ctx[5]]),
-        9,
+        10,
         "this build's version moved: name the previous one here"
     );
     let mut old = ctx.clone();
-    old[4..6].copy_from_slice(&8u16.to_le_bytes());
+    old[4..6].copy_from_slice(&9u16.to_le_bytes());
     let (_, recovered) =
         engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
     assert!(
