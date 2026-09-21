@@ -1034,8 +1034,13 @@ impl<B: Blocks> Shell<B> {
     /// start reading where it left off.
     fn on_head(&mut self, got: Option<(u64, Cid)>) -> Vec<Effect> {
         match (self.head.take(), got) {
-            (Some((want, _)), Some((seq, root))) => {
-                if seq == want {
+            // The head this shell WROTE is (seq, root), and only that pair
+            // read back is its confirmation. The same seq under another root
+            // is another writer's head at that seq: a conflict, never
+            // `Published` (sdk#178: seq alone was compared, and a foreign
+            // head at our seq was told Published).
+            (Some((want, want_root)), Some((seq, root))) => {
+                if seq == want && root == want_root {
                     self.head_exists = true;
                     self.engine.step(Event::HeadConfirmed(seq))
                 } else {
