@@ -124,6 +124,14 @@ fn head_writable(ctx: &DelegateCtx) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     }
 }
 
+/// How many of `msgs` are operations on the NODE, as opposed to messages to
+/// the client (`ApplicationMessage`).
+fn node_ops(msgs: &[OutboundDelegateMsg]) -> usize {
+    msgs.iter()
+        .filter(|m| !matches!(m, OutboundDelegateMsg::ApplicationMessage(_)))
+        .count()
+}
+
 fn id32(k: &ContractInstanceId) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&k.as_bytes()[..32]);
@@ -567,7 +575,11 @@ impl DelegateInterface for EngineDelegate {
         // from any other break.
         let note = crate::shell::reply_bytes(&protocol::Reply::Call {
             saw,
-            ops: msgs.len() as u32,
+            // NODE operations only. `msgs` also holds this call's replies to
+            // the client by now, and counting them read a no-op write's three
+            // state replies as three ops -- the number M1 compares with the
+            // native matrix's PUTs and GETs.
+            ops: node_ops(&msgs) as u32,
             stranded: out.stranded as u32,
             // `refused_no_code` folds in here: from outside, a put the shell
             // would not build and a message it could not read are the same
@@ -641,3 +653,31 @@ const REGISTER_PARAMS: &[u8] = b"register_contract_params";
 /// The device signing key, as handed in. TEST ONLY today — generated per run
 /// by the driver, never read from disk, removed at the end of the run.
 const SIGNING_KEY: &[u8] = b"device_signing_key";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply() -> OutboundDelegateMsg {
+        OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(vec![1]).processed(true))
+    }
+
+    fn get() -> OutboundDelegateMsg {
+        OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(ContractInstanceId::new(
+            [7u8; 32],
+        )))
+    }
+
+    /// `Reply::Call.ops` counts node operations, not replies: a no-op
+    /// write's call -- three state replies and nothing for the node -- is 0.
+    #[test]
+    fn a_call_with_only_client_replies_reports_no_node_ops() {
+        assert_eq!(node_ops(&[reply(), reply(), reply()]), 0);
+    }
+
+    /// The control: node operations ARE counted, beside the replies.
+    #[test]
+    fn control_node_operations_are_counted_and_replies_are_not() {
+        assert_eq!(node_ops(&[get(), get(), reply(), get(), reply()]), 3);
+    }
+}

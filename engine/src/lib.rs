@@ -457,6 +457,12 @@ pub struct Params {
     /// whole remainder of a range, and asking for all of it is how one scan
     /// becomes an unbounded fan-out. This is a bound on the CORE's appetite,
     /// not a batch size: the shell still decides how many it issues at once.
+    ///
+    /// And never MORE than one return carries (the shell's `max_gets`,
+    /// refused at the shell's construction otherwise): what a return cannot
+    /// carry is dropped at the end of the call and nothing asks for it again,
+    /// so a read that needed more than that in one round never came back
+    /// (sdk#150; live on two private nodes: 0 of 60 rows, 0 of 300).
     pub max_fetch_per_round: usize,
     /// How many times a block is asked for before the read is answered
     /// `Unavailable`. Attempts are RE-ISSUED, not waited on (ARCHITECTURE §7).
@@ -641,7 +647,7 @@ impl Default for Params {
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
             transfer_superseded_waiters: true,
-            max_fetch_per_round: 8,
+            max_fetch_per_round: 4,
             max_attempts: 3,
             max_read_rounds: 64,
             share_fetches: true,
@@ -996,6 +1002,11 @@ impl<B: Blocks> Engine<B> {
     }
 
     /// Groups whose redundancy does not exist yet.
+    /// The parameters this engine runs under.
+    pub fn params(&self) -> &Params {
+        &self.params
+    }
+
     pub fn owed_groups(&self) -> usize {
         self.owed.len()
     }

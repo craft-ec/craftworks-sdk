@@ -213,6 +213,23 @@ fn rows_in(r: &engine::read::ReadResult) -> u64 {
     }
 }
 
+/// The engine may never ask for more in one round than one return carries.
+///
+/// What a return cannot carry is dropped when the call ends, and nothing
+/// asks for it again: the read waits for ever. Measured live on two private
+/// nodes (sdk#150's L3): the engine asked for 8, a return carried 4, and no
+/// cold read of 60 or 300 rows ever answered. So the pairing is REFUSED, not
+/// tolerated.
+fn check_limits(params: &engine::Params, limits: Limits) {
+    assert!(
+        params.max_fetch_per_round <= limits.max_gets,
+        "max_fetch_per_round ({}) is over what one return carries (max_gets {}): \
+         the rest would be dropped at the end of the call and never asked for again",
+        params.max_fetch_per_round,
+        limits.max_gets
+    );
+}
+
 /// A client, as the engine keys it: the SESSION that sent the frame and the
 /// VERSION it spoke, packed into the engine's opaque 64-bit id
 /// (craftworks-sdk#146).
@@ -387,6 +404,7 @@ impl<B: Blocks> Shell<B> {
             None => (Vec::new(), BTreeMap::new(), None, Vec::new(), false, None),
         };
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
+        check_limits(&params, Limits::default());
         Shell {
             client_version: 0,
             engine,
@@ -436,6 +454,9 @@ impl<B: Blocks> Shell<B> {
 
     /// One call: everything that arrived, everything that leaves.
     pub fn handle(&mut self, inbound: Vec<Inbound>) -> Outbound {
+        // `limits` is a public field, so the pairing is checked where it is
+        // used as well as where the shell is built.
+        check_limits(self.engine.params(), self.limits);
         let mut out = Outbound::default();
         let mut sched = Scheduler::default();
         // WHAT THE NODE CONFIRMED BEFORE THIS CALL EXISTED.
