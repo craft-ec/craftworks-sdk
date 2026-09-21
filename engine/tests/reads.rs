@@ -836,6 +836,9 @@ fn no_read_sequence_panics_and_every_read_answers() {
             Params {
                 max_attempts: 2,
                 max_context_bytes: 32 * 1024,
+                // A context this small declares an asks table to match: the
+                // default's 132 x 48 B is over its 1/16 share (sdk#150 PR 3).
+                max_asks: 32,
                 ..Params::default()
             },
         );

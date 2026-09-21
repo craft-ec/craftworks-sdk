@@ -28,7 +28,7 @@
 //! | W1 multi-block commit | batch, one-per-call, +real-ticks, +cold | evicting: a WRITE reads its path once per apply, so eviction is W2/W3's case; two sessions: sdk#146's mode, not yet in this fixture |
 //! | W2 cold wide read | batch+cold, one-per-call+cold, +evicting | warm: nothing is fetched, so it cannot overflow; real ticks: a read is not ticked |
 //! | W3 parked then refused | one-per-call+cold | warm: nothing parks (reported NOT REACHED if tried); batch: its answers arrive together, hiding the node-driven verdict |
-//! | W4 commit across a tick | one-per-call+real-ticks | batch: nothing is in flight across a call; cold/evicting: W1 covers the cold commit |
+//! | W4 across a tick, FIRST commit / not first | one-per-call+real-ticks | batch: nothing is in flight across a call; cold/evicting: W1 covers the cold commit |
 //! | W5 parity past one return | one-per-call | cold/evicting: parity is put, not read; real ticks: W4 covers ticks during a commit |
 //! | W7 a write that emits zero blocks | batch (control), one-per-call, +real-ticks | cold/evicting: the write still reads its path cold, which is W8's case (M1 DoD note 11) |
 //! | (all) | -- | two live sessions: needs a second connection whose calls interleave -- sdk#146, added there |
@@ -436,16 +436,36 @@ fn w3_parked_then_refused(mode: Mode) -> Cell {
 }
 
 /// W4: a commit IN FLIGHT across a real tick -- one second old must not be
-/// `Stalled` (the bound is 64 ticks), and it must still publish.
-fn w4_commit_across_a_tick(mode: Mode) -> Cell {
+/// `Stalled` (the bound is 64 ticks), it must publish, and its PARITY must be
+/// written: `ParityComplete`, with the node's PUT count moving after the
+/// publish. "Published" alone is not redundancy (M1 DoD A0).
+///
+/// Two arms. FIRST commit ever: its parity used to go out `after` the empty
+/// tree's root, which nobody confirms, so it was held, dropped with the call
+/// and -- recorded as `sent` -- never asked for again (sdk#150 PR 3). NOT
+/// first: a commit already published before it.
+fn w4_commit_across_a_tick(mode: Mode, first: bool) -> Cell {
+    use testkit::full_node::Served;
     let node = node_for(mode);
     let mut c = connect(&node, mode);
-    c.hold_answers();
-    c.client(&Request::Identity);
+    let base = 1_790_000_000_000u64;
+    let mut k = 1;
     let mut replies = Vec::new();
-    while c.held() > 0 {
-        replies.extend(c.release_one());
+    c.client(&Request::Identity);
+    if !first {
+        let r = c.client(&Request::Write {
+            write_id: 9,
+            ops: vec![Op::Put(b"k/before".to_vec(), value(3, 30 * 1024))],
+        });
+        if !states_of(&r, 9).contains(&WriteState::Published) {
+            return Cell::NotReached(format!(
+                "the earlier commit never published: {:?}",
+                states_of(&r, 9)
+            ));
+        }
+        replies.extend(r);
     }
+    c.hold_answers();
     replies.extend(c.client(&Request::Write {
         write_id: 1,
         ops: vec![
@@ -456,27 +476,32 @@ fn w4_commit_across_a_tick(mode: Mode) -> Cell {
     if c.held() == 0 {
         return Cell::NotReached("the commit finished inside its first call".into());
     }
-    let base = 1_790_000_000_000u64;
-    let mut k = 1;
     while c.held() > 0 && k < 40 {
         replies.extend(c.tick_at(base + k * 1000));
         replies.extend(c.release_one());
         k += 1;
     }
-    let st = states_of(&replies, 1);
-    if let Some(why) = every_call(&mut c) {
-        return Cell::Red(format!("{why}; told {st:?}"));
-    }
     // THE CRITERION, explicit: a commit younger than `max_accept_age` ticks
-    // is not `Stalled`. This workload runs at most 39 one-second ticks, all
-    // under the bound, so ANY `Stalled` here is early -- the `now` defect,
-    // which W1 cannot see (its criterion is only "publishes").
+    // is not `Stalled`.
     let bound = engine::Params::default().max_accept_age;
     assert!(
         k - 1 < bound,
         "the workload outgrew its own premise: {} ticks >= {bound}",
         k - 1
     );
+    let published_at = c.served(Served::Put);
+    // Time after the publish, each tick's answers delivered one per call.
+    for j in 0..10 {
+        replies.extend(c.tick_at(base + (k + j) * 1000));
+        while c.held() > 0 {
+            replies.extend(c.release_one());
+        }
+    }
+    let parity_puts = c.served(Served::Put) - published_at;
+    let st = states_of(&replies, 1);
+    if let Some(why) = every_call(&mut c) {
+        return Cell::Red(format!("{why}; told {st:?}"));
+    }
     if st.contains(&WriteState::Stalled) {
         return Cell::Red(format!(
             "told Stalled within {} s, under max_accept_age ({bound} ticks): {st:?}",
@@ -486,7 +511,20 @@ fn w4_commit_across_a_tick(mode: Mode) -> Cell {
     if !st.contains(&WriteState::Published) {
         return Cell::Red(format!("never published: {st:?}"));
     }
+    if !st.contains(&WriteState::ParityComplete) || parity_puts == 0 {
+        return Cell::Red(format!(
+            "published without redundancy: {parity_puts} PUT(s) after the publish; told {st:?}"
+        ));
+    }
     Cell::Green
+}
+
+fn w4_first(mode: Mode) -> Cell {
+    w4_commit_across_a_tick(mode, true)
+}
+
+fn w4_not_first(mode: Mode) -> Cell {
+    w4_commit_across_a_tick(mode, false)
 }
 
 /// How many writes W5 makes before its flush: enough that the flush needs
@@ -498,7 +536,6 @@ fn w5_parity_overflow(mode: Mode) -> Cell {
     let node = node_for(mode);
     let mut c = connect(&node, mode);
     c.client(&Request::Identity);
-    let mut last = 0;
     for w in 0..W5_WRITES {
         let ops = (0..60u64)
             .map(|i| {
@@ -518,26 +555,42 @@ fn w5_parity_overflow(mode: Mode) -> Cell {
         if !st.contains(&WriteState::Published) {
             return Cell::Red(format!("write {w} never published: {st:?}"));
         }
-        last = 100 + w;
     }
     let puts_before = c.served(testkit::full_node::Served::Put);
-    let r = c.client(&Request::Flush);
+    let mut r = c.client(&Request::Flush);
     let flush_puts = c.served(testkit::full_node::Served::Put) - puts_before;
-    let done = states_of(&r, last);
+    // TIME after the flush, past `reask_after`: what a return could not
+    // carry is asked again (PR 3), so "re-asked, not lost" is SHOWN here --
+    // every write's ParityComplete, and the PUTs it took -- not stated.
+    let base = 1_790_000_000_000u64;
+    let ticks = 3 * engine::Params::default().reask_after;
+    for k in 1..=ticks {
+        r.extend(c.tick_at(base + k * 1000));
+        while c.held() > 0 {
+            r.extend(c.release_one());
+        }
+    }
+    let parity_puts = c.served(testkit::full_node::Served::Put) - puts_before;
+    let complete = (100..100 + W5_WRITES)
+        .filter(|w| states_of(&r, *w).contains(&WriteState::ParityComplete))
+        .count();
+    let eventually = format!(
+        "after {ticks} ticks: {parity_puts} parity PUTs, ParityComplete for {complete} of {W5_WRITES} writes"
+    );
     // Strands FIRST. What was SERVED can never exceed the per-return cap the
     // cell exists to test -- a flush that emitted 200 serves exactly 128 --
     // so "fit in one return" is only believed when nothing was stranded.
     if let Some(why) = every_call(&mut c) {
-        return Cell::Red(format!("{why}; flush put {flush_puts}"));
+        return Cell::Red(format!("{why}; flush put {flush_puts}; {eventually}"));
     }
     if flush_puts < 128 {
         return Cell::NotReached(format!(
             "the flush put {flush_puts} parity blocks, under one return (128)"
         ));
     }
-    if !done.contains(&WriteState::ParityComplete) {
+    if (complete as u64) < W5_WRITES {
         return Cell::Red(format!(
-            "the last write never reached ParityComplete after the flush ({flush_puts} puts)"
+            "not every write reached ParityComplete: {eventually}"
         ));
     }
     Cell::Green
@@ -549,14 +602,8 @@ type Workload = (&'static str, fn(Mode) -> Cell, Vec<Mode>);
 
 /// The cells red on the code as it stands, each with the defect it shows.
 const KNOWN_RED: &[(&str, &str, &str)] = &[
-    // THE HEAD BUMP (F2) is fixed: the three W1 cells it held red are green.
-    // THE CLOCK is carried and a pre-clock start anchored (engine/tests/clock.rs):
-    // W4 is no longer Stalled. It is red on what that left visible.
-    (
-        "W4 commit in flight across a real tick",
-        "one-per-call+real-ticks",
-        "parity for the in-flight commit gated on the STALE published root (seq 0), which the shell never seeds: stranded",
-    ),
+    // THE HEAD BUMP (F2), THE CLOCK and FIRST-COMMIT PARITY are fixed: W1
+    // and both W4 arms are green, W4 asserting ParityComplete and parity PUTs.
     // THE READ OVERFLOW is fixed: the engine never asks for more fetches in
     // a round than one return carries (`max_fetch_per_round` <= `max_gets`,
     // refused at the shell's construction). W2's two cold cells are green.
@@ -582,18 +629,20 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
         "one-per-call+cold+two-sessions",
         "parked write's fetches stranded: park_write asks for its whole path, which max_fetch_per_round does not bound -- sdk#150's LIMITS PR owns it",
     ),
-    // Every write here is multi-block, so the head strand stops the workload
-    // before the parity flush it exists for.
+    // The flush asks for more parity than one return carries. Since PR 3 an
+    // ask that strands is asked again after `reask_after` ticks, so this is
+    // no longer a LOSS -- but a strand is still a strand, and the engine
+    // learning the shell's limits is PR 5.
     (
         "W5 parity wider than one return",
         "one-per-call",
-        "parity puts over max_puts stranded (25 past 128)",
+        "A0.1 fails: the flush strands 4 parity puts past max_puts 128 (the engine's max_asks 132 is not told the shell's limit -- PR 5). What holds, printed in the cell: re-asked after reask_after, every write ParityComplete",
     ),
 ];
 
 #[test]
 fn every_workload_under_every_mode() {
-    let workloads: [Workload; 6] = [
+    let workloads: [Workload; 7] = [
         (
             "W1 multi-block commit publishes",
             w1_multi_block_commit,
@@ -640,8 +689,16 @@ fn every_workload_under_every_mode() {
             ],
         ),
         (
-            "W4 commit in flight across a real tick",
-            w4_commit_across_a_tick,
+            "W4 across a tick, FIRST commit",
+            w4_first,
+            vec![Mode {
+                real_ticks: true,
+                ..APC
+            }],
+        ),
+        (
+            "W4 across a tick, not first",
+            w4_not_first,
             vec![Mode {
                 real_ticks: true,
                 ..APC

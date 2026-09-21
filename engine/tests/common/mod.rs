@@ -223,6 +223,11 @@ impl Harness {
         out
     }
 
+    /// The context's size as last written (Rehydrate mode).
+    pub fn context_len(&self) -> usize {
+        self.ctx.len()
+    }
+
     /// The root the engine would report. In rehydrate mode that means
     /// rebuilding it, which is the point: nothing is remembered outside the
     /// context.
