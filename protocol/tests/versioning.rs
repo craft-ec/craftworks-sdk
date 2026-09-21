@@ -9,7 +9,7 @@ use protocol::*;
 /// rejects everything.
 #[test]
 fn an_unknown_version_is_answered_unsupported_and_a_known_one_is_not() {
-    let good = encode_request(CURRENT, &Request::Flush);
+    let good = encode_request(CURRENT, &Request::Flush).expect("encodes");
     assert_eq!(
         decode_request(&good),
         Incoming::Ok(Envelope {
@@ -40,7 +40,7 @@ fn unsupported_carries_the_versions_that_are_served() {
         got: 99,
         known: KNOWN.to_vec(),
     };
-    let round = decode_reply(&encode_reply(&r)).expect("decodes");
+    let round = decode_reply(&encode_reply(&r).expect("encodes")).expect("decodes");
     match round {
         Reply::Unsupported { got, known } => {
             assert_eq!(got, 99);
@@ -75,7 +75,7 @@ fn a_future_body_is_unsupported_not_unparseable() {
 /// Trailing bytes are refused, not half-read.
 #[test]
 fn a_message_with_trailing_bytes_is_refused() {
-    let good = encode_request(CURRENT, &Request::Flush);
+    let good = encode_request(CURRENT, &Request::Flush).expect("encodes");
     let mut trailing = good.clone();
     trailing.extend_from_slice(b"and then some");
     assert_eq!(
@@ -100,7 +100,8 @@ fn nothing_malformed_panics_and_every_case_is_refused() {
             write_id: 1,
             ops: vec![Op::Put(b"k".to_vec(), vec![7u8; 64])],
         },
-    );
+    )
+    .expect("encodes");
     let mut tried = 0usize;
     let mut refused = 0usize;
 

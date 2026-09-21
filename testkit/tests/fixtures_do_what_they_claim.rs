@@ -210,7 +210,7 @@ fn the_shell_detects_the_version_a_client_spoke() {
 
     let mut v2 = Node::new();
     let _ = v2.step(vec![engine_delegate::shell::Inbound::Client(
-        protocol::encode_request(protocol::CURRENT, &write()),
+        protocol::encode_request(protocol::CURRENT, &write()).expect("encodes"),
     )]);
     assert_eq!(
         v2.detected_client_version(),
@@ -220,7 +220,7 @@ fn the_shell_detects_the_version_a_client_spoke() {
 
     let mut v1 = Node::new();
     let _ = v1.step(vec![engine_delegate::shell::Inbound::Client(
-        protocol::encode_request(1, &write()),
+        protocol::encode_request(1, &write()).expect("encodes"),
     )]);
     assert_eq!(
         v1.detected_client_version(),

@@ -181,7 +181,22 @@ fn state_tag(s: State) -> u64 {
         State::Busy => 4,
         State::Failed => 5,
         State::Lost => 6,
+        State::TooLarge { .. } => 7,
     }
+}
+
+/// A reply's bytes, never an empty frame.
+///
+/// A reply too large to encode (a page over `MAX_MESSAGE`) is answered with
+/// the reason instead — `Dropped { TooLarge }`, a few bytes — because the
+/// client is waiting on it and silence is the one answer it cannot act on
+/// (craftworks-sdk#136: `encode_reply` used to return `[]` here).
+pub(crate) fn reply_bytes(r: &protocol::Reply) -> Vec<u8> {
+    protocol::encode_reply(r).unwrap_or_else(|reason| {
+        protocol::encode_reply(&protocol::Reply::Dropped { reason }).expect(
+            "a Dropped reply is a handful of bytes; `a_dropped_reply_always_encodes` pins it",
+        )
+    })
 }
 
 /// How many rows a read's answer carried.
@@ -438,7 +453,7 @@ impl<B: Blocks> Shell<B> {
                     // waiting, and a refusal it can act on beats a silence it
                     // cannot.
                     crate::serve::Served::Answer(reply) => {
-                        out.replies.push(protocol::encode_reply(&reply));
+                        out.replies.push(reply_bytes(&reply));
                         out.dropped.push(Dropped::Unparseable);
                         Vec::new()
                     }
@@ -498,38 +513,36 @@ impl<B: Blocks> Shell<B> {
         // Answer the protocol requests that produce no engine event.
         if self.identity {
             self.identity = false;
-            out.replies
-                .push(protocol::encode_reply(&protocol::Reply::Identity {
-                    engine: concat!("craftworks-engine/", env!("CARGO_PKG_VERSION")).into(),
-                    // WHERE the authority came from. Never the key.
-                    key_source: "Provisioned(Test)".into(),
-                    head_seq: self.engine.published_seq(),
-                    head_root: self.engine.published_root(),
-                    // The page's provisioning decision rests on this. An
-                    // unprovisioned delegate answers `Identity` with a seq of
-                    // 0 and a zero root — INDISTINGUISHABLE from a healthy
-                    // engine that has simply never been written to, while it
-                    // silently drops every head op it is given. Without this
-                    // field a page cannot tell "set me up" from "already set
-                    // up and empty", and re-installing costs the signing key
-                    // and with it every head written under the old one.
-                    head_writable: self.head_writable,
-                    head_id: self.head_id,
-                }));
+            out.replies.push(reply_bytes(&protocol::Reply::Identity {
+                engine: concat!("craftworks-engine/", env!("CARGO_PKG_VERSION")).into(),
+                // WHERE the authority came from. Never the key.
+                key_source: "Provisioned(Test)".into(),
+                head_seq: self.engine.published_seq(),
+                head_root: self.engine.published_root(),
+                // The page's provisioning decision rests on this. An
+                // unprovisioned delegate answers `Identity` with a seq of
+                // 0 and a zero root — INDISTINGUISHABLE from a healthy
+                // engine that has simply never been written to, while it
+                // silently drops every head op it is given. Without this
+                // field a page cannot tell "set me up" from "already set
+                // up and empty", and re-installing costs the signing key
+                // and with it every head written under the old one.
+                head_writable: self.head_writable,
+                head_id: self.head_id,
+            }));
         }
         if self.already_installed {
             self.already_installed = false;
             out.replies
-                .push(protocol::encode_reply(&protocol::Reply::AlreadyInstalled));
+                .push(reply_bytes(&protocol::Reply::AlreadyInstalled));
         }
         for req_id in std::mem::take(&mut self.unserved) {
             // Named, not silent. A client that asked and heard nothing cannot
             // tell "this build does not serve that yet" from "lost".
-            out.replies
-                .push(protocol::encode_reply(&protocol::Reply::Unavailable {
-                    req_id,
-                    blocked_on: [0u8; 32],
-                }));
+            out.replies.push(reply_bytes(&protocol::Reply::Unavailable {
+                req_id,
+                blocked_on: [0u8; 32],
+            }));
         }
         out.ops = sched.take(self.limits);
         // No code, no put. A delegate cannot fabricate a contract, so a PUT
@@ -571,7 +584,7 @@ impl<B: Blocks> Shell<B> {
             self.step(1, protocol::Step::ReadBack, self.read_back_hits as u64);
         }
         for r in std::mem::take(&mut self.trace) {
-            out.replies.push(protocol::encode_reply(&r));
+            out.replies.push(reply_bytes(&r));
         }
         out.client_version = self.client_version;
         out.stranded = sched.ready_len() + sched.held_len();
@@ -960,7 +973,20 @@ impl<B: Blocks> Shell<B> {
                         State::Busy => W::Busy,
                         State::Failed => W::Failed,
                         State::Lost => W::Lost,
-                    },
+                        State::TooLarge { bound, limit, got } => W::too_large(
+                            match bound {
+                                engine::WriteBound::CommitBlocks => {
+                                    protocol::WriteBound::CommitBlocks
+                                }
+                                engine::WriteBound::WriteBytes => protocol::WriteBound::WriteBytes,
+                            },
+                            *limit,
+                            *got,
+                        ),
+                    }
+                    // THE ONE PLACE a write state leaves the delegate, so the
+                    // one place an older client is told what it can read.
+                    .for_client(self.client_version),
                 },
                 Effect::Reply { req_id, result, .. } => {
                     // WHERE THIS ENGINE STANDS, as it answers.
@@ -1055,7 +1081,7 @@ impl<B: Blocks> Shell<B> {
                 },
                 _ => continue,
             };
-            out.replies.push(protocol::encode_reply(&r));
+            out.replies.push(reply_bytes(&r));
         }
     }
 

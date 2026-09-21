@@ -101,6 +101,18 @@ pub enum Refused {
     /// More pending BYTES than this client will hold. A count is not a byte
     /// budget: ten writes of a megabyte are not ten small ones.
     TooManyPendingBytes { cap: usize },
+    /// The write, encoded, would be `bytes` against a wire limit of `limit`:
+    /// it cannot be SENT. Refused before anything is held, so it never sits
+    /// waiting for an answer that cannot come (craftworks-sdk#136).
+    TooLargeToSend { bytes: u64, limit: usize },
+    /// The ENGINE refused it as never acceptable: over `limit` of `bound` by
+    /// `got`. Rolled back; sending it again is refused again, so splitting it
+    /// is the caller's call (craftworks-sdk#136).
+    TooLarge {
+        bound: protocol::WriteBound,
+        limit: u32,
+        got: u32,
+    },
 }
 
 impl std::fmt::Display for Refused {
@@ -112,6 +124,20 @@ impl std::fmt::Display for Refused {
             Refused::TooManyPendingBytes { cap } => {
                 write!(f, "{cap} bytes of writes are already waiting for an answer")
             }
+            Refused::TooLargeToSend { bytes, limit } => write!(
+                f,
+                "this write is {bytes} bytes as sent and the limit is {limit}; split it into smaller writes"
+            ),
+            Refused::TooLarge { bound, limit, got } => match bound {
+                protocol::WriteBound::CommitBlocks => write!(
+                    f,
+                    "this write would change {got} blocks at once and the limit is {limit}; split it into smaller writes"
+                ),
+                protocol::WriteBound::WriteBytes => write!(
+                    f,
+                    "this write is {got} bytes and the limit is {limit}; split it into smaller writes"
+                ),
+            },
         }
     }
 }
@@ -542,23 +568,58 @@ impl Copy {
     /// from this one. Over-rolling-back is honest; under-rolling-back leaves a
     /// value on screen that was never anywhere.
     pub fn failed(&mut self, write_id: u64) -> Told {
+        self.fall(std::collections::BTreeMap::from([(
+            write_id,
+            RolledBack::Failed,
+        )]))
+    }
+
+    /// Roll back `seeds` -- and every write behind one of them on any key --
+    /// WHOLE, on every key each touches.
+    ///
+    /// A write made after another on the same key was made on top of it, so it
+    /// goes too (`AfterFailed`). This used to truncate KEY BY KEY: a later
+    /// multi-key write lost only its entry on the shared key, stayed queued
+    /// with the rest, and was re-sent WITHOUT it -- half of one atomic write
+    /// published (craftworks-sdk#136, measured: sent `[other, shared]`, then
+    /// `[other]`, which published). A write is all or nothing in the copy, as
+    /// on the wire; and a write that falls can take down writes behind it on
+    /// ITS other keys, so this is a closure, not one pass.
+    fn fall(&mut self, seeds: std::collections::BTreeMap<u64, RolledBack>) -> Told {
+        let mut falls: std::collections::BTreeSet<u64> = seeds.keys().copied().collect();
+        loop {
+            let mut grew = false;
+            for e in self.keys.values() {
+                if let Some(i) = e.pending.iter().position(|w| falls.contains(&w.write_id)) {
+                    for w in &e.pending[i..] {
+                        grew |= falls.insert(w.write_id);
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
         let mut told = Told::default();
         for (key, e) in self.keys.iter_mut() {
-            let Some(i) = e.pending.iter().position(|w| w.write_id == write_id) else {
-                continue;
-            };
-            told.rolled_back_keys.push(key.clone());
-            for (n, w) in e.pending.iter().enumerate().skip(i) {
+            let mut touched = false;
+            e.pending.retain(|w| {
+                if !falls.contains(&w.write_id) {
+                    return true;
+                }
+                touched = true;
                 told.rolled_back.push((
                     w.write_id,
-                    if n == i {
-                        RolledBack::Failed
-                    } else {
-                        RolledBack::AfterFailed
-                    },
+                    seeds
+                        .get(&w.write_id)
+                        .copied()
+                        .unwrap_or(RolledBack::AfterFailed),
                 ));
+                false
+            });
+            if touched {
+                told.rolled_back_keys.push(key.clone());
             }
-            e.pending.truncate(i);
         }
         self.drop_empty();
         told
@@ -566,33 +627,17 @@ impl Copy {
 
     /// Roll back anything that has waited too long without a verdict.
     pub fn time_out(&mut self, now_ms: u64) -> Told {
-        let mut told = Told::default();
         let timeout = self.pending_timeout_ms;
-        for (key, e) in self.keys.iter_mut() {
-            let Some(i) = e
-                .pending
-                .iter()
-                .position(|w| now_ms.saturating_sub(w.at_ms) >= timeout)
-            else {
-                continue;
-            };
-            told.rolled_back_keys.push(key.clone());
-            // As `failed`: everything behind the timed-out write goes too,
-            // for the same reason.
-            for (n, w) in e.pending.iter().enumerate().skip(i) {
-                told.rolled_back.push((
-                    w.write_id,
-                    if n == i {
-                        RolledBack::Unknown
-                    } else {
-                        RolledBack::AfterFailed
-                    },
-                ));
-            }
-            e.pending.truncate(i);
-        }
-        self.drop_empty();
-        told
+        // As `failed`: everything behind a timed-out write goes too, for the
+        // same reason, and whole.
+        let seeds = self
+            .keys
+            .values()
+            .flat_map(|e| e.pending.iter())
+            .filter(|w| now_ms.saturating_sub(w.at_ms) >= timeout)
+            .map(|w| (w.write_id, RolledBack::Unknown))
+            .collect();
+        self.fall(seeds)
     }
 
     /// The engine moved to a new root: apply the changes to BASE.

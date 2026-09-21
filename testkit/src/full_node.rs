@@ -265,7 +265,7 @@ impl Conn {
 
     /// Send a client request and run it to a standstill.
     pub fn client(&mut self, r: &protocol::Request) -> Vec<Vec<u8>> {
-        let frame = protocol::encode_request(protocol::CURRENT, r);
+        let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
         self.step(vec![Inbound::Client(frame)])
     }
 

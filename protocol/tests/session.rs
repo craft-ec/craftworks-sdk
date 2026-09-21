@@ -25,7 +25,7 @@ fn fixture_path() -> std::path::PathBuf {
 /// future version drops or changes any of these, THIS file is what notices.
 fn v1_session() -> Session {
     let mut lines = Vec::new();
-    let mut send = |r: Request| lines.push(Line::Sent(encode_request(1, &r)));
+    let mut send = |r: Request| lines.push(Line::Sent(encode_request(1, &r).expect("encodes")));
 
     send(Request::Identity);
     send(Request::Write {
@@ -65,7 +65,7 @@ fn v1_session() -> Session {
     send(Request::Tick { now: 1_726_000_000 });
     send(Request::Flush);
 
-    let mut recv = |r: Reply| lines.push(Line::Received(encode_reply(&r)));
+    let mut recv = |r: Reply| lines.push(Line::Received(encode_reply(&r).expect("encodes")));
     recv(Reply::Identity {
         engine: "craftworks-engine/0.1".into(),
         key_source: "Provisioned(Test)".into(),

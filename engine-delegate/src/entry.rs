@@ -565,7 +565,7 @@ impl DelegateInterface for EngineDelegate {
         // What this call did, always. A delegate has no log anyone can read,
         // so a break anywhere in the chain is otherwise indistinguishable
         // from any other break.
-        let note = protocol::encode_reply(&protocol::Reply::Call {
+        let note = crate::shell::reply_bytes(&protocol::Reply::Call {
             saw,
             ops: msgs.len() as u32,
             stranded: out.stranded as u32,
@@ -603,7 +603,7 @@ impl DelegateInterface for EngineDelegate {
         // draining replies is looking for the answer to ITS request, and an
         // extra message in that queue is a reply to somebody else's question.
         if out.client_version >= 2 {
-            let bytes = protocol::encode_reply(&protocol::Reply::CallBytes {
+            let bytes = crate::shell::reply_bytes(&protocol::Reply::CallBytes {
                 put_bytes: out.put_bytes as u64,
                 puts: out.puts as u32,
                 gets: out.gets as u32,

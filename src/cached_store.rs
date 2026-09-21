@@ -177,6 +177,19 @@ impl CachedStore {
                 // The commit that was in flight is over, however it ended.
                 self.drain_queued();
             }
+            // Terminal, not applied, and NEVER acceptable as it is. Rolled
+            // back with its reason, and -- unlike `Busy` -- never re-sent: the
+            // same write is refused the same way every time, and re-sending it
+            // oldest-first blocked every write behind it (craftworks-sdk#136).
+            W::TooLarge { bound, limit, got } => {
+                let told = self.copy.failed(write_id);
+                self.rolled_back.extend(told.rolled_back_keys);
+                self.refused.push((
+                    write_id,
+                    crate::copy::Refused::TooLarge { bound, limit, got },
+                ));
+                self.drain_queued();
+            }
             // Still in flight, and said so rather than silently.
             W::Stalled => {}
         }
@@ -264,6 +277,34 @@ impl CachedStore {
         let write_id = self.next_write_id;
         self.next_write_id += 1;
         let now = (self.now_ms)();
+        let request = Request::Write {
+            write_id,
+            ops: edits
+                .iter()
+                .map(|(k, v)| match v {
+                    Some(v) => protocol::Op::Put(k.clone(), v.clone()),
+                    None => protocol::Op::Delete(k.clone()),
+                })
+                .collect(),
+        };
+
+        // WILL IT FIT ON THE WIRE? Asked before the copy holds anything. The
+        // copy measures keys plus values; the wire measures those plus the
+        // framing, so a write exactly at the copy's bound passed it, encoded
+        // to nothing, was answered "Unparseable" with no id, held the copy's
+        // whole byte budget for a minute -- refusing every write made in that
+        // window -- and was then rolled back (craftworks-sdk#136, measured).
+        let bytes = protocol::request_len(protocol::CURRENT, &request);
+        if bytes > protocol::MAX_MESSAGE as u64 {
+            self.refused.push((
+                write_id,
+                crate::copy::Refused::TooLargeToSend {
+                    bytes,
+                    limit: protocol::MAX_MESSAGE,
+                },
+            ));
+            return;
+        }
 
         // Applied to the copy FIRST, and only sent if the copy took it. A
         // write the client cannot hold is one it must not pretend to have
@@ -284,16 +325,7 @@ impl CachedStore {
                 return;
             }
         }
-        self.client.send(&Request::Write {
-            write_id,
-            ops: edits
-                .into_iter()
-                .map(|(k, v)| match v {
-                    Some(v) => protocol::Op::Put(k, v),
-                    None => protocol::Op::Delete(k),
-                })
-                .collect(),
-        });
+        self.client.send(&request);
     }
 
     /// The write id the next write will carry, so a caller can watch for it.

@@ -101,7 +101,7 @@ impl Node {
     }
 
     fn client(&mut self, r: &protocol::Request) -> Vec<protocol::Reply> {
-        let frame = protocol::encode_request(protocol::CURRENT, r);
+        let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
         self.step(vec![Inbound::Client(frame)])
             .iter()
             .filter_map(|b| protocol::decode_reply(b).ok())
