@@ -467,6 +467,21 @@ pub struct Params {
     pub max_carried_ops_bytes: usize,
     /// How many settle rounds a commit gets before it is released `Lost`.
     pub max_settle_rounds: u32,
+    /// The most parity groups owed at once. Unit: one group -- its three
+    /// ids, two ages, and up to two confirmed blocks. Past it the OLDEST is
+    /// abandoned, counted: data outranks redundancy (sdk#162).
+    pub max_owed_groups: usize,
+    /// The most (write, group) waits for `ParityComplete`. Unit: one group,
+    /// named by its first parity id (32 B), in a waiter's set. Past it the
+    /// oldest WAITER is dropped, counted.
+    pub max_parity_waiting_refs: usize,
+    /// What of `max_context_bytes` the SHELL's own state may take beside the
+    /// engine's: its read-backs (up to one commit's blocks), the head, the
+    /// tracing flags, and the wrapper. Checked by the shell's tests.
+    pub shell_context_reserve: usize,
+    /// The least the parked reads may be left, once every fixed cap is
+    /// counted. Construction refuses params that leave less.
+    pub min_parked_read_bytes: usize,
     /// Off = the negative control for coalescing.
     pub coalesce_parity: bool,
     /// Find superseded groups by scanning the WHOLE tree instead of only what
@@ -676,6 +691,10 @@ impl Default for Params {
             max_asks: 132,
             max_carried_ops_bytes: 16 * 1024,
             max_settle_rounds: 3,
+            max_owed_groups: 128,
+            max_parity_waiting_refs: 1024,
+            shell_context_reserve: 12 * 1024,
+            min_parked_read_bytes: 32 * 1024,
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
             transfer_superseded_waiters: true,
@@ -724,6 +743,20 @@ struct Owed {
     /// has gone unprotected, and a group rewritten every tick has gone
     /// unprotected the whole time.
     since: u64,
+}
+
+/// What an engine shed to keep its context saveable (sdk#162), per call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shed {
+    /// Parity groups NOT CODED because `owed` was at its cap: left to the
+    /// scrub (sdk#181, #119), never forgotten from what was already owed.
+    pub uncoded: usize,
+    /// Writes that will no longer hear `ParityComplete`.
+    pub waits: usize,
+    /// Parked reads answered `Unavailable` to make room.
+    pub reads: usize,
+    /// Parked writes answered `Busy` to make room.
+    pub writes: usize,
 }
 
 /// A write whose apply stopped on a block the node does not hold.
@@ -800,6 +833,9 @@ struct Commit {
     /// block: a commit's data puts would fill the asks table's slots.
     settle_at: u64,
     settle_rounds: u32,
+    /// Its parity was left uncoded (the owed cap, sdk#162): its writes are
+    /// never told ParityComplete.
+    uncoded: bool,
 }
 
 /// The write pipeline.
@@ -887,13 +923,22 @@ pub struct Engine<B: Blocks> {
     parity_confirmed: BTreeSet<Cid>,
     /// Unanswered asks, for pacing only (`asks`).
     asks: asks::Asks,
+    /// Shed this call to stay saveable (`keep_saveable`); not carried.
+    shed: Shed,
+    /// The write being applied had its parity left uncoded (the owed cap);
+    /// handed to its commit by `start_commit`.
+    uncoded: bool,
     /// The groups each write is still waiting on.
     ///
     /// A SET and not a count, because a superseded group is replaced by the
     /// groups that now cover the same members, and a count cannot express
     /// "swap one for two" without drifting. `ParityComplete` is a state of the
     /// WRITE — reported once, when this set empties.
-    parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<ParityIds>>,
+    /// Each group named by its FIRST parity id: a group is identified by any
+    /// of its three ids, and 32 B a reference instead of 96 is what lets the
+    /// cap hold an ordinary burst of writes (sdk#187 review: at 256 full ids,
+    /// 112 of 200 one-row writes never heard ParityComplete).
+    parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<Cid>>,
     /// A write whose tree path is not held, waiting for the blocks it needs.
     ///
     /// At most ONE, and it costs the context its ops. That is affordable only
@@ -983,6 +1028,28 @@ impl<B: Blocks> Engine<B> {
             params.max_pack > pack::PACK_HEADER,
             "max_pack holds no members"
         );
+        // EVERY CAP HAS A BYTE MEANING, AND THEY SUM UNDER THE BOUND (sdk#162).
+        // Everything the context carries that is not a parked read is capped;
+        // its worst case, from each unit's measured size, must leave the
+        // parked reads at least `min_parked_read_bytes` -- they take the rest,
+        // and are the first thing shed when the bound is reached.
+        //
+        // `max_context_bytes: usize::MAX` is an engine whose context is never
+        // saved -- an in-process writer building a fixture, with no returns
+        // and no bound -- and has no sum to keep.
+        let fixed = worst_case_fixed_bytes(&params);
+        let room = params
+            .max_context_bytes
+            .saturating_sub(params.shell_context_reserve + CONTEXT_HEADER);
+        assert!(
+            params.max_context_bytes == usize::MAX
+                || fixed.saturating_add(params.min_parked_read_bytes) <= room,
+            "the context's caps do not fit its bound: {fixed} B fixed + {} B for parked reads \
+             > {room} B (max_context_bytes {} less the shell's {} and the header)",
+            params.min_parked_read_bytes,
+            params.max_context_bytes,
+            params.shell_context_reserve
+        );
         // The asks table is carried, so its worst case is part of the
         // context's. This bounds ITS share; whether every carried cap sums
         // under the bound is sdk#162's question, not answered here.
@@ -1012,6 +1079,8 @@ impl<B: Blocks> Engine<B> {
             owed: BTreeMap::new(),
             parity_confirmed: BTreeSet::new(),
             asks: asks::Asks::default(),
+            shed: Shed::default(),
+            uncoded: false,
             parity_waiting: BTreeMap::new(),
             in_flight_since: None,
             parked_write: None,
@@ -1117,10 +1186,80 @@ impl<B: Blocks> Engine<B> {
                 out.extend(self.drive(r));
             }
             out.extend(self.step_inner(event));
+            out.extend(self.keep_saveable());
             return out;
         }
-        self.step_inner(event)
+        let mut out = self.step_inner(event);
+        out.extend(self.keep_saveable());
+        out
     }
+
+    /// What this engine shed to stay saveable, since the last `take_shed`.
+    /// Per call, never carried: it is what the call report says.
+    pub fn take_shed(&mut self) -> Shed {
+        std::mem::take(&mut self.shed)
+    }
+
+    /// KEEP THE CONTEXT SAVEABLE, at the end of every step (sdk#162).
+    ///
+    /// A context over `max_context_bytes` was not saved at all: the node kept
+    /// the PREVIOUS call's while this call's effects had already gone, and the
+    /// request behind it was told nothing, ever. Checking requests at the
+    /// door cannot prevent it -- the context also grows on the node's
+    /// ANSWERS (a parked scan's `held`, waiters moving at publish) -- so the
+    /// bound is kept here, after whatever the step did, by shedding work in a
+    /// NAMED order, each with its own verdict:
+    ///   1. parity waiters past `max_parity_waiting_refs`: the OLDEST waiter,
+    ///      which will not hear ParityComplete (counted);
+    ///   2. past the byte bound: the newest parked READ (`Unavailable`, as the
+    ///      count cap answers), then the parked WRITE (`Busy`: it may re-send).
+    ///      Never the commit in flight, and never OWED parity: it is not
+    ///      re-derivable from the tree today (sdk#181), so it is bounded where
+    ///      it grows -- past its cap a write's parity is left uncoded
+    ///      (`record_owed`) -- and never forgotten here.
+    ///
+    /// If none of that fits it, `to_context` fails -- a bug, reported loudly
+    /// by the host, never a silent `None`.
+    fn keep_saveable(&mut self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        while self.parity_waiting.values().map(BTreeSet::len).sum::<usize>()
+            > self.params.max_parity_waiting_refs
+        {
+            let Some(w) = self.parity_waiting.keys().next().copied() else {
+                break;
+            };
+            self.parity_waiting.remove(&w);
+            self.shed.waits += 1;
+        }
+        let limit = self
+            .params
+            .max_context_bytes
+            .saturating_sub(self.params.shell_context_reserve);
+        while self.context_len() > limit {
+            if let Some(req_id) = self.reads.parked.keys().next_back().copied() {
+                let p = self.reads.parked.remove(&req_id).expect("just listed");
+                let result = self.gave_up(&p.want, p.root);
+                self.forget_waiting(req_id);
+                self.shed.reads += 1;
+                out.push(Effect::Reply {
+                    client: p.client,
+                    req_id,
+                    result,
+                });
+            } else if let Some(pw) = self.parked_write.take() {
+                self.shed.writes += 1;
+                out.push(Effect::Notify {
+                    client: pw.client,
+                    write_id: pw.write_id,
+                    state: State::Busy,
+                });
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
 
     fn step_inner(&mut self, event: Event) -> Vec<Effect> {
         match event {
@@ -1668,6 +1807,13 @@ impl<B: Blocks> Engine<B> {
             reqs.remove(&req_id);
             !reqs.is_empty()
         });
+        // A block nobody waits on any more has no attempts to count. Left
+        // behind, one entry per block asked for and never answered outlived
+        // the read that asked -- shed, given up or capped -- in no cap and in
+        // no sum, and a context with ZERO parked reads went over its bound
+        // (sdk#187 review, executed).
+        let waiting = &self.reads.waiting;
+        self.reads.attempts.retain(|id, _| waiting.contains_key(id));
     }
 
     fn on_write(
@@ -1823,7 +1969,8 @@ impl<B: Blocks> Engine<B> {
             if owed.is_empty() {
                 told.push(State::ParityComplete);
             } else {
-                self.parity_waiting.insert((client, write_id), owed);
+                self.parity_waiting
+                    .insert((client, write_id), owed.iter().map(|k| k[0]).collect());
             }
             return told
                 .into_iter()
@@ -2092,11 +2239,41 @@ impl<B: Blocks> Engine<B> {
             .filter(|(key, _)| !self.parity_touched(key) && gone.contains(&key[0]))
             .map(|(key, _)| *key)
             .collect();
+        // PAST THE OWED CAP, THIS WRITE'S NEW GROUPS ARE NOT CODED (sdk#162).
+        // Data outranks redundancy: the write is not refused -- a Busy here
+        // closes the engine for good when parity never confirms -- and nothing
+        // already owed is forgotten, because `owed` is not re-derivable from
+        // the tree today (sdk#181). The commit publishes without parity for
+        // what it changed, counted and reported "left to the scrub", and its
+        // writes are never told ParityComplete.
+        let new_groups = by_group.keys().filter(|k| !self.owed.contains_key(*k)).count();
+        let uncoded = new_groups > 0
+            && self.owed.len() - dropped.len() + new_groups > self.params.max_owed_groups;
+        if uncoded {
+            by_group.retain(|k, _| self.owed.contains_key(k));
+            self.shed.uncoded += new_groups;
+            self.uncoded = true;
+        }
         // What now covers the members those groups held.
         let replacements: BTreeSet<ParityIds> = by_group.keys().copied().collect();
         for key in dropped {
             self.forget_group(&key);
             self.coded_since_commit.remove(&key);
+            if uncoded {
+                // Their replacements were not coded: a waiter on them would be
+                // "complete" with no redundancy behind it. Dropped, counted.
+                let mut empty = Vec::new();
+                for (w, waiting) in self.parity_waiting.iter_mut() {
+                    if waiting.remove(&key[0]) && waiting.is_empty() {
+                        empty.push(*w);
+                    }
+                }
+                for w in empty {
+                    self.parity_waiting.remove(&w);
+                    self.shed.waits += 1;
+                }
+                continue;
+            }
             let n = self.transfer_waiters(key, &replacements);
             self.pending_notifications.extend(n);
         }
@@ -2128,7 +2305,7 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         let mut done: Vec<(ClientId, WriteId)> = Vec::new();
         for (w, waiting) in self.parity_waiting.iter_mut() {
-            if waiting.remove(&group) && waiting.is_empty() {
+            if waiting.remove(&group[0]) && waiting.is_empty() {
                 done.push(*w);
             }
         }
@@ -2164,10 +2341,10 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         let mut done: Vec<(ClientId, WriteId)> = Vec::new();
         for (w, waiting) in self.parity_waiting.iter_mut() {
-            if !waiting.remove(&from) {
+            if !waiting.remove(&from[0]) {
                 continue;
             }
-            waiting.extend(to.iter().copied());
+            waiting.extend(to.iter().map(|k| k[0]));
             // Nothing covers those members any more — the write was a delete,
             // or what it wrote is gone. There is no redundancy left to owe.
             if waiting.is_empty() {
@@ -2307,6 +2484,7 @@ impl<B: Blocks> Engine<B> {
             }),
             settle_at: self.now,
             settle_rounds: 0,
+            uncoded: std::mem::take(&mut self.uncoded),
         });
         out
     }
@@ -2448,7 +2626,7 @@ impl<B: Blocks> Engine<B> {
         for g in groups.iter().chain(std::mem::take(&mut self.coded_since_commit).iter()) {
             self.forget_group(g);
             for waiting in self.parity_waiting.values_mut() {
-                waiting.remove(g);
+                waiting.remove(&g[0]);
             }
         }
     }
@@ -2599,6 +2777,12 @@ impl<B: Blocks> Engine<B> {
             .copied()
             .collect();
         for w in &c.writes {
+            // Parity for part of what it changed was never coded (the owed
+            // cap): it is not redundant and will not be told it is.
+            if c.uncoded {
+                self.parity_waiting.remove(w);
+                continue;
+            }
             if still.is_empty() {
                 // A commit that coded no groups — a small write with no
                 // referenced values — owes nothing, so its writes are
@@ -2612,7 +2796,8 @@ impl<B: Blocks> Engine<B> {
                     state: State::ParityComplete,
                 });
             } else {
-                self.parity_waiting.insert(*w, still.clone());
+                self.parity_waiting
+                    .insert(*w, still.iter().map(|k| k[0]).collect());
             }
         }
         // Coalescing off is the control: put each group's parity the moment
@@ -2982,6 +3167,52 @@ impl<B: Blocks> Engine<B> {
     }
 }
 
+/// The worst case, in context bytes, of everything carried that is not a
+/// parked read, at `params`' caps. Each unit's size is MEASURED by encoding
+/// one, with the context's own options, rather than written down, so a field
+/// added to a unit moves the bound with it.
+pub(crate) fn worst_case_fixed_bytes(params: &Params) -> usize {
+    use bincode::Options;
+    let enc = |n: Result<u64, bincode::Error>| n.map_or(usize::MAX / 16, |n| n as usize);
+    let o = || bincode::DefaultOptions::new().with_fixint_encoding();
+    let cid: Cid = [0u8; 32];
+    let group: ParityIds = [cid; 3];
+    // An owed group: its ids and ages, and up to two of its blocks confirmed.
+    let owed_unit = enc(o().serialized_size(&(group, 0u64, 0u64))) + 2 * enc(o().serialized_size(&cid));
+    // A parity wait: one group id in a waiter's set, and (at worst, one per
+    // ref) the waiter's own key and set length.
+    let wait_unit = enc(o().serialized_size(&cid))
+        + enc(o().serialized_size(&(ClientId(0), WriteId(0))))
+        + 8;
+    // The commit in flight, at its caps: data and confirmed ids, one group per
+    // block at most, the carried ops, and its few writes and scalars.
+    let m = |a: usize, b: usize| a.saturating_mul(b);
+    let commit = m(m(2, params.max_commit_blocks), enc(o().serialized_size(&cid)))
+        .saturating_add(m(params.max_commit_blocks, enc(o().serialized_size(&group))))
+        .saturating_add(params.max_carried_ops_bytes)
+        .saturating_add(512);
+    // The parked write: its ops' own cap, and the path it waits on.
+    let parked_write = params
+        .max_parked_write_bytes
+        .saturating_add(64 * enc(o().serialized_size(&cid)) + 128);
+    // Subscriptions: two keys at their cap, a cid and a few scalars each.
+    let subs = m(params.max_subscriptions, m(2, params.max_sub_key.saturating_add(8)).saturating_add(128));
+    let asks = m(params.max_asks, asks::ASK_BYTES).saturating_add(8);
+    // Scalars, epochs, the told-stalled list for a commit's writes.
+    let scalars = 1024;
+    [
+        commit,
+        parked_write,
+        subs,
+        asks,
+        m(params.max_owed_groups, owed_unit),
+        m(params.max_parity_waiting_refs, wait_unit),
+        scalars,
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
+}
+
 /// A write's ops as the tree takes them: a SET in key order, the LAST op on
 /// a key winning -- the client's sequence, collapsed the way the SDK does.
 fn batch_of(ops: &[(Vec<u8>, Op)]) -> Vec<(Vec<u8>, TreeEdit)> {
@@ -3292,7 +3523,7 @@ struct Context {
     parked: Vec<(read::ReqId, read::Parked)>,
     waiting: Vec<(Cid, Vec<read::ReqId>)>,
     attempts: Vec<(Cid, u32)>,
-    parity_waiting: Vec<((ClientId, WriteId), Vec<ParityIds>)>,
+    parity_waiting: Vec<((ClientId, WriteId), Vec<Cid>)>,
     head_epoch: Option<Epoch>,
     /// The write waiting on a cold tree path, ops and all. It is the one
     /// place client bytes ride in the context, which is why there is at most
@@ -3347,6 +3578,9 @@ const CLOCK_RESET_TICKS: u64 = 600;
 
 /// The version this build writes. Bumped when the shape changes.
 ///
+/// 9: a commit says whether its parity was left uncoded at the owed cap
+/// (sdk#162).
+///
 /// 8: a commit carries what settles it from fact: its base root, its ops
 /// when they are small, and its own settle pace (sdk#150 E1/E2).
 ///
@@ -3372,7 +3606,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 8;
+const CONTEXT_VERSION: u16 = 9;
 
 /// What a context this build wrote begins with.
 ///
@@ -3428,7 +3662,71 @@ pub enum ContextError {
 impl<B: Blocks> Engine<B> {
     /// What this engine must carry to its next call.
     pub fn to_context(&self) -> Result<Vec<u8>, ContextError> {
-        let c = Context {
+        let c = self.context_value();
+        use bincode::Options;
+        let body = context_opts(self.params.max_context_bytes)
+            .serialize(&c)
+            .map_err(|_| ContextError::Unreadable)?;
+        let total = CONTEXT_HEADER + body.len();
+        if total > self.params.max_context_bytes {
+            return Err(ContextError::TooLarge(total));
+        }
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&CONTEXT_MAGIC);
+        out.extend_from_slice(&CONTEXT_VERSION.to_le_bytes());
+        out.extend_from_slice(&context_checksum(&body));
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// The size `to_context` would write, header included, without writing it.
+    ///
+    /// Sized field by field FROM THE LIVE STATE, never by building the
+    /// `Context` -- that clones every collection (a commit's pack bodies
+    /// among them) and, run at the end of every step, made the engine's own
+    /// suites ~4x slower (sdk#162 review, measured). With fixint bincode a
+    /// map encodes exactly as a sequence of its pairs and a set as a sequence,
+    /// so the sum is the length `to_context` writes; every engine test that
+    /// rehydrates checks the two are equal (`common::Harness::step`).
+    pub fn context_len(&self) -> usize {
+        use bincode::Options;
+        let o = bincode::DefaultOptions::new().with_fixint_encoding();
+        let sz = |r: Result<u64, bincode::Error>| r.map_or(usize::MAX / 64, |n| n as usize);
+        let carries = self.params.context_carries_pending;
+        let none_u64: Option<u64> = None;
+        let none_commit: Option<Commit> = None;
+        let owed_entry = sz(o.serialized_size(&([[0u8; 32]; 3], 0u64, 0u64)));
+        let told: Vec<(ClientId, WriteId)> = Vec::new();
+        CONTEXT_HEADER
+            + sz(o.serialized_size(&CONTEXT_VERSION))
+            + sz(o.serialized_size(&(self.published_seq, self.published_root, self.root, self.next_seq)))
+            + if carries {
+                sz(o.serialized_size(&self.pending))
+            } else {
+                sz(o.serialized_size(&none_commit))
+            }
+            + 8
+            + self.owed.len() * owed_entry
+            + sz(o.serialized_size(&self.parity_confirmed))
+            + sz(o.serialized_size(&self.asks.to_vec()))
+            + sz(o.serialized_size(&self.reads.parked))
+            + sz(o.serialized_size(&self.reads.waiting))
+            + sz(o.serialized_size(&self.reads.attempts))
+            + sz(o.serialized_size(&self.parity_waiting))
+            + sz(o.serialized_size(&self.head_epoch))
+            + sz(o.serialized_size(&self.parked_write))
+            + sz(o.serialized_size(&self.subs))
+            + if carries {
+                sz(o.serialized_size(&self.in_flight_since))
+                    + sz(o.serialized_size(&self.told_stalled))
+            } else {
+                sz(o.serialized_size(&none_u64)) + sz(o.serialized_size(&told))
+            }
+            + sz(o.serialized_size(&self.now))
+    }
+
+    fn context_value(&self) -> Context {
+        Context {
             version: CONTEXT_VERSION,
             published_seq: self.published_seq,
             published_root: self.published_root,
@@ -3480,21 +3778,7 @@ impl<B: Blocks> Engine<B> {
                 Vec::new()
             },
             now: self.now,
-        };
-        use bincode::Options;
-        let body = context_opts(self.params.max_context_bytes)
-            .serialize(&c)
-            .map_err(|_| ContextError::Unreadable)?;
-        let total = CONTEXT_HEADER + body.len();
-        if total > self.params.max_context_bytes {
-            return Err(ContextError::TooLarge(total));
         }
-        let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&CONTEXT_MAGIC);
-        out.extend_from_slice(&CONTEXT_VERSION.to_le_bytes());
-        out.extend_from_slice(&context_checksum(&body));
-        out.extend_from_slice(&body);
-        Ok(out)
     }
 
     /// Rebuild an engine from what the last call carried.

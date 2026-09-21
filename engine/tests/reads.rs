@@ -836,9 +836,20 @@ fn no_read_sequence_panics_and_every_read_answers() {
             Params {
                 max_attempts: 2,
                 max_context_bytes: 32 * 1024,
-                // A context this small declares an asks table to match: the
-                // default's 132 x 48 B is over its 1/16 share (sdk#150 PR 3).
+                // A context this small declares every cap to match: the
+                // defaults' worst case is ~247 KiB (sdk#162), and the asks
+                // table's 132 x 48 B is over its 1/16 share (sdk#150 PR 3).
+                // Scaled, the fixed worst case is ~21 KiB, leaving the parked
+                // reads -- what this test parks -- the rest.
                 max_asks: 32,
+                max_parked_write_bytes: 4 * 1024,
+                max_commit_blocks: 16,
+                max_carried_ops_bytes: 2 * 1024,
+                max_subscriptions: 4,
+                max_owed_groups: 16,
+                max_parity_waiting_refs: 16,
+                shell_context_reserve: 2 * 1024,
+                min_parked_read_bytes: 4 * 1024,
                 ..Params::default()
             },
         );
@@ -1205,5 +1216,66 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
     println!(
         "  {quiet} fetch(es) on a quiet node, {busy} on a busy one, \
          {control} with both off (identical in Live and Rehydrate)"
+    );
+}
+
+/// A read that GIVES UP leaves nothing of itself in the context (sdk#187
+/// review). It waited on up to a round's worth of blocks; one kept missing
+/// until it was answered Unavailable. Every block it asked for had an
+/// `attempts` entry, and those for the blocks that never came back outlived
+/// it -- in no cap, in no sum -- so a context with no parked reads at all
+/// went over its bound. Idle before, idle after.
+#[test]
+fn a_read_that_gives_up_leaves_no_attempts_behind() {
+    let (_, root, all) = fixture(500);
+    let (mut e, store) = reader(root, Params::default());
+    let idle = e.context_len();
+    let r = Range {
+        lo: Bound::Unbounded,
+        hi: Bound::Unbounded,
+        reverse: false,
+        after: None,
+        max_entries: 200,
+        max_bytes: 1 << 20,
+    };
+    let first = stepped!(
+        e,
+        Event::Scan {
+            client: ClientId(1),
+            req_id: ReqId(1),
+            range: Box::new(r),
+        }
+    );
+    // The root arrives; the next round asks for several blocks.
+    let fetched = |fx: &[Effect]| -> Vec<Cid> {
+        fx.iter()
+            .filter_map(|f| match f {
+                Effect::FetchBlock { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    };
+    let root_ask = fetched(&first);
+    assert_eq!(root_ask, vec![root], "the cold read did not ask for its root first");
+    let bytes = all.get(&root).expect("the root").to_vec();
+    store.put(root, &bytes);
+    let round = stepped!(e, Event::BlockArrived { id: root, bytes });
+    let asked = fetched(&round);
+    assert!(asked.len() >= 2, "the second round asked for {} block(s): not a round", asked.len());
+    // One of them misses until the read gives up; the rest never answer.
+    let mut answered = false;
+    for _ in 0..16 {
+        let out = stepped!(e, Event::BlockMissed(asked[0]));
+        if replies(&out).iter().any(|(id, r)| *id == ReqId(1) && matches!(r, ReadResult::Unavailable(_))) {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "the read never gave up");
+    assert_eq!(
+        e.context_len(),
+        idle,
+        "a read that gave up left {} B in the context",
+        e.context_len() as i64 - idle as i64
     );
 }

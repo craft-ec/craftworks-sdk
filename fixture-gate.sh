@@ -29,6 +29,13 @@ allow() {
     testkit/src/full_node.rs) return 0 ;;
     # Tests OF a constructor are about the constructor.
     tests/cached_store.rs) return 0 ;;
+    # sdk#162: its construction tests are of Engine::new's cap-sum assertion
+    # (refuses caps that cannot fit the bound; the defaults fit).
+    engine/tests/owed_cap.rs) return 0 ;;
+    # sdk#162: reproduces entry.rs's SAVE RULE at the shell boundary, with
+    # the shell's max_gets lifted -- the fixture exposes engine params, not
+    # the shell's limits. The fixture's own path is matrix W9.
+    engine-delegate/tests/context_bound.rs) return 0 ;;
     *) return 1 ;;
   esac
 }

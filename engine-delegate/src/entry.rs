@@ -356,10 +356,12 @@ impl DelegateInterface for EngineDelegate {
             }
         }
 
-        // A context that cannot be written is not an error to report: the
-        // next call starts fresh, re-reads the head, and reports whatever was
-        // in flight `Lost`. Failing the call instead would turn a recoverable
-        // state into a refused message.
+        // A context that cannot be written leaves the node holding the
+        // PREVIOUS call's, while this call's effects have already gone
+        // (sdk#162). The engine sheds work to keep its context under its
+        // bound, so this is a bug when it happens -- and it is SAID, in this
+        // call's report, never passed over.
+        let mut not_saved = saved.is_none();
         if let Some(c) = saved.as_deref() {
             ctx.write(c);
         }
@@ -509,6 +511,7 @@ impl DelegateInterface for EngineDelegate {
                 let more = shell.handle(vec![Inbound::NoHead]);
                 (more, shell.to_context())
             };
+            not_saved |= saved2.is_none();
             if let Some(c) = saved2.as_deref() {
                 ctx.write(c);
             }
@@ -552,10 +555,25 @@ impl DelegateInterface for EngineDelegate {
                 } else {
                     node_said
                 };
-                if out.stranded_detail.is_empty() {
+                let base = if out.stranded_detail.is_empty() {
                     base
                 } else {
                     format!("stranded: {} | {base}", out.stranded_detail)
+                };
+                let s = out.shed;
+                let base = if s == engine::Shed::default() {
+                    base
+                } else {
+                    format!(
+                        "shed: {} read(s) Unavailable, {} write(s) Busy, {} parity wait(s) dropped; \
+                         {} parity group(s) left to the scrub | {base}",
+                        s.reads, s.writes, s.waits, s.uncoded
+                    )
+                };
+                if not_saved {
+                    format!("CONTEXT NOT SAVED | {base}")
+                } else {
+                    base
                 }
             },
         });

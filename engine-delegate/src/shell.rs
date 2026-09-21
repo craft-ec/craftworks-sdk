@@ -107,6 +107,11 @@ pub struct Outbound {
     /// What was stranded and why, when `stranded` is non-zero (sdk#150).
     /// Structure only -- see `Scheduler::stranded_report`.
     pub stranded_detail: String,
+    /// What the engine shed this call to keep its context saveable, and the
+    /// parity it left uncoded at the owed cap (sdk#162). Counted so a
+    /// refusal is never read as silence, and parity left to the scrub never
+    /// as "coming".
+    pub shed: engine::Shed,
     /// Counted, never a panic. Reported to the client so a format mismatch
     /// is visible rather than a silence it waits on for ever.
     pub dropped: Vec<Dropped>,
@@ -217,6 +222,33 @@ fn rows_in(r: &engine::read::ReadResult) -> u64 {
 /// nodes (sdk#150's L3): the engine asked for 8, a return carried 4, and no
 /// cold read of 60 or 300 rows ever answered. So the pairing is REFUSED, not
 /// tolerated.
+/// The shell's own worst case must fit the part of the context bound the
+/// engine leaves it (sdk#162). Its read-backs are of blocks the engine is
+/// waiting on (`awaiting` is pruned to that every call), so at most a
+/// commit's data plus the parity asks out at once; each is measured by
+/// encoding one, with the context's own options.
+fn check_reserve(params: &engine::Params) {
+    use bincode::Options;
+    let n = |v: Result<u64, bincode::Error>| v.map_or(usize::MAX / 64, |n| n as usize);
+    let read_back = n(ctx_opts().serialized_size(&([0u8; 32], 0u32)));
+    let head = n(ctx_opts().serialized_size(&Some((0u64, [0u8; 32]))));
+    let tracing = n(ctx_opts().serialized_size(&Some(protocol::TraceOf::Write(0))))
+        + n(ctx_opts().serialized_size(&false));
+    // The engine's bytes ride in a Vec: its length prefix, and the vec for
+    // the read-backs.
+    let wrapper = 2 * n(ctx_opts().serialized_size(&Vec::<u8>::new()));
+    let worst = wrapper
+        + (params.max_commit_blocks.saturating_add(params.max_asks)).saturating_mul(read_back)
+        + head
+        + tracing;
+    assert!(
+        worst <= params.shell_context_reserve,
+        "the shell's worst case ({worst} B) is over shell_context_reserve ({} B): \
+         the engine at its bound plus the shell would not save",
+        params.shell_context_reserve
+    );
+}
+
 fn check_limits(params: &engine::Params, limits: Limits) {
     assert!(
         params.max_fetch_per_round <= limits.max_gets,
@@ -410,6 +442,7 @@ impl<B: Blocks> Shell<B> {
         };
         let (engine, resumed) = Engine::from_context_or_new(&engine_ctx, params, blocks);
         check_limits(&params, Limits::default());
+        check_reserve(&params);
         Shell {
             client_version: 0,
             engine,
@@ -443,7 +476,7 @@ impl<B: Blocks> Shell<B> {
         let engine = self.engine.to_context().ok()?;
         // #41's exact encoding, with slice 5's `head_exists` gone: it is
         // derived from the engine's published seq, not carried.
-        ctx_opts()
+        let whole = ctx_opts()
             .serialize(&Carried {
                 engine,
                 shell: ShellState {
@@ -453,7 +486,13 @@ impl<B: Blocks> Shell<B> {
                     tracing_of: self.tracing_of,
                 },
             })
-            .ok()
+            .ok()?;
+        // `max_context_bytes` bounds the WHOLE context, the shell's part
+        // included (sdk#162): the engine keeps itself under it less
+        // `shell_context_reserve`, and the shell's worst case is asserted to
+        // fit the reserve where the shell is built. Over it is a bug, and the
+        // host says so -- `None`, reported as NOT SAVED.
+        (whole.len() <= self.engine.params().max_context_bytes).then_some(whole)
     }
 
     /// One call: everything that arrived, everything that leaves.
@@ -685,6 +724,13 @@ impl<B: Blocks> Shell<B> {
             out.replies.push(reply_bytes(&r));
         }
         out.client_version = self.client_version;
+        out.shed = self.engine.take_shed();
+        // Read-backs only for blocks the engine still waits on: one for a
+        // commit released Lost, or a group no longer owed, would otherwise
+        // stay for ever and the shell's part of the context would grow
+        // without bound (sdk#162).
+        let waiting = self.engine.waiting_on();
+        self.awaiting.retain(|id, _| waiting.contains(id));
         out.stranded = sched.ready_len() + sched.held_len();
         if out.stranded > 0 {
             out.stranded_detail = sched.stranded_report();
