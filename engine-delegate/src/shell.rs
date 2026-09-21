@@ -490,9 +490,21 @@ impl<B: Blocks> Shell<B> {
         // `max_context_bytes` bounds the WHOLE context, the shell's part
         // included (sdk#162): the engine keeps itself under it less
         // `shell_context_reserve`, and the shell's worst case is asserted to
-        // fit the reserve where the shell is built. Over it is a bug, and the
-        // host says so -- `None`, reported as NOT SAVED.
-        (whole.len() <= self.engine.params().max_context_bytes).then_some(whole)
+        // fit the reserve where the shell is built (`check_reserve`).
+        //
+        // A BACKSTOP NO HONEST TEST REACHES: with both of those in force no
+        // valid params exceed the bound here, so reaching it means an
+        // estimate was wrong -- the engine's `worst_case_fixed_bytes` or the
+        // shell's `check_reserve`. Loud in every debug run; in release, `None`,
+        // which the host reports as NOT SAVED.
+        let fits = whole.len() <= self.engine.params().max_context_bytes;
+        debug_assert!(
+            fits,
+            "the whole context ({} B) is over max_context_bytes: worst_case_fixed_bytes or \
+             check_reserve underestimated",
+            whole.len()
+        );
+        fits.then_some(whole)
     }
 
     /// One call: everything that arrived, everything that leaves.
