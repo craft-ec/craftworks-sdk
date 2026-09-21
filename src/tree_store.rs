@@ -417,21 +417,22 @@ impl TreeStore {
 
 impl Store for TreeStore {
     fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.apply_batch(&[(key.to_vec(), Edit::Put(value.to_vec()))]);
+        // A tree refuses nothing (`apply_batch` below always answers `Ok`).
+        let _ = self.apply_batch(&[(key.to_vec(), Edit::Put(value.to_vec()))]);
     }
 
     fn delete(&mut self, key: &[u8]) -> bool {
         let existed = self.lookup(key).is_some();
-        self.apply_batch(&[(key.to_vec(), Edit::Delete)]);
+        let _ = self.apply_batch(&[(key.to_vec(), Edit::Delete)]);
         existed
     }
 
     /// One `apply`, so a record and everything written with it become one new
     /// root. Writing them one at a time would mint a root for a state the app
     /// never had.
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) {
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
         if edits.is_empty() {
-            return;
+            return Ok(());
         }
         let batch: Vec<(Vec<u8>, TreeEdit)> = sorted_edits(edits.to_vec())
             .into_iter()
@@ -474,6 +475,7 @@ impl Store for TreeStore {
                 self.prune_owed();
             }
         }
+        Ok(())
     }
 }
 

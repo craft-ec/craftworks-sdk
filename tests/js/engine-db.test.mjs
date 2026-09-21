@@ -295,6 +295,32 @@ await t("THE CONTROL: a ticketless NOT_LOADED on a write still surfaces", async 
   assert.equal(asks, 1, "a write with no ticket to wait on was retried anyway");
 });
 
+await t("a write the store REFUSED rejects with its code, whether it may be retried, and the bound it met — never resolves as made (sdk#180)", async () => {
+  // Rust built this: `{ code, message, transient, retryable, cap }`. The
+  // wrapper must carry every field a caller acts on — a handoff waits for a
+  // confirmation and retries on `retryable`, and shows `cap`.
+  let asks = 0;
+  const refusal = { code: "NO_ROOM", message: "not written: 256 writes are already waiting for an answer", transient: false, retryable: true, cap: 256 };
+  const s = { create_at() { asks += 1; throw { ...refusal }; }, put() { asks += 1; throw { ...refusal }; },
+              update() { asks += 1; throw { ...refusal }; }, delete() { asks += 1; throw { ...refusal }; } };
+  const db = engineDb(s);
+  for (const [name, call] of [["createAt", () => db.createAt("tasks", "a".repeat(32), {})], ["put", () => db.put("tasks", {})],
+                              ["update", () => db.update("tasks", "a".repeat(32), {})], ["delete", () => db.delete("tasks", "a".repeat(32))]]) {
+    await assert.rejects(call, e => {
+      assert.equal(e.name, "DbError", `${name}: not a DbError`);
+      assert.equal(e.code, "NO_ROOM", `${name}: the code`);
+      assert.equal(e.retryable, true, `${name}: retryable was lost`);
+      assert.equal(e.cap, 256, `${name}: the cap was lost`);
+      assert.equal(e.transient, false, `${name}: a reload does not make room`);
+      return true;
+    }, `${name} resolved for a write the store refused`);
+  }
+  assert.equal(asks, 4, "a refused write was re-sent by the wrapper: waiting for room is the caller's decision");
+  // A refusal that is NOT retryable says so.
+  const s2 = { put() { throw { code: "NO_SESSION", message: "no session", transient: false, retryable: false }; } };
+  await assert.rejects(() => engineDb(s2).put("tasks", {}), e => e.code === "NO_SESSION" && e.retryable === false && !("cap" in e));
+});
+
 await t("nothing in the wrapper branches on a message, or waits on a timer", () => {
   const src = readFileSync(new URL("../../js/engine-db.js", import.meta.url), "utf8");
   const code = src.split("\n").filter(l => !l.trim().startsWith("//"));

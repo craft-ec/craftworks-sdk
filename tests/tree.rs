@@ -183,7 +183,7 @@ fn a_batch_equals_the_same_edits_one_at_a_time() {
         seed_store(&mut singly);
         assert_eq!(batched.root(), singly.root(), "same start");
 
-        batched.apply_batch(&edits);
+        batched.apply_batch(&edits).expect("the store took the write");
         // Singly, in the SDK's own order — which is what the batch resolves to.
         for (k, e) in sorted_edits(edits.clone()) {
             match e {
@@ -228,7 +228,7 @@ fn the_sdk_sorts_and_dedupes_before_the_tree_sees_a_batch() {
     assert_eq!(done[2].1, Edit::Delete, "the last write to a key wins");
 
     let mut t = TreeStore::new();
-    t.apply_batch(&edits);
+    t.apply_batch(&edits).expect("the store took the write");
     assert_eq!(
         Reads::get(&mut t, &key(1)).unwrap().as_deref(),
         Some(&b"early"[..])
@@ -236,7 +236,7 @@ fn the_sdk_sorts_and_dedupes_before_the_tree_sees_a_batch() {
     assert_eq!(Reads::get(&mut t, &key(5)), Ok(None), "the delete was last");
     // And the same batch offered to the reference store agrees.
     let mut m = MemStore::default();
-    m.apply_batch(&edits);
+    m.apply_batch(&edits).expect("the store took the write");
     for i in [1u64, 3, 5] {
         assert_eq!(
             Reads::get(&mut t, &key(i)),
@@ -266,7 +266,7 @@ fn a_refused_batch_changes_nothing() {
         t.apply_batch(&[
             (key(1), Edit::Put(b"ok".to_vec())),
             (too_long, Edit::Put(b"no".to_vec())),
-        ]);
+        ]).expect("the store took the write");
     }));
     assert!(refused.is_err(), "an over-long key must not pass silently");
     assert_eq!(t.root(), before_root, "the root moved on a refused batch");
@@ -389,7 +389,7 @@ fn cost_against_the_reference_store() {
     let edits: Vec<(Vec<u8>, Edit)> = (0..N)
         .map(|i| (key(i), Edit::Put(vals[i as usize].clone())))
         .collect();
-    let tree_batch = time(|| batched.apply_batch(&edits));
+    let tree_batch = time(|| batched.apply_batch(&edits).expect("the store took the write"));
     assert_eq!(batched.root(), tree.root(), "a batch is the same contents");
 
     let rate = |d: std::time::Duration| N as f64 / d.as_secs_f64();

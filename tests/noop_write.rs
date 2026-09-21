@@ -140,7 +140,8 @@ fn defining_a_domain_twice_publishes_and_the_next_write_goes() {
 
     let w3 = p.db.store_mut().next_write_id();
     p.db.store_mut()
-        .apply_batch(&[(b"d/other".to_vec(), Edit::Put(b"x".to_vec()))]);
+        .apply_batch(&[(b"d/other".to_vec(), Edit::Put(b"x".to_vec()))])
+        .expect("the store took the write");
     p.pump();
     p.seconds(5);
 

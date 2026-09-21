@@ -117,7 +117,7 @@ impl Client {
         let keys: Vec<Vec<u8>> = keys.collect();
         for chunk in keys.chunks(100) {
             let edits: Vec<_> = chunk.iter().map(|k| (k.clone(), craftworks_sdk::Edit::Put(value.to_vec()))).collect();
-            self.store.apply_batch(&edits);
+            self.store.apply_batch(&edits).expect("the store took the write");
             assert!(self.store.refused.is_empty(), "the copy refused a set-up write: {:?}", self.store.refused);
             self.pump();
         }

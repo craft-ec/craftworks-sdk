@@ -119,7 +119,7 @@ impl Page {
                 format!("d/pair/{tag}/b").into_bytes(),
                 Edit::Put(b"2".to_vec()),
             ),
-        ]);
+        ]).expect("the store took the write");
         id
     }
 
@@ -276,7 +276,7 @@ impl<S: Store> Store for Counting<S> {
         self.writes.push(1);
         self.inner.delete(key)
     }
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) {
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), craftworks_sdk::Refused> {
         self.writes.push(edits.len());
         self.inner.apply_batch(edits)
     }

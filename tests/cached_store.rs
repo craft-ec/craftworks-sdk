@@ -118,8 +118,9 @@ fn a_refused_multi_key_write_leaves_none_of_its_keys_changed() {
     s.on_page(b"a/", b"b/", vec![], root(1));
     s.copy.max_pending = 2;
 
-    // Three keys, a cap of two: the third is refused part-way through.
-    Store::apply_batch(
+    // Three keys, a cap of two: the third is refused part-way through — and
+    // the refusal is what the call RETURNS (sdk#180).
+    let refused = Store::apply_batch(
         &mut s,
         &[
             (b"a/1".to_vec(), Edit::Put(b"x".to_vec())),
@@ -127,7 +128,8 @@ fn a_refused_multi_key_write_leaves_none_of_its_keys_changed() {
             (b"a/3".to_vec(), Edit::Put(b"z".to_vec())),
         ],
     );
-    assert_eq!(s.refused.len(), 1, "the batch was not refused");
+    assert_eq!(refused, Err(craftworks_sdk::Refused::TooManyPending { cap: 2 }), "the batch was not refused");
+    assert_eq!(s.refused.len(), 1, "the refusal was not counted");
     for k in [&b"a/1"[..], b"a/2", b"a/3"] {
         assert_eq!(
             Reads::get(&mut s, k),

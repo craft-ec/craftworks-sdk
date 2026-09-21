@@ -268,7 +268,15 @@ pub trait Store {
     /// **The caller sorts.** Edits arrive sorted by key with no duplicates; the
     /// SDK does that in [`sorted_edits`] before calling, because it is the
     /// caller that knows which of two writes to one key is the later one.
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) {
+    ///
+    /// **A refusal is the RETURN VALUE** (craftworks-sdk#180). A store that
+    /// holds writes for a node — [`CachedStore`](crate::CachedStore) — may
+    /// refuse one before anything is applied: no room, no session, too large
+    /// to send. It used to push the refusal onto a list and return `()`, and
+    /// nothing read the list: `Db` answered `Created` for 45 of 300 writes the
+    /// copy had refused. Returned, it cannot be missed — there is no second
+    /// place to look.
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
         for (k, e) in edits {
             match e {
                 Edit::Put(v) => self.put(k, v),
@@ -277,6 +285,7 @@ pub trait Store {
                 }
             }
         }
+        Ok(())
     }
 }
 

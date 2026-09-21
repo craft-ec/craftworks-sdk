@@ -134,7 +134,7 @@ impl Page {
             }))
             .collect();
         edits.sort_by(|a, b| a.0.cmp(&b.0));
-        self.store.apply_batch(&edits);
+        self.store.apply_batch(&edits).expect("the store took the write");
         id
     }
 }
@@ -217,7 +217,7 @@ fn a_queued_write_sharing_a_key_with_a_refused_one_rolls_back_with_it_whole() {
             p.store.apply_batch(&[
                 (b"d/other".to_vec(), Edit::Put(b"from B".to_vec())),
                 (b"d/shared".to_vec(), Edit::Put(b"from B".to_vec())),
-            ]);
+            ]).expect("the store took the write");
         } else {
             p.store.put(b"d/shared", b"from B");
         }

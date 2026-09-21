@@ -1299,6 +1299,12 @@ fn db_err(e: &DbError) -> JsValue {
     let _ = js_sys::Reflect::set(&o, &"code".into(), &e.code().into());
     let _ = js_sys::Reflect::set(&o, &"message".into(), &e.to_string().into());
     let _ = js_sys::Reflect::set(&o, &"transient".into(), &e.is_transient().into());
+    // Whether waiting for a confirmation and making the SAME write again may
+    // succeed (NO_ROOM), with the bound it met (sdk#180).
+    let _ = js_sys::Reflect::set(&o, &"retryable".into(), &e.is_retryable().into());
+    if let Some(cap) = e.cap() {
+        let _ = js_sys::Reflect::set(&o, &"cap".into(), &JsValue::from_f64(cap as f64));
+    }
     o.into()
 }
 
