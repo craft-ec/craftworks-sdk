@@ -105,6 +105,16 @@ export async function artefactBytes(
   // returns 200 with the wrong bytes must not end the search. Every failure
   // is kept, so a total failure can say what each source actually did rather
   // than only naming the last.
+  // ONE OR THE OTHER, never both. Taking `urls` and ignoring `url` silently
+  // drops a source a caller believed it had supplied, and the symptom would
+  // be an artefact that resolves from the wrong place — or not at all, with
+  // no hint that half the request was discarded.
+  if (url && urls) {
+    throw new Error(
+      `artefact ${sha256} was given both \`url\` and \`urls\`; pass one. ` +
+        "Taking either silently would drop a source the caller supplied.",
+    );
+  }
   const sources = urls ?? (url ? [url] : []);
   if (sources.length === 0) {
     throw new Error(`artefact ${sha256} has no url to fetch it from`);

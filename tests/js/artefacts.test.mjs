@@ -399,5 +399,46 @@ await t("**THE CONTROL THAT MATTERS: bytes that do not match the named hash are 
   );
 });
 
+await t("**naming a key with no origin is a REFUSAL, not a quiet fallback**", async () => {
+  // An app that names a contract carries none of the artefacts, so the only
+  // remaining source is a file it does not ship: it 404s, and the failure
+  // names a missing LOCAL file — pointing at the app's own bundle when the
+  // real fault is that there was nowhere to ask. Fatal and misleading
+  // together.
+  await assert.rejects(
+    () => shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {
+      artefactsKey: "ARTEFACTS",
+      origin: null,
+    }),
+    e => {
+      assert.match(e.message, /ARTEFACTS/, "the refusal does not name the contract");
+      assert.match(e.message, /no origin/, "it does not say what is missing");
+      return true;
+    },
+  );
+});
+
+await t("THE CONTROL: no key and no origin is fine — that is the local path", async () => {
+  // Without this, refusing whenever `origin` is absent would break every
+  // development build and every test that passes no origin at all.
+  const spec = await shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {
+    origin: null,
+  });
+  assert.deepEqual(spec.block.urls, ["https://node/v1/contract/web/theapp/sdk/block.wasm"]);
+});
+
+await t("`url` and `urls` together is refused, not silently half-used", async () => {
+  // Taking either one drops a source the caller believed it supplied, and
+  // the symptom is an artefact resolving from the wrong place with no hint
+  // that half the request was discarded.
+  await assert.rejects(
+    () => artefactBytes(
+      { url: "a", urls: ["b"], sha256: "f".repeat(64) },
+      { fetch: async () => new Response(new Uint8Array()), caches: null, subtle: crypto.subtle },
+    ),
+    /both .url. and .urls./,
+  );
+});
+
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall ok\n");
 process.exit(failures ? 1 : 0);

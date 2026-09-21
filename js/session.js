@@ -76,9 +76,24 @@ export async function shippedArtefacts(
   // NO CIRCULARITY: `/v1/contract/web/<key>/<file>` is a plain HTTP GET to
   // the node already serving this page. It resolves no Block contract, so it
   // needs none of the four artefacts to fetch the four artefacts.
+  // NAMING A KEY IS A REQUIREMENT, NOT A PREFERENCE.
+  //
+  // An app names an artefacts contract because it carries none of the four
+  // files itself. So a key with no origin to build a url from is not a case
+  // to degrade quietly: the only remaining source is a file the app does not
+  // ship, it 404s, and the failure names a missing LOCAL file — pointing at
+  // the app's own bundle when the real fault is that there was nowhere to ask.
+  // Fatal and misleading together, which is worse than either.
+  if (artefactsKey && !origin) {
+    throw new Error(
+      `artefacts contract ${artefactsKey} was named but there is no origin to ` +
+        "fetch it from. An app that names a contract carries none of the " +
+        "artefacts itself, so this cannot fall back to the files beside it.",
+    );
+  }
   const sources = (file) => {
     const out = [];
-    if (artefactsKey && origin) {
+    if (artefactsKey) {
       out.push(`${origin}/v1/contract/web/${artefactsKey}/${file}`);
     }
     out.push(new URL("./" + file, base).href);
