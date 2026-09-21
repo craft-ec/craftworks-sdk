@@ -17,6 +17,13 @@
 use std::{path::Path, process::Command};
 
 fn main() {
+    // WHEN TO REGENERATE is the hand-written half of a generated value, and
+    // where staleness collects (sdk#134). Once any `rerun-if-*` is printed,
+    // cargo watches ONLY what is declared — so every input this script reads
+    // is declared, the environment variable included. Without it, pointing
+    // `CRAFTWORKS_CONTRACTS` at a checkout (or at a different one) left the
+    // wasm reporting the hashes of the build before, `unknown` included.
+    println!("cargo:rerun-if-env-changed=CRAFTWORKS_CONTRACTS");
     println!("cargo:rerun-if-changed=src/build_rev.txt");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rustc-env=SDK_BUILD_REV={}", rev());
@@ -51,7 +58,7 @@ fn contract_hashes() -> (String, String, String) {
         return unknown();
     };
     let path = repo.join("build/hashes.toml");
-    println!("cargo:rerun-if-changed={}", path.display());
+    watch(&path);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return unknown();
     };
@@ -66,14 +73,35 @@ fn contract_hashes() -> (String, String, String) {
     (field("block"), field("register"), field("rev"))
 }
 
-/// The contracts checkout beside this one, if there is one.
+/// The contracts checkout: the one named, else the one beside this crate.
 fn contracts_repo() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     if let Ok(p) = std::env::var("CRAFTWORKS_CONTRACTS") {
         return Some(PathBuf::from(p));
     }
     let beside = Path::new(env!("CARGO_MANIFEST_DIR")).join("../freenet-contracts");
-    beside.join("build/hashes.toml").is_file().then_some(beside)
+    if beside.join("build/hashes.toml").is_file() {
+        return Some(beside);
+    }
+    // Not built yet. Watch the nearest part of it that EXISTS, so a contracts
+    // build appearing re-runs this — and nothing that does not exist: cargo
+    // re-runs a script watching a missing path on EVERY build, and recompiles
+    // the crate with it (measured), which would make every build slow for
+    // anyone without the contracts.
+    for dir in [beside.join("build"), beside] {
+        if dir.is_dir() {
+            println!("cargo:rerun-if-changed={}", dir.display());
+            break;
+        }
+    }
+    None
+}
+
+/// Watch the file this script read. Named explicitly (`CRAFTWORKS_CONTRACTS`)
+/// and absent, it is watched anyway: the caller said where the contracts are,
+/// so re-running until they appear there is what was asked for.
+fn watch(path: &Path) {
+    println!("cargo:rerun-if-changed={}", path.display());
 }
 
 /// The commit this build came from, or `unknown` when nothing can say.
