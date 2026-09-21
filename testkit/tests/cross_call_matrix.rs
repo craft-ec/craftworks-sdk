@@ -393,11 +393,12 @@ type Workload = (&'static str, fn(Mode) -> Cell, Vec<Mode>);
 /// The cells red on the code as it stands, each with the defect it shows.
 const KNOWN_RED: &[(&str, &str, &str)] = &[
     // THE HEAD BUMP (F2) is fixed: the three W1 cells it held red are green.
-    // `now` is still not in the context: W4 shows it (Stalled after 1 s).
+    // THE CLOCK is carried and a pre-clock start anchored (engine/tests/clock.rs):
+    // W4 is no longer Stalled. It is red on what that left visible.
     (
         "W4 commit in flight across a real tick",
         "one-per-call+real-ticks",
-        "Stalled after 1 s (`now` not carried); tick calls still strand",
+        "parity for the in-flight commit gated on the STALE published root (seq 0), which the shell never seeds: stranded",
     ),
     // THE READ OVERFLOW: the engine asks for more fetches than one return
     // carries (max_gets 4); the rest wait "for the next entry", which the
