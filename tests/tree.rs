@@ -491,11 +491,11 @@ fn an_oversize_record_is_refused_and_the_database_still_works() {
     assert_ne!(d.store().root(), root);
     assert_eq!(d.count("notes").unwrap(), 2);
     assert!(d
-        .get("notes", &from_hex(&ok.id).unwrap())
+        .get("notes", from_hex(&ok.id).unwrap())
         .unwrap()
         .is_some());
     assert!(d
-        .get("notes", &from_hex(&after.id).unwrap())
+        .get("notes", from_hex(&after.id).unwrap())
         .unwrap()
         .is_some());
 

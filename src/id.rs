@@ -86,3 +86,68 @@ pub fn from_hex(s: &str) -> Option<RKey> {
     }
     Some(id)
 }
+
+/// WHERE a record is, which is not the same as WHAT it is.
+///
+/// A record's own id is its `rkey` and always has been. In a domain that
+/// declares a parent, the key is `<parent>‖<rkey>`, so addressing the record
+/// needs both — the rkey alone names it but cannot find it.
+///
+/// Kept as a separate type rather than widening `RKey` because the rkey is
+/// load-bearing on its own: it is time-ordered, and `created_ms` reads the
+/// timestamp straight out of it (see craftworks-sdk#117 on why that ordering
+/// matters). A parent prepended to it would break both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Loc {
+    pub parent: Option<RKey>,
+    pub rkey: RKey,
+}
+
+impl Loc {
+    pub fn bare(rkey: RKey) -> Self {
+        Loc { parent: None, rkey }
+    }
+    pub fn under(parent: RKey, rkey: RKey) -> Self {
+        Loc { parent: Some(parent), rkey }
+    }
+}
+
+/// A bare rkey addresses a record in a domain with no parent. Present so the
+/// common call reads as it always did.
+impl From<RKey> for Loc {
+    fn from(rkey: RKey) -> Self {
+        Loc::bare(rkey)
+    }
+}
+
+impl From<&RKey> for Loc {
+    fn from(rkey: &RKey) -> Self {
+        Loc::bare(*rkey)
+    }
+}
+
+impl From<&Loc> for Loc {
+    fn from(l: &Loc) -> Self {
+        *l
+    }
+}
+
+/// The id an app holds: 32 hex for a bare record, 64 for one under a parent.
+///
+/// SELF-DESCRIBING BY LENGTH, so an app never has to be told which kind it
+/// has and never parses one. That is what keeps `Session::preload`'s rule
+/// intact — the app names a parent, and the SDK still owns what a range IS.
+pub fn loc_to_hex(loc: &Loc) -> String {
+    match loc.parent {
+        Some(p) => format!("{}{}", crate::hex(&p), crate::hex(&loc.rkey)),
+        None => crate::hex(&loc.rkey),
+    }
+}
+
+pub fn loc_from_hex(s: &str) -> Option<Loc> {
+    match s.len() {
+        32 => Some(Loc::bare(from_hex(s)?)),
+        64 => Some(Loc::under(from_hex(&s[..32])?, from_hex(&s[32..])?)),
+        _ => None,
+    }
+}

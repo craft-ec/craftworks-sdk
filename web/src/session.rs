@@ -917,21 +917,41 @@ impl Session {
 
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
         let p = fields_of(patch)?;
-        let k = rkey_of(id)?;
-        let r = self.db.update(domain, &k, &p);
+        let k = loc_of(id)?;
+        let r = self.db.update(domain, k, &p);
         json_of(self.decided(r)?)
     }
 
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
-        let k = rkey_of(id)?;
-        let r = self.db.get(domain, &k);
+        let k = loc_of(id)?;
+        let r = self.db.get(domain, k);
         self.answer(r)
     }
 
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
-        let k = rkey_of(id)?;
-        let r = self.db.delete(domain, &k);
+        let k = loc_of(id)?;
+        let r = self.db.delete(domain, k);
         self.decided(r)
+    }
+
+    /// The children of one parent, as a bounded read (craftworks-sdk#122).
+    ///
+    /// The app names the PARENT and never builds a key range, which is the
+    /// rule `preload` keeps for the same reason.
+    pub fn children(
+        &mut self,
+        domain: &str,
+        parent: &str,
+        reverse: bool,
+        limit: usize,
+        after: &str,
+    ) -> Result<String, JsValue> {
+        let after = if after.is_empty() { None } else { Some(rkey_of(after)?) };
+        let p = rkey_of(parent)?;
+        let r = self
+            .db
+            .children(domain, &p, craftworks_sdk::Scan { reverse, limit, after });
+        self.answer(r)
     }
 
     /// `after` is a record id or the empty string.
@@ -1253,5 +1273,13 @@ fn fields_of(s: &str) -> Result<serde_json::Map<String, serde_json::Value>, JsVa
 
 fn rkey_of(id: &str) -> Result<craftworks_sdk::id::RKey, JsValue> {
     craftworks_sdk::id::from_hex(id)
+        .ok_or_else(|| db_err(&DbError::Refused(format!("`{id}` is not a record id"))))
+}
+
+/// A record id as an app holds it: 32 hex, or 64 when the domain keys its
+/// records under a parent (craftworks-sdk#122). The length says which, so an
+/// app never takes one apart.
+fn loc_of(id: &str) -> Result<craftworks_sdk::id::Loc, JsValue> {
+    craftworks_sdk::id::loc_from_hex(id)
         .ok_or_else(|| db_err(&DbError::Refused(format!("`{id}` is not a record id"))))
 }

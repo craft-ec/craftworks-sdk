@@ -18,7 +18,7 @@ fn a_domains_range_holds_its_records_and_nothing_else() {
     assert!(lo < hi, "an empty range asks for nothing");
 
     let id = [7u8; 16];
-    let key = craftworks_sdk::db::record_key("tasks", &id);
+    let key = craftworks_sdk::db::record_key("tasks", id);
     assert!(
         key >= lo && key < hi,
         "a record of the domain falls outside the range that is supposed to load it"
@@ -27,7 +27,7 @@ fn a_domains_range_holds_its_records_and_nothing_else() {
     // THE CONTROL: another domain's record does NOT fall in it. Without this,
     // a `domain_range` returning the whole key space would pass the assertion
     // above — and would make every preload fetch the entire database.
-    let other = craftworks_sdk::db::record_key("notes", &id);
+    let other = craftworks_sdk::db::record_key("notes", id);
     assert!(
         other < lo || other >= hi,
         "another domain's records fall inside this domain's range"
@@ -49,7 +49,7 @@ fn different_domains_have_different_ranges() {
 #[test]
 fn a_domain_is_not_swallowed_by_one_whose_name_extends_it() {
     let (lo, hi) = D::domain_range("task");
-    let inner = craftworks_sdk::db::record_key("tasks", &[1u8; 16]);
+    let inner = craftworks_sdk::db::record_key("tasks", [1u8; 16]);
     assert!(
         inner < lo || inner >= hi,
         "records of `tasks` fall inside the range of `task`"

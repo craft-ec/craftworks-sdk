@@ -125,6 +125,13 @@ fn fields(json: &str) -> Result<Map<String, Value>, JsError> {
 fn rkey(hex: &str) -> Result<id::RKey, JsError> {
     id::from_hex(hex).ok_or_else(|| err("record id must be 32 hex characters"))
 }
+/// A record id as an app holds it: 32 hex, or 64 when the domain keys its
+/// records under a parent. The app never takes one apart — the length says
+/// which it is, so it does not have to know (craftworks-sdk#122).
+fn loc(hex: &str) -> Result<id::Loc, JsError> {
+    id::loc_from_hex(hex)
+        .ok_or_else(|| err("record id must be 32 hex characters, or 64 under a parent"))
+}
 fn json<T: serde::Serialize>(v: &T) -> Result<String, JsError> {
     serde_json::to_string(v).map_err(err)
 }
@@ -268,16 +275,39 @@ impl Db {
         json(
             &self
                 .0
-                .update(domain, &rkey(id)?, &fields(patch)?)
+                .update(domain, loc(id)?, &fields(patch)?)
                 .map_err(err)?,
         )
     }
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsError> {
-        json(&self.0.get(domain, &rkey(id)?).map_err(err)?)
+        json(&self.0.get(domain, loc(id)?).map_err(err)?)
     }
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsError> {
-        self.0.delete(domain, &rkey(id)?).map_err(err)
+        self.0.delete(domain, loc(id)?).map_err(err)
     }
+    /// The children of one parent, as a bounded read.
+    ///
+    /// The app names the PARENT; it never builds a key range. That is the same
+    /// rule `Session::preload` keeps — a caller that built one would be
+    /// encoding the key layout — and it is why this exists as a call rather
+    /// than as a range an app could assemble (craftworks-sdk#122).
+    pub fn children(
+        &mut self,
+        domain: &str,
+        parent: &str,
+        reverse: bool,
+        limit: usize,
+        after: &str,
+    ) -> Result<String, JsError> {
+        let after = if after.is_empty() { None } else { Some(rkey(after)?) };
+        json(
+            &self
+                .0
+                .children(domain, &rkey(parent)?, Scan { reverse, limit, after })
+                .map_err(err)?,
+        )
+    }
+
     /// `after` is a record id or the empty string.
     pub fn scan(
         &mut self,

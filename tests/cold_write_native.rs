@@ -187,8 +187,8 @@ fn a_cold_put_update_and_delete_park_too() {
         fields.insert("title".into(), serde_json::json!("x"));
         let r = match what {
             "put" => p.db.put("tasks", &fields).map(|_| ()),
-            "update" => p.db.update("tasks", &[9u8; 16], &fields).map(|_| ()),
-            _ => p.db.delete("tasks", &[9u8; 16]).map(|_| ()),
+            "update" => p.db.update("tasks", [9u8; 16], &fields).map(|_| ()),
+            _ => p.db.delete("tasks", [9u8; 16]).map(|_| ()),
         };
         let (loads, store) = (&mut p.loads, p.db.store_mut());
         match decide(loads, store, r, 0) {
