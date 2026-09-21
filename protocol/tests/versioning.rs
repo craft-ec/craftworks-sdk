@@ -9,12 +9,13 @@ use protocol::*;
 /// rejects everything.
 #[test]
 fn an_unknown_version_is_answered_unsupported_and_a_known_one_is_not() {
-    let good = encode_request(CURRENT, &Request::Flush).expect("encodes");
+    let session = protocol::mint_session(0x0123_4567_89ab);
+    let good = protocol::encode_session_request(CURRENT, session, &Request::Flush).expect("encodes");
     assert_eq!(
         decode_request(&good),
         Incoming::Ok(Envelope {
             version: CURRENT,
-            session: protocol::LEGACY_SESSION,
+            session,
             body: Request::Flush
         }),
         "a message at the current version was not understood, so nothing \
@@ -195,5 +196,21 @@ fn a_minted_session_is_48_bits_and_never_legacy() {
         assert_ne!(s, protocol::LEGACY_SESSION, "{r}");
         assert_ne!(s, 0);
         assert!(s < (1 << protocol::SESSION_BITS), "{r} -> {s}");
+    }
+}
+
+/// **A1: a v4 frame whose session no client can hold is REFUSED by name** —
+/// zero, the legacy session, or wider than 48 bits — never truncated into a
+/// session whose verdicts the sender would then drop.
+#[test]
+fn a_v4_frame_with_a_session_no_client_can_hold_is_refused_by_name() {
+    for bad in [0u64, protocol::LEGACY_SESSION, 1 << 48, 0xABCD_0000_0000_0123, u64::MAX] {
+        let b = protocol::encode_session_request(4, bad, &Request::Flush).expect("encodes");
+        assert_eq!(decode_request(&b), Incoming::Dropped(protocol::Dropped::BadSession), "session {bad:#x}");
+    }
+    // THE CONTROL: a real one, and the widest real one, decode.
+    for good in [2u64, (1 << 48) - 1, protocol::mint_session(u64::MAX)] {
+        let b = protocol::encode_session_request(4, good, &Request::Flush).expect("encodes");
+        assert!(matches!(decode_request(&b), Incoming::Ok(_)), "session {good:#x}");
     }
 }

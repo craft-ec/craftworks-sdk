@@ -82,10 +82,15 @@ pub const SESSION_SINCE: u16 = 4;
 /// parked write, a commit in flight — with no second table beside it.
 pub const SESSION_BITS: u32 = 48;
 
-/// A session from 64 random bits: the low 48, never the legacy one.
+/// A session from 64 random bits: the low 48, never zero or the legacy one.
 pub fn mint_session(random: u64) -> u64 {
     let s = random & ((1u64 << SESSION_BITS) - 1);
     if s == LEGACY_SESSION || s == 0 { LEGACY_SESSION + 1 } else { s }
+}
+
+/// Whether a v4 frame's session is one a client can hold.
+pub fn session_is_valid(session: u64) -> bool {
+    session != 0 && session != LEGACY_SESSION && session < (1u64 << SESSION_BITS)
 }
 
 /// A client's message, with its version on the front.
@@ -793,6 +798,11 @@ pub enum Dropped {
     /// A message kind this side has no use for. Appended, like everything
     /// else: a variant's position is its wire tag.
     NotForUs,
+    /// A v4 frame whose session is not one a client can hold: zero, the
+    /// legacy session, or wider than [`SESSION_BITS`] (craftworks-sdk#146).
+    /// Refused by name rather than truncated: a truncated session is told
+    /// its verdicts under a number it does not hold, and drops them all.
+    BadSession,
 }
 
 /// The largest message this build will decode.
@@ -821,14 +831,21 @@ fn opts() -> impl bincode::Options {
 /// engine answered `Unparseable` with no write id, the write sat awaiting a
 /// verdict until the copy's timeout rolled it back, and the only words anyone
 /// saw were the wrong ones (craftworks-sdk#136).
+///
+/// A request with NO session is a pre-v4 request: from v4 a frame must name
+/// a real session, and the legacy one is refused at decode
+/// ([`Dropped::BadSession`]). So this encodes at most v3; a client that has a
+/// session sends it with [`encode_session_request`].
 pub fn encode_request(version: u16, body: &Request) -> Result<Vec<u8>, Dropped> {
-    encode_session_request(version, LEGACY_SESSION, body)
+    encode_session_request(version.min(SESSION_SINCE - 1), LEGACY_SESSION, body)
 }
 
 /// Encode a client's message from `session`. Before v4 the session is not
 /// on the wire and a reader takes it to be [`LEGACY_SESSION`].
 pub fn encode_session_request(version: u16, session: u64, body: &Request) -> Result<Vec<u8>, Dropped> {
     use bincode::Options;
+    // An invalid session on a v4 frame ENCODES (so a test can send one) and
+    // is refused at DECODE, which is where it has to be enforced anyway.
     if version >= SESSION_SINCE {
         opts().serialize(&Envelope { version, session, body: body.clone() })
     } else {
@@ -888,7 +905,10 @@ pub fn decode_request(bytes: &[u8]) -> Incoming {
         return Incoming::Unsupported(version);
     }
     let decoded = if version >= SESSION_SINCE {
-        opts().deserialize::<Envelope>(bytes)
+        match opts().deserialize::<Envelope>(bytes) {
+            Ok(e) if !session_is_valid(e.session) => return Incoming::Dropped(Dropped::BadSession),
+            other => other,
+        }
     } else {
         opts()
             .deserialize::<LegacyEnvelope>(bytes)

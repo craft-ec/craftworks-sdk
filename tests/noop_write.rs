@@ -84,20 +84,19 @@ impl Page {
                 {
                     self.verdicts.entry(write_id).or_default().push(state);
                 }
-                match decoded {
-                    // What the HOST does with a page: `CachedStore` records a
-                    // range as loaded only when told the interval it asked for.
-                    Ok(protocol::Reply::Page {
-                        req_id: LOAD,
-                        entries,
-                        cursor: None,
-                        at,
-                        ..
-                    }) => self
-                        .db
+                // What the HOST does with a page: `CachedStore` records a
+                // range as loaded only when told the interval it asked for.
+                if let Ok(protocol::Reply::Page {
+                    req_id: LOAD,
+                    entries,
+                    cursor: None,
+                    at,
+                    ..
+                }) = decoded
+                {
+                    self.db
                         .store_mut()
-                        .on_page(b"", &EVERYTHING, entries, at.root),
-                    _ => {}
+                        .on_page(b"", &EVERYTHING, entries, at.root);
                 }
                 self.db.store_mut().on_inbound(&reply);
             }

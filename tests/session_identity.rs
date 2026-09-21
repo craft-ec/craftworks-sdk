@@ -119,12 +119,12 @@ fn each_tabs_write_states_name_that_tabs_session() {
     tab1.write(b"k/tab1", b"from tab 1");
     tab2.write(b"k/tab2", b"from tab 2");
     for (name, tab) in [("tab 1", &tab1), ("tab 2", &tab2)] {
-        let mine = tab.store.client.session();
+        let mine = tab.store.client.session().expect("a session");
         assert!(!tab.told.is_empty(), "{name} was told nothing, so this checks nothing");
         assert!(tab.told.iter().all(|(s, _)| *s == Some(mine)),
             "{name} (session {mine}) was told states naming {:?}", tab.told);
     }
-    assert_ne!(tab1.store.client.session(), tab2.store.client.session());
+    assert_ne!(tab1.store.client.session().expect("a session"), tab2.store.client.session().expect("a session"));
 }
 
 /// **A state naming ANOTHER session is dropped, never applied**, even for a
@@ -136,7 +136,7 @@ fn a_write_state_for_another_session_is_ignored() {
     s.put(b"k", b"v");                       // write id 1, pending
     let id = s.copy.pending_ids()[0];
     let foreign = protocol::encode_reply(&protocol::Reply::SessionWriteState {
-        session: s.client.session() ^ 0x55,
+        session: s.client.session().expect("a session") ^ 0x55,
         write_id: id,
         state: protocol::WriteState::Failed,
     })
@@ -146,7 +146,7 @@ fn a_write_state_for_another_session_is_ignored() {
     assert_eq!(s.client.foreign_write_states, 1, "and it was not counted");
     // THE CONTROL: the same verdict, for THIS session, is applied.
     let own = protocol::encode_reply(&protocol::Reply::SessionWriteState {
-        session: s.client.session(),
+        session: s.client.session().expect("a session"),
         write_id: id,
         state: protocol::WriteState::Failed,
     })
@@ -198,8 +198,123 @@ fn two_sessions_waiting_on_parity_together_are_each_told_it_completed() {
             *complete.entry(*who).or_default() += 1;
         }
     }
-    let (s1, s2) = (tab1.store.client.session(), tab2.store.client.session());
+    let (s1, s2) = (tab1.store.client.session().expect("a session"), tab2.store.client.session().expect("a session"));
     println!("  ParityComplete by session: {complete:?} (tab 1 {s1}, tab 2 {s2})");
     assert_eq!(complete.get(&Some(s1)).copied().unwrap_or(0), 1, "tab 1 was not told its parity completed: {complete:?}");
     assert_eq!(complete.get(&Some(s2)).copied().unwrap_or(0), 1, "tab 2 was not told its parity completed: {complete:?}");
+}
+
+// ---- the architect's review of #165 -----------------------------------------
+
+/// **A2: an UNNAMED verdict is somebody else's.** A v3 tab's `w1: Failed`,
+/// delivered to this v4 tab's connection because they share the delegate, must
+/// not roll back this tab's own `w1`.
+#[test]
+fn a_plain_verdict_is_another_tabs_and_is_never_applied() {
+    let (mut s, _clock) = testkit::cached_store();
+    s.put(b"k", b"v");
+    let id = s.copy.pending_ids()[0];
+    let plain = protocol::encode_reply(&protocol::Reply::WriteState { write_id: id, state: protocol::WriteState::Failed }).unwrap();
+    s.on_inbound(&plain);
+    assert_eq!(s.copy.pending_ids(), vec![id], "a v3 tab's verdict rolled back this tab's write");
+    assert_eq!(s.client.foreign_write_states, 1, "and it was not counted as foreign");
+}
+
+/// **A1, and the RNG: a page that could not mint a session makes NO write** —
+/// refused by name, nothing sent — rather than sharing one fallback number
+/// with every other such page.
+#[test]
+fn a_page_with_no_session_refuses_its_writes_by_name_and_sends_nothing() {
+    let (mut s, _clock) = testkit::cached_store();
+    s.client = craftworks_sdk::engine_client::Client::from_random(None);
+    s.put(b"k", b"v");
+    assert_eq!(s.refused.len(), 1);
+    assert!(matches!(s.refused[0].1, craftworks_sdk::copy::Refused::NoSession), "{:?}", s.refused);
+    assert!(s.copy.pending_ids().is_empty(), "the write is held as if it could be sent");
+    assert!(s.take_outbound().is_empty(), "it was sent under no session");
+    // THE CONTROL: the same page with randomness writes.
+    let (mut ok, _c) = testkit::cached_store();
+    ok.put(b"k", b"v");
+    assert!(ok.refused.is_empty());
+    assert_eq!(ok.take_outbound().len(), 1);
+}
+
+/// **A3: a reload is a new session, and its bindings are not starved by the
+/// pages before it.** Six page loads of eight bindings each, through one
+/// delegate that is never told a page went away. Before, the fifth and sixth
+/// loads were refused 8 of 8.
+#[test]
+fn six_page_loads_of_eight_bindings_each_are_all_accepted() {
+    let node = testkit::FullNode::new();
+    let mut c = node.connect();
+    let sub = |i: u64| protocol::Request::SubscribeRange {
+        sub_id: i,
+        lo: protocol::Bound::Included(format!("d/{i:03}/").into_bytes()),
+        hi: protocol::Bound::Excluded(format!("d/{i:03}0").into_bytes()),
+    };
+    let accepted = |r: &[Vec<u8>]| -> Vec<bool> {
+        r.iter()
+            .filter_map(|b| protocol::decode_reply(b).ok())
+            .filter_map(|x| match x {
+                protocol::Reply::Subscribed { accepted, .. } => Some(matches!(accepted, protocol::Accepted::Yes)),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut log = Vec::new();
+    for load in 0..6u64 {
+        let session = protocol::mint_session(0x5000 + load);
+        let mut yes = 0;
+        for i in 1..=8u64 {
+            let a = accepted(&c.client_as(session, protocol::CURRENT, &sub(i)));
+            assert_eq!(a.len(), 1, "load {} binding {i} was not answered", load + 1);
+            yes += a[0] as usize;
+        }
+        log.push(yes);
+    }
+    println!("  accepted per page load: {log:?}");
+    assert_eq!(log, vec![8; 6], "a later page load was refused its bindings");
+}
+
+/// A3's other bound: ONE page cannot take every other page's room.
+#[test]
+fn one_page_is_refused_past_its_own_share() {
+    let node = testkit::FullNode::new();
+    let mut c = node.connect();
+    let per = engine::Params::default().max_subscriptions_per_client as u64;
+    let session = protocol::mint_session(0x77);
+    let mut answers = Vec::new();
+    for i in 1..=per + 1 {
+        for r in c.client_as(session, protocol::CURRENT, &protocol::Request::SubscribeRange {
+            sub_id: i,
+            lo: protocol::Bound::Included(format!("e/{i:03}/").into_bytes()),
+            hi: protocol::Bound::Excluded(format!("e/{i:03}0").into_bytes()),
+        }) {
+            if let Ok(protocol::Reply::Subscribed { accepted, .. }) = protocol::decode_reply(&r) {
+                answers.push(matches!(accepted, protocol::Accepted::Yes));
+            }
+        }
+    }
+    assert_eq!(answers.len() as u64, per + 1);
+    assert!(answers[..per as usize].iter().all(|a| *a), "a page was refused inside its share");
+    assert!(!answers[per as usize], "a page was given more than its share of the delegate's subscriptions");
+}
+
+/// A1 at the delegate: a frame with a bad session is ANSWERED `BadSession`, and
+/// nothing it asked for is done.
+#[test]
+fn the_delegate_answers_a_bad_session_by_name_and_applies_nothing() {
+    let node = testkit::FullNode::new();
+    let mut c = node.connect();
+    let r = c.client_as(0xABCD_0000_0000_0123, protocol::CURRENT, &protocol::Request::Write {
+        write_id: 1,
+        ops: vec![protocol::Op::Put(b"k/wide".to_vec(), b"x".to_vec())],
+    });
+    let replies: Vec<protocol::Reply> = r.iter().filter_map(|b| protocol::decode_reply(b).ok()).collect();
+    assert!(
+        replies.iter().any(|x| matches!(x, protocol::Reply::Dropped { reason: protocol::Dropped::BadSession })),
+        "{replies:?}"
+    );
+    assert!(!replies.iter().any(|x| matches!(x, protocol::Reply::WriteState { .. } | protocol::Reply::SessionWriteState { .. })),
+        "a write under a bad session was acted on: {replies:?}");
 }

@@ -451,8 +451,10 @@ impl Conn {
     }
 
     /// Send a client request and run it to a standstill.
+    /// A request from a client with NO session: a pre-v4 client, since v4
+    /// requires a real one (sdk#146) — so it speaks the last version before.
     pub fn client(&mut self, r: &protocol::Request) -> Vec<Vec<u8>> {
-        self.client_as(protocol::LEGACY_SESSION, protocol::CURRENT, r)
+        self.client_as(protocol::LEGACY_SESSION, protocol::SESSION_SINCE - 1, r)
     }
 
     /// A request from a given SESSION speaking a given VERSION — one of

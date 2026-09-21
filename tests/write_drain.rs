@@ -24,8 +24,12 @@ fn store() -> CachedStore {
     s
 }
 
-fn verdict(write_id: u64, state: WriteState) -> Vec<u8> {
-    protocol::encode_reply(&protocol::Reply::WriteState { write_id, state }).expect("encodes")
+/// The engine's verdict on one of THIS store's writes: named with its session,
+/// as the delegate names a v4 writer's (sdk#146) — an unnamed one is another
+/// tab's, and is never applied.
+fn verdict(s: &CachedStore, write_id: u64, state: WriteState) -> Vec<u8> {
+    let session = s.client.session().expect("a session");
+    protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id, state }).expect("encodes")
 }
 
 /// **300 sequential writes all land, with zero refusals.**
@@ -38,7 +42,7 @@ fn three_hundred_writes_all_land_when_each_is_published() {
     for i in 0..300u64 {
         let id = s.next_write_id();
         s.put(format!("d\0note\0{i:06}").as_bytes(), b"v");
-        s.on_inbound(&verdict(id, WriteState::Published));
+        s.on_inbound(&verdict(&s, id, WriteState::Published));
     }
     assert!(
         s.refused.is_empty(),
@@ -84,7 +88,7 @@ fn a_row_goes_pending_then_clean_through_the_reply_path() {
     s.put(&key, b"v");
     assert_eq!(s.row_state(&key), RowState::Pending);
 
-    s.on_inbound(&verdict(id, WriteState::Published));
+    s.on_inbound(&verdict(&s, id, WriteState::Published));
     assert_eq!(
         s.row_state(&key),
         RowState::Clean,
@@ -101,7 +105,7 @@ fn busy_puts_the_row_back_in_the_queue() {
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
-    s.on_inbound(&verdict(id, WriteState::Busy));
+    s.on_inbound(&verdict(&s, id, WriteState::Busy));
     assert_eq!(s.row_state(&key), RowState::Queued);
 }
 
@@ -112,7 +116,7 @@ fn a_failed_verdict_gives_the_row_rolled_back() {
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
-    s.on_inbound(&verdict(id, WriteState::Failed));
+    s.on_inbound(&verdict(&s, id, WriteState::Failed));
     assert_eq!(
         s.row_state(&key),
         RowState::RolledBack,
@@ -132,7 +136,7 @@ fn a_verdict_for_an_unknown_write_changes_nothing_and_is_counted() {
     s.put(&key, b"v");
     assert_eq!(s.row_state(&key), RowState::Pending);
 
-    s.on_inbound(&verdict(id + 999, WriteState::Published));
+    s.on_inbound(&verdict(&s, id + 999, WriteState::Published));
     assert_eq!(
         s.row_state(&key),
         RowState::Pending,
@@ -146,7 +150,7 @@ fn a_verdict_for_an_unknown_write_changes_nothing_and_is_counted() {
 
     // THE CONTROL: its OWN id does clear it, so the refusal above is about
     // the id and not about verdicts being ignored.
-    s.on_inbound(&verdict(id, WriteState::Published));
+    s.on_inbound(&verdict(&s, id, WriteState::Published));
     assert_eq!(s.row_state(&key), RowState::Clean);
 }
 
@@ -161,10 +165,10 @@ fn a_duplicate_published_is_harmless() {
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
     s.put(&key, b"v");
-    s.on_inbound(&verdict(id, WriteState::Published));
+    s.on_inbound(&verdict(&s, id, WriteState::Published));
     assert_eq!(s.row_state(&key), RowState::Clean);
 
-    s.on_inbound(&verdict(id, WriteState::Published));
+    s.on_inbound(&verdict(&s, id, WriteState::Published));
     assert_eq!(
         s.row_state(&key),
         RowState::Clean,

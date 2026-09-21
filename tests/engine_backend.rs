@@ -100,7 +100,10 @@ impl Transport for Loop {
             if let protocol::Incoming::Ok(env) = protocol::decode_request(request) {
                 if let protocol::Request::Write { write_id, .. } = env.body {
                     self.busy_for -= 1;
-                    return vec![protocol::encode_reply(&protocol::Reply::WriteState {
+                    // Named with the writer's session, as the delegate names a v4
+                    // writer's verdict (sdk#146): an unnamed one is another tab's.
+                    return vec![protocol::encode_reply(&protocol::Reply::SessionWriteState {
+                        session: env.session,
                         write_id,
                         state: WriteState::Busy,
                     })

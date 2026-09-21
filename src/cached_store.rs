@@ -290,6 +290,13 @@ impl CachedStore {
                 .collect(),
         };
 
+        // NO SESSION, NO WRITE (sdk#146): refused by name, before anything is
+        // held, rather than sent under a number another tab shares.
+        if self.client.session().is_none() {
+            self.refused.push((write_id, crate::copy::Refused::NoSession));
+            return;
+        }
+
         // WILL IT FIT ON THE WIRE? Asked before the copy holds anything. The
         // copy measures keys plus values; the wire measures those plus the
         // framing, so a write exactly at the copy's bound passed it, encoded

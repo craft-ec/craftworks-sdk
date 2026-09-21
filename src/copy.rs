@@ -113,6 +113,11 @@ pub enum Refused {
         limit: u32,
         got: u32,
     },
+    /// This page has NO SESSION: the browser gave it no randomness to mint one
+    /// (craftworks-sdk#146). Without one its writes could not be told apart
+    /// from another tab's, so none is made — loudly, never as a shared
+    /// fallback number that is the old collision under a new name.
+    NoSession,
 }
 
 impl std::fmt::Display for Refused {
@@ -124,6 +129,10 @@ impl std::fmt::Display for Refused {
             Refused::TooManyPendingBytes { cap } => {
                 write!(f, "{cap} bytes of writes are already waiting for an answer")
             }
+            Refused::NoSession => write!(
+                f,
+                "this page could not start a session (the browser gave it no randomness), so it cannot save; reload the page"
+            ),
             Refused::TooLargeToSend { bytes, limit } => write!(
                 f,
                 "this write is {bytes} bytes as sent and the limit is {limit}; split it into smaller writes"

@@ -593,6 +593,10 @@ pub struct Params {
     /// that thinks it is watching and is not waits for ever, and nothing it
     /// can see would tell it otherwise.
     pub max_subscriptions: usize,
+    /// Standing subscriptions ONE client — one page load — may hold (sdk#146),
+    /// so one page cannot take every other's room. Half the engine-wide cap:
+    /// two live tabs fit side by side without either evicting the other.
+    pub max_subscriptions_per_client: usize,
     /// The longest bound a subscription may carry.
     ///
     /// The bounds are client-chosen byte strings. Without this one
@@ -662,6 +666,7 @@ impl Default for Params {
             stale_after_missing: 3,
             max_delta_entries: 256,
             max_subscriptions: 32,
+            max_subscriptions_per_client: 16,
             max_sub_key: 256,
             notify_without_diff: false,
         }
@@ -1076,13 +1081,26 @@ impl<B: Blocks> Engine<B> {
                 sub_id,
                 range,
             } => {
-                let accepted = self.subs.add(
+                let (accepted, evicted) = self.subs.add(
                     client,
                     sub_id,
                     range,
-                    self.params.max_subscriptions,
-                    self.params.max_sub_key,
+                    subs::SubLimits {
+                        max_subs: self.params.max_subscriptions,
+                        max_per_client: self.params.max_subscriptions_per_client,
+                        max_key: self.params.max_sub_key,
+                    },
                 );
+                // The oldest client's subscriptions are dropped UNTOLD, and on
+                // purpose. A `Changed` names no session and is delivered to
+                // whichever connection's call produced it — this one, the NEW
+                // page's — so a `Stale` for the evicted ids would reach the
+                // wrong tab, under sub ids it may hold itself (sdk#166: reads
+                // and notifications are not yet sessioned). A victim that is
+                // still live loses push and keeps its tick backstop — slower,
+                // never wrong — and re-asserts its subscriptions on reconnect.
+                // Almost always the victim is a page that reloaded away.
+                let _ = evicted;
                 vec![Effect::Subscribed {
                     client,
                     sub_id,
@@ -2969,7 +2987,7 @@ struct Context {
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 5;
+const CONTEXT_VERSION: u16 = 6;
 
 /// What a context this build wrote begins with.
 ///
