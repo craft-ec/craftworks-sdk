@@ -791,7 +791,7 @@ fn no_event_sequence_panics() {
     for seed in 1..=40u64 {
         let mut r = rng(seed);
         let mut e = common::new_store_params(Params {
-            max_backlog: 4096,
+            max_write_bytes: 4096,
             parity_age: 2,
             ..Params::default()
         });
@@ -846,7 +846,7 @@ fn pick(r: &mut impl FnMut() -> u64, known: &[Cid]) -> Cid {
 #[test]
 fn a_full_backlog_refuses_a_write_without_applying_it() {
     let mut e = common::new_store_params(Params {
-        max_backlog: 4000,
+        max_write_bytes: 4000,
         ..Params::default()
     });
     let mut seen = Seen::default();

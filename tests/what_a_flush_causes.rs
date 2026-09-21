@@ -97,7 +97,7 @@ impl Node {
     }
 
     fn client(&mut self, r: &protocol::Request) {
-        let frame = protocol::encode_request(protocol::CURRENT, r);
+        let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
         self.step(vec![Inbound::Client(frame)]);
     }
 }

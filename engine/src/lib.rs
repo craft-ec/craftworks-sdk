@@ -134,8 +134,29 @@ pub enum State {
     /// re-submits. Silence would leave it waiting on a write nobody will ever
     /// finish -- the one outcome a client cannot recover from.
     Lost,
-    /// TERMINAL: refused without being accepted; the backlog is full.
+    /// TERMINAL: refused without being accepted, for now -- a commit is in
+    /// flight, or a cold write was declined while its blocks are fetched.
+    /// Re-sending later can succeed.
     Busy,
+    /// TERMINAL: refused without being accepted, and NEVER acceptable as it
+    /// is: it is over `limit` of `bound` by `got` (craftworks-sdk#136). Unlike
+    /// `Busy`, re-sending it is refused the same way every time.
+    TooLarge {
+        bound: WriteBound,
+        limit: usize,
+        got: usize,
+    },
+}
+
+/// Which bound a [`State::TooLarge`] write is over.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum WriteBound {
+    /// Distinct blocks one commit would write ([`Params::max_commit_blocks`]).
+    CommitBlocks,
+    /// Bytes in one write ([`Params::max_write_bytes`]).
+    WriteBytes,
 }
 
 // `Event` is not `Eq`: a scan carries a `Range`, whose bounds are
@@ -408,9 +429,13 @@ pub struct Params {
     /// with the other half in place — keepers putting the members, and reads
     /// resolving through the head's packs.
     pub pack_on_write: bool,
-    /// Accepted-but-not-durable bytes beyond which a `Write` is refused. A
-    /// queue with no bound is a queue that eventually eats the node.
-    pub max_backlog: usize,
+    /// The largest ONE write, in bytes (keys plus values).
+    ///
+    /// Named for what it bounds. It was `max_backlog`, but a write is refused
+    /// `Busy` whenever a commit is pending or a write is parked, so by the time
+    /// this is checked there is no backlog at all: it bounds a single write
+    /// (craftworks-sdk#136), and a write over it is `TooLarge`, not `Busy`.
+    pub max_write_bytes: usize,
     /// Ticks after which an owed group's parity is put even while its members
     /// keep changing, so a hot group cannot stay unprotected for ever.
     pub parity_age: u64,
@@ -530,7 +555,7 @@ pub struct Params {
     /// TWO bounds meet here and they are one number.
     ///
     /// The context: a commit's bookkeeping carries a Cid per block it waits
-    /// on, ~54 B each (measured), and `max_backlog` bounds a commit in BYTES
+    /// on, ~54 B each (measured), and `max_write_bytes` bounds a write in BYTES
     /// which says nothing about how many blocks those bytes become.
     ///
     /// The PLATFORM: a pack's bytes exist only in the return that made them
@@ -607,7 +632,7 @@ impl Default for Params {
             max_pack: 1024 * 1024,
             max_packed_value: 64 * 1024,
             pack_on_write: false,
-            max_backlog: 8 * 1024 * 1024,
+            max_write_bytes: 8 * 1024 * 1024,
             parity_age: 32,
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
@@ -1526,12 +1551,21 @@ impl<B: Blocks> Engine<B> {
                 state: State::Busy,
             }];
         }
-        // Refused BEFORE it is applied, for the same reason.
-        if self.backlog() + size > self.params.max_backlog {
+        // Refused BEFORE it is applied, for the same reason. Nothing is
+        // pending and nothing is parked here (the `Busy` above), and `folded`
+        // is empty at every point an event can observe, so there is no
+        // backlog: this is one write against its own bound, and a write over
+        // it is over it every time -- `TooLarge`, never `Busy`.
+        debug_assert_eq!(self.backlog(), 0);
+        if size > self.params.max_write_bytes {
             return vec![Effect::Notify {
                 client,
                 write_id,
-                state: State::Busy,
+                state: State::TooLarge {
+                    bound: WriteBound::WriteBytes,
+                    limit: self.params.max_write_bytes,
+                    got: size,
+                },
             }];
         }
 
@@ -1615,10 +1649,18 @@ impl<B: Blocks> Engine<B> {
         // leaves no trace, which is what `Busy` promises.
         if emitted.len() > self.params.max_commit_blocks {
             self.parked_write = None;
+            // `emitted` counts DISTINCT blocks -- a function of the tree and
+            // the contents, not of how many ops the write had -- and it is the
+            // same on every re-send against the same tree. So: `TooLarge`,
+            // with the count, never `Busy`, which the outbox re-sends for ever.
             return vec![Effect::Notify {
                 client,
                 write_id,
-                state: State::Busy,
+                state: State::TooLarge {
+                    bound: WriteBound::CommitBlocks,
+                    limit: self.params.max_commit_blocks,
+                    got: emitted.len(),
+                },
             }];
         }
         // It applied, so it is no longer parked.
@@ -1685,15 +1727,31 @@ impl<B: Blocks> Engine<B> {
         // cap would have let exactly the state through that it exists to
         // refuse. Serializing here is the park path, which is rare.
         let parked_cost = bincode::serialized_size(&ops).unwrap_or(u64::MAX) as usize;
+        let needs: BTreeSet<Cid> = need.iter().copied().collect();
         if parked_cost > self.params.max_parked_write_bytes {
             self.parked_write = None;
-            return vec![Effect::Notify {
+            // DECLINE TO PARK, BUT STILL FETCH. Answering `Busy` without the
+            // fetches refused the one thing that would make this write
+            // acceptable: a cold write too big to carry stayed cold, and was
+            // `Busy` for ever (craftworks-sdk#136, measured). With the blocks
+            // fetched the re-send finds them warm, applies without parking,
+            // and `Busy` is TRUE -- which is why this is not `TooLarge`: the
+            // same write succeeds on a warm node.
+            let mut out: Vec<Effect> = needs
+                .iter()
+                .map(|id| Effect::FetchBlock {
+                    id: *id,
+                    via: read::Via::Direct,
+                    attempt: rounds,
+                })
+                .collect();
+            out.push(Effect::Notify {
                 client,
                 write_id,
                 state: State::Busy,
-            }];
+            });
+            return out;
         }
-        let needs: BTreeSet<Cid> = need.iter().copied().collect();
         let out = needs
             .iter()
             .map(|id| Effect::FetchBlock {

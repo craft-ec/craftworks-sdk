@@ -714,11 +714,11 @@ impl Session {
                 self.delegate = Some(key);
                 wire::frame_register_delegate(container, stream).map(|f| (f, named))
             }
-            Step::Ask => self
-                .engine_frames(
-                    protocol::encode_request(1, &protocol::Request::Identity),
-                    stream,
-                )
+            // An error, never a panic: this is the page, and a panic in wasm is
+            // a dead page.
+            Step::Ask => protocol::encode_request(1, &protocol::Request::Identity)
+                .map_err(|r| format!("the identity request cannot be encoded: {r:?}"))
+                .and_then(|payload| self.engine_frames(payload, stream))
                 .map(|f| (f, String::new())),
             Step::Install => {
                 // A TEST key, minted here and then FORGOTTEN. The page keeps
@@ -745,7 +745,9 @@ impl Session {
                     register_params: wire::register_params(&vk, wire::HEAD_NAME),
                     signing_key: protocol::TestKey(sk.to_bytes().to_vec()),
                 };
-                self.engine_frames(protocol::encode_request(1, &req), stream)
+                protocol::encode_request(1, &req)
+                    .map_err(|r| format!("the install request cannot be encoded: {r:?}"))
+                    .and_then(|payload| self.engine_frames(payload, stream))
                     .map(|f| (f, String::new()))
             }
         };

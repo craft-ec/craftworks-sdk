@@ -32,7 +32,7 @@ pub mod session;
 ///
 /// A list, not a number: "the current version" is what a protocol says right
 /// before it drops an old client. Serving several is the normal state.
-pub const KNOWN: &[u16] = &[1, 2];
+pub const KNOWN: &[u16] = &[1, 2, 3];
 
 /// The version this build SPEAKS when it starts a conversation.
 ///
@@ -52,7 +52,12 @@ pub const KNOWN: &[u16] = &[1, 2];
 /// message is added as a variant and never as a field, and why the delegate
 /// sends v2-only messages ONLY to a client that said it speaks v2. A v1
 /// client is never sent one at all, so its decoder never has to refuse one.
-pub const CURRENT: u16 = 2;
+///
+/// v3 adds [`WriteState::TooLarge`] — again a new variant, sent only to a
+/// client that spoke v3; an older one is told [`WriteState::Failed`], which
+/// means the same thing to it (not in the tree; sending it again is refused
+/// again) without a reason it could not read.
+pub const CURRENT: u16 = 3;
 
 /// A client's message, with its version on the front.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +616,38 @@ pub enum WriteState {
     /// TERMINAL. Its commit will not publish and the client is the only
     /// thing that still has it.
     Lost,
+    /// TERMINAL, nothing applied, and **never** acceptable as it is: the
+    /// write is over `limit` of `bound` by what `got` says (craftworks-sdk#136).
+    /// Unlike `Busy` it must not be re-sent — the same write is refused the
+    /// same way every time. Splitting it is the caller's decision.
+    ///
+    /// `limit` and `got` SATURATE at `u32::MAX` (see [`saturating_u32`]):
+    /// a count too large for the field says "at least this much", never a
+    /// wrapped small number that would read as under the limit. v3 only.
+    TooLarge {
+        bound: WriteBound,
+        limit: u32,
+        got: u32,
+    },
+}
+
+/// Which of the engine's bounds a [`WriteState::TooLarge`] write is over.
+/// APPEND ONLY: a variant's position is its wire tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriteBound {
+    /// Distinct blocks one commit would write (`max_commit_blocks`).
+    CommitBlocks,
+    /// Bytes in one write (`max_write_bytes`).
+    WriteBytes,
+}
+
+/// A count into a `u32` wire field, saturating rather than wrapping.
+///
+/// `n as u32` of 2^32 + 5 is 5 — a count that says "far over" arriving as
+/// "just over", or under. A saturated count is still over any limit it was
+/// compared with.
+pub fn saturating_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 impl WriteState {
@@ -618,7 +655,7 @@ impl WriteState {
     pub fn terminal(self) -> bool {
         matches!(
             self,
-            WriteState::Busy | WriteState::Failed | WriteState::Lost
+            WriteState::Busy | WriteState::Failed | WriteState::Lost | WriteState::TooLarge { .. }
         )
     }
 
@@ -632,6 +669,60 @@ impl WriteState {
     pub fn should_resubmit(self) -> bool {
         matches!(self, WriteState::Busy)
     }
+
+    /// The protocol version that introduced this state. A client that spoke
+    /// an older one cannot decode it and must be told [`Self::for_client`].
+    ///
+    /// ONE MATCH, so a state added later (sdk#143's `Conflict`) is one arm
+    /// here and one in `for_client`, and the version tests pick it up by
+    /// iterating [`Self::NEWER_THAN_V2`].
+    pub fn since(self) -> u16 {
+        match self {
+            WriteState::Accepted
+            | WriteState::Stalled
+            | WriteState::Published
+            | WriteState::ParityComplete
+            | WriteState::Busy
+            | WriteState::Failed
+            | WriteState::Lost => 1,
+            WriteState::TooLarge { .. } => 3,
+        }
+    }
+
+    /// What a client that speaks `version` is told for this state: the state
+    /// itself if it can read it, else the older state that means the same to
+    /// it. The delegate calls this at the one place write states leave it.
+    pub fn for_client(self, version: u16) -> WriteState {
+        if version >= self.since() {
+            return self;
+        }
+        match self {
+            // Not in the tree, and sending it again is refused again —
+            // exactly what `Failed` already tells an older client.
+            WriteState::TooLarge { .. } => WriteState::Failed,
+            other => other,
+        }
+    }
+
+    /// `TooLarge`, from counts as the engine holds them. The ONLY way the
+    /// delegate builds one, so the narrowing to the wire's `u32` happens in
+    /// one place and saturates -- a wrapped count could read as UNDER the
+    /// limit it is over.
+    pub fn too_large(bound: WriteBound, limit: usize, got: usize) -> WriteState {
+        WriteState::TooLarge {
+            bound,
+            limit: saturating_u32(limit),
+            got: saturating_u32(got),
+        }
+    }
+
+    /// Every state newer than v2, one example each — what the version tests
+    /// iterate, so a new state is covered by adding it here.
+    pub const NEWER_THAN_V2: &'static [WriteState] = &[WriteState::TooLarge {
+        bound: WriteBound::CommitBlocks,
+        limit: 128,
+        got: 129,
+    }];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -668,19 +759,41 @@ fn opts() -> impl bincode::Options {
         .with_limit(MAX_MESSAGE as u64)
 }
 
-pub fn encode_request(version: u16, body: &Request) -> Vec<u8> {
+/// Encode a client's message — or say why it cannot be sent.
+///
+/// A `Result`, never an empty frame. This was `.unwrap_or_default()`, so a
+/// message over [`MAX_MESSAGE`] became `[]`: the client sent nothing, the
+/// engine answered `Unparseable` with no write id, the write sat awaiting a
+/// verdict until the copy's timeout rolled it back, and the only words anyone
+/// saw were the wrong ones (craftworks-sdk#136).
+pub fn encode_request(version: u16, body: &Request) -> Result<Vec<u8>, Dropped> {
     use bincode::Options;
     opts()
         .serialize(&Envelope {
             version,
             body: body.clone(),
         })
-        .unwrap_or_default()
+        .map_err(|e| classify(&e))
 }
 
-pub fn encode_reply(r: &Reply) -> Vec<u8> {
+/// Encode a reply — or say why it cannot be sent. See [`encode_request`].
+pub fn encode_reply(r: &Reply) -> Result<Vec<u8>, Dropped> {
     use bincode::Options;
-    opts().serialize(r).unwrap_or_default()
+    opts().serialize(r).map_err(|e| classify(&e))
+}
+
+/// How many bytes a client message would encode to, with no limit applied —
+/// so a sender can refuse a write that will not fit BEFORE anything is sent
+/// or held.
+pub fn request_len(version: u16, body: &Request) -> u64 {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .serialized_size(&Envelope {
+            version,
+            body: body.clone(),
+        })
+        .unwrap_or(u64::MAX)
 }
 
 /// What came of trying to read a client's message.

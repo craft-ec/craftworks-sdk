@@ -249,49 +249,75 @@ fn a_second_write_while_one_is_parked_is_refused() {
     println!("  a second write while one is parked: Busy, tree untouched");
 }
 
-/// A write too big to carry in the context is refused rather than parked.
+/// A write too big to carry in the context is not parked -- but its blocks
+/// ARE fetched, so the re-send finds a warm path and applies.
 ///
 /// The parked write's ops ride in the context, which the platform caps at
-/// 400 KiB. Parking one that does not fit would produce a context that cannot
-/// be written, and the failure would surface at `to_context` — after the
-/// client had been told nothing at all.
+/// 400 KiB, so one that does not fit is not parked. It used to be refused
+/// with NO fetches: the one thing that would make it acceptable was the thing
+/// the refusal skipped, and a cold write over the cap was `Busy` for ever
+/// (craftworks-sdk#136, measured by the architect: 5 x 40 KiB, cold, four
+/// re-sends, four `Busy`, zero fetches). Now `Busy` is TRUE: re-sent after the
+/// fetched blocks arrive, the same write applies.
 #[test]
-fn a_write_too_big_to_park_is_refused_while_a_smaller_one_parks() {
+fn a_write_too_big_to_park_fetches_its_path_and_applies_when_re_sent() {
     let (_, root, all) = fixture(400);
     let cap = 4096usize;
     let params = Params {
         max_parked_write_bytes: cap,
         ..Params::default()
     };
-    let mut refused = None;
-    let mut parked = None;
-    for (label, len) in [("over", cap + 1), ("under", cap / 2)] {
+    // THE CONTROL: under the cap, the same cold path PARKS -- so the cap, not
+    // the cold path, is what the larger write meets.
+    {
         let cold = Store::fresh();
         cold.put(root, all.get(&root).expect("the root"));
         let mut h = started(Mode::Rehydrate, params, cold, root);
-        let out = h.step(write_one("k/00100", &vec![7u8; len]));
-        if label == "over" {
-            refused = Some((states(&out), fetches(&out).len()));
-        } else {
-            parked = Some((states(&out), fetches(&out).len()));
-        }
+        let out = h.step(write_one("k/00100", &vec![7u8; cap / 2]));
+        assert!(
+            states(&out).is_empty() && !fetches(&out).is_empty(),
+            "a write UNDER the cap onto the same cold path was not parked: {:?}",
+            states(&out)
+        );
     }
-    let (over_states, over_fetches) = refused.expect("ran");
-    let (under_states, under_fetches) = parked.expect("ran");
-    assert_eq!(
-        over_states,
-        vec![State::Busy],
-        "a write over the parking cap was not refused"
-    );
-    assert_eq!(over_fetches, 0, "a refused write asked for blocks anyway");
-    // The control: the cap is what refused it, not the cold path.
-    assert!(
-        under_states.is_empty() && under_fetches > 0,
-        "a write UNDER the same cap, onto the same cold path, was not parked \
-         ({under_states:?}, {under_fetches} fetches) — so the cap is not what \
-         refused the larger one"
-    );
-    println!("  over the cap: Busy with 0 fetches; under it: parked with {under_fetches}");
+    let cold = Store::fresh();
+    cold.put(root, all.get(&root).expect("the root"));
+    let mut h = started(Mode::Rehydrate, params, cold.clone(), root);
+    let big = vec![7u8; cap + 1];
+    let mut rounds = 0;
+    let accepted = loop {
+        rounds += 1;
+        assert!(
+            rounds <= 8,
+            "still not accepted after {rounds} re-sends: Busy for ever"
+        );
+        let out = h.step(write_one("k/00100", &big));
+        let st = states(&out);
+        if st.contains(&State::Accepted) {
+            break true;
+        }
+        assert_eq!(
+            st,
+            vec![State::Busy],
+            "round {rounds}: an over-cap write was not refused Busy"
+        );
+        let wanted = fetches(&out);
+        assert!(
+            !wanted.is_empty(),
+            "round {rounds}: refused with NO fetches -- the path stays cold and the write is Busy for ever"
+        );
+        // The node delivers what was asked for.
+        for id in wanted {
+            let bytes = all.get(&id).expect("held");
+            cold.put(id, bytes);
+            let _ = h.step(Event::BlockArrived {
+                id,
+                bytes: bytes.to_vec(),
+            });
+        }
+    };
+    assert!(accepted);
+    println!("  over the cap: Busy with fetches; accepted on re-send {rounds}");
 }
 
 /// A parked write and a parked read wait on the same block, and both are
@@ -408,6 +434,14 @@ fn a_parked_write_of_many_tiny_ops_is_capped_on_what_it_costs() {
         "a write whose payload is {payload} B (under the {cap} B cap) but \
          whose context cost is far over it was parked anyway"
     );
-    assert_eq!(fetches(&out).len(), 0, "a refused write asked for blocks");
-    println!("  {n} tiny ops: {payload} B of payload, refused on context cost");
+    // Declined, not parked -- and its path IS fetched, so the re-send finds it
+    // warm (craftworks-sdk#136: a refusal with no fetches was `Busy` for ever).
+    assert!(
+        !fetches(&out).is_empty(),
+        "a write declined on its cost fetched nothing -- it stays cold for ever"
+    );
+    println!(
+        "  {n} tiny ops: {payload} B of payload, declined on context cost, {} fetch(es)",
+        fetches(&out).len()
+    );
 }

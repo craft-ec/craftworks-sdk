@@ -138,7 +138,8 @@ async fn main() -> Result<()> {
     }
 
     // ---- 3: an engine request reaches the delegate and answers ----
-    let ask = protocol::encode_request(protocol::CURRENT, &protocol::Request::Identity);
+    let ask =
+        protocol::encode_request(protocol::CURRENT, &protocol::Request::Identity).expect("encodes");
     let frames = wire::frame_delegate_op(&dkey, &Parameters::from(vec![]), ask, 2)
         .map_err(|e| anyhow::anyhow!("framing DelegateOp: {e}"))?;
     send_frames(&mut a, frames).await?;
@@ -176,7 +177,8 @@ async fn main() -> Result<()> {
     let bare = format!("ws://127.0.0.1:{port}/v1/contract/command");
     let mut b = open(&bare).await?;
     let mut rb = Reassembler::new();
-    let ask = protocol::encode_request(protocol::CURRENT, &protocol::Request::Identity);
+    let ask =
+        protocol::encode_request(protocol::CURRENT, &protocol::Request::Identity).expect("encodes");
     let frames = wire::frame_delegate_op(&dkey, &Parameters::from(vec![]), ask, 3)
         .map_err(|e| anyhow::anyhow!("framing: {e}"))?;
     send_frames(&mut b, frames).await?;

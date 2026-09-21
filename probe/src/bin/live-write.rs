@@ -38,7 +38,7 @@ async fn connect(ws: &str) -> Result<WebApi> {
 }
 
 async fn send(client: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()> {
-    let payload = protocol::encode_request(protocol::CURRENT, r);
+    let payload = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
     timeout(
         STEP,
         client.send(ClientRequest::DelegateOp(

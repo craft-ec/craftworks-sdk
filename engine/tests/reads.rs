@@ -614,14 +614,14 @@ fn a_hostile_preload_costs_the_budget() {
 /// ZERO fetches (sdk#120).
 #[test]
 fn a_warm_preload_costs_the_budget() {
-    // BIG ENOUGH TO BLOW THE BUDGET, and built to stay inside `max_backlog`.
+    // BIG ENOUGH TO BLOW THE BUDGET, and built to stay inside `max_write_bytes`.
     //
     // 2,000 records make ~161 blocks, UNDER the default budget of 256 — so a
     // fixture that size satisfies the bound without ever testing it, which is
     // the same defect as the cold-path test this one replaces.
     //
     // And the shared `fixture()` makes every third value 1,400 B, so 40,000
-    // records is ~18 MB against an 8 MiB `max_backlog`: the write is REFUSED,
+    // records is ~18 MB against an 8 MiB `max_write_bytes`: the write is REFUSED,
     // the tree comes back EMPTY, and the bound is satisfied by a fixture that
     // does not exist. Small uniform values instead — record count drives block
     // count without the byte blow-up.

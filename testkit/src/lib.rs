@@ -301,7 +301,7 @@ impl Node {
     /// read-back lands later still. That span is exactly what a one-process
     /// driver cannot see.
     pub fn client(&mut self, r: &protocol::Request) -> Vec<Vec<u8>> {
-        let frame = protocol::encode_request(protocol::CURRENT, r);
+        let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
         let mut out = self.step(vec![Inbound::Client(frame)]);
         for _ in 0..6 {
             let acks: Vec<Inbound> = std::mem::take(&mut self.last_put_ids)

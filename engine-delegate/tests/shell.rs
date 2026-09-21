@@ -48,6 +48,7 @@ fn write_req() -> Vec<u8> {
             ops: vec![protocol::Op::Put(b"k".to_vec(), vec![3u8; 40])],
         },
     )
+    .expect("encodes")
 }
 
 /// A `PutContractResponse` is NOT a confirmation; the read-back is.
@@ -194,7 +195,7 @@ fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
 /// same thing.
 #[test]
 fn a_message_with_trailing_bytes_is_refused_rather_than_half_read() {
-    let good = protocol::encode_request(protocol::CURRENT, &Request::Flush);
+    let good = protocol::encode_request(protocol::CURRENT, &Request::Flush).expect("encodes");
     assert!(
         matches!(protocol::decode_request(&good), protocol::Incoming::Ok(_)),
         "a well-formed Flush was refused, so the check below shows nothing"
@@ -477,7 +478,8 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
             register_params: vec![3u8; 16],
             signing_key: protocol::TestKey(vec![4u8; 32]),
         },
-    );
+    )
+    .expect("encodes");
     let out = s.handle(vec![Inbound::Client(req)]);
     assert!(
         s.provisioned,
@@ -494,10 +496,9 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
 
     // What the ENGINE records is where its authority came from — and the
     // type says TEST, which is the whole point of naming it.
-    let out = s.handle(vec![Inbound::Client(protocol::encode_request(
-        protocol::CURRENT,
-        &Request::Identity,
-    ))]);
+    let out = s.handle(vec![Inbound::Client(
+        protocol::encode_request(protocol::CURRENT, &Request::Identity).expect("encodes"),
+    )]);
     assert!(
         out.ops
             .iter()
@@ -518,8 +519,9 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
 ///
 /// That makes the core's `max_commit_blocks` and the shell's per-return PUT
 /// limit one number, not two. This asserts the consequence: at the boundary
-/// the write is refused with `Busy` and nothing is put, rather than a partial
-/// set going out.
+/// the write is refused -- `TooLarge`, naming the bound and the count, since
+/// it is refused the same way every time (craftworks-sdk#136) -- and nothing
+/// is put, rather than a partial set going out.
 #[test]
 fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     // The two numbers, set equal. A commit may name at most what one return
@@ -533,7 +535,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     };
     let store = Store::default();
 
-    let run = |n: u32| -> (Vec<WriteState>, usize, usize) {
+    let run = |n: u32, version: u16| -> (Vec<WriteState>, usize, usize) {
         let mut s: Shell<Store> =
             Shell::resume_with(&[], params, store.clone(), StoreFacts::provisioned());
         s.limits = engine_delegate::schedule::Limits {
@@ -548,10 +550,10 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
                 )
             })
             .collect();
-        let out = s.handle(vec![Inbound::Client(protocol::encode_request(
-            protocol::CURRENT,
-            &Request::Write { write_id: 1, ops },
-        ))]);
+        let out = s.handle(vec![Inbound::Client(
+            protocol::encode_request(version, &Request::Write { write_id: 1, ops })
+                .expect("encodes"),
+        )]);
         let puts = out
             .ops
             .iter()
@@ -561,12 +563,23 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     };
 
     // Over the boundary: refused, and NOTHING put.
-    let (over, over_puts, over_stranded) = run(per_return as u32 * 4);
-    assert_eq!(
-        over,
-        vec![WriteState::Busy],
+    let (over, over_puts, over_stranded) = run(per_return as u32 * 4, protocol::CURRENT);
+    assert!(
+        matches!(
+            over.as_slice(),
+            [WriteState::TooLarge { bound: protocol::WriteBound::CommitBlocks, limit: 4, got }] if *got > 4
+        ),
         "a commit naming more blocks than one return can carry was not \
-         refused; it was {over:?}"
+         refused TooLarge; it was {over:?}"
+    );
+    // THE SAME WRITE FROM A v2 CLIENT: it cannot read `TooLarge`, so it is
+    // told `Failed` -- not in the tree, do not re-send -- and never sent a
+    // variant its decoder would drop (the one conversion point, `for_client`).
+    let (over_v2, _, _) = run(per_return as u32 * 4, 2);
+    assert_eq!(
+        over_v2,
+        vec![WriteState::Failed],
+        "a v2 client was sent {over_v2:?}"
     );
     assert_eq!(
         over_puts, 0,
@@ -578,7 +591,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
     // The control: under the boundary it is accepted and every block goes out
     // in this one return. Without it, "nothing was put" is also what a shell
     // that never puts anything looks like.
-    let (under, under_puts, under_stranded) = run(2);
+    let (under, under_puts, under_stranded) = run(2, protocol::CURRENT);
     assert_eq!(under.first(), Some(&WriteState::Accepted));
     assert!(
         under_puts > 0,
@@ -591,7 +604,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
          so the shell is holding puts it cannot hold"
     );
     println!(
-        "  over the boundary: Busy, 0 puts; under it: Accepted, {under_puts} put(s), 0 stranded"
+        "  over the boundary: {over:?} (v2 client: Failed), 0 puts; under it: Accepted, {under_puts} put(s), 0 stranded"
     );
 }
 
@@ -609,14 +622,17 @@ fn a_subscribed_range_is_pushed_a_changed_across_the_context() {
 
     // One call: subscribe.
     let mut s: Shell<Store> = Shell::resume(&ctx, Params::default(), store.clone());
-    let out = s.handle(vec![Inbound::Client(protocol::encode_request(
-        protocol::CURRENT,
-        &Request::SubscribeRange {
-            sub_id: 7,
-            lo: protocol::Bound::Included(b"k".to_vec()),
-            hi: protocol::Bound::Unbounded,
-        },
-    ))]);
+    let out = s.handle(vec![Inbound::Client(
+        protocol::encode_request(
+            protocol::CURRENT,
+            &Request::SubscribeRange {
+                sub_id: 7,
+                lo: protocol::Bound::Included(b"k".to_vec()),
+                hi: protocol::Bound::Unbounded,
+            },
+        )
+        .expect("encodes"),
+    )]);
     let accepted: Vec<protocol::Accepted> = out
         .replies
         .iter()
@@ -702,15 +718,18 @@ fn a_subscribed_range_is_pushed_a_changed_across_the_context() {
 fn a_commit_outside_the_subscribed_range_pushes_nothing() {
     let store = Store::default();
     let mut s: Shell<Store> = Shell::resume(&[], Params::default(), store.clone());
-    let out = s.handle(vec![Inbound::Client(protocol::encode_request(
-        protocol::CURRENT,
-        &Request::SubscribeRange {
-            sub_id: 7,
-            // `write_req` writes the key "k"; this range starts after it.
-            lo: protocol::Bound::Included(b"zzz".to_vec()),
-            hi: protocol::Bound::Unbounded,
-        },
-    ))]);
+    let out = s.handle(vec![Inbound::Client(
+        protocol::encode_request(
+            protocol::CURRENT,
+            &Request::SubscribeRange {
+                sub_id: 7,
+                // `write_req` writes the key "k"; this range starts after it.
+                lo: protocol::Bound::Included(b"zzz".to_vec()),
+                hi: protocol::Bound::Unbounded,
+            },
+        )
+        .expect("encodes"),
+    )]);
     assert!(!out.replies.is_empty(), "the subscribe was not answered");
     let mut ctx = s.to_context().expect("a context");
 
@@ -775,10 +794,9 @@ fn identity_reports_whether_a_head_can_be_written_both_ways() {
                 head_id: [0u8; 32],
             },
         );
-        let out = s.handle(vec![Inbound::Client(protocol::encode_request(
-            1,
-            &protocol::Request::Identity,
-        ))]);
+        let out = s.handle(vec![Inbound::Client(
+            protocol::encode_request(1, &protocol::Request::Identity).expect("encodes"),
+        )]);
         out.replies
             .iter()
             .filter_map(|b| protocol::decode_reply(b).ok())
@@ -829,15 +847,18 @@ fn an_install_at_a_provisioned_delegate_changes_nothing_and_says_so() {
                 head_id: [0u8; 32],
             },
         );
-        let out = s.handle(vec![Inbound::Client(protocol::encode_request(
-            1,
-            &protocol::Request::Install {
-                block_code: vec![0xB1; 8],
-                register_code: vec![0x8E; 8],
-                register_params: vec![0x01; 4],
-                signing_key: protocol::TestKey(vec![0x77; 32]),
-            },
-        ))]);
+        let out = s.handle(vec![Inbound::Client(
+            protocol::encode_request(
+                1,
+                &protocol::Request::Install {
+                    block_code: vec![0xB1; 8],
+                    register_code: vec![0x8E; 8],
+                    register_params: vec![0x01; 4],
+                    signing_key: protocol::TestKey(vec![0x77; 32]),
+                },
+            )
+            .expect("encodes"),
+        )]);
         let replies = out
             .replies
             .iter()
@@ -894,10 +915,9 @@ fn identity_names_the_head_contract_when_there_is_one() {
                 head_id,
             },
         );
-        let out = s.handle(vec![Inbound::Client(protocol::encode_request(
-            1,
-            &protocol::Request::Identity,
-        ))]);
+        let out = s.handle(vec![Inbound::Client(
+            protocol::encode_request(1, &protocol::Request::Identity).expect("encodes"),
+        )]);
         out.replies
             .iter()
             .filter_map(|b| protocol::decode_reply(b).ok())

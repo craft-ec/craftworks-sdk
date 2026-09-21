@@ -31,6 +31,7 @@ fn a_real_call_report(dropped: u32) -> Vec<u8> {
         head_update: 0,
         note: "domain=medical row=patient-notes alice@example.com".into(),
     })
+    .expect("encodes")
 }
 
 /// A REAL per-call report leaves no key, no value and no domain name.

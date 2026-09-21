@@ -90,6 +90,8 @@ pub struct Client {
     rec: Option<instrument::SyncRecorder>,
     /// Per-call reports that arrived with no recorder attached.
     unrecorded_calls: u64,
+    /// Requests that could not be encoded, so were never sent.
+    unencodable: usize,
     traces: Traces,
     /// The client's clock, as a function, because this crate compiles to wasm
     /// and to a host binary and must not reach for one of its own.
@@ -113,6 +115,7 @@ impl Client {
             now_ms: None,
             rec: None,
             unrecorded_calls: 0,
+            unencodable: 0,
         }
     }
 
@@ -164,9 +167,22 @@ impl Client {
     }
 
     /// Queue a request. It goes out when the host next asks.
+    ///
+    /// A request that cannot be encoded is NOT queued as an empty frame —
+    /// which is what `encode_request` used to hand back, and the engine
+    /// answered "Unparseable" with no id to hang it on (craftworks-sdk#136).
+    /// It is counted, and `CachedStore` refuses a write that will not fit
+    /// before it ever gets here.
     pub fn send(&mut self, r: &Request) {
-        self.outbound
-            .push(protocol::encode_request(protocol::CURRENT, r));
+        match protocol::encode_request(protocol::CURRENT, r) {
+            Ok(bytes) => self.outbound.push(bytes),
+            Err(_) => self.unencodable += 1,
+        }
+    }
+
+    /// Requests that could not be encoded, so were never sent.
+    pub fn unencodable(&self) -> usize {
+        self.unencodable
     }
 
     /// Everything waiting to be sent, in order. **Drained.**

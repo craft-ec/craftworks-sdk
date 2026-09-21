@@ -25,7 +25,7 @@ fn store() -> CachedStore {
 }
 
 fn verdict(write_id: u64, state: WriteState) -> Vec<u8> {
-    protocol::encode_reply(&protocol::Reply::WriteState { write_id, state })
+    protocol::encode_reply(&protocol::Reply::WriteState { write_id, state }).expect("encodes")
 }
 
 /// **300 sequential writes all land, with zero refusals.**

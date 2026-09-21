@@ -103,7 +103,8 @@ impl Transport for Loop {
                     return vec![protocol::encode_reply(&protocol::Reply::WriteState {
                         write_id,
                         state: WriteState::Busy,
-                    })];
+                    })
+                    .expect("encodes")];
                 }
             }
         }
@@ -348,7 +349,8 @@ fn an_unanswerable_read_is_an_error_and_not_an_absence() {
                         vec![protocol::encode_reply(&protocol::Reply::Unavailable {
                             req_id,
                             blocked_on: [7u8; 32],
-                        })]
+                        })
+                        .expect("encodes")]
                     }
                     _ => Vec::new(),
                 },
@@ -523,7 +525,8 @@ fn an_unreadable_message_is_counted_and_not_silently_ignored() {
     let mut damaged = protocol::encode_reply(&protocol::Reply::Value {
         req_id: 0,
         value: None,
-    });
+    })
+    .expect("encodes");
     damaged.push(0xFF);
     db.client().on_inbound(&damaged);
     db.client().on_inbound(b"not a message at all");
