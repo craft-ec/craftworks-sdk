@@ -49,9 +49,20 @@ pub struct PendingWrite {
     pub value: Option<Vec<u8>>,
     /// Queued but not yet submitted (the engine answered `Busy`).
     pub queued: bool,
-    /// When this write was made, on the client's clock. What the timeout
-    /// measures against.
+    /// When this write last LEFT for the node, on the client's clock
+    /// (restamped by [`Copy::sent`] on every send). What the timeout measures
+    /// against.
     pub at_ms: u64,
+    /// Made, and held by the outbox's window: the node has never seen it
+    /// (craftworks-sdk#176). Never timed out — the timeout is for "no verdict
+    /// ever came", and nothing was asked yet.
+    pub held: bool,
+    /// Sent, and no verdict yet: this write holds one of the outbox's window
+    /// slots. THE record of the slot — the window is counted from these bits
+    /// ([`Copy::at_node_count`]), so a write that is rolled back, published or
+    /// answered takes its slot with it. A separate set of ids, cleared only by
+    /// a verdict, kept the slots of timed-out writes for ever (sdk#179).
+    pub at_node: bool,
     /// **Reserved, unused in phase 3.** The base version this write was
     /// computed against, for the phase-8 fix that lets a verdict invalidate
     /// only the writes that actually depended on the failed one. Present now
@@ -491,6 +502,8 @@ impl Copy {
                 value,
                 queued: false,
                 at_ms,
+                held: false,
+                at_node: false,
                 declared_base: None,
             });
         self.pending_count += 1;
@@ -536,6 +549,61 @@ impl Copy {
                 }
             }
         }
+    }
+
+    fn each_of(&mut self, write_id: u64, mut f: impl FnMut(&mut PendingWrite)) {
+        for e in self.keys.values_mut() {
+            for w in &mut e.pending {
+                if w.write_id == write_id {
+                    f(w);
+                }
+            }
+        }
+    }
+
+    /// The outbox's window is full: this write is held, not sent.
+    pub fn hold(&mut self, write_id: u64) {
+        self.each_of(write_id, |w| {
+            w.held = true;
+            w.queued = false;
+            w.at_node = false;
+        });
+    }
+
+    /// THIS WRITE LEFT FOR THE NODE NOW — the one function every send goes
+    /// through: the first send, a release from the window, a `Busy` re-send.
+    /// It takes a window slot, and its timeout starts HERE. Measured from the
+    /// `put`, a 300-row publish rolled back every row the window was still
+    /// holding at 60 s as `Unknown` (craftworks-sdk#176); measured from the
+    /// FIRST send, a `Busy` write re-sent at 55 s was rolled back 6 s later
+    /// and its `Published` then arrived for a write the copy no longer had
+    /// (sdk#179).
+    pub fn sent(&mut self, write_id: u64, now_ms: u64) {
+        self.each_of(write_id, |w| {
+            w.held = false;
+            w.queued = false;
+            w.at_node = true;
+            w.at_ms = now_ms;
+        });
+    }
+
+    /// The node answered this write — any verdict: its window slot is free.
+    pub fn answered(&mut self, write_id: u64) {
+        self.each_of(write_id, |w| w.at_node = false);
+    }
+
+    /// Writes sent and not yet answered: the outbox's window, counted from the
+    /// writes themselves. Distinct WRITES — a multi-key write is one entry per
+    /// key and one slot.
+    pub fn at_node_count(&self) -> usize {
+        let ids: std::collections::BTreeSet<u64> = self
+            .keys
+            .values()
+            .flat_map(|e| e.pending.iter())
+            .filter(|w| w.at_node)
+            .map(|w| w.write_id)
+            .collect();
+        ids.len()
     }
 
     pub fn submitted(&mut self, write_id: u64) {
@@ -643,7 +711,7 @@ impl Copy {
             .keys
             .values()
             .flat_map(|e| e.pending.iter())
-            .filter(|w| now_ms.saturating_sub(w.at_ms) >= timeout)
+            .filter(|w| !w.held && now_ms.saturating_sub(w.at_ms) >= timeout)
             .map(|w| (w.write_id, RolledBack::Unknown))
             .collect();
         self.fall(seeds)

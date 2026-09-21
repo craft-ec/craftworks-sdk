@@ -1047,6 +1047,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "blake3",
+ "craftworks-sdk",
  "curve25519-dalek",
  "ed25519-dalek",
  "engine",
