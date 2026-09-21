@@ -68,6 +68,32 @@ impl IdGen {
     }
 }
 
+/// The slot a record derived from a source takes: a deterministic rkey.
+///
+/// `created_ms (8 bytes, big-endian) ‖ BLAKE3(namespace, source_id)[..8]`.
+/// The same source always gives the same slot — on any run, device or
+/// platform (the vector is pinned in `tests/create_at.rs`) — and the time
+/// prefix means derived slots sort among minted ids by creation time, exactly
+/// as minted ones do (craftworks-sdk#149).
+///
+/// **`created_ms` is the source record's `created` FIELD**, never a time read
+/// back out of its id: in LocalDb the two are two clock reads and disagree
+/// about once in 5,000 records, and two paths that derived the slot from the
+/// two different times would copy that record twice.
+///
+/// The namespace is length-prefixed in the hash, so no split of one string
+/// between `namespace` and `source_id` can collide with another split.
+pub fn slot_from(created_ms: u64, namespace: &str, source_id: &str) -> RKey {
+    let mut h = blake3::Hasher::new();
+    h.update(&(namespace.len() as u64).to_be_bytes());
+    h.update(namespace.as_bytes());
+    h.update(source_id.as_bytes());
+    let mut slot = [0u8; 16];
+    slot[..8].copy_from_slice(&created_ms.to_be_bytes());
+    slot[8..].copy_from_slice(&h.finalize().as_bytes()[..8]);
+    slot
+}
+
 pub fn created_ms(id: &RKey) -> u64 {
     u64::from_be_bytes(id[..8].try_into().unwrap())
 }

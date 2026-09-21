@@ -113,6 +113,21 @@ pub fn parse_block_id(text: &str) -> Result<String, JsError> {
     }))
 }
 
+/// The slot a record copied from a source takes, as 32 hex: the same source
+/// always gives the same slot (craftworks-sdk#149). `createdMs` is the SOURCE
+/// record's `created` field — never a time read out of its id.
+///
+/// A number, not a BigInt, because that is what `created` is in JavaScript;
+/// anything that is not a whole, non-negative, exactly representable
+/// millisecond count is refused rather than rounded into another slot.
+#[wasm_bindgen(js_name = slotFrom)]
+pub fn slot_from(created_ms: f64, namespace: &str, source_id: &str) -> Result<String, JsError> {
+    if !(created_ms >= 0.0 && created_ms.fract() == 0.0 && created_ms <= 9_007_199_254_740_991.0) {
+        return Err(err(format!("createdMs must be a whole number of milliseconds; got {created_ms}")));
+    }
+    Ok(id::to_hex(&craftworks_sdk::slot_from(created_ms as u64, namespace, source_id)))
+}
+
 fn err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }
@@ -270,6 +285,12 @@ impl Db {
     /// first and returns this instead.
     pub fn put(&mut self, domain: &str, f: &str) -> Result<String, JsError> {
         json(&self.0.put(domain, &fields(f)?).map_err(err)?)
+    }
+    /// Create at a slot the caller derived (`slotFrom`), or answer the record
+    /// already there: `{ outcome: "created" | "exists", record }`. Never an
+    /// overwrite (craftworks-sdk#149).
+    pub fn create_at(&mut self, domain: &str, slot: &str, f: &str) -> Result<String, JsError> {
+        json(&self.0.create_at(domain, rkey(slot)?, &fields(f)?).map_err(err)?)
     }
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsError> {
         json(
