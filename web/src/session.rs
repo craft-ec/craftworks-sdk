@@ -442,9 +442,14 @@ impl Session {
                         Some(after),
                     ));
             }
-            craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
+            craftworks_sdk::loads::Page::Complete { lo, hi, rows, at } => {
                 let root = self.head_root;
                 self.db.store_mut().on_page(&lo, &hi, rows, root);
+                // A whole domain, loaded at one root: the next question about
+                // it can be a real delta FROM that root (sdk#142).
+                if let Some(d) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_of_range(&lo, &hi) {
+                    self.refresh.on_loaded(&d, at.root);
+                }
             }
             // The tree moved under this load, or it finished behind what
             // this client already knows. Ask again from the top: what was

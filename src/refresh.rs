@@ -144,6 +144,23 @@ impl Refresh {
         Answer::Reload { domain }
     }
 
+    /// A load of the WHOLE domain completed, every page read at `root`.
+    ///
+    /// **This is what makes the delta path run at all** (sdk#142). `seen` was
+    /// written only by a delta, and a delta could only be asked for FROM
+    /// `seen` — so every question went out from the zero root, the engine
+    /// made three fetches of a block that cannot exist and answered
+    /// `FullReloadRequired`, and every change notification reloaded the
+    /// whole domain. A completed load is the other fact that establishes a
+    /// root: the copy holds the domain as it was AT that root.
+    ///
+    /// The root is the one the pages were answered at — never the `new_root`
+    /// a `FullReloadRequired` named, since the tree can move between that
+    /// refusal and the reload finishing.
+    pub fn on_loaded(&mut self, domain: &str, root: [u8; 32]) {
+        self.seen.insert(domain.to_string(), root);
+    }
+
     /// A question that will never be answered: drop it so the domain can be
     /// asked about again.
     pub fn give_up(&mut self, req_id: u64) -> Option<String> {

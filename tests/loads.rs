@@ -29,7 +29,7 @@ fn a_range_is_requested_and_completed() {
     assert_eq!(l.in_flight(), 1);
 
     match l.on_page(id, rows(3), None, AT) {
-        Page::Complete { lo, hi, rows } => {
+        Page::Complete { lo, hi, rows, .. } => {
             assert_eq!(lo, b"a/".to_vec());
             assert_eq!(hi, b"a0".to_vec());
             assert_eq!(rows.len(), 3);

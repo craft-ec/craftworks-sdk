@@ -40,6 +40,10 @@ pub enum Page {
         lo: Vec<u8>,
         hi: Vec<u8>,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
+        /// The head EVERY page was read at — a restart throws away a load
+        /// whose pages disagree. What a delta from this range may start FROM
+        /// (sdk#142).
+        at: protocol::At,
     },
     /// The tree moved under this load, or it finished behind what this
     /// client already knows. Ask again from the top of the range.
@@ -254,6 +258,7 @@ impl Loads {
             lo: load.lo,
             hi: load.hi,
             rows: load.rows,
+            at: finished_at,
         }
     }
 

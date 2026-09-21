@@ -132,6 +132,7 @@ impl FullNode {
             max_stranded: 0,
             params: engine::Params::default(),
             asked: BTreeMap::new(),
+            fetched: BTreeMap::new(),
         })))
     }
 
@@ -180,6 +181,8 @@ struct ConnState {
     /// Every request this connection sent, and whether it was ANSWERED:
     /// `w<id>` for a write (a terminal write state), `r<id>` for a read.
     asked: BTreeMap<String, bool>,
+    /// Block fetches, by block id: what `fetches_of` counts.
+    fetched: BTreeMap<Cid, usize>,
 }
 
 /// One client's connection: its own context over a shared node.
@@ -344,6 +347,7 @@ impl Conn {
                 }
                 engine_delegate::schedule::Op::Get { id, .. } => {
                     self.record(Served::Get);
+                    *self.0.borrow_mut().fetched.entry(id).or_default() += 1;
                     let held = {
                         let s = self.0.borrow();
                         let n = &s.node;
@@ -442,6 +446,13 @@ impl Conn {
     }
 
     /// How many of this op kind the node served.
+    /// How many times the engine fetched THIS block. The all-zero id is the
+    /// one worth asking about: a fetch of it is a question with no answer
+    /// (sdk#142).
+    pub fn fetches_of(&self, id: &Cid) -> usize {
+        self.0.borrow().fetched.get(id).copied().unwrap_or(0)
+    }
+
     pub fn served(&self, what: Served) -> usize {
         self.0.borrow().served.get(&what).copied().unwrap_or(0)
     }

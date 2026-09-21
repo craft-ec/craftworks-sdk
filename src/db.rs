@@ -322,6 +322,16 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         (lo, hi)
     }
 
+    /// The domain whose WHOLE range is exactly `[lo, hi)`, if any — the
+    /// inverse of [`Db::domain_range`], kept beside it so the layout is
+    /// still known in one place. A narrower or wider span names no domain.
+    pub fn domain_of_range(lo: &[u8], hi: &[u8]) -> Option<String> {
+        let name = lo.strip_prefix(&[T_RECORD])?.strip_suffix(&[0])?;
+        let domain = std::str::from_utf8(name).ok()?;
+        check_domain(domain).ok()?;
+        (Self::domain_range(domain) == (lo.to_vec(), hi.to_vec())).then(|| domain.to_string())
+    }
+
     pub fn new(store: S, env: E, device: [u8; 4]) -> Self {
         Db {
             store,
