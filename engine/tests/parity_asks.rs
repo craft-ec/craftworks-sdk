@@ -438,3 +438,47 @@ fn two_tabs_ticking_from_clocks_two_seconds_apart_keep_the_schedule() {
         "with two tabs' clocks 2 s apart, the re-ask came at {again:?} ticks, not reask_after"
     );
 }
+
+/// THE FORWARD HALF OF A RESET, at the bad tick itself. One tick far ahead,
+/// taken as time passing, makes every age enormous for THAT call: the write
+/// in flight is told `Stalled` falsely and every unanswered ask is re-put at
+/// once. Both are checked in that call; the control is the stall timer still
+/// firing, `max_accept_age` honest ticks after the reset. (Core dev's mutant
+/// on #167: `CLOCK_RESET_TICKS = u64::MAX` passed every other test, because
+/// the NEXT ordinary tick is "behind" and resets anyway.)
+#[test]
+fn one_tick_far_ahead_is_a_reset_in_that_very_call() {
+    let p = Params::default();
+    let mut h = harness(p);
+    let (at, asked) = first_ask(&mut h); // unanswered parity asks
+    let second = h.step(write(2, 64, 0x55)); // a commit in flight, never confirmed
+    assert!(told(&second, 2).contains(&State::Accepted));
+    let far = T0 + at + 10 * 365 * 86_400;
+    let out = h.step(Event::Tick(far));
+    assert!(
+        !told(&out, 2).contains(&State::Stalled),
+        "a tick far ahead told the write in flight Stalled at once"
+    );
+    let reput: Vec<Cid> = parity(&out)
+        .into_iter()
+        .filter(|id| asked.contains(id))
+        .collect();
+    assert!(
+        reput.is_empty(),
+        "a tick far ahead re-put {} unanswered ask(s) at once",
+        reput.len()
+    );
+    // CONTROL: time does pass from the reset on.
+    let mut stalled_at = None;
+    for k in 1..=p.max_accept_age {
+        if told(&h.step(Event::Tick(far + k)), 2).contains(&State::Stalled) {
+            stalled_at = Some(k);
+            break;
+        }
+    }
+    assert_eq!(
+        stalled_at,
+        Some(p.max_accept_age),
+        "the stall timer after the reset"
+    );
+}
