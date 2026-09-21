@@ -30,6 +30,20 @@
 //! stays green until a fix makes one disappear, and then that test names the
 //! issue and asks to be inverted.
 
+//! THE LOOP RULE (twice now a drive-until loop cost real time: an 8-minute
+//! mutant on sdk#179, a 22-minute hang in model v2): EVERY loop that waits on
+//! the model's state either ADVANCES THE MODEL'S CLOCK or is BOUNDED and fails
+//! by name. A cold commit makes no progress until the clock moves; a loop that
+//! does neither spins for ever and says nothing.
+//!
+//! THE STREAM RULE (model v2's re-pin): a new fault NEVER draws from an
+//! existing generator. It gets its own, derived from the seed, and a switch
+//! (`Config::v2`). Drawn inline from `rng`, one fault shifted every later draw,
+//! so "seed N" after it was a different run from "seed N" before it, and a
+//! count's move could not be traced to anything. With its own stream and its
+//! switch off, every seed is the run it was before -- which a test holds
+//! (`with_every_v2_behaviour_off_the_model_is_the_node_before_v2`).
+
 use craftworks_sdk::{CachedStore, Store};
 use protocol::{Op, Reply, Request, WriteState};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -96,9 +110,33 @@ struct Config {
     /// Misbehaviour on. Off, the node is HEALTHY: it answers every frame, in
     /// order, to the right session, and never forgets; the clock never jumps.
     faults: bool,
+    /// Which of model v2's node behaviours are ON (the `V2_*` bits). Each draws
+    /// from its OWN generator, never from `rng`, so switching one on changes a
+    /// run only where it fires: with all of them off a seed is exactly the run
+    /// it was before v2 (`diagnostic_per_seed_findings`, WPM_V2=0), and a
+    /// count that moves when one is switched on moved BECAUSE of it.
+    v2: u16,
 }
 
-const TODAY: Config = Config { rule: Rule::Today, driver: Driver::Today, steps: 200, faults: true };
+/// A cold (parked) write: its commit waits on reads; later writes meet Busy.
+const V2_COLD: u16 = 1 << 0;
+/// A write that changes nothing is answered at the door (sdk#160/#164).
+const V2_NOOP: u16 = 1 << 1;
+/// The engine says TooLarge where an Accepted would be.
+const V2_TOOLARGE: u16 = 1 << 2;
+/// Stalled, said once at 64 s in flight.
+const V2_STALLED: u16 = 1 << 3;
+/// A commit ends Lost without landing.
+const V2_LOST: u16 = 1 << 4;
+/// The context rolls back one step (step slot 97).
+const V2_ROLLBACK: u16 = 1 << 5;
+/// A structural misroute run (step slot 98).
+const V2_MISROUTE_RUN: u16 = 1 << 6;
+/// A third connection floods the node's queue (step slot 99).
+const V2_FLOOD: u16 = 1 << 7;
+const V2_ALL: u16 = (1 << 8) - 1;
+
+const TODAY: Config = Config { rule: Rule::Today, driver: Driver::Today, steps: 200, faults: true, v2: V2_ALL };
 const HEALTHY: Config = Config { faults: false, ..TODAY };
 
 /// The node's request queue per key: 100 waiting + 1 in service (F51).
@@ -132,6 +170,15 @@ struct Commit {
     ops: Vec<Op>,
     /// The head PUT landed: the ops are in the tree, not yet answered.
     landed: bool,
+    /// A COLD write: the engine parked it on reads (its path is not in
+    /// memory) until this time; every later write meets `Busy` meanwhile.
+    cold_until: Option<u64>,
+    /// When it was taken, for `Stalled` (64 s in flight).
+    taken_ms: u64,
+    stalled_said: bool,
+    /// Re-sent after the context rolled back one step, and ALREADY landed
+    /// once: its head PUT is the same one again — no second apply.
+    replayed: bool,
 }
 
 /// How a write ended, as the PERSON was told it.
@@ -144,6 +191,9 @@ enum End {
 
 struct Model {
     rng: Rng,
+    /// One generator per v2 behaviour (bit index of `V2_*`), seeded from the
+    /// run's seed: a behaviour's draws never move the main stream.
+    v2rng: [Rng; 8],
     cfg: Config,
     clock: testkit::Clock,
     stores: [CachedStore; 2],
@@ -159,9 +209,23 @@ struct Model {
     inbound: VecDeque<(usize, Vec<u8>)>,
     parked: bool,
     queued_while_parked: usize,
+    /// The commit as it was at the start of this step — what a context that
+    /// ROLLS BACK one step (sdk#162's unsaved call) returns to.
+    prev_commit: Option<Commit>,
+    /// A STRUCTURAL misroute: every verdict for session `.0` goes to the
+    /// other session until step `.1` — a quiet tab's tick-decided verdicts
+    /// all reach the tab that ticks, not a 6 % coin each.
+    misroute_run: Option<(usize, usize)>,
     /// Verdicts on their way to a session: (addressed to, bytes, about).
     outbound: VecDeque<(usize, Vec<u8>, u64)>,
     /// (session, write_id) → the step it was APPLIED at.
+    ///
+    /// APPLIED = TAKEN AND NOT WITHDRAWN (the Rev3Node's rule, here too). This
+    /// node records a take only where nothing can withdraw it: at its head
+    /// PUT's landing, which puts it in the tree, or at the no-op door, which
+    /// changes nothing. A commit that ends Lost, or is forgotten with its
+    /// context, before landing was never recorded; one replayed after a
+    /// rolled-back context re-sends the same head PUT and is not recorded again.
     applied: BTreeMap<(usize, u64), usize>,
     last_applied: [u64; 2],
     // --- the harness's view of each write ---
@@ -221,6 +285,7 @@ impl Model {
         ];
         Model {
             rng: Rng(seed),
+            v2rng: std::array::from_fn(|k| Rng(seed ^ (0xC0FF_EE00_0000_0000 | ((k as u64 + 1) << 32)))),
             cfg,
             clock,
             stores,
@@ -231,6 +296,8 @@ impl Model {
             inbound: VecDeque::new(),
             parked: false,
             queued_while_parked: 0,
+            prev_commit: None,
+            misroute_run: None,
             outbound: VecDeque::new(),
             applied: BTreeMap::new(),
             last_applied: [0, 0],
@@ -271,6 +338,7 @@ impl Model {
             "Busy, then applied after a later write",
             "its Published went to the other session",
             "the node lost its context after the head PUT",
+            "the context rolled back past its head PUT",
             "its verdict was dropped",
             "left the client after it was rolled back",
             "the client's clock jumped while it was at the node",
@@ -520,15 +588,24 @@ impl Model {
         // idle engine (sdk#176: 0 Busy in every live L4 run). `Busy` is what a
         // request meets when it reaches the engine mid-commit anyway — a
         // FAULT here, never on a healthy node.
-        if self.commit.is_some() && !(self.faults && self.rng.chance(30)) {
+        //
+        // A COLD commit is different: the engine parked it on reads and
+        // returned, so the node goes on delivering calls — and every write
+        // that reaches the engine meanwhile is answered `Busy` (a Busy STORM:
+        // `on_write`, read by the architect).
+        let cold = self.commit.as_ref().is_some_and(|c| c.cold_until.is_some_and(|t| self.clock.now_ms() < t));
+        if self.commit.is_some() && !cold && !(self.faults && self.rng.chance(30)) {
             return;
         }
         let Some((i, f)) = self.inbound.pop_front() else { return };
         // Every client frame the delegate RUNS is answered by its per-call
         // report (entry.rs emits one per call, on the sender's connection) --
         // what a page counts its frames against (sdk#174: at most one
-        // unanswered tick per session).
-        self.stores[i].on_inbound(&call_report());
+        // unanswered tick per session). The third connection's report goes to
+        // the third connection, which this model does not run.
+        if let Some(s) = self.stores.get_mut(i) {
+            s.on_inbound(&call_report());
+        }
         let protocol::Incoming::Ok(env) = protocol::decode_request(&f) else { return };
         // ASKWRITE, answered as the engine answers it (sdk#174, the sdk#196
         // review): a write the engine does not know -- never taken, or
@@ -541,17 +618,44 @@ impl Model {
             return;
         }
         let Request::Write { write_id, ops } = env.body else { return };
+        if i > 1 {
+            return; // the third connection sends no writes
+        }
         match self.cfg.rule {
             Rule::Today => {
                 if self.commit.is_some() {
                     self.note(i, write_id, "Busy");
                     self.saw.insert("a Busy");
+                    if cold {
+                        self.saw.insert("a Busy behind a cold (parked) write");
+                    }
                     self.reply(i, write_id, WriteState::Busy);
+                } else if self.on(V2_NOOP) && self.is_no_op(&ops) {
+                    // THE NO-OP FAST PATH (sdk#160/#164): a write that changes
+                    // nothing is answered at the door — Accepted, Published,
+                    // ParityComplete in one call, no commit, nothing for a
+                    // later write to be Busy behind. It is TAKEN (the ruling:
+                    // "applied" = taken under the rule, tree changed or not).
+                    self.saw.insert("a no-op write answered at the door");
+                    self.take(i, write_id, "answered at the door (no-op)");
+                    self.reply(i, write_id, WriteState::Accepted);
+                    self.reply(i, write_id, WriteState::Published);
+                    self.reply(i, write_id, WriteState::ParityComplete);
                 } else if self.faults && self.rng.chance(3) {
                     // The engine refuses it as invalid: nothing applied.
                     self.reply(i, write_id, WriteState::Failed);
+                } else if self.on(V2_TOOLARGE) && self.faults && self.v2r(V2_TOOLARGE).chance(2) {
+                    // TooLarge from the ENGINE (CommitBlocks is decided after
+                    // the apply is computed): where an Accepted would be.
+                    self.saw.insert("TooLarge said by the engine");
+                    self.reply(i, write_id, WriteState::too_large(protocol::WriteBound::CommitBlocks, 128, 129));
                 } else {
-                    self.commit = Some(Commit { session: i, write_id, ops, landed: false });
+                    let now = self.clock.now_ms();
+                    let cold_until = (self.on(V2_COLD) && self.faults && self.v2r(V2_COLD).chance(12)).then(|| now + 2_000 + self.v2r(V2_COLD).below(90_000));
+                    if cold_until.is_some() {
+                        self.saw.insert("a cold (parked) write");
+                    }
+                    self.commit = Some(Commit { session: i, write_id, ops, landed: false, cold_until, taken_ms: now, stalled_said: false, replayed: false });
                     self.reply(i, write_id, WriteState::Accepted);
                 }
             }
@@ -559,11 +663,77 @@ impl Model {
         }
     }
 
+    /// Is this v2 behaviour switched on?
+    fn on(&self, bit: u16) -> bool {
+        self.cfg.v2 & bit != 0
+    }
+
+    /// The generator of v2 behaviour `bit`.
+    fn v2r(&mut self, bit: u16) -> &mut Rng {
+        &mut self.v2rng[bit.trailing_zeros() as usize]
+    }
+
+    /// Would these ops change nothing in the node's tree?
+    fn is_no_op(&self, ops: &[Op]) -> bool {
+        ops.iter().all(|op| match op {
+            Op::Put(k, v) => self.tree.get(k) == Some(v),
+            Op::Delete(k) => !self.tree.contains_key(k),
+        })
+    }
+
+    /// The node TAKES (session, write_id) under its rule — the W2 and W3
+    /// checks, and the apply log, in one place for every path that takes.
+    fn take(&mut self, session: usize, write_id: u64, how: &str) {
+        let key = (session, write_id);
+        if let Some(first) = self.applied.get(&key) {
+            let d = format!("session {session} w{write_id} applied at step {first} and again at step {}", self.step);
+            let tag = self.cause(session, write_id);
+            self.find_tagged("W3 APPLIED TWICE", tag, d);
+        }
+        if write_id < self.last_applied[session] {
+            let busy = self.notes.get(&key).is_some_and(|n| n.contains(&"Busy"));
+            if busy {
+                self.note(session, write_id, "Busy, then applied after a later write");
+            }
+            let d = format!("session {session} w{write_id} applied after w{} — a later write of the session landed first", self.last_applied[session]);
+            let tag = self.cause(session, write_id);
+            self.find_tagged("W2 OUT OF ORDER", tag, d);
+        }
+        self.last_applied[session] = self.last_applied[session].max(write_id);
+        self.applied.insert(key, self.step);
+        self.log(format!("node APPLIES s{session} w{write_id} ({how})"));
+    }
+
     /// The commit in flight moves one step: its head PUT lands (the ops are
     /// APPLIED), then — in a later step — it is answered `Published`.
     fn advance_commit(&mut self) {
         let Some(c) = self.commit.clone() else { return };
+        let now = self.clock.now_ms();
+        // STALLED at 64 s in flight — said once, the write stays in flight.
+        if self.on(V2_STALLED) && !c.stalled_said && now.saturating_sub(c.taken_ms) >= 64_000 {
+            self.saw.insert("Stalled said");
+            self.commit.as_mut().expect("the commit").stalled_said = true;
+            self.reply(c.session, c.write_id, WriteState::Stalled);
+        }
+        if c.cold_until.is_some_and(|t| now < t) {
+            return; // parked on reads
+        }
+        if self.on(V2_LOST) && !c.landed && self.faults && self.v2r(V2_LOST).chance(2) {
+            // LOST: the commit ends without landing (a head conflict, settle
+            // rounds exhausted). Nothing applied.
+            self.saw.insert("Lost said");
+            self.commit = None;
+            self.reply(c.session, c.write_id, WriteState::Lost);
+            return;
+        }
         if !c.landed {
+            if c.replayed {
+                // The same head PUT again, after the context rolled back: the
+                // tree already holds it. No second apply.
+                self.log(format!("node re-sends s{} w{}'s head PUT (context rolled back)", c.session, c.write_id));
+                self.commit.as_mut().expect("the commit").landed = true;
+                return;
+            }
             for op in &c.ops {
                 match op {
                     Op::Put(k, v) => {
@@ -574,27 +744,7 @@ impl Model {
                     }
                 }
             }
-            let key = (c.session, c.write_id);
-            if let Some(first) = self.applied.get(&key) {
-                let d = format!("session {} w{} applied at step {first} and again at step {}", c.session, c.write_id, self.step);
-                let tag = self.cause(c.session, c.write_id);
-                self.find_tagged("W3 APPLIED TWICE", tag, d);
-            }
-            if c.write_id < self.last_applied[c.session] {
-                let busy = self.notes.get(&(c.session, c.write_id)).is_some_and(|n| n.contains(&"Busy"));
-                if busy {
-                    self.note(c.session, c.write_id, "Busy, then applied after a later write");
-                }
-                let d = format!(
-                    "session {} w{} applied after w{} — a later write of the session landed first",
-                    c.session, c.write_id, self.last_applied[c.session]
-                );
-                let tag = self.cause(c.session, c.write_id);
-                self.find_tagged("W2 OUT OF ORDER", tag, d);
-            }
-            self.last_applied[c.session] = self.last_applied[c.session].max(c.write_id);
-            self.applied.insert(key, self.step);
-            self.log(format!("node APPLIES s{} w{} (head PUT landed)", c.session, c.write_id));
+            self.take(c.session, c.write_id, "head PUT landed");
             self.commit.as_mut().expect("the commit").landed = true;
         } else {
             self.commit = None;
@@ -625,7 +775,11 @@ impl Model {
             self.note(to, about, "its verdict was dropped");
             return;
         }
-        if faults && self.rng.chance(6) {
+        let structural = faults && self.misroute_run.is_some_and(|(from, until)| from == to && self.step < until);
+        if structural || (faults && self.rng.chance(6)) {
+            if structural {
+                self.saw.insert("a structural misroute run");
+            }
             if matches!(state, WriteState::Published | WriteState::ParityComplete) {
                 self.note(to, about, "its Published went to the other session");
             }
@@ -674,6 +828,35 @@ impl Model {
         }
     }
 
+    /// The context ROLLS BACK one step: the commit is what it was at the start
+    /// of this step. A commit that had landed and been answered comes back
+    /// landed-not-answered, and says Published a second time; one that had
+    /// landed is REPLAYED (same head PUT, no second apply).
+    fn context_rolls_back(&mut self) {
+        // A commit that LANDED this step and is rolled back past: its head is
+        // in the tree, and the context no longer knows it exists.
+        if let Some(c) = self.commit.clone().filter(|c| c.landed) {
+            if self.prev_commit.as_ref().is_none_or(|p| (p.session, p.write_id) != (c.session, c.write_id)) {
+                self.note(c.session, c.write_id, "the context rolled back past its head PUT");
+            }
+        }
+        let back = self.prev_commit.clone();
+        let mut back = back.map(|mut c| {
+            if self.applied.contains_key(&(c.session, c.write_id)) && !c.landed {
+                c.replayed = true;
+            }
+            c
+        });
+        if let Some(c) = back.as_mut() {
+            if self.applied.contains_key(&(c.session, c.write_id)) {
+                self.saw.insert("a verdict said twice (context rolled back)");
+            }
+        }
+        self.saw.insert("a context rolled back one step");
+        self.log(format!("node's context ROLLS BACK one step (commit {:?})", back.as_ref().map(|c| (c.session, c.write_id, c.landed))));
+        self.commit = back;
+    }
+
     /// The delegate FORGETS EVERYTHING — its context is gone. The tree (with
     /// whatever head PUT landed) stays; the commit in flight does not.
     fn context_loss(&mut self) {
@@ -700,6 +883,7 @@ impl Model {
 
     fn fault_step(&mut self) {
         self.step += 1;
+        self.prev_commit = self.commit.clone();
         // Time passes on every step — honestly, so a write can sit at the node
         // past the timeout with no jump involved.
         let dt = self.rng.below(600);
@@ -756,6 +940,34 @@ impl Model {
                 self.log(format!("node {}", if p { "PARKS (a cold write)" } else { "unparks" }));
                 self.saw.insert("the node parked");
             }
+            // The context ROLLS BACK one step (sdk#162's unsaved call): the
+            // commit is what it was a step ago. A landed-and-answered commit
+            // comes back, and says its verdicts AGAIN.
+            97 if self.faults && self.on(V2_ROLLBACK) => self.context_rolls_back(),
+            // A STRUCTURAL misroute: one session's verdicts all go to the other
+            // for a while.
+            98 if self.faults && self.on(V2_MISROUTE_RUN) => {
+                    let from = self.v2r(V2_MISROUTE_RUN).below(2) as usize;
+                    let until = self.step + 10 + self.v2r(V2_MISROUTE_RUN).below(50) as usize;
+                    self.log(format!("every verdict for s{from} goes to the other session until step {until}"));
+                    self.misroute_run = Some((from, until));
+                }
+            // A THIRD connection (another tab's reads and ticks) floods the
+            // node's queue: the sessions' frames meet the 101 (F51).
+            99 if self.faults && self.on(V2_FLOOD) => {
+                    let n = 40 + self.v2r(V2_FLOOD).below(80);
+                    let tick = protocol::encode_request(3, &Request::Tick { now: 1 }).expect("a tick encodes");
+                    let mut refused = 0;
+                    for _ in 0..n {
+                        if self.inbound.len() >= NODE_ADMITS {
+                            refused += 1;
+                        } else {
+                            self.inbound.push_back((2, tick.clone()));
+                        }
+                    }
+                    self.saw.insert("a third connection flooded the queue");
+                    self.log(format!("a third connection sends {n} frames ({refused} refused)"));
+                }
             _ => {
                 self.pump(0);
                 self.pump(1);
@@ -778,6 +990,18 @@ impl Model {
         }
     }
 
+    /// Move the commit in flight while it CAN move, at most 4 steps. A cold
+    /// one waits on the clock, which the caller advances — never spin on it.
+    fn advance_while_warm(&mut self) {
+        for _ in 0..4 {
+            let cold = self.commit.as_ref().is_some_and(|c| c.cold_until.is_some_and(|t| self.clock.now_ms() < t));
+            if self.commit.is_none() || cold {
+                break;
+            }
+            self.advance_commit();
+        }
+    }
+
     /// Faults off; everything delivered, every second ticked, until nothing
     /// is pending anywhere — or FAIL BY NAME.
     fn drive_to_rest(&mut self) {
@@ -794,17 +1018,17 @@ impl Model {
             }
             // A commit in flight moves on the node's own answers, not on a
             // client's next frame: advance it whether or not anything is
-            // queued. (Only a queued frame used to move it, so a session
-            // that sent nothing held a commit in flight for as long as it
-            // stayed silent.)
-            while self.commit.is_some() {
-                self.advance_commit();
-            }
+            // queued (sdk#196). Bounded, and never on a cold commit, which
+            // waits on the clock this round advances below (the loop rule).
+            self.advance_while_warm();
+            let mut spins = 0;
             while !self.inbound.is_empty() {
-                self.serve();
-                while self.commit.is_some() {
-                    self.advance_commit();
+                spins += 1;
+                if spins > 10_000 {
+                    break; // the node cannot take more this round; time moves below
                 }
+                self.serve();
+                self.advance_while_warm();
                 for i in 0..2 {
                     self.pump(i);
                 }
@@ -906,6 +1130,16 @@ const COVERAGE: &[&str] = &[
     "a context lost AFTER a head PUT",
     "the client's clock jumped",
     "honest time crossed the 60 s timeout (no jump)",
+    "a cold (parked) write",
+    "a Busy behind a cold (parked) write",
+    "a no-op write answered at the door",
+    "Stalled said",
+    "Lost said",
+    "TooLarge said by the engine",
+    "a structural misroute run",
+    "a context rolled back one step",
+    "a verdict said twice (context rolled back)",
+    "a third connection flooded the queue",
     // NOT MODELLED: the sessions write disjoint keys, so W6 holds without
     // deltas. Two writers of one key are M2's business (`Commit{reads,
     // writes}`); this model is blind to them, and says so.
@@ -925,7 +1159,6 @@ struct Tally {
 /// the blindness is on the page, not discovered later.
 const NOT_REACHED: &[(&str, &str)] = &[
     ("two sessions writing one key", "the sessions' keys are disjoint (see `keys`); two writers of one key are M2's `Commit{reads,writes}`"),
-    ("a request refused past 101 (F51)", "two windowed sessions put at most 2 x 16 writes plus their ticks in the node's queue; F51 needs the unwindowed client or more sessions (model v2)"),
 ];
 
 /// One seeded run: its findings, its trace, what its mix reached, and how its
@@ -991,6 +1224,32 @@ fn sweep_all(seeds: std::ops::Range<u64>, cfg: Config) -> Sweep {
     Sweep { first, runs_with, reached }
 }
 
+/// Every (class, cause) whose run count differs from `table`, named.
+fn moved_from(table: &[(&str, &str, usize, &str)], sw: &Sweep) -> Vec<String> {
+    let want: BTreeMap<(&str, &str), usize> = table.iter().map(|(c, t, n, _)| ((*c, *t), *n)).collect();
+    let mut moved = Vec::new();
+    for k in want.keys().chain(sw.runs_with.keys()).collect::<BTreeSet<_>>() {
+        let (was, now) = (want.get(k).copied(), sw.runs_with.get(k).copied().unwrap_or(0));
+        match was {
+            None => moved.push(format!("NEW {} [{}]: {now} runs — a defect nobody has named", k.0, k.1)),
+            Some(w) if w != now => moved.push(format!("{} [{}]: {w} → {now} runs", k.0, k.1)),
+            _ => {}
+        }
+    }
+    moved
+}
+
+/// THE CONTROL for every count model v2 moved: with each v2 behaviour switched
+/// off the model is the node before v2, seed for seed, so it finds exactly the
+/// table pinned then (`KNOWN_V1`). A behaviour that draws from a shared stream,
+/// or runs when switched off, moves this -- and then no move in
+/// `KNOWN_RED_TODAY` can be traced to the behaviour said to cause it.
+#[test]
+fn with_every_v2_behaviour_off_the_model_is_the_node_before_v2() {
+    let moved = moved_from(KNOWN_V1, &sweep_all(0..1_000, Config { v2: 0, ..TODAY }));
+    assert!(moved.is_empty(), "v2 switched off is not the node before v2:\n  {}", moved.join("\n  "));
+}
+
 fn sweep(seeds: std::ops::Range<u64>, cfg: Config) -> Found {
     sweep_all(seeds, cfg).first
 }
@@ -1025,6 +1284,39 @@ fn show(seed: u64, cfg: Config) -> String {
 /// misrouted Published — sdk#184; LATE VERDICT — sdk#183 (on a HEALTHY node
 /// it is gone: `a_healthy_node_finds_nothing`).
 const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
+    // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
+    // Re-pinned ONCE for model v2's node (eight behaviours, each on its own
+    // stream: the stream rule above). Argued SEED BY SEED against `KNOWN_V1`,
+    // one behaviour switched on at a time (`diagnostic_per_seed_findings`,
+    // WPM_V2=<bit>), McNemar per pair, Bonferroni over the 16 pairs
+    // (p < 0.0031). Each MOVED pair below names the behaviours that move it
+    // alone; the no-op door, Stalled and the flood move NONE (their flips are
+    // balanced) -- the control that the test tells a perturbation from an effect.
+    ("FALSE ROLLBACK", "Busy, then applied after a later write", 4, "sdk#183"), // 11: no behaviour alone past the bar
+    ("FALSE ROLLBACK", "its Published went to the other session", 823, "sdk#184"), // 874: misroute run +97/-0 up; cold -354 down
+    ("FALSE ROLLBACK", "its verdict was dropped", 599, "sdk#183"), // 844: cold, misroute run, rollback down; TooLarge, Lost up
+    ("FALSE ROLLBACK", "left the client after it was rolled back", 319, "sdk#183"), // 712: cold, misroute run down; TooLarge, Lost up
+    ("FALSE ROLLBACK", "rolled back behind another write of its keys", 851, "sdk#183"), // 892: cold, misroute run down; TooLarge, Lost up
+    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 293, "sdk#183"), // 181: cold up (inferred: a parked commit keeps the write at the node across a jump)
+    // NEW, and owned by one behaviour: the context rollback (0 -> 190 alone).
+    ("FALSE ROLLBACK", "the context rolled back past its head PUT", 61, "sdk#183"),
+    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 131, "sdk#183"), // 411: cold down, misroute run down
+    ("FALSE ROLLBACK", "timed out while its commit was in flight", 127, "sdk#183"), // 1: cold +148/-0 (inferred: a parked commit outlives the client's timeout)
+    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 37, "sdk#183"), // 8: no behaviour alone past the bar (cold p 0.0033); together, up
+    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 12, "sdk#183"), // 23: no behaviour alone past the bar
+    // Under faults: a Published (or Failed) arriving after the copy rolled the
+    // write back — the false rollbacks above, seen from the other side.
+    ("LATE VERDICT", "", 1000, "sdk#183"),
+    ("STALE CLOCK", "Busy", 834, "sdk#183"), // 287: cold +651/-10 (inferred: the Busy storm behind a parked write); Lost, misroute run down
+    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 112, "sdk#183"), // 265: cold, rollback, misroute run down
+    ("W5 NOT REFILLED AFTER A FALL", "", 212, "sdk#183"), // 302: cold, misroute run down; TooLarge, Lost up (inferred: more terminal verdicts, more falls)
+    ("W6 COPY LIES", "", 845, "sdk#183"), // 501: cold +387, misroute run +309
+];
+
+/// The table as it stood BEFORE model v2 (sdk#174's pin, on a0c3ecc), kept
+/// as the control: with every v2 behaviour off, the model must find exactly
+/// this -- seed for seed it is the same run.
+const KNOWN_V1: &[(&str, &str, usize, &str)] = &[
     // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
     // Re-pinned ONCE for sdk#174's client (the tick gate, the AskWrite sender,
     // a refusal answering its frame): its timing moves these exact counts. No
@@ -1068,20 +1360,18 @@ fn the_sweep_finds_exactly_the_known_classes_and_counts() {
     }
     assert!(blind.is_empty(), "the step mix never reaches {blind:?}: the model is blind there");
 
+    // W1 and W5 hold on today's client in EVERY seed — a write is whole on
+    // the wire, never more than the window at the node, never held with room
+    // except right after a fall (its own known class). Checked on this same
+    // sweep: a second 1,000-seed pass for it cost 18 s of a debug gate.
+    let broken: Vec<_> = sw.first.keys().filter(|(c, _)| c.starts_with("W1") || *c == "W5 WINDOW" || *c == "W5 HELD WITH ROOM").collect();
+    assert!(broken.is_empty(), "W1/W5 broken on today's client: {broken:?}");
+
     println!("  RUNS PER (CLASS, CAUSE) OF 1,000 — as table rows:");
     for ((c, t), n) in &sw.runs_with {
         println!("    ({c:?}, {t:?}, {n}, \"\"),");
     }
-    let want: BTreeMap<(&str, &str), usize> = KNOWN_RED_TODAY.iter().map(|(c, t, n, _)| ((*c, *t), *n)).collect();
-    let mut moved = Vec::new();
-    for k in want.keys().chain(sw.runs_with.keys()).collect::<BTreeSet<_>>() {
-        let (was, now) = (want.get(k).copied(), sw.runs_with.get(k).copied().unwrap_or(0));
-        match was {
-            None => moved.push(format!("NEW {} [{}]: {now} runs — a defect nobody has named", k.0, k.1)),
-            Some(w) if w != now => moved.push(format!("{} [{}]: {w} → {now} runs", k.0, k.1)),
-            _ => {}
-        }
-    }
+    let moved = moved_from(KNOWN_RED_TODAY, &sw);
     assert!(
         moved.is_empty(),
         "the classes the model finds on this tree MOVED — a new defect (up, or a new class) or a fix (down; invert a tripwire whose class reaches 0):\n  {}",
@@ -1089,33 +1379,45 @@ fn the_sweep_finds_exactly_the_known_classes_and_counts() {
     );
 }
 
-/// A pinned finding: `seed` must still find `class` with cause `tag` —
-/// TODAY. When this fails, the defect it pins is gone: invert this test
-/// (assert the class is absent for this seed) and take the class off
-/// `KNOWN_RED_TODAY` once no seed finds it.
-fn tripwire(seed: u64, cfg: Config, class: &str, tag: &str, issue: &str) {
-    let (f, _, _) = run(seed, cfg);
-    let hit = f.iter().any(|x| x.class == class && x.tag == tag);
-    assert!(
-        hit,
-        "seed {seed} no longer finds {class} [{tag}] ({issue}) — if a fix for it landed, INVERT this tripwire.\n{}",
-        show(seed, cfg)
-    );
+/// A pinned finding: some seed in `0..TRIPWIRE_SEEDS` must still find
+/// `class` with cause `tag` — TODAY. The FIRST such seed is printed, so the
+/// repro stays deterministic, but the pin does not churn when a timing
+/// change moves which seed it is. When this fails, the defect is gone: invert
+/// the tripwire (assert no seed finds it) and take the pair off
+/// `KNOWN_RED_TODAY` once its count is 0.
+const TRIPWIRE_SEEDS: u64 = 50;
+
+fn tripwire(cfg: Config, class: &str, tag: &str, issue: &str) {
+    for seed in 0..TRIPWIRE_SEEDS {
+        let (f, _, _) = run(seed, cfg);
+        if f.iter().any(|x| x.class == class && x.tag == tag) {
+            println!("  {class} [{tag}] ({issue}): first at seed {seed} — WPM_SEED={seed} for its trace");
+            return;
+        }
+    }
+    panic!("no seed in 0..{TRIPWIRE_SEEDS} finds {class} [{tag}] ({issue}) — if a fix for it landed, INVERT this tripwire");
 }
 
 /// sdk#179 c, found unaided: a write answered Busy, re-sent after a later
 /// write of the same session had landed — the older value lands last.
+/// Model v2, the context rollback alone (0 -> 190 of 1,000): a commit that
+/// LANDED is rolled back past by its context, and the client, told nothing
+/// more, rolls the write back while its head is in the tree.
+#[test]
+fn known_red_a_context_rolled_back_past_its_head_put_is_a_false_rollback() {
+    tripwire(TODAY, "FALSE ROLLBACK", "the context rolled back past its head PUT", "sdk#183");
+}
+
 #[test]
 fn known_red_busy_reorder_k_old_after_k_new() {
-    // Seed 9 since sdk#174 (was 5): the first seed that still finds it.
-    tripwire(9, TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
+    tripwire(TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
 }
 
 /// A Busy'd write, queued at the client with its original clock, never
 /// re-offered while others were pending, rolled back Unknown by the timer.
 #[test]
 fn known_red_stale_clock_of_a_queued_write() {
-    tripwire(6, TODAY, "STALE CLOCK", "Busy", "sdk#183");
+    tripwire(TODAY, "STALE CLOCK", "Busy", "sdk#183");
 }
 
 /// Run (a): the node's context is lost after the head PUT landed and before
@@ -1123,42 +1425,39 @@ fn known_red_stale_clock_of_a_queued_write() {
 /// and the node HAS it.
 #[test]
 fn known_red_context_loss_after_the_head_put_is_a_false_rollback() {
-    tripwire(0, TODAY, "FALSE ROLLBACK", "the node lost its context after the head PUT", "sdk#183 run (a)");
+    tripwire(TODAY, "FALSE ROLLBACK", "the node lost its context after the head PUT", "sdk#183 run (a)");
 }
 
 /// sdk#184: a Published delivered to the OTHER session (F49); this one is
 /// told Unknown at 60 s, and the node has it.
 #[test]
 fn known_red_misrouted_published_is_a_false_rollback() {
-    tripwire(0, TODAY, "FALSE ROLLBACK", "its Published went to the other session", "sdk#184");
+    tripwire(TODAY, "FALSE ROLLBACK", "its Published went to the other session", "sdk#184");
 }
 
 /// A dropped verdict (F39): the same false rollback by a different road.
 #[test]
 fn known_red_dropped_verdict_is_a_false_rollback() {
-    tripwire(0, TODAY, "FALSE ROLLBACK", "its verdict was dropped", "sdk#183");
+    tripwire(TODAY, "FALSE ROLLBACK", "its verdict was dropped", "sdk#183");
 }
 
 /// A frame that sat in the client's outbox leaves AFTER its write was rolled
 /// back, and the node applies it.
 #[test]
 fn known_red_a_rolled_back_write_still_leaves_and_lands() {
-    // Seed 1 since sdk#174 (was 0): the first seed that still finds it.
-    tripwire(1, TODAY, "FALSE ROLLBACK", "left the client after it was rolled back", "sdk#183");
+    tripwire(TODAY, "FALSE ROLLBACK", "left the client after it was rolled back", "sdk#183");
 }
 
 /// The window refilled before the fall it should follow (`on_write_state`).
 #[test]
 fn known_red_the_window_is_not_refilled_after_a_fall() {
-    // Seed 1 since sdk#174 (was 0): the first seed that still finds it.
-    tripwire(1, TODAY, "W5 NOT REFILLED AFTER A FALL", "", "sdk#183");
+    tripwire(TODAY, "W5 NOT REFILLED AFTER A FALL", "", "sdk#183");
 }
 
 /// W6 at rest: the copy shows a value the node does not have.
 #[test]
 fn known_red_the_copy_lies_at_rest() {
-    // Seed 0 since sdk#174 (was 1): the first seed that still finds it.
-    tripwire(0, TODAY, "W6 COPY LIES", "", "sdk#183");
+    tripwire(TODAY, "W6 COPY LIES", "", "sdk#183");
 }
 
 /// THE HARNESS'S OWN CHECK — not a finding about today's client, which
@@ -1184,16 +1483,6 @@ fn harness_check_resend_on_silence_makes_today_apply_twice() {
     );
 }
 
-/// W1 and W5 hold on today's client in every seed: a write is whole on the
-/// wire, never more than the window of a session's writes is at the node, and
-/// writes are not held while there is room — except right after a fall, which
-/// is its own known class. (Checked every step; this pins that they are CLEAN.)
-#[test]
-fn today_keeps_writes_whole_and_the_window() {
-    let found = sweep(0..1_000, TODAY);
-    let broken: Vec<_> = found.keys().filter(|(c, _)| c.starts_with("W1") || *c == "W5 WINDOW" || *c == "W5 HELD WITH ROOM").collect();
-    assert!(broken.is_empty(), "{broken:?}");
-}
 
 /// THE LIVENESS FLOOR. Every rest check is a SAFETY check: a client that
 /// rolls everything back, or never sends, passes them all (executed by the
@@ -1637,8 +1926,11 @@ mod rev3 {
 #[ignore = "diagnostic: a per-seed dump for a paired comparison of two clients"]
 fn diagnostic_per_seed_findings() {
     let n: u64 = std::env::var("SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5_000);
+    // WPM_V2=<mask of V2_* bits> (default all): 0 is the node before model v2.
+    let v2: u16 = std::env::var("WPM_V2").ok().and_then(|s| s.parse().ok()).unwrap_or(V2_ALL);
+    let cfg = Config { v2, ..TODAY };
     for seed in 0..n {
-        let (f, _, _) = run(seed, TODAY);
+        let (f, _, _) = run(seed, cfg);
         let mut pairs: Vec<String> = f.iter().map(|x| format!("{}|{}", x.class, x.tag)).collect();
         pairs.sort();
         pairs.dedup();
