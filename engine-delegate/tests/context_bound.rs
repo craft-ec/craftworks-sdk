@@ -360,3 +360,75 @@ fn the_shell_at_its_worst_beside_the_engine_at_its_limit_still_saves_and_sheds_t
         "an OLDER read was refused while a newer one was kept"
     );
 }
+
+/// The shell's read-backs follow what the engine still WAITS ON (sdk#187
+/// review). A commit too large to carry has its puts acknowledged but never
+/// seen by the delegate, so it holds read-backs; settled from fact, it is
+/// released Lost. Its read-backs must go with it -- left behind, they
+/// outlived every Lost commit and the shell's share grew without bound.
+#[test]
+fn a_lost_commit_leaves_no_read_backs_in_the_shell() {
+    let p = Params::default();
+    let node = Store::default();
+    let cold = Store::default(); // the delegate never sees what it put
+    let mut ctx: Vec<u8> = Vec::new();
+    let run = |ctx: &mut Vec<u8>,
+                   inbound: Vec<Inbound>|
+     -> (usize, Vec<Vec<u8>>, Vec<engine_delegate::schedule::Op>) {
+        let mut s: Shell<Store> =
+            Shell::resume_with(ctx, p, cold.clone(), StoreFacts::provisioned());
+        let out = s.handle(inbound);
+        *ctx = s.to_context().expect("saves");
+        (s.awaiting(), out.replies, out.ops)
+    };
+    let _ = run(&mut ctx, vec![frame(&Request::Tick { now: 1_790_000_000 })]);
+    // 30 KiB in one value: too large to carry, so a silent commit is Lost.
+    let (_, _, ops) = run(
+        &mut ctx,
+        vec![frame(&Request::Write {
+            write_id: 1,
+            ops: vec![protocol::Op::Put(b"k/big".to_vec(), vec![9u8; 30 * 1024])],
+        })],
+    );
+    let mut acks = Vec::new();
+    for op in ops {
+        if let engine_delegate::schedule::Op::Put { id, bytes } = op {
+            node.put(id, &bytes);
+            acks.push(Inbound::PutAcked { id, ok: true });
+        }
+    }
+    let mut most = 0;
+    for a in acks {
+        let (n, _, _) = run(&mut ctx, vec![a]); // read-backs issued, never answered
+        most = most.max(n);
+    }
+    assert!(most > 0, "no read-back was held: the test is empty");
+    let mut lost = false;
+    let mut left = most;
+    for k in 1..=40u64 {
+        let (n, replies, _) = run(
+            &mut ctx,
+            vec![frame(&Request::Tick {
+                now: 1_790_000_000 + k,
+            })],
+        );
+        left = n;
+        lost |= replies
+            .iter()
+            .filter_map(|b| protocol::decode_reply(b).ok())
+            .any(|r| {
+                matches!(
+                    r,
+                    Reply::WriteState {
+                        write_id: 1,
+                        state: protocol::WriteState::Lost
+                    }
+                )
+            });
+        if lost {
+            break;
+        }
+    }
+    assert!(lost, "the silent commit was never released Lost");
+    assert_eq!(left, 0, "{left} read-back(s) outlived the Lost commit");
+}

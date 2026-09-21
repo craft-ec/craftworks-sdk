@@ -1220,6 +1220,13 @@ impl<B: Blocks> Engine<B> {
     ///
     /// If none of that fits it, `to_context` fails -- a bug, reported loudly
     /// by the host, never a silent `None`.
+    ///
+    /// ITS COST, MEASURED (sdk#187 review), so nobody optimises it blind: it
+    /// sizes the live state by reference each step (`context_len`). Release,
+    /// the burst test that parks ~10,000 reads in ONE engine
+    /// (`context.rs`): 0.08 s on main, 0.15 s here -- about 7 us a step,
+    /// noise beside a delegate's handful of steps a call. Debug, the same
+    /// test: 0.30 -> 10.4 s; every other engine suite within +0.8 s.
     fn keep_saveable(&mut self) -> Vec<Effect> {
         let mut out = Vec::new();
         while self.parity_waiting.values().map(BTreeSet::len).sum::<usize>()
@@ -1247,6 +1254,17 @@ impl<B: Blocks> Engine<B> {
                     result,
                 });
             } else if let Some(pw) = self.parked_write.take() {
+                // A BACKSTOP NO HONEST TEST REACHES: `Engine::new` asserts the
+                // fixed worst case -- the parked write at its cap included --
+                // plus `min_parked_read_bytes` fits the room, so once every
+                // parked read is shed the context is under the limit and this
+                // arm is not reached. Reaching it means
+                // `worst_case_fixed_bytes` UNDERESTIMATED: loud in every debug
+                // run, a counted Busy in release.
+                debug_assert!(
+                    false,
+                    "worst_case_fixed_bytes underestimated: the context is over its bound with every parked read shed"
+                );
                 self.shed.writes += 1;
                 out.push(Effect::Notify {
                     client: pw.client,
