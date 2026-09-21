@@ -213,7 +213,14 @@ impl CachedStore {
         // Only when the engine can take it: with a write still awaiting a
         // verdict, another would be refused again and the re-send would be
         // pure traffic.
-        if self.copy.pending().0 > self.copy.queued_count() {
+        //
+        // WRITES against WRITES. This compared `pending().0` — (key, write)
+        // ENTRIES — with `queued_count()`, which counts WRITES. The two agree
+        // for single-key writes, which is all the burst test used; one queued
+        // 2-key write made it `2 > 1` for ever, the outbox never sent again,
+        // and every write behind it was rolled back at the timeout
+        // (craftworks-sdk#139).
+        if self.copy.pending_writes() > self.copy.queued_count() {
             return;
         }
         let Some((write_id, edits)) = self.copy.oldest_queued() else {
