@@ -429,6 +429,58 @@ await t("THE CONTROL: both surfaces answer `status`, so an app cannot tell them 
   assert.equal(b.status().state, "ready");
 });
 
+// ---------------------------------------------------------------------------
+// A READ SHOULD COST WHAT THE SCREEN COSTS.
+//
+// `reload` scanned the whole domain, every time, for every binding — so a
+// component showing twenty rows read twenty thousand if the domain held them.
+// `Scan { limit, after }` existed unused the whole time.
+// ---------------------------------------------------------------------------
+
+await t("**a binding with a limit asks for a PAGE, not the domain**", async () => {
+  const asked = [];
+  const db = engineDb({
+    session: {
+      ...fakeSession().session,
+      scan: (domain, reverse, limit, after) => {
+        asked.push({ domain, limit, after });
+        return "[]";
+      },
+      root: () => "node:r",
+    },
+  });
+  const b = db.bind("notes", { limit: 20 });
+  await b.reload();
+  assert.ok(asked.length > 0, "the binding never scanned at all — this test measures nothing");
+  assert.strictEqual(asked.at(-1).limit, 20,
+    `the scan asked for limit ${asked.at(-1).limit}, so the read costs the DOMAIN and not the screen`);
+  assert.strictEqual(b.limit, 20, "the binding does not report the page size it was given");
+});
+
+await t("THE CONTROL: no limit still asks for everything", async () => {
+  // Unbounded is the default rather than a hidden 50, because a caller that
+  // asked for everything and silently got a page would draw a partial list
+  // and call it complete — the same confusion between "all of it" and "what
+  // I could get" that NotLoaded exists to prevent one layer down.
+  const asked = [];
+  const db = engineDb({
+    session: {
+      ...fakeSession().session,
+      scan: (domain, reverse, limit) => { asked.push(limit); return "[]"; },
+      root: () => "node:r",
+    },
+  });
+  await db.bind("notes").reload();
+  assert.strictEqual(asked.at(-1), 0, "a binding with no limit quietly paginated");
+});
+
+await t("THE CONTROL: both surfaces take a limit, so an app cannot tell them apart", async () => {
+  const memory = new (wrap(fakeRaw()).Db)();
+  const b = memory.bind("notes", { limit: 20 });
+  assert.strictEqual(b.limit, 20, "the in-memory binding ignores the page size");
+  assert.strictEqual(memory.bind("notes").limit, 0, "its default is not unbounded");
+});
+
 await t("a BINDING from the engine has the shape a component holds", () => {
   const b = engineDb(fakeSession()).bind("tasks", { live: false });
   for (const m of ["getSnapshot", "subscribe", "reload"]) {

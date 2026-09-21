@@ -279,7 +279,7 @@ export function engineDb(handle) {
      * reloaded. Both have the same snapshot and the same subscribe, so
      * flipping it never changes the component.
      */
-    bind(domain, { live = false } = {}) {
+    bind(domain, { live = false, limit = 0 } = {}) {
       let rows = [], root = null;
       // WHAT THIS BINDING LAST MANAGED TO DO.
       //
@@ -303,6 +303,29 @@ export function engineDb(handle) {
       const listeners = new Set();
       const b = {
         get live() { return live; },
+        /**
+         * How many rows this binding reads. `0` is UNBOUNDED, and is what
+         * every caller got before there was a choice.
+         *
+         * # A READ SHOULD COST WHAT THE SCREEN COSTS
+         *
+         * `reload` scanned the whole domain, every time, for every binding.
+         * A component showing twenty rows read twenty thousand if the domain
+         * held them, and `Scan { limit, after }` existed unused the whole
+         * time — the third mechanism this week built, tested and never
+         * called.
+         *
+         * Priced by F43 that is not a rounding error: a cold far read is
+         * seconds, so a list over a cold domain fetched every record in it
+         * to show a screenful.
+         *
+         * Unbounded stays the DEFAULT rather than a hidden 50, because a
+         * caller that asked for everything and silently got a page would
+         * draw a partial list and call it complete — which is the same
+         * confusion between "all of it" and "what I could get" that
+         * `NotLoaded` exists to prevent one layer down.
+         */
+        get limit() { return limit; },
         /**
          * `{ state, why, code }` — `loading`, `ready` or `unreachable`.
          *
@@ -348,7 +371,9 @@ export function engineDb(handle) {
           session.refresh_domain(domain);
           let next;
           try {
-            next = await self.scan(domain);
+            // THE PAGE, not the domain. `limit: 0` is unbounded and is what
+            // the scan has always done.
+            next = await self.scan(domain, { limit });
           } catch (e) {
             // UNREACHABLE IS AN ANSWER, not an exception to swallow.
             //
