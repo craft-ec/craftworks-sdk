@@ -2449,13 +2449,14 @@ impl<B: Blocks> Engine<B> {
         // every write `Stalled` on the first tick (sdk#150, W4). A start taken
         // before there was a clock is anchored to the first clock, not
         // measured from zero. A real tick is never 0, so 0 means "unknown".
-        // TWO CLOCKS, ONE ENGINE. Every tab ticks from its own clock, and two
-        // tabs a second apart alternate forwards and backwards. A tick behind
-        // the last by no more than `CLOCK_SKEW_TICKS` is that: time has not
-        // moved, so the tick's work runs at the time already reached. Taken as
-        // a reset instead, it re-anchored every deadline on every other tick
-        // and nothing was ever due.
-        let now = if self.now != 0 && now < self.now && self.now - now <= CLOCK_SKEW_TICKS {
+        // ENGINE TIME IS THE MOST IT HAS SEEN. Every tab and every device
+        // ticks from its own clock, so two of them a second -- or five minutes
+        // -- apart alternate forwards and backwards. A step back within
+        // `CLOCK_RESET_TICKS` is that: time has not moved, and the tick's work
+        // runs at the time already reached. Taken as a reset, it re-anchored
+        // every deadline on every other tick and nothing was ever due again
+        // (21 parity puts in 600 s against 126 on one clock, executed).
+        let now = if self.now != 0 && now < self.now && self.now - now <= CLOCK_RESET_TICKS {
             self.now
         } else {
             now
@@ -2479,9 +2480,8 @@ impl<B: Blocks> Engine<B> {
             // sends, and every deadline is measured against it: one tick ten
             // years ahead froze every re-ask for good (0 in 600 ticks, executed)
             // and the stall timer and owed ages with it. A context lives 600 s
-            // (F32), so a tick further back than `CLOCK_SKEW_TICKS`, or more
-            // than that later, cannot be the same clock: every date is
-            // re-anchored to it. Nothing
+            // (F32), so a jump of more than that, either way, cannot be the
+            // same clock: every date is re-anchored to it. Nothing
             // becomes due early for it, and nothing waits on a clock that is
             // gone.
             if let Some(since) = self.in_flight_since.as_mut() {
@@ -3083,15 +3083,12 @@ struct Context {
     now: u64,
 }
 
-/// A tick more than this after the last one is a different clock, not the
-/// same one moving on: a delegate context lives 600 s (F32), so no engine
-/// sees a real gap longer than that. Ticks are seconds (`protocol::tick_of`).
+/// A tick more than this after the last one, or before it, is a different
+/// clock, not the same one moving on: a delegate context lives 600 s (F32),
+/// so no engine sees a real gap longer than that. A smaller step BACK is
+/// another tab's or device's clock, and is ignored. Ticks are seconds
+/// (`protocol::tick_of`).
 const CLOCK_RESET_TICKS: u64 = 600;
-
-/// How far BEHIND the last tick another tab's clock may be and still be the
-/// same clock: well above the second or two two machines' clocks disagree
-/// by, and far under `CLOCK_RESET_TICKS`.
-const CLOCK_SKEW_TICKS: u64 = 60;
 
 /// The version this build writes. Bumped when the shape changes.
 ///

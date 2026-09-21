@@ -85,12 +85,15 @@ impl Asks {
     /// just asked, and not counted again -- the failure is the answer to the
     /// attempt already counted, so a failing node is paced exactly like a
     /// silent one.
+    ///
+    /// Only an ask already MADE can fail, so this re-dates an existing entry
+    /// and never inserts one: it is the one writer that does not check
+    /// `max_asks`, and the table's bound must not rest on a path being
+    /// unreachable.
     pub fn failed(&mut self, ask: Ask, now: u64) {
-        let p = self.by.entry(ask).or_insert(Pace {
-            at: now,
-            attempts: 1,
-        });
-        p.at = now;
+        if let Some(p) = self.by.get_mut(&ask) {
+            p.at = now;
+        }
     }
 
     /// The node answered `ask`, or it stopped being owed.

@@ -415,28 +415,58 @@ fn the_first_re_ask_is_at_reask_after_and_the_second_at_twice_that() {
     );
 }
 
-/// TWO TABS, TWO CLOCKS, ONE ENGINE: ticks alternate between clocks 2 s
-/// apart, so every other tick is "earlier". Parity must still be re-asked on
-/// schedule -- a behind-by-a-little tick is the same clock, not a reset that
-/// re-anchors every deadline (which left nothing ever due).
-#[test]
-fn two_tabs_ticking_from_clocks_two_seconds_apart_keep_the_schedule() {
-    let p = Params::default();
-    let mut h = harness(p);
-    let (at, _) = first_ask(&mut h);
-    let mut again = None;
-    for k in at + 1..=at + 3 * p.reask_after {
-        for t in [T0 + k, T0 + k - 2] {
-            if again.is_none() && !parity(&h.step(Event::Tick(t))).is_empty() {
-                again = Some(k - at);
-            }
+/// Parity puts over 600 silent ticks, with a second clock `lag` behind the
+/// first ticking in between (two tabs, or two devices on one node).
+fn silent_puts(lag: Option<u64>) -> usize {
+    let mut h = harness(Params::default());
+    let (at, asked) = first_ask(&mut h);
+    let mut n = asked.len();
+    for k in at + 1..=600 {
+        n += parity(&h.step(Event::Tick(T0 + k))).len();
+        if let Some(lag) = lag {
+            n += parity(&h.step(Event::Tick(T0 + k - lag))).len();
         }
     }
-    assert_eq!(
-        again,
-        Some(p.reask_after),
-        "with two tabs' clocks 2 s apart, the re-ask came at {again:?} ticks, not reask_after"
-    );
+    n
+}
+
+/// TWO CLOCKS, ONE ENGINE: engine time is the most it has seen, so a second
+/// clock BEHIND the first -- by a second, or by two minutes -- changes
+/// nothing. Taken as a reset, a step back re-anchored every deadline on
+/// every other tick: 21 parity puts in 600 s, no re-ask ever (executed).
+#[test]
+fn a_second_clock_behind_the_first_changes_nothing() {
+    let one = silent_puts(None);
+    for lag in [1, 2, 120] {
+        assert_eq!(
+            silent_puts(Some(lag)),
+            one,
+            "with a second clock {lag} s behind, the parity puts differ from one clock's"
+        );
+    }
+    println!("  one clock: {one} parity puts in 600 silent ticks; 1, 2 and 120 s behind: the same");
+}
+
+/// ...and where a step back stops being the same clock: 2 behind is
+/// ignored, 601 behind (past a context's lifetime) re-anchors.
+#[test]
+fn a_tick_601_behind_re_anchors_and_2_behind_does_not() {
+    let p = Params::default();
+    // 2 behind: nothing moves; the re-ask comes on the original schedule.
+    let mut h = harness(p);
+    let (at, _) = first_ask(&mut h);
+    assert!(parity(&h.step(Event::Tick(T0 + at - 2))).is_empty());
+    let first = (at + 1..=at + p.reask_after)
+        .find(|k| !parity(&h.step(Event::Tick(T0 + k))).is_empty())
+        .map(|k| k - at);
+    assert_eq!(first, Some(p.reask_after), "2 behind moved the schedule");
+    // 601 behind: a different clock; everything is dated from it.
+    let mut h = harness(p);
+    let (at, _) = first_ask(&mut h);
+    let back = T0 + at - 601;
+    assert!(parity(&h.step(Event::Tick(back))).is_empty());
+    let first = (1..=p.reask_after).find(|k| !parity(&h.step(Event::Tick(back + k))).is_empty());
+    assert_eq!(first, Some(p.reask_after), "601 behind did not re-anchor");
 }
 
 /// THE FORWARD HALF OF A RESET, at the bad tick itself. One tick far ahead,
