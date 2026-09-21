@@ -414,3 +414,27 @@ fn the_first_re_ask_is_at_reask_after_and_the_second_at_twice_that() {
         "re-asks at these tick offsets from the first ask"
     );
 }
+
+/// TWO TABS, TWO CLOCKS, ONE ENGINE: ticks alternate between clocks 2 s
+/// apart, so every other tick is "earlier". Parity must still be re-asked on
+/// schedule -- a behind-by-a-little tick is the same clock, not a reset that
+/// re-anchors every deadline (which left nothing ever due).
+#[test]
+fn two_tabs_ticking_from_clocks_two_seconds_apart_keep_the_schedule() {
+    let p = Params::default();
+    let mut h = harness(p);
+    let (at, _) = first_ask(&mut h);
+    let mut again = None;
+    for k in at + 1..=at + 3 * p.reask_after {
+        for t in [T0 + k, T0 + k - 2] {
+            if again.is_none() && !parity(&h.step(Event::Tick(t))).is_empty() {
+                again = Some(k - at);
+            }
+        }
+    }
+    assert_eq!(
+        again,
+        Some(p.reask_after),
+        "with two tabs' clocks 2 s apart, the re-ask came at {again:?} ticks, not reask_after"
+    );
+}
