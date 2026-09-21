@@ -238,7 +238,16 @@ impl CachedStore {
         // id, so believing it would let one message clear or fail somebody
         // else's write. Counted rather than applied.
         if !self.copy.pending_ids().contains(&write_id) {
-            self.unknown_verdicts += 1;
+            // EXCEPT the one that is expected: the engine sends
+            // `ParityComplete` AFTER `Published` for every coded write, and by
+            // then this client has settled the write and let it go. Counting
+            // it made `unknown_verdicts` noise on every live write, hiding the
+            // verdicts that ARE strangers. One this client never issued (an id
+            // it has not minted) is still counted.
+            let expected = matches!(state, W::ParityComplete) && write_id < self.next_write_id;
+            if !expected {
+                self.unknown_verdicts += 1;
+            }
             return;
         }
         match state {
