@@ -96,6 +96,13 @@ pub struct Client {
     /// The client's clock, as a function, because this crate compiles to wasm
     /// and to a host binary and must not reach for one of its own.
     now_ms: Option<Box<dyn Fn() -> u64>>,
+    /// THIS page load, on every frame it sends (craftworks-sdk#146). Minted
+    /// at random when the client is made — a reload is a new session — and
+    /// carrying nothing of the person or of any key.
+    session: u64,
+    /// Write states for ANOTHER session's writes, delivered here because
+    /// every tab shares one delegate. Counted, never applied.
+    pub foreign_write_states: usize,
 }
 
 impl Default for Client {
@@ -116,6 +123,38 @@ impl Client {
             rec: None,
             unrecorded_calls: 0,
             unencodable: 0,
+            session: {
+                let mut b = [0u8; 8];
+                // A failed RNG leaves a zero, which `mint_session` still turns
+                // into a non-legacy session; uniqueness is then only as good
+                // as the RNG, which is the whole of what it ever was.
+                let _ = getrandom::getrandom(&mut b);
+                protocol::mint_session(u64::from_le_bytes(b))
+            },
+            foreign_write_states: 0,
+        }
+    }
+
+    /// This page load's session.
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
+    /// A write state that is about one of THIS session's writes, as
+    /// `(write_id, state)` — or `None` for any other reply, and for a state
+    /// naming another session, which is counted. The one place both stores
+    /// ask, so neither can apply a stranger's verdict (craftworks-sdk#146).
+    pub fn own_write_state(&mut self, r: &Reply) -> Option<(u64, protocol::WriteState)> {
+        match r {
+            Reply::WriteState { write_id, state } => Some((*write_id, *state)),
+            Reply::SessionWriteState { session, write_id, state } if *session == self.session => {
+                Some((*write_id, *state))
+            }
+            Reply::SessionWriteState { .. } => {
+                self.foreign_write_states += 1;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -187,7 +226,7 @@ impl Client {
     /// It is counted, and `CachedStore` refuses a write that will not fit
     /// before it ever gets here.
     pub fn send(&mut self, r: &Request) {
-        match protocol::encode_request(protocol::CURRENT, r) {
+        match protocol::encode_session_request(protocol::CURRENT, self.session, r) {
             Ok(bytes) => self.outbound.push(bytes),
             Err(_) => self.unencodable += 1,
         }

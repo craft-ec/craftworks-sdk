@@ -81,8 +81,9 @@ impl Page {
                 inbound.push(Inbound::Client(frame));
             }
             for reply in self.conn.step(inbound) {
-                if let Ok(protocol::Reply::WriteState { write_id, state }) =
-                    protocol::decode_reply(&reply)
+                if let Some((write_id, state)) = protocol::decode_reply(&reply)
+                    .ok()
+                    .and_then(|r| self.store.client.own_write_state(&r))
                 {
                     if state == protocol::WriteState::Accepted {
                         self.accepted.push(write_id);

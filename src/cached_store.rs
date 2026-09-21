@@ -138,8 +138,10 @@ impl CachedStore {
     /// and 44 were refused. For every state a thing can enter, there has to
     /// be named code that takes it out.
     pub fn on_inbound(&mut self, bytes: &[u8]) {
-        if let Ok(protocol::Reply::WriteState { write_id, state }) = protocol::decode_reply(bytes) {
-            self.on_write_state(write_id, state);
+        if let Ok(r) = protocol::decode_reply(bytes) {
+            if let Some((write_id, state)) = self.client.own_write_state(&r) {
+                self.on_write_state(write_id, state);
+            }
         }
         self.client.on_inbound(bytes);
     }

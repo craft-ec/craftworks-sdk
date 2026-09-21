@@ -14,6 +14,7 @@ fn an_unknown_version_is_answered_unsupported_and_a_known_one_is_not() {
         decode_request(&good),
         Incoming::Ok(Envelope {
             version: CURRENT,
+            session: protocol::LEGACY_SESSION,
             body: Request::Flush
         }),
         "a message at the current version was not understood, so nothing \
@@ -154,4 +155,45 @@ fn nothing_malformed_panics_and_every_case_is_refused() {
          is not reading the structure"
     );
     println!("  {tried} malformed inputs, {refused} refused, 0 panics");
+}
+
+/// v4 carries the SESSION on every request, and it round-trips (sdk#146).
+#[test]
+fn a_v4_request_carries_its_session() {
+    let s = protocol::mint_session(0xdead_beef_cafe_f00d);
+    let b = protocol::encode_session_request(4, s, &Request::Flush).expect("encodes");
+    match decode_request(&b) {
+        Incoming::Ok(e) => assert_eq!((e.version, e.session, e.body), (4, s, Request::Flush)),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// THE CONTROL, and the promise to old pages: a v3 request is encoded
+/// EXACTLY as before — no session on the wire — and decodes as the legacy
+/// session.
+#[test]
+fn a_v3_request_is_the_old_bytes_and_decodes_as_the_legacy_session() {
+    let b = protocol::encode_session_request(3, 12345, &Request::Flush).expect("encodes");
+    // The pre-v4 envelope: version (u16 LE) then the body — nothing between.
+    let old_shape = protocol::encode_session_request(3, protocol::LEGACY_SESSION, &Request::Flush).unwrap();
+    assert_eq!(b, old_shape, "a session leaked onto a v3 frame");
+    assert_eq!(protocol::request_len(3, &Request::Flush) as usize, b.len());
+    match decode_request(&b) {
+        Incoming::Ok(e) => assert_eq!((e.version, e.session), (3, protocol::LEGACY_SESSION)),
+        other => panic!("{other:?}"),
+    }
+    let v4 = protocol::encode_session_request(4, 12345, &Request::Flush).unwrap();
+    assert_eq!(v4.len(), b.len() + 8, "v4 is the v3 frame plus eight bytes of session");
+    assert_eq!(protocol::request_len(4, &Request::Flush) as usize, v4.len());
+}
+
+/// A minted session is never the legacy one, and never wider than 48 bits.
+#[test]
+fn a_minted_session_is_48_bits_and_never_legacy() {
+    for r in [0u64, 1, u64::MAX, 1 << 48, (1 << 48) + 1] {
+        let s = protocol::mint_session(r);
+        assert_ne!(s, protocol::LEGACY_SESSION, "{r}");
+        assert_ne!(s, 0);
+        assert!(s < (1 << protocol::SESSION_BITS), "{r} -> {s}");
+    }
 }

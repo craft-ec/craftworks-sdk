@@ -281,7 +281,7 @@ impl<T: Transport> EngineStore<T> {
             let replies = self.ask(&req);
             let mut answered = false;
             for r in replies {
-                if let Reply::WriteState { write_id, state } = r {
+                if let Some((write_id, state)) = self.client.own_write_state(&r) {
                     if write_id != id {
                         continue;
                     }

@@ -319,7 +319,7 @@ impl Conn {
             {
                 use protocol::{Reply as R, WriteState as W};
                 let key = match r {
-                    R::WriteState { write_id, state }
+                    R::WriteState { write_id, state } | R::SessionWriteState { write_id, state, .. }
                         if state.terminal() || matches!(state, W::Published) =>
                     {
                         Some(format!("w{write_id}"))
@@ -452,6 +452,12 @@ impl Conn {
 
     /// Send a client request and run it to a standstill.
     pub fn client(&mut self, r: &protocol::Request) -> Vec<Vec<u8>> {
+        self.client_as(protocol::LEGACY_SESSION, protocol::CURRENT, r)
+    }
+
+    /// A request from a given SESSION speaking a given VERSION — one of
+    /// several tabs sharing this delegate (craftworks-sdk#146).
+    pub fn client_as(&mut self, session: u64, version: u16, r: &protocol::Request) -> Vec<Vec<u8>> {
         {
             use protocol::Request as Q;
             let key = match r {
@@ -465,7 +471,7 @@ impl Conn {
                 self.0.borrow_mut().asked.insert(k, false);
             }
         }
-        let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
+        let frame = protocol::encode_session_request(version, session, r).expect("encodes");
         self.step(vec![Inbound::Client(frame)])
     }
 

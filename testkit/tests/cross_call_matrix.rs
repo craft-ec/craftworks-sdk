@@ -47,6 +47,11 @@ struct Mode {
     cold: bool,
     evicting: bool,
     real_ticks: bool,
+    /// TWO LIVE SESSIONS (sdk#146): the workload's writer is one v4 session,
+    /// and after each of its calls a second session — speaking v2, a tab
+    /// that has not reloaded since an upgrade — sends a tick of its own
+    /// through the same delegate.
+    two_sessions: bool,
 }
 
 impl Mode {
@@ -66,6 +71,9 @@ impl Mode {
         if self.real_ticks {
             p.push("real-ticks")
         }
+        if self.two_sessions {
+            p.push("two-sessions")
+        }
         p.join("+")
     }
 }
@@ -75,6 +83,7 @@ const BATCH: Mode = Mode {
     cold: false,
     evicting: false,
     real_ticks: false,
+    two_sessions: false,
 };
 const APC: Mode = Mode {
     one_per_call: true,
@@ -94,6 +103,9 @@ fn states_of(replies: &[Vec<u8>], id: u64) -> Vec<WriteState> {
         .filter_map(|b| protocol::decode_reply(b).ok())
         .filter_map(|r| match r {
             Reply::WriteState { write_id, state } if write_id == id => Some(state),
+            // In a two-session cell only the WRITER has writes, so its states
+            // are these; the bystander must never be told one (see `Tabs`).
+            Reply::SessionWriteState { write_id, state, .. } if write_id == id => Some(state),
             _ => None,
         })
         .collect()
@@ -152,6 +164,46 @@ fn node_for(mode: Mode) -> FullNode {
     }
 }
 
+/// The two sessions of a `two_sessions` cell (sdk#146).
+const WRITER: u64 = 0x0000_1111_2222_3333;
+const BYSTANDER: u64 = 0x0000_4444_5555_6666;
+
+/// The workload's request — and in a two-session cell, the WRITER's, followed
+/// by a tick from a v2 BYSTANDER through the same delegate.
+fn send(c: &mut Conn, mode: Mode, r: &Request) -> Vec<Vec<u8>> {
+    if !mode.two_sessions {
+        return c.client(r);
+    }
+    let mut out = c.client_as(WRITER, protocol::CURRENT, r);
+    out.extend(c.client_as(
+        BYSTANDER,
+        2,
+        &Request::Tick { now: protocol::tick_of(1_790_000_000_000) },
+    ));
+    out
+}
+
+/// In a two-session cell, every write state must be the WRITER's and say so:
+/// one unnamed, or naming the bystander, is a state a tab could apply to its
+/// own write of the same id.
+fn misaddressed(mode: Mode, replies: &[Vec<u8>]) -> Option<String> {
+    if !mode.two_sessions {
+        return None;
+    }
+    let bad: Vec<String> = replies
+        .iter()
+        .filter_map(|b| protocol::decode_reply(b).ok())
+        .filter_map(|r| match r {
+            Reply::WriteState { write_id, state } => Some(format!("unnamed w{write_id}:{state:?}")),
+            Reply::SessionWriteState { session, write_id, state } if session != WRITER => {
+                Some(format!("session {session:#x} w{write_id}:{state:?}"))
+            }
+            _ => None,
+        })
+        .collect();
+    (!bad.is_empty()).then(|| format!("write states not addressed to the writer: {bad:?}"))
+}
+
 /// The assertions every cell makes: on every call it ran, and then that the
 /// engine is still open.
 fn every_call(c: &mut Conn) -> Option<String> {
@@ -196,7 +248,7 @@ fn w1_multi_block_commit(mode: Mode) -> Cell {
             Op::Put(b"k/small".to_vec(), b"small".to_vec()),
         ],
     };
-    let mut replies = c.client(&w);
+    let mut replies = send(&mut c, mode, &w);
     // Real ticks: time keeps passing while the commit is in flight.
     if mode.real_ticks {
         let base = 1_790_000_000_000u64;
@@ -207,6 +259,9 @@ fn w1_multi_block_commit(mode: Mode) -> Cell {
     let st = states_of(&replies, 1);
     if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; told {st:?}"));
+    }
+    if let Some(why) = misaddressed(mode, &replies) {
+        return Cell::Red(why);
     }
     if !st.contains(&WriteState::Published) {
         return Cell::Red(format!("never published: told {st:?}"));
@@ -326,14 +381,11 @@ fn w3_parked_then_refused(mode: Mode) -> Cell {
         .collect();
     // Re-sent on Busy, the way the outbox does, a bounded number of times.
     let mut st = Vec::new();
+    let mut all = Vec::new();
     for _ in 0..6 {
-        let got = states_of(
-            &c.client(&Request::Write {
-                write_id: 1,
-                ops: ops.clone(),
-            }),
-            1,
-        );
+        let replies = send(&mut c, mode, &Request::Write { write_id: 1, ops: ops.clone() });
+        let got = states_of(&replies, 1);
+        all.extend(replies);
         let busy = got.last() == Some(&WriteState::Busy);
         st.extend(got);
         if !busy {
@@ -349,10 +401,14 @@ fn w3_parked_then_refused(mode: Mode) -> Cell {
     if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; told {st:?}"));
     }
+    if let Some(why) = misaddressed(mode, &all) {
+        return Cell::Red(why);
+    }
     match st.last() {
         Some(WriteState::TooLarge { .. }) => Cell::Green,
         other => Cell::Red(format!(
-            "a v3 client was told {other:?} after the park, not TooLarge (all: {st:?})"
+            "a v{} client was told {other:?} after the park, not TooLarge (all: {st:?})",
+            protocol::CURRENT
         )),
     }
 }
@@ -499,15 +555,19 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
         "one-per-call+cold+evicting",
         "eviction ping-pong (cycle)",
     ),
-    // The parked write's fetches strand FIRST (the read overflow), so the
-    // `client_version`-after-a-park defect behind it cannot show yet -- and
-    // it stays red past the overflow until sdk#146, which carries the
-    // client's version WITH THE WRITE (one version per shell is overwritten
-    // by whichever client spoke last: executed on #157's review).
+    // The parked write's fetches strand (the read overflow). The verdict's
+    // VERSION is no longer a reason: sdk#146 carries it with the write, and
+    // engine-delegate's `a_write_refused_after_a_park_is_told_in_its_clients_
+    // version_whoever_else_speaks` proves it with the GET limit lifted.
     (
         "W3 parked write refused, told why",
         "one-per-call+cold",
-        "parked write's fetches stranded; the verdict's version waits on sdk#146",
+        "parked write's fetches stranded (the read overflow)",
+    ),
+    (
+        "W3 parked write refused, told why",
+        "one-per-call+cold+two-sessions",
+        "parked write's fetches stranded (the read overflow)",
     ),
     // Every write here is multi-block, so the head strand stops the workload
     // before the parity flush it exists for.
@@ -532,6 +592,10 @@ fn every_workload_under_every_mode() {
                     ..APC
                 },
                 Mode { cold: true, ..APC },
+                Mode {
+                    two_sessions: true,
+                    ..APC
+                },
             ],
         ),
         (
@@ -553,7 +617,14 @@ fn every_workload_under_every_mode() {
         (
             "W3 parked write refused, told why",
             w3_parked_then_refused,
-            vec![Mode { cold: true, ..APC }],
+            vec![
+                Mode { cold: true, ..APC },
+                Mode {
+                    cold: true,
+                    two_sessions: true,
+                    ..APC
+                },
+            ],
         ),
         (
             "W4 commit in flight across a real tick",

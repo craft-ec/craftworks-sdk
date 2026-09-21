@@ -74,7 +74,8 @@ fn every_older_reply_still_decodes_to_itself() {
 fn a_v1_request_is_still_understood_after_the_bump() {
     assert!(protocol::KNOWN.contains(&1), "v1 must remain served");
     assert!(protocol::KNOWN.contains(&2), "v2 must remain served");
-    assert_eq!(protocol::CURRENT, 3);
+    assert!(protocol::KNOWN.contains(&3), "v3 must remain served");
+    assert_eq!(protocol::CURRENT, 4);
 
     let v1 = encode_request(1, &Request::Flush).expect("encodes");
     match decode_request(&v1) {

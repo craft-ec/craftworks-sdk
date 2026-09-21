@@ -62,9 +62,10 @@ impl Page {
             inbound.push(Inbound::Client(frame));
         }
         for reply in self.conn.step(inbound) {
-            if let Ok(protocol::Reply::WriteState { write_id, state }) =
-                protocol::decode_reply(&reply)
-            {
+            if let Some((write_id, state)) = protocol::decode_reply(&reply)
+                    .ok()
+                    .and_then(|r| self.store.client.own_write_state(&r))
+                {
                 self.verdicts.entry(write_id).or_default().push(state);
             }
             self.store.on_inbound(&reply);
@@ -214,8 +215,10 @@ fn a_pair_queued_behind_a_write_in_flight() -> Page {
     let inbound: Vec<Inbound> = frames.into_iter().map(Inbound::Client).collect();
     let mut accepted_first = false;
     for reply in p.conn.step(inbound) {
-        if let Ok(protocol::Reply::WriteState { write_id, state }) = protocol::decode_reply(&reply)
-        {
+        if let Some((write_id, state)) = protocol::decode_reply(&reply)
+                    .ok()
+                    .and_then(|r| p.store.client.own_write_state(&r))
+                {
             p.verdicts.entry(write_id).or_default().push(state);
             // Hold back the first write's PUBLISH, so it stays awaiting.
             if write_id == first
