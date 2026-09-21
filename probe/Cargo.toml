@@ -24,3 +24,5 @@ protocol = { path = "../protocol" }
 wire = { path = "../wire" }
 engine = { path = "../engine" }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
+# live-cold-read derives a throwaway X25519 transport key for a second private node.
+curve25519-dalek = "4"

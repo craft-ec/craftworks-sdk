@@ -331,30 +331,52 @@ fn w2_cold_wide_read(mode: Mode) -> Cell {
     let node = node_for(mode);
     let mut c = connect(&node, mode);
     c.client(&Request::Identity);
-    let r = c.client(&Request::Range {
-        req_id: 1,
-        lo: Bound::Unbounded,
-        hi: Bound::Unbounded,
-        reverse: false,
-        after: None,
-        max_entries: 300,
-    });
-    let pages: Vec<usize> = r
-        .iter()
-        .filter_map(|b| protocol::decode_reply(b).ok())
-        .filter_map(|x| match x {
-            Reply::Page {
-                req_id: 1, entries, ..
-            } => Some(entries.len()),
-            _ => None,
-        })
-        .collect();
+    // 300 is over one page (`MAX_PAGE_ENTRIES` 256), so the reader follows
+    // the cursor, as a client does: the claim is 300 of 300, not one page.
+    let mut after: Option<Vec<u8>> = None;
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    let mut pages: Vec<usize> = Vec::new();
+    for req_id in 1..=4u64 {
+        let r = c.client(&Request::Range {
+            req_id,
+            lo: Bound::Unbounded,
+            hi: Bound::Unbounded,
+            reverse: false,
+            after: after.clone(),
+            max_entries: 300 - rows.len() as u32,
+        });
+        let page = r
+            .iter()
+            .filter_map(|b| protocol::decode_reply(b).ok())
+            .find_map(|x| match x {
+                Reply::Page {
+                    req_id: id,
+                    entries,
+                    cursor,
+                    ..
+                } if id == req_id => Some((entries, cursor)),
+                _ => None,
+            });
+        let Some((entries, cursor)) = page else { break };
+        pages.push(entries.len());
+        rows.extend(entries.into_iter().map(|(k, _)| k));
+        if cursor.is_none() || rows.len() >= 300 {
+            break;
+        }
+        after = cursor;
+    }
     if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; pages {pages:?}"));
     }
-    match pages.last() {
-        Some(300) => Cell::Green,
-        other => Cell::Red(format!("the cold read returned {other:?} of 300 entries")),
+    let distinct: std::collections::BTreeSet<&Vec<u8>> = rows.iter().collect();
+    if rows.len() == 300 && distinct.len() == 300 {
+        Cell::Green
+    } else {
+        Cell::Red(format!(
+            "the cold read returned {} rows ({} distinct) of 300 in pages {pages:?}",
+            rows.len(),
+            distinct.len()
+        ))
     }
 }
 
@@ -535,19 +557,9 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
         "one-per-call+real-ticks",
         "parity for the in-flight commit gated on the STALE published root (seq 0), which the shell never seeds: stranded",
     ),
-    // THE READ OVERFLOW: the engine asks for more fetches than one return
-    // carries (max_gets 4); the rest wait "for the next entry", which the
-    // per-call scheduler never reaches, and the read is never answered.
-    (
-        "W2 cold read wider than one return",
-        "batch+cold",
-        "read fetches over max_gets stranded",
-    ),
-    (
-        "W2 cold read wider than one return",
-        "one-per-call+cold",
-        "read fetches over max_gets stranded",
-    ),
+    // THE READ OVERFLOW is fixed: the engine never asks for more fetches in
+    // a round than one return carries (`max_fetch_per_round` <= `max_gets`,
+    // refused at the shell's construction). W2's two cold cells are green.
     // THE EVICTION PING-PONG: `arrived` lasts one call and the node keeps
     // nothing it served, so a read needing two such blocks never finishes.
     (
@@ -555,19 +567,20 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
         "one-per-call+cold+evicting",
         "eviction ping-pong (cycle)",
     ),
-    // The parked write's fetches strand (the read overflow). The verdict's
+    // The parked write's fetches strand: `park_write` asks for its whole
+    // path, which `max_fetch_per_round` does not bound (the limits PR). The verdict's
     // VERSION is no longer a reason: sdk#146 carries it with the write, and
     // engine-delegate's `a_write_refused_after_a_park_is_told_in_its_clients_
     // version_whoever_else_speaks` proves it with the GET limit lifted.
     (
         "W3 parked write refused, told why",
         "one-per-call+cold",
-        "parked write's fetches stranded (the read overflow)",
+        "parked write's fetches stranded: park_write asks for its whole path, which max_fetch_per_round does not bound -- sdk#150's LIMITS PR owns it",
     ),
     (
         "W3 parked write refused, told why",
         "one-per-call+cold+two-sessions",
-        "parked write's fetches stranded (the read overflow)",
+        "parked write's fetches stranded: park_write asks for its whole path, which max_fetch_per_round does not bound -- sdk#150's LIMITS PR owns it",
     ),
     // Every write here is multi-block, so the head strand stops the workload
     // before the parity flush it exists for.

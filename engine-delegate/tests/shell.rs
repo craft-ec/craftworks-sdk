@@ -1077,3 +1077,41 @@ fn a_write_refused_after_a_park_is_told_in_its_clients_version_whoever_else_spea
         }
     }
 }
+
+/// The engine may not ask for more in one round than one return carries: the
+/// rest would be dropped at the end of the call and never asked for again.
+/// Live on two private nodes (sdk#150's L3), the engine asked for 8, a return
+/// carried 4, and no cold read ever answered. The pairing is refused.
+#[test]
+#[should_panic(expected = "is over what one return carries")]
+fn a_fetch_round_larger_than_a_return_is_refused_at_construction() {
+    let params = Params {
+        max_fetch_per_round: engine_delegate::schedule::Limits::default().max_gets + 1,
+        ..Params::default()
+    };
+    let _: Shell<Store> =
+        Shell::resume_with(&[], params, Store::default(), StoreFacts::provisioned());
+}
+
+/// ...and where `limits` is changed after construction, where it is used.
+#[test]
+#[should_panic(expected = "is over what one return carries")]
+fn a_return_narrowed_below_the_fetch_round_is_refused_where_it_is_used() {
+    let mut s: Shell<Store> = Shell::resume_with(
+        &[],
+        Params::default(),
+        Store::default(),
+        StoreFacts::provisioned(),
+    );
+    s.limits.max_gets = Params::default().max_fetch_per_round - 1;
+    let _ = s.handle(Vec::new());
+}
+
+#[test]
+fn control_the_default_pairing_is_accepted() {
+    let p = Params::default();
+    assert!(p.max_fetch_per_round <= engine_delegate::schedule::Limits::default().max_gets);
+    let mut s: Shell<Store> =
+        Shell::resume_with(&[], p, Store::default(), StoreFacts::provisioned());
+    let _ = s.handle(Vec::new());
+}
