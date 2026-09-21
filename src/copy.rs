@@ -49,9 +49,14 @@ pub struct PendingWrite {
     pub value: Option<Vec<u8>>,
     /// Queued but not yet submitted (the engine answered `Busy`).
     pub queued: bool,
-    /// When this write was made, on the client's clock. What the timeout
-    /// measures against.
+    /// When this write was SENT, on the client's clock — when it was made,
+    /// unless the outbox's window held it (then restamped by
+    /// [`Copy::sent`]). What the timeout measures against.
     pub at_ms: u64,
+    /// Made, and held by the outbox's window: the node has never seen it
+    /// (craftworks-sdk#176). Never timed out — the timeout is for "no verdict
+    /// ever came", and nothing was asked yet.
+    pub held: bool,
     /// **Reserved, unused in phase 3.** The base version this write was
     /// computed against, for the phase-8 fix that lets a verdict invalidate
     /// only the writes that actually depended on the failed one. Present now
@@ -491,6 +496,7 @@ impl Copy {
                 value,
                 queued: false,
                 at_ms,
+                held: false,
                 declared_base: None,
             });
         self.pending_count += 1;
@@ -533,6 +539,32 @@ impl Copy {
             for w in &mut e.pending {
                 if w.write_id == write_id {
                     w.queued = true;
+                }
+            }
+        }
+    }
+
+    /// The outbox's window is full: this write is held, not sent.
+    pub fn hold(&mut self, write_id: u64) {
+        for e in self.keys.values_mut() {
+            for w in &mut e.pending {
+                if w.write_id == write_id {
+                    w.held = true;
+                }
+            }
+        }
+    }
+
+    /// A held write went out now: its timeout starts HERE. Measured from
+    /// the `put`, a 300-row publish rolled back every row the window was
+    /// still holding at 60 s as `Unknown` — a failure reported about writes
+    /// the node had never been asked to make (craftworks-sdk#176).
+    pub fn sent(&mut self, write_id: u64, now_ms: u64) {
+        for e in self.keys.values_mut() {
+            for w in &mut e.pending {
+                if w.write_id == write_id {
+                    w.held = false;
+                    w.at_ms = now_ms;
                 }
             }
         }
@@ -643,7 +675,7 @@ impl Copy {
             .keys
             .values()
             .flat_map(|e| e.pending.iter())
-            .filter(|w| now_ms.saturating_sub(w.at_ms) >= timeout)
+            .filter(|w| !w.held && now_ms.saturating_sub(w.at_ms) >= timeout)
             .map(|w| (w.write_id, RolledBack::Unknown))
             .collect();
         self.fall(seeds)

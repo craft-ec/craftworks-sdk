@@ -20,6 +20,28 @@ use crate::engine_client::Client;
 use crate::store::{Delta, Edit, IdWidth, Read, Reads, RowState, Store, StoreError};
 use protocol::Request;
 
+/// Writes this session may have AT THE NODE, sent and not yet answered, at
+/// once (craftworks-sdk#176).
+///
+/// Named for what it bounds: requests outstanding at the node — not bytes,
+/// not writes queued here. The node's fair queue holds 100 requests per key,
+/// and every delegate request on a node shares ONE key: 100 waiting + 1 in
+/// service. A 100-row publish sent its 102 writes back-to-back, the 102nd was
+/// refused with no verdict, and the publish failed every time (the
+/// architect's L4 probe, 4 of 4). `Busy` was meant to pace the outbox and a
+/// real node never sends it — it runs one delegate round-trip at a time, so a
+/// pipelined write waits in the NODE's queue and meets an idle engine.
+///
+/// MEASURED, a 100-row publish (102 writes of 5 KiB) on a live node, the time
+/// until the last is published, three runs each, interleaved:
+/// window 16 — 28.1 / 29.0 / 27.0 s; 32 — 29.9 / 25.9 / 25.7 s;
+/// 64 — 24.2 / 23.9 / 24.2 s. Every run: all published, nothing refused.
+/// 32 is not reliably faster than 16. 64 is ~4 s faster, and two sessions
+/// bursting at 64 would overfill the shared 100 between them; 16 lets six.
+/// The pace is the node's — about 3.4 commits a second, one write each — and
+/// a wider window does not change it; only fewer commits per row would.
+pub const WRITES_IN_FLIGHT: usize = 16;
+
 /// Reads from the copy; writes to the pump and, optimistically, to the copy.
 pub struct CachedStore {
     pub copy: Copy,
@@ -38,6 +60,14 @@ pub struct CachedStore {
     rolled_back: std::collections::BTreeSet<Vec<u8>>,
     /// Verdicts for writes this client never issued.
     unknown_verdicts: usize,
+    /// Writes SENT and not yet answered with any verdict: what is at the node
+    /// (sdk#176). Never more than [`WRITES_IN_FLIGHT`].
+    unanswered: std::collections::BTreeSet<u64>,
+    /// Writes made while the window was full, oldest first: in the copy
+    /// already, sent as the window opens.
+    held: std::collections::VecDeque<(u64, Request)>,
+    /// The most writes ever outstanding at once — what a test asserts.
+    pub in_flight_high_water: usize,
     /// The clock, handed in for the same reason the traces' is: this crate
     /// compiles to wasm and to a host binary and must not reach for one.
     now_ms: Box<dyn Fn() -> u64>,
@@ -52,8 +82,45 @@ impl CachedStore {
             refused: Vec::new(),
             rolled_back: std::collections::BTreeSet::new(),
             unknown_verdicts: 0,
+            unanswered: std::collections::BTreeSet::new(),
+            held: std::collections::VecDeque::new(),
+            in_flight_high_water: 0,
             now_ms,
         }
+    }
+
+    /// Send a write if the window has room, else hold it — in order.
+    fn dispatch(&mut self, write_id: u64, request: Request) {
+        if self.unanswered.len() >= WRITES_IN_FLIGHT || !self.held.is_empty() {
+            // Behind anything already held: writes go out in the order made.
+            self.copy.hold(write_id);
+            self.held.push_back((write_id, request));
+            return;
+        }
+        self.client.send(&request);
+        self.unanswered.insert(write_id);
+        self.in_flight_high_water = self.in_flight_high_water.max(self.unanswered.len());
+    }
+
+    /// The window opened: send what is held, oldest first, while it has room.
+    fn fill_window(&mut self) {
+        while self.unanswered.len() < WRITES_IN_FLIGHT {
+            let Some((write_id, request)) = self.held.pop_front() else { break };
+            // A held write the copy has since given up on (timed out) is not
+            // sent: its verdict would be for a write nobody is waiting on.
+            if !self.copy.pending_ids().contains(&write_id) {
+                continue;
+            }
+            self.copy.sent(write_id, (self.now_ms)());
+            self.client.send(&request);
+            self.unanswered.insert(write_id);
+            self.in_flight_high_water = self.in_flight_high_water.max(self.unanswered.len());
+        }
+    }
+
+    /// Writes held because the window is full.
+    pub fn held_count(&self) -> usize {
+        self.held.len()
     }
 
     /// Queue the request that loads `[lo, hi)`. The host pumps; the answer
@@ -153,6 +220,11 @@ impl CachedStore {
     /// failure this function exists to fix.
     fn on_write_state(&mut self, write_id: u64, state: protocol::WriteState) {
         use protocol::WriteState as W;
+        // ANY verdict answers the request: it is no longer waiting at the
+        // node, so the window has room for the next (sdk#176).
+        if self.unanswered.remove(&write_id) {
+            self.fill_window();
+        }
         // A verdict for a write this client never issued. The node chose the
         // id, so believing it would let one message clear or fail somebody
         // else's write. Counted rather than applied.
@@ -244,7 +316,7 @@ impl CachedStore {
         // The SAME write_id. A new one would make the engine's verdict about
         // a write this copy no longer knows, and the row would never clear.
         self.copy.submitted(write_id);
-        self.client.send(&Request::Write {
+        let request = Request::Write {
             write_id,
             ops: edits
                 .into_iter()
@@ -253,7 +325,8 @@ impl CachedStore {
                     None => protocol::Op::Delete(k),
                 })
                 .collect(),
-        });
+        };
+        self.dispatch(write_id, request);
     }
 
     /// How many writes are waiting for the engine to have room.
@@ -334,7 +407,7 @@ impl CachedStore {
                 return;
             }
         }
-        self.client.send(&request);
+        self.dispatch(write_id, request);
     }
 
     /// The write id the next write will carry, so a caller can watch for it.

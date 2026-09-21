@@ -23,6 +23,9 @@ protocol = { path = "../protocol" }
 # the whole reason the framing lives in a crate instead of in JavaScript.
 wire = { path = "../wire" }
 engine = { path = "../engine" }
+# live-handoff drives the SDK's own `CachedStore`, so the run measures the
+# outbox's pacing (sdk#176), not a hand-written send loop.
+craftworks-sdk = { path = ".." }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 # live-cold-read derives a throwaway X25519 transport key for a second private node.
 curve25519-dalek = "4"
