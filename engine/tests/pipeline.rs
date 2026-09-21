@@ -968,6 +968,49 @@ fn impossible_params_are_refused_where_they_are_set() {
     let _ = Engine::new(ok, Store::default());
 }
 
+/// The limit that bites a packed member is its KIND's, not the pack's.
+///
+/// The check above bounded `max_packed_value` against `max_pack` — the
+/// container — and packed members are `RAW`, whose ceiling is 262,208. So
+/// every setting from 262,209 up to `max_pack - 11` satisfied it: with a
+/// 1 MiB pack that is a **786,357-wide band** the engine accepted and that
+/// builds packs the contract refuses PER MEMBER.
+///
+/// That band is worse than a panic. The refusal happens at the NODE, remotely,
+/// where nothing local says why (F48) — the diagnosable local failure existed
+/// and was unreachable, so what survived was the least diagnosable one.
+///
+/// Driven at the boundary rather than deep in the band: an off-by-one here
+/// either refuses a setting the network accepts or admits one it does not, and
+/// a value picked from the middle cannot tell those apart.
+#[test]
+fn a_packed_value_over_its_kinds_limit_is_refused_where_it_is_set() {
+    let raw_limit = engine::pack::max_body(freenet_prolly::kind::RAW);
+    assert_eq!(raw_limit, 262_208, "the contract's RAW ceiling");
+
+    // Inside the old band: it fits a 1 MiB pack, so the pack-size check passes
+    // and ONLY the per-member one can catch it.
+    let bad = Params {
+        max_pack: 1024 * 1024,
+        max_packed_value: raw_limit + 1,
+        ..Params::default()
+    };
+    assert!(
+        std::panic::catch_unwind(move || Engine::new(bad, Store::default())).is_err(),
+        "max_packed_value {} fits the pack but not a RAW member, and was accepted",
+        raw_limit + 1,
+    );
+
+    // And exactly at the limit is accepted, so this is the relationship and
+    // not a blanket refusal of large values.
+    let ok = Params {
+        max_pack: 1024 * 1024,
+        max_packed_value: raw_limit,
+        ..Params::default()
+    };
+    let _ = Engine::new(ok, Store::default());
+}
+
 /// A write whose group is re-coded before its parity goes out waits for the
 /// NEW coding, not for the one that was abandoned.
 ///

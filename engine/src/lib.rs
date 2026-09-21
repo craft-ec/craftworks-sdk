@@ -868,11 +868,29 @@ pub struct Engine<B: Blocks> {
 
 impl<B: Blocks> Engine<B> {
     /// Anything a caller can set must not be able to panic the core later.
-    /// `max_packed_value` above `max_pack` describes a value that must ride in
-    /// a pack and cannot fit in one; the planner would reach an `unreachable!`
-    /// three steps away, where nothing points back at the setting that caused
-    /// it. Refused here instead, naming both numbers.
+    /// `max_packed_value` above the limit describes a value that must ride in
+    /// a pack and cannot; the planner would reach an `unreachable!` three steps
+    /// away, where nothing points back at the setting that caused it. Refused
+    /// here instead, naming both numbers.
+    ///
+    /// **The limit is the PER-MEMBER one, not the pack's.** This bounded
+    /// `max_packed_value` against `max_pack` — the container — and packed
+    /// members are `RAW`, so every setting in [262,209, 1,048,565] passed here
+    /// and produced packs the contract refuses per member: a 786,357-wide band
+    /// the engine accepted and the network would not. That is worse than a
+    /// panic, because the refusal happens REMOTELY, where a node can log
+    /// nothing at the moment it refuses (F48). Both numbers are needed: a
+    /// member must fit its kind's limit AND the pack must be able to hold one
+    /// (craftworks-sdk#117).
     pub fn new(params: Params, blocks: B) -> Self {
+        assert!(
+            params.max_packed_value <= pack::max_body(freenet_prolly::kind::RAW),
+            "max_packed_value ({}) is above what the network accepts for one \
+             member of its kind ({}): the pack would be built here and refused \
+             THERE, per member, where nothing local says why",
+            params.max_packed_value,
+            pack::max_body(freenet_prolly::kind::RAW)
+        );
         assert!(
             params.max_packed_value + pack::member_cost(0) + pack::PACK_HEADER <= params.max_pack,
             "max_packed_value ({}) cannot fit in a pack of max_pack ({}): a value \
@@ -1981,7 +1999,6 @@ impl<B: Blocks> Engine<B> {
             prev_root: self.published_root,
             seq,
             root: self.root,
-            owed: self.owed.keys().copied().collect(),
         }
         .encode();
 
