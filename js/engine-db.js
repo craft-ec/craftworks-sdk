@@ -311,8 +311,12 @@ export function engineDb(handle) {
      * reloaded. Both have the same snapshot and the same subscribe, so
      * flipping it never changes the component.
      */
-    bind(domain, { live = false, limit = 0, reverse = false } = {}) {
+    bind(domain, { parent = null, live = false, limit = 0, reverse = false } = {}) {
       let rows = [], root = null;
+      // WHAT THIS BINDING WATCHES: the domain, or one parent's band of it
+      // (sdk#137). Named by the session — the layout is Rust's — so a live
+      // band is told of changes in its band, and not of one under a sibling.
+      const key = parent ? session.watch_key(domain, parent) : domain;
       // WHAT THIS BINDING LAST MANAGED TO DO.
       //
       // A component holds a binding and reads `getSnapshot()`. Until now that
@@ -376,6 +380,8 @@ export function engineDb(handle) {
          * to whoever reverses an array afterwards.
          */
         get reverse() { return reverse; },
+        /** Whose children this reads, or `null` for the whole domain. */
+        get parent() { return parent; },
         /**
          * `{ state, why, code }` — `loading`, `ready` or `unreachable`.
          *
@@ -418,12 +424,14 @@ export function engineDb(handle) {
          * because those are visible before any engine has confirmed them.
          */
         async reload() {
-          session.refresh_domain(domain);
+          session.refresh_domain(key);
           let next;
           try {
             // THE PAGE, not the domain. `limit: 0` is unbounded and is what
-            // the scan has always done.
-            next = await self.scan(domain, { limit, reverse });
+            // the scan has always done. With a parent, the PAGE OF ITS BAND.
+            next = parent
+              ? await self.children(domain, parent, { limit, reverse })
+              : await self.scan(domain, { limit, reverse });
           } catch (e) {
             // UNREACHABLE IS AN ANSWER, not an exception to swallow.
             //
@@ -483,7 +491,7 @@ export function engineDb(handle) {
       // A LIVE binding is additionally re-run when the session says this
       // domain is stale — that is, when somebody else changed it. A plain one
       // takes out no watch at all, which is the whole cost difference.
-      const unwatch = live ? self.watch(domain, rerun) : null;
+      const unwatch = live ? self.watch(key, rerun) : null;
       b.stop = () => {
         unwatch?.();
         const set = mine.get(domain);

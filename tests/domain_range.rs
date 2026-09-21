@@ -73,3 +73,20 @@ fn domain_of_range_names_a_domain_only_for_its_whole_range() {
     let (task_lo, _) = D::domain_range("task");
     assert_eq!(D::domain_of_range(&task_lo, &hi), None, "nor a span straddling two domains");
 }
+
+/// `watch_key_of_range` names a whole domain OR one parent's band — the
+/// spans a binding reads — and nothing else (sdk#137).
+#[test]
+fn watch_key_of_range_names_a_domain_or_a_band_and_nothing_else() {
+    let (lo, hi) = D::domain_range("tasks");
+    assert_eq!(D::watch_key_of_range(&lo, &hi).as_deref(), Some("tasks"));
+    let p = [3u8; 16];
+    let (blo, bhi) = D::parent_range("tasks", &p);
+    let key = D::watch_key_of_range(&blo, &bhi).expect("a band names its key");
+    assert_eq!(key, D::watch_key("tasks", Some(&p)));
+    assert_eq!(D::watch_range(&key), Some((blo.clone(), bhi.clone())), "and the key names the band back");
+    let mut past = blo.clone();
+    past.push(0);
+    assert_eq!(D::watch_key_of_range(&blo, &past), None, "a narrower span is not the band");
+    assert_eq!(D::watch_key_of_range(&blo, &hi), None, "nor one reaching the domain's end");
+}

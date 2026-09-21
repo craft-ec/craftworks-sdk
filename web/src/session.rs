@@ -93,7 +93,8 @@ pub struct Session {
     /// page that believed it was being notified while it was actually
     /// polling is the failure `LiveMode` exists to make impossible.
     watching: bool,
-    /// Domains this page has bound, so a head move can name what is stale.
+    /// What this page has bound, so a head move can name what is stale: watch
+    /// keys (`Db::watch_key`) — a domain, or one parent's band of it.
     bound: std::collections::BTreeSet<String>,
     /// Asking what changed, and which answer belongs to which domain.
     ///
@@ -447,7 +448,7 @@ impl Session {
                 self.db.store_mut().on_page(&lo, &hi, rows, root);
                 // A whole domain, loaded at one root: the next question about
                 // it can be a real delta FROM that root (sdk#142).
-                if let Some(d) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_of_range(&lo, &hi) {
+                if let Some(d) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key_of_range(&lo, &hi) {
                     self.refresh.on_loaded(&d, at.root);
                 }
             }
@@ -555,7 +556,12 @@ impl Session {
     /// notification recoverable: however many were dropped, the gap closes in
     /// one call.
     fn refresh(&mut self, domain: &str) {
-        let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(domain);
+        // A watch KEY: a domain, or one parent's band (sdk#137) — so a live
+        // band asks what changed IN ITS BAND, and a change under a sibling
+        // parent is not a change to it.
+        let Some((lo, hi)) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_range(domain) else {
+            return;
+        };
         // From the session's ONE request counter, shared with every load
         // (sdk#166).
         let id = self.loads.take_id();
@@ -574,21 +580,21 @@ impl Session {
         let bound: Vec<(String, Vec<u8>, Vec<u8>)> = self
             .bound
             .iter()
-            .map(|d| {
-                let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(d);
-                (d.clone(), lo, hi)
+            .filter_map(|d| {
+                let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_range(d)?;
+                Some((d.clone(), lo, hi))
             })
             .collect();
-        let keys = told
-            .rolled_back_keys
-            .iter()
-            .chain(told.moved_under_pending.iter());
-        self.refresh.note_local(keys, |k| {
-            bound
+        // EVERY watch containing the key, not the first: a domain binding and
+        // a band binding of the same domain both moved (sdk#137).
+        for (d, lo, hi) in &bound {
+            let keys = told
+                .rolled_back_keys
                 .iter()
-                .find(|(_, lo, hi)| k >= &lo[..] && k < &hi[..])
-                .map(|(d, _, _)| d.clone())
-        });
+                .chain(told.moved_under_pending.iter());
+            self.refresh
+                .note_local(keys, |k| (k >= &lo[..] && k < &hi[..]).then(|| d.clone()));
+        }
     }
 
     /// A delta arrived: apply it through the copy — or, if `Refresh` says it
@@ -643,12 +649,24 @@ impl Session {
         self.refresh(domain);
     }
 
-    /// A domain this page is showing, so a head move can name it.
+    /// What this page is showing — a watch key from [`Session::watch_key`] —
+    /// so a head move can name it.
     ///
     /// Recorded by the session rather than tracked in JS, because deciding
     /// what to reload is a decision.
     pub fn bind(&mut self, domain: &str) {
         self.bound.insert(domain.to_string());
+    }
+
+    /// The watch key for a binding of `domain`, over one `parent`'s band when
+    /// `parent` is not empty (sdk#137). JavaScript holds it as an opaque name;
+    /// what it MEANS is decided here.
+    pub fn watch_key(&self, domain: &str, parent: &str) -> Result<String, JsValue> {
+        if parent.is_empty() {
+            return Ok(craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key(domain, None));
+        }
+        let p = rkey_of(parent)?;
+        Ok(craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key(domain, Some(&p)))
     }
 
     pub fn unbind(&mut self, domain: &str) {
