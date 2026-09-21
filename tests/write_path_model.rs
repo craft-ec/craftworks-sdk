@@ -1280,6 +1280,13 @@ impl Rev3Node {
                 if write_id < next {
                     return vec![self.verdict(s, write_id, WriteState::Duplicate, s, f)];
                 }
+                // 1b. The write IS the commit in flight for this session —
+                //     taken, not yet published: a re-send (after silence, a
+                //     reconnect) is told so, not Busy while its own Ack says
+                //     taken (WRITE-PATH rev 3, rulings: Q4).
+                if self.commit.as_ref().is_some_and(|c| c.session == s && c.write_id == write_id) {
+                    return vec![self.verdict(s, write_id, WriteState::Duplicate, s, f)];
+                }
                 // 2. A commit pending: Busy, `next` untouched.
                 if self.commit.is_some() {
                     return vec![self.verdict(s, write_id, WriteState::Busy, s, f)];
@@ -1427,6 +1434,21 @@ mod rev3 {
         assert_eq!(st, WriteState::Duplicate);
         assert_eq!(ack.published_through, 1, "the Duplicate's Ack must say it PUBLISHED");
         assert_eq!(n.applied, vec![(A, 1)], "applied twice");
+    }
+
+    /// Rule 1b: the write IS this session's commit in flight — a re-send of
+    /// a TAKEN write is a Duplicate whose Ack says taken, not Busy, and it is
+    /// applied once.
+    #[test]
+    fn a_taken_write_sent_again_is_a_duplicate_that_says_taken() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        let (ack, st) = one(n.call(&write(A, 2, 1, 1, "a")));
+        assert_eq!(st, WriteState::Duplicate, "a taken write re-sent was not told it is taken");
+        assert_eq!((ack.taken_through, ack.published_through), (1, 0), "the Duplicate's Ack must say TAKEN, not published");
+        assert_eq!(n.applied, vec![(A, 1)]);
+        // CONTROL: another session's write during the same commit is still Busy.
+        assert_eq!(one(n.call(&write(B, 1, 1, 1, "b"))).1, WriteState::Busy);
     }
 
     /// Rule 2: while a commit is pending, Busy — and `next` does not move.
