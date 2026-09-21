@@ -2648,7 +2648,25 @@ impl<B: Blocks> Engine<B> {
     /// roots costs the budget, not the manifest.
     fn on_preload(&mut self, _client: ClientId, roots: Vec<Cid>) -> Vec<Effect> {
         let mut out = Vec::new();
-        let mut blocks = 0usize;
+        // WORK, NOT MISSES.
+        //
+        // This counted only blocks it had to FETCH, so a block the node
+        // already held fell through to `Node::parse`, pushed its children,
+        // and cost the budget nothing. On a tree the node holds, the budget
+        // could never fire and the walk ran to completion — so the preload
+        // did its most work in exactly the case where it had nothing to do,
+        // and that case is the common one: every open after the first,
+        // against the user's own tree.
+        //
+        // Measured before this: 8,972 nodes parsed against a budget of 256,
+        // in ONE `process()` call, in a wasm delegate, for ZERO fetches
+        // (sdk#120). A bound that only the cold path could reach was a bound
+        // on the path that did not need one.
+        //
+        // Both a parse and a fetch are one unit of work now. The cold path is
+        // unchanged — a miss still costs one and still stops at the guard.
+        let mut work = 0usize;
+        let mut bytes = 0usize;
         for root in roots.into_iter().take(self.params.preload_roots) {
             // Only over a root the session already holds: a preload is a hint
             // about what is already ours, not an invitation to fetch a
@@ -2658,7 +2676,7 @@ impl<B: Blocks> Engine<B> {
             }
             let mut stack = vec![root];
             while let Some(cid) = stack.pop() {
-                if blocks >= self.params.preload_blocks {
+                if work >= self.params.preload_blocks || bytes >= self.params.preload_bytes {
                     return out;
                 }
                 let Some(b) = self.blocks.get(&cid) else {
@@ -2666,7 +2684,7 @@ impl<B: Blocks> Engine<B> {
                     if self.reads.waiting.contains_key(&cid) {
                         continue;
                     }
-                    blocks += 1;
+                    work += 1;
                     self.reads.fetches += 1;
                     out.push(Effect::FetchBlock {
                         id: cid,
@@ -2675,6 +2693,15 @@ impl<B: Blocks> Engine<B> {
                     });
                     continue;
                 };
+                // A PARSE IS WORK, and its BYTES are the dimension that
+                // actually costs: a few large nodes can be more work than
+                // many small ones, which a count alone cannot see.
+                // `preload_bytes` was declared, defaulted and read NOWHERE —
+                // a parameter nobody reads is a claim, not a bound, and it
+                // sat in a settings surface as though it constrained
+                // something.
+                work += 1;
+                bytes += b.len();
                 self.nodes_parsed += 1;
                 let Ok(n) = Node::parse(b) else { continue };
                 if !n.is_leaf() {
