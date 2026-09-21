@@ -599,6 +599,164 @@ fn a_hostile_preload_costs_the_budget() {
     );
 }
 
+/// **A WARM PRELOAD COSTS THE BUDGET TOO.**
+///
+/// `a_hostile_preload_costs_the_budget` above asserts a bound on WORK, which
+/// is the right claim — but its fixture holds only the root, so the walk hits
+/// misses immediately and stops. It exercises the COLD path and asserts a
+/// bound that only the WARM path can violate: a bound nothing can blow.
+///
+/// Here the store holds the whole tree, which is the COMMON case — every open
+/// after the first, against the user's own tree. A block the node already
+/// holds used to fall through to `Node::parse` and push its children without
+/// touching the budget, so the walk ran to completion: measured at 8,972
+/// nodes parsed against a budget of 256, in one call, in a wasm delegate, for
+/// ZERO fetches (sdk#120).
+#[test]
+fn a_warm_preload_costs_the_budget() {
+    // BIG ENOUGH TO BLOW THE BUDGET, and built to stay inside `max_backlog`.
+    //
+    // 2,000 records make ~161 blocks, UNDER the default budget of 256 — so a
+    // fixture that size satisfies the bound without ever testing it, which is
+    // the same defect as the cold-path test this one replaces.
+    //
+    // And the shared `fixture()` makes every third value 1,400 B, so 40,000
+    // records is ~18 MB against an 8 MiB `max_backlog`: the write is REFUSED,
+    // the tree comes back EMPTY, and the bound is satisfied by a fixture that
+    // does not exist. Small uniform values instead — record count drives block
+    // count without the byte blow-up.
+    let records: BTreeMap<Vec<u8>, Vec<u8>> = (0..60_000u32)
+        .map(|i| (format!("k/{i:06}").into_bytes(), vec![(i % 251) as u8; 24]))
+        .collect();
+    let (root, all) = tree(&records);
+    let (mut e, store) = reader(root, Params::default());
+    // THE WHOLE TREE, not just the root. The preload has nothing to fetch and
+    // everything to walk, which is exactly the case that was unbounded.
+    for (id, bytes) in all.0.iter() {
+        store.put(*id, bytes);
+    }
+    e.reset_cost();
+
+    let p = Params::default();
+    let out = stepped!(
+        e,
+        Event::Preload {
+            client: ClientId(1),
+            roots: vec![root],
+        }
+    );
+
+    assert!(
+        fetch_ids(&out).is_empty(),
+        "a warm preload fetched {} block(s); the store holds everything, so this \
+         test is not measuring the warm path at all",
+        fetch_ids(&out).len()
+    );
+    // THE FIXTURE MUST BE ABLE TO BLOW THE BOUND. A tree with fewer blocks
+    // than the budget satisfies it no matter what the code does.
+    assert!(
+        all.0.len() > p.preload_blocks * 2,
+        "the tree holds {} blocks against a budget of {} — too small to blow the \
+         bound at all",
+        all.0.len(),
+        p.preload_blocks
+    );
+    assert!(
+        e.nodes_parsed() > 0,
+        "the preload parsed nothing, so the bound below is satisfied by a walk \
+         that never happened"
+    );
+    assert!(
+        e.nodes_parsed() <= p.preload_blocks,
+        "a warm preload parsed {} nodes against a budget of {}. The budget \
+         counted MISSES, and a warm tree has none — so the preload did its most \
+         work in exactly the case where it had nothing to do.",
+        e.nodes_parsed(),
+        p.preload_blocks
+    );
+    println!(
+        "  warm preload: {} fetches, {} parses, budget {}",
+        fetch_ids(&out).len(),
+        e.nodes_parsed(),
+        p.preload_blocks
+    );
+}
+
+/// **`preload_bytes` STOPS THE WALK**, with a control just under it.
+///
+/// It was declared, defaulted to 4 MiB and read NOWHERE — the third
+/// declared-but-unread thing found in a day, after `Manifest.owed` (#117) and
+/// `Event::Preload`'s absent producer. A parameter nobody reads is a claim,
+/// not a bound, and it appeared in a settings surface as though it
+/// constrained something.
+///
+/// It bounds the dimension a COUNT cannot see: a few large nodes can be more
+/// work than many small ones.
+#[test]
+fn preload_bytes_stops_the_walk() {
+    let records: BTreeMap<Vec<u8>, Vec<u8>> = (0..60_000u32)
+        .map(|i| (format!("k/{i:06}").into_bytes(), vec![(i % 251) as u8; 24]))
+        .collect();
+    let (root, all) = tree(&records);
+
+    // The byte budget BITES: small enough that it stops the walk well before
+    // the block count would. The block budget is left wide open so the only
+    // thing that can stop it is the bytes.
+    let tight = Params {
+        preload_blocks: usize::MAX,
+        preload_bytes: 20_000,
+        ..Params::default()
+    };
+    let (mut tight_e, tight_store) = reader(root, tight);
+    for (id, bytes) in all.0.iter() {
+        tight_store.put(*id, bytes);
+    }
+    tight_e.reset_cost();
+    stepped!(
+        tight_e,
+        Event::Preload {
+            client: ClientId(1),
+            roots: vec![root],
+        }
+    );
+    let stopped = tight_e.nodes_parsed();
+
+    // THE CONTROL, just under it: the same walk with the byte budget raised
+    // goes further. Without this, a walk that stopped for some OTHER reason —
+    // an empty tree, a guard above — would look exactly like a byte bound
+    // working.
+    let loose = Params {
+        preload_blocks: usize::MAX,
+        preload_bytes: 100_000_000,
+        ..Params::default()
+    };
+    let (mut loose_e, loose_store) = reader(root, loose);
+    for (id, bytes) in all.0.iter() {
+        loose_store.put(*id, bytes);
+    }
+    loose_e.reset_cost();
+    stepped!(
+        loose_e,
+        Event::Preload {
+            client: ClientId(1),
+            roots: vec![root],
+        }
+    );
+    let went_on = loose_e.nodes_parsed();
+
+    assert!(
+        stopped > 0,
+        "the bounded walk parsed nothing, so it did not stop — it never started"
+    );
+    assert!(
+        went_on > stopped,
+        "raising the byte budget from 20,000 to 100,000,000 changed nothing \
+         ({stopped} parses either way), so `preload_bytes` is not what stopped \
+         the first walk and this test is measuring something else"
+    );
+    println!("  preload_bytes: 20,000 -> {stopped} parses, 100 MB -> {went_on} parses");
+}
+
 /// A range pages in both directions, and every feed pages newest-first.
 #[test]
 fn a_range_pages_in_both_directions() {
