@@ -507,6 +507,11 @@ impl Model {
             return;
         }
         let Some((i, f)) = self.inbound.pop_front() else { return };
+        // Every client frame the delegate RUNS is answered by its per-call
+        // report (entry.rs emits one per call, on the sender's connection) --
+        // what a page counts its frames against (sdk#174: at most one
+        // unanswered tick per session).
+        self.stores[i].on_inbound(&call_report());
         let protocol::Incoming::Ok(env) = protocol::decode_request(&f) else { return };
         let Request::Write { write_id, ops } = env.body else { return };
         match self.cfg.rule {
@@ -760,6 +765,14 @@ impl Model {
                     self.resend_on_silence(i);
                 }
             }
+            // A commit in flight moves on the node's own answers, not on a
+            // client's next frame: advance it whether or not anything is
+            // queued. (Only a queued frame used to move it, so a session
+            // that sent nothing held a commit in flight for as long as it
+            // stayed silent.)
+            while self.commit.is_some() {
+                self.advance_commit();
+            }
             while !self.inbound.is_empty() {
                 self.serve();
                 while self.commit.is_some() {
@@ -998,7 +1011,7 @@ const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
     ("STALE CLOCK", "Busy", 292, "sdk#183"),
     ("W2 OUT OF ORDER", "Busy, then applied after a later write", 246, "sdk#183"),
     ("W5 NOT REFILLED AFTER A FALL", "", 297, "sdk#183"),
-    ("W6 COPY LIES", "", 495, "sdk#183"),
+    ("W6 COPY LIES", "", 494, "sdk#183"),
 ];
 
 #[test]
@@ -1569,4 +1582,21 @@ mod rev3 {
         assert_eq!(ack.session, A, "the Ack names the WRITE's session");
         assert_eq!(ack.answering, None, "B's frame was reported as A's");
     }
+}
+
+/// The per-call report a delegate emits for every client frame it runs.
+fn call_report() -> Vec<u8> {
+    protocol::encode_reply(&Reply::Call {
+        saw: protocol::Saw::Client,
+        effects: 0,
+        ops: 0,
+        awaiting: 0,
+        read_back: 0,
+        stranded: 0,
+        dropped: 0,
+        head_put: 0,
+        head_update: 0,
+        note: String::new(),
+    })
+    .expect("a per-call report encodes")
 }
