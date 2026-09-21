@@ -34,7 +34,10 @@ fn written(n: u64) -> FullNode {
     a
 }
 
-fn page(r: &[Vec<u8>], req: u64) -> Option<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+/// A page's keys and its cursor.
+type Keys = (Vec<Vec<u8>>, Option<Vec<u8>>);
+
+fn page(r: &[Vec<u8>], req: u64) -> Option<Keys> {
     r.iter()
         .filter_map(|b| protocol::decode_reply(b).ok())
         .find_map(|x| match x {

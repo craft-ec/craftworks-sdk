@@ -672,3 +672,114 @@ fn contract_of(id: &Cid) -> Cid {
     // block id, and a function of this one.
     freenet_prolly::block_id(0xC0, id)
 }
+
+/// How many client requests the node holds for one delegate while it runs
+/// another's chain: 8 waiting, the 9th refused (F50, the architect's read of
+/// freenet-core).
+pub const NODE_QUEUE: usize = 8;
+
+/// THE NODE'S QUEUE IN FRONT OF ONE DELEGATE (sdk#174).
+///
+/// A real node runs one delegate chain at a time, under exclusion; client
+/// requests that arrive meanwhile wait in a queue of [`NODE_QUEUE`] and the
+/// next is REFUSED — no call, no reply, nothing the client can hear. `Conn`
+/// alone runs every frame at once, so it cannot show what a page's cadence
+/// does to that queue. This does: `park` is a delegate busy on someone's
+/// chain, frames are `offer`ed from several tabs, and `run` serves them in
+/// order, each answered by its replies AND the per-call report the delegate
+/// entry emits for every client frame (`Reply::Call { saw: Client }`) —
+/// which is what a page counts its frames against.
+pub struct NodeQueue {
+    conn: Conn,
+    parked: bool,
+    queue: VecDeque<(usize, Vec<u8>)>,
+    /// Frames refused because the queue was full.
+    pub rejected: usize,
+    /// The deepest the queue has been.
+    pub max_depth: usize,
+    /// Every request served, by tab, in the order served.
+    pub ran: Vec<(usize, protocol::Request)>,
+}
+
+impl NodeQueue {
+    pub fn new(conn: Conn) -> NodeQueue {
+        NodeQueue {
+            conn,
+            parked: false,
+            queue: VecDeque::new(),
+            rejected: 0,
+            max_depth: 0,
+            ran: Vec::new(),
+        }
+    }
+
+    /// The delegate is busy on another chain (`true`) or free (`false`).
+    pub fn park(&mut self, on: bool) {
+        self.parked = on;
+    }
+
+    /// A frame from tab `tab` reaches the node: queued, or REFUSED when the
+    /// queue is full (`false`).
+    pub fn offer(&mut self, tab: usize, frame: Vec<u8>) -> bool {
+        if self.queue.len() >= NODE_QUEUE {
+            self.rejected += 1;
+            return false;
+        }
+        self.queue.push_back((tab, frame));
+        self.max_depth = self.max_depth.max(self.queue.len());
+        true
+    }
+
+    /// What is waiting, decoded, by tab.
+    pub fn queued(&self) -> Vec<(usize, protocol::Request)> {
+        self.queue
+            .iter()
+            .filter_map(|(t, f)| body_of(f).map(|r| (*t, r)))
+            .collect()
+    }
+
+    /// Serve everything queued, in order — unless parked. Each frame's
+    /// replies go back to the tab that sent it, followed by its per-call
+    /// report.
+    pub fn run(&mut self) -> Vec<(usize, Vec<Vec<u8>>)> {
+        let mut out = Vec::new();
+        while !self.parked {
+            let Some((tab, frame)) = self.queue.pop_front() else {
+                break;
+            };
+            if let Some(r) = body_of(&frame) {
+                self.ran.push((tab, r));
+            }
+            let mut replies = self.conn.step(vec![Inbound::Client(frame)]);
+            replies.push(
+                protocol::encode_reply(&protocol::Reply::Call {
+                    saw: protocol::Saw::Client,
+                    effects: 0,
+                    ops: 0,
+                    awaiting: 0,
+                    read_back: 0,
+                    stranded: 0,
+                    dropped: 0,
+                    head_put: 0,
+                    head_update: 0,
+                    note: String::new(),
+                })
+                .expect("a per-call report encodes"),
+            );
+            out.push((tab, replies));
+        }
+        out
+    }
+
+    /// The connection behind the queue.
+    pub fn conn(&self) -> &Conn {
+        &self.conn
+    }
+}
+
+fn body_of(frame: &[u8]) -> Option<protocol::Request> {
+    match protocol::decode_request(frame) {
+        protocol::Incoming::Ok(e) => Some(e.body),
+        _ => None,
+    }
+}

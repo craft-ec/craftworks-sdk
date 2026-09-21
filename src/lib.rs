@@ -20,6 +20,7 @@ pub mod record;
 pub mod refresh;
 pub mod schema;
 pub mod store;
+pub mod tick_gate;
 pub mod trace;
 pub mod tree_store;
 
