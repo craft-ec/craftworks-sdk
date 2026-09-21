@@ -70,7 +70,7 @@ export function wrap(raw) {
     // Do not set it on ordinary data. A subscription is a standing cost paid
     // continuously, and it is worth it only where being told sooner is worth
     // something — data read once and shown is correct when it is read.
-    bind(domain, { live = false } = {}) { return new Binding(this, domain, live); }
+    bind(domain, { live = false, limit = 0 } = {}) { return new Binding(this, domain, live, limit); }
   }
 
   // One domain's rows, with a referentially STABLE snapshot.
@@ -81,15 +81,15 @@ export function wrap(raw) {
   // render for ever, whatever the data did. The array is replaced only when
   // the rows differ.
   class Binding {
-    #db; #domain; #live; #rows = []; #listeners = new Set(); #root = null;
+    #db; #domain; #live; #limit; #rows = []; #listeners = new Set(); #root = null;
     // The same shape the engine-backed binding answers. This database is in
     // the tab, so a range is never unreachable here — but an app must not be
     // able to tell which backend it has from what a call returns (sdk#87),
     // and a component that branched on `status()` existing would work in a
     // preview and throw once published.
     #status = { state: "loading", why: "", code: "" };
-    constructor(db, domain, live) {
-      this.#db = db; this.#domain = domain; this.#live = live;
+    constructor(db, domain, live, limit = 0) {
+      this.#db = db; this.#domain = domain; this.#live = live; this.#limit = limit;
       // Bound once, so React sees the SAME function identity across renders;
       // a changing subscribe re-subscribes on every render.
       this.subscribe = this.subscribe.bind(this);
@@ -101,6 +101,8 @@ export function wrap(raw) {
       // project was published.
     }
     get live() { return this.#live; }
+    // The same shape the engine-backed binding answers. `0` is unbounded.
+    get limit() { return this.#limit; }
     // The rows, as the same array until they change.
     getSnapshot() { return this.#rows; }
     /**
@@ -120,7 +122,7 @@ export function wrap(raw) {
     // compared first, so a reload with nothing to do reads nothing.
     async reload() {
       const root = this.#db.root();
-      const rows = await this.#db.scan(this.#domain);
+      const rows = await this.#db.scan(this.#domain, { limit: this.#limit });
       this.#root = root;
       const was = this.#status.state;
       this.#status = { state: "ready", why: "", code: "" };
