@@ -1675,6 +1675,30 @@ impl<B: Blocks> Engine<B> {
         }
         // It applied, so it is no longer parked.
         self.parked_write = None;
+        // A WRITE THAT CHANGES NOTHING IS NOT A COMMIT (sdk#160). The tree it
+        // asks for IS the published tree, so it is published already. As a
+        // commit it had no blocks, so no confirmation could ever arrive to
+        // bump the head, and the commit never ended: Accepted, then Stalled,
+        // and every later write Busy for ever. `Db::define` writes the same
+        // schema on every open, so this was every second open of an app.
+        //
+        // Both conditions: no blocks AND the published root. A write that
+        // changes the tree always emits its new root, so "no blocks" alone
+        // would also hold for nothing else today -- but the published root is
+        // the statement that makes answering `Published` TRUE, so it is the
+        // one checked.
+        if emitted.is_empty() && applied.root == self.published_root && self.unpublished.is_empty()
+        {
+            self.root = applied.root;
+            return [State::Accepted, State::Published, State::ParityComplete]
+                .into_iter()
+                .map(|state| Effect::Notify {
+                    client,
+                    write_id,
+                    state,
+                })
+                .collect();
+        }
         // The blocks are NOT kept. A delegate's memory is fresh on every call,
         // so anything retained here is gone by the next one; they are emitted
         // in this same step and read back from the node afterwards.

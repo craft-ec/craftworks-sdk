@@ -5,9 +5,13 @@
 //! test red, against a defect that stopped every real write over one block:
 //! the suite had almost no test in which a multi-block commit must publish
 //! through the shell. So the gate is a matrix. Each WORKLOAD runs under each
-//! MODE it can meet on a real node, and every cell asserts the same two things
-//! on every call: nothing is STRANDED (lost at the end of the call), and every
-//! request is eventually ANSWERED.
+//! MODE it can meet on a real node, and every cell asserts the same three
+//! things: nothing is STRANDED (lost at the end of a call), every request is
+//! eventually ANSWERED, and the engine is OPEN AFTERWARDS -- a trailing
+//! one-key write on the same connection reaches `Published`. The third is
+//! what a wedged engine fails while passing the first two: a commit that can
+//! never end strands nothing and leaves nothing unanswered that anyone asked
+//! twice (sdk#160).
 //!
 //! A cell is green, red (with its reason), or NOT REACHED -- the workload did
 //! not create the condition it exists for (a parity flush that fit in one
@@ -26,6 +30,7 @@
 //! | W3 parked then refused | one-per-call+cold | warm: nothing parks (reported NOT REACHED if tried); batch: its answers arrive together, hiding the node-driven verdict |
 //! | W4 commit across a tick | one-per-call+real-ticks | batch: nothing is in flight across a call; cold/evicting: W1 covers the cold commit |
 //! | W5 parity past one return | one-per-call | cold/evicting: parity is put, not read; real ticks: W4 covers ticks during a commit |
+//! | W7 a write that emits zero blocks | batch (control), one-per-call, +real-ticks | cold/evicting: the write still reads its path cold, which is W8's case (M1 DoD note 11) |
 //! | (all) | -- | two live sessions: needs a second connection whose calls interleave -- sdk#146, added there |
 //!
 //! `KNOWN_RED` is the list of cells red on the code as it stands, each naming
@@ -147,8 +152,18 @@ fn node_for(mode: Mode) -> FullNode {
     }
 }
 
-/// The two assertions every cell makes, on every call it ran.
-fn every_call(c: &Conn) -> Option<String> {
+/// The assertions every cell makes: on every call it ran, and then that the
+/// engine is still open.
+fn every_call(c: &mut Conn) -> Option<String> {
+    // OPEN AFTERWARDS. Its calls are subject to the two checks below as well.
+    let mut after = c.client(&Request::Write {
+        write_id: OPEN_AFTERWARDS,
+        ops: vec![Op::Put(b"k/open-afterwards".to_vec(), b"x".to_vec())],
+    });
+    while c.held() > 0 {
+        after.extend(c.release_one());
+    }
+    let open = states_of(&after, OPEN_AFTERWARDS);
     if c.max_stranded() > 0 {
         // WHICH effects, from the per-call report -- a count cannot say.
         let which = c.strand_details();
@@ -159,8 +174,15 @@ fn every_call(c: &Conn) -> Option<String> {
         ));
     }
     let u = c.unanswered();
-    (!u.is_empty()).then(|| format!("never answered: {u:?}"))
+    if !u.is_empty() {
+        return Some(format!("never answered: {u:?}"));
+    }
+    (!open.contains(&WriteState::Published))
+        .then(|| format!("the engine is CLOSED afterwards: a trailing write was told {open:?}"))
 }
+
+/// The trailing write's id, clear of every workload's.
+const OPEN_AFTERWARDS: u64 = 900_001;
 
 /// W1: a commit of TWO OR MORE data blocks must PUBLISH.
 fn w1_multi_block_commit(mode: Mode) -> Cell {
@@ -183,11 +205,68 @@ fn w1_multi_block_commit(mode: Mode) -> Cell {
         }
     }
     let st = states_of(&replies, 1);
-    if let Some(why) = every_call(&c) {
+    if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; told {st:?}"));
     }
     if !st.contains(&WriteState::Published) {
         return Cell::Red(format!("never published: told {st:?}"));
+    }
+    Cell::Green
+}
+
+/// W7: a write that changes NOTHING -- the tree it asks for is the published
+/// one, so it emits zero blocks -- is published at once, with no PUT and no
+/// head (sdk#160: it was a commit with no blocks, which no confirmation could
+/// ever end, and the engine was `Busy` to everyone after it).
+fn w7_zero_block_write(mode: Mode) -> Cell {
+    use testkit::full_node::Served;
+    let node = node_for(mode);
+    let mut c = connect(&node, mode);
+    c.client(&Request::Identity);
+    let same = || Request::Write {
+        write_id: 0,
+        ops: vec![Op::Put(b"k/schema".to_vec(), b"the same bytes".to_vec())],
+    };
+    let base = 1_790_000_000_000u64;
+    let mut replies = Vec::new();
+    let mut to_node = (0, 0);
+    for id in [1u64, 2] {
+        let (puts, heads) = (c.served(Served::Put), c.served(Served::Head));
+        let Request::Write { ops, .. } = same() else {
+            unreachable!()
+        };
+        replies.extend(c.client(&Request::Write { write_id: id, ops }));
+        if mode.real_ticks {
+            for k in 1..=3 {
+                replies.extend(c.tick_at(base + (id * 10 + k) * 1000));
+            }
+        }
+        to_node = (c.served(Served::Put) - puts, c.served(Served::Head) - heads);
+    }
+    let two = states_of(&replies, 2);
+    if !states_of(&replies, 1).contains(&WriteState::Published) {
+        return Cell::NotReached(format!(
+            "the first write never published: {:?}",
+            states_of(&replies, 1)
+        ));
+    }
+    if let Some(why) = every_call(&mut c) {
+        return Cell::Red(format!("{why}; the no-op was told {two:?}"));
+    }
+    if two
+        != [
+            WriteState::Accepted,
+            WriteState::Published,
+            WriteState::ParityComplete,
+        ]
+    {
+        return Cell::Red(format!("the no-op write was told {two:?}"));
+    }
+    if to_node != (0, 0) {
+        return Cell::Red(format!(
+            "the no-op write sent {} PUT(s) and {} head(s)",
+            to_node.0, to_node.1
+        ));
     }
     Cell::Green
 }
@@ -215,7 +294,7 @@ fn w2_cold_wide_read(mode: Mode) -> Cell {
             _ => None,
         })
         .collect();
-    if let Some(why) = every_call(&c) {
+    if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; pages {pages:?}"));
     }
     match pages.last() {
@@ -267,7 +346,7 @@ fn w3_parked_then_refused(mode: Mode) -> Cell {
     if c.served(testkit::full_node::Served::Get) == 0 {
         return Cell::NotReached(format!("the write never parked (no GETs); told {st:?}"));
     }
-    if let Some(why) = every_call(&c) {
+    if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; told {st:?}"));
     }
     match st.last() {
@@ -307,7 +386,7 @@ fn w4_commit_across_a_tick(mode: Mode) -> Cell {
         k += 1;
     }
     let st = states_of(&replies, 1);
-    if let Some(why) = every_call(&c) {
+    if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; told {st:?}"));
     }
     // THE CRITERION, explicit: a commit younger than `max_accept_age` ticks
@@ -370,7 +449,7 @@ fn w5_parity_overflow(mode: Mode) -> Cell {
     // Strands FIRST. What was SERVED can never exceed the per-return cap the
     // cell exists to test -- a flush that emitted 200 serves exactly 128 --
     // so "fit in one return" is only believed when nothing was stranded.
-    if let Some(why) = every_call(&c) {
+    if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; flush put {flush_puts}"));
     }
     if flush_puts < 128 {
@@ -441,7 +520,7 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
 
 #[test]
 fn every_workload_under_every_mode() {
-    let workloads: [Workload; 5] = [
+    let workloads: [Workload; 6] = [
         (
             "W1 multi-block commit publishes",
             w1_multi_block_commit,
@@ -488,6 +567,18 @@ fn every_workload_under_every_mode() {
             "W5 parity wider than one return",
             w5_parity_overflow,
             vec![APC],
+        ),
+        (
+            "W7 a write that emits zero blocks",
+            w7_zero_block_write,
+            vec![
+                BATCH,
+                APC,
+                Mode {
+                    real_ticks: true,
+                    ..APC
+                },
+            ],
         ),
     ];
     let mut surprises = Vec::new();
