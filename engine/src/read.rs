@@ -212,6 +212,13 @@ pub(crate) struct Parked {
     /// budget never trips and nothing ever ends. A tight warm set turned a
     /// cold read into a livelock exactly that way.
     pub held: BTreeSet<Cid>,
+    /// GETs this read has caused, across its rounds (sdk#174). To the node
+    /// one client request is ONE delegate chain however many rounds it
+    /// takes, held under exclusion throughout and truncated, invisibly, past
+    /// 100 iterations; a read stops at `max_gets_per_request` and answers what
+    /// it has with a cursor, and the next page is a new request.
+    #[serde(default)]
+    pub gets: u32,
 }
 
 /// The read side of the engine's state.
@@ -455,6 +462,31 @@ pub(crate) fn attempt<B: Blocks>(
             }
         }
     }
+}
+
+/// A SHORT page for a scan that has used its request's GETs (sdk#174): the
+/// entries it has reached, in order, up to the first whose value is not
+/// warm, and a cursor after the last -- the next page is a new request.
+/// `None` for anything but a scan, or when nothing has been reached yet
+/// (there is no key to put a cursor after).
+pub(crate) fn short_page<B: Blocks>(blocks: &B, want: &Want, root: &Cid) -> Option<ReadResult> {
+    let Want::Scan(spec) = want else {
+        return None;
+    };
+    let r: Range = spec.as_ref().into();
+    let page = range_with(RangeOptions::default(), blocks, root, &r).ok()?;
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = page
+        .entries
+        .into_iter()
+        .take_while(|(_, v)| !matches!(v, Value::Ref { cid, .. } if blocks.get(cid).is_none()))
+        .map(|(k, v)| (k, materialise(blocks, v)))
+        .collect();
+    let last = entries.last()?.0.clone();
+    Some(ReadResult::Page {
+        entries,
+        cursor: Some(last),
+        complete: false,
+    })
 }
 
 /// The bytes of a value, wherever the format put it.

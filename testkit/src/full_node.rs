@@ -49,11 +49,14 @@ use crate::Store;
 
 pub const FULL_NODE: Site = Site::of("testkit::full_node");
 
-/// How deep the answer-feeding may go before it is called a loop.
-///
-/// A cold write settles in a handful of rounds. Anything approaching this is a
-/// cycle, and the panic names the depth rather than hanging the run.
-const MAX_ROUNDS: usize = 32;
+/// How deep the answer-feeding may go before it is called a loop: the NODE's
+/// own cap on one client request's delegate chain, 100 iterations (F50, the
+/// architect's read of freenet-core). A real node truncates past it without
+/// a word; this fixture panics, naming the depth, so the truncation is a
+/// failure here rather than a silence. (It was 32, "a cold write settles in
+/// a handful of rounds" -- true until a parked write asked for its path one
+/// round at a time, sdk#174, which is within the node's cap and was not.)
+const MAX_ROUNDS: usize = 100;
 
 /// Which op the node served.
 ///
