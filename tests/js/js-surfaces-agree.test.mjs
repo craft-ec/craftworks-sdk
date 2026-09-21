@@ -273,6 +273,162 @@ await t("THE CONTROL: a reload that changes NOTHING keeps the same snapshot", ()
   });
 });
 
+// ---------------------------------------------------------------------------
+// UNREACHABLE IS NOT EMPTY, and a component must be able to tell.
+//
+// A component holds a binding and reads `getSnapshot()`. An empty array meant
+// BOTH "the range was read and holds nothing" and "the range could not be
+// reached" — and the second is not a smaller version of the first. Absence is
+// never provable (§3); the layers underneath were built at real cost to keep
+// `NotLoaded` apart from empty (sdk#54, #63); and a binding that flattens
+// them is the LAST place that distinction can be lost.
+// ---------------------------------------------------------------------------
+
+const scanning = answer => ({
+  ...fakeSession().session,
+  scan: answer,
+  root: () => "node:r",
+});
+
+await t("**a range that cannot be read is `unreachable`, not empty**", async () => {
+  const db = engineDb({
+    session: scanning(() => {
+      const e = new Error("the range this read needed could not be loaded");
+      e.code = "UNAVAILABLE";
+      throw e;
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+
+  assert.deepEqual(b.getSnapshot(), [], "there are no rows either way — that is the problem");
+  assert.equal(b.status().state, "unreachable",
+    "a range nobody could read reports the same state as one that is empty, so a " +
+    "component renders `No records yet` over a tree it merely could not reach");
+  assert.equal(b.status().code, "UNAVAILABLE", "the code a caller would branch on is gone");
+  assert.match(b.status().why, /could not be loaded/, "the sentence a person would read is gone");
+});
+
+await t("THE CONTROL: a range that IS empty says so, and is not unreachable", async () => {
+  // Without this, a binding that reported `unreachable` whenever it had no
+  // rows would pass the test above — and an app would claim it could not
+  // reach a domain that is simply empty, which is the same lie reversed.
+  const db = engineDb({ session: scanning(() => "[]") });
+  const b = db.bind("notes");
+  await b.reload();
+  assert.deepEqual(b.getSnapshot(), []);
+  assert.equal(b.status().state, "ready",
+    "an empty range was reported unreachable; emptiness IS provable once the range was read");
+});
+
+await t("a binding is `loading` until its first reload finishes", async () => {
+  const db = engineDb({ session: scanning(() => "[]") });
+  const b = db.bind("notes");
+  assert.equal(b.status().state, "loading",
+    "a binding claims to know something before it has read anything");
+  await b.reload();
+  assert.equal(b.status().state, "ready");
+});
+
+await t("**the state changing is itself a change, even when the rows do not**", async () => {
+  // A range that was unreachable and is now readable-and-empty is a different
+  // screen with the same rows. A binding that only told its listeners when
+  // the ROWS changed would leave the component showing the error for ever.
+  let fail = true;
+  const db = engineDb({
+    session: scanning(() => {
+      if (fail) {
+        const e = new Error("no"); e.code = "UNAVAILABLE"; throw e;
+      }
+      return "[]";
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+  assert.equal(b.status().state, "unreachable");
+
+  let told = 0;
+  b.subscribe(() => { told += 1; });
+  fail = false;
+  await b.reload();
+
+  assert.equal(b.status().state, "ready", "it never recovered");
+  assert.deepEqual(b.getSnapshot(), [], "the rows are the same — no rows, either way");
+  assert.equal(told, 1,
+    "nobody was told the range became readable, because only the rows are watched. " +
+    "The component would show `unreachable` over a range it can now read.");
+});
+
+await t("**a DIFFERENT reason is a change, even with the same state**", async () => {
+  // `state` alone is not the whole of status. Two failures with different
+  // reasons share a state, so a comparison on `state` replaced `why` and
+  // `code` and told nobody — and the doc tells callers to SHOW `why`, so a
+  // component displayed the first sentence for ever while the real reason
+  // changed underneath it.
+  //
+  // THE ERROR DIFFERS PER CALL, and the two are asserted distinct before
+  // anything is concluded: `bind()` itself triggers a scan, so a probe
+  // drawing from a fixed list consumes one before the first `reload()` and
+  // would compare an error against itself — a gap manufactured by its own
+  // setup.
+  let n = 0;
+  const db = engineDb({
+    session: scanning(() => {
+      n += 1;
+      const e = new Error(`reason ${n}`);
+      e.code = `CODE_${n}`;
+      throw e;
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+  const first = { ...b.status() };
+
+  let told = 0;
+  b.subscribe(() => { told += 1; });
+  await b.reload();
+  const second = { ...b.status() };
+
+  assert.notDeepEqual(first, second,
+    "the two failures are identical, so this test cannot detect anything — " +
+    "the error must differ per call");
+  assert.equal(first.state, second.state, "they must share a state, or the state alone would catch it");
+  assert.equal(second.code, `CODE_${n}`, "the latest reason is not the one held");
+  assert.equal(told, 1,
+    `the reason changed from ${first.code} to ${second.code} and nobody was told. ` +
+    "A component showing status().why displays a stale sentence for ever.");
+});
+
+await t("THE CONTROL: the SAME failure twice tells nobody", async () => {
+  // Without this, a binding that notified on every reload would pass the
+  // test above and re-render for ever on an unchanging error.
+  const db = engineDb({
+    session: scanning(() => {
+      const e = new Error("the same every time");
+      e.code = "SAME";
+      throw e;
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+  let told = 0;
+  b.subscribe(() => { told += 1; });
+  await b.reload();
+  assert.equal(told, 0, "an unchanged failure notified anyway, so nothing is stable");
+});
+
+await t("THE CONTROL: both surfaces answer `status`, so an app cannot tell them apart", async () => {
+  // The in-memory database is in the tab and a range there is never
+  // unreachable — but a component that branched on `status()` EXISTING would
+  // work in a preview and throw the moment the project was published.
+  const memory = new (wrap(fakeRaw()).Db)();
+  const b = memory.bind("notes");
+  assert.equal(typeof b.status, "function", "the in-memory binding has no status()");
+  assert.equal(b.status().state, "loading", "it claims to know something before reading");
+  await b.reload();
+  assert.equal(b.status().state, "ready");
+});
+
 await t("a BINDING from the engine has the shape a component holds", () => {
   const b = engineDb(fakeSession()).bind("tasks", { live: false });
   for (const m of ["getSnapshot", "subscribe", "reload"]) {

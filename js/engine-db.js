@@ -41,6 +41,16 @@ const rethrow = e => {
   throw e;
 };
 
+/**
+ * Did the STATUS move? All three fields, because any of them is on screen.
+ *
+ * `state` alone is not enough: two failures with different reasons share a
+ * state, and a caller showing `why` would display the first sentence for
+ * ever. The same mistake as comparing rows without `state` (below) and as
+ * comparing a binding by rows alone — three instances of one shape.
+ */
+const changed = (a, b) => a.state !== b.state || a.why !== b.why || a.code !== b.code;
+
 /** Are these the same rows? By id, `updated` AND `state` — see below. */
 const same = (a, b) => {
   if (a.length !== b.length) return false;
@@ -271,9 +281,51 @@ export function engineDb(handle) {
      */
     bind(domain, { live = false } = {}) {
       let rows = [], root = null;
+      // WHAT THIS BINDING LAST MANAGED TO DO.
+      //
+      // A component holds a binding and reads `getSnapshot()`. Until now that
+      // was all it could learn, so an empty array meant BOTH "the range was
+      // read and holds nothing" and "the range could not be reached" — and a
+      // component has no way to tell them apart.
+      //
+      // That distinction is the architecture's whole character: absence is
+      // never provable (§3), a cold far read is seconds (F43), and the layers
+      // underneath were built at real cost to keep the two apart —
+      // `NotLoaded` is not empty (sdk#54, #63). A binding that flattens them
+      // is the last place it can be lost, and an app saying "No records yet"
+      // over a tree it merely could not reach wastes every honest answer
+      // beneath it.
+      //
+      // `loading` until the first reload finishes, then `ready` or
+      // `unreachable`. Empty is not a state here: it is `ready` with no rows,
+      // which is exactly what makes it PROVABLE.
+      let status = { state: "loading", why: "", code: "" };
       const listeners = new Set();
       const b = {
         get live() { return live; },
+        /**
+         * `{ state, why, code }` — `loading`, `ready` or `unreachable`.
+         *
+         * # A BINDING'S OBSERVABLE STATE IS ROWS **AND** STATUS
+         *
+         * A comparison over rows alone misses a transition. Twice now:
+         *
+         * * a row whose write state moved `PENDING` -> `CLEAN` changes
+         *   neither `id` nor `updated`, so the snapshot comparison said
+         *   "the same rows" and a person watched "saving" for seventy
+         *   seconds over data that was already on the network (sdk#96);
+         * * a range going from `unreachable` to readable-and-empty is a
+         *   different screen with identical rows, so anything watching only
+         *   the rows leaves the error on screen for ever.
+         *
+         * Anything deciding whether a binding changed must read both.
+         *
+         * Read it beside `getSnapshot()`: no rows with `ready` is an empty
+         * range, and no rows with `unreachable` is a range nobody could read.
+         * `why` is the SDK's own sentence, and `code` its stable code, so a
+         * caller can show the first and branch on the second.
+         */
+        status: () => status,
         // The SAME array until the rows change: a caller re-rendering on
         // every identity change would re-render for ever otherwise.
         getSnapshot: () => rows,
@@ -294,15 +346,61 @@ export function engineDb(handle) {
          */
         async reload() {
           session.refresh_domain(domain);
-          const next = await self.scan(domain);
+          let next;
+          try {
+            next = await self.scan(domain);
+          } catch (e) {
+            // UNREACHABLE IS AN ANSWER, not an exception to swallow.
+            //
+            // This rejected, and its own caller — `rerun`, below — called it
+            // without awaiting, so the rejection was unhandled and the
+            // component was told nothing at all. It kept whatever rows it had
+            // and no one could see that the read had failed.
+            const was = status;
+            status = {
+              state: "unreachable",
+              why: String(e?.message ?? e),
+              code: String(e?.code ?? ""),
+            };
+            // ALL THREE FIELDS, not just `state`.
+            //
+            // This compared `state` alone, so a binding that failed twice for
+            // DIFFERENT reasons replaced `why` and `code` and told nobody —
+            // and the doc above tells callers to show `why`, so a component
+            // displayed a stale sentence for ever while the real reason
+            // changed underneath it.
+            //
+            // Third instance of one shape, and this one inside the fix for
+            // the second: a row's write state moving and the snapshot
+            // comparison missing it (sdk#96), a range becoming readable and
+            // the row comparison missing it (above), and now a reason
+            // changing and the state comparison missing it. `state` is not
+            // the whole of status, exactly as rows are not the whole of a
+            // binding.
+            if (changed(was, status)) for (const cb of listeners) cb();
+            return false;
+          }
           root = self.root();
-          if (same(rows, next)) return false;
+          const was = status;
+          status = { state: "ready", why: "", code: "" };
+          if (same(rows, next)) {
+            // The ROWS did not change but the STATUS may have: a range that
+            // was unreachable and is now readable-and-empty is a different
+            // screen, and a component that only watched the rows would never
+            // redraw.
+            const moved = changed(was, status);
+            if (moved) for (const cb of listeners) cb();
+            return moved;
+          }
           rows = next;
           for (const cb of listeners) cb();
           return true;
         },
       };
       // Its own client's writes reach it whatever `live` says.
+      // The rejection is handled INSIDE `reload` now, which records it as a
+      // state rather than throwing. This stays deliberately fire-and-forget:
+      // it is called from a notification, and there is nobody to await it.
       const rerun = () => { b.reload(); };
       if (!mine.has(domain)) mine.set(domain, new Set());
       mine.get(domain).add(rerun);
