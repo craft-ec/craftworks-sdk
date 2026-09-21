@@ -434,6 +434,14 @@ fn a_parked_write_of_many_tiny_ops_is_capped_on_what_it_costs() {
         "a write whose payload is {payload} B (under the {cap} B cap) but \
          whose context cost is far over it was parked anyway"
     );
-    assert_eq!(fetches(&out).len(), 0, "a refused write asked for blocks");
-    println!("  {n} tiny ops: {payload} B of payload, refused on context cost");
+    // Declined, not parked -- and its path IS fetched, so the re-send finds it
+    // warm (craftworks-sdk#136: a refusal with no fetches was `Busy` for ever).
+    assert!(
+        !fetches(&out).is_empty(),
+        "a write declined on its cost fetched nothing -- it stays cold for ever"
+    );
+    println!(
+        "  {n} tiny ops: {payload} B of payload, declined on context cost, {} fetch(es)",
+        fetches(&out).len()
+    );
 }

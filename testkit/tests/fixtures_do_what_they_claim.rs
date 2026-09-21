@@ -214,7 +214,7 @@ fn the_shell_detects_the_version_a_client_spoke() {
     )]);
     assert_eq!(
         v2.detected_client_version(),
-        2,
+        protocol::CURRENT,
         "a client speaking the current version must be detected as such"
     );
 

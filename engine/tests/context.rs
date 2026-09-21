@@ -442,15 +442,17 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
     };
 
     let (out, before, after) = run(big(cap as u32 * 4));
+    // Refused as NEVER acceptable, with the count -- not `Busy`, which the
+    // outbox re-sends for ever (craftworks-sdk#136).
     assert!(
         out.iter().any(|f| matches!(
             f,
             Effect::Notify {
-                state: engine::State::Busy,
+                state: engine::State::TooLarge { bound: engine::WriteBound::CommitBlocks, limit, got },
                 ..
-            }
+            } if *limit == cap && *got > cap
         )),
-        "a write naming more than {cap} blocks was not refused"
+        "a write naming more than {cap} blocks was not refused TooLarge"
     );
     assert_eq!(
         before, after,
