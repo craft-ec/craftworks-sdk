@@ -426,6 +426,13 @@ pub fn cached_store() -> (craftworks_sdk::CachedStore, Clock) {
     (craftworks_sdk::CachedStore::new(clock.as_fn()), clock)
 }
 
+/// A `CachedStore` on a clock the caller already holds — so several
+/// sessions share ONE clock, and advancing it moves them all (the write
+/// path's model test runs two).
+pub fn cached_store_on(clock: &Clock) -> craftworks_sdk::CachedStore {
+    craftworks_sdk::CachedStore::new(clock.as_fn())
+}
+
 /// The same, started at a given time.
 pub fn cached_store_at(start_ms: u64) -> (craftworks_sdk::CachedStore, Clock) {
     let clock = Clock::new(start_ms);
