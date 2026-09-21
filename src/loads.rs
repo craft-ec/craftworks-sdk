@@ -101,6 +101,8 @@ pub struct Loads {
     /// exactly that, and it is a fact this registry can see and a caller
     /// cannot.
     done: std::collections::BTreeSet<(Vec<u8>, Vec<u8>)>,
+    /// Pages refused because they held keys outside their load's range.
+    pub foreign_pages: usize,
 }
 
 impl Default for Loads {
@@ -120,6 +122,7 @@ impl Loads {
             known_seq: 0,
             budget_ms: 30_000,
             done: std::collections::BTreeSet::new(),
+            foreign_pages: 0,
         }
     }
 
@@ -140,8 +143,7 @@ impl Loads {
         if let Some((id, _)) = self.open.iter().find(|(_, l)| l.lo == lo && l.hi == hi) {
             return Some((*id, false));
         }
-        let id = self.next;
-        self.next += 1;
+        let id = self.take_id();
         self.open.insert(
             id,
             Load {
@@ -154,6 +156,19 @@ impl Loads {
             },
         );
         Some((id, true))
+    }
+
+    /// A request id from THIS session's one counter (sdk#166).
+    ///
+    /// Every kind of read shares it — a range load and a `ChangesSince` are
+    /// both just `req_id` on the wire, and the engine parks every read in one
+    /// map keyed by the id alone. Two counters each starting at 1 made one
+    /// tab's first load and first refresh the same read: one was answered,
+    /// the other waited out its budget. `Refresh` takes its ids from here.
+    pub fn take_id(&mut self) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        id
     }
 
     /// Forget which spans have been loaded.
@@ -193,6 +208,24 @@ impl Loads {
             // that already timed out. Applying it would record a range as
             // loaded on the strength of an answer whose question is gone.
             return Page::Nothing;
+        };
+        // A PAGE OF SOMEBODY ELSE'S RANGE (sdk#166). Reads are keyed by the id
+        // alone, and another tab's first load is also id 1: this load can be
+        // handed THAT range's rows. Accepted, the range was recorded as loaded
+        // with none of its own rows — "everything here not in this list is
+        // absent", said of a list that holds nothing of here: a wrong empty,
+        // shown as right. A range is never recorded on rows that are not in
+        // it; the load ends Unavailable, which is honest, and is re-asked.
+        let (lo, hi) = (load.lo.clone(), load.hi.clone());
+        let outside = |k: &[u8]| k < lo.as_slice() || k >= hi.as_slice();
+        if entries.iter().any(|(k, _)| outside(k)) || cursor.as_deref().is_some_and(outside) {
+            self.open.remove(&id);
+            self.ended.push((id, Ended::Unavailable));
+            self.foreign_pages += 1;
+            return Page::Nothing;
+        }
+        let Some(load) = self.open.get_mut(&id) else {
+            unreachable!("checked above");
         };
         // THE TREE MOVED UNDER THIS LOAD.
         //

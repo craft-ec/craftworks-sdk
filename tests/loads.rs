@@ -15,8 +15,10 @@ const AT: protocol::At = protocol::At {
     root: [1u8; 32],
 };
 
+/// Rows INSIDE the `a/` range these tests load: a page holding keys outside
+/// its load's range is refused (sdk#166).
 fn rows(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-    (0..n).map(|i| (vec![i as u8], vec![0u8])).collect()
+    (0..n).map(|i| (vec![b'a', b'/', i as u8], vec![0u8])).collect()
 }
 
 /// A range asked for once is requested once, and answering it ends the
@@ -224,7 +226,11 @@ fn control_a_chain_of_different_spans_keeps_going() {
     let (a, _) = l
         .want(b"note/#", b"note/#\0", 0)
         .expect("the schema's span");
-    l.on_page(a, rows(1), None, AT);
+    // The schema's own key: a row inside the span, so hop 1 COMPLETES.
+    assert!(matches!(
+        l.on_page(a, vec![(b"note/#".to_vec(), vec![0])], None, AT),
+        craftworks_sdk::loads::Page::Complete { .. }
+    ));
     let _ = l.take_ended();
     // hop 2: the rows. A DIFFERENT span, so it proceeds.
     let b = l.want(b"note/", b"note0", 1);

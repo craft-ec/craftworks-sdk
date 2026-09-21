@@ -42,7 +42,6 @@ pub struct Refresh {
     seen: std::collections::BTreeMap<String, [u8; 32]>,
     in_flight: std::collections::BTreeMap<u64, String>,
     changed: std::collections::BTreeSet<String>,
-    next: u64,
     /// Answers for questions nobody asked.
     pub unasked: usize,
 }
@@ -59,7 +58,6 @@ impl Refresh {
             seen: std::collections::BTreeMap::new(),
             in_flight: std::collections::BTreeMap::new(),
             changed: std::collections::BTreeSet::new(),
-            next: 1,
             unasked: 0,
         }
     }
@@ -70,12 +68,15 @@ impl Refresh {
     /// **One in flight per domain.** Several notifications about one domain
     /// is the ordinary case on a tree somebody is writing to, and a request
     /// each would multiply its traffic by how often it is written.
-    pub fn ask(&mut self, domain: &str, lo: &[u8], hi: &[u8]) -> Option<protocol::Request> {
+    ///
+    /// `req_id` is the caller's, from the session's ONE counter
+    /// (`Loads::take_id`): this used to keep its own, starting at 1 like the
+    /// loads' — so a tab's first refresh and first load were the same read to
+    /// the engine, and one of them was never answered (sdk#166).
+    pub fn ask(&mut self, req_id: u64, domain: &str, lo: &[u8], hi: &[u8]) -> Option<protocol::Request> {
         if self.in_flight.values().any(|d| d == domain) {
             return None;
         }
-        let req_id = self.next;
-        self.next += 1;
         self.in_flight.insert(req_id, domain.to_string());
         Some(protocol::Request::ChangesSince {
             req_id,

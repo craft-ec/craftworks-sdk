@@ -556,7 +556,10 @@ impl Session {
     /// one call.
     fn refresh(&mut self, domain: &str) {
         let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(domain);
-        if let Some(req) = self.refresh.ask(domain, &lo, &hi) {
+        // From the session's ONE request counter, shared with every load
+        // (sdk#166).
+        let id = self.loads.take_id();
+        if let Some(req) = self.refresh.ask(id, domain, &lo, &hi) {
             self.db.store_mut().client.send(&req);
         }
     }
