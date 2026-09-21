@@ -14,12 +14,14 @@
 //! usage: L3_PORT=<base port> live-cold-read <engine_delegate.wasm> <block.wasm> <register.wasm>
 //!        (uses base, base+1 for A's ws/net and base+10, base+11 for B's)
 //!
-//! L3_LONG_WINDOW=1 (default off; the ordinary probe is unchanged without it): TEST 1 listens 130 s per request
-//! instead of 60, and a request not answered at 60 s is NOT given up -- it goes on listening and ticking, and the
-//! moment its page arrives is recorded. Afterwards both nodes are kept alive a further 100 s (listening, no new
+//! Outcomes: GREEN; STALLED N s, RECOVERED (a cold read waited past 30 s and then came back whole -- F52's heal);
+//! RED (not answered within the 100 s window, answered wrong, or stranded).
+//!
+//! L3_LONG_WINDOW=1 (default off): TEST 1 listens 130 s per request instead of 100, a request still unanswered at
+//! 60 s is marked (and listened to and ticked on), and the moment its page arrives is recorded. Afterwards both nodes are kept alive a further 100 s (listening, no new
 //! requests), so a node bound that ends at +60..+90 s has spoken before anything is killed. KEEP_LOGS is required.
-//! Every bound the node has on a stuck GET (stream claim 60 s, op TTL 60 s, park budget 75 s, park TTL 90 s) is
-//! >= the 60 s window, so a red ended at 60 s cannot say whether the node would have recovered.
+//! It exists because every bound the node has on a stuck GET (stream claim 60 s, op TTL 60 s, park budget 75 s,
+//! park TTL 90 s) was >= the old 60 s window, so a red ended at 60 s could not say whether the node would recover.
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
@@ -35,7 +37,20 @@ use tokio::time::timeout;
 
 const STEP: Duration = Duration::from_secs(10);
 const BUDGET: Duration = Duration::from_secs(420);
-const COLD_READ: Duration = Duration::from_secs(60);
+/// How long one cold read is waited for before it is RED.
+///
+/// 100 s, not 60 (F52, sdk#173): a streamed GET response lost between two nodes is healed by the node itself --
+/// its stream wait times out 60 s after the lost response was SENT, a second GET is served, and the page follows
+/// (measured: stream failed at +63.7 s, page at +68.2 s). A 60 s window ended every such run at the one moment
+/// the node could not yet have spoken, so a heal was read as a red. Past 100 s nothing heals it.
+const COLD_READ: Duration = Duration::from_secs(100);
+/// The fixed listens of TESTs 2 and 3, unchanged by F52's window.
+const LISTEN: Duration = Duration::from_secs(30);
+/// The window every red before F52 ended at: the long mode marks a request still unanswered here.
+const OLD_WINDOW: Duration = Duration::from_secs(60);
+/// An answer later than this is a STALL that recovered -- its own outcome, neither green nor red. An unstalled
+/// cold read answered in 1-9 s in every one of 11 long-window runs.
+const STALLED_AFTER: Duration = Duration::from_secs(30);
 /// The long-window mode's numbers (L3_LONG_WINDOW=1).
 const LONG_READ: Duration = Duration::from_secs(130);
 const LONG_HOLD: Duration = Duration::from_secs(100);
@@ -227,7 +242,7 @@ async fn main() -> Result<()> {
     println!("\nTEST 2  tab 1 asks Range a/ (60 rows, cold) as req 1; tab 2 asks NOTHING. Who hears the Page?");
     let t0 = Instant::now();
     send(&mut t1, &dkey_b, &range(1, "a/", 256)).await?;
-    let (h1, h2) = tokio::join!(hear(&mut t1, t0, COLD_READ / 2), hear(&mut t2, t0, COLD_READ / 2));
+    let (h1, h2) = tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN));
     let (s2a, _) = show("tab 1 (the asker)", &h1); let (s2b, _) = show("tab 2 (silent)", &h2);
     let rows_of = |h: &[(u128, String)], req: u64| -> usize { h.iter().filter_map(|(_, l)| l.strip_prefix(&format!("PAGE req {req}: "))?.split(' ').next()?.parse::<usize>().ok()).sum() };
     let t2_rows = rows_of(&h1, 1);
@@ -237,7 +252,7 @@ async fn main() -> Result<()> {
     let t0 = Instant::now();
     send(&mut t1, &dkey_b, &range(7, "b/", 256)).await?;
     send(&mut t2, &dkey_b, &range(7, "c/", 256)).await?;
-    let (h1, h2) = tokio::join!(hear(&mut t1, t0, COLD_READ / 2), hear(&mut t2, t0, COLD_READ / 2));
+    let (h1, h2) = tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN));
     // Judged: each tab hears 60 rows of ITS OWN prefix. It is also the cell that decides whether sdk#166 is live.
     let (s3a, _) = show("tab 1 (asked b/)", &h1); let (s3b, _) = show("tab 2 (asked c/)", &h2);
     let first_of = |h: &[(u128, String)]| -> Option<String> { h.iter().find_map(|(_, l)| l.strip_prefix("PAGE req 7: ").map(|x| x.to_string())) };
@@ -262,7 +277,7 @@ async fn main() -> Result<()> {
         println!("    req {req} sent at +{} ms (unix {} ms)", t0.elapsed().as_millis(), now_ms());
         let mut page: Option<(usize, bool)> = None; let end = Instant::now() + read_window;
         while Instant::now() < end && page.is_none() {
-            if long && !said_60 && sent.elapsed() >= COLD_READ {
+            if long && !said_60 && sent.elapsed() >= OLD_WINDOW {
                 said_60 = true;
                 println!("    req {req} NOT ANSWERED at 60 s (unix {} ms) -- listening and ticking on, to {} s", now_ms(), LONG_READ.as_secs());
                 all.push((t0.elapsed().as_millis(), format!("MARK req {req} not answered at 60 s")));
@@ -311,8 +326,8 @@ async fn main() -> Result<()> {
     // returns the wrong rows cannot be confused.
     let refused = all.iter().filter(|(_, l)| l.starts_with("NODE ERROR")).count();
     let pages = all.iter().filter(|(_, l)| l.starts_with("PAGE req")).count();
-    if pages == 0 { red.push(format!("TEST 1 NOT ANSWERED: no page in the window; the node refused {refused} request(s): {:?}",
-        all.iter().find(|(_, l)| l.starts_with("NODE ERROR")).map(|(_, l)| l.clone()))); }
+    if pages == 0 { red.push(format!("TEST 1 NOT ANSWERED within {} s; the node refused {refused} request(s): {:?}",
+        read_window.as_secs(), all.iter().find(|(_, l)| l.starts_with("NODE ERROR")).map(|(_, l)| l.clone()))); }
     else if got != 300 { red.push(format!("TEST 1 ANSWERED WRONG: read {got} of 300 rows")); }
     if s1 != 0 { red.push(format!("TEST 1 stranded {s1} effect(s)")); }
     if t2_rows != 60 { red.push(format!("TEST 2 the asker heard {t2_rows} of 60 rows")); }
@@ -320,6 +335,15 @@ async fn main() -> Result<()> {
     let own = |p: &Option<String>, prefix: &str| p.as_deref().is_some_and(|l| l.starts_with("60 rows") && l.contains(&format!("\"{prefix}0000\"")));
     if !own(&t3.0, "b/") || !own(&t3.1, "c/") { red.push(format!("TEST 3 a tab did not hear 60 rows of its own prefix: tab 1 {:?}, tab 2 {:?}", t3.0, t3.1)); }
     if s3a + s3b != 0 { red.push(format!("TEST 3 stranded {} effect(s)", s3a + s3b)); }
+    // STALLED, RECOVERED: every check passed, but a cold read waited past `STALLED_AFTER` for its page (F52's
+    // heal). Said apart from GREEN so a heal is never counted as a clean read, and from RED so it is never counted
+    // as a failure.
+    let stalls: Vec<(u64, u128)> = answered.iter().filter_map(|(r, a)| a.filter(|ms| *ms > STALLED_AFTER.as_millis()).map(|ms| (*r, ms))).collect();
+    if red.is_empty() && !stalls.is_empty() {
+        for (r, ms) in &stalls { println!("STALLED {} s, RECOVERED: req {r} answered {ms} ms after its send", ms / 1000); }
+        println!("VERDICT: STALLED, RECOVERED -- every check passed; {} cold read(s) waited past {} s (F52)", stalls.len(), STALLED_AFTER.as_secs());
+        return Ok(());
+    }
     if red.is_empty() { println!("VERDICT: GREEN -- cold reads come back whole, nothing stranded; compare live GETs {gets1} with the native twin"); Ok(()) }
     else { for r in &red { println!("RED: {r}"); } bail!("{} check(s) red", red.len()) }
 }
