@@ -37,20 +37,13 @@ use tokio::time::timeout;
 
 const STEP: Duration = Duration::from_secs(10);
 const BUDGET: Duration = Duration::from_secs(420);
-/// How long one cold read is waited for before it is RED.
-///
-/// 100 s, not 60 (F52, sdk#173): a streamed GET response lost between two nodes is healed by the node itself --
-/// its stream wait times out 60 s after the lost response was SENT, a second GET is served, and the page follows
-/// (measured: stream failed at +63.7 s, page at +68.2 s). A 60 s window ended every such run at the one moment
-/// the node could not yet have spoken, so a heal was read as a red. Past 100 s nothing heals it.
-const COLD_READ: Duration = Duration::from_secs(100);
+/// How long one cold read is waited for before it is RED: `probe::verdict::COLD_READ_MS`, where the reason (F52)
+/// is written.
+const COLD_READ: Duration = Duration::from_millis(probe::verdict::COLD_READ_MS as u64);
 /// The fixed listens of TESTs 2 and 3, unchanged by F52's window.
 const LISTEN: Duration = Duration::from_secs(30);
 /// The window every red before F52 ended at: the long mode marks a request still unanswered here.
 const OLD_WINDOW: Duration = Duration::from_secs(60);
-/// An answer later than this is a STALL that recovered -- its own outcome, neither green nor red. An unstalled
-/// cold read answered in 1-9 s in every one of 11 long-window runs.
-const STALLED_AFTER: Duration = Duration::from_secs(30);
 /// The long-window mode's numbers (L3_LONG_WINDOW=1).
 const LONG_READ: Duration = Duration::from_secs(130);
 const LONG_HOLD: Duration = Duration::from_secs(100);
@@ -326,8 +319,10 @@ async fn main() -> Result<()> {
     // returns the wrong rows cannot be confused.
     let refused = all.iter().filter(|(_, l)| l.starts_with("NODE ERROR")).count();
     let pages = all.iter().filter(|(_, l)| l.starts_with("PAGE req")).count();
-    if pages == 0 { red.push(format!("TEST 1 NOT ANSWERED within {} s; the node refused {refused} request(s): {:?}",
-        read_window.as_secs(), all.iter().find(|(_, l)| l.starts_with("NODE ERROR")).map(|(_, l)| l.clone()))); }
+    // NOT ANSWERED is the verdict's, from each request's own answer time; what the node refused meanwhile is said
+    // beside it, since a parked delegate refusing ticks is what a stall looks like from here.
+    if pages == 0 { println!("TEST 1: no page at all; the node refused {refused} request(s): {:?}",
+        all.iter().find(|(_, l)| l.starts_with("NODE ERROR")).map(|(_, l)| l.clone())); }
     else if got != 300 { red.push(format!("TEST 1 ANSWERED WRONG: read {got} of 300 rows")); }
     if s1 != 0 { red.push(format!("TEST 1 stranded {s1} effect(s)")); }
     if t2_rows != 60 { red.push(format!("TEST 2 the asker heard {t2_rows} of 60 rows")); }
@@ -335,17 +330,17 @@ async fn main() -> Result<()> {
     let own = |p: &Option<String>, prefix: &str| p.as_deref().is_some_and(|l| l.starts_with("60 rows") && l.contains(&format!("\"{prefix}0000\"")));
     if !own(&t3.0, "b/") || !own(&t3.1, "c/") { red.push(format!("TEST 3 a tab did not hear 60 rows of its own prefix: tab 1 {:?}, tab 2 {:?}", t3.0, t3.1)); }
     if s3a + s3b != 0 { red.push(format!("TEST 3 stranded {} effect(s)", s3a + s3b)); }
-    // STALLED, RECOVERED: every check passed, but a cold read waited past `STALLED_AFTER` for its page (F52's
-    // heal). Said apart from GREEN so a heal is never counted as a clean read, and from RED so it is never counted
-    // as a failure.
-    let stalls: Vec<(u64, u128)> = answered.iter().filter_map(|(r, a)| a.filter(|ms| *ms > STALLED_AFTER.as_millis()).map(|ms| (*r, ms))).collect();
-    if red.is_empty() && !stalls.is_empty() {
-        for (r, ms) in &stalls { println!("STALLED {} s, RECOVERED: req {r} answered {ms} ms after its send", ms / 1000); }
-        println!("VERDICT: STALLED, RECOVERED -- every check passed; {} cold read(s) waited past {} s (F52)", stalls.len(), STALLED_AFTER.as_secs());
-        return Ok(());
+    // STALLED, RECOVERED is said apart from GREEN, so a heal is never counted as a clean read, and from RED, so it
+    // is never counted as a failure (`probe::verdict`, where every arm is tested).
+    match probe::verdict::cold_read(&answered, red) {
+        probe::verdict::Verdict::Green => { println!("VERDICT: GREEN -- cold reads come back whole, nothing stranded; compare live GETs {gets1} with the native twin"); Ok(()) }
+        probe::verdict::Verdict::StalledRecovered { secs, req } => {
+            println!("VERDICT: STALLED {secs} s, RECOVERED -- req {req}'s page came {secs} s after its send, past {} s (F52); every check passed",
+                probe::verdict::STALLED_AFTER_MS / 1000);
+            Ok(())
+        }
+        probe::verdict::Verdict::Red(why) => { for r in &why { println!("RED: {r}"); } bail!("{} check(s) red", why.len()) }
     }
-    if red.is_empty() { println!("VERDICT: GREEN -- cold reads come back whole, nothing stranded; compare live GETs {gets1} with the native twin"); Ok(()) }
-    else { for r in &red { println!("RED: {r}"); } bail!("{} check(s) red", red.len()) }
 }
 
 /// A connection's ticks, gated as a page gates them (sdk#174): at most one
