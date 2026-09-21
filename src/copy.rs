@@ -463,7 +463,16 @@ impl Copy {
         Ok(())
     }
 
-    /// Pending writes held, and the bytes they hold.
+    /// Pending ENTRIES held — one per (key, write), so a 2-key write counts
+    /// 2 — and the bytes they hold.
+    ///
+    /// Not a count of WRITES: this comment said "writes" while the code
+    /// counted entries, and the outbox compared it with [`queued_count`],
+    /// which does count writes — so a queued multi-key write stopped the
+    /// outbox for ever (craftworks-sdk#139). For writes, see
+    /// [`pending_writes`](Self::pending_writes).
+    ///
+    /// [`queued_count`]: Self::queued_count
     pub fn pending(&self) -> (usize, usize) {
         (self.pending_count, self.pending_bytes)
     }
@@ -671,7 +680,13 @@ impl Copy {
         Some((id, edits))
     }
 
-    /// How many writes are waiting to be sent again.
+    /// How many distinct pending WRITES there are, whatever keys each holds.
+    /// The same unit as [`queued_count`](Self::queued_count).
+    pub fn pending_writes(&self) -> usize {
+        self.pending_ids().len()
+    }
+
+    /// How many distinct WRITES are waiting to be sent again.
     pub fn queued_count(&self) -> usize {
         let mut ids = std::collections::BTreeSet::new();
         for e in self.keys.values() {
