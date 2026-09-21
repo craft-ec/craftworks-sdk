@@ -948,21 +948,11 @@ impl Session {
         limit: usize,
         after: &str,
     ) -> Result<String, JsValue> {
-        let after = if after.is_empty() {
-            None
-        } else {
-            Some(rkey_of(after)?)
-        };
+        let after = if after.is_empty() { None } else { Some(rkey_of(after)?) };
         let p = rkey_of(parent)?;
-        let r = self.db.children(
-            domain,
-            &p,
-            craftworks_sdk::Scan {
-                reverse,
-                limit,
-                after,
-            },
-        );
+        let r = self
+            .db
+            .children(domain, &p, craftworks_sdk::Scan { reverse, limit, after });
         self.answer(r)
     }
 
