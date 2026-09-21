@@ -2905,8 +2905,13 @@ struct Context {
     /// took `in_flight_since = 0`, the next real tick was seconds since 1970,
     /// and every write that outlived one tick was told `Stalled` after about
     /// a second instead of `max_accept_age` (sdk#150, W4 in the cross-call
-    /// matrix). Owed parity's age was taken from the same zero, so it never
-    /// coalesced either.
+    /// matrix).
+    ///
+    /// It does NOT make owed parity coalesce across calls: `Owed`'s
+    /// `last_changed` and `since` are rebuilt as 0 on every rehydrate, so on a
+    /// real node a group's parity fires on the first tick after any call
+    /// boundary, whatever `parity_age` says. That is what fires W4's parity
+    /// mid-commit; it is sdk#150 PR 3's.
     now: u64,
 }
 

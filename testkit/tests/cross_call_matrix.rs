@@ -421,11 +421,14 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
         "eviction ping-pong (cycle)",
     ),
     // The parked write's fetches strand FIRST (the read overflow), so the
-    // `client_version`-after-a-park defect behind it cannot show yet.
+    // `client_version`-after-a-park defect behind it cannot show yet -- and
+    // it stays red past the overflow until sdk#146, which carries the
+    // client's version WITH THE WRITE (one version per shell is overwritten
+    // by whichever client spoke last: executed on #157's review).
     (
         "W3 parked write refused, told why",
         "one-per-call+cold",
-        "parked write's fetches stranded; client_version behind it",
+        "parked write's fetches stranded; the verdict's version waits on sdk#146",
     ),
     // Every write here is multi-block, so the head strand stops the workload
     // before the parity flush it exists for.
