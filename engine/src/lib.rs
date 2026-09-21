@@ -1690,7 +1690,20 @@ impl<B: Blocks> Engine<B> {
         if emitted.is_empty() && applied.root == self.published_root && self.unpublished.is_empty()
         {
             self.root = applied.root;
-            return [State::Accepted, State::Published, State::ParityComplete]
+            let mut told = vec![State::Accepted, State::Published];
+            // ParityComplete only if it is TRUE. The tree is the published
+            // one, but its redundancy may still be owed -- and a write that
+            // re-sends after a lost `Published`, this shortcut's main
+            // customer, is exactly one whose groups ARE still owed. So it
+            // waits on the groups owed now and hears it when they settle, as
+            // a write covered by a superseded group does.
+            let owed: BTreeSet<ParityIds> = self.owed.keys().copied().collect();
+            if owed.is_empty() {
+                told.push(State::ParityComplete);
+            } else {
+                self.parity_waiting.insert((client, write_id), owed);
+            }
+            return told
                 .into_iter()
                 .map(|state| Effect::Notify {
                     client,

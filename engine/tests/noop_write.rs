@@ -121,3 +121,79 @@ fn a_real_change_is_not_published_without_its_head() {
         states(&all, 2)
     );
 }
+
+/// ParityComplete only when TRUE. A no-op made while the published tree's
+/// parity is still owed -- a re-send after a lost `Published`, the shortcut's
+/// main customer -- waits on those groups and hears it with the write that
+/// coded them. Executed by the architect on #164: told ParityComplete at once
+/// while three parity puts were still to come.
+#[test]
+fn a_no_op_while_parity_is_owed_is_parity_complete_only_when_it_is() {
+    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    let big = vec![7u8; 30 * 1024];
+    // No tick yet: published, and its parity still owed.
+    let first = h.step(write(1, b"k/big", &big));
+    let all = settle(&mut h, first);
+    assert_eq!(states(&all, 1), vec![State::Accepted, State::Published]);
+
+    let again = h.step(write(2, b"k/big", &big));
+    assert_eq!(
+        states(&again, 2),
+        vec![State::Accepted, State::Published],
+        "a no-op was told ParityComplete while the tree's parity is still owed"
+    );
+    assert_eq!(to_node(&again), 0);
+
+    // Time passes and the node answers the parity puts.
+    let mut later = Vec::new();
+    for t in 1..=40 {
+        let out = h.step(Event::Tick(1_790_000_000 + t));
+        for f in &out {
+            if let Effect::PutParity { id, .. } = f {
+                later.extend(h.step(Event::PutConfirmed(*id)));
+            }
+        }
+        later.extend(out);
+    }
+    assert!(
+        states(&later, 1).contains(&State::ParityComplete),
+        "{:?}",
+        states(&later, 1)
+    );
+    assert_eq!(
+        states(&later, 2),
+        vec![State::ParityComplete],
+        "the no-op never heard ParityComplete once the parity landed"
+    );
+}
+
+/// A CONTROL, named because it is a door: a write BACK to an earlier value
+/// (A, B, A) is not a no-op against the PUBLISHED tree, so it commits -- its
+/// blocks are emitted again, because the apply does not de-duplicate against
+/// what the node holds. Were that de-duplication ever added, this write would
+/// emit no blocks with a root that is NOT the published one, and the wedge
+/// would return through here.
+#[test]
+fn a_write_back_to_an_earlier_value_commits_and_publishes() {
+    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    for (id, v) in [(1u64, b"A"), (2, b"B")] {
+        let fx = h.step(write(id, b"k/v", v));
+        assert!(states(&settle(&mut h, fx), id).contains(&State::Published));
+    }
+    let back = h.step(write(3, b"k/v", b"A"));
+    assert_eq!(
+        states(&back, 3),
+        vec![State::Accepted],
+        "A->B->A was short-cut"
+    );
+    assert!(
+        to_node(&back) > 0,
+        "A->B->A emitted nothing: the apply now de-duplicates"
+    );
+    let all = settle(&mut h, back);
+    assert!(
+        states(&all, 3).contains(&State::Published),
+        "{:?}",
+        states(&all, 3)
+    );
+}
