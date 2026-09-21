@@ -202,7 +202,9 @@ fn control_a_warm_write_is_one_call() {
 }
 
 /// A parked write NOBODY asks after -- its client went away -- is released
-/// Failed after 3 x reask_after ticks, and the engine is open again.
+/// `Busy` after 3 x reask_after ticks RUN (nothing applied; `Busy` is what a
+/// client re-sends, where `Failed` is rolled back and shown to the person),
+/// and the engine is open again.
 #[test]
 fn a_parked_write_nobody_asks_after_is_released_and_the_engine_opens() {
     let p = engine::Params::default();
@@ -226,7 +228,13 @@ fn a_parked_write_nobody_asks_after_is_released_and_the_engine_opens() {
     );
     let mut released_at = None;
     for k in 1..=4 * p.reask_after {
-        if told(&c.tick_at(T0 + k * 1000), 1).contains(&WriteState::Failed) {
+        let t = told(&c.tick_at(T0 + k * 1000), 1);
+        assert!(
+            !t.iter()
+                .any(|s| matches!(s, WriteState::Failed | WriteState::Lost)),
+            "a parked write was told {t:?}: rolled back, where nothing was wrong with it"
+        );
+        if t.contains(&WriteState::Busy) {
             released_at = Some(k);
             break;
         }
@@ -244,5 +252,192 @@ fn a_parked_write_nobody_asks_after_is_released_and_the_engine_opens() {
         told(&next, 2).contains(&WriteState::Published),
         "the engine stayed closed: {:?}",
         told(&next, 2)
+    );
+}
+
+/// THE CLOCK STOOD STILL (the architect's sdk#196 review, executed). While a
+/// chain is served the node runs nothing else, so no tick runs and the
+/// engine's `now` does not move; each chain here takes 50 s of wall time (64
+/// GETs at ~0.75 s -- an ordinary cold write on a real network). The client
+/// asks after its write as each chain ends, and the next tick to run carries
+/// the real time, +50 s. Measured as `now - stamp`, that jump was the write's
+/// "silence" and it was released `Failed` while its client was asking. Counted
+/// in ticks run, it is never released and it publishes.
+#[test]
+fn a_park_the_clock_did_not_see_is_not_the_write_s_silence() {
+    let node = FullNode::cold_over(&written(600));
+    let mut c = node.connect();
+    c.client(&Request::Identity);
+    let _ = c.tick_at(T0);
+    let ops: Vec<Op> = (0..120u64)
+        .map(|i| {
+            Op::Put(
+                format!("t/{:06}", i * 5).into_bytes(),
+                value(20_000 + i, 1024),
+            )
+        })
+        .collect();
+    let (mut seen, _) = chain(&mut c, &Request::Write { write_id: 1, ops });
+    let mut all = told(&seen, 1);
+    let mut clock = T0;
+    let mut chains = 1;
+    while !all.contains(&WriteState::Published) && chains < 16 {
+        clock += 50_000;
+        let (o, _) = chain(&mut c, &Request::AskWrite { write_id: 1 });
+        seen = o;
+        seen.extend(c.tick_at(clock));
+        all.extend(told(&seen, 1));
+        chains += 1;
+    }
+    println!("  50 s per chain, no tick between: {chains} chains, told {all:?}");
+    assert!(
+        !all.iter()
+            .any(|s| matches!(s, WriteState::Failed | WriteState::Lost | WriteState::Busy)),
+        "a write whose client was asking was released: {all:?}"
+    );
+    assert!(
+        all.contains(&WriteState::Published),
+        "never published: {all:?}"
+    );
+    assert!(
+        chains >= 3,
+        "the write needed fewer than three chains: the test is empty"
+    );
+}
+
+/// Asking after a write the engine FINISHED and forgot -- its `Published`
+/// dropped or delivered to another tab (F39, F49) -- gets NO verdict. It was
+/// told `Lost` by absence, which rolled back a write that is in the tree.
+#[test]
+fn asking_after_a_finished_write_gets_no_verdict() {
+    let node = FullNode::new();
+    let mut c = node.connect();
+    c.client(&Request::Identity);
+    let out = c.client(&Request::Write {
+        write_id: 1,
+        ops: vec![Op::Put(b"k".to_vec(), b"v".to_vec())],
+    });
+    assert!(
+        told(&out, 1).contains(&WriteState::Published),
+        "the control write did not publish"
+    );
+    let asked = c.client(&Request::AskWrite { write_id: 1 });
+    assert_eq!(
+        told(&asked, 1),
+        Vec::<WriteState>::new(),
+        "a published write the engine forgot was given a verdict"
+    );
+}
+
+/// A write whose client keeps asking is never released, however long its
+/// blocks take: every ask is heard, and silence counts only ticks with no
+/// ask between. The node here HOLDS its answers for 60 s of ticks while the
+/// client asks each second; released, the write publishes.
+#[test]
+fn a_write_whose_client_keeps_asking_is_never_released() {
+    let p = engine::Params::default();
+    let node = FullNode::cold_over(&written(300));
+    let mut c = node.connect();
+    c.client(&Request::Identity);
+    let _ = c.tick_at(T0);
+    c.hold_answers();
+    let ops: Vec<Op> = (0..20u64)
+        .map(|i| {
+            Op::Put(
+                format!("t/{:06}", i * 15).into_bytes(),
+                value(20_000 + i, 1024),
+            )
+        })
+        .collect();
+    let mut all = told(&c.client(&Request::Write { write_id: 1, ops }), 1);
+    assert!(
+        c.held() > 0,
+        "nothing was held: the write never waited on a block"
+    );
+    let secs = 4 * p.reask_after;
+    for k in 1..=secs {
+        all.extend(told(&c.tick_at(T0 + k * 1000), 1));
+        all.extend(told(&c.client(&Request::AskWrite { write_id: 1 }), 1));
+    }
+    assert!(
+        !all.iter()
+            .any(|s| matches!(s, WriteState::Busy | WriteState::Failed | WriteState::Lost)),
+        "released after {secs} s while its client asked every second: {all:?}"
+    );
+    // The node stops holding; what it held is delivered, and every ask's
+    // re-fetch of the same blocks with it (a duplicate answer is ignored).
+    c.stop_holding();
+    let mut k = secs;
+    while c.held() > 0 && k < secs + 200 {
+        all.extend(told(&c.release_one(), 1));
+        k += 1;
+        all.extend(told(&c.tick_at(T0 + k * 1000), 1));
+        all.extend(told(&c.client(&Request::AskWrite { write_id: 1 }), 1));
+        if all.contains(&WriteState::Published) {
+            break;
+        }
+    }
+    println!("  held {secs} s with an ask a second, then released: told {all:?}");
+    assert!(
+        all.contains(&WriteState::Published),
+        "never published: {all:?}"
+    );
+}
+
+/// A GET ANSWER LOST FROM THE WRITE'S CHAIN (sdk#173's event) is fetched
+/// again by its WRITER's next ask, and the write's verdicts are said in the
+/// writer's own chain (the architect's sdk#196 v4-bridge review, executed).
+/// The ask returned nothing while the round was "still out": the write was
+/// neither fetched nor released for as long as its client kept asking, and a
+/// block fetched by ANOTHER tab's chain carried its Published to that tab.
+#[test]
+fn a_lost_get_answer_is_fetched_again_by_the_writer_s_ask() {
+    let node = FullNode::cold_over(&written(300));
+    let mut c = node.connect();
+    c.client(&Request::Identity);
+    let _ = c.tick_at(T0);
+    c.hold_answers();
+    let ops: Vec<Op> = (0..20u64)
+        .map(|i| {
+            Op::Put(
+                format!("t/{:06}", i * 15).into_bytes(),
+                value(20_000 + i, 1024),
+            )
+        })
+        .collect();
+    let _ = c.client(&Request::Write { write_id: 1, ops });
+    let held = c.held();
+    assert!(
+        held >= 1,
+        "the write's round held no answer: nothing to lose"
+    );
+    assert!(c.lose_one_held(), "nothing lost");
+    let mut all = Vec::new();
+    while c.held() > 0 {
+        all.extend(told(&c.release_one(), 1));
+    }
+    c.stop_holding();
+    assert!(
+        all.is_empty(),
+        "the write went on with an answer missing: {all:?}"
+    );
+    let mut in_asks = Vec::new();
+    let mut first_ask_gets = None;
+    for _ in 0..4 {
+        let (o, g) = chain(&mut c, &Request::AskWrite { write_id: 1 });
+        first_ask_gets.get_or_insert(g);
+        in_asks.extend(told(&o, 1));
+        if in_asks.contains(&WriteState::Published) {
+            break;
+        }
+    }
+    println!("  one answer lost of {held}: the first ask re-fetched {first_ask_gets:?} GETs; told in the writer's asks {in_asks:?}");
+    assert!(
+        first_ask_gets.unwrap_or(0) >= 1,
+        "the writer's ask fetched nothing: the lost block was never asked again"
+    );
+    assert!(
+        in_asks.contains(&WriteState::Published),
+        "the write was not published in its writer's own chain: {in_asks:?}"
     );
 }

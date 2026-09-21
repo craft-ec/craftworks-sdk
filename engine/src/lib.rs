@@ -806,11 +806,21 @@ struct ParkedWrite {
     /// asks after it (`AskWrite`), which starts a new chain.
     #[serde(default)]
     gets: u32,
-    /// The engine's `now` when this write last heard anything -- a block it
-    /// asked for, or its client asking after it. Silent for
-    /// `3 * reask_after`, it is released `Failed` (the client re-sends).
+    /// Ticks RUN since this write last heard anything -- a block it asked
+    /// for, or its client asking after it. Counted in ticks that ran, never
+    /// as `now - stamp`: the engine's clock moves only when a tick runs, and
+    /// none runs while the delegate is parked on a chain, so a stamp is stale
+    /// by exactly the park and the first tick after it measured the PARK as
+    /// the write's silence (the architect's sdk#196 review, executed: a 64-GET
+    /// chain at ~0.75 s a GET is ~48 s -- the ordinary cold write). At
+    /// `3 * reask_after` it is released `Busy`: nothing of it is applied and
+    /// its client re-sends it.
     #[serde(default)]
-    heard_at: u64,
+    idle_ticks: u64,
+    /// The engine time of the last tick counted, so two tabs ticking the same
+    /// second count once.
+    #[serde(default)]
+    idle_at: u64,
 }
 
 /// A commit in flight: one apply, one head bump.
@@ -1514,29 +1524,46 @@ impl<B: Blocks> Engine<B> {
         if let Some(p) = self.parked_write.as_mut() {
             if p.client == client && p.write_id == write_id {
                 p.gets = 0;
-                p.heard_at = self.now;
+                p.idle_ticks = 0;
                 if !p.needs.is_empty() {
-                    // Its round is still out: nothing to continue yet.
-                    return Vec::new();
+                    // ITS ROUND IS STILL OUT -- and cannot be: the node runs
+                    // no ask while this write's chain is live, so a block
+                    // still needed when its client asks is an answer that
+                    // chain LOST (sdk#173's event). Asked again HERE, in the
+                    // writer's own chain: returning nothing left the write
+                    // neither fetched nor released for as long as its client
+                    // kept asking, and let another tab's chain fetch the
+                    // block and carry the write's verdicts where the writer
+                    // never hears them (F49; the architect's sdk#196 v4-bridge
+                    // review, executed). Paced by the asks themselves: at most
+                    // one unanswered per session, a second apart.
+                    p.gets = p.needs.len() as u32;
+                    let attempt = p.rounds;
+                    return p
+                        .needs
+                        .iter()
+                        .map(|id| Effect::FetchBlock {
+                            id: *id,
+                            via: read::Via::Direct,
+                            attempt,
+                        })
+                        .collect();
                 }
                 let p = p.clone();
                 return self.apply_write(p.client, p.write_id, p.ops, p.bytes);
             }
         }
-        let known = self.folded.iter().any(|(_, w)| *w == write_id)
-            || self
-                .pending
-                .as_ref()
-                .is_some_and(|c| c.writes.iter().any(|(_, w)| *w == write_id))
-            || self.parity_waiting.keys().any(|(_, w)| *w == write_id);
-        if known {
-            return Vec::new();
-        }
-        vec![Effect::Notify {
-            client,
-            write_id,
-            state: State::Lost,
-        }]
+        // A WRITE THIS ENGINE DOES NOT KNOW IS NOT A LOST WRITE. It may be
+        // one it published and forgot, whose `Published` was dropped or went
+        // to another tab (F39, F49): `Lost` here rolled back a write that IS
+        // in the tree (the architect's sdk#196 review, executed). `Lost` is
+        // said only on positive evidence about THIS (client, write id) -- a
+        // commit released lost -- and not knowing is not evidence: no verdict.
+        // The client's own timeout decides what it does not hear about. (A
+        // ledger in the head value, WRITE-PATH rev 3, is what will let an
+        // engine answer "published" for a write it has forgotten.)
+        let _ = client;
+        Vec::new()
     }
 
     /// Take a root as the published one, and tell whoever was watching.
@@ -2186,7 +2213,8 @@ impl<B: Blocks> Engine<B> {
             gets: gets + needs.len() as u32,
             needs,
             bytes: size,
-            heard_at: self.now,
+            idle_ticks: 0,
+            idle_at: self.now,
         });
         out
     }
@@ -2204,7 +2232,7 @@ impl<B: Blocks> Engine<B> {
         if !p.needs.remove(&id) {
             return Vec::new();
         }
-        p.heard_at = self.now;
+        p.idle_ticks = 0;
         if !p.needs.is_empty() {
             // Still waiting on the rest of this round's blocks. Running now
             // would spend a round to stop at the very next one.
@@ -2990,11 +3018,6 @@ impl<B: Blocks> Engine<B> {
                     c.settle_at = now;
                 }
             }
-            if let Some(p) = self.parked_write.as_mut() {
-                if p.heard_at == 0 {
-                    p.heard_at = now;
-                }
-            }
             // A group first owed before any clock is dated from the first,
             // or its age bound would fire at once.
             for o in self.owed.values_mut() {
@@ -3019,7 +3042,7 @@ impl<B: Blocks> Engine<B> {
                 c.settle_at = now;
             }
             if let Some(p) = self.parked_write.as_mut() {
-                p.heard_at = now;
+                p.idle_at = now;
             }
             for o in self.owed.values_mut() {
                 o.since = now;
@@ -3043,22 +3066,35 @@ impl<B: Blocks> Engine<B> {
     }
 
     /// A parked write that has heard NOTHING -- no block it asked for, no
-    /// client asking after it -- for `3 * reask_after` is released `Failed`
-    /// (nothing of it is in the tree; its client re-sends). Waiting for a
-    /// continuation that never comes would otherwise keep the engine `Busy`
-    /// to every writer for good (sdk#174; the audit's E7 in general, PR 6).
+    /// client asking after it -- for `3 * reask_after` TICKS RUN is released
+    /// `Busy`: nothing of it is in the tree, and `Busy` is the verdict a
+    /// client re-sends (`Failed` is rolled back and shown to the person).
+    /// Waiting for a continuation that never comes would otherwise keep the
+    /// engine `Busy` to every writer for good (sdk#174; the audit's E7 in
+    /// general, PR 6).
+    ///
+    /// A tick that RAN is the only honest unit: the node runs one request at
+    /// a time, so a tick running means no chain of this write is being
+    /// served at that moment. A tick carrying the same time as the last one
+    /// counted (another tab, the same second) is not another second.
     fn release_silent_parked_write(&mut self, now: u64) -> Vec<Effect> {
-        let Some(p) = self.parked_write.as_ref() else {
+        let limit = 3 * self.params.reask_after;
+        let Some(p) = self.parked_write.as_mut() else {
             return Vec::new();
         };
-        if p.heard_at == 0 || now.saturating_sub(p.heard_at) < 3 * self.params.reask_after {
+        if now <= p.idle_at {
+            return Vec::new();
+        }
+        p.idle_at = now;
+        p.idle_ticks += 1;
+        if p.idle_ticks < limit {
             return Vec::new();
         }
         let p = self.parked_write.take().expect("checked");
         vec![Effect::Notify {
             client: p.client,
             write_id: p.write_id,
-            state: State::Failed,
+            state: State::Busy,
         }]
     }
 
@@ -3742,7 +3778,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 10;
+const CONTEXT_VERSION: u16 = 11;
 
 /// What a context this build wrote begins with.
 ///

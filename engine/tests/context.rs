@@ -864,9 +864,14 @@ fn a_refused_context_recovers_from_the_head_and_reports_the_write_lost() {
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec![engine::State::Lost],
-        "a client asking about the write in flight when the context was \
-         refused was not told Lost, so it cannot know whether to re-submit"
+        Vec::<engine::State>::new(),
+        "a client asking about a write this fresh engine has no record of was \
+         told something. Not knowing is not evidence (sdk#196 review): the \
+         write may be one that published and whose Published was lost, so \
+         `Lost` would roll back a write that is in the tree. No verdict; the \
+         client's own timeout decides"
     );
-    println!("  refused context: fresh start, head re-read, write reported Lost");
+    println!(
+        "  refused context: fresh start, head re-read, the unknown write answered with no verdict"
+    );
 }

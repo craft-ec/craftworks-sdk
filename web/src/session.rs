@@ -294,6 +294,9 @@ impl Session {
             }
             Incoming::Ack(kind) => self.on_ack(kind),
             Incoming::Refused(why) => {
+                // A refused frame will never run: the refusal is its answer
+                // (sdk#196 review, 1b), or the tick and ask gates lag for good.
+                self.db.store_mut().client.frame_refused();
                 // The node's wording, kept for display. Nothing branches on
                 // it: the node chose it, and a reason that steers control flow
                 // is an input from a stranger.
@@ -1227,7 +1230,13 @@ impl Session {
         // says what time it is. Owed parity was therefore never put and a
         // stuck commit was never reported `Stalled`, on a page that was
         // ticking a thousand times a minute.
+        //
+        // At most one unanswered tick per session (sdk#174): a refused one is
+        // benign, the next carries the time as it is then.
         self.db.store_mut().send_tick(now);
+        // And the continuation of a write the engine parked: it runs when
+        // its client asks after it, and nothing else asks (sdk#174).
+        self.db.store_mut().ask_unheard(now);
         // THROUGH THE STORE'S OWN TICK, not straight to the copy.
         //
         // This called `copy.time_out(now)` directly, which does the rolling

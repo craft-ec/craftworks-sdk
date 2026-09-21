@@ -61,6 +61,13 @@ pub enum Event {
     Stale { sub_id: u64 },
 }
 
+/// The kinds of frame that go at most one at a time.
+#[derive(Clone, Copy)]
+enum OneKind {
+    Tick,
+    Ask,
+}
+
 /// The client's side of the wire. No socket, no clock, no blocking.
 pub struct Client {
     /// Requests encoded and waiting for the host to send them.
@@ -107,6 +114,11 @@ pub struct Client {
     /// Write states for ANOTHER session's writes, delivered here because
     /// every tab shares one delegate. Counted, never applied.
     pub foreign_write_states: usize,
+    /// This session's frames against the reports that answered them, and the
+    /// two kinds that go at most one at a time (craftworks-sdk#174).
+    frames: crate::tick_gate::Frames,
+    pub ticks: crate::tick_gate::OneAtATime,
+    pub asks: crate::tick_gate::OneAtATime,
 }
 
 impl Default for Client {
@@ -141,6 +153,9 @@ impl Client {
             session: random.map(|b| protocol::mint_session(u64::from_le_bytes(b))),
             unsent_no_session: 0,
             foreign_write_states: 0,
+            frames: Default::default(),
+            ticks: Default::default(),
+            asks: Default::default(),
         }
     }
 
@@ -245,9 +260,73 @@ impl Client {
             return;
         };
         match protocol::encode_session_request(protocol::CURRENT, session, r) {
-            Ok(bytes) => self.outbound.push(bytes),
+            Ok(bytes) => {
+                self.outbound.push(bytes);
+                self.frames.sent();
+            }
             Err(_) => self.unencodable += 1,
         }
+    }
+
+    /// Send `r` if no frame of its kind is unanswered — `true` if it went.
+    ///
+    /// The one door for the two kinds that go at most one at a time: a Tick
+    /// and an AskWrite (craftworks-sdk#174). See [`crate::tick_gate`].
+    fn send_one_at_a_time(&mut self, kind: OneKind, now_ms: u64, r: &Request) -> bool {
+        let gate = match kind {
+            OneKind::Tick => &mut self.ticks,
+            OneKind::Ask => &mut self.asks,
+        };
+        if !gate.may(now_ms, &mut self.frames) {
+            return false;
+        }
+        let before = self.frames;
+        self.send(r);
+        if self.frames == before {
+            // Not sent (no session, unencodable): nothing is outstanding.
+            return false;
+        }
+        let gate = match kind {
+            OneKind::Tick => &mut self.ticks,
+            OneKind::Ask => &mut self.asks,
+        };
+        gate.went(now_ms, &self.frames);
+        true
+    }
+
+    /// The node REFUSED one of this connection's frames with a host error
+    /// (a full queue behind a parked delegate, F50; the 102nd, F51): that
+    /// frame will never run, so the refusal IS its answer. Counted as one, or
+    /// every refusal left the one-at-a-time gates a frame behind for good and
+    /// two of them shut both for `FORGET_MS` (the architect's sdk#196 review,
+    /// executed: 2 refused → 22 ticks and 22 asks in 120 s, against 121).
+    ///
+    /// The host error does not say WHICH request it refuses, and a refused
+    /// client-API request (a subscribe) is counted too: the gate may then open
+    /// one frame early once, never shut.
+    pub fn frame_refused(&mut self) {
+        self.frames.answered();
+    }
+
+    /// TELL THE DELEGATE THE TIME — unless a tick of ours is unanswered.
+    ///
+    /// AT MOST ONE UNANSWERED TICK PER SESSION, ALWAYS. A refused tick costs
+    /// nothing: the one outstanding will be answered, and the next goes with
+    /// the time as it is THEN.
+    pub fn send_tick(&mut self, now_ms: u64) -> bool {
+        self.send_one_at_a_time(
+            OneKind::Tick,
+            now_ms,
+            &Request::Tick {
+                now: protocol::tick_of(now_ms),
+            },
+        )
+    }
+
+    /// Ask after a write — the continuation of a write the engine parked
+    /// (sdk#174) — unless an ask of ours is unanswered.
+    pub fn send_ask(&mut self, now_ms: u64, write_id: u64) -> bool {
+        self.send_one_at_a_time(OneKind::Ask, now_ms, &Request::AskWrite { write_id })
     }
 
     /// Requests that could not be encoded, so were never sent.
@@ -314,6 +393,13 @@ impl Client {
             }
         };
         self.record_reply(&reply);
+        if let Reply::Call {
+            saw: protocol::Saw::Client,
+            ..
+        } = reply
+        {
+            self.frames.answered();
+        }
         match reply {
             Reply::Changed {
                 sub_id,
