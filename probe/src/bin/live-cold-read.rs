@@ -13,6 +13,13 @@
 //!
 //! usage: L3_PORT=<base port> live-cold-read <engine_delegate.wasm> <block.wasm> <register.wasm>
 //!        (uses base, base+1 for A's ws/net and base+10, base+11 for B's)
+//!
+//! L3_LONG_WINDOW=1 (default off; the ordinary probe is unchanged without it): TEST 1 listens 130 s per request
+//! instead of 60, and a request not answered at 60 s is NOT given up -- it goes on listening and ticking, and the
+//! moment its page arrives is recorded. Afterwards both nodes are kept alive a further 100 s (listening, no new
+//! requests), so a node bound that ends at +60..+90 s has spoken before anything is killed. KEEP_LOGS is required.
+//! Every bound the node has on a stuck GET (stream claim 60 s, op TTL 60 s, park budget 75 s, park TTL 90 s) is
+//! >= the 60 s window, so a red ended at 60 s cannot say whether the node would have recovered.
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
@@ -29,6 +36,12 @@ use tokio::time::timeout;
 const STEP: Duration = Duration::from_secs(10);
 const BUDGET: Duration = Duration::from_secs(420);
 const COLD_READ: Duration = Duration::from_secs(60);
+/// The long-window mode's numbers (L3_LONG_WINDOW=1).
+const LONG_READ: Duration = Duration::from_secs(130);
+const LONG_HOLD: Duration = Duration::from_secs(100);
+const LONG_BUDGET: Duration = Duration::from_secs(720);
+
+fn long_window() -> bool { std::env::var("L3_LONG_WINDOW").is_ok_and(|v| v == "1") }
 
 struct Live { child: Option<Child>, ws: u16 }
 impl Live {
@@ -140,6 +153,10 @@ fn show(title: &str, log: &[(u128, String)]) -> (u32, u32) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let started = Instant::now();
+    let long = long_window();
+    let (read_window, budget) = if long { (LONG_READ, LONG_BUDGET) } else { (COLD_READ, BUDGET) };
+    if long && std::env::var("KEEP_LOGS").is_err() { bail!("L3_LONG_WINDOW=1 needs KEEP_LOGS=<dir>: its runs are read from the node logs"); }
+    if long { println!("mode: LONG WINDOW -- TEST 1 {} s per request, not given up at 60 s; nodes held {} s after", LONG_READ.as_secs(), LONG_HOLD.as_secs()); }
     let base: u16 = std::env::var("L3_PORT").ok().and_then(|p| p.parse().ok()).context("L3_PORT=<base port> is required; there is no default")?;
     let mut a = std::env::args().skip(1);
     let (dw, bw, rw) = (a.next().context("usage: live-cold-read <engine_delegate.wasm> <block.wasm> <register.wasm>")?, a.next().unwrap_or_default(), a.next().unwrap_or_default());
@@ -233,12 +250,23 @@ async fn main() -> Result<()> {
     send(&mut t1, &dkey_b, &Request::Identity).await?; g1.sent(); let idw = hear(&mut t1, started, Duration::from_secs(3)).await; g1.heard(&idw);
     println!("    fresh connection: {:?}", idw.iter().filter(|(_, l)| l.starts_with("identity")).map(|(_, l)| l.clone()).next_back());
     let t0 = Instant::now(); let mut got = 0usize; let mut after: Option<Vec<u8>> = None; let mut all = Vec::new(); let mut req = 20u64;
+    // Wall clock of TEST 1's start, so a line here can be put beside the nodes' own timestamps.
+    println!("    TEST 1 t0 = unix {} ms", now_ms());
+    // (req, ms after ITS send that its answer came, or None) -- the long mode's measurement.
+    let mut answered: Vec<(u64, Option<u128>)> = Vec::new();
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     loop {
         let mut r = range(req, "w/", 256); if let Request::Range { after: a, .. } = &mut r { *a = after.clone(); }
         send(&mut t1, &dkey_b, &r).await?; g1.sent();
-        let mut page: Option<(usize, bool)> = None; let end = Instant::now() + COLD_READ;
+        let sent = Instant::now(); let mut said_60 = false;
+        println!("    req {req} sent at +{} ms (unix {} ms)", t0.elapsed().as_millis(), now_ms());
+        let mut page: Option<(usize, bool)> = None; let end = Instant::now() + read_window;
         while Instant::now() < end && page.is_none() {
+            if long && !said_60 && sent.elapsed() >= COLD_READ {
+                said_60 = true;
+                println!("    req {req} NOT ANSWERED at 60 s (unix {} ms) -- listening and ticking on, to {} s", now_ms(), LONG_READ.as_secs());
+                all.push((t0.elapsed().as_millis(), format!("MARK req {req} not answered at 60 s")));
+            }
             let h = hear(&mut t1, t0, Duration::from_millis(1000)).await;
             g1.heard(&h);
             for (_, l) in &h { if l.starts_with(&format!("PAGE req {req}:")) { let n: usize = l.split(": ").nth(1).and_then(|x| x.split(' ').next()).and_then(|x| x.parse().ok()).unwrap_or(0); page = Some((n, l.ends_with("more: true"))); }
@@ -250,16 +278,27 @@ async fn main() -> Result<()> {
                 last_tick = Instant::now();
             }
         }
+        answered.push((req, page.map(|_| sent.elapsed().as_millis())));
+        if let Some(ms) = answered.last().and_then(|(_, a)| *a) { println!("    req {req} answered {ms} ms after its send (unix {} ms)", now_ms()); }
         match page { Some((n, more)) => { got += n; if !more || n == 0 { break; } after = Some(format!("w/{:04}", got - 1).into_bytes()); req += 1; }
-                     None => { println!("    no answer to req {req} within {COLD_READ:?}"); break; } }
-        if started.elapsed() > BUDGET { println!("    BUDGET reached"); break; }
+                     None => { println!("    no answer to req {req} within {read_window:?}"); break; } }
+        if started.elapsed() > budget { println!("    BUDGET reached"); break; }
     }
-    let (s1, gets1) = show("tab 1", &all);
+    if long {
+        // HOLD: both nodes stay up so a bound past the window still gets to speak in their logs. Listening only.
+        println!("    holding both nodes {} s after TEST 1 (unix {} ms), listening, no requests", LONG_HOLD.as_secs(), now_ms());
+        let late = hear(&mut t1, t0, LONG_HOLD).await;
+        for (ms, l) in late.iter().filter(|(_, l)| !l.starts_with("call")) { println!("    held  {ms:>6} ms  {l}"); }
+        all.extend(late.into_iter().map(|(ms, l)| (ms, format!("HELD {l}"))));
+        println!("    hold over (unix {} ms)", now_ms());
+        for (r, a) in &answered { println!("    ANSWER req {r}: {}", a.map_or("none".to_string(), |ms| format!("{ms} ms after send"))); }
+    }
+    let (s1, gets1) = show("tab 1", &all.iter().filter(|(_, l)| !l.starts_with("HELD ")).cloned().collect::<Vec<_>>());
     println!("    => {got} of 300 rows in {:.1} s; live GETs (node ops over its calls) {gets1}", t0.elapsed().as_secs_f32());
     println!("    ticks (gated, sdk#174): setup on A sent {} withheld {} forgotten {}; TEST 1 sent {} withheld {} forgotten {}",
         ga.sent_ticks, ga.t.refused, ga.t.forgotten, g1.sent_ticks, g1.t.refused, g1.t.forgotten);
 
-    println!("\ndone in {:.1} s (budget {} s). Nodes are killed by their handles; temp tree removed.", started.elapsed().as_secs_f32(), BUDGET.as_secs());
+    println!("\ndone in {:.1} s (budget {} s). Nodes are killed by their handles; temp tree removed.", started.elapsed().as_secs_f32(), budget.as_secs());
     drop(node_b); drop(node_a);
     if let Ok(keep) = std::env::var("KEEP_LOGS") {
         for n in ["a", "b"] { let _ = std::fs::create_dir_all(format!("{keep}/{n}"));
