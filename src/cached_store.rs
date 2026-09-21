@@ -60,9 +60,6 @@ pub struct CachedStore {
     rolled_back: std::collections::BTreeSet<Vec<u8>>,
     /// Verdicts for writes this client never issued.
     unknown_verdicts: usize,
-    /// Writes SENT and not yet answered with any verdict: what is at the node
-    /// (sdk#176). Never more than [`WRITES_IN_FLIGHT`].
-    unanswered: std::collections::BTreeSet<u64>,
     /// Writes made while the window was full, oldest first: in the copy
     /// already, sent as the window opens.
     held: std::collections::VecDeque<(u64, Request)>,
@@ -82,7 +79,6 @@ impl CachedStore {
             refused: Vec::new(),
             rolled_back: std::collections::BTreeSet::new(),
             unknown_verdicts: 0,
-            unanswered: std::collections::BTreeSet::new(),
             held: std::collections::VecDeque::new(),
             in_flight_high_water: 0,
             now_ms,
@@ -91,30 +87,34 @@ impl CachedStore {
 
     /// Send a write if the window has room, else hold it — in order.
     fn dispatch(&mut self, write_id: u64, request: Request) {
-        if self.unanswered.len() >= WRITES_IN_FLIGHT || !self.held.is_empty() {
+        if self.copy.at_node_count() >= WRITES_IN_FLIGHT || !self.held.is_empty() {
             // Behind anything already held: writes go out in the order made.
             self.copy.hold(write_id);
             self.held.push_back((write_id, request));
             return;
         }
-        self.client.send(&request);
-        self.unanswered.insert(write_id);
-        self.in_flight_high_water = self.in_flight_high_water.max(self.unanswered.len());
+        self.send_write(write_id, &request);
+    }
+
+    /// The ONE place a write reaches the wire: it takes a window slot and its
+    /// timeout starts now ([`Copy::sent`]).
+    fn send_write(&mut self, write_id: u64, request: &Request) {
+        self.copy.sent(write_id, (self.now_ms)());
+        self.client.send(request);
+        self.in_flight_high_water = self.in_flight_high_water.max(self.copy.at_node_count());
     }
 
     /// The window opened: send what is held, oldest first, while it has room.
     fn fill_window(&mut self) {
-        while self.unanswered.len() < WRITES_IN_FLIGHT {
+        while self.copy.at_node_count() < WRITES_IN_FLIGHT {
             let Some((write_id, request)) = self.held.pop_front() else { break };
-            // A held write the copy has since given up on (timed out) is not
-            // sent: its verdict would be for a write nobody is waiting on.
+            // A held write the copy has since given up on (rolled back behind
+            // a failed one) is not sent: its verdict would be for a write
+            // nobody is waiting on.
             if !self.copy.pending_ids().contains(&write_id) {
                 continue;
             }
-            self.copy.sent(write_id, (self.now_ms)());
-            self.client.send(&request);
-            self.unanswered.insert(write_id);
-            self.in_flight_high_water = self.in_flight_high_water.max(self.unanswered.len());
+            self.send_write(write_id, &request);
         }
     }
 
@@ -222,9 +222,8 @@ impl CachedStore {
         use protocol::WriteState as W;
         // ANY verdict answers the request: it is no longer waiting at the
         // node, so the window has room for the next (sdk#176).
-        if self.unanswered.remove(&write_id) {
-            self.fill_window();
-        }
+        self.copy.answered(write_id);
+        self.fill_window();
         // A verdict for a write this client never issued. The node chose the
         // id, so believing it would let one message clear or fail somebody
         // else's write. Counted rather than applied.
@@ -315,7 +314,8 @@ impl CachedStore {
         };
         // The SAME write_id. A new one would make the engine's verdict about
         // a write this copy no longer knows, and the row would never clear.
-        self.copy.submitted(write_id);
+        // Sent through `dispatch`, so the re-send takes a window slot and
+        // restarts its timeout like any send (sdk#179).
         let request = Request::Write {
             write_id,
             ops: edits
@@ -345,6 +345,10 @@ impl CachedStore {
         let told = self.copy.time_out(now);
         self.rolled_back
             .extend(told.rolled_back_keys.iter().cloned());
+        // A write rolled back took its window slot with it: send what that
+        // frees. Without this, sixteen verdicts that never came left the
+        // outbox holding every later write until reload (sdk#179).
+        self.fill_window();
         told
     }
 

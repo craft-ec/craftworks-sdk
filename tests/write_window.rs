@@ -21,6 +21,30 @@ use std::collections::VecDeque;
 /// The node's fair-queue capacity per key: 100 waiting + 1 in service.
 const NODE_ADMITS: usize = 101;
 
+/// The window, for a test to loop over — or a FAILURE BY NAME when there is
+/// no window worth the name. A test that loops `0..WRITES_IN_FLIGHT` under a
+/// window-removed mutant (`usize::MAX`) makes four billion writes and hangs
+/// instead of failing (it hung for 8+ minutes in review).
+fn window() -> usize {
+    // An `if`, not an `assert!`: the value is a constant today and a mutant
+    // tomorrow, and this line is for the mutant.
+    if WRITES_IN_FLIGHT >= NODE_ADMITS {
+        panic!("the window ({WRITES_IN_FLIGHT}) is not narrower than the node's queue ({NODE_ADMITS}): it bounds nothing");
+    }
+    WRITES_IN_FLIGHT
+}
+
+/// Drive `step` until it reports nothing left, or FAIL BY NAME at `cap`
+/// steps — never spin.
+fn drive(what: &str, cap: usize, mut step: impl FnMut() -> bool) {
+    for _ in 0..cap {
+        if !step() {
+            return;
+        }
+    }
+    panic!("{what}: still going after {cap} steps");
+}
+
 struct QueueingNode {
     conn: testkit::Conn,
     queue: VecDeque<Vec<u8>>,
@@ -60,18 +84,17 @@ fn publish(n: u32) -> (CachedStore, QueueingNode) {
     let mut q = QueueingNode { conn, queue: VecDeque::new(), refused: 0, deepest: 0 };
     s.client.send(&protocol::Request::Identity);
     q.accept(s.take_outbound());
-    while q.serve_one(&mut s) {}
+    drive("the node answering Identity", 100, || q.serve_one(&mut s));
     for i in 0..n {
         s.put(format!("d/notes/{i:08}").as_bytes(), &vec![b'x'; 5 * 1024]);
         q.accept(s.take_outbound());
     }
     // The node works through its queue; each answer may open the window.
-    for _ in 0..100_000 {
-        if !q.serve_one(&mut s) {
-            break;
-        }
+    drive("the node serving the publish", 100_000, || {
+        let served = q.serve_one(&mut s);
         q.accept(s.take_outbound());
-    }
+        served
+    });
     (s, q)
 }
 
@@ -100,7 +123,7 @@ fn a_hundred_and_two_writes_all_publish_and_never_overfill_the_node() {
 #[test]
 fn control_a_burst_fills_the_window() {
     let (s, _q) = publish(40);
-    assert_eq!(s.in_flight_high_water, WRITES_IN_FLIGHT, "the window never filled, so it bounded nothing");
+    assert_eq!(s.in_flight_high_water, window(), "the window never filled, so it bounded nothing");
 }
 
 /// Past the copy's own bound (`max_pending`, 256) a write is refused BY NAME
@@ -141,7 +164,7 @@ fn a_slow_node_publishes_every_write_and_none_is_rolled_back_while_held() {
     let mut q = QueueingNode { conn, queue: VecDeque::new(), refused: 0, deepest: 0 };
     s.client.send(&protocol::Request::Identity);
     q.accept(s.take_outbound());
-    while q.serve_one(&mut s) {}
+    drive("the node answering Identity", 100, || q.serve_one(&mut s));
     let n = s.copy.max_pending;
     for i in 0..n as u32 {
         s.put(format!("d/notes/{i:08}").as_bytes(), &vec![b'x'; 5 * 1024]);
@@ -149,9 +172,9 @@ fn a_slow_node_publishes_every_write_and_none_is_rolled_back_while_held() {
     }
     assert!(s.refused.is_empty(), "{:?}", s.refused);
     let (mut rolled_back, mut since_tick, mut elapsed) = (Vec::new(), 0u64, 0u64);
-    for _ in 0..100_000 {
+    drive("the slow node serving", 100_000, || {
         if !q.serve_one(&mut s) {
-            break;
+            return false;
         }
         clock.advance(SERVE_MS);
         elapsed += SERVE_MS;
@@ -161,7 +184,8 @@ fn a_slow_node_publishes_every_write_and_none_is_rolled_back_while_held() {
             rolled_back.extend(s.tick().rolled_back);
         }
         q.accept(s.take_outbound());
-    }
+        true
+    });
     println!(
         "  {n} writes at {SERVE_MS} ms each: {} s elapsed, rolled back {}, still pending {}, refused by the node {}",
         elapsed / 1000,
@@ -187,13 +211,13 @@ fn control_a_sent_write_with_no_verdict_times_out_from_its_send() {
     let mut q = QueueingNode { conn, queue: VecDeque::new(), refused: 0, deepest: 0 };
     s.client.send(&protocol::Request::Identity);
     q.accept(s.take_outbound());
-    while q.serve_one(&mut s) {}
+    drive("the node answering Identity", 100, || q.serve_one(&mut s));
     let first = s.next_write_id();
-    for i in 0..=WRITES_IN_FLIGHT as u32 {
+    for i in 0..=window() as u32 {
         s.put(format!("d/notes/{i:08}").as_bytes(), b"v");
         q.accept(s.take_outbound());
     }
-    let last = first + WRITES_IN_FLIGHT as u64;
+    let last = first + window() as u64;
     assert_eq!(s.held_count(), 1, "write {last} should be held");
     // At 50 s the node answers write 1 only; the window sends write 17.
     clock.advance(50_000);
@@ -211,4 +235,80 @@ fn control_a_sent_write_with_no_verdict_times_out_from_its_send() {
     clock.advance(1);
     let at_110: Vec<u64> = s.tick().rolled_back.iter().map(|(id, _)| *id).collect();
     assert_eq!(at_110, vec![last], "a sent write with no verdict must still time out");
+}
+
+/// A reply naming THIS store's session.
+fn verdict(s: &CachedStore, write_id: u64, state: protocol::WriteState) -> Vec<u8> {
+    protocol::encode_reply(&protocol::Reply::SessionWriteState {
+        session: s.client.session().expect("a session"),
+        write_id,
+        state,
+    })
+    .expect("encodes")
+}
+
+/// **Sixteen sent writes whose verdicts never come** — the node refused them
+/// with a host error naming no request, or never answered — are rolled back
+/// at 60 s, and THEIR SLOTS GO WITH THEM. RED before (the architect's probe on
+/// 908feb6): a separate set of sent ids was cleared only by a verdict, so
+/// "then 5 more writes: 0 reached the wire; held 5; ten minutes later … still
+/// held 5" — the outbox dead until reload.
+#[test]
+fn sixteen_lost_verdicts_free_the_window() {
+    let (mut s, clock) = testkit::cached_store();
+    for i in 0..window() as u32 {
+        s.put(format!("lost/{i:02}").as_bytes(), b"x");
+    }
+    assert_eq!(s.take_outbound().len(), WRITES_IN_FLIGHT);
+    clock.advance(61_000);
+    let told = s.tick();
+    assert_eq!(told.rolled_back.len(), WRITES_IN_FLIGHT, "the sixteen are rolled back at 60 s");
+    for i in 0..5u32 {
+        s.put(format!("later/{i:02}").as_bytes(), b"y");
+    }
+    assert_eq!(s.take_outbound().len(), 5, "the person's next writes never reached the wire");
+    assert_eq!(s.held_count(), 0);
+}
+
+/// The same, with writes ALREADY HELD when the sixteen time out: the tick that
+/// rolls them back sends the held ones. (Nothing else would: no verdict is
+/// coming to open the window.)
+#[test]
+fn a_time_out_releases_what_the_window_holds() {
+    let (mut s, clock) = testkit::cached_store();
+    for i in 0..window() as u32 + 5 {
+        s.put(format!("w/{i:02}").as_bytes(), b"x");
+    }
+    assert_eq!(s.take_outbound().len(), WRITES_IN_FLIGHT);
+    assert_eq!(s.held_count(), 5);
+    clock.advance(61_000);
+    let told = s.tick();
+    assert_eq!(told.rolled_back.len(), WRITES_IN_FLIGHT);
+    assert_eq!(s.take_outbound().len(), 5, "the five held writes were not released by the tick");
+    assert_eq!(s.held_count(), 0);
+}
+
+/// **Every send restarts the timeout — the `Busy` re-send too.** The
+/// architect's probe on 908feb6: a write answered `Busy` at 0 s and re-sent
+/// at 55 s was rolled back at 61 s — 6 s after the re-send — and the node's
+/// `Published` then arrived for a write the copy no longer had.
+#[test]
+fn a_busy_write_re_sent_is_timed_from_the_re_send() {
+    let (mut s, clock) = testkit::cached_store();
+    s.put(b"K", b"v");
+    let id = s.copy.pending_ids()[0];
+    assert_eq!(s.take_outbound().len(), 1);
+    let busy = verdict(&s, id, protocol::WriteState::Busy);
+    s.on_inbound(&busy);
+    clock.advance(55_000);
+    let _ = s.tick();
+    assert_eq!(s.take_outbound().len(), 1, "the queued write was not re-sent");
+    clock.advance(6_000);
+    let told = s.tick();
+    assert!(told.rolled_back.is_empty(), "rolled back 6 s after its re-send: {:?}", told.rolled_back);
+    assert_eq!(s.copy.pending_ids(), vec![id]);
+    let published = verdict(&s, id, protocol::WriteState::Published);
+    s.on_inbound(&published);
+    assert!(s.copy.pending_ids().is_empty(), "the Published verdict did not clear it");
+    assert_eq!(s.unknown_verdicts(), 0, "the verdict arrived for a write the copy no longer had");
 }
