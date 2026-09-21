@@ -16,8 +16,10 @@ use craftworks_sdk::loads::Page;
 use craftworks_sdk::Loads;
 use protocol::At;
 
+/// Rows inside the `a/` range these tests load (a page outside its load's
+/// range is refused, sdk#166).
 fn rows(n: usize, tag: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
-    (0..n).map(|i| (vec![tag, i as u8], vec![tag])).collect()
+    (0..n).map(|i| (vec![b'a', b'/', tag, i as u8], vec![tag])).collect()
 }
 
 const OLD: At = At {
@@ -77,7 +79,7 @@ fn a_write_between_two_pages_restarts_the_load() {
                 "the restarted load kept rows from the old tree"
             );
             assert!(
-                rows.iter().all(|(k, _)| k[0] != 1),
+                rows.iter().all(|(k, _)| k[2] != 1),
                 "a row from the first, abandoned attempt survived into the result"
             );
         }
@@ -105,8 +107,8 @@ fn control_with_one_head_on_both_pages_the_mixed_range_is_recorded() {
             // Rows from BOTH pages, recorded as one range. With a real write
             // in between, these two tags would be two trees — and nothing
             // here could tell. That is the defect, reproduced.
-            assert!(rows.iter().any(|(k, _)| k[0] == 1));
-            assert!(rows.iter().any(|(k, _)| k[0] == 2));
+            assert!(rows.iter().any(|(k, _)| k[2] == 1));
+            assert!(rows.iter().any(|(k, _)| k[2] == 2));
         }
         other => panic!("the control did not complete: {other:?}"),
     }

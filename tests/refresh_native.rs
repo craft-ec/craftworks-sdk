@@ -41,6 +41,14 @@ fn range() -> (Vec<u8>, Vec<u8>) {
     craftworks_sdk::Db::<CachedStore, craftworks_sdk::SystemEnv>::domain_range("note")
 }
 
+/// A request id for a refresh. The session takes it from the ONE counter its
+/// loads use (`Loads::take_id`, sdk#166); this harness makes a fresh `Loads`
+/// per load, so its refreshes number from far above any of them instead.
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn key(n: u32) -> Vec<u8> {
     let (lo, _) = range();
     let mut k = lo;
@@ -211,7 +219,7 @@ impl Client {
     }
 
     fn refresh(&mut self, r: &mut Refresh) -> Vec<String> {
-        if let Some(req) = r.ask("note", &range().0, &range().1) {
+        if let Some(req) = r.ask(next_id(), "note", &range().0, &range().1) {
             self.store.client.send(&req);
         }
         for reply in self.pump() {
@@ -414,11 +422,11 @@ fn control_a_tab_that_never_asks_sees_nothing_new() {
 fn one_question_per_domain_at_a_time() {
     let mut r = Refresh::new();
     assert!(
-        r.ask("note", &range().0, &range().1).is_some(),
+        r.ask(next_id(), "note", &range().0, &range().1).is_some(),
         "the first ask was refused"
     );
     assert!(
-        r.ask("note", &range().0, &range().1).is_none(),
+        r.ask(next_id(), "note", &range().0, &range().1).is_none(),
         "a second question went out while one was outstanding; a tree somebody \
          is writing to would multiply its traffic by how often it is written"
     );
@@ -433,7 +441,7 @@ fn one_question_per_domain_at_a_time() {
 fn an_empty_delta_moves_nothing() {
     let mut r = Refresh::new();
     let protocol::Request::ChangesSince { req_id, .. } =
-        r.ask("note", &range().0, &range().1).expect("an ask")
+        r.ask(next_id(), "note", &range().0, &range().1).expect("an ask")
     else {
         unreachable!()
     };
@@ -453,7 +461,7 @@ fn an_empty_delta_moves_nothing() {
 fn a_full_reload_forgets_the_root_it_could_not_reconcile() {
     let mut r = Refresh::new();
     let protocol::Request::ChangesSince { req_id, .. } =
-        r.ask("note", &range().0, &range().1).expect("an ask")
+        r.ask(next_id(), "note", &range().0, &range().1).expect("an ask")
     else {
         unreachable!()
     };
@@ -467,7 +475,7 @@ fn a_full_reload_forgets_the_root_it_could_not_reconcile() {
     let _ = r.take_changed();
 
     let protocol::Request::ChangesSince { req_id, from, .. } =
-        r.ask("note", &range().0, &range().1).expect("an ask")
+        r.ask(next_id(), "note", &range().0, &range().1).expect("an ask")
     else {
         unreachable!()
     };
@@ -523,7 +531,7 @@ fn changed_since_load(n: u32) -> (Client, Refresh, Asked) {
     for i in 1..=n {
         a.write(&key(i), b"row");
     }
-    let req = r.ask("note", &range().0, &range().1).expect("Refresh asked nothing");
+    let req = r.ask(next_id(), "note", &range().0, &range().1).expect("Refresh asked nothing");
     b.store.client.send(&req);
     let asked = b
         .pump()
@@ -593,7 +601,7 @@ fn a_delta_of_exactly_one_page_is_complete_when_the_engine_says_so() {
     // boundary — a full page with NO cursor is complete, not "probably more" —
     // is pinned on `Refresh` directly.
     let mut r = Refresh::new();
-    let Some(protocol::Request::ChangesSince { req_id, .. }) = r.ask("note", &range().0, &range().1) else { unreachable!() };
+    let Some(protocol::Request::ChangesSince { req_id, .. }) = r.ask(next_id(), "note", &range().0, &range().1) else { unreachable!() };
     let page: Vec<_> = (0..256).map(|i| (key(i), Some(b"v".to_vec()))).collect();
     assert!(matches!(r.on_delta(req_id, page, None, [3u8; 32]), Answer::Delta { .. }), "256 is not taken to mean more");
     assert_eq!(r.seen("note"), Some([3u8; 32]));
