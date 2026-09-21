@@ -1198,3 +1198,353 @@ fn trace() {
     let driver = if std::env::var("WPM_RESEND").is_ok() { Driver::ResendOnSilence } else { Driver::Today };
     println!("{}", show(seed, Config { driver, ..TODAY }));
 }
+
+// ====================================================================
+// RULE::REV3 — the scripted node's rule for wire v5, at the FRAME level
+// (WRITE-PATH.md revision 3, "The rule"). Fed v5 frames by hand, no client:
+// today's client speaks v4, and the client that speaks v5 is build step 3,
+// which wires this node into the model above. Types from sdk#193.
+// ====================================================================
+
+/// The rev-3 node: the order rule over a tree, a HEAD (root + ledger) that
+/// survives a forget, and a CONTEXT (the commit in flight, what was taken,
+/// what frames were seen) that does not.
+#[derive(Default)]
+struct Rev3Node {
+    tree: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// THE HEAD'S LEDGER: `published_through[S]`, written with the head PUT —
+    /// the same signed record — so it is atomic with the commit and read by
+    /// an engine that has just lost everything.
+    ledger: BTreeMap<u64, u64>,
+    // --- the context: gone on a forget ---
+    commit: Option<Rev3Commit>,
+    taken_through: BTreeMap<u64, u64>,
+    frames_seen: BTreeMap<u64, u64>,
+    /// Every (session, write_id) APPLIED, for W3. APPLIED = TAKEN under the
+    /// rule AND NOT WITHDRAWN: a take whose commit died un-landed — Failed,
+    /// Lost, or a forget before its head PUT — is withdrawn, so the write
+    /// sent again and taken again is a correct recovery, not a double apply.
+    applied: Vec<(u64, u64)>,
+}
+
+#[derive(Clone)]
+struct Rev3Commit {
+    session: u64,
+    write_id: u64,
+    ops: Vec<Op>,
+    landed: bool,
+}
+
+impl Rev3Node {
+    fn next(&self, s: u64) -> u64 {
+        self.ledger.get(&s).copied().unwrap_or(0) + 1
+    }
+
+    fn ack(&self, s: u64, answering: Option<u64>) -> protocol::Ack {
+        protocol::Ack {
+            session: s,
+            published_through: self.ledger.get(&s).copied().unwrap_or(0),
+            taken_through: self.taken_through.get(&s).copied().unwrap_or(0),
+            // The scripted node does not model parity: it does not KNOW, and
+            // says so — never "0 owed".
+            parity: None,
+            frames_seen: self.frames_seen.get(&s).copied().unwrap_or(0),
+            answering,
+        }
+    }
+
+    /// A verdict to session `s`, wrapped with `s`'s Ack. `caller` is the
+    /// session whose frame started this call, and `frame` that frame.
+    fn verdict(&self, s: u64, write_id: u64, state: WriteState, caller: u64, frame: u64) -> Vec<u8> {
+        let answering = (caller == s).then_some(frame);
+        protocol::encode_reply(&Reply::Acked {
+            ack: self.ack(s, answering),
+            body: Box::new(Reply::SessionWriteState { session: s, write_id, state }),
+        })
+        .expect("a verdict encodes")
+    }
+
+    /// One call: a v5 frame in, the replies out.
+    fn call(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
+        let env = match protocol::decode_request(frame) {
+            protocol::Incoming::Ok(env) if env.version >= protocol::FLOOR_SINCE => env,
+            other => panic!("the rev-3 node is fed v5 frames only: {other:?}"),
+        };
+        let (s, f) = (env.session, env.frame.expect("a v5 frame carries its sequence"));
+        let seen = self.frames_seen.entry(s).or_insert(0);
+        *seen = (*seen).max(f);
+        match env.body {
+            Request::WriteFrom { write_id, floor, ops } => {
+                let next = self.next(s);
+                // 1. Below next: already PUBLISHED. Nothing applied; the Ack says so.
+                if write_id < next {
+                    return vec![self.verdict(s, write_id, WriteState::Duplicate, s, f)];
+                }
+                // 2. A commit pending: Busy, `next` untouched.
+                if self.commit.is_some() {
+                    return vec![self.verdict(s, write_id, WriteState::Busy, s, f)];
+                }
+                // 3. The expected one: take it. (`floor > next` is ordinary —
+                //    ids have gaps where a write was refused at make.)
+                let expected = next.max(floor);
+                if write_id == expected {
+                    self.applied.push((s, write_id));
+                    self.taken_through.insert(s, write_id);
+                    self.commit = Some(Rev3Commit { session: s, write_id, ops, landed: false });
+                    return vec![self.verdict(s, write_id, WriteState::Accepted, s, f)];
+                }
+                // 4. Anything else: OutOfOrder, nothing applied.
+                vec![self.verdict(s, write_id, WriteState::OutOfOrder { expected }, s, f)]
+            }
+            // A tick moves the commit one step — and its verdict goes to the
+            // COMMIT's session, whoever ticked (F49's shape).
+            Request::Tick { .. } => self.step(s, f),
+            other => panic!("the rev-3 node's frame tests send WriteFrom and Tick only: {other:?}"),
+        }
+    }
+
+    /// The commit moves one step: its head PUT lands — the tree AND the
+    /// ledger, one record — then it is answered Published.
+    fn step(&mut self, caller: u64, frame: u64) -> Vec<Vec<u8>> {
+        let Some(c) = self.commit.clone() else { return Vec::new() };
+        if !c.landed {
+            for op in &c.ops {
+                match op {
+                    Op::Put(k, v) => {
+                        self.tree.insert(k.clone(), v.clone());
+                    }
+                    Op::Delete(k) => {
+                        self.tree.remove(k);
+                    }
+                }
+            }
+            // ONLY A PUBLISH CONSUMES A NUMBER.
+            self.ledger.insert(c.session, c.write_id);
+            self.commit.as_mut().expect("the commit").landed = true;
+            return Vec::new();
+        }
+        self.commit = None;
+        vec![self.verdict(c.session, c.write_id, WriteState::Published, caller, frame)]
+    }
+
+    /// The commit FAILS (the engine refused it): nothing applied, and the
+    /// number is RELEASED — the ledger does not move.
+    fn fail(&mut self, caller: u64, frame: u64) -> Vec<Vec<u8>> {
+        let Some(c) = self.commit.take() else { return Vec::new() };
+        assert!(!c.landed, "a landed commit does not fail");
+        self.applied.retain(|a| *a != (c.session, c.write_id));
+        vec![self.verdict(c.session, c.write_id, WriteState::Failed, caller, frame)]
+    }
+
+    /// The commit is LOST (a head conflict, settle rounds exhausted) before
+    /// its head lands: nothing applied, and — like Failed — the number is
+    /// RELEASED; only a publish consumes one.
+    fn lose(&mut self, caller: u64, frame: u64) -> Vec<Vec<u8>> {
+        let Some(c) = self.commit.take() else { return Vec::new() };
+        assert!(!c.landed, "a landed commit is not lost: its head holds it");
+        self.applied.retain(|a| *a != (c.session, c.write_id));
+        vec![self.verdict(c.session, c.write_id, WriteState::Lost, caller, frame)]
+    }
+
+    /// The context is LOST: the commit in flight, what was taken, what frames
+    /// were seen. The tree and its head's ledger stay.
+    fn forget(&mut self) {
+        // A take whose head never landed is WITHDRAWN: nothing of it is in the
+        // tree or the ledger. (A landed one stays applied: its head holds it.)
+        if let Some(c) = self.commit.as_ref().filter(|c| !c.landed) {
+            let taken = (c.session, c.write_id);
+            self.applied.retain(|a| *a != taken);
+        }
+        self.commit = None;
+        self.taken_through.clear();
+        self.frames_seen.clear();
+    }
+}
+
+mod rev3 {
+    use super::*;
+
+    const A: u64 = 0x0000_1234_5678_9abc;
+    const B: u64 = 0x0000_2345_6789_abcd;
+
+    fn write(s: u64, frame: u64, write_id: u64, floor: u64, v: &str) -> Vec<u8> {
+        protocol::encode_v5_request(s, 1_790_000_000_000, frame, &Request::WriteFrom { write_id, floor, ops: vec![Op::Put(b"k".to_vec(), v.as_bytes().to_vec())] })
+            .expect("encodes")
+    }
+    fn tick(s: u64, frame: u64) -> Vec<u8> {
+        protocol::encode_v5_request(s, 1_790_000_000_000, frame, &Request::Tick { now: 1 }).expect("encodes")
+    }
+    /// (whose Ack, the Ack, whose write, which write, the state) of each reply.
+    fn read(replies: &[Vec<u8>]) -> Vec<(protocol::Ack, u64, u64, WriteState)> {
+        replies
+            .iter()
+            .map(|b| match protocol::decode_reply(b).expect("decodes") {
+                Reply::Acked { ack, body } => match *body {
+                    Reply::SessionWriteState { session, write_id, state } => (ack, session, write_id, state),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("a reply to a v5 client that is not Acked: {other:?}"),
+            })
+            .collect()
+    }
+    fn one(replies: Vec<Vec<u8>>) -> (protocol::Ack, WriteState) {
+        let r = read(&replies);
+        assert_eq!(r.len(), 1, "{r:?}");
+        (r[0].0, r[0].3)
+    }
+    /// Take, land, publish w`id` of `s` with ticks from `s`.
+    fn publish(n: &mut Rev3Node, s: u64, frame: &mut u64, id: u64, floor: u64) {
+        *frame += 1;
+        assert_eq!(one(n.call(&write(s, *frame, id, floor, "v"))).1, WriteState::Accepted);
+        *frame += 1;
+        assert!(n.call(&tick(s, *frame)).is_empty());
+        *frame += 1;
+        assert_eq!(one(n.call(&tick(s, *frame))).1, WriteState::Published);
+    }
+
+    /// Rule 3, then the ledger: taken in order, published, and the Ack says
+    /// how far — on EVERY reply, with the frame it answers, parity unknown.
+    #[test]
+    fn in_order_writes_are_taken_and_the_ack_says_how_far() {
+        let mut n = Rev3Node::default();
+        let (ack, st) = one(n.call(&write(A, 1, 1, 1, "a")));
+        assert_eq!(st, WriteState::Accepted);
+        assert_eq!((ack.session, ack.published_through, ack.taken_through, ack.frames_seen, ack.answering, ack.parity), (A, 0, 1, 1, Some(1), None));
+        assert!(n.call(&tick(A, 2)).is_empty());
+        let (ack, st) = one(n.call(&tick(A, 3)));
+        assert_eq!(st, WriteState::Published);
+        assert_eq!((ack.published_through, ack.answering), (1, Some(3)));
+    }
+
+    /// Rule 1: a write at or below what is published is a DUPLICATE —
+    /// nothing applied, and the Ack says it published.
+    #[test]
+    fn a_published_write_sent_again_is_a_duplicate_and_applied_once() {
+        let mut n = Rev3Node::default();
+        let mut f = 0;
+        publish(&mut n, A, &mut f, 1, 1);
+        let (ack, st) = one(n.call(&write(A, 10, 1, 1, "a")));
+        assert_eq!(st, WriteState::Duplicate);
+        assert_eq!(ack.published_through, 1, "the Duplicate's Ack must say it PUBLISHED");
+        assert_eq!(n.applied, vec![(A, 1)], "applied twice");
+    }
+
+    /// Rule 2: while a commit is pending, Busy — and `next` does not move.
+    #[test]
+    fn a_write_while_a_commit_is_pending_is_busy() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        assert_eq!(one(n.call(&write(B, 1, 1, 1, "b"))).1, WriteState::Busy);
+        assert_eq!(n.next(B), 1);
+    }
+
+    /// Rule 3's floor arm: a gap (an id refused at make, never sent) is
+    /// ORDINARY — `floor > next` takes the floor.
+    #[test]
+    fn a_gap_below_the_floor_is_ordinary() {
+        let mut n = Rev3Node::default();
+        let mut f = 0;
+        publish(&mut n, A, &mut f, 1, 1);
+        // w2 was refused at make; the client's floor is now 3.
+        assert_eq!(one(n.call(&write(A, 20, 3, 3, "c"))).1, WriteState::Accepted);
+    }
+
+    /// Rule 4: anything else is OutOfOrder{expected} — nothing applied. THE
+    /// sdk#179 c case: W2 Busy'd, W3 already at the node → W3 is refused, not
+    /// applied ahead of W2.
+    #[test]
+    fn a_write_ahead_of_its_turn_is_out_of_order_and_not_applied() {
+        let mut n = Rev3Node::default();
+        let mut f = 0;
+        publish(&mut n, A, &mut f, 1, 1);
+        // The client still holds w2 un-ended (floor 2) and sends w3.
+        let (_, st) = one(n.call(&write(A, 30, 3, 2, "new")));
+        assert_eq!(st, WriteState::OutOfOrder { expected: 2 });
+        assert_eq!(n.applied, vec![(A, 1)], "w3 was applied ahead of w2");
+        // w2, then w3, in order.
+        let mut f2 = 30;
+        publish(&mut n, A, &mut f2, 2, 2);
+        publish(&mut n, A, &mut f2, 3, 3);
+        assert_eq!(n.applied, vec![(A, 1), (A, 2), (A, 3)]);
+    }
+
+    /// ONLY A PUBLISH CONSUMES A NUMBER: a Failed releases it, and the same
+    /// write sent again gets a TRUE second attempt.
+    #[test]
+    fn a_failed_write_releases_its_number() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        let (ack, st) = one(n.fail(A, 1));
+        assert_eq!(st, WriteState::Failed);
+        assert_eq!(ack.published_through, 0, "a failed write was counted published");
+        assert_eq!(one(n.call(&write(A, 2, 1, 1, "a"))).1, WriteState::Accepted, "no second attempt after Failed");
+    }
+
+    /// Lost releases its number too: nothing published, a true second attempt.
+    #[test]
+    fn a_lost_write_releases_its_number() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        let (ack, st) = one(n.lose(A, 1));
+        assert_eq!(st, WriteState::Lost);
+        assert_eq!(ack.published_through, 0, "a lost write was counted published");
+        assert_eq!(one(n.call(&write(A, 2, 1, 1, "a"))).1, WriteState::Accepted, "no second attempt after Lost");
+    }
+
+    /// The ledger moves WITH the head, not before: a context lost after the
+    /// take and BEFORE the head PUT published nothing, so the write sent again
+    /// is TAKEN — not answered Duplicate for a write that never landed.
+    #[test]
+    fn a_context_lost_before_the_head_lands_publishes_nothing() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        n.forget(); // before any tick: the head PUT never went
+        assert_eq!(n.taken_through.get(&A), None, "taken_through survived the forget: it is the context's");
+        assert!(n.applied.is_empty(), "the un-landed take was not withdrawn");
+        let (ack, st) = one(n.call(&write(A, 2, 1, 1, "a")));
+        assert_eq!(st, WriteState::Accepted, "a write that never landed was told Duplicate");
+        assert_eq!(ack.published_through, 0);
+        assert_eq!(ack.taken_through, 1, "the re-send is taken again");
+        assert!(!n.tree.contains_key(b"k".as_slice()), "the tree changed without a head PUT");
+        // …and that is ONE apply, not two: the forgotten take was withdrawn.
+        assert!(n.call(&tick(A, 3)).is_empty());
+        assert_eq!(one(n.call(&tick(A, 4))).1, WriteState::Published);
+        assert_eq!(n.applied, vec![(A, 1)], "a correct recovery was counted as a double apply");
+        assert_eq!(n.tree.get(b"k".as_slice()).map(|v| v.as_slice()), Some(b"a".as_slice()));
+    }
+
+    /// THE LEDGER SURVIVES A FORGET — run (a): the head PUT landed, the
+    /// context died before its answer, the write is sent again. A fresh
+    /// engine reads the ledger: Duplicate, published — NOT applied twice.
+    #[test]
+    fn the_ledger_survives_a_forget_and_nothing_is_applied_twice() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        assert!(n.call(&tick(A, 2)).is_empty()); // the head PUT lands
+        n.forget(); // …and the context dies before the Published
+        // B writes the key in between.
+        let mut fb = 0;
+        publish(&mut n, B, &mut fb, 1, 1);
+        let (ack, st) = one(n.call(&write(A, 3, 1, 1, "a")));
+        assert_eq!(st, WriteState::Duplicate, "run (a): the write was taken again");
+        assert_eq!(ack.published_through, 1);
+        assert_eq!(n.applied.iter().filter(|a| **a == (A, 1)).count(), 1, "applied twice across the forget");
+        // …and taken_through went BACKWARDS with the context: it says 0.
+        assert_eq!(ack.taken_through, 0);
+    }
+
+    /// A verdict decided in ANOTHER session's call (F49's shape) carries its
+    /// OWN session's Ack — and answers none of that session's frames.
+    #[test]
+    fn a_verdict_decided_in_anothers_call_answers_none_of_its_frames() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        assert!(n.call(&tick(B, 1)).is_empty());
+        let r = read(&n.call(&tick(B, 2)));
+        assert_eq!(r.len(), 1);
+        let (ack, session, _, state) = r[0];
+        assert_eq!((session, state), (A, WriteState::Published));
+        assert_eq!(ack.session, A, "the Ack names the WRITE's session");
+        assert_eq!(ack.answering, None, "B's frame was reported as A's");
+    }
+}
