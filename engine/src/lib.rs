@@ -2297,33 +2297,16 @@ impl<B: Blocks> Engine<B> {
         // Re-emit exactly what is missing, and nothing else. A retry that
         // re-sends the whole commit pays for every block again, and a retry
         // that re-sends nothing stalls it for ever.
-        if let Some(group) = self.owed_group_of(&id) {
-            if self.parity_confirmed.contains(&id) {
-                return Vec::new();
+        if self.owed_group_of(&id).is_some() {
+            // A FAILURE IS PACED LIKE SILENCE, never faster (sdk#150 review A).
+            // Re-putting on the spot -- or erasing the pace so the next emit
+            // re-asks -- turned a node answering every parity put FAILED into
+            // a put on every call (2100 PUTs in 100 ticks, executed), where
+            // silence re-asks once a window. The failure is recorded as an
+            // attempt made now; `emit_parity` re-asks when the pace says.
+            if !self.parity_confirmed.contains(&id) {
+                self.asks.failed(asks::Ask::Parity(id), self.now);
             }
-            let bytes = self
-                .owed
-                .get(&group)
-                .and_then(|o| o.blocks.iter().find(|(c, _)| *c == id))
-                .map(|(_, b)| b.clone());
-            if let Some(bytes) = bytes {
-                self.asks.asked(asks::Ask::Parity(id), self.now);
-                return vec![Effect::PutParity {
-                    group,
-                    id,
-                    bytes,
-                    after: vec![self.published_root],
-                }];
-            }
-            // The bytes are not on hand. A rehydrated engine carries owed
-            // groups as IDS, so this is the ordinary case, not an edge one:
-            // a parity put that fails in a later call than the one that sent
-            // it lands here every time.
-            //
-            // The failure is an answer: the ask is settled, so it is due at
-            // once, and the next `emit_parity` recomputes the group's blocks
-            // and puts this one again.
-            self.asks.settled(&asks::Ask::Parity(id));
             return Vec::new();
         }
         let Some(c) = self.pending.as_ref() else {
@@ -2479,6 +2462,23 @@ impl<B: Blocks> Engine<B> {
                 if o.since == 0 {
                     o.since = now;
                 }
+            }
+        } else if now < self.now || now - self.now > CLOCK_RESET_TICKS {
+            // A CLOCK RESET (sdk#150 review B). `now` is whatever the client
+            // sends, and every deadline is measured against it: one tick ten
+            // years ahead froze every re-ask for good (0 in 600 ticks, executed)
+            // and the stall timer and owed ages with it. A context lives 600 s
+            // (F32), so a tick EARLIER than the last, or more than that later,
+            // cannot be the same clock: every date is re-anchored to it. Nothing
+            // becomes due early for it, and nothing waits on a clock that is
+            // gone.
+            if let Some(since) = self.in_flight_since.as_mut() {
+                *since = now;
+            }
+            self.asks.reanchor(now);
+            for o in self.owed.values_mut() {
+                o.since = now;
+                o.last_changed = o.last_changed.min(now);
             }
         }
         self.now = now;
@@ -3071,10 +3071,19 @@ struct Context {
     now: u64,
 }
 
+/// A tick more than this after the last one is a different clock, not the
+/// same one moving on: a delegate context lives 600 s (F32), so no engine
+/// sees a real gap longer than that. Ticks are seconds (`protocol::tick_of`).
+const CLOCK_RESET_TICKS: u64 = 600;
+
 /// The version this build writes. Bumped when the shape changes.
 ///
-/// 6: `in_flight_parity` left it for `parity_confirmed` (the answers) and
-/// `asks` (pacing): an emission is not a fact (sdk#150).
+/// 7: `in_flight_parity` left it for `parity_confirmed` (the answers) and
+/// `asks` (pacing), and owed groups carry their ages: an emission is not a
+/// fact (sdk#150).
+///
+/// 6: a subscription carries its birth order, under a per-client cap
+/// (sdk#146).
 ///
 /// 5: the engine's clock joined it -- `now`, which `in_flight_since` and the
 /// parity ages are measured against (sdk#150).
@@ -3091,7 +3100,7 @@ struct Context {
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 6;
+const CONTEXT_VERSION: u16 = 7;
 
 /// What a context this build wrote begins with.
 ///

@@ -129,6 +129,13 @@ fn write(n: u64) -> protocol::Request {
     }
 }
 
+/// Ticks between calls here: a throttled tab, 30 s apart. It was 1_000, a
+/// shorthand for "long past the deadline" -- but a gap over 600 s is a clock
+/// RESET to the engine (a context lives 600 s, F32; sdk#150 PR 3), which
+/// re-anchors every deadline, so that shorthand now measures nothing. Five
+/// steps are 150 s, well past `max_accept_age` (64) and inside one clock.
+const STEP: u64 = 30;
+
 /// Run a stuck write, then either tick past the deadline or do nothing, and
 /// say whether `Stalled` was ever reported.
 fn stalled_reported(with_tick: bool) -> bool {
@@ -143,7 +150,7 @@ fn stalled_reported(with_tick: bool) -> bool {
     // they differ only in whether time was sent.
     for i in 1..=5u64 {
         if with_tick {
-            seen.extend(node.states(&protocol::Request::Tick { now: i * 1_000 }));
+            seen.extend(node.states(&protocol::Request::Tick { now: i * STEP }));
         } else {
             seen.extend(node.states(&protocol::Request::AskWrite { write_id: 1 }));
         }
@@ -283,7 +290,7 @@ fn stalled_is_reported_once_not_on_every_tick() {
     let mut stalls = 0;
     for i in 1..=6u64 {
         stalls += node
-            .states(&protocol::Request::Tick { now: i * 1_000 })
+            .states(&protocol::Request::Tick { now: i * STEP })
             .iter()
             .filter(|s| **s == protocol::WriteState::Stalled)
             .count();
@@ -306,7 +313,7 @@ fn control_a_commit_that_publishes_is_never_stalled() {
     // NOT deaf: the puts are acknowledged and the commit publishes.
     let mut seen = node.states(&write(1));
     for i in 1..=6u64 {
-        seen.extend(node.states(&protocol::Request::Tick { now: i * 1_000 }));
+        seen.extend(node.states(&protocol::Request::Tick { now: i * STEP }));
     }
     assert!(
         !seen.contains(&protocol::WriteState::Stalled),
@@ -346,10 +353,16 @@ fn a_context_from_the_previous_version_is_refused() {
          would say nothing about versions"
     );
 
-    // The version sits at bytes [4..6], after the magic.
+    // The version sits at bytes [4..6], after the magic. The PREVIOUS one is
+    // 6: sdk#150 PR 3's 7 replaced `in_flight_parity` with the answers and
+    // the pacing table, a shape a v6 context would decode into as nonsense.
+    assert_eq!(
+        u16::from_le_bytes([ctx[4], ctx[5]]),
+        7,
+        "this build's version moved: name the previous one here"
+    );
     let mut old = ctx.clone();
-    old[4] = 2;
-    old[5] = 0;
+    old[4..6].copy_from_slice(&6u16.to_le_bytes());
     let (_, recovered) =
         engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
     assert!(

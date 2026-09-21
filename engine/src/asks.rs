@@ -27,6 +27,9 @@ use std::collections::BTreeMap;
 /// measures a table at its cap.
 pub const ASK_BYTES: usize = 4 + 32 + 8 + 4;
 
+/// The longest wait between re-asks is `reask_after << MAX_DOUBLINGS`.
+pub const MAX_DOUBLINGS: u32 = 6;
+
 /// The share of `max_context_bytes` the table may take at its cap: 1/16.
 pub const CONTEXT_SHARE: usize = 16;
 
@@ -54,11 +57,18 @@ pub struct Asks {
 
 impl Asks {
     /// Whether `ask` may go out at `now`: never asked, or unanswered for
-    /// `after` ticks.
+    /// `after` ticks -- doubled for each attempt past the first, up to 64x.
+    ///
+    /// DECAY, not an end (sdk#150 review C). Redundancy is worth asking for
+    /// as long as it is owed, but at a fixed pace a node that never answers
+    /// took 798 parity puts in 600 ticks for ONE 64-record write -- about
+    /// 0.46 MiB/s upstream for ever. Doubling bounds that to a handful per
+    /// context lifetime and still re-asks.
     pub fn due(&self, ask: &Ask, now: u64, after: u64) -> bool {
-        self.by
-            .get(ask)
-            .is_none_or(|p| now.saturating_sub(p.at) >= after)
+        self.by.get(ask).is_none_or(|p| {
+            let doublings = p.attempts.saturating_sub(1).min(MAX_DOUBLINGS);
+            now.saturating_sub(p.at) >= after.saturating_mul(1 << doublings)
+        })
     }
 
     /// `ask` went out at `now`.
@@ -69,6 +79,18 @@ impl Asks {
         });
         p.at = now;
         p.attempts = p.attempts.saturating_add(1);
+    }
+
+    /// The node answered `ask` with a FAILURE: it is re-dated to `now`, as if
+    /// just asked, and not counted again -- the failure is the answer to the
+    /// attempt already counted, so a failing node is paced exactly like a
+    /// silent one.
+    pub fn failed(&mut self, ask: Ask, now: u64) {
+        let p = self.by.entry(ask).or_insert(Pace {
+            at: now,
+            attempts: 1,
+        });
+        p.at = now;
     }
 
     /// The node answered `ask`, or it stopped being owed.
@@ -88,6 +110,13 @@ impl Asks {
             if p.at == 0 {
                 p.at = now;
             }
+        }
+    }
+
+    /// The clock was reset: every ask is dated from the new one.
+    pub fn reanchor(&mut self, now: u64) {
+        for p in self.by.values_mut() {
+            p.at = now;
         }
     }
 

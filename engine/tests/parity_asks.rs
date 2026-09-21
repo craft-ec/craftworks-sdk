@@ -276,3 +276,141 @@ fn an_ask_costs_at_most_ask_bytes_in_the_context() {
         grew / asked.len()
     );
 }
+
+/// Publish a 64-record write and return the tick of its first parity ask and
+/// the blocks asked (left unanswered).
+fn first_ask(h: &mut Harness) -> (u64, Vec<Cid>) {
+    let first = h.step(write(1, 64, 0));
+    let _ = publish(h, first);
+    for k in 1..=4 {
+        let got = parity(&h.step(Event::Tick(T0 + k)));
+        if !got.is_empty() {
+            return (k, got);
+        }
+    }
+    panic!("no parity put at all");
+}
+
+/// REVIEW A: a FAILED put is paced like silence, never faster. Before, a
+/// failure erased the pace and every call re-put: 2100 PUTs on 100 of 100
+/// ticks, executed. And it IS asked again -- the opposite mutant, a failed
+/// put never re-asked, goes red on the lower bound.
+#[test]
+fn a_failed_parity_put_is_asked_again_no_faster_than_silence() {
+    let mut h = harness(Params::default());
+    let first = h.step(write(1, 64, 0));
+    let _ = publish(&mut h, first);
+    let mut ticks_with_puts = 0;
+    for k in 1..=100 {
+        let got = parity(&h.step(Event::Tick(T0 + k)));
+        if !got.is_empty() {
+            ticks_with_puts += 1;
+        }
+        for id in got {
+            let _ = h.step(Event::PutFailed(id));
+        }
+    }
+    assert!(
+        (2..=7).contains(&ticks_with_puts),
+        "parity put on {ticks_with_puts} of 100 ticks with every put answered FAILED"
+    );
+    println!("  every parity put failed: asked on {ticks_with_puts} of 100 ticks");
+}
+
+/// REVIEW C: nobody answering is re-asked with DECAY. At a fixed pace one
+/// 64-record write took 798 parity puts in 600 ticks (executed); doubled per
+/// attempt it is a handful per block, and still more than one.
+#[test]
+fn unanswered_parity_is_re_asked_with_decay() {
+    let mut h = harness(Params::default());
+    let (at, blocks) = first_ask(&mut h);
+    let mut per_block = std::collections::BTreeMap::<Cid, usize>::new();
+    for id in &blocks {
+        per_block.insert(*id, 1);
+    }
+    for k in at + 1..=600 {
+        for id in parity(&h.step(Event::Tick(T0 + k))) {
+            *per_block.entry(id).or_default() += 1;
+        }
+    }
+    let most = per_block.values().max().copied().unwrap_or(0);
+    let least = per_block.values().min().copied().unwrap_or(0);
+    let total: usize = per_block.values().sum();
+    assert!(
+        least >= 3,
+        "a block was asked only {least} time(s) in 600 ticks: re-asking stopped"
+    );
+    assert!(
+        most <= 7,
+        "a block was asked {most} times in 600 ticks: no decay"
+    );
+    println!(
+        "  600 ticks, nobody answering: {total} parity puts for {} blocks ({least}..{most} each)",
+        blocks.len()
+    );
+}
+
+/// REVIEW B: one tick from the FUTURE must not freeze every deadline. The
+/// client's clock came back to the present afterwards; before, that read as
+/// "10 years early" to every ask, and nothing was re-asked in 600 ticks.
+#[test]
+fn a_tick_from_the_future_does_not_freeze_re_asking() {
+    let mut h = harness(Params::default());
+    let (at, _) = first_ask(&mut h);
+    let _ = h.step(Event::Tick(T0 + 10 * 365 * 86_400));
+    let mut again = 0;
+    for k in at + 1..=at + 600 {
+        again += parity(&h.step(Event::Tick(T0 + k))).len();
+    }
+    assert!(
+        again > 0,
+        "nothing was re-asked in 600 ticks after one tick from the future"
+    );
+}
+
+/// ...and a tick from the PAST makes nothing due early: it is a reset, and
+/// everything is dated from it -- due a full window later, not at once and
+/// not never.
+#[test]
+fn a_tick_from_the_past_makes_nothing_due_early() {
+    let p = Params::default();
+    let mut h = harness(p);
+    let (_, blocks) = first_ask(&mut h);
+    let back = T0 - 1000;
+    assert!(
+        parity(&h.step(Event::Tick(back))).is_empty(),
+        "re-asked on the reset itself"
+    );
+    for k in 1..p.reask_after {
+        assert!(
+            parity(&h.step(Event::Tick(back + k))).is_empty(),
+            "re-asked {k} tick(s) after a reset, under reask_after"
+        );
+    }
+    let again = parity(&h.step(Event::Tick(back + p.reask_after)));
+    assert_eq!(
+        again.iter().collect::<BTreeSet<_>>(),
+        blocks.iter().collect::<BTreeSet<_>>(),
+        "not re-asked a full window after the reset"
+    );
+}
+
+/// The decay's off-by-one, pinned: the FIRST re-ask comes at exactly
+/// `reask_after` ticks, the second at 2x that after it -- not 2x, 4x.
+#[test]
+fn the_first_re_ask_is_at_reask_after_and_the_second_at_twice_that() {
+    let p = Params::default();
+    let mut h = harness(p);
+    let (at, _) = first_ask(&mut h);
+    let mut asked_at = Vec::new();
+    for k in at + 1..=at + 3 * p.reask_after + 1 {
+        if !parity(&h.step(Event::Tick(T0 + k))).is_empty() {
+            asked_at.push(k - at);
+        }
+    }
+    assert_eq!(
+        asked_at,
+        vec![p.reask_after, 3 * p.reask_after],
+        "re-asks at these tick offsets from the first ask"
+    );
+}

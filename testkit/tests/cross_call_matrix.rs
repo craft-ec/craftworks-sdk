@@ -490,14 +490,24 @@ fn w4_commit_across_a_tick(mode: Mode, first: bool) -> Cell {
         k - 1
     );
     let published_at = c.served(Served::Put);
-    // Time after the publish, each tick's answers delivered one per call.
+    // Time after the publish. TWO ticks before each tick's answers are
+    // delivered, so an engine that re-asked what is merely unanswered -- a
+    // re-put on every call -- shows here as more PUTs (review of #167).
     for j in 0..10 {
-        replies.extend(c.tick_at(base + (k + j) * 1000));
+        replies.extend(c.tick_at(base + (k + 2 * j) * 1000));
+        replies.extend(c.tick_at(base + (k + 2 * j + 1) * 1000));
         while c.held() > 0 {
             replies.extend(c.release_one());
         }
     }
     let parity_puts = c.served(Served::Put) - published_at;
+    // THE UPPER BOUND: this commit's two keys code ONE parity group, three
+    // blocks, and nothing is unanswered for `reask_after` ticks here.
+    if parity_puts > 3 {
+        return Cell::Red(format!(
+            "{parity_puts} PUTs after the publish for ONE parity group (3 blocks): re-asked what was only unanswered"
+        ));
+    }
     let st = states_of(&replies, 1);
     if let Some(why) = every_call(&mut c) {
         return Cell::Red(format!("{why}; told {st:?}"));
