@@ -481,6 +481,70 @@ await t("THE CONTROL: both surfaces take a limit, so an app cannot tell them apa
   assert.strictEqual(memory.bind("notes").limit, 0, "its default is not unbounded");
 });
 
+// ---------------------------------------------------------------------------
+// A LIMIT WITHOUT A DIRECTION IS HALF A PAGE.
+//
+// Ids are time-ordered, so the first `limit` rows of a FORWARD scan are the
+// OLDEST. A caller rendering newest-first by reversing the snapshot then shows
+// the oldest page in reverse, and the newest records never reach the screen —
+// measured on the builder: past 50 records, note 51 onward never appeared
+// though the form had accepted them (craftworks-builder#51).
+//
+// The page bounded the read and silently changed WHICH rows it was a page of.
+// ---------------------------------------------------------------------------
+
+await t("**a reverse binding pages from the NEWEST end**", async () => {
+  // The fake answers the way the real scan does: forward gives the head of
+  // the range, reverse gives the tail.
+  const all = Array.from({ length: 60 }, (_, i) => ({ id: `n${String(i).padStart(3, "0")}`, updated: i }));
+  const db = engineDb({
+    session: {
+      ...fakeSession().session,
+      scan: (_d, reverse, limit) => {
+        const rows = reverse ? [...all].reverse() : all;
+        return JSON.stringify(limit ? rows.slice(0, limit) : rows);
+      },
+      root: () => "node:r",
+    },
+  });
+
+  const forward = db.bind("notes", { limit: 50 });
+  await forward.reload();
+  const back = db.bind("notes", { limit: 50, reverse: true });
+  await back.reload();
+
+  assert.strictEqual(forward.getSnapshot().length, 50, "the forward page is not a page");
+  assert.strictEqual(forward.getSnapshot().at(-1).id, "n049",
+    "the forward page does not end where a forward page should");
+  assert.strictEqual(back.getSnapshot()[0].id, "n059",
+    "a reverse binding did not start at the NEWEST row, so a newest-first list " +
+    "paged from the wrong end and the latest records never reach the screen");
+  assert.strictEqual(back.reverse, true, "the binding does not report its direction");
+});
+
+await t("THE CONTROL: the default is still FORWARD", async () => {
+  // Without this, a binding that always reversed would pass the test above
+  // and silently flip every existing caller's order.
+  const asked = [];
+  const db = engineDb({
+    session: {
+      ...fakeSession().session,
+      scan: (_d, reverse) => { asked.push(reverse); return "[]"; },
+      root: () => "node:r",
+    },
+  });
+  await db.bind("notes").reload();
+  assert.strictEqual(asked.at(-1), false, "a binding with no direction asked for a reverse scan");
+  assert.strictEqual(db.bind("notes").reverse, false, "its default direction is not forward");
+});
+
+await t("THE CONTROL: both surfaces take a direction", async () => {
+  const memory = new (wrap(fakeRaw()).Db)();
+  assert.strictEqual(memory.bind("notes", { reverse: true }).reverse, true,
+    "the in-memory binding ignores the direction, so an app could tell the backends apart");
+  assert.strictEqual(memory.bind("notes").reverse, false, "its default is not forward");
+});
+
 await t("a BINDING from the engine has the shape a component holds", () => {
   const b = engineDb(fakeSession()).bind("tasks", { live: false });
   for (const m of ["getSnapshot", "subscribe", "reload"]) {
