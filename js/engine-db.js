@@ -51,28 +51,48 @@ const rethrow = e => {
  */
 const changed = (a, b) => a.state !== b.state || a.why !== b.why || a.code !== b.code;
 
-/** Are these the same rows? By id, `updated` AND `state` — see below. */
-const same = (a, b) => {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    // `state` TOO, and it is not an optimisation detail.
-    //
-    // A write moves PENDING -> CLEAN when it reaches the network, and that
-    // changes neither `id` nor `updated` — `updated` is the record's own
-    // timestamp and a write state is not a content change. So a comparison
-    // of those two alone says "the same rows", the snapshot is not replaced,
-    // no listener fires, and the component never re-renders.
-    //
-    // MEASURED against a real node: a row sat on screen saying "saving" for
-    // 70 seconds while `db.scan()` returned it CLEAN the whole time. The data
-    // was safely published within a second; only the screen was wrong, which
-    // is the worst version of this — a person watching a spinner is told
-    // their data is unsaved when it is on the network, and closing the tab
-    // then feels like losing it.
-    if (a[i].id !== b[i].id || a[i].updated !== b[i].updated || a[i].state !== b[i].state) {
-      return false;
-    }
+/**
+ * Is this the same VALUE? Objects by their keys in any order, lists in order,
+ * everything else by `Object.is`-like identity of kind and value.
+ */
+const equal = (a, b) => {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!equal(a[i], b[i])) return false;
+    return true;
   }
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  for (const k of keys) if (!Object.hasOwn(b, k) || !equal(a[k], b[k])) return false;
+  return true;
+};
+
+/**
+ * Are these the same rows? EVERYTHING a row carries, not a subset of it.
+ *
+ * ONE definition, used by both backends (`wrap.js` imports this one). It was
+ * two copies of the same comparison over `id`, `updated` and `state`, on the
+ * reasoning that "a record's contents cannot change without its `updated`
+ * moving". They can: `Db::update` stamps `now_ms().max(previous)`, so a second
+ * edit in one millisecond, or any edit after the clock went backwards, keeps
+ * `updated` where it was. The record was written, `reload()` answered false,
+ * no listener fired and the screen kept the old text (craftworks-sdk#129).
+ *
+ * Fourth instance of one shape — a row's write state (#96), a range becoming
+ * readable (#114), a status reason (#114's fix), and now content: each a
+ * change invisible to a comparison over a SUBSET of what a person can see.
+ * So this compares the whole row and names no field; a field added to a row
+ * later is compared without anyone remembering to add it here.
+ *
+ * The cost is one walk of rows that `scan` has just `JSON.parse`d — the same
+ * order of work, already paid once per reload.
+ */
+export const sameRows = (a, b) => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (!equal(a[i], b[i])) return false;
   return true;
 };
 
@@ -438,7 +458,7 @@ export function engineDb(handle) {
           root = self.root();
           const was = status;
           status = { state: "ready", why: "", code: "" };
-          if (same(rows, next)) {
+          if (sameRows(rows, next)) {
             // The ROWS did not change but the STATUS may have: a range that
             // was unreachable and is now readable-and-empty is a different
             // screen, and a component that only watched the rows would never
