@@ -312,3 +312,44 @@ fn a_busy_write_re_sent_is_timed_from_the_re_send() {
     assert!(s.copy.pending_ids().is_empty(), "the Published verdict did not clear it");
     assert_eq!(s.unknown_verdicts(), 0, "the verdict arrived for a write the copy no longer had");
 }
+
+/// **Any verdict frees the slot, not only `Published`.** Sixteen sent and one
+/// held; the sixteen are answered `Accepted` only (a cold commit: accepted
+/// long before it publishes) — or `Busy` only (the write stays pending,
+/// queued to go again). Either way none of them is still WAITING at the node,
+/// so the held write goes. A slot freed only when the write left the copy
+/// would keep the window shut on sixteen writes the node had already answered.
+#[test]
+fn any_verdict_frees_the_slot_accepted_or_busy() {
+    // Both arms run and both are reported: one failing must not hide the other.
+    let mut shut = Vec::new();
+    for state in [protocol::WriteState::Accepted, protocol::WriteState::Busy] {
+        let (mut s, _clock) = testkit::cached_store();
+        for i in 0..=window() as u32 {
+            s.put(format!("v/{i:02}").as_bytes(), b"x");
+        }
+        let sent: Vec<u64> = s.copy.pending_ids().into_iter().take(window()).collect();
+        let held_id = *s.copy.pending_ids().last().expect("a held write");
+        assert_eq!(s.take_outbound().len(), window());
+        assert_eq!(s.held_count(), 1);
+        for id in sent {
+            let v = verdict(&s, id, state);
+            s.on_inbound(&v);
+        }
+        let out: Vec<u64> = s
+            .take_outbound()
+            .iter()
+            .filter_map(|f| match protocol::decode_request(f) {
+                protocol::Incoming::Ok(env) => match env.body {
+                    protocol::Request::Write { write_id, .. } => Some(write_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        if !out.contains(&held_id) || s.held_count() != 0 {
+            shut.push(format!("after sixteen {state:?} verdicts the held write {held_id} never reached the wire (sent: {out:?})"));
+        }
+    }
+    assert!(shut.is_empty(), "{shut:#?}");
+}
