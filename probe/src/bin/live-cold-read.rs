@@ -13,6 +13,15 @@
 //!
 //! usage: L3_PORT=<base port> live-cold-read <engine_delegate.wasm> <block.wasm> <register.wasm>
 //!        (uses base, base+1 for A's ws/net and base+10, base+11 for B's)
+//!
+//! Outcomes: GREEN; STALLED N s, RECOVERED (a cold read waited past 30 s and then came back whole -- F52's heal);
+//! RED (not answered within the 100 s window, answered wrong, or stranded).
+//!
+//! L3_LONG_WINDOW=1 (default off): TEST 1 listens 130 s per request instead of 100, a request still unanswered at
+//! 60 s is marked (and listened to and ticked on), and the moment its page arrives is recorded. Afterwards both nodes are kept alive a further 100 s (listening, no new
+//! requests), so a node bound that ends at +60..+90 s has spoken before anything is killed. KEEP_LOGS is required.
+//! It exists because every bound the node has on a stuck GET (stream claim 60 s, op TTL 60 s, park budget 75 s,
+//! park TTL 90 s) was >= the old 60 s window, so a red ended at 60 s could not say whether the node would recover.
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
@@ -28,7 +37,19 @@ use tokio::time::timeout;
 
 const STEP: Duration = Duration::from_secs(10);
 const BUDGET: Duration = Duration::from_secs(420);
-const COLD_READ: Duration = Duration::from_secs(60);
+/// How long one cold read is waited for before it is RED: `probe::verdict::COLD_READ_MS`, where the reason (F52)
+/// is written.
+const COLD_READ: Duration = Duration::from_millis(probe::verdict::COLD_READ_MS as u64);
+/// The fixed listens of TESTs 2 and 3, unchanged by F52's window.
+const LISTEN: Duration = Duration::from_secs(30);
+/// The window every red before F52 ended at: the long mode marks a request still unanswered here.
+const OLD_WINDOW: Duration = Duration::from_secs(60);
+/// The long-window mode's numbers (L3_LONG_WINDOW=1).
+const LONG_READ: Duration = Duration::from_secs(130);
+const LONG_HOLD: Duration = Duration::from_secs(100);
+const LONG_BUDGET: Duration = Duration::from_secs(720);
+
+fn long_window() -> bool { std::env::var("L3_LONG_WINDOW").is_ok_and(|v| v == "1") }
 
 struct Live { child: Option<Child>, ws: u16 }
 impl Live {
@@ -140,6 +161,10 @@ fn show(title: &str, log: &[(u128, String)]) -> (u32, u32) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let started = Instant::now();
+    let long = long_window();
+    let (read_window, budget) = if long { (LONG_READ, LONG_BUDGET) } else { (COLD_READ, BUDGET) };
+    if long && std::env::var("KEEP_LOGS").is_err() { bail!("L3_LONG_WINDOW=1 needs KEEP_LOGS=<dir>: its runs are read from the node logs"); }
+    if long { println!("mode: LONG WINDOW -- TEST 1 {} s per request, not given up at 60 s; nodes held {} s after", LONG_READ.as_secs(), LONG_HOLD.as_secs()); }
     let base: u16 = std::env::var("L3_PORT").ok().and_then(|p| p.parse().ok()).context("L3_PORT=<base port> is required; there is no default")?;
     let mut a = std::env::args().skip(1);
     let (dw, bw, rw) = (a.next().context("usage: live-cold-read <engine_delegate.wasm> <block.wasm> <register.wasm>")?, a.next().unwrap_or_default(), a.next().unwrap_or_default());
@@ -210,7 +235,7 @@ async fn main() -> Result<()> {
     println!("\nTEST 2  tab 1 asks Range a/ (60 rows, cold) as req 1; tab 2 asks NOTHING. Who hears the Page?");
     let t0 = Instant::now();
     send(&mut t1, &dkey_b, &range(1, "a/", 256)).await?;
-    let (h1, h2) = tokio::join!(hear(&mut t1, t0, COLD_READ / 2), hear(&mut t2, t0, COLD_READ / 2));
+    let (h1, h2) = tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN));
     let (s2a, _) = show("tab 1 (the asker)", &h1); let (s2b, _) = show("tab 2 (silent)", &h2);
     let rows_of = |h: &[(u128, String)], req: u64| -> usize { h.iter().filter_map(|(_, l)| l.strip_prefix(&format!("PAGE req {req}: "))?.split(' ').next()?.parse::<usize>().ok()).sum() };
     let t2_rows = rows_of(&h1, 1);
@@ -220,7 +245,7 @@ async fn main() -> Result<()> {
     let t0 = Instant::now();
     send(&mut t1, &dkey_b, &range(7, "b/", 256)).await?;
     send(&mut t2, &dkey_b, &range(7, "c/", 256)).await?;
-    let (h1, h2) = tokio::join!(hear(&mut t1, t0, COLD_READ / 2), hear(&mut t2, t0, COLD_READ / 2));
+    let (h1, h2) = tokio::join!(hear(&mut t1, t0, LISTEN), hear(&mut t2, t0, LISTEN));
     // Judged: each tab hears 60 rows of ITS OWN prefix. It is also the cell that decides whether sdk#166 is live.
     let (s3a, _) = show("tab 1 (asked b/)", &h1); let (s3b, _) = show("tab 2 (asked c/)", &h2);
     let first_of = |h: &[(u128, String)]| -> Option<String> { h.iter().find_map(|(_, l)| l.strip_prefix("PAGE req 7: ").map(|x| x.to_string())) };
@@ -233,12 +258,23 @@ async fn main() -> Result<()> {
     send(&mut t1, &dkey_b, &Request::Identity).await?; g1.sent(); let idw = hear(&mut t1, started, Duration::from_secs(3)).await; g1.heard(&idw);
     println!("    fresh connection: {:?}", idw.iter().filter(|(_, l)| l.starts_with("identity")).map(|(_, l)| l.clone()).next_back());
     let t0 = Instant::now(); let mut got = 0usize; let mut after: Option<Vec<u8>> = None; let mut all = Vec::new(); let mut req = 20u64;
+    // Wall clock of TEST 1's start, so a line here can be put beside the nodes' own timestamps.
+    println!("    TEST 1 t0 = unix {} ms", now_ms());
+    // (req, ms after ITS send that its answer came, or None) -- the long mode's measurement.
+    let mut answered: Vec<(u64, Option<u128>)> = Vec::new();
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     loop {
         let mut r = range(req, "w/", 256); if let Request::Range { after: a, .. } = &mut r { *a = after.clone(); }
         send(&mut t1, &dkey_b, &r).await?; g1.sent();
-        let mut page: Option<(usize, bool)> = None; let end = Instant::now() + COLD_READ;
+        let sent = Instant::now(); let mut said_60 = false;
+        println!("    req {req} sent at +{} ms (unix {} ms)", t0.elapsed().as_millis(), now_ms());
+        let mut page: Option<(usize, bool)> = None; let end = Instant::now() + read_window;
         while Instant::now() < end && page.is_none() {
+            if long && !said_60 && sent.elapsed() >= OLD_WINDOW {
+                said_60 = true;
+                println!("    req {req} NOT ANSWERED at 60 s (unix {} ms) -- listening and ticking on, to {} s", now_ms(), LONG_READ.as_secs());
+                all.push((t0.elapsed().as_millis(), format!("MARK req {req} not answered at 60 s")));
+            }
             let h = hear(&mut t1, t0, Duration::from_millis(1000)).await;
             g1.heard(&h);
             for (_, l) in &h { if l.starts_with(&format!("PAGE req {req}:")) { let n: usize = l.split(": ").nth(1).and_then(|x| x.split(' ').next()).and_then(|x| x.parse().ok()).unwrap_or(0); page = Some((n, l.ends_with("more: true"))); }
@@ -250,16 +286,27 @@ async fn main() -> Result<()> {
                 last_tick = Instant::now();
             }
         }
+        answered.push((req, page.map(|_| sent.elapsed().as_millis())));
+        if let Some(ms) = answered.last().and_then(|(_, a)| *a) { println!("    req {req} answered {ms} ms after its send (unix {} ms)", now_ms()); }
         match page { Some((n, more)) => { got += n; if !more || n == 0 { break; } after = Some(format!("w/{:04}", got - 1).into_bytes()); req += 1; }
-                     None => { println!("    no answer to req {req} within {COLD_READ:?}"); break; } }
-        if started.elapsed() > BUDGET { println!("    BUDGET reached"); break; }
+                     None => { println!("    no answer to req {req} within {read_window:?}"); break; } }
+        if started.elapsed() > budget { println!("    BUDGET reached"); break; }
     }
-    let (s1, gets1) = show("tab 1", &all);
+    if long {
+        // HOLD: both nodes stay up so a bound past the window still gets to speak in their logs. Listening only.
+        println!("    holding both nodes {} s after TEST 1 (unix {} ms), listening, no requests", LONG_HOLD.as_secs(), now_ms());
+        let late = hear(&mut t1, t0, LONG_HOLD).await;
+        for (ms, l) in late.iter().filter(|(_, l)| !l.starts_with("call")) { println!("    held  {ms:>6} ms  {l}"); }
+        all.extend(late.into_iter().map(|(ms, l)| (ms, format!("HELD {l}"))));
+        println!("    hold over (unix {} ms)", now_ms());
+        for (r, a) in &answered { println!("    ANSWER req {r}: {}", a.map_or("none".to_string(), |ms| format!("{ms} ms after send"))); }
+    }
+    let (s1, gets1) = show("tab 1", &all.iter().filter(|(_, l)| !l.starts_with("HELD ")).cloned().collect::<Vec<_>>());
     println!("    => {got} of 300 rows in {:.1} s; live GETs (node ops over its calls) {gets1}", t0.elapsed().as_secs_f32());
     println!("    ticks (gated, sdk#174): setup on A sent {} withheld {} forgotten {}; TEST 1 sent {} withheld {} forgotten {}",
         ga.sent_ticks, ga.t.refused, ga.t.forgotten, g1.sent_ticks, g1.t.refused, g1.t.forgotten);
 
-    println!("\ndone in {:.1} s (budget {} s). Nodes are killed by their handles; temp tree removed.", started.elapsed().as_secs_f32(), BUDGET.as_secs());
+    println!("\ndone in {:.1} s (budget {} s). Nodes are killed by their handles; temp tree removed.", started.elapsed().as_secs_f32(), budget.as_secs());
     drop(node_b); drop(node_a);
     if let Ok(keep) = std::env::var("KEEP_LOGS") {
         for n in ["a", "b"] { let _ = std::fs::create_dir_all(format!("{keep}/{n}"));
@@ -272,8 +319,10 @@ async fn main() -> Result<()> {
     // returns the wrong rows cannot be confused.
     let refused = all.iter().filter(|(_, l)| l.starts_with("NODE ERROR")).count();
     let pages = all.iter().filter(|(_, l)| l.starts_with("PAGE req")).count();
-    if pages == 0 { red.push(format!("TEST 1 NOT ANSWERED: no page in the window; the node refused {refused} request(s): {:?}",
-        all.iter().find(|(_, l)| l.starts_with("NODE ERROR")).map(|(_, l)| l.clone()))); }
+    // NOT ANSWERED is the verdict's, from each request's own answer time; what the node refused meanwhile is said
+    // beside it, since a parked delegate refusing ticks is what a stall looks like from here.
+    if pages == 0 { println!("TEST 1: no page at all; the node refused {refused} request(s): {:?}",
+        all.iter().find(|(_, l)| l.starts_with("NODE ERROR")).map(|(_, l)| l.clone())); }
     else if got != 300 { red.push(format!("TEST 1 ANSWERED WRONG: read {got} of 300 rows")); }
     if s1 != 0 { red.push(format!("TEST 1 stranded {s1} effect(s)")); }
     if t2_rows != 60 { red.push(format!("TEST 2 the asker heard {t2_rows} of 60 rows")); }
@@ -281,8 +330,17 @@ async fn main() -> Result<()> {
     let own = |p: &Option<String>, prefix: &str| p.as_deref().is_some_and(|l| l.starts_with("60 rows") && l.contains(&format!("\"{prefix}0000\"")));
     if !own(&t3.0, "b/") || !own(&t3.1, "c/") { red.push(format!("TEST 3 a tab did not hear 60 rows of its own prefix: tab 1 {:?}, tab 2 {:?}", t3.0, t3.1)); }
     if s3a + s3b != 0 { red.push(format!("TEST 3 stranded {} effect(s)", s3a + s3b)); }
-    if red.is_empty() { println!("VERDICT: GREEN -- cold reads come back whole, nothing stranded; compare live GETs {gets1} with the native twin"); Ok(()) }
-    else { for r in &red { println!("RED: {r}"); } bail!("{} check(s) red", red.len()) }
+    // STALLED, RECOVERED is said apart from GREEN, so a heal is never counted as a clean read, and from RED, so it
+    // is never counted as a failure (`probe::verdict`, where every arm is tested).
+    match probe::verdict::cold_read(&answered, red) {
+        probe::verdict::Verdict::Green => { println!("VERDICT: GREEN -- cold reads come back whole, nothing stranded; compare live GETs {gets1} with the native twin"); Ok(()) }
+        probe::verdict::Verdict::StalledRecovered { secs, req } => {
+            println!("VERDICT: STALLED {secs} s, RECOVERED -- req {req}'s page came {secs} s after its send, past {} s (F52); every check passed",
+                probe::verdict::STALLED_AFTER_MS / 1000);
+            Ok(())
+        }
+        probe::verdict::Verdict::Red(why) => { for r in &why { println!("RED: {r}"); } bail!("{} check(s) red", why.len()) }
+    }
 }
 
 /// A connection's ticks, gated as a page gates them (sdk#174): at most one
