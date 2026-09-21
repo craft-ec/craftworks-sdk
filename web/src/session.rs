@@ -259,15 +259,20 @@ impl Session {
                         // say "this range is empty", which is a wrong answer
                         // wearing the shape of a right one.
                         // WHAT CHANGED since this client last looked.
+                        //
+                        // Every field BOUND, no `..`: a `cursor` dropped in
+                        // one is how a first page was applied as the whole
+                        // answer (sdk#140), and a field added later must
+                        // fail to compile here rather than vanish.
                         Ok(protocol::Reply::Delta {
                             req_id,
                             changes,
+                            cursor,
                             new_root,
                             at,
-                            ..
                         }) => {
                             self.loads.note_seq(at.seq);
-                            self.on_delta(req_id, changes, new_root)
+                            self.on_delta(req_id, changes, cursor, new_root)
                         }
                         // The delta could not be computed. The interval is
                         // forgotten and re-requested in full, through the
@@ -578,21 +583,25 @@ impl Session {
         });
     }
 
-    /// A delta arrived: apply it through the copy.
+    /// A delta arrived: apply it through the copy — or, if `Refresh` says it
+    /// is only a first page, reload the domain INSTEAD. Never after: the copy
+    /// records the root in `apply_delta` too, so applying first would leave
+    /// it claiming a root it is not at (sdk#140).
     fn on_delta(
         &mut self,
         req_id: u64,
         changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        cursor: Option<Vec<u8>>,
         new_root: [u8; 32],
     ) {
-        match self.refresh.on_delta(req_id, changes, new_root) {
+        match self.refresh.on_delta(req_id, changes, cursor, new_root) {
             craftworks_sdk::Answer::Delta {
                 changes, new_root, ..
             } => {
                 self.db.store_mut().on_delta(changes, new_root);
             }
             craftworks_sdk::Answer::NotOurs => self.foreign_notifications += 1,
-            craftworks_sdk::Answer::Reload { .. } => {}
+            craftworks_sdk::Answer::Reload { domain } => self.reload(&domain),
         }
     }
 
@@ -602,7 +611,12 @@ impl Session {
             self.foreign_notifications += 1;
             return;
         };
-        let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(&domain);
+        self.reload(&domain);
+    }
+
+    /// Forget a domain's range and load it again.
+    fn reload(&mut self, domain: &str) {
+        let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(domain);
         // FORGOTTEN, then re-requested through `Loads` -- ticketed and bounded
         // like any other load. The copy must not keep answering from a range
         // the engine has just said it cannot reconcile.

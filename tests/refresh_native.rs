@@ -27,6 +27,8 @@ struct Client {
     conn: testkit::Conn,
     /// Every `ChangesSince` this client sent. The measurement.
     asks: usize,
+    /// Full reloads `Refresh` decided on.
+    reloads: usize,
 }
 
 /// The domain's range, from the ONE function that knows the layout.
@@ -62,6 +64,7 @@ impl Client {
             store: testkit::cached_store().0,
             conn,
             asks: 0,
+            reloads: 0,
         };
         // START THE ENGINE. `Identity` is also how a session begins: answering
         // "where is your head" requires reading it, so the head read goes out
@@ -173,26 +176,31 @@ impl Client {
                 Ok(protocol::Reply::Delta {
                     req_id,
                     changes,
+                    cursor,
                     new_root,
                     ..
-                }) => {
-                    if let Answer::Delta {
-                        changes, new_root, ..
-                    } = r.on_delta(req_id, changes, new_root)
-                    {
-                        self.store.on_delta(changes, new_root);
-                    }
-                }
-                Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => {
-                    if let Answer::Reload { .. } = r.on_full_reload(req_id) {
-                        self.store.copy.forget(&range().0, &range().1);
-                        self.load();
-                    }
-                }
+                }) => self.answer(r.on_delta(req_id, changes, cursor, new_root)),
+                Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => self.answer(r.on_full_reload(req_id)),
                 _ => {}
             }
         }
         r.take_changed()
+    }
+
+    /// Do what `Refresh` decided, as the session does: apply a delta, or
+    /// forget the range and load it again — INSTEAD, never after.
+    fn answer(&mut self, a: Answer) {
+        match a {
+            Answer::Delta { changes, new_root, .. } => {
+                self.store.on_delta(changes, new_root);
+            }
+            Answer::Reload { .. } => {
+                self.reloads += 1;
+                self.store.copy.forget(&range().0, &range().1);
+                self.load();
+            }
+            Answer::NotOurs => {}
+        }
     }
 }
 
@@ -378,7 +386,7 @@ fn an_empty_delta_moves_nothing() {
     else {
         unreachable!()
     };
-    let a = r.on_delta(req_id, Vec::new(), [7u8; 32]);
+    let a = r.on_delta(req_id, Vec::new(), None, [7u8; 32]);
     assert!(matches!(a, Answer::Delta { moved: false, .. }));
     assert!(
         r.take_changed().is_empty(),
@@ -401,6 +409,7 @@ fn a_full_reload_forgets_the_root_it_could_not_reconcile() {
     r.on_delta(
         req_id,
         vec![(b"k".to_vec(), Some(b"v".to_vec()))],
+        None,
         [9u8; 32],
     );
     assert_eq!(r.seen("note"), Some([9u8; 32]));
@@ -427,9 +436,131 @@ fn a_full_reload_forgets_the_root_it_could_not_reconcile() {
 #[test]
 fn an_answer_nobody_asked_for_is_counted_and_not_applied() {
     let mut r = Refresh::new();
-    let a = r.on_delta(999, vec![(b"k".to_vec(), Some(b"v".to_vec()))], [1u8; 32]);
+    let a = r.on_delta(999, vec![(b"k".to_vec(), Some(b"v".to_vec()))], None, [1u8; 32]);
     assert_eq!(a, Answer::NotOurs);
     assert_eq!(r.unasked, 1);
     assert!(r.take_changed().is_empty());
     assert_eq!(r.seen("note"), None, "it moved a root on a stranger's word");
+}
+
+// ---- a CURSORED delta is not a complete one (craftworks-sdk#140) -------------
+
+/// The root the engine is answering reads AT, now: the `at` of a page.
+fn root_now(c: &mut Client) -> [u8; 32] {
+    c.store
+        .client
+        .send(&Loads::range_request(9_000_000, &range().0, &range().1, None));
+    for reply in c.pump() {
+        if let Ok(protocol::Reply::Page { at, .. }) = protocol::decode_reply(&reply) {
+            return at.root;
+        }
+    }
+    panic!("no page came back to say which root the engine stands on");
+}
+
+/// What `ChangesSince` answered.
+struct Asked {
+    req_id: u64,
+    changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    cursor: Option<Vec<u8>>,
+    new_root: [u8; 32],
+}
+
+/// B loaded `note` at a root; A then wrote `n` rows; B asks what changed FROM
+/// that root.
+///
+/// **SEEDED.** `Refresh` records a root only on a delta, and gets a delta only
+/// from a recorded root (sdk#142), so on its own it never asks from anything
+/// but zero and never receives a `Delta` at all — which is how this defect
+/// hid. The seeding here is at the wire: the question `Refresh` asked, sent
+/// from the root B loaded at, answered under `Refresh`'s own req_id.
+fn changed_since_load(n: u32) -> (Client, Refresh, Asked) {
+    let node = testkit::FullNode::new();
+    let conn = node.connect();
+    let mut a = Client::tab(conn.clone());
+    let mut b = Client::tab(conn);
+    a.write(&key(0), b"before");
+    b.load();
+    let from = root_now(&mut b);
+    for i in 1..=n {
+        a.write(&key(i), b"row");
+    }
+    let mut r = Refresh::new();
+    let Some(protocol::Request::ChangesSince { req_id, lo, hi, max_entries, .. }) = r.ask("note", &range().0, &range().1)
+    else {
+        panic!("Refresh asked nothing");
+    };
+    b.store.client.send(&protocol::Request::ChangesSince { req_id, from, lo, hi, max_entries });
+    let asked = b
+        .pump()
+        .iter()
+        .find_map(|x| match protocol::decode_reply(x) {
+            Ok(protocol::Reply::Delta { req_id, changes, cursor, new_root, .. }) => {
+                Some(Asked { req_id, changes, cursor, new_root })
+            }
+            _ => None,
+        })
+        .expect("VACUITY GUARD: no Reply::Delta came back, so the path under test never ran");
+    (b, r, asked)
+}
+
+/// **A delta of 300 changes is paged at 256, and page 1 is not the answer.**
+///
+/// RED before the fix, measured: page 1 applied, `seen` advanced to its
+/// `new_root`, and B saw 257 of 301 rows — 44 stale under a root claiming to
+/// be current, and nothing would ever have asked for them.
+#[test]
+fn a_cursored_delta_reloads_the_domain_instead_of_standing_on_page_one() {
+    let (mut b, mut r, d) = changed_since_load(300);
+    assert!(d.cursor.is_some(), "VACUITY GUARD: 300 changes came back in one page, so no cursor was ever handled");
+    assert_eq!(d.changes.len(), 256);
+    let answer = r.on_delta(d.req_id, d.changes, d.cursor, d.new_root);
+    assert!(matches!(answer, Answer::Reload { .. }), "a first page was taken for the whole answer: {answer:?}");
+    // Before the reload completes, NEITHER place a root is kept claims the
+    // new one: not `Refresh`, and not the copy.
+    assert_eq!(r.seen("note"), None, "seen advanced on a partial page");
+    assert_ne!(b.store.copy.root(), Some(d.new_root), "the copy recorded a root it is not at");
+    b.answer(answer);
+    assert_eq!(b.rows(), 301, "after the reload the copy equals the tree");
+    assert_eq!(r.take_changed(), vec!["note".to_string()], "and the domain is reported as moved");
+}
+
+/// THE CONTROL: fewer changes than a page is ONE delta, applied — no reload.
+///
+/// Or the fix has quietly turned every delta into a reload.
+#[test]
+fn control_a_delta_under_a_page_is_applied_and_reloads_nothing() {
+    let (mut b, mut r, d) = changed_since_load(200);
+    assert!(d.cursor.is_none());
+    assert_eq!(d.changes.len(), 200);
+    let new_root = d.new_root;
+    let answer = r.on_delta(d.req_id, d.changes, d.cursor, d.new_root);
+    assert!(matches!(answer, Answer::Delta { .. }), "{answer:?}");
+    b.answer(answer);
+    assert_eq!(b.reloads, 0, "a delta that fit in a page was answered with a reload");
+    assert_eq!(r.seen("note"), Some(new_root), "and seen advanced exactly to it");
+    assert_eq!(b.rows(), 201);
+}
+
+/// THE BOUNDARY: exactly one page of changes. What the engine says here is
+/// asserted, not assumed — "256 means more" would be a guess.
+#[test]
+fn a_delta_of_exactly_one_page_is_complete_when_the_engine_says_so() {
+    let (mut b, mut r, d) = changed_since_load(256);
+    assert_eq!(d.changes.len(), 256);
+    let complete = d.cursor.is_none();
+    let answer = r.on_delta(d.req_id, d.changes, d.cursor, d.new_root);
+    b.answer(answer);
+    println!("  256 changes: cursor {}, reloads {}", if complete { "None" } else { "Some" }, b.reloads);
+    assert_eq!(b.reloads, if complete { 0 } else { 1 }, "the answer follows the cursor, and only the cursor");
+    assert_eq!(b.rows(), 257);
+    // Measured: this engine sends a cursor at exactly a full page, since it
+    // cannot know there is no 257th without looking. So the other half of the
+    // boundary — a full page with NO cursor is complete, not "probably more" —
+    // is pinned on `Refresh` directly.
+    let mut r = Refresh::new();
+    let Some(protocol::Request::ChangesSince { req_id, .. }) = r.ask("note", &range().0, &range().1) else { unreachable!() };
+    let page: Vec<_> = (0..256).map(|i| (key(i), Some(b"v".to_vec()))).collect();
+    assert!(matches!(r.on_delta(req_id, page, None, [3u8; 32]), Answer::Delta { .. }), "256 is not taken to mean more");
+    assert_eq!(r.seen("note"), Some([3u8; 32]));
 }
