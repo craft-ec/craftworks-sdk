@@ -471,8 +471,9 @@ pub struct Params {
     /// ids, two ages, and up to two confirmed blocks. Past it the OLDEST is
     /// abandoned, counted: data outranks redundancy (sdk#162).
     pub max_owed_groups: usize,
-    /// The most (write, group) waits for `ParityComplete`. Unit: one group
-    /// id in a waiter's set. Past it the oldest WAITER is dropped, counted.
+    /// The most (write, group) waits for `ParityComplete`. Unit: one group,
+    /// named by its first parity id (32 B), in a waiter's set. Past it the
+    /// oldest WAITER is dropped, counted.
     pub max_parity_waiting_refs: usize,
     /// What of `max_context_bytes` the SHELL's own state may take beside the
     /// engine's: its read-backs (up to one commit's blocks), the head, the
@@ -691,8 +692,8 @@ impl Default for Params {
             max_carried_ops_bytes: 16 * 1024,
             max_settle_rounds: 3,
             max_owed_groups: 128,
-            max_parity_waiting_refs: 256,
-            shell_context_reserve: 8 * 1024,
+            max_parity_waiting_refs: 1024,
+            shell_context_reserve: 12 * 1024,
             min_parked_read_bytes: 32 * 1024,
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
@@ -933,7 +934,11 @@ pub struct Engine<B: Blocks> {
     /// groups that now cover the same members, and a count cannot express
     /// "swap one for two" without drifting. `ParityComplete` is a state of the
     /// WRITE — reported once, when this set empties.
-    parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<ParityIds>>,
+    /// Each group named by its FIRST parity id: a group is identified by any
+    /// of its three ids, and 32 B a reference instead of 96 is what lets the
+    /// cap hold an ordinary burst of writes (sdk#187 review: at 256 full ids,
+    /// 112 of 200 one-row writes never heard ParityComplete).
+    parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<Cid>>,
     /// A write whose tree path is not held, waiting for the blocks it needs.
     ///
     /// At most ONE, and it costs the context its ops. That is affordable only
@@ -1802,6 +1807,13 @@ impl<B: Blocks> Engine<B> {
             reqs.remove(&req_id);
             !reqs.is_empty()
         });
+        // A block nobody waits on any more has no attempts to count. Left
+        // behind, one entry per block asked for and never answered outlived
+        // the read that asked -- shed, given up or capped -- in no cap and in
+        // no sum, and a context with ZERO parked reads went over its bound
+        // (sdk#187 review, executed).
+        let waiting = &self.reads.waiting;
+        self.reads.attempts.retain(|id, _| waiting.contains_key(id));
     }
 
     fn on_write(
@@ -1957,7 +1969,8 @@ impl<B: Blocks> Engine<B> {
             if owed.is_empty() {
                 told.push(State::ParityComplete);
             } else {
-                self.parity_waiting.insert((client, write_id), owed);
+                self.parity_waiting
+                    .insert((client, write_id), owed.iter().map(|k| k[0]).collect());
             }
             return told
                 .into_iter()
@@ -2251,7 +2264,7 @@ impl<B: Blocks> Engine<B> {
                 // "complete" with no redundancy behind it. Dropped, counted.
                 let mut empty = Vec::new();
                 for (w, waiting) in self.parity_waiting.iter_mut() {
-                    if waiting.remove(&key) && waiting.is_empty() {
+                    if waiting.remove(&key[0]) && waiting.is_empty() {
                         empty.push(*w);
                     }
                 }
@@ -2292,7 +2305,7 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         let mut done: Vec<(ClientId, WriteId)> = Vec::new();
         for (w, waiting) in self.parity_waiting.iter_mut() {
-            if waiting.remove(&group) && waiting.is_empty() {
+            if waiting.remove(&group[0]) && waiting.is_empty() {
                 done.push(*w);
             }
         }
@@ -2328,10 +2341,10 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         let mut done: Vec<(ClientId, WriteId)> = Vec::new();
         for (w, waiting) in self.parity_waiting.iter_mut() {
-            if !waiting.remove(&from) {
+            if !waiting.remove(&from[0]) {
                 continue;
             }
-            waiting.extend(to.iter().copied());
+            waiting.extend(to.iter().map(|k| k[0]));
             // Nothing covers those members any more — the write was a delete,
             // or what it wrote is gone. There is no redundancy left to owe.
             if waiting.is_empty() {
@@ -2613,7 +2626,7 @@ impl<B: Blocks> Engine<B> {
         for g in groups.iter().chain(std::mem::take(&mut self.coded_since_commit).iter()) {
             self.forget_group(g);
             for waiting in self.parity_waiting.values_mut() {
-                waiting.remove(g);
+                waiting.remove(&g[0]);
             }
         }
     }
@@ -2783,7 +2796,8 @@ impl<B: Blocks> Engine<B> {
                     state: State::ParityComplete,
                 });
             } else {
-                self.parity_waiting.insert(*w, still.clone());
+                self.parity_waiting
+                    .insert(*w, still.iter().map(|k| k[0]).collect());
             }
         }
         // Coalescing off is the control: put each group's parity the moment
@@ -3167,7 +3181,7 @@ pub(crate) fn worst_case_fixed_bytes(params: &Params) -> usize {
     let owed_unit = enc(o().serialized_size(&(group, 0u64, 0u64))) + 2 * enc(o().serialized_size(&cid));
     // A parity wait: one group id in a waiter's set, and (at worst, one per
     // ref) the waiter's own key and set length.
-    let wait_unit = enc(o().serialized_size(&group))
+    let wait_unit = enc(o().serialized_size(&cid))
         + enc(o().serialized_size(&(ClientId(0), WriteId(0))))
         + 8;
     // The commit in flight, at its caps: data and confirmed ids, one group per
@@ -3509,7 +3523,7 @@ struct Context {
     parked: Vec<(read::ReqId, read::Parked)>,
     waiting: Vec<(Cid, Vec<read::ReqId>)>,
     attempts: Vec<(Cid, u32)>,
-    parity_waiting: Vec<((ClientId, WriteId), Vec<ParityIds>)>,
+    parity_waiting: Vec<((ClientId, WriteId), Vec<Cid>)>,
     head_epoch: Option<Epoch>,
     /// The write waiting on a cold tree path, ops and all. It is the one
     /// place client bytes ride in the context, which is why there is at most
@@ -3666,13 +3680,49 @@ impl<B: Blocks> Engine<B> {
     }
 
     /// The size `to_context` would write, header included, without writing it.
+    ///
+    /// Sized field by field FROM THE LIVE STATE, never by building the
+    /// `Context` -- that clones every collection (a commit's pack bodies
+    /// among them) and, run at the end of every step, made the engine's own
+    /// suites ~4x slower (sdk#162 review, measured). With fixint bincode a
+    /// map encodes exactly as a sequence of its pairs and a set as a sequence,
+    /// so the sum is the length `to_context` writes; every engine test that
+    /// rehydrates checks the two are equal (`common::Harness::step`).
     pub fn context_len(&self) -> usize {
         use bincode::Options;
+        let o = bincode::DefaultOptions::new().with_fixint_encoding();
+        let sz = |r: Result<u64, bincode::Error>| r.map_or(usize::MAX / 64, |n| n as usize);
+        let carries = self.params.context_carries_pending;
+        let none_u64: Option<u64> = None;
+        let none_commit: Option<Commit> = None;
+        let owed_entry = sz(o.serialized_size(&([[0u8; 32]; 3], 0u64, 0u64)));
+        let told: Vec<(ClientId, WriteId)> = Vec::new();
         CONTEXT_HEADER
-            + bincode::DefaultOptions::new()
-                .with_fixint_encoding()
-                .serialized_size(&self.context_value())
-                .map_or(usize::MAX, |n| n as usize)
+            + sz(o.serialized_size(&CONTEXT_VERSION))
+            + sz(o.serialized_size(&(self.published_seq, self.published_root, self.root, self.next_seq)))
+            + if carries {
+                sz(o.serialized_size(&self.pending))
+            } else {
+                sz(o.serialized_size(&none_commit))
+            }
+            + 8
+            + self.owed.len() * owed_entry
+            + sz(o.serialized_size(&self.parity_confirmed))
+            + sz(o.serialized_size(&self.asks.to_vec()))
+            + sz(o.serialized_size(&self.reads.parked))
+            + sz(o.serialized_size(&self.reads.waiting))
+            + sz(o.serialized_size(&self.reads.attempts))
+            + sz(o.serialized_size(&self.parity_waiting))
+            + sz(o.serialized_size(&self.head_epoch))
+            + sz(o.serialized_size(&self.parked_write))
+            + sz(o.serialized_size(&self.subs))
+            + if carries {
+                sz(o.serialized_size(&self.in_flight_since))
+                    + sz(o.serialized_size(&self.told_stalled))
+            } else {
+                sz(o.serialized_size(&none_u64)) + sz(o.serialized_size(&told))
+            }
+            + sz(o.serialized_size(&self.now))
     }
 
     fn context_value(&self) -> Context {

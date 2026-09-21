@@ -1218,3 +1218,64 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
          {control} with both off (identical in Live and Rehydrate)"
     );
 }
+
+/// A read that GIVES UP leaves nothing of itself in the context (sdk#187
+/// review). It waited on up to a round's worth of blocks; one kept missing
+/// until it was answered Unavailable. Every block it asked for had an
+/// `attempts` entry, and those for the blocks that never came back outlived
+/// it -- in no cap, in no sum -- so a context with no parked reads at all
+/// went over its bound. Idle before, idle after.
+#[test]
+fn a_read_that_gives_up_leaves_no_attempts_behind() {
+    let (_, root, all) = fixture(500);
+    let (mut e, store) = reader(root, Params::default());
+    let idle = e.context_len();
+    let r = Range {
+        lo: Bound::Unbounded,
+        hi: Bound::Unbounded,
+        reverse: false,
+        after: None,
+        max_entries: 200,
+        max_bytes: 1 << 20,
+    };
+    let first = stepped!(
+        e,
+        Event::Scan {
+            client: ClientId(1),
+            req_id: ReqId(1),
+            range: Box::new(r),
+        }
+    );
+    // The root arrives; the next round asks for several blocks.
+    let fetched = |fx: &[Effect]| -> Vec<Cid> {
+        fx.iter()
+            .filter_map(|f| match f {
+                Effect::FetchBlock { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    };
+    let root_ask = fetched(&first);
+    assert_eq!(root_ask, vec![root], "the cold read did not ask for its root first");
+    let bytes = all.get(&root).expect("the root").to_vec();
+    store.put(root, &bytes);
+    let round = stepped!(e, Event::BlockArrived { id: root, bytes });
+    let asked = fetched(&round);
+    assert!(asked.len() >= 2, "the second round asked for {} block(s): not a round", asked.len());
+    // One of them misses until the read gives up; the rest never answer.
+    let mut answered = false;
+    for _ in 0..16 {
+        let out = stepped!(e, Event::BlockMissed(asked[0]));
+        if replies(&out).iter().any(|(id, r)| *id == ReqId(1) && matches!(r, ReadResult::Unavailable(_))) {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "the read never gave up");
+    assert_eq!(
+        e.context_len(),
+        idle,
+        "a read that gave up left {} B in the context",
+        e.context_len() as i64 - idle as i64
+    );
+}

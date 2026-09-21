@@ -116,6 +116,10 @@ fn over_the_commit_block_budget_is_too_large_with_its_count_and_the_boundary_is_
         answer(
             Params {
                 max_commit_blocks: got,
+                // A commit cap above the default needs room in the context
+                // (sdk#162: the caps sum under the bound); the parked write
+                // gives it.
+                max_parked_write_bytes: 64 * 1024,
                 ..Params::default()
             },
             ops.clone()
@@ -127,6 +131,10 @@ fn over_the_commit_block_budget_is_too_large_with_its_count_and_the_boundary_is_
         answer(
             Params {
                 max_commit_blocks: got - 1,
+                // A commit cap above the default needs room in the context
+                // (sdk#162: the caps sum under the bound); the parked write
+                // gives it.
+                max_parked_write_bytes: 64 * 1024,
                 ..Params::default()
             },
             ops.clone()

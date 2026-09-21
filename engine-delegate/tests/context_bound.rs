@@ -15,7 +15,6 @@ use protocol::{Reply, Request};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-
 #[derive(Clone, Default)]
 struct Store(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
 
@@ -220,5 +219,144 @@ fn a_request_that_would_overflow_the_context_is_refused_by_name_and_every_call_s
     assert!(
         w3.iter().any(|s| s == "Published"),
         "the trailing write did not publish: {w3:?}"
+    );
+}
+
+/// THE SHELL'S SHARE, at the same time as the engine at its limit (sdk#162
+/// review). The engine keeps itself under `max_context_bytes` less
+/// `shell_context_reserve`; the shell's own state rides on top, and the WHOLE
+/// is what must save. Here the shell carries read-backs for a whole commit
+/// whose puts were acknowledged but whose blocks the delegate has not seen
+/// (a slow node never answers the read-backs), and cold reads are parked
+/// until the engine sheds. Every call must save. And the shed ORDER within
+/// one client is pinned: the reads refused are exactly the NEWEST ones.
+#[test]
+fn the_shell_at_its_worst_beside_the_engine_at_its_limit_still_saves_and_sheds_the_newest() {
+    let p = Params::default();
+    let node = Store::default();
+    let mut ctx: Vec<u8> = Vec::new();
+    let mut inbound = vec![frame(&Request::Write {
+        write_id: 1,
+        ops: (0..400u32)
+            .map(|i| protocol::Op::Put(format!("h/{i:04}").into_bytes(), vec![i as u8; 200]))
+            .collect(),
+    })];
+    for _ in 0..400 {
+        let mut s: Shell<Store> =
+            Shell::resume_with(&ctx, p, node.clone(), StoreFacts::provisioned());
+        let out = s.handle(std::mem::take(&mut inbound));
+        ctx = s.to_context().expect("the history saves");
+        inbound = answer(&node, out.ops);
+        if inbound.is_empty() {
+            break;
+        }
+    }
+    let cold = Store::default();
+    let unsaved = std::cell::Cell::new(0usize);
+    let most_awaiting = std::cell::Cell::new(0usize);
+    let told: RefCell<BTreeMap<String, Vec<String>>> = RefCell::new(BTreeMap::new());
+    let mut put_ids = std::collections::BTreeSet::new();
+    let call = |ctx: &mut Vec<u8>, inbound: Vec<Inbound>| -> Vec<engine_delegate::schedule::Op> {
+        let mut s: Shell<Store> =
+            Shell::resume_with(ctx, p, cold.clone(), StoreFacts::provisioned());
+        s.limits.max_gets = 1000; // the parked write's path; see the first test
+        let out = s.handle(inbound);
+        most_awaiting.set(most_awaiting.get().max(s.awaiting()));
+        match s.to_context() {
+            Some(c) => *ctx = c,
+            None => unsaved.set(unsaved.get() + 1),
+        }
+        heard(&out.replies, &mut told.borrow_mut());
+        out.ops
+    };
+    // 1. A write of ~60 blocks (under the parked-write cap, so it parks and
+    //    applies), on the cold path: its path GETs are
+    //    answered, its PUTs acknowledged -- but the delegate never sees the
+    //    blocks (the read-backs are the slow node's to answer, and it does not).
+    let w = Request::Write {
+        write_id: 2,
+        ops: (0..60u32)
+            .map(|i| {
+                let mut v = vec![0u8; 2048];
+                v[..4].copy_from_slice(&i.to_le_bytes());
+                protocol::Op::Put(format!("w/{i:04}").into_bytes(), v)
+            })
+            .collect(),
+    };
+    let mut queue: Vec<Inbound> = vec![frame(&w)];
+    for _ in 0..400 {
+        if queue.is_empty() {
+            break;
+        }
+        let ops = call(&mut ctx, std::mem::take(&mut queue));
+        for op in ops {
+            use engine_delegate::schedule::Op;
+            match op {
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    put_ids.insert(id);
+                    queue.push(Inbound::PutAcked { id, ok: true });
+                }
+                // A read-back of the commit's own block: never answered.
+                Op::Get { id, .. } if put_ids.contains(&id) => {}
+                Op::Get { id, .. } => {
+                    let bytes = node.get(&id).map(|b| b.to_vec());
+                    if let Some(b) = &bytes {
+                        cold.put(id, b);
+                    }
+                    queue.push(Inbound::GotState { id, bytes });
+                }
+                _ => {}
+            }
+        }
+    }
+    let most_awaiting = most_awaiting.get();
+    assert!(
+        most_awaiting >= 40,
+        "the shell carried only {most_awaiting} read-backs: not at its worst"
+    );
+    // 2. Cold reads, never answered, until the engine sheds.
+    let pad = |c: u8| vec![c; 900];
+    for i in 0..400u64 {
+        let mut lo = b"h/0000".to_vec();
+        lo.extend(pad(b'a'));
+        let mut hi = b"h/9999".to_vec();
+        hi.extend(pad(b'z'));
+        let _ = call(
+            &mut ctx,
+            vec![frame(&Request::Range {
+                req_id: 10_000 + i,
+                lo: protocol::Bound::Included(lo),
+                hi: protocol::Bound::Excluded(hi),
+                reverse: false,
+                after: None,
+                max_entries: 10,
+            })],
+        );
+    }
+    let unsaved = unsaved.get();
+    let told = told.into_inner();
+    let refused: Vec<u64> = told
+        .iter()
+        .filter(|(_, v)| v.iter().any(|s| s == "Unavailable"))
+        .filter_map(|(k, _)| k.strip_prefix('r')?.parse().ok())
+        .collect();
+    let kept_max = (10_000..10_400u64).filter(|r| !refused.contains(r)).max();
+    println!(
+        "  shell read-backs {most_awaiting}; unsaved {unsaved}; {} reads refused, the oldest refused {:?}, the newest kept {kept_max:?}",
+        refused.len(),
+        refused.iter().min()
+    );
+    assert_eq!(
+        unsaved, 0,
+        "{unsaved} call(s) could not save: the engine left the shell no room"
+    );
+    assert!(
+        !refused.is_empty(),
+        "no read was refused: the engine never reached its limit"
+    );
+    assert!(
+        refused.iter().min() > kept_max.as_ref(),
+        "an OLDER read was refused while a newer one was kept"
     );
 }

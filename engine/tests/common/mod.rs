@@ -223,6 +223,16 @@ impl Harness {
                     .expect("the engine's own context must read back");
                 let out = e.step(ev);
                 add(&mut self.shed, e.take_shed());
+                // `context_len` sizes the live state field by field; it must be
+                // exactly what `to_context` writes (sdk#162), in every state any
+                // engine test reaches.
+                if let Ok(c) = e.to_context() {
+                    assert_eq!(
+                        e.context_len(),
+                        c.len(),
+                        "context_len drifted from to_context"
+                    );
+                }
                 self.ctx = e.to_context().expect("a context after every step");
                 self.max_context = self.max_context.max(self.ctx.len());
                 out
