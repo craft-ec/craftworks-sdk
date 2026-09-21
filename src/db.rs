@@ -7,7 +7,7 @@
 use crate::id::{self, Env, IdGen, Loc, RKey};
 use crate::record;
 use crate::schema::Schema;
-use crate::store::{sorted_edits, Edit, Reads, Store, StoreError};
+use crate::store::{sorted_edits, Edit, IdWidth, Reads, Store, StoreError};
 use freenet_prolly::node::{MAX_KEY, MAX_VALUE};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -458,9 +458,33 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         self.read(&schema, &loc, &key, &bytes)
     }
 
+    /// A record, or `None`.
+    ///
+    /// **An id this domain cannot address answers `None` rather than
+    /// refusing.** The ids reaching a read come from OUTSIDE the program — a
+    /// value in browser storage written by an older build, a pasted link, a
+    /// record deleted on another device — and for every one of those the
+    /// honest answer is *absent*, which this already has a representation for.
+    /// Making "malformed" a different CONTROL-FLOW outcome from "missing"
+    /// forces every caller that touches an outside id into a `try`, and the
+    /// one that forgets is the one that crashes (craftworks-sdk#118).
+    ///
+    /// This matters more since #122, not less: a component id stored before
+    /// that change is 32 hex where the domain now wants 64, so the stale-id
+    /// case is no longer hypothetical.
+    ///
+    /// A WRITE still refuses, and that asymmetry is deliberate: answering
+    /// "nothing to do" to a delete or an update aimed at an id nobody can
+    /// resolve would hide the caller's mistake instead of reporting it.
     pub fn get(&mut self, domain: &str, at: impl Into<Loc>) -> Result<Option<Record>> {
         let schema = self.need_schema(domain)?;
-        let loc = self.locate(&schema, domain, at)?;
+        let at: Loc = at.into();
+        let Ok(loc) = self.locate(&schema, domain, at) else {
+            // Well-formed (it parsed) and the wrong WIDTH for this domain: the
+            // one case the answer "not found" would otherwise leave silent.
+            self.store.wrong_width(IdWidth::of(at.parent.is_some()), IdWidth::of(schema.parent.is_some()));
+            return Ok(None);
+        };
         let key = record_key(domain, loc);
         match self.get_key(&key)? {
             Some(b) => self.read(&schema, &loc, &key, &b).map(Some),
@@ -541,19 +565,20 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// Resolve what a caller handed us into a full location, or refuse.
     ///
     /// A bare rkey in a parent-keyed domain cannot address anything: the key
-    /// needs the parent. Building one without it would read a key that cannot
-    /// exist and answer `None` -- a WRONG ANSWER rather than an error, and the
-    /// app would report "no such record" about one sitting right there.
+    /// needs the parent. A WRITE refuses here. A read does not reach this
+    /// refusal — `get` turns it into `None`, because the bare ids that reach a
+    /// read come from outside (a value stored before #122, a pasted link) and
+    /// for those "absent" is the honest answer (craftworks-sdk#118).
     fn locate(&self, schema: &Schema, domain: &str, at: impl Into<Loc>) -> Result<Loc> {
         let loc = at.into();
         match (&schema.parent, &loc.parent) {
             (Some(pf), None) => Err(DbError::Refused(format!(
-                "domain `{domain}` keys its records under `{pf}`, so a record id \
-                 alone cannot address one -- use the full id, which carries both"
+                "domain `{domain}` keys its records under `{pf}`, so it wants a \
+                 64-hex id (parent then record); this one is 32 hex"
             ))),
             (None, Some(_)) => Err(DbError::Refused(format!(
-                "domain `{domain}` does not key its records under a parent, but \
-                 this id carries one"
+                "domain `{domain}` does not key its records under a parent, so it \
+                 wants a 32-hex id; this one is 64 hex"
             ))),
             _ => Ok(loc),
         }

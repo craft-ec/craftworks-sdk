@@ -11,7 +11,7 @@ protocol = { path = "../protocol" }
 engine-delegate = { path = "../engine-delegate" }
 craftworks-sdk = { path = ".." }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
-instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "631241b" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "4b269b5ecb128b49590c5f072b395d68587b6b37" }
 
 [dev-dependencies]
-instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "631241b" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "4b269b5ecb128b49590c5f072b395d68587b6b37" }

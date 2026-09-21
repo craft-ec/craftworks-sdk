@@ -279,8 +279,17 @@ impl Db {
                 .map_err(err)?,
         )
     }
+    /// An id that does not parse answers `null`, the same as one that parses
+    /// and is not there. See `Db::get` for why a read and a write differ here
+    /// (craftworks-sdk#118).
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsError> {
-        json(&self.0.get(domain, loc(id)?).map_err(err)?)
+        let Some(at) = id::loc_from_hex(id) else {
+            // The DOMAIN is still checked: "no such domain" is a programming
+            // error, not an outside id, and must not be hidden behind `null`.
+            self.0.schema(domain).map_err(err)?;
+            return Ok("null".into());
+        };
+        json(&self.0.get(domain, at).map_err(err)?)
     }
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsError> {
         self.0.delete(domain, loc(id)?).map_err(err)

@@ -50,7 +50,7 @@ pub use loads::{Ended, Loads};
 pub use parking::{decide, Outcome};
 pub use refresh::{Answer, Refresh};
 pub use schema::{Field, Kind, Schema};
-pub use store::{Delta, Edit, MemStore, Read, Reads, Store, StoreError};
+pub use store::{Delta, Edit, IdWidth, MemStore, Read, Reads, Store, StoreError};
 pub use trace::{Stamped, Trace, Traces};
 pub use tree_store::{OwedGroup, OwedParity, Stats, TreeStore};
 

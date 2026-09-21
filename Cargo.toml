@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
 protocol = { path = "protocol" }
-instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "631241b" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "4b269b5ecb128b49590c5f072b395d68587b6b37" }
 
 # The JS surface exists only in the wasm build. The version is pinned to the
 # wasm-bindgen CLI: the two must match exactly.

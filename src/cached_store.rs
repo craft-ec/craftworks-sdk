@@ -17,7 +17,7 @@
 
 use crate::copy::{Copy, Refused};
 use crate::engine_client::Client;
-use crate::store::{Delta, Edit, Read, Reads, RowState, Store, StoreError};
+use crate::store::{Delta, Edit, IdWidth, Read, Reads, RowState, Store, StoreError};
 use protocol::Request;
 
 /// Reads from the copy; writes to the pump and, optimistically, to the copy.
@@ -363,6 +363,10 @@ impl Store for CachedStore {
 }
 
 impl Reads for CachedStore {
+    fn wrong_width(&self, given: IdWidth, wanted: IdWidth) {
+        self.client.record_wrong_width(given, wanted);
+    }
+
     /// What this key's own write is doing, from the local copy.
     ///
     /// `Unknown` when the key is not loaded — **never `Clean`**. "I have not
