@@ -52,6 +52,13 @@ struct Mode {
     /// that has not reloaded since an upgrade — sends a tick of its own
     /// through the same delegate.
     two_sessions: bool,
+    /// Answers name the CONTRACT, as a real node's do, and the shell matches
+    /// them to the blocks it is waiting on (sdk#150 PR 4).
+    contract: bool,
+    /// Block PUTs land and their acks never come (sdk#150 E2).
+    lose_acks: bool,
+    /// Block PUTs never reach the node, until the cell heals it.
+    drop_puts: bool,
 }
 
 impl Mode {
@@ -74,6 +81,15 @@ impl Mode {
         if self.two_sessions {
             p.push("two-sessions")
         }
+        if self.contract {
+            p.push("contract")
+        }
+        if self.lose_acks {
+            p.push("lose-acks")
+        }
+        if self.drop_puts {
+            p.push("drop-puts")
+        }
         p.join("+")
     }
 }
@@ -84,6 +100,9 @@ const BATCH: Mode = Mode {
     evicting: false,
     real_ticks: false,
     two_sessions: false,
+    contract: false,
+    lose_acks: false,
+    drop_puts: false,
 };
 const APC: Mode = Mode {
     one_per_call: true,
@@ -147,6 +166,11 @@ fn connect(node: &FullNode, mode: Mode) -> Conn {
     } else {
         c.answers_together();
     }
+    if mode.contract {
+        c.pair_by_contract();
+    }
+    c.lose_put_acks(mode.lose_acks);
+    c.drop_puts(mode.drop_puts);
     c
 }
 
@@ -208,6 +232,11 @@ fn misaddressed(mode: Mode, replies: &[Vec<u8>]) -> Option<String> {
 /// engine is still open.
 fn every_call(c: &mut Conn) -> Option<String> {
     // OPEN AFTERWARDS. Its calls are subject to the two checks below as well.
+    // The node is HEALED first: this asks whether the ENGINE is open, and a
+    // write on a node still losing every ack has nothing to settle it but
+    // ticks this check does not send.
+    c.lose_put_acks(false);
+    c.drop_puts(false);
     let mut after = c.client(&Request::Write {
         write_id: OPEN_AFTERWARDS,
         ops: vec![Op::Put(b"k/open-afterwards".to_vec(), b"x".to_vec())],
@@ -249,6 +278,9 @@ fn w1_multi_block_commit(mode: Mode) -> Cell {
         ],
     };
     let mut replies = send(&mut c, mode, &w);
+    if mode.lose_acks || mode.drop_puts {
+        return w1_silent(mode, c, w, replies);
+    }
     // Real ticks: time keeps passing while the commit is in flight.
     if mode.real_ticks {
         let base = 1_790_000_000_000u64;
@@ -265,6 +297,69 @@ fn w1_multi_block_commit(mode: Mode) -> Cell {
     }
     if !st.contains(&WriteState::Published) {
         return Cell::Red(format!("never published: told {st:?}"));
+    }
+    Cell::Green
+}
+
+/// W6: one commit of MORE THAN 64 BLOCKS publishes -- 100 distinct 2 KiB
+/// values, each its own block. Under `+contract` the answers name contracts:
+/// the shell's pairing map held 64 while a return carries 128 puts, so such
+/// a commit evicted its own pairings, read an ack back as a block, and never
+/// published (sdk#150, executed: 36 GETs, 24 stranded, Stalled).
+fn w6_over_64_blocks(mode: Mode) -> Cell {
+    use testkit::full_node::Served;
+    let node = node_for(mode);
+    let mut c = connect(&node, mode);
+    c.client(&Request::Identity);
+    let before = c.served(Served::Put);
+    let ops: Vec<Op> = (0..100u64)
+        .map(|i| {
+            Op::Put(
+                format!("k/wide/{i:04}").into_bytes(),
+                value(60_000 + i, 2048),
+            )
+        })
+        .collect();
+    // Re-sent on Busy, the way the outbox does. On a cold node a write this
+    // size is over `max_parked_write_bytes`, so it is declined while its path
+    // is fetched -- ONE block per re-send, since the apply stops at the first
+    // missing one (measured: 40 re-sends for this tree). That cost is
+    // sdk#174's continuation, not this cell's claim; the count is printed.
+    let mut st = Vec::new();
+    let mut sends = 0;
+    for _ in 0..64 {
+        sends += 1;
+        let got = states_of(
+            &c.client(&Request::Write {
+                write_id: 1,
+                ops: ops.clone(),
+            }),
+            1,
+        );
+        let busy = got.last() == Some(&WriteState::Busy);
+        st.extend(got);
+        if !busy {
+            break;
+        }
+    }
+    if mode.cold {
+        println!(
+            "    (W6 {}: {sends} send(s) before the write applied)",
+            mode.name()
+        );
+    }
+    st.retain(|s| *s != WriteState::Busy);
+    let puts = c.served(Served::Put) - before;
+    if let Some(why) = every_call(&mut c) {
+        return Cell::Red(format!("{why}; {puts} PUTs; told {st:?}"));
+    }
+    if puts <= 64 {
+        return Cell::NotReached(format!(
+            "the commit put {puts} blocks, not more than 64; told {st:?}"
+        ));
+    }
+    if !st.contains(&WriteState::Published) {
+        return Cell::Red(format!("never published ({puts} PUTs): told {st:?}"));
     }
     Cell::Green
 }
@@ -321,6 +416,65 @@ fn w7_zero_block_write(mode: Mode) -> Cell {
         return Cell::Red(format!(
             "the no-op write sent {} PUT(s) and {} head(s)",
             to_node.0, to_node.1
+        ));
+    }
+    Cell::Green
+}
+
+/// W1 under SILENCE on the write path (sdk#150 E2), with real ticks so the
+/// engine can settle from fact. `lose-acks`: the puts landed, only their acks
+/// were lost -- the commit publishes BY FACT, with no data put repeated.
+/// `drop-puts`: the puts never arrived, and W1's ops (30 KiB) are too large
+/// to carry for a re-put -- so the write is told `Lost` within its deadline
+/// and the engine is RELEASED; the node heals, the client re-sends, and that
+/// publishes.
+fn w1_silent(mode: Mode, mut c: Conn, w: Request, mut replies: Vec<Vec<u8>>) -> Cell {
+    use testkit::full_node::Served;
+    let base = 1_790_000_000_000u64;
+    let data_puts = c.served(Served::Put);
+    let deadline = 2 * engine::Params::default().reask_after;
+    let mut settled_at = None;
+    for k in 1..=deadline {
+        replies.extend(c.tick_at(base + k * 1000));
+        let st = states_of(&replies, 1);
+        if st.contains(&WriteState::Published) || st.contains(&WriteState::Lost) {
+            settled_at = Some(k);
+            break;
+        }
+    }
+    let st = states_of(&replies, 1);
+    let repeated = c.served(Served::Put) - data_puts;
+    if mode.lose_acks {
+        if !st.contains(&WriteState::Published) {
+            return Cell::Red(format!(
+                "acks lost: not published by fact in {deadline} ticks: {st:?}"
+            ));
+        }
+        if repeated != 0 {
+            return Cell::Red(format!(
+                "acks lost: {repeated} data put(s) repeated before publishing"
+            ));
+        }
+    } else {
+        if !st.contains(&WriteState::Lost) {
+            return Cell::Red(format!(
+                "puts dropped: not told Lost within {deadline} ticks: {st:?}"
+            ));
+        }
+        // The node heals; the client re-sends the same ops.
+        c.drop_puts(false);
+        let Request::Write { ops, .. } = w else {
+            unreachable!()
+        };
+        let again = c.client(&Request::Write { write_id: 2, ops });
+        let st2 = states_of(&again, 2);
+        if !st2.contains(&WriteState::Published) {
+            return Cell::Red(format!("after Lost the re-send was told {st2:?}"));
+        }
+    }
+    if let Some(why) = every_call(&mut c) {
+        return Cell::Red(format!(
+            "{why}; settled at tick {settled_at:?}; told {st:?}"
         ));
     }
     Cell::Green
@@ -652,7 +806,7 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
 
 #[test]
 fn every_workload_under_every_mode() {
-    let workloads: [Workload; 7] = [
+    let workloads: [Workload; 8] = [
         (
             "W1 multi-block commit publishes",
             w1_multi_block_commit,
@@ -666,6 +820,18 @@ fn every_workload_under_every_mode() {
                 Mode { cold: true, ..APC },
                 Mode {
                     two_sessions: true,
+                    ..APC
+                },
+                Mode {
+                    contract: true,
+                    ..APC
+                },
+                Mode {
+                    lose_acks: true,
+                    ..APC
+                },
+                Mode {
+                    drop_puts: true,
                     ..APC
                 },
             ],
@@ -718,6 +884,19 @@ fn every_workload_under_every_mode() {
             "W5 parity wider than one return",
             w5_parity_overflow,
             vec![APC],
+        ),
+        (
+            "W6 one commit of more than 64 blocks",
+            w6_over_64_blocks,
+            vec![
+                BATCH,
+                APC,
+                Mode { cold: true, ..APC },
+                Mode {
+                    contract: true,
+                    ..APC
+                },
+            ],
         ),
         (
             "W7 a write that emits zero blocks",

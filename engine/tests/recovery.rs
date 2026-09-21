@@ -543,10 +543,15 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
         );
     }
 
-    // Time passes with the commit stuck.
+    // Time passes with the commit stuck. Its effects are KEPT: a tick may
+    // settle the commit from fact (sdk#150) -- its blocks are held, so they
+    // are confirmed and the head is sent in a tick's effects, which the
+    // network answers below along with the rest.
+    let mut later: Vec<Effect> = Vec::new();
     for tick in 1..=(t * 3) {
         let out = stepped!(e, Event::Tick(tick));
         absorb(&mut seen, &out);
+        later.extend(out);
     }
 
     // Write 1 is the one that is genuinely held: it was accepted, its edit is
@@ -580,6 +585,7 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
 
     // Now the network answers, and the stalled write gets saved.
     let mut queue = first;
+    queue.extend(later);
     for (id, bytes) in &held {
         net.confirm(*id, bytes);
     }

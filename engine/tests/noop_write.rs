@@ -107,14 +107,20 @@ fn a_real_change_is_not_published_without_its_head() {
     assert_eq!(states(&changed, 2), vec![State::Accepted]);
     assert!(to_node(&changed) > 0, "a real change put nothing");
     let mut told = Vec::new();
+    let mut effects = changed;
     for t in 1..10 {
-        told.extend(states(&h.step(Event::Tick(1_790_000_000 + t)), 2));
+        // Ticks may settle the commit from FACT (sdk#150): its blocks are
+        // held, so they are confirmed and the head is sent -- in a tick's
+        // effects, which are kept to be answered below.
+        let out = h.step(Event::Tick(1_790_000_000 + t));
+        told.extend(states(&out, 2));
+        effects.extend(out);
     }
     assert!(
         !told.contains(&State::Published),
         "a real change was told Published with no head confirmed: {told:?}"
     );
-    let all = settle(&mut h, changed);
+    let all = settle(&mut h, effects);
     assert!(
         states(&all, 2).contains(&State::Published),
         "and once confirmed it does publish: {:?}",

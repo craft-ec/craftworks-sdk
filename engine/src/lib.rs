@@ -458,6 +458,15 @@ pub struct Params {
     /// one already made. Checked at construction against
     /// `asks::CONTEXT_SHARE` of `max_context_bytes`.
     pub max_asks: usize,
+    /// The most a commit's OPS may take in the context, serialized, so a
+    /// data put lost in flight can be re-derived and re-put (sdk#150 E2).
+    /// A commit's BYTES are never carried -- up to 128 blocks of 16 KiB
+    /// against a 400 KiB context -- but the ops that made them are usually
+    /// small, and the apply is a pure function of (base root, ops). A write
+    /// over this is released `Lost` instead, and its client re-sends.
+    pub max_carried_ops_bytes: usize,
+    /// How many settle rounds a commit gets before it is released `Lost`.
+    pub max_settle_rounds: u32,
     /// Off = the negative control for coalescing.
     pub coalesce_parity: bool,
     /// Find superseded groups by scanning the WHOLE tree instead of only what
@@ -665,6 +674,8 @@ impl Default for Params {
             parity_age: 32,
             reask_after: 16,
             max_asks: 132,
+            max_carried_ops_bytes: 16 * 1024,
+            max_settle_rounds: 3,
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
             transfer_superseded_waiters: true,
@@ -778,6 +789,17 @@ struct Commit {
     head_sent: bool,
     /// Bytes of the accepted-but-not-durable writes, for the backlog bound.
     bytes: usize,
+    /// The root the commit's ops were applied to: the published root when it
+    /// started. Re-applying `ops` to it re-derives the same blocks.
+    base: Cid,
+    /// The ops that made this commit, when they fit `max_carried_ops_bytes`:
+    /// what a lost data put is re-derived from (sdk#150 E2).
+    ops: Option<Vec<(Vec<u8>, Op)>>,
+    /// When this commit was last settled from fact, and how many times --
+    /// its OWN pace, doubling like an ask's. Per commit rather than per
+    /// block: a commit's data puts would fill the asks table's slots.
+    settle_at: u64,
+    settle_rounds: u32,
 }
 
 /// The write pipeline.
@@ -1027,6 +1049,29 @@ impl<B: Blocks> Engine<B> {
     /// confirmed ON THE NODE -- carried in the context, so true at the top of
     /// a call that did not see the confirmation (sdk#150). The head bump is
     /// emitted only once every one of them is here, naming them as `after`.
+    /// Every block this engine is waiting on the NODE to answer about: the
+    /// commit's unconfirmed data, the blocks parked reads wait on, the parked
+    /// write's path, and owed parity not yet confirmed (sdk#150).
+    ///
+    /// Derived, never recorded. An answer names a CONTRACT, and the host
+    /// matches it back to a block by deriving each of these blocks' contract
+    /// ids -- so no map of "what went out" is carried, and nothing that was
+    /// asked for can be evicted from one.
+    pub fn waiting_on(&self) -> BTreeSet<Cid> {
+        let mut w: BTreeSet<Cid> = BTreeSet::new();
+        if let Some(c) = &self.pending {
+            w.extend(c.data.difference(&c.confirmed).copied());
+        }
+        w.extend(self.reads.waiting.keys().copied());
+        if let Some(p) = &self.parked_write {
+            w.extend(p.needs.iter().copied());
+        }
+        for key in self.owed.keys() {
+            w.extend(key.iter().filter(|id| !self.parity_confirmed.contains(*id)));
+        }
+        w
+    }
+
     pub fn confirmed_in_flight(&self) -> impl Iterator<Item = Cid> + '_ {
         self.pending
             .iter()
@@ -1195,6 +1240,19 @@ impl<B: Blocks> Engine<B> {
 
     fn on_head_read(&mut self, epoch: Epoch, seq: u64, root: Cid) -> Vec<Effect> {
         self.head_epoch = Some(epoch);
+        // WITH A COMMIT IN FLIGHT, a head read is that commit's question:
+        // its own head is the confirmation, an older one says its head never
+        // landed, and anything newer is another writer's. Adopting whatever
+        // came back would move the tree out from under the commit.
+        if let Some(c) = self.pending.as_ref() {
+            return if seq == c.seq && root == c.root {
+                self.on_head(seq)
+            } else if seq < c.seq {
+                self.head_not_landed()
+            } else {
+                self.on_head_conflict(seq, root)
+            };
+        }
         let changed = self.adopt(seq, root);
         self.recovered = true;
         // The tree is not walked here. Reads warm it lazily (slice 2), which
@@ -1209,6 +1267,10 @@ impl<B: Blocks> Engine<B> {
     /// No head under the newest epoch: try the one before it, and only when
     /// they are exhausted is this a device that has never written.
     fn on_head_missing(&mut self) -> Vec<Effect> {
+        // A commit in flight whose head is not there: it never landed.
+        if self.pending.is_some() {
+            return self.head_not_landed();
+        }
         if !self.epochs.is_empty() {
             self.epochs.remove(0);
         }
@@ -1230,9 +1292,17 @@ impl<B: Blocks> Engine<B> {
     /// head, and the writes that were in flight are re-applied to the tree
     /// that won.
     fn on_head_conflict(&mut self, seq: u64, root: Cid) -> Vec<Effect> {
-        let rebasing: Vec<(ClientId, WriteId)> = self
-            .pending
-            .take()
+        // An OLDER head is not a conflict: this commit's head never landed.
+        if self.pending.as_ref().is_some_and(|c| seq < c.seq) {
+            return self.head_not_landed();
+        }
+        let dead = self.pending.take();
+        // The dead commit's groups describe a tree that never published.
+        if let Some(c) = &dead {
+            let groups = c.groups.clone();
+            self.forget_dead_groups(&groups);
+        }
+        let rebasing: Vec<(ClientId, WriteId)> = dead
             .map(|c| c.writes)
             .into_iter()
             .flatten()
@@ -1667,20 +1737,7 @@ impl<B: Blocks> Engine<B> {
         // run instead, which is the same ops in the same order producing a
         // different tree; the differential against a from-scratch rebuild is
         // what caught it.
-        let batch: Vec<(Vec<u8>, TreeEdit)> = ops
-            .iter()
-            .map(|(k, o)| {
-                (
-                    k.clone(),
-                    match o {
-                        Op::Put(v) => TreeEdit::Put(v.clone()),
-                        Op::Delete => TreeEdit::Delete,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .collect();
+        let batch = batch_of(&ops);
 
         let old_root = self.root;
         let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
@@ -1799,7 +1856,7 @@ impl<B: Blocks> Engine<B> {
         // and it is empty at every point an event can observe.
         debug_assert!(self.pending.is_none());
         let to_ship = self.take_unpublished();
-        out.extend(self.start_commit(to_ship));
+        out.extend(self.start_commit(to_ship, Some(ops)));
         out
     }
 
@@ -2129,7 +2186,11 @@ impl<B: Blocks> Engine<B> {
     }
 
     /// Plan the packs for what a commit emitted, and send them.
-    fn start_commit(&mut self, emitted: Vec<(Cid, Vec<u8>)>) -> Vec<Effect> {
+    fn start_commit(
+        &mut self,
+        emitted: Vec<(Cid, Vec<u8>)>,
+        ops: Option<Vec<(Vec<u8>, Op)>>,
+    ) -> Vec<Effect> {
         let seq = self.next_seq;
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
@@ -2240,8 +2301,175 @@ impl<B: Blocks> Engine<B> {
             writes,
             head_sent: false,
             bytes,
+            base: self.published_root,
+            ops: ops.filter(|o| {
+                bincode::serialized_size(o).is_ok_and(|n| n as usize <= self.params.max_carried_ops_bytes)
+            }),
+            settle_at: self.now,
+            settle_rounds: 0,
         });
         out
+    }
+
+    /// SETTLE A SILENT COMMIT FROM FACT (sdk#150 E1/E2).
+    ///
+    /// An effect the engine emitted can be stranded, cut or never answered,
+    /// and nothing reports that: "asked, therefore it happened" left a commit
+    /// in flight for ever and every later write `Busy`. So once a commit has
+    /// heard nothing for its pace (`reask_after`, doubling per round), the
+    /// engine looks at what is TRUE:
+    ///   1. a data block the node HOLDS is confirmed, whoever did or did not
+    ///      say so (a sync read of what is held here, F14);
+    ///   2. every block confirmed and the head sent: READ the head -- its
+    ///      seq and root are in the context, so nothing is re-sent blind;
+    ///   3. blocks still missing: re-apply the carried ops to the commit's
+    ///      base and re-put the missing ones (the same ops on the same root
+    ///      make the same blocks); with no ops carried, or after
+    ///      `max_settle_rounds`, the commit is `Lost` and the engine is
+    ///      RELEASED -- the client still holds the ops, and re-sends.
+    fn settle_by_fact(&mut self, now: u64) -> Vec<Effect> {
+        let Some(c) = self.pending.as_ref() else {
+            return Vec::new();
+        };
+        let wait = self
+            .params
+            .reask_after
+            .saturating_mul(1 << c.settle_rounds.min(asks::MAX_DOUBLINGS));
+        if now.saturating_sub(c.settle_at) < wait {
+            return Vec::new();
+        }
+        let held: Vec<Cid> = c
+            .data
+            .difference(&c.confirmed)
+            .copied()
+            .filter(|id| self.blocks.get(id).is_some())
+            .collect();
+        let mut out = Vec::new();
+        for id in held {
+            out.extend(self.on_confirmed(id));
+        }
+        let Some(c) = self.pending.as_mut() else {
+            return out;
+        };
+        c.settle_at = now;
+        c.settle_rounds += 1;
+        let missing: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
+        if missing.is_empty() {
+            if c.head_sent {
+                out.push(Effect::ReadHead {
+                    epoch: self.head_epoch.unwrap_or(Epoch(1)),
+                });
+            }
+            return out;
+        }
+        if c.settle_rounds <= self.params.max_settle_rounds {
+            if let Some(fx) = self.reput_from_ops(&missing) {
+                out.extend(fx);
+                return out;
+            }
+        }
+        out.extend(self.release_lost());
+        out
+    }
+
+    /// Re-derive the commit's missing blocks from its carried ops, and put
+    /// them again. `None` when no ops are carried, or they no longer make
+    /// the commit's root (nothing to re-put that would be the same commit).
+    fn reput_from_ops(&mut self, missing: &BTreeSet<Cid>) -> Option<Vec<Effect>> {
+        let c = self.pending.as_ref()?;
+        let batch = batch_of(c.ops.as_ref()?);
+        let (base, root) = (c.base, c.root);
+        let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
+        let applied = apply_with(
+            ApplyOptions::default(),
+            &self.source(),
+            &base,
+            &batch,
+            |id, b: &[u8]| emitted.push((id, b.to_vec())),
+        );
+        match applied {
+            Ok(a) if a.root == root => Some(
+                emitted
+                    .into_iter()
+                    .filter(|(id, _)| missing.contains(id))
+                    .map(|(id, bytes)| Effect::PutBlock {
+                        id,
+                        bytes,
+                        after: Vec::new(),
+                    })
+                    .collect(),
+            ),
+            // The path went cold since (F33): fetch it, and re-derive on the
+            // next round.
+            Err(ApplyError::Read(ReadError::Need(need))) => Some(
+                need.into_iter()
+                    .map(|id| Effect::FetchBlock {
+                        id,
+                        via: read::Via::Direct,
+                        attempt: 1,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Give up the commit in flight: its writes are `Lost` (their edits are
+    /// not in any published tree; each client still holds its ops and
+    /// re-sends), the tree goes back to the published one, the groups it
+    /// coded stop being owed -- they describe a tree that never published --
+    /// and the engine is open for the next write.
+    fn release_lost(&mut self) -> Vec<Effect> {
+        let Some(c) = self.pending.take() else {
+            return Vec::new();
+        };
+        self.in_flight_since = None;
+        self.unpublished.clear();
+        self.root = self.published_root;
+        self.next_seq = self.published_seq + 1;
+        self.forget_dead_groups(&c.groups);
+        c.writes
+            .into_iter()
+            .map(|w| {
+                self.told_stalled.remove(&w);
+                self.parity_waiting.remove(&w);
+                Effect::Notify {
+                    client: w.0,
+                    write_id: w.1,
+                    state: State::Lost,
+                }
+            })
+            .collect()
+    }
+
+    /// Groups a commit that will never publish coded: not owed, and nothing
+    /// waits on them.
+    fn forget_dead_groups(&mut self, groups: &BTreeSet<ParityIds>) {
+        for g in groups.iter().chain(std::mem::take(&mut self.coded_since_commit).iter()) {
+            self.forget_group(g);
+            for waiting in self.parity_waiting.values_mut() {
+                waiting.remove(g);
+            }
+        }
+    }
+
+    /// The head read back shows the commit's head is NOT there (an older seq,
+    /// or none): the write of it never landed. Re-issue it -- the same seq and
+    /// root, which the Register takes or refuses on its own terms.
+    fn head_not_landed(&mut self) -> Vec<Effect> {
+        let Some(c) = self.pending.as_mut() else {
+            return Vec::new();
+        };
+        if c.confirmed.len() < c.data.len() {
+            c.head_sent = false;
+            return Vec::new();
+        }
+        c.head_sent = true;
+        vec![Effect::UpdateHead {
+            seq: c.seq,
+            root: c.root,
+            after: c.data.iter().copied().collect(),
+        }]
     }
 
     fn on_confirmed(&mut self, id: Cid) -> Vec<Effect> {
@@ -2435,7 +2663,7 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         if self.pending.is_none() && !self.unpublished.is_empty() {
             let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship));
+            out.extend(self.start_commit(to_ship, None));
         }
         // Every group, whatever its age and whether or not it settled.
         out.extend(self.emit_parity(|_| true));
@@ -2468,6 +2696,11 @@ impl<B: Blocks> Engine<B> {
                 }
             }
             self.asks.anchor(now);
+            if let Some(c) = self.pending.as_mut() {
+                if c.settle_at == 0 {
+                    c.settle_at = now;
+                }
+            }
             // A group first owed before any clock is dated from the first,
             // or its age bound would fire at once.
             for o in self.owed.values_mut() {
@@ -2488,6 +2721,9 @@ impl<B: Blocks> Engine<B> {
                 *since = now;
             }
             self.asks.reanchor(now);
+            if let Some(c) = self.pending.as_mut() {
+                c.settle_at = now;
+            }
             for o in self.owed.values_mut() {
                 o.since = now;
                 o.last_changed = o.last_changed.min(now);
@@ -2495,6 +2731,7 @@ impl<B: Blocks> Engine<B> {
         }
         self.now = now;
         let mut out = self.age_out_accepted(now);
+        out.extend(self.settle_by_fact(now));
         if !self.params.coalesce_parity {
             return out;
         }
@@ -2743,6 +2980,24 @@ impl<B: Blocks> Engine<B> {
             self.asks.settled(&asks::Ask::Parity(*id));
         }
     }
+}
+
+/// A write's ops as the tree takes them: a SET in key order, the LAST op on
+/// a key winning -- the client's sequence, collapsed the way the SDK does.
+fn batch_of(ops: &[(Vec<u8>, Op)]) -> Vec<(Vec<u8>, TreeEdit)> {
+    ops.iter()
+        .map(|(k, o)| {
+            (
+                k.clone(),
+                match o {
+                    Op::Put(v) => TreeEdit::Put(v.clone()),
+                    Op::Delete => TreeEdit::Delete,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect()
 }
 
 fn kind_raw() -> u8 {
@@ -3092,6 +3347,9 @@ const CLOCK_RESET_TICKS: u64 = 600;
 
 /// The version this build writes. Bumped when the shape changes.
 ///
+/// 8: a commit carries what settles it from fact: its base root, its ops
+/// when they are small, and its own settle pace (sdk#150 E1/E2).
+///
 /// 7: `in_flight_parity` left it for `parity_confirmed` (the answers) and
 /// `asks` (pacing), and owed groups carry their ages: an emission is not a
 /// fact (sdk#150).
@@ -3114,7 +3372,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 7;
+const CONTEXT_VERSION: u16 = 8;
 
 /// What a context this build wrote begins with.
 ///

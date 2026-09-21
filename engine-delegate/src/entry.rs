@@ -171,25 +171,13 @@ impl DelegateInterface for EngineDelegate {
         };
 
         let mut node_said = String::new();
-        let mut trace = String::new();
+        let trace = String::new();
         let saw = match &inbound {
             InboundDelegateMsg::ApplicationMessage(_) => protocol::Saw::Client,
             InboundDelegateMsg::GetContractResponse(_) => protocol::Saw::GetResponse,
             InboundDelegateMsg::PutContractResponse(_) => protocol::Saw::PutResponse,
             InboundDelegateMsg::UpdateContractResponse(_) => protocol::Saw::UpdateResponse,
             _ => protocol::Saw::Other,
-        };
-        // What block a response is about, if this is one and the pairing was
-        // remembered. Read before the shell is built, because the shell needs
-        // the answer to build the message it is given.
-        let remembered: Option<[u8; 32]> = match &inbound {
-            InboundDelegateMsg::GetContractResponse(r) => {
-                Shell::<NodeBlocks>::peek_block_for(&carried, &id32(&r.contract_id))
-            }
-            InboundDelegateMsg::PutContractResponse(r) => {
-                Shell::<NodeBlocks>::peek_block_for(&carried, &id32(&r.contract_id))
-            }
-            _ => None,
         };
         let msg = match &inbound {
             InboundDelegateMsg::ApplicationMessage(m) => Inbound::Client(m.payload.to_vec()),
@@ -230,12 +218,10 @@ impl DelegateInterface for EngineDelegate {
                                 bytes: Some(body),
                             }
                         }
-                        // A MISS carries no state to compute from, so this is
-                        // the one case the remembered pairing is for.
-                        _ => Inbound::GotState {
-                            id: remembered.unwrap_or(id32),
-                            bytes: None,
-                        },
+                        // A MISS carries no state to compute from: it names the
+                        // contract, and the shell finds the block it is
+                        // waiting on whose contract that is.
+                        _ => Inbound::MissedContract { contract: id32 },
                     }
                 }
             }
@@ -273,21 +259,12 @@ impl DelegateInterface for EngineDelegate {
                 if let Err(e) = &r.result {
                     node_said = e.clone();
                 }
-                Inbound::PutAcked {
-                    // The CONTRACT id, translated back to the block the
-                    // engine knows. Telling the core a contract id is telling
-                    // it about a block it never emitted, and it ignores it —
-                    // which is a commit that never publishes and no error
-                    // anywhere.
-                    id: {
-                        // Whether the contract id could be matched back to a
-                        // block the engine knows. An UNPAIRED put response is
-                        // one the core will ignore, so it is worth saying.
-                        if remembered.is_none() {
-                            trace = "shell: put response UNPAIRED".into();
-                        }
-                        remembered.unwrap_or(id32)
-                    },
+                // The CONTRACT id, as the node names it. The shell matches it
+                // to the block it is waiting on (`block_for_contract`), and
+                // drops one it is not waiting on as Unexpected rather than
+                // take a contract id for a block.
+                Inbound::PutAckedContract {
+                    contract: id32,
                     ok: r.result.is_ok(),
                 }
             }
@@ -321,6 +298,11 @@ impl DelegateInterface for EngineDelegate {
                     head_id: head_id.unwrap_or_default(),
                 },
             );
+            // Answers name contracts; the shell matches them to the blocks it
+            // is waiting on through the Block contract's own derivation.
+            shell.contract_of = code
+                .as_deref()
+                .map(|c| Box::new(crate::blocks::contract_deriver(c)) as crate::shell::ContractOf);
             let out = shell.handle(vec![msg]);
             head_exists = shell.head_exists();
             (out, shell.to_context(), shell.installed)
@@ -381,7 +363,6 @@ impl DelegateInterface for EngineDelegate {
         if let Some(c) = saved.as_deref() {
             ctx.write(c);
         }
-        let carried2 = ctx.read();
 
         let mut msgs: Vec<OutboundDelegateMsg> = Vec::new();
         // Set when the engine asked for its head and there is no Register to
@@ -397,13 +378,11 @@ impl DelegateInterface for EngineDelegate {
         let mut head_put_bytes = 0usize;
         let mut head_update_bytes = 0usize;
         // contract id -> the block id the engine knows it by.
-        let mut asked: Vec<([u8; 32], [u8; 32])> = Vec::new();
         for op in out.ops {
             match op {
                 Op::Get { id, .. } => {
                     let Some(code) = code.clone() else { continue };
                     let c = block_contract(&code, &id);
-                    asked.push((id32(c.key().id()), id));
                     msgs.push(OutboundDelegateMsg::GetContractRequest(
                         GetContractRequest::new(*c.key().id()),
                     ));
@@ -439,7 +418,6 @@ impl DelegateInterface for EngineDelegate {
                         continue;
                     }
                     let c = block_contract(&code, &id);
-                    asked.push((id32(c.key().id()), id));
                     msgs.push(OutboundDelegateMsg::PutContractRequest(
                         PutContractRequest::new(
                             c,
@@ -508,31 +486,6 @@ impl DelegateInterface for EngineDelegate {
                     )),
                     None => no_head = true,
                 },
-            }
-        }
-        // Remember what went out, so a MISS coming back can be matched to the
-        // block the engine asked for. Written through a shell so it lands in
-        // the same context everything else does.
-        if !asked.is_empty() {
-            let saved3 = {
-                let blocks = NodeBlocks::with_code(ctx, code.clone());
-                let mut shell = Shell::resume_with(
-                    &carried2,
-                    Params::default(),
-                    blocks,
-                    StoreFacts {
-                        has_code: code.is_some(),
-                        head_writable: writable,
-                        head_id: head_id.unwrap_or_default(),
-                    },
-                );
-                for (contract, block) in &asked {
-                    shell.note_request(*contract, *block);
-                }
-                shell.to_context()
-            };
-            if let Some(c) = saved3.as_deref() {
-                ctx.write(c);
             }
         }
         let carried2 = ctx.read();
