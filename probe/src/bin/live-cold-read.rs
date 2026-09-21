@@ -172,6 +172,7 @@ async fn main() -> Result<()> {
     let mut rows: Vec<(String, u32)> = (0..300).map(|i| ("w".to_string(), i)).collect();
     for p in ["a", "b", "c"] { rows.extend((0..60).map(|i| (p.to_string(), i))); }
     let mut published = 0;
+    let mut ga = Gate::default();
     for (n, chunk) in rows.chunks(40).enumerate() {
         let mut ops: Vec<protocol::Op> = chunk.iter().map(|(p, i)| { let mut v = vec![p.as_bytes()[0]; 1000]; v[..4].copy_from_slice(&i.to_le_bytes());
             protocol::Op::Put(format!("{p}/{i:04}").into_bytes(), v) }).collect();
@@ -180,13 +181,14 @@ async fn main() -> Result<()> {
         // re-sent on Busy, as an outbox does
         let t = Instant::now(); let mut ok = false;
         'one: while t.elapsed() < Duration::from_secs(60) {
-            send(&mut ca, &dkey, &Request::Write { write_id: id, ops: ops.clone() }).await?;
+            send(&mut ca, &dkey, &Request::Write { write_id: id, ops: ops.clone() }).await?; ga.sent();
             let end = Instant::now() + Duration::from_secs(30);
             while Instant::now() < end {
                 let got = hear(&mut ca, started, Duration::from_millis(500)).await;
+                ga.heard(&got);
                 if got.iter().any(|(_, l)| *l == format!("w{id}: Published")) { ok = true; break 'one; }
                 if got.iter().any(|(_, l)| *l == format!("w{id}: Busy")) { tokio::time::sleep(Duration::from_millis(500)).await; continue 'one; }
-                send(&mut ca, &dkey, &Request::Tick { now: protocol::tick_of(now_ms()) }).await?;
+                ga.tick(&mut ca, &dkey).await?;
             }
         }
         if !ok { bail!("SETUP FAILED on A: write {id} ({} rows) never published — nothing below would mean anything", chunk.len()); }
@@ -227,22 +229,24 @@ async fn main() -> Result<()> {
     // ---- TEST 1: the wide cold read ----
     println!("\nTEST 1  tab 1 asks Range w/ (300 rows, cold, wider than one return's 4 GETs), paging 256 at a time.");
     let mut t1 = connect(&node_b.url()).await?;   // a FRESH connection: nothing from the tests above is in its way
-    send(&mut t1, &dkey_b, &Request::Identity).await?; let idw = hear(&mut t1, started, Duration::from_secs(3)).await;
+    let mut g1 = Gate::default();
+    send(&mut t1, &dkey_b, &Request::Identity).await?; g1.sent(); let idw = hear(&mut t1, started, Duration::from_secs(3)).await; g1.heard(&idw);
     println!("    fresh connection: {:?}", idw.iter().filter(|(_, l)| l.starts_with("identity")).map(|(_, l)| l.clone()).next_back());
     let t0 = Instant::now(); let mut got = 0usize; let mut after: Option<Vec<u8>> = None; let mut all = Vec::new(); let mut req = 20u64;
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     loop {
         let mut r = range(req, "w/", 256); if let Request::Range { after: a, .. } = &mut r { *a = after.clone(); }
-        send(&mut t1, &dkey_b, &r).await?;
+        send(&mut t1, &dkey_b, &r).await?; g1.sent();
         let mut page: Option<(usize, bool)> = None; let end = Instant::now() + COLD_READ;
         while Instant::now() < end && page.is_none() {
             let h = hear(&mut t1, t0, Duration::from_millis(1000)).await;
+            g1.heard(&h);
             for (_, l) in &h { if l.starts_with(&format!("PAGE req {req}:")) { let n: usize = l.split(": ").nth(1).and_then(|x| x.split(' ').next()).and_then(|x| x.parse().ok()).unwrap_or(0); page = Some((n, l.ends_with("more: true"))); }
                                if l.starts_with(&format!("UNAVAILABLE req {req}")) { page = Some((0, false)); } }
             all.extend(h);
-            // One tick a SECOND, by the wall clock, whatever the node answered.
+            // A tick a second -- AT MOST ONE UNANSWERED (sdk#174), as a page sends them.
             if last_tick.elapsed() >= Duration::from_secs(1) {
-                send(&mut t1, &dkey_b, &Request::Tick { now: protocol::tick_of(now_ms()) }).await?;
+                g1.tick(&mut t1, &dkey_b).await?;
                 last_tick = Instant::now();
             }
         }
@@ -252,6 +256,8 @@ async fn main() -> Result<()> {
     }
     let (s1, gets1) = show("tab 1", &all);
     println!("    => {got} of 300 rows in {:.1} s; live GETs (node ops over its calls) {gets1}", t0.elapsed().as_secs_f32());
+    println!("    ticks (gated, sdk#174): setup on A sent {} withheld {} forgotten {}; TEST 1 sent {} withheld {} forgotten {}",
+        ga.sent_ticks, ga.t.refused, ga.t.forgotten, g1.sent_ticks, g1.t.refused, g1.t.forgotten);
 
     println!("\ndone in {:.1} s (budget {} s). Nodes are killed by their handles; temp tree removed.", started.elapsed().as_secs_f32(), BUDGET.as_secs());
     drop(node_b); drop(node_a);
@@ -277,6 +283,22 @@ async fn main() -> Result<()> {
     if s3a + s3b != 0 { red.push(format!("TEST 3 stranded {} effect(s)", s3a + s3b)); }
     if red.is_empty() { println!("VERDICT: GREEN -- cold reads come back whole, nothing stranded; compare live GETs {gets1} with the native twin"); Ok(()) }
     else { for r in &red { println!("RED: {r}"); } bail!("{} check(s) red", red.len()) }
+}
+
+/// A connection's ticks, gated as a page gates them (sdk#174): at most one
+/// unanswered, a frame answered by its per-call report (`call saw Client`).
+#[derive(Default)]
+struct Gate { f: craftworks_sdk::tick_gate::Frames, t: craftworks_sdk::tick_gate::OneAtATime, sent_ticks: u32 }
+impl Gate {
+    fn sent(&mut self) { self.f.sent(); }
+    fn heard(&mut self, h: &[(u128, String)]) { for (_, l) in h { if l.starts_with("call saw Client") { self.f.answered(); } } }
+    async fn tick(&mut self, c: &mut WebApi, k: &DelegateKey) -> Result<()> {
+        let now = now_ms();
+        if !self.t.may(now, &mut self.f) { return Ok(()); }
+        send(c, k, &Request::Tick { now: protocol::tick_of(now) }).await?;
+        self.f.sent(); self.t.went(now, &self.f); self.sent_ticks += 1;
+        Ok(())
+    }
 }
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }

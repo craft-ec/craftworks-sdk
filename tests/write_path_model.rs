@@ -419,6 +419,9 @@ impl Model {
                     self.note(i, write_id, "the node refused its frame");
                 }
             }
+            // The host error reaches the SENDER's connection: the page counts
+            // it as its frame's answer (sdk#196 review, 1b).
+            self.stores[i].client.frame_refused();
             return;
         }
         if self.parked {
@@ -444,7 +447,21 @@ impl Model {
     fn tick(&mut self, i: usize) {
         self.fell_at_node[i] = false; // the tick refills after its own rollbacks
         let now = self.clock.now_ms();
-        self.stores[i].send_tick(now);
+        // At most one unanswered tick per session (sdk#174): what the gate
+        // withheld, and what it gave up on, are situations the sweep must
+        // show it reaches.
+        let forgotten = self.stores[i].client.ticks.forgotten;
+        if !self.stores[i].send_tick(now) {
+            self.saw.insert("a tick withheld (one unanswered)");
+        }
+        if self.stores[i].client.ticks.forgotten > forgotten {
+            self.saw.insert("a tick forgotten after FORGET_MS");
+        }
+        // And the page asks after its oldest quiet write, as Session::tick
+        // does (sdk#174): the path the model must SEE.
+        if self.stores[i].ask_unheard(now).is_some() {
+            self.saw.insert("an AskWrite sent");
+        }
         let queued_before = self.queued[i].clone();
         let mut timed_out = Vec::new();
         self.ends_across(i, |m| {
@@ -507,7 +524,22 @@ impl Model {
             return;
         }
         let Some((i, f)) = self.inbound.pop_front() else { return };
+        // Every client frame the delegate RUNS is answered by its per-call
+        // report (entry.rs emits one per call, on the sender's connection) --
+        // what a page counts its frames against (sdk#174: at most one
+        // unanswered tick per session).
+        self.stores[i].on_inbound(&call_report());
         let protocol::Incoming::Ok(env) = protocol::decode_request(&f) else { return };
+        // ASKWRITE, answered as the engine answers it (sdk#174, the sdk#196
+        // review): a write the engine does not know -- never taken, or
+        // published and forgotten -- gets NO verdict; `Lost` is said only on
+        // positive evidence, which this node's rule never has. A write it
+        // holds (its commit in flight) is answered by the commit, not the ask.
+        // Nothing here parks, so an ask never continues a chain.
+        if let Request::AskWrite { .. } = env.body {
+            self.saw.insert("an AskWrite served");
+            return;
+        }
         let Request::Write { write_id, ops } = env.body else { return };
         match self.cfg.rule {
             Rule::Today => {
@@ -760,6 +792,14 @@ impl Model {
                     self.resend_on_silence(i);
                 }
             }
+            // A commit in flight moves on the node's own answers, not on a
+            // client's next frame: advance it whether or not anything is
+            // queued. (Only a queued frame used to move it, so a session
+            // that sent nothing held a commit in flight for as long as it
+            // stayed silent.)
+            while self.commit.is_some() {
+                self.advance_commit();
+            }
             while !self.inbound.is_empty() {
                 self.serve();
                 while self.commit.is_some() {
@@ -857,6 +897,10 @@ const COVERAGE: &[&str] = &[
     "a request refused past 101 (F51)",
     "a request refused while parked (F50)",
     "the node parked",
+    "a tick withheld (one unanswered)",
+    "a tick forgotten after FORGET_MS",
+    "an AskWrite sent",
+    "an AskWrite served",
     "a context lost with no commit",
     "a context lost with a commit taken, not landed",
     "a context lost AFTER a head PUT",
@@ -982,23 +1026,28 @@ fn show(seed: u64, cfg: Config) -> String {
 /// it is gone: `a_healthy_node_finds_nothing`).
 const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
     // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
-    ("FALSE ROLLBACK", "Busy, then applied after a later write", 13, "sdk#183"),
-    ("FALSE ROLLBACK", "its Published went to the other session", 871, "sdk#184"),
-    ("FALSE ROLLBACK", "its verdict was dropped", 827, "sdk#183"),
-    ("FALSE ROLLBACK", "left the client after it was rolled back", 706, "sdk#183"),
-    ("FALSE ROLLBACK", "rolled back behind another write of its keys", 894, "sdk#183"),
-    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 179, "sdk#183"),
-    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 437, "sdk#183"),
-    ("FALSE ROLLBACK", "timed out while its commit was in flight", 3, "sdk#183"),
-    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 4, "sdk#183"),
-    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 20, "sdk#183"),
+    // Re-pinned ONCE for sdk#174's client (the tick gate, the AskWrite sender,
+    // a refusal answering its frame): its timing moves these exact counts. No
+    // class new, none gone; argued SEED BY SEED in that commit -- over 5,000
+    // seeds every pair's flips are balanced (smallest paired sign-test p 0.07,
+    // of 15 pairs). `diagnostic_per_seed_findings` makes the table again.
+    ("FALSE ROLLBACK", "Busy, then applied after a later write", 11, "sdk#183"),
+    ("FALSE ROLLBACK", "its Published went to the other session", 874, "sdk#184"),
+    ("FALSE ROLLBACK", "its verdict was dropped", 844, "sdk#183"),
+    ("FALSE ROLLBACK", "left the client after it was rolled back", 712, "sdk#183"),
+    ("FALSE ROLLBACK", "rolled back behind another write of its keys", 892, "sdk#183"),
+    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 181, "sdk#183"),
+    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 411, "sdk#183"),
+    ("FALSE ROLLBACK", "timed out while its commit was in flight", 1, "sdk#183"),
+    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 8, "sdk#183"),
+    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 23, "sdk#183"),
     // Under faults: a Published (or Failed) arriving after the copy rolled the
     // write back — the false rollbacks above, seen from the other side.
     ("LATE VERDICT", "", 1000, "sdk#183"),
-    ("STALE CLOCK", "Busy", 292, "sdk#183"),
-    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 246, "sdk#183"),
-    ("W5 NOT REFILLED AFTER A FALL", "", 297, "sdk#183"),
-    ("W6 COPY LIES", "", 495, "sdk#183"),
+    ("STALE CLOCK", "Busy", 287, "sdk#183"),
+    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 265, "sdk#183"),
+    ("W5 NOT REFILLED AFTER A FALL", "", 302, "sdk#183"),
+    ("W6 COPY LIES", "", 501, "sdk#183"),
 ];
 
 #[test]
@@ -1058,7 +1107,8 @@ fn tripwire(seed: u64, cfg: Config, class: &str, tag: &str, issue: &str) {
 /// write of the same session had landed — the older value lands last.
 #[test]
 fn known_red_busy_reorder_k_old_after_k_new() {
-    tripwire(5, TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
+    // Seed 9 since sdk#174 (was 5): the first seed that still finds it.
+    tripwire(9, TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
 }
 
 /// A Busy'd write, queued at the client with its original clock, never
@@ -1093,19 +1143,22 @@ fn known_red_dropped_verdict_is_a_false_rollback() {
 /// back, and the node applies it.
 #[test]
 fn known_red_a_rolled_back_write_still_leaves_and_lands() {
-    tripwire(0, TODAY, "FALSE ROLLBACK", "left the client after it was rolled back", "sdk#183");
+    // Seed 1 since sdk#174 (was 0): the first seed that still finds it.
+    tripwire(1, TODAY, "FALSE ROLLBACK", "left the client after it was rolled back", "sdk#183");
 }
 
 /// The window refilled before the fall it should follow (`on_write_state`).
 #[test]
 fn known_red_the_window_is_not_refilled_after_a_fall() {
-    tripwire(0, TODAY, "W5 NOT REFILLED AFTER A FALL", "", "sdk#183");
+    // Seed 1 since sdk#174 (was 0): the first seed that still finds it.
+    tripwire(1, TODAY, "W5 NOT REFILLED AFTER A FALL", "", "sdk#183");
 }
 
 /// W6 at rest: the copy shows a value the node does not have.
 #[test]
 fn known_red_the_copy_lies_at_rest() {
-    tripwire(1, TODAY, "W6 COPY LIES", "", "sdk#183");
+    // Seed 0 since sdk#174 (was 1): the first seed that still finds it.
+    tripwire(0, TODAY, "W6 COPY LIES", "", "sdk#183");
 }
 
 /// THE HARNESS'S OWN CHECK — not a finding about today's client, which
@@ -1569,4 +1622,43 @@ mod rev3 {
         assert_eq!(ack.session, A, "the Ack names the WRITE's session");
         assert_eq!(ack.answering, None, "B's frame was reported as A's");
     }
+}
+
+/// DIAGNOSTIC, not a gate: every seed's (class|cause) set, one line a seed,
+/// so two clients can be compared SEED BY SEED -- the re-pin's argument. The
+/// pins are exact counts of a chaotic system, so any client timing change
+/// moves most of them; a re-pin carries information only with the PAIRED
+/// table this dump makes (seeds that flip each way, per pair), never with a
+/// difference of totals (the architect's sdk#196 review).
+///
+/// `SEEDS=5000 cargo test --test write_path_model diagnostic_per_seed_findings -- --ignored --nocapture > arm.txt`
+/// on each tree, then compare the `SEED` lines.
+#[test]
+#[ignore = "diagnostic: a per-seed dump for a paired comparison of two clients"]
+fn diagnostic_per_seed_findings() {
+    let n: u64 = std::env::var("SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5_000);
+    for seed in 0..n {
+        let (f, _, _) = run(seed, TODAY);
+        let mut pairs: Vec<String> = f.iter().map(|x| format!("{}|{}", x.class, x.tag)).collect();
+        pairs.sort();
+        pairs.dedup();
+        println!("SEED\t{seed}\t{}", pairs.join("\t"));
+    }
+}
+
+/// The per-call report a delegate emits for every client frame it runs.
+fn call_report() -> Vec<u8> {
+    protocol::encode_reply(&Reply::Call {
+        saw: protocol::Saw::Client,
+        effects: 0,
+        ops: 0,
+        awaiting: 0,
+        read_back: 0,
+        stranded: 0,
+        dropped: 0,
+        head_put: 0,
+        head_update: 0,
+        note: String::new(),
+    })
+    .expect("a per-call report encodes")
 }

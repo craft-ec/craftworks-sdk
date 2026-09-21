@@ -42,6 +42,17 @@ use protocol::Request;
 /// a wider window does not change it; only fewer commits per row would.
 pub const WRITES_IN_FLIGHT: usize = 16;
 
+/// How long a write the engine has taken may go unheard before this client
+/// asks after it (craftworks-sdk#174).
+///
+/// A write that needs more blocks than one request may fetch is PARKED by the
+/// engine and says nothing: its next round runs when its client asks after it
+/// (`AskWrite`), and one nobody asks after is released `Failed` after three
+/// re-ask periods of silence. A second is well inside that, and at most one
+/// ask is outstanding at a time, so this costs one queue slot at the node at
+/// most.
+pub const ASK_AFTER_MS: u64 = 1_000;
+
 /// Reads from the copy; writes to the pump and, optimistically, to the copy.
 pub struct CachedStore {
     pub copy: Copy,
@@ -68,6 +79,13 @@ pub struct CachedStore {
     /// The clock, handed in for the same reason the traces' is: this crate
     /// compiles to wasm and to a host binary and must not reach for one.
     now_ms: Box<dyn Fn() -> u64>,
+    /// Writes the engine has TAKEN and not finished, by when this client last
+    /// heard of them (sent, a non-terminal verdict, or asked after) — what
+    /// [`CachedStore::ask_unheard`] reads. Its own map rather than a flag on
+    /// the copy's entries (sdk#174): in on send, out on any terminal verdict,
+    /// on `Busy` (back in the outbox, not at the engine), and when the copy
+    /// no longer holds the write.
+    unheard: std::collections::BTreeMap<u64, u64>,
 }
 
 impl CachedStore {
@@ -82,6 +100,7 @@ impl CachedStore {
             held: std::collections::VecDeque::new(),
             in_flight_high_water: 0,
             now_ms,
+            unheard: std::collections::BTreeMap::new(),
         }
     }
 
@@ -99,7 +118,9 @@ impl CachedStore {
     /// The ONE place a write reaches the wire: it takes a window slot and its
     /// timeout starts now ([`Copy::sent`]).
     fn send_write(&mut self, write_id: u64, request: &Request) {
-        self.copy.sent(write_id, (self.now_ms)());
+        let now = (self.now_ms)();
+        self.copy.sent(write_id, now);
+        self.unheard.insert(write_id, now);
         self.client.send(request);
         self.in_flight_high_water = self.in_flight_high_water.max(self.copy.at_node_count());
     }
@@ -187,10 +208,12 @@ impl CachedStore {
     ///
     /// `now_ms` is the wall clock; [`protocol::tick_of`] is what quantises
     /// it, in one place, so two callers cannot pick two units.
-    pub fn send_tick(&mut self, now_ms: u64) {
-        self.client.send(&Request::Tick {
-            now: protocol::tick_of(now_ms),
-        });
+    ///
+    /// AT MOST ONE UNANSWERED TICK PER SESSION (sdk#174): `false` when one of
+    /// ours is still waiting at the node. That is benign — see
+    /// [`crate::tick_gate`].
+    pub fn send_tick(&mut self, now_ms: u64) -> bool {
+        self.client.send_tick(now_ms)
     }
 
     /// The page is going away: ship what is waiting.
@@ -233,6 +256,7 @@ impl CachedStore {
         // ANY verdict answers the request: it is no longer waiting at the
         // node, so the window has room for the next (sdk#176).
         self.copy.answered(write_id);
+        self.heard(write_id, state);
         self.fill_window();
         // A verdict for a write this client never issued. The node chose the
         // id, so believing it would let one message clear or fail somebody
@@ -297,6 +321,56 @@ impl CachedStore {
                 debug_assert!(false, "the order rule is v5-only: a v4 client must never be told this");
             }
         }
+    }
+
+    /// A verdict for `write_id` arrived: it is heard of now, or out of the
+    /// engine's hands.
+    fn heard(&mut self, write_id: u64, state: protocol::WriteState) {
+        use protocol::WriteState as W;
+        match state {
+            // Duplicate (v5): already taken, its end still to come -- heard.
+            W::Accepted | W::Stalled | W::Duplicate => {
+                if let Some(at) = self.unheard.get_mut(&write_id) {
+                    *at = (self.now_ms)();
+                }
+            }
+            // OutOfOrder (v5): nothing applied, back in the outbox like Busy.
+            W::Busy
+            | W::OutOfOrder { .. }
+            | W::Published
+            | W::ParityComplete
+            | W::Failed
+            | W::Lost
+            | W::TooLarge { .. } => {
+                self.unheard.remove(&write_id);
+            }
+        }
+    }
+
+    /// ASK AFTER THE OLDEST WRITE THE ENGINE HAS GONE QUIET ON (sdk#174).
+    ///
+    /// The continuation of a parked write: one `AskWrite` for the oldest
+    /// write taken and unheard for [`ASK_AFTER_MS`], and only when no ask of
+    /// this session's is unanswered. The oldest because the engine takes one
+    /// commit at a time and parks at most one write — the oldest it holds; a
+    /// write behind it is waiting on it, not on an ask. Returns the write id
+    /// asked after.
+    ///
+    /// Never a write the engine has not taken: one still held by the window
+    /// or queued after `Busy` is unknown to it, and it would answer `Lost`.
+    pub fn ask_unheard(&mut self, now_ms: u64) -> Option<u64> {
+        let pending = self.copy.pending_ids();
+        self.unheard
+            .retain(|id, _| pending.binary_search(id).is_ok());
+        let (&write_id, &at) = self.unheard.iter().next()?;
+        if now_ms.saturating_sub(at) < ASK_AFTER_MS {
+            return None;
+        }
+        if !self.client.send_ask(now_ms, write_id) {
+            return None;
+        }
+        self.unheard.insert(write_id, now_ms);
+        Some(write_id)
     }
 
     /// Verdicts for writes this client never issued.

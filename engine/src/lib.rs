@@ -507,6 +507,13 @@ pub struct Params {
     /// so a read that needed more than that in one round never came back
     /// (sdk#150; live on two private nodes: 0 of 60 rows, 0 of 300).
     pub max_fetch_per_round: usize,
+    /// The most GETs ONE client request may cause (sdk#174): a scan answers
+    /// a short page and a cursor at it, a parked write waits for the client's
+    /// AskWrite to continue. The node runs a request as one delegate chain
+    /// under exclusion and truncates it, invisibly, past 100 iterations
+    /// (~400 GETs); this keeps a chain an order of magnitude under that and
+    /// releases the delegate between pages.
+    pub max_gets_per_request: u32,
     /// How many times a block is asked for before the read is answered
     /// `Unavailable`. Attempts are RE-ISSUED, not waited on (ARCHITECTURE §7).
     pub max_attempts: u32,
@@ -699,6 +706,7 @@ impl Default for Params {
             whole_tree_supersede_scan: false,
             transfer_superseded_waiters: true,
             max_fetch_per_round: 4,
+            max_gets_per_request: 64,
             max_attempts: 3,
             max_read_rounds: 64,
             share_fetches: true,
@@ -714,7 +722,7 @@ impl Default for Params {
             max_accept_age: 64,
             bound_accept_age: true,
             context_carries_pending: true,
-            max_apply_rounds: 32,
+            max_apply_rounds: 256,
             max_parked_write_bytes: 128 * 1024,
             max_parked_reads: 1000,
             max_commit_blocks: 128,
@@ -793,6 +801,26 @@ struct ParkedWrite {
     needs: BTreeSet<Cid>,
     /// Bytes of the ops, for the backlog bound.
     bytes: usize,
+    /// GETs this write's CURRENT chain has caused (sdk#174). At
+    /// `max_gets_per_request` it asks for nothing more until its client
+    /// asks after it (`AskWrite`), which starts a new chain.
+    #[serde(default)]
+    gets: u32,
+    /// Ticks RUN since this write last heard anything -- a block it asked
+    /// for, or its client asking after it. Counted in ticks that ran, never
+    /// as `now - stamp`: the engine's clock moves only when a tick runs, and
+    /// none runs while the delegate is parked on a chain, so a stamp is stale
+    /// by exactly the park and the first tick after it measured the PARK as
+    /// the write's silence (the architect's sdk#196 review, executed: a 64-GET
+    /// chain at ~0.75 s a GET is ~48 s -- the ordinary cold write). At
+    /// `3 * reask_after` it is released `Busy`: nothing of it is applied and
+    /// its client re-sends it.
+    #[serde(default)]
+    idle_ticks: u64,
+    /// The engine time of the last tick counted, so two tabs ticking the same
+    /// second count once.
+    #[serde(default)]
+    idle_at: u64,
 }
 
 /// A commit in flight: one apply, one head bump.
@@ -1488,20 +1516,54 @@ impl<B: Blocks> Engine<B> {
 
     /// A client asking after a write this engine has never heard of.
     fn on_ask(&mut self, client: ClientId, write_id: WriteId) -> Vec<Effect> {
-        let known = self.folded.iter().any(|(_, w)| *w == write_id)
-            || self
-                .pending
-                .as_ref()
-                .is_some_and(|c| c.writes.iter().any(|(_, w)| *w == write_id))
-            || self.parity_waiting.keys().any(|(_, w)| *w == write_id);
-        if known {
-            return Vec::new();
+        // A PARKED WRITE ITS CLIENT ASKS AFTER: the next chain (sdk#174). Its
+        // GETs start again from nothing and the apply runs again -- which
+        // asks for its next round, or applies. The TICK does not also try:
+        // one mechanism. (A parked write was not among the writes this engine
+        // "knew", so asking after one was answered `Lost`.)
+        if let Some(p) = self.parked_write.as_mut() {
+            if p.client == client && p.write_id == write_id {
+                p.gets = 0;
+                p.idle_ticks = 0;
+                if !p.needs.is_empty() {
+                    // ITS ROUND IS STILL OUT -- and cannot be: the node runs
+                    // no ask while this write's chain is live, so a block
+                    // still needed when its client asks is an answer that
+                    // chain LOST (sdk#173's event). Asked again HERE, in the
+                    // writer's own chain: returning nothing left the write
+                    // neither fetched nor released for as long as its client
+                    // kept asking, and let another tab's chain fetch the
+                    // block and carry the write's verdicts where the writer
+                    // never hears them (F49; the architect's sdk#196 v4-bridge
+                    // review, executed). Paced by the asks themselves: at most
+                    // one unanswered per session, a second apart.
+                    p.gets = p.needs.len() as u32;
+                    let attempt = p.rounds;
+                    return p
+                        .needs
+                        .iter()
+                        .map(|id| Effect::FetchBlock {
+                            id: *id,
+                            via: read::Via::Direct,
+                            attempt,
+                        })
+                        .collect();
+                }
+                let p = p.clone();
+                return self.apply_write(p.client, p.write_id, p.ops, p.bytes);
+            }
         }
-        vec![Effect::Notify {
-            client,
-            write_id,
-            state: State::Lost,
-        }]
+        // A WRITE THIS ENGINE DOES NOT KNOW IS NOT A LOST WRITE. It may be
+        // one it published and forgot, whose `Published` was dropped or went
+        // to another tab (F39, F49): `Lost` here rolled back a write that IS
+        // in the tree (the architect's sdk#196 review, executed). `Lost` is
+        // said only on positive evidence about THIS (client, write id) -- a
+        // commit released lost -- and not knowing is not evidence: no verdict.
+        // The client's own timeout decides what it does not hear about. (A
+        // ledger in the head value, WRITE-PATH rev 3, is what will let an
+        // engine answer "published" for a write it has forgotten.)
+        let _ = client;
+        Vec::new()
     }
 
     /// Take a root as the published one, and tell whoever was watching.
@@ -1630,6 +1692,7 @@ impl<B: Blocks> Engine<B> {
                 levels_done: 0,
                 rounds: 0,
                 held: BTreeSet::from([root]),
+                gets: 0,
             },
         );
         let out = self.drive(req_id);
@@ -1741,6 +1804,28 @@ impl<B: Blocks> Engine<B> {
                         result,
                     }];
                 }
+                // THIS REQUEST'S GETS ARE SPENT (sdk#174): answer what has been
+                // reached, with a cursor, and let the next page be a new
+                // request -- the node's exclusion is released between them.
+                // A read that has reached nothing yet has no key to put a
+                // cursor after; it continues, bounded by the tree's depth.
+                let used = self.reads.parked.get(&req_id).map_or(0, |q| q.gets);
+                let room = self.params.max_gets_per_request.saturating_sub(used) as usize;
+                if room == 0 {
+                    let short = {
+                        let source = self.source();
+                        read::short_page(&source, &p.want, &p.root)
+                    };
+                    if let Some(result) = short {
+                        self.reads.parked.remove(&req_id);
+                        self.forget_waiting(req_id);
+                        return vec![Effect::Reply {
+                            client: p.client,
+                            req_id,
+                            result,
+                        }];
+                    }
+                }
                 let levels_done = self.reads.parked.get(&req_id).map_or(0, |q| q.levels_done);
                 out.push(Effect::Progress {
                     client: p.client,
@@ -1763,7 +1848,13 @@ impl<B: Blocks> Engine<B> {
                 if !self.params.refetch_held {
                     ids.retain(|id| self.blocks.get(id).is_none());
                 }
-                let cap = self.params.max_fetch_per_round;
+                // A round asks for no more than one return carries, and no more
+                // than the request has left -- so the cap is met exactly.
+                let cap = if room == 0 {
+                    self.params.max_fetch_per_round
+                } else {
+                    self.params.max_fetch_per_round.min(room)
+                };
                 if self.params.fetch_ahead {
                     // Everything the readable branches name, whether or not
                     // this descent needs it.
@@ -1812,6 +1903,9 @@ impl<B: Blocks> Engine<B> {
                             .copied()
                             .map_or(read::Via::Direct, read::Via::Pack);
                         self.reads.fetches += 1;
+                        if let Some(q) = self.reads.parked.get_mut(&req_id) {
+                            q.gets += 1;
+                        }
                         out.push(Effect::FetchBlock { id, via, attempt });
                     }
                 }
@@ -2061,7 +2155,23 @@ impl<B: Blocks> Engine<B> {
         // cap would have let exactly the state through that it exists to
         // refuse. Serializing here is the park path, which is rare.
         let parked_cost = bincode::serialized_size(&ops).unwrap_or(u64::MAX) as usize;
-        let needs: BTreeSet<Cid> = need.iter().copied().collect();
+        // ONE ROUND AT A TIME, AND NO MORE THAN THE CHAIN HAS LEFT (sdk#174).
+        // Asking for a whole path at once stranded past a return's GETs
+        // (matrix W3); a chain past the node's iteration cap is truncated
+        // without a word. So a round asks for what one return carries, and a
+        // chain whose GETs are spent asks for nothing until the client asks
+        // after its write -- `on_ask` -- which is a new chain.
+        let gets = self
+            .parked_write
+            .as_ref()
+            .filter(|p| p.write_id == write_id)
+            .map_or(0, |p| p.gets);
+        let room = self.params.max_gets_per_request.saturating_sub(gets) as usize;
+        let needs: BTreeSet<Cid> = need
+            .iter()
+            .copied()
+            .take(self.params.max_fetch_per_round.min(room))
+            .collect();
         if parked_cost > self.params.max_parked_write_bytes {
             self.parked_write = None;
             // DECLINE TO PARK, BUT STILL FETCH. Answering `Busy` without the
@@ -2100,8 +2210,11 @@ impl<B: Blocks> Engine<B> {
             ops,
             root: self.root,
             rounds,
+            gets: gets + needs.len() as u32,
             needs,
             bytes: size,
+            idle_ticks: 0,
+            idle_at: self.now,
         });
         out
     }
@@ -2119,6 +2232,7 @@ impl<B: Blocks> Engine<B> {
         if !p.needs.remove(&id) {
             return Vec::new();
         }
+        p.idle_ticks = 0;
         if !p.needs.is_empty() {
             // Still waiting on the rest of this round's blocks. Running now
             // would spend a round to stop at the very next one.
@@ -2927,6 +3041,9 @@ impl<B: Blocks> Engine<B> {
             if let Some(c) = self.pending.as_mut() {
                 c.settle_at = now;
             }
+            if let Some(p) = self.parked_write.as_mut() {
+                p.idle_at = now;
+            }
             for o in self.owed.values_mut() {
                 o.since = now;
                 o.last_changed = o.last_changed.min(now);
@@ -2934,6 +3051,7 @@ impl<B: Blocks> Engine<B> {
         }
         self.now = now;
         let mut out = self.age_out_accepted(now);
+        out.extend(self.release_silent_parked_write(now));
         out.extend(self.settle_by_fact(now));
         if !self.params.coalesce_parity {
             return out;
@@ -2945,6 +3063,39 @@ impl<B: Blocks> Engine<B> {
             o.last_changed < now || now.saturating_sub(o.since) >= age
         }));
         out
+    }
+
+    /// A parked write that has heard NOTHING -- no block it asked for, no
+    /// client asking after it -- for `3 * reask_after` TICKS RUN is released
+    /// `Busy`: nothing of it is in the tree, and `Busy` is the verdict a
+    /// client re-sends (`Failed` is rolled back and shown to the person).
+    /// Waiting for a continuation that never comes would otherwise keep the
+    /// engine `Busy` to every writer for good (sdk#174; the audit's E7 in
+    /// general, PR 6).
+    ///
+    /// A tick that RAN is the only honest unit: the node runs one request at
+    /// a time, so a tick running means no chain of this write is being
+    /// served at that moment. A tick carrying the same time as the last one
+    /// counted (another tab, the same second) is not another second.
+    fn release_silent_parked_write(&mut self, now: u64) -> Vec<Effect> {
+        let limit = 3 * self.params.reask_after;
+        let Some(p) = self.parked_write.as_mut() else {
+            return Vec::new();
+        };
+        if now <= p.idle_at {
+            return Vec::new();
+        }
+        p.idle_at = now;
+        p.idle_ticks += 1;
+        if p.idle_ticks < limit {
+            return Vec::new();
+        }
+        let p = self.parked_write.take().expect("checked");
+        vec![Effect::Notify {
+            client: p.client,
+            write_id: p.write_id,
+            state: State::Busy,
+        }]
     }
 
     /// Say so when a write has sat merely accepted too long.
@@ -3596,6 +3747,9 @@ const CLOCK_RESET_TICKS: u64 = 600;
 
 /// The version this build writes. Bumped when the shape changes.
 ///
+/// 10: a parked read counts its request's GETs, and a parked write its
+/// chain's and when it last heard anything (sdk#174).
+///
 /// 9: a commit says whether its parity was left uncoded at the owed cap
 /// (sdk#162).
 ///
@@ -3624,7 +3778,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 9;
+const CONTEXT_VERSION: u16 = 11;
 
 /// What a context this build wrote begins with.
 ///

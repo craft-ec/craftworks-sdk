@@ -188,3 +188,35 @@ fn the_decision_is_delegated_to_the_sdk() {
          of it."
     );
 }
+
+/// sdk#174: THE PAGE'S TICK ASKS AFTER A PARKED WRITE. A cold write the engine
+/// parks continues only when its client asks after it; nothing else asks. A
+/// `tick` that stopped calling `ask_unheard` leaves every such write parked
+/// until the engine releases it -- with every native test green, because they
+/// drive the store directly.
+#[test]
+fn the_tick_asks_after_quiet_writes() {
+    let body = body_of("tick");
+    assert!(
+        body.contains("ask_unheard("),
+        "`Session::tick` no longer asks after the writes the engine went quiet on (sdk#174)"
+    );
+}
+
+/// sdk#196 review, 1b: A REFUSED FRAME IS ANSWERED BY ITS REFUSAL. The
+/// node's host error is the only word a refused frame ever gets; if the
+/// session does not hand it to the client's frame count, two refusals shut
+/// the tick and ask gates for FORGET_MS.
+#[test]
+fn a_refusal_answers_its_frame() {
+    let body = body_of("on_inbound");
+    let at = body
+        .find("Incoming::Refused(")
+        .expect("no `Incoming::Refused` arm in `on_inbound` -- this gate is reading nothing");
+    let arm = &body[at..];
+    let arm = &arm[..arm.find("\n            Incoming::").unwrap_or(arm.len())];
+    assert!(
+        arm.contains("frame_refused()"),
+        "the `Incoming::Refused` arm does not count the refusal as its frame's answer: {arm}"
+    );
+}

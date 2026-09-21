@@ -319,7 +319,11 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
             );
         }
 
-        // (d) an accepted-only write is answered Lost, never silence.
+        // (d) an accepted-only write the restarted engine has no record of is
+        // answered with NO verdict (sdk#196 review): not knowing is not
+        // evidence -- the same answer is given for a write that published and
+        // whose Published was lost, where `Lost` would roll back a write that
+        // is in the tree. The client's own timeout decides.
         for wid in &accepted_only {
             let out = stepped!(
                 e,
@@ -329,15 +333,9 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                 }
             );
             assert!(
-                out.iter().any(|f| matches!(
-                    f,
-                    Effect::Notify {
-                        state: State::Lost,
-                        ..
-                    }
-                )),
-                "{cut:?}: write {wid:?} was accepted and never published, and the \
-                 restarted engine did not report it Lost"
+                !out.iter().any(|f| matches!(f, Effect::Notify { .. })),
+                "{cut:?}: write {wid:?} is unknown to the restarted engine, and \
+                 it was given a verdict anyway: {out:?}"
             );
             checked_lost += 1;
         }
@@ -975,9 +973,10 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
 ///
 /// So the answer cannot come from the engine's memory — it has none — and it
 /// must not be a guess. It comes from re-reading the HEAD, which is the one
-/// durable record, and from `AskWrite`, which says `Lost` for a write the
-/// engine does not know: honest, and the only word that leaves the client
-/// holding a write it can safely re-submit.
+/// durable record. `AskWrite` about a write the engine does not know gets NO
+/// verdict (sdk#196 review): "unknown" is also what an engine says about a
+/// write it published and forgot, so `Lost` there would be a guess. The
+/// client's timeout is what hands the write back for re-submitting.
 ///
 /// Both halves are asserted, because they differ in what a re-submit does:
 ///   (a) the head LANDED — re-submitting is a no-op against the same tree;
@@ -1038,8 +1037,8 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
              Register actually holds"
         );
 
-        // The client asks. It gets an answer, and the answer is Lost: the
-        // engine has no record, and saying anything else would be a guess.
+        // The client asks. The engine has no record, so it says NOTHING:
+        // `Lost` would be a guess (sdk#196 review).
         let out = stepped!(
             e,
             Event::AskWrite {
@@ -1054,15 +1053,14 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![State::Lost],
+            Vec::<State>::new(),
             "landed={landed}: a client asking about a write the engine has no \
-             record of was not told Lost, so it cannot know whether to \
-             re-submit"
+             record of was given a verdict; not knowing is not evidence"
         );
 
         // And re-submitting is safe in both worlds. The write is the same
         // ops, so the tree it produces is the intended one either way — that
-        // is what makes `Lost` a word a client can act on.
+        // is what makes re-submitting after a timeout safe.
         warm_from(&mut e, &net);
         let _ = stepped!(
             e,
