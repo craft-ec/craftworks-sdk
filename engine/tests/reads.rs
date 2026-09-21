@@ -836,9 +836,20 @@ fn no_read_sequence_panics_and_every_read_answers() {
             Params {
                 max_attempts: 2,
                 max_context_bytes: 32 * 1024,
-                // A context this small declares an asks table to match: the
-                // default's 132 x 48 B is over its 1/16 share (sdk#150 PR 3).
+                // A context this small declares every cap to match: the
+                // defaults' worst case is ~247 KiB (sdk#162), and the asks
+                // table's 132 x 48 B is over its 1/16 share (sdk#150 PR 3).
+                // Scaled, the fixed worst case is ~21 KiB, leaving the parked
+                // reads -- what this test parks -- the rest.
                 max_asks: 32,
+                max_parked_write_bytes: 4 * 1024,
+                max_commit_blocks: 16,
+                max_carried_ops_bytes: 2 * 1024,
+                max_subscriptions: 4,
+                max_owed_groups: 16,
+                max_parity_waiting_refs: 16,
+                shell_context_reserve: 2 * 1024,
+                min_parked_read_bytes: 4 * 1024,
                 ..Params::default()
             },
         );

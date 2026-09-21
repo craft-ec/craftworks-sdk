@@ -107,6 +107,11 @@ pub struct Outbound {
     /// What was stranded and why, when `stranded` is non-zero (sdk#150).
     /// Structure only -- see `Scheduler::stranded_report`.
     pub stranded_detail: String,
+    /// What the engine shed this call to keep its context saveable, and the
+    /// parity it left uncoded at the owed cap (sdk#162). Counted so a
+    /// refusal is never read as silence, and parity left to the scrub never
+    /// as "coming".
+    pub shed: engine::Shed,
     /// Counted, never a panic. Reported to the client so a format mismatch
     /// is visible rather than a silence it waits on for ever.
     pub dropped: Vec<Dropped>,
@@ -685,6 +690,7 @@ impl<B: Blocks> Shell<B> {
             out.replies.push(reply_bytes(&r));
         }
         out.client_version = self.client_version;
+        out.shed = self.engine.take_shed();
         out.stranded = sched.ready_len() + sched.held_len();
         if out.stranded > 0 {
             out.stranded_detail = sched.stranded_report();

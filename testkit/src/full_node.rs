@@ -131,6 +131,9 @@ impl FullNode {
             // so with `answers_together`.
             one_answer_per_call: true,
             pair_by_contract: false,
+            unsaved: 0,
+            max_context: 0,
+            shed: engine::Shed::default(),
             lose_put_acks: false,
             drop_puts: false,
             hold: false,
@@ -180,6 +183,12 @@ struct ConnState {
     /// does, and let the shell match them back (sdk#150). A hit needs no
     /// matching: the block id is computed from the state that came back.
     pair_by_contract: bool,
+    /// Calls whose context could not be saved (the node kept the previous).
+    unsaved: usize,
+    /// The largest context saved.
+    max_context: usize,
+    /// What the engine shed across all calls (sdk#162).
+    shed: engine::Shed,
     /// SILENCE on the write path (sdk#150 E2). The put LANDS and its ack is
     /// never sent...
     lose_put_acks: bool,
@@ -216,6 +225,21 @@ impl Conn {
     /// Returns every reply the shell produced along the way.
     pub fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
         self.step_bounded(inbound, 0)
+    }
+
+    /// Calls whose context could not be saved: must stay 0 (sdk#162).
+    pub fn unsaved(&self) -> usize {
+        self.0.borrow().unsaved
+    }
+
+    /// The largest context any call saved.
+    pub fn max_context(&self) -> usize {
+        self.0.borrow().max_context
+    }
+
+    /// What the engine shed, summed over every call.
+    pub fn shed(&self) -> engine::Shed {
+        self.0.borrow().shed
     }
 
     /// Block PUTs land and are never acknowledged (see the field).
@@ -265,6 +289,14 @@ impl Conn {
     /// the node answer is queued again (the connection is still holding).
     pub fn release_one(&mut self) -> Vec<Vec<u8>> {
         let next = self.0.borrow_mut().held.pop_front();
+        // A cold node keeps what it fetched when the fetch completes -- which,
+        // held, is now.
+        if let Some(Inbound::GotState { id, bytes: Some(b) }) = &next {
+            let s = self.0.borrow();
+            if s.node.network.is_some() && !s.node.evicting {
+                s.node.store.put(*id, b);
+            }
+        }
         match next {
             Some(a) => self.step_bounded(vec![a], 0),
             None => Vec::new(),
@@ -337,7 +369,20 @@ impl Conn {
 
         {
             let mut s = self.0.borrow_mut();
-            s.ctx = shell.to_context().expect("a context after every call");
+            // A context that cannot be saved leaves the node holding the
+            // previous one -- modelled, not panicked on (sdk#162) -- and
+            // counted, so a cell can assert it never happened.
+            match shell.to_context() {
+                Some(c) => {
+                    s.max_context = s.max_context.max(c.len());
+                    s.ctx = c;
+                }
+                None => s.unsaved += 1,
+            }
+            s.shed.reads += out.shed.reads;
+            s.shed.writes += out.shed.writes;
+            s.shed.waits += out.shed.waits;
+            s.shed.uncoded += out.shed.uncoded;
             s.max_stranded = s.max_stranded.max(out.stranded);
             if out.stranded > 0 {
                 let call = s.calls;
@@ -425,7 +470,12 @@ impl Conn {
                             // what it fetched unless it is evicting.
                             Some(net) => {
                                 let b = net.get(&id).map(|b| b.to_vec());
-                                if let (Some(b), false) = (&b, n.evicting) {
+                                // HOLDING its answers, the node has not got
+                                // the block yet either: it keeps it when the
+                                // answer is released (`release_one`), not
+                                // when the GET is served -- or every later
+                                // read would find it warm (sdk#162's W9).
+                                if let (Some(b), false, false) = (&b, n.evicting, s.hold) {
                                     n.store.put(id, b);
                                 }
                                 b

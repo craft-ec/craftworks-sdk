@@ -190,6 +190,8 @@ pub struct Harness {
     ctx: Vec<u8>,
     /// Contexts written, and the largest seen — the budget's own evidence.
     pub max_context: usize,
+    /// What the engine shed, summed over every step (sdk#162).
+    pub shed: engine::Shed,
 }
 
 impl Harness {
@@ -203,16 +205,24 @@ impl Harness {
             live: (mode == Mode::Live).then_some(e),
             ctx,
             max_context: 0,
+            shed: engine::Shed::default(),
         }
     }
 
     pub fn step(&mut self, ev: Event) -> Vec<Effect> {
         let out = match self.mode {
-            Mode::Live => self.live.as_mut().expect("a live engine").step(ev),
+            Mode::Live => {
+                let e = self.live.as_mut().expect("a live engine");
+                let out = e.step(ev);
+                let s = e.take_shed();
+                add(&mut self.shed, s);
+                out
+            }
             Mode::Rehydrate => {
                 let mut e = Engine::from_context(&self.ctx, self.params, self.store.clone())
                     .expect("the engine's own context must read back");
                 let out = e.step(ev);
+                add(&mut self.shed, e.take_shed());
                 self.ctx = e.to_context().expect("a context after every step");
                 self.max_context = self.max_context.max(self.ctx.len());
                 out
@@ -289,6 +299,8 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
     let mut w = Engine::new(
         Params {
             max_commit_blocks: usize::MAX,
+            // Never saves a context: an in-process writer has no bound to keep.
+            max_context_bytes: usize::MAX,
             ..Params::default()
         },
         ws.clone(),
@@ -366,4 +378,11 @@ pub fn rebuild(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> Cid {
         t.push_bytes(k, v).unwrap();
     }
     t.finish().unwrap()
+}
+
+fn add(total: &mut engine::Shed, s: engine::Shed) {
+    total.reads += s.reads;
+    total.writes += s.writes;
+    total.waits += s.waits;
+    total.uncoded += s.uncoded;
 }

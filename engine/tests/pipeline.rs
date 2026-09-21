@@ -910,6 +910,8 @@ fn a_single_key_write_parses_nodes_in_proportion_to_depth() {
             // a tree one commit deep, which is the opposite of what it is
             // for. The single-key write it then measures IS under the cap.
             max_commit_blocks: usize::MAX,
+            // And it never saves a context, so it has no bound to keep.
+            max_context_bytes: usize::MAX,
             ..Params::default()
         });
         let mut seen = Seen::default();

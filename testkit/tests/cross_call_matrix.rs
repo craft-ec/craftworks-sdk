@@ -254,6 +254,20 @@ fn every_call(c: &mut Conn) -> Option<String> {
             which.join(" / ")
         ));
     }
+    // A0.4: every call's context SAVED, and within its bound (sdk#162).
+    if c.unsaved() > 0 {
+        return Some(format!(
+            "{} call(s) ended with a context that could not be saved",
+            c.unsaved()
+        ));
+    }
+    let bound = engine::Params::default().max_context_bytes;
+    if c.max_context() > bound {
+        return Some(format!(
+            "a context of {} B, over its {bound} B bound",
+            c.max_context()
+        ));
+    }
     let u = c.unanswered();
     if !u.is_empty() {
         return Some(format!("never answered: {u:?}"));
@@ -360,6 +374,71 @@ fn w6_over_64_blocks(mode: Mode) -> Cell {
     }
     if !st.contains(&WriteState::Published) {
         return Cell::Red(format!("never published ({puts} PUTs): told {st:?}"));
+    }
+    Cell::Green
+}
+
+/// W9: the context driven TO its bound (sdk#162). A slow node -- every
+/// answer held -- and cold range reads with long bounds parked until the
+/// context is full, then a write. The engine must shed work BY NAME (reads
+/// answered Unavailable) rather than fail to save; once the node answers,
+/// the write settles and the engine is open (A0.3). Every call saves (A0.4).
+fn w9_context_to_its_bound(mode: Mode) -> Cell {
+    let node = node_for(mode);
+    let mut c = connect(&node, mode);
+    c.client(&Request::Identity);
+    c.hold_answers();
+    let pad = |b: u8| vec![b; 900];
+    let mut replies = Vec::new();
+    for i in 0..400u64 {
+        // Long bounds that bracket the tree's keys (`t/000000`..): '/' sorts
+        // before the digits and ':' after them.
+        let mut lo = b"t/".to_vec();
+        lo.extend(pad(b'/'));
+        let mut hi = b"t/".to_vec();
+        hi.extend(pad(b':'));
+        replies.extend(c.client(&Request::Range {
+            req_id: 10_000 + i,
+            lo: Bound::Included(lo),
+            hi: Bound::Excluded(hi),
+            reverse: false,
+            after: None,
+            max_entries: 10,
+        }));
+    }
+    replies.extend(c.client(&Request::Write {
+        write_id: 1,
+        ops: vec![Op::Put(b"k/under-pressure".to_vec(), b"x".to_vec())],
+    }));
+    while c.held() > 0 {
+        replies.extend(c.release_one());
+    }
+    let refused = replies
+        .iter()
+        .filter_map(|b| protocol::decode_reply(b).ok())
+        .filter(|r| matches!(r, Reply::Unavailable { .. }))
+        .count();
+    let st = states_of(&replies, 1);
+    let shed = c.shed();
+    if let Some(why) = every_call(&mut c) {
+        return Cell::Red(format!(
+            "{why}; {refused} read(s) refused; write told {st:?}"
+        ));
+    }
+    if shed.reads == 0 {
+        return Cell::NotReached(format!(
+            "the context never reached its bound (max {} B): nothing was shed",
+            c.max_context()
+        ));
+    }
+    if refused < shed.reads {
+        return Cell::Red(format!(
+            "{} read(s) shed but only {refused} told Unavailable",
+            shed.reads
+        ));
+    }
+    if st.is_empty() {
+        return Cell::Red("the write that met a full context was told nothing".into());
     }
     Cell::Green
 }
@@ -806,7 +885,7 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
 
 #[test]
 fn every_workload_under_every_mode() {
-    let workloads: [Workload; 8] = [
+    let workloads: [Workload; 9] = [
         (
             "W1 multi-block commit publishes",
             w1_multi_block_commit,
@@ -897,6 +976,11 @@ fn every_workload_under_every_mode() {
                     ..APC
                 },
             ],
+        ),
+        (
+            "W9 the context driven to its bound",
+            w9_context_to_its_bound,
+            vec![Mode { cold: true, ..APC }],
         ),
         (
             "W7 a write that emits zero blocks",
