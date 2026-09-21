@@ -63,7 +63,7 @@ async function best(effort, fallback = null) {
  * second fetch rather than something else in the environment.
  */
 export async function artefactBytes(
-  { url, sha256 },
+  { url, urls, sha256 },
   {
     fetch: fetchWith = typeof fetch === "function" ? fetch : null,
     caches: cacheStorage = typeof caches === "object" ? caches : null,
@@ -73,7 +73,9 @@ export async function artefactBytes(
   if (!sha256) {
     // Without a hash nothing can be verified and nothing may be shared: a
     // cache keyed by a name nobody checks is worse than no cache at all.
-    throw new Error(`artefact ${url} has no sha256; refusing to cache it`);
+    throw new Error(
+      `artefact ${url ?? (urls ?? []).join(", ")} has no sha256; refusing to cache it`,
+    );
   }
   const key = `/artefact/${sha256}`;
   const box = cacheStorage ? await best(() => cacheStorage.open(CACHE_NAME)) : null;
@@ -90,13 +92,63 @@ export async function artefactBytes(
     }
   }
 
-  const res = await fetchWith(url);
-  if (!res.ok) throw new Error(`could not fetch ${url}: ${res.status}`);
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  if (!(await matches(bytes, sha256, subtle))) {
-    // Never installed, never cached. A wrong artefact is not a smaller one.
+  // MORE THAN ONE PLACE TO GET IT, because the hash is the identity.
+  //
+  // An app that named ONE source for its artefacts would be dead whenever
+  // that one source was unavailable — and if every app names the same one,
+  // every app is dead together. That is a coupling worth removing, and it is
+  // free: the bytes are verified against `sha256` either way, so a second
+  // source costs nothing in trust. It cannot serve anything different,
+  // because anything different does not hash to this.
+  //
+  // First one that VERIFIES wins, not first that answers: a source that
+  // returns 200 with the wrong bytes must not end the search. Every failure
+  // is kept, so a total failure can say what each source actually did rather
+  // than only naming the last.
+  // ONE OR THE OTHER, never both. Taking `urls` and ignoring `url` silently
+  // drops a source a caller believed it had supplied, and the symptom would
+  // be an artefact that resolves from the wrong place — or not at all, with
+  // no hint that half the request was discarded.
+  if (url && urls) {
     throw new Error(
-      `${url} does not hash to ${sha256}: refusing to install it or cache it`,
+      `artefact ${sha256} was given both \`url\` and \`urls\`; pass one. ` +
+        "Taking either silently would drop a source the caller supplied.",
+    );
+  }
+  const sources = urls ?? (url ? [url] : []);
+  if (sources.length === 0) {
+    throw new Error(`artefact ${sha256} has no url to fetch it from`);
+  }
+  let bytes = null;
+  const failures = [];
+  for (const from of sources) {
+    let res;
+    try {
+      res = await fetchWith(from);
+    } catch (e) {
+      failures.push(`${from}: ${e?.message ?? e}`);
+      continue;
+    }
+    if (!res.ok) {
+      failures.push(`${from}: ${res.status}`);
+      continue;
+    }
+    const got = new Uint8Array(await res.arrayBuffer());
+    if (!(await matches(got, sha256, subtle))) {
+      // Never installed, never cached. A wrong artefact is not a smaller one.
+      failures.push(`${from}: does not hash to ${sha256}`);
+      continue;
+    }
+    bytes = got;
+    break;
+  }
+  if (!bytes) {
+    // NAMES WHICH ARTEFACT AND WHAT EACH SOURCE DID. An app that will not
+    // open is the symptom a person reports, so the first thing they can send
+    // has to identify the block and say what was tried.
+    throw new Error(
+      `could not resolve artefact ${sha256} from any source:\n  ` +
+        failures.join("\n  "),
     );
   }
   // Storing is the OPTIONAL part: a full or refused cache costs the next app
