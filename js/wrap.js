@@ -1,5 +1,5 @@
 import { openSession, open as openWith, SHIPPED_ARTEFACTS } from "./session.js";
-import { engineDb } from "./engine-db.js";
+import { engineDb, sameRows } from "./engine-db.js";
 
 // Plain-object API over the wasm surface. `raw` is the wasm-bindgen module.
 //
@@ -142,48 +142,22 @@ export function wrap(raw) {
       this.#root = root;
       const was = this.#status.state;
       this.#status = { state: "ready", why: "", code: "" };
-      if (was !== "ready" && same(this.#rows, rows)) {
+      if (was !== "ready" && sameRows(this.#rows, rows)) {
         // Rows unchanged, STATE changed: the first load of an empty domain
         // moves `loading` to `ready`, and a component watching only the rows
         // would sit on "loading" for ever.
         for (const cb of this.#listeners) cb();
         return true;
       }
-      if (same(this.#rows, rows)) return false;
+      if (sameRows(this.#rows, rows)) return false;
       this.#rows = rows;
       for (const cb of this.#listeners) cb();
       return true;
     }
   }
 
-  // Are these the same rows? Compared by id, updated stamp and write STATE
-  // rather than deeply: a record's contents cannot change without its
-  // `updated` moving, and a deep compare of a long list on every reload is
-  // the cost this is trying to avoid. `state` is not content and moves on its
-  // own, which is exactly why it has to be here.
-  function same(a, b) {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      // `state` TOO, and it is not an optimisation detail.
-    //
-    // A write moves PENDING -> CLEAN when it reaches the network, and that
-    // changes neither `id` nor `updated` — `updated` is the record's own
-    // timestamp and a write state is not a content change. So a comparison
-    // of those two alone says "the same rows", the snapshot is not replaced,
-    // no listener fires, and the component never re-renders.
-    //
-    // MEASURED against a real node: a row sat on screen saying "saving" for
-    // 70 seconds while `db.scan()` returned it CLEAN the whole time. The data
-    // was safely published within a second; only the screen was wrong, which
-    // is the worst version of this — a person watching a spinner is told
-    // their data is unsaved when it is on the network, and closing the tab
-    // then feels like losing it.
-    if (a[i].id !== b[i].id || a[i].updated !== b[i].updated || a[i].state !== b[i].state) {
-      return false;
-    }
-    }
-    return true;
-  }
+  // "Are these the same rows?" is `sameRows`, in engine-db.js: ONE definition
+  // for both backends, comparing the whole row (craftworks-sdk#129).
   // `blockId` and nothing beside it: an app is given ids that ADDRESS
   // something. The raw module also exposes `contentHash` (plain BLAKE3, which
   // fetches nothing) for the frozen vectors; it is not part of this surface.
