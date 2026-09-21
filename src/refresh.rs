@@ -86,16 +86,33 @@ impl Refresh {
         })
     }
 
+    /// A delta arrived.
+    ///
+    /// **A delta with a `cursor` is a FIRST PAGE, not an answer** (sdk#140).
+    /// The engine pages at 256 changes; applying page 1 and recording
+    /// `new_root` as seen would leave everything after it stale under a root
+    /// that claims to be current — and the next question starts FROM that
+    /// root, where those changes are no longer changes, so nothing would ever
+    /// fetch them. So it is answered the way `binding.rs` answers the same
+    /// thing: too much changed to diff, reload the domain. Nothing of the
+    /// page is applied and `seen` does not advance.
+    ///
+    /// `cursor` is a parameter, not left in the reply, because dropping it in
+    /// a `..` is exactly how this happened.
     pub fn on_delta(
         &mut self,
         req_id: u64,
         changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        cursor: Option<Vec<u8>>,
         new_root: [u8; 32],
     ) -> Answer {
         let Some(domain) = self.in_flight.remove(&req_id) else {
             self.unasked += 1;
             return Answer::NotOurs;
         };
+        if cursor.is_some() {
+            return self.reload(domain);
+        }
         let moved = !changes.is_empty();
         self.seen.insert(domain.clone(), new_root);
         if moved {
@@ -114,6 +131,11 @@ impl Refresh {
             self.unasked += 1;
             return Answer::NotOurs;
         };
+        self.reload(domain)
+    }
+
+    /// The domain has to be read again in full.
+    fn reload(&mut self, domain: String) -> Answer {
         // The root this client thought it stood on is no longer a root the
         // engine can reconcile from, so it is forgotten rather than kept as
         // a starting point that will fail the same way next time.
