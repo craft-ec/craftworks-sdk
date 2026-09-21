@@ -1333,6 +1333,16 @@ impl Rev3Node {
         vec![self.verdict(c.session, c.write_id, WriteState::Failed, caller, frame)]
     }
 
+    /// The commit is LOST (a head conflict, settle rounds exhausted) before
+    /// its head lands: nothing applied, and — like Failed — the number is
+    /// RELEASED; only a publish consumes one.
+    fn lose(&mut self, caller: u64, frame: u64) -> Vec<Vec<u8>> {
+        let Some(c) = self.commit.take() else { return Vec::new() };
+        assert!(!c.landed, "a landed commit is not lost: its head holds it");
+        self.applied.retain(|a| *a != (c.session, c.write_id));
+        vec![self.verdict(c.session, c.write_id, WriteState::Lost, caller, frame)]
+    }
+
     /// The context is LOST: the commit in flight, what was taken, what frames
     /// were seen. The tree and its head's ledger stay.
     fn forget(&mut self) {
@@ -1459,6 +1469,31 @@ mod rev3 {
         assert_eq!(st, WriteState::Failed);
         assert_eq!(ack.published_through, 0, "a failed write was counted published");
         assert_eq!(one(n.call(&write(A, 2, 1, 1, "a"))).1, WriteState::Accepted, "no second attempt after Failed");
+    }
+
+    /// Lost releases its number too: nothing published, a true second attempt.
+    #[test]
+    fn a_lost_write_releases_its_number() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        let (ack, st) = one(n.lose(A, 1));
+        assert_eq!(st, WriteState::Lost);
+        assert_eq!(ack.published_through, 0, "a lost write was counted published");
+        assert_eq!(one(n.call(&write(A, 2, 1, 1, "a"))).1, WriteState::Accepted, "no second attempt after Lost");
+    }
+
+    /// The ledger moves WITH the head, not before: a context lost after the
+    /// take and BEFORE the head PUT published nothing, so the write sent again
+    /// is TAKEN — not answered Duplicate for a write that never landed.
+    #[test]
+    fn a_context_lost_before_the_head_lands_publishes_nothing() {
+        let mut n = Rev3Node::default();
+        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
+        n.forget(); // before any tick: the head PUT never went
+        let (ack, st) = one(n.call(&write(A, 2, 1, 1, "a")));
+        assert_eq!(st, WriteState::Accepted, "a write that never landed was told Duplicate");
+        assert_eq!(ack.published_through, 0);
+        assert!(!n.tree.contains_key(b"k".as_slice()), "the tree changed without a head PUT");
     }
 
     /// THE LEDGER SURVIVES A FORGET — run (a): the head PUT landed, the
