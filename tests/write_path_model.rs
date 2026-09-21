@@ -1220,7 +1220,10 @@ struct Rev3Node {
     commit: Option<Rev3Commit>,
     taken_through: BTreeMap<u64, u64>,
     frames_seen: BTreeMap<u64, u64>,
-    /// Every (session, write_id) TAKEN under the rule, for W3.
+    /// Every (session, write_id) APPLIED, for W3. APPLIED = TAKEN under the
+    /// rule AND NOT WITHDRAWN: a take whose commit died un-landed — Failed,
+    /// Lost, or a forget before its head PUT — is withdrawn, so the write
+    /// sent again and taken again is a correct recovery, not a double apply.
     applied: Vec<(u64, u64)>,
 }
 
@@ -1346,6 +1349,12 @@ impl Rev3Node {
     /// The context is LOST: the commit in flight, what was taken, what frames
     /// were seen. The tree and its head's ledger stay.
     fn forget(&mut self) {
+        // A take whose head never landed is WITHDRAWN: nothing of it is in the
+        // tree or the ledger. (A landed one stays applied: its head holds it.)
+        if let Some(c) = self.commit.as_ref().filter(|c| !c.landed) {
+            let taken = (c.session, c.write_id);
+            self.applied.retain(|a| *a != taken);
+        }
         self.commit = None;
         self.taken_through.clear();
         self.frames_seen.clear();
@@ -1490,10 +1499,18 @@ mod rev3 {
         let mut n = Rev3Node::default();
         assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
         n.forget(); // before any tick: the head PUT never went
+        assert_eq!(n.taken_through.get(&A), None, "taken_through survived the forget: it is the context's");
+        assert!(n.applied.is_empty(), "the un-landed take was not withdrawn");
         let (ack, st) = one(n.call(&write(A, 2, 1, 1, "a")));
         assert_eq!(st, WriteState::Accepted, "a write that never landed was told Duplicate");
         assert_eq!(ack.published_through, 0);
+        assert_eq!(ack.taken_through, 1, "the re-send is taken again");
         assert!(!n.tree.contains_key(b"k".as_slice()), "the tree changed without a head PUT");
+        // …and that is ONE apply, not two: the forgotten take was withdrawn.
+        assert!(n.call(&tick(A, 3)).is_empty());
+        assert_eq!(one(n.call(&tick(A, 4))).1, WriteState::Published);
+        assert_eq!(n.applied, vec![(A, 1)], "a correct recovery was counted as a double apply");
+        assert_eq!(n.tree.get(b"k".as_slice()).map(|v| v.as_slice()), Some(b"a".as_slice()));
     }
 
     /// THE LEDGER SURVIVES A FORGET — run (a): the head PUT landed, the
