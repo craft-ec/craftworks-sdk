@@ -7,7 +7,7 @@
 use crate::id::{self, Env, IdGen, Loc, RKey};
 use crate::record;
 use crate::schema::Schema;
-use crate::store::{sorted_edits, Edit, Reads, Store, StoreError};
+use crate::store::{sorted_edits, Edit, IdWidth, Reads, Store, StoreError};
 use freenet_prolly::node::{MAX_KEY, MAX_VALUE};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -482,8 +482,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let Ok(loc) = self.locate(&schema, domain, at) else {
             // Well-formed (it parsed) and the wrong WIDTH for this domain: the
             // one case the answer "not found" would otherwise leave silent.
-            let width = |parented: bool| if parented { 64 } else { 32 };
-            self.store.wrong_width(width(at.parent.is_some()), width(schema.parent.is_some()));
+            self.store.wrong_width(IdWidth::of(at.parent.is_some()), IdWidth::of(schema.parent.is_some()));
             return Ok(None);
         };
         let key = record_key(domain, loc);

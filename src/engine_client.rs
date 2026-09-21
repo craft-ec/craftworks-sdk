@@ -131,12 +131,13 @@ impl Client {
 
     /// Record that a read was handed an id of the wrong width (see
     /// [`Reads::wrong_width`](crate::store::Reads::wrong_width)). Two numbers
-    /// from the vocabulary, 32 or 64 each; nothing from the id or the domain.
-    pub fn record_wrong_width(&self, given: usize, wanted: usize) {
+    /// from the vocabulary, 32 or 64 each and nothing else — they come from an
+    /// enum, not a count — and nothing from the id or the domain.
+    pub fn record_wrong_width(&self, given: crate::store::IdWidth, wanted: crate::store::IdWidth) {
         use instrument::{vocab::Key, Entry, Event, OpId, Probe, Site};
         const READ: Site = Site::of("sdk::db::read::id-width");
         let Some(rec) = &self.rec else { return };
-        for (key, value) in [(Key::IdWidthGiven, given as u64), (Key::IdWidthWanted, wanted as u64)] {
+        for (key, value) in [(Key::IdWidthGiven, given.hex()), (Key::IdWidthWanted, wanted.hex())] {
             rec.event(Event::Counter { site: READ, op: OpId::NONE, entry: Entry { key, value } });
         }
     }

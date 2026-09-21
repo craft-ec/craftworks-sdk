@@ -14,6 +14,7 @@
 //!     that hook into its own client's recording.
 use craftworks_sdk::engine_client::Client;
 use craftworks_sdk::id::{loc_from_hex, Loc};
+use craftworks_sdk::store::IdWidth;
 use craftworks_sdk::*;
 use instrument::{vocab::Key, Record as _};
 use serde_json::{json, Map, Value};
@@ -55,7 +56,7 @@ impl Reads for Recorded {
     fn changes_since(&mut self, f: [u8; 32], lo: &[u8], hi: &[u8], m: u32) -> store::Read<Delta> {
         self.inner.changes_since(f, lo, hi, m)
     }
-    fn wrong_width(&self, given: usize, wanted: usize) {
+    fn wrong_width(&self, given: IdWidth, wanted: IdWidth) {
         self.client.record_wrong_width(given, wanted);
     }
 }
@@ -153,7 +154,7 @@ fn cached_store_forwards_the_hook_into_its_recording() {
     // Through the probed fixture, not built bare (fixture-gate).
     let (mut s, _clock) = testkit::cached_store();
     s.client.record_into(16);
-    s.wrong_width(32, 64);
+    s.wrong_width(IdWidth::Bare, IdWidth::Parented);
     let r = s.client.recording().expect("a recording");
     assert_eq!((r.total(Key::IdWidthGiven), r.total(Key::IdWidthWanted)), (32, 64));
 }

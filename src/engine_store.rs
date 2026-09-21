@@ -19,7 +19,7 @@
 
 use crate::engine_client::Client;
 pub use crate::engine_client::Event;
-use crate::store::{Delta, Edit, Read, Reads, Store, StoreError};
+use crate::store::{Delta, Edit, IdWidth, Read, Reads, Store, StoreError};
 use crate::trace::Trace;
 use protocol::outbox::{Lost, Outbox, PreImage};
 use protocol::{Reply, Request, WriteState};
@@ -410,7 +410,7 @@ impl<T: Transport> Store for EngineStore<T> {
 /// than this: a door that exists only to turn callers away is a door, and
 /// someone eventually walks through it.
 impl<T: Transport> Reads for EngineStore<T> {
-    fn wrong_width(&self, given: usize, wanted: usize) {
+    fn wrong_width(&self, given: IdWidth, wanted: IdWidth) {
         self.client.record_wrong_width(given, wanted);
     }
 

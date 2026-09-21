@@ -137,6 +137,29 @@ impl RowState {
     }
 }
 
+/// The two widths a record id comes in: a bare record's rkey (32 hex) or a
+/// parented one's parent ‖ rkey (64 hex). A value from a fixed set, so the
+/// recorder can put nothing else on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdWidth {
+    Bare,
+    Parented,
+}
+
+impl IdWidth {
+    pub fn of(parented: bool) -> Self {
+        if parented { IdWidth::Parented } else { IdWidth::Bare }
+    }
+
+    /// Hex characters in an id of this width.
+    pub fn hex(self) -> u64 {
+        match self {
+            IdWidth::Bare => 32,
+            IdWidth::Parented => 64,
+        }
+    }
+}
+
 pub trait Reads {
     fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>>;
 
@@ -161,7 +184,7 @@ pub trait Reads {
     /// domain, whose name is the app's.
     ///
     /// No-op by default: a store with no recorder has nowhere to put it.
-    fn wrong_width(&self, _given: usize, _wanted: usize) {}
+    fn wrong_width(&self, _given: IdWidth, _wanted: IdWidth) {}
 
     /// Entries with `lo <= key < hi`, ascending, or descending if `reverse`;
     /// at most `limit`.
