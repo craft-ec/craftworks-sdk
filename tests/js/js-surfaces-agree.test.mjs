@@ -126,6 +126,11 @@ const ARGS = {
   define: ["d", { type: "T", fields: [] }],
   schema: ["d"], domains: [], count: ["d"], get: ["d", "x"], delete: ["d", "x"],
   put: ["d", {}], update: ["d", "x", {}], scan: ["d"],
+  // The parent is a record id both surfaces will refuse to parse; that is
+  // fine, because what this gate compares is the SHAPE of the answer (promise
+  // or value), and a refusal that differs in shape is exactly the drift it
+  // exists to catch.
+  children: ["d", "x"],
   root: [], stats: [], bind: ["d"],
 };
 

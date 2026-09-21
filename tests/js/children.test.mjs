@@ -13,7 +13,12 @@ import { createRequire } from "node:module";
 import { wrap } from "../../js/wrap.js";
 const sdk = wrap(createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js"));
 
-const t = async (name, fn) => { await fn(); process.stdout.write(`ok ${name}\n`); };
+// `  ok  ` with TWO leading spaces, which is not cosmetic: gate.sh counts
+// `^  ok ` and a flush-left line is invisible to the ratchet. These four
+// checks ran green and uncounted before this was fixed, which means deleting
+// them later would not have been caught — the exact state the ratchet exists
+// to prevent.
+const t = async (name, fn) => { await fn(); process.stdout.write(`  ok  ${name}\n`); };
 
 const componentSchema = {
   type: "Component",
