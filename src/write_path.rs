@@ -1,5 +1,6 @@
 //! THE CLIENT'S WRITE PATH, rebuilt from the table — STRUCTURE ONLY
-//! (WRITE-PATH.md revision 3, "A write's life at the client"; build step 3).
+//! (WRITE-PATH.md revision 3, "A write's life at the client" and "Rulings made
+//! while mapping the table to code"; build step 3).
 //!
 //! Every function here is one EVENT of the table, and its doc comment is that
 //! event's column, cell by cell, stage by stage — so the mapping from the
@@ -8,31 +9,53 @@
 //! compiled and linted only when asked for (`cargo check --features
 //! write-path-v5`), and nothing calls it.
 //!
+//! TWO DOORS. A write reaches the wire through ONE function, [`WritePath::leave`];
+//! a reply reaches the write path through ONE function, [`WritePath::on_reply`].
+//! Everything else is private to one of them.
+//!
 //! What this REPLACES when it lands: `PendingWrite::{queued, held, at_node}`,
 //! `CachedStore::{held, drain_queued}`, `Copy::{hold, sent, answered,
-//! submitted, queued}` — one `Stage` per write instead of three flags and a
-//! queue, and ONE function through which a write reaches the wire.
-//!
-//! Questions the table leaves open are marked `OPEN(Qn)`; they are asked, not
-//! chosen.
+//! submitted, queued}`, and — for v5 — sdk#174's `unheard` map (folded into
+//! `Stage::AtNode`).
 
 #![allow(dead_code, unused_variables)]
 
-use protocol::{Ack, Op, WriteState};
+use protocol::{Ack, Op, Reply, WriteState};
+
+/// The window's byte bound (W5), with `WRITES_IN_FLIGHT` = 16 its count bound:
+/// an EIGHTH of the node's 64 MiB park budget (F15). PROVISIONAL — re-measured
+/// in build step 5. Always at least one write, whatever its size.
+pub const BYTES_IN_FLIGHT: usize = 8 * 1024 * 1024;
+
+/// Silence this long (no reply to this session while it has writes `AtNode`
+/// or `Taken`) → the ONE recovery. Recovery is harmless (every re-send is
+/// safe against rule 1), so this clock is short.
+pub const T_RECOVER_MS: u64 = 10_000;
+
+/// A recovery attempt that stays silent this long has failed; `Unknown` only
+/// after TWO. Giving up is not harmless, so this clock is long: the node's
+/// `PARK_TTL` of 90 s plus margin (F50).
+pub const T_GIVE_UP_MS: u64 = 100_000;
+
+/// A gap longer than this between two of this client's own 1 s ticks is a
+/// CLOCK JUMP (the machine slept) — judged on the client's clock alone.
+pub const CLOCK_JUMP_MS: u64 = 5_000;
 
 /// Where one write is, at the client. The ONLY per-write state.
 ///
 /// * `Held` — made, not at the node: never sent, or refused with nothing
 ///   applied (`Busy`, `OutOfOrder`). Leaves through [`WritePath::leave`].
-/// * `AtNode { since }` — sent, no verdict. The window (W5) is these writes
-///   (and their bytes), DERIVED — never a second record.
+/// * `AtNode { since, asked_at }` — sent, no verdict. The window (W5) is these
+///   writes (and their bytes), DERIVED — never a second record. `asked_at` is
+///   when it was last asked after (`AskWrite`), `None` if never: sdk#174's
+///   `unheard` map, folded into the stage.
 /// * `Taken` — the engine has it: `Accepted`, or `id ≤ taken_through`. **No
-///   age timeout**: a cold commit legitimately outlasts any T (F50: 75 s), and
-///   `Stalled` says so. The only clock is SILENCE, per session (below).
+///   age timeout** (a cold commit legitimately outlasts any T: F50's 75 s) and
+///   NOT asked after — a `Taken` write learns from the Ack on every tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Held,
-    AtNode { since: u64 },
+    AtNode { since: u64, asked_at: Option<u64> },
     Taken,
 }
 
@@ -52,59 +75,107 @@ pub enum Ended {
     /// Fell: `Failed`, `Lost`, `TooLarge`, or behind one of those on a key
     /// (`Copy::fall`, whole).
     Fell(WriteState),
-    /// Recovery met silence twice. The ONLY place `Unknown` remains.
+    /// Recovery gave up TWICE. The ONLY place `Unknown` remains.
     Unknown,
 }
 
-/// One session's write path. Holds the un-ended writes, the session's clock
-/// of SILENCE, and the counters the model test asserts on.
+/// What made this session silent — every kind is ONE event, and the answer is
+/// the same recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Silence {
+    /// `T_RECOVER_MS` with no reply to this session while it has writes
+    /// `AtNode`/`Taken`.
+    NoReply,
+    /// The socket dropped and a new one opened.
+    Reconnect,
+    /// The page came back from the back/forward cache (`pageshow`,
+    /// `persisted`).
+    PageShow,
+    /// A gap > `CLOCK_JUMP_MS` between two of this client's own ticks.
+    ClockJump,
+}
+
+/// One session's write path.
 #[derive(Debug, Default)]
 pub struct WritePath {
     pub unended: Vec<Unended>,
     /// When THIS SESSION was last answered anything (any reply carrying its
     /// Ack). Silence is measured from here — never per write.
     pub last_heard_ms: u64,
-    /// Verdicts in a cell the table calls impossible (footnote ¹). Counted,
+    /// When this client last ticked, for [`Silence::ClockJump`].
+    pub last_tick_ms: u64,
+    /// Recovery attempts that met silence in a row (two → `Unknown`).
+    pub silent_recoveries: u8,
+    /// Verdicts in a cell the table calls impossible (footnote ¹) — and any
+    /// per-write `ParityComplete`, which a v5 session is never sent. Counted,
     /// otherwise ignored; the model test asserts 0 at the end of every run.
     pub impossible_verdicts: u64,
-    /// Verdicts for a write this session no longer holds ("(not pending)" row).
+    /// Verdicts for a write this session no longer holds ("(not pending)").
     pub not_pending_verdicts: u64,
-    /// Recoveries in a row that met silence (two → `Unknown`).
-    pub silent_recoveries: u8,
+    /// Bodies ignored because they would move a write BACKWARDS from what
+    /// the same reply's Ack had just established.
+    pub behind_their_ack: u64,
 }
 
 impl WritePath {
-    // ------------------------------------------------------------ leaving
+    // ================================================= door 1: a write leaves
 
     /// THE ONE FUNCTION THROUGH WHICH A WRITE REACHES THE WIRE.
     ///
-    /// Sets `AtNode { since: now }` and sends the write WHOLE, as
-    /// `WriteFrom { write_id, floor, ops }` with `floor` = the lowest id this
-    /// session still holds un-ended — computed AFTER `Copy::fall` has taken
-    /// any later same-key writes with a fallen one. sdk#179 a (a slot never
-    /// freed) and b (a re-send keeping the old clock) cannot be written
-    /// against this shape: there is no second place a write leaves from, and
-    /// no slot record beside the stage.
+    /// Sets `AtNode { since: now, asked_at: None }` and sends the write WHOLE,
+    /// as `WriteFrom { write_id, floor, ops }` with `floor` = [`floor`](Self::floor),
+    /// computed AFTER `Copy::fall` has taken any later same-key writes with a
+    /// fallen one. sdk#179 a (a slot never freed) and b (a re-send keeping the
+    /// old clock) cannot be written against this shape: there is no second
+    /// place a write leaves from, and no slot record beside the stage.
     pub fn leave(&mut self, write_id: u64, now_ms: u64) {
         todo!("step 3")
     }
 
-    /// The lowest write id this session still holds un-ended — the `floor`
-    /// on every `WriteFrom` (rule 3's `max(next, floor)`).
+    /// The lowest write id this session still holds un-ended — the `floor` on
+    /// every `WriteFrom`. The engine's rule-3 floor arm STAYS once ids are no
+    /// longer gapped at make (sdk#186): a client-side FALL still releases
+    /// numbers, and an evicted session returns through it (ruling Q8).
     pub fn floor(&self) -> u64 {
         todo!("step 3")
     }
 
-    // ------------------------------------------------ per-stage cells: events
-
-    /// **window has room** — `Held` → `AtNode{now}`, sent WHOLE through
-    /// [`leave`](Self::leave). Held writes leave OLDEST FIRST, and only while
-    /// no LOWER write id is `Held`. `AtNode`, `Taken`: —.
-    ///
-    /// The window is the count AND the bytes of writes `AtNode` (W5:
-    /// `WRITES_IN_FLIGHT` = 16, `BYTES_IN_FLIGHT`; always at least one).
-    /// OPEN(Q1): `BYTES_IN_FLIGHT`'s value is not in the table.
+    /// **window has room** — `Held` → `AtNode{now}` through [`leave`](Self::leave),
+    /// WHOLE, OLDEST FIRST, and only while no LOWER write id is `Held`.
+    /// `AtNode`, `Taken`: —. The window: at most `WRITES_IN_FLIGHT` writes and
+    /// [`BYTES_IN_FLIGHT`] bytes `AtNode`; always at least one (ruling Q1).
     pub fn on_room(&mut self, now_ms: u64) {
+        todo!("step 3")
+    }
+
+    // ================================================= door 2: a reply arrives
+
+    /// THE ONE FUNCTION THROUGH WHICH A REPLY REACHES THE WRITE PATH (ruling
+    /// Q4's reading order). A v5 reply is `Acked { ack, body }`:
+    /// 1. an Ack for ANOTHER session is dropped, as a foreign
+    ///    `SessionWriteState` is;
+    /// 2. the Ack is applied FIRST ([`apply_ack`](Self::apply_ack));
+    /// 3. then the body's verdict, through the per-verdict cells below — and a
+    ///    body that would move a write BACKWARDS from what its own Ack just
+    ///    established (a `Busy` for a write the Ack says taken) is IGNORED and
+    ///    counted in `behind_their_ack`.
+    ///
+    /// Every reply to this session also resets its silence clock.
+    pub fn on_reply(&mut self, ack: &Ack, body: &Reply, now_ms: u64) {
+        todo!("step 3")
+    }
+
+    /// **Any reply carrying an `Ack`** (this session's):
+    /// * every write with `id ≤ published_through` is gone, base moves;
+    /// * every `AtNode` with `id ≤ taken_through` → `Taken`;
+    /// * **`taken_through` can go BACKWARDS** (the engine forgot): a `Taken`
+    ///   write above BOTH numbers → `Held`, or "no age timeout" waits for ever.
+    ///
+    /// **Durable** (ruling Q5): the FIRST Ack with `published_through ≥ id`
+    /// AND `parity == Some { owed_groups: 0, .. }`. `owed_groups` counts
+    /// UNCODED groups, so 0 never means "not coded"; `None` is never durable;
+    /// `at_seq` is diagnostic only — no publishing seq is needed.
+    fn apply_ack(&mut self, ack: &Ack, now_ms: u64) {
         todo!("step 3")
     }
 
@@ -113,20 +184,18 @@ impl WritePath {
     /// * `AtNode`: → `Taken`.
     /// * `Taken`: stay.
     /// * not pending: counted.
-    pub fn on_accepted(&mut self, write_id: u64) {
+    fn on_accepted(&mut self, write_id: u64) {
         todo!("step 3")
     }
 
-    /// **`Published` / `ParityComplete` / an Ack with `published_through ≥ id`**
-    /// — in EVERY stage: gone; base moves (⁴ for `Held`: a write re-held after
-    /// the engine forgot can still be published).
+    /// **`Published`** — in EVERY stage: gone; base moves (⁴ for `Held`: a
+    /// write re-held after the engine forgot can still be published).
     /// * not pending: counted.
     ///
-    /// OPEN(Q2): does a v5 engine still SEND a per-write `ParityComplete`
-    /// after `Published`? If it does, every one arrives "not pending" and the
-    /// counter is noise (the sdk#192 lesson); if parity is only the Ack's stat,
-    /// the per-write verdict should be gone from v5.
-    pub fn on_published(&mut self, write_id: u64) {
+    /// A per-write **`ParityComplete`** is NEVER sent to a v5 session — parity
+    /// is the Ack's stat — so one arriving is counted in
+    /// `impossible_verdicts` (ruling Q2).
+    fn on_published(&mut self, write_id: u64) {
         todo!("step 3")
     }
 
@@ -134,24 +203,23 @@ impl WritePath {
     /// * `Held`: impossible¹.
     /// * `AtNode`: → `Held`². Re-offered when any other reply arrives, or on
     ///   `tick` — NOT at once (today's `drain_queued` rule).
-    /// * `Taken`: impossible¹.
+    /// * `Taken`: impossible¹ — and a `Busy` for a write its own Ack says
+    ///   taken never reaches here: [`on_reply`](Self::on_reply) ignores it.
     /// * not pending: counted.
-    pub fn on_busy(&mut self, write_id: u64) {
+    fn on_busy(&mut self, write_id: u64) {
         todo!("step 3")
     }
 
     /// **`OutOfOrder { expected }`** —
     /// * `Held`: impossible¹.
-    /// * `AtNode`: → `Held`; `expected` leaves AT ONCE (go-back-N: a request
-    ///   refused with no verdict — F50's 9th, F51's 102nd — costs a round
-    ///   trip, not a 60 s false rollback).
+    /// * `AtNode`: → `Held`, and the session's OWN lowest un-ended write leaves
+    ///   AT ONCE with a fresh floor (go-back-N: a request refused with no
+    ///   verdict — F50's 9th, F51's 102nd — costs a round trip, not a 60 s
+    ///   false rollback). `expected` is ADVICE: a write this session no longer
+    ///   holds is NEVER resurrected (ruling Q3).
     /// * `Taken`: impossible¹.
     /// * not pending: counted.
-    ///
-    /// OPEN(Q3): `expected` names a write this session does NOT hold (already
-    /// ended here — e.g. its `Failed` arrived after the engine's number moved).
-    /// Nothing to send: fall back to `floor`, count it, or both?
-    pub fn on_out_of_order(&mut self, write_id: u64, expected: u64) {
+    fn on_out_of_order(&mut self, write_id: u64, expected: u64) {
         todo!("step 3")
     }
 
@@ -161,18 +229,17 @@ impl WritePath {
     ///   write on any of its keys, WHOLE (W1). The number is RELEASED (only a
     ///   publish consumes one), so the next `floor` passes it.
     /// * not pending: counted.
-    pub fn on_fell(&mut self, write_id: u64, why: WriteState) {
+    fn on_fell(&mut self, write_id: u64, why: WriteState) {
         todo!("step 3")
     }
 
-    /// **`Duplicate`** — in every stage: read its Ack⁴. A `Duplicate` is never
-    /// "no information": its Ack says published (→ gone) or taken (→ `Taken`).
+    /// **`Duplicate`** — in every stage: read its Ack⁴ (already applied by
+    /// [`on_reply`](Self::on_reply)). A Duplicate is never "no information":
+    /// * rule 1 (`id < next`): the Ack says PUBLISHED → gone;
+    /// * rule 1b (the write IS the session's commit in flight — ruling Q4):
+    ///   the Ack says TAKEN (`taken_through`) → `Taken`.
     /// * not pending: counted.
-    ///
-    /// OPEN(Q4): by the engine's rule 1 a Duplicate means `id < next =
-    /// published_through + 1`, i.e. ALWAYS published — when does footnote ⁴'s
-    /// "taken" arm happen?
-    pub fn on_duplicate(&mut self, write_id: u64, ack: &Ack) {
+    fn on_duplicate(&mut self, write_id: u64) {
         todo!("step 3")
     }
 
@@ -181,80 +248,56 @@ impl WritePath {
     /// * `AtNode`: stay.
     /// * `Taken`: stay; the row says so.
     /// * not pending: counted.
-    pub fn on_stalled(&mut self, write_id: u64) {
+    fn on_stalled(&mut self, write_id: u64) {
         todo!("step 3")
     }
 
-    // ------------------------------------------------ session-level events
+    // ================================================= the session's clocks
 
-    /// **Any reply carrying an `Ack`** (this session's; a foreign Ack is
-    /// dropped, as a foreign `SessionWriteState` is):
-    /// * every write with `id ≤ published_through` is gone, base moves;
-    /// * every `AtNode` with `id ≤ taken_through` → `Taken`;
-    /// * **`taken_through` can go BACKWARDS** (the engine forgot): a `Taken`
-    ///   write above BOTH numbers → `Held`, or "no age timeout" waits for ever.
-    ///
-    /// This is how a dropped or misrouted verdict heals. It also resets the
-    /// session's silence clock (`last_heard_ms`) and `silent_recoveries`.
-    pub fn on_ack(&mut self, ack: &Ack, now_ms: u64) {
+    /// **Silence of any kind** — no reply for [`T_RECOVER_MS`], a reconnect,
+    /// `pageshow(persisted)`, a clock jump (> [`CLOCK_JUMP_MS`] between two of
+    /// this client's own ticks, judged on the client clock alone) — is ONE
+    /// event, never a rollback: → [`recover`](Self::recover) (ruling Q6).
+    pub fn on_silence(&mut self, kind: Silence, now_ms: u64) {
         todo!("step 3")
     }
 
-    /// **The Ack's parity stat** `Some(Parity { owed_groups, at_seq })` — a
-    /// write is DURABLE when `owed_groups == 0` at a seq ≥ the one that
-    /// published it. `None` = the engine does not know: never "durable".
-    ///
-    /// OPEN(Q5): the client must know the SEQ that published each write to
-    /// compare — the Ack carries `published_through` (an id), not the seq.
-    /// Where does "its publishing seq" come from?
-    pub fn on_parity(&mut self, ack: &Ack) {
+    /// THE ONE RECOVERY: ask (`tick`), read the Ack, settle by it; then
+    /// re-send everything still un-ended from the LOWEST id, in order, whole
+    /// — safe against a fact (rule 1). Nothing is rolled back as `Unknown` by
+    /// a timer alone.
+    fn recover(&mut self, now_ms: u64) {
         todo!("step 3")
     }
 
-    /// **SILENCE** (`T` with no reply to this session while it has writes
-    /// `AtNode`/`Taken`), **RECONNECT**, **`pageshow(persisted)`**, **CLIENT
-    /// CLOCK JUMP** (> T in one tick) — ONE recovery: ask (`tick`), read the
-    /// Ack, settle by it; then re-send everything still un-ended from the
-    /// LOWEST id, in order, whole — safe against a fact (rule 1). Nothing is
-    /// rolled back as `Unknown` by a timer alone.
-    ///
-    /// OPEN(Q6): T's value (today's `pending_timeout_ms` is 60 s) — and does a
-    /// clock jump count from the client's clock alone, or also the Ack's?
-    pub fn recover(&mut self, now_ms: u64) {
-        todo!("step 3")
-    }
-
-    /// **Recovery itself meets silence, twice** — the un-ended writes fall as
-    /// `Unknown`, TOLD. The only place `Unknown` remains.
+    /// **A recovery attempt silent for [`T_GIVE_UP_MS`]** — counted; after
+    /// TWO in a row the un-ended writes fall as `Unknown`, TOLD. The only
+    /// place `Unknown` remains.
     pub fn on_recovery_silent(&mut self, now_ms: u64) -> Vec<(u64, Ended)> {
         todo!("step 3")
     }
 
     /// **A write `AtNode` with no verdict for 1 s** (it may be PARKED: cold
     /// blocks being fetched; the client cannot tell) — `AskWrite(write_id)`,
-    /// about once a second, at most ONE unanswered per session. A PULL, so its
-    /// answer comes in a call the writer started (not misroutable).
-    ///
-    /// OPEN(Q7): engineer2's sdk#174 already has `ask_unheard` with its own
-    /// `unheard` map and `tick_gate::OneAtATime`. Does this REPLACE its map
-    /// with the stage (AtNode + since), keeping `OneAtATime` for the
-    /// one-at-a-time rule — and does it ask `Taken` writes too (the table says
-    /// `AtNode`; #174 asks after `Accepted`)?
+    /// about once a second, at most ONE unanswered per session, for `AtNode`
+    /// writes ONLY (a `Taken` write learns from the Ack on every tick). Asked
+    /// time lives in `AtNode { asked_at }`; the one-at-a-time rule is
+    /// `tick_gate::OneAtATime` (ruling Q7).
     pub fn ask_unheard(&mut self, now_ms: u64) -> Option<u64> {
         todo!("step 3")
     }
 
-    /// **A host error naming no request** — NOT a cell: it has no addressee.
-    /// It is nothing; silence or `OutOfOrder{expected}` covers what it meant.
+    // ================================================= not cells
+
+    /// **A host error naming no request** — for the WRITE PATH it has no
+    /// addressee and is nothing: silence or `OutOfOrder{expected}` covers what
+    /// it meant. It still answers one FRAME for the SEND GATE (sdk#196, 1b):
+    /// the frame it refused is no longer outstanding there.
     pub fn on_host_error(&mut self) {}
 
     /// **Make-time refusal** (too large, the copy's cap) — the id is NOT
-    /// minted (today it is, leaving gaps: sdk#186), and the refusal is the
-    /// write's return value (sdk#180). Lives where ids are minted
-    /// (`CachedStore::submit`), not here; listed so the table is complete.
-    ///
-    /// OPEN(Q8): with ids no longer gapped, rule 3's `floor > next` arm still
-    /// happens (a write FALLS client-side, releasing its number) — confirm the
-    /// floor arm stays for that, not only for make-time gaps.
+    /// minted (sdk#186), and the refusal is the write's return value
+    /// (sdk#180). Lives where ids are minted (`CachedStore::submit`), not
+    /// here; listed so the table is complete.
     pub fn make_time_refusal(&mut self) {}
 }
