@@ -59,6 +59,17 @@ impl Node {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             bail!("something is already listening on {port}; refusing to share it");
         }
+        // The network port too — BEFORE anything is created or spawned. It was
+        // checked after the directories were made, so a refused network port
+        // left a tree behind.
+        if let Mode::IsolatedNetwork { network_port } = mode {
+            if RESERVED.contains(&network_port) {
+                bail!("network port {network_port} belongs to someone else's node");
+            }
+            if TcpStream::connect(("127.0.0.1", network_port)).is_ok() {
+                bail!("something is already listening on {network_port}");
+            }
+        }
         for sub in ["data", "config", "log"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
@@ -69,12 +80,6 @@ impl Node {
         let mut args: Vec<String> = match mode {
             Mode::Local => vec!["local".into(), "local".into()],
             Mode::IsolatedNetwork { network_port } => {
-                if RESERVED.contains(&network_port) {
-                    bail!("network port {network_port} belongs to someone else's node");
-                }
-                if TcpStream::connect(("127.0.0.1", network_port)).is_ok() {
-                    bail!("something is already listening on {network_port}");
-                }
                 vec![
                     "network".into(),
                     "--is-gateway".into(),

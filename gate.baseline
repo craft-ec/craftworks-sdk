@@ -1,7 +1,7 @@
 craftworks-sdk=300
 engine=107
 engine-delegate=42
-probe=5
+probe=7
 probe-delegate=0
 protocol=50
 testkit=15
