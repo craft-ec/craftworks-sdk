@@ -132,6 +132,19 @@ else
   fi
   js_ok=$(grep -c "^  ok " /tmp/gate-npm.$$ || true)
   rm -f /tmp/gate-npm.$$
+  # ZERO IS ITS OWN REFUSAL, separate from "differs from the baseline".
+  #
+  # A filter that matches nothing exits 0 and prints a success line — every
+  # runner behaves this way — so a run that executed NO tests is
+  # indistinguishable from one that passed them all, in the only output
+  # anyone reads. And a baseline of 0 would AGREE with it, which is how a
+  # could-not-check becomes a permanent pass.
+  #
+  # So it is refused here rather than left to the comparison below: the
+  # comparison answers "did it change", and this answers "did it run".
+  [ "$js_ok" -eq 0 ] && fail "npm test reported ZERO passing tests. A filter \
+that matches nothing exits 0 and prints a success line, so this is a run that \
+checked nothing rather than a suite that passed."
 fi
 
 # ------------------------------------------------------ fixture gate ----
@@ -171,22 +184,54 @@ running, which is the state this gate exists to make impossible to publish."
     fi
   fi
 done
+# THE JS HALF, under the same rule as the cargo members.
+#
+# It was printed and not enforced, so a JavaScript test that silently stopped
+# running passed the gate — and that half is what the page and the builder
+# actually run. The gate's own warning said "no count moved. If you added a
+# test, IT IS NOT BEING RUN" while the npm count moved 66 -> 72 untracked:
+# true of a surface it did not watch (sdk#115).
+js_base=$(base_for "npm")
+if [ -z "$js_base" ]; then
+  printf "%-18s %8s %8s\n" "npm" "$js_ok" "NEW"
+  fail "npm is not in $BASELINE — record it with ./gate.sh --accept"
+  moved=1
+else
+  jd=$((js_ok - js_base))
+  jmark="$jd"; [ $jd -gt 0 ] && jmark="+$jd"; [ $jd -eq 0 ] && jmark="—"
+  printf "%-18s %8s %8s\n" "npm" "$js_ok" "$jmark"
+  if [ $jd -lt 0 ]; then
+    fail "npm LOST $((-jd)) test(s). A count that falls is a test that stopped \
+running, which is the state this gate exists to make impossible to publish."
+    moved=1
+  elif [ $jd -gt 0 ]; then
+    moved=1
+  fi
+fi
+
 # Members recorded but gone. A baseline that outlives its crate is a line
 # nobody checks, which is how a stale expectation survives.
 if [ -f "$BASELINE" ]; then
   while IFS='=' read -r k _; do
     [ -n "$k" ] || continue
+    [ "$k" = "npm" ] && continue
     echo "$MEMBERS" | grep -qx "$k" || fail "$k is in $BASELINE but is no longer a workspace member"
   done < "$BASELINE"
 fi
 
 echo
-echo "ran: cargo test per member ($total passing), clippy --workspace --all-targets -D warnings ($clippy_warnings warnings), npm test ($js_ok ok), fixture-gate ($fixture_line)"
+# COVERAGE ON THE SUCCESS LINE, for both halves, because success is what gets
+# believed without reading. A green run that does not say WHICH surface it
+# covered reads the same whether it covered one or both.
+echo "ran: cargo test per member ($total passing, ${#NAMES[@]} members vs baseline), \
+clippy --workspace --all-targets -D warnings ($clippy_warnings warnings), \
+npm test ($js_ok ok vs baseline ${js_base:-none}), fixture-gate ($fixture_line)"
 
 if [ "${1-}" = "--accept" ]; then
   : > "$BASELINE"
   for i in "${!NAMES[@]}"; do echo "${NAMES[$i]}=${COUNTS[$i]}" >> "$BASELINE"; done
-  echo "gate: recorded ${#NAMES[@]} member counts in $BASELINE"
+  echo "npm=$js_ok" >> "$BASELINE"
+  echo "gate: recorded ${#NAMES[@]} member counts and npm=$js_ok in $BASELINE"
   exit 0
 fi
 
