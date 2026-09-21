@@ -174,7 +174,7 @@ fn round_trips_to_load(rows: usize) -> (usize, usize) {
                     craftworks_sdk::loads::Page::More { lo, hi, after } => {
                         pending = Some(Loads::range_request(req_id, &lo, &hi, Some(after)));
                     }
-                    craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
+                    craftworks_sdk::loads::Page::Complete { lo, hi, rows, .. } => {
                         delivered = rows.len();
                         fresh.on_page(&lo, &hi, rows, [0u8; 32]);
                     }

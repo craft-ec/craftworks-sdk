@@ -14,13 +14,6 @@
 use craftworks_sdk::{Answer, CachedStore, Loads, Refresh, Store as _};
 use engine_delegate::shell::Inbound;
 
-/// One head for every page: these tests do not move the tree, and a
-/// constant says so rather than leaving it to be inferred.
-const AT: protocol::At = protocol::At {
-    seq: 1,
-    root: [1u8; 32],
-};
-
 /// A client: a `CachedStore` whose traffic crosses a real engine.
 struct Client {
     store: CachedStore,
@@ -29,6 +22,13 @@ struct Client {
     asks: usize,
     /// Full reloads `Refresh` decided on.
     reloads: usize,
+    /// What `ChangesSince` was ANSWERED with — the reply type, which is the
+    /// assertion every earlier test of this path lacked (sdk#142).
+    deltas: usize,
+    refused: usize,
+    /// Entries handed to this client: rows in pages plus changes in deltas.
+    /// What a notification COSTS it, whatever the engine had cached.
+    received: usize,
 }
 
 /// The domain's range, from the ONE function that knows the layout.
@@ -65,6 +65,9 @@ impl Client {
             conn,
             asks: 0,
             reloads: 0,
+            deltas: 0,
+            refused: 0,
+            received: 0,
         };
         // START THE ENGINE. `Identity` is also how a session begins: answering
         // "where is your head" requires reading it, so the head read goes out
@@ -86,6 +89,11 @@ impl Client {
                 }
             }
             for reply in self.conn.step(vec![Inbound::Client(frame)]) {
+                match protocol::decode_reply(&reply) {
+                    Ok(protocol::Reply::Page { entries, .. }) => self.received += entries.len(),
+                    Ok(protocol::Reply::Delta { changes, .. }) => self.received += changes.len(),
+                    _ => {}
+                }
                 self.store.on_inbound(&reply);
                 all.push(reply);
             }
@@ -93,13 +101,43 @@ impl Client {
         all
     }
 
+    /// Many keys as ONE write, so a large domain is set up in one commit.
+    fn write_many(&mut self, keys: impl Iterator<Item = Vec<u8>>, value: &[u8]) {
+        // In batches of 100: measured here, one write of a thousand keys left
+        // the domain EMPTY, with nothing said. So each batch asserts the copy
+        // refused nothing, and the caller asserts the rows arrived.
+        let keys: Vec<Vec<u8>> = keys.collect();
+        for chunk in keys.chunks(100) {
+            let edits: Vec<_> = chunk.iter().map(|k| (k.clone(), craftworks_sdk::Edit::Put(value.to_vec()))).collect();
+            self.store.apply_batch(&edits);
+            assert!(self.store.refused.is_empty(), "the copy refused a set-up write: {:?}", self.store.refused);
+            self.pump();
+        }
+    }
+
     fn write(&mut self, key: &[u8], value: &[u8]) {
         self.store.put(key, value);
         self.pump();
     }
 
+    /// Load the whole domain, as a binding's first read does, and — as the
+    /// session does — tell `Refresh` the root it was read at (sdk#142).
+    fn load_into(&mut self, r: &mut Refresh) {
+        if let Some((lo, hi, root)) = self.load_at() {
+            if let Some(d) = craftworks_sdk::Db::<CachedStore, craftworks_sdk::SystemEnv>::domain_of_range(&lo, &hi) {
+                r.on_loaded(&d, root);
+            }
+        }
+    }
+
     /// Load the whole domain, as a binding's first read does.
     fn load(&mut self) {
+        let _ = self.load_at();
+    }
+
+    /// Load the whole domain; the span and root it completed at, if it did.
+    fn load_at(&mut self) -> Option<(Vec<u8>, Vec<u8>, [u8; 32])> {
+        let mut done = None;
         let mut loads = Loads::new();
         let (id, _) = loads.want(&range().0, &range().1, 0).expect("a fresh span");
         let mut pending = Some(Loads::range_request(id, &range().0, &range().1, None));
@@ -110,18 +148,22 @@ impl Client {
                     req_id,
                     entries,
                     cursor,
+                    at,
                     ..
                 }) = protocol::decode_reply(&reply)
                 {
-                    match loads.on_page(req_id, entries, cursor, AT) {
+                    // The page's OWN head, as the session passes it: that is
+                    // the root a completed load records (sdk#142).
+                    match loads.on_page(req_id, entries, cursor, at) {
                         craftworks_sdk::loads::Page::More { lo, hi, after } => {
                             pending = Some(Loads::range_request(req_id, &lo, &hi, Some(after)));
                         }
-                        craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
+                        craftworks_sdk::loads::Page::Complete { lo, hi, rows, at } => {
                             if std::env::var("DIAG").is_ok() {
                                 println!("    load complete: {} row(s)", rows.len());
                             }
                             self.store.on_page(&lo, &hi, rows, [0u8; 32]);
+                            done = Some((lo, hi, at.root));
                         }
                         // The tree moved under this load: ask again from
                         // the top of the range.
@@ -133,6 +175,7 @@ impl Client {
                 }
             }
         }
+        done
     }
 
     /// How many rows this client can SEE in the domain.
@@ -179,8 +222,16 @@ impl Client {
                     cursor,
                     new_root,
                     ..
-                }) => self.answer(r.on_delta(req_id, changes, cursor, new_root)),
-                Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => self.answer(r.on_full_reload(req_id)),
+                }) => {
+                    self.deltas += 1;
+                    let a = r.on_delta(req_id, changes, cursor, new_root);
+                    self.answer(r, a)
+                }
+                Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => {
+                    self.refused += 1;
+                    let a = r.on_full_reload(req_id);
+                    self.answer(r, a)
+                }
                 _ => {}
             }
         }
@@ -189,7 +240,7 @@ impl Client {
 
     /// Do what `Refresh` decided, as the session does: apply a delta, or
     /// forget the range and load it again — INSTEAD, never after.
-    fn answer(&mut self, a: Answer) {
+    fn answer(&mut self, r: &mut Refresh, a: Answer) {
         match a {
             Answer::Delta { changes, new_root, .. } => {
                 self.store.on_delta(changes, new_root);
@@ -197,7 +248,7 @@ impl Client {
             Answer::Reload { .. } => {
                 self.reloads += 1;
                 self.store.copy.forget(&range().0, &range().1);
-                self.load();
+                self.load_into(r);
             }
             Answer::NotOurs => {}
         }
@@ -445,19 +496,6 @@ fn an_answer_nobody_asked_for_is_counted_and_not_applied() {
 
 // ---- a CURSORED delta is not a complete one (craftworks-sdk#140) -------------
 
-/// The root the engine is answering reads AT, now: the `at` of a page.
-fn root_now(c: &mut Client) -> [u8; 32] {
-    c.store
-        .client
-        .send(&Loads::range_request(9_000_000, &range().0, &range().1, None));
-    for reply in c.pump() {
-        if let Ok(protocol::Reply::Page { at, .. }) = protocol::decode_reply(&reply) {
-            return at.root;
-        }
-    }
-    panic!("no page came back to say which root the engine stands on");
-}
-
 /// What `ChangesSince` answered.
 struct Asked {
     req_id: u64,
@@ -466,31 +504,27 @@ struct Asked {
     new_root: [u8; 32],
 }
 
-/// B loaded `note` at a root; A then wrote `n` rows; B asks what changed FROM
-/// that root.
+/// B loaded `note` — which records the root it was loaded at (sdk#142) — A
+/// then wrote `n` rows, and B asks what changed.
 ///
-/// **SEEDED.** `Refresh` records a root only on a delta, and gets a delta only
-/// from a recorded root (sdk#142), so on its own it never asks from anything
-/// but zero and never receives a `Delta` at all — which is how this defect
-/// hid. The seeding here is at the wire: the question `Refresh` asked, sent
-/// from the root B loaded at, answered under `Refresh`'s own req_id.
+/// Before sdk#142 this had to be SEEDED at the wire: `Refresh` recorded a
+/// root only on a delta and got a delta only from a recorded root, so it
+/// never received one at all, which is how sdk#140 hid. Now the completed
+/// load seeds it, as the session does.
 fn changed_since_load(n: u32) -> (Client, Refresh, Asked) {
     let node = testkit::FullNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn);
     a.write(&key(0), b"before");
-    b.load();
-    let from = root_now(&mut b);
+    let mut r = Refresh::new();
+    b.load_into(&mut r);
+    assert!(r.seen("note").is_some(), "the completed load recorded no root");
     for i in 1..=n {
         a.write(&key(i), b"row");
     }
-    let mut r = Refresh::new();
-    let Some(protocol::Request::ChangesSince { req_id, lo, hi, max_entries, .. }) = r.ask("note", &range().0, &range().1)
-    else {
-        panic!("Refresh asked nothing");
-    };
-    b.store.client.send(&protocol::Request::ChangesSince { req_id, from, lo, hi, max_entries });
+    let req = r.ask("note", &range().0, &range().1).expect("Refresh asked nothing");
+    b.store.client.send(&req);
     let asked = b
         .pump()
         .iter()
@@ -520,7 +554,7 @@ fn a_cursored_delta_reloads_the_domain_instead_of_standing_on_page_one() {
     // new one: not `Refresh`, and not the copy.
     assert_eq!(r.seen("note"), None, "seen advanced on a partial page");
     assert_ne!(b.store.copy.root(), Some(d.new_root), "the copy recorded a root it is not at");
-    b.answer(answer);
+    b.answer(&mut r, answer);
     assert_eq!(b.rows(), 301, "after the reload the copy equals the tree");
     assert_eq!(r.take_changed(), vec!["note".to_string()], "and the domain is reported as moved");
 }
@@ -536,7 +570,7 @@ fn control_a_delta_under_a_page_is_applied_and_reloads_nothing() {
     let new_root = d.new_root;
     let answer = r.on_delta(d.req_id, d.changes, d.cursor, d.new_root);
     assert!(matches!(answer, Answer::Delta { .. }), "{answer:?}");
-    b.answer(answer);
+    b.answer(&mut r, answer);
     assert_eq!(b.reloads, 0, "a delta that fit in a page was answered with a reload");
     assert_eq!(r.seen("note"), Some(new_root), "and seen advanced exactly to it");
     assert_eq!(b.rows(), 201);
@@ -550,7 +584,7 @@ fn a_delta_of_exactly_one_page_is_complete_when_the_engine_says_so() {
     assert_eq!(d.changes.len(), 256);
     let complete = d.cursor.is_none();
     let answer = r.on_delta(d.req_id, d.changes, d.cursor, d.new_root);
-    b.answer(answer);
+    b.answer(&mut r, answer);
     println!("  256 changes: cursor {}, reloads {}", if complete { "None" } else { "Some" }, b.reloads);
     assert_eq!(b.reloads, if complete { 0 } else { 1 }, "the answer follows the cursor, and only the cursor");
     assert_eq!(b.rows(), 257);
@@ -563,4 +597,113 @@ fn a_delta_of_exactly_one_page_is_complete_when_the_engine_says_so() {
     let page: Vec<_> = (0..256).map(|i| (key(i), Some(b"v".to_vec()))).collect();
     assert!(matches!(r.on_delta(req_id, page, None, [3u8; 32]), Answer::Delta { .. }), "256 is not taken to mean more");
     assert_eq!(r.seen("note"), Some([3u8; 32]));
+}
+
+// ---- the delta path RUNS (craftworks-sdk#142) ---------------------------------
+
+const ZERO: [u8; 32] = [0u8; 32];
+
+/// Two tabs; `rows` rows written by A; B loaded the domain (seeding `seen`
+/// only if `seed`); A then changes one row; B is asked to refresh.
+fn one_change(rows: u32, seed: bool) -> (Client, Refresh, testkit::Conn, usize, usize) {
+    let node = testkit::FullNode::new();
+    let conn = node.connect();
+    let mut a = Client::tab(conn.clone());
+    let mut b = Client::tab(conn.clone());
+    a.write_many((0..rows).map(key), b"v1");
+    let mut r = Refresh::new();
+    if seed { b.load_into(&mut r) } else { b.load() }
+    assert_eq!(b.rows(), rows as usize, "the domain was set up");
+    a.write(&key(0), b"v2");
+    let gets = conn.served(testkit::full_node::Served::Get);
+    let zero = conn.fetches_of(&ZERO);
+    b.received = 0;
+    let _ = b.refresh(&mut r);
+    (b, r, conn, gets, zero)
+}
+
+/// **After one completed load, the next refresh is answered by a DELTA.**
+///
+/// RED before this change: `seen` was never set, the question went out from
+/// the zero root, and the answer was `FullReloadRequired` — every time.
+#[test]
+fn after_a_completed_load_the_next_refresh_is_a_delta() {
+    let (mut b, r, conn, _, zero_before) = one_change(3, true);
+    assert_eq!((b.deltas, b.refused), (1, 0), "the reply TYPE: a Delta, and no refusal");
+    assert_eq!(b.reloads, 0, "and nothing was reloaded");
+    assert_eq!(conn.fetches_of(&ZERO) - zero_before, 0, "no fetch of the block that cannot exist");
+    assert_eq!(b.rows(), 3);
+    assert!(r.seen("note").is_some());
+}
+
+/// THE CONTROL, and the old behaviour: a load that records no root makes
+/// the question go out from zero, refused after fetches of block `00…0`.
+#[test]
+fn control_with_no_recorded_root_the_engine_refuses_and_the_domain_reloads() {
+    let (b, _, conn, _, zero_before) = one_change(3, false);
+    assert_eq!((b.deltas, b.refused, b.reloads), (0, 1, 1));
+    println!("  fetches of block 00…0 for one refresh from zero: {}", conn.fetches_of(&ZERO) - zero_before);
+    assert!(conn.fetches_of(&ZERO) > zero_before, "the doomed fetches this change removes");
+}
+
+/// A root the engine genuinely cannot reach still falls back to a reload —
+/// the fix did not turn the fallback into a hang.
+#[test]
+fn an_unobtainable_old_root_still_falls_back_to_a_full_reload() {
+    let node = testkit::FullNode::new();
+    let conn = node.connect();
+    let mut a = Client::tab(conn.clone());
+    let mut b = Client::tab(conn);
+    a.write(&key(0), b"v1");
+    let mut r = Refresh::new();
+    b.load_into(&mut r);
+    r.on_loaded("note", [9u8; 32]);   // a root no block exists for
+    a.write(&key(1), b"v1");
+    let _ = b.refresh(&mut r);
+    assert_eq!((b.refused, b.reloads), (1, 1));
+    assert_eq!(b.rows(), 2);
+    assert_ne!(r.seen("note"), Some([9u8; 32]), "the unreachable root is not kept as a starting point");
+    assert!(r.seen("note").is_some(), "and the reload recorded the root it was read at");
+}
+
+/// **The cost, as a number**: what ONE change notification over a
+/// 1,000-record domain costs the tab, from zero (before) and from the loaded
+/// root (after).
+#[test]
+fn a_change_notification_over_a_thousand_rows_costs_a_delta_not_a_reload() {
+    let (old, _, before_conn, before_gets, _) = one_change(1000, false);
+    let before = before_conn.served(testkit::full_node::Served::Get) - before_gets;
+    let (new, _, after_conn, after_gets, _) = one_change(1000, true);
+    let after = after_conn.served(testkit::full_node::Served::Get) - after_gets;
+    println!("  per change notification, 1,000 rows: blocks fetched {before} -> {after}; entries handed to the tab {} -> {}", old.received, new.received);
+    assert_eq!(new.deltas, 1);
+    assert_eq!(old.received, 1000, "before: the whole domain, again");
+    assert_eq!(new.received, 1, "after: the one change");
+    assert!(after < before, "and no doomed fetch: {after} vs {before}");
+}
+
+/// A copy brought up to date BY DELTA and one brought up by a FULL RELOAD
+/// hold equal rows — byte for byte, which is what the JS `sameRows` compares.
+#[test]
+fn a_delta_applied_copy_and_a_full_reload_hold_equal_rows() {
+    use craftworks_sdk::store::Reads;
+    let node = testkit::FullNode::new();
+    let conn = node.connect();
+    let mut a = Client::tab(conn.clone());
+    let mut b = Client::tab(conn.clone());
+    a.write_many((0..10).map(key), b"v1");
+    let mut r = Refresh::new();
+    b.load_into(&mut r);
+    a.write(&key(3), b"v2");
+    a.store.delete(&key(4));
+    a.pump();
+    a.write(&key(20), b"new");
+    let _ = b.refresh(&mut r);
+    assert_eq!(b.deltas, 1, "B came up to date by delta");
+    let mut c = Client::tab(conn);
+    c.load();
+    let by_delta = b.store.scan(&range().0, &range().1, false, usize::MAX).unwrap();
+    let by_reload = c.store.scan(&range().0, &range().1, false, usize::MAX).unwrap();
+    assert_eq!(by_delta, by_reload);
+    assert_eq!(by_delta.len(), 10);
 }

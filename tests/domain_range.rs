@@ -55,3 +55,21 @@ fn a_domain_is_not_swallowed_by_one_whose_name_extends_it() {
         "records of `tasks` fall inside the range of `task`"
     );
 }
+
+/// `domain_of_range` is the inverse, and ONLY of a whole domain's range: a
+/// completed load of anything narrower or wider must not be taken for the
+/// domain, or `Refresh` would ask for deltas from a root the copy only partly
+/// holds (sdk#142).
+#[test]
+fn domain_of_range_names_a_domain_only_for_its_whole_range() {
+    let (lo, hi) = D::domain_range("tasks");
+    assert_eq!(D::domain_of_range(&lo, &hi).as_deref(), Some("tasks"));
+    let key = craftworks_sdk::db::record_key("tasks", [1u8; 16]);
+    let mut after = key.clone();
+    after.push(0);
+    assert_eq!(D::domain_of_range(&key, &after), None, "one record's span is not the domain");
+    assert_eq!(D::domain_of_range(&lo, &after), None, "nor is a prefix of it");
+    assert_eq!(D::domain_of_range(b"", &[0xFF; 8]), None, "nor everything");
+    let (task_lo, _) = D::domain_range("task");
+    assert_eq!(D::domain_of_range(&task_lo, &hi), None, "nor a span straddling two domains");
+}

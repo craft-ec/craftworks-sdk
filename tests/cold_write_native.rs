@@ -106,7 +106,7 @@ impl Page {
                     Some(after),
                 ));
             }
-            craftworks_sdk::loads::Page::Complete { lo, hi, rows } => {
+            craftworks_sdk::loads::Page::Complete { lo, hi, rows, .. } => {
                 self.db.store_mut().on_page(&lo, &hi, rows, [0u8; 32]);
             }
             craftworks_sdk::loads::Page::Restart { lo, hi } => {
