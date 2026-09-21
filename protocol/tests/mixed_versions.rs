@@ -168,7 +168,9 @@ fn every_state_newer_than_v2_is_refused_by_a_v2_decoder_not_misread() {
 
 #[test]
 fn an_older_client_is_told_what_it_can_read_and_a_v3_client_the_state_itself() {
-    for state in protocol::WriteState::NEWER_THAN_V2 {
+    // The order rule's verdicts are never sent below v5 — their downgrade is a
+    // debug assertion, tested on its own in tests/v5.rs.
+    for state in protocol::WriteState::NEWER_THAN_V2.iter().filter(|s| !protocol::WriteState::ORDER_RULE.contains(s)) {
         assert!(
             state.since() > 2,
             "{state:?} is listed as newer than v2 but says since {}",

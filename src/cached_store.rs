@@ -284,6 +284,18 @@ impl CachedStore {
             }
             // Still in flight, and said so rather than silently.
             W::Stalled => {}
+            // The order rule's verdicts (v5). This client speaks v4 and the
+            // engine never tells a pre-v5 client either one; the client that
+            // handles them is build step 3. Until then, the TRUE v4 reading:
+            // nothing applied and may go again (as `Busy`); already taken, its
+            // end still to come (as `Stalled`).
+            W::OutOfOrder { .. } => {
+                debug_assert!(false, "the order rule is v5-only: a v4 client must never be told this");
+                self.copy.queued(write_id)
+            }
+            W::Duplicate => {
+                debug_assert!(false, "the order rule is v5-only: a v4 client must never be told this");
+            }
         }
     }
 

@@ -452,6 +452,13 @@ impl Client {
             // closed reason until craftworks-instrument names it. The REPLY
             // names it exactly (`Dropped::BadSession`).
             Dropped::BadSession => DropReason::Unparseable,
+            // v5's refusals (WRITE-PATH rev 3), likewise not yet in the
+            // instrument's vocabulary; the reply names each exactly.
+            Dropped::BadFrame
+            | Dropped::WrongWriteShape
+            | Dropped::NestedAck
+            | Dropped::NeedsV5Envelope
+            | Dropped::AckSessionMismatch => DropReason::Unparseable,
         };
         rec.event(Event::Counter {
             site: DROP,

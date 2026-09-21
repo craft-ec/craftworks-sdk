@@ -31,12 +31,26 @@ pub enum Served {
     Answer(Reply),
 }
 
+/// The versions this ENGINE serves: what the protocol knows, up to what it
+/// speaks. v5 is decodable (the write path's wire, craftworks-sdk#183) before
+/// the engine implements it (build step 2); until then a v5 frame is answered
+/// exactly as it was before v5 was known — `Unsupported`, naming these.
+fn served() -> Vec<u16> {
+    protocol::KNOWN.iter().copied().filter(|v| *v <= protocol::CURRENT).collect()
+}
+
 pub fn serve(bytes: &[u8]) -> Served {
     match protocol::decode_request(bytes) {
+        // A version the protocol knows and this engine does not yet serve —
+        // `WriteFrom` included. Answered by name, never acted on half-way.
+        Incoming::Ok(env) if env.version > protocol::CURRENT => Served::Answer(Reply::Unsupported {
+            got: env.version,
+            known: served(),
+        }),
         Incoming::Ok(env) => Served::Do(env.body, env.version, env.session),
         Incoming::Unsupported(got) => Served::Answer(Reply::Unsupported {
             got,
-            known: protocol::KNOWN.to_vec(),
+            known: served(),
         }),
         Incoming::Dropped(reason) => Served::Answer(Reply::Dropped { reason }),
     }

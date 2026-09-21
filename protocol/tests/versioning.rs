@@ -16,6 +16,8 @@ fn an_unknown_version_is_answered_unsupported_and_a_known_one_is_not() {
         Incoming::Ok(Envelope {
             version: CURRENT,
             session,
+            now_ms: None,
+            frame: None,
             body: Request::Flush
         }),
         "a message at the current version was not understood, so nothing \

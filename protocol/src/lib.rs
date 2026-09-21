@@ -32,7 +32,7 @@ pub mod session;
 ///
 /// A list, not a number: "the current version" is what a protocol says right
 /// before it drops an old client. Serving several is the normal state.
-pub const KNOWN: &[u16] = &[1, 2, 3, 4];
+pub const KNOWN: &[u16] = &[1, 2, 3, 4, 5];
 
 /// The version this build SPEAKS when it starts a conversation.
 ///
@@ -66,7 +66,20 @@ pub const KNOWN: &[u16] = &[1, 2, 3, 4];
 /// be overwritten by the next tab's; it rides on each frame instead. A v4
 /// client is told its writes' states with the session named, so a tab can
 /// drop a state for somebody else's write.
+///
+/// v5 is the WRITE PATH's wire (WRITE-PATH.md revision 3, craftworks-sdk#183).
+/// Its envelope carries the client's `now` (wall-clock ms) and a per-session
+/// FRAME sequence on every request; a write carries its session's `floor`
+/// ([`Request::WriteFrom`]); every reply to a v5 client is wrapped with the
+/// session's [`Ack`] ([`Reply::Acked`]); and two verdicts are new —
+/// [`WriteState::Duplicate`] and [`WriteState::OutOfOrder`]. v5 is KNOWN
+/// (decodable) and not yet CURRENT: it becomes current when a client and an
+/// engine both speak it. Types only — no behaviour lives here.
 pub const CURRENT: u16 = 4;
+
+/// The first version whose envelope carries `now` and a frame sequence, whose
+/// write carries a floor, and whose replies carry an [`Ack`].
+pub const FLOOR_SINCE: u16 = 5;
 
 /// The session a message from before v4 is taken to be: the one every client
 /// was, before there were sessions. An old page still works; it is simply
@@ -105,7 +118,34 @@ pub struct Envelope {
     /// Which page load sent it: minted at random by the client, carrying
     /// nothing of the person or of any key.
     pub session: u64,
+    /// The client's wall clock, in ms, when it sent this (v5). `None` means
+    /// THIS VERSION DOES NOT CARRY IT — never "time zero": nothing may read it
+    /// as 0 (`unwrap_or(0)`), or every pre-v5 frame would say it is 1970.
+    pub now_ms: Option<u64>,
+    /// This session's frame sequence: 1, 2, 3… on every request it sends
+    /// (v5), so "my frame was seen" is a fact read off the next [`Ack`].
+    /// `None` means this version does not carry it — never 0, which a v5
+    /// frame may not use.
+    pub frame: Option<u64>,
     pub body: Request,
+}
+
+/// The v4 envelope, as it is on the wire: the version, the session, the body.
+#[derive(Serialize, Deserialize)]
+struct EnvelopeV4 {
+    version: u16,
+    session: u64,
+    body: Request,
+}
+
+/// The v5 envelope, as it is on the wire.
+#[derive(Serialize, Deserialize)]
+struct EnvelopeV5 {
+    version: u16,
+    session: u64,
+    now_ms: u64,
+    frame: u64,
+    body: Request,
 }
 
 /// The envelope before v4: the version, then the body.
@@ -260,6 +300,15 @@ pub enum Request {
         lo: Bound,
         hi: Bound,
         max_entries: u32,
+    },
+    /// A write, with the lowest write id this session still holds un-ended
+    /// (v5 — WRITE-PATH.md "The rule"). The ONLY write shape in a v5 frame:
+    /// a plain [`Request::Write`] there is refused at decode
+    /// ([`Dropped::WrongWriteShape`]), as this one is below v5.
+    WriteFrom {
+        write_id: u64,
+        floor: u64,
+        ops: Vec<Op>,
     },
 }
 
@@ -573,6 +622,51 @@ pub enum Reply {
         write_id: u64,
         state: WriteState,
     },
+    /// A reply to a v5 client, with that session's [`Ack`] (v5). Wraps EVERY
+    /// reply to a v5 client — verdicts, pages, tick answers, call reports —
+    /// and is never sent to an older one. ONE wrapper: a body that is itself
+    /// `Acked` is refused at decode ([`Dropped::NestedAck`]).
+    Acked {
+        ack: Ack,
+        body: Box<Reply>,
+    },
+}
+
+/// What the engine knows about one session's writes, on every reply to it
+/// (v5 — WRITE-PATH.md "The ledger", "The rule"). Cumulative, so a dropped or
+/// misrouted verdict heals on the next reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    /// WHOSE — a reply can reach another session (F49), and a client drops
+    /// an Ack that is not its own, as it drops a foreign `SessionWriteState`.
+    pub session: u64,
+    /// The highest write id of this session whose commit is published. 0 is
+    /// SAFE BY DIRECTION: it claims nothing published, so an engine that does
+    /// not know yet can say 0 and settle nothing falsely.
+    pub published_through: u64,
+    /// The highest write id the engine has TAKEN (it can go backwards: the
+    /// engine forgot). 0 is safe by direction, as above: nothing claimed taken.
+    pub taken_through: u64,
+    /// The TREE's parity, as a stat rather than a per-write verdict the
+    /// platform can misroute: `None` when the engine does not KNOW (so it can
+    /// never read as "0 owed — durable"); `Some` with the groups still owed at
+    /// a head seq.
+    pub parity: Option<Parity>,
+    /// The highest frame sequence of this session the engine has seen — a
+    /// MAXIMUM, not a receipt: it does not say that every lower frame
+    /// arrived, only that none higher has.
+    pub frames_seen: u64,
+    /// The frame that started the call this reply is made in, if a frame of
+    /// THIS session did (a reply produced in another session's call — a tick
+    /// deciding a verdict — answers none of this session's frames).
+    pub answering: Option<u64>,
+}
+
+/// The tree's parity at a head: how many groups are still owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parity {
+    pub owed_groups: u64,
+    pub at_seq: u64,
 }
 
 /// Why a subscriber was told something changed.
@@ -689,6 +783,15 @@ pub enum WriteState {
         limit: u32,
         got: u32,
     },
+    /// This (session, write id) is below the engine's next — already taken
+    /// (v5, rule 1). Nothing applied; the reply's [`Ack`] says whether it
+    /// published.
+    Duplicate,
+    /// Not the write the engine expects next from this session (v5, rule 4).
+    /// Nothing applied; the client re-sends `expected`, at once, whole.
+    OutOfOrder {
+        expected: u64,
+    },
 }
 
 /// Which of the engine's bounds a [`WriteState::TooLarge`] write is over.
@@ -715,7 +818,11 @@ impl WriteState {
     pub fn terminal(self) -> bool {
         matches!(
             self,
-            WriteState::Busy | WriteState::Failed | WriteState::Lost | WriteState::TooLarge { .. }
+            WriteState::Busy
+                | WriteState::Failed
+                | WriteState::Lost
+                | WriteState::TooLarge { .. }
+                | WriteState::OutOfOrder { .. }
         )
     }
 
@@ -727,7 +834,7 @@ impl WriteState {
     /// client's judgement, since another writer may have moved the tree
     /// underneath it.
     pub fn should_resubmit(self) -> bool {
-        matches!(self, WriteState::Busy)
+        matches!(self, WriteState::Busy | WriteState::OutOfOrder { .. })
     }
 
     /// The protocol version that introduced this state. A client that spoke
@@ -746,6 +853,7 @@ impl WriteState {
             | WriteState::Failed
             | WriteState::Lost => 1,
             WriteState::TooLarge { .. } => 3,
+            WriteState::Duplicate | WriteState::OutOfOrder { .. } => FLOOR_SINCE,
         }
     }
 
@@ -753,6 +861,20 @@ impl WriteState {
     /// itself if it can read it, else the older state that means the same to
     /// it. The delegate calls this at the one place write states leave it.
     pub fn for_client(self, version: u16) -> WriteState {
+        // Reaching a pre-v5 client with an order-rule verdict is a BUG, and a
+        // debug build says so here, at the call. The VALUE it is told is
+        // `mapped_down`, which is pure and tested in every profile: a
+        // delegate is a release build, and there the value is what ships.
+        debug_assert!(
+            version >= FLOOR_SINCE || !matches!(self, WriteState::Duplicate | WriteState::OutOfOrder { .. }),
+            "the order rule is v5-only: a pre-v5 client must never be told this"
+        );
+        self.mapped_down(version)
+    }
+
+    /// What a client of `version` is told for this state — the pure mapping,
+    /// with no assertion, so it is tested in debug and release alike.
+    pub fn mapped_down(self, version: u16) -> WriteState {
         if version >= self.since() {
             return self;
         }
@@ -760,6 +882,14 @@ impl WriteState {
             // Not in the tree, and sending it again is refused again —
             // exactly what `Failed` already tells an older client.
             WriteState::TooLarge { .. } => WriteState::Failed,
+            // The order rule's verdicts exist only on v5, whose writes carry a
+            // floor; a pre-v5 client never meets them. If one ever did, it is
+            // told the TRUE v4 equivalent — never `Failed`, which would roll
+            // back a write the engine may have applied (a false rollback).
+            // Nothing applied, may be sent again: exactly `Busy`.
+            WriteState::OutOfOrder { .. } => WriteState::Busy,
+            // Non-terminal, claims nothing false: `Stalled`.
+            WriteState::Duplicate => WriteState::Stalled,
             other => other,
         }
     }
@@ -778,11 +908,19 @@ impl WriteState {
 
     /// Every state newer than v2, one example each — what the version tests
     /// iterate, so a new state is covered by adding it here.
-    pub const NEWER_THAN_V2: &'static [WriteState] = &[WriteState::TooLarge {
-        bound: WriteBound::CommitBlocks,
-        limit: 128,
-        got: 129,
-    }];
+    pub const NEWER_THAN_V2: &'static [WriteState] = &[
+        WriteState::TooLarge {
+            bound: WriteBound::CommitBlocks,
+            limit: 128,
+            got: 129,
+        },
+        WriteState::Duplicate,
+        WriteState::OutOfOrder { expected: 7 },
+    ];
+
+    /// The order rule's verdicts (v5): never sent below v5, so their
+    /// downgrade is a debug assertion, not a path.
+    pub const ORDER_RULE: &'static [WriteState] = &[WriteState::Duplicate, WriteState::OutOfOrder { expected: 7 }];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -803,6 +941,21 @@ pub enum Dropped {
     /// Refused by name rather than truncated: a truncated session is told
     /// its verdicts under a number it does not hold, and drops them all.
     BadSession,
+    /// A v5 frame whose frame sequence is 0: sequences start at 1, as
+    /// sessions are never 0.
+    BadFrame,
+    /// A write in the wrong shape for its version: a plain `Write` in a v5
+    /// frame (which must say its floor), or a `WriteFrom` below v5. One write
+    /// shape per version.
+    WrongWriteShape,
+    /// An `Acked` reply whose body is itself `Acked`: one wrapper, never two.
+    NestedAck,
+    /// A v5 frame asked of an encoder that cannot write `now` and a frame
+    /// sequence (`encode_session_request`); use `encode_v5_request`.
+    NeedsV5Envelope,
+    /// An `Acked` reply whose `ack.session` is not the session its body names:
+    /// one reply is about one session.
+    AckSessionMismatch,
 }
 
 /// The largest message this build will decode.
@@ -842,16 +995,34 @@ pub fn encode_request(version: u16, body: &Request) -> Result<Vec<u8>, Dropped> 
 
 /// Encode a client's message from `session`. Before v4 the session is not
 /// on the wire and a reader takes it to be [`LEGACY_SESSION`].
+///
+/// At most v4: a v5 frame also carries `now` and a frame sequence, so asking
+/// for v5 here is REFUSED by name ([`Dropped::NeedsV5Envelope`]) — never
+/// clamped: a clamp would, the day `CURRENT` becomes 5, keep every caller
+/// sending v4 without a word.
 pub fn encode_session_request(version: u16, session: u64, body: &Request) -> Result<Vec<u8>, Dropped> {
     use bincode::Options;
+    if version >= FLOOR_SINCE {
+        return Err(Dropped::NeedsV5Envelope);
+    }
     // An invalid session on a v4 frame ENCODES (so a test can send one) and
     // is refused at DECODE, which is where it has to be enforced anyway.
     if version >= SESSION_SINCE {
-        opts().serialize(&Envelope { version, session, body: body.clone() })
+        opts().serialize(&EnvelopeV4 { version, session, body: body.clone() })
     } else {
         opts().serialize(&LegacyEnvelope { version, body: body.clone() })
     }
     .map_err(|e| classify(&e))
+}
+
+/// Encode a v5 frame: the session, the client's wall clock in ms, and this
+/// session's next frame sequence. Like the session, a bad frame (0) ENCODES
+/// and is refused at decode.
+pub fn encode_v5_request(session: u64, now_ms: u64, frame: u64, body: &Request) -> Result<Vec<u8>, Dropped> {
+    use bincode::Options;
+    opts()
+        .serialize(&EnvelopeV5 { version: FLOOR_SINCE, session, now_ms, frame, body: body.clone() })
+        .map_err(|e| classify(&e))
 }
 
 /// Encode a reply — or say why it cannot be sent. See [`encode_request`].
@@ -866,8 +1037,10 @@ pub fn encode_reply(r: &Reply) -> Result<Vec<u8>, Dropped> {
 pub fn request_len(version: u16, body: &Request) -> u64 {
     use bincode::Options;
     let o = bincode::DefaultOptions::new().with_fixint_encoding();
-    if version >= SESSION_SINCE {
-        o.serialized_size(&Envelope { version, session: LEGACY_SESSION, body: body.clone() })
+    if version >= FLOOR_SINCE {
+        o.serialized_size(&EnvelopeV5 { version, session: LEGACY_SESSION, now_ms: 0, frame: 0, body: body.clone() })
+    } else if version >= SESSION_SINCE {
+        o.serialized_size(&EnvelopeV4 { version, session: LEGACY_SESSION, body: body.clone() })
     } else {
         o.serialized_size(&LegacyEnvelope { version, body: body.clone() })
     }
@@ -904,17 +1077,29 @@ pub fn decode_request(bytes: &[u8]) -> Incoming {
     if !KNOWN.contains(&version) {
         return Incoming::Unsupported(version);
     }
-    let decoded = if version >= SESSION_SINCE {
-        match opts().deserialize::<Envelope>(bytes) {
+    let decoded = if version >= FLOOR_SINCE {
+        match opts().deserialize::<EnvelopeV5>(bytes) {
             Ok(e) if !session_is_valid(e.session) => return Incoming::Dropped(Dropped::BadSession),
-            other => other,
+            Ok(e) if e.frame == 0 => return Incoming::Dropped(Dropped::BadFrame),
+            Ok(e) => Ok(Envelope { version: e.version, session: e.session, now_ms: Some(e.now_ms), frame: Some(e.frame), body: e.body }),
+            Err(e) => Err(e),
+        }
+    } else if version >= SESSION_SINCE {
+        match opts().deserialize::<EnvelopeV4>(bytes) {
+            Ok(e) if !session_is_valid(e.session) => return Incoming::Dropped(Dropped::BadSession),
+            Ok(e) => Ok(Envelope { version: e.version, session: e.session, now_ms: None, frame: None, body: e.body }),
+            Err(e) => Err(e),
         }
     } else {
         opts()
             .deserialize::<LegacyEnvelope>(bytes)
-            .map(|e| Envelope { version: e.version, session: LEGACY_SESSION, body: e.body })
+            .map(|e| Envelope { version: e.version, session: LEGACY_SESSION, now_ms: None, frame: None, body: e.body })
     };
     match decoded {
+        // ONE write shape per version: a v5 write says its floor, and a
+        // floor means nothing below v5.
+        Ok(e) if matches!(e.body, Request::Write { .. }) && e.version >= FLOOR_SINCE => Incoming::Dropped(Dropped::WrongWriteShape),
+        Ok(e) if matches!(e.body, Request::WriteFrom { .. }) && e.version < FLOOR_SINCE => Incoming::Dropped(Dropped::WrongWriteShape),
         Ok(e) => Incoming::Ok(e),
         Err(e) => Incoming::Dropped(classify(&e)),
     }
@@ -925,7 +1110,17 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Reply, Dropped> {
     if bytes.len() > MAX_MESSAGE {
         return Err(Dropped::TooLarge);
     }
-    opts().deserialize::<Reply>(bytes).map_err(|e| classify(&e))
+    match opts().deserialize::<Reply>(bytes) {
+        // One wrapper, never two.
+        Ok(Reply::Acked { body, .. }) if matches!(*body, Reply::Acked { .. }) => Err(Dropped::NestedAck),
+        // One reply is about one session: an Ack for A around B's verdict is
+        // refused rather than half-applied.
+        Ok(Reply::Acked { ack, body }) if matches!(*body, Reply::SessionWriteState { session, .. } if session != ack.session) => {
+            Err(Dropped::AckSessionMismatch)
+        }
+        Ok(r) => Ok(r),
+        Err(e) => Err(classify(&e)),
+    }
 }
 
 fn classify(e: &bincode::Error) -> Dropped {
