@@ -34,7 +34,7 @@ fn states(out: &[Vec<u8>]) -> Vec<WriteState> {
     out.iter()
         .filter_map(|b| protocol::decode_reply(b).ok())
         .filter_map(|r| match r {
-            Reply::WriteState { state, .. } => Some(state),
+            Reply::WriteState { state, .. } | Reply::SessionWriteState { state, .. } => Some(state),
             _ => None,
         })
         .collect()
@@ -952,4 +952,128 @@ fn identity_names_the_head_contract_when_there_is_one() {
          its own head and every tab that made no write must poll"
     );
     assert!(writable);
+}
+
+/// What the node does with a call's ops: each answered, in order.
+fn answer(node: &Store, ops: Vec<engine_delegate::schedule::Op>) -> Vec<Inbound> {
+    use engine_delegate::schedule::Op;
+    ops.into_iter()
+        .map(|op| match op {
+            Op::Put { id, bytes } => {
+                node.put(id, &bytes);
+                Inbound::PutAcked { id, ok: true }
+            }
+            Op::Get { id, .. } => Inbound::GotState {
+                id,
+                bytes: node.get(&id).map(|b| b.to_vec()),
+            },
+            Op::Head { seq, root } => Inbound::GotHead { seq, root },
+            Op::ReadHead { .. } => Inbound::NoHead,
+        })
+        .collect()
+}
+
+/// **A write's verdict is told in ITS client's version — whoever else speaks
+/// while it is parked** (sdk#146; the architect's probe on sdk#157).
+///
+/// The write parks on a cold path and is refused once the path arrives — a
+/// call the NODE made, with no client in it. Two tabs mid-upgrade share the
+/// delegate, and the other one speaks (a `Tick`) while the write is parked.
+/// One version per shell was overwritten by whoever spoke last: a v4 writer
+/// with a v2 bystander was told `Failed`, and a v2 writer with a v4 bystander
+/// was sent `TooLarge`, which a v2 client must never be sent. The version now
+/// travels with the write, in its client id.
+///
+/// The shell is rebuilt from its context before every call and the node
+/// answers one op per call, the real shape. The GET limit is lifted: the
+/// path's GETs are the read overflow, sdk#150's own defect.
+#[test]
+fn a_write_refused_after_a_park_is_told_in_its_clients_version_whoever_else_speaks() {
+    let node = Store::default();
+    let mut ctx: Vec<u8> = Vec::new();
+    let mut inbound = vec![Inbound::Client(
+        protocol::encode_request(protocol::CURRENT, &Request::Write {
+            write_id: 1,
+            ops: (0..400u32).map(|i| protocol::Op::Put(format!("h/{i:04}").into_bytes(), vec![i as u8; 200])).collect(),
+        })
+        .expect("encodes"),
+    )];
+    let mut published = false;
+    for _ in 0..200 {
+        let mut s: Shell<Store> = Shell::resume_with(&ctx, Params::default(), node.clone(), StoreFacts::provisioned());
+        let out = s.handle(std::mem::take(&mut inbound));
+        ctx = s.to_context().expect("a context");
+        published |= states(&out.replies).contains(&WriteState::Published);
+        inbound = answer(&node, out.ops);
+        if inbound.is_empty() {
+            break;
+        }
+    }
+    assert!(published, "the history never published");
+
+    const WRITER: u64 = 0x0000_1111_2222_3333;
+    const BYSTANDER: u64 = 0x0000_4444_5555_6666;
+    // (the writer's verdicts, GETs made, whether the bystander spoke while parked)
+    let run = |writer: u16, bystander: Option<u16>| -> (Vec<WriteState>, usize, bool) {
+        let cold = Store::default();
+        let params = Params { max_commit_blocks: 4, ..Params::default() };
+        let mut ctx = ctx.clone();
+        let mut queue: std::collections::VecDeque<Inbound> = std::collections::VecDeque::from([Inbound::Client(
+            protocol::encode_session_request(writer, WRITER, &Request::Write {
+                write_id: 2,
+                ops: (0..40u32)
+                    .map(|i| {
+                        let mut v = vec![0u8; 1024];
+                        v[..4].copy_from_slice(&i.to_le_bytes());
+                        protocol::Op::Put(format!("h/{:04}x", i * 10).into_bytes(), v)
+                    })
+                    .collect(),
+            })
+            .expect("encodes"),
+        )]);
+        let (mut told, mut gets, mut spoke, mut calls) = (Vec::new(), 0, false, 0);
+        for _ in 0..400 {
+            let Some(one) = queue.pop_front() else { break };
+            if let Inbound::GotState { id, bytes: Some(b) } = &one {
+                cold.put(*id, b);
+            }
+            let mut s: Shell<Store> = Shell::resume_with(&ctx, params, cold.clone(), StoreFacts::provisioned());
+            s.limits.max_gets = 1000;
+            let out = s.handle(vec![one]);
+            ctx = s.to_context().expect("a context");
+            gets += out.ops.iter().filter(|o| matches!(o, engine_delegate::schedule::Op::Get { .. })).count();
+            told.extend(states(&out.replies));
+            queue.extend(answer(&node, out.ops));
+            calls += 1;
+            // The other tab speaks ONCE, in a call of its own, while the write is parked.
+            if let (Some(v), false, true) = (bystander, spoke, calls == 1 && gets > 0) {
+                spoke = true;
+                let mut s: Shell<Store> = Shell::resume_with(&ctx, params, cold.clone(), StoreFacts::provisioned());
+                s.limits.max_gets = 1000;
+                let out = s.handle(vec![Inbound::Client(
+                    protocol::encode_session_request(v, BYSTANDER, &Request::Tick { now: 1_790_000_000 }).expect("encodes"),
+                )]);
+                ctx = s.to_context().expect("a context");
+                told.extend(states(&out.replies));
+                queue.extend(answer(&node, out.ops));
+            }
+        }
+        (told, gets, spoke)
+    };
+
+    let c = protocol::CURRENT;
+    // row: (writer, bystander) -> the writer's last verdict
+    for (row, (writer, bystander)) in [(c, None), (c, Some(2u16)), (2u16, None), (2u16, Some(c))].into_iter().enumerate() {
+        let (told, gets, spoke) = run(writer, bystander);
+        println!("  row {}: writer v{writer}, bystander {bystander:?} (spoke while parked: {spoke}; {gets} GETs) -> {:?}", row + 1, told.last());
+        assert!(gets > 0, "row {}: the write never parked, so this tests nothing", row + 1);
+        assert_eq!(spoke, bystander.is_some(), "row {}: the bystander did not speak while the write was parked", row + 1);
+        if writer >= 3 {
+            assert!(matches!(told.last(), Some(WriteState::TooLarge { .. })),
+                "row {}: a v{writer} writer, refused after a park, was told {told:?}", row + 1);
+        } else {
+            assert_eq!(told.last(), Some(&WriteState::Failed),
+                "row {}: a v{writer} writer must be told Failed, never a state it cannot read: {told:?}", row + 1);
+        }
+    }
 }

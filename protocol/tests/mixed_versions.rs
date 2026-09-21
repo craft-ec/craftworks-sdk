@@ -74,7 +74,8 @@ fn every_older_reply_still_decodes_to_itself() {
 fn a_v1_request_is_still_understood_after_the_bump() {
     assert!(protocol::KNOWN.contains(&1), "v1 must remain served");
     assert!(protocol::KNOWN.contains(&2), "v2 must remain served");
-    assert_eq!(protocol::CURRENT, 3);
+    assert!(protocol::KNOWN.contains(&3), "v3 must remain served");
+    assert_eq!(protocol::CURRENT, 4);
 
     let v1 = encode_request(1, &Request::Flush).expect("encodes");
     match decode_request(&v1) {
@@ -237,7 +238,9 @@ fn a_request_over_the_limit_is_an_error_not_an_empty_frame() {
         write_id: 1,
         ops: vec![protocol::Op::Put(b"k".to_vec(), vec![0u8; 10])],
     };
-    let bytes = encode_request(protocol::CURRENT, &small).expect("fits");
+    // At CURRENT a frame carries a session (sdk#146): the length is of the
+    // frame a client WITH one sends.
+    let bytes = protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(7), &small).expect("fits");
     assert_eq!(
         bytes.len() as u64,
         protocol::request_len(protocol::CURRENT, &small)

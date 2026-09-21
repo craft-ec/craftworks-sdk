@@ -22,14 +22,18 @@ pub enum Served {
     /// message?" can only be answered from what the client said on the way in.
     /// Dropping it here is what would make a v2-only message reach a v1
     /// reader.
-    Do(Request, u16),
+    ///
+    /// And the SESSION that sent it (v4; [`protocol::LEGACY_SESSION`] before):
+    /// every tab shares this delegate, so the frame is the only place that
+    /// says whose it is (craftworks-sdk#146).
+    Do(Request, u16, u64),
     /// Answer with this and do nothing else.
     Answer(Reply),
 }
 
 pub fn serve(bytes: &[u8]) -> Served {
     match protocol::decode_request(bytes) {
-        Incoming::Ok(env) => Served::Do(env.body, env.version),
+        Incoming::Ok(env) => Served::Do(env.body, env.version, env.session),
         Incoming::Unsupported(got) => Served::Answer(Reply::Unsupported {
             got,
             known: protocol::KNOWN.to_vec(),

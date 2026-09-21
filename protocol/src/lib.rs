@@ -32,7 +32,7 @@ pub mod session;
 ///
 /// A list, not a number: "the current version" is what a protocol says right
 /// before it drops an old client. Serving several is the normal state.
-pub const KNOWN: &[u16] = &[1, 2, 3];
+pub const KNOWN: &[u16] = &[1, 2, 3, 4];
 
 /// The version this build SPEAKS when it starts a conversation.
 ///
@@ -57,14 +57,62 @@ pub const KNOWN: &[u16] = &[1, 2, 3];
 /// client that spoke v3; an older one is told [`WriteState::Failed`], which
 /// means the same thing to it (not in the tree; sending it again is refused
 /// again) without a reason it could not read.
-pub const CURRENT: u16 = 3;
+///
+/// v4 puts the SESSION on every request and adds [`Reply::SessionWriteState`]
+/// (craftworks-sdk#146). Every tab and page load was `ClientId(1)` and its
+/// first write `WriteId 1`, so the engine's `(client, write)` keys collided by
+/// default. The delegate receives a bare frame with no connection behind it —
+/// every tab shares one context — so a session said once, on `Identity`, would
+/// be overwritten by the next tab's; it rides on each frame instead. A v4
+/// client is told its writes' states with the session named, so a tab can
+/// drop a state for somebody else's write.
+pub const CURRENT: u16 = 4;
+
+/// The session a message from before v4 is taken to be: the one every client
+/// was, before there were sessions. An old page still works; it is simply
+/// the one session that cannot be told apart from another old page.
+pub const LEGACY_SESSION: u64 = 1;
+
+/// The first version whose envelope carries a session.
+pub const SESSION_SINCE: u16 = 4;
+
+/// How many bits of a session are significant: 48. The delegate keys a
+/// write by `{session, version}` packed into the engine's one 64-bit client
+/// id, so the version rides with the write wherever the write goes — a
+/// parked write, a commit in flight — with no second table beside it.
+pub const SESSION_BITS: u32 = 48;
+
+/// A session from 64 random bits: the low 48, never zero or the legacy one.
+pub fn mint_session(random: u64) -> u64 {
+    let s = random & ((1u64 << SESSION_BITS) - 1);
+    if s == LEGACY_SESSION || s == 0 { LEGACY_SESSION + 1 } else { s }
+}
+
+/// Whether a v4 frame's session is one a client can hold.
+pub fn session_is_valid(session: u64) -> bool {
+    session != 0 && session != LEGACY_SESSION && session < (1u64 << SESSION_BITS)
+}
 
 /// A client's message, with its version on the front.
+///
+/// On the wire the version is always first; from v4 the session follows it
+/// (see [`encode_session_request`]). Decoded, an older message carries
+/// [`LEGACY_SESSION`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     /// Which protocol version the body is in. First field, always.
     pub version: u16,
+    /// Which page load sent it: minted at random by the client, carrying
+    /// nothing of the person or of any key.
+    pub session: u64,
     pub body: Request,
+}
+
+/// The envelope before v4: the version, then the body.
+#[derive(Serialize, Deserialize)]
+struct LegacyEnvelope {
+    version: u16,
+    body: Request,
 }
 
 /// What a client asks the engine to do.
@@ -513,6 +561,18 @@ pub enum Reply {
         /// only looked.
         gets: u32,
     },
+    /// How far along a write is — and WHOSE write (v4, craftworks-sdk#146).
+    ///
+    /// Every tab shares one delegate context, and a state is delivered to
+    /// whichever connection's call produced it — so a tab ticking can be told
+    /// the state of another tab's write, with the same write id as its own.
+    /// Named, it drops it. Sent only to a writer that spoke v4; an older one
+    /// keeps [`Reply::WriteState`].
+    SessionWriteState {
+        session: u64,
+        write_id: u64,
+        state: WriteState,
+    },
 }
 
 /// Why a subscriber was told something changed.
@@ -738,6 +798,11 @@ pub enum Dropped {
     /// A message kind this side has no use for. Appended, like everything
     /// else: a variant's position is its wire tag.
     NotForUs,
+    /// A v4 frame whose session is not one a client can hold: zero, the
+    /// legacy session, or wider than [`SESSION_BITS`] (craftworks-sdk#146).
+    /// Refused by name rather than truncated: a truncated session is told
+    /// its verdicts under a number it does not hold, and drops them all.
+    BadSession,
 }
 
 /// The largest message this build will decode.
@@ -766,14 +831,27 @@ fn opts() -> impl bincode::Options {
 /// engine answered `Unparseable` with no write id, the write sat awaiting a
 /// verdict until the copy's timeout rolled it back, and the only words anyone
 /// saw were the wrong ones (craftworks-sdk#136).
+///
+/// A request with NO session is a pre-v4 request: from v4 a frame must name
+/// a real session, and the legacy one is refused at decode
+/// ([`Dropped::BadSession`]). So this encodes at most v3; a client that has a
+/// session sends it with [`encode_session_request`].
 pub fn encode_request(version: u16, body: &Request) -> Result<Vec<u8>, Dropped> {
+    encode_session_request(version.min(SESSION_SINCE - 1), LEGACY_SESSION, body)
+}
+
+/// Encode a client's message from `session`. Before v4 the session is not
+/// on the wire and a reader takes it to be [`LEGACY_SESSION`].
+pub fn encode_session_request(version: u16, session: u64, body: &Request) -> Result<Vec<u8>, Dropped> {
     use bincode::Options;
-    opts()
-        .serialize(&Envelope {
-            version,
-            body: body.clone(),
-        })
-        .map_err(|e| classify(&e))
+    // An invalid session on a v4 frame ENCODES (so a test can send one) and
+    // is refused at DECODE, which is where it has to be enforced anyway.
+    if version >= SESSION_SINCE {
+        opts().serialize(&Envelope { version, session, body: body.clone() })
+    } else {
+        opts().serialize(&LegacyEnvelope { version, body: body.clone() })
+    }
+    .map_err(|e| classify(&e))
 }
 
 /// Encode a reply — or say why it cannot be sent. See [`encode_request`].
@@ -787,13 +865,13 @@ pub fn encode_reply(r: &Reply) -> Result<Vec<u8>, Dropped> {
 /// or held.
 pub fn request_len(version: u16, body: &Request) -> u64 {
     use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .serialized_size(&Envelope {
-            version,
-            body: body.clone(),
-        })
-        .unwrap_or(u64::MAX)
+    let o = bincode::DefaultOptions::new().with_fixint_encoding();
+    if version >= SESSION_SINCE {
+        o.serialized_size(&Envelope { version, session: LEGACY_SESSION, body: body.clone() })
+    } else {
+        o.serialized_size(&LegacyEnvelope { version, body: body.clone() })
+    }
+    .unwrap_or(u64::MAX)
 }
 
 /// What came of trying to read a client's message.
@@ -826,7 +904,17 @@ pub fn decode_request(bytes: &[u8]) -> Incoming {
     if !KNOWN.contains(&version) {
         return Incoming::Unsupported(version);
     }
-    match opts().deserialize::<Envelope>(bytes) {
+    let decoded = if version >= SESSION_SINCE {
+        match opts().deserialize::<Envelope>(bytes) {
+            Ok(e) if !session_is_valid(e.session) => return Incoming::Dropped(Dropped::BadSession),
+            other => other,
+        }
+    } else {
+        opts()
+            .deserialize::<LegacyEnvelope>(bytes)
+            .map(|e| Envelope { version: e.version, session: LEGACY_SESSION, body: e.body })
+    };
+    match decoded {
         Ok(e) => Incoming::Ok(e),
         Err(e) => Incoming::Dropped(classify(&e)),
     }

@@ -79,8 +79,9 @@ impl Page {
                 .conn
                 .step(frames.into_iter().map(Inbound::Client).collect())
             {
-                if let Ok(protocol::Reply::WriteState { write_id, state }) =
-                    protocol::decode_reply(&reply)
+                if let Some((write_id, state)) = protocol::decode_reply(&reply)
+                    .ok()
+                    .and_then(|r| self.store.client.own_write_state(&r))
                 {
                     self.verdicts.entry(write_id).or_default().push(state);
                 }

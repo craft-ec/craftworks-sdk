@@ -96,6 +96,17 @@ pub struct Client {
     /// The client's clock, as a function, because this crate compiles to wasm
     /// and to a host binary and must not reach for one of its own.
     now_ms: Option<Box<dyn Fn() -> u64>>,
+    /// THIS page load, on every frame it sends (craftworks-sdk#146). Minted
+    /// at random when the client is made — a reload is a new session — and
+    /// carrying nothing of the person or of any key. `None` when there was no
+    /// randomness to mint it from: then nothing is sent, and writes are
+    /// refused by name (`Refused::NoSession`).
+    session: Option<u64>,
+    /// Requests not sent because this client has no session.
+    pub unsent_no_session: usize,
+    /// Write states for ANOTHER session's writes, delivered here because
+    /// every tab shares one delegate. Counted, never applied.
+    pub foreign_write_states: usize,
 }
 
 impl Default for Client {
@@ -106,6 +117,14 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Client {
+        let mut b = [0u8; 8];
+        Client::from_random(getrandom::getrandom(&mut b).ok().map(|()| b))
+    }
+
+    /// A client whose session is minted from these random bytes — or, given
+    /// `None` (the RNG failed), a client with no session at all. Public so a
+    /// test can drive the failure; `new` is what an app gets.
+    pub fn from_random(random: Option<[u8; 8]>) -> Client {
         Client {
             outbound: Vec::new(),
             replies: Vec::new(),
@@ -116,6 +135,40 @@ impl Client {
             rec: None,
             unrecorded_calls: 0,
             unencodable: 0,
+            // A FAILED RNG IS LOUD. It used to leave zeroes, which minted the
+            // same session for every such tab — the collision this exists to
+            // end, under a new number and silently (the builder#73 rule).
+            session: random.map(|b| protocol::mint_session(u64::from_le_bytes(b))),
+            unsent_no_session: 0,
+            foreign_write_states: 0,
+        }
+    }
+
+    /// This page load's session, or `None` if it could not mint one.
+    pub fn session(&self) -> Option<u64> {
+        self.session
+    }
+
+    /// A write state that is about one of THIS session's writes, as
+    /// `(write_id, state)` — or `None` for any other reply, and for a state
+    /// naming another session, which is counted. The one place both stores
+    /// ask, so neither can apply a stranger's verdict (craftworks-sdk#146).
+    ///
+    /// An UNNAMED `WriteState` is somebody else's by construction: this
+    /// client speaks v4 with a session, so its own are always named, and a
+    /// plain one is a pre-v4 tab's verdict delivered here because it shares
+    /// the delegate. Taking it would let a v3 tab's `w1: Failed` roll back
+    /// this tab's `w1` (the architect's A2 on sdk#165).
+    pub fn own_write_state(&mut self, r: &Reply) -> Option<(u64, protocol::WriteState)> {
+        match r {
+            Reply::SessionWriteState { session, write_id, state } if Some(*session) == self.session => {
+                Some((*write_id, *state))
+            }
+            Reply::SessionWriteState { .. } | Reply::WriteState { .. } => {
+                self.foreign_write_states += 1;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -187,7 +240,11 @@ impl Client {
     /// It is counted, and `CachedStore` refuses a write that will not fit
     /// before it ever gets here.
     pub fn send(&mut self, r: &Request) {
-        match protocol::encode_request(protocol::CURRENT, r) {
+        let Some(session) = self.session else {
+            self.unsent_no_session += 1;
+            return;
+        };
+        match protocol::encode_session_request(protocol::CURRENT, session, r) {
             Ok(bytes) => self.outbound.push(bytes),
             Err(_) => self.unencodable += 1,
         }
@@ -391,6 +448,10 @@ impl Client {
             Dropped::TooLarge => DropReason::TooLarge,
             Dropped::Unexpected => DropReason::Unexpected,
             Dropped::NotForUs => DropReason::NotForUs,
+            // Not in the instrument's reviewed vocabulary yet; the nearest
+            // closed reason until craftworks-instrument names it. The REPLY
+            // names it exactly (`Dropped::BadSession`).
+            Dropped::BadSession => DropReason::Unparseable,
         };
         rec.event(Event::Counter {
             site: DROP,

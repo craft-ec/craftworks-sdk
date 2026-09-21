@@ -254,9 +254,19 @@ fn a_tick_carries_the_wall_clock_in_the_protocol_s_unit() {
     let mut b = store();
     a.send_tick(1_700_000_123_456);
     b.send_tick(1_700_000_123_999);
+    // The BODIES, not the frames: since sdk#146 each tab's frame names its own
+    // session, which is the point of it; the time is the body's.
+    let bodies = |fs: Vec<Vec<u8>>| -> Vec<protocol::Request> {
+        fs.iter()
+            .filter_map(|f| match protocol::decode_request(f) {
+                protocol::Incoming::Ok(e) => Some(e.body),
+                _ => None,
+            })
+            .collect()
+    };
     assert_eq!(
-        a.take_outbound(),
-        b.take_outbound(),
+        bodies(a.take_outbound()),
+        bodies(b.take_outbound()),
         "two tabs reading the same second sent different times. A delegate's \
          context is shared by every connection (F47), so the lower one would \
          make everything look young again and the deadlines would never fire"

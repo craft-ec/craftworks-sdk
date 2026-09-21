@@ -210,7 +210,8 @@ fn the_shell_detects_the_version_a_client_spoke() {
 
     let mut v2 = Node::new();
     let _ = v2.step(vec![engine_delegate::shell::Inbound::Client(
-        protocol::encode_request(protocol::CURRENT, &write()).expect("encodes"),
+        // At CURRENT a frame carries a session (sdk#146).
+        protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(5), &write()).expect("encodes"),
     )]);
     assert_eq!(
         v2.detected_client_version(),

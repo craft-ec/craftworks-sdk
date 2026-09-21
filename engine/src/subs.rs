@@ -133,12 +133,26 @@ struct Watch {
     missing_streak: u32,
     /// Stopped, and the client has been told so.
     stale: bool,
+    /// When this subscription was taken, in subscribe order: what makes one
+    /// SESSION older than another (sdk#146). A client id is a random
+    /// session, so the id itself says nothing about age.
+    born: u64,
 }
 
 /// Every standing subscription, by client and client-chosen id.
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Subs {
     ranges: BTreeMap<(u64, u64), Watch>,
+    /// The next `born`.
+    next: u64,
+}
+
+/// The bounds a subscribe is checked against.
+#[derive(Clone, Copy, Debug)]
+pub struct SubLimits {
+    pub max_subs: usize,
+    pub max_per_client: usize,
+    pub max_key: usize,
 }
 
 /// What came of a subscribe.
@@ -176,31 +190,66 @@ impl Subs {
     /// one: it must be idempotent, and it must be how a `Stale` range is
     /// brought back to life, because there is nothing else a client can do
     /// about one.
+    ///
+    /// # Whose room it is (sdk#146)
+    ///
+    /// Every page load is its own client now, and nothing tells the engine a
+    /// page went away — so a reload's old subscriptions stayed, under one
+    /// engine-wide cap, and a few reloads refused every new page's bindings.
+    /// Two bounds instead:
+    ///
+    /// - **Per client**, `max_per_client`: one page cannot take the room of
+    ///   every other. Over it, `Full`, and the page is told.
+    /// - **Engine-wide**, `max_subs`: at the cap, the OLDEST OTHER client —
+    ///   the one whose first standing subscription is oldest — loses all of
+    ///   its subscriptions, which are RETURNED (the caller decides whether it
+    ///   can tell anyone; today it cannot address them, see the engine). A
+    ///   page that reloaded away is exactly the room this frees. Only when
+    ///   the asking client is the only one holding anything is the subscribe
+    ///   refused.
     pub fn add(
         &mut self,
         client: ClientId,
         sub_id: u64,
         range: SubRange,
-        max_subs: usize,
-        max_key: usize,
-    ) -> Accepted {
-        if range.widest() > max_key {
-            return Accepted::TooWide;
+        limits: SubLimits,
+    ) -> (Accepted, Vec<(ClientId, u64)>) {
+        if range.widest() > limits.max_key {
+            return (Accepted::TooWide, Vec::new());
         }
         let key = (client.0, sub_id);
-        if !self.ranges.contains_key(&key) && self.ranges.len() >= max_subs {
-            return Accepted::Full;
+        let mut evicted = Vec::new();
+        if let Some(w) = self.ranges.get_mut(&key) {
+            // A re-subscribe resets it and keeps its place.
+            *w = Watch { range, last_told: None, missing_streak: 0, stale: false, born: w.born };
+            return (Accepted::Yes, evicted);
         }
-        self.ranges.insert(
-            key,
-            Watch {
-                range,
-                last_told: None,
-                missing_streak: 0,
-                stale: false,
-            },
-        );
-        Accepted::Yes
+        if self.ranges.keys().filter(|(c, _)| *c == client.0).count() >= limits.max_per_client {
+            return (Accepted::Full, evicted);
+        }
+        if self.ranges.len() >= limits.max_subs {
+            // The oldest OTHER client: the smallest `born` among its entries.
+            let mut oldest: Option<(u64, u64)> = None; // (born, client)
+            for ((c, _), w) in &self.ranges {
+                if *c != client.0 && oldest.is_none_or(|(b, _)| w.born < b) {
+                    oldest = Some((w.born, *c));
+                }
+            }
+            let Some((_, victim)) = oldest else {
+                return (Accepted::Full, evicted);
+            };
+            evicted = self
+                .ranges
+                .keys()
+                .filter(|(c, _)| *c == victim)
+                .map(|(c, s)| (ClientId(*c), *s))
+                .collect();
+            self.ranges.retain(|(c, _), _| *c != victim);
+        }
+        let born = self.next;
+        self.next += 1;
+        self.ranges.insert(key, Watch { range, last_told: None, missing_streak: 0, stale: false, born });
+        (Accepted::Yes, evicted)
     }
 
     /// Drop one. An id that is not there is not an error — a client dropping

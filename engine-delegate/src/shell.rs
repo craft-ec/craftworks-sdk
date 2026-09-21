@@ -213,9 +213,27 @@ fn rows_in(r: &engine::read::ReadResult) -> u64 {
     }
 }
 
-/// The engine's ids, from the protocol's plain numbers.
-fn as_client(n: u64) -> engine::ClientId {
-    engine::ClientId(n)
+/// A client, as the engine keys it: the SESSION that sent the frame and the
+/// VERSION it spoke, packed into the engine's opaque 64-bit id
+/// (craftworks-sdk#146).
+///
+/// Every tab and page load was `ClientId(1)`, so the engine's `(client,
+/// write)` keys collided by default. And the version is a property of the
+/// WRITE, not of the shell: one version per shell was overwritten by
+/// whichever client spoke last, so a v2 writer could be sent a v3-only
+/// verdict and a v3 writer a v2 one. Packed, it travels wherever the engine
+/// carries the client — a parked write, a commit's writes — and every
+/// `Notify` is addressed from its own write. A session is one page load, so
+/// its version cannot change under it.
+fn as_client(session: u64, version: u16) -> engine::ClientId {
+    let s = session & ((1u64 << protocol::SESSION_BITS) - 1);
+    engine::ClientId((s << 16) | version as u64)
+}
+fn version_of(c: engine::ClientId) -> u16 {
+    (c.0 & 0xFFFF) as u16
+}
+fn session_of(c: engine::ClientId) -> u64 {
+    c.0 >> 16
 }
 fn as_write_id(n: u64) -> engine::WriteId {
     engine::WriteId(n)
@@ -258,6 +276,10 @@ pub struct Shell<B: Blocks> {
     pub read_back_hits: usize,
     /// The client asked who it is talking to.
     pub identity: bool,
+    /// Who sent the frame being handled: its session and version (see
+    /// `as_client`). Per FRAME, never carried: the next frame may be another
+    /// tab's.
+    speaker: engine::ClientId,
     /// Requests in the protocol's vocabulary that this shell does not serve
     /// yet. Answered, never ignored.
     pub unserved: Vec<u64>,
@@ -380,6 +402,7 @@ impl<B: Blocks> Shell<B> {
             provisioned: false,
             read_back_hits: 0,
             identity: false,
+            speaker: as_client(protocol::LEGACY_SESSION, 1),
             unserved: Vec::new(),
             page_clamp: BTreeMap::new(),
             has_code,
@@ -455,12 +478,13 @@ impl<B: Blocks> Shell<B> {
             self.attribute(&msg);
             let effects = match msg {
                 Inbound::Client(bytes) => match crate::serve::serve(&bytes) {
-                    crate::serve::Served::Do(r, v) => {
-                        // The highest version any client has spoken this call.
-                        // A v2-only message goes out only if someone asked in
-                        // v2; a v1 client is never sent one, so its decoder
-                        // never has to refuse one.
+                    crate::serve::Served::Do(r, v, session) => {
+                        // The highest version any client has spoken this call,
+                        // for the replies that are about the CALL (a trace,
+                        // its byte counts). A write's state is addressed from
+                        // the write itself: see `as_client`.
                         self.client_version = self.client_version.max(v);
+                        self.speaker = as_client(session, v);
                         self.on_protocol(r)
                     }
                     // A version this build does not serve, or bytes it cannot
@@ -684,12 +708,12 @@ impl<B: Blocks> Shell<B> {
                 }
             }
             P::Get { req_id, key } => Event::Get {
-                client: as_client(1),
+                client: self.speaker,
                 req_id: as_req_id(req_id),
                 key,
             },
             P::Write { write_id, ops } => Event::Write {
-                client: as_client(1),
+                client: self.speaker,
                 write_id: as_write_id(write_id),
                 ops: ops
                     .into_iter()
@@ -699,8 +723,13 @@ impl<B: Blocks> Shell<B> {
                     })
                     .collect(),
             },
+            // UNUSED BY ANY CLIENT (sdk#146): `src/`, `web/src/` and `js/` send
+            // no `AskWrite` (read at all three, against 3 `Request::Write`
+            // senders as the control). Served, and keyed by the asking
+            // session like every request, so a reader of `on_ask`'s `known`
+            // test knows it is exercised by tests alone.
             P::AskWrite { write_id } => Event::AskWrite {
-                client: as_client(1),
+                client: self.speaker,
                 write_id: as_write_id(write_id),
             },
             P::Tick { now } => Event::Tick(now),
@@ -721,7 +750,7 @@ impl<B: Blocks> Shell<B> {
                 let clamped = (max_entries as usize).clamp(1, MAX_PAGE_ENTRIES);
                 self.page_clamp.insert(req_id, clamped as u32);
                 Event::Scan {
-                    client: as_client(1),
+                    client: self.speaker,
                     req_id: as_req_id(req_id),
                     range: Box::new(freenet_prolly::range::Range {
                         lo: bound(lo),
@@ -734,14 +763,14 @@ impl<B: Blocks> Shell<B> {
                 }
             }
             P::Preload { roots } => Event::Preload {
-                client: as_client(1),
+                client: self.speaker,
                 // Fixed-width ids off the wire. A root is 32 bytes; anything
                 // else is not one, and the engine's budget bounds how many of
                 // them are walked.
                 roots: roots.into_iter().collect(),
             },
             P::SubscribeRange { sub_id, lo, hi } => Event::SubscribeRange {
-                client: as_client(1),
+                client: self.speaker,
                 sub_id,
                 range: engine::subs::SubRange {
                     lo: bound(lo),
@@ -755,7 +784,7 @@ impl<B: Blocks> Shell<B> {
             // that silently does nothing at the node would be worse than
             // having none.
             P::Unsubscribe { sub_id } => Event::Unsubscribe {
-                client: as_client(1),
+                client: self.speaker,
                 sub_id,
             },
             P::ChangesSince {
@@ -765,7 +794,7 @@ impl<B: Blocks> Shell<B> {
                 hi,
                 max_entries,
             } => Event::ChangesSince {
-                client: as_client(1),
+                client: self.speaker,
                 req_id: as_req_id(req_id),
                 from,
                 range: engine::subs::SubRange {
@@ -980,10 +1009,10 @@ impl<B: Blocks> Shell<B> {
         for f in effects {
             let r = match f {
                 Effect::Notify {
-                    write_id, state, ..
-                } => protocol::Reply::WriteState {
-                    write_id: write_id.0,
-                    state: match state {
+                    client, write_id, state,
+                } => {
+                    let version = version_of(*client);
+                    let state = match state {
                         State::Accepted => W::Accepted,
                         State::Stalled => W::Stalled,
                         State::Published => W::Published,
@@ -1003,9 +1032,23 @@ impl<B: Blocks> Shell<B> {
                         ),
                     }
                     // THE ONE PLACE a write state leaves the delegate, so the
-                    // one place an older client is told what it can read.
-                    .for_client(self.client_version),
-                },
+                    // one place a client is told what IT can read — in the
+                    // version of the write's own client, never of whichever
+                    // tab happened to speak in this call.
+                    .for_client(version);
+                    // Named only for a writer that can read it AND has a session
+                    // to name: a v4 frame that sent the legacy session is as
+                    // indistinguishable as any pre-v4 page, and gains nothing.
+                    if version >= protocol::SESSION_SINCE && session_of(*client) != protocol::LEGACY_SESSION {
+                        protocol::Reply::SessionWriteState {
+                            session: session_of(*client),
+                            write_id: write_id.0,
+                            state,
+                        }
+                    } else {
+                        protocol::Reply::WriteState { write_id: write_id.0, state }
+                    }
+                }
                 Effect::Reply { req_id, result, .. } => {
                     // WHERE THIS ENGINE STANDS, as it answers.
                     //
@@ -1114,7 +1157,7 @@ impl<B: Blocks> Shell<B> {
             return;
         }
         let Inbound::Client(bytes) = msg else { return };
-        let crate::serve::Served::Do(r, _) = crate::serve::serve(bytes) else {
+        let crate::serve::Served::Do(r, _, _) = crate::serve::serve(bytes) else {
             return;
         };
         let (of, began) = match &r {

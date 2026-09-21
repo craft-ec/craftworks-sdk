@@ -76,23 +76,27 @@ impl Page {
                 .conn
                 .step(frames.into_iter().map(Inbound::Client).collect())
             {
-                match protocol::decode_reply(&reply) {
-                    Ok(protocol::Reply::WriteState { write_id, state }) => {
-                        self.verdicts.entry(write_id).or_default().push(state);
-                    }
-                    // What the HOST does with a page: `CachedStore` records a
-                    // range as loaded only when told the interval it asked for.
-                    Ok(protocol::Reply::Page {
-                        req_id: LOAD,
-                        entries,
-                        cursor: None,
-                        at,
-                        ..
-                    }) => self
-                        .db
+                let decoded = protocol::decode_reply(&reply);
+                // This page's OWN write states, as the store reads them: named
+                // by its session since sdk#146.
+                if let Some((write_id, state)) =
+                    decoded.as_ref().ok().and_then(|r| self.db.store_mut().client.own_write_state(r))
+                {
+                    self.verdicts.entry(write_id).or_default().push(state);
+                }
+                // What the HOST does with a page: `CachedStore` records a
+                // range as loaded only when told the interval it asked for.
+                if let Ok(protocol::Reply::Page {
+                    req_id: LOAD,
+                    entries,
+                    cursor: None,
+                    at,
+                    ..
+                }) = decoded
+                {
+                    self.db
                         .store_mut()
-                        .on_page(b"", &EVERYTHING, entries, at.root),
-                    _ => {}
+                        .on_page(b"", &EVERYTHING, entries, at.root);
                 }
                 self.db.store_mut().on_inbound(&reply);
             }
