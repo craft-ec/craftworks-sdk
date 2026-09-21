@@ -81,6 +81,9 @@ const TRANSPORT_ONLY: &[&str] = &[
     "take_stale",
     "bind",
     "unbind",
+    // The NAME of what a binding watches — a domain, or one parent's band
+    // (sdk#137). Session bookkeeping for `bind`, not a read of data.
+    "watch_key",
     // Ask the engine what changed in a domain since this client last looked.
     // An in-memory store IS the tree: nothing can have changed in it that
     // this client did not do, so there is nothing to ask.

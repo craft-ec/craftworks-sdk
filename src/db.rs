@@ -316,6 +316,55 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// any particular database, and it does not check that the domain is
     /// DEFINED: that is a question about this database's contents, and the
     /// caller that needs it asks separately.
+    /// Every key one PARENT's children live under, in a domain that declares
+    /// a parent, as `[lo, hi)` — the band `Db::children` reads.
+    pub fn parent_range(domain: &str, parent: &RKey) -> (Vec<u8>, Vec<u8>) {
+        parent_span(domain, parent)
+    }
+
+    /// What a session WATCHES for one binding: the whole domain, or one
+    /// parent's band of it (craftworks-sdk#137). A string, so it can cross to
+    /// JavaScript and back as an opaque name; its layout is known only here
+    /// and in [`Db::watch_range`]. `#` cannot occur in a domain name.
+    pub fn watch_key(domain: &str, parent: Option<&RKey>) -> String {
+        match parent {
+            Some(p) => format!("{domain}#{}", id::to_hex(p)),
+            None => domain.to_string(),
+        }
+    }
+
+    /// The watch key whose range is EXACTLY `[lo, hi)`: a whole domain, or
+    /// one parent's band — so a completed load of either establishes the root
+    /// a live binding of it asks deltas from (sdk#142 for domains, sdk#137 for
+    /// bands). A span that is neither names nothing.
+    pub fn watch_key_of_range(lo: &[u8], hi: &[u8]) -> Option<String> {
+        if let Some(d) = Self::domain_of_range(lo, hi) {
+            return Some(d);
+        }
+        let rest = lo.strip_prefix(&[T_RECORD])?;
+        let z = rest.iter().position(|b| *b == 0)?;
+        let domain = std::str::from_utf8(&rest[..z]).ok()?;
+        check_domain(domain).ok()?;
+        let parent: RKey = rest[z + 1..].try_into().ok()?;
+        (Self::parent_range(domain, &parent) == (lo.to_vec(), hi.to_vec()))
+            .then(|| Self::watch_key(domain, Some(&parent)))
+    }
+
+    /// The range a [`Db::watch_key`] names, or `None` for a string that is
+    /// not one.
+    pub fn watch_range(key: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        match key.split_once('#') {
+            Some((domain, parent)) => {
+                check_domain(domain).ok()?;
+                Some(Self::parent_range(domain, &id::from_hex(parent)?))
+            }
+            None => {
+                check_domain(key).ok()?;
+                Some(Self::domain_range(key))
+            }
+        }
+    }
+
     pub fn domain_range(domain: &str) -> (Vec<u8>, Vec<u8>) {
         let lo = prefix(domain);
         let hi = upper(&lo);

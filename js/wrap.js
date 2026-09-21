@@ -84,7 +84,12 @@ export function wrap(raw) {
     // Do not set it on ordinary data. A subscription is a standing cost paid
     // continuously, and it is worth it only where being told sooner is worth
     // something — data read once and shown is correct when it is read.
-    bind(domain, { live = false, limit = 0, reverse = false } = {}) { return new Binding(this, domain, live, limit, reverse); }
+    // `parent`: the rows of ONE parent, read as its band (`children`), in a
+    // domain that declares one (sdk#137). A domain that does not refuses it,
+    // as `children` does.
+    bind(domain, { parent = null, live = false, limit = 0, reverse = false } = {}) {
+      return new Binding(this, domain, live, limit, reverse, parent);
+    }
   }
 
   // One domain's rows, with a referentially STABLE snapshot.
@@ -95,15 +100,16 @@ export function wrap(raw) {
   // render for ever, whatever the data did. The array is replaced only when
   // the rows differ.
   class Binding {
-    #db; #domain; #live; #limit; #reverse; #rows = []; #listeners = new Set(); #root = null;
+    #db; #domain; #live; #limit; #reverse; #parent; #rows = []; #listeners = new Set(); #root = null;
     // The same shape the engine-backed binding answers. This database is in
     // the tab, so a range is never unreachable here — but an app must not be
     // able to tell which backend it has from what a call returns (sdk#87),
     // and a component that branched on `status()` existing would work in a
     // preview and throw once published.
     #status = { state: "loading", why: "", code: "" };
-    constructor(db, domain, live, limit = 0, reverse = false) {
+    constructor(db, domain, live, limit = 0, reverse = false, parent = null) {
       this.#db = db; this.#domain = domain; this.#live = live; this.#limit = limit; this.#reverse = reverse;
+      this.#parent = parent;
       // Bound once, so React sees the SAME function identity across renders;
       // a changing subscribe re-subscribes on every render.
       this.subscribe = this.subscribe.bind(this);
@@ -119,6 +125,9 @@ export function wrap(raw) {
     get limit() { return this.#limit; }
     // Which END a page comes from. A limit without a direction is half a page.
     get reverse() { return this.#reverse; }
+    // Whose children this reads, or `null` for the whole domain — reported so
+    // a caller can check it got the band it asked for.
+    get parent() { return this.#parent; }
     // The rows, as the same array until they change.
     getSnapshot() { return this.#rows; }
     /**
@@ -138,7 +147,11 @@ export function wrap(raw) {
     // compared first, so a reload with nothing to do reads nothing.
     async reload() {
       const root = this.#db.root();
-      const rows = await this.#db.scan(this.#domain, { limit: this.#limit, reverse: this.#reverse });
+      // ONE PARENT'S BAND, not the domain: the read costs the rows under this
+      // parent, however many other parents the domain holds (sdk#137).
+      const rows = this.#parent
+        ? await this.#db.children(this.#domain, this.#parent, { limit: this.#limit, reverse: this.#reverse })
+        : await this.#db.scan(this.#domain, { limit: this.#limit, reverse: this.#reverse });
       this.#root = root;
       const was = this.#status.state;
       this.#status = { state: "ready", why: "", code: "" };

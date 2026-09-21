@@ -134,6 +134,15 @@ const ARGS = {
   root: [], stats: [], bind: ["d"],
 };
 
+/**
+ * Calls whose OPTIONS change what they read (sdk#137): each is asked of both
+ * surfaces too, so an option one surface ignores cannot hide behind the other
+ * answering the same shape without it.
+ */
+const OPTION_CALLS = [
+  ["bind", ["d", { parent: "0000000000000000000000000000000a", limit: 5, reverse: true }]],
+];
+
 /** Is this a promise? The only question the two surfaces must agree on. */
 const isThenable = v => typeof v?.then === "function";
 
@@ -181,6 +190,50 @@ await t("**both surfaces answer the same SHAPE, not just the same names**", () =
     "green log that is indistinguishable from one it checked. Give it " +
     "arguments in ARGS, or say why it is exempt.");
   console.log(`      ${shared.length} shared methods, all compared by shape`);
+});
+
+await t("**a binding over ONE PARENT reports it on both surfaces** (sdk#137)", () => {
+  const memory = new (wrap(fakeRaw()).Db)();
+  const engine = engineDb({ ...fakeSession(), session: { ...fakeSession().session, watch_key: (d, p) => `${d}#${p}`, children: () => "[]" } });
+  for (const [name, args] of OPTION_CALLS) {
+    const a = memory[name](...args), b = engine[name](...args);
+    for (const [k, want] of Object.entries(args[1])) {
+      assert.deepEqual([a[k], b[k]], [want, want], `${name}: option \`${k}\` not reported by both surfaces`);
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// EVERY RUST-BOUNDARY DATA METHOD HAS A JS COUNTERPART, ON BOTH SURFACES.
+// ---------------------------------------------------------------------------
+//
+// The gate above compares the two JS surfaces with EACH OTHER, so when
+// `children` was missing from both it was green: they agreed, on its
+// absence (sdk#137). This compares each against the BUILT wasm — the
+// in-memory `Db`'s methods, which are the data surface by definition.
+
+const snakeToCamel = s => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+/** Methods on a wasm class that are not data: wasm-bindgen's own. */
+const BINDGEN = new Set(["constructor", "free", "__destroy_into_raw"]);
+const dataMethodsOf = cls => Object.getOwnPropertyNames(cls.prototype).filter(n => !BINDGEN.has(n) && typeof n === "string");
+/** What a JS surface is missing of a wasm data surface. */
+const missingFrom = (wasmMethods, jsSurface) => wasmMethods.map(snakeToCamel).filter(m => !jsSurface.has(m));
+
+await t("**every data method of the BUILT wasm Db exists on BOTH JavaScript surfaces**", async () => {
+  const { createRequire } = await import("node:module");
+  const raw = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
+  const wasm = dataMethodsOf(raw.Db);
+  assert.ok(wasm.includes("children") && wasm.length > 8, `the reader found only ${wasm}, so it checks nothing`);
+  const memory = surfaceOf(new (wrap(fakeRaw()).Db)());
+  const engine = surfaceOf(engineDb(fakeSession()));
+  assert.deepEqual(missingFrom(wasm, memory), [], "the in-memory JS surface lacks a wasm data method");
+  assert.deepEqual(missingFrom(wasm, engine), [], "the engine-backed JS surface lacks a wasm data method");
+});
+
+await t("THE CONTROL: a wasm method with no JS counterpart is FOUND missing", () => {
+  class Fake { children() {} frobnicate_rows() {} }
+  const js = new Set(["children"]);
+  assert.deepEqual(missingFrom(dataMethodsOf(Fake), js), ["frobnicateRows"]);
 });
 
 await t("THE CONTROL: a method that is sync on one side and async on the other FAILS", () => {

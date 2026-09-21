@@ -131,8 +131,15 @@ impl Client {
     /// Load the whole domain, as a binding's first read does, and — as the
     /// session does — tell `Refresh` the root it was read at (sdk#142).
     fn load_into(&mut self, r: &mut Refresh) {
-        if let Some((lo, hi, root)) = self.load_at() {
-            if let Some(d) = craftworks_sdk::Db::<CachedStore, craftworks_sdk::SystemEnv>::domain_of_range(&lo, &hi) {
+        let (lo, hi) = range();
+        self.load_span_into(r, &lo, &hi);
+    }
+
+    /// Load any span — a domain, or one parent's band — and seed `Refresh`
+    /// with the watch key it names, as the session does (sdk#137).
+    fn load_span_into(&mut self, r: &mut Refresh, lo: &[u8], hi: &[u8]) {
+        if let Some((lo, hi, root)) = self.load_span(lo, hi) {
+            if let Some(d) = craftworks_sdk::Db::<CachedStore, craftworks_sdk::SystemEnv>::watch_key_of_range(&lo, &hi) {
                 r.on_loaded(&d, root);
             }
         }
@@ -145,10 +152,16 @@ impl Client {
 
     /// Load the whole domain; the span and root it completed at, if it did.
     fn load_at(&mut self) -> Option<(Vec<u8>, Vec<u8>, [u8; 32])> {
+        let (lo, hi) = range();
+        self.load_span(&lo, &hi)
+    }
+
+    /// Load `[lo, hi)`; the span and root it completed at, if it did.
+    fn load_span(&mut self, lo: &[u8], hi: &[u8]) -> Option<(Vec<u8>, Vec<u8>, [u8; 32])> {
         let mut done = None;
         let mut loads = Loads::new();
-        let (id, _) = loads.want(&range().0, &range().1, 0).expect("a fresh span");
-        let mut pending = Some(Loads::range_request(id, &range().0, &range().1, None));
+        let (id, _) = loads.want(lo, hi, 0).expect("a fresh span");
+        let mut pending = Some(Loads::range_request(id, lo, hi, None));
         while let Some(req) = pending.take() {
             self.store.client.send(&req);
             for reply in self.pump() {
@@ -714,4 +727,74 @@ fn a_delta_applied_copy_and_a_full_reload_hold_equal_rows() {
     let by_reload = c.store.scan(&range().0, &range().1, false, usize::MAX).unwrap();
     assert_eq!(by_delta, by_reload);
     assert_eq!(by_delta.len(), 10);
+}
+
+// ---- a LIVE BAND is told of its band, not of a sibling's (sdk#137) ----------
+
+type Dbx = craftworks_sdk::Db<CachedStore, craftworks_sdk::SystemEnv>;
+
+fn band_key(parent: u8, n: u32) -> Vec<u8> {
+    let (lo, _) = Dbx::parent_range("note", &[parent; 16]);
+    let mut k = lo;
+    k.extend_from_slice(&[0u8; 12]);
+    k.extend_from_slice(&n.to_be_bytes());
+    k
+}
+
+/// **B watches parent P's band. A write under sibling Q is NOT a change to it;
+/// a write under P is.** The second half is the control: without it a band
+/// told of everything would pass.
+#[test]
+fn a_band_watch_is_told_of_its_band_and_not_of_a_siblings() {
+    let node = testkit::FullNode::new();
+    let conn = node.connect();
+    let mut a = Client::tab(conn.clone());
+    let mut b = Client::tab(conn);
+    let p = Dbx::watch_key("note", Some(&[1u8; 16]));
+    let (lo, hi) = Dbx::watch_range(&p).expect("a band key names a range");
+    a.write(&band_key(1, 0), b"p0");
+    a.write(&band_key(2, 0), b"q0");
+    // B loads its band and records where it stands (as a session does).
+    let mut r = Refresh::new();
+    let ask = |r: &mut Refresh, b: &mut Client| -> Vec<String> {
+        if let Some(req) = r.ask(next_id(), &p, &lo, &hi) {
+            b.store.client.send(&req);
+        }
+        for reply in b.pump() {
+            match protocol::decode_reply(&reply) {
+                Ok(protocol::Reply::Delta { req_id, changes, cursor, new_root, .. }) => {
+                    if let Answer::Delta { changes, new_root, .. } = r.on_delta(req_id, changes, cursor, new_root) {
+                        b.store.on_delta(changes, new_root);
+                    }
+                }
+                Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => {
+                    let _ = r.on_full_reload(req_id);
+                }
+                _ => {}
+            }
+        }
+        r.take_changed()
+    };
+    // B loads its BAND — as a parented binding's `children` read does — and
+    // the completed load names the band, so its root is the one deltas start
+    // from (the session does the same, via `watch_key_of_range`).
+    b.load_span_into(&mut r, &lo, &hi);
+    assert!(r.seen(&p).is_some(), "the band's load recorded no root, so every question would be a reload");
+
+    a.write(&band_key(2, 1), b"q1"); // under the SIBLING
+    assert_eq!(ask(&mut r, &mut b), Vec::<String>::new(), "a write under a sibling parent was reported as a change to this band");
+
+    a.write(&band_key(1, 1), b"p1"); // under P
+    assert_eq!(ask(&mut r, &mut b), vec![p.clone()], "a write in the band was not reported");
+}
+
+/// The key layout round-trips, and a string that is not a key names nothing.
+#[test]
+fn a_watch_key_names_its_range_and_nothing_else_does() {
+    assert_eq!(Dbx::watch_range("note"), Some(Dbx::domain_range("note")));
+    let k = Dbx::watch_key("note", Some(&[7u8; 16]));
+    assert_eq!(Dbx::watch_range(&k), Some(Dbx::parent_range("note", &[7u8; 16])));
+    for bad in ["", "No", "note#", "note#xyz", "note#0123", "a#b#c"] {
+        assert_eq!(Dbx::watch_range(bad), None, "{bad:?}");
+    }
 }
