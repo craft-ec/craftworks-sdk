@@ -93,9 +93,13 @@ struct Config {
     rule: Rule,
     driver: Driver,
     steps: usize,
+    /// Misbehaviour on. Off, the node is HEALTHY: it answers every frame, in
+    /// order, to the right session, and never forgets; the clock never jumps.
+    faults: bool,
 }
 
-const TODAY: Config = Config { rule: Rule::Today, driver: Driver::Today, steps: 200 };
+const TODAY: Config = Config { rule: Rule::Today, driver: Driver::Today, steps: 200, faults: true };
+const HEALTHY: Config = Config { faults: false, ..TODAY };
 
 /// The node's request queue per key: 100 waiting + 1 in service (F51).
 const NODE_ADMITS: usize = 101;
@@ -103,6 +107,8 @@ const NODE_ADMITS: usize = 101;
 const PARKED_ADMITS: usize = 8;
 /// W5.
 const WINDOW: usize = 16;
+/// One node action (take a request, or move the commit one step).
+const NODE_ACTION_MS: u64 = 100;
 /// Drive-to-rest gives up — BY NAME — after this many rounds.
 const REST_CAP: usize = 2_000;
 
@@ -142,7 +148,10 @@ struct Model {
     clock: testkit::Clock,
     stores: [CachedStore; 2],
     sessions: [u64; 2],
-    /// Keys each session writes: disjoint, so W6 needs no deltas.
+    /// Keys each session writes: DISJOINT, so W6 needs no deltas. Its price,
+    /// stated: a cross-session effect on one key is invisible here — a
+    /// double apply shows as W3 only, never as W6, and two writers of one key
+    /// are not modelled at all (M2's `Commit{reads,writes}`; `COVERAGE` reads 0).
     keys: [[&'static [u8]; 4]; 2],
     // --- the node ---
     tree: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -168,6 +177,15 @@ struct Model {
     queued: [BTreeSet<u64>; 2],
     findings: Vec<Finding>,
     trace: Vec<String>,
+    /// What this run's mix actually REACHED (see `COVERAGE`).
+    saw: BTreeSet<&'static str>,
+    /// Fault-phase time that passed WITHOUT a jump.
+    honest_ms: u64,
+    /// Time the node has not yet spent on work.
+    node_budget: u64,
+    /// A rollback carried by a verdict, and nothing since that refills the
+    /// window (the session's next verdict or tick).
+    fell_at_node: [bool; 2],
     step: usize,
     faults: bool,
 }
@@ -224,8 +242,12 @@ impl Model {
             queued: [BTreeSet::new(), BTreeSet::new()],
             findings: Vec::new(),
             trace: Vec::new(),
+            saw: BTreeSet::new(),
+            fell_at_node: [false, false],
+            honest_ms: 0,
+            node_budget: 0,
             step: 0,
-            faults: true,
+            faults: cfg.faults,
         }
     }
 
@@ -254,6 +276,7 @@ impl Model {
             "the client's clock jumped while it was at the node",
             "timed out while its frame waited in the node's queue",
             "timed out while its verdict was on its way",
+            "timed out while its commit was in flight",
             "the node refused its frame",
             "rolled back behind another write of its keys",
             "Busy",
@@ -283,12 +306,18 @@ impl Model {
                     "rolled back behind another write of its keys".into()
                 }
             };
-            let end = if why == "Published" {
+            let end = if why == "Published" || why == "ParityComplete" {
                 End::Published { step: self.step }
             } else {
                 End::RolledBack { why, step: self.step }
             };
             self.at_node[i].remove(id);
+            // A rollback carried by a VERDICT frees the slots of every write it
+            // takes, sent or still in the outbox — and today the window was
+            // refilled before it (the tick refills after its rollbacks).
+            if matches!(&end, End::RolledBack { why, .. } if !why.contains("(by the tick)")) {
+                self.fell_at_node[i] = true;
+            }
             if let Some(prev) = self.ended[i].insert(*id, end.clone()) {
                 self.find("W4 ENDED TWICE", format!("session {i} w{id}: {prev:?}, then {end:?}"));
             }
@@ -328,6 +357,25 @@ impl Model {
         for f in self.stores[i].take_outbound() {
             self.send_to_node(i, f, false);
         }
+        if self.stores[i].held_count() > 0 {
+            self.saw.insert("the window bound (writes held)");
+            // The other half of W5: held writes leave while there is ROOM. A
+            // client holding writes with fewer than the window at the node
+            // has a slot it thinks is taken — the leaked-slot family (a
+            // verdict that frees nothing, a timeout that frees nothing).
+            let at = self.at_node[i].len();
+            if at < WINDOW {
+                let d = format!("session {i} holds {} writes with only {at} at the node (window {WINDOW}); queued {}", self.stores[i].held_count(), self.stores[i].queued_count());
+                if self.fell_at_node[i] {
+                    // Today's order in `on_write_state`: the window is refilled
+                    // BEFORE `copy.failed` takes the later writes down with the
+                    // failed one — their slots come free after the refill ran.
+                    self.find("W5 NOT REFILLED AFTER A FALL", d);
+                } else {
+                    self.find("W5 HELD WITH ROOM", d);
+                }
+            }
+        }
         let at = self.at_node[i].len();
         if at > WINDOW {
             let ids: Vec<u64> = self.at_node[i].keys().copied().collect();
@@ -365,6 +413,7 @@ impl Model {
         // F51 / F50: refused with a host error — no verdict, to anyone.
         if self.inbound.len() >= NODE_ADMITS || (self.parked && self.faults && self.queued_while_parked >= PARKED_ADMITS) {
             self.log(format!("node REFUSES a frame from s{i} (queue {}, parked {})", self.inbound.len(), self.parked));
+            self.saw.insert(if self.parked { "a request refused while parked (F50)" } else { "a request refused past 101 (F51)" });
             if let protocol::Incoming::Ok(env) = protocol::decode_request(&f) {
                 if let Request::Write { write_id, .. } = env.body {
                     self.note(i, write_id, "the node refused its frame");
@@ -393,6 +442,7 @@ impl Model {
     }
 
     fn tick(&mut self, i: usize) {
+        self.fell_at_node[i] = false; // the tick refills after its own rollbacks
         let now = self.clock.now_ms();
         self.stores[i].send_tick(now);
         let queued_before = self.queued[i].clone();
@@ -400,7 +450,15 @@ impl Model {
         self.ends_across(i, |m| {
             let told = m.stores[i].tick();
             timed_out = told.rolled_back.iter().filter(|(_, why)| matches!(why, craftworks_sdk::RolledBack::Unknown)).map(|(id, _)| *id).collect();
-            told.rolled_back.iter().map(|(id, why)| (*id, format!("{why:?} (by the tick)"))).collect()
+            told.rolled_back
+                .iter()
+                .map(|(id, why)| {
+                    if matches!(why, craftworks_sdk::RolledBack::AfterFailed) {
+                        m.note(i, *id, "rolled back behind another write of its keys");
+                    }
+                    (*id, format!("{why:?} (by the tick)"))
+                })
+                .collect()
         });
         for id in timed_out {
             let waiting = self.inbound.iter().any(|(s, f)| {
@@ -411,6 +469,9 @@ impl Model {
             }
             if self.outbound.iter().any(|(to, _, about)| *to == i && *about == id) {
                 self.note(i, id, "timed out while its verdict was on its way");
+            }
+            if self.commit.as_ref().is_some_and(|c| c.session == i && c.write_id == id) {
+                self.note(i, id, "timed out while its commit was in flight");
             }
             if queued_before.contains(&id) {
                 // The node ANSWERED it (`Busy`); it sat queued at the client,
@@ -437,6 +498,14 @@ impl Model {
         if self.parked {
             return;
         }
+        // A real node runs one delegate call at a time, so a request waits in
+        // the node's queue until the commit in flight is done and meets an
+        // idle engine (sdk#176: 0 Busy in every live L4 run). `Busy` is what a
+        // request meets when it reaches the engine mid-commit anyway — a
+        // FAULT here, never on a healthy node.
+        if self.commit.is_some() && !(self.faults && self.rng.chance(30)) {
+            return;
+        }
         let Some((i, f)) = self.inbound.pop_front() else { return };
         let protocol::Incoming::Ok(env) = protocol::decode_request(&f) else { return };
         let Request::Write { write_id, ops } = env.body else { return };
@@ -444,6 +513,7 @@ impl Model {
             Rule::Today => {
                 if self.commit.is_some() {
                     self.note(i, write_id, "Busy");
+                    self.saw.insert("a Busy");
                     self.reply(i, write_id, WriteState::Busy);
                 } else if self.faults && self.rng.chance(3) {
                     // The engine refuses it as invalid: nothing applied.
@@ -497,6 +567,11 @@ impl Model {
         } else {
             self.commit = None;
             self.reply(c.session, c.write_id, WriteState::Published);
+            // As the real engine does for every coded write: ParityComplete
+            // AFTER Published — for a write the client has, by then, already
+            // settled (cached_store.rs counts it as a verdict for a write it
+            // no longer has).
+            self.reply(c.session, c.write_id, WriteState::ParityComplete);
         }
     }
 
@@ -514,6 +589,7 @@ impl Model {
         };
         if faults && self.rng.chance(6) {
             self.log(format!("verdict for s{to} w{about} DROPPED (F39)"));
+            self.saw.insert("a verdict dropped (F39)");
             self.note(to, about, "its verdict was dropped");
             return;
         }
@@ -523,6 +599,7 @@ impl Model {
             }
             to = 1 - to;
             self.log(format!("verdict about w{about} delivered to the WRONG session s{to} (F49)"));
+            self.saw.insert("a verdict misrouted (F49)");
         }
         // A session hears about its OWN writes only: a misrouted verdict names
         // the other session, and the client drops it as foreign.
@@ -539,15 +616,40 @@ impl Model {
             }
         }
         let label = state_name(&state);
+        // The session's OWN verdict refills the window — before whatever this
+        // one falls. A misrouted one is dropped as foreign and refills nothing.
+        if own {
+            self.fell_at_node[to] = false;
+        }
         self.ends_across(to, |m| {
             m.stores[to].on_inbound(&bytes);
             BTreeMap::from([(about, if own { label.clone() } else { format!("(foreign) {label}") })])
         });
     }
 
+    /// The node does work in proportion to TIME: one action (take a request,
+    /// or move the commit a step) per `NODE_ACTION_MS` — a write is three
+    /// actions, so about 3.4 commits a second, as measured live.
+    fn node_works(&mut self, dt: u64) {
+        self.node_budget += dt;
+        while self.node_budget >= NODE_ACTION_MS {
+            self.node_budget -= NODE_ACTION_MS;
+            if self.commit.is_some() {
+                self.advance_commit();
+            } else {
+                self.serve();
+            }
+        }
+    }
+
     /// The delegate FORGETS EVERYTHING — its context is gone. The tree (with
     /// whatever head PUT landed) stays; the commit in flight does not.
     fn context_loss(&mut self) {
+        self.saw.insert(match &self.commit {
+            None => "a context lost with no commit",
+            Some(c) if !c.landed => "a context lost with a commit taken, not landed",
+            Some(_) => "a context lost AFTER a head PUT",
+        });
         if let Some(c) = self.commit.clone().filter(|c| c.landed) {
             self.note(c.session, c.write_id, "the node lost its context after the head PUT");
         }
@@ -566,21 +668,35 @@ impl Model {
 
     fn fault_step(&mut self) {
         self.step += 1;
+        // Time passes on every step — honestly, so a write can sit at the node
+        // past the timeout with no jump involved.
+        let dt = self.rng.below(600);
+        self.clock.advance(dt);
+        self.honest_ms += dt;
+        self.node_works(dt);
         let i = self.rng.below(2) as usize;
         match self.rng.below(100) {
             0..=29 => self.make_write(i),
             30..=44 => self.pump(i),
             45..=59 => self.serve(),
             60..=69 => self.advance_commit(),
-            70..=81 => self.deliver(true),
+            70..=81 => self.deliver(self.faults),
             82..=89 => {
-                self.clock.advance(self.rng.below(3_000));
+                let dt = self.rng.below(3_000);
+                self.clock.advance(dt);
+                self.honest_ms += dt;
+                self.node_works(dt);
                 self.tick(i);
             }
-            90..=91 => {
+            // The client's clock JUMPS — the machine slept. RARE (1 in 500
+            // steps): the architect measured every Unknown rollback downstream
+            // of a jump when it was 1 in 50, and no seed's HONEST time ever
+            // crossed the 60 s timeout. Time now also passes on every step.
+            90..=91 if self.faults && self.rng.chance(10) => {
                 // The client's clock JUMPS: the machine slept.
                 let ms = 61_000 + self.rng.below(3_600_000);
                 self.log(format!("the client's clock JUMPS {ms} ms"));
+                self.saw.insert("the client's clock jumped");
                 for j in 0..2 {
                     let ids: Vec<u64> = self.at_node[j].keys().copied().collect();
                     for id in ids {
@@ -590,21 +706,23 @@ impl Model {
                 self.clock.advance(ms);
                 self.tick(i);
             }
-            92..=93 => self.context_loss(),
+            92..=93 if self.faults => self.context_loss(),
             94..=95 => {
                 // A BURST — a publish's handoff, a paste: more writes at once
                 // than the window holds, so the window is what paces them.
                 let n = 17 + self.rng.below(24);
                 self.log(format!("s{i} makes a BURST of {n} writes"));
+                self.saw.insert("a burst");
                 for _ in 0..n {
                     self.make_write(i);
                 }
             }
-            96 => {
+            96 if self.faults => {
                 self.parked = !self.parked;
                 self.queued_while_parked = 0;
                 let p = self.parked;
                 self.log(format!("node {}", if p { "PARKS (a cold write)" } else { "unparks" }));
+                self.saw.insert("the node parked");
             }
             _ => {
                 self.pump(0);
@@ -613,6 +731,18 @@ impl Model {
         }
         if self.cfg.driver == Driver::ResendOnSilence {
             self.resend_on_silence(i);
+        }
+        // A page sends what it has at once, and answers arrive as they come:
+        // both happen EVERY step. Under faults an answer may be held back a
+        // step (delay; out of order), dropped or misrouted — in `deliver`.
+        self.pump(0);
+        self.pump(1);
+        let ready = self.outbound.len();
+        for _ in 0..ready {
+            if self.faults && self.rng.chance(30) {
+                continue; // delayed: stays for a later step
+            }
+            self.deliver(self.faults);
         }
     }
 
@@ -713,31 +843,116 @@ impl Model {
     }
 }
 
-/// One seeded run: its findings and its trace.
-fn run(seed: u64, cfg: Config) -> (Vec<Finding>, Vec<String>) {
+/// What the step mix can reach. A situation no run reaches is one the model
+/// is BLIND to — whatever defect lives there, the sweep cannot find it — so
+/// every one is counted and printed, zeros included. (908feb6 ran identically
+/// to main, seed for seed, until bursts were in the mix: the window never
+/// bound, so its leaked slot was invisible.)
+const COVERAGE: &[&str] = &[
+    "the window bound (writes held)",
+    "a burst",
+    "a Busy",
+    "a verdict dropped (F39)",
+    "a verdict misrouted (F49)",
+    "a request refused past 101 (F51)",
+    "a request refused while parked (F50)",
+    "the node parked",
+    "a context lost with no commit",
+    "a context lost with a commit taken, not landed",
+    "a context lost AFTER a head PUT",
+    "the client's clock jumped",
+    "honest time crossed the 60 s timeout (no jump)",
+    // NOT MODELLED: the sessions write disjoint keys, so W6 holds without
+    // deltas. Two writers of one key are M2's business (`Commit{reads,
+    // writes}`); this model is blind to them, and says so.
+    "two sessions writing one key",
+];
+
+/// How the writes of a run ended, over both sessions.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Tally {
+    made: usize,
+    refused_at_make: usize,
+    published: usize,
+    rolled_back: usize,
+}
+
+/// Situations in `COVERAGE` this model does NOT reach, and why — printed, so
+/// the blindness is on the page, not discovered later.
+const NOT_REACHED: &[(&str, &str)] = &[
+    ("two sessions writing one key", "the sessions' keys are disjoint (see `keys`); two writers of one key are M2's `Commit{reads,writes}`"),
+    ("a request refused past 101 (F51)", "two windowed sessions put at most 2 x 16 writes plus their ticks in the node's queue; F51 needs the unwindowed client or more sessions (model v2)"),
+];
+
+/// One seeded run: its findings, its trace, what its mix reached, and how its
+/// writes ended.
+fn run_full(seed: u64, cfg: Config) -> (Vec<Finding>, Vec<String>, BTreeSet<&'static str>, Tally) {
     let mut m = Model::new(seed, cfg);
     for _ in 0..cfg.steps {
         m.fault_step();
     }
+    if m.honest_ms >= 60_000 {
+        m.saw.insert("honest time crossed the 60 s timeout (no jump)");
+    }
     m.drive_to_rest();
     m.check_at_rest();
-    (m.findings, m.trace)
-}
-
-/// Every (class, cause) found across `seeds`, with the first seed that found it.
-fn sweep(seeds: std::ops::Range<u64>, cfg: Config) -> BTreeMap<(&'static str, &'static str), (u64, String)> {
-    let mut first = BTreeMap::new();
-    for seed in seeds {
-        let (f, _) = run(seed, cfg);
-        for x in f {
-            first.entry((x.class, x.tag)).or_insert((seed, x.detail));
+    let mut t = Tally::default();
+    for i in 0..2 {
+        t.made += m.made[i].len();
+        for e in m.ended[i].values() {
+            match e {
+                End::Published { .. } => t.published += 1,
+                End::RolledBack { .. } => t.rolled_back += 1,
+                End::RefusedAtMake => t.refused_at_make += 1,
+            }
         }
     }
-    first
+    (m.findings, m.trace, m.saw, t)
+}
+
+fn run(seed: u64, cfg: Config) -> (Vec<Finding>, Vec<String>, BTreeSet<&'static str>) {
+    let (f, trace, saw, _) = run_full(seed, cfg);
+    (f, trace, saw)
+}
+
+type Found = BTreeMap<(&'static str, &'static str), (u64, String)>;
+
+/// Every (class, cause) found across `seeds`, with the first seed that found
+/// it — and how many runs reached each situation in `COVERAGE`.
+struct Sweep {
+    first: Found,
+    /// Runs in which each (class, cause) appeared at least once.
+    runs_with: BTreeMap<(&'static str, &'static str), usize>,
+    reached: BTreeMap<&'static str, usize>,
+}
+
+fn sweep_all(seeds: std::ops::Range<u64>, cfg: Config) -> Sweep {
+    let mut first = BTreeMap::new();
+    let mut runs_with: BTreeMap<(&'static str, &'static str), usize> = BTreeMap::new();
+    let mut reached: BTreeMap<&'static str, usize> = COVERAGE.iter().map(|c| (*c, 0)).collect();
+    for seed in seeds {
+        let (f, _, saw) = run(seed, cfg);
+        let mut here = BTreeSet::new();
+        for x in f {
+            here.insert((x.class, x.tag));
+            first.entry((x.class, x.tag)).or_insert((seed, x.detail));
+        }
+        for c in here {
+            *runs_with.entry(c).or_insert(0) += 1;
+        }
+        for c in saw {
+            *reached.entry(c).or_insert(0) += 1;
+        }
+    }
+    Sweep { first, runs_with, reached }
+}
+
+fn sweep(seeds: std::ops::Range<u64>, cfg: Config) -> Found {
+    sweep_all(seeds, cfg).first
 }
 
 fn show(seed: u64, cfg: Config) -> String {
-    let (f, trace) = run(seed, cfg);
+    let (f, trace, _) = run(seed, cfg);
     let keep: usize = std::env::var("WPM_TAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(80);
     let tail: Vec<&String> = trace.iter().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
     format!(
@@ -751,36 +966,75 @@ fn show(seed: u64, cfg: Config) -> String {
 
 // ------------------------------------------------------------- the gate
 
-/// What today's client and today's engine rule are KNOWN to break, and the
-/// issue each belongs to. The sweep must find EXACTLY these classes: a class
-/// that appears and is not listed is a NEW defect; a listed one that stops
-/// appearing means a fix landed — remove it here, and invert its tripwire.
-const KNOWN_RED_TODAY: &[(&str, &str)] = &[
-    // Told rolled back, and the node applied it — for every cause tagged.
-    ("FALSE ROLLBACK", "sdk#183 (and sdk#184 for a misrouted Published)"),
-    // A verdict arrived for a write the copy had already ended.
-    ("LATE VERDICT", "sdk#183"),
-    // A write the node answered Busy, rolled back Unknown by a timer, never re-offered.
-    ("STALE CLOCK", "sdk#183"),
-    // A Busy'd write re-sent after a later write of its session landed: K=old after K=new.
-    ("W2 OUT OF ORDER", "sdk#183"),
-    // At rest the copy shows a value the node does not have.
-    ("W6 COPY LIES", "sdk#183"),
+/// What today's client and today's engine rule are KNOWN to break: each
+/// (class, cause) PAIR, the number of the 1,000 fixed seeds that find it, and
+/// the issue it belongs to. The runs are deterministic, so the COUNT is
+/// pinned, not only the class — and per CAUSE, not only per class: a new
+/// defect that lands inside a known class (a verdict that frees no slot shows
+/// up as more STALE CLOCK and FALSE ROLLBACK; a frame that leaves after its
+/// rollback is a new cause of a known FALSE ROLLBACK) moves a count, and a
+/// fix moves one DOWN. Either way the sweep fails and says which pair —
+/// update this table in the same change, and invert a tripwire whose pair
+/// reaches 0.
+///
+/// Issues: FALSE ROLLBACK, STALE CLOCK, W2, W5 refill, W6 — sdk#183; a
+/// misrouted Published — sdk#184; LATE VERDICT — the client counting a
+/// ParityComplete for a write it no longer holds (its own fix PR).
+const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
+    // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
+    ("FALSE ROLLBACK", "Busy, then applied after a later write", 13, "sdk#183"),
+    ("FALSE ROLLBACK", "its Published went to the other session", 871, "sdk#184"),
+    ("FALSE ROLLBACK", "its verdict was dropped", 827, "sdk#183"),
+    ("FALSE ROLLBACK", "left the client after it was rolled back", 706, "sdk#183"),
+    ("FALSE ROLLBACK", "rolled back behind another write of its keys", 894, "sdk#183"),
+    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 179, "sdk#183"),
+    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 437, "sdk#183"),
+    ("FALSE ROLLBACK", "timed out while its commit was in flight", 3, "sdk#183"),
+    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 4, "sdk#183"),
+    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 20, "sdk#183"),
+    ("LATE VERDICT", "", 1000, "the ParityComplete client fix (its own PR)"),
+    ("STALE CLOCK", "Busy", 292, "sdk#183"),
+    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 246, "sdk#183"),
+    ("W5 NOT REFILLED AFTER A FALL", "", 297, "sdk#183"),
+    ("W6 COPY LIES", "", 495, "sdk#183"),
 ];
 
 #[test]
-fn the_sweep_finds_exactly_the_known_classes() {
-    let found = sweep(0..1_000, TODAY);
-    for ((class, tag), (seed, detail)) in &found {
+fn the_sweep_finds_exactly_the_known_classes_and_counts() {
+    let sw = sweep_all(0..1_000, TODAY);
+    for ((class, tag), (seed, detail)) in &sw.first {
         println!("  {class:<16} [{tag}] first at seed {seed:>4}: {detail}");
     }
-    let got: BTreeSet<&str> = found.keys().map(|(c, _)| *c).collect();
-    let want: BTreeSet<&str> = KNOWN_RED_TODAY.iter().map(|(c, _)| *c).collect();
-    let new: Vec<&&str> = got.difference(&want).collect();
-    let gone: Vec<&&str> = want.difference(&got).collect();
+    println!("  COVERAGE over 1,000 runs — a situation no run reaches is one the model is blind to:");
+    for c in COVERAGE {
+        println!("    {:>5}  {c}", sw.reached[c]);
+    }
+    // Every situation the model CLAIMS to cover is reached; the one it does
+    // not model reads 0, visibly, rather than being left off the list.
+    let blind: Vec<&&str> = COVERAGE.iter().filter(|c| !NOT_REACHED.iter().any(|(n, _)| n == *c) && sw.reached[*c] == 0).collect();
+    for (c, why) in NOT_REACHED {
+        println!("    NOT REACHED, by design: {c} — {why}");
+    }
+    assert!(blind.is_empty(), "the step mix never reaches {blind:?}: the model is blind there");
+
+    println!("  RUNS PER (CLASS, CAUSE) OF 1,000 — as table rows:");
+    for ((c, t), n) in &sw.runs_with {
+        println!("    ({c:?}, {t:?}, {n}, \"\"),");
+    }
+    let want: BTreeMap<(&str, &str), usize> = KNOWN_RED_TODAY.iter().map(|(c, t, n, _)| ((*c, *t), *n)).collect();
+    let mut moved = Vec::new();
+    for k in want.keys().chain(sw.runs_with.keys()).collect::<BTreeSet<_>>() {
+        let (was, now) = (want.get(k).copied(), sw.runs_with.get(k).copied().unwrap_or(0));
+        match was {
+            None => moved.push(format!("NEW {} [{}]: {now} runs — a defect nobody has named", k.0, k.1)),
+            Some(w) if w != now => moved.push(format!("{} [{}]: {w} → {now} runs", k.0, k.1)),
+            _ => {}
+        }
+    }
     assert!(
-        new.is_empty() && gone.is_empty(),
-        "NEW classes (a defect nobody has named): {new:?}; GONE (a fix landed — take them off KNOWN_RED_TODAY and invert their tripwire): {gone:?}"
+        moved.is_empty(),
+        "the classes the model finds on this tree MOVED — a new defect (up, or a new class) or a fix (down; invert a tripwire whose class reaches 0):\n  {}",
+        moved.join("\n  ")
     );
 }
 
@@ -789,7 +1043,7 @@ fn the_sweep_finds_exactly_the_known_classes() {
 /// (assert the class is absent for this seed) and take the class off
 /// `KNOWN_RED_TODAY` once no seed finds it.
 fn tripwire(seed: u64, cfg: Config, class: &str, tag: &str, issue: &str) {
-    let (f, _) = run(seed, cfg);
+    let (f, _, _) = run(seed, cfg);
     let hit = f.iter().any(|x| x.class == class && x.tag == tag);
     assert!(
         hit,
@@ -802,14 +1056,14 @@ fn tripwire(seed: u64, cfg: Config, class: &str, tag: &str, issue: &str) {
 /// write of the same session had landed — the older value lands last.
 #[test]
 fn known_red_busy_reorder_k_old_after_k_new() {
-    tripwire(21, TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
+    tripwire(5, TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
 }
 
 /// A Busy'd write, queued at the client with its original clock, never
 /// re-offered while others were pending, rolled back Unknown by the timer.
 #[test]
 fn known_red_stale_clock_of_a_queued_write() {
-    tripwire(0, TODAY, "STALE CLOCK", "Busy", "sdk#183");
+    tripwire(6, TODAY, "STALE CLOCK", "Busy", "sdk#183");
 }
 
 /// Run (a): the node's context is lost after the head PUT landed and before
@@ -824,7 +1078,7 @@ fn known_red_context_loss_after_the_head_put_is_a_false_rollback() {
 /// told Unknown at 60 s, and the node has it.
 #[test]
 fn known_red_misrouted_published_is_a_false_rollback() {
-    tripwire(4, TODAY, "FALSE ROLLBACK", "its Published went to the other session", "sdk#184");
+    tripwire(0, TODAY, "FALSE ROLLBACK", "its Published went to the other session", "sdk#184");
 }
 
 /// A dropped verdict (F39): the same false rollback by a different road.
@@ -840,10 +1094,16 @@ fn known_red_a_rolled_back_write_still_leaves_and_lands() {
     tripwire(0, TODAY, "FALSE ROLLBACK", "left the client after it was rolled back", "sdk#183");
 }
 
+/// The window refilled before the fall it should follow (`on_write_state`).
+#[test]
+fn known_red_the_window_is_not_refilled_after_a_fall() {
+    tripwire(0, TODAY, "W5 NOT REFILLED AFTER A FALL", "", "sdk#183");
+}
+
 /// W6 at rest: the copy shows a value the node does not have.
 #[test]
 fn known_red_the_copy_lies_at_rest() {
-    tripwire(0, TODAY, "W6 COPY LIES", "", "sdk#183");
+    tripwire(1, TODAY, "W6 COPY LIES", "", "sdk#183");
 }
 
 /// THE HARNESS'S OWN CHECK — not a finding about today's client, which
@@ -870,13 +1130,37 @@ fn harness_check_resend_on_silence_makes_today_apply_twice() {
 }
 
 /// W1 and W5 hold on today's client in every seed: a write is whole on the
-/// wire, and never more than the window of a session's writes is at the node.
-/// (They are checked every step; this pins that they are CLEAN today.)
+/// wire, never more than the window of a session's writes is at the node, and
+/// writes are not held while there is room — except right after a fall, which
+/// is its own known class. (Checked every step; this pins that they are CLEAN.)
 #[test]
 fn today_keeps_writes_whole_and_the_window() {
     let found = sweep(0..1_000, TODAY);
-    let broken: Vec<_> = found.keys().filter(|(c, _)| c.starts_with("W1") || c.starts_with("W5")).collect();
+    let broken: Vec<_> = found.keys().filter(|(c, _)| c.starts_with("W1") || *c == "W5 WINDOW" || *c == "W5 HELD WITH ROOM").collect();
     assert!(broken.is_empty(), "{broken:?}");
+}
+
+/// THE LIVENESS FLOOR. Every rest check is a SAFETY check: a client that
+/// rolls everything back, or never sends, passes them all (executed by the
+/// architect: "a node that swallows every frame: 50 writes made, applied 0,
+/// findings []"). On a HEALTHY node — no fault of any kind — every write
+/// made and not refused at make is PUBLISHED, and none is rolled back.
+#[test]
+fn liveness_on_a_healthy_node_every_write_is_published() {
+    let mut total = Tally::default();
+    let mut short = Vec::new();
+    for seed in 0..300 {
+        let (_, _, _, t) = run_full(seed, HEALTHY);
+        if t.rolled_back != 0 || t.published != t.made - t.refused_at_make {
+            short.push((seed, t));
+        }
+        total.made += t.made;
+        total.refused_at_make += t.refused_at_make;
+        total.published += t.published;
+        total.rolled_back += t.rolled_back;
+    }
+    println!("  healthy, 300 seeds: {total:?}");
+    assert!(short.is_empty(), "{} healthy runs did not publish every write: first {:?}", short.len(), short.first());
 }
 
 /// A run is a function of its seed — or no seed can be pinned.
