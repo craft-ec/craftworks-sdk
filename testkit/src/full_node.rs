@@ -126,10 +126,14 @@ impl FullNode {
             served: BTreeMap::new(),
             replies: Vec::new(),
             handed: Vec::new(),
-            one_answer_per_call: false,
+            // THE REAL NODE'S SHAPE BY DEFAULT (sdk#150). Answers handed back
+            // together are the special case, and a test that wants them says
+            // so with `answers_together`.
+            one_answer_per_call: true,
             hold: false,
             held: VecDeque::new(),
             max_stranded: 0,
+            strand_details: Vec::new(),
             params: engine::Params::default(),
             asked: BTreeMap::new(),
             fetched: BTreeMap::new(),
@@ -176,6 +180,9 @@ struct ConnState {
     held: VecDeque<Inbound>,
     /// The largest `stranded` any call reported. Must stay 0.
     max_stranded: usize,
+    /// For each call that stranded anything: WHAT, from the shell's own
+    /// `stranded_detail` (structure only, no ids).
+    strand_details: Vec<String>,
     /// The engine's parameters for this connection's calls.
     params: engine::Params,
     /// Every request this connection sent, and whether it was ANSWERED:
@@ -199,9 +206,16 @@ impl Conn {
         self.step_bounded(inbound, 0)
     }
 
-    /// Deliver the node's answers one per call, as a real node does.
+    /// Deliver the node's answers one per call, as a real node does -- the
+    /// default.
     pub fn one_answer_per_call(&self) {
         self.0.borrow_mut().one_answer_per_call = true;
+    }
+
+    /// Hand a call's answers back together in one call -- the fixture's old
+    /// shape, which no real node produces. For a control only.
+    pub fn answers_together(&self) {
+        self.0.borrow_mut().one_answer_per_call = false;
     }
 
     /// Run this connection's calls with these engine parameters.
@@ -242,6 +256,11 @@ impl Conn {
     /// end of that call. The shell's own doc says it must never be non-zero.
     pub fn max_stranded(&self) -> usize {
         self.0.borrow().max_stranded
+    }
+
+    /// What each stranding call stranded, in call order.
+    pub fn strand_details(&self) -> Vec<String> {
+        self.0.borrow().strand_details.clone()
     }
 
     /// Requests sent on this connection that have had no answer yet.
@@ -288,6 +307,11 @@ impl Conn {
             let mut s = self.0.borrow_mut();
             s.ctx = shell.to_context().expect("a context after every call");
             s.max_stranded = s.max_stranded.max(out.stranded);
+            if out.stranded > 0 {
+                let call = s.calls;
+                s.strand_details
+                    .push(format!("call {call}: {}", out.stranded_detail));
+            }
             for r in out
                 .replies
                 .iter()

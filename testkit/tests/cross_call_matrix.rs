@@ -13,6 +13,21 @@
 //! not create the condition it exists for (a parity flush that fit in one
 //! return tests nothing), which is reported, never counted as green.
 //!
+//! # Which cells exist, and which are ABSENT on purpose
+//!
+//! Modes: batch (answers together -- the old fixture, a control), one-per-call
+//! (the real node's shape), cold, evicting, real ticks, and two live
+//! sessions. A cell that is not run is a decision, listed here:
+//!
+//! | workload | run under | absent, and why |
+//! |---|---|---|
+//! | W1 multi-block commit | batch, one-per-call, +real-ticks, +cold | evicting: a WRITE reads its path once per apply, so eviction is W2/W3's case; two sessions: sdk#146's mode, not yet in this fixture |
+//! | W2 cold wide read | batch+cold, one-per-call+cold, +evicting | warm: nothing is fetched, so it cannot overflow; real ticks: a read is not ticked |
+//! | W3 parked then refused | one-per-call+cold | warm: nothing parks (reported NOT REACHED if tried); batch: its answers arrive together, hiding the node-driven verdict |
+//! | W4 commit across a tick | one-per-call+real-ticks | batch: nothing is in flight across a call; cold/evicting: W1 covers the cold commit |
+//! | W5 parity past one return | one-per-call | cold/evicting: parity is put, not read; real ticks: W4 covers ticks during a commit |
+//! | (all) | -- | two live sessions: needs a second connection whose calls interleave -- sdk#146, added there |
+//!
 //! `KNOWN_RED` is the list of cells red on the code as it stands, each naming
 //! the defect. A red cell not in the list fails the test; so does a listed
 //! cell that turns green -- a fix must move its cells, so the list can never
@@ -112,6 +127,8 @@ fn connect(node: &FullNode, mode: Mode) -> Conn {
     let c = node.connect();
     if mode.one_per_call {
         c.one_answer_per_call();
+    } else {
+        c.answers_together();
     }
     c
 }
@@ -133,9 +150,12 @@ fn node_for(mode: Mode) -> FullNode {
 /// The two assertions every cell makes, on every call it ran.
 fn every_call(c: &Conn) -> Option<String> {
     if c.max_stranded() > 0 {
+        // WHICH effects, from the per-call report -- a count cannot say.
+        let which = c.strand_details();
         return Some(format!(
-            "a call stranded {} effect(s) -- lost at the end of the call",
-            c.max_stranded()
+            "a call stranded {} effect(s) -- lost at the end of the call [{}]",
+            c.max_stranded(),
+            which.join(" / ")
         ));
     }
     let u = c.unanswered();
@@ -290,8 +310,21 @@ fn w4_commit_across_a_tick(mode: Mode) -> Cell {
     if let Some(why) = every_call(&c) {
         return Cell::Red(format!("{why}; told {st:?}"));
     }
+    // THE CRITERION, explicit: a commit younger than `max_accept_age` ticks
+    // is not `Stalled`. This workload runs at most 39 one-second ticks, all
+    // under the bound, so ANY `Stalled` here is early -- the `now` defect,
+    // which W1 cannot see (its criterion is only "publishes").
+    let bound = engine::Params::default().max_accept_age;
+    assert!(
+        k - 1 < bound,
+        "the workload outgrew its own premise: {} ticks >= {bound}",
+        k - 1
+    );
     if st.contains(&WriteState::Stalled) {
-        return Cell::Red(format!("told Stalled after at most {} s: {st:?}", k - 1));
+        return Cell::Red(format!(
+            "told Stalled within {} s, under max_accept_age ({bound} ticks): {st:?}",
+            k - 1
+        ));
     }
     if !st.contains(&WriteState::Published) {
         return Cell::Red(format!("never published: {st:?}"));
@@ -299,13 +332,17 @@ fn w4_commit_across_a_tick(mode: Mode) -> Cell {
     Cell::Green
 }
 
+/// How many writes W5 makes before its flush: enough that the flush needs
+/// more parity puts than one return carries (measured: 12 writes gave 45).
+const W5_WRITES: u64 = 40;
+
 /// W5: parity for more groups than one return may put.
 fn w5_parity_overflow(mode: Mode) -> Cell {
     let node = node_for(mode);
     let mut c = connect(&node, mode);
     c.client(&Request::Identity);
     let mut last = 0;
-    for w in 0..12u64 {
+    for w in 0..W5_WRITES {
         let ops = (0..60u64)
             .map(|i| {
                 Op::Put(
@@ -330,13 +367,16 @@ fn w5_parity_overflow(mode: Mode) -> Cell {
     let r = c.client(&Request::Flush);
     let flush_puts = c.served(testkit::full_node::Served::Put) - puts_before;
     let done = states_of(&r, last);
-    if flush_puts <= 128 {
-        return Cell::NotReached(format!(
-            "the flush put {flush_puts} parity blocks, which fit one return (128)"
-        ));
-    }
+    // Strands FIRST. What was SERVED can never exceed the per-return cap the
+    // cell exists to test -- a flush that emitted 200 serves exactly 128 --
+    // so "fit in one return" is only believed when nothing was stranded.
     if let Some(why) = every_call(&c) {
         return Cell::Red(format!("{why}; flush put {flush_puts}"));
+    }
+    if flush_puts < 128 {
+        return Cell::NotReached(format!(
+            "the flush put {flush_puts} parity blocks, under one return (128)"
+        ));
     }
     if !done.contains(&WriteState::ParityComplete) {
         return Cell::Red(format!(
@@ -352,30 +392,13 @@ type Workload = (&'static str, fn(Mode) -> Cell, Vec<Mode>);
 
 /// The cells red on the code as it stands, each with the defect it shows.
 const KNOWN_RED: &[(&str, &str, &str)] = &[
-    // THE HEAD BUMP: held on blocks an EARLIER call confirmed, stranded, never
-    // re-emitted (head_sent is already true). Fix: F2, seed the scheduler from
-    // the engine's carried `pending.confirmed`.
-    (
-        "W1 multi-block commit publishes",
-        "one-per-call",
-        "head bump stranded (F2)",
-    ),
-    (
-        "W1 multi-block commit publishes",
-        "one-per-call+cold",
-        "head bump stranded (F2)",
-    ),
-    // ...and with real ticks, also `Stalled` after ~1 s: the engine's `now` is
-    // not in the context, so `in_flight_since` is 0 against an epoch tick.
-    (
-        "W1 multi-block commit publishes",
-        "one-per-call+real-ticks",
-        "head bump stranded (F2); `now` not carried",
-    ),
+    // THE HEAD BUMP (F2) is fixed: the three W1 cells it held red are green.
+    // THE CLOCK is carried and a pre-clock start anchored (engine/tests/clock.rs):
+    // W4 is no longer Stalled. It is red on what that left visible.
     (
         "W4 commit in flight across a real tick",
         "one-per-call+real-ticks",
-        "head bump stranded (F2); Stalled after 1 s (`now` not carried)",
+        "parity for the in-flight commit gated on the STALE published root (seq 0), which the shell never seeds: stranded",
     ),
     // THE READ OVERFLOW: the engine asks for more fetches than one return
     // carries (max_gets 4); the rest wait "for the next entry", which the
@@ -398,18 +421,21 @@ const KNOWN_RED: &[(&str, &str, &str)] = &[
         "eviction ping-pong (cycle)",
     ),
     // The parked write's fetches strand FIRST (the read overflow), so the
-    // `client_version`-after-a-park defect behind it cannot show yet.
+    // `client_version`-after-a-park defect behind it cannot show yet -- and
+    // it stays red past the overflow until sdk#146, which carries the
+    // client's version WITH THE WRITE (one version per shell is overwritten
+    // by whichever client spoke last: executed on #157's review).
     (
         "W3 parked write refused, told why",
         "one-per-call+cold",
-        "parked write's fetches stranded; client_version behind it",
+        "parked write's fetches stranded; the verdict's version waits on sdk#146",
     ),
     // Every write here is multi-block, so the head strand stops the workload
     // before the parity flush it exists for.
     (
         "W5 parity wider than one return",
         "one-per-call",
-        "head bump stranded (F2) before parity is reached",
+        "parity puts over max_puts stranded (25 past 128)",
     ),
 ];
 

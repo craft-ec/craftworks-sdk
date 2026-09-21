@@ -976,6 +976,16 @@ impl<B: Blocks> Engine<B> {
         self.published_seq
     }
 
+    /// Blocks of the commit in flight that this engine has already seen
+    /// confirmed ON THE NODE -- carried in the context, so true at the top of
+    /// a call that did not see the confirmation (sdk#150). The head bump is
+    /// emitted only once every one of them is here, naming them as `after`.
+    pub fn confirmed_in_flight(&self) -> impl Iterator<Item = Cid> + '_ {
+        self.pending
+            .iter()
+            .flat_map(|c| c.confirmed.iter().copied())
+    }
+
     pub fn published_root(&self) -> Cid {
         self.published_root
     }
@@ -2347,6 +2357,19 @@ impl<B: Blocks> Engine<B> {
     }
 
     fn on_tick(&mut self, now: u64) -> Vec<Effect> {
+        // THE FIRST CLOCK THIS ENGINE SEES. `now` is 0 until a tick arrives, so
+        // a commit started before any tick recorded `in_flight_since = 0` --
+        // and against an epoch-seconds tick that is 56 years old, which told
+        // every write `Stalled` on the first tick (sdk#150, W4). A start taken
+        // before there was a clock is anchored to the first clock, not
+        // measured from zero. A real tick is never 0, so 0 means "unknown".
+        if self.now == 0 {
+            if let Some(since) = self.in_flight_since.as_mut() {
+                if *since == 0 {
+                    *since = now;
+                }
+            }
+        }
         self.now = now;
         let mut out = self.age_out_accepted(now);
         if !self.params.coalesce_parity {
@@ -2874,9 +2897,28 @@ struct Context {
     /// a caller learns to ignore — and this one matters. It only has anything
     /// in it while a commit is stuck, and it is emptied when one publishes.
     told_stalled: Vec<(ClientId, WriteId)>,
+    /// THE CLOCK the two fields above are measured against: the `now` of the
+    /// last tick this engine saw.
+    ///
+    /// `in_flight_since` joined the context in sdk#81 and the clock it is
+    /// compared with did not. So a write started in a call with no `Tick`
+    /// took `in_flight_since = 0`, the next real tick was seconds since 1970,
+    /// and every write that outlived one tick was told `Stalled` after about
+    /// a second instead of `max_accept_age` (sdk#150, W4 in the cross-call
+    /// matrix).
+    ///
+    /// It does NOT make owed parity coalesce across calls: `Owed`'s
+    /// `last_changed` and `since` are rebuilt as 0 on every rehydrate, so on a
+    /// real node a group's parity fires on the first tick after any call
+    /// boundary, whatever `parity_age` says. That is what fires W4's parity
+    /// mid-commit; it is sdk#150 PR 3's.
+    now: u64,
 }
 
 /// The version this build writes. Bumped when the shape changes.
+///
+/// 5: the engine's clock joined it -- `now`, which `in_flight_since` and the
+/// parity ages are measured against (sdk#150).
 ///
 /// 4: the parity in flight joined it — without it a confirmed parity block
 /// could not be attributed to its group, so no group ever settled and every
@@ -2890,7 +2932,7 @@ struct Context {
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 4;
+const CONTEXT_VERSION: u16 = 5;
 
 /// What a context this build wrote begins with.
 ///
@@ -2992,6 +3034,7 @@ impl<B: Blocks> Engine<B> {
             } else {
                 Vec::new()
             },
+            now: self.now,
         };
         use bincode::Options;
         let body = context_opts(self.params.max_context_bytes)
@@ -3085,6 +3128,7 @@ impl<B: Blocks> Engine<B> {
         e.parked_write = c.parked_write;
         e.in_flight_since = c.in_flight_since;
         e.told_stalled = c.told_stalled.into_iter().collect();
+        e.now = c.now;
         e.recovered = true;
         // The owed groups come back as ids with no bytes. They are recomputed
         // on demand from the node's blocks, which is sound because parity is a
