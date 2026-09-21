@@ -924,8 +924,16 @@ impl Session {
         json_of(self.decided(r)?)
     }
 
+    /// An id that does not parse answers `null`, the same as one that parses
+    /// and is not there (craftworks-sdk#118).
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
-        let k = loc_of(id)?;
+        let Some(k) = craftworks_sdk::id::loc_from_hex(id) else {
+            // The domain is still checked: a read of a domain that does not
+            // exist is a programming error, not a stale id from outside.
+            let probe = self.db.schema(domain);
+            self.answer(probe)?;
+            return Ok("null".into());
+        };
         let r = self.db.get(domain, k);
         self.answer(r)
     }

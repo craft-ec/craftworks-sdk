@@ -35,7 +35,10 @@ await assert.rejects(async () => await db.put("tasks", { done: true }), /`title`
 await assert.rejects(async () => await db.put("tasks", { title: 7 }), /must be text/);
 await assert.rejects(async () => await db.put("tasks", { title: "t", colour: "red" }), /not a field/);
 await assert.rejects(async () => await db.put("nope", { title: "t" }), /no schema/);
-await assert.rejects(async () => await db.get("tasks", "xyz"), /32 hex/);
+// An id that cannot be parsed reads as ABSENT, not as a throw: the ids
+// reaching a read come from outside the program, and "you cannot have it" is
+// one answer, not two control-flow outcomes (craftworks-sdk#118).
+assert.strictEqual(await db.get("tasks", "xyz"), null);
 await assert.rejects(async () => await db.define("tasks", { type: "Task", fields: [] }), /only appended/);
 assert.strictEqual(await db.count("tasks"), 2, "refused writes store nothing");
 

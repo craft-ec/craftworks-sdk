@@ -168,19 +168,29 @@ fn a_parented_id_round_trips_through_get_update_and_delete() {
     assert!(d.get("component", loc).unwrap().is_none());
 }
 
-/// A bare rkey cannot address a record in a parent-keyed domain, and the
-/// refusal is the point: the key needs the parent, so building one without it
-/// would read a key that cannot exist and answer `None` — a WRONG ANSWER
-/// rather than an error, with the app reporting "no such record" about one
-/// sitting right there.
+/// A bare rkey cannot address a record in a parent-keyed domain. A READ of one
+/// answers `None`; a WRITE refuses.
+///
+/// **This reverses what #122 first said**, which was that `None` here is "a
+/// WRONG ANSWER, with the app reporting no such record about one sitting right
+/// there". That scenario needs a caller holding a 64-hex id and cutting the
+/// parent off it — which the design forbids: an app never takes an id apart.
+/// The bare ids that actually reach a read come from OUTSIDE — a value stored
+/// before #122 made component ids 64 hex, a pasted link — and for those
+/// "absent" is the honest answer (craftworks-sdk#118). A write still refuses,
+/// because "nothing to do" would hide the caller's mistake.
 #[test]
-fn a_bare_id_is_refused_rather_than_answered_wrongly() {
+fn a_bare_id_reads_as_absent_and_a_write_with_one_refuses() {
     let mut d = db();
     d.define("component", &comp_schema()).unwrap();
     let rec = d.put("component", &fields("0000000000000000000000000000000a", "x")).unwrap();
     let bare = loc_from_hex(&rec.id).unwrap().rkey;
 
-    let e = d.get("component", bare).unwrap_err().to_string();
+    assert!(d.get("component", bare).unwrap().is_none());
+    // THE CONTROL: the record is there under its full id, so `None` above is
+    // about the id, not about an empty domain.
+    assert!(d.get("component", loc_from_hex(&rec.id).unwrap()).unwrap().is_some());
+    let e = d.delete("component", bare).unwrap_err().to_string();
     assert!(e.contains("cannot address"), "got: {e}");
 
     // And the other direction: a parented id in a domain with no parent.
@@ -195,7 +205,8 @@ fn a_bare_id_is_refused_rather_than_answered_wrongly() {
     .unwrap();
     let plain = d.put("note", &Map::new()).unwrap();
     assert_eq!(plain.id.len(), 32, "no parent, no parent in the id");
-    let e = d.get("note", loc_from_hex(&rec.id).unwrap()).unwrap_err().to_string();
+    assert!(d.get("note", loc_from_hex(&rec.id).unwrap()).unwrap().is_none());
+    let e = d.delete("note", loc_from_hex(&rec.id).unwrap()).unwrap_err().to_string();
     assert!(e.contains("does not key its records under a parent"), "got: {e}");
 }
 

@@ -86,10 +86,11 @@ await t("the refusals arrive in JavaScript as thrown Errors with the Rust messag
   const pid = "0000000000000000000000000000000a";
   const r = await db.put("component", { project: pid, title: "x" });
 
-  // A bare rkey cannot address a record in a parent-keyed domain. Refused
-  // rather than answered `null`, which would be a WRONG ANSWER — the app
-  // reporting "no such record" about one sitting right there.
-  await assert.rejects(() => db.get("component", r.id.slice(32)), /cannot address/);
+  // A bare rkey cannot address a record in a parent-keyed domain. A read of
+  // one is ABSENT (craftworks-sdk#118: ids reaching a read come from outside);
+  // a write with one refuses, because "nothing to do" would hide the mistake.
+  assert.strictEqual(await db.get("component", r.id.slice(32)), null);
+  await assert.rejects(() => db.delete("component", r.id.slice(32)), /cannot address/);
 
   // A patch cannot re-parent: the parent decides the key.
   await assert.rejects(
