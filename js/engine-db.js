@@ -41,6 +41,16 @@ const rethrow = e => {
   throw e;
 };
 
+/**
+ * Did the STATUS move? All three fields, because any of them is on screen.
+ *
+ * `state` alone is not enough: two failures with different reasons share a
+ * state, and a caller showing `why` would display the first sentence for
+ * ever. The same mistake as comparing rows without `state` (below) and as
+ * comparing a binding by rows alone — three instances of one shape.
+ */
+const changed = (a, b) => a.state !== b.state || a.why !== b.why || a.code !== b.code;
+
 /** Are these the same rows? By id, `updated` AND `state` — see below. */
 const same = (a, b) => {
   if (a.length !== b.length) return false;
@@ -346,25 +356,41 @@ export function engineDb(handle) {
             // without awaiting, so the rejection was unhandled and the
             // component was told nothing at all. It kept whatever rows it had
             // and no one could see that the read had failed.
-            const was = status.state;
+            const was = status;
             status = {
               state: "unreachable",
               why: String(e?.message ?? e),
               code: String(e?.code ?? ""),
             };
-            if (was !== "unreachable") for (const cb of listeners) cb();
+            // ALL THREE FIELDS, not just `state`.
+            //
+            // This compared `state` alone, so a binding that failed twice for
+            // DIFFERENT reasons replaced `why` and `code` and told nobody —
+            // and the doc above tells callers to show `why`, so a component
+            // displayed a stale sentence for ever while the real reason
+            // changed underneath it.
+            //
+            // Third instance of one shape, and this one inside the fix for
+            // the second: a row's write state moving and the snapshot
+            // comparison missing it (sdk#96), a range becoming readable and
+            // the row comparison missing it (above), and now a reason
+            // changing and the state comparison missing it. `state` is not
+            // the whole of status, exactly as rows are not the whole of a
+            // binding.
+            if (changed(was, status)) for (const cb of listeners) cb();
             return false;
           }
           root = self.root();
-          const was = status.state;
+          const was = status;
           status = { state: "ready", why: "", code: "" };
           if (same(rows, next)) {
-            // The ROWS did not change but the STATE may have: a range that
+            // The ROWS did not change but the STATUS may have: a range that
             // was unreachable and is now readable-and-empty is a different
             // screen, and a component that only watched the rows would never
             // redraw.
-            if (was !== "ready") for (const cb of listeners) cb();
-            return was !== "ready";
+            const moved = changed(was, status);
+            if (moved) for (const cb of listeners) cb();
+            return moved;
           }
           rows = next;
           for (const cb of listeners) cb();

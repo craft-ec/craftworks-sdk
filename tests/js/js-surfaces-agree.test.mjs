@@ -359,6 +359,64 @@ await t("**the state changing is itself a change, even when the rows do not**", 
     "The component would show `unreachable` over a range it can now read.");
 });
 
+await t("**a DIFFERENT reason is a change, even with the same state**", async () => {
+  // `state` alone is not the whole of status. Two failures with different
+  // reasons share a state, so a comparison on `state` replaced `why` and
+  // `code` and told nobody — and the doc tells callers to SHOW `why`, so a
+  // component displayed the first sentence for ever while the real reason
+  // changed underneath it.
+  //
+  // THE ERROR DIFFERS PER CALL, and the two are asserted distinct before
+  // anything is concluded: `bind()` itself triggers a scan, so a probe
+  // drawing from a fixed list consumes one before the first `reload()` and
+  // would compare an error against itself — a gap manufactured by its own
+  // setup.
+  let n = 0;
+  const db = engineDb({
+    session: scanning(() => {
+      n += 1;
+      const e = new Error(`reason ${n}`);
+      e.code = `CODE_${n}`;
+      throw e;
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+  const first = { ...b.status() };
+
+  let told = 0;
+  b.subscribe(() => { told += 1; });
+  await b.reload();
+  const second = { ...b.status() };
+
+  assert.notDeepEqual(first, second,
+    "the two failures are identical, so this test cannot detect anything — " +
+    "the error must differ per call");
+  assert.equal(first.state, second.state, "they must share a state, or the state alone would catch it");
+  assert.equal(second.code, `CODE_${n}`, "the latest reason is not the one held");
+  assert.equal(told, 1,
+    `the reason changed from ${first.code} to ${second.code} and nobody was told. ` +
+    "A component showing status().why displays a stale sentence for ever.");
+});
+
+await t("THE CONTROL: the SAME failure twice tells nobody", async () => {
+  // Without this, a binding that notified on every reload would pass the
+  // test above and re-render for ever on an unchanging error.
+  const db = engineDb({
+    session: scanning(() => {
+      const e = new Error("the same every time");
+      e.code = "SAME";
+      throw e;
+    }),
+  });
+  const b = db.bind("notes");
+  await b.reload();
+  let told = 0;
+  b.subscribe(() => { told += 1; });
+  await b.reload();
+  assert.equal(told, 0, "an unchanged failure notified anyway, so nothing is stable");
+});
+
 await t("THE CONTROL: both surfaces answer `status`, so an app cannot tell them apart", async () => {
   // The in-memory database is in the tab and a range there is never
   // unreachable — but a component that branched on `status()` EXISTING would
