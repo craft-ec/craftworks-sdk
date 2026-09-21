@@ -978,8 +978,8 @@ fn show(seed: u64, cfg: Config) -> String {
 /// reaches 0.
 ///
 /// Issues: FALSE ROLLBACK, STALE CLOCK, W2, W5 refill, W6 — sdk#183; a
-/// misrouted Published — sdk#184; LATE VERDICT — the client counting a
-/// ParityComplete for a write it no longer holds (its own fix PR).
+/// misrouted Published — sdk#184; LATE VERDICT — sdk#183 (on a HEALTHY node
+/// it is gone: `a_healthy_node_finds_nothing`).
 const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
     // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
     ("FALSE ROLLBACK", "Busy, then applied after a later write", 13, "sdk#183"),
@@ -992,7 +992,9 @@ const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
     ("FALSE ROLLBACK", "timed out while its commit was in flight", 3, "sdk#183"),
     ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 4, "sdk#183"),
     ("FALSE ROLLBACK", "timed out while its verdict was on its way", 20, "sdk#183"),
-    ("LATE VERDICT", "", 1000, "the ParityComplete client fix (its own PR)"),
+    // Under faults: a Published (or Failed) arriving after the copy rolled the
+    // write back — the false rollbacks above, seen from the other side.
+    ("LATE VERDICT", "", 1000, "sdk#183"),
     ("STALE CLOCK", "Busy", 292, "sdk#183"),
     ("W2 OUT OF ORDER", "Busy, then applied after a later write", 246, "sdk#183"),
     ("W5 NOT REFILLED AFTER A FALL", "", 297, "sdk#183"),
@@ -1161,6 +1163,22 @@ fn liveness_on_a_healthy_node_every_write_is_published() {
     }
     println!("  healthy, 300 seeds: {total:?}");
     assert!(short.is_empty(), "{} healthy runs did not publish every write: first {:?}", short.len(), short.first());
+}
+
+/// A HEALTHY node finds NOTHING: no fault, so no class of any kind. The
+/// last one standing on today's client was LATE VERDICT — the engine's
+/// `ParityComplete` after `Published`, counted as a stranger's verdict for
+/// a write the client had already settled (fixed with this test).
+#[test]
+fn a_healthy_node_finds_nothing() {
+    let mut found: BTreeMap<&str, (u64, String)> = BTreeMap::new();
+    for seed in 0..300 {
+        let (f, _, _) = run(seed, HEALTHY);
+        for x in f {
+            found.entry(x.class).or_insert((seed, x.detail));
+        }
+    }
+    assert!(found.is_empty(), "a node with no fault still produced findings: {found:?}");
 }
 
 /// A run is a function of its seed — or no seed can be pinned.
