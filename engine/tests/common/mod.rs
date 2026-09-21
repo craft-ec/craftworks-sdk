@@ -223,6 +223,17 @@ impl Harness {
         out
     }
 
+    /// Owed parity groups, as the engine stands (rebuilt from its context in
+    /// Rehydrate mode, as a delegate would be).
+    pub fn owed_groups(&self) -> usize {
+        match self.mode {
+            Mode::Live => self.live.as_ref().expect("a live engine").owed_groups(),
+            Mode::Rehydrate => Engine::from_context(&self.ctx, self.params, self.store.clone())
+                .expect("its own context")
+                .owed_groups(),
+        }
+    }
+
     /// The context's size as last written (Rehydrate mode).
     pub fn context_len(&self) -> usize {
         self.ctx.len()

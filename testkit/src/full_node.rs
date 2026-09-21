@@ -131,6 +131,8 @@ impl FullNode {
             // so with `answers_together`.
             one_answer_per_call: true,
             pair_by_contract: false,
+            lose_put_acks: false,
+            drop_puts: false,
             hold: false,
             held: VecDeque::new(),
             max_stranded: 0,
@@ -178,6 +180,11 @@ struct ConnState {
     /// does, and let the shell match them back (sdk#150). A hit needs no
     /// matching: the block id is computed from the state that came back.
     pair_by_contract: bool,
+    /// SILENCE on the write path (sdk#150 E2). The put LANDS and its ack is
+    /// never sent...
+    lose_put_acks: bool,
+    /// ...or the put never reaches the node at all.
+    drop_puts: bool,
     /// HOLD the node's answers instead of delivering them: they queue until
     /// the test releases them, one per call, so a tick can land while a
     /// commit is in flight.
@@ -209,6 +216,17 @@ impl Conn {
     /// Returns every reply the shell produced along the way.
     pub fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
         self.step_bounded(inbound, 0)
+    }
+
+    /// Block PUTs land and are never acknowledged (see the field).
+    pub fn lose_put_acks(&self, on: bool) {
+        self.0.borrow_mut().lose_put_acks = on;
+    }
+
+    /// Block PUTs never reach the node (see the field). Off again, the node
+    /// has healed.
+    pub fn drop_puts(&self, on: bool) {
+        self.0.borrow_mut().drop_puts = on;
     }
 
     /// Answer under CONTRACT ids, as a real node does (see the field).
@@ -373,6 +391,9 @@ impl Conn {
             match o {
                 engine_delegate::schedule::Op::Put { id, bytes } => {
                     self.record(Served::Put);
+                    if self.0.borrow().drop_puts {
+                        continue;
+                    }
                     {
                         let s = self.0.borrow();
                         s.node.store.put(id, &bytes);
@@ -381,6 +402,9 @@ impl Conn {
                         }
                     }
                     self.0.borrow_mut().handed.push(bytes);
+                    if self.0.borrow().lose_put_acks {
+                        continue;
+                    }
                     next.push(if paired {
                         Inbound::PutAckedContract {
                             contract: contract_of(&id),

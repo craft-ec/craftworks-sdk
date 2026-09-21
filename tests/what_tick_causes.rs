@@ -354,15 +354,15 @@ fn a_context_from_the_previous_version_is_refused() {
     );
 
     // The version sits at bytes [4..6], after the magic. The PREVIOUS one is
-    // 6: sdk#150 PR 3's 7 replaced `in_flight_parity` with the answers and
-    // the pacing table, a shape a v6 context would decode into as nonsense.
+    // 7: sdk#150 PR 4's 8 gave a commit its base, its carried ops and its
+    // settle pace, a shape a v7 context would decode into as nonsense.
     assert_eq!(
         u16::from_le_bytes([ctx[4], ctx[5]]),
-        7,
+        8,
         "this build's version moved: name the previous one here"
     );
     let mut old = ctx.clone();
-    old[4..6].copy_from_slice(&6u16.to_le_bytes());
+    old[4..6].copy_from_slice(&7u16.to_le_bytes());
     let (_, recovered) =
         engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
     assert!(

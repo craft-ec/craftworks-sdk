@@ -634,6 +634,14 @@ impl<B: Blocks> Shell<B> {
                 blocked_on: [0u8; 32],
             }));
         }
+        // What the engine confirmed FROM FACT during this call (a tick's
+        // settle, sdk#150 E2) reaches the scheduler too: the head bump it
+        // emitted in the same step depends on exactly those blocks, and a
+        // scheduler told only at the top of the call would hold it and lose
+        // it with the call.
+        for id in self.engine.confirmed_in_flight() {
+            sched.confirm(id);
+        }
         out.ops = sched.take(self.limits);
         // No code, no put. A delegate cannot fabricate a contract, so a PUT
         // before `Install` is one the node would refuse anyway. Refusing it
@@ -1034,8 +1042,10 @@ impl<B: Blocks> Shell<B> {
                     self.engine.step(Event::HeadConflict { seq, root })
                 }
             }
-            // Written, and not there. The ack was not a promise.
-            (Some(_), None) => Vec::new(),
+            // Written, and not there: the ack was not a promise. The engine
+            // hears it, so a commit whose head never landed re-issues it
+            // rather than waiting for a confirmation that cannot come.
+            (Some(_), None) => self.engine.step(Event::HeadMissing),
             (None, Some((seq, root))) => {
                 // Reading one is proof it is there.
                 self.head_exists = true;
