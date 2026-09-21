@@ -133,7 +133,15 @@ export async function artefactBytes(
       failures.push(`${from}: ${res.status}`);
       continue;
     }
-    const got = new Uint8Array(await res.arrayBuffer());
+    // `fetch` resolves on the HEADERS; the body can still fail, and that is
+    // this source's failure too — the next source is asked.
+    let got;
+    try {
+      got = new Uint8Array(await res.arrayBuffer());
+    } catch (e) {
+      failures.push(`${from}: ${e?.message ?? e}`);
+      continue;
+    }
     if (!(await matches(got, sha256, subtle))) {
       // Never installed, never cached. A wrong artefact is not a smaller one.
       failures.push(`${from}: does not hash to ${sha256}`);
