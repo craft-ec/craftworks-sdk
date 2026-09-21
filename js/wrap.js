@@ -37,6 +37,9 @@ export function wrap(raw) {
     async schema(domain) { return JSON.parse(this.#db.schema(domain)); }
     async domains() { return JSON.parse(this.#db.domains()); }
     async put(domain, fields) { return JSON.parse(this.#db.put(domain, JSON.stringify(fields))); }
+    // A create at a slot the caller derived with `slotFrom`, never an
+    // overwrite: → { outcome: "created" | "exists", record } (sdk#149).
+    async createAt(domain, slot, fields) { return JSON.parse(this.#db.create_at(domain, slot, JSON.stringify(fields))); }
     async update(domain, id, patch) { return JSON.parse(this.#db.update(domain, id, JSON.stringify(patch))); }
     async get(domain, id) { return JSON.parse(this.#db.get(domain, id)); }
     async delete(domain, id) { return this.#db.delete(domain, id); }
@@ -206,6 +209,8 @@ export function wrap(raw) {
     buildInfo,
     blockId: raw.blockId,
     parseBlockId,
+    // The deterministic slot for a record copied from a source (sdk#149).
+    slotFrom: raw.slotFrom,
     Db,
     // THE ONE CALL AN APP MAKES.
     //

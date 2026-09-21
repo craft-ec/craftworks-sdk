@@ -44,6 +44,29 @@ fn ser_state<S: serde::Serializer>(
     ser.serialize_str(s.code())
 }
 
+/// What [`Db::create_at`] did: made the record, or found one already there.
+///
+/// An outcome and not an error, because both answers are ordinary — a second
+/// handoff of the same row is EXPECTED to find its copy — and both carry the
+/// record. What `Exists` never means is "overwritten": the held record comes
+/// back exactly as it is stored, and deciding whether to update it is the
+/// caller's, which is the only one that knows what the copy was copied from.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "outcome", content = "record", rename_all = "lowercase")]
+pub enum CreateAt {
+    Created(Record),
+    Exists(Record),
+}
+
+/// How far ahead of this device's clock a slot's time may be.
+///
+/// A slot's first 8 bytes ARE the record's `created`, and every newest-first
+/// list sorts by them — so a slot dated in the future would sit at the top of
+/// every such list until that time passed, for ever if it is far enough out.
+/// The allowance is for two devices' clocks disagreeing, not for a date the
+/// caller chose: a policy value, five minutes, not a measured one.
+pub const SLOT_SKEW_MS: u64 = 5 * 60 * 1000;
+
 #[derive(Default, Clone, Copy)]
 pub struct Scan {
     pub reverse: bool,
@@ -416,6 +439,64 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let key = record_key(domain, loc);
         self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
         self.read(&schema, &loc, &key, &bytes)
+    }
+
+    /// Create a record at a key THE CALLER chose, or find the one already there.
+    ///
+    /// `put` mints the rkey, so writing "the same record" twice writes two.
+    /// A copy whose key is a FUNCTION of its source — [`id::slot_from`] —
+    /// lands on the same key however many times, from however many tabs, it
+    /// is made, and nothing has to remember that it was (craftworks-sdk#149).
+    ///
+    /// **A create, never an overwrite.** If a record is already stored at the
+    /// slot, it is returned as [`CreateAt::Exists`] and the tree is not
+    /// touched.
+    ///
+    /// **Not loaded is not absent.** The slot is READ before anything is
+    /// decided, and a read that could not be answered is an error, exactly as
+    /// it is for `get`. A fresh session holds nothing; answering "absent"
+    /// there would write Preview's copy over a published record — including
+    /// one edited since it was published. The recovery is the usual one: load
+    /// and ask again, which repeats the attempt and not the effect, because
+    /// nothing is written before the read answers.
+    ///
+    /// The slot's first 8 bytes are the record's `created`, as a minted id's
+    /// are — so a copy keeps its source's creation time and sorts among the
+    /// minted records by it. That makes `created` the caller's to choose, so a
+    /// time more than [`SLOT_SKEW_MS`] ahead of this clock is refused. The
+    /// record's `updated` is NOW: it was written now, whatever it copies.
+    ///
+    /// The parent, in a domain that has one, comes from the fields as it does
+    /// for `put`; the slot is the rkey under it.
+    ///
+    /// Stated residual, until the write can carry `expected: Absent`
+    /// (craftworks-sdk#148 step 1): two sessions that both read the slot
+    /// absent both write it, and the second write wins. There is still at
+    /// most ONE record at the slot; which content it holds is the later's.
+    pub fn create_at(
+        &mut self,
+        domain: &str,
+        slot: RKey,
+        fields: &Map<String, Value>,
+    ) -> Result<CreateAt> {
+        let schema = self.need_schema(domain)?;
+        let loc = Loc { parent: parent_of(&schema, fields)?, rkey: slot };
+        let key = record_key(domain, loc);
+        if let Some(held) = self.get_key(&key)? {
+            return self.read(&schema, &loc, &key, &held).map(CreateAt::Exists);
+        }
+        let now = self.env.now_ms();
+        let created = id::created_ms(&slot);
+        if created > now.saturating_add(SLOT_SKEW_MS) {
+            return Err(DbError::Refused(format!(
+                "this slot is dated {}ms ahead of this device's clock; a record's \
+                 creation time may not be more than {SLOT_SKEW_MS}ms in the future",
+                created - now
+            )));
+        }
+        let bytes = record::encode(&schema, fields, created, now.max(created), &self.author)?;
+        self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
+        self.read(&schema, &loc, &key, &bytes).map(CreateAt::Created)
     }
 
     /// Merge `patch` over the record; a `null` value removes that field.

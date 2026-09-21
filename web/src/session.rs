@@ -917,6 +917,17 @@ impl Session {
         json_of(self.decided(r)?)
     }
 
+    /// Create at a derived slot, or answer the record already there
+    /// (craftworks-sdk#149). The slot is READ first, and an unloaded one is a
+    /// parked `NotLoaded` like any read — never taken for absent, which in a
+    /// fresh session would write over the published record.
+    pub fn create_at(&mut self, domain: &str, slot: &str, fields: &str) -> Result<String, JsValue> {
+        let f = fields_of(fields)?;
+        let s = rkey_of(slot)?;
+        let r = self.db.create_at(domain, s, &f);
+        json_of(self.decided(r)?)
+    }
+
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
         let p = fields_of(patch)?;
         let k = loc_of(id)?;

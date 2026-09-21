@@ -84,6 +84,7 @@ const lateSession = ({ afterMs = 20, rows = [{ id: "a" }], fail = false } = {}) 
       throw e;
     },
     put() { return s.scan(); },
+    create_at(domain = "tasks") { return s.scan(domain); },
     // A COLD DEFINE. It reads the existing schema before it can check the new
     // one against it, so until that range is loaded it fails exactly as a
     // read does — with a ticket.
@@ -188,10 +189,12 @@ await t("**a COLD DEFINE succeeds, with no preload**", async () => {
   assert.equal(s.requests(), 1, "it issued more than one request for one range");
 });
 
-await t("a cold PUT, UPDATE and DELETE do the same — they all read first", async () => {
+await t("a cold PUT, CREATE_AT, UPDATE and DELETE do the same — they all read first", async () => {
   // `need_schema` is on all three paths, so none of them is a special case.
   for (const [name, call] of [
     ["put", db => db.put("tasks", {})],
+    // sdk#149: a cold slot is NOT absent — createAt waits to read it too.
+    ["createAt", db => db.createAt("tasks", "a", {})],
     ["update", db => db.update("tasks", "a", {})],
     ["delete", db => db.delete("tasks", "a")],
   ]) {

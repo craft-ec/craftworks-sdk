@@ -51,7 +51,7 @@ const fakeRaw = () => ({
   Db: function () {
     return {
       define() {}, schema: () => "null", domains: () => "[]",
-      put: () => "{}", update: () => "{}", get: () => "null", delete: () => false,
+      put: () => "{}", create_at: () => "{}", update: () => "{}", get: () => "null", delete: () => false,
       scan: () => "[]", count: () => 0, root: () => "", stats: () => "{}",
     };
   },
@@ -60,7 +60,7 @@ const fakeRaw = () => ({
 
 const fakeSession = () => ({
   session: {
-    schema: () => "null", domains: () => "[]", put: () => "{}", update: () => "{}",
+    schema: () => "null", domains: () => "[]", put: () => "{}", create_at: () => "{}", update: () => "{}",
     get: () => "null", delete: () => false, scan: () => "[]", count: () => 0,
     root: () => "", stats: () => "{}", define: () => undefined,
     preload: () => 0, trace: () => "null", trace_on: () => undefined,
@@ -125,7 +125,7 @@ await t("and the engine side's extras are declared, not accidental", () => {
 const ARGS = {
   define: ["d", { type: "T", fields: [] }],
   schema: ["d"], domains: [], count: ["d"], get: ["d", "x"], delete: ["d", "x"],
-  put: ["d", {}], update: ["d", "x", {}], scan: ["d"],
+  put: ["d", {}], createAt: ["d", "x", {}], update: ["d", "x", {}], scan: ["d"],
   // The parent is a record id both surfaces will refuse to parse; that is
   // fine, because what this gate compares is the SHAPE of the answer (promise
   // or value), and a refusal that differs in shape is exactly the drift it

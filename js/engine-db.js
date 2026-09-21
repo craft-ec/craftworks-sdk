@@ -241,6 +241,13 @@ export function engineDb(handle) {
       touched(domain);
       return r;
     },
+    // Reads the slot first, so a cold one parks and retries like any read;
+    // nothing is written before it answers (sdk#149).
+    async createAt(domain, slot, fields) {
+      const r = await once(() => JSON.parse(session.create_at(domain, slot, JSON.stringify(fields))));
+      touched(domain);
+      return r;
+    },
     async update(domain, id, patch) {
       const r = await once(() => JSON.parse(session.update(domain, id, JSON.stringify(patch))));
       touched(domain);
