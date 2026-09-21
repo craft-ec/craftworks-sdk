@@ -410,6 +410,10 @@ impl<T: Transport> Store for EngineStore<T> {
 /// than this: a door that exists only to turn callers away is a door, and
 /// someone eventually walks through it.
 impl<T: Transport> Reads for EngineStore<T> {
+    fn wrong_width(&self, given: usize, wanted: usize) {
+        self.client.record_wrong_width(given, wanted);
+    }
+
     fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
         self.read(key)
     }

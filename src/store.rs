@@ -150,6 +150,19 @@ pub trait Reads {
         RowState::Clean
     }
 
+    /// A read was handed a well-formed record id of the wrong WIDTH for its
+    /// domain — 32 hex where the domain keys under a parent (64), or the
+    /// reverse — and answered "not found".
+    ///
+    /// That answer is right (craftworks-sdk#118: the ids reaching a read come
+    /// from outside), and it makes one programmer error silent: a caller that
+    /// truncated a 64-hex id. So it is RECORDED, where a store has a recorder,
+    /// instead of thrown. Only the two widths: never the id, and never the
+    /// domain, whose name is the app's.
+    ///
+    /// No-op by default: a store with no recorder has nowhere to put it.
+    fn wrong_width(&self, _given: usize, _wanted: usize) {}
+
     /// Entries with `lo <= key < hi`, ascending, or descending if `reverse`;
     /// at most `limit`.
     fn scan(

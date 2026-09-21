@@ -363,6 +363,10 @@ impl Store for CachedStore {
 }
 
 impl Reads for CachedStore {
+    fn wrong_width(&self, given: usize, wanted: usize) {
+        self.client.record_wrong_width(given, wanted);
+    }
+
     /// What this key's own write is doing, from the local copy.
     ///
     /// `Unknown` when the key is not loaded — **never `Clean`**. "I have not

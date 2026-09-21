@@ -191,7 +191,7 @@ fn a_bare_id_reads_as_absent_and_a_write_with_one_refuses() {
     // about the id, not about an empty domain.
     assert!(d.get("component", loc_from_hex(&rec.id).unwrap()).unwrap().is_some());
     let e = d.delete("component", bare).unwrap_err().to_string();
-    assert!(e.contains("cannot address"), "got: {e}");
+    assert!(e.contains("wants a 64-hex id"), "a refused write names the width it wanted; got: {e}");
 
     // And the other direction: a parented id in a domain with no parent.
     d.define(

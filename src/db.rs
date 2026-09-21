@@ -478,7 +478,12 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// resolve would hide the caller's mistake instead of reporting it.
     pub fn get(&mut self, domain: &str, at: impl Into<Loc>) -> Result<Option<Record>> {
         let schema = self.need_schema(domain)?;
+        let at: Loc = at.into();
         let Ok(loc) = self.locate(&schema, domain, at) else {
+            // Well-formed (it parsed) and the wrong WIDTH for this domain: the
+            // one case the answer "not found" would otherwise leave silent.
+            let width = |parented: bool| if parented { 64 } else { 32 };
+            self.store.wrong_width(width(at.parent.is_some()), width(schema.parent.is_some()));
             return Ok(None);
         };
         let key = record_key(domain, loc);
@@ -569,12 +574,12 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let loc = at.into();
         match (&schema.parent, &loc.parent) {
             (Some(pf), None) => Err(DbError::Refused(format!(
-                "domain `{domain}` keys its records under `{pf}`, so a record id \
-                 alone cannot address one -- use the full id, which carries both"
+                "domain `{domain}` keys its records under `{pf}`, so it wants a \
+                 64-hex id (parent then record); this one is 32 hex"
             ))),
             (None, Some(_)) => Err(DbError::Refused(format!(
-                "domain `{domain}` does not key its records under a parent, but \
-                 this id carries one"
+                "domain `{domain}` does not key its records under a parent, so it \
+                 wants a 32-hex id; this one is 64 hex"
             ))),
             _ => Ok(loc),
         }

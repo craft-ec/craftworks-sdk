@@ -129,6 +129,18 @@ impl Client {
         self.rec = Some(instrument::SyncRecorder::with_capacity(capacity));
     }
 
+    /// Record that a read was handed an id of the wrong width (see
+    /// [`Reads::wrong_width`](crate::store::Reads::wrong_width)). Two numbers
+    /// from the vocabulary, 32 or 64 each; nothing from the id or the domain.
+    pub fn record_wrong_width(&self, given: usize, wanted: usize) {
+        use instrument::{vocab::Key, Entry, Event, OpId, Probe, Site};
+        const READ: Site = Site::of("sdk::db::read::id-width");
+        let Some(rec) = &self.rec else { return };
+        for (key, value) in [(Key::IdWidthGiven, given as u64), (Key::IdWidthWanted, wanted as u64)] {
+            rec.event(Event::Counter { site: READ, op: OpId::NONE, entry: Entry { key, value } });
+        }
+    }
+
     /// The recording, for a support bundle or a test. A SEPARATE handle: the
     /// trait the recording code holds returns unit and has no read-back, so a
     /// probe can never become an input.
