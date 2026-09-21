@@ -34,7 +34,7 @@
 //! `two_clients` needs.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use engine_delegate::shell::{Inbound, Shell, StoreFacts};
@@ -74,13 +74,46 @@ pub enum Served {
 /// Shared by every connection to it, because that is what one node IS.
 #[derive(Clone, Default)]
 pub struct FullNode {
+    /// What the delegate reads DIRECTLY: the node's local cache.
     store: Store,
+    /// Where a GET is answered from, when it is not the local cache: the
+    /// network behind a COLD node (sdk#150). `None` is the default warm node,
+    /// whose every block is local.
+    network: Option<Store>,
+    /// An EVICTING node answers a GET and does not keep the block (F33,
+    /// populate-not-retain), so a block fetched in one call is gone in the
+    /// next. Only meaningful with `network`.
+    evicting: bool,
     head: Rc<RefCell<Option<(u64, Cid)>>>,
 }
 
 impl FullNode {
     pub fn new() -> FullNode {
         FullNode::default()
+    }
+
+    /// A COLD node over `writer`'s network: it holds no block locally, sees
+    /// the same head Register, and answers every GET from the network --
+    /// populating its cache, unless it is also [`evicting`](Self::evicting).
+    /// What a second device, or a node that restarted, is (sdk#150).
+    pub fn cold_over(writer: &FullNode) -> FullNode {
+        FullNode {
+            store: Store::default(),
+            network: Some(
+                writer
+                    .network
+                    .clone()
+                    .unwrap_or_else(|| writer.store.clone()),
+            ),
+            evicting: false,
+            head: writer.head.clone(),
+        }
+    }
+
+    /// Answer GETs without keeping the block (F33). See `FullNode::evicting`.
+    pub fn evicting(mut self) -> FullNode {
+        self.evicting = true;
+        self
     }
 
     /// A NEW client on this node: its own delegate context, the same blocks.
@@ -93,6 +126,12 @@ impl FullNode {
             served: BTreeMap::new(),
             replies: Vec::new(),
             handed: Vec::new(),
+            one_answer_per_call: false,
+            hold: false,
+            held: VecDeque::new(),
+            max_stranded: 0,
+            params: engine::Params::default(),
+            asked: BTreeMap::new(),
         })))
     }
 
@@ -124,6 +163,23 @@ struct ConnState {
     served: BTreeMap<Served, usize>,
     replies: Vec<Vec<u8>>,
     handed: Vec<Vec<u8>>,
+    /// Deliver the node's answers ONE PER CALL, as a real node does (each
+    /// `PutResponse` / `GetResponse` is its own delegate call). Off by
+    /// default here, so no existing test changes meaning; the cross-call
+    /// matrix turns it on (sdk#150).
+    one_answer_per_call: bool,
+    /// HOLD the node's answers instead of delivering them: they queue until
+    /// the test releases them, one per call, so a tick can land while a
+    /// commit is in flight.
+    hold: bool,
+    held: VecDeque<Inbound>,
+    /// The largest `stranded` any call reported. Must stay 0.
+    max_stranded: usize,
+    /// The engine's parameters for this connection's calls.
+    params: engine::Params,
+    /// Every request this connection sent, and whether it was ANSWERED:
+    /// `w<id>` for a write (a terminal write state), `r<id>` for a read.
+    asked: BTreeMap<String, bool>,
 }
 
 /// One client's connection: its own context over a shared node.
@@ -140,6 +196,62 @@ impl Conn {
         self.step_bounded(inbound, 0)
     }
 
+    /// Deliver the node's answers one per call, as a real node does.
+    pub fn one_answer_per_call(&self) {
+        self.0.borrow_mut().one_answer_per_call = true;
+    }
+
+    /// Run this connection's calls with these engine parameters.
+    pub fn set_params(&self, params: engine::Params) {
+        self.0.borrow_mut().params = params;
+    }
+
+    /// Queue the node's answers instead of delivering them; see `release`.
+    pub fn hold_answers(&self) {
+        self.0.borrow_mut().hold = true;
+    }
+
+    /// How many node answers are queued.
+    pub fn held(&self) -> usize {
+        self.0.borrow().held.len()
+    }
+
+    /// Deliver ONE queued node answer as its own call. What that call makes
+    /// the node answer is queued again (the connection is still holding).
+    pub fn release_one(&mut self) -> Vec<Vec<u8>> {
+        let next = self.0.borrow_mut().held.pop_front();
+        match next {
+            Some(a) => self.step_bounded(vec![a], 0),
+            None => Vec::new(),
+        }
+    }
+
+    /// Send the page's clock: a `Tick` at `now_ms`, quantised exactly as a
+    /// page does (`protocol::tick_of`) -- seconds since the epoch, not the
+    /// small integers native tests used to send.
+    pub fn tick_at(&mut self, now_ms: u64) -> Vec<Vec<u8>> {
+        self.client(&protocol::Request::Tick {
+            now: protocol::tick_of(now_ms),
+        })
+    }
+
+    /// The largest number of effects any call left stranded -- lost at the
+    /// end of that call. The shell's own doc says it must never be non-zero.
+    pub fn max_stranded(&self) -> usize {
+        self.0.borrow().max_stranded
+    }
+
+    /// Requests sent on this connection that have had no answer yet.
+    pub fn unanswered(&self) -> Vec<String> {
+        self.0
+            .borrow()
+            .asked
+            .iter()
+            .filter(|(_, a)| !**a)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     fn step_bounded(&mut self, inbound: Vec<Inbound>, depth: usize) -> Vec<Vec<u8>> {
         assert!(
             depth < MAX_ROUNDS,
@@ -147,9 +259,9 @@ impl Conn {
              without settling: that is a cycle, not a slow write"
         );
 
-        let (ctx, store) = {
+        let (ctx, store, params) = {
             let s = self.0.borrow();
-            (s.ctx.clone(), s.node.store.clone())
+            (s.ctx.clone(), s.node.store.clone(), s.params)
         };
 
         let op = {
@@ -165,17 +277,39 @@ impl Conn {
 
         // Every call rehydrates. Anything the engine wanted to remember and
         // did not put in the context is gone by the next line (F32).
-        let mut shell: Shell<Store> = Shell::resume_with(
-            &ctx,
-            engine::Params::default(),
-            store,
-            StoreFacts::provisioned(),
-        );
+        let mut shell: Shell<Store> =
+            Shell::resume_with(&ctx, params, store, StoreFacts::provisioned());
         let out = shell.handle(inbound);
 
         {
             let mut s = self.0.borrow_mut();
             s.ctx = shell.to_context().expect("a context after every call");
+            s.max_stranded = s.max_stranded.max(out.stranded);
+            for r in out
+                .replies
+                .iter()
+                .filter_map(|b| protocol::decode_reply(b).ok())
+            {
+                use protocol::{Reply as R, WriteState as W};
+                let key = match r {
+                    R::WriteState { write_id, state }
+                        if state.terminal() || matches!(state, W::Published) =>
+                    {
+                        Some(format!("w{write_id}"))
+                    }
+                    R::Value { req_id, .. }
+                    | R::Page { req_id, .. }
+                    | R::Unavailable { req_id, .. }
+                    | R::Delta { req_id, .. }
+                    | R::FullReloadRequired { req_id, .. } => Some(format!("r{req_id}")),
+                    _ => None,
+                };
+                if let Some(k) = key {
+                    if let Some(a) = s.asked.get_mut(&k) {
+                        *a = true;
+                    }
+                }
+            }
             s.replies.extend(out.replies.iter().cloned());
             for (key, value) in [
                 (Key::BytesOut, out.put_bytes as u64),
@@ -201,6 +335,9 @@ impl Conn {
                     {
                         let s = self.0.borrow();
                         s.node.store.put(id, &bytes);
+                        if let Some(net) = &s.node.network {
+                            net.put(id, &bytes);
+                        }
                     }
                     self.0.borrow_mut().handed.push(bytes);
                     next.push(Inbound::PutAcked { id, ok: true });
@@ -209,7 +346,19 @@ impl Conn {
                     self.record(Served::Get);
                     let held = {
                         let s = self.0.borrow();
-                        s.node.store.get(&id).map(|b| b.to_vec())
+                        let n = &s.node;
+                        match &n.network {
+                            // A cold node answers from the network, and keeps
+                            // what it fetched unless it is evicting.
+                            Some(net) => {
+                                let b = net.get(&id).map(|b| b.to_vec());
+                                if let (Some(b), false) = (&b, n.evicting) {
+                                    n.store.put(id, b);
+                                }
+                                b
+                            }
+                            None => n.store.get(&id).map(|b| b.to_vec()),
+                        }
                     };
                     next.push(Inbound::GotState { id, bytes: held });
                 }
@@ -253,7 +402,17 @@ impl Conn {
         });
 
         let mut replies = out.replies;
-        if !next.is_empty() {
+        let (hold, one) = {
+            let s = self.0.borrow();
+            (s.hold, s.one_answer_per_call)
+        };
+        if hold {
+            self.0.borrow_mut().held.extend(next);
+        } else if one {
+            for answer in next {
+                replies.extend(self.step_bounded(vec![answer], depth + 1));
+            }
+        } else if !next.is_empty() {
             replies.extend(self.step_bounded(next, depth + 1));
         }
         replies
@@ -265,6 +424,19 @@ impl Conn {
 
     /// Send a client request and run it to a standstill.
     pub fn client(&mut self, r: &protocol::Request) -> Vec<Vec<u8>> {
+        {
+            use protocol::Request as Q;
+            let key = match r {
+                Q::Write { write_id, .. } => Some(format!("w{write_id}")),
+                Q::Get { req_id, .. }
+                | Q::Range { req_id, .. }
+                | Q::ChangesSince { req_id, .. } => Some(format!("r{req_id}")),
+                _ => None,
+            };
+            if let Some(k) = key {
+                self.0.borrow_mut().asked.insert(k, false);
+            }
+        }
         let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
         self.step(vec![Inbound::Client(frame)])
     }

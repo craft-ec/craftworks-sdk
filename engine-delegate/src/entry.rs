@@ -578,10 +578,20 @@ impl DelegateInterface for EngineDelegate {
             head_update: head_update_bytes as u32,
             read_back: out.read_back_hits as u32,
             effects: out.effects as u32,
-            note: if node_said.is_empty() {
-                trace
-            } else {
-                node_said
+            // A stranded effect is lost when this call ends, so WHAT was
+            // stranded leads the note (sdk#150): the count alone could not
+            // say which effects, or why.
+            note: {
+                let base = if node_said.is_empty() {
+                    trace
+                } else {
+                    node_said
+                };
+                if out.stranded_detail.is_empty() {
+                    base
+                } else {
+                    format!("stranded: {} | {base}", out.stranded_detail)
+                }
             },
         });
         msgs.push(OutboundDelegateMsg::ApplicationMessage(

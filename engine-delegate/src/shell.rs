@@ -98,6 +98,9 @@ pub struct Outbound {
     /// it again. This must never be non-zero, and it is reported rather than
     /// asserted so the live run can see it too.
     pub stranded: usize,
+    /// What was stranded and why, when `stranded` is non-zero (sdk#150).
+    /// Structure only -- see `Scheduler::stranded_report`.
+    pub stranded_detail: String,
     /// Counted, never a panic. Reported to the client so a format mismatch
     /// is visible rather than a silence it waits on for ever.
     pub dropped: Vec<Dropped>,
@@ -588,6 +591,9 @@ impl<B: Blocks> Shell<B> {
         }
         out.client_version = self.client_version;
         out.stranded = sched.ready_len() + sched.held_len();
+        if out.stranded > 0 {
+            out.stranded_detail = sched.stranded_report();
+        }
         out.awaiting = self.awaiting.len();
         out.read_back_hits = self.read_back_hits;
         // Counted from the ops actually leaving this call, not from a running

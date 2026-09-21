@@ -221,4 +221,46 @@ impl Scheduler {
     pub fn held_len(&self) -> usize {
         self.held.len()
     }
+
+    /// WHAT is stranded, and why -- for the per-call report (sdk#150).
+    ///
+    /// Structure only, never an id: this reaches the client's diagnostics ring
+    /// and from there a support bundle, and a block id is a hash of user data.
+    /// Each stranded op is named by kind and by which list holds it: `ready`
+    /// (cut off by a per-return limit) or `held` (waiting on a dependency),
+    /// and a held op's dependencies are classed as: another op stranded
+    /// `ready` in this same call, a put `issued` this call and not yet
+    /// confirmed, or `other` (neither -- nothing in this call will produce it).
+    pub fn stranded_report(&self) -> String {
+        let kind = |op: &Op| match op {
+            Op::Get { .. } => "get",
+            Op::Put { .. } => "put",
+            Op::Head { .. } => "head",
+            Op::ReadHead { .. } => "read-head",
+        };
+        let ready_ids: BTreeSet<Cid> = self.ready.iter().filter_map(Op::id).collect();
+        let mut parts: Vec<String> = self
+            .ready
+            .iter()
+            .map(|op| format!("ready {}", kind(op)))
+            .collect();
+        for (deps, op) in &self.held {
+            let (mut on_ready, mut on_issued, mut other) = (0, 0, 0);
+            for d in deps {
+                if ready_ids.contains(d) {
+                    on_ready += 1;
+                } else if self.issued_puts.contains(d) {
+                    on_issued += 1;
+                } else {
+                    other += 1;
+                }
+            }
+            parts.push(format!(
+                "held {} on {} dep(s): {on_ready} stranded-ready, {on_issued} issued-unconfirmed, {other} other",
+                kind(op),
+                deps.len()
+            ));
+        }
+        parts.join("; ")
+    }
 }
