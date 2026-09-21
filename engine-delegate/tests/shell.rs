@@ -41,8 +41,8 @@ fn states(out: &[Vec<u8>]) -> Vec<WriteState> {
 }
 
 fn write_req() -> Vec<u8> {
-    protocol::encode_request(
-        protocol::CURRENT,
+    protocol::encode_session_request(
+        protocol::CURRENT, protocol::mint_session(0x5e55_1017),
         &Request::Write {
             write_id: 1,
             ops: vec![protocol::Op::Put(b"k".to_vec(), vec![3u8; 40])],
@@ -195,7 +195,7 @@ fn a_put_never_readable_back_fails_only_after_its_rounds_run_out() {
 /// same thing.
 #[test]
 fn a_message_with_trailing_bytes_is_refused_rather_than_half_read() {
-    let good = protocol::encode_request(protocol::CURRENT, &Request::Flush).expect("encodes");
+    let good = protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(0x5e55_1017), &Request::Flush).expect("encodes");
     assert!(
         matches!(protocol::decode_request(&good), protocol::Incoming::Ok(_)),
         "a well-formed Flush was refused, so the check below shows nothing"
@@ -470,8 +470,8 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
         },
     );
 
-    let req = protocol::encode_request(
-        protocol::CURRENT,
+    let req = protocol::encode_session_request(
+        protocol::CURRENT, protocol::mint_session(0x5e55_1017),
         &Request::Install {
             block_code: vec![1u8; 64],
             register_code: vec![2u8; 32],
@@ -497,7 +497,7 @@ fn install_provisions_what_the_delegate_cannot_make_and_nothing_is_derived() {
     // What the ENGINE records is where its authority came from — and the
     // type says TEST, which is the whole point of naming it.
     let out = s.handle(vec![Inbound::Client(
-        protocol::encode_request(protocol::CURRENT, &Request::Identity).expect("encodes"),
+        protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(0x5e55_1017), &Request::Identity).expect("encodes"),
     )]);
     assert!(
         out.ops
@@ -551,7 +551,7 @@ fn a_commit_larger_than_one_return_is_refused_rather_than_half_emitted() {
             })
             .collect();
         let out = s.handle(vec![Inbound::Client(
-            protocol::encode_request(version, &Request::Write { write_id: 1, ops })
+            protocol::encode_session_request(version, protocol::mint_session(0x5e55_1017), &Request::Write { write_id: 1, ops })
                 .expect("encodes"),
         )]);
         let puts = out
@@ -623,8 +623,8 @@ fn a_subscribed_range_is_pushed_a_changed_across_the_context() {
     // One call: subscribe.
     let mut s: Shell<Store> = Shell::resume(&ctx, Params::default(), store.clone());
     let out = s.handle(vec![Inbound::Client(
-        protocol::encode_request(
-            protocol::CURRENT,
+        protocol::encode_session_request(
+            protocol::CURRENT, protocol::mint_session(0x5e55_1017),
             &Request::SubscribeRange {
                 sub_id: 7,
                 lo: protocol::Bound::Included(b"k".to_vec()),
@@ -719,8 +719,8 @@ fn a_commit_outside_the_subscribed_range_pushes_nothing() {
     let store = Store::default();
     let mut s: Shell<Store> = Shell::resume(&[], Params::default(), store.clone());
     let out = s.handle(vec![Inbound::Client(
-        protocol::encode_request(
-            protocol::CURRENT,
+        protocol::encode_session_request(
+            protocol::CURRENT, protocol::mint_session(0x5e55_1017),
             &Request::SubscribeRange {
                 sub_id: 7,
                 // `write_req` writes the key "k"; this range starts after it.
@@ -992,7 +992,7 @@ fn a_write_refused_after_a_park_is_told_in_its_clients_version_whoever_else_spea
     let node = Store::default();
     let mut ctx: Vec<u8> = Vec::new();
     let mut inbound = vec![Inbound::Client(
-        protocol::encode_request(protocol::CURRENT, &Request::Write {
+        protocol::encode_session_request(protocol::CURRENT, protocol::mint_session(0x5e55_1017), &Request::Write {
             write_id: 1,
             ops: (0..400u32).map(|i| protocol::Op::Put(format!("h/{i:04}").into_bytes(), vec![i as u8; 200])).collect(),
         })
@@ -1126,8 +1126,8 @@ fn a_head_read_back_at_our_seq_under_another_root_is_not_published() {
         let node = Store::default();
         let mut ctx: Vec<u8> = Vec::new();
         let mut inbound = vec![Inbound::Client(
-            protocol::encode_request(
-                protocol::CURRENT,
+            protocol::encode_session_request(
+                protocol::CURRENT, protocol::mint_session(0x5e55_1017),
                 &Request::Write {
                     write_id: 1,
                     ops: vec![protocol::Op::Put(b"k/a".to_vec(), vec![7u8; 3000])],

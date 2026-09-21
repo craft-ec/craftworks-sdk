@@ -33,7 +33,7 @@ async fn connect(ws: &str) -> Result<WebApi> {
     Ok(WebApi::start(stream))
 }
 async fn send(client: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()> {
-    let payload = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
+    let payload = protocol::encode_session_request(protocol::CURRENT, probe_session(), r).expect("encodes");
     timeout(STEP, client.send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
         key: key.clone(), params: vec![].into(),
         inbound: vec![InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload))] })))
@@ -52,7 +52,7 @@ async fn write(client: &mut WebApi, key: &DelegateKey, id: u64, ops: Vec<protoco
         if let Ok(Ok(HostResponse::DelegateResponse { values, .. })) = timeout(Duration::from_millis(250), client.recv()).await {
             for v in values { if let OutboundDelegateMsg::ApplicationMessage(m) = v {
                 match protocol::decode_reply(&m.payload.to_vec()) {
-                    Ok(Reply::WriteState { write_id, state }) if write_id == id => {
+                    Ok(Reply::WriteState { write_id, state } | Reply::SessionWriteState { write_id, state, .. }) if write_id == id => {
                         if state == WriteState::Published && h.first_published_ms.is_none() { h.first_published_ms = Some(t0.elapsed().as_millis()); stop_at = Some(Instant::now() + Duration::from_millis(2500)); }
                         if state == WriteState::Busy { stop_at = Some(Instant::now()); }
                         h.states.push(state);
@@ -127,4 +127,11 @@ async fn main() -> Result<()> {
     println!("done in {:.1} s (budget {} s)", started.elapsed().as_secs_f32(), BUDGET.as_secs());
     if red.is_empty() { println!("VERDICT: GREEN — a no-op write publishes at once with zero ops, and the engine stays open"); Ok(()) }
     else { for r in &red { println!("RED: {r}"); } bail!("{} check(s) red", red.len()) }
+}
+
+/// This probe's session: sessioned, as every app is. It passed `CURRENT` to
+/// the session-less encoder, which clamped it to v3 on the LEGACY session —
+/// the one path no app takes (craftworks-sdk#194).
+fn probe_session() -> u64 {
+    protocol::mint_session(0x9E37_79B9_7F4A_7C15 ^ std::process::id() as u64)
 }

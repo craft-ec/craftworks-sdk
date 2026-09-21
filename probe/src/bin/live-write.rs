@@ -38,7 +38,7 @@ async fn connect(ws: &str) -> Result<WebApi> {
 }
 
 async fn send(client: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()> {
-    let payload = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
+    let payload = protocol::encode_session_request(protocol::CURRENT, probe_session(), r).expect("encodes");
     timeout(
         STEP,
         client.send(ClientRequest::DelegateOp(
@@ -67,7 +67,7 @@ async fn until(client: &mut WebApi, want: State, deadline: Instant) -> (bool, Ve
                     if let OutboundDelegateMsg::ApplicationMessage(m) = v {
                         let owned = m.payload.to_vec();
                         match protocol::decode_reply(&owned) {
-                            Ok(Reply::WriteState { state, .. }) => {
+                            Ok(Reply::WriteState { state, .. } | Reply::SessionWriteState { state, .. }) => {
                                 seen.push(state);
                                 if state == want {
                                     return (true, seen);
@@ -700,4 +700,11 @@ fn getrandom(buf: &mut [u8]) {
         s ^= s << 17;
         *b = (s & 0xff) as u8;
     }
+}
+
+/// This probe's session: sessioned, as every app is. It passed `CURRENT` to
+/// the session-less encoder, which clamped it to v3 on the LEGACY session —
+/// the one path no app takes (craftworks-sdk#194).
+fn probe_session() -> u64 {
+    protocol::mint_session(0x9E37_79B9_7F4A_7C15 ^ std::process::id() as u64)
 }

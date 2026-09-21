@@ -956,6 +956,10 @@ pub enum Dropped {
     /// An `Acked` reply whose `ack.session` is not the session its body names:
     /// one reply is about one session.
     AckSessionMismatch,
+    /// A session-less encoder asked for a version whose frames carry a
+    /// session (v4 and later): use `encode_session_request`, or say you mean
+    /// the legacy path with `LAST_SESSIONLESS` (craftworks-sdk#194).
+    NeedsSession,
 }
 
 /// The largest message this build will decode.
@@ -987,11 +991,23 @@ fn opts() -> impl bincode::Options {
 ///
 /// A request with NO session is a pre-v4 request: from v4 a frame must name
 /// a real session, and the legacy one is refused at decode
-/// ([`Dropped::BadSession`]). So this encodes at most v3; a client that has a
-/// session sends it with [`encode_session_request`].
+/// ([`Dropped::BadSession`]). So this encodes at most v3
+/// ([`LAST_SESSIONLESS`]), and asking it for v4 or later is REFUSED by name
+/// ([`Dropped::NeedsSession`]) — it used to CLAMP, so every caller passing
+/// `CURRENT` (every probe) silently spoke v3 on the legacy session, the one
+/// path no app uses (craftworks-sdk#194). A client that has a session sends it
+/// with [`encode_session_request`]; one that means the legacy path says so
+/// with `LAST_SESSIONLESS`.
 pub fn encode_request(version: u16, body: &Request) -> Result<Vec<u8>, Dropped> {
-    encode_session_request(version.min(SESSION_SINCE - 1), LEGACY_SESSION, body)
+    if version >= SESSION_SINCE {
+        return Err(Dropped::NeedsSession);
+    }
+    encode_session_request(version, LEGACY_SESSION, body)
 }
+
+/// The newest version with NO session on the wire: what a caller of
+/// [`encode_request`] passes when it means the legacy path.
+pub const LAST_SESSIONLESS: u16 = SESSION_SINCE - 1;
 
 /// Encode a client's message from `session`. Before v4 the session is not
 /// on the wire and a reader takes it to be [`LEGACY_SESSION`].

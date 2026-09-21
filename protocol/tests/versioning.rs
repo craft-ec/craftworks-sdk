@@ -79,7 +79,7 @@ fn a_future_body_is_unsupported_not_unparseable() {
 /// Trailing bytes are refused, not half-read.
 #[test]
 fn a_message_with_trailing_bytes_is_refused() {
-    let good = encode_request(CURRENT, &Request::Flush).expect("encodes");
+    let good = encode_session_request(CURRENT, mint_session(0x5e55_1017), &Request::Flush).expect("encodes");
     let mut trailing = good.clone();
     trailing.extend_from_slice(b"and then some");
     assert_eq!(
@@ -98,8 +98,8 @@ fn a_message_with_trailing_bytes_is_refused() {
 /// print the same thing.
 #[test]
 fn nothing_malformed_panics_and_every_case_is_refused() {
-    let good = encode_request(
-        CURRENT,
+    let good = encode_session_request(
+        CURRENT, mint_session(0x5e55_1017),
         &Request::Write {
             write_id: 1,
             ops: vec![Op::Put(b"k".to_vec(), vec![7u8; 64])],
@@ -215,4 +215,18 @@ fn a_v4_frame_with_a_session_no_client_can_hold_is_refused_by_name() {
         let b = protocol::encode_session_request(4, good, &Request::Flush).expect("encodes");
         assert!(matches!(decode_request(&b), Incoming::Ok(_)), "session {good:#x}");
     }
+}
+
+/// The session-less encoder REFUSES a version whose frames carry a session —
+/// it used to clamp v4+ to v3, so every caller passing `CURRENT` spoke the
+/// legacy session silently (craftworks-sdk#194).
+#[test]
+fn the_session_less_encoder_refuses_a_sessioned_version_by_name() {
+    for v in [SESSION_SINCE, CURRENT, FLOOR_SINCE] {
+        assert_eq!(encode_request(v, &Request::Flush), Err(Dropped::NeedsSession), "v{v}");
+    }
+    // CONTROL: the legacy path, asked for by name, still encodes — as v3.
+    let legacy = encode_request(LAST_SESSIONLESS, &Request::Flush).expect("encodes");
+    assert_eq!(u16::from_le_bytes([legacy[0], legacy[1]]), 3);
+    assert!(matches!(decode_request(&legacy), Incoming::Ok(Envelope { session: LEGACY_SESSION, .. })));
 }

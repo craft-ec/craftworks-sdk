@@ -301,7 +301,10 @@ impl Node {
     /// read-back lands later still. That span is exactly what a one-process
     /// driver cannot see.
     pub fn client(&mut self, r: &protocol::Request) -> Vec<Vec<u8>> {
-        let frame = protocol::encode_request(protocol::CURRENT, r).expect("encodes");
+        // The LEGACY path, by name: `client` is the session-less client of the
+        // fixture (`client_as` is the sessioned one). It asked for CURRENT and
+        // was clamped to v3 until sdk#194 made the encoder refuse; same wire.
+        let frame = protocol::encode_request(protocol::LAST_SESSIONLESS, r).expect("encodes");
         let mut out = self.step(vec![Inbound::Client(frame)]);
         for _ in 0..6 {
             let acks: Vec<Inbound> = std::mem::take(&mut self.last_put_ids)
