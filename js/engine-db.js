@@ -279,7 +279,7 @@ export function engineDb(handle) {
      * reloaded. Both have the same snapshot and the same subscribe, so
      * flipping it never changes the component.
      */
-    bind(domain, { live = false, limit = 0 } = {}) {
+    bind(domain, { live = false, limit = 0, reverse = false } = {}) {
       let rows = [], root = null;
       // WHAT THIS BINDING LAST MANAGED TO DO.
       //
@@ -327,6 +327,24 @@ export function engineDb(handle) {
          */
         get limit() { return limit; },
         /**
+         * WHICH END OF THE RANGE A PAGE COMES FROM.
+         *
+         * A limit without a direction is only half a page. Ids are
+         * time-ordered, so the first `limit` rows of a FORWARD scan are the
+         * OLDEST — and a caller that renders newest-first by reversing the
+         * snapshot then shows the oldest page in reverse order, with the
+         * newest records never on screen at all.
+         *
+         * Measured on the builder (craftworks-builder#51): past 50 records a
+         * list showed notes 1..50 newest-first and note 51 onward never
+         * appeared, though the form had accepted them. The page bounded the
+         * read and silently changed WHICH rows it was a page OF.
+         *
+         * So the direction belongs to the binding, beside the limit, and not
+         * to whoever reverses an array afterwards.
+         */
+        get reverse() { return reverse; },
+        /**
          * `{ state, why, code }` — `loading`, `ready` or `unreachable`.
          *
          * # A BINDING'S OBSERVABLE STATE IS ROWS **AND** STATUS
@@ -373,7 +391,7 @@ export function engineDb(handle) {
           try {
             // THE PAGE, not the domain. `limit: 0` is unbounded and is what
             // the scan has always done.
-            next = await self.scan(domain, { limit });
+            next = await self.scan(domain, { limit, reverse });
           } catch (e) {
             // UNREACHABLE IS AN ANSWER, not an exception to swallow.
             //
