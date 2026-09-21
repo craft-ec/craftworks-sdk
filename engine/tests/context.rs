@@ -806,11 +806,13 @@ fn a_damaged_context_is_refused_without_panicking_or_allocating_the_world() {
 /// A refused context costs a restart, not correctness.
 ///
 /// This is the other half of refusing: it is only free if what follows is
-/// right. The engine starts from `Start`, re-reads its head, and answers a
-/// client asking about the write that was in flight with `Lost` — the word
-/// that leaves the client holding a write it can safely re-submit.
+/// right. The engine starts from `Start`, re-reads its head, and gives a
+/// client asking about the write that was in flight NO verdict: a fresh
+/// engine cannot tell a write that died from one whose head landed before the
+/// loss, so `Lost` would be a guess (WRITE-PATH.md session table; sdk#196).
+/// The client's own timeout hands the write back.
 #[test]
-fn a_refused_context_recovers_from_the_head_and_reports_the_write_lost() {
+fn a_refused_context_recovers_from_the_head_and_gives_the_unknown_write_no_verdict() {
     let mut store = Store::default();
     let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
     let out = e.step(Event::Write {

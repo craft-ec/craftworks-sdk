@@ -110,7 +110,7 @@ fn rebuild(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> Cid {
 #[test]
 fn the_engine_survives_being_dropped_at_every_commit_boundary() {
     let mut cut_at: BTreeMap<Cut, usize> = BTreeMap::new();
-    let mut checked_lost = 0usize;
+    let mut checked_unknown = 0usize;
 
     for (batch_n, cut) in CUTS.iter().enumerate() {
         // A scripted workload: three commits, cut in the third.
@@ -337,7 +337,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                 "{cut:?}: write {wid:?} is unknown to the restarted engine, and \
                  it was given a verdict anyway: {out:?}"
             );
-            checked_lost += 1;
+            checked_unknown += 1;
         }
         let _ = batch_n;
     }
@@ -352,11 +352,11 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
         CUTS.len()
     );
     assert!(
-        checked_lost > 0,
-        "no accepted-only write was ever checked for Lost"
+        checked_unknown > 0,
+        "no accepted-only write was ever asked after"
     );
     println!(
-        "  cut at all {} boundaries; {checked_lost} Lost replies checked",
+        "  cut at all {} boundaries; {checked_unknown} unknown writes given no verdict",
         CUTS.len()
     );
 }
@@ -1077,7 +1077,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
              different tree from the one the lost commit would have published"
         );
         println!(
-            "  head {}: recovered at {}, write reported Lost, re-submit \
+            "  head {}: recovered at {}, the unknown write given no verdict, re-submit \
              reproduces the intended tree",
             if landed { "landed" } else { "did NOT land" },
             if landed {

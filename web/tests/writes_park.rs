@@ -198,7 +198,7 @@ fn the_decision_is_delegated_to_the_sdk() {
 fn the_tick_asks_after_quiet_writes() {
     let body = body_of("tick");
     assert!(
-        body.contains("ask_unheard("),
+        calls(&body, ".ask_unheard(now);"),
         "`Session::tick` no longer asks after the writes the engine went quiet on (sdk#174)"
     );
 }
@@ -216,7 +216,67 @@ fn a_refusal_answers_its_frame() {
     let arm = &body[at..];
     let arm = &arm[..arm.find("\n            Incoming::").unwrap_or(arm.len())];
     assert!(
-        arm.contains("frame_refused()"),
+        calls(arm, ".client.frame_refused();"),
         "the `Incoming::Refused` arm does not count the refusal as its frame's answer: {arm}"
     );
+}
+
+/// Does this code CALL `statement` (e.g. `.client.frame_refused();`)? Line
+/// comments, block comments and string literals are removed first: `body_of`
+/// strips only `//`, so a `/* frame_refused() */` or a string naming it would
+/// otherwise pass a gate about what the code DOES (sdk#196 merge review).
+fn calls(code: &str, statement: &str) -> bool {
+    let mut out = String::new();
+    let b = code.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i..].starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i..].starts_with(b"/*") {
+            match code[i + 2..].find("*/") {
+                Some(e) => i += e + 4,
+                None => break,
+            }
+        } else if b[i] == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    let squeezed: String = out.split_whitespace().collect();
+    let want: String = statement.split_whitespace().collect();
+    squeezed.contains(&want)
+}
+
+/// THE CONTROL for the reader above: it finds a real call, and refuses the
+/// same words in a line comment, a block comment, a string, or mentioned
+/// without being called -- so `a_refusal_answers_its_frame` can fail.
+#[test]
+fn control_only_a_real_call_counts_as_frame_refused() {
+    assert!(calls(
+        "self.db.store_mut().client.frame_refused();",
+        ".client.frame_refused();"
+    ));
+    assert!(calls(
+        "self.db\n    .store_mut()\n    .client\n    .frame_refused();",
+        ".client.frame_refused();"
+    ));
+    for fake in [
+        "// self.db.store_mut().client.frame_refused();",
+        "/* self.db.store_mut().client.frame_refused(); */",
+        "let s = \"self.db.store_mut().client.frame_refused();\";",
+        "let f = Client::frame_refused;",
+    ] {
+        assert!(
+            !calls(fake, ".client.frame_refused();"),
+            "the reader counted a non-call: {fake}"
+        );
+    }
 }
