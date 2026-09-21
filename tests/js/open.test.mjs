@@ -52,7 +52,7 @@ function fakeSession({ deliverAfterMs = null } = {}) {
     refused: () => "",
     exhausted: () => false,
     pendingDelivery: false,
-    tick_ms: () => 7777,
+    tick_ms: () => 7777, unsaved_writes: () => 0,
     flush() {},
     // The TICK. This is where a load nobody answered is given up on — in the
     // real session, `loads.time_out`.

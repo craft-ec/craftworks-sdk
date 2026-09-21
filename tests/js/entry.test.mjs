@@ -51,7 +51,7 @@ function fakeRaw() {
     unusable: () => "[]",
     // A DISTINCTIVE RATE. 1000 would pass whether the page asked the session
     // or wrote a literal; 7777 can only come from having asked.
-    tick_ms: () => 7777,
+    tick_ms: () => 7777, unsaved_writes: () => 0,
     ticks: 0,
     flushes: 0,
     tick() {
@@ -151,7 +151,7 @@ function watchingRaw() {
     unusable: () => "[]",
     // A DISTINCTIVE RATE. 1000 would pass whether the page asked the session
     // or wrote a literal; 7777 can only come from having asked.
-    tick_ms: () => 7777,
+    tick_ms: () => 7777, unsaved_writes: () => 0,
     ticks: 0,
     flushes: 0,
     tick() {
@@ -385,6 +385,67 @@ await t("and closing flushes, while the socket can still carry it", async () => 
     "moment the frame could still be sent");
   assert.equal(page.doc.size, 0, "the lifecycle listeners outlived the page");
   assert.equal(page.win.size, 0, "the window listeners outlived the page");
+});
+
+// ---- THE UNSAVED-CHANGES GUARD (craftworks-sdk#163) ------------------------
+//
+// A write is safe from a closing tab only once it is PUBLISHED. The session
+// counts every write not yet published — held by the window included
+// (`unsaved_writes`, tested natively in tests/unsaved_writes.rs) — and the
+// page asks the browser's "leave site?" question while that count is above
+// zero, and stops asking the moment it reaches zero.
+
+/** A fake session whose unsaved count the test sets, and whose `put` makes one. */
+function unsavedRaw() {
+  const raw = fakeRaw();
+  const s = raw.__session;
+  s.unsaved = 0;
+  s.unsaved_writes = () => s.unsaved;
+  s.put = () => { s.unsaved += 1; return JSON.stringify({ id: "a".repeat(32), created: 1, updated: 1, fields: {} }); };
+  return raw;
+}
+
+/** What a browser does with a `beforeunload` listener: call it, and ask if it objected. */
+const leaving = page => {
+  const fn = page.win.get("beforeunload");
+  if (!fn) return { asked: false };
+  const e = { prevented: false, preventDefault() { this.prevented = true; }, returnValue: undefined };
+  fn(e);
+  return { asked: e.prevented || e.returnValue !== undefined };
+};
+
+await t("**a write made and not yet published arms the guard AT ONCE; the last one publishing disarms it**", async () => {
+  const raw = unsavedRaw();
+  const events = [];
+  const page = pageOf(raw, { onEvent: e => { if (e.kind === "saving") events.push(e.count); } });
+  const { db, close } = await wrap(raw).open(page.opts);
+  assert.equal(page.win.has("beforeunload"), false, "a page with nothing unsaved asks the leave-site question anyway");
+
+  for (let i = 0; i < 100; i++) await db.put("tasks", { title: `row ${i}` });
+  // Armed in the same task as the write — not at the next message or tick.
+  assert.equal(leaving(page).asked, true, "100 writes unsaved and the tab would close without a word");
+
+  raw.__session.unsaved = 3;          // 97 published; 3 still going
+  page.clock.body();
+  assert.equal(leaving(page).asked, true, "disarmed with 3 writes still unsaved");
+
+  raw.__session.unsaved = 0;          // the last one published
+  page.clock.body();
+  assert.equal(page.win.has("beforeunload"), false, "everything is published and the page still objects to closing");
+
+  assert.deepEqual(events, [...Array.from({ length: 100 }, (_, i) => i + 1), 3, 0],
+    "the page was not told each count as it changed — it cannot say 'saving N…' without it");
+  close();
+});
+
+await t("closing a page with writes unsaved removes the guard with the page", async () => {
+  const raw = unsavedRaw();
+  const page = pageOf(raw);
+  const { db, close } = await wrap(raw).open(page.opts);
+  await db.put("tasks", { title: "one" });
+  assert.equal(page.win.has("beforeunload"), true);
+  close();
+  assert.equal(page.win.has("beforeunload"), false, "the guard outlived the page");
 });
 
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");

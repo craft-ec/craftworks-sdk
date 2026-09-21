@@ -81,7 +81,7 @@ function fakeRaw() {
     url: () => "ws://127.0.0.1:17509/", outbound: () => [], sent() {}, reconnected() {}, provision() {},
     take_progress: () => "[]", take_loads: () => "[]", provisioned: () => true, refused: () => "",
     exhausted: () => false, unusable: () => "[]",
-    tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }), tick_ms: () => 7777,
+    tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }), tick_ms: () => 7777, unsaved_writes: () => 0,
     flush() {}, bind() {}, unbind() {}, refresh_domain() {}, scan, root: () => "root",
     live_mode: () => JSON.stringify({ mode: "HeadSubscribed", why: "", foreignNotifications: 0 }),
     take_stale: () => "[]",
