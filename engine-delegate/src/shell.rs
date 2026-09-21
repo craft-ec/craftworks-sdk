@@ -436,6 +436,18 @@ impl<B: Blocks> Shell<B> {
         if self.engine.published_seq() > 0 {
             sched.confirm(self.engine.published_root());
         }
+        // THE SAME RULE, for the commit in flight (sdk#150). On a real node
+        // each answer to a PUT is its own call, so the block a head bump waits
+        // on was confirmed in an EARLIER call -- this scheduler, which starts
+        // every call knowing nothing, held the head on it, the head was
+        // stranded at the end of the call, the engine (having already marked
+        // it sent) never emitted it again, and the write never published.
+        // Measured live on every revision back to #85. The engine carries
+        // what it has seen confirmed, so the scheduler is told, not left to
+        // rediscover it.
+        for id in self.engine.confirmed_in_flight() {
+            sched.confirm(id);
+        }
 
         for msg in inbound {
             // Attribution BEFORE the work, so the steps the work produces
