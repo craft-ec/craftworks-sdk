@@ -102,10 +102,6 @@ fn a_commit_manifest_round_trips_and_refuses_a_malformed_one() {
         prev_root: [9u8; 32],
         seq: 8,
         root: [4u8; 32],
-        owed: vec![
-            [[1u8; 32], [2u8; 32], [3u8; 32]],
-            [[5u8; 32], [6u8; 32], [7u8; 32]],
-        ],
     };
     let bytes = m.encode();
     assert_eq!(pack::Manifest::decode(&bytes).as_ref(), Some(&m));
@@ -123,11 +119,63 @@ fn a_commit_manifest_round_trips_and_refuses_a_malformed_one() {
         pack::Manifest::decode(&extra).is_none(),
         "a manifest with trailing bytes decoded anyway"
     );
-    // A count that does not match what follows.
-    let mut lying = bytes.clone();
-    lying[84] = 9;
-    assert!(
-        pack::Manifest::decode(&lying).is_none(),
-        "a manifest claiming 9 groups it does not carry decoded anyway"
-    );
+    // FIXED WIDTH now that the owed set is gone (craftworks-sdk#117), so the
+    // length itself is the check: a manifest is exactly this long.
+    assert_eq!(bytes.len(), 4 + 8 + 32 + 8 + 32, "the manifest is fixed width");
+}
+
+/// THE CHECK HAS TO FIRE.
+///
+/// Before craftworks-sdk#117 `PackError::TooLarge` was not merely unfired but
+/// UNFIREABLE: `max_body` appeared nowhere in the SDK, so nothing compared a
+/// member to its kind's limit and an oversized pack was built in silence and
+/// refused at the NODE — remotely, where a node can log nothing at the moment
+/// it refuses.
+///
+/// A size check that no test fires is that same defect one level up, so this
+/// drives the boundary from both sides for every kind that has its own limit.
+/// The limit is per KIND, not per pack: packed members are `RAW`, so the
+/// ceiling that bites one is 262,208 and not the pack's 1 MiB.
+#[test]
+fn an_oversized_member_is_refused_here_rather_than_at_the_node() {
+    let raw = freenet_prolly::kind::RAW;
+    for kind in [raw, freenet_prolly::kind::PARITY, pack::PACK_KIND] {
+        let limit = pack::max_body(kind);
+
+        // Exactly at the limit is ACCEPTED. Without this the check could be
+        // off by one in the safe direction and refuse what the network takes.
+        pack::build(&[member(kind, 1, limit)])
+            .unwrap_or_else(|e| panic!("kind {kind} at its limit of {limit} B must build: {e:?}"));
+
+        // One byte over is refused, and the error says WHY — it is rendered
+        // into a panic message by the only caller, so what it carries is the
+        // whole diagnosis available at the moment it fires.
+        match pack::build(&[member(kind, 1, limit + 1)]) {
+            Err(pack::PackError::TooLarge { kind: k, len, limit: l }) => {
+                assert_eq!((k, len, l), (kind, limit + 1, limit));
+            }
+            other => panic!("kind {kind} one byte over {limit} must be refused, got {other:?}"),
+        }
+    }
+}
+
+/// The limits are the contract's, mirrored rather than imported, so a test has
+/// to hold them to the numbers rather than to the constant's own definition —
+/// which would agree with itself whatever it drifted to.
+#[test]
+fn the_mirrored_limits_are_the_contracts_numbers() {
+    assert_eq!(pack::MAX_BODY, 262_208);
+    assert_eq!(pack::MAX_PACK, 1_048_576);
+    assert_eq!(pack::MAX_PARITY, 262_213);
+    assert_eq!(pack::max_body(freenet_prolly::kind::RAW), 262_208);
+    assert_eq!(pack::max_body(pack::PACK_KIND), 1_048_576);
+
+    // And the KINDS the dispatch turns on. `max_body` selects by kind, so the
+    // limits being right is worth nothing if the engine and the contract
+    // disagree about which byte means PARITY — the mirror would then be
+    // correct and still applied to the wrong member. The contract spells these
+    // in its own `kind` module; the engine reads freenet-prolly's.
+    assert_eq!(freenet_prolly::kind::RAW, 0);
+    assert_eq!(freenet_prolly::kind::PARITY, 4);
+    assert_eq!(pack::PACK_KIND, 6);
 }

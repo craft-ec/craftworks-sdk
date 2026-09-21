@@ -28,21 +28,68 @@ pub const MANIFEST_MAGIC: &[u8; 4] = b"CM01";
 /// it is the value the Block contract assigns to PACK.
 pub const PACK_KIND: u8 = 6;
 
-/// What a commit says about itself.
+// ---------------------------------------------------------------------------
+// What the network will accept, PER MEMBER — mirrored, not imported.
+//
+// These are the Block contract's numbers. They are copied rather than depended
+// on for the reason `PACK_KIND` above is: the SDK and the contracts
+// deliberately do not share a revision, because a contract's wasm hash depends
+// on its dependencies' IDENTITY, so pinning them together would make every SDK
+// change a network epoch. What ties the two is tested against the released
+// artefact, never rev equality.
+//
+// Until this existed, `max_body` appeared NOWHERE in the SDK. Nothing compared
+// a member to its kind's limit, so `PackError::TooLarge` was not merely
+// unfired but UNFIREABLE, and an oversized pack was built in silence and
+// refused at the NODE — remotely, where a node can log nothing at the moment it
+// refuses (F48). The legible local failure was designed and unreachable; what
+// survived was the least diagnosable one.
+// ---------------------------------------------------------------------------
+
+/// The largest ordinary block body the contract accepts.
+pub const MAX_BODY: usize = 256 * 1024 + 64;
+
+/// A parity symbol is as long as the longest member it codes, plus its framing.
+pub const MAX_PARITY: usize = 4 + 1 + MAX_BODY;
+
+/// The largest pack, as a container. Agrees with the contract.
+pub const MAX_PACK: usize = 1024 * 1024;
+
+/// The largest body the contract accepts for a block of `kind`.
 ///
-/// The network is the journal: after a restart the engine holds only its
-/// device key, reads its head, finds its packs the head does not yet name, and
-/// replays these in `seq` order. So everything needed to resume — where the
-/// commit came FROM, where it goes, and what redundancy it still owes — is in
-/// the pack, not in any local file.
+/// The limit that bites a packed member is THIS, not the pack's: packed members
+/// are `RAW`, so the ceiling is 262,208 and not the pack's 1 MiB. Confusing the
+/// two is the error this function exists to stop being made twice.
+pub const fn max_body(kind: u8) -> usize {
+    match kind {
+        PACK_KIND => MAX_PACK,
+        kind::PARITY => MAX_PARITY,
+        _ => MAX_BODY,
+    }
+}
+
+/// What a commit says about itself: where it came FROM and where it goes.
+///
+/// **It used to claim more, and that claim is withdrawn.** The doc here said a
+/// restarted engine "finds its packs the head does not yet name" and replays
+/// them, so the manifest also carried the redundancy the commit still owed.
+/// That recovery cannot be performed: a pack's key is its content hash, so an
+/// engine holding only its device key cannot enumerate packs its head does not
+/// name — only the HEAD makes anything findable (`lib.rs`, on the same point).
+/// The `owed` set is gone with it (craftworks-sdk#117).
+///
+/// Two further reasons it should not come back as carried state. The set was
+/// WRONG: a commit-time snapshot can name a group superseded since, and
+/// `record_owed` spends its whole diff walk dropping exactly those, so a
+/// recovering engine trusting it would undo that coalescing. And what recovery
+/// needs is DERIVED, not carried: parity ids live in the node, so a walk from
+/// the published root names every group (craftworks-sdk#119).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub prev_seq: u64,
     pub prev_root: Cid,
     pub seq: u64,
     pub root: Cid,
-    /// The parity groups this commit owes, by their three ids.
-    pub owed: Vec<[Cid; 3]>,
 }
 
 impl Manifest {
@@ -52,45 +99,25 @@ impl Manifest {
         out.extend_from_slice(&self.prev_root);
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.root);
-        // u32, and refused above it rather than truncated: a count that wraps
-        // writes a small number in front of a long body, and the reader then
-        // stops early and silently resumes an incomplete commit.
-        let n = u32::try_from(self.owed.len()).expect("owed groups fit in u32");
-        out.extend_from_slice(&n.to_le_bytes());
-        for g in &self.owed {
-            for id in g {
-                out.extend_from_slice(id);
-            }
-        }
         out
     }
 
     pub fn decode(body: &[u8]) -> Option<Manifest> {
-        let (head, rest) = body.split_at_checked(4 + 8 + 32 + 8 + 32 + 4)?;
+        // Fixed width now that the owed set is gone, and TRAILING BYTES ARE
+        // REFUSED: a manifest is exactly this long, so anything after it is
+        // either a different format or something appended, and reading past a
+        // length nobody declared is how a parser starts trusting its input.
+        let head: &[u8; 4 + 8 + 32 + 8 + 32] = body.try_into().ok()?;
         if &head[..4] != MANIFEST_MAGIC {
             return None;
         }
         let u64_at = |o: usize| u64::from_le_bytes(head[o..o + 8].try_into().unwrap());
         let cid_at = |o: usize| -> Cid { head[o..o + 32].try_into().unwrap() };
-        let n = u32::from_le_bytes(head[84..88].try_into().unwrap()) as usize;
-        // The declared count must fit what follows before anything is read.
-        if rest.len() != n.checked_mul(96)? {
-            return None;
-        }
-        let mut owed = Vec::with_capacity(n);
-        for g in rest.chunks_exact(96) {
-            owed.push([
-                g[0..32].try_into().unwrap(),
-                g[32..64].try_into().unwrap(),
-                g[64..96].try_into().unwrap(),
-            ]);
-        }
         Some(Manifest {
             prev_seq: u64_at(4),
             prev_root: cid_at(12),
             seq: u64_at(44),
             root: cid_at(52),
-            owed,
         })
     }
 }
@@ -100,7 +127,12 @@ impl Manifest {
 pub enum PackError {
     Empty,
     TooManyMembers(usize),
-    TooLarge(usize),
+    /// A member is longer than the contract accepts for ITS kind.
+    ///
+    /// Carries the limit and the kind, not just the length: this error is
+    /// rendered into a panic message by the one caller, so what it says is
+    /// the entire diagnosis available at the moment it fires.
+    TooLarge { kind: u8, len: usize, limit: usize },
 }
 
 /// Build one pack body. Members are sorted and de-duplicated by block id,
@@ -114,6 +146,13 @@ pub fn build(members: &[(u8, Vec<u8>)]) -> Result<Vec<u8>, PackError> {
     }
     if ordered.len() > u16::MAX as usize {
         return Err(PackError::TooManyMembers(ordered.len()));
+    }
+    // THE MISSING COMPARISON. Checked per MEMBER against its own kind's limit,
+    // because that is what the contract applies — a pack whose total fits can
+    // still carry a member the network refuses, and that refusal happens
+    // remotely where it is hardest to see.
+    if let Some((kind, body)) = ordered.iter().find(|(k, b)| b.len() > max_body(*k)) {
+        return Err(PackError::TooLarge { kind: *kind, len: body.len(), limit: max_body(*kind) });
     }
     let mut out = Vec::from(&PACK_MAGIC[..]);
     out.extend_from_slice(&(ordered.len() as u16).to_le_bytes());
