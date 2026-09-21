@@ -1115,3 +1115,76 @@ fn control_the_default_pairing_is_accepted() {
         Shell::resume_with(&[], p, Store::default(), StoreFacts::provisioned());
     let _ = s.handle(Vec::new());
 }
+
+/// sdk#178: the head read back at THIS commit's seq but under ANOTHER root is
+/// another writer's head -- a conflict, never `Published`. The shell compared
+/// the seq only, so a foreign head at our seq was told Published. The control
+/// is this commit's own (seq, root), which publishes.
+#[test]
+fn a_head_read_back_at_our_seq_under_another_root_is_not_published() {
+    let run = |foreign_root: bool| -> Vec<WriteState> {
+        let node = Store::default();
+        let mut ctx: Vec<u8> = Vec::new();
+        let mut inbound = vec![Inbound::Client(
+            protocol::encode_request(
+                protocol::CURRENT,
+                &Request::Write {
+                    write_id: 1,
+                    ops: vec![protocol::Op::Put(b"k/a".to_vec(), vec![7u8; 3000])],
+                },
+            )
+            .expect("encodes"),
+        )];
+        let mut told = Vec::new();
+        for _ in 0..60 {
+            let mut s: Shell<Store> = Shell::resume_with(
+                &ctx,
+                Params::default(),
+                node.clone(),
+                StoreFacts::provisioned(),
+            );
+            let out = s.handle(std::mem::take(&mut inbound));
+            ctx = s.to_context().expect("a context");
+            told.extend(states(&out.replies));
+            for op in out.ops {
+                use engine_delegate::schedule::Op;
+                inbound.push(match op {
+                    Op::Put { id, bytes } => {
+                        node.put(id, &bytes);
+                        Inbound::PutAcked { id, ok: true }
+                    }
+                    Op::Get { id, .. } => Inbound::GotState {
+                        id,
+                        bytes: node.get(&id).map(|b| b.to_vec()),
+                    },
+                    // The Register answers with the SAME seq; with
+                    // `foreign_root`, under somebody else's root.
+                    Op::Head { seq, root } => Inbound::GotHead {
+                        seq,
+                        root: if foreign_root { [0xEE; 32] } else { root },
+                    },
+                    Op::ReadHead { .. } => Inbound::NoHead,
+                });
+            }
+            if inbound.is_empty() {
+                break;
+            }
+        }
+        told
+    };
+    let own = run(false);
+    assert!(
+        own.contains(&WriteState::Published),
+        "the control did not publish: {own:?}"
+    );
+    let foreign = run(true);
+    assert!(
+        !foreign.contains(&WriteState::Published),
+        "a head at our seq under another root was told Published: {foreign:?}"
+    );
+    assert!(
+        foreign.contains(&WriteState::Lost),
+        "not told Lost after the conflict: {foreign:?}"
+    );
+    println!("  own head: {own:?}; foreign root at our seq: {foreign:?}");
+}
