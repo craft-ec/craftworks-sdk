@@ -501,8 +501,9 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
 /// here would otherwise go unscanned for ever.
 #[test]
 fn no_global_state_in_the_engine() {
-    const SOURCES: [(&str, &str); 4] = [
+    const SOURCES: [(&str, &str); 5] = [
         ("src/lib.rs", include_str!("../src/lib.rs")),
+        ("src/asks.rs", include_str!("../src/asks.rs")),
         ("src/read.rs", include_str!("../src/read.rs")),
         ("src/pack.rs", include_str!("../src/pack.rs")),
         ("src/subs.rs", include_str!("../src/subs.rs")),
@@ -662,15 +663,19 @@ fn owed_parity_survives_a_rehydration_and_is_still_put() {
         }
     }
     live_parity.sort();
+    // Nothing here confirms a parity put, so each is re-asked every
+    // `reask_after` ticks (sdk#150: an ask is not a fact). The oracle is the
+    // DISTINCT ids; the full lists, re-asks and all, are compared below too.
+    let distinct = |v: &[Cid]| v.iter().collect::<std::collections::BTreeSet<_>>().len();
     // The oracle must exist. Guarded behind an `if !live_parity.is_empty()`,
     // the comparison below would be skipped silently whenever the live engine
     // happened to put nothing — which is the case it most needs to catch.
     assert_eq!(
-        live_parity.len(),
+        distinct(&live_parity),
         owed * 3,
-        "the live engine put {} parity block(s) for {owed} owed group(s), so \
+        "the live engine put {} distinct parity block(s) for {owed} owed group(s), so \
          there is no oracle to compare the rehydrated one against",
-        live_parity.len()
+        distinct(&live_parity)
     );
 
     // The same context, in an engine that never saw the commit.
@@ -698,11 +703,11 @@ fn owed_parity_survives_a_rehydration_and_is_still_put() {
     );
     put.sort();
     assert_eq!(
-        put.len(),
+        distinct(&put),
         owed * 3,
-        "{owed} group(s) owed, {} parity block(s) put: a group is three \
+        "{owed} group(s) owed, {} distinct parity block(s) put: a group is three \
          blocks, so this is not one per group",
-        put.len()
+        distinct(&put)
     );
     // The recomputed blocks are the SAME blocks, by id. Parity is a pure
     // function of its members, and this is the assertion that says so rather

@@ -67,8 +67,12 @@
 //! that the right answer?** If the honest answer is "whatever it defaults
 //! to", either carry it — and bump `CONTEXT_VERSION` — or derive it from
 //! something already carried, which is better: two copies of one fact can
-//! disagree, and a derived one cannot. `Owed::sent` is derived from
-//! `in_flight_parity` for that reason rather than carried beside it.
+//! disagree, and a derived one cannot.
+//!
+//! And an EMISSION is not a fact (sdk#150). An effect the engine returns can
+//! be held and dropped by the scheduler, cut by a per-return limit, or never
+//! answered; "I asked, therefore it happened" made each of those a permanent
+//! loss. What is owed is derived from answers; `asks` only paces re-asking.
 //!
 //! And the test has to span calls. An assertion that passes on an engine
 //! driven straight through proves nothing about this.
@@ -80,6 +84,7 @@ use freenet_prolly::store::{Blocks, ReadError};
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod asks;
 pub mod pack;
 pub mod read;
 pub mod subs;
@@ -439,6 +444,20 @@ pub struct Params {
     /// Ticks after which an owed group's parity is put even while its members
     /// keep changing, so a hot group cannot stay unprotected for ever.
     pub parity_age: u64,
+    /// Ticks an ask goes unanswered before it is asked again (sdk#150).
+    ///
+    /// An ask is not a fact: the effect may have been stranded, cut by a
+    /// return's limit or never answered, and nothing reports that. So an
+    /// unanswered ask is re-made after this long. Every ask is idempotent,
+    /// so a slow answer costs one more put, never a wrong state.
+    pub reask_after: u64,
+    /// The most asks outstanding at once. Unit: one ask, at most
+    /// `asks::ASK_BYTES` of context. Default: one return's worth (`max_puts`
+    /// 128 + `max_gets` 4). A full table defers a NEW ask -- what it asks for
+    /// stays owed and goes when an answer frees a place -- and never drops
+    /// one already made. Checked at construction against
+    /// `asks::CONTEXT_SHARE` of `max_context_bytes`.
+    pub max_asks: usize,
     /// Off = the negative control for coalescing.
     pub coalesce_parity: bool,
     /// Find superseded groups by scanning the WHOLE tree instead of only what
@@ -644,6 +663,8 @@ impl Default for Params {
             pack_on_write: false,
             max_write_bytes: 8 * 1024 * 1024,
             parity_age: 32,
+            reask_after: 16,
+            max_asks: 132,
             coalesce_parity: true,
             whole_tree_supersede_scan: false,
             transfer_superseded_waiters: true,
@@ -692,8 +713,6 @@ struct Owed {
     /// has gone unprotected, and a group rewritten every tick has gone
     /// unprotected the whole time.
     since: u64,
-    /// Whether its puts have been emitted and are outstanding.
-    sent: bool,
 }
 
 /// A write whose apply stopped on a block the node does not hold.
@@ -840,8 +859,12 @@ pub struct Engine<B: Blocks> {
     /// group is re-coded before its parity goes out, the old parity is
     /// superseded and must never be put.
     owed: BTreeMap<ParityIds, Owed>,
-    /// Parity blocks emitted and awaiting confirmation, back to their group.
-    in_flight_parity: BTreeMap<Cid, ParityIds>,
+    /// Parity blocks of owed groups the node has CONFIRMED -- the fact a
+    /// group settles on, when all three are in. What was merely emitted is
+    /// in `asks`, which paces and decides nothing.
+    parity_confirmed: BTreeSet<Cid>,
+    /// Unanswered asks, for pacing only (`asks`).
+    asks: asks::Asks,
     /// The groups each write is still waiting on.
     ///
     /// A SET and not a count, because a superseded group is replaced by the
@@ -938,6 +961,18 @@ impl<B: Blocks> Engine<B> {
             params.max_pack > pack::PACK_HEADER,
             "max_pack holds no members"
         );
+        // The asks table is carried, so its worst case is part of the
+        // context's. This bounds ITS share; whether every carried cap sums
+        // under the bound is sdk#162's question, not answered here.
+        assert!(
+            params.max_asks.saturating_mul(asks::ASK_BYTES)
+                <= params.max_context_bytes / asks::CONTEXT_SHARE,
+            "max_asks ({}) x {} B is over 1/{} of max_context_bytes ({})",
+            params.max_asks,
+            asks::ASK_BYTES,
+            asks::CONTEXT_SHARE,
+            params.max_context_bytes
+        );
         let empty = empty_leaf();
         let root = empty.cid;
         Engine {
@@ -953,7 +988,8 @@ impl<B: Blocks> Engine<B> {
             folded: Vec::new(),
             folded_bytes: 0,
             owed: BTreeMap::new(),
-            in_flight_parity: BTreeMap::new(),
+            parity_confirmed: BTreeSet::new(),
+            asks: asks::Asks::default(),
             parity_waiting: BTreeMap::new(),
             in_flight_since: None,
             parked_write: None,
@@ -1993,15 +2029,16 @@ impl<B: Blocks> Engine<B> {
         let dropped: Vec<ParityIds> = self
             .owed
             .iter()
-            // Never drop one already emitted: it is out there being confirmed,
-            // and forgetting it would lose the ParityComplete it owes.
-            .filter(|(key, o)| !o.sent && gone.contains(&key[0]))
+            // Never drop one already asked for or partly confirmed: its
+            // answers are coming, and forgetting it would lose the
+            // ParityComplete it owes.
+            .filter(|(key, _)| !self.parity_touched(key) && gone.contains(&key[0]))
             .map(|(key, _)| *key)
             .collect();
         // What now covers the members those groups held.
         let replacements: BTreeSet<ParityIds> = by_group.keys().copied().collect();
         for key in dropped {
-            self.owed.remove(&key);
+            self.forget_group(&key);
             self.coded_since_commit.remove(&key);
             let n = self.transfer_waiters(key, &replacements);
             self.pending_notifications.extend(n);
@@ -2013,7 +2050,6 @@ impl<B: Blocks> Engine<B> {
                 blocks: blocks.clone(),
                 last_changed: now,
                 since: now,
-                sent: false,
             });
             e.blocks = blocks;
             e.last_changed = now;
@@ -2213,10 +2249,14 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         // A parity block landing: the group it belongs to is that much closer
         // to having redundancy.
-        if let Some(group) = self.in_flight_parity.remove(&id) {
-            let done = !self.in_flight_parity.values().any(|g| *g == group);
-            if done {
-                self.owed.remove(&group);
+        //
+        // The group is found among the OWED groups, which are their own ids,
+        // so nothing maps a parity block to its group but the fact itself.
+        if let Some(group) = self.owed_group_of(&id) {
+            self.asks.settled(&asks::Ask::Parity(id));
+            self.parity_confirmed.insert(id);
+            if group.iter().all(|m| self.parity_confirmed.contains(m)) {
+                self.forget_group(&group);
                 out.extend(self.settle_group(group));
             }
             return out;
@@ -2257,35 +2297,15 @@ impl<B: Blocks> Engine<B> {
         // Re-emit exactly what is missing, and nothing else. A retry that
         // re-sends the whole commit pays for every block again, and a retry
         // that re-sends nothing stalls it for ever.
-        if let Some(group) = self.in_flight_parity.get(&id).copied() {
-            if let Some(o) = self.owed.get(&group) {
-                if let Some((_, bytes)) = o.blocks.iter().find(|(c, _)| *c == id) {
-                    return vec![Effect::PutParity {
-                        group,
-                        id,
-                        bytes: bytes.clone(),
-                        after: vec![self.published_root],
-                    }];
-                }
-            }
-            // The bytes are not on hand. A rehydrated engine carries owed
-            // groups as IDS, so this is the ordinary case, not an edge one:
-            // a parity put that fails in a later call than the one that sent
-            // it lands here every time.
-            //
-            // The group stops being in flight — which is the truth, the put
-            // failed — so the next `emit_parity` recomputes its blocks and
-            // sends the whole trio again. Leaving the ids in flight instead
-            // would leave the group permanently `sent` with nothing behind
-            // it: never retried, never settled, owed for ever.
-            //
-            // All three go, not just this one. `sent` is derived from what is
-            // in flight, so a group with two ids still listed would stay sent
-            // and the retry would never happen. Re-putting a parity block
-            // that already landed costs a put; the ids and bytes are the
-            // same, so it cannot make the network disagree with itself.
-            for member in group {
-                self.in_flight_parity.remove(&member);
+        if self.owed_group_of(&id).is_some() {
+            // A FAILURE IS PACED LIKE SILENCE, never faster (sdk#150 review A).
+            // Re-putting on the spot -- or erasing the pace so the next emit
+            // re-asks -- turned a node answering every parity put FAILED into
+            // a put on every call (2100 PUTs in 100 ticks, executed), where
+            // silence re-asks once a window. The failure is recorded as an
+            // attempt made now; `emit_parity` re-asks when the pace says.
+            if !self.parity_confirmed.contains(&id) {
+                self.asks.failed(asks::Ask::Parity(id), self.now);
             }
             return Vec::new();
         }
@@ -2429,11 +2449,48 @@ impl<B: Blocks> Engine<B> {
         // every write `Stalled` on the first tick (sdk#150, W4). A start taken
         // before there was a clock is anchored to the first clock, not
         // measured from zero. A real tick is never 0, so 0 means "unknown".
+        // ENGINE TIME IS THE MOST IT HAS SEEN. Every tab and every device
+        // ticks from its own clock, so two of them a second -- or five minutes
+        // -- apart alternate forwards and backwards. A step back within
+        // `CLOCK_RESET_TICKS` is that: time has not moved, and the tick's work
+        // runs at the time already reached. Taken as a reset, it re-anchored
+        // every deadline on every other tick and nothing was ever due again
+        // (21 parity puts in 600 s against 126 on one clock, executed).
+        let now = if self.now != 0 && now < self.now && self.now - now <= CLOCK_RESET_TICKS {
+            self.now
+        } else {
+            now
+        };
         if self.now == 0 {
             if let Some(since) = self.in_flight_since.as_mut() {
                 if *since == 0 {
                     *since = now;
                 }
+            }
+            self.asks.anchor(now);
+            // A group first owed before any clock is dated from the first,
+            // or its age bound would fire at once.
+            for o in self.owed.values_mut() {
+                if o.since == 0 {
+                    o.since = now;
+                }
+            }
+        } else if now < self.now || now - self.now > CLOCK_RESET_TICKS {
+            // A CLOCK RESET (sdk#150 review B). `now` is whatever the client
+            // sends, and every deadline is measured against it: one tick ten
+            // years ahead froze every re-ask for good (0 in 600 ticks, executed)
+            // and the stall timer and owed ages with it. A context lives 600 s
+            // (F32), so a jump of more than that, either way, cannot be the
+            // same clock: every date is re-anchored to it. Nothing
+            // becomes due early for it, and nothing waits on a clock that is
+            // gone.
+            if let Some(since) = self.in_flight_since.as_mut() {
+                *since = now;
+            }
+            self.asks.reanchor(now);
+            for o in self.owed.values_mut() {
+                o.since = now;
+                o.last_changed = o.last_changed.min(now);
             }
         }
         self.now = now;
@@ -2516,12 +2573,10 @@ impl<B: Blocks> Engine<B> {
     /// nothing behind it. In production EVERY call is a rehydration, so that
     /// was not an edge case: it was all of them, and the redundancy the tree
     /// promised was silently never written.
-    fn recompute_owed(&mut self) -> Vec<Effect> {
-        let wanted: BTreeSet<ParityIds> = self
-            .owed
-            .iter()
-            .filter(|(_, o)| !o.sent && o.blocks.is_empty())
-            .map(|(k, _)| *k)
+    fn recompute_owed(&mut self, of: BTreeSet<ParityIds>) -> Vec<Effect> {
+        let wanted: BTreeSet<ParityIds> = of
+            .into_iter()
+            .filter(|k| self.owed.get(k).is_some_and(|o| o.blocks.is_empty()))
             .collect();
         if wanted.is_empty() {
             return Vec::new();
@@ -2608,25 +2663,55 @@ impl<B: Blocks> Engine<B> {
     }
 
     fn emit_parity(&mut self, want: impl Fn(&Owed) -> bool) -> Vec<Effect> {
-        // A rehydrated engine owes groups it has no bytes for. Recover them
-        // before deciding what to send, or every group would be marked sent
-        // with nothing behind it.
-        let mut out = self.recompute_owed();
-        let keys: Vec<ParityIds> = self
+        // NOTHING FOR A COMMIT THAT IS NOT PUBLISHED (sdk#150). A parity put
+        // goes out `after` the published root, and a group coded by the
+        // commit in flight has members that root does not hold. For the FIRST
+        // commit that root is the empty tree's, which nobody puts or
+        // confirms: the puts were held and dropped with the call, and under
+        // `sent` the first save's redundancy was lost for good. The group
+        // goes out on the first emit after its commit publishes.
+        //
+        // (A `published_seq == 0` guard beside this was killed by no test --
+        // this filter already covers the first commit -- so it is not here.)
+        let unpublished: BTreeSet<ParityIds> = self
+            .pending
+            .as_ref()
+            .map(|c| c.groups.clone())
+            .unwrap_or_default();
+        let (now, every) = (self.now, self.params.reask_after);
+        // What is owed, from fact: a block not confirmed. Whether to ask for
+        // it NOW is the pacing table's only question.
+        let due: Vec<ParityIds> = self
             .owed
             .iter()
-            .filter(|(_, o)| !o.sent && !o.blocks.is_empty() && want(o))
+            .filter(|(k, o)| !unpublished.contains(*k) && want(o))
+            .filter(|(k, _)| {
+                k.iter().any(|id| {
+                    !self.parity_confirmed.contains(id)
+                        && self.asks.due(&asks::Ask::Parity(*id), now, every)
+                })
+            })
             .map(|(k, _)| *k)
             .collect();
-        for key in keys {
-            let blocks = {
-                let o = self.owed.get_mut(&key).expect("just listed");
-                o.sent = true;
-                o.blocks.clone()
-            };
-            debug_assert!(!blocks.is_empty(), "filtered above");
+        // A rehydrated engine owes groups it has no bytes for: recover the
+        // ones about to be asked for.
+        let mut out = self.recompute_owed(due.iter().copied().collect());
+        for key in due {
+            let blocks = self
+                .owed
+                .get(&key)
+                .map(|o| o.blocks.clone())
+                .unwrap_or_default();
             for (id, bytes) in blocks {
-                self.in_flight_parity.insert(id, key);
+                let ask = asks::Ask::Parity(id);
+                if self.parity_confirmed.contains(&id) || !self.asks.due(&ask, now, every) {
+                    continue;
+                }
+                // Full: a NEW ask waits for a place; it stays owed.
+                if self.asks.get(&ask).is_none() && self.asks.len() >= self.params.max_asks {
+                    continue;
+                }
+                self.asks.asked(ask, now);
                 out.push(Effect::PutParity {
                     group: key,
                     id,
@@ -2636,6 +2721,27 @@ impl<B: Blocks> Engine<B> {
             }
         }
         out
+    }
+
+    /// The owed group a parity block belongs to. A group IS its three ids.
+    fn owed_group_of(&self, id: &Cid) -> Option<ParityIds> {
+        self.owed.keys().find(|k| k.contains(id)).copied()
+    }
+
+    /// Whether anything of this group has been asked for or confirmed.
+    fn parity_touched(&self, key: &ParityIds) -> bool {
+        key.iter().any(|id| {
+            self.parity_confirmed.contains(id) || self.asks.get(&asks::Ask::Parity(*id)).is_some()
+        })
+    }
+
+    /// A group stopped being owed: its facts and its asks go with it.
+    fn forget_group(&mut self, key: &ParityIds) {
+        self.owed.remove(key);
+        for id in key {
+            self.parity_confirmed.remove(id);
+            self.asks.settled(&asks::Ask::Parity(*id));
+        }
     }
 }
 
@@ -2916,22 +3022,18 @@ struct Context {
     /// parity is a pure function of a group's members, so a re-hydrated
     /// engine recomputes them from the node's blocks and puts the same bytes
     /// under the same ids. Idempotent by construction.
-    owed_groups: Vec<ParityIds>,
-    /// PARITY BLOCKS ALREADY PUT AND NOT YET CONFIRMED.
-    ///
-    /// The ids only: a parity id belongs to exactly one group, and the group
-    /// IS its three ids, so the map from id to group is rebuilt by looking
-    /// the id up among the owed groups rather than carried twice. A group
-    /// with anything in flight is still owed by construction — it leaves
-    /// `owed` only when its last parity block confirms — so the lookup can
-    /// never miss.
-    ///
-    /// Carried for the reason `in_flight_since` is: the ack arrives in a
-    /// LATER call, and an engine rebuilt without this could not say which
-    /// group the confirmed block belonged to. The group then never settled,
-    /// stayed owed for ever, and was re-coded and re-put on every single
-    /// tick — measured in `what_a_flush_causes`.
-    in_flight_parity: Vec<Cid>,
+    /// With each group's ages, `(ids, last_changed, since)`: rebuilt as 0 on
+    /// every rehydrate, they made a group's parity fire on the first tick
+    /// after ANY call boundary, whatever `parity_age` said (sdk#150).
+    owed_groups: Vec<(ParityIds, u64, u64)>,
+    /// Parity blocks of owed groups the node CONFIRMED. A group settles when
+    /// all three are in; the ack for each arrives in its own later call.
+    parity_confirmed: Vec<Cid>,
+    /// Asks not yet answered, and when each last went out: PACING only
+    /// (`asks`). It replaced `in_flight_parity`, from which `Owed::sent` was
+    /// re-derived on every call -- so an emission recorded as a fact was
+    /// re-recorded by the context itself (sdk#150).
+    asks: Vec<(asks::Ask, asks::Pace)>,
     parked: Vec<(read::ReqId, read::Parked)>,
     waiting: Vec<(Cid, Vec<read::ReqId>)>,
     attempts: Vec<(Cid, u32)>,
@@ -2981,7 +3083,21 @@ struct Context {
     now: u64,
 }
 
+/// A tick more than this after the last one, or before it, is a different
+/// clock, not the same one moving on: a delegate context lives 600 s (F32),
+/// so no engine sees a real gap longer than that. A smaller step BACK is
+/// another tab's or device's clock, and is ignored. Ticks are seconds
+/// (`protocol::tick_of`).
+const CLOCK_RESET_TICKS: u64 = 600;
+
 /// The version this build writes. Bumped when the shape changes.
+///
+/// 7: `in_flight_parity` left it for `parity_confirmed` (the answers) and
+/// `asks` (pacing), and owed groups carry their ages: an emission is not a
+/// fact (sdk#150).
+///
+/// 6: a subscription carries its birth order, under a per-client cap
+/// (sdk#146).
 ///
 /// 5: the engine's clock joined it -- `now`, which `in_flight_since` and the
 /// parity ages are measured against (sdk#150).
@@ -2998,7 +3114,7 @@ struct Context {
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 6;
+const CONTEXT_VERSION: u16 = 7;
 
 /// What a context this build wrote begins with.
 ///
@@ -3065,8 +3181,13 @@ impl<B: Blocks> Engine<B> {
             } else {
                 None
             },
-            owed_groups: self.owed.keys().copied().collect(),
-            in_flight_parity: self.in_flight_parity.keys().copied().collect(),
+            owed_groups: self
+                .owed
+                .iter()
+                .map(|(k, o)| (*k, o.last_changed, o.since))
+                .collect(),
+            parity_confirmed: self.parity_confirmed.iter().copied().collect(),
+            asks: self.asks.to_vec(),
             parked: self
                 .reads
                 .parked
@@ -3200,29 +3321,20 @@ impl<B: Blocks> Engine<B> {
         // on demand from the node's blocks, which is sound because parity is a
         // pure function of its members: the same group gives the same three
         // blocks under the same three ids, whoever computes them.
-        let in_flight: BTreeSet<Cid> = c.in_flight_parity.into_iter().collect();
-        for key in c.owed_groups {
-            // `sent` is not a field of its own: a group has been sent exactly
-            // when one of its parity blocks is still in flight. Deriving it
-            // means the two cannot disagree — a carried `sent` with nothing
-            // in flight would be a group that never re-sends and never
-            // settles.
-            let sent = key.iter().any(|id| in_flight.contains(id));
+        // Nothing about an ask is re-derived here: what was confirmed is
+        // carried as the node said it, and what was asked only paces.
+        for (key, last_changed, since) in c.owed_groups {
             e.owed.insert(
                 key,
                 Owed {
                     blocks: Vec::new(),
-                    last_changed: 0,
-                    since: 0,
-                    sent,
+                    last_changed,
+                    since,
                 },
             );
-            for id in key {
-                if in_flight.contains(&id) {
-                    e.in_flight_parity.insert(id, key);
-                }
-            }
         }
+        e.parity_confirmed = c.parity_confirmed.into_iter().collect();
+        e.asks = asks::Asks::from_vec(c.asks);
         for (r, p) in c.parked {
             e.reads.parked.insert(r, p);
         }
