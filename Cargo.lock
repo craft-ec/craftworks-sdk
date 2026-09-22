@@ -1004,6 +1004,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "page-io"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "craftec-register-contract",
+ "ed25519-dalek",
+ "engine",
+ "engine-delegate",
+ "freenet-prolly",
+ "freenet-stdlib",
+ "page",
+ "protocol",
+ "signer",
+ "signer-proto",
+ "wire",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
