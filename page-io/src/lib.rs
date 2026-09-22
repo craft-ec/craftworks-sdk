@@ -65,6 +65,56 @@ pub struct HeadSubscription {
     pub ended: Option<String>,
 }
 
+/// What a page tells its app about being kept up to date (sdk#259): the
+/// MAPPING from the facts above to `LiveMode`, here — beside the facts, and
+/// natively testable — rather than inside the web Session, which no native
+/// test can build (a mutant that made "subscribed" unreachable there survived
+/// every suite).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveMode {
+    /// `HeadSubscribed` or `Polled`.
+    pub mode: &'static str,
+    /// Why not, in words; empty when subscribed.
+    pub why: String,
+    /// Head moves the subscription has delivered.
+    pub head_changes: usize,
+}
+
+impl LiveMode {
+    /// A connection with no page yet.
+    pub fn no_page() -> LiveMode {
+        LiveMode { mode: "Polled", why: "there is no page on this connection yet".into(), head_changes: 0 }
+    }
+}
+
+impl HeadSubscription {
+    /// The report, in the order a reader should look: ANSWERED wins over
+    /// everything (a failure counted before the head existed does not undo a
+    /// subscription the node now holds); then an opening that ENDED; then
+    /// head reads the node FAILED; then asked-and-unanswered; then unasked.
+    pub fn live_mode(&self) -> LiveMode {
+        let tick = " The tick keeps the data right meanwhile.";
+        let (mode, why) = if self.answered {
+            ("HeadSubscribed", String::new())
+        } else if let Some(said) = &self.ended {
+            ("Polled", format!("opening ended, so the head is never read: {said}"))
+        } else if self.failed > 0 {
+            (
+                "Polled",
+                format!(
+                    "the node answered the head read with a failure {} time(s) — no head yet, a refusal, or a peered node's false NotFound (F55); it is asked again.{tick}",
+                    self.failed
+                ),
+            )
+        } else if self.asked {
+            ("Polled", format!("the head read with subscribe has not been answered yet.{tick}"))
+        } else {
+            ("Polled", "the head has not been read on this connection yet".to_string())
+        };
+        LiveMode { mode, why, head_changes: self.changes }
+    }
+}
+
 pub struct PageIo {
     pub server: Server,
     art: Artefacts,

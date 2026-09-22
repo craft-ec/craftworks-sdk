@@ -1003,3 +1003,54 @@ fn an_opening_that_ended_is_reported_as_the_reason_there_is_no_subscription() {
         "the reason there is no subscription is not in the report, so it would say 'not answered yet' for ever: {h:?}"
     );
 }
+
+/// sdk#259: THE MAPPING, every branch. What a page tells its app — `mode`,
+/// `why`, `headChanges` — from page-io's facts. It used to live only in the
+/// web Session, which no native test can build: a mutant there that made
+/// "subscribed" unreachable (`h if false && h.answered`) survived every suite,
+/// so the one thing this report exists to say was never pinned.
+#[test]
+fn the_live_mode_mapping_says_subscribed_only_when_answered_and_otherwise_why() {
+    use page_io::{HeadSubscription, LiveMode};
+    let h = |asked, answered, changes, failed, ended: Option<&str>| HeadSubscription { asked, answered, changes, failed, ended: ended.map(str::to_string) };
+
+    // ANSWERED: subscribed, with what it delivered — and it WINS over a
+    // failure counted before the head existed (measured on the fixture: 1000
+    // failed reads, then answered once the head was created).
+    let m = h(true, true, 3, 1000, None).live_mode();
+    assert_eq!((m.mode, m.why.as_str(), m.head_changes), ("HeadSubscribed", "", 3), "an answered head read is not reported as a subscription: {m:?}");
+
+    // ENDED: Polled, in the words it ended with — even if a read was asked.
+    let m = h(true, false, 0, 2, Some("the signer refused: KeyAlreadyProvisioned")).live_mode();
+    assert_eq!(m.mode, "Polled");
+    assert!(m.why.contains("opening ended") && m.why.contains("KeyAlreadyProvisioned"), "an ended opening is not the reason given: {m:?}");
+
+    // FAILED: Polled, how many times, and that page-io cannot tell which.
+    let m = h(true, false, 0, 4, None).live_mode();
+    assert_eq!(m.mode, "Polled");
+    assert!(m.why.contains("failure 4 time(s)") && m.why.contains("F55"), "failed head reads are not the reason given: {m:?}");
+
+    // ASKED, unanswered.
+    let m = h(true, false, 0, 0, None).live_mode();
+    assert_eq!(m.mode, "Polled");
+    assert!(m.why.contains("not been answered yet"), "{m:?}");
+
+    // NOT ASKED.
+    let m = h(false, false, 0, 0, None).live_mode();
+    assert_eq!(m.mode, "Polled");
+    assert!(m.why.contains("has not been read"), "{m:?}");
+
+    // No page at all.
+    assert_eq!(LiveMode::no_page().mode, "Polled");
+
+    // And end to end, through real frames: a page whose head exists reports
+    // HeadSubscribed — the report the two-tab's live arm asserts.
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 0u64;
+    let _ = client(&mut io, &mut node, &mut now, &Request::Identity);
+    assert_eq!(io.head_subscription().live_mode().mode, "Polled", "a page reported a subscription to a head that does not exist yet");
+    let _ = client(&mut io, &mut node, &mut now, &write(1, "k/1", "v"));
+    let m = io.head_subscription().live_mode();
+    assert_eq!(m.mode, "HeadSubscribed", "a page whose head read was answered does not say so: {m:?}");
+}

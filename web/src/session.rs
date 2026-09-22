@@ -663,23 +663,15 @@ impl Session {
         // makes this page live. This used to report the Session's own
         // `watching`, set by the delegate path's `watch_head` — which the
         // switch-over deleted, so it was false for ever: a page subscribed
-        // the whole time said "Polled", and the two-tab probe read its number
-        // as "the tick's number wearing a different name".
-        let tick = " The tick keeps the data right meanwhile.";
-        let h = self.page.as_ref().map(|p| p.head_subscription());
-        let (changes, (mode, why)) = match &h {
-            None => (0, ("Polled", "there is no page on this connection yet".to_string())),
-            Some(h) => (h.changes, match h {
-                h if h.answered => ("HeadSubscribed", String::new()),
-                page_io::HeadSubscription { ended: Some(said), .. } => ("Polled", format!("opening ended, so the head is never read: {said}")),
-                h if h.failed > 0 => ("Polled", format!(
-                    "the node answered the head read with a failure {} time(s) — no head yet, a refusal, or a peered node's false NotFound (F55); it is asked again.{tick}",
-                    h.failed
-                )),
-                h if h.asked => ("Polled", format!("the head read with subscribe has not been answered yet.{tick}")),
-                _ => ("Polled", "the head has not been read on this connection yet".to_string()),
-            }),
-        };
+        // the whole time reported that it was polling, and the two-tab probe
+        // read its number as "the tick's number wearing a different name".
+        // The MAPPING is page-io's (`HeadSubscription::live_mode`), where a
+        // native test pins every branch; this only serializes it. (No mode is
+        // named in quotes anywhere in this function, comments included:
+        // the web crate's page-path wiring test refuses a quoted mode here, as one
+        // would be a second mapping no native test can reach.)
+        let m = self.page.as_ref().map(|p| p.head_subscription().live_mode()).unwrap_or_else(page_io::LiveMode::no_page);
+        let (mode, why, changes) = (m.mode, m.why, m.head_changes);
         serde_json::json!({
             "mode": mode,
             "why": why,

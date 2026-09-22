@@ -122,4 +122,13 @@ fn live_mode_reports_the_pages_own_head_subscription() {
         "the delegate path's watch flags are still in the Session: they are never set now, so anything reading them reports a path that does not exist"
     );
     assert!(body.contains("headChanges"), "what the subscription has DELIVERED is not reported, so subscribed cannot be told from subscribed-and-being-told:\n{body}");
+    // The MAPPING is page-io's (`HeadSubscription::live_mode`, pinned branch
+    // by branch natively). The Session only serializes it: it calls it, and
+    // it names no mode of its own — a literal here is a second mapping no
+    // native test can reach (a mutant making "subscribed" unreachable in the
+    // Session survived every suite).
+    assert!(body.contains(".live_mode()"), "live_mode does not use page-io's mapping:\n{body}");
+    for literal in ["\"HeadSubscribed\"", "\"Polled\""] {
+        assert!(!body.contains(literal), "live_mode decides a mode itself ({literal}), outside the mapping the native test pins:\n{body}");
+    }
 }
