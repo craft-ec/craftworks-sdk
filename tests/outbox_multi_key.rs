@@ -125,7 +125,7 @@ impl Page {
 
     fn one(&mut self, tag: &str) -> u64 {
         let id = self.store.next_write_id();
-        self.store.put(format!("d/notes/{tag}").as_bytes(), b"x");
+        self.store.put(format!("d/notes/{tag}").as_bytes(), b"x").expect("the store took the write");
         id
     }
 }
@@ -268,14 +268,6 @@ struct Counting<S> {
     writes: Vec<usize>,
 }
 impl<S: Store> Store for Counting<S> {
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.writes.push(1);
-        self.inner.put(key, value)
-    }
-    fn delete(&mut self, key: &[u8]) -> bool {
-        self.writes.push(1);
-        self.inner.delete(key)
-    }
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), craftworks_sdk::Refused> {
         self.writes.push(edits.len());
         self.inner.apply_batch(edits)

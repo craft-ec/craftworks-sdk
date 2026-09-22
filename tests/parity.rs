@@ -101,7 +101,7 @@ fn nodes_holding_referenced_values_are_accepted_too() {
     let mut r = rng(11);
     for i in 0..60u64 {
         let big = vec![(r() % 251) as u8; MAX_INLINE + 1 + (r() % 2048) as usize];
-        store.put(format!("big/{i:06}").as_bytes(), &big);
+        store.put(format!("big/{i:06}").as_bytes(), &big).expect("the store took the write");
     }
     let (nodes, others) = every_node_passes(&store);
     assert!(nodes >= 1);
@@ -131,7 +131,7 @@ fn deletes_and_rewrites_leave_no_refusable_node_behind() {
     let mut store = TreeStore::new();
     let mut r = rng(13);
     for i in 0..500u64 {
-        store.put(format!("k/{i:08}").as_bytes(), &[(r() % 251) as u8; 40]);
+        store.put(format!("k/{i:08}").as_bytes(), &[(r() % 251) as u8; 40]).expect("the store took the write");
     }
     let mut batch: Vec<(Vec<u8>, Edit)> = Vec::new();
     for i in (0..500u64).step_by(3) {

@@ -65,8 +65,8 @@ fn differential(seed: u64, ops: usize, store: &mut (impl Store + Reads)) -> Map 
         match r() % 10 {
             0..=5 => {
                 let (k, v) = (key(i), value(&mut r));
-                store.put(&k, &v);
-                mem.put(&k, &v);
+                store.put(&k, &v).expect("the store took the write");
+                mem.put(&k, &v).expect("the store took the write");
                 want.insert(k, v);
             }
             6..=7 => {
@@ -134,14 +134,14 @@ fn the_root_depends_on_the_contents_and_not_on_the_order() {
         // and corrected. None of it may show in the root.
         for (n, k) in order.iter().enumerate() {
             if n.is_multiple_of(5) {
-                t.put(k, b"wrong");
+                t.put(k, b"wrong").expect("the store took the write");
             }
-            t.put(k, &target[*k]);
+            t.put(k, &target[*k]).expect("the store took the write");
             if n.is_multiple_of(7) {
                 let mut junk = (*k).clone();
                 junk.push(b'~');
-                t.put(&junk, b"junk");
-                t.delete(&junk);
+                t.put(&junk, b"junk").expect("the store took the write");
+                t.delete(&junk).expect("the store took the write");
             }
         }
         roots.push(t.root());
@@ -175,7 +175,7 @@ fn a_batch_equals_the_same_edits_one_at_a_time() {
         // The same starting point for both.
         let seed_store = |s: &mut TreeStore| {
             for i in 0..40u64 {
-                s.put(&key(i), format!("start-{i}").as_bytes());
+                s.put(&key(i), format!("start-{i}").as_bytes()).expect("the store took the write");
             }
         };
         let (mut batched, mut singly) = (TreeStore::new(), TreeStore::new());
@@ -187,10 +187,8 @@ fn a_batch_equals_the_same_edits_one_at_a_time() {
         // Singly, in the SDK's own order — which is what the batch resolves to.
         for (k, e) in sorted_edits(edits.clone()) {
             match e {
-                Edit::Put(v) => singly.put(&k, &v),
-                Edit::Delete => {
-                    singly.delete(&k);
-                }
+                Edit::Put(v) => singly.put(&k, &v).expect("a tree refuses nothing"),
+                Edit::Delete => singly.delete(&k).expect("a tree refuses nothing"),
             }
         }
         assert_eq!(
@@ -257,7 +255,7 @@ fn a_refused_batch_changes_nothing() {
     use freenet_prolly::node::MAX_KEY;
     let mut t = TreeStore::new();
     for i in 0..30u64 {
-        t.put(&key(i), b"v");
+        t.put(&key(i), b"v").expect("the store took the write");
     }
     let (before_root, before_stats) = (t.root(), t.stats());
 
@@ -317,7 +315,7 @@ fn stats_describe_the_tree() {
 
     let mut r = rng(5);
     for i in 0..5000u64 {
-        t.put(&key(i), &vec![7u8; 100 + (r() % 100) as usize]);
+        t.put(&key(i), &vec![7u8; 100 + (r() % 100) as usize]).expect("the store took the write");
     }
     let s = t.stats();
     assert!(s.height >= 2, "5000 records need more than one leaf");
@@ -325,7 +323,7 @@ fn stats_describe_the_tree() {
     assert!(s.bytes > 5000 * 100, "{s:?}");
     // Nothing is removed: superseded nodes stay, so blocks only grow.
     let before = t.stats().blocks;
-    t.put(&key(0), b"changed");
+    t.put(&key(0), b"changed").expect("the store took the write");
     assert!(t.stats().blocks >= before, "history must not be dropped");
 }
 
@@ -360,13 +358,13 @@ fn cost_against_the_reference_store() {
     let mut tree = TreeStore::new();
     let tree_put = time(|| {
         for i in 0..N {
-            tree.put(&key(i), &vals[i as usize]);
+            tree.put(&key(i), &vals[i as usize]).expect("the store took the write");
         }
     });
     let mut mem = MemStore::default();
     let mem_put = time(|| {
         for i in 0..N {
-            mem.put(&key(i), &vals[i as usize]);
+            mem.put(&key(i), &vals[i as usize]).expect("the store took the write");
         }
     });
 
@@ -429,7 +427,7 @@ fn cost_against_the_reference_store() {
     let mut scattered = TreeStore::new();
     let scattered_put = time(|| {
         for &i in &order {
-            scattered.put(&key(i), &vals[i as usize]);
+            scattered.put(&key(i), &vals[i as usize]).expect("the store took the write");
         }
     });
     assert_eq!(scattered.root(), tree.root(), "same contents, same root");

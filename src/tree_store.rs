@@ -416,17 +416,6 @@ impl TreeStore {
 }
 
 impl Store for TreeStore {
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        // A tree refuses nothing (`apply_batch` below always answers `Ok`).
-        let _ = self.apply_batch(&[(key.to_vec(), Edit::Put(value.to_vec()))]);
-    }
-
-    fn delete(&mut self, key: &[u8]) -> bool {
-        let existed = self.lookup(key).is_some();
-        let _ = self.apply_batch(&[(key.to_vec(), Edit::Delete)]);
-        existed
-    }
-
     /// One `apply`, so a record and everything written with it become one new
     /// root. Writing them one at a time would mint a root for a state the app
     /// never had.

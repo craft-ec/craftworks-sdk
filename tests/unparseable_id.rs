@@ -40,14 +40,14 @@ impl Env for FakeEnv {
 #[derive(Default)]
 struct VecStore(Vec<(Vec<u8>, Vec<u8>)>);
 impl Store for VecStore {
-    fn put(&mut self, k: &[u8], v: &[u8]) {
-        self.0.retain(|(a, _)| a != k);
-        self.0.push((k.to_vec(), v.to_vec()));
-    }
-    fn delete(&mut self, k: &[u8]) -> bool {
-        let n = self.0.len();
-        self.0.retain(|(a, _)| a != k);
-        n != self.0.len()
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, store::Edit)]) -> Result<(), craftworks_sdk::Refused> {
+        for (k, e) in edits {
+            self.0.retain(|(a, _)| a != k);
+            if let store::Edit::Put(v) = e {
+                self.0.push((k.clone(), v.clone()));
+            }
+        }
+        Ok(())
     }
 }
 impl Reads for VecStore {

@@ -10,7 +10,7 @@ use craftworks_sdk::store::{Delta, Read, Reads};
 use craftworks_sdk::{Binding, LiveMode, MemStore, Store, TreeStore};
 
 fn put(s: &mut impl Store, k: &str, v: &str) {
-    s.put(k.as_bytes(), v.as_bytes());
+    s.put(k.as_bytes(), v.as_bytes()).expect("the store took the write");
 }
 
 fn keys(b: &Binding) -> Vec<String> {
@@ -219,8 +219,8 @@ fn a_reload_uses_the_delta_where_it_can_and_the_full_read_where_it_cannot() {
     // A change, a removal, and an addition — every arm of a delta.
     put(&mut tree, "a/007", "moved");
     put(&mut mem, "a/007", "moved");
-    tree.delete(b"a/008");
-    mem.delete(b"a/008");
+    tree.delete(b"a/008").expect("the store took the write");
+    mem.delete(b"a/008").expect("the store took the write");
     put(&mut tree, "a/999", "added");
     put(&mut mem, "a/999", "added");
 
@@ -312,13 +312,13 @@ fn a_delta_that_does_not_fit_in_one_page_is_not_applied_in_part() {
 
     let mut s = Paged(TreeStore::new());
     for i in 0..8u32 {
-        s.0.put(format!("a/{i:03}").as_bytes(), b"seed");
+        s.0.put(format!("a/{i:03}").as_bytes(), b"seed").expect("the store took the write");
     }
     let mut b = Binding::new(b"a/", b"b/", false);
     b.delta_above(0);
     b.reload(&mut s).expect("reload");
 
-    s.0.put(b"a/000", b"real");
+    s.0.put(b"a/000", b"real").expect("the store took the write");
     b.reload(&mut s).expect("reload");
 
     assert!(

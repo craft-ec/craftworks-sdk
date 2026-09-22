@@ -11,7 +11,7 @@ fn verdict(s: &craftworks_sdk::CachedStore, write_id: u64, state: protocol::Writ
 #[test]
 fn parity_complete_after_published_is_not_a_strangers_verdict() {
     let (mut s, _clock) = testkit::cached_store();
-    craftworks_sdk::Store::put(&mut s, b"k", b"v");
+    craftworks_sdk::Store::put(&mut s, b"k", b"v").expect("the store took the write");
     let id = s.copy.pending_ids()[0];
     for st in [protocol::WriteState::Accepted, protocol::WriteState::Published, protocol::WriteState::ParityComplete] {
         let v = verdict(&s, id, st);

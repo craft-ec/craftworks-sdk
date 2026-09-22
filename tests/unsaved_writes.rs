@@ -25,7 +25,7 @@ fn a_hundred_writes_are_unsaved_until_published_held_ones_included() {
         }
     }
     for i in 0..100u32 {
-        s.put(format!("d/notes/{i:04}").as_bytes(), b"row");
+        s.put(format!("d/notes/{i:04}").as_bytes(), b"row").expect("the store took the write");
     }
     let sent = s.take_outbound();
     assert_eq!(sent.len(), WRITES_IN_FLIGHT, "the window is not full, so this proves nothing about held writes");
@@ -55,7 +55,7 @@ fn a_hundred_writes_are_unsaved_until_published_held_ones_included() {
 #[test]
 fn an_accepted_write_is_still_unsaved() {
     let (mut s, _clock) = testkit::cached_store();
-    s.put(b"d/notes/0001", b"row");
+    s.put(b"d/notes/0001", b"row").expect("the store took the write");
     let id = s.copy.pending_ids()[0];
     let accepted = protocol::encode_reply(&protocol::Reply::SessionWriteState {
         session: s.client.session().expect("a session"),

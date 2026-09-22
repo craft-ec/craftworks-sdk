@@ -55,7 +55,7 @@ impl Tab {
     }
 
     fn write(&mut self, key: &[u8], value: &[u8]) {
-        self.store.put(key, value);
+        self.store.put(key, value).expect("the store took the write");
         self.pump();
     }
 }
@@ -133,7 +133,7 @@ fn each_tabs_write_states_name_that_tabs_session() {
 #[test]
 fn a_write_state_for_another_session_is_ignored() {
     let (mut s, _clock) = testkit::cached_store();
-    s.put(b"k", b"v");                       // write id 1, pending
+    s.put(b"k", b"v").expect("the store took the write");                       // write id 1, pending
     let id = s.copy.pending_ids()[0];
     let foreign = protocol::encode_reply(&protocol::Reply::SessionWriteState {
         session: s.client.session().expect("a session") ^ 0x55,
@@ -212,7 +212,7 @@ fn two_sessions_waiting_on_parity_together_are_each_told_it_completed() {
 #[test]
 fn a_plain_verdict_is_another_tabs_and_is_never_applied() {
     let (mut s, _clock) = testkit::cached_store();
-    s.put(b"k", b"v");
+    s.put(b"k", b"v").expect("the store took the write");
     let id = s.copy.pending_ids()[0];
     let plain = protocol::encode_reply(&protocol::Reply::WriteState { write_id: id, state: protocol::WriteState::Failed }).unwrap();
     s.on_inbound(&plain);
@@ -227,14 +227,15 @@ fn a_plain_verdict_is_another_tabs_and_is_never_applied() {
 fn a_page_with_no_session_refuses_its_writes_by_name_and_sends_nothing() {
     let (mut s, _clock) = testkit::cached_store();
     s.client = craftworks_sdk::engine_client::Client::from_random(None);
-    s.put(b"k", b"v");
+    let r = s.put(b"k", b"v");
+    assert!(matches!(r, Err(craftworks_sdk::copy::Refused::NoSession)), "the refusal was not returned: {r:?}");
     assert_eq!(s.refused.len(), 1);
     assert!(matches!(s.refused[0].1, craftworks_sdk::copy::Refused::NoSession), "{:?}", s.refused);
     assert!(s.copy.pending_ids().is_empty(), "the write is held as if it could be sent");
     assert!(s.take_outbound().is_empty(), "it was sent under no session");
     // THE CONTROL: the same page with randomness writes.
     let (mut ok, _c) = testkit::cached_store();
-    ok.put(b"k", b"v");
+    ok.put(b"k", b"v").expect("the store took the write");
     assert!(ok.refused.is_empty());
     assert_eq!(ok.take_outbound().len(), 1);
 }

@@ -41,7 +41,7 @@ fn tree() -> (Cid, BTreeMap<Cid, Vec<u8>>) {
         for i in 0..ROWS {
             let mut v = format!("{p}/{i:04}:").into_bytes();
             v.resize(VALUE_BYTES, p.as_bytes()[0]);
-            t.put(format!("{p}/{i:04}").as_bytes(), &v);
+            t.put(format!("{p}/{i:04}").as_bytes(), &v).expect("the store took the write");
         }
     }
     let root = t.root();

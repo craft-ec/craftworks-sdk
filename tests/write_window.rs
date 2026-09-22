@@ -85,10 +85,16 @@ fn publish(n: u32) -> (CachedStore, QueueingNode) {
     s.client.send(&protocol::Request::Identity);
     q.accept(s.take_outbound());
     drive("the node answering Identity", 100, || q.serve_one(&mut s));
+    // Past the copy's cap a write is refused; the refusal is RETURNED, and it
+    // is the same count the store reports (sdk#186).
+    let mut returned = 0;
     for i in 0..n {
-        s.put(format!("d/notes/{i:08}").as_bytes(), &vec![b'x'; 5 * 1024]);
+        if s.put(format!("d/notes/{i:08}").as_bytes(), &vec![b'x'; 5 * 1024]).is_err() {
+            returned += 1;
+        }
         q.accept(s.take_outbound());
     }
+    assert_eq!(returned, s.refused.len(), "a refusal was reported but not returned");
     // The node works through its queue; each answer may open the window.
     drive("the node serving the publish", 100_000, || {
         let served = q.serve_one(&mut s);
@@ -167,7 +173,7 @@ fn a_slow_node_publishes_every_write_and_none_is_rolled_back_while_held() {
     drive("the node answering Identity", 100, || q.serve_one(&mut s));
     let n = s.copy.max_pending;
     for i in 0..n as u32 {
-        s.put(format!("d/notes/{i:08}").as_bytes(), &vec![b'x'; 5 * 1024]);
+        s.put(format!("d/notes/{i:08}").as_bytes(), &vec![b'x'; 5 * 1024]).expect("the store took the write");
         q.accept(s.take_outbound());
     }
     assert!(s.refused.is_empty(), "{:?}", s.refused);
@@ -214,7 +220,7 @@ fn control_a_sent_write_with_no_verdict_times_out_from_its_send() {
     drive("the node answering Identity", 100, || q.serve_one(&mut s));
     let first = s.next_write_id();
     for i in 0..=window() as u32 {
-        s.put(format!("d/notes/{i:08}").as_bytes(), b"v");
+        s.put(format!("d/notes/{i:08}").as_bytes(), b"v").expect("the store took the write");
         q.accept(s.take_outbound());
     }
     let last = first + window() as u64;
@@ -257,14 +263,14 @@ fn verdict(s: &CachedStore, write_id: u64, state: protocol::WriteState) -> Vec<u
 fn sixteen_lost_verdicts_free_the_window() {
     let (mut s, clock) = testkit::cached_store();
     for i in 0..window() as u32 {
-        s.put(format!("lost/{i:02}").as_bytes(), b"x");
+        s.put(format!("lost/{i:02}").as_bytes(), b"x").expect("the store took the write");
     }
     assert_eq!(s.take_outbound().len(), WRITES_IN_FLIGHT);
     clock.advance(61_000);
     let told = s.tick();
     assert_eq!(told.rolled_back.len(), WRITES_IN_FLIGHT, "the sixteen are rolled back at 60 s");
     for i in 0..5u32 {
-        s.put(format!("later/{i:02}").as_bytes(), b"y");
+        s.put(format!("later/{i:02}").as_bytes(), b"y").expect("the store took the write");
     }
     assert_eq!(s.take_outbound().len(), 5, "the person's next writes never reached the wire");
     assert_eq!(s.held_count(), 0);
@@ -277,7 +283,7 @@ fn sixteen_lost_verdicts_free_the_window() {
 fn a_time_out_releases_what_the_window_holds() {
     let (mut s, clock) = testkit::cached_store();
     for i in 0..window() as u32 + 5 {
-        s.put(format!("w/{i:02}").as_bytes(), b"x");
+        s.put(format!("w/{i:02}").as_bytes(), b"x").expect("the store took the write");
     }
     assert_eq!(s.take_outbound().len(), WRITES_IN_FLIGHT);
     assert_eq!(s.held_count(), 5);
@@ -295,7 +301,7 @@ fn a_time_out_releases_what_the_window_holds() {
 #[test]
 fn a_busy_write_re_sent_is_timed_from_the_re_send() {
     let (mut s, clock) = testkit::cached_store();
-    s.put(b"K", b"v");
+    s.put(b"K", b"v").expect("the store took the write");
     let id = s.copy.pending_ids()[0];
     assert_eq!(s.take_outbound().len(), 1);
     let busy = verdict(&s, id, protocol::WriteState::Busy);
@@ -326,7 +332,7 @@ fn any_verdict_frees_the_slot_accepted_or_busy() {
     for state in [protocol::WriteState::Accepted, protocol::WriteState::Busy] {
         let (mut s, _clock) = testkit::cached_store();
         for i in 0..=window() as u32 {
-            s.put(format!("v/{i:02}").as_bytes(), b"x");
+            s.put(format!("v/{i:02}").as_bytes(), b"x").expect("the store took the write");
         }
         let sent: Vec<u64> = s.copy.pending_ids().into_iter().take(window()).collect();
         let held_id = *s.copy.pending_ids().last().expect("a held write");

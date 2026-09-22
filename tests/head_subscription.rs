@@ -62,7 +62,7 @@ fn head(n: u8) -> HeadId {
 }
 
 fn put(s: &mut impl Store, k: &str, v: &str) {
-    s.put(k.as_bytes(), v.as_bytes());
+    s.put(k.as_bytes(), v.as_bytes()).expect("the store took the write");
 }
 
 fn rows(t: &Trees, tree: usize, i: usize) -> usize {

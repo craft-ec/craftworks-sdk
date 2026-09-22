@@ -124,7 +124,7 @@ impl Client {
     }
 
     fn write(&mut self, key: &[u8], value: &[u8]) {
-        self.store.put(key, value);
+        self.store.put(key, value).expect("the store took the write");
         self.pump();
     }
 
@@ -716,7 +716,7 @@ fn a_delta_applied_copy_and_a_full_reload_hold_equal_rows() {
     let mut r = Refresh::new();
     b.load_into(&mut r);
     a.write(&key(3), b"v2");
-    a.store.delete(&key(4));
+    a.store.delete(&key(4)).expect("the store took the write");
     a.pump();
     a.write(&key(20), b"new");
     let _ = b.refresh(&mut r);

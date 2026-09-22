@@ -99,13 +99,13 @@ async fn main() -> Result<()> {
     let first_id = store.next_write_id();
     let t0 = Instant::now();
     let mut sent_frames = 0usize;
-    store.put(b"s/notes", br#"{"type":"Note","fields":[{"name":"title","kind":"text"},{"name":"body","kind":"text"}]}"#);
+    store.put(b"s/notes", br#"{"type":"Note","fields":[{"name":"title","kind":"text"},{"name":"body","kind":"text"}]}"#).expect("the store took the write");
     sent_frames += pump(&mut client, &dkey, &mut store).await?;
     for i in 0..rows {
-        store.put(format!("d/notes/{:032x}", 0x0190_0000_0000u64 + i).as_bytes(), &text(i));
+        store.put(format!("d/notes/{:032x}", 0x0190_0000_0000u64 + i).as_bytes(), &text(i)).expect("the store took the write");
         sent_frames += pump(&mut client, &dkey, &mut store).await?;
     }
-    store.put(b"d/craftworks.published/notes", b"{}");
+    store.put(b"d/craftworks.published/notes", b"{}").expect("the store took the write");
     sent_frames += pump(&mut client, &dkey, &mut store).await?;
     // A write the COPY refused (its own bound, `max_pending` = 256) was never sent: refused by name, reported
     // separately. Everything else must publish.
