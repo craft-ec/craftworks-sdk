@@ -1044,6 +1044,16 @@ pub struct Engine<B: Blocks> {
     /// group settles on, when all three are in. What was merely emitted is
     /// in `asks`, which paces and decides nothing.
     parity_confirmed: BTreeSet<Cid>,
+    /// Whether `owed` covers the WHOLE published tree (sdk#119). Not carried
+    /// in the context: a rehydrated engine says `NotScanned`, which is the
+    /// honest answer when nothing re-derived it.
+    parity_scan: ParityScan,
+    /// Where `recompute_owed`'s walk stopped (sdk#181). It RESUMES here on
+    /// the next call instead of restarting at the root, so a group listed
+    /// beyond the first `max_parity_scan_blocks` nodes is reached in a few
+    /// calls rather than never. Kept in memory only: the page keeps its
+    /// engine between calls, and a rehydrated delegate restarts as before.
+    parity_walk: Option<ParityWalk>,
     /// Unanswered asks, for pacing only (`asks`).
     asks: asks::Asks,
     /// Shed this call to stay saveable (`keep_saveable`); not carried.
@@ -1201,6 +1211,8 @@ impl<B: Blocks> Engine<B> {
             folded_bytes: 0,
             owed: BTreeMap::new(),
             parity_confirmed: BTreeSet::new(),
+            parity_scan: ParityScan::NotScanned,
+            parity_walk: None,
             asks: asks::Asks::default(),
             shed: Shed::default(),
             uncoded: false,
@@ -1278,6 +1290,14 @@ impl<B: Blocks> Engine<B> {
     /// The parameters this engine runs under.
     pub fn params(&self) -> &Params {
         &self.params
+    }
+
+    /// Whether [`Engine::owed_groups`] covers the whole published tree
+    /// (sdk#119). A zero is "all put" ONLY under `Done`; under `NotScanned`
+    /// it means nothing is known beyond what this engine coded itself — and
+    /// every surface that reports redundancy must say so, never "0 owed".
+    pub fn parity_scan(&self) -> &ParityScan {
+        &self.parity_scan
     }
 
     pub fn owed_groups(&self) -> usize {
@@ -1675,6 +1695,14 @@ impl<B: Blocks> Engine<B> {
         let was = self.published_root;
         self.root = root;
         self.published_root = root;
+        // A root taken from OUTSIDE — a head read, another writer's head —
+        // was made by commits this engine did not code, so nothing here knows
+        // their parity. Only the empty tree is known in full: it lists none.
+        self.parity_scan = if root == self.empty.cid {
+            ParityScan::Done { root }
+        } else {
+            ParityScan::NotScanned
+        };
         self.published_seq = seq;
         self.next_seq = seq + 1;
         self.notify_subs(was)
@@ -3044,6 +3072,12 @@ impl<B: Blocks> Engine<B> {
         let was = self.published_root;
         self.published_seq = c.seq;
         self.published_root = c.root;
+        // THIS engine's commit: every group it coded is in `owed`, so a tree
+        // known in full stays known in full. `NotScanned` stays `NotScanned`:
+        // one commit says nothing about the parity of the tree beneath it.
+        if matches!(self.parity_scan, ParityScan::Done { .. }) {
+            self.parity_scan = ParityScan::Done { root: c.root };
+        }
         // ONE per commit: this runs where the head is confirmed, which
         // happens once per commit, rather than per write or per block.
         out.extend(self.notify_subs(was));
@@ -3333,13 +3367,24 @@ impl<B: Blocks> Engine<B> {
         let mut found: Vec<(ParityIds, ParityBlocks)> = Vec::new();
         let mut need: BTreeSet<Cid> = BTreeSet::new();
         let mut left = self.params.max_parity_scan_blocks;
+        // RESUME where the last call stopped (sdk#181). A fresh walk only when
+        // there is none, or the root it was walking is no longer ours.
+        let mut walk = match self.parity_walk.take() {
+            Some(w) if w.root == self.root => w,
+            _ => ParityWalk::from(self.root),
+        };
+        // Nodes not held THIS call: asked for, and put back on the walk so a
+        // later call visits them once they arrive — dropping them would skip
+        // their subtree for the rest of the walk.
+        let mut deferred: Vec<Cid> = Vec::new();
         {
             let source = self.source();
-            let mut stack = vec![self.root];
-            let mut seen: BTreeSet<Cid> = BTreeSet::new();
+            let stack = &mut walk.stack;
+            let seen = &mut walk.seen;
             let mut still: BTreeSet<ParityIds> = wanted.clone();
             while let Some(cid) = stack.pop() {
                 if still.is_empty() || left == 0 {
+                    stack.push(cid);
                     break;
                 }
                 if !seen.insert(cid) {
@@ -3347,8 +3392,10 @@ impl<B: Blocks> Engine<B> {
                 }
                 let Some(bytes) = source.get(&cid) else {
                     // The walk stopped here. Ask for it; the group stays owed
-                    // and the next call resumes from a warmer tree.
+                    // and a later call comes back to it.
                     need.insert(cid);
+                    seen.remove(&cid);
+                    deferred.push(cid);
                     continue;
                 };
                 left -= 1;
@@ -3396,6 +3443,13 @@ impl<B: Blocks> Engine<B> {
                     }
                 }
             }
+        }
+        walk.stack.extend(deferred);
+        // A walk that has visited the whole tree starts again at the root on
+        // the next call: a group still wanted may be listed by a node that
+        // was not held on the way past.
+        if !walk.stack.is_empty() {
+            self.parity_walk = Some(walk);
         }
         for (key, blocks) in found {
             if let Some(o) = self.owed.get_mut(&key) {
@@ -3491,6 +3545,40 @@ impl<B: Blocks> Engine<B> {
             self.parity_confirmed.remove(id);
             self.asks.settled(&asks::Ask::Parity(*id));
         }
+    }
+}
+
+/// Whether an engine's owed parity covers the WHOLE published tree (sdk#119).
+///
+/// A zero from [`Engine::owed_groups`] means "every group is put" only under
+/// `Done`. Under `NotScanned` the engine knows the groups it coded itself and
+/// nothing about the tree beneath them — which is every engine that read a
+/// non-empty head, adopted another writer's, or was rehydrated. Re-deriving
+/// what such a tree owes needs a presence probe; until it lands (sdk#119 PR2)
+/// `NotScanned` is the honest answer, and a surface must say it as such.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParityScan {
+    /// Nothing is known beyond what this engine coded.
+    NotScanned,
+    /// This engine has tracked the tree since it was empty: every group of
+    /// `root` is confirmed or in `owed`.
+    Done { root: Cid },
+}
+
+/// `recompute_owed`'s walk, kept between calls so it RESUMES (sdk#181).
+#[derive(Clone, Debug)]
+struct ParityWalk {
+    /// The root being walked; a different root starts a new walk.
+    root: Cid,
+    /// Nodes still to visit.
+    stack: Vec<Cid>,
+    /// Nodes already visited in this walk.
+    seen: BTreeSet<Cid>,
+}
+
+impl ParityWalk {
+    fn from(root: Cid) -> Self {
+        ParityWalk { root, stack: vec![root], seen: BTreeSet::new() }
     }
 }
 
