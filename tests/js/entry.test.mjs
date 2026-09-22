@@ -268,6 +268,24 @@ await t("**a head move re-runs a LIVE binding, never a plain one**", async () =>
   assert.equal(raw.__session.scans(), before + 1, "a head move did not re-run exactly the LIVE binding");
 });
 
+await t("**liveMode says how many LIVE bindings are bound, not only what the SESSION holds (sdk#259)**", async () => {
+  const { raw, db } = await openWatching();
+  assert.equal(db.liveMode().liveBindings, 0, "a page with no LIVE binding reported one");
+  const live = db.bind("tasks", { live: true });
+  const plain = db.bind("notes", { live: false });
+  await settle();
+  assert.equal(db.liveMode().liveBindings, 1, "a LIVE binding is bound and the report does not say so");
+  assert.equal(db.liveMode().mode, "HeadSubscribed", "the session half of the report was lost");
+  // A page can hold the subscription and have nothing to re-run on it: that
+  // is what "not live = read when needed" looks like, and a tool reading only
+  // the session's half would call this page live.
+  live.stop?.();
+  plain.stop?.();
+  await settle();
+  assert.equal(db.liveMode().liveBindings, 0, "a stopped LIVE binding is still counted, so the page looks live when nothing watches");
+  assert.ok(raw.__session.scans() >= 0);
+});
+
 await t("**a HeadChanged for OUR head re-runs a bound scan, with no app call**", async () => {
   const raw = watchingRaw();
   const sdk = wrap(raw);

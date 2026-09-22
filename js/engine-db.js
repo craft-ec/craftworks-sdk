@@ -577,7 +577,17 @@ export function engineDb(handle) {
      * WHY. A page that believed it was being notified while it was polling
      * is the failure this exists to prevent.
      */
-    liveMode: () => JSON.parse(session.live_mode()),
+    /**
+     * How this page is kept up to date, as it really is (sdk#259).
+     *
+     * `mode`/`why`/`headChanges` are the SESSION's: whether the head read
+     * with subscribe was answered, and how many head moves it has delivered.
+     * `liveBindings` is this layer's, and it is the other half: a page can
+     * hold the subscription and have no LIVE binding to re-run on it, which
+     * is exactly what "not live = read when needed" looks like. Reporting one
+     * without the other lets a tool call a page live because the SESSION is.
+     */
+    liveMode: () => ({ ...JSON.parse(session.live_mode()), liveBindings: bound.size }),
 
     // THE PAGE CALLS THIS after handing a message to the session, and after
     // each tick. It is how a parked read learns its load is done, and how a
