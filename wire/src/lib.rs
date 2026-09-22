@@ -75,6 +75,7 @@ use freenet_stdlib::prelude::*;
 
 pub mod block;
 pub mod provision;
+pub mod puts;
 pub mod signer;
 pub mod webapp;
 pub mod reassemble;
@@ -151,6 +152,11 @@ pub enum Incoming {
     /// is refused on a node with a peer (F55) — that is how a cold read learns
     /// a root is local. A refusal that names nothing stays [`Incoming::Refused`].
     GetFailed { id: [u8; 32] },
+    /// A contract PUT the node REFUSED, naming the contract (its
+    /// `ContractError::Put { key, cause }`) as [`AckKind::Put`] names one it
+    /// accepted — so a refusal is attributed to its PUT by key, never by
+    /// position. `said` is the node's `cause`: display only.
+    PutFailed { key: String, said: String },
     /// The node accepted a request, and WHICH.
     ///
     /// **An ack is not durability.** A write becomes published by being READ
@@ -484,6 +490,11 @@ fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
         Err(Unusable::NodeSaidNo) if get_refused(bytes).is_some() => {
             Err(Incoming::GetFailed { id: get_refused(bytes).expect("just checked") })
         }
+        // A PUT refusal that names its contract: which PUT it answers.
+        Err(Unusable::NodeSaidNo) if put_refused(bytes).is_some() => {
+            let (key, said) = put_refused(bytes).expect("just checked");
+            Err(Incoming::PutFailed { key, said })
+        }
         // A node's own error reply is a MESSAGE, not a failure to read one.
         Err(Unusable::NodeSaidNo) => Err(Incoming::Refused(Refused {
             said: "the node refused the request".into(),
@@ -601,6 +612,21 @@ fn get_refused(bytes: &[u8]) -> Option<[u8; 32]> {
             let mut id = [0u8; 32];
             id.copy_from_slice(&key.id().as_bytes()[..32]);
             Some(id)
+        }
+        _ => None,
+    }
+}
+
+/// The contract (named as [`AckKind::Put`] names it) and the node's cause, if
+/// the bytes are a PUT refusal.
+fn put_refused(bytes: &[u8]) -> Option<(String, String)> {
+    use freenet_stdlib::client_api::{ClientError, ContractError, ErrorKind, RequestError};
+    let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
+        return None;
+    };
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key, cause })) => {
+            Some((key.to_string(), cause.to_string()))
         }
         _ => None,
     }

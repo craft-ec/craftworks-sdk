@@ -24,6 +24,7 @@
 //! | `Ack(Put)` of a block | `PutOk` |
 //! | `Ack(Put)` / `Ack(Updated)` of the Register | `Updated` (it says nothing more, F56); the register exists |
 //! | a signer answer | `Signer { id, answer }`; a `Held { present }` goes back to the blocks its id asked about |
+//! | `Ack(Put)` / `PutFailed` of any OTHER contract | handed back unread ([`PageIo::take_others`]): the app's own PUTs ([`PageIo::put_contract`], builder#104) are the caller's to match |
 //!
 //! THE FIRST-PUT RACE: two pages on one key both see no register and both
 //! PUT it. The signer signs ONE record from the genesis (at most one
@@ -80,6 +81,9 @@ pub struct PageIo {
     signer_has_record: Option<bool>,
     /// A failed head read waiting on that answer.
     head_failed_pending: bool,
+    /// Node answers about contracts that are not this page's register or
+    /// blocks — the app's own PUTs — handed back unread (`take_others`).
+    others: Vec<Incoming>,
 }
 
 /// The id the record query goes out under.
@@ -122,7 +126,25 @@ impl PageIo {
             provisioned: false,
             signer_has_record: None,
             head_failed_pending: false,
+            others: Vec::new(),
         }
+    }
+
+    /// PUT a contract the APP names (builder#104: a web container). Framed
+    /// here, on this page's stream counter, because this is the only path to
+    /// the node (main's condition 3) and two chunked requests on one stream id
+    /// would be reassembled into each other. The answer comes back through
+    /// [`PageIo::take_others`], named by the contract's key.
+    pub fn put_contract(&mut self, contract: ContractContainer, state: WrappedState) -> Result<(), String> {
+        let stream = self.next_stream();
+        let f = wire::frame_put(contract, state, stream)?;
+        self.out.extend(f);
+        Ok(())
+    }
+
+    /// Node answers this page did not own (see `others`), oldest first.
+    pub fn take_others(&mut self) -> Vec<Incoming> {
+        std::mem::take(&mut self.others)
     }
 
     /// PROVISION the signer: register its delegate (from its wasm) and hand it
@@ -210,7 +232,9 @@ impl PageIo {
                     self.server.node(Answer::GetMissed(cid), now);
                 }
             }
-            Incoming::Ack(wire::AckKind::Put(key)) | Incoming::Ack(wire::AckKind::Updated(key)) => {
+            Incoming::Ack(wire::AckKind::Put(key)) | Incoming::Ack(wire::AckKind::Updated(key))
+                if key == self.register_key || self.by_key.contains_key(&key) =>
+            {
                 if key == self.register_key {
                     self.register_seen = true;
                     self.server.node(Answer::Updated, now);
@@ -218,6 +242,14 @@ impl PageIo {
                     self.server.node(Answer::PutOk(cid), now);
                 }
             }
+            // Someone else's PUT answer: the app's, handed back unread.
+            answer @ Incoming::Ack(wire::AckKind::Put(_)) => self.others.push(answer),
+            // A refused PUT of our own register or block is what a refusal
+            // naming nothing was before `PutFailed` existed: reported.
+            Incoming::PutFailed { key, said } if key == self.register_key || self.by_key.contains_key(&key) => {
+                self.unusable.push(format!("the node refused: {said}"))
+            }
+            answer @ Incoming::PutFailed { .. } => self.others.push(answer),
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
                     match wire::signer::read_answer(&m) {

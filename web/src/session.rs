@@ -145,6 +145,9 @@ pub struct Session {
     page: Option<page_io::PageIo>,
     /// `Identity` sent to the in-page server once the signer is provisioned.
     page_identity_sent: bool,
+    /// PUTs of contracts the APP names (`put_contract`, builder#104), and
+    /// what the node said about each — matched by the key it names.
+    puts: wire::puts::Puts,
 }
 
 #[wasm_bindgen]
@@ -194,6 +197,7 @@ impl Session {
             cold_contract: None,
             cold_chosen: false,
             page_mode: false,
+            puts: wire::puts::Puts::default(),
             signer_code: Vec::new(),
             page: None,
             page_identity_sent: false,
@@ -249,6 +253,14 @@ impl Session {
                 }
             }
             Incoming::Ack(kind) => self.on_ack(kind),
+            // A refused PUT naming its contract: the app's, if it is one of
+            // `put_contract`'s; otherwise what any refusal is (below).
+            Incoming::PutFailed { key, said } => {
+                if !self.puts.refused(&key, &said) {
+                    self.db.store_mut().client.frame_refused();
+                    self.plan.on_refused(&said);
+                }
+            }
             Incoming::Refused(why) => {
                 // A refused frame will never run: the refusal is its answer
                 // (sdk#196 review, 1b), or the tick and ask gates lag for good.
@@ -411,6 +423,13 @@ impl Session {
                 self.foreign_notifications += 1;
             }
             return;
+        }
+        // An app's PUT, by the key the ack names — before the plan, which
+        // would otherwise take it for a provisioning step's.
+        if let AckKind::Put(key) = &kind {
+            if self.puts.acked(key) {
+                return;
+            }
         }
         self.plan.on_ack(&kind);
         self.note_progress();
@@ -955,9 +974,22 @@ impl Session {
         let frames = p.take_frames();
         let replies = p.take_replies();
         let ready = p.provisioned() && !self.page_identity_sent;
+        let others = p.take_others();
         self.out.extend(frames);
         for m in replies {
             self.on_engine_reply(m);
+        }
+        // The node's answers about contracts that are not the page's own: the
+        // app's PUTs, by the key each names.
+        for answer in others {
+            let ours = match &answer {
+                Incoming::Ack(AckKind::Put(key)) => self.puts.acked(key),
+                Incoming::PutFailed { key, said } => self.puts.refused(key, said),
+                _ => false,
+            };
+            if !ours {
+                self.unusable.push(format!("a PUT answer for a contract this session never put: {answer:?}"));
+            }
         }
         if ready {
             self.page_identity_sent = true;
@@ -1209,6 +1241,50 @@ impl Session {
         // when nothing was lost.
         self.subscribed = false;
         self.watching = false;
+        // An app PUT's answer sent on the old socket never arrives on this one.
+        self.puts.connection_lost();
+    }
+
+    /// PUT a contract the APP names — its code, params and state (builder#104:
+    /// a web container, whose params are the hash of its state) — and return
+    /// its key: the contract instance id, as the node names it and serves a
+    /// web container under (`/v1/contract/web/<key>/`).
+    ///
+    /// The frames go out with the next `outbound`, through page-io in page
+    /// mode (the only path to the node there). [`Session::put_status`] says
+    /// what the node answered, matched by this key. **An ack is not
+    /// durability:** a publisher that must know reads it back.
+    pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
+        let (key, contract, state) = wire::puts::contract(&code, &params, &state);
+        if self.page_mode {
+            let Some(p) = self.page.as_mut() else {
+                return Err(JsValue::from_str("page mode: provision first — there is no path to the node before it"));
+            };
+            p.put_contract(contract, state).map_err(|e| JsValue::from_str(&e))?;
+            self.puts.begin(key.clone());
+            self.pump_page();
+        } else {
+            let stream = self.next_stream();
+            let frames = wire::frame_put(contract, state, stream).map_err(|e| JsValue::from_str(&e))?;
+            self.out.extend(frames);
+            self.puts.begin(key.clone());
+        }
+        Ok(key)
+    }
+
+    /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
+    /// `{"state":"none"|"pending"|"put"|"refused"|"unanswered","said":"…"}`.
+    /// `said` is the node's own words for a refusal: display only.
+    pub fn put_status(&self, key: &str) -> String {
+        use wire::puts::PutState;
+        let (state, said) = match self.puts.state(key) {
+            None => ("none", ""),
+            Some(PutState::Pending) => ("pending", ""),
+            Some(PutState::Put) => ("put", ""),
+            Some(PutState::Refused(w)) => ("refused", w.as_str()),
+            Some(PutState::Unanswered) => ("unanswered", ""),
+        };
+        serde_json::json!({ "state": state, "said": said }).to_string()
     }
 
     // ---- the data surface -------------------------------------------

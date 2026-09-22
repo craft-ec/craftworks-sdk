@@ -78,6 +78,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     // its clock alone at that moment.
     "cold_due_ms",
     "cold_tick",
+    // PUBLISHING a contract the app names (builder#104: its web container),
+    // and what the node said. A node operation: an in-memory store has no
+    // node to put anything on.
+    "put_contract",
+    "put_status",
     // PAGE MODE (ruling B): which engine this session runs — the delegate's,
     // or the in-page one over page-io. A transport choice; an in-memory store
     // has no engine at all.
