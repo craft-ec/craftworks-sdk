@@ -375,6 +375,10 @@ export async function openSession(Session, {
     for (const c of report.conflicts ?? []) onEvent({ kind: "conflict", ...c });
     // sdk#225b: rows of a saved write that another device replaced.
     for (const s of report.superseded ?? []) onEvent({ kind: "superseded", ...s });
+    // sdk#143/#144: a conflicted update was RE-RUN on the new version. Only
+    // what it could not keep is told: fields changed elsewhere too
+    // ("dropped"), a record deleted elsewhere, or a named failure.
+    for (const r of report.reruns ?? []) onEvent({ kind: "rerun", ...r });
     const done = JSON.parse(session.take_progress());
     for (const step of done) onEvent({ kind: "provisioned", step });
     // The tick is also where a load that nobody answered is given up on, so

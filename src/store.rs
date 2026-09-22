@@ -287,6 +287,25 @@ pub trait Store {
         }
         Ok(())
     }
+    /// The id of the write this store made last, if it numbers them (M2's
+    /// re-run: `Db` remembers what each of its writes MEANT by this id).
+    fn last_write_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Is this write still waiting on the node (not yet ended)?
+    fn is_pending_write(&self, write_id: u64) -> bool {
+        let _ = write_id;
+        false
+    }
+
+    /// Conflicts since the last call, each a CHAIN: the write that conflicted
+    /// and the later writes that fell with it (on its keys, W1), in the order
+    /// they were made, with the keys whose reads no longer held.
+    fn take_conflict_chains(&mut self) -> Vec<ConflictChain> {
+        Vec::new()
+    }
+
     /// Apply several edits as ONE change that says what it READ (M2,
     /// sdk#148): a store that holds writes for a NODE sends the reads with
     /// them, and the engine checks them where the edits land. The default is
@@ -301,6 +320,16 @@ pub trait Store {
         let _ = reads;
         self.apply_batch(edits)
     }
+}
+
+/// A write that CONFLICTED (a key it read had moved) and the later writes that
+/// fell with it, in the order they were made (M2's re-run, sdk#143/#144).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConflictChain {
+    pub write_ids: Vec<u64>,
+    /// The keys whose reads no longer held (often the schema, a key no write
+    /// in the chain wrote).
+    pub keys: Vec<Vec<u8>>,
 }
 
 /// Sort by key and drop all but the LAST edit for each key.

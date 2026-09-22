@@ -95,6 +95,9 @@ pub struct CachedStore {
     conflicts: Vec<Conflicted>,
     /// Superseded rows this client was told of (sdk#225b), for the app.
     superseded: Vec<Superseded>,
+    /// Conflict chains for `Db`'s re-run (sdk#143/#144): drained by
+    /// `take_conflict_chains`.
+    chains: Vec<crate::store::ConflictChain>,
 }
 
 /// A Published write whose `keys` another device of the same identity
@@ -157,6 +160,7 @@ impl CachedStore {
             reads_of: std::collections::BTreeMap::new(),
             conflicts: Vec::new(),
             superseded: Vec::new(),
+            chains: Vec::new(),
         }
     }
 
@@ -316,6 +320,9 @@ impl CachedStore {
             }
             if let protocol::Reply::Conflicted { session, write_id, key, current } = &r {
                 if self.client.session() == Some(*session) {
+                    if let Some(c) = self.chains.iter_mut().rev().find(|c| c.write_ids.contains(write_id)) {
+                        c.keys.push(key.clone());
+                    }
                     self.forget_key(key);
                     self.conflicts.push(Conflicted { write_id: *write_id, key: key.clone(), current: *current });
                 }
@@ -381,6 +388,15 @@ impl CachedStore {
             W::Conflict => {
                 self.reads_of.remove(&write_id);
                 let told = self.copy.failed(write_id);
+                // THE CHAIN, for `Db`'s re-run: this write and every later one
+                // that fell with it, in the order they were made.
+                let mut ids: Vec<u64> = told.rolled_back.iter().map(|(id, _)| *id).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                for id in &ids {
+                    self.reads_of.remove(id);
+                }
+                self.chains.push(crate::store::ConflictChain { write_ids: ids, keys: Vec::new() });
                 for k in &told.rolled_back_keys {
                     self.forget_key(k);
                 }
@@ -654,6 +670,18 @@ impl Store for CachedStore {
 
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
         self.apply_commit(&[], edits)
+    }
+
+    fn last_write_id(&self) -> Option<u64> {
+        self.next_write_id.checked_sub(1).filter(|id| *id > 0)
+    }
+
+    fn is_pending_write(&self, write_id: u64) -> bool {
+        self.copy.pending_ids().contains(&write_id)
+    }
+
+    fn take_conflict_chains(&mut self) -> Vec<crate::store::ConflictChain> {
+        std::mem::take(&mut self.chains)
     }
 
     /// ONE write, so the engine applies them as one commit — with what it READ,
