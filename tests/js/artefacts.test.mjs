@@ -11,7 +11,7 @@ import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { shippedArtefacts } from "../../js/session.js";
-import { artefactBytes, allArtefactBytes, CACHE_NAME } from "../../js/artefacts.js";
+import { artefactBytes, allArtefactBytes, CACHE_NAME, ambientCaches } from "../../js/artefacts.js";
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -397,6 +397,28 @@ await t("**NO CIRCULARITY: resolving the artefacts consumes none of them**", asy
         `${name} is fetched from ${u}, which is not a plain GET to this node`);
     }
   }
+});
+
+await t("**in a SANDBOXED frame, where even READING `caches` throws, an artefact is still fetched and verified**", async () => {
+  // How a node serves every web app (builder#104): an iframe sandboxed without
+  // allow-same-origin, where the `caches` getter throws a SecurityError. The
+  // DEFAULT is what a loader uses, so the default is what is tested.
+  const bytes = new Uint8Array([4, 5, 6]);
+  const sha256 = await sha(bytes);
+  const had = Object.getOwnPropertyDescriptor(globalThis, "caches");
+  Object.defineProperty(globalThis, "caches", { configurable: true, get() { throw new DOMException("Cache storage is disabled because the context is sandboxed", "SecurityError"); } });
+  try {
+    assert.throws(() => globalThis.caches, /sandboxed/, "THE CONTROL: the getter really throws, as a sandboxed frame's does");
+    assert.equal(ambientCaches(), null);
+    const got = await artefactBytes({ urls: ["https://node/v1/contract/web/ARTEFACTS/block.wasm"], sha256 }, { fetch: async () => new Response(bytes) });
+    assert.deepEqual(new Uint8Array(got), bytes);
+  } finally {
+    if (had) Object.defineProperty(globalThis, "caches", had); else delete globalThis.caches;
+  }
+  const store = { open: async () => ({}) };
+  Object.defineProperty(globalThis, "caches", { configurable: true, value: store });
+  try { assert.equal(ambientCaches(), store, "an ordinary page's Cache Storage is still used"); }
+  finally { if (had) Object.defineProperty(globalThis, "caches", had); else delete globalThis.caches; }
 });
 
 await t("**THE CONTROL THAT MATTERS: bytes that do not match the named hash are REFUSED**", async () => {

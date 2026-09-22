@@ -62,11 +62,27 @@ async function best(effort, fallback = null) {
  * the cache OFF, which is the control proving the cache is what avoids the
  * second fetch rather than something else in the environment.
  */
+/**
+ * The page's Cache Storage, or `null` where it cannot be had. In a SANDBOXED
+ * frame without `allow-same-origin` — which is how a node serves every web
+ * app (builder#104) — merely READING `caches` throws a SecurityError. No cache
+ * then means fetching and verifying every time, which is already this file's
+ * path for a cache that is unavailable; throwing instead stopped the app from
+ * opening at all.
+ */
+export function ambientCaches() {
+  try {
+    return typeof caches === "object" ? caches : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 export async function artefactBytes(
   { url, urls, sha256 },
   {
     fetch: fetchWith = typeof fetch === "function" ? fetch : null,
-    caches: cacheStorage = typeof caches === "object" ? caches : null,
+    caches: cacheStorage = ambientCaches(),
     subtle = typeof crypto === "object" ? crypto.subtle : null,
   } = {},
 ) {
