@@ -411,6 +411,29 @@ fn an_own_writes_state_change_names_its_keys() {
     assert_eq!(verdict_of(&[W::Published, W::Published]), vec![both, vec![]], "a repeated verdict named the keys again");
 }
 
+/// sdk#264 / builder#107: a SUPERSEDED write (another device's head won and
+/// holds ITS values at these keys) names its keys, so a plain binding on them
+/// re-reads and shows the winner's value instead of this tab's forgotten one
+/// -- the case where the screen is most wrong. The control: a `Superseded` for
+/// another session names none.
+#[test]
+fn a_superseded_write_names_its_keys() {
+    let named = |ours: bool| -> Vec<Vec<u8>> {
+        let mut s = store();
+        s.on_page(b"a/", b"b/", vec![], root(1));
+        Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"mine".to_vec()))]).expect("taken");
+        let _ = s.take_outbound();
+        let session = s.client.session().expect("a session");
+        let _ = s.take_state_changed();
+        let to = if ours { session } else { session + 1 };
+        let keys = vec![b"a/1".to_vec()];
+        s.on_inbound(&protocol::encode_reply(&protocol::Reply::Superseded { session: to, write_id: 1, seq: 2, root: root(2), keys }).expect("encodes"));
+        s.take_state_changed()
+    };
+    assert_eq!(named(true), vec![b"a/1".to_vec()], "a superseded write did not name its keys: its plain bindings keep showing this tab's forgotten value");
+    assert_eq!(named(false), Vec::<Vec<u8>>::new(), "another session's Superseded named keys here");
+}
+
 /// The keys `take_state_changed` names become DOMAINS by `Db::domain_of_key`:
 /// a record key names its domain; a schema key (or any non-record key) names
 /// none, so it re-runs nothing.
