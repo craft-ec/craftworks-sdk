@@ -24,12 +24,16 @@
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
 //! | `Signed(state)` (`signer_proto::Answer` under the in-flight sign's id, as `wire::signer::read_answer` decodes it; any other id is ignored) | [`Op::Update`] with exactly those bytes |
 //! | `AlreadySigned(state)` | [`Op::Update`] with exactly those bytes (the signer's requirement 2: at most one signature per prev). If its root is another page's, the read-back shows this seq under that root: `HeadConflict` |
-//! | `NotNext { current }` | `HeadConflict` onto `current`: the engine ADOPTS the winning head and reports the dead commit's writes `Lost`; the app submits them again on the winner (with no read-set check yet — the next PR) |
+//! | `NotNext { current }` | NOT adopted yet (1b): the register is READ first (`Page::on_verify`) |
+//! | … the register holds `current`, or a later head | `HeadConflict` onto it: the engine adopts it and reports the dead commit's writes `Lost`; the app submits them again, each checked against its READS where it lands (#218) |
+//! | … the register is ONE behind (the signer's record is ahead, its UPDATE unlanded) | LAND it: Sign from the register's head with `next.seq = register.seq + 1` (any root) under a fresh id → `AlreadySigned(record)` (`signer::decide`'s `r.prev == *prev` arm; signer/tests/sign.rs `two_requests_from_one_prev_in_sequence_get_one_signature`) → [`Op::Update`] those bytes → read; adopted once the register shows it. Safe by invariant 0; two pages landing the same bytes is an equal decision, held bytes win. RESIDUAL: a page whose signer answered before ITS blocks were stored leaves holes, surfacing here |
+//! | … the register is 2+ behind | a NAMED failure in [`Page::unusable`] — unrecoverable (one record per signer) and unreachable by 1b |
+//! | … the register does not answer | read again on its deadline; after [`VERIFY_BUDGET_MS`], "the register is not answering" — nothing adopted |
 //! | `Refused(RootNotHeld / HeadUnknown / RecordNotSaved)` | the same sign request after a doubling backoff from [`BACKOFF_MS`]; for `HeadUnknown` the register is READ first, which makes the signer's node hold it |
 //! | `Refused(Forked)` | LOUD: [`Page::forked`] and `unusable`; never retried — a fork is news |
-//! | a signer answer no sign gets (`Putting`, `Put`, `Held`, `Provisioned`, another verb's refusal) | ignored: it does NOT clear the sign's deadline (answers carry no request id until SG02) |
+//! | a signer answer under any id but the in-flight sign's (SG02), or not shaped like a sign's | ignored: it does NOT clear the sign's deadline |
 //! | any other `Refused(why)` | nothing more is asked; recorded in [`Page::unusable`]; the engine's own clock reports the write `Stalled` |
-//! | `Updated` | a register read-back ([`Op::ReadHead`]): an UpdateResponse carries nothing (F56) |
+//! | `Updated` | a register read ([`Op::ReadHead`]) — this commit's read-back, or a landing's verify read: an UpdateResponse carries nothing (F56). On a peered node the register is read through the head SUBSCRIPTION (F55); the web layer frames it so |
 //! | `Head(Some(mine))` while a head is owed | `HeadConfirmed(seq)` — the only way a commit is Published |
 //! | `Head(older seq)` while owed | not visible yet: the head is read again next tick, and after [`HEAD_READS`] reads the UPDATE is re-sent |
 //! | `Head(newer seq, or same seq another root)` while owed | `HeadConflict` |
@@ -39,20 +43,28 @@
 //! | any op unanswered for [`SILENT_MS`] | re-sent as it was — every op here is idempotent (a block is its hash, a sign re-ask is answered AlreadySigned, a record is the same record) |
 //!
 //! ## Invariants (each asserted by the model test, each with a mutant)
-//! 1. A write is `Published` only when the register READ BACK holds this
-//!    page's (seq, root).
+//! 0. A signer record exists only after its commit's blocks were put and
+//!    confirmed: `Page::release` lets an `UpdateHead` leave only when its
+//!    whole `after` set is confirmed. (What makes LAND safe.)
+//! 1. A `Published` write's effect is in a head H the register was READ to
+//!    hold, and every later register head descends from H through the
+//!    signer's records — or a page reported the fork, LOUDLY. (A write that
+//!    changes nothing is Published at the engine's published head, sdk#160,
+//!    which may already be behind the register: still true.)
+//! 1b. The engine never ADOPTS a head (HeadConflict / HeadRead) the register
+//!    has not been read to hold, and so a page signs only from such a head:
+//!    the register is never 2+ behind the signer's record.
 //! 2. The page UPDATEs the register only with bytes the signer returned.
 //! 3. A published root is WHOLE on the node: every block it reaches was put
 //!    and answered before the head was signed.
-//! 4. Every write ends `Published` once the faults stop.
+//! 4. Every write ends `Published` once the faults stop (bar a fork).
 //!
 //! ## Not here (next PRs)
-//! * the read-set check before a rebase (M2: `Event::Write{reads}` in the
-//!   engine). Today a `Lost` write submitted again by the app is applied on
-//!   the winner's root whatever it read — right for blind writes only;
+//! * the SDK half of the read set (#148): `Db`'s own ops declaring reads;
 //! * a persisted outbox / RELOAD beyond what the signer's record gives (a
 //!   fresh page on the same key is answered `AlreadySigned` and lands it);
-//! * the web Session's `Db` over this, and provisioning the signer.
+//! * the web Session over [`server::Server`], and provisioning the signer (B2);
+//! * every node call on the RTO estimator instead of [`SILENT_MS`] (B2).
 
 pub mod server;
 
