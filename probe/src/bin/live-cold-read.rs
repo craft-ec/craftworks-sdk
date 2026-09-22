@@ -49,6 +49,80 @@ const LONG_HOLD: Duration = Duration::from_secs(100);
 const LONG_BUDGET: Duration = Duration::from_secs(720);
 
 fn long_window() -> bool { std::env::var("L3_LONG_WINDOW").is_ok_and(|v| v == "1") }
+/// L3_PAGE_PATH=1: TEST 1 reads its 300 cold rows through the PAGE's own GETs (`craftworks_sdk::cold`, a short
+/// timeout and a fresh re-fetch) on a fresh client connection to B, not through B's delegate.
+fn page_path() -> bool { std::env::var("L3_PAGE_PATH").is_ok_and(|v| v == "1") }
+
+/// The head's root, from B's delegate (B's own data: the engine path).
+async fn head_root(client: &mut WebApi, key: &DelegateKey) -> Result<[u8; 32]> {
+    send(client, key, &Request::Identity).await?;
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        if let Ok(Ok(HostResponse::DelegateResponse { values, .. })) = timeout(Duration::from_millis(500), client.recv()).await {
+            for v in values {
+                if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                    if let Ok(Reply::Identity { head_root, .. }) = protocol::decode_reply(&m.payload.to_vec()) {
+                        if head_root != [0u8; 32] { return Ok(head_root); }
+                    }
+                }
+            }
+        }
+    }
+    bail!("B's delegate named no head root within 10 s")
+}
+
+/// THE PAGE PATH: the SDK's own cold reader (`craftworks_sdk::cold::ColdReads`) driven over REAL client GETs on a
+/// fresh connection — the same core the page runs. Returns (rows, ms to the whole range, the cold log).
+async fn page_read(url: &str, root: [u8; 32], block_code: &[u8], lo: &[u8], hi: &[u8], window: Duration) -> Result<(usize, Option<u128>, Vec<craftworks_sdk::cold::ColdEvent>)> {
+    use freenet_stdlib::client_api::{ClientError, ContractError, ContractRequest, ContractResponse, ErrorKind, RequestError};
+    let mut c = connect(url).await?;
+    let derive = wire::block::contract_deriver(block_code);
+    let mut cold = craftworks_sdk::cold::ColdReads { on: true, ..Default::default() };
+    cold.set_root(root);
+    let start = Instant::now();
+    let now = |s: Instant| s.elapsed().as_millis() as u64 + 1;
+    if !cold.take(1, lo, hi, now(start)) { bail!("the cold reader refused the load"); }
+    let mut log = Vec::new();
+    while start.elapsed() < window {
+        for g in cold.take_gets() {
+            let key = ContractInstanceId::new(derive(&g.block));
+            timeout(STEP, c.send(ClientRequest::ContractOp(ContractRequest::Get { key, return_contract_code: false, subscribe: false, blocking_subscribe: false })))
+                .await.map_err(|_| anyhow::anyhow!("the node stopped accepting"))??;
+        }
+        let block_of = |cold: &craftworks_sdk::cold::ColdReads, id: &ContractInstanceId| -> Option<[u8; 32]> {
+            cold.fetching().find(|b| derive(b)[..] == id.as_bytes()[..32]).copied()
+        };
+        match timeout(Duration::from_millis(100), c.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }))) => {
+                if let Some(b) = block_of(&cold, key.id()) { cold.arrived(b, state.as_ref(), now(start)); }
+            }
+            Ok(Err(e)) => {
+                let e: ClientError = e;
+                if let ErrorKind::RequestError(RequestError::ContractError(ContractError::Get { key, .. })) = e.kind() {
+                    if let Some(b) = block_of(&cold, key.id()) { cold.refused(b, now(start)); }
+                } else {
+                    println!("    page path: node error {}", e.to_string().chars().take(160).collect::<String>());
+                }
+            }
+            _ => {}
+        }
+        cold.tick(now(start));
+        log.append(&mut cold.log);
+        if let Some((_, rows, _)) = cold.take_done().pop() {
+            return Ok((rows.len(), Some(start.elapsed().as_millis()), log));
+        }
+        if !cold.take_not_answering().is_empty() {
+            log.append(&mut cold.log);
+            println!("    page path: a block ran out its own deadline -- the node is not answering");
+            return Ok((0, None, log));
+        }
+        if !cold.take_returned().is_empty() {
+            println!("    page path: the node called the root its own (F55) -- handed back, not read by the page");
+            return Ok((0, None, log));
+        }
+    }
+    Ok((0, None, log))
+}
 
 /// Both nodes start through `probe::node`'s ONE door: the owner's ports refused before anything is created (the
 /// tested refusal, sdk#199), the command line with its dirs and NODE_FLAGS, killed by their handles on drop.
@@ -247,7 +321,29 @@ async fn main() -> Result<()> {
         answered.push((7, t3_page_ms.1));
     }
     let mut last_tick = Instant::now() - Duration::from_secs(1);
-    loop {
+    if page_path() {
+        let root_b = head_root(&mut t1, &dkey_b).await?;
+        println!("    PAGE PATH: w/ read by the page's own GETs (per fetch: {} ms a GET, at most {} in flight, {} ms a block), root {}", craftworks_sdk::cold::COLD_GET_TIMEOUT_MS, craftworks_sdk::cold::COLD_IN_FLIGHT, craftworks_sdk::cold::COLD_FETCH_DEADLINE_MS, hex(&root_b[..4]));
+        let (rows, ms, log) = page_read(&node_b.ws(), root_b, &block, b"w/", b"w0", read_window).await?;
+        let (mut first, mut timeouts, mut reget_ok, mut gave_up) = (0, 0, 0, 0);
+        for e in &log {
+            use craftworks_sdk::cold::ColdEvent as E;
+            match e {
+                E::Answered { .. } => first += 1,
+                E::TimedOut { block, attempt, after_ms } => { timeouts += 1; println!("    TIMEOUT block {} attempt {attempt} after {after_ms} ms", hex(&block[..4])); }
+                E::ReGetAnswered { block, attempt, after_ms } => { reget_ok += 1; println!("    RE-GET ANSWERED block {} on attempt {attempt}, {after_ms} ms after its first GET", hex(&block[..4])); }
+                E::NotAnswering { block, after_ms } => { gave_up += 1; println!("    NOT ANSWERING: block {} ran out its own deadline after {after_ms} ms", hex(&block[..4])); }
+                E::Rejected { block } => println!("    REJECTED block {} (bytes did not hash to it)", hex(&block[..4])),
+                E::Local { root } => println!("    LOCAL root {}", hex(&root[..4])),
+            }
+        }
+        println!("    page path: {rows} rows in {} ms; blocks {first} on the first GET, {timeouts} timeout(s), {reget_ok} answered by a re-GET, {gave_up} not answering",
+            ms.map_or("-".to_string(), |m| m.to_string()));
+        got = rows;
+        answered.push((req, ms));
+        all.push((t0.elapsed().as_millis(), format!("PAGE req {req}: {rows} rows via the page path")));
+    }
+    while !page_path() {
         let mut r = range(req, "w/", 256); if let Request::Range { after: a, .. } = &mut r { *a = after.clone(); }
         send(&mut t1, &dkey_b, &r).await?; g1.sent();
         let sent = Instant::now(); let mut said_60 = false;

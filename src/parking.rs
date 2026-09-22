@@ -79,6 +79,20 @@ pub fn decide<T>(
     r: Result<T, DbError>,
     now_ms: u64,
 ) -> Outcome<T> {
+    decide_with(loads, store, r, now_ms, None)
+}
+
+/// [`decide`], with the page's COLD READS given the first refusal of a new
+/// load (`crate::cold`): a range they take is read by the page's own GETs and
+/// never reaches the engine; one they leave goes to the engine exactly as
+/// `decide` sends it.
+pub fn decide_with<T>(
+    loads: &mut Loads,
+    store: &mut CachedStore,
+    r: Result<T, DbError>,
+    now_ms: u64,
+    cold: Option<&mut crate::cold::ColdReads>,
+) -> Outcome<T> {
     let e = match r {
         Ok(v) => {
             // The chain this call was walking is finished; the next one
@@ -98,7 +112,8 @@ pub fn decide<T>(
         // the caller is told instead of sent round.
         return Outcome::Told(e);
     };
-    if send {
+    let taken = send && cold.is_some_and(|c| c.take(req_id, &lo, &hi, now_ms));
+    if send && !taken {
         // A FULL PAGE, by the shared constant. `0` reads like "no limit" and
         // is not one: the shell clamps it to ONE entry, so a range of N rows
         // would load in N round trips of a single row.

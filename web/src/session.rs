@@ -123,6 +123,14 @@ pub struct Session {
     /// then is still recorded against zero — which is what a brand-new engine
     /// actually stands on.
     head_root: [u8; 32],
+    /// COLD READS IN THE PAGE (`craftworks_sdk::cold`): a range this node does
+    /// not hold, read by this page's own GETs with a short timeout and a
+    /// re-fetch, instead of by the engine's cold read and F52's stall.
+    cold: craftworks_sdk::cold::ColdReads,
+    /// A block's contract id from its cid — the Block contract's code hashed
+    /// once (`wire::block::contract_deriver`). `None` until the page hands the
+    /// code in with [`Session::set_cold_reads`]: without it no GET can be named.
+    cold_contract: Option<Box<dyn Fn(&craftworks_sdk::Cid) -> craftworks_sdk::Cid>>,
 }
 
 #[wasm_bindgen]
@@ -168,6 +176,8 @@ impl Session {
             refresh: craftworks_sdk::Refresh::new(),
             asked_at_ms: 0,
             watch_refused: String::new(),
+            cold: craftworks_sdk::cold::ColdReads::default(),
+            cold_contract: None,
         })
     }
 
@@ -234,6 +244,9 @@ impl Session {
                             // filed under the wrong root would make a stale
                             // range look current.
                             self.head_root = head_root;
+                            if head_root != [0u8; 32] {
+                                self.cold.set_root(head_root);
+                            }
                             // The newest head this client has heard of, from
                             // anywhere. A load that finishes behind it is not
                             // recorded.
@@ -321,6 +334,22 @@ impl Session {
                     self.foreign_notifications += 1;
                 }
             }
+            // This session never GETs: the answer is to a question it did not
+            // ask (the engine-in-the-page shape's, ENGINE-SHAPE §2).
+            Incoming::Got { id, state } => match self.cold_block(id) {
+                Some(block) => {
+                    self.cold.arrived(block, &state, crate::js_now_ms());
+                    self.pump_cold();
+                }
+                None => self.unusable.push("a GET answer this session never asked for".to_string()),
+            },
+            Incoming::GetFailed { id } => match self.cold_block(id) {
+                Some(block) => {
+                    self.cold.refused(block, crate::js_now_ms());
+                    self.pump_cold();
+                }
+                None => self.unusable.push("a GET refusal for a contract this session never asked for".to_string()),
+            },
             Incoming::Unusable(why) => self.unusable.push(format!("{why:?}")),
             Incoming::Partial => {}
         }
@@ -383,7 +412,11 @@ impl Session {
     /// `tests/cold_write_native.rs` drives it against a real `Shell`.
     fn decide<T>(&mut self, r: Result<T, DbError>) -> craftworks_sdk::Outcome<T> {
         let now = crate::js_now_ms();
-        craftworks_sdk::decide(&mut self.loads, self.db.store_mut(), r, now)
+        // Cold reads take a new load only when the page can name the GETs.
+        let cold = self.cold_contract.as_ref().map(|_| &mut self.cold);
+        let o = craftworks_sdk::decide_with(&mut self.loads, self.db.store_mut(), r, now, cold);
+        self.pump_cold();
+        o
     }
 
     /// A WRITE THAT HAD TO READ BEFORE IT COULD APPLY.
@@ -482,11 +515,12 @@ impl Session {
             .into_iter()
             .map(|(id, how)| {
                 let ok = how == craftworks_sdk::Ended::Loaded;
-                serde_json::json!({
-                    "id": id,
-                    "ok": ok,
-                    "code": if ok { "LOADED" } else { "UNAVAILABLE" },
-                })
+                let code = match how {
+                    craftworks_sdk::Ended::Loaded => "LOADED",
+                    craftworks_sdk::Ended::Unavailable => "UNAVAILABLE",
+                    craftworks_sdk::Ended::NotAnswering => "NOT_ANSWERING",
+                };
+                serde_json::json!({ "id": id, "ok": ok, "code": code })
             })
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
@@ -835,6 +869,51 @@ impl Session {
         wire::frame_engine_request(&key, payload, stream)
     }
 
+    /// COLD READS: what the cold reader decided, carried out.
+    ///
+    /// * loads it handed back (the root is this node's own, F55; or the tree
+    ///   is not something a fetch fixes) go to the engine exactly as `decide`
+    ///   sends them;
+    /// * each GET goes out as a FRESH client GET of the block's contract —
+    ///   on this connection. ASSUMPTION (the live run tells): a re-GET on the
+    ///   same connection is not pinned behind the stalled one; client GETs
+    ///   are not deduplicated (F55, read), each is its own transaction;
+    /// * each finished load completes through the SAME path an engine page
+    ///   does (`on_page`), at the root it read.
+    fn pump_cold(&mut self) {
+        for (id, lo, hi) in self.cold.take_returned() {
+            self.db
+                .store_mut()
+                .client
+                .send(&craftworks_sdk::Loads::range_request(id, &lo, &hi, None));
+        }
+        let gets = self.cold.take_gets();
+        if let Some(contract) = self.cold_contract.as_ref() {
+            let ids: Vec<craftworks_sdk::Cid> = gets.iter().map(|g| contract(&g.block)).collect();
+            for id in ids {
+                let stream = self.next_stream();
+                match wire::frame_get(wire::contract_id(id), false, stream) {
+                    Ok(frames) => self.out.extend(frames),
+                    Err(e) => self.unusable.push(format!("a cold GET could not be framed: {e}")),
+                }
+            }
+        }
+        for id in self.cold.take_not_answering() {
+            self.loads.on_not_answering(id);
+        }
+        for (id, rows, root) in self.cold.take_done() {
+            let at = protocol::At { seq: self.loads.known_seq(), root };
+            self.on_page(id, rows, None, at);
+        }
+    }
+
+    /// The block a GET answer is about: the one being fetched whose contract
+    /// the node named.
+    fn cold_block(&self, contract: [u8; 32]) -> Option<craftworks_sdk::Cid> {
+        let derive = self.cold_contract.as_ref()?;
+        self.cold.fetching().find(|b| derive(b) == contract).copied()
+    }
+
     fn next_stream(&mut self) -> u32 {
         self.stream = self.stream.wrapping_add(1).max(1);
         self.stream
@@ -848,6 +927,28 @@ impl Session {
             .map(|(s, _)| format!("{s:?}"))
             .collect();
         serde_json::to_string(&done).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// COLD READS IN THE PAGE, on or off, with the Block contract's code (the
+    /// page's own artefact: a GET names a block by its contract, which the
+    /// code and the block id derive). On: a range this node does not hold is
+    /// read by this page's own GETs — each with a short timeout and a fresh
+    /// re-fetch — instead of by the engine, whose cold read can stall ≈ 60 s
+    /// (F52). A root the node says is its own goes back to the engine (F55).
+    pub fn set_cold_reads(&mut self, on: bool, block_code: Vec<u8>) {
+        self.cold.on = on;
+        self.cold_contract = if on && !block_code.is_empty() {
+            Some(Box::new(wire::block::contract_deriver(&block_code)))
+        } else {
+            None
+        };
+    }
+
+    /// Every cold GET's timeout, re-fetch and answer since this was last
+    /// asked, as JSON — what a live run reports, and what a support bundle
+    /// carries.
+    pub fn take_cold_log(&mut self) -> String {
+        serde_json::to_string(&std::mem::take(&mut self.cold.log)).unwrap_or_else(|_| "[]".into())
     }
 
     /// Messages this build could not use, by reason.
@@ -1259,6 +1360,8 @@ impl Session {
         // A load nobody answered ends as UNAVAILABLE rather than waiting for
         // ever. The read parked on it gets a fact; a page can show it.
         self.loads.time_out(now);
+        self.cold.tick(now);
+        self.pump_cold();
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
             "stalled": stalled.map(|s| format!("{s:?}")),

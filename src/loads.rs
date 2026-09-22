@@ -21,6 +21,10 @@ pub enum Ended {
     /// It will not arrive. The engine could not answer, nothing answered
     /// within the bound, or it is larger than this client will hold.
     Unavailable,
+    /// The page read it itself (`crate::cold`) and the NODE stopped answering
+    /// within the read's deadline. Not "missing": nothing said the data is not
+    /// there, only that nobody answered.
+    NotAnswering,
 }
 
 /// What the caller should do with a page that just arrived.
@@ -303,6 +307,14 @@ impl Loads {
     pub fn on_unavailable(&mut self, id: u64) {
         if self.open.remove(&id).is_some() {
             self.ended.push((id, Ended::Unavailable));
+        }
+    }
+
+    /// The page's own cold read of this load hit its deadline: the node is not
+    /// answering. Not recorded as loaded, and not "missing".
+    pub fn on_not_answering(&mut self, id: u64) {
+        if self.open.remove(&id).is_some() {
+            self.ended.push((id, Ended::NotAnswering));
         }
     }
 

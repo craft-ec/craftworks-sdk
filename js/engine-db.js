@@ -228,7 +228,11 @@ export function engineDb(handle) {
         // it is not "not yet".
         throw new DbError({
           code: code ?? "UNAVAILABLE",
-          message: "the range this read needed could not be loaded",
+          // NOT_ANSWERING: the page read it itself and the node stopped
+          // answering — not that the data is missing.
+          message: code === "NOT_ANSWERING"
+            ? "the node is not answering"
+            : "the range this read needed could not be loaded",
           transient: true,
         });
       }

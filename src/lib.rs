@@ -8,6 +8,7 @@
 pub mod binding;
 pub mod blockid;
 pub mod cached_store;
+pub mod cold;
 pub mod copy;
 pub mod db;
 pub mod engine_client;
@@ -53,7 +54,7 @@ pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use live::{HeadId, HeadWatch, Recorder, Trees};
 pub use loads::{Ended, Loads};
-pub use parking::{decide, Outcome};
+pub use parking::{decide, decide_with, Outcome};
 pub use refresh::{Answer, Refresh};
 pub use schema::{Field, Kind, Schema};
 pub use store::{Delta, Edit, IdWidth, MemStore, Read, Reads, Store, StoreError};
