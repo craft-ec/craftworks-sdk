@@ -10,5 +10,5 @@ signer=16
 signer-proto=2
 testkit=32
 web=23
-wire=45
+wire=48
 npm=169

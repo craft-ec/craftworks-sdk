@@ -234,6 +234,13 @@ await t("the manifest's hashes ARE the shipped files", async () => {
     checked += 1;
   }
   assert.equal(checked, 4, "every artefact must be checked, not some of them");
+  // The artefacts CONTAINER (builder#104): the shipped file is what the
+  // manifest says, and it names the address a builder PUTs it under.
+  const c = manifest.container;
+  assert.ok(c && c.address && c.sha256 && c.xz, `artefacts.json has no usable container entry: ${JSON.stringify(c)}`);
+  const cbytes = new Uint8Array(await readFile(new URL("artefacts.webapp", dir)));
+  assert.equal(await sha(cbytes), c.sha256, "artefacts.webapp does not hash to what artefacts.json claims");
+  assert.equal(cbytes.length, c.bytes);
 });
 
 // ---------------------------------------------------------------------------
