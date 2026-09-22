@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod head;
+
 /// `SG02`: the signer's messages, version 2 (an echoed request id).
 pub const MAGIC: [u8; 4] = *b"SG02";
 
@@ -85,6 +87,9 @@ pub enum Why {
     NotABlock {
         index: u32,
     },
+    /// The value to sign carries a ledger that is not the format ([`head::check`]): nothing is signed, because a
+    /// malformed ledger, once signed, degrades every reader's merge for that head's life and nobody is told.
+    BadLedger,
 }
 
 /// What the signer answers. See `signer::decide` for the rule behind `Signed` / `NotNext` / `AlreadySigned`.

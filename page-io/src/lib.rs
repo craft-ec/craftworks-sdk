@@ -200,9 +200,9 @@ impl PageIo {
             Incoming::Got { id, state } => {
                 if id == self.register_id {
                     self.register_seen = true;
-                    let head = engine_delegate::register::record_of(&state)
-                        .and_then(|(seq, v)| v.get(..32).map(|r| (seq, r.try_into().expect("32"))));
-                    self.server.node(Answer::Head(head), now);
+                    // The head WHOLE (root ‖ ledger), tolerantly: the root is
+                    // the value's first 32 bytes whatever ledger follows.
+                    self.server.node(Answer::Head(page::HeadRead::from_record(&state)), now);
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
                     let body = wire::block::block_of_state(&state).map(|(_, b)| b.to_vec()).unwrap_or_default();
                     self.server.node(Answer::Got { id: cid, bytes: body }, now);
@@ -390,7 +390,7 @@ impl PageIo {
                     &self.art.signer,
                     id,
                     signer_proto::Head { seq: prev_seq, root: prev_root },
-                    signer_proto::Next { seq, root, ledger: Vec::new() },
+                    signer_proto::Next { seq, root, ledger: page::sign_ledger(prev_seq, prev_root, root) },
                     stream,
                 ),
                 Op::AskHeld { id } => {

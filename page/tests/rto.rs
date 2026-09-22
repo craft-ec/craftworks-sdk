@@ -27,7 +27,7 @@ fn warmed(writes: u64, delay: u64) -> (Page, u64) {
                 let a = match op {
                     Op::Put { id, .. } => Answer::PutOk(id),
                     Op::Get { id } => Answer::GetMissed(id),
-                    Op::ReadHead => Answer::Head(head),
+                    Op::ReadHead => Answer::Head(head.map(Into::into)),
                     // A signer that signs whatever it is asked: the clock is
                     // the subject here, not the signing rule.
                     Op::Sign { id, seq, root, .. } => {

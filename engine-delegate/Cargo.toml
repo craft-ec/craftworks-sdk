@@ -13,6 +13,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 engine = { path = "../engine" }
+# The head value's ONE format (root ‖ ledger) and the record parser, shared with the signer and the page.
+signer-proto = { path = "../signer-proto" }
 protocol = { path = "../protocol" }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 freenet-stdlib = { version = "0.10.0", features = ["contract"] }

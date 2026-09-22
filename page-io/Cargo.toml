@@ -14,10 +14,10 @@ signer-proto = { path = "../signer-proto" }
 protocol = { path = "../protocol" }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
-# The Register record format, from its ONE implementation.
-engine-delegate = { path = "../engine-delegate", default-features = false }
 
 [dev-dependencies]
+# The scripted node's own record reader (the delegate's), beside the page's.
+engine-delegate = { path = "../engine-delegate", default-features = false }
 bincode = "1"
 # The far side of the wire-level node: the REAL signer and Register contract.
 signer = { path = "../signer" }

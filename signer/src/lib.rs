@@ -68,7 +68,8 @@ pub enum Decision {
 }
 
 /// THE RULE, pure. Applied in this order:
-/// (a) `next.seq == prev.seq + 1`, else `Refused(NotSuccessor)`; not provisioned → `Refused(NotProvisioned)`.
+/// (a) `next.seq == prev.seq + 1`, else `Refused(NotSuccessor)`; not provisioned → `Refused(NotProvisioned)`; a value
+///     whose ledger is not the format (`signer_proto::head::check`) → `Refused(BadLedger)`.
 /// (b) AT MOST ONE SIGNATURE PER PREV: `record.prev == prev` → `AlreadySigned(record.signed)`, identical re-ask or a
 ///     different `next` alike. Checked BEFORE (c), so a re-ask after the head moved on still gets its own bytes back.
 /// (c) TRUTH = the later of `record.next` and `head_read`, by seq, and at an EQUAL seq the Register's (a read AHEAD
@@ -90,6 +91,11 @@ pub fn decide(f: &Facts, prev: &Head, next: &Next) -> Decision {
     }
     if !f.provisioned {
         return Decision::Reply(Refused(Why::NotProvisioned));
+    }
+    // The value is the ONE format (signer_proto::head) or nothing is signed:
+    // this is the one place a malformed ledger can be stopped.
+    if signer_proto::head::check(&next.value()).is_err() {
+        return Decision::Reply(Refused(Why::BadLedger));
     }
     if let Some(r) = &f.record {
         if r.prev == *prev {
@@ -296,14 +302,11 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
     let head_read = match (&rcode, &rparams) {
         (Some(c), Some(p)) => host
             .contract_state(&register_id(c, p))
+            // TOLERANT (signer_proto::head): the root is the value's first 32
+            // bytes, whatever ledger follows.
             .and_then(|st| {
-                engine_delegate::register::record_of(&st).map(|(seq, v)| (seq, v.to_vec()))
-            })
-            .and_then(|(seq, v)| {
-                v.get(..32).map(|r| Head {
-                    seq,
-                    root: r.try_into().expect("32"),
-                })
+                let (seq, v) = signer_proto::head::record_of(&st)?;
+                Some(Head { seq, root: signer_proto::head::read_value(v)?.root })
             }),
         _ => None,
     };

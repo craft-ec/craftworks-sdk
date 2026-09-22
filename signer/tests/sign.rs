@@ -612,3 +612,40 @@ fn two_requests_in_flight_are_each_answered_under_their_own_id() {
         Some((12, Answer::Refused(Why::Unreadable)))
     );
 }
+
+/// The head value's ONE format (signer_proto::head): a value whose ledger is
+/// not the format is REFUSED, and nothing is signed, whatever else is right.
+#[test]
+fn a_malformed_ledger_is_refused_and_nothing_is_signed() {
+    let mut w = World::new();
+    w.hold_root(root(1));
+    let mut bad = next(1, 1);
+    bad.ledger = vec![signer_proto::head::LEDGER_VERSION, signer_proto::head::TAG_PREV, 3, 0, 1, 2, 3];
+    assert_eq!(w.sign(genesis(), &bad), Answer::Refused(Why::BadLedger));
+    // Nothing was signed: the well-formed request from the same prev signs.
+    assert!(matches!(w.sign(genesis(), &next(1, 1)), Answer::Signed(_)));
+}
+
+/// A ledgered value (PREV filled) is signed; and a REGISTER holding a
+/// ledgered head is read by its root, so the signer's truth is right.
+#[test]
+fn a_prev_ledger_is_signed_and_a_ledgered_register_head_is_read_by_its_root() {
+    use signer_proto::head::{value, Ledger};
+    let mut w = World::new();
+    w.hold_root(root(1));
+    w.hold_root(root(2));
+    let first = next(1, 1);
+    let Answer::Signed(st) = w.sign(genesis(), &first) else { panic!("the genesis head was not signed") };
+    w.land(&st);
+    let prev = Head { seq: 1, root: root(1) };
+    let ledgered = Next { seq: 2, root: root(2), ledger: value(&root(2), &Ledger { prev: Some(prev), ..Ledger::default() })[32..].to_vec() };
+    let Answer::Signed(st2) = w.sign(prev, &ledgered) else { panic!("a PREV-ledgered value was not signed") };
+    let (seq, v) = signer_proto::head::record_of(&st2).expect("a record");
+    let hv = signer_proto::head::read_value(v).expect("a head");
+    assert_eq!((seq, hv.root, hv.ledger.prev), (2, root(2), Some(prev)));
+    // The register now holds that ledgered head: the signer's truth is it.
+    w.land(&st2);
+    assert_eq!(w.sign(prev, &next(2, 2)), Answer::AlreadySigned(st2.clone()), "one signature per prev");
+    assert_eq!(w.sign(Head { seq: 1, root: root(1) }, &next(3, 2)), Answer::Refused(Why::NotSuccessor));
+    assert!(matches!(w.sign(Head { seq: 2, root: root(2) }, &next(3, 1)), Answer::Signed(_) | Answer::Refused(Why::RootNotHeld)), "a ledgered register head was not read as seq 2");
+}

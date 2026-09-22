@@ -10,7 +10,7 @@ fn opened_on(head: Option<(u64, [u8; 32])>) -> Page {
     let mut p = Page::new(Params::default(), PutPath::Page);
     let ops = p.take_ops();
     assert!(ops.iter().any(|o| matches!(o, Op::ReadHead)), "a page reads its head first: {ops:?}");
-    p.answer(Answer::Head(head), Ms(1));
+    p.answer(Answer::Head(head.map(Into::into)), Ms(1));
     p
 }
 
