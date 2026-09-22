@@ -223,11 +223,19 @@ impl WritePath {
         todo!("step 3")
     }
 
-    /// **`Failed` / `Lost` / `TooLarge`** —
+    /// **`Failed` / `TooLarge`** —
     /// * `Held`: impossible¹.
     /// * `AtNode`, `Taken`: falls³ — `Copy::fall`, the write and every later
     ///   write on any of its keys, WHOLE (W1). The number is RELEASED (only a
     ///   publish consumes one), so the next `floor` passes it.
+    ///
+    /// **`Lost`** is NOT one of them (sdk#265): its commit applied nothing and
+    /// this client is the only thing that still holds the write, so `AtNode`
+    /// and `Taken` go → `Held`, to leave again WITH THEIR READS. Under one
+    /// budget per write (`WRITE_TRIES`, shared with `Db`'s re-runs); a later
+    /// write of this session on its keys that has left the outbox is pulled
+    /// back behind it, and one that PUBLISHES first makes it unlandable in the
+    /// order made, so it falls NAMED. See WRITE-PATH.md's footnote ⁶.
     /// * not pending: counted.
     fn on_fell(&mut self, write_id: u64, why: WriteState) {
         todo!("step 3")

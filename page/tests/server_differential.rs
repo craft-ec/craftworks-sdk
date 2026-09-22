@@ -1375,7 +1375,7 @@ fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
     let rounds = usize::from(craftworks_sdk::RERUN_ROUNDS);
     assert_eq!(tab.sends.range(w + 1..).count(), rounds, "not exactly {rounds} re-runs went on the wire");
     assert!(
-        matches!(events.as_slice(), [craftworks_sdk::RerunEvent::Failed { reason, .. }] if reason.contains("re-runs")),
+        matches!(events.as_slice(), [craftworks_sdk::RerunEvent::Failed { reason, .. }] if reason.contains(&format!("after {rounds} tries"))),
         "the chain did not end as ONE named failure: {events:?}"
     );
     let rec = published_record(&node, &rerun_schema(), &key).expect("published");

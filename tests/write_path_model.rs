@@ -228,6 +228,9 @@ struct Model {
     /// rolled-back context re-sends the same head PUT and is not recorded again.
     applied: BTreeMap<(usize, u64), usize>,
     last_applied: [u64; 2],
+    /// The last write of a session APPLIED on each key: the per-key order
+    /// the client owns even where the engine has no floor (sdk#265).
+    last_on_key: [BTreeMap<Vec<u8>, u64>; 2],
     // --- the harness's view of each write ---
     made: [BTreeMap<u64, Vec<Op>>; 2],
     ended: [BTreeMap<u64, End>; 2],
@@ -301,6 +304,7 @@ impl Model {
             outbound: VecDeque::new(),
             applied: BTreeMap::new(),
             last_applied: [0, 0],
+            last_on_key: [BTreeMap::new(), BTreeMap::new()],
             made: [BTreeMap::new(), BTreeMap::new()],
             ended: [BTreeMap::new(), BTreeMap::new()],
             at_node: [BTreeMap::new(), BTreeMap::new()],
@@ -335,6 +339,7 @@ impl Model {
     /// order a reader should look.
     fn cause(&self, session: usize, write_id: u64) -> &'static str {
         const ORDER: &[&str] = &[
+            "re-sent after its Lost",
             "Busy, then applied after a later write",
             "its Published went to the other session",
             "the node lost its context after the head PUT",
@@ -699,6 +704,31 @@ impl Model {
             let tag = self.cause(session, write_id);
             self.find_tagged("W2 OUT OF ORDER", tag, d);
         }
+        // PER KEY (sdk#265's property): whatever the engine's order rule, a
+        // session's LAST write on a key must be the one that lands last there
+        // — that is what the person sees. A `Lost` write re-sent after a later
+        // write of its own keys landed would put the older value back.
+        for op in self.made[session].get(&write_id).cloned().unwrap_or_default() {
+            let key = match &op {
+                Op::Put(k, _) | Op::Delete(k) => k.clone(),
+            };
+            if self.last_on_key[session].get(&key).is_some_and(|last| write_id < *last) {
+                let last = self.last_on_key[session][&key];
+                let d = format!("session {session} w{write_id} applied on key {key:?} after its own later w{last}");
+                // WHOSE inversion it is. A later write the client had already
+                // ROLLED BACK is not in the copy to be pulled back behind this
+                // one, so the order it lands in is owned by the false rollback
+                // (sdk#183), not by the re-send (sdk#265).
+                let tag = if matches!(self.ended[session].get(&last), Some(End::RolledBack { .. })) {
+                    "after a write the client had rolled back"
+                } else {
+                    self.cause(session, write_id)
+                };
+                self.find_tagged("W2 KEY ORDER", tag, d);
+            }
+            let at = self.last_on_key[session].entry(key).or_default();
+            *at = (*at).max(write_id);
+        }
         self.last_applied[session] = self.last_applied[session].max(write_id);
         self.applied.insert(key, self.step);
         self.log(format!("node APPLIES s{session} w{write_id} ({how})"));
@@ -794,6 +824,12 @@ impl Model {
             _ => false,
         };
         if own {
+            // The client HEARD `Lost` for its own write: from here a re-send of
+            // it is sdk#265's, which is what the per-key order check is about.
+            // A dropped or misrouted Lost is not — nothing told the client.
+            if matches!(state, WriteState::Lost) {
+                self.note(to, about, "re-sent after its Lost");
+            }
             self.at_node[to].remove(&about);
             if matches!(state, WriteState::Busy) {
                 self.queued[to].insert(about);
@@ -1292,25 +1328,43 @@ const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
     // (p < 0.0031). Each MOVED pair below names the behaviours that move it
     // alone; the no-op door, Stalled and the flood move NONE (their flips are
     // balanced) -- the control that the test tells a perturbation from an effect.
-    ("FALSE ROLLBACK", "Busy, then applied after a later write", 4, "sdk#183"), // 11: no behaviour alone past the bar
-    ("FALSE ROLLBACK", "its Published went to the other session", 823, "sdk#184"), // 874: misroute run +97/-0 up; cold -354 down
-    ("FALSE ROLLBACK", "its verdict was dropped", 599, "sdk#183"), // 844: cold, misroute run, rollback down; TooLarge, Lost up
-    ("FALSE ROLLBACK", "left the client after it was rolled back", 319, "sdk#183"), // 712: cold, misroute run down; TooLarge, Lost up
+    //
+    // Re-pinned for sdk#265 (a `Lost` write is RE-SENT with its reads, bounded
+    // by one budget, instead of falling). Only the `Lost` paths move: with
+    // every v2 behaviour off — no `Lost` said — `KNOWN_V1` is unchanged except
+    // the class newly NAMED below, which is the control that this is the
+    // re-send moving these counts and nothing else.
+    // A `Lost` write with no tries left, or one a later write of its own keys
+    // has already landed over, falls NAMED — and its last re-send can still be
+    // at the node and be applied after: the re-send's own residual (sdk#265).
+    ("FALSE ROLLBACK", "", 1, "sdk#265"),
+    ("FALSE ROLLBACK", "re-sent after its Lost", 2, "sdk#265"),
+    ("FALSE ROLLBACK", "Busy, then applied after a later write", 5, "sdk#183"), // 11: no behaviour alone past the bar
+    ("FALSE ROLLBACK", "its Published went to the other session", 824, "sdk#184"), // 874: misroute run +97/-0 up; cold -354 down
+    ("FALSE ROLLBACK", "its verdict was dropped", 594, "sdk#183"), // 844: cold, misroute run, rollback down; TooLarge, Lost up
+    ("FALSE ROLLBACK", "left the client after it was rolled back", 323, "sdk#183"), // 712: cold, misroute run down; TooLarge, Lost up
     ("FALSE ROLLBACK", "rolled back behind another write of its keys", 851, "sdk#183"), // 892: cold, misroute run down; TooLarge, Lost up
-    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 293, "sdk#183"), // 181: cold up (inferred: a parked commit keeps the write at the node across a jump)
+    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 299, "sdk#183"), // 181: cold up (inferred: a parked commit keeps the write at the node across a jump)
     // NEW, and owned by one behaviour: the context rollback (0 -> 190 alone).
-    ("FALSE ROLLBACK", "the context rolled back past its head PUT", 61, "sdk#183"),
-    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 131, "sdk#183"), // 411: cold down, misroute run down
-    ("FALSE ROLLBACK", "timed out while its commit was in flight", 127, "sdk#183"), // 1: cold +148/-0 (inferred: a parked commit outlives the client's timeout)
-    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 37, "sdk#183"), // 8: no behaviour alone past the bar (cold p 0.0033); together, up
-    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 12, "sdk#183"), // 23: no behaviour alone past the bar
+    ("FALSE ROLLBACK", "the context rolled back past its head PUT", 63, "sdk#183"),
+    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 132, "sdk#183"), // 411: cold down, misroute run down
+    ("FALSE ROLLBACK", "timed out while its commit was in flight", 133, "sdk#183"), // 1: cold +148/-0 (inferred: a parked commit outlives the client's timeout)
+    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 38, "sdk#183"), // 8: no behaviour alone past the bar (cold p 0.0033); together, up
+    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 11, "sdk#183"), // 23: no behaviour alone past the bar
     // Under faults: a Published (or Failed) arriving after the copy rolled the
     // write back — the false rollbacks above, seen from the other side.
     ("LATE VERDICT", "", 1000, "sdk#183"),
-    ("STALE CLOCK", "Busy", 834, "sdk#183"), // 287: cold +651/-10 (inferred: the Busy storm behind a parked write); Lost, misroute run down
-    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 112, "sdk#183"), // 265: cold, rollback, misroute run down
-    ("W5 NOT REFILLED AFTER A FALL", "", 212, "sdk#183"), // 302: cold, misroute run down; TooLarge, Lost up (inferred: more terminal verdicts, more falls)
-    ("W6 COPY LIES", "", 845, "sdk#183"), // 501: cold +387, misroute run +309
+    ("STALE CLOCK", "Busy", 835, "sdk#183"), // 287: cold +651/-10 (inferred: the Busy storm behind a parked write); Lost, misroute run down
+    // PER KEY, the property a person sees (sdk#265's own cause is asserted
+    // ZERO above): both of these are the tree's, not the re-send's — sdk#268.
+    ("W2 KEY ORDER", "Busy, then applied after a later write", 64, "sdk#268"),
+    ("W2 KEY ORDER", "after a write the client had rolled back", 50, "sdk#268"),
+    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 117, "sdk#183"), // 265: cold, rollback, misroute run down
+    // The v4 engine has no floor: a write taken while a `Lost` one waits to go
+    // again is applied first. ACROSS KEYS only — per key it is zero.
+    ("W2 OUT OF ORDER", "re-sent after its Lost", 4, "sdk#265"),
+    ("W5 NOT REFILLED AFTER A FALL", "", 198, "sdk#183"), // 302: cold, misroute run down; TooLarge, Lost up (inferred: more terminal verdicts, more falls)
+    ("W6 COPY LIES", "", 851, "sdk#183"), // 501: cold +387, misroute run +309
 ];
 
 /// The table as it stood BEFORE model v2 (sdk#174's pin, on a0c3ecc), kept
@@ -1337,6 +1391,10 @@ const KNOWN_V1: &[(&str, &str, usize, &str)] = &[
     // write back — the false rollbacks above, seen from the other side.
     ("LATE VERDICT", "", 1000, "sdk#183"),
     ("STALE CLOCK", "Busy", 287, "sdk#183"),
+    // NAMED by sdk#265's per-key check; the behaviour is older than it, and
+    // with no `Lost` said these are the only rows it adds here (sdk#268).
+    ("W2 KEY ORDER", "Busy, then applied after a later write", 192, "sdk#268"),
+    ("W2 KEY ORDER", "after a write the client had rolled back", 100, "sdk#268"),
     ("W2 OUT OF ORDER", "Busy, then applied after a later write", 265, "sdk#183"),
     ("W5 NOT REFILLED AFTER A FALL", "", 302, "sdk#183"),
     ("W6 COPY LIES", "", 501, "sdk#183"),
@@ -1366,6 +1424,14 @@ fn the_sweep_finds_exactly_the_known_classes_and_counts() {
     // sweep: a second 1,000-seed pass for it cost 18 s of a debug gate.
     let broken: Vec<_> = sw.first.keys().filter(|(c, _)| c.starts_with("W1") || *c == "W5 WINDOW" || *c == "W5 HELD WITH ROOM").collect();
     assert!(broken.is_empty(), "W1/W5 broken on today's client: {broken:?}");
+
+    // sdk#265's PROPERTY: a `Lost` write is re-sent, and a re-send must never
+    // land after a LATER write of the person's on the same key — the older
+    // value would be the one they are left with. (Out of order across
+    // DIFFERENT keys is the v4 engine's own, `W2 OUT OF ORDER`: it has no
+    // floor, so a write taken while the Lost one waits is applied first.)
+    let key_order: Vec<_> = sw.first.iter().filter(|((c, t), _)| *c == "W2 KEY ORDER" && *t == "re-sent after its Lost").collect();
+    assert!(key_order.is_empty(), "a re-sent Lost write landed after a later write of its own keys (sdk#265): {key_order:?}");
 
     println!("  RUNS PER (CLASS, CAUSE) OF 1,000 — as table rows:");
     for ((c, t), n) in &sw.runs_with {

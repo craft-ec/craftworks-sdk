@@ -306,6 +306,12 @@ pub trait Store {
         Vec::new()
     }
 
+    /// A re-run made `write_id` as try `tries` of an earlier write: its
+    /// `Lost` re-sends count on from there (sdk#265, one budget).
+    fn carry_tries(&mut self, write_id: u64, tries: u8) {
+        let _ = (write_id, tries);
+    }
+
     /// Apply several edits as ONE change that says what it READ (M2,
     /// sdk#148): a store that holds writes for a NODE sends the reads with
     /// them, and the engine checks them where the edits land. The default is
@@ -330,6 +336,9 @@ pub struct ConflictChain {
     /// The keys whose reads no longer held (often the schema, a key no write
     /// in the chain wrote).
     pub keys: Vec<Vec<u8>>,
+    /// Tries the chain's writes already spent at the store (`Lost` re-sends,
+    /// sdk#265): ONE budget per write with `Db`'s re-runs, never one each.
+    pub tries: u8,
 }
 
 /// Sort by key and drop all but the LAST edit for each key.
