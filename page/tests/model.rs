@@ -27,7 +27,7 @@
 use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
-use page::{Answer, Op, Page, PutPath, SignAnswer};
+use page::{Answer, Op, Page, PutPath};
 use std::collections::BTreeMap;
 
 const BLOCK_CODE: &[u8] = b"model block code";
@@ -188,25 +188,15 @@ impl Node {
         self.register.as_deref().map(head_of)
     }
 
-    fn sign(&mut self, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> SignAnswer {
+    /// The REAL signer's answer, exactly as it encodes it and the page's
+    /// `wire::signer::read_answer` decodes it.
+    fn sign(&mut self, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> signer_proto::Answer {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger: Vec::new() },
         };
-        match signer::serve(&mut Host(self), &signer::encode_request(&req)) {
-            signer::Answer::Signed(state) => SignAnswer::Signed(state),
-            signer::Answer::AlreadySigned(state) => {
-                let (seq, root) = head_of(&state);
-                SignAnswer::AlreadySigned { state, seq, root }
-            }
-            signer::Answer::NotNext { current } => {
-                SignAnswer::NotNext { seq: current.seq, root: current.root }
-            }
-            signer::Answer::Refused(why) => {
-                SignAnswer::Refused { retry: matches!(why, signer::Why::RootNotHeld), why: format!("{why:?}") }
-            }
-            other => panic!("the signer answered a sign with {other:?}"),
-        }
+        let answer = signer::serve(&mut Host(self), &signer::encode_request(&req));
+        wire::signer::read_answer(&signer_proto::encode_answer(&answer)).expect("a signer answer reads back")
     }
 
     /// Every entry of the tree at `root`, or `None` if any block is missing.

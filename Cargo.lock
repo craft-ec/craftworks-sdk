@@ -985,6 +985,7 @@ dependencies = [
  "engine-delegate",
  "freenet-prolly",
  "signer",
+ "signer-proto",
  "wire",
 ]
 

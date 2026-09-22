@@ -22,11 +22,11 @@
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
-//! | `Signed(state)` | [`Op::Update`] with exactly those bytes |
-//! | `AlreadySigned { state, .. }` | [`Op::Update`] with exactly those bytes (the signer's requirement 2: at most one signature per prev). If its root is another page's, the read-back shows this seq under that root: `HeadConflict` |
-//! | `NotNext { seq, root }` | `HeadConflict { seq, root }`: the engine ADOPTS the winning head and reports the dead commit's writes `Lost`; the app submits them again on the winner (with no read-set check yet — the next PR) |
-//! | `Refused { retry: true }` | the same sign request at the next tick (a root not held yet, a full queue) |
-//! | `Refused { retry: false }` | nothing more is asked; recorded in [`Page::unusable`]; the engine's own clock reports the write `Stalled` |
+//! | `Signed(state)` (`signer_proto::Answer`, as `wire::signer::read_answer` decodes it) | [`Op::Update`] with exactly those bytes |
+//! | `AlreadySigned(state)` | [`Op::Update`] with exactly those bytes (the signer's requirement 2: at most one signature per prev). If its root is another page's, the read-back shows this seq under that root: `HeadConflict` |
+//! | `NotNext { current }` | `HeadConflict` onto `current`: the engine ADOPTS the winning head and reports the dead commit's writes `Lost`; the app submits them again on the winner (with no read-set check yet — the next PR) |
+//! | `Refused(RootNotHeld)` | the same sign request at the next tick (the root's PUT is still landing) |
+//! | any other `Refused(why)` | nothing more is asked; recorded in [`Page::unusable`]; the engine's own clock reports the write `Stalled` |
 //! | `Updated` | a register read-back ([`Op::ReadHead`]): an UpdateResponse carries nothing (F56) |
 //! | `Head(Some(mine))` while a head is owed | `HeadConfirmed(seq)` — the only way a commit is Published |
 //! | `Head(older seq)` while owed | not visible yet: the head is read again next tick, and after [`HEAD_READS`] reads the UPDATE is re-sent |
@@ -138,20 +138,6 @@ pub enum Op {
     AskHeld { id: Cid },
 }
 
-/// What the signer answered, as the web layer decoded it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SignAnswer {
-    /// Signed this page's `(seq, root)`: the register state to UPDATE.
-    Signed(Vec<u8>),
-    /// `prev` was already signed from: the FIRST record's bytes and its head.
-    AlreadySigned { state: Vec<u8>, seq: u64, root: Cid },
-    /// `prev` is not the current head: this is.
-    NotNext { seq: u64, root: Cid },
-    /// Refused. `retry`: worth asking again (a root not held yet, a full
-    /// queue); otherwise not (not provisioned, a fork, cannot sign).
-    Refused { retry: bool, why: String },
-}
-
 /// What arrived, as the web layer decoded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
@@ -159,7 +145,9 @@ pub enum Answer {
     PutRefused { id: Cid, transient: bool },
     Got { id: Cid, bytes: Vec<u8> },
     GetMissed(Cid),
-    Signer(SignAnswer),
+    /// The signer's answer to [`Op::Sign`], as `wire::signer::read_answer`
+    /// decoded it — the merged type (sdk#214), not a copy of it.
+    Signer(signer_proto::Answer),
     /// The head UPDATE was answered. It says NOTHING about which record the
     /// register kept (F56).
     Updated,
@@ -375,16 +363,17 @@ impl Page {
         }
     }
 
-    fn on_signer(&mut self, s: SignAnswer) {
+    fn on_signer(&mut self, s: signer_proto::Answer) {
+        use signer_proto::{Answer as A, Why};
         let Some(owed) = self.owed.as_mut() else { return };
         match s {
-            SignAnswer::Signed(state) => {
+            A::Signed(state) => {
                 self.signer_records.insert(state.clone());
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
                 self.send(Waiting::Update, Op::Update { state });
             }
-            SignAnswer::AlreadySigned { state, seq, root } => {
+            A::AlreadySigned(state) => {
                 // Requirement 2: ONE signature per prev, and it is landed as
                 // it is — its blocks were stored before it was signed.
                 self.signer_records.insert(state.clone());
@@ -396,17 +385,19 @@ impl Page {
                 // record reads back as the same seq under another root — a
                 // conflict, never Published (the model's mutant M5: a second
                 // mechanism for this was dead weight).
-                let _ = (seq, root);
                 self.send(Waiting::Update, Op::Update { state });
             }
-            SignAnswer::NotNext { seq, root } => {
+            A::NotNext { current } => {
                 self.owed = None;
-                self.step(Event::HeadConflict { seq, root });
+                self.step(Event::HeadConflict { seq: current.seq, root: current.root });
             }
-            SignAnswer::Refused { retry: true, .. } => self.sign_again = true,
-            SignAnswer::Refused { retry: false, why } => {
-                self.unusable.push(format!("the signer refused: {why}"));
-            }
+            // The root block is not readable by the signer's node YET (its
+            // PUT is still landing): worth asking again. A node's "queue
+            // full" never reaches here — it is not a signer answer — and is
+            // re-asked by the deadline like any silence.
+            A::Refused(Why::RootNotHeld) => self.sign_again = true,
+            A::Refused(why) => self.unusable.push(format!("the signer refused: {why:?}")),
+            other => self.unusable.push(format!("the signer answered a sign with {other:?}")),
         }
     }
 

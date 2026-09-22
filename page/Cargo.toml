@@ -13,6 +13,8 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "97
 # stay valid: the engine owns its `Blocks` and only ever lends `&B`, while the
 # page must keep adding the blocks it writes and fetches. MIT OR Apache-2.0.
 elsa = "1"
+# The signer's answers, the merged type (sdk#214): serde + bincode only.
+signer-proto = { path = "../signer-proto" }
 
 [dev-dependencies]
 # The far side of the scripted client API runs the REAL signer rule and the
