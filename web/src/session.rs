@@ -93,6 +93,14 @@ pub struct Session {
     /// which is what makes being told an accelerator rather than the
     /// mechanism.
     head_moved: bool,
+    /// The in-page engine's PUBLISHED head as this session last saw it. A
+    /// move is the head moving — this tab's own commit, or another device's
+    /// head adopted — and sets `head_moved`, which is what the node's
+    /// HeadChanged push did on the delegate path. Without it a bound domain
+    /// was never re-asked after a write published, and its rows said
+    /// "saving" until something else re-rendered them (builder#102's
+    /// two-tab, measured on #260).
+    seen_published: (u64, [u8; 32]),
     /// The root the engine last reported standing on.
     ///
     /// A page is recorded against the root it was read at, and a page
@@ -162,6 +170,7 @@ impl Session {
             foreign_notifications: 0,
             watching: false,
             head_moved: false,
+            seen_published: (0, [0u8; 32]),
             bound: std::collections::BTreeSet::new(),
             refresh: craftworks_sdk::Refresh::new(),
             asked_at_ms: 0,
@@ -722,6 +731,11 @@ impl Session {
     fn pump_page(&mut self) {
         self.mint_if_needed();
         let Some(p) = self.page.as_mut() else { return };
+        let published = p.server.page.published();
+        if published != self.seen_published {
+            self.seen_published = published;
+            self.head_moved = true;
+        }
         let frames = p.take_frames();
         let replies = p.take_replies();
         let ready = p.provisioned() && !self.page_identity_sent;
