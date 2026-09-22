@@ -36,6 +36,11 @@ struct WireNode {
     /// The next this many GETs of the Register FAIL, as an unreachable node's
     /// do (sdk#175).
     fail_register_gets: usize,
+    /// The next this many signer requests are answered EMPTY — a
+    /// DelegateResponse carrying no message — as the real node answered a
+    /// request that reached it before the registration had taken (#260,
+    /// measured: 7 of 12 opens).
+    empty_signer_answers: usize,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -72,6 +77,7 @@ impl WireNode {
             served: BTreeMap::new(),
             register_puts: 0,
             fail_register_gets: 0,
+            empty_signer_answers: 0,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -96,6 +102,7 @@ impl WireNode {
             served: BTreeMap::new(),
             register_puts: 0,
             fail_register_gets: 0,
+            empty_signer_answers: 0,
         }
     }
 
@@ -186,6 +193,10 @@ impl WireNode {
             }
             ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, inbound, .. }) => {
                 *self.served.entry("signer").or_default() += 1;
+                if self.empty_signer_answers > 0 {
+                    self.empty_signer_answers -= 1;
+                    return Some(ok(HostResponse::DelegateResponse { key, values: Vec::new() }));
+                }
                 let mut values = Vec::new();
                 for m in inbound {
                     if let InboundDelegateMsg::ApplicationMessage(am) = m {
@@ -195,10 +206,15 @@ impl WireNode {
                 }
                 Some(ok(HostResponse::DelegateResponse { key, values }))
             }
-            // Registering the signer again (a reopened page): already held.
-            ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { .. }) => {
+            // Registering the signer (again, for a reopened page: already
+            // held). Answered as the REAL node answers it — measured on
+            // 0.2.136 (#260's frame log): an 80-byte DelegateResponse naming
+            // the delegate and carrying NO message, which `wire::unframe`
+            // reads as `Ack(Registered)`. This answered `HostResponse::Ok`
+            // before, which no page ever sees from a node.
+            ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate, .. }) => {
                 *self.served.entry("register delegate").or_default() += 1;
-                Some(ok(HostResponse::Ok))
+                Some(ok(HostResponse::DelegateResponse { key: delegate.key().clone(), values: Vec::new() }))
             }
             other => panic!("page-io sent a request the node does not expect: {other:?}"),
         }
@@ -750,4 +766,71 @@ fn control_a_page_that_always_mints_loses_the_persons_tree() {
     assert_eq!(minted, 1);
     assert!(!again.provisioned(), "a second key was accepted: the check above could not have told the difference");
     assert!(again.register_id() != node.register_id, "the minting page is not on another register");
+}
+
+/// What each frame asks the node, by kind (a delegate registration, a signer
+/// request, or anything else).
+fn kinds(frames: &[Vec<u8>]) -> Vec<&'static str> {
+    frames
+        .iter()
+        .map(|f| match bincode::deserialize::<ClientRequest>(f) {
+            Ok(ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { .. })) => "register",
+            Ok(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { .. })) => "signer",
+            _ => "other",
+        })
+        .collect()
+}
+
+/// #260, MEASURED: the signer's registration and its first request sent in
+/// ONE flush was answered EMPTY by the node 7 times in 12, and the page waited
+/// for ever. So the registration goes ALONE, and the first request (the
+/// Register query) only once the registration is answered.
+#[test]
+fn the_signers_first_request_waits_for_its_registration_to_be_answered() {
+    let key = [23u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+    );
+    io.begin(container);
+    let first = io.take_frames();
+    assert_eq!(kinds(&first), ["register"], "the first request went out with the registration, before it was answered");
+    for f in &first {
+        let answer = node.serve(f).expect("the registration is answered");
+        io.inbound(&answer, Ms(1_000));
+    }
+    assert_eq!(kinds(&io.take_frames()), ["signer"], "the registration's answer did not release the Register query");
+}
+
+/// THE AMBIGUITY (main's ruling on #260): `wire::unframe` maps ANY empty
+/// DelegateResponse to `Ack(Registered)`. Once the registration is answered,
+/// an empty response to the outstanding query is "no answer" — asked again —
+/// never a second registration. Here the node answers the query empty once,
+/// then for real: the page asks again and opens.
+#[test]
+fn an_empty_reply_to_the_query_is_no_answer_and_the_re_ask_opens() {
+    let key = [24u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    node.empty_signer_answers = 1;
+    let mut now = 1_000;
+    let (io, minted) = opening(&mut node, &mut now, &key, false);
+    assert_eq!(node.empty_signer_answers, 0, "the node never answered empty: the case did not happen");
+    assert_eq!(minted, 1, "the page never learnt the signer holds no key");
+    assert!(io.provisioned(), "an empty reply ended the open: {:?}", io.unusable());
+    assert!(node.served["signer"] >= 3, "the query was not asked again after the empty reply ({} signer requests)", node.served["signer"]);
+}
+
+/// And it is BOUNDED: a node that only ever answers empty ends the open BY
+/// NAME, never a silent wait.
+#[test]
+fn a_signer_that_only_answers_empty_is_named_not_waited_on() {
+    let key = [25u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    node.empty_signer_answers = usize::MAX;
+    let mut now = 1_000;
+    let (io, _) = opening(&mut node, &mut now, &key, false);
+    assert!(!io.provisioned());
+    assert!(io.unusable().iter().any(|u| u.contains("answered its first request EMPTY")), "not named: {:?}", io.unusable());
 }
