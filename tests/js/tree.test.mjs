@@ -106,6 +106,26 @@ await t(`**bounded: at most ${MAX_OPEN_TREES} open trees, and ${MAX_TREE_SUBSCRI
   (await h.tree(HEAD_B)).close();
 });
 
+await t("**provision: false — a visitor opens the socket, installs NOTHING, and still reads trees**", async () => {
+  const sock = {};
+  const fetched = [];
+  const h = await openSession(Session, {
+    port: 7999,
+    artefacts: { delegate: "d", block: "b", register: "r" },
+    provision: false,
+    fetch: async url => { fetched.push(url); return { ok: true, arrayBuffer: async () => enc(`${url} code`).buffer }; },
+    connect: (engine, { onEvent }) => { sock.engine = engine; sock.emit = onEvent; return { pump() {}, close() {} }; },
+    setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+    addEventListener: null, removeEventListener: null, documentOf: null,
+  });
+  assert.deepEqual(fetched, [], "a visitor fetched provisioning artefacts it will not install");
+  await h.tree(HEAD_A);
+  assert.deepEqual(fetched, ["b"], "tree() did not fetch the Block code, or fetched more");
+  const ops = [...new Set(frames(sock).map(x => x.op))];
+  assert.deepEqual(ops, ["get"], `a visitor's socket carried ${ops}: something was installed`);
+  assert.equal(h.provisioned(), false, "THE CONTROL: the visitor's own tree was not provisioned");
+});
+
 await t("THE MEASUREMENT: one open tree reader's wasm memory, before any rows", async () => {
   // Many readers at once, so the growth is pages the allocator had to ADD,
   // not free space it already held (16 fit in that and read as 0 B).

@@ -35,6 +35,7 @@ const PROMISED = {
   Db: "function",
   open: "function",
   SHIPPED_ARTEFACTS: "object",
+  webapp: "object",
   internals: "object",
 };
 

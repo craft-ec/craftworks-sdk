@@ -52,4 +52,15 @@ await t("a path added twice, an unsafe path, and an empty container are refused"
   assert.throws(() => new AppContainer().finish(), /no files/);
 });
 
+await t("the SDK ENTRY hands a page the same three (wrap), not only the raw module", async () => {
+  const { wrap } = await import("../../js/wrap.js");
+  const raw = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
+  const { webapp } = wrap(raw);
+  for (const k of ["params", "address", "AppContainer"]) assert.equal(typeof webapp[k], "function", `sdk.webapp.${k}`);
+  const c = new webapp.AppContainer();
+  for (const [p, b] of FILES) c.add(p, b);
+  assert.deepEqual(c.finish(), build(FILES), "the entry's AppContainer is not the module's");
+  assert.deepEqual(webapp.params(build(FILES)), webapp_params(build(FILES)));
+});
+
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }
