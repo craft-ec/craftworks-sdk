@@ -42,7 +42,9 @@ fn in_page_mode_every_path_to_the_node_is_page_io() {
     let prov = body_of(&src, "provision");
     assert!(prov.contains("if self.page_mode {") && prov.contains("self.provision_page(block, register);"), "provisioning does not go to the signer:\n{prov}");
     let page = body_of(&src, "provision_page");
-    assert!(page.contains("io.provision(container,") && page.contains("self.switch_cold(false"), "provision_page does not provision the signer or leaves cold reads on:\n{page}");
+    // It ASKS the signer first (`begin`); what it sends is tested on the real
+    // Session in tests/js/page-identity.test.mjs.
+    assert!(page.contains("io.begin(container)") && page.contains("self.switch_cold(false"), "provision_page does not open through the signer or leaves cold reads on:\n{page}");
     let adv = body_of(&src, "advance");
     assert!(adv.contains("if self.page_mode {\n            return;"), "the engine delegate's plan runs in page mode:\n{adv}");
 }

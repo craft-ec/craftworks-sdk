@@ -999,7 +999,25 @@ impl Session {
     /// out, its protocol replies reach this session exactly as a delegate's
     /// did, and once the signer is provisioned the in-page engine is started
     /// with `Identity`.
+    /// The signer answered that it holds NO key: this person's first page on
+    /// this node. Mint one and provision it — the only place a key is minted.
+    fn mint_if_needed(&mut self) {
+        let Some(p) = self.page.as_mut() else { return };
+        if !p.needs_key() {
+            return;
+        }
+        let mut seed = [0u8; 32];
+        if getrandom::getrandom(&mut seed).is_err() {
+            self.unusable.push("no randomness to mint a key".into());
+            return;
+        }
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
+        p.provision_with(sk.to_bytes().to_vec(), params);
+    }
+
     fn pump_page(&mut self) {
+        self.mint_if_needed();
         let Some(p) = self.page.as_mut() else { return };
         let frames = p.take_frames();
         let replies = p.take_replies();
@@ -1142,7 +1160,15 @@ impl Session {
 
     /// Messages this build could not use, by reason.
     pub fn unusable(&self) -> String {
-        serde_json::to_string(&self.unusable).unwrap_or_else(|_| "[]".into())
+        // AND page-io's, in page mode: what the page's own I/O could not use
+        // (a refused provisioning, a frame it could not make, a mint it was
+        // stopped from) is this session's to report. Kept apart, it was
+        // invisible — core dev's M254 minted on every pump and nothing showed.
+        let mut all = self.unusable.clone();
+        if let Some(p) = self.page.as_ref() {
+            all.extend(p.unusable().iter().cloned());
+        }
+        serde_json::to_string(&all).unwrap_or_else(|_| "[]".into())
     }
 
     /// The artefacts to provision with, as the page fetched them.
@@ -1182,18 +1208,16 @@ impl Session {
         if self.page.is_some() {
             return;
         }
-        let mut seed = [0u8; 32];
-        if getrandom::getrandom(&mut seed).is_err() {
-            self.unusable.push("no randomness to mint a key".into());
-            return;
-        }
-        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let vk = sk.verifying_key().to_bytes();
+        // NOT MINTED HERE. The page ASKS the signer which Register it signs
+        // for, and opens that one; only a signer holding no key gets a new one
+        // (`mint_if_needed`, from `pump_page`). Minting on every load made a
+        // reload — and every second tab — a new identity (sdk#234).
         let (container, signer) = wire::delegate_from_code(&self.signer_code);
         let art = page_io::Artefacts {
             block_code: block,
             register_code: register,
-            register_params: wire::register_params(&vk, wire::HEAD_NAME),
+            // Named by the signer's answer, or by the minted key's.
+            register_params: Vec::new(),
             signer,
         };
         let server = page::server::Server::new(
@@ -1201,7 +1225,7 @@ impl Session {
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
-        io.provision(container, sk.to_bytes().to_vec());
+        io.begin(container);
         self.cold_chosen = true;
         self.switch_cold(false, Vec::new());
         self.page = Some(io);

@@ -669,3 +669,21 @@ fn a_ledgered_register_head_with_no_record_of_mine_is_read_by_its_root() {
         "a ledgered register head was not read: the signer could not sign on from it"
     );
 }
+
+/// "WHICH REGISTER DO YOU SIGN FOR?" — none before a key is provisioned; its
+/// Register's params after; and never the key. Params left behind with no key
+/// name nothing (a half-written store must not open a tree it cannot sign for).
+#[test]
+fn the_signer_names_the_register_it_signs_for_and_only_with_a_key() {
+    let mut fresh = Mem::default();
+    assert_eq!(serve(&mut fresh, &encode_request(5, &Request::Register)), Answer::Register { params: None });
+    let w = World::new();
+    let mut host = w.host.clone();
+    let a = serve(&mut host, &encode_request(6, &Request::Register));
+    assert_eq!(a, Answer::Register { params: Some(w.params.clone()) });
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    assert!(!format!("{a:?}").contains(&format!("{:?}", sk.to_bytes().to_vec())), "the key left the signer");
+    let mut orphan = Mem::default();
+    orphan.secrets.insert(REGISTER_PARAMS.to_vec(), w.params.clone());
+    assert_eq!(serve(&mut orphan, &encode_request(7, &Request::Register)), Answer::Register { params: None }, "params with no key named a Register");
+}

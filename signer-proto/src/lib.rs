@@ -121,6 +121,11 @@ pub enum Answer {
         present: Vec<bool>,
     },
     Refused(Why),
+    /// The Register this signer signs for — its params — or `None` when it holds no key (never provisioned). Appended
+    /// LAST, so every earlier answer keeps its encoding.
+    Register {
+        params: Option<Vec<u8>>,
+    },
 }
 
 /// What the page asks.
@@ -149,6 +154,11 @@ pub enum Request {
     Held {
         contracts: Vec<[u8; 32]>,
     },
+    /// WHICH REGISTER DO YOU SIGN FOR? A page that opens must reopen the person's own tree, not mint a new identity
+    /// on every load: this is how it learns whether the signer already holds a key, and for which Register. Needs
+    /// nothing; answers [`Answer::Register`]. The key itself never leaves the signer. Appended LAST, so every earlier
+    /// request keeps its encoding.
+    Register,
 }
 
 fn encode<T: Serialize>(t: &T) -> Vec<u8> {

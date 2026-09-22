@@ -83,6 +83,22 @@ impl WireNode {
         n
     }
 
+    /// A node whose signer has NEVER been provisioned: the person's first page.
+    /// `signing_key` is what that page will mint, so the test knows the register.
+    fn unprovisioned(signing_key: &[u8; 32]) -> WireNode {
+        let sk = ed25519_dalek::SigningKey::from_bytes(signing_key);
+        let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
+        WireNode {
+            contracts: BTreeMap::new(),
+            register_id: signer::register_id(REGISTER_CODE, &params),
+            register_params: params,
+            secrets: BTreeMap::new(),
+            served: BTreeMap::new(),
+            register_puts: 0,
+            fail_register_gets: 0,
+        }
+    }
+
     fn merge_register(&mut self, state: &[u8]) {
         let params = Parameters::from(self.register_params.clone());
         let next = match self.contracts.get(&self.register_id) {
@@ -653,4 +669,85 @@ fn the_own_page_and_a_reader_read_the_same_tree_identically_intact_and_corrupted
     // Unavailable (blocked on it), never read as "no rows".
     assert!(mine.len() == 1 && mine[0].starts_with("Unavailable { req_id: 22"), "the own page did not refuse corrupted blocks: {mine:?}");
     assert_eq!(theirs, mine, "a reader and the own page refused a corrupted tree differently");
+}
+
+/// A page that OPENS as the Session does now (`begin`): it knows nothing of
+/// the register yet — it asks the signer, and mints only when told "none".
+/// Returns the page and how many keys it minted.
+fn opening(node: &mut WireNode, now: &mut u64, mint: &[u8; 32], always_mint: bool) -> (PageIo, usize) {
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+    );
+    io.begin(container);
+    settle(&mut io, node, now);
+    let mut minted = 0;
+    if io.needs_key() || always_mint {
+        let sk = ed25519_dalek::SigningKey::from_bytes(mint);
+        minted += 1;
+        if always_mint && !io.needs_key() {
+            // THE MUTANT'S PATH: a page that mints whatever the signer said.
+            io = PageIo::new(
+                Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+                Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME), signer: wire::delegate_from_code(SIGNER_CODE).1 },
+            );
+            io.provision(wire::delegate_from_code(SIGNER_CODE).0, sk.to_bytes().to_vec());
+        } else {
+            io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+        }
+        settle(&mut io, node, now);
+    }
+    (io, minted)
+}
+
+fn row_count(io: &mut PageIo, node: &mut WireNode, now: &mut u64, req_id: u64) -> Option<usize> {
+    let range = Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    client(io, node, now, &range).iter().find_map(|x| match x { Reply::Page { req_id: q, entries, .. } if *q == req_id => Some(entries.len()), _ => None })
+}
+
+/// A RELOAD AND A SECOND TAB ARE THE SAME PERSON (the switch-over blocker): a
+/// page asks the signer which Register it signs for and opens THAT one. Only
+/// the first page ever — on a signer holding no key — mints.
+#[test]
+fn a_reload_and_a_second_tab_reopen_the_same_register_and_only_the_first_page_mints() {
+    let key = [21u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    let mut now = 1_000;
+    let (mut first, minted) = opening(&mut node, &mut now, &key, false);
+    assert_eq!(minted, 1, "the first page, on a signer with no key, must mint");
+    assert!(first.provisioned(), "the minted key was not provisioned: {:?}", first.unusable());
+    assert_eq!(first.register_id(), node.register_id);
+    client(&mut first, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["a", "b", "c"].iter().enumerate() {
+        assert!(states(&client(&mut first, &mut node, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    for (i, label) in ["the reload", "a second tab"].into_iter().enumerate() {
+        let (mut again, minted) = opening(&mut node, &mut now, &[99u8; 32], false);
+        assert_eq!(minted, 0, "{label} minted a new identity");
+        assert!(again.provisioned(), "{label} did not open the signer's register: {:?}", again.unusable());
+        assert_eq!(again.register_id(), node.register_id, "{label} opened another register");
+        client(&mut again, &mut node, &mut now, &Request::Identity);
+        // The person's rows: the first page's three, and each earlier reopen's one.
+        assert_eq!(row_count(&mut again, &mut node, &mut now, 31 + i as u64), Some(3 + i), "{label} did not see the person's rows");
+        let k = format!("from-{i}");
+        assert!(states(&client(&mut again, &mut node, &mut now, &write(10 + i as u64, &k, "v")), 10 + i as u64).contains(&WriteState::Published), "{label} cannot write its own tree");
+    }
+    assert_eq!(node.register_puts, 1, "a second register was created");
+}
+
+/// THE CONTROL (the mutant a page that always mints is): a reload that mints
+/// its own key is refused by the signer and never sees the person's rows.
+#[test]
+fn control_a_page_that_always_mints_loses_the_persons_tree() {
+    let key = [22u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    let mut now = 1_000;
+    let (mut first, _) = opening(&mut node, &mut now, &key, false);
+    client(&mut first, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut first, &mut node, &mut now, &write(1, "a", "v")), 1).contains(&WriteState::Published));
+    let (again, minted) = opening(&mut node, &mut now, &[98u8; 32], true);
+    assert_eq!(minted, 1);
+    assert!(!again.provisioned(), "a second key was accepted: the check above could not have told the difference");
+    assert!(again.register_id() != node.register_id, "the minting page is not on another register");
 }

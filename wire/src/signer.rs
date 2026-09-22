@@ -106,6 +106,12 @@ pub fn frame_held(
     frame(key, id, &SignerRequest::Held { contracts }, stream_id)
 }
 
+/// Ask the signer which Register it signs for ([`SignerRequest::Register`]): how a page reopens the person's own tree
+/// instead of minting a new identity on every load.
+pub fn frame_register_query(key: &DelegateKey, id: u32, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
+    frame(key, id, &SignerRequest::Register, stream_id)
+}
+
 /// A signer answer and the id of the request it answers, from one application message of a delegate response;
 /// `None` for anything that is not one. An id of [`UNATTRIBUTED`] answers no page request (a `Put`, which names its
 /// contract, or a request whose id could not be read).
