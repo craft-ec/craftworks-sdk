@@ -69,6 +69,86 @@ pub fn container(metadata: &[u8], web: &[u8]) -> Vec<u8> {
     v
 }
 
+/// `data` as a valid `.xz` stream whose one block holds LZMA2 STORED chunks:
+/// no compression, so no encoder, only framing — CRC32 check, as the xz
+/// format (1.2.0) specifies it. What a page can make without an xz encoder,
+/// for an APP container (a few hundred KB of JavaScript, where the artefacts
+/// container's native xz is what saves the megabytes). Deterministic: the
+/// same data gives the same bytes.
+pub fn xz_stored(data: &[u8]) -> Vec<u8> {
+    const MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
+    const FLAGS: [u8; 2] = [0x00, 0x01]; // check = CRC32
+    let mut out = Vec::with_capacity(data.len() + data.len() / 65_536 * 3 + 64);
+    // Stream header.
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&FLAGS);
+    out.extend_from_slice(&crc32(&FLAGS).to_le_bytes());
+    // Block header: size byte ((12 / 4) - 1), flags (one filter, no sizes),
+    // the LZMA2 filter (id 0x21, one property byte: the smallest dictionary,
+    // which stored chunks never use), padding to 4, CRC32.
+    let mut header = vec![0x02, 0x00, 0x21, 0x01, 0x00, 0x00, 0x00, 0x00];
+    let hcrc = crc32(&header);
+    header.extend_from_slice(&hcrc.to_le_bytes());
+    out.extend_from_slice(&header);
+    // LZMA2: uncompressed chunks of at most 64 KiB — the first resets the
+    // dictionary (0x01), the rest do not (0x02) — then the end marker.
+    let start = out.len();
+    for (i, chunk) in data.chunks(65_536).enumerate() {
+        out.push(if i == 0 { 0x01 } else { 0x02 });
+        out.extend_from_slice(&((chunk.len() - 1) as u16).to_be_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.push(0x00);
+    let compressed = out.len() - start;
+    out.resize(out.len().div_ceil(4) * 4, 0);
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    // Index: one record (unpadded block size, uncompressed size), padded, CRC32.
+    let mut index = vec![0x00];
+    varint(&mut index, 1);
+    varint(&mut index, (header.len() + compressed + 4) as u64);
+    varint(&mut index, data.len() as u64);
+    index.resize(index.len().div_ceil(4) * 4, 0);
+    let icrc = crc32(&index);
+    index.extend_from_slice(&icrc.to_le_bytes());
+    out.extend_from_slice(&index);
+    // Stream footer: CRC32 of (backward size, flags), backward size, flags, magic.
+    let mut tail = ((index.len() / 4 - 1) as u32).to_le_bytes().to_vec();
+    tail.extend_from_slice(&FLAGS);
+    out.extend_from_slice(&crc32(&tail).to_le_bytes());
+    out.extend_from_slice(&tail);
+    out.extend_from_slice(b"YZ");
+    out
+}
+
+/// An APP web container: `files` as a deterministic tar, stored-chunk xz,
+/// in the node's framing, with no metadata.
+pub fn app_container(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    if files.is_empty() {
+        return Err("an app container with no files".into());
+    }
+    Ok(container(&[], &xz_stored(&tar(files)?)))
+}
+
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// CRC-32 (IEEE 802.3, reflected), as xz's headers and CRC32 check use it.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+        }
+    }
+    !c
+}
+
 /// `webapp`'s params for a state: its blake3.
 pub fn params(state: &[u8]) -> [u8; 32] {
     *blake3::hash(state).as_bytes()

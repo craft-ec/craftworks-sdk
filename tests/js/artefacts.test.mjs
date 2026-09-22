@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { shippedArtefacts } from "../../js/session.js";
 import { artefactBytes, allArtefactBytes, CACHE_NAME } from "../../js/artefacts.js";
 
@@ -241,6 +242,21 @@ await t("the manifest's hashes ARE the shipped files", async () => {
   const cbytes = new Uint8Array(await readFile(new URL("artefacts.webapp", dir)));
   assert.equal(await sha(cbytes), c.sha256, "artefacts.webapp does not hash to what artefacts.json claims");
   assert.equal(cbytes.length, c.bytes);
+  // The `webapp` CODE ships beside it, and is what the manifest says.
+  const w = manifest.webapp;
+  assert.ok(w && w.file === "webapp.wasm", `artefacts.json has no webapp entry: ${JSON.stringify(w)}`);
+  const wbytes = new Uint8Array(await readFile(new URL(w.file, dir)));
+  assert.equal(await sha(wbytes), w.sha256, "webapp.wasm does not hash to what artefacts.json claims");
+  assert.equal(wbytes.length, w.bytes);
+  // And the three AGREE: the shipped container under the shipped code, as
+  // the wasm derives its address, is the address the manifest advertises.
+  // Otherwise every app would name an artefacts address nobody published.
+  const { webapp_address } = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
+  assert.equal(webapp_address(wbytes, cbytes), c.address, "the shipped container's address is not the manifest's");
+  const tampered = cbytes.slice(); tampered[tampered.length - 1] ^= 1;
+  assert.notEqual(webapp_address(wbytes, tampered), c.address, "THE CONTROL: a different container got the same address");
+  const otherCode = wbytes.slice(); otherCode[0] ^= 1;
+  assert.notEqual(webapp_address(otherCode, cbytes), c.address, "THE CONTROL: other contract code got the same address");
 });
 
 // ---------------------------------------------------------------------------
