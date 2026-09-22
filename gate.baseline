@@ -4,6 +4,7 @@ engine-delegate=42
 probe=17
 probe-delegate=0
 protocol=50
+signer=10
 testkit=32
 web=14
 wire=33

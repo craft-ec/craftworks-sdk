@@ -366,7 +366,7 @@ mod tests {
         ///
         /// `wire` frames the client API; `probe` drives live nodes; the
         /// delegates are compiled by the node itself and link the guest side.
-        const ALLOWED: [&str; 6] = [
+        const ALLOWED: [&str; 7] = [
             "wire",
             // The browser build LINKS the core to the framing, which is its
             // whole job — and it is the reason `craftworks-sdk` can stay OFF
@@ -376,6 +376,11 @@ mod tests {
             "probe",
             "probe-delegate",
             "engine-delegate",
+            // The SIGNER (sdk#209) is a delegate too: the node compiles it and it
+            // links the guest side (secrets + the synchronous contract read). Its
+            // import gate (signer/build.sh) shows exactly 5 imports, all from
+            // freenet_delegate*, so no client stack reached its wasm.
+            "signer",
             // The test fixtures. It wraps `Shell`, so it cannot avoid
             // `engine-delegate` and inherits the client stack through it.
             //

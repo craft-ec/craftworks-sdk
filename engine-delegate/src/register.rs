@@ -126,6 +126,17 @@ pub fn head_state(
 /// the contract did that before the node stored it, and re-checking here
 /// would be this copy of the format deciding whether the authority was right.
 pub fn head_of(state: &[u8]) -> Option<(u64, [u8; 32])> {
+    let (seq, value) = record_of(state)?;
+    // A head's value IS a root cid: anything else is not one of ours.
+    let root: [u8; 32] = value.try_into().ok()?;
+    Some((seq, root))
+}
+
+/// Read `(seq, value)` out of an encoded Register state, whatever the value
+/// is -- the one parser of the record's layout. `head_of` is this plus "the
+/// value is a 32-byte root"; the signer (sdk#209) reads a value that may carry
+/// a ledger after the root. Like `head_of`, it does NOT verify the signature.
+pub fn record_of(state: &[u8]) -> Option<(u64, &[u8])> {
     let rest = state.strip_prefix(MAGIC)?;
     let (&flags, rest) = rest.split_first()?;
     if flags & FLAG_RECORD == 0 {
@@ -140,7 +151,5 @@ pub fn head_of(state: &[u8]) -> Option<(u64, [u8; 32])> {
         return None;
     }
     let value = rest.get(..vlen)?;
-    // A head's value IS a root cid: anything else is not one of ours.
-    let root: [u8; 32] = value.try_into().ok()?;
-    Some((seq, root))
+    Some((seq, value))
 }
