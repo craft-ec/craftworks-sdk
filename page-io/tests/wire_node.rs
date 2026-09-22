@@ -451,6 +451,7 @@ fn a_head_changed_from_the_node_makes_an_idle_page_read_and_adopt_the_new_head()
     let r = pump(&mut a, &mut node, &mut now);
     let got = r.iter().any(|x| matches!(x, Reply::Value { req_id: 7, value: Some(v) } if v == b"2"));
     assert!(got, "the idle tab did not adopt the head the node pushed: {r:?}");
+}
 
 /// An APP's PUT (builder#104: a web container) goes out through page-io — the
 /// only path to the node — beside the page's own writes, and its answer comes
