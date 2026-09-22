@@ -216,6 +216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-register-contract"
+version = "0.1.0"
+source = "git+https://github.com/craft-ec/freenet-contracts?rev=0a8cb05#0a8cb051d9592d4b4fbfc5a4399b3b99118e5ad6"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "craftworks-sdk"
 version = "0.1.0"
 dependencies = [
@@ -979,11 +989,13 @@ name = "page"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "craftec-register-contract",
  "ed25519-dalek",
  "elsa",
  "engine",
  "engine-delegate",
  "freenet-prolly",
+ "freenet-stdlib",
  "signer",
  "signer-proto",
  "wire",

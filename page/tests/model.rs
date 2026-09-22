@@ -4,15 +4,17 @@
 //! the far side run the real rules, not models of them:
 //! * the SIGNER: `signer::serve` over an in-memory host whose synchronous
 //!   read sees exactly what the scripted node holds;
-//! * the head REGISTER's record format (`engine_delegate::register`), and
-//!   its merge as measured (F56): the higher seq wins, equal seq the lower
-//!   value, and a losing UPDATE is still answered as a success.
+//! * the head REGISTER itself: every UPDATE goes through the contract's own
+//!   `update_state` (craftec-register-contract, natively) — the lower
+//!   BLAKE3(value) at an equal seq, F56's sticky fork evidence, and a losing
+//!   UPDATE still answered as a success.
 //!
 //! Faults, each on its OWN random stream (a new fault never shifts an old
 //! one's draws): a PUT lost before it lands, a PUT's answer lost after it
 //! landed, a transient PUT refusal (F51's queue), a GET answer lost, a sign
-//! request lost, an UPDATE lost, an UPDATE answered and NOT applied, a head
-//! read lost, and every answer's delay.
+//! request lost, the signer failing to save its record (`RecordNotSaved`),
+//! an UPDATE lost, an UPDATE answered and NOT applied, a head read lost, and
+//! every answer's delay.
 //!
 //! The app is an outbox: a write the engine reports `Lost` (a rebase) or
 //! `Busy` (one commit at a time) is submitted again, as WritePath does.
@@ -67,6 +69,7 @@ struct Faults {
     update_lost: u64,
     update_not_applied: u64,
     head_lost: u64,
+    record_not_saved: u64,
 }
 
 const FAULTS: Faults = Faults {
@@ -78,6 +81,7 @@ const FAULTS: Faults = Faults {
     update_lost: 80,
     update_not_applied: 80,
     head_lost: 80,
+    record_not_saved: 60,
 };
 const CALM: Faults = Faults {
     put_lost: 0,
@@ -88,6 +92,7 @@ const CALM: Faults = Faults {
     update_lost: 0,
     update_not_applied: 0,
     head_lost: 0,
+    record_not_saved: 0,
 };
 
 /// The block's kind, recovered from its id (the network holds `kind ‖ body`).
@@ -108,7 +113,10 @@ struct Node {
     contracts: BTreeMap<[u8; 32], Cid>,
     register: Option<Vec<u8>>,
     register_id: [u8; 32],
+    register_params: Vec<u8>,
     secrets: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// The signer's record write fails while this is set (a fault).
+    record_fails: bool,
 }
 
 impl Blocks for Node {
@@ -123,6 +131,9 @@ impl signer::Host for Host<'_> {
         self.0.secrets.get(key).cloned()
     }
     fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if self.0.record_fails && key == signer::RECORD {
+            return false;
+        }
         self.0.secrets.insert(key.to_vec(), value.to_vec());
         true
     }
@@ -150,7 +161,9 @@ impl Node {
             contracts: BTreeMap::new(),
             register: None,
             register_id: signer::register_id(REGISTER_CODE, &params),
+            register_params: params.clone(),
             secrets: BTreeMap::new(),
+            record_fails: false,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -167,21 +180,33 @@ impl Node {
         self.blocks.insert(id, body.to_vec());
     }
 
-    /// The register's merge as measured (F56): the higher seq wins; at an
-    /// equal seq the lower value; the loser is still answered success.
+    /// An UPDATE, through the Register contract's OWN `update_state`: the
+    /// state the node keeps is exactly the contract's answer (F56: a loser is
+    /// still told success; that is the caller's `Updated`).
     fn update(&mut self, state: &[u8]) {
-        let (seq, _) = engine_delegate::register::record_of(state).expect("a record");
-        let keep_new = match &self.register {
-            None => true,
+        use freenet_stdlib::prelude::*;
+        let params = Parameters::from(self.register_params.clone());
+        let next = match &self.register {
+            None => {
+                let v = <craftec_register_contract::Register as ContractInterface>::validate_state(
+                    params,
+                    State::from(state.to_vec()),
+                    RelatedContracts::default(),
+                );
+                assert!(matches!(v, Ok(ValidateResult::Valid)), "the signer's record is not a valid register state");
+                state.to_vec()
+            }
             Some(cur) => {
-                let (cseq, cval) = engine_delegate::register::record_of(cur).expect("a record");
-                let (_, nval) = engine_delegate::register::record_of(state).expect("a record");
-                seq > cseq || (seq == cseq && nval < cval)
+                let m = <craftec_register_contract::Register as ContractInterface>::update_state(
+                    params,
+                    State::from(cur.clone()),
+                    vec![UpdateData::State(State::from(state.to_vec()))],
+                )
+                .expect("the register merged");
+                m.new_state.expect("the register answered a state").as_ref().to_vec()
             }
         };
-        if keep_new {
-            self.register = Some(state.to_vec());
-        }
+        self.register = Some(next);
     }
 
     fn head(&self) -> Option<(u64, Cid)> {
@@ -267,6 +292,7 @@ struct Seen {
     lost: usize,
     busy: usize,
     updates: usize,
+    record_not_saved: usize,
 }
 
 fn run(seed: u64, writes_per_page: usize, path: PutPath) -> Result<Seen, String> {
@@ -281,6 +307,7 @@ fn run(seed: u64, writes_per_page: usize, path: PutPath) -> Result<Seen, String>
     let mut s_upd_na = Rng::new(seed, 8);
     let mut s_head = Rng::new(seed, 9);
     let mut s_app = Rng::new(seed, 10);
+    let mut s_rec = Rng::new(seed, 11);
 
     let mut apps: Vec<App> = (0..2)
         .map(|i| App {
@@ -375,7 +402,13 @@ fn run(seed: u64, writes_per_page: usize, path: PutPath) -> Result<Seen, String>
                     if s_sign.chance(faults.sign_lost) {
                         None
                     } else {
-                        Some(Answer::Signer(node.sign(prev_seq, prev_root, seq, root)))
+                        node.record_fails = s_rec.chance(faults.record_not_saved);
+                        let a = node.sign(prev_seq, prev_root, seq, root);
+                        node.record_fails = false;
+                        if matches!(a, signer_proto::Answer::Refused(signer_proto::Why::RecordNotSaved)) {
+                            seen.record_not_saved += 1;
+                        }
+                        Some(Answer::Signer(a))
                     }
                 }
                 Op::Update { state } => {
@@ -498,12 +531,14 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
         total.lost += s.lost;
         total.busy += s.busy;
         total.updates += s.updates;
+        total.record_not_saved += s.record_not_saved;
     }
     println!("{SEEDS} seeds × 2 pages × {WRITES} writes: {total:?}");
     // The model is not vacuous: the race and the faults were reached.
     assert_eq!(total.published, SEEDS as usize * 2 * WRITES, "not every write was published once");
     assert!(total.lost > 0, "no rebase was ever reached: the two pages never raced");
     assert!(total.updates > total.published / 2, "too few UPDATEs for the writes published");
+    assert!(total.record_not_saved > 0, "the signer never failed to save its record: RecordNotSaved unexercised");
 }
 
 /// THE CONTROL for invariant 3: the whole-tree check FAILS on a root with a

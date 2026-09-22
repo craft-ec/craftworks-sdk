@@ -24,3 +24,9 @@ engine-delegate = { path = "../engine-delegate", default-features = false }
 wire = { path = "../wire" }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 bincode = "1"
+# The head Register's REAL merge (its `update_state`, natively): the lower
+# BLAKE3(value) at an equal seq, and F56's sticky fork evidence. A model kinder
+# than the contract would hide exactly the forks the signer exists to prevent.
+# `default-features = false`: no wasm entry points, the same code.
+craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "0a8cb05", default-features = false }
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }

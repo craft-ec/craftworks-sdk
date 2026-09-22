@@ -18,14 +18,16 @@
 //! | effect / answer | what the page does |
 //! |---|---|
 //! | `PutBlock` / `PutParity` | the bytes join [`PageBlocks`] (the page is now the memory a node was); held until its `after` set is confirmed, then [`Op::Put`] |
-//! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → the PUT again |
+//! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → asked again on a doubling backoff, the PUT again only after [`HELD_ABSENTS`] absents in a row |
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
 //! | `Signed(state)` (`signer_proto::Answer`, as `wire::signer::read_answer` decodes it) | [`Op::Update`] with exactly those bytes |
 //! | `AlreadySigned(state)` | [`Op::Update`] with exactly those bytes (the signer's requirement 2: at most one signature per prev). If its root is another page's, the read-back shows this seq under that root: `HeadConflict` |
 //! | `NotNext { current }` | `HeadConflict` onto `current`: the engine ADOPTS the winning head and reports the dead commit's writes `Lost`; the app submits them again on the winner (with no read-set check yet — the next PR) |
-//! | `Refused(RootNotHeld)` | the same sign request at the next tick (the root's PUT is still landing) |
+//! | `Refused(RootNotHeld / HeadUnknown / RecordNotSaved)` | the same sign request after a doubling backoff from [`BACKOFF_MS`]; for `HeadUnknown` the register is READ first, which makes the signer's node hold it |
+//! | `Refused(Forked)` | LOUD: [`Page::forked`] and `unusable`; never retried — a fork is news |
+//! | a signer answer no sign gets (`Putting`, `Put`, `Held`, `Provisioned`, another verb's refusal) | ignored: it does NOT clear the sign's deadline (answers carry no request id until SG02) |
 //! | any other `Refused(why)` | nothing more is asked; recorded in [`Page::unusable`]; the engine's own clock reports the write `Stalled` |
 //! | `Updated` | a register read-back ([`Op::ReadHead`]): an UpdateResponse carries nothing (F56) |
 //! | `Head(Some(mine))` while a head is owed | `HeadConfirmed(seq)` — the only way a commit is Published |
@@ -66,6 +68,16 @@ pub const SILENT_MS: u64 = 2_000;
 /// the UPDATE itself is re-sent. ASSUMPTION (the live run tells): a page's
 /// own UPDATE is visible to its own GET within a few reads.
 pub const HEAD_READS: u32 = 3;
+
+/// [`PutPath::Wrapper`]: `Held` answers "absent" this many times before the
+/// block is PUT again. The signer's own PUTs go out AFTER it answers
+/// `Putting`, so an early absent can be honest (engineer2's review of
+/// sdk#215); a re-PUT is harmless but re-sends the block.
+pub const HELD_ABSENTS: u32 = 3;
+
+/// The first wait before a backed-off re-ask (a `Held` absent, a retryable
+/// signer refusal); it doubles each time, up to [`SILENT_MS`].
+pub const BACKOFF_MS: u64 = 100;
 
 /// The only code epoch this build writes under.
 const EPOCH: Epoch = Epoch(1);
@@ -165,6 +177,10 @@ enum Waiting {
     Get(Cid),
     Sign,
     Update,
+    /// A register read whose answer nobody judges: it only makes the node
+    /// hold the register, so the signer's synchronous read can see a head
+    /// (`Refused(HeadUnknown)`).
+    Warm,
     /// The engine's own head read (recovery, `Effect::ReadHead`).
     RecoverHead,
     /// This executor's read-back after an UPDATE.
@@ -193,8 +209,16 @@ pub struct Page {
     /// Effects held until their `after` set is confirmed, in emitted order.
     held: Vec<(BTreeSet<Cid>, Effect)>,
     owed: Option<Owed>,
-    /// A sign request to repeat at the next tick (a retryable refusal).
-    sign_again: bool,
+    /// A sign request to repeat once the clock passes this (a retryable
+    /// refusal), and how many times in a row it was refused.
+    sign_again: Option<u64>,
+    sign_refusals: u32,
+    /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
+    /// many absents in a row.
+    held_again: BTreeMap<Cid, (u64, u32)>,
+    /// The loud one: the signer saw this key's head FORKED (two roots at one
+    /// seq). Never retried; a fork is news.
+    forked: Option<String>,
     /// A PUT to repeat at the next tick (a transient refusal).
     put_again: BTreeMap<Cid, Vec<u8>>,
     /// Deadlines of the ops in flight, and each op to re-send.
@@ -223,7 +247,10 @@ impl Page {
             confirmed: BTreeSet::new(),
             held: Vec::new(),
             owed: None,
-            sign_again: false,
+            sign_again: None,
+            sign_refusals: 0,
+            held_again: BTreeMap::new(),
+            forked: None,
             put_again: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             out: Vec::new(),
@@ -265,8 +292,13 @@ impl Page {
         for (id, bytes) in std::mem::take(&mut self.put_again) {
             self.send(Waiting::Put(id), Op::Put { id, bytes });
         }
-        if std::mem::take(&mut self.sign_again) {
+        if self.sign_again.is_some_and(|at| now >= at) {
+            self.sign_again = None;
             self.ask_sign();
+        }
+        let due: Vec<Cid> = self.held_again.iter().filter(|(_, (at, _))| now >= *at).map(|(id, _)| *id).collect();
+        for id in due {
+            self.send(Waiting::Held(id), Op::AskHeld { id });
         }
         if let Some(o) = &self.owed {
             if o.record.is_some() && o.stale_reads > 0 && !self.deadlines.contains_key(&Waiting::ReadBack) {
@@ -294,12 +326,22 @@ impl Page {
             Answer::Held { id, present } => {
                 let Some((_, _)) = self.deadlines.remove(&Waiting::Held(id)) else { return };
                 if present {
+                    self.held_again.remove(&id);
                     self.confirm(id);
-                } else if let Some(bytes) = self.blocks.get(&id).map(<[u8]>::to_vec) {
-                    // Not there (yet): put again at the NEXT TICK, as a
-                    // transient refusal is — at once would re-put a block the
-                    // node never keeps as fast as it can answer.
-                    self.put_again.insert(id, bytes);
+                    return;
+                }
+                // Not there YET is the ordinary answer to an early ask: ask
+                // again on a doubling backoff, and only after HELD_ABSENTS in
+                // a row put it again — never at the speed of the answers.
+                let absents = self.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
+                if absents >= HELD_ABSENTS {
+                    self.held_again.remove(&id);
+                    if let Some(bytes) = self.blocks.get(&id).map(<[u8]>::to_vec) {
+                        self.put_again.insert(id, bytes);
+                    }
+                } else {
+                    let wait = (BACKOFF_MS << absents).min(SILENT_MS);
+                    self.held_again.insert(id, (now + wait, absents));
                 }
             }
             Answer::PutRefused { id, transient } => {
@@ -329,6 +371,16 @@ impl Page {
                 }
             }
             Answer::Signer(s) => {
+                // Only an answer SHAPED like a sign's answer is taken as the
+                // sign's. The signer's answers carry no request id yet (SG02
+                // adds one), and `Putting`, `Put`, `Held`, `Provisioned` or a
+                // refusal only another verb gives are answers to something
+                // else: clearing the sign's deadline on one of them would
+                // leave the commit un-asked until the engine said Stalled
+                // (engineer2's review of sdk#215).
+                if !answers_a_sign(&s) {
+                    return;
+                }
                 if self.deadlines.remove(&Waiting::Sign).is_none() {
                     return; // an answer to a sign request already answered
                 }
@@ -342,6 +394,7 @@ impl Page {
             // One register read can answer both a recovery read and a
             // read-back: a head is a head, whoever asked.
             Answer::Head(h) => {
+                self.deadlines.remove(&Waiting::Warm);
                 if self.deadlines.remove(&Waiting::RecoverHead).is_some() {
                     match h {
                         Some((seq, root)) => self.step(Event::HeadRead { epoch: EPOCH, seq, root }),
@@ -355,7 +408,7 @@ impl Page {
         }
     }
 
-    /// A block is on the node: the one place `PutConfirmed` comes from.
+        /// A block is on the node: the one place `PutConfirmed` comes from.
     fn confirm(&mut self, id: Cid) {
         if self.confirmed.insert(id) {
             self.step(Event::PutConfirmed(id));
@@ -366,6 +419,10 @@ impl Page {
     fn on_signer(&mut self, s: signer_proto::Answer) {
         use signer_proto::{Answer as A, Why};
         let Some(owed) = self.owed.as_mut() else { return };
+        self.sign_refusals = match &s {
+            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved) => self.sign_refusals,
+            _ => 0,
+        };
         match s {
             A::Signed(state) => {
                 self.signer_records.insert(state.clone());
@@ -391,11 +448,28 @@ impl Page {
                 self.owed = None;
                 self.step(Event::HeadConflict { seq: current.seq, root: current.root });
             }
-            // The root block is not readable by the signer's node YET (its
-            // PUT is still landing): worth asking again. A node's "queue
-            // full" never reaches here — it is not a signer answer — and is
-            // re-asked by the deadline like any silence.
-            A::Refused(Why::RootNotHeld) => self.sign_again = true,
+            // RETRYABLE, on a doubling backoff (engineer2's table):
+            // RootNotHeld — the root's PUT is still landing; HeadUnknown — the
+            // node does not hold the register, so a page read of it is sent
+            // first to make it held; RecordNotSaved — the signer could not
+            // write its record and signed nothing. A node's "queue full" is
+            // not a signer answer: it is re-asked by the deadline.
+            A::Refused(why @ (Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved)) => {
+                if why == Why::HeadUnknown {
+                    self.send(Waiting::Warm, Op::ReadHead);
+                }
+                self.sign_refusals += 1;
+                let wait = (BACKOFF_MS << self.sign_refusals.min(5)).min(SILENT_MS);
+                self.sign_again = Some(self.now + wait);
+            }
+            // LOUD: a fork is news, never a silent retry.
+            A::Refused(why @ Why::Forked { .. }) => {
+                let msg = format!("FORKED: the signer saw two roots at one seq for this key: {why:?}");
+                self.forked = Some(msg.clone());
+                self.unusable.push(msg);
+            }
+            // Permanent: not provisioned, not a successor, cannot sign,
+            // unreadable.
             A::Refused(why) => self.unusable.push(format!("the signer refused: {why:?}")),
             other => self.unusable.push(format!("the signer answered a sign with {other:?}")),
         }
@@ -468,7 +542,8 @@ impl Page {
     fn drop_dead_head(&mut self) {
         if self.owed.as_ref().is_some_and(|o| o.seq <= self.engine.published_seq()) {
             self.owed = None;
-            self.sign_again = false;
+            self.sign_again = None;
+            self.sign_refusals = 0;
             for w in [Waiting::Sign, Waiting::Update, Waiting::ReadBack] {
                 self.deadlines.remove(&w);
             }
@@ -570,6 +645,12 @@ impl Page {
         (self.engine.published_seq(), self.engine.published_root())
     }
 
+    /// The signer saw this key's head FORKED: shown to the person, never
+    /// retried.
+    pub fn forked(&self) -> Option<&str> {
+        self.forked.as_deref()
+    }
+
     /// Every record the signer returned (invariant 2's evidence).
     pub fn signer_records(&self) -> &BTreeSet<Vec<u8>> {
         &self.signer_records
@@ -578,5 +659,20 @@ impl Page {
     /// The blocks the page holds.
     pub fn blocks(&self) -> &PageBlocks {
         &self.blocks
+    }
+}
+
+/// Is this the kind of answer a SIGN request gets? `Signed`, `AlreadySigned`,
+/// `NotNext`, or a refusal the sign verb gives; not `Putting`, `Put`, `Held`,
+/// `Provisioned`, or a refusal only PUT-WITH-CODE or Provision gives.
+fn answers_a_sign(a: &signer_proto::Answer) -> bool {
+    use signer_proto::{Answer as A, Why};
+    match a {
+        A::Signed(_) | A::AlreadySigned(_) | A::NotNext { .. } => true,
+        A::Refused(w) => !matches!(
+            w,
+            Why::BlockCount { .. } | Why::NotABlock { .. } | Why::KeyAlreadyProvisioned | Why::RegisterChanged
+        ),
+        A::Provisioned | A::Putting { .. } | A::Put { .. } | A::Held { .. } => false,
     }
 }
