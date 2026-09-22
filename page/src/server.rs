@@ -70,12 +70,6 @@ pub struct Server {
     trace: Vec<protocol::Reply>,
     tracing_of: Option<protocol::TraceOf>,
     out: Vec<Vec<u8>>,
-    /// READS held until the page has recovered its head (sdk#175's twin): an
-    /// engine that has not read its head answers from the EMPTY tree it
-    /// started on — `Page { entries: [], complete: true }` for data that
-    /// exists. Not a change to the ported rules: they run on each read, in
-    /// order, the moment the head is read.
-    held_reads: Vec<(Request, u16, u64)>,
 }
 
 impl Server {
@@ -95,7 +89,6 @@ impl Server {
             trace: Vec::new(),
             tracing_of: None,
             out: Vec::new(),
-            held_reads: Vec::new(),
         }
     }
 
@@ -110,13 +103,12 @@ impl Server {
         self.attribute(bytes);
         match serve(bytes) {
             Served::Do(r, v, session) => {
-                if is_read(&r) && !self.page.recovered() {
-                    self.held_reads.push((r, v, session));
-                } else {
-                    self.client_version = self.client_version.max(v);
-                    self.speaker = as_client(session, v);
-                    self.on_protocol(r);
-                }
+                // A read before the head is recovered is PARKED by the engine
+                // itself (sdk#223) and answered in order once it is; this
+                // Server held it until then, and no longer needs to.
+                self.client_version = self.client_version.max(v);
+                self.speaker = as_client(session, v);
+                self.on_protocol(r);
             }
             Served::Answer(reply) => {
                 out.replies.push(reply_bytes(&reply));
@@ -166,16 +158,8 @@ impl Server {
     }
 
     /// Every client-facing effect the page produced, turned into replies and
-    /// trace steps (shell.rs `handle`, 628–660). Reads held for the head run
-    /// first, in the order they came, once the head is read.
+    /// trace steps (shell.rs `handle`, 628–660).
     fn drain(&mut self, out: &mut Outbound) {
-        if self.page.recovered() && !self.held_reads.is_empty() {
-            for (r, v, session) in std::mem::take(&mut self.held_reads) {
-                self.client_version = self.client_version.max(v);
-                self.speaker = as_client(session, v);
-                self.on_protocol(r);
-            }
-        }
         let effects = self.page.take_client();
         self.reply_from(&effects, out);
         self.step(1, protocol::Step::Effects, effects.len() as u64);
@@ -674,7 +658,3 @@ fn as_epoch(n: u32) -> engine::Epoch {
     engine::Epoch(n)
 }
 
-/// A request that READS the tree (and so must wait for the head).
-fn is_read(r: &Request) -> bool {
-    matches!(r, Request::Get { .. } | Request::Range { .. } | Request::ChangesSince { .. } | Request::Preload { .. })
-}
