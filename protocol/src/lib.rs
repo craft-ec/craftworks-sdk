@@ -310,6 +310,40 @@ pub enum Request {
         floor: u64,
         ops: Vec<Op>,
     },
+    /// A write that says what it READ (M2, craftworks-sdk#148): the engine
+    /// checks every read against the tree the ops land on, in the same apply,
+    /// and a read that no longer holds applies NOTHING and ends
+    /// [`WriteState::Conflict`] with [`Reply::Conflicted`] naming the key.
+    ///
+    /// `Db` declares a read for every key it writes (the record it patched or
+    /// found absent, and the domain's schema), so `writes ⊆ keys(reads)` holds
+    /// for everything it sends; the engine enforcing it is sdk#235.
+    ///
+    /// Sent to [`page::Server`](../page/server/index.html) at v4: that server
+    /// answers only the `Db` compiled into the SAME wasm bundle, so client and
+    /// server can never be from different builds on this path — the "a new
+    /// message only to a client that spoke vN" rule guards against build
+    /// skew, and here there is none (main's ruling on sdk#225). The Shell
+    /// takes it too; it runs the same engine.
+    Commit {
+        write_id: u64,
+        reads: Vec<(Vec<u8>, Expect)>,
+        ops: Vec<Op>,
+    },
+}
+
+/// What a [`Request::Commit`] READ at a key, as the engine checks it
+/// (`engine::Expect`, the same three cases).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Expect {
+    /// The key is not in the tree (a create).
+    Absent,
+    /// The key is in the tree, whatever it holds (a child's parent).
+    Present,
+    /// The key holds exactly this value: the engine's `leaf_hash` of the
+    /// bytes read — the LEAF form, inline or by reference, never a hash the
+    /// client made up of its own.
+    Value([u8; 32]),
 }
 
 /// Which id space a trace question is in.
@@ -630,6 +664,18 @@ pub enum Reply {
         ack: Ack,
         body: Box<Reply>,
     },
+    /// A [`Request::Commit`] read that no longer held: nothing of the write
+    /// was applied (M2). `key` is the read that failed and `current` what the
+    /// tree holds there now (its leaf hash, or `None`: absent), so the app can
+    /// decide against the truth and not against a copy that may lag it. The
+    /// write's state is [`WriteState::Conflict`], sent beside this. From
+    /// `page::Server` to v4, for the reason on [`Request::Commit`].
+    Conflicted {
+        session: u64,
+        write_id: u64,
+        key: Vec<u8>,
+        current: Option<[u8; 32]>,
+    },
 }
 
 /// What the engine knows about one session's writes, on every reply to it
@@ -792,6 +838,11 @@ pub enum WriteState {
     OutOfOrder {
         expected: u64,
     },
+    /// TERMINAL, nothing applied: a key a [`Request::Commit`] READ no longer
+    /// holds what it read ([`Reply::Conflicted`] names it). NEVER re-sent as
+    /// it is — the same write conflicts the same way; what to do next is the
+    /// app's. From `page::Server` at v4 (see [`Request::Commit`]).
+    Conflict,
 }
 
 /// Which of the engine's bounds a [`WriteState::TooLarge`] write is over.
@@ -823,6 +874,7 @@ impl WriteState {
                 | WriteState::Lost
                 | WriteState::TooLarge { .. }
                 | WriteState::OutOfOrder { .. }
+                | WriteState::Conflict
         )
     }
 
@@ -853,6 +905,7 @@ impl WriteState {
             | WriteState::Failed
             | WriteState::Lost => 1,
             WriteState::TooLarge { .. } => 3,
+            WriteState::Conflict => SESSION_SINCE,
             WriteState::Duplicate | WriteState::OutOfOrder { .. } => FLOOR_SINCE,
         }
     }
@@ -882,6 +935,9 @@ impl WriteState {
             // Not in the tree, and sending it again is refused again —
             // exactly what `Failed` already tells an older client.
             WriteState::TooLarge { .. } => WriteState::Failed,
+            // Nothing applied and sending it again conflicts again: what
+            // `Failed` tells an older client.
+            WriteState::Conflict => WriteState::Failed,
             // The order rule's verdicts exist only on v5, whose writes carry a
             // floor; a pre-v5 client never meets them. If one ever did, it is
             // told the TRUE v4 equivalent — never `Failed`, which would roll
@@ -916,6 +972,7 @@ impl WriteState {
         },
         WriteState::Duplicate,
         WriteState::OutOfOrder { expected: 7 },
+        WriteState::Conflict,
     ];
 
     /// The order rule's verdicts (v5): never sent below v5, so their

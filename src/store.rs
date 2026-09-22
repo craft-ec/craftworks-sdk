@@ -287,6 +287,20 @@ pub trait Store {
         }
         Ok(())
     }
+    /// Apply several edits as ONE change that says what it READ (M2,
+    /// sdk#148): a store that holds writes for a NODE sends the reads with
+    /// them, and the engine checks them where the edits land. The default is
+    /// right for a store that IS the truth — `MemStore`, `TreeStore` — where
+    /// `Db` read and writes inside one `&mut` borrow, so nothing can have
+    /// moved between the read and the write.
+    fn apply_commit(
+        &mut self,
+        reads: &[(Vec<u8>, protocol::Expect)],
+        edits: &[(Vec<u8>, Edit)],
+    ) -> Result<(), crate::copy::Refused> {
+        let _ = reads;
+        self.apply_batch(edits)
+    }
 }
 
 /// Sort by key and drop all but the LAST edit for each key.

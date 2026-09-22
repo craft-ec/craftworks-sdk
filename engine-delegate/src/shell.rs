@@ -853,6 +853,32 @@ impl<B: Blocks> Shell<B> {
                     .collect(),
                 reads: Vec::new(),
             },
+            // M2 (sdk#148): a write that says what it READ. The reads go to the
+            // engine, which checks them where the ops land.
+            P::Commit { write_id, reads, ops } => Event::Write {
+                client: self.speaker,
+                write_id: as_write_id(write_id),
+                ops: ops
+                    .into_iter()
+                    .map(|o| match o {
+                        protocol::Op::Put(k, v) => (k, engine::Op::Put(v)),
+                        protocol::Op::Delete(k) => (k, engine::Op::Delete),
+                    })
+                    .collect(),
+                reads: reads
+                    .into_iter()
+                    .map(|(k, e)| {
+                        (
+                            k,
+                            match e {
+                                protocol::Expect::Absent => engine::Expect::Absent,
+                                protocol::Expect::Present => engine::Expect::Present,
+                                protocol::Expect::Value(h) => engine::Expect::Value(h),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
             // UNUSED BY ANY CLIENT (sdk#146): `src/`, `web/src/` and `js/` send
             // no `AskWrite` (read at all three, against 3 `Request::Write`
             // senders as the control). Served, and keyed by the asking

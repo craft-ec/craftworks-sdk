@@ -276,6 +276,32 @@ impl Server {
                     .collect(),
                 reads: Vec::new(),
             },
+            // M2 (sdk#148): a write that says what it READ. The reads go to the
+            // engine, which checks them where the ops land.
+            P::Commit { write_id, reads, ops } => Event::Write {
+                client: self.speaker,
+                write_id: as_write_id(write_id),
+                ops: ops
+                    .into_iter()
+                    .map(|o| match o {
+                        protocol::Op::Put(k, v) => (k, engine::Op::Put(v)),
+                        protocol::Op::Delete(k) => (k, engine::Op::Delete),
+                    })
+                    .collect(),
+                reads: reads
+                    .into_iter()
+                    .map(|(k, e)| {
+                        (
+                            k,
+                            match e {
+                                protocol::Expect::Absent => engine::Expect::Absent,
+                                protocol::Expect::Present => engine::Expect::Present,
+                                protocol::Expect::Value(h) => engine::Expect::Value(h),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
             // UNUSED BY ANY CLIENT (sdk#146): `src/`, `web/src/` and `js/` send
             // no `AskWrite` (read at all three, against 3 `Request::Write`
             // senders as the control). Served, and keyed by the asking
@@ -425,9 +451,9 @@ impl Server {
                         State::Busy => W::Busy,
                         State::Failed => W::Failed,
                         State::Lost => W::Lost,
-                        // Unreachable here: this path sends no reads. Nothing
-                        // was applied, so `Failed` is true to this client.
-                        State::Conflict => W::Failed,
+                        // M2: nothing applied, a read no longer held. `for_client`
+                        // tells a pre-v4 client `Failed`, which is true to it.
+                        State::Conflict => W::Conflict,
                         State::TooLarge { bound, limit, got } => W::too_large(
                             match bound {
                                 engine::WriteBound::CommitBlocks => {
@@ -455,6 +481,21 @@ impl Server {
                         }
                     } else {
                         protocol::Reply::WriteState { write_id: write_id.0, state }
+                    }
+                }
+                // WHICH read no longer held, and what the tree holds there now
+                // (M2) — to a v4 writer with a session (the same bundle: see
+                // `protocol::Request::Commit`). An older one has its `Failed`.
+                Effect::Conflicted { client, write_id, key, current } => {
+                    let version = version_of(*client);
+                    if version < protocol::SESSION_SINCE || session_of(*client) == protocol::LEGACY_SESSION {
+                        continue;
+                    }
+                    protocol::Reply::Conflicted {
+                        session: session_of(*client),
+                        write_id: write_id.0,
+                        key: key.clone(),
+                        current: current.as_ref().map(|f| f.hash()),
                     }
                 }
                 Effect::Reply { req_id, result, .. } => {

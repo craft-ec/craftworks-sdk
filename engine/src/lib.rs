@@ -2163,7 +2163,7 @@ impl<B: Blocks> Engine<B> {
         // come through here, so they are all checked where the ops land. A
         // read key whose path is not held parks the write exactly as its own
         // path does — never a Conflict, since nothing proved it differs.
-        match self.check_reads(&reads) {
+        match self.check_reads(&reads, &ops) {
             Ok(()) => {}
             Err(ReadsCheck::Need(need)) => return self.park_write(client, write_id, ops, reads, size, need),
             Err(ReadsCheck::Differs { key, current }) => {
@@ -2446,7 +2446,14 @@ impl<B: Blocks> Engine<B> {
     }
 
     /// Every read against the tree this apply lands on.
-    fn check_reads(&self, reads: &[(Vec<u8>, Expect)]) -> Result<(), ReadsCheck> {
+    /// Every read against the tree this apply lands on. A read that no
+    /// longer holds is still SATISFIED when this write's own op for that key
+    /// leaves exactly what the tree holds now — a write that is already there
+    /// (main's ruling on sdk#148: two tabs defining one schema from one
+    /// Absent base both succeed; deleting what is already gone is not a
+    /// conflict). Only a key the write WRITES can be satisfied that way; a
+    /// read of anything else that moved is a Conflict.
+    fn check_reads(&self, reads: &[(Vec<u8>, Expect)], ops: &[(Vec<u8>, Op)]) -> Result<(), ReadsCheck> {
         let source = WithEmptyLeaf {
             inner: &self.blocks,
             empty_cid: self.empty.cid,
@@ -2469,7 +2476,13 @@ impl<B: Blocks> Engine<B> {
                 (Expect::Value(h), Some(f)) => f.hash() == *h,
                 _ => false,
             };
-            if !holds {
+            // The write's LAST op on this key decides what it leaves there.
+            let already_there = || match ops.iter().rev().find(|(k, _)| k == key) {
+                Some((_, Op::Put(v))) => found.as_ref().is_some_and(|f| f.hash() == leaf_hash(v)),
+                Some((_, Op::Delete)) => found.is_none(),
+                None => false,
+            };
+            if !holds && !already_there() {
                 return Err(ReadsCheck::Differs { key: key.clone(), current: found });
             }
         }

@@ -67,7 +67,7 @@ impl Page {
             }
             for f in &frames {
                 if let protocol::Incoming::Ok(env) = protocol::decode_request(f) {
-                    if let protocol::Request::Write { write_id, .. } = env.body {
+                    if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
                         *self.sends.entry(write_id).or_default() += 1;
                     }
                 }

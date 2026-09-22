@@ -23,6 +23,9 @@ blake3 = { version = "1", default-features = false }
 [dev-dependencies]
 # The OLD side of the differential: the Shell over a scripted node.
 testkit = { path = "../testkit" }
+# The client a page::Server answers: `Db` over `CachedStore`, driven end to end (M2).
+craftworks-sdk = { path = ".." }
+serde_json = "1"
 # The far side of the scripted client API runs the REAL signer rule and the
 # REAL Register record format, never a model of them.
 signer = { path = "../signer" }

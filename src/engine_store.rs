@@ -237,6 +237,11 @@ impl<T: Transport> EngineStore<T> {
     /// spin: the caller is a UI thread in a browser, and "eventually" there
     /// means "never, visibly".
     fn submit(&mut self, edits: Vec<protocol::Op>) {
+        self.submit_reading(Vec::new(), edits)
+    }
+
+    /// A write that says what it READ (M2): the outbox sends it as a Commit.
+    fn submit_reading(&mut self, reads: Vec<(Vec<u8>, protocol::Expect)>, edits: Vec<protocol::Op>) {
         let write_id = self.next_write_id;
         self.next_write_id += 1;
 
@@ -261,7 +266,7 @@ impl<T: Transport> EngineStore<T> {
             })
             .collect();
 
-        self.outbox.push_against(write_id, edits, pre);
+        self.outbox.push_reading(write_id, edits, pre, reads);
 
         let mut rounds = 0;
         while !self.outbox.is_empty() {
@@ -275,7 +280,7 @@ impl<T: Transport> EngineStore<T> {
                 return;
             };
             let id = match &req {
-                Request::Write { write_id, .. } => *write_id,
+                Request::Write { write_id, .. } | Request::Commit { write_id, .. } => *write_id,
                 _ => unreachable!("the outbox only sends writes"),
             };
             let replies = self.ask(&req);
@@ -308,6 +313,12 @@ impl<T: Transport> EngineStore<T> {
                         WriteState::Failed => {
                             self.outbox.settle(id, state);
                             self.client.events.push(Event::Failed { write_id: id });
+                        }
+                        // M2: a read no longer held, nothing applied; terminal,
+                        // and never re-sent (the outbox ends it).
+                        WriteState::Conflict => {
+                            self.outbox.settle(id, state);
+                            self.client.events.push(Event::Conflict { write_id: id, keys: keys.clone() });
                         }
                         other => {
                             if other == WriteState::Busy {
@@ -389,9 +400,15 @@ impl<T: Transport> Store for EngineStore<T> {
     }
 
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
+        self.apply_commit(&[], edits)
+    }
+
+    fn apply_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
         // ONE write, so the engine applies them as one commit — which is what
-        // makes a record and its index entries one fact rather than several.
-        self.submit(
+        // makes a record and its index entries one fact rather than several —
+        // with what it READ, checked where it lands (M2).
+        self.submit_reading(
+            reads.to_vec(),
             edits
                 .iter()
                 .map(|(k, e)| match e {

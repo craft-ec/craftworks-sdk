@@ -86,9 +86,47 @@ pub struct CachedStore {
     /// on `Busy` (back in the outbox, not at the engine), and when the copy
     /// no longer holds the write.
     unheard: std::collections::BTreeMap<u64, u64>,
+    /// What each write in the copy READ (M2, sdk#148), so a re-send after
+    /// `Busy` is the SAME `Commit` — its reads as well as its ops. In on
+    /// submit, out when the write ends.
+    reads_of: std::collections::BTreeMap<u64, Vec<(Vec<u8>, protocol::Expect)>>,
+    /// Conflicts this client was told of, for the app: drained by
+    /// [`CachedStore::take_conflicts`].
+    conflicts: Vec<Conflicted>,
+}
+
+/// A write that did not apply because a key it READ had moved (M2): which
+/// write, which key, and what the tree holds there now (its read token, or
+/// `None`: absent). Told to the app; the write is rolled back and the key is
+/// forgotten here so the next read fetches the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflicted {
+    pub write_id: u64,
+    pub key: Vec<u8>,
+    pub current: Option<[u8; 32]>,
+}
+
+/// The request that carries a write: a `Commit` when it declares reads, else
+/// a plain `Write` (a store's own traffic, e.g. `put` through the trait).
+fn write_request(write_id: u64, reads: Option<&Vec<(Vec<u8>, protocol::Expect)>>, ops: Vec<protocol::Op>) -> Request {
+    match reads {
+        Some(reads) if !reads.is_empty() => Request::Commit { write_id, reads: reads.clone(), ops },
+        _ => Request::Write { write_id, ops },
+    }
 }
 
 impl CachedStore {
+    /// Conflicts told since the last call (M2): each a write rolled back
+    /// because what it read had moved.
+    pub fn take_conflicts(&mut self) -> Vec<Conflicted> {
+        std::mem::take(&mut self.conflicts)
+    }
+
+    /// Forget a key in the copy: the next read fetches what the TREE holds.
+    fn forget_key(&mut self, key: &[u8]) {
+        self.copy.forget_key(key);
+    }
+
     pub fn new(now_ms: Box<dyn Fn() -> u64>) -> CachedStore {
         CachedStore {
             copy: Copy::new(),
@@ -101,6 +139,8 @@ impl CachedStore {
             in_flight_high_water: 0,
             now_ms,
             unheard: std::collections::BTreeMap::new(),
+            reads_of: std::collections::BTreeMap::new(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -242,6 +282,16 @@ impl CachedStore {
             if let Some((write_id, state)) = self.client.own_write_state(&r) {
                 self.on_write_state(write_id, state);
             }
+            // WHICH read no longer held (M2): the key is forgotten — it is
+            // exactly what is known stale here, often the SCHEMA, which no
+            // rolled-back write names (the architect's #1) — and the app is
+            // told. Only this session's.
+            if let protocol::Reply::Conflicted { session, write_id, key, current } = &r {
+                if self.client.session() == Some(*session) {
+                    self.forget_key(key);
+                    self.conflicts.push(Conflicted { write_id: *write_id, key: key.clone(), current: *current });
+                }
+            }
         }
         self.client.on_inbound(bytes);
     }
@@ -283,14 +333,30 @@ impl CachedStore {
             // On the network. THIS is what clears it — and it is also the
             // moment the engine has room again, so the next queued write goes.
             W::Published | W::ParityComplete => {
+                self.reads_of.remove(&write_id);
                 self.copy.published(write_id);
                 self.drain_queued();
             }
             // Terminal and not applied. The edit is not in the tree.
             W::Failed | W::Lost => {
+                self.reads_of.remove(&write_id);
                 let told = self.copy.failed(write_id);
                 self.rolled_back.extend(told.rolled_back_keys);
                 // The commit that was in flight is over, however it ended.
+                self.drain_queued();
+            }
+            // M2: a key it READ had moved, so NOTHING applied. It falls WHOLE
+            // with every later write on its keys (W1, `Copy::fall`), those
+            // keys are FORGOTTEN so no row shows a value the tree lacks (W6),
+            // and it is NEVER re-sent: the same write conflicts the same way,
+            // and what to do next is the app's.
+            W::Conflict => {
+                self.reads_of.remove(&write_id);
+                let told = self.copy.failed(write_id);
+                for k in &told.rolled_back_keys {
+                    self.forget_key(k);
+                }
+                self.rolled_back.extend(told.rolled_back_keys);
                 self.drain_queued();
             }
             // Terminal, not applied, and NEVER acceptable as it is. Rolled
@@ -341,6 +407,7 @@ impl CachedStore {
             | W::ParityComplete
             | W::Failed
             | W::Lost
+            | W::Conflict
             | W::TooLarge { .. } => {
                 self.unheard.remove(&write_id);
             }
@@ -421,16 +488,15 @@ impl CachedStore {
         // a write this copy no longer knows, and the row would never clear.
         // Sent through `dispatch`, so the re-send takes a window slot and
         // restarts its timeout like any send (sdk#179).
-        let request = Request::Write {
-            write_id,
-            ops: edits
-                .into_iter()
-                .map(|(k, v)| match v {
-                    Some(v) => protocol::Op::Put(k, v),
-                    None => protocol::Op::Delete(k),
-                })
-                .collect(),
-        };
+        let ops = edits
+            .into_iter()
+            .map(|(k, v)| match v {
+                Some(v) => protocol::Op::Put(k, v),
+                None => protocol::Op::Delete(k),
+            })
+            .collect();
+        // The SAME Commit: its reads travel with it again.
+        let request = write_request(write_id, self.reads_of.get(&write_id), ops);
         self.dispatch(write_id, request);
     }
 
@@ -460,19 +526,26 @@ impl CachedStore {
     /// Make a write: into the copy, then onto the wire — or REFUSED, before
     /// anything is held, and the refusal returned (craftworks-sdk#180).
     fn submit(&mut self, edits: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<(), Refused> {
+        self.submit_reading(Vec::new(), edits)
+    }
+
+    /// A write that says what it READ (M2): sent as a `Commit`.
+    fn submit_reading(
+        &mut self,
+        reads: Vec<(Vec<u8>, protocol::Expect)>,
+        edits: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), Refused> {
         let write_id = self.next_write_id;
         self.next_write_id += 1;
         let now = (self.now_ms)();
-        let request = Request::Write {
-            write_id,
-            ops: edits
-                .iter()
-                .map(|(k, v)| match v {
-                    Some(v) => protocol::Op::Put(k.clone(), v.clone()),
-                    None => protocol::Op::Delete(k.clone()),
-                })
-                .collect(),
-        };
+        let ops = edits
+            .iter()
+            .map(|(k, v)| match v {
+                Some(v) => protocol::Op::Put(k.clone(), v.clone()),
+                None => protocol::Op::Delete(k.clone()),
+            })
+            .collect();
+        let request = write_request(write_id, Some(&reads), ops);
 
         // NO SESSION, NO WRITE (sdk#146): refused by name, before anything is
         // held, rather than sent under a number another tab shares.
@@ -515,6 +588,9 @@ impl CachedStore {
                 return Err(self.refuse(write_id, why));
             }
         }
+        if !reads.is_empty() {
+            self.reads_of.insert(write_id, reads);
+        }
         self.dispatch(write_id, request);
         Ok(())
     }
@@ -549,8 +625,14 @@ impl Store for CachedStore {
     }
 
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
-        // ONE write, so the engine applies them as one commit.
-        self.submit(
+        self.apply_commit(&[], edits)
+    }
+
+    /// ONE write, so the engine applies them as one commit — with what it READ,
+    /// checked by the engine where it lands (M2).
+    fn apply_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
+        self.submit_reading(
+            reads.to_vec(),
             edits
                 .iter()
                 .map(|(k, e)| match e {
