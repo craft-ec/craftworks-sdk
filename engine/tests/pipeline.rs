@@ -1138,6 +1138,10 @@ fn after_a_disconnect_every_write_publishes_and_its_parity_is_put_without_a_tick
             },
             store.clone(),
         );
+        // A NEW tree, and the engine is told so: a write before the head is
+        // recovered waits for it (sdk#223). This test is about a DISCONNECT
+        // after that, not about recovery.
+        let _ = e.step(Event::HeadMissing);
         let mut seen = Seen::default();
         // Values by reference, so the leaves carry parity over them.
         let mut queue = Vec::new();

@@ -84,8 +84,15 @@ macro_rules! stepped {
 }
 
 /// `Engine::new` with the thread's store, so a converted test reads as it did.
+///
+/// The engine is told the tree is NEW (`HeadMissing`), because a write made
+/// before the head is recovered waits for it (sdk#223) and these tests write
+/// straight away. A test about recovery itself sends `Start` and its own
+/// answer, which resets this.
 pub fn new_store_params(params: Params) -> Engine<Store> {
-    Engine::new(params, Store::default())
+    let mut e = Engine::new(params, Store::default());
+    let _ = e.step(Event::HeadMissing);
+    e
 }
 
 impl Store {
@@ -196,7 +203,11 @@ pub struct Harness {
 
 impl Harness {
     pub fn new(mode: Mode, params: Params, store: Store) -> Self {
-        let e = Engine::new(params, store.clone());
+        let mut e = Engine::new(params, store.clone());
+        // A NEW tree, and the engine is told so: a write before recovery
+        // waits for it (sdk#223). A test that reads a head (`Start` then
+        // `HeadRead`) resets and redoes this, as `Start` does.
+        let _ = e.step(Event::HeadMissing);
         let ctx = e.to_context().expect("a fresh engine has a context");
         Harness {
             mode,
@@ -319,6 +330,9 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
         .iter()
         .map(|(k, v)| (k.clone(), Op::Put(v.clone())))
         .collect();
+    // A NEW tree: there is no head to recover, and the engine is told so. A
+    // write before recovery waits for it (sdk#223), so this writer says it.
+    let _ = w.step(Event::HeadMissing);
     let mut queue = {
         let out = w.step(Event::Write {
             client: ClientId(1),

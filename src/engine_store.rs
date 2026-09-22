@@ -264,7 +264,22 @@ impl<T: Transport> EngineStore<T> {
             .collect();
 
         self.outbox.push_reading(write_id, edits, pre, reads);
+        self.drive_outbox(&keys);
+    }
 
+    /// Send what is QUEUED, with no new edit of its own.
+    ///
+    /// The page does this on its tick. It is what a write refused `Busy`, or
+    /// one the engine has not answered yet — parked until the head is
+    /// recovered (sdk#223) — waits for: without it, a write made at open sits
+    /// in the outbox until the app happens to write again.
+    pub fn drain_queued(&mut self) {
+        self.drive_outbox(&[]);
+    }
+
+    /// One bounded pass of the outbox. `keys` are the keys of the write just
+    /// submitted, for comparing a `Lost` one against what is there now.
+    fn drive_outbox(&mut self, keys: &[Vec<u8>]) {
         let mut rounds = 0;
         while !self.outbox.is_empty() {
             rounds += 1;
@@ -315,7 +330,7 @@ impl<T: Transport> EngineStore<T> {
                         // and never re-sent (the outbox ends it).
                         WriteState::Conflict => {
                             self.outbox.settle(id, state);
-                            self.client.events.push(Event::Conflict { write_id: id, keys: keys.clone() });
+                            self.client.events.push(Event::Conflict { write_id: id, keys: keys.to_vec() });
                         }
                         other => {
                             if other == WriteState::Busy {

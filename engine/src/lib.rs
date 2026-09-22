@@ -1006,6 +1006,14 @@ impl<B: Blocks> Blocks for WithEmptyLeaf<'_, B> {
     }
 }
 
+/// A write waiting for the HEAD to be recovered: whose it is, and what it
+/// asked for — the ops it makes and the reads it was made against.
+///
+/// Engine-local, and deliberately not in the context: a rebuild loses it, and
+/// nothing is lost with it, because the write was answered `Accepted` and the
+/// client's outbox keeps an accepted write until it is PUBLISHED.
+type WriteBeforeHead = (ClientId, WriteId, Vec<(Vec<u8>, Op)>, Vec<(Vec<u8>, Expect)>);
+
 pub struct Engine<B: Blocks> {
     /// The empty leaf, which a device with no head has as its root and which
     /// nothing on the network holds until the first commit publishes it.
@@ -1101,6 +1109,14 @@ pub struct Engine<B: Blocks> {
     /// had not been read to find. They wait here, and are answered — in order —
     /// the moment `HeadRead` or `HeadMissing` recovers the root.
     before_head: Vec<(ClientId, read::ReqId, read::Want)>,
+    /// A WRITE that arrived before the head was recovered (sdk#223's other
+    /// half). Applied to the EMPTY tree it would commit a head that knows
+    /// nothing of the one it should build on — a fork of the person's own tree.
+    /// So it waits, like a read, and is applied the moment `HeadRead` or
+    /// `HeadMissing` recovers the root. At most ONE, as a commit is: a second
+    /// write before recovery is `Busy`, the answer it gets while one is in
+    /// flight.
+    before_head_write: Option<WriteBeforeHead>,
     /// Notifications raised while applying a write — a group superseded part
     /// way through — collected here so `on_write` can return them with the
     /// rest rather than dropping them.
@@ -1231,6 +1247,7 @@ impl<B: Blocks> Engine<B> {
             head_epoch: None,
             recovered: false,
             before_head: Vec::new(),
+            before_head_write: None,
             pending_notifications: Vec::new(),
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
@@ -1564,6 +1581,7 @@ impl<B: Blocks> Engine<B> {
         let mut changed = self.adopt(seq, root);
         self.recovered = true;
         changed.extend(self.release_before_head());
+        changed.extend(self.release_before_head_write());
         // The tree is not walked here. Reads warm it lazily (slice 2), which
         // is also what makes a restart cheap: the engine is usable the moment
         // it knows its root.
@@ -1593,6 +1611,7 @@ impl<B: Blocks> Engine<B> {
         // A device that has never written: its tree IS empty, so the reads
         // that waited are answered from it — empty and complete, now truly.
         changed.extend(self.release_before_head());
+        changed.extend(self.release_before_head_write());
         changed
     }
 
@@ -1834,6 +1853,15 @@ impl<B: Blocks> Engine<B> {
         }
         self.before_head.push((client, req_id, want));
         Vec::new()
+    }
+
+    /// The head is recovered: apply the write that waited for it, on the
+    /// recovered root.
+    fn release_before_head_write(&mut self) -> Vec<Effect> {
+        match self.before_head_write.take() {
+            Some((client, write_id, ops, reads)) => self.on_write(client, write_id, ops, reads),
+            None => Vec::new(),
+        }
     }
 
     /// The head is recovered: answer every read that waited for it, in the
@@ -2116,6 +2144,22 @@ impl<B: Blocks> Engine<B> {
         // which has a page and an outbox; the delegate has neither. `Busy`
         // says so, and leaves no trace — a write both applied and refused is
         // the worst of both.
+        // BEFORE THE HEAD IS RECOVERED the tree is the empty one: a write
+        // applied now would commit a head blind to the real one. It waits
+        // (`before_head_write`); a second one is Busy, as during a commit.
+        if !self.recovered {
+            if self.before_head_write.is_some() || self.pending.is_some() || self.parked_write.is_some() {
+                return vec![Effect::Notify { client, write_id, state: State::Busy }];
+            }
+            self.before_head_write = Some((client, write_id, ops, reads));
+            // ANSWERED, not silently held. `Accepted` is what it is: the
+            // engine has the write and nothing is on the network yet. Saying
+            // nothing leaves the client's outbox believing the write is still
+            // in flight, so nothing re-sends it and nothing reports it —
+            // which is what the page's own `held_writes` did (measured: five
+            // writes made at open sat in the outbox for ever).
+            return vec![Effect::Notify { client, write_id, state: State::Accepted }];
+        }
         if self.pending.is_some() || self.parked_write.is_some() {
             return vec![Effect::Notify {
                 client,
