@@ -329,11 +329,9 @@ impl Server {
         for f in own {
             match f {
                 Effect::Reply { req_id, result, .. } => self.on_own_read(req_id.0, result),
-                Effect::Notify { write_id, state, .. } => {
-                    if self.on_merge_verdict(write_id.0, state, now) {
-                        published_here = true;
-                        merge_done = true;
-                    }
+                Effect::Notify { write_id, state, .. } if self.on_merge_verdict(write_id.0, state, now) => {
+                    published_here = true;
+                    merge_done = true;
                 }
                 _ => {}
             }
