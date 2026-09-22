@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,36 @@ function accept(baseline, counts, failed = 0, extra = []) {
   return { rc: r.status, err: r.stderr, unchanged: sha(b) === before, now: readFileSync(b, "utf8") };
 }
 const BASE = "craftworks-sdk=221\nengine=78\nnpm=146\n";
+
+t("**a baseline that CANNOT be written is a failure naming it — never 'recorded' (sdk#252)**", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gate-accept-ro-"));
+  const b = join(dir, "gate.baseline"), c = join(tmpdir(), `gate-accept-counts-${process.pid}`);
+  writeFileSync(b, BASE); writeFileSync(c, "craftworks-sdk=222\nengine=78\nnpm=146\n");
+  chmodSync(dir, 0o555); // the directory refuses the rename, as a full disk refuses the write
+  try {
+    const r = spawnSync("/bin/bash", [helper, b, "0", c], { encoding: "utf8" });
+    assert.notEqual(r.status, 0, `a write that failed exited 0: ${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /FAILED to write .*gate\.baseline/);
+    assert.doesNotMatch(r.stdout, /recorded/, "it said 'recorded' about counts it did not record");
+    assert.equal(readFileSync(b, "utf8"), BASE, "the baseline changed");
+  } finally { chmodSync(dir, 0o755); }
+});
+
+t("**free space is checked again RIGHT BEFORE writing: under the floor, refused, byte-identical**", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gate-accept-"));
+  const b = join(dir, "gate.baseline"), c = join(dir, "counts");
+  writeFileSync(b, BASE); writeFileSync(c, "craftworks-sdk=222\nengine=78\nnpm=146\n");
+  const r = spawnSync("/bin/bash", [helper, b, "0", c], { encoding: "utf8", env: { ...process.env, GATE_MIN_GIB: "5", GATE_FREE_GIB_FOR_TEST: "2" } });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /2 GiB free, under 5 GiB, right before writing/);
+  assert.equal(readFileSync(b, "utf8"), BASE);
+});
+
+t("THE CONTROL: a writable baseline with room is recorded and reads back identical", () => {
+  const r = accept(BASE, "craftworks-sdk=222\nengine=78\nnpm=146\n");
+  assert.equal(r.rc, 0, r.err);
+  assert.equal(r.now, "craftworks-sdk=222\nengine=78\nnpm=146\n");
+});
 
 t("**a run in which a STEP FAILED is refused, and the baseline is byte-identical**", () => {
   // Counts that only RISE, so the loss check cannot be what refuses it: the
