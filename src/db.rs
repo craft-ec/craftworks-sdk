@@ -648,8 +648,19 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                         step.events.push(RerunEvent::Failed { write_id: id, reason: format!("field `{gone}` is no longer in `{domain}`'s schema") });
                         continue;
                     }
-                    let dropped: Vec<String> = patch.keys().filter(|f| theirs(f)).cloned().collect();
-                    let mine: Map<String, Value> = patch.iter().filter(|(f, _)| !theirs(f)).map(|(f, v)| (f.clone(), v.clone())).collect();
+                    // ALREADY SATISFIED (sdk#145's second layer): a field that
+                    // already holds this patch's value is neither lost nor
+                    // written again. That is the case of this write's own
+                    // re-send after a lost answer, when it is stored already:
+                    // it conflicts (its read no longer holds), and it must not
+                    // be told "dropped" for a change that is there.
+                    let holds = |f: &String, v: &Value| match cur.get(f) {
+                        Some(c) => c == v,
+                        None => v.is_null(),
+                    };
+                    let dropped: Vec<String> = patch.iter().filter(|(f, v)| !holds(f, v) && theirs(f)).map(|(f, _)| f.clone()).collect();
+                    let mine: Map<String, Value> =
+                        patch.iter().filter(|(f, v)| !holds(f, v) && !theirs(f)).map(|(f, v)| (f.clone(), v.clone())).collect();
                     if !dropped.is_empty() {
                         step.events.push(RerunEvent::Dropped { write_id: id, fields: dropped });
                     }

@@ -393,3 +393,38 @@ fn a_delete_of_a_record_read_absent_that_now_exists_conflicts() {
     assert_eq!(states(&fx, 2), vec![State::Conflict], "a delete over a record created since its read went through");
     assert_eq!(value_at(&h.store, &h.published_root(), b"r").as_deref(), Some(&b"made elsewhere"[..]));
 }
+
+/// sdk#145, THE LOST ANSWER: w3 (title t1, read the record at v0) and w4
+/// (body b1, read it at w3's value) both publish. w3's answer was lost, and
+/// w3 is re-sent byte for byte, WITH ITS READS. Its read no longer holds and
+/// its value is not what is there, so it is a Conflict: it applies NOTHING
+/// (root unchanged, no block, no head), and w4's body stands. The engine
+/// remembers no published id; the read set is what refuses the re-send.
+/// (Without reads a re-send is still applied as new: the named residual, a
+/// store-level blind write only. Every `Db` write carries its reads.)
+/// Control: a NEW write with a read that holds applies — refusal is by what
+/// the write read, not by its bytes.
+#[test]
+fn a_re_sent_write_whose_answer_was_lost_applies_nothing_and_undoes_nothing() {
+    for mode in [Mode::Live, Mode::Rehydrate] {
+        let mut h = fresh(mode);
+        let fx = h.step(write(1, &[(b"rec", Some(b"t0 b0"))], vec![]));
+        settle(&mut h, fx);
+        let w3 = |id| write(id, &[(b"rec", Some(b"t1 b0"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t0 b0")))]);
+        let fx = h.step(w3(3));
+        assert!(states(&settle(&mut h, fx), 3).contains(&State::Published), "{mode:?}");
+        let fx = h.step(write(4, &[(b"rec", Some(b"t1 b1"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t1 b0")))]));
+        assert!(states(&settle(&mut h, fx), 4).contains(&State::Published), "{mode:?}");
+        let before = h.published_root();
+        let fx = h.step(w3(3));
+        assert_eq!(states(&fx, 3), vec![State::Conflict], "{mode:?}: the re-send was not refused");
+        assert!(!fx.iter().any(|f| matches!(f, Effect::PutBlock { .. } | Effect::UpdateHead { .. })), "{mode:?}: the re-send wrote something");
+        let all = settle(&mut h, fx);
+        assert!(!states(&all, 3).contains(&State::Published), "{mode:?}");
+        assert_eq!(h.published_root(), before, "{mode:?}: the re-send moved the tree");
+        assert_eq!(value_at(&h.store, &h.published_root(), b"rec").as_deref(), Some(&b"t1 b1"[..]), "{mode:?}: w4 was undone");
+        // The control: a NEW write, its read holding, applies.
+        let fx = h.step(write(5, &[(b"rec", Some(b"t1 b0"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t1 b1")))]));
+        assert!(states(&settle(&mut h, fx), 5).contains(&State::Published), "{mode:?}: the control did not apply");
+    }
+}

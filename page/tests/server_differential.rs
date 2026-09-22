@@ -1584,3 +1584,24 @@ fn a_re_run_whose_record_never_loads_fails_at_the_load_budget() {
     assert!(tab.db.rerun(t0 + budget + 1, budget).events.is_empty(), "told twice");
     assert_eq!(tab.sends.range(w + 1..).count(), 0, "a re-run was written without its record");
 }
+
+/// ALREADY SATISFIED (sdk#145's second layer): the other side made the SAME
+/// change (their title t1, this tab's stale title t1). Nothing was lost, so
+/// nothing is told and nothing is written again. The same shape as this
+/// tab's own re-send after a lost answer, when the write is stored already.
+#[test]
+fn a_stale_update_the_other_side_already_made_is_satisfied_silently() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
+    let theirs = their_record(&mut tab, &rerun_schema(), &key, serde_json::json!({ "title": "t1", "note": "n1" }));
+    elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)]);
+    let w = tab.db.store_mut().next_write_id();
+    tab.db.update("t", loc, &obj(serde_json::json!({ "title": "t1" }))).expect("the update is made");
+    let (events, raw) = settle(&mut tab, &mut rig, &mut node);
+    assert!(events.is_empty(), "a change that is there was told lost: {events:?}");
+    assert!(raw.is_empty(), "{raw:?}");
+    assert_eq!(tab.sends.range(w + 1..).count(), 0, "a satisfied change was written again");
+    let rec = published_record(&node, &rerun_schema(), &key).expect("published");
+    assert_eq!((rec.get("title"), rec.get("note")), (Some(&serde_json::json!("t1")), Some(&serde_json::json!("n1"))));
+}
