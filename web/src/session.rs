@@ -58,19 +58,6 @@ pub struct Session {
     /// that reacted to any of them would reload on somebody else's contract.
     /// A count is also the thing that says whether it is happening at all.
     foreign_notifications: usize,
-    /// Whether this connection has ASKED the node to watch the head.
-    ///
-    /// Reset on reconnect, not remembered: the node's copy of a subscription
-    /// outlives the engine's context and can be evicted at its cap without
-    /// anyone being told (F39), so a new connection asks again. Re-asking is
-    /// idempotent at the node, so it costs nothing when nothing was lost.
-    subscribed: bool,
-    /// Whether the node ACCEPTED it.
-    ///
-    /// Distinct from having asked, and the distinction is the whole point: a
-    /// page that believed it was being notified while it was actually
-    /// polling is the failure `LiveMode` exists to make impossible.
-    watching: bool,
     /// What this page has bound, so a head move can name what is stale: watch
     /// keys (`Db::watch_key`) — a domain, or one parent's band of it.
     bound: std::collections::BTreeSet<String>,
@@ -80,11 +67,6 @@ pub struct Session {
     /// rather than through a fake session written in JavaScript — which
     /// compiles this file and runs none of it.
     refresh: craftworks_sdk::Refresh,
-    /// When the subscribe request went out, so an unanswered one does not sit
-    /// at "asked" for ever.
-    asked_at_ms: u64,
-    /// The node refused to watch the head, in its own words. Display only.
-    watch_refused: String,
     /// The head moved. Set by a notification, drained by the page.
     ///
     /// A HINT and never an authority: a fabricated one costs a reload, and a
@@ -171,15 +153,11 @@ impl Session {
             head_root: [0u8; 32],
             head_id: [0u8; 32],
             head_named: String::new(),
-            subscribed: false,
             foreign_notifications: 0,
-            watching: false,
             head_moved: false,
             seen_published: (0, [0u8; 32]),
             bound: std::collections::BTreeSet::new(),
             refresh: craftworks_sdk::Refresh::new(),
-            asked_at_ms: 0,
-            watch_refused: String::new(),
             cold: craftworks_sdk::cold::ColdReads::default(),
             cold_contract: None,
             cold_chosen: false,
@@ -680,48 +658,27 @@ impl Session {
     /// shows which one a component really has, so a binding that silently
     /// fell back to polling cannot look like one that did not.
     pub fn live_mode(&self) -> String {
-        let waited = crate::js_now_ms().saturating_sub(self.asked_at_ms);
+        // THE PAGE PATH'S SUBSCRIPTION IS PAGE-IO'S (sdk#259). The head is
+        // read by GET with `subscribe`, and the node's answer to THAT is what
+        // makes this page live. This used to report the Session's own
+        // `watching`, set by the delegate path's `watch_head` — which the
+        // switch-over deleted, so it was false for ever: a page subscribed
+        // the whole time said "Polled", and the two-tab probe read its number
+        // as "the tick's number wearing a different name".
         let tick = " The tick keeps the data right meanwhile.";
-        let (mode, why) = if self.watching {
-            ("HeadSubscribed", String::new())
-        } else if !self.watch_refused.is_empty() {
-            let said = &self.watch_refused;
-            (
-                "Polled",
-                format!("the node refused to watch the head: {said}.{tick}"),
-            )
-        } else if !self.provisioned() {
-            (
-                "Polled",
-                "this node is not provisioned, so there is no head to watch".to_string(),
-            )
-        } else if self.head_id == [0u8; 32] {
-            (
-                "Polled",
-                "the engine has not named a head contract yet".to_string(),
-            )
-        } else if self.subscribed && waited > WATCH_ANSWER_MS {
-            // ASKED AND NEVER ANSWERED. Without this it sits at "asked" for
-            // ever and a page shows a subscription it does not have.
-            (
-                "Polled",
-                format!("asked to watch the head and the node never answered.{tick}"),
-            )
-        } else if self.subscribed {
-            (
-                "Polled",
-                "the node has not accepted the subscription yet".to_string(),
-            )
-        } else {
-            (
-                "Polled",
-                "no subscription has been asked for on this connection".to_string(),
-            )
+        let (asked, answered, changes) = self.page.as_ref().map(|p| p.head_subscription()).unwrap_or((false, false, 0));
+        let (mode, why) = match (asked, answered) {
+            (_, true) => ("HeadSubscribed", String::new()),
+            (true, false) => ("Polled", format!("the head read with subscribe has not been answered yet.{tick}")),
+            (false, false) => ("Polled", "the head has not been read on this connection yet".to_string()),
         };
         serde_json::json!({
             "mode": mode,
             "why": why,
             "foreignNotifications": self.foreign_notifications,
+            // What the subscription has DELIVERED, so "subscribed" can be told
+            // from "subscribed and being told".
+            "headChanges": changes,
         })
         .to_string()
     }
@@ -1037,12 +994,8 @@ impl Session {
     /// The step in flight is re-issued by `tick`, not here, because a reply
     /// may have been sent before the socket dropped and arrive on the new one.
     pub fn reconnected(&mut self) {
-        // The node's copy of a subscription outlives the engine's context and
-        // can be evicted at its cap without anyone being told (F39), so this
-        // connection asks again. Idempotent at the node, so it costs nothing
-        // when nothing was lost.
-        self.subscribed = false;
-        self.watching = false;
+        // The head subscription is page-io's, and it re-reads the head on the
+        // new connection: nothing to reset here (sdk#259).
         // An app PUT's answer sent on the old socket never arrives on this one.
         self.puts.connection_lost();
     }
@@ -1634,13 +1587,6 @@ impl Session {
     }
 }
 
-/// How long a subscribe request may go unanswered before this session says
-/// it is polling.
-///
-/// Not a claim about the network: a bound on the WAIT, so a page never shows
-/// a subscription it does not have. The tick keeps the data right either way,
-/// which is why this can be short.
-const WATCH_ANSWER_MS: u64 = 10_000;
 
 /// The request ids preload uses, kept away from the app's own.
 const PRELOAD_REQ_BASE: u64 = 1 << 32;

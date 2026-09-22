@@ -949,3 +949,29 @@ fn opening_is_stalled_while_unanswered_and_exhausted_when_the_reasks_are_spent()
     let (page, _) = opening(&mut silent, &mut now, &[29u8; 32], false);
     assert!(page.exhausted() && page.refused().is_none() && !page.stalled(), "exhausted {} refused {:?} stalled {}", page.exhausted(), page.refused(), page.stalled());
 }
+
+/// sdk#259: page-io reports the head subscription AS IT IS — asked, answered,
+/// and how many head moves it has delivered. On the page path this is what
+/// `LiveMode` is built from: the Session's own `watching` belongs to the
+/// delegate path the switch-over deleted, so a page that held the
+/// subscription the whole time reported "Polled" and a probe read its number
+/// as "the tick's wearing a different name".
+#[test]
+fn page_io_says_whether_the_head_subscription_was_asked_answered_and_delivering() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 0u64;
+
+    // Before anything is sent: nothing asked, nothing answered. NOT "live".
+    assert_eq!(io.head_subscription(), (false, false, 0), "page-io claimed a subscription before it read the head");
+
+    let _ = client(&mut io, &mut node, &mut now, &Request::Identity);
+    println!("  after Identity (no head yet): {:?}", io.head_subscription());
+    assert!(io.head_subscription().0, "the head was never read with subscribe, so nothing can notify this page");
+
+    // The first write CREATES the head register, and the page reads it again.
+    let _ = client(&mut io, &mut node, &mut now, &write(1, "k/1", "v"));
+    println!("  after the first write (the head exists): {:?}", io.head_subscription());
+    let (asked, answered, _) = io.head_subscription();
+    assert!(asked && answered, "the page holds no answered head read once the head exists: nothing can notify it");
+}

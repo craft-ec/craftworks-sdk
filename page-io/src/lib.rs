@@ -59,6 +59,15 @@ pub struct PageIo {
     /// The Register exists on the node: this page read it, or its PUT was
     /// answered. Until then a head goes out as a PUT, which creates it.
     register_seen: bool,
+    /// THE HEAD SUBSCRIPTION, as page-io can honestly report it (sdk#259):
+    /// whether the GET-with-subscribe has been SENT, whether the node has
+    /// ANSWERED it, and how many head moves it has delivered. A page that
+    /// believed it was being notified while it was polling is the failure
+    /// `LiveMode` exists to make impossible, and on the page path the
+    /// subscription is page-io's, not the Session's.
+    head_asked: bool,
+    head_answered: bool,
+    head_changes: usize,
     /// Blocks in flight, by contract id and by key string (a PUT's answer
     /// names the key).
     by_contract: BTreeMap<[u8; 32], Cid>,
@@ -169,6 +178,9 @@ impl PageIo {
             register_id,
             register_key,
             register_seen: false,
+            head_asked: false,
+            head_answered: false,
+            head_changes: 0,
             by_contract: BTreeMap::new(),
             by_key: BTreeMap::new(),
             held: BTreeMap::new(),
@@ -367,6 +379,15 @@ impl PageIo {
     }
 
     /// The head Register's instance id (what `Identity` reports as `head_id`).
+    /// THE HEAD SUBSCRIPTION AS IT REALLY IS (sdk#259): asked, answered, and
+    /// how many head moves it has delivered. The page path's `LiveMode` is
+    /// built from this — the Session's own `subscribed`/`watching` belong to
+    /// the delegate path, which no longer exists, so reporting from them said
+    /// "Polled" on a page that was subscribed the whole time.
+    pub fn head_subscription(&self) -> (bool, bool, usize) {
+        (self.head_asked, self.head_answered, self.head_changes)
+    }
+
     pub fn register_id(&self) -> [u8; 32] {
         self.register_id
     }
@@ -403,6 +424,9 @@ impl PageIo {
             Incoming::Got { id, state } => {
                 if id == self.register_id {
                     self.register_seen = true;
+                    // The GET that carried `subscribe` was answered: the node
+                    // holds this page's subscription to the head (sdk#259).
+                    self.head_answered = true;
                     // The head WHOLE (root ‖ ledger), tolerantly: the root is
                     // the value's first 32 bytes whatever ledger follows.
                     self.server.node(Answer::Head(page::HeadRead::from_record(&state)), now);
@@ -540,7 +564,12 @@ impl PageIo {
             // The head moved on the node (the subscription the head read
             // took): the RELOAD TRIGGER. A hint only — the page READS the
             // register and adopts only what that read shows (sdk#225).
-            Incoming::HeadChanged { key } if key == self.register_key => self.server.head_hint(),
+            Incoming::HeadChanged { key } if key == self.register_key => {
+                // What the subscription DELIVERED: counted, so "subscribed"
+                // can be told from "subscribed and being told" (sdk#259).
+                self.head_changes += 1;
+                self.server.head_hint();
+            }
             Incoming::Refused(r) => {
                 // While the first exchange is unanswered, a refusal that names
                 // nothing is the node refusing IT: opening ends, by name.
@@ -729,7 +758,10 @@ impl PageIo {
                     self.by_contract.insert(contract, id);
                     wire::frame_get(wire::contract_id(contract), false, stream)
                 }
-                Op::ReadHead => wire::frame_get(wire::contract_id(self.register_id), true, stream),
+                Op::ReadHead => {
+                    self.head_asked = true;
+                    wire::frame_get(wire::contract_id(self.register_id), true, stream)
+                }
                 Op::Update { state } => {
                     if self.register_seen {
                         wire::frame_update(self.register.key(), state, stream)
