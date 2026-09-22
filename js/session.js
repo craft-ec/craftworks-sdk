@@ -319,9 +319,16 @@ export async function openSession(Session, {
     },
   };
 
+  // WHETHER THIS PAGE EVER REACHED THE NODE. A socket that never opened and a
+  // node that never answers are different failures with different fixes, and
+  // only this tells them apart: page-io counts unanswered asks either way, so
+  // an unopened socket would otherwise be reported as "the signer is not
+  // answering" when the node is simply not running (sdk#263 follow-up).
+  let everOpened = false;
   const conn = connectWith(socketEngine, {
     url: session.url(),
     onEvent: e => {
+      if (e.kind === "open") everOpened = true;
       // A new socket means the stream ids restart, so a half-received
       // chunked reply from the old one must not be completed with bytes
       // from this one.
@@ -497,6 +504,10 @@ export async function openSession(Session, {
     // caller that asks is not broken.
     exhausted: () => session.exhausted(),
     refused: () => session.refused(),
+    /** Has a socket to this node EVER opened? See `everOpened`. */
+    connectedOnce: () => everOpened,
+    /** Which node this session is for, as the page named it. */
+    url: () => session.url(),
     unusable: () => JSON.parse(session.unusable()),
     // `engineDb` registers its drain here, so a completed load reaches the
     // reads waiting on it. Without this every read that missed the cache
@@ -575,9 +586,15 @@ export async function open(Session, opts = {}) {
 }
 
 /**
- * Until the node says it is provisioned — or that it cannot be. Three ends,
- * never one timeout: refused (the signer's or the node's words), exhausted
- * (page-io's re-asks are spent), or the budget.
+ * Until the node says it is provisioned — or that it cannot be. Four ends,
+ * never one timeout: refused (the signer's or the node's words), NOT RUNNING
+ * (no socket ever opened), exhausted (page-io's re-asks are spent), or the
+ * budget.
+ *
+ * The not-running end comes FIRST among the failures, because page-io counts
+ * an unanswered ask the same way whether the node ignored it or was never
+ * there — and "the signer is not answering" sends someone to look at a node
+ * that is not running (sdk#263 follow-up).
  */
 export async function untilProvisioned(handle, {
   provisionBudgetMs = 60_000, provisionEveryMs = 100,
@@ -589,9 +606,18 @@ export async function untilProvisioned(handle, {
     if (handle.provisioned()) return;
     const refused = handle.refused?.();
     if (refused) throw new Error(`the node refused to set up: ${refused}`);
-    if (handle.exhausted?.()) throw new Error("the signer is not answering: every re-ask was spent and the node is still not provisioned");
+    const never = handle.connectedOnce ? !handle.connectedOnce() : false;
+    const at = handle.url?.() ? ` at ${handle.url()}` : "";
+    if (handle.exhausted?.()) {
+      throw new Error(never
+        ? `nothing answered${at}: no connection was ever made — is the node running?`
+        : "the signer is not answering: every re-ask was spent and the node is still not provisioned");
+    }
     if (clock() - started > provisionBudgetMs) {
-      throw new Error(`the node did not finish setting up in ${Math.round(provisionBudgetMs / 1000)} s; is it running?`);
+      const secs = Math.round(provisionBudgetMs / 1000);
+      throw new Error(never
+        ? `nothing answered${at} in ${secs} s: no connection was ever made — is the node running?`
+        : `the node did not finish setting up in ${secs} s; is it running?`);
     }
     await new Promise(r => afterMs(r, provisionEveryMs));
   }
