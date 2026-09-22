@@ -75,7 +75,14 @@ fn the_page_reports_head_moves_and_own_write_states() {
     let pump = body_of(&src, "pump_page");
     assert!(pump.contains("p.server.page.published()") && pump.contains("self.head_moved = true"), "a published head move does not mark the head moved:\n{pump}");
     let own = body_of(&src, "take_state_changed");
-    assert!(own.contains(".take_state_changed()") && own.contains("domain_of_key"), "own write states are not reported by domain:\n{own}");
+    // By the APP-RELATIVE domain (`own_domains_of_keys`, pinned natively in
+    // tests/cached_store.rs): this used to require `domain_of_key` here, which
+    // is the STORED `<app>.<name>` since craftworks-sdk#267 — keyed by no
+    // binding, so a plain table said "saving" for good (builder#107, back).
+    assert!(
+        own.contains(".take_state_changed()") && own.contains("own_domains_of_keys") && own.contains("self.app"),
+        "own write states are not reported by the app-relative domain the bindings are keyed by:\n{own}"
+    );
 }
 
 /// sdk#266: the Session ROUTES adoption and the re-ask. The decisions are
@@ -131,4 +138,18 @@ fn live_mode_reports_the_pages_own_head_subscription() {
     for literal in ["\"HeadSubscribed\"", "\"Polled\""] {
         assert!(!body.contains(literal), "live_mode decides a mode itself ({literal}), outside the mapping the native test pins:\n{body}");
     }
+}
+
+/// A loaded page is recorded at the root it was READ at (`at.root`), never at
+/// `head_root` — which is set from `Identity` only and stays the first head
+/// on the page path. Recorded at the stale root, every load after a delta
+/// looked like another tree and wiped the whole copy (measured in sdk#282's
+/// acceptance run: a read of another app's notes answered NOT_LOADED for ever).
+#[test]
+fn a_loaded_page_is_recorded_at_the_root_it_was_read_at() {
+    let src = session_src();
+    let at = src.find("craftworks_sdk::loads::Page::Complete { lo, hi, rows, at } =>").expect("the page-complete arm");
+    let arm = &src[at..at + src[at..].find("craftworks_sdk::loads::Page::Restart").expect("the next arm")];
+    assert!(arm.contains("on_page(&lo, &hi, rows, at.root)"), "a completed page is not recorded at the root it was read at:\n{arm}");
+    assert!(!arm.contains("self.head_root"), "a completed page is recorded at head_root, the stale first head:\n{arm}");
 }
