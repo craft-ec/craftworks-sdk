@@ -983,3 +983,57 @@ fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
         }
     }
 }
+
+/// A TIP OF TWO WRITES (main's condition on Z5): a commit carries ONE write —
+/// the engine refuses a second with `Busy` — so a tip holds more than one only
+/// through a NO-OP write Published at the same head (sdk#160), whose value at
+/// every key is the tree's there. Here the second write puts the SAME bytes at
+/// the record's key; it publishes at the same head, joining the tip. A
+/// same-seq winner without the record then tells BOTH writes Superseded on
+/// that key — each write its own reply, the same row.
+#[test]
+fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
+    use signer_proto::head::{value, Ledger};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.db.define("t", &tab_schema()).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+    let w1 = tab.db.store_mut().next_write_id() - 1;
+    tab.pump(&mut rig, &mut node);
+    let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
+    let key = craftworks_sdk::db::record_key("t", loc);
+    let head = node.head().expect("published");
+    let bytes = node.tree(&head.1).expect("whole").get(&key).cloned().expect("the record is in the tip");
+    // The same bytes again: a no-op, Published at the same head.
+    let w2 = tab.db.store_mut().next_write_id();
+    craftworks_sdk::store::Store::apply_commit(
+        tab.db.store_mut(),
+        &[(key.clone(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(&bytes)))],
+        &[(key.clone(), craftworks_sdk::store::Edit::Put(bytes.clone()))],
+    )
+    .expect("the store took it");
+    tab.pump(&mut rig, &mut node);
+    assert!(tab.verdicts.get(&w2).is_some_and(|v| v.contains(&protocol::WriteState::Published)), "the second write did not publish: {:?}", tab.verdicts.get(&w2));
+    assert_eq!(node.head(), Some(head), "the second write moved the head: it was not a no-op, the tip is one write");
+    // Displaced at its own seq by a winner without the record.
+    let hr = node.head_read().expect("a head");
+    let base = hr.prev().expect("a prev");
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let mut salt = 0u8;
+    let st = loop {
+        let r = device_tree(&mut node, &[(b"other".to_vec(), vec![salt])]);
+        let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
+        if page::beats(&v, hr.value()) {
+            break engine_delegate::register::head_state(&node.register_params, &key_of, head.0, &v).expect("signs");
+        }
+        salt += 1;
+    };
+    node.update(&st);
+    rig.server.head_hint();
+    tab.pump(&mut rig, &mut node);
+    let mut told: Vec<(u64, Vec<Vec<u8>>)> = tab.db.store_mut().take_superseded().into_iter().map(|s| (s.write_id, s.keys)).collect();
+    told.sort();
+    assert_eq!(told, vec![(w1, vec![key.clone()]), (w2, vec![key.clone()])], "each write of the tip was not told its row");
+}

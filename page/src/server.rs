@@ -105,6 +105,12 @@ struct Tip {
 struct Probe {
     winner: (u64, freenet_prolly::Cid),
     writes: TipWrites,
+    /// What the tip left at each key: ONE value per key, because every tip
+    /// write agrees there. A commit carries ONE write (the engine refuses a
+    /// second with `Busy`; `folded` is a handoff, never a queue), and the
+    /// tip's other writes are no-op writes Published at the same head
+    /// (sdk#160), whose value at every key IS the tree's there. Debug-asserted.
+    left: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     pending: BTreeMap<u64, Vec<u8>>,
     superseded: std::collections::BTreeSet<Vec<u8>>,
 }
@@ -246,8 +252,8 @@ impl Server {
             Effect::Reply { client, req_id, result } if *client == PROBE_CLIENT => {
                 if let Some(p) = self.probe.as_mut() {
                     if let Some(key) = p.pending.remove(&req_id.0) {
-                        let want = p.writes.iter().rev().find_map(|(_, fin)| fin.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone()));
-                        let holds = matches!(result, engine::read::ReadResult::Value(v) if Some(v.clone()) == want);
+                        let want = p.left.get(&key);
+                        let holds = matches!(result, engine::read::ReadResult::Value(v) if Some(v) == want);
                         if !holds {
                             p.superseded.insert(key);
                         }
@@ -303,9 +309,14 @@ impl Server {
     }
 
     fn start_probe(&mut self, winner: (u64, freenet_prolly::Cid), writes: TipWrites) {
-        let mut keys: Vec<Vec<u8>> = writes.iter().flat_map(|(_, fin)| fin.iter().map(|(k, _)| k.clone())).collect();
-        keys.sort();
-        keys.dedup();
+        let mut left: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        for (_, fin) in &writes {
+            for (k, v) in fin {
+                let was = left.insert(k.clone(), v.clone());
+                debug_assert!(was.is_none_or(|w| w == *v), "two writes of one tip disagree at a key: a commit carries one write, the rest are no-ops");
+            }
+        }
+        let keys: Vec<Vec<u8>> = left.keys().cloned().collect();
         let mut pending = BTreeMap::new();
         let mut reqs = Vec::new();
         for key in keys {
@@ -314,7 +325,7 @@ impl Server {
             pending.insert(rid, key.clone());
             reqs.push((rid, key));
         }
-        self.probe = Some(Probe { winner, writes, pending, superseded: Default::default() });
+        self.probe = Some(Probe { winner, writes, left, pending, superseded: Default::default() });
         for (rid, key) in reqs {
             self.page.event(Event::Get { client: PROBE_CLIENT, req_id: as_req_id(rid), key });
         }
