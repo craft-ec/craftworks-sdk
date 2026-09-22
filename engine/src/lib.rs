@@ -127,6 +127,22 @@ pub enum Expect {
     /// The key holds exactly this value: [`leaf_hash`] of the bytes read
     /// (`update` over the record it patched, a delete of what was read).
     Value([u8; 32]),
+    /// "I write this key whatever it holds": the FORCED form, named so it can
+    /// be counted (sdk#235, W8). TRANSITIONAL — only a store-level batch that
+    /// genuinely cannot read first builds one, an app's write never does, and
+    /// sdk#281 removes it once the count is zero. It holds against any tree,
+    /// so it reads nothing.
+    Any,
+}
+
+/// The first key a write changes without having read it, if any (sdk#235,
+/// W8). Pure and syntactic: the write's own op keys against its own read
+/// keys. A plain `Write` has no reads, so any op it carries is unread.
+fn unread_key(ops: &[(Vec<u8>, Op)], reads: &[(Vec<u8>, Expect)]) -> Option<Vec<u8>> {
+    ops.iter()
+        .map(|(k, _)| k)
+        .find(|k| !reads.iter().any(|(r, _)| r == *k))
+        .cloned()
 }
 
 /// A value as the tree STORES it: inline bytes, or a reference to the block
@@ -221,6 +237,14 @@ pub enum State {
     /// [`Effect::Conflicted`]. NEVER re-sent as it is — the same write
     /// conflicts the same way; what to do next is the app's (sdk#148).
     Conflict,
+    /// TERMINAL, nothing applied: the write changes `key` and did not read it
+    /// (sdk#235, W8). Judged AT THE DOOR on the write's own bytes — op keys ⊆
+    /// read keys — before any other answer and reading no state, so it can
+    /// never follow `Accepted`. NEVER re-sent: the same write is refused the
+    /// same way every time. Distinct from `Conflict` on purpose: "what you
+    /// read moved" and "you never read it" are different facts. WHICH key
+    /// rides beside it in [`Effect::Unread`], as `Conflict`'s does.
+    Unread,
 }
 
 /// Which bound a [`State::TooLarge`] write is over.
@@ -244,7 +268,9 @@ pub enum Event {
         write_id: WriteId,
         ops: Vec<(Vec<u8>, Op)>,
         /// What it read: checked against the tree the ops land on, in the same
-        /// apply. Empty = a blind write, applied as ever.
+        /// apply. Every op key must be here (W8, sdk#235) — a write with an op
+        /// key outside its reads is refused at the door as `Unread`; a forced
+        /// write says so per key with [`Expect::Any`] ([`Event::forced_write`]).
         reads: Vec<(Vec<u8>, Expect)>,
     },
     /// A block was READ BACK from our own node. Never an ack: W1 says an
@@ -358,6 +384,17 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// A FORCED write: every op key read as [`Expect::Any`] — "I write this
+    /// key whatever it holds" (sdk#235, W8). The ONE way a write that does not
+    /// depend on what was there is built, so it is named and counted, never
+    /// an implicit reads-less write (which the engine refuses as `Unread`).
+    pub fn forced_write(client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, Op)>) -> Event {
+        let reads = ops.iter().map(|(k, _)| (k.clone(), Expect::Any)).collect();
+        Event::Write { client, write_id, ops, reads }
+    }
+}
+
 /// Which code epoch a head was written under.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -448,6 +485,14 @@ pub enum Effect {
         write_id: WriteId,
         key: Vec<u8>,
         current: Option<LeafForm>,
+    },
+
+    /// Beside a `Notify{Unread}`: the key the write changes and did not read
+    /// (sdk#235). The first such key in the write's own op order.
+    Unread {
+        client: ClientId,
+        write_id: WriteId,
+        key: Vec<u8>,
     },
 
     // ---- the read path ----
@@ -1117,6 +1162,10 @@ pub struct Engine<B: Blocks> {
     /// write before recovery is `Busy`, the answer it gets while one is in
     /// flight.
     before_head_write: Option<WriteBeforeHead>,
+    /// Writes TAKEN with at least one `Expect::Any` read: forced past their
+    /// reads (sdk#235). Shown to a person, so the transitional form is a
+    /// number someone can act on (sdk#281 removes `Any` at zero).
+    forced_writes: u64,
     /// Notifications raised while applying a write — a group superseded part
     /// way through — collected here so `on_write` can return them with the
     /// rest rather than dropping them.
@@ -1248,6 +1297,7 @@ impl<B: Blocks> Engine<B> {
             recovered: false,
             before_head: Vec::new(),
             before_head_write: None,
+            forced_writes: 0,
             pending_notifications: Vec::new(),
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
@@ -1322,6 +1372,11 @@ impl<B: Blocks> Engine<B> {
     /// every surface that reports redundancy must say so, never "0 owed".
     pub fn parity_scan(&self) -> &ParityScan {
         &self.parity_scan
+    }
+
+    /// Writes taken with an `Expect::Any` read: forced past their reads.
+    pub fn forced_writes(&self) -> u64 {
+        self.forced_writes
     }
 
     pub fn owed_groups(&self) -> usize {
@@ -2130,6 +2185,17 @@ impl<B: Blocks> Engine<B> {
         ops: Vec<(Vec<u8>, Op)>,
         reads: Vec<(Vec<u8>, Expect)>,
     ) -> Vec<Effect> {
+        // AT THE DOOR (sdk#235, W8): a write names what it read. SYNTACTIC —
+        // the write's own op keys against its own read keys — so it reads no
+        // state and comes before every other answer: before Busy, before the
+        // pre-head park (which answers Accepted at once), before the order
+        // rule and the size. Nothing is consumed, moved, parked or applied.
+        if let Some(key) = unread_key(&ops, &reads) {
+            return vec![
+                Effect::Notify { client, write_id, state: State::Unread },
+                Effect::Unread { client, write_id, key },
+            ];
+        }
         let size: usize = ops
             .iter()
             .map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 })
@@ -2336,6 +2402,9 @@ impl<B: Blocks> Engine<B> {
         // this is where it is known.
         self.unpublished.extend(emitted.iter().cloned());
 
+        if reads.iter().any(|(_, e)| *e == Expect::Any) {
+            self.forced_writes += 1;
+        }
         let mut out = vec![Effect::Notify {
             client,
             write_id,
@@ -2506,6 +2575,9 @@ impl<B: Blocks> Engine<B> {
         };
         let mut need = Vec::new();
         for (key, want) in reads {
+            if *want == Expect::Any {
+                continue; // holds against any tree, so it reads nothing
+            }
             let found = match freenet_prolly::read::get(&source, &self.root, key) {
                 Ok(v) => v.map(LeafForm::of),
                 Err(ReadError::Need(n)) => {

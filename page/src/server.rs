@@ -183,6 +183,11 @@ struct Probe {
 const PROBE_CLIENT: engine::ClientId = engine::ClientId(0);
 
 impl Server {
+    /// Writes taken forced past their reads (sdk#235).
+    pub fn forced_writes(&self) -> u64 {
+        self.page.forced_writes()
+    }
+
     pub fn new(page: Page, facts: SignerFacts) -> Server {
         Server {
             page,
@@ -382,7 +387,7 @@ impl Server {
                             }
                         }
                     }
-                    State::Failed | State::Lost | State::Conflict | State::TooLarge { .. } => {
+                    State::Failed | State::Lost | State::Conflict | State::Unread | State::TooLarge { .. } => {
                         self.sent.remove(&id);
                     }
                     _ => {}
@@ -598,7 +603,7 @@ impl Server {
                 m.resend = true;
                 false
             }
-            State::Lost | State::Conflict | State::Failed | State::TooLarge { .. } => {
+            State::Lost | State::Conflict | State::Unread | State::Failed | State::TooLarge { .. } => {
                 // It could not land where it was judged: the kept keys are
                 // superseded too — told, never blind.
                 let kept = std::mem::take(&mut m.kept);
@@ -763,6 +768,7 @@ impl Server {
                                 protocol::Expect::Absent => engine::Expect::Absent,
                                 protocol::Expect::Present => engine::Expect::Present,
                                 protocol::Expect::Value(h) => engine::Expect::Value(h),
+                                protocol::Expect::Any => engine::Expect::Any,
                             },
                         )
                     })
@@ -932,6 +938,9 @@ impl Server {
                         // M2: nothing applied, a read no longer held. `for_client`
                         // tells a pre-v4 client `Failed`, which is true to it.
                         State::Conflict => W::Conflict,
+                        // sdk#235: refused at the door, a key written unread.
+                        // `for_client` tells a pre-v4 client `Failed`.
+                        State::Unread => W::Unread,
                         State::TooLarge { bound, limit, got } => W::too_large(
                             match bound {
                                 engine::WriteBound::CommitBlocks => {
@@ -975,6 +984,15 @@ impl Server {
                         key: key.clone(),
                         current: current.as_ref().map(|f| f.hash()),
                     }
+                }
+                // WHICH key a write changed unread (sdk#235) — to the same
+                // bundle only, as `Conflicted`; an older client has `Failed`.
+                Effect::Unread { client, write_id, key } => {
+                    let version = version_of(*client);
+                    if version < protocol::SESSION_SINCE || session_of(*client) == protocol::LEGACY_SESSION {
+                        continue;
+                    }
+                    protocol::Reply::Unread { session: session_of(*client), write_id: write_id.0, key: key.clone() }
                 }
                 Effect::Reply { req_id, result, .. } => {
                     // WHERE THIS ENGINE STANDS, as it answers.
@@ -1156,6 +1174,9 @@ fn state_tag(s: State) -> u64 {
         // (`reads: Vec::new()` below), so nothing can conflict. Tagged as a
         // failure, which is what it would mean to this client.
         State::Conflict => 5,
+        // Refused at the door (sdk#235): a failure to this client, like
+        // `Conflict`.
+        State::Unread => 5,
     }
 }
 

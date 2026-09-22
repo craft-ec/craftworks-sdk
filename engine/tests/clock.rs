@@ -29,12 +29,7 @@ fn stalled(fx: &[Effect]) -> bool {
 }
 
 fn write() -> Event {
-    Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"k".to_vec(), Op::Put(vec![1u8; 40]))],
-        reads: Vec::new(),
-    }
+    Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![1u8; 40]))])
 }
 
 /// Epoch seconds, as `protocol::tick_of` produces them.

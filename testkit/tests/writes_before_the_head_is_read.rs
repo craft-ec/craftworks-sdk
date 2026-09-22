@@ -34,10 +34,7 @@ fn a_write_made_before_the_head_is_read_lands_on_the_head_and_loses_nothing() {
     // A tab that DID read its head writes the data this person already has.
     let mut first = node.connect();
     first.client(&Request::Identity);
-    let w = first.client(&Request::Write {
-        write_id: 1,
-        ops: vec![Op::Put(b"k/old".to_vec(), vec![7u8; 2000])],
-    });
+    let w = first.client(&Request::forced_write(1, vec![Op::Put(b"k/old".to_vec(), vec![7u8; 2000])]));
     assert!(told(&w, 1).contains(&WriteState::Published), "the first write: {:?}", told(&w, 1));
     let before = rows_at_the_head(&node);
     assert_eq!(before, vec![b"k/old".to_vec()], "THE CONTROL: the node holds the old data");
@@ -45,10 +42,7 @@ fn a_write_made_before_the_head_is_read_lands_on_the_head_and_loses_nothing() {
     // A NEW TAB writes at once — no Identity, so its engine has not read the
     // head and stands on the empty tree.
     let mut fresh = node.connect();
-    let early = fresh.client(&Request::Write {
-        write_id: 1,
-        ops: vec![Op::Put(b"k/new".to_vec(), vec![8u8; 2000])],
-    });
+    let early = fresh.client(&Request::forced_write(1, vec![Op::Put(b"k/new".to_vec(), vec![8u8; 2000])]));
     assert!(
         !told(&early, 1).contains(&WriteState::Published),
         "a write published before the head was read: {:?}",

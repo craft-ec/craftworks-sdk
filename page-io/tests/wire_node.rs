@@ -283,7 +283,7 @@ fn client(io: &mut PageIo, node: &mut WireNode, now: &mut u64, r: &Request) -> V
 }
 
 fn write(id: u64, k: &str, v: &str) -> Request {
-    Request::Write { write_id: id, ops: vec![protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec())] }
+    Request::forced_write(id, vec![protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec())])
 }
 
 fn states(rs: &[Reply], id: u64) -> Vec<WriteState> {

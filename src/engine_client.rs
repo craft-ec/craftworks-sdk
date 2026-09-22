@@ -47,6 +47,13 @@ pub enum Event {
     Conflict { write_id: u64, keys: Vec<Vec<u8>> },
     /// A write will never be applied and re-submitting would not help.
     Failed { write_id: u64 },
+    /// Refused at the door: the SDK wrote a key it did not read (sdk#235,
+    /// W8). Our bug, not the person's; never re-sent.
+    Unread { write_id: u64 },
+    /// A FORCED write (`Expect::Any`) told `Lost`: fallen, NOT re-sent — it
+    /// has no premise to re-check, so a re-send is a blind overwrite
+    /// (sdk#235, WRITE-PATH ⁷).
+    ForcedLost { write_id: u64 },
     /// Something in a subscribed range changed. An ACCELERATOR: a binding
     /// that never heard this would still be correct, on its backstop.
     Changed {

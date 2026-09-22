@@ -143,12 +143,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
             let wid = WriteId(next_write);
             let mut queue = stepped!(
                 e,
-                Event::Write {
-                    client: ClientId(1),
-                    write_id: wid,
-                    ops,
-                    reads: Vec::new(),
-                }
+                Event::forced_write(ClientId(1), wid, ops)
             );
             accepted_only.insert(wid);
 
@@ -394,12 +389,7 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
         .collect();
     let mut queue = stepped!(
         e,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops,
-            reads: Vec::new(),
-        }
+        Event::forced_write(ClientId(1), WriteId(1), ops)
     );
 
     // Confirm ONE put, then take whatever head the engine offers.
@@ -488,12 +478,7 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
     // Write 1 opens a commit. Its puts are held back, so it cannot publish.
     let first = stepped!(
         e,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-            reads: Vec::new(),
-        }
+        Event::forced_write(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
     );
     let held: Vec<(Cid, Vec<u8>)> = first
         .iter()
@@ -525,12 +510,7 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
     for n in 2..=6u64 {
         let out = stepped!(
             e,
-            Event::Write {
-                client: ClientId(1),
-                write_id: WriteId(n),
-                ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
-                reads: Vec::new(),
-            }
+            Event::forced_write(ClientId(1), WriteId(n), vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))])
         );
         absorb(&mut seen, &out);
     }
@@ -661,12 +641,7 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
     let mut stalled = 0;
     let _ = stepped!(
         e2,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-            reads: Vec::new(),
-        }
+        Event::forced_write(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
     );
     for tick in 1..=(t * 3) {
         for f in stepped!(e2, Event::Tick(tick)) {
@@ -821,12 +796,7 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
     for (n, key) in [(1u64, &b"mine"[..]), (2, &b"also-mine"[..])] {
         for f in stepped!(
             e,
-            Event::Write {
-                client: ClientId(1),
-                write_id: WriteId(n),
-                ops: vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))],
-                reads: Vec::new(),
-            }
+            Event::forced_write(ClientId(1), WriteId(n), vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))])
         ) {
             if let Effect::Notify {
                 write_id, state, ..
@@ -931,22 +901,12 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
     // Write 1 opens a commit the network never confirms.
     let _ = stepped!(
         e,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
-            reads: Vec::new(),
-        }
+        Event::forced_write(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
     );
     // Write 2 folds behind it.
     let _ = stepped!(
         e,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(2),
-            ops: vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))],
-            reads: Vec::new(),
-        }
+        Event::forced_write(ClientId(1), WriteId(2), vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))])
     );
     let mut failed = false;
     for t in 1..=20u64 {
@@ -999,12 +959,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
         // A write, driven until the head is emitted but no further.
         let out = stepped!(
             e,
-            Event::Write {
-                client: ClientId(1),
-                write_id: WriteId(1),
-                ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
-                reads: Vec::new(),
-            }
+            Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))])
         );
         let mut queue = out;
         let mut head = None;
@@ -1073,12 +1028,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
         warm_from(&mut e, &net);
         let _ = stepped!(
             e,
-            Event::Write {
-                client: ClientId(1),
-                write_id: WriteId(2),
-                ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
-                reads: Vec::new(),
-            }
+            Event::forced_write(ClientId(1), WriteId(2), vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))])
         );
         assert_eq!(
             e.root(),
@@ -1127,12 +1077,7 @@ fn recomputing_owed_parity_is_bounded_and_resumes() {
         .collect();
     let mut queue = stepped!(
         e,
-        Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops,
-            reads: Vec::new(),
-        }
+        Event::forced_write(ClientId(1), WriteId(1), ops)
     );
     let mut guard = 0;
     while let Some(f) = queue.pop() {

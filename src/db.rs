@@ -789,6 +789,16 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// the engine checks them where the edits land.
     fn write(&mut self, reads: Vec<(Vec<u8>, Expect)>, edits: Vec<(Vec<u8>, Edit)>) -> Result<()> {
         debug_assert!(edits.iter().all(|(k, _)| reads.iter().any(|(r, _)| r == k)), "a write without a read of its key");
+        // AN APP'S WRITE IS NEVER FORCED (sdk#235 ruling 1). `Expect::Any` is
+        // the transitional form for store-level batches that cannot read
+        // first; every `Db` op reads what it writes, so an `Any` here is a bug
+        // in this file, refused by name rather than sent to be counted.
+        if let Some((k, _)) = reads.iter().find(|(_, e)| *e == Expect::Any) {
+            return Err(DbError::Refused(format!(
+                "a Db write may not force key {}: an app's write always says what it read",
+                crate::hex(k)
+            )));
+        }
         for (key, edit) in &edits {
             if key.len() > MAX_KEY {
                 return Err(DbError::TooLarge(format!(

@@ -1472,6 +1472,35 @@ impl Session {
         for id in &lost_gave_up {
             self.unusable.push(format!("write {id} was told Lost with its {} tries spent and was not saved", craftworks_sdk::cached_store::WRITE_TRIES));
         }
+        // sdk#235: writes refused at the door — OUR bug, never the person's —
+        // each with every write that fell with it, NAMED.
+        let unread: Vec<serde_json::Value> = self
+            .db
+            .store_mut()
+            .take_unread()
+            .into_iter()
+            .map(|u| {
+                let key = u.key.as_deref().map(hex);
+                let line = format!(
+                    "The app's SDK wrote {} without reading it first, so {} change{} {} not saved. This is a bug in the SDK, not something you did.",
+                    key.as_deref().map(|k| format!("key {k}")).unwrap_or_else(|| "a key".into()),
+                    u.write_ids.len(),
+                    if u.write_ids.len() == 1 { "" } else { "s" },
+                    if u.write_ids.len() == 1 { "was" } else { "were" },
+                );
+                self.unusable.push(line.clone());
+                serde_json::json!({ "writeIds": u.write_ids, "key": key, "line": line })
+            })
+            .collect();
+        // A forced write told Lost falls, not re-sent (sdk#235): named.
+        let forced_lost = self.db.store_mut().take_forced_lost();
+        for id in &forced_lost {
+            self.unusable.push(format!("write {id} was forced past its reads and was lost; it was not sent again, because a forced write cannot be re-checked"));
+        }
+        // How many writes the engine took forced past their reads: the
+        // transitional form, as a number a person can see (sdk#281 removes
+        // `Any` at zero). Only the SDK's store-level batches build one.
+        let forced_writes = self.page.as_ref().map(|p| p.forced_writes()).unwrap_or(0);
         // A LOCAL change is a change too: a write that rolled back moves the
         // rows a component is showing, and the component finds out the same
         // way it finds out about anybody else's.
@@ -1555,6 +1584,12 @@ impl Session {
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
             "lostGaveUp": lost_gave_up,
+            "unread": unread,
+            "forcedLost": forced_lost,
+            "forcedWrites": {
+                "count": forced_writes,
+                "line": format!("{forced_writes} write{} forced past their reads (by the SDK's store-level batches)", if forced_writes == 1 { "" } else { "s" }),
+            },
             "loadsInFlight": self.loads.in_flight(),
             "conflicts": conflicts,
             "superseded": superseded,

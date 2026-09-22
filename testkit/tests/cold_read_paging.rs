@@ -16,7 +16,7 @@ fn written(n: usize) -> PageNode {
     let mut c = node.connect();
     c.client(&Request::Identity);
     let ops = (0..n).map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), vec![7u8; 40])).collect();
-    c.client(&Request::Write { write_id: 1, ops });
+    c.client(&Request::forced_write(1, ops));
     assert!(node.head().is_some(), "the rows never published");
     node
 }
@@ -76,7 +76,7 @@ fn control_a_warm_read_is_one_page_per_256_rows() {
     let mut c = node.connect();
     c.client(&Request::Identity);
     let ops = (0..300).map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), vec![7u8; 40])).collect();
-    c.client(&Request::Write { write_id: 1, ops });
+    c.client(&Request::forced_write(1, ops));
     let (keys, cursor, gets) = page(&mut c, 1, None);
     assert_eq!((keys.len(), gets), (256, 0));
     assert!(cursor.is_some());

@@ -20,12 +20,7 @@ fn states(fx: &[Effect]) -> Vec<State> {
 }
 
 fn write(id: u64, ops: Vec<(Vec<u8>, Op)>) -> Event {
-    Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(id),
-        ops,
-        reads: Vec::new(),
-    }
+    Event::forced_write(ClientId(1), WriteId(id), ops)
 }
 
 /// `n` DISTINCT values of `size` bytes, one key each. Distinct on purpose:

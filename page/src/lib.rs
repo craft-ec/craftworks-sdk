@@ -477,9 +477,14 @@ impl Page {
         self.client_event(ev);
     }
 
-    /// A BLIND write, as the app made it: nothing it read is checked.
+    /// A FORCED write (sdk#235, W8): every op key is read as `Expect::Any` — "I write
+    /// this key whatever it holds" — so the engine takes it, counts it, and a
+    /// `Lost` one is not re-sent. A write that depends on what was there says
+    /// so with [`Page::write_reading`]; a reads-less write is refused as
+    /// `Unread`, so there is no third way.
     pub fn write(&mut self, client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, WriteOp)>) {
-        self.write_reading(client, write_id, ops, Vec::new());
+        let reads = ops.iter().map(|(k, _)| (k.clone(), engine::Expect::Any)).collect();
+        self.write_reading(client, write_id, ops, reads);
     }
 
     /// A write that states what it READ (sdk#148): the engine checks each
@@ -1303,6 +1308,13 @@ impl Page {
 
     /// How many parity groups the engine owes right now (what a Tick past
     /// `parity_age`, or a Flush, is for).
+    /// Writes the engine took forced past their reads (`Expect::Any`,
+    /// sdk#235): shown to a person, so the transitional form is a number
+    /// someone can act on.
+    pub fn forced_writes(&self) -> u64 {
+        self.engine.forced_writes()
+    }
+
     pub fn owed_groups(&self) -> usize {
         self.engine.owed_groups()
     }

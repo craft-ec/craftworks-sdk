@@ -16,7 +16,7 @@ use testkit::page_node::Served;
 use testkit::{PageConn, PageNode};
 
 fn write(n: u64) -> protocol::Request {
-    protocol::Request::Write { write_id: n, ops: vec![protocol::Op::Put(format!("k/{n:04}").into_bytes(), vec![0x5A; 64])] }
+    protocol::Request::forced_write(n, vec![protocol::Op::Put(format!("k/{n:04}").into_bytes(), vec![0x5A; 64])])
 }
 
 /// Ticks between calls: a throttled tab, 30 s apart. Five steps are 150 s,

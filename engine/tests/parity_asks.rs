@@ -19,10 +19,10 @@ const T0: u64 = 1_790_000_000;
 
 /// Values by reference, so leaves carry parity over them.
 fn write(id: u64, n: u32, salt: u8) -> Event {
-    Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(id),
-        ops: (0..n)
+    Event::forced_write(
+        ClientId(1),
+        WriteId(id),
+        (0..n)
             .map(|i| {
                 (
                     format!("k/{i:05}").into_bytes(),
@@ -30,8 +30,7 @@ fn write(id: u64, n: u32, salt: u8) -> Event {
                 )
             })
             .collect(),
-        reads: Vec::new(),
-    }
+    )
 }
 
 fn parity(fx: &[Effect]) -> Vec<Cid> {

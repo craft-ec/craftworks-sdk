@@ -71,7 +71,7 @@ fn cold_tree() -> PageNode {
     w.client(&Request::Identity);
     let mut ops: Vec<Op> = (0..120u32).map(|i| Op::Put(format!("d/notes/{i:04}").into_bytes(), vec![1u8; 900])).collect();
     ops.extend((0..120u32).map(|i| Op::Put(format!("d/tasks/{i:04}").into_bytes(), vec![2u8; 900])));
-    w.client(&Request::Write { write_id: 1, ops });
+    w.client(&Request::forced_write(1, ops));
     PageNode::cold_over(&writer)
 }
 

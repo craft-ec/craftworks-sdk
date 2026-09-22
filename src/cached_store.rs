@@ -82,6 +82,14 @@ pub struct CachedStore {
     /// Writes that fell `Lost` with no tries left, for the app to be told by
     /// name. Drained by [`CachedStore::take_lost_gave_up`].
     lost_gave_up: Vec<u64>,
+    /// Writes refused AT THE DOOR because the SDK wrote a key it did not read
+    /// (sdk#235): each with every later write that fell with it, and the key
+    /// once the node names it. OUR bug, never the person's — shown as such.
+    unread: Vec<Unread>,
+    /// `Lost` writes that carried an `Expect::Any` read, fallen rather than
+    /// re-sent (sdk#235): a forced write has no premise to re-check, so
+    /// re-sending it would be the blind overwrite #265 made safe.
+    forced_lost: Vec<u64>,
     pub copy: Copy,
     pub client: Client,
     next_write_id: u64,
@@ -144,6 +152,17 @@ pub struct Superseded {
     pub keys: Vec<Vec<u8>>,
 }
 
+/// A write refused AT THE DOOR because the SDK wrote a key it did not read
+/// (sdk#235, W8): the refused write, every later write that fell with it,
+/// and — once the node's `Reply::Unread` names it — the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unread {
+    /// The refused write and every later write that fell with it, in order.
+    pub write_ids: Vec<u64>,
+    /// The key it wrote unread, once the node's `Reply::Unread` names it.
+    pub key: Option<Vec<u8>>,
+}
+
 /// A write that did not apply because a key it READ had moved (M2): which
 /// write, which key, and what the tree holds there now (its read token, or
 /// `None`: absent). Told to the app; the write is rolled back and the key is
@@ -181,6 +200,21 @@ impl CachedStore {
 
     /// Writes that fell after being told `Lost` with none of its [`WRITE_TRIES`] left
     /// (sdk#265), for the app to be told by name. Drains.
+    /// Writes refused as `Unread` since the last call (sdk#235).
+    pub fn take_unread(&mut self) -> Vec<Unread> {
+        std::mem::take(&mut self.unread)
+    }
+
+    /// `Lost` forced writes fallen, not re-sent, since the last call.
+    pub fn take_forced_lost(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.forced_lost)
+    }
+
+    /// Did this write say it writes a key WHATEVER it holds (`Expect::Any`)?
+    fn forced(&self, write_id: u64) -> bool {
+        self.reads_of.get(&write_id).is_some_and(|r| r.iter().any(|(_, e)| *e == protocol::Expect::Any))
+    }
+
     pub fn take_lost_gave_up(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.lost_gave_up)
     }
@@ -201,6 +235,8 @@ impl CachedStore {
             pulled_back: std::collections::BTreeSet::new(),
             resending: std::collections::BTreeSet::new(),
             lost_gave_up: Vec::new(),
+            unread: Vec::new(),
+            forced_lost: Vec::new(),
             copy: Copy::new(),
             client: Client::new(),
             next_write_id: 1,
@@ -387,6 +423,15 @@ impl CachedStore {
                     self.superseded.push(Superseded { write_id: *write_id, keys: keys.clone() });
                 }
             }
+            // WHICH key a write changed unread (sdk#235): named beside the
+            // writes that fell for it.
+            if let protocol::Reply::Unread { session, write_id, key } = &r {
+                if self.client.session() == Some(*session) {
+                    if let Some(u) = self.unread.iter_mut().rev().find(|u| u.write_ids.contains(write_id)) {
+                        u.key = Some(key.clone());
+                    }
+                }
+            }
             if let protocol::Reply::Conflicted { session, write_id, key, current } = &r {
                 // A PULLED-BACK write's conflict is expected and is not the
                 // app's: it declared what the `Lost` write in front of it
@@ -494,6 +539,18 @@ impl CachedStore {
             // one of its keys: the person's last edit is there, and this one
             // going again would put the older value back (W2 per key). It
             // falls, named, like one out of tries.
+            // A FORCED write (`Expect::Any`) told Lost is NOT re-sent (sdk#235,
+            // WRITE-PATH ⁷): it has no premise the engine could re-check, so a
+            // re-send is exactly the blind overwrite #265's re-send is safe
+            // against. It falls, NAMED, until sdk#281 removes `Any`.
+            W::Lost if self.forced(write_id) => {
+                self.forced_lost.push(write_id);
+                self.reads_of.remove(&write_id);
+                let told = self.copy.failed(write_id);
+                self.state_changed.extend(told.rolled_back_keys.iter().cloned());
+                self.rolled_back.extend(told.rolled_back_keys);
+                self.drain_queued();
+            }
             W::Lost if !self.copy.overtaken(write_id) && self.try_again(write_id) => {
                 self.copy.queued(write_id);
                 self.resending.insert(write_id);
@@ -521,6 +578,26 @@ impl CachedStore {
                 self.state_changed.extend(told.rolled_back_keys.iter().cloned());
                 self.rolled_back.extend(told.rolled_back_keys);
                 // The commit that was in flight is over, however it ended.
+                self.drain_queued();
+            }
+            // sdk#235: refused AT THE DOOR — the SDK wrote a key it did not
+            // read. NOTHING applied. It falls WHOLE with every later write on
+            // its keys (W1) and is NEVER re-sent: the same write is refused
+            // the same way every time. Every write that fell is NAMED — the
+            // person's edits lost for OUR bug. No re-run chain: nothing moved
+            // that an app could re-decide against.
+            W::Unread => {
+                let told = self.copy.failed(write_id);
+                let mut ids: Vec<u64> = told.rolled_back.iter().map(|(id, _)| *id).collect();
+                ids.push(write_id);
+                ids.sort_unstable();
+                ids.dedup();
+                for id in &ids {
+                    self.reads_of.remove(id);
+                }
+                self.unread.push(Unread { write_ids: ids, key: None });
+                self.state_changed.extend(told.rolled_back_keys.iter().cloned());
+                self.rolled_back.extend(told.rolled_back_keys);
                 self.drain_queued();
             }
             // M2: a key it READ had moved, so NOTHING applied. It falls WHOLE
@@ -609,6 +686,7 @@ impl CachedStore {
             | W::Failed
             | W::Lost
             | W::Conflict
+            | W::Unread
             | W::TooLarge { .. } => {
                 self.unheard.remove(&write_id);
             }
@@ -807,8 +885,13 @@ impl CachedStore {
 }
 
 impl Store for CachedStore {
+    /// A store-level batch that cannot read first: it says so, key by key,
+    /// as `Expect::Any` (sdk#235, W8) — counted by the engine and shown, never
+    /// an implicit reads-less `Write`. Only these store-level callers build
+    /// `Any`; `Db` refuses to.
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
-        self.apply_commit(&[], edits)
+        let reads: Vec<(Vec<u8>, protocol::Expect)> = edits.iter().map(|(k, _)| (k.clone(), protocol::Expect::Any)).collect();
+        self.apply_commit(&reads, edits)
     }
 
     fn last_write_id(&self) -> Option<u64> {

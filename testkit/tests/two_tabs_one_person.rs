@@ -7,7 +7,7 @@ use protocol::{Op, Reply, Request, WriteState};
 use testkit::PageNode;
 
 fn put(id: u64, k: &str) -> Request {
-    Request::Write { write_id: id, ops: vec![Op::Put(k.as_bytes().to_vec(), k.as_bytes().to_vec())] }
+    Request::forced_write(id, vec![Op::Put(k.as_bytes().to_vec(), k.as_bytes().to_vec())])
 }
 
 /// Write states a batch of reply frames told, by (write id).
