@@ -17,6 +17,7 @@ trace = ["freenet-stdlib/trace"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+signer-proto = { path = "../signer-proto" }
 bincode = "1"
 freenet-stdlib = { version = "0.10.0", features = ["contract"] }
 # The Register record format and the Block contract's id, from their ONE implementation (pinned by known-answer

@@ -444,3 +444,61 @@ fn the_same_key_with_another_register_is_refused() {
         Answer::Refused(Why::RegisterChanged)
     );
 }
+
+/// PUT-WITH-CODE: block STATES in, each named by its own hash; the contracts are answered in order and the entry is
+/// handed exactly those PUTs.
+#[test]
+fn put_blocks_names_each_block_by_its_hash_and_hands_the_entry_the_puts() {
+    let mut w = World::new();
+    let states: Vec<Vec<u8>> = (1..=3u8).map(block_state).collect();
+    let served = serve_full(
+        &mut w.host,
+        &encode_request(&Request::PutBlocks {
+            states: states.clone(),
+        }),
+    );
+    let ids: Vec<[u8; 32]> = (1..=3u8).map(block_root).collect();
+    let contracts: Vec<[u8; 32]> = ids
+        .iter()
+        .map(|id| engine_delegate::blocks::contract_for(BCODE, id))
+        .collect();
+    assert_eq!(served.answer, Answer::Putting { contracts });
+    assert_eq!(served.puts, ids.into_iter().zip(states).collect::<Vec<_>>());
+}
+
+#[test]
+fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
+    let mut w = World::new();
+    let ask = |w: &mut World, states: Vec<Vec<u8>>| {
+        serve_full(&mut w.host, &encode_request(&Request::PutBlocks { states }))
+    };
+    let none = ask(&mut w, vec![]);
+    assert_eq!(
+        none.answer,
+        Answer::Refused(Why::BlockCount { max: 128, got: 0 })
+    );
+    let many = ask(&mut w, vec![block_state(1); 129]);
+    assert_eq!(
+        many.answer,
+        Answer::Refused(Why::BlockCount { max: 128, got: 129 })
+    );
+    let bad = ask(&mut w, vec![block_state(1), vec![]]);
+    assert_eq!(bad.answer, Answer::Refused(Why::NotABlock { index: 1 }));
+    for s in [none, many, bad] {
+        assert!(
+            s.puts.is_empty(),
+            "a refused PutBlocks still handed the entry PUTs"
+        );
+    }
+    let mut bare = Mem::default();
+    let r = serve_full(
+        &mut bare,
+        &encode_request(&Request::PutBlocks {
+            states: vec![block_state(1)],
+        }),
+    );
+    assert_eq!(
+        (r.answer, r.puts.len()),
+        (Answer::Refused(Why::NotProvisioned), 0)
+    );
+}

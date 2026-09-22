@@ -17,6 +17,8 @@ bincode = "1"
 # and the delegate name a block's contract the same way.
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 blake3 = "1"
+# The signer's wire types (serde only): `wire::signer` frames them.
+signer-proto = { path = "../signer-proto" }
 
 [dev-dependencies]
 bincode = "1"

@@ -1,0 +1,10 @@
+[package]
+name = "signer-proto"
+version = "0.1.0"
+edition = "2021"
+description = "The signer's wire types (sdk#209): what the page sends the signer delegate and what it answers. serde only."
+
+[dependencies]
+# ONLY serde: the page's SDK core depends on this, and the client-API boundary gate keeps freenet-stdlib out of it.
+serde = { version = "1", features = ["derive"] }
+bincode = "1"

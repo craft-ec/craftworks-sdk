@@ -9,7 +9,11 @@
 //!     `NotNext{current: seq 2}` = not visible (the signer only knows its own record);
 //!  5. IS THE RECORD DURABLE BEFORE THE REPLY? A `Signed` arrives, and the node is SIGKILLed at once and restarted on
 //!     the same data; the SAME prev with a DIFFERENT next is asked again. `AlreadySigned(first)` = durable;
-//!     `Signed` = the record was lost with the process (two signatures at one seq: the fork the signer exists to stop).
+//!     `Signed` = the record was lost with the process (two signatures at one seq: the fork the signer exists to stop);
+//!  6. PUT-WITH-CODE: the page hands the signer two block states (no code); the signer names each block's contract
+//!     (`Putting`) and PUTs it with the Block code it holds. Each named contract must match the one the page derives,
+//!     and a client GET of each must return the state. The `Put` answers the delegate sends back are REPORTED
+//!     (which connection, if any, receives them is measured, not assumed).
 //!
 //! Exit status is the verdict. usage: SIGNER_PORT=<port> live-signer <signer.wasm> <block.wasm> <register.wasm>
 
@@ -99,6 +103,52 @@ fn container(code: &[u8], params: &[u8]) -> ContractContainer {
         std::sync::Arc::new(ContractCode::from(code.to_vec())),
         Parameters::from(params.to_vec()),
     )))
+}
+
+async fn get_state(c: &mut WebApi, id: ContractInstanceId) -> Result<Option<Vec<u8>>> {
+    timeout(
+        STEP,
+        c.send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: id,
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        })),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("send blocked"))??;
+    let end = tokio::time::Instant::now() + STEP;
+    while tokio::time::Instant::now() < end {
+        match timeout(Duration::from_millis(500), c.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state, ..
+            }))) => return Ok(Some(state.as_ref().to_vec())),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => bail!("node error: {e}"),
+            Err(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Every signer answer that arrives on `c` within `window`.
+async fn drain(c: &mut WebApi, window: Duration) -> Vec<Answer> {
+    let mut got = Vec::new();
+    let end = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() < end {
+        if let Ok(Ok(HostResponse::DelegateResponse { values, .. })) =
+            timeout(Duration::from_millis(250), c.recv()).await
+        {
+            for v in values {
+                if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                    if let Some(a) = signer::decode_answer(&m.payload) {
+                        got.push(a);
+                    }
+                }
+            }
+        }
+    }
+    got
 }
 
 async fn contract_op(c: &mut WebApi, r: ContractRequest<'static>) -> Result<String> {
@@ -424,6 +474,66 @@ async fn main() -> Result<()> {
         red.push(format!(
             "RECORD NOT DURABLE: after a restart the same prev was answered {again:?}"
         ));
+    }
+
+    // 6. PUT-WITH-CODE.
+    let fresh: Vec<([u8; 32], Vec<u8>)> = (9..=10u8).map(block).collect();
+    let putting = ask(
+        &mut c3,
+        &key,
+        &Request::PutBlocks {
+            states: fresh.iter().map(|(_, st)| st.clone()).collect(),
+        },
+    )
+    .await?;
+    let expect: Vec<[u8; 32]> = fresh
+        .iter()
+        .map(|(id, _)| engine_delegate::blocks::contract_for(&bcode, id))
+        .collect();
+    match &putting {
+        Answer::Putting { contracts } if *contracts == expect => {
+            println!(
+                "PUT-WITH-CODE: the signer named both block contracts as the page derives them"
+            )
+        }
+        other => red.push(format!(
+            "PUT-WITH-CODE: expected Putting{{{expect:?}}}, told {other:?}"
+        )),
+    }
+    let puts = drain(&mut c3, Duration::from_secs(5)).await;
+    println!(
+        "PUT-WITH-CODE: {} Put answer(s) reached the asking connection within 5 s: {puts:?}",
+        puts.len()
+    );
+    for (i, (id, st)) in fresh.iter().enumerate() {
+        let cid = container(&bcode, id).key().id().to_owned();
+        match get_state(&mut c3, cid).await? {
+            Some(got) if got == *st => {
+                println!("PUT-WITH-CODE: block {} served to a client GET", i + 9)
+            }
+            Some(got) => red.push(format!(
+                "PUT-WITH-CODE: block {} GET returned {} B, not its state",
+                i + 9,
+                got.len()
+            )),
+            None => red.push(format!(
+                "PUT-WITH-CODE: block {} not served to a client GET within {STEP:?}",
+                i + 9
+            )),
+        }
+    }
+
+    // The control: a block NOBODY put must not be served, or the GETs above prove nothing.
+    let (never, _) = block(11);
+    match get_state(&mut c3, container(&bcode, &never).key().id().to_owned()).await {
+        Ok(Some(got)) => red.push(format!(
+            "CONTROL: a never-put block was served ({} B): the GET check cannot fail",
+            got.len()
+        )),
+        Ok(None) => {
+            println!("CONTROL: a never-put block is not served (no answer within {STEP:?})")
+        }
+        Err(e) => println!("CONTROL: a never-put block is not served ({e})"),
     }
 
     drop(c3);
