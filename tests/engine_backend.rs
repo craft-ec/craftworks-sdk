@@ -42,7 +42,13 @@ impl Transport for Loop {
                 }
             }
         }
-        self.conn.frame(request)
+        let replies = self.conn.frame(request);
+        // NOTHING STRANDED. The Shell loopback asserted that no call ended with
+        // an effect unsent (`out.stranded == 0`). A page has no call to end:
+        // the same claim is that once the exchange has settled, the page is
+        // waiting on NO op it made.
+        assert!(!self.conn.with_server(|s| s.page.waiting()), "the page is still waiting on an op it made");
+        replies
     }
 }
 
