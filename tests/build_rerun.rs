@@ -24,6 +24,7 @@ impl Probe {
         std::fs::create_dir_all(krate.join("src")).unwrap();
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         std::fs::copy(here.join("build.rs"), krate.join("build.rs")).unwrap();
+        std::fs::copy(here.join("build_support.rs"), krate.join("build_support.rs")).unwrap();
         std::fs::copy(here.join("src/build_rev.txt"), krate.join("src/build_rev.txt")).unwrap();
         std::fs::write(
             krate.join("Cargo.toml"),
@@ -44,6 +45,23 @@ impl Probe {
         // resolution: cargo compares mtimes.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(dir.join("build/hashes.toml"), format!("block = \"{block}\"\nregister = \"r\"\nrev = \"v\"\n")).unwrap();
+    }
+
+    /// A build that must FAIL — no contracts to name (craftworks-sdk#252):
+    /// what it said.
+    fn build_refused(&self, contracts_env: Option<&Path>) -> String {
+        let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        c.args(["run", "-v"])
+            .current_dir(self.root.join("sdk"))
+            .env("CARGO_TARGET_DIR", self.root.join("target"))
+            .env_remove("CRAFTWORKS_CONTRACTS");
+        if let Some(p) = contracts_env {
+            c.env("CRAFTWORKS_CONTRACTS", p);
+        }
+        let out = c.output().expect("cargo runs");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "a build with no contracts to name SUCCEEDED: {stderr}");
+        stderr
     }
 
     /// Build and run: (what was baked, whether the build script ran).
@@ -72,12 +90,14 @@ impl Drop for Probe {
     }
 }
 
-/// **Case 1: a build with no contracts, then the contracts named** — the wasm
-/// must stop saying `unknown`. RED before: it stayed `unknown` for good.
+/// **Case 1: a build with no contracts FAILS, naming the variable and the
+/// path (sdk#252 — it baked `unknown` and exited 0); then the contracts named,
+/// it bakes their hash.**
 #[test]
 fn naming_the_contracts_after_a_build_without_them_bakes_their_hash() {
     let p = Probe::new("named");
-    assert_eq!(p.build(None).0, "unknown");
+    let said = p.build_refused(None);
+    assert!(said.contains("CRAFTWORKS_CONTRACTS") && said.contains("freenet-contracts/build/hashes.toml"), "{said}");
     let c = p.contracts("contracts");
     p.write_hashes(&c, "sha256:aaa");
     assert_eq!(p.build(Some(&c)).0, "sha256:aaa", "the build kept the hash of a build that had no contracts");
@@ -120,7 +140,7 @@ fn a_contracts_build_appearing_beside_the_crate_is_picked_up() {
     let p = Probe::new("appears");
     let beside = p.contracts("freenet-contracts");
     std::fs::create_dir_all(&beside).unwrap();
-    assert_eq!(p.build(None).0, "unknown");
+    assert!(p.build_refused(None).contains("no contracts build at"), "an unbuilt checkout beside was taken for a build");
     p.write_hashes(&beside, "sha256:built");
     assert_eq!(p.build(None).0, "sha256:built");
 }
@@ -137,12 +157,15 @@ fn an_untouched_build_does_not_rerun_the_script() {
     assert!(p.build(Some(&c)).1, "the first build did not run the script, so the checks below prove nothing");
     assert!(!p.build(Some(&c)).1, "re-ran with nothing changed (contracts named)");
 
+    // No contracts anywhere, or an unbuilt checkout beside: FAILS every time,
+    // naming it — never a cached "success" (sdk#252).
     let q = Probe::new("still-none");
-    assert!(q.build(None).1);
-    assert!(!q.build(None).1, "re-ran with nothing changed (no contracts anywhere)");
-
+    for _ in 0..2 {
+        assert!(q.build_refused(None).contains("CRAFTWORKS_CONTRACTS is not set"));
+    }
     let r = Probe::new("still-beside-unbuilt");
     std::fs::create_dir_all(r.contracts("freenet-contracts")).unwrap();
-    assert!(r.build(None).1);
-    assert!(!r.build(None).1, "re-ran with nothing changed (an unbuilt checkout beside)");
+    for _ in 0..2 {
+        assert!(r.build_refused(None).contains("no contracts build at"));
+    }
 }
