@@ -51,9 +51,9 @@
 //!    signer's records — or a page reported the fork, LOUDLY. (A write that
 //!    changes nothing is Published at the engine's published head, sdk#160,
 //!    which may already be behind the register: still true.)
-//! 1b. The engine never ADOPTS a head (HeadConflict / HeadRead) the register
-//!    has not been read to hold, and so a page signs only from such a head:
-//!    the register is never 2+ behind the signer's record.
+//!    - **1b.** The engine never ADOPTS a head (HeadConflict / HeadRead) the
+//!      register has not been read to hold, and so a page signs only from
+//!      such a head: the register is never 2+ behind the signer's record.
 //! 2. The page UPDATEs the register only with bytes the signer returned.
 //! 3. A published root is WHOLE on the node: every block it reaches was put
 //!    and answered before the head was signed.
