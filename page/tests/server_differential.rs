@@ -1061,6 +1061,31 @@ fn a_same_seq_race_is_merged_key_by_key() {
         tab.pump(&mut rig, &mut node);
         let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
         let key = craftworks_sdk::db::record_key("t", loc);
+        // The long-delta case's tip is ONE write of TWO keys: the record again
+        // (which the winner changes, behind the cut) and a key only this page
+        // writes. Main's point: a key wrongly kept by a cut delta sinks the
+        // whole merge write, so the truly one-sided key must end PUBLISHED —
+        // an outcome, not only a message.
+        let extra = vec![0x02, b'x'];
+        if case.ends_with("behind a long delta") {
+            let (_, r) = node.head().expect("published");
+            let now_rec = node.tree(&r).expect("whole").get(&key).cloned().expect("the record");
+            // A write that declared NO reads (a store-level batch): the
+            // stale-premise rule cannot cover it, so only the COMPLETE delta
+            // decides which of its keys the winner changed — and a cut read as
+            // complete would keep the record and write this page's value over
+            // the winner's, the merge write carrying no read to refuse it.
+            let _ = now_rec;
+            craftworks_sdk::store::Store::apply_batch(
+                tab.db.store_mut(),
+                &[
+                    (key.clone(), craftworks_sdk::store::Edit::Put(b"mine, again".to_vec())),
+                    (extra.clone(), craftworks_sdk::store::Edit::Put(b"only mine".to_vec())),
+                ],
+            )
+            .expect("the store took it");
+            tab.pump(&mut rig, &mut node);
+        }
         let (tip_seq, tip_root) = node.head().expect("published");
         let mine = node.tree(&tip_root).expect("whole").get(&key).cloned().expect("the record");
         let hr = node.head_read().expect("a head");
@@ -1113,6 +1138,10 @@ fn a_same_seq_race_is_merged_key_by_key() {
             _ => {
                 assert_eq!(told.iter().map(|s| s.keys.clone()).collect::<Vec<_>>(), vec![vec![key.clone()]], "{case}: {told:?}");
                 assert_eq!(fin.get(&key), Some(&theirs_record), "{case}: their value at the record did not stand");
+                if case.ends_with("behind a long delta") {
+                    assert_eq!(fin.get(&extra).map(|v| v.as_slice()), Some(&b"only mine"[..]), "{case}: the truly one-sided key was lost with the record: the merge write fell WHOLE");
+                    assert_eq!(fseq, tip_seq + 1, "{case}: no merge commit on top of the winner");
+                }
             }
         }
     }
