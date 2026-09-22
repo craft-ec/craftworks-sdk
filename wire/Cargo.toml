@@ -13,9 +13,15 @@ description = "The one place allowed to know freenet's client API. Pure framing,
 # by having been remembered.
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 bincode = "1"
+# A block's contract and state (`block.rs`): the tree's own ids, so the page
+# and the delegate name a block's contract the same way.
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+blake3 = "1"
 
 [dev-dependencies]
 bincode = "1"
+# The moved block functions are pinned equal to the copies the shell still has.
+engine-delegate = { path = "../engine-delegate", default-features = false }
 # The tests assert against stdlib's OWN caps rather than restating them: a
 # number copied here would agree with itself while the real bound moved.
 freenet-stdlib = { version = "0.10.0", features = ["net"] }

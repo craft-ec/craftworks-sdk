@@ -73,6 +73,7 @@
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 
+pub mod block;
 pub mod provision;
 pub mod reassemble;
 /// The delegate's identity, so a caller can hold one without depending on
@@ -130,6 +131,24 @@ pub enum Incoming {
     /// **A HINT, never an authority.** See the module docs: a root from the
     /// node means "look", not "this is where the tree is".
     HeadChanged { key: String },
+    /// A contract GET answered (ENGINE-SHAPE §2: the page reads blocks and the
+    /// head itself). `id` is the contract's INSTANCE id, 32 bytes, as the node
+    /// names it: the page matches it against the head it subscribed to. For a
+    /// BLOCK the id is not trusted either way — the block id is recomputed
+    /// from the state (`block::block_of_state`) and a state nobody asked for
+    /// verifies as nothing.
+    ///
+    /// ASSUMPTION (the cold read's tests decide it): a node that cannot find a
+    /// contract answers with `ContractError::Get` ([`Incoming::GetFailed`]),
+    /// not with an empty state. An empty `GetResponse` stays unusable, and to
+    /// a cold read it is a GET that did not answer.
+    Got { id: [u8; 32], state: Vec<u8> },
+    /// A contract GET the node REFUSED, naming the contract (its
+    /// `ContractError::Get { key, .. }`), so the page can tell which of its
+    /// GETs this answers. A page GET of a block this node's own delegate wrote
+    /// is refused on a node with a peer (F55) — that is how a cold read learns
+    /// a root is local. A refusal that names nothing stays [`Incoming::Refused`].
+    GetFailed { id: [u8; 32] },
     /// The node accepted a request, and WHICH.
     ///
     /// **An ack is not durability.** A write becomes published by being READ
@@ -170,6 +189,10 @@ pub enum AckKind {
     Put(String),
     /// A subscription was taken, and on what.
     Subscribed(String),
+    /// A contract UPDATE was answered. It carries NO information about which
+    /// record the register kept (F56): the page confirms by the SUBSCRIBED
+    /// head's ledger, never by this (ENGINE-SHAPE §5, correction 4).
+    Updated(String),
     /// Something that needed no answer succeeded. Names nothing because there
     /// is nothing to name — and a step must not rely on this one to identify
     /// itself.
@@ -296,6 +319,33 @@ pub fn frame_put(
         related_contracts: RelatedContracts::default(),
         subscribe: false,
         blocking_subscribe: false,
+    });
+    frames(&req, stream_id)
+}
+
+/// Frame a contract GET (the page reads blocks and the head itself: ENGINE-SHAPE
+/// §2). `subscribe`: the HEAD is read with a subscription — a peered node serves
+/// a page only what it is subscribed to or wrote (F55), and a subscription is
+/// also how a head move reaches this page (§5 correction 4). A block is got
+/// without one; `return_contract_code` never, the page has the code.
+pub fn frame_get(id: ContractInstanceId, subscribe: bool, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
+    let req = ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Get {
+        key: id,
+        return_contract_code: false,
+        subscribe,
+        blocking_subscribe: false,
+    });
+    frames(&req, stream_id)
+}
+
+/// Frame a contract UPDATE with a whole new state — the head register's signed
+/// record (§5: `Signed` → send UPDATE). An UPDATE names the contract by its
+/// full KEY (code hash included), not by instance id. An UPDATE of an identical
+/// record is the same record, so a silent one is re-sent as it is.
+pub fn frame_update(key: ContractKey, state: Vec<u8>, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
+    let req = ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Update {
+        key,
+        data: UpdateData::State(State::from(state)),
     });
     frames(&req, stream_id)
 }
@@ -428,6 +478,10 @@ pub fn unframe(r: &mut Reassembler, bytes: &[u8]) -> Incoming {
 fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
     match Reassembler::decode(bytes) {
         Ok(d) => Ok(d),
+        // A GET refusal that names its contract: which GET it answers.
+        Err(Unusable::NodeSaidNo) if get_refused(bytes).is_some() => {
+            Err(Incoming::GetFailed { id: get_refused(bytes).expect("just checked") })
+        }
         // A node's own error reply is a MESSAGE, not a failure to read one.
         Err(Unusable::NodeSaidNo) => Err(Incoming::Refused(Refused {
             said: "the node refused the request".into(),
@@ -455,6 +509,23 @@ fn classify(r: HostResponse) -> Incoming {
             } else {
                 Incoming::EngineBytes(out)
             }
+        }
+        // A GET answered with NO state is not a block (no kind byte) and not a
+        // head record: unusable, as every GET answer was before the page read
+        // blocks itself — a run of zeroes decodes as exactly this. ASSUMPTION
+        // (the live run tells): a node that cannot find a contract answers
+        // with an error, not with an empty state; to a cold read an empty one
+        // is a GET that did not answer, and is re-fetched.
+        HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) if state.as_ref().is_empty() => {
+            Incoming::Unusable(Unusable::UnknownKind("ContractResponse::GetResponse (no state)"))
+        }
+        HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) => {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&key.id().as_bytes()[..32]);
+            Incoming::Got { id, state: state.as_ref().to_vec() }
+        }
+        HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+            Incoming::Ack(AckKind::Updated(key.to_string()))
         }
         HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, .. }) => {
             Incoming::HeadChanged {
@@ -506,6 +577,22 @@ fn frames(req: &ClientRequest<'static>, stream_id: u32) -> Result<Vec<Vec<u8>>, 
         .iter()
         .map(|c| bincode::serialize(c).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// The contract a node's GET refusal names, if the bytes are one.
+fn get_refused(bytes: &[u8]) -> Option<[u8; 32]> {
+    use freenet_stdlib::client_api::{ClientError, ContractError, ErrorKind, RequestError};
+    let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
+        return None;
+    };
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Get { key, .. })) => {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&key.id().as_bytes()[..32]);
+            Some(id)
+        }
+        _ => None,
+    }
 }
 
 /// Handles for tests that need to build what a node would send.

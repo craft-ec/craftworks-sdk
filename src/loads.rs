@@ -21,6 +21,10 @@ pub enum Ended {
     /// It will not arrive. The engine could not answer, nothing answered
     /// within the bound, or it is larger than this client will hold.
     Unavailable,
+    /// The page read it itself (`crate::cold`) and the NODE stopped answering
+    /// within the read's deadline. Not "missing": nothing said the data is not
+    /// there, only that nobody answered.
+    NotAnswering,
 }
 
 /// What the caller should do with a page that just arrived.
@@ -306,13 +310,30 @@ impl Loads {
         }
     }
 
+    /// The page's own cold read of this load hit its deadline: the node is not
+    /// answering. Not recorded as loaded, and not "missing".
+    pub fn on_not_answering(&mut self, id: u64) {
+        if self.open.remove(&id).is_some() {
+            self.ended.push((id, Ended::NotAnswering));
+        }
+    }
+
     /// End every load that has outlived the budget. The reads parked on them
     /// get a fact instead of a wait.
     pub fn time_out(&mut self, now_ms: u64) -> Vec<u64> {
+        self.time_out_except(now_ms, |_| false)
+    }
+
+    /// [`Loads::time_out`], except the loads `kept` names. These are the
+    /// page's own cold reads: they end by their BLOCKS' deadlines ("not
+    /// answering", [`Loads::on_not_answering`]), never by the whole load's
+    /// age. A cold load of many blocks can outlive 30 s while each block is
+    /// still inside its own deadline, and it is still loading.
+    pub fn time_out_except(&mut self, now_ms: u64, kept: impl Fn(u64) -> bool) -> Vec<u64> {
         let over: Vec<u64> = self
             .open
             .iter()
-            .filter(|(_, l)| now_ms.saturating_sub(l.at_ms) > self.budget_ms)
+            .filter(|(id, l)| !kept(**id) && now_ms.saturating_sub(l.at_ms) > self.budget_ms)
             .map(|(id, _)| *id)
             .collect();
         for id in &over {

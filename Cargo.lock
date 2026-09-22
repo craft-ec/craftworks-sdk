@@ -1913,6 +1913,9 @@ name = "wire"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
+ "engine-delegate",
+ "freenet-prolly",
  "freenet-stdlib",
 ]
 

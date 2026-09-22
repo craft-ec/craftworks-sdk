@@ -1,0 +1,81 @@
+//! A block as the network holds it: the contract it lives in, and the state
+//! that contract stores.
+//!
+//! MOVED HERE from engine-delegate (`blocks::contract_for`,
+//! `blocks::contract_deriver`, `entry::block_state`) for the engine-in-the-page
+//! shape (ENGINE-SHAPE.md §6): the PAGE now puts and gets blocks itself, and
+//! this crate is the one place allowed to know freenet's types. The page and
+//! the delegate must name a block's contract identically — a different
+//! derivation is a different contract — so there is ONE copy, pinned equal to
+//! engine-delegate's by `wire/tests/block.rs` until that copy is deleted with
+//! the shell.
+//!
+//! QUESTION (engineer2 / main): engine-delegate keeps its own copies for now —
+//! it is read-only for this branch, and §6 deletes most of it. Switch it onto
+//! these (a `wire` dependency) with the signer PR, or leave it to die?
+
+use freenet_prolly::Cid;
+use freenet_stdlib::prelude::*;
+
+/// The contract instance a block lives in.
+///
+/// A block's cid is the Block contract's PARAMS — `blake3(kind ‖ body)` — and
+/// the instance id is derived by the node from the code AND the params, so
+/// the two are different 32-byte values.
+pub fn contract_for(code: &[u8], cid: &Cid) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&block_contract(code, cid).key().id().as_bytes()[..32]);
+    out
+}
+
+/// `contract_for` with the code hashed ONCE: matching answers to blocks
+/// hashes ~100 KiB of contract code per candidate otherwise. The node's
+/// derivation, restated: `blake3(code_hash ‖ params)` (freenet-stdlib
+/// `generate_id`), pinned equal to `contract_for` by the tests.
+pub fn contract_deriver(code: &[u8]) -> impl Fn(&Cid) -> Cid {
+    let code_hash = CodeHash::from_code(code);
+    let code_hash: [u8; 32] = code_hash.as_ref().try_into().expect("a code hash is 32 bytes");
+    move |cid: &Cid| {
+        let mut h = blake3::Hasher::new();
+        h.update(&code_hash);
+        h.update(cid);
+        *h.finalize().as_bytes()
+    }
+}
+
+/// The Block contract, instantiated for the block whose id is `cid`.
+pub fn block_contract(code: &[u8], cid: &Cid) -> ContractContainer {
+    ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(code.to_vec())),
+        Parameters::from(cid.to_vec()),
+    )))
+}
+
+/// The Block contract's STATE for a block: `kind ‖ body`, with the kind
+/// RECOVERED by trying the four — at most four BLAKE3 passes, and exact,
+/// because the id is a hash over the kind byte and only the right one can
+/// match. `None`: the id does not hash these bytes under any kind, and the
+/// contract would refuse it.
+pub fn block_state(id: &Cid, body: &[u8]) -> Option<Vec<u8>> {
+    use freenet_prolly::kind;
+    // 6 is the Block contract's PACK kind, which freenet-prolly does not
+    // export: packs are a transport the tree itself never holds.
+    for k in [kind::TREE_NODE, kind::RAW, kind::PARITY, 6u8] {
+        if freenet_prolly::block_id(k, body) == *id {
+            let mut v = Vec::with_capacity(1 + body.len());
+            v.push(k);
+            v.extend_from_slice(body);
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The inverse, for a GET answer: a Block contract's state is `kind ‖ body`,
+/// and the block id it holds is computed from it, never looked up — a state
+/// that hashes to something nobody asked for is caught by the caller's
+/// verify-by-id rather than trusted because a map said so.
+pub fn block_of_state(state: &[u8]) -> Option<(Cid, &[u8])> {
+    let (&kind, body) = state.split_first()?;
+    Some((freenet_prolly::block_id(kind, body), body))
+}
