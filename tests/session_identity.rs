@@ -8,12 +8,11 @@
 //! another's.
 
 use craftworks_sdk::{CachedStore, Store as _};
-use engine_delegate::shell::Inbound;
 
 /// One tab: a `CachedStore` over a connection to the node.
 struct Tab {
     store: CachedStore,
-    conn: testkit::Conn,
+    conn: testkit::PageConn,
     /// `(session, write_id)` of every write this tab sent, read off the wire.
     sent: Vec<(u64, u64)>,
     /// Every write state this tab was told, with the session it names
@@ -29,7 +28,7 @@ fn session_of(env: &protocol::Envelope) -> u64 {
 }
 
 impl Tab {
-    fn on(conn: testkit::Conn) -> Tab {
+    fn on(conn: testkit::PageConn) -> Tab {
         let mut t = Tab { store: testkit::cached_store().0, conn, sent: Vec::new(), told: Vec::new() };
         t.store.client.send(&protocol::Request::Identity);
         t.pump();
@@ -43,7 +42,7 @@ impl Tab {
                     self.sent.push((session_of(&env), write_id));
                 }
             }
-            for reply in self.conn.step(vec![Inbound::Client(frame)]) {
+            for reply in self.conn.frame(&frame) {
                 match protocol::decode_reply(&reply) {
                     Ok(protocol::Reply::SessionWriteState { session, state, .. }) => self.told.push((Some(session), state)),
                     Ok(protocol::Reply::WriteState { state, .. }) => self.told.push((None, state)),
@@ -61,7 +60,7 @@ impl Tab {
 }
 
 /// What the node holds at `key`, read by a fresh tab.
-fn stored(conn: &testkit::Conn, key: &[u8]) -> Option<Vec<u8>> {
+fn stored(conn: &testkit::PageConn, key: &[u8]) -> Option<Vec<u8>> {
     use craftworks_sdk::store::Reads;
     let mut reader = Tab::on(conn.clone());
     let mut hi = key.to_vec();
@@ -70,7 +69,7 @@ fn stored(conn: &testkit::Conn, key: &[u8]) -> Option<Vec<u8>> {
     let frames = reader.store.take_outbound();
     let mut rows = Vec::new();
     for frame in frames {
-        for reply in reader.conn.step(vec![Inbound::Client(frame)]) {
+        for reply in reader.conn.frame(&frame) {
             if let Ok(protocol::Reply::Page { entries, at, .. }) = protocol::decode_reply(&reply) {
                 rows = entries.clone();
                 reader.store.on_page(key, &hi, entries, at.root);
@@ -85,7 +84,7 @@ fn stored(conn: &testkit::Conn, key: &[u8]) -> Option<Vec<u8>> {
 /// writes stored.**
 #[test]
 fn two_tabs_and_a_reload_are_three_sessions_and_all_three_writes_land() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut tab1 = Tab::on(conn.clone());
     let mut tab2 = Tab::on(conn.clone());
@@ -112,7 +111,7 @@ fn two_tabs_and_a_reload_are_three_sessions_and_all_three_writes_land() {
 /// another's.
 #[test]
 fn each_tabs_write_states_name_that_tabs_session() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut tab1 = Tab::on(conn.clone());
     let mut tab2 = Tab::on(conn.clone());
@@ -161,7 +160,7 @@ fn a_write_state_for_another_session_is_ignored() {
 /// was never told. The node's answers are HELD so both writes wait together.
 #[test]
 fn two_sessions_waiting_on_parity_together_are_each_told_it_completed() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut conn = node.connect();
     let mut tab1 = Tab::on(conn.clone());
     let mut tab2 = Tab::on(conn.clone());
@@ -246,7 +245,7 @@ fn a_page_with_no_session_refuses_its_writes_by_name_and_sends_nothing() {
 /// loads were refused 8 of 8.
 #[test]
 fn six_page_loads_of_eight_bindings_each_are_all_accepted() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut c = node.connect();
     let sub = |i: u64| protocol::Request::SubscribeRange {
         sub_id: i,
@@ -280,7 +279,7 @@ fn six_page_loads_of_eight_bindings_each_are_all_accepted() {
 /// A3's other bound: ONE page cannot take every other page's room.
 #[test]
 fn one_page_is_refused_past_its_own_share() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut c = node.connect();
     let per = engine::Params::default().max_subscriptions_per_client as u64;
     let session = protocol::mint_session(0x77);
@@ -305,7 +304,7 @@ fn one_page_is_refused_past_its_own_share() {
 /// nothing it asked for is done.
 #[test]
 fn the_delegate_answers_a_bad_session_by_name_and_applies_nothing() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut c = node.connect();
     let r = c.client_as(0xABCD_0000_0000_0123, protocol::CURRENT, &protocol::Request::Write {
         write_id: 1,

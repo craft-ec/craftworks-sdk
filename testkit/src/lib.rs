@@ -34,6 +34,8 @@
 //! an input.
 
 pub mod full_node;
+pub mod page_node;
+pub use page_node::{PageConn, PageNode};
 pub use full_node::{Conn, DumpConnOnPanic, FullNode, Served};
 
 use std::cell::RefCell;

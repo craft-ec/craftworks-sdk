@@ -6,7 +6,7 @@
 //! won, and its re-send publishes at seq 2 with both writes readable.
 
 use protocol::{Op, Reply, Request, WriteState};
-use testkit::full_node::FullNode;
+use testkit::page_node::PageNode;
 
 fn told(r: &[Vec<u8>], id: u64) -> Vec<WriteState> {
     r.iter()
@@ -20,7 +20,7 @@ fn told(r: &[Vec<u8>], id: u64) -> Vec<WriteState> {
 
 #[test]
 fn a_second_writer_at_the_same_seq_is_lost_not_published_and_its_re_send_publishes() {
-    let node = FullNode::new();
+    let node = PageNode::new();
     let (mut a, mut b) = (node.connect(), node.connect());
     a.client(&Request::Identity);
     b.client(&Request::Identity); // both read NO head: each will commit seq 1

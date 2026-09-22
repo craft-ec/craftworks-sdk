@@ -1,5 +1,5 @@
 //! craftworks-sdk#160: a write that changes NOTHING, through the path an app
-//! takes -- `Db` over `CachedStore` over the real engine (`FullNode`).
+//! takes -- `Db` over `CachedStore` over the real engine (`PageNode`).
 //!
 //! `Db::define` writes the schema unconditionally, and an app defines every
 //! domain on every open. Traced here before the fix, LIVE, not latent: the
@@ -9,10 +9,9 @@
 
 use craftworks_sdk::store::{Edit, Store as _};
 use craftworks_sdk::*;
-use engine_delegate::shell::Inbound;
 use serde_json::json;
 use std::collections::BTreeMap;
-use testkit::full_node::{Conn, FullNode};
+use testkit::page_node::{PageConn, PageNode};
 
 struct At;
 impl Env for At {
@@ -30,8 +29,8 @@ const EVERYTHING: [u8; 64] = [0xFF; 64];
 struct Page {
     db: Db<CachedStore, At>,
     clock: testkit::Clock,
-    _node: FullNode,
-    conn: Conn,
+    _node: PageNode,
+    conn: PageConn,
     /// Per write id, how many times it went on the wire.
     sends: BTreeMap<u64, usize>,
     verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
@@ -39,7 +38,7 @@ struct Page {
 
 impl Page {
     fn new() -> Page {
-        let node = FullNode::new();
+        let node = PageNode::new();
         let conn = node.connect();
         let (store, clock) = testkit::cached_store();
         let mut p = Page {
@@ -74,7 +73,7 @@ impl Page {
             }
             for reply in self
                 .conn
-                .step(frames.into_iter().map(Inbound::Client).collect())
+                .frames(&frames)
             {
                 let decoded = protocol::decode_reply(&reply);
                 // This page's OWN write states, as the store reads them: named
@@ -129,14 +128,14 @@ fn defining_a_domain_twice_publishes_and_the_next_write_goes() {
     p.db.define("tasks", &schema()).expect("the first define");
     p.pump();
     p.seconds(5);
-    let puts_before = p.conn.served(testkit::full_node::Served::Put);
+    let puts_before = p.conn.served(testkit::page_node::Served::Put);
 
     let w2 = p.db.store_mut().next_write_id();
     p.db.define("tasks", &schema())
         .expect("the same define again");
     p.pump();
     p.seconds(90);
-    let puts_for_w2 = p.conn.served(testkit::full_node::Served::Put) - puts_before;
+    let puts_for_w2 = p.conn.served(testkit::page_node::Served::Put) - puts_before;
 
     let w3 = p.db.store_mut().next_write_id();
     p.db.store_mut()

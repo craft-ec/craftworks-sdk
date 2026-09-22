@@ -11,7 +11,7 @@
 use craftworks_sdk::loads::Page;
 use craftworks_sdk::{Loads, Refresh};
 use protocol::{Bound, Op, Reply, Request};
-use testkit::full_node::{FullNode, Served};
+use testkit::page_node::{PageNode, Served};
 
 const AT: protocol::At = protocol::At { seq: 1, root: [1u8; 32] };
 
@@ -65,14 +65,14 @@ fn control_a_page_inside_the_range_completes() {
 }
 
 /// The architect's tree: 120 notes and 120 tasks, published, read COLD.
-fn cold_tree() -> FullNode {
-    let writer = FullNode::new();
+fn cold_tree() -> PageNode {
+    let writer = PageNode::new();
     let mut w = writer.connect();
     w.client(&Request::Identity);
     let mut ops: Vec<Op> = (0..120u32).map(|i| Op::Put(format!("d/notes/{i:04}").into_bytes(), vec![1u8; 900])).collect();
     ops.extend((0..120u32).map(|i| Op::Put(format!("d/tasks/{i:04}").into_bytes(), vec![2u8; 900])));
     w.client(&Request::Write { write_id: 1, ops });
-    FullNode::cold_over(&writer)
+    PageNode::cold_over(&writer)
 }
 
 fn range(req_id: u64, domain: &str) -> Request {

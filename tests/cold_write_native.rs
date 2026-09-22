@@ -21,7 +21,6 @@
 //! is nothing loaded to read.
 
 use craftworks_sdk::{decide, CachedStore, Loads, Outcome};
-use engine_delegate::shell::Inbound;
 
 const AT: protocol::At = protocol::At {
     seq: 1,
@@ -34,7 +33,7 @@ type Db = craftworks_sdk::Db<CachedStore, craftworks_sdk::SystemEnv>;
 struct Page {
     db: Db,
     loads: Loads,
-    conn: testkit::Conn,
+    conn: testkit::PageConn,
     /// Range requests this page has sent. The measurement: a parked call must
     /// ASK for what it is waiting on, or the wait is for ever.
     requests: usize,
@@ -49,7 +48,7 @@ impl Page {
                 [7u8; 4],
             ),
             loads: Loads::new(),
-            conn: testkit::FullNode::new().connect(),
+            conn: testkit::PageNode::new().connect(),
             requests: 0,
         };
         // START THE ENGINE, exactly as a session does: `Identity` is what
@@ -77,7 +76,7 @@ impl Page {
                         self.requests += 1;
                     }
                 }
-                for reply in self.conn.step(vec![Inbound::Client(frame)]) {
+                for reply in self.conn.frame(&frame) {
                     self.db.store_mut().on_inbound(&reply);
                     self.take_page(&reply);
                 }

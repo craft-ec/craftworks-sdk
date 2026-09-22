@@ -15,7 +15,6 @@
 
 use craftworks_sdk::cached_store::WRITES_IN_FLIGHT;
 use craftworks_sdk::{CachedStore, Store as _};
-use engine_delegate::shell::Inbound;
 use std::collections::VecDeque;
 
 /// The node's fair-queue capacity per key: 100 waiting + 1 in service.
@@ -46,7 +45,7 @@ fn drive(what: &str, cap: usize, mut step: impl FnMut() -> bool) {
 }
 
 struct QueueingNode {
-    conn: testkit::Conn,
+    conn: testkit::PageConn,
     queue: VecDeque<Vec<u8>>,
     /// Requests refused because the queue was full: a host error, no verdict.
     refused: usize,
@@ -68,7 +67,7 @@ impl QueueingNode {
     /// Serve ONE request, as the node runs one delegate round-trip at a time.
     fn serve_one(&mut self, store: &mut CachedStore) -> bool {
         let Some(f) = self.queue.pop_front() else { return false };
-        for reply in self.conn.step(vec![Inbound::Client(f)]) {
+        for reply in self.conn.frame(&f) {
             store.on_inbound(&reply);
         }
         true
@@ -78,7 +77,7 @@ impl QueueingNode {
 /// `n` writes made back-to-back, as the handoff makes them, then the node
 /// serves until nothing is left.
 fn publish(n: u32) -> (CachedStore, QueueingNode) {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let (mut s, _clock) = testkit::cached_store();
     let mut q = QueueingNode { conn, queue: VecDeque::new(), refused: 0, deepest: 0 };
@@ -164,7 +163,7 @@ fn three_hundred_writes_every_one_the_copy_takes_publishes() {
 #[test]
 fn a_slow_node_publishes_every_write_and_none_is_rolled_back_while_held() {
     const SERVE_MS: u64 = 300;
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let (mut s, clock) = testkit::cached_store();
     let mut q = QueueingNode { conn, queue: VecDeque::new(), refused: 0, deepest: 0 };
@@ -211,7 +210,7 @@ fn a_slow_node_publishes_every_write_and_none_is_rolled_back_while_held() {
 /// answered, go at 60 s; write 17 goes at 110 s and not before.
 #[test]
 fn control_a_sent_write_with_no_verdict_times_out_from_its_send() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let (mut s, clock) = testkit::cached_store();
     let mut q = QueueingNode { conn, queue: VecDeque::new(), refused: 0, deepest: 0 };

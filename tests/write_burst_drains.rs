@@ -17,13 +17,12 @@
 
 use craftworks_sdk::store::Store as _;
 use craftworks_sdk::CachedStore;
-use engine_delegate::shell::Inbound;
-use testkit::full_node::{Conn, FullNode};
+use testkit::page_node::{PageConn, PageNode};
 
 struct Page {
     store: CachedStore,
-    _node: FullNode,
-    conn: Conn,
+    _node: PageNode,
+    conn: PageConn,
     /// Every `Write` this page put on the wire, in the order it sent them.
     sent: Vec<u64>,
     /// Every write the ENGINE ACCEPTED, in the order it accepted them.
@@ -37,11 +36,10 @@ struct Page {
 
 impl Page {
     fn new() -> Page {
-        // THE SHARED FIXTURE, not forty hand-rolled lines. `testkit::Node`
-        // answers `Op::Put` only; a burst needs a node that reads its head on
-        // `Identity` and feeds its own answers back, which is what
-        // `FullNode` is for (sdk#101).
-        let node = FullNode::new();
+        // THE SHARED FIXTURE, not forty hand-rolled lines: the page path's
+        // node (`page::Server` over a scripted client API), which reads its
+        // head on `Identity` and feeds its own answers back (sdk#101).
+        let node = PageNode::new();
         let conn = node.connect();
         let mut p = Page {
             store: testkit::cached_store().0,
@@ -63,8 +61,8 @@ impl Page {
     /// contention this file exists to test never happened — the first version
     /// of this harness passed with the fix removed.
     ///
-    /// A delegate really is invoked with everything that has arrived, and a
-    /// burst made faster than a round trip really does land together.
+    /// A burst made faster than a round trip really does land together, and
+    /// the page's Server takes every frame before any node answer.
     fn pump(&mut self) {
         for _ in 0..200 {
             let frames = self.store.take_outbound();
@@ -78,9 +76,9 @@ impl Page {
                         self.sent.push(write_id);
                     }
                 }
-                inbound.push(Inbound::Client(frame));
+                inbound.push(frame);
             }
-            for reply in self.conn.step(inbound) {
+            for reply in self.conn.frames(&inbound) {
                 if let Some((write_id, state)) = protocol::decode_reply(&reply)
                     .ok()
                     .and_then(|r| self.store.client.own_write_state(&r))

@@ -5,7 +5,7 @@
 //! waiter cap at 256 full group ids, 112 of 200 never did. Named by a group's
 //! first id (32 B) the cap holds 1024 and the caps still sum under the bound.
 use protocol::{Op, Reply, Request, WriteState};
-use testkit::full_node::FullNode;
+use testkit::page_node::PageNode;
 
 const T0: u64 = 1_790_000_000_000;
 
@@ -21,7 +21,7 @@ fn states(r: &[Vec<u8>], id: u64) -> Vec<WriteState> {
 
 #[test]
 fn two_hundred_one_row_writes_back_to_back_all_hear_parity_complete() {
-    let node = FullNode::new();
+    let node = PageNode::new();
     let mut c = node.connect();
     c.client(&Request::Identity);
     let mut all: Vec<Vec<u8>> = Vec::new();
@@ -61,10 +61,9 @@ fn two_hundred_one_row_writes_back_to_back_all_hear_parity_complete() {
     let complete = (0..writes)
         .filter(|w| states(&all, 100 + w).contains(&WriteState::ParityComplete))
         .count();
-    println!(
-        "  {complete} of {writes} one-row writes heard ParityComplete; shed {:?}",
-        c.shed()
-    );
+    // (The Shell also printed what its engine SHED to keep the delegate's
+    // context saveable. A page has no context to keep, so nothing is shed.)
+    println!("  {complete} of {writes} one-row writes heard ParityComplete");
     assert_eq!(
         complete as u64,
         writes,

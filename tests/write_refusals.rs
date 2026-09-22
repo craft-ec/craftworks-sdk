@@ -2,7 +2,7 @@
 //! its reason, and the writes behind it go on.
 //!
 //! Driven through the path an app takes -- `CachedStore` over the real engine
-//! (`FullNode`) -- with a tick every second past `pending_timeout_ms`.
+//! (`PageNode`) -- with a tick every second past `pending_timeout_ms`.
 //!
 //! Measured before the fix, on this harness:
 //!   * 200 x 2 KiB in one write, then 10 ordinary writes: the batch was
@@ -16,15 +16,14 @@
 use craftworks_sdk::copy::Refused;
 use craftworks_sdk::store::{Edit, Store as _};
 use craftworks_sdk::CachedStore;
-use engine_delegate::shell::Inbound;
 use std::collections::{BTreeMap, BTreeSet};
-use testkit::full_node::{Conn, FullNode};
+use testkit::page_node::{PageConn, PageNode};
 
 struct Page {
     store: CachedStore,
     clock: testkit::Clock,
-    _node: FullNode,
-    conn: Conn,
+    _node: PageNode,
+    conn: PageConn,
     /// Per write id: the keys each SEND carried, bulk keys left out.
     sends: BTreeMap<u64, Vec<Vec<String>>>,
     verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
@@ -34,7 +33,7 @@ struct Page {
 
 impl Page {
     fn new() -> Page {
-        let node = FullNode::new();
+        let node = PageNode::new();
         let conn = node.connect();
         let (store, clock) = testkit::cached_store();
         let mut p = Page {
@@ -77,7 +76,7 @@ impl Page {
             }
             for reply in self
                 .conn
-                .step(frames.into_iter().map(Inbound::Client).collect())
+                .frames(&frames)
             {
                 if let Some((write_id, state)) = protocol::decode_reply(&reply)
                     .ok()

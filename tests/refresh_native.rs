@@ -12,12 +12,11 @@
 //! context, the same node underneath.
 
 use craftworks_sdk::{Answer, CachedStore, Loads, Refresh, Store as _};
-use engine_delegate::shell::Inbound;
 
 /// A client: a `CachedStore` whose traffic crosses a real engine.
 struct Client {
     store: CachedStore,
-    conn: testkit::Conn,
+    conn: testkit::PageConn,
     /// Every `ChangesSince` this client sent. The measurement.
     asks: usize,
     /// Full reloads `Refresh` decided on.
@@ -58,16 +57,16 @@ fn key(n: u32) -> Vec<u8> {
 
 impl Client {
     /// A client with its OWN delegate context: a second DEVICE.
-    fn new(node: &testkit::FullNode) -> Client {
+    fn new(node: &testkit::PageNode) -> Client {
         Client::on(node.connect())
     }
 
     /// A client sharing a delegate context: a second TAB on one node.
-    fn tab(conn: testkit::Conn) -> Client {
+    fn tab(conn: testkit::PageConn) -> Client {
         Client::on(conn)
     }
 
-    fn on(conn: testkit::Conn) -> Client {
+    fn on(conn: testkit::PageConn) -> Client {
         let mut c = Client {
             store: testkit::cached_store().0,
             conn,
@@ -96,7 +95,7 @@ impl Client {
                     self.asks += 1;
                 }
             }
-            for reply in self.conn.step(vec![Inbound::Client(frame)]) {
+            for reply in self.conn.frame(&frame) {
                 match protocol::decode_reply(&reply) {
                     Ok(protocol::Reply::Page { entries, .. }) => self.received += entries.len(),
                     Ok(protocol::Reply::Delta { changes, .. }) => self.received += changes.len(),
@@ -332,7 +331,7 @@ impl Client {
 #[test]
 #[ignore = "TWO DEVICES, not two tabs: an engine does not adopt a head it did not write (sdk#78, phase 6)"]
 fn a_second_device_does_not_see_the_first_ones_write() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = Client::new(&node); // its OWN context
     let mut b = Client::new(&node); // and its own
 
@@ -357,7 +356,7 @@ fn a_second_device_does_not_see_the_first_ones_write() {
 /// itself — and the whole point is that reading alone never can.
 #[test]
 fn control_a_client_that_never_asks_sees_nothing_new() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = Client::new(&node);
     let mut b = Client::new(&node);
 
@@ -379,10 +378,10 @@ fn control_a_client_that_never_asks_sees_nothing_new() {
 /// **TWO TABS: B, WHICH WROTE NOTHING, SEES A'S ROW BY ASKING.**
 ///
 /// The shape a node actually gives them: one delegate, ONE context, two
-/// connections. Measured, not assumed — see `Conn`.
+/// connections. Measured, not assumed — see `PageConn`.
 #[test]
 fn two_tabs_on_one_node_see_each_others_writes() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn.clone());
@@ -414,7 +413,7 @@ fn two_tabs_on_one_node_see_each_others_writes() {
 /// THE CONTROL for the tab case: without asking, B sees nothing.
 #[test]
 fn control_a_tab_that_never_asks_sees_nothing_new() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn.clone());
@@ -533,7 +532,7 @@ struct Asked {
 /// never received one at all, which is how sdk#140 hid. Now the completed
 /// load seeds it, as the session does.
 fn changed_since_load(n: u32) -> (Client, Refresh, Asked) {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn);
@@ -626,8 +625,8 @@ const ZERO: [u8; 32] = [0u8; 32];
 
 /// Two tabs; `rows` rows written by A; B loaded the domain (seeding `seen`
 /// only if `seed`); A then changes one row; B is asked to refresh.
-fn one_change(rows: u32, seed: bool) -> (Client, Refresh, testkit::Conn, usize, usize) {
-    let node = testkit::FullNode::new();
+fn one_change(rows: u32, seed: bool) -> (Client, Refresh, testkit::PageConn, usize, usize) {
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn.clone());
@@ -636,7 +635,7 @@ fn one_change(rows: u32, seed: bool) -> (Client, Refresh, testkit::Conn, usize, 
     if seed { b.load_into(&mut r) } else { b.load() }
     assert_eq!(b.rows(), rows as usize, "the domain was set up");
     a.write(&key(0), b"v2");
-    let gets = conn.served(testkit::full_node::Served::Get);
+    let gets = conn.served(testkit::page_node::Served::Get);
     let zero = conn.fetches_of(&ZERO);
     b.received = 0;
     let _ = b.refresh(&mut r);
@@ -671,7 +670,7 @@ fn control_with_no_recorded_root_the_engine_refuses_and_the_domain_reloads() {
 /// the fix did not turn the fallback into a hang.
 #[test]
 fn an_unobtainable_old_root_still_falls_back_to_a_full_reload() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn);
@@ -693,9 +692,9 @@ fn an_unobtainable_old_root_still_falls_back_to_a_full_reload() {
 #[test]
 fn a_change_notification_over_a_thousand_rows_costs_a_delta_not_a_reload() {
     let (old, _, before_conn, before_gets, _) = one_change(1000, false);
-    let before = before_conn.served(testkit::full_node::Served::Get) - before_gets;
+    let before = before_conn.served(testkit::page_node::Served::Get) - before_gets;
     let (new, _, after_conn, after_gets, _) = one_change(1000, true);
-    let after = after_conn.served(testkit::full_node::Served::Get) - after_gets;
+    let after = after_conn.served(testkit::page_node::Served::Get) - after_gets;
     println!("  per change notification, 1,000 rows: blocks fetched {before} -> {after}; entries handed to the tab {} -> {}", old.received, new.received);
     assert_eq!(new.deltas, 1);
     assert_eq!(old.received, 1000, "before: the whole domain, again");
@@ -708,7 +707,7 @@ fn a_change_notification_over_a_thousand_rows_costs_a_delta_not_a_reload() {
 #[test]
 fn a_delta_applied_copy_and_a_full_reload_hold_equal_rows() {
     use craftworks_sdk::store::Reads;
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn.clone());
@@ -746,7 +745,7 @@ fn band_key(parent: u8, n: u32) -> Vec<u8> {
 /// told of everything would pass.
 #[test]
 fn a_band_watch_is_told_of_its_band_and_not_of_a_siblings() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let conn = node.connect();
     let mut a = Client::tab(conn.clone());
     let mut b = Client::tab(conn);

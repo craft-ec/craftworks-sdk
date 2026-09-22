@@ -87,7 +87,7 @@ fn a_second_create_at_the_same_slot_is_exists_and_the_root_does_not_move() {
 /// before either write lands are the stated residual until sdk#148 step 1.)
 #[test]
 fn two_sessions_creating_the_same_slot_store_exactly_one_record() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = Db::new(EngineStore::new(node.connect()), clock(NOW).0, [0, 0, 0, 1]);
     a.store_mut().identity().unwrap();
     a.define("tasks", &task()).unwrap();

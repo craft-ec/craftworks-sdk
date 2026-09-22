@@ -14,7 +14,7 @@
 //! already enforced and already tested rather than one written for it later.
 
 use protocol::{Reply, Request, MAX_PAGE_ENTRIES};
-use testkit::FullNode;
+use testkit::PageNode;
 
 fn write(n: u64) -> Request {
     Request::Write {
@@ -27,8 +27,8 @@ fn write(n: u64) -> Request {
 }
 
 /// A node with enough rows that a page limit can actually bite.
-fn node_with_rows(n: u64) -> (FullNode, testkit::Conn) {
-    let node = FullNode::new();
+fn node_with_rows(n: u64) -> (PageNode, testkit::PageConn) {
+    let node = PageNode::new();
     let mut c = node.connect();
     c.client(&Request::Identity);
     for i in 1..=n {
@@ -37,7 +37,7 @@ fn node_with_rows(n: u64) -> (FullNode, testkit::Conn) {
     (node, c)
 }
 
-fn page_of(conn: &testkit::Conn, req_id: u64) -> Option<(usize, u32)> {
+fn page_of(conn: &testkit::PageConn, req_id: u64) -> Option<(usize, u32)> {
     conn.replies().into_iter().find_map(|r| match r {
         Reply::Page {
             req_id: id,
@@ -49,7 +49,7 @@ fn page_of(conn: &testkit::Conn, req_id: u64) -> Option<(usize, u32)> {
     })
 }
 
-fn ask(conn: &mut testkit::Conn, req_id: u64, max_entries: u32) {
+fn ask(conn: &mut testkit::PageConn, req_id: u64, max_entries: u32) {
     conn.client(&Request::Range {
         req_id,
         lo: protocol::Bound::Unbounded,
