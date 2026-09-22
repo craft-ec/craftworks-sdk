@@ -989,6 +989,7 @@ name = "page"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "craftec-register-contract",
  "ed25519-dalek",
  "elsa",

@@ -257,6 +257,10 @@ impl PageIo {
                     }
                 }
             }
+            // The head moved on the node (the subscription the head read
+            // took): the RELOAD TRIGGER. A hint only — the page READS the
+            // register and adopts only what that read shows (sdk#225).
+            Incoming::HeadChanged { key } if key == self.register_key => self.server.head_hint(),
             Incoming::Refused(r) => self.unusable.push(format!("the node refused: {}", r.said)),
             Incoming::Unusable(u) => self.unusable.push(format!("{u:?}")),
             _ => {}

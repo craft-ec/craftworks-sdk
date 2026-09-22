@@ -396,3 +396,59 @@ fn control_a_new_apps_not_found_is_no_head() {
     let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 7, entries, .. } = x { Some(entries.len()) } else { None }).collect();
     assert_eq!(pages, vec![0], "a new app did not open its (empty) tree: {r:?}");
 }
+
+/// Frames only, NO clock: an op re-sent on its RTO, or the idle backstop,
+/// cannot be what moved the page (sdk#225's hint test must not pass on the
+/// backstop).
+fn pump(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
+    let mut replies = Vec::new();
+    for _ in 0..500 {
+        let frames = io.take_frames();
+        replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
+        if frames.is_empty() {
+            break;
+        }
+        *now += 1;
+        for f in frames {
+            if let Some(answer) = node.serve(&f) {
+                io.inbound(&answer, Ms(*now));
+            }
+        }
+    }
+    replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
+    replies
+}
+
+/// sdk#225's RELOAD TRIGGER through real frames: another tab moves the
+/// register; the node pushes `UpdateNotification` for it to the idle tab,
+/// which READS the register and adopts what it holds — with no clock
+/// passing, so neither a re-send nor the backstop is what moved it — and then
+/// reads the other tab's row.
+#[test]
+fn a_head_changed_from_the_node_makes_an_idle_page_read_and_adopt_the_new_head() {
+    let mut node = WireNode::new(&[8u8; 32]);
+    let (mut a, mut b) = (page_io(&node), page_io(&node));
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "a", "1")), 1).contains(&WriteState::Published));
+    client(&mut b, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut b, &mut node, &mut now, &write(1, "b", "2")), 1).contains(&WriteState::Published));
+    assert_eq!(node.head().map(|h| h.0), Some(2));
+    // `a` is idle at seq 1. The node's push:
+    let key = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(REGISTER_CODE.to_vec())),
+        Parameters::from(node.register_params.clone()),
+    )))
+    .key();
+    let state = node.contracts.get(&node.register_id).cloned().expect("a register");
+    let push = ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+        key,
+        update: UpdateData::State(State::from(state)),
+    }));
+    a.inbound(&push, Ms(now));
+    pump(&mut a, &mut node, &mut now);
+    a.client(&protocol::encode_session_request(4, 9, &Request::Get { req_id: 7, key: b"b".to_vec() }).expect("encodes"));
+    let r = pump(&mut a, &mut node, &mut now);
+    let got = r.iter().any(|x| matches!(x, Reply::Value { req_id: 7, value: Some(v) } if v == b"2"));
+    assert!(got, "the idle tab did not adopt the head the node pushed: {r:?}");
+}

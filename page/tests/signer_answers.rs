@@ -70,15 +70,24 @@ fn control_a_sign_shaped_answer_ends_the_wait() {
     assert_eq!(p.unusable().len(), 1);
 }
 
-/// A fork is NEWS: surfaced as `forked()`, never retried.
+/// THE SAME IDENTITY NEVER FORKS (owner, sdk#225): an older signer's
+/// `Refused(Forked{mine, read})` is the Register's tie-break having kept
+/// ANOTHER device's head at this seq. It is recovered exactly as `NotNext{read}`:
+/// the register is READ (1b), what it holds is adopted, the commit built on the
+/// displaced head is `Lost` for the app to send again — and nothing is unusable.
 #[test]
-fn a_fork_is_surfaced_loudly_and_never_retried() {
+fn a_fork_answer_is_recovered_as_not_next_and_nothing_is_unusable() {
     let (mut p, now, id) = at_sign(PutPath::Page);
-    let fork = Why::Forked { mine: Head { seq: 1, root: [1; 32] }, read: Head { seq: 1, root: [2; 32] } };
+    let theirs = Head { seq: 1, root: [2; 32] };
+    let fork = Why::Forked { mine: Head { seq: 1, root: [1; 32] }, read: theirs };
     p.answer(Answer::Signer { id, answer: A::Refused(fork) }, Ms(now + 1));
-    assert!(p.forked().is_some_and(|m| m.starts_with("FORKED")), "a fork was not surfaced");
-    p.tick(Ms(now + 10 * page::rto::RTO_INITIAL_MS as u64));
-    assert_eq!(signs(&p.take_ops()), 0, "a fork was retried");
+    let ops = p.take_ops();
+    assert!(ops.contains(&Op::ReadHead), "the register was not read after a Forked answer: {ops:?}");
+    p.answer(Answer::Head(Some((theirs.seq, theirs.root))), Ms(now + 2));
+    assert_eq!(p.published(), (theirs.seq, theirs.root), "the register's head was not adopted");
+    let lost = p.take_notices().into_iter().any(|(_, w, s)| w == WriteId(1) && s == State::Lost);
+    assert!(lost, "the write built on the displaced head was not handed back as Lost");
+    assert!(p.unusable().is_empty(), "a same-key fork left the page unusable: {:?}", p.unusable());
 }
 
 /// `HeadUnknown`: the node does not hold the register, so the page READS it
@@ -170,4 +179,72 @@ fn the_engine_hears_the_page_clock_in_seconds() {
     }
     let stalled = p.take_notices().iter().filter(|(_, _, s)| *s == State::Stalled).count();
     assert_eq!(stalled, 0, "a write was told Stalled after one second: the engine read milliseconds as seconds");
+}
+
+/// S1b: an OLD signer's `Forked` while the page already stands on the
+/// register's head at that seq. The old rule refuses EVERY ask until the
+/// register passes that seq, so the sign is not re-asked (a loop otherwise),
+/// it is named once, and it is asked again once a head read shows the
+/// register past it.
+#[test]
+fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_register_moves() {
+    let (mut p, now, id) = at_sign(PutPath::Page);
+    // A REAL tree to stand on (the empty one), so the next write applies
+    // without a fetch.
+    let theirs = Head { seq: 1, root: p.published().1 };
+    let fork = || A::Refused(Why::Forked { mine: Head { seq: 1, root: [1; 32] }, read: theirs });
+    // Adopt theirs first (S1), then write again: the commit is built on
+    // theirs, and the old signer still says Forked.
+    p.answer(Answer::Signer { id, answer: fork() }, Ms(now + 1));
+    let _ = p.take_ops();
+    p.answer(Answer::Head(Some((theirs.seq, theirs.root))), Ms(now + 2));
+    let _ = p.take_notices();
+    p.write(ClientId(1), WriteId(2), vec![(b"k2".to_vec(), WriteOp::Put(b"v2".to_vec()))]);
+    let mut id2 = None;
+    for _ in 0..20 {
+        for op in p.take_ops() {
+            match op {
+                Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now + 3)),
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now + 3)),
+                Op::Sign { id, prev_seq, prev_root, .. } => {
+                    assert_eq!((prev_seq, prev_root), (theirs.seq, theirs.root), "not built on the adopted head");
+                    id2 = Some(id);
+                }
+                _ => {}
+            }
+        }
+        if id2.is_some() {
+            break;
+        }
+    }
+    let id2 = id2.expect("the second write asked the signer");
+    p.answer(Answer::Signer { id: id2, answer: fork() }, Ms(now + 4));
+    let named = p.unusable().iter().filter(|u| u.contains("SIGNER UPGRADE NEEDED")).count();
+    assert!(p.needs_signer_upgrade(), "the host was not asked for the current signer");
+    assert_eq!(named, 1, "the old signer's refusal was not named once: {:?}", p.unusable());
+    for k in 1..=20 {
+        p.tick(Ms(now + 4 + k * page::rto::RTO_INITIAL_MS as u64));
+        assert_eq!(signs(&p.take_ops()), 0, "re-asked an old signer that refuses every ask: a loop");
+    }
+    // The register moves past seq 1: the page is not left waiting. The newer
+    // head is adopted, the commit built on seq 1 is dead and handed back
+    // `Lost` for the app to send again, and the upgrade ask is withdrawn.
+    let later = now + 30 * page::rto::RTO_INITIAL_MS as u64;
+    p.answer(Answer::Head(Some((2, [9; 32]))), Ms(later));
+    p.tick(Ms(later + 1));
+    assert_eq!(p.published().0, 2, "the register's newer head was not adopted");
+    let lost = p.take_notices().into_iter().any(|(_, w, s)| w == WriteId(2) && s == State::Lost);
+    assert!(lost, "the commit on the old seq was left waiting instead of handed back");
+    assert!(!p.needs_signer_upgrade(), "still asking for an upgrade after the register moved");
+}
+
+/// A `HeadChanged` hint is READ even while a commit is owed (the architect's
+/// #5 on sdk#225): parity and heads are owed right after every commit, which
+/// is exactly when another device's head is likeliest to land.
+#[test]
+fn a_hint_is_read_while_a_commit_is_owed() {
+    let (mut p, _, _) = at_sign(PutPath::Page);
+    let _ = p.take_ops();
+    p.head_hint();
+    assert!(p.take_ops().contains(&Op::ReadHead), "a hint was dropped because a commit is owed");
 }

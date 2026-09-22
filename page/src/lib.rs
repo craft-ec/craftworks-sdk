@@ -30,7 +30,7 @@
 //! | … the register is 2+ behind | a NAMED failure in [`Page::unusable`] — unrecoverable (one record per signer) and unreachable by 1b |
 //! | … the register does not answer | read again on its deadline; after [`VERIFY_BUDGET_MS`], "the register is not answering" — nothing adopted |
 //! | `Refused(RootNotHeld / HeadUnknown / RecordNotSaved)` | the same sign request after a doubling backoff from [`BACKOFF_MS`]; for `HeadUnknown` the register is READ first, which makes the signer's node hold it |
-//! | `Refused(Forked)` | LOUD: [`Page::forked`] and `unusable`; never retried — a fork is news |
+//! | `Refused(Forked { read, .. })` (an OLD signer: the new one answers `NotNext`, sdk#225) | the same identity never forks: as `NotNext { current: read }` — read, then adopt. If the page already stands on `read`, the old rule refuses every ask until the register passes that seq: NOT re-asked, named once in [`Page::unusable`], and asked again when a head read shows the register past it |
 //! | a signer answer under any id but the in-flight sign's (SG02), or not shaped like a sign's | ignored: it does NOT clear the sign's deadline |
 //! | any other `Refused(why)` | nothing more is asked; recorded in [`Page::unusable`]; the engine's own clock reports the write `Stalled` |
 //! | `Updated` | a register read ([`Op::ReadHead`]) — this commit's read-back, or a landing's verify read: an UpdateResponse carries nothing (F56). On a peered node the register is read through the head SUBSCRIPTION (F55); the web layer frames it so |
@@ -221,6 +221,10 @@ enum Waiting {
     Verify,
     /// This executor's read-back after an UPDATE.
     ReadBack,
+    /// A register read on the node's `HeadChanged` hint, or the idle
+    /// backstop ([`HEAD_BACKSTOP_MS`]): is there a head this page has not
+    /// adopted?
+    Hint,
 }
 
 /// The head this page owes the network: a commit's `(seq, root)` from the
@@ -259,6 +263,44 @@ struct Verify {
 /// adopts nothing. The cold reads' per-block budget.
 pub const VERIFY_BUDGET_MS: u64 = 30_000;
 
+/// With nothing else reading the register, a head read at least this often:
+/// the subscription's renewal cadence. A `HeadChanged` from the node is a
+/// hint the node may DROP (a full notification channel, an evicted
+/// subscription), so an idle page must still learn of a head that moved
+/// (the architect's attack on sdk#225).
+pub const HEAD_BACKSTOP_MS: u64 = 120_000;
+
+/// F56's equal-seq rule as the Register decides it: of two heads at ONE seq,
+/// the one whose VALUE has the lower BLAKE3 wins (`(terminal, seq,
+/// Reverse(BLAKE3(value)))`). A head's value today is its bare root; the
+/// ledger-format PR (a versioned `root ‖ prev`) changes what is hashed, and
+/// must change this with it.
+/// The head a Register record names: `(seq, root)`, from `RG01 | flags |
+/// terminal | seq (u64 LE) | vlen (u16 LE) | value`, the value's first 32
+/// bytes being the root. A SECOND reader of the layout
+/// (`engine_delegate::register::record_of` is the first): the page crate does
+/// not link the delegate, and `tests/record_head.rs` pins the two to agree.
+/// The ledger-format PR, which changes every head reader at once, folds it
+/// back into one.
+pub fn record_head(state: &[u8]) -> Option<(u64, Cid)> {
+    let rest = state.strip_prefix(b"RG01")?;
+    let (&flags, rest) = rest.split_first()?;
+    if flags & 0b01 == 0 {
+        return None;
+    }
+    let (_terminal, rest) = rest.split_first()?;
+    let (seq, rest) = rest.split_at_checked(8)?;
+    let seq = u64::from_le_bytes(seq.try_into().ok()?);
+    let (vlen, rest) = rest.split_at_checked(2)?;
+    let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
+    let value = rest.get(..vlen)?;
+    Some((seq, value.get(..32)?.try_into().ok()?))
+}
+
+fn beats(a: &Cid, b: &Cid) -> bool {
+    blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes()
+}
+
 /// One page's writes: the engine, the executor state, and what to send.
 pub struct Page {
     path: PutPath,
@@ -288,9 +330,16 @@ pub struct Page {
     /// Landings started, and the most UPDATEs one landing needed.
     landings: u32,
     most_landing_updates: u32,
-    /// The loud one: the signer saw this key's head FORKED (two roots at one
-    /// seq). Never retried; a fork is news.
-    forked: Option<String>,
+    /// An OLD signer refused on a same-seq record while this page already
+    /// stood on the register's head at that seq: the sign waits until a head
+    /// read shows the register past it (sdk#225's S1b).
+    old_signer_fork_at: Option<u64>,
+    /// The records the signer signed for THIS page, by seq: `(root, bytes)`.
+    /// What an equal-seq sighting is judged against — this page's claim at
+    /// that seq, whose bytes it can land again if they win the tie-break.
+    my_records: BTreeMap<u64, (Cid, Vec<u8>)>,
+    /// When the register was last read (any head answer), for the backstop.
+    last_head_at: u64,
     /// A PUT to repeat at the next tick (a transient refusal).
     put_again: BTreeMap<Cid, Vec<u8>>,
     /// Deadlines of the ops in flight, and each op to re-send.
@@ -357,7 +406,9 @@ impl Page {
             verify: None,
             landings: 0,
             most_landing_updates: 0,
-            forked: None,
+            old_signer_fork_at: None,
+            my_records: BTreeMap::new(),
+            last_head_at: 0,
             put_again: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -469,6 +520,12 @@ impl Page {
                 v.again_at = None;
             }
             self.send(Waiting::Verify, Op::ReadHead);
+        }
+        // THE BACKSTOP: a hint can be dropped, so an idle page reads the
+        // register at least every HEAD_BACKSTOP_MS.
+        if self.engine_has_head && self.verify.is_none() && !self.reading_head() && now.saturating_sub(self.last_head_at) >= HEAD_BACKSTOP_MS {
+            self.last_head_at = now;
+            self.send(Waiting::Hint, Op::ReadHead);
         }
         // The engine's OWN head read (recovery) has the same budget: it is
         // asked again on its RTO for as long as it takes, and past the budget
@@ -607,7 +664,18 @@ impl Page {
             // One register read can answer both a recovery read and a
             // read-back: a head is a head, whoever asked.
             Answer::Head(h) => {
+                self.last_head_at = self.now;
                 self.answered(&Waiting::Warm);
+                // S1b: the register moved past an old signer's same-seq
+                // record, so it signs again.
+                if let (Some(at), Some((seq, _))) = (self.old_signer_fork_at, h) {
+                    if seq > at {
+                        self.old_signer_fork_at = None;
+                        if self.owed.is_some() {
+                            self.sign_again = Some(self.now);
+                        }
+                    }
+                }
                 if self.answered(&Waiting::RecoverHead).is_some() {
                     match h {
                         Some((seq, root)) => self.step(Event::HeadRead { epoch: EPOCH, seq, root }),
@@ -620,6 +688,9 @@ impl Page {
                 }
                 if self.answered(&Waiting::Verify).is_some() {
                     self.on_verify(h);
+                }
+                if self.answered(&Waiting::Hint).is_some() {
+                    self.on_hint(h);
                 }
             }
         }
@@ -645,7 +716,7 @@ impl Page {
             };
             match s {
                 A::Signed(state) | A::AlreadySigned(state) => {
-                    self.signer_records.insert(state.clone());
+                    self.note_record(&state);
                     self.send(Waiting::Update, Op::Update { state });
                     let v = self.verify.as_mut().expect("checked");
                     v.updates += 1;
@@ -685,6 +756,9 @@ impl Page {
         match s {
             A::Signed(state) => {
                 self.signer_records.insert(state.clone());
+                if let Some((sq, rt)) = record_head(&state) {
+                    self.my_records.insert(sq, (rt, state.clone()));
+                }
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
                 self.send(Waiting::Update, Op::Update { state });
@@ -693,6 +767,9 @@ impl Page {
                 // Requirement 2: ONE signature per prev, and it is landed as
                 // it is — its blocks were stored before it was signed.
                 self.signer_records.insert(state.clone());
+                if let Some((sq, rt)) = record_head(&state) {
+                    self.my_records.insert(sq, (rt, state.clone()));
+                }
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
                 // Its root may not be this commit's (a record another page
@@ -727,11 +804,27 @@ impl Page {
                 let wait = (BACKOFF_MS << self.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
                 self.sign_again = Some(self.now + wait);
             }
-            // LOUD: a fork is news, never a silent retry.
-            A::Refused(why @ Why::Forked { .. }) => {
-                let msg = format!("FORKED: the signer saw two roots at one seq for this key: {why:?}");
-                self.forked = Some(msg.clone());
-                self.unusable.push(msg);
+            // THE SAME IDENTITY NEVER FORKS (owner, sdk#225). Only an OLD
+            // signer says this (the new one answers `NotNext{read}`): another
+            // device's head won the Register's tie-break at this seq. It is
+            // recovered as that `NotNext` is — read, then adopt (1b) — unless
+            // the page already stands on `read`: then the old rule will refuse
+            // every ask until the Register passes this seq, so the sign is NOT
+            // re-asked (a loop otherwise) and that is named, once.
+            A::Refused(Why::Forked { read, .. }) => {
+                if self.engine.published_seq() == read.seq && self.engine.published_root() == read.root {
+                    if self.old_signer_fork_at != Some(read.seq) {
+                        self.old_signer_fork_at = Some(read.seq);
+                        self.unusable.push(format!(
+                            "SIGNER UPGRADE NEEDED: this signer predates the same-identity rule (sdk#225) and refuses every sign while its record and the register differ at seq {}; load the current version (its signer ships with the page). It signs again once the register moves past that seq",
+                            read.seq
+                        ));
+                    }
+                } else {
+                    let now = self.now;
+                    self.verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None, first_at: now });
+                    self.send(Waiting::Verify, Op::ReadHead);
+                }
             }
             // Permanent: not provisioned, not a successor, cannot sign,
             // unreadable.
@@ -769,6 +862,22 @@ impl Page {
     fn on_verify(&mut self, h: Option<(u64, Cid)>) {
         let Some(v) = self.verify.clone() else { return };
         let reg_seq = h.map_or(0, |(s, _)| s);
+        // The register at the signer's seq, and THIS page's own record there
+        // is another root that wins the tie-break: LAND it (its UPDATE has not
+        // merged here yet) rather than adopt a head about to lose. Judged by
+        // the record, never by what the signer named: at an equal seq the
+        // signer names the REGISTER's head (rule c), so `v.root` is theirs.
+        if let Some((seq, root)) = h.filter(|(s, _)| *s == v.seq) {
+            if let Some(bytes) = self.my_winning_record(seq, &root) {
+                if let Some(v) = self.verify.as_mut() {
+                    v.landing = true;
+                    v.updates += 1;
+                    self.most_landing_updates = self.most_landing_updates.max(v.updates);
+                }
+                self.send(Waiting::Update, Op::Update { state: bytes });
+                return;
+            }
+        }
         if let Some((seq, root)) = h.filter(|(s, _)| *s >= v.seq) {
             self.verify = None;
             self.owed = None;
@@ -807,6 +916,75 @@ impl Page {
         self.ask_land();
     }
 
+    /// A register read on a hint (the node's `HeadChanged`, or the idle
+    /// backstop): the RELOAD TRIGGER (sdk#225). This read IS the register read
+    /// 1b asks for, so what it shows may be adopted as it is.
+    ///
+    /// * No head, or the head the engine stands on, or an older one: nothing
+    ///   (a hint never opens an empty tree).
+    /// * This page's owed head, or another root at its seq: the read-back's
+    ///   judgement, which knows this page's claim there.
+    /// * The SAME seq as the published head under another root, and this
+    ///   page's record there wins the tie-break: it is landed again (its
+    ///   UPDATE has not merged here), never displaced.
+    /// * Otherwise a newer head, or a same-seq winner: ADOPTED
+    ///   (`HeadConflict`). A commit in flight dies `Lost`, as in any conflict.
+    fn on_hint(&mut self, h: Option<(u64, Cid)>) {
+        let Some((seq, root)) = h else { return };
+        if !self.engine_has_head || self.verify.is_some() {
+            return;
+        }
+        let (pseq, proot) = (self.engine.published_seq(), self.engine.published_root());
+        if (seq, root) == (pseq, proot) || seq < pseq {
+            return;
+        }
+        if self.owed.as_ref().is_some_and(|o| o.record.is_some() && o.seq == seq) {
+            self.on_read_back(h);
+            return;
+        }
+        if let Some(bytes) = self.my_winning_record(seq, &root) {
+            self.send(Waiting::Update, Op::Update { state: bytes });
+            return;
+        }
+        self.owed = None;
+        self.step(Event::HeadConflict { seq, root });
+    }
+
+    /// The node said the head register changed (`HeadChanged`, a HINT a node
+    /// can fabricate or drop): read it. ALWAYS — owed parity, an owed head
+    /// or idle alike (the architect's #5): only a verify in progress, which
+    /// reads the register itself, makes it redundant.
+    pub fn head_hint(&mut self) {
+        if self.verify.is_none() && !self.deadlines.contains_key(&Waiting::Hint) {
+            self.send(Waiting::Hint, Op::ReadHead);
+        }
+    }
+
+    /// A record the signer returned (`Signed`, or `AlreadySigned`: the one it
+    /// already made for that prev, under THIS page's key): kept whole for
+    /// invariant 2, and by the head it names for the tie-break.
+    fn note_record(&mut self, state: &[u8]) {
+        self.signer_records.insert(state.to_vec());
+        if let Some((seq, root)) = record_head(state) {
+            self.my_records.insert(seq, (root, state.to_vec()));
+        }
+    }
+
+    /// THIS page's own record at `seq`, if it is another root than `root` and
+    /// WINS the tie-break against it: the bytes to land. A head that loses to
+    /// such a record is never adopted — the register will hold mine once my
+    /// UPDATE merges (the architect's attack on sdk#225, case 1).
+    fn my_winning_record(&self, seq: u64, root: &Cid) -> Option<Vec<u8>> {
+        self.my_records.get(&seq).filter(|(m, _)| m != root && beats(m, root)).map(|(_, b)| b.clone())
+    }
+
+    /// Is a register read already in flight?
+    fn reading_head(&self) -> bool {
+        [Waiting::Warm, Waiting::RecoverHead, Waiting::Verify, Waiting::ReadBack, Waiting::Hint]
+            .iter()
+            .any(|w| self.deadlines.contains_key(w))
+    }
+
     /// The register read back after an UPDATE: the only way a commit is
     /// Published (F56: the UPDATE's answer says nothing).
     fn on_read_back(&mut self, h: Option<(u64, Cid)>) {
@@ -815,6 +993,8 @@ impl Page {
             return; // a read-back outlived its commit
         }
         let want = (owed.seq, owed.root);
+        let mine_wins = matches!(h, Some((s, r)) if s == want.0 && self.my_winning_record(s, &r).is_some());
+        let Some(owed) = self.owed.as_mut() else { return };
         match h {
             Some(read) if read == want => {
                 let owed = self.owed.take().expect("owed");
@@ -829,6 +1009,19 @@ impl Page {
                     self.send(Waiting::Update, Op::Update { state });
                 } else {
                     // Asked at the next tick (tick() re-reads while stale).
+                }
+            }
+            // THE SAME SEQ, ANOTHER ROOT, and THIS page's record there wins
+            // the tie-break: the register will hold mine once my UPDATE
+            // merges (the node has not merged it yet). Adopting theirs would
+            // drop a head that is about to win (the architect's attack on
+            // sdk#225, case 1). Read again; after HEAD_READS, UPDATE again.
+            Some((seq, _)) if seq == want.0 && mine_wins => {
+                owed.stale_reads += 1;
+                if owed.stale_reads >= HEAD_READS {
+                    owed.stale_reads = 0;
+                    let state = owed.record.clone().expect("an UPDATE was sent");
+                    self.send(Waiting::Update, Op::Update { state });
                 }
             }
             Some((seq, root)) => {
@@ -916,6 +1109,14 @@ impl Page {
         }
     }
 
+    /// The signer answering this page predates sdk#225's rule (a stale
+    /// bundle: in page mode the signer's code ships with the page), and it
+    /// refuses every sign until the register moves on. The host asks for the
+    /// current version rather than letting the page sit.
+    pub fn needs_signer_upgrade(&self) -> bool {
+        self.old_signer_fork_at.is_some()
+    }
+
     /// Has the engine recovered its head (its own head read answered)? A read
     /// before this would be answered from the empty tree it started on.
     pub fn recovered(&self) -> bool {
@@ -934,7 +1135,8 @@ impl Page {
         let held = self.held_again.values().map(|(at, _)| *at);
         let verify = self.verify.as_ref().and_then(|v| v.again_at);
         let puts = (!self.put_again.is_empty()).then_some(self.now);
-        deadlines.chain(sign).chain(held).chain(verify).chain(puts).min().map(Ms)
+        let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
+        deadlines.chain(sign).chain(held).chain(verify).chain(puts).chain(backstop).min().map(Ms)
     }
 
     /// The retry clock now: `(RTO ms, SRTT ms, GET window)`.
@@ -952,6 +1154,7 @@ impl Page {
         self.drop_dead_head();
         if recovery && !self.engine_has_head {
             self.engine_has_head = true;
+            self.last_head_at = self.now;
             for w in std::mem::take(&mut self.held_writes) {
                 self.step(w);
             }
@@ -1113,11 +1316,6 @@ impl Page {
         (self.landings, self.most_landing_updates)
     }
 
-    /// The signer saw this key's head FORKED: shown to the person, never
-    /// retried.
-    pub fn forked(&self) -> Option<&str> {
-        self.forked.as_deref()
-    }
 
     /// Every record the signer returned (invariant 2's evidence).
     pub fn signer_records(&self) -> &BTreeSet<Vec<u8>> {

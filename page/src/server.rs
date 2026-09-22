@@ -137,6 +137,16 @@ impl Server {
     }
 
     /// The page's clock.
+    /// The node's `HeadChanged` for the head register: a hint the page acts
+    /// on by READING the register (sdk#225's reload trigger).
+    pub fn head_hint(&mut self) {
+        let mut out = Outbound::default();
+        self.page.head_hint();
+        self.drain(&mut out);
+        self.answer_call(&mut out);
+        self.out.extend(out.replies);
+    }
+
     pub fn tick(&mut self, now_ms: Ms) {
         let mut out = Outbound::default();
         self.page.tick(now_ms);

@@ -17,6 +17,8 @@ elsa = "1"
 signer-proto = { path = "../signer-proto" }
 # The page ↔ engine protocol page::Server answers (ruling B).
 protocol = { path = "../protocol" }
+# F56's equal-seq tie-break is the lower BLAKE3 of the head's value (sdk#225).
+blake3 = { version = "1", default-features = false }
 
 [dev-dependencies]
 # The OLD side of the differential: the Shell over a scripted node.
