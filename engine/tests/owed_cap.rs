@@ -60,6 +60,7 @@ fn past_the_owed_cap_writes_still_publish_and_their_parity_is_left_to_the_scrub(
             client: ClientId(1),
             write_id: WriteId(i + 1),
             ops: vec![(format!("k/{i:05}").into_bytes(), Op::Put(vec![(i % 251) as u8; 1400]))],
+            reads: Vec::new(),
         });
         let all = publish(&mut h, fx);
         told_all.push((i + 1, told(&all, i + 1)));
@@ -88,6 +89,7 @@ fn past_the_owed_cap_writes_still_publish_and_their_parity_is_left_to_the_scrub(
         client: ClientId(1),
         write_id: WriteId(999),
         ops: vec![(b"z/after".to_vec(), Op::Put(b"x".to_vec()))],
+        reads: Vec::new(),
     });
     assert!(told(&publish(&mut h, fx), 999).contains(&State::Published));
 }

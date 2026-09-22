@@ -113,6 +113,7 @@ fn a_context_round_trips_and_refuses_what_it_cannot_read() {
                 )
             })
             .collect(),
+        reads: Vec::new(),
     });
     store.absorb(&out);
 
@@ -218,6 +219,7 @@ fn the_context_costs_what_it_is_budgeted() {
         client: ClientId(1),
         write_id: WriteId(1),
         ops,
+        reads: Vec::new(),
     });
     store.absorb(&out);
     let in_flight = e.to_context().expect("in flight").len();
@@ -358,6 +360,7 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
         client: ClientId(1),
         write_id: WriteId(1),
         ops,
+        reads: Vec::new(),
     });
     let commit_blocks = out
         .iter()
@@ -436,6 +439,7 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops,
+            reads: Vec::new(),
         });
         let after = e.root();
         (out, before, after)
@@ -625,6 +629,7 @@ fn owed_parity_survives_a_rehydration_and_is_still_put() {
         client: ClientId(1),
         write_id: WriteId(1),
         ops,
+        reads: Vec::new(),
     });
     store.absorb(&queue);
     let mut live: Vec<Effect> = Vec::new();
@@ -750,6 +755,7 @@ fn a_damaged_context_is_refused_without_panicking_or_allocating_the_world() {
         client: ClientId(1),
         write_id: WriteId(1),
         ops,
+        reads: Vec::new(),
     });
     let good = e.to_context().expect("context");
 
@@ -819,6 +825,7 @@ fn a_refused_context_recovers_from_the_head_and_gives_the_unknown_write_no_verdi
         client: ClientId(1),
         write_id: WriteId(1),
         ops: vec![(b"k".to_vec(), Op::Put(vec![5u8; 40]))],
+        reads: Vec::new(),
     });
     store.absorb(&out);
     let good = e.to_context().expect("context");

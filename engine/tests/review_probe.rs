@@ -24,6 +24,7 @@ fn a_failed_pack_put_is_re_emitted() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops: vec![put("a".into(), b"x".to_vec())],
+            reads: Vec::new(),
         }
     );
     let pack = fx
@@ -65,6 +66,7 @@ fn parity_complete_fires_once_per_write() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops,
+            reads: Vec::new(),
         }
     );
     let mut pc = 0;

@@ -324,6 +324,7 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
             client: ClientId(1),
             write_id: WriteId(1),
             ops,
+            reads: Vec::new(),
         });
         ws.absorb(&out);
         out

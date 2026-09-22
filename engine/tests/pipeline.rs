@@ -23,6 +23,7 @@ fn write(client: u64, id: u64, ops: Vec<(Vec<u8>, Op)>) -> Event {
         client: c(client),
         write_id: w(id),
         ops,
+        reads: Vec::new(),
     }
 }
 
