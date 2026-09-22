@@ -15,6 +15,7 @@ fn write(id: u64, key: &[u8], value: &[u8]) -> Event {
         client: ClientId(1),
         write_id: WriteId(id),
         ops: vec![(key.to_vec(), Op::Put(value.to_vec()))],
+        reads: Vec::new(),
     }
 }
 

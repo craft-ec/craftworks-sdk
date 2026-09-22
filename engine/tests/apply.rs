@@ -61,6 +61,7 @@ fn write_one(key: &str, val: &[u8]) -> Event {
         client: ClientId(1),
         write_id: WriteId(1),
         ops: vec![(key.as_bytes().to_vec(), Op::Put(val.to_vec()))],
+        reads: Vec::new(),
     }
 }
 
@@ -235,6 +236,7 @@ fn a_second_write_while_one_is_parked_is_refused() {
         client: ClientId(2),
         write_id: WriteId(2),
         ops: vec![(b"k/00200".to_vec(), Op::Put(b"second".to_vec()))],
+        reads: Vec::new(),
     });
     assert_eq!(
         states(&out),
@@ -427,6 +429,7 @@ fn a_parked_write_of_many_tiny_ops_is_capped_on_what_it_costs() {
         client: ClientId(1),
         write_id: WriteId(1),
         ops,
+        reads: Vec::new(),
     });
     assert_eq!(
         states(&out),

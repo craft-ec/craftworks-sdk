@@ -147,6 +147,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                     client: ClientId(1),
                     write_id: wid,
                     ops,
+                    reads: Vec::new(),
                 }
             );
             accepted_only.insert(wid);
@@ -397,6 +398,7 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops,
+            reads: Vec::new(),
         }
     );
 
@@ -490,6 +492,7 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+            reads: Vec::new(),
         }
     );
     let held: Vec<(Cid, Vec<u8>)> = first
@@ -526,6 +529,7 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
                 client: ClientId(1),
                 write_id: WriteId(n),
                 ops: vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))],
+                reads: Vec::new(),
             }
         );
         absorb(&mut seen, &out);
@@ -661,6 +665,7 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+            reads: Vec::new(),
         }
     );
     for tick in 1..=(t * 3) {
@@ -820,6 +825,7 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
                 client: ClientId(1),
                 write_id: WriteId(n),
                 ops: vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))],
+                reads: Vec::new(),
             }
         ) {
             if let Effect::Notify {
@@ -929,6 +935,7 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops: vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))],
+            reads: Vec::new(),
         }
     );
     // Write 2 folds behind it.
@@ -938,6 +945,7 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
             client: ClientId(1),
             write_id: WriteId(2),
             ops: vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))],
+            reads: Vec::new(),
         }
     );
     let mut failed = false;
@@ -995,6 +1003,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
                 client: ClientId(1),
                 write_id: WriteId(1),
                 ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
+                reads: Vec::new(),
             }
         );
         let mut queue = out;
@@ -1068,6 +1077,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
                 client: ClientId(1),
                 write_id: WriteId(2),
                 ops: vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))],
+                reads: Vec::new(),
             }
         );
         assert_eq!(
@@ -1121,6 +1131,7 @@ fn recomputing_owed_parity_is_bounded_and_resumes() {
             client: ClientId(1),
             write_id: WriteId(1),
             ops,
+            reads: Vec::new(),
         }
     );
     let mut guard = 0;

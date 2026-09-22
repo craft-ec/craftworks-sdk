@@ -30,6 +30,7 @@ fn write(id: u64, n: u32, salt: u8) -> Event {
                 )
             })
             .collect(),
+        reads: Vec::new(),
     }
 }
 

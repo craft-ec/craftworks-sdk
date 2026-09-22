@@ -81,6 +81,7 @@ fn commit(h: &mut Harness, write_id: u64, ops: Vec<(Vec<u8>, Op)>) -> Vec<Effect
         client: c(1),
         write_id: w(write_id),
         ops,
+        reads: Vec::new(),
     });
     let mut i = 0;
     let mut guard = 0;

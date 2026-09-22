@@ -33,6 +33,7 @@ fn write() -> Event {
         client: ClientId(1),
         write_id: WriteId(1),
         ops: vec![(b"k".to_vec(), Op::Put(vec![1u8; 40]))],
+        reads: Vec::new(),
     }
 }
 

@@ -187,6 +187,10 @@ fn state_tag(s: State) -> u64 {
         State::Failed => 5,
         State::Lost => 6,
         State::TooLarge { .. } => 7,
+        // Never reached on this path: the delegate's writes carry no reads
+        // (`reads: Vec::new()` below), so nothing can conflict. Tagged as a
+        // failure, which is what it would mean to this client.
+        State::Conflict => 5,
     }
 }
 
@@ -847,6 +851,7 @@ impl<B: Blocks> Shell<B> {
                         protocol::Op::Delete(k) => (k, engine::Op::Delete),
                     })
                     .collect(),
+                reads: Vec::new(),
             },
             // UNUSED BY ANY CLIENT (sdk#146): `src/`, `web/src/` and `js/` send
             // no `AskWrite` (read at all three, against 3 `Request::Write`
@@ -1152,6 +1157,9 @@ impl<B: Blocks> Shell<B> {
                         State::Busy => W::Busy,
                         State::Failed => W::Failed,
                         State::Lost => W::Lost,
+                        // Unreachable here: this path sends no reads. Nothing
+                        // was applied, so `Failed` is true to this client.
+                        State::Conflict => W::Failed,
                         State::TooLarge { bound, limit, got } => W::too_large(
                             match bound {
                                 engine::WriteBound::CommitBlocks => {

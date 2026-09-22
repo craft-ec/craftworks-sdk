@@ -110,6 +110,71 @@ pub enum Op {
     Delete,
 }
 
+/// What a write READ, stated with it: the key as the writer saw it
+/// (sdk#148's `Commit{reads, writes}`). The engine checks every expectation
+/// against the tree it is about to apply ON, inside that same apply (R0), and
+/// a write whose read no longer holds applies NOTHING and ends `Conflict`.
+/// That is the only place the check can live: between an outside check and
+/// the apply another commit can land, and only the engine knows which root it
+/// applies on.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Expect {
+    /// The key is not in the tree (`create_at`: nothing is there yet).
+    Absent,
+    /// The key is in the tree, whatever its value (a child needs its parent
+    /// to EXIST, not to be unchanged).
+    Present,
+    /// The key holds exactly this value: [`leaf_hash`] of the bytes read
+    /// (`update` over the record it patched, a delete of what was read).
+    Value([u8; 32]),
+}
+
+/// A value as the tree STORES it: inline bytes, or a reference to the block
+/// that holds it. What a `Conflict` reports as the key's current value, so the
+/// app can merge without reading a copy that may lag the tree.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LeafForm {
+    Inline(Vec<u8>),
+    Ref { cid: Cid, len: u32 },
+}
+
+impl LeafForm {
+    fn of(v: freenet_prolly::node::Value<'_>) -> LeafForm {
+        match v {
+            freenet_prolly::node::Value::Inline(b) => LeafForm::Inline(b.to_vec()),
+            freenet_prolly::node::Value::Ref { cid, len } => LeafForm::Ref { cid, len },
+        }
+    }
+
+    /// The hash an [`Expect::Value`] compares.
+    pub fn hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        match self {
+            LeafForm::Inline(b) => {
+                h.update(&[0]);
+                h.update(b);
+            }
+            LeafForm::Ref { cid, len } => {
+                h.update(&[1]);
+                h.update(cid);
+                h.update(&len.to_le_bytes());
+            }
+        }
+        *h.finalize().as_bytes()
+    }
+}
+
+/// The [`Expect::Value`] for a value the writer READ as `bytes`.
+///
+/// It hashes the value's STORED FORM (`Value::for_bytes`, the format's one
+/// decision of inline vs reference), never the bytes themselves: a value
+/// stored by reference is then compared by its reference, and the engine never
+/// fetches a large value just to compare it (the architect's attack on the
+/// design). Same stored form ⇔ same value.
+pub fn leaf_hash(bytes: &[u8]) -> [u8; 32] {
+    LeafForm::of(freenet_prolly::node::Value::for_bytes(bytes).0).hash()
+}
+
 /// How far along a write is.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -151,6 +216,11 @@ pub enum State {
         limit: usize,
         got: usize,
     },
+    /// TERMINAL, nothing applied: a key the write READ no longer holds what
+    /// it read ([`Expect`]). The key and its current value ride beside it in
+    /// [`Effect::Conflicted`]. NEVER re-sent as it is — the same write
+    /// conflicts the same way; what to do next is the app's (sdk#148).
+    Conflict,
 }
 
 /// Which bound a [`State::TooLarge`] write is over.
@@ -173,6 +243,9 @@ pub enum Event {
         client: ClientId,
         write_id: WriteId,
         ops: Vec<(Vec<u8>, Op)>,
+        /// What it read: checked against the tree the ops land on, in the same
+        /// apply. Empty = a blind write, applied as ever.
+        reads: Vec<(Vec<u8>, Expect)>,
     },
     /// A block was READ BACK from our own node. Never an ack: W1 says an
     /// acknowledgement is not evidence the block is there.
@@ -321,6 +394,16 @@ pub enum Provisioned {
     Test,
 }
 
+/// Why a write's reads did not all hold.
+enum ReadsCheck {
+    /// Their paths are not held yet: park, fetch, check again.
+    Need(Vec<Cid>),
+    /// This key does not hold what the write read.
+    Differs { key: Vec<u8>, current: Option<LeafForm> },
+    /// The tree cannot be read (a corrupt block): nothing applied.
+    Unreadable,
+}
+
 /// A group's three parity ids. The unit redundancy comes in: three blocks are
 /// one group's protection and are worth nothing separately.
 pub type ParityIds = [Cid; 3];
@@ -356,6 +439,15 @@ pub enum Effect {
         client: ClientId,
         write_id: WriteId,
         state: State,
+    },
+    /// Beside a `Notify{Conflict}`: WHICH read no longer holds, and what the
+    /// key holds now (`None`: absent) — the value the engine just read, so the
+    /// app can merge without re-reading a copy that may lag.
+    Conflicted {
+        client: ClientId,
+        write_id: WriteId,
+        key: Vec<u8>,
+        current: Option<LeafForm>,
     },
 
     // ---- the read path ----
@@ -789,6 +881,9 @@ struct ParkedWrite {
     /// is part of the apply and is redone each round, so what is carried is
     /// the client's own request and nothing derived from it.
     ops: Vec<(Vec<u8>, Op)>,
+    /// What it read, checked again at every resume on THAT resume's root (R0).
+    #[serde(default)]
+    reads: Vec<(Vec<u8>, Expect)>,
     /// The root the apply started from. A write parked across a head change
     /// is stale: its edits belong to a tree that is no longer current.
     root: Cid,
@@ -1313,7 +1408,8 @@ impl<B: Blocks> Engine<B> {
                 client,
                 write_id,
                 ops,
-            } => self.on_write(client, write_id, ops),
+                reads,
+            } => self.on_write(client, write_id, ops, reads),
             Event::PutConfirmed(id) => self.on_confirmed(id),
             Event::PutFailed(id) => self.on_failed(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
@@ -1550,7 +1646,7 @@ impl<B: Blocks> Engine<B> {
                         .collect();
                 }
                 let p = p.clone();
-                return self.apply_write(p.client, p.write_id, p.ops, p.bytes);
+                return self.apply_write(p.client, p.write_id, p.ops, p.reads, p.bytes);
             }
         }
         // A WRITE THIS ENGINE DOES NOT KNOW IS NOT A LOST WRITE. It may be
@@ -1933,11 +2029,13 @@ impl<B: Blocks> Engine<B> {
         client: ClientId,
         write_id: WriteId,
         ops: Vec<(Vec<u8>, Op)>,
+        reads: Vec<(Vec<u8>, Expect)>,
     ) -> Vec<Effect> {
         let size: usize = ops
             .iter()
             .map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 })
-            .sum();
+            .sum::<usize>()
+            + reads.iter().map(|(k, _)| k.len() + 33).sum::<usize>();
         // ONE COMMIT AT A TIME. A write arriving while a commit is in flight
         // is REFUSED, not folded.
         //
@@ -1972,7 +2070,7 @@ impl<B: Blocks> Engine<B> {
             }];
         }
 
-        self.apply_write(client, write_id, ops, size)
+        self.apply_write(client, write_id, ops, reads, size)
     }
 
     /// Apply a write to the tree, parking it if the path is not held.
@@ -1986,8 +2084,29 @@ impl<B: Blocks> Engine<B> {
         client: ClientId,
         write_id: WriteId,
         ops: Vec<(Vec<u8>, Op)>,
+        reads: Vec<(Vec<u8>, Expect)>,
         size: usize,
     ) -> Vec<Effect> {
+        // THE READS FIRST, on the root THIS apply lands on (R0): the first
+        // apply, every resume from a park, and a re-submit after `Lost` all
+        // come through here, so they are all checked where the ops land. A
+        // read key whose path is not held parks the write exactly as its own
+        // path does — never a Conflict, since nothing proved it differs.
+        match self.check_reads(&reads) {
+            Ok(()) => {}
+            Err(ReadsCheck::Need(need)) => return self.park_write(client, write_id, ops, reads, size, need),
+            Err(ReadsCheck::Differs { key, current }) => {
+                self.parked_write = None;
+                return vec![
+                    Effect::Notify { client, write_id, state: State::Conflict },
+                    Effect::Conflicted { client, write_id, key, current },
+                ];
+            }
+            Err(ReadsCheck::Unreadable) => {
+                self.parked_write = None;
+                return vec![Effect::Notify { client, write_id, state: State::Failed }];
+            }
+        }
         // The tree takes a SET in key order; the client wrote a SEQUENCE. Two
         // ops on one key in a batch are the client changing its mind, so the
         // LAST wins — the SDK's rule, and the one a caller who wrote `put`
@@ -2016,7 +2135,7 @@ impl<B: Blocks> Engine<B> {
             // The path is not held. Nothing is wrong: park the write, fetch
             // what it asked for, and run the apply again when it arrives.
             Err(ApplyError::Read(ReadError::Need(need))) => {
-                return self.park_write(client, write_id, ops, size, need)
+                return self.park_write(client, write_id, ops, reads, size, need)
             }
             // The SDK screens keys and values before a write reaches here, so
             // a refusal means something bypassed it. It is reported, not
@@ -2131,6 +2250,7 @@ impl<B: Blocks> Engine<B> {
         client: ClientId,
         write_id: WriteId,
         ops: Vec<(Vec<u8>, Op)>,
+        reads: Vec<(Vec<u8>, Expect)>,
         size: usize,
         need: Vec<Cid>,
     ) -> Vec<Effect> {
@@ -2154,7 +2274,7 @@ impl<B: Blocks> Engine<B> {
         // payload of 128 KiB and a serialized cost of megabytes, so a payload
         // cap would have let exactly the state through that it exists to
         // refuse. Serializing here is the park path, which is rare.
-        let parked_cost = bincode::serialized_size(&ops).unwrap_or(u64::MAX) as usize;
+        let parked_cost = bincode::serialized_size(&(&ops, &reads)).unwrap_or(u64::MAX) as usize;
         // ONE ROUND AT A TIME, AND NO MORE THAN THE CHAIN HAS LEFT (sdk#174).
         // Asking for a whole path at once stranded past a return's GETs
         // (matrix W3); a chain past the node's iteration cap is truncated
@@ -2208,6 +2328,7 @@ impl<B: Blocks> Engine<B> {
             client,
             write_id,
             ops,
+            reads,
             root: self.root,
             rounds,
             gets: gets + needs.len() as u32,
@@ -2250,7 +2371,44 @@ impl<B: Blocks> Engine<B> {
                 state: State::Failed,
             }];
         }
-        self.apply_write(p.client, p.write_id, p.ops, p.bytes)
+        self.apply_write(p.client, p.write_id, p.ops, p.reads, p.bytes)
+    }
+
+    /// Every read against the tree this apply lands on.
+    fn check_reads(&self, reads: &[(Vec<u8>, Expect)]) -> Result<(), ReadsCheck> {
+        let source = WithEmptyLeaf {
+            inner: &self.blocks,
+            empty_cid: self.empty.cid,
+            empty_bytes: &self.empty.bytes,
+            arrived: &self.arrived,
+        };
+        let mut need = Vec::new();
+        for (key, want) in reads {
+            let found = match freenet_prolly::read::get(&source, &self.root, key) {
+                Ok(v) => v.map(LeafForm::of),
+                Err(ReadError::Need(n)) => {
+                    need.extend(n);
+                    continue;
+                }
+                Err(_) => return Err(ReadsCheck::Unreadable),
+            };
+            let holds = match (want, &found) {
+                (Expect::Absent, None) => true,
+                (Expect::Present, Some(_)) => true,
+                (Expect::Value(h), Some(f)) => f.hash() == *h,
+                _ => false,
+            };
+            if !holds {
+                return Err(ReadsCheck::Differs { key: key.clone(), current: found });
+            }
+        }
+        if need.is_empty() {
+            Ok(())
+        } else {
+            need.sort();
+            need.dedup();
+            Err(ReadsCheck::Need(need))
+        }
     }
 
     fn backlog(&self) -> usize {
@@ -3501,6 +3659,7 @@ impl<B: Blocks> Engine<B> {
                     p.client,
                     p.write_id,
                     p.ops,
+                    p.reads,
                     p.bytes,
                     p.needs.into_iter().collect(),
                 ));
