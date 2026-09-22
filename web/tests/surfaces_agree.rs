@@ -83,6 +83,13 @@ const TRANSPORT_ONLY: &[&str] = &[
     // node to put anything on.
     "put_contract",
     "put_status",
+    // READING SOMEBODY'S TREE (sdk#239): a reader session on the shared
+    // socket — the head it names, that it writes nothing, and whose frames
+    // are whose. An in-memory store is one tree and has no socket.
+    "open_named",
+    "read_only",
+    "head_id",
+    "unowned",
     // PAGE MODE (ruling B): which engine this session runs — the delegate's,
     // or the in-page one over page-io. A transport choice; an in-memory store
     // has no engine at all.

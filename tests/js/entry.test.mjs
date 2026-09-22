@@ -44,7 +44,10 @@ function fakeRaw() {
   const session = {
     url: () => "ws://127.0.0.1:7509/",
     outbound: () => [], sent() {},
-    on_inbound() { if (ticket && !loaded) { loaded = true; ended.push({ id: ticket, ok: true, code: "LOADED" }); } },
+    // The real one says whether the frame was its own (sdk#239); a fake's
+    // delivery always is.
+    on_inbound() { if (ticket && !loaded) { loaded = true; ended.push({ id: ticket, ok: true, code: "LOADED" }); } return true; },
+    unowned() {},
     reconnected() {}, take_progress: () => "[]", provision() {},
     take_loads() { const o = ended; ended = []; return JSON.stringify(o); },
     provisioned: () => true, refused: () => "", exhausted: () => false,
@@ -164,11 +167,13 @@ function watchingRaw() {
     take_stale() { const s = stale; stale = []; return JSON.stringify(s); },
     live_mode: () => JSON.stringify({ mode: "HeadSubscribed", why: "", foreignNotifications: foreign }),
     scan() { scans += 1; return JSON.stringify([{ id: "a" }]); },
-    // The node's notification.
+    // The node's notification. Ours is taken; anything else is not this
+    // session's (sdk#239) and is counted once, through `unowned`.
     on_inbound(key) {
-      if (key === "ours") stale = [...bound];
-      else foreign += 1;
+      if (key === "ours") { stale = [...bound]; return true; }
+      return false;
     },
+    unowned() { foreign += 1; },
     scans: () => scans,
     foreign: () => foreign,
   };
