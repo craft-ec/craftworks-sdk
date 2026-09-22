@@ -649,3 +649,23 @@ fn a_prev_ledger_is_signed_and_a_ledgered_register_head_is_read_by_its_root() {
     assert_eq!(w.sign(Head { seq: 1, root: root(1) }, &next(3, 2)), Answer::Refused(Why::NotSuccessor));
     assert!(matches!(w.sign(Head { seq: 2, root: root(2) }, &next(3, 1)), Answer::Signed(_) | Answer::Refused(Why::RootNotHeld)), "a ledgered register head was not read as seq 2");
 }
+
+/// The signer's HEAD READ on a ledgered head it holds NO record for (another
+/// device's, sdk#233): the truth comes from the register alone, so the read
+/// must take the root of a `root ‖ ledger` value. The exact-32 reader of
+/// before the format read it as no head and answered `HeadUnknown`.
+#[test]
+fn a_ledgered_register_head_with_no_record_of_mine_is_read_by_its_root() {
+    use signer_proto::head::{value, Ledger};
+    let mut w = World::new();
+    w.hold_root(root(2));
+    w.hold_root(root(3));
+    let v = value(&root(2), &Ledger { prev: Some(Head { seq: 4, root: root(1) }), ..Ledger::default() });
+    let theirs = engine_delegate::register::head_state(&w.params, &[7u8; 32], 5, &v).unwrap();
+    w.land(&theirs);
+    let from = Head { seq: 5, root: root(2) };
+    assert!(
+        matches!(w.sign(from, &next(6, 3)), Answer::Signed(_)),
+        "a ledgered register head was not read: the signer could not sign on from it"
+    );
+}

@@ -122,3 +122,25 @@ fn a_quorum_register_is_refused_not_signed_as_if_it_were_one_writer() {
          produces a record that looks valid and decides nothing"
     );
 }
+
+/// THE DELEGATE'S OWN head reader on a ledgered head (sdk#233, main's M3):
+/// `head_of` returns the ROOT and seq of a value that is `root ‖ ledger`, and
+/// `record_of` returns the whole value. Before the ledger format `head_of`
+/// demanded a value of exactly 32 bytes and read every ledgered head as NO
+/// HEAD — an empty app. Pinned here, on this reader, not only in the codec.
+#[test]
+fn head_of_reads_the_root_of_a_ledgered_head() {
+    use engine_delegate::register::{head_of, record_of};
+    use signer_proto::head::{value, Ledger};
+    let root = [0x5A; 32];
+    let v = value(&root, &Ledger { prev: Some(signer_proto::Head { seq: 6, root: [3; 32] }), ..Ledger::default() });
+    assert!(v.len() > 32, "the value carries no ledger: the test would not see the old rule");
+    let st = head_state(&params(), &SIGNING_KEY, 7, &v).expect("signs");
+    assert_eq!(head_of(&st), Some((7, root)), "a ledgered head read as no head");
+    assert_eq!(record_of(&st).map(|(s, x)| (s, x.to_vec())), Some((7, v.clone())));
+    // And a ledger no build knows (an unknown trailing field): still the root.
+    let mut unknown = v.clone();
+    unknown.extend_from_slice(&[250, 1, 0, 9]);
+    let st = head_state(&params(), &SIGNING_KEY, 8, &unknown).expect("signs");
+    assert_eq!(head_of(&st), Some((8, root)));
+}
