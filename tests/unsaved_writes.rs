@@ -9,18 +9,17 @@
 
 use craftworks_sdk::cached_store::WRITES_IN_FLIGHT;
 use craftworks_sdk::Store as _;
-use engine_delegate::shell::Inbound;
 
 /// **100 writes with the window full: all 100 are unsaved, though only the
 /// window's worth is at the node; once every one is published, none is.**
 #[test]
 fn a_hundred_writes_are_unsaved_until_published_held_ones_included() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut conn = node.connect();
     let (mut s, _clock) = testkit::cached_store();
     s.client.send(&protocol::Request::Identity);
     for f in s.take_outbound() {
-        for r in conn.step(vec![Inbound::Client(f)]) {
+        for r in conn.frame(&f) {
             s.on_inbound(&r);
         }
     }
@@ -42,7 +41,7 @@ fn a_hundred_writes_are_unsaved_until_published_held_ones_included() {
     for step in 0.. {
         assert!(step < 10_000, "the node was still answering after 10,000 requests");
         let Some(f) = queue.pop_front() else { break };
-        for r in conn.step(vec![Inbound::Client(f)]) {
+        for r in conn.frame(&f) {
             s.on_inbound(&r);
         }
         queue.extend(s.take_outbound());

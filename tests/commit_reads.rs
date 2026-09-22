@@ -7,10 +7,11 @@
 
 use craftworks_sdk::store::{Reads, RowState};
 use craftworks_sdk::*;
-use engine_delegate::shell::Inbound;
 use serde_json::json;
 use std::collections::BTreeMap;
+use engine_delegate::shell::Inbound;
 use testkit::full_node::{Conn, FullNode};
+use testkit::page_node::{PageConn, PageNode};
 
 struct At(u32);
 impl Env for At {
@@ -29,14 +30,14 @@ const EVERYTHING: [u8; 64] = [0xFF; 64];
 struct Tab {
     db: Db<CachedStore, At>,
     clock: testkit::Clock,
-    conn: Conn,
+    conn: PageConn,
     sends: BTreeMap<u64, usize>,
     verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
     conflicted_replies: usize,
 }
 
 impl Tab {
-    fn open(node: &FullNode, seed: u32) -> Tab {
+    fn open(node: &PageNode, seed: u32) -> Tab {
         let (store, clock) = testkit::cached_store();
         let mut t = Tab {
             db: Db::new(store, At(seed), [seed as u8, 2, 3, 4]),
@@ -71,7 +72,7 @@ impl Tab {
                     }
                 }
             }
-            for reply in self.conn.step(frames.into_iter().map(Inbound::Client).collect()) {
+            for reply in self.conn.frames(&frames) {
                 let decoded = protocol::decode_reply(&reply);
                 if let Some((write_id, state)) = decoded.as_ref().ok().and_then(|r| self.db.store_mut().client.own_write_state(r)) {
                     self.verdicts.entry(write_id).or_default().push(state);
@@ -119,7 +120,7 @@ fn published(v: &[protocol::WriteState]) -> bool {
 #[test]
 fn a_stale_update_is_refused_rolled_back_and_never_re_sent() {
     for interfere in [false, true] {
-        let node = FullNode::new();
+        let node = PageNode::new();
         let mut a = Tab::open(&node, 1);
         a.db.define("tasks", &schema()).expect("define");
         a.pump();
@@ -167,7 +168,7 @@ fn a_stale_update_is_refused_rolled_back_and_never_re_sent() {
 /// record is made; the other is refused (sdk#149's stated residual, closed).
 #[test]
 fn two_create_ats_of_one_slot_make_one_record() {
-    let node = FullNode::new();
+    let node = PageNode::new();
     let mut a = Tab::open(&node, 1);
     a.db.define("tasks", &schema()).expect("define");
     a.pump();
@@ -191,7 +192,7 @@ fn two_create_ats_of_one_slot_make_one_record() {
 /// this on every mount.
 #[test]
 fn two_sessions_defining_one_schema_both_succeed() {
-    let node = FullNode::new();
+    let node = PageNode::new();
     let mut a = Tab::open(&node, 1);
     let mut b = Tab::open(&node, 2);
     let (wa, wb) = (a.db.store_mut().next_write_id(), b.db.store_mut().next_write_id());

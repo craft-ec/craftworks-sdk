@@ -13,23 +13,22 @@
 
 use craftworks_sdk::store::{Delta, Edit, MemStore, Read, Reads, Store};
 use craftworks_sdk::{id::loc_from_hex, CachedStore, Db, SystemEnv};
-use engine_delegate::shell::Inbound;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use testkit::full_node::{Conn, FullNode};
+use testkit::page_node::{PageConn, PageNode};
 
 struct Page {
     store: CachedStore,
     clock: testkit::Clock,
-    _node: FullNode,
-    conn: Conn,
+    _node: PageNode,
+    conn: PageConn,
     sent: BTreeMap<u64, usize>,
     verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
 }
 
 impl Page {
     fn new() -> Page {
-        let node = FullNode::new();
+        let node = PageNode::new();
         let conn = node.connect();
         let (store, clock) = testkit::cached_store();
         let mut p = Page {
@@ -59,9 +58,9 @@ impl Page {
                     *self.sent.entry(write_id).or_default() += 1;
                 }
             }
-            inbound.push(Inbound::Client(frame));
+            inbound.push(frame);
         }
-        for reply in self.conn.step(inbound) {
+        for reply in self.conn.frames(&inbound) {
             if let Some((write_id, state)) = protocol::decode_reply(&reply)
                     .ok()
                     .and_then(|r| self.store.client.own_write_state(&r))
@@ -212,9 +211,8 @@ fn a_pair_queued_behind_a_write_in_flight() -> Page {
     let first = p.one("first");
     let pair = p.pair("p");
     let frames = p.store.take_outbound();
-    let inbound: Vec<Inbound> = frames.into_iter().map(Inbound::Client).collect();
     let mut accepted_first = false;
-    for reply in p.conn.step(inbound) {
+    for reply in p.conn.frames(&frames) {
         if let Some((write_id, state)) = protocol::decode_reply(&reply)
                     .ok()
                     .and_then(|r| p.store.client.own_write_state(&r))

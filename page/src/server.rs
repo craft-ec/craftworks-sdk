@@ -68,6 +68,10 @@ pub struct Server {
     page_clamp: BTreeMap<u64, u32>,
     tracing: bool,
     trace: Vec<protocol::Reply>,
+    /// The page's client-API ops, taken by the Server as each call ends so
+    /// its trace can name what LEFT (the Shell's Put and Head steps), and
+    /// handed to the host by [`Server::take_ops`].
+    ops: Vec<Op>,
     tracing_of: Option<protocol::TraceOf>,
     out: Vec<Vec<u8>>,
     /// sdk#225b: each write handed to the engine, by (client, write id), as the
@@ -189,6 +193,7 @@ impl Server {
             page_clamp: BTreeMap::new(),
             tracing: false,
             trace: Vec::new(),
+            ops: Vec::new(),
             tracing_of: None,
             out: Vec::new(),
             sent: BTreeMap::new(),
@@ -262,7 +267,26 @@ impl Server {
 
     /// Client-API operations for the web layer to frame and send.
     pub fn take_ops(&mut self) -> Vec<Op> {
-        self.page.take_ops()
+        self.collect_ops();
+        std::mem::take(&mut self.ops)
+    }
+
+    /// Take what the page wants sent, and name in the trace what LEAVES: the
+    /// block PUTs (counted) and the head it asks the signer to sign (its
+    /// seq), as the Shell's trace named its node ops. A cold write's trace
+    /// that never said Put or Head would hide exactly the hop that breaks.
+    fn collect_ops(&mut self) {
+        let ops = self.page.take_ops();
+        let puts = ops.iter().filter(|o| matches!(o, Op::Put { .. })).count();
+        if puts > 0 {
+            self.step(1, protocol::Step::Put, puts as u64);
+        }
+        for op in &ops {
+            if let Op::Sign { seq, .. } = op {
+                self.step(1, protocol::Step::Head, *seq);
+            }
+        }
+        self.ops.extend(ops);
     }
 
     /// Every client-facing effect the page produced, turned into replies and
@@ -293,6 +317,7 @@ impl Server {
                 _ => {}
             }
         }
+        self.collect_ops();
     }
 
     /// THE SAME IDENTITY, DISPLACED (sdk#225b), before the effects become

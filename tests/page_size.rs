@@ -12,17 +12,13 @@
 //! what it checks agrees with itself.
 //!
 //! So this drives the REAL path — a `CachedStore` whose loads go through
-//! `Loads::range_request`, against a real `Shell` over an in-memory store —
-//! and counts the `Request::Range` messages that actually crossed.
+//! `Loads::range_request`, against a real tab (`page::Server` over the page
+//! path's scripted node) — and counts the `Request::Range` messages that
+//! actually crossed. The clamp is the page Server's now (the Shell's rule,
+//! kept: `clamp(1, MAX_PAGE_ENTRIES)`).
 
 use craftworks_sdk::store::Store as _;
 use craftworks_sdk::{CachedStore, Loads};
-use engine_delegate::shell::{Inbound, Shell, StoreFacts};
-use freenet_prolly::store::Blocks;
-use freenet_prolly::Cid;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
 
 /// One head for every page: these tests do not move the tree, and a
 /// constant says so rather than leaving it to be inferred.
@@ -31,84 +27,30 @@ const AT: protocol::At = protocol::At {
     root: [1u8; 32],
 };
 
-#[derive(Clone, Default)]
-struct BlockStore(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
-
-impl Blocks for BlockStore {
-    fn get(&self, cid: &Cid) -> Option<&[u8]> {
-        self.0.borrow().get(cid).copied()
-    }
-}
-
-impl BlockStore {
-    fn put(&self, id: Cid, bytes: &[u8]) {
-        if self.0.borrow().contains_key(&id) {
-            return;
-        }
-        let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
-        self.0.borrow_mut().insert(id, leaked);
-    }
-}
-
-/// A real shell, rebuilt from its context between every exchange — which is
-/// what a delegate does — plus a COUNT of the range requests it was asked.
+/// A real tab — `page::Server` over the page path's scripted node — plus a
+/// COUNT of the range requests it was asked.
 struct Node {
-    store: BlockStore,
-    ctx: Vec<u8>,
+    conn: testkit::PageConn,
     /// Every `Request::Range` that crossed. This is the measurement.
     ranges: usize,
 }
 
 impl Node {
     fn new() -> Node {
-        Node {
-            store: BlockStore::default(),
-            ctx: Vec::new(),
-            ranges: 0,
-        }
+        // Started as a page starts it: `Identity` first, which reads the head.
+        let mut conn = testkit::PageNode::new().connect();
+        conn.client(&protocol::Request::Identity);
+        Node { conn, ranges: 0 }
     }
 
-    fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
-        let mut shell: Shell<BlockStore> = Shell::resume_with(
-            &self.ctx,
-            engine::Params::default(),
-            self.store.clone(),
-            StoreFacts::provisioned(),
-        );
-        let out = shell.handle(inbound);
-        self.ctx = shell.to_context().expect("a context after every call");
-        let mut next = Vec::new();
-        for op in out.ops {
-            match op {
-                engine_delegate::schedule::Op::Put { id, bytes } => {
-                    self.store.put(id, &bytes);
-                    next.push(Inbound::PutAcked { id, ok: true });
-                }
-                engine_delegate::schedule::Op::Get { id, .. } => {
-                    let held = self.store.get(&id).map(|b| b.to_vec());
-                    next.push(Inbound::GotState { id, bytes: held });
-                }
-                engine_delegate::schedule::Op::Head { seq, root } => {
-                    next.push(Inbound::GotHead { seq, root })
-                }
-                engine_delegate::schedule::Op::ReadHead { .. } => next.push(Inbound::NoHead),
-            }
-        }
-        let mut replies = out.replies;
-        if !next.is_empty() {
-            replies.extend(self.step(next));
-        }
-        replies
-    }
-
-    /// Hand the shell one client request, counting it if it is a range.
+    /// Hand the tab one client request, counting it if it is a range.
     fn exchange(&mut self, request: &[u8]) -> Vec<Vec<u8>> {
         if let protocol::Incoming::Ok(env) = protocol::decode_request(request) {
             if matches!(env.body, protocol::Request::Range { .. }) {
                 self.ranges += 1;
             }
         }
-        self.step(vec![Inbound::Client(request.to_vec())])
+        self.conn.frame(request)
     }
 }
 
@@ -279,12 +221,12 @@ fn control_asking_with_zero_costs_one_round_trip_per_row() {
     );
 }
 
-/// The constant the loaders send survives the SHELL'S OWN clamp.
+/// The constant the loaders send survives the SERVER'S OWN clamp.
 ///
-/// Asked through the shell rather than through a copy of its arithmetic: a
-/// test that re-implements what it checks agrees with itself.
+/// Asked through the page's Server rather than through a copy of its
+/// arithmetic: a test that re-implements what it checks agrees with itself.
 #[test]
-fn the_page_constant_is_not_clamped_down_by_the_real_shell() {
+fn the_page_constant_is_not_clamped_down_by_the_real_server() {
     let mut node = Node::new();
     let mut store = CachedStore::new(Box::new(|| 0));
     // One row is enough: the reply reports the page size the shell USED.

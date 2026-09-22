@@ -15,7 +15,7 @@
 use craftworks_sdk::{Binding, EngineStore, LiveMode, Store as _};
 use std::rc::Rc;
 
-fn client(node: &testkit::FullNode) -> EngineStore<testkit::Conn> {
+fn client(node: &testkit::PageNode) -> EngineStore<testkit::PageConn> {
     let mut s = EngineStore::new(node.connect());
     s.identity().expect("the engine answers who it is");
     s
@@ -27,7 +27,7 @@ fn client(node: &testkit::FullNode) -> EngineStore<testkit::Conn> {
 /// `Changed` is a TRIGGER, and what it triggers is the same reload the
 /// backstop does. One code path means the rarely-exercised one is the one
 /// that runs all the time.
-fn pump(store: &mut EngineStore<testkit::Conn>, b: &mut Binding) -> usize {
+fn pump(store: &mut EngineStore<testkit::PageConn>, b: &mut Binding) -> usize {
     let mut woken = 0;
     for e in store.take_events() {
         if let craftworks_sdk::EngineEvent::Changed { sub_id, .. } = e {
@@ -52,7 +52,7 @@ fn keys(b: &Binding) -> Vec<String> {
 /// A writes; B's list changes, and B never asked.
 #[test]
 fn a_write_on_one_client_updates_the_others_list_without_polling() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = client(&node);
     let mut b = client(&node);
 
@@ -106,7 +106,7 @@ fn a_write_on_one_client_updates_the_others_list_without_polling() {
 /// in a passing notification test would reveal.
 #[test]
 fn a_non_live_binding_takes_no_subscription_and_is_still_correct() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = client(&node);
     let mut b = client(&node);
 
@@ -147,7 +147,7 @@ fn a_non_live_binding_takes_no_subscription_and_is_still_correct() {
 /// more.
 #[test]
 fn a_live_binding_that_is_never_told_still_catches_up_on_its_tick() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = client(&node);
     let mut b = client(&node);
 
@@ -185,7 +185,7 @@ fn a_live_binding_that_is_never_told_still_catches_up_on_its_tick() {
 /// number that decides whether it is affordable at all.
 #[test]
 fn the_backstops_quiet_tick_reads_nothing() {
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = client(&node);
     let mut b = client(&node);
     for i in 0..8u32 {
@@ -242,7 +242,7 @@ fn the_backstops_quiet_tick_reads_nothing() {
 #[test]
 fn a_cold_writes_trace_shows_every_hop_and_the_client_times_it() {
     use protocol::{Step, TraceOf};
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = client(&node);
 
     // A clock the test drives: one millisecond per reading, so an assertion
@@ -308,7 +308,7 @@ fn a_cold_writes_trace_shows_every_hop_and_the_client_times_it() {
 #[test]
 fn nothing_is_traced_until_a_client_asks() {
     use protocol::TraceOf;
-    let node = testkit::FullNode::new();
+    let node = testkit::PageNode::new();
     let mut a = client(&node);
     a.put(b"list/01", b"first").expect("the store took the write");
     assert!(

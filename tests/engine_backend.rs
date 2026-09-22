@@ -1,44 +1,17 @@
 //! The SDK talking to a real engine, with no node and no browser.
 //!
-//! The transport is a loopback into an actual `Shell` driven against an
-//! in-memory store: the same protocol bytes, the same shell, the same core.
+//! The transport is a loopback into an actual tab — `page::Server` over the
+//! page path's scripted node: the same protocol bytes, the same core.
 //! What is missing is only the network — which is the part the live run
 //! covers and the part that cannot be made to answer `Busy` on demand.
 
 use craftworks_sdk::{EngineStore, Transport};
-use engine_delegate::shell::{Inbound, Shell, StoreFacts};
-use freenet_prolly::store::Blocks;
-use freenet_prolly::Cid;
 use protocol::{Bound, WriteState};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
 
-/// The node's block store.
-#[derive(Clone, Default)]
-struct Store(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
-
-impl Blocks for Store {
-    fn get(&self, cid: &Cid) -> Option<&[u8]> {
-        self.0.borrow().get(cid).copied()
-    }
-}
-
-impl Store {
-    fn put(&self, id: Cid, bytes: &[u8]) {
-        if self.0.borrow().contains_key(&id) {
-            return;
-        }
-        let leaked: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
-        self.0.borrow_mut().insert(id, leaked);
-    }
-}
-
-/// A loopback to a real shell, rebuilt from its context between every
-/// exchange — which is what a delegate does.
+/// A loopback to a real tab: the page's `page::Server` over the page path's
+/// scripted node (`testkit::page_node`), run to a standstill per exchange.
 struct Loop {
-    store: Store,
-    ctx: Vec<u8>,
+    conn: testkit::PageConn,
     /// Answer the next N writes `Busy` before letting any through, so the
     /// outbox is actually exercised rather than merely present.
     busy_for: usize,
@@ -46,49 +19,7 @@ struct Loop {
 
 impl Loop {
     fn new(busy_for: usize) -> Loop {
-        Loop {
-            store: Store::default(),
-            ctx: Vec::new(),
-            busy_for,
-        }
-    }
-
-    fn step(&mut self, inbound: Vec<Inbound>) -> Vec<Vec<u8>> {
-        let mut shell: Shell<Store> = Shell::resume_with(
-            &self.ctx,
-            engine::Params::default(),
-            self.store.clone(),
-            StoreFacts::provisioned(),
-        );
-        let out = shell.handle(inbound);
-        self.ctx = shell.to_context().expect("a context after every call");
-        assert_eq!(
-            out.stranded, 0,
-            "the shell stranded effects, which are lost"
-        );
-        // The node does what the ops ask.
-        let mut next = Vec::new();
-        for op in out.ops {
-            match op {
-                engine_delegate::schedule::Op::Put { id, bytes } => {
-                    self.store.put(id, &bytes);
-                    next.push(Inbound::PutAcked { id, ok: true });
-                }
-                engine_delegate::schedule::Op::Get { id, .. } => {
-                    let held = self.store.get(&id).map(|b| b.to_vec());
-                    next.push(Inbound::GotState { id, bytes: held });
-                }
-                engine_delegate::schedule::Op::Head { seq, root } => {
-                    next.push(Inbound::GotHead { seq, root })
-                }
-                engine_delegate::schedule::Op::ReadHead { .. } => next.push(Inbound::NoHead),
-            }
-        }
-        let mut replies = out.replies;
-        if !next.is_empty() {
-            replies.extend(self.step(next));
-        }
-        replies
+        Loop { conn: testkit::PageNode::new().connect(), busy_for }
     }
 }
 
@@ -111,7 +42,7 @@ impl Transport for Loop {
                 }
             }
         }
-        self.step(vec![Inbound::Client(request.to_vec())])
+        self.conn.frame(request)
     }
 }
 

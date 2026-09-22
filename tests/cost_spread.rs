@@ -24,7 +24,8 @@
 use craftworks_sdk::expected::{expected, Op, DEFAULT_BATCH};
 use protocol::Request;
 use std::ops::Bound;
-use testkit::{Conn, FullNode, Served};
+use testkit::page_node::Served;
+use testkit::{PageConn, PageNode};
 
 fn write(n: u64) -> Request {
     Request::Write {
@@ -43,14 +44,14 @@ struct Observed {
     bytes: u64,
 }
 
-fn observe(c: &mut Conn, r: &Request) -> Observed {
-    let before_ops = [Served::Put, Served::Get, Served::Head, Served::ReadHead]
+fn observe(c: &mut PageConn, r: &Request) -> Observed {
+    let before_ops = [Served::Put, Served::Get, Served::Head, Served::ReadHead, Served::Sign]
         .iter()
         .map(|s| c.served(*s))
         .sum::<usize>();
     let before_bytes = c.bytes_handed_to_this_node();
     c.client(r);
-    let after_ops = [Served::Put, Served::Get, Served::Head, Served::ReadHead]
+    let after_ops = [Served::Put, Served::Get, Served::Head, Served::ReadHead, Served::Sign]
         .iter()
         .map(|s| c.served(*s))
         .sum::<usize>();
@@ -74,8 +75,8 @@ fn spread(xs: &[u64]) -> String {
 
 /// A WARM read costs the node NOTHING, and that is the finding.
 ///
-/// The delegate reads blocks the node already holds straight through
-/// `Blocks`; it does not ask. So a point read and a range both cost zero node
+/// The page reads blocks it holds (it wrote them) from its own memory; it
+/// does not ask the node. So a point read and a range both cost zero node
 /// operations, whatever the derived figure says the path is — and a ratchet
 /// over that would pin 0 against 0 for ever and fire never.
 ///
@@ -83,8 +84,8 @@ fn spread(xs: &[u64]) -> String {
 /// something, that is a regression this catches, and an assertion says so
 /// better than a baseline file would.
 #[test]
-fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_three() {
-    let node = FullNode::new();
+fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_five() {
+    let node = PageNode::new();
     let mut c = node.connect();
     c.client(&Request::Identity);
     for i in 1..=400 {
@@ -92,13 +93,17 @@ fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_three() {
     }
 
     let root = node.head().expect("a head after 400 writes").1;
-    let store = node.store();
+    let store = node.clone();
 
     // ---- COMMIT: five DIFFERENT writes ------------------------------------
+    let kinds = [Served::Put, Served::Get, Served::Head, Served::ReadHead, Served::Sign];
     let mut commit_ops = Vec::new();
     let mut commit_bytes = Vec::new();
+    let mut commit_kinds = Vec::new();
     for i in 401..=405 {
+        let before: Vec<usize> = kinds.iter().map(|k| c.served(*k)).collect();
         let o = observe(&mut c, &write(i));
+        commit_kinds.push(kinds.iter().zip(before).map(|(k, b)| (*k, c.served(*k) - b)).collect::<Vec<_>>());
         commit_ops.push(o.ops as u64);
         commit_bytes.push(o.bytes);
     }
@@ -193,11 +198,23 @@ holding them — both are worth knowing.",
         "the DERIVED side must be non-zero, or the assertions above pass \
 because nothing was measured rather than because nothing was asked",
     );
+    // THE PAGE PATH'S COMMIT, per kind. On the Shell this was 3 (data
+    // nodes, head, parity: §7). The page makes the same three — two block
+    // PUTs and the head UPDATE — plus the two the design adds: the head is
+    // SIGNED by the signer delegate (one request; the engine no longer holds
+    // a key), and the head is READ after the UPDATE, because an UPDATE's
+    // answer says nothing about which record the Register kept (F56). Per
+    // kind, so a change to any one of them fails by name.
+    let want = vec![(Served::Put, 2), (Served::Get, 0), (Served::Head, 1), (Served::ReadHead, 1), (Served::Sign, 1)];
     assert!(
-        commit_ops.iter().all(|&n| n == 3),
-        "a commit took a different number of node operations: {commit_ops:?}. \
-Three is data nodes, head, parity (§7); a change here is a change to what a \
-write costs every app.",
+        commit_kinds.iter().all(|k| *k == want),
+        "a commit took a different mix of node operations: {commit_kinds:?}. \
+Two PUTs (data, parity), one head UPDATE, one signer request, one head READ; \
+a change here is a change to what a write costs every app.",
+    );
+    assert!(
+        commit_ops.iter().all(|&n| n == 5),
+        "a commit took a different number of node operations: {commit_ops:?}",
     );
     // Bytes are NOT asserted: they climb monotonically with the tree
     // (2192 → 2512 over five consecutive writes), so any figure pinned here
