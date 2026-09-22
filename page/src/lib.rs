@@ -22,7 +22,7 @@
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
-//! | `Signed(state)` (`signer_proto::Answer`, as `wire::signer::read_answer` decodes it) | [`Op::Update`] with exactly those bytes |
+//! | `Signed(state)` (`signer_proto::Answer` under the in-flight sign's id, as `wire::signer::read_answer` decodes it; any other id is ignored) | [`Op::Update`] with exactly those bytes |
 //! | `AlreadySigned(state)` | [`Op::Update`] with exactly those bytes (the signer's requirement 2: at most one signature per prev). If its root is another page's, the read-back shows this seq under that root: `HeadConflict` |
 //! | `NotNext { current }` | `HeadConflict` onto `current`: the engine ADOPTS the winning head and reports the dead commit's writes `Lost`; the app submits them again on the winner (with no read-set check yet — the next PR) |
 //! | `Refused(RootNotHeld / HeadUnknown / RecordNotSaved)` | the same sign request after a doubling backoff from [`BACKOFF_MS`]; for `HeadUnknown` the register is READ first, which makes the signer's node hold it |
@@ -139,8 +139,10 @@ pub enum Op {
     Put { id: Cid, bytes: Vec<u8> },
     /// GET the Block contract for `id`.
     Get { id: Cid },
-    /// Ask the signer to sign `(prev → seq, root)`.
-    Sign { prev_seq: u64, prev_root: Cid, seq: u64, root: Cid },
+    /// Ask the signer to sign `(prev → seq, root)`, as signer request `id`
+    /// (SG02): the answer carries it back, and only the answer under the id of
+    /// the sign in flight is taken as its answer. A fresh id per ask.
+    Sign { id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid },
     /// UPDATE the head register with exactly these bytes (a signed record).
     Update { state: Vec<u8> },
     /// GET the head register.
@@ -157,9 +159,10 @@ pub enum Answer {
     PutRefused { id: Cid, transient: bool },
     Got { id: Cid, bytes: Vec<u8> },
     GetMissed(Cid),
-    /// The signer's answer to [`Op::Sign`], as `wire::signer::read_answer`
-    /// decoded it — the merged type (sdk#214), not a copy of it.
-    Signer(signer_proto::Answer),
+    /// A signer answer and the id of the request it answers, as
+    /// `wire::signer::read_answer` decoded it (SG02) — the merged type, not a
+    /// copy of it.
+    Signer { id: u32, answer: signer_proto::Answer },
     /// The head UPDATE was answered. It says NOTHING about which record the
     /// register kept (F56).
     Updated,
@@ -202,6 +205,12 @@ struct Owed {
 /// One page's writes: the engine, the executor state, and what to send.
 pub struct Page {
     path: PutPath,
+    /// The id of the sign request in flight, if one is (SG02); an answer under
+    /// any other id answers something else, a superseded ask included.
+    sign_id: Option<u32>,
+    /// The next signer request id this page issues: from 1, as `0` is
+    /// `signer_proto::UNATTRIBUTED`.
+    next_request: u32,
     engine: Engine<PageBlocks>,
     blocks: PageBlocks,
     /// Blocks whose PUT was answered ok (an effect's `after` is judged here).
@@ -259,6 +268,8 @@ impl Page {
             unusable: Vec::new(),
             now: 0,
             signer_records: BTreeSet::new(),
+            sign_id: None,
+            next_request: 1,
         };
         // The key is in the SIGNER's secret store; the engine only states
         // where its authority comes from.
@@ -370,20 +381,22 @@ impl Page {
                     self.step(Event::BlockMissed(id));
                 }
             }
-            Answer::Signer(s) => {
-                // Only an answer SHAPED like a sign's answer is taken as the
-                // sign's. The signer's answers carry no request id yet (SG02
-                // adds one), and `Putting`, `Put`, `Held`, `Provisioned` or a
-                // refusal only another verb gives are answers to something
-                // else: clearing the sign's deadline on one of them would
-                // leave the commit un-asked until the engine said Stalled
-                // (engineer2's review of sdk#215).
-                if !answers_a_sign(&s) {
+            Answer::Signer { id, answer: s } => {
+                // THE ID decides (SG02): only the answer under the id of the
+                // sign in flight is the sign's. Anything else -- another
+                // verb's answer, a `Put` (UNATTRIBUTED), or a late answer to a
+                // superseded ask -- is not, and must not clear the sign's
+                // deadline, or the commit sits un-asked until the engine says
+                // Stalled (engineer2's review of sdk#215). The SHAPE check
+                // stays as a second guard: under the sign's id, only a sign's
+                // kind of answer is taken.
+                if self.sign_id != Some(id) || !answers_a_sign(&s) {
                     return;
                 }
                 if self.deadlines.remove(&Waiting::Sign).is_none() {
                     return; // an answer to a sign request already answered
                 }
+                self.sign_id = None;
                 self.on_signer(s);
             }
             Answer::Updated => {
@@ -512,7 +525,11 @@ impl Page {
 
     fn ask_sign(&mut self) {
         let Some(o) = &self.owed else { return };
+        let id = self.next_request;
+        self.next_request = self.next_request.checked_add(1).unwrap_or(1);
+        self.sign_id = Some(id);
         let op = Op::Sign {
+            id,
             prev_seq: self.engine.published_seq(),
             prev_root: self.engine.published_root(),
             seq: o.seq,
@@ -544,6 +561,7 @@ impl Page {
             self.owed = None;
             self.sign_again = None;
             self.sign_refusals = 0;
+            self.sign_id = None;
             for w in [Waiting::Sign, Waiting::Update, Waiting::ReadBack] {
                 self.deadlines.remove(&w);
             }
