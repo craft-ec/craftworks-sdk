@@ -308,6 +308,10 @@ pub struct Page {
     /// register's budget runs from here — and whether "not answering" was said.
     recover_since: Option<u64>,
     recover_told: bool,
+    /// The engine's own head read has been ANSWERED (a head, or certainly
+    /// none): until then its tree is the empty one it started on, and a read
+    /// answered from it would say "empty" about data that exists.
+    recovered: bool,
     out: Vec<Op>,
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
@@ -358,6 +362,7 @@ impl Page {
             attempt_of: BTreeMap::new(),
             recover_since: None,
             recover_told: false,
+            recovered: false,
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
@@ -588,6 +593,7 @@ impl Page {
                         Some((seq, root)) => self.step(Event::HeadRead { epoch: EPOCH, seq, root }),
                         None => self.step(Event::HeadMissing),
                     }
+                    self.recovered = true;
                 }
                 if self.answered(&Waiting::ReadBack).is_some() {
                     self.on_read_back(h);
@@ -888,6 +894,12 @@ impl Page {
             self.get_queue.pop_front();
             self.send(Waiting::Get(id), Op::Get { id });
         }
+    }
+
+    /// Has the engine recovered its head (its own head read answered)? A read
+    /// before this would be answered from the empty tree it started on.
+    pub fn recovered(&self) -> bool {
+        self.recovered
     }
 
     /// When the next deadline falls (a host sets a one-shot timer for it, as

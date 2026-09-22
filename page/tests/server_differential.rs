@@ -609,3 +609,25 @@ fn a_restart_mid_commit_the_signer_lands_what_the_shell_lost() {
     let tree = tree_of(&fnode.store(), &root);
     assert!(!tree.contains_key(&b"gone"[..]), "the Shell kept a write whose head never landed?");
 }
+
+/// sdk#175's twin: a READ that arrives before the page has read its head is
+/// HELD, not answered from the empty tree the engine started on — it is
+/// answered, with the rows, once the head is read.
+#[test]
+fn a_read_before_the_head_is_read_waits_for_it() {
+    let mut node = Node::new();
+    let mut writer = PageRig::new();
+    writer.client_as(&mut node, &Request::Identity);
+    assert!(published(&states(&writer.client_as(&mut node, &write(1, &[("a", Some("1")), ("b", Some("2"))])), 1)));
+    // A second page: its Identity starts the engine and sends the head read,
+    // and the Range goes in BEFORE any answer.
+    let mut reader = PageRig::new();
+    for r in [Request::Identity, range(42)] {
+        let frame = protocol::encode_session_request(VERSION, SESSION, &r).expect("encodes");
+        reader.server.client(&frame);
+    }
+    let early = decode(reader.server.take_replies());
+    assert!(page_entries(&early, 42).is_none(), "a read was answered before the head was read: {early:?}");
+    let p = reader.run(&mut node);
+    assert_eq!(page_entries(&p, 42).map(|e| e.len()), Some(2), "the held read did not answer with the rows: {p:?}");
+}

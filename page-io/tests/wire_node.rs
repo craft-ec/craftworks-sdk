@@ -179,6 +179,11 @@ impl WireNode {
                 }
                 Some(ok(HostResponse::DelegateResponse { key, values }))
             }
+            // Registering the signer again (a reopened page): already held.
+            ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { .. }) => {
+                *self.served.entry("register delegate").or_default() += 1;
+                Some(ok(HostResponse::Ok))
+            }
             other => panic!("page-io sent a request the node does not expect: {other:?}"),
         }
     }
@@ -348,4 +353,46 @@ fn a_failed_head_read_never_opens_an_empty_tree() {
     let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 5, entries, .. } = x { Some(entries.len()) } else { None }).collect();
     assert_eq!(node.fail_register_gets, 0, "the failing reads were never asked again");
     assert_eq!(pages, vec![3], "the reopened page read {pages:?} rows: a failed head read opened an empty tree");
+}
+
+/// Main's ruling on sdk#175: a register read answered NotFound (a peered node
+/// can say so FALSELY, F55) on an app that EXISTS must never open an empty
+/// tree — even for a page that just provisioned (the same key again). The
+/// signer holds a record, so the NotFound is only silence.
+#[test]
+fn a_false_not_found_on_an_existing_app_never_opens_an_empty_tree() {
+    let mut node = WireNode::new(&[7u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["p", "q"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    // A reopened page that PROVISIONS (the same key, accepted) and whose first
+    // two head reads are answered "not found".
+    node.fail_register_gets = 2;
+    let mut b = page_io(&node);
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+    b.provision(container, sk.to_bytes().to_vec());
+    client(&mut b, &mut node, &mut now, &Request::Identity);
+    let range = Request::Range { req_id: 6, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client(&mut b, &mut node, &mut now, &range);
+    let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 6, entries, .. } = x { Some(entries.len()) } else { None }).collect();
+    assert_eq!(pages, vec![2], "a false NotFound on an existing app opened {pages:?}");
+}
+
+/// THE CONTROL: a genuinely NEW app (the signer holds no record) whose head
+/// read is "not found" does open its empty tree — and publishes onto it.
+#[test]
+fn control_a_new_apps_not_found_is_no_head() {
+    let mut node = WireNode::new(&[8u8; 32]);
+    // The signer is provisioned but has signed nothing.
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    client(&mut io, &mut node, &mut now, &Request::Identity);
+    let range = Request::Range { req_id: 7, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client(&mut io, &mut node, &mut now, &range);
+    let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 7, entries, .. } = x { Some(entries.len()) } else { None }).collect();
+    assert_eq!(pages, vec![0], "a new app did not open its (empty) tree: {r:?}");
 }

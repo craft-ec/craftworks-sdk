@@ -112,3 +112,16 @@ fn a_get_refusal_naming_its_contract_is_get_failed_with_its_id() {
     let bare = bincode::serialize(&Err::<HostResponse, ClientError>(wire::_test::client_error("no"))).expect("encodes");
     assert!(matches!(unframe(&mut Reassembler::new(), &bare), Incoming::Refused(_)));
 }
+
+/// 0.2.136's explicit NotFound for a GET is `GetFailed` naming the contract,
+/// the same message as the `ContractError::Get` refusal.
+#[test]
+fn a_not_found_answer_is_a_get_failed_naming_the_contract() {
+    let key = block_contract(CODE, &cid(9)).key();
+    let reply: Result<HostResponse, wire::_test::Err> =
+        Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id: *key.id() }));
+    let bytes = bincode::serialize(&reply).expect("encodes");
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&key.id().as_bytes()[..32]);
+    assert_eq!(unframe(&mut Reassembler::new(), &bytes), Incoming::GetFailed { id });
+}

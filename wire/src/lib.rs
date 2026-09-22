@@ -539,6 +539,15 @@ fn classify(r: HostResponse) -> Incoming {
         HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key, .. }) => {
             Incoming::Ack(AckKind::Subscribed(key.to_string()))
         }
+        // 0.2.136 answers a GET of a contract that exists nowhere with an
+        // explicit NotFound ("after exhaustive search"), not an error: the
+        // same fact as a `ContractError::Get` refusal, so the same message.
+        // (Seen live: the head Register's first read, before its first PUT.)
+        HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&instance_id.as_bytes()[..32]);
+            Incoming::GetFailed { id }
+        }
         HostResponse::Ok => Incoming::Ack(AckKind::Ok),
         // A kind this build has no use for. NAMED, so a failure says which:
         // the first run of the live driver reported `NotForUs` and could have

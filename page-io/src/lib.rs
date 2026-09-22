@@ -18,7 +18,7 @@
 //! | answer | becomes |
 //! |---|---|
 //! | `Got` of the Register | `Head(record)`; the register now exists |
-//! | `GetFailed` of the Register | `Head(None)` |
+//! | `GetFailed` / NotFound of the Register | `Head(None)` ONLY if the signer holds no record for it (asked once, `ask_record`); otherwise silence — re-asked on the RTO, "not answering" at its budget (sdk#175; a peered NotFound can be false, F55) |
 //! | `Got` of a block | `Got { id, body }` (the executor verifies it against its id) |
 //! | `GetFailed` of a block | `GetMissed` |
 //! | `Ack(Put)` of a block | `PutOk` |
@@ -72,11 +72,22 @@ pub struct PageIo {
     unusable: Vec<String>,
     /// The signer answered `Provisioned`: it holds the key and the naming.
     provisioned: bool,
-    /// The Register is named by a key THIS page minted (`provision`), so it
-    /// cannot exist on the network yet: a failed read of it is certainly
-    /// "no head" — the only case where it may be (sdk#175).
-    register_new: bool,
+    /// Does the SIGNER hold a record for this register (main's ruling on
+    /// sdk#175)? `None`: not asked yet. Only a signer with NO record — and no
+    /// head it can read — makes a failed head read "no head"; otherwise the
+    /// head exists and a NotFound (which a peered node can answer FALSELY,
+    /// F55) is only silence.
+    signer_has_record: Option<bool>,
+    /// A failed head read waiting on that answer.
+    head_failed_pending: bool,
 }
+
+/// The id the record query goes out under.
+const RECORD_QUERY_ID: u32 = (1 << 31) - 2;
+
+/// A root no node holds: the record query names it so that nothing can be
+/// signed (see `ask_record`).
+const UNHELD_ROOT: [u8; 32] = [0xA5; 32];
 
 /// The id a provisioning request goes out under: far from the executor's own
 /// sign ids (from 1) and from the `Held` ids (from 2³¹).
@@ -109,7 +120,8 @@ impl PageIo {
             replies: Vec::new(),
             unusable: Vec::new(),
             provisioned: false,
-            register_new: false,
+            signer_has_record: None,
+            head_failed_pending: false,
         }
     }
 
@@ -119,7 +131,6 @@ impl PageIo {
     /// (real device keys are sdk#14). `provisioned()` turns true when the
     /// signer answers `Provisioned`.
     pub fn provision(&mut self, signer: DelegateContainer, signing_key: Vec<u8>) {
-        self.register_new = true;
         let stream = self.next_stream();
         match wire::frame_register_delegate(signer, stream) {
             Ok(f) => self.out.extend(f),
@@ -179,14 +190,21 @@ impl PageIo {
             }
             Incoming::GetFailed { id } => {
                 if id == self.register_id {
-                    // A failed read of the head is SILENCE, re-asked on its RTO
-                    // and reported "not answering" at its budget — never "no
-                    // head": that would open an EMPTY tree over a register
-                    // that is merely unreachable (sdk#175). The one exception
-                    // is a register this page just named with a key it minted,
-                    // which cannot exist yet.
-                    if self.register_new && !self.register_seen {
-                        self.server.node(Answer::Head(None), now);
+                    // A failed read of the head — a refusal, or 0.2.136's
+                    // explicit NotFound, which a PEERED node can answer
+                    // falsely (F55) — is "no head" ONLY if the signer holds no
+                    // record for this register. Otherwise the head exists and
+                    // this is SILENCE: re-asked on the RTO, "not answering" at
+                    // its budget. Opening an empty tree over an existing app
+                    // would have its first commit PUT a second register that
+                    // F56 then merges against the real one (sdk#175).
+                    match (self.register_seen, self.signer_has_record) {
+                        (false, Some(false)) => self.server.node(Answer::Head(None), now),
+                        (false, None) => {
+                            self.head_failed_pending = true;
+                            self.ask_record();
+                        }
+                        _ => {}
                     }
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
                     self.server.node(Answer::GetMissed(cid), now);
@@ -209,6 +227,24 @@ impl PageIo {
                         }
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
                             self.unusable.push(format!("the signer refused provisioning: {why:?}"));
+                        }
+                        // The record query's answer (`ask_record`).
+                        Some((RECORD_QUERY_ID, answer)) => {
+                            use signer_proto::{Answer as A, Why};
+                            let has = match answer {
+                                // No record, no head it can read: only genesis
+                                // would be signable, and the unheld root stops it.
+                                A::Refused(Why::RootNotHeld) => Some(false),
+                                // A record from genesis, or a later truth.
+                                A::AlreadySigned(_) | A::NotNext { .. } | A::Refused(Why::Forked { .. }) => Some(true),
+                                _ => None,
+                            };
+                            if let Some(h) = has {
+                                self.signer_has_record = Some(h);
+                                if !h && std::mem::take(&mut self.head_failed_pending) && !self.register_seen {
+                                    self.server.node(Answer::Head(None), now);
+                                }
+                            }
                         }
                         Some((id, signer_proto::Answer::Held { present })) => {
                             let asked = self.held.remove(&id).unwrap_or_default();
@@ -251,6 +287,30 @@ impl PageIo {
 
     pub fn unusable(&self) -> &[String] {
         &self.unusable
+    }
+
+    /// Ask the signer whether it holds a record for this register, WITHOUT
+    /// being able to sign anything: a sign request from the genesis naming a
+    /// root no node holds. `signer::decide` answers it in this order —
+    /// `AlreadySigned` if its record's prev is the genesis, `NotNext` if its
+    /// record or a head it can read is the truth, and only then, with neither,
+    /// `Refused(RootNotHeld)` because the root is not held. Nothing is ever
+    /// signed: the root check comes before any signature. ASSUMPTION (a verb
+    /// of its own would be clearer; the signer's owner may add one): the
+    /// order of `decide` stays as it is, which signer/tests pin.
+    fn ask_record(&mut self) {
+        let genesis_root = self.server.page.published().1;
+        let stream = self.next_stream();
+        match wire::signer::frame_sign(
+            &self.art.signer,
+            RECORD_QUERY_ID,
+            signer_proto::Head { seq: 0, root: genesis_root },
+            signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
+            stream,
+        ) {
+            Ok(f) => self.out.extend(f),
+            Err(e) => self.unusable.push(format!("could not frame the record query: {e}")),
+        }
     }
 
     fn next_stream(&mut self) -> u32 {
