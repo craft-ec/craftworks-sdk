@@ -48,7 +48,13 @@ step_fail() { STEP_FAILED=1; fail "$@"; }
 step() { echo; echo "── $* ──"; }
 FAILED=0
 STEP_FAILED=0
-BASELINE=gate.baseline
+# ONE FILE PER MEMBER (sdk#279): `gate.baseline.d/<member>` holds that
+# member's recorded count and nothing else. A single counts file conflicted on
+# nearly every merge (14 rebases in one day, each a full re-gate) although no
+# two PRs had touched the same member; per member, two PRs conflict only when
+# they move the SAME count, which is when they should. A PR's diff still names
+# exactly which members' counts moved: the files it changes.
+BASELINE=gate.baseline.d
 
 # `--accept [--accept-loss MEMBER]...`: see tools/gate-accept.sh.
 ACCEPT=0
@@ -64,6 +70,17 @@ while [ $# -gt 0 ]; do
 done
 if [ ${#ACCEPT_ARGS[@]} -gt 0 ] && [ $ACCEPT -eq 0 ]; then
   echo "gate: --accept-loss only means something with --accept" >&2; exit 2
+fi
+
+# THE OLD FORM IS REFUSED, not merged with the new (sdk#279). A branch made
+# before the split still carries `gate.baseline`; reading one form and writing
+# the other would leave two answers to "what does this member expect", and the
+# stale one would be the one nobody looks at.
+if [ -e gate.baseline ]; then
+  echo "${RED}gate: gate.baseline (the old single file) is present. The counts live in${OFF}" >&2
+  echo "${RED}gate: $BASELINE/ now, one file per member (sdk#279): take main's $BASELINE/${OFF}" >&2
+  echo "${RED}gate: and delete gate.baseline. Refusing to run with both forms.${OFF}" >&2
+  exit 1
 fi
 
 # ---------------------------------------------------------------- disk ----
@@ -182,7 +199,10 @@ step "summary"
 printf "%-18s %8s %8s\n" "member" "tests" "vs base"
 moved=0
 # A lookup, not an associative array: macOS ships bash 3.2, which has none.
-base_for() { [ -f "$BASELINE" ] && grep -E "^$1=" "$BASELINE" 2>/dev/null | head -1 | cut -d= -f2; }
+# A member's recorded count: its file's one line, or nothing. NOTHING is not
+# zero — a member with no file is NEW (or its file was deleted) and FAILS below,
+# so deleting a file can never quietly lower what the gate expects (sdk#279).
+base_for() { [ -f "$BASELINE/$1" ] && head -1 "$BASELINE/$1" | tr -d '[:space:]'; }
 for i in "${!NAMES[@]}"; do
   m=${NAMES[$i]}; n=${COUNTS[$i]}
   b=$(base_for "$m")
@@ -232,15 +252,16 @@ fi
 
 # Members recorded but gone. A baseline that outlives its crate is a line
 # nobody checks, which is how a stale expectation survives.
-if [ -f "$BASELINE" ]; then
-  while IFS='=' read -r k _; do
-    [ -n "$k" ] || continue
+if [ -d "$BASELINE" ]; then
+  for f in "$BASELINE"/*; do
+    [ -f "$f" ] || continue
+    k=$(basename "$f")
     [ "$k" = "npm" ] && continue
     # No pipe (sdk#138): under pipefail, `echo | grep -q` can report FAILURE
     # exactly when the match succeeds — grep exits on the first match and
     # echo takes SIGPIPE (5 misfires in 3000 at load ~10, reproduced).
     grep -qx -- "$k" <<< "$MEMBERS" || fail "$k is in $BASELINE but is no longer a workspace member"
-  done < "$BASELINE"
+  done
 fi
 
 echo
