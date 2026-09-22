@@ -69,6 +69,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     // there — they are connection mechanics, not data.
     "take_loads",
     "loads_in_flight",
+    // WHICH APP this session is, in the person's ONE tree (the forest
+    // ruling): the prefix that keeps apps apart on a shared register. An
+    // in-memory store is one app's data and nobody else's, so there is no
+    // tree to divide. `open({app})` requires it and calls it once.
+    "set_app",
     // COLD READS IN THE PAGE: how ranges this node does not hold are fetched
     // — the page's own GETs, and their log. An in-memory store holds every
     // block; there is nothing cold to fetch or to report on.
