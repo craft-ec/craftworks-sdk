@@ -53,7 +53,6 @@ getrandom = { version = "0.2", features = ["js"] }
 # cycle exists only in the test build, never in the library's own graph.
 testkit = { path = "testkit" }
 engine = { path = "engine" }
-engine-delegate = { path = "engine-delegate", default-features = false }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 wasmi = "0.32"
 bincode = "1"
@@ -63,7 +62,7 @@ bincode = "1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
-members = ["contract-keys", "engine", "engine-delegate", "page", "page-io", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
+members = ["contract-keys", "engine", "page", "page-io", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
 
 [profile.release]
 opt-level = "s"

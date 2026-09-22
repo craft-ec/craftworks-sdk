@@ -366,7 +366,7 @@ mod tests {
         ///
         /// `wire` frames the client API; `probe` drives live nodes; the
         /// delegates are compiled by the node itself and link the guest side.
-        const ALLOWED: [&str; 8] = [
+        const ALLOWED: [&str; 7] = [
             "wire",
             // The page executor's I/O (ruling B, part 2): `page::Server`'s ops
             // framed with `wire`, the node's answers decoded back. Framing the
@@ -380,22 +380,24 @@ mod tests {
             "web",
             "probe",
             "probe-delegate",
-            "engine-delegate",
             // The SIGNER (sdk#209) is a delegate too: the node compiles it and it
             // links the guest side (secrets + the synchronous contract read). Its
             // import gate (signer/build.sh) shows exactly 5 imports, all from
             // freenet_delegate*, so no client stack reached its wasm.
             "signer",
-            // The test fixtures. It wraps `Shell`, so it cannot avoid
-            // `engine-delegate` and inherits the client stack through it.
+            // The test fixtures. The page path's node (`page_node`) runs the
+            // REAL Register merge (`craftec-register-contract`'s
+            // `update_state`, natively) and the real signer, and the Register
+            // brings the client stack with it.
             //
             // This is an excuse, and the gate's own note says excusing a crate
             // is the wrong answer when restructuring is available. It is not
-            // available here — a fixture that wraps the shell must depend on
-            // the shell — so the excuse is made SAFE instead, by the assertion
-            // below: `testkit` must never appear in any other member's NORMAL
-            // closure. It may be a dev-dependency of anything and a real
-            // dependency of nothing, which is what keeps it out of a delegate.
+            // available here — a fixture that runs the contract's own merge
+            // must depend on the contract — so the excuse is made SAFE
+            // instead, by the assertion below: `testkit` must never appear in
+            // any other member's NORMAL closure. It may be a dev-dependency of
+            // anything and a real dependency of nothing, which is what keeps
+            // it out of a delegate.
             "testkit",
         ];
 

@@ -30,7 +30,6 @@ serde_json = "1"
 # REAL Register record format, never a model of them.
 signer = { path = "../signer" }
 contract-keys = { path = "../contract-keys" }
-engine-delegate = { path = "../engine-delegate", default-features = false }
 wire = { path = "../wire" }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 bincode = "1"

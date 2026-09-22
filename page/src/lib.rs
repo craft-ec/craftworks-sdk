@@ -1308,6 +1308,12 @@ impl Page {
         }
     }
 
+    /// How many parity groups the engine owes right now (what a Tick past
+    /// `parity_age`, or a Flush, is for).
+    pub fn owed_groups(&self) -> usize {
+        self.engine.owed_groups()
+    }
+
     /// Is anything still owed an answer or a re-send — an op in flight, a
     /// backed-off retry? `false` means this page is at rest until something
     /// new arrives.
