@@ -142,6 +142,12 @@ export async function openSession(Session, {
   // skip saying which.
   port,
   artefacts = null,
+  // Provision this person's OWN tree on the node (install the engine and
+  // hand it a key). FALSE opens the socket and installs NOTHING: a visitor who
+  // only reads other people's trees (`tree`) leaves no trace on the node, and
+  // their own tree is not created until they have something to write
+  // (builder#104). The artefacts are still used — `tree` needs the Block code.
+  provision = true,
   // NO LITERAL. The rate comes from the session, which reads it from
   // `protocol`, because the page sends the time and the engine's deadlines
   // are counted in that unit — a 1000 written here would go on being right
@@ -196,7 +202,7 @@ export async function openSession(Session, {
     return blockCode;
   };
 
-  if (artefacts) {
+  if (artefacts && provision) {
     // Fetched in parallel and awaited TOGETHER: a partial set is not a
     // smaller provisioning, it is one that installs a delegate it cannot
     // then give contract code to.
