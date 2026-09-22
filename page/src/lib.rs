@@ -312,6 +312,10 @@ pub struct Page {
     /// none): until then its tree is the empty one it started on, and a read
     /// answered from it would say "empty" about data that exists.
     recovered: bool,
+    /// Has the engine been told its head (`HeadRead` / `HeadMissing`)?
+    engine_has_head: bool,
+    /// Writes made before it was, in order (see [`Page::write_reading`]).
+    held_writes: Vec<Event>,
     out: Vec<Op>,
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
@@ -363,6 +367,8 @@ impl Page {
             recover_since: None,
             recover_told: false,
             recovered: false,
+            engine_has_head: false,
+            held_writes: Vec::new(),
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
@@ -376,7 +382,7 @@ impl Page {
     /// Any engine event from a client (a read, a subscription, a tick, a
     /// start), carried out like every other.
     pub fn event(&mut self, ev: Event) {
-        self.step(ev);
+        self.client_event(ev);
     }
 
     /// A BLIND write, as the app made it: nothing it read is checked.
@@ -394,7 +400,21 @@ impl Page {
         ops: Vec<(Vec<u8>, WriteOp)>,
         reads: Vec<(Vec<u8>, engine::Expect)>,
     ) {
-        self.step(Event::Write { client, write_id, ops, reads });
+        self.client_event(Event::Write { client, write_id, ops, reads });
+    }
+
+    /// A WRITE before the engine has read its head is HELD, and replayed in
+    /// order once the head is recovered. Committed at once, it would land on
+    /// the EMPTY tree the engine starts on, and the page would sign that from
+    /// the genesis over a register nobody read (1b) — main's M2 on #227 found
+    /// the check that should have seen it could not. Reads are held the same
+    /// way by [`server::Server`] (and by the engine itself once sdk#223 lands).
+    fn client_event(&mut self, ev: Event) {
+        if !self.engine_has_head && matches!(ev, Event::Write { .. }) {
+            self.held_writes.push(ev);
+            return;
+        }
+        self.step(ev);
     }
 
     /// The page's clock: the engine's tick, and every op past its deadline
@@ -924,9 +944,18 @@ impl Page {
 
     /// Step the engine and carry out what it decided.
     fn step(&mut self, ev: Event) {
+        // The engine has a head once it is TOLD one, whoever tells it: the
+        // held writes go the moment it is, onto the tree it now stands on.
+        let recovery = matches!(ev, Event::HeadRead { .. } | Event::HeadMissing);
         let fx = self.engine.step(ev);
         self.carry_out(fx);
         self.drop_dead_head();
+        if recovery && !self.engine_has_head {
+            self.engine_has_head = true;
+            for w in std::mem::take(&mut self.held_writes) {
+                self.step(w);
+            }
+        }
     }
 
     /// An owed head is LIVE only while it is ahead of what the engine has

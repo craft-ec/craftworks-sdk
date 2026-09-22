@@ -159,12 +159,22 @@ fn an_unanswered_head_read_is_never_an_empty_tree() {
     }
     assert!(asked >= 3, "the head read was not asked again ({asked})");
     // A write now: had the engine taken "no head", it would commit onto the
-    // EMPTY tree and ask to sign from genesis. It must not ask to sign at all.
+    // EMPTY tree and ask to sign from genesis. Every PUT is ANSWERED, so that
+    // sign is reachable (a check with its puts unanswered could never see one:
+    // main's M2 survived it) — and it must not be asked. Only the head read
+    // stays silent.
     p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
     for _ in 0..100 {
         now += 10;
         p.tick(Ms(now));
-        assert!(!p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "a write was signed onto a tree nobody read");
+        for op in p.take_ops() {
+            match op {
+                Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
+                Op::Sign { .. } => panic!("a write was signed onto a tree nobody read"),
+                _ => {}
+            }
+        }
     }
     assert!(
         p.unusable().iter().any(|u| u.contains("not answering")),
