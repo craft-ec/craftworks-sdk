@@ -1389,6 +1389,7 @@ dependencies = [
  "bincode",
  "ed25519-dalek",
  "engine-delegate",
+ "freenet-prolly",
  "freenet-stdlib",
  "serde",
  "wire",

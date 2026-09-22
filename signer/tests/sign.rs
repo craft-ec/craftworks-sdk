@@ -51,11 +51,14 @@ impl World {
         assert_eq!(a, Answer::Provisioned);
         World { host, params }
     }
-    /// The node holds this tree's root block.
+    /// The node holds this tree's root block: its real state (`kind ‖ body`), which hashes to the root.
     fn hold_root(&mut self, root: [u8; 32]) {
+        let n = (0..=255u8)
+            .find(|n| block_root(*n) == root)
+            .expect("a root made by `root(n)`");
         self.host.states.insert(
             engine_delegate::blocks::contract_for(BCODE, &root),
-            vec![1, 2, 3],
+            block_state(n),
         );
     }
     /// The page's UPDATE of the Register landed: the node's local state is now this signed record.
@@ -75,8 +78,18 @@ impl World {
     }
 }
 
+fn block_state(n: u8) -> Vec<u8> {
+    let mut st = vec![freenet_prolly::kind::RAW];
+    st.extend_from_slice(&[n; 40]);
+    st
+}
+fn block_root(n: u8) -> [u8; 32] {
+    let st = block_state(n);
+    freenet_prolly::block_id(st[0], &st[1..])
+}
+/// A root that names a real block (the signer checks the held state hashes to it).
 fn root(n: u8) -> [u8; 32] {
-    [n; 32]
+    block_root(n)
 }
 fn genesis() -> Head {
     Head {
@@ -120,10 +133,11 @@ fn an_identical_re_ask_gets_the_same_bytes_back() {
     assert_eq!(again, Answer::AlreadySigned(signed(&first)));
 }
 
-/// THE RACE: two connections ask from the same prev; the loser is told what won, BEFORE any UPDATE leaves (nothing
-/// has landed here), and never gets a signature of its own.
+/// Two requests from the same prev, SEQUENTIAL here (the delegate runs one call at a time): the second is told what
+/// won, BEFORE any UPDATE leaves, and never gets a signature of its own. The real race (two connections at once) is
+/// `live-signer`'s.
 #[test]
-fn two_tabs_racing_from_one_prev_get_one_signature() {
+fn two_requests_from_one_prev_in_sequence_get_one_signature() {
     let mut w = World::new();
     w.hold_root(root(1));
     w.hold_root(root(2));
@@ -223,15 +237,27 @@ fn a_head_read_ahead_of_the_record_is_the_truth() {
     ));
 }
 
-/// Q4: the Register at the SAME seq as the record, a different root. The record (what THIS key signed) is the truth.
+/// The Register at the SAME seq as the record, a different root: another holder of the key signed a competing head.
+/// NOTHING is signed, from either root; the answer is `Forked` (sdk#210 review §1: `NotNext{mine}` let this signer's
+/// policy displace the other write).
 #[test]
-fn at_equal_seq_the_record_wins_over_the_read() {
+fn equal_seq_different_roots_is_a_fork_and_nothing_is_signed() {
     let mut w = World::new();
     w.hold_root(root(1));
     w.hold_root(root(3));
     let _ = w.sign(genesis(), &next(1, 1));
     let other = engine_delegate::register::head_state(&w.params, &[7u8; 32], 1, &root(4)).unwrap();
     w.land(&other);
+    let fork = Answer::Refused(Why::Forked {
+        mine: Head {
+            seq: 1,
+            root: root(1),
+        },
+        read: Head {
+            seq: 1,
+            root: root(4),
+        },
+    });
     assert_eq!(
         w.sign(
             Head {
@@ -240,12 +266,19 @@ fn at_equal_seq_the_record_wins_over_the_read() {
             },
             &next(2, 3)
         ),
-        Answer::NotNext {
-            current: Head {
+        fork,
+        "signed on from THEIR root"
+    );
+    assert_eq!(
+        w.sign(
+            Head {
                 seq: 1,
                 root: root(1)
-            }
-        }
+            },
+            &next(2, 3)
+        ),
+        fork,
+        "signed on from MY root"
     );
 }
 
@@ -357,4 +390,57 @@ fn only_a_lost_record_with_an_unlanded_head_can_sign_twice_at_one_seq() {
             "record kept {record_kept}, head landed {head_landed}"
         );
     }
+}
+
+/// "Root held" means the RIGHT block: a state under the root's contract that does not hash to the root is refused.
+#[test]
+fn a_held_state_that_is_not_the_root_block_is_refused() {
+    let mut w = World::new();
+    let r = root(1);
+    w.host.states.insert(
+        engine_delegate::blocks::contract_for(BCODE, &r),
+        block_state(2),
+    );
+    assert_eq!(
+        w.sign(genesis(), &next(1, 1)),
+        Answer::Refused(Why::RootNotHeld)
+    );
+}
+
+/// A different Register for the same key is refused: the one record is never carried to another Register.
+#[test]
+fn the_same_key_with_another_register_is_refused() {
+    let w0 = World::new();
+    let mut w = w0;
+    let again = |params: Vec<u8>, code: &[u8]| Request::Provision {
+        signing_key: ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .to_bytes()
+            .to_vec(),
+        register_code: code.to_vec(),
+        register_params: params,
+        block_code: BCODE.to_vec(),
+    };
+    let same = serve(
+        &mut w.host,
+        &encode_request(&again(w.params.clone(), RCODE)),
+    );
+    assert_eq!(
+        same,
+        Answer::Provisioned,
+        "re-provisioning the SAME Register must still work"
+    );
+    let mut other = w.params.clone();
+    let last = other.len() - 1;
+    other[last] ^= 1;
+    assert_eq!(
+        serve(&mut w.host, &encode_request(&again(other, RCODE))),
+        Answer::Refused(Why::RegisterChanged)
+    );
+    assert_eq!(
+        serve(
+            &mut w.host,
+            &encode_request(&again(w.params.clone(), b"another register code"))
+        ),
+        Answer::Refused(Why::RegisterChanged)
+    );
 }

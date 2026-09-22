@@ -24,6 +24,9 @@ freenet-stdlib = { version = "0.10.0", features = ["contract"] }
 # entry point must not be linked into this wasm. QUESTION (Q8 on sdk#209): these move to a small crate both the signer
 # and the page depend on, when the engine delegate retires.
 engine-delegate = { path = "../engine-delegate", default-features = false }
+# The root check hashes the root block the way the tree does (kind + block_id): the SAME rev as every other
+# freenet-prolly pin in this repo.
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 
 [dev-dependencies]
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
