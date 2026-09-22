@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const FILES: [&str; 5] = ["craftworks_sdk_bg.wasm", "engine_delegate.wasm", "signer.wasm", "block.wasm", "register.wasm"];
+const FILES: [&str; 4] = ["craftworks_sdk_bg.wasm", "signer.wasm", "block.wasm", "register.wasm"];
 
 fn main() -> Result<(), String> {
     let a: Vec<String> = std::env::args().skip(1).collect();

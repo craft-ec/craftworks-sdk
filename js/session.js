@@ -2,8 +2,8 @@
 //
 // Like `connection.js`, this makes NO decisions. It fetches three files,
 // hands them to Rust, and drives two clocks. What to send, in what order,
-// whether an ack answers the step in flight, whether the delegate is
-// provisioned at all — every one of those is in `wire`, tested against a
+// whether an ack answers the step in flight, whether the signer is
+// provisioned at all — every one of those is in Rust (`page-io`, `wire`), tested against a
 // transport that reorders, duplicates and drops, and against a node.
 
 import { connect } from "./connection.js";
@@ -15,10 +15,10 @@ import { allArtefactBytes, artefactBytes } from "./artefacts.js";
  *
  * Named here rather than by each caller: they are the SDK's own build output,
  * and a page that spelled one of them wrong would fetch a 404, hand in an
- * empty array and install a delegate with no contract code behind it.
+ * empty array and provision a signer with no contract code behind it.
  */
 export const SHIPPED_ARTEFACTS = {
-  delegate: new URL("./engine_delegate.wasm", import.meta.url).href,
+  signer: new URL("./signer.wasm", import.meta.url).href,
   block: new URL("./block.wasm", import.meta.url).href,
   register: new URL("./register.wasm", import.meta.url).href,
 };
@@ -107,7 +107,7 @@ export async function shippedArtefacts(
     return { urls: sources(e.file), sha256: e.sha256 };
   };
   return {
-    delegate: at("delegate"),
+    signer: at("signer"),
     block: at("block"),
     register: at("register"),
     sdk: at("sdk"),
@@ -123,7 +123,7 @@ export async function shippedArtefacts(
  *
  * Pass no artefacts to connect to a node that is already provisioned — the
  * page then never sends a byte of contract code, and `provisioned()` still
- * answers, because the delegate is asked rather than assumed.
+ * answers, because the signer is asked rather than assumed.
  */
 /** Trees one session reads at once: each is its own engine in this page. */
 export const MAX_OPEN_TREES = 32;
@@ -131,7 +131,7 @@ export const MAX_OPEN_TREES = 32;
 export const MAX_TREE_SUBSCRIPTIONS = 400;
 
 export async function openSession(Session, {
-  // NO DEFAULT. Publishing installs a delegate and hands it a signing key,
+  // NO DEFAULT. Publishing provisions a signer and hands it a signing key,
   // so which node receives one is a decision, and a default makes it by
   // accident — it already did: a screenshot run in the builder, meant to
   // capture "there is no node running", connected to a node that was
@@ -204,7 +204,7 @@ export async function openSession(Session, {
 
   if (artefacts && provision) {
     // Fetched in parallel and awaited TOGETHER: a partial set is not a
-    // smaller provisioning, it is one that installs a delegate it cannot
+    // smaller provisioning, it is one that provisions a signer it cannot
     // then give contract code to.
     // TWO SHAPES, and the difference is whether the bytes can be shared.
     //
@@ -213,17 +213,17 @@ export async function openSession(Session, {
     // A bare URL string is fetched per app, unverified and unshared — kept
     // because callers pass `SHIPPED_ARTEFACTS` straight through, and because
     // a caller who has no hash must not get a cache entry nobody can check.
-    const hashed = ["delegate", "block", "register"].every(
+    const hashed = ["signer", "block", "register"].every(
       k => artefacts[k] && typeof artefacts[k] === "object" && artefacts[k].sha256,
     );
-    let delegate, block, register;
+    let signer, block, register;
     if (hashed) {
-      ({ delegate, block, register } = await allArtefactBytes(artefacts, {
+      ({ signer, block, register } = await allArtefactBytes(artefacts, {
         fetch: fetchWith,
       }));
     } else {
-      [delegate, block, register] = await Promise.all(
-        [artefacts.delegate, artefacts.block, artefacts.register].map(async url => {
+      [signer, block, register] = await Promise.all(
+        [artefacts.signer, artefacts.block, artefacts.register].map(async url => {
           const r = await fetchWith(url);
           if (!r.ok) throw new Error(`could not fetch ${url}: ${r.status}`);
           return new Uint8Array(await r.arrayBuffer());
@@ -231,7 +231,7 @@ export async function openSession(Session, {
       );
     }
     blockCode = block;
-    session.provision(delegate, block, register);
+    session.provision(signer, block, register);
   }
 
   // THE UNSAVED-CHANGES GUARD (craftworks-sdk#163).
@@ -368,7 +368,6 @@ export async function openSession(Session, {
 
   const timer = everyMs(() => {
     const report = JSON.parse(session.tick());
-    if (report.stalled) onEvent({ kind: "stalled", step: report.stalled });
     if (report.rolledBack > 0) onEvent({ kind: "rolledBack", count: report.rolledBack });
     // M2 (sdk#148): a write refused because what it READ had moved. The row
     // is rolled back and shows the current version; this says why.
@@ -390,7 +389,7 @@ export async function openSession(Session, {
     guard();
     // AND THE FRAME HAS TO LEAVE.
     //
-    // `session.tick()` QUEUES a `Tick` for the delegate; `pump` is the only
+    // `session.tick()` QUEUES a `Tick` for the in-page engine; `pump` is the only
     // thing that puts bytes on the socket, and the socket otherwise pumps on
     // open and on a message. A tick on an idle connection produces neither,
     // so without this the time the page generates every second would sit in
@@ -485,9 +484,9 @@ export async function openSession(Session, {
         },
       };
     },
-    // Everything was accepted and the delegate STILL cannot write a head.
-    // A different fact from stalled and from refused, and a page says so
-    // rather than spinning.
+    // The engine delegate's install plan: gone with it. Always false on the
+    // page path (the signer's refusals are in `unusable()`); kept so a
+    // caller that asks is not broken.
     exhausted: () => session.exhausted(),
     refused: () => session.refused(),
     unusable: () => JSON.parse(session.unusable()),

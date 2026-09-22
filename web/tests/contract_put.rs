@@ -3,9 +3,9 @@
 //!
 //! Its behaviour is tested on the real `Session` in
 //! `tests/js/contract-put.test.mjs`: the frames sent, `put_status` through
-//! none → pending → put / refused, a dropped socket, and page mode.
+//! none → pending → put / refused, a dropped socket.
 //!
-//! What that cannot see: in page mode the PUT must be framed BY page-io, on
+//! What that cannot see: the PUT must be framed BY page-io, on
 //! page-io's stream counter, not by the Session on its own. Both produce the
 //! same frame for the same PUT; they differ only in the chunk STREAM ID, and
 //! two chunked requests on one stream id are reassembled into each other at
@@ -22,20 +22,24 @@ fn body_of(name: &str) -> &'static str {
     &rest[..end]
 }
 
-#[test]
-fn in_page_mode_the_put_is_framed_by_page_io() {
-    let put = body_of("put_contract");
-    let page = &put[put.find("if self.page_mode {").expect("a page-mode branch")..put.find("} else {").expect("an else")];
-    assert!(
-        page.contains("p.put_contract(contract, state)") && !page.contains("frame_put") && !page.contains("self.out"),
-        "page mode frames the PUT outside page-io:\n{page}"
-    );
+/// The rule, as a check the tests below apply to a body.
+fn framed_by_page_io(body: &str) -> bool {
+    body.contains("p.put_contract(contract, state)") && !body.contains("frame_put") && !body.contains("self.out")
 }
 
-/// THE CONTROL: the reader finds the real body, and the negative can fire.
 #[test]
-fn control_the_reader_finds_the_body() {
+fn the_put_is_framed_by_page_io() {
     let put = body_of("put_contract");
-    assert!(put.contains("wire::puts::contract(&code, &params, &state)"));
-    assert!(put.contains("wire::frame_put("), "the delegate-mode branch this reader must exclude is gone");
+    assert!(framed_by_page_io(put), "the PUT is framed outside page-io:\n{put}");
+}
+
+/// THE CONTROL: the reader finds the real body, and the negative can fire —
+/// on a body that frames the PUT itself (the delegate path's, before the
+/// switch-over removed it).
+#[test]
+fn control_the_reader_finds_the_body_and_the_check_can_fail() {
+    let put = body_of("put_contract");
+    assert!(put.contains("wire::puts::contract(&code, &params, &state)"), "the reader did not find put_contract's body");
+    let delegate_era = "p.put_contract(contract, state)?; let frames = wire::frame_put(contract, state, stream)?; self.out.extend(frames);";
+    assert!(!framed_by_page_io(delegate_era), "the check passes a body that frames the PUT on the Session's own stream");
 }

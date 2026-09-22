@@ -53,7 +53,7 @@ await t("**a view says it is read-only and stands on the NAMED head**", async ()
 
 await t("**a view installs NOTHING on the node: its only frames are GETs, the head read with a subscription**", async () => {
   const s = view();
-  s.provision(new TextEncoder().encode("delegate"), BLOCK, new TextEncoder().encode("register")); // refused, never sent
+  s.provision(new TextEncoder().encode("signer code"), BLOCK, new TextEncoder().encode("register")); // refused, never sent
   const frames = sent(s);
   assert.ok(frames.length > 0, "THE CONTROL: the view sent nothing at all, so 'only GETs' would be vacuous");
   assert.deepEqual([...new Set(frames.map(f => f.op))], ["get"], `a view sent ${JSON.stringify(frames)}`);
@@ -63,8 +63,7 @@ await t("**a view installs NOTHING on the node: its only frames are GETs, the he
 
 await t("THE CONTROL: an ordinary session DOES register with the node — the check above can see it", async () => {
   const s = new Session(7999);
-  s.set_page_mode(true, new TextEncoder().encode("signer code"));
-  s.provision(new Uint8Array(), BLOCK, new TextEncoder().encode("register"));
+  s.provision(new TextEncoder().encode("signer code"), BLOCK, new TextEncoder().encode("register"));
   assert.ok(sent(s).some(f => f.op === "delegate"), "provisioning sent no delegate op");
 });
 
@@ -83,8 +82,7 @@ await t("a malformed head, and a view over a session already on its own head, ar
   assert.throws(() => new Session(7999).open_named(BLOCK, "abc", 1), /64 hex/);
   assert.throws(() => new Session(7999).open_named(BLOCK, "zz".repeat(32), 1), /64 hex/);
   const s = new Session(7999);
-  s.set_page_mode(true, new TextEncoder().encode("signer code"));
-  s.provision(new Uint8Array(), BLOCK, new TextEncoder().encode("register"));
+  s.provision(new TextEncoder().encode("signer code"), BLOCK, new TextEncoder().encode("register"));
   assert.throws(() => s.open_named(BLOCK, HEAD, 1), /already open/);
 });
 

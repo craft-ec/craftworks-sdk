@@ -205,24 +205,6 @@ fn the_tick_asks_after_quiet_writes() {
     );
 }
 
-/// sdk#196 review, 1b: A REFUSED FRAME IS ANSWERED BY ITS REFUSAL. The
-/// node's host error is the only word a refused frame ever gets; if the
-/// session does not hand it to the client's frame count, two refusals shut
-/// the tick and ask gates for FORGET_MS.
-#[test]
-fn a_refusal_answers_its_frame() {
-    let body = body_of("on_inbound");
-    let at = body
-        .find("Incoming::Refused(")
-        .expect("no `Incoming::Refused` arm in `on_inbound` -- this gate is reading nothing");
-    let arm = &body[at..];
-    let arm = &arm[..arm.find("\n            Incoming::").unwrap_or(arm.len())];
-    assert!(
-        calls(arm, ".client.frame_refused();"),
-        "the `Incoming::Refused` arm does not count the refusal as its frame's answer: {arm}"
-    );
-}
-
 /// Does this code CALL `statement` (e.g. `.client.frame_refused();`)? Line
 /// comments, block comments and string literals are removed first: `body_of`
 /// strips only `//`, so a `/* frame_refused() */` or a string naming it would

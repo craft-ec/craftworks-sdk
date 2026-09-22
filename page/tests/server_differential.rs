@@ -1,17 +1,13 @@
-//! THE DIFFERENTIAL: `page::Server` against the engine delegate's Shell
-//! (main's ruling B, condition 2).
+//! `page::Server` over a scripted CLIENT API: the real signer
+//! (`signer::serve`) signs, and every UPDATE goes through the Register
+//! contract's own `update_state`.
 //!
-//! The same protocol requests go to both:
-//! * the OLD side is testkit's `FullNode` — the Shell over a scripted node,
-//!   signing the head with its own key;
-//! * the NEW side is `page::Server` over a scripted CLIENT API — the real
-//!   signer (`signer::serve`) signs, and every UPDATE goes through the
-//!   Register contract's own `update_state`.
-//!
-//! Their replies are compared decoded, modulo the head's signer — the one
-//! difference ruling B allows. Where the SIGNER makes a case behave
-//! differently by design (a restart mid-commit: the signer's record lands the
-//! commit the Shell lost), the divergence is asserted explicitly, not hidden.
+//! This began as THE DIFFERENTIAL against the engine delegate's Shell (main's
+//! ruling B, condition 2): the same requests to both, the replies compared.
+//! The Shell is deleted (the switch-over), so each case now asserts, on the
+//! page alone, the concrete outcome the two AGREED on — the write states, the
+//! rows, the tree. Where the page differs from the Shell by design (a restart
+//! mid-commit, a same-key displacement), the page's behaviour is asserted.
 
 use engine::Params;
 use freenet_prolly::store::Blocks;
@@ -20,7 +16,6 @@ use page::server::{Server, SignerFacts};
 use page::{Ms, Answer, Op, Page, PutPath};
 use protocol::{Reply, Request, WriteState};
 use std::collections::BTreeMap;
-use testkit::full_node::FullNode;
 
 const BLOCK_CODE: &[u8] = b"differential block code";
 const REGISTER_CODE: &[u8] = b"differential register code";
@@ -287,10 +282,6 @@ fn decode(frames: Vec<Vec<u8>>) -> Vec<Reply> {
     frames.iter().map(|f| protocol::decode_reply(f).expect("a reply decodes")).collect()
 }
 
-/// The Shell side, the same way.
-fn old(conn: &mut testkit::full_node::Conn, r: &Request) -> Vec<Reply> {
-    decode(conn.client_as(SESSION, VERSION, r))
-}
 
 fn write(id: u64, ops: &[(&str, Option<&str>)]) -> Request {
     Request::Write {
@@ -328,43 +319,40 @@ fn states(rs: &[Reply], id: u64) -> Vec<WriteState> {
         .collect()
 }
 
-/// THE HAPPY PATH: identity, writes, a delete, a range, a subscribed range —
-/// the replies are IDENTICAL, reply for reply.
+/// THE HAPPY PATH: identity, writes, a delete, a range, a subscribed range,
+/// a get — each answered, the writes published, the rows as written (the
+/// outcome the page and the Shell answered reply for reply).
 #[test]
-fn the_same_requests_get_the_same_replies() {
-    let fnode = FullNode::new();
-    let mut conn = fnode.connect();
+fn the_happy_path_answers_every_request() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
-    let script = [
-        Request::Identity,
-        Request::SubscribeRange { sub_id: 3, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded },
-        write(1, &[("a", Some("1")), ("b", Some("2"))]),
-        write(2, &[("c", Some("3"))]),
-        write(3, &[("a", None)]),
-        range(10),
-        Request::Get { req_id: 11, key: b"b".to_vec() },
-        Request::Identity,
-    ];
-    for (n, r) in script.iter().enumerate() {
-        let (o, p) = (old(&mut conn, r), rig.client_as(&mut node, r));
-        assert_eq!(p, o, "request {n} ({r:?}): the page answered differently from the Shell");
+    let first = rig.client_as(&mut node, &Request::Identity);
+    assert!(matches!(first.first(), Some(Reply::Identity { head_seq: 0, .. })), "{first:?}");
+    let sub = rig.client_as(&mut node, &Request::SubscribeRange { sub_id: 3, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded });
+    assert!(sub.iter().any(|r| matches!(r, Reply::Subscribed { sub_id: 3, .. })), "the subscribed range was not answered: {sub:?}");
+    for (id, ops) in [(1, vec![("a", Some("1")), ("b", Some("2"))]), (2, vec![("c", Some("3"))]), (3, vec![("a", None)])] {
+        let st = states(&rig.client_as(&mut node, &write(id, &ops)), id);
+        assert!(published(&st), "write {id}: {st:?}");
     }
-    assert_eq!(node.head().map(|h| h.1), fnode.head().map(|h| h.1), "the two published different trees");
+    let rows = page_entries(&rig.client_as(&mut node, &range(10)), 10);
+    let kv = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    assert_eq!(rows, Some(vec![kv("b", "2"), kv("c", "3")]), "the range did not return the rows as written");
+    let got = rig.client_as(&mut node, &Request::Get { req_id: 11, key: b"b".to_vec() });
+    assert!(got.iter().any(|r| matches!(r, Reply::Value { req_id: 11, value: Some(v) } if v == b"2")), "{got:?}");
+    let again = rig.client_as(&mut node, &Request::Identity);
+    assert!(matches!(again.first(), Some(Reply::Identity { head_seq: 3, .. })), "{again:?}");
+    let (_, root) = node.head().expect("published");
+    assert_eq!(tree_of(&node, &root), BTreeMap::from([kv("b", "2"), kv("c", "3")]), "the published tree");
 }
 
-/// v5 and above: `Unsupported` on both, naming the same served versions.
+/// v5 and above: `Unsupported`, naming the version it got.
 #[test]
-fn a_v5_frame_is_unsupported_on_both() {
-    let fnode = FullNode::new();
-    let mut conn = fnode.connect();
+fn a_v5_frame_is_unsupported() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let frame = protocol::encode_v5_request(SESSION, 1_000, 1, &Request::Identity).expect("a v5 envelope encodes");
-    let o = decode(conn.step(vec![engine_delegate::shell::Inbound::Client(frame.clone())]));
     rig.server.client(&frame);
     let p = rig.run(&mut node);
-    assert_eq!(p, o);
     assert!(matches!(p.first(), Some(Reply::Unsupported { got: 5, .. })), "{p:?}");
 }
 
@@ -387,166 +375,123 @@ fn published(st: &[WriteState]) -> bool {
     st.contains(&WriteState::Published)
 }
 
-/// A PUT's answer lost, then the node heals. The Shell re-asks its puts after
-/// `reask_after` seconds of ticks; the page re-sends each at its deadline.
-/// Neither publishes on a lost answer alone (the Shell reads back only after
-/// an ack); both publish once answers flow, the same tree.
+/// A PUT's answer lost, then the node heals: the page re-sends each put at its
+/// deadline, never publishes on a lost answer alone, and publishes once
+/// answers flow — the tree holding the write.
 #[test]
-fn a_lost_put_answer_publishes_once_the_node_answers_on_both() {
-    let fnode = FullNode::new();
-    let mut conn = fnode.connect();
+fn a_lost_put_answer_publishes_once_the_node_answers() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     rig.faults.lose_first_put_answers = true;
     let t0 = 1_800_000_000u64;
     for r in [Request::Identity, Request::Tick { now: t0 }] {
-        old(&mut conn, &r);
         rig.client_as(&mut node, &r);
     }
-    let w = write(1, &[("a", Some("1")), ("b", Some("2"))]);
-    conn.lose_put_acks(true);
-    let mut o = old(&mut conn, &w);
-    assert!(!published(&states(&o, 1)), "the Shell published with every ack lost");
-    conn.lose_put_acks(false);
-    for t in 1..=40 {
-        o.extend(old(&mut conn, &Request::Tick { now: t0 + t }));
-    }
-    let p = rig.client_as(&mut node, &w);
-    assert!(published(&states(&o, 1)), "Shell: {:?}", states(&o, 1));
+    let p = rig.client_as(&mut node, &write(1, &[("a", Some("1")), ("b", Some("2"))]));
     assert!(published(&states(&p, 1)), "page: {:?}", states(&p, 1));
-    assert_eq!(node.head().map(|h| h.1), fnode.head().map(|h| h.1));
+    let (_, root) = node.head().expect("published");
+    let kv = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    assert_eq!(tree_of(&node, &root), BTreeMap::from([kv("a", "1"), kv("b", "2")]));
+    assert!(!rig.put_once.is_empty(), "no put answer was lost: the fault never fired");
 }
 
 /// A COLD read: the rows are only on the network, and the page's first GET of
-/// each block goes unanswered and is fetched again. The same rows as the
-/// Shell's cold node answers.
+/// each block goes unanswered and is fetched again. All 60 rows, as written.
 #[test]
-fn a_cold_read_with_a_lost_get_returns_the_same_rows() {
-    let fnode = FullNode::new();
-    let mut w = fnode.connect();
+fn a_cold_read_with_a_lost_get_returns_every_row() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
-    old(&mut w, &Request::Identity);
     rig.client_as(&mut node, &Request::Identity);
     let rows: Vec<(String, String)> = (0..60).map(|i| (format!("k/{i:03}"), format!("v{i}"))).collect();
     let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
-    let wr = write(1, &ops);
-    assert!(published(&states(&old(&mut w, &wr), 1)));
-    assert!(published(&states(&rig.client_as(&mut node, &wr), 1)));
-    // The readers: nothing local.
-    let cold = FullNode::cold_over(&fnode);
-    let mut rc = cold.connect();
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &ops)), 1)));
+    // The reader: nothing local.
     let mut rnode = Node::new();
     rnode.network = Some(std::mem::take(&mut node.blocks));
     rnode.register = node.register.clone();
     let mut rr = PageRig::new();
     rr.faults.lose_first_gets = true;
-    old(&mut rc, &Request::Identity);
     rr.client_as(&mut rnode, &Request::Identity);
-    let (o, p) = (old(&mut rc, &range(20)), rr.client_as(&mut rnode, &range(20)));
-    let (oe, pe) = (page_entries(&o, 20), page_entries(&p, 20));
-    assert!(oe.as_ref().is_some_and(|e| e.len() == 60), "Shell: {o:?}");
-    assert_eq!(pe, oe, "the page's cold read returned different rows");
+    let p = rr.client_as(&mut rnode, &range(20));
+    let want: Vec<(Vec<u8>, Vec<u8>)> = rows.iter().map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())).collect();
+    assert_eq!(page_entries(&p, 20), Some(want), "the page's cold read returned different rows");
+    assert!(!rr.got_once.is_empty(), "no GET went unanswered: the fault never fired");
 }
 
-/// One commit at a time: a write while a commit is in flight is `Busy` on both.
+/// One commit at a time: a write while a commit is in flight is `Busy`.
 #[test]
-fn a_write_behind_a_commit_in_flight_is_busy_on_both() {
-    let fnode = FullNode::new();
-    let mut conn = fnode.connect();
+fn a_write_behind_a_commit_in_flight_is_busy() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
-    old(&mut conn, &Request::Identity);
     rig.client_as(&mut node, &Request::Identity);
-    conn.hold_answers();
     rig.faults.hold = true;
-    let (o1, p1) = (old(&mut conn, &write(1, &[("a", Some("1"))])), rig.client_as(&mut node, &write(1, &[("a", Some("1"))])));
-    assert_eq!(states(&p1, 1), states(&o1, 1));
-    let (o2, p2) = (old(&mut conn, &write(2, &[("b", Some("2"))])), rig.client_as(&mut node, &write(2, &[("b", Some("2"))])));
-    assert_eq!(states(&o2, 2), vec![WriteState::Busy], "Shell");
-    assert_eq!(states(&p2, 2), states(&o2, 2), "page");
+    let p1 = rig.client_as(&mut node, &write(1, &[("a", Some("1"))]));
+    assert!(!states(&p1, 1).contains(&WriteState::Busy) && !published(&states(&p1, 1)), "the first write: {:?}", states(&p1, 1));
+    let p2 = rig.client_as(&mut node, &write(2, &[("b", Some("2"))]));
+    assert_eq!(states(&p2, 2), vec![WriteState::Busy]);
 }
 
 /// A commit that cannot finish is told `Stalled` once `max_accept_age`
-/// SECONDS have passed — on both, from the client's protocol ticks.
+/// SECONDS have passed, from the client's protocol ticks — and not before.
 #[test]
-fn a_held_commit_is_stalled_after_its_age_on_both() {
-    let fnode = FullNode::new();
-    let mut conn = fnode.connect();
+fn a_held_commit_is_stalled_after_its_age() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let t0 = 1_800_000_000u64;
     for r in [Request::Identity, Request::Tick { now: t0 }] {
-        old(&mut conn, &r);
         rig.client_as(&mut node, &r);
     }
-    conn.hold_answers();
     rig.faults.hold = true;
-    let w = write(1, &[("a", Some("1"))]);
-    old(&mut conn, &w);
-    rig.client_as(&mut node, &w);
-    let early = Request::Tick { now: t0 + 30 };
-    let (o, p) = (old(&mut conn, &early), rig.client_as(&mut node, &early));
-    assert!(!states(&o, 1).contains(&WriteState::Stalled) && !states(&p, 1).contains(&WriteState::Stalled), "stalled early");
-    let late = Request::Tick { now: t0 + 65 };
-    let (o, p) = (old(&mut conn, &late), rig.client_as(&mut node, &late));
-    assert_eq!(states(&o, 1), vec![WriteState::Stalled], "Shell");
-    assert_eq!(states(&p, 1), states(&o, 1), "page");
+    rig.client_as(&mut node, &write(1, &[("a", Some("1"))]));
+    let p = rig.client_as(&mut node, &Request::Tick { now: t0 + 30 });
+    assert!(!states(&p, 1).contains(&WriteState::Stalled), "stalled early");
+    let p = rig.client_as(&mut node, &Request::Tick { now: t0 + 65 });
+    assert_eq!(states(&p, 1), vec![WriteState::Stalled]);
 }
 
-/// Two tabs on ONE key, the second stale: its write is `Lost` (the page: the
-/// signer's NotNext; the Shell: the head read back under another root), and
-/// re-sent it publishes on the winner. The same outcomes, the same tree.
+/// Two tabs on ONE key, the second stale: its write is `Lost` (the signer's
+/// NotNext), and re-sent it publishes on the winner, the tree holding both.
 #[test]
-fn two_tabs_on_one_key_the_stale_one_loses_then_publishes_on_both() {
-    let fnode = FullNode::new();
-    let (mut a, mut b) = (fnode.connect(), fnode.connect());
+fn two_tabs_on_one_key_the_stale_one_loses_then_publishes() {
     let mut node = Node::new();
     let (mut pa, mut pb) = (PageRig::new(), PageRig::new());
-    for c in [&mut a, &mut b] {
-        old(c, &Request::Identity);
-    }
     pa.client_as(&mut node, &Request::Identity);
     pb.client_as(&mut node, &Request::Identity);
-    let w1 = write(1, &[("a", Some("1"))]);
-    assert!(published(&states(&old(&mut a, &w1), 1)));
-    assert!(published(&states(&pa.client_as(&mut node, &w1), 1)));
-    let w2 = write(2, &[("b", Some("2"))]);
-    let (o, p) = (old(&mut b, &w2), pb.client_as(&mut node, &w2));
-    assert!(states(&o, 2).contains(&WriteState::Lost), "Shell: {:?}", states(&o, 2));
+    assert!(published(&states(&pa.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
+    let p = pb.client_as(&mut node, &write(2, &[("b", Some("2"))]));
     assert!(states(&p, 2).contains(&WriteState::Lost), "page: {:?}", states(&p, 2));
-    let w3 = write(3, &[("b", Some("2"))]);
-    let (o, p) = (old(&mut b, &w3), pb.client_as(&mut node, &w3));
-    assert!(published(&states(&o, 3)) && published(&states(&p, 3)), "Shell {:?} page {:?}", states(&o, 3), states(&p, 3));
-    assert_eq!(node.head().map(|h| h.1), fnode.head().map(|h| h.1), "different trees after the race");
+    let p = pb.client_as(&mut node, &write(3, &[("b", Some("2"))]));
+    assert!(published(&states(&p, 3)), "page {:?}", states(&p, 3));
+    let (_, root) = node.head().expect("published");
+    let kv = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    assert_eq!(tree_of(&node, &root), BTreeMap::from([kv("a", "1"), kv("b", "2")]), "the tree after the race");
 }
 
-/// The signer fails to save its record once (page only — the Shell signed
-/// with no record): asked again after its backoff, and the write publishes
-/// with the same states as the Shell's.
+/// The signer fails to save its record once: asked again after its backoff,
+/// and the write publishes — with the same states as a write whose record
+/// saved first time (the Shell's, on main: it signed with no record).
 #[test]
-fn record_not_saved_once_publishes_like_the_shell() {
-    let fnode = FullNode::new();
-    let mut conn = fnode.connect();
-    let mut node = Node::new();
-    let mut rig = PageRig::new();
-    rig.faults.record_not_saved_once = true;
-    old(&mut conn, &Request::Identity);
-    rig.client_as(&mut node, &Request::Identity);
-    let w = write(1, &[("a", Some("1"))]);
-    let (o, p) = (old(&mut conn, &w), rig.client_as(&mut node, &w));
-    assert_eq!(states(&p, 1), states(&o, 1));
-    assert!(published(&states(&p, 1)));
+fn record_not_saved_once_still_publishes() {
+    let run = |fail: bool| {
+        let mut node = Node::new();
+        let mut rig = PageRig::new();
+        rig.faults.record_not_saved_once = fail;
+        rig.client_as(&mut node, &Request::Identity);
+        states(&rig.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)
+    };
+    let (failed, clean) = (run(true), run(false));
+    assert!(published(&failed), "{failed:?}");
+    assert_eq!(failed, clean, "a record saved late told the write something different");
 }
 
 /// TWO ROOTS AT ONE SEQ for this key — another device of the same identity,
 /// whose head won the Register's tie-break. The same identity never forks
 /// (owner, sdk#225): the page ADOPTS the winner, the write built on the
 /// displaced head is handed back `Lost`, sent again it publishes on the
-/// winner, and nothing is unusable. The Shell had no check at all and
-/// publishes over it blind — a divergence by design, asserted here.
+/// winner, and nothing is unusable. (The Shell had no check at all and
+/// published over it blind: the divergence this was written to show.)
 #[test]
-fn a_same_key_displacement_is_adopted_on_the_page_and_unseen_by_the_shell() {
+fn a_same_key_displacement_is_adopted_on_the_page() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     rig.client_as(&mut node, &Request::Identity);
@@ -567,23 +512,14 @@ fn a_same_key_displacement_is_adopted_on_the_page_and_unseen_by_the_shell() {
     let again = states(&rig.client_as(&mut node, &write(2, &[("b", Some("2"))])), 2);
     assert!(published(&again), "sent again, the write did not publish on the winner: {again:?}");
     assert!(rig.server.page.unusable().is_empty(), "a same-key displacement left the page unusable: {:?}", rig.server.page.unusable());
-    // The Shell, the same story: nothing in it can see the fork.
-    let fnode = FullNode::new();
-    let mut conn = fnode.connect();
-    old(&mut conn, &Request::Identity);
-    old(&mut conn, &write(1, &[("a", Some("1"))]));
-    let (s, _) = fnode.head().expect("published");
-    fnode.set_head(s, [9u8; 32]);
-    let o = old(&mut conn, &write(2, &[("b", Some("2"))]));
-    assert!(!states(&o, 2).is_empty(), "the Shell said nothing: {o:?}");
 }
 
 /// A RESTART MID-COMMIT: the first page's UPDATE never lands and the page is
-/// gone. The Shell's next engine LOSES that write; the page's next engine is
-/// answered AlreadySigned and LANDS it — the signer's record is the third
-/// memory (ENGINE-SHAPE §5). A divergence by design, asserted.
+/// gone. The page's next engine is answered AlreadySigned and LANDS it — the
+/// signer's record is the third memory (ENGINE-SHAPE §5). (The Shell's next
+/// engine LOST that write: the divergence this was written to show.)
 #[test]
-fn a_restart_mid_commit_the_signer_lands_what_the_shell_lost() {
+fn a_restart_mid_commit_the_signer_lands_the_first_commit() {
     let mut node = Node::new();
     let mut first = PageRig::new();
     first.client_as(&mut node, &Request::Identity);
@@ -618,20 +554,6 @@ fn a_restart_mid_commit_the_signer_lands_what_the_shell_lost() {
     let tree = tree_of(&node, &root);
     assert_eq!(tree.get(&b"gone"[..]).map(Vec::as_slice), Some(&b"1"[..]), "the signer's record did not land the first commit");
     assert_eq!(tree.get(&b"new"[..]).map(Vec::as_slice), Some(&b"2"[..]), "{rs:?}");
-
-    // The Shell: the same restart, and the first write is gone.
-    let fnode = FullNode::new();
-    let mut c1 = fnode.connect();
-    old(&mut c1, &Request::Identity);
-    c1.hold_answers();
-    old(&mut c1, &write(1, &[("gone", Some("1"))]));
-    drop(c1);
-    let mut c2 = fnode.connect();
-    old(&mut c2, &Request::Identity);
-    assert!(published(&states(&old(&mut c2, &write(2, &[("new", Some("2"))])), 2)));
-    let (_, root) = fnode.head().expect("published");
-    let tree = tree_of(&fnode.store(), &root);
-    assert!(!tree.contains_key(&b"gone"[..]), "the Shell kept a write whose head never landed?");
 }
 
 /// sdk#175's twin: a READ that arrives before the page has read its head is

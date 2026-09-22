@@ -95,7 +95,32 @@ pub struct PageIo {
     /// `begin` asked the signer which Register it signs for, and it holds
     /// none: the caller mints a key and calls `provision_with`.
     needs_key: bool,
+    /// The signer's registration was answered (its `Ack(Registered)`).
+    signer_registered: bool,
+    /// The signer's FIRST request — the Register query (`begin`) or
+    /// Provision (`provision`) — and whether it is out. HELD until the
+    /// registration is answered: sent together with it, the node answered it
+    /// with an EMPTY response 7 times in 12 (#260, measured), and the page
+    /// waited for ever.
+    first: Option<First>,
+    first_sent: bool,
+    /// Empty responses to the outstanding first request: each is "no
+    /// answer", and the request goes again, at most [`FIRST_EMPTIES`] times.
+    first_empties: u8,
 }
+
+/// The signer's first request, kept so it can be sent once the registration
+/// is answered, and again after an empty response.
+enum First {
+    /// "Which Register do you sign for?" (`begin`).
+    Query,
+    /// Provision with this signing key (`provision`).
+    Provision(Vec<u8>),
+}
+
+/// How many EMPTY responses to the signer's first request are taken as "no
+/// answer, ask again" before the page says so by name.
+const FIRST_EMPTIES: u8 = 3;
 
 /// The counter part of a reader's stream id; the top byte is its range.
 const STREAM_COUNTER: u32 = 0x00FF_FFFF;
@@ -148,6 +173,10 @@ impl PageIo {
             now: Ms(0),
             stream_base: 0,
             needs_key: false,
+            signer_registered: false,
+            first: None,
+            first_sent: false,
+            first_empties: 0,
         }
     }
 
@@ -195,15 +224,44 @@ impl PageIo {
     /// signer holds no key: [`PageIo::needs_key`], and the caller mints one
     /// and calls [`PageIo::provision_with`]. The key never leaves the signer.
     pub fn begin(&mut self, signer: DelegateContainer) {
+        self.register_signer(signer, First::Query);
+    }
+
+    /// Register the signer ALONE; its first request goes once the node has
+    /// answered the registration (`inbound`, `Ack(Registered)`).
+    fn register_signer(&mut self, signer: DelegateContainer, first: First) {
         let stream = self.next_stream();
         match wire::frame_register_delegate(signer, stream) {
             Ok(f) => self.out.extend(f),
             Err(e) => self.unusable.push(format!("could not frame the signer's registration: {e}")),
         }
+        self.first = Some(first);
+        self.first_sent = false;
+        self.first_empties = 0;
+    }
+
+    /// Send the signer's first request (again).
+    fn send_first(&mut self) {
         let stream = self.next_stream();
-        match wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream) {
-            Ok(f) => self.out.extend(f),
-            Err(e) => self.unusable.push(format!("could not frame the register query: {e}")),
+        let framed = match self.first.as_ref() {
+            None => return,
+            Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
+            Some(First::Provision(key)) => wire::signer::frame_provision(
+                &self.art.signer,
+                PROVISION_ID,
+                key.clone(),
+                self.art.register_code.clone(),
+                self.art.register_params.clone(),
+                self.art.block_code.clone(),
+                stream,
+            ),
+        };
+        match framed {
+            Ok(f) => {
+                self.out.extend(f);
+                self.first_sent = true;
+            }
+            Err(e) => self.unusable.push(format!("could not frame the signer's first request: {e}")),
         }
     }
 
@@ -275,24 +333,7 @@ impl PageIo {
             self.unusable.push("read-only: provisioning refused — a reader installs nothing".into());
             return;
         }
-        let stream = self.next_stream();
-        match wire::frame_register_delegate(signer, stream) {
-            Ok(f) => self.out.extend(f),
-            Err(e) => self.unusable.push(format!("could not frame the signer's registration: {e}")),
-        }
-        let stream = self.next_stream();
-        match wire::signer::frame_provision(
-            &self.art.signer,
-            PROVISION_ID,
-            signing_key,
-            self.art.register_code.clone(),
-            self.art.register_params.clone(),
-            self.art.block_code.clone(),
-            stream,
-        ) {
-            Ok(f) => self.out.extend(f),
-            Err(e) => self.unusable.push(format!("could not frame the signer's provisioning: {e}")),
-        }
+        self.register_signer(signer, First::Provision(signing_key));
     }
 
     /// The signer said it holds the key and the naming.
@@ -379,6 +420,26 @@ impl PageIo {
                     self.server.node(Answer::PutOk(cid), now);
                 }
             }
+            // THE SIGNER'S REGISTRATION ANSWERED — or, once it has been, an
+            // EMPTY response to its outstanding first request. `wire::unframe`
+            // maps ANY empty DelegateResponse to `Ack(Registered)`, so the two
+            // look alike: the first is the registration, and any after it,
+            // while the first request is out, is "no answer" — asked again, at
+            // most FIRST_EMPTIES times — never a second registration.
+            Incoming::Ack(wire::AckKind::Registered(key)) if key == self.art.signer.to_string() => {
+                if !self.signer_registered {
+                    self.signer_registered = true;
+                    self.send_first();
+                } else if self.first.is_some() && self.first_sent {
+                    self.first_empties += 1;
+                    if self.first_empties <= FIRST_EMPTIES {
+                        self.send_first();
+                    } else {
+                        self.unusable.push(format!("the signer answered its first request EMPTY {} times", self.first_empties));
+                        self.first = None;
+                    }
+                }
+            }
             // Someone else's PUT answer: the app's, handed back unread.
             answer @ Incoming::Ack(wire::AckKind::Put(_)) => self.others.push(answer),
             // A refused PUT of our own register or block is what a refusal
@@ -389,7 +450,13 @@ impl PageIo {
             answer @ Incoming::PutFailed { .. } => self.others.push(answer),
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
-                    match wire::signer::read_answer(&m) {
+                    let answer = wire::signer::read_answer(&m);
+                    // A REAL answer to the signer's first request ends it: no
+                    // more re-sends, and a later empty response is nobody's.
+                    if matches!(answer, Some((REGISTER_QUERY_ID | PROVISION_ID, _))) {
+                        self.first = None;
+                    }
+                    match answer {
                         // `begin`'s question: which Register? Named: open it,
                         // provisioned already. None: the caller mints a key.
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => match params {

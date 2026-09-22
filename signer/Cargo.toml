@@ -8,7 +8,7 @@ description = "The SIGNER: a delegate that signs the head only if the named prev
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# The `#[delegate]` macro emits the exported entry point only behind this, declared HERE as in engine-delegate.
+# The `#[delegate]` macro emits the exported entry point only behind this, and it must be declared HERE.
 # OFF by default: a native build (the rule, `serve`, their tests) exports nothing; `build.sh` turns it on for the wasm
 # the node runs, and the import gate runs on THAT artefact.
 default = []

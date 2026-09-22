@@ -102,3 +102,17 @@ fn a_cold_node_fetches_from_the_network_and_keeps_what_it_fetched() {
     assert!(c2.served(Served::Get) > 0, "the second tab asked its node nothing: it cannot have read the row");
     assert_eq!(cold.network_fetches(), far, "a block the node fetched once was fetched from the network again");
 }
+
+/// The CLOCK a test drives (re-stated from the Shell fixture's own test): the
+/// closure handed to a constructor reads the live clock, not a snapshot.
+#[test]
+fn the_clock_can_be_driven() {
+    let c = testkit::Clock::new(1_000);
+    assert_eq!(c.now_ms(), 1_000);
+    c.advance(500);
+    assert_eq!(c.now_ms(), 1_500);
+    let f = c.as_fn();
+    assert_eq!(f(), 1_500);
+    c.advance(250);
+    assert_eq!(f(), 1_750, "the closure reads the live clock, not a snapshot");
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the SIGNER delegate and GATE it, in one step (as engine-delegate/build.sh): a delegate importing a host
+# Build the SIGNER delegate and GATE it, in one step: a delegate importing a host
 # function the node does not define fails to INSTANTIATE and is simply never called, so building without checking
 # produces exactly the artefact that fails that way. The signer imports only secrets and the synchronous
 # `get_contract_state`; the gate proves it (0.2.136 removed put/update/subscribe_contract, which it never calls).

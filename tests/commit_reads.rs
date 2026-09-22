@@ -9,8 +9,6 @@ use craftworks_sdk::store::{Reads, RowState};
 use craftworks_sdk::*;
 use serde_json::json;
 use std::collections::BTreeMap;
-use engine_delegate::shell::Inbound;
-use testkit::full_node::{Conn, FullNode};
 use testkit::page_node::{PageConn, PageNode};
 
 struct At(u32);
@@ -206,54 +204,3 @@ fn two_sessions_defining_one_schema_both_succeed() {
     assert!(published(&b.told(wb)), "B's identical define was refused: {:?}", b.told(wb));
 }
 
-/// THE SHELL'S OWN MAPPING, on a Conflict its engine decides by the READ
-/// check: a stale `Commit` straight through one connection. The Shell says
-/// `Failed` — never `Conflict`, never `Conflicted` — to v4 (main's ruling:
-/// an older v4 build would drop either and time out).
-#[test]
-fn the_shell_tells_a_stale_commit_failed_never_conflict() {
-    let node = FullNode::new();
-    let mut conn = node.connect();
-    let send = |conn: &mut Conn, r: &protocol::Request| -> Vec<protocol::Reply> {
-        let f = protocol::encode_session_request(protocol::CURRENT, 0x1234_5678, r).expect("encodes");
-        conn.step(vec![Inbound::Client(f)]).iter().filter_map(|b| protocol::decode_reply(b).ok()).collect()
-    };
-    let _ = send(&mut conn, &protocol::Request::Identity);
-    let put = protocol::Request::Commit { write_id: 1, reads: vec![(b"k".to_vec(), protocol::Expect::Absent)], ops: vec![protocol::Op::Put(b"k".to_vec(), b"v1".to_vec())] };
-    let _ = send(&mut conn, &put);
-    for _ in 0..20 {
-        let _ = send(&mut conn, &protocol::Request::Tick { now: 1_750_000_000 });
-    }
-    // Read Absent again: stale.
-    let stale = protocol::Request::Commit { write_id: 2, reads: vec![(b"k".to_vec(), protocol::Expect::Absent)], ops: vec![protocol::Op::Put(b"k".to_vec(), b"v2".to_vec())] };
-    let mut replies = send(&mut conn, &stale);
-    for _ in 0..20 {
-        replies.extend(send(&mut conn, &protocol::Request::Tick { now: 1_750_000_001 }));
-    }
-    let states: Vec<protocol::WriteState> = replies
-        .iter()
-        .filter_map(|r| match r {
-            protocol::Reply::SessionWriteState { write_id: 2, state, .. } | protocol::Reply::WriteState { write_id: 2, state } => Some(*state),
-            _ => None,
-        })
-        .collect();
-    assert!(states.contains(&protocol::WriteState::Failed), "a stale Commit was not refused: {states:?}");
-    assert!(!states.contains(&protocol::WriteState::Conflict), "the Shell told Conflict: {states:?}");
-    assert!(!replies.iter().any(|r| matches!(r, protocol::Reply::Conflicted { .. })), "the Shell sent Conflicted");
-}
-
-/// main's condition on the new replies: the Shell (the delegate path, where an
-/// OLDER v4 build may be listening) NEVER produces `Reply::Superseded` or
-/// `Reply::Conflicted` — only page::Server does, which serves its own bundle.
-/// Read from the source, with a control that must find the Shell's real reply
-/// producer, so an empty read cannot pass.
-#[test]
-fn the_shell_never_produces_superseded_or_conflicted() {
-    let shell = include_str!("../engine-delegate/src/shell.rs");
-    assert!(shell.contains("protocol::Reply::SessionWriteState {"), "control: the Shell's own reply producer was not found — the read is empty");
-    for new in ["Reply::Superseded", "Reply::Conflicted"] {
-        assert!(!shell.contains(new), "the Shell produces {new}, which an older v4 build would drop");
-    }
-    let server = include_str!("../page/src/server.rs");
-    assert!(server.contains("protocol::Reply::Superseded {") && server.contains("protocol::Reply::Conflicted {"), "page::Server no longer produces them: this test is about nothing");
-}

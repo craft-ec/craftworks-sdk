@@ -26,19 +26,14 @@ allow() {
   case "$1" in
     # The fixtures themselves have to build the thing they wrap.
     testkit/src/lib.rs) return 0 ;;
-    testkit/src/full_node.rs) return 0 ;;
     # Tests OF a constructor are about the constructor.
     tests/cached_store.rs) return 0 ;;
     # sdk#162: its construction tests are of Engine::new's cap-sum assertion
     # (refuses caps that cannot fit the bound; the defaults fit).
     engine/tests/owed_cap.rs) return 0 ;;
-    # sdk#162: reproduces entry.rs's SAVE RULE at the shell boundary, with
-    # the shell's max_gets lifted -- the fixture exposes engine params, not
-    # the shell's limits. The fixture's own path is matrix W9.
-    engine-delegate/tests/context_bound.rs) return 0 ;;
     # sdk#181/#119: a test of the ENGINE's own parity state across ONE context
     # round-trip (owed ids without bytes, the walk resuming, ParityScan). The
-    # fixture wraps the shell, which rehydrates on every call and hides both.
+    # fixture runs a whole page, which never round-trips a context.
     engine/tests/parity_scan.rs) return 0 ;;
     *) return 1 ;;
   esac
@@ -55,7 +50,7 @@ while IFS= read -r f; do
   elif grep -q "testkit::" "$f"; then
     through_fixture=$((through_fixture + 1))
   fi
-done < <(find tests engine/tests engine-delegate/tests testkit -name '*.rs' 2>/dev/null | sort)
+done < <(find tests engine/tests testkit -name '*.rs' 2>/dev/null | sort)
 
 # "Could not check" is a FAILURE, not a pass. A scan that matched no files at
 # all has told you nothing, and is the shape that stays green for weeks.
