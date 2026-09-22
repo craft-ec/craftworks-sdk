@@ -13,7 +13,14 @@ use freenet_prolly::node::{MAX_KEY, MAX_VALUE};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-pub const MAX_DOMAIN: usize = 32;
+/// The longest domain as the TREE stores it: `<app>.<name>`, an app id
+/// (`app::MAX_APP`) and a name (`app::MAX_NAME`) with a `.` between.
+///
+/// Not a key budget in itself: a record key is a tag, this, a separator and
+/// up to two 16-byte ids, far inside `MAX_KEY` (512) — asserted in
+/// `tests/app_namespace.rs`. It was 32 and checked on the PREFIXED name, so
+/// an app's id ate into every domain it named (sdk#276).
+pub const MAX_DOMAIN: usize = crate::app::MAX_APP + 1 + crate::app::MAX_NAME;
 const T_SYSTEM: u8 = 0x00;
 const T_RECORD: u8 = 0x01;
 

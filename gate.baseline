@@ -1,5 +1,5 @@
 contract-keys=7
-craftworks-sdk=344
+craftworks-sdk=348
 engine=125
 page=60
 page-io=25
@@ -11,4 +11,4 @@ signer-proto=13
 testkit=16
 web=26
 wire=57
-npm=228
+npm=229

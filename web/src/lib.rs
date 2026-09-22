@@ -256,6 +256,15 @@ fn js_now_ms() -> u64 {
     js_sys::Date::now() as u64
 }
 
+/// The name an app wrote, checked by the SAME rule a Session applies before
+/// prefixing (`app::check_name`, 1–32): the in-tab db holds one app's data
+/// under the names it wrote, so a name the node would refuse is refused here
+/// too, in the same words (sdk#276). The core's own bound is the STORED name.
+fn name(domain: &str) -> Result<&str, JsError> {
+    craftworks_sdk::app::check_name(domain).map_err(err)?;
+    Ok(domain)
+}
+
 /// A database on the real prolly tree, in memory. The same surface will sit
 /// over the node's engine later; what changes is where the blocks live.
 #[wasm_bindgen]
@@ -271,10 +280,10 @@ impl Db {
     }
     pub fn define(&mut self, domain: &str, schema: &str) -> Result<(), JsError> {
         let s: Schema = serde_json::from_str(schema).map_err(err)?;
-        self.0.define(domain, &s).map_err(err)
+        self.0.define(name(domain)?, &s).map_err(err)
     }
     pub fn schema(&mut self, domain: &str) -> Result<String, JsError> {
-        json(&self.0.schema(domain).map_err(err)?)
+        json(&self.0.schema(name(domain)?).map_err(err)?)
     }
     pub fn domains(&mut self) -> Result<String, JsError> {
         json(&self.0.domains().map_err(err)?)
@@ -284,19 +293,19 @@ impl Db {
     /// the store would take the whole SDK down with it, so `Db` screens
     /// first and returns this instead.
     pub fn put(&mut self, domain: &str, f: &str) -> Result<String, JsError> {
-        json(&self.0.put(domain, &fields(f)?).map_err(err)?)
+        json(&self.0.put(name(domain)?, &fields(f)?).map_err(err)?)
     }
     /// Create at a slot the caller derived (`slotFrom`), or answer the record
     /// already there: `{ outcome: "created" | "exists", record }`. Never an
     /// overwrite (craftworks-sdk#149).
     pub fn create_at(&mut self, domain: &str, slot: &str, f: &str) -> Result<String, JsError> {
-        json(&self.0.create_at(domain, rkey(slot)?, &fields(f)?).map_err(err)?)
+        json(&self.0.create_at(name(domain)?, rkey(slot)?, &fields(f)?).map_err(err)?)
     }
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsError> {
         json(
             &self
                 .0
-                .update(domain, loc(id)?, &fields(patch)?)
+                .update(name(domain)?, loc(id)?, &fields(patch)?)
                 .map_err(err)?,
         )
     }
@@ -307,13 +316,13 @@ impl Db {
         let Some(at) = id::loc_from_hex(id) else {
             // The DOMAIN is still checked: "no such domain" is a programming
             // error, not an outside id, and must not be hidden behind `null`.
-            self.0.schema(domain).map_err(err)?;
+            self.0.schema(name(domain)?).map_err(err)?;
             return Ok("null".into());
         };
-        json(&self.0.get(domain, at).map_err(err)?)
+        json(&self.0.get(name(domain)?, at).map_err(err)?)
     }
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsError> {
-        self.0.delete(domain, loc(id)?).map_err(err)
+        self.0.delete(name(domain)?, loc(id)?).map_err(err)
     }
     /// The children of one parent, as a bounded read.
     ///
@@ -333,7 +342,7 @@ impl Db {
         json(
             &self
                 .0
-                .children(domain, &rkey(parent)?, Scan { reverse, limit, after })
+                .children(name(domain)?, &rkey(parent)?, Scan { reverse, limit, after })
                 .map_err(err)?,
         )
     }
@@ -355,7 +364,7 @@ impl Db {
             &self
                 .0
                 .scan(
-                    domain,
+                    name(domain)?,
                     Scan {
                         reverse,
                         limit,
@@ -386,7 +395,7 @@ impl Db {
     }
 
     pub fn count(&mut self, domain: &str) -> Result<usize, JsError> {
-        self.0.count(domain).map_err(err)
+        self.0.count(name(domain)?).map_err(err)
     }
 }
 
