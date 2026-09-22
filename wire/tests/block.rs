@@ -18,7 +18,7 @@ fn cid(n: u8) -> [u8; 32] {
 #[test]
 fn the_page_names_a_blocks_contract_as_the_delegate_does() {
     for n in [0u8, 1, 7, 255] {
-        assert_eq!(contract_for(CODE, &cid(n)), engine_delegate::blocks::contract_for(CODE, &cid(n)));
+        assert_eq!(contract_for(CODE, &cid(n)), contract_keys::block::contract_for(CODE, &cid(n)));
         assert_eq!(contract_deriver(CODE)(&cid(n)), contract_for(CODE, &cid(n)), "the fast deriver drifted from the node's");
     }
 }

@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
     let head_state = get_state(&mut client, head_id).await;
     match head_state
         .as_deref()
-        .and_then(engine_delegate::register::head_of)
+        .and_then(contract_keys::register::head_of)
     {
         Some((seq, root)) => println!("head:  Register holds seq {seq}, root {}", hex8(&root)),
         None => bail!("the head Register does not hold a readable record after Published"),

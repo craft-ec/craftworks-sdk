@@ -167,7 +167,7 @@ fn seq_of(node: &Node) -> u64 {
 }
 
 fn head_of(state: &[u8]) -> (u64, Cid) {
-    let (seq, v) = engine_delegate::register::record_of(state).expect("a register record");
+    let (seq, v) = contract_keys::register::record_of(state).expect("a register record");
     (seq, v[..32].try_into().expect("32"))
 }
 
@@ -207,7 +207,7 @@ impl Node {
     }
 
     fn put(&mut self, id: Cid, body: &[u8]) {
-        self.contracts.insert(engine_delegate::blocks::contract_for(BLOCK_CODE, &id), id);
+        self.contracts.insert(contract_keys::block::contract_for(BLOCK_CODE, &id), id);
         self.blocks.insert(id, body.to_vec());
     }
 

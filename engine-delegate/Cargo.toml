@@ -15,16 +15,11 @@ crate-type = ["cdylib", "rlib"]
 engine = { path = "../engine" }
 # The head value's ONE format (root ‖ ledger) and the record parser, shared with the signer and the page.
 signer-proto = { path = "../signer-proto" }
+# The Block contract's id and the Register record, now shared with the signer and the page.
+contract-keys = { path = "../contract-keys" }
 protocol = { path = "../protocol" }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 freenet-stdlib = { version = "0.10.0", features = ["contract"] }
-# Signing a Register record. Pinned exactly and default-features off for the
-# same reason the Register contract pins it: `default-features = false`
-# selects the full `S < L` scalar check over the legacy three-bit one, and a
-# signature this delegate makes has to verify under the contract that will
-# check it.
-ed25519-dalek = { version = "=2.2.0", default-features = false }
-blake3 = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 

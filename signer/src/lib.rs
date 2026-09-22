@@ -282,7 +282,7 @@ fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> (Answer, Puts) {
             return refuse(Why::NotABlock { index: i as u32 });
         };
         let id = freenet_prolly::block_id(kind, body);
-        contracts.push(engine_delegate::blocks::contract_for(&code, &id));
+        contracts.push(contract_keys::block::contract_for(&code, &id));
         puts.push((id, st));
     }
     (Answer::Putting { contracts }, puts)
@@ -313,7 +313,7 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
     // Held AND the right block: the state is `kind ‖ body` and must hash to the root it is named by (as
     // entry.rs::block_state names a block), not merely be present.
     let root_held = bcode.as_deref().is_some_and(|c| {
-        host.contract_state(&engine_delegate::blocks::contract_for(c, &next.root))
+        host.contract_state(&contract_keys::block::contract_for(c, &next.root))
             .is_some_and(|s| matches!(s.split_first(), Some((&k, body)) if freenet_prolly::block_id(k, body) == next.root))
     });
     let facts = Facts {
@@ -329,7 +329,7 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
                 return Answer::Refused(Why::NotProvisioned);
             };
             let Ok(signed) =
-                engine_delegate::register::head_state(&params, &key, next.seq, &next.value())
+                contract_keys::register::head_state(&params, &key, next.seq, &next.value())
             else {
                 return Answer::Refused(Why::CannotSign);
             };

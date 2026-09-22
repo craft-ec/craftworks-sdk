@@ -104,7 +104,7 @@ impl Node {
     }
 
     fn put(&mut self, id: Cid, body: &[u8]) {
-        self.contracts.insert(engine_delegate::blocks::contract_for(BLOCK_CODE, &id), id);
+        self.contracts.insert(contract_keys::block::contract_for(BLOCK_CODE, &id), id);
         self.blocks.insert(id, body.to_vec());
     }
 
@@ -128,7 +128,7 @@ impl Node {
 
     fn head(&self) -> Option<(u64, Cid)> {
         let st = self.register.as_deref()?;
-        engine_delegate::register::head_of(st)
+        contract_keys::register::head_of(st)
     }
 
     /// Every entry of the tree at `root`, or `None` if a block is missing.
@@ -558,7 +558,7 @@ fn a_same_key_displacement_is_adopted_on_the_page_and_unseen_by_the_shell() {
     // the signer's read, and a fake root would leave nothing to build on.
     let beats = |a: &Cid, b: &Cid| blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes();
     let winner = (0u32..512).map(|salt| sibling_root(&mut node, salt)).find(|r| beats(r, &mine)).expect("some tree wins");
-    let other = engine_delegate::register::head_state(&node.register_params, &key, seq, &winner).expect("signs");
+    let other = contract_keys::register::head_state(&node.register_params, &key, seq, &winner).expect("signs");
     node.update(&other);
     assert_eq!(node.head(), Some((seq, winner)), "the winner did not take the register");
     let second = states(&rig.client_as(&mut node, &write(2, &[("b", Some("2"))])), 2);
@@ -958,7 +958,7 @@ fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
             }
         };
         let v = value(&root, &Ledger { prev: prev.map(|(s, r)| signer_proto::Head { seq: s, root: r }), ..Ledger::default() });
-        let st = engine_delegate::register::head_state(&node.register_params, &key_of, seq, &v).expect("signs");
+        let st = contract_keys::register::head_state(&node.register_params, &key_of, seq, &v).expect("signs");
         node.update(&st);
         assert_eq!(node.head().map(|h| h.0), Some(seq), "{case}: the other device's head did not take the register");
         rig.server.head_hint();
@@ -1026,7 +1026,7 @@ fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
         let r = device_tree(&mut node, &[(b"other".to_vec(), vec![salt])]);
         let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
         if page::beats(&v, hr.value()) {
-            break engine_delegate::register::head_state(&node.register_params, &key_of, head.0, &v).expect("signs");
+            break contract_keys::register::head_state(&node.register_params, &key_of, head.0, &v).expect("signs");
         }
         salt += 1;
     };
@@ -1113,7 +1113,7 @@ fn a_same_seq_race_is_merged_key_by_key() {
             let r = device_tree(&mut node, &entries);
             let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
             if page::beats(&v, hr.value()) {
-                break engine_delegate::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+                break contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
             }
             salt += 1;
         };
@@ -1208,7 +1208,7 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
         let r = device_tree(&mut node, &e);
         let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
         if page::beats(&v, hr.value()) {
-            break (r, engine_delegate::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs"));
+            break (r, contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs"));
         }
         salt += 1;
     };
@@ -1231,7 +1231,7 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
     e.push((key.clone(), theirs.clone()));
     let x2 = device_tree(&mut node, &e);
     let v2 = value(&x2, &Ledger { prev: Some(signer_proto::Head { seq: tip_seq, root: x_root }), ..Ledger::default() });
-    node.update(&engine_delegate::register::head_state(&node.register_params, &key_of, tip_seq + 1, &v2).expect("signs"));
+    node.update(&contract_keys::register::head_state(&node.register_params, &key_of, tip_seq + 1, &v2).expect("signs"));
     // Release the GETs: the delta completes, the merge write meets a busy engine,
     // the later write's sign meets x' and the page adopts it; the merge re-sends ON x'.
     for op in held.drain(..) {

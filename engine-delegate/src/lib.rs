@@ -13,7 +13,8 @@
 
 pub mod blocks;
 pub mod entry;
-pub mod register;
+/// Moved to `contract-keys` (it outlives this crate); re-exported for the shell.
+pub use contract_keys::register;
 pub mod schedule;
 pub mod serve;
 pub mod shell;

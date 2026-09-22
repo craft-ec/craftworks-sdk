@@ -27,8 +27,8 @@ signer-proto = { path = "../signer-proto" }
 # wrong one is what every real PUT would meet.
 craftec-webapp-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "9ff9d22", default-features = false }
 bincode = "1"
-# The moved block functions are pinned equal to the copies the shell still has.
-engine-delegate = { path = "../engine-delegate", default-features = false }
+# The block functions here are pinned equal to the contract id the signer and the page derive.
+contract-keys = { path = "../contract-keys" }
 # The tests assert against stdlib's OWN caps rather than restating them: a
 # number copied here would agree with itself while the real bound moved.
 freenet-stdlib = { version = "0.10.0", features = ["net"] }

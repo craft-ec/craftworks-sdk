@@ -220,7 +220,7 @@ async fn put_with_code(
     .await?;
     let expect: Vec<[u8; 32]> = fresh
         .iter()
-        .map(|(id, _)| engine_delegate::blocks::contract_for(bcode, id))
+        .map(|(id, _)| contract_keys::block::contract_for(bcode, id))
         .collect();
     match &putting {
         Answer::Putting { contracts } if *contracts == expect => {
@@ -231,7 +231,7 @@ async fn put_with_code(
         )),
     }
     let mut ask_about = expect.clone();
-    ask_about.push(engine_delegate::blocks::contract_for(bcode, &never));
+    ask_about.push(contract_keys::block::contract_for(bcode, &never));
     let mut puts = 0usize;
     let t = tokio::time::Instant::now();
     let mut present = held_once(c, key, &ask_about, &mut puts).await?;
@@ -473,7 +473,7 @@ async fn main() -> Result<()> {
             signed_bytes(&x).unwrap_or_default()
         }
     };
-    let (wseq, wroot) = engine_delegate::register::head_of(&winner)
+    let (wseq, wroot) = contract_keys::register::head_of(&winner)
         .context("the winner's record does not parse")?;
     println!(
         "race: the winner is seq {wseq}, root #{}",
@@ -515,7 +515,7 @@ async fn main() -> Result<()> {
     }
 
     // 4. VISIBILITY of a page-UPDATEd Register to the sync read.
-    let ahead = engine_delegate::register::head_state(&params, &sk.to_bytes(), 5, &r(5))
+    let ahead = contract_keys::register::head_state(&params, &sk.to_bytes(), 5, &r(5))
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let rkey = container(&rcode, &params).key();
     contract_op(

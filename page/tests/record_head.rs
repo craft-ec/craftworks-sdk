@@ -3,7 +3,7 @@
 //! every value, and all are TOLERANT (main's ruling: the last head change an
 //! old reader cannot survive).
 
-use engine_delegate::register::{head_of, head_state};
+use contract_keys::register::{head_of, head_state};
 use signer_proto::head::{value, Ledger};
 
 fn params() -> Vec<u8> {

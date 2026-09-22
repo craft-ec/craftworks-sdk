@@ -3,7 +3,7 @@
 //! differ in root, and on values that share a root and differ only in ledger.
 
 use craftec_register_contract::Register;
-use engine_delegate::register::head_state;
+use contract_keys::register::head_state;
 use freenet_stdlib::prelude::*;
 use signer_proto::head::{record_of, value, Ledger};
 
