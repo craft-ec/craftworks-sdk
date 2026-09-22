@@ -345,3 +345,24 @@ fn a_block_the_node_refuses_every_time_waits_its_rto_and_runs_out_its_deadline()
     // a dozen or so asks in 30 s, not one per refusal (30 s / 20 ms = 1500).
     assert!(asks <= 30, "the refused block was asked {asks} times in {} ms", COLD_FETCH_DEADLINE_MS);
 }
+
+/// The page's one-shot timer: `next_due_ms` names when the earliest fetch in
+/// flight reaches its RTO, and a tick AT that moment times it out — not one
+/// millisecond before.
+#[test]
+fn next_due_names_the_moment_the_earliest_fetch_times_out() {
+    let (root, _net) = tree();
+    let mut c = ColdReads::switched_on();
+    assert_eq!(c.next_due_ms(0), None, "nothing in flight, nothing due");
+    c.set_root(root);
+    assert!(c.take(1, b"a/", b"a0", 0));
+    let _ = c.take_gets();
+    let rto = COLD_RTO_INITIAL_MS as u64;
+    assert_eq!(c.next_due_ms(0), Some(rto));
+    assert_eq!(c.next_due_ms(400), Some(rto - 400));
+    c.tick(rto - 1);
+    assert!(c.take_gets().is_empty(), "timed out before it was due");
+    assert_eq!(c.next_due_ms(rto - 1), Some(1));
+    c.tick(rto);
+    assert_eq!(c.take_gets().len(), 1, "not re-sent at the moment it was due");
+}

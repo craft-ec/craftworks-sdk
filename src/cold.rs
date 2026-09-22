@@ -480,6 +480,16 @@ impl ColdReads {
         std::mem::take(&mut self.returned)
     }
 
+    /// How long from `now_ms` until the EARLIEST fetch in flight reaches its
+    /// RTO — when [`ColdReads::tick`] next has something to do. `None`: no
+    /// fetch in flight. The page sets a one-shot timer for it, so a late
+    /// fetch is seen at its own timeout even when nothing else arrives and
+    /// the page's own tick is a second away.
+    pub fn next_due_ms(&self, now_ms: u64) -> Option<u64> {
+        let rto = self.rto_ms().ceil() as u64;
+        self.fetching.values().map(|f| (f.sent_at + rto).saturating_sub(now_ms)).min()
+    }
+
     /// Blocks being fetched right now — the page matches an answer's contract
     /// to one of these.
     pub fn fetching(&self) -> impl Iterator<Item = &Cid> {

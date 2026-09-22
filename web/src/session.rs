@@ -973,6 +973,24 @@ impl Session {
         self.switch_cold(on, block_code);
     }
 
+    /// Milliseconds until the cold reader's earliest fetch reaches its RTO,
+    /// or -1 when none is in flight. The page arms a one-shot timer for it
+    /// and calls [`Session::cold_tick`] then — so a late fetch is seen at its
+    /// own timeout even when no answer arrives and the 1 s tick is far off.
+    pub fn cold_due_ms(&self) -> i32 {
+        match self.cold.next_due_ms(crate::js_now_ms()) {
+            Some(ms) => ms.min(i32::MAX as u64) as i32,
+            None => -1,
+        }
+    }
+
+    /// The cold reader's clock alone, at the moment [`Session::cold_due_ms`]
+    /// named: its late fetches re-sent, its give-ups reported.
+    pub fn cold_tick(&mut self) {
+        self.cold.tick(crate::js_now_ms());
+        self.pump_cold();
+    }
+
     /// Every cold GET's timeout, re-fetch and answer since this was last
     /// asked, as JSON — what a live run reports, and what a support bundle
     /// carries.
