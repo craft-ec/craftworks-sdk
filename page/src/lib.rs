@@ -266,9 +266,22 @@ impl Page {
         p
     }
 
-    /// A write, as the app made it.
+    /// A BLIND write, as the app made it: nothing it read is checked.
     pub fn write(&mut self, client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, WriteOp)>) {
-        self.step(Event::Write { client, write_id, ops });
+        self.write_reading(client, write_id, ops, Vec::new());
+    }
+
+    /// A write that states what it READ (sdk#148): the engine checks each
+    /// expectation against the tree the ops land on, and a read that no longer
+    /// holds applies nothing and ends `Conflict`.
+    pub fn write_reading(
+        &mut self,
+        client: ClientId,
+        write_id: WriteId,
+        ops: Vec<(Vec<u8>, WriteOp)>,
+        reads: Vec<(Vec<u8>, engine::Expect)>,
+    ) {
+        self.step(Event::Write { client, write_id, ops, reads });
     }
 
     /// The page's clock: the engine's tick, and every op past its deadline
