@@ -443,6 +443,8 @@ impl AppContainer {
     pub fn finish(&self) -> Result<Vec<u8>, JsError> {
         let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
         wire::webapp::app_container(&files).map_err(|e| JsError::new(&e))
+    }
+}
 
 /// This page's wasm linear memory, in bytes: what a tree reader costs is
 /// MEASURED against it (`tests/js/tree.test.mjs`), and the open-tree cap is
