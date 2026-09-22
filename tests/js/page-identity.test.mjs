@@ -29,6 +29,8 @@ const signerRequests = s => { const out = s.outbound(); s.sent(out.length); retu
 /** Register params as `wire::register_params` lays them out: RG01, a version byte, the key, the name. */
 const params = keyByte => new Uint8Array([...enc("RG01"), 0, ...new Array(32).fill(keyByte), ...enc("head")]);
 const page = () => { const s = new Session(7999); s.set_page_mode(true, enc("signer code")); s.provision(enc("delegate"), enc("block code"), enc("register code")); return s; };
+/** Several turns of the page's clock and pump; then what it had to call unusable. */
+const settled = s => { for (let i = 0; i < 4; i += 1) { s.tick(); s.sent(s.outbound().length); } return JSON.parse(s.unusable()); };
 const answer = (s, id, p) => { s.on_inbound(new Uint8Array(Buffer.from(stdlib([], `register:${id}:${p ? hex(p) : "none"}`).signer_answer, "hex"))); };
 
 await t("**a page ASKS the signer which Register first — nothing is minted or provisioned yet**", async () => {
@@ -44,6 +46,9 @@ await t("**the signer names a Register: the page opens IT, provisions nothing, a
     answer(s, q.id, params(7));
     assert.deepEqual(signerRequests(s).filter(r => r.req === "Provision"), [], "a key was provisioned over the signer's own");
     assert.equal(s.provisioned(), true, "the named Register was not opened");
+    // NOTHING UNUSABLE after several pumps: a page that kept trying to mint
+    // (and was stopped a layer down) would report itself unusable for ever.
+    assert.deepEqual(settled(s), [], `the ${_} is unusable`);
     heads.push(s.head_id());
   }
   assert.ok(heads[0].length === 64 && heads[0] === heads[1], `the reload and the second tab stand on ${heads}`);
@@ -57,6 +62,8 @@ await t("**the signer holds NO key: only then is one minted and provisioned**", 
   const [q] = signerRequests(s);
   answer(s, q.id, null);
   assert.deepEqual(signerRequests(s).map(r => r.req), ["Provision"], "a first page did not provision a new key");
+  assert.deepEqual(settled(s), [], "a first page that minted once is unusable");
+  assert.deepEqual(signerRequests(s).filter(r => r.req === "Provision"), [], "a second key was provisioned");
 });
 
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }
