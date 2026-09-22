@@ -42,6 +42,11 @@ use protocol::Request;
 /// a wider window does not change it; only fewer commits per row would.
 pub const WRITES_IN_FLIGHT: usize = 16;
 
+/// How many published writes' keys are kept for their ParityComplete (so a
+/// row can move from "saved" to "saved + backed up"). Oldest dropped first:
+/// a lost one costs a re-render at the next change, never a wrong row.
+pub const KEYS_KEPT: usize = 1024;
+
 /// How long a write the engine has taken may go unheard before this client
 /// asks after it (craftworks-sdk#174).
 ///
@@ -95,6 +100,15 @@ pub struct CachedStore {
     conflicts: Vec<Conflicted>,
     /// Superseded rows this client was told of (sdk#225b), for the app.
     superseded: Vec<Superseded>,
+    /// Keys whose OWN write changed state (published, parity-complete, lost,
+    /// failed, conflict, superseded) since `take_state_changed` was last
+    /// asked: what a row showing that write's state must be re-read for
+    /// (builder#107). Local knowledge about this client's own writes, not a
+    /// subscription.
+    state_changed: Vec<Vec<u8>>,
+    /// A PUBLISHED write's keys, kept until its ParityComplete (which arrives
+    /// after the copy has let the write go). Bounded: [`KEYS_KEPT`].
+    published_keys: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
     /// Conflict chains for `Db`'s re-run (sdk#143/#144): drained by
     /// `take_conflict_chains`.
     chains: Vec<crate::store::ConflictChain>,
@@ -135,6 +149,14 @@ impl CachedStore {
         std::mem::take(&mut self.conflicts)
     }
 
+    /// Keys whose own write changed state since the last call (builder#107).
+    pub fn take_state_changed(&mut self) -> Vec<Vec<u8>> {
+        let mut keys = std::mem::take(&mut self.state_changed);
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     /// Superseded rows told since the last call (sdk#225b).
     pub fn take_superseded(&mut self) -> Vec<Superseded> {
         std::mem::take(&mut self.superseded)
@@ -160,6 +182,8 @@ impl CachedStore {
             reads_of: std::collections::BTreeMap::new(),
             conflicts: Vec::new(),
             superseded: Vec::new(),
+            state_changed: Vec::new(),
+            published_keys: std::collections::BTreeMap::new(),
             chains: Vec::new(),
         }
     }
@@ -315,6 +339,7 @@ impl CachedStore {
                     for k in keys {
                         self.forget_key(k);
                     }
+                    self.state_changed.extend(keys.iter().cloned());
                     self.superseded.push(Superseded { write_id: *write_id, keys: keys.clone() });
                 }
             }
@@ -356,6 +381,9 @@ impl CachedStore {
             let expected = matches!(state, W::ParityComplete) && write_id < self.next_write_id;
             if !expected {
                 self.unknown_verdicts += 1;
+            } else if let Some(keys) = self.published_keys.remove(&write_id) {
+                // "saved" → "saved + backed up": its rows change too.
+                self.state_changed.extend(keys);
             }
             return;
         }
@@ -369,6 +397,14 @@ impl CachedStore {
             // moment the engine has room again, so the next queued write goes.
             W::Published | W::ParityComplete => {
                 self.reads_of.remove(&write_id);
+                let keys = self.copy.keys_of(write_id);
+                self.state_changed.extend(keys.iter().cloned());
+                if matches!(state, W::Published) {
+                    self.published_keys.insert(write_id, keys);
+                    while self.published_keys.len() > KEYS_KEPT {
+                        self.published_keys.pop_first();
+                    }
+                }
                 self.copy.published(write_id);
                 self.drain_queued();
             }
@@ -376,6 +412,7 @@ impl CachedStore {
             W::Failed | W::Lost => {
                 self.reads_of.remove(&write_id);
                 let told = self.copy.failed(write_id);
+                self.state_changed.extend(told.rolled_back_keys.iter().cloned());
                 self.rolled_back.extend(told.rolled_back_keys);
                 // The commit that was in flight is over, however it ended.
                 self.drain_queued();
@@ -400,6 +437,7 @@ impl CachedStore {
                 for k in &told.rolled_back_keys {
                     self.forget_key(k);
                 }
+                self.state_changed.extend(told.rolled_back_keys.iter().cloned());
                 self.rolled_back.extend(told.rolled_back_keys);
                 self.drain_queued();
             }
@@ -560,6 +598,7 @@ impl CachedStore {
         let told = self.copy.time_out(now);
         self.rolled_back
             .extend(told.rolled_back_keys.iter().cloned());
+        self.state_changed.extend(told.rolled_back_keys.iter().cloned());
         // A write rolled back took its window slot with it: send what that
         // frees. Without this, sixteen verdicts that never came left the
         // outbox holding every later write until reload (sdk#179).

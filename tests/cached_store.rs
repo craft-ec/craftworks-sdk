@@ -363,3 +363,88 @@ fn a_conflicted_write_leaves_none_of_its_own_keys_in_the_copy() {
         }
     }
 }
+
+/// builder#107: a client's OWN write changing state names its KEYS, so the
+/// rows showing that write can be re-read — the "saving" chip on a plain
+/// binding moves to "saved" (Published), to "saved + backed up"
+/// (ParityComplete, after the copy has let the write go), and a lost write's
+/// rows show it is gone. Each verdict names exactly the write's keys, once.
+/// The control: a verdict that changes nothing (Accepted) names none.
+#[test]
+fn an_own_writes_state_change_names_its_keys() {
+    let verdict_of = |states: &[protocol::WriteState]| -> Vec<Vec<Vec<u8>>> {
+        let mut s = store();
+        s.on_page(b"a/", b"b/", vec![], root(1));
+        Store::apply_batch(
+            &mut s,
+            &[
+                (b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v1".to_vec())),
+                (b"a/2".to_vec(), craftworks_sdk::store::Edit::Put(b"v2".to_vec())),
+            ],
+        )
+        .expect("the store took the write");
+        let write_id = s
+            .take_outbound()
+            .iter()
+            .find_map(|f| match protocol::decode_request(f) {
+                protocol::Incoming::Ok(env) => match env.body {
+                    protocol::Request::Commit { write_id, .. } | protocol::Request::Write { write_id, .. } => Some(write_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the write went out");
+        let session = s.client.session().expect("a session");
+        let _ = s.take_state_changed();
+        states
+            .iter()
+            .map(|st| {
+                s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id, state: *st }).expect("encodes"));
+                s.take_state_changed()
+            })
+            .collect()
+    };
+    let both = vec![b"a/1".to_vec(), b"a/2".to_vec()];
+    use protocol::WriteState as W;
+    assert_eq!(verdict_of(&[W::Accepted, W::Published, W::ParityComplete]), vec![vec![], both.clone(), both.clone()], "Published and then ParityComplete must each name the write's keys; Accepted changes no row's settled state");
+    assert_eq!(verdict_of(&[W::Lost]), vec![both.clone()], "a lost write's rows were not named");
+    assert_eq!(verdict_of(&[W::Published, W::Published]), vec![both, vec![]], "a repeated verdict named the keys again");
+}
+
+/// sdk#264 / builder#107: a SUPERSEDED write (another device's head won and
+/// holds ITS values at these keys) names its keys, so a plain binding on them
+/// re-reads and shows the winner's value instead of this tab's forgotten one
+/// -- the case where the screen is most wrong. The control: a `Superseded` for
+/// another session names none.
+#[test]
+fn a_superseded_write_names_its_keys() {
+    let named = |ours: bool| -> Vec<Vec<u8>> {
+        let mut s = store();
+        s.on_page(b"a/", b"b/", vec![], root(1));
+        Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"mine".to_vec()))]).expect("taken");
+        let _ = s.take_outbound();
+        let session = s.client.session().expect("a session");
+        let _ = s.take_state_changed();
+        let to = if ours { session } else { session + 1 };
+        let keys = vec![b"a/1".to_vec()];
+        s.on_inbound(&protocol::encode_reply(&protocol::Reply::Superseded { session: to, write_id: 1, seq: 2, root: root(2), keys }).expect("encodes"));
+        s.take_state_changed()
+    };
+    assert_eq!(named(true), vec![b"a/1".to_vec()], "a superseded write did not name its keys: its plain bindings keep showing this tab's forgotten value");
+    assert_eq!(named(false), Vec::<Vec<u8>>::new(), "another session's Superseded named keys here");
+}
+
+/// The keys `take_state_changed` names become DOMAINS by `Db::domain_of_key`:
+/// a record key names its domain; a schema key (or any non-record key) names
+/// none, so it re-runs nothing.
+#[test]
+fn a_record_key_names_its_domain_and_a_schema_key_none() {
+    use craftworks_sdk::db::record_key;
+    type D = craftworks_sdk::Db<craftworks_sdk::MemStore, craftworks_sdk::SystemEnv>;
+    let loc = craftworks_sdk::id::loc_from_hex(&"ab".repeat(16)).expect("an id");
+    assert_eq!(D::domain_of_key(&record_key("notes", loc)), Some("notes".to_string()));
+    let mut schema = vec![0u8];
+    schema.extend_from_slice(b"schema\0notes");
+    assert_eq!(D::domain_of_key(&schema), None, "a schema key named a domain: a define would re-run every binding");
+    assert_eq!(D::domain_of_key(b""), None);
+}

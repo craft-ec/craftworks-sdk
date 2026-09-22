@@ -146,7 +146,7 @@ await t("the artefacts an app is handed are the ones this build ships", () => {
  * somebody else's contract, which is the case that must change nothing.
  */
 function watchingRaw() {
-  let stale = [], bound = new Set(), foreign = 0, scans = 0;
+  let stale = [], bound = new Set(), foreign = 0, scans = 0, ownChanged = [], title = "mine";
   const session = {
     url: () => "ws://127.0.0.1:17509/",
     outbound: () => [], sent() {}, reconnected() {}, provision() {},
@@ -166,12 +166,29 @@ function watchingRaw() {
     bind: d => bound.add(d),
     unbind: d => bound.delete(d),
     take_stale() { const s = stale; stale = []; return JSON.stringify(s); },
+    take_state_changed() { const s = ownChanged; ownChanged = []; return JSON.stringify(s); },
+    // A binding's reload asks the session to refresh what it reads first.
+    refreshes: 0,
+    refresh_domain() { session.refreshes += 1; },
+    root: () => "00".repeat(32),
     live_mode: () => JSON.stringify({ mode: "HeadSubscribed", why: "", foreignNotifications: foreign }),
-    scan() { scans += 1; return JSON.stringify([{ id: "a" }]); },
+    scan() { scans += 1; return JSON.stringify([{ id: "a", title }]); },
     // The node's notification. Ours is taken; anything else is not this
     // session's (sdk#239) and is counted once, through `unowned`.
     on_inbound(key) {
       if (key === "ours") { stale = [...bound]; return true; }
+      // One of THIS client's own writes on `domain` changed state (the node's
+      // verdict on it), as the store reports it (builder#107).
+      if (typeof key === "string" && key.startsWith("own:")) { ownChanged = [key.slice(4)]; return true; }
+      // This client's write on `domain` was SUPERSEDED (sdk#225b): another
+      // device's head won, the tree holds ITS value, and the store names the
+      // write's keys as its own state change.
+      if (typeof key === "string" && key.startsWith("superseded:")) {
+        const [, domain, winner] = key.split(":");
+        title = winner;
+        ownChanged = [domain];
+        return true;
+      }
       return false;
     },
     unowned() { foreign += 1; },
@@ -185,6 +202,68 @@ function watchingRaw() {
     __session: session,
   };
 }
+
+/** An open over `watchingRaw`, with `deliver(key)` as the node's frame. */
+const openWatching = async () => {
+  const raw = watchingRaw();
+  const sdk = wrap(raw);
+  let deliver;
+  const { db } = await sdk.open({
+    port: 17509,
+    fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
+    connect: (session, { onEvent }) => {
+      deliver = key => { session.on_inbound(key); onEvent({ kind: "message" }); };
+      return { close() {}, pump() {} };
+    },
+    setInterval: () => 1, clearInterval: () => {},
+  });
+  return { raw, db, deliver: key => deliver(key) };
+};
+const settle = () => new Promise(r => setTimeout(r, 10));
+
+await t("**a PLAIN binding re-reads when its OWN write changes state (builder#107)**", async () => {
+  const { raw, db, deliver } = await openWatching();
+  db.bind("tasks", { live: false });
+  await settle();
+  const before = raw.__session.scans();
+  deliver("own:tasks");
+  await settle();
+  assert.ok(raw.__session.scans() > before, "a plain binding stayed on its old snapshot after its own write published: its chip would say saving for ever");
+});
+
+await t("**a PLAIN binding shows the WINNER'S value after its own write is superseded (sdk#264)**", async () => {
+  const { db, deliver } = await openWatching();
+  const b = db.bind("tasks", { live: false });
+  await settle();
+  assert.equal(b.getSnapshot()[0]?.title, "mine", "the binding never showed this tab's own value");
+  deliver("superseded:tasks:theirs");
+  await settle();
+  assert.equal(b.getSnapshot()[0]?.title, "theirs", "after this tab's write was superseded its plain binding still shows the forgotten value");
+});
+
+await t("THE CONTROL: somebody ELSE'S write (a head move) does NOT re-run a PLAIN binding", async () => {
+  const { raw, db, deliver } = await openWatching();
+  db.bind("tasks", { live: false });
+  await settle();
+  const before = raw.__session.scans();
+  deliver("ours");
+  await settle();
+  assert.equal(raw.__session.scans(), before, "a plain binding re-read on another writer's change: LIVE would mean nothing");
+});
+
+await t("**a head move re-runs a LIVE binding, never a plain one**", async () => {
+  const { raw, db, deliver } = await openWatching();
+  let liveRuns = 0, plainRuns = 0;
+  const live = db.bind("tasks", { live: true });
+  const plain = db.bind("notes", { live: false });
+  live.subscribe?.(() => { liveRuns += 1; });
+  plain.subscribe?.(() => { plainRuns += 1; });
+  await settle();
+  const before = raw.__session.scans();
+  deliver("ours");
+  await settle();
+  assert.equal(raw.__session.scans(), before + 1, "a head move did not re-run exactly the LIVE binding");
+});
 
 await t("**a HeadChanged for OUR head re-runs a bound scan, with no app call**", async () => {
   const raw = watchingRaw();

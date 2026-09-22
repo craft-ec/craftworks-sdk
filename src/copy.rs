@@ -647,6 +647,11 @@ impl Copy {
     }
 
     /// The engine published this write: its value becomes base.
+    /// The keys this pending write touches.
+    pub fn keys_of(&self, write_id: u64) -> Vec<Vec<u8>> {
+        self.keys.iter().filter(|(_, e)| e.pending.iter().any(|w| w.write_id == write_id)).map(|(k, _)| k.clone()).collect()
+    }
+
     pub fn published(&mut self, write_id: u64) {
         let mut empty: Vec<Vec<u8>> = Vec::new();
         for (k, e) in self.keys.iter_mut() {

@@ -64,3 +64,16 @@ fn control_the_reader_finds_the_bodies() {
     let src = session_src();
     assert!(body_of(&src, "pump_page").contains("take_frames()"));
 }
+
+/// The page path tells the UI what the delegate path used to (builder#107):
+/// the in-page engine's PUBLISHED head moving sets `head_moved` (the delegate
+/// path's HeadChanged, which re-asks LIVE bindings), and this client's OWN
+/// writes changing state are reported by domain for every binding.
+#[test]
+fn the_page_reports_head_moves_and_own_write_states() {
+    let src = session_src();
+    let pump = body_of(&src, "pump_page");
+    assert!(pump.contains("p.server.page.published()") && pump.contains("self.head_moved = true"), "a published head move does not mark the head moved:\n{pump}");
+    let own = body_of(&src, "take_state_changed");
+    assert!(own.contains(".take_state_changed()") && own.contains("domain_of_key"), "own write states are not reported by domain:\n{own}");
+}

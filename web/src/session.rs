@@ -93,6 +93,14 @@ pub struct Session {
     /// which is what makes being told an accelerator rather than the
     /// mechanism.
     head_moved: bool,
+    /// The in-page engine's PUBLISHED head as this session last saw it. A
+    /// move is the head moving — this tab's own commit, or another device's
+    /// head adopted — and sets `head_moved`, which is what the node's
+    /// HeadChanged push did on the delegate path. Without it a bound domain
+    /// was never re-asked after a write published, and its rows said
+    /// "saving" until something else re-rendered them (builder#102's
+    /// two-tab, measured on #260).
+    seen_published: (u64, [u8; 32]),
     /// The root the engine last reported standing on.
     ///
     /// A page is recorded against the root it was read at, and a page
@@ -162,6 +170,7 @@ impl Session {
             foreign_notifications: 0,
             watching: false,
             head_moved: false,
+            seen_published: (0, [0u8; 32]),
             bound: std::collections::BTreeSet::new(),
             refresh: craftworks_sdk::Refresh::new(),
             asked_at_ms: 0,
@@ -467,6 +476,26 @@ impl Session {
     /// The head moving is a HINT. A missed notification costs nothing — the
     /// tick re-reads the root regardless — and a spurious one costs a reload.
     /// What it is NOT is a root: nothing here goes into the copy.
+    /// The domains where one of THIS client's own writes changed state
+    /// (published, parity-complete, lost, failed, conflict, superseded) since
+    /// this was last asked, as JSON. Drains. Every binding of this client on
+    /// them re-reads, LIVE or not: its own write's state reaching it is the
+    /// same rule as its own write reaching it, and it costs no network
+    /// (builder#107). LIVE governs only OTHER writers' changes
+    /// ([`Session::take_stale`]).
+    pub fn take_state_changed(&mut self) -> String {
+        let mut domains: Vec<String> = self
+            .db
+            .store_mut()
+            .take_state_changed()
+            .iter()
+            .filter_map(|k| craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_of_key(k))
+            .collect();
+        domains.sort();
+        domains.dedup();
+        serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into())
+    }
+
     pub fn take_stale(&mut self) -> String {
         if std::mem::take(&mut self.head_moved) {
             // The head moved, so every bound domain is worth ASKING about.
@@ -722,6 +751,11 @@ impl Session {
     fn pump_page(&mut self) {
         self.mint_if_needed();
         let Some(p) = self.page.as_mut() else { return };
+        let published = p.server.page.published();
+        if published != self.seen_published {
+            self.seen_published = published;
+            self.head_moved = true;
+        }
         let frames = p.take_frames();
         let replies = p.take_replies();
         let ready = p.provisioned() && !self.page_identity_sent;
