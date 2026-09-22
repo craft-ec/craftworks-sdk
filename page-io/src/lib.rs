@@ -50,6 +50,21 @@ pub struct Artefacts {
     pub signer: DelegateKey,
 }
 
+/// The head subscription as page-io can honestly report it (sdk#259).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadSubscription {
+    /// The head was read with `subscribe`.
+    pub asked: bool,
+    /// The node answered that read: it holds this page's subscription.
+    pub answered: bool,
+    /// Head moves the subscription has delivered.
+    pub changes: usize,
+    /// Head reads answered with a failure (no head yet, a refusal, or F55).
+    pub failed: usize,
+    /// Opening ended, in words: no head read is coming.
+    pub ended: Option<String>,
+}
+
 pub struct PageIo {
     pub server: Server,
     art: Artefacts,
@@ -68,6 +83,10 @@ pub struct PageIo {
     head_asked: bool,
     head_answered: bool,
     head_changes: usize,
+    /// Head reads the node answered with a FAILURE: no head yet, a refusal,
+    /// or a peered node's false NotFound (F55) — page-io cannot tell which,
+    /// and says so rather than guessing (sdk#259).
+    head_failed: usize,
     /// Blocks in flight, by contract id and by key string (a PUT's answer
     /// names the key).
     by_contract: BTreeMap<[u8; 32], Cid>,
@@ -181,6 +200,7 @@ impl PageIo {
             head_asked: false,
             head_answered: false,
             head_changes: 0,
+            head_failed: 0,
             by_contract: BTreeMap::new(),
             by_key: BTreeMap::new(),
             held: BTreeMap::new(),
@@ -384,8 +404,16 @@ impl PageIo {
     /// built from this — the Session's own `subscribed`/`watching` belong to
     /// the delegate path, which no longer exists, so reporting from them said
     /// "Polled" on a page that was subscribed the whole time.
-    pub fn head_subscription(&self) -> (bool, bool, usize) {
-        (self.head_asked, self.head_answered, self.head_changes)
+    pub fn head_subscription(&self) -> HeadSubscription {
+        HeadSubscription {
+            asked: self.head_asked,
+            answered: self.head_answered,
+            changes: self.head_changes,
+            failed: self.head_failed,
+            // Opening ended — refused in someone's words, or its re-asks spent:
+            // there is no head read coming, so no subscription either.
+            ended: self.refused.clone().or_else(|| self.exhausted.then(|| "the signer is not answering".to_string())),
+        }
     }
 
     pub fn register_id(&self) -> [u8; 32] {
@@ -439,6 +467,7 @@ impl PageIo {
             }
             Incoming::GetFailed { id } => {
                 if id == self.register_id {
+                    self.head_failed += 1;
                     // A failed read of the head — a refusal, or 0.2.136's
                     // explicit NotFound, which a PEERED node can answer
                     // falsely (F55) — is "no head" ONLY if the signer holds no

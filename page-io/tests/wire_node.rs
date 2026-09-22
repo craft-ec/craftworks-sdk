@@ -963,15 +963,43 @@ fn page_io_says_whether_the_head_subscription_was_asked_answered_and_delivering(
     let mut now = 0u64;
 
     // Before anything is sent: nothing asked, nothing answered. NOT "live".
-    assert_eq!(io.head_subscription(), (false, false, 0), "page-io claimed a subscription before it read the head");
+    let h = io.head_subscription();
+    assert!(!h.asked && !h.answered && h.changes == 0, "page-io claimed a subscription before it read the head: {h:?}");
 
     let _ = client(&mut io, &mut node, &mut now, &Request::Identity);
-    println!("  after Identity (no head yet): {:?}", io.head_subscription());
-    assert!(io.head_subscription().0, "the head was never read with subscribe, so nothing can notify this page");
+    let h = io.head_subscription();
+    println!("  after Identity (no head yet): {h:?}");
+    assert!(h.asked, "the head was never read with subscribe, so nothing can notify this page");
+    assert!(!h.answered, "a head that does not exist yet was called answered");
+    assert!(h.failed > 0, "the node's failure to serve a head that does not exist was not counted, so `Polled` could not say why");
 
     // The first write CREATES the head register, and the page reads it again.
     let _ = client(&mut io, &mut node, &mut now, &write(1, "k/1", "v"));
-    println!("  after the first write (the head exists): {:?}", io.head_subscription());
-    let (asked, answered, _) = io.head_subscription();
-    assert!(asked && answered, "the page holds no answered head read once the head exists: nothing can notify it");
+    let h = io.head_subscription();
+    println!("  after the first write (the head exists): {h:?}");
+    assert!(h.asked && h.answered, "the page holds no answered head read once the head exists: nothing can notify it");
+    assert_eq!(h.ended, None, "an opening that succeeded was reported as ended");
+}
+
+/// sdk#259: an opening that ENDED — refused in the signer's words, here —
+/// means no head read is coming, so no subscription either, and the report
+/// says so in those words rather than "not answered yet" for ever.
+#[test]
+fn an_opening_that_ended_is_reported_as_the_reason_there_is_no_subscription() {
+    let mut node = WireNode::new(&[26u8; 32]);
+    let mut now = 1_000;
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let other = ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: wire::register_params(&other.verifying_key().to_bytes(), wire::HEAD_NAME), signer },
+    );
+    io.provision(container, other.to_bytes().to_vec());
+    settle(&mut io, &mut node, &mut now);
+    let h = io.head_subscription();
+    assert!(!h.answered, "a page whose opening was refused reported a subscription: {h:?}");
+    assert!(
+        h.ended.as_deref().is_some_and(|s| s.contains("KeyAlreadyProvisioned")),
+        "the reason there is no subscription is not in the report, so it would say 'not answered yet' for ever: {h:?}"
+    );
 }

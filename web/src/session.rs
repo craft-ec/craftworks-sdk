@@ -666,11 +666,19 @@ impl Session {
         // the whole time said "Polled", and the two-tab probe read its number
         // as "the tick's number wearing a different name".
         let tick = " The tick keeps the data right meanwhile.";
-        let (asked, answered, changes) = self.page.as_ref().map(|p| p.head_subscription()).unwrap_or((false, false, 0));
-        let (mode, why) = match (asked, answered) {
-            (_, true) => ("HeadSubscribed", String::new()),
-            (true, false) => ("Polled", format!("the head read with subscribe has not been answered yet.{tick}")),
-            (false, false) => ("Polled", "the head has not been read on this connection yet".to_string()),
+        let h = self.page.as_ref().map(|p| p.head_subscription());
+        let (changes, (mode, why)) = match &h {
+            None => (0, ("Polled", "there is no page on this connection yet".to_string())),
+            Some(h) => (h.changes, match h {
+                h if h.answered => ("HeadSubscribed", String::new()),
+                page_io::HeadSubscription { ended: Some(said), .. } => ("Polled", format!("opening ended, so the head is never read: {said}")),
+                h if h.failed > 0 => ("Polled", format!(
+                    "the node answered the head read with a failure {} time(s) — no head yet, a refusal, or a peered node's false NotFound (F55); it is asked again.{tick}",
+                    h.failed
+                )),
+                h if h.asked => ("Polled", format!("the head read with subscribe has not been answered yet.{tick}")),
+                _ => ("Polled", "the head has not been read on this connection yet".to_string()),
+            }),
         };
         serde_json::json!({
             "mode": mode,
