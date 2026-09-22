@@ -86,12 +86,20 @@ fn main() {
         }))
         .expect("encodes"))
     });
+    // SIGNER_CODE=<hex> — the node's answer to the SIGNER's registration, as
+    // measured on 0.2.136 (sdk#260's frame log): a DelegateResponse naming
+    // that delegate and carrying NO message.
+    let registered = std::env::var("SIGNER_CODE").ok().map(|code| {
+        let (_, dkey) = wire::delegate_from_code(&unhex(&code));
+        hex(&bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse { key: dkey, values: vec![] })).expect("encodes"))
+    });
     println!(
-        r#"{{"key":"{key}","ack":"{}","refusal":"{}","got":"{}","signer_answer":"{}","frames":[{}]}}"#,
+        r#"{{"key":"{key}","ack":"{}","refusal":"{}","got":"{}","signer_answer":"{}","registered":"{}","frames":[{}]}}"#,
         hex(&ack),
         hex(&refusal),
         hex(&got),
         signer_answer.unwrap_or_default(),
+        registered.unwrap_or_default(),
         frames.join(",")
     );
 }

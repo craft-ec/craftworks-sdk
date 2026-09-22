@@ -20,7 +20,7 @@ const enc = s => new TextEncoder().encode(s);
 const hex = b => Buffer.from(b).toString("hex");
 function stdlib(frames = [], signerAnswer = null) {
   const r = spawnSync("cargo", ["run", "-q", "-p", "wire", "--example", "node_answers", "--", "00", "00", "00", "x", ...frames.map(hex)],
-    { cwd: root, encoding: "utf8", maxBuffer: 1 << 26, env: { ...process.env, ...(signerAnswer ? { SIGNER_ANSWER: signerAnswer } : {}) } });
+    { cwd: root, encoding: "utf8", maxBuffer: 1 << 26, env: { ...process.env, SIGNER_CODE: hex(enc("signer code")), ...(signerAnswer ? { SIGNER_ANSWER: signerAnswer } : {}) } });
   assert.equal(r.status, 0, r.stderr);
   return JSON.parse(r.stdout);
 }
@@ -28,7 +28,17 @@ function stdlib(frames = [], signerAnswer = null) {
 const signerRequests = s => { const out = s.outbound(); s.sent(out.length); return stdlib(out).frames.flatMap(f => f.signer ?? []); };
 /** Register params as `wire::register_params` lays them out: RG01, a version byte, the key, the name. */
 const params = keyByte => new Uint8Array([...enc("RG01"), 0, ...new Array(32).fill(keyByte), ...enc("head")]);
-const page = () => { const s = new Session(7999); s.provision(enc("signer code"), enc("block code"), enc("register code")); return s; };
+/** The frames a session sends now, decoded, and given up. */
+const sentNow = s => { const out = s.outbound(); s.sent(out.length); return stdlib(out).frames; };
+/** A page provisioning, its registration ANSWERED as the node answers it
+ * (an empty DelegateResponse naming the signer): only then does it ask. */
+const page = () => {
+  const s = new Session(7999);
+  s.provision(enc("signer code"), enc("block code"), enc("register code"));
+  sentNow(s);
+  s.on_inbound(new Uint8Array(Buffer.from(stdlib().registered, "hex")));
+  return s;
+};
 /** Several turns of the page's clock and pump; then what it had to call unusable. */
 const settled = s => { for (let i = 0; i < 4; i += 1) { s.tick(); s.sent(s.outbound().length); } return JSON.parse(s.unusable()); };
 const answer = (s, id, p) => { s.on_inbound(new Uint8Array(Buffer.from(stdlib([], `register:${id}:${p ? hex(p) : "none"}`).signer_answer, "hex"))); };
@@ -36,6 +46,16 @@ const answer = (s, id, p) => { s.on_inbound(new Uint8Array(Buffer.from(stdlib([]
 await t("**a page ASKS the signer which Register first — nothing is minted or provisioned yet**", async () => {
   const reqs = signerRequests(page());
   assert.deepEqual(reqs.map(r => r.req), ["Register"], `a page opened with ${JSON.stringify(reqs)}`);
+});
+
+await t("**the signer's registration goes ALONE: its first request waits for the registration's answer (#260, measured)**", async () => {
+  const s = new Session(7999);
+  s.provision(enc("signer code"), enc("block code"), enc("register code"));
+  const first = sentNow(s);
+  assert.deepEqual(first.map(f => f.op), ["delegate"], `the first flush: ${JSON.stringify(first)}`);
+  assert.deepEqual(first.flatMap(f => f.signer ?? []), [], "a signer request went out with the registration, before it was answered");
+  s.on_inbound(new Uint8Array(Buffer.from(stdlib().registered, "hex")));
+  assert.deepEqual(signerRequests(s).map(r => r.req), ["Register"], "the registration's answer did not release the Register query");
 });
 
 await t("**the signer names a Register: the page opens IT, provisions nothing, and two pages told the same stand on the same head**", async () => {
