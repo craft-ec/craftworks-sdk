@@ -19,6 +19,80 @@ into two merged pull requests while eight workspace members sat out. The real
 number is 358. Nothing failed and nothing warned; the only tell was a count
 that did not move.
 
+## Build a site on the SDK
+
+A whole site on the SDK alone, with no builder: [`examples/notes/`](examples/notes/index.html). Serve the repository root after `./build.sh` and open `/examples/notes/#node=<your node's ws port>`. The engine runs in the page; the node holds only the signer.
+
+The page's whole program, verbatim (`tests/js/readme-notes.test.mjs` fails if this block and the page ever differ):
+
+```js
+import { load } from "../../pkg/web/index.js";
+
+const $ = id => document.getElementById(id);
+const say = (text, bad = false) => { $("status").textContent = text; $("status").className = bad ? "bad" : ""; };
+const params = new URLSearchParams(location.hash.slice(1));
+const port = Number(params.get("node"));
+let saving = 0;
+
+try {
+  // NO DEFAULT PORT: which node gets your key is a decision, not a default.
+  if (!Number.isInteger(port) || port <= 0) throw new Error("say which node: add #node=<port> to the URL");
+  const sdk = await load();
+  // ONE CALL: connect, provision the node if it needs it, and hand back a db.
+  // "saving N…" comes from the session, which counts every write not yet
+  // published — closing the tab before 0 would lose them.
+  const { db } = await sdk.open({
+    port,
+    onEvent: e => { if (e.kind === "saving") { saving = e.count; render(); } },
+  });
+  await db.define("notes", { type: "Note", fields: [{ name: "text", kind: "text", required: true }] });
+
+  // A BINDING: the list re-reads by itself when the data changes.
+  const notes = db.bind("notes", { limit: 500 });
+  notes.subscribe(render);
+  await notes.reload();
+
+  function render() {
+    const rows = notes.getSnapshot();
+    $("list").replaceChildren(...rows.map(r => {
+      const li = document.createElement("li");
+      const span = Object.assign(document.createElement("span"), { textContent: r.fields.text });
+      const edit = Object.assign(document.createElement("button"), { textContent: "Edit" });
+      edit.onclick = async () => {
+        const text = prompt("Edit note", r.fields.text);
+        if (text) await db.update("notes", r.id, { text });
+      };
+      const del = Object.assign(document.createElement("button"), { textContent: "Delete" });
+      del.onclick = () => db.delete("notes", r.id);
+      li.append(span, edit, del);
+      return li;
+    }));
+    say(saving > 0 ? `saving ${saving}…` : `${rows.length} note${rows.length === 1 ? "" : "s"}`);
+  }
+
+  $("add").onsubmit = async e => {
+    e.preventDefault();
+    const text = $("text").value.trim();
+    if (!text) return;
+    $("text").value = "";
+    await db.put("notes", { text });
+  };
+  // The acceptance seam: the tools read the db through this.
+  globalThis.__notes = { db, notes, saving: () => saving };
+  render();
+} catch (e) {
+  say(`Could not open: ${e.message}`, true);
+}
+```
+
+What it relies on, and what each part is for:
+- **`sdk.open({ port })`** connects, provisions the node if it needs it, and hands back a db. There's no default port: which node gets your key is a decision.
+- **`onEvent` `saving`** counts every write not yet published. Show "saving N…" until 0; closing the tab before then would lose them.
+- **`db.define`** gives a collection its schema, once. **`db.bind`** gives a list that re-reads itself when the data changes.
+- **`db.put` / `db.update` / `db.delete`** are the writes; each is published to the node.
+
+`examples/notes/acceptance.mjs` runs this page live against a private local node. It checks that 50 notes put come back after a reload, a second tab sees them, and an update and a delete reach that second tab.
+
 ## Collections
 
 ```js

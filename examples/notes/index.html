@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0 auto; padding: 16px; max-width: 640px; }
+  form { display: flex; gap: 8px; margin: 12px 0; }
+  input { flex: 1; padding: 6px 8px; font: inherit; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid #8884; }
+  li span { flex: 1; }
+  #status { color: #666; font-size: .9em; min-height: 1.2em; }
+  #status.bad { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>Notes</h1>
+<p id="status" role="status">Loading…</p>
+<form id="add"><input id="text" placeholder="A note" autocomplete="off" required><button>Add</button></form>
+<ul id="list"></ul>
+<!--
+  A SITE ON THE SDK ALONE (craftworks-sdk#234): no builder, nothing but this
+  file and the SDK's pkg/web. Served from the repo root, open it as
+    /examples/notes/#node=<your node's ws port>
+  Every call below is one an app makes; the README's "Build a site on the SDK"
+  is taken from this file.
+-->
+<script type="module">
+import { load } from "../../pkg/web/index.js";
+
+const $ = id => document.getElementById(id);
+const say = (text, bad = false) => { $("status").textContent = text; $("status").className = bad ? "bad" : ""; };
+const params = new URLSearchParams(location.hash.slice(1));
+const port = Number(params.get("node"));
+let saving = 0;
+
+try {
+  // NO DEFAULT PORT: which node gets your key is a decision, not a default.
+  if (!Number.isInteger(port) || port <= 0) throw new Error("say which node: add #node=<port> to the URL");
+  const sdk = await load();
+  // ONE CALL: connect, provision the node if it needs it, and hand back a db.
+  // "saving N…" comes from the session, which counts every write not yet
+  // published — closing the tab before 0 would lose them.
+  const { db } = await sdk.open({
+    port,
+    onEvent: e => { if (e.kind === "saving") { saving = e.count; render(); } },
+  });
+  await db.define("notes", { type: "Note", fields: [{ name: "text", kind: "text", required: true }] });
+
+  // A BINDING: the list re-reads by itself when the data changes.
+  const notes = db.bind("notes", { limit: 500 });
+  notes.subscribe(render);
+  await notes.reload();
+
+  function render() {
+    const rows = notes.getSnapshot();
+    $("list").replaceChildren(...rows.map(r => {
+      const li = document.createElement("li");
+      const span = Object.assign(document.createElement("span"), { textContent: r.fields.text });
+      const edit = Object.assign(document.createElement("button"), { textContent: "Edit" });
+      edit.onclick = async () => {
+        const text = prompt("Edit note", r.fields.text);
+        if (text) await db.update("notes", r.id, { text });
+      };
+      const del = Object.assign(document.createElement("button"), { textContent: "Delete" });
+      del.onclick = () => db.delete("notes", r.id);
+      li.append(span, edit, del);
+      return li;
+    }));
+    say(saving > 0 ? `saving ${saving}…` : `${rows.length} note${rows.length === 1 ? "" : "s"}`);
+  }
+
+  $("add").onsubmit = async e => {
+    e.preventDefault();
+    const text = $("text").value.trim();
+    if (!text) return;
+    $("text").value = "";
+    await db.put("notes", { text });
+  };
+  // The acceptance seam: the tools read the db through this.
+  globalThis.__notes = { db, notes, saving: () => saving };
+  render();
+} catch (e) {
+  say(`Could not open: ${e.message}`, true);
+}
+</script>
+</body>
+</html>

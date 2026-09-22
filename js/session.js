@@ -543,5 +543,43 @@ export async function open(Session, opts = {}) {
   const handle = await openSession(Session, opts);
   // Registers its own wake-up with the handle. The page never sees `drain`.
   const db = engineDb(handle);
+  // A DB THAT CAN BE READ. When this call provisions the node, the db is
+  // handed over only once the node says it is provisioned: a read made before
+  // that has no engine to answer it and fails as UNAVAILABLE ("the range this
+  // read needed could not be loaded"). Measured on the notes site (sdk#234):
+  // define-then-scan straight after open() failed every time; waiting for
+  // `provisioned()` first, all five of its checks passed. The builder's
+  // publish always waited; an app should not have to know to.
+  if (opts.artefacts && opts.provision !== false) {
+    try {
+      await untilProvisioned(handle, opts);
+    } catch (e) {
+      handle.close();
+      throw e;
+    }
+  }
   return { ...handle, db };
+}
+
+/**
+ * Until the node says it is provisioned — or that it cannot be. Three ends,
+ * never one timeout: refused (the signer's or the node's words), exhausted
+ * (page-io's re-asks are spent), or the budget.
+ */
+export async function untilProvisioned(handle, {
+  provisionBudgetMs = 60_000, provisionEveryMs = 100,
+  now: clock = () => Date.now(),
+  setTimeout: afterMs = setTimeout,
+} = {}) {
+  const started = clock();
+  for (;;) {
+    if (handle.provisioned()) return;
+    const refused = handle.refused?.();
+    if (refused) throw new Error(`the node refused to set up: ${refused}`);
+    if (handle.exhausted?.()) throw new Error("the signer is not answering: every re-ask was spent and the node is still not provisioned");
+    if (clock() - started > provisionBudgetMs) {
+      throw new Error(`the node did not finish setting up in ${Math.round(provisionBudgetMs / 1000)} s; is it running?`);
+    }
+    await new Promise(r => afterMs(r, provisionEveryMs));
+  }
 }
