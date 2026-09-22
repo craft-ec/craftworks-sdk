@@ -38,7 +38,7 @@ impl Tab {
     fn pump(&mut self) {
         for frame in self.store.take_outbound() {
             if let protocol::Incoming::Ok(env) = protocol::decode_request(&frame) {
-                if let protocol::Request::Write { write_id, .. } = env.body {
+                if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
                     self.sent.push((session_of(&env), write_id));
                 }
             }

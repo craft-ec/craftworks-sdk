@@ -518,7 +518,14 @@ impl Server {
         let Some(m) = self.merge.as_mut() else { return };
         // A write whose declared read moved on their side had a stale
         // premise: ALL its keys are superseded (main's rule).
-        let stale: Vec<bool> = m.writes.iter().map(|(_, w)| w.reads.iter().any(|(k, _)| m.theirs.contains_key(k))).collect();
+        // An `Any` read states NO premise ("whatever it holds", sdk#235), so it
+        // can never be stale: counting it would supersede every forced write
+        // whose key the other side touched, which is a rollback, not a merge.
+        let stale: Vec<bool> = m
+            .writes
+            .iter()
+            .map(|(_, w)| w.reads.iter().any(|(k, e)| *e != engine::Expect::Any && m.theirs.contains_key(k)))
+            .collect();
         let mut kept = Vec::new();
         for (k, v) in &m.left {
             let premise_ok = m.writes.iter().zip(&stale).filter(|((_, w), _)| w.finals.iter().any(|(wk, _)| wk == k)).all(|(_, s)| !*s);
@@ -1097,7 +1104,10 @@ impl Server {
             return;
         };
         let (of, began) = match &r {
-            protocol::Request::Write { write_id, ops } => {
+            // A write is traced whatever its shape: since sdk#235 every write
+            // the SDK sends is a `Commit` (a forced one reads `Any`), so a
+            // trace that started only on `Write` went silent.
+            protocol::Request::Write { write_id, ops } | protocol::Request::Commit { write_id, ops, .. } => {
                 (protocol::TraceOf::Write(*write_id), ops.len() as u64)
             }
             protocol::Request::Get { req_id, .. }

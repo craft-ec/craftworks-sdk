@@ -69,13 +69,18 @@ fn a_write_shows_at_once_and_goes_out_on_the_pump() {
     // And it says it is not settled.
     assert!(s.copy.get(b"a/1").unwrap().is_pending());
 
-    // It really left, as a Write, exactly once.
+    // It really left, exactly once — as a FORCED write (sdk#235, W8): a
+    // store-level `put` cannot read first, so it says so, key by key, as
+    // `Expect::Any`, and never as a reads-less `Write` (which is refused).
     let out = s.take_outbound();
     assert_eq!(out.len(), 1, "expected one request, got {}", out.len());
     match protocol::decode_request(&out[0]) {
         protocol::Incoming::Ok(env) => match env.body {
-            protocol::Request::Write { ops, .. } => assert_eq!(ops.len(), 1),
-            other => panic!("not a Write: {other:?}"),
+            protocol::Request::Commit { ops, reads, .. } => {
+                assert_eq!(ops.len(), 1);
+                assert_eq!(reads, vec![(b"a/1".to_vec(), protocol::Expect::Any)], "a store-level put did not name its key as forced");
+            }
+            other => panic!("not a forced Commit: {other:?}"),
         },
         other => panic!("not decodable: {other:?}"),
     }
@@ -375,8 +380,12 @@ fn an_own_writes_state_change_names_its_keys() {
     let verdict_of = |states: &[protocol::WriteState]| -> Vec<Vec<Vec<u8>>> {
         let mut s = store();
         s.on_page(b"a/", b"b/", vec![], root(1));
-        Store::apply_batch(
+        // WITH its reads, as a `Db` write makes it: a forced (`Any`) write
+        // told Lost falls rather than going again (sdk#235), and this test is
+        // about the write that DOES go again.
+        Store::apply_commit(
             &mut s,
+            &[(b"a/1".to_vec(), protocol::Expect::Absent), (b"a/2".to_vec(), protocol::Expect::Absent)],
             &[
                 (b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v1".to_vec())),
                 (b"a/2".to_vec(), craftworks_sdk::store::Edit::Put(b"v2".to_vec())),
@@ -464,7 +473,7 @@ fn a_record_key_names_its_domain_and_a_schema_key_none() {
 fn a_lost_write_is_re_sent_and_falls_named_only_at_the_bound() {
     let mut s = store();
     s.on_page(b"a/", b"b/", vec![], root(1));
-    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
+    Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
     let sent = |s: &mut CachedStore| -> Vec<u64> {
         s.take_outbound()
             .iter()
@@ -551,9 +560,9 @@ fn a_write_behind_a_lost_one_is_pulled_back_and_lands_after_it() {
 fn a_lost_write_a_later_one_landed_over_falls_named_rather_than_re_sent() {
     let mut s = store();
     s.on_page(b"a/", b"b/", vec![], root(1));
-    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"first".to_vec()))]).expect("taken");
+    Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"first".to_vec()))]).expect("taken");
     let w1 = *sent_ids(&mut s).first().expect("w1 went out");
-    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"second".to_vec()))]).expect("taken");
+    Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(b"first")))], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"second".to_vec()))]).expect("taken");
     let w2 = *sent_ids(&mut s).first().expect("w2 went out");
     let session = s.client.session().expect("a session");
     let say = |s: &mut CachedStore, id: u64, st: protocol::WriteState| s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id: id, state: st }).expect("encodes"));
@@ -575,7 +584,7 @@ fn the_lost_re_sends_and_the_conflict_re_runs_share_one_budget() {
     use craftworks_sdk::store::Store as _;
     let mut s = store();
     s.on_page(b"a/", b"b/", vec![], root(1));
-    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
+    Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
     let w1 = *sent_ids(&mut s).first().expect("w1 went out");
     let session = s.client.session().expect("a session");
     let say = |s: &mut CachedStore, id: u64, st: protocol::WriteState| s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id: id, state: st }).expect("encodes"));
@@ -592,7 +601,7 @@ fn the_lost_re_sends_and_the_conflict_re_runs_share_one_budget() {
     // Lost tries from N, not from zero.
     let mut s = store();
     s.on_page(b"a/", b"b/", vec![], root(1));
-    Store::apply_batch(&mut s, &[(b"a/2".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
+    Store::apply_commit(&mut s, &[(b"a/2".to_vec(), protocol::Expect::Absent)], &[(b"a/2".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
     let w = *sent_ids(&mut s).first().expect("it went out");
     s.carry_tries(w, craftworks_sdk::cached_store::WRITE_TRIES);
     let session = s.client.session().expect("a session");
@@ -628,4 +637,52 @@ fn own_state_changes_name_the_app_relative_domain_its_bindings_are_keyed_by() {
     assert!(!D::own_domains_of_keys(Some(app), std::slice::from_ref(&mine)).contains(&format!("{app}.notes")), "the stored name leaked through");
     // No app (data from before apps): the name as stored, as `app::own` says.
     assert_eq!(D::own_domains_of_keys(None, &[record_key("notes", loc)]), vec!["notes".to_string()]);
+}
+
+/// **A FORCED write told `Lost` falls, NAMED, and is NOT re-sent** (sdk#235,
+/// WRITE-PATH ⁷). It has no premise the engine could re-check, so going again
+/// would be exactly the blind overwrite #265's re-send is made safe against.
+#[test]
+fn a_forced_write_told_lost_falls_named_and_is_not_re_sent() {
+    let mut s = store();
+    s.on_page(b"a/", b"b/", vec![], root(1));
+    // A store-level put: it cannot read first, so it is forced (`Any`).
+    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
+    let write_id = *sent_ids(&mut s).first().expect("the write went out");
+    let session = s.client.session().expect("a session");
+    s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id, state: protocol::WriteState::Lost }).expect("encodes"));
+    assert!(sent_ids(&mut s).is_empty(), "a forced write told Lost was sent again");
+    assert_eq!(s.take_forced_lost(), vec![write_id], "the forced write that fell was not named");
+    assert!(s.take_lost_gave_up().is_empty(), "it was named as out of tries, which it was not");
+    assert_eq!(s.copy.pending().0, 0, "the fallen write is still held");
+    // THE CONTROL (the test above): the same Lost on a write WITH its reads
+    // goes again — so this is the forced rule, not every Lost falling.
+}
+
+/// **`Unread` falls the write AND every later write on its keys, names them
+/// ALL with the key, and never re-sends** (sdk#235, WRITE-PATH ⁷).
+#[test]
+fn an_unread_write_falls_with_its_dependants_all_named_and_is_never_re_sent() {
+    let mut s = store();
+    s.on_page(b"a/", b"b/", vec![], root(1));
+    Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"one".to_vec()))]).expect("taken");
+    Store::apply_commit(
+        &mut s,
+        &[(b"a/1".to_vec(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(b"one")))],
+        &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"two".to_vec()))],
+    )
+    .expect("taken");
+    let ids = sent_ids(&mut s);
+    let first = *ids.first().expect("the first write went out");
+    let session = s.client.session().expect("a session");
+    let say = |s: &mut CachedStore, r: protocol::Reply| s.on_inbound(&protocol::encode_reply(&r).expect("encodes"));
+    say(&mut s, protocol::Reply::SessionWriteState { session, write_id: first, state: protocol::WriteState::Unread });
+    say(&mut s, protocol::Reply::Unread { session, write_id: first, key: b"a/1".to_vec() });
+    let told = s.take_unread();
+    assert_eq!(told.len(), 1, "the Unread was not reported once: {told:?}");
+    assert_eq!(told[0].write_ids.len(), 2, "the later write on its key did not fall with it, named: {told:?}");
+    assert!(told[0].write_ids.contains(&first));
+    assert_eq!(told[0].key.as_deref(), Some(&b"a/1"[..]), "the key the node named was not attached");
+    assert!(sent_ids(&mut s).is_empty(), "an Unread write (or one behind it) was sent again");
+    assert_eq!(Reads::get(&mut s, b"a/1").ok().flatten(), None, "the row still shows a value that was never saved");
 }

@@ -200,13 +200,20 @@ impl Tab {
 #[test]
 fn two_tabs_writing_at_once_lose_nothing_at_the_client() {
     use craftworks_sdk::store::Store as _;
+    // Each write WITH its read, as a `Db` write makes it. A store-level `put`
+    // is FORCED (`Expect::Any`, sdk#235) and a forced write told Lost falls,
+    // named, instead of going again — so it would not test #265's re-send,
+    // which is what this test is for.
+    let create = |k: &[u8]| (vec![(k.to_vec(), protocol::Expect::Absent)], vec![(k.to_vec(), craftworks_sdk::store::Edit::Put(k.to_vec()))]);
     let node = PageNode::new();
     let (mut x, mut y) = (Tab::open(&node), Tab::open(&node));
     x.conn.hold_answers();
     y.conn.hold_answers();
-    x.store.put(b"x1", b"x1").expect("x takes x1");
+    let (r, e) = create(b"x1");
+    x.store.apply_commit(&r, &e).expect("x takes x1");
     x.pump();
-    y.store.put(b"y1", b"y1").expect("y takes y1");
+    let (r, e) = create(b"y1");
+    y.store.apply_commit(&r, &e).expect("y takes y1");
     y.pump();
     x.conn.stop_holding();
     y.conn.stop_holding();
@@ -221,7 +228,8 @@ fn two_tabs_writing_at_once_lose_nothing_at_the_client() {
             y.release();
         }
     }
-    x.store.put(b"x2", b"x2").expect("x takes x2");
+    let (r, e) = create(b"x2");
+    x.store.apply_commit(&r, &e).expect("x takes x2");
     x.pump();
     for t in 1..=30u64 {
         for tab in [&mut x, &mut y] {

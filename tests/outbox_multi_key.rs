@@ -54,7 +54,7 @@ impl Page {
         let mut inbound = Vec::new();
         for frame in frames {
             if let protocol::Incoming::Ok(env) = protocol::decode_request(&frame) {
-                if let protocol::Request::Write { write_id, .. } = env.body {
+                if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
                     *self.sent.entry(write_id).or_default() += 1;
                 }
             }

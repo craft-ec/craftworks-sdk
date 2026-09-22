@@ -1199,6 +1199,24 @@ mod tests {
     use super::*;
     use crate::store::MemStore;
 
+    /// **An app's write is never forced** (sdk#235 ruling 1): a `Db` write
+    /// carrying `Expect::Any` is REFUSED by name — a real refusal, not a
+    /// debug assertion — and the store is never reached.
+    #[test]
+    fn a_db_write_carrying_any_is_refused_and_the_store_is_untouched() {
+        let mut d = Db::new(MemStore::default(), crate::id::SystemEnv, *b"dev1");
+        let key = b"\x01notes\x00k".to_vec();
+        let e = d
+            .write(vec![(key.clone(), Expect::Any)], vec![(key.clone(), Edit::Put(b"v".to_vec()))])
+            .expect_err("a Db write carrying Any was accepted");
+        assert!(matches!(e, DbError::Refused(_)), "not a refusal: {e:?}");
+        assert!(e.to_string().contains("may not force key"), "{e}");
+        assert_eq!(d.get_key(&key).unwrap(), None, "the refused write reached the store");
+        // THE CONTROL: the same write with a real read is made.
+        d.write(vec![(key.clone(), Expect::Absent)], vec![(key.clone(), Edit::Put(b"v".to_vec()))]).expect("a write with its read is made");
+        assert_eq!(d.get_key(&key).unwrap(), Some(b"v".to_vec()));
+    }
+
     /// The key screen guards DERIVED keys. Nothing an app can write today
     /// produces one — a record key is a 1-byte tag, a domain of at most 32, a
     /// separator and a 16-byte id — but index terms will be built from a

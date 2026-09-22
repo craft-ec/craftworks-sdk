@@ -18,14 +18,26 @@ use std::collections::BTreeMap;
 mod common;
 use common::{Harness, Mode, Store};
 
+/// A write with these reads. Every op key the test does NOT read is FORCED
+/// (`Expect::Any`, sdk#235 W8): these tests are about the reads they declare —
+/// often of a key the write does not touch — and a write must name every key
+/// it changes, so the rest are named as "whatever it holds". The declared
+/// reads are checked exactly as before.
 fn write(id: u64, ops: &[(&[u8], Option<&[u8]>)], reads: Vec<(Vec<u8>, Expect)>) -> Event {
+    let ops: Vec<(Vec<u8>, Op)> = ops
+        .iter()
+        .map(|(k, v)| (k.to_vec(), v.map_or(Op::Delete, |v| Op::Put(v.to_vec()))))
+        .collect();
+    let mut reads = reads;
+    for (k, _) in &ops {
+        if !reads.iter().any(|(r, _)| r == k) {
+            reads.push((k.clone(), Expect::Any));
+        }
+    }
     Event::Write {
         client: ClientId(1),
         write_id: WriteId(id),
-        ops: ops
-            .iter()
-            .map(|(k, v)| (k.to_vec(), v.map_or(Op::Delete, |v| Op::Put(v.to_vec()))))
-            .collect(),
+        ops,
         reads,
     }
 }

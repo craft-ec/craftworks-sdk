@@ -346,7 +346,7 @@ fn any_verdict_frees_the_slot_accepted_or_busy() {
             .iter()
             .filter_map(|f| match protocol::decode_request(f) {
                 protocol::Incoming::Ok(env) => match env.body {
-                    protocol::Request::Write { write_id, .. } => Some(write_id),
+                    protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } => Some(write_id),
                     _ => None,
                 },
                 _ => None,
