@@ -210,6 +210,12 @@ export function wrap(raw) {
     // that says why.
     open: (opts = {}) => openWith(raw.Session, { artefacts: SHIPPED_ARTEFACTS, ...opts }),
     SHIPPED_ARTEFACTS,
+    // PUBLISHING a web container (builder#104): `params(state)` is the
+    // `webapp` contract's params (BLAKE3, which a page has no other way to
+    // compute), `address(code, state)` the key the node serves it under, and
+    // `AppContainer` builds an app's container in the page. The PUT itself is
+    // the session's `put_contract`.
+    webapp: { params: raw.webapp_params, address: raw.webapp_address, AppContainer: raw.AppContainer },
     // The halves, for tests that drive the parts and for a host running its
     // own loop. NOT app-facing: handing an app the two things it can wire
     // wrongly, beside the one call it cannot, is how the wiring gets done by
