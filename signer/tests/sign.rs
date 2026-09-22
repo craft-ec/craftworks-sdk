@@ -502,3 +502,39 @@ fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
         (Answer::Refused(Why::NotProvisioned), 0)
     );
 }
+
+/// READ-LOCAL: present / absent per contract, in order, from the node's local states alone -- so a block the node
+/// holds is `true` and one it does not is `false`, whatever order they are asked in. Needs no provisioning.
+#[test]
+fn held_says_which_contracts_this_node_holds_in_the_order_asked() {
+    let mut host = Mem::default();
+    let have = engine_delegate::blocks::contract_for(BCODE, &block_root(1));
+    let lack = engine_delegate::blocks::contract_for(BCODE, &block_root(2));
+    host.states.insert(have, block_state(1));
+    let ask = |host: &mut Mem, contracts: Vec<[u8; 32]>| {
+        serve(
+            &mut host.clone(),
+            &encode_request(&Request::Held { contracts }),
+        )
+    };
+    assert_eq!(
+        ask(&mut host, vec![have, lack, have]),
+        Answer::Held {
+            present: vec![true, false, true]
+        }
+    );
+    assert_eq!(
+        ask(&mut host, vec![lack, have]),
+        Answer::Held {
+            present: vec![false, true]
+        }
+    );
+    assert_eq!(
+        ask(&mut host, vec![]),
+        Answer::Refused(Why::BlockCount { max: 128, got: 0 })
+    );
+    assert_eq!(
+        ask(&mut host, vec![have; 129]),
+        Answer::Refused(Why::BlockCount { max: 128, got: 129 })
+    );
+}

@@ -168,6 +168,7 @@ pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
     };
     let answer = match req {
         Request::PutBlocks { states } => return put_blocks(host, states),
+        Request::Held { contracts } => held(host, &contracts),
         Request::Provision {
             signing_key,
             register_code,
@@ -220,6 +221,23 @@ fn provision<H: Host>(
         Answer::Provisioned
     } else {
         Answer::Refused(Why::NotProvisioned)
+    }
+}
+
+/// READ-LOCAL: whether this node holds each contract's state, by the host's synchronous local read -- never a
+/// network fetch, so it cannot park. Needs no provisioning: it reads, and says nothing but present / absent.
+fn held<H: Host>(host: &H, contracts: &[[u8; 32]]) -> Answer {
+    if contracts.is_empty() || contracts.len() > MAX_PUT_BLOCKS {
+        return Answer::Refused(Why::BlockCount {
+            max: MAX_PUT_BLOCKS as u32,
+            got: contracts.len() as u32,
+        });
+    }
+    Answer::Held {
+        present: contracts
+            .iter()
+            .map(|c| host.contract_state(c).is_some())
+            .collect(),
     }
 }
 

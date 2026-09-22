@@ -64,7 +64,7 @@ pub enum Why {
         read: Head,
     },
     RegisterChanged,
-    /// A `PutBlocks` with none, or more than [`MAX_PUT_BLOCKS`].
+    /// A `PutBlocks` or `Held` with none, or more than [`MAX_PUT_BLOCKS`].
     BlockCount {
         max: u32,
         got: u32,
@@ -88,7 +88,8 @@ pub enum Answer {
     AlreadySigned(Vec<u8>),
     Provisioned,
     /// PUT-WITH-CODE accepted: one PUT is on its way per block, in order, to these Block contracts (the page names a
-    /// block's contract the same way, `contract_for(block_code, block_id)`). One `Put` answer follows per PUT.
+    /// block's contract the same way, `contract_for(block_code, block_id)`). Confirm them with `Held`: the node's
+    /// answer to each PUT is relayed as `Put`, but no `Put` reached the ASKING connection in the live run (#214).
     Putting {
         contracts: Vec<[u8; 32]>,
     },
@@ -97,6 +98,10 @@ pub enum Answer {
         contract: [u8; 32],
         ok: bool,
         note: String,
+    },
+    /// READ-LOCAL: for each contract asked, in order, whether THIS node holds its state.
+    Held {
+        present: Vec<bool>,
     },
     Refused(Why),
 }
@@ -119,6 +124,13 @@ pub enum Request {
     /// ≈100 KB of code never crosses the page's socket (arm A, measured: 98.4 % of a client PUT is code).
     PutBlocks {
         states: Vec<Vec<u8>>,
+    },
+    /// READ-LOCAL: does this node hold these contracts' state? The signer's synchronous local read, per contract --
+    /// never a network fetch, so it cannot park. How the page confirms a PUT-WITH-CODE block: on a node WITH A PEER a
+    /// client GET of a delegate-put block is answered NotFound (F55), and the `Put` answers do not reach the page.
+    /// 1..=[`MAX_PUT_BLOCKS`] contracts.
+    Held {
+        contracts: Vec<[u8; 32]>,
     },
 }
 
@@ -182,6 +194,9 @@ mod tests {
             Request::PutBlocks {
                 states: vec![vec![1, 2], vec![3]],
             },
+            Request::Held {
+                contracts: vec![[6; 32], [7; 32]],
+            },
         ];
         for r in reqs {
             let b = encode_request(&r);
@@ -194,6 +209,10 @@ mod tests {
             note: "no".into(),
         };
         assert_eq!(decode_answer(&encode_answer(&a)), Some(a));
+        let h = Answer::Held {
+            present: vec![true, false],
+        };
+        assert_eq!(decode_answer(&encode_answer(&h)), Some(h));
     }
 
     #[test]

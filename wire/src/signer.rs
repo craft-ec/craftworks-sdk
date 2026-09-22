@@ -71,6 +71,23 @@ pub fn frame_put_blocks(
     frame(key, &SignerRequest::PutBlocks { states }, stream_id)
 }
 
+/// READ-LOCAL: ask whether the signer's node holds these contracts (1..=[`MAX_PUT_BLOCKS`]). Answered
+/// `Held{present}`, in order. How the page confirms PUT-WITH-CODE blocks: a client GET of one is answered NotFound on a
+/// node with a peer (F55). Refused HERE when the count is out of range.
+pub fn frame_held(
+    key: &DelegateKey,
+    contracts: Vec<[u8; 32]>,
+    stream_id: u32,
+) -> Result<Vec<Vec<u8>>, String> {
+    if contracts.is_empty() || contracts.len() > MAX_PUT_BLOCKS {
+        return Err(format!(
+            "Held asks about 1..={MAX_PUT_BLOCKS} contracts, not {}",
+            contracts.len()
+        ));
+    }
+    frame(key, &SignerRequest::Held { contracts }, stream_id)
+}
+
 /// A signer answer, from one application message of a delegate response; `None` for anything that is not one.
 pub fn read_answer(payload: &[u8]) -> Option<SignerAnswer> {
     signer_proto::decode_answer(payload)
@@ -131,6 +148,20 @@ mod tests {
         assert!(frame_put_blocks(&key(), vec![], 1).is_err());
         assert!(frame_put_blocks(&key(), vec![vec![1]; MAX_PUT_BLOCKS + 1], 1).is_err());
         assert!(frame_put_blocks(&key(), vec![vec![1]; MAX_PUT_BLOCKS], 1).is_ok());
+    }
+
+    #[test]
+    fn held_is_framed_and_its_count_is_refused_before_framing() {
+        let p = payload(&frame_held(&key(), vec![[4; 32], [5; 32]], 1).unwrap());
+        assert_eq!(
+            signer_proto::decode_request(&p),
+            Some(SignerRequest::Held {
+                contracts: vec![[4; 32], [5; 32]]
+            })
+        );
+        assert!(frame_held(&key(), vec![], 1).is_err());
+        assert!(frame_held(&key(), vec![[1; 32]; MAX_PUT_BLOCKS + 1], 1).is_err());
+        assert!(frame_held(&key(), vec![[1; 32]; MAX_PUT_BLOCKS], 1).is_ok());
     }
 
     #[test]
