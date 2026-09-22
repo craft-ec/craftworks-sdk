@@ -17,7 +17,7 @@ use engine::Params;
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use page::server::{Server, SignerFacts};
-use page::{Ms, Answer, Op, Page, PutPath, SILENT_MS};
+use page::{Ms, Answer, Op, Page, PutPath};
 use protocol::{Reply, Request, WriteState};
 use std::collections::BTreeMap;
 use testkit::full_node::FullNode;
@@ -200,7 +200,7 @@ impl PageRig {
                     break;
                 }
                 idle += 1;
-                self.now += SILENT_MS;
+                self.now = self.server.page.next_due().map_or(self.now + 1, |d| d.0.max(self.now + 1));
                 self.server.tick(Ms(self.now));
                 replies.extend(decode(self.server.take_replies()));
                 continue;

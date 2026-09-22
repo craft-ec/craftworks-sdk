@@ -5,7 +5,7 @@
 //! wrapper-path `Held` that keeps answering absent.
 
 use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
-use page::{Ms, Answer, Op, Page, PutPath, BACKOFF_MS, HELD_ABSENTS, SILENT_MS};
+use page::{Ms, Answer, Op, Page, PutPath, BACKOFF_MS, HELD_ABSENTS};
 use signer_proto::{Answer as A, Head, Why};
 
 /// A page with one write, driven until it asks the signer; returns it, the
@@ -53,7 +53,7 @@ fn a_misrouted_answer_does_not_stop_the_sign_being_asked_again() {
         let (mut p, now, id) = at_sign(PutPath::Page);
         let under = if other_id { id.wrapping_add(1000) } else { id };
         p.answer(Answer::Signer { id: under, answer: misrouted.clone() }, Ms(now + 1));
-        p.tick(Ms(now + SILENT_MS));
+        p.tick(Ms(now + page::rto::RTO_INITIAL_MS as u64));
         assert_eq!(signs(&p.take_ops()), 1, "after a misrouted {misrouted:?} (id {under}) the sign was never asked again");
         assert!(p.unusable().is_empty(), "a misrouted answer was taken as the sign's: {:?}", p.unusable());
     }
@@ -65,7 +65,7 @@ fn a_misrouted_answer_does_not_stop_the_sign_being_asked_again() {
 fn control_a_sign_shaped_answer_ends_the_wait() {
     let (mut p, now, id) = at_sign(PutPath::Page);
     p.answer(Answer::Signer { id, answer: A::Refused(Why::NotSuccessor) }, Ms(now + 1));
-    p.tick(Ms(now + SILENT_MS));
+    p.tick(Ms(now + page::rto::RTO_INITIAL_MS as u64));
     assert_eq!(signs(&p.take_ops()), 0, "a permanent refusal was re-asked");
     assert_eq!(p.unusable().len(), 1);
 }
@@ -77,7 +77,7 @@ fn a_fork_is_surfaced_loudly_and_never_retried() {
     let fork = Why::Forked { mine: Head { seq: 1, root: [1; 32] }, read: Head { seq: 1, root: [2; 32] } };
     p.answer(Answer::Signer { id, answer: A::Refused(fork) }, Ms(now + 1));
     assert!(p.forked().is_some_and(|m| m.starts_with("FORKED")), "a fork was not surfaced");
-    p.tick(Ms(now + 10 * SILENT_MS));
+    p.tick(Ms(now + 10 * page::rto::RTO_INITIAL_MS as u64));
     assert_eq!(signs(&p.take_ops()), 0, "a fork was retried");
 }
 

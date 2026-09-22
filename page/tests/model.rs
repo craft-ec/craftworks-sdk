@@ -29,7 +29,7 @@
 use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
-use page::{Answer, Ms, Op, Page, PutPath, SILENT_MS};
+use page::{Answer, Ms, Op, Page, PutPath};
 use std::collections::BTreeMap;
 
 const BLOCK_CODE: &[u8] = b"model block code";
@@ -769,7 +769,7 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                 if !p.waiting() {
                     return;
                 }
-                *now += SILENT_MS;
+                *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
                 p.tick(Ms(*now));
                 continue;
             }

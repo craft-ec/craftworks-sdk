@@ -40,7 +40,7 @@
 //! | `Head(None)` while owed | the UPDATE is re-sent |
 //! | `Head(..)` for the engine's own `ReadHead` | `HeadRead` / `HeadMissing` (recovery) — kept apart from a read-back, which only judges the owed head |
 //! | `FetchBlock` | [`Op::Get`]; `Got` → verified, joins [`PageBlocks`], `BlockArrived`; `GetMissed` → `BlockMissed` |
-//! | any op unanswered for [`SILENT_MS`] | re-sent as it was — every op here is idempotent (a block is its hash, a sign re-ask is answered AlreadySigned, a record is the same record) |
+//! | any op unanswered for its RTO ([`rto`]: RFC 6298 over this page's own completed calls, Karn, §5.5 back-off; GETs also in a congestion window) | re-sent as it was — every op here is idempotent (a block is its hash, a sign re-ask is answered AlreadySigned, a record is the same record). No fixed deadline anywhere: the 30 s budgets are give-ups, not retry timers |
 //!
 //! ## Invariants (each asserted by the model test, each with a mutant)
 //! 0. A signer record exists only after its commit's blocks were put and
@@ -64,8 +64,8 @@
 //! * a persisted outbox / RELOAD beyond what the signer's record gives (a
 //!   fresh page on the same key is answered `AlreadySigned` and lands it);
 //! * the web Session over [`server::Server`], and provisioning the signer (B2);
-//! * every node call on the RTO estimator instead of [`SILENT_MS`] (B2).
 
+pub mod rto;
 pub mod server;
 
 use engine::{ClientId, Effect, Engine, Epoch, Event, KeySource, Op as WriteOp, Params, State, WriteId};
@@ -73,10 +73,6 @@ use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-
-/// An op unanswered this long is re-sent as it was. From CLAUDE.md's "a put
-/// confirmation ≤ ~2 s": a bound on the WAIT, not a measurement.
-pub const SILENT_MS: u64 = 2_000;
 
 /// Register reads that may still show the OLDER head after an UPDATE before
 /// the UPDATE itself is re-sent. ASSUMPTION (the live run tells): a page's
@@ -90,7 +86,7 @@ pub const HEAD_READS: u32 = 3;
 pub const HELD_ABSENTS: u32 = 3;
 
 /// The first wait before a backed-off re-ask (a `Held` absent, a retryable
-/// signer refusal); it doubles each time, up to [`SILENT_MS`].
+/// signer refusal); it doubles each time, capped by [`rto::RTO_MAX_MS`].
 pub const BACKOFF_MS: u64 = 100;
 
 /// A time on the PAGE's clock, in MILLISECONDS. Every clock parameter of
@@ -198,6 +194,15 @@ pub enum Answer {
     Held { id: Cid, present: bool },
 }
 
+/// An op in flight.
+#[derive(Debug, Clone)]
+struct Deadline {
+    at: u64,
+    op: Op,
+    sent_at: u64,
+    attempt: u32,
+}
+
 /// Which op a deadline is for.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Waiting {
@@ -289,7 +294,16 @@ pub struct Page {
     /// A PUT to repeat at the next tick (a transient refusal).
     put_again: BTreeMap<Cid, Vec<u8>>,
     /// Deadlines of the ops in flight, and each op to re-send.
-    deadlines: BTreeMap<Waiting, (u64, Op)>,
+    /// Every op in flight: when it is due again, the op to re-send, when it
+    /// went out and on which attempt (Karn: only an attempt-1 answer samples).
+    deadlines: BTreeMap<Waiting, Deadline>,
+    /// The retry clock of every node call (`rto`), and the GET window.
+    rto: rto::Rto,
+    window: rto::Window,
+    /// GETs waiting for a place in the window, in the order asked.
+    get_queue: std::collections::VecDeque<Cid>,
+    /// The attempt a re-send continues from (set when an op times out).
+    attempt_of: BTreeMap<Waiting, u32>,
     out: Vec<Op>,
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
@@ -334,6 +348,10 @@ impl Page {
             forked: None,
             put_again: BTreeMap::new(),
             deadlines: BTreeMap::new(),
+            rto: rto::Rto::default(),
+            window: rto::Window::default(),
+            get_queue: Default::default(),
+            attempt_of: BTreeMap::new(),
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
@@ -375,9 +393,19 @@ impl Page {
         let now = now.0;
         self.now = now;
         let late: Vec<Waiting> =
-            self.deadlines.iter().filter(|(_, (at, _))| now >= *at).map(|(w, _)| w.clone()).collect();
+            self.deadlines.iter().filter(|(_, d)| now >= d.at).map(|(w, _)| w.clone()).collect();
+        // RFC 6298 §5.5 — ONCE per tick, however many timed out — and a GET
+        // that timed out halves the window.
+        if !late.is_empty() {
+            self.rto.timed_out();
+        }
+        if late.iter().any(|w| matches!(w, Waiting::Get(_))) {
+            self.window.halved();
+        }
         for w in late {
-            let (_, op) = self.deadlines.remove(&w).expect("listed");
+            let d = self.deadlines.remove(&w).expect("listed");
+            let op = d.op.clone();
+            self.attempt_of.insert(w.clone(), d.attempt);
             match w {
                 // A GET that did not answer is the engine's to re-issue: it
                 // counts attempts and gives up within its own budget.
@@ -444,7 +472,7 @@ impl Page {
         self.now = now;
         match a {
             Answer::PutOk(id) => {
-                if self.deadlines.remove(&Waiting::Put(id)).is_none() && self.confirmed.contains(&id) {
+                if self.answered(&Waiting::Put(id)).is_none() && self.confirmed.contains(&id) {
                     return; // a second answer to a re-sent PUT
                 }
                 self.put_again.remove(&id);
@@ -455,7 +483,7 @@ impl Page {
                 }
             }
             Answer::Held { id, present } => {
-                let Some((_, _)) = self.deadlines.remove(&Waiting::Held(id)) else { return };
+                let Some(_) = self.answered(&Waiting::Held(id)) else { return };
                 if present {
                     self.held_again.remove(&id);
                     self.confirm(id);
@@ -471,12 +499,12 @@ impl Page {
                         self.put_again.insert(id, bytes);
                     }
                 } else {
-                    let wait = (BACKOFF_MS << absents).min(SILENT_MS);
+                    let wait = (BACKOFF_MS << absents).min(rto::RTO_MAX_MS as u64);
                     self.held_again.insert(id, (now + wait, absents));
                 }
             }
             Answer::PutRefused { id, transient } => {
-                let Some((_, op)) = self.deadlines.remove(&Waiting::Put(id)) else { return };
+                let Some(op) = self.answered(&Waiting::Put(id)) else { return };
                 if transient {
                     if let Op::Put { bytes, .. } = op {
                         self.put_again.insert(id, bytes);
@@ -486,7 +514,7 @@ impl Page {
                 }
             }
             Answer::Got { id, bytes } => {
-                if self.deadlines.remove(&Waiting::Get(id)).is_none() {
+                if self.answered(&Waiting::Get(id)).is_none() {
                     return;
                 }
                 // Verified BEFORE it joins the page's memory: a block that is
@@ -497,7 +525,7 @@ impl Page {
                 self.step(Event::BlockArrived { id, bytes });
             }
             Answer::GetMissed(id) => {
-                if self.deadlines.remove(&Waiting::Get(id)).is_some() {
+                if self.answered(&Waiting::Get(id)).is_some() {
                     self.step(Event::BlockMissed(id));
                 }
             }
@@ -513,14 +541,14 @@ impl Page {
                 if self.sign_id != Some(id) || !answers_a_sign(&s) {
                     return;
                 }
-                if self.deadlines.remove(&Waiting::Sign).is_none() {
+                if self.answered(&Waiting::Sign).is_none() {
                     return; // an answer to a sign request already answered
                 }
                 self.sign_id = None;
                 self.on_signer(s);
             }
             Answer::Updated => {
-                if self.deadlines.remove(&Waiting::Update).is_some() {
+                if self.answered(&Waiting::Update).is_some() {
                     // A LANDING's UPDATE is judged by its own read — does the
                     // register now hold the head the signer named — never by
                     // this commit's read-back.
@@ -534,17 +562,17 @@ impl Page {
             // One register read can answer both a recovery read and a
             // read-back: a head is a head, whoever asked.
             Answer::Head(h) => {
-                self.deadlines.remove(&Waiting::Warm);
-                if self.deadlines.remove(&Waiting::RecoverHead).is_some() {
+                self.answered(&Waiting::Warm);
+                if self.answered(&Waiting::RecoverHead).is_some() {
                     match h {
                         Some((seq, root)) => self.step(Event::HeadRead { epoch: EPOCH, seq, root }),
                         None => self.step(Event::HeadMissing),
                     }
                 }
-                if self.deadlines.remove(&Waiting::ReadBack).is_some() {
+                if self.answered(&Waiting::ReadBack).is_some() {
                     self.on_read_back(h);
                 }
-                if self.deadlines.remove(&Waiting::Verify).is_some() {
+                if self.answered(&Waiting::Verify).is_some() {
                     self.on_verify(h);
                 }
             }
@@ -567,7 +595,7 @@ impl Page {
         if self.verify.as_ref().is_some_and(|v| v.landing) {
             let backoff = |v: &mut Verify, now: u64| {
                 v.tries += 1;
-                v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(SILENT_MS));
+                v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
             };
             match s {
                 A::Signed(state) | A::AlreadySigned(state) => {
@@ -650,7 +678,7 @@ impl Page {
                     self.send(Waiting::Warm, Op::ReadHead);
                 }
                 self.sign_refusals += 1;
-                let wait = (BACKOFF_MS << self.sign_refusals.min(5)).min(SILENT_MS);
+                let wait = (BACKOFF_MS << self.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
                 self.sign_again = Some(self.now + wait);
             }
             // LOUD: a fork is news, never a silent retry.
@@ -719,7 +747,7 @@ impl Page {
                 let now = self.now;
                 let v = self.verify.as_mut().expect("present");
                 v.tries += 1;
-                v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(SILENT_MS));
+                v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
                 return;
             }
         };
@@ -796,9 +824,70 @@ impl Page {
         self.send(Waiting::Sign, op);
     }
 
+    /// An op goes out, due again one RTO from now. A GET waits for a place
+    /// in the window.
     fn send(&mut self, w: Waiting, op: Op) {
-        self.deadlines.insert(w, (self.now + SILENT_MS, op.clone()));
+        if let Waiting::Get(id) = w {
+            let in_flight = self.deadlines.keys().filter(|k| matches!(k, Waiting::Get(_))).count();
+            if in_flight >= self.window.size() && !self.deadlines.contains_key(&w) {
+                if !self.get_queue.contains(&id) {
+                    self.get_queue.push_back(id);
+                }
+                return;
+            }
+        }
+        let attempt = self.attempt_of.remove(&w).map_or(1, |a| a + 1);
+        let d = Deadline { at: self.now + self.rto.rto_ms(), op: op.clone(), sent_at: self.now, attempt };
+        self.deadlines.insert(w, d);
         self.out.push(op);
+    }
+
+    /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
+    /// (Karn: a re-sent call never is), and a GET opens the window. `None`:
+    /// nothing was waiting on it.
+    fn answered(&mut self, w: &Waiting) -> Option<Op> {
+        let d = self.deadlines.remove(w)?;
+        self.attempt_of.remove(w);
+        if d.attempt == 1 {
+            self.rto.sample(self.now.saturating_sub(d.sent_at));
+        }
+        if matches!(w, Waiting::Get(_)) {
+            self.window.opened();
+            self.fill_gets();
+        }
+        Some(d.op)
+    }
+
+    /// GETs waiting on the window take the places that are free.
+    fn fill_gets(&mut self) {
+        while let Some(id) = self.get_queue.front().copied() {
+            let in_flight = self.deadlines.keys().filter(|k| matches!(k, Waiting::Get(_))).count();
+            if in_flight >= self.window.size() {
+                break;
+            }
+            self.get_queue.pop_front();
+            self.send(Waiting::Get(id), Op::Get { id });
+        }
+    }
+
+    /// When the next deadline falls (a host sets a one-shot timer for it, as
+    /// the cold reads do), or `None`.
+    pub fn next_due(&self) -> Option<Ms> {
+        // EVERY timer the page keeps: an op's deadline, a refused sign's
+        // back-off, a `Held` re-ask, a pending verify, and a PUT to repeat at
+        // the next tick. A host that armed only for deadlines would sleep
+        // through a back-off (the differential's RecordNotSaved case did).
+        let deadlines = self.deadlines.values().map(|d| d.at);
+        let sign = self.sign_again;
+        let held = self.held_again.values().map(|(at, _)| *at);
+        let verify = self.verify.as_ref().and_then(|v| v.again_at);
+        let puts = (!self.put_again.is_empty()).then_some(self.now);
+        deadlines.chain(sign).chain(held).chain(verify).chain(puts).min().map(Ms)
+    }
+
+    /// The retry clock now: `(RTO ms, SRTT ms, GET window)`.
+    pub fn clock(&self) -> (u64, Option<f64>, usize) {
+        (self.rto.rto_ms(), self.rto.srtt_ms(), self.window.size())
     }
 
     /// Step the engine and carry out what it decided.
