@@ -47,9 +47,35 @@ await t("a REFUSAL ends it in the node's words, and the session is closed", asyn
 });
 
 await t("EXHAUSTED and the BUDGET each end it, saying which", async () => {
-  await assert.rejects(() => open(FakeSession({ exhaust: true }), deps()), /the signer is not answering/);
+  // The socket OPENS here: this is the signer failing to answer, not a node
+  // that is not there — the two are told apart by the test below.
+  const opens = () => ({ connect: (_e, { onEvent } = {}) => { onEvent?.({ kind: "open" }); return { pump() {}, close() {} }; } });
+  await assert.rejects(() => open(FakeSession({ exhaust: true }), deps(opens())), /the signer is not answering/);
   let clock = 0;
-  await assert.rejects(() => untilProvisioned({ provisioned: () => false }, { provisionBudgetMs: 5000, provisionEveryMs: 1000, now: () => (clock += 1000), setTimeout: tick }),
+  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => true }, { provisionBudgetMs: 5000, provisionEveryMs: 1000, now: () => (clock += 1000), setTimeout: tick }),
+    /did not finish setting up in 5 s/);
+});
+
+await t("**a node that is NOT RUNNING is named as that, not as a silent signer**", async () => {
+  // Nothing ever opened: page-io spends its re-asks exactly as it would
+  // against a node that ignores them, so only the socket tells them apart.
+  const S = FakeSession({ exhaust: true });
+  await assert.rejects(() => open(S, deps({ connect: () => ({ pump() {}, close() {} }) })),
+    /nothing answered at ws:\/\/127\.0\.0\.1:1\/: no connection was ever made — is the node running\?/);
+  // THE CONTROL: the same exhaustion, with a socket that DID open, is the
+  // signer's failure and says so.
+  await assert.rejects(() => open(S, deps({ connect: (_e, { onEvent } = {}) => { onEvent?.({ kind: "open" }); return { pump() {}, close() {} }; } })),
+    /the signer is not answering/);
+});
+
+await t("the BUDGET says which too: never connected, or connected and still setting up", async () => {
+  let clock = 0;
+  const tick = r => setTimeout(r, 0);
+  const budget = { provisionBudgetMs: 5000, provisionEveryMs: 1000, now: () => (clock += 1000), setTimeout: tick };
+  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => false, url: () => "ws://127.0.0.1:7999/" }, budget),
+    /nothing answered at ws:\/\/127\.0\.0\.1:7999\/ in 5 s: no connection was ever made/);
+  clock = 0;
+  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => true }, budget),
     /did not finish setting up in 5 s/);
 });
 
