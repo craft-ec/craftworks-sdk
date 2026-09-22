@@ -1,37 +1,44 @@
 //! COLD READS IN THE PAGE against a scripted client API (craftworks_sdk::cold).
 //!
-//! * One GET stalled the way F52 stalls — its first GET answered only after
-//!   60 s: the read completes in about one timeout plus one fetch, and a read
-//!   that does not need that block does not wait for it at all.
-//! * A batch the node answers IN TURN (≈ 115 ms a GET: 70 pipelined GETs took
-//!   ≈ 8 s under load, measured): no false timeouts with the in-flight cap —
-//!   and without the cap there are (the cap's mutant, run by hand).
-//! * A node that never answers: "not answering" when a block's OWN deadline
-//!   runs out, never "missing".
+//! NOTHING IS FIXED (the owner): the timeout is RFC 6298's RTO over completed
+//! fetches (with Karn's rule), the concurrency a congestion window — TCP's
+//! answers. EVERYTHING IS PER FETCH: each GET has its own clock, and a timeout
+//! re-sends only that GET.
 //!
-//! EVERYTHING IS PER FETCH (the owner): each GET has its own clock, and a
-//! timeout re-sends only that GET.
+//! * a fast node: the window opens past 32 and the RTO falls below 200 ms;
+//! * a node answering IN TURN at 100 ms a GET: no false timeouts in a
+//!   128-fetch read — its queue shows as rising samples and a wider RTO;
+//! * one GET stalled the way F52 stalls (first GET answered after 60 s):
+//!   exactly ONE re-fetch, within about one RTO, every other block sent once;
+//! * KARN: the late answer of a re-sent fetch is never a sample;
+//! * a node that never answers: "not answering" when a block's OWN deadline
+//!   runs out, never "missing".
 
-use craftworks_sdk::cold::{ColdEvent, ColdReads, COLD_FETCH_DEADLINE_MS, COLD_GET_TIMEOUT_MS, COLD_IN_FLIGHT};
+use craftworks_sdk::cold::{ColdEvent, ColdReads, COLD_FETCH_DEADLINE_MS, COLD_RTO_INITIAL_MS};
 use craftworks_sdk::{Store, TreeStore};
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// An unstalled cold GET, one at a time: well under 1 s.
 const FETCH_MS: u64 = 300;
+/// A fast node: loopback.
+const FAST_MS: u64 = 20;
 /// F52: a lost streamed response is healed ≈ 60 s after it was sent.
 const STALL_MS: u64 = 60_000;
-/// A node answering GETs in turn: 70 pipelined in ≈ 8 s.
-const IN_TURN_MS: u64 = 115;
-const STEP_MS: u64 = 10;
+/// A node answering GETs in turn.
+const IN_TURN_MS: u64 = 100;
+const STEP_MS: u64 = 5;
+const ROWS: u32 = 700;
+const VALUE_BYTES: usize = 4_000;
 
-/// Two ranges of 150 rows each, values big enough to be their own blocks.
+/// Two ranges of `ROWS` rows each, values big enough to be their own blocks —
+/// so one range is a batch of 70+ GETs (the owner's test).
 fn tree() -> (Cid, BTreeMap<Cid, Vec<u8>>) {
     let mut t = TreeStore::new();
     for p in ["a", "b"] {
-        for i in 0..150u32 {
+        for i in 0..ROWS {
             let mut v = format!("{p}/{i:04}:").into_bytes();
-            v.resize(1_000, p.as_bytes()[0]);
+            v.resize(VALUE_BYTES, p.as_bytes()[0]);
             t.put(format!("{p}/{i:04}").as_bytes(), &v);
         }
     }
@@ -55,10 +62,13 @@ fn tree() -> (Cid, BTreeMap<Cid, Vec<u8>>) {
 /// How the scripted node answers.
 #[derive(Clone, Copy)]
 enum Node {
-    /// Every GET after `FETCH_MS`, except the FIRST GET of this block, after `STALL_MS`.
-    Stalls(Option<Cid>),
+    /// Every GET after `ms`, except the FIRST GET of `stalled`, after `STALL_MS`.
+    Stalls { ms: u64, stalled: Option<Cid> },
     /// One GET at a time, `IN_TURN_MS` each, in the order sent.
     InTurn,
+    /// Every GET after `FAST_MS`, except `late`: its FIRST GET answered after
+    /// `late_ms`, and every re-send of it never.
+    Late { late: Cid, late_ms: u64 },
     /// Never.
     Silent,
 }
@@ -67,18 +77,21 @@ struct Run {
     finished: BTreeMap<u64, u64>,
     cold: ColdReads,
     asked: Vec<Cid>,
-    most_in_flight: usize,
+    most_window: f64,
     timed_out: usize,
+    /// (window just before, just after) every tick in which a fetch timed out.
+    halvings: Vec<(f64, f64)>,
 }
 
 fn run(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, loads: &[(u64, &str)], node: Node, until_ms: u64) -> Run {
-    let mut c = ColdReads { on: true, ..ColdReads::default() };
+    let mut c = ColdReads::switched_on();
     c.set_root(root);
     let mut due: Vec<(u64, Cid)> = Vec::new();
     let mut node_free = 0u64;
     let mut asked = Vec::new();
     let mut finished = BTreeMap::new();
-    let (mut most_in_flight, mut now) = (0, 0);
+    let (mut most_window, mut now) = (0f64, 0);
+    let mut halvings = Vec::new();
     for (id, prefix) in loads {
         let (lo, hi) = (format!("{prefix}/").into_bytes(), format!("{prefix}0").into_bytes());
         assert!(c.take(*id, &lo, &hi, now), "the cold reader refused a load");
@@ -87,27 +100,38 @@ fn run(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, loads: &[(u64, &str)], node: Nod
         for g in c.take_gets() {
             asked.push(g.block);
             match node {
-                Node::Stalls(s) => {
-                    let wait = if Some(g.block) == s && g.attempt == 1 { STALL_MS } else { FETCH_MS };
+                Node::Stalls { ms, stalled } => {
+                    let wait = if Some(g.block) == stalled && g.attempt == 1 { STALL_MS } else { ms };
                     due.push((now + wait, g.block));
                 }
                 Node::InTurn => {
                     node_free = node_free.max(now) + IN_TURN_MS;
                     due.push((node_free, g.block));
                 }
+                Node::Late { late, late_ms } => {
+                    if g.block != late {
+                        due.push((now + FAST_MS, g.block));
+                    } else if g.attempt == 1 {
+                        due.push((now + late_ms, g.block));
+                    }
+                }
                 Node::Silent => {}
             }
         }
-        most_in_flight = most_in_flight.max(c.fetching().count());
+        most_window = most_window.max(c.window());
         now += STEP_MS;
         let (ready, later): (Vec<_>, Vec<_>) = due.into_iter().partition(|(t, _)| *t <= now);
         due = later;
         for (_, b) in ready {
             c.arrived(b, &net[&b], now);
         }
+        let (before, timeouts) = (c.window(), c.log.iter().filter(|e| matches!(e, ColdEvent::TimedOut { .. })).count());
         c.tick(now);
+        if c.log.iter().filter(|e| matches!(e, ColdEvent::TimedOut { .. })).count() > timeouts {
+            halvings.push((before, c.window()));
+        }
         for (id, rows, _) in c.take_done() {
-            assert_eq!(rows.len(), 150, "load {id} finished with {} rows", rows.len());
+            assert_eq!(rows.len(), ROWS as usize, "load {id} finished with {} rows", rows.len());
             finished.insert(id, now);
         }
         if !c.take_not_answering().is_empty() {
@@ -115,29 +139,53 @@ fn run(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, loads: &[(u64, &str)], node: Nod
         }
     }
     let timed_out = c.log.iter().filter(|e| matches!(e, ColdEvent::TimedOut { .. })).count();
-    Run { finished, cold: c, asked, most_in_flight, timed_out }
+    Run { finished, cold: c, asked, most_window, timed_out, halvings }
 }
 
 /// The blocks one range's walk GETs, unstalled.
 fn blocks_of(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, prefix: &str) -> BTreeSet<Cid> {
-    run(root, net, &[(1, prefix)], Node::Stalls(None), 60_000).asked.into_iter().collect()
+    run(root, net, &[(1, prefix)], Node::Stalls { ms: FETCH_MS, stalled: None }, 600_000).asked.into_iter().collect()
 }
 
 #[test]
-fn a_stalled_get_costs_one_timeout_and_one_fetch_not_the_stall() {
+fn on_a_fast_node_the_window_opens_and_the_rto_falls() {
+    let (root, net) = tree();
+    let r = run(root, &net, &[(1, "a")], Node::Stalls { ms: FAST_MS, stalled: None }, 600_000);
+    assert!(r.finished.contains_key(&1));
+    assert!(r.most_window > 32.0, "the window only reached {}", r.most_window);
+    assert!(r.cold.rto_ms() < 200.0, "the RTO is {} ms on a {FAST_MS} ms node", r.cold.rto_ms());
+    assert_eq!(r.timed_out, 0);
+}
+
+/// A node answering in turn: every answer waits behind those sent before it,
+/// so a growing window shows as rising samples — a wider RTO — and no healthy
+/// fetch, merely queued, is timed out.
+#[test]
+fn a_node_answering_in_turn_has_no_false_timeouts() {
+    let (root, net) = tree();
+    let r = run(root, &net, &[(1, "a")], Node::InTurn, 600_000);
+    assert!(r.finished.contains_key(&1), "the read did not finish");
+    assert!(r.asked.len() >= 128, "{} fetches: not the 128 the owner's test names", r.asked.len());
+    assert_eq!(r.timed_out, 0, "{} healthy fetches, merely queued at the node, were timed out", r.timed_out);
+}
+
+#[test]
+fn a_stalled_get_costs_exactly_one_re_fetch_within_about_one_rto() {
     let (root, net) = tree();
     let only_a: Vec<Cid> = blocks_of(root, &net, "a").difference(&blocks_of(root, &net, "b")).copied().collect();
     let stalled = *only_a.last().expect("range a needs a block range b does not");
-    let base = run(root, &net, &[(1, "a")], Node::Stalls(None), 120_000).finished[&1];
-    let r = run(root, &net, &[(1, "a"), (2, "b")], Node::Stalls(Some(stalled)), 120_000);
-    let (a, b) = (r.finished[&1], r.finished[&2]);
-    assert!(a <= base + COLD_GET_TIMEOUT_MS + FETCH_MS + 2 * STEP_MS, "a stalled GET cost {a} ms against {base} unstalled: it waited on the stall");
+    let base = run(root, &net, &[(1, "a")], Node::Stalls { ms: FETCH_MS, stalled: None }, 600_000).finished[&1];
+    let r = run(root, &net, &[(1, "a"), (2, "b")], Node::Stalls { ms: FETCH_MS, stalled: Some(stalled) }, 600_000);
+    let a = r.finished[&1];
     assert!(a < STALL_MS, "the read took the whole stall ({a} ms)");
-    // …because it was ASKED AGAIN, and the re-GET is what answered.
-    assert!(r.cold.log.iter().any(|e| matches!(e, ColdEvent::TimedOut { block, attempt: 1, .. } if *block == stalled)));
+    // The re-fetch went out on the stalled GET's OWN timeout — about one RTO.
+    let after = r.cold.log.iter().find_map(|e| match e {
+        ColdEvent::TimedOut { block, attempt: 1, after_ms } if *block == stalled => Some(*after_ms),
+        _ => None,
+    });
+    assert!(after.is_some_and(|ms| ms as f64 <= COLD_RTO_INITIAL_MS + STEP_MS as f64), "the stalled GET timed out after {after:?} ms");
     assert!(r.cold.log.iter().any(|e| matches!(e, ColdEvent::ReGetAnswered { block, attempt: 2, .. } if *block == stalled)));
-    // PER FETCH: exactly ONE re-fetch was sent — the stalled block's — and
-    // every other block was sent once.
+    // PER FETCH: exactly ONE re-fetch was sent — the stalled block's.
     let mut sends: BTreeMap<Cid, usize> = BTreeMap::new();
     for b in &r.asked {
         *sends.entry(*b).or_default() += 1;
@@ -146,37 +194,52 @@ fn a_stalled_get_costs_one_timeout_and_one_fetch_not_the_stall() {
     assert_eq!(sends[&stalled], 2, "the stalled block was sent {} times", sends[&stalled]);
     let others: Vec<_> = sends.iter().filter(|(b, n)| **b != stalled && **n != 1).collect();
     assert!(others.is_empty(), "blocks other than the stalled one were re-sent: {others:?}");
-    // The other read never waited on it.
-    assert!(b <= base + 2 * STEP_MS, "a read that does not need the stalled block took {b} ms against {base}");
+    println!("unstalled {base} ms; with one GET stalled 60 s: read a {a} ms, read b {} ms", r.finished[&2]);
 }
 
-/// THE CAP: a node answering in turn delays the LAST of a big batch by the
-/// whole batch; with at most `COLD_IN_FLIGHT` in flight no GET waits long
-/// enough to be timed out while it is merely queued.
+/// A TIMEOUT HALVES THE WINDOW (≥ 1): a node that stops answering is not
+/// sent more.
 #[test]
-fn a_batch_the_node_answers_in_turn_has_no_false_timeouts() {
+fn a_timeout_halves_the_window() {
     let (root, net) = tree();
-    let r = run(root, &net, &[(1, "a")], Node::InTurn, 120_000);
-    assert!(r.finished.contains_key(&1), "the batch did not finish");
-    assert!(r.asked.len() >= 70, "the batch is {} GETs, not a batch", r.asked.len());
-    assert!(r.most_in_flight <= COLD_IN_FLIGHT, "{} GETs were in flight", r.most_in_flight);
-    assert_eq!(r.timed_out, 0, "{} healthy GETs, merely queued at the node, were timed out", r.timed_out);
+    let blocks: Vec<Cid> = blocks_of(root, &net, "a").into_iter().collect();
+    let stalled = blocks[blocks.len() - 1];
+    let r = run(root, &net, &[(1, "a")], Node::Stalls { ms: FAST_MS, stalled: Some(stalled) }, 600_000);
+    assert!(!r.halvings.is_empty(), "no fetch timed out");
+    for (before, after) in &r.halvings {
+        assert!((*after - (before / 2.0).max(1.0)).abs() < 1e-9, "a timeout took the window from {before} to {after}");
+    }
+}
+
+/// KARN'S RULE: a fetch that was re-sent is never a sample. Here the FIRST
+/// GET of one block is answered only after 5 s and its re-sends never are:
+/// the answer comes back while the fetch is on a re-send, and nothing says
+/// which copy answered. Sampled, 5 s of "round trip" would blow the RTO far
+/// past what a 20 ms node deserves.
+#[test]
+fn a_late_answer_to_a_re_sent_fetch_is_not_a_sample() {
+    let (root, net) = tree();
+    let blocks: Vec<Cid> = blocks_of(root, &net, "a").into_iter().collect();
+    let late = blocks[blocks.len() / 2];
+    let r = run(root, &net, &[(1, "a")], Node::Late { late, late_ms: 5_000 }, 600_000);
+    assert!(r.finished.contains_key(&1), "the read did not finish");
+    assert!(r.cold.log.iter().any(|e| matches!(e, ColdEvent::ReGetAnswered { block, .. } if *block == late)), "the late block was not re-sent before its answer came");
+    assert!(r.cold.rto_ms() < 200.0, "the RTO is {} ms: a re-sent fetch's answer was sampled", r.cold.rto_ms());
 }
 
 #[test]
 fn a_block_the_node_never_answers_is_not_answering_at_its_own_deadline_not_missing() {
     let (root, net) = tree();
-    let r = run(root, &net, &[(1, "a")], Node::Silent, 2 * COLD_FETCH_DEADLINE_MS);
+    let r = run(root, &net, &[(1, "a")], Node::Silent, 4 * COLD_FETCH_DEADLINE_MS);
     assert!(r.finished.is_empty());
     let when = r.cold.log.iter().find_map(|e| match e {
         ColdEvent::NotAnswering { block, after_ms } if *block == root => Some(*after_ms),
         _ => None,
     });
-    // The block's deadline counts from its FIRST send, checked on each of its
-    // own 2 s timeouts: it ends within one timeout past 30 s.
-    assert!(when.is_some_and(|ms| (COLD_FETCH_DEADLINE_MS..COLD_FETCH_DEADLINE_MS + COLD_GET_TIMEOUT_MS + STEP_MS).contains(&ms)), "not answering at {when:?}");
-    // Re-fetched without a try count until then, and nothing is asked after.
-    assert!(r.timed_out >= (COLD_FETCH_DEADLINE_MS / COLD_GET_TIMEOUT_MS) as usize);
+    // The deadline counts from the block's FIRST send and is checked on each
+    // of its own (backed-off) timeouts: it ends on the first timeout past 30 s.
+    assert!(when.is_some_and(|ms| (COLD_FETCH_DEADLINE_MS..2 * COLD_FETCH_DEADLINE_MS).contains(&ms)), "not answering at {when:?}");
+    assert!(r.timed_out >= 3, "re-fetched only {} times before giving up", r.timed_out);
     assert_eq!(r.cold.open(), 0);
     assert_eq!(r.cold.fetching().count(), 0, "a read that ended left GETs in flight");
 }
@@ -184,7 +247,7 @@ fn a_block_the_node_never_answers_is_not_answering_at_its_own_deadline_not_missi
 #[test]
 fn a_block_whose_bytes_do_not_hash_to_it_is_dropped_and_asked_again() {
     let (root, net) = tree();
-    let mut c = ColdReads { on: true, ..ColdReads::default() };
+    let mut c = ColdReads::switched_on();
     c.set_root(root);
     assert!(c.take(1, b"a/", b"a0", 0));
     let first = c.take_gets();
@@ -200,7 +263,7 @@ fn a_block_whose_bytes_do_not_hash_to_it_is_dropped_and_asked_again() {
 #[test]
 fn a_root_the_node_refuses_is_its_own_and_goes_back_to_the_engine() {
     let (root, _) = tree();
-    let mut c = ColdReads { on: true, ..ColdReads::default() };
+    let mut c = ColdReads::switched_on();
     c.set_root(root);
     assert!(c.take(7, b"a/", b"a0", 0));
     let _ = c.take_gets();

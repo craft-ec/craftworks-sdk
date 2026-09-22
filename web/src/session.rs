@@ -936,6 +936,14 @@ impl Session {
     /// re-fetch — instead of by the engine, whose cold read can stall ≈ 60 s
     /// (F52). A root the node says is its own goes back to the engine (F55).
     pub fn set_cold_reads(&mut self, on: bool, block_code: Vec<u8>) {
+        if on && !self.cold.on {
+            // A fresh reader: the RTO and the window start where RFC 6298 and
+            // slow start say, at the head this session already knows.
+            self.cold = craftworks_sdk::cold::ColdReads::switched_on();
+            if self.head_root != [0u8; 32] {
+                self.cold.set_root(self.head_root);
+            }
+        }
         self.cold.on = on;
         self.cold_contract = if on && !block_code.is_empty() {
             Some(Box::new(wire::block::contract_deriver(&block_code)))

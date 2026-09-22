@@ -77,7 +77,7 @@ async fn page_read(url: &str, root: [u8; 32], block_code: &[u8], lo: &[u8], hi: 
     use freenet_stdlib::client_api::{ClientError, ContractError, ContractRequest, ContractResponse, ErrorKind, RequestError};
     let mut c = connect(url).await?;
     let derive = wire::block::contract_deriver(block_code);
-    let mut cold = craftworks_sdk::cold::ColdReads { on: true, ..Default::default() };
+    let mut cold = craftworks_sdk::cold::ColdReads::switched_on();
     cold.set_root(root);
     let start = Instant::now();
     let now = |s: Instant| s.elapsed().as_millis() as u64 + 1;
@@ -109,6 +109,7 @@ async fn page_read(url: &str, root: [u8; 32], block_code: &[u8], lo: &[u8], hi: 
         cold.tick(now(start));
         log.append(&mut cold.log);
         if let Some((_, rows, _)) = cold.take_done().pop() {
+            println!("    page path: at the end, RTO {:.0} ms, window {:.1}", cold.rto_ms(), cold.window());
             return Ok((rows.len(), Some(start.elapsed().as_millis()), log));
         }
         if !cold.take_not_answering().is_empty() {
@@ -323,7 +324,7 @@ async fn main() -> Result<()> {
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     if page_path() {
         let root_b = head_root(&mut t1, &dkey_b).await?;
-        println!("    PAGE PATH: w/ read by the page's own GETs (per fetch: {} ms a GET, at most {} in flight, {} ms a block), root {}", craftworks_sdk::cold::COLD_GET_TIMEOUT_MS, craftworks_sdk::cold::COLD_IN_FLIGHT, craftworks_sdk::cold::COLD_FETCH_DEADLINE_MS, hex(&root_b[..4]));
+        println!("    PAGE PATH: w/ read by the page's own GETs (per fetch: RFC 6298 RTO from {} ms, a congestion window from {}, {} ms a block), root {}", craftworks_sdk::cold::COLD_RTO_INITIAL_MS, craftworks_sdk::cold::COLD_WINDOW_INITIAL, craftworks_sdk::cold::COLD_FETCH_DEADLINE_MS, hex(&root_b[..4]));
         let (rows, ms, log) = page_read(&node_b.ws(), root_b, &block, b"w/", b"w0", read_window).await?;
         let (mut first, mut timeouts, mut reget_ok, mut gave_up) = (0, 0, 0, 0);
         for e in &log {

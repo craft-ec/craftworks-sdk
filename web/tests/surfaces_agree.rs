@@ -69,6 +69,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     // there — they are connection mechanics, not data.
     "take_loads",
     "loads_in_flight",
+    // COLD READS IN THE PAGE: how ranges this node does not hold are fetched
+    // — the page's own GETs, and their log. An in-memory store holds every
+    // block; there is nothing cold to fetch or to report on.
+    "set_cold_reads",
+    "take_cold_log",
     // How this session finds out the head moved, and whether it is being
     // TOLD or polling. An in-memory store has no head on a node and nothing
     // to be notified by — its data cannot change under it — so there is

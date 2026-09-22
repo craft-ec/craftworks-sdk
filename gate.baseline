@@ -1,4 +1,4 @@
-craftworks-sdk=308
+craftworks-sdk=317
 engine=107
 engine-delegate=42
 probe=17
@@ -7,5 +7,5 @@ protocol=50
 signer=10
 testkit=32
 web=14
-wire=33
+wire=39
 npm=167

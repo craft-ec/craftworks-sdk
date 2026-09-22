@@ -510,6 +510,15 @@ fn classify(r: HostResponse) -> Incoming {
                 Incoming::EngineBytes(out)
             }
         }
+        // A GET answered with NO state is not a block (no kind byte) and not a
+        // head record: unusable, as every GET answer was before the page read
+        // blocks itself — a run of zeroes decodes as exactly this. ASSUMPTION
+        // (the live run tells): a node that cannot find a contract answers
+        // with an error, not with an empty state; to a cold read an empty one
+        // is a GET that did not answer, and is re-fetched.
+        HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) if state.as_ref().is_empty() => {
+            Incoming::Unusable(Unusable::UnknownKind("ContractResponse::GetResponse (no state)"))
+        }
         HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) => {
             let mut id = [0u8; 32];
             id.copy_from_slice(&key.id().as_bytes()[..32]);

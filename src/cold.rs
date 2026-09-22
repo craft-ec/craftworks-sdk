@@ -3,10 +3,22 @@
 //! A range this node does not hold is read by the PAGE itself, block by block,
 //! through client-API GETs — not by the engine in the delegate, whose cold
 //! read can sit in F52's stall for ≈ 60 s, parking the delegate so every other
-//! request queues behind it. At most [`COLD_IN_FLIGHT`] GETs are in flight
-//! (the rest wait in the page), so each GET's clock
-//! ([`COLD_GET_TIMEOUT_MS`], from when it is SENT) measures that GET and not
-//! the node's queue. EVERYTHING IS PER FETCH (the owner): a GET that times out
+//! request queues behind it.
+//!
+//! NOTHING IS FIXED (the owner): both the timeout and the concurrency move
+//! with what the network does — TCP's answers, which are prior art for
+//! exactly this:
+//! * the TIMEOUT is RFC 6298's RTO over completed fetches (`SRTT`, `RTTVAR`,
+//!   `RTO = SRTT + 4·RTTVAR`, a [`COLD_RTO_FLOOR_MS`] floor, [`COLD_RTO_INITIAL_MS`]
+//!   before any sample), with KARN'S RULE: a fetch that was re-sent is never
+//!   sampled — which copy answered is unknowable;
+//! * the CONCURRENCY is a congestion window — [`COLD_WINDOW_INITIAL`] to start,
+//!   +1 per answer below the slow-start threshold (doubling per round), +1 per
+//!   window of answers above it, halved (≥ 1) on a timeout with the threshold
+//!   set there — so queueing inside the node shows as rising samples, a wider
+//!   RTO and a window that stops growing: the loop finds the limit.
+//!
+//! EVERYTHING IS PER FETCH (the owner): a GET that times out
 //! is asked again as a FRESH GET — ONLY that GET; the others in flight are
 //! untouched — client GETs are not deduplicated, each is its own transaction
 //! (F55, read; a re-GET beating a stall is what the live test measures). There
@@ -35,21 +47,15 @@ use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
-/// GETs in flight at once; the rest wait in the page.
-///
-/// So a GET's clock measures THAT GET: 70 pipelined GETs finished only after
-/// ≈ 8 s under load (measured), so a short per-GET clock on an uncapped batch
-/// cuts healthy fetches that were merely queued at the node, and each
-/// re-fetch adds load. At 8, a GET waits behind at most 7 others.
-pub const COLD_IN_FLIGHT: usize = 8;
+/// The RTO before any fetch has answered (RFC 6298 §2.1 says 1 s).
+pub const COLD_RTO_INITIAL_MS: f64 = 1_000.0;
 
-/// How long one cold GET is given, from when it is SENT, before it is asked
-/// AGAIN as a fresh GET.
-///
-/// 2 s: an unstalled cold GET, one at a time, answers well under 1 s; F52's
-/// stall heals only ≈ 60 s after the lost response was sent. With at most
-/// [`COLD_IN_FLIGHT`] in flight, 2 s is past every healthy answer.
-pub const COLD_GET_TIMEOUT_MS: u64 = 2_000;
+/// The RTO never falls below this: a loopback node answers in a few ms, and a
+/// timeout that close to the sample re-sends on scheduling jitter alone.
+pub const COLD_RTO_FLOOR_MS: f64 = 100.0;
+
+/// The congestion window a page starts with, in fetches.
+pub const COLD_WINDOW_INITIAL: f64 = 4.0;
 
 /// How long one BLOCK's fetch — its first GET and every re-fetch — may take,
 /// from its FIRST send, before the reads needing it say "the node is not
@@ -63,6 +69,12 @@ pub const COLD_FETCH_DEADLINE_MS: u64 = 30_000;
 /// Rows one cold walk gathers per pass of the tree before it resumes after the
 /// last key — the range is read WHOLE before the load completes.
 const WALK_PAGE: usize = 4096;
+
+/// The rows of a range, key and value.
+pub type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// A load the page finished: its ticket, every row of the range, the root read at.
+pub type Finished = (u64, Rows, Cid);
 
 /// An instruction to the page: GET this block, as a fresh transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,16 +134,23 @@ pub struct ColdReads {
     local: BTreeSet<Cid>,
     /// Blocks held, each verified against its id.
     blocks: BTreeMap<Cid, Vec<u8>>,
-    /// In flight: at most [`COLD_IN_FLIGHT`].
+    /// In flight: at most the congestion window.
     fetching: BTreeMap<Cid, Fetch>,
     /// Wanted, waiting for a place in flight, in the order wanted.
     queued: std::collections::VecDeque<Cid>,
     loads: BTreeMap<u64, Load>,
     gets: Vec<Get>,
-    done: Vec<(u64, Vec<(Vec<u8>, Vec<u8>)>, Cid)>,
+    done: Vec<Finished>,
     returned: Vec<(u64, Vec<u8>, Vec<u8>)>,
     not_answering: Vec<u64>,
     pub log: Vec<ColdEvent>,
+    /// RFC 6298's smoothed round-trip time and its variation, over completed
+    /// fetches that were never re-sent (Karn). `None` before the first sample.
+    srtt: Option<f64>,
+    rttvar: f64,
+    /// The congestion window, and the slow-start threshold (`None`: none yet).
+    window: f64,
+    ssthresh: Option<f64>,
 }
 
 /// The held blocks, as the tree reads them.
@@ -155,6 +174,63 @@ enum Pass {
 }
 
 impl ColdReads {
+    /// A cold reader with the flag ON.
+    pub fn switched_on() -> ColdReads {
+        ColdReads { on: true, window: COLD_WINDOW_INITIAL, ..ColdReads::default() }
+    }
+
+    /// The retransmission timeout now, in ms (RFC 6298).
+    pub fn rto_ms(&self) -> f64 {
+        match self.srtt {
+            None => COLD_RTO_INITIAL_MS,
+            Some(srtt) => (srtt + 4.0 * self.rttvar).max(COLD_RTO_FLOOR_MS),
+        }
+    }
+
+    /// One fetch's own timeout: the RTO, BACKED OFF per re-send of it (RFC 6298
+    /// §5.5) — without it a truly lost GET, at a 100 ms RTO, is re-sent some
+    /// three hundred times in its 30 s. Per fetch: the others' clocks are
+    /// untouched.
+    fn timeout_of(&self, attempt: u32) -> f64 {
+        self.rto_ms() * f64::from(1u32 << attempt.saturating_sub(1).min(8))
+    }
+
+    /// The congestion window now: how many fetches may be in flight.
+    pub fn window(&self) -> f64 {
+        self.window.max(1.0)
+    }
+
+    /// A fetch answered on its FIRST send: its round trip is a sample (RFC
+    /// 6298 §2.2–2.3), and the window opens.
+    fn sample(&mut self, r: f64) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(r);
+                self.rttvar = r / 2.0;
+            }
+            Some(srtt) => {
+                self.rttvar = 0.75 * self.rttvar + 0.25 * (srtt - r).abs();
+                self.srtt = Some(0.875 * srtt + 0.125 * r);
+            }
+        }
+    }
+
+    /// An answer opens the window: +1 below the slow-start threshold, +1 per
+    /// window of answers above it.
+    fn opened(&mut self) {
+        let w = self.window();
+        self.window = if self.ssthresh.is_some_and(|t| w >= t) { w + 1.0 / w } else { w + 1.0 };
+    }
+
+    /// A timeout halves the window (≥ 1) and sets the threshold there. Once per
+    /// tick however many fetches timed out in it — TCP halves once per loss
+    /// EVENT, not per lost segment.
+    fn halved(&mut self) {
+        let half = (self.window() / 2.0).max(1.0);
+        self.window = half;
+        self.ssthresh = Some(half);
+    }
+
     /// The root this page reads at — from the head it learned (Identity, a page
     /// answered at a root). Loads already under way keep the root they began at.
     pub fn set_root(&mut self, root: Cid) {
@@ -188,6 +264,12 @@ impl ColdReads {
             return;
         }
         let after_ms = now_ms.saturating_sub(f.first_at);
+        // KARN'S RULE: a re-sent fetch is never a sample — the answer may be
+        // the first copy's, late, or the second's; nothing says which.
+        if f.attempt == 1 {
+            self.sample(now_ms.saturating_sub(f.sent_at) as f64);
+        }
+        self.opened();
         self.log.push(if f.attempt > 1 {
             ColdEvent::ReGetAnswered { block, attempt: f.attempt, after_ms }
         } else {
@@ -235,9 +317,12 @@ impl ColdReads {
         let late: Vec<Cid> = self
             .fetching
             .iter()
-            .filter(|(_, f)| now_ms.saturating_sub(f.sent_at) >= COLD_GET_TIMEOUT_MS)
+            .filter(|(_, f)| now_ms.saturating_sub(f.sent_at) as f64 >= self.timeout_of(f.attempt))
             .map(|(c, _)| *c)
             .collect();
+        if !late.is_empty() {
+            self.halved();
+        }
         for block in late {
             let f = self.fetching.remove(&block).expect("listed");
             self.log.push(ColdEvent::TimedOut { block, attempt: f.attempt, after_ms: now_ms.saturating_sub(f.sent_at) });
@@ -264,7 +349,7 @@ impl ColdReads {
 
     /// Queued blocks take the places in flight that are free.
     fn fill(&mut self, now_ms: u64) {
-        while self.fetching.len() < COLD_IN_FLIGHT {
+        while (self.fetching.len() as f64) < self.window().floor() {
             let Some(block) = self.queued.pop_front() else { break };
             if !self.blocks.contains_key(&block) && !self.fetching.contains_key(&block) {
                 self.send(block, 1, now_ms, now_ms);
@@ -363,7 +448,7 @@ impl ColdReads {
     }
 
     /// Loads that finished: (ticket, every row of the range, the root read at).
-    pub fn take_done(&mut self) -> Vec<(u64, Vec<(Vec<u8>, Vec<u8>)>, Cid)> {
+    pub fn take_done(&mut self) -> Vec<Finished> {
         std::mem::take(&mut self.done)
     }
 
