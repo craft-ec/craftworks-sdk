@@ -949,6 +949,14 @@ impl Page {
         (self.engine.published_seq(), self.engine.published_root())
     }
 
+    /// Whether this page's owed parity covers the whole published tree
+    /// (craftworks-sdk#119). The surface every redundancy report reads: a
+    /// page that opened on a non-empty head says `NotScanned` — its "0 owed"
+    /// means it never looked — until sdk#119's probe re-derives it.
+    pub fn parity_scan(&self) -> &engine::ParityScan {
+        self.engine.parity_scan()
+    }
+
     /// Landings of a signer's record this page started, and the most UPDATEs
     /// one of them needed (a lost UPDATE is re-sent at its deadline).
     pub fn landings(&self) -> (u32, u32) {

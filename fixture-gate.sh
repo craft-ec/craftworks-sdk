@@ -36,6 +36,10 @@ allow() {
     # the shell's max_gets lifted -- the fixture exposes engine params, not
     # the shell's limits. The fixture's own path is matrix W9.
     engine-delegate/tests/context_bound.rs) return 0 ;;
+    # sdk#181/#119: a test of the ENGINE's own parity state across ONE context
+    # round-trip (owed ids without bytes, the walk resuming, ParityScan). The
+    # fixture wraps the shell, which rehydrates on every call and hides both.
+    engine/tests/parity_scan.rs) return 0 ;;
     *) return 1 ;;
   esac
 }
