@@ -87,4 +87,19 @@ await t("the IN-MEMORY db has the same other(), and says it holds only this app'
   }
 });
 
+await t("**the in-tab db holds the SAME name rule as a Session: 32 is a name, 33 is refused naming it** (sdk#276)", async () => {
+  const raw = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
+  const db = new (wrap(raw).Db)();
+  const schema = { type: "Row", fields: [{ name: "n", kind: "int" }] };
+  const ok = "n".repeat(32), long = "n".repeat(33);
+  await db.define(ok, schema);
+  await db.put(ok, { n: 1 });
+  assert.equal((await db.scan(ok)).length, 1, "THE CONTROL: a 32-character name writes and scans");
+  await assert.rejects(() => db.define(long, schema), e => e.message.includes(`domain \`${long}\` must be 1–32`), "a 33-character name was not refused in the node's words");
+  // And a Session with an app at the longest id takes the longest name.
+  const s = new Session(7999);
+  s.set_app("a".repeat(32));
+  s.define(ok, JSON.stringify(schema));
+});
+
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }
