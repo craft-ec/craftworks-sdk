@@ -1,13 +1,14 @@
 craftworks-sdk=321
 engine=119
 engine-delegate=42
-page=25
+page=31
+page-io=5
 probe=17
 probe-delegate=0
 protocol=50
 signer=16
 signer-proto=2
 testkit=32
-web=19
-wire=44
+web=23
+wire=45
 npm=169

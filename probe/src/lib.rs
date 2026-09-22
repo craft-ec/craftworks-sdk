@@ -366,8 +366,13 @@ mod tests {
         ///
         /// `wire` frames the client API; `probe` drives live nodes; the
         /// delegates are compiled by the node itself and link the guest side.
-        const ALLOWED: [&str; 7] = [
+        const ALLOWED: [&str; 8] = [
             "wire",
+            // The page executor's I/O (ruling B, part 2): `page::Server`'s ops
+            // framed with `wire`, the node's answers decoded back. Framing the
+            // client API is its whole job, as it is `wire`'s — which is what
+            // keeps `page` (the executor, sans-IO) OFF this list.
+            "page-io",
             // The browser build LINKS the core to the framing, which is its
             // whole job — and it is the reason `craftworks-sdk` can stay OFF
             // this list. Splitting the cdylib out is what kept the core on the

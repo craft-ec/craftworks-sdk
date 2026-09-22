@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 bincode = "1"
 futures = "0.3"
+getrandom = "0.2"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 # The live write run drives the engine delegate, so it speaks its wire format
@@ -19,6 +20,9 @@ serde = { version = "1", features = ["derive"] }
 # here reaches the delegate's wasm.
 engine-delegate = { path = "../engine-delegate", default-features = false }
 protocol = { path = "../protocol" }
+# The PAGE PATH live run (ruling B): the in-page engine and its client-API I/O.
+page = { path = "../page" }
+page-io = { path = "../page-io" }
 # The live round trip sends the EXACT bytes the browser will send, which is
 # the whole reason the framing lives in a crate instead of in JavaScript.
 wire = { path = "../wire" }

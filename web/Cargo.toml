@@ -13,6 +13,10 @@ crate-type = ["cdylib"]
 craftworks-sdk = { path = ".." }
 wire = { path = "../wire" }
 protocol = { path = "../protocol" }
+# PAGE MODE (ruling B): the in-page engine, and its I/O over the client API.
+page = { path = "../page" }
+page-io = { path = "../page-io" }
+engine = { path = "../engine" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Only for the block-id tag on the tree root the panel shows; the SDK owns
