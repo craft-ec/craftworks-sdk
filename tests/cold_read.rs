@@ -27,6 +27,8 @@ const FAST_MS: u64 = 20;
 const STALL_MS: u64 = 60_000;
 /// A node answering GETs in turn.
 const IN_TURN_MS: u64 = 100;
+/// A block fetched from a peer, cold: the first live run's ≈ 1.5 s.
+const SLOW_MS: u64 = 1_500;
 const STEP_MS: u64 = 5;
 const ROWS: u32 = 700;
 const VALUE_BYTES: usize = 4_000;
@@ -69,6 +71,10 @@ enum Node {
     /// Every GET after `FAST_MS`, except `late`: its FIRST GET answered after
     /// `late_ms`, and every re-send of it never.
     Late { late: Cid, late_ms: u64 },
+    /// The first `fast` GETs after `FAST_MS` (blocks the node holds nearby),
+    /// every later one after `SLOW_MS` (fetched from a peer) — the first live
+    /// run's shape.
+    TwoSpeed { fast: usize },
     /// Never.
     Silent,
 }
@@ -114,6 +120,10 @@ fn run(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, loads: &[(u64, &str)], node: Nod
                     } else if g.attempt == 1 {
                         due.push((now + late_ms, g.block));
                     }
+                }
+                Node::TwoSpeed { fast } => {
+                    let wait = if asked.len() <= fast { FAST_MS } else { SLOW_MS };
+                    due.push((now + wait, g.block));
                 }
                 Node::Silent => {}
             }
@@ -211,6 +221,23 @@ fn a_timeout_halves_the_window() {
     }
 }
 
+/// THE FIRST LIVE RUN'S SHAPE: a few fast answers teach the RTO its 100 ms
+/// floor, then every fetch takes 1.5 s. Without §5.5's back-off every slow
+/// fetch is re-sent — so, by Karn, never sampled — and the RTO never learns
+/// (live: 142 timeouts, 72 blocks answered only on a re-send). With it, the RTO
+/// climbs past the round trip, a first GET answers, and SRTT learns 1.5 s.
+#[test]
+fn after_a_few_fast_answers_the_rto_learns_a_slow_round_trip() {
+    let (root, net) = tree();
+    let r = run(root, &net, &[(1, "a")], Node::TwoSpeed { fast: 3 }, 600_000);
+    assert!(r.finished.contains_key(&1), "the read did not finish");
+    let first = r.cold.log.iter().filter(|e| matches!(e, ColdEvent::Answered { .. })).count();
+    let resent = r.cold.log.iter().filter(|e| matches!(e, ColdEvent::ReGetAnswered { .. })).count();
+    let srtt = r.cold.srtt_ms().expect("sampled");
+    assert!(srtt >= 1_000.0, "SRTT {srtt} ms: the RTO never learned the 1.5 s round trip");
+    assert!(first > 4 * resent, "{first} blocks answered on the first GET, {resent} only on a re-send");
+}
+
 /// KARN'S RULE: a fetch that was re-sent is never a sample. Here the FIRST
 /// GET of one block is answered only after 5 s and its re-sends never are:
 /// the answer comes back while the fetch is on a re-send, and nothing says
@@ -224,7 +251,10 @@ fn a_late_answer_to_a_re_sent_fetch_is_not_a_sample() {
     let r = run(root, &net, &[(1, "a")], Node::Late { late, late_ms: 5_000 }, 600_000);
     assert!(r.finished.contains_key(&1), "the read did not finish");
     assert!(r.cold.log.iter().any(|e| matches!(e, ColdEvent::ReGetAnswered { block, .. } if *block == late)), "the late block was not re-sent before its answer came");
-    assert!(r.cold.rto_ms() < 200.0, "the RTO is {} ms: a re-sent fetch's answer was sampled", r.cold.rto_ms());
+    // The SMOOTHED round trip — not the RTO, which is rightly backed off by
+    // the re-sends that never answered.
+    let srtt = r.cold.srtt_ms().expect("fast fetches were sampled");
+    assert!(srtt < 100.0, "SRTT {srtt} ms on a {FAST_MS} ms node: a re-sent fetch's answer was sampled");
 }
 
 #[test]

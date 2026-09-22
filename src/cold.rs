@@ -10,8 +10,9 @@
 //! exactly this:
 //! * the TIMEOUT is RFC 6298's RTO over completed fetches (`SRTT`, `RTTVAR`,
 //!   `RTO = SRTT + 4·RTTVAR`, a [`COLD_RTO_FLOOR_MS`] floor, [`COLD_RTO_INITIAL_MS`]
-//!   before any sample), with KARN'S RULE: a fetch that was re-sent is never
-//!   sampled — which copy answered is unknowable;
+//!   before any sample), with KARN'S RULE — a fetch that was re-sent is never
+//!   sampled, which copy answered is unknowable — and §5.5's BACK-OFF: a
+//!   timeout doubles the RTO until a fetch answers on its first send;
 //! * the CONCURRENCY is a congestion window — [`COLD_WINDOW_INITIAL`] to start,
 //!   +1 per answer below the slow-start threshold (doubling per round), +1 per
 //!   window of answers above it, halved (≥ 1) on a timeout with the threshold
@@ -151,6 +152,12 @@ pub struct ColdReads {
     /// The congestion window, and the slow-start threshold (`None`: none yet).
     window: f64,
     ssthresh: Option<f64>,
+    /// RFC 6298 §5.5's back-off: doublings of the RTO since the last clean
+    /// sample. Without it, Karn's rule leaves the RTO at a floor learned from
+    /// fast fetches while every slower one is re-sent — and so never sampled —
+    /// for ever (the first live run: RTO 100 ms, 142 timeouts, 72 blocks
+    /// answered only on a re-send, of fetches that take ≈ 1.5 s).
+    backoff: u32,
 }
 
 /// The held blocks, as the tree reads them.
@@ -181,18 +188,18 @@ impl ColdReads {
 
     /// The retransmission timeout now, in ms (RFC 6298).
     pub fn rto_ms(&self) -> f64 {
-        match self.srtt {
+        let base = match self.srtt {
             None => COLD_RTO_INITIAL_MS,
             Some(srtt) => (srtt + 4.0 * self.rttvar).max(COLD_RTO_FLOOR_MS),
-        }
+        };
+        base * f64::from(1u32 << self.backoff)
     }
 
-    /// One fetch's own timeout: the RTO, BACKED OFF per re-send of it (RFC 6298
-    /// §5.5) — without it a truly lost GET, at a 100 ms RTO, is re-sent some
-    /// three hundred times in its 30 s. Per fetch: the others' clocks are
-    /// untouched.
-    fn timeout_of(&self, attempt: u32) -> f64 {
-        self.rto_ms() * f64::from(1u32 << attempt.saturating_sub(1).min(8))
+    /// The smoothed round trip (RFC 6298's SRTT), `None` before any clean
+    /// sample. Karn's rule is what keeps it honest: a re-sent fetch never
+    /// feeds it, whatever the back-off does to the RTO meanwhile.
+    pub fn srtt_ms(&self) -> Option<f64> {
+        self.srtt
     }
 
     /// The congestion window now: how many fetches may be in flight.
@@ -268,6 +275,7 @@ impl ColdReads {
         // the first copy's, late, or the second's; nothing says which.
         if f.attempt == 1 {
             self.sample(now_ms.saturating_sub(f.sent_at) as f64);
+            self.backoff = 0;
         }
         self.opened();
         self.log.push(if f.attempt > 1 {
@@ -317,11 +325,14 @@ impl ColdReads {
         let late: Vec<Cid> = self
             .fetching
             .iter()
-            .filter(|(_, f)| now_ms.saturating_sub(f.sent_at) as f64 >= self.timeout_of(f.attempt))
+            .filter(|(_, f)| now_ms.saturating_sub(f.sent_at) as f64 >= self.rto_ms())
             .map(|(c, _)| *c)
             .collect();
         if !late.is_empty() {
             self.halved();
+            // RFC 6298 §5.5: back the timer off — once per tick, however many
+            // timed out in it — and keep it backed off until a clean sample.
+            self.backoff = (self.backoff + 1).min(6);
         }
         for block in late {
             let f = self.fetching.remove(&block).expect("listed");
