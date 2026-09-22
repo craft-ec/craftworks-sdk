@@ -27,7 +27,7 @@
 use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
-use page::{Answer, Op, Page, SignAnswer};
+use page::{Answer, Op, Page, PutPath, SignAnswer};
 use std::collections::BTreeMap;
 
 const BLOCK_CODE: &[u8] = b"model block code";
@@ -191,7 +191,7 @@ impl Node {
     fn sign(&mut self, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> SignAnswer {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
-            next: signer::Next { seq, root: root, ledger: Vec::new() },
+            next: signer::Next { seq, root, ledger: Vec::new() },
         };
         match signer::serve(&mut Host(self), &signer::encode_request(&req)) {
             signer::Answer::Signed(state) => SignAnswer::Signed(state),
@@ -279,7 +279,7 @@ struct Seen {
     updates: usize,
 }
 
-fn run(seed: u64, writes_per_page: usize) -> Result<Seen, String> {
+fn run(seed: u64, writes_per_page: usize, path: PutPath) -> Result<Seen, String> {
     let (mut node, _) = Node::new();
     let mut s_delay = Rng::new(seed, 1);
     let mut s_put_lost = Rng::new(seed, 2);
@@ -294,12 +294,19 @@ fn run(seed: u64, writes_per_page: usize) -> Result<Seen, String> {
 
     let mut apps: Vec<App> = (0..2)
         .map(|i| App {
-            page: Page::new(Params::default()),
+            page: Page::new(Params::default(), path),
             client: ClientId(i as u64 + 1),
             next_id: 0,
             inflight: BTreeMap::new(),
             todo: (0..writes_per_page)
-                .map(|n| (format!("p{i}/{n:03}").into_bytes(), format!("v{seed}-{i}-{n}").into_bytes()))
+                .map(|n| {
+                    // 3 KB values: a tree with blocks BELOW its root, so a
+                    // root can be signed while a child is missing — the
+                    // signer's own check guards the root block only.
+                    let mut v = format!("v{seed}-{i}-{n}:").into_bytes();
+                    v.resize(3_000, b'a' + (n % 26) as u8);
+                    (format!("p{i}/{n:03}").into_bytes(), v)
+                })
                 .collect(),
             wrote: BTreeMap::new(),
             published: 0,
@@ -347,11 +354,16 @@ fn run(seed: u64, writes_per_page: usize) -> Result<Seen, String> {
             let answer = match f.op {
                 Op::Put { id, bytes } => {
                     if s_put_lost.chance(faults.put_lost) {
-                        None
+                        // On the wrapper path an answer is no evidence: a
+                        // put that never landed is still answered ok, so an
+                        // executor that trusted it would publish a hole.
+                        (path == PutPath::Wrapper).then_some(Answer::PutOk(id))
                     } else if s_put_ref.chance(faults.put_refused) {
                         Some(Answer::PutRefused { id, transient: true })
                     } else {
                         node.put(id, &bytes);
+                        // The wrapper path: the answer never reaches the page
+                        // (sdk#214) — here it does, and must confirm nothing.
                         if s_put_ans.chance(faults.put_answer_lost) {
                             None
                         } else {
@@ -387,6 +399,13 @@ fn run(seed: u64, writes_per_page: usize) -> Result<Seen, String> {
                         Some(Answer::Updated)
                     }
                 }
+                Op::AskHeld { id } => {
+                    if s_head.chance(faults.head_lost) {
+                        None
+                    } else {
+                        Some(Answer::Held { id, present: node.blocks.contains_key(&id) })
+                    }
+                }
                 Op::ReadHead => {
                     if s_head.chance(faults.head_lost) {
                         None
@@ -417,6 +436,13 @@ fn run(seed: u64, writes_per_page: usize) -> Result<Seen, String> {
                 a.inflight.len(),
                 a.page.unusable()
             ));
+        }
+    }
+    // Nothing the pages could not do: a refusal hidden in `unusable` would
+    // otherwise pass as long as the retries got round it.
+    for (i, a) in apps.iter().enumerate() {
+        if !a.page.unusable().is_empty() {
+            return Err(format!("page {i} recorded: {:?}", a.page.unusable()));
         }
     }
     let (_, root) = node.head().ok_or("no head at the end")?;
@@ -477,7 +503,7 @@ const WRITES: usize = 12;
 fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_hold() {
     let mut total = Seen::default();
     for seed in 1..=SEEDS {
-        let s = run(seed, WRITES).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let s = run(seed, WRITES, PutPath::Page).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         total.published += s.published;
         total.lost += s.lost;
         total.busy += s.busy;
@@ -497,7 +523,7 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
 #[test]
 fn control_the_whole_tree_check_fails_on_a_missing_block() {
     let (mut node, _) = Node::new();
-    let mut p = Page::new(Params::default());
+    let mut p = Page::new(Params::default(), PutPath::Page);
     p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(vec![7u8; 5_000]))]);
     let mut puts = Vec::new();
     for _ in 0..20 {
@@ -518,6 +544,7 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                     p.answer(Answer::Updated, 0);
                 }
                 Op::Get { id } => p.answer(Answer::GetMissed(id), 0),
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, 0),
             }
         }
     }
@@ -526,4 +553,16 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
     let gone = *puts.iter().find(|b| **b != root).expect("a block under the root");
     node.blocks.remove(&gone);
     assert!(node.tree(&root).is_none(), "the whole-tree check passed over a missing block");
+}
+
+/// THE WRAPPER PATH: a PUT's answer confirms nothing, only the signer's
+/// read-local `Held` does. Same faults, same invariants.
+#[test]
+fn on_the_wrapper_path_a_put_is_confirmed_by_held_and_the_invariants_hold() {
+    let mut published = 0;
+    for seed in 1..=SEEDS / 2 {
+        let s = run(seed, WRITES, PutPath::Wrapper).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        published += s.published;
+    }
+    assert_eq!(published, (SEEDS / 2) as usize * 2 * WRITES);
 }

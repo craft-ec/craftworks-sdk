@@ -18,7 +18,7 @@
 //! | effect / answer | what the page does |
 //! |---|---|
 //! | `PutBlock` / `PutParity` | the bytes join [`PageBlocks`] (the page is now the memory a node was); held until its `after` set is confirmed, then [`Op::Put`] |
-//! | `PutOk` | `PutConfirmed` — on the PUT's answer (main's ruling for sdk#213: a page-PUT block is served, measured 20/20; no per-block read-back) |
+//! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → the PUT again |
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
@@ -105,6 +105,21 @@ impl Blocks for PageBlocks {
     }
 }
 
+/// Where a block's PUT goes, and so what CONFIRMS it (`PutConfirmed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutPath {
+    /// The page PUTs to its OWN node through the client API. The PUT's answer
+    /// confirms it (main's ruling for sdk#213: a page-PUT block is served,
+    /// measured 20/20).
+    Page,
+    /// The signer puts it (put-with-code, the wrapper path). No PUT answer
+    /// reaches the page's connection (sdk#214: 0 in 5 s), and a client GET of
+    /// a delegate-put block on a peered node is NotFound (F55). So a put's
+    /// answer confirms NOTHING: the page asks the signer's read-local verb
+    /// ([`Op::AskHeld`]) and only `Held { present: true }` confirms.
+    Wrapper,
+}
+
 /// A client-API operation for the web layer to frame and send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -118,6 +133,9 @@ pub enum Op {
     Update { state: Vec<u8> },
     /// GET the head register.
     ReadHead,
+    /// [`PutPath::Wrapper`] only: ask the signer's read-local verb whether the
+    /// node holds this block now.
+    AskHeld { id: Cid },
 }
 
 /// What the signer answered, as the web layer decoded it.
@@ -147,12 +165,15 @@ pub enum Answer {
     Updated,
     /// The head register as read: `(seq, root)`, or `None` if there is none.
     Head(Option<(u64, Cid)>),
+    /// [`PutPath::Wrapper`]: the signer's synchronous local read of a block.
+    Held { id: Cid, present: bool },
 }
 
 /// Which op a deadline is for.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Waiting {
     Put(Cid),
+    Held(Cid),
     Get(Cid),
     Sign,
     Update,
@@ -176,6 +197,7 @@ struct Owed {
 
 /// One page's writes: the engine, the executor state, and what to send.
 pub struct Page {
+    path: PutPath,
     engine: Engine<PageBlocks>,
     blocks: PageBlocks,
     /// Blocks whose PUT was answered ok (an effect's `after` is judged here).
@@ -203,10 +225,11 @@ pub struct Page {
 impl Page {
     /// A page with a fresh engine. It reads its head first (`ReadHead`), as a
     /// delegate's engine did.
-    pub fn new(params: Params) -> Page {
+    pub fn new(params: Params, path: PutPath) -> Page {
         let blocks = PageBlocks::default();
         let engine = Engine::new(params, blocks.clone());
         let mut p = Page {
+            path,
             engine,
             blocks,
             confirmed: BTreeSet::new(),
@@ -245,6 +268,9 @@ impl Page {
                 // A GET that did not answer is the engine's to re-issue: it
                 // counts attempts and gives up within its own budget.
                 Waiting::Get(id) => self.step(Event::BlockMissed(id)),
+                // Rebuilt, not replayed: the published head it names as prev
+                // may have moved since it was first sent.
+                Waiting::Sign => self.ask_sign(),
                 _ => self.send(w, op),
             }
         }
@@ -271,9 +297,22 @@ impl Page {
                     return; // a second answer to a re-sent PUT
                 }
                 self.put_again.remove(&id);
-                self.confirmed.insert(id);
-                self.step(Event::PutConfirmed(id));
-                self.release();
+                match self.path {
+                    PutPath::Page => self.confirm(id),
+                    // An answer is not a confirmation on this path: ask.
+                    PutPath::Wrapper => self.send(Waiting::Held(id), Op::AskHeld { id }),
+                }
+            }
+            Answer::Held { id, present } => {
+                let Some((_, _)) = self.deadlines.remove(&Waiting::Held(id)) else { return };
+                if present {
+                    self.confirm(id);
+                } else if let Some(bytes) = self.blocks.get(&id).map(<[u8]>::to_vec) {
+                    // Not there (yet): put again at the NEXT TICK, as a
+                    // transient refusal is — at once would re-put a block the
+                    // node never keeps as fast as it can answer.
+                    self.put_again.insert(id, bytes);
+                }
             }
             Answer::PutRefused { id, transient } => {
                 let Some((_, op)) = self.deadlines.remove(&Waiting::Put(id)) else { return };
@@ -325,6 +364,14 @@ impl Page {
                     self.on_read_back(h);
                 }
             }
+        }
+    }
+
+    /// A block is on the node: the one place `PutConfirmed` comes from.
+    fn confirm(&mut self, id: Cid) {
+        if self.confirmed.insert(id) {
+            self.step(Event::PutConfirmed(id));
+            self.release();
         }
     }
 
@@ -418,6 +465,23 @@ impl Page {
     fn step(&mut self, ev: Event) {
         let fx = self.engine.step(ev);
         self.carry_out(fx);
+        self.drop_dead_head();
+    }
+
+    /// An owed head is LIVE only while it is ahead of what the engine has
+    /// published. Once the engine adopts another head (a conflict, a recovery
+    /// read), the commit that owed it is dead — its writes were told `Lost` —
+    /// and nothing more is asked or sent for it. Without this the page went on
+    /// asking the signer for a dead commit from a stale prev (the model found
+    /// it: `NotSuccessor`, hidden behind the retries that got round it).
+    fn drop_dead_head(&mut self) {
+        if self.owed.as_ref().is_some_and(|o| o.seq <= self.engine.published_seq()) {
+            self.owed = None;
+            self.sign_again = false;
+            for w in [Waiting::Sign, Waiting::Update, Waiting::ReadBack] {
+                self.deadlines.remove(&w);
+            }
+        }
     }
 
     fn carry_out(&mut self, fx: Vec<Effect>) {
@@ -472,6 +536,11 @@ impl Page {
                             self.send(Waiting::Put(id), Op::Put { id, bytes });
                         }
                     }
+                    // A head held across an adopt belongs to a DEAD commit
+                    // (its writes were told `Lost`): it is at or behind what
+                    // the engine now publishes, and asking for it would name a
+                    // prev it does not follow (the model: `NotSuccessor`).
+                    Effect::UpdateHead { seq, .. } if seq <= self.engine.published_seq() => {}
                     Effect::UpdateHead { seq, root, .. } => {
                         self.owed = Some(Owed { seq, root, record: None, stale_reads: 0 });
                         self.ask_sign();
