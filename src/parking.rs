@@ -147,7 +147,12 @@ pub fn decide_with<T>(
         return Outcome::Told(e);
     };
     let (lo, hi) = (lo.to_vec(), hi.to_vec());
-    let Some((req_id, send)) = loads.want(&lo, &hi, now_ms) else {
+    // A range this copy knows it is BEHIND on is asked again even though it
+    // was loaded: that is progress, not a loop (sdk#266).
+    let stale_from = store.copy.stale_from(&lo, &hi);
+    let stale = stale_from.is_some();
+    let asked = if stale { Some(loads.want_again(&lo, &hi, now_ms)) } else { loads.want(&lo, &hi, now_ms) };
+    let Some((req_id, send)) = asked else {
         // This span was loaded already and the call still cannot be answered.
         // Loading it again would answer exactly as it did the first time, so
         // the caller is told instead of sent round.
@@ -159,8 +164,8 @@ pub fn decide_with<T>(
     // "send me the range": a delta of what moved, under this read's own
     // ticket, which the answer completes. A range nobody has ever loaded
     // takes the full load below, as before.
-    if send && !taken && store.copy.is_stale(&lo, &hi) {
-        if let Some(from) = store.copy.root() {
+    if send && !taken {
+        if let Some(from) = stale_from {
             store.client.send(&protocol::Request::ChangesSince {
                 req_id,
                 from,

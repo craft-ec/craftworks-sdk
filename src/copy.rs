@@ -226,10 +226,17 @@ pub struct Copy {
     /// The key intervals that have been LOADED, as `[lo, hi)`, disjoint and
     /// sorted. What makes "not loaded" different from "empty".
     loaded: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Loaded intervals this copy knows it is BEHIND on: the head moved and
-    /// it was not this page's commit (sdk#266). Their rows are still here —
-    /// a delta patches them — but a read of one is not answered from the copy.
-    stale: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Loaded intervals this copy knows it is BEHIND on, each with the root
+    /// it was last CURRENT at (sdk#266). Their rows are still here — a delta
+    /// from that root patches them — but a read of one is not answered from
+    /// the copy.
+    ///
+    /// The root is per RANGE because the copy has one root and many ranges:
+    /// the first range refreshed moves `root` to the head that won, and a
+    /// second range asked from THAT root is told nothing changed and shows
+    /// its old rows as current (measured in a browser: y's scan answered 0
+    /// rows for ever, with the node answering every re-ask).
+    stale: Vec<(Vec<u8>, Vec<u8>, [u8; 32])>,
     /// The root this copy reflects. RECORDED, never computed.
     root: Option<[u8; 32]>,
     bytes: usize,
@@ -287,7 +294,7 @@ impl Copy {
     /// Is this key inside a range that has been loaded — and not one this
     /// copy knows it is BEHIND on (sdk#266)?
     pub fn is_loaded(&self, key: &[u8]) -> bool {
-        self.holds(key) && !self.stale.iter().any(|(lo, hi)| key >= lo.as_slice() && key < hi.as_slice())
+        self.holds(key) && !self.stale.iter().any(|(lo, hi, _)| key >= lo.as_slice() && key < hi.as_slice())
     }
 
     /// Is this key inside a range whose rows this copy HOLDS, stale or not?
@@ -312,18 +319,56 @@ impl Copy {
     /// this tab's the copy already holds those values, and marking then would
     /// double the read traffic of ordinary writing.
     pub fn mark_stale(&mut self) {
-        self.stale = self.loaded.clone();
+        let Some(root) = self.root else { return };
+        let fresh: Vec<(Vec<u8>, Vec<u8>)> = self
+            .loaded
+            .iter()
+            .filter(|(l, h)| !self.stale.iter().any(|(sl, sh, _)| sl <= l && h <= sh))
+            .cloned()
+            .collect();
+        self.stale.extend(fresh.into_iter().map(|(l, h)| (l, h, root)));
     }
 
     /// Is any part of `[lo, hi)` stale?
     pub fn is_stale(&self, lo: &[u8], hi: &[u8]) -> bool {
-        self.stale.iter().any(|(l, h)| l.as_slice() < hi && lo < h.as_slice())
+        self.stale_from(lo, hi).is_some()
     }
 
-    /// A delta from this copy's root has been applied over `[lo, hi)`: it is
-    /// as new as the head that delta named.
+    /// The root a stale part of `[lo, hi)` was last CURRENT at: what its
+    /// re-ask asks FROM. The oldest of them, so nothing is skipped.
+    pub fn stale_from(&self, lo: &[u8], hi: &[u8]) -> Option<[u8; 32]> {
+        self.stale
+            .iter()
+            .filter(|(l, h, _)| l.as_slice() < hi && lo < h.as_slice())
+            .map(|(_, _, root)| *root)
+            .next()
+    }
+
+    /// A delta from this copy's root has been applied over `[lo, hi)`: that
+    /// span is as new as the head the delta named.
+    ///
+    /// SUBTRACTED, not dropped. A page loads a wide range — the whole key
+    /// space, on an opening session — and READS a narrow one, a domain. With
+    /// only whole ranges cleared, the wide stale range survived every delta:
+    /// the read re-asked, was answered, and found the range stale again, for
+    /// ever (measured in a browser, sdk#266: `y.scan` threw "not loaded"
+    /// every 250 ms for 30 s while the node answered each re-ask).
     pub fn refreshed(&mut self, lo: &[u8], hi: &[u8]) {
-        self.stale.retain(|(l, h)| !(lo <= l.as_slice() && h.as_slice() <= hi));
+        let mut out = Vec::with_capacity(self.stale.len() + 1);
+        for (l, h, root) in std::mem::take(&mut self.stale) {
+            // Disjoint: untouched.
+            if h.as_slice() <= lo || hi <= l.as_slice() {
+                out.push((l, h, root));
+                continue;
+            }
+            if l.as_slice() < lo {
+                out.push((l.clone(), lo.to_vec(), root));
+            }
+            if hi < h.as_slice() {
+                out.push((hi.to_vec(), h, root));
+            }
+        }
+        self.stale = out;
     }
 
     /// What a component sees, or `None` if this range was never loaded.
