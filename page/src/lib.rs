@@ -304,6 +304,10 @@ pub struct Page {
     get_queue: std::collections::VecDeque<Cid>,
     /// The attempt a re-send continues from (set when an op times out).
     attempt_of: BTreeMap<Waiting, u32>,
+    /// When the engine's own head read first went out and got no answer — the
+    /// register's budget runs from here — and whether "not answering" was said.
+    recover_since: Option<u64>,
+    recover_told: bool,
     out: Vec<Op>,
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
@@ -352,6 +356,8 @@ impl Page {
             window: rto::Window::default(),
             get_queue: Default::default(),
             attempt_of: BTreeMap::new(),
+            recover_since: None,
+            recover_told: false,
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
@@ -438,6 +444,20 @@ impl Page {
                 v.again_at = None;
             }
             self.send(Waiting::Verify, Op::ReadHead);
+        }
+        // The engine's OWN head read (recovery) has the same budget: it is
+        // asked again on its RTO for as long as it takes, and past the budget
+        // this page says the register is not answering. It is NEVER turned
+        // into `HeadMissing` — that would open an empty tree over a register
+        // that is merely unreachable (sdk#175).
+        if self.deadlines.contains_key(&Waiting::RecoverHead) {
+            let since = *self.recover_since.get_or_insert(now);
+            if !self.recover_told && now.saturating_sub(since) >= VERIFY_BUDGET_MS {
+                self.recover_told = true;
+                self.unusable.push(format!("the register is not answering: no head read within {VERIFY_BUDGET_MS} ms"));
+            }
+        } else {
+            self.recover_since = None;
         }
         // The register's own budget: past it, "not answering" — named, and
         // nothing adopted.

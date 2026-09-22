@@ -142,3 +142,33 @@ fn with_no_answers_the_rto_backs_off() {
     }
     assert_eq!(seen, vec![2_000, 4_000, 8_000], "the RTO did not double per timeout");
 }
+
+/// sdk#175 at the executor: the engine's own head read that is never
+/// answered is asked again on its RTO for as long as it takes — it never
+/// becomes `HeadMissing`, which would open an EMPTY tree — and past the
+/// register's budget the page says it is not answering.
+#[test]
+fn an_unanswered_head_read_is_never_an_empty_tree() {
+    let mut p = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000u64;
+    let mut asked = 0;
+    for _ in 0..40_000 {
+        now += 1;
+        p.tick(Ms(now));
+        asked += p.take_ops().iter().filter(|o| **o == Op::ReadHead).count();
+    }
+    assert!(asked >= 3, "the head read was not asked again ({asked})");
+    // A write now: had the engine taken "no head", it would commit onto the
+    // EMPTY tree and ask to sign from genesis. It must not ask to sign at all.
+    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    for _ in 0..100 {
+        now += 10;
+        p.tick(Ms(now));
+        assert!(!p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "a write was signed onto a tree nobody read");
+    }
+    assert!(
+        p.unusable().iter().any(|u| u.contains("not answering")),
+        "no 'not answering' after 40 s of silence: {:?}",
+        p.unusable()
+    );
+}

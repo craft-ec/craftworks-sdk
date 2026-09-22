@@ -275,6 +275,8 @@ struct App {
     next_id: u64,
     /// write id → (key, value), in flight in the engine.
     inflight: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
+    /// When each write was submitted (page ms): `Stalled` is judged by it.
+    submitted: BTreeMap<u64, u64>,
     /// Writes to (re-)submit.
     todo: Vec<(Vec<u8>, Vec<u8>)>,
     /// Every key this app wrote and its LAST value.
@@ -283,11 +285,12 @@ struct App {
 }
 
 impl App {
-    fn submit(&mut self) {
+    fn submit(&mut self, now: u64) {
         if let Some((k, v)) = self.todo.first().cloned() {
             self.todo.remove(0);
             self.next_id += 1;
             self.inflight.insert(self.next_id, (k.clone(), v.clone()));
+            self.submitted.insert(self.next_id, now);
             self.page.write(self.client, WriteId(self.next_id), vec![(k, WriteOp::Put(v))]);
         }
     }
@@ -362,6 +365,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
             client: ClientId(i as u64 + 1),
             next_id: 0,
             inflight: BTreeMap::new(),
+            submitted: BTreeMap::new(),
             todo: (0..writes_per_page)
                 .map(|n| {
                     // 3 KB values: a tree with blocks BELOW its root, so a
@@ -411,7 +415,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         // The apps submit.
         for a in &mut apps {
             if a.inflight.is_empty() && !a.todo.is_empty() && s_app.chance(300) {
-                a.submit();
+                a.submit(now);
             }
         }
         // Ops leave the pages.
@@ -508,12 +512,12 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
             };
             let Some(answer) = answer else { continue };
             apps[f.page].page.answer(answer, Ms(now));
-            check(&mut apps, f.page, &node, &mut seen)?;
+            check(&mut apps, f.page, &node, &mut seen, now)?;
         }
         now += 5;
         for i in 0..apps.len() {
             apps[i].page.tick(Ms(now));
-            check(&mut apps, i, &node, &mut seen)?;
+            check(&mut apps, i, &node, &mut seen, now)?;
         }
         if now > calm_at && apps.iter().all(|a| a.todo.is_empty() && a.inflight.is_empty()) && flights.is_empty() {
             break;
@@ -577,7 +581,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     Ok(seen)
 }
 
-fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen) -> Result<(), String> {
+fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> Result<(), String> {
     // THE REGISTER IS NEVER 2+ BEHIND THE SIGNER'S RECORD (1b on the sign
     // side, the architect's attack): past one, the record for the seq between
     // is overwritten and no page could land it.
@@ -629,6 +633,17 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen) -> Result<(),
                 }
                 if let Some(w) = a.inflight.remove(&wid.0) {
                     a.todo.push(w);
+                }
+            }
+            // NO WRITE IS STALLED INSIDE ITS BUDGET: the engine says Stalled
+            // after `max_accept_age` (64) SECONDS unconfirmed. A page clock
+            // passed through in ms (#215's defect) told writes Stalled after
+            // 64 ms — the model now sees that, not only the unit test.
+            State::Stalled => {
+                let since = a.submitted.get(&wid.0).copied().unwrap_or(0);
+                let age = now.saturating_sub(since);
+                if age < 64_000 {
+                    return Err(format!("page {i}: write {} told Stalled {age} ms after it was submitted (budget 64 s)", wid.0));
                 }
             }
             _ => {}

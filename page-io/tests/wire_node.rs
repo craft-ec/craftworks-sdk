@@ -33,6 +33,9 @@ struct WireNode {
     served: BTreeMap<&'static str, usize>,
     /// PUTs of the Register (creations), counted.
     register_puts: usize,
+    /// The next this many GETs of the Register FAIL, as an unreachable node's
+    /// do (sdk#175).
+    fail_register_gets: usize,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -68,6 +71,7 @@ impl WireNode {
             secrets: BTreeMap::new(),
             served: BTreeMap::new(),
             register_puts: 0,
+            fail_register_gets: 0,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -131,13 +135,17 @@ impl WireNode {
             }
             ClientRequest::ContractOp(ContractRequest::Get { key, subscribe, .. }) => {
                 let id: [u8; 32] = key.as_bytes()[..32].try_into().expect("32");
+                let failing = id == self.register_id && self.fail_register_gets > 0;
+                if failing {
+                    self.fail_register_gets -= 1;
+                }
                 if id == self.register_id {
                     assert!(subscribe, "the head was read WITHOUT a subscription (F55)");
                     *self.served.entry("get register").or_default() += 1;
                 } else {
                     *self.served.entry("get block").or_default() += 1;
                 }
-                match self.contracts.get(&id) {
+                match self.contracts.get(&id).filter(|_| !failing) {
                     Some(state) => {
                         let ckey = ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32]));
                         Some(ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -176,6 +184,8 @@ impl WireNode {
     }
 }
 
+/// A page REOPENING on this node: its signer was provisioned before, so it
+/// did not mint the key and the register may well exist.
 fn page_io(node: &WireNode) -> PageIo {
     let (_, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
@@ -199,13 +209,14 @@ fn settle(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
         let frames = io.take_frames();
         replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
         if frames.is_empty() {
+            // Only timers left: go to the next one (or now, if it is due).
             match io.next_due() {
-                Some(Ms(t)) if t > *now => {
-                    *now = t;
+                Some(Ms(t)) => {
+                    *now = (*now).max(t);
                     io.tick(Ms(*now));
                     continue;
                 }
-                _ => break,
+                None => break,
             }
         }
         *now += 1;
@@ -313,4 +324,28 @@ fn two_pages_racing_the_first_put_create_one_register() {
     let r = settle(loser, &mut node, &mut now);
     assert!(states(&r, 2).contains(&WriteState::Published), "the race's loser never published: {r:?}");
     assert_eq!(node.head().map(|h| h.0), Some(2));
+}
+
+/// sdk#175: a head read that FAILS is silence, never "no head". A page that
+/// reopens on a node whose register exists, and whose first head reads fail,
+/// must not open an EMPTY tree: it asks again on its RTO and reads the rows.
+#[test]
+fn a_failed_head_read_never_opens_an_empty_tree() {
+    let mut node = WireNode::new(&[6u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["x", "y", "z"].iter().enumerate() {
+        let r = client(&mut a, &mut node, &mut now, &write(n as u64 + 1, k, "v"));
+        assert!(states(&r, n as u64 + 1).contains(&WriteState::Published));
+    }
+    // A second page reopens; its first three head reads fail.
+    node.fail_register_gets = 3;
+    let mut b = page_io(&node);
+    client(&mut b, &mut node, &mut now, &Request::Identity);
+    let range = Request::Range { req_id: 5, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client(&mut b, &mut node, &mut now, &range);
+    let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 5, entries, .. } = x { Some(entries.len()) } else { None }).collect();
+    assert_eq!(node.fail_register_gets, 0, "the failing reads were never asked again");
+    assert_eq!(pages, vec![3], "the reopened page read {pages:?} rows: a failed head read opened an empty tree");
 }

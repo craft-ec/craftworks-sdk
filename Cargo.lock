@@ -1891,9 +1891,12 @@ version = "0.1.0"
 dependencies = [
  "craftworks-sdk",
  "ed25519-dalek",
+ "engine",
  "freenet-prolly",
  "getrandom 0.2.17",
  "js-sys",
+ "page",
+ "page-io",
  "protocol",
  "serde",
  "serde_json",

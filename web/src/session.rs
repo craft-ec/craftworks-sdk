@@ -135,6 +135,16 @@ pub struct Session {
     /// are ON by default, switched on by [`Session::provision`] with the
     /// Block code it hands in; after it, the builder's choice stands.
     cold_chosen: bool,
+    /// PAGE MODE (ruling B): the engine runs IN THE PAGE (`page::Server`) and
+    /// the SIGNER signs, instead of the engine delegate. Behind a flag until
+    /// the switch-over, default OFF (`set_page_mode`).
+    page_mode: bool,
+    /// The signer delegate's wasm, handed in with the flag.
+    signer_code: Vec<u8>,
+    /// The page's I/O over the client API, from `provision` on.
+    page: Option<page_io::PageIo>,
+    /// `Identity` sent to the in-page server once the signer is provisioned.
+    page_identity_sent: bool,
 }
 
 #[wasm_bindgen]
@@ -183,6 +193,10 @@ impl Session {
             cold: craftworks_sdk::cold::ColdReads::default(),
             cold_contract: None,
             cold_chosen: false,
+            page_mode: false,
+            signer_code: Vec::new(),
+            page: None,
+            page_identity_sent: false,
         })
     }
 
@@ -219,95 +233,19 @@ impl Session {
     /// something larger, or something this build cannot use — which is
     /// counted rather than ignored.
     pub fn on_inbound(&mut self, bytes: &[u8]) {
+        // PAGE MODE: every node frame is the page executor's (page-io); there
+        // is no engine delegate to hear from.
+        if self.page_mode {
+            if let Some(p) = self.page.as_mut() {
+                p.inbound(bytes, page::Ms(crate::js_now_ms()));
+            }
+            self.pump_page();
+            return;
+        }
         match wire::unframe(&mut self.frames, bytes) {
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
-                    // Read, not intercepted: the store still gets every byte.
-                    // `Identity` is the only reply provisioning rests on, and
-                    // it is the delegate's own report about its own secret
-                    // store rather than an acknowledgement that a message
-                    // arrived.
-                    match protocol::decode_reply(&m) {
-                        Ok(protocol::Reply::Identity {
-                            head_writable,
-                            head_root,
-                            head_id,
-                            head_seq,
-                            ..
-                        }) => {
-                            // Which contract the head IS. Without it a tab
-                            // that made no write can only poll: an
-                            // engine-originated push returns to whoever
-                            // invoked the delegate (F40).
-                            self.head_id = head_id;
-                            self.head_named = if head_id == [0u8; 32] {
-                                String::new()
-                            } else {
-                                wire::contract_id(head_id).to_string()
-                            };
-                            // The root pages are recorded against. A page
-                            // filed under the wrong root would make a stale
-                            // range look current.
-                            self.head_root = head_root;
-                            if head_root != [0u8; 32] {
-                                self.cold.set_root(head_root);
-                            }
-                            // The newest head this client has heard of, from
-                            // anywhere. A load that finishes behind it is not
-                            // recorded.
-                            self.loads.note_seq(head_seq);
-                            self.plan.on_identity(head_writable);
-                            self.note_progress();
-                        }
-                        // Another writer got there first. The ordinary
-                        // outcome of two tabs opened together, not an error:
-                        // the plan goes on to the confirming Ask and simply
-                        // stops claiming an install it did not make.
-                        Ok(protocol::Reply::AlreadyInstalled) => {
-                            self.plan.on_already_installed();
-                        }
-                        Ok(protocol::Reply::Page {
-                            req_id,
-                            entries,
-                            cursor,
-                            at,
-                            ..
-                        }) => self.on_page(req_id, entries, cursor, at),
-                        // A read the engine could not answer. The range is
-                        // NOT recorded as loaded: an empty page here would
-                        // say "this range is empty", which is a wrong answer
-                        // wearing the shape of a right one.
-                        // WHAT CHANGED since this client last looked.
-                        //
-                        // Every field BOUND, no `..`: a `cursor` dropped in
-                        // one is how a first page was applied as the whole
-                        // answer (sdk#140), and a field added later must
-                        // fail to compile here rather than vanish.
-                        Ok(protocol::Reply::Delta {
-                            req_id,
-                            changes,
-                            cursor,
-                            new_root,
-                            at,
-                        }) => {
-                            self.loads.note_seq(at.seq);
-                            self.on_delta(req_id, changes, cursor, new_root)
-                        }
-                        // The delta could not be computed. The interval is
-                        // forgotten and re-requested in full, through the
-                        // ordinary load path so it is bounded and ticketed
-                        // like any other — NOT applied as if it were a delta,
-                        // which would record a range as current on the
-                        // strength of an answer that said it could not say.
-                        Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => {
-                            self.on_full_reload(req_id)
-                        }
-                        Ok(protocol::Reply::Unavailable { req_id, .. }) => {
-                            self.loads.on_unavailable(req_id)
-                        }
-                        _ => {}
-                    }
-                    self.db.store_mut().on_inbound(&m);
+                    self.on_engine_reply(m);
                 }
             }
             Incoming::Ack(kind) => self.on_ack(kind),
@@ -367,6 +305,97 @@ impl Session {
             Incoming::Unusable(why) => self.unusable.push(format!("{why:?}")),
             Incoming::Partial => {}
         }
+    }
+
+    /// One protocol reply for this session's store — from the engine
+    /// delegate, or (page mode) from the in-page `page::Server`.
+    fn on_engine_reply(&mut self, m: Vec<u8>) {
+        // Read, not intercepted: the store still gets every byte.
+        // `Identity` is the only reply provisioning rests on, and
+        // it is the delegate's own report about its own secret
+        // store rather than an acknowledgement that a message
+        // arrived.
+        match protocol::decode_reply(&m) {
+            Ok(protocol::Reply::Identity {
+                head_writable,
+                head_root,
+                head_id,
+                head_seq,
+                ..
+            }) => {
+                // Which contract the head IS. Without it a tab
+                // that made no write can only poll: an
+                // engine-originated push returns to whoever
+                // invoked the delegate (F40).
+                self.head_id = head_id;
+                self.head_named = if head_id == [0u8; 32] {
+                    String::new()
+                } else {
+                    wire::contract_id(head_id).to_string()
+                };
+                // The root pages are recorded against. A page
+                // filed under the wrong root would make a stale
+                // range look current.
+                self.head_root = head_root;
+                if head_root != [0u8; 32] {
+                    self.cold.set_root(head_root);
+                }
+                // The newest head this client has heard of, from
+                // anywhere. A load that finishes behind it is not
+                // recorded.
+                self.loads.note_seq(head_seq);
+                self.plan.on_identity(head_writable);
+                self.note_progress();
+            }
+            // Another writer got there first. The ordinary
+            // outcome of two tabs opened together, not an error:
+            // the plan goes on to the confirming Ask and simply
+            // stops claiming an install it did not make.
+            Ok(protocol::Reply::AlreadyInstalled) => {
+                self.plan.on_already_installed();
+            }
+            Ok(protocol::Reply::Page {
+                req_id,
+                entries,
+                cursor,
+                at,
+                ..
+            }) => self.on_page(req_id, entries, cursor, at),
+            // A read the engine could not answer. The range is
+            // NOT recorded as loaded: an empty page here would
+            // say "this range is empty", which is a wrong answer
+            // wearing the shape of a right one.
+            // WHAT CHANGED since this client last looked.
+            //
+            // Every field BOUND, no `..`: a `cursor` dropped in
+            // one is how a first page was applied as the whole
+            // answer (sdk#140), and a field added later must
+            // fail to compile here rather than vanish.
+            Ok(protocol::Reply::Delta {
+                req_id,
+                changes,
+                cursor,
+                new_root,
+                at,
+            }) => {
+                self.loads.note_seq(at.seq);
+                self.on_delta(req_id, changes, cursor, new_root)
+            }
+            // The delta could not be computed. The interval is
+            // forgotten and re-requested in full, through the
+            // ordinary load path so it is bounded and ticketed
+            // like any other — NOT applied as if it were a delta,
+            // which would record a range as current on the
+            // strength of an answer that said it could not say.
+            Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => {
+                self.on_full_reload(req_id)
+            }
+            Ok(protocol::Reply::Unavailable { req_id, .. }) => {
+                self.loads.on_unavailable(req_id)
+            }
+            _ => {}
+        }
+        self.db.store_mut().on_inbound(&m);
     }
 
     fn on_ack(&mut self, kind: AckKind) {
@@ -781,6 +810,10 @@ impl Session {
     /// Take the next provisioning step, if there is one and nothing is in
     /// flight. The frames go on the outbound queue; nothing is sent here.
     fn advance(&mut self) {
+        // PAGE MODE has no engine delegate to install: `provision_page`.
+        if self.page_mode {
+            return;
+        }
         let Some(step) = self.plan.next_step() else {
             return;
         };
@@ -861,6 +894,17 @@ impl Session {
     /// queue defect already fixed once in the page's socket pump, where a
     /// closed socket silently discarded every request behind the first.
     fn envelope_engine_requests(&mut self) {
+        // PAGE MODE: the store's protocol frames go to the in-page server, not
+        // to a delegate. Held (not drained) until the page exists.
+        if self.page_mode {
+            if self.page.is_some() {
+                for bytes in self.db.store_mut().take_outbound() {
+                    self.page.as_mut().expect("checked").client(&bytes);
+                }
+                self.pump_page();
+            }
+            return;
+        }
         let Some(key) = self.delegate.clone() else {
             return;
         };
@@ -900,6 +944,33 @@ impl Session {
         } else {
             None
         };
+    }
+
+    /// PAGE MODE: what `page-io` produced, carried out — its node frames go
+    /// out, its protocol replies reach this session exactly as a delegate's
+    /// did, and once the signer is provisioned the in-page engine is started
+    /// with `Identity`.
+    fn pump_page(&mut self) {
+        let Some(p) = self.page.as_mut() else { return };
+        let frames = p.take_frames();
+        let replies = p.take_replies();
+        let ready = p.provisioned() && !self.page_identity_sent;
+        self.out.extend(frames);
+        for m in replies {
+            self.on_engine_reply(m);
+        }
+        if ready {
+            self.page_identity_sent = true;
+            match protocol::encode_request(1, &protocol::Request::Identity) {
+                Ok(frame) => {
+                    if let Some(p) = self.page.as_mut() {
+                        p.client(&frame);
+                    }
+                    self.pump_page();
+                }
+                Err(e) => self.unusable.push(format!("the identity request cannot be encoded: {e:?}")),
+            }
+        }
     }
 
     /// COLD READS: what the cold reader decided, carried out.
@@ -978,7 +1049,11 @@ impl Session {
     /// and calls [`Session::cold_tick`] then — so a late fetch is seen at its
     /// own timeout even when no answer arrives and the 1 s tick is far off.
     pub fn cold_due_ms(&self) -> i32 {
-        match self.cold.next_due_ms(crate::js_now_ms()) {
+        let now = crate::js_now_ms();
+        // The page executor's next timer too (page mode): its every node call
+        // retries on its RTO, and the page's 1 s tick is too coarse for it.
+        let page = self.page.as_ref().and_then(|p| p.next_due()).map(|d| d.0.saturating_sub(now));
+        match [self.cold.next_due_ms(now), page].into_iter().flatten().min() {
             Some(ms) => ms.min(i32::MAX as u64) as i32,
             None => -1,
         }
@@ -987,8 +1062,13 @@ impl Session {
     /// The cold reader's clock alone, at the moment [`Session::cold_due_ms`]
     /// named: its late fetches re-sent, its give-ups reported.
     pub fn cold_tick(&mut self) {
-        self.cold.tick(crate::js_now_ms());
+        let now = crate::js_now_ms();
+        self.cold.tick(now);
         self.pump_cold();
+        if let Some(p) = self.page.as_mut() {
+            p.tick(page::Ms(now));
+        }
+        self.pump_page();
     }
 
     /// Every cold GET's timeout, re-fetch and answer since this was last
@@ -1009,6 +1089,10 @@ impl Session {
     /// already-provisioned node never calls this and never sends a byte of
     /// contract code.
     pub fn provision(&mut self, delegate: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
+        if self.page_mode {
+            self.provision_page(block, register);
+            return;
+        }
         // Cold reads are ON by default (the owner: default on once the live
         // ×20 is green), and the Block code is what names a GET. A builder
         // who chose already keeps that choice.
@@ -1022,13 +1106,62 @@ impl Session {
         });
     }
 
+    /// PAGE MODE's provisioning: a TEST key minted here and FORGOTTEN (as the
+    /// delegate path's; real keys are sdk#14), the head Register named by it,
+    /// and the SIGNER registered and provisioned — all through `page-io`. The
+    /// page's own cold reads are OFF here: the in-page engine fetches blocks
+    /// itself, through `page-io`, on the RTO estimator and the window.
+    fn provision_page(&mut self, block: Vec<u8>, register: Vec<u8>) {
+        if self.page.is_some() {
+            return;
+        }
+        let mut seed = [0u8; 32];
+        if getrandom::getrandom(&mut seed).is_err() {
+            self.unusable.push("no randomness to mint a key".into());
+            return;
+        }
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let vk = sk.verifying_key().to_bytes();
+        let (container, signer) = wire::delegate_from_code(&self.signer_code);
+        let art = page_io::Artefacts {
+            block_code: block,
+            register_code: register,
+            register_params: wire::register_params(&vk, wire::HEAD_NAME),
+            signer,
+        };
+        let server = page::server::Server::new(
+            page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
+            page::server::SignerFacts::default(),
+        );
+        let mut io = page_io::PageIo::new(server, art);
+        io.provision(container, sk.to_bytes().to_vec());
+        self.cold_chosen = true;
+        self.switch_cold(false, Vec::new());
+        self.page = Some(io);
+        self.pump_page();
+        self.envelope_engine_requests();
+    }
+
     /// Has provisioning finished — because the DELEGATE said so?
     ///
     /// Not "every step was sent": an unprovisioned delegate answers
     /// `Identity` exactly like a healthy empty one while dropping every head
     /// it is given, so the only honest answer comes from asking it.
     pub fn provisioned(&self) -> bool {
+        if self.page_mode {
+            return self.page.as_ref().is_some_and(|p| p.provisioned());
+        }
         self.plan.provisioned()
+    }
+
+    /// PAGE MODE on or off, with the SIGNER delegate's wasm (ruling B). Called
+    /// BEFORE `provision`; default OFF until the switch-over. On: `provision`
+    /// provisions the signer instead of installing the engine delegate, the
+    /// engine runs in the page, and every node operation goes through
+    /// `page-io` — no other path to the node.
+    pub fn set_page_mode(&mut self, on: bool, signer_code: Vec<u8>) {
+        self.page_mode = on;
+        self.signer_code = signer_code;
     }
 
     /// Everything was sent, accepted, and the delegate still cannot write a
@@ -1417,6 +1550,10 @@ impl Session {
         let cold = &self.cold;
         self.loads.time_out_except(now, |id| cold.holds(id));
         self.cold.tick(now);
+        if let Some(p) = self.page.as_mut() {
+            p.tick(page::Ms(now));
+        }
+        self.pump_page();
         self.pump_cold();
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),

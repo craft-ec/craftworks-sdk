@@ -70,7 +70,17 @@ pub struct PageIo {
     out: Vec<Vec<u8>>,
     replies: Vec<Vec<u8>>,
     unusable: Vec<String>,
+    /// The signer answered `Provisioned`: it holds the key and the naming.
+    provisioned: bool,
+    /// The Register is named by a key THIS page minted (`provision`), so it
+    /// cannot exist on the network yet: a failed read of it is certainly
+    /// "no head" — the only case where it may be (sdk#175).
+    register_new: bool,
 }
+
+/// The id a provisioning request goes out under: far from the executor's own
+/// sign ids (from 1) and from the `Held` ids (from 2³¹).
+const PROVISION_ID: u32 = (1 << 31) - 1;
 
 impl PageIo {
     pub fn new(server: Server, art: Artefacts) -> PageIo {
@@ -98,7 +108,41 @@ impl PageIo {
             out: Vec::new(),
             replies: Vec::new(),
             unusable: Vec::new(),
+            provisioned: false,
+            register_new: false,
         }
+    }
+
+    /// PROVISION the signer: register its delegate (from its wasm) and hand it
+    /// the head's key, the Register it signs for and the Block code. The key
+    /// is the page's TEST key, minted by the caller and forgotten after this
+    /// (real device keys are sdk#14). `provisioned()` turns true when the
+    /// signer answers `Provisioned`.
+    pub fn provision(&mut self, signer: DelegateContainer, signing_key: Vec<u8>) {
+        self.register_new = true;
+        let stream = self.next_stream();
+        match wire::frame_register_delegate(signer, stream) {
+            Ok(f) => self.out.extend(f),
+            Err(e) => self.unusable.push(format!("could not frame the signer's registration: {e}")),
+        }
+        let stream = self.next_stream();
+        match wire::signer::frame_provision(
+            &self.art.signer,
+            PROVISION_ID,
+            signing_key,
+            self.art.register_code.clone(),
+            self.art.register_params.clone(),
+            self.art.block_code.clone(),
+            stream,
+        ) {
+            Ok(f) => self.out.extend(f),
+            Err(e) => self.unusable.push(format!("could not frame the signer's provisioning: {e}")),
+        }
+    }
+
+    /// The signer said it holds the key and the naming.
+    pub fn provisioned(&self) -> bool {
+        self.provisioned
     }
 
     /// The head Register's instance id (what `Identity` reports as `head_id`).
@@ -135,7 +179,15 @@ impl PageIo {
             }
             Incoming::GetFailed { id } => {
                 if id == self.register_id {
-                    self.server.node(Answer::Head(None), now);
+                    // A failed read of the head is SILENCE, re-asked on its RTO
+                    // and reported "not answering" at its budget — never "no
+                    // head": that would open an EMPTY tree over a register
+                    // that is merely unreachable (sdk#175). The one exception
+                    // is a register this page just named with a key it minted,
+                    // which cannot exist yet.
+                    if self.register_new && !self.register_seen {
+                        self.server.node(Answer::Head(None), now);
+                    }
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
                     self.server.node(Answer::GetMissed(cid), now);
                 }
@@ -151,6 +203,13 @@ impl PageIo {
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
                     match wire::signer::read_answer(&m) {
+                        Some((_, signer_proto::Answer::Provisioned)) => {
+                            self.provisioned = true;
+                            self.signer_provisioned();
+                        }
+                        Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
+                            self.unusable.push(format!("the signer refused provisioning: {why:?}"));
+                        }
                         Some((id, signer_proto::Answer::Held { present })) => {
                             let asked = self.held.remove(&id).unwrap_or_default();
                             for (cid, p) in asked.into_iter().zip(present) {
