@@ -635,15 +635,18 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                     a.todo.push(w);
                 }
             }
-            // NO WRITE IS STALLED INSIDE ITS BUDGET: the engine says Stalled
+            // NO WRITE IS STALLED BEFORE ITS BUDGET: the engine says Stalled
             // after `max_accept_age` (64) SECONDS unconfirmed. A page clock
             // passed through in ms (#215's defect) told writes Stalled after
             // 64 ms — the model now sees that, not only the unit test.
+            // The engine's clock is WHOLE seconds (`engine_seconds` floors),
+            // so 64 of its seconds can be just over 63 real ones: seed 10's
+            // fork run is told Stalled at 63 815 ms, inside the budget.
             State::Stalled => {
                 let since = a.submitted.get(&wid.0).copied().unwrap_or(0);
                 let age = now.saturating_sub(since);
-                if age < 64_000 {
-                    return Err(format!("page {i}: write {} told Stalled {age} ms after it was submitted (budget 64 s)", wid.0));
+                if age <= 63_000 {
+                    return Err(format!("page {i}: write {} told Stalled {age} ms after it was submitted (budget 64 engine seconds, over 63 s)", wid.0));
                 }
             }
             _ => {}
