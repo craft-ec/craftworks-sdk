@@ -4,14 +4,26 @@
 //! freenet-stdlib's guest side, and the client-API boundary gate keeps freenet-stdlib out of the SDK core. This is
 //! serde and bincode, nothing else.
 //!
-//! Every message starts with [`MAGIC`], `SG01`: a node's delegate reply does not say WHICH delegate sent it once
+//! Every message starts with [`MAGIC`], `SG02`: a node's delegate reply does not say WHICH delegate sent it once
 //! `wire::unframe` has classified it, so the page tells a signer answer from an engine reply by its first four bytes.
-//! The `01` is the version; a different one is not read.
+//! The `02` is the version; a different one is not read.
+//!
+//! # Every answer names its request (SG02)
+//!
+//! After the magic comes the request's `id` (u32), and the signer ECHOES it on the answer. An answer's variant does
+//! not say which request it answers: `Held{present}` names no contract, `Refused(NotProvisioned)` answers a sign or a
+//! put, `Refused(BlockCount)` a put or a held. With two requests in flight only the id attributes an answer -- a pacing
+//! rule (one request of each kind at a time) would stand in for an identity. The page's ids are its own; `0` is
+//! [`UNATTRIBUTED`], never a page's: the answer to a request whose id could not be read, and the `Put` answers, which
+//! arrive after the request that caused them and name their contract instead.
 
 use serde::{Deserialize, Serialize};
 
-/// `SG01`: the signer's messages, version 1.
-pub const MAGIC: [u8; 4] = *b"SG01";
+/// `SG02`: the signer's messages, version 2 (an echoed request id).
+pub const MAGIC: [u8; 4] = *b"SG02";
+
+/// The id no page request carries: an answer that cannot be attributed to one (see the crate docs).
+pub const UNATTRIBUTED: u32 = 0;
 
 /// Most blocks one `PutBlocks` may carry: one return's worth of PUTs (the node's per-return limit, schedule.rs).
 pub const MAX_PUT_BLOCKS: usize = 128;
@@ -151,19 +163,29 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8], limit: u64) -> Option<T> {
         .ok()
 }
 
-pub fn encode_request(r: &Request) -> Vec<u8> {
-    encode(r)
+/// Request `id` (a page's own, never [`UNATTRIBUTED`]); the answer carries it back.
+pub fn encode_request(id: u32, r: &Request) -> Vec<u8> {
+    encode(&(id, r))
 }
-pub fn encode_answer(a: &Answer) -> Vec<u8> {
-    encode(a)
+/// An answer to request `id`.
+pub fn encode_answer(id: u32, a: &Answer) -> Vec<u8> {
+    encode(&(id, a))
 }
-/// `None` for anything that is not a signer request of this version, or does not decode EXACTLY.
-pub fn decode_request(bytes: &[u8]) -> Option<Request> {
+/// `(id, request)`; `None` for anything that is not a signer request of this version, or does not decode EXACTLY.
+pub fn decode_request(bytes: &[u8]) -> Option<(u32, Request)> {
     decode(bytes, 8 * 1024 * 1024)
 }
-/// `None` for anything that is not a signer answer of this version -- an engine reply included -- or does not decode
+/// The id of a request that does not decode, so its `Unreadable` still names it: the four bytes after the magic,
+/// [`UNATTRIBUTED`] when there are not four, or no magic.
+pub fn request_id(bytes: &[u8]) -> u32 {
+    match bytes.strip_prefix(&MAGIC).and_then(|r| r.get(..4)) {
+        Some(id) => u32::from_le_bytes([id[0], id[1], id[2], id[3]]),
+        None => UNATTRIBUTED,
+    }
+}
+/// `(id, answer)`; `None` for anything that is not a signer answer of this version -- an engine reply included -- or does not decode
 /// EXACTLY.
-pub fn decode_answer(bytes: &[u8]) -> Option<Answer> {
+pub fn decode_answer(bytes: &[u8]) -> Option<(u32, Answer)> {
     decode(bytes, 1024 * 1024)
 }
 
@@ -198,34 +220,38 @@ mod tests {
                 contracts: vec![[6; 32], [7; 32]],
             },
         ];
-        for r in reqs {
-            let b = encode_request(&r);
-            assert_eq!(&b[..4], b"SG01");
-            assert_eq!(decode_request(&b), Some(r));
+        for (id, r) in (1..).zip(reqs) {
+            let b = encode_request(id, &r);
+            assert_eq!(&b[..4], b"SG02");
+            assert_eq!(request_id(&b), id);
+            assert_eq!(decode_request(&b), Some((id, r)));
         }
         let a = Answer::Put {
             contract: [5; 32],
             ok: false,
             note: "no".into(),
         };
-        assert_eq!(decode_answer(&encode_answer(&a)), Some(a));
+        assert_eq!(decode_answer(&encode_answer(7, &a)), Some((7, a)));
         let h = Answer::Held {
             present: vec![true, false],
         };
-        assert_eq!(decode_answer(&encode_answer(&h)), Some(h));
+        assert_eq!(
+            decode_answer(&encode_answer(u32::MAX, &h)),
+            Some((u32::MAX, h))
+        );
     }
 
     #[test]
     fn what_is_not_a_signer_message_is_not_read() {
-        let good = encode_answer(&Answer::Provisioned);
+        let good = encode_answer(3, &Answer::Provisioned);
         assert_eq!(
             decode_answer(&good[1..]),
             None,
             "a message without its magic was read"
         );
         let mut v2 = good.clone();
-        v2[3] = b'2';
-        assert_eq!(decode_answer(&v2), None, "another version was read");
+        v2[3] = b'1';
+        assert_eq!(decode_answer(&v2), None, "version 1 was read as version 2");
         let mut trailing = good.clone();
         trailing.push(0);
         assert_eq!(
@@ -234,6 +260,17 @@ mod tests {
             "trailing bytes were accepted"
         );
         assert_eq!(decode_answer(&[]), None);
+        assert_eq!(
+            request_id(b"SG02\x05\x00"),
+            UNATTRIBUTED,
+            "a short id was read"
+        );
+        assert_eq!(
+            request_id(b"SG01\x05\x00\x00\x00"),
+            UNATTRIBUTED,
+            "another version's id was read"
+        );
+        assert_eq!(request_id(b"SG02\x05\x00\x00\x00garbage"), 5);
         assert_eq!(
             decode_answer(&[0x04, 0, 0, 0, 1]),
             None,

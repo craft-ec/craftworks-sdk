@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 
 // The wire types live in `signer-proto`, so the page can speak them without linking this delegate.
 pub use signer_proto::{
-    decode_answer, decode_request, encode_answer, encode_request, Answer, Head, Next, Request, Why,
-    MAGIC, MAX_PUT_BLOCKS,
+    decode_answer, decode_request, encode_answer, encode_request, request_id, Answer, Head, Next,
+    Request, Why, MAGIC, MAX_PUT_BLOCKS, UNATTRIBUTED,
 };
 
 /// THE ONE RECORD the signer keeps: the last thing it signed, from which prev, and the exact bytes returned.
@@ -143,31 +143,45 @@ pub fn register_id(code: &[u8], params: &[u8]) -> [u8; 32] {
     out
 }
 
+/// `(block id, state)` pairs to PUT under the Block contract, in order.
+pub type Puts = Vec<([u8; 32], Vec<u8>)>;
+
 /// One request, served, and what the entry must PUT for it (only `PutBlocks` puts anything).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Served {
+    /// The request's id, echoed on the answer (SG02): what attributes it with several requests in flight.
+    pub id: u32,
     pub answer: Answer,
     /// `(block id, state)` to PUT under the Block contract, in order; the entry builds each contract from the code in
     /// its secret store and answers every `PutContractResponse` with `Answer::Put`.
-    pub puts: Vec<([u8; 32], Vec<u8>)>,
+    pub puts: Puts,
 }
 
-/// One request, answered: `serve_full` without the puts. What every non-`PutBlocks` request needs.
+/// One request, answered: `serve_full` without the puts or the id. What every non-`PutBlocks` request needs.
 pub fn serve<H: Host>(host: &mut H, request: &[u8]) -> Answer {
     serve_full(host, request).answer
+}
+
+/// The bytes the entry sends back for a served request: its answer, under ITS id.
+pub fn reply(served: &Served) -> Vec<u8> {
+    encode_answer(served.id, &served.answer)
 }
 
 /// One request, served: gather the facts, decide, and -- on `Sign` -- sign, save the record, reply; on `PutBlocks`
 /// name each block's contract and hand the entry the PUTs.
 pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
-    let Some(req) = decode_request(request) else {
+    let Some((id, req)) = decode_request(request) else {
         return Served {
+            id: request_id(request),
             answer: Answer::Refused(Why::Unreadable),
             puts: Vec::new(),
         };
     };
     let answer = match req {
-        Request::PutBlocks { states } => return put_blocks(host, states),
+        Request::PutBlocks { states } => {
+            let (answer, puts) = put_blocks(host, states);
+            return Served { id, answer, puts };
+        }
         Request::Held { contracts } => held(host, &contracts),
         Request::Provision {
             signing_key,
@@ -184,6 +198,7 @@ pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
         Request::Sign { prev, next } => sign(host, prev, next),
     };
     Served {
+        id,
         answer,
         puts: Vec::new(),
     }
@@ -247,11 +262,8 @@ fn held<H: Host>(host: &H, contracts: &[[u8; 32]]) -> Answer {
 ///
 /// Stated limit (F35, measured): in LOCAL mode the node DROPS a delegate-originated PUT, so this verb is for a network
 /// node -- the page on its OWN node PUTs directly (the code is a local copy there).
-fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> Served {
-    let refuse = |w: Why| Served {
-        answer: Answer::Refused(w),
-        puts: Vec::new(),
-    };
+fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> (Answer, Puts) {
+    let refuse = |w: Why| (Answer::Refused(w), Vec::new());
     let Some(code) = host.get_secret(BLOCK_CODE) else {
         return refuse(Why::NotProvisioned);
     };
@@ -271,10 +283,7 @@ fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> Served {
         contracts.push(engine_delegate::blocks::contract_for(&code, &id));
         puts.push((id, st));
     }
-    Served {
-        answer: Answer::Putting { contracts },
-        puts,
-    }
+    (Answer::Putting { contracts }, puts)
 }
 
 fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {

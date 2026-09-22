@@ -55,7 +55,12 @@ async fn register_delegate(c: &mut WebApi, wasm: &[u8]) -> Result<DelegateKey> {
     Ok(key)
 }
 
-async fn send_signer(c: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<()> {
+/// Every signer request of this run gets its own id (SG02), from 1: `0` is UNATTRIBUTED.
+static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Send `r` under a fresh id, and return the id its answer will carry.
+async fn send_signer(c: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<u32> {
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     timeout(
         STEP,
         c.send(ClientRequest::DelegateOp(
@@ -63,25 +68,29 @@ async fn send_signer(c: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<(
                 key: key.clone(),
                 params: vec![].into(),
                 inbound: vec![InboundDelegateMsg::ApplicationMessage(
-                    ApplicationMessage::new(signer::encode_request(r)),
+                    ApplicationMessage::new(signer::encode_request(id, r)),
                 )],
             },
         )),
     )
     .await
     .map_err(|_| anyhow::anyhow!("send blocked"))??;
-    Ok(())
+    Ok(id)
 }
 
-async fn answer(c: &mut WebApi) -> Result<Answer> {
+/// The answer to request `id`, attributed by its id alone. Answers under any other id -- a `Put` (UNATTRIBUTED), or
+/// another request's -- are counted into `others`, never taken for this one.
+async fn answer_to(c: &mut WebApi, id: u32, others: &mut Vec<(u32, Answer)>) -> Result<Answer> {
     let end = tokio::time::Instant::now() + STEP;
     while tokio::time::Instant::now() < end {
         match timeout(Duration::from_millis(500), c.recv()).await {
             Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
                 for v in values {
                     if let OutboundDelegateMsg::ApplicationMessage(m) = v {
-                        if let Some(a) = signer::decode_answer(&m.payload) {
-                            return Ok(a);
+                        match signer::decode_answer(&m.payload) {
+                            Some((got, a)) if got == id => return Ok(a),
+                            Some(other) => others.push(other),
+                            None => {}
                         }
                     }
                 }
@@ -91,12 +100,18 @@ async fn answer(c: &mut WebApi) -> Result<Answer> {
             Err(_) => {}
         }
     }
-    bail!("no answer from the signer within {STEP:?}")
+    bail!("no answer to signer request {id} within {STEP:?}")
 }
 
+/// Ask, and take the answer to THIS request; an answer to any other is a finding, not this one's.
 async fn ask(c: &mut WebApi, key: &DelegateKey, r: &Request) -> Result<Answer> {
-    send_signer(c, key, r).await?;
-    answer(c).await
+    let id = send_signer(c, key, r).await?;
+    let mut others = Vec::new();
+    let a = answer_to(c, id, &mut others).await?;
+    if others.iter().any(|(i, _)| *i != signer::UNATTRIBUTED) {
+        bail!("answers to requests not in flight arrived before request {id}'s: {others:?}");
+    }
+    Ok(a)
 }
 
 fn container(code: &[u8], params: &[u8]) -> ContractContainer {
@@ -159,7 +174,7 @@ async fn held_once(
     contracts: &[[u8; 32]],
     puts: &mut usize,
 ) -> Result<Vec<bool>> {
-    send_signer(
+    let id = send_signer(
         c,
         key,
         &Request::Held {
@@ -167,12 +182,17 @@ async fn held_once(
         },
     )
     .await?;
-    loop {
-        match answer(c).await? {
-            Answer::Held { present } => return Ok(present),
-            Answer::Put { .. } => *puts += 1,
-            other => bail!("Held answered {other:?}"),
+    let mut others = Vec::new();
+    let a = answer_to(c, id, &mut others).await?;
+    for (i, o) in others {
+        match o {
+            Answer::Put { .. } if i == signer::UNATTRIBUTED => *puts += 1,
+            other => bail!("request {id} (Held) heard an answer to request {i}: {other:?}"),
         }
+    }
+    match a {
+        Answer::Held { present } => Ok(present),
+        other => bail!("Held answered {other:?}"),
     }
 }
 
@@ -272,7 +292,7 @@ async fn drain(c: &mut WebApi, window: Duration) -> Vec<Answer> {
         {
             for v in values {
                 if let OutboundDelegateMsg::ApplicationMessage(m) = v {
-                    if let Some(a) = signer::decode_answer(&m.payload) {
+                    if let Some((_, a)) = signer::decode_answer(&m.payload) {
                         got.push(a);
                     }
                 }
@@ -421,9 +441,13 @@ async fn main() -> Result<()> {
             ledger: vec![],
         },
     };
-    send_signer(&mut c1, &key, &ra).await?;
-    send_signer(&mut c2, &key, &rb).await?;
-    let (x, y) = tokio::join!(answer(&mut c1), answer(&mut c2));
+    let ia = send_signer(&mut c1, &key, &ra).await?;
+    let ib = send_signer(&mut c2, &key, &rb).await?;
+    let (mut oa, mut ob) = (Vec::new(), Vec::new());
+    let (x, y) = tokio::join!(
+        answer_to(&mut c1, ia, &mut oa),
+        answer_to(&mut c2, ib, &mut ob)
+    );
     let (x, y) = (x?, y?);
     let kinds = |a: &Answer| match a {
         Answer::Signed(_) => "Signed",

@@ -17,10 +17,8 @@ impl crate::Host for Ctx<'_> {
     }
 }
 
-fn reply(a: &crate::Answer) -> OutboundDelegateMsg {
-    OutboundDelegateMsg::ApplicationMessage(
-        ApplicationMessage::new(crate::encode_answer(a)).processed(true),
-    )
+fn message(bytes: Vec<u8>) -> OutboundDelegateMsg {
+    OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(bytes).processed(true))
 }
 
 pub struct Signer;
@@ -36,7 +34,7 @@ impl DelegateInterface for Signer {
         match inbound {
             InboundDelegateMsg::ApplicationMessage(m) => {
                 let served = crate::serve_full(&mut Ctx(ctx), &m.payload);
-                let mut out = vec![reply(&served.answer)];
+                let mut out = vec![message(crate::reply(&served))];
                 if !served.puts.is_empty() {
                     // `serve_full` checked the code is provisioned before it named a single contract.
                     let code = ctx.get_secret(crate::BLOCK_CODE).unwrap_or_default();
@@ -56,7 +54,8 @@ impl DelegateInterface for Signer {
                 }
                 Ok(out)
             }
-            // The node's answer to one of PUT-WITH-CODE's PUTs, relayed as it comes: nothing is remembered.
+            // The node's answer to one of PUT-WITH-CODE's PUTs, relayed as it comes: nothing is remembered, so it
+            // cannot name the request that caused it -- it is UNATTRIBUTED and names its contract instead.
             InboundDelegateMsg::PutContractResponse(r) => {
                 let mut contract = [0u8; 32];
                 contract.copy_from_slice(&r.contract_id.as_bytes()[..32]);
@@ -64,7 +63,10 @@ impl DelegateInterface for Signer {
                     Ok(_) => (true, String::new()),
                     Err(e) => (false, e.chars().take(200).collect()),
                 };
-                Ok(vec![reply(&crate::Answer::Put { contract, ok, note })])
+                Ok(vec![message(crate::encode_answer(
+                    crate::UNATTRIBUTED,
+                    &crate::Answer::Put { contract, ok, note },
+                ))])
             }
             // The signer issues no GET, UPDATE or SUBSCRIBE, so nothing else can answer it.
             _ => Ok(Vec::new()),
