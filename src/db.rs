@@ -479,6 +479,16 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// The domain whose WHOLE range is exactly `[lo, hi)`, if any — the
     /// inverse of [`Db::domain_range`], kept beside it so the layout is
     /// still known in one place. A narrower or wider span names no domain.
+    /// The domain a RECORD key is in, or `None` for any other key (a schema,
+    /// an index entry).
+    pub fn domain_of_key(key: &[u8]) -> Option<String> {
+        let rest = key.strip_prefix(&[T_RECORD])?;
+        let z = rest.iter().position(|b| *b == 0)?;
+        let domain = std::str::from_utf8(&rest[..z]).ok()?;
+        check_domain(domain).ok()?;
+        Some(domain.to_string())
+    }
+
     pub fn domain_of_range(lo: &[u8], hi: &[u8]) -> Option<String> {
         let name = lo.strip_prefix(&[T_RECORD])?.strip_suffix(&[0])?;
         let domain = std::str::from_utf8(name).ok()?;

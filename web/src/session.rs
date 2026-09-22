@@ -476,6 +476,26 @@ impl Session {
     /// The head moving is a HINT. A missed notification costs nothing — the
     /// tick re-reads the root regardless — and a spurious one costs a reload.
     /// What it is NOT is a root: nothing here goes into the copy.
+    /// The domains where one of THIS client's own writes changed state
+    /// (published, parity-complete, lost, failed, conflict, superseded) since
+    /// this was last asked, as JSON. Drains. Every binding of this client on
+    /// them re-reads, LIVE or not: its own write's state reaching it is the
+    /// same rule as its own write reaching it, and it costs no network
+    /// (builder#107). LIVE governs only OTHER writers' changes
+    /// ([`Session::take_stale`]).
+    pub fn take_state_changed(&mut self) -> String {
+        let mut domains: Vec<String> = self
+            .db
+            .store_mut()
+            .take_state_changed()
+            .iter()
+            .filter_map(|k| craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_of_key(k))
+            .collect();
+        domains.sort();
+        domains.dedup();
+        serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into())
+    }
+
     pub fn take_stale(&mut self) -> String {
         if std::mem::take(&mut self.head_moved) {
             // The head moved, so every bound domain is worth ASKING about.

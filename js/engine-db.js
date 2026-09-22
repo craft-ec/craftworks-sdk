@@ -129,7 +129,7 @@ export function engineDb(handle) {
   };
 
   // Woken by the page, on the task that handled the message.
-  handle.onReadsWake?.(() => { drain(); reloadStale(); });
+  handle.onReadsWake?.(() => { drain(); reloadStale(); reloadOwnStates(); });
 
   // Bindings this app is showing, by domain, so a head move can re-run them.
   const bound = new Map();   // domain -> Set<callback>
@@ -167,6 +167,20 @@ export function engineDb(handle) {
     let changed;
     try { changed = JSON.parse(session.take_stale()); } catch (_) { return; }
     for (const domain of changed) for (const cb of bound.get(domain) ?? []) cb();
+  };
+
+  /**
+   * This client's OWN writes changed state (published, backed up, lost,
+   * conflicted, superseded): re-run every binding of this client on those
+   * domains, LIVE or not. Without it a plain binding showed "saving" until
+   * something else re-rendered it (builder#107): its own write's state is
+   * local knowledge about its own write, not a subscription, and costs no
+   * network. LIVE still governs only somebody ELSE'S changes.
+   */
+  const reloadOwnStates = () => {
+    let changed;
+    try { changed = JSON.parse(session.take_state_changed()); } catch (_) { return; }
+    for (const domain of changed) for (const r of mine.get(domain) ?? []) r();
   };
 
   /** Wait for the load this read is parked on. */
@@ -547,7 +561,7 @@ export function engineDb(handle) {
     // each tick. It is how a parked read learns its load is done, and how a
     // stale binding learns the head moved. Without it every read that missed
     // the cache waits for ever.
-    drain: () => { drain(); reloadStale(); },
+    drain: () => { drain(); reloadStale(); reloadOwnStates(); },
 
     // The tree's root, or "" when this client cannot state one. EMPTY is not
     // a zero root: a zero root reads as a real, empty database.
