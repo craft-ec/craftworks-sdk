@@ -498,3 +498,159 @@ fn a_put_refusal_goes_to_whoever_owns_the_contract_it_names() {
     assert!(io.take_others().is_empty(), "the page's own register refusal was handed to the app");
     assert_eq!(io.unusable(), ["the node refused: invalid put".to_string()]);
 }
+
+fn reader(node: &WireNode) -> PageIo {
+    PageIo::reader(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        BLOCK_CODE.to_vec(),
+        node.register_id,
+        1,
+    )
+}
+
+fn rows(io: &mut PageIo, node: &mut WireNode, now: &mut u64, req_id: u64) -> Vec<usize> {
+    let range = Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client(io, node, now, &range);
+    r.iter().filter_map(|x| if let Reply::Page { req_id: q, entries, .. } = x { (*q == req_id).then_some(entries.len()) } else { None }).collect()
+}
+
+/// A PUBLISHED HEAD READ BY A VISITOR (sdk#239): a reader of the named
+/// register sees the publisher's rows, says the head is NOT writable, and —
+/// the addition main asked for — leaves NO trace on the node it reads from:
+/// no delegate registered, no signer message, no PUT, no UPDATE. Only reads.
+#[test]
+fn a_reader_of_a_named_head_sees_the_rows_and_leaves_no_trace_on_the_node() {
+    let mut node = WireNode::new(&[9u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["x", "y", "z"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    let before = node.served.clone();
+
+    let mut v = reader(&node);
+    assert!(v.read_only() && v.provisioned(), "a reader must be ready with nothing to provision");
+    let id = client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert!(id.iter().any(|r| matches!(r, Reply::Identity { head_writable: false, head_id, .. } if *head_id == node.register_id)), "{id:?}");
+    assert_eq!(rows(&mut v, &mut node, &mut now, 11), vec![3], "the visitor did not see the publisher's rows");
+
+    // What the VISITOR made the node do: reads, and nothing else.
+    let visitor: BTreeMap<&str, usize> = node.served.iter().map(|(k, n)| (*k, n - before.get(k).copied().unwrap_or(0))).filter(|(_, n)| *n > 0).collect();
+    for k in visitor.keys() {
+        assert!(["get register", "get block"].contains(k), "the visitor made the node serve a {k}: {visitor:?}");
+    }
+    assert!(visitor.contains_key("get register"), "THE CONTROL: the count saw the visitor at all: {visitor:?}");
+
+    // The publisher writes again; the reader, reading again, sees it.
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(4, "w", "v")), 4).contains(&WriteState::Published));
+    v.server.head_hint();
+    let _ = settle(&mut v, &mut node, &mut now);
+    assert_eq!(rows(&mut v, &mut node, &mut now, 12), vec![4], "the visitor never saw the publisher's next row");
+    assert!(v.unusable().is_empty(), "{:?}", v.unusable());
+}
+
+/// The SAFETY NET: a write sent to a reader anyway is never framed — no block
+/// PUT, no signer request, no head update reaches the node — and never
+/// reported Published. (The UI never offers one: the runtime renders a view.)
+#[test]
+fn a_write_to_a_reader_reaches_nothing_and_never_publishes() {
+    let mut node = WireNode::new(&[10u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "x", "v")), 1).contains(&WriteState::Published));
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let before = node.served.clone();
+    let head = node.head();
+    let r = client(&mut v, &mut node, &mut now, &write(2, "intruder", "v"));
+    assert!(!states(&r, 2).contains(&WriteState::Published), "a reader's write was reported Published: {r:?}");
+    for k in ["put block", "put register", "update", "signer", "register delegate"] {
+        assert_eq!(node.served.get(k), before.get(k), "a reader's write made the node serve a {k}");
+    }
+    assert_eq!(node.head(), head, "a reader's write moved the publisher's head");
+    // And provisioning a reader is refused, not sent.
+    let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+    v.provision(container, vec![0u8; 32]);
+    assert!(v.take_frames().is_empty(), "a reader framed a provisioning");
+    assert!(v.unusable().iter().any(|u| u.contains("read-only")), "{:?}", v.unusable());
+}
+
+/// A failed read of a NAMED head is silence, re-asked — never an empty view,
+/// and the reader asks no signer (it has none).
+#[test]
+fn a_readers_failed_head_read_is_silence_never_an_empty_view() {
+    let mut node = WireNode::new(&[11u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "x", "v")), 1).contains(&WriteState::Published));
+    node.fail_register_gets = 3;
+    let signer_before = node.served.get("signer").copied();
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert_eq!(rows(&mut v, &mut node, &mut now, 13), vec![1], "a failed named-head read opened an empty view");
+    assert_eq!(node.fail_register_gets, 0, "the failing reads were never asked again");
+    assert_eq!(node.served.get("signer").copied(), signer_before, "a reader asked a signer");
+}
+
+/// The answers to request `req_id`, as Debug text — what a client would see.
+fn answers_to(r: &[Reply], req_id: u64) -> Vec<String> {
+    r.iter()
+        .filter(|x| match x {
+            Reply::Page { req_id: q, .. } | Reply::Unavailable { req_id: q, .. } => *q == req_id,
+            _ => false,
+        })
+        .map(|x| format!("{x:?}"))
+        .collect()
+}
+
+/// ONE READ PATH (the owner's rule on sdk#239): the SAME tree read through
+/// the person's OWN page and through a READER gives the same rows — and,
+/// with its blocks corrupted on the node, the same refusal. A reader is the
+/// same `PageIo`, `Server` and engine with writing switched off, so any
+/// difference here is a second read path.
+#[test]
+fn the_own_page_and_a_reader_read_the_same_tree_identically_intact_and_corrupted() {
+    let mut node = WireNode::new(&[12u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(n as u64 + 1, k, &format!("value-{n}"))), n as u64 + 1).contains(&WriteState::Published));
+    }
+    let range = |req_id| Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+
+    // INTACT: a fresh own page (reopened, same key) and a reader.
+    let mut own = page_io(&node);
+    client(&mut own, &mut node, &mut now, &Request::Identity);
+    let mine = answers_to(&client(&mut own, &mut node, &mut now, &range(21)), 21);
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let theirs = answers_to(&client(&mut v, &mut node, &mut now, &range(21)), 21);
+    // Entries print as bytes: the key `alpha` and the value `value-3`.
+    let alpha = format!("{:?}", b"alpha".to_vec());
+    let value3 = format!("{:?}", b"value-3".to_vec());
+    assert!(mine.len() == 1 && mine[0].contains(&alpha) && mine[0].contains(&value3), "the own page did not read the tree: {mine:?}");
+    assert_eq!(theirs, mine, "a reader read the same tree differently from the own page");
+
+    // CORRUPTED: every block's bytes on the node changed (the head intact).
+    let reg = node.register_id;
+    for (id, st) in node.contracts.iter_mut() {
+        if *id != reg {
+            let last = st.len() - 1;
+            st[last] ^= 0x01;
+        }
+    }
+    let mut own = page_io(&node);
+    client(&mut own, &mut node, &mut now, &Request::Identity);
+    let mine = answers_to(&client(&mut own, &mut node, &mut now, &range(22)), 22);
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let theirs = answers_to(&client(&mut v, &mut node, &mut now, &range(22)), 22);
+    // REFUSED, not an empty page: a block that does not hash to its id is
+    // Unavailable (blocked on it), never read as "no rows".
+    assert!(mine.len() == 1 && mine[0].starts_with("Unavailable { req_id: 22"), "the own page did not refuse corrupted blocks: {mine:?}");
+    assert_eq!(theirs, mine, "a reader and the own page refused a corrupted tree differently");
+}

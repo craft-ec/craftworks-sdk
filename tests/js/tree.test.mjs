@@ -1,0 +1,126 @@
+// READING SOMEBODY'S TREE (sdk#239): `handle.tree(registerId)` on the
+// person's OWN session, through the real wasm `Session` and the real
+// `openSession` — only the socket is injected.
+//
+// Data is a forest: one tree per identity. A session writes its own tree and
+// reads any tree by address. Each tree is a reader Session (the same type and
+// read path, writing switched off) on the ONE socket; the socket's frames are
+// shared by ownership, bounded by memory and by F57's 500 subscriptions.
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { openSession, MAX_OPEN_TREES, MAX_TREE_SUBSCRIPTIONS } from "../../js/session.js";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const sdk = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
+const { Session, wasm_memory_bytes } = sdk;
+
+let failures = 0;
+const t = async (name, fn) => {
+  try { await fn(); process.stdout.write(`  ok  ${name}\n`); }
+  catch (e) { failures += 1; process.stdout.write(`  FAIL ${name}\n    ${e.stack ?? JSON.stringify(e)}\n`); }
+};
+const enc = s => new TextEncoder().encode(s);
+const hex = b => Buffer.from(b).toString("hex");
+const HEAD_A = "a1".repeat(32), HEAD_B = "b2".repeat(32);
+
+/** Decode frames with the stdlib; also the node's ack for an unrelated PUT. */
+function stdlib(frames = []) {
+  const r = spawnSync("cargo", ["run", "-q", "-p", "wire", "--example", "node_answers", "--",
+    hex(enc("somebody's contract")), "00", "00", "x", ...frames.map(hex)], { cwd: root, encoding: "utf8", maxBuffer: 1 << 26 });
+  assert.equal(r.status, 0, r.stderr);
+  const o = JSON.parse(r.stdout);
+  return { frames: o.frames, strangersGet: new Uint8Array(Buffer.from(o.got, "hex")) };
+}
+
+/** The person's own session, over an injected socket we can drive. */
+async function own() {
+  const sock = {};
+  const h = await openSession(Session, {
+    port: 7999,
+    artefacts: { delegate: "d", block: "b", register: "r" },
+    fetch: async url => ({ ok: true, arrayBuffer: async () => enc(`${url} code`).buffer }),
+    connect: (engine, { onEvent }) => { sock.engine = engine; sock.emit = onEvent; return { pump() {}, close() {} }; },
+    setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+    addEventListener: null, removeEventListener: null, documentOf: null,
+  });
+  // Whatever provisioning queued goes first, so what follows is the tree's.
+  sock.engine.sent(sock.engine.outbound().length);
+  return { h, sock };
+}
+const frames = sock => { const out = sock.engine.outbound(); sock.engine.sent(out.length); return stdlib(out).frames; };
+
+await t("**tree() is a read-only Db on the SAME session: every write refused, the head it names**", async () => {
+  const { h } = await own();
+  const tr = await h.tree(HEAD_A);
+  assert.equal(tr.headId(), HEAD_A);
+  for (const write of [() => tr.db.put("notes", { text: "x" }), () => tr.db.delete("notes", "00".repeat(24))]) {
+    // BOUNDED: a write that is not refused is queued and never settles, and
+    // that must fail here by name, not hang the file.
+    const bounded = () => Promise.race([write(), new Promise((_, no) => setTimeout(() => no(new Error("the write was not refused: it is waiting on the node")), 2000))]);
+    await assert.rejects(bounded, e => e.code === "REFUSED" && /^read-only: /.test(e.message));
+  }
+  assert.equal(h.readOnly(), false, "THE CONTROL: the person's own session still writes");
+});
+
+await t("**a tree installs nothing on the node: its frames on the shared socket are GETs, its head watched**", async () => {
+  const { h, sock } = await own();
+  await h.tree(HEAD_A);
+  const f = frames(sock);
+  assert.ok(f.length > 0, "THE CONTROL: the tree sent nothing, so 'only GETs' would be vacuous");
+  assert.deepEqual([...new Set(f.map(x => x.op))], ["get"], JSON.stringify(f));
+  assert.ok(f.some(x => x.subscribe), "the tree's head was not watched");
+});
+
+await t("**N trees, one socket: each opens its own head reader, and a frame nobody asked for is counted ONCE**", async () => {
+  const { h, sock } = await own();
+  await h.tree(HEAD_A);
+  await h.tree(HEAD_B);
+  const heads = frames(sock).filter(x => x.subscribe).map(x => x.key);
+  assert.equal(new Set(heads).size, 2, `two trees, ${heads.length} head reads: ${heads}`);
+  const before = JSON.parse(h.session.live_mode()).foreignNotifications;
+  sock.engine.on_inbound(stdlib().strangersGet);
+  assert.equal(JSON.parse(h.session.live_mode()).foreignNotifications, before + 1, "an unowned frame was not counted exactly once");
+});
+
+await t(`**bounded: at most ${MAX_OPEN_TREES} open trees, and ${MAX_TREE_SUBSCRIPTIONS} tree subscriptions per socket (F57) — refused by name, never dropped**`, async () => {
+  const { h, sock } = await own();
+  const open = [];
+  for (let i = 0; i < MAX_OPEN_TREES; i += 1) open.push(await h.tree(i.toString(16).padStart(64, "0")));
+  await assert.rejects(() => h.tree(HEAD_A), /trees are already open/);
+  open.pop().close();
+  const again = await h.tree(HEAD_A); // a slot freed
+  again.close();
+  for (const tr of open) tr.close();
+  // Closed trees keep their subscription (no unsubscribe) until a reconnect.
+  let opened = MAX_OPEN_TREES + 1, refused = null;
+  while (!refused) {
+    try { (await h.tree(HEAD_B)).close(); opened += 1; } catch (e) { refused = e; }
+    assert.ok(opened <= MAX_TREE_SUBSCRIPTIONS, "the subscription cap never fired");
+  }
+  assert.equal(opened, MAX_TREE_SUBSCRIPTIONS, `refused after ${opened}`);
+  assert.match(refused.message, /500 per connection, F57/);
+  sock.emit({ kind: "open" }); // a new socket: only the open trees' subscriptions remain
+  (await h.tree(HEAD_B)).close();
+});
+
+await t("THE MEASUREMENT: one open tree reader's wasm memory, before any rows", async () => {
+  // Many readers at once, so the growth is pages the allocator had to ADD,
+  // not free space it already held (16 fit in that and read as 0 B).
+  const n = 200;
+  const before = wasm_memory_bytes();
+  const readers = [];
+  for (let i = 0; i < n; i += 1) {
+    const s = new Session(7999);
+    s.open_named(enc("block code"), (i + 1).toString(16).padStart(64, "0"), (i % 255) + 1);
+    readers.push(s);
+  }
+  const grew = wasm_memory_bytes() - before;
+  process.stdout.write(`      memory: ${n} tree readers grew wasm memory by ${grew} B — ${Math.round(grew / n)} B per reader before any rows\n`);
+  assert.ok(before > 0 && grew > 0, "THE CONTROL: the measurement saw the readers at all");
+  for (const s of readers) s.free();
+});
+
+if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }

@@ -38,7 +38,7 @@ fn in_page_mode_every_path_to_the_node_is_page_io() {
     assert!(env.contains("if self.page_mode {") && env.contains(".client(&bytes)"), "the store's frames do not go to page-io:\n{env}");
     let inbound = body_of(&src, "on_inbound");
     let head = &inbound[..inbound.find("match wire::unframe").expect("the delegate path")];
-    assert!(head.contains("if self.page_mode {") && head.contains("p.inbound(bytes,") && head.contains("return;"), "node frames reach the delegate path in page mode:\n{head}");
+    assert!(head.contains("if self.page_mode {") && head.contains("p.inbound(bytes,") && head.contains("return owned;"), "node frames reach the delegate path in page mode:\n{head}");
     let prov = body_of(&src, "provision");
     assert!(prov.contains("if self.page_mode {") && prov.contains("self.provision_page(block, register);"), "provisioning does not go to the signer:\n{prov}");
     let page = body_of(&src, "provision_page");

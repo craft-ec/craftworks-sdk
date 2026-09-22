@@ -8,7 +8,7 @@
 
 import { connect } from "./connection.js";
 import { engineDb } from "./engine-db.js";
-import { allArtefactBytes } from "./artefacts.js";
+import { allArtefactBytes, artefactBytes } from "./artefacts.js";
 
 /**
  * The artefacts as `build.sh` ships them, beside this file.
@@ -125,6 +125,11 @@ export async function shippedArtefacts(
  * page then never sends a byte of contract code, and `provisioned()` still
  * answers, because the delegate is asked rather than assumed.
  */
+/** Trees one session reads at once: each is its own engine in this page. */
+export const MAX_OPEN_TREES = 32;
+/** Tree subscriptions on one socket: F57 allows 500, and the rest is headroom. */
+export const MAX_TREE_SUBSCRIPTIONS = 400;
+
 export async function openSession(Session, {
   // NO DEFAULT. Publishing installs a delegate and hands it a signing key,
   // so which node receives one is a decision, and a default makes it by
@@ -164,6 +169,32 @@ export async function openSession(Session, {
   documentOf = (typeof document === "object" ? document : null),
 } = {}) {
   const session = new Session(port);
+  // A tree reader's stream-id range, 1..=255 and never reused while open.
+  let rangeCursor = 0;
+  const nextRange = () => {
+    for (let i = 0; i < 255; i += 1) {
+      rangeCursor = (rangeCursor % 255) + 1;
+      if (![...trees].some(t => t.range === rangeCursor)) return rangeCursor;
+    }
+    throw new Error("tree(): no stream range free");
+  };
+
+  // The Block code, once fetched: a tree reader (`tree`) needs it to name
+  // the blocks it GETs, and fetches it itself when provisioning did not.
+  let blockCode = null;
+  const blockBytes = async () => {
+    if (blockCode) return blockCode;
+    const b = artefacts?.block;
+    if (!b) throw new Error("tree(): no Block code — open the session with artefacts");
+    if (typeof b === "object" && b.sha256) {
+      blockCode = await artefactBytes(b, { fetch: fetchWith });
+    } else {
+      const r = await fetchWith(b);
+      if (!r.ok) throw new Error(`could not fetch ${b}: ${r.status}`);
+      blockCode = new Uint8Array(await r.arrayBuffer());
+    }
+    return blockCode;
+  };
 
   if (artefacts) {
     // Fetched in parallel and awaited TOGETHER: a partial set is not a
@@ -193,6 +224,7 @@ export async function openSession(Session, {
         }),
       );
     }
+    blockCode = block;
     session.provision(delegate, block, register);
   }
 
@@ -232,17 +264,64 @@ export async function openSession(Session, {
     }
   };
 
-  const conn = connectWith(session, {
+  // THE TREES THIS PERSON READS (sdk#239): each is its own reader Session —
+  // the same type, the same read path, with writing switched off — sharing
+  // this ONE socket. `{ session, drain }`, in the order they were opened.
+  const trees = new Set();
+  // Subscriptions this SOCKET carries: the person's own head, plus one per
+  // tree opened since it connected. The client API has no unsubscribe
+  // (stdlib 0.10), so a closed tree's subscription is held until the socket
+  // reconnects — counted, not forgotten (F57: 500 per connection).
+  let treeSubscriptions = 0;
+
+  // THE SOCKET'S ENGINE: every session on it. Each frame out, in order —
+  // the person's own first; each frame in is offered to every session, and
+  // each takes only what it asked for (by contract id). A frame nobody took
+  // is counted once, on the person's own session. Mechanics only: which
+  // frame is whose is decided in Rust (`on_inbound`).
+  let lastBatch = [];
+  const members = () => [session, ...[...trees].map(t => t.session)];
+  const socketEngine = {
+    outbound() {
+      lastBatch = [];
+      const out = [];
+      for (const m of members()) {
+        const b = m.outbound();
+        lastBatch.push([m, b.length]);
+        out.push(...b);
+      }
+      return out;
+    },
+    sent(n) {
+      for (const [m, len] of lastBatch) {
+        const k = Math.min(n, len);
+        if (k > 0) m.sent(k);
+        n -= k;
+        if (n <= 0) break;
+      }
+    },
+    on_inbound(bytes) {
+      let owned = false;
+      for (const m of members()) owned = m.on_inbound(bytes) || owned;
+      if (!owned) session.unowned();
+    },
+  };
+
+  const conn = connectWith(socketEngine, {
     url: session.url(),
     onEvent: e => {
       // A new socket means the stream ids restart, so a half-received
       // chunked reply from the old one must not be completed with bytes
       // from this one.
-      if (e.kind === "open") session.reconnected();
+      if (e.kind === "open") {
+        session.reconnected();
+        for (const t of trees) t.session.reconnected();
+        treeSubscriptions = trees.size;
+      }
       // A message arrived and has been handed to the session: any load it
       // completed can now wake the reads parked on it. On the task that
       // handled the message, not on a timer.
-      if (e.kind === "message") { drainReads(); guard(); armCold(); }
+      if (e.kind === "message") { drainReads(); for (const t of trees) t.drain(); guard(); armCold(); }
       onEvent(e);
     },
   });
@@ -258,15 +337,19 @@ export async function openSession(Session, {
     if (coldTimer !== null) stopAfter(coldTimer);
     coldTimer = null;
     if (closed) return;
-    const due = session.cold_due_ms();
-    if (due < 0) return;
+    // The EARLIEST due across every session on the socket: a tree's reader
+    // re-asks on its RTO exactly as the person's own session does.
+    const dues = members().map(m => m.cold_due_ms()).filter(d => d >= 0);
+    if (!dues.length) return;
+    const due = Math.min(...dues);
     coldTimer = afterMs(() => {
       coldTimer = null;
       // A timer the host fired after close() (or could not cancel) does
       // nothing: the session is done.
       if (closed) return;
-      session.cold_tick();
+      for (const m of members()) m.cold_tick();
       drainReads();
+      for (const t of trees) t.drain();
       conn.pump();
       armCold();
     }, due);
@@ -290,6 +373,7 @@ export async function openSession(Session, {
     // the reads parked on it are woken with a fact rather than left hanging.
     // Nothing else exercises this path: every other route delivers a message.
     drainReads();
+    for (const t of trees) { t.session.tick(); t.drain(); }
     // A write rolled back at its timeout is no longer unsaved either.
     guard();
     // AND THE FRAME HAS TO LEAVE.
@@ -345,6 +429,50 @@ export async function openSession(Session, {
   return {
     session,
     provisioned: () => session.provisioned(),
+    // This person's own session writes; a tree handle (below) is read-only.
+    readOnly: () => session.read_only(),
+    // The head this session stands on, as `tree()` takes it (hex; "" until
+    // Identity has named it). What a publisher records so others can read it.
+    headId: () => session.head_id(),
+    /**
+     * READ SOMEBODY'S TREE (sdk#239): the data forest, one tree per identity.
+     * `registerId` is that tree's head Register (their `headId()`). Returns
+     * `{ db, headId, close }`: `db` is the same engine-backed surface as this
+     * session's own, reading through the SAME path, and refusing every write.
+     * Nothing is installed on the node; the head is watched on this socket.
+     *
+     * BOUNDED, and a refusal past either bound says which: MAX_OPEN_TREES
+     * engines at once (memory), and MAX_TREE_SUBSCRIPTIONS per socket (F57).
+     */
+    tree: async registerId => {
+      if (closed) throw new Error("tree(): this session is closed");
+      if (trees.size >= MAX_OPEN_TREES) {
+        throw new Error(`tree(): ${MAX_OPEN_TREES} trees are already open, each its own engine — close one first`);
+      }
+      if (treeSubscriptions >= MAX_TREE_SUBSCRIPTIONS) {
+        throw new Error(
+          `tree(): this connection already carries ${treeSubscriptions} tree subscriptions ` +
+          `(the node allows 500 per connection, F57, and closed ones are held until it reconnects)`);
+      }
+      const block = await blockBytes();
+      const reader = new Session(port);
+      const range = nextRange();
+      reader.open_named(block, registerId, range);
+      const t = { session: reader, drain: () => {}, range };
+      trees.add(t);
+      treeSubscriptions += 1;
+      const db = engineDb({ session: reader, onReadsWake: fn => { t.drain = fn; } });
+      conn.pump();
+      armCold();
+      return {
+        db,
+        headId: () => reader.head_id(),
+        close: () => {
+          if (!trees.delete(t)) return;
+          reader.free();
+        },
+      };
+    },
     // Everything was accepted and the delegate STILL cannot write a head.
     // A different fact from stalled and from refused, and a page says so
     // rather than spinning.

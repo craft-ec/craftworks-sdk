@@ -445,3 +445,18 @@ impl AppContainer {
         wire::webapp::app_container(&files).map_err(|e| JsError::new(&e))
     }
 }
+
+/// This page's wasm linear memory, in bytes: what a tree reader costs is
+/// MEASURED against it (`tests/js/tree.test.mjs`), and the open-tree cap is
+/// set from that measurement, not from a guess.
+#[wasm_bindgen]
+pub fn wasm_memory_bytes() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (core::arch::wasm32::memory_size(0) * 65_536) as f64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0.0
+    }
+}

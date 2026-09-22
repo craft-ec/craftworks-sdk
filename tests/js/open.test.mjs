@@ -44,7 +44,10 @@ function fakeSession({ deliverAfterMs = null } = {}) {
     url: () => "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native",
     outbound: () => [],
     sent() {},
-    on_inbound() { if (self.pendingDelivery) { loaded = true; ended.push({ id: ticket, ok: true, code: "LOADED" }); self.pendingDelivery = false; } },
+    // The real one says whether the frame was its own (sdk#239); a fake's
+    // delivery always is.
+    on_inbound() { if (self.pendingDelivery) { loaded = true; ended.push({ id: ticket, ok: true, code: "LOADED" }); self.pendingDelivery = false; } return true; },
+    unowned() {},
     reconnected() {},
     take_progress: () => "[]",
     take_loads() { const o = ended; ended = []; return JSON.stringify(o); },
