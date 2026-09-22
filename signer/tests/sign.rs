@@ -41,12 +41,15 @@ impl World {
         let mut host = Mem::default();
         let a = serve(
             &mut host,
-            &encode_request(&Request::Provision {
-                signing_key: sk.to_bytes().to_vec(),
-                register_code: RCODE.to_vec(),
-                register_params: params.clone(),
-                block_code: BCODE.to_vec(),
-            }),
+            &encode_request(
+                1,
+                &Request::Provision {
+                    signing_key: sk.to_bytes().to_vec(),
+                    register_code: RCODE.to_vec(),
+                    register_params: params.clone(),
+                    block_code: BCODE.to_vec(),
+                },
+            ),
         );
         assert_eq!(a, Answer::Provisioned);
         World { host, params }
@@ -70,10 +73,13 @@ impl World {
     fn sign(&mut self, prev: Head, next: &Next) -> Answer {
         serve(
             &mut self.host,
-            &encode_request(&Request::Sign {
-                prev,
-                next: next.clone(),
-            }),
+            &encode_request(
+                1,
+                &Request::Sign {
+                    prev,
+                    next: next.clone(),
+                },
+            ),
         )
     }
 }
@@ -313,10 +319,13 @@ fn every_refusal_is_named() {
     assert_eq!(
         serve(
             &mut bare,
-            &encode_request(&Request::Sign {
-                prev: genesis(),
-                next: next(1, 1)
-            })
+            &encode_request(
+                1,
+                &Request::Sign {
+                    prev: genesis(),
+                    next: next(1, 1)
+                }
+            )
         ),
         Answer::Refused(Why::NotProvisioned)
     );
@@ -327,7 +336,7 @@ fn every_refusal_is_named() {
         block_code: BCODE.to_vec(),
     };
     assert_eq!(
-        serve(&mut w.host, &encode_request(&other)),
+        serve(&mut w.host, &encode_request(1, &other)),
         Answer::Refused(Why::KeyAlreadyProvisioned)
     );
 }
@@ -422,7 +431,7 @@ fn the_same_key_with_another_register_is_refused() {
     };
     let same = serve(
         &mut w.host,
-        &encode_request(&again(w.params.clone(), RCODE)),
+        &encode_request(1, &again(w.params.clone(), RCODE)),
     );
     assert_eq!(
         same,
@@ -433,13 +442,13 @@ fn the_same_key_with_another_register_is_refused() {
     let last = other.len() - 1;
     other[last] ^= 1;
     assert_eq!(
-        serve(&mut w.host, &encode_request(&again(other, RCODE))),
+        serve(&mut w.host, &encode_request(1, &again(other, RCODE))),
         Answer::Refused(Why::RegisterChanged)
     );
     assert_eq!(
         serve(
             &mut w.host,
-            &encode_request(&again(w.params.clone(), b"another register code"))
+            &encode_request(1, &again(w.params.clone(), b"another register code"))
         ),
         Answer::Refused(Why::RegisterChanged)
     );
@@ -453,9 +462,12 @@ fn put_blocks_names_each_block_by_its_hash_and_hands_the_entry_the_puts() {
     let states: Vec<Vec<u8>> = (1..=3u8).map(block_state).collect();
     let served = serve_full(
         &mut w.host,
-        &encode_request(&Request::PutBlocks {
-            states: states.clone(),
-        }),
+        &encode_request(
+            1,
+            &Request::PutBlocks {
+                states: states.clone(),
+            },
+        ),
     );
     let ids: Vec<[u8; 32]> = (1..=3u8).map(block_root).collect();
     let contracts: Vec<[u8; 32]> = ids
@@ -470,7 +482,10 @@ fn put_blocks_names_each_block_by_its_hash_and_hands_the_entry_the_puts() {
 fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
     let mut w = World::new();
     let ask = |w: &mut World, states: Vec<Vec<u8>>| {
-        serve_full(&mut w.host, &encode_request(&Request::PutBlocks { states }))
+        serve_full(
+            &mut w.host,
+            &encode_request(1, &Request::PutBlocks { states }),
+        )
     };
     let none = ask(&mut w, vec![]);
     assert_eq!(
@@ -493,9 +508,12 @@ fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
     let mut bare = Mem::default();
     let r = serve_full(
         &mut bare,
-        &encode_request(&Request::PutBlocks {
-            states: vec![block_state(1)],
-        }),
+        &encode_request(
+            1,
+            &Request::PutBlocks {
+                states: vec![block_state(1)],
+            },
+        ),
     );
     assert_eq!(
         (r.answer, r.puts.len()),
@@ -514,7 +532,7 @@ fn held_says_which_contracts_this_node_holds_in_the_order_asked() {
     let ask = |host: &mut Mem, contracts: Vec<[u8; 32]>| {
         serve(
             &mut host.clone(),
-            &encode_request(&Request::Held { contracts }),
+            &encode_request(1, &Request::Held { contracts }),
         )
     };
     assert_eq!(
@@ -536,5 +554,73 @@ fn held_says_which_contracts_this_node_holds_in_the_order_asked() {
     assert_eq!(
         ask(&mut host, vec![have; 129]),
         Answer::Refused(Why::BlockCount { max: 128, got: 129 })
+    );
+}
+
+/// SG02: every answer carries ITS request's id, so answers to requests in flight together are attributed by id
+/// alone -- two `Held`s, answered out of order, each named by what it asked. An answer's variant cannot do this:
+/// `Held{present}` names no contract.
+#[test]
+fn two_requests_in_flight_are_each_answered_under_their_own_id() {
+    let mut host = Mem::default();
+    let have = engine_delegate::blocks::contract_for(BCODE, &block_root(1));
+    let lack = engine_delegate::blocks::contract_for(BCODE, &block_root(2));
+    host.states.insert(have, block_state(1));
+    let (a, b) = (7u32, 9u32);
+    let ask_a = encode_request(
+        a,
+        &Request::Held {
+            contracts: vec![have],
+        },
+    );
+    let ask_b = encode_request(
+        b,
+        &Request::Held {
+            contracts: vec![lack],
+        },
+    );
+    // Served B first, as a node may: the answers arrive in the other order from the asks.
+    let replies = [
+        reply(&serve_full(&mut host, &ask_b)),
+        reply(&serve_full(&mut host, &ask_a)),
+    ];
+    let by_id: std::collections::BTreeMap<u32, Answer> = replies
+        .iter()
+        .map(|r| wire::signer::read_answer(r).expect("a signer answer"))
+        .collect();
+    assert_eq!(by_id.len(), 2, "two answers under one id: {by_id:?}");
+    assert_eq!(
+        by_id.get(&a),
+        Some(&Answer::Held {
+            present: vec![true]
+        }),
+        "request {a}'s answer"
+    );
+    assert_eq!(
+        by_id.get(&b),
+        Some(&Answer::Held {
+            present: vec![false]
+        }),
+        "request {b}'s answer"
+    );
+    // A refusal is attributed the same way, and one that does not decode still names the id it carried.
+    let bare = reply(&serve_full(
+        &mut Mem::default(),
+        &encode_request(11, &Request::Held { contracts: vec![] }),
+    ));
+    assert_eq!(
+        wire::signer::read_answer(&bare),
+        Some((11, Answer::Refused(Why::BlockCount { max: 128, got: 0 })))
+    );
+    let mut broken = encode_request(
+        12,
+        &Request::Held {
+            contracts: vec![have],
+        },
+    );
+    broken.push(0);
+    assert_eq!(
+        wire::signer::read_answer(&reply(&serve_full(&mut host, &broken))),
+        Some((12, Answer::Refused(Why::Unreadable)))
     );
 }

@@ -171,7 +171,7 @@ impl Node {
             register_params: params.clone(),
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(&req)), signer::Answer::Provisioned);
+        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
         (n, params)
     }
 
@@ -215,13 +215,14 @@ impl Node {
 
     /// The REAL signer's answer, exactly as it encodes it and the page's
     /// `wire::signer::read_answer` decodes it.
-    fn sign(&mut self, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> signer_proto::Answer {
+    fn sign(&mut self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> (u32, signer_proto::Answer) {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger: Vec::new() },
         };
-        let answer = signer::serve(&mut Host(self), &signer::encode_request(&req));
-        wire::signer::read_answer(&signer_proto::encode_answer(&answer)).expect("a signer answer reads back")
+        // Through the BYTES both ways: the request under the page's id, the answer under the id the signer echoes.
+        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
+        wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
     }
 
     /// Every entry of the tree at `root`, or `None` if any block is missing.
@@ -398,17 +399,17 @@ fn run(seed: u64, writes_per_page: usize, path: PutPath) -> Result<Seen, String>
                         })
                     }
                 }
-                Op::Sign { prev_seq, prev_root, seq, root } => {
+                Op::Sign { id, prev_seq, prev_root, seq, root } => {
                     if s_sign.chance(faults.sign_lost) {
                         None
                     } else {
                         node.record_fails = s_rec.chance(faults.record_not_saved);
-                        let a = node.sign(prev_seq, prev_root, seq, root);
+                        let (id, a) = node.sign(id, prev_seq, prev_root, seq, root);
                         node.record_fails = false;
                         if matches!(a, signer_proto::Answer::Refused(signer_proto::Why::RecordNotSaved)) {
                             seen.record_not_saved += 1;
                         }
-                        Some(Answer::Signer(a))
+                        Some(Answer::Signer { id, answer: a })
                     }
                 }
                 Op::Update { state } => {
@@ -560,9 +561,9 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                     p.answer(Answer::PutOk(id), 0);
                 }
                 Op::ReadHead => p.answer(Answer::Head(node.head()), 0),
-                Op::Sign { prev_seq, prev_root, seq, root } => {
-                    let a = node.sign(prev_seq, prev_root, seq, root);
-                    p.answer(Answer::Signer(a), 0);
+                Op::Sign { id, prev_seq, prev_root, seq, root } => {
+                    let (id, a) = node.sign(id, prev_seq, prev_root, seq, root);
+                    p.answer(Answer::Signer { id, answer: a }, 0);
                 }
                 Op::Update { state } => {
                     node.update(&state);
