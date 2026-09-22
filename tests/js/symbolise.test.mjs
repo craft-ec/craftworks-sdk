@@ -12,12 +12,14 @@ const kept = new URL(`../../pkg/web-symbols/craftworks_sdk_bg.${hash}.wasm`, imp
 
 // 1. Stripped: the shipped module carries no name section at all.
 assert.equal(WebAssembly.Module.customSections(new WebAssembly.Module(shipped), "name").length, 0, "the shipped wasm still carries its name section");
+console.log("  ok the shipped wasm carries no name section");
 
 // 2. The names are kept, keyed by the SHIPPED bytes' hash — and only one set.
 const keptFiles = readdirSync(new URL("../../pkg/web-symbols/", import.meta.url));
 assert.deepEqual(keptFiles, [`craftworks_sdk_bg.${hash}.wasm`], `no names kept for these exact bytes: ${keptFiles}`);
 const names = functionNames(readFileSync(kept));
 assert.ok(names.size > 1000, `the kept names are too few to be a build's: ${names.size}`);
+console.log(`  ok the names are kept for these exact bytes (${names.size} functions)`);
 
 // 3. A REAL abort inside the shipped module (the build is panic = abort): an
 // allocation no layout can hold. Every import answers with a no-op, which is
@@ -36,8 +38,9 @@ try {
   trace = e.stack;
 }
 assert.ok(trace, "the impossible allocation did not trap: the test drove nothing");
+console.log("  ok a real abort inside the shipped wasm traps");
 const frames = symbolise(trace, names);
 assert.ok(frames.length > 0, `the trap's stack carries no wasm frames: ${trace}`);
 assert.ok(frames.every(f => f.name !== null), `a frame was not symbolised: ${JSON.stringify(frames)}`);
 assert.ok(frames.some(f => /malloc|alloc/.test(f.name)), `the frames do not name the allocation that aborted: ${JSON.stringify(frames)}`);
-console.log("symbolise: ok —", frames.slice(0, 3).map(f => `[${f.index}] ${f.name}`).join(" | "));
+console.log("  ok its frames are symbolised from the kept names:", frames.slice(0, 3).map(f => `[${f.index}] ${f.name}`).join(" | "));
