@@ -657,3 +657,206 @@ fn sibling_root(node: &mut Node, salt: u32) -> Cid {
     }
     panic!("the sibling page never asked to sign");
 }
+
+/// A TAB: `Db` over `CachedStore`, its frames served by this rig's
+/// `page::Server` over the scripted node, its replies fed back — the whole page
+/// path, native.
+struct Tab {
+    db: craftworks_sdk::Db<craftworks_sdk::CachedStore, TabEnv>,
+    /// Per write id, how many times it went on the wire (a `Commit` or a `Write`).
+    sends: BTreeMap<u64, usize>,
+    /// Per write id, the states it was told, in order.
+    verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
+}
+
+struct TabEnv(u32);
+impl craftworks_sdk::Env for TabEnv {
+    fn now_ms(&mut self) -> u64 {
+        1_750_000_000_000
+    }
+    fn rand32(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        self.0
+    }
+}
+
+impl Tab {
+    fn open(rig: &mut PageRig, node: &mut Node) -> Tab {
+        let (store, _clock) = testkit::cached_store();
+        let mut t = Tab { db: craftworks_sdk::Db::new(store, TabEnv(1), [1, 2, 3, 4]), sends: BTreeMap::new(), verdicts: BTreeMap::new() };
+        t.db.store_mut().client.send(&Request::Identity);
+        t.pump(rig, node);
+        t.db.store_mut().request_range(1, b"", &[0xFF; 64], 256);
+        t.pump(rig, node);
+        t
+    }
+
+    fn pump(&mut self, rig: &mut PageRig, node: &mut Node) {
+        for _ in 0..400 {
+            let frames = self.db.store_mut().take_outbound();
+            let mut moved = !frames.is_empty();
+            for f in &frames {
+                if let protocol::Incoming::Ok(env) = protocol::decode_request(f) {
+                    if let Request::Write { write_id, .. } | Request::Commit { write_id, .. } = env.body {
+                        *self.sends.entry(write_id).or_default() += 1;
+                    }
+                }
+                rig.server.client(f);
+            }
+            for op in rig.server.take_ops() {
+                moved = true;
+                if let Some(a) = rig.answer(node, op) {
+                    rig.server.node(a, Ms(rig.now));
+                }
+            }
+            for r in rig.server.take_replies() {
+                moved = true;
+                // What the HOST does with a page: the copy records a range as
+                // loaded only when told the interval it asked for.
+                let decoded = protocol::decode_reply(&r);
+                if let Some((w, st)) = decoded.as_ref().ok().and_then(|x| self.db.store_mut().client.own_write_state(x)) {
+                    self.verdicts.entry(w).or_default().push(st);
+                }
+                if let Ok(Reply::Page { req_id: 1, entries, cursor: None, at, .. }) = decoded {
+                    self.db.store_mut().on_page(b"", &[0xFF; 64], entries, at.root);
+                }
+                self.db.store_mut().on_inbound(&r);
+            }
+            if !moved {
+                if !rig.server.page.waiting() {
+                    return;
+                }
+                rig.now = rig.server.page.next_due().map_or(rig.now + 1, |d| d.0.max(rig.now + 1));
+                rig.server.tick(Ms(rig.now));
+            }
+        }
+    }
+}
+
+fn tab_schema() -> craftworks_sdk::Schema {
+    serde_json::from_value(serde_json::json!({ "type": "T", "fields": [{ "name": "title", "kind": "text", "required": true }] })).expect("a schema")
+}
+
+/// M2 on the PAGE path (sdk#148's SDK half): a tab's `update` over a record
+/// another session has since changed is a stale `Commit`. The engine applies
+/// NOTHING; the tab is told `Conflict` with `Conflicted` naming the key (a v4
+/// client of this same build decodes both); the write is rolled back, the key
+/// FORGOTTEN in the copy (no row shows a value the tree lacks), the conflict
+/// surfaced to the app, and the write NEVER re-sent. The other session's
+/// value stands. Control: the same update with nothing in between publishes,
+/// and nothing is conflicted.
+#[test]
+fn a_stale_update_is_told_conflict_rolled_back_forgotten_and_never_re_sent() {
+    for interfere in [false, true] {
+        let mut node = Node::new();
+        let mut rig = PageRig::new();
+        let mut tab = Tab::open(&mut rig, &mut node);
+        tab.db.define("t", &tab_schema()).expect("define");
+        tab.pump(&mut rig, &mut node);
+        let rec = tab.db.put("t", &serde_json::json!({ "title": "first" }).as_object().unwrap().clone()).expect("put");
+        tab.pump(&mut rig, &mut node);
+        let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("a record's id parses");
+        let key = craftworks_sdk::db::record_key("t", loc);
+        if interfere {
+            // ANOTHER session writes the record's key, blind, behind this tab's copy.
+            let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::Write { write_id: 1, ops: vec![protocol::Op::Put(key.clone(), b"elsewhere".to_vec())] }).expect("encodes");
+            rig.server.client(&other);
+            for _ in 0..200 {
+                let ops = rig.server.take_ops();
+                if ops.is_empty() && !rig.server.page.waiting() {
+                    break;
+                }
+                for op in ops {
+                    if let Some(a) = rig.answer(&mut node, op) {
+                        rig.server.node(a, Ms(rig.now));
+                    }
+                }
+                rig.now += 50;
+                rig.server.tick(Ms(rig.now));
+            }
+            let _ = rig.server.take_replies();
+        }
+        let w = tab.db.store_mut().next_write_id();
+        tab.db.update("t", loc, serde_json::json!({ "title": "second" }).as_object().unwrap()).expect("the update is made");
+        tab.pump(&mut rig, &mut node);
+        for _ in 0..5 {
+            rig.now += 30_000;
+            rig.server.tick(Ms(rig.now));
+            tab.db.store_mut().tick();
+            tab.pump(&mut rig, &mut node);
+        }
+        let conflicts = tab.db.store_mut().take_conflicts();
+        assert_eq!(tab.sends.get(&w), Some(&1), "interfere {interfere}: the write went on the wire {:?} times", tab.sends.get(&w));
+        if interfere {
+            assert_eq!(tab.verdicts.get(&w).and_then(|v| v.last()), Some(&protocol::WriteState::Conflict), "not told Conflict: {:?}", tab.verdicts.get(&w));
+            assert_eq!(conflicts.len(), 1, "a stale update was not told as ONE conflict: {conflicts:?}");
+            assert_eq!((conflicts[0].write_id, &conflicts[0].key), (w, &key));
+            assert_eq!(craftworks_sdk::store::Reads::row_state(tab.db.store_mut(), &key), craftworks_sdk::store::RowState::RolledBack);
+            assert!(matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &key), Err(craftworks_sdk::store::StoreError::NotLoaded)), "the conflicted key was not forgotten: the copy still shows a value");
+            let (_, root) = node.head().expect("a head");
+            let _ = root;
+        } else {
+            assert!(conflicts.is_empty(), "nothing moved and yet a conflict: {conflicts:?}");
+            assert_eq!(craftworks_sdk::store::Reads::row_state(tab.db.store_mut(), &key), craftworks_sdk::store::RowState::Clean, "the unconflicted update did not publish");
+        }
+    }
+}
+
+/// THE SCHEMA KEY (the architect's #1 on the slice): another session changes
+/// the domain's SCHEMA behind this tab's copy. The tab's update reads the
+/// record (unchanged) and the schema (stale): it conflicts ON THE SCHEMA KEY,
+/// which no rolled-back write names — and that key is FORGOTTEN too, so the
+/// next write reads the schema fresh instead of conflicting again for ever.
+#[test]
+fn a_schema_changed_elsewhere_conflicts_on_the_schema_key_and_forgets_it() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.db.define("t", &tab_schema()).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let rec = tab.db.put("t", &serde_json::json!({ "title": "first" }).as_object().unwrap().clone()).expect("put");
+    tab.pump(&mut rig, &mut node);
+    let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
+    // The schema key, as `Db` names it.
+    let mut schema_key = vec![0u8];
+    schema_key.extend_from_slice(b"schema\0t");
+    let wider: craftworks_sdk::Schema = serde_json::from_value(serde_json::json!({ "type": "T", "fields": [
+        { "name": "title", "kind": "text", "required": true },
+        { "name": "note", "kind": "text" }
+    ] })).expect("a schema");
+    let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::Write {
+        write_id: 1,
+        ops: vec![protocol::Op::Put(schema_key.clone(), serde_json::to_vec(&wider).unwrap())],
+    })
+    .expect("encodes");
+    rig.server.client(&other);
+    for _ in 0..200 {
+        let ops = rig.server.take_ops();
+        if ops.is_empty() && !rig.server.page.waiting() {
+            break;
+        }
+        for op in ops {
+            if let Some(a) = rig.answer(&mut node, op) {
+                rig.server.node(a, Ms(rig.now));
+            }
+        }
+        rig.now += 50;
+        rig.server.tick(Ms(rig.now));
+    }
+    let _ = rig.server.take_replies();
+    let w = tab.db.store_mut().next_write_id();
+    tab.db.update("t", loc, serde_json::json!({ "title": "second" }).as_object().unwrap()).expect("the update is made");
+    tab.pump(&mut rig, &mut node);
+    let conflicts = tab.db.store_mut().take_conflicts();
+    assert_eq!(conflicts.iter().map(|c| (c.write_id, c.key.clone())).collect::<Vec<_>>(), vec![(w, schema_key.clone())], "not a conflict on the SCHEMA key");
+    assert!(
+        matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &schema_key), Err(craftworks_sdk::store::StoreError::NotLoaded)),
+        "the stale schema was not forgotten: the next write would conflict on it again"
+    );
+    // And the fallen write's OWN key (the record: not the key that conflicted).
+    let key = craftworks_sdk::db::record_key("t", loc);
+    assert!(
+        matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &key), Err(craftworks_sdk::store::StoreError::NotLoaded)),
+        "the rolled-back record still shows its unsaved value"
+    );
+}

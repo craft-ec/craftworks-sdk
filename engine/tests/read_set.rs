@@ -358,3 +358,38 @@ fn model_stale_views_never_overwrite_and_conflicts_name_the_truth() {
     println!("read-set model: {published} published, {conflicts} conflicts");
     assert!(published > 500 && conflicts > 200, "the model did not reach both outcomes: {published} / {conflicts}");
 }
+
+/// main's ruling on sdk#148's SDK slice: a write whose value ALREADY is what
+/// the tree holds at every key whose read no longer holds is a success, not a
+/// Conflict. Two tabs define one schema from one Absent base: both succeed.
+/// Control: the same race with DIFFERENT bytes still conflicts.
+#[test]
+fn a_write_that_is_already_there_at_its_conflicting_key_succeeds() {
+    let mut h = fresh(Mode::Live);
+    let fx = h.step(write(1, &[(b"schema/x", Some(b"S"))], vec![(b"schema/x".to_vec(), Expect::Absent)]));
+    assert!(states(&settle(&mut h, fx), 1).contains(&State::Published));
+    // The second tab read Absent too, and writes EXACTLY what is there.
+    let fx = h.step(write(2, &[(b"schema/x", Some(b"S"))], vec![(b"schema/x".to_vec(), Expect::Absent)]));
+    let all = settle(&mut h, fx);
+    assert!(conflicted(&all, 2).is_none(), "an equal write was told Conflict");
+    assert!(states(&all, 2).contains(&State::Published), "an equal write was not Published: {:?}", states(&all, 2));
+    // The control: different bytes from the same stale read conflict.
+    let fx = h.step(write(3, &[(b"schema/x", Some(b"T"))], vec![(b"schema/x".to_vec(), Expect::Absent)]));
+    assert_eq!(states(&fx, 3), vec![State::Conflict]);
+    // A delete of what is ALREADY gone, read Present: the same rule.
+    let fx = h.step(write(4, &[(b"gone", None)], vec![(b"gone".to_vec(), Expect::Present)]));
+    assert!(conflicted(&settle(&mut h, fx), 4).is_none(), "deleting what is already absent was told Conflict");
+}
+
+/// The no-op path still runs the compare (the architect's #4): a delete of a
+/// record read ABSENT that someone has since CREATED is a Conflict — never a
+/// silent "nothing to do".
+#[test]
+fn a_delete_of_a_record_read_absent_that_now_exists_conflicts() {
+    let mut h = fresh(Mode::Live);
+    let fx = h.step(write(1, &[(b"r", Some(b"made elsewhere"))], vec![]));
+    settle(&mut h, fx);
+    let fx = h.step(write(2, &[(b"r", None)], vec![(b"r".to_vec(), Expect::Absent)]));
+    assert_eq!(states(&fx, 2), vec![State::Conflict], "a delete over a record created since its read went through");
+    assert_eq!(value_at(&h.store, &h.published_root(), b"r").as_deref(), Some(&b"made elsewhere"[..]));
+}

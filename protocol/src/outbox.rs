@@ -60,6 +60,9 @@ pub struct Pending {
     /// would compare against whatever happened since, which is the thing
     /// being tested for.
     pub pre: Vec<(Vec<u8>, Option<PreImage>)>,
+    /// What it READ (M2, sdk#148): sent with it as a [`Request::Commit`], so
+    /// the engine checks it where it lands — on every send, the same reads.
+    pub reads: Vec<(Vec<u8>, crate::Expect)>,
     /// How many times it has been sent. For reporting, never for giving up:
     /// the outbox does not decide a write is hopeless, the engine does.
     pub attempts: u32,
@@ -110,8 +113,23 @@ impl Outbox {
             write_id,
             ops,
             pre,
+            reads: Vec::new(),
             attempts: 0,
         });
+    }
+
+    /// The app made a write that says what it READ (M2).
+    pub fn push_reading(
+        &mut self,
+        write_id: u64,
+        ops: Vec<crate::Op>,
+        pre: Vec<(Vec<u8>, Option<PreImage>)>,
+        reads: Vec<(Vec<u8>, crate::Expect)>,
+    ) {
+        self.push_against(write_id, ops, pre);
+        if let Some(p) = self.queue.iter_mut().find(|p| p.write_id == write_id) {
+            p.reads = reads;
+        }
     }
 
     /// The app made a write.
@@ -125,6 +143,7 @@ impl Outbox {
             write_id,
             ops,
             pre: Vec::new(),
+            reads: Vec::new(),
             attempts: 0,
         });
     }
@@ -192,9 +211,10 @@ impl Outbox {
         p.attempts += 1;
         self.in_flight = Some(p.write_id);
         self.sent += 1;
-        Some(Request::Write {
-            write_id: p.write_id,
-            ops: p.ops.clone(),
+        Some(if p.reads.is_empty() {
+            Request::Write { write_id: p.write_id, ops: p.ops.clone() }
+        } else {
+            Request::Commit { write_id: p.write_id, reads: p.reads.clone(), ops: p.ops.clone() }
         })
     }
 

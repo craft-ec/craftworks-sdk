@@ -1631,10 +1631,28 @@ impl Session {
         }
         self.pump_page();
         self.pump_cold();
+        // M2 (sdk#148): writes that did not apply because what they READ had
+        // moved. Facts and one default line; how to show them is the page's.
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let conflicts: Vec<serde_json::Value> = self
+            .db
+            .store_mut()
+            .take_conflicts()
+            .into_iter()
+            .map(|c| {
+                serde_json::json!({
+                    "writeId": c.write_id,
+                    "key": hex(&c.key),
+                    "current": c.current.map(|h| hex(&h)),
+                    "line": "This change was not saved: the record was changed elsewhere first. Showing the current version.",
+                })
+            })
+            .collect();
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
             "stalled": stalled.map(|s| format!("{s:?}")),
             "loadsInFlight": self.loads.in_flight(),
+            "conflicts": conflicts,
         })
         .to_string()
     }

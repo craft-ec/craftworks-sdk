@@ -336,6 +336,36 @@ impl Copy {
             .retain(|(l, h)| !(l.as_slice() >= lo && h.as_slice() <= hi));
     }
 
+    /// Forget ONE key, however wide the interval that loaded it (M2): its
+    /// entry goes (unless a write is pending on it) and a hole is punched in
+    /// every loaded interval that covers it, so the next read of it is
+    /// `NotLoaded` and fetches what the TREE holds. [`Copy::forget`] drops
+    /// only intervals lying wholly inside its range, which a single key never
+    /// covers.
+    pub fn forget_key(&mut self, key: &[u8]) {
+        if self.keys.get(key).is_some_and(|e| e.pending.is_empty()) {
+            if let Some(e) = self.keys.remove(key) {
+                self.bytes = self.bytes.saturating_sub(e.base.as_ref().map_or(0, |v| v.len()));
+            }
+        }
+        let mut after = key.to_vec();
+        after.push(0);
+        let mut out = Vec::with_capacity(self.loaded.len() + 1);
+        for (l, h) in std::mem::take(&mut self.loaded) {
+            if l.as_slice() <= key && key < h.as_slice() {
+                if l.as_slice() < key {
+                    out.push((l, key.to_vec()));
+                }
+                if after < h {
+                    out.push((after.clone(), h));
+                }
+            } else {
+                out.push((l, h));
+            }
+        }
+        self.loaded = out;
+    }
+
     /// Rows in `[lo, hi)`, or `None` if any of that range was never loaded.
     pub fn range(&self, lo: &[u8], hi: &[u8]) -> Option<Vec<(Vec<u8>, Visible)>> {
         if !self.range_loaded(lo, hi) {

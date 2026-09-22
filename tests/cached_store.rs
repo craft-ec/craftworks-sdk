@@ -312,3 +312,52 @@ fn a_flush_is_queued_as_a_frame() {
          and the engine waits for a tick that will never come"
     );
 }
+
+/// M2 (sdk#148), main's surviving mutant on #238: a write that CONFLICTS on
+/// one key (a/1) and also wrote another key nobody touched (a/2). After the
+/// Conflict the copy must not serve the fallen value at EITHER key — a/2 is
+/// not the conflicted key, so only the fall's own forgetting clears it: it is
+/// NotLoaded, and the next read fetches the tree's value. Control: the same
+/// write Published shows the new value at a/2.
+#[test]
+fn a_conflicted_write_leaves_none_of_its_own_keys_in_the_copy() {
+    use craftworks_sdk::read_token::read_token;
+    for verdict in [protocol::WriteState::Published, protocol::WriteState::Conflict] {
+        let mut s = store();
+        s.on_page(b"a/", b"b/", vec![(b"a/1".to_vec(), b"old1".to_vec()), (b"a/2".to_vec(), b"old2".to_vec())], root(1));
+        Store::apply_commit(
+            &mut s,
+            &[
+                (b"a/1".to_vec(), protocol::Expect::Value(read_token(b"old1"))),
+                (b"a/2".to_vec(), protocol::Expect::Value(read_token(b"old2"))),
+            ],
+            &[
+                (b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"mine1".to_vec())),
+                (b"a/2".to_vec(), craftworks_sdk::store::Edit::Put(b"mine2".to_vec())),
+            ],
+        )
+        .expect("the store took the write");
+        let frames = s.take_outbound();
+        let write_id = frames
+            .iter()
+            .find_map(|f| match protocol::decode_request(f) {
+                protocol::Incoming::Ok(env) => match env.body {
+                    protocol::Request::Commit { write_id, .. } => Some(write_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the write went as a Commit");
+        let session = s.client.session().expect("a session");
+        let say = |s: &mut CachedStore, r: protocol::Reply| s.on_inbound(&protocol::encode_reply(&r).expect("encodes"));
+        say(&mut s, protocol::Reply::SessionWriteState { session, write_id, state: verdict });
+        if verdict == protocol::WriteState::Conflict {
+            // What page::Server sends beside it, naming a/1 only.
+            say(&mut s, protocol::Reply::Conflicted { session, write_id, key: b"a/1".to_vec(), current: Some(read_token(b"theirs")) });
+            assert_eq!(Reads::get(&mut s, b"a/1"), Err(StoreError::NotLoaded), "the conflicted key still shows a value");
+            assert_eq!(Reads::get(&mut s, b"a/2"), Err(StoreError::NotLoaded), "the fallen write's OTHER key still shows its unsaved value (W6)");
+        } else {
+            assert_eq!(Reads::get(&mut s, b"a/2"), Ok(Some(b"mine2".to_vec())), "control: the published write's value is not shown");
+        }
+    }
+}

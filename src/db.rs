@@ -8,6 +8,7 @@ use crate::id::{self, Env, IdGen, Loc, RKey};
 use crate::record;
 use crate::schema::Schema;
 use crate::store::{sorted_edits, Edit, IdWidth, Reads, Store, StoreError};
+use protocol::Expect;
 use freenet_prolly::node::{MAX_KEY, MAX_VALUE};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -457,7 +458,25 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// contents, so an app can produce a long one without ever writing it). A
     /// store is allowed to treat a limit breach as a bug and stop — see
     /// [`Store`] — so the app has to be told before, in a way it can handle.
-    fn write(&mut self, edits: Vec<(Vec<u8>, Edit)>) -> Result<()> {
+    /// What a key holds NOW, as a read a write declares: its value's leaf hash
+    /// (the engine's token) or `Absent`. Not loaded is an error, exactly as
+    /// for `get`: "absent" is a claim, and a wrong one would let a write land
+    /// over a value it never saw.
+    fn read_of(&mut self, key: &[u8]) -> Result<(Vec<u8>, Expect)> {
+        Ok((
+            key.to_vec(),
+            match self.get_key(key)? {
+                Some(v) => Expect::Value(crate::read_token::read_token(&v)),
+                None => Expect::Absent,
+            },
+        ))
+    }
+
+    /// Every write says what it READ (M2, sdk#148): `reads` holds a read for
+    /// every key in `edits` (so `writes ⊆ keys(reads)` by construction), and
+    /// the engine checks them where the edits land.
+    fn write(&mut self, reads: Vec<(Vec<u8>, Expect)>, edits: Vec<(Vec<u8>, Edit)>) -> Result<()> {
+        debug_assert!(edits.iter().all(|(k, _)| reads.iter().any(|(r, _)| r == k)), "a write without a read of its key");
         for (key, edit) in &edits {
             if key.len() > MAX_KEY {
                 return Err(DbError::TooLarge(format!(
@@ -480,7 +499,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         // not made; answering `Created` for it told the caller its data was
         // written when it had been dropped.
         self.store
-            .apply_batch(&sorted_edits(edits))
+            .apply_commit(&reads, &sorted_edits(edits))
             .map_err(DbError::WriteRefused)
     }
 
@@ -496,7 +515,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             old.allows(schema)?;
         }
         let bytes = serde_json::to_vec(schema).map_err(|e| e.to_string())?;
-        self.write(vec![(schema_key(domain), Edit::Put(bytes))])
+        // READ: the schema as it stands (or its absence). Two tabs that define
+        // the same schema from one Absent base both succeed: a write already
+        // there is not a conflict (the engine's rule, sdk#148).
+        let read = self.read_of(&schema_key(domain))?;
+        self.write(vec![read], vec![(schema_key(domain), Edit::Put(bytes))])
     }
 
     /// The domain's schema, or `None` if it has none.
@@ -539,7 +562,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let now = id::created_ms(&rkey);
         let bytes = record::encode(&schema, fields, now, now, &self.author)?;
         let key = record_key(domain, loc);
-        self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
+        // READ: a fresh key is ABSENT (a create, never an overwrite), and the
+        // schema it was encoded under is the one that stands (C1: a record is
+        // positional, so a schema that moved under it would scramble it).
+        let reads = vec![(key.clone(), Expect::Absent), self.read_of(&schema_key(domain))?];
+        self.write(reads, vec![(key.clone(), Edit::Put(bytes.clone()))])?;
         self.read(&schema, &loc, &key, &bytes)
     }
 
@@ -597,7 +624,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             )));
         }
         let bytes = record::encode(&schema, fields, created, now.max(created), &self.author)?;
-        self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
+        // READ: the slot ABSENT, so two sessions that both found it absent
+        // make ONE record — the other is told Conflict (closing the residual
+        // above, sdk#148) — and the schema it was encoded under.
+        let reads = vec![(key.clone(), Expect::Absent), self.read_of(&schema_key(domain))?];
+        self.write(reads, vec![(key.clone(), Edit::Put(bytes.clone()))])?;
         self.read(&schema, &loc, &key, &bytes).map(CreateAt::Created)
     }
 
@@ -637,7 +668,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         // `updated` never runs backwards, even if the clock does.
         let updated = self.env.now_ms().max(d.updated);
         let bytes = record::encode(&schema, &d.fields, d.created, updated, &d.author)?;
-        self.write(vec![(key.clone(), Edit::Put(bytes.clone()))])?;
+        // READ: the record exactly as it was patched — a patch over bytes
+        // that moved since would replace a change this session never saw —
+        // and the schema it was decoded and re-encoded under.
+        let reads = vec![(key.clone(), Expect::Value(crate::read_token::read_token(&old))), self.read_of(&schema_key(domain))?];
+        self.write(reads, vec![(key.clone(), Edit::Put(bytes.clone()))])?;
         self.read(&schema, &loc, &key, &bytes)
     }
 
@@ -680,8 +715,12 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let schema = self.need_schema(domain)?;
         let loc = self.locate(&schema, domain, at)?;
         let key = record_key(domain, loc);
-        let existed = self.get_key(&key)?.is_some();
-        self.write(vec![(key, Edit::Delete)])?;
+        // READ: what is deleted is what was read — its value, or its absence
+        // (and a record CREATED since an absent read is a conflict, not a
+        // silent "nothing to do").
+        let read = self.read_of(&key)?;
+        let existed = !matches!(read.1, Expect::Absent);
+        self.write(vec![read], vec![(key, Edit::Delete)])?;
         Ok(existed)
     }
 
@@ -880,7 +919,7 @@ mod tests {
 
         let mut d = Db::new(Panics, crate::id::SystemEnv, *b"dev1");
         let long = vec![b'k'; MAX_KEY + 1];
-        let e = d.write(vec![(long, Edit::Put(b"v".to_vec()))]).unwrap_err();
+        let e = d.write(vec![(long.clone(), protocol::Expect::Absent)], vec![(long, Edit::Put(b"v".to_vec()))]).unwrap_err();
         assert_eq!(
             e.code(),
             "TOO_LARGE",
@@ -890,7 +929,7 @@ mod tests {
         // The longest legal key is accepted — so the refusal is the length and
         // not the screen refusing everything.
         let mut d = Db::new(MemStore::default(), crate::id::SystemEnv, *b"dev1");
-        d.write(vec![(vec![b'k'; MAX_KEY], Edit::Put(b"v".to_vec()))])
+        d.write(vec![(vec![b'k'; MAX_KEY], protocol::Expect::Absent)], vec![(vec![b'k'; MAX_KEY], Edit::Put(b"v".to_vec()))])
             .unwrap();
     }
 }
