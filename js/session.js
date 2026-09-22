@@ -151,6 +151,10 @@ export async function openSession(Session, {
   fetch: fetchWith = (typeof fetch === "function" ? fetch : null),
   setInterval: everyMs = setInterval,
   clearInterval: stopEvery = clearInterval,
+  // The cold reader's one-shot timer (sdk#212's follow-up), injected like the
+  // interval so a test can drive it.
+  setTimeout: afterMs = setTimeout,
+  clearTimeout: stopAfter = clearTimeout,
   // The page lifecycle, injected for the same reason the timer is: the
   // wiring is the part that must not be taken on trust, and a test that
   // needed a real browser tab to close would not run.
@@ -238,10 +242,35 @@ export async function openSession(Session, {
       // A message arrived and has been handed to the session: any load it
       // completed can now wake the reads parked on it. On the task that
       // handled the message, not on a timer.
-      if (e.kind === "message") { drainReads(); guard(); }
+      if (e.kind === "message") { drainReads(); guard(); armCold(); }
       onEvent(e);
     },
   });
+
+  // THE COLD READER'S OWN TIMER. Its fetches time out at an RTO of ≈ 100 ms –
+  // 2 s; the tick below is a second apart, and with no answer arriving at all
+  // a late fetch would wait for it. So after anything that can change what is
+  // in flight — a message, a tick, this timer itself — the one-shot timer is
+  // set again for exactly when the earliest fetch is due.
+  let coldTimer = null;
+  let closed = false;
+  const armCold = () => {
+    if (coldTimer !== null) stopAfter(coldTimer);
+    coldTimer = null;
+    if (closed) return;
+    const due = session.cold_due_ms();
+    if (due < 0) return;
+    coldTimer = afterMs(() => {
+      coldTimer = null;
+      // A timer the host fired after close() (or could not cancel) does
+      // nothing: the session is done.
+      if (closed) return;
+      session.cold_tick();
+      drainReads();
+      conn.pump();
+      armCold();
+    }, due);
+  };
 
   // What wakes a parked read. `connection.js` calls back on every message;
   // this is how the session's "that load ended" reaches the promise waiting
@@ -269,6 +298,7 @@ export async function openSession(Session, {
     // the outbox until something else happened to send — which, on the quiet
     // connection where a stuck commit actually lives, is nothing.
     conn.pump();
+    armCold();
   }, tickMs ?? session.tick_ms());
 
   // THE LAST THING THIS PAGE SAYS.
@@ -336,6 +366,8 @@ export async function openSession(Session, {
       // and it is the one moment the frame can still be sent.
       flush();
       stopEvery(timer);
+      closed = true;
+      if (coldTimer !== null) { stopAfter(coldTimer); coldTimer = null; }
       if (offWindow) for (const [name, fn] of listeners) offWindow(name, fn);
       if (guarded) { offWindow?.("beforeunload", onBeforeUnload); guarded = false; }
       documentOf?.removeEventListener?.("visibilitychange", onHide);

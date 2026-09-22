@@ -69,3 +69,14 @@ fn every_get_answer_also_runs_the_cold_clock() {
         assert!(body.contains("self.cold.tick(now)"), "{arm} does not run the cold clock:\n{body}");
     }
 }
+
+/// The one-shot timer's entry runs the cold clock AND carries out what it
+/// decided (the re-fetches it queued, the give-ups it reported); its partner
+/// reports when that is next due.
+#[test]
+fn the_cold_timer_entry_ticks_and_pumps() {
+    let src = session_src();
+    let tick = body_of(&src, "cold_tick");
+    assert!(tick.contains("self.cold.tick(") && tick.contains("self.pump_cold()"), "`cold_tick` does not tick and pump:\n{tick}");
+    assert!(body_of(&src, "cold_due_ms").contains("next_due_ms("), "`cold_due_ms` does not ask the cold reader");
+}

@@ -36,7 +36,7 @@ function engineRaw() {
     take_progress: () => "[]", take_loads: () => "[]",
     provisioned: () => true, refused: () => "", exhausted: () => false, unusable: () => "[]",
     tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }),
-    tick_ms: () => 7777, unsaved_writes: () => 0,
+    tick_ms: () => 7777, unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {},
     flush() {},
     bind: d => bound.add(d),
     unbind: d => bound.delete(d),

@@ -51,7 +51,7 @@ function fakeRaw() {
     unusable: () => "[]",
     // A DISTINCTIVE RATE. 1000 would pass whether the page asked the session
     // or wrote a literal; 7777 can only come from having asked.
-    tick_ms: () => 7777, unsaved_writes: () => 0,
+    tick_ms: () => 7777, unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {},
     ticks: 0,
     flushes: 0,
     tick() {
@@ -151,7 +151,7 @@ function watchingRaw() {
     unusable: () => "[]",
     // A DISTINCTIVE RATE. 1000 would pass whether the page asked the session
     // or wrote a literal; 7777 can only come from having asked.
-    tick_ms: () => 7777, unsaved_writes: () => 0,
+    tick_ms: () => 7777, unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {},
     ticks: 0,
     flushes: 0,
     tick() {

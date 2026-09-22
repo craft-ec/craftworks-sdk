@@ -52,7 +52,7 @@ function fakeSession({ deliverAfterMs = null } = {}) {
     refused: () => "",
     exhausted: () => false,
     pendingDelivery: false,
-    tick_ms: () => 7777, unsaved_writes: () => 0,
+    tick_ms: () => 7777, unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {},
     flush() {},
     // The TICK. This is where a load nobody answered is given up on — in the
     // real session, `loads.time_out`.
@@ -204,6 +204,57 @@ await t("THE CONTROL: a named port is accepted", async () => {
     clearInterval: clock.clearInterval,
   });
   assert.ok(handle.db, "a named port was refused");
+});
+
+await t("the cold reader's one-shot timer fires when its earliest fetch is due, and not after close", async () => {
+  const session = fakeSession();
+  // One fetch in flight, due in 40 ms; after its tick, nothing is.
+  let due = 40, coldTicks = 0;
+  session.cold_due_ms = () => due;
+  session.cold_tick = () => { coldTicks += 1; due = -1; };
+  const ref = {};
+  const clock = fakeClock();
+  const timers = [];
+  let pumps = 0, cleared = 0;
+  const connect = (s, { onEvent }) => {
+    ref.deliver = () => { s.on_inbound(new Uint8Array()); onEvent({ kind: "message" }); };
+    return { close() {}, pump() { pumps += 1; } };
+  };
+  const page = await open(function () { return session; }, {
+    port: 17509,
+    connect,
+    setInterval: clock.setInterval,
+    clearInterval: clock.clearInterval,
+    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout: () => { cleared += 1; },
+  });
+  ref.deliver();
+  assert.equal(timers.length, 1, "a message did not arm the cold timer");
+  assert.equal(timers[0].ms, 40, "the timer was not set for when the fetch is due");
+  const before = pumps;
+  timers[0].fn();
+  assert.equal(coldTicks, 1, "the timer did not run the cold clock");
+  assert.ok(pumps > before, "a re-fetch the cold clock queued was not put on the socket");
+  assert.equal(timers.length, 1, "re-armed with nothing in flight");
+  // Something in flight again, then the page closes: nothing is armed after.
+  due = 25;
+  ref.deliver();
+  assert.equal(timers.length, 2);
+  page.close();
+  assert.ok(cleared >= 1, "close() left the cold timer set");
+  // A host that fires the timer anyway: the cold reader still has something
+  // due, so a live session WOULD tick and re-arm. A closed one does neither.
+  session.cold_tick = () => { coldTicks += 1; };
+  const ticksBefore = coldTicks;
+  timers[1].fn();
+  assert.equal(coldTicks, ticksBefore, "a timer that fired after close() ran the cold clock");
+  assert.equal(timers.length, 2, "a timer that fired after close() armed another");
+  // A message the socket delivers AFTER close() (closing is not instant):
+  // with a fetch still due, a live session would arm the timer; a closed one
+  // does not.
+  due = 30;
+  ref.deliver();
+  assert.equal(timers.length, 2, "a message after close() armed the cold timer");
 });
 
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");

@@ -74,6 +74,10 @@ const TRANSPORT_ONLY: &[&str] = &[
     // block; there is nothing cold to fetch or to report on.
     "set_cold_reads",
     "take_cold_log",
+    // The cold reader's one-shot timer: when its earliest fetch is due, and
+    // its clock alone at that moment.
+    "cold_due_ms",
+    "cold_tick",
     // How this session finds out the head moved, and whether it is being
     // TOLD or polling. An in-memory store has no head on a node and nothing
     // to be notified by — its data cannot change under it — so there is
