@@ -1,5 +1,5 @@
 //! sdk#209's acceptance, natively: `serve` over an in-memory Host (a secret map + the node's local contract states).
-use engine_delegate::register::head_of;
+use contract_keys::register::head_of;
 use signer::*;
 use std::collections::BTreeMap;
 
@@ -60,7 +60,7 @@ impl World {
             .find(|n| block_root(*n) == root)
             .expect("a root made by `root(n)`");
         self.host.states.insert(
-            engine_delegate::blocks::contract_for(BCODE, &root),
+            contract_keys::block::contract_for(BCODE, &root),
             block_state(n),
         );
     }
@@ -214,7 +214,7 @@ fn a_head_read_ahead_of_the_record_is_the_truth() {
     w.hold_root(root(9));
     let _ = w.sign(genesis(), &next(1, 1));
     // Another holder of the key signed further (seq 5): the Register shows it.
-    let other = engine_delegate::register::head_state(&w.params, &[7u8; 32], 5, &root(5)).unwrap();
+    let other = contract_keys::register::head_state(&w.params, &[7u8; 32], 5, &root(5)).unwrap();
     w.land(&other);
     assert_eq!(
         w.sign(
@@ -253,7 +253,7 @@ fn equal_seq_different_roots_the_register_wins_and_signing_goes_on_from_it() {
     w.hold_root(root(1));
     w.hold_root(root(3));
     let _ = w.sign(genesis(), &next(1, 1));
-    let other = engine_delegate::register::head_state(&w.params, &[7u8; 32], 1, &root(4)).unwrap();
+    let other = contract_keys::register::head_state(&w.params, &[7u8; 32], 1, &root(4)).unwrap();
     w.land(&other);
     let theirs = Head {
         seq: 1,
@@ -395,7 +395,7 @@ fn a_held_state_that_is_not_the_root_block_is_refused() {
     let mut w = World::new();
     let r = root(1);
     w.host.states.insert(
-        engine_delegate::blocks::contract_for(BCODE, &r),
+        contract_keys::block::contract_for(BCODE, &r),
         block_state(2),
     );
     assert_eq!(
@@ -460,7 +460,7 @@ fn put_blocks_names_each_block_by_its_hash_and_hands_the_entry_the_puts() {
     let ids: Vec<[u8; 32]> = (1..=3u8).map(block_root).collect();
     let contracts: Vec<[u8; 32]> = ids
         .iter()
-        .map(|id| engine_delegate::blocks::contract_for(BCODE, id))
+        .map(|id| contract_keys::block::contract_for(BCODE, id))
         .collect();
     assert_eq!(served.answer, Answer::Putting { contracts });
     assert_eq!(served.puts, ids.into_iter().zip(states).collect::<Vec<_>>());
@@ -514,8 +514,8 @@ fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
 #[test]
 fn held_says_which_contracts_this_node_holds_in_the_order_asked() {
     let mut host = Mem::default();
-    let have = engine_delegate::blocks::contract_for(BCODE, &block_root(1));
-    let lack = engine_delegate::blocks::contract_for(BCODE, &block_root(2));
+    let have = contract_keys::block::contract_for(BCODE, &block_root(1));
+    let lack = contract_keys::block::contract_for(BCODE, &block_root(2));
     host.states.insert(have, block_state(1));
     let ask = |host: &mut Mem, contracts: Vec<[u8; 32]>| {
         serve(
@@ -551,8 +551,8 @@ fn held_says_which_contracts_this_node_holds_in_the_order_asked() {
 #[test]
 fn two_requests_in_flight_are_each_answered_under_their_own_id() {
     let mut host = Mem::default();
-    let have = engine_delegate::blocks::contract_for(BCODE, &block_root(1));
-    let lack = engine_delegate::blocks::contract_for(BCODE, &block_root(2));
+    let have = contract_keys::block::contract_for(BCODE, &block_root(1));
+    let lack = contract_keys::block::contract_for(BCODE, &block_root(2));
     host.states.insert(have, block_state(1));
     let (a, b) = (7u32, 9u32);
     let ask_a = encode_request(
@@ -661,7 +661,7 @@ fn a_ledgered_register_head_with_no_record_of_mine_is_read_by_its_root() {
     w.hold_root(root(2));
     w.hold_root(root(3));
     let v = value(&root(2), &Ledger { prev: Some(Head { seq: 4, root: root(1) }), ..Ledger::default() });
-    let theirs = engine_delegate::register::head_state(&w.params, &[7u8; 32], 5, &v).unwrap();
+    let theirs = contract_keys::register::head_state(&w.params, &[7u8; 32], 5, &v).unwrap();
     w.land(&theirs);
     let from = Head { seq: 5, root: root(2) };
     assert!(

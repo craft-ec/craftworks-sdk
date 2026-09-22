@@ -1,6 +1,6 @@
 //! Known-answer vectors for the Register's wire format.
 //!
-//! The format is implemented in `engine_delegate::register` rather than
+//! The format is implemented in `contract_keys::register` rather than
 //! imported, because sdk#35 deliberately decouples this repository's revision
 //! from the contracts' and a path dependency would re-couple them. A second
 //! copy of a wire format drifts, and care is not what stops it — THESE are.
@@ -16,7 +16,7 @@
 //! signs will be refused by the contract — silently, from the engine's point
 //! of view, as a commit that never publishes.
 
-use engine_delegate::register::{head_state, HeadError};
+use contract_keys::register::{head_state, HeadError};
 
 /// The fixed key the vectors were generated with.
 const SIGNING_KEY: [u8; 32] = [7u8; 32];
@@ -130,7 +130,7 @@ fn a_quorum_register_is_refused_not_signed_as_if_it_were_one_writer() {
 /// HEAD — an empty app. Pinned here, on this reader, not only in the codec.
 #[test]
 fn head_of_reads_the_root_of_a_ledgered_head() {
-    use engine_delegate::register::{head_of, record_of};
+    use contract_keys::register::{head_of, record_of};
     use signer_proto::head::{value, Ledger};
     let root = [0x5A; 32];
     let v = value(&root, &Ledger { prev: Some(signer_proto::Head { seq: 6, root: [3; 32] }), ..Ledger::default() });

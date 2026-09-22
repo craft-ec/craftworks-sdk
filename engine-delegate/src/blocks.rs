@@ -13,6 +13,8 @@ use freenet_stdlib::prelude::DelegateCtx;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+pub use contract_keys::block::{contract_deriver, contract_for};
+
 /// Reads through to the node, and keeps what it read for the rest of the call.
 ///
 /// `Blocks::get` hands out `Option<&[u8]>` borrowed from `&self`, while the
@@ -24,42 +26,6 @@ use std::collections::BTreeMap;
 /// The cache is also what keeps a descent honest: without it, reading one
 /// node twice in a call could give two different answers, and the tree would
 /// appear to change under the apply.
-/// The contract instance a block lives in.
-///
-/// A block's cid is the Block contract's PARAMS — `blake3(kind ‖ body)` — and
-/// the instance id is derived by the node from the code AND the params, so
-/// the two are different 32-byte values.
-pub fn contract_for(code: &[u8], cid: &Cid) -> [u8; 32] {
-    use freenet_stdlib::prelude::*;
-    let c = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
-        std::sync::Arc::new(ContractCode::from(code.to_vec())),
-        Parameters::from(cid.to_vec()),
-    )));
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&c.key().id().as_bytes()[..32]);
-    out
-}
-
-/// `contract_for` with the code hashed ONCE: the deriver the shell matches
-/// answers with (`Shell::contract_of`). Hashing ~100 KiB of contract code per
-/// candidate, per answer, is what a map was avoiding; hashing it once per call
-/// makes each candidate one 64-byte blake3. The node's derivation, restated:
-/// `blake3(code_hash || params)` (freenet-stdlib `generate_id`), pinned equal
-/// to `contract_for` by `the_fast_deriver_is_the_node_s_derivation`.
-pub fn contract_deriver(code: &[u8]) -> impl Fn(&Cid) -> Cid {
-    let code_hash = freenet_stdlib::prelude::CodeHash::from_code(code);
-    let code_hash: [u8; 32] = code_hash
-        .as_ref()
-        .try_into()
-        .expect("a code hash is 32 bytes");
-    move |cid: &Cid| {
-        let mut h = blake3::Hasher::new();
-        h.update(&code_hash);
-        h.update(cid);
-        *h.finalize().as_bytes()
-    }
-}
-
 pub struct NodeBlocks<'a> {
     /// Borrowed immutably: `get_contract_state` takes `&self`, so the ctx is
     /// still free to be written at the end of the call. A `&mut` here would
@@ -117,22 +83,5 @@ impl Blocks for NodeBlocks<'_> {
         });
         self.seen.borrow_mut().insert(*cid, leaked);
         leaked
-    }
-}
-
-#[cfg(test)]
-mod deriver_tests {
-    use super::*;
-
-    #[test]
-    fn the_fast_deriver_is_the_node_s_derivation() {
-        let code = vec![0x5Au8; 4096];
-        let derive = contract_deriver(&code);
-        for i in 0..8u8 {
-            let cid = [i; 32];
-            assert_eq!(derive(&cid), contract_for(&code, &cid), "cid {i}");
-        }
-        // And it depends on the code: another code, another id.
-        assert_ne!(contract_deriver(&[1u8; 16])(&[0u8; 32]), derive(&[0u8; 32]));
     }
 }

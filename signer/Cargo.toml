@@ -21,10 +21,9 @@ signer-proto = { path = "../signer-proto" }
 bincode = "1"
 freenet-stdlib = { version = "0.10.0", features = ["contract"] }
 # The Register record format and the Block contract's id, from their ONE implementation (pinned by known-answer
-# vectors in engine-delegate/tests/register.rs), never a second copy. default-features OFF: the engine delegate's own
-# entry point must not be linked into this wasm. QUESTION (Q8 on sdk#209): these move to a small crate both the signer
-# and the page depend on, when the engine delegate retires.
-engine-delegate = { path = "../engine-delegate", default-features = false }
+# vectors in contract-keys/tests/register.rs), never a second copy: the small crate the signer and the page share
+# (sdk#209's Q8), so the signer no longer links the engine delegate at all.
+contract-keys = { path = "../contract-keys" }
 # The root check hashes the root block the way the tree does (kind + block_id): the SAME rev as every other
 # freenet-prolly pin in this repo.
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }

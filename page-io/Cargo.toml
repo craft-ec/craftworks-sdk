@@ -16,8 +16,8 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "97
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 
 [dev-dependencies]
-# The scripted node's own record reader (the delegate's), beside the page's.
-engine-delegate = { path = "../engine-delegate", default-features = false }
+# The scripted node's own record reader, beside the page's.
+contract-keys = { path = "../contract-keys" }
 bincode = "1"
 # The far side of the wire-level node: the REAL signer and Register contract.
 signer = { path = "../signer" }

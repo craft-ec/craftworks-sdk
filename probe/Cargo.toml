@@ -15,10 +15,9 @@ futures = "0.3"
 getrandom = "0.2"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
-# The live write run drives the engine delegate, so it speaks its wire format
-# and signs with the same key type. A dependency of the DRIVER only: nothing
-# here reaches the delegate's wasm.
-engine-delegate = { path = "../engine-delegate", default-features = false }
+# The Register record and the Block contract's id, as the signer and the page
+# derive them. A dependency of the DRIVER only: nothing here reaches a wasm.
+contract-keys = { path = "../contract-keys" }
 protocol = { path = "../protocol" }
 # The PAGE PATH live run (ruling B): the in-page engine and its client-API I/O.
 page = { path = "../page" }

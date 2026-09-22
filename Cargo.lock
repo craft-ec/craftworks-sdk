@@ -192,6 +192,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "contract-keys"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "freenet-prolly",
+ "freenet-stdlib",
+ "signer-proto",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,8 +491,7 @@ name = "engine-delegate"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "blake3",
- "ed25519-dalek",
+ "contract-keys",
  "engine",
  "freenet-prolly",
  "freenet-stdlib",
@@ -999,6 +1009,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "contract-keys",
  "craftec-register-contract",
  "craftworks-sdk",
  "ed25519-dalek",
@@ -1020,10 +1031,10 @@ name = "page-io"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "contract-keys",
  "craftec-register-contract",
  "ed25519-dalek",
  "engine",
- "engine-delegate",
  "freenet-prolly",
  "freenet-stdlib",
  "page",
@@ -1115,11 +1126,11 @@ dependencies = [
  "anyhow",
  "bincode",
  "blake3",
+ "contract-keys",
  "craftworks-sdk",
  "curve25519-dalek",
  "ed25519-dalek",
  "engine",
- "engine-delegate",
  "freenet-prolly",
  "freenet-stdlib",
  "futures",
@@ -1458,8 +1469,8 @@ name = "signer"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "contract-keys",
  "ed25519-dalek",
- "engine-delegate",
  "freenet-prolly",
  "freenet-stdlib",
  "serde",
@@ -2003,8 +2014,8 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "contract-keys",
  "craftec-webapp-contract",
- "engine-delegate",
  "freenet-prolly",
  "freenet-stdlib",
  "signer-proto",

@@ -103,7 +103,7 @@ impl WireNode {
 
     fn head(&self) -> Option<(u64, Cid)> {
         let st = self.contracts.get(&self.register_id)?;
-        let (seq, v) = engine_delegate::register::record_of(st)?;
+        let (seq, v) = contract_keys::register::record_of(st)?;
         Some((seq, v[..32].try_into().expect("32")))
     }
 
