@@ -503,8 +503,15 @@ fn the_chaos_wrapper_with_every_arm_off_changes_nothing() {
 #[test]
 fn a_dropped_reply_is_answered_rather_than_waited_on() {
     use craftworks_sdk::{Reads, StoreError};
-    let mut db = EngineStore::new(Chaos::dropping(Loop::new(0), 42, 1));
-    // EVERY reply dropped: the harshest case, and the one that must not hang.
+    // Started over ONE calm exchange: a read to an engine that has not
+    // recovered its head waits for it (sdk#223), so an unstarted engine would
+    // send no reply to drop, and this test would pass on a timeout that proves
+    // nothing about dropped replies.
+    let mut chaos = Chaos::dropping(Loop::new(0), 42, 1);
+    chaos.calm_for = 1;
+    let mut db = EngineStore::new(chaos);
+    db.identity().expect("the engine answers who it is");
+    // From here EVERY reply dropped: the harshest case, and the one that must not hang.
     let answer = Reads::get(&mut db, b"k/one");
     assert_eq!(
         answer,

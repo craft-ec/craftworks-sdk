@@ -1279,3 +1279,85 @@ fn a_read_that_gives_up_leaves_no_attempts_behind() {
         e.context_len() as i64 - idle as i64
     );
 }
+
+/// Serve fetches from `all` (put, THEN tell) until the queue drains; return
+/// every reply, by request.
+fn settle_by_request(e: &mut Engine<Store>, store: &Store, all: &MemBlocks, first: Vec<Effect>) -> BTreeMap<ReqId, ReadResult> {
+    let mut queue = first;
+    let mut answered = BTreeMap::new();
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the read did not settle");
+        match f {
+            Effect::FetchBlock { id, .. } => {
+                if let Some(bytes) = all.get(&id) {
+                    let bytes = bytes.to_vec();
+                    store.put(id, &bytes);
+                    queue.extend(stepped!(e, Event::BlockArrived { id, bytes }));
+                }
+            }
+            Effect::Reply { req_id, result, .. } => {
+                answered.insert(req_id, result);
+            }
+            _ => {}
+        }
+    }
+    answered
+}
+
+fn started() -> (Engine<Store>, Store) {
+    let store = Store::fresh();
+    let mut e = Engine::new(Params::default(), store.clone());
+    let out = stepped!(
+        e,
+        Event::Start { key: engine::KeySource::SecretStore, epochs: vec![engine::Epoch(1)] }
+    );
+    assert!(
+        out.iter().any(|f| matches!(f, Effect::ReadHead { .. })),
+        "a started engine reads its head first"
+    );
+    (e, store)
+}
+
+/// **sdk#223: a read that arrives before the head is recovered WAITS, and is
+/// answered with the tree's rows once `HeadRead` arrives.** The engine used to
+/// answer it from the EMPTY tree at once — `Value(None)` / an empty COMPLETE
+/// page — a false "nothing here" about data it had not read the head to find.
+#[test]
+fn a_read_before_the_head_is_recovered_waits_and_is_answered_with_the_rows() {
+    let records: BTreeMap<Vec<u8>, Vec<u8>> =
+        (0..50u8).map(|i| (format!("k/{i:03}").into_bytes(), vec![i; 8])).collect();
+    let (root, all) = tree(&records);
+    let (mut e, store) = started();
+
+    let early = stepped!(e, get(1, 7, b"k/003"));
+    assert!(
+        replies(&early).is_empty(),
+        "a read was answered before the head was read: {:?}",
+        replies(&early)
+    );
+
+    let out = stepped!(e, Event::HeadRead { epoch: engine::Epoch(1), seq: 3, root });
+    let answered = settle_by_request(&mut e, &store, &all, out);
+    assert_eq!(
+        answered.get(&ReqId(7)),
+        Some(&ReadResult::Value(Some(vec![3u8; 8]))),
+        "the waiting read was not answered from the recovered tree: {answered:?}"
+    );
+}
+
+/// **The other recovery: `HeadMissing` — a genuinely new app — releases the
+/// waiting reads as empty, now TRULY empty.** And order is kept: two reads
+/// that waited are both answered.
+#[test]
+fn head_missing_releases_the_waiting_reads_as_empty() {
+    let (mut e, store) = started();
+    let mut early = stepped!(e, get(1, 1, b"a"));
+    early.extend(stepped!(e, get(1, 2, b"b")));
+    assert!(replies(&early).is_empty(), "answered before recovery: {:?}", replies(&early));
+    let out = stepped!(e, Event::HeadMissing);
+    let answered = settle_by_request(&mut e, &store, &MemBlocks::default(), out);
+    assert_eq!(answered.get(&ReqId(1)), Some(&ReadResult::Value(None)));
+    assert_eq!(answered.get(&ReqId(2)), Some(&ReadResult::Value(None)));
+}

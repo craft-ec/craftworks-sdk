@@ -42,6 +42,10 @@ pub struct Chaos<T: Transport> {
     pub hold_1_in: u64,
     pub dup_1_in: u64,
     pub drop_1_in: u64,
+    /// Exchanges passed through untouched before any arm applies: an engine
+    /// must be STARTED before a read reaches it (sdk#223), and a connection
+    /// that drops every reply would drop the start's too.
+    pub calm_for: usize,
     pub seen: Perturbed,
 }
 
@@ -54,6 +58,7 @@ impl<T: Transport> Chaos<T> {
             hold_1_in: 3,
             dup_1_in: 4,
             drop_1_in: 0,
+            calm_for: 0,
             seen: Perturbed::default(),
         }
     }
@@ -93,6 +98,10 @@ impl<T: Transport> Chaos<T> {
 impl<T: Transport> Transport for Chaos<T> {
     fn exchange(&mut self, request: &[u8]) -> Vec<Vec<u8>> {
         let fresh = self.inner.exchange(request);
+        if self.calm_for > 0 {
+            self.calm_for -= 1;
+            return fresh;
+        }
         // Anything held from before goes out FIRST, which is what makes this
         // a reorder rather than a delay: a reply to an older request arrives
         // among the answers to a newer one.

@@ -61,7 +61,16 @@ fn the_empty_leaf_is_the_only_block_the_core_knows_and_it_hashes_to_its_id() {
 
     // An engine with an EMPTY source can still read its own empty tree, and
     // gets "no such key" rather than "unavailable".
+    //
+    // "A device with no head" is a FACT the engine learns, not its starting
+    // assumption: a read before the head is recovered waits for it (sdk#223).
+    // So the head is read, and found missing, first — and that costs no block.
     let mut e = Engine::new(Params::default(), Store::default());
+    let _ = e.step(Event::Start {
+        key: engine::KeySource::SecretStore,
+        epochs: vec![engine::Epoch(1)],
+    });
+    let _ = e.step(Event::HeadMissing);
     let out = e.step(Event::Get {
         client: ClientId(1),
         req_id: engine::read::ReqId(1),
