@@ -14,6 +14,26 @@ wasm=target/wasm32-unknown-unknown/release/web.wasm
 # repo and has no business renaming the file the builder loads.
 wasm-bindgen --target web    --out-name craftworks_sdk --out-dir pkg/web  "$wasm"
 wasm-bindgen --target nodejs --out-name craftworks_sdk --out-dir pkg/node "$wasm"
+
+# THE SHIPPED WASM CARRIES NO FUNCTION NAMES (sdk#228): its `name` section is
+# ~25% of the page's first load and nothing at run time reads it. Only that
+# section is removed — nothing the loader or wasm-bindgen reads. The names are
+# KEPT, beside the package and never shipped, keyed by the SHIPPED bytes' hash:
+# a support bundle's `wasm-function[N]` frames name the build they came from,
+# and `tools/symbolise.mjs` turns them back into Rust paths offline.
+# Required, not best-effort: the artefacts container's address is a hash of
+# these bytes, so a build without wasm-tools would publish a different one.
+command -v wasm-tools >/dev/null || { echo "wasm-tools is required: build.sh strips the shipped wasm's name section" >&2; exit 1; }
+shipped=pkg/web/craftworks_sdk_bg.wasm
+names_before=$(wc -c < "$shipped" | tr -d ' ')
+stripped_tmp=$(mktemp)
+wasm-tools strip --delete '^name$' "$shipped" -o "$stripped_tmp"
+stripped_hash=$(shasum -a 256 "$stripped_tmp" | cut -d' ' -f1)
+mkdir -p pkg/web-symbols
+rm -f pkg/web-symbols/craftworks_sdk_bg.*.wasm
+cp "$shipped" "pkg/web-symbols/craftworks_sdk_bg.$stripped_hash.wasm"
+mv "$stripped_tmp" "$shipped"
+echo "pkg/web/craftworks_sdk_bg.wasm: $names_before -> $(wc -c < "$shipped" | tr -d ' ') B, name section stripped; names kept at pkg/web-symbols/craftworks_sdk_bg.$stripped_hash.wasm"
 cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js pkg/web/
 
 # EVERY MODULE THE ENTRY CAN REACH IS IN THE PACKAGE.
