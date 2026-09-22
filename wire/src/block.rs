@@ -5,14 +5,11 @@
 //! `blocks::contract_deriver`, `entry::block_state`) for the engine-in-the-page
 //! shape (ENGINE-SHAPE.md §6): the PAGE now puts and gets blocks itself, and
 //! this crate is the one place allowed to know freenet's types. The page and
-//! the delegate must name a block's contract identically — a different
-//! derivation is a different contract — so there is ONE copy, pinned equal to
-//! engine-delegate's by `wire/tests/block.rs` until that copy is deleted with
-//! the shell.
-//!
-//! QUESTION (engineer2 / main): engine-delegate keeps its own copies for now —
-//! it is read-only for this branch, and §6 deletes most of it. Switch it onto
-//! these (a `wire` dependency) with the signer PR, or leave it to die?
+//! the signer must name a block's contract identically — a different
+//! derivation is a different contract — so this derivation is pinned equal to
+//! the signer's (`contract_keys::block`, which restates it without the
+//! stdlib) by `wire/tests/block.rs`. engine-delegate, which had its own copy,
+//! is deleted (the switch-over).
 
 use freenet_prolly::Cid;
 use freenet_stdlib::prelude::*;

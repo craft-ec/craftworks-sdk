@@ -28,7 +28,7 @@ function stdlib(frames = [], signerAnswer = null) {
 const signerRequests = s => { const out = s.outbound(); s.sent(out.length); return stdlib(out).frames.flatMap(f => f.signer ?? []); };
 /** Register params as `wire::register_params` lays them out: RG01, a version byte, the key, the name. */
 const params = keyByte => new Uint8Array([...enc("RG01"), 0, ...new Array(32).fill(keyByte), ...enc("head")]);
-const page = () => { const s = new Session(7999); s.set_page_mode(true, enc("signer code")); s.provision(enc("delegate"), enc("block code"), enc("register code")); return s; };
+const page = () => { const s = new Session(7999); s.provision(enc("signer code"), enc("block code"), enc("register code")); return s; };
 /** Several turns of the page's clock and pump; then what it had to call unusable. */
 const settled = s => { for (let i = 0; i < 4; i += 1) { s.tick(); s.sent(s.outbound().length); } return JSON.parse(s.unusable()); };
 const answer = (s, id, p) => { s.on_inbound(new Uint8Array(Buffer.from(stdlib([], `register:${id}:${p ? hex(p) : "none"}`).signer_answer, "hex"))); };

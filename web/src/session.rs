@@ -19,19 +19,10 @@
 
 use craftworks_sdk::{CachedStore, DbError, SystemEnv};
 use wasm_bindgen::prelude::*;
-use wire::provision::{Provisioner, Step};
-use wire::{AckKind, DelegateKey, Incoming, Reassembler};
+use wire::{AckKind, Incoming};
 
-/// The artefacts a page provisions with, as bytes it fetched.
-///
-/// **The DEVELOPMENT path.** The long-term shape is both fetched from the
-/// network by hash (§19, sdk#5); shipping them beside the wasm is how a page
-/// can do it today.
-struct Artefacts {
-    delegate: Vec<u8>,
-    block: Vec<u8>,
-    register: Vec<u8>,
-}
+/// A block's contract id from its cid (the Block code hashed once).
+type ContractOf = Box<dyn Fn(&craftworks_sdk::Cid) -> craftworks_sdk::Cid>;
 
 /// Everything one page-to-node connection needs.
 #[wasm_bindgen]
@@ -41,28 +32,15 @@ pub struct Session {
     /// pump reaches it through `store_mut()` rather than through a second
     /// handle that could drift out of step with it.
     db: craftworks_sdk::Db<CachedStore, SystemEnv>,
-    frames: Reassembler,
-    plan: Provisioner,
     /// Frames waiting to go out. WIRE frames, already enveloped — the page
     /// sends bytes and never learns what a `ClientRequest` is.
     out: Vec<Vec<u8>>,
-    /// The delegate this session talks to, once its code is on hand.
-    ///
-    /// DERIVED from the code, never carried beside it: a key that named a
-    /// different build would address requests to a delegate this session
-    /// never registered.
-    delegate: Option<DelegateKey>,
-    artefacts: Option<Artefacts>,
     /// A counter, so each chunked request gets its own stream and two
     /// concurrent ones cannot be reassembled into each other.
     stream: u32,
     port: u16,
-    /// Steps completed, for the page to show. Drained by `take_progress`.
-    progress: Vec<(Step, bool)>,
     /// Messages this build could not use, by reason.
     unusable: Vec<String>,
-    /// How many of the plan's completed steps have been reported.
-    reported: usize,
     /// Ranges asked for and not yet answered. The bookkeeping lives in the
     /// SDK, not here, so it can be tested on a machine rather than only in a
     /// tab — which is what the first version of this recovery could not be.
@@ -130,21 +108,19 @@ pub struct Session {
     /// A block's contract id from its cid — the Block contract's code hashed
     /// once (`wire::block::contract_deriver`). `None` until the page hands the
     /// code in with [`Session::set_cold_reads`]: without it no GET can be named.
-    cold_contract: Option<Box<dyn Fn(&craftworks_sdk::Cid) -> craftworks_sdk::Cid>>,
+    cold_contract: Option<ContractOf>,
     /// The builder called [`Session::set_cold_reads`]. Until then cold reads
     /// are ON by default, switched on by [`Session::provision`] with the
     /// Block code it hands in; after it, the builder's choice stands.
     cold_chosen: bool,
-    /// PAGE MODE (ruling B): the engine runs IN THE PAGE (`page::Server`) and
-    /// the SIGNER signs, instead of the engine delegate. Behind a flag until
-    /// the switch-over, default OFF (`set_page_mode`).
-    page_mode: bool,
-    /// The signer delegate's wasm, handed in with the flag.
+    /// The SIGNER delegate's wasm, handed in with [`Session::provision`].
     signer_code: Vec<u8>,
     /// The page's I/O over the client API, from `provision` on.
     page: Option<page_io::PageIo>,
     /// `Identity` sent to the in-page server once the signer is provisioned.
     page_identity_sent: bool,
+    /// The signer's provisioning was reported by `take_progress`.
+    provision_told: bool,
     /// PUTs of contracts the APP names (`put_contract`, builder#104), and
     /// what the node said about each — matched by the key it names.
     puts: wire::puts::Puts,
@@ -174,16 +150,10 @@ impl Session {
                 SystemEnv,
                 device,
             ),
-            frames: Reassembler::new(),
-            plan: Provisioner::new(),
             out: Vec::new(),
-            delegate: None,
-            artefacts: None,
             stream: 1,
             port,
-            progress: Vec::new(),
             unusable: Vec::new(),
-            reported: 0,
             loads: craftworks_sdk::Loads::new(),
             head_root: [0u8; 32],
             head_id: [0u8; 32],
@@ -199,12 +169,12 @@ impl Session {
             cold: craftworks_sdk::cold::ColdReads::default(),
             cold_contract: None,
             cold_chosen: false,
-            page_mode: false,
             puts: wire::puts::Puts::default(),
             read_only: false,
             signer_code: Vec::new(),
             page: None,
             page_identity_sent: false,
+            provision_told: false,
         })
     }
 
@@ -220,8 +190,6 @@ impl Session {
     /// go — and a write made before the socket opens is the ordinary start of
     /// every session.
     pub fn outbound(&mut self) -> Vec<js_sys::Uint8Array> {
-        self.advance();
-        self.watch_head();
         self.envelope_engine_requests();
         self.out
             .iter()
@@ -246,99 +214,14 @@ impl Session {
     /// is offered every frame and takes only what it asked for. A frame no
     /// session takes is counted once, with [`Session::unowned`].
     pub fn on_inbound(&mut self, bytes: &[u8]) -> bool {
-        // PAGE MODE: every node frame is the page executor's (page-io); there
-        // is no engine delegate to hear from.
-        if self.page_mode {
-            let owned = match self.page.as_mut() {
-                Some(p) => p.inbound(bytes, page::Ms(crate::js_now_ms())),
-                None => false,
-            };
-            self.pump_page();
-            return owned;
-        }
-        match wire::unframe(&mut self.frames, bytes) {
-            Incoming::EngineBytes(msgs) => {
-                for m in msgs {
-                    self.on_engine_reply(m);
-                }
-                true
-            }
-            Incoming::Ack(kind) => self.on_ack(kind),
-            // A refused PUT naming its contract: the app's, if it is one of
-            // `put_contract`'s; otherwise what any refusal is (below).
-            Incoming::PutFailed { key, said } => {
-                if !self.puts.refused(&key, &said) {
-                    self.db.store_mut().client.frame_refused();
-                    self.plan.on_refused(&said);
-                }
-                true
-            }
-            Incoming::Refused(why) => {
-                // A refused frame will never run: the refusal is its answer
-                // (sdk#196 review, 1b), or the tick and ask gates lag for good.
-                self.db.store_mut().client.frame_refused();
-                // The node's wording, kept for display. Nothing branches on
-                // it: the node chose it, and a reason that steers control flow
-                // is an input from a stranger.
-                self.plan.on_refused(&why.said);
-                true
-            }
-            Incoming::HeadChanged { key } => {
-                // ONLY for the head this session asked to watch.
-                //
-                // A notification names a contract, and the node chooses what
-                // it sends. Acting on any of them would let one unasked-for
-                // message make a page reload for ever. This is still a HINT
-                // even when it matches — what it triggers is the reload a
-                // tick would do anyway — but a hint about somebody else's
-                // contract is not even that.
-                // Compared as the node NAMES it. The engine reports a head
-                // as 32 bytes and the client API names contracts as strings;
-                // rendering ours the same way is the only comparison that is
-                // about the same thing.
-                // Somebody else's head is another session's on this socket,
-                // or nobody's — counted then, once (`unowned`).
-                if self.subscribed && !self.head_named.is_empty() && key == self.head_named {
-                    self.head_moved = true;
-                    true
-                } else {
-                    false
-                }
-            }
-            // The page's own cold GETs (`pump_cold`): matched to the block
-            // being fetched whose contract the node named.
-            Incoming::Got { id, state } => match self.cold_block(id) {
-                Some(block) => {
-                    let now = crate::js_now_ms();
-                    self.cold.arrived(block, &state, now);
-                    // The cold clock also runs on every answer, not only on the
-                    // page's 1 s tick: an RTO is ≈ 100 ms – 2 s, and a read's
-                    // answers arrive far more often than once a second. With
-                    // NO answers arriving, a late fetch is seen at the next
-                    // 1 s tick (the one gap left; the owner's to rule on).
-                    self.cold.tick(now);
-                    self.pump_cold();
-                    true
-                }
-                // Another session's on this socket, or nobody's (`unowned`).
-                None => false,
-            },
-            Incoming::GetFailed { id } => match self.cold_block(id) {
-                Some(block) => {
-                    let now = crate::js_now_ms();
-                    self.cold.refused(block, now);
-                    self.cold.tick(now);
-                    self.pump_cold();
-                    true
-                }
-                None => false,
-            },
-            Incoming::Unusable(why) => {
-                self.unusable.push(format!("{why:?}"));
-                true
-            }
-            Incoming::Partial => true,
-        }
+        // Every node frame is the page executor's (page-io): the engine runs
+        // in this page and the node is reached only through it.
+        let owned = match self.page.as_mut() {
+            Some(p) => p.inbound(bytes, page::Ms(crate::js_now_ms())),
+            None => false,
+        };
+        self.pump_page();
+        owned
     }
 
     /// A node frame NO session on this socket asked for (`on_inbound` said
@@ -348,8 +231,8 @@ impl Session {
         self.foreign_notifications += 1;
     }
 
-    /// One protocol reply for this session's store — from the engine
-    /// delegate, or (page mode) from the in-page `page::Server`.
+    /// One protocol reply for this session's store, from the in-page
+    /// `page::Server`.
     fn on_engine_reply(&mut self, m: Vec<u8>) {
         // Read, not intercepted: the store still gets every byte.
         // `Identity` is the only reply provisioning rests on, and
@@ -358,7 +241,6 @@ impl Session {
         // arrived.
         match protocol::decode_reply(&m) {
             Ok(protocol::Reply::Identity {
-                head_writable,
                 head_root,
                 head_id,
                 head_seq,
@@ -385,15 +267,6 @@ impl Session {
                 // anywhere. A load that finishes behind it is not
                 // recorded.
                 self.loads.note_seq(head_seq);
-                self.plan.on_identity(head_writable);
-                self.note_progress();
-            }
-            // Another writer got there first. The ordinary
-            // outcome of two tabs opened together, not an error:
-            // the plan goes on to the confirming Ask and simply
-            // stops claiming an install it did not make.
-            Ok(protocol::Reply::AlreadyInstalled) => {
-                self.plan.on_already_installed();
             }
             Ok(protocol::Reply::Page {
                 req_id,
@@ -437,47 +310,6 @@ impl Session {
             _ => {}
         }
         self.db.store_mut().on_inbound(&m);
-    }
-
-    fn on_ack(&mut self, kind: AckKind) -> bool {
-        // The subscribe ack is matched by the KEY IT NAMES, never by
-        // position. Both acks arrive on one connection with no correlation
-        // id, so pairing by order would let a delegate registration confirm
-        // a subscription that was never accepted — which is harness#38's
-        // shape, and it has already been made once in this file.
-        if let AckKind::Subscribed(key) = &kind {
-            // Another session's subscription on this socket, or nobody's.
-            if *key == self.head_named && !self.head_named.is_empty() {
-                self.watching = true;
-                return true;
-            }
-            return false;
-        }
-        // An app's PUT, by the key the ack names — before the plan, which
-        // would otherwise take it for a provisioning step's.
-        if let AckKind::Put(key) = &kind {
-            if self.puts.acked(key) {
-                return true;
-            }
-        }
-        self.plan.on_ack(&kind);
-        self.note_progress();
-        true
-    }
-
-    /// Record any steps the plan completed since this was last asked.
-    ///
-    /// Counted from the plan's own list rather than from the call that might
-    /// have completed one: `on_identity` can finish two steps at once (it
-    /// proves the delegate is registered AND reports the install), and a
-    /// caller that pushed "the last one" would show one of them.
-    fn note_progress(&mut self) {
-        let done = self.plan.result().steps.len();
-        while self.reported < done {
-            let (step, _) = self.plan.result().steps[self.reported];
-            self.progress.push((step, true));
-            self.reported += 1;
-        }
     }
 
     /// A read's answer, with a `NotLoaded` turned into a real request and a
@@ -623,28 +455,6 @@ impl Session {
     /// request rather than one each.
     pub fn loads_in_flight(&self) -> usize {
         self.loads.in_flight()
-    }
-
-    /// Ask the node to tell us when the head moves.
-    ///
-    /// Once per connection, and only once there IS a head: an unprovisioned
-    /// delegate has no Register to name.
-    fn watch_head(&mut self) {
-        if self.subscribed || self.head_id == [0u8; 32] || !self.plan.provisioned() {
-            return;
-        }
-        let id = wire::contract_id(self.head_id);
-        let stream = self.next_stream();
-        match wire::frame_subscribe(id, stream) {
-            Ok(frames) => {
-                self.out.extend(frames);
-                self.subscribed = true;
-                self.asked_at_ms = crate::js_now_ms();
-            }
-            Err(e) => self
-                .unusable
-                .push(format!("could not ask to watch the head: {e}")),
-        }
     }
 
     /// Which bound domains are stale, because the head moved. Drains.
@@ -820,7 +630,7 @@ impl Session {
                 "Polled",
                 format!("the node refused to watch the head: {said}.{tick}"),
             )
-        } else if !self.plan.provisioned() {
+        } else if !self.provisioned() {
             (
                 "Polled",
                 "this node is not provisioned, so there is no head to watch".to_string(),
@@ -856,124 +666,17 @@ impl Session {
         .to_string()
     }
 
-    /// Take the next provisioning step, if there is one and nothing is in
-    /// flight. The frames go on the outbound queue; nothing is sent here.
-    fn advance(&mut self) {
-        // PAGE MODE has no engine delegate to install: `provision_page`.
-        if self.page_mode {
-            return;
-        }
-        let Some(step) = self.plan.next_step() else {
-            return;
-        };
-        if self.artefacts.is_none() {
-            // Nothing to provision WITH. Not an error: a page that only
-            // reads an already-provisioned node never calls `provision`.
-            return;
-        }
-        let now = crate::js_now_ms();
-        let stream = self.next_stream();
-
-        let framed = match step {
-            Step::Delegate => {
-                let code = self
-                    .artefacts
-                    .as_ref()
-                    .expect("checked above")
-                    .delegate
-                    .clone();
-                let (container, key) = wire::delegate_from_code(&code);
-                let named = key.to_string();
-                self.delegate = Some(key);
-                wire::frame_register_delegate(container, stream).map(|f| (f, named))
-            }
-            // An error, never a panic: this is the page, and a panic in wasm is
-            // a dead page.
-            Step::Ask => protocol::encode_request(1, &protocol::Request::Identity)
-                .map_err(|r| format!("the identity request cannot be encoded: {r:?}"))
-                .and_then(|payload| self.engine_frames(payload, stream))
-                .map(|f| (f, String::new())),
-            Step::Install => {
-                // A TEST key, minted here and then FORGOTTEN. The page keeps
-                // no copy: on every later open it asks the delegate, which is
-                // what makes "close the tab, reopen, the data is there" true
-                // without a browser holding a key at all. Real keys are
-                // sdk#14 — a passkey-derived device key that never leaves
-                // keycraft — and nothing here may be reused as that path.
-                let mut seed = [0u8; 32];
-                if getrandom::getrandom(&mut seed).is_err() {
-                    // No randomness is a refusal, never a fixed key: a
-                    // predictable signing key is one anybody can forge a head
-                    // with.
-                    self.unusable.push("no randomness to mint a key".into());
-                    return;
-                }
-                let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-                let vk = sk.verifying_key().to_bytes();
-                let art = self.artefacts.as_ref().expect("checked above");
-                let (block_code, register_code) = (art.block.clone(), art.register.clone());
-                let req = protocol::Request::Install {
-                    block_code,
-                    register_code,
-                    register_params: wire::register_params(&vk, wire::HEAD_NAME),
-                    signing_key: protocol::TestKey(sk.to_bytes().to_vec()),
-                };
-                protocol::encode_request(1, &req)
-                    .map_err(|r| format!("the install request cannot be encoded: {r:?}"))
-                    .and_then(|payload| self.engine_frames(payload, stream))
-                    .map(|f| (f, String::new()))
-            }
-        };
-
-        match framed {
-            Ok((frames, named)) => {
-                self.out.extend(frames);
-                self.plan.sent(step, &named, now);
-            }
-            // Framing failed on THIS build's own bytes, so re-sending would
-            // fail the same way. Recorded, and the step is not marked sent.
-            Err(e) => self.unusable.push(format!("could not frame {step:?}: {e}")),
-        }
-    }
-
-    /// Envelope whatever the engine has queued, once the delegate is known.
-    ///
-    /// Until then the engine KEEPS them. An earlier version drained the
-    /// engine here and dropped what it could not frame — the same lose-the-
-    /// queue defect already fixed once in the page's socket pump, where a
-    /// closed socket silently discarded every request behind the first.
+    /// Hand the store's protocol frames to the in-page server. HELD (not
+    /// drained) until the page exists: an earlier version drained and dropped
+    /// what it could not deliver — the lose-the-queue defect already fixed
+    /// once in the page's socket pump.
     fn envelope_engine_requests(&mut self) {
-        // PAGE MODE: the store's protocol frames go to the in-page server, not
-        // to a delegate. Held (not drained) until the page exists.
-        if self.page_mode {
-            if self.page.is_some() {
-                for bytes in self.db.store_mut().take_outbound() {
-                    self.page.as_mut().expect("checked").client(&bytes);
-                }
-                self.pump_page();
+        if self.page.is_some() {
+            for bytes in self.db.store_mut().take_outbound() {
+                self.page.as_mut().expect("checked").client(&bytes);
             }
-            return;
+            self.pump_page();
         }
-        let Some(key) = self.delegate.clone() else {
-            return;
-        };
-        for bytes in self.db.store_mut().take_outbound() {
-            let stream = self.next_stream();
-            match wire::frame_engine_request(&key, bytes, stream) {
-                Ok(frames) => self.out.extend(frames),
-                Err(e) => self
-                    .unusable
-                    .push(format!("could not frame a request: {e}")),
-            }
-        }
-    }
-
-    fn engine_frames(&mut self, payload: Vec<u8>, stream: u32) -> Result<Vec<Vec<u8>>, String> {
-        let key = self
-            .delegate
-            .clone()
-            .ok_or_else(|| "no delegate to address".to_string())?;
-        wire::frame_engine_request(&key, payload, stream)
     }
 
     /// Cold reads on or off with the Block code — the one place both the
@@ -1091,37 +794,33 @@ impl Session {
         }
     }
 
-    /// The block a GET answer is about: the one being fetched whose contract
-    /// the node named.
-    fn cold_block(&self, contract: [u8; 32]) -> Option<craftworks_sdk::Cid> {
-        let derive = self.cold_contract.as_ref()?;
-        self.cold.fetching().find(|b| derive(b) == contract).copied()
-    }
 
     fn next_stream(&mut self) -> u32 {
         self.stream = self.stream.wrapping_add(1).max(1);
         self.stream
     }
 
-    /// Steps that completed since this was last asked, as JSON.
+    /// Provisioning steps that completed since this was last asked, as JSON.
+    /// The page path has one: the signer is provisioned ([`Session::provisioned`]),
+    /// reported ONCE.
     pub fn take_progress(&mut self) -> String {
-        let done: Vec<String> = self
-            .progress
-            .drain(..)
-            .map(|(s, _)| format!("{s:?}"))
-            .collect();
-        serde_json::to_string(&done).unwrap_or_else(|_| "[]".into())
+        if self.provisioned() && !std::mem::replace(&mut self.provision_told, true) {
+            return r#"["Signer"]"#.into();
+        }
+        "[]".into()
     }
 
-    /// COLD READS IN THE PAGE, on or off, with the Block contract's code (the
-    /// page's own artefact: a GET names a block by its contract, which the
-    /// code and the block id derive). On: a range this node does not hold is
-    /// read by this page's own GETs — each with a short timeout and a fresh
-    /// re-fetch — instead of by the engine, whose cold read can stall ≈ 60 s
-    /// (F52). A root the node says is its own goes back to the engine (F55).
+    /// The Session's OWN cold reads — the F52 mitigation for the engine
+    /// DELEGATE, whose cold read could stall ≈ 60 s — are OFF on the page
+    /// path: the in-page engine fetches every block itself through page-io,
+    /// each node call on its RTO (#227). Turning them ON is refused by name
+    /// rather than half-done (their answers would never reach this session,
+    /// page-io owning every node frame); their removal is sdk#258.
     pub fn set_cold_reads(&mut self, on: bool, block_code: Vec<u8>) {
-        self.cold_chosen = true;
-        self.switch_cold(on, block_code);
+        let _ = block_code;
+        if on {
+            self.unusable.push("set_cold_reads(true): the in-page engine reads cold itself; the Session's own cold reads are off (sdk#258)".into());
+        }
     }
 
     /// Milliseconds until the cold reader's earliest fetch reaches its RTO,
@@ -1171,35 +870,25 @@ impl Session {
         serde_json::to_string(&all).unwrap_or_else(|_| "[]".into())
     }
 
-    /// The artefacts to provision with, as the page fetched them.
+    /// Provision this session on the node: the SIGNER delegate's wasm, and
+    /// the Block and Register contracts' code, as the page fetched them.
     ///
-    /// Handing them in is what starts provisioning. A page that only reads an
-    /// already-provisioned node never calls this and never sends a byte of
-    /// contract code.
-    pub fn provision(&mut self, delegate: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
+    /// The engine runs IN THE PAGE (`page::Server`) and the signer signs: the
+    /// signer is registered, asked which Register it signs for, and given a
+    /// key only when it holds none (`provision_page`). Every node operation
+    /// goes through `page-io` — there is no other path to the node. A page
+    /// that only reads somebody's head calls [`Session::open_named`] instead.
+    pub fn provision(&mut self, signer: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
         // A VIEW installs nothing on the node it reads from (sdk#239).
         if self.read_only {
             self.unusable.push(format!("{READ_ONLY}: provisioning refused"));
             return;
         }
-        if self.page_mode {
-            self.provision_page(block, register);
-            return;
-        }
-        // Cold reads are ON by default (the owner: default on once the live
-        // ×20 is green), and the Block code is what names a GET. A builder
-        // who chose already keeps that choice.
-        if !self.cold_chosen {
-            self.switch_cold(true, block.clone());
-        }
-        self.artefacts = Some(Artefacts {
-            delegate,
-            block,
-            register,
-        });
+        self.signer_code = signer;
+        self.provision_page(block, register);
     }
 
-    /// PAGE MODE's provisioning: a TEST key minted here and FORGOTTEN (as the
+    /// The provisioning: a TEST key minted here and FORGOTTEN (as the
     /// delegate path's; real keys are sdk#14), the head Register named by it,
     /// and the SIGNER registered and provisioned — all through `page-io`. The
     /// page's own cold reads are OFF here: the in-page engine fetches blocks
@@ -1233,52 +922,34 @@ impl Session {
         self.envelope_engine_requests();
     }
 
-    /// Has provisioning finished — because the DELEGATE said so?
-    ///
-    /// Not "every step was sent": an unprovisioned delegate answers
-    /// `Identity` exactly like a healthy empty one while dropping every head
-    /// it is given, so the only honest answer comes from asking it.
+    /// Has provisioning finished — because the SIGNER said so: it answered
+    /// Provisioned to a fresh key, or NAMED the Register it signs for (a
+    /// reload, a second tab: nothing minted). `PageIo::provisioned`, and
+    /// nothing else (engineer2's contract for `open()`, sdk#255).
     pub fn provisioned(&self) -> bool {
-        if self.page_mode {
-            return self.page.as_ref().is_some_and(|p| p.provisioned());
-        }
-        self.plan.provisioned()
-    }
-
-    /// PAGE MODE on or off, with the SIGNER delegate's wasm (ruling B). Called
-    /// BEFORE `provision`; default OFF until the switch-over. On: `provision`
-    /// provisions the signer instead of installing the engine delegate, the
-    /// engine runs in the page, and every node operation goes through
-    /// `page-io` — no other path to the node.
-    pub fn set_page_mode(&mut self, on: bool, signer_code: Vec<u8>) {
-        self.page_mode = on;
-        self.signer_code = signer_code;
+        self.page.as_ref().is_some_and(|p| p.provisioned())
     }
 
     /// Everything was sent, accepted, and the delegate still cannot write a
-    /// head. A different fact from stalled and from refused, and the page
-    /// says so rather than spinning.
+    /// head: the ENGINE DELEGATE's install plan, which the page path does not
+    /// have. Always `false` — as it was in page mode before the switch-over —
+    /// and kept so a caller that asks is not broken. The signer's own
+    /// refusals are in [`Session::unusable`].
     pub fn exhausted(&self) -> bool {
-        self.plan.exhausted()
+        false
     }
 
-    /// The step that stalled, if one has, as a string — or empty.
-    ///
-    /// A page shows this. Without it a step nobody answers leaves the screen
-    /// saying nothing at all, which is indistinguishable from slow.
+    /// The install step that stalled: the engine delegate's plan, which the
+    /// page path does not have. Always empty (see [`Session::exhausted`]).
     pub fn stalled(&self) -> String {
-        self.plan
-            .stalled()
-            .map(|s| format!("{s:?}"))
-            .unwrap_or_default()
+        String::new()
     }
 
-    /// Why provisioning stopped, in the node's own words — or empty.
+    /// Why the engine delegate's install stopped: that plan is gone. Always
+    /// empty (see [`Session::exhausted`]); the signer's refusals are in
+    /// [`Session::unusable`].
     pub fn refused(&self) -> String {
-        self.plan
-            .refused()
-            .map(|(s, w)| format!("{s:?}: {w}"))
-            .unwrap_or_default()
+        String::new()
     }
 
     /// The socket dropped and a new one opened.
@@ -1293,7 +964,6 @@ impl Session {
     /// The step in flight is re-issued by `tick`, not here, because a reply
     /// may have been sent before the socket dropped and arrive on the new one.
     pub fn reconnected(&mut self) {
-        self.frames.reset();
         // The node's copy of a subscription outlives the engine's context and
         // can be evicted at its cap without anyone being told (F39), so this
         // connection asks again. Idempotent at the node, so it costs nothing
@@ -1309,25 +979,18 @@ impl Session {
     /// its key: the contract instance id, as the node names it and serves a
     /// web container under (`/v1/contract/web/<key>/`).
     ///
-    /// The frames go out with the next `outbound`, through page-io in page
-    /// mode (the only path to the node there). [`Session::put_status`] says
+    /// The frames go out with the next `outbound`, through page-io (the only
+    /// path to the node). [`Session::put_status`] says
     /// what the node answered, matched by this key. **An ack is not
     /// durability:** a publisher that must know reads it back.
     pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
         let (key, contract, state) = wire::puts::contract(&code, &params, &state);
-        if self.page_mode {
-            let Some(p) = self.page.as_mut() else {
-                return Err(JsValue::from_str("page mode: provision first — there is no path to the node before it"));
-            };
-            p.put_contract(contract, state).map_err(|e| JsValue::from_str(&e))?;
-            self.puts.begin(key.clone());
-            self.pump_page();
-        } else {
-            let stream = self.next_stream();
-            let frames = wire::frame_put(contract, state, stream).map_err(|e| JsValue::from_str(&e))?;
-            self.out.extend(frames);
-            self.puts.begin(key.clone());
-        }
+        let Some(p) = self.page.as_mut() else {
+            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
+        };
+        p.put_contract(contract, state).map_err(|e| JsValue::from_str(&e))?;
+        self.puts.begin(key.clone());
+        self.pump_page();
         Ok(key)
     }
 
@@ -1336,7 +999,7 @@ impl Session {
     /// the publisher's session). Published data is readable by default;
     /// writing is access control, which a view does not have.
     ///
-    /// Instead of `provision`: the in-page engine (page mode) reads that head
+    /// Instead of `provision`: the in-page engine reads that head
     /// and its blocks through page-io's READER — no signer, nothing installed
     /// or registered on this node — and every write is refused before it
     /// reaches the store ([`Session::read_only`]).
@@ -1352,10 +1015,9 @@ impl Session {
         for (i, b) in id.iter_mut().enumerate() {
             *b = u8::from_str_radix(&register_id[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
         }
-        if self.page.is_some() || self.artefacts.is_some() {
+        if self.page.is_some() {
             return Err(JsValue::from_str("open_named: this session is already open on its own head"));
         }
-        self.page_mode = true;
         self.read_only = true;
         let server = page::server::Server::new(
             page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
@@ -1747,7 +1409,6 @@ impl Session {
         // rows a component is showing, and the component finds out the same
         // way it finds out about anybody else's.
         self.note_local(&told);
-        let stalled = self.plan.tick(now);
         // A load nobody answered ends as UNAVAILABLE rather than waiting for
         // ever. The read parked on it gets a fact; a page can show it.
         // A load the page's own cold read holds ends by its blocks' deadlines
@@ -1826,7 +1487,6 @@ impl Session {
             .collect();
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
-            "stalled": stalled.map(|s| format!("{s:?}")),
             "loadsInFlight": self.loads.in_flight(),
             "conflicts": conflicts,
             "superseded": superseded,

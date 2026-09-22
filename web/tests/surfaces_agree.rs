@@ -90,10 +90,6 @@ const TRANSPORT_ONLY: &[&str] = &[
     "read_only",
     "head_id",
     "unowned",
-    // PAGE MODE (ruling B): which engine this session runs — the delegate's,
-    // or the in-page one over page-io. A transport choice; an in-memory store
-    // has no engine at all.
-    "set_page_mode",
     // How this session finds out the head moved, and whether it is being
     // TOLD or polling. An in-memory store has no head on a node and nothing
     // to be notified by — its data cannot change under it — so there is

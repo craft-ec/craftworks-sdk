@@ -133,7 +133,7 @@ await t("a COLD SCAN resolves through sdk.open() and nothing else", async () => 
 
 await t("the artefacts an app is handed are the ones this build ships", () => {
   const sdk = wrap(fakeRaw());
-  for (const k of ["delegate", "block", "register"]) {
+  for (const k of ["signer", "block", "register"]) {
     assert.equal(typeof sdk.SHIPPED_ARTEFACTS[k], "string", `no ${k} artefact`);
     assert.match(sdk.SHIPPED_ARTEFACTS[k], /\.wasm$/, `${k} is not a wasm artefact`);
   }

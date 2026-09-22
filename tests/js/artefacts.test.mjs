@@ -192,18 +192,18 @@ await t("all three are fetched together, and a missing one fails the set", async
   const caches = fakeCaches();
   const net = countingFetch(PAYLOAD);
   const spec = {
-    delegate: { url: "/d", sha256 },
+    signer: { url: "/s", sha256 },
     block: { url: "/b", sha256 },
     register: { url: "/r", sha256 },
   };
   const all = await allArtefactBytes(spec, { fetch: net.fetch, caches, subtle });
-  assert.deepEqual(Object.keys(all).sort(), ["block", "delegate", "register"]);
+  assert.deepEqual(Object.keys(all).sort(), ["block", "register", "signer"]);
   // All three are the same bytes here, so the cache makes it ONE fetch — which
   // is the content-addressing working: same hash, same entry, whatever the url.
   assert.ok(net.calls() >= 1);
 
   await assert.rejects(
-    () => allArtefactBytes({ delegate: spec.delegate }, { fetch: net.fetch, caches, subtle }),
+    () => allArtefactBytes({ signer: spec.signer }, { fetch: net.fetch, caches, subtle }),
     /no block artefact/,
     "a partial set is not a smaller provisioning",
   );
@@ -223,7 +223,7 @@ await t("the manifest's hashes ARE the shipped files", async () => {
     await readFile(new URL("artefacts.json", dir), "utf8"),
   );
   let checked = 0;
-  for (const name of ["delegate", "signer", "block", "register", "sdk"]) {
+  for (const name of ["signer", "block", "register", "sdk"]) {
     const entry = manifest[name];
     assert.ok(entry, `artefacts.json has no ${name}`);
     const bytes = new Uint8Array(await readFile(new URL(entry.file, dir)));
@@ -234,7 +234,7 @@ await t("the manifest's hashes ARE the shipped files", async () => {
     assert.equal(bytes.length, entry.bytes, `${entry.file} is not ${entry.bytes} B`);
     checked += 1;
   }
-  assert.equal(checked, 5, "every artefact must be checked, not some of them");
+  assert.equal(checked, 4, "every artefact must be checked, not some of them");
   // The artefacts CONTAINER (builder#104): the shipped file is what the
   // manifest says, and it names the address a builder PUTs it under.
   const c = manifest.container;
@@ -347,7 +347,7 @@ await t("THE CONTROL: no url at all is refused, not silently empty", async () =>
 // ---------------------------------------------------------------------------
 
 const MANIFEST = JSON.stringify({
-  delegate: { file: "engine_delegate.wasm", sha256: "d".repeat(64), bytes: 1 },
+  signer: { file: "signer.wasm", sha256: "d".repeat(64), bytes: 1 },
   block: { file: "block.wasm", sha256: "b".repeat(64), bytes: 1 },
   register: { file: "register.wasm", sha256: "r".repeat(64), bytes: 1 },
   sdk: { file: "craftworks_sdk_bg.wasm", sha256: "5".repeat(64), bytes: 1 },
@@ -363,11 +363,11 @@ await t("**an app that names a contract key points at it FIRST**", async () => {
     artefactsKey: "ARTEFACTS",
     origin: "https://node",
   });
-  assert.deepEqual(spec.delegate.urls, [
-    "https://node/v1/contract/web/ARTEFACTS/engine_delegate.wasm",
-    "https://node/v1/contract/web/theapp/sdk/engine_delegate.wasm",
+  assert.deepEqual(spec.signer.urls, [
+    "https://node/v1/contract/web/ARTEFACTS/signer.wasm",
+    "https://node/v1/contract/web/theapp/sdk/signer.wasm",
   ], "the shared copy is not tried first, or the local one is not kept as a fallback");
-  assert.equal(spec.delegate.sha256, "d".repeat(64), "the hash from the manifest is gone");
+  assert.equal(spec.signer.sha256, "d".repeat(64), "the hash from the manifest is gone");
 });
 
 await t("THE CONTROL: with no key, it is the local file and nothing else", async () => {
@@ -429,7 +429,7 @@ await t("**THE CONTROL THAT MATTERS: bytes that do not match the named hash are 
   await assert.rejects(
     () =>
       artefactBytes(
-        { urls: ["https://node/v1/contract/web/ARTEFACTS/engine_delegate.wasm"], sha256 },
+        { urls: ["https://node/v1/contract/web/ARTEFACTS/signer.wasm"], sha256 },
         {
           fetch: async () => new Response(new Uint8Array([9, 9, 9])),
           caches: null,

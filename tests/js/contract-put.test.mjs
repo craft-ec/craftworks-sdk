@@ -45,21 +45,30 @@ const flush = (s, ours) => {
   return node(CODE, PARAMS, STATE, "x", out).frames.filter(f => ours === undefined || f.op === "put");
 };
 
+/** A session provisioned on the page path (the only one): the node is reached
+ * through page-io, and a PUT before this has no path at all. */
+const provisioned = () => {
+  const s = new Session(7999);
+  s.provision(new TextEncoder().encode("signer code"), new TextEncoder().encode("block code"), new TextEncoder().encode("register code"));
+  flush(s);
+  return s;
+};
+
 const us = node(CODE, PARAMS, STATE);
 const them = node(OTHER, PARAMS, STATE);
 
 await t("the PUT goes out as ONE frame: a Put of the app's contract with its state, under the key put_contract returned", async () => {
-  const s = new Session(7999);
+  const s = provisioned();
   assert.deepEqual(status(s, us.key), { state: "none", said: "" });
   const key = s.put_contract(CODE, PARAMS, STATE);
   assert.equal(key, us.key, "put_contract returned a key the node does not name the contract by");
   assert.deepEqual(status(s, key), { state: "pending", said: "" });
-  assert.deepEqual(flush(s), [{ op: "put", key, state: hex(STATE) }], "the frames sent are not exactly the PUT");
+  assert.deepEqual(flush(s, "puts"), [{ op: "put", key, state: hex(STATE) }], "the PUT frames sent are not exactly the PUT");
   assert.equal(s.outbound().length, 0, "the PUT was not given up once sent");
 });
 
 await t("**the node's ack settles it: none → pending → put**", async () => {
-  const s = new Session(7999);
+  const s = provisioned();
   const key = s.put_contract(CODE, PARAMS, STATE);
   flush(s);
   s.on_inbound(them.ack);
@@ -69,7 +78,7 @@ await t("**the node's ack settles it: none → pending → put**", async () => {
 });
 
 await t("**a refusal naming the contract: → refused, in the node's words, and not blamed on provisioning**", async () => {
-  const s = new Session(7999);
+  const s = provisioned();
   const key = s.put_contract(CODE, PARAMS, STATE);
   flush(s);
   s.on_inbound(node(OTHER, PARAMS, STATE, "not ours").refusal);
@@ -82,7 +91,7 @@ await t("**a refusal naming the contract: → refused, in the node's words, and 
 });
 
 await t("**a dropped socket → unanswered; an answer on the new socket still settles it; a settled one stays**", async () => {
-  const s = new Session(7999);
+  const s = provisioned();
   const done = s.put_contract(OTHER, PARAMS, STATE);
   const key = s.put_contract(CODE, PARAMS, STATE);
   flush(s);
@@ -94,14 +103,13 @@ await t("**a dropped socket → unanswered; an answer on the new socket still se
   assert.deepEqual(status(s, key), { state: "put", said: "" });
 });
 
-await t("**PAGE MODE: the PUT goes through page-io, and its ack and refusal come back to put_status**", async () => {
+await t("**the PUT goes through page-io, and its ack and refusal come back to put_status**", async () => {
   const s = new Session(7999);
-  s.set_page_mode(true, new TextEncoder().encode("signer code"));
-  assert.throws(() => s.put_contract(CODE, PARAMS, STATE), /provision first/, "page mode PUT before there is a path to the node");
-  s.provision(new Uint8Array(), new TextEncoder().encode("block code"), new TextEncoder().encode("register code"));
+  assert.throws(() => s.put_contract(CODE, PARAMS, STATE), /provision first/, "a PUT before there is a path to the node");
+  s.provision(new TextEncoder().encode("signer code"), new TextEncoder().encode("block code"), new TextEncoder().encode("register code"));
   flush(s);
   const key = s.put_contract(CODE, PARAMS, STATE);
-  assert.deepEqual(flush(s, "puts"), [{ op: "put", key, state: hex(STATE) }], "the page-mode PUT did not go out");
+  assert.deepEqual(flush(s, "puts"), [{ op: "put", key, state: hex(STATE) }], "the PUT did not go out");
   s.on_inbound(us.ack);
   assert.deepEqual(status(s, key), { state: "put", said: "" }, "page-io's handed-back ack never reached put_status");
   const other = s.put_contract(OTHER, PARAMS, STATE);
@@ -110,10 +118,9 @@ await t("**PAGE MODE: the PUT goes through page-io, and its ack and refusal come
   assert.deepEqual(status(s, other), { state: "refused", said: "too big" });
 });
 
-await t("PAGE MODE: an answer for a contract this session never put is counted unusable, not dropped", async () => {
+await t("an answer for a contract this session never put is counted unusable, not dropped", async () => {
   const s = new Session(7999);
-  s.set_page_mode(true, new TextEncoder().encode("signer code"));
-  s.provision(new Uint8Array(), new TextEncoder().encode("block code"), new TextEncoder().encode("register code"));
+  s.provision(new TextEncoder().encode("signer code"), new TextEncoder().encode("block code"), new TextEncoder().encode("register code"));
   flush(s);
   const before = s.unusable();
   s.on_inbound(them.ack);

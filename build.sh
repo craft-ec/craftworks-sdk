@@ -71,18 +71,15 @@ if [ ! -f "$contracts/build/block.wasm" ]; then
   echo "no contracts build at $contracts/build (set CRAFTWORKS_CONTRACTS)" >&2
   exit 1
 fi
-./engine-delegate/build.sh >/dev/null
-delegate=target/wasm32-unknown-unknown/release/engine_delegate.stripped.wasm
-cp "$delegate" pkg/web/engine_delegate.wasm
-# THE SIGNER, beside the engine delegate: page mode (ruling B) provisions it
-# instead, and a published app opened on another node fetches it from the
-# artefacts container like the other four (builder#104). Built and
-# import-gated by its own script.
+# THE SIGNER: the one delegate (the engine runs in the page, ruling B). A
+# published app opened on another node fetches it from the artefacts
+# container like the other three (builder#104). Built and import-gated by its
+# own script.
 ./signer/build.sh >/dev/null
 cp target/wasm32-unknown-unknown/release/signer.stripped.wasm pkg/web/signer.wasm
 cp "$contracts/build/block.wasm" "$contracts/build/register.wasm" pkg/web/
 
-# THE ARTEFACTS CONTAINER (craftworks-builder#104): the four artefacts in ONE
+# THE ARTEFACTS CONTAINER (craftworks-builder#104): the artefacts in ONE
 # web container under the `webapp` contract (freenet-contracts epoch 2), which
 # the node serves at /v1/contract/web/<address>/<file> — where session.js
 # already looks for them. The same bytes for every app of this build, so it is
@@ -126,7 +123,7 @@ assert len(s) == 16 + m + w, "the container's framing does not add up"
 open(sys.argv[2], 'wb').write(s[16 + m:])
 PY
 (cd "$unpacked" && xz -dc web.xz | tar -xf -)
-for f in craftworks_sdk_bg.wasm engine_delegate.wasm signer.wasm block.wasm register.wasm; do
+for f in craftworks_sdk_bg.wasm signer.wasm block.wasm register.wasm; do
   cmp -s "$unpacked/$f" "pkg/web/$f" ||
     { echo "the artefacts container's $f is not the shipped $f" >&2; exit 1; }
 done
@@ -138,11 +135,11 @@ rm -rf "$unpacked"
 # app never runs it, the node does.
 cp "$contracts/build/webapp.wasm" pkg/web/
 
-# The delegate's hash cannot be inside the SDK's own wasm — a build cannot
+# The signer's hash cannot be inside the SDK's own wasm — a build cannot
 # contain its own digest — and the CONTRACT hashes are in `buildInfo()`,
 # copied from `hashes.toml` by `build.rs`. This file carries the one that is
 # left, beside the bytes it describes.
-# EVERY artefact's hash, not only the delegate's (sdk#5).
+# EVERY artefact's hash, not only the signer's (sdk#5).
 #
 # The hashes are what the shared cache is keyed by and what each artefact is
 # CHECKED against before it is used, so they are not documentation: an app
@@ -152,14 +149,11 @@ cp "$contracts/build/webapp.wasm" pkg/web/
 # by someone remembering to update it.
 hash_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
 size_of() { wc -c < "$1" | tr -d ' '; }
-delegate_hash=$(hash_of pkg/web/engine_delegate.wasm)
 block_hash=$(hash_of pkg/web/block.wasm)
 register_hash=$(hash_of pkg/web/register.wasm)
 sdk_hash=$(hash_of pkg/web/craftworks_sdk_bg.wasm)
 cat > pkg/web/artefacts.json <<JSON
 {
-  "delegate": { "file": "engine_delegate.wasm", "sha256": "$delegate_hash",
-                "bytes": $(size_of pkg/web/engine_delegate.wasm) },
   "signer":   { "file": "signer.wasm",          "sha256": "$(hash_of pkg/web/signer.wasm)",
                 "bytes": $(size_of pkg/web/signer.wasm) },
   "block":    { "file": "block.wasm",           "sha256": "$block_hash",
@@ -176,4 +170,4 @@ cat > pkg/web/artefacts.json <<JSON
 JSON
 # wasm-bindgen emits CommonJS for node; say so, since this package is ESM.
 echo '{"type":"commonjs"}' > pkg/node/package.json
-echo "pkg/web $(wc -c < pkg/web/craftworks_sdk_bg.wasm | tr -d ' ') B + delegate $(wc -c < pkg/web/engine_delegate.wasm | tr -d ' ') B + 2 contracts"
+echo "pkg/web $(wc -c < pkg/web/craftworks_sdk_bg.wasm | tr -d ' ') B + signer $(wc -c < pkg/web/signer.wasm | tr -d ' ') B + 2 contracts"

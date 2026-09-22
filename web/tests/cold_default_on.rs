@@ -1,10 +1,12 @@
-//! Cold reads in the page are ON by default, and the builder can turn them off.
+//! The Session's OWN cold reads — the F52 mitigation for the engine delegate,
+//! whose cold read could stall ≈ 60 s — are OFF on the page path, which the
+//! switch-over made the only one: the in-page engine fetches every block
+//! itself through page-io, each node call on its RTO (#227). Their removal is
+//! sdk#258; until then this pins that they stay off and that asking for them
+//! is refused by name rather than half-done.
 //!
 //! `Session` cannot be built natively, so this reads the source. The reader
 //! itself (`craftworks_sdk::cold`) is tested in the sdk's `tests/cold_read.rs`.
-//! What those tests cannot see is whether a page that never calls
-//! `set_cold_reads` gets it switched on. Without that, the default would
-//! silently be OFF and every cold range would go back to the engine's F52 stall.
 
 use std::path::Path;
 
@@ -22,23 +24,20 @@ fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn provisioning_switches_cold_reads_on_unless_the_builder_chose() {
+fn provisioning_turns_the_sessions_cold_reads_off_and_turning_them_on_is_refused() {
     let src = session_src();
-    let provision = body_of(&src, "provision");
-    assert!(
-        provision.contains("if !self.cold_chosen") && provision.contains("self.switch_cold(true, block.clone())"),
-        "`provision` does not switch cold reads on by default:\n{provision}"
-    );
+    let page = body_of(&src, "provision_page");
+    assert!(page.contains("self.switch_cold(false"), "provisioning leaves the Session's cold reads on:\n{page}");
     let set = body_of(&src, "set_cold_reads");
-    assert!(set.contains("self.cold_chosen = true"), "the builder's choice is not remembered:\n{set}");
-    assert!(set.contains("self.switch_cold(on, block_code)"), "the builder's choice is not applied:\n{set}");
+    assert!(set.contains("self.unusable.push(") && set.contains("sdk#258"), "turning cold reads on is not refused by name:\n{set}");
+    assert!(!src.contains("switch_cold(true"), "something still switches the Session's own cold reads ON");
 }
 
 /// THE CONTROL: the reader finds the real bodies, so the check above can fail.
 #[test]
 fn control_the_reader_finds_the_bodies() {
     let src = session_src();
-    assert!(body_of(&src, "provision").contains("self.artefacts = Some("));
+    assert!(body_of(&src, "provision_page").contains("io.begin(container)"));
     assert!(body_of(&src, "switch_cold").contains("contract_deriver("));
 }
 
@@ -54,20 +53,6 @@ fn the_tick_spares_the_loads_the_cold_reader_holds() {
     assert!(tick.contains("time_out_except(now, |id| cold.holds(id))"), "`tick` ends cold loads by their age:\n{tick}");
     assert!(!tick.contains("self.loads.time_out(now)"), "`tick` still ends every load by its age");
     assert!(tick.contains("self.cold.tick(now)"), "`tick` never drives the cold reader's clock");
-}
-
-/// The cold clock runs on every GET answer, not only on the page's 1 s tick.
-/// The live runs ticked it at that cadence (after every message, at least
-/// every 100 ms); a page that ticked it once a second would notice a late
-/// fetch up to a second after its RTO.
-#[test]
-fn every_get_answer_also_runs_the_cold_clock() {
-    let src = session_src();
-    for arm in ["Incoming::Got { id, state } =>", "Incoming::GetFailed { id } =>"] {
-        let at = src.find(arm).unwrap_or_else(|| panic!("no arm {arm}"));
-        let body = &src[at..at + src[at..].find("None =>").expect("the arm's None")];
-        assert!(body.contains("self.cold.tick(now)"), "{arm} does not run the cold clock:\n{body}");
-    }
 }
 
 /// The one-shot timer's entry runs the cold clock AND carries out what it

@@ -190,11 +190,11 @@ async function matches(bytes, sha256, subtle) {
 /**
  * All three, in parallel and awaited together.
  *
- * A partial set is not a smaller provisioning, it is one that installs a
- * delegate it cannot then give contract code to — so one failure fails the
+ * A partial set is not a smaller provisioning, it is one that provisions a
+ * signer it cannot then give contract code to — so one failure fails the
  * lot rather than leaving a half-provisioned node.
  *
- * **The delegate is always fetched, never named by key.** `DelegateRequest`
+ * **The signer (a delegate) is always fetched, never named by key.** `DelegateRequest`
  * has only `RegisterDelegate { delegate: DelegateContainer, … }`,
  * `ApplicationMessages` and `UnregisterDelegate` — there is no request that
  * fetches delegate code from the network, so its bytes must come from the
@@ -202,7 +202,7 @@ async function matches(bytes, sha256, subtle) {
  * from on a miss.
  */
 export async function allArtefactBytes(spec, deps = {}) {
-  const names = ["delegate", "block", "register"];
+  const names = ["signer", "block", "register"];
   const out = await Promise.all(
     names.map(n => {
       if (!spec[n]) throw new Error(`no ${n} artefact in the manifest`);

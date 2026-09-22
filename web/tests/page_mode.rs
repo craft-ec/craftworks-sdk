@@ -1,13 +1,14 @@
-//! PAGE MODE in the web Session (ruling B, part 2). `Session` cannot be built
-//! natively, so this reads the source, as the other web wiring gates do: the
-//! decisions are tested natively in `page` and `page-io`
-//! (`page-io/tests/wire_node.rs` drives a whole write through real frames),
-//! and what those cannot see is whether the Session still ROUTES to them.
+//! THE PAGE PATH in the web Session (ruling B; the switch-over made it the
+//! only one). `Session` cannot be built natively, so this reads the source,
+//! as the other web wiring gates do: the decisions are tested natively in
+//! `page` and `page-io` (`page-io/tests/wire_node.rs` drives a whole write
+//! through real frames), and what those cannot see is whether the Session
+//! still ROUTES to them.
 //!
-//! * the flag is OFF by default;
-//! * with it on, the store's protocol frames go to page-io, not to a delegate;
-//!   node frames go to page-io; provisioning goes to the signer through
-//!   page-io; the engine delegate's plan does not run — no other path;
+//! * there is NO delegate path left to route to: no engine-delegate framing,
+//!   no install plan, no mode flag;
+//! * the store's protocol frames go to page-io; node frames go to page-io;
+//!   provisioning goes to the signer through page-io;
 //! * the page's own cold reads are off (the in-page engine fetches blocks
 //!   itself, through page-io, on the RTO estimator);
 //! * the one-shot timer and the tick drive page-io.
@@ -26,27 +27,26 @@ fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn page_mode_is_off_by_default() {
+fn there_is_no_delegate_path_left() {
     let src = session_src();
-    assert!(src.contains("            page_mode: false,"), "page mode is not OFF in `new`");
+    for gone in ["frame_engine_request", "frame_register_delegate", "Provisioner", "page_mode", "fn advance(", "wire::unframe"] {
+        assert!(!src.contains(gone), "the delegate path is still in the Session: `{gone}`");
+    }
 }
 
 #[test]
-fn in_page_mode_every_path_to_the_node_is_page_io() {
+fn every_path_to_the_node_is_page_io() {
     let src = session_src();
     let env = body_of(&src, "envelope_engine_requests");
-    assert!(env.contains("if self.page_mode {") && env.contains(".client(&bytes)"), "the store's frames do not go to page-io:\n{env}");
+    assert!(env.contains(".client(&bytes)"), "the store's frames do not go to page-io:\n{env}");
     let inbound = body_of(&src, "on_inbound");
-    let head = &inbound[..inbound.find("match wire::unframe").expect("the delegate path")];
-    assert!(head.contains("if self.page_mode {") && head.contains("p.inbound(bytes,") && head.contains("return owned;"), "node frames reach the delegate path in page mode:\n{head}");
+    assert!(inbound.contains("p.inbound(bytes,"), "node frames do not go to page-io:\n{inbound}");
     let prov = body_of(&src, "provision");
-    assert!(prov.contains("if self.page_mode {") && prov.contains("self.provision_page(block, register);"), "provisioning does not go to the signer:\n{prov}");
+    assert!(prov.contains("self.signer_code = signer;") && prov.contains("self.provision_page(block, register);"), "provisioning does not go to the signer:\n{prov}");
     let page = body_of(&src, "provision_page");
     // It ASKS the signer first (`begin`); what it sends is tested on the real
     // Session in tests/js/page-identity.test.mjs.
     assert!(page.contains("io.begin(container)") && page.contains("self.switch_cold(false"), "provision_page does not open through the signer or leaves cold reads on:\n{page}");
-    let adv = body_of(&src, "advance");
-    assert!(adv.contains("if self.page_mode {\n            return;"), "the engine delegate's plan runs in page mode:\n{adv}");
 }
 
 #[test]
