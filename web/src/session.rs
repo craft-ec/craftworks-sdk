@@ -1481,6 +1481,12 @@ impl Session {
         // calling it directly skipped every decision the store makes around
         // it.
         let told = self.db.store_mut().tick();
+        // A write told `Lost` with no tries left fell (sdk#265): said by name,
+        // never a row that just vanished.
+        let lost_gave_up = self.db.store_mut().take_lost_gave_up();
+        for id in &lost_gave_up {
+            self.unusable.push(format!("write {id} was told Lost with its {} tries spent and was not saved", craftworks_sdk::cached_store::WRITE_TRIES));
+        }
         // A LOCAL change is a change too: a write that rolled back moves the
         // rows a component is showing, and the component finds out the same
         // way it finds out about anybody else's.
@@ -1563,6 +1569,7 @@ impl Session {
             .collect();
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
+            "lostGaveUp": lost_gave_up,
             "loadsInFlight": self.loads.in_flight(),
             "conflicts": conflicts,
             "superseded": superseded,

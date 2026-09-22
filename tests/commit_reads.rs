@@ -113,10 +113,15 @@ fn published(v: &[protocol::WriteState]) -> bool {
 }
 
 /// B read the record, A changed it, B's update from its stale read is REFUSED:
-/// nothing applied, `Failed` on this path, rolled back, sent ONCE, and A's
-/// value stands for a fresh reader. The control (no A in between) publishes.
+/// nothing applied, rolled back, and A's value stands for a fresh reader. The
+/// control (no A in between) publishes.
+///
+/// It goes ONCE — unless B's own engine judged it on its older view and said
+/// `Lost`, which means nothing applied and B still holds it: then it goes
+/// again WITH ITS READS (sdk#265) and is refused where they are judged,
+/// `Conflict` + `Conflicted` naming the key (M2). Bounded by its one budget.
 #[test]
-fn a_stale_update_is_refused_rolled_back_and_never_re_sent() {
+fn a_stale_update_is_refused_and_rolled_back_however_often_it_goes() {
     for interfere in [false, true] {
         let node = PageNode::new();
         let mut a = Tab::open(&node, 1);
@@ -140,14 +145,28 @@ fn a_stale_update_is_refused_rolled_back_and_never_re_sent() {
         b.db.update("tasks", loc, &fields("B's edit")).expect("B's update is made");
         b.pump();
         b.seconds(10);
-        assert_eq!(b.sends.get(&w), Some(&1), "interfere {interfere}: B's write went on the wire {:?} times", b.sends.get(&w));
-        assert_eq!(b.conflicted_replies, 0, "the Shell sent `Conflicted` — a reply an older v4 build cannot read");
+        // ONCE — unless B's engine judged it on its own older view and said
+        // `Lost`, which is "nothing applied, the client still holds it": it
+        // goes again, WITH ITS READS, and is refused where they are judged
+        // (sdk#265). Bounded by the write's one budget, never unbounded.
+        let sent = b.sends.get(&w).copied().unwrap_or(0);
+        let tries = usize::from(craftworks_sdk::cached_store::WRITE_TRIES);
+        if b.told(w).contains(&protocol::WriteState::Lost) {
+            assert!((1..=1 + tries).contains(&sent), "interfere {interfere}: a Lost write went on the wire {sent} times, past its {tries} tries");
+        } else {
+            assert_eq!(sent, 1, "interfere {interfere}: B's write went on the wire {sent} times");
+        }
+        // `Conflicted` is for a v4 writer WITH A SESSION and names the key
+        // whose read no longer held. It belongs to a write judged where its
+        // reads are — the re-send — and to nothing else.
+        let re_sent = sent > 1;
+        assert!(b.conflicted_replies <= usize::from(re_sent), "`Conflicted` arrived for a write that was never re-judged: {} of them", b.conflicted_replies);
         if interfere {
             // Refused where its read is judged (`Failed`), or — when B's
             // engine judged it on its own older view — lost to A's newer head
             // (`Lost`, R0: re-judged if ever re-sent). Either way NOT applied.
             assert!(
-                matches!(b.told(w).last(), Some(protocol::WriteState::Failed | protocol::WriteState::Lost)),
+                matches!(b.told(w).last(), Some(protocol::WriteState::Failed | protocol::WriteState::Lost | protocol::WriteState::Conflict)),
                 "a stale update was not refused: {:?}",
                 b.told(w)
             );

@@ -407,7 +407,14 @@ fn an_own_writes_state_change_names_its_keys() {
     let both = vec![b"a/1".to_vec(), b"a/2".to_vec()];
     use protocol::WriteState as W;
     assert_eq!(verdict_of(&[W::Accepted, W::Published, W::ParityComplete]), vec![vec![], both.clone(), both.clone()], "Published and then ParityComplete must each name the write's keys; Accepted changes no row's settled state");
-    assert_eq!(verdict_of(&[W::Lost]), vec![both.clone()], "a lost write's rows were not named");
+    // sdk#265: a `Lost` write GOES AGAIN, so nothing about its rows has
+    // changed — they still say saving, which is true. Its keys are named when
+    // it runs out of tries and FALLS, which is when the rows are wrong.
+    let tries = usize::from(craftworks_sdk::cached_store::WRITE_TRIES);
+    let losts = vec![W::Lost; tries + 1];
+    let mut named: Vec<Vec<Vec<u8>>> = vec![vec![]; tries];
+    named.push(both.clone());
+    assert_eq!(verdict_of(&losts), named, "a lost write named its rows before it fell, or did not name them when it did");
     assert_eq!(verdict_of(&[W::Published, W::Published]), vec![both, vec![]], "a repeated verdict named the keys again");
 }
 
@@ -447,4 +454,149 @@ fn a_record_key_names_its_domain_and_a_schema_key_none() {
     schema.extend_from_slice(b"schema\0notes");
     assert_eq!(D::domain_of_key(&schema), None, "a schema key named a domain: a define would re-run every binding");
     assert_eq!(D::domain_of_key(b""), None);
+}
+
+/// sdk#265: a write told `Lost` is RE-SENT (with its reads), not rolled back:
+/// its commit applied nothing and this client is the only thing that holds
+/// it. BOUNDED: the first WRITE_TRIES Losts re-send it; the next one
+/// falls it, and it is named for the app (`take_lost_gave_up`).
+#[test]
+fn a_lost_write_is_re_sent_and_falls_named_only_at_the_bound() {
+    let mut s = store();
+    s.on_page(b"a/", b"b/", vec![], root(1));
+    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
+    let sent = |s: &mut CachedStore| -> Vec<u64> {
+        s.take_outbound()
+            .iter()
+            .filter_map(|f| match protocol::decode_request(f) {
+                protocol::Incoming::Ok(env) => match env.body {
+                    protocol::Request::Commit { write_id, .. } | protocol::Request::Write { write_id, .. } => Some(write_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    let first = sent(&mut s);
+    let write_id = *first.first().expect("the write went out");
+    let session = s.client.session().expect("a session");
+    let lost = |s: &mut CachedStore| s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id, state: protocol::WriteState::Lost }).expect("encodes"));
+    let bound = craftworks_sdk::cached_store::WRITE_TRIES as usize + 1;
+    for n in 1..bound {
+        lost(&mut s);
+        assert_eq!(sent(&mut s), vec![write_id], "Lost #{n} did not re-send the write");
+        assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"v".to_vec())), "Lost #{n} rolled the row back");
+        assert!(s.take_lost_gave_up().is_empty(), "named before the bound");
+    }
+    lost(&mut s);
+    assert!(sent(&mut s).is_empty(), "re-sent past the bound: a write that is Lost for ever would spin");
+    assert_eq!(s.take_lost_gave_up(), vec![write_id], "the write that fell at the bound was not named");
+    assert_eq!(s.copy.pending().0, 0, "the fallen write is still held");
+}
+
+/// Every write frame this store has sent since the last call, by write id.
+fn sent_ids(s: &mut CachedStore) -> Vec<u64> {
+    s.take_outbound()
+        .iter()
+        .filter_map(|f| match protocol::decode_request(f) {
+            protocol::Incoming::Ok(env) => match env.body {
+                protocol::Request::Commit { write_id, .. } | protocol::Request::Write { write_id, .. } => Some(write_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// sdk#265, the architect's item 1 (ORDERING). A write made AFTER a `Lost`
+/// one, on its keys, that has already LEFT the outbox is PULLED BACK: its
+/// `Conflict` — its reads declared the Lost write's value, which the tree
+/// that won does not hold — queues it again BEHIND that write, rather than
+/// falling it and asking the app. Both land, in the order the person made
+/// them, and the key ends with the LATER value.
+#[test]
+fn a_write_behind_a_lost_one_is_pulled_back_and_lands_after_it() {
+    use craftworks_sdk::read_token::read_token;
+    let mut s = store();
+    s.on_page(b"a/", b"b/", vec![(b"a/1".to_vec(), b"old".to_vec())], root(1));
+    Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Value(read_token(b"old")))], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"first".to_vec()))]).expect("taken");
+    let w1 = *sent_ids(&mut s).first().expect("w1 went out");
+    // Made and SENT before the Lost arrives: it is at the node, not in the
+    // outbox, so it cannot simply be re-ordered — it is pulled back.
+    Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Value(read_token(b"first")))], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"second".to_vec()))]).expect("taken");
+    let w2 = *sent_ids(&mut s).first().expect("w2 went out");
+    let session = s.client.session().expect("a session");
+    let say = |s: &mut CachedStore, id: u64, st: protocol::WriteState| s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id: id, state: st }).expect("encodes"));
+    say(&mut s, w1, protocol::WriteState::Lost);
+    // Nothing goes yet: w2 is still at the node, and the engine takes one
+    // commit at a time (`drain_queued`).
+    assert!(sent_ids(&mut s).is_empty(), "a write went while another was still awaiting its verdict");
+    // w2 was judged at the head that won, where a/1 does not hold "first".
+    say(&mut s, w2, protocol::WriteState::Conflict);
+    s.on_inbound(&protocol::encode_reply(&protocol::Reply::Conflicted { session, write_id: w2, key: b"a/1".to_vec(), current: Some(read_token(b"theirs")) }).expect("encodes"));
+    assert!(s.take_conflict_chains().is_empty(), "the pulled-back write was sent to the app as a conflict instead of going again behind the Lost one");
+    assert_eq!(sent_ids(&mut s), vec![w1], "the Lost write did not go again, oldest first");
+    say(&mut s, w1, protocol::WriteState::Published);
+    assert_eq!(sent_ids(&mut s), vec![w2], "the pulled-back write did not follow the Lost one");
+    say(&mut s, w2, protocol::WriteState::Published);
+    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"second".to_vec())), "the key does not hold the LAST write the person made");
+    assert_eq!(s.copy.pending().0, 0, "a write is still unsaved");
+}
+
+/// The other half of item 1: when a later write of this client's LANDS first
+/// on the Lost write's key, the Lost one can no longer go — in the order made
+/// it is underneath, and a write goes whole or not at all (W1). It falls, and
+/// it is NAMED; the key keeps the LAST value the person wrote.
+#[test]
+fn a_lost_write_a_later_one_landed_over_falls_named_rather_than_re_sent() {
+    let mut s = store();
+    s.on_page(b"a/", b"b/", vec![], root(1));
+    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"first".to_vec()))]).expect("taken");
+    let w1 = *sent_ids(&mut s).first().expect("w1 went out");
+    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"second".to_vec()))]).expect("taken");
+    let w2 = *sent_ids(&mut s).first().expect("w2 went out");
+    let session = s.client.session().expect("a session");
+    let say = |s: &mut CachedStore, id: u64, st: protocol::WriteState| s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id: id, state: st }).expect("encodes"));
+    // The later write is taken and published while w1's Lost is still on its
+    // way — the node's order, not the client's choice.
+    say(&mut s, w2, protocol::WriteState::Published);
+    say(&mut s, w1, protocol::WriteState::Lost);
+    assert!(sent_ids(&mut s).is_empty(), "the Lost write went again over a later write that had landed: the older value would win");
+    assert_eq!(s.take_lost_gave_up(), vec![w1], "the write that could no longer go was not named");
+    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"second".to_vec())), "the key does not hold the LAST write the person made");
+}
+
+/// sdk#265, the architect's item 2 (ONE BUDGET). The tries a write spends on
+/// `Lost` re-sends travel with its conflict CHAIN into `Db`'s re-run, so the
+/// two bounds are one budget of [`WRITE_TRIES`] — not 3 × 3 = 9 rounds — and
+/// a re-run write starts from the tries already spent.
+#[test]
+fn the_lost_re_sends_and_the_conflict_re_runs_share_one_budget() {
+    use craftworks_sdk::store::Store as _;
+    let mut s = store();
+    s.on_page(b"a/", b"b/", vec![], root(1));
+    Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
+    let w1 = *sent_ids(&mut s).first().expect("w1 went out");
+    let session = s.client.session().expect("a session");
+    let say = |s: &mut CachedStore, id: u64, st: protocol::WriteState| s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id: id, state: st }).expect("encodes"));
+    say(&mut s, w1, protocol::WriteState::Lost);
+    let _ = sent_ids(&mut s);
+    say(&mut s, w1, protocol::WriteState::Lost);
+    let _ = sent_ids(&mut s);
+    say(&mut s, w1, protocol::WriteState::Conflict);
+    let chains = s.take_conflict_chains();
+    assert_eq!(chains.len(), 1, "the conflict did not reach the app as one chain");
+    assert_eq!(chains[0].tries, 2, "the chain did not carry the tries the Lost re-sends spent: the two bounds would multiply");
+
+    // And the other direction: a write `Db` made as re-run round N spends its
+    // Lost tries from N, not from zero.
+    let mut s = store();
+    s.on_page(b"a/", b"b/", vec![], root(1));
+    Store::apply_batch(&mut s, &[(b"a/2".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
+    let w = *sent_ids(&mut s).first().expect("it went out");
+    s.carry_tries(w, craftworks_sdk::cached_store::WRITE_TRIES);
+    let session = s.client.session().expect("a session");
+    s.on_inbound(&protocol::encode_reply(&protocol::Reply::SessionWriteState { session, write_id: w, state: protocol::WriteState::Lost }).expect("encodes"));
+    assert!(sent_ids(&mut s).is_empty(), "a re-run write went again on a fresh Lost budget: the bounds multiply");
+    assert_eq!(s.take_lost_gave_up(), vec![w], "it fell without being named");
 }

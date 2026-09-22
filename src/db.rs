@@ -567,7 +567,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                 chain.write_ids.iter().filter_map(|id| self.ops.remove(id).map(|op| (*id, op))).collect();
             if !ops.is_empty() {
                 step.taken.extend(ops.iter().map(|(id, _)| *id));
-                let round = ops.iter().map(|(_, op)| op.round()).max().unwrap_or(0);
+                let round = ops.iter().map(|(_, op)| op.round()).max().unwrap_or(0).max(chain.tries);
                 self.reruns.push_back(Rerun { ops, round, deadline_ms: now_ms + wait_ms });
             }
         }
@@ -597,7 +597,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             for (id, _) in r.ops.drain(..) {
                 step.events.push(RerunEvent::Failed {
                     write_id: id,
-                    reason: format!("the record was changed elsewhere again after {RERUN_ROUNDS} re-runs"),
+                    reason: format!("the record was changed elsewhere again after {RERUN_ROUNDS} tries"),
                 });
             }
             return Ok(());
@@ -680,8 +680,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                     match self.update(&domain, loc, &mine) {
                         Ok(_) => {
                             // The re-run's own op carries the chain's round.
-                            if let Some(op) = self.store.last_write_id().and_then(|new| self.ops.get_mut(&new)) {
-                                op.set_round(round);
+                            if let Some(new) = self.store.last_write_id() {
+                                if let Some(op) = self.ops.get_mut(&new) {
+                                    op.set_round(round);
+                                }
+                                self.store.carry_tries(new, round);
                             }
                         }
                         Err(e) => step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() }),
@@ -724,8 +727,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                     next.fields.extend(add);
                     match self.define(&domain, &next) {
                         Ok(()) => {
-                            if let Some(op) = self.store.last_write_id().and_then(|new| self.ops.get_mut(&new)) {
-                                op.set_round(round);
+                            if let Some(new) = self.store.last_write_id() {
+                                if let Some(op) = self.ops.get_mut(&new) {
+                                    op.set_round(round);
+                                }
+                                self.store.carry_tries(new, round);
                             }
                         }
                         Err(e) => step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() }),

@@ -211,6 +211,10 @@ impl Told {
 #[derive(Debug, Default, Clone)]
 struct Entry {
     base: Option<Vec<u8>>,
+    /// The write of THIS client that last set `base` here, if one did
+    /// (sdk#265): a `Lost` write older than it can no longer land in the
+    /// order the person made it, whatever the copy still holds.
+    base_write: Option<u64>,
     /// In the order they were made. The last one is what shows.
     pending: Vec<PendingWrite>,
 }
@@ -659,6 +663,7 @@ impl Copy {
                 continue;
             };
             let w = e.pending.remove(i);
+            e.base_write = Some(write_id);
             // Base moves forward. Anything pending BEHIND it still shows on
             // top, which is the point of keeping a list.
             e.base = w.value;
@@ -686,6 +691,38 @@ impl Copy {
         )]))
     }
 
+    /// `seeds` and every write BEHIND one of them on any key -- a closure: a
+    /// write behind a seed can take down writes behind it on its other keys.
+    fn closure(&self, mut set: std::collections::BTreeSet<u64>) -> std::collections::BTreeSet<u64> {
+        loop {
+            let mut grew = false;
+            for e in self.keys.values() {
+                if let Some(i) = e.pending.iter().position(|w| set.contains(&w.write_id)) {
+                    for w in &e.pending[i..] {
+                        grew |= set.insert(w.write_id);
+                    }
+                }
+            }
+            if !grew {
+                return set;
+            }
+        }
+    }
+
+    /// The writes made AFTER `write_id` on its keys (and behind those on
+    /// theirs), oldest first: what must land after it (sdk#265).
+    pub fn behind(&self, write_id: u64) -> Vec<u64> {
+        let mut set = self.closure(std::collections::BTreeSet::from([write_id]));
+        set.remove(&write_id);
+        set.into_iter().collect()
+    }
+
+    /// Has this write LEFT the outbox -- sent, or taken by the engine --
+    /// rather than held by the window or queued to go again?
+    pub fn left_outbox(&self, write_id: u64) -> bool {
+        self.keys.values().flat_map(|e| e.pending.iter()).any(|w| w.write_id == write_id && !w.queued && !w.held)
+    }
+
     /// Roll back `seeds` -- and every write behind one of them on any key --
     /// WHOLE, on every key each touches.
     ///
@@ -698,20 +735,7 @@ impl Copy {
     /// on the wire; and a write that falls can take down writes behind it on
     /// ITS other keys, so this is a closure, not one pass.
     fn fall(&mut self, seeds: std::collections::BTreeMap<u64, RolledBack>) -> Told {
-        let mut falls: std::collections::BTreeSet<u64> = seeds.keys().copied().collect();
-        loop {
-            let mut grew = false;
-            for e in self.keys.values() {
-                if let Some(i) = e.pending.iter().position(|w| falls.contains(&w.write_id)) {
-                    for w in &e.pending[i..] {
-                        grew |= falls.insert(w.write_id);
-                    }
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
+        let falls = self.closure(seeds.keys().copied().collect());
         let mut told = Told::default();
         for (key, e) in self.keys.iter_mut() {
             let mut touched = false;
@@ -772,6 +796,7 @@ impl Copy {
             }
             let e = self.keys.entry(k.clone()).or_default();
             e.base = v;
+            e.base_write = None;
             if !e.pending.is_empty() {
                 told.moved_under_pending.push(k.clone());
             }
@@ -815,6 +840,39 @@ impl Copy {
     ///
     /// All the edits of that write together — a multi-key write is all or
     /// nothing on the wire as it is in the copy.
+    /// The writes made BEFORE `write_id` on any of its keys and still
+    /// pending: what should land ahead of it.
+    pub fn ahead_of(&self, write_id: u64) -> Vec<u64> {
+        let mut ids = std::collections::BTreeSet::new();
+        for e in self.keys.values() {
+            if let Some(i) = e.pending.iter().position(|w| w.write_id == write_id) {
+                ids.extend(e.pending[..i].iter().map(|w| w.write_id));
+            }
+        }
+        ids.into_iter().collect()
+    }
+
+    /// Has a LATER write of this client's already landed on one of this
+    /// write's keys (sdk#265)? Then this one cannot go again: it would put
+    /// the older value back where the person's last edit is.
+    pub fn overtaken(&self, write_id: u64) -> bool {
+        self.keys
+            .values()
+            .filter(|e| e.pending.iter().any(|w| w.write_id == write_id))
+            .any(|e| e.base_write.is_some_and(|b| b > write_id))
+    }
+
+    /// Is this write queued to go again?
+    pub fn is_queued(&self, write_id: u64) -> bool {
+        self.keys.values().flat_map(|e| e.pending.iter()).any(|w| w.write_id == write_id && w.queued)
+    }
+
+    /// These writes can no longer land (sdk#265): they fall, WHOLE, with
+    /// every write behind them, as [`Copy::failed`].
+    pub fn failed_all(&mut self, write_ids: &[u64]) -> Told {
+        self.fall(write_ids.iter().map(|id| (*id, RolledBack::Failed)).collect())
+    }
+
     pub fn oldest_queued(&self) -> Option<QueuedWrite> {
         let mut best: Option<u64> = None;
         for e in self.keys.values() {

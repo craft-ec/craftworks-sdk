@@ -46,6 +46,15 @@ pub const WRITES_IN_FLIGHT: usize = 16;
 /// row can move from "saved" to "saved + backed up"). Oldest dropped first:
 /// a lost one costs a re-render at the next change, never a wrong row.
 pub const KEYS_KEPT: usize = 1024;
+/// How many times one write may go AGAIN before it falls, named (sdk#265):
+/// ONE budget per write, carried across its `Lost` re-sends and `Db`'s
+/// Conflict re-runs (sdk#249) — `RERUN_ROUNDS`, never that times itself. A
+/// `Lost` commit applied nothing and the client is the only thing that still
+/// holds the write; its re-send carries its reads, so the engine re-judges it
+/// on the head that won. What it means for the person: a sibling tab that
+/// wins every commit starves this tab's edit within this many of its
+/// commits, and the app is told.
+pub const WRITE_TRIES: u8 = crate::db::RERUN_ROUNDS;
 
 /// How long a write the engine has taken may go unheard before this client
 /// asks after it (craftworks-sdk#174).
@@ -60,6 +69,19 @@ pub const ASK_AFTER_MS: u64 = 1_000;
 
 /// Reads from the copy; writes to the pump and, optimistically, to the copy.
 pub struct CachedStore {
+    /// Tries each write has spent going again ([`WRITE_TRIES`], sdk#265).
+    tries: std::collections::BTreeMap<u64, u8>,
+    /// Writes made after a `Lost` one on its keys that had already LEFT the
+    /// outbox when it was told: pulled back behind it (go-back-N), so a
+    /// verdict that says it did not apply queues it again, in app order,
+    /// rather than falling it (sdk#265).
+    pulled_back: std::collections::BTreeSet<u64>,
+    /// Writes told `Lost` and queued to go again (sdk#265): what a later
+    /// write on their keys must not overtake.
+    resending: std::collections::BTreeSet<u64>,
+    /// Writes that fell `Lost` with no tries left, for the app to be told by
+    /// name. Drained by [`CachedStore::take_lost_gave_up`].
+    lost_gave_up: Vec<u64>,
     pub copy: Copy,
     pub client: Client,
     next_write_id: u64,
@@ -157,6 +179,12 @@ impl CachedStore {
         keys
     }
 
+    /// Writes that fell after being told `Lost` with none of its [`WRITE_TRIES`] left
+    /// (sdk#265), for the app to be told by name. Drains.
+    pub fn take_lost_gave_up(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.lost_gave_up)
+    }
+
     /// Superseded rows told since the last call (sdk#225b).
     pub fn take_superseded(&mut self) -> Vec<Superseded> {
         std::mem::take(&mut self.superseded)
@@ -169,6 +197,10 @@ impl CachedStore {
 
     pub fn new(now_ms: Box<dyn Fn() -> u64>) -> CachedStore {
         CachedStore {
+            tries: std::collections::BTreeMap::new(),
+            pulled_back: std::collections::BTreeSet::new(),
+            resending: std::collections::BTreeSet::new(),
+            lost_gave_up: Vec::new(),
             copy: Copy::new(),
             client: Client::new(),
             next_write_id: 1,
@@ -203,6 +235,12 @@ impl CachedStore {
     /// timeout starts now ([`Copy::sent`]).
     fn send_write(&mut self, write_id: u64, request: &Request) {
         let now = (self.now_ms)();
+        // Leaving while an OLDER `Lost` write on its keys still waits to go
+        // again: it is ahead of that write at the engine, so it is pulled
+        // back behind it (sdk#265, go-back-N).
+        if self.copy.ahead_of(write_id).iter().any(|a| self.resending.contains(a) && self.copy.is_queued(*a)) {
+            self.pulled_back.insert(write_id);
+        }
         self.copy.sent(write_id, now);
         self.unheard.insert(write_id, now);
         self.client.send(request);
@@ -344,7 +382,12 @@ impl CachedStore {
                 }
             }
             if let protocol::Reply::Conflicted { session, write_id, key, current } = &r {
-                if self.client.session() == Some(*session) {
+                // A PULLED-BACK write's conflict is expected and is not the
+                // app's: it declared what the `Lost` write in front of it
+                // wrote, and it goes again behind it (sdk#265). Its key stays
+                // loaded — forgetting it would take the row off the screen
+                // for a write that is still on its way.
+                if self.client.session() == Some(*session) && !self.pulled_back.contains(write_id) {
                     if let Some(c) = self.chains.iter_mut().rev().find(|c| c.write_ids.contains(write_id)) {
                         c.keys.push(key.clone());
                     }
@@ -362,12 +405,22 @@ impl CachedStore {
     /// rather than silently leaving a write pending for ever, which is the
     /// failure this function exists to fix.
     fn on_write_state(&mut self, write_id: u64, state: protocol::WriteState) {
-        use protocol::WriteState as W;
         // ANY verdict answers the request: it is no longer waiting at the
         // node, so the window has room for the next (sdk#176).
         self.copy.answered(write_id);
         self.heard(write_id, state);
         self.fill_window();
+        self.classify(write_id, state);
+        // Per-write state for writes the copy no longer holds.
+        let pending = self.copy.pending_ids();
+        let holds = |id: &u64| pending.binary_search(id).is_ok();
+        self.tries.retain(|id, _| holds(id));
+        self.pulled_back.retain(|id| holds(id));
+        self.resending.retain(|id| holds(id));
+    }
+
+    fn classify(&mut self, write_id: u64, state: protocol::WriteState) {
+        use protocol::WriteState as W;
         // A verdict for a write this client never issued. The node chose the
         // id, so believing it would let one message clear or fail somebody
         // else's write. Counted rather than applied.
@@ -405,11 +458,58 @@ impl CachedStore {
                         self.published_keys.pop_first();
                     }
                 }
+                // A `Lost` write this one was made AFTER, on its keys, and
+                // that has not gone again: the person's later edit landed
+                // first, so the older one can no longer land in the order made
+                // (W2) nor in part (W1). It falls WHOLE, named (sdk#265).
+                let overtaken: Vec<u64> = self.copy.ahead_of(write_id).into_iter().filter(|a| self.resending.contains(a)).collect();
                 self.copy.published(write_id);
+                if !overtaken.is_empty() {
+                    let told = self.copy.failed_all(&overtaken);
+                    self.rolled_back.extend(told.rolled_back_keys);
+                    self.lost_gave_up.extend(overtaken);
+                }
                 self.drain_queued();
             }
             // Terminal and not applied. The edit is not in the tree.
+            // LOST (sdk#265): its commit will not publish and this client is
+            // the only thing that still holds the write — the engine's words.
+            // Back to HELD and re-sent through the outbox, WITH its reads, so
+            // the engine re-judges it on the head that won: a stale premise
+            // is a Conflict there (#249's re-run), never a blind re-apply.
+            // Bounded by the write's ONE budget ([`WRITE_TRIES`]): with none
+            // left it falls, named.
+            //
+            // GO-BACK-N (the architect's attack, 1): every later write on its
+            // keys that has already LEFT the outbox is pulled back behind it,
+            // so the person's last edit lands last. Held and queued ones
+            // already wait behind it (`fill_window`, `drain_queued`).
+            // ... unless a LATER write of this client's has already landed on
+            // one of its keys: the person's last edit is there, and this one
+            // going again would put the older value back (W2 per key). It
+            // falls, named, like one out of tries.
+            W::Lost if !self.copy.overtaken(write_id) && self.try_again(write_id) => {
+                self.copy.queued(write_id);
+                self.resending.insert(write_id);
+                for id in self.copy.behind(write_id) {
+                    if self.copy.left_outbox(id) {
+                        self.pulled_back.insert(id);
+                    }
+                }
+                self.drain_queued();
+            }
+            // A PULLED-BACK write refused because a key it read held what the
+            // `Lost` one wrote, and the tree does not yet: queued behind it
+            // with the same reads, which match once it lands. Its budget is
+            // the same one.
+            W::Conflict if self.pulled_back.contains(&write_id) && self.try_again(write_id) => {
+                self.copy.queued(write_id);
+                self.drain_queued();
+            }
             W::Failed | W::Lost => {
+                if matches!(state, W::Lost) {
+                    self.lost_gave_up.push(write_id);
+                }
                 self.reads_of.remove(&write_id);
                 let told = self.copy.failed(write_id);
                 self.state_changed.extend(told.rolled_back_keys.iter().cloned());
@@ -433,7 +533,9 @@ impl CachedStore {
                 for id in &ids {
                     self.reads_of.remove(id);
                 }
-                self.chains.push(crate::store::ConflictChain { write_ids: ids, keys: Vec::new() });
+                // Tries its writes spent here go on with the chain: one budget.
+                let tries = ids.iter().filter_map(|id| self.tries.get(id)).copied().max().unwrap_or(0);
+                self.chains.push(crate::store::ConflictChain { write_ids: ids, keys: Vec::new(), tries });
                 for k in &told.rolled_back_keys {
                     self.forget_key(k);
                 }
@@ -469,6 +571,17 @@ impl CachedStore {
                 debug_assert!(false, "the order rule is v5-only: a v4 client must never be told this");
             }
         }
+    }
+
+    /// Spend one of this write's [`WRITE_TRIES`] on going again; false when
+    /// it has none left.
+    fn try_again(&mut self, write_id: u64) -> bool {
+        let spent = self.tries.entry(write_id).or_default();
+        if *spent >= WRITE_TRIES {
+            return false;
+        }
+        *spent += 1;
+        true
     }
 
     /// A verdict for `write_id` arrived: it is heard of now, or out of the
@@ -702,6 +815,13 @@ impl Store for CachedStore {
 
     fn take_conflict_chains(&mut self) -> Vec<crate::store::ConflictChain> {
         std::mem::take(&mut self.chains)
+    }
+
+    fn carry_tries(&mut self, write_id: u64, tries: u8) {
+        if self.copy.pending_ids().binary_search(&write_id).is_ok() {
+            let spent = self.tries.entry(write_id).or_default();
+            *spent = (*spent).max(tries);
+        }
     }
 
     /// ONE write, so the engine applies them as one commit — with what it READ,
