@@ -41,6 +41,9 @@ struct WireNode {
     /// request that reached it before the registration had taken (#260,
     /// measured: 7 of 12 opens).
     empty_signer_answers: usize,
+    /// The next this many signer answers are LOST — nothing comes back at
+    /// all: only the RTO re-ask recovers from that.
+    drop_signer_answers: usize,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -78,6 +81,7 @@ impl WireNode {
             register_puts: 0,
             fail_register_gets: 0,
             empty_signer_answers: 0,
+            drop_signer_answers: 0,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -103,6 +107,7 @@ impl WireNode {
             register_puts: 0,
             fail_register_gets: 0,
             empty_signer_answers: 0,
+            drop_signer_answers: 0,
         }
     }
 
@@ -193,6 +198,11 @@ impl WireNode {
             }
             ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, inbound, .. }) => {
                 *self.served.entry("signer").or_default() += 1;
+                if self.drop_signer_answers > 0 {
+                    self.drop_signer_answers -= 1;
+                    *self.served.entry("signer answer lost").or_default() += 1;
+                    return None;
+                }
                 if self.empty_signer_answers > 0 {
                     self.empty_signer_answers -= 1;
                     return Some(ok(HostResponse::DelegateResponse { key, values: Vec::new() }));
@@ -833,4 +843,109 @@ fn a_signer_that_only_answers_empty_is_named_not_waited_on() {
     let (io, _) = opening(&mut node, &mut now, &key, false);
     assert!(!io.provisioned());
     assert!(io.unusable().iter().any(|u| u.contains("answered its first request EMPTY")), "not named: {:?}", io.unusable());
+}
+
+/// EVERY NODE CALL ON THE RTO (the ruling since #227): a lost answer to the
+/// page's FIRST signer request — "which Register?" — is asked again, and the
+/// page opens. Measured before this: 4 of 9 fresh-node page-mode opens hung.
+#[test]
+fn a_lost_first_signer_answer_is_asked_again_and_the_page_opens() {
+    let key = [23u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    node.drop_signer_answers = 1;
+    let mut now = 1_000;
+    let (page, minted) = opening(&mut node, &mut now, &key, false);
+    assert_eq!(node.served.get("signer answer lost"), Some(&1), "THE CONTROL: the first answer was not lost, so nothing was tested");
+    assert!(page.provisioned(), "a lost first answer was never asked again: {:?} {:?}", node.served, page.unusable());
+    assert_eq!(minted, 1, "the re-asked question was answered 'none' and the key minted once");
+    assert!(page.unusable().is_empty(), "{:?}", page.unusable());
+}
+
+/// ...and a lost PROVISIONING answer too.
+#[test]
+fn a_lost_provisioning_answer_is_asked_again() {
+    let key = [24u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    let mut now = 1_000;
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+    );
+    io.begin(container);
+    settle(&mut io, &mut node, &mut now);
+    assert!(io.needs_key());
+    node.drop_signer_answers = 1;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+    io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+    settle(&mut io, &mut node, &mut now);
+    assert!(io.provisioned(), "a lost provisioning answer was never asked again: {:?}", node.served);
+}
+
+/// BOUNDED: a signer that never answers is asked a bounded number of times,
+/// then named "not answering" — never re-asked for ever, never a silent hang.
+#[test]
+fn a_signer_that_never_answers_is_named_not_answering_and_not_asked_for_ever() {
+    let key = [25u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    node.drop_signer_answers = 10_000;
+    let mut now = 1_000;
+    let (page, _) = opening(&mut node, &mut now, &key, false);
+    assert!(!page.provisioned());
+    assert!(page.unusable().iter().any(|u| u.starts_with("the signer is not answering")), "{:?}", page.unusable());
+    let asked = node.served["signer"];
+    assert!((2..=10).contains(&asked), "asked {asked} times within the budget");
+    assert!(now >= 1_000 + page::VERIFY_BUDGET_MS, "gave up before its budget, at {now}");
+}
+
+/// OPENING ENDS BY NAME (what `open()` reports): REFUSED — the signer's own
+/// words — when a page provisions another key over the one it holds.
+#[test]
+fn opening_that_the_signer_refuses_is_refused_in_its_words() {
+    let mut node = WireNode::new(&[26u8; 32]); // the signer already holds this person's key
+    let mut now = 1_000;
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let other = ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: wire::register_params(&other.verifying_key().to_bytes(), wire::HEAD_NAME), signer },
+    );
+    io.provision(container, other.to_bytes().to_vec());
+    settle(&mut io, &mut node, &mut now);
+    assert!(!io.provisioned());
+    assert!(io.refused().is_some_and(|r| r.contains("KeyAlreadyProvisioned")), "{:?}", io.refused());
+    assert!(!io.exhausted() && !io.stalled(), "a refusal is not also 'not answering' or 'still waiting'");
+}
+
+/// ...EXHAUSTED when its re-asks are spent, and STALLED while it is still
+/// waiting past the first RTO — and neither once it is answered.
+#[test]
+fn opening_is_stalled_while_unanswered_and_exhausted_when_the_reasks_are_spent() {
+    // Stalled, stepped by hand: the first answer is lost.
+    let key = [28u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    node.drop_signer_answers = 1;
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+    );
+    io.begin(container);
+    for f in io.take_frames() {
+        if let Some(a) = node.serve(&f) { io.inbound(&a, Ms(1_000)); }
+    }
+    io.tick(Ms(1_000)); // anchors the first exchange
+    assert!(!io.stalled(), "stalled before its first RTO");
+    io.tick(Ms(2_000)); // past it, and re-asked
+    assert!(io.stalled(), "not stalled past its first RTO, unanswered");
+    let mut now = 2_000;
+    settle(&mut io, &mut node, &mut now);
+    assert!(io.needs_key() && !io.stalled() && !io.exhausted(), "answered, and still stalled or exhausted");
+
+    // Exhausted: a signer that never answers.
+    let mut silent = WireNode::unprovisioned(&[29u8; 32]);
+    silent.drop_signer_answers = 10_000;
+    let mut now = 1_000;
+    let (page, _) = opening(&mut silent, &mut now, &[29u8; 32], false);
+    assert!(page.exhausted() && page.refused().is_none() && !page.stalled(), "exhausted {} refused {:?} stalled {}", page.exhausted(), page.refused(), page.stalled());
 }
