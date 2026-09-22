@@ -129,6 +129,8 @@ struct Node {
     record_fails: bool,
     /// Every head the register has ever held: what "read back" can mean.
     held_heads: std::collections::BTreeSet<(u64, Cid)>,
+    /// The VALUE the register held for each of those heads (root ‖ ledger).
+    held_values: BTreeMap<(u64, Cid), Vec<u8>>,
 }
 
 impl Blocks for Node {
@@ -159,11 +161,6 @@ impl signer::Host for Host<'_> {
     }
 }
 
-/// F56's equal-seq rule, as the Register decides it (the lower BLAKE3 of the
-/// value, which is the bare root today).
-fn page_beats(a: &Cid, b: &Cid) -> bool {
-    blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes()
-}
 
 fn seq_of(node: &Node) -> u64 {
     node.head().map_or(0, |h| h.0)
@@ -193,6 +190,7 @@ impl Node {
             dev: 0,
             record_fails: false,
             held_heads: Default::default(),
+            held_values: BTreeMap::new(),
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -242,6 +240,9 @@ impl Node {
         self.register = Some(next);
         if let Some(h) = self.head() {
             self.held_heads.insert(h);
+            if let Some(r) = self.head_read() {
+                self.held_values.insert(h, r.value().to_vec());
+            }
         }
     }
 
@@ -249,12 +250,17 @@ impl Node {
         self.register.as_deref().map(head_of)
     }
 
+    /// The head WHOLE, as page-io reads it off the node: seq and value.
+    fn head_read(&self) -> Option<page::HeadRead> {
+        page::HeadRead::from_record(self.register.as_deref()?)
+    }
+
     /// The REAL signer's answer, exactly as it encodes it and the page's
     /// `wire::signer::read_answer` decodes it.
     fn sign(&mut self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> (u32, signer_proto::Answer) {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
-            next: signer::Next { seq, root, ledger: Vec::new() },
+            next: signer::Next { seq, root, ledger: page::sign_ledger(prev_seq, prev_root, root) },
         };
         // Through the BYTES both ways: the request under the page's id, the answer under the id the signer echoes.
         let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
@@ -542,7 +548,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                     if s_head.chance(faults.head_lost) {
                         None
                     } else {
-                        Some(Answer::Head(node.head()))
+                        Some(Answer::Head(node.head_read()))
                     }
                 }
             };
@@ -703,9 +709,10 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                     // stands on never loses the tie-break to a record this
                     // page's signer made at the same seq.
                     let (ps, pr) = a.page.published();
+                    let theirs = node.held_values.get(&(ps, pr)).cloned().unwrap_or_else(|| pr.to_vec());
                     for rec in a.page.signer_records() {
-                        let (rs, rr) = head_of(rec);
-                        if rs == ps && rr != pr && page_beats(&rr, &pr) {
+                        let r = page::HeadRead::from_record(rec).expect("a signer record");
+                        if r.seq == ps && r.root() != pr && page::beats(r.value(), &theirs) {
                             return Err(format!("page {i}: adopted ({ps}, ..), which LOSES the tie-break to its own record at that seq"));
                         }
                     }
@@ -834,7 +841,7 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                     puts.push(id);
                     p.answer(Answer::PutOk(id), Ms(0));
                 }
-                Op::ReadHead => p.answer(Answer::Head(node.head()), Ms(0)),
+                Op::ReadHead => p.answer(Answer::Head(node.head_read()), Ms(0)),
                 Op::Sign { id, prev_seq, prev_root, seq, root } => {
                     let (id, a) = node.sign(id, prev_seq, prev_root, seq, root);
                     p.answer(Answer::Signer { id, answer: a }, Ms(0));
@@ -913,7 +920,7 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                             Some(Answer::Updated)
                         }
                     }
-                    Op::ReadHead => Some(Answer::Head(node.head())),
+                    Op::ReadHead => Some(Answer::Head(node.head_read())),
                     Op::AskHeld { id } => Some(Answer::Held { id, present: node.blocks.contains_key(&id) }),
                 };
                 if let Some(ans) = ans {

@@ -83,7 +83,7 @@ fn a_fork_answer_is_recovered_as_not_next_and_nothing_is_unusable() {
     p.answer(Answer::Signer { id, answer: A::Refused(fork) }, Ms(now + 1));
     let ops = p.take_ops();
     assert!(ops.contains(&Op::ReadHead), "the register was not read after a Forked answer: {ops:?}");
-    p.answer(Answer::Head(Some((theirs.seq, theirs.root))), Ms(now + 2));
+    p.answer(Answer::Head(Some((theirs.seq, theirs.root).into())), Ms(now + 2));
     assert_eq!(p.published(), (theirs.seq, theirs.root), "the register's head was not adopted");
     let lost = p.take_notices().into_iter().any(|(_, w, s)| w == WriteId(1) && s == State::Lost);
     assert!(lost, "the write built on the displaced head was not handed back as Lost");
@@ -197,7 +197,7 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
     // theirs, and the old signer still says Forked.
     p.answer(Answer::Signer { id, answer: fork() }, Ms(now + 1));
     let _ = p.take_ops();
-    p.answer(Answer::Head(Some((theirs.seq, theirs.root))), Ms(now + 2));
+    p.answer(Answer::Head(Some((theirs.seq, theirs.root).into())), Ms(now + 2));
     let _ = p.take_notices();
     p.write(ClientId(1), WriteId(2), vec![(b"k2".to_vec(), WriteOp::Put(b"v2".to_vec()))]);
     let mut id2 = None;
@@ -230,7 +230,7 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
     // head is adopted, the commit built on seq 1 is dead and handed back
     // `Lost` for the app to send again, and the upgrade ask is withdrawn.
     let later = now + 30 * page::rto::RTO_INITIAL_MS as u64;
-    p.answer(Answer::Head(Some((2, [9; 32]))), Ms(later));
+    p.answer(Answer::Head(Some((2, [9; 32]).into())), Ms(later));
     p.tick(Ms(later + 1));
     assert_eq!(p.published().0, 2, "the register's newer head was not adopted");
     let lost = p.take_notices().into_iter().any(|(_, w, s)| w == WriteId(2) && s == State::Lost);

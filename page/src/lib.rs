@@ -188,8 +188,9 @@ pub enum Answer {
     /// The head UPDATE was answered. It says NOTHING about which record the
     /// register kept (F56).
     Updated,
-    /// The head register as read: `(seq, root)`, or `None` if there is none.
-    Head(Option<(u64, Cid)>),
+    /// The head register as read: its seq and whole VALUE ([`HeadRead`]), or
+    /// `None` if there is none.
+    Head(Option<HeadRead>),
     /// [`PutPath::Wrapper`]: the signer's synchronous local read of a block.
     Held { id: Cid, present: bool },
 }
@@ -275,29 +276,69 @@ pub const HEAD_BACKSTOP_MS: u64 = 120_000;
 /// Reverse(BLAKE3(value)))`). A head's value today is its bare root; the
 /// ledger-format PR (a versioned `root ‖ prev`) changes what is hashed, and
 /// must change this with it.
-/// The head a Register record names: `(seq, root)`, from `RG01 | flags |
-/// terminal | seq (u64 LE) | vlen (u16 LE) | value`, the value's first 32
-/// bytes being the root. A SECOND reader of the layout
-/// (`engine_delegate::register::record_of` is the first): the page crate does
-/// not link the delegate, and `tests/record_head.rs` pins the two to agree.
-/// The ledger-format PR, which changes every head reader at once, folds it
-/// back into one.
-pub fn record_head(state: &[u8]) -> Option<(u64, Cid)> {
-    let rest = state.strip_prefix(b"RG01")?;
-    let (&flags, rest) = rest.split_first()?;
-    if flags & 0b01 == 0 {
-        return None;
-    }
-    let (_terminal, rest) = rest.split_first()?;
-    let (seq, rest) = rest.split_at_checked(8)?;
-    let seq = u64::from_le_bytes(seq.try_into().ok()?);
-    let (vlen, rest) = rest.split_at_checked(2)?;
-    let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
-    let value = rest.get(..vlen)?;
-    Some((seq, value.get(..32)?.try_into().ok()?))
+/// A head register as read: its `seq` and its whole VALUE — `root ‖ ledger`,
+/// the one format of `signer_proto::head` — so the equal-seq tie-break can hash
+/// what the Register hashes, and a merge can read the head's `prev`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadRead {
+    pub seq: u64,
+    /// At least a root: a shorter value is not a head, and is never built.
+    value: Vec<u8>,
 }
 
-fn beats(a: &Cid, b: &Cid) -> bool {
+impl HeadRead {
+    /// A head as a Register record states it (tolerantly: any ledger).
+    pub fn from_record(state: &[u8]) -> Option<HeadRead> {
+        let (seq, v) = signer_proto::head::record_of(state)?;
+        HeadRead::from_value(seq, v)
+    }
+
+    /// A head from its seq and value; `None` for a value shorter than a root.
+    pub fn from_value(seq: u64, value: &[u8]) -> Option<HeadRead> {
+        signer_proto::head::read_value(value)?;
+        Some(HeadRead { seq, value: value.to_vec() })
+    }
+
+    /// The root: the value's first 32 bytes, whatever follows.
+    pub fn root(&self) -> Cid {
+        self.value[..32].try_into().expect("a head's value holds a root")
+    }
+
+    /// The value as the Register holds it.
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// The head it was signed from, if its ledger says (a refused ledger says
+    /// nothing: never "built on" anything).
+    pub fn prev(&self) -> Option<(u64, Cid)> {
+        let h = signer_proto::head::read_value(&self.value)?;
+        h.ledger.prev.filter(|_| !h.refused).map(|p| (p.seq, p.root))
+    }
+}
+
+/// A head with no ledger (the pre-format value, a bare root).
+impl From<(u64, Cid)> for HeadRead {
+    fn from((seq, root): (u64, Cid)) -> HeadRead {
+        HeadRead { seq, value: root.to_vec() }
+    }
+}
+
+/// The ledger a head signed from `prev` carries: its PREV, omitted at the
+/// genesis (`prev_seq == 0`), never zeros. The bytes after the root in
+/// `signer_proto::Next`'s value; the one rule for every sign request.
+pub fn sign_ledger(prev_seq: u64, prev_root: Cid, root: Cid) -> Vec<u8> {
+    use signer_proto::head::{value, Ledger};
+    let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
+    value(&root, &Ledger { prev, ..Ledger::default() })[32..].to_vec()
+}
+
+/// F56's equal-seq rule as the Register decides it: of two heads at ONE seq,
+/// the one whose VALUE has the lower BLAKE3 wins (`(terminal, seq,
+/// Reverse(BLAKE3(value)))`). The WHOLE value, ledger and all: two heads can
+/// share a root and differ in their ledgers. Pinned against the contract's own
+/// merge by `tests/tie_break.rs`.
+pub fn beats(a: &[u8], b: &[u8]) -> bool {
     blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes()
 }
 
@@ -340,6 +381,8 @@ pub struct Page {
     my_records: BTreeMap<u64, (Cid, Vec<u8>)>,
     /// When the register was last read (any head answer), for the backstop.
     last_head_at: u64,
+    /// That read, whole: what an equal-seq tie-break hashes.
+    last_head: Option<HeadRead>,
     /// A PUT to repeat at the next tick (a transient refusal).
     put_again: BTreeMap<Cid, Vec<u8>>,
     /// Deadlines of the ops in flight, and each op to re-send.
@@ -409,6 +452,7 @@ impl Page {
             old_signer_fork_at: None,
             my_records: BTreeMap::new(),
             last_head_at: 0,
+            last_head: None,
             put_again: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -663,8 +707,10 @@ impl Page {
             }
             // One register read can answer both a recovery read and a
             // read-back: a head is a head, whoever asked.
-            Answer::Head(h) => {
+            Answer::Head(read) => {
                 self.last_head_at = self.now;
+                let h = read.as_ref().map(|r| (r.seq, r.root()));
+                self.last_head = read;
                 self.answered(&Waiting::Warm);
                 // S1b: the register moved past an old signer's same-seq
                 // record, so it signs again.
@@ -756,8 +802,8 @@ impl Page {
         match s {
             A::Signed(state) => {
                 self.signer_records.insert(state.clone());
-                if let Some((sq, rt)) = record_head(&state) {
-                    self.my_records.insert(sq, (rt, state.clone()));
+                if let Some(h) = HeadRead::from_record(&state) {
+                    self.my_records.insert(h.seq, (h.root(), state.clone()));
                 }
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
@@ -767,8 +813,8 @@ impl Page {
                 // Requirement 2: ONE signature per prev, and it is landed as
                 // it is — its blocks were stored before it was signed.
                 self.signer_records.insert(state.clone());
-                if let Some((sq, rt)) = record_head(&state) {
-                    self.my_records.insert(sq, (rt, state.clone()));
+                if let Some(h) = HeadRead::from_record(&state) {
+                    self.my_records.insert(h.seq, (h.root(), state.clone()));
                 }
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
@@ -965,8 +1011,8 @@ impl Page {
     /// invariant 2, and by the head it names for the tie-break.
     fn note_record(&mut self, state: &[u8]) {
         self.signer_records.insert(state.to_vec());
-        if let Some((seq, root)) = record_head(state) {
-            self.my_records.insert(seq, (root, state.to_vec()));
+        if let Some(h) = HeadRead::from_record(state) {
+            self.my_records.insert(h.seq, (h.root(), state.to_vec()));
         }
     }
 
@@ -975,7 +1021,15 @@ impl Page {
     /// such a record is never adopted — the register will hold mine once my
     /// UPDATE merges (the architect's attack on sdk#225, case 1).
     fn my_winning_record(&self, seq: u64, root: &Cid) -> Option<Vec<u8>> {
-        self.my_records.get(&seq).filter(|(m, _)| m != root && beats(m, root)).map(|(_, b)| b.clone())
+        let (mine_root, bytes) = self.my_records.get(&seq)?;
+        if mine_root == root {
+            return None;
+        }
+        // Theirs by its whole value, as just read (a bare root if it came some
+        // other way); mine by the value the signer signed.
+        let theirs = self.last_head.as_ref().filter(|h| h.seq == seq && h.root() == *root).map_or_else(|| root.to_vec(), |h| h.value().to_vec());
+        let mine = HeadRead::from_record(bytes)?;
+        beats(mine.value(), &theirs).then(|| bytes.clone())
     }
 
     /// Is a register read already in flight?

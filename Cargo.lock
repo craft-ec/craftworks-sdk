@@ -479,6 +479,7 @@ dependencies = [
  "freenet-stdlib",
  "protocol",
  "serde",
+ "signer-proto",
 ]
 
 [[package]]

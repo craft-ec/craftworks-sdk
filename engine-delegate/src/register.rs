@@ -118,7 +118,10 @@ pub fn head_state(
     Ok(out)
 }
 
-/// Read `(seq, value)` out of an encoded Register state.
+/// Read `(seq, root)` out of an encoded Register state, TOLERANTLY: the root is
+/// the value's first 32 bytes whatever ledger follows (signer_proto::head, the
+/// one format). Until the ledger format this demanded a value of EXACTLY 32
+/// bytes, so a ledgered head read as "no head"; from here on no reader does.
 ///
 /// The seq is taken from the RECORD, never assumed to be the one that was
 /// written: a different seq there is another writer's head, which is a
@@ -127,29 +130,12 @@ pub fn head_state(
 /// would be this copy of the format deciding whether the authority was right.
 pub fn head_of(state: &[u8]) -> Option<(u64, [u8; 32])> {
     let (seq, value) = record_of(state)?;
-    // A head's value IS a root cid: anything else is not one of ours.
-    let root: [u8; 32] = value.try_into().ok()?;
-    Some((seq, root))
+    Some((seq, signer_proto::head::read_value(value)?.root))
 }
 
 /// Read `(seq, value)` out of an encoded Register state, whatever the value
-/// is -- the one parser of the record's layout. `head_of` is this plus "the
-/// value is a 32-byte root"; the signer (sdk#209) reads a value that may carry
-/// a ledger after the root. Like `head_of`, it does NOT verify the signature.
+/// is: `signer_proto::head::record_of`, the one parser of the record's layout.
+/// Like `head_of`, it does NOT verify the signature.
 pub fn record_of(state: &[u8]) -> Option<(u64, &[u8])> {
-    let rest = state.strip_prefix(MAGIC)?;
-    let (&flags, rest) = rest.split_first()?;
-    if flags & FLAG_RECORD == 0 {
-        return None;
-    }
-    let (_terminal, rest) = rest.split_first()?;
-    let (seq, rest) = rest.split_at_checked(8)?;
-    let seq = u64::from_le_bytes(seq.try_into().ok()?);
-    let (vlen, rest) = rest.split_at_checked(2)?;
-    let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
-    if vlen > MAX_VALUE {
-        return None;
-    }
-    let value = rest.get(..vlen)?;
-    Some((seq, value))
+    signer_proto::head::record_of(state)
 }

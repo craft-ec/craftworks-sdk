@@ -128,14 +128,18 @@ impl Node {
 
     fn head(&self) -> Option<(u64, Cid)> {
         let st = self.register.as_deref()?;
-        let (seq, v) = engine_delegate::register::record_of(st)?;
-        Some((seq, v[..32].try_into().expect("32")))
+        engine_delegate::register::head_of(st)
+    }
+
+    /// The head WHOLE, as page-io reads it off the node: seq and value.
+    fn head_read(&self) -> Option<page::HeadRead> {
+        page::HeadRead::from_record(self.register.as_deref()?)
     }
 
     fn sign(&mut self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> (u32, signer_proto::Answer) {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
-            next: signer::Next { seq, root, ledger: Vec::new() },
+            next: signer::Next { seq, root, ledger: page::sign_ledger(prev_seq, prev_root, root) },
         };
         let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
@@ -251,7 +255,7 @@ impl PageRig {
                 node.update(&state);
                 Answer::Updated
             }
-            Op::ReadHead => Answer::Head(node.head()),
+            Op::ReadHead => Answer::Head(node.head_read()),
             Op::AskHeld { id } => Answer::Held { id, present: node.blocks.contains_key(&id) },
         })
     }
