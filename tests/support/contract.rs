@@ -8,8 +8,17 @@
 //! The ABI is the freenet-stdlib one, reproduced here because there is no
 //! host-side helper for it: `__frnt__initiate_buffer(capacity) -> i64` hands
 //! back a `BufferBuilder` in the module's linear memory; the payload goes at
-//! `start` behind a 4-byte little-endian length; `validate_state(params,
-//! state, related) -> i64` points at a `ContractInterfaceResult`.
+//! `start`; `validate_state(params, state, related) -> i64` points at a
+//! `ContractInterfaceResult`.
+//!
+//! The FRAMING is the node's choice, made from the module's imports exactly as
+//! freenet 0.2.136 makes it (`module_has_streaming_io`: any import from
+//! `freenet_contract_io`). STREAMING (a freenet-stdlib-built contract): the
+//! payload sits behind a 4-byte little-endian length and `last_write` counts
+//! both. LEGACY (no such import: the Block contract's hand-written ABI,
+//! freenet-contracts#44): the payload alone, and `last_write` is its length. A
+//! host that framed every module one way would drive the other kind wrong and
+//! read its answers as verdicts.
 
 #![allow(dead_code)]
 
@@ -32,6 +41,8 @@ pub struct Contract {
     memory: wasmi::Memory,
     initiate: wasmi::TypedFunc<i32, i64>,
     validate: wasmi::TypedFunc<(i64, i64, i64), i64>,
+    /// The module imports from `freenet_contract_io`: the node streams to it.
+    streaming: bool,
 }
 
 /// What the contract said about a state.
@@ -51,6 +62,9 @@ impl Contract {
     pub fn load(wasm: &[u8]) -> Result<Contract, String> {
         let engine = Engine::default();
         let module = Module::new(&engine, wasm).map_err(|e| format!("not loadable: {e}"))?;
+        let streaming = module
+            .imports()
+            .any(|i| i.module() == "freenet_contract_io");
         let mut store = Store::new(&engine, ());
         let mut linker = <Linker<()>>::new(&engine);
         // The one import. Returning 0 means "no more bytes": everything is
@@ -84,6 +98,7 @@ impl Contract {
             memory,
             initiate,
             validate,
+            streaming,
         })
     }
 
@@ -106,7 +121,8 @@ impl Contract {
 
     /// Put `payload` into a fresh guest buffer and return its pointer.
     fn buffer(&mut self, payload: &[u8]) -> Result<i64, String> {
-        let total = payload.len() + 4;
+        let header = if self.streaming { 4 } else { 0 };
+        let total = payload.len() + header;
         let ptr = self
             .initiate
             .call(&mut self.store, total as i32)
@@ -118,7 +134,9 @@ impl Contract {
             return Err(format!("buffer capacity {capacity} < {total}"));
         }
         let mut bytes = Vec::with_capacity(total);
-        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        if self.streaming {
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        }
         bytes.extend_from_slice(payload);
         self.memory
             .write(&mut self.store, start, &bytes)
