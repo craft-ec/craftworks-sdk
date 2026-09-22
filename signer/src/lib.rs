@@ -71,16 +71,17 @@ pub enum Decision {
 /// (a) `next.seq == prev.seq + 1`, else `Refused(NotSuccessor)`; not provisioned → `Refused(NotProvisioned)`.
 /// (b) AT MOST ONE SIGNATURE PER PREV: `record.prev == prev` → `AlreadySigned(record.signed)`, identical re-ask or a
 ///     different `next` alike. Checked BEFORE (c), so a re-ask after the head moved on still gets its own bytes back.
-/// (c) FORK: the record and `head_read` at the SAME seq with DIFFERENT roots → `Refused(Forked{mine, read})`, and
-///     nothing is signed (the checkpoint decides; sdk#210 review §1).
-/// (d) TRUTH = the later of `record.next` and `head_read`, by seq (a read AHEAD is another holder moving the head:
-///     the page rebases, nothing is displaced; a read BEHIND is the page's UPDATE not landed yet: the record wins).
+/// (c) TRUTH = the later of `record.next` and `head_read`, by seq, and at an EQUAL seq the Register's (a read AHEAD
+///     is another holder moving the head: the page rebases, nothing is displaced; a read BEHIND is the page's UPDATE
+///     not landed yet: the record wins; a read at the record's seq with ANOTHER root is another device of this
+///     identity whose head the Register's tie-break kept -- the same identity never forks (owner, sdk#225), so that
+///     head is the truth, this signer signs on from it only, and never displaces it: sdk#210 review §1).
 ///     `prev != truth` → `NotNext{ current: truth }`. No truth at all: only the genesis (`prev.seq == 0`) is signable,
 ///     else `Refused(HeadUnknown)`. Stated limit: a node that does not HOLD the Register (a second device, a fresh
 ///     node) with no record signs seq 1 for a key whose head may be further on elsewhere. Harmless at the Register
 ///     (the higher seq wins) but the page's UPDATE then loses silently, and it learns so only from the head
 ///     subscription.
-/// (e) the root block must be held AND hash to `next.root`, else `Refused(RootNotHeld)`.
+/// (d) the root block must be held AND hash to `next.root`, else `Refused(RootNotHeld)`.
 /// Otherwise `Sign`.
 pub fn decide(f: &Facts, prev: &Head, next: &Next) -> Decision {
     use Answer::*;
@@ -96,13 +97,8 @@ pub fn decide(f: &Facts, prev: &Head, next: &Next) -> Decision {
         }
     }
     let signed_head = f.record.as_ref().map(|r| r.next.head());
-    if let (Some(mine), Some(read)) = (signed_head, f.head_read) {
-        if mine.seq == read.seq && mine.root != read.root {
-            return Decision::Reply(Refused(Why::Forked { mine, read }));
-        }
-    }
     let truth = match (signed_head, f.head_read) {
-        (Some(mine), Some(read)) if read.seq > mine.seq => Some(read),
+        (Some(mine), Some(read)) if read.seq >= mine.seq => Some(read),
         (Some(mine), _) => Some(mine),
         (None, read) => read,
     };
