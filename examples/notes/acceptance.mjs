@@ -101,6 +101,15 @@ try {
     await a.evaluate(`for (let i = 0; i < 50; i += 1) await window.__notes.db.put("notes", { text: "note " + i }); return 1;`);
     const saved = await a.until(`return window.__notes.saving() === 0 && window.__notes.notes.getSnapshot().length === 50;`, 300_000, 1000);
     check(!!saved, `${path}: 50 notes put and published ("saving" back to 0) in ${Date.now() - t0} ms`, await a.evaluate(`return { saving: window.__notes.saving(), shown: window.__notes.notes.getSnapshot().length };`));
+    // THE ROWS SAY SO TOO, on the PLAIN binding, with nothing else re-reading
+    // it (sdk#282). `saving() === 0` is the SESSION's count, and it stayed
+    // right while every row the binding showed still said PENDING — the
+    // defect #267 brought back (builder#107): a tab's own write reported its
+    // state under the stored `<app>.notes`, no binding matched, and nothing
+    // re-read. This asserts what a person sees on each row.
+    const clean = await a.until(`const s = window.__notes.notes.getSnapshot(); return s.length === 50 && s.every(r => r.state === "CLEAN") ? 50 : null;`, 60_000, 500);
+    check(clean === 50, `${path}: every one of the 50 rows the plain binding shows says CLEAN (saved), not PENDING`,
+      clean === 50 ? undefined : await a.evaluate(`const c = {}; for (const r of window.__notes.notes.getSnapshot()) c[r.state] = (c[r.state] ?? 0) + 1; return c;`));
     await a.evaluate(`location.reload(); return 1;`);
     const back = await a.until(`return window.__notes?.notes?.getSnapshot().length === 50 ? 50 : null;`, 120_000, 1000);
     check(back === 50, `${path}: after a reload, all 50 are back`, await a.evaluate(`return window.__notes?.notes?.getSnapshot().length ?? document.getElementById("status")?.textContent;`));
