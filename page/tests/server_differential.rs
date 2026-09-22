@@ -513,36 +513,34 @@ fn record_not_saved_once_publishes_like_the_shell() {
     assert!(published(&states(&p, 1)));
 }
 
-/// A FORK — two roots at one seq for this key (another holder of the key):
-/// the page is LOUD (`forked()`, never published); the Shell had NO fork check
-/// and publishes over it. The signer is what adds the check — a divergence by
-/// design, asserted here.
+/// TWO ROOTS AT ONE SEQ for this key — another device of the same identity,
+/// whose head won the Register's tie-break. The same identity never forks
+/// (owner, sdk#225): the page ADOPTS the winner, the write built on the
+/// displaced head is handed back `Lost`, sent again it publishes on the
+/// winner, and nothing is unusable. The Shell had no check at all and
+/// publishes over it blind — a divergence by design, asserted here.
 #[test]
-fn a_fork_is_loud_on_the_page_and_unseen_by_the_shell() {
+fn a_same_key_displacement_is_adopted_on_the_page_and_unseen_by_the_shell() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     rig.client_as(&mut node, &Request::Identity);
     assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
     let (seq, mine) = node.head().expect("published");
-    // Another holder of the key signs a DIFFERENT root at the same seq — one
-    // that WINS the Register's equal-seq rule (the lower BLAKE3 of the value),
-    // or the fork would be invisible to the signer's read.
     let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
-    let winner = (1u8..=255)
-        .find(|b| {
-            let other = engine_delegate::register::head_state(&node.register_params, &key, seq, &[*b; 32]).expect("signs");
-            let before = node.register.clone();
-            node.update(&other);
-            let won = node.head().map(|h| h.1) != Some(mine);
-            if !won {
-                node.register = before;
-            }
-            won
-        })
-        .expect("some root wins the register");
-    assert_ne!([winner; 32], mine);
-    rig.client_as(&mut node, &write(2, &[("b", Some("2"))]));
-    assert!(rig.server.page.forked().is_some(), "the fork was not surfaced; unusable: {:?}", rig.server.page.unusable());
+    // The other device's REAL tree, whose root WINS the equal-seq rule (the
+    // lower BLAKE3 of the value): the fork would otherwise be invisible to
+    // the signer's read, and a fake root would leave nothing to build on.
+    let beats = |a: &Cid, b: &Cid| blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes();
+    let winner = (0u32..512).map(|salt| sibling_root(&mut node, salt)).find(|r| beats(r, &mine)).expect("some tree wins");
+    let other = engine_delegate::register::head_state(&node.register_params, &key, seq, &winner).expect("signs");
+    node.update(&other);
+    assert_eq!(node.head(), Some((seq, winner)), "the winner did not take the register");
+    let second = states(&rig.client_as(&mut node, &write(2, &[("b", Some("2"))])), 2);
+    assert!(second.contains(&WriteState::Lost), "a write built on the displaced head was not handed back: {second:?}");
+    assert_eq!(rig.server.page.published(), (seq, winner), "the winner was not adopted");
+    let again = states(&rig.client_as(&mut node, &write(2, &[("b", Some("2"))])), 2);
+    assert!(published(&again), "sent again, the write did not publish on the winner: {again:?}");
+    assert!(rig.server.page.unusable().is_empty(), "a same-key displacement left the page unusable: {:?}", rig.server.page.unusable());
     // The Shell, the same story: nothing in it can see the fork.
     let fnode = FullNode::new();
     let mut conn = fnode.connect();
@@ -630,4 +628,28 @@ fn a_read_before_the_head_is_read_waits_for_it() {
     assert!(page_entries(&early, 42).is_none(), "a read was answered before the head was read: {early:?}");
     let p = reader.run(&mut node);
     assert_eq!(page_entries(&p, 42).map(|e| e.len()), Some(2), "the held read did not answer with the rows: {p:?}");
+}
+
+/// ANOTHER DEVICE'S TREE, for real: a fresh page from the same genesis writes
+/// `salt`, and its blocks go onto the node; returns its root (never signed —
+/// the caller signs a head for it as the other device's signer would).
+fn sibling_root(node: &mut Node, salt: u32) -> Cid {
+    use engine::{ClientId, Op as WriteOp, WriteId};
+    let mut p = Page::new(Params::default(), PutPath::Page);
+    p.write(ClientId(9), WriteId(1), vec![(format!("sib/{salt}").into_bytes(), WriteOp::Put(vec![salt as u8; 64]))]);
+    for _ in 0..50 {
+        for op in p.take_ops() {
+            match op {
+                Op::ReadHead => p.answer(Answer::Head(None), Ms(1)),
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    p.answer(Answer::PutOk(id), Ms(1));
+                }
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(1)),
+                Op::Sign { root, .. } => return root,
+                _ => {}
+            }
+        }
+    }
+    panic!("the sibling page never asked to sign");
 }

@@ -1604,8 +1604,12 @@ impl<B: Blocks> Engine<B> {
     /// head, and the writes that were in flight are re-applied to the tree
     /// that won.
     fn on_head_conflict(&mut self, seq: u64, root: Cid) -> Vec<Effect> {
-        // An OLDER head is not a conflict: this commit's head never landed.
-        if self.pending.as_ref().is_some_and(|c| seq < c.seq) {
+        // An OLDER head is not a conflict: this commit's head never landed —
+        // unless it is the head this commit was BUILT ON shown under ANOTHER
+        // root: that head was displaced (another device of the same identity
+        // won the Register's tie-break, sdk#225), so the commit is dead.
+        let displaced = seq == self.published_seq() && root != self.published_root();
+        if self.pending.as_ref().is_some_and(|c| seq < c.seq) && !displaced {
             return self.head_not_landed();
         }
         let dead = self.pending.take();

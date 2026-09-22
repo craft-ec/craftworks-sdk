@@ -243,38 +243,22 @@ fn a_head_read_ahead_of_the_record_is_the_truth() {
     ));
 }
 
-/// The Register at the SAME seq as the record, a different root: another holder of the key signed a competing head.
-/// NOTHING is signed, from either root; the answer is `Forked` (sdk#210 review §1: `NotNext{mine}` let this signer's
-/// policy displace the other write).
+/// The Register at the SAME seq as the record, a different root: another device of this identity signed a competing
+/// head and the Register's tie-break kept THEIRS. The same identity never forks (owner, sdk#225): the Register's head is
+/// the truth. Signing goes on from THEIR root; from MY root the answer is `NotNext{their head}`, so this signer never
+/// displaces the other write (sdk#210 review §1) and is never stuck either.
 #[test]
-fn equal_seq_different_roots_is_a_fork_and_nothing_is_signed() {
+fn equal_seq_different_roots_the_register_wins_and_signing_goes_on_from_it() {
     let mut w = World::new();
     w.hold_root(root(1));
     w.hold_root(root(3));
     let _ = w.sign(genesis(), &next(1, 1));
     let other = engine_delegate::register::head_state(&w.params, &[7u8; 32], 1, &root(4)).unwrap();
     w.land(&other);
-    let fork = Answer::Refused(Why::Forked {
-        mine: Head {
-            seq: 1,
-            root: root(1),
-        },
-        read: Head {
-            seq: 1,
-            root: root(4),
-        },
-    });
-    assert_eq!(
-        w.sign(
-            Head {
-                seq: 1,
-                root: root(4)
-            },
-            &next(2, 3)
-        ),
-        fork,
-        "signed on from THEIR root"
-    );
+    let theirs = Head {
+        seq: 1,
+        root: root(4),
+    };
     assert_eq!(
         w.sign(
             Head {
@@ -283,8 +267,12 @@ fn equal_seq_different_roots_is_a_fork_and_nothing_is_signed() {
             },
             &next(2, 3)
         ),
-        fork,
-        "signed on from MY root"
+        Answer::NotNext { current: theirs },
+        "signed on from MY root, which the Register's tie-break displaced"
+    );
+    assert!(
+        matches!(w.sign(theirs, &next(2, 3)), Answer::Signed(_)),
+        "did not sign on from THEIR root: this key is stuck"
     );
 }
 

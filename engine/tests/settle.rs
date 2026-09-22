@@ -191,6 +191,31 @@ fn a_head_that_never_landed_is_issued_again_not_taken_for_a_conflict() {
     assert!(told(&done, 1).contains(&State::Published));
 }
 
+/// E1's other side (sdk#225): the head this commit was BUILT ON is displaced
+/// — the Register shows ITS seq under ANOTHER root (another device of the
+/// same identity won the tie-break). That is not "my head never landed": the
+/// commit is dead, its writes are told `Lost`, and the winner is adopted. E1
+/// alone let the page ask to sign from a displaced prev for ever.
+#[test]
+fn a_displaced_prev_under_a_pending_commit_is_a_conflict_not_an_unlanded_head() {
+    let p = Params::default();
+    let mut h = harness();
+    let first = h.step(write(1, small()));
+    let mut head = None;
+    for f in answer_blocks_only(&mut h, first) {
+        if let Effect::UpdateHead { seq, .. } = f {
+            head = Some(seq);
+        }
+    }
+    let seq = head.expect("the head was sent once the blocks were in");
+    let (_, _) = tick_until(&mut h, 0, 2 * p.reask_after, 1);
+    let winner: Cid = [7; 32];
+    assert_ne!(winner, h.published_root());
+    let fx = h.step(Event::HeadConflict { seq: seq - 1, root: winner });
+    assert!(told(&fx, 1).contains(&State::Lost), "a displaced prev was taken for an unlanded head: {:?}", told(&fx, 1));
+    assert_eq!(h.published_root(), winner, "the winner was not adopted");
+}
+
 /// Answer only the block puts in `fx` and what they cause; return every
 /// effect seen, head effects unanswered.
 fn answer_blocks_only(h: &mut Harness, mut fx: Vec<Effect>) -> Vec<Effect> {

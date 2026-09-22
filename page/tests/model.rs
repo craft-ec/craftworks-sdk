@@ -70,6 +70,9 @@ struct Faults {
     update_not_applied: u64,
     head_lost: u64,
     record_not_saved: u64,
+    /// The node's `HeadChanged` push to a page is dropped (a full
+    /// notification channel, an evicted subscription).
+    hint_lost: u64,
 }
 
 const FAULTS: Faults = Faults {
@@ -82,6 +85,7 @@ const FAULTS: Faults = Faults {
     update_not_applied: 80,
     head_lost: 80,
     record_not_saved: 60,
+    hint_lost: 300,
 };
 const CALM: Faults = Faults {
     put_lost: 0,
@@ -93,6 +97,7 @@ const CALM: Faults = Faults {
     update_not_applied: 0,
     head_lost: 0,
     record_not_saved: 0,
+    hint_lost: 0,
 };
 
 /// The block's kind, recovered from its id (the network holds `kind ‖ body`).
@@ -114,7 +119,12 @@ struct Node {
     register: Option<Vec<u8>>,
     register_id: [u8; 32],
     register_params: Vec<u8>,
-    secrets: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Each DEVICE's signer secrets (the key and its record): one device is
+    /// two tabs on one signer; two devices are two signers with one key on one
+    /// register — the user's own devices (sdk#225).
+    secrets: Vec<BTreeMap<Vec<u8>, Vec<u8>>>,
+    /// Which device's signer the current request is served by.
+    dev: usize,
     /// The signer's record write fails while this is set (a fault).
     record_fails: bool,
     /// Every head the register has ever held: what "read back" can mean.
@@ -130,13 +140,14 @@ impl Blocks for Node {
 struct Host<'a>(&'a mut Node);
 impl signer::Host for Host<'_> {
     fn get_secret(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.secrets.get(key).cloned()
+        self.0.secrets[self.0.dev].get(key).cloned()
     }
     fn set_secret(&mut self, key: &[u8], value: &[u8]) -> bool {
         if self.0.record_fails && key == signer::RECORD {
             return false;
         }
-        self.0.secrets.insert(key.to_vec(), value.to_vec());
+        let d = self.0.dev;
+        self.0.secrets[d].insert(key.to_vec(), value.to_vec());
         true
     }
     fn contract_state(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
@@ -148,6 +159,16 @@ impl signer::Host for Host<'_> {
     }
 }
 
+/// F56's equal-seq rule, as the Register decides it (the lower BLAKE3 of the
+/// value, which is the bare root today).
+fn page_beats(a: &Cid, b: &Cid) -> bool {
+    blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes()
+}
+
+fn seq_of(node: &Node) -> u64 {
+    node.head().map_or(0, |h| h.0)
+}
+
 fn head_of(state: &[u8]) -> (u64, Cid) {
     let (seq, v) = engine_delegate::register::record_of(state).expect("a register record");
     (seq, v[..32].try_into().expect("32"))
@@ -155,6 +176,10 @@ fn head_of(state: &[u8]) -> (u64, Cid) {
 
 impl Node {
     fn new() -> (Node, Vec<u8>) {
+        Node::with_devices(1)
+    }
+
+    fn with_devices(devices: usize) -> (Node, Vec<u8>) {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let vk = sk.verifying_key().to_bytes();
         let params = wire::register_params(&vk, wire::HEAD_NAME);
@@ -164,7 +189,8 @@ impl Node {
             register: None,
             register_id: signer::register_id(REGISTER_CODE, &params),
             register_params: params.clone(),
-            secrets: BTreeMap::new(),
+            secrets: vec![BTreeMap::new(); devices],
+            dev: 0,
             record_fails: false,
             held_heads: Default::default(),
         };
@@ -174,7 +200,11 @@ impl Node {
             register_params: params.clone(),
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        for d in 0..devices {
+            n.dev = d;
+            assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        }
+        n.dev = 0;
         (n, params)
     }
 
@@ -296,6 +326,9 @@ impl App {
     }
 }
 
+/// (page, write, the head it was told Published at, its key and value).
+type PublishedAt = (usize, u64, (u64, Cid), Option<(Vec<u8>, Vec<u8>)>);
+
 #[derive(Default, Debug)]
 struct Seen {
     published: usize,
@@ -306,21 +339,29 @@ struct Seen {
     landings: u32,
     most_landing_updates: u32,
     /// (page, write, the head it was told Published at).
-    published_at: Vec<(usize, u64, (u64, Cid))>,
-    /// Published heads a fork later displaced (the fork test's evidence).
+    published_at: Vec<PublishedAt>,
+    /// Published writes whose head a same-seq WINNER later displaced, and
+    /// whose value the final tree does not hold: the per-key merge (#225b)
+    /// is what keeps them. Counted and named here, never silent.
     displaced: usize,
+    /// Seqs the register held under two roots: the devices really raced.
+    races: usize,
 }
 
 /// What a run plays.
 #[derive(Clone, Copy)]
 struct Cfg {
     faults: Faults,
-    /// Inject ONE same-seq fork (another holder of the key signs a root that
-    /// WINS the register's tie-break) once something has published.
-    fork: bool,
+    /// 1: the two pages are two TABS on one signer. 2: two DEVICES of one
+    /// identity — two signers, one key, one register (sdk#225): they race at
+    /// every seq, and the register's tie-break decides.
+    devices: usize,
+    /// Every `HeadChanged` push is dropped, calm or not: an idle page learns
+    /// only by the backstop read.
+    no_hints: bool,
 }
 
-const NORMAL: Cfg = Cfg { faults: FAULTS, fork: false };
+const NORMAL: Cfg = Cfg { faults: FAULTS, devices: 1, no_hints: false };
 
 /// Does `later` descend from `h` through the signer's records (next → prev)?
 fn descends(edges: &BTreeMap<(u64, Cid), (u64, Cid)>, later: (u64, Cid), h: (u64, Cid)) -> bool {
@@ -345,8 +386,8 @@ fn run(seed: u64, writes_per_page: usize, path: PutPath) -> Result<Seen, String>
 
 fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Result<Seen, String> {
     let mut edges: BTreeMap<(u64, Cid), (u64, Cid)> = BTreeMap::new();
-    let mut forked_in = false;
-    let (mut node, _) = Node::new();
+    let (mut node, _) = Node::with_devices(cfg.devices);
+    let dev_of = |page: usize| if cfg.devices == 1 { 0 } else { page };
     let mut s_delay = Rng::new(seed, 1);
     let mut s_put_lost = Rng::new(seed, 2);
     let mut s_put_ans = Rng::new(seed, 3);
@@ -358,6 +399,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     let mut s_head = Rng::new(seed, 9);
     let mut s_app = Rng::new(seed, 10);
     let mut s_rec = Rng::new(seed, 11);
+    let mut s_hint = Rng::new(seed, 12);
 
     let mut apps: Vec<App> = (0..2)
         .map(|i| App {
@@ -394,24 +436,6 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     let end = calm_at + 600_000;
     while now < end {
         let faults = if now < calm_at { cfg.faults } else { CALM };
-        // THE FORK: once something has published, another holder of the key
-        // signs a different root at the register's seq — one that WINS the
-        // equal-seq tie-break (the lower BLAKE3), displacing the head.
-        if cfg.fork && !forked_in && !seen.published_at.is_empty() {
-            if let Some((seq, mine)) = node.head() {
-                let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
-                for b in 1u8..=255 {
-                    let st = engine_delegate::register::head_state(&node.register_params, &key, seq, &[b; 32]).expect("signs");
-                    let before = node.register.clone();
-                    node.update(&st);
-                    if node.head().map(|h| h.1) != Some(mine) {
-                        forked_in = true;
-                        break;
-                    }
-                    node.register = before;
-                }
-            }
-        }
         // The apps submit.
         for a in &mut apps {
             if a.inflight.is_empty() && !a.todo.is_empty() && s_app.chance(300) {
@@ -472,9 +496,10 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         None
                     } else {
                         node.record_fails = s_rec.chance(faults.record_not_saved);
+                        node.dev = dev_of(f.page);
                         let (id, a) = node.sign(id, prev_seq, prev_root, seq, root);
                         node.record_fails = false;
-                        if let Some(rec) = node.secrets.get(signer::RECORD) {
+                        if let Some(rec) = node.secrets[node.dev].get(signer::RECORD) {
                             let rec: signer::Record = bincode::deserialize(rec).expect("the signer's record");
                             edges.insert((rec.next.seq, rec.next.root), (rec.prev.seq, rec.prev.root));
                         }
@@ -490,7 +515,18 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         None
                     } else {
                         if !s_upd_na.chance(faults.update_not_applied) {
+                            let before = node.head();
                             node.update(&state);
+                            // THE SUBSCRIPTION: a head that moved is pushed to
+                            // every OTHER page as `HeadChanged` — a hint, and
+                            // a lossy one.
+                            if node.head() != before {
+                                for (j, other) in apps.iter_mut().enumerate() {
+                                    if j != f.page && !cfg.no_hints && !s_hint.chance(faults.hint_lost) {
+                                        other.page.head_hint();
+                                    }
+                                }
+                            }
                         }
                         Some(Answer::Updated)
                     }
@@ -519,7 +555,8 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
             apps[i].page.tick(Ms(now));
             check(&mut apps, i, &node, &mut seen, now)?;
         }
-        if now > calm_at && apps.iter().all(|a| a.todo.is_empty() && a.inflight.is_empty()) && flights.is_empty() {
+        let converged = apps.iter().all(|a| Some(a.page.published()) == node.head());
+        if now > calm_at && apps.iter().all(|a| a.todo.is_empty() && a.inflight.is_empty()) && flights.is_empty() && converged {
             break;
         }
     }
@@ -528,28 +565,53 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         seen.landings += l;
         seen.most_landing_updates = seen.most_landing_updates.max(m);
     }
-    // INVARIANT 1, in full: a Published write's head H was read from the
-    // register (checked as it happened), AND every later register head
-    // descends from H — or a page reported the fork, LOUDLY. A head a
-    // same-seq fork displaced took its writes with it (F56).
-    let forked = apps.iter().any(|a| a.page.forked().is_some());
-    if let Some(fin) = node.head() {
-        for (i, wid, h) in &seen.published_at {
-            if !descends(&edges, fin, *h) {
-                seen.displaced += 1;
-                if !forked {
-                    return Err(format!(
-                        "page {i}: write {wid} was Published at {:?}, which a later head {:?} does not descend from, and no page reported a fork",
-                        h.0, fin.0
-                    ));
-                }
-            }
+    // RACES: seqs the register held under two roots (non-vacuity for the
+    // two-device runs).
+    let mut per_seq: BTreeMap<u64, usize> = BTreeMap::new();
+    for (sq, _) in &node.held_heads {
+        *per_seq.entry(*sq).or_default() += 1;
+    }
+    seen.races = per_seq.values().filter(|n| **n > 1).count();
+    // CONVERGED: every page ends on the register's head — an IDLE one too,
+    // by the `HeadChanged` hint or, every hint lost, the backstop read.
+    for (i, a) in apps.iter().enumerate() {
+        if Some(a.page.published()) != node.head() {
+            return Err(format!("page {i} ends on {:?}, the register on {:?}: it never learned", a.page.published().0, node.head().map(|h| h.0)));
         }
     }
-    if cfg.fork {
-        // After a fork, writes need not all publish (Forked is permanent):
-        // the claims above are the whole test.
-        return Ok(seen);
+    // INVARIANT 1, in full: a Published write's head H was read from the
+    // register (checked as it happened), AND the final register head
+    // descends from H through the signers' records (BOTH devices'), OR the
+    // final chain passes through ANOTHER root at H's own seq — a sibling
+    // device's head the register kept, by the equal-seq tie-break or by a
+    // higher seq built on it (F56: the higher seq wins). The same identity
+    // never forks (sdk#225): that is the register's rule, never a fork. Until
+    // the per-key merge (#225b) those writes' values are gone, and they are
+    // COUNTED (`displaced`), not silent.
+    if let Some(fin) = node.head() {
+        let tree = node.tree(&fin.1).unwrap_or_default();
+        let mut chain: BTreeMap<u64, Cid> = BTreeMap::new();
+        let mut c = fin;
+        chain.insert(c.0, c.1);
+        while let Some(p) = edges.get(&c) {
+            c = *p;
+            chain.insert(c.0, c.1);
+        }
+        for (i, wid, h, kv) in &seen.published_at {
+            if descends(&edges, fin, *h) {
+                continue;
+            }
+            let sibling = chain.get(&h.0).is_some_and(|x| *x != h.1 && node.held_heads.contains(&(h.0, *x)));
+            if !sibling {
+                return Err(format!(
+                    "page {i}: write {wid} was Published at {:?}, which the final head {:?} does not descend from through any sibling at that seq",
+                    h.0, fin.0
+                ));
+            }
+            if kv.as_ref().is_some_and(|(k, v)| tree.get(k) != Some(v)) {
+                seen.displaced += 1;
+            }
+        }
     }
     // INVARIANT 4.
     for (i, a) in apps.iter().enumerate() {
@@ -574,7 +636,14 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     for a in &apps {
         for (k, v) in &a.wrote {
             if tree.get(k) != Some(v) {
-                return Err(format!("the final tree lost {:?}", String::from_utf8_lossy(k)));
+                // Only a write Published at a head a winner displaced may be
+                // missing (counted above, #225b's to keep).
+                let displaced = seen.published_at.iter().any(|(_, _, h, kv)| {
+                    kv.as_ref().is_some_and(|(pk, pv)| pk == k && pv == v) && !descends(&edges, (seq_of(&node), root), *h)
+                });
+                if !displaced {
+                    return Err(format!("the final tree lost {:?}", String::from_utf8_lossy(k)));
+                }
             }
         }
     }
@@ -585,11 +654,13 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
     // THE REGISTER IS NEVER 2+ BEHIND THE SIGNER'S RECORD (1b on the sign
     // side, the architect's attack): past one, the record for the seq between
     // is overwritten and no page could land it.
-    if let Some(rec) = node.secrets.get(signer::RECORD) {
-        let rec: signer::Record = bincode::deserialize(rec).expect("the signer's record");
-        let reg = node.head().map_or(0, |h| h.0);
-        if rec.next.seq > reg + 1 {
-            return Err(format!("the signer's record (seq {}) is {} ahead of the register (seq {reg})", rec.next.seq, rec.next.seq - reg));
+    for secrets in &node.secrets {
+        if let Some(rec) = secrets.get(signer::RECORD) {
+            let rec: signer::Record = bincode::deserialize(rec).expect("the signer's record");
+            let reg = node.head().map_or(0, |h| h.0);
+            if rec.next.seq > reg + 1 {
+                return Err(format!("the signer's record (seq {}) is {} ahead of the register (seq {reg})", rec.next.seq, rec.next.seq - reg));
+            }
         }
     }
     let a = &mut apps[i];
@@ -619,7 +690,7 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                 if node.tree(&root).is_none() {
                     return Err(format!("page {i}: Published at a root that is not whole on the node"));
                 }
-                seen.published_at.push((i, wid.0, (seq, root)));
+                seen.published_at.push((i, wid.0, (seq, root), a.inflight.get(&wid.0).cloned()));
                 if a.inflight.remove(&wid.0).is_some() {
                     a.published += 1;
                     seen.published += 1;
@@ -627,6 +698,17 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
             }
             State::Lost | State::Busy | State::Failed | State::TooLarge { .. } => {
                 if state == State::Lost {
+                    // ONLY A CONFIRMED WINNER IS ADOPTED (the architect's
+                    // attack on sdk#225, case 1): the head this page now
+                    // stands on never loses the tie-break to a record this
+                    // page's signer made at the same seq.
+                    let (ps, pr) = a.page.published();
+                    for rec in a.page.signer_records() {
+                        let (rs, rr) = head_of(rec);
+                        if rs == ps && rr != pr && page_beats(&rr, &pr) {
+                            return Err(format!("page {i}: adopted ({ps}, ..), which LOSES the tie-break to its own record at that seq"));
+                        }
+                    }
                     seen.lost += 1;
                 } else if state == State::Busy {
                     seen.busy += 1;
@@ -686,7 +768,7 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
 /// with every invariant (main's condition 2).
 #[test]
 fn a_landing_whose_update_is_lost_twice_still_lands() {
-    let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, fork: false };
+    let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
     let mut most = 0;
     let mut landings = 0;
     for seed in 1..=20 {
@@ -700,20 +782,38 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
     assert!(most >= 3, "no landing's UPDATE was lost twice (most: {most})");
 }
 
-/// A FORK DISPLACES A PUBLISHED HEAD: another holder of the key signs a root
-/// that wins the register's equal-seq tie-break. The writes told Published at
-/// the displaced head are gone — so a page must have said so, LOUDLY
-/// (`forked()`). Non-vacuous: some Published head IS displaced.
+/// TWO DEVICES OF ONE IDENTITY (sdk#225): two signers, one key, one
+/// register, racing at every seq through the same faults, `HeadChanged`
+/// pushes lost 30% of the time. The same identity never forks: no page is
+/// ever unusable, every adopt is the tie-break's CONFIRMED winner, every
+/// write publishes, and both pages end on the register's head. Non-vacuous:
+/// the register held some seq under two roots. A Published write a winner
+/// displaced is counted — the per-key merge (#225b) is what keeps it.
 #[test]
-fn a_fork_that_displaces_a_published_head_is_reported() {
-    let cfg = Cfg { faults: FAULTS, fork: true };
-    let mut displaced = 0;
-    for seed in 1..=10 {
+fn two_devices_on_one_key_race_and_no_page_is_ever_unusable() {
+    let cfg = Cfg { devices: 2, ..NORMAL };
+    let (mut races, mut displaced, mut lost) = (0, 0, 0);
+    for seed in 1..=SEEDS / 2 {
         let s = run_with(seed, WRITES, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write was published once");
+        races += s.races;
         displaced += s.displaced;
+        lost += s.lost;
     }
-    println!("fork: {displaced} Published heads displaced, each reported");
-    assert!(displaced > 0, "no fork ever displaced a Published head: the test is vacuous");
+    println!("two devices: {races} raced seqs, {lost} Lost and re-sent, {displaced} Published writes displaced by a winner (#225b keeps them)");
+    assert!(races > 0, "the two devices never raced at a seq: the test is vacuous");
+}
+
+/// AN IDLE PAGE LEARNS WITH EVERY HINT LOST: no `HeadChanged` ever reaches a
+/// page, so only the backstop read (HEAD_BACKSTOP_MS) tells a device that
+/// stopped writing that the other one moved the register. Both still end on
+/// the register's head (the run's convergence check).
+#[test]
+fn with_every_hint_lost_an_idle_device_still_learns_by_the_backstop() {
+    let cfg = Cfg { devices: 2, no_hints: true, ..NORMAL };
+    for seed in 1..=6 {
+        run_with(seed, WRITES, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
 }
 
 /// THE CONTROL for invariant 3: the whole-tree check FAILS on a root with a
@@ -850,7 +950,7 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
             }
         }
     }
-    let rec: signer::Record = bincode::deserialize(node.secrets.get(signer::RECORD).expect("a record")).expect("decodes");
+    let rec: signer::Record = bincode::deserialize(node.secrets[0].get(signer::RECORD).expect("a record")).expect("decodes");
     assert_eq!((rec.next.seq, node.head().map(|h| h.0)), (2, Some(1)), "the record is not one ahead of the register");
     drop(a);
     // B, stale at seq 0, writes: NotNext names record 2; B lands it.
