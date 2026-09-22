@@ -255,7 +255,7 @@ if [ $ACCEPT -eq 1 ]; then
   counts_file=$(mktemp)
   for i in "${!NAMES[@]}"; do echo "${NAMES[$i]}=${COUNTS[$i]}" >> "$counts_file"; done
   echo "npm=$js_ok" >> "$counts_file"
-  ./tools/gate-accept.sh "$BASELINE" "$STEP_FAILED" "$counts_file" ${ACCEPT_ARGS[@]+"${ACCEPT_ARGS[@]}"}
+  GATE_MIN_GIB=$MIN_GIB ./tools/gate-accept.sh "$BASELINE" "$STEP_FAILED" "$counts_file" ${ACCEPT_ARGS[@]+"${ACCEPT_ARGS[@]}"}
   rc=$?
   rm -f "$counts_file"
   exit $rc

@@ -16,6 +16,9 @@
 
 use std::{path::Path, process::Command};
 
+#[path = "build_support.rs"]
+mod build_support;
+
 fn main() {
     // WHEN TO REGENERATE is the hand-written half of a generated value, and
     // where staleness collects (sdk#134). Once any `rerun-if-*` is printed,
@@ -40,61 +43,33 @@ fn main() {
     println!("cargo:rustc-env=SDK_CONTRACTS_REV={rev}");
 }
 
-/// `(block, register, rev)` as the contracts build recorded them.
-///
-/// `unknown` where the checkout cannot be found — a deliberate value, like
-/// `rev`'s: a build that cannot name what it provisions with is exactly what
-/// the versions panel exists to surface, and a plausible-looking default would
-/// hide it.
+/// `(block, register, rev)` as the contracts build recorded them — or the
+/// build FAILS, naming CRAFTWORKS_CONTRACTS and the path it looked at
+/// (craftworks-sdk#252; `build_support::contracts_repo`). It used to bake
+/// `unknown` and exit 0.
 fn contract_hashes() -> (String, String, String) {
-    let unknown = || {
-        (
-            "unknown".to_string(),
-            "unknown".to_string(),
-            "unknown".to_string(),
-        )
-    };
-    let Some(repo) = contracts_repo() else {
-        return unknown();
+    let beside = Path::new(env!("CARGO_MANIFEST_DIR")).join("../freenet-contracts");
+    let env = std::env::var("CRAFTWORKS_CONTRACTS").ok();
+    let repo = match build_support::contracts_repo(env.as_deref(), &beside, |p| p.is_file()) {
+        Ok(r) => r,
+        Err(why) => {
+            // Watch what was looked at, so the build re-runs once it exists.
+            watch(&beside.join("build/hashes.toml"));
+            panic!("{why}");
+        }
     };
     let path = repo.join("build/hashes.toml");
     watch(&path);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return unknown();
-    };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let field = |name: &str| {
         text.lines()
             .find_map(|l| {
                 let (k, v) = l.split_once('=')?;
                 (k.trim() == name).then(|| v.trim().trim_matches('"').to_string())
             })
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| panic!("{} names no `{name}`", path.display()))
     };
     (field("block"), field("register"), field("rev"))
-}
-
-/// The contracts checkout: the one named, else the one beside this crate.
-fn contracts_repo() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    if let Ok(p) = std::env::var("CRAFTWORKS_CONTRACTS") {
-        return Some(PathBuf::from(p));
-    }
-    let beside = Path::new(env!("CARGO_MANIFEST_DIR")).join("../freenet-contracts");
-    if beside.join("build/hashes.toml").is_file() {
-        return Some(beside);
-    }
-    // Not built yet. Watch the nearest part of it that EXISTS, so a contracts
-    // build appearing re-runs this — and nothing that does not exist: cargo
-    // re-runs a script watching a missing path on EVERY build, and recompiles
-    // the crate with it (measured), which would make every build slow for
-    // anyone without the contracts.
-    for dir in [beside.join("build"), beside] {
-        if dir.is_dir() {
-            println!("cargo:rerun-if-changed={}", dir.display());
-            break;
-        }
-    }
-    None
 }
 
 /// Watch the file this script read. Named explicitly (`CRAFTWORKS_CONTRACTS`)

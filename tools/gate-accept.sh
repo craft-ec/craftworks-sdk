@@ -66,6 +66,26 @@ for a in ${allow[@]+"${allow[@]}"}; do
 done
 
 [ $refused -eq 0 ] || { echo "gate --accept: $baseline is unchanged." >&2; exit 1; }
+# THE WRITE IS CHECKED, not assumed (craftworks-sdk#252): on a full disk this
+# once left the baseline unchanged while the run looked accepted. So: the free
+# space is checked again RIGHT BEFORE writing (the gate's own floor, handed in
+# as GATE_MIN_GIB; the start-of-run check is minutes stale by now), a failed
+# copy or rename is a failure naming the file, and the baseline must READ BACK
+# byte-identical to what was meant — or this says so and exits non-zero.
+min_gib=${GATE_MIN_GIB:-5}
+free_gib=${GATE_FREE_GIB_FOR_TEST:-$(df -k "$(dirname "$baseline")" | awk 'NR==2 {printf "%d", $4/1048576}')}
+if [ "$free_gib" -lt "$min_gib" ]; then
+  echo "gate --accept: REFUSED — ${free_gib} GiB free, under ${min_gib} GiB, right before writing $baseline; it is unchanged." >&2
+  exit 1
+fi
 tmp="$baseline.accept.$$"
-cp "$counts" "$tmp" && mv "$tmp" "$baseline"
+if ! cp "$counts" "$tmp" || ! mv "$tmp" "$baseline"; then
+  rm -f "$tmp"
+  echo "gate --accept: FAILED to write $baseline — the counts were NOT recorded." >&2
+  exit 1
+fi
+if ! cmp -s "$counts" "$baseline"; then
+  echo "gate --accept: FAILED — $baseline does not read back as what was written; the counts are NOT recorded." >&2
+  exit 1
+fi
 echo "gate: recorded $(grep -c '=' "$baseline") counts in $baseline"
