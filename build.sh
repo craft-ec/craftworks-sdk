@@ -8,6 +8,8 @@ cd "$(dirname "$0")"
 # one it has to excuse.
 cargo build --release -p web --target wasm32-unknown-unknown
 wasm=target/wasm32-unknown-unknown/release/web.wasm
+# Emptied first, so what ships is only what this build wrote (sdk#263).
+tools/pkg-reset.sh pkg
 # `--out-name`, so the artefact keeps the name every consumer already
 # imports. The cdylib moved from `craftworks-sdk` to `web` to keep the core on
 # the checked side of the boundary gate; that is a layout decision inside this
