@@ -72,7 +72,7 @@ pub struct Server {
     out: Vec<Vec<u8>>,
     /// sdk#225b: each write handed to the engine, by (client, write id), as the
     /// FINAL value it leaves at each key (`None`: deleted), until it ends.
-    sent: BTreeMap<(u64, u64), Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+    sent: BTreeMap<WriteKey, Finals>,
     /// The writes of this page's LATEST Published commit and the head it was
     /// built on: what a same-identity displacement can take (only the tip can
     /// be displaced at its own seq; a higher seq built on it keeps it).
@@ -85,10 +85,17 @@ pub struct Server {
     next_probe: u64,
 }
 
+/// What a write leaves at each key, in key order (`None`: deleted).
+type Finals = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+/// A write by (engine client, write id).
+type WriteKey = (u64, u64);
+/// A commit's writes.
+type TipWrites = Vec<(WriteKey, Finals)>;
+
 /// A Published commit's writes (sdk#225b).
 struct Tip {
     head: (u64, freenet_prolly::Cid),
-    writes: Vec<((u64, u64), Vec<(Vec<u8>, Option<Vec<u8>>)>)>,
+    writes: TipWrites,
 }
 
 /// The tip's keys, read at the head that displaced it (sdk#225b, cell C —
@@ -97,7 +104,7 @@ struct Tip {
 /// other value, or a read that could not be answered, is SUPERSEDED, told.
 struct Probe {
     winner: (u64, freenet_prolly::Cid),
-    writes: Vec<((u64, u64), Vec<(Vec<u8>, Option<Vec<u8>>)>)>,
+    writes: TipWrites,
     pending: BTreeMap<u64, Vec<u8>>,
     superseded: std::collections::BTreeSet<Vec<u8>>,
 }
@@ -295,7 +302,7 @@ impl Server {
         self.finish_probe(out);
     }
 
-    fn start_probe(&mut self, winner: (u64, freenet_prolly::Cid), writes: Vec<((u64, u64), Vec<(Vec<u8>, Option<Vec<u8>>)>)>) {
+    fn start_probe(&mut self, winner: (u64, freenet_prolly::Cid), writes: TipWrites) {
         let mut keys: Vec<Vec<u8>> = writes.iter().flat_map(|(_, fin)| fin.iter().map(|(k, _)| k.clone())).collect();
         keys.sort();
         keys.dedup();
