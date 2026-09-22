@@ -18,6 +18,11 @@ impl Probe {
     /// `<tmp>/sdk` (the crate, with the real build.rs) beside
     /// `<tmp>/freenet-contracts` (created only when a case wants it).
     fn new(tag: &str) -> Probe {
+        Probe::printing(tag, "SDK_BLOCK_HASH")
+    }
+
+    /// A probe whose program prints the baked value of `var`.
+    fn printing(tag: &str, var: &str) -> Probe {
         let root = std::env::temp_dir().join(format!("sdk134-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let krate = root.join("sdk");
@@ -31,7 +36,7 @@ impl Probe {
             "[package]\nname = \"sdk134-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n[workspace]\n",
         )
         .unwrap();
-        std::fs::write(krate.join("src/main.rs"), "fn main() { println!(\"{}\", env!(\"SDK_BLOCK_HASH\")); }\n").unwrap();
+        std::fs::write(krate.join("src/main.rs"), format!("fn main() {{ println!(\"{{}}\", env!(\"{var}\")); }}\n")).unwrap();
         Probe { root }
     }
 
@@ -81,6 +86,21 @@ impl Probe {
         // The program prints one line: what was baked.
         let baked = String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or("").trim().to_string();
         (baked, ran)
+    }
+}
+
+impl Probe {
+    /// Run git in the probe crate, as a throwaway repository with its own
+    /// identity (no global config is read or needed).
+    fn git(&self, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.name=probe", "-c", "user.email=probe@invalid", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(self.root.join("sdk"))
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 }
 
@@ -168,4 +188,45 @@ fn an_untouched_build_does_not_rerun_the_script() {
     for _ in 0..2 {
         assert!(r.build_refused(None).contains("no contracts build at"));
     }
+}
+
+/// **A new COMMIT moves the rev the wasm names** (the label that evidence is
+/// filed under). Before this, `build.rs` re-ran only on `build_rev.txt`,
+/// `Cargo.lock` or the contracts: three builds at three HEADs all reported
+/// the first HEAD, clean, with nothing to say it was stale.
+#[test]
+fn a_new_commit_moves_the_baked_rev() {
+    let p = Probe::printing("rev", "SDK_BUILD_REV");
+    let c = p.contracts("contracts");
+    p.write_hashes(&c, "sha256:aaa");
+    // The crate as a repository of its own; the target dir is outside it.
+    p.git(&["init", "-q", "-b", "main"]);
+    // The lock file is tracked, as it is in the real repository — otherwise
+    // the first build creates it and the tree reads as dirty.
+    let lock = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["generate-lockfile"])
+        .current_dir(p.root.join("sdk"))
+        .output()
+        .expect("cargo runs");
+    assert!(lock.status.success(), "{}", String::from_utf8_lossy(&lock.stderr));
+    p.git(&["add", "-A"]);
+    p.git(&["commit", "-q", "-m", "one"]);
+    let first = p.git(&["rev-parse", "--short=7", "HEAD"]);
+    assert_eq!(p.build(Some(&c)).0, first, "THE CONTROL: the first build names its HEAD");
+
+    // An empty commit: HEAD moves, no file the compiler reads does.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    p.git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    let second = p.git(&["rev-parse", "--short=7", "HEAD"]);
+    let (baked, ran) = p.build(Some(&c));
+    assert!(ran, "a new commit did not re-run the build script");
+    assert_eq!(baked, second, "the wasm still names {first} after a commit to {second}");
+
+    // And a branch switch to an older commit moves it back.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    p.git(&["checkout", "-q", "--detach", &first]);
+    assert_eq!(p.build(Some(&c)).0, first, "a checkout of an older commit still names the newer one");
+
+    // THE CONTROL that this is not "re-run always": nothing changed, no re-run.
+    assert!(!p.build(Some(&c)).1, "the script re-ran with HEAD unchanged");
 }
