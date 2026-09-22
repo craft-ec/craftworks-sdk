@@ -72,7 +72,7 @@ pub struct Server {
     out: Vec<Vec<u8>>,
     /// sdk#225b: each write handed to the engine, by (client, write id), as the
     /// FINAL value it leaves at each key (`None`: deleted), until it ends.
-    sent: BTreeMap<WriteKey, Finals>,
+    sent: BTreeMap<WriteKey, Sent>,
     /// The writes of this page's LATEST Published commit and the head it was
     /// built on: what a same-identity displacement can take (only the tip can
     /// be displaced at its own seq; a higher seq built on it keeps it).
@@ -83,18 +83,72 @@ pub struct Server {
     /// A displaced tip being judged key by key at the winner.
     probe: Option<Probe>,
     next_probe: u64,
+    /// A same-seq race being MERGED (cell B).
+    merge: Option<Merge>,
 }
+
+/// THE MERGE of a same-seq race (sdk#225b part 2, cell B): the winner was
+/// signed from the SAME base P as this page's tip. Their changes P→winner are
+/// read from the engine (`ChangesSince`, resumed until COMPLETE — a cut delta
+/// is unknown, never "not theirs"); per key of the tip:
+/// * changed only here, and every read its write declared unchanged there →
+///   KEPT, re-applied on the winner;
+/// * changed there to exactly this page's value → neither (already there);
+/// * changed there otherwise, or a read of its write changed there →
+///   SUPERSEDED, the winner's value stands, told.
+///
+/// The kept keys go as ONE write WITH READS — the kept writes' own declared
+/// reads, still true at the winner since it did not change them — so the
+/// engine compares them where the write lands and a winner that moved on
+/// refuses it (R0): never blind. `Lost` (the head moved again) re-sends, up to
+/// [`MERGE_ROUNDS`]; then, or on `Conflict`/`Failed`, the kept keys are
+/// superseded too.
+struct Merge {
+    winner: (u64, freenet_prolly::Cid),
+    writes: TipWrites,
+    left: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    from: freenet_prolly::Cid,
+    /// The delta read in flight, and what has come back of it.
+    req: u64,
+    theirs: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Decided: what is kept (the merge write's ops and reads) and what not.
+    kept: Vec<Vec<u8>>,
+    reads: Reads,
+    superseded: std::collections::BTreeSet<Vec<u8>>,
+    /// The merge write, once sent: its id, and rounds sent.
+    write: Option<u64>,
+    rounds: u8,
+    resend: bool,
+}
+
+/// How many times a merge write is sent against a head that keeps moving.
+const MERGE_ROUNDS: u8 = 3;
+
+/// The engine client the merge commit is written under: session 0, never a
+/// real session — so its verdicts are the Server's, never a client's.
+const MERGE_CLIENT: engine::ClientId = engine::ClientId(1);
 
 /// What a write leaves at each key, in key order (`None`: deleted).
 type Finals = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 /// A write by (engine client, write id).
 type WriteKey = (u64, u64);
+/// What a write declared it READ.
+type Reads = Vec<(Vec<u8>, engine::Expect)>;
+/// A write as the Server keeps it: what it left at each key, and what it read.
+#[derive(Clone)]
+struct Sent {
+    finals: Finals,
+    reads: Reads,
+}
 /// A commit's writes.
-type TipWrites = Vec<(WriteKey, Finals)>;
+type TipWrites = Vec<(WriteKey, Sent)>;
 
 /// A Published commit's writes (sdk#225b).
 struct Tip {
     head: (u64, freenet_prolly::Cid),
+    /// The head this commit was signed from (its ledger's PREV): the base a
+    /// same-seq race is merged on.
+    base: Option<(u64, freenet_prolly::Cid)>,
     writes: TipWrites,
 }
 
@@ -142,6 +196,7 @@ impl Server {
             seen_head: (0, [0; 32]),
             probe: None,
             next_probe: 1,
+            merge: None,
         }
     }
 
@@ -214,6 +269,13 @@ impl Server {
     /// trace steps (shell.rs `handle`, 628–660).
     fn drain(&mut self, out: &mut Outbound) {
         let mut effects = self.page.take_client();
+        // A merge write the engine was too busy for goes again NOW — at the
+        // start of a later call, never inside the one that was refused, where
+        // nothing can have freed the engine (it would only be refused again).
+        if self.merge.as_ref().is_some_and(|m| m.resend) {
+            self.send_merge();
+            effects.extend(self.page.take_client());
+        }
         self.same_identity(&mut effects, out);
         self.reply_from(&effects, out);
         self.step(1, protocol::Step::Effects, effects.len() as u64);
@@ -247,34 +309,46 @@ impl Server {
     ///   session. The per-key MERGE (re-applying one-sided keys on the
     ///   winner) replaces the second arm for a same-seq race next.
     fn same_identity(&mut self, effects: &mut Vec<Effect>, out: &mut Outbound) {
-        // The probe's own answers.
+        let now = self.page.published();
+        let mut published_here = false;
+        let mut merge_done = false;
+        // The Server's own reads and the merge write's verdicts: never a
+        // client's, never replied.
+        let mut own = Vec::new();
         effects.retain(|f| match f {
-            Effect::Reply { client, req_id, result } if *client == PROBE_CLIENT => {
-                if let Some(p) = self.probe.as_mut() {
-                    if let Some(key) = p.pending.remove(&req_id.0) {
-                        let want = p.left.get(&key);
-                        let holds = matches!(result, engine::read::ReadResult::Value(v) if Some(v) == want);
-                        if !holds {
-                            p.superseded.insert(key);
-                        }
-                    }
-                }
+            Effect::Reply { client, .. } if *client == PROBE_CLIENT => {
+                own.push(f.clone());
+                false
+            }
+            Effect::Notify { client, .. } if *client == MERGE_CLIENT => {
+                own.push(f.clone());
                 false
             }
             _ => true,
         });
-        let now = self.page.published();
-        let mut published_here = false;
+        for f in own {
+            match f {
+                Effect::Reply { req_id, result, .. } => self.on_own_read(req_id.0, result),
+                Effect::Notify { write_id, state, .. } if self.on_merge_verdict(write_id.0, state, now) => {
+                    published_here = true;
+                    merge_done = true;
+                }
+                _ => {}
+            }
+        }
         for f in effects.iter() {
             if let Effect::Notify { client, write_id, state } = f {
                 let id = (client.0, write_id.0);
                 match state {
                     State::Published => {
-                        if let Some(fin) = self.sent.remove(&id) {
+                        if let Some(sent) = self.sent.remove(&id) {
                             published_here = true;
                             match self.tip.as_mut() {
-                                Some(t) if t.head == now => t.writes.push((id, fin)),
-                                _ => self.tip = Some(Tip { head: now, writes: vec![(id, fin)] }),
+                                Some(t) if t.head == now => t.writes.push((id, sent)),
+                                _ => {
+                                    let base = self.page.last_read().filter(|r| (r.seq, r.root()) == now).and_then(|r| r.prev());
+                                    self.tip = Some(Tip { head: now, base, writes: vec![(id, sent)] });
+                                }
                             }
                         }
                     }
@@ -289,8 +363,13 @@ impl Server {
             if let Some(tip) = self.tip.take() {
                 if now.0 >= tip.head.0 && now != tip.head {
                     let prev = self.page.last_read().filter(|r| (r.seq, r.root()) == now).and_then(|r| r.prev());
-                    if prev != Some(tip.head) {
-                        self.start_probe(now, tip.writes);
+                    match (prev, tip.base) {
+                        // They built on the tip: nothing displaced.
+                        (Some(p), _) if p == tip.head => {}
+                        // A same-seq race from the SAME base: merge.
+                        (Some(p), Some(b)) if p == b && now.0 == tip.head.0 => self.start_merge(now, tip.writes, b.1),
+                        // Anything else: judge each key at the winner.
+                        _ => self.start_probe(now, tip.writes),
                     }
                 } else {
                     self.tip = Some(tip);
@@ -298,7 +377,10 @@ impl Server {
             }
         }
         self.seen_head = now;
-        // The probe's reads may have answered at once (held blocks).
+        if merge_done {
+            self.finish_merge(out);
+        }
+        // The Server's own reads (or the merge write) may have answered at once.
         let more = self.page.take_client();
         if !more.is_empty() {
             let mut more = more;
@@ -308,14 +390,188 @@ impl Server {
         self.finish_probe(out);
     }
 
-    fn start_probe(&mut self, winner: (u64, freenet_prolly::Cid), writes: TipWrites) {
-        let mut left: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        for (_, fin) in &writes {
-            for (k, v) in fin {
-                let was = left.insert(k.clone(), v.clone());
-                debug_assert!(was.is_none_or(|w| w == *v), "two writes of one tip disagree at a key: a commit carries one write, the rest are no-ops");
+    /// One of the Server's own reads answered: a probe's `Get`, or a page of
+    /// the merge's delta.
+    fn on_own_read(&mut self, req: u64, result: engine::read::ReadResult) {
+        if let Some(p) = self.probe.as_mut() {
+            if let Some(key) = p.pending.remove(&req) {
+                let holds = matches!(&result, engine::read::ReadResult::Value(v) if Some(v) == p.left.get(&key));
+                if !holds {
+                    p.superseded.insert(key);
+                }
+                return;
             }
         }
+        let Some(m) = self.merge.as_mut().filter(|m| m.req == req && m.write.is_none()) else { return };
+        match result {
+            engine::read::ReadResult::Delta { changes, cursor, .. } => {
+                m.theirs.extend(changes);
+                match cursor {
+                    // CUT: not "absent in theirs" — resume after it.
+                    Some(c) => {
+                        let rid = self.next_probe;
+                        self.next_probe += 1;
+                        m.req = rid;
+                        let from = m.from;
+                        self.page.event(Event::ChangesSince {
+                            client: PROBE_CLIENT,
+                            req_id: as_req_id(rid),
+                            from,
+                            range: engine::subs::SubRange { lo: std::ops::Bound::Excluded(c), hi: std::ops::Bound::Unbounded },
+                            max_entries: 256,
+                        });
+                    }
+                    None => self.decide_merge(),
+                }
+            }
+            // The base's blocks are gone, or a block could not be had: the
+            // delta cannot be known, so the keys are judged one by one at the
+            // winner instead (the conservative cell).
+            _ => {
+                let m = self.merge.take().expect("checked");
+                self.start_probe(m.winner, m.writes);
+            }
+        }
+    }
+
+    fn start_merge(&mut self, winner: (u64, freenet_prolly::Cid), writes: TipWrites, from: freenet_prolly::Cid) {
+        let rid = self.next_probe;
+        self.next_probe += 1;
+        self.merge = Some(Merge {
+            winner,
+            left: left_of(&writes),
+            writes,
+            from,
+            req: rid,
+            theirs: BTreeMap::new(),
+            kept: Vec::new(),
+            reads: Vec::new(),
+            superseded: Default::default(),
+            write: None,
+            rounds: 0,
+            resend: false,
+        });
+        self.page.event(Event::ChangesSince {
+            client: PROBE_CLIENT,
+            req_id: as_req_id(rid),
+            from,
+            range: engine::subs::SubRange { lo: std::ops::Bound::Unbounded, hi: std::ops::Bound::Unbounded },
+            max_entries: 256,
+        });
+    }
+
+    /// Their COMPLETE delta is in: decide per key, then send the kept keys.
+    fn decide_merge(&mut self) {
+        let Some(m) = self.merge.as_mut() else { return };
+        // A write whose declared read moved on their side had a stale
+        // premise: ALL its keys are superseded (main's rule).
+        let stale: Vec<bool> = m.writes.iter().map(|(_, w)| w.reads.iter().any(|(k, _)| m.theirs.contains_key(k))).collect();
+        let mut kept = Vec::new();
+        for (k, v) in &m.left {
+            let premise_ok = m.writes.iter().zip(&stale).filter(|((_, w), _)| w.finals.iter().any(|(wk, _)| wk == k)).all(|(_, s)| !*s);
+            match m.theirs.get(k) {
+                Some(t) if t == v => {}
+                Some(_) => {
+                    m.superseded.insert(k.clone());
+                }
+                None if premise_ok => kept.push(k.clone()),
+                None => {
+                    m.superseded.insert(k.clone());
+                }
+            }
+        }
+        let mut reads: BTreeMap<Vec<u8>, engine::Expect> = BTreeMap::new();
+        for ((_, w), s) in m.writes.iter().zip(&stale) {
+            if !*s && w.finals.iter().any(|(k, _)| kept.contains(k)) {
+                for (k, e) in &w.reads {
+                    reads.insert(k.clone(), e.clone());
+                }
+            }
+        }
+        m.kept = kept;
+        m.reads = reads.into_iter().collect();
+        if m.kept.is_empty() {
+            // Nothing to re-apply: told now.
+            m.write = Some(0);
+            let mut out = Outbound::default();
+            self.finish_merge(&mut out);
+            self.out.extend(out.replies);
+        } else {
+            self.send_merge();
+        }
+    }
+
+    /// The kept keys as ONE engine write, with the reads the engine checks
+    /// where it lands.
+    fn send_merge(&mut self) {
+        let wid = self.next_probe;
+        self.next_probe += 1;
+        let Some(m) = self.merge.as_mut() else { return };
+        m.resend = false;
+        m.write = Some(wid);
+        let ops: Vec<(Vec<u8>, engine::Op)> = m
+            .kept
+            .iter()
+            .map(|k| (k.clone(), match m.left.get(k).cloned().flatten() {
+                Some(v) => engine::Op::Put(v),
+                None => engine::Op::Delete,
+            }))
+            .collect();
+        let reads = m.reads.clone();
+        self.page.event(Event::Write { client: MERGE_CLIENT, write_id: as_write_id(wid), ops, reads });
+    }
+
+    /// A verdict on the merge write. True when it PUBLISHED.
+    fn on_merge_verdict(&mut self, write_id: u64, state: State, now: (u64, freenet_prolly::Cid)) -> bool {
+        let Some(m) = self.merge.as_mut().filter(|m| m.write == Some(write_id)) else { return false };
+        match state {
+            State::Published => {
+                // The merge commit is this page's tip now: its kept keys.
+                let kept = m.kept.clone();
+                let writes: TipWrites = m
+                    .writes
+                    .iter()
+                    .filter_map(|(id, w)| {
+                        let finals: Finals = w.finals.iter().filter(|(k, _)| kept.contains(k)).cloned().collect();
+                        (!finals.is_empty()).then(|| (*id, Sent { finals, reads: w.reads.clone() }))
+                    })
+                    .collect();
+                self.tip = Some(Tip { head: now, base: Some(m.winner), writes });
+                true
+            }
+            // The engine had another commit: the same write again, later —
+            // not a round (only a head that moved costs one).
+            State::Busy => {
+                m.resend = true;
+                false
+            }
+            State::Lost if m.rounds + 1 < MERGE_ROUNDS => {
+                m.rounds += 1;
+                m.resend = true;
+                false
+            }
+            State::Lost | State::Conflict | State::Failed | State::TooLarge { .. } => {
+                // It could not land where it was judged: the kept keys are
+                // superseded too — told, never blind.
+                let kept = std::mem::take(&mut m.kept);
+                m.superseded.extend(kept);
+                let mut out = Outbound::default();
+                self.finish_merge(&mut out);
+                self.out.extend(out.replies);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// The merge is over: tell each write's session its superseded keys.
+    fn finish_merge(&mut self, out: &mut Outbound) {
+        let Some(m) = self.merge.take() else { return };
+        tell_superseded(out, m.winner, &m.writes, &m.superseded);
+    }
+
+    fn start_probe(&mut self, winner: (u64, freenet_prolly::Cid), writes: TipWrites) {
+        let left = left_of(&writes);
         let keys: Vec<Vec<u8>> = left.keys().cloned().collect();
         let mut pending = BTreeMap::new();
         let mut reqs = Vec::new();
@@ -338,20 +594,7 @@ impl Server {
             return;
         }
         let p = self.probe.take().expect("checked");
-        for ((client, write_id), fin) in &p.writes {
-            let keys: Vec<Vec<u8>> = fin.iter().map(|(k, _)| k.clone()).filter(|k| p.superseded.contains(k)).collect();
-            let c = engine::ClientId(*client);
-            if keys.is_empty() || version_of(c) < protocol::SESSION_SINCE || session_of(c) == protocol::LEGACY_SESSION {
-                continue;
-            }
-            out.replies.push(reply_bytes(&protocol::Reply::Superseded {
-                session: session_of(c),
-                write_id: *write_id,
-                seq: p.winner.0,
-                root: p.winner.1,
-                keys,
-            }));
-        }
+        tell_superseded(out, p.winner, &p.writes, &p.superseded);
     }
 
     /// The answers that are about the CALL, not an effect (shell.rs 663–700).
@@ -608,7 +851,7 @@ impl Server {
         // `Page::take_client` by the caller, as `handle` read `effects`.
         // sdk#225b: what each write leaves at each key, in case its commit is
         // displaced by another device's.
-        if let Event::Write { client, write_id, ops, .. } = &ev {
+        if let Event::Write { client, write_id, ops, reads } = &ev {
             let mut finals: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
             for (k, o) in ops {
                 finals.insert(k.clone(), match o {
@@ -616,7 +859,7 @@ impl Server {
                     engine::Op::Delete => None,
                 });
             }
-            self.sent.insert((client.0, write_id.0), finals.into_iter().collect());
+            self.sent.insert((client.0, write_id.0), Sent { finals: finals.into_iter().collect(), reads: reads.clone() });
         }
         self.page.event(ev);
         Vec::new()
@@ -807,6 +1050,31 @@ impl Server {
 enum Served {
     Do(Request, u16, u64),
     Answer(Reply),
+}
+
+/// What a tip left at each key: ONE value per key, because every tip write
+/// agrees there (see [`Probe::left`]). Debug-asserted.
+fn left_of(writes: &TipWrites) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+    let mut left: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    for (_, w) in writes {
+        for (k, v) in &w.finals {
+            let was = left.insert(k.clone(), v.clone());
+            debug_assert!(was.is_none_or(|x| x == *v), "two writes of one tip disagree at a key: a commit carries one write, the rest are no-ops");
+        }
+    }
+    left
+}
+
+/// Each write's session is told the keys of ITS that the winner replaced.
+fn tell_superseded(out: &mut Outbound, winner: (u64, freenet_prolly::Cid), writes: &TipWrites, superseded: &std::collections::BTreeSet<Vec<u8>>) {
+    for ((client, write_id), w) in writes {
+        let keys: Vec<Vec<u8>> = w.finals.iter().map(|(k, _)| k.clone()).filter(|k| superseded.contains(k)).collect();
+        let c = engine::ClientId(*client);
+        if keys.is_empty() || version_of(c) < protocol::SESSION_SINCE || session_of(c) == protocol::LEGACY_SESSION {
+            continue;
+        }
+        out.replies.push(reply_bytes(&protocol::Reply::Superseded { session: session_of(c), write_id: *write_id, seq: winner.0, root: winner.1, keys }));
+    }
 }
 
 fn served() -> Vec<u16> {
