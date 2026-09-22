@@ -1736,14 +1736,46 @@ impl Session {
         }
         self.pump_page();
         self.pump_cold();
+        // sdk#143/#144: a conflicted update or define is RE-RUN on the new
+        // base. What it must load first goes through the ordinary load path
+        // (and its timeout); what it could not keep is the app's news.
+        let rerun = self.db.rerun(now, self.loads.budget_ms);
+        for (lo, hi) in rerun.load {
+            let _ = self.decide::<()>(Err(DbError::NotLoaded { lo, hi }));
+        }
+        let reruns: Vec<serde_json::Value> = rerun
+            .events
+            .iter()
+            .map(|e| match e {
+                craftworks_sdk::RerunEvent::Dropped { write_id, fields } => serde_json::json!({
+                    "writeId": write_id,
+                    "outcome": "dropped",
+                    "fields": fields,
+                    "line": "Some of your change was not kept: these fields were changed elsewhere first.",
+                }),
+                craftworks_sdk::RerunEvent::Deleted { write_id } => serde_json::json!({
+                    "writeId": write_id,
+                    "outcome": "deleted",
+                    "line": "Your change was not kept: the record was deleted elsewhere.",
+                }),
+                craftworks_sdk::RerunEvent::Failed { write_id, reason } => serde_json::json!({
+                    "writeId": write_id,
+                    "outcome": "failed",
+                    "reason": reason,
+                    "line": "Your change could not be saved.",
+                }),
+            })
+            .collect();
         // M2 (sdk#148): writes that did not apply because what they READ had
-        // moved. Facts and one default line; how to show them is the page's.
+        // moved, and were not re-run (a create, a delete). Facts and one
+        // default line; how to show them is the page's.
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let conflicts: Vec<serde_json::Value> = self
             .db
             .store_mut()
             .take_conflicts()
             .into_iter()
+            .filter(|c| !rerun.taken.contains(&c.write_id))
             .map(|c| {
                 serde_json::json!({
                     "writeId": c.write_id,
@@ -1774,6 +1806,7 @@ impl Session {
             "loadsInFlight": self.loads.in_flight(),
             "conflicts": conflicts,
             "superseded": superseded,
+            "reruns": reruns,
         })
         .to_string()
     }

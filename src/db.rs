@@ -83,6 +83,71 @@ pub struct Db<S: Store + Reads, E: Env> {
     ids: IdGen,
     /// Signing identity. All zero until identities land (phase 3).
     author: [u8; 32],
+    /// What each of this Db's writes MEANT, by the store's write id, while it
+    /// is pending: the patch an update made, the fields a define appended. On
+    /// a Conflict the operation is RE-RUN on the new base (sdk#143/#144).
+    ops: std::collections::BTreeMap<u64, Op>,
+    /// Conflicted chains being re-run, oldest first.
+    reruns: std::collections::VecDeque<Rerun>,
+}
+
+/// What an update or a define meant, so a Conflict can re-run it.
+#[derive(Debug, Clone)]
+enum Op {
+    Patch { domain: String, loc: Loc, base: Map<String, Value>, patch: Map<String, Value>, round: u8 },
+    Append { domain: String, appended: Vec<crate::schema::Field>, round: u8 },
+}
+
+impl Op {
+    fn round(&self) -> u8 {
+        match self {
+            Op::Patch { round, .. } | Op::Append { round, .. } => *round,
+        }
+    }
+
+    fn set_round(&mut self, to: u8) {
+        match self {
+            Op::Patch { round, .. } | Op::Append { round, .. } => *round = to,
+        }
+    }
+}
+
+/// A conflicted chain: its operations in the order they were made, and the
+/// latest moment it may wait for a reload.
+#[derive(Debug)]
+struct Rerun {
+    ops: std::collections::VecDeque<(u64, Op)>,
+    /// How many times this chain has been re-run already: ONE budget for the
+    /// whole chain, never one per write.
+    round: u8,
+    deadline_ms: u64,
+}
+
+/// How many times one chain may be re-run: a record rewritten under the
+/// writer every time ends here, the writes named — never a spin.
+pub const RERUN_ROUNDS: u8 = 3;
+
+/// What a re-run could NOT keep (sdk#143/#144), for the app to tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RerunEvent {
+    /// These fields of the write were changed elsewhere too: the other write
+    /// stands, this one's value at them was dropped.
+    Dropped { write_id: u64, fields: Vec<String> },
+    /// The record was deleted elsewhere: nothing of the write was re-applied.
+    Deleted { write_id: u64 },
+    /// Nothing of the write could be re-applied: named why.
+    Failed { write_id: u64, reason: String },
+}
+
+/// One call of [`Db::rerun`]: what it needs loaded before it can go on, and
+/// what it could not keep.
+#[derive(Debug, Default)]
+pub struct RerunStep {
+    pub load: Vec<(Vec<u8>, Vec<u8>)>,
+    pub events: Vec<RerunEvent>,
+    /// The conflicted writes this call took up to re-run. Their raw Conflict
+    /// is not the app's news: the re-run's outcome is.
+    pub taken: Vec<u64>,
 }
 
 /// Why a `Db` call did not answer.
@@ -427,6 +492,8 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             env,
             ids: IdGen::new(device),
             author: [0; 32],
+            ops: std::collections::BTreeMap::new(),
+            reruns: std::collections::VecDeque::new(),
         }
     }
 
@@ -458,6 +525,196 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// contents, so an app can produce a long one without ever writing it). A
     /// store is allowed to treat a limit breach as a bug and stop — see
     /// [`Store`] — so the app has to be told before, in a way it can handle.
+    /// Remember what the write just made meant, if the store numbers writes.
+    fn remember(&mut self, op: Op) {
+        if let Some(id) = self.store.last_write_id() {
+            self.ops.insert(id, op);
+        }
+    }
+
+    /// RE-RUN WHAT CONFLICTED (sdk#143/#144, the owner's cell rule at field
+    /// level): a write refused because a key it READ had moved is made again
+    /// on the new base — its PATCH, not its bytes — with fresh reads. Fields
+    /// the other side changed too go to the other side (told once); the rest
+    /// land. A chain (the conflicted write and the later ones on its record
+    /// that fell with it) is re-run in the order it was made, each on the
+    /// record as the previous re-run left it, under ONE budget.
+    ///
+    /// The host calls this on its tick: it answers what must be LOADED before
+    /// it can go on (the copy forgot the conflicted keys) and what it could not
+    /// keep. A wait for a load is bounded by `wait_ms`, the LOAD PATH's own
+    /// budget (the host passes it: one timeout, not two); the chain's re-runs
+    /// by [`RERUN_ROUNDS`].
+    ///
+    /// Stated residual (the architect's #5): "unchanged" is per field, current
+    /// against the value this write read. Another writer changing a field and
+    /// changing it BACK across two of its writes reads as unchanged, and this
+    /// patch then wins over their final value.
+    pub fn rerun(&mut self, now_ms: u64, wait_ms: u64) -> RerunStep {
+        let mut step = RerunStep::default();
+        for chain in self.store.take_conflict_chains() {
+            let ops: std::collections::VecDeque<(u64, Op)> =
+                chain.write_ids.iter().filter_map(|id| self.ops.remove(id).map(|op| (*id, op))).collect();
+            if !ops.is_empty() {
+                step.taken.extend(ops.iter().map(|(id, _)| *id));
+                let round = ops.iter().map(|(_, op)| op.round()).max().unwrap_or(0);
+                self.reruns.push_back(Rerun { ops, round, deadline_ms: now_ms + wait_ms });
+            }
+        }
+        // What is no longer pending and did not conflict ended: forget it.
+        let store = &self.store;
+        self.ops.retain(|id, _| store.is_pending_write(*id));
+        let mut waiting = std::collections::VecDeque::new();
+        while let Some(mut r) = self.reruns.pop_front() {
+            match self.rerun_chain(&mut r, &mut step) {
+                Ok(()) => {}
+                Err(()) if now_ms < r.deadline_ms => waiting.push_back(r),
+                Err(()) => {
+                    for (id, _) in r.ops {
+                        step.events.push(RerunEvent::Failed { write_id: id, reason: "the record could not be read again in time".into() });
+                    }
+                }
+            }
+        }
+        self.reruns = waiting;
+        step
+    }
+
+    /// Re-run a chain's operations in order. `Err` means "waiting for a load"
+    /// (named in `step.load`); the chain keeps what is left.
+    fn rerun_chain(&mut self, r: &mut Rerun, step: &mut RerunStep) -> std::result::Result<(), ()> {
+        if r.round >= RERUN_ROUNDS {
+            for (id, _) in r.ops.drain(..) {
+                step.events.push(RerunEvent::Failed {
+                    write_id: id,
+                    reason: format!("the record was changed elsewhere again after {RERUN_ROUNDS} re-runs"),
+                });
+            }
+            return Ok(());
+        }
+        let round = r.round + 1;
+        while let Some((id, op)) = r.ops.front().cloned() {
+            match op {
+                Op::Patch { domain, loc, base, patch, .. } => {
+                    let key = record_key(&domain, loc);
+                    let schema = match self.schema(&domain) {
+                        Ok(Some(s)) => s,
+                        Ok(None) => {
+                            r.ops.pop_front();
+                            step.events.push(RerunEvent::Failed { write_id: id, reason: format!("domain `{domain}` has no schema") });
+                            continue;
+                        }
+                        Err(DbError::NotLoaded { lo, hi }) => {
+                            step.load.push((lo, hi));
+                            return Err(());
+                        }
+                        Err(e) => {
+                            r.ops.pop_front();
+                            step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() });
+                            continue;
+                        }
+                    };
+                    let cur = match self.get_key(&key) {
+                        Ok(Some(b)) => b,
+                        Ok(None) => {
+                            r.ops.pop_front();
+                            step.events.push(RerunEvent::Deleted { write_id: id });
+                            continue;
+                        }
+                        Err(DbError::NotLoaded { lo, hi }) => {
+                            step.load.push((lo, hi));
+                            return Err(());
+                        }
+                        Err(e) => {
+                            r.ops.pop_front();
+                            step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() });
+                            continue;
+                        }
+                    };
+                    r.ops.pop_front();
+                    let cur = match record::decode(&schema, &cur) {
+                        Ok(d) => d.fields,
+                        Err(e) => {
+                            step.events.push(RerunEvent::Failed { write_id: id, reason: e });
+                            continue;
+                        }
+                    };
+                    // USER fields only: `updated`/`created`/`author` are not
+                    // fields, so another write never counts as changing them.
+                    let theirs = |f: &String| cur.get(f) != base.get(f);
+                    // Schemas only GROW, so a patch field the schema no longer
+                    // has is unreachable: a named refusal, not a silent drop.
+                    if let Some(gone) = patch.keys().find(|f| !schema.fields.iter().any(|g| &g.name == *f)) {
+                        step.events.push(RerunEvent::Failed { write_id: id, reason: format!("field `{gone}` is no longer in `{domain}`'s schema") });
+                        continue;
+                    }
+                    let dropped: Vec<String> = patch.keys().filter(|f| theirs(f)).cloned().collect();
+                    let mine: Map<String, Value> = patch.iter().filter(|(f, _)| !theirs(f)).map(|(f, v)| (f.clone(), v.clone())).collect();
+                    if !dropped.is_empty() {
+                        step.events.push(RerunEvent::Dropped { write_id: id, fields: dropped });
+                    }
+                    if mine.is_empty() {
+                        continue;
+                    }
+                    match self.update(&domain, loc, &mine) {
+                        Ok(_) => {
+                            // The re-run's own op carries the chain's round.
+                            if let Some(op) = self.store.last_write_id().and_then(|new| self.ops.get_mut(&new)) {
+                                op.set_round(round);
+                            }
+                        }
+                        Err(e) => step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() }),
+                    }
+                }
+                Op::Append { domain, appended, .. } => {
+                    let stored = match self.schema(&domain) {
+                        Ok(s) => s,
+                        Err(DbError::NotLoaded { lo, hi }) => {
+                            step.load.push((lo, hi));
+                            return Err(());
+                        }
+                        Err(e) => {
+                            r.ops.pop_front();
+                            step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() });
+                            continue;
+                        }
+                    };
+                    r.ops.pop_front();
+                    let Some(mut next) = stored else {
+                        step.events.push(RerunEvent::Failed { write_id: id, reason: format!("`{domain}`'s schema is gone") });
+                        continue;
+                    };
+                    let mut add = Vec::new();
+                    let mut refused = None;
+                    for f in &appended {
+                        match next.fields.iter().find(|g| g.name == f.name) {
+                            Some(g) if g.kind == f.kind => {}
+                            Some(g) => refused = Some(format!("field `{}` was added elsewhere as {:?}, here as {:?}", f.name, g.kind, f.kind)),
+                            None => add.push(f.clone()),
+                        }
+                    }
+                    if let Some(reason) = refused {
+                        step.events.push(RerunEvent::Failed { write_id: id, reason });
+                        continue;
+                    }
+                    if add.is_empty() {
+                        continue;
+                    }
+                    next.fields.extend(add);
+                    match self.define(&domain, &next) {
+                        Ok(()) => {
+                            if let Some(op) = self.store.last_write_id().and_then(|new| self.ops.get_mut(&new)) {
+                                op.set_round(round);
+                            }
+                        }
+                        Err(e) => step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() }),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// What a key holds NOW, as a read a write declares: its value's leaf hash
     /// (the engine's token) or `Absent`. Not loaded is an error, exactly as
     /// for `get`: "absent" is a claim, and a wrong one would let a write land
@@ -511,7 +768,8 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     pub fn define(&mut self, domain: &str, schema: &Schema) -> Result<()> {
         check_domain(domain)?;
         schema.check()?;
-        if let Some(old) = self.schema(domain)? {
+        let base = self.schema(domain)?;
+        if let Some(old) = &base {
             old.allows(schema)?;
         }
         let bytes = serde_json::to_vec(schema).map_err(|e| e.to_string())?;
@@ -519,7 +777,13 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         // the same schema from one Absent base both succeed: a write already
         // there is not a conflict (the engine's rule, sdk#148).
         let read = self.read_of(&schema_key(domain))?;
-        self.write(vec![read], vec![(schema_key(domain), Edit::Put(bytes))])
+        self.write(vec![read], vec![(schema_key(domain), Edit::Put(bytes))])?;
+        let appended: Vec<crate::schema::Field> = match &base {
+            Some(b) => schema.fields.iter().filter(|f| !b.fields.iter().any(|g| g.name == f.name)).cloned().collect(),
+            None => schema.fields.clone(),
+        };
+        self.remember(Op::Append { domain: domain.to_string(), appended, round: 0 });
+        Ok(())
     }
 
     /// The domain's schema, or `None` if it has none.
@@ -672,7 +936,9 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         // that moved since would replace a change this session never saw —
         // and the schema it was decoded and re-encoded under.
         let reads = vec![(key.clone(), Expect::Value(crate::read_token::read_token(&old))), self.read_of(&schema_key(domain))?];
+        let base = record::decode(&schema, &old)?.fields;
         self.write(reads, vec![(key.clone(), Edit::Put(bytes.clone()))])?;
+        self.remember(Op::Patch { domain: domain.to_string(), loc, base, patch: patch.clone(), round: 0 });
         self.read(&schema, &loc, &key, &bytes)
     }
 
