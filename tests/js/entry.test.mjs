@@ -211,6 +211,7 @@ const openWatching = async () => {
   const sdk = wrap(raw);
   let deliver;
   const { db } = await sdk.open({
+    app: "test-app",
     port: 17509,
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: (session, { onEvent }) => {
