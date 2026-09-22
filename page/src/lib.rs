@@ -406,8 +406,6 @@ pub struct Page {
     recovered: bool,
     /// Has the engine been told its head (`HeadRead` / `HeadMissing`)?
     engine_has_head: bool,
-    /// Writes made before it was, in order (see [`Page::write_reading`]).
-    held_writes: Vec<Event>,
     out: Vec<Op>,
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
@@ -463,7 +461,6 @@ impl Page {
             recover_told: false,
             recovered: false,
             engine_has_head: false,
-            held_writes: Vec::new(),
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
@@ -498,17 +495,16 @@ impl Page {
         self.client_event(Event::Write { client, write_id, ops, reads });
     }
 
-    /// A WRITE before the engine has read its head is HELD, and replayed in
-    /// order once the head is recovered. Committed at once, it would land on
-    /// the EMPTY tree the engine starts on, and the page would sign that from
-    /// the genesis over a register nobody read (1b) — main's M2 on #227 found
-    /// the check that should have seen it could not. Reads are held the same
-    /// way by [`server::Server`] (and by the engine itself once sdk#223 lands).
+    /// Straight to the engine, WRITES INCLUDED.
+    ///
+    /// A write made before the head is recovered would land on the EMPTY tree
+    /// the engine starts on, and the page would sign that from the genesis
+    /// over a register nobody read (1b). The page used to hold such writes
+    /// itself; the ENGINE now parks one and answers `Busy` to the rest
+    /// (sdk#223), which is the same rule one layer down — and, unlike the
+    /// hold, it ANSWERS: a held write was invisible to the client's outbox,
+    /// so nothing re-sent it and nothing reported it.
     fn client_event(&mut self, ev: Event) {
-        if !self.engine_has_head && matches!(ev, Event::Write { .. }) {
-            self.held_writes.push(ev);
-            return;
-        }
         self.step(ev);
     }
 
@@ -1215,9 +1211,6 @@ impl Page {
         if recovery && !self.engine_has_head {
             self.engine_has_head = true;
             self.last_head_at = self.now;
-            for w in std::mem::take(&mut self.held_writes) {
-                self.step(w);
-            }
         }
     }
 

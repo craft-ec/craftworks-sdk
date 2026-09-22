@@ -108,6 +108,8 @@ fn a_context_round_trips_and_refuses_what_it_cannot_read() {
         ..Params::default()
     };
     let mut e = Engine::new(packed, store.clone());
+    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
+    let _ = e.step(Event::HeadMissing);
     let out = e.step(Event::Write {
         client: ClientId(1),
         write_id: WriteId(1),
@@ -224,6 +226,8 @@ fn the_context_costs_what_it_is_budgeted() {
             )
         })
         .collect();
+    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
+    let _ = e.step(Event::HeadMissing);
     let out = e.step(Event::Write {
         client: ClientId(1),
         write_id: WriteId(1),
@@ -365,6 +369,8 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
             )
         })
         .collect();
+    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
+    let _ = e2.step(Event::HeadMissing);
     let out = e2.step(Event::Write {
         client: ClientId(1),
         write_id: WriteId(1),
@@ -444,6 +450,8 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
             epochs: vec![engine::Epoch(1)],
         });
         let before = e.root();
+        // A new tree: nothing to recover. A write before recovery waits (sdk#223).
+        let _ = e.step(Event::HeadMissing);
         let out = e.step(Event::Write {
             client: ClientId(1),
             write_id: WriteId(1),
@@ -634,6 +642,8 @@ fn owed_parity_survives_a_rehydration_and_is_still_put() {
             )
         })
         .collect();
+    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
+    let _ = e.step(Event::HeadMissing);
     let mut queue = e.step(Event::Write {
         client: ClientId(1),
         write_id: WriteId(1),
@@ -760,6 +770,8 @@ fn a_damaged_context_is_refused_without_panicking_or_allocating_the_world() {
     let ops: Vec<(Vec<u8>, Op)> = (0..200)
         .map(|i| (format!("k{i:04}").into_bytes(), Op::Put(vec![7u8; 100])))
         .collect();
+    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
+    let _ = e.step(Event::HeadMissing);
     let _ = e.step(Event::Write {
         client: ClientId(1),
         write_id: WriteId(1),
@@ -830,6 +842,8 @@ fn a_damaged_context_is_refused_without_panicking_or_allocating_the_world() {
 fn a_refused_context_recovers_from_the_head_and_gives_the_unknown_write_no_verdict() {
     let mut store = Store::default();
     let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
+    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
+    let _ = e.step(Event::HeadMissing);
     let out = e.step(Event::Write {
         client: ClientId(1),
         write_id: WriteId(1),

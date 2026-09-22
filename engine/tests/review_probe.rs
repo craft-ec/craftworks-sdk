@@ -18,6 +18,9 @@ fn a_failed_pack_put_is_re_emitted() {
         },
         Store::default(),
     );
+    // A NEW tree, and the engine is told so: a write before the head is
+    // recovered waits for it (sdk#223). These probes are about the PACK path.
+    let _ = e.step(Event::HeadMissing);
     let fx = stepped!(
         e,
         Event::Write {
@@ -57,6 +60,9 @@ fn parity_complete_fires_once_per_write() {
         },
         Store::default(),
     );
+    // A NEW tree, and the engine is told so: a write before the head is
+    // recovered waits for it (sdk#223). These probes are about the PACK path.
+    let _ = e.step(Event::HeadMissing);
     let ops: Vec<_> = (0..4000)
         .map(|i| put(format!("key-{i:06}"), vec![7u8; 40]))
         .collect();

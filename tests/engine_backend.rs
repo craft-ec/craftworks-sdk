@@ -490,3 +490,44 @@ fn an_unreadable_message_is_counted_and_not_silently_ignored() {
     );
     println!("  dropped: {now:?}");
 }
+
+/// **The writes an app makes AT OPEN all land, in order, with nothing for the
+/// app to do** (sdk#223's write half).
+///
+/// This is what a page does the moment it opens: define a collection, seed it,
+/// then edit — five writes, before anything has told the engine what head it
+/// stands on. A write applied to the empty tree then would commit a head that
+/// knows nothing of the real one, so the engine parks the first and answers
+/// the rest `Busy`. Both are invisible here on purpose: the outbox re-sends,
+/// and the app sees five writes that land.
+#[test]
+fn every_write_made_at_open_lands_in_order_with_nothing_for_the_app_to_do() {
+    use craftworks_sdk::Store as _;
+    // NOT `started`: no `identity()` first, so these writes are made before
+    // the head is recovered — the case this exists for.
+    let mut db = EngineStore::new(Loop::new(0));
+    for i in 0..5u32 {
+        db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes())
+            .unwrap_or_else(|e| panic!("write {i} at open was refused: {e:?}"));
+    }
+    // What a page does next: it learns who it is, then reads. The parked
+    // write is applied on the recovered root, and the outbox re-sends the
+    // rest as the exchanges go by — no app call re-sends anything.
+    db.identity().expect("the engine answers who it is");
+    // The page's TICK, which is what sends what is queued. No app call
+    // re-sends anything, and nothing the app did reported an error.
+    db.drain_queued();
+    let rows = db.list(Bound::Unbounded, Bound::Unbounded, false).expect("the range reads");
+    assert_eq!(db.waiting(), 0, "writes made at open are still queued");
+    let keys: Vec<String> = rows.iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).collect();
+    assert_eq!(
+        keys,
+        (0..5).map(|i| format!("k/{i:02}")).collect::<Vec<String>>(),
+        "the five writes made at open did not all land, in order"
+    );
+    for (i, (_, v)) in rows.iter().enumerate() {
+        assert_eq!(v.as_slice(), format!("v{i}").as_bytes(), "row {i} has the wrong value");
+    }
+    println!("  5 writes at open, all readable in order");
+}
+
