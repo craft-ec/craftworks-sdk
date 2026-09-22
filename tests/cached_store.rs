@@ -625,7 +625,7 @@ fn own_state_changes_name_the_app_relative_domain_its_bindings_are_keyed_by() {
         "a tab's own state change did not name the domains its bindings are keyed by (once each, app-relative), or named another app's"
     );
     // THE CONTROL: the stored name is NOT what a binding is keyed by.
-    assert!(!D::own_domains_of_keys(Some(app), &[mine.clone()]).contains(&format!("{app}.notes")), "the stored name leaked through");
+    assert!(!D::own_domains_of_keys(Some(app), std::slice::from_ref(&mine)).contains(&format!("{app}.notes")), "the stored name leaked through");
     // No app (data from before apps): the name as stored, as `app::own` says.
     assert_eq!(D::own_domains_of_keys(None, &[record_key("notes", loc)]), vec!["notes".to_string()]);
 }
