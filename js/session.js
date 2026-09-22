@@ -148,6 +148,11 @@ export async function openSession(Session, {
   // their own tree is not created until they have something to write
   // (builder#104). The artefacts are still used — `tree` needs the Block code.
   provision = true,
+  // THE APP this session is (the forest ruling): a person's one tree is
+  // divided by app, and every domain name here is relative to this app — it
+  // has no name for another app's data and cannot write it. `open()` requires
+  // it; a session without one writes nothing.
+  app = null,
   // NO LITERAL. The rate comes from the session, which reads it from
   // `protocol`, because the page sends the time and the engine's deadlines
   // are counted in that unit — a 1000 written here would go on being right
@@ -175,6 +180,7 @@ export async function openSession(Session, {
   documentOf = (typeof document === "object" ? document : null),
 } = {}) {
   const session = new Session(port);
+  if (app !== null) session.set_app(app);
   // A tree reader's stream-id range, 1..=255 and never reused while open.
   let rangeCursor = 0;
   const nextRange = () => {
@@ -455,7 +461,7 @@ export async function openSession(Session, {
      * BOUNDED, and a refusal past either bound says which: MAX_OPEN_TREES
      * engines at once (memory), and MAX_TREE_SUBSCRIPTIONS per socket (F57).
      */
-    tree: async registerId => {
+    tree: async (registerId, { app: treeApp = app } = {}) => {
       if (closed) throw new Error("tree(): this session is closed");
       if (trees.size >= MAX_OPEN_TREES) {
         throw new Error(`tree(): ${MAX_OPEN_TREES} trees are already open, each its own engine — close one first`);
@@ -468,6 +474,8 @@ export async function openSession(Session, {
       const block = await blockBytes();
       const reader = new Session(port);
       const range = nextRange();
+      // The SAME app's space in that person's tree, unless told another.
+      if (treeApp !== null) reader.set_app(treeApp);
       reader.open_named(block, registerId, range);
       const t = { session: reader, drain: () => {}, range };
       trees.add(t);
@@ -535,6 +543,11 @@ export async function openSession(Session, {
  * driving the parts separately is the whole point.
  */
 export async function open(Session, opts = {}) {
+  // NO APP, NO SESSION: a person's tree is divided by app, and a session with
+  // no app would write outside every app's space (the forest ruling).
+  if (typeof opts.app !== "string" || !opts.app) {
+    throw new Error("open() needs { app }: which app this is decides where its data lives in the person's tree");
+  }
   if (!Number.isInteger(opts.port) || opts.port <= 0 || opts.port > 65535) {
     throw new Error(
       "open() needs a port: which node this connects to is a decision, and " +

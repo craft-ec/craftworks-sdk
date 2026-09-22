@@ -132,6 +132,8 @@ const ARGS = {
   // exists to catch.
   children: ["d", "x"],
   root: [], stats: [], bind: ["d"],
+  // Another app's data, read-only: the handle itself is a VALUE on both surfaces.
+  other: ["some-app"],
 };
 
 /**

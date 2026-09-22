@@ -46,6 +46,7 @@ function fakeSession({ deliverAfterMs = null } = {}) {
     sent() {},
     // The real one says whether the frame was its own (sdk#239); a fake's
     // delivery always is.
+    set_app() {}, // the app a session is (sdk forest ruling); a fake needs no namespace
     on_inbound() { if (self.pendingDelivery) { loaded = true; ended.push({ id: ticket, ok: true, code: "LOADED" }); self.pendingDelivery = false; } return true; },
     unowned() {},
     reconnected() {},
@@ -106,7 +107,7 @@ await t("a page that calls only open() and scan() resolves a COLD read", async (
   const session = fakeSession({ deliverAfterMs: 0 });
   const ref = {};
   const clock = fakeClock();
-  const { db } = await open(function () { return session; }, {
+  const { db } = await open(function () { return session; }, { app: "test-app",
     port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
@@ -125,7 +126,7 @@ await t("A DEAD SOCKET rejects UNAVAILABLE through the TICK path", async () => {
   const session = fakeSession({ deliverAfterMs: null });
   const ref = {};
   const clock = fakeClock();
-  const { db } = await open(function () { return session; }, {
+  const { db } = await open(function () { return session; }, { app: "test-app",
     port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
@@ -148,7 +149,7 @@ await t("THE CONTROL: the same setup WITH a message resolves", async () => {
   const session = fakeSession({ deliverAfterMs: 0 });
   const ref = {};
   const clock = fakeClock();
-  const { db } = await open(function () { return session; }, {
+  const { db } = await open(function () { return session; }, { app: "test-app",
     port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
@@ -165,7 +166,7 @@ await t("open() hands back a db WITHOUT the page ever seeing drain", async () =>
   const session = fakeSession({ deliverAfterMs: 0 });
   const ref = {};
   const clock = fakeClock();
-  const handle = await open(function () { return session; }, {
+  const handle = await open(function () { return session; }, { app: "test-app",
     port: 17509,   // NAMED. `open` has no default, deliberately.
     connect: fakeConnect(ref),
     setInterval: clock.setInterval,
@@ -189,7 +190,7 @@ await t("**open() REFUSES to pick a port for you**", async () => {
   // whatever port it uses; nobody just gets to skip saying which.
   for (const port of [undefined, 0, -1, 70000, "7509", null]) {
     await assert.rejects(
-      () => open(function () { return fakeSession(); }, { port, connect: () => ({ close() {} }) }),
+      () => open(function () { return fakeSession(); }, { app: "test-app", port, connect: () => ({ close() {} }) }),
       e => { assert.match(e.message, /needs a port/); return true; },
       `port ${JSON.stringify(port)} was accepted`);
   }
@@ -200,7 +201,7 @@ await t("THE CONTROL: a named port is accepted", async () => {
   // and nothing could ever connect.
   const session = fakeSession({ deliverAfterMs: 0 });
   const clock = fakeClock();
-  const handle = await open(function () { return session; }, {
+  const handle = await open(function () { return session; }, { app: "test-app",
     port: 17509,
     connect: fakeConnect({}),
     setInterval: clock.setInterval,
@@ -223,7 +224,7 @@ await t("the cold reader's one-shot timer fires when its earliest fetch is due, 
     ref.deliver = () => { s.on_inbound(new Uint8Array()); onEvent({ kind: "message" }); };
     return { close() {}, pump() { pumps += 1; } };
   };
-  const page = await open(function () { return session; }, {
+  const page = await open(function () { return session; }, { app: "test-app",
     port: 17509,
     connect,
     setInterval: clock.setInterval,

@@ -90,6 +90,18 @@ export function wrap(raw) {
     bind(domain, { parent = null, live = false, limit = 0, reverse = false } = {}) {
       return new Binding(this, domain, live, limit, reverse, parent);
     }
+
+    // Another app's data (the node-backed db's `other`). An in-memory
+    // database is one app's preview and holds nobody else's: the same shape,
+    // and every call says so rather than answering "empty".
+    other(app) {
+      const no = async () => {
+        const e = new Error(`an in-memory database holds only this app's data; \`${app}\`'s lives on a node`);
+        e.code = "REFUSED";
+        throw e;
+      };
+      return { schema: no, get: no, count: no, scan: no, children: no, define: no, put: no, createAt: no, update: no, delete: no };
+    }
   }
 
   // One domain's rows, with a referentially STABLE snapshot.

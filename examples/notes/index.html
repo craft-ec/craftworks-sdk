@@ -25,6 +25,7 @@
   A SITE ON THE SDK ALONE (craftworks-sdk#234): no builder, nothing but this
   file and the SDK's pkg/web. Served from the repo root, open it as
     /examples/notes/#node=<your node's ws port>
+    add &app=<id> to be another app in the same person's tree (default notes-example)
   Every call below is one an app makes; the README's "Build a site on the SDK"
   is taken from this file.
 -->
@@ -44,10 +45,15 @@ try {
   // ONE CALL: connect, provision the node if it needs it, and hand back a db.
   // "saving N…" comes from the session, which counts every write not yet
   // published — closing the tab before 0 would lose them.
-  const { db } = await sdk.open({
+  // THE APP this is. A person has one tree, divided by app: `notes` here
+  // is this app's own, and no other app can write it.
+  const app = params.get("app") ?? "notes-example";
+  const handle = await sdk.open({
+    app,
     port,
     onEvent: e => { if (e.kind === "saving") { saving = e.count; render(); } },
   });
+  const { db } = handle;
   await db.define("notes", { type: "Note", fields: [{ name: "text", kind: "text", required: true }] });
 
   // A BINDING: the list re-reads by itself when the data changes.
@@ -81,7 +87,7 @@ try {
     await db.put("notes", { text });
   };
   // The acceptance seam: the tools read the db through this.
-  globalThis.__notes = { db, notes, saving: () => saving };
+  globalThis.__notes = { db, notes, saving: () => saving, head: () => handle.headId() };
   render();
 } catch (e) {
   say(`Could not open: ${e.message}`, true);

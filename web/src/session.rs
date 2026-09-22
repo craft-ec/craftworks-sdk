@@ -135,6 +135,11 @@ pub struct Session {
     /// A VIEW of somebody's published head (`open_named`, sdk#239): reads
     /// only, and every write refused before it reaches the store.
     read_only: bool,
+    /// THE APP this session is (the forest ruling): a person has ONE tree,
+    /// divided by app. Every domain name crossing into this session is
+    /// app-relative and gains `<app>.` here, so an app has no name for
+    /// another app's data and cannot write it. `None`: nothing is written.
+    app: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -180,6 +185,7 @@ impl Session {
             cold_chosen: false,
             puts: wire::puts::Puts::default(),
             read_only: false,
+            app: None,
             signer_code: Vec::new(),
             page: None,
             page_identity_sent: false,
@@ -506,7 +512,8 @@ impl Session {
                 self.refresh(&d);
             }
         }
-        let changed = self.refresh.take_changed();
+        // Back to the app-relative keys JavaScript holds.
+        let changed: Vec<String> = self.refresh.take_changed().iter().filter_map(|k| self.own_name(k)).collect();
         serde_json::to_string(&changed).unwrap_or_else(|_| "[]".into())
     }
 
@@ -614,7 +621,10 @@ impl Session {
     }
 
     pub fn refresh_domain(&mut self, domain: &str) {
-        self.refresh(domain);
+        // A watch key is a domain, or `domain#parent`: app-relative here too.
+        if let Ok(key) = self.read_name(domain) {
+            self.refresh(&key);
+        }
     }
 
     /// What this page is showing — a watch key from [`Session::watch_key`] —
@@ -623,7 +633,9 @@ impl Session {
     /// Recorded by the session rather than tracked in JS, because deciding
     /// what to reload is a decision.
     pub fn bind(&mut self, domain: &str) {
-        self.bound.insert(domain.to_string());
+        if let Ok(key) = self.read_name(domain) {
+            self.bound.insert(key);
+        }
     }
 
     /// The watch key for a binding of `domain`, over one `parent`'s band when
@@ -638,7 +650,9 @@ impl Session {
     }
 
     pub fn unbind(&mut self, domain: &str) {
-        self.bound.remove(domain);
+        if let Ok(key) = self.read_name(domain) {
+            self.bound.remove(&key);
+        }
     }
 
     /// How this session actually finds out that the head moved.
@@ -1082,6 +1096,19 @@ impl Session {
         }
     }
 
+    /// Which app this session is (`open({ app })`). Set once: an app id is
+    /// 1–32 of a-z 0-9 _ - (no `.`, which separates it from the domain).
+    pub fn set_app(&mut self, app: &str) -> Result<(), JsValue> {
+        craftworks_sdk::app::check(app).map_err(|e| db_err(&e))?;
+        match &self.app {
+            Some(a) if a != app => Err(db_err(&DbError::Refused(format!("this session is app `{a}`; it cannot become `{app}`")))),
+            _ => {
+                self.app = Some(app.to_string());
+                Ok(())
+            }
+        }
+    }
+
     /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
     /// `{"state":"none"|"pending"|"put"|"refused"|"unanswered","said":"…"}`.
     /// `said` is the node's own words for a refusal: display only.
@@ -1118,30 +1145,35 @@ impl Session {
         // the same app); any other is a write, refused. The schema is READ
         // through the same decision, so an unloaded one parks, never "none".
         if self.read_only {
-            let r = self.db.schema(domain).and_then(|old| match old {
+            let name = self.read_name(domain)?;
+            let r = self.db.schema(&name).and_then(|old| match old {
                 Some(o) if o == s => Ok(()),
                 _ => Err(DbError::Refused(format!("{READ_ONLY}: `{domain}` is not defined like that here"))),
             });
             return self.decided(r);
         }
-        let r = self.db.define(domain, &s);
+        let name = self.write_name(domain)?;
+        let r = self.db.define(&name, &s);
         self.decided(r)
     }
 
     pub fn schema(&mut self, domain: &str) -> Result<String, JsValue> {
-        let r = self.db.schema(domain);
+        let name = self.read_name(domain)?;
+        let r = self.db.schema(&name);
         self.answer(r)
     }
 
     pub fn domains(&mut self) -> Result<String, JsValue> {
-        let r = self.db.domains();
+        // THIS app's domains, by the names it gave them.
+        let r = self.db.domains().map(|all| all.iter().filter_map(|d| self.own_name(d)).collect::<Vec<_>>());
         self.answer(r)
     }
 
     pub fn put(&mut self, domain: &str, fields: &str) -> Result<String, JsValue> {
         self.writable()?;
+        let name = self.write_name(domain)?;
         let f = fields_of(fields)?;
-        let r = self.db.put(domain, &f);
+        let r = self.db.put(&name, &f);
         json_of(self.decided(r)?)
     }
 
@@ -1151,23 +1183,27 @@ impl Session {
     /// fresh session would write over the published record.
     pub fn create_at(&mut self, domain: &str, slot: &str, fields: &str) -> Result<String, JsValue> {
         self.writable()?;
+        let name = self.write_name(domain)?;
         let f = fields_of(fields)?;
         let s = rkey_of(slot)?;
-        let r = self.db.create_at(domain, s, &f);
+        let r = self.db.create_at(&name, s, &f);
         json_of(self.decided(r)?)
     }
 
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
         self.writable()?;
+        let name = self.write_name(domain)?;
         let p = fields_of(patch)?;
         let k = loc_of(id)?;
-        let r = self.db.update(domain, k, &p);
+        let r = self.db.update(&name, k, &p);
         json_of(self.decided(r)?)
     }
 
     /// An id that does not parse answers `null`, the same as one that parses
     /// and is not there (craftworks-sdk#118).
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
+        let name = self.read_name(domain)?;
+        let domain = name.as_str();
         let Some(k) = craftworks_sdk::id::loc_from_hex(id) else {
             // The domain is still checked: a read of a domain that does not
             // exist is a programming error, not a stale id from outside.
@@ -1181,8 +1217,9 @@ impl Session {
 
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
         self.writable()?;
+        let name = self.write_name(domain)?;
         let k = loc_of(id)?;
-        let r = self.db.delete(domain, k);
+        let r = self.db.delete(&name, k);
         self.decided(r)
     }
 
@@ -1200,9 +1237,10 @@ impl Session {
     ) -> Result<String, JsValue> {
         let after = if after.is_empty() { None } else { Some(rkey_of(after)?) };
         let p = rkey_of(parent)?;
+        let name = self.read_name(domain)?;
         let r = self
             .db
-            .children(domain, &p, craftworks_sdk::Scan { reverse, limit, after });
+            .children(&name, &p, craftworks_sdk::Scan { reverse, limit, after });
         self.answer(r)
     }
 
@@ -1219,8 +1257,9 @@ impl Session {
         } else {
             Some(rkey_of(after)?)
         };
+        let name = self.read_name(domain)?;
         let r = self.db.scan(
-            domain,
+            &name,
             craftworks_sdk::Scan {
                 reverse,
                 limit,
@@ -1268,7 +1307,8 @@ impl Session {
         // takes `decided` like the writes do. Before this it called a private
         // `park` directly and never told `Loads` the chain had SUCCEEDED, so
         // a count that worked left the done-set standing for the next call.
-        let r = self.db.count(domain);
+        let name = self.read_name(domain)?;
+        let r = self.db.count(&name);
         self.decided(r)
     }
 
@@ -1308,6 +1348,8 @@ impl Session {
         const MAX_DOMAINS: usize = 64;
         let domains: Vec<String> = serde_json::from_str(manifest)
             .map_err(|e| db_err(&DbError::Refused(format!("preload manifest: {e}"))))?;
+        // App-relative, like every name that crosses in.
+        let domains = domains.iter().map(|d| self.read_name(d)).collect::<Result<Vec<_>, _>>()?;
         if domains.len() > MAX_DOMAINS {
             return Err(db_err(&DbError::TooLarge(format!(
                 "preload names {} domains and the limit is {MAX_DOMAINS}",
@@ -1573,6 +1615,24 @@ const PRELOAD_REQ_BASE: u64 = 1 << 32;
 
 /// A `DbError` as JavaScript sees it: a stable `code` and a message that is
 /// for a person to read, never for code to branch on.
+impl Session {
+    /// A domain (or watch key) this app READS, as the tree stores it
+    /// (`craftworks_sdk::app::read`).
+    fn read_name(&self, name: &str) -> Result<String, JsValue> {
+        craftworks_sdk::app::read(self.app.as_deref(), name).map_err(|e| db_err(&e))
+    }
+
+    /// A domain this app WRITES: only its own (`craftworks_sdk::app::write`).
+    fn write_name(&self, name: &str) -> Result<String, JsValue> {
+        craftworks_sdk::app::write(self.app.as_deref(), name).map_err(|e| db_err(&e))
+    }
+
+    /// A stored name back to what this app calls it; `None` for another app's.
+    fn own_name(&self, stored: &str) -> Option<String> {
+        craftworks_sdk::app::own(self.app.as_deref(), stored)
+    }
+}
+
 /// What every refusal of a view says first.
 const READ_ONLY: &str = "read-only: this is a view of somebody's published data, and writing needs write access";
 
