@@ -15,8 +15,12 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "97
 elsa = "1"
 # The signer's answers, the merged type (sdk#214): serde + bincode only.
 signer-proto = { path = "../signer-proto" }
+# The page ↔ engine protocol page::Server answers (ruling B).
+protocol = { path = "../protocol" }
 
 [dev-dependencies]
+# The OLD side of the differential: the Shell over a scripted node.
+testkit = { path = "../testkit" }
 # The far side of the scripted client API runs the REAL signer rule and the
 # REAL Register record format, never a model of them.
 signer = { path = "../signer" }

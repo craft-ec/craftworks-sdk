@@ -4,8 +4,8 @@
 //! fork, a register the signer's node does not hold, and the pace of a
 //! wrapper-path `Held` that keeps answering absent.
 
-use engine::{ClientId, Op as WriteOp, Params, WriteId};
-use page::{Answer, Op, Page, PutPath, BACKOFF_MS, HELD_ABSENTS, SILENT_MS};
+use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
+use page::{Ms, Answer, Op, Page, PutPath, BACKOFF_MS, HELD_ABSENTS, SILENT_MS};
 use signer_proto::{Answer as A, Head, Why};
 
 /// A page with one write, driven until it asks the signer; returns it, the
@@ -18,9 +18,9 @@ fn at_sign(path: PutPath) -> (Page, u64, u32) {
     for _ in 0..20 {
         for op in p.take_ops() {
             match op {
-                Op::ReadHead => p.answer(Answer::Head(None), now),
-                Op::Put { id, .. } => p.answer(Answer::PutOk(id), now),
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, now),
+                Op::ReadHead => p.answer(Answer::Head(None), Ms(now)),
+                Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
                 Op::Sign { id, .. } => return (p, now, id),
                 other => panic!("unexpected before the sign: {other:?}"),
             }
@@ -52,8 +52,8 @@ fn a_misrouted_answer_does_not_stop_the_sign_being_asked_again() {
     ] {
         let (mut p, now, id) = at_sign(PutPath::Page);
         let under = if other_id { id.wrapping_add(1000) } else { id };
-        p.answer(Answer::Signer { id: under, answer: misrouted.clone() }, now + 1);
-        p.tick(now + SILENT_MS);
+        p.answer(Answer::Signer { id: under, answer: misrouted.clone() }, Ms(now + 1));
+        p.tick(Ms(now + SILENT_MS));
         assert_eq!(signs(&p.take_ops()), 1, "after a misrouted {misrouted:?} (id {under}) the sign was never asked again");
         assert!(p.unusable().is_empty(), "a misrouted answer was taken as the sign's: {:?}", p.unusable());
     }
@@ -64,8 +64,8 @@ fn a_misrouted_answer_does_not_stop_the_sign_being_asked_again() {
 #[test]
 fn control_a_sign_shaped_answer_ends_the_wait() {
     let (mut p, now, id) = at_sign(PutPath::Page);
-    p.answer(Answer::Signer { id, answer: A::Refused(Why::NotSuccessor) }, now + 1);
-    p.tick(now + SILENT_MS);
+    p.answer(Answer::Signer { id, answer: A::Refused(Why::NotSuccessor) }, Ms(now + 1));
+    p.tick(Ms(now + SILENT_MS));
     assert_eq!(signs(&p.take_ops()), 0, "a permanent refusal was re-asked");
     assert_eq!(p.unusable().len(), 1);
 }
@@ -75,9 +75,9 @@ fn control_a_sign_shaped_answer_ends_the_wait() {
 fn a_fork_is_surfaced_loudly_and_never_retried() {
     let (mut p, now, id) = at_sign(PutPath::Page);
     let fork = Why::Forked { mine: Head { seq: 1, root: [1; 32] }, read: Head { seq: 1, root: [2; 32] } };
-    p.answer(Answer::Signer { id, answer: A::Refused(fork) }, now + 1);
+    p.answer(Answer::Signer { id, answer: A::Refused(fork) }, Ms(now + 1));
     assert!(p.forked().is_some_and(|m| m.starts_with("FORKED")), "a fork was not surfaced");
-    p.tick(now + 10 * SILENT_MS);
+    p.tick(Ms(now + 10 * SILENT_MS));
     assert_eq!(signs(&p.take_ops()), 0, "a fork was retried");
 }
 
@@ -86,12 +86,12 @@ fn a_fork_is_surfaced_loudly_and_never_retried() {
 #[test]
 fn head_unknown_reads_the_register_then_asks_again_after_a_backoff() {
     let (mut p, now, id) = at_sign(PutPath::Page);
-    p.answer(Answer::Signer { id, answer: A::Refused(Why::HeadUnknown) }, now);
+    p.answer(Answer::Signer { id, answer: A::Refused(Why::HeadUnknown) }, Ms(now));
     let ops = p.take_ops();
     assert!(ops.contains(&Op::ReadHead), "the register was not read to make it held: {ops:?}");
-    p.tick(now + 1);
+    p.tick(Ms(now + 1));
     assert_eq!(signs(&p.take_ops()), 0, "asked again with no backoff");
-    p.tick(now + 2 * BACKOFF_MS);
+    p.tick(Ms(now + 2 * BACKOFF_MS));
     assert_eq!(signs(&p.take_ops()), 1, "never asked again after its backoff");
     assert!(p.unusable().is_empty());
 }
@@ -101,8 +101,8 @@ fn head_unknown_reads_the_register_then_asks_again_after_a_backoff() {
 fn record_not_saved_and_root_not_held_are_asked_again_after_a_backoff() {
     for why in [Why::RecordNotSaved, Why::RootNotHeld] {
         let (mut p, now, id) = at_sign(PutPath::Page);
-        p.answer(Answer::Signer { id, answer: A::Refused(why.clone()) }, now);
-        p.tick(now + 2 * BACKOFF_MS);
+        p.answer(Answer::Signer { id, answer: A::Refused(why.clone()) }, Ms(now));
+        p.tick(Ms(now + 2 * BACKOFF_MS));
         assert_eq!(signs(&p.take_ops()), 1, "{why:?} was not asked again");
     }
 }
@@ -119,21 +119,21 @@ fn a_held_absent_is_asked_again_and_re_put_only_after_several() {
     for _ in 0..200 {
         for op in p.take_ops() {
             match op {
-                Op::ReadHead => p.answer(Answer::Head(None), now),
+                Op::ReadHead => p.answer(Answer::Head(None), Ms(now)),
                 Op::Put { id, .. } => {
                     puts += 1;
                     blocks.insert(id);
-                    p.answer(Answer::PutOk(id), now);
+                    p.answer(Answer::PutOk(id), Ms(now));
                 }
                 Op::AskHeld { id } => {
                     asks += 1;
-                    p.answer(Answer::Held { id, present: false }, now);
+                    p.answer(Answer::Held { id, present: false }, Ms(now));
                 }
                 _ => {}
             }
         }
         now += 50;
-        p.tick(now);
+        p.tick(Ms(now));
         if asks >= 3 * HELD_ABSENTS as usize {
             break;
         }
@@ -144,4 +144,30 @@ fn a_held_absent_is_asked_again_and_re_put_only_after_several() {
     // per absent.
     let allowed = blocks.len() + asks / HELD_ABSENTS as usize;
     assert!(puts <= allowed, "{puts} PUTs for {} blocks and {asks} Held asks (at most {allowed})", blocks.len());
+}
+
+/// The page's clock is MILLISECONDS; the engine's is SECONDS. The engine
+/// tells a write `Stalled` after `max_accept_age` (64) SECONDS unconfirmed —
+/// so a page ticking 20 times a second over one ordinary second of unanswered
+/// puts must not be told Stalled (#215 passed the milliseconds through, and
+/// every write that waited 64 ms was reported stalled).
+#[test]
+fn the_engine_hears_the_page_clock_in_seconds() {
+    let mut p = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000_000;
+    p.tick(Ms(now));
+    for op in p.take_ops() {
+        if op == Op::ReadHead {
+            p.answer(Answer::Head(None), Ms(now));
+        }
+    }
+    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    assert!(p.take_ops().iter().any(|o| matches!(o, Op::Put { .. })), "the write put nothing");
+    for _ in 0..20 {
+        now += 50;
+        p.tick(Ms(now));
+        let _ = p.take_ops();
+    }
+    let stalled = p.take_notices().iter().filter(|(_, _, s)| *s == State::Stalled).count();
+    assert_eq!(stalled, 0, "a write was told Stalled after one second: the engine read milliseconds as seconds");
 }
