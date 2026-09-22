@@ -21,6 +21,7 @@ const BUDGET_MS = Number(process.env.BUDGET_MS ?? 600_000);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const kids = [];
 let failed = 0;
+let ran = null; // what actually ran: { hex, manifest, rev }
 const check = (ok, what, ev) => { if (!ok) failed += 1; console.log(`${ok ? "PASS" : "FAIL"}  ${what}${ev === undefined ? "" : `  — ${JSON.stringify(ev)}`}`); };
 const finish = async code => {
   for (const k of kids.reverse()) { try { process.kill(k.pid, "SIGTERM"); } catch (_) {} }
@@ -85,6 +86,17 @@ try {
     const ready = await a.until(`return !!window.__notes;`, 120_000);
     check(!!ready, `${path}: the page opened a node-backed db`, await a.evaluate(`return document.getElementById("status")?.textContent;`));
     if (!ready) continue;
+    // WHAT ACTUALLY RAN (craftworks CLAUDE.md, 2026-09-23): the sha256 of the
+    // SDK wasm bytes this page loaded, checked against the manifest the build
+    // wrote. A hash cannot go stale the way a baked rev can; the rev is shown
+    // beside it as a convenience.
+    ran = await a.evaluate(`
+      const bytes = await (await fetch("/pkg/web/craftworks_sdk_bg.wasm", { cache: "no-store" })).arrayBuffer();
+      const hex = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
+      const manifest = (await (await fetch("/pkg/web/artefacts.json", { cache: "no-store" })).json()).sdk?.sha256;
+      const rev = (await (await import("/pkg/web/index.js")).load()).buildInfo().rev;
+      return { hex, manifest, rev };`);
+    check(ran?.hex && ran.hex === ran.manifest, `${path}: the SDK the page ran is the one the build's manifest names — sdk ${ran?.hex?.slice(0, 12)}, rev ${ran?.rev}`, ran?.hex === ran?.manifest ? undefined : ran);
     const t0 = Date.now();
     await a.evaluate(`for (let i = 0; i < 50; i += 1) await window.__notes.db.put("notes", { text: "note " + i }); return 1;`);
     const saved = await a.until(`return window.__notes.saving() === 0 && window.__notes.notes.getSnapshot().length === 50;`, 300_000, 1000);
@@ -143,5 +155,6 @@ try {
   failed += 1;
   console.log(`FAIL  the run stopped: ${e.message}`);
 }
-console.log(failed ? `\n${failed} check(s) FAILED` : "\nall checks passed");
+const label = ran?.hex ? ` — sdk ${ran.hex.slice(0, 12)}, rev ${ran.rev}` : " — what ran is unknown";
+console.log(failed ? `\n${failed} check(s) FAILED${label}` : `\nall checks passed${label}`);
 await finish(failed ? 1 : 0);

@@ -29,6 +29,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CRAFTWORKS_CONTRACTS");
     println!("cargo:rerun-if-changed=src/build_rev.txt");
     println!("cargo:rerun-if-changed=Cargo.lock");
+    // The rev is read from git, so git's record of HEAD is an input too.
+    // Without it a new COMMIT re-ran nothing, and the wasm went on naming the
+    // commit it was first built at — measured: three builds at three HEADs
+    // all reported the first one, with no `-dirty` to say so.
+    watch_head();
     println!("cargo:rustc-env=SDK_BUILD_REV={}", rev());
     println!("cargo:rustc-env=SDK_PROLLY_REV={}", prolly_rev());
     // The contract hashes this build provisions with, COPIED from the
@@ -77,6 +82,35 @@ fn contract_hashes() -> (String, String, String) {
 /// so re-running until they appear there is what was asked for.
 fn watch(path: &Path) {
     println!("cargo:rerun-if-changed={}", path.display());
+}
+
+/// Watch where git keeps HEAD, so a commit re-runs this script.
+///
+/// Three places, because a commit can land in any of them: this worktree's
+/// `HEAD` (a checkout of another branch or a detached commit), the common
+/// `refs/heads` DIRECTORY (a commit rewrites the branch's loose ref, or
+/// creates it when the branch was packed — cargo scans a directory for any
+/// change), and `packed-refs`. Only paths that EXIST are declared: cargo
+/// re-runs every build for a declared path that does not exist, which would
+/// trade a stale rev for a script that never stops running.
+///
+/// What this does NOT cover: an UNSTAGED edit changes none of these, so
+/// `-dirty` reflects the tree as it was when the script last ran. A rev is a
+/// convenience label; the artefact's identity is the sha256 of its bytes,
+/// which `artefacts.json` carries and which cannot go stale.
+fn watch_head() {
+    let Some(head) = git(&["rev-parse", "--path-format=absolute", "--git-path", "HEAD"]) else {
+        return; // not a checkout (an archive): `build_rev.txt` names the commit
+    };
+    let mut paths = vec![std::path::PathBuf::from(head)];
+    if let Some(common) = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
+        let common = std::path::PathBuf::from(common);
+        paths.push(common.join("refs/heads"));
+        paths.push(common.join("packed-refs"));
+    }
+    for p in paths.iter().filter(|p| p.exists()) {
+        watch(p);
+    }
 }
 
 /// The commit this build came from, or `unknown` when nothing can say.
