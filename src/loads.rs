@@ -321,10 +321,19 @@ impl Loads {
     /// End every load that has outlived the budget. The reads parked on them
     /// get a fact instead of a wait.
     pub fn time_out(&mut self, now_ms: u64) -> Vec<u64> {
+        self.time_out_except(now_ms, |_| false)
+    }
+
+    /// [`Loads::time_out`], except the loads `kept` names. These are the
+    /// page's own cold reads: they end by their BLOCKS' deadlines ("not
+    /// answering", [`Loads::on_not_answering`]), never by the whole load's
+    /// age. A cold load of many blocks can outlive 30 s while each block is
+    /// still inside its own deadline, and it is still loading.
+    pub fn time_out_except(&mut self, now_ms: u64, kept: impl Fn(u64) -> bool) -> Vec<u64> {
         let over: Vec<u64> = self
             .open
             .iter()
-            .filter(|(_, l)| now_ms.saturating_sub(l.at_ms) > self.budget_ms)
+            .filter(|(id, l)| !kept(**id) && now_ms.saturating_sub(l.at_ms) > self.budget_ms)
             .map(|(id, _)| *id)
             .collect();
         for id in &over {

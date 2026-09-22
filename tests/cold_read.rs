@@ -77,6 +77,9 @@ enum Node {
     TwoSpeed { fast: usize },
     /// Never.
     Silent,
+    /// Every GET after `FAST_MS`, but `refused` is REFUSED after `FAST_MS`,
+    /// every time — a block the node will not serve (not the root).
+    Refuses { refused: Cid },
 }
 
 struct Run {
@@ -93,6 +96,7 @@ fn run(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, loads: &[(u64, &str)], node: Nod
     let mut c = ColdReads::switched_on();
     c.set_root(root);
     let mut due: Vec<(u64, Cid)> = Vec::new();
+    let mut refusals: Vec<(u64, Cid)> = Vec::new();
     let mut node_free = 0u64;
     let mut asked = Vec::new();
     let mut finished = BTreeMap::new();
@@ -126,6 +130,8 @@ fn run(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, loads: &[(u64, &str)], node: Nod
                     due.push((now + wait, g.block));
                 }
                 Node::Silent => {}
+                Node::Refuses { refused } if g.block == refused => refusals.push((now + FAST_MS, g.block)),
+                Node::Refuses { .. } => due.push((now + FAST_MS, g.block)),
             }
         }
         most_window = most_window.max(c.window());
@@ -134,6 +140,11 @@ fn run(root: Cid, net: &BTreeMap<Cid, Vec<u8>>, loads: &[(u64, &str)], node: Nod
         due = later;
         for (_, b) in ready {
             c.arrived(b, &net[&b], now);
+        }
+        let (ready, later): (Vec<_>, Vec<_>) = refusals.into_iter().partition(|(t, _)| *t <= now);
+        refusals = later;
+        for (_, b) in ready {
+            c.refused(b, now);
         }
         let (before, timeouts) = (c.window(), c.log.iter().filter(|e| matches!(e, ColdEvent::TimedOut { .. })).count());
         c.tick(now);
@@ -284,9 +295,15 @@ fn a_block_whose_bytes_do_not_hash_to_it_is_dropped_and_asked_again() {
     assert_eq!(first.len(), 1, "the root first");
     c.arrived(root, b"\x00not the root", 100);
     assert!(c.log.contains(&ColdEvent::Rejected { block: root }));
+    // Asked again on its OWN clock, at its RTO — not at the speed of the bad answer.
+    assert!(c.take_gets().is_empty(), "a rejected block was asked again at once, re-arming its clock");
+    let rto = COLD_RTO_INITIAL_MS as u64;
+    c.tick(rto - 1);
+    assert!(c.take_gets().is_empty(), "asked again before its RTO");
+    c.tick(rto);
     let again = c.take_gets();
     assert_eq!((again[0].block, again[0].attempt), (root, 2), "a rejected block was not asked again");
-    c.arrived(root, &net[&root], 200);
+    c.arrived(root, &net[&root], rto + 100);
     assert!(!c.take_gets().is_empty(), "the verified root did not lead on to its children");
 }
 
@@ -309,4 +326,22 @@ fn off_or_rootless_it_takes_nothing() {
     assert!(!c.take(1, b"a/", b"a0", 0), "the flag is off");
     c.on = true;
     assert!(!c.take(1, b"a/", b"a0", 0), "no root known");
+}
+
+/// A block the node REFUSES every time, fast, is not re-asked at the speed of
+/// the refusal: it waits its RTO like any unanswered fetch, and its own
+/// deadline still runs out. Re-asking it at once would re-arm its clock on
+/// every refusal, so it would never time out, never reach its deadline, and
+/// the page would send GETs as fast as the node refuses them.
+#[test]
+fn a_block_the_node_refuses_every_time_waits_its_rto_and_runs_out_its_deadline() {
+    let (root, net) = tree();
+    let inner = *blocks_of(root, &net, "a").iter().find(|b| **b != root).expect("an inner block");
+    let r = run(root, &net, &[(1, "a")], Node::Refuses { refused: inner }, 4 * COLD_FETCH_DEADLINE_MS);
+    let asks = r.asked.iter().filter(|b| **b == inner).count();
+    let not_answering = r.cold.log.iter().any(|e| matches!(e, ColdEvent::NotAnswering { block, .. } if *block == inner));
+    assert!(not_answering, "the refused block never ran out its deadline ({asks} GETs of it)");
+    // Backed-off RTOs from the floor: ≈ 100·(1+2+4+…) ms, capped at ×64 —
+    // a dozen or so asks in 30 s, not one per refusal (30 s / 20 ms = 1500).
+    assert!(asks <= 30, "the refused block was asked {asks} times in {} ms", COLD_FETCH_DEADLINE_MS);
 }

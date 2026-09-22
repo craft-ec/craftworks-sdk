@@ -73,12 +73,11 @@
 use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 
+pub mod block;
 pub mod provision;
 pub mod reassemble;
 /// The delegate's identity, so a caller can hold one without depending on
 /// freenet itself. Opaque everywhere outside this crate.
-pub mod block;
-
 pub use freenet_stdlib::prelude::DelegateKey;
 pub use provision::{Did, Provisioned, Step};
 pub use reassemble::Reassembler;
@@ -131,6 +130,7 @@ pub enum Incoming {
     ///
     /// **A HINT, never an authority.** See the module docs: a root from the
     /// node means "look", not "this is where the tree is".
+    HeadChanged { key: String },
     /// A contract GET answered (ENGINE-SHAPE §2: the page reads blocks and the
     /// head itself). `id` is the contract's INSTANCE id, 32 bytes, as the node
     /// names it: the page matches it against the head it subscribed to. For a
@@ -138,9 +138,10 @@ pub enum Incoming {
     /// from the state (`block::block_of_state`) and a state nobody asked for
     /// verifies as nothing.
     ///
-    /// QUESTION (step 2, measured): a GET of a contract the node cannot find —
-    /// an error response (`Refused`) or a `GetResponse` with an empty state?
-    /// The page's "silent vs refused" cells need to know which.
+    /// ASSUMPTION (the cold read's tests decide it): a node that cannot find a
+    /// contract answers with `ContractError::Get` ([`Incoming::GetFailed`]),
+    /// not with an empty state. An empty `GetResponse` stays unusable, and to
+    /// a cold read it is a GET that did not answer.
     Got { id: [u8; 32], state: Vec<u8> },
     /// A contract GET the node REFUSED, naming the contract (its
     /// `ContractError::Get { key, .. }`), so the page can tell which of its
@@ -148,7 +149,6 @@ pub enum Incoming {
     /// is refused on a node with a peer (F55) — that is how a cold read learns
     /// a root is local. A refusal that names nothing stays [`Incoming::Refused`].
     GetFailed { id: [u8; 32] },
-    HeadChanged { key: String },
     /// The node accepted a request, and WHICH.
     ///
     /// **An ack is not durability.** A write becomes published by being READ

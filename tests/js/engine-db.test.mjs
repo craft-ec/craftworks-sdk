@@ -52,7 +52,7 @@ const t = async (name, fn) => {
  * reports nothing. A wrapper that re-asks without waiting sees the second
  * NOT_LOADED and fails — which is the behaviour the old test could not see.
  */
-const lateSession = ({ afterMs = 20, rows = [{ id: "a" }], fail = false } = {}) => {
+const lateSession = ({ afterMs = 20, rows = [{ id: "a" }], fail = false, failCode = "UNAVAILABLE" } = {}) => {
   let loaded = false;
   let asks = 0;
   let requests = 0;
@@ -73,7 +73,7 @@ const lateSession = ({ afterMs = 20, rows = [{ id: "a" }], fail = false } = {}) 
         requests += 1;
         setTimeout(() => {
           loaded = !fail;
-          ended.push({ id: ticket, ok: !fail, code: fail ? "UNAVAILABLE" : "LOADED" });
+          ended.push({ id: ticket, ok: !fail, code: fail ? failCode : "LOADED" });
           s.pump();               // the page, woken by a message arriving
         }, afterMs);
       }
@@ -137,6 +137,19 @@ await t("a load that ENDS without delivering rejects — it is not 'not yet'", a
   await assert.rejects(() => db.scan("tasks"), e => {
     assert.ok(e instanceof DbError);
     assert.equal(e.code, "UNAVAILABLE");
+    return true;
+  });
+});
+
+await t("a cold read the NODE stopped answering says so — not that the data could not be loaded", async () => {
+  const s = lateSession({ afterMs: 10, fail: true, failCode: "NOT_ANSWERING" });
+  const db = engineDb(s);
+  s.pump = db.drain;
+  await assert.rejects(() => db.scan("tasks"), e => {
+    assert.ok(e instanceof DbError);
+    assert.equal(e.code, "NOT_ANSWERING");
+    assert.equal(e.message, "the node is not answering");
+    assert.equal(e.transient, true, "a node not answering is not a permanent failure");
     return true;
   });
 });

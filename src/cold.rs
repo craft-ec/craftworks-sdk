@@ -266,8 +266,12 @@ impl ColdReads {
         };
         let verified = state.split_first().is_some_and(|(&k, body)| freenet_prolly::block_id(k, body) == block);
         if !verified {
+            // Dropped, and asked again when its OWN clock says — not now. A
+            // node that answers wrong bytes fast would otherwise be asked again
+            // at the speed of its answers, each re-send re-arming the clock,
+            // so the block would never time out and never reach its deadline.
             self.log.push(ColdEvent::Rejected { block });
-            self.send(block, f.attempt + 1, f.first_at, now_ms);
+            self.fetching.insert(block, f);
             return;
         }
         let after_ms = now_ms.saturating_sub(f.first_at);
@@ -293,8 +297,9 @@ impl ColdReads {
 
     /// The node REFUSED a GET for `block`. For the ROOT — a block this node's
     /// own delegate wrote is refused to a page on a node with a peer (F55) —
-    /// the root is LOCAL and its loads go back to the engine. Any other block:
-    /// treated as a timeout, asked again.
+    /// the root is LOCAL and its loads go back to the engine. Any other block
+    /// stays in flight on its own clock: [`ColdReads::tick`] asks it again at
+    /// its RTO, as a timeout, and its deadline still runs.
     ///
     /// ASSUMPTION (the live run tells): a refusal for the root means "local",
     /// not "missing everywhere" — a root that exists nowhere is not one a head
@@ -314,7 +319,9 @@ impl ColdReads {
             self.fill(now_ms);
             return;
         }
-        self.send(block, f.attempt + 1, f.first_at, now_ms);
+        // Not re-sent NOW: that would re-arm its clock on every refusal, and a
+        // node that refuses fast would be asked as fast, for ever.
+        self.fetching.insert(block, f);
     }
 
     /// The page's clock, PER FETCH: each GET past its own timeout is asked
@@ -477,6 +484,11 @@ impl ColdReads {
     /// to one of these.
     pub fn fetching(&self) -> impl Iterator<Item = &Cid> {
         self.fetching.keys()
+    }
+
+    /// Is load `id` this reader's (taken, not yet finished, returned or ended)?
+    pub fn holds(&self, id: u64) -> bool {
+        self.loads.contains_key(&id)
     }
 
     /// Loads under way.

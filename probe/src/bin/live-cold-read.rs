@@ -86,8 +86,13 @@ async fn page_read(url: &str, root: [u8; 32], block_code: &[u8], lo: &[u8], hi: 
     while start.elapsed() < window {
         for g in cold.take_gets() {
             let key = ContractInstanceId::new(derive(&g.block));
-            timeout(STEP, c.send(ClientRequest::ContractOp(ContractRequest::Get { key, return_contract_code: false, subscribe: false, blocking_subscribe: false })))
-                .await.map_err(|_| anyhow::anyhow!("the node stopped accepting"))??;
+            // A send that does not complete is not the end of the read: that GET simply goes unanswered, and the cold
+            // reader's own clock times it out and re-fetches it — as in the page.
+            match timeout(STEP, c.send(ClientRequest::ContractOp(ContractRequest::Get { key, return_contract_code: false, subscribe: false, blocking_subscribe: false }))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => println!("    page path: a GET send failed: {}", e.to_string().chars().take(120).collect::<String>()),
+                Err(_) => println!("    page path: a GET send did not complete within {STEP:?} (block {})", hex(&g.block[..4])),
+            }
         }
         let block_of = |cold: &craftworks_sdk::cold::ColdReads, id: &ContractInstanceId| -> Option<[u8; 32]> {
             cold.fetching().find(|b| derive(b)[..] == id.as_bytes()[..32]).copied()
@@ -276,6 +281,9 @@ async fn main() -> Result<()> {
     let id2 = hear(&mut t2, started, Duration::from_secs(4)).await;
     let head = id1.iter().chain(id2.iter()).filter(|(_, l)| l.starts_with("identity")).map(|(_, l)| l.clone()).next_back();
     println!("B: {:?}   <- PRECONDITION: a head seq > 0 means B found the tree A wrote; 0 means every read below is of an EMPTY tree", head);
+    // THE PAGE PATH'S ROOT, read NOW, while B's delegate is fresh: TESTs 2 and 3 can park it in F52's stall, and a
+    // page learns its root from the head, not from a stalled delegate (the first x20: runs 1 and 4 died asking it).
+    let root_early = if page_path() { Some(head_root(&mut t1, &dkey_b).await?) } else { None };
 
     // ---- TEST 2 first (it needs the coldest tree): which connection hears a node-driven reply? ----
     println!("\nTEST 2  tab 1 asks Range a/ (60 rows, cold) as req 1; tab 2 asks NOTHING. Who hears the Page?");
@@ -323,7 +331,7 @@ async fn main() -> Result<()> {
     }
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     if page_path() {
-        let root_b = head_root(&mut t1, &dkey_b).await?;
+        let root_b = root_early.expect("read at setup in page-path mode");
         println!("    PAGE PATH: w/ read by the page's own GETs (per fetch: RFC 6298 RTO from {} ms, a congestion window from {}, {} ms a block), root {}", craftworks_sdk::cold::COLD_RTO_INITIAL_MS, craftworks_sdk::cold::COLD_WINDOW_INITIAL, craftworks_sdk::cold::COLD_FETCH_DEADLINE_MS, hex(&root_b[..4]));
         let (rows, ms, log) = page_read(&node_b.ws(), root_b, &block, b"w/", b"w0", read_window).await?;
         let (mut first, mut timeouts, mut reget_ok, mut gave_up) = (0, 0, 0, 0);

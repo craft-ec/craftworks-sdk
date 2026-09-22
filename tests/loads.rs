@@ -132,6 +132,23 @@ fn a_load_nobody_answers_ends_within_the_bound() {
     assert_eq!(l.in_flight(), 0);
 }
 
+/// A load the page's own COLD READ holds is not ended by its age: it ends by
+/// its blocks' deadlines, as NOT_ANSWERING. A load beside it that the cold
+/// reader does not hold still times out — the control that `kept` is what
+/// spared the first one.
+#[test]
+fn a_load_the_cold_read_holds_outlives_the_budget_the_others_do_not() {
+    let mut l = Loads::new();
+    l.budget_ms = 1_000;
+    let (cold, _) = l.want(b"a/", b"a0", 0).expect("a fresh span is wanted");
+    let (plain, _) = l.want(b"b/", b"b0", 0).expect("a fresh span is wanted");
+    assert_eq!(l.time_out_except(5_000, |id| id == cold), vec![plain]);
+    assert_eq!(l.take_ended(), vec![(plain, Ended::Unavailable)]);
+    assert_eq!(l.in_flight(), 1, "the cold load was ended by its age");
+    l.on_not_answering(cold);
+    assert_eq!(l.take_ended(), vec![(cold, Ended::NotAnswering)]);
+}
+
 /// THE CONTROL for the bound: a load that IS answered never times out.
 #[test]
 fn control_an_answered_load_never_times_out() {

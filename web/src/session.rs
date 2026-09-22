@@ -131,6 +131,10 @@ pub struct Session {
     /// once (`wire::block::contract_deriver`). `None` until the page hands the
     /// code in with [`Session::set_cold_reads`]: without it no GET can be named.
     cold_contract: Option<Box<dyn Fn(&craftworks_sdk::Cid) -> craftworks_sdk::Cid>>,
+    /// The builder called [`Session::set_cold_reads`]. Until then cold reads
+    /// are ON by default, switched on by [`Session::provision`] with the
+    /// Block code it hands in; after it, the builder's choice stands.
+    cold_chosen: bool,
 }
 
 #[wasm_bindgen]
@@ -178,6 +182,7 @@ impl Session {
             watch_refused: String::new(),
             cold: craftworks_sdk::cold::ColdReads::default(),
             cold_contract: None,
+            cold_chosen: false,
         })
     }
 
@@ -334,18 +339,27 @@ impl Session {
                     self.foreign_notifications += 1;
                 }
             }
-            // This session never GETs: the answer is to a question it did not
-            // ask (the engine-in-the-page shape's, ENGINE-SHAPE §2).
+            // The page's own cold GETs (`pump_cold`): matched to the block
+            // being fetched whose contract the node named.
             Incoming::Got { id, state } => match self.cold_block(id) {
                 Some(block) => {
-                    self.cold.arrived(block, &state, crate::js_now_ms());
+                    let now = crate::js_now_ms();
+                    self.cold.arrived(block, &state, now);
+                    // The cold clock also runs on every answer, not only on the
+                    // page's 1 s tick: an RTO is ≈ 100 ms – 2 s, and a read's
+                    // answers arrive far more often than once a second. With
+                    // NO answers arriving, a late fetch is seen at the next
+                    // 1 s tick (the one gap left; the owner's to rule on).
+                    self.cold.tick(now);
                     self.pump_cold();
                 }
                 None => self.unusable.push("a GET answer this session never asked for".to_string()),
             },
             Incoming::GetFailed { id } => match self.cold_block(id) {
                 Some(block) => {
-                    self.cold.refused(block, crate::js_now_ms());
+                    let now = crate::js_now_ms();
+                    self.cold.refused(block, now);
+                    self.cold.tick(now);
                     self.pump_cold();
                 }
                 None => self.unusable.push("a GET refusal for a contract this session never asked for".to_string()),
@@ -869,6 +883,25 @@ impl Session {
         wire::frame_engine_request(&key, payload, stream)
     }
 
+    /// Cold reads on or off with the Block code — the one place both the
+    /// default (at provision) and the builder's choice go through.
+    fn switch_cold(&mut self, on: bool, block_code: Vec<u8>) {
+        if on && !self.cold.on {
+            // A fresh reader: the RTO and the window start where RFC 6298 and
+            // slow start say, at the head this session already knows.
+            self.cold = craftworks_sdk::cold::ColdReads::switched_on();
+            if self.head_root != [0u8; 32] {
+                self.cold.set_root(self.head_root);
+            }
+        }
+        self.cold.on = on;
+        self.cold_contract = if on && !block_code.is_empty() {
+            Some(Box::new(wire::block::contract_deriver(&block_code)))
+        } else {
+            None
+        };
+    }
+
     /// COLD READS: what the cold reader decided, carried out.
     ///
     /// * loads it handed back (the root is this node's own, F55; or the tree
@@ -936,20 +969,8 @@ impl Session {
     /// re-fetch — instead of by the engine, whose cold read can stall ≈ 60 s
     /// (F52). A root the node says is its own goes back to the engine (F55).
     pub fn set_cold_reads(&mut self, on: bool, block_code: Vec<u8>) {
-        if on && !self.cold.on {
-            // A fresh reader: the RTO and the window start where RFC 6298 and
-            // slow start say, at the head this session already knows.
-            self.cold = craftworks_sdk::cold::ColdReads::switched_on();
-            if self.head_root != [0u8; 32] {
-                self.cold.set_root(self.head_root);
-            }
-        }
-        self.cold.on = on;
-        self.cold_contract = if on && !block_code.is_empty() {
-            Some(Box::new(wire::block::contract_deriver(&block_code)))
-        } else {
-            None
-        };
+        self.cold_chosen = true;
+        self.switch_cold(on, block_code);
     }
 
     /// Every cold GET's timeout, re-fetch and answer since this was last
@@ -970,6 +991,12 @@ impl Session {
     /// already-provisioned node never calls this and never sends a byte of
     /// contract code.
     pub fn provision(&mut self, delegate: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
+        // Cold reads are ON by default (the owner: default on once the live
+        // ×20 is green), and the Block code is what names a GET. A builder
+        // who chose already keeps that choice.
+        if !self.cold_chosen {
+            self.switch_cold(true, block.clone());
+        }
         self.artefacts = Some(Artefacts {
             delegate,
             block,
@@ -1367,7 +1394,10 @@ impl Session {
         let stalled = self.plan.tick(now);
         // A load nobody answered ends as UNAVAILABLE rather than waiting for
         // ever. The read parked on it gets a fact; a page can show it.
-        self.loads.time_out(now);
+        // A load the page's own cold read holds ends by its blocks' deadlines
+        // (the cold reader's), not by the load's age.
+        let cold = &self.cold;
+        self.loads.time_out_except(now, |id| cold.holds(id));
         self.cold.tick(now);
         self.pump_cold();
         serde_json::json!({
