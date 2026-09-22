@@ -395,3 +395,53 @@ impl Default for Db {
         Self::new()
     }
 }
+
+/// `webapp`'s params for a web container's state: its blake3 (builder#104).
+/// With the `webapp` code (`pkg/web/webapp.wasm`) and the state, it is all
+/// `Session.put_contract` needs to publish a container — and the key that
+/// returns is the address the node serves it under.
+#[wasm_bindgen]
+pub fn webapp_params(state: &[u8]) -> Vec<u8> {
+    wire::webapp::params(state).to_vec()
+}
+
+/// The address the node serves a web container under
+/// (`/v1/contract/web/<address>/`): the `webapp` contract's key for this
+/// state, derived by freenet-stdlib itself. The same key a PUT of
+/// `(code, webapp_params(state), state)` is answered with.
+#[wasm_bindgen]
+pub fn webapp_address(code: &[u8], state: &[u8]) -> String {
+    wire::webapp::address(code, state)
+}
+
+/// An APP web container (builder#104), built in the page: the files as a
+/// deterministic tar (sorted, whatever order they are added in), in xz of
+/// stored LZMA2 chunks (no compression: the page has no xz encoder, and the
+/// real `xz` reads it — `wire/tests/webapp_xz.rs`), in the node's framing.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct AppContainer(Vec<(String, Vec<u8>)>);
+
+#[wasm_bindgen]
+impl AppContainer {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> AppContainer {
+        AppContainer::default()
+    }
+
+    /// A file, at a plain relative path. A path added twice is refused: two
+    /// entries for one path would unpack as whichever the tar reader kept.
+    pub fn add(&mut self, path: String, bytes: Vec<u8>) -> Result<(), JsError> {
+        if self.0.iter().any(|(p, _)| *p == path) {
+            return Err(JsError::new(&format!("{path} was added twice")));
+        }
+        self.0.push((path, bytes));
+        Ok(())
+    }
+
+    /// The container's bytes: the state to PUT under `webapp`.
+    pub fn finish(&self) -> Result<Vec<u8>, JsError> {
+        let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        wire::webapp::app_container(&files).map_err(|e| JsError::new(&e))
+    }
+}

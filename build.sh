@@ -105,6 +105,12 @@ for f in craftworks_sdk_bg.wasm engine_delegate.wasm block.wasm register.wasm; d
     { echo "the artefacts container's $f is not the shipped $f" >&2; exit 1; }
 done
 rm -rf "$unpacked"
+# THE `webapp` CODE, shipped beside the container it validates: a builder
+# PUTs a container as (this code, blake3(state), state), and with no copy of
+# the code it could publish neither the artefacts container nor an app's
+# (builder#104). Not IN the container, and not an artefact an app names: an
+# app never runs it, the node does.
+cp "$contracts/build/webapp.wasm" pkg/web/
 
 # The delegate's hash cannot be inside the SDK's own wasm — a build cannot
 # contain its own digest — and the CONTRACT hashes are in `buildInfo()`,
@@ -135,6 +141,8 @@ cat > pkg/web/artefacts.json <<JSON
   "sdk":      { "file": "craftworks_sdk_bg.wasm", "sha256": "$sdk_hash",
                 "bytes": $(size_of pkg/web/craftworks_sdk_bg.wasm) },
   "container": $container_json,
+  "webapp":   { "file": "webapp.wasm",          "sha256": "$(hash_of pkg/web/webapp.wasm)",
+                "bytes": $(size_of pkg/web/webapp.wasm) },
   "note": "hashes key the shared artefact cache and are verified before use (sdk#5)"
 }
 JSON
