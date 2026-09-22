@@ -77,3 +77,28 @@ fn the_page_reports_head_moves_and_own_write_states() {
     let own = body_of(&src, "take_state_changed");
     assert!(own.contains(".take_state_changed()") && own.contains("domain_of_key"), "own write states are not reported by domain:\n{own}");
 }
+
+/// sdk#266: the Session ROUTES adoption and the re-ask. The decisions are
+/// tested natively (`craftworks-sdk/tests/stale_on_adopt.rs` for the copy and
+/// the delta, `testkit/tests/read_when_needed.rs` for a whole tab reading at
+/// a head it adopted); what only this file can see is whether the Session
+/// still calls them.
+#[test]
+fn an_adopted_head_makes_the_ranges_stale_and_a_read_re_asks() {
+    let src = session_src();
+    let pump = body_of(&src, "pump_page");
+    assert!(
+        pump.contains("take_adopted()") && pump.contains("mark_stale()"),
+        "a head this page ADOPTED does not make its loaded ranges stale, so a read answers at a head the page has left:\n{pump}"
+    );
+    let delta = body_of(&src, "on_delta");
+    assert!(
+        delta.contains("parking::delta_for_read"),
+        "a delta answering a READ's own ticket is not routed to it, so the read waits out its budget:\n{delta}"
+    );
+    let full = body_of(&src, "on_full_reload");
+    assert!(
+        full.contains("parking::full_reload_for_read"),
+        "a re-ask the engine could not diff does not fall back to a full load under the read's ticket:\n{full}"
+    );
+}

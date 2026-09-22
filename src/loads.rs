@@ -299,6 +299,18 @@ impl Loads {
         }
     }
 
+    /// A DELTA answered this read (sdk#266): the range was held already and
+    /// only behind, so what came back is what changed, not the rows. The
+    /// ticket completes exactly as a page completes — the read parked on it
+    /// wakes and reads the copy, now current. Returns the range, `None` when
+    /// no such load is open (a duplicate, or one that timed out).
+    pub fn on_refreshed(&mut self, id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        let load = self.open.remove(&id)?;
+        self.ended.push((id, Ended::Loaded));
+        self.done.insert((load.lo.clone(), load.hi.clone()));
+        Some((load.lo, load.hi))
+    }
+
     /// The engine said it could not answer this read.
     ///
     /// The range is NOT recorded as loaded. An empty page here would say

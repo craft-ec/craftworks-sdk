@@ -583,6 +583,18 @@ impl Session {
         cursor: Option<Vec<u8>>,
         new_root: [u8; 32],
     ) {
+        // A READ'S OWN re-ask of a stale range (sdk#266): the ticket is a
+        // load's, and this delta is its answer.
+        if self.loads.range_of(req_id).is_some() {
+            if let Some((root, lo, hi)) = craftworks_sdk::parking::delta_for_read(&mut self.loads, self.db.store_mut(), req_id, changes, cursor, new_root) {
+                // A whole domain is current again at this root: the next
+                // question about it can be a delta FROM here (sdk#142).
+                if let Some(d) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key_of_range(&lo, &hi) {
+                    self.refresh.on_loaded(&d, root);
+                }
+            }
+            return;
+        }
         match self.refresh.on_delta(req_id, changes, cursor, new_root) {
             craftworks_sdk::Answer::Delta {
                 changes, new_root, ..
@@ -596,6 +608,11 @@ impl Session {
 
     /// The engine could not compute a delta: load the range again.
     fn on_full_reload(&mut self, req_id: u64) {
+        // A stale range's re-ask the engine could not diff: load it in full,
+        // under the same ticket the read is parked on (sdk#266).
+        if craftworks_sdk::parking::full_reload_for_read(&mut self.loads, self.db.store_mut(), req_id) {
+            return;
+        }
         let craftworks_sdk::Answer::Reload { domain } = self.refresh.on_full_reload(req_id) else {
             self.foreign_notifications += 1;
             return;
@@ -769,6 +786,14 @@ impl Session {
         if published != self.seen_published {
             self.seen_published = published;
             self.head_moved = true;
+        }
+        // A head this page ADOPTED — somebody else's commit, never its own:
+        // every loaded range is behind it, and the next read of one re-asks
+        // with a delta (sdk#266). Its OWN commits mark nothing: the copy
+        // already holds those values, and marking would double the read
+        // traffic of ordinary writing.
+        if p.server.take_adopted() {
+            self.db.store_mut().mark_stale();
         }
         let frames = p.take_frames();
         let replies = p.take_replies();

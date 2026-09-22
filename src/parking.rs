@@ -86,6 +86,47 @@ pub fn decide<T>(
 /// load (`crate::cold`): a range they take is read by the page's own GETs and
 /// never reaches the engine; one they leave goes to the engine exactly as
 /// `decide` sends it.
+/// A `Delta` or a `FullReloadRequired` whose `req_id` is a READ'S OWN ticket
+/// (sdk#266): the read parked on a stale range, and this is its answer.
+///
+/// Returns false when the id belongs to no open load — then it is a
+/// binding's refresh, and the caller's `Refresh` owns it.
+///
+/// * a delta that fits: applied, the range is current again, the ticket
+///   completes and the read wakes;
+/// * a PAGED delta (too much changed to patch) or a `FullReloadRequired`:
+///   the range is loaded in full under the SAME ticket, so the read waits
+///   for one answer rather than being told to start again.
+pub fn delta_for_read(
+    loads: &mut Loads,
+    store: &mut CachedStore,
+    req_id: u64,
+    changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    cursor: Option<Vec<u8>>,
+    new_root: [u8; 32],
+) -> Option<([u8; 32], Vec<u8>, Vec<u8>)> {
+    let (lo, hi) = loads.range_of(req_id).map(|(l, h)| (l.to_vec(), h.to_vec()))?;
+    if cursor.is_some() {
+        store.client.send(&Loads::range_request(req_id, &lo, &hi, None));
+        return None;
+    }
+    store.on_delta(changes, new_root);
+    store.copy.refreshed(&lo, &hi);
+    loads.on_refreshed(req_id);
+    Some((new_root, lo, hi))
+}
+
+/// The engine could not diff a stale range's re-ask: load it in full under
+/// the read's own ticket (sdk#266). False when the id is not a read's.
+pub fn full_reload_for_read(loads: &mut Loads, store: &mut CachedStore, req_id: u64) -> bool {
+    let Some((lo, hi)) = loads.range_of(req_id).map(|(l, h)| (l.to_vec(), h.to_vec())) else {
+        return false;
+    };
+    store.copy.forget(&lo, &hi);
+    store.client.send(&Loads::range_request(req_id, &lo, &hi, None));
+    true
+}
+
 pub fn decide_with<T>(
     loads: &mut Loads,
     store: &mut CachedStore,
@@ -113,6 +154,23 @@ pub fn decide_with<T>(
         return Outcome::Told(e);
     };
     let taken = send && cold.is_some_and(|c| c.take(req_id, &lo, &hi, now_ms));
+    // ALREADY HELD, ONLY BEHIND (sdk#266). The copy has these rows and knows
+    // the root it read them at, so the question is "what changed since", not
+    // "send me the range": a delta of what moved, under this read's own
+    // ticket, which the answer completes. A range nobody has ever loaded
+    // takes the full load below, as before.
+    if send && !taken && store.copy.is_stale(&lo, &hi) {
+        if let Some(from) = store.copy.root() {
+            store.client.send(&protocol::Request::ChangesSince {
+                req_id,
+                from,
+                lo: protocol::Bound::Included(lo.clone()),
+                hi: protocol::Bound::Excluded(hi.clone()),
+                max_entries: protocol::MAX_PAGE_ENTRIES,
+            });
+            return Outcome::Wait(e, req_id);
+        }
+    }
     if send && !taken {
         // A FULL PAGE, by the shared constant. `0` reads like "no limit" and
         // is not one: the shell clamps it to ONE entry, so a range of N rows
