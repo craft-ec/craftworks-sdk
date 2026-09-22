@@ -226,6 +226,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-webapp-contract"
+version = "0.1.0"
+source = "git+https://github.com/craft-ec/freenet-contracts?rev=9ff9d22#9ff9d22e7fc770036b228203ef5e2b778e6865dc"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
 name = "craftworks-sdk"
 version = "0.1.0"
 dependencies = [
@@ -1992,6 +2000,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "craftec-webapp-contract",
  "engine-delegate",
  "freenet-prolly",
  "freenet-stdlib",
