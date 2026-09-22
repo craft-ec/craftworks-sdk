@@ -92,6 +92,9 @@ pub struct PageIo {
     /// A reader's stream-id range (`reader`), in the top byte; 0 for the
     /// person's own page, which keeps the whole space below it.
     stream_base: u32,
+    /// `begin` asked the signer which Register it signs for, and it holds
+    /// none: the caller mints a key and calls `provision_with`.
+    needs_key: bool,
 }
 
 /// The counter part of a reader's stream id; the top byte is its range.
@@ -99,6 +102,9 @@ const STREAM_COUNTER: u32 = 0x00FF_FFFF;
 
 /// The id the record query goes out under.
 const RECORD_QUERY_ID: u32 = (1 << 31) - 2;
+
+/// The id the "which Register do you sign for?" query goes out under (`begin`).
+const REGISTER_QUERY_ID: u32 = (1 << 31) - 3;
 
 /// A root no node holds: the record query names it so that nothing can be
 /// signed (see `ask_record`).
@@ -141,6 +147,7 @@ impl PageIo {
             read_only: false,
             now: Ms(0),
             stream_base: 0,
+            needs_key: false,
         }
     }
 
@@ -178,6 +185,61 @@ impl PageIo {
         io.signer_has_record = Some(true);
         io.server.set_facts(SignerFacts { head_writable: false, head_id: register_id });
         io
+    }
+
+    /// OPEN THE PERSON'S OWN TREE (a switch-over blocker): register the signer
+    /// and ASK it which Register it signs for, before anything is minted. A
+    /// page that minted a key on every load would be a new identity after
+    /// every reload and in every second tab. The answer either names the
+    /// Register — this page opens it, and nothing is provisioned — or says the
+    /// signer holds no key: [`PageIo::needs_key`], and the caller mints one
+    /// and calls [`PageIo::provision_with`]. The key never leaves the signer.
+    pub fn begin(&mut self, signer: DelegateContainer) {
+        let stream = self.next_stream();
+        match wire::frame_register_delegate(signer, stream) {
+            Ok(f) => self.out.extend(f),
+            Err(e) => self.unusable.push(format!("could not frame the signer's registration: {e}")),
+        }
+        let stream = self.next_stream();
+        match wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream) {
+            Ok(f) => self.out.extend(f),
+            Err(e) => self.unusable.push(format!("could not frame the register query: {e}")),
+        }
+    }
+
+    /// The signer holds no key (`begin`'s answer): mint one and `provision_with` it.
+    pub fn needs_key(&self) -> bool {
+        self.needs_key
+    }
+
+    /// Provision a signer that holds no key, for the Register `register_params`
+    /// names (the minted key's). Only after `begin` said it needs one.
+    pub fn provision_with(&mut self, signing_key: Vec<u8>, register_params: Vec<u8>) {
+        if !std::mem::take(&mut self.needs_key) {
+            self.unusable.push("provision_with: the signer was not asked, or already holds a key".into());
+            return;
+        }
+        self.set_register(register_params.clone());
+        let stream = self.next_stream();
+        match wire::signer::frame_provision(
+            &self.art.signer, PROVISION_ID, signing_key,
+            self.art.register_code.clone(), register_params, self.art.block_code.clone(), stream,
+        ) {
+            Ok(f) => self.out.extend(f),
+            Err(e) => self.unusable.push(format!("could not frame the signer's provisioning: {e}")),
+        }
+    }
+
+    /// Name the Register this page's head lives in.
+    fn set_register(&mut self, params: Vec<u8>) {
+        let register = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(self.art.register_code.clone())),
+            Parameters::from(params.clone()),
+        )));
+        self.register_id.copy_from_slice(&register.key().id().as_bytes()[..32]);
+        self.register_key = register.key().to_string();
+        self.register = register;
+        self.art.register_params = params;
     }
 
     /// A reader of a named head (`reader`): nothing can be written.
@@ -328,6 +390,19 @@ impl PageIo {
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
                     match wire::signer::read_answer(&m) {
+                        // `begin`'s question: which Register? Named: open it,
+                        // provisioned already. None: the caller mints a key.
+                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => match params {
+                            Some(params) => {
+                                self.set_register(params);
+                                // Whether it has SIGNED anything is the record
+                                // query's to say (`ask_record`): provisioned is
+                                // not "has a head".
+                                self.provisioned = true;
+                                self.signer_provisioned();
+                            }
+                            None => self.needs_key = true,
+                        },
                         Some((_, signer_proto::Answer::Provisioned)) => {
                             self.provisioned = true;
                             self.signer_provisioned();

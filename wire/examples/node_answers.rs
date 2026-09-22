@@ -53,16 +53,45 @@ fn main() {
             Ok(ClientRequest::ContractOp(ContractRequest::Update { key, .. })) => {
                 format!(r#"{{"op":"update","key":"{}"}}"#, key.id().encode())
             }
+            // A SIGNER request inside a delegate message: named, with its id.
+            Ok(ClientRequest::DelegateOp(freenet_stdlib::client_api::DelegateRequest::ApplicationMessages { inbound, .. })) => {
+                let reqs: Vec<String> = inbound
+                    .iter()
+                    .filter_map(|m| match m {
+                        freenet_stdlib::prelude::InboundDelegateMsg::ApplicationMessage(am) => signer_proto::decode_request(&am.payload)
+                            .map(|(id, r)| format!(r#"{{"req":"{}","id":{id}}}"#, format!("{r:?}").split([' ', '{', '(']).next().unwrap_or("?"))),
+                        _ => None,
+                    })
+                    .collect();
+                format!(r#"{{"op":"delegate","signer":[{}]}}"#, reqs.join(","))
+            }
             Ok(ClientRequest::DelegateOp(_)) => r#"{"op":"delegate"}"#.to_string(),
             Ok(other) => format!(r#"{{"op":"{}"}}"#, format!("{other:?}").split(['(', ' ', '{']).next().unwrap_or("?")),
             Err(_) => r#"{"op":"undecodable"}"#.to_string(),
         })
         .collect();
+    // SIGNER_ANSWER=register:<id>:<params hex | none> — the signer's answer to
+    // "which Register?", as the node delivers it (a delegate response).
+    let signer_answer = std::env::var("SIGNER_ANSWER").ok().map(|spec| {
+        let mut it = spec.splitn(3, ':');
+        let (_, id, params) = (it.next(), it.next().expect("id").parse::<u32>().expect("id"), it.next().expect("params"));
+        let params = (params != "none").then(|| unhex(params));
+        let payload = signer_proto::encode_answer(id, &signer_proto::Answer::Register { params });
+        let (_, dkey) = wire::delegate_from_code(b"any: the page does not check which delegate answered");
+        hex(&bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse {
+            key: dkey,
+            values: vec![freenet_stdlib::prelude::OutboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(payload),
+            )],
+        }))
+        .expect("encodes"))
+    });
     println!(
-        r#"{{"key":"{key}","ack":"{}","refusal":"{}","got":"{}","frames":[{}]}}"#,
+        r#"{{"key":"{key}","ack":"{}","refusal":"{}","got":"{}","signer_answer":"{}","frames":[{}]}}"#,
         hex(&ack),
         hex(&refusal),
         hex(&got),
+        signer_answer.unwrap_or_default(),
         frames.join(",")
     );
 }

@@ -198,6 +198,10 @@ pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
             block_code,
         ),
         Request::Sign { prev, next } => sign(host, prev, next),
+        // The Register it signs for, only if it holds a key for it: params left behind without a key name nothing.
+        Request::Register => Answer::Register {
+            params: host.get_secret(KEY).and(host.get_secret(REGISTER_PARAMS)),
+        },
     };
     Served {
         id,
