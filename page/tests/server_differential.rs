@@ -186,12 +186,6 @@ impl PageRig {
         self.run(node)
     }
 
-    fn tick(&mut self, node: &mut Node, now: u64) -> Vec<Reply> {
-        self.now = now;
-        self.server.tick(Ms(now));
-        self.run(node)
-    }
-
     /// Answer every op until none is left; when only silence is left, let the
     /// clock pass a deadline (bounded), as a real page's tick would.
     fn run(&mut self, node: &mut Node) -> Vec<Reply> {
@@ -301,7 +295,7 @@ fn states(rs: &[Reply], id: u64) -> Vec<WriteState> {
     rs.iter()
         .filter_map(|r| match r {
             Reply::WriteState { write_id, state } | Reply::SessionWriteState { write_id, state, .. } if *write_id == id => {
-                Some(state.clone())
+                Some(*state)
             }
             _ => None,
         })
@@ -316,7 +310,7 @@ fn the_same_requests_get_the_same_replies() {
     let mut conn = fnode.connect();
     let mut node = Node::new();
     let mut rig = PageRig::new();
-    let script = vec![
+    let script = [
         Request::Identity,
         Request::SubscribeRange { sub_id: 3, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded },
         write(1, &[("a", Some("1")), ("b", Some("2"))]),
@@ -535,16 +529,15 @@ fn a_fork_is_loud_on_the_page_and_unseen_by_the_shell() {
     // or the fork would be invisible to the signer's read.
     let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
     let winner = (1u8..=255)
-        .find_map(|b| {
-            let other = engine_delegate::register::head_state(&node.register_params, &key, seq, &[b; 32]).expect("signs");
+        .find(|b| {
+            let other = engine_delegate::register::head_state(&node.register_params, &key, seq, &[*b; 32]).expect("signs");
             let before = node.register.clone();
             node.update(&other);
-            if node.head().map(|h| h.1) != Some(mine) {
-                Some(b)
-            } else {
+            let won = node.head().map(|h| h.1) != Some(mine);
+            if !won {
                 node.register = before;
-                None
             }
+            won
         })
         .expect("some root wins the register");
     assert_ne!([winner; 32], mine);
