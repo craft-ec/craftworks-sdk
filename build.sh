@@ -54,6 +54,12 @@ fi
 ./engine-delegate/build.sh >/dev/null
 delegate=target/wasm32-unknown-unknown/release/engine_delegate.stripped.wasm
 cp "$delegate" pkg/web/engine_delegate.wasm
+# THE SIGNER, beside the engine delegate: page mode (ruling B) provisions it
+# instead, and a published app opened on another node fetches it from the
+# artefacts container like the other four (builder#104). Built and
+# import-gated by its own script.
+./signer/build.sh >/dev/null
+cp target/wasm32-unknown-unknown/release/signer.stripped.wasm pkg/web/signer.wasm
 cp "$contracts/build/block.wasm" "$contracts/build/register.wasm" pkg/web/
 
 # THE ARTEFACTS CONTAINER (craftworks-builder#104): the four artefacts in ONE
@@ -100,7 +106,7 @@ assert len(s) == 16 + m + w, "the container's framing does not add up"
 open(sys.argv[2], 'wb').write(s[16 + m:])
 PY
 (cd "$unpacked" && xz -dc web.xz | tar -xf -)
-for f in craftworks_sdk_bg.wasm engine_delegate.wasm block.wasm register.wasm; do
+for f in craftworks_sdk_bg.wasm engine_delegate.wasm signer.wasm block.wasm register.wasm; do
   cmp -s "$unpacked/$f" "pkg/web/$f" ||
     { echo "the artefacts container's $f is not the shipped $f" >&2; exit 1; }
 done
@@ -134,6 +140,8 @@ cat > pkg/web/artefacts.json <<JSON
 {
   "delegate": { "file": "engine_delegate.wasm", "sha256": "$delegate_hash",
                 "bytes": $(size_of pkg/web/engine_delegate.wasm) },
+  "signer":   { "file": "signer.wasm",          "sha256": "$(hash_of pkg/web/signer.wasm)",
+                "bytes": $(size_of pkg/web/signer.wasm) },
   "block":    { "file": "block.wasm",           "sha256": "$block_hash",
                 "bytes": $(size_of pkg/web/block.wasm) },
   "register": { "file": "register.wasm",        "sha256": "$register_hash",

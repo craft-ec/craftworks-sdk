@@ -223,7 +223,7 @@ await t("the manifest's hashes ARE the shipped files", async () => {
     await readFile(new URL("artefacts.json", dir), "utf8"),
   );
   let checked = 0;
-  for (const name of ["delegate", "block", "register", "sdk"]) {
+  for (const name of ["delegate", "signer", "block", "register", "sdk"]) {
     const entry = manifest[name];
     assert.ok(entry, `artefacts.json has no ${name}`);
     const bytes = new Uint8Array(await readFile(new URL(entry.file, dir)));
@@ -234,7 +234,7 @@ await t("the manifest's hashes ARE the shipped files", async () => {
     assert.equal(bytes.length, entry.bytes, `${entry.file} is not ${entry.bytes} B`);
     checked += 1;
   }
-  assert.equal(checked, 4, "every artefact must be checked, not some of them");
+  assert.equal(checked, 5, "every artefact must be checked, not some of them");
   // The artefacts CONTAINER (builder#104): the shipped file is what the
   // manifest says, and it names the address a builder PUTs it under.
   const c = manifest.container;
