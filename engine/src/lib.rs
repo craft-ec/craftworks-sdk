@@ -1095,6 +1095,12 @@ pub struct Engine<B: Blocks> {
     epochs: Vec<Epoch>,
     head_epoch: Option<Epoch>,
     recovered: bool,
+    /// Reads that arrived before the head was recovered, in arrival order
+    /// (sdk#223). The tree before recovery is the EMPTY tree, and answering
+    /// from it said "complete, and there is nothing here" about data the head
+    /// had not been read to find. They wait here, and are answered — in order —
+    /// the moment `HeadRead` or `HeadMissing` recovers the root.
+    before_head: Vec<(ClientId, read::ReqId, read::Want)>,
     /// Notifications raised while applying a write — a group superseded part
     /// way through — collected here so `on_write` can return them with the
     /// rest rather than dropping them.
@@ -1224,6 +1230,7 @@ impl<B: Blocks> Engine<B> {
             epochs: Vec::new(),
             head_epoch: None,
             recovered: false,
+            before_head: Vec::new(),
             pending_notifications: Vec::new(),
             unpublished: Vec::new(),
             coded_since_commit: BTreeSet::new(),
@@ -1439,12 +1446,12 @@ impl<B: Blocks> Engine<B> {
                 client,
                 req_id,
                 key,
-            } => self.on_read(client, req_id, read::Want::Get(key)),
+            } => self.read_or_wait(client, req_id, read::Want::Get(key)),
             Event::Scan {
                 client,
                 req_id,
                 range,
-            } => self.on_read(
+            } => self.read_or_wait(
                 client,
                 req_id,
                 read::Want::Scan(Box::new(range.as_ref().into())),
@@ -1455,7 +1462,7 @@ impl<B: Blocks> Engine<B> {
                 from,
                 range,
                 max_entries,
-            } => self.on_read(
+            } => self.read_or_wait(
                 client,
                 req_id,
                 read::Want::Delta(Box::new(read::DeltaSpec {
@@ -1554,8 +1561,9 @@ impl<B: Blocks> Engine<B> {
                 self.on_head_conflict(seq, root)
             };
         }
-        let changed = self.adopt(seq, root);
+        let mut changed = self.adopt(seq, root);
         self.recovered = true;
+        changed.extend(self.release_before_head());
         // The tree is not walked here. Reads warm it lazily (slice 2), which
         // is also what makes a restart cheap: the engine is usable the moment
         // it knows its root.
@@ -1580,8 +1588,11 @@ impl<B: Blocks> Engine<B> {
         }
         // A device with no head starts from the empty tree. Its root is a
         // constant, not something to fetch.
-        let changed = self.adopt(0, self.empty.cid);
+        let mut changed = self.adopt(0, self.empty.cid);
         self.recovered = true;
+        // A device that has never written: its tree IS empty, so the reads
+        // that waited are answered from it — empty and complete, now truly.
+        changed.extend(self.release_before_head());
         changed
     }
 
@@ -1804,6 +1815,34 @@ impl<B: Blocks> Engine<B> {
     /// Rule 1: a warm hit replies in the same `step`, with no other effect. A
     /// read that is already answerable must not cost a round trip, because
     /// most reads in a live app are answerable.
+    /// A read before the head is recovered WAITS (sdk#223): the only tree an
+    /// unrecovered engine has is the empty one, and an answer from it is a
+    /// false "complete, nothing here". Bounded like parked reads: past
+    /// `max_parked_reads` a read is answered as one that could not be served
+    /// (`gave_up`), never as empty.
+    fn read_or_wait(&mut self, client: ClientId, req_id: read::ReqId, want: read::Want) -> Vec<Effect> {
+        if self.recovered {
+            return self.on_read(client, req_id, want);
+        }
+        if self.before_head.len() >= self.params.max_parked_reads {
+            let result = self.gave_up(&want, self.published_root);
+            return vec![Effect::Reply { client, req_id, result }];
+        }
+        self.before_head.push((client, req_id, want));
+        Vec::new()
+    }
+
+    /// The head is recovered: answer every read that waited for it, in the
+    /// order they arrived.
+    fn release_before_head(&mut self) -> Vec<Effect> {
+        let waiting = std::mem::take(&mut self.before_head);
+        let mut out = Vec::new();
+        for (client, req_id, want) in waiting {
+            out.extend(self.on_read(client, req_id, want));
+        }
+        out
+    }
+
     fn on_read(&mut self, client: ClientId, req_id: read::ReqId, want: read::Want) -> Vec<Effect> {
         let root = self.published_root;
         self.reads.parked.insert(
@@ -3876,6 +3915,9 @@ impl<B: Blocks> Engine<B> {
     pub fn adopt_root_for_test(&mut self, root: Cid) {
         self.root = root;
         self.published_root = root;
+        // A reader that HAS its head is recovered: its reads are answered, not
+        // held for a head read that already happened (sdk#223).
+        self.recovered = true;
     }
 
     /// The block source this engine reads through.
