@@ -75,6 +75,7 @@ use freenet_stdlib::prelude::*;
 
 pub mod block;
 pub mod provision;
+pub mod signer;
 pub mod reassemble;
 /// The delegate's identity, so a caller can hold one without depending on
 /// freenet itself. Opaque everywhere outside this crate.

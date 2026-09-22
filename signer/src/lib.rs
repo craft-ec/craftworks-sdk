@@ -32,39 +32,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A head: `(seq, root)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Head {
-    pub seq: u64,
-    pub root: [u8; 32],
-}
-
-/// The head that follows `prev`: `seq` MUST be `prev.seq + 1`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Next {
-    pub seq: u64,
-    pub root: [u8; 32],
-    /// WRITE-PATH's ledger. Opaque here: its encoding lands with WRITE-PATH step 2 (Q1 on sdk#209), and until then
-    /// the rule "a ledger never lowers a session's published_through" cannot be checked and is NOT (stated, not
-    /// hidden). It is signed as part of the value: `root` alone when empty -- exactly what every existing head reader
-    /// (`register::head_of`) accepts -- else `root ‖ ledger`.
-    pub ledger: Vec<u8>,
-}
-
-impl Next {
-    pub fn head(&self) -> Head {
-        Head {
-            seq: self.seq,
-            root: self.root,
-        }
-    }
-    /// The Register value this head is signed as.
-    pub fn value(&self) -> Vec<u8> {
-        let mut v = self.root.to_vec();
-        v.extend_from_slice(&self.ledger);
-        v
-    }
-}
+// The wire types live in `signer-proto`, so the page can speak them without linking this delegate.
+pub use signer_proto::{
+    decode_answer, decode_request, encode_answer, encode_request, Answer, Head, Next, Request, Why,
+    MAGIC, MAX_PUT_BLOCKS,
+};
 
 /// THE ONE RECORD the signer keeps: the last thing it signed, from which prev, and the exact bytes returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,55 +44,6 @@ pub struct Record {
     pub prev: Head,
     pub next: Next,
     pub signed: Vec<u8>,
-}
-
-/// Why a request is refused outright, rather than answered with a fact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Why {
-    /// `next.seq != prev.seq + 1`.
-    NotSuccessor,
-    /// No key (or no Register / Block naming) has been provisioned. Named, never a silence.
-    NotProvisioned,
-    /// The signer knows no head at all -- no record, and the Register is not readable locally -- and `prev` is not
-    /// the genesis (seq 0). It cannot tell whether `prev` is current, so it does not sign.
-    HeadUnknown,
-    /// The ROOT BLOCK of `next.root` is not readable by the sync read, or what is read does not HASH to `next.root`
-    /// (`block_id(kind, body) == root`, as the tree names a block): a head pointing at a tree the node does not hold
-    /// would publish a hole.
-    RootNotHeld,
-    /// The record and the Register, at the SAME seq, name DIFFERENT roots: another holder of this key signed a
-    /// competing head. The signer signs NOTHING on either -- signing on from its own would silently displace the
-    /// other write (the Register keeps the higher seq, F56); signing on from theirs is resolving a fork. The
-    /// attested checkpoint decides; the page reports it.
-    Forked { mine: Head, read: Head },
-    /// A DIFFERENT Register (params or code) was provisioned for the same key. The one record belongs to the Register
-    /// it was signed for, and is never carried to another.
-    RegisterChanged,
-    /// The record could not be written: NO signature is returned without its record.
-    RecordNotSaved,
-    /// A DIFFERENT key is already provisioned: a key is never replaced silently.
-    KeyAlreadyProvisioned,
-    /// The stored key cannot sign for the provisioned Register (not its writer, not mode 0, bad length).
-    CannotSign,
-    /// The request could not be decoded, or names a version this build does not speak.
-    Unreadable,
-}
-
-/// The answer the page receives.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Answer {
-    /// `next` follows the CURRENT head; the record is saved; these are the Register state bytes to UPDATE.
-    Signed(Vec<u8>),
-    /// `prev` is not the current head: rebase onto `current`.
-    NotNext {
-        current: Head,
-    },
-    /// `prev` has ALREADY been signed from: the FIRST record's bytes, whatever `next` asked this time. An identical
-    /// re-ask is idempotent (the page re-UPDATEs the same bytes); a different next is told what won.
-    AlreadySigned(Vec<u8>),
-    /// A key and the naming are stored.
-    Provisioned,
-    Refused(Why),
 }
 
 /// Everything the rule consults, and nothing else.
@@ -194,59 +117,6 @@ pub fn decide(f: &Facts, prev: &Head, next: &Next) -> Decision {
     Decision::Sign
 }
 
-/// The request as the page frames it: a VERSION byte, then bincode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Request {
-    Sign {
-        prev: Head,
-        next: Next,
-    },
-    Provision {
-        signing_key: Vec<u8>,
-        register_code: Vec<u8>,
-        register_params: Vec<u8>,
-        block_code: Vec<u8>,
-    },
-}
-
-/// The only version this build speaks.
-pub const VERSION: u8 = 1;
-
-pub fn encode_request(r: &Request) -> Vec<u8> {
-    let mut out = vec![VERSION];
-    out.extend(bincode::serialize(r).expect("a request encodes"));
-    out
-}
-
-pub fn encode_answer(a: &Answer) -> Vec<u8> {
-    let mut out = vec![VERSION];
-    out.extend(bincode::serialize(a).expect("an answer encodes"));
-    out
-}
-
-pub fn decode_answer(bytes: &[u8]) -> Option<Answer> {
-    match bytes.split_first() {
-        Some((&VERSION, rest)) => bincode::deserialize(rest).ok(),
-        _ => None,
-    }
-}
-
-fn decode_request(bytes: &[u8]) -> Option<Request> {
-    match bytes.split_first() {
-        Some((&VERSION, rest)) => {
-            // Bounded: a request is a head and a ledger, or a provision of two contracts' code.
-            use bincode::Options;
-            bincode::DefaultOptions::new()
-                .with_fixint_encoding()
-                .allow_trailing_bytes()
-                .with_limit(4 * 1024 * 1024)
-                .deserialize(rest)
-                .ok()
-        }
-        _ => None,
-    }
-}
-
 /// Secret-store names.
 pub const KEY: &[u8] = b"signer_key";
 pub const RECORD: &[u8] = b"signer_record";
@@ -273,45 +143,137 @@ pub fn register_id(code: &[u8], params: &[u8]) -> [u8; 32] {
     out
 }
 
-/// One request, served: gather the facts, decide, and -- on `Sign` -- sign, save the record, reply.
+/// One request, served, and what the entry must PUT for it (only `PutBlocks` puts anything).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Served {
+    pub answer: Answer,
+    /// `(block id, state)` to PUT under the Block contract, in order; the entry builds each contract from the code in
+    /// its secret store and answers every `PutContractResponse` with `Answer::Put`.
+    pub puts: Vec<([u8; 32], Vec<u8>)>,
+}
+
+/// One request, answered: `serve_full` without the puts. What every non-`PutBlocks` request needs.
 pub fn serve<H: Host>(host: &mut H, request: &[u8]) -> Answer {
+    serve_full(host, request).answer
+}
+
+/// One request, served: gather the facts, decide, and -- on `Sign` -- sign, save the record, reply; on `PutBlocks`
+/// name each block's contract and hand the entry the PUTs.
+pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
     let Some(req) = decode_request(request) else {
-        return Answer::Refused(Why::Unreadable);
+        return Served {
+            answer: Answer::Refused(Why::Unreadable),
+            puts: Vec::new(),
+        };
     };
-    match req {
+    let answer = match req {
+        Request::PutBlocks { states } => return put_blocks(host, states),
+        Request::Held { contracts } => held(host, &contracts),
         Request::Provision {
             signing_key,
             register_code,
             register_params,
             block_code,
-        } => {
-            if let Some(held) = host.get_secret(KEY) {
-                if held != signing_key {
-                    return Answer::Refused(Why::KeyAlreadyProvisioned);
-                }
-                // The same key re-provisioned: only for the SAME Register. The record belongs to the Register it was
-                // signed for; another Register's requests must never be answered from it.
-                let same = host
-                    .get_secret(REGISTER_PARAMS)
-                    .is_none_or(|p| p == register_params)
-                    && host
-                        .get_secret(REGISTER_CODE)
-                        .is_none_or(|c| c == register_code);
-                if !same {
-                    return Answer::Refused(Why::RegisterChanged);
-                }
-            }
-            let ok = host.set_secret(KEY, &signing_key)
-                && host.set_secret(REGISTER_CODE, &register_code)
-                && host.set_secret(REGISTER_PARAMS, &register_params)
-                && host.set_secret(BLOCK_CODE, &block_code);
-            if ok {
-                Answer::Provisioned
-            } else {
-                Answer::Refused(Why::NotProvisioned)
-            }
-        }
+        } => provision(
+            host,
+            signing_key,
+            register_code,
+            register_params,
+            block_code,
+        ),
         Request::Sign { prev, next } => sign(host, prev, next),
+    };
+    Served {
+        answer,
+        puts: Vec::new(),
+    }
+}
+
+/// Store the key and what naming the Register and a block needs: refused for another key, or another Register.
+fn provision<H: Host>(
+    host: &mut H,
+    signing_key: Vec<u8>,
+    register_code: Vec<u8>,
+    register_params: Vec<u8>,
+    block_code: Vec<u8>,
+) -> Answer {
+    if let Some(held) = host.get_secret(KEY) {
+        if held != signing_key {
+            return Answer::Refused(Why::KeyAlreadyProvisioned);
+        }
+        // The same key re-provisioned: only for the SAME Register. The record belongs to the Register it was
+        // signed for; another Register's requests must never be answered from it.
+        let same = host
+            .get_secret(REGISTER_PARAMS)
+            .is_none_or(|p| p == register_params)
+            && host
+                .get_secret(REGISTER_CODE)
+                .is_none_or(|c| c == register_code);
+        if !same {
+            return Answer::Refused(Why::RegisterChanged);
+        }
+    }
+    let ok = host.set_secret(KEY, &signing_key)
+        && host.set_secret(REGISTER_CODE, &register_code)
+        && host.set_secret(REGISTER_PARAMS, &register_params)
+        && host.set_secret(BLOCK_CODE, &block_code);
+    if ok {
+        Answer::Provisioned
+    } else {
+        Answer::Refused(Why::NotProvisioned)
+    }
+}
+
+/// READ-LOCAL: whether this node holds each contract's state, by the host's synchronous local read -- never a
+/// network fetch, so it cannot park. Needs no provisioning: it reads, and says nothing but present / absent.
+fn held<H: Host>(host: &H, contracts: &[[u8; 32]]) -> Answer {
+    if contracts.is_empty() || contracts.len() > MAX_PUT_BLOCKS {
+        return Answer::Refused(Why::BlockCount {
+            max: MAX_PUT_BLOCKS as u32,
+            got: contracts.len() as u32,
+        });
+    }
+    Answer::Held {
+        present: contracts
+            .iter()
+            .map(|c| host.contract_state(c).is_some())
+            .collect(),
+    }
+}
+
+/// PUT-WITH-CODE: the page's block STATES, each named by its own hash, PUT under the Block contract from inside the
+/// node. Nothing is remembered: the answer names the contracts in order, and each node answer is relayed as it comes.
+/// Refused whole if any state is not a block, or the count is outside one return's worth.
+///
+/// Stated limit (F35, measured): in LOCAL mode the node DROPS a delegate-originated PUT, so this verb is for a network
+/// node -- the page on its OWN node PUTs directly (the code is a local copy there).
+fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> Served {
+    let refuse = |w: Why| Served {
+        answer: Answer::Refused(w),
+        puts: Vec::new(),
+    };
+    let Some(code) = host.get_secret(BLOCK_CODE) else {
+        return refuse(Why::NotProvisioned);
+    };
+    if states.is_empty() || states.len() > MAX_PUT_BLOCKS {
+        return refuse(Why::BlockCount {
+            max: MAX_PUT_BLOCKS as u32,
+            got: states.len() as u32,
+        });
+    }
+    let mut puts = Vec::with_capacity(states.len());
+    let mut contracts = Vec::with_capacity(states.len());
+    for (i, st) in states.into_iter().enumerate() {
+        let Some((&kind, body)) = st.split_first() else {
+            return refuse(Why::NotABlock { index: i as u32 });
+        };
+        let id = freenet_prolly::block_id(kind, body);
+        contracts.push(engine_delegate::blocks::contract_for(&code, &id));
+        puts.push((id, st));
+    }
+    Served {
+        answer: Answer::Putting { contracts },
+        puts,
     }
 }
 

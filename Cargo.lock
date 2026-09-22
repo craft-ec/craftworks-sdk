@@ -1392,7 +1392,16 @@ dependencies = [
  "freenet-prolly",
  "freenet-stdlib",
  "serde",
+ "signer-proto",
  "wire",
+]
+
+[[package]]
+name = "signer-proto"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
 ]
 
 [[package]]
@@ -1917,6 +1926,7 @@ dependencies = [
  "engine-delegate",
  "freenet-prolly",
  "freenet-stdlib",
+ "signer-proto",
 ]
 
 [[package]]

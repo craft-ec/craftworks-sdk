@@ -9,7 +9,12 @@
 //!     `NotNext{current: seq 2}` = not visible (the signer only knows its own record);
 //!  5. IS THE RECORD DURABLE BEFORE THE REPLY? A `Signed` arrives, and the node is SIGKILLed at once and restarted on
 //!     the same data; the SAME prev with a DIFFERENT next is asked again. `AlreadySigned(first)` = durable;
-//!     `Signed` = the record was lost with the process (two signatures at one seq: the fork the signer exists to stop).
+//!     `Signed` = the record was lost with the process (two signatures at one seq: the fork the signer exists to stop);
+//!  6. PUT-WITH-CODE: the page hands the signer two block states (no code); the signer names each block's contract
+//!     (`Putting`) and PUTs it with the Block code it holds. Each named contract must match the one the page derives,
+//!     and READ-LOCAL (`Held`) must say both present and a never-put block absent. (a) on the isolated node a client
+//!     GET serves each; (b) on a PEERED node -- B joined to a private gateway A -- a client GET is refused (F55),
+//!     which is why the page confirms through `Held`. `Put` answers reaching the page are counted, not assumed.
 //!
 //! Exit status is the verdict. usage: SIGNER_PORT=<port> live-signer <signer.wasm> <block.wasm> <register.wasm>
 
@@ -99,6 +104,182 @@ fn container(code: &[u8], params: &[u8]) -> ContractContainer {
         std::sync::Arc::new(ContractCode::from(code.to_vec())),
         Parameters::from(params.to_vec()),
     )))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// A client GET's outcome, kept whole: a NotFound is a finding here (F55), not an error to bail on.
+#[derive(Debug)]
+#[allow(dead_code)] // the fields are read through `Debug`, in the red lines and the control's report
+enum Got {
+    Served(Vec<u8>),
+    /// `ContractResponse::NotFound`: an ANSWER, not a node error -- what F55 looks like to a client.
+    NotFound,
+    NodeError(String),
+    /// No answer to the GET within STEP; what else arrived meanwhile, by name.
+    Silent(Vec<String>),
+}
+
+async fn get(c: &mut WebApi, id: ContractInstanceId) -> Result<Got> {
+    timeout(
+        STEP,
+        c.send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: id,
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        })),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("send blocked"))??;
+    let mut seen = Vec::new();
+    let end = tokio::time::Instant::now() + STEP;
+    while tokio::time::Instant::now() < end {
+        match timeout(Duration::from_millis(500), c.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                state, ..
+            }))) => return Ok(Got::Served(state.as_ref().to_vec())),
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::NotFound { .. }))) => {
+                return Ok(Got::NotFound)
+            }
+            Ok(Ok(other)) => seen.push(other.to_string()),
+            Ok(Err(e)) => return Ok(Got::NodeError(e.to_string())),
+            Err(_) => {}
+        }
+    }
+    Ok(Got::Silent(seen))
+}
+
+/// Ask `Held` about `contracts` once; the `Put` answers that arrive first are counted, not mistaken for it.
+async fn held_once(
+    c: &mut WebApi,
+    key: &DelegateKey,
+    contracts: &[[u8; 32]],
+    puts: &mut usize,
+) -> Result<Vec<bool>> {
+    send_signer(
+        c,
+        key,
+        &Request::Held {
+            contracts: contracts.to_vec(),
+        },
+    )
+    .await?;
+    loop {
+        match answer(c).await? {
+            Answer::Held { present } => return Ok(present),
+            Answer::Put { .. } => *puts += 1,
+            other => bail!("Held answered {other:?}"),
+        }
+    }
+}
+
+/// Step 6: PutBlocks two blocks; the signer must name them as the page does; `Held` must say present for both and
+/// absent for a never-put block (polled until the PUTs land, bounded by STEP); then a client GET of each, which the
+/// isolated node serves and a PEERED node answers NotFound (F55) -- the expectation is `peered`'s, and a mismatch is red.
+async fn put_with_code(
+    c: &mut WebApi,
+    key: &DelegateKey,
+    bcode: &[u8],
+    label: &str,
+    first: u8,
+    peered: bool,
+    red: &mut Vec<String>,
+) -> Result<()> {
+    let fresh: Vec<([u8; 32], Vec<u8>)> = (first..first + 2).map(block).collect();
+    let (never, _) = block(first + 2);
+    let putting = ask(
+        c,
+        key,
+        &Request::PutBlocks {
+            states: fresh.iter().map(|(_, st)| st.clone()).collect(),
+        },
+    )
+    .await?;
+    let expect: Vec<[u8; 32]> = fresh
+        .iter()
+        .map(|(id, _)| engine_delegate::blocks::contract_for(bcode, id))
+        .collect();
+    match &putting {
+        Answer::Putting { contracts } if *contracts == expect => {
+            println!("{label}: the signer named both block contracts as the page derives them")
+        }
+        other => red.push(format!(
+            "{label}: expected Putting{{{expect:?}}}, told {other:?}"
+        )),
+    }
+    let mut ask_about = expect.clone();
+    ask_about.push(engine_delegate::blocks::contract_for(bcode, &never));
+    let mut puts = 0usize;
+    let t = tokio::time::Instant::now();
+    let mut present = held_once(c, key, &ask_about, &mut puts).await?;
+    while present != [true, true, false] && t.elapsed() < STEP {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        present = held_once(c, key, &ask_about, &mut puts).await?;
+    }
+    println!(
+        "{label}: READ-LOCAL Held [block {}, block {}, never-put {}] = {present:?} after {} ms",
+        first,
+        first + 1,
+        first + 2,
+        t.elapsed().as_millis()
+    );
+    if present != [true, true, false] {
+        red.push(format!(
+            "{label}: Held said {present:?}, not [true, true, false]"
+        ));
+    }
+    puts += drain(c, Duration::from_secs(3))
+        .await
+        .iter()
+        .filter(|a| matches!(a, Answer::Put { .. }))
+        .count();
+    println!("{label}: {puts} Put answer(s) reached the asking connection");
+    for (i, (id, st)) in fresh.iter().enumerate() {
+        let n = first as usize + i;
+        let got = get(c, container(bcode, id).key().id().to_owned()).await?;
+        let served = matches!(&got, Got::Served(b) if b == st);
+        match (&got, peered) {
+            (Got::Served(_), false) if served => println!("{label}: block {n}: a client GET serves it"),
+            (Got::NotFound, true) => {
+                println!("{label}: block {n}: a client GET is answered NotFound (F55)")
+            }
+            (g, true) if served => red.push(format!(
+                "{label}: block {n}: a client GET SERVED it on the peered node ({g:?}): F55 did not reproduce -- is B peered? the case this step exists for is not covered"
+            )),
+            (g, _) => red.push(format!("{label}: block {n}: a client GET gave {g:?}")),
+        }
+    }
+    match get(c, container(bcode, &never).key().id().to_owned()).await? {
+        Got::Served(b) => red.push(format!(
+            "{label}: CONTROL: a never-put block was served ({} B): the GET check cannot fail",
+            b.len()
+        )),
+        g => println!("{label}: CONTROL: a never-put block is not served ({g:?})"),
+    }
+    Ok(())
+}
+
+/// Every signer answer that arrives on `c` within `window`.
+async fn drain(c: &mut WebApi, window: Duration) -> Vec<Answer> {
+    let mut got = Vec::new();
+    let end = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() < end {
+        if let Ok(Ok(HostResponse::DelegateResponse { values, .. })) =
+            timeout(Duration::from_millis(250), c.recv()).await
+        {
+            for v in values {
+                if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                    if let Some(a) = signer::decode_answer(&m.payload) {
+                        got.push(a);
+                    }
+                }
+            }
+        }
+    }
+    got
 }
 
 async fn contract_op(c: &mut WebApi, r: ContractRequest<'static>) -> Result<String> {
@@ -426,8 +607,73 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // 6a. PUT-WITH-CODE on the ISOLATED node (no peer): a client GET serves the local copy.
+    put_with_code(&mut c3, &key, &bcode, "6a isolated", 9, false, &mut red).await?;
+
     drop(c3);
     drop(node);
+
+    // 6b. PUT-WITH-CODE on a PEERED node: B joined to a private gateway A, both on loopback, both made here. The case
+    // the design must survive: a client GET of a delegate-put block is NotFound on a node with a peer (F55), so the
+    // page confirms through READ-LOCAL (`Held`).
+    let pdir = dir.join("peered");
+    let mut secret = [0u8; 32];
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
+    }
+    let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(secret).to_bytes();
+    std::fs::create_dir_all(pdir.join("a"))?;
+    std::fs::write(pdir.join("a/transport.key"), hex(&secret))?;
+    let (aws, anet, bws, bnet) = (port + 20, port + 21, port + 30, port + 31);
+    let node_a = Node::spawn_private_network(
+        aws,
+        anet,
+        &pdir.join("a"),
+        &[
+            "--is-gateway".into(),
+            "--transport-keypair".into(),
+            pdir.join("a/transport.key").to_string_lossy().into_owned(),
+            "--public-network-address".into(),
+            "127.0.0.1".into(),
+            "--public-network-port".into(),
+            anet.to_string(),
+        ],
+    )?;
+    let node_b = Node::spawn_private_network(
+        bws,
+        bnet,
+        &pdir.join("b"),
+        &[
+            "--gateway".into(),
+            format!("127.0.0.1:{anet},{}", hex(&public)),
+        ],
+    )?;
+    println!(
+        "6b: A = private gateway ws {aws} net {anet}; B = joined to A only, ws {bws} net {bnet}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut cb = connect(&node_b.ws()).await?;
+    let keyb = register_delegate(&mut cb, &wasm).await?;
+    let pb = ask(
+        &mut cb,
+        &keyb,
+        &Request::Provision {
+            signing_key: sk.to_bytes().to_vec(),
+            register_code: rcode.clone(),
+            register_params: params.clone(),
+            block_code: bcode.clone(),
+        },
+    )
+    .await?;
+    if pb != Answer::Provisioned {
+        bail!("6b: B's signer not provisioned: {pb:?}");
+    }
+    put_with_code(&mut cb, &keyb, &bcode, "6b peered", 12, true, &mut red).await?;
+    drop(cb);
+    drop(node_b);
+    drop(node_a);
+
     if red.is_empty() {
         println!("VERDICT: GREEN");
         Ok(())

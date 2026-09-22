@@ -1,4 +1,5 @@
-//! The entry the node calls: `serve` over the real delegate context. Behind `freenet-main-delegate` (OFF natively).
+//! The entry the node calls: `serve_full` over the real delegate context. Behind `freenet-main-delegate` (OFF
+//! natively).
 
 use freenet_stdlib::prelude::*;
 
@@ -16,6 +17,12 @@ impl crate::Host for Ctx<'_> {
     }
 }
 
+fn reply(a: &crate::Answer) -> OutboundDelegateMsg {
+    OutboundDelegateMsg::ApplicationMessage(
+        ApplicationMessage::new(crate::encode_answer(a)).processed(true),
+    )
+}
+
 pub struct Signer;
 
 #[delegate]
@@ -26,14 +33,41 @@ impl DelegateInterface for Signer {
         _origin: Option<MessageOrigin>,
         inbound: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-        // Only a client's message is served. The signer issues no contract op, so no node answer can arrive; anything
-        // else is ignored rather than guessed at.
-        let InboundDelegateMsg::ApplicationMessage(m) = inbound else {
-            return Ok(Vec::new());
-        };
-        let answer = crate::serve(&mut Ctx(ctx), &m.payload);
-        Ok(vec![OutboundDelegateMsg::ApplicationMessage(
-            ApplicationMessage::new(crate::encode_answer(&answer)).processed(true),
-        )])
+        match inbound {
+            InboundDelegateMsg::ApplicationMessage(m) => {
+                let served = crate::serve_full(&mut Ctx(ctx), &m.payload);
+                let mut out = vec![reply(&served.answer)];
+                if !served.puts.is_empty() {
+                    // `serve_full` checked the code is provisioned before it named a single contract.
+                    let code = ctx.get_secret(crate::BLOCK_CODE).unwrap_or_default();
+                    let code = std::sync::Arc::new(ContractCode::from(code));
+                    for (id, state) in served.puts {
+                        let contract = ContractContainer::from(ContractWasmAPIVersion::V1(
+                            WrappedContract::new(code.clone(), Parameters::from(id.to_vec())),
+                        ));
+                        out.push(OutboundDelegateMsg::PutContractRequest(
+                            PutContractRequest::new(
+                                contract,
+                                WrappedState::new(state),
+                                RelatedContracts::default(),
+                            ),
+                        ));
+                    }
+                }
+                Ok(out)
+            }
+            // The node's answer to one of PUT-WITH-CODE's PUTs, relayed as it comes: nothing is remembered.
+            InboundDelegateMsg::PutContractResponse(r) => {
+                let mut contract = [0u8; 32];
+                contract.copy_from_slice(&r.contract_id.as_bytes()[..32]);
+                let (ok, note) = match &r.result {
+                    Ok(_) => (true, String::new()),
+                    Err(e) => (false, e.chars().take(200).collect()),
+                };
+                Ok(vec![reply(&crate::Answer::Put { contract, ok, note })])
+            }
+            // The signer issues no GET, UPDATE or SUBSCRIBE, so nothing else can answer it.
+            _ => Ok(Vec::new()),
+        }
     }
 }
