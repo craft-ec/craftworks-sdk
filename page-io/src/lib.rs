@@ -107,6 +107,20 @@ pub struct PageIo {
     /// Empty responses to the outstanding first request: each is "no
     /// answer", and the request goes again, at most [`FIRST_EMPTIES`] times.
     first_empties: u8,
+    /// EVERY NODE CALL ON THE RTO (the ruling since #227): the signer's
+    /// registration and its first request are asked again on a doubling
+    /// interval until answered, bounded by `VERIFY_BUDGET_MS` — the empty-reply
+    /// re-send above covers one failure; this covers a reply that never comes.
+    /// `first_started`/`first_next_at` are anchored by the page's clock.
+    first_started: Option<Ms>,
+    first_next_at: Ms,
+    first_gap_ms: u64,
+    /// The signer's container, to register it again on the RTO.
+    signer_container: Option<DelegateContainer>,
+    /// WHY OPENING ENDED, by name (what `open()` reports): the signer's or the
+    /// node's refusal of the first exchange, in its words; or its re-asks spent.
+    refused: Option<String>,
+    exhausted: bool,
 }
 
 /// The signer's first request, kept so it can be sent once the registration
@@ -177,6 +191,12 @@ impl PageIo {
             first: None,
             first_sent: false,
             first_empties: 0,
+            first_started: None,
+            first_next_at: Ms(0),
+            first_gap_ms: page::rto::RTO_INITIAL_MS as u64,
+            signer_container: None,
+            refused: None,
+            exhausted: false,
         }
     }
 
@@ -230,6 +250,7 @@ impl PageIo {
     /// Register the signer ALONE; its first request goes once the node has
     /// answered the registration (`inbound`, `Ack(Registered)`).
     fn register_signer(&mut self, signer: DelegateContainer, first: First) {
+        self.signer_container = Some(signer.clone());
         let stream = self.next_stream();
         match wire::frame_register_delegate(signer, stream) {
             Ok(f) => self.out.extend(f),
@@ -238,6 +259,9 @@ impl PageIo {
         self.first = Some(first);
         self.first_sent = false;
         self.first_empties = 0;
+        self.first_started = None;
+        self.first_next_at = Ms(0);
+        self.first_gap_ms = page::rto::RTO_INITIAL_MS as u64;
     }
 
     /// Send the signer's first request (again).
@@ -277,15 +301,16 @@ impl PageIo {
             self.unusable.push("provision_with: the signer was not asked, or already holds a key".into());
             return;
         }
-        self.set_register(register_params.clone());
-        let stream = self.next_stream();
-        match wire::signer::frame_provision(
-            &self.art.signer, PROVISION_ID, signing_key,
-            self.art.register_code.clone(), register_params, self.art.block_code.clone(), stream,
-        ) {
-            Ok(f) => self.out.extend(f),
-            Err(e) => self.unusable.push(format!("could not frame the signer's provisioning: {e}")),
-        }
+        self.set_register(register_params);
+        // The signer is registered already (it answered the query): the
+        // Provision is the first request now, re-asked like one.
+        self.first = Some(First::Provision(signing_key));
+        self.first_sent = false;
+        self.first_empties = 0;
+        self.first_started = None;
+        self.first_next_at = Ms(0);
+        self.first_gap_ms = page::rto::RTO_INITIAL_MS as u64;
+        self.send_first();
     }
 
     /// Name the Register this page's head lives in.
@@ -437,6 +462,7 @@ impl PageIo {
                     } else {
                         self.unusable.push(format!("the signer answered its first request EMPTY {} times", self.first_empties));
                         self.first = None;
+                        self.exhausted = true;
                     }
                 }
             }
@@ -475,7 +501,12 @@ impl PageIo {
                             self.signer_provisioned();
                         }
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
+                            self.refused = Some(format!("the signer refused provisioning: {why:?}"));
                             self.unusable.push(format!("the signer refused provisioning: {why:?}"));
+                        }
+                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Refused(why))) => {
+                            self.refused = Some(format!("the signer refused to say which Register it signs for: {why:?}"));
+                            self.unusable.push(format!("the signer refused the register query: {why:?}"));
                         }
                         // The record query's answer (`ask_record`).
                         Some((RECORD_QUERY_ID, answer)) => {
@@ -510,7 +541,15 @@ impl PageIo {
             // took): the RELOAD TRIGGER. A hint only — the page READS the
             // register and adopts only what that read shows (sdk#225).
             Incoming::HeadChanged { key } if key == self.register_key => self.server.head_hint(),
-            Incoming::Refused(r) => self.unusable.push(format!("the node refused: {}", r.said)),
+            Incoming::Refused(r) => {
+                // While the first exchange is unanswered, a refusal that names
+                // nothing is the node refusing IT: opening ends, by name.
+                if self.first.is_some() {
+                    self.first = None;
+                    self.refused = Some(format!("the node refused: {}", r.said));
+                }
+                self.unusable.push(format!("the node refused: {}", r.said))
+            }
             Incoming::Unusable(u) => self.unusable.push(format!("{u:?}")),
             _ => {}
         }
@@ -537,13 +576,73 @@ impl PageIo {
     /// The page's clock.
     pub fn tick(&mut self, now: Ms) {
         self.now = now;
+        self.tick_first(now);
         self.server.tick(now);
         self.pump();
     }
 
-    /// When the page's next timer falls (a host arms a one-shot for it).
+    /// The first exchange on the page's clock: anchored at its first tick,
+    /// asked again when due (the registration if it was never answered, else
+    /// the first request, through `send_first`), doubling to 8 s, and past
+    /// `VERIFY_BUDGET_MS` named "not answering" — never asked for ever.
+    fn tick_first(&mut self, now: Ms) {
+        if self.first.is_none() {
+            return;
+        }
+        let started = *self.first_started.get_or_insert(now);
+        if self.first_next_at.0 == 0 {
+            self.first_next_at = Ms(now.0 + self.first_gap_ms);
+            return;
+        }
+        if now.0 < self.first_next_at.0 {
+            return;
+        }
+        if now.0.saturating_sub(started.0) >= page::VERIFY_BUDGET_MS {
+            let what = match self.first { Some(First::Query) => "which Register it signs for", _ => "provisioning" };
+            self.unusable.push(format!("the signer is not answering: no answer to {what} within {} ms", page::VERIFY_BUDGET_MS));
+            self.first = None;
+            self.exhausted = true;
+            return;
+        }
+        self.first_gap_ms = (self.first_gap_ms * 2).min(8_000);
+        self.first_next_at = Ms(now.0 + self.first_gap_ms);
+        if !self.signer_registered {
+            if let Some(signer) = self.signer_container.clone() {
+                let stream = self.next_stream();
+                match wire::frame_register_delegate(signer, stream) {
+                    Ok(f) => self.out.extend(f),
+                    Err(e) => self.unusable.push(format!("could not frame the signer's registration: {e}")),
+                }
+            }
+        } else {
+            self.send_first();
+        }
+    }
+
+    /// Opening was REFUSED — by the signer or the node, in its words.
+    pub fn refused(&self) -> Option<&str> {
+        self.refused.as_deref()
+    }
+
+    /// Opening's re-asks are spent: the signer is "not answering".
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Still waiting on the first exchange past its first RTO.
+    pub fn stalled(&self) -> bool {
+        self.first.is_some() && self.first_started.is_some_and(|s| self.now.0.saturating_sub(s.0) >= page::rto::RTO_INITIAL_MS as u64)
+    }
+
+    /// When the page's next timer falls (a host arms a one-shot for it) —
+    /// the engine's, or the first exchange's re-ask. Unanchored, it is due
+    /// NOW, so the host ticks once and the real clock anchors it.
     pub fn next_due(&self) -> Option<Ms> {
-        self.server.page.next_due()
+        let first = self.first.as_ref().map(|_| if self.first_next_at.0 == 0 { self.now } else { self.first_next_at });
+        match (self.server.page.next_due(), first) {
+            (Some(a), Some(b)) => Some(Ms(a.0.min(b.0))),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Frames for the node, in order.

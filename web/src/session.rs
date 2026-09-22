@@ -930,26 +930,26 @@ impl Session {
         self.page.as_ref().is_some_and(|p| p.provisioned())
     }
 
-    /// Everything was sent, accepted, and the delegate still cannot write a
-    /// head: the ENGINE DELEGATE's install plan, which the page path does not
-    /// have. Always `false` — as it was in page mode before the switch-over —
-    /// and kept so a caller that asks is not broken. The signer's own
-    /// refusals are in [`Session::unusable`].
+    /// Opening's re-asks are SPENT: the signer did not answer the first
+    /// exchange (the Register query, or the provisioning) within its budget —
+    /// "not answering" (page-io's `exhausted`). One of `open()`'s named ends.
     pub fn exhausted(&self) -> bool {
-        false
+        self.page.as_ref().is_some_and(|p| p.exhausted())
     }
 
-    /// The install step that stalled: the engine delegate's plan, which the
-    /// page path does not have. Always empty (see [`Session::exhausted`]).
+    /// Opening is STILL WAITING past its first RTO: the first exchange is
+    /// being re-asked and not yet answered. Named for display; empty when not.
     pub fn stalled(&self) -> String {
-        String::new()
+        match self.page.as_ref() {
+            Some(p) if p.stalled() => "the signer has not answered yet; asking again".into(),
+            _ => String::new(),
+        }
     }
 
-    /// Why the engine delegate's install stopped: that plan is gone. Always
-    /// empty (see [`Session::exhausted`]); the signer's refusals are in
-    /// [`Session::unusable`].
+    /// Opening was REFUSED, by the signer or the node, in its own words
+    /// (page-io's `refused`) — or empty. One of `open()`'s named ends.
     pub fn refused(&self) -> String {
-        String::new()
+        self.page.as_ref().and_then(|p| p.refused()).unwrap_or_default().to_string()
     }
 
     /// The socket dropped and a new one opened.

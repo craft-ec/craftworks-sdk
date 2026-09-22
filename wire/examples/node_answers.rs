@@ -74,9 +74,14 @@ fn main() {
     // "which Register?", as the node delivers it (a delegate response).
     let signer_answer = std::env::var("SIGNER_ANSWER").ok().map(|spec| {
         let mut it = spec.splitn(3, ':');
-        let (_, id, params) = (it.next(), it.next().expect("id").parse::<u32>().expect("id"), it.next().expect("params"));
-        let params = (params != "none").then(|| unhex(params));
-        let payload = signer_proto::encode_answer(id, &signer_proto::Answer::Register { params });
+        let (kind, id, arg) = (it.next().expect("kind"), it.next().expect("id").parse::<u32>().expect("id"), it.next().unwrap_or(""));
+        // register:<id>:<params hex | none>, or refused:<id>: (the signer's
+        // "a different key is already provisioned").
+        let answer = match kind {
+            "refused" => signer_proto::Answer::Refused(signer_proto::Why::KeyAlreadyProvisioned),
+            _ => signer_proto::Answer::Register { params: (arg != "none").then(|| unhex(arg)) },
+        };
+        let payload = signer_proto::encode_answer(id, &answer);
         let (_, dkey) = wire::delegate_from_code(b"any: the page does not check which delegate answered");
         hex(&bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse {
             key: dkey,
