@@ -100,6 +100,10 @@ const TRANSPORT_ONLY: &[&str] = &[
     // to be notified by — its data cannot change under it — so there is
     // nothing for these to report there.
     "take_stale",
+    // Which domains THIS client's own writes changed state on (builder#107):
+    // an in-memory store's writes are final the moment they are made, so no
+    // row's state ever moves after it.
+    "take_state_changed",
     "bind",
     "unbind",
     // The NAME of what a binding watches — a domain, or one parent's band
