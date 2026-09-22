@@ -496,6 +496,27 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         Some(domain.to_string())
     }
 
+    /// The domains these RECORD keys are in, as the APP names them — sorted,
+    /// once each. What a Session hands JavaScript when its own writes change
+    /// state, so the bindings it holds (keyed by the app-relative name) re-run.
+    ///
+    /// Returned app-relative, never as stored: a key of another app is not
+    /// this app's to name and is dropped. craftworks-sdk#267 prefixed every
+    /// stored domain with its app, and this path went on reporting the STORED
+    /// name (`<app>.notes`) — which no binding is keyed by — so a tab's own
+    /// write never re-ran its bindings and a plain table said "saving" for
+    /// good: builder#107, back (measured in the builder's two-tab control).
+    pub fn own_domains_of_keys(app: Option<&str>, keys: &[Vec<u8>]) -> Vec<String> {
+        let mut out: Vec<String> = keys
+            .iter()
+            .filter_map(|k| Self::domain_of_key(k))
+            .filter_map(|stored| crate::app::own(app, &stored))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn domain_of_range(lo: &[u8], hi: &[u8]) -> Option<String> {
         let name = lo.strip_prefix(&[T_RECORD])?.strip_suffix(&[0])?;
         let domain = std::str::from_utf8(name).ok()?;

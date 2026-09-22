@@ -600,3 +600,32 @@ fn the_lost_re_sends_and_the_conflict_re_runs_share_one_budget() {
     assert!(sent_ids(&mut s).is_empty(), "a re-run write went again on a fresh Lost budget: the bounds multiply");
     assert_eq!(s.take_lost_gave_up(), vec![w], "it fell without being named");
 }
+
+/// builder#107, after craftworks-sdk#267: a tab's OWN write changing state is
+/// reported by the domain the APP names — the name its bindings are keyed by —
+/// never the stored `<app>.<name>`. Reported as stored, no binding matched,
+/// nothing re-ran, and a plain table said "saving" for good (measured in the
+/// builder's two-tab control, SDK 53e9f50: A's chip showed "saving" and never
+/// "saved" in 20 s).
+#[test]
+fn own_state_changes_name_the_app_relative_domain_its_bindings_are_keyed_by() {
+    use craftworks_sdk::db::record_key;
+    type D = craftworks_sdk::Db<craftworks_sdk::MemStore, craftworks_sdk::SystemEnv>;
+    let loc = craftworks_sdk::id::loc_from_hex(&"ab".repeat(16)).expect("an id");
+    let app = "rmud6o02cnfqk0001"; // a builder project id, the case that was measured
+    let mine = record_key(&format!("{app}.notes"), loc);
+    let also_mine = record_key(&format!("{app}.craftworks.published"), loc);
+    let theirs = record_key("otherapp.notes", loc);
+    let mut schema = vec![0u8];
+    schema.extend_from_slice(format!("schema\0{app}.notes").as_bytes());
+
+    assert_eq!(
+        D::own_domains_of_keys(Some(app), &[mine.clone(), also_mine.clone(), mine.clone(), theirs.clone(), schema]),
+        vec!["craftworks.published".to_string(), "notes".to_string()],
+        "a tab's own state change did not name the domains its bindings are keyed by (once each, app-relative), or named another app's"
+    );
+    // THE CONTROL: the stored name is NOT what a binding is keyed by.
+    assert!(!D::own_domains_of_keys(Some(app), &[mine.clone()]).contains(&format!("{app}.notes")), "the stored name leaked through");
+    // No app (data from before apps): the name as stored, as `app::own` says.
+    assert_eq!(D::own_domains_of_keys(None, &[record_key("notes", loc)]), vec!["notes".to_string()]);
+}

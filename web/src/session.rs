@@ -468,15 +468,10 @@ impl Session {
     /// (builder#107). LIVE governs only OTHER writers' changes
     /// ([`Session::take_stale`]).
     pub fn take_state_changed(&mut self) -> String {
-        let mut domains: Vec<String> = self
-            .db
-            .store_mut()
-            .take_state_changed()
-            .iter()
-            .filter_map(|k| craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_of_key(k))
-            .collect();
-        domains.sort();
-        domains.dedup();
+        let keys = self.db.store_mut().take_state_changed();
+        // Back to the app-relative names JavaScript holds, as `take_stale`
+        // does — the stored `<app>.<name>` is keyed by no binding (#267).
+        let domains = craftworks_sdk::Db::<CachedStore, SystemEnv>::own_domains_of_keys(self.app.as_deref(), &keys);
         serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into())
     }
 

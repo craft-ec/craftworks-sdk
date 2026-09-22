@@ -75,7 +75,14 @@ fn the_page_reports_head_moves_and_own_write_states() {
     let pump = body_of(&src, "pump_page");
     assert!(pump.contains("p.server.page.published()") && pump.contains("self.head_moved = true"), "a published head move does not mark the head moved:\n{pump}");
     let own = body_of(&src, "take_state_changed");
-    assert!(own.contains(".take_state_changed()") && own.contains("domain_of_key"), "own write states are not reported by domain:\n{own}");
+    // By the APP-RELATIVE domain (`own_domains_of_keys`, pinned natively in
+    // tests/cached_store.rs): this used to require `domain_of_key` here, which
+    // is the STORED `<app>.<name>` since craftworks-sdk#267 — keyed by no
+    // binding, so a plain table said "saving" for good (builder#107, back).
+    assert!(
+        own.contains(".take_state_changed()") && own.contains("own_domains_of_keys") && own.contains("self.app"),
+        "own write states are not reported by the app-relative domain the bindings are keyed by:\n{own}"
+    );
 }
 
 /// sdk#266: the Session ROUTES adoption and the re-ask. The decisions are
