@@ -397,8 +397,20 @@ impl Session {
                     ));
             }
             craftworks_sdk::loads::Page::Complete { lo, hi, rows, at } => {
-                let root = self.head_root;
-                self.db.store_mut().on_page(&lo, &hi, rows, root);
+                // AT THE ROOT IT WAS READ AT — every page of this load agreed
+                // on `at` (`Loads` restarts a load whose pages disagree). Not
+                // the Session's `head_root` field: that is set from `Identity`
+                // only (the wiring test refuses the field in this arm), so on the
+                // page path it stays the FIRST head this session saw. The copy
+                // is per root, and a delta moves it to the delta's real root,
+                // so a page recorded at the stale one read as a different tree
+                // and `loaded_range` WIPED every loaded range — the page just
+                // loaded included. Measured (sdk#282's acceptance run): pages
+                // read at 61b37a53 recorded at 0e62cdb5, the copy wiped on every
+                // load, and a read of another app's notes answered a ticketless
+                // NOT_LOADED for ever. The refresh bookkeeping just below
+                // already used `at.root`; now the rows do too.
+                self.db.store_mut().on_page(&lo, &hi, rows, at.root);
                 // A whole domain, loaded at one root: the next question about
                 // it can be a real delta FROM that root (sdk#142).
                 if let Some(d) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key_of_range(&lo, &hi) {
