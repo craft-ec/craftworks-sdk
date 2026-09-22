@@ -1037,3 +1037,187 @@ fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
     told.sort();
     assert_eq!(told, vec![(w1, vec![key.clone()]), (w2, vec![key.clone()])], "each write of the tip was not told its row");
 }
+
+/// sdk#225b part 2, THE MERGE (cell B): another device's commit at the tip's
+/// seq, signed from the SAME base P, whose tree is exactly P plus THEIR
+/// changes. Per key: changed only here (and its write's reads unchanged there)
+/// → KEPT, re-applied on the winner as a Commit with reads; changed there too
+/// → SUPERSEDED, told.
+/// * c1 they added an unrelated key → nothing told; the merge publishes on top
+///   of the winner, and the final tree holds BOTH their key and this page's
+///   record;
+/// * c2 they changed the record itself → the record is Superseded, and their
+///   value stands.
+#[test]
+fn a_same_seq_race_is_merged_key_by_key() {
+    use signer_proto::head::{value, Ledger};
+    for case in ["one-sided mine is kept", "both changed the record", "both changed the record, behind a long delta"] {
+        let mut node = Node::new();
+        let mut rig = PageRig::new();
+        let mut tab = Tab::open(&mut rig, &mut node);
+        tab.db.define("t", &tab_schema()).expect("define");
+        tab.pump(&mut rig, &mut node);
+        let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+        tab.pump(&mut rig, &mut node);
+        let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
+        let key = craftworks_sdk::db::record_key("t", loc);
+        let (tip_seq, tip_root) = node.head().expect("published");
+        let mine = node.tree(&tip_root).expect("whole").get(&key).cloned().expect("the record");
+        let hr = node.head_read().expect("a head");
+        let base = hr.prev().expect("the tip has a prev");
+        let base_tree = node.tree(&base.1).expect("the base is whole");
+        let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+        let theirs_record = b"their bytes for the record".to_vec();
+        let mut salt = 0u8;
+        let st = loop {
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
+            entries.push((b"other".to_vec(), vec![salt]));
+            if case.starts_with("both changed the record") {
+                entries.push((key.clone(), theirs_record.clone()));
+            }
+            // 300 changes of theirs that sort BEFORE the record: longer than
+            // one delta page, so the record's change comes after a CUT — a cut
+            // delta is unknown, never "not changed there" (the architect's #3).
+            if case.ends_with("behind a long delta") {
+                for i in 0..300u16 {
+                    let mut k = vec![0x00, b'f'];
+                    k.extend_from_slice(&i.to_be_bytes());
+                    entries.push((k, vec![1]));
+                }
+            }
+            let r = device_tree(&mut node, &entries);
+            let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
+            if page::beats(&v, hr.value()) {
+                break engine_delegate::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+            }
+            salt += 1;
+        };
+        node.update(&st);
+        rig.server.head_hint();
+        tab.pump(&mut rig, &mut node);
+        for _ in 0..20 {
+            rig.now += 1_000;
+            rig.server.tick(Ms(rig.now));
+            tab.pump(&mut rig, &mut node);
+        }
+        let told = tab.db.store_mut().take_superseded();
+        let (fseq, froot) = node.head().expect("a head");
+        let fin = node.tree(&froot).expect("the final tree is whole");
+        match case {
+            "one-sided mine is kept" => {
+                assert!(told.is_empty(), "{case}: told Superseded for a key only this page changed: {told:?}");
+                assert_eq!(fseq, tip_seq + 1, "{case}: no merge commit on top of the winner");
+                assert_eq!(fin.get(&key), Some(&mine), "{case}: this page's record did not survive the merge");
+                assert!(fin.contains_key(b"other".as_slice()), "{case}: their change did not survive the merge");
+            }
+            _ => {
+                assert_eq!(told.iter().map(|s| s.keys.clone()).collect::<Vec<_>>(), vec![vec![key.clone()]], "{case}: {told:?}");
+                assert_eq!(fin.get(&key), Some(&theirs_record), "{case}: their value at the record did not stand");
+            }
+        }
+    }
+}
+
+/// Drive the rig, answering every op EXCEPT block GETs, which are held (a cold
+/// node). Returns when nothing else moves.
+fn run_holding_gets(tab: &mut Tab, rig: &mut PageRig, node: &mut Node, held: &mut Vec<Op>) {
+    for _ in 0..400 {
+        let frames = tab.db.store_mut().take_outbound();
+        let mut moved = !frames.is_empty();
+        for f in &frames {
+            rig.server.client(f);
+        }
+        for op in rig.server.take_ops() {
+            moved = true;
+            if matches!(op, Op::Get { .. }) {
+                held.push(op);
+                continue;
+            }
+            if let Some(a) = rig.answer(node, op) {
+                rig.server.node(a, Ms(rig.now));
+            }
+        }
+        for r in rig.server.take_replies() {
+            moved = true;
+            tab.db.store_mut().on_inbound(&r);
+        }
+        if !moved {
+            return;
+        }
+    }
+}
+
+/// THE MERGE WRITE IS A COMMIT WITH READS, NEVER BLIND (the architect's #2 on
+/// the table): a merge decided against the winner x can LAND on a newer head,
+/// when the engine was busy and the page adopted another device's x' in
+/// between. Its reads — the kept writes' own, true at x — are compared where
+/// it lands: x' changed the record, so the merge conflicts and the record is
+/// SUPERSEDED, told; their x' value stands. A blind merge would have written
+/// this page's value over it.
+#[test]
+fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
+    use signer_proto::head::{value, Ledger};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.db.define("t", &tab_schema()).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+    tab.pump(&mut rig, &mut node);
+    let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
+    let key = craftworks_sdk::db::record_key("t", loc);
+    let (tip_seq, _) = node.head().expect("published");
+    let hr = node.head_read().expect("a head");
+    let base = hr.prev().expect("a prev");
+    let base_tree = node.tree(&base.1).expect("whole");
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    // x: the same-seq winner, P plus an unrelated key (so the record is one-sided mine).
+    let mut salt = 0u8;
+    let (x_root, x_state) = loop {
+        let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
+        e.push((b"other".to_vec(), vec![salt]));
+        let r = device_tree(&mut node, &e);
+        let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
+        if page::beats(&v, hr.value()) {
+            break (r, engine_delegate::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs"));
+        }
+        salt += 1;
+    };
+    node.update(&x_state);
+    // The page learns of x, adopts it and starts the merge; x's blocks are cold,
+    // so the merge's delta waits on GETs (held).
+    let mut held = Vec::new();
+    rig.server.head_hint();
+    run_holding_gets(&mut tab, &mut rig, &mut node, &mut held);
+    assert_eq!(rig.server.page.published().1, x_root, "the page did not adopt x");
+    assert!(!held.is_empty(), "the merge's delta did not need a fetch: the window this test is about does not exist");
+    // A new write of this tab, parked on the same cold blocks: the engine is busy.
+    tab.db.put("t", &serde_json::json!({ "title": "later" }).as_object().unwrap().clone()).expect("a later put");
+    run_holding_gets(&mut tab, &mut rig, &mut node, &mut held);
+    // x': ANOTHER head of the other device, on top of x, that changes the record.
+    let x_tree = node.tree(&x_root).expect("whole");
+    let theirs = b"their record, on x-prime".to_vec();
+    let mut e: Vec<(Vec<u8>, Vec<u8>)> = x_tree.into_iter().collect();
+    e.retain(|(k, _)| *k != key);
+    e.push((key.clone(), theirs.clone()));
+    let x2 = device_tree(&mut node, &e);
+    let v2 = value(&x2, &Ledger { prev: Some(signer_proto::Head { seq: tip_seq, root: x_root }), ..Ledger::default() });
+    node.update(&engine_delegate::register::head_state(&node.register_params, &key_of, tip_seq + 1, &v2).expect("signs"));
+    // Release the GETs: the delta completes, the merge write meets a busy engine,
+    // the later write's sign meets x' and the page adopts it; the merge re-sends ON x'.
+    for op in held.drain(..) {
+        if let Some(a) = rig.answer(&mut node, op) {
+            rig.server.node(a, Ms(rig.now));
+        }
+    }
+    tab.pump(&mut rig, &mut node);
+    for _ in 0..20 {
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        tab.pump(&mut rig, &mut node);
+    }
+    let fin = node.tree(&node.head().expect("a head").1).expect("whole");
+    assert_eq!(fin.get(&key), Some(&theirs), "the merge wrote this page's value over x-prime's: it went blind");
+    let told: Vec<Vec<Vec<u8>>> = tab.db.store_mut().take_superseded().into_iter().map(|s| s.keys).collect();
+    assert!(told.iter().any(|k| k.contains(&key)), "the record was not told Superseded: {told:?}");
+}
