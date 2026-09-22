@@ -84,6 +84,10 @@ pub struct Server {
     /// The published head last seen, to tell an ADOPTION (it moved with no
     /// Published of ours at the new head) from a commit of ours.
     seen_head: (u64, freenet_prolly::Cid),
+    /// An adoption happened since the client last asked (sdk#266): the head
+    /// this page stands on moved and NOT by a commit of this page's. What
+    /// the client reads to know its loaded ranges are behind.
+    adopted: bool,
     /// A displaced tip being judged key by key at the winner.
     probe: Option<Probe>,
     next_probe: u64,
@@ -199,6 +203,7 @@ impl Server {
             sent: BTreeMap::new(),
             tip: None,
             seen_head: (0, [0; 32]),
+            adopted: false,
             probe: None,
             next_probe: 1,
             merge: None,
@@ -384,6 +389,18 @@ impl Server {
                 }
             }
         }
+        if now != self.seen_head {
+            // ADOPTED, or OURS? Ours is a commit of this page's that published
+            // at this very head — in this call (`published_here`) or in an
+            // earlier one, which is exactly what the tip records. Anything
+            // else is somebody else's head, and every range the client holds
+            // is behind it (sdk#266).
+            // The FIRST head this page reads is not an adoption: it is
+            // where the page starts, and the client holds nothing yet.
+            let first = self.seen_head == (0, [0; 32]);
+            let ours = published_here || self.tip.as_ref().is_some_and(|t| t.head == now);
+            self.adopted |= !ours && !first;
+        }
         if now != self.seen_head && !published_here {
             if let Some(tip) = self.tip.take() {
                 if now.0 >= tip.head.0 && now != tip.head {
@@ -413,6 +430,12 @@ impl Server {
             effects.extend(more);
         }
         self.finish_probe(out);
+    }
+
+    /// Has this page ADOPTED a head that was not its own commit since the
+    /// last call (sdk#266)? Drains.
+    pub fn take_adopted(&mut self) -> bool {
+        std::mem::take(&mut self.adopted)
     }
 
     /// One of the Server's own reads answered: a probe's `Get`, or a page of

@@ -276,6 +276,12 @@ impl CachedStore {
         self.copy.pending_writes()
     }
 
+    /// THE HEAD MOVED AND IT WAS NOT THIS PAGE'S COMMIT (sdk#266): every
+    /// loaded range is behind, and the next read of one re-asks.
+    pub fn mark_stale(&mut self) {
+        self.copy.mark_stale();
+    }
+
     /// Queue the request that loads `[lo, hi)`. The host pumps; the answer
     /// arrives at [`CachedStore::on_page`].
     pub fn request_range(&mut self, req_id: u64, lo: &[u8], hi: &[u8], max_entries: u32) {

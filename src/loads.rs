@@ -144,8 +144,19 @@ impl Loads {
         if self.done.contains(&(lo.to_vec(), hi.to_vec())) {
             return None;
         }
+        Some(self.want_again(lo, hi, now_ms))
+    }
+
+    /// The ticket for `[lo, hi)` WITHOUT the no-progress guard: the span was
+    /// loaded, and the copy has since learned it is BEHIND the head this page
+    /// stands on (sdk#266). Asking again is exactly the progress the guard
+    /// exists to require — measured in a browser: with the guard applied, a
+    /// stale range answered a TICKETLESS `NotLoaded` (`wait=undefined`) every
+    /// 250 ms for 30 s, so the read never re-asked and the tab never saw the
+    /// other tab's row.
+    pub fn want_again(&mut self, lo: &[u8], hi: &[u8], now_ms: u64) -> (u64, bool) {
         if let Some((id, _)) = self.open.iter().find(|(_, l)| l.lo == lo && l.hi == hi) {
-            return Some((*id, false));
+            return (*id, false);
         }
         let id = self.take_id();
         self.open.insert(
@@ -159,7 +170,7 @@ impl Loads {
                 restarts: 0,
             },
         );
-        Some((id, true))
+        (id, true)
     }
 
     /// A request id from THIS session's one counter (sdk#166).
@@ -297,6 +308,18 @@ impl Loads {
             rows: load.rows,
             at: finished_at,
         }
+    }
+
+    /// A DELTA answered this read (sdk#266): the range was held already and
+    /// only behind, so what came back is what changed, not the rows. The
+    /// ticket completes exactly as a page completes — the read parked on it
+    /// wakes and reads the copy, now current. Returns the range, `None` when
+    /// no such load is open (a duplicate, or one that timed out).
+    pub fn on_refreshed(&mut self, id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        let load = self.open.remove(&id)?;
+        self.ended.push((id, Ended::Loaded));
+        self.done.insert((load.lo.clone(), load.hi.clone()));
+        Some((load.lo, load.hi))
     }
 
     /// The engine said it could not answer this read.

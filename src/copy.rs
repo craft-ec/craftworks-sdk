@@ -226,6 +226,17 @@ pub struct Copy {
     /// The key intervals that have been LOADED, as `[lo, hi)`, disjoint and
     /// sorted. What makes "not loaded" different from "empty".
     loaded: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Loaded intervals this copy knows it is BEHIND on, each with the root
+    /// it was last CURRENT at (sdk#266). Their rows are still here — a delta
+    /// from that root patches them — but a read of one is not answered from
+    /// the copy.
+    ///
+    /// The root is per RANGE because the copy has one root and many ranges:
+    /// the first range refreshed moves `root` to the head that won, and a
+    /// second range asked from THAT root is told nothing changed and shows
+    /// its old rows as current (measured in a browser: y's scan answered 0
+    /// rows for ever, with the node answering every re-ask).
+    stale: Vec<(Vec<u8>, Vec<u8>, [u8; 32])>,
     /// The root this copy reflects. RECORDED, never computed.
     root: Option<[u8; 32]>,
     bytes: usize,
@@ -259,6 +270,7 @@ impl Copy {
         Copy {
             keys: BTreeMap::new(),
             loaded: Vec::new(),
+            stale: Vec::new(),
             root: None,
             bytes: 0,
             max_bytes: 8 * 1024 * 1024,
@@ -279,11 +291,84 @@ impl Copy {
         self.bytes
     }
 
-    /// Is this key inside a range that has been loaded?
+    /// Is this key inside a range that has been loaded — and not one this
+    /// copy knows it is BEHIND on (sdk#266)?
     pub fn is_loaded(&self, key: &[u8]) -> bool {
+        self.holds(key) && !self.stale.iter().any(|(lo, hi, _)| key >= lo.as_slice() && key < hi.as_slice())
+    }
+
+    /// Is this key inside a range whose rows this copy HOLDS, stale or not?
+    /// What a delta patches: a stale range keeps its rows, because the delta
+    /// that refreshes it says only what CHANGED (sdk#266).
+    fn holds(&self, key: &[u8]) -> bool {
         self.loaded
             .iter()
             .any(|(lo, hi)| key >= lo.as_slice() && key < hi.as_slice())
+    }
+
+    /// THE HEAD MOVED, AND NOT BY THIS PAGE'S OWN COMMIT (sdk#266).
+    ///
+    /// Every loaded range is now known to be behind: a read of one must not
+    /// be answered from the copy, because "read when needed" means a read
+    /// returns data at least as new as the head this page has adopted. The
+    /// rows STAY — the next read re-asks with a delta from the root the copy
+    /// stands on, which is cheap where a full reload is not — and the range
+    /// becomes current again when that delta lands ([`Copy::refreshed`]).
+    ///
+    /// Only a head that is NOT this page's own commit: after every commit of
+    /// this tab's the copy already holds those values, and marking then would
+    /// double the read traffic of ordinary writing.
+    pub fn mark_stale(&mut self) {
+        let Some(root) = self.root else { return };
+        let fresh: Vec<(Vec<u8>, Vec<u8>)> = self
+            .loaded
+            .iter()
+            .filter(|(l, h)| !self.stale.iter().any(|(sl, sh, _)| sl <= l && h <= sh))
+            .cloned()
+            .collect();
+        self.stale.extend(fresh.into_iter().map(|(l, h)| (l, h, root)));
+    }
+
+    /// Is any part of `[lo, hi)` stale?
+    pub fn is_stale(&self, lo: &[u8], hi: &[u8]) -> bool {
+        self.stale_from(lo, hi).is_some()
+    }
+
+    /// The root a stale part of `[lo, hi)` was last CURRENT at: what its
+    /// re-ask asks FROM. The oldest of them, so nothing is skipped.
+    pub fn stale_from(&self, lo: &[u8], hi: &[u8]) -> Option<[u8; 32]> {
+        self.stale
+            .iter()
+            .filter(|(l, h, _)| l.as_slice() < hi && lo < h.as_slice())
+            .map(|(_, _, root)| *root)
+            .next()
+    }
+
+    /// A delta from this copy's root has been applied over `[lo, hi)`: that
+    /// span is as new as the head the delta named.
+    ///
+    /// SUBTRACTED, not dropped. A page loads a wide range — the whole key
+    /// space, on an opening session — and READS a narrow one, a domain. With
+    /// only whole ranges cleared, the wide stale range survived every delta:
+    /// the read re-asked, was answered, and found the range stale again, for
+    /// ever (measured in a browser, sdk#266: `y.scan` threw "not loaded"
+    /// every 250 ms for 30 s while the node answered each re-ask).
+    pub fn refreshed(&mut self, lo: &[u8], hi: &[u8]) {
+        let mut out = Vec::with_capacity(self.stale.len() + 1);
+        for (l, h, root) in std::mem::take(&mut self.stale) {
+            // Disjoint: untouched.
+            if h.as_slice() <= lo || hi <= l.as_slice() {
+                out.push((l, h, root));
+                continue;
+            }
+            if l.as_slice() < lo {
+                out.push((l.clone(), lo.to_vec(), root));
+            }
+            if hi < h.as_slice() {
+                out.push((hi.to_vec(), h, root));
+            }
+        }
+        self.stale = out;
     }
 
     /// What a component sees, or `None` if this range was never loaded.
@@ -388,6 +473,10 @@ impl Copy {
     pub fn range_loaded(&self, lo: &[u8], hi: &[u8]) -> bool {
         if lo >= hi {
             return true;
+        }
+        // Behind the head this page has adopted: not an answer (sdk#266).
+        if self.is_stale(lo, hi) {
+            return false;
         }
         let mut at = lo.to_vec();
         loop {
@@ -790,8 +879,10 @@ impl Copy {
         let mut told = Told::default();
         for (k, v) in changes {
             // Outside what is loaded, there is nothing to update: the copy
-            // does not accumulate rows it was never asked for.
-            if !self.is_loaded(&k) {
+            // does not accumulate rows it was never asked for. A STALE range
+            // still holds its rows, and this delta is exactly what brings it
+            // up to date (sdk#266) — `holds`, not `is_loaded`.
+            if !self.holds(&k) {
                 continue;
             }
             let e = self.keys.entry(k.clone()).or_default();
