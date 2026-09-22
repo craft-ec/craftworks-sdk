@@ -119,3 +119,19 @@ fn drive(e: &mut Engine<Store>, first: Vec<Effect>) {
     }
     panic!("the commit did not settle");
 }
+
+/// **A write with AT LEAST ONE `Any` read is counted** — a MIXED one included
+/// (WRITE-PATH W8: "each accepted one is counted", and what `Session.tick()`
+/// shows is this count). One key forced, one key read for real: 0 → 1.
+#[test]
+fn a_write_mixing_one_forced_key_with_one_real_read_is_counted() {
+    let mut e = recovered();
+    assert_eq!(e.forced_writes(), 0);
+    let fx = e.step(write(
+        1,
+        vec![("k/a", Op::Put(b"1".to_vec())), ("k/b", Op::Put(b"2".to_vec()))],
+        vec![("k/a", Expect::Any), ("k/b", Expect::Absent)],
+    ));
+    assert!(told(&fx, 1).contains(&State::Accepted), "the mixed write was not taken: {fx:?}");
+    assert_eq!(e.forced_writes(), 1, "a write with one forced key and one real read was not counted as forced");
+}
