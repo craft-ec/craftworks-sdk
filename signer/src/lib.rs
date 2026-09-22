@@ -14,6 +14,17 @@
 //! - **No GETs, no contract ops, no tree logic, no memory beyond ONE record.** It reads only by the node's
 //!   SYNCHRONOUS local read (`get_contract_state`), so it can never park (F50: only a cold GET/SUBSCRIBE parks a
 //!   delegate), never strand, and has nothing to settle.
+//! - **But it shares the executor's ONE default queue** (F51; `fair_queue.rs`: a delegate request names no contract,
+//!   so it goes to the default queue on the serial `contract_handling` loop, capped at 100 waiting). It waits behind
+//!   whatever iteration of another delegate's chain is running, and a burst from another delegate can get a sign
+//!   request REFUSED "queue full" with no answer. The page treats a refusal as "ask again" (as sdk#196 1b does): a
+//!   re-ask is safe by rule (b), which answers the first record.
+//! - **The record is on disk before the reply is built.** `sign` replies `Signed` only after `set_secret(RECORD)`
+//!   returned true, and the node's `store_secret` writes a tmp file, `sync_all`s and atomically renames BEFORE it
+//!   returns (freenet-core v0.2.135 `wasm_runtime/secrets_store/store.rs:790–832`, read by the architect, sdk#210
+//!   review). So "record lost after a signature left" -- the one ordering that would sign twice -- is excluded by
+//!   SOURCE; `live-signer` confirms it once (SIGKILL the instant `Signed` arrived, restart, `AlreadySigned(first)`).
+//!   A crash INSIDE the write loses a signature nobody received: no fork.
 //!
 //! [`decide`] is the rule, pure. [`serve`] is the whole request over a [`Host`] (secrets + the sync read), so every
 //! ordering the issue names -- the race, identical re-ask, one signature per prev, a record that was not saved -- is
@@ -73,9 +84,18 @@ pub enum Why {
     /// The signer knows no head at all -- no record, and the Register is not readable locally -- and `prev` is not
     /// the genesis (seq 0). It cannot tell whether `prev` is current, so it does not sign.
     HeadUnknown,
-    /// The ROOT BLOCK of `next.root` is not readable by the sync read: a head pointing at a tree the node does not
-    /// hold would publish a hole.
+    /// The ROOT BLOCK of `next.root` is not readable by the sync read, or what is read does not HASH to `next.root`
+    /// (`block_id(kind, body) == root`, as the tree names a block): a head pointing at a tree the node does not hold
+    /// would publish a hole.
     RootNotHeld,
+    /// The record and the Register, at the SAME seq, name DIFFERENT roots: another holder of this key signed a
+    /// competing head. The signer signs NOTHING on either -- signing on from its own would silently displace the
+    /// other write (the Register keeps the higher seq, F56); signing on from theirs is resolving a fork. The
+    /// attested checkpoint decides; the page reports it.
+    Forked { mine: Head, read: Head },
+    /// A DIFFERENT Register (params or code) was provisioned for the same key. The one record belongs to the Register
+    /// it was signed for, and is never carried to another.
+    RegisterChanged,
     /// The record could not be written: NO signature is returned without its record.
     RecordNotSaved,
     /// A DIFFERENT key is already provisioned: a key is never replaced silently.
@@ -128,11 +148,16 @@ pub enum Decision {
 /// (a) `next.seq == prev.seq + 1`, else `Refused(NotSuccessor)`; not provisioned → `Refused(NotProvisioned)`.
 /// (b) AT MOST ONE SIGNATURE PER PREV: `record.prev == prev` → `AlreadySigned(record.signed)`, identical re-ask or a
 ///     different `next` alike. Checked BEFORE (c), so a re-ask after the head moved on still gets its own bytes back.
-/// (c) TRUTH = the later of `record.next` and `head_read`, by seq; at EQUAL seq the RECORD (what THIS key signed; a
-///     different root there is another holder of the key -- reported by the checkpoint, not resolved here).
+/// (c) FORK: the record and `head_read` at the SAME seq with DIFFERENT roots → `Refused(Forked{mine, read})`, and
+///     nothing is signed (the checkpoint decides; sdk#210 review §1).
+/// (d) TRUTH = the later of `record.next` and `head_read`, by seq (a read AHEAD is another holder moving the head:
+///     the page rebases, nothing is displaced; a read BEHIND is the page's UPDATE not landed yet: the record wins).
 ///     `prev != truth` → `NotNext{ current: truth }`. No truth at all: only the genesis (`prev.seq == 0`) is signable,
-///     else `Refused(HeadUnknown)`.
-/// (d) the root block must be held, else `Refused(RootNotHeld)`.
+///     else `Refused(HeadUnknown)`. Stated limit: a node that does not HOLD the Register (a second device, a fresh
+///     node) with no record signs seq 1 for a key whose head may be further on elsewhere. Harmless at the Register
+///     (the higher seq wins) but the page's UPDATE then loses silently, and it learns so only from the head
+///     subscription.
+/// (e) the root block must be held AND hash to `next.root`, else `Refused(RootNotHeld)`.
 /// Otherwise `Sign`.
 pub fn decide(f: &Facts, prev: &Head, next: &Next) -> Decision {
     use Answer::*;
@@ -148,6 +173,11 @@ pub fn decide(f: &Facts, prev: &Head, next: &Next) -> Decision {
         }
     }
     let signed_head = f.record.as_ref().map(|r| r.next.head());
+    if let (Some(mine), Some(read)) = (signed_head, f.head_read) {
+        if mine.seq == read.seq && mine.root != read.root {
+            return Decision::Reply(Refused(Why::Forked { mine, read }));
+        }
+    }
     let truth = match (signed_head, f.head_read) {
         (Some(mine), Some(read)) if read.seq > mine.seq => Some(read),
         (Some(mine), _) => Some(mine),
@@ -259,6 +289,17 @@ pub fn serve<H: Host>(host: &mut H, request: &[u8]) -> Answer {
                 if held != signing_key {
                     return Answer::Refused(Why::KeyAlreadyProvisioned);
                 }
+                // The same key re-provisioned: only for the SAME Register. The record belongs to the Register it was
+                // signed for; another Register's requests must never be answered from it.
+                let same = host
+                    .get_secret(REGISTER_PARAMS)
+                    .is_none_or(|p| p == register_params)
+                    && host
+                        .get_secret(REGISTER_CODE)
+                        .is_none_or(|c| c == register_code);
+                if !same {
+                    return Answer::Refused(Why::RegisterChanged);
+                }
             }
             let ok = host.set_secret(KEY, &signing_key)
                 && host.set_secret(REGISTER_CODE, &register_code)
@@ -299,9 +340,11 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
             }),
         _ => None,
     };
+    // Held AND the right block: the state is `kind ‖ body` and must hash to the root it is named by (as
+    // entry.rs::block_state names a block), not merely be present.
     let root_held = bcode.as_deref().is_some_and(|c| {
         host.contract_state(&engine_delegate::blocks::contract_for(c, &next.root))
-            .is_some_and(|s| !s.is_empty())
+            .is_some_and(|s| matches!(s.split_first(), Some((&k, body)) if freenet_prolly::block_id(k, body) == next.root))
     });
     let facts = Facts {
         provisioned,
