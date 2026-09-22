@@ -236,11 +236,8 @@ impl<T: Transport> EngineStore<T> {
     /// Bounded. An outbox that cannot make progress must return rather than
     /// spin: the caller is a UI thread in a browser, and "eventually" there
     /// means "never, visibly".
-    fn submit(&mut self, edits: Vec<protocol::Op>) {
-        self.submit_reading(Vec::new(), edits)
-    }
-
-    /// A write that says what it READ (M2): the outbox sends it as a Commit.
+    ///
+    /// It says what it READ (M2): the outbox sends it as a Commit.
     fn submit_reading(&mut self, reads: Vec<(Vec<u8>, protocol::Expect)>, edits: Vec<protocol::Op>) {
         let write_id = self.next_write_id;
         self.next_write_id += 1;
@@ -386,19 +383,6 @@ impl<T: Transport> EngineStore<T> {
 }
 
 impl<T: Transport> Store for EngineStore<T> {
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.submit(vec![protocol::Op::Put(key.to_vec(), value.to_vec())]);
-    }
-
-    fn delete(&mut self, key: &[u8]) -> bool {
-        // A read that FAILED is not a key that was absent. Reported as "did
-        // not exist" here would be a lie the caller acts on; the write still
-        // goes, because deleting a key is right whether or not it was there.
-        let existed = matches!(self.read(key), Ok(Some(_)));
-        self.submit(vec![protocol::Op::Delete(key.to_vec())]);
-        existed
-    }
-
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
         self.apply_commit(&[], edits)
     }

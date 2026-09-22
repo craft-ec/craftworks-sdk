@@ -124,7 +124,7 @@ fn round_trips_to_load(rows: usize) -> (usize, usize) {
     // Put `rows` records in the node's tree, through the real engine.
     for i in 0..rows {
         let key = format!("d\0note\0{i:06}").into_bytes();
-        store.put(&key, b"v");
+        store.put(&key, b"v").expect("the store took the write");
         for frame in store.take_outbound() {
             for reply in node.exchange(&frame) {
                 store.on_inbound(&reply);
@@ -224,7 +224,7 @@ fn control_asking_with_zero_costs_one_round_trip_per_row() {
     let mut store = CachedStore::new(Box::new(|| 0));
     for i in 0..20 {
         let key = format!("d\0note\0{i:06}").into_bytes();
-        store.put(&key, b"v");
+        store.put(&key, b"v").expect("the store took the write");
         for frame in store.take_outbound() {
             for reply in node.exchange(&frame) {
                 store.on_inbound(&reply);
@@ -288,7 +288,7 @@ fn the_page_constant_is_not_clamped_down_by_the_real_shell() {
     let mut node = Node::new();
     let mut store = CachedStore::new(Box::new(|| 0));
     // One row is enough: the reply reports the page size the shell USED.
-    store.put(b"d\x00note\x00000001", b"v");
+    store.put(b"d\x00note\x00000001", b"v").expect("the store took the write");
     for frame in store.take_outbound() {
         for reply in node.exchange(&frame) {
             store.on_inbound(&reply);

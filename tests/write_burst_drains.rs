@@ -97,7 +97,7 @@ impl Page {
 
     fn write(&mut self, n: usize) {
         let key = format!("d/notes/{n:06}").into_bytes();
-        self.store.put(&key, format!("body {n}").as_bytes());
+        self.store.put(&key, format!("body {n}").as_bytes()).expect("the store took the write");
     }
 
     /// Writes still outstanding: (count, bytes).
@@ -183,9 +183,9 @@ fn control_an_idle_outbox_sends_nothing() {
 fn control_a_key_written_twice_keeps_the_later_value() {
     let mut p = Page::new();
     let key = b"d/notes/000000".to_vec();
-    p.store.put(&key, b"first");
-    p.store.put(&key, b"second");
-    p.store.put(&key, b"third");
+    p.store.put(&key, b"first").expect("the store took the write");
+    p.store.put(&key, b"second").expect("the store took the write");
+    p.store.put(&key, b"third").expect("the store took the write");
     p.pump();
 
     assert_eq!(p.outstanding().0, 0, "the key never settled");

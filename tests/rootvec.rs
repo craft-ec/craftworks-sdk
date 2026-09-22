@@ -19,11 +19,11 @@ fn fixture() -> TreeStore {
         // A repeating pattern rather than randomness: the fixture has to be the
         // same tomorrow, in another language, on another machine.
         let n = 16 + (i * 37 % 97) as usize;
-        s.put(format!("k/{i:06}").as_bytes(), &vec![(i % 251) as u8; n]);
+        s.put(format!("k/{i:06}").as_bytes(), &vec![(i % 251) as u8; n]).expect("the store took the write");
     }
     // Two values well over MAX_INLINE, so referenced values are in the picture.
-    s.put(b"big/a", &vec![7u8; 4096]);
-    s.put(b"big/b", &vec![9u8; 9000]);
+    s.put(b"big/a", &vec![7u8; 4096]).expect("the store took the write");
+    s.put(b"big/b", &vec![9u8; 9000]).expect("the store took the write");
     s
 }
 

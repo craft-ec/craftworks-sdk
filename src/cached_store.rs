@@ -568,12 +568,8 @@ impl CachedStore {
     }
 
     /// Make a write: into the copy, then onto the wire — or REFUSED, before
-    /// anything is held, and the refusal returned (craftworks-sdk#180).
-    fn submit(&mut self, edits: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<(), Refused> {
-        self.submit_reading(Vec::new(), edits)
-    }
-
-    /// A write that says what it READ (M2): sent as a `Commit`.
+    /// anything is held, and the refusal returned (craftworks-sdk#180). It
+    /// says what it READ (M2), and is sent as a `Commit`.
     fn submit_reading(
         &mut self,
         reads: Vec<(Vec<u8>, protocol::Expect)>,
@@ -653,21 +649,6 @@ impl CachedStore {
 }
 
 impl Store for CachedStore {
-    // `put` and `delete` have no error channel: a refusal here reaches only
-    // `refused`. `Db` writes through `apply_batch`, which returns it.
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        let _ = self.submit(vec![(key.to_vec(), Some(value.to_vec()))]);
-    }
-
-    fn delete(&mut self, key: &[u8]) -> bool {
-        // What the copy knows. A delete of a key in an unloaded range reports
-        // `false` — not because it was absent, but because nothing here knows;
-        // the delete still goes, which is right either way.
-        let existed = matches!(self.copy.get(key), Some(v) if v.value().is_some());
-        let _ = self.submit(vec![(key.to_vec(), None)]);
-        existed
-    }
-
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
         self.apply_commit(&[], edits)
     }

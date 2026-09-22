@@ -63,7 +63,7 @@ fn a_write_shows_at_once_and_goes_out_on_the_pump() {
         root(1),
     );
 
-    Store::put(&mut s, b"a/1", b"mine");
+    Store::put(&mut s, b"a/1", b"mine").expect("the store took the write");
     // Visible immediately — that is what optimistic means.
     assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"mine".to_vec())));
     // And it says it is not settled.
@@ -92,10 +92,12 @@ fn a_write_the_copy_refuses_never_reaches_the_wire() {
     s.on_page(b"a/", b"b/", vec![], root(1));
     s.copy.max_pending = 1;
 
-    Store::put(&mut s, b"a/1", b"first");
+    Store::put(&mut s, b"a/1", b"first").expect("the store took the write");
     assert_eq!(s.take_outbound().len(), 1, "the first write must go");
 
-    Store::put(&mut s, b"a/2", b"second");
+    // The refusal is the RETURN VALUE (sdk#186), and the same one reported.
+    let refused = Store::put(&mut s, b"a/2", b"second").expect_err("a write past the copy's cap was taken");
+    assert_eq!(s.refused.last().map(|(_, r)| r), Some(&refused), "the returned refusal is not the one reported");
     assert_eq!(
         s.take_outbound().len(),
         0,
@@ -153,7 +155,7 @@ fn a_delta_updates_what_is_loaded_and_leaves_pending_on_top() {
         ],
         root(1),
     );
-    Store::put(&mut s, b"a/1", b"mine");
+    Store::put(&mut s, b"a/1", b"mine").expect("the store took the write");
 
     let told = s.on_delta(
         vec![

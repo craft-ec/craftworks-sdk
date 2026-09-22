@@ -118,7 +118,7 @@ fn a_rolled_back_write_is_not_reported_as_saved() {
     s.copy.pending_timeout_ms = 10;
 
     let key = b"d\0note\0x".to_vec();
-    craftworks_sdk::store::Store::put(&mut s, &key, b"v");
+    craftworks_sdk::store::Store::put(&mut s, &key, b"v").expect("the store took the write");
     assert_eq!(s.row_state(&key), RowState::Pending);
 
     // Nothing ever answers it, and the client gives up.
@@ -143,7 +143,7 @@ fn a_rolled_back_write_is_not_reported_as_saved() {
 
     // Writing again replaces the failure with something in flight, which is
     // a truer answer than the old failure.
-    craftworks_sdk::store::Store::put(&mut s, &key, b"v2");
+    craftworks_sdk::store::Store::put(&mut s, &key, b"v2").expect("the store took the write");
     assert_eq!(s.row_state(&key), RowState::Pending);
 }
 
@@ -162,7 +162,7 @@ fn control_an_answered_write_is_never_reported_rolled_back() {
 
     let key = b"d\0note\0x".to_vec();
     let write_id = s.next_write_id();
-    craftworks_sdk::store::Store::put(&mut s, &key, b"v");
+    craftworks_sdk::store::Store::put(&mut s, &key, b"v").expect("the store took the write");
     s.copy.published(write_id);
 
     now.set(1_000);

@@ -143,7 +143,7 @@ fn calm(busy_for: usize) -> EngineStore<Chaos<Loop>> {
 fn a_write_through_the_sdk_is_readable_through_the_sdk() {
     use craftworks_sdk::Store as _;
     let mut db = started(0);
-    db.put(b"k/one", b"first");
+    db.put(b"k/one", b"first").expect("the store took the write");
     assert_eq!(
         db.read_mut(b"k/one").unwrap().as_deref(),
         Some(&b"first"[..]),
@@ -162,7 +162,7 @@ fn writes_refused_busy_still_arrive_through_the_sdk() {
     use craftworks_sdk::Store as _;
     let mut db = started(6);
     for i in 0..4u32 {
-        db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes());
+        db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes()).expect("the store took the write");
     }
     assert!(
         db.resubmits > 0,
@@ -191,7 +191,7 @@ fn a_range_reads_back_every_row_in_order_and_both_ways() {
     use craftworks_sdk::Store as _;
     let mut db = started(0);
     for i in 0..12u32 {
-        db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes());
+        db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes()).expect("the store took the write");
     }
 
     let rows = db.list(Bound::Unbounded, Bound::Unbounded, false).unwrap();
@@ -244,7 +244,7 @@ fn an_oversized_page_request_is_clamped_and_says_so() {
     use craftworks_sdk::Store as _;
     let mut db = started(0);
     for i in 0..12u32 {
-        db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes());
+        db.put(format!("k/{i:02}").as_bytes(), format!("v{i}").as_bytes()).expect("the store took the write");
     }
     let asked = 100_000u32;
     let p = db
@@ -302,8 +302,8 @@ fn the_engine_and_the_memory_backend_answer_the_same_reads() {
 
     for i in 0..12u32 {
         let (k, v) = (format!("k/{i:02}"), format!("v{i}"));
-        SdkStore::put(&mut engine, k.as_bytes(), v.as_bytes());
-        SdkStore::put(&mut mem, k.as_bytes(), v.as_bytes());
+        SdkStore::put(&mut engine, k.as_bytes(), v.as_bytes()).expect("the store took the write");
+        SdkStore::put(&mut mem, k.as_bytes(), v.as_bytes()).expect("the store took the write");
     }
 
     for i in 0..14u32 {
@@ -448,7 +448,8 @@ fn the_client_survives_a_connection_that_reorders_and_duplicates() {
                 &mut db,
                 format!("k/{i:02}").as_bytes(),
                 format!("v{i}").as_bytes(),
-            );
+            )
+            .expect("the store took the write");
         }
         for i in 0..8u32 {
             let k = format!("k/{i:02}");
@@ -478,7 +479,7 @@ fn the_client_survives_a_connection_that_reorders_and_duplicates() {
 fn the_chaos_wrapper_with_every_arm_off_changes_nothing() {
     use craftworks_sdk::Reads;
     let mut db = calm(0);
-    craftworks_sdk::Store::put(&mut db, b"k/one", b"first");
+    craftworks_sdk::Store::put(&mut db, b"k/one", b"first").expect("the store took the write");
     assert_eq!(
         Reads::get(&mut db, b"k/one").unwrap().as_deref(),
         Some(&b"first"[..])

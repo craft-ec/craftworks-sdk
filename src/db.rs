@@ -1155,12 +1155,6 @@ mod tests {
     fn a_key_past_the_trees_limit_is_refused_before_the_store_is_touched() {
         struct Panics;
         impl Store for Panics {
-            fn put(&mut self, _: &[u8], _: &[u8]) {
-                panic!("the store must not be reached")
-            }
-            fn delete(&mut self, _: &[u8]) -> bool {
-                panic!("the store must not be reached")
-            }
             fn apply_batch(&mut self, _: &[(Vec<u8>, Edit)]) -> std::result::Result<(), crate::copy::Refused> {
                 panic!("the store must not be reached")
             }

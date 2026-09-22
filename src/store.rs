@@ -245,17 +245,27 @@ pub trait Reads {
 /// and that has to be visible in the type rather than hidden behind `&self`.
 ///
 /// **An implementation may treat a write it cannot represent as a bug and
-/// stop.** A write has no error channel — `put` returns nothing — so a key or
-/// value past what the underlying structure allows cannot be reported, and
-/// failing quietly would be worse than failing loudly. Screening is
+/// stop.** A key or value past what the underlying structure allows is not a
+/// refusal the store can name — [`Refused`](crate::copy::Refused) is for a
+/// store holding writes for a node — and failing quietly would be worse than
+/// failing loudly. Screening is
 /// [`Db`](crate::Db)'s job: it checks every key and value against the tree's
 /// limits before a store is touched, and returns an error the app can handle.
 /// That division is deliberate, and it is why [`TreeStore`](crate::TreeStore)
 /// may panic where a limit is breached.
 pub trait Store {
-    fn put(&mut self, key: &[u8], value: &[u8]);
-    /// Returns whether the key existed.
-    fn delete(&mut self, key: &[u8]) -> bool;
+    /// One key, as a batch of one: refused or not the same way as
+    /// [`Store::apply_batch`], and the refusal RETURNED (sdk#186). These
+    /// returned nothing once, so a refusal through them reached only a list —
+    /// the door #180 closed for `apply_batch`, left open beside it. They are
+    /// not separate paths any more: no store implements them.
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), crate::copy::Refused> {
+        self.apply_batch(&[(key.to_vec(), Edit::Put(value.to_vec()))])
+    }
+    /// See [`Store::put`].
+    fn delete(&mut self, key: &[u8]) -> Result<(), crate::copy::Refused> {
+        self.apply_batch(&[(key.to_vec(), Edit::Delete)])
+    }
 
     /// Apply several edits as ONE change.
     ///
@@ -276,17 +286,7 @@ pub trait Store {
     /// nothing read the list: `Db` answered `Created` for 45 of 300 writes the
     /// copy had refused. Returned, it cannot be missed — there is no second
     /// place to look.
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
-        for (k, e) in edits {
-            match e {
-                Edit::Put(v) => self.put(k, v),
-                Edit::Delete => {
-                    self.delete(k);
-                }
-            }
-        }
-        Ok(())
-    }
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused>;
     /// The id of the write this store made last, if it numbers them (M2's
     /// re-run: `Db` remembers what each of its writes MEANT by this id).
     fn last_write_id(&self) -> Option<u64> {
@@ -350,11 +350,18 @@ pub fn sorted_edits(edits: Vec<(Vec<u8>, Edit)>) -> Vec<(Vec<u8>, Edit)> {
 pub struct MemStore(BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl Store for MemStore {
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.0.insert(key.to_vec(), value.to_vec());
-    }
-    fn delete(&mut self, key: &[u8]) -> bool {
-        self.0.remove(key).is_some()
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
+        for (k, e) in edits {
+            match e {
+                Edit::Put(v) => {
+                    self.0.insert(k.clone(), v.clone());
+                }
+                Edit::Delete => {
+                    self.0.remove(k);
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -112,7 +112,7 @@ impl Page {
 
     fn one(&mut self, key: &str) -> u64 {
         let id = self.store.next_write_id();
-        self.store.put(key.as_bytes(), b"x");
+        self.store.put(key.as_bytes(), b"x").expect("the store took the write");
         id
     }
 
@@ -219,7 +219,7 @@ fn a_queued_write_sharing_a_key_with_a_refused_one_rolls_back_with_it_whole() {
                 (b"d/shared".to_vec(), Edit::Put(b"from B".to_vec())),
             ]).expect("the store took the write");
         } else {
-            p.store.put(b"d/shared", b"from B");
+            p.store.put(b"d/shared", b"from B").expect("the store took the write");
         }
         let c = p.one("d/elsewhere");
         p.pump();
@@ -262,7 +262,8 @@ fn a_write_too_large_to_send_is_refused_before_it_is_held_or_sent() {
     let frames_before = p.frames;
     let id = p.store.next_write_id();
     // Exactly the copy's bound: key + value = 4 MiB, which the copy allows.
-    p.store.put(key, &vec![7u8; 4 * 1024 * 1024 - key.len()]);
+    let r = p.store.put(key, &vec![7u8; 4 * 1024 * 1024 - key.len()]);
+    assert!(matches!(r, Err(Refused::TooLargeToSend { .. })), "the refusal was not returned: {r:?}");
     assert!(
         matches!(p.store.refused.last(), Some((rid, Refused::TooLargeToSend { bytes, limit })) if *rid == id && *bytes > *limit as u64),
         "not refused as too large to send: {:?}",
@@ -292,7 +293,7 @@ fn a_write_too_large_to_send_is_refused_before_it_is_held_or_sent() {
     let mut q = Page::new();
     let id = q.store.next_write_id();
     let wire_room = protocol::MAX_MESSAGE - 1024 - 64;
-    q.store.put(key, &vec![7u8; wire_room]);
+    q.store.put(key, &vec![7u8; wire_room]).expect("the store took the write");
     assert!(
         q.store.refused.is_empty(),
         "a write under the wire limit was refused: {:?}",

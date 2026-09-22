@@ -41,7 +41,7 @@ fn three_hundred_writes_all_land_when_each_is_published() {
     let mut s = store();
     for i in 0..300u64 {
         let id = s.next_write_id();
-        s.put(format!("d\0note\0{i:06}").as_bytes(), b"v");
+        s.put(format!("d\0note\0{i:06}").as_bytes(), b"v").expect("the store took the write");
         s.on_inbound(&verdict(&s, id, WriteState::Published));
     }
     assert!(
@@ -65,9 +65,8 @@ fn three_hundred_writes_all_land_when_each_is_published() {
 #[test]
 fn control_without_a_verdict_the_copy_fills_up_and_refuses() {
     let mut s = store();
-    for i in 0..300u64 {
-        s.put(format!("d\0note\0{i:06}").as_bytes(), b"v");
-    }
+    let returned = (0..300u64).filter(|i| s.put(format!("d\0note\0{i:06}").as_bytes(), b"v").is_err()).count();
+    assert_eq!(returned, s.refused.len(), "a refusal was reported but not returned (sdk#186)");
     assert!(
         !s.refused.is_empty(),
         "300 unacknowledged writes were all accepted, so the cap that makes \
@@ -85,7 +84,7 @@ fn a_row_goes_pending_then_clean_through_the_reply_path() {
     let mut s = store();
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
-    s.put(&key, b"v");
+    s.put(&key, b"v").expect("the store took the write");
     assert_eq!(s.row_state(&key), RowState::Pending);
 
     s.on_inbound(&verdict(&s, id, WriteState::Published));
@@ -104,7 +103,7 @@ fn busy_puts_the_row_back_in_the_queue() {
     let mut s = store();
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
-    s.put(&key, b"v");
+    s.put(&key, b"v").expect("the store took the write");
     s.on_inbound(&verdict(&s, id, WriteState::Busy));
     assert_eq!(s.row_state(&key), RowState::Queued);
 }
@@ -115,7 +114,7 @@ fn a_failed_verdict_gives_the_row_rolled_back() {
     let mut s = store();
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
-    s.put(&key, b"v");
+    s.put(&key, b"v").expect("the store took the write");
     s.on_inbound(&verdict(&s, id, WriteState::Failed));
     assert_eq!(
         s.row_state(&key),
@@ -133,7 +132,7 @@ fn a_verdict_for_an_unknown_write_changes_nothing_and_is_counted() {
     let mut s = store();
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
-    s.put(&key, b"v");
+    s.put(&key, b"v").expect("the store took the write");
     assert_eq!(s.row_state(&key), RowState::Pending);
 
     s.on_inbound(&verdict(&s, id + 999, WriteState::Published));
@@ -164,7 +163,7 @@ fn a_duplicate_published_is_harmless() {
     let mut s = store();
     let key = b"d\x00note\x00000001".to_vec();
     let id = s.next_write_id();
-    s.put(&key, b"v");
+    s.put(&key, b"v").expect("the store took the write");
     s.on_inbound(&verdict(&s, id, WriteState::Published));
     assert_eq!(s.row_state(&key), RowState::Clean);
 

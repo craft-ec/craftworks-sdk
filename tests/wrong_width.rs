@@ -36,11 +36,8 @@ struct Recorded {
     client: Client,
 }
 impl Store for Recorded {
-    fn put(&mut self, k: &[u8], v: &[u8]) {
-        self.inner.put(k, v)
-    }
-    fn delete(&mut self, k: &[u8]) -> bool {
-        self.inner.delete(k)
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, store::Edit)]) -> Result<(), craftworks_sdk::Refused> {
+        self.inner.apply_batch(edits)
     }
 }
 impl Reads for Recorded {

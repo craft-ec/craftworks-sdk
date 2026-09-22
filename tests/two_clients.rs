@@ -57,7 +57,7 @@ fn a_write_on_one_client_updates_the_others_list_without_polling() {
     let mut b = client(&node);
 
     // A seeds the list.
-    a.put(b"list/01", b"first");
+    a.put(b"list/01", b"first").expect("the store took the write");
 
     // B binds the range, LIVE, and asks to be told.
     let mut view = Binding::new(b"list/", b"list0", true);
@@ -74,7 +74,7 @@ fn a_write_on_one_client_updates_the_others_list_without_polling() {
     let before = view.snapshot();
 
     // A writes again. B does nothing but let its connection turn over.
-    a.put(b"list/02", b"second");
+    a.put(b"list/02", b"second").expect("the store took the write");
     let woken = pump(&mut b, &mut view);
 
     assert!(
@@ -110,7 +110,7 @@ fn a_non_live_binding_takes_no_subscription_and_is_still_correct() {
     let mut a = client(&node);
     let mut b = client(&node);
 
-    a.put(b"list/01", b"first");
+    a.put(b"list/01", b"first").expect("the store took the write");
 
     let mut view = Binding::new(b"list/", b"list0", false);
     view.reload(&mut b).expect("first read");
@@ -118,7 +118,7 @@ fn a_non_live_binding_takes_no_subscription_and_is_still_correct() {
     assert_eq!(view.sub_id(), None, "a non-live binding subscribed");
     assert_eq!(view.mode(), LiveMode::Manual);
 
-    a.put(b"list/02", b"second");
+    a.put(b"list/02", b"second").expect("the store took the write");
 
     // It is told nothing...
     let woken = pump(&mut b, &mut view);
@@ -151,14 +151,14 @@ fn a_live_binding_that_is_never_told_still_catches_up_on_its_tick() {
     let mut a = client(&node);
     let mut b = client(&node);
 
-    a.put(b"list/01", b"first");
+    a.put(b"list/01", b"first").expect("the store took the write");
     let mut view = Binding::new(b"list/", b"list0", true);
     let accepted = b.subscribe_range(7, b"list/", b"list0").expect("answered");
     view.note_subscribed(7, accepted);
     view.reload(&mut b).expect("first read");
 
     for i in 2..6u32 {
-        a.put(format!("list/{i:02}").as_bytes(), b"more");
+        a.put(format!("list/{i:02}").as_bytes(), b"more").expect("the store took the write");
         // Every notification DROPPED, as the node's full channel drops them.
         let dropped = b.take_events().len();
         let _ = dropped;
@@ -189,7 +189,7 @@ fn the_backstops_quiet_tick_reads_nothing() {
     let mut a = client(&node);
     let mut b = client(&node);
     for i in 0..8u32 {
-        a.put(format!("list/{i:02}").as_bytes(), b"v");
+        a.put(format!("list/{i:02}").as_bytes(), b"v").expect("the store took the write");
     }
     let mut view = Binding::new(b"list/", b"list0", true);
 
@@ -255,7 +255,7 @@ fn a_cold_writes_trace_shows_every_hop_and_the_client_times_it() {
         t.get()
     }));
 
-    a.put(b"list/01", b"first");
+    a.put(b"list/01", b"first").expect("the store took the write");
 
     let tr = a
         .trace(TraceOf::Write(1))
@@ -310,7 +310,7 @@ fn nothing_is_traced_until_a_client_asks() {
     use protocol::TraceOf;
     let node = testkit::FullNode::new();
     let mut a = client(&node);
-    a.put(b"list/01", b"first");
+    a.put(b"list/01", b"first").expect("the store took the write");
     assert!(
         a.trace(TraceOf::Write(1)).is_none(),
         "the engine emitted a call tree nobody asked for"
@@ -325,7 +325,7 @@ fn nothing_is_traced_until_a_client_asks() {
         "turning tracing on invented a trace for an operation that had \
          already finished"
     );
-    a.put(b"list/02", b"second");
+    a.put(b"list/02", b"second").expect("the store took the write");
     assert!(
         a.trace(TraceOf::Write(2)).is_some(),
         "tracing was turned on and the next write still produced nothing"
