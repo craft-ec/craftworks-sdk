@@ -1753,11 +1753,27 @@ impl Session {
                 })
             })
             .collect();
+        // sdk#225b: rows of a saved write that another device of the same
+        // identity replaced.
+        let superseded: Vec<serde_json::Value> = self
+            .db
+            .store_mut()
+            .take_superseded()
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "writeId": s.write_id,
+                    "keys": s.keys.iter().map(|k| hex(k)).collect::<Vec<_>>(),
+                    "line": "Your last save was replaced by your other device for these rows. Showing its version.",
+                })
+            })
+            .collect();
         serde_json::json!({
             "rolledBack": told.rolled_back.len(),
             "stalled": stalled.map(|s| format!("{s:?}")),
             "loadsInFlight": self.loads.in_flight(),
             "conflicts": conflicts,
+            "superseded": superseded,
         })
         .to_string()
     }

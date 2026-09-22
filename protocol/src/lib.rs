@@ -675,6 +675,19 @@ pub enum Reply {
         write_id: u64,
         key: Vec<u8>,
         current: Option<[u8; 32]>,
+    },    /// A PUBLISHED write whose value at some of its keys another device of
+    /// the same identity replaced (sdk#225b): the register's tie-break kept
+    /// the other device's head at this write's seq, and the merge could not
+    /// keep these `keys` (both sides changed them, or a read of this write's
+    /// changed there). The winner's values stand at them; the write stays
+    /// Published for the rest. `seq`/`root` name the head that won. From
+    /// `page::Server` to v4 (the same bundle, as [`Reply::Conflicted`]).
+    Superseded {
+        session: u64,
+        write_id: u64,
+        seq: u64,
+        root: [u8; 32],
+        keys: Vec<Vec<u8>>,
     },
 }
 
