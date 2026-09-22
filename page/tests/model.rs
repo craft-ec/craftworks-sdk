@@ -326,6 +326,9 @@ impl App {
     }
 }
 
+/// (page, write, the head it was told Published at, its key and value).
+type PublishedAt = (usize, u64, (u64, Cid), Option<(Vec<u8>, Vec<u8>)>);
+
 #[derive(Default, Debug)]
 struct Seen {
     published: usize,
@@ -336,7 +339,7 @@ struct Seen {
     landings: u32,
     most_landing_updates: u32,
     /// (page, write, the head it was told Published at).
-    published_at: Vec<(usize, u64, (u64, Cid), Option<(Vec<u8>, Vec<u8>)>)>,
+    published_at: Vec<PublishedAt>,
     /// Published writes whose head a same-seq WINNER later displaced, and
     /// whose value the final tree does not hold: the per-key merge (#225b)
     /// is what keeps them. Counted and named here, never silent.
@@ -518,9 +521,9 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                             // every OTHER page as `HeadChanged` — a hint, and
                             // a lossy one.
                             if node.head() != before {
-                                for j in 0..apps.len() {
+                                for (j, other) in apps.iter_mut().enumerate() {
                                     if j != f.page && !cfg.no_hints && !s_hint.chance(faults.hint_lost) {
-                                        apps[j].page.head_hint();
+                                        other.page.head_hint();
                                     }
                                 }
                             }
