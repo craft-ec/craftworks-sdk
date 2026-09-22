@@ -47,6 +47,7 @@ function fakeRaw() {
     outbound: () => [], sent() {},
     // The real one says whether the frame was its own (sdk#239); a fake's
     // delivery always is.
+    set_app() {}, // the app a session is (sdk forest ruling); a fake needs no namespace
     on_inbound() { if (ticket && !loaded) { loaded = true; ended.push({ id: ticket, ok: true, code: "LOADED" }); } return true; },
     unowned() {},
     reconnected() {}, take_progress: () => "[]", provision() {},
@@ -110,7 +111,7 @@ await t("a COLD SCAN resolves through sdk.open() and nothing else", async () => 
   const sdk = wrap(raw);
 
   // Exactly what a page does: one call, then read.
-  const { db, close } = await sdk.open({
+  const { db, close } = await sdk.open({ app: "test-app",
     port: 17509,   // NAMED. There is no default port, deliberately.
     // The artefacts are FETCHED by default — `wrap` binds this build's own,
     // which is the point. Here the fetch is faked, because the test is about
@@ -175,6 +176,7 @@ function watchingRaw() {
     scan() { scans += 1; return JSON.stringify([{ id: "a", title }]); },
     // The node's notification. Ours is taken; anything else is not this
     // session's (sdk#239) and is counted once, through `unowned`.
+    set_app() {}, // the app a session is (sdk forest ruling); a fake needs no namespace
     on_inbound(key) {
       if (key === "ours") { stale = [...bound]; return true; }
       // One of THIS client's own writes on `domain` changed state (the node's
@@ -269,7 +271,7 @@ await t("**a HeadChanged for OUR head re-runs a bound scan, with no app call**",
   const raw = watchingRaw();
   const sdk = wrap(raw);
   let deliver;
-  const { db } = await sdk.open({
+  const { db } = await sdk.open({ app: "test-app",
     port: 17509,
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: (session, { onEvent }) => {
@@ -297,7 +299,7 @@ await t("THE CONTROL: a notification for SOMEBODY ELSE'S contract re-runs nothin
   const raw = watchingRaw();
   const sdk = wrap(raw);
   let deliver;
-  const { db } = await sdk.open({
+  const { db } = await sdk.open({ app: "test-app",
     port: 17509,
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: (session, { onEvent }) => {
@@ -346,7 +348,7 @@ function pageOf(raw, extra = {}) {
   const clock = { body: null, stopped: false };
   const win = new Map(), doc = new Map();
   const conn = { pumps: 0, closed: false };
-  const opts = {
+  const opts = { app: "test-app",
     port: 17509,
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: () => ({ close() { conn.closed = true; }, pump() { conn.pumps += 1; } }),

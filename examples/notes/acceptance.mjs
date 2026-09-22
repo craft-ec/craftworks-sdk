@@ -102,6 +102,28 @@ try {
     await b.evaluate(`location.reload(); return 1;`);
     const after = await b.until(`const s = window.__notes?.notes?.getSnapshot() ?? []; return s.length === 49 && s.some(r => r.fields.text === "edited") ? s.length : null;`, 120_000, 1000);
     check(after === 49, `${path}: an update and a delete reach the second tab`, await b.evaluate(`return (window.__notes?.notes?.getSnapshot() ?? []).length;`));
+
+    // TWO APPS, ONE PERSON (the forest ruling): two other apps on this node
+    // stand on the SAME register — the person's one tree — and each has its
+    // own `notes`; the second cannot write the first's, and can read it.
+    const appUrl = id => `${url}&app=${id}`;
+    const x = await tab(debug), y = await tab(debug);
+    await x.evaluate(`location.href = ${JSON.stringify(appUrl("app-x"))}; return 1;`);
+    await y.evaluate(`location.href = ${JSON.stringify(appUrl("app-y"))}; return 1;`);
+    const bothUp = (await x.until(`return !!window.__notes;`, 120_000)) && (await y.until(`return !!window.__notes;`, 120_000));
+    if (!bothUp) { check(false, `${path}: two apps opened`, await x.evaluate(`return document.getElementById("status")?.textContent;`)); continue; }
+    await x.evaluate(`await window.__notes.db.put("notes", { text: "x1" }); await window.__notes.db.put("notes", { text: "x2" }); return 1;`);
+    await y.evaluate(`await window.__notes.db.put("notes", { text: "y1" }); return 1;`);
+    await x.until(`return window.__notes.saving() === 0;`, 120_000, 500);
+    await y.until(`return window.__notes.saving() === 0;`, 120_000, 500);
+    const heads = [await x.evaluate(`return window.__notes.head();`), await y.evaluate(`return window.__notes.head();`), await a.evaluate(`return window.__notes.head();`)];
+    check(heads[0] && heads[0] === heads[1] && heads[1] === heads[2], `${path}: two apps and the notes-example app stand on ONE register (the person's tree)`, heads.map(h => h?.slice(0, 12)));
+    const own = [await x.until(`const n = window.__notes.notes.getSnapshot().length; return n === 2 ? n : null;`, 60_000, 500), await y.until(`const n = window.__notes.notes.getSnapshot().length; return n === 1 ? n : null;`, 60_000, 500)];
+    check(own[0] === 2 && own[1] === 1, `${path}: each app sees only its OWN notes (app-x 2, app-y 1; notes-example's 49 in neither)`, own);
+    const cross = await y.evaluate(`try { await window.__notes.db.other("app-x").put("notes", { text: "intruder" }); return "WRITTEN"; } catch (e) { return e.code + ": " + e.message; }`);
+    check(/^REFUSED: read-only: `app-x` is another app's data/.test(cross), `${path}: app-y's write into app-x's space is refused by name`, cross);
+    const read = await y.evaluate(`try { return (await window.__notes.db.other("app-x").scan("notes")).map(r => r.fields.text).sort(); } catch (e) { return e.code + ": " + e.message; }`);
+    check(JSON.stringify(read) === JSON.stringify(["x1", "x2"]), `${path}: app-y READS app-x's notes (public by default), and only them`, read);
   }
 } catch (e) {
   failed += 1;

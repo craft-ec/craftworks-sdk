@@ -310,6 +310,28 @@ export function engineDb(handle) {
       return r;
     },
 
+    /**
+     * ANOTHER APP'S DATA in this person's tree, READ-ONLY (the forest ruling):
+     * public by default, and an app writes only its own. Reads take the
+     * absolute `@app/name` form the session resolves; every write is refused
+     * by name, never attempted.
+     */
+    other(app) {
+      if (!/^[a-z0-9_-]{1,32}$/.test(app ?? "")) throw new Error(`other(): \`${app}\` is not an app id (1–32 of a-z 0-9 _ -)`);
+      const abs = d => `@${app}/${d}`;
+      const refused = async () => {
+        throw new DbError({ code: "REFUSED", message: `read-only: \`${app}\` is another app's data, and an app writes only its own`, transient: false });
+      };
+      return {
+        schema: d => self.schema(abs(d)),
+        get: (d, id) => self.get(abs(d), id),
+        count: d => self.count(abs(d)),
+        scan: (d, o) => self.scan(abs(d), o),
+        children: (d, p, o) => self.children(abs(d), p, o),
+        define: refused, put: refused, createAt: refused, update: refused, delete: refused,
+      };
+    },
+
     // ---- reads: a NOT_LOADED queues a load, waits for it, asks once more ----
     schema:  domain  => once(() => JSON.parse(session.schema(domain))),
     domains: ()      => once(() => JSON.parse(session.domains())),

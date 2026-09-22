@@ -32,6 +32,7 @@ function engineRaw() {
   let pending = null;        // a delta the engine is holding, until asked
   const session = {
     url: () => "ws://127.0.0.1:17509/",
+    set_app() {}, // the app a session is (the forest ruling); a fake needs no namespace
     outbound: () => [], sent() {}, reconnected() {}, provision() {},
     take_progress: () => "[]", take_loads: () => "[]",
     provisioned: () => true, refused: () => "", exhausted: () => false, unusable: () => "[]",
@@ -79,7 +80,7 @@ function engineRaw() {
 async function openDb(raw) {
   const sdk = wrap(raw);
   let deliver;
-  const { db } = await sdk.open({
+  const { db } = await sdk.open({ app: "test-app",
     port: 17509,
     fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: (_s, { onEvent }) => {

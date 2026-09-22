@@ -17,7 +17,7 @@ function FakeSession({ after = 3, refuse = "", exhaust = false } = {}) {
   let polls = 0;
   return function () {
     return {
-      url: () => "ws://127.0.0.1:1/", outbound: () => [], sent() {}, on_inbound: () => true, unowned() {},
+      url: () => "ws://127.0.0.1:1/", outbound: () => [], sent() {}, on_inbound: () => true, unowned() {}, set_app() {},
       reconnected() {}, take_progress: () => "[]", take_loads: () => "[]", tick_ms: () => 1000, tick: () => "{}",
       unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {}, flush() {}, provision() {},
       provisioned: () => (polls += 1) > after && !refuse && !exhaust, refused: () => refuse, exhausted: () => exhaust,
@@ -26,7 +26,7 @@ function FakeSession({ after = 3, refuse = "", exhaust = false } = {}) {
   };
 }
 const deps = extra => ({
-  port: 7999, artefacts: { signer: "s", block: "b", register: "r" },
+  port: 7999, app: "test-app", artefacts: { signer: "s", block: "b", register: "r" },
   fetch: async () => ({ ok: true, arrayBuffer: async () => new Uint8Array([1]).buffer }),
   connect: () => ({ pump() {}, close() { deps.closed = (deps.closed ?? 0) + 1; } }),
   setInterval: () => 0, clearInterval() {}, setTimeout: tick, clearTimeout() {},

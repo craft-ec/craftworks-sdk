@@ -78,7 +78,7 @@ function fakeRaw() {
   let rows = [];
   const scan = () => JSON.stringify(rows);
   const session = {
-    url: () => "ws://127.0.0.1:17509/", outbound: () => [], sent() {}, reconnected() {}, provision() {},
+    url: () => "ws://127.0.0.1:17509/", outbound: () => [], sent() {}, reconnected() {}, provision() {}, set_app() {},
     take_progress: () => "[]", take_loads: () => "[]", provisioned: () => true, refused: () => "",
     exhausted: () => false, unusable: () => "[]",
     tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }), tick_ms: () => 7777, unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {},
@@ -95,7 +95,7 @@ function fakeRaw() {
 }
 const backends = {
   "in-tab (wrap.js)": async raw => new (wrap(raw).Db)(),
-  "engine (engine-db.js)": async raw => (await wrap(raw).open({
+  "engine (engine-db.js)": async raw => (await wrap(raw).open({ app: "test-app",
     port: 17509, fetch: async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }),
     connect: () => ({ close() {}, pump() {} }), setInterval: () => 1, clearInterval: () => {},
   })).db,

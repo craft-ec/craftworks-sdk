@@ -41,10 +41,15 @@ try {
   // ONE CALL: connect, provision the node if it needs it, and hand back a db.
   // "saving N…" comes from the session, which counts every write not yet
   // published — closing the tab before 0 would lose them.
-  const { db } = await sdk.open({
+  // THE APP this is. A person has one tree, divided by app: `notes` here
+  // is this app's own, and no other app can write it.
+  const app = params.get("app") ?? "notes-example";
+  const handle = await sdk.open({
+    app,
     port,
     onEvent: e => { if (e.kind === "saving") { saving = e.count; render(); } },
   });
+  const { db } = handle;
   await db.define("notes", { type: "Note", fields: [{ name: "text", kind: "text", required: true }] });
 
   // A BINDING: the list re-reads by itself when the data changes.
@@ -78,7 +83,7 @@ try {
     await db.put("notes", { text });
   };
   // The acceptance seam: the tools read the db through this.
-  globalThis.__notes = { db, notes, saving: () => saving };
+  globalThis.__notes = { db, notes, saving: () => saving, head: () => handle.headId() };
   render();
 } catch (e) {
   say(`Could not open: ${e.message}`, true);
@@ -86,7 +91,7 @@ try {
 ```
 
 What it relies on, and what each part is for:
-- **`sdk.open({ port })`** connects, provisions the node if it needs it, and hands back a db. There's no default port: which node gets your key is a decision.
+- **`sdk.open({ app, port })`** connects, provisions the node if it needs it, and hands back a db once it's ready. There's no default port: which node gets your key is a decision. `app` is required: a person has one tree, divided by app, and every name an app uses (`notes`) is its own. It can't write another app's data. `db.other(app)` reads another app's data, read-only.
 - **`onEvent` `saving`** counts every write not yet published. Show "saving N…" until 0; closing the tab before then would lose them.
 - **`db.define`** gives a collection its schema, once. **`db.bind`** gives a list that re-reads itself when the data changes.
 - **`db.put` / `db.update` / `db.delete`** are the writes; each is published to the node.

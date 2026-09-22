@@ -5,6 +5,7 @@
 //! Every capability is written once in Rust and exposed to JavaScript from
 //! [`js`], so the builder and apps get it the phase it lands.
 
+pub mod app;
 pub mod binding;
 pub mod blockid;
 pub mod cached_store;
