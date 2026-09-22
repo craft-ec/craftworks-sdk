@@ -148,6 +148,9 @@ pub struct Session {
     /// PUTs of contracts the APP names (`put_contract`, builder#104), and
     /// what the node said about each — matched by the key it names.
     puts: wire::puts::Puts,
+    /// A VIEW of somebody's published head (`open_named`, sdk#239): reads
+    /// only, and every write refused before it reaches the store.
+    read_only: bool,
 }
 
 #[wasm_bindgen]
@@ -198,6 +201,7 @@ impl Session {
             cold_chosen: false,
             page_mode: false,
             puts: wire::puts::Puts::default(),
+            read_only: false,
             signer_code: Vec::new(),
             page: None,
             page_identity_sent: false,
@@ -236,21 +240,28 @@ impl Session {
     /// moved, an ack for the step being provisioned, a refusal, a chunk of
     /// something larger, or something this build cannot use — which is
     /// counted rather than ignored.
-    pub fn on_inbound(&mut self, bytes: &[u8]) {
+    ///
+    /// Returns whether the frame was THIS session's. One socket carries a
+    /// person's own session and every tree they read (`tree`, sdk#239); each
+    /// is offered every frame and takes only what it asked for. A frame no
+    /// session takes is counted once, with [`Session::unowned`].
+    pub fn on_inbound(&mut self, bytes: &[u8]) -> bool {
         // PAGE MODE: every node frame is the page executor's (page-io); there
         // is no engine delegate to hear from.
         if self.page_mode {
-            if let Some(p) = self.page.as_mut() {
-                p.inbound(bytes, page::Ms(crate::js_now_ms()));
-            }
+            let owned = match self.page.as_mut() {
+                Some(p) => p.inbound(bytes, page::Ms(crate::js_now_ms())),
+                None => false,
+            };
             self.pump_page();
-            return;
+            return owned;
         }
         match wire::unframe(&mut self.frames, bytes) {
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
                     self.on_engine_reply(m);
                 }
+                true
             }
             Incoming::Ack(kind) => self.on_ack(kind),
             // A refused PUT naming its contract: the app's, if it is one of
@@ -260,6 +271,7 @@ impl Session {
                     self.db.store_mut().client.frame_refused();
                     self.plan.on_refused(&said);
                 }
+                true
             }
             Incoming::Refused(why) => {
                 // A refused frame will never run: the refusal is its answer
@@ -269,6 +281,7 @@ impl Session {
                 // it: the node chose it, and a reason that steers control flow
                 // is an input from a stranger.
                 self.plan.on_refused(&why.said);
+                true
             }
             Incoming::HeadChanged { key } => {
                 // ONLY for the head this session asked to watch.
@@ -283,10 +296,13 @@ impl Session {
                 // as 32 bytes and the client API names contracts as strings;
                 // rendering ours the same way is the only comparison that is
                 // about the same thing.
+                // Somebody else's head is another session's on this socket,
+                // or nobody's — counted then, once (`unowned`).
                 if self.subscribed && !self.head_named.is_empty() && key == self.head_named {
                     self.head_moved = true;
+                    true
                 } else {
-                    self.foreign_notifications += 1;
+                    false
                 }
             }
             // The page's own cold GETs (`pump_cold`): matched to the block
@@ -302,8 +318,10 @@ impl Session {
                     // 1 s tick (the one gap left; the owner's to rule on).
                     self.cold.tick(now);
                     self.pump_cold();
+                    true
                 }
-                None => self.unusable.push("a GET answer this session never asked for".to_string()),
+                // Another session's on this socket, or nobody's (`unowned`).
+                None => false,
             },
             Incoming::GetFailed { id } => match self.cold_block(id) {
                 Some(block) => {
@@ -311,12 +329,23 @@ impl Session {
                     self.cold.refused(block, now);
                     self.cold.tick(now);
                     self.pump_cold();
+                    true
                 }
-                None => self.unusable.push("a GET refusal for a contract this session never asked for".to_string()),
+                None => false,
             },
-            Incoming::Unusable(why) => self.unusable.push(format!("{why:?}")),
-            Incoming::Partial => {}
+            Incoming::Unusable(why) => {
+                self.unusable.push(format!("{why:?}"));
+                true
+            }
+            Incoming::Partial => true,
         }
+    }
+
+    /// A node frame NO session on this socket asked for (`on_inbound` said
+    /// no, for every one). Counted, never silently dropped: the node chooses
+    /// what it sends, and the count says whether it is happening at all.
+    pub fn unowned(&mut self) {
+        self.foreign_notifications += 1;
     }
 
     /// One protocol reply for this session's store — from the engine
@@ -410,29 +439,30 @@ impl Session {
         self.db.store_mut().on_inbound(&m);
     }
 
-    fn on_ack(&mut self, kind: AckKind) {
+    fn on_ack(&mut self, kind: AckKind) -> bool {
         // The subscribe ack is matched by the KEY IT NAMES, never by
         // position. Both acks arrive on one connection with no correlation
         // id, so pairing by order would let a delegate registration confirm
         // a subscription that was never accepted — which is harness#38's
         // shape, and it has already been made once in this file.
         if let AckKind::Subscribed(key) = &kind {
+            // Another session's subscription on this socket, or nobody's.
             if *key == self.head_named && !self.head_named.is_empty() {
                 self.watching = true;
-            } else {
-                self.foreign_notifications += 1;
+                return true;
             }
-            return;
+            return false;
         }
         // An app's PUT, by the key the ack names — before the plan, which
         // would otherwise take it for a provisioning step's.
         if let AckKind::Put(key) = &kind {
             if self.puts.acked(key) {
-                return;
+                return true;
             }
         }
         self.plan.on_ack(&kind);
         self.note_progress();
+        true
     }
 
     /// Record any steps the plan completed since this was last asked.
@@ -1121,6 +1151,11 @@ impl Session {
     /// already-provisioned node never calls this and never sends a byte of
     /// contract code.
     pub fn provision(&mut self, delegate: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
+        // A VIEW installs nothing on the node it reads from (sdk#239).
+        if self.read_only {
+            self.unusable.push(format!("{READ_ONLY}: provisioning refused"));
+            return;
+        }
         if self.page_mode {
             self.provision_page(block, register);
             return;
@@ -1272,6 +1307,61 @@ impl Session {
         Ok(key)
     }
 
+    /// Open a VIEW of somebody's PUBLISHED head (sdk#239): the Register whose
+    /// instance id is `register_id` (hex, as [`Session::head_id`] gives it on
+    /// the publisher's session). Published data is readable by default;
+    /// writing is access control, which a view does not have.
+    ///
+    /// Instead of `provision`: the in-page engine (page mode) reads that head
+    /// and its blocks through page-io's READER — no signer, nothing installed
+    /// or registered on this node — and every write is refused before it
+    /// reaches the store ([`Session::read_only`]).
+    ///
+    /// `range` (1..=255): this reader's stream-id range on the shared socket,
+    /// one per open tree.
+    pub fn open_named(&mut self, block_code: Vec<u8>, register_id: &str, range: u8) -> Result<(), JsValue> {
+        let bad = || JsValue::from_str("open_named: a register id is 64 hex characters");
+        if register_id.len() != 64 || !register_id.is_ascii() {
+            return Err(bad());
+        }
+        let mut id = [0u8; 32];
+        for (i, b) in id.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&register_id[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+        }
+        if self.page.is_some() || self.artefacts.is_some() {
+            return Err(JsValue::from_str("open_named: this session is already open on its own head"));
+        }
+        self.page_mode = true;
+        self.read_only = true;
+        let server = page::server::Server::new(
+            page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
+            page::server::SignerFacts::default(),
+        );
+        self.cold_chosen = true;
+        self.switch_cold(false, Vec::new());
+        self.page = Some(page_io::PageIo::reader(server, block_code, id, range));
+        self.pump_page();
+        self.envelope_engine_requests();
+        Ok(())
+    }
+
+    /// This session is a VIEW (`open_named`): nothing can be written. What a
+    /// runtime renders from — a view shows no inputs.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The head this session stands on, as `open_named` takes it: the head
+    /// Register's instance id in hex, or empty until `Identity` has named it.
+    /// What a publisher records so a view can open the same head.
+    pub fn head_id(&self) -> String {
+        if self.head_id == [0u8; 32] {
+            String::new()
+        } else {
+            self.head_id.iter().map(|b| format!("{b:02x}")).collect()
+        }
+    }
+
     /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
     /// `{"state":"none"|"pending"|"put"|"refused"|"unanswered","said":"…"}`.
     /// `said` is the node's own words for a refusal: display only.
@@ -1303,6 +1393,17 @@ impl Session {
     pub fn define(&mut self, domain: &str, schema: &str) -> Result<(), JsValue> {
         let s: craftworks_sdk::Schema =
             serde_json::from_str(schema).map_err(|e| db_err(&DbError::Refused(e.to_string())))?;
+        // A VIEW defines nothing: a definition identical to the published
+        // one is a no-op (an app defines its domains on open, and a view runs
+        // the same app); any other is a write, refused. The schema is READ
+        // through the same decision, so an unloaded one parks, never "none".
+        if self.read_only {
+            let r = self.db.schema(domain).and_then(|old| match old {
+                Some(o) if o == s => Ok(()),
+                _ => Err(DbError::Refused(format!("{READ_ONLY}: `{domain}` is not defined like that here"))),
+            });
+            return self.decided(r);
+        }
         let r = self.db.define(domain, &s);
         self.decided(r)
     }
@@ -1318,6 +1419,7 @@ impl Session {
     }
 
     pub fn put(&mut self, domain: &str, fields: &str) -> Result<String, JsValue> {
+        self.writable()?;
         let f = fields_of(fields)?;
         let r = self.db.put(domain, &f);
         json_of(self.decided(r)?)
@@ -1328,6 +1430,7 @@ impl Session {
     /// parked `NotLoaded` like any read — never taken for absent, which in a
     /// fresh session would write over the published record.
     pub fn create_at(&mut self, domain: &str, slot: &str, fields: &str) -> Result<String, JsValue> {
+        self.writable()?;
         let f = fields_of(fields)?;
         let s = rkey_of(slot)?;
         let r = self.db.create_at(domain, s, &f);
@@ -1335,6 +1438,7 @@ impl Session {
     }
 
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
+        self.writable()?;
         let p = fields_of(patch)?;
         let k = loc_of(id)?;
         let r = self.db.update(domain, k, &p);
@@ -1356,6 +1460,7 @@ impl Session {
     }
 
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
+        self.writable()?;
         let k = loc_of(id)?;
         let r = self.db.delete(domain, k);
         self.decided(r)
@@ -1701,6 +1806,20 @@ const PRELOAD_REQ_BASE: u64 = 1 << 32;
 
 /// A `DbError` as JavaScript sees it: a stable `code` and a message that is
 /// for a person to read, never for code to branch on.
+/// What every refusal of a view says first.
+const READ_ONLY: &str = "read-only: this is a view of somebody's published data, and writing needs write access";
+
+impl Session {
+    /// A view refuses every write, before it reaches the store: the safety
+    /// net under a runtime that renders a view with no inputs at all.
+    fn writable(&self) -> Result<(), JsValue> {
+        if self.read_only {
+            return Err(db_err(&DbError::Refused(READ_ONLY.into())));
+        }
+        Ok(())
+    }
+}
+
 fn db_err(e: &DbError) -> JsValue {
     let o = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&o, &"code".into(), &e.code().into());

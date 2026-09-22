@@ -5,8 +5,9 @@
 //!
 //! `node_answers <code> <params> <state> <cause> [frame…]`, every argument
 //! but `cause` in hex. Prints one JSON object:
-//! `{"key", "ack", "refusal", "frames": [{"op", "key", "state"}]}` — the ack
-//! and the refusal hex-encoded as the node sends them, each frame decoded.
+//! `{"key", "ack", "refusal", "got", "frames": [{"op", …}]}` — the PUT's ack
+//! and refusal and a GET answer, hex-encoded as the node sends them, and each
+//! frame decoded.
 
 use freenet_stdlib::client_api::{ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, ErrorKind, HostResponse, RequestError};
 
@@ -32,6 +33,12 @@ fn main() {
     }))
     .into();
     let refusal = bincode::serialize(&Err::<HostResponse, ClientError>(refusal)).expect("encodes");
+    // A GET answer for this contract: what a page that never asked for it
+    // must leave to whoever did.
+    let got = bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::ContractResponse(
+        ContractResponse::GetResponse { key: c.key(), contract: None, state: freenet_stdlib::prelude::WrappedState::new(unhex(&a[2])) },
+    )))
+    .expect("encodes");
     let frames: Vec<String> = a[4..]
         .iter()
         .map(|f| match bincode::deserialize::<ClientRequest>(&unhex(f)) {
@@ -40,14 +47,22 @@ fn main() {
                 contract.key().id().encode(),
                 hex(state.as_ref())
             ),
+            Ok(ClientRequest::ContractOp(ContractRequest::Get { key, subscribe, .. })) => {
+                format!(r#"{{"op":"get","key":"{}","subscribe":{subscribe}}}"#, key.encode())
+            }
+            Ok(ClientRequest::ContractOp(ContractRequest::Update { key, .. })) => {
+                format!(r#"{{"op":"update","key":"{}"}}"#, key.id().encode())
+            }
+            Ok(ClientRequest::DelegateOp(_)) => r#"{"op":"delegate"}"#.to_string(),
             Ok(other) => format!(r#"{{"op":"{}"}}"#, format!("{other:?}").split(['(', ' ', '{']).next().unwrap_or("?")),
             Err(_) => r#"{"op":"undecodable"}"#.to_string(),
         })
         .collect();
     println!(
-        r#"{{"key":"{key}","ack":"{}","refusal":"{}","frames":[{}]}}"#,
+        r#"{{"key":"{key}","ack":"{}","refusal":"{}","got":"{}","frames":[{}]}}"#,
         hex(&ack),
         hex(&refusal),
+        hex(&got),
         frames.join(",")
     );
 }
