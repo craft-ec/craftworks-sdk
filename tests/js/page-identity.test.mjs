@@ -48,7 +48,7 @@ await t("**the signer names a Register: the page opens IT, provisions nothing, a
     assert.equal(s.provisioned(), true, "the named Register was not opened");
     // NOTHING UNUSABLE after several pumps: a page that kept trying to mint
     // (and was stopped a layer down) would report itself unusable for ever.
-    assert.deepEqual(settled(s), [], `the ${_} is unusable`);
+    assert.deepEqual(settled(s), [], `${_} is unusable`);
     heads.push(s.head_id());
   }
   assert.ok(heads[0].length === 64 && heads[0] === heads[1], `the reload and the second tab stand on ${heads}`);

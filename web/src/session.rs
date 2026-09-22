@@ -1160,7 +1160,15 @@ impl Session {
 
     /// Messages this build could not use, by reason.
     pub fn unusable(&self) -> String {
-        serde_json::to_string(&self.unusable).unwrap_or_else(|_| "[]".into())
+        // AND page-io's, in page mode: what the page's own I/O could not use
+        // (a refused provisioning, a frame it could not make, a mint it was
+        // stopped from) is this session's to report. Kept apart, it was
+        // invisible — core dev's M254 minted on every pump and nothing showed.
+        let mut all = self.unusable.clone();
+        if let Some(p) = self.page.as_ref() {
+            all.extend(p.unusable().iter().cloned());
+        }
+        serde_json::to_string(&all).unwrap_or_else(|_| "[]".into())
     }
 
     /// The artefacts to provision with, as the page fetched them.
