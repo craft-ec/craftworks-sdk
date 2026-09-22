@@ -66,6 +66,19 @@ if [ ! -f "$contracts/build/webapp.wasm" ]; then
   echo "no webapp.wasm in $contracts/build (freenet-contracts epoch 2 or later)" >&2
   exit 1
 fi
+# THE XZ IS PINNED, as the contracts pin wasm-opt: the container's ADDRESS is
+# a hash of xz's exact output, and xz's output can differ between versions.
+# Every builder builds this SDK from its own checkout, so an unpinned xz would
+# give two machines two addresses for one SDK rev — no sharing between their
+# apps, and a build that does not reproduce. A different xz is refused, not
+# warned about.
+WANT_XZ=${WANT_XZ_OVERRIDE_FOR_TEST:-5.8.3}
+got_xz=$(xz --version 2>/dev/null | head -1 | awk '{print $NF}')
+if [ "$got_xz" != "$WANT_XZ" ]; then
+  echo "xz $got_xz, expected $WANT_XZ: the artefacts container's address is a hash of xz's output," >&2
+  echo "  so a different xz publishes a different address for the same SDK rev. Install xz $WANT_XZ." >&2
+  exit 1
+fi
 cargo build -q --release -p wire --bin artefacts-container
 container_tool=target/release/artefacts-container
 container_json=$("$container_tool" pkg/web "$contracts/build/webapp.wasm" pkg/web/artefacts.webapp)
