@@ -36,11 +36,10 @@ fn unread_key(fx: &[Effect]) -> Option<Vec<u8>> {
     })
 }
 
-/// A recovered engine over a fresh store.
+/// A recovered engine, through the engine tests' fixture (it tells a fresh
+/// engine its tree is new).
 fn recovered() -> Engine<Store> {
-    let mut e = Engine::new(Params::default(), Store::fresh());
-    let _ = e.step(Event::HeadMissing);
-    e
+    common::new_store_params(Params::default())
 }
 
 /// **A key written and not read is refused AT THE DOOR, naming it, and the
@@ -70,21 +69,9 @@ fn a_write_with_no_reads_is_refused() {
     assert_eq!(unread_key(&fx).as_deref(), Some(&b"k/a"[..]));
 }
 
-/// **Before the head: Unread, never Accepted** — the door comes before the
-/// pre-head park, which answers Accepted at once (core dev's stated rule). And
-/// nothing is parked: recovering the head releases nothing for it.
-#[test]
-fn before_the_head_an_unread_write_is_refused_not_parked() {
-    let mut e = Engine::new(Params::default(), Store::fresh());
-    let fx = e.step(write(1, vec![("k/a", Op::Put(b"1".to_vec()))], vec![]));
-    assert_eq!(told(&fx, 1), vec![State::Unread], "a write before the head was not judged at the door: {fx:?}");
-    let released = e.step(Event::HeadMissing);
-    assert!(told(&released, 1).is_empty(), "a refused write was parked and released on the head: {released:?}");
-    // THE CONTROL: a write that read its key, before the head, IS parked.
-    let mut f = Engine::new(Params::default(), Store::fresh());
-    let parked = f.step(write(1, vec![("k/a", Op::Put(b"1".to_vec()))], vec![("k/a", Expect::Absent)]));
-    assert_eq!(told(&parked, 1), vec![State::Accepted], "THE CONTROL: a write that read its key was not parked");
-}
+// Before the head: see testkit/tests/writes_within_reads_before_the_head.rs —
+// an engine that has not read its head is a PAGE that has not asked
+// `Identity`, which the testkit fixture builds (fixture-gate).
 
 /// **During a commit: Unread, never Busy** — the door comes before Busy, so
 /// a malformed write is refused in the same words whatever the engine is doing.
