@@ -1480,7 +1480,7 @@ impl Session {
             .take_unread()
             .into_iter()
             .map(|u| {
-                let key = u.key.as_deref().map(hex);
+                let key = u.key.as_deref().map(craftworks_sdk::hex);
                 let line = format!(
                     "The app's SDK wrote {} without reading it first, so {} change{} {} not saved. This is a bug in the SDK, not something you did.",
                     key.as_deref().map(|k| format!("key {k}")).unwrap_or_else(|| "a key".into()),
