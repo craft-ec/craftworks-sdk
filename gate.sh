@@ -236,7 +236,10 @@ if [ -f "$BASELINE" ]; then
   while IFS='=' read -r k _; do
     [ -n "$k" ] || continue
     [ "$k" = "npm" ] && continue
-    echo "$MEMBERS" | grep -qx "$k" || fail "$k is in $BASELINE but is no longer a workspace member"
+    # No pipe (sdk#138): under pipefail, `echo | grep -q` can report FAILURE
+    # exactly when the match succeeds — grep exits on the first match and
+    # echo takes SIGPIPE (5 misfires in 3000 at load ~10, reproduced).
+    grep -qx -- "$k" <<< "$MEMBERS" || fail "$k is in $BASELINE but is no longer a workspace member"
   done < "$BASELINE"
 fi
 
