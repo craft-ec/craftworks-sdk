@@ -96,10 +96,16 @@ await t("**the in-tab db holds the SAME name rule as a Session: 32 is a name, 33
   await db.put(ok, { n: 1 });
   assert.equal((await db.scan(ok)).length, 1, "THE CONTROL: a 32-character name writes and scans");
   await assert.rejects(() => db.define(long, schema), e => e.message.includes(`domain \`${long}\` must be 1–32`), "a 33-character name was not refused in the node's words");
-  // And a Session with an app at the longest id takes the longest name.
+  // And a Session with an app at the LONGEST id: its longest name passes the
+  // name rule and reaches the store — which, holding nothing loaded, answers
+  // NOT_LOADED. That answer is the proof: a name refusal comes first.
   const s = new Session(7999);
   s.set_app("a".repeat(32));
-  s.define(ok, JSON.stringify(schema));
+  const got = (() => { try { s.define(ok, JSON.stringify(schema)); return null; } catch (e) { return e; } })();
+  assert.ok(!got || got.code === "NOT_LOADED", `a 32-character name at a 32-character app id was refused: ${JSON.stringify(got)}`);
+  const past = (() => { try { s.define(long, JSON.stringify(schema)); return null; } catch (e) { return e; } })();
+  assert.ok(past && /domain `n{33}` must be 1–32/.test(past.message), `a 33-character name was not refused in the node's words: ${JSON.stringify(past)}`);
+  assert.ok(!past.message.includes("aaaa."), `the refusal names the PREFIXED name: ${past.message}`);
 });
 
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }
