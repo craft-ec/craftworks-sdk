@@ -93,6 +93,16 @@ pub struct CachedStore {
     /// Conflicts this client was told of, for the app: drained by
     /// [`CachedStore::take_conflicts`].
     conflicts: Vec<Conflicted>,
+    /// Superseded rows this client was told of (sdk#225b), for the app.
+    superseded: Vec<Superseded>,
+}
+
+/// A Published write whose `keys` another device of the same identity
+/// replaced (sdk#225b): those rows show the winner's values now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Superseded {
+    pub write_id: u64,
+    pub keys: Vec<Vec<u8>>,
 }
 
 /// A write that did not apply because a key it READ had moved (M2): which
@@ -122,6 +132,11 @@ impl CachedStore {
         std::mem::take(&mut self.conflicts)
     }
 
+    /// Superseded rows told since the last call (sdk#225b).
+    pub fn take_superseded(&mut self) -> Vec<Superseded> {
+        std::mem::take(&mut self.superseded)
+    }
+
     /// Forget a key in the copy: the next read fetches what the TREE holds.
     fn forget_key(&mut self, key: &[u8]) {
         self.copy.forget_key(key);
@@ -141,6 +156,7 @@ impl CachedStore {
             unheard: std::collections::BTreeMap::new(),
             reads_of: std::collections::BTreeMap::new(),
             conflicts: Vec::new(),
+            superseded: Vec::new(),
         }
     }
 
@@ -286,6 +302,18 @@ impl CachedStore {
             // exactly what is known stale here, often the SCHEMA, which no
             // rolled-back write names (the architect's #1) — and the app is
             // told. Only this session's.
+            // SUPERSEDED (sdk#225b): another device's head won, and these keys
+            // of a Published write hold ITS values now. Forget them (the copy's
+            // base is this tab's value, which the tree no longer holds) and
+            // tell the app which rows.
+            if let protocol::Reply::Superseded { session, write_id, keys, .. } = &r {
+                if self.client.session() == Some(*session) {
+                    for k in keys {
+                        self.forget_key(k);
+                    }
+                    self.superseded.push(Superseded { write_id: *write_id, keys: keys.clone() });
+                }
+            }
             if let protocol::Reply::Conflicted { session, write_id, key, current } = &r {
                 if self.client.session() == Some(*session) {
                     self.forget_key(key);

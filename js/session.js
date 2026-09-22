@@ -373,6 +373,8 @@ export async function openSession(Session, {
     // M2 (sdk#148): a write refused because what it READ had moved. The row
     // is rolled back and shows the current version; this says why.
     for (const c of report.conflicts ?? []) onEvent({ kind: "conflict", ...c });
+    // sdk#225b: rows of a saved write that another device replaced.
+    for (const s of report.superseded ?? []) onEvent({ kind: "superseded", ...s });
     const done = JSON.parse(session.take_progress());
     for (const step of done) onEvent({ kind: "provisioned", step });
     // The tick is also where a load that nobody answered is given up on, so

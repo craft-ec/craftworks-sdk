@@ -1163,6 +1163,12 @@ impl Page {
         }
     }
 
+    /// The register as this page last READ it (any head answer), whole —
+    /// what a merge reads a winner's `prev` from (sdk#225b).
+    pub fn last_read(&self) -> Option<&HeadRead> {
+        self.last_head.as_ref()
+    }
+
     /// The signer answering this page predates sdk#225's rule (a stale
     /// bundle: in page mode the signer's code ships with the page), and it
     /// refuses every sign until the register moves on. The host asks for the

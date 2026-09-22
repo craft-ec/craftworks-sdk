@@ -240,3 +240,19 @@ fn the_shell_tells_a_stale_commit_failed_never_conflict() {
     assert!(!states.contains(&protocol::WriteState::Conflict), "the Shell told Conflict: {states:?}");
     assert!(!replies.iter().any(|r| matches!(r, protocol::Reply::Conflicted { .. })), "the Shell sent Conflicted");
 }
+
+/// main's condition on the new replies: the Shell (the delegate path, where an
+/// OLDER v4 build may be listening) NEVER produces `Reply::Superseded` or
+/// `Reply::Conflicted` — only page::Server does, which serves its own bundle.
+/// Read from the source, with a control that must find the Shell's real reply
+/// producer, so an empty read cannot pass.
+#[test]
+fn the_shell_never_produces_superseded_or_conflicted() {
+    let shell = include_str!("../engine-delegate/src/shell.rs");
+    assert!(shell.contains("protocol::Reply::SessionWriteState {"), "control: the Shell's own reply producer was not found — the read is empty");
+    for new in ["Reply::Superseded", "Reply::Conflicted"] {
+        assert!(!shell.contains(new), "the Shell produces {new}, which an older v4 build would drop");
+    }
+    let server = include_str!("../page/src/server.rs");
+    assert!(server.contains("protocol::Reply::Superseded {") && server.contains("protocol::Reply::Conflicted {"), "page::Server no longer produces them: this test is about nothing");
+}

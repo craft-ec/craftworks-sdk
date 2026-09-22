@@ -131,6 +131,28 @@ impl Node {
         engine_delegate::register::head_of(st)
     }
 
+    /// Every entry of the tree at `root`, or `None` if a block is missing.
+    fn tree(&self, root: &Cid) -> Option<BTreeMap<Vec<u8>, Vec<u8>>> {
+        use freenet_prolly::range::{range, read_value, Range};
+        use std::ops::Bound;
+        let mut out = BTreeMap::new();
+        let mut after = None;
+        loop {
+            let r = Range { lo: Bound::Unbounded, hi: Bound::Unbounded, reverse: false, after: after.clone(), max_entries: 4096, max_bytes: usize::MAX };
+            let page = range(self, root, &r).ok()?;
+            if !page.need.is_empty() {
+                return None;
+            }
+            for (k, v) in &page.entries {
+                out.insert(k.clone(), read_value(self, *v).ok()?.to_vec());
+            }
+            if page.finished() {
+                return Some(out);
+            }
+            after = page.next.clone();
+        }
+    }
+
     /// The head WHOLE, as page-io reads it off the node: seq and value.
     fn head_read(&self) -> Option<page::HeadRead> {
         page::HeadRead::from_record(self.register.as_deref()?)
@@ -859,4 +881,159 @@ fn a_schema_changed_elsewhere_conflicts_on_the_schema_key_and_forgets_it() {
         matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &key), Err(craftworks_sdk::store::StoreError::NotLoaded)),
         "the rolled-back record still shows its unsaved value"
     );
+}
+
+/// ANOTHER DEVICE'S TREE holding exactly `entries`, built by a fresh page from
+/// the genesis; its blocks go onto the node. Returns its root.
+fn device_tree(node: &mut Node, entries: &[(Vec<u8>, Vec<u8>)]) -> Cid {
+    use engine::{ClientId, Op as WriteOp, WriteId};
+    let mut p = Page::new(Params::default(), PutPath::Page);
+    p.write(ClientId(9), WriteId(1), entries.iter().map(|(k, v)| (k.clone(), WriteOp::Put(v.clone()))).collect());
+    for _ in 0..50 {
+        for op in p.take_ops() {
+            match op {
+                Op::ReadHead => p.answer(Answer::Head(None), Ms(1)),
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    p.answer(Answer::PutOk(id), Ms(1));
+                }
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(1)),
+                Op::Sign { root, .. } => return root,
+                _ => {}
+            }
+        }
+    }
+    panic!("the other device's page never asked to sign");
+}
+
+/// sdk#225b through the page path: a tab publishes a record; ANOTHER DEVICE of
+/// the same identity lands a head on the register (signed with the same key, as
+/// two devices are until #226); the tab reads it on the node's hint and adopts
+/// it (#225a). What it is TOLD depends on the winner's `prev` and contents:
+/// * a same-seq winner that lacks the record → `Superseded` naming the record's
+///   key, and the tab's copy forgets it (NotLoaded: the next read fetches the
+///   winner's value);
+/// * a winner whose prev IS the tab's tip (they built on it) → nothing;
+/// * a winner two commits deep whose tree holds exactly the tab's value → nothing
+///   (the architect's false-Superseded case: probed, equal, kept).
+#[test]
+fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
+    use signer_proto::head::{value, Ledger};
+    for case in ["same-seq, record lost", "built on the tip", "two deep, record kept"] {
+        let mut node = Node::new();
+        let mut rig = PageRig::new();
+        let mut tab = Tab::open(&mut rig, &mut node);
+        tab.db.define("t", &tab_schema()).expect("define");
+        tab.pump(&mut rig, &mut node);
+        let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+        tab.pump(&mut rig, &mut node);
+        let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
+        let key = craftworks_sdk::db::record_key("t", loc);
+        let (tip_seq, tip_root) = node.head().expect("the tab published");
+        let tip_tree = node.tree(&tip_root).expect("the tip is whole");
+        let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+        let (seq, root, prev) = match case {
+            "same-seq, record lost" => {
+                // The other device's commit at the tip's seq, built on the
+                // tip's prev, WITHOUT the record — and winning the tie-break.
+                let hr = node.head_read().expect("a head");
+                let base = hr.prev().expect("the tip has a prev");
+                let mut salt = 0u8;
+                loop {
+                    let r = device_tree(&mut node, &[(b"other".to_vec(), vec![salt])]);
+                    let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
+                    if page::beats(&v, hr.value()) {
+                        break (tip_seq, r, Some(base));
+                    }
+                    salt += 1;
+                }
+            }
+            "built on the tip" => (tip_seq + 1, device_tree(&mut node, &[(b"other".to_vec(), b"x".to_vec())]), Some((tip_seq, tip_root))),
+            _ => {
+                // Two deep: a head at tip+2 whose prev is NOT the tip, but whose
+                // tree holds the tab's record exactly (they built on it twice).
+                let mut entries: Vec<(Vec<u8>, Vec<u8>)> = tip_tree.into_iter().collect();
+                entries.push((b"other".to_vec(), b"y".to_vec()));
+                (tip_seq + 2, device_tree(&mut node, &entries), Some((tip_seq + 1, [0x42; 32])))
+            }
+        };
+        let v = value(&root, &Ledger { prev: prev.map(|(s, r)| signer_proto::Head { seq: s, root: r }), ..Ledger::default() });
+        let st = engine_delegate::register::head_state(&node.register_params, &key_of, seq, &v).expect("signs");
+        node.update(&st);
+        assert_eq!(node.head().map(|h| h.0), Some(seq), "{case}: the other device's head did not take the register");
+        rig.server.head_hint();
+        tab.pump(&mut rig, &mut node);
+        for _ in 0..10 {
+            rig.now += 1_000;
+            rig.server.tick(Ms(rig.now));
+            tab.pump(&mut rig, &mut node);
+        }
+        assert_eq!(rig.server.page.published().0, seq, "{case}: the tab did not adopt the other device's head");
+        let told = tab.db.store_mut().take_superseded();
+        match case {
+            "same-seq, record lost" => {
+                assert_eq!(told.len(), 1, "{case}: {told:?}");
+                assert_eq!(told[0].keys, vec![key.clone()], "{case}: the superseded rows are not the record");
+                assert!(
+                    matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &key), Err(craftworks_sdk::store::StoreError::NotLoaded)),
+                    "{case}: the replaced row still shows the tab's value"
+                );
+            }
+            _ => assert!(told.is_empty(), "{case}: told Superseded for a value the winner holds: {told:?}"),
+        }
+    }
+}
+
+/// A TIP OF TWO WRITES (main's condition on Z5): a commit carries ONE write —
+/// the engine refuses a second with `Busy` — so a tip holds more than one only
+/// through a NO-OP write Published at the same head (sdk#160), whose value at
+/// every key is the tree's there. Here the second write puts the SAME bytes at
+/// the record's key; it publishes at the same head, joining the tip. A
+/// same-seq winner without the record then tells BOTH writes Superseded on
+/// that key — each write its own reply, the same row.
+#[test]
+fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
+    use signer_proto::head::{value, Ledger};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.db.define("t", &tab_schema()).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+    let w1 = tab.db.store_mut().next_write_id() - 1;
+    tab.pump(&mut rig, &mut node);
+    let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
+    let key = craftworks_sdk::db::record_key("t", loc);
+    let head = node.head().expect("published");
+    let bytes = node.tree(&head.1).expect("whole").get(&key).cloned().expect("the record is in the tip");
+    // The same bytes again: a no-op, Published at the same head.
+    let w2 = tab.db.store_mut().next_write_id();
+    craftworks_sdk::store::Store::apply_commit(
+        tab.db.store_mut(),
+        &[(key.clone(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(&bytes)))],
+        &[(key.clone(), craftworks_sdk::store::Edit::Put(bytes.clone()))],
+    )
+    .expect("the store took it");
+    tab.pump(&mut rig, &mut node);
+    assert!(tab.verdicts.get(&w2).is_some_and(|v| v.contains(&protocol::WriteState::Published)), "the second write did not publish: {:?}", tab.verdicts.get(&w2));
+    assert_eq!(node.head(), Some(head), "the second write moved the head: it was not a no-op, the tip is one write");
+    // Displaced at its own seq by a winner without the record.
+    let hr = node.head_read().expect("a head");
+    let base = hr.prev().expect("a prev");
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let mut salt = 0u8;
+    let st = loop {
+        let r = device_tree(&mut node, &[(b"other".to_vec(), vec![salt])]);
+        let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
+        if page::beats(&v, hr.value()) {
+            break engine_delegate::register::head_state(&node.register_params, &key_of, head.0, &v).expect("signs");
+        }
+        salt += 1;
+    };
+    node.update(&st);
+    rig.server.head_hint();
+    tab.pump(&mut rig, &mut node);
+    let mut told: Vec<(u64, Vec<Vec<u8>>)> = tab.db.store_mut().take_superseded().into_iter().map(|s| (s.write_id, s.keys)).collect();
+    told.sort();
+    assert_eq!(told, vec![(w1, vec![key.clone()]), (w2, vec![key.clone()])], "each write of the tip was not told its row");
 }
