@@ -1069,11 +1069,12 @@ impl PageIo {
                         not_held.push(id);
                         continue;
                     }
-                    Op::Put { .. } | Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
+                    Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
                         self.unusable.push(format!("read-only: a {} was not sent", op_name(&op)));
                         continue;
                     }
-                    Op::Get { .. } | Op::ReadHead => {}
+                    // BISECT (#341's one wire hunk on a view): a repair PUT goes out.
+                    Op::Put { .. } | Op::Get { .. } | Op::ReadHead => {}
                 }
             }
             let stream = self.next_stream();
