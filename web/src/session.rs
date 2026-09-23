@@ -67,6 +67,8 @@ pub struct Session {
     /// app-relative and gains `<app>.` here, so an app has no name for
     /// another app's data and cannot write it. `None`: nothing is written.
     app: Option<String>,
+    /// SCRATCH PROBE: the last define's domain and outcome.
+    probe_last_define: String,
 }
 
 #[wasm_bindgen]
@@ -96,6 +98,7 @@ impl Session {
             foreign_notifications: 0,
             bound: craftworks_sdk::LiveBindings::default(),
             app: None,
+            probe_last_define: String::new(),
             signer_code: Vec::new(),
             page_identity_sent: false,
             provision_told: false,
@@ -711,6 +714,8 @@ impl Session {
             "headAnswers": p.probe_answers.get(&reg).copied().unwrap_or_default(),
             "headChanges": p.probe_head_changes,
             "window": {"size": win, "inflight": inflight},
+            "mayWrite": serde_json::from_str::<serde_json::Value>(&self.can_write("")).unwrap_or_default(),
+            "lastDefine": self.probe_last_define,
             "log": self.page_mut().map(|p| p.server.page.probe_log.drain(..).collect::<Vec<_>>()).unwrap_or_default(),
         })
         .to_string()
@@ -746,6 +751,15 @@ impl Session {
     // Nothing downstream branches on the message.
 
     pub fn define(&mut self, domain: &str, schema: &str) -> Result<(), JsValue> {
+        let r = self.define_inner(domain, schema);
+        self.probe_last_define = match &r {
+            Ok(()) => format!("{domain}: ok"),
+            Err(e) => format!("{domain}: {}", js_sys::JSON::stringify(e).ok().and_then(|v| v.as_string()).unwrap_or_default()),
+        };
+        r
+    }
+
+    fn define_inner(&mut self, domain: &str, schema: &str) -> Result<(), JsValue> {
         let s: craftworks_sdk::Schema =
             serde_json::from_str(schema).map_err(|e| db_err(&DbError::Refused(e.to_string())))?;
         // A VIEW defines nothing: a definition identical to the published
