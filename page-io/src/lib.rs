@@ -201,9 +201,6 @@ pub struct PageIo {
     /// The app's PUTs by contract key: the exact contract and state, framed
     /// again whenever the page re-sends [`Op::PutApp`].
     app_contracts: BTreeMap<String, (ContractContainer, WrappedState)>,
-    /// A READER of a NAMED head ([`PageIo::reader`], sdk#239): no signer, so
-    /// nothing is signed, PUT or updated, and nothing is installed on the node.
-    read_only: bool,
     /// The last time the node or the clock spoke, for answers made locally.
     now: Ms,
     /// A reader's stream-id range (`reader`), in the top byte; 0 for the
@@ -334,7 +331,6 @@ impl PageIo {
             head_failed_pending: false,
             others: Vec::new(),
             app_contracts: BTreeMap::new(),
-            read_only: false,
             now: Ms(0),
             stream_base: 0,
             needs_key: false,
@@ -390,7 +386,7 @@ impl PageIo {
         );
         io.register_id = register_id;
         io.register_key = wire::contract_id(register_id).to_string();
-        io.read_only = true;
+        io.server.page.set_read_only();
         io.stream_base = u32::from(range.max(1)) << 24;
         io.provisioned = true;
         // "The head exists": a failed read of it is silence, and the signer
@@ -435,7 +431,7 @@ impl PageIo {
     /// inputs. "Yes" means THIS NODE'S SIGNER SIGNS FOR that head; a keyset
     /// (a device key among an identity's keys) is Phase 6.
     pub fn may_write(&self, head: Option<[u8; 32]>) -> MayWrite {
-        if self.read_only {
+        if self.read_only() {
             return MayWrite::No(READ_ONLY.into());
         }
         let other = |r: &[u8; 32]| MayWrite::No(format!("this node signs for another head ({})", hex(r)));
@@ -611,7 +607,8 @@ impl PageIo {
 
     /// A reader of a named head (`reader`): nothing can be written.
     pub fn read_only(&self) -> bool {
-        self.read_only
+        // THE PAGE's: the one owner of "read-only" (it makes no commit op).
+        self.server.page.read_only()
     }
 
     /// PUT a contract the APP names (builder#104: a web container). Framed
@@ -620,7 +617,7 @@ impl PageIo {
     /// would be reassembled into each other. The answer comes back through
     /// [`PageIo::take_others`], named by the contract's key.
     pub fn put_contract(&mut self, contract: ContractContainer, state: WrappedState, now: Ms) -> Result<(), String> {
-        if self.read_only {
+        if self.read_only() {
             return Err("read-only: a reader PUTs nothing".into());
         }
         let key = contract.key().to_string();
@@ -648,7 +645,7 @@ impl PageIo {
     /// signer answers `Provisioned`.
     pub fn provision(&mut self, signer: DelegateContainer, signing_key: Vec<u8>) {
         // A READER installs nothing on the node it reads from (sdk#239).
-        if self.read_only {
+        if self.read_only() {
             self.unusable.push("read-only: provisioning refused — a reader installs nothing".into());
             return;
         }
@@ -684,7 +681,7 @@ impl PageIo {
 
     /// Tell the server what the signer holds, once it is provisioned.
     pub fn signer_provisioned(&mut self) {
-        if self.read_only {
+        if self.read_only() {
             return;
         }
         self.server.set_facts(SignerFacts { head_writable: true, head_id: self.register_id });
@@ -920,11 +917,11 @@ impl PageIo {
         let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k);
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id } => mine(id),
-            Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only,
+            Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             Incoming::HeadChanged { key } => *key == self.register_key,
             Incoming::Partial => true,
-            Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::Refused(_) | Incoming::Unusable(_) => !self.read_only,
+            Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::Refused(_) | Incoming::Unusable(_) => !self.read_only(),
         }
     }
 
@@ -1062,18 +1059,25 @@ impl PageIo {
     fn pump(&mut self) {
         self.replies.extend(self.server.take_replies());
         let mut not_held = Vec::new();
+        let mut not_sent = Vec::new();
         for op in self.server.take_ops() {
-            if self.read_only {
+            if self.read_only() {
                 match op {
                     Op::AskHeld { id } => {
                         not_held.push(id);
                         continue;
                     }
-                    Op::Put { .. } | Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
-                        self.unusable.push(format!("read-only: a {} was not sent", op_name(&op)));
+                    // A view's page makes no commit op; one that arrives is
+                    // REFUSED BY NAME and handed back as the op's answer --
+                    // loud, and ended: nothing waits on a frame never sent.
+                    Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
+                        let why = format!("read-only: a {} is never sent from a view", op_name(&op));
+                        self.unusable.push(why.clone());
+                        not_sent.push((op, why));
                         continue;
                     }
-                    Op::Get { .. } | Op::ReadHead => {}
+                    // A repair PUT (the only PUT a view's page makes), reads.
+                    Op::Put { .. } | Op::Get { .. } | Op::ReadHead => {}
                 }
             }
             let stream = self.next_stream();
@@ -1129,10 +1133,13 @@ impl PageIo {
                 Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
             }
         }
-        if !not_held.is_empty() {
+        if !not_held.is_empty() || !not_sent.is_empty() {
             let now = self.now;
             for id in not_held {
                 self.server.node(Answer::Held { id, present: false }, now);
+            }
+            for (op, why) in not_sent {
+                self.server.node(Answer::NotSent { op, why }, now);
             }
             self.pump();
         }

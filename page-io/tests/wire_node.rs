@@ -1352,3 +1352,82 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     assert!(yes(io.may_write(Some(node.register_id))), "a claimed page may not write the register it minted: {:?}", io.may_write(Some(node.register_id)));
     assert!(no(io.may_write(Some(stranger))));
 }
+
+/// A VIEW PUTS BACK A BLOCK IT REBUILT, AND NOTHING WAITS ON IT (read-only
+/// has one owner, the page). The publisher's first leaf is gone from the
+/// node; a VIEW reading the tree rebuilds it from its group (race get) and
+/// the page puts it back -- a repair restores existing content-addressed
+/// bytes, no key, no head moved -- so the node serves exactly ONE block PUT
+/// from the view, it is answered, and the view waits on nothing after. The
+/// mutant (page-io drops a read-only page's PUT, the page keeps its
+/// deadline) leaves the block un-put and the view waiting: red.
+#[test]
+fn a_view_puts_back_a_block_it_rebuilt_and_waits_on_nothing() {
+    let mut node = WireNode::new(&[35u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    let big = "v".repeat(900);
+    let ops: Vec<protocol::Op> = (0..60).map(|i| protocol::Op::Put(format!("row/{i:03}").into_bytes(), big.clone().into_bytes())).collect();
+    let rs = client(&mut a, &mut node, &mut now, &Request::forced_write(1, ops));
+    assert!(states(&rs, 1).contains(&WriteState::Published), "the publisher's tree did not publish");
+    let (_, root) = node.head().expect("a head");
+    let root_bytes = freenet_prolly::store::Blocks::get(a.server.page.blocks(), &root).expect("the writer holds its root").to_vec();
+    let root_node = freenet_prolly::node::Node::parse(&root_bytes).expect("a node");
+    assert!(!root_node.is_leaf() && root_node.parity_count() > 0, "THE CONTROL: the tree has no grouped children to rebuild from");
+    let (lost, _) = root_node.child(0);
+    let gone = wire::block::contract_for(BLOCK_CODE, &lost);
+    assert!(node.contracts.remove(&gone).is_some(), "the lost leaf was not on the node");
+
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let served_before = node.served.clone();
+    let before = node.served.get("put block").copied().unwrap_or(0);
+    assert_eq!(rows(&mut v, &mut node, &mut now, 21), vec![60], "the view did not read every row through the rebuild");
+    for _ in 0..20 {
+        now += 1_000;
+        v.tick(Ms(now));
+        settle(&mut v, &mut node, &mut now);
+    }
+    let put = node.served.get("put block").copied().unwrap_or(0) - before;
+    assert_eq!(put, 1, "the view put back {put} block(s); a rebuilt block is put back exactly once ({:?})", v.unusable());
+    assert!(node.contracts.contains_key(&gone), "the rebuilt leaf is not on the node again");
+    assert!(!v.server.page.waiting(), "the view still waits on something after its repair PUT was answered");
+    for k in ["put register", "update", "signer", "register delegate"] {
+        let by_view = node.served.get(k).copied().unwrap_or(0) - served_before.get(k).copied().unwrap_or(0);
+        assert_eq!(by_view, 0, "a view made the node serve a {k}");
+    }
+}
+
+/// READ-ONLY HAS ONE OWNER, THE PAGE: the door's refusal (`may_write`, what
+/// the web Session asks) and the page's filter (no commit op) answer from the
+/// same flag. A view is refused at the door by name, and a write that
+/// reaches its page anyway makes no commit op -- named, not sent, nothing
+/// waited on. Mutants that flip ONE alone go red: the door answering "yes"
+/// on a view, or the page making a view's commit ops.
+#[test]
+fn a_views_door_refusal_and_its_pages_filter_agree() {
+    let mut node = WireNode::new(&[36u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "x", "v")), 1).contains(&WriteState::Published));
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert!(v.read_only() && v.server.page.read_only(), "page-io's read-only is not the page's");
+    for head in [None, Some(node.register_id)] {
+        assert_eq!(v.may_write(head), page_io::MayWrite::No(page_io::READ_ONLY.into()), "the door let a view write {head:?}");
+    }
+    let before = node.served.clone();
+    let wr = client(&mut v, &mut node, &mut now, &write(2, "intruder", "v"));
+    for _ in 0..200 {
+        now += 1_000;
+        v.tick(Ms(now));
+        settle(&mut v, &mut node, &mut now);
+    }
+    assert!(states(&wr, 2).contains(&WriteState::Failed), "a view's write was not refused at the door: {wr:?}");
+    assert!(v.server.page.unusable().iter().any(|u| u.starts_with("read-only: write 2 refused at the door")), "the view's refusal was not named: {:?}", v.server.page.unusable());
+    for k in ["put block", "put register", "update", "signer"] {
+        assert_eq!(node.served.get(k), before.get(k), "a view's write reached the node as a {k}");
+    }
+}

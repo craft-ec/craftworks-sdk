@@ -205,6 +205,11 @@ pub enum Answer {
     AppPutOk(String),
     /// The node refused the app's PUT of this contract key, in its words.
     AppPutRefused { key: String, said: String },
+    /// An op this page produced that its HOST will not send (a read-only
+    /// page's commit op: never produced, so this is loud), in the host's
+    /// words. It ENDS the op's wait -- nothing waits on a frame that never
+    /// left.
+    NotSent { op: Op, why: String },
 }
 
 /// Where an app's PUT ([`Op::PutApp`]) stands. It always ENDS: acknowledged,
@@ -516,6 +521,11 @@ pub struct Page {
     /// Effects this executor does not act on (the read path's replies,
     /// subscriptions), for the caller.
     unusable: Vec<String>,
+    /// A VIEW (sdk#239): this page writes nothing of its own -- no commit op,
+    /// ever -- and still puts back a block it REBUILT for a read (a repair
+    /// restores existing content-addressed bytes: no key, no head moved).
+    /// THE one owner of "read-only": page-io and the web Session ask here.
+    read_only: bool,
     now: u64,
     /// Every record the signer returned — invariant 2's evidence.
     signer_records: BTreeSet<Vec<u8>>,
@@ -572,6 +582,7 @@ impl Page {
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
+            read_only: false,
             now: 0,
             signer_records: BTreeSet::new(),
             sign_id: None,
@@ -759,6 +770,25 @@ impl Page {
         let now = now.0;
         self.now = now;
         match a {
+            Answer::NotSent { op, why } => {
+                let w = match &op {
+                    Op::Put { id, .. } => Some(Waiting::Put(*id)),
+                    Op::Update { .. } => Some(Waiting::Update),
+                    Op::Sign { .. } => Some(Waiting::Sign),
+                    Op::PutApp { key } => Some(Waiting::PutApp(key.clone())),
+                    _ => None,
+                };
+                if let Some(w) = w {
+                    self.answered(&w);
+                }
+                if let Op::PutApp { key } = &op {
+                    if let Some(p) = self.app_puts.get_mut(key) {
+                        p.0 = AppPut::Refused(why.clone());
+                    }
+                }
+                self.repair_puts.retain(|id| !matches!(&op, Op::Put { id: o, .. } if o == id));
+                self.unusable.push(format!("not sent: {why}"));
+            }
             Answer::AppPutOk(key) => {
                 if self.answered(&Waiting::PutApp(key.clone())).is_some() {
                     if let Some(p) = self.app_puts.get_mut(&key) {
@@ -1538,6 +1568,18 @@ impl Page {
     fn carry_out(&mut self, fx: Vec<Effect>) {
         for f in fx {
             match f {
+                // A VIEW makes no commit op: nothing of it is held, sent or
+                // waited on. The door refuses a view's writes first, so this
+                // is loud -- a commit on a view is a defect, named.
+                Effect::PutBlock { .. } | Effect::PutParity { .. } | Effect::UpdateHead { .. } | Effect::PutPack { .. } if self.read_only => {
+                    let what = match f {
+                        Effect::PutBlock { .. } => "block PUT",
+                        Effect::PutParity { .. } => "parity PUT",
+                        Effect::PutPack { .. } => "pack PUT",
+                        _ => "head update",
+                    };
+                    self.unusable.push(format!("read-only: a commit's {what} was not made (a view writes nothing but a repair)"));
+                }
                 Effect::PutBlock { id, ref bytes, ref after } | Effect::PutParity { id, ref bytes, ref after, .. } => {
                     // The page is the memory now: the engine keeps no bytes.
                     self.blocks.insert(id, bytes);
@@ -1731,6 +1773,17 @@ impl Page {
     }
 
     /// Things this page could not do, by reason.
+    /// Make this page a VIEW ([`Page::read_only`]): for good, set once when
+    /// the page is made a reader of somebody's head.
+    pub fn set_read_only(&mut self) {
+        self.read_only = true;
+    }
+
+    /// Is this page a VIEW: it makes no commit op, only repair PUTs.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn unusable(&self) -> &[String] {
         &self.unusable
     }
