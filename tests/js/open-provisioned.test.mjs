@@ -68,6 +68,28 @@ await t("**a node that is NOT RUNNING is named as that, not as a silent signer**
     /the signer is not answering/);
 });
 
+await t("**a node that is not there is named at once: two refused ATTEMPTS, never opened — not the budget**", async () => {
+  // The clock moves 1 ms a poll: without the refusal end this reaches the
+  // BUDGET's message, not this one — the assertion then fails, never hangs.
+  let c = 0;
+  const frozen = { provisionBudgetMs: 2_000, provisionEveryMs: 1, now: () => (c += 1), setTimeout: r => setTimeout(r, 0) };
+  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => false, refusedBeforeOpen: () => 2, url: () => "ws://127.0.0.1:7999/" }, frozen),
+    /nothing answered at ws:\/\/127\.0\.0\.1:7999\/: the connection was refused and never opened — is the node running\?/);
+  // THE CONTROL: one refused attempt is a node still starting — it waits.
+  let polls = 0;
+  const one = untilProvisioned({ provisioned: () => (polls += 1) > 3, connectedOnce: () => false, refusedBeforeOpen: () => 1 }, frozen);
+  await one;
+  assert.ok(polls > 3, "one refusal ended the wait");
+  // Through open(), with a REAL refused socket's events: each attempt fires
+  // `error` THEN `closed` (connection.js). ONE such attempt is a node still
+  // starting: open() keeps waiting and succeeds once it is provisioned.
+  const attempts = n => ({ connect: (_e, { onEvent } = {}) => { for (let i = 0; i < n; i += 1) { onEvent?.({ kind: "error" }); onEvent?.({ kind: "closed" }); } return { pump() {}, close() {} }; } });
+  const h = await open(FakeSession({ after: 5 }), deps(attempts(1)));
+  assert.ok(h.db, "one refused attempt (error + closed) ended open(): a node still starting is not a node that is not there");
+  // TWO attempts: the node is not there, named.
+  await assert.rejects(() => open(FakeSession({ after: 1e9 }), deps(attempts(2))), /the connection was refused and never opened/);
+});
+
 await t("the BUDGET says which too: never connected, or connected and still setting up", async () => {
   let clock = 0;
   const tick = r => setTimeout(r, 0);
