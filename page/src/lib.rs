@@ -479,6 +479,9 @@ pub struct Page {
     last_head: Option<HeadRead>,
     /// A PUT to repeat at the next tick (a transient refusal).
     put_again: BTreeMap<Cid, Vec<u8>>,
+    /// Blocks rebuilt from their group and PUT back (sdk#303): sent like a commit's PUT, but answered for NO
+    /// commit -- an answer confirms nothing a commit or a head waits on. Left when a commit puts the same block.
+    repair_puts: BTreeSet<Cid>,
     /// Deadlines of the ops in flight, and each op to re-send.
     /// Every op in flight: when it is due again, the op to re-send, when it
     /// went out and on which attempt (Karn: only an attempt-1 answer samples).
@@ -552,6 +555,7 @@ impl Page {
             last_head_at: 0,
             last_head: None,
             put_again: BTreeMap::new(),
+            repair_puts: BTreeSet::new(),
             deadlines: BTreeMap::new(),
             app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -760,6 +764,10 @@ impl Page {
                     return; // a second answer to a re-sent PUT
                 }
                 self.put_again.remove(&id);
+                // A repaired block's PUT is done: it confirms nothing (the architect's (b)).
+                if self.repair_puts.contains(&id) {
+                    return;
+                }
                 match self.path {
                     PutPath::Page => self.confirm(id),
                     // An answer is not a confirmation on this path: ask.
@@ -793,7 +801,7 @@ impl Page {
                     if let Op::Put { bytes, .. } = op {
                         self.put_again.insert(id, bytes);
                     }
-                } else {
+                } else if !self.repair_puts.contains(&id) {
                     self.step(Event::PutFailed(id));
                 }
             }
@@ -1501,6 +1509,15 @@ impl Page {
                 // A queued write's warm-apply block (R-b): kept for reads of
                 // the warm root, never put -- its commit puts the same bytes.
                 Effect::Keep { id, ref bytes } => self.blocks.insert(id, bytes),
+                // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
+                // op, deadline and re-send), unless it is on its way or there already.
+                Effect::PutRepaired { id, ref bytes } => {
+                    self.blocks.insert(id, bytes);
+                    if !self.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.put_again.contains_key(&id) {
+                        self.repair_puts.insert(id);
+                        self.send(Waiting::Put(id), Op::Put { id, bytes: bytes.clone() });
+                    }
+                }
                 Effect::PutPack { id, .. } => {
                     // No packs in this phase, as the shell refuses them.
                     self.unusable.push("a pack was emitted; packs are off in this phase".into());
@@ -1552,6 +1569,8 @@ impl Page {
                             let more = self.engine.step(Event::PutConfirmed(id));
                             self.carry_out(more);
                         } else {
+                            // A commit's own now: its answer is the commit's.
+                            self.repair_puts.remove(&id);
                             self.send(Waiting::Put(id), Op::Put { id, bytes });
                         }
                     }
@@ -1855,5 +1874,31 @@ mod unneeded_gets {
         p.get_queue.push_back(wanted);
         p.end_unneeded_gets();
         assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![wanted], "the held block's queued GET was not ended, or the wanted one was");
+    }
+}
+
+#[cfg(test)]
+mod repair_put {
+    use super::*;
+
+    /// A block rebuilt from its group is PUT through the one sender, and its answer is NOBODY's commit (the
+    /// architect's (b) on sdk#331): it confirms nothing a commit or a head's `after` waits on. When a commit puts
+    /// the same block, the answer is the commit's again.
+    #[test]
+    fn a_repair_puts_answer_confirms_nothing() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let (id, bytes) = ([7u8; 32], b"rebuilt".to_vec());
+        p.carry_out(vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
+        let puts: Vec<Op> = p.take_ops().into_iter().filter(|o| matches!(o, Op::Put { .. })).collect();
+        assert_eq!(puts, vec![Op::Put { id, bytes: bytes.clone() }], "the repair was not PUT through the sender");
+        assert!(p.deadlines.contains_key(&Waiting::Put(id)), "the repair PUT has no deadline: it would not be re-sent");
+        p.answer(Answer::PutOk(id), Ms(1));
+        assert!(!p.confirmed.contains(&id), "a repair PUT's answer confirmed the block for the commits");
+        assert!(!p.deadlines.contains_key(&Waiting::Put(id)), "the answered repair PUT is still waiting");
+
+        // The same block, then put by a commit: its answer is the commit's.
+        p.carry_out(vec![Effect::PutBlock { id, bytes: bytes.clone(), after: Vec::new() }]);
+        p.answer(Answer::PutOk(id), Ms(2));
+        assert!(p.confirmed.contains(&id), "a commit's PUT of a once-repaired block was not confirmed");
     }
 }

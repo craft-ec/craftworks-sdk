@@ -120,21 +120,8 @@ fn a_leaf_group(blocks: &BTreeMap<Cid, Vec<u8>>, root: Cid) -> (Vec<Cid>, Vec<Ci
     }
 }
 
-#[test]
-fn a_withdrawn_get_is_not_asked_again() {
-    withdrawn_gets(false);
-}
-
-/// The same with every OTHER leaf read first and answered slowly (300 ms, packs included), so the race runs on a
-/// window the slow GETs have shrunk (to 3): still every read answered, nothing withdrawn re-sent, nothing left
-/// waiting. It does NOT leave a group block queued when the group resolves (the window refills before the engine
-/// hears the resolving answer); the queue clause of `end_unneeded_gets` is tested inside the page crate.
-#[test]
-fn withdrawal_holds_with_slow_reads_in_flight() {
-    withdrawn_gets(true);
-}
-
-fn withdrawn_gets(busy: bool) {
+/// A writer page's real tree (6000 rows), with its parity, on a fake node: the node, the root, and the clock.
+fn written() -> (Node_, Cid, u64) {
     // The writer: a real tree, with its parity, on the node.
     let mut node = Node_::default();
     let mut now = 1_000u64;
@@ -160,6 +147,81 @@ fn withdrawn_gets(busy: bool) {
         );
     }
     let (_, root) = node.head.expect("the writer published");
+    (node, root, now)
+}
+
+/// The keys of one leaf.
+fn keys_of(node: &Node_, leaf: Cid) -> Vec<Vec<u8>> {
+    let n = Node::parse(&node.blocks[&leaf]).expect("a leaf");
+    (0..n.len()).map(|i| n.key(i)).collect()
+}
+
+/// A cold reader page reads `keys` from `node` (`silent` never answered) until every read is answered or 60 s
+/// pass; returns the page, the GETs it sent, and how many reads were answered.
+fn read_all(node: &mut Node_, now: &mut u64, keys: &[Vec<u8>], silent: &BTreeSet<Cid>) -> (Page, Vec<(u64, Cid)>, usize) {
+    let mut r = Page::new(Params::default(), PutPath::Page);
+    let mut gets = Vec::new();
+    drive(&mut r, node, silent, now, 500, &mut gets);
+    for (n, key) in keys.iter().enumerate() {
+        r.event(Event::Get { client: ClientId(2), req_id: engine::read::ReqId(n as u64), key: key.clone() });
+    }
+    let mut replied = BTreeSet::new();
+    for _ in 0..60 {
+        drive(&mut r, node, silent, now, 1_000, &mut gets);
+        for e in r.take_client() {
+            if let Effect::Reply { client: ClientId(2), req_id, .. } = e {
+                replied.insert(req_id.0);
+            }
+        }
+        if replied.len() == keys.len() && !r.waiting() {
+            break;
+        }
+    }
+    (r, gets, replied.len())
+}
+
+/// REPAIR IS A WRITE (the owner, on sdk#331): a member the node has LOST (NotFound) is read through its group,
+/// rebuilt, and PUT back by the commit's own PUT -- so the NEXT reader, fresh, gets it straight from the node
+/// with no repair at all.
+#[test]
+fn a_rebuilt_block_is_put_back_and_the_next_reader_gets_it_directly() {
+    let (mut node, root, mut now) = written();
+    let (members, _) = a_leaf_group(&node.blocks, root);
+    let member = members[members.len() / 2];
+    let lost = node.blocks.remove(&member).expect("on the node");
+    let keys = keys_of(&Node_ { blocks: [(member, lost.clone())].into_iter().collect(), ..Node_::default() }, member);
+
+    let (a, _, answered) = read_all(&mut node, &mut now, &keys, &BTreeSet::new());
+    let (started, rebuilt, _) = a.repair_counts();
+    println!("  first reader: {answered} of {} reads answered; repairs started {started}, rebuilt {rebuilt}; the node has the member again: {}", keys.len(), node.blocks.contains_key(&member));
+    assert_eq!(answered, keys.len(), "the first reader was not answered");
+    assert_eq!(rebuilt, 1, "the member was not rebuilt");
+    assert_eq!(node.blocks.get(&member), Some(&lost), "the rebuilt member was not PUT back (acked) as its own bytes");
+    assert!(!a.waiting(), "the first reader still waits (its PUT unacked?)");
+
+    let (b, gets, answered) = read_all(&mut node, &mut now, &keys, &BTreeSet::new());
+    // Racing starts a race on every first want, so "started" is not the measure: REBUILT is.
+    println!("  second reader: {answered} answered; races started {}, rebuilt {}; GETs of the member {}", b.repair_counts().0, b.repair_counts().1, gets.iter().filter(|(_, id)| *id == member).count());
+    assert_eq!(answered, keys.len(), "the second reader was not answered");
+    assert_eq!(b.repair_counts().1, 0, "the second reader had to rebuild the member: the network is still damaged");
+}
+
+#[test]
+fn a_withdrawn_get_is_not_asked_again() {
+    withdrawn_gets(false);
+}
+
+/// The same with every OTHER leaf read first and answered slowly (300 ms, packs included), so the race runs on a
+/// window the slow GETs have shrunk (to 3): still every read answered, nothing withdrawn re-sent, nothing left
+/// waiting. It does NOT leave a group block queued when the group resolves (the window refills before the engine
+/// hears the resolving answer); the queue clause of `end_unneeded_gets` is tested inside the page crate.
+#[test]
+fn withdrawal_holds_with_slow_reads_in_flight() {
+    withdrawn_gets(true);
+}
+
+fn withdrawn_gets(busy: bool) {
+    let (mut node, root, mut now) = written();
     let (members, parity) = a_leaf_group(&node.blocks, root);
     assert!(
         parity.iter().all(|p| node.blocks.contains_key(p)),

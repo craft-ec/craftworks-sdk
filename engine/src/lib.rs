@@ -483,6 +483,14 @@ pub enum Effect {
         id: Cid,
         bytes: Vec<u8>,
     },
+    /// A block REBUILT from its sibling group (sdk#303, the owner's rule 11: repair from parity), PUT back so the
+    /// network is whole again. The same PUT as a commit's, through the page's one sender -- but no commit's: its
+    /// answer confirms nothing a commit or a head waits on. Emitted only for a block a reader wanted and whose
+    /// bytes are its id ([`Engine::rebuilt`]).
+    PutRepaired {
+        id: Cid,
+        bytes: Vec<u8>,
+    },
     PutPack {
         id: Cid,
         bytes: Vec<u8>,
@@ -4752,8 +4760,9 @@ impl<B: Blocks> Engine<B> {
                 Ok(body) => {
                     self.repair_counts.1 += 1;
                     // The page KEEPS it (the node lost it; reads go on from
-                    // the page's blocks), and it lands like any arrival.
-                    let mut out = vec![Effect::Keep { id: missing, bytes: body.clone() }];
+                    // the page's blocks), PUTs it back, and it lands like any
+                    // arrival -- asked BEFORE the arrival, which ends the wait.
+                    let mut out = self.rebuilt(missing, &body);
                     out.extend(self.on_arrived(missing, body));
                     out
                 }
