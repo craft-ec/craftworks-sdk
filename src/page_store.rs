@@ -100,6 +100,10 @@ struct Ticket {
 /// the session's first line; the page from provisioning on).
 type Deferred = (u64, Option<Cid>, freenet_prolly::range::Range);
 
+/// How many ENDED tickets are kept for a `resume` that may still come
+/// ([`PageStore::forget_old_ended`]).
+pub const KEEP_ENDED: usize = 64;
+
 /// The page's store: `Db` reads and writes through it, over a [`Host`].
 pub struct PageStore<H: Host> {
     host: Option<H>,
@@ -303,6 +307,26 @@ impl<H: Host> PageStore<H> {
                 t.at_ms = now;
                 self.ended.push((id, how));
             }
+        }
+        self.forget_old_ended();
+    }
+
+    /// AN ENDED TICKET THE APP NEVER RESUMES is forgotten once
+    /// [`KEEP_ENDED`] newer ones have ended — a COUNT over finished reads,
+    /// never a clock on a waiting one (rule 8). It was the old lifetime's
+    /// second job (engineer2, sdk#302 review): without it, every abandoned
+    /// read kept its entry for the life of the page. Forgetting pins
+    /// nothing wrong: `resume` of a forgotten ticket reads unpinned, at the
+    /// head. An OPEN ticket is never forgotten.
+    fn forget_old_ended(&mut self) {
+        let mut ended: Vec<(u64, u64)> = self.tickets.iter().filter(|(_, t)| t.ended.is_some()).map(|(id, t)| (t.at_ms, *id)).collect();
+        if ended.len() <= KEEP_ENDED {
+            return;
+        }
+        ended.sort();
+        for (_, id) in ended.drain(..ended.len() - KEEP_ENDED) {
+            self.tickets.remove(&id);
+            self.why.remove(&id);
         }
     }
 
@@ -629,5 +653,55 @@ impl<H: Host> Store for PageStore<H> {
     fn apply_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
         let made = self.writes.make(reads, edits);
         self.hand_over(made)
+    }
+}
+
+#[cfg(test)]
+mod ended_tickets {
+    use super::*;
+
+    /// Never called: the store under test has no host.
+    struct NoHost;
+    impl Host for NoHost {
+        fn with_server<R>(&mut self, _: impl FnOnce(&mut page::server::Server) -> R) -> R {
+            unreachable!("no host")
+        }
+        fn peek<R>(&self, _: impl FnOnce(&page::server::Server) -> R) -> R {
+            unreachable!("no host")
+        }
+        fn client(&mut self, _: &[u8]) {}
+        fn take_replies(&mut self) -> Vec<Vec<u8>> {
+            Vec::new()
+        }
+    }
+
+    fn store() -> PageStore<NoHost> {
+        PageStore::new(Box::new(|| 0), Box::new(|| 0))
+    }
+
+    fn open(s: &mut PageStore<NoHost>, id: u64, now: u64) {
+        s.tickets.insert(id, Ticket { root: None, at_ms: now, ended: None, queue_wait: None });
+    }
+
+    /// An abandoned read's ticket is not kept for the life of the page: of
+    /// 200 ended and never resumed, the newest KEEP_ENDED stay, and an OPEN
+    /// ticket among them is never forgotten.
+    #[test]
+    fn ended_tickets_the_app_never_resumes_are_forgotten_beyond_the_newest_few() {
+        let mut s = store();
+        open(&mut s, 10_000, 0);
+        for id in 1..=200u64 {
+            open(&mut s, id, id);
+            s.why.insert(id, "gone".into());
+            s.end(id, Ended::Unavailable, 1_000 + id);
+        }
+        let ended: Vec<u64> = s.tickets.iter().filter(|(_, t)| t.ended.is_some()).map(|(id, _)| *id).collect();
+        assert_eq!(ended.len(), KEEP_ENDED, "abandoned ended tickets are kept for ever: {}", ended.len());
+        assert_eq!(ended, (200 - KEEP_ENDED as u64 + 1..=200).collect::<Vec<_>>(), "not the NEWEST ended tickets were kept");
+        assert!(s.tickets.get(&10_000).is_some_and(|t| t.ended.is_none()), "an OPEN ticket was forgotten");
+        assert_eq!(s.why.len(), KEEP_ENDED, "the reasons of forgotten tickets were kept");
+        // A forgotten ticket resumes UNPINNED (reads at the head), a kept one pinned to its root.
+        s.resume(1);
+        assert_eq!(s.pinned, None);
     }
 }
