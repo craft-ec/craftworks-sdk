@@ -15,6 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 struct Node_ {
     blocks: BTreeMap<Cid, Vec<u8>>,
     head: Option<(u64, Cid)>,
+    /// Answers on their way back, with when they land: kept ACROSS drive calls, or every answer still in flight at
+    /// the end of a call would be lost (which, at 300 ms, is most of them).
+    due: Vec<(u64, Answer)>,
 }
 
 /// Drive `p` against `node` until nothing is waiting (or `for_ms` passes), answering after 5 ms; `silent` blocks
@@ -27,8 +30,20 @@ fn drive(
     for_ms: u64,
     gets: &mut Vec<(u64, Cid)>,
 ) {
+    drive_slow(p, node, silent, &BTreeSet::new(), now, for_ms, gets)
+}
+
+/// [`drive`], with the `slow` blocks answered after 300 ms instead of 5.
+fn drive_slow(
+    p: &mut Page,
+    node: &mut Node_,
+    silent: &BTreeSet<Cid>,
+    slow: &BTreeSet<Cid>,
+    now: &mut u64,
+    for_ms: u64,
+    gets: &mut Vec<(u64, Cid)>,
+) {
     let end = *now + for_ms;
-    let mut due: Vec<(u64, Answer)> = Vec::new();
     while *now < end {
         for op in p.take_ops() {
             let a = match op {
@@ -67,12 +82,16 @@ fn drive(
                 Op::PutApp { key } => Some(Answer::AppPutOk(key)),
             };
             if let Some(a) = a {
-                due.push((*now + 5, a));
+                let delay = match &a {
+                    Answer::Got { id, .. } | Answer::GetMissed(id) if slow.contains(id) => 300,
+                    _ => 5,
+                };
+                node.due.push((*now + delay, a));
             }
         }
         *now += 1;
-        let (ready, later): (Vec<_>, Vec<_>) = due.into_iter().partition(|(t, _)| *t <= *now);
-        due = later;
+        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut node.due).into_iter().partition(|(t, _)| *t <= *now);
+        node.due = later;
         for (_, a) in ready {
             p.answer(a, Ms(*now));
         }
@@ -103,6 +122,19 @@ fn a_leaf_group(blocks: &BTreeMap<Cid, Vec<u8>>, root: Cid) -> (Vec<Cid>, Vec<Ci
 
 #[test]
 fn a_withdrawn_get_is_not_asked_again() {
+    withdrawn_gets(false);
+}
+
+/// The same with every OTHER leaf read at once and answered slowly (300 ms), so the race runs while the window is
+/// busy with unrelated GETs: still every read answered, nothing withdrawn re-sent, nothing left waiting.
+/// NOT REACHED here: a withdrawn block still QUEUED for the window when its group resolves (all 11 of the group's
+/// blocks went out before it resolved); `end_unneeded_gets`' `get_queue` clause is untested.
+#[test]
+fn withdrawal_holds_with_slow_reads_in_flight() {
+    withdrawn_gets(true);
+}
+
+fn withdrawn_gets(busy: bool) {
     // The writer: a real tree, with its parity, on the node.
     let mut node = Node_::default();
     let mut now = 1_000u64;
@@ -137,6 +169,25 @@ fn a_withdrawn_get_is_not_asked_again() {
     let silent: BTreeSet<Cid> = [member, spare].into_iter().collect();
     let leaf = Node::parse(&node.blocks[&member]).expect("a leaf");
     let keys: Vec<Vec<u8>> = (0..leaf.len()).map(|i| leaf.key(i)).collect();
+    let member_keys = keys.len();
+    // Busy: one key from each OTHER leaf too, those leaves answered slowly, so their GETs hold the window and the
+    // race's slots wait in the queue behind them.
+    let mut slow = BTreeSet::new();
+    let mut keys = keys;
+    if busy {
+        let mut at = vec![root];
+        while let Some(id) = at.pop() {
+            let n = Node::parse(&node.blocks[&id]).expect("a node");
+            if n.is_leaf() {
+                if !members.contains(&id) {
+                    slow.insert(id);
+                    keys.push(n.key(0));
+                }
+            } else {
+                at.extend((0..n.len()).map(|i| n.child(i).0));
+            }
+        }
+    }
 
     // The reader, cold.
     let mut r = Page::new(Params::default(), PutPath::Page);
@@ -149,29 +200,27 @@ fn a_withdrawn_get_is_not_asked_again() {
             key: key.clone(),
         });
     }
-    let mut answered = 0;
+    let mut replied: BTreeSet<u64> = BTreeSet::new();
     let mut answered_at = None;
     for _ in 0..60 {
-        drive(&mut r, &mut node, &silent, &mut now, 1_000, &mut gets);
-        answered += r
-            .take_client()
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Effect::Reply {
-                        client: ClientId(2),
-                        ..
-                    }
-                )
-            })
-            .count();
-        if answered == keys.len() && answered_at.is_none() {
+        drive_slow(&mut r, &mut node, &silent, &slow, &mut now, 1_000, &mut gets);
+        for e in r.take_client() {
+            if let Effect::Reply { client: ClientId(2), req_id, .. } = e {
+                replied.insert(req_id.0);
+            }
+        }
+        if replied.len() == keys.len() && answered_at.is_none() {
             answered_at = Some(now);
         }
     }
-    let answered_at = answered_at
-        .unwrap_or_else(|| panic!("{answered} of {} reads answered in 60 s", keys.len()));
+    let answered = replied.len();
+    let answered_at = answered_at.unwrap_or_else(|| {
+        let missing: Vec<String> = (0..keys.len() as u64)
+            .filter(|n| !replied.contains(n))
+            .map(|n| format!("#{n} {}", String::from_utf8_lossy(&keys[n as usize])))
+            .collect();
+        panic!("{answered} of {} reads answered in 60 s (the member's are #0..#{}); unanswered: {missing:?}; waiting {}", keys.len(), member_keys, r.waiting())
+    });
     let spare_gets = gets.iter().filter(|(_, id)| *id == spare).count();
     // A GET the RTO had already timed out may go once more before the engine withdrew it; after that, none.
     let late: Vec<u64> = gets
@@ -185,4 +234,22 @@ fn a_withdrawn_get_is_not_asked_again() {
         "a withdrawn GET was asked again {} times after its race finished: {late:?} ms after",
         late.len()
     );
+    let group_gets: BTreeMap<Cid, usize> = gets.iter().filter(|(_, id)| members.contains(id) || parity.contains(id)).fold(BTreeMap::new(), |mut m, (_, id)| {
+        *m.entry(*id).or_insert(0) += 1;
+        m
+    });
+    println!("  group of {} + {}: {} of its blocks asked, {} GETs", members.len(), parity.len(), group_gets.len(), group_gets.values().sum::<usize>());
+    // The rebuilt member is not asked again either, and nothing is left waiting or withdrawn.
+    let member_late = gets.iter().filter(|(t, id)| *id == member && *t > answered_at + 1_000).count();
+    assert_eq!(member_late, 0, "the rebuilt member was still asked for after its reads were answered");
+    assert!(!r.waiting(), "the reader still waits, with every read answered (a withdrawn GET kept its deadline?)");
+    assert_eq!(r.withdrawn(), 0, "withdrawn GETs the page never ended");
+
+    // A LATE answer to the withdrawn GET, with bytes that are not its id: nothing re-sent, nothing left over.
+    let before = gets.len();
+    r.answer(Answer::Got { id: spare, bytes: b"not the block".to_vec() }, Ms(now));
+    drive(&mut r, &mut node, &silent, &mut now, 30_000, &mut gets);
+    assert_eq!(gets.len(), before, "a late wrong answer to a withdrawn GET was asked again: {:?}", &gets[before..]);
+    assert_eq!(r.withdrawn(), 0);
+    assert!(!r.waiting());
 }

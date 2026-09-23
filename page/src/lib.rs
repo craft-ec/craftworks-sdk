@@ -641,13 +641,6 @@ impl Page {
                 // `Unavailable` ("block … could not be had"). The attempt
                 // count carries over, so "not answering for N s" counts
                 // from the first send.
-                // …unless the engine has WITHDRAWN it (sdk#303): a raced group block its read no longer needs
-                // is dropped, not re-asked for ever.
-                // Taken out of the set here: the GET ends, so the engine keeps no entry for it.
-                Waiting::Get(id) if self.engine.is_withdrawn(&id) => {
-                    self.engine.take_withdrawn(&id);
-                    self.attempt_of.remove(&Waiting::Get(id));
-                }
                 Waiting::Get(id) => self.send(Waiting::Get(id), op),
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
@@ -811,12 +804,6 @@ impl Page {
                 // Verified BEFORE it joins the page's memory: a block that is
                 // not its id is not kept, and the engine hears a miss.
                 let good = engine::read::matches_id(&id, &bytes);
-                // A LATE arrival nobody wants (sdk#303: withdrawn when its race finished) is not kept: the
-                // page's memory is append-only, and this block is nobody's.
-                if good && self.engine.take_withdrawn(&id) {
-                    self.get_again.remove(&id);
-                    return;
-                }
                 if good {
                     self.blocks.insert(id, &bytes);
                     self.get_again.remove(&id);
@@ -830,10 +817,6 @@ impl Page {
             }
             Answer::GetMissed(id) => {
                 if self.answered(&Waiting::Get(id)).is_some() {
-                    // A NotFound for a GET the engine WITHDREW (sdk#303) ends it: nobody asks again.
-                    if self.engine.take_withdrawn(&id) {
-                        return;
-                    }
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
                     // asked again on a backoff -- a node that has not got it
@@ -1449,6 +1432,33 @@ impl Page {
         }
     }
 
+    /// A GET nobody needs ENDS at once -- its deadline, its re-ask backoff and the engine's entry go together --
+    /// rather than being re-sent at its next timeout for ever (sdk#303):
+    /// * one the engine WITHDREW: a raced group block no read needs once its group resolved;
+    /// * one for a block the page HOLDS: a member rebuilt from its group, which the node never answered.
+    /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
+    /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
+    fn end_unneeded_gets(&mut self) {
+        let mut ended = self.engine.take_all_withdrawn();
+        ended.extend(
+            self.deadlines
+                .keys()
+                .filter_map(|w| match w {
+                    Waiting::Get(id) => Some(*id),
+                    _ => None,
+                })
+                .chain(self.get_again.keys().copied())
+                .chain(self.get_queue.iter().copied())
+                .filter(|id| self.blocks.get(id).is_some()),
+        );
+        for id in &ended {
+            self.deadlines.remove(&Waiting::Get(*id));
+            self.attempt_of.remove(&Waiting::Get(*id));
+            self.get_again.remove(id);
+        }
+        self.get_queue.retain(|id| !ended.contains(id));
+    }
+
     /// What the engine publishes now, as a head.
     fn engine_published(&self) -> (u64, Cid) {
         (self.engine.published_seq(), self.engine.published_root())
@@ -1524,6 +1534,9 @@ impl Page {
             }
         }
         self.release();
+        // Every engine step's effects come through here, so no GET the engine stopped needing outlives the call
+        // that stopped needing it (sdk#303).
+        self.end_unneeded_gets();
     }
 
     /// Effects whose `after` set is now confirmed go out, in emitted order.
@@ -1591,6 +1604,11 @@ impl Page {
     /// Is anything still owed an answer or a re-send — an op in flight, a
     /// backed-off retry? `false` means this page is at rest until something
     /// new arrives.
+    /// GETs the engine withdrew that this page has not ended yet (sdk#303): 0 after every step.
+    pub fn withdrawn(&self) -> usize {
+        self.engine.withdrawn_count()
+    }
+
     pub fn waiting(&self) -> bool {
         !self.deadlines.is_empty()
             || !self.put_again.is_empty()

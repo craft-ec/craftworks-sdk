@@ -133,8 +133,8 @@ fn read_cold_as(
             match f {
                 Effect::FetchBlock { id, .. } => {
                     *asked.entry(id).or_insert(0) += 1;
-                    // As the page does: an answer to a GET the engine withdrew meanwhile is dropped.
-                    if e.take_withdrawn(&id) {
+                    // As the page does: a GET the engine withdrew meanwhile has ended, and is not answered.
+                    if e.is_withdrawn(&id) {
                         continue;
                     }
                     match (net.get(&id).copied().unwrap_or(Net::Serve), all.get(&id)) {

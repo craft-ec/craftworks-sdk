@@ -1182,7 +1182,7 @@ pub struct Engine<B: Blocks> {
     repair_slots: BTreeMap<Cid, BTreeSet<Cid>>,
     /// Group blocks a finished repair or race asked for and nobody wants any more (sdk#303): the page WITHDRAWS
     /// their GETs (a requester dropping what it no longer needs, not a cut-off) and does not keep them if they
-    /// arrive late ([`Engine::take_withdrawn`]).
+    /// arrive late ([`Engine::take_all_withdrawn`]).
     withdrawn: BTreeSet<Cid>,
     /// Repairs started, finished (verified, kept), and given up.
     repair_counts: (u64, u64, u64),

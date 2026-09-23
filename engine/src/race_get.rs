@@ -37,14 +37,19 @@ impl<B: Blocks> Engine<B> {
         }
     }
 
-    /// Was `id` asked for by a race or repair that has finished, with nobody wanting it any more? The page does
-    /// not re-send its GET (it stays withdrawn, so a late arrival is still recognised).
+    /// Was `id` asked for by a race or repair that has finished, with nobody wanting it any more?
     pub fn is_withdrawn(&self, id: &Cid) -> bool {
         self.withdrawn.contains(id)
     }
 
-    /// The same, for a block that just ARRIVED: withdrawn, it is not kept, and the engine forgets it.
-    pub fn take_withdrawn(&mut self, id: &Cid) -> bool {
-        self.withdrawn.remove(id)
+    /// Every block withdrawn since the last call, handed to the page, which ENDS their GETs (queued, in flight or
+    /// waiting to re-ask): the engine keeps no entry after.
+    pub fn take_all_withdrawn(&mut self) -> std::collections::BTreeSet<Cid> {
+        std::mem::take(&mut self.withdrawn)
+    }
+
+    /// Withdrawn blocks the page has not taken yet (0 after every page call).
+    pub fn withdrawn_count(&self) -> usize {
+        self.withdrawn.len()
     }
 }
