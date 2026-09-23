@@ -497,6 +497,16 @@ fn run(seed: u64, mutant: Option<Mutant>, steps: usize, fast: usize) -> Vec<Find
     if open != 0 {
         found.push(Finding { class: "A TICKET NEVER ENDED", detail: format!("seed {seed}: {open} open at rest") });
     }
+    // NO `Busy` ON THE PAGE PATH (R-b; COMMIT-LIFE K1): a write is queued by
+    // the engine and a bound refuses it by name, never `Busy`.
+    // Counted where `Busy` is MADE (page::Server), not where the harness sees
+    // replies: the store consumes its own write verdicts inside `sync`, so a
+    // count in `feed` saw almost none (measured: 0 on R-a, where bursts DO
+    // meet Busy — a blind check).
+    let busy = y.conn.with_server(|s| s.busy_told());
+    if busy > 0 {
+        found.push(Finding { class: "A WRITE WAS TOLD BUSY ON THE PAGE PATH", detail: format!("seed {seed}: {busy} Busy verdict(s)") });
+    }
     // INTERIM (R-b): nothing held or queued at rest, so nothing overlaid.
     if y.store.writes.copy.any_unaccepted() {
         found.push(Finding { class: "OVERLAY NOT EMPTY AT REST", detail: format!("seed {seed}") });

@@ -54,6 +54,11 @@ pub struct SignerFacts {
 }
 
 pub struct Server {
+    /// `Busy` verdicts this server has told a client (R-b, COMMIT-LIFE K1:
+    /// on the page path a write is QUEUED, never `Busy`). A count for the
+    /// model's check; it decides nothing. A `Cell` because verdicts are
+    /// told from `reply_from(&self)`.
+    busy_told: std::cell::Cell<u64>,
     pub page: Page,
     facts: SignerFacts,
     client_version: u16,
@@ -216,6 +221,11 @@ pub trait Host {
 const PROBE_CLIENT: engine::ClientId = engine::ClientId(0);
 
 impl Server {
+    /// How many `Busy` verdicts this server has told (see the field).
+    pub fn busy_told(&self) -> u64 {
+        self.busy_told.get()
+    }
+
     /// Writes taken forced past their reads (sdk#235).
     pub fn forced_writes(&self) -> u64 {
         self.page.forced_writes()
@@ -223,6 +233,7 @@ impl Server {
 
     pub fn new(page: Page, facts: SignerFacts) -> Server {
         Server {
+            busy_told: std::cell::Cell::new(0),
             page,
             facts,
             client_version: 0,
@@ -1020,7 +1031,10 @@ impl Server {
                         State::Stalled => W::Stalled,
                         State::Published => W::Published,
                         State::ParityComplete => W::ParityComplete,
-                        State::Busy => W::Busy,
+                        State::Busy => {
+                            self.busy_told.set(self.busy_told.get() + 1);
+                            W::Busy
+                        }
                         State::Failed => W::Failed,
                         State::Lost => W::Lost,
                         // M2: nothing applied, a read no longer held. `for_client`
