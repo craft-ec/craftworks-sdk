@@ -27,7 +27,10 @@ fn read(req_id: u64, after: Option<Vec<u8>>) -> Request {
 
 /// The keys and cursor of request `req_id`'s page, and the GETs it caused: `(on the wire, WANTED, RACED)`. The cap
 /// counts the WANTED ones -- a block's race (sdk#303: its group asked at once) rides inside its one fetch.
-fn page(c: &mut PageConn, req_id: u64, after: Option<Vec<u8>>) -> (Vec<Vec<u8>>, Option<Vec<u8>>, (usize, usize, usize)) {
+/// One request's page: its keys, its cursor, and its GETs `(on the wire, wanted, raced)`.
+type Page = (Vec<Vec<u8>>, Option<Vec<u8>>, (usize, usize, usize));
+
+fn page(c: &mut PageConn, req_id: u64, after: Option<Vec<u8>>) -> Page {
     let before = c.served(Served::Get);
     let counts = |c: &PageConn| c.with_server(|s| s.page.fetch_counts());
     let (w0, r0) = counts(c);
