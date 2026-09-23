@@ -158,7 +158,7 @@ fn owed_zero_is_done_only_for_an_engine_that_tracked_the_tree() {
     let ops = (0..300u32).map(|i| (key(i), Op::Put(vec![7u8; 1400]))).collect();
     write(&mut e, &mut net, 1, ops, &mut told);
     ticks(&mut e, &mut net, 1, 200, &mut told);
-    let root = net.head.expect("a head").1;
+    let root = net.head.unwrap_or_else(|| panic!("no head was written; the write was told {told:?}")).1;
     assert_eq!(e.parity_scan(), &ParityScan::Done { root }, "its own commits keep it Done, at the new root");
     assert_eq!(e.owed_groups(), 0, "the control: this engine's zero is 'all put'");
 

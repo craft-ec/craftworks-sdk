@@ -1098,11 +1098,15 @@ struct RaceGroup {
     present: usize,
     /// Members this commit did not change but an EARLIER commit is still
     /// putting (its stragglers): not known to be on the network until acked
-    /// (the architect, rule 10's count).
+    /// (the architect, rule 10's count). One entry per SLOT.
     #[serde(default)]
-    earlier: BTreeSet<Cid>,
-    /// The group's blocks this commit puts (new members and new parity).
-    new: BTreeSet<Cid>,
+    earlier: Vec<Cid>,
+    /// The group's blocks this commit puts (new members and new parity), one
+    /// entry per SLOT: the same value under two keys of one leaf is ONE
+    /// block filling TWO slots, and counted as a set it filled one -- a
+    /// group of repeated values could never reach k, and its commit never
+    /// published.
+    new: Vec<Cid>,
 }
 
 impl Race {
@@ -1119,12 +1123,12 @@ impl Race {
             let ids: Vec<Cid> = node.parity().collect();
             for (g, (_, members)) in freenet_prolly::parity::group_members(&node).into_iter().enumerate() {
                 let Some(trio) = ids.get(3 * g..3 * g + 3) else { continue };
-                let new: BTreeSet<Cid> = members.iter().chain(trio).copied().filter(|c| new_ids.contains(c)).collect();
+                let new: Vec<Cid> = members.iter().chain(trio).copied().filter(|c| new_ids.contains(c)).collect();
                 if new.is_empty() {
                     continue;
                 }
                 let k = members.len();
-                let earlier: BTreeSet<Cid> = members.iter().copied().filter(|m| !new_ids.contains(m) && unacked.contains(m)).collect();
+                let earlier: Vec<Cid> = members.iter().copied().filter(|m| !new_ids.contains(m) && unacked.contains(m)).collect();
                 let present = members.iter().filter(|m| !new_ids.contains(*m) && !unacked.contains(*m)).count();
                 covered.extend(new.iter().copied());
                 groups.push(RaceGroup { k, present, earlier, new });
@@ -1140,7 +1144,9 @@ impl Race {
     /// not).
     fn recoverable(&self, confirmed: &BTreeSet<Cid>, unacked: &BTreeSet<Cid>) -> bool {
         self.must.is_subset(confirmed)
-            && self.groups.iter().all(|g| g.present + g.new.intersection(confirmed).count() + g.earlier.difference(unacked).count() >= g.k)
+            && self.groups.iter().all(|g| {
+                g.present + g.new.iter().filter(|c| confirmed.contains(*c)).count() + g.earlier.iter().filter(|c| !unacked.contains(*c)).count() >= g.k
+            })
     }
 
 }
@@ -4643,7 +4649,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 13;
+const CONTEXT_VERSION: u16 = 14;
 
 /// What a context this build wrote begins with.
 ///

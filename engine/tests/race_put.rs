@@ -252,3 +252,18 @@ fn a_foreign_head_re_coding_the_group_withdraws_the_straggler_and_the_write_wait
     assert!(states(&all, 4).contains(&State::ParityComplete));
     assert!(states(&all, 2).contains(&State::ParityComplete), "the carried write was never BACKED_UP by the next own commit");
 }
+
+/// THE SAME VALUE UNDER MANY KEYS OF ONE LEAF is ONE block filling many
+/// slots of the leaf's value group. Counted as a set it filled one slot, the
+/// group never reached k, and the commit never published (measured: 50 rows
+/// of one 1,400 B value -- 14 puts acked, no head, the write `Stalled`).
+#[test]
+fn repeated_values_in_one_group_publish() {
+    let mut r = Rig::base();
+    let v = vec![7u8; freenet_prolly::node::MAX_INLINE + 400];
+    let ops: Vec<(Vec<u8>, Op)> = (0..50u32).map(|i| put(&format!("r/{i:06}"), &v)).collect();
+    let all = r.commit(2, ops, |_, _| true);
+    assert!(head(&all).is_some(), "no head: a group of one value in many slots never reached k");
+    assert!(states(&all, 2).contains(&State::Published), "{:?}", states(&all, 2));
+    assert!(states(&all, 2).contains(&State::ParityComplete), "{:?}", states(&all, 2));
+}
