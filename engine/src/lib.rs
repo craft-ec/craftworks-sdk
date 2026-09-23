@@ -690,21 +690,11 @@ pub struct Params {
     /// (~400 GETs); this keeps a chain an order of magnitude under that and
     /// releases the delegate between pages.
     pub max_gets_per_request: u32,
-    /// How many times a block is asked for before the read is answered
-    /// `Unavailable`. Attempts are RE-ISSUED, not waited on (ARCHITECTURE §7).
-    pub max_attempts: u32,
-    /// A block no attempt could fetch is REBUILT from its sibling group
-    /// (`repair`: any k of the group's k+3, verified by hash) before its read
-    /// is answered `Unavailable` (Phase 4, gap 1). Off only as the control.
+    /// A block the node answered NotFound is ALSO rebuilt from its sibling
+    /// group (`repair`: any k of the group's k+3, verified by hash) while the
+    /// page keeps asking for it (Phase 4, gap 1): an alternative source,
+    /// never a reason to stop. Off only as the control.
     pub repair_reads: bool,
-    /// Fetch rounds one read may make before it is answered `Unavailable`.
-    ///
-    /// Bounds the read itself, which `max_attempts` cannot: that counts a
-    /// BLOCK's failures, and a node that serves a block and then evicts it
-    /// produces an endless series of successes. Generous enough that a deep
-    /// tree on a slow node finishes, small enough that a read cannot spin for
-    /// a whole delegate slice.
-    pub max_read_rounds: u32,
     /// Two requests needing one block share its fetch. Off = the control.
     pub share_fetches: bool,
     /// Ceilings on an advisory preload: roots, blocks, bytes. A preload may
@@ -892,9 +882,7 @@ impl Default for Params {
             transfer_superseded_waiters: true,
             max_fetch_per_round: 4,
             max_gets_per_request: 64,
-            max_attempts: 3,
             repair_reads: true,
-            max_read_rounds: 64,
             share_fetches: true,
             preload_roots: 4,
             preload_blocks: 256,
@@ -992,7 +980,6 @@ struct Repair {
     group: repair::Group,
     have: BTreeMap<usize, Vec<u8>>,
     asked: BTreeMap<usize, u32>,
-    failed: BTreeSet<usize>,
 }
 
 /// One of a merge's writes for [`Engine::merge_front`]: its id, ops and reads.
@@ -2402,29 +2389,18 @@ impl<B: Blocks> Engine<B> {
                 });
             }
             read::Attempt::Need(ids) | read::Attempt::NeedFrom { ids, .. } => {
-                // A round that asks for something is a round: if the read has
-                // made too many without finishing, it ENDS. The node may be
-                // evicting what it serves faster than the descent can use it,
-                // and a read that cannot finish must say so rather than spin.
-                let over = {
+                // A round that asks for something is a round. There is NO cap
+                // on them (the owner's rule 7: retry until answered): a read
+                // ends when its blocks arrive, never because it has taken
+                // many rounds. A slow node is shown as "not answering for N
+                // s" by the page's sender, not turned into `Unavailable`.
+                {
                     let q = self.reads.parked.get_mut(&req_id).expect("parked");
                     q.levels_done += 1;
                     q.rounds += 1;
                     if let Some(node) = advance_to {
                         q.frontier = Some(node);
                     }
-                    q.rounds > self.params.max_read_rounds
-                };
-                if over {
-                    let blocked = ids.first().copied().unwrap_or(p.root);
-                    let result = self.gave_up(&p.want, blocked);
-                    self.reads.parked.remove(&req_id);
-                    self.forget_waiting(req_id);
-                    return vec![Effect::Reply {
-                        client: p.client,
-                        req_id,
-                        result,
-                    }];
                 }
                 // THIS REQUEST'S GETS ARE SPENT (sdk#174): answer what has been
                 // reached, with a cursor, and let the next page be a new
@@ -4513,6 +4489,13 @@ impl<B: Blocks> Engine<B> {
         let mut woken: BTreeSet<read::ReqId> = BTreeSet::new();
         for l in &landed {
             self.reads.attempts.remove(l);
+            // The block itself came: a repair rebuilding it is no longer
+            // needed, and its group's asks end with it -- otherwise a slot
+            // that is also missing would be re-asked for ever for a block
+            // already here.
+            if self.repairs.contains_key(l) {
+                self.end_repair(*l);
+            }
             if let Some(reqs) = self.reads.waiting.remove(l) {
                 for r in &reqs {
                     // Pinned for as long as this read is parked: it will
@@ -4581,52 +4564,59 @@ impl<B: Blocks> Engine<B> {
         let Some(reqs) = self.reads.waiting.get(&id).cloned() else {
             return Vec::new();
         };
-        let attempt = self.reads.attempts.entry(id).or_insert(0);
-        *attempt += 1;
-        let attempt = *attempt;
-        if attempt < self.params.max_attempts {
-            let via = self
-                .reads
-                .in_pack
-                .get(&id)
-                .copied()
-                .map_or(read::Via::Direct, read::Via::Pack);
-            self.reads.fetches += 1;
-            return vec![Effect::FetchBlock { id, via, attempt }];
+        // The node answered NotFound. The readers keep waiting and the block
+        // is ASKED AGAIN -- with no count that ends it (the owner's rule 7:
+        // retry until answered). The PAGE paces the re-asks on its backoff
+        // (the one sender), so a node that answers NotFound at once is not
+        // asked at the speed of its answers. A slow or forgetful node is
+        // shown as "not answering", never answered `Unavailable`.
+        let attempt = {
+            let a = self.reads.attempts.entry(id).or_insert(0);
+            *a += 1;
+            *a
+        };
+        // A DELTA is an optimisation over a reload, not a read of its own:
+        // a block it needs that the node answers NotFound (an answer, never
+        // silence -- the page no longer turns silence into a miss) is most
+        // likely an old root's, gone for good. It is answered
+        // `FullReloadRequired` at once -- the client reloads from the current
+        // root, so nothing is lost and live updates do not wait on a vanished
+        // root. Every other read keeps waiting.
+        let mut out = Vec::new();
+        for req in &reqs {
+            let is_delta = self.reads.parked.get(req).is_some_and(|p| matches!(p.want, read::Want::Delta(_)));
+            if is_delta {
+                let p = self.reads.parked.remove(req).expect("just read");
+                let result = self.gave_up(&p.want, id);
+                self.forget_waiting(*req);
+                out.push(Effect::Reply { client: p.client, req_id: *req, result });
+            }
         }
-        // Out of attempts. Before anyone is told: REBUILD it from its group
-        // (Phase 4, gap 1). The readers keep waiting on it; a verified
-        // rebuild lands exactly like an arrival.
+        if !self.reads.waiting.contains_key(&id) {
+            return out;
+        }
+        let via = self.reads.in_pack.get(&id).copied().map_or(read::Via::Direct, read::Via::Pack);
+        self.reads.fetches += 1;
+        out.push(Effect::FetchBlock { id, via, attempt });
+        // Meanwhile the group is an ALTERNATIVE source (Phase 4, gap 1): a
+        // verified rebuild lands exactly like an arrival.
         if self.params.repair_reads && !self.repairs.contains_key(&id) {
             let roots: Vec<Cid> = reqs.iter().filter_map(|r| self.reads.parked.get(r).map(|p| p.root)).collect();
             let group = roots.into_iter().find_map(|root| repair::find_group(&self.source(), root, id));
             if let Some(group) = group {
-                return self.start_repair(group);
-            }
-        }
-        self.fail_waiting(id)
-    }
-
-    /// Everyone waiting on `id` is told, once: it could not be had.
-    fn fail_waiting(&mut self, id: Cid) -> Vec<Effect> {
-        let Some(reqs) = self.reads.waiting.get(&id).cloned() else {
-            return Vec::new();
-        };
-        self.reads.waiting.remove(&id);
-        self.reads.attempts.remove(&id);
-        let mut out = Vec::new();
-        for req in reqs {
-            if let Some(p) = self.reads.parked.remove(&req) {
-                let result = self.gave_up(&p.want, id);
-                self.forget_waiting(req);
-                out.push(Effect::Reply {
-                    client: p.client,
-                    req_id: req,
-                    result,
-                });
+                out.extend(self.start_repair(group));
             }
         }
         out
+    }
+
+    /// Does this engine still wait on block `id` -- a parked read, a repair
+    /// slot, or a parked write? The page re-asks a NotFound block only while
+    /// this is true, so a block nobody needs any more is not asked for ever.
+    pub fn awaits_block(&self, id: &Cid) -> bool {
+        self.reads.waiting.contains_key(id)
+            || self.repair_slots.contains_key(id)
+            || self.parked_write.as_ref().is_some_and(|p| p.needs.contains(id))
     }
 
     /// Start rebuilding `group.missing`: what is held already counts, and
@@ -4635,7 +4625,7 @@ impl<B: Blocks> Engine<B> {
     fn start_repair(&mut self, group: repair::Group) -> Vec<Effect> {
         self.repair_counts.0 += 1;
         let missing = group.missing;
-        let mut r = Repair { group, have: BTreeMap::new(), asked: BTreeMap::new(), failed: BTreeSet::new() };
+        let mut r = Repair { group, have: BTreeMap::new(), asked: BTreeMap::new() };
         let mut out = Vec::new();
         for i in 0..r.group.slots.len() {
             if i == r.group.missing_ix {
@@ -4664,7 +4654,7 @@ impl<B: Blocks> Engine<B> {
     fn on_repair_block(&mut self, slot: Cid, bytes: Option<&[u8]>) -> Vec<Effect> {
         let mut out = Vec::new();
         let for_: Vec<Cid> = self.repair_slots.get(&slot).map(|s| s.iter().copied().collect()).unwrap_or_default();
-        let mut refetch = false;
+        let mut still_asked = false;
         for missing in for_ {
             let Some(r) = self.repairs.get_mut(&missing) else { continue };
             let Some(i) = r.group.slots.iter().position(|s| *s == slot) else { continue };
@@ -4675,22 +4665,19 @@ impl<B: Blocks> Engine<B> {
                     r.asked.remove(&i);
                 }
                 _ => {
-                    let n = r.asked.entry(i).or_insert(0);
-                    *n += 1;
-                    if *n < self.params.max_attempts {
-                        refetch = true;
-                    } else {
-                        r.asked.remove(&i);
-                        r.failed.insert(i);
-                    }
+                    // Still asked, and asked AGAIN: a group block that is slow
+                    // is not a group block that is gone, so no count here
+                    // ever gives up on it (the page paces the re-ask).
+                    *r.asked.entry(i).or_insert(0) += 1;
+                    still_asked = true;
                 }
             }
             out.extend(self.try_repair(missing));
         }
-        if refetch && self.repair_slots.contains_key(&slot) {
+        if still_asked && self.repair_slots.contains_key(&slot) {
             self.reads.fetches += 1;
             out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 1 });
-        } else if !refetch {
+        } else if !still_asked {
             // Nobody asks for this block any more (it came, or it is spent).
             if let Some(set) = self.repair_slots.get_mut(&slot) {
                 set.retain(|m| self.repairs.get(m).is_some_and(|r| r.asked.keys().any(|i| r.group.slots[*i] == slot)));
@@ -4702,9 +4689,9 @@ impl<B: Blocks> Engine<B> {
         out
     }
 
-    /// With `k` of the group held, rebuild and VERIFY; with too few left to
-    /// ever reach `k`, give up -- and the readers are told `Unavailable`,
-    /// naming the block, as before repair existed.
+    /// With `k` of the group held, rebuild and VERIFY. A rebuild that does
+    /// not verify ends the REPAIR, named in `repair_failed`, and never the
+    /// read: the block itself is still asked for, and the readers wait.
     fn try_repair(&mut self, missing: Cid) -> Vec<Effect> {
         let Some(r) = self.repairs.get(&missing) else { return Vec::new() };
         let k = r.group.k;
@@ -4724,17 +4711,9 @@ impl<B: Blocks> Engine<B> {
                 Err(why) => {
                     self.repair_counts.2 += 1;
                     self.repair_failed = Some(format!("block {} could not be repaired: {why}", short_id(&missing)));
-                    self.fail_waiting(missing)
+                    Vec::new()
                 }
             };
-        }
-        let could = r.have.len() + r.asked.len();
-        if could < k {
-            let why = format!("block {} is lost and its group cannot rebuild it: {} of the {k} needed could be had", short_id(&missing), r.have.len());
-            self.end_repair(missing);
-            self.repair_counts.2 += 1;
-            self.repair_failed = Some(why);
-            return self.fail_waiting(missing);
         }
         Vec::new()
     }

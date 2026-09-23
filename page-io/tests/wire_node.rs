@@ -705,9 +705,12 @@ fn the_own_page_and_a_reader_read_the_same_tree_identically_intact_and_corrupted
     client(&mut v, &mut node, &mut now, &Request::Identity);
     let theirs = answers_to(&client(&mut v, &mut node, &mut now, &range(22)), 22);
     // REFUSED, not an empty page: a block that does not hash to its id is
-    // Unavailable (blocked on it), never read as "no rows".
-    assert!(mine.len() == 1 && mine[0].starts_with("Unavailable { req_id: 22"), "the own page did not refuse corrupted blocks: {mine:?}");
-    assert_eq!(theirs, mine, "a reader and the own page refused a corrupted tree differently");
+    // not the block, so nothing is read from it -- never "no rows". And the
+    // read does not END on it either (rule 7): the block is asked for again
+    // (another copy, a repair), so the answer is NONE yet, identically on
+    // both paths.
+    assert!(mine.is_empty(), "the own page answered from corrupted blocks: {mine:?}");
+    assert_eq!(theirs, mine, "a reader and the own page treated a corrupted tree differently");
 }
 
 /// A page that OPENS as the Session does now (`begin`): it knows nothing of

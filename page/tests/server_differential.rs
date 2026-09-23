@@ -193,6 +193,14 @@ struct PageRig {
     got_once: std::collections::BTreeSet<Cid>,
     put_once: std::collections::BTreeSet<Cid>,
     held: Vec<Op>,
+    /// GETs of these blocks are never answered: a node that is SILENT about
+    /// them (not NotFound -- nothing at all).
+    silent: std::collections::BTreeSet<Cid>,
+    /// Every GET the node was asked, per block.
+    gets: BTreeMap<Cid, usize>,
+    /// When each GET was asked (simulated ms), in order: what a cost
+    /// failure prints, so it says WHEN the re-sends went, not only how many.
+    get_at: Vec<u64>,
 }
 
 impl PageRig {
@@ -210,6 +218,9 @@ impl PageRig {
             got_once: Default::default(),
             put_once: Default::default(),
             held: Vec::new(),
+            silent: Default::default(),
+            gets: BTreeMap::new(),
+            get_at: Vec::new(),
         }
     }
 
@@ -217,6 +228,46 @@ impl PageRig {
         let frame = protocol::encode_session_request(VERSION, self.session, r).expect("encodes");
         self.server.client(&frame);
         self.run(node)
+    }
+
+    /// Hand the page a request and nothing else: no `run`, so the clock does
+    /// not move (a timed test drives it with [`PageRig::run_for`]).
+    fn send_only(&mut self, r: &Request) {
+        let frame = protocol::encode_session_request(VERSION, self.session, r).expect("encodes");
+        self.server.client(&frame);
+    }
+
+    /// Run until `ms` of simulated time have passed, the page's own timers
+    /// driving the clock (what a host that sleeps until `next_due` does).
+    fn run_for(&mut self, node: &mut Node, ms: u64) -> Vec<Reply> {
+        // Its OWN loop, never `run`: `run` moves the clock itself (to each
+        // next deadline, up to 2,000 times), so a "5 minute" run through it
+        // lasted 33 simulated hours and counted a day's worth of correct
+        // 60 s re-sends as a storm.
+        let until = self.now + ms;
+        let mut replies = decode(self.server.take_replies());
+        loop {
+            for _ in 0..10_000 {
+                let ops = self.server.take_ops();
+                if ops.is_empty() {
+                    break;
+                }
+                for op in ops {
+                    if let Some(a) = self.answer(node, op) {
+                        self.server.node(a, Ms(self.now));
+                    }
+                }
+                replies.extend(decode(self.server.take_replies()));
+            }
+            if self.now >= until {
+                break;
+            }
+            let next = self.server.page.next_due().map_or(until, |d| d.0.min(until));
+            self.now = next.max(self.now + 1).min(until);
+            self.server.tick(Ms(self.now));
+            replies.extend(decode(self.server.take_replies()));
+        }
+        replies
     }
 
     /// Answer every op until none is left; when only silence is left, let the
@@ -263,6 +314,11 @@ impl PageRig {
                 Answer::PutOk(id)
             }
             Op::Get { id } => {
+                *self.gets.entry(id).or_insert(0) += 1;
+                self.get_at.push(self.now);
+                if self.silent.contains(&id) {
+                    return None;
+                }
                 if self.faults.lose_first_gets && self.got_once.insert(id) {
                     return None;
                 }
@@ -1965,7 +2021,9 @@ fn a_merge_goes_before_a_later_own_write_and_the_later_value_stands() {
 /// that held it go away). A page writes 6,000 rows and PUTS ITS OWN PARITY;
 /// the node then LOSES blocks of one sibling group; a fresh page reads every
 /// row of the lost leaves through `Page::send`. Three lost: every value right,
-/// rebuilt from the group. A fourth lost: those reads end `Unavailable`.
+/// rebuilt from the group. A fourth lost: the group cannot rebuild, and the
+/// read does NOT end (rule 7) -- the page keeps asking the node for five
+/// minutes of NotFound, and when the block is back the read answers it.
 #[test]
 fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
     use freenet_prolly::node::Node as TreeNode;
@@ -2008,6 +2066,7 @@ fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
     };
     let three_keys: Vec<Vec<u8>> = members[..3].iter().flat_map(|l| keys_of(&node, l)).collect();
     let first_leaf_keys = keys_of(&node, &members[0]);
+    let first_leaf = node.blocks.get(&members[0]).expect("held").clone();
     // THE NODE LOSES three members of the group.
     for l in &members[..3] {
         node.blocks.remove(l);
@@ -2037,9 +2096,67 @@ fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
     let mut late = PageRig::new();
     late.session = SESSION + 60;
     late.client_as(&mut node, &Request::Identity);
-    match read(&mut late, &mut node, &first_leaf_keys[0]) {
-        Some(Reply::Unavailable { .. }) => {}
-        other => panic!("with 4 of a group lost a read answered {other:?}"),
+    let key = first_leaf_keys[0].clone();
+    let want: u32 = std::str::from_utf8(&key[2..]).expect("utf8").parse().expect("a number");
+    let id = 9_000u64;
+    let answer = |rs: &[Reply]| rs.iter().find(|r| matches!(r, Reply::Value { req_id, .. } | Reply::Unavailable { req_id, .. } if *req_id == id)).cloned();
+    late.send_only(&Request::Get { req_id: id, key: key.clone() });
+    let mut rs = Vec::new();
+    // FIVE MINUTES of the node answering NotFound: no answer, never
+    // `Unavailable`, and the block asked for again and again.
+    rs.extend(late.run_for(&mut node, 300_000));
+    assert_eq!(answer(&rs), None, "with the block NotFound for 5 min the read ended: {:?}", answer(&rs));
+    assert!(late.server.page.waiting(), "the page stopped waiting on a read it never answered");
+    let asked = late.gets.get(&members[0]).copied().unwrap_or(0);
+    assert!(asked >= 5, "the lost leaf was asked for {asked} time(s) in 5 min: the page stopped asking");
+    // ...and on a BACKOFF, not at the speed of the NotFounds: doubling from
+    // 100 ms to the 60 s ceiling is ~15 asks in 5 min.
+    assert!(asked <= 40, "the lost leaf was asked for {asked} times in 5 min: re-asked at the speed of the answers, not on a backoff; GETs at {:?} .. {:?}", &late.get_at[..late.get_at.len().min(12)], &late.get_at[late.get_at.len().saturating_sub(4)..]);
+    // The block is back (a keeper's repair, a late PUT): the SAME read answers.
+    node.blocks.insert(members[0], first_leaf);
+    rs.extend(late.run_for(&mut node, 120_000));
+    match answer(&rs) {
+        Some(Reply::Value { value: Some(v), .. }) if v == value(want).into_bytes() => {}
+        other => panic!("the block came back and the read answered {other:?} (asked {asked} times while it was gone)"),
     }
-    assert!(late.server.page.repair_failed().is_some_and(|w| w.contains("cannot rebuild it")), "{:?}", late.server.page.repair_failed());
+    println!("  4 of a group lost: 5 min NotFound, {asked} GETs, no Unavailable; block back -> the read answers");
+}
+
+/// **A BLOCK THE NODE IS SILENT ABOUT FOR FIVE MINUTES IS STILL READ** (the
+/// owner's rule 7; the owner's "block … could not be had"). Silence is not
+/// an answer: the page re-sends the GET on the RTO, the read never ends
+/// `Unavailable`, and when the node answers, the read answers.
+#[test]
+fn a_block_silent_for_five_minutes_then_answering_is_read() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..600u32).map(|i| (format!("k/{i:06}"), format!("value {i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &ops)), 1)), "the write did not publish");
+    // A fresh page; the node goes SILENT about every block (it answers
+    // nothing), so the read's first GET goes unanswered.
+    let mut reader = PageRig::new();
+    reader.session = SESSION + 70;
+    reader.client_as(&mut node, &Request::Identity);
+    reader.silent = node.blocks.keys().copied().collect();
+    let id = 7_000u64;
+    reader.send_only(&Request::Get { req_id: id, key: b"k/000321".to_vec() });
+    let mut rs = Vec::new();
+    rs.extend(reader.run_for(&mut node, 300_000));
+    let answer = |rs: &[Reply]| rs.iter().find(|r| matches!(r, Reply::Value { req_id, .. } | Reply::Unavailable { req_id, .. } if *req_id == id)).cloned();
+    assert_eq!(answer(&rs), None, "a read over a silent node ended: {:?}", answer(&rs));
+    let sent: usize = reader.gets.values().sum();
+    assert!(sent >= 5, "{sent} GETs in 5 min of silence: the page did not re-send");
+    // ...each on its OWN backoff (RTO x 2^(n-1), to the 60 s ceiling), not at
+    // a shared RTO other answers keep pulling down.
+    assert!(sent <= 60, "{sent} GETs in 5 min of silence: re-sent without a per-op backoff; first at {:?}, last at {:?}", &reader.get_at[..reader.get_at.len().min(12)], &reader.get_at[reader.get_at.len().saturating_sub(4)..]);
+    // The node answers again.
+    reader.silent.clear();
+    rs.extend(reader.run_for(&mut node, 120_000));
+    match answer(&rs) {
+        Some(Reply::Value { value: Some(v), .. }) if v == b"value 321" => {}
+        other => panic!("the node answered again and the read answered {other:?} ({sent} GETs while silent)"),
+    }
+    println!("  5 min silent: {sent} GETs re-sent, no Unavailable; node answers -> the read answers");
 }

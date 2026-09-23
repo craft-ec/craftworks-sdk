@@ -68,10 +68,21 @@ fn keys_in(all: &MemBlocks, leaves: &[Cid]) -> Vec<Vec<u8>> {
 
 /// What a cold reader answers for `keys`, from a network holding `all` minus
 /// `lost`; the page keeps what the engine rebuilt (`Keep`).
+///
+/// The engine re-asks a missed block with NO count that ends it (rule 7);
+/// the PAGE paces those re-asks on a backoff. This harness has no clock, so
+/// it plays the pacing as "a block asked more than [`PACED`] times is not
+/// asked again yet": its later re-asks are held, as a paced page holds them
+/// until due. A read that is still waiting then is a read the page would
+/// show as "not answering" -- never one that ended.
+const PACED: usize = 3;
+
 fn read_cold(root: Cid, all: &MemBlocks, lost: &BTreeSet<Cid>, keys: &[Vec<u8>], params: Params) -> (BTreeMap<Vec<u8>, ReadResult>, Engine<Store>) {
     let (mut e, store) = cold_reader(root, params);
     let mut answers = BTreeMap::new();
     for (n, key) in keys.iter().enumerate() {
+        // Paced per read: each read is its own stretch of time.
+        let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
         let mut queue = e.step(Event::Get { client: ClientId(1), req_id: ReqId(n as u64), key: key.clone() });
         let mut steps = 0;
         while let Some(f) = queue.pop() {
@@ -79,6 +90,11 @@ fn read_cold(root: Cid, all: &MemBlocks, lost: &BTreeSet<Cid>, keys: &[Vec<u8>],
             assert!(steps < 20_000, "a read did not settle");
             match f {
                 Effect::FetchBlock { id, .. } => {
+                    let times = asked.entry(id).or_insert(0);
+                    *times += 1;
+                    if *times > PACED {
+                        continue;
+                    }
                     let ev = match all.get(&id).filter(|_| !lost.contains(&id)) {
                         Some(b) => {
                             store.put(id, b);
@@ -136,34 +152,38 @@ fn up_to_three_lost_blocks_of_a_group_are_rebuilt_and_every_read_is_right() {
     }
 }
 
+/// Past the group's reach the read WAITS (rule 7): it is never answered
+/// `Unavailable`, and the engine still awaits the block, so the page keeps
+/// asking for it and shows "not answering for N s". The block may come back
+/// (a keeper's repair, a late PUT); `Unavailable` would have thrown away the
+/// read that could then be answered.
 #[test]
-fn four_lost_blocks_of_a_group_end_unavailable_and_say_why() {
+fn four_lost_blocks_of_a_group_wait_and_are_never_answered_unavailable() {
     let records = records();
     let (root, mut all) = tree(&records);
     let (members, _) = a_leaf_group(&mut all, root);
     let lost: BTreeSet<Cid> = members[..4].iter().copied().collect();
     let keys = keys_in(&all, &members[..1]);
     let (answers, e) = read_cold(root, &all, &lost, &keys, Params::default());
-    for (k, r) in &answers {
-        assert!(matches!(r, ReadResult::Unavailable(c) if *c == members[0]), "{}: past the group's reach, answered {r:?}", String::from_utf8_lossy(k));
-    }
-    assert_eq!(answers.len(), keys.len(), "a read never answered");
-    let why = e.repair_failed().expect("a given-up repair did not say why");
-    assert!(why.contains("cannot rebuild it") && why.contains(&format!("of the {} needed", members.len())), "{why}");
-    println!("  4 lost: {why}");
+    assert!(answers.is_empty(), "past the group's reach a read ended: {answers:?}");
+    assert!(e.awaits_block(&members[0]), "the engine stopped waiting on the lost block: nothing would ask for it again");
+    assert_eq!(e.repair_counts().1, 0, "a group short of k rebuilt something");
+    println!("  4 lost: {} read(s) waiting, block still awaited, repairs {:?}", keys.len(), e.repair_counts());
 }
 
 /// THE CONTROL: the same network, repair off -- one lost member is a read
-/// that cannot be answered. The passes above are the repair's.
+/// that is not answered (it waits on the block). The passes above are the
+/// repair's.
 #[test]
-fn control_with_repair_off_one_lost_block_is_unavailable() {
+fn control_with_repair_off_one_lost_block_is_not_read() {
     let records = records();
     let (root, mut all) = tree(&records);
     let (members, _) = a_leaf_group(&mut all, root);
     let lost: BTreeSet<Cid> = [members[0]].into_iter().collect();
     let keys = keys_in(&all, &members[..1]);
     let (answers, e) = read_cold(root, &all, &lost, &keys, Params { repair_reads: false, ..Params::default() });
-    assert!(answers.values().all(|r| matches!(r, ReadResult::Unavailable(_))), "with repair off a lost block was read: {answers:?}");
+    assert!(answers.is_empty(), "with repair off a lost block was answered: {answers:?}");
+    assert!(e.awaits_block(&members[0]));
     assert_eq!(e.repair_counts(), (0, 0, 0));
 }
 
@@ -206,6 +226,7 @@ fn a_group_block_that_does_not_hash_to_its_slot_is_not_used() {
     let lost: BTreeSet<Cid> = [members[0]].into_iter().collect();
     let keys = keys_in(&all, &members[..1]);
     let (answers, e) = read_cold(root, &forged, &lost, &keys, Params::default());
-    assert!(answers.values().all(|r| matches!(r, ReadResult::Unavailable(_))), "forged parity rebuilt a block: {answers:?}");
+    assert!(answers.is_empty(), "forged parity answered a read: {answers:?}");
     assert_eq!(e.repair_counts().1, 0, "a block was rebuilt from forged parity");
+    assert!(e.awaits_block(&members[0]), "the lost block is no longer awaited");
 }

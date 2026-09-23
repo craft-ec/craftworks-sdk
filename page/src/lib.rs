@@ -453,6 +453,10 @@ pub struct Page {
     /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
+    /// A block the node answered NotFound, asked again on a doubling backoff
+    /// (rule 7: retry until answered) while the engine still waits on it:
+    /// `(due at, NotFounds so far)`. `u64::MAX` = asked, awaiting the answer.
+    get_again: BTreeMap<Cid, (u64, u32)>,
     /// A `NotNext{current}` not yet ADOPTED: the register must be read to hold
     /// it first (invariant 1b).
     verify: Option<Verify>,
@@ -537,6 +541,7 @@ impl Page {
             sign_again: None,
             sign_refusals: 0,
             held_again: BTreeMap::new(),
+            get_again: BTreeMap::new(),
             verify: None,
             landings: 0,
             most_landing_updates: 0,
@@ -628,9 +633,13 @@ impl Page {
             let op = d.op.clone();
             self.attempt_of.insert(w.clone(), d.attempt);
             match w {
-                // A GET that did not answer is the engine's to re-issue: it
-                // counts attempts and gives up within its own budget.
-                Waiting::Get(id) => self.step(Event::BlockMissed(id)),
+                // A GET nobody answered is SENT AGAIN on the RTO (rule 7),
+                // never turned into a miss: silence is not an answer, and a
+                // miss is what the engine used to count down to
+                // `Unavailable` ("block … could not be had"). The attempt
+                // count carries over, so "not answering for N s" counts
+                // from the first send.
+                Waiting::Get(id) => self.send(Waiting::Get(id), op),
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
                 // A landing's request, or this commit's.
@@ -707,6 +716,10 @@ impl Page {
         let due: Vec<Cid> = self.held_again.iter().filter(|(_, (at, _))| now >= *at).map(|(id, _)| *id).collect();
         for id in due {
             self.send(Waiting::Held(id), Op::AskHeld { id });
+        }
+        let due: Vec<Cid> = self.get_again.iter().filter(|(_, (at, _))| *at != u64::MAX && now >= *at).map(|(id, _)| *id).collect();
+        for id in due {
+            self.get_again_now(id);
         }
         if let Some(o) = &self.owed {
             if o.record.is_some() && o.stale_reads > 0 && !self.deadlines.contains_key(&Waiting::ReadBack) {
@@ -788,13 +801,30 @@ impl Page {
                 }
                 // Verified BEFORE it joins the page's memory: a block that is
                 // not its id is not kept, and the engine hears a miss.
-                if engine::read::matches_id(&id, &bytes) {
+                let good = engine::read::matches_id(&id, &bytes);
+                if good {
                     self.blocks.insert(id, &bytes);
+                    self.get_again.remove(&id);
+                } else {
+                    // Scheduled BEFORE the engine hears it: the engine
+                    // re-asks inside that step, and the pacing check must
+                    // already see the backoff, or the re-ask goes out at once.
+                    self.ask_again_later(id);
                 }
                 self.step(Event::BlockArrived { id, bytes });
             }
             Answer::GetMissed(id) => {
                 if self.answered(&Waiting::Get(id)).is_some() {
+                    // A real answer: the engine hears it (a NotFound starts a
+                    // repair from the block's group), and the block itself is
+                    // asked again on a backoff -- a node that has not got it
+                    // YET is the ordinary case, and one that lost it may have
+                    // it back from a keeper or a late PUT.
+                    // Scheduled BEFORE the engine hears it: the engine
+                    // re-asks inside that step, and the pacing check must
+                    // already see the backoff, or the re-ask goes out at the
+                    // speed of the answers (3,001 GETs in 5 min, measured).
+                    self.ask_again_later(id);
                     self.step(Event::BlockMissed(id));
                 }
             }
@@ -1250,7 +1280,14 @@ impl Page {
             }
         }
         let attempt = self.attempt_of.remove(&w).map_or(1, |a| a + 1);
-        let d = Deadline { at: self.now + self.rto.rto_ms(), op: op.clone(), sent_at: self.now, attempt };
+        // PER-OP backoff on top of the shared RTO (TCP backs off per
+        // segment): the n-th send of one op waits RTO x 2^(n-1), capped at
+        // the RTO's ceiling. The shared RTO alone is pulled back down by every
+        // other op's answers, so an op nobody answers was re-sent at that
+        // small RTO for ever -- thousands of GETs in five minutes (measured
+        // on a silent node once silence stopped ending a read).
+        let wait = (self.rto.rto_ms() << (attempt - 1).min(16)).min(rto::RTO_MAX_MS as u64);
+        let d = Deadline { at: self.now + wait, op: op.clone(), sent_at: self.now, attempt };
         self.deadlines.insert(w, d);
         self.out.push(op);
     }
@@ -1313,10 +1350,11 @@ impl Page {
         let deadlines = self.deadlines.values().map(|d| d.at);
         let sign = self.sign_again;
         let held = self.held_again.values().map(|(at, _)| *at);
+        let gets = self.get_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
         let verify = self.verify.as_ref().and_then(|v| v.again_at);
         let puts = (!self.put_again.is_empty()).then_some(self.now);
         let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
-        deadlines.chain(sign).chain(held).chain(verify).chain(puts).chain(backstop).min().map(Ms)
+        deadlines.chain(sign).chain(held).chain(gets).chain(verify).chain(puts).chain(backstop).min().map(Ms)
     }
 
     /// The retry clock now: `(RTO ms, SRTT ms, GET window)`.
@@ -1433,6 +1471,19 @@ impl Page {
                         let bytes = self.blocks.get(&id).expect("held").to_vec();
                         let more = self.engine.step(Event::BlockArrived { id, bytes });
                         self.carry_out(more);
+                    } else if self.deadlines.contains_key(&Waiting::Get(id)) || self.get_queue.contains(&id) {
+                        // ONE GET per block while one is out: its answer
+                        // serves every reader, and its re-send is the RTO's
+                        // (with its backoff). A second send here would reset
+                        // that clock -- the engine re-asks on every tick and
+                        // re-descent, so a silent block was re-sent on every
+                        // one of them (2,001 GETs in 5 min, measured).
+                    } else if self.get_again.get(&id).is_some_and(|(at, _)| *at != u64::MAX && *at > self.now) {
+                        // The node answered NotFound a moment ago and the
+                        // block is due to be asked again on its backoff: the
+                        // engine's re-ask waits for that, so a node that
+                        // answers NotFound at once is not asked at the speed
+                        // of its answers.
                     } else {
                         self.send(Waiting::Get(id), Op::Get { id });
                     }
@@ -1505,7 +1556,33 @@ impl Page {
     /// backed-off retry? `false` means this page is at rest until something
     /// new arrives.
     pub fn waiting(&self) -> bool {
-        !self.deadlines.is_empty() || !self.put_again.is_empty() || self.sign_again.is_some() || !self.held_again.is_empty()
+        !self.deadlines.is_empty()
+            || !self.put_again.is_empty()
+            || self.sign_again.is_some()
+            || !self.held_again.is_empty()
+            || !self.get_again.is_empty()
+    }
+
+    /// Schedule `id` to be asked again after a doubling backoff (from
+    /// [`BACKOFF_MS`], capped at the RTO's ceiling) -- never at the speed of
+    /// the answers.
+    fn ask_again_later(&mut self, id: Cid) {
+        let n = self.get_again.get(&id).map_or(0, |(_, n)| *n) + 1;
+        let wait = (BACKOFF_MS << n.min(16)).min(rto::RTO_MAX_MS as u64);
+        self.get_again.insert(id, (self.now + wait, n));
+    }
+
+    /// Ask for `id` again -- if the engine still waits on it and the page
+    /// does not already hold it (a repair may have rebuilt it meanwhile).
+    fn get_again_now(&mut self, id: Cid) {
+        if self.blocks.get(&id).is_some() || !self.engine.awaits_block(&id) {
+            self.get_again.remove(&id);
+            return;
+        }
+        if let Some(e) = self.get_again.get_mut(&id) {
+            e.0 = u64::MAX;
+        }
+        self.send(Waiting::Get(id), Op::Get { id });
     }
 
     /// Ops to send, in order.

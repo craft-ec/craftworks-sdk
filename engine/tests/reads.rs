@@ -834,7 +834,6 @@ fn no_read_sequence_panics_and_every_read_answers() {
         let (mut e, store) = reader(
             root,
             Params {
-                max_attempts: 2,
                 max_context_bytes: 32 * 1024,
                 // A context this small declares every cap to match: the
                 // defaults' worst case is ~247 KiB (sdk#162), and the asks
@@ -1011,7 +1010,7 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
             store.forget(root);
         }
 
-        let (mut answered, mut unavailable) = (0, 0);
+        let (mut answered, mut unavailable, mut waiting) = (0, 0, 0);
         let mut unanswered_keys: Vec<Vec<u8>> = Vec::new();
         for (n, key) in keys.iter().step_by(400).enumerate() {
             let mut queue = h.step(Event::Get {
@@ -1021,6 +1020,14 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
             });
             let mut steps = 0;
             let mut served = 0usize;
+            // The engine re-asks with no count that ends a read (rule 7);
+            // the page paces it. This harness has no clock, so it plays the
+            // pacing as "a block asked more than PACED times in this read is
+            // not asked again yet". A read still unanswered then is one the
+            // page would show as "not answering" -- never one that ended.
+            const PACED: usize = 64;
+            let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
+            let mut replied = false;
             while let Some(f) = queue.pop() {
                 steps += 1;
                 assert!(
@@ -1030,6 +1037,11 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
                 );
                 match f {
                     Effect::FetchBlock { id, .. } => {
+                        let times = asked.entry(id).or_insert(0);
+                        *times += 1;
+                        if *times > PACED {
+                            continue;
+                        }
                         let ev = match all.get(&id) {
                             Some(b) => {
                                 store.put(id, b);
@@ -1049,26 +1061,35 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
                         };
                         queue.extend(h.step(ev));
                     }
-                    Effect::Reply { result, .. } => match result {
-                        ReadResult::Value(_) => answered += 1,
-                        ReadResult::Unavailable(_) | ReadResult::OutOfWarmSpace => {
-                            unavailable += 1;
-                            unanswered_keys.push(key.clone());
+                    Effect::Reply { result, .. } => {
+                        replied = true;
+                        match result {
+                            ReadResult::Value(_) => answered += 1,
+                            ReadResult::Unavailable(_) | ReadResult::OutOfWarmSpace => {
+                                unavailable += 1;
+                                unanswered_keys.push(key.clone());
+                            }
+                            other => panic!("a Get was answered with {other:?}"),
                         }
-                        other => panic!("a Get was answered with {other:?}"),
-                    },
+                    }
                     _ => {}
                 }
             }
+            if !replied {
+                waiting += 1;
+                unanswered_keys.push(key.clone());
+            }
         }
+        // Rule 7: nothing ends a read because the node was slow or forgot.
+        assert_eq!(unavailable, 0, "forget_every={forget_every}: a read ended Unavailable");
         assert_eq!(
-            answered + unavailable,
+            answered + waiting,
             keys.iter().step_by(400).count(),
-            "forget_every={forget_every}: not every read was answered"
+            "forget_every={forget_every}: a read was lost track of"
         );
         println!(
             "  {records_in_tree} records, forget every {forget_every}: \
-             {answered} answered, {unavailable} unavailable"
+             {answered} answered, {waiting} still waiting, {unavailable} unavailable"
         );
 
         // THE ACCEPTANCE ROW (sdk#34). Printed since #32; asserted now.
@@ -1098,7 +1119,7 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
         }
         if forget_every != 1 {
             assert_eq!(
-                unavailable, 0,
+                waiting, 0,
                 "forget_every={forget_every}: a node that retains anything at \
                  all must answer every read"
             );
@@ -1218,14 +1239,14 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
     );
 }
 
-/// A read that GIVES UP leaves nothing of itself in the context (sdk#187
-/// review). It waited on up to a round's worth of blocks; one kept missing
-/// until it was answered Unavailable. Every block it asked for had an
-/// `attempts` entry, and those for the blocks that never came back outlived
-/// it -- in no cap, in no sum -- so a context with no parked reads at all
-/// went over its bound. Idle before, idle after.
+/// A read whose block keeps MISSING does not end (rule 7: retry until
+/// answered) -- sixteen NotFounds and it is still waiting, the block asked
+/// again after each -- and once the block comes, the read answers and leaves
+/// nothing of itself in the context (sdk#187 review: `attempts` entries once
+/// outlived their read and pushed an idle context over its bound). Idle
+/// before, idle after.
 #[test]
-fn a_read_that_gives_up_leaves_no_attempts_behind() {
+fn a_read_whose_block_keeps_missing_waits_then_answers_and_leaves_no_attempts_behind() {
     let (_, root, all) = fixture(500);
     let (mut e, store) = reader(root, Params::default());
     let idle = e.context_len();
@@ -1261,20 +1282,41 @@ fn a_read_that_gives_up_leaves_no_attempts_behind() {
     let round = stepped!(e, Event::BlockArrived { id: root, bytes });
     let asked = fetched(&round);
     assert!(asked.len() >= 2, "the second round asked for {} block(s): not a round", asked.len());
-    // One of them misses until the read gives up; the rest never answer.
-    let mut answered = false;
-    for _ in 0..16 {
+    // One of them misses sixteen times: the read is NOT answered, and the
+    // block is asked for again after every miss.
+    for n in 0..16 {
         let out = stepped!(e, Event::BlockMissed(asked[0]));
-        if replies(&out).iter().any(|(id, r)| *id == ReqId(1) && matches!(r, ReadResult::Unavailable(_))) {
-            answered = true;
-            break;
+        assert!(
+            !replies(&out).iter().any(|(id, _)| *id == ReqId(1)),
+            "the read ended after {} NotFound(s): {:?}",
+            n + 1,
+            replies(&out)
+        );
+        assert!(fetched(&out).contains(&asked[0]), "miss {}: the block was not asked for again", n + 1);
+    }
+    assert!(e.awaits_block(&asked[0]), "the engine stopped waiting on the block");
+    // Now the node has it: serve everything the read asks for.
+    let mut queue: Vec<Effect> = asked.iter().map(|id| Effect::FetchBlock { id: *id, via: engine::read::Via::Direct, attempt: 0 }).collect();
+    let mut answered = false;
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the read did not settle once its blocks came");
+        match f {
+            Effect::FetchBlock { id, .. } => {
+                let bytes = all.get(&id).expect("held").to_vec();
+                store.put(id, &bytes);
+                queue.extend(stepped!(e, Event::BlockArrived { id, bytes }));
+            }
+            Effect::Reply { req_id, .. } if req_id == ReqId(1) => answered = true,
+            _ => {}
         }
     }
-    assert!(answered, "the read never gave up");
+    assert!(answered, "the block came back and the read never answered");
     assert_eq!(
         e.context_len(),
         idle,
-        "a read that gave up left {} B in the context",
+        "a finished read left {} B in the context",
         e.context_len() as i64 - idle as i64
     );
 }
