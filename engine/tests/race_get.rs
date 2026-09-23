@@ -509,5 +509,5 @@ fn a_forged_slot_does_not_count_toward_k() {
 }
 
 fn hex(c: &Cid) -> String {
-    c.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    core_types::hex::encode(&c[..6])
 }
