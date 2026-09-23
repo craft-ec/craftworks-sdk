@@ -1,4 +1,4 @@
-import { openSession, open as openWith, SHIPPED_ARTEFACTS } from "./session.js";
+import { openSession, open as openWith, openAsked as openAskedWith, SHIPPED_ARTEFACTS } from "./session.js";
 import { engineDb, sameRows } from "./engine-db.js";
 
 // Plain-object API over the wasm surface. `raw` is the wasm-bindgen module.
@@ -221,6 +221,10 @@ export function wrap(raw) {
     // screen that never fills the first time it forgets one, and nothing
     // that says why.
     open: (opts = {}) => openWith(raw.Session, { artefacts: SHIPPED_ARTEFACTS, ...opts }),
+    // WHOSE NODE: a session that asked this node's signer which head it signs
+    // for — nothing registered, minted or provisioned — and STAYS OPEN, its
+    // `asked()` the identity (`openAsked`).
+    openAsked: (opts = {}) => openAskedWith(raw.Session, { artefacts: SHIPPED_ARTEFACTS, ...opts }),
     SHIPPED_ARTEFACTS,
     // PUBLISHING a web container (builder#104): `params(state)` is the
     // `webapp` contract's params (BLAKE3, which a page has no other way to

@@ -50,6 +50,19 @@ pub struct Artefacts {
     pub signer: DelegateKey,
 }
 
+/// What the node's signer said to [`PageIo::ask`]: whose node this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asked {
+    /// It signs for this Register (instance id): the node holds this key.
+    Register([u8; 32]),
+    /// The signer is there and holds no key.
+    NoKey,
+    /// The node has no such delegate, or the signer refused: in their words.
+    Refused(String),
+    /// Nothing answered within the first request's budget.
+    NotAnswering,
+}
+
 /// The head subscription as page-io can honestly report it (sdk#259).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadSubscription {
@@ -202,6 +215,11 @@ pub struct PageIo {
     /// node's refusal of the first exchange, in its words; or its re-asks spent.
     refused: Option<String>,
     exhausted: bool,
+    /// [`PageIo::ask`]: this page only ASKS the node's signer which Register
+    /// it holds — nothing is registered, minted or provisioned — and the
+    /// answer ends here ([`Asked`]).
+    asking: bool,
+    asked: Option<Asked>,
 }
 
 /// The signer's first request, kept so it can be sent once the registration
@@ -302,6 +320,8 @@ impl PageIo {
             signer_container: None,
             refused: None,
             exhausted: false,
+            asking: false,
+            asked: None,
         }
     }
 
@@ -339,6 +359,32 @@ impl PageIo {
         io.signer_has_record = Some(true);
         io.server.set_facts(SignerFacts { head_writable: false, head_id: register_id });
         io
+    }
+
+    /// WHOSE NODE IS THIS? Ask the node's EXISTING signer which Register it
+    /// signs for — the same query [`PageIo::begin`] sends, on the same first-
+    /// request clock — WITHOUT registering it first. On the node that holds
+    /// a person's key the answer names their Register; anywhere else the node
+    /// has no such delegate (refused), or it holds no key: either way nothing
+    /// is installed, minted or provisioned, and a visitor leaves no trace.
+    /// The answer: [`PageIo::asked`].
+    pub fn ask(&mut self) {
+        self.asking = true;
+        // Not registered by this page, and never will be: the query goes out
+        // at once, and a node without the delegate says so.
+        self.signer_registered = true;
+        self.first = Some(First::Query);
+        self.first_sent = false;
+        self.first_empties = 0;
+        self.first_started = None;
+        self.first_next_at = Ms(0);
+        self.first_gap_ms = page::rto::RTO_INITIAL_MS as u64;
+        self.send_first();
+    }
+
+    /// [`PageIo::ask`]'s answer, once there is one.
+    pub fn asked(&self) -> Option<&Asked> {
+        self.asked.as_ref().filter(|_| self.asking)
     }
 
     /// OPEN THE PERSON'S OWN TREE (a switch-over blocker): register the signer
@@ -599,6 +645,11 @@ impl PageIo {
                         self.unusable.push(format!("the signer answered its first request EMPTY {} times", self.first_empties));
                         self.first = None;
                         self.exhausted = true;
+                        // Measured on 0.2.136: a node WITHOUT the signer
+                        // delegate answers its request EMPTY — a visitor's.
+                        if self.asking {
+                            self.asked = Some(Asked::Refused(format!("no signer on this node: it answered EMPTY {} times", self.first_empties)));
+                        }
                     }
                 }
             }
@@ -628,6 +679,17 @@ impl PageIo {
                     match answer {
                         // `begin`'s question: which Register? Named: open it,
                         // provisioned already. None: the caller mints a key.
+                        // Only ASKED (`ask`): the answer is recorded, and
+                        // nothing is opened, minted or provisioned.
+                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) if self.asking => {
+                            self.asked = Some(match params {
+                                Some(params) => {
+                                    self.set_register(params);
+                                    Asked::Register(self.register_id)
+                                }
+                                None => Asked::NoKey,
+                            });
+                        }
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => match params {
                             Some(params) => {
                                 self.set_register(params);
@@ -646,6 +708,9 @@ impl PageIo {
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
                             self.refused = Some(format!("the signer refused provisioning: {why:?}"));
                             self.unusable.push(format!("the signer refused provisioning: {why:?}"));
+                        }
+                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Refused(why))) if self.asking => {
+                            self.asked = Some(Asked::Refused(format!("the signer refused to say which Register it signs for: {why:?}")));
                         }
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Refused(why))) => {
                             self.refused = Some(format!("the signer refused to say which Register it signs for: {why:?}"));
@@ -695,6 +760,9 @@ impl PageIo {
                 if self.first.is_some() {
                     self.first = None;
                     self.refused = Some(format!("the node refused: {}", r.said));
+                    if self.asking {
+                        self.asked = Some(Asked::Refused(format!("the node refused: {}", r.said)));
+                    }
                 }
                 self.unusable.push(format!("the node refused: {}", r.said))
             }
@@ -750,6 +818,9 @@ impl PageIo {
             self.unusable.push(format!("the signer is not answering: no answer to {what} within {} ms", page::VERIFY_BUDGET_MS));
             self.first = None;
             self.exhausted = true;
+                        if self.asking {
+                            self.asked = Some(Asked::NotAnswering);
+                        }
             return;
         }
         self.first_gap_ms = (self.first_gap_ms * 2).min(8_000);
