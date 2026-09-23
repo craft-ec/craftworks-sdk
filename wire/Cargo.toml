@@ -15,7 +15,7 @@ freenet-stdlib = { version = "0.10.0", features = ["net"] }
 bincode = "1"
 # A block's contract and state (`block.rs`): the tree's own ids, so the page
 # and the delegate name a block's contract the same way.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
 blake3 = "1"
 # The signer's wire types (serde only): `wire::signer` frames them.
 signer-proto = { path = "../signer-proto" }

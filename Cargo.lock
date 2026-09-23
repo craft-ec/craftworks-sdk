@@ -538,7 +538,7 @@ dependencies = [
 [[package]]
 name = "freenet-prolly"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=9764b86#9764b86b07f2bebc8e1d5b5f2c28d4f3b0f91d94"
+source = "git+https://github.com/craft-ec/freenet-prolly?rev=d8716d3#d8716d39479e3deccb952b97a111b37009e9e1b6"
 dependencies = [
  "blake3",
 ]
