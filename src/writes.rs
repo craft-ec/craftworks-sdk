@@ -17,7 +17,7 @@
 //! turn -- 34 of 3,000 paced puts, gone, with "saving" reading 0).
 
 use crate::engine_client::Client;
-use crate::store::{Edit, Refused, RowState};
+use crate::store::{Edit, Refused};
 use page::fates::Fate;
 use protocol::Request;
 use std::collections::{BTreeMap, BTreeSet};
@@ -291,12 +291,6 @@ impl Writes {
     /// Whether a key's last write of this client's ended unpublished.
     pub fn rolled_back(&self, key: &[u8]) -> bool {
         self.rolled_back.contains(key)
-    }
-
-    /// The row state of a key this client has an open write on, if any:
-    /// what its OWN write is doing, before the Server is asked.
-    pub fn row_state_hint(&self, key: &[u8]) -> Option<RowState> {
-        self.rolled_back(key).then_some(RowState::RolledBack)
     }
 
     pub fn take_conflicts(&mut self) -> Vec<Conflicted> {

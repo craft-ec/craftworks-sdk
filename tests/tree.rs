@@ -8,6 +8,7 @@ use craftworks_sdk::id::from_hex;
 use craftworks_sdk::store::{sorted_edits, Edit};
 use craftworks_sdk::tree_store::Options;
 use craftworks_sdk::*;
+use testkit::MemStore;
 use freenet_prolly::build::TreeBuilder;
 use freenet_prolly::node::MAX_INLINE;
 use std::collections::BTreeMap;
@@ -282,10 +283,7 @@ fn a_refused_batch_changes_nothing() {
 /// values.
 #[test]
 fn a_store_that_drops_value_blocks_fails() {
-    let mut lossy = TreeStore::with_options(Options {
-        keep_value_blocks: false,
-        ..Options::default()
-    });
+    let mut lossy = TreeStore::with_options(Options { keep_value_blocks: false });
     let broke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         differential(1, 200, &mut lossy);
     }));

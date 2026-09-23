@@ -17,7 +17,9 @@
 //!   every tab on it. (The delegate-era cross-call `Node` and `FullNode`, which
 //!   rebuilt the Shell from its context on every call, went with the Shell.)
 
+pub mod mem_store;
 pub mod page_node;
+pub use mem_store::MemStore;
 pub use page_node::{PageConn, PageNode};
 
 use std::cell::RefCell;

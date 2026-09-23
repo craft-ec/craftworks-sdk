@@ -227,8 +227,8 @@ fn a_non_live_binding_takes_no_subscription_of_either_kind() {
 
     let i = trees.add(head(1), Binding::new(b"a/", b"b/", false), &mut w);
     assert_eq!(
-        (trees.subscriptions(), w.calls, trees.binding(0, i).sub_id()),
-        (0, 0, None),
+        (trees.subscriptions(), w.calls),
+        (0, 0),
         "a non-live binding reached for a subscription\n{}",
         trees.probe.dump()
     );

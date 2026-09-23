@@ -198,7 +198,7 @@ pub trait Reads {
     /// How many entries lie in `[lo, hi)` (craftworks-sdk#123).
     ///
     /// By default it enumerates — right for a store with no tree behind it
-    /// (`MemStore` is a map; a copy holds rows, not nodes). A store that HAS
+    /// (a map holds rows, not nodes). A store that HAS
     /// the tree answers from the aggregate every node already carries, in
     /// O(height) node reads rather than one per entry.
     ///
@@ -321,7 +321,7 @@ pub trait Store {
     /// Apply several edits as ONE change that says what it READ (M2,
     /// sdk#148): a store that holds writes for a NODE sends the reads with
     /// them, and the engine checks them where the edits land. The default is
-    /// right for a store that IS the truth — `MemStore`, `TreeStore` — where
+    /// right for a store that IS the truth — `TreeStore`, or a test's in-memory map — where
     /// `Db` read and writes inside one `&mut` borrow, so nothing can have
     /// moved between the read and the write.
     fn apply_commit(
@@ -417,83 +417,3 @@ pub fn sorted_edits(edits: Vec<(Vec<u8>, Edit)>) -> Vec<(Vec<u8>, Edit)> {
     out.into_iter().collect()
 }
 
-/// In-memory store.
-#[derive(Default)]
-pub struct MemStore(BTreeMap<Vec<u8>, Vec<u8>>);
-
-impl Store for MemStore {
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
-        for (k, e) in edits {
-            match e {
-                Edit::Put(v) => {
-                    self.0.insert(k.clone(), v.clone());
-                }
-                Edit::Delete => {
-                    self.0.remove(k);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Reads for MemStore {
-    fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
-        Ok(self.0.get(key).cloned())
-    }
-    fn scan(
-        &mut self,
-        lo: &[u8],
-        hi: &[u8],
-        reverse: bool,
-        limit: usize,
-    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
-        if lo >= hi {
-            return Ok(Vec::new());
-        }
-        let r = self
-            .0
-            .range(lo.to_vec()..hi.to_vec())
-            .map(|(k, v)| (k.clone(), v.clone()));
-        Ok(if reverse {
-            r.rev().take(limit).collect()
-        } else {
-            r.take(limit).collect()
-        })
-    }
-    /// A hash of the whole map.
-    ///
-    /// Not a prolly root, and it does not have to be: what a root is FOR here
-    /// is answering "is this the same content I last saw", and a content hash
-    /// answers that exactly. It means a binding over the in-memory store
-    /// behaves like one over a tree — including reloading when it should —
-    /// rather than working only on the backend it was tested against.
-    fn root(&mut self) -> Read<[u8; 32]> {
-        let mut h = blake3::Hasher::new();
-        for (k, v) in &self.0 {
-            h.update(&(k.len() as u64).to_le_bytes());
-            h.update(k);
-            h.update(&(v.len() as u64).to_le_bytes());
-            h.update(v);
-        }
-        Ok(*h.finalize().as_bytes())
-    }
-    /// The in-memory store keeps no history, so it cannot diff two roots.
-    ///
-    /// It says so with the DEFINED answer rather than an error, which is the
-    /// point of that answer existing: a binding does the same thing here as
-    /// it does against an engine whose old root has been evicted, so the
-    /// reload path is exercised on both backends instead of only the one
-    /// that is harder to test.
-    fn changes_since(
-        &mut self,
-        _from: [u8; 32],
-        _lo: &[u8],
-        _hi: &[u8],
-        _max_entries: u32,
-    ) -> Read<Delta> {
-        Ok(Delta::FullReloadRequired {
-            new_root: self.root()?,
-        })
-    }
-}
