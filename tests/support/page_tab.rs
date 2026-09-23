@@ -119,14 +119,12 @@ impl<E: Env> Tab<E> {
         self.db.store_mut().sync();
     }
 
-    /// `n` seconds pass: the store's tick (tickets' lifetimes, the ask after
-    /// an applying write), then a pump. Nothing times a write out (R-b).
+    /// `n` seconds pass: the ask after an applying write, then a pump.
+    /// Nothing times a write or a read out (R-b; rules 7, 8).
     pub fn seconds(&mut self, n: u64) {
         for _ in 0..n {
             self.clock.advance(1000);
             let _ = self.db.store_mut().ask_after_applying();
-            let now = self.clock.now_ms();
-            self.db.store_mut().tick(now);
             self.pump();
         }
     }

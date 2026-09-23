@@ -1,17 +1,9 @@
-//! THE RE-RUN'S BOUND (sdk#143/#144, re-planted for READ-STATE R-a): a
+//! A RE-RUN THAT CANNOT READ YET WAITS (sdk#143/#144; rules 7, 8): a
 //! conflicted update is re-run on the new base, and to re-run it must READ
-//! the record again. When that read cannot be answered — its walk stops on a
-//! block, and the ticket ends NOT_ANSWERING or UNAVAILABLE, or never ends —
-//! the chain does not wait for ever: inside the bound it waits (nothing told,
-//! nothing written); at the bound the write fails NAMED, once.
-//!
-//! The bound is the one the page passes (`Session::tick` →
-//! `Db::rerun(now, TICKET_LIFE_MS)`): the ticket's own lifetime. This was
-//! `page/tests/server_differential.rs`'s
-//! `a_re_run_whose_record_never_loads_fails_at_the_load_budget`, whose
-//! premise (a Conflict FORGOT the record in the copy) went with the copy.
-
-use craftworks_sdk::page_store::TICKET_LIFE_MS;
+//! the record again. While that read is not answered the chain WAITS —
+//! nothing told, nothing written — for as long as it takes: no time ends it
+//! (the old 60 s bound, `TICKET_LIFE_MS`, is gone). When the read is
+//! answered, the re-run is made.
 use craftworks_sdk::store::{ConflictChain, Delta, Edit, Read, Reads, Store, StoreError};
 use craftworks_sdk::{Db, Env, MemStore, RerunEvent};
 use serde_json::{json, Map, Value};
@@ -81,7 +73,7 @@ fn obj(v: Value) -> Map<String, Value> {
 }
 
 #[test]
-fn a_re_run_whose_read_never_answers_fails_named_at_the_tickets_lifetime() {
+fn a_re_run_whose_read_is_not_answered_waits_and_is_made_when_it_is() {
     let mut db = Db::new(Parking::default(), FakeEnv(1_000), [1, 2, 3, 4]);
     let schema = serde_json::from_value(json!({ "type": "T", "fields": [{ "name": "title", "kind": "text", "required": true }, { "name": "body", "kind": "text" }] })).expect("a schema");
     db.define("t", &schema).expect("define");
@@ -94,18 +86,24 @@ fn a_re_run_whose_read_never_answers_fails_named_at_the_tickets_lifetime() {
     db.store_mut().refuse_reads = true;
     let writes = db.store().writes;
 
-    let t0 = 5_000;
-    let first = db.rerun(t0, TICKET_LIFE_MS);
-    assert!(!first.load.is_empty() && first.events.is_empty(), "the re-run did not wait for its read: {first:?}");
-    let inside = db.rerun(t0 + TICKET_LIFE_MS - 1, TICKET_LIFE_MS);
-    assert!(!inside.load.is_empty() && inside.events.is_empty(), "gave up inside the bound: {inside:?}");
-    let past = db.rerun(t0 + TICKET_LIFE_MS, TICKET_LIFE_MS);
-    assert!(
-        matches!(past.events.as_slice(), [RerunEvent::Failed { write_id, reason }] if *write_id == w && reason.contains("could not be read")),
-        "the re-run did not end NAMED at the bound: {past:?}"
-    );
-    assert!(db.rerun(t0 + TICKET_LIFE_MS + 1, TICKET_LIFE_MS).events.is_empty(), "told twice");
+    // A thousand ticks of a read that is not answered: it waits, and says
+    // what it waits for — never an end.
+    for i in 0..1_000 {
+        let step = db.rerun();
+        assert!(!step.load.is_empty() && step.events.is_empty(), "the re-run ended on tick {i} without an answer: {step:?}");
+    }
     assert_eq!(db.store().writes, writes, "a re-run was written without its record");
+    // The read is answered at last: the chain ENDS — not failed, and no
+    // longer waiting. (The record already holds this write's edit, so the
+    // re-run has nothing left to write; the control below is the case that
+    // writes.)
+    db.store_mut().refuse_reads = false;
+    let answered = db.rerun();
+    println!("answered: {answered:?}");
+    assert!(answered.load.is_empty(), "still waiting after its read was answered: {answered:?}");
+    assert!(answered.events.iter().all(|e| !matches!(e, RerunEvent::Failed { write_id, .. } if *write_id == w)), "{answered:?}");
+    let after = db.rerun();
+    assert!(after.load.is_empty() && after.events.is_empty(), "the chain did not end: {after:?}");
 }
 
 /// THE CONTROL: the same chain, the reads answering — the re-run is MADE
@@ -130,7 +128,7 @@ fn control_a_re_run_that_can_read_is_made() {
     db.store_mut().inner.apply_batch(&[(key.clone(), Edit::Put(theirs))]).expect("theirs");
     db.store_mut().chains.push(ConflictChain { write_ids: vec![w], keys: Vec::new(), tries: 0 });
     let writes = db.store().writes;
-    let step = db.rerun(5_000, TICKET_LIFE_MS);
+    let step = db.rerun();
     assert!(step.events.is_empty() && step.load.is_empty(), "{step:?}");
     assert_eq!(db.store().writes, writes + 1, "the re-run was not made");
     let got = craftworks_sdk::record::decode(&schema, &db.store_mut().inner.get(&key).expect("read").expect("present")).expect("decodes").fields;

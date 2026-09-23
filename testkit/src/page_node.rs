@@ -636,6 +636,8 @@ impl ConnState {
             Op::AskHeld { id } => Answer::Held { id, present: self.node.holds(&id) },
             // A node that takes every app PUT (a web container) it is sent.
             Op::PutApp { key } => Answer::AppPutOk(key),
+            // Page-io's signer requests: the page alone never makes one.
+            Op::Ext(_) => return None,
         })
     }
 }

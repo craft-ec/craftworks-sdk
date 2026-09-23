@@ -279,16 +279,12 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       try {
         await waitFor(ticket);
       } catch (ended) {
-        // The load ENDED and did not deliver: the engine could not reach the
-        // data, or nothing answered within the session's bound. Either way
-        // it is not "not yet". `why` is the engine's reason, when it gave one.
+        // The load ENDED and did not deliver: the engine could not have the
+        // data (an ANSWER — no time ends a load, rule 8). `why` is the
+        // engine's reason, when it gave one.
         const code = typeof ended === "string" ? ended : ended?.code;
         const why = typeof ended === "string" ? null : ended?.why;
-        const base = code === "NOT_ANSWERING"
-          // NOT_ANSWERING: the page read it itself and the node stopped
-          // answering — not that the data is missing.
-          ? "the node is not answering"
-          : "the range this read needed could not be loaded";
+        const base = "the range this read needed could not be loaded";
         throw new DbError({
           code: code ?? "UNAVAILABLE",
           message: why ? `${base}: ${why}` : base,

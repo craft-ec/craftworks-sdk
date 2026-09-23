@@ -526,7 +526,14 @@ export async function openSession(Session, {
     // The engine delegate's install plan: gone with it. Always false on the
     // page path (the signer's refusals are in `unusable()`); kept so a
     // caller that asks is not broken.
-    exhausted: () => session.exhausted(),
+    /**
+     * NOT ANSWERING FOR N s: the request that has waited longest, as
+     * `{ what, ms }`, or null. What a page shows while the node is slow (rule
+     * 8); it ends nothing — the page's sender keeps re-sending.
+     */
+    notAnswering: () => JSON.parse(session.not_answering()),
+    /** A person cancels the pending PUT of `key` (named `cancelled`). */
+    cancelPut: key => session.cancel_put(key),
     refused: () => session.refused(),
     /** Has a socket to this node EVER opened? See `everOpened`. */
     connectedOnce: () => everOpened,
@@ -655,26 +662,20 @@ export async function open(Session, opts = {}) {
 }
 
 /**
- * Until the node says it is provisioned — or that it cannot be. Four ends,
- * never one timeout: refused (the signer's or the node's words), NOT RUNNING
- * (no socket ever opened), exhausted (page-io's re-asks are spent), or the
- * budget.
- *
- * The not-running end comes FIRST among the failures, because page-io counts
- * an unanswered ask the same way whether the node ignored it or was never
- * there — and "the signer is not answering" sends someone to look at a node
- * that is not running (sdk#263 follow-up). And it comes FAST: a socket that
- * never opened and was refused twice is a node that is not there, known in
- * about a second — not after page-io's re-asks are spent or the budget runs
- * out, a person watching "setting up" the whole time (builder#102: the
- * no-node publish shot waited 7.5 s and never saw it end).
+ * Until the node says it is provisioned — or that it cannot be. Ends only on
+ * an ANSWER (rule 8): refused (the signer's or the node's words), or NOT
+ * RUNNING (the connection was refused twice and never opened, sdk#292 — the
+ * node's own answer), or a person cancelling (`signal`). A slow node never
+ * ends it: page-io re-sends through the page's sender until it answers, and
+ * `onWaiting({ what, ms })` is told how long it has not answered, so a page
+ * can say "not answering for N s".
  */
 export async function untilProvisioned(handle, {
-  provisionBudgetMs = 60_000, provisionEveryMs = 100,
-  now: clock = () => Date.now(),
+  provisionEveryMs = 100,
   setTimeout: afterMs = setTimeout,
+  signal = null,
+  onWaiting = () => {},
 } = {}) {
-  const started = clock();
   for (;;) {
     if (handle.provisioned()) return;
     const refused = handle.refused?.();
@@ -684,17 +685,9 @@ export async function untilProvisioned(handle, {
     if (never && (handle.refusedBeforeOpen?.() ?? 0) >= 2) {
       throw new Error(`nothing answered${at}: the connection was refused and never opened — is the node running?`);
     }
-    if (handle.exhausted?.()) {
-      throw new Error(never
-        ? `nothing answered${at}: no connection was ever made — is the node running?`
-        : "the signer is not answering: every re-ask was spent and the node is still not provisioned");
-    }
-    if (clock() - started > provisionBudgetMs) {
-      const secs = Math.round(provisionBudgetMs / 1000);
-      throw new Error(never
-        ? `nothing answered${at} in ${secs} s: no connection was ever made — is the node running?`
-        : `the node did not finish setting up in ${secs} s; is it running?`);
-    }
+    if (signal?.aborted) throw new Error("cancelled: setting up was stopped");
+    const waiting = handle.notAnswering?.();
+    if (waiting) onWaiting(waiting);
     await new Promise(r => afterMs(r, provisionEveryMs));
   }
 }

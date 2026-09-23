@@ -63,7 +63,7 @@ fn a_band_is_told_of_its_own_band_and_not_of_a_siblings() {
 
 /// THE ARCHITECT'S CONTROL on sdk#289: `RenderedAt` is set when the binding's
 /// re-read COMPLETES, never when a change is reported. A re-read that fails
-/// (its ticket ends UNAVAILABLE or NOT_ANSWERING) never completes, so with
+/// (its ticket ends UNAVAILABLE) never completes, so with
 /// the head unmoved the change is reported AGAIN — and once a re-read has
 /// completed, nothing is. Red on de3c931, where the report itself advanced
 /// `RenderedAt` to the head and the failed binding was never told again.

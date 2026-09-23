@@ -287,6 +287,7 @@ impl PageRig {
             Op::ReadHead => Answer::Head(node.head_read()),
             Op::AskHeld { id } => Answer::Held { id, present: node.blocks.contains_key(&id) },
             Op::PutApp { key } => Answer::AppPutOk(key),
+            Op::Ext(_) => return None,
         })
     }
 }
@@ -1411,9 +1412,8 @@ fn settle(tab: &mut Tab, rig: &mut PageRig, node: &mut Node) -> (Vec<craftworks_
     for _ in 0..12 {
         tab.lend(rig, node, |db| db.store_mut().sync());
         tab.pump(rig, node);
-        let now = rig.now;
         let step = tab.lend(rig, node, |db| {
-            let step = db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS);
+            let step = db.rerun();
             // A re-run that stopped on blocks walks again on the next tick.
             db.store_mut().take_ticket();
             db.store_mut().unpin();
@@ -1556,8 +1556,7 @@ fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
         tab.pump(&mut rig, &mut node);
         // Its re-run is made behind the next commit in flight...
         commit_in_flight(&mut rig, &mut node, 2_001 + round);
-        let now = rig.now;
-        let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
+        let step = tab.lend(&mut rig, &mut node, |db| db.rerun());
         events.extend(step.events);
         // ...and changed again before it lands.
         interfere(&mut tab, &mut rig, &mut node, &mut other_id);
@@ -1637,8 +1636,7 @@ fn a_write_never_gets_more_than_the_one_budget_across_re_sends_and_re_runs() {
         tab.lend(&mut rig, &mut node, |db| db.store_mut().sync());
         tab.pump(&mut rig, &mut node);
         commit_in_flight(&mut rig, &mut node, 3_001 + round);
-        let now = rig.now;
-        let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
+        let step = tab.lend(&mut rig, &mut node, |db| db.rerun());
         events.extend(step.events);
         let theirs = note(&node, 10 + round);
         elsewhere(&mut rig, &mut node, 10 + round, vec![protocol::Op::Put(key.clone(), theirs)]);
