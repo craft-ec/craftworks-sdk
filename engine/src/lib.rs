@@ -367,6 +367,12 @@ pub enum Event {
     },
     /// No head under any epoch: a brand-new device, empty tree, seq 0.
     HeadMissing,
+    /// Whether this page can SIGN a head now, stepped by the page on each
+    /// CHANGE of its one signer decision. While `false` no commit is CUT:
+    /// writes queue and apply to the warm root (reads see them), and the
+    /// moment it turns `true` ONE commit carries the queue, in arrival order.
+    /// Before any is stepped the engine can sign (every existing path).
+    CanSign(bool),
     /// Another engine holds this device key and is ahead. The loser re-reads
     /// and rebases; it never publishes a fork.
     HeadConflict {
@@ -1280,6 +1286,10 @@ pub struct Engine<B: Blocks> {
     epochs: Vec<Epoch>,
     head_epoch: Option<Epoch>,
     recovered: bool,
+    /// The last `Event::CanSign` (true until told otherwise): the consequence
+    /// of the events it was told, never a polled or copied field. Page memory
+    /// only, never in the context: the page steps it again on each change.
+    can_sign: bool,
     /// Reads that arrived before the head was recovered, in arrival order
     /// (sdk#223). The tree before recovery is the EMPTY tree, and answering
     /// from it said "complete, and there is nothing here" about data the head
@@ -1490,6 +1500,7 @@ impl<B: Blocks> Engine<B> {
             epochs: Vec::new(),
             head_epoch: None,
             recovered: false,
+            can_sign: true,
             before_head: Vec::new(),
             queue: std::collections::VecDeque::new(),
             rebuild_differs: 0,
@@ -2020,6 +2031,15 @@ impl<B: Blocks> Engine<B> {
             Event::Start { key, epochs } => self.on_start(key, epochs),
             Event::HeadRead { epoch, seq, root } => self.on_head_read(epoch, seq, root),
             Event::HeadMissing => self.on_head_missing(),
+            Event::CanSign(can) => {
+                self.can_sign = can;
+                // Turned ON: the held queue is cut now, as one commit.
+                if can {
+                    self.advance()
+                } else {
+                    Vec::new()
+                }
+            }
             Event::HeadConflict { seq, root } => self.on_head_conflict(seq, root),
             Event::AskWrite { client, write_id } => self.on_ask(client, write_id),
         }
@@ -2704,9 +2724,13 @@ impl<B: Blocks> Engine<B> {
                     moved |= applied_or_gone;
                 }
             }
-            let (fx, popped) = self.commit_front();
-            out.extend(fx);
-            moved |= popped;
+            // THE GATE: no commit is cut while this page cannot sign; the
+            // writes keep applying to the warm root above.
+            if self.can_sign {
+                let (fx, popped) = self.commit_front();
+                out.extend(fx);
+                moved |= popped;
+            }
             if !moved {
                 break;
             }
@@ -4008,6 +4032,9 @@ impl<B: Blocks> Engine<B> {
     /// is exactly the part that does not need a clock.
     fn on_flush(&mut self) -> Vec<Effect> {
         let mut out = Vec::new();
+        // No `can_sign` check here: `unpublished` is filled only by the cut in
+        // `advance`, the ONE place the gate is read, so while the page cannot
+        // sign there is nothing here to ship.
         if self.pending.is_none() && !self.unpublished.is_empty() {
             let to_ship = self.take_unpublished();
             out.extend(self.start_commit(to_ship, None));
