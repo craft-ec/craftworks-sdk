@@ -4648,7 +4648,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 14;
+const CONTEXT_VERSION: u16 = 13;
 
 /// What a context this build wrote begins with.
 ///
