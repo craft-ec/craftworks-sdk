@@ -452,6 +452,10 @@ pub struct Page {
     /// refusal), and how many times in a row it was refused.
     sign_again: Option<u64>,
     sign_refusals: u32,
+    /// The signer refused the sign in flight as NOT APPROVED (sdk#318): this app has not been allowed to write
+    /// the user's tree. Not an end (rule 8): re-asked on the same backoff as the other retryable refusals, and at
+    /// once on [`Page::nudge_sign`]; cleared by the next signature.
+    needs_approval: bool,
     /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
@@ -538,6 +542,7 @@ impl Page {
             owed: None,
             sign_again: None,
             sign_refusals: 0,
+            needs_approval: false,
             held_again: BTreeMap::new(),
             verify: None,
             landings: 0,
@@ -887,6 +892,7 @@ impl Page {
             };
             match s {
                 A::Signed(state) | A::AlreadySigned(state) => {
+                    self.needs_approval = false;
                     self.note_record(&state);
                     self.send(Waiting::Update, Op::Update { state });
                     let v = self.verify.as_mut().expect("checked");
@@ -901,7 +907,8 @@ impl Page {
                     v.landing = false;
                     backoff(v, now);
                 }
-                A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved | Why::NotSuccessor) => {
+                A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved | Why::NotSuccessor | Why::NotApproved) => {
+                    self.needs_approval = matches!(s, A::Refused(Why::NotApproved));
                     let now = self.now;
                     let v = self.verify.as_mut().expect("checked");
                     v.landing = false;
@@ -921,9 +928,11 @@ impl Page {
         }
         let Some(owed) = self.owed.as_mut() else { return };
         self.sign_refusals = match &s {
-            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved) => self.sign_refusals,
+            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved | Why::NotApproved) => self.sign_refusals,
             _ => 0,
         };
+        // NOT APPROVED is named while it lasts, and only then: any other answer means the signer took the ask.
+        self.needs_approval = matches!(s, A::Refused(Why::NotApproved));
         match s {
             A::Signed(state) => {
                 self.signer_records.insert(state.clone());
@@ -967,7 +976,10 @@ impl Page {
             // first to make it held; RecordNotSaved — the signer could not
             // write its record and signed nothing. A node's "queue full" is
             // not a signer answer: it is re-asked by the deadline.
-            A::Refused(why @ (Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved)) => {
+            // NOT APPROVED (sdk#318): the user has not allowed this app to write their tree yet. The same owed
+            // commit is re-asked (the same prev), on the same backoff -- no timer of its own -- and at once when
+            // the SDK nudges (the user came back from the consent page).
+            A::Refused(why @ (Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved | Why::NotApproved)) => {
                 if why == Why::HeadUnknown {
                     self.send(Waiting::Warm, Op::ReadHead);
                 }
@@ -1582,6 +1594,29 @@ impl Page {
     }
 
     /// Things this page could not do, by reason.
+    /// Is the sign in flight waiting on the user's CONSENT (sdk#318)? The signer refused it as not approved:
+    /// the app has not been allowed to write this tree. Every write queued behind it waits on the same.
+    pub fn needs_approval(&self) -> bool {
+        self.needs_approval
+    }
+
+    /// The user may have just allowed this app (sdk#318): re-ask a sign that is waiting on approval NOW, rather
+    /// than at its backoff (which can be a minute). An event, not a timer: the SDK calls it when the page becomes
+    /// visible or focused again. Nothing else changes, and it is a no-op unless approval is what is awaited.
+    pub fn nudge_sign(&mut self) {
+        if !self.needs_approval {
+            return;
+        }
+        if self.sign_again.is_some() {
+            self.sign_again = Some(self.now);
+        }
+        if let Some(v) = self.verify.as_mut() {
+            if v.again_at.is_some() {
+                v.again_at = Some(self.now);
+            }
+        }
+    }
+
     pub fn unusable(&self) -> &[String] {
         &self.unusable
     }
@@ -1720,8 +1755,16 @@ fn answers_a_sign(a: &signer_proto::Answer) -> bool {
         A::Signed(_) | A::AlreadySigned(_) | A::NotNext { .. } => true,
         A::Refused(w) => !matches!(
             w,
-            Why::BlockCount { .. } | Why::NotABlock { .. } | Why::KeyAlreadyProvisioned | Why::RegisterChanged
+            Why::BlockCount { .. } | Why::NotABlock { .. } | Why::KeyAlreadyProvisioned | Why::RegisterChanged | Why::Removed
         ),
-        A::Provisioned | A::Putting { .. } | A::Put { .. } | A::Held { .. } | A::Register { .. } => false,
+        A::Provisioned
+        | A::Putting { .. }
+        | A::Put { .. }
+        | A::Held { .. }
+        | A::Register { .. }
+        | A::Capability(_)
+        | A::Approved { .. }
+        | A::Owns(_)
+        | A::HasRecord(_) => false,
     }
 }

@@ -90,6 +90,12 @@ pub enum Why {
     /// The value to sign carries a ledger that is not the format ([`head::check`]): nothing is signed, because a
     /// malformed ledger, once signed, degrades every reader's merge for that head's life and nobody is told.
     BadLedger,
+    /// A GATED verb (sign, which Register, re-provision, approve) from an origin the owner has not approved and
+    /// without the owner's capability (sdk#318). Nothing changed. Appended, as every variant after `BadLedger`.
+    NotApproved,
+    /// A verb this signer no longer serves (`PutBlocks`, sdk#318): its slot is kept so every later variant keeps
+    /// its encoding.
+    Removed,
 }
 
 /// What the signer answers. See `signer::decide` for the rule behind `Signed` / `NotNext` / `AlreadySigned`.
@@ -126,6 +132,20 @@ pub enum Answer {
     Register {
         params: Option<Vec<u8>>,
     },
+    /// Provisioned (or the held key re-stated), and the OWNER CAPABILITY (sdk#318): what the owner's own session
+    /// keeps and wraps its gated requests in ([`Request::WithCap`]). Derived from the signing key, so re-stating
+    /// the key yields the same one; it is never the key.
+    Capability([u8; 32]),
+    /// The web apps (contract instance ids) the owner has approved to sign, after an `Approve` / `Unapprove`.
+    Approved {
+        apps: Vec<[u8; 32]>,
+    },
+    /// MEMBERSHIP (sdk#318): whether this signer signs for the Register these params name. What "is the viewer
+    /// the publisher?" needs, without telling a stranger's site whose node this is.
+    Owns(bool),
+    /// Whether this signer has signed anything for its Register: it holds a record, or can read a head of it
+    /// ([`Request::HasRecord`]).
+    HasRecord(bool),
 }
 
 /// What the page asks.
@@ -159,6 +179,29 @@ pub enum Request {
     /// nothing; answers [`Answer::Register`]. The key itself never leaves the signer. Appended LAST, so every earlier
     /// request keeps its encoding.
     Register,
+    /// A GATED request carrying the OWNER CAPABILITY ([`Answer::Capability`]) (sdk#318). Only the owner's own
+    /// session holds it; an app the owner approved signs without it (its origin is `WebApp(id)`). One level only.
+    WithCap {
+        cap: [u8; 32],
+        inner: Box<Request>,
+    },
+    /// Approve a web app (its contract instance id) to use the gated verbs. Capability only: approval happens in
+    /// the owner's own session, never by an app's request.
+    Approve {
+        app: [u8; 32],
+    },
+    /// Withdraw an approval. Capability only.
+    Unapprove {
+        app: [u8; 32],
+    },
+    /// Does this signer sign for the Register these params name? Open to all; answers only yes or no
+    /// ([`Answer::Owns`]).
+    Owns {
+        register_params: Vec<u8>,
+    },
+    /// Has this signer signed anything for its Register? Open to all ([`Answer::HasRecord`]), and nothing is signed:
+    /// the question a page asks at open, which it used to ask with an unsignable `Sign` (sdk#318 gates `Sign`).
+    HasRecord,
 }
 
 fn encode<T: Serialize>(t: &T) -> Vec<u8> {

@@ -95,7 +95,7 @@ impl Node {
             register_params: params,
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        assert!(matches!(signer::serve(&mut Host(&mut n), signer::Caller::Unattested, &signer::encode_request(1, &req)), signer::Answer::Capability(_)));
         n
     }
 
@@ -159,7 +159,13 @@ impl Node {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger },
         };
-        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
+        // THE OWNER'S SESSION (sdk#318): its signs carry the owner capability, derived from the key as the signer
+        // derives it -- what page-io sends once the builder handed it the capability.
+        let host = Host(self);
+        let cap = signer::Host::get_secret(&host, signer::KEY).map(|k| signer::capability_of(&k));
+        let req = wire::signer::with_cap(cap, req);
+        let mut host = host;
+        let served = signer::serve_full(&mut host, signer::Caller::Unattested, &signer::encode_request(id, &req));
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
     }
 }

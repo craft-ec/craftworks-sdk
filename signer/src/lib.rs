@@ -125,6 +125,32 @@ pub const RECORD: &[u8] = b"signer_record";
 pub const REGISTER_CODE: &[u8] = b"signer_register_code";
 pub const REGISTER_PARAMS: &[u8] = b"signer_register_params";
 pub const BLOCK_CODE: &[u8] = b"signer_block_code";
+/// The web apps (contract instance ids) the owner approved to use the gated verbs (sdk#318): bincode `Vec<[u8; 32]>`.
+pub const APPROVED: &[u8] = b"signer_approved";
+
+/// WHO IS ASKING, as the node attests it (sdk#318). `WebApp(id)`: a web app the node served under its token
+/// (`MessageOrigin::WebApp`). `Unattested`: anything else -- a tokenless client, whose origin the node does not
+/// know, and which a stranger's sandboxed app can also be. Only an APPROVED `WebApp` passes the gate by origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    WebApp([u8; 32]),
+    Unattested,
+}
+
+/// The OWNER CAPABILITY for a signing key (sdk#318): derived, so re-stating the key yields the same one and no
+/// secret besides the key needs keeping; one-way, so the capability never gives the key back.
+pub fn capability_of(signing_key: &[u8]) -> [u8; 32] {
+    blake3::derive_key("craftworks signer owner capability v1 (sdk#318)", signing_key)
+}
+
+/// Equal without an early exit, so a guess is not timed byte by byte.
+fn same(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn approved_apps<H: Host>(host: &H) -> Vec<[u8; 32]> {
+    host.get_secret(APPROVED).and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default()
+}
 
 /// What the signer reaches, and nothing more: its secret store and the node's SYNCHRONOUS local read.
 pub trait Host {
@@ -145,23 +171,17 @@ pub fn register_id(code: &[u8], params: &[u8]) -> [u8; 32] {
     out
 }
 
-/// `(block id, state)` pairs to PUT under the Block contract, in order.
-pub type Puts = Vec<([u8; 32], Vec<u8>)>;
-
-/// One request, served, and what the entry must PUT for it (only `PutBlocks` puts anything).
+/// One request, served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Served {
     /// The request's id, echoed on the answer (SG02): what attributes it with several requests in flight.
     pub id: u32,
     pub answer: Answer,
-    /// `(block id, state)` to PUT under the Block contract, in order; the entry builds each contract from the code in
-    /// its secret store and answers every `PutContractResponse` with `Answer::Put`.
-    pub puts: Puts,
 }
 
-/// One request, answered: `serve_full` without the puts or the id. What every non-`PutBlocks` request needs.
-pub fn serve<H: Host>(host: &mut H, request: &[u8]) -> Answer {
-    serve_full(host, request).answer
+/// One request, answered: `serve_full` without the id.
+pub fn serve<H: Host>(host: &mut H, caller: Caller, request: &[u8]) -> Answer {
+    serve_full(host, caller, request).answer
 }
 
 /// The bytes the entry sends back for a served request: its answer, under ITS id.
@@ -169,44 +189,90 @@ pub fn reply(served: &Served) -> Vec<u8> {
     encode_answer(served.id, &served.answer)
 }
 
-/// One request, served: gather the facts, decide, and -- on `Sign` -- sign, save the record, reply; on `PutBlocks`
-/// name each block's contract and hand the entry the PUTs.
-pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
+/// One request, served: THE GATE first (sdk#318), then gather the facts, decide, and -- on `Sign` -- sign, save the
+/// record, reply.
+///
+/// OPEN to anyone: `Held` (present / absent, of content-addressed blocks), `Owns` (yes / no for params the asker
+/// already names), and -- for now -- `Register` ("which Register?": a user's app asks it at open, and consent is
+/// asked at the first WRITE; what it discloses is the stated privacy follow-up). GATED -- answered only for an
+/// approved `WebApp(id)` caller or a request carrying the owner capability ([`Request::WithCap`]): `Sign`, and a
+/// `Provision` once a key is held. `Approve` / `Unapprove`: the capability ONLY, so approval happens in the owner's
+/// own session and never by an app's request. `PutBlocks` is removed. A refusal changes nothing.
+pub fn serve_full<H: Host>(host: &mut H, caller: Caller, request: &[u8]) -> Served {
     let Some((id, req)) = decode_request(request) else {
-        return Served {
-            id: request_id(request),
-            answer: Answer::Refused(Why::Unreadable),
-            puts: Vec::new(),
-        };
+        return Served { id: request_id(request), answer: Answer::Refused(Why::Unreadable) };
     };
-    let answer = match req {
-        Request::PutBlocks { states } => {
-            let (answer, puts) = put_blocks(host, states);
-            return Served { id, answer, puts };
+    let key = host.get_secret(KEY);
+    let (req, with_cap) = match req {
+        Request::WithCap { inner, .. } if matches!(*inner, Request::WithCap { .. }) => {
+            return Served { id, answer: Answer::Refused(Why::Unreadable) };
         }
-        Request::Held { contracts } => held(host, &contracts),
-        Request::Provision {
-            signing_key,
-            register_code,
-            register_params,
-            block_code,
-        } => provision(
-            host,
-            signing_key,
-            register_code,
-            register_params,
-            block_code,
-        ),
-        Request::Sign { prev, next } => sign(host, prev, next),
-        // The Register it signs for, only if it holds a key for it: params left behind without a key name nothing.
-        Request::Register => Answer::Register {
-            params: host.get_secret(KEY).and(host.get_secret(REGISTER_PARAMS)),
-        },
+        Request::WithCap { cap, inner } => {
+            let held = key.as_deref().map(capability_of);
+            (*inner, held.is_some_and(|h| same(&h, &cap)))
+        }
+        other => (other, false),
     };
-    Served {
-        id,
-        answer,
-        puts: Vec::new(),
+    let by_origin = matches!(caller, Caller::WebApp(app) if approved_apps(host).contains(&app));
+    let gated = with_cap || by_origin;
+    let refuse = || Answer::Refused(Why::NotApproved);
+    let answer = match req {
+        Request::PutBlocks { .. } => Answer::Refused(Why::Removed),
+        Request::Held { contracts } => held(host, &contracts),
+        Request::Owns { register_params } => Answer::Owns(
+            key.is_some() && host.get_secret(REGISTER_PARAMS).is_some_and(|p| p == register_params),
+        ),
+        // OPEN, for now: a user's app asks it at OPEN, before any write, so gating it would move consent from
+        // the first write to the open. What it discloses (whose node this is) is the stated privacy follow-up.
+        Request::Register => Answer::Register {
+            params: key.and(host.get_secret(REGISTER_PARAMS)),
+        },
+        // No key held: there is nothing to sign with and nobody's capability to check; name that.
+        Request::Sign { .. } if key.is_none() => Answer::Refused(Why::NotProvisioned),
+        Request::Sign { prev, next } if gated => sign(host, prev, next),
+        Request::Sign { .. } => refuse(),
+        // THE FIRST PROVISION sets the key: the install-time step (sdk#318 C3). After it, re-stating the SAME key
+        // proves ownership as well as the capability does (the capability is derived from it), and anything else
+        // needs the capability.
+        Request::Provision { signing_key, register_code, register_params, block_code } => {
+            let restated = key.as_deref() == Some(signing_key.as_slice());
+            if key.is_some() && !(gated || restated) {
+                refuse()
+            } else if key.is_none() && matches!(caller, Caller::WebApp(_)) {
+                // THE FIRST PROVISION never comes from a served app (sdk#318, the architect's (ii)): a served app
+                // arrives as `WebApp(id)` (measured), so none can take the owner's place on a fresh node. The
+                // owner's builder, and a native tool, are unattested.
+                refuse()
+            } else {
+                match provision(host, signing_key.clone(), register_code, register_params, block_code) {
+                    Answer::Provisioned => Answer::Capability(capability_of(&signing_key)),
+                    other => other,
+                }
+            }
+        }
+        Request::HasRecord => Answer::HasRecord(has_record(host)),
+        Request::Approve { app } if with_cap => set_approved(host, |apps| {
+            if !apps.contains(&app) {
+                apps.push(app);
+            }
+        }),
+        Request::Unapprove { app } if with_cap => set_approved(host, |apps| apps.retain(|a| *a != app)),
+        Request::Approve { .. } | Request::Unapprove { .. } => refuse(),
+        // Unwrapped above, one level only; named rather than assumed.
+        Request::WithCap { .. } => Answer::Refused(Why::Unreadable),
+    };
+    Served { id, answer }
+}
+
+/// Change the approval list and answer with what it now is; a list that could not be saved is a refusal.
+fn set_approved<H: Host>(host: &mut H, change: impl FnOnce(&mut Vec<[u8; 32]>)) -> Answer {
+    let mut apps = approved_apps(host);
+    change(&mut apps);
+    let bytes = bincode::serialize(&apps).expect("a list of ids encodes");
+    if host.set_secret(APPROVED, &bytes) {
+        Answer::Approved { apps }
+    } else {
+        Answer::Refused(Why::RecordNotSaved)
     }
 }
 
@@ -262,34 +328,18 @@ fn held<H: Host>(host: &H, contracts: &[[u8; 32]]) -> Answer {
     }
 }
 
-/// PUT-WITH-CODE: the page's block STATES, each named by its own hash, PUT under the Block contract from inside the
-/// node. Nothing is remembered: the answer names the contracts in order, and each node answer is relayed as it comes.
-/// Refused whole if any state is not a block, or the count is outside one return's worth.
-///
-/// Stated limit (F35, measured): in LOCAL mode the node DROPS a delegate-originated PUT, so this verb is for a network
-/// node -- the page on its OWN node PUTs directly (the code is a local copy there).
-fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> (Answer, Puts) {
-    let refuse = |w: Why| (Answer::Refused(w), Vec::new());
-    let Some(code) = host.get_secret(BLOCK_CODE) else {
-        return refuse(Why::NotProvisioned);
-    };
-    if states.is_empty() || states.len() > MAX_PUT_BLOCKS {
-        return refuse(Why::BlockCount {
-            max: MAX_PUT_BLOCKS as u32,
-            got: states.len() as u32,
-        });
+/// A record, or a head of its Register the node holds: what `decide` would take as the truth.
+fn has_record<H: Host>(host: &H) -> bool {
+    if host.get_secret(RECORD).is_some() {
+        return true;
     }
-    let mut puts = Vec::with_capacity(states.len());
-    let mut contracts = Vec::with_capacity(states.len());
-    for (i, st) in states.into_iter().enumerate() {
-        let Some((&kind, body)) = st.split_first() else {
-            return refuse(Why::NotABlock { index: i as u32 });
-        };
-        let id = freenet_prolly::block_id(kind, body);
-        contracts.push(contract_keys::block::contract_for(&code, &id));
-        puts.push((id, st));
+    match (host.get_secret(REGISTER_CODE), host.get_secret(REGISTER_PARAMS)) {
+        (Some(c), Some(p)) => host
+            .contract_state(&register_id(&c, &p))
+            .and_then(|st| signer_proto::head::record_of(&st).map(|_| ()))
+            .is_some(),
+        _ => false,
     }
-    (Answer::Putting { contracts }, puts)
 }
 
 fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {

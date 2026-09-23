@@ -70,6 +70,9 @@ pub struct PageNode {
     register_id: [u8; 32],
     register_params: Vec<u8>,
     secrets: Rc<RefCell<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    /// The OWNER CAPABILITY the signer handed back at provisioning (sdk#318): a tab of this node is the owner's
+    /// own session, so its sign requests carry it, as page-io's do.
+    cap: [u8; 32],
     /// The signer fails to save its record on the next sign (once).
     record_fails: Rc<Cell<bool>>,
     /// GETs this node answered from the NETWORK (a cold node's misses).
@@ -130,7 +133,8 @@ impl PageNode {
     pub fn new() -> PageNode {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
-        let n = PageNode {
+        let mut n = PageNode {
+            cap: [0u8; 32],
             blocks: Rc::default(),
             network: None,
             contracts: Rc::default(),
@@ -147,7 +151,10 @@ impl PageNode {
             register_params: params,
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        match signer::serve(&mut Host(&n), signer::Caller::Unattested, &signer::encode_request(1, &req)) {
+            signer::Answer::Capability(cap) => n.cap = cap,
+            other => panic!("the signer did not provision: {other:?}"),
+        }
         n
     }
 
@@ -272,7 +279,8 @@ impl PageNode {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger },
         };
-        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
+        let req = signer::Request::WithCap { cap: self.cap, inner: Box::new(req) };
+        let served = signer::serve_full(&mut Host(self), signer::Caller::Unattested, &signer::encode_request(id, &req));
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
     }
 }

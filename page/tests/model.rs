@@ -200,7 +200,7 @@ impl Node {
         };
         for d in 0..devices {
             n.dev = d;
-            assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+            assert!(matches!(signer::serve(&mut Host(&mut n), signer::Caller::Unattested, &signer::encode_request(1, &req)), signer::Answer::Capability(_)));
         }
         n.dev = 0;
         (n, params)
@@ -263,7 +263,13 @@ impl Node {
             next: signer::Next { seq, root, ledger },
         };
         // Through the BYTES both ways: the request under the page's id, the answer under the id the signer echoes.
-        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
+        // THE OWNER'S SESSION (sdk#318): its signs carry the owner capability, derived from the key as the signer
+        // derives it -- what page-io sends once the builder handed it the capability.
+        let host = Host(self);
+        let cap = signer::Host::get_secret(&host, signer::KEY).map(|k| signer::capability_of(&k));
+        let req = wire::signer::with_cap(cap, req);
+        let mut host = host;
+        let served = signer::serve_full(&mut host, signer::Caller::Unattested, &signer::encode_request(id, &req));
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
     }
 

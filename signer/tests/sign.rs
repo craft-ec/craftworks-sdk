@@ -29,6 +29,23 @@ impl Host for Mem {
     }
 }
 
+/// THE OWNER'S SESSION (sdk#318): every request this file sends is the owner's, so it carries the owner capability
+/// once a key is held (derived from that key, as the signer derives it). These shadow `signer::serve` /
+/// `serve_full`, so each test below still tests what it tested; the gate itself is tests/origin.rs.
+fn as_owner<H: Host>(host: &H, request: &[u8]) -> Vec<u8> {
+    match (host.get_secret(KEY), decode_request(request)) {
+        (Some(key), Some((id, r))) => encode_request(id, &Request::WithCap { cap: capability_of(&key), inner: Box::new(r) }),
+        _ => request.to_vec(),
+    }
+}
+fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
+    let wrapped = as_owner(host, request);
+    signer::serve_full(host, Caller::Unattested, &wrapped)
+}
+fn serve<H: Host>(host: &mut H, request: &[u8]) -> Answer {
+    serve_full(host, request).answer
+}
+
 struct World {
     host: Mem,
     params: Vec<u8>,
@@ -51,7 +68,7 @@ impl World {
                 },
             ),
         );
-        assert_eq!(a, Answer::Provisioned);
+        assert_eq!(a, Answer::Capability(capability_of(&sk.to_bytes())));
         World { host, params }
     }
     /// The node holds this tree's root block: its real state (`kind ‖ body`), which hashes to the root.
@@ -423,7 +440,7 @@ fn the_same_key_with_another_register_is_refused() {
     );
     assert_eq!(
         same,
-        Answer::Provisioned,
+        Answer::Capability(capability_of(&[7u8; 32])),
         "re-provisioning the SAME Register must still work"
     );
     let mut other = w.params.clone();
@@ -442,71 +459,13 @@ fn the_same_key_with_another_register_is_refused() {
     );
 }
 
-/// PUT-WITH-CODE: block STATES in, each named by its own hash; the contracts are answered in order and the entry is
-/// handed exactly those PUTs.
+/// PUT-WITH-CODE is REMOVED (sdk#318): no production caller, and any app can PUT through the client API directly, so
+/// the verb was attack surface only. Its slot stays, refused by name, and nothing is put.
 #[test]
-fn put_blocks_names_each_block_by_its_hash_and_hands_the_entry_the_puts() {
+fn put_blocks_is_removed() {
     let mut w = World::new();
-    let states: Vec<Vec<u8>> = (1..=3u8).map(block_state).collect();
-    let served = serve_full(
-        &mut w.host,
-        &encode_request(
-            1,
-            &Request::PutBlocks {
-                states: states.clone(),
-            },
-        ),
-    );
-    let ids: Vec<[u8; 32]> = (1..=3u8).map(block_root).collect();
-    let contracts: Vec<[u8; 32]> = ids
-        .iter()
-        .map(|id| contract_keys::block::contract_for(BCODE, id))
-        .collect();
-    assert_eq!(served.answer, Answer::Putting { contracts });
-    assert_eq!(served.puts, ids.into_iter().zip(states).collect::<Vec<_>>());
-}
-
-#[test]
-fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
-    let mut w = World::new();
-    let ask = |w: &mut World, states: Vec<Vec<u8>>| {
-        serve_full(
-            &mut w.host,
-            &encode_request(1, &Request::PutBlocks { states }),
-        )
-    };
-    let none = ask(&mut w, vec![]);
-    assert_eq!(
-        none.answer,
-        Answer::Refused(Why::BlockCount { max: 128, got: 0 })
-    );
-    let many = ask(&mut w, vec![block_state(1); 129]);
-    assert_eq!(
-        many.answer,
-        Answer::Refused(Why::BlockCount { max: 128, got: 129 })
-    );
-    let bad = ask(&mut w, vec![block_state(1), vec![]]);
-    assert_eq!(bad.answer, Answer::Refused(Why::NotABlock { index: 1 }));
-    for s in [none, many, bad] {
-        assert!(
-            s.puts.is_empty(),
-            "a refused PutBlocks still handed the entry PUTs"
-        );
-    }
-    let mut bare = Mem::default();
-    let r = serve_full(
-        &mut bare,
-        &encode_request(
-            1,
-            &Request::PutBlocks {
-                states: vec![block_state(1)],
-            },
-        ),
-    );
-    assert_eq!(
-        (r.answer, r.puts.len()),
-        (Answer::Refused(Why::NotProvisioned), 0)
-    );
+    let r = serve_full(&mut w.host, &encode_request(1, &Request::PutBlocks { states: vec![block_state(1)] }));
+    assert_eq!(r.answer, Answer::Refused(Why::Removed));
 }
 
 /// READ-LOCAL: present / absent per contract, in order, from the node's local states alone -- so a block the node
@@ -686,4 +645,136 @@ fn the_signer_names_the_register_it_signs_for_and_only_with_a_key() {
     let mut orphan = Mem::default();
     orphan.secrets.insert(REGISTER_PARAMS.to_vec(), w.params.clone());
     assert_eq!(serve(&mut orphan, &encode_request(7, &Request::Register)), Answer::Register { params: None }, "params with no key named a Register");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// THE ORIGIN GATE (sdk#318). Sent RAW here (`signer::serve` with an explicit caller), not through the owner wrapper
+// above: these are the requests a stranger's app, an approved app and the owner's session actually make.
+// ---------------------------------------------------------------------------------------------------------------
+
+const APP: [u8; 32] = [0xA1; 32];
+const STRANGER: [u8; 32] = [0x5E; 32];
+
+fn raw(w: &mut World, caller: Caller, r: Request) -> Answer {
+    signer::serve(&mut w.host, caller, &encode_request(9, &r))
+}
+fn cap_of(w: &World) -> [u8; 32] {
+    capability_of(&w.host.get_secret(KEY).expect("provisioned"))
+}
+fn with_cap(cap: [u8; 32], r: Request) -> Request {
+    Request::WithCap { cap, inner: Box::new(r) }
+}
+fn sign_req() -> Request {
+    Request::Sign { prev: genesis(), next: next(1, 1) }
+}
+
+/// **A stranger's app asking sign-if-next is refused BY NAME, and nothing changes**: no record, no Register state,
+/// no secret touched. Tokenless (unattested) and a served app the owner never approved alike.
+#[test]
+fn an_unapproved_origin_asking_to_sign_is_refused_and_nothing_changes() {
+    let mut w = World::new();
+    w.hold_root(root(1));
+    let before = w.host.secrets.clone();
+    for caller in [Caller::Unattested, Caller::WebApp(STRANGER)] {
+        assert_eq!(raw(&mut w, caller, sign_req()), Answer::Refused(Why::NotApproved), "{caller:?}");
+    }
+    assert_eq!(w.host.secrets, before, "a refused sign changed the signer's secrets");
+    assert!(w.host.get_secret(RECORD).is_none(), "a refused sign left a record");
+    // THE CONTROL: the owner's session, same request, same state, signs.
+    let cap = cap_of(&w);
+    assert!(matches!(raw(&mut w, Caller::Unattested, with_cap(cap, sign_req())), Answer::Signed(_)));
+}
+
+/// An approved app signs by its ORIGIN, with no capability; a withdrawn approval stops it again.
+#[test]
+fn an_approved_app_signs_and_unapprove_stops_it() {
+    let mut w = World::new();
+    w.hold_root(root(1));
+    let cap = cap_of(&w);
+    assert_eq!(raw(&mut w, Caller::Unattested, with_cap(cap, Request::Approve { app: APP })), Answer::Approved { apps: vec![APP] });
+    assert!(matches!(raw(&mut w, Caller::WebApp(APP), sign_req()), Answer::Signed(_)));
+    // Approval is by the app's id: another app is still a stranger, and a tokenless caller is not the app.
+    w.hold_root(root(2));
+    let from_one = Request::Sign { prev: Head { seq: 1, root: root(1) }, next: next(2, 2) };
+    assert_eq!(raw(&mut w, Caller::WebApp(STRANGER), from_one.clone()), Answer::Refused(Why::NotApproved));
+    assert_eq!(raw(&mut w, Caller::Unattested, from_one.clone()), Answer::Refused(Why::NotApproved));
+    assert_eq!(raw(&mut w, Caller::Unattested, with_cap(cap, Request::Unapprove { app: APP })), Answer::Approved { apps: vec![] });
+    assert_eq!(raw(&mut w, Caller::WebApp(APP), from_one), Answer::Refused(Why::NotApproved), "an unapproved app still signed");
+}
+
+/// Approval happens only in the owner's session: an app cannot approve itself (or anyone), even an approved one.
+#[test]
+fn only_the_capability_approves() {
+    let mut w = World::new();
+    let cap = cap_of(&w);
+    for caller in [Caller::Unattested, Caller::WebApp(STRANGER)] {
+        assert_eq!(raw(&mut w, caller, Request::Approve { app: STRANGER }), Answer::Refused(Why::NotApproved));
+    }
+    raw(&mut w, Caller::Unattested, with_cap(cap, Request::Approve { app: APP }));
+    assert_eq!(raw(&mut w, Caller::WebApp(APP), Request::Approve { app: STRANGER }), Answer::Refused(Why::NotApproved));
+    assert_eq!(raw(&mut w, Caller::WebApp(APP), Request::Unapprove { app: APP }), Answer::Refused(Why::NotApproved));
+    let mut wrong = cap;
+    wrong[0] ^= 1;
+    assert_eq!(raw(&mut w, Caller::Unattested, with_cap(wrong, Request::Approve { app: STRANGER })), Answer::Refused(Why::NotApproved));
+    assert_eq!(raw(&mut w, Caller::Unattested, with_cap(wrong, sign_req())), Answer::Refused(Why::NotApproved), "a wrong capability signed");
+}
+
+/// `Owns` answers only yes / no, to anyone. "Which Register?" is OPEN for now (consent is asked at the first
+/// WRITE, and a user's app asks it at open); what it discloses is the stated privacy follow-up.
+#[test]
+fn membership_and_which_register_are_open() {
+    let mut w = World::new();
+    let params = w.params.clone();
+    assert_eq!(raw(&mut w, Caller::WebApp(STRANGER), Request::Register), Answer::Register { params: Some(params.clone()) });
+    assert_eq!(raw(&mut w, Caller::WebApp(STRANGER), Request::Owns { register_params: params }), Answer::Owns(true));
+    assert_eq!(raw(&mut w, Caller::WebApp(STRANGER), Request::Owns { register_params: b"someone else".to_vec() }), Answer::Owns(false));
+    let mut fresh = Mem::default();
+    assert_eq!(signer::serve(&mut fresh, Caller::Unattested, &encode_request(1, &Request::Register)), Answer::Register { params: None });
+    assert_eq!(signer::serve(&mut fresh, Caller::Unattested, &encode_request(1, &Request::Owns { register_params: vec![1] })), Answer::Owns(false));
+}
+
+/// A provisioned signer is re-provisioned only by its owner: the capability, or the SAME key re-stated (which is
+/// what the capability is derived from). Another key from a stranger is refused by the gate, before anything else.
+#[test]
+fn a_provisioned_signer_is_re_provisioned_only_by_its_owner() {
+    let mut w = World::new();
+    let params = w.params.clone();
+    let prov = |key: Vec<u8>| Request::Provision { signing_key: key, register_code: RCODE.to_vec(), register_params: params.clone(), block_code: BCODE.to_vec() };
+    assert_eq!(raw(&mut w, Caller::WebApp(STRANGER), prov(vec![8u8; 32])), Answer::Refused(Why::NotApproved));
+    assert_eq!(raw(&mut w, Caller::Unattested, prov(vec![7u8; 32])), Answer::Capability(capability_of(&[7u8; 32])), "re-stating the held key");
+    assert_eq!(w.host.get_secret(KEY), Some(vec![7u8; 32]), "the key changed");
+}
+
+/// One level of wrapping only.
+#[test]
+fn a_nested_capability_is_unreadable() {
+    let mut w = World::new();
+    let cap = cap_of(&w);
+    assert_eq!(raw(&mut w, Caller::Unattested, with_cap(cap, with_cap(cap, sign_req()))), Answer::Refused(Why::Unreadable));
+}
+
+/// A FRESH signer is never provisioned by a served app (the architect's (ii)): a served app arrives as
+/// `WebApp(id)` (measured), so none can take the owner's place. The owner's builder, unattested, provisions it.
+#[test]
+fn a_served_app_cannot_provision_a_fresh_signer() {
+    let mut host = Mem::default();
+    let prov = Request::Provision { signing_key: vec![9u8; 32], register_code: RCODE.to_vec(), register_params: vec![1], block_code: BCODE.to_vec() };
+    assert_eq!(signer::serve(&mut host, Caller::WebApp(STRANGER), &encode_request(1, &prov)), Answer::Refused(Why::NotApproved));
+    assert!(host.get_secret(KEY).is_none(), "a served app's refused Provision left a key");
+    // THE CONTROL: the builder (unattested) provisions the same signer.
+    assert_eq!(signer::serve(&mut host, Caller::Unattested, &encode_request(2, &prov)), Answer::Capability(capability_of(&[9u8; 32])));
+}
+
+/// `HasRecord` is OPEN and signs nothing (sdk#318): what a page asks at open, which it used to ask with an
+/// unsignable `Sign` -- now gated. False before any signature; true once there is a record.
+#[test]
+fn has_record_is_open_and_says_whether_anything_was_signed() {
+    let mut w = World::new();
+    w.hold_root(root(1));
+    let before = w.host.secrets.clone();
+    assert_eq!(raw(&mut w, Caller::WebApp(STRANGER), Request::HasRecord), Answer::HasRecord(false));
+    assert_eq!(w.host.secrets, before, "asking changed the signer");
+    let cap = cap_of(&w);
+    assert!(matches!(raw(&mut w, Caller::Unattested, with_cap(cap, sign_req())), Answer::Signed(_)));
+    assert_eq!(raw(&mut w, Caller::WebApp(STRANGER), Request::HasRecord), Answer::HasRecord(true));
 }

@@ -51,6 +51,9 @@ struct WireNode {
     /// answered EMPTY (as 0.2.136 answers a delegate it does not have), and
     /// a registration makes it present.
     empty_until_registered: bool,
+    /// WHO the signer sees asking (sdk#318): tokenless (the builder, a native tool) by default; a served app
+    /// arrives as `WebApp(its id)`. Set per exchange by a test that drives two sessions.
+    caller: signer::Caller,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -91,6 +94,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            caller: signer::Caller::Unattested,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -98,7 +102,7 @@ impl WireNode {
             register_params: params,
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        assert!(matches!(signer::serve(&mut Host(&mut n), signer::Caller::Unattested, &signer::encode_request(1, &req)), signer::Answer::Capability(_)));
         n
     }
 
@@ -119,6 +123,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            caller: signer::Caller::Unattested,
         }
     }
 
@@ -224,7 +229,9 @@ impl WireNode {
                 let mut values = Vec::new();
                 for m in inbound {
                     if let InboundDelegateMsg::ApplicationMessage(am) = m {
-                        let served = signer::serve_full(&mut Host(self), &am.payload);
+                        // Whoever this exchange's session is (`caller`): tokenless by default, as the builder is.
+                        let caller = self.caller;
+                        let served = signer::serve_full(&mut Host(self), caller, &am.payload);
                         values.push(OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(signer::reply(&served))));
                     }
                 }
@@ -261,6 +268,10 @@ fn page_io(node: &WireNode) -> PageIo {
     );
     assert_eq!(io.register_id(), node.register_id, "page-io names the head differently from the node");
     io.signer_provisioned();
+    // The OWNER'S session (sdk#318): the builder hands page-io the capability it kept for this node.
+    if let Some(key) = node.secrets.get(signer::KEY) {
+        io.set_capability(signer::capability_of(key));
+    }
     io
 }
 
@@ -771,6 +782,8 @@ fn a_reload_and_a_second_tab_reopen_the_same_register_and_only_the_first_page_mi
     let (mut first, minted) = opening(&mut node, &mut now, &key, false);
     assert_eq!(minted, 1, "the first page, on a signer with no key, must mint");
     assert!(first.provisioned(), "the minted key was not provisioned: {:?}", first.unusable());
+    // sdk#318: provisioning handed back the owner capability; the builder keeps it and gives it to every reopen.
+    let cap = first.capability().expect("the first page's provisioning handed back no capability");
     assert_eq!(first.register_id(), node.register_id);
     client(&mut first, &mut node, &mut now, &Request::Identity);
     for (n, k) in ["a", "b", "c"].iter().enumerate() {
@@ -778,6 +791,7 @@ fn a_reload_and_a_second_tab_reopen_the_same_register_and_only_the_first_page_mi
     }
     for (i, label) in ["the reload", "a second tab"].into_iter().enumerate() {
         let (mut again, minted) = opening(&mut node, &mut now, &[99u8; 32], false);
+        again.set_capability(cap);
         assert_eq!(minted, 0, "{label} minted a new identity");
         assert!(again.provisioned(), "{label} did not open the signer's register: {:?}", again.unusable());
         assert_eq!(again.register_id(), node.register_id, "{label} opened another register");
@@ -788,6 +802,14 @@ fn a_reload_and_a_second_tab_reopen_the_same_register_and_only_the_first_page_mi
         assert!(states(&client(&mut again, &mut node, &mut now, &write(10 + i as u64, &k, "v")), 10 + i as u64).contains(&WriteState::Published), "{label} cannot write its own tree");
     }
     assert_eq!(node.register_puts, 1, "a second register was created");
+    // THE CONTROL (sdk#318): a reopen WITHOUT the capability reads the person's rows, and its write WAITS on
+    // approval -- not published, not ended, named.
+    let (mut bare, _) = opening(&mut node, &mut now, &[99u8; 32], false);
+    client(&mut bare, &mut node, &mut now, &Request::Identity);
+    assert_eq!(row_count(&mut bare, &mut node, &mut now, 40), Some(5), "a reopen without the capability cannot read");
+    let rs = client(&mut bare, &mut node, &mut now, &write(20, "no-cap", "v"));
+    assert!(!states(&rs, 20).contains(&WriteState::Published), "a session without the capability published: {:?}", states(&rs, 20));
+    assert!(bare.server.page.needs_approval(), "the waiting write does not say it needs approval");
 }
 
 /// THE CONTROL (the mutant a page that always mints is): a reload that mints
@@ -941,7 +963,9 @@ fn opening_that_the_signer_refuses_is_refused_in_its_words() {
     io.provision(container, other.to_bytes().to_vec());
     settle(&mut io, &mut node, &mut now);
     assert!(!io.provisioned());
-    assert!(io.refused().is_some_and(|r| r.contains("KeyAlreadyProvisioned")), "{:?}", io.refused());
+    // sdk#318: a page without this signer's owner capability, provisioning ANOTHER key over the one it holds,
+    // meets the gate first -- still an end in the signer's own words.
+    assert!(io.refused().is_some_and(|r| r.contains("NotApproved")), "{:?}", io.refused());
     assert!(!io.exhausted() && !io.stalled(), "a refusal is not also 'not answering' or 'still waiting'");
 }
 
@@ -1027,7 +1051,7 @@ fn an_opening_that_ended_is_reported_as_the_reason_there_is_no_subscription() {
     let h = io.head_subscription();
     assert!(!h.answered, "a page whose opening was refused reported a subscription: {h:?}");
     assert!(
-        h.ended.as_deref().is_some_and(|s| s.contains("KeyAlreadyProvisioned")),
+        h.ended.as_deref().is_some_and(|s| s.contains("NotApproved")),
         "the reason there is no subscription is not in the report, so it would say 'not answered yet' for ever: {h:?}"
     );
 }
@@ -1221,10 +1245,13 @@ fn control_opening_registers_the_signer() {
 /// the row back (a reload keeps the viewer's rows).
 #[test]
 fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
+    // A SERVED app claims the user's own tree (sdk#318): it arrives as WebApp(APP).
+    const APP: [u8; 32] = [0xA9; 32];
     for case in ["signs for their register", "signer holds no key", "no signer here"] {
         let key = [31u8; 32];
         let mut node = if case == "signs for their register" { WireNode::new(&key) } else { WireNode::unprovisioned(&key) };
         node.empty_until_registered = case == "no signer here";
+        node.caller = signer::Caller::WebApp(APP);
         let mut now = 1_000;
         let mut io = asker();
         settle(&mut io, &mut node, &mut now);
@@ -1238,22 +1265,45 @@ fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
         assert!(io.claim(container), "{case}: the claim was refused");
         settle(&mut io, &mut node, &mut now);
         if io.needs_key() {
+            // A SERVED APP never provisions a fresh signer (sdk#318 (ii)): the user sets this node up in their
+            // builder first, and the refusal says so in the signer's words.
             let sk = ed25519_dalek::SigningKey::from_bytes(&key);
             io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
             settle(&mut io, &mut node, &mut now);
+            assert!(!io.provisioned(), "{case}: a served app provisioned a fresh signer");
+            assert!(io.refused().is_some_and(|r| r.contains("NotApproved")), "{case}: {:?}", io.refused());
+            assert!(!node.secrets.contains_key(signer::KEY), "{case}: a refused provisioning left a key");
+            continue;
         }
         assert!(io.provisioned(), "{case}: the claimed page never opened: {:?}", io.unusable());
         assert_eq!(io.register_id(), node.register_id, "{case}: the claimed page names another register");
-        let registered = node.served.get("register delegate").copied().unwrap_or(0);
-        assert_eq!(registered, usize::from(case == "no signer here"), "{case}: the signer was registered {registered} times");
         assert_eq!(io.asked().cloned(), want, "{case}: the claim rewrote the answer (the identity's one owner)");
         client(&mut io, &mut node, &mut now, &Request::Identity);
+        // THE APP'S FIRST WRITE WAITS ON CONSENT: not published, not ended, named.
         let rs = client(&mut io, &mut node, &mut now, &write(1, "mine", "1"));
-        assert!(states(&rs, 1).iter().any(|s| matches!(s, WriteState::Published)), "{case}: the viewer's first write did not publish: {:?}", states(&rs, 1));
-        assert!(node.contracts.contains_key(&node.register_id), "{case}: the first write did not create the viewer's head");
+        assert!(!states(&rs, 1).contains(&WriteState::Published), "{case}: an unapproved app published: {:?}", states(&rs, 1));
+        assert!(io.server.page.needs_approval(), "{case}: the waiting write does not say it needs approval: states {:?}, unusable {:?}, served {:?}", states(&rs, 1), io.unusable(), node.served);
+        // THE USER ALLOWS IT, in their own (owner's) session, which holds the capability.
+        node.caller = signer::Caller::Unattested;
+        let mut owner = page_io(&node);
+        owner.approve(APP, true);
+        settle(&mut owner, &mut node, &mut now);
+        assert_eq!(owner.approved(), Some(&[APP][..]), "{case}: the approval did not land: {:?}", owner.unusable());
+        // Back in the app: nudged (the page became visible again), the same write is signed and published.
+        node.caller = signer::Caller::WebApp(APP);
+        io.server.page.nudge_sign();
+        let rs = settle(&mut io, &mut node, &mut now);
+        assert!(
+            states(&rs, 1).contains(&WriteState::Published),
+            "{case}: the approved app's write did not publish: {:?} / unusable {:?}",
+            states(&rs, 1),
+            io.unusable()
+        );
+        assert!(!io.server.page.needs_approval(), "{case}: still says it needs approval after the signature");
+        assert!(node.contracts.contains_key(&node.register_id), "{case}: the first write did not create the user's head");
         let mut again = page_io(&node);
         client(&mut again, &mut node, &mut now, &Request::Identity);
-        assert_eq!(row_count(&mut again, &mut node, &mut now, 70), Some(1), "{case}: a reopened page does not read the viewer's row");
+        assert_eq!(row_count(&mut again, &mut node, &mut now, 70), Some(1), "{case}: a reopened page does not read the user's row");
     }
 }
 

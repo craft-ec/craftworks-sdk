@@ -13,7 +13,8 @@ pub use signer_proto::{
     Answer as SignerAnswer, Head, Next, Request as SignerRequest, Why, MAX_PUT_BLOCKS, UNATTRIBUTED,
 };
 
-fn frame(
+/// Frame ANY signer request under the page's `id`. The verbs below are this with their request spelled out.
+pub fn frame_request(
     key: &DelegateKey,
     id: u32,
     r: &SignerRequest,
@@ -42,7 +43,7 @@ pub fn frame_sign(
     next: Next,
     stream_id: u32,
 ) -> Result<Vec<Vec<u8>>, String> {
-    frame(key, id, &SignerRequest::Sign { prev, next }, stream_id)
+    frame_request(key, id, &SignerRequest::Sign { prev, next }, stream_id)
 }
 
 /// Provision the signer: the head's key, the Register it signs for, and the Block contract's code (for its root check
@@ -56,7 +57,7 @@ pub fn frame_provision(
     block_code: Vec<u8>,
     stream_id: u32,
 ) -> Result<Vec<Vec<u8>>, String> {
-    frame(
+    frame_request(
         key,
         id,
         &SignerRequest::Provision {
@@ -85,7 +86,7 @@ pub fn frame_put_blocks(
             states.len()
         ));
     }
-    frame(key, id, &SignerRequest::PutBlocks { states }, stream_id)
+    frame_request(key, id, &SignerRequest::PutBlocks { states }, stream_id)
 }
 
 /// READ-LOCAL: ask whether the signer's node holds these contracts (1..=[`MAX_PUT_BLOCKS`]). Answered
@@ -103,13 +104,22 @@ pub fn frame_held(
             contracts.len()
         ));
     }
-    frame(key, id, &SignerRequest::Held { contracts }, stream_id)
+    frame_request(key, id, &SignerRequest::Held { contracts }, stream_id)
 }
 
 /// Ask the signer which Register it signs for ([`SignerRequest::Register`]): how a page reopens the person's own tree
 /// instead of minting a new identity on every load.
 pub fn frame_register_query(key: &DelegateKey, id: u32, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
-    frame(key, id, &SignerRequest::Register, stream_id)
+    frame_request(key, id, &SignerRequest::Register, stream_id)
+}
+
+/// `r`, carrying the owner capability when the page holds one (sdk#318): what a GATED verb needs from a session
+/// that is not an approved app. Without a capability the request goes as it is.
+pub fn with_cap(cap: Option<[u8; 32]>, r: SignerRequest) -> SignerRequest {
+    match cap {
+        Some(cap) => SignerRequest::WithCap { cap, inner: Box::new(r) },
+        None => r,
+    }
 }
 
 /// A signer answer and the id of the request it answers, from one application message of a delegate response;

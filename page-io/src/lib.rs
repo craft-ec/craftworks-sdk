@@ -242,6 +242,11 @@ pub struct PageIo {
     /// [`PageIo::claim`]: this asked page opens the person's OWN tree after
     /// all. The answer stays what it was; the page carries on as `begin`'s.
     claimed: bool,
+    /// The OWNER CAPABILITY (sdk#318), when this session is the owner's: handed back by the signer when this page
+    /// provisioned it, or given by the host (`set_capability`, from the builder's storage). Wraps every sign.
+    capability: Option<[u8; 32]>,
+    /// The apps approved to write, as the signer last said (`approve`); `None` until asked.
+    approved: Option<Vec<[u8; 32]>>,
 }
 
 /// The signer's first request, kept so it can be sent once the registration
@@ -266,13 +271,13 @@ const RECORD_QUERY_ID: u32 = (1 << 31) - 2;
 /// The id the "which Register do you sign for?" query goes out under (`begin`).
 const REGISTER_QUERY_ID: u32 = (1 << 31) - 3;
 
-/// A root no node holds: the record query names it so that nothing can be
-/// signed (see `ask_record`).
-const UNHELD_ROOT: [u8; 32] = [0xA5; 32];
 
 /// The id a provisioning request goes out under: far from the executor's own
 /// sign ids (from 1) and from the `Held` ids (from 2³¹).
 const PROVISION_ID: u32 = (1 << 31) - 1;
+
+/// The id an approval change goes out under (sdk#318).
+const APPROVE_ID: u32 = (1 << 31) - 4;
 
 /// The page's I/O as the store's host (READ-STATE): a call on the server is
 /// carried out at once — its node ops framed, its replies kept for the client.
@@ -345,6 +350,8 @@ impl PageIo {
             asking: false,
             asked: None,
             claimed: false,
+            capability: None,
+            approved: None,
         }
     }
 
@@ -640,6 +647,37 @@ impl PageIo {
     }
 
     /// The signer said it holds the key and the naming.
+    /// This session's owner capability (sdk#318), for the host to KEEP (the builder stores it per node): `None`
+    /// until the signer handed one to this page or the host gave one.
+    pub fn capability(&self) -> Option<[u8; 32]> {
+        self.capability
+    }
+
+    /// The owner capability the host kept (sdk#318). Every sign from here on carries it.
+    pub fn set_capability(&mut self, cap: [u8; 32]) {
+        self.capability = Some(cap);
+    }
+
+    /// Allow (`true`) or withdraw (`false`) an app's writes to this user's tree (sdk#318). The owner's session only:
+    /// without the capability there is nothing to send, and that is said.
+    pub fn approve(&mut self, app: [u8; 32], allow: bool) {
+        let Some(cap) = self.capability else {
+            self.unusable.push("approve: this session holds no owner capability".into());
+            return;
+        };
+        let r = if allow { signer_proto::Request::Approve { app } } else { signer_proto::Request::Unapprove { app } };
+        let stream = self.next_stream();
+        match wire::signer::frame_request(&self.art.signer, APPROVE_ID, &wire::signer::with_cap(Some(cap), r), stream) {
+            Ok(f) => self.out.extend(f),
+            Err(e) => self.unusable.push(format!("could not frame an approval: {e}")),
+        }
+    }
+
+    /// The approved apps, as the signer last answered an approval change.
+    pub fn approved(&self) -> Option<&[[u8; 32]]> {
+        self.approved.as_deref()
+    }
+
     pub fn provisioned(&self) -> bool {
         self.provisioned
     }
@@ -818,9 +856,15 @@ impl PageIo {
                             }
                             None => self.needs_key = true,
                         },
-                        Some((_, signer_proto::Answer::Provisioned)) => {
+                        // Provisioned: the capability comes back with it (sdk#318), and this session keeps it.
+                        Some((_, signer_proto::Answer::Capability(cap))) => {
+                            self.capability = Some(cap);
                             self.provisioned = true;
                             self.signer_provisioned();
+                        }
+                        Some((APPROVE_ID, signer_proto::Answer::Approved { apps })) => self.approved = Some(apps),
+                        Some((APPROVE_ID, signer_proto::Answer::Refused(why))) => {
+                            self.unusable.push(format!("the signer refused an approval change: {why:?}"));
                         }
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
                             self.refused = Some(format!("the signer refused provisioning: {why:?}"));
@@ -835,13 +879,9 @@ impl PageIo {
                         }
                         // The record query's answer (`ask_record`).
                         Some((RECORD_QUERY_ID, answer)) => {
-                            use signer_proto::{Answer as A, Why};
+                            use signer_proto::Answer as A;
                             let has = match answer {
-                                // No record, no head it can read: only genesis
-                                // would be signable, and the unheld root stops it.
-                                A::Refused(Why::RootNotHeld) => Some(false),
-                                // A record from genesis, or a later truth.
-                                A::AlreadySigned(_) | A::NotNext { .. } | A::Refused(Why::Forked { .. }) => Some(true),
+                                A::HasRecord(h) => Some(h),
                                 _ => None,
                             };
                             if let Some(h) = has {
@@ -1000,25 +1040,11 @@ impl PageIo {
         &self.unusable
     }
 
-    /// Ask the signer whether it holds a record for this register, WITHOUT
-    /// being able to sign anything: a sign request from the genesis naming a
-    /// root no node holds. `signer::decide` answers it in this order —
-    /// `AlreadySigned` if its record's prev is the genesis, `NotNext` if its
-    /// record or a head it can read is the truth, and only then, with neither,
-    /// `Refused(RootNotHeld)` because the root is not held. Nothing is ever
-    /// signed: the root check comes before any signature. ASSUMPTION (a verb
-    /// of its own would be clearer; the signer's owner may add one): the
-    /// order of `decide` stays as it is, which signer/tests pin.
+    /// Ask the signer whether it has signed anything for this register (sdk#318: its own open verb,
+    /// `HasRecord`, which signs nothing and needs no capability).
     fn ask_record(&mut self) {
-        let genesis_root = self.server.page.published().1;
         let stream = self.next_stream();
-        match wire::signer::frame_sign(
-            &self.art.signer,
-            RECORD_QUERY_ID,
-            signer_proto::Head { seq: 0, root: genesis_root },
-            signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
-            stream,
-        ) {
+        match wire::signer::frame_request(&self.art.signer, RECORD_QUERY_ID, &signer_proto::Request::HasRecord, stream) {
             Ok(f) => self.out.extend(f),
             Err(e) => self.unusable.push(format!("could not frame the record query: {e}")),
         }
@@ -1084,11 +1110,18 @@ impl PageIo {
                         wire::frame_put(self.register.clone(), WrappedState::new(state), stream)
                     }
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => wire::signer::frame_sign(
+                // Carrying the owner capability when this session holds one (sdk#318); an approved app signs by
+                // its origin, without.
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => wire::signer::frame_request(
                     &self.art.signer,
                     id,
-                    signer_proto::Head { seq: prev_seq, root: prev_root },
-                    signer_proto::Next { seq, root, ledger },
+                    &wire::signer::with_cap(
+                        self.capability,
+                        signer_proto::Request::Sign {
+                            prev: signer_proto::Head { seq: prev_seq, root: prev_root },
+                            next: signer_proto::Next { seq, root, ledger },
+                        },
+                    ),
                     stream,
                 ),
                 Op::PutApp { key } => match self.app_contracts.get(&key) {
