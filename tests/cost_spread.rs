@@ -28,13 +28,10 @@ use testkit::page_node::Served;
 use testkit::{PageConn, PageNode};
 
 fn write(n: u64) -> Request {
-    Request::Write {
-        write_id: n,
-        ops: vec![protocol::Op::Put(
+    Request::forced_write(n, vec![protocol::Op::Put(
             format!("k/{n:06}").into_bytes(),
             vec![(n % 251) as u8; 64],
-        )],
-    }
+        )])
 }
 
 /// What the node was asked to DO for one client operation, and what crossed.

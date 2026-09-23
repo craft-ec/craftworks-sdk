@@ -31,19 +31,13 @@ fn two_hundred_one_row_writes_back_to_back_all_hear_parity_complete() {
         let mut v = vec![0u8; 1000];
         v[..8].copy_from_slice(&w.to_le_bytes());
         let ops = vec![Op::Put(format!("k/{w:07}").into_bytes(), v)];
-        let mut r = c.client(&Request::Write {
-            write_id: 100 + w,
-            ops: ops.clone(),
-        });
+        let mut r = c.client(&Request::forced_write(100 + w, ops.clone()));
         for _ in 0..20 {
             if states(&r, 100 + w).contains(&WriteState::Published) {
                 break;
             }
             if states(&r, 100 + w).last() == Some(&WriteState::Busy) {
-                r = c.client(&Request::Write {
-                    write_id: 100 + w,
-                    ops: ops.clone(),
-                });
+                r = c.client(&Request::forced_write(100 + w, ops.clone()));
             }
             tick += 1;
             r.extend(c.tick_at(T0 + tick * 1000));

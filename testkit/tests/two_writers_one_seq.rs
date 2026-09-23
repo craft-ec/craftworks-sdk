@@ -24,20 +24,14 @@ fn a_second_writer_at_the_same_seq_is_lost_not_published_and_its_re_send_publish
     let (mut a, mut b) = (node.connect(), node.connect());
     a.client(&Request::Identity);
     b.client(&Request::Identity); // both read NO head: each will commit seq 1
-    let wa = a.client(&Request::Write {
-        write_id: 1,
-        ops: vec![Op::Put(b"k/a".to_vec(), vec![1u8; 3000])],
-    });
+    let wa = a.client(&Request::forced_write(1, vec![Op::Put(b"k/a".to_vec(), vec![1u8; 3000])]));
     assert!(
         told(&wa, 1).contains(&WriteState::Published),
         "A: {:?}",
         told(&wa, 1)
     );
     let a_head = node.head().expect("A's head");
-    let wb = b.client(&Request::Write {
-        write_id: 1,
-        ops: vec![Op::Put(b"k/b".to_vec(), vec![2u8; 3000])],
-    });
+    let wb = b.client(&Request::forced_write(1, vec![Op::Put(b"k/b".to_vec(), vec![2u8; 3000])]));
     let st = told(&wb, 1);
     assert!(
         !st.contains(&WriteState::Published),
@@ -49,10 +43,7 @@ fn a_second_writer_at_the_same_seq_is_lost_not_published_and_its_re_send_publish
     );
     assert_eq!(node.head(), Some(a_head), "the Register's head moved");
     // B re-sends, as its outbox does, on the head that won.
-    let again = b.client(&Request::Write {
-        write_id: 2,
-        ops: vec![Op::Put(b"k/b".to_vec(), vec![2u8; 3000])],
-    });
+    let again = b.client(&Request::forced_write(2, vec![Op::Put(b"k/b".to_vec(), vec![2u8; 3000])]));
     assert!(
         told(&again, 2).contains(&WriteState::Published),
         "{:?}",

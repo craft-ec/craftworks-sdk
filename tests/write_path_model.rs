@@ -415,7 +415,13 @@ impl Model {
         edits.sort_by(|a, b| a.0.cmp(&b.0));
         let id = self.stores[i].next_write_id();
         let refused_before = self.stores[i].refused.len();
-        let _ = Store::apply_batch(&mut self.stores[i], &edits);
+        // An APP's write, which always says what it read (sdk#235): NOT a
+        // store-level `apply_batch`, which is forced (`Expect::Any`) and falls
+        // on Lost instead of going again — the path this model exists to
+        // check. The model's node checks no reads, so the premise's value
+        // does not matter here; that it is a premise, not `Any`, does.
+        let reads: Vec<(Vec<u8>, protocol::Expect)> = edits.iter().map(|(k, _)| (k.clone(), protocol::Expect::Present)).collect();
+        let _ = Store::apply_commit(&mut self.stores[i], &reads, &edits);
         self.made[i].insert(id, ops_of(&edits));
         if self.stores[i].refused.len() > refused_before {
             self.ended[i].insert(id, End::RefusedAtMake);
@@ -459,7 +465,7 @@ impl Model {
 
     fn send_to_node(&mut self, i: usize, f: Vec<u8>, resent: bool) {
         if let protocol::Incoming::Ok(env) = protocol::decode_request(&f) {
-            if let Request::Write { write_id, ops } = &env.body {
+            if let Request::Write { write_id, ops } | Request::Commit { write_id, ops, .. } = &env.body {
                 // W1: the frame carries exactly the ops the write was made with.
                 if let Some(made) = self.made[i].get(write_id) {
                     if made != ops {
@@ -488,7 +494,7 @@ impl Model {
             self.log(format!("node REFUSES a frame from s{i} (queue {}, parked {})", self.inbound.len(), self.parked));
             self.saw.insert(if self.parked { "a request refused while parked (F50)" } else { "a request refused past 101 (F51)" });
             if let protocol::Incoming::Ok(env) = protocol::decode_request(&f) {
-                if let Request::Write { write_id, .. } = env.body {
+                if let Request::Write { write_id, .. } | Request::Commit { write_id, .. } = env.body {
                     self.note(i, write_id, "the node refused its frame");
                 }
             }
@@ -552,7 +558,7 @@ impl Model {
         });
         for id in timed_out {
             let waiting = self.inbound.iter().any(|(s, f)| {
-                *s == i && matches!(protocol::decode_request(f), protocol::Incoming::Ok(env) if matches!(env.body, Request::Write { write_id, .. } if write_id == id))
+                *s == i && matches!(protocol::decode_request(f), protocol::Incoming::Ok(env) if matches!(env.body, Request::Write { write_id, .. } | Request::Commit { write_id, .. } if write_id == id))
             });
             if waiting {
                 self.note(i, id, "timed out while its frame waited in the node's queue");
@@ -622,7 +628,7 @@ impl Model {
             self.saw.insert("an AskWrite served");
             return;
         }
-        let Request::Write { write_id, ops } = env.body else { return };
+        let (Request::Write { write_id, ops } | Request::Commit { write_id, ops, .. }) = env.body else { return };
         if i > 1 {
             return; // the third connection sends no writes
         }
@@ -1080,7 +1086,7 @@ impl Model {
             // The tick frames just pumped are not work: only a WRITE still
             // queued at the node, an answer on its way, or a commit is.
             let writes_queued = self.inbound.iter().any(|(_, f)| {
-                matches!(protocol::decode_request(f), protocol::Incoming::Ok(env) if matches!(env.body, Request::Write { .. }))
+                matches!(protocol::decode_request(f), protocol::Incoming::Ok(env) if matches!(env.body, Request::Write { .. } | Request::Commit { .. }))
             });
             let quiet = self.pending(0).is_empty()
                 && self.pending(1).is_empty()

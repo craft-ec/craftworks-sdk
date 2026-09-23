@@ -19,12 +19,7 @@ fn c(n: u64) -> ClientId {
 }
 
 fn write(client: u64, id: u64, ops: Vec<(Vec<u8>, Op)>) -> Event {
-    Event::Write {
-        client: c(client),
-        write_id: w(id),
-        ops,
-        reads: Vec::new(),
-    }
+    Event::forced_write(c(client), w(id), ops)
 }
 
 fn put(k: &str, v: &[u8]) -> (Vec<u8>, Op) {

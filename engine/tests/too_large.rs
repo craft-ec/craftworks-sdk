@@ -20,12 +20,7 @@ fn states(fx: &[Effect]) -> Vec<State> {
 }
 
 fn write(id: u64, ops: Vec<(Vec<u8>, Op)>) -> Event {
-    Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(id),
-        ops,
-        reads: Vec::new(),
-    }
+    Event::forced_write(ClientId(1), WriteId(id), ops)
 }
 
 /// `n` DISTINCT values of `size` bytes, one key each. Distinct on purpose:
@@ -182,7 +177,10 @@ fn identical_values_are_one_block_so_count_is_not_the_bound() {
 #[test]
 fn over_the_write_byte_bound_is_too_large_with_its_size_and_the_boundary_is_exact() {
     let ops = vec![(b"k".to_vec(), Op::Put(vec![1u8; 5000]))];
-    let size = 1 + 5000;
+    // The op (key 1 + value 5000) AND its read: every write names what it read
+    // (sdk#235, W8), this one forced — `k` read as `Any` — and a read costs its
+    // key plus 33 bytes in the engine's count (`on_write`'s `size`).
+    let size = (1 + 5000) + (1 + 33);
     assert_eq!(
         answer(
             Params {

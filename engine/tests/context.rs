@@ -110,13 +110,13 @@ fn a_context_round_trips_and_refuses_what_it_cannot_read() {
     let mut e = Engine::new(packed, store.clone());
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
-    let out = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
+    let out = e.step(Event::forced_write(
+        ClientId(1),
+        WriteId(1),
         // Big enough that the pack is the dominant thing in the commit. With
         // a tiny write the bookkeeping is legitimately larger than the pack,
         // and "context < pack" would be the wrong property to assert.
-        ops: (0..40u32)
+        (0..40u32)
             .map(|i| {
                 (
                     format!("k/{i:03}").into_bytes(),
@@ -124,8 +124,7 @@ fn a_context_round_trips_and_refuses_what_it_cannot_read() {
                 )
             })
             .collect(),
-        reads: Vec::new(),
-    });
+    ));
     store.absorb(&out);
 
     let bytes = e.to_context().expect("a context");
@@ -228,12 +227,7 @@ fn the_context_costs_what_it_is_budgeted() {
         .collect();
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
-    let out = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-        reads: Vec::new(),
-    });
+    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
     store.absorb(&out);
     let in_flight = e.to_context().expect("in flight").len();
     let blocks = out
@@ -371,12 +365,7 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
         .collect();
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e2.step(Event::HeadMissing);
-    let out = e2.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-        reads: Vec::new(),
-    });
+    let out = e2.step(Event::forced_write(ClientId(1), WriteId(1), ops));
     let commit_blocks = out
         .iter()
         .filter(|f| matches!(f, Effect::PutPack { .. } | Effect::PutBlock { .. }))
@@ -452,12 +441,7 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
         let before = e.root();
         // A new tree: nothing to recover. A write before recovery waits (sdk#223).
         let _ = e.step(Event::HeadMissing);
-        let out = e.step(Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops,
-            reads: Vec::new(),
-        });
+        let out = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
         let after = e.root();
         (out, before, after)
     };
@@ -644,12 +628,7 @@ fn owed_parity_survives_a_rehydration_and_is_still_put() {
         .collect();
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
-    let mut queue = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-        reads: Vec::new(),
-    });
+    let mut queue = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
     store.absorb(&queue);
     let mut live: Vec<Effect> = Vec::new();
     let mut guard = 0;
@@ -772,12 +751,7 @@ fn a_damaged_context_is_refused_without_panicking_or_allocating_the_world() {
         .collect();
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
-    let _ = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-        reads: Vec::new(),
-    });
+    let _ = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
     let good = e.to_context().expect("context");
 
     let (mut refused, mut accepted) = (0usize, 0usize);
@@ -844,12 +818,7 @@ fn a_refused_context_recovers_from_the_head_and_gives_the_unknown_write_no_verdi
     let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
-    let out = e.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(b"k".to_vec(), Op::Put(vec![5u8; 40]))],
-        reads: Vec::new(),
-    });
+    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![5u8; 40]))]));
     store.absorb(&out);
     let good = e.to_context().expect("context");
     let published = e.published_root();

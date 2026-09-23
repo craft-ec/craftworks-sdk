@@ -87,7 +87,7 @@ fn drive_with(e: &mut Engine<Store>, net: &mut Network, first: Vec<Effect>, told
 }
 
 fn write(e: &mut Engine<Store>, net: &mut Network, id: u64, ops: Vec<(Vec<u8>, Op)>, told: &mut BTreeMap<u64, Vec<State>>) {
-    let out = stepped!(e, Event::Write { client: ClientId(1), write_id: WriteId(id), ops, reads: Vec::new() });
+    let out = stepped!(e, Event::forced_write(ClientId(1), WriteId(id), ops));
     drive(e, net, out, told);
 }
 
@@ -145,7 +145,7 @@ fn editing_the_leftmost_key_of_a_big_tree_reaches_parity_complete() {
     for (label, k) in [("RIGHTMOST", n - 1), ("LEFTMOST", 0)] {
         let w = id;
         id += 1;
-        let out = stepped!(e, Event::Write { client: ClientId(1), write_id: WriteId(w), ops: vec![(key(k), Op::Put(b"edited".to_vec()))], reads: Vec::new() });
+        let out = stepped!(e, Event::forced_write(ClientId(1), WriteId(w), vec![(key(k), Op::Put(b"edited".to_vec()))]));
         drive_with(&mut e, &mut net, out, &mut told, true);
         ticks_with(&mut e, &mut net, t, 5, &mut told, true);
         assert!(e.owed_groups() > 0, "{label}: the edit owes no parity, so nothing here needs recovering");

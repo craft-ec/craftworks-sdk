@@ -334,12 +334,7 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
     // write before recovery waits for it (sdk#223), so this writer says it.
     let _ = w.step(Event::HeadMissing);
     let mut queue = {
-        let out = w.step(Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(1),
-            ops,
-            reads: Vec::new(),
-        });
+        let out = w.step(Event::forced_write(ClientId(1), WriteId(1), ops));
         ws.absorb(&out);
         out
     };

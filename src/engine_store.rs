@@ -88,6 +88,9 @@ pub struct EngineStore<T: Transport> {
     /// How many times the outbox re-sent something. Reported, so "it worked"
     /// and "it worked first time" are distinguishable.
     pub resubmits: u64,
+    /// Writes sent with an `Expect::Any` read: forced (sdk#235). A `Lost` one
+    /// falls instead of going again.
+    forced: std::collections::BTreeSet<u64>,
 }
 
 impl<T: Transport> EngineStore<T> {
@@ -98,6 +101,7 @@ impl<T: Transport> EngineStore<T> {
             outbox: Outbox::new(),
             next_write_id: 1,
             resubmits: 0,
+            forced: std::collections::BTreeSet::new(),
         }
     }
 
@@ -263,6 +267,9 @@ impl<T: Transport> EngineStore<T> {
             })
             .collect();
 
+        if reads.iter().any(|(_, e)| *e == protocol::Expect::Any) {
+            self.forced.insert(write_id);
+        }
         self.outbox.push_reading(write_id, edits, pre, reads);
         self.drive_outbox(&keys);
     }
@@ -304,6 +311,19 @@ impl<T: Transport> EngineStore<T> {
                     }
                     answered = true;
                     match state {
+                        // A FORCED write told Lost falls, NAMED, and is not
+                        // re-sent (sdk#235): no premise, so a re-send is blind.
+                        WriteState::Lost if self.forced.contains(&id) => {
+                            self.forced.remove(&id);
+                            self.outbox.settle(id, WriteState::Failed);
+                            self.client.events.push(Event::ForcedLost { write_id: id });
+                        }
+                        // Refused at the door (sdk#235): never re-sent.
+                        WriteState::Unread => {
+                            self.forced.remove(&id);
+                            self.outbox.settle(id, state);
+                            self.client.events.push(Event::Unread { write_id: id });
+                        }
                         WriteState::Lost => {
                             let current: std::collections::BTreeMap<Vec<u8>, Option<PreImage>> =
                                 keys.iter()
@@ -398,8 +418,11 @@ impl<T: Transport> EngineStore<T> {
 }
 
 impl<T: Transport> Store for EngineStore<T> {
+    /// A store-level batch that cannot read first: it says so, key by key, as
+    /// `Expect::Any` (sdk#235, W8) — counted by the engine and shown.
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
-        self.apply_commit(&[], edits)
+        let reads: Vec<(Vec<u8>, protocol::Expect)> = edits.iter().map(|(k, _)| (k.clone(), protocol::Expect::Any)).collect();
+        self.apply_commit(&reads, edits)
     }
 
     fn apply_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {

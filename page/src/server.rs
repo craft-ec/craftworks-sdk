@@ -183,6 +183,11 @@ struct Probe {
 const PROBE_CLIENT: engine::ClientId = engine::ClientId(0);
 
 impl Server {
+    /// Writes taken forced past their reads (sdk#235).
+    pub fn forced_writes(&self) -> u64 {
+        self.page.forced_writes()
+    }
+
     pub fn new(page: Page, facts: SignerFacts) -> Server {
         Server {
             page,
@@ -382,7 +387,7 @@ impl Server {
                             }
                         }
                     }
-                    State::Failed | State::Lost | State::Conflict | State::TooLarge { .. } => {
+                    State::Failed | State::Lost | State::Conflict | State::Unread | State::TooLarge { .. } => {
                         self.sent.remove(&id);
                     }
                     _ => {}
@@ -513,7 +518,14 @@ impl Server {
         let Some(m) = self.merge.as_mut() else { return };
         // A write whose declared read moved on their side had a stale
         // premise: ALL its keys are superseded (main's rule).
-        let stale: Vec<bool> = m.writes.iter().map(|(_, w)| w.reads.iter().any(|(k, _)| m.theirs.contains_key(k))).collect();
+        // An `Any` read states NO premise ("whatever it holds", sdk#235), so it
+        // can never be stale: counting it would supersede every forced write
+        // whose key the other side touched, which is a rollback, not a merge.
+        let stale: Vec<bool> = m
+            .writes
+            .iter()
+            .map(|(_, w)| w.reads.iter().any(|(k, e)| *e != engine::Expect::Any && m.theirs.contains_key(k)))
+            .collect();
         let mut kept = Vec::new();
         for (k, v) in &m.left {
             let premise_ok = m.writes.iter().zip(&stale).filter(|((_, w), _)| w.finals.iter().any(|(wk, _)| wk == k)).all(|(_, s)| !*s);
@@ -598,7 +610,7 @@ impl Server {
                 m.resend = true;
                 false
             }
-            State::Lost | State::Conflict | State::Failed | State::TooLarge { .. } => {
+            State::Lost | State::Conflict | State::Unread | State::Failed | State::TooLarge { .. } => {
                 // It could not land where it was judged: the kept keys are
                 // superseded too — told, never blind.
                 let kept = std::mem::take(&mut m.kept);
@@ -763,6 +775,7 @@ impl Server {
                                 protocol::Expect::Absent => engine::Expect::Absent,
                                 protocol::Expect::Present => engine::Expect::Present,
                                 protocol::Expect::Value(h) => engine::Expect::Value(h),
+                                protocol::Expect::Any => engine::Expect::Any,
                             },
                         )
                     })
@@ -932,6 +945,9 @@ impl Server {
                         // M2: nothing applied, a read no longer held. `for_client`
                         // tells a pre-v4 client `Failed`, which is true to it.
                         State::Conflict => W::Conflict,
+                        // sdk#235: refused at the door, a key written unread.
+                        // `for_client` tells a pre-v4 client `Failed`.
+                        State::Unread => W::Unread,
                         State::TooLarge { bound, limit, got } => W::too_large(
                             match bound {
                                 engine::WriteBound::CommitBlocks => {
@@ -975,6 +991,15 @@ impl Server {
                         key: key.clone(),
                         current: current.as_ref().map(|f| f.hash()),
                     }
+                }
+                // WHICH key a write changed unread (sdk#235) — to the same
+                // bundle only, as `Conflicted`; an older client has `Failed`.
+                Effect::Unread { client, write_id, key } => {
+                    let version = version_of(*client);
+                    if version < protocol::SESSION_SINCE || session_of(*client) == protocol::LEGACY_SESSION {
+                        continue;
+                    }
+                    protocol::Reply::Unread { session: session_of(*client), write_id: write_id.0, key: key.clone() }
                 }
                 Effect::Reply { req_id, result, .. } => {
                     // WHERE THIS ENGINE STANDS, as it answers.
@@ -1079,7 +1104,10 @@ impl Server {
             return;
         };
         let (of, began) = match &r {
-            protocol::Request::Write { write_id, ops } => {
+            // A write is traced whatever its shape: since sdk#235 every write
+            // the SDK sends is a `Commit` (a forced one reads `Any`), so a
+            // trace that started only on `Write` went silent.
+            protocol::Request::Write { write_id, ops } | protocol::Request::Commit { write_id, ops, .. } => {
                 (protocol::TraceOf::Write(*write_id), ops.len() as u64)
             }
             protocol::Request::Get { req_id, .. }
@@ -1156,6 +1184,9 @@ fn state_tag(s: State) -> u64 {
         // (`reads: Vec::new()` below), so nothing can conflict. Tagged as a
         // failure, which is what it would mean to this client.
         State::Conflict => 5,
+        // Refused at the door (sdk#235): a failure to this client, like
+        // `Conflict`.
+        State::Unread => 5,
     }
 }
 

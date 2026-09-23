@@ -763,6 +763,11 @@ impl PageIo {
         std::mem::take(&mut self.replies)
     }
 
+    /// Writes the engine took forced past their reads (sdk#235).
+    pub fn forced_writes(&self) -> u64 {
+        self.server.forced_writes()
+    }
+
     pub fn unusable(&self) -> &[String] {
         &self.unusable
     }

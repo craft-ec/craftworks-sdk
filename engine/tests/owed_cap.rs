@@ -56,12 +56,7 @@ fn past_the_owed_cap_writes_still_publish_and_their_parity_is_left_to_the_scrub(
     for i in 0..200u64 {
         // One key each, a value large enough to be carried by reference, so
         // every write codes parity.
-        let fx = h.step(Event::Write {
-            client: ClientId(1),
-            write_id: WriteId(i + 1),
-            ops: vec![(format!("k/{i:05}").into_bytes(), Op::Put(vec![(i % 251) as u8; 1400]))],
-            reads: Vec::new(),
-        });
+        let fx = h.step(Event::forced_write(ClientId(1), WriteId(i + 1), vec![(format!("k/{i:05}").into_bytes(), Op::Put(vec![(i % 251) as u8; 1400]))]));
         let all = publish(&mut h, fx);
         told_all.push((i + 1, told(&all, i + 1)));
         // Time passes; parity is asked for and never answered.
@@ -85,12 +80,7 @@ fn past_the_owed_cap_writes_still_publish_and_their_parity_is_left_to_the_scrub(
         "a write past the cap was told ParityComplete"
     );
     // And the engine is open.
-    let fx = h.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(999),
-        ops: vec![(b"z/after".to_vec(), Op::Put(b"x".to_vec()))],
-        reads: Vec::new(),
-    });
+    let fx = h.step(Event::forced_write(ClientId(1), WriteId(999), vec![(b"z/after".to_vec(), Op::Put(b"x".to_vec()))]));
     assert!(told(&publish(&mut h, fx), 999).contains(&State::Published));
 }
 

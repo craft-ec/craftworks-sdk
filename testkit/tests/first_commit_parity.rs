@@ -40,13 +40,10 @@ fn first_commit(ticks_in_flight: bool) -> (Vec<WriteState>, usize, bool) {
     let mut c = node.connect();
     c.client(&Request::Identity);
     c.hold_answers();
-    let mut all = c.client(&Request::Write {
-        write_id: 1,
-        ops: vec![
+    let mut all = c.client(&Request::forced_write(1, vec![
             Op::Put(b"k/big".to_vec(), value(7, 30 * 1024)),
             Op::Put(b"k/small".to_vec(), b"small".to_vec()),
-        ],
-    });
+        ]));
     let base = 1_790_000_000_000u64;
     let mut k = 1u64;
     while c.held() > 0 && k < 40 {

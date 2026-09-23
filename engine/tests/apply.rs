@@ -57,12 +57,7 @@ fn states(fx: &[Effect]) -> Vec<State> {
 }
 
 fn write_one(key: &str, val: &[u8]) -> Event {
-    Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops: vec![(key.as_bytes().to_vec(), Op::Put(val.to_vec()))],
-        reads: Vec::new(),
-    }
+    Event::forced_write(ClientId(1), WriteId(1), vec![(key.as_bytes().to_vec(), Op::Put(val.to_vec()))])
 }
 
 /// A write onto a cold path is parked, fetched for, and applies.
@@ -232,12 +227,7 @@ fn a_second_write_while_one_is_parked_is_refused() {
     let out = h.step(write_one("k/00100", b"first"));
     assert!(!fetches(&out).is_empty(), "the first write did not park");
 
-    let out = h.step(Event::Write {
-        client: ClientId(2),
-        write_id: WriteId(2),
-        ops: vec![(b"k/00200".to_vec(), Op::Put(b"second".to_vec()))],
-        reads: Vec::new(),
-    });
+    let out = h.step(Event::forced_write(ClientId(2), WriteId(2), vec![(b"k/00200".to_vec(), Op::Put(b"second".to_vec()))]));
     assert_eq!(
         states(&out),
         vec![State::Busy],
@@ -425,12 +415,7 @@ fn a_parked_write_of_many_tiny_ops_is_capped_on_what_it_costs() {
          be refused by a payload cap too, and would not show the difference"
     );
 
-    let out = h.step(Event::Write {
-        client: ClientId(1),
-        write_id: WriteId(1),
-        ops,
-        reads: Vec::new(),
-    });
+    let out = h.step(Event::forced_write(ClientId(1), WriteId(1), ops));
     assert_eq!(
         states(&out),
         vec![State::Busy],

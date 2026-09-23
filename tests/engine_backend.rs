@@ -29,7 +29,7 @@ impl Transport for Loop {
         // engine does this whenever a commit is already in flight.
         if self.busy_for > 0 {
             if let protocol::Incoming::Ok(env) = protocol::decode_request(request) {
-                if let protocol::Request::Write { write_id, .. } = env.body {
+                if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
                     self.busy_for -= 1;
                     // Named with the writer's session, as the delegate names a v4
                     // writer's verdict (sdk#146): an unnamed one is another tab's.

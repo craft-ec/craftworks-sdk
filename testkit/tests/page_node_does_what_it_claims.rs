@@ -7,7 +7,7 @@
 use testkit::page_node::{PageNode, Served};
 
 fn put(id: u64, k: &str, v: &str) -> protocol::Request {
-    protocol::Request::Write { write_id: id, ops: vec![protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec())] }
+    protocol::Request::forced_write(id, vec![protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec())])
 }
 
 fn published(frames: &[Vec<u8>], id: u64) -> bool {

@@ -332,8 +332,25 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// A FORCED write: a [`Request::Commit`] reading every op key as
+    /// [`Expect::Any`] — "I write this key whatever it holds" (sdk#235, W8).
+    /// The ONE way a write that does not depend on what was there is sent, so
+    /// the engine can count it; a reads-less [`Request::Write`] is refused as
+    /// [`WriteState::Unread`].
+    pub fn forced_write(write_id: u64, ops: Vec<Op>) -> Request {
+        let reads = ops
+            .iter()
+            .map(|o| match o {
+                Op::Put(k, _) | Op::Delete(k) => (k.clone(), Expect::Any),
+            })
+            .collect();
+        Request::Commit { write_id, reads, ops }
+    }
+}
+
 /// What a [`Request::Commit`] READ at a key, as the engine checks it
-/// (`engine::Expect`, the same three cases).
+/// (`engine::Expect`, the same four cases).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expect {
     /// The key is not in the tree (a create).
@@ -344,6 +361,11 @@ pub enum Expect {
     /// bytes read — the LEAF form, inline or by reference, never a hash the
     /// client made up of its own.
     Value([u8; 32]),
+    /// "I write this key whatever it holds" — the FORCED form, named so it is
+    /// countable (sdk#235, W8). TRANSITIONAL: only a store-level batch that
+    /// cannot read first sends it; `Db` refuses to build one; sdk#281 removes
+    /// it once the count is zero.
+    Any,
 }
 
 /// Which id space a trace question is in.
@@ -675,6 +697,15 @@ pub enum Reply {
         write_id: u64,
         key: Vec<u8>,
         current: Option<[u8; 32]>,
+    },
+    /// A write refused AT THE DOOR because it changes `key` without having
+    /// read it (sdk#235, W8): nothing applied. The write's state is
+    /// [`WriteState::Unread`], sent beside this. From `page::Server` to v4
+    /// (the same bundle, as [`Reply::Conflicted`]).
+    Unread {
+        session: u64,
+        write_id: u64,
+        key: Vec<u8>,
     },    /// A PUBLISHED write whose value at some of its keys another device of
     /// the same identity replaced (sdk#225b): the register's tie-break kept
     /// the other device's head at this write's seq, and the merge could not
@@ -856,6 +887,11 @@ pub enum WriteState {
     /// it is — the same write conflicts the same way; what to do next is the
     /// app's. From `page::Server` at v4 (see [`Request::Commit`]).
     Conflict,
+    /// TERMINAL, nothing applied: the write changes a key it did not read
+    /// (sdk#235, W8) — judged at the door, before any other answer.
+    /// [`Reply::Unread`] names the key. NEVER re-sent: the same write is
+    /// refused the same way every time.
+    Unread,
 }
 
 /// Which of the engine's bounds a [`WriteState::TooLarge`] write is over.
@@ -888,6 +924,7 @@ impl WriteState {
                 | WriteState::TooLarge { .. }
                 | WriteState::OutOfOrder { .. }
                 | WriteState::Conflict
+                | WriteState::Unread
         )
     }
 
@@ -918,7 +955,7 @@ impl WriteState {
             | WriteState::Failed
             | WriteState::Lost => 1,
             WriteState::TooLarge { .. } => 3,
-            WriteState::Conflict => SESSION_SINCE,
+            WriteState::Conflict | WriteState::Unread => SESSION_SINCE,
             WriteState::Duplicate | WriteState::OutOfOrder { .. } => FLOOR_SINCE,
         }
     }
@@ -951,6 +988,10 @@ impl WriteState {
             // Nothing applied and sending it again conflicts again: what
             // `Failed` tells an older client.
             WriteState::Conflict => WriteState::Failed,
+            // Refused at the door, and refused the same way again: what
+            // `Failed` tells an older client — never an unknown tag it drops
+            // and later reads as "may have been saved" (architect, sdk#235).
+            WriteState::Unread => WriteState::Failed,
             // The order rule's verdicts exist only on v5, whose writes carry a
             // floor; a pre-v5 client never meets them. If one ever did, it is
             // told the TRUE v4 equivalent — never `Failed`, which would roll
@@ -986,6 +1027,7 @@ impl WriteState {
         WriteState::Duplicate,
         WriteState::OutOfOrder { expected: 7 },
         WriteState::Conflict,
+        WriteState::Unread,
     ];
 
     /// The order rule's verdicts (v5): never sent below v5, so their

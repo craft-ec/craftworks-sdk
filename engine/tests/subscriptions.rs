@@ -77,12 +77,7 @@ fn accepted(effects: &[Effect]) -> Vec<engine::subs::Accepted> {
 /// Drive one write all the way to its head being confirmed, collecting every
 /// effect produced along the way.
 fn commit(h: &mut Harness, write_id: u64, ops: Vec<(Vec<u8>, Op)>) -> Vec<Effect> {
-    let mut all = h.step(Event::Write {
-        client: c(1),
-        write_id: w(write_id),
-        ops,
-        reads: Vec::new(),
-    });
+    let mut all = h.step(Event::forced_write(c(1), w(write_id), ops));
     let mut i = 0;
     let mut guard = 0;
     while i < all.len() {

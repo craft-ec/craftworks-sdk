@@ -284,16 +284,13 @@ fn decode(frames: Vec<Vec<u8>>) -> Vec<Reply> {
 
 
 fn write(id: u64, ops: &[(&str, Option<&str>)]) -> Request {
-    Request::Write {
-        write_id: id,
-        ops: ops
+    Request::forced_write(id, ops
             .iter()
             .map(|(k, v)| match v {
                 Some(v) => protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec()),
                 None => protocol::Op::Delete(k.as_bytes().to_vec()),
             })
-            .collect(),
-    }
+            .collect())
 }
 
 fn range(req_id: u64) -> Request {
@@ -703,7 +700,7 @@ fn a_stale_update_is_told_conflict_rolled_back_forgotten_and_never_re_sent() {
         let key = craftworks_sdk::db::record_key("t", loc);
         if interfere {
             // ANOTHER session writes the record's key, blind, behind this tab's copy.
-            let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::Write { write_id: 1, ops: vec![protocol::Op::Put(key.clone(), b"elsewhere".to_vec())] }).expect("encodes");
+            let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(1, vec![protocol::Op::Put(key.clone(), b"elsewhere".to_vec())])).expect("encodes");
             rig.server.client(&other);
             for _ in 0..200 {
                 let ops = rig.server.take_ops();
@@ -768,10 +765,7 @@ fn a_schema_changed_elsewhere_conflicts_on_the_schema_key_and_forgets_it() {
         { "name": "title", "kind": "text", "required": true },
         { "name": "note", "kind": "text" }
     ] })).expect("a schema");
-    let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::Write {
-        write_id: 1,
-        ops: vec![protocol::Op::Put(schema_key.clone(), serde_json::to_vec(&wider).unwrap())],
-    })
+    let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(1, vec![protocol::Op::Put(schema_key.clone(), serde_json::to_vec(&wider).unwrap())]))
     .expect("encodes");
     rig.server.client(&other);
     for _ in 0..200 {
@@ -1198,7 +1192,7 @@ fn schema_key_of(domain: &str) -> Vec<u8> {
 /// ANOTHER SESSION writes `ops`, blind, behind the tab's copy: the tab does
 /// not hear of it until a write of its own is refused.
 fn elsewhere(rig: &mut PageRig, node: &mut Node, write_id: u64, ops: Vec<protocol::Op>) {
-    let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::Write { write_id, ops }).expect("encodes");
+    let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(write_id, ops)).expect("encodes");
     rig.server.client(&other);
     for _ in 0..200 {
         let ops = rig.server.take_ops();

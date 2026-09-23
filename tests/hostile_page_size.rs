@@ -17,13 +17,10 @@ use protocol::{Reply, Request, MAX_PAGE_ENTRIES};
 use testkit::PageNode;
 
 fn write(n: u64) -> Request {
-    Request::Write {
-        write_id: n,
-        ops: vec![protocol::Op::Put(
+    Request::forced_write(n, vec![protocol::Op::Put(
             format!("k/{n:06}").into_bytes(),
             vec![(n % 251) as u8; 64],
-        )],
-    }
+        )])
 }
 
 /// A node with enough rows that a page limit can actually bite.

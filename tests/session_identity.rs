@@ -38,7 +38,7 @@ impl Tab {
     fn pump(&mut self) {
         for frame in self.store.take_outbound() {
             if let protocol::Incoming::Ok(env) = protocol::decode_request(&frame) {
-                if let protocol::Request::Write { write_id, .. } = env.body {
+                if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
                     self.sent.push((session_of(&env), write_id));
                 }
             }
@@ -306,10 +306,7 @@ fn one_page_is_refused_past_its_own_share() {
 fn the_delegate_answers_a_bad_session_by_name_and_applies_nothing() {
     let node = testkit::PageNode::new();
     let mut c = node.connect();
-    let r = c.client_as(0xABCD_0000_0000_0123, protocol::CURRENT, &protocol::Request::Write {
-        write_id: 1,
-        ops: vec![protocol::Op::Put(b"k/wide".to_vec(), b"x".to_vec())],
-    });
+    let r = c.client_as(0xABCD_0000_0000_0123, protocol::CURRENT, &protocol::Request::forced_write(1, vec![protocol::Op::Put(b"k/wide".to_vec(), b"x".to_vec())]));
     let replies: Vec<protocol::Reply> = r.iter().filter_map(|b| protocol::decode_reply(b).ok()).collect();
     assert!(
         replies.iter().any(|x| matches!(x, protocol::Reply::Dropped { reason: protocol::Dropped::BadSession })),
