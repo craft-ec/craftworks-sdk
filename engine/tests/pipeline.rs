@@ -120,13 +120,13 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
     }
 }
 
+/// RACE PUT (COMMIT-LIFE §P): the head is signed when the ROOT is acked and
+/// every changed group has k of its k+m -- not when every block is. Two
+/// values too large to ride in the leaf, so the leaf's value group has k = 2
+/// members and 3 parity; the leaf IS the root (in no group), so it must be
+/// acked itself.
 #[test]
-fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
-    // Two values too large to ride in a pack, so the commit has SEVERAL
-    // outstanding puts. With a single put the "all but the last" loop below
-    // runs zero times and the test cannot tell a head that waits from one
-    // that does not -- measured: a mutant emitting the head on the first
-    // confirmation survived this test until the fixture was widened.
+fn one_write_reaches_published_when_its_root_and_groups_are_recoverable() {
     let mut e = common::new_store_params(Params {
         max_packed_value: 1024,
         ..Params::default()
@@ -145,57 +145,50 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
         )
     );
     seen.absorb(&out);
-    assert_eq!(
-        seen.of(1, 1),
-        &[State::Accepted],
-        "a write is accepted before anything is on the network"
-    );
-    let packs = ids(&out);
-    assert!(
-        packs.len() >= 2,
-        "this fixture produced {} put(s); with fewer than two the loop below \
-         is empty and proves nothing about waiting",
-        packs.len()
-    );
-    assert!(
-        head_of(&out).is_none(),
-        "the head moved before a single pack was confirmed"
-    );
+    assert_eq!(seen.of(1, 1), &[State::Accepted], "a write is accepted before anything is on the network");
+    let blocks: Vec<(Cid, Vec<u8>)> = out
+        .iter()
+        .filter_map(|f| match f {
+            Effect::PutBlock { id, bytes, .. } => Some((*id, bytes.clone())),
+            _ => None,
+        })
+        .collect();
+    let is = |k: u8, (id, b): &(Cid, Vec<u8>)| freenet_prolly::block_id(k, b) == *id;
+    let root: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::TREE_NODE, x)).map(|x| x.0).collect();
+    let values: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::RAW, x)).map(|x| x.0).collect();
+    let parity: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::PARITY, x)).map(|x| x.0).collect();
+    assert_eq!((root.len(), values.len(), parity.len()), (1, 2, 3), "the fixture is not root + 2 values + their group's 3 parity");
+    assert!(head_of(&out).is_none(), "the head moved before a single block was confirmed");
 
-    // Confirm all but one: still no head.
-    for id in &packs[..packs.len() - 1] {
-        let out = stepped!(e, Event::PutConfirmed(*id));
+    // The group has k = 2 of its 5 acked (a value and a parity), the root not:
+    // NO head -- the root is in no group and nothing can rebuild it.
+    for id in [values[0], parity[0], parity[1]] {
+        let out = stepped!(e, Event::PutConfirmed(id));
         seen.absorb(&out);
-        assert!(
-            head_of(&out).is_none(),
-            "the head moved while a pack was still unconfirmed"
-        );
+        assert!(head_of(&out).is_none(), "the head moved with the ROOT un-acked");
     }
-    let out = stepped!(e, Event::PutConfirmed(packs[packs.len() - 1]));
+    // The root lands: the head goes out, with a value and a parity still out.
+    let out = stepped!(e, Event::PutConfirmed(root[0]));
     seen.absorb(&out);
-    let (seq, root, after) = head_of(&out).expect("the head must move once every pack is in");
+    let (seq, head_root, after) = head_of(&out).expect("root acked and the group at k: the head must move (race put)");
     assert_eq!(seq, 1);
-    assert_eq!(root, e.root());
-    // The dependency is stated as well as obeyed, so a shell that batches
-    // aggressively cannot get it wrong either.
+    assert_eq!(head_root, e.root());
+    // `after` is the race set: only what was counted, all acked.
+    let acked: BTreeSet<Cid> = [values[0], parity[0], parity[1], root[0]].into_iter().collect();
     let named: BTreeSet<Cid> = after.into_iter().collect();
-    assert_eq!(
-        named,
-        packs.iter().copied().collect::<BTreeSet<_>>(),
-        "UpdateHead does not name every block it depends on"
-    );
-    // No state between Accepted and Published: what the head does not name
-    // was never published, so nothing before the head moves can be promised
-    // to survive a restart.
+    assert!(named.is_subset(&acked), "UpdateHead names a block that is not acked: {:?}", named.difference(&acked).collect::<Vec<_>>());
+    assert!(named.contains(&root[0]), "UpdateHead does not name the root it depends on");
     assert_eq!(seen.of(1, 1), &[State::Accepted]);
 
     let out = stepped!(e, Event::HeadConfirmed(seq));
     seen.absorb(&out);
-    assert_eq!(
-        seen.of(1, 1),
-        &[State::Accepted, State::Published],
-        "states must arrive once each, in order"
-    );
+    assert_eq!(seen.of(1, 1), &[State::Accepted, State::Published], "SAVED at k, not BACKED_UP");
+    // The stragglers land: BACKED_UP.
+    for id in [values[1], parity[2]] {
+        let out = stepped!(e, Event::PutConfirmed(id));
+        seen.absorb(&out);
+    }
+    assert_eq!(seen.of(1, 1), &[State::Accepted, State::Published, State::ParityComplete], "states must arrive once each, in order");
 }
 
 /// Confirm every put and head the engine asks for, until it asks for none.
@@ -473,11 +466,27 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
             }
             // The states themselves must agree too: a rehydrate that reaches the
             // right root while telling a client something different is still a
-            // bug the root comparison cannot see.
+            // bug the root comparison cannot see. EXCEPT `ParityComplete`: a
+            // published commit's stragglers (race put, COMMIT-LIFE §P) are
+            // PAGE memory, never in the context (the architect's correction
+            // (c)), so an engine rebuilt from its context between calls does
+            // not know them and cannot tell BACKED_UP -- a reload loses that by
+            // design, and the keeper covers it. Everything up to `Published`
+            // must agree exactly; BACKED_UP is asserted in Live only (below).
+            let upto_published = |s: &Seen| -> Seen {
+                Seen(s.0.iter().map(|(k, v)| (*k, v.iter().copied().filter(|x| *x != State::ParityComplete).collect())).collect())
+            };
             assert_eq!(
-                l.seen, d.seen,
+                upto_published(&l.seen),
+                upto_published(&d.seen),
                 "seed {seed}: the two modes reported different write states"
             );
+            for (client, id) in &l.live {
+                let states = l.seen.of(*client, *id);
+                if states.contains(&State::Published) {
+                    assert!(states.contains(&State::ParityComplete), "seed {seed}: in Live, write {id} published and every block was acked, but it was never BACKED_UP: {states:?}");
+                }
+            }
             pack_failures += l.pack_failures + d.pack_failures;
             direct_failures += l.direct_failures + d.direct_failures;
             directs += l.directs + d.directs;
@@ -790,59 +799,41 @@ fn a_packed_value_over_its_kinds_limit_is_refused_where_it_is_set() {
 }
 
 
-/// The page-closed promise, with no clock at all.
-///
-/// `Tick` arrives only from a connected client (W4: the released node fires
-/// no wake-ups), so once the tab closes nothing will ever ask the engine to
-/// get on with it. Everything the promise covers must therefore be
-/// event-driven — a commit in flight advances on its own confirmations — or
-/// must happen on `Flush`, which the shell sends on disconnect.
-///
-/// So this drives writes, sends `Flush`, and then NEVER sends a tick. Every
-/// write must still reach `Published` and `ParityComplete`.
-///
-/// The control is the same run with no `Flush`: owed parity stays owed for
-/// ever, and the test sees it. Without that, "parity was complete" would
-/// read identically in a build where `Flush` did nothing.
+/// A tab can close at any moment. Nothing wakes the engine afterwards (no
+/// tick, no wake-ups), so everything a write is promised must happen on its
+/// own confirmations. Under race put (COMMIT-LIFE §P) a commit's parity goes
+/// out IN THE SAME ROUND as its data, so every write reaches `Published` AND
+/// `ParityComplete` with no tick and no `Flush` at all, and a `Flush` after
+/// the commits puts nothing. The parity is COUNTED in the commit rounds, so
+/// `ParityComplete` cannot pass over a commit that coded none.
 #[test]
-fn after_a_disconnect_every_write_publishes_and_its_parity_is_put_without_a_tick() {
+fn after_a_disconnect_every_write_publishes_and_is_backed_up_with_no_tick_and_no_flush() {
     let run = |flush: bool| -> (Seen, usize, usize) {
         let store = Store::fresh();
-        let mut e = Engine::new(
-            Params {
-                ..Params::default()
-            },
-            store.clone(),
-        );
-        // A NEW tree, and the engine is told so: a write before the head is
-        // recovered waits for it (sdk#223). This test is about a DISCONNECT
-        // after that, not about recovery.
+        let mut e = Engine::new(Params::default(), store.clone());
+        // A NEW tree, and the engine is told so (sdk#223).
         let _ = e.step(Event::HeadMissing);
         let mut seen = Seen::default();
+        let mut commit_parity = 0usize;
         // Values by reference, so the leaves carry parity over them.
         let mut queue = Vec::new();
         for n in 1..=3u64 {
-            let ops: Vec<(Vec<u8>, Op)> = (0..16u32)
-                .map(|i| {
-                    (
-                        format!("k/{n}/{i:04}").into_bytes(),
-                        Op::Put(vec![(i % 251) as u8; 1400]),
-                    )
-                })
-                .collect();
+            let ops: Vec<(Vec<u8>, Op)> = (0..16u32).map(|i| (format!("k/{n}/{i:04}").into_bytes(), Op::Put(vec![(i % 251) as u8; 1400]))).collect();
             let out = stepped!(e, write(1, n, ops));
             seen.absorb(&out);
             queue.extend(out.clone());
-            // Drive this commit to published before the next write, since one
-            // commit at a time means the next would otherwise be refused.
             let mut guard = 0;
             while let Some(f) = queue.pop() {
                 guard += 1;
                 assert!(guard < 100_000, "the commit did not settle");
                 let o = match &f {
-                    Effect::PutPack { id, .. }
-                    | Effect::PutBlock { id, .. }
-                    | Effect::PutParity { id, .. } => stepped!(e, Event::PutConfirmed(*id)),
+                    Effect::PutBlock { id, bytes, .. } => {
+                        if freenet_prolly::block_id(freenet_prolly::kind::PARITY, bytes) == *id {
+                            commit_parity += 1;
+                        }
+                        stepped!(e, Event::PutConfirmed(*id))
+                    }
+                    Effect::PutPack { id, .. } => stepped!(e, Event::PutConfirmed(*id)),
                     Effect::UpdateHead { seq, .. } => stepped!(e, Event::HeadConfirmed(*seq)),
                     _ => Vec::new(),
                 };
@@ -850,71 +841,25 @@ fn after_a_disconnect_every_write_publishes_and_its_parity_is_put_without_a_tick
                 queue.extend(o);
             }
         }
-
         // The client goes away. No tick is sent here, or ever.
+        let mut flush_puts = 0usize;
         if flush {
             let out = stepped!(e, Event::Flush);
             seen.absorb(&out);
-            queue.extend(out);
+            flush_puts = out.iter().filter(|f| matches!(f, Effect::PutBlock { .. } | Effect::PutPack { .. })).count();
         }
-        let mut guard = 0;
-        let mut parity_put = 0usize;
-        while let Some(f) = queue.pop() {
-            guard += 1;
-            assert!(guard < 100_000, "the flush did not settle");
-            let o = match &f {
-                Effect::PutParity { id, .. } => {
-                    parity_put += 1;
-                    stepped!(e, Event::PutConfirmed(*id))
-                }
-                Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => {
-                    stepped!(e, Event::PutConfirmed(*id))
-                }
-                Effect::UpdateHead { seq, .. } => stepped!(e, Event::HeadConfirmed(*seq)),
-                _ => Vec::new(),
-            };
-            seen.absorb(&o);
-            queue.extend(o);
-        }
-        (seen, parity_put, e.owed_groups())
+        (seen, commit_parity, flush_puts)
     };
 
-    let (seen, put, _) = run(true);
-    for n in 1..=3u64 {
-        let states = seen.of(1, n);
-        assert!(
-            states.contains(&State::Published),
-            "write {n} did not publish after a disconnect: {states:?}"
-        );
-        assert!(
-            states.contains(&State::ParityComplete),
-            "write {n} published but its parity was never complete, and no \
-             tick is ever coming: {states:?}"
-        );
-        assert!(
-            valid_sequence(states),
-            "write {n} reported an impossible sequence: {states:?}"
-        );
+    for flush in [false, true] {
+        let (seen, commit_parity, flush_puts) = run(flush);
+        for n in 1..=3u64 {
+            let states = seen.of(1, n);
+            assert!(states.contains(&State::Published), "flush={flush}: write {n} did not publish: {states:?}");
+            assert!(states.contains(&State::ParityComplete), "flush={flush}: write {n} published but was never BACKED_UP, and no tick is ever coming: {states:?}");
+            assert!(valid_sequence(states), "flush={flush}: write {n} reported an impossible sequence: {states:?}");
+        }
+        assert!(commit_parity > 0, "flush={flush}: the commits put no parity at all, so ParityComplete above says nothing");
+        assert_eq!(flush_puts, 0, "flush={flush}: a Flush after the commits put {flush_puts} block(s): parity is still paid late");
     }
-    assert!(
-        put > 0,
-        "Flush put no parity at all, so ParityComplete above says nothing"
-    );
-
-    // The control: no Flush, no tick, and the parity stays owed.
-    let (control, control_put, _) = run(false);
-    let complete = (1..=3u64)
-        .filter(|n| control.of(1, *n).contains(&State::ParityComplete))
-        .count();
-    assert_eq!(
-        control_put, 0,
-        "the control put {control_put} parity block(s) without a Flush or a \
-         tick, so Flush is not what puts them"
-    );
-    assert_eq!(
-        complete, 0,
-        "{complete} write(s) reached ParityComplete with no Flush and no \
-         tick, so the test cannot tell a working Flush from a no-op"
-    );
-    println!("  disconnect, no ticks ever: 3 writes published, {put} parity block(s) put (control without Flush: {control_put})");
 }
