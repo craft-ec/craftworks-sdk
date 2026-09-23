@@ -642,8 +642,13 @@ fn a_write_to_a_reader_reaches_nothing_and_never_publishes() {
     assert_eq!(node.head(), head, "a reader's write moved the publisher's head");
     // And provisioning a reader is refused, not sent.
     let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+    // What was already queued is the view's own READS (nothing it may not
+    // send); what `provision` adds is what this asks about.
+    let queued = v.take_frames();
+    assert!(kinds(&queued).iter().all(|k| *k == "other"), "a reader had a delegate frame queued: {:?}", kinds(&queued));
     v.provision(container, vec![0u8; 32]);
-    assert!(v.take_frames().is_empty(), "a reader framed a provisioning");
+    let fr = v.take_frames();
+    assert!(fr.is_empty(), "a reader framed a provisioning");
     assert!(v.unusable().iter().any(|u| u.contains("read-only")), "{:?}", v.unusable());
 }
 
