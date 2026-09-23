@@ -1436,3 +1436,24 @@ fn a_views_door_refusal_and_its_pages_filter_agree() {
         assert_eq!(node.served.get(k), before.get(k), "a view's write reached the node as a {k}");
     }
 }
+
+/// A VIEW'S DEFINE IS REFUSED AT THE DOOR, AND NOTHING IS QUEUED (the
+/// architect's precision 2 on #338). A schema define is an ordinary write;
+/// on a VIEW it is told `Failed` at the page's door, named, and the engine's
+/// queue is EMPTY after -- beside the user's own no-tree define, which is
+/// queued and visible (#342, `with_no_tree_writes_wait_visible_…`).
+#[test]
+fn a_views_define_is_refused_at_the_door_and_nothing_is_queued() {
+    let mut node = WireNode::new(&[38u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "x", "v")), 1).contains(&WriteState::Published));
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert_eq!(v.server.page.queue_load().0, 0, "THE CONTROL: the view's queue was not empty before");
+    let r = client(&mut v, &mut node, &mut now, &write(2, "schema/notes", "{}"));
+    assert!(states(&r, 2).contains(&WriteState::Failed), "a view's define was not refused at the door: {r:?}");
+    assert!(v.server.page.unusable().iter().any(|u| u.starts_with("read-only: write 2 refused at the door")), "not named: {:?}", v.server.page.unusable());
+    assert_eq!(v.server.page.queue_load().0, 0, "a view's define was queued on the engine");
+}
