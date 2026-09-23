@@ -53,3 +53,39 @@ pub fn cold_read(answers: &[(u64, Option<u128>)], other: Vec<String>) -> Verdict
         _ => Verdict::Green,
     }
 }
+
+/// Where one write stands, from every reply seen so far: `None` while more is
+/// coming, `Some(Ok(()))` once it is `Published`, `Some(Err(why))` once a
+/// TERMINAL state came without it.
+///
+/// Terminal is [`protocol::WriteState::terminal`], not a list kept here: a
+/// hand list missed `Unread` (sdk#283), and the live run then waited 120 s on
+/// an answer that was already final and read as a stall.
+pub fn write_outcome(id: u64, replies: &[protocol::Reply]) -> Option<Result<(), String>> {
+    use protocol::{Reply, WriteState};
+    fn peel(r: &Reply) -> &Reply {
+        match r {
+            Reply::Acked { body, .. } => body,
+            r => r,
+        }
+    }
+    let mut unread = None;
+    let mut last = None;
+    for r in replies.iter().map(peel) {
+        match r {
+            Reply::SessionWriteState { write_id, state, .. } | Reply::WriteState { write_id, state } if *write_id == id => {
+                if *state == WriteState::Published {
+                    return Some(Ok(()));
+                }
+                last = Some(*state);
+            }
+            Reply::Unread { write_id, key, .. } if *write_id == id => unread = Some(String::from_utf8_lossy(key).into_owned()),
+            _ => {}
+        }
+    }
+    let state = last.filter(|s| s.terminal())?;
+    Some(Err(match unread {
+        Some(key) => format!("write {id} ended {state:?} without Published: it changes {key:?}, which it did not read"),
+        None => format!("write {id} ended {state:?} without Published"),
+    }))
+}

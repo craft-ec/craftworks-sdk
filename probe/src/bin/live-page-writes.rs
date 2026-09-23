@@ -20,7 +20,7 @@ use page::server::{Server, SignerFacts};
 use page::{Ms, Page, PutPath};
 use page_io::{Artefacts, PageIo};
 use probe::node::{Mode, Node, TempTree};
-use protocol::{Reply, Request, WriteState};
+use protocol::{Reply, Request};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -156,23 +156,16 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
         let id = w as u64 + 1;
         let ops = chunk.iter().map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), format!("value {i} of run {run}").into_bytes())).collect();
         let t = Instant::now();
-        io.client(&protocol::encode_session_request(4, SESSION, &Request::Write { write_id: id, ops }).expect("encodes"));
-        let got = drive(&mut sock, &mut io, t0, Duration::from_secs(120), &mut 0, |r, _| {
-            r.iter().any(|x| matches!(x, Reply::SessionWriteState { write_id, state, .. } | Reply::WriteState { write_id, state } if *write_id == id && matches!(state, WriteState::Published | WriteState::Lost | WriteState::Failed | WriteState::Busy | WriteState::TooLarge { .. })))
-        })
-        .await
-        .with_context(|| format!("write {id}"))?;
+        // A write that does not read what it changes is sent FORCED
+        // (sdk#283): a reads-less `Request::Write` is refused `Unread`.
+        io.client(&protocol::encode_session_request(4, SESSION, &Request::forced_write(id, ops)).expect("encodes"));
+        let got = drive(&mut sock, &mut io, t0, Duration::from_secs(120), &mut 0, |r, _| probe::verdict::write_outcome(id, r).is_some())
+            .await
+            .with_context(|| format!("write {id}"))?;
         // Published is what counts (ParityComplete follows it); anything
-        // terminal without it is the failure.
-        let seen: Vec<WriteState> = got
-            .iter()
-            .filter_map(|x| match x {
-                Reply::SessionWriteState { write_id, state, .. } | Reply::WriteState { write_id, state } if *write_id == id => Some(*state),
-                _ => None,
-            })
-            .collect();
-        if !seen.contains(&WriteState::Published) {
-            bail!("write {id} was never Published: {seen:?}");
+        // terminal without it is the failure, said with its reason.
+        if let Some(Err(why)) = probe::verdict::write_outcome(id, &got) {
+            bail!("{why}");
         }
         write_ms.push(t.elapsed().as_millis());
     }
