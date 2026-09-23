@@ -58,13 +58,19 @@ async function node(ws, net) {
   for (const p of [ws, net]) if (OWNERS.includes(p)) throw new Error(`${p} is the owner's; refusing`);
   if (!(await free(ws)) || !(await free(net)) || !(await udpFree(net))) throw new Error(`port ${ws}/${net} is busy; refusing`);
   const dir = mkdtempSync(join(tmpdir(), "notes-node-"));
-  for (const d of ["data", "config", "log"]) mkdirSync(join(dir, d));
+  for (const d of ["data", "config", "log", "webapp-cache"]) mkdirSync(join(dir, d));
   const child = spawn("freenet", ["network", "--is-gateway", "--skip-load-from-network",
     "--network-address", "127.0.0.1", "--network-port", String(net),
     "--public-network-address", "127.0.0.1", "--public-network-port", String(net),
     "--ws-api-address", "127.0.0.1", "--ws-api-port", String(ws),
     "--data-dir", join(dir, "data"), "--config-dir", join(dir, "config"), "--log-dir", join(dir, "log"),
-    "--disable-auto-update"], { stdio: "ignore" });
+    "--disable-auto-update"], {
+    stdio: "ignore",
+    // ITS OWN web-app cache: the default is one per-USER directory, so a test
+    // node would share, and sweep, the owner's node's cache (craftworks
+    // CLAUDE.md; freenet-core config.rs:3330).
+    env: { ...process.env, FREENET_WEBAPP_CACHE_DIR: join(dir, "webapp-cache") },
+  });
   kids.push(child);
   for (let i = 0; i < 180 && !(await answers(ws)); i += 1) await sleep(250);
   console.log(`node pid ${child.pid} ws ${ws} (${dir})`);
