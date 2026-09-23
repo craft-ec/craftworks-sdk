@@ -639,6 +639,13 @@ impl Page {
                 // `Unavailable` ("block … could not be had"). The attempt
                 // count carries over, so "not answering for N s" counts
                 // from the first send.
+                // …unless the engine has WITHDRAWN it (sdk#303): a raced group block its read no longer needs
+                // is dropped, not re-asked for ever.
+                // Taken out of the set here: the GET ends, so the engine keeps no entry for it.
+                Waiting::Get(id) if self.engine.is_withdrawn(&id) => {
+                    self.engine.take_withdrawn(&id);
+                    self.attempt_of.remove(&Waiting::Get(id));
+                }
                 Waiting::Get(id) => self.send(Waiting::Get(id), op),
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
@@ -802,6 +809,12 @@ impl Page {
                 // Verified BEFORE it joins the page's memory: a block that is
                 // not its id is not kept, and the engine hears a miss.
                 let good = engine::read::matches_id(&id, &bytes);
+                // A LATE arrival nobody wants (sdk#303: withdrawn when its race finished) is not kept: the
+                // page's memory is append-only, and this block is nobody's.
+                if good && self.engine.take_withdrawn(&id) {
+                    self.get_again.remove(&id);
+                    return;
+                }
                 if good {
                     self.blocks.insert(id, &bytes);
                     self.get_again.remove(&id);
@@ -815,6 +828,10 @@ impl Page {
             }
             Answer::GetMissed(id) => {
                 if self.answered(&Waiting::Get(id)).is_some() {
+                    // A NotFound for a GET the engine WITHDREW (sdk#303) ends it: nobody asks again.
+                    if self.engine.take_withdrawn(&id) {
+                        return;
+                    }
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
                     // asked again on a backoff -- a node that has not got it

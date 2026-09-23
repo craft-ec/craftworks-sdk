@@ -87,6 +87,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod asks;
 pub mod pack;
 pub mod read;
+pub mod race_get;
 pub mod repair;
 pub mod subs;
 
@@ -695,6 +696,11 @@ pub struct Params {
     /// page keeps asking for it (Phase 4, gap 1): an alternative source,
     /// never a reason to stop. Off only as the control.
     pub repair_reads: bool,
+    /// RACE GET (the owner's rule 11, sdk#303): the FIRST time a read wants a block of a sibling group, every
+    /// other block of that group -- members and parity -- is asked at once, and the read finishes on the member
+    /// itself or on any `k` of the group (rebuilt, verified), whichever comes first. Point reads too. Off only as
+    /// the control (today's one-at-a-time, which harness#13 measures against). Needs `repair_reads`.
+    pub race_get: bool,
     /// Two requests needing one block share its fetch. Off = the control.
     pub share_fetches: bool,
     /// Ceilings on an advisory preload: roots, blocks, bytes. A preload may
@@ -883,6 +889,7 @@ impl Default for Params {
             max_fetch_per_round: 4,
             max_gets_per_request: 64,
             repair_reads: true,
+            race_get: true,
             share_fetches: true,
             preload_roots: 4,
             preload_blocks: 256,
@@ -1168,6 +1175,10 @@ pub struct Engine<B: Blocks> {
     repairs: BTreeMap<Cid, Repair>,
     /// Which repairs a group block is being fetched for.
     repair_slots: BTreeMap<Cid, BTreeSet<Cid>>,
+    /// Group blocks a finished repair or race asked for and nobody wants any more (sdk#303): the page WITHDRAWS
+    /// their GETs (a requester dropping what it no longer needs, not a cut-off) and does not keep them if they
+    /// arrive late ([`Engine::take_withdrawn`]).
+    withdrawn: BTreeSet<Cid>,
     /// Repairs started, finished (verified, kept), and given up.
     repair_counts: (u64, u64, u64),
     /// Why the last repair was given up, in words (the read is answered
@@ -1431,6 +1442,7 @@ impl<B: Blocks> Engine<B> {
             arrived: BTreeMap::new(),
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
+            withdrawn: BTreeSet::new(),
             repair_counts: (0, 0, 0),
             repair_failed: None,
             root,
@@ -1761,13 +1773,29 @@ impl<B: Blocks> Engine<B> {
             out.extend(self.keep_saveable());
             self.cascade.clear();
             self.arrived.clear();
+            self.one_ask_each(&mut out);
             return out;
         }
         let mut out = self.step_inner(event);
         out.extend(self.keep_saveable());
         self.cascade.clear();
         self.arrived.clear();
+        self.one_ask_each(&mut out);
         out
+    }
+
+    /// ONE ask per block per step (sdk#303). A block can be wanted for several reasons in one step -- a read, a
+    /// race for its sibling, a repair re-asking a slot -- and each reason used to push its own `FetchBlock`. The
+    /// page sends one GET per block while one is out anyway; this keeps the engine's own asks, and its `fetches`
+    /// count, equal to what goes out.
+    fn one_ask_each(&mut self, out: &mut Vec<Effect>) {
+        let mut seen = BTreeSet::new();
+        let before = out.len();
+        out.retain(|e| match e {
+            Effect::FetchBlock { id, .. } => seen.insert(*id),
+            _ => true,
+        });
+        self.reads.fetches = self.reads.fetches.saturating_sub(before - out.len());
     }
 
     /// What this engine shed to stay saveable, since the last `take_shed`.
@@ -2492,7 +2520,13 @@ impl<B: Blocks> Engine<B> {
                     // fetch is emitted again every time the engine re-descends
                     // and finds the same block missing.
                     let first = self.reads.want(id, req_id, self.params.share_fetches);
-                    if first || !self.params.dedupe_in_flight {
+                    // Wanted again: no longer withdrawn (sdk#303).
+                    self.withdrawn.remove(&id);
+                    // A race for a sibling asked this block already (sdk#303): that GET answers this read too.
+                    let raced = self.params.dedupe_in_flight && self.repair_slots.contains_key(&id);
+                    if raced {
+                        out.extend(self.race(id, p.root));
+                    } else if first || !self.params.dedupe_in_flight {
                         let attempt = *self.reads.attempts.entry(id).or_insert(0);
                         let via = self
                             .reads
@@ -2505,6 +2539,8 @@ impl<B: Blocks> Engine<B> {
                             q.gets += 1;
                         }
                         out.push(Effect::FetchBlock { id, via, attempt });
+                        // RACE (rule 11, sdk#303): the rest of this block's group, at once.
+                        out.extend(self.race(id, p.root));
                     }
                 }
             }
@@ -4638,9 +4674,15 @@ impl<B: Blocks> Engine<B> {
                 }
                 _ => {
                     r.asked.insert(i, 0);
+                    // ONE ask per block (sdk#303): a slot another member's race, or a read, has in flight already
+                    // is not asked twice -- racing every member of a group would otherwise ask each slot k times.
+                    let in_flight = self.repair_slots.contains_key(&slot) || self.reads.waiting.contains_key(&slot);
                     self.repair_slots.entry(slot).or_default().insert(missing);
-                    self.reads.fetches += 1;
-                    out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 0 });
+                    self.withdrawn.remove(&slot);
+                    if !in_flight {
+                        self.reads.fetches += 1;
+                        out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 0 });
+                    }
                 }
             }
         }
@@ -4720,10 +4762,21 @@ impl<B: Blocks> Engine<B> {
 
     fn end_repair(&mut self, missing: Cid) {
         self.repairs.remove(&missing);
-        self.repair_slots.retain(|_, set| {
+        let mut freed = Vec::new();
+        self.repair_slots.retain(|slot, set| {
             set.remove(&missing);
+            if set.is_empty() {
+                freed.push(*slot);
+            }
             !set.is_empty()
         });
+        // WITHDRAWN (sdk#303): a slot no repair asks for any more, no read waits on, and the page does not
+        // hold is no longer wanted -- its GET is dropped, not re-asked for ever.
+        for slot in freed {
+            if !self.reads.waiting.contains_key(&slot) && self.blocks.get(&slot).is_none() {
+                self.withdrawn.insert(slot);
+            }
+        }
     }
 
     /// Rule 7: preload is advisory and budgeted.
