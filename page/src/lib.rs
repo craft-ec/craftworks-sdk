@@ -656,7 +656,7 @@ impl Page {
             // holds (a repair rebuilt it), ends here.
             if let Waiting::Get(id) = w {
                 if !d.sent && (self.blocks.get(&id).is_some() || !self.engine.awaits_block(&id)) {
-                    self.attempt_of.remove(&w);
+                    self.drop_get(id);
                     continue;
                 }
             }
@@ -1360,14 +1360,26 @@ impl Page {
     /// queued re-send is dropped. It held no place and is no RTO sample.
     fn answered_get(&mut self, id: Cid) -> Option<u32> {
         if let Some(d) = self.deadlines.get(&Waiting::Get(id)) {
+            // On the wire: `answered` takes the Karn sample and opens the
+            // window, which a queued GET must not do.
             let attempt = d.attempt;
             self.answered(&Waiting::Get(id))?;
+            self.drop_get(id);
             return Some(attempt);
         }
-        let at = self.get_queue.iter().position(|q| *q == id)?;
-        let attempt = self.attempt_of.remove(&Waiting::Get(id))?;
-        self.get_queue.remove(at);
+        let attempt = self.get_queue.contains(&id).then(|| self.attempt_of.get(&Waiting::Get(id)).copied()).flatten()?;
+        self.drop_get(id);
         Some(attempt)
+    }
+
+    /// A GET ENDS: THE one definition of that. It leaves every holder a GET
+    /// has -- its deadline (on the wire or parked), the attempt its re-send
+    /// would continue from, and its place in the window's queue. An answer,
+    /// a withdrawal and a block the page already holds all end a GET here.
+    fn drop_get(&mut self, id: Cid) {
+        self.deadlines.remove(&Waiting::Get(id));
+        self.attempt_of.remove(&Waiting::Get(id));
+        self.get_queue.retain(|q| *q != id);
     }
 
     /// The node ANSWERED a GET without the block (NotFound, or bytes that are
@@ -1531,11 +1543,9 @@ impl Page {
                 .chain(self.get_queue.iter().copied())
                 .filter(|id| self.blocks.get(id).is_some()),
         );
-        for id in &ended {
-            self.deadlines.remove(&Waiting::Get(*id));
-            self.attempt_of.remove(&Waiting::Get(*id));
+        for id in ended {
+            self.drop_get(id);
         }
-        self.get_queue.retain(|id| !ended.contains(id));
     }
 
     /// What the engine publishes now, as a head.
@@ -2214,6 +2224,51 @@ mod window_loss {
         assert!(queued_when_answered, "THE CONTROL: no lost GET was still queued when its late answer landed");
         assert!(all.iter().all(|(id, _)| p.blocks.get(id).is_some()), "not every block was read in 3 s: sends {sends:?}");
         assert!(!p.get_queue.iter().any(|q| p.blocks.get(q).is_some()), "a block already read is still queued to be asked again");
+    }
+
+    /// ENDING A GET LEAVES NO TRACE, however it ends (`drop_get`, the one
+    /// definition). Two lost GETs are queued for a place with their attempt
+    /// kept: one is ended by its LATE ANSWER, the other by being WITHDRAWN
+    /// (its block is now held), and so is one still ON THE WIRE. None is left
+    /// in any of the three holders:
+    /// deadline, attempt, queue. Mutants "drop_get forgets one holder" (each
+    /// of the three) -> red.
+    #[test]
+    fn an_ended_get_is_in_no_holder() {
+        let all = blocks(4);
+        let mut node = Node_::new(&all);
+        let (late, withdrawn) = (all[0].0, all[1].0);
+        node.silent.extend([late, withdrawn, all[2].0, all[3].0]);
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.window.halved();
+        let mut now = 1_000u64;
+        // `late` and `withdrawn` take the floor's two places, time out, and
+        // queue behind the two asks that were waiting (which now hold the
+        // places, silent too).
+        for id in [late, withdrawn, all[2].0, all[3].0] {
+            ask(&mut p, now, id);
+        }
+        node.run(&mut p, &mut now, 1_100);
+        let holders = |p: &Page, id: Cid| {
+            (p.deadlines.contains_key(&Waiting::Get(id)), p.attempt_of.contains_key(&Waiting::Get(id)), p.get_queue.contains(&id))
+        };
+        for id in [late, withdrawn] {
+            assert!(p.get_queue.contains(&id) && p.attempt_of.contains_key(&Waiting::Get(id)) && !p.deadlines.contains_key(&Waiting::Get(id)), "THE CONTROL: {:?} is not a queued lost GET: {:?}", &id[..2], holders(&p, id));
+        }
+        // The late answer to `late`'s first send.
+        let bytes = all[0].1.clone();
+        p.answer(Answer::Got { id: late, bytes }, Ms(now));
+        assert!(p.blocks.get(&late).is_some(), "the late answer was not taken");
+        assert_eq!(holders(&p, late), (false, false, false), "a GET ended by its late answer left a trace (deadline, attempt, queue)");
+        // `withdrawn` (queued) and one ON THE WIRE: their blocks are held now
+        // (a repair rebuilt them), so nobody needs either GET.
+        let on_wire = all[2].0;
+        assert!(p.deadlines.get(&Waiting::Get(on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
+        p.blocks.insert(withdrawn, &all[1].1);
+        p.blocks.insert(on_wire, &all[2].1);
+        p.end_unneeded_gets();
+        assert_eq!(holders(&p, withdrawn), (false, false, false), "a withdrawn queued GET left a trace (deadline, attempt, queue)");
+        assert_eq!(holders(&p, on_wire), (false, false, false), "a withdrawn GET on the wire left a trace (deadline, attempt, queue)");
     }
 
     /// THE WINDOW HALVES ONCE PER LOSS EPISODE. One silent GET timing out
