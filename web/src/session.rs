@@ -680,10 +680,6 @@ impl Session {
         }
     }
 
-    /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
-    /// `{"state":"none"|"pending"|"put"|"refused"|"failed","said":"…"}`.
-    /// It always ENDS (the page's budget): `refused` carries the node's words,
-    /// `failed` what was tried. `said` is display only.
     /// A PERSON cancels a pending PUT of `key` (a publish they stopped): the
     /// one end that is not the node's answer, named `cancelled` (rule 8).
     pub fn cancel_put(&mut self, key: &str) {
@@ -702,6 +698,12 @@ impl Session {
         }
     }
 
+    /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
+    /// `{"state":"none"|"pending"|"put"|"refused"|"cancelled","said":"…"}`.
+    /// It ends only on an answer (rule 8: no budget): `put` the node's ack,
+    /// `refused` in the node's words, `cancelled` a person stopped it; while
+    /// `pending` the page re-sends it and `not_answering` says for how long.
+    /// `said` is display only.
     pub fn put_status(&self, key: &str) -> String {
         use page::AppPut;
         let (state, said) = match self.page().and_then(|p| p.app_put(key)) {
