@@ -8,7 +8,7 @@
 
 import { connect } from "./connection.js";
 import { engineDb } from "./engine-db.js";
-import { allArtefactBytes, artefactBytes } from "./artefacts.js";
+import { allArtefactBytes, artefactBytes, served, servedText } from "./artefacts.js";
 
 /**
  * The artefacts as `build.sh` ships them, beside this file.
@@ -56,9 +56,8 @@ export async function shippedArtefacts(
   } = {},
 ) {
   const url = new URL("./artefacts.json", base).href;
-  const r = await fetchWith(url);
-  if (!r.ok) throw new Error(`could not fetch ${url}: ${r.status}`);
-  const m = await r.json();
+  // Through the one fetch: waited on, never ended by a status (#126 ruling).
+  const m = JSON.parse(await servedText({ url }, { fetch: fetchWith }));
   // WHERE THE SAME BYTES CAN BE GOT, in the order to try.
   //
   // The hash is the identity, so a second source costs nothing in trust: it
@@ -201,9 +200,7 @@ export async function openSession(Session, {
     if (typeof b === "object" && b.sha256) {
       blockCode = await artefactBytes(b, { fetch: fetchWith });
     } else {
-      const r = await fetchWith(b);
-      if (!r.ok) throw new Error(`could not fetch ${b}: ${r.status}`);
-      blockCode = new Uint8Array(await r.arrayBuffer());
+      blockCode = await served({ url: b }, { fetch: fetchWith });
     }
     return blockCode;
   };
@@ -229,11 +226,7 @@ export async function openSession(Session, {
       }));
     } else {
       [signer, block, register] = await Promise.all(
-        [artefacts.signer, artefacts.block, artefacts.register].map(async url => {
-          const r = await fetchWith(url);
-          if (!r.ok) throw new Error(`could not fetch ${url}: ${r.status}`);
-          return new Uint8Array(await r.arrayBuffer());
-        }),
+        [artefacts.signer, artefacts.block, artefacts.register].map(url => served({ url }, { fetch: fetchWith })),
       );
     }
     blockCode = block;

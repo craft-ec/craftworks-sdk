@@ -150,6 +150,29 @@ pub fn slot_from(created_ms: f64, namespace: &str, source_id: &str) -> Result<St
     Ok(id::to_hex(&craftworks_sdk::slot_from(created_ms as u64, namespace, source_id)))
 }
 
+/// THE app-id rule, `app::check` — its one statement — for JavaScript
+/// (`sdk.ids.app`): refused in its words, or nothing. Every page and tool asks
+/// this instead of writing the rule again (#126 ruling).
+#[wasm_bindgen]
+pub fn app_check(app: &str) -> Result<(), JsError> {
+    craftworks_sdk::app::check(app).map_err(err)
+}
+
+/// Is `hex` a 32-byte id in hex (64 lower- or upper-case hex characters) —
+/// the SDK's own parse of a head's instance id (`head_of_hex`), exposed
+/// (`sdk.ids.hex32`), not written again (#126 ruling).
+#[wasm_bindgen]
+pub fn hex32_ok(hex: &str) -> bool {
+    session::head_of_hex(hex).is_some()
+}
+
+/// Is `hex` a record id as an app holds it — 32 hex, or 64 under a parent —
+/// by the SDK's own parse (`id::loc_from_hex`, `sdk.ids.loc`).
+#[wasm_bindgen]
+pub fn loc_ok(hex: &str) -> bool {
+    id::loc_from_hex(hex).is_some()
+}
+
 fn err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }

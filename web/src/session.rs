@@ -661,6 +661,12 @@ impl Session {
 
     /// Which app this session is (`open({ app })`). Set once: an app id is
     /// 1–32 of a-z 0-9 _ - (no `.`, which separates it from the domain).
+    /// THE app-id rule, `app::check` — its one statement — for this session's
+    /// JavaScript (`engine-db`'s `other(app)`), in its words. Nothing is set.
+    pub fn check_app(&self, app: &str) -> Result<(), JsValue> {
+        craftworks_sdk::app::check(app).map_err(|e| db_err(&e))
+    }
+
     pub fn set_app(&mut self, app: &str) -> Result<(), JsValue> {
         craftworks_sdk::app::check(app).map_err(|e| db_err(&e))?;
         match &self.app {
@@ -1279,7 +1285,7 @@ impl Session {
 }
 
 /// A head id as `head_id()` gives it: 64 hex characters.
-fn head_of_hex(hex: &str) -> Option<[u8; 32]> {
+pub(crate) fn head_of_hex(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 || !hex.is_ascii() {
         return None;
     }

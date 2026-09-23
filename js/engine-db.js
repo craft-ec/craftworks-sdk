@@ -370,7 +370,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
      * by name, never attempted.
      */
     other(app) {
-      if (!/^[a-z0-9_-]{1,32}$/.test(app ?? "")) throw new Error(`other(): \`${app}\` is not an app id (1–32 of a-z 0-9 _ -)`);
+      // The app-id rule's one statement (`app::check`), in its words.
+      try { session.check_app(String(app ?? "")); } catch (e) { throw new Error(`other(): ${e?.message ?? e}`); }
       const abs = d => `@${app}/${d}`;
       const refused = async () => {
         throw new DbError({ code: "REFUSED", message: `read-only: \`${app}\` is another app's data, and an app writes only its own`, transient: false });
