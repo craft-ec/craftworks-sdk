@@ -2252,3 +2252,42 @@ fn a_commit_built_before_a_foreign_winner_is_never_signed_as_its_successor() {
     assert_eq!(fin.get(&b"b"[..]).map(Vec::as_slice), Some(&b"2"[..]), "the later write never landed (told {:?})", states(&rs, 3));
     let _ = ours;
 }
+
+/// **A DELTA WHOSE BLOCK IS SILENT WAITS** (rule 7). A delta answers
+/// `FullReloadRequired` on a real NotFound -- the old root is most likely gone
+/// -- but SILENCE is not an answer: a node that has not replied yet says
+/// nothing about whether the block exists. So over five minutes of silence
+/// the delta is answered nothing at all, and when the node answers, it is
+/// answered the real `Delta`. (Turning silence into a miss -- the old tick --
+/// answers it `FullReloadRequired` at once: the mutant this test kills.)
+#[test]
+fn a_delta_whose_block_is_silent_waits_and_is_answered_the_delta() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..600u32).map(|i| (format!("k/{i:06}"), format!("value {i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &ops)), 1)), "the first write did not publish");
+    let (_, from) = node.head().expect("published");
+    assert!(published(&states(&rig.client_as(&mut node, &write(2, &[("k/000321", Some("changed"))])), 2)), "the second write did not publish");
+    // A fresh page asks what changed since the first root; the node is SILENT
+    // about every block.
+    let mut reader = PageRig::new();
+    reader.session = SESSION + 80;
+    reader.client_as(&mut node, &Request::Identity);
+    reader.silent = node.blocks.keys().copied().collect();
+    let id = 8_000u64;
+    reader.send_only(&Request::ChangesSince { req_id: id, from, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, max_entries: 100 });
+    let answer = |rs: &[Reply]| rs.iter().find(|r| matches!(r, Reply::Delta { req_id, .. } | Reply::FullReloadRequired { req_id, .. } | Reply::Unavailable { req_id, .. } if *req_id == id)).cloned();
+    let mut rs = reader.run_for(&mut node, 300_000);
+    assert_eq!(answer(&rs), None, "a delta over a SILENT node was answered: {:?}", answer(&rs));
+    let sent: usize = reader.gets.values().sum();
+    assert!((1..=60).contains(&sent), "{sent} GETs in 5 min of silence");
+    reader.silent.clear();
+    rs.extend(reader.run_for(&mut node, 120_000));
+    match answer(&rs) {
+        Some(Reply::Delta { changes, .. }) if changes.iter().any(|(k, v)| k == b"k/000321" && v.as_deref() == Some(&b"changed"[..])) => {}
+        other => panic!("the node answered again and the delta was answered {other:?} ({sent} GETs while silent)"),
+    }
+    println!("  delta over 5 min of silence: {sent} GETs, no answer; node answers -> the Delta");
+}
