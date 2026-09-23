@@ -259,13 +259,26 @@ impl Session {
     }
 
     /// What this page is showing LIVE — a watch key from
-    /// [`Session::watch_key`] — so a head move can name it. Its `RenderedAt`
-    /// starts at the root now: the binding's first read is at this root or a
-    /// newer one.
+    /// [`Session::watch_key`] — so a head move can name it. It has rendered
+    /// nothing yet: its `RenderedAt` is set by [`Session::rendered`] when its
+    /// first read completes, never here.
     pub fn bind(&mut self, domain: &str) {
         if let Ok(key) = self.read_name(domain) {
-            let at = self.db.store_mut().head();
-            self.bound.bind(craftworks_sdk::live_bindings::WatchKey::of(key), at);
+            self.bound.bind(craftworks_sdk::live_bindings::WatchKey::of(key));
+        }
+    }
+
+    /// The binding of `domain` (a watch key) has just SHOWN what the read
+    /// that completed in this same call answered: its `RenderedAt` is the
+    /// root that read walked (`PageStore::answered_at` — the pinned root it
+    /// resumed at, or the head). Called by `engine-db.js` synchronously after
+    /// the binding's read returns, so no other read runs in between. A
+    /// re-read that failed never calls it, and its change is reported again
+    /// (the architect on sdk#289).
+    pub fn rendered(&mut self, domain: &str) {
+        if let Ok(key) = self.read_name(domain) {
+            let root = self.db.store().answered_at();
+            self.bound.rendered(&craftworks_sdk::live_bindings::WatchKey::of(key), root);
         }
     }
 
@@ -580,6 +593,7 @@ impl Session {
             page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
             page::server::SignerFacts::default(),
         );
+        self.db.store_mut().set_view();
         self.db.store_mut().set_host(page_io::PageIo::reader(server, block_code, id, range));
         self.pump_page();
         Ok(())

@@ -490,9 +490,17 @@ export function engineDb(handle) {
           try {
             // THE PAGE, not the domain. `limit: 0` is unbounded and is what
             // the scan has always done. With a parent, the PAGE OF ITS BAND.
-            next = parent
-              ? await self.children(domain, parent, { limit, reverse })
-              : await self.scan(domain, { limit, reverse });
+            next = await once(() => {
+              const rows = JSON.parse(parent
+                ? session.children(domain, parent, reverse, limit, "")
+                : session.scan(domain, reverse, limit, ""));
+              // RENDERED, in the same synchronous call as the read that
+              // answered: the session records the root that read walked as
+              // this binding's RenderedAt. A read that fails never gets here,
+              // so its change is reported again (the architect on sdk#289).
+              session.rendered(key);
+              return rows;
+            });
           } catch (e) {
             // UNREACHABLE IS AN ANSWER, not an exception to swallow.
             //
@@ -545,7 +553,17 @@ export function engineDb(handle) {
       // The rejection is handled INSIDE `reload` now, which records it as a
       // state rather than throwing. This stays deliberately fire-and-forget:
       // it is called from a notification, and there is nobody to await it.
-      const rerun = () => { b.reload(); };
+      //
+      // ONE re-read at a time. LIVE reports a changed binding on every
+      // message until its re-read has completed, so a re-read already in
+      // flight is followed by exactly one more — never a pile of them.
+      let running = false, again = false;
+      const rerun = async () => {
+        if (running) { again = true; return; }
+        running = true;
+        try { do { again = false; await b.reload(); } while (again); }
+        finally { running = false; }
+      };
       if (!mine.has(domain)) mine.set(domain, new Set());
       mine.get(domain).add(rerun);
 

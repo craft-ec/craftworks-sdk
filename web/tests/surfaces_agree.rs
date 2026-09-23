@@ -70,6 +70,9 @@ const TRANSPORT_ONLY: &[&str] = &[
     // connection mechanics, not data.
     "take_loads",
     "resume",
+    // A LIVE binding's read COMPLETED: its RenderedAt is the root that read
+    // answered at. An in-memory store has no head to diff against.
+    "rendered",
     "loads_in_flight",
     // WHICH APP this session is, in the person's ONE tree (the forest
     // ruling): the prefix that keeps apps apart on a shared register. An

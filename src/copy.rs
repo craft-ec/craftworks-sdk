@@ -253,6 +253,18 @@ impl Copy {
         self.keys
             .range::<[u8], _>((B::Included(lo), B::Excluded(hi)))
             .filter_map(|(k, e)| {
+                // Reading only the LAST write is right because no write the
+                // engine TOOK follows one it has not on the same key: the
+                // outbox sends in order, and go-back-N pulls a later write
+                // back behind a `Lost` one (sdk#265). Asserted, not assumed.
+                debug_assert!(
+                    {
+                        let taken = |w: &PendingWrite| !(w.queued || w.held || w.at_node);
+                        let first_untaken = e.pending.iter().position(|w| !taken(w));
+                        first_untaken.is_none_or(|i| e.pending[i..].iter().all(|w| !taken(w)))
+                    },
+                    "a write the engine took follows one it has not, on one key: the overlay would show the older value"
+                );
                 let w = e.pending.last()?;
                 (w.queued || w.held || w.at_node).then(|| (k.clone(), w.value.clone()))
             })

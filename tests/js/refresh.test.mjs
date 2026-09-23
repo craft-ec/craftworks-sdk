@@ -28,6 +28,7 @@ const settle = () => new Promise(r => setTimeout(r, 10));
  */
 function engineRaw() {
   let rows = [], changed = [], bound = new Set(), foreign = 0, told = 0;
+  const unrendered = new Set();
   const session = {
     url: () => "ws://127.0.0.1:17509/",
     set_app() {}, // the app a session is (the forest ruling); a fake needs no namespace
@@ -39,15 +40,20 @@ function engineRaw() {
     flush() {},
     bind: d => bound.add(d),
     unbind: d => bound.delete(d),
+    // The session reports a changed binding until its re-read COMPLETES and
+    // says so (READ-STATE: RenderedAt is set on completion).
+    rendered: d => { unrendered.delete(d); },
     scan: () => JSON.stringify(rows),
     root: () => `root-${rows.length}`,
     put: () => { rows = [...rows, { id: `p${rows.length}`, updated: 1 }]; return "{}"; },
     live_mode: () => JSON.stringify({ mode: "HeadSubscribed", why: "", foreignNotifications: foreign }),
     take_stale() {
       told += 1;
-      const c = changed.filter(d => bound.has(d)); changed = [];
-      return JSON.stringify(c);
+      for (const d of changed) unrendered.add(d);
+      changed = [];
+      return JSON.stringify([...unrendered].filter(d => bound.has(d)));
     },
+    unrendered: () => [...unrendered],
     take_state_changed: () => "[]",
     /// Another tab's head is adopted: `domain`'s rows are now `newRows`.
     moved(domain, newRows) { rows = newRows; changed.push(domain); },
@@ -93,6 +99,8 @@ await t("**a head move the session names re-runs a live binding, and the new row
   assert.ok(raw.__s.told() > toldBefore, "the page never asked the session which LIVE ranges changed");
   assert.deepEqual(b.getSnapshot(), [{ id: "from-A", updated: 2 }],
     "the binding did not show the rows the head move carried — with no app call, which is the point");
+  assert.deepEqual(raw.__s.unrendered(), [],
+    "the binding re-read and never told the session it had RENDERED, so it is reported again on every message");
 });
 
 await t("THE CONTROL: a head move that changed nothing shown re-renders nothing, and liveMode says so", async () => {

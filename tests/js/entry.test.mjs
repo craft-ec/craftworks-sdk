@@ -167,6 +167,7 @@ function watchingRaw() {
     flush() { session.flushes += 1; },
     bind: d => bound.add(d),
     unbind: d => bound.delete(d),
+    rendered() {},
     take_stale() { const s = stale; stale = []; return JSON.stringify(s); },
     take_state_changed() { const s = ownChanged; ownChanged = []; return JSON.stringify(s); },
     // A binding's reload asks the session to refresh what it reads first.

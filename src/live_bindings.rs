@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// use craftworks_sdk::LiveBindings;
 /// let mut live = LiveBindings::default();
 /// // A JavaScript string where a watch key is expected:
-/// live.bind("notes".to_string(), None);
+/// live.bind("notes".to_string());
 /// ```
 ///
 /// The control, which DOES compile — the same name through `app::read`:
@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 /// use craftworks_sdk::{app, LiveBindings};
 /// use craftworks_sdk::live_bindings::WatchKey;
 /// let mut live = LiveBindings::default();
-/// live.bind(WatchKey::of(app::read(Some("notes-app"), "notes").unwrap()), None);
+/// live.bind(WatchKey::of(app::read(Some("notes-app"), "notes").unwrap()));
 /// assert_eq!(live.len(), 1);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,8 +62,23 @@ pub struct LiveBindings {
 impl LiveBindings {
     /// Bind `key` at `head`: its binding's first read is at this root or a
     /// newer one. Binding a key already bound keeps its `RenderedAt`.
-    pub fn bind(&mut self, key: WatchKey, head: Option<Cid>) {
-        self.at.entry(key).or_insert(head);
+    /// Bind `key`. It has rendered NOTHING yet, so until its first read
+    /// completes ([`LiveBindings::rendered`]) every head counts as a change
+    /// to it — never the head at bind time, which its read may not reach.
+    pub fn bind(&mut self, key: WatchKey) {
+        self.at.entry(key).or_insert(None);
+    }
+
+    /// The binding's read of `key` COMPLETED, answered at `root` (the pinned
+    /// root it resumed at, or the head): what it shows now is that tree. Set
+    /// on completion, never at report time (the architect on sdk#289): a
+    /// re-read that parks and ends UNAVAILABLE / NOT_ANSWERING, or answers at
+    /// an older pinned root, leaves `RenderedAt` where the binding really is,
+    /// so the change is reported again.
+    pub fn rendered(&mut self, key: &WatchKey, root: Option<Cid>) {
+        if let (Some(at), Some(root)) = (self.at.get_mut(key), root) {
+            *at = Some(root);
+        }
     }
 
     pub fn unbind(&mut self, key: &WatchKey) {
@@ -79,11 +94,13 @@ impl LiveBindings {
     }
 
     /// Which bound keys' ranges changed between their `RenderedAt` and
-    /// `head`, in key order. Each such key's `RenderedAt` moves to `head`: its
-    /// binding re-reads at that root or a newer one, so no change is missed —
-    /// at worst one re-read finds nothing new. A diff that cannot be walked (a
-    /// block this page does not hold, a root with no range) counts as a
-    /// change, and the re-read waits on the fetch.
+    /// `head`, in key order. It only REPORTS: a changed key keeps its
+    /// `RenderedAt` until its binding's re-read completes
+    /// ([`LiveBindings::rendered`]), so a re-read that fails is reported
+    /// again. An UNCHANGED key moves to `head` — its range is the same tree at
+    /// both roots. A diff that cannot be walked (a block this page does not
+    /// hold, a root with no range) counts as a change, and the re-read waits
+    /// on the fetch.
     pub fn take_changed<S: Reads>(&mut self, store: &mut S, head: Option<Cid>, range_of: impl Fn(&str) -> Option<(Vec<u8>, Vec<u8>)>) -> Vec<WatchKey> {
         let Some(head) = head else { return Vec::new() };
         let mut changed = Vec::new();
@@ -98,9 +115,10 @@ impl LiveBindings {
                 },
                 _ => true,
             };
-            *at = Some(head);
             if moved {
                 changed.push(key.clone());
+            } else {
+                *at = Some(head);
             }
         }
         changed

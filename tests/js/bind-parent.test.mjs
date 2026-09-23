@@ -70,7 +70,7 @@ const recordingSession = () => {
   const s = {
     asked: [], bound: [], stale: [],
     watch_key: (d, p) => `${d}#${p}`,
-    bind: k => s.bound.push(k), unbind: () => {},
+    bind: k => s.bound.push(k), unbind: () => {}, rendered: k => s.asked.push(["rendered", k]),
     children: (d, p) => { s.asked.push(["children", d, p]); return "[]"; },
     scan: d => { s.asked.push(["scan", d]); return "[]"; },
     take_stale: () => { const out = s.stale; s.stale = []; return JSON.stringify(out); },

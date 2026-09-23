@@ -122,6 +122,14 @@ pub struct PageStore<H: Host> {
     deferred: Vec<Deferred>,
     /// Walks made — what a test and the cost measurement read.
     pub walks: u64,
+    /// The root this store's last ANSWERED read walked: what a LIVE binding
+    /// records as its `RenderedAt` when its read completes.
+    answered_at: Option<Cid>,
+    /// A VIEW of somebody's published head (`open_named`): it writes nothing,
+    /// so its warm root IS its published root — asserted where `head()`
+    /// answers, so a future "preview as a visitor" of one's OWN tree cannot
+    /// inherit the warm root silently (READ-STATE inv. 6).
+    view: bool,
     /// Why a ticket ended UNAVAILABLE, in the engine's words, until it is
     /// taken with its end ([`PageStore::why`]).
     why: BTreeMap<u64, String>,
@@ -144,6 +152,8 @@ impl<H: Host> PageStore<H> {
             pinned: None,
             deferred: Vec::new(),
             walks: 0,
+            answered_at: None,
+            view: false,
             why: BTreeMap::new(),
             interim_overlay: true,
         }
@@ -238,6 +248,17 @@ impl<H: Host> PageStore<H> {
         self.tickets.remove(&ticket);
     }
 
+    /// This store is a VIEW (READ-STATE inv. 6: a visitor's walk takes the
+    /// published root).
+    pub fn set_view(&mut self) {
+        self.view = true;
+    }
+
+    /// The root the last answered read walked (see the field).
+    pub fn answered_at(&self) -> Option<Cid> {
+        self.answered_at
+    }
+
     /// Pin this call's walks to `root` — what `resume` does for a ticket's
     /// root, for a caller that holds a root of its own (a control's copy).
     pub fn pin(&mut self, root: Cid) {
@@ -305,8 +326,20 @@ impl<H: Host> PageStore<H> {
         if let Some(p) = self.pinned {
             return Some(p);
         }
-        self.host.as_mut()?.with_server(|s| s.read_root())
+        let view = self.view;
+        self.host.as_mut()?.with_server(|s| {
+            let warm = s.read_root()?;
+            if view {
+                // A view writes nothing: its warm root is its published one,
+                // and it is the published root a visitor's walk takes.
+                let published = s.page.published().1;
+                assert_eq!(warm, published, "a VIEW's warm root differs from its published root: something wrote into a view");
+                return Some(published);
+            }
+            Some(warm)
+        })
     }
+
 
     /// A walk stopped: the engine reads `range` at `root`, and the read is
     /// this call's ticket.
@@ -411,7 +444,10 @@ impl<H: Host> Reads for PageStore<H> {
         }
         let root = self.root_or_park(key, &next_key(key))?;
         match self.walk(&root, &Walk::Get(key.to_vec())) {
-            Walked::Done(ReadResult::Value(v)) => Ok(v),
+            Walked::Done(ReadResult::Value(v)) => {
+                self.answered_at = Some(root);
+                Ok(v)
+            }
             Walked::Need(_) => Err(self.park(Some(root), scan_range(key, &next_key(key), 1))),
             Walked::Done(_) | Walked::Broken(_) => Err(StoreError::Unavailable),
         }
@@ -437,7 +473,10 @@ impl<H: Host> Reads for PageStore<H> {
         let overlay = if self.interim_overlay { self.writes.copy.unaccepted(lo, hi) } else { Vec::new() };
         let walk_limit = if overlay.is_empty() { limit } else { usize::MAX };
         let rows = match self.walk_scan(root, lo, hi, reverse, walk_limit) {
-            Ok(rows) => rows,
+            Ok(rows) => {
+                self.answered_at = Some(root);
+                rows
+            }
             Err(WalkStop::Need(range)) => return Err(self.park(Some(root), range)),
             Err(WalkStop::Unavailable) => return Err(StoreError::Unavailable),
         };

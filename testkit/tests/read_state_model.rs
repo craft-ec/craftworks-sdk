@@ -141,6 +141,10 @@ enum Mutant {
 const LIVE: (&[u8], &[u8]) = (b"k/", b"k/024");
 const LIVE_KEY: &str = "live";
 
+fn live_key() -> craftworks_sdk::live_bindings::WatchKey {
+    craftworks_sdk::live_bindings::WatchKey::of(craftworks_sdk::app::StoredName::of_tree(LIVE_KEY.into()))
+}
+
 /// THE WALKING READER (slice R): a `PageStore` over tab y, read the way
 /// `engine-db.js`'s `once` reads — a refusal's ticket waited on, then RESUMED
 /// so the next walk is pinned to its root.
@@ -166,8 +170,7 @@ impl Walks {
         store.interim_overlay = mutant != Some(Mutant::NoOverlay);
         let mut w = Walks { store, conn, ended: BTreeMap::new(), mutant, stale: None, live: Default::default(), rendered: None, live_failed: Vec::new() };
         w.drain();
-        let head = w.store.head();
-        w.live.bind(craftworks_sdk::live_bindings::WatchKey::of(craftworks_sdk::app::StoredName::of_tree(LIVE_KEY.into())), head);
+        w.live.bind(live_key());
         w.rerender();
         w
     }
@@ -267,7 +270,13 @@ impl Walks {
     /// The LIVE binding's re-read: what it shows now.
     fn rerender(&mut self) {
         match self.read(LIVE.0, LIVE.1, &mut |_| {}) {
-            Ok(rows) => self.rendered = Some(rows),
+            Ok(rows) => {
+                self.rendered = Some(rows);
+                // RenderedAt: the root this read ANSWERED at, set now that it
+                // has completed (as `engine-db.js` calls `session.rendered`).
+                let at = self.store.answered_at();
+                self.live.rendered(&live_key(), at);
+            }
             Err(f) => self.live_failed.push(format!("{f:?}")),
         }
     }
