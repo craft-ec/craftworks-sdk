@@ -732,6 +732,8 @@ impl PageIo {
                     self.first = None;
                     self.server.page.ext_answered(Ext::SignerFirst, now);
                     self.asked = Some(Asked::NoSigner("no signer on this node: it answered EMPTY".into()));
+                    // What the engine may do now depends on it (#342: no tree yet → writes wait, unput).
+                    self.step_can_sign();
                 }
             }
             // The app's PUT: the page ends its deadline.
