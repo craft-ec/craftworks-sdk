@@ -121,9 +121,7 @@ fn container(code: &[u8], params: &[u8]) -> ContractContainer {
     )))
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
+use core_types::hex::encode as hex;
 
 /// A client GET's outcome, kept whole: a NotFound is a finding here (F55), not an error to bail on.
 #[derive(Debug)]

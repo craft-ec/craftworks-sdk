@@ -654,7 +654,7 @@ impl Session {
         // page-io's: it names the Register it reads (sdk#239), and nothing
         // here keeps a second copy of it.
         match self.page().map(|p| p.register_id()) {
-            Some(id) if id != [0u8; 32] => id.iter().map(|b| format!("{b:02x}")).collect(),
+            Some(id) if id != [0u8; 32] => core_types::hex::encode(&id),
             _ => String::new(),
         }
     }
@@ -1142,7 +1142,7 @@ impl Session {
         // M2 (sdk#148): writes that did not apply because what they READ had
         // moved, and were not re-run (a create, a delete). Facts and one
         // default line; how to show them is the page's.
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let hex = core_types::hex::encode;
         let conflicts: Vec<serde_json::Value> = self
             .db
             .store_mut()
@@ -1280,14 +1280,7 @@ impl Session {
 
 /// A head id as `head_id()` gives it: 64 hex characters.
 fn head_of_hex(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 || !hex.is_ascii() {
-        return None;
-    }
-    let mut id = [0u8; 32];
-    for (i, b) in id.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(id)
+    core_types::hex::decode_array(hex)
 }
 
 fn db_err(e: &DbError) -> JsValue {

@@ -10,6 +10,7 @@ description = "The browser build: the SDK core plus the client-API framing, and 
 crate-type = ["cdylib"]
 
 [dependencies]
+core-types = { path = "../core-types" }
 craftworks-sdk = { path = ".." }
 wire = { path = "../wire" }
 protocol = { path = "../protocol" }

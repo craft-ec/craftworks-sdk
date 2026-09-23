@@ -22,16 +22,14 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 
-/// `RG01`, at the front of both the params and an encoded state.
-const MAGIC: &[u8; 4] = b"RG01";
+/// `RG01`, at the front of both the params and an encoded state (the one statement: `signer_proto::head`).
+use signer_proto::head::RECORD_MAGIC as MAGIC;
 /// Domain separation: what a signature is over is never a bare hash.
 const SIG_DOMAIN: &[u8; 8] = b"RG01-sig";
 const KEY_LEN: usize = 32;
 const HASH_LEN: usize = 32;
-/// The state carries a record, and no equivocation evidence.
-const FLAG_RECORD: u8 = 0b01;
-/// A Register value is capped; the head is 32 bytes, far inside it.
-const MAX_VALUE: usize = 4096;
+/// The state carries a record, and no equivocation evidence; a Register value is capped.
+use signer_proto::head::{FLAG_RECORD, VALUE_MAX as MAX_VALUE};
 
 /// Why a head could not be built.
 #[derive(Debug, PartialEq, Eq)]

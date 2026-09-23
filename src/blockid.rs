@@ -130,19 +130,14 @@ fn split(s: &str) -> Result<(&str, Cid), IdError> {
     if !is_hash(rest) {
         return Err(IdError::Malformed);
     }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&rest[i * 2..i * 2 + 2], 16).map_err(|_| IdError::Malformed)?;
-    }
+    let out = core_types::hex::decode_array::<32>(rest).ok_or(IdError::Malformed)?;
     Ok((tag, out))
 }
 
 /// Lower-case hex only: an id has ONE spelling, so two copies of the same id
 /// are the same string and comparing them as strings is safe.
 fn is_hash(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    core_types::hex::is_lower(s, 32)
 }
 
 impl BlockId {

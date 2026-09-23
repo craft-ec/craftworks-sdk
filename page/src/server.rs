@@ -437,7 +437,7 @@ impl Server {
             Effect::Reply { client, req_id, result } if *client == WALK_CLIENT => {
                 let how = match result {
                     engine::read::ReadResult::Page { .. } => Fetched::Loaded,
-                    engine::read::ReadResult::Unavailable(cid) => Fetched::Unavailable(format!("block {} could not be had", cid.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())),
+                    engine::read::ReadResult::Unavailable(cid) => Fetched::Unavailable(format!("block {} could not be had", engine::short_id(cid))),
                     engine::read::ReadResult::OutOfWarmSpace => Fetched::Unavailable("the read needs more than the warm bound holds".into()),
                     _ => Fetched::Unavailable("the engine answered a walk's fetch with something other than a page".into()),
                 };

@@ -10,8 +10,8 @@
 
 use crate::db::DbError;
 
-/// The longest app id.
-pub const MAX_APP: usize = 32;
+/// The longest app id (layer 0's one statement).
+pub use core_types::name::MAX_APP;
 
 /// The longest name an app WRITES — a domain, relative to the app.
 ///
@@ -24,17 +24,14 @@ pub const MAX_NAME: usize = 32;
 
 /// Is `app` an app id: 1–32 of a-z 0-9 _ - (no `.`, no `@`, no `/`).
 pub fn check(app: &str) -> Result<(), DbError> {
-    let ok = (1..=MAX_APP).contains(&app.len()) && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b));
-    if ok { Ok(()) } else { Err(DbError::Refused(format!("app id `{app}` must be 1–{MAX_APP} of a-z 0-9 _ -"))) }
+    if core_types::name::app_ok(app) { Ok(()) } else { Err(DbError::Refused(format!("app id `{app}` must be 1–{MAX_APP} of a-z 0-9 _ -"))) }
 }
 
 /// Is `name` a name an app may use: 1–32 of a-z 0-9 _ - . — the same rule a
 /// domain always had. A watch key (`domain#parent`) is checked by its domain.
 pub fn check_name(name: &str) -> Result<(), DbError> {
     let domain = name.split_once('#').map_or(name, |(d, _)| d);
-    let ok = (1..=MAX_NAME).contains(&domain.len())
-        && domain.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b));
-    if ok {
+    if core_types::name::domain_ok(domain, MAX_NAME) {
         Ok(())
     } else {
         Err(DbError::NotDefined(format!("domain `{domain}` must be 1–{MAX_NAME} of a-z 0-9 _ - .")))
