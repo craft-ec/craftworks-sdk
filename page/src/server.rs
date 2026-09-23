@@ -968,6 +968,17 @@ impl Server {
                 protocol::Bound::Excluded(k) => B::Excluded(k),
             }
         }
+        // A VIEW WRITES NOTHING, at the door (read-only has one owner, the
+        // page): its write is told `Failed` -- terminal, nothing applied --
+        // by name, and the engine never queues it.
+        if self.page.read_only() {
+            if let P::Write { write_id, .. } | P::Commit { write_id, .. } = &r {
+                let id = *write_id;
+                self.page.unusable.push(format!("read-only: write {id} refused at the door (a view writes nothing)"));
+                self.page.client_fx.push(Effect::Notify { client: self.speaker, write_id: as_write_id(id), state: State::Failed });
+                return Vec::new();
+            }
+        }
         let ev = match r {
             // v5's write (craftworks-sdk#183). Cannot arrive: decode refuses it
             // below v5, and `serve` answers every v5 frame `Unsupported` until

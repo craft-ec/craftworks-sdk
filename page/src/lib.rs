@@ -205,6 +205,11 @@ pub enum Answer {
     AppPutOk(String),
     /// The node refused the app's PUT of this contract key, in its words.
     AppPutRefused { key: String, said: String },
+    /// An op this page sent that its HOST will not send (a read-only page's
+    /// `Update` or `Sign`: never produced, so this is loud), in the host's
+    /// words. It ENDS every wait on that op -- nothing waits on a frame that
+    /// never left. (An app's PUT has its own: [`Answer::AppPutRefused`].)
+    NotSent { op: Op, why: String },
 }
 
 /// Where an app's PUT ([`Op::PutApp`]) stands. It always ENDS: acknowledged,
@@ -514,6 +519,11 @@ pub struct Page {
     /// Effects this executor does not act on (the read path's replies,
     /// subscriptions), for the caller.
     unusable: Vec<String>,
+    /// A VIEW (sdk#239): this page writes nothing of its own -- no commit op,
+    /// ever -- and still puts back a block it REBUILT for a read (a repair
+    /// restores existing content-addressed bytes: no key, no head moved).
+    /// THE one owner of "read-only": page-io and the web Session ask here.
+    read_only: bool,
     now: u64,
     /// Every record the signer returned — invariant 2's evidence.
     signer_records: BTreeSet<Vec<u8>>,
@@ -569,6 +579,7 @@ impl Page {
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
+            read_only: false,
             now: 0,
             signer_records: BTreeSet::new(),
             sign_id: None,
@@ -752,6 +763,17 @@ impl Page {
         let now = now.0;
         self.now = now;
         match a {
+            Answer::NotSent { op, why } => {
+                // WHICH WAIT AN OP HAS is stated once: the deadline `send`
+                // recorded for it (an op alone does not say -- a head read
+                // is sent for five different waits). Every wait on this op
+                // ends; there is no kind for which nothing does.
+                let ended: Vec<Waiting> = self.deadlines.iter().filter(|(_, d)| d.op == op).map(|(w, _)| w.clone()).collect();
+                for w in &ended {
+                    self.answered(w);
+                }
+                self.unusable.push(format!("not sent: {why}"));
+            }
             Answer::AppPutOk(key) => {
                 if self.answered(&Waiting::PutApp(key.clone())).is_some() {
                     if let Some(p) = self.app_puts.get_mut(&key) {
@@ -1524,6 +1546,18 @@ impl Page {
     fn carry_out(&mut self, fx: Vec<Effect>) {
         for f in fx {
             match f {
+                // A VIEW makes no commit op: nothing of it is held, sent or
+                // waited on. The door refuses a view's writes first, so this
+                // is loud -- a commit on a view is a defect, named.
+                Effect::PutBlock { .. } | Effect::PutParity { .. } | Effect::UpdateHead { .. } | Effect::PutPack { .. } if self.read_only => {
+                    let what = match f {
+                        Effect::PutBlock { .. } => "block PUT",
+                        Effect::PutParity { .. } => "parity PUT",
+                        Effect::PutPack { .. } => "pack PUT",
+                        _ => "head update",
+                    };
+                    self.unusable.push(format!("read-only: a commit's {what} was not made (a view writes nothing but a repair)"));
+                }
                 Effect::PutBlock { id, ref bytes, ref after } | Effect::PutParity { id, ref bytes, ref after, .. } => {
                     // The page is the memory now: the engine keeps no bytes.
                     self.blocks.insert(id, bytes);
@@ -1717,6 +1751,17 @@ impl Page {
     }
 
     /// Things this page could not do, by reason.
+    /// Make this page a VIEW ([`Page::read_only`]): for good, set once when
+    /// the page is made a reader of somebody's head.
+    pub fn set_read_only(&mut self) {
+        self.read_only = true;
+    }
+
+    /// Is this page a VIEW: it makes no commit op, only repair PUTs.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn unusable(&self) -> &[String] {
         &self.unusable
     }
@@ -1934,5 +1979,42 @@ mod parked_get {
         // The engine here waits on nothing: the parked GET ends rather than going out.
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
+    }
+}
+
+#[cfg(test)]
+mod not_sent {
+    use super::*;
+
+    /// AN OP THE HOST WILL NOT SEND ENDS ITS WAIT, whatever its kind: the
+    /// wait is found through the deadline `send` recorded, so no kind is left
+    /// waiting (a match on the op's kind with a `_ => None` arm left a Get or
+    /// a head read waiting for ever). Every op kind, and a head read under
+    /// each of its five waits.
+    #[test]
+    fn a_not_sent_answer_ends_the_wait_of_every_op_kind() {
+        let id = [9u8; 32];
+        let sign = Op::Sign { id: 1, prev_seq: 0, prev_root: [0u8; 32], seq: 1, root: id, ledger: Vec::new() };
+        let cases = vec![
+            (Waiting::Put(id), Op::Put { id, bytes: b"x".to_vec() }),
+            (Waiting::Get(id), Op::Get { id }),
+            (Waiting::Held(id), Op::AskHeld { id }),
+            (Waiting::Sign, sign),
+            (Waiting::Update, Op::Update { state: b"s".to_vec() }),
+            (Waiting::PutApp("k".into()), Op::PutApp { key: "k".into() }),
+            (Waiting::Warm, Op::ReadHead),
+            (Waiting::RecoverHead, Op::ReadHead),
+            (Waiting::Verify, Op::ReadHead),
+            (Waiting::ReadBack, Op::ReadHead),
+            (Waiting::Hint, Op::ReadHead),
+        ];
+        for (w, op) in cases {
+            let mut p = Page::new(Params::default(), PutPath::Page);
+            p.send(w.clone(), op.clone());
+            let _ = p.take_ops();
+            assert!(p.deadlines.contains_key(&w), "THE CONTROL: {w:?} was not waiting after its send");
+            p.answer(Answer::NotSent { op: op.clone(), why: "refused".into() }, Ms(1));
+            assert!(!p.deadlines.contains_key(&w), "a NotSent for {op:?} left {w:?} waiting");
+        }
     }
 }
