@@ -1177,14 +1177,15 @@ fn asking_whose_node_registers_mints_and_provisions_nothing() {
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
 }
 
-/// A READER LEAVES NO TRACE, frame by frame: on a node without the signer
-/// (it answers EMPTY, as a real 0.2.136 node does), every frame the asking
-/// page sends is the Register QUERY, and none is a registration. And every
-/// EMPTY is an answer to a query: the page counts exactly as many as the node
-/// served. A page that took the first EMPTY for its signer's registration
-/// (the page never registered one) would ask one query more than it counts.
+/// ASKING LEAVES NO TRACE, frame by frame: on a node without the signer (it
+/// answers EMPTY, as a real 0.2.136 node does), the asking page sends the
+/// Register QUERY and nothing else — never a registration — and that one
+/// EMPTY IS the node's answer ("no signer here"): one query, one answer, done
+/// (rule 8: an answer ends it; no count, no clock). A page that took the
+/// EMPTY for its signer's registration (it never registered one) would ask
+/// the query a second time.
 #[test]
-fn asking_on_a_node_without_the_signer_sends_only_the_query_and_counts_every_empty_answer() {
+fn asking_on_a_node_without_the_signer_sends_one_query_and_takes_its_empty_answer() {
     let mut node = WireNode::unprovisioned(&[11u8; 32]);
     node.empty_signer_answers = usize::MAX;
     let mut io = asker();
@@ -1214,20 +1215,11 @@ fn asking_on_a_node_without_the_signer_sends_only_the_query_and_counts_every_emp
     assert!(sent.iter().all(|k| *k == "signer"), "asking sent a frame that is not the query: {sent:?}");
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
     assert!(!io.provisioned() && node.secrets.is_empty(), "asking provisioned the node");
+    // Named as a node with NO SIGNER: its own answer, not a refusal.
+    assert!(matches!(io.asked(), Some(page_io::Asked::NoSigner(_))), "a node without the signer was not named as one: {:?}", io.asked());
     let served = node.served.get("signer").copied().unwrap_or(0);
-    let counted = match io.asked() {
-        // Named as a node with NO SIGNER (its own answer, not a refusal), in
-        // words that count the EMPTY answers.
-        Some(page_io::Asked::NoSigner(w)) => w
-            .split("EMPTY ")
-            .nth(1)
-            .and_then(|r| r.split(' ').next())
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or_else(|| panic!("the answer does not say how many EMPTY answers: {w}")),
-        other => panic!("a node without the signer was not named as one: {other:?}"),
-    };
-    assert_eq!(counted, served, "the node answered {served} queries EMPTY and the page counted {counted}: an EMPTY was taken for something else");
-    assert_eq!(sent.len(), served, "frames sent {sent:?} against queries served {served}");
+    assert_eq!(served, 1, "the node answered EMPTY and was asked again ({served} queries): an EMPTY was taken for something else");
+    assert_eq!(sent, ["signer"], "frames sent: {sent:?}");
 }
 
 /// THE CONTROL: the page that OPENS (`begin`) does register the signer — so
@@ -1295,7 +1287,8 @@ fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
 }
 
 /// NOTHING IS CLAIMED ON AN ANSWER NOT HAD: before the signer answers, and
-/// when it never does, a claim says `false` and nothing is registered,
+/// while it stays silent (which ends nothing: rule 8), a claim says `false`
+/// and nothing is registered,
 /// minted or opened -- the runtime shows the inputs disabled, with why.
 #[test]
 fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
@@ -1308,7 +1301,12 @@ fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
     let mut now = 1_000;
     node.drop_signer_answers = usize::MAX;
     settle(&mut io, &mut node, &mut now);
-    assert_eq!(io.asked(), Some(&page_io::Asked::NotAnswering), "{:?}", io.unusable());
+    // RULE 8: silence is not an answer and ends nothing. The ask stays
+    // unanswered, the page says what it waits on, and nothing is claimed.
+    assert_eq!(io.asked(), None, "a silent signer was taken as an answer: {:?}", io.asked());
+    let (what, ms) = io.not_answering().expect("a silent signer, and the page does not say what it waits on");
+    assert!(what.contains("signer"), "the page names the wrong wait: {what}");
+    assert!(ms > 0, "the wait has no length");
     assert!(!io.claim(container), "a silent signer's page was claimed");
     assert!(!io.provisioned() && !io.needs_key(), "a refused claim opened or minted");
     assert_eq!(node.served.get("register delegate"), None, "a refused claim registered the signer");
