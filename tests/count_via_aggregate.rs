@@ -9,6 +9,7 @@
 
 use craftworks_sdk::store::{Edit, Reads, Store as _};
 use craftworks_sdk::*;
+use testkit::MemStore;
 use serde_json::{json, Map, Value};
 
 struct FakeEnv {

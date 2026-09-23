@@ -23,12 +23,7 @@ pub mod tick_gate;
 pub mod trace;
 pub mod tree_store;
 pub mod writes;
-/// The client's write path from WRITE-PATH.md revision 3 — structure only,
-/// behind the OFF feature `write-path-v5` (build step 3).
-#[cfg(feature = "write-path-v5")]
-pub mod write_path;
 
-mod engine_store;
 pub use binding::{Binding, LiveMode, Reloads};
 /// What this build IS, baked from the source by `build.rs`.
 ///
@@ -47,16 +42,15 @@ pub use writes::Writes;
 pub use db::{CreateAt, Db, DbError, Record, RerunEvent, RerunStep, Scan, SLOT_SKEW_MS};
 pub use id::slot_from;
 pub use engine_client::{Client, Event as EngineEvent};
-pub use engine_store::{EngineStore, Page, Transport};
 pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use live::{HeadId, HeadWatch, Recorder, Trees};
 pub use live_bindings::LiveBindings;
 pub use page_store::{Ended, Outcome, PageStore};
 pub use schema::{Field, Kind, Schema};
-pub use store::{Delta, Edit, IdWidth, MemStore, Read, Reads, Refused, Store, StoreError};
+pub use store::{Delta, Edit, IdWidth, Read, Reads, Refused, Store, StoreError};
 pub use trace::{Stamped, Trace, Traces};
-pub use tree_store::{OwedGroup, OwedParity, Stats, TreeStore};
+pub use tree_store::{Stats, TreeStore};
 
 /// The tree format tag every node carries, from the library that writes them.
 ///

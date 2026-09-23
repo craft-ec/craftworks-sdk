@@ -16,6 +16,7 @@
 //!   - a slot dated in the future is refused; `updated` is now.
 use craftworks_sdk::id::{created_ms, loc_from_hex, to_hex};
 use craftworks_sdk::*;
+use testkit::MemStore;
 use serde_json::{json, Map, Value};
 
 mod support;
@@ -90,21 +91,20 @@ fn a_second_create_at_the_same_slot_is_exists_and_the_root_does_not_move() {
 #[test]
 fn two_sessions_creating_the_same_slot_store_exactly_one_record() {
     let node = testkit::PageNode::new();
-    let mut a = Db::new(EngineStore::new(node.connect()), clock(NOW).0, [0, 0, 0, 1]);
-    a.store_mut().identity().unwrap();
-    a.define("tasks", &task()).unwrap();
-    let from_a = a.create_at("tasks", slot(), &fields(json!({ "title": "from a" }))).unwrap();
-    // A's writes reach the node, as they do when a tab ticks or closes.
-    a.store_mut().flush();
+    let mut a = support::page_tab::Tab::open(&node, clock(NOW).0, [0, 0, 0, 1]);
+    a.call(|d| d.define("tasks", &task())).unwrap();
+    let from_a = a.call(|d| d.create_at("tasks", slot(), &fields(json!({ "title": "from a" })))).unwrap();
+    // A's writes reach the node, as they do when a tab ticks.
+    a.seconds(5);
+    assert!(a.db.store().unsaved_writes() == 0, "A's writes did not publish");
 
-    let mut b = Db::new(EngineStore::new(node.connect()), clock(NOW).0, [0, 0, 0, 2]);
-    b.store_mut().identity().unwrap();
-    let from_b = b.create_at("tasks", slot(), &fields(json!({ "title": "from b" }))).unwrap();
+    let mut b = support::page_tab::Tab::open(&node, clock(NOW).0, [0, 0, 0, 2]);
+    let from_b = b.call(|d| d.create_at("tasks", slot(), &fields(json!({ "title": "from b" })))).unwrap();
     assert!(matches!(from_a, CreateAt::Created(_)), "{from_a:?}");
     let CreateAt::Exists(held) = from_b else { panic!("the second session overwrote: {from_b:?}") };
     assert_eq!(held.fields["title"], "from a");
 
-    let rows = b.scan("tasks", Scan::default()).unwrap();
+    let rows = b.call(|d| d.scan("tasks", Scan::default())).unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].fields["title"], "from a");
 }

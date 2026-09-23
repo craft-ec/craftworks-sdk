@@ -57,7 +57,8 @@ fn an_app_id_is_one() {
 use craftworks_sdk::app::{check_name, MAX_APP, MAX_NAME};
 use craftworks_sdk::db::{record_key, MAX_DOMAIN};
 use craftworks_sdk::id::Loc;
-use craftworks_sdk::{Db, Env, MemStore, Scan};
+use craftworks_sdk::{Db, Env, Scan};
+use testkit::MemStore;
 
 struct Clock(u64, u32);
 impl Env for Clock {

@@ -175,7 +175,7 @@ fn a_superseded_write_names_its_keys() {
 #[test]
 fn a_record_key_names_its_domain_and_a_schema_key_none() {
     use craftworks_sdk::db::record_key;
-    type D = craftworks_sdk::Db<craftworks_sdk::MemStore, craftworks_sdk::SystemEnv>;
+    type D = craftworks_sdk::Db<testkit::MemStore, craftworks_sdk::SystemEnv>;
     let loc = craftworks_sdk::id::loc_from_hex(&"ab".repeat(16)).expect("an id");
     assert_eq!(D::domain_of_key(&record_key("notes", loc)), Some("notes".to_string()));
     let mut schema = vec![0u8];
@@ -189,7 +189,7 @@ fn a_record_key_names_its_domain_and_a_schema_key_none() {
 #[test]
 fn own_state_changes_name_the_app_relative_domain_its_bindings_are_keyed_by() {
     use craftworks_sdk::db::record_key;
-    type D = craftworks_sdk::Db<craftworks_sdk::MemStore, craftworks_sdk::SystemEnv>;
+    type D = craftworks_sdk::Db<testkit::MemStore, craftworks_sdk::SystemEnv>;
     let loc = craftworks_sdk::id::loc_from_hex(&"ab".repeat(16)).expect("an id");
     let app = "rmud6o02cnfqk0001";
     let mine = record_key(&format!("{app}.notes"), loc);

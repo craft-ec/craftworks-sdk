@@ -7,7 +7,8 @@
 
 use craftworks_sdk::store::{Edit, Store};
 use craftworks_sdk::live_bindings::WatchKey;
-use craftworks_sdk::{Db, LiveBindings, MemStore, SystemEnv};
+use craftworks_sdk::{Db, LiveBindings, SystemEnv};
+use testkit::MemStore;
 
 type D = Db<MemStore, SystemEnv>;
 

@@ -1130,14 +1130,14 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemStore;
+    use crate::tree_store::TreeStore;
 
     /// **An app's write is never forced** (sdk#235 ruling 1): a `Db` write
     /// carrying `Expect::Any` is REFUSED by name — a real refusal, not a
     /// debug assertion — and the store is never reached.
     #[test]
     fn a_db_write_carrying_any_is_refused_and_the_store_is_untouched() {
-        let mut d = Db::new(MemStore::default(), crate::id::SystemEnv, *b"dev1");
+        let mut d = Db::new(TreeStore::new(), crate::id::SystemEnv, *b"dev1");
         let key = b"\x01notes\x00k".to_vec();
         let e = d
             .write(vec![(key.clone(), Expect::Any)], vec![(key.clone(), Edit::Put(b"v".to_vec()))])
@@ -1204,7 +1204,7 @@ mod tests {
         assert!(e.to_string().contains(&MAX_KEY.to_string()), "{e}");
         // The longest legal key is accepted — so the refusal is the length and
         // not the screen refusing everything.
-        let mut d = Db::new(MemStore::default(), crate::id::SystemEnv, *b"dev1");
+        let mut d = Db::new(TreeStore::new(), crate::id::SystemEnv, *b"dev1");
         d.write(vec![(vec![b'k'; MAX_KEY], protocol::Expect::Absent)], vec![(vec![b'k'; MAX_KEY], Edit::Put(b"v".to_vec()))])
             .unwrap();
     }

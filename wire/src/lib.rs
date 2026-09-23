@@ -74,7 +74,6 @@ use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 
 pub mod block;
-pub mod provision;
 pub mod puts;
 pub mod signer;
 pub mod webapp;
@@ -82,7 +81,6 @@ pub mod reassemble;
 /// The delegate's identity, so a caller can hold one without depending on
 /// freenet itself. Opaque everywhere outside this crate.
 pub use freenet_stdlib::prelude::DelegateKey;
-pub use provision::{Did, Provisioned, Step};
 pub use reassemble::Reassembler;
 
 /// The largest single frame this build will decode before looking inside.
@@ -300,19 +298,6 @@ pub fn frame_engine_request(
 /// bytes; this is what turns those into something the client API will accept.
 pub fn contract_id(bytes: [u8; 32]) -> ContractInstanceId {
     ContractInstanceId::new(bytes)
-}
-
-/// Frame a client-API subscription to a contract.
-///
-/// This is the notifier that reaches a connection which made no write: an
-/// engine-originated push returns to whoever invoked the delegate, so it
-/// cannot (F40).
-pub fn frame_subscribe(id: ContractInstanceId, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
-    let req = ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Subscribe {
-        key: id,
-        summary: None,
-    });
-    frames(&req, stream_id)
 }
 
 /// Frame a contract PUT.
