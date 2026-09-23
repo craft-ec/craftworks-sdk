@@ -29,7 +29,7 @@ engine = { path = "../engine" }
 # live-signer drives the signer delegate (sdk#209) with its own request/answer types.
 signer = { path = "../signer" }
 # live-signer PUTs real blocks (kind + block_id): the SAME rev as every other freenet-prolly pin here.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
 # live-handoff drives the SDK's own `CachedStore`, so the run measures the
 # outbox's pacing (sdk#176), not a hand-written send loop.
 craftworks-sdk = { path = ".." }
