@@ -892,6 +892,18 @@ pub enum WriteState {
     /// [`Reply::Unread`] names the key. NEVER re-sent: the same write is
     /// refused the same way every time.
     Unread,
+    /// Nothing applied, not admitted NOW: the page's write queue holds
+    /// `bytes` of its `limit` and this session already has a write in it
+    /// (R-b; COMMIT-LIFE K1). BACKPRESSURE: the client waits for room and
+    /// makes the write again. Never `Busy`. Counts saturate at `u32::MAX` as
+    /// `TooLarge`'s do. From `page::Server` at v4.
+    QueueFull { bytes: u32, limit: u32 },
+    /// TERMINAL: whether the write LANDED cannot be known (its commit died by
+    /// the engine's lights and the new head's ledger no longer lists this
+    /// page; COMMIT-LIFE ⁵). Never re-sent, never rolled back: the app is
+    /// told to CHECK. From `page::Server` at v4; an older client is told
+    /// `Stalled` (nothing claimed).
+    Unknown,
 }
 
 /// Which of the engine's bounds a [`WriteState::TooLarge`] write is over.
@@ -925,6 +937,8 @@ impl WriteState {
                 | WriteState::OutOfOrder { .. }
                 | WriteState::Conflict
                 | WriteState::Unread
+                | WriteState::QueueFull { .. }
+                | WriteState::Unknown
         )
     }
 
@@ -955,7 +969,7 @@ impl WriteState {
             | WriteState::Failed
             | WriteState::Lost => 1,
             WriteState::TooLarge { .. } => 3,
-            WriteState::Conflict | WriteState::Unread => SESSION_SINCE,
+            WriteState::Conflict | WriteState::Unread | WriteState::QueueFull { .. } | WriteState::Unknown => SESSION_SINCE,
             WriteState::Duplicate | WriteState::OutOfOrder { .. } => FLOOR_SINCE,
         }
     }
@@ -992,6 +1006,12 @@ impl WriteState {
             // `Failed` tells an older client — never an unknown tag it drops
             // and later reads as "may have been saved" (architect, sdk#235).
             WriteState::Unread => WriteState::Failed,
+            // Nothing applied; the queue is the page's. `Failed`, as `Unread`:
+            // never `Busy`, which an older outbox re-sent for ever.
+            WriteState::QueueFull { .. } => WriteState::Failed,
+            // Claims nothing: `Stalled` (never `Lost`, which would roll back
+            // a write that may have landed).
+            WriteState::Unknown => WriteState::Stalled,
             // The order rule's verdicts exist only on v5, whose writes carry a
             // floor; a pre-v5 client never meets them. If one ever did, it is
             // told the TRUE v4 equivalent — never `Failed`, which would roll
@@ -1028,6 +1048,8 @@ impl WriteState {
         WriteState::OutOfOrder { expected: 7 },
         WriteState::Conflict,
         WriteState::Unread,
+        WriteState::QueueFull { bytes: 4096, limit: 4096 },
+        WriteState::Unknown,
     ];
 
     /// The order rule's verdicts (v5): never sent below v5, so their

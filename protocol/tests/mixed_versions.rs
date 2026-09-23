@@ -178,6 +178,15 @@ fn an_older_client_is_told_what_it_can_read_and_a_v3_client_the_state_itself() {
         );
         for old in 1..state.since() {
             let told = state.for_client(old);
+            // `Unknown` (R-b, COMMIT-LIFE ⁵: may have landed, check) has NO
+            // older state that means the same. It is told `Stalled`, which
+            // claims nothing: an older client neither rolls it back (`Lost`,
+            // `Failed`) nor sends it again -- the one safe wrong answer. Named
+            // here, not by loosening the rule below for every state.
+            if *state == protocol::WriteState::Unknown {
+                assert_eq!(told, protocol::WriteState::Stalled, "a v{old} client is told {told:?} for Unknown");
+                continue;
+            }
             assert!(
                 told.since() <= old,
                 "a v{old} client would be sent {told:?}, which it cannot read"

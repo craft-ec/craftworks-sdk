@@ -153,57 +153,43 @@ fn a_lost_write_is_the_client_s_to_re_send_or_the_merge_s_to_supersede_never_bot
     assert!(saw_lost, "no tab was told Lost in this race: the test cannot say anything about who owns a Lost");
 }
 
-/// One tab as the SDK drives it: a `CachedStore` over its own `page::Server`.
+/// One tab as the SDK drives it: a `PageStore` over its own `page::Server`.
 struct Tab {
-    store: craftworks_sdk::CachedStore,
+    store: craftworks_sdk::PageStore<testkit::PageConn>,
     conn: testkit::PageConn,
 }
 
 impl Tab {
     fn open(node: &PageNode) -> Tab {
-        let (mut store, _clock) = testkit::cached_store();
-        let mut conn = node.connect();
-        store.client.send(&Request::Identity);
-        let mut t = Tab { store, conn: conn.clone() };
-        let _ = &mut conn;
-        t.pump();
-        t
+        let (mut store, conn, _clock) = testkit::page_store(node);
+        store.sync();
+        Tab { store, conn }
     }
 
-    /// Hand what the store queued to the tab, and every reply back.
+    /// Carry what is waiting both ways.
     fn pump(&mut self) {
-        for _ in 0..100 {
-            let frames = self.store.take_outbound();
-            if frames.is_empty() {
-                return;
-            }
-            for r in self.conn.frames(&frames) {
-                self.store.on_inbound(&r);
-            }
-        }
+        self.store.sync();
     }
 
     /// Deliver ONE held node answer, then what it caused.
     fn release(&mut self) {
-        for r in self.conn.release_one() {
-            self.store.on_inbound(&r);
-        }
+        let _ = self.conn.release_one();
         self.pump();
     }
 }
 
-/// sdk#265 AT THE CLIENT: the same race, each tab a `CachedStore` as the SDK
-/// runs it. The tab that loses the same-seq race is told `Lost` for its
-/// in-flight write; a `Lost` write is the client's to RE-SEND (the engine's
-/// and the protocol's contract), so it lands on the head that won. Every row
+/// sdk#265 AT THE CLIENT: the same race, each tab a `PageStore` as the SDK
+/// runs it. The tab that loses the same-seq race has its in-flight write's
+/// commit die: a FOREIGN MOVE, and its ENGINE re-applies the write at the
+/// front on the head that won (R-b; go-back-N in the engine, once). Every row
 /// both tabs wrote is in the tree, and neither tab holds an unsaved write.
 #[test]
 fn two_tabs_writing_at_once_lose_nothing_at_the_client() {
     use craftworks_sdk::store::Store as _;
     // Each write WITH its read, as a `Db` write makes it. A store-level `put`
-    // is FORCED (`Expect::Any`, sdk#235) and a forced write told Lost falls,
-    // named, instead of going again — so it would not test #265's re-send,
-    // which is what this test is for.
+    // is FORCED (`Expect::Any`, sdk#235) and a forced write whose commit dies
+    // falls, named, instead of going again -- so it would not test #265's
+    // go-again, which is what this test is for.
     let create = |k: &[u8]| (vec![(k.to_vec(), protocol::Expect::Absent)], vec![(k.to_vec(), craftworks_sdk::store::Edit::Put(k.to_vec()))]);
     let node = PageNode::new();
     let (mut x, mut y) = (Tab::open(&node), Tab::open(&node));
@@ -234,15 +220,14 @@ fn two_tabs_writing_at_once_lose_nothing_at_the_client() {
     for t in 1..=30u64 {
         for tab in [&mut x, &mut y] {
             let now = tab.conn.now_ms() + t * 1_000;
-            for r in tab.conn.tick_at(now) {
-                tab.store.on_inbound(&r);
-            }
-            tab.store.tick();
+            let _ = tab.conn.tick_at(now);
             tab.pump();
         }
     }
     let keys = keys_on_node(&node);
-    println!("  the tree: {keys:?}; x unsaved {:?}, y unsaved {:?}", x.store.copy.pending(), y.store.copy.pending());
+    println!("  the tree: {keys:?}; x unsaved {}, y unsaved {}", x.store.unsaved_writes(), y.store.unsaved_writes());
     assert_eq!(keys, ["x1", "x2", "y1"], "a row one of the two tabs wrote is not in the tree (sdk#265)");
-    assert_eq!((x.store.copy.pending().0, y.store.copy.pending().0), (0, 0), "a tab still holds an unsaved write");
+    assert_eq!((x.store.unsaved_writes(), y.store.unsaved_writes()), (0, 0), "a tab still holds an unsaved write");
+    let ended: Vec<_> = x.store.writes.take_ended().into_iter().chain(y.store.writes.take_ended()).collect();
+    assert!(ended.is_empty(), "a write ended unpublished: {ended:?}");
 }

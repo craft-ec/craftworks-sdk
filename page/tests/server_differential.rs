@@ -13,6 +13,7 @@ use engine::Params;
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use page::server::{Server, SignerFacts};
+use page::fates::Fate;
 use page::{Ms, Answer, Op, Page, PutPath};
 use protocol::{Reply, Request, WriteState};
 use std::collections::BTreeMap;
@@ -153,10 +154,10 @@ impl Node {
         page::HeadRead::from_record(self.register.as_deref()?)
     }
 
-    fn sign(&mut self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> (u32, signer_proto::Answer) {
+    fn sign(&mut self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid, ledger: Vec<u8>) -> (u32, signer_proto::Answer) {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
-            next: signer::Next { seq, root, ledger: page::sign_ledger(prev_seq, prev_root, root) },
+            next: signer::Next { seq, root, ledger },
         };
         let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
@@ -183,6 +184,10 @@ struct Faults {
 /// `page::Server` over the scripted node, run to a standstill like `Conn`.
 struct PageRig {
     server: Server,
+    /// The session this page's client speaks under: every page LOAD mints its
+    /// own (a reload is a new session, and the page's device id in heads'
+    /// `through` is its first session, COMMIT-LIFE ⁵).
+    session: u64,
     now: u64,
     faults: Faults,
     got_once: std::collections::BTreeSet<Cid>,
@@ -192,9 +197,14 @@ struct PageRig {
 
 impl PageRig {
     fn new() -> PageRig {
-        let page = Page::unstarted(Params::default(), PutPath::Page);
+        PageRig::with(Params::default())
+    }
+
+    fn with(params: Params) -> PageRig {
+        let page = Page::unstarted(params, PutPath::Page);
         PageRig {
             server: Server::new(page, SignerFacts { head_writable: true, head_id: [0; 32] }),
+            session: SESSION,
             now: 1_000,
             faults: Faults::default(),
             got_once: Default::default(),
@@ -204,7 +214,7 @@ impl PageRig {
     }
 
     fn client_as(&mut self, node: &mut Node, r: &Request) -> Vec<Reply> {
-        let frame = protocol::encode_session_request(VERSION, SESSION, r).expect("encodes");
+        let frame = protocol::encode_session_request(VERSION, self.session, r).expect("encodes");
         self.server.client(&frame);
         self.run(node)
     }
@@ -264,9 +274,9 @@ impl PageRig {
                     Answer::GetMissed(id)
                 }
             }
-            Op::Sign { id, prev_seq, prev_root, seq, root } => {
+            Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
                 node.record_fails = std::mem::take(&mut self.faults.record_not_saved_once);
-                let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root);
+                let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                 node.record_fails = false;
                 Answer::Signer { id, answer }
             }
@@ -417,9 +427,10 @@ fn a_cold_read_with_a_lost_get_returns_every_row() {
     assert!(!rr.got_once.is_empty(), "no GET went unanswered: the fault never fired");
 }
 
-/// One commit at a time: a write while a commit is in flight is `Busy`.
+/// One commit at a time, and a write while one is in flight is QUEUED
+/// (R-b): `Accepted` at once, never `Busy`; it commits when the first lands.
 #[test]
-fn a_write_behind_a_commit_in_flight_is_busy() {
+fn a_write_behind_a_commit_in_flight_is_queued() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     rig.client_as(&mut node, &Request::Identity);
@@ -427,7 +438,43 @@ fn a_write_behind_a_commit_in_flight_is_busy() {
     let p1 = rig.client_as(&mut node, &write(1, &[("a", Some("1"))]));
     assert!(!states(&p1, 1).contains(&WriteState::Busy) && !published(&states(&p1, 1)), "the first write: {:?}", states(&p1, 1));
     let p2 = rig.client_as(&mut node, &write(2, &[("b", Some("2"))]));
-    assert_eq!(states(&p2, 2), vec![WriteState::Busy]);
+    assert_eq!(states(&p2, 2), vec![WriteState::Accepted]);
+    assert_eq!(rig.server.busy_told(), 0, "a write was told Busy on the page path");
+    // THE PULL API: its fate while it waits is its stage, not a verdict.
+    assert_eq!(rig.server.fate(SESSION, 1), Some(Fate::Committing));
+    assert_eq!(rig.server.fate(SESSION, 2), Some(Fate::Queued));
+    rig.faults.hold = false;
+    for op in std::mem::take(&mut rig.held) {
+        if let Some(a) = rig.answer(&mut node, op) {
+            rig.server.node(a, Ms(rig.now));
+        }
+    }
+    let _ = rig.run(&mut node);
+    for w in [1, 2] {
+        assert!(matches!(rig.server.fate(SESSION, w), Some(Fate::Published { .. })), "write {w} did not end Published");
+        assert_eq!(rig.server.fate(SESSION, w), None, "a terminal fate outlived being read");
+    }
+}
+
+/// THE QUEUE'S BOUND, TOLD BY NAME (R-b; COMMIT-LIFE K1): past the byte
+/// bound the write is told `QueueFull` with the bytes and the limit --
+/// backpressure the SDK waits on, and names only at the app's deadline --
+/// never `Busy` and never a generic `Failed`; nothing of it is applied. The
+/// protocol downgrades it only for a client older than v4.
+#[test]
+fn a_full_queue_is_told_by_name() {
+    let mut node = Node::new();
+    let mut rig = PageRig::with(Params { max_queue_bytes: 64, ..Params::default() });
+    rig.client_as(&mut node, &Request::Identity);
+    rig.faults.hold = true;
+    let p = rig.client_as(&mut node, &write(1, &[("k1", Some("v"))]));
+    assert_eq!(states(&p, 1), vec![WriteState::Accepted], "the session's first write was not taken");
+    let p = rig.client_as(&mut node, &write(2, &[("k2", Some(&"v".repeat(64)))]));
+    let told = states(&p, 2);
+    assert!(matches!(told.as_slice(), [WriteState::QueueFull { limit: 64, .. }]), "not told by name on the wire: {told:?}");
+    assert!(matches!(rig.server.fate(SESSION, 2), Some(Fate::QueueFull { limit: 64, .. })), "the app does not read QueueFull by name");
+    assert_eq!(WriteState::QueueFull { bytes: 9, limit: 64 }.for_client(3), WriteState::Failed, "a pre-v4 client is not told the older word that means the same to it");
+    assert_eq!(rig.server.queue_load().0, 1, "the refused write joined the queue");
 }
 
 /// A commit that cannot finish is told `Stalled` once `max_accept_age`
@@ -448,17 +495,25 @@ fn a_held_commit_is_stalled_after_its_age() {
     assert_eq!(states(&p, 1), vec![WriteState::Stalled]);
 }
 
-/// Two tabs on ONE key, the second stale: its write is `Lost` (the signer's
-/// NotNext), and re-sent it publishes on the winner, the tree holding both.
+/// Two tabs on ONE key, the second stale: its commit meets the other tab's
+/// head (the signer's NotNext), a FOREIGN MOVE. The write is FORCED (a
+/// store-level write, `Expect::Any`), so its engine does not re-apply it
+/// blind: it falls `Lost`, named (WRITE-PATH ⁷) -- the winner's ledger does
+/// not list this page, so it did not land -- and made again it publishes on
+/// the winner, the tree holding both. (With both tabs under ONE session this
+/// test once read the other tab's `through` as this page's and told the lost
+/// write `Published`: a device id is per page load, COMMIT-LIFE ⁵.)
 #[test]
 fn two_tabs_on_one_key_the_stale_one_loses_then_publishes() {
     let mut node = Node::new();
     let (mut pa, mut pb) = (PageRig::new(), PageRig::new());
+    pb.session = SESSION + 1;
     pa.client_as(&mut node, &Request::Identity);
     pb.client_as(&mut node, &Request::Identity);
     assert!(published(&states(&pa.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
     let p = pb.client_as(&mut node, &write(2, &[("b", Some("2"))]));
-    assert!(states(&p, 2).contains(&WriteState::Lost), "page: {:?}", states(&p, 2));
+    assert!(states(&p, 2).contains(&WriteState::Lost), "the forced write whose commit did not land was not told Lost: {:?}", states(&p, 2));
+    assert!(!published(&states(&p, 2)), "a write that did not land was told Published: {:?}", states(&p, 2));
     let p = pb.client_as(&mut node, &write(3, &[("b", Some("2"))]));
     assert!(published(&states(&p, 3)), "page {:?}", states(&p, 3));
     let (_, root) = node.head().expect("published");
@@ -541,7 +596,11 @@ fn a_restart_mid_commit_the_signer_lands_the_first_commit() {
     }
     assert!(node.head().is_none(), "the head landed; this is not a restart mid-commit");
     drop(first);
+    // A RESTART is a new page load: a new session (and so a new device id in
+    // heads' `through` -- the same one would let the old page's `through`
+    // witness the new engine's writes, whose arrival numbers start again).
     let mut next = PageRig::new();
+    next.session = SESSION + 100;
     next.client_as(&mut node, &Request::Identity);
     let w2 = write(2, &[("new", Some("2"))]);
     let p = next.client_as(&mut node, &w2);
@@ -633,6 +692,10 @@ impl page::server::Host for Lent {
         let r = f(&mut rig.server);
         answer_ops(rig, node, inbox);
         r
+    }
+    fn peek<R>(&self, f: impl FnOnce(&Server) -> R) -> R {
+        let Lent { rig: Some((rig, _)), .. } = self else { panic!("a tab's call runs with the rig lent") };
+        f(&rig.server)
     }
     fn client(&mut self, frame: &[u8]) {
         self.sent.push(frame.to_vec());
@@ -800,12 +863,11 @@ fn tab_schema() -> craftworks_sdk::Schema {
 /// M2 on the PAGE path (sdk#148's SDK half): a tab's `update` whose READ is
 /// overtaken before it lands is a stale `Commit`. Reads walk the warm tree
 /// (READ-STATE), so the read is stale only if it is made and then WAITS: the
-/// engine is busy with another session's commit and answers `Busy`, the tab
-/// holds the write, and another session changes the record meanwhile
-/// ([`behind`]). The engine applies NOTHING; the tab is told `Conflict` with
-/// `Conflicted` naming the key; the write is rolled back, the conflict
-/// surfaced to the app, and the write NEVER re-sent as itself (one `Busy`
-/// re-send, then the verdict). The other session's value stands, and it is
+/// engine is busy with another session's commit and QUEUES it (R-b), and
+/// another device changes the record meanwhile ([`behind`]). The engine
+/// applies NOTHING of it; the tab is told `Conflict` with `Conflicted`
+/// naming the key; the write is rolled back, the conflict surfaced to the
+/// app, and the write NEVER re-sent as itself (sent once, then the verdict). The other session's value stands, and it is
 /// what the tab reads. Control: the same wait with nothing changed publishes
 /// the update, and nothing is conflicted.
 #[test]
@@ -826,20 +888,22 @@ fn a_stale_update_is_told_conflict_rolled_back_and_never_re_sent() {
         for _ in 0..5 {
             rig.now += 30_000;
             rig.server.tick(Ms(rig.now));
-            tab.db.store_mut().writes.tick();
+            tab.lend(&mut rig, &mut node, |db| db.store_mut().sync());
             tab.pump(&mut rig, &mut node);
         }
         let conflicts = tab.db.store_mut().writes.take_conflicts();
-        assert_eq!(tab.sends.get(&w), Some(&2), "interfere {interfere}: the write went on the wire {:?} times (once, then once after Busy)", tab.sends.get(&w));
+        assert_eq!(tab.sends.get(&w), Some(&1), "interfere {interfere}: the write went on the wire {:?} times (once: queued, then judged where it lands, R-b)", tab.sends.get(&w));
         if interfere {
             assert_eq!(tab.verdicts.get(&w).and_then(|v| v.last()), Some(&protocol::WriteState::Conflict), "not told Conflict: {:?}", tab.verdicts.get(&w));
             assert_eq!(conflicts.len(), 1, "a stale update was not told as ONE conflict: {conflicts:?}");
             assert_eq!((conflicts[0].write_id, &conflicts[0].key), (w, &key));
-            assert_eq!(craftworks_sdk::store::Reads::row_state(tab.db.store_mut(), &key), craftworks_sdk::store::RowState::RolledBack);
+            assert_eq!(tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Reads::row_state(db.store_mut(), &key)), craftworks_sdk::store::RowState::RolledBack);
             assert_eq!(tab.get(&mut rig, &mut node, &key), Some(b"elsewhere".to_vec()), "the tab does not read the tree's value at the conflicted key");
         } else {
             assert!(conflicts.is_empty(), "nothing moved and yet a conflict: {conflicts:?}");
-            assert_eq!(craftworks_sdk::store::Reads::row_state(tab.db.store_mut(), &key), craftworks_sdk::store::RowState::Clean, "the unconflicted update did not publish");
+            // Saved: CLEAN, or BACKED_UP once no parity is owed (sdk#294).
+            let st = tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Reads::row_state(db.store_mut(), &key));
+            assert!(st.is_settled(), "the unconflicted update did not publish: {st:?}");
         }
     }
 }
@@ -868,7 +932,7 @@ fn a_schema_changed_elsewhere_conflicts_on_the_schema_key() {
     let w = tab.db.store().writes.next_write_id();
     let theirs = vec![protocol::Op::Put(schema_key.clone(), serde_json::to_vec(&wider).unwrap())];
     behind(&mut tab, &mut rig, &mut node, 1, theirs, |db| db.update("t", loc, serde_json::json!({ "title": "second" }).as_object().unwrap()));
-    tab.db.store_mut().writes.tick();
+    tab.lend(&mut rig, &mut node, |db| db.store_mut().sync());
     tab.pump(&mut rig, &mut node);
     let conflicts = tab.db.store_mut().writes.take_conflicts();
     assert_eq!(conflicts.iter().map(|c| (c.write_id, c.key.clone())).collect::<Vec<_>>(), vec![(w, schema_key.clone())], "not a conflict on the SCHEMA key");
@@ -983,8 +1047,9 @@ fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
 /// through a NO-OP write Published at the same head (sdk#160), whose value at
 /// every key is the tree's there. Here the second write puts the SAME bytes at
 /// the record's key; it publishes at the same head, joining the tip. A
-/// same-seq winner without the record then tells BOTH writes Superseded on
-/// that key — each write its own reply, the same row.
+/// same-seq winner without the record then tells the key's LAST writer
+/// Superseded -- never the earlier one, whose key a later write of its own
+/// overwrote (COMMIT-LIFE K9 §2: it lost to its own app's order).
 #[test]
 fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
     use signer_proto::head::{value, Ledger};
@@ -1029,7 +1094,8 @@ fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
     tab.pump(&mut rig, &mut node);
     let mut told: Vec<(u64, Vec<Vec<u8>>)> = tab.db.store_mut().writes.take_superseded().into_iter().map(|s| (s.write_id, s.keys)).collect();
     told.sort();
-    assert_eq!(told, vec![(w1, vec![key.clone()]), (w2, vec![key.clone()])], "each write of the tip was not told its row");
+    let _ = w1;
+    assert_eq!(told, vec![(w2, vec![key.clone()])], "the key's last writer was not the one told (or the earlier one was told too)");
 }
 
 /// sdk#225b part 2, THE MERGE (cell B): another device's commit at the tip's
@@ -1251,25 +1317,34 @@ fn schema_key_of(domain: &str) -> Vec<u8> {
     k
 }
 
-/// ANOTHER SESSION writes `ops`, blind, behind the tab's copy: the tab does
-/// not hear of it until a write of its own is refused.
-fn elsewhere(rig: &mut PageRig, node: &mut Node, write_id: u64, ops: Vec<protocol::Op>) {
-    let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(write_id, ops)).expect("encodes");
-    rig.server.client(&other);
-    for _ in 0..200 {
-        let ops = rig.server.take_ops();
-        if ops.is_empty() && !rig.server.page.waiting() {
-            break;
-        }
-        for op in ops {
-            if let Some(a) = rig.answer(node, op) {
-                rig.server.node(a, Ms(rig.now));
+/// ANOTHER DEVICE of this identity lands `ops` on the register: a head at
+/// the tip's seq + 1, built on the tip, holding the tip's tree with `ops`
+/// applied. The page does not hear of it until its own commit's sign meets it
+/// (a FOREIGN MOVE): then it adopts it and re-applies its queue on it, in
+/// order (R-b). Writes of this page's own sessions share one queue and can
+/// never be stale against each other -- only a foreign head makes a stale
+/// write.
+fn elsewhere(_rig: &mut PageRig, node: &mut Node, _write_id: u64, ops: Vec<protocol::Op>) {
+    use signer_proto::head::{value, Ledger};
+    let (tip_seq, tip_root) = node.head().expect("a head to build on");
+    let mut tree = node.tree(&tip_root).expect("the tip is whole");
+    for op in ops {
+        match op {
+            protocol::Op::Put(k, v) => {
+                tree.insert(k, v);
+            }
+            protocol::Op::Delete(k) => {
+                tree.remove(&k);
             }
         }
-        rig.now += 50;
-        rig.server.tick(Ms(rig.now));
     }
-    let _ = rig.server.take_replies();
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = tree.into_iter().collect();
+    let root = device_tree(node, &entries);
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let v = value(&root, &Ledger { prev: Some(signer_proto::Head { seq: tip_seq, root: tip_root }), ..Ledger::default() });
+    let st = contract_keys::register::head_state(&node.register_params, &key_of, tip_seq + 1, &v).expect("signs");
+    node.update(&st);
+    assert_eq!(node.head().map(|h| h.0), Some(tip_seq + 1), "the other device's head did not take the register");
 }
 
 /// A COMMIT IN FLIGHT: another session's write of a key nobody reads, with
@@ -1282,7 +1357,10 @@ fn commit_in_flight(rig: &mut PageRig, node: &mut Node, write_id: u64) {
     assert!(!rig.held.is_empty(), "the filler's commit went nowhere: nothing is in flight");
 }
 
-/// The node answers what it held; the commit in flight lands.
+/// The node answers what it held. What follows -- the commit landing, and
+/// the queue behind it committing (R-b) -- runs on the tab's next pump, so the
+/// replies it makes reach the tab: a queued write's verdicts are made in a
+/// node answer's step, not in a call of the tab's.
 fn release(rig: &mut PageRig, node: &mut Node) {
     rig.faults.hold = false;
     for op in std::mem::take(&mut rig.held) {
@@ -1290,25 +1368,24 @@ fn release(rig: &mut PageRig, node: &mut Node) {
             rig.server.node(a, Ms(rig.now));
         }
     }
-    let _ = rig.run(node);
 }
 
-/// A STALE WRITE, as one can still happen when reads walk the warm tree
-/// (READ-STATE): the tab's write `make` READS now — while the engine is busy
-/// with another session's commit, so it is told `Busy` and the tab holds it —
-/// then ANOTHER SESSION's `theirs` lands, and the tab's write goes again and
-/// meets it where it lands. (A write made AFTER theirs would read theirs: a
-/// premise is the tree's, never a copy's.) `theirs` empty is the control:
-/// the same wait, nothing changed.
+/// A STALE WRITE, as one can still happen (R-b): the tab's write `make`
+/// READS now -- while another session's commit is in flight, so it is QUEUED
+/// behind it -- then ANOTHER DEVICE's `theirs` lands on the register, and
+/// when the commit in flight meets it the page adopts it and re-applies the
+/// queue there: the tab's write is judged where it lands. (A write made
+/// AFTER theirs would read theirs: a premise is the tree's, never a copy's.)
+/// `theirs` empty is the control: the same wait, nothing changed.
 fn behind<T: std::fmt::Debug>(tab: &mut Tab, rig: &mut PageRig, node: &mut Node, write_id: u64, theirs: Vec<protocol::Op>, make: impl Fn(&mut TabDb) -> Result<T, craftworks_sdk::DbError>) -> T {
     commit_in_flight(rig, node, 1_000 + write_id);
     let w = tab.db.store().writes.next_write_id();
     let r = tab.call(rig, node, make).expect("the write is made");
-    assert_eq!(tab.verdicts.get(&w).and_then(|v| v.last()), Some(&protocol::WriteState::Busy), "the tab's write did not wait behind the commit in flight: {:?}", tab.verdicts.get(&w));
-    release(rig, node);
+    assert_eq!(tab.verdicts.get(&w).and_then(|v| v.last()), Some(&protocol::WriteState::Accepted), "the tab's write was not queued behind the commit in flight: {:?}", tab.verdicts.get(&w));
     if !theirs.is_empty() {
         elsewhere(rig, node, write_id, theirs);
     }
+    release(rig, node);
     r
 }
 
@@ -1331,7 +1408,7 @@ fn settle(tab: &mut Tab, rig: &mut PageRig, node: &mut Node) -> (Vec<craftworks_
     let mut events = Vec::new();
     let mut raw = Vec::new();
     for _ in 0..12 {
-        tab.db.store_mut().writes.tick();
+        tab.lend(rig, node, |db| db.store_mut().sync());
         tab.pump(rig, node);
         let now = rig.now;
         let step = tab.lend(rig, node, |db| {
@@ -1388,7 +1465,7 @@ fn a_stale_update_to_another_field_is_re_run_and_both_changes_land() {
         let (events, raw) = settle(&mut tab, &mut rig, &mut node);
         assert!(events.is_empty(), "interfere {interfere}: nothing was lost and yet {events:?}");
         assert!(raw.is_empty(), "interfere {interfere}: a raw conflict reached the app: {raw:?}");
-        assert_eq!(tab.sends.get(&w), Some(&2), "the stale write itself was re-sent after its Conflict (it goes twice: once told Busy, once to its verdict)");
+        assert_eq!(tab.sends.get(&w), Some(&1), "the stale write itself was re-sent (it goes once: queued, then judged where it lands)");
         let rec = published_record(&node, &rerun_schema(), &key).expect("published");
         let want_title = if interfere { "t1" } else { "t0" };
         assert_eq!((rec.get("title"), rec.get("body")), (Some(&serde_json::json!(want_title)), Some(&serde_json::json!("b1"))), "interfere {interfere}");
@@ -1425,12 +1502,13 @@ fn a_chain_of_stale_updates_is_re_run_in_order_and_every_change_survives() {
     let mut rig = PageRig::new();
     let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
     let theirs = their_record(&mut tab, &mut rig, &mut node, &rerun_schema(), &key, serde_json::json!({ "note": "n1" }));
-    // Both updates read while a commit is in flight, and wait; theirs lands.
+    // Both updates read while a commit is in flight, and queue; theirs lands
+    // on the register before that commit does.
     commit_in_flight(&mut rig, &mut node, 1_001);
     tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "title": "t1" })))).expect("the first update");
     tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" })))).expect("the second update");
-    release(&mut rig, &mut node);
     elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)]);
+    release(&mut rig, &mut node);
     let (events, raw) = settle(&mut tab, &mut rig, &mut node);
     assert!(events.is_empty(), "{events:?}");
     assert!(raw.is_empty(), "{raw:?}");
@@ -1443,7 +1521,8 @@ fn a_chain_of_stale_updates_is_re_run_in_order_and_every_change_survives() {
 }
 
 /// THE BUDGET: the record is changed elsewhere before every re-run lands.
-/// After RERUN_ROUNDS re-runs the chain ends as a named failure of its write —
+/// With the one budget spent (the engine's `max_write_tries`, no count of
+/// `Db`'s own) the chain ends as a named failure of its write —
 /// never a spin — and their last value stands.
 #[test]
 fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
@@ -1465,28 +1544,111 @@ fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
         let _ = tab;
     };
     // The update, and every re-run of it, READS while a commit is in flight
-    // and waits; the record is changed again before it lands.
+    // and queues; the record is changed again (another device) before that
+    // commit lands, so the queue is re-applied on the change: Conflict.
     commit_in_flight(&mut rig, &mut node, 2_000);
     tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" })))).expect("the update is made");
-    release(&mut rig, &mut node);
     interfere(&mut tab, &mut rig, &mut node, &mut other_id);
+    release(&mut rig, &mut node);
     for round in 0..10u64 {
-        // The waiting write goes again and meets the change: Conflict.
-        tab.db.store_mut().writes.tick();
+        tab.lend(&mut rig, &mut node, |db| db.store_mut().sync());
         tab.pump(&mut rig, &mut node);
         // Its re-run is made behind the next commit in flight...
         commit_in_flight(&mut rig, &mut node, 2_001 + round);
         let now = rig.now;
         let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
         events.extend(step.events);
-        release(&mut rig, &mut node);
         // ...and changed again before it lands.
         interfere(&mut tab, &mut rig, &mut node, &mut other_id);
+        release(&mut rig, &mut node);
     }
-    let rounds = usize::from(craftworks_sdk::RERUN_ROUNDS);
+    let rounds = Params::default().max_write_tries as usize;
     assert_eq!(tab.sends.range(w + 1..).count(), rounds, "not exactly {rounds} re-runs went on the wire");
     assert!(
         matches!(events.as_slice(), [craftworks_sdk::RerunEvent::Failed { reason, .. }] if reason.contains(&format!("after {rounds} tries"))),
+        "the chain did not end as ONE named failure: {events:?}"
+    );
+    let rec = published_record(&node, &rerun_schema(), &key).expect("published");
+    assert_eq!(rec.get("body"), Some(&serde_json::json!("b0")), "a failed chain wrote anyway");
+}
+
+/// **ONE BUDGET ACROSS THE ENGINE'S RE-SENDS AND `Db`'s RE-RUNS** (sdk#265;
+/// core dev on #295). The update's own commit dies to another device's head
+/// (the engine re-applies it at the front: one try spent), which also changed
+/// the record's `note`, so it conflicts there. `Db`'s re-run draws on from
+/// that one: with a budget of three it has TWO re-runs left, and when the
+/// record is changed under each the chain fails, named. A `Db` counting on
+/// its own would re-run three times -- four tries of one write.
+#[test]
+fn a_write_never_gets_more_than_the_one_budget_across_re_sends_and_re_runs() {
+    let budget = Params::default().max_write_tries as usize;
+    assert_eq!(budget, 3, "the test's arithmetic is for a budget of three");
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
+    let schema = rerun_schema();
+    let note = |node: &Node, n: u64| {
+        let (_, root) = node.head().expect("a head");
+        let cur = node.tree(&root).expect("a tree").get(&key).cloned().expect("the record");
+        let mut d = craftworks_sdk::record::decode(&schema, &cur).expect("decodes");
+        d.fields.insert("note".into(), serde_json::json!(format!("n{n}")));
+        craftworks_sdk::record::encode(&schema, &d.fields, d.created, d.updated + 1, &d.author).expect("encodes")
+    };
+    let w = tab.db.store().writes.next_write_id();
+    // The update's own commit, in flight: its answers held.
+    rig.faults.hold = true;
+    tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" })))).expect("the update is made");
+    assert!(!rig.held.is_empty(), "the update's commit is not in flight");
+    // A foreign head kills it and changes the record. Before it, the write is
+    // driven into a COMMIT (its fetches answered, its commit's puts and sign
+    // held), so the head kills a commit, never a re-apply.
+    for kill in 1..=1u64 {
+        let session = tab.db.store().writes.client.session().expect("the tab has a session");
+        let committing = |rig: &PageRig| rig.server.queued_of(session).iter().any(|(id, f)| *id == w && matches!(f, Fate::Committing));
+        for _ in 0..50 {
+            if committing(&rig) {
+                break;
+            }
+            let (commit, other): (Vec<Op>, Vec<Op>) = std::mem::take(&mut rig.held).into_iter().partition(|op| matches!(op, Op::Put { .. } | Op::Sign { .. } | Op::Update { .. }));
+            rig.held = commit;
+            for op in other {
+                if let Some(a) = rig.answer(&mut node, op) {
+                    rig.server.node(a, Ms(rig.now));
+                }
+            }
+            tab.pump(&mut rig, &mut node);
+        }
+        assert!(committing(&rig), "kill {kill}: the write is not in a commit: {:?}", rig.server.queued_of(session));
+        let ops = vec![protocol::Op::Put(key.clone(), note(&node, kill))];
+        elsewhere(&mut rig, &mut node, kill, ops);
+        for op in std::mem::take(&mut rig.held) {
+            if let Some(a) = rig.answer(&mut node, op) {
+                rig.server.node(a, Ms(rig.now));
+            }
+        }
+        tab.pump(&mut rig, &mut node);
+    }
+    rig.faults.hold = false;
+    release(&mut rig, &mut node);
+    // Every re-run is made behind a commit in flight and changed again before it lands.
+    let mut events = Vec::new();
+    for round in 0..10u64 {
+        tab.lend(&mut rig, &mut node, |db| db.store_mut().sync());
+        tab.pump(&mut rig, &mut node);
+        commit_in_flight(&mut rig, &mut node, 3_001 + round);
+        let now = rig.now;
+        let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
+        events.extend(step.events);
+        let theirs = note(&node, 10 + round);
+        elsewhere(&mut rig, &mut node, 10 + round, vec![protocol::Op::Put(key.clone(), theirs)]);
+        release(&mut rig, &mut node);
+    }
+    let reruns = tab.sends.range(w + 1..).count();
+    let resent_by_engine = 1usize;
+    println!("  one budget {budget}: engine re-sends {resent_by_engine} + Db re-runs {reruns}");
+    assert_eq!(resent_by_engine + reruns, budget, "one write got {} tries, the budget is {budget}", resent_by_engine + reruns);
+    assert!(
+        matches!(events.as_slice(), [craftworks_sdk::RerunEvent::Failed { reason, .. }] if reason.contains(&format!("after {budget} tries"))),
         "the chain did not end as ONE named failure: {events:?}"
     );
     let rec = published_record(&node, &rerun_schema(), &key).expect("published");
@@ -1606,4 +1768,193 @@ fn a_stale_update_the_other_side_already_made_is_satisfied_silently() {
     assert_eq!(tab.sends.range(w + 1..).count(), 0, "a satisfied change was written again");
     let rec = published_record(&node, &rerun_schema(), &key).expect("published");
     assert_eq!((rec.get("title"), rec.get("note")), (Some(&serde_json::json!("t1")), Some(&serde_json::json!("n1"))));
+}
+
+/// sdk#225b WITH GROUP COMMIT (K9 §2): a tip whose GROUP wrote one key twice
+/// (W1 k=a, then W2 k=b reading a), displaced at its seq by another device's
+/// commit from the same base. The merge re-applies the group IN ORDER on the
+/// winner, each write re-judged there:
+/// * the winner left k alone -> both land again, k holds b (the FINAL value),
+///   nobody is told Superseded;
+/// * the winner changed k -> k's LAST writer (W2) is told Superseded for it;
+///   W1, whose k its own W2 overwrote, is never told (it lost to its own
+///   app's order), and the winner's value stands.
+#[test]
+fn a_group_that_wrote_one_key_twice_merges_by_its_final_value() {
+    use signer_proto::head::{value, Ledger};
+    for they_change_k in [false, true] {
+        let mut node = Node::new();
+        let mut rig = PageRig::new();
+        let mut tab = Tab::open(&mut rig, &mut node);
+        tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
+        tab.pump(&mut rig, &mut node);
+        let k = b"k/twice".to_vec();
+        // A commit in flight, so W1 and W2 queue behind it and are CUT together.
+        rig.faults.hold = true;
+        tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Store::apply_commit(db.store_mut(), &[(b"k/first".to_vec(), protocol::Expect::Absent)], &[(b"k/first".to_vec(), craftworks_sdk::store::Edit::Put(b"f".to_vec()))])).expect("taken");
+        let w1 = tab.db.store().writes.next_write_id();
+        tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Store::apply_commit(db.store_mut(), &[(k.clone(), protocol::Expect::Absent)], &[(k.clone(), craftworks_sdk::store::Edit::Put(b"a".to_vec()))])).expect("taken");
+        let w2 = tab.db.store().writes.next_write_id();
+        tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Store::apply_commit(db.store_mut(), &[(k.clone(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(b"a")))], &[(k.clone(), craftworks_sdk::store::Edit::Put(b"b".to_vec()))])).expect("taken");
+        release(&mut rig, &mut node);
+        tab.pump(&mut rig, &mut node);
+        for w in [w1, w2] {
+            assert!(tab.verdicts.get(&w).is_some_and(|v| v.contains(&protocol::WriteState::Published)), "write {w} did not publish: {:?}", tab.verdicts.get(&w));
+        }
+        let (tip_seq, tip_root) = node.head().expect("published");
+        assert_eq!(node.tree(&tip_root).expect("whole").get(&k).map(Vec::as_slice), Some(&b"b"[..]), "the group's final value is not in the tip");
+        // The other device's commit at the tip's seq, from the tip's base.
+        let hr = node.head_read().expect("a head");
+        let base = hr.prev().expect("the tip has a prev");
+        let base_tree = node.tree(&base.1).expect("the base is whole");
+        assert!(!base_tree.contains_key(&k) && base_tree.contains_key(b"k/first".as_slice()), "W1 and W2 were not ONE commit on top of the first: this is not a group");
+        let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+        let mut salt = 0u8;
+        let st = loop {
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
+            entries.push((b"other".to_vec(), vec![salt]));
+            if they_change_k {
+                entries.push((k.clone(), b"theirs".to_vec()));
+            }
+            let r = device_tree(&mut node, &entries);
+            let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
+            if page::beats(&v, hr.value()) {
+                break contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+            }
+            salt += 1;
+        };
+        node.update(&st);
+        rig.server.head_hint();
+        tab.pump(&mut rig, &mut node);
+        for _ in 0..20 {
+            rig.now += 1_000;
+            rig.server.tick(Ms(rig.now));
+            tab.pump(&mut rig, &mut node);
+        }
+        let told: Vec<(u64, Vec<Vec<u8>>)> = tab.db.store_mut().writes.take_superseded().into_iter().map(|s| (s.write_id, s.keys)).collect();
+        let (_, froot) = node.head().expect("a head");
+        let fin = node.tree(&froot).expect("the final tree is whole");
+        if they_change_k {
+            assert_eq!(told, vec![(w2, vec![k.clone()])], "not the key's LAST writer alone told");
+            assert_eq!(fin.get(&k).map(Vec::as_slice), Some(&b"theirs"[..]), "their value did not stand");
+        } else {
+            assert!(told.is_empty(), "told Superseded for a key the winner never touched: {told:?}");
+            assert_eq!(fin.get(&k).map(Vec::as_slice), Some(&b"b"[..]), "the merge did not land the group's FINAL value");
+        }
+        assert!(fin.contains_key(b"other".as_slice()), "their change did not survive the merge");
+    }
+}
+
+/// **A FULL `through` LIST OF OLDER ENTRIES: A FIRST COMMIT THAT DIES IS
+/// RE-APPLIED, NEVER `Unknown`** (review §3 on sdk#295). A device is minted
+/// per page load, so a household's list reaches `THROUGH_MAX` and stays
+/// there. This page's first commit (seq 2) dies to another device's head at
+/// seq 2 whose list is full -- of entries last written at seq 1, older than
+/// our commit. Ours cannot have been evicted (eviction takes the lowest
+/// `last`), so absent means NOT THERE: the write is re-applied on the winner
+/// and publishes. Read as `Unknown` it would end there, its value never
+/// landing.
+#[test]
+fn a_dying_first_commit_under_a_full_list_of_older_entries_is_re_applied() {
+    use signer_proto::head::{value, Ledger, Through, THROUGH_MAX};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
+    let (s1, root1) = node.head().expect("published");
+    // This page's next commit, at s1 + 1: nothing of it reaches the node.
+    rig.faults.hold = true;
+    let mine = Request::Commit { write_id: 2, reads: vec![(b"b".to_vec(), protocol::Expect::Absent)], ops: vec![protocol::Op::Put(b"b".to_vec(), b"2".to_vec())] };
+    rig.client_as(&mut node, &mine);
+    assert_eq!(rig.server.page.committing_seq(), Some(s1 + 1), "the commit is not in flight at s1 + 1");
+    rig.held.clear();
+    rig.faults.hold = false;
+    // Another device's head at the same seq, built on ours, with a FULL list
+    // of entries older than our commit.
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = node.tree(&root1).expect("whole").into_iter().collect();
+    entries.push((b"theirs".to_vec(), b"x".to_vec()));
+    let theirs = device_tree(&mut node, &entries);
+    let through: Vec<Through> = (0..THROUGH_MAX)
+        .map(|i| {
+            let mut d = [0u8; 16];
+            d[..8].copy_from_slice(&(i as u64 + 1000).to_le_bytes());
+            Through { device: d, seq: 1, last: s1 }
+        })
+        .collect();
+    let v = value(&theirs, &Ledger { prev: Some(signer_proto::Head { seq: s1, root: root1 }), through, ..Ledger::default() });
+    let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let st = contract_keys::register::head_state(&node.register_params, &key, s1 + 1, &v).expect("signs");
+    node.update(&st);
+    assert_eq!(node.head(), Some((s1 + 1, theirs)), "their head did not take the register");
+    rig.server.head_hint();
+    let mut rs = rig.run(&mut node);
+    for _ in 0..10 {
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        rs.extend(rig.run(&mut node));
+    }
+    let told = states(&rs, 2);
+    assert!(!told.contains(&WriteState::Unknown), "a dying first commit under a full list of OLDER entries was told Unknown: {told:?}");
+    assert!(published(&told), "the write was not re-applied and published on the winner: {told:?}");
+    let (_, root) = node.head().expect("a head");
+    let tree = tree_of(&node, &root);
+    assert_eq!(tree.get(&b"b"[..]).map(Vec::as_slice), Some(&b"2"[..]), "the write's value never landed");
+    assert_eq!(tree.get(&b"theirs"[..]).map(Vec::as_slice), Some(&b"x"[..]), "the winner's value was lost");
+}
+
+/// **THE MERGE GOES AT THE FRONT, BEFORE A LATER OWN WRITE** (review §1 on
+/// sdk#295; K9 §2). The tip W1 (forced, k = a) publishes at s; W2 (k = b,
+/// read k = a: after W1 in app order) is in flight behind it. Another device
+/// wins at s from the same base, leaving k alone. The displaced W1 must be
+/// re-applied BEFORE W2: then W2's read holds and the tree ends at the LATER
+/// value b, nothing told superseded. Queued behind (the defect), W2 is judged
+/// on the winner first -- k absent there, so it conflicts -- and W1' lands a
+/// after it: the older value wins, and the page's own later write is lost.
+#[test]
+fn a_merge_goes_before_a_later_own_write_and_the_later_value_stands() {
+    use signer_proto::head::{value, Ledger};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("base", Some("0"))])), 1)));
+    let (base_seq, base_root) = node.head().expect("the base");
+    assert!(published(&states(&rig.client_as(&mut node, &write(2, &[("k", Some("a"))])), 2)));
+    let hr = node.head_read().expect("the tip");
+    let (tip_seq, _) = node.head().expect("the tip");
+    // W2, in flight behind the tip: nothing of it reaches the node.
+    rig.faults.hold = true;
+    let w2 = Request::Commit { write_id: 3, reads: vec![(b"k".to_vec(), protocol::Expect::Value(engine::leaf_hash(b"a")))], ops: vec![protocol::Op::Put(b"k".to_vec(), b"b".to_vec())] };
+    let mut rs = rig.client_as(&mut node, &w2);
+    rig.held.clear();
+    rig.faults.hold = false;
+    // The other device's head at the tip's seq, from the same base, leaving k alone.
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let base_tree = node.tree(&base_root).expect("whole");
+    let mut salt = 0u8;
+    let st = loop {
+        let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
+        e.push((b"other".to_vec(), vec![salt]));
+        let r = device_tree(&mut node, &e);
+        let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base_seq, root: base_root }), ..Ledger::default() });
+        if page::beats(&v, hr.value()) {
+            break contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+        }
+        salt += 1;
+    };
+    node.update(&st);
+    rig.server.head_hint();
+    rs.extend(rig.run(&mut node));
+    for _ in 0..20 {
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        rs.extend(rig.run(&mut node));
+    }
+    let told = states(&rs, 3);
+    let fin = node.tree(&node.head().expect("a head").1).expect("whole");
+    assert_eq!(fin.get(&b"k"[..]).map(Vec::as_slice), Some(&b"b"[..]), "the older value landed over the later one (W2 told {told:?})");
+    assert!(published(&told), "the later write did not publish: {told:?}");
+    assert!(fin.contains_key(&b"other"[..]), "their change did not survive");
+    let superseded: Vec<&Reply> = rs.iter().filter(|r| format!("{r:?}").contains("Superseded")).collect();
+    assert!(superseded.is_empty(), "a key was told superseded by the page's own later write: {superseded:?}");
+    assert_eq!(rig.server.page.queue_counts().2, 0, "an impossible transition was counted (the hold was not in place)");
 }

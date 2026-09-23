@@ -9,7 +9,7 @@
 //! precise moment is an ordinary value being dropped here; against a live
 //! node it is a race nobody can schedule.
 
-use engine::{ClientId, Effect, Engine, Epoch, Event, KeySource, Op, Params, State, WriteId};
+use engine::{ClientId, Effect, Engine, Epoch, Event, Expect, KeySource, Op, Params, State, WriteId};
 use freenet_prolly::build::TreeBuilder;
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
@@ -458,13 +458,12 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
 /// re-submits, the original publishes anyway, and a write someone else made
 /// in between is overwritten by the re-submission.
 ///
-/// Writes arriving BEHIND it are the other half, and under one-commit-at-a-
-/// time they are refused rather than folded. `Busy` is terminal and must
-/// leave nothing behind: this asserts the published tree contains write 1's
-/// key and none of theirs, because a write both applied and refused is the
-/// double-apply hazard `Stalled` exists to avoid, wearing the other mask.
+/// Writes arriving BEHIND it are the other half (R-b): QUEUED, `Accepted` in
+/// the step that submitted them, and -- behind a commit that is not moving --
+/// told `Stalled` once each too: taken, not saved, not moving. When the
+/// network answers, each publishes in its own commit, in order.
 #[test]
-fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
+fn a_stalled_write_is_reported_once_and_the_writes_queued_behind_it_publish() {
     let t = 8u64;
     let mut net = Network::default();
     let mut e = boot(
@@ -519,8 +518,8 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
     for n in 2..=6u64 {
         assert_eq!(
             seen.get(&WriteId(n)).map(Vec::as_slice),
-            Some([State::Busy].as_slice()),
-            "write {n} arrived behind an open commit and was not refused in \
+            Some([State::Accepted].as_slice()),
+            "write {n} arrived behind an open commit and was not taken in \
              the same step"
         );
     }
@@ -555,13 +554,13 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
         !one.contains(&State::Failed),
         "write 1 was reported Failed while its edit is still in the tree"
     );
-    // A refused write is not a stalled one, and a tick must not change its
-    // mind: `Busy` is terminal.
+    // Queued behind the stuck commit: taken, and not moving either -- told
+    // `Stalled` once each, never `Failed`.
     for n in 2..=6u64 {
         assert_eq!(
             seen.get(&WriteId(n)).map(Vec::as_slice),
-            Some([State::Busy].as_slice()),
-            "write {n} was refused and then told something else as well"
+            Some([State::Accepted, State::Stalled].as_slice()),
+            "write {n}, queued behind a stuck commit, was not told Stalled once"
         );
     }
 
@@ -604,29 +603,28 @@ fn a_stalled_write_is_reported_once_and_a_refused_one_leaves_no_trace() {
         "write 1 reported an impossible sequence: {one:?}"
     );
 
-    // The refused writes left NO trace. Compared against a tree built from
-    // write 1's key alone: if any of k2..k6 had been applied and refused, the
-    // roots differ, and a re-submitting client would apply it twice.
-    let mut only_one: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-    only_one.insert(b"a".to_vec(), vec![1u8; 40]);
-    let (_, published) = net.head.expect("the commit never published a head");
-    assert_eq!(
-        published,
-        rebuild(&only_one),
-        "the published tree is not write 1's edit alone, so a write that was \
-         told Busy was applied anyway"
-    );
-    // ...and the comparison is sensitive: a tree that DID contain a refused
-    // key has a different root. Without this, the assertion above would pass
-    // just as well if `rebuild` returned a constant.
-    let mut with_k2 = only_one.clone();
-    with_k2.insert(b"k2".to_vec(), vec![2u8; 40]);
-    assert_ne!(
-        rebuild(&with_k2),
-        published,
-        "the root comparison cannot tell a refused write's key apart, so it \
-         proves nothing"
-    );
+    // Every queued write published too, each in its own commit, in order:
+    // the published tree is all six edits.
+    let mut all_six: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    all_six.insert(b"a".to_vec(), vec![1u8; 40]);
+    for n in 2..=6u64 {
+        let told = seen.get(&WriteId(n)).cloned().unwrap_or_default();
+        assert!(told.contains(&State::Published), "queued write {n} never published: {told:?}");
+        assert!(valid_sequence(&told), "write {n} reported an impossible sequence: {told:?}");
+        all_six.insert(format!("k{n}").into_bytes(), vec![2u8; 40]);
+    }
+    let (seq, published) = net.head.expect("the commit never published a head");
+    assert_eq!(published, rebuild(&all_six), "the published tree is not all six writes");
+    // GROUP COMMIT (K9): write 1's commit, then the five queued behind it
+    // cut together once it publishes.
+    assert_eq!(seq, 2, "the writes queued behind the stuck commit did not go as one group");
+    assert_eq!(e.commits_and_writes(), (2, 6), "writes per commit");
+    assert_eq!(e.rebuild_differs(), 0, "K9: a rebuilt commit's root differed from its warm root");
+    // ...and the comparison is sensitive: a tree missing one queued write's
+    // key has a different root.
+    let mut without_k6 = all_six.clone();
+    without_k6.remove(b"k6".as_slice());
+    assert_ne!(rebuild(&without_k6), published, "the root comparison cannot tell a missing write apart");
 
     // The control: with the bound off, nobody is told anything.
     let net2 = Network::default();
@@ -776,108 +774,77 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
 /// Rule 6. A restart racing the old process is the ordinary case, not an
 /// exotic one — the Register refuses the lower or equal seq, and the engine
 /// that loses must take the winner's head rather than publish a second
-/// history under the same key. Its in-flight writes are reported `Lost`,
-/// because their commit is not going to publish and the client is the only
-/// thing that still has them.
+/// history under the same key.
 ///
-/// `Lost` is owed to exactly the writes the engine ACCEPTED. A write refused
-/// with `Busy` was already answered and is already the client's problem;
-/// telling it `Lost` as well would be a second terminal state for one write,
-/// and a client tracking states would see its write end twice. So the
-/// expected set is read off the accept notices rather than written out, and
-/// the refused write is asserted to stay at the one answer it got.
+/// A FOREIGN MOVE (R-b; COMMIT-LIFE § A write's stage): the dead commit's
+/// write goes again at the FRONT, re-judged on the head that won, with one
+/// try spent -- unless it is FORCED (`Expect::Any`), which falls `Lost`,
+/// named, and is never re-applied (WRITE-PATH ⁷). Every write queued behind
+/// it is re-applied in order onto the winner. Nothing is told twice.
 #[test]
 fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
-    let net = Network::default();
-    let mut e = boot(&net, Params::default());
-    let before = e.published_root();
+    for forced in [true, false] {
+        let net = Network::default();
+        let mut e = boot(&net, Params::default());
+        let before = e.published_root();
 
-    let mut answers: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
-    for (n, key) in [(1u64, &b"mine"[..]), (2, &b"also-mine"[..])] {
-        for f in stepped!(
-            e,
-            Event::forced_write(ClientId(1), WriteId(n), vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))])
-        ) {
-            if let Effect::Notify {
-                write_id, state, ..
-            } = f
-            {
-                answers.entry(write_id).or_default().push(state);
+        let mut answers: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
+        for (n, key) in [(1u64, &b"mine"[..]), (2, &b"also-mine"[..])] {
+            let ops = vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))];
+            // Write 1 (the commit) is the forced one, or a checked one that
+            // read its key absent; write 2 is checked the same way.
+            let ev = if forced && n == 1 {
+                Event::forced_write(ClientId(1), WriteId(n), ops)
+            } else {
+                Event::Write { client: ClientId(1), write_id: WriteId(n), ops, reads: vec![(key.to_vec(), Expect::Absent)] }
+            };
+            for f in stepped!(e, ev) {
+                if let Effect::Notify { write_id, state, .. } = f {
+                    answers.entry(write_id).or_default().push(state);
+                }
             }
         }
-    }
-    assert_ne!(e.root(), before, "the writes did not reach the warm tree");
-    let accepted: Vec<WriteId> = answers
-        .iter()
-        .filter(|(_, st)| st.contains(&State::Accepted))
-        .map(|(w, _)| *w)
-        .collect();
-    assert!(
-        !accepted.is_empty(),
-        "no write was accepted, so there is nothing this test can lose and          the Lost assertion below would hold over the empty set"
-    );
-
-    // The other engine got there first.
-    let theirs: BTreeMap<Vec<u8>, Vec<u8>> = (0..30u32)
-        .map(|i| (format!("theirs{i:02}").into_bytes(), vec![9u8; 30]))
-        .collect();
-    let winner = rebuild(&theirs);
-    let out = stepped!(
-        e,
-        Event::HeadConflict {
-            seq: 99,
-            root: winner,
+        assert_ne!(e.root(), before, "the writes did not reach the warm tree");
+        for n in 1..=2 {
+            assert_eq!(answers[&WriteId(n)], vec![State::Accepted], "write {n} was not taken");
         }
-    );
 
-    assert_eq!(
-        e.published_root(),
-        winner,
-        "the loser did not take the winner's head"
-    );
-    assert_eq!(
-        e.root(),
-        winner,
-        "the loser kept its own tree alongside the winner's: that is a fork"
-    );
-    let lost: Vec<WriteId> = out
-        .iter()
-        .filter_map(|f| match f {
-            Effect::Notify {
-                write_id,
-                state: State::Lost,
-                ..
-            } => Some(*write_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        lost, accepted,
-        "Lost was not reported for exactly the writes the engine accepted, so \
-         either a client waits for ever on a commit that will never publish, \
-         or a write it already answered ends a second time"
-    );
-    for (w, st) in &answers {
-        if st.contains(&State::Accepted) {
-            continue;
+        // The other engine got there first.
+        let mut theirs: BTreeMap<Vec<u8>, Vec<u8>> = (0..30u32)
+            .map(|i| (format!("theirs{i:02}").into_bytes(), vec![9u8; 30]))
+            .collect();
+        // The winner's tree is on the node (it published it), so re-applying
+        // onto it reads blocks the node holds rather than parking.
+        let (winner, their_blocks) = common::tree(&theirs);
+        for (id, bytes) in their_blocks.0.iter() {
+            e.blocks().put(*id, bytes);
         }
-        assert_eq!(
-            st.as_slice(),
-            [State::Busy].as_slice(),
-            "{w:?} was refused and then told something else as well"
-        );
-        assert!(
-            !lost.contains(w),
-            "{w:?} was refused with Busy and reported Lost too: one write, \
-             two terminal states"
-        );
+        let out = stepped!(e, Event::HeadConflict { seq: 99, root: winner });
+        for f in &out {
+            if let Effect::Notify { write_id, state, .. } = f {
+                answers.entry(*write_id).or_default().push(*state);
+            }
+        }
+
+        assert_eq!(e.published_root(), winner, "the loser did not take the winner's head");
+        // The warm root is the WINNER plus what goes again -- never the
+        // loser's own history beside it.
+        if !forced {
+            theirs.insert(b"mine".to_vec(), vec![1u8; 40]);
+        }
+        theirs.insert(b"also-mine".to_vec(), vec![2u8; 40]);
+        assert_eq!(e.root(), rebuild(&theirs), "forced={forced}: the queue was not re-applied onto the winner, in order");
+        let lost: Vec<WriteId> = answers.iter().filter(|(_, st)| st.contains(&State::Lost)).map(|(w, _)| *w).collect();
+        if forced {
+            assert_eq!(lost, vec![WriteId(1)], "the forced write in the dead commit did not fall Lost, alone");
+            assert_eq!(e.lost_fell(), (1, 0), "the forced Lost was not counted");
+        } else {
+            assert!(lost.is_empty(), "a checked write fell Lost on its first dead commit: {lost:?}");
+        }
+        assert_eq!(answers[&WriteId(2)], vec![State::Accepted], "the queued write was told something twice");
+        assert_eq!(e.queued_writes(), if forced { 1 } else { 2 }, "forced={forced}: the queue is not what goes again");
+        println!("  conflict (forced={forced}): loser adopts the winner's head; lost {lost:?}; the rest re-applied on it");
     }
-    let refused = answers.len() - accepted.len();
-    println!(
-        "  conflict: loser adopts the winner's head; {} accepted write(s) \
-         reported Lost, {refused} refused one(s) left alone",
-        accepted.len()
-    );
 }
 
 /// A write whose edit is still in the tree is never reported `Failed`.

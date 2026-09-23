@@ -65,6 +65,7 @@
 //!   fresh page on the same key is answered `AlreadySigned` and lands it);
 //! * the web Session over [`server::Server`], and provisioning the signer (B2);
 
+pub mod fates;
 pub mod rto;
 pub mod server;
 
@@ -164,7 +165,9 @@ pub enum Op {
     /// Ask the signer to sign `(prev → seq, root)`, as signer request `id`
     /// (SG02): the answer carries it back, and only the answer under the id of
     /// the sign in flight is taken as its answer. A fresh id per ask.
-    Sign { id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid },
+    /// `ledger`: the bytes after the root in the value to sign (its PREV and
+    /// every page's `through`, this page's updated: [`Page::sign_ledger_of`]).
+    Sign { id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid, ledger: Vec<u8> },
     /// UPDATE the head register with exactly these bytes (a signed record).
     Update { state: Vec<u8> },
     /// GET the head register.
@@ -309,6 +312,55 @@ impl HeadRead {
         &self.value
     }
 
+    /// The `through` its ledger records for `device`: the last arrival number
+    /// of that page's writes this head carries (COMMIT-LIFE ⁵, the witness).
+    /// `None`: no entry, or a refused ledger.
+    pub fn through_of(&self, device: &[u8; 16]) -> Option<u64> {
+        let h = signer_proto::head::read_value(&self.value)?;
+        if h.refused {
+            return None;
+        }
+        h.ledger.through.iter().find(|t| &t.device == device).map(|t| t.seq)
+    }
+
+    /// What this head WITNESSES of `device`'s commits (COMMIT-LIFE ⁵), for a
+    /// commit that would have landed at seq `commit_seq`: its `through`
+    /// entry; or, with none, `NotThere` whenever that can be KNOWN -- the list
+    /// was never at its bound, or its entries show ours cannot have been
+    /// evicted -- otherwise, or with a ledger that cannot be read, `Unknown`.
+    /// Absent is never read as below.
+    pub fn witness_of(&self, device: &[u8; 16], commit_seq: Option<u64>) -> engine::Witness {
+        let Some(h) = signer_proto::head::read_value(&self.value) else { return engine::Witness::Unknown };
+        if h.refused {
+            return engine::Witness::Unknown;
+        }
+        let through = &h.ledger.through;
+        match through.iter().find(|t| &t.device == device) {
+            Some(t) => engine::Witness::Through(t.seq),
+            // SAFE because the list never SHRINKS on a chain: every page's
+            // head copies its prev's list forward (`sign_ledger_of`), LRU
+            // evicts only on an insert past `THROUGH_MAX`, and a #225b merge
+            // is signed on the winner, which built on the same base and so
+            // carries that base's list. So an entry absent from a list still
+            // below its bound was never in this chain: NotThere, not Unknown.
+            None if through.len() < signer_proto::head::THROUGH_MAX => engine::Witness::NotThere,
+            // A FULL list (review §3 on sdk#295: a device is minted per page
+            // load, so a list fills and stays full). Eviction takes the lowest
+            // (`last`, device); had our commit landed at s its entry would
+            // carry `last` >= s, and every entry evicted before it sits at or
+            // below it. So an entry left with `last` < s proves ours was never
+            // evicted: absent means not there. STRICTLY below: at `last` == s
+            // the tie is broken by device id, and ours could have gone first.
+            None if commit_seq.is_some_and(|s| through.iter().any(|t| t.last < s)) => engine::Witness::NotThere,
+            None => engine::Witness::Unknown,
+        }
+    }
+
+    /// Every page's `through` its ledger carries.
+    pub fn through(&self) -> Vec<signer_proto::head::Through> {
+        signer_proto::head::read_value(&self.value).filter(|h| !h.refused).map(|h| h.ledger.through).unwrap_or_default()
+    }
+
     /// The head it was signed from, if its ledger says (a refused ledger says
     /// nothing: never "built on" anything).
     pub fn prev(&self) -> Option<(u64, Cid)> {
@@ -345,6 +397,14 @@ pub fn beats(a: &[u8], b: &[u8]) -> bool {
 /// One page's writes: the engine, the executor state, and what to send.
 pub struct Page {
     path: PutPath,
+    /// This page's id in heads' `through` (COMMIT-LIFE ⁵): set once, from
+    /// its first session; zeros until then.
+    device: [u8; 16],
+    /// Hold the engine's cut when a head displaces this page's published one
+    /// at the SAME seq (review §1 on sdk#295): the Server may merge the
+    /// displaced group, which must go at the front. Only a Server that
+    /// releases the hold sets this.
+    hold_on_displace: bool,
     /// The id of the sign request in flight, if one is (SG02); an answer under
     /// any other id answers something else, a superseded ask included.
     sign_id: Option<u32>,
@@ -436,6 +496,8 @@ impl Page {
         let engine = Engine::new(params, blocks.clone());
         Page {
             path,
+            device: [0; 16],
+            hold_on_displace: false,
             engine,
             blocks,
             confirmed: BTreeSet::new(),
@@ -1100,7 +1162,8 @@ impl Page {
         let id = self.next_request;
         self.next_request = self.next_request.checked_add(1).unwrap_or(1);
         self.sign_id = Some(id);
-        self.send(Waiting::Sign, Op::Sign { id, prev_seq, prev_root, seq: prev_seq + 1, root });
+        let ledger = self.sign_ledger_of(prev_seq, prev_root, prev_seq + 1, root);
+        self.send(Waiting::Sign, Op::Sign { id, prev_seq, prev_root, seq: prev_seq + 1, root, ledger });
     }
 
     fn ask_sign(&mut self) {
@@ -1108,13 +1171,9 @@ impl Page {
         let id = self.next_request;
         self.next_request = self.next_request.checked_add(1).unwrap_or(1);
         self.sign_id = Some(id);
-        let op = Op::Sign {
-            id,
-            prev_seq: self.engine.published_seq(),
-            prev_root: self.engine.published_root(),
-            seq: o.seq,
-            root: o.root,
-        };
+        let (prev_seq, prev_root, seq, root) = (self.engine.published_seq(), self.engine.published_root(), o.seq, o.root);
+        let ledger = self.sign_ledger_of(prev_seq, prev_root, seq, root);
+        let op = Op::Sign { id, prev_seq, prev_root, seq, root, ledger };
         self.send(Waiting::Sign, op);
     }
 
@@ -1206,7 +1265,57 @@ impl Page {
     }
 
     /// Step the engine and carry out what it decided.
+    /// The ledger a head this page signs carries (COMMIT-LIFE ⁵): its PREV,
+    /// and every page's `through` copied forward from the prev head -- so a
+    /// head built on another page's commit still WITNESSES that it landed --
+    /// with this page's own entry set to the last arrival its commit carries.
+    pub fn sign_ledger_of(&self, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> Vec<u8> {
+        use signer_proto::head::{value, Ledger, Through};
+        let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
+        let mut through: Vec<Through> =
+            self.last_read().filter(|r| (r.seq, r.root()) == (prev_seq, prev_root)).map(|r| r.through()).unwrap_or_default();
+        if self.device != [0; 16] {
+            if let Some(t) = self.engine.committing_through() {
+                through.retain(|e| e.device != self.device);
+                through.push(Through { device: self.device, seq: t, last: seq });
+            }
+        }
+        value(&root, &Ledger { prev, through, ..Ledger::default() })[32..].to_vec()
+    }
+
+    /// This page's device id in heads' `through` (COMMIT-LIFE ⁵). Zeros:
+    /// none yet -- its heads carry no entry, and no witness is read. It MUST
+    /// be unique per page LOAD (per engine): arrival numbers start again with
+    /// every engine, so two engines under one id would read each other's
+    /// `through` as their own and tell a write that did not land `Published`.
+    /// The Server sets it from the page's first session, which a page load
+    /// mints at random (one page, one session).
+    pub fn set_device(&mut self, device: [u8; 16]) {
+        if self.device == [0; 16] {
+            self.device = device;
+        }
+    }
+
     fn step(&mut self, ev: Event) {
+        // THE WITNESS (COMMIT-LIFE ⁵): a head about to be adopted says, in its
+        // ledger, how far THIS page's writes are in it -- whether a commit
+        // the engine is about to call dead in fact landed unheard.
+        if let Event::HeadConflict { seq, root } | Event::HeadRead { seq, root, .. } = &ev {
+            // No read of that head (it came some other way): nothing is
+            // witnessed, which is the old rule -- not landed.
+            let witness = (self.device != [0; 16])
+                .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, self.engine.committing_seq())))
+                .flatten();
+            self.engine.set_witness(witness);
+        }
+        // A SAME-SEQ DISPLACEMENT of this page's head: the Server may merge
+        // the displaced group, so no cut is made until it has placed it (or
+        // decided not to) -- set BEFORE the step that re-derives the queue.
+        if let Event::HeadConflict { seq, root } = &ev {
+            if self.hold_on_displace && (*seq, *root) != self.published() && *seq == self.published().0 {
+                self.engine.hold_cut();
+            }
+        }
         // The engine has a head once it is TOLD one, whoever tells it: the
         // held writes go the moment it is, onto the tree it now stands on.
         let recovery = matches!(ev, Event::HeadRead { .. } | Event::HeadMissing);
@@ -1250,6 +1359,9 @@ impl Page {
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
                     self.held.push((after, f.clone()));
                 }
+                // A queued write's warm-apply block (R-b): kept for reads of
+                // the warm root, never put -- its commit puts the same bytes.
+                Effect::Keep { id, ref bytes } => self.blocks.insert(id, bytes),
                 Effect::PutPack { id, .. } => {
                     // No packs in this phase, as the shell refuses them.
                     self.unusable.push("a pack was emitted; packs are off in this phase".into());
@@ -1391,6 +1503,88 @@ impl Page {
     /// Every record the signer returned (invariant 2's evidence).
     pub fn signer_records(&self) -> &BTreeSet<Vec<u8>> {
         &self.signer_records
+    }
+
+    /// Every write in the engine's queue with its stage (R-b).
+    pub fn queue_stages(&self) -> Vec<(engine::ClientId, engine::WriteId, engine::Stage)> {
+        self.engine.queue_stages().collect()
+    }
+
+    /// Does a write still applying write a key in `[lo, hi)`?
+    pub fn applying_touches(&self, lo: &[u8], hi: &[u8]) -> bool {
+        self.engine.applying_touches(lo, hi)
+    }
+
+    /// The stage of the last queued write that writes `key`.
+    pub fn stage_of_key(&self, key: &[u8]) -> Option<engine::Stage> {
+        self.engine.stage_of_key(key)
+    }
+
+    /// Writes queued and their bytes (what `QueueFull` measures).
+    pub fn queue_load(&self) -> (usize, usize) {
+        self.engine.queue_load()
+    }
+
+    /// Own commits published and the queued writes they carried (K9: writes
+    /// per commit, what group commit is measured by).
+    pub fn commits_and_writes(&self) -> (u64, u64) {
+        self.engine.commits_and_writes()
+    }
+
+    /// Writes told `Published` because a head's ledger witnessed their group
+    /// landed unheard (COMMIT-LIFE ⁵).
+    pub fn landed_by_witness(&self) -> u64 {
+        self.engine.landed_by_witness()
+    }
+
+    /// Writes told `Published` by a no-op group: the tree already held them.
+    pub fn noop_published(&self) -> u64 {
+        self.engine.noop_published()
+    }
+
+    /// See `hold_on_displace`: the Server that merges turns it on.
+    pub fn hold_on_displace(&mut self) {
+        self.hold_on_displace = true;
+    }
+
+    pub fn cut_held(&self) -> bool {
+        self.engine.cut_held()
+    }
+
+    /// The hold ends with nothing to merge.
+    pub fn release_cut(&mut self) {
+        let fx = self.engine.release_cut();
+        self.carry_out(fx);
+    }
+
+    /// A merge's writes, at the FRONT of the queue (review §1 on sdk#295).
+    pub fn merge_front(&mut self, client: ClientId, writes: Vec<engine::MergeWrite>) {
+        let fx = self.engine.merge_front(client, writes);
+        self.carry_out(fx);
+    }
+
+    /// The next write taken is a re-run that spent `tries` (ONE budget).
+    pub fn carry_tries(&mut self, tries: u32) {
+        self.engine.carry_tries(tries);
+    }
+
+    pub fn clear_carried_tries(&mut self) {
+        self.engine.clear_carried_tries();
+    }
+
+    pub fn max_write_tries(&self) -> u32 {
+        self.engine.max_write_tries()
+    }
+
+    /// The seq the commit in flight would land at (`None`: none in flight).
+    pub fn committing_seq(&self) -> Option<u64> {
+        self.engine.committing_seq()
+    }
+
+    /// The engine's own counts the model reads (R-b): K9 rebuilds that
+    /// differed, re-derivations on own publish, impossible stage moves.
+    pub fn queue_counts(&self) -> (u64, u64, u64) {
+        (self.engine.rebuild_differs(), self.engine.own_publish_rederived(), self.engine.impossible_transitions())
     }
 
     /// The WARM root: this page's accepted writes applied, published or not

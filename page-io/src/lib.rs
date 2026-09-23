@@ -239,6 +239,9 @@ impl page::server::Host for PageIo {
         self.pump();
         r
     }
+    fn peek<R>(&self, f: impl FnOnce(&Server) -> R) -> R {
+        f(&self.server)
+    }
     fn client(&mut self, frame: &[u8]) {
         PageIo::client(self, frame);
     }
@@ -872,11 +875,11 @@ impl PageIo {
                         wire::frame_put(self.register.clone(), WrappedState::new(state), stream)
                     }
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root } => wire::signer::frame_sign(
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => wire::signer::frame_sign(
                     &self.art.signer,
                     id,
                     signer_proto::Head { seq: prev_seq, root: prev_root },
-                    signer_proto::Next { seq, root, ledger: page::sign_ledger(prev_seq, prev_root, root) },
+                    signer_proto::Next { seq, root, ledger },
                     stream,
                 ),
                 Op::AskHeld { id } => {

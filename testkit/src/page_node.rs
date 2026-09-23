@@ -267,10 +267,10 @@ impl PageNode {
         *self.register.borrow_mut() = Some(next);
     }
 
-    fn sign(&self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> (u32, signer_proto::Answer) {
+    fn sign(&self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid, ledger: Vec<u8>) -> (u32, signer_proto::Answer) {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
-            next: signer::Next { seq, root, ledger: page::sign_ledger(prev_seq, prev_root, root) },
+            next: signer::Next { seq, root, ledger },
         };
         let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
@@ -414,6 +414,9 @@ impl page::server::Host for PageConn {
         let out = st.run();
         st.inbox.extend(out);
         r
+    }
+    fn peek<R>(&self, f: impl FnOnce(&Server) -> R) -> R {
+        f(&self.0.borrow().server)
     }
     fn client(&mut self, frame: &[u8]) {
         let mut st = self.0.borrow_mut();
@@ -615,9 +618,9 @@ impl ConnState {
                     None => Answer::GetMissed(id),
                 }
             }
-            Op::Sign { id, prev_seq, prev_root, seq, root } => {
+            Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
                 self.count(Served::Sign);
-                let (id, answer) = self.node.sign(id, prev_seq, prev_root, seq, root);
+                let (id, answer) = self.node.sign(id, prev_seq, prev_root, seq, root, ledger);
                 self.node.record_fails.set(false);
                 Answer::Signer { id, answer }
             }

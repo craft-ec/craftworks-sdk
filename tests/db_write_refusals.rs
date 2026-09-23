@@ -1,17 +1,19 @@
 //! A write the store REFUSED is answered as refused, never as made
-//! (craftworks-sdk#180).
+//! (craftworks-sdk#180), and the refusal NAMES what the caller can do.
 //!
-//! `Db::write` called `apply_batch`, which returned nothing; `CachedStore`
-//! pushed its refusal onto a list and nothing read the list. Measured: 300
-//! `create_at` against the copy's cap of 256 pending answered `Ok(Created)`
-//! 300 times, while the copy had refused 45 of them — a caller told its data
-//! was written when it had been dropped. In the builder that turned a 300-row
-//! publish into "46 of 302 records did not reach the node".
+//! Since R-b the only bound on writes waiting to be saved is the BYTES the
+//! ENGINE's queue holds (COMMIT-LIFE K1; no count cap): past it the store
+//! says `QUEUE_FULL` -- by name, with the bytes and the limit -- and the
+//! SDK's `write()` WAITS on it (backpressure) and names it to the app only at
+//! the app's deadline. Here, at the store, it is the answer the wait is made
+//! of: never a generic failure, never a write answered `Created` that is not
+//! there, and the same write made again once the queue drains is taken. (Before R-b the client's copy held the bound and
+//! answered `NO_ROOM`; measured then: 300 `create_at` against its cap of 256
+//! answered `Ok(Created)` 300 times while 45 had been dropped.)
 //!
-//! Driven over the real `Db` on the page's store (`PageStore`) over the page
-//! path's node, the schema published, then the node's answers HELD — as a
-//! real node's arrive after a round trip — so every write after it stays
-//! pending and the cap is reached.
+//! Driven over the real `Db` on the page's store over the page path's node,
+//! the schema published, then the node's answers HELD -- as a real node's
+//! arrive after a round trip -- so every write after it waits in the queue.
 
 use craftworks_sdk::{CreateAt, DbError, Refused, Schema, SystemEnv};
 use serde_json::{json, Map, Value};
@@ -22,15 +24,15 @@ type Tab = support::page_tab::Tab<SystemEnv>;
 /// A slot's `created` in the past, so no write is refused for its clock.
 const PAST_MS: u64 = 1_700_000_000_000;
 
-/// A tab with the schema PUBLISHED, then the node silent: what it writes
-/// from here stays pending.
-fn db() -> Tab {
+/// A tab whose page's queue bound is `params`, the schema PUBLISHED, then the
+/// node silent: what it writes from here waits in the queue.
+fn db_with(params: engine::Params) -> Tab {
     let node = testkit::PageNode::new();
-    let mut t = Tab::open(&node, SystemEnv, [1, 2, 3, 4]);
+    let mut t = Tab::open_with(&node, params, SystemEnv, [1, 2, 3, 4]);
     let sc: Schema = serde_json::from_value(json!({ "type": "Row", "fields": [{ "name": "n", "kind": "int" }] })).unwrap();
     t.call(|d| d.define("rows", &sc)).expect("the schema is written");
     t.seconds(3);
-    assert_eq!(t.db.store().writes.copy.pending_writes(), 0, "the schema did not publish");
+    assert_eq!(t.db.store().unsaved_writes(), 0, "the schema did not publish");
     t.conn.hold_answers();
     t
 }
@@ -55,97 +57,83 @@ fn slot(i: u64) -> craftworks_sdk::RKey {
 fn node_answers(t: &mut Tab) {
     t.conn.stop_holding();
     while t.conn.held() > 0 {
-        let replies = t.conn.release_one();
-        for r in &replies {
-            t.db.store_mut().writes.on_inbound(r);
-        }
+        let _ = t.conn.release_one();
         t.pump();
     }
     t.seconds(3);
 }
 
-/// **300 `create_at` past the copy's cap: every `Created` is really there,
-/// and the rest are refused `NO_ROOM` by name.** RED before: 300 `Created`,
-/// 45 of them absent from the copy and never sent.
+/// A small byte bound, so a burst meets it.
+const BOUND: usize = 2_000;
+
+fn small() -> engine::Params {
+    engine::Params { max_queue_bytes: BOUND, ..engine::Params::default() }
+}
+
+/// **300 `create_at` past the queue's byte bound: every `Created` is really
+/// there, and the rest are told `QUEUE_FULL` by name**, with the limit.
 #[test]
-fn create_at_past_the_cap_is_refused_no_room_and_nothing_created_is_absent() {
-    let mut t = db();
+fn create_at_past_the_queue_bound_is_told_queue_full_and_nothing_created_is_absent() {
+    let mut t = db_with(small());
     let d = &mut t.db;
-    let before = d.store().writes.copy.pending_writes();
-    let cap = d.store().writes.copy.max_pending;
-    let (mut created, mut no_room, mut absent) = (0usize, 0usize, Vec::new());
+    let (mut created, mut full, mut absent) = (0usize, 0usize, Vec::new());
     for i in 0..300u64 {
         match d.create_at("rows", slot(i), &fields(i as i64)) {
             Ok(CreateAt::Created(r)) => {
                 created += 1;
-                // Created means WRITTEN: readable at once, from the copy.
+                // Created means TAKEN: readable at once, on the warm root.
                 if d.get("rows", loc(&r)).expect("the range is loaded").is_none() {
                     absent.push(i);
                 }
             }
             Ok(CreateAt::Exists(_)) => panic!("row {i}: nothing was there to exist"),
             Err(e) => {
-                assert_eq!(e.code(), "NO_ROOM", "row {i}: {e}");
-                assert!(e.is_retryable(), "NO_ROOM is retryable after a confirmation");
-                assert_eq!(e.cap(), Some(cap));
-                no_room += 1;
+                assert_eq!(e.code(), "QUEUE_FULL", "row {i}: {e}");
+                assert!(e.is_retryable(), "QUEUE_FULL is retryable once the queue drains");
+                assert_eq!(e.cap(), Some(BOUND), "row {i}: not told the limit");
+                full += 1;
             }
         }
     }
-    println!("  300 create_at, {before} pending before, cap {cap}: created {created}, NO_ROOM {no_room}, created-but-absent {}", absent.len());
+    println!("  300 create_at, byte bound {BOUND}: created {created}, QUEUE_FULL {full}, created-but-absent {}", absent.len());
     assert!(absent.is_empty(), "answered Created, and not there: rows {absent:?}");
-    assert_eq!(created, cap - before, "every write the copy had room for is created");
-    assert_eq!(no_room, 300 - (cap - before));
+    assert!(created > 0 && full > 0, "the bound was not met, or nothing was taken: created {created}, full {full}");
+    assert_eq!(created + full, 300);
 }
 
-/// `put` past the cap: refused, and the store did not take it.
+/// `put` past the bound: told by name, and the queue did not take it.
 #[test]
-fn put_past_the_cap_is_refused_no_room() {
-    let mut t = db();
+fn put_past_the_bound_is_told_queue_full() {
+    let mut t = db_with(engine::Params { max_queue_bytes: 1, ..engine::Params::default() });
     let d = &mut t.db;
-    d.store_mut().writes.copy.max_pending = d.store().writes.copy.pending_writes() + 1;
-    d.put("rows", &fields(1)).expect("room for one");
-    let pending = d.store().writes.copy.pending_writes();
+    d.put("rows", &fields(1)).expect("a session's first write is always taken");
     let e = d.put("rows", &fields(2)).expect_err("no room for a second");
-    assert_eq!(e.code(), "NO_ROOM", "{e}");
-    assert_eq!(d.store().writes.copy.pending_writes(), pending, "the refused write entered the copy anyway");
+    assert_eq!(e.code(), "QUEUE_FULL", "{e}");
+    assert!(matches!(e, DbError::WriteRefused(Refused::QueueFull { limit: 1, bytes }) if bytes > 0), "{e:?}");
+    assert_eq!(d.store().queue_load().0, 1, "the refused write entered the queue anyway");
 }
 
-/// `update` past the cap: refused, and the record keeps its old value.
+/// `update` past the bound: refused, and the record keeps its old value.
 #[test]
-fn update_past_the_cap_is_refused_and_the_record_is_unchanged() {
-    let mut t = db();
+fn update_past_the_bound_is_refused_and_the_record_is_unchanged() {
+    let mut t = db_with(engine::Params { max_queue_bytes: 1, ..engine::Params::default() });
     let d = &mut t.db;
     let r = d.put("rows", &fields(1)).expect("room");
-    d.store_mut().writes.copy.max_pending = d.store().writes.copy.pending_writes();
     let e = d.update("rows", loc(&r), &fields(2)).expect_err("no room");
-    assert_eq!(e.code(), "NO_ROOM", "{e}");
+    assert_eq!(e.code(), "QUEUE_FULL", "{e}");
     let now = d.get("rows", loc(&r)).expect("loaded").expect("still there");
     assert_eq!(now.fields.get("n"), Some(&json!(1)), "the refused update shows on screen");
 }
 
-/// `delete` past the cap: refused, and the record is still there.
+/// `delete` past the bound: refused, and the record is still there.
 #[test]
-fn delete_past_the_cap_is_refused_and_the_record_stays() {
-    let mut t = db();
+fn delete_past_the_bound_is_refused_and_the_record_stays() {
+    let mut t = db_with(engine::Params { max_queue_bytes: 1, ..engine::Params::default() });
     let d = &mut t.db;
     let r = d.put("rows", &fields(1)).expect("room");
-    d.store_mut().writes.copy.max_pending = d.store().writes.copy.pending_writes();
     let e = d.delete("rows", loc(&r)).expect_err("no room");
-    assert_eq!(e.code(), "NO_ROOM", "{e}");
+    assert_eq!(e.code(), "QUEUE_FULL", "{e}");
     assert!(d.get("rows", loc(&r)).expect("loaded").is_some(), "the refused delete removed it");
-}
-
-/// The BYTE cap is its own code.
-#[test]
-fn past_the_byte_cap_is_refused_no_room_bytes() {
-    let mut t = db();
-    let d = &mut t.db;
-    d.store_mut().writes.copy.max_pending_bytes = 64;
-    let e = d.put("rows", &fields(1)).expect_err("a record is more than 64 bytes");
-    assert_eq!(e.code(), "NO_ROOM_BYTES", "{e}");
-    assert!(e.is_retryable());
-    assert_eq!(e.cap(), Some(64));
 }
 
 /// A page with NO SESSION makes no writes — and says so, by its own code.
@@ -162,24 +150,25 @@ fn a_page_with_no_session_is_refused_no_session() {
     assert!(matches!(e, DbError::WriteRefused(Refused::NoSession)));
 }
 
-/// **After a confirmation frees room, the SAME write made again succeeds** —
-/// the recovery `NO_ROOM` names.
+/// **Once the queue drains, the SAME write made again succeeds** — the
+/// recovery `QUEUE_FULL` names.
 #[test]
-fn a_write_refused_no_room_succeeds_once_a_confirmation_frees_room() {
-    let mut t = db();
+fn a_write_refused_queue_full_succeeds_once_the_queue_drains() {
+    let mut t = db_with(small());
     let d = &mut t.db;
-    let cap = d.store().writes.copy.max_pending;
     let mut i = 0u64;
-    while d.store().writes.copy.pending_writes() < cap {
-        d.create_at("rows", slot(i), &fields(i as i64)).expect("room");
-        i += 1;
-    }
-    let e = d.create_at("rows", slot(i), &fields(i as i64)).expect_err("full");
-    assert_eq!(e.code(), "NO_ROOM");
+    let e = loop {
+        match d.create_at("rows", slot(i), &fields(i as i64)) {
+            Ok(_) => i += 1,
+            Err(e) => break e,
+        }
+        assert!(i < 1000, "the queue never filled");
+    };
+    assert_eq!(e.code(), "QUEUE_FULL");
     node_answers(&mut t);
     let d = &mut t.db;
     match d.create_at("rows", slot(i), &fields(i as i64)) {
         Ok(CreateAt::Created(_)) => {}
-        other => panic!("the retry after a confirmation did not create: {other:?}"),
+        other => panic!("the retry after the queue drained did not create: {other:?}"),
     }
 }

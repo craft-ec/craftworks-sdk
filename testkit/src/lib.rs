@@ -6,7 +6,8 @@
 //! the differences decided what the tests could SEE.
 //!
 //! - **A clock that never advanced, written out eleven times.**
-//!   `CachedStore::new(Box::new(|| 0))` appeared in six files. Nothing in the
+//!   `CachedStore::new(Box::new(|| 0))` appeared in six files (the outbox,
+//!   gone with R-b: the engine owns the write queue). Nothing in the
 //!   SDK's tests could observe time passing, so a whole class of behaviour was
 //!   untestable by construction rather than by decision. [`Clock`] is one a
 //!   test can drive.
@@ -48,31 +49,6 @@ impl Clock {
         let c = self.0.clone();
         Box::new(move || *c.borrow())
     }
-}
-
-/// A `CachedStore` whose clock can be DRIVEN, with the clock handed back.
-///
-/// Replaces `CachedStore::new(Box::new(|| 0))` — a clock frozen at zero,
-/// written out by hand in six files. Nothing in those tests could observe time
-/// passing, so "does this behaviour need time?" was a question the suite could
-/// not ask. Handing the clock back is the point: a fixture that hid it would
-/// be the same frozen clock with better manners.
-pub fn cached_store() -> (craftworks_sdk::CachedStore, Clock) {
-    let clock = Clock::new(0);
-    (craftworks_sdk::CachedStore::new(clock.as_fn()), clock)
-}
-
-/// A `CachedStore` on a clock the caller already holds — so several
-/// sessions share ONE clock, and advancing it moves them all (the write
-/// path's model test runs two).
-pub fn cached_store_on(clock: &Clock) -> craftworks_sdk::CachedStore {
-    craftworks_sdk::CachedStore::new(clock.as_fn())
-}
-
-/// The same, started at a given time.
-pub fn cached_store_at(start_ms: u64) -> (craftworks_sdk::CachedStore, Clock) {
-    let clock = Clock::new(start_ms);
-    (craftworks_sdk::CachedStore::new(clock.as_fn()), clock)
 }
 
 /// A tab's STORE (READ-STATE, design B): a `PageStore` lent a new tab on

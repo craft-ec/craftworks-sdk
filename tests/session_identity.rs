@@ -7,11 +7,21 @@
 //! pending writes, "have I seen this write") took one session's write for
 //! another's.
 
-use craftworks_sdk::{CachedStore, Store as _};
+use craftworks_sdk::Writes;
 
-/// One tab: a `CachedStore` over a connection to the node.
+/// A fresh write half on a frozen clock: framing and a session.
+fn writes() -> Writes {
+    Writes::new(Box::new(|| 0))
+}
+
+/// A forced one-key write, as a store-level `put` makes it (sdk#235).
+fn put(w: &mut Writes, key: &[u8], value: &[u8]) -> Result<u64, craftworks_sdk::Refused> {
+    w.make(&[(key.to_vec(), protocol::Expect::Any)], &[(key.to_vec(), craftworks_sdk::Edit::Put(value.to_vec()))])
+}
+
+/// One tab: a write half over a connection to the node.
 struct Tab {
-    store: CachedStore,
+    store: Writes,
     conn: testkit::PageConn,
     /// `(session, write_id)` of every write this tab sent, read off the wire.
     sent: Vec<(u64, u64)>,
@@ -29,7 +39,7 @@ fn session_of(env: &protocol::Envelope) -> u64 {
 
 impl Tab {
     fn on(conn: testkit::PageConn) -> Tab {
-        let mut t = Tab { store: testkit::cached_store().0, conn, sent: Vec::new(), told: Vec::new() };
+        let mut t = Tab { store: writes(), conn, sent: Vec::new(), told: Vec::new() };
         t.store.client.send(&protocol::Request::Identity);
         t.pump();
         t
@@ -54,7 +64,7 @@ impl Tab {
     }
 
     fn write(&mut self, key: &[u8], value: &[u8]) {
-        self.store.put(key, value).expect("the store took the write");
+        put(&mut self.store, key, value).expect("the store took the write");
         self.pump();
     }
 }
@@ -112,14 +122,14 @@ fn each_tabs_write_states_name_that_tabs_session() {
     assert_ne!(tab1.store.client.session().expect("a session"), tab2.store.client.session().expect("a session"));
 }
 
-/// **A state naming ANOTHER session is dropped, never applied**, even for a
-/// write id this tab has pending — which is the ordinary case, since every
-/// tab's first write is id 1.
+/// **A state naming ANOTHER session ends nothing here**, even for a write id
+/// this tab has open -- the ordinary case, since every tab's first write is
+/// id 1. Since R-b a pushed verdict ends nothing at all: a write's fate is
+/// PULLED from the Server by (session, write id).
 #[test]
 fn a_write_state_for_another_session_is_ignored() {
-    let (mut s, _clock) = testkit::cached_store();
-    s.put(b"k", b"v").expect("the store took the write");                       // write id 1, pending
-    let id = s.copy.pending_ids()[0];
+    let mut s = writes();
+    let id = put(&mut s, b"k", b"v").expect("the store took the write");
     let foreign = protocol::encode_reply(&protocol::Reply::SessionWriteState {
         session: s.client.session().expect("a session") ^ 0x55,
         write_id: id,
@@ -127,17 +137,8 @@ fn a_write_state_for_another_session_is_ignored() {
     })
     .unwrap();
     s.on_inbound(&foreign);
-    assert_eq!(s.copy.pending_ids(), vec![id], "another session's verdict rolled this tab's write back");
-    assert_eq!(s.client.foreign_write_states, 1, "and it was not counted");
-    // THE CONTROL: the same verdict, for THIS session, is applied.
-    let own = protocol::encode_reply(&protocol::Reply::SessionWriteState {
-        session: s.client.session().expect("a session"),
-        write_id: id,
-        state: protocol::WriteState::Failed,
-    })
-    .unwrap();
-    s.on_inbound(&own);
-    assert!(s.copy.pending_ids().is_empty(), "its own verdict was not applied either, so the drop above proves nothing");
+    assert!(s.is_open(id), "another session's verdict ended this tab's write");
+    assert!(s.take_ended().is_empty(), "another session's verdict was told to this tab's app");
 }
 
 /// **Two tabs' first writes waiting at ONCE each hear `ParityComplete`** — the
@@ -154,8 +155,8 @@ fn two_sessions_waiting_on_parity_together_are_each_told_it_completed() {
     tab1.write(b"k/tab1", b"from tab 1");
     tab2.write(b"k/tab2", b"from tab 2");
     assert!(conn.held() > 0, "nothing was held, so the two writes never waited together");
-    // Release the node's answers one per call, and let each tab tick between
-    // rounds as a page does (a write refused Busy is re-sent from its queue).
+    // Release the node's answers one per call, each tab pumping between
+    // rounds as a page does.
     let mut released: Vec<(Option<u64>, protocol::WriteState)> = Vec::new();
     for _ in 0..200 {
         while conn.held() > 0 {
@@ -170,10 +171,9 @@ fn two_sessions_waiting_on_parity_together_are_each_told_it_completed() {
             }
         }
         for tab in [&mut tab1, &mut tab2] {
-            tab.store.tick();
             tab.pump();
         }
-        if conn.held() == 0 && tab1.store.copy.pending_ids().is_empty() && tab2.store.copy.pending_ids().is_empty() {
+        if conn.held() == 0 {
             break;
         }
     }
@@ -192,16 +192,15 @@ fn two_sessions_waiting_on_parity_together_are_each_told_it_completed() {
 // ---- the architect's review of #165 -----------------------------------------
 
 /// **A2: an UNNAMED verdict is somebody else's.** A v3 tab's `w1: Failed`,
-/// delivered to this v4 tab's connection because they share the delegate, must
-/// not roll back this tab's own `w1`.
+/// delivered to this v4 tab's connection, ends nothing here -- and is counted
+/// as foreign.
 #[test]
 fn a_plain_verdict_is_another_tabs_and_is_never_applied() {
-    let (mut s, _clock) = testkit::cached_store();
-    s.put(b"k", b"v").expect("the store took the write");
-    let id = s.copy.pending_ids()[0];
+    let mut s = writes();
+    let id = put(&mut s, b"k", b"v").expect("the store took the write");
     let plain = protocol::encode_reply(&protocol::Reply::WriteState { write_id: id, state: protocol::WriteState::Failed }).unwrap();
     s.on_inbound(&plain);
-    assert_eq!(s.copy.pending_ids(), vec![id], "a v3 tab's verdict rolled back this tab's write");
+    assert!(s.is_open(id), "a v3 tab's verdict ended this tab's write");
     assert_eq!(s.client.foreign_write_states, 1, "and it was not counted as foreign");
 }
 
@@ -210,17 +209,17 @@ fn a_plain_verdict_is_another_tabs_and_is_never_applied() {
 /// with every other such page.
 #[test]
 fn a_page_with_no_session_refuses_its_writes_by_name_and_sends_nothing() {
-    let (mut s, _clock) = testkit::cached_store();
+    let mut s = writes();
     s.client = craftworks_sdk::engine_client::Client::from_random(None);
-    let r = s.put(b"k", b"v");
-    assert!(matches!(r, Err(craftworks_sdk::copy::Refused::NoSession)), "the refusal was not returned: {r:?}");
+    let r = put(&mut s, b"k", b"v");
+    assert!(matches!(r, Err(craftworks_sdk::Refused::NoSession)), "the refusal was not returned: {r:?}");
     assert_eq!(s.refused.len(), 1);
-    assert!(matches!(s.refused[0].1, craftworks_sdk::copy::Refused::NoSession), "{:?}", s.refused);
-    assert!(s.copy.pending_ids().is_empty(), "the write is held as if it could be sent");
+    assert!(matches!(s.refused[0].1, craftworks_sdk::Refused::NoSession), "{:?}", s.refused);
+    assert_eq!(s.open_writes(), 0, "the write is held as if it could be sent");
     assert!(s.take_outbound().is_empty(), "it was sent under no session");
     // THE CONTROL: the same page with randomness writes.
-    let (mut ok, _c) = testkit::cached_store();
-    ok.put(b"k", b"v").expect("the store took the write");
+    let mut ok = writes();
+    put(&mut ok, b"k", b"v").expect("the store took the write");
     assert!(ok.refused.is_empty());
     assert_eq!(ok.take_outbound().len(), 1);
 }

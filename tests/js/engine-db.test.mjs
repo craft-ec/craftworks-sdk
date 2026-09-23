@@ -316,10 +316,9 @@ await t("THE CONTROL: a ticketless NOT_LOADED on a write still surfaces", async 
 
 await t("a write the store REFUSED rejects with its code, whether it may be retried, and the bound it met — never resolves as made (sdk#180)", async () => {
   // Rust built this: `{ code, message, transient, retryable, cap }`. The
-  // wrapper must carry every field a caller acts on — a handoff waits for a
-  // confirmation and retries on `retryable`, and shows `cap`.
+  // wrapper must carry every field a caller acts on.
   let asks = 0;
-  const refusal = { code: "NO_ROOM", message: "not written: 256 writes are already waiting for an answer", transient: false, retryable: true, cap: 256 };
+  const refusal = { code: "TOO_LARGE_TO_SEND", message: "this write is 9 bytes as sent and the limit is 8", transient: false, retryable: false };
   const s = { create_at() { asks += 1; throw { ...refusal }; }, put() { asks += 1; throw { ...refusal }; },
               update() { asks += 1; throw { ...refusal }; }, delete() { asks += 1; throw { ...refusal }; } };
   const db = engineDb(s);
@@ -327,17 +326,95 @@ await t("a write the store REFUSED rejects with its code, whether it may be retr
                               ["update", () => db.update("tasks", "a".repeat(32), {})], ["delete", () => db.delete("tasks", "a".repeat(32))]]) {
     await assert.rejects(call, e => {
       assert.equal(e.name, "DbError", `${name}: not a DbError`);
-      assert.equal(e.code, "NO_ROOM", `${name}: the code`);
-      assert.equal(e.retryable, true, `${name}: retryable was lost`);
-      assert.equal(e.cap, 256, `${name}: the cap was lost`);
-      assert.equal(e.transient, false, `${name}: a reload does not make room`);
+      assert.equal(e.code, "TOO_LARGE_TO_SEND", `${name}: the code`);
+      assert.equal(e.retryable, false, `${name}: retryable was lost`);
+      assert.equal(e.transient, false, `${name}: a reload does not make it smaller`);
       return true;
     }, `${name} resolved for a write the store refused`);
   }
-  assert.equal(asks, 4, "a refused write was re-sent by the wrapper: waiting for room is the caller's decision");
-  // A refusal that is NOT retryable says so.
-  const s2 = { put() { throw { code: "NO_SESSION", message: "no session", transient: false, retryable: false }; } };
-  await assert.rejects(() => engineDb(s2).put("tasks", {}), e => e.code === "NO_SESSION" && e.retryable === false && !("cap" in e));
+  assert.equal(asks, 4, "a refused write was re-sent by the wrapper");
+});
+
+await t("a FULL QUEUE is backpressure: the write waits for the session's wake and is made again (R-b; COMMIT-LIFE K1)", async () => {
+  // QUEUE_FULL is not a verdict on the write: nothing was written, and the
+  // same write made again once a commit publishes is taken. The wrapper waits
+  // on the session's own wake -- never a timer -- and asks again.
+  let asks = 0, wake;
+  const full = { code: "QUEUE_FULL", message: "4000 of 4096 bytes of writes are already waiting to be saved; wait for them, then try again", transient: false, retryable: true, cap: 4096 };
+  const s = { put() { asks += 1; if (asks < 3) throw { ...full }; return JSON.stringify({ id: "x" }); }, take_loads: () => "[]" };
+  const db = engineDb({ session: s, onReadsWake: fn => { wake = fn; } });
+  let done = false;
+  const p = db.put("tasks", {}).then(r => { done = true; return r; });
+  await new Promise(r => setImmediate(r));
+  assert.equal(asks, 1, "the first ask was not made");
+  assert.equal(done, false, "a write met a full queue and resolved without waiting");
+  wake();
+  await new Promise(r => setImmediate(r));
+  assert.equal(asks, 2, "the wake did not make the write again");
+  wake();
+  const r = await p;
+  assert.equal(asks, 3, "the write was not made again once the queue had room");
+  assert.deepEqual(r, { id: "x" });
+});
+
+await t("past the app's deadline a full queue fails NAMED, with the limit and how long it waited", async () => {
+  let clock = 0, wake;
+  const full = { code: "QUEUE_FULL", message: "4000 of 4096 bytes of writes are already waiting to be saved; wait for them, then try again", transient: false, retryable: true, cap: 4096 };
+  const s = { put() { throw { ...full }; }, take_loads: () => "[]" };
+  const db = engineDb({ session: s, onReadsWake: fn => { wake = fn; } }, { writeDeadlineMs: 5_000, now: () => clock });
+  const p = assert.rejects(() => db.put("tasks", {}), e => {
+    assert.equal(e.code, "QUEUE_FULL");
+    assert.equal(e.retryable, true, "the app cannot tell to try again later");
+    assert.equal(e.cap, 4096, "the limit was lost");
+    assert.ok(e.message.includes("waited"), `not told it waited: ${e.message}`);
+    return true;
+  });
+  await new Promise(r => setImmediate(r));
+  clock = 4_999;
+  wake();
+  await new Promise(r => setImmediate(r));
+  clock = 5_000;
+  wake();
+  await p;
+});
+
+await t("with NO deadline passed a full queue waits for room however long it takes, and says it is waiting (the owner: no limit, managed by the core)", async () => {
+  let clock = 0, wake, room = false;
+  const full = { code: "QUEUE_FULL", message: "full", transient: false, retryable: true, cap: 4096 };
+  const s = { put() { if (!room) throw { ...full }; return JSON.stringify({ id: "x" }); }, take_loads: () => "[]" };
+  const db = engineDb({ session: s, onReadsWake: fn => { wake = fn; } }, { now: () => clock });
+  let failed;
+  const p = db.put("tasks", {}).catch(e => { failed = e; });
+  for (const at of [59_999, 60_000, 3_600_000, 86_400_000]) {
+    await new Promise(r => setImmediate(r));
+    clock = at;
+    wake();
+  }
+  await new Promise(r => setImmediate(r));
+  assert.equal(failed, undefined, `the SDK chose a deadline of its own: failed after ${clock} ms`);
+  assert.equal(db.waitingForRoom(), 1, "a write waiting for room is not shown as waiting");
+  room = true;
+  wake();
+  await p;
+  assert.equal(failed, undefined);
+  assert.equal(db.waitingForRoom(), 0, "a taken write is still shown as waiting");
+});
+
+await t("writes waiting for room are made again in the ORDER they waited (review sec. 2 on sdk#295)", async () => {
+  // The engine holds a session told QUEUE_FULL until its queue is empty;
+  // then the FIRST write made again is taken. That must be the oldest.
+  let wake, room = false;
+  const made = [];
+  const full = { code: "QUEUE_FULL", message: "full", transient: false, retryable: true, cap: 4096 };
+  const s = { put(_d, row) { if (!room) throw { ...full }; made.push(JSON.parse(row).v); return JSON.stringify({ id: JSON.parse(row).v }); }, take_loads: () => "[]" };
+  const db = engineDb({ session: s, onReadsWake: fn => { wake = fn; } });
+  const ps = ["a", "b", "c"].map(v => db.put("tasks", { v }));
+  await new Promise(r => setImmediate(r));
+  assert.equal(db.waitingForRoom(), 3);
+  room = true;
+  wake();
+  await Promise.all(ps);
+  assert.deepEqual(made, ["a", "b", "c"], "a later write was made before an older one that waited");
 });
 
 await t("nothing in the wrapper branches on a message, or waits on a timer", () => {

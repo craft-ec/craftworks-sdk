@@ -108,6 +108,11 @@ pub enum RowState {
     Pending,
     /// A write that was rolled back: it failed, or nothing ever answered it.
     RolledBack,
+    /// Saved, AND its redundancy is on the network: no parity is owed over a
+    /// tree whose parity is known in full (sdk#294; READ-STATE `key_state`'s
+    /// `SavedAndBackedUp`, the one owner). What the builder's "saved + backed
+    /// up" chip shows.
+    BackedUp,
 }
 
 impl RowState {
@@ -118,6 +123,7 @@ impl RowState {
             RowState::Queued => "QUEUED",
             RowState::Pending => "PENDING",
             RowState::RolledBack => "ROLLED_BACK",
+            RowState::BackedUp => "BACKED_UP",
         }
     }
 
@@ -126,7 +132,7 @@ impl RowState {
     /// An invariant, not a convenience: a row showing an unacknowledged value
     /// must SAY so.
     pub fn is_settled(self) -> bool {
-        self == RowState::Clean
+        matches!(self, RowState::Clean | RowState::BackedUp)
     }
 }
 
@@ -239,7 +245,7 @@ pub trait Reads {
 ///
 /// **An implementation may treat a write it cannot represent as a bug and
 /// stop.** A key or value past what the underlying structure allows is not a
-/// refusal the store can name — [`Refused`](crate::copy::Refused) is for a
+/// refusal the store can name — [`Refused`] is for a
 /// store holding writes for a node — and failing quietly would be worse than
 /// failing loudly. Screening is
 /// [`Db`](crate::Db)'s job: it checks every key and value against the tree's
@@ -252,11 +258,11 @@ pub trait Store {
     /// returned nothing once, so a refusal through them reached only a list —
     /// the door #180 closed for `apply_batch`, left open beside it. They are
     /// not separate paths any more: no store implements them.
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), crate::copy::Refused> {
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Refused> {
         self.apply_batch(&[(key.to_vec(), Edit::Put(value.to_vec()))])
     }
     /// See [`Store::put`].
-    fn delete(&mut self, key: &[u8]) -> Result<(), crate::copy::Refused> {
+    fn delete(&mut self, key: &[u8]) -> Result<(), Refused> {
         self.apply_batch(&[(key.to_vec(), Edit::Delete)])
     }
 
@@ -273,13 +279,13 @@ pub trait Store {
     /// caller that knows which of two writes to one key is the later one.
     ///
     /// **A refusal is the RETURN VALUE** (craftworks-sdk#180). A store that
-    /// holds writes for a node — [`CachedStore`](crate::CachedStore) — may
+    /// holds writes for a node — the page's store — may
     /// refuse one before anything is applied: no room, no session, too large
     /// to send. It used to push the refusal onto a list and return `()`, and
     /// nothing read the list: `Db` answered `Created` for 45 of 300 writes the
     /// copy had refused. Returned, it cannot be missed — there is no second
     /// place to look.
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused>;
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused>;
     /// The id of the write this store made last, if it numbers them (M2's
     /// re-run: `Db` remembers what each of its writes MEANT by this id).
     fn last_write_id(&self) -> Option<u64> {
@@ -299,10 +305,17 @@ pub trait Store {
         Vec::new()
     }
 
-    /// A re-run made `write_id` as try `tries` of an earlier write: its
-    /// `Lost` re-sends count on from there (sdk#265, one budget).
-    fn carry_tries(&mut self, write_id: u64, tries: u8) {
-        let _ = (write_id, tries);
+    /// ONE BUDGET (sdk#265): the NEXT write made is a `Db` re-run of one
+    /// that had spent `tries`; the engine counts on from there. `0`: none.
+    fn carry_tries(&mut self, tries: u32) {
+        let _ = tries;
+    }
+
+    /// The one budget of tries a write has -- dead-commit re-sends and `Db`
+    /// re-runs together. The ENGINE owns the number; a store without one
+    /// never conflicts, and answers the engine's default.
+    fn max_write_tries(&self) -> u32 {
+        engine::Params::default().max_write_tries
     }
 
     /// Apply several edits as ONE change that says what it READ (M2,
@@ -315,7 +328,7 @@ pub trait Store {
         &mut self,
         reads: &[(Vec<u8>, protocol::Expect)],
         edits: &[(Vec<u8>, Edit)],
-    ) -> Result<(), crate::copy::Refused> {
+    ) -> Result<(), Refused> {
         let _ = reads;
         self.apply_batch(edits)
     }
@@ -329,9 +342,66 @@ pub struct ConflictChain {
     /// The keys whose reads no longer held (often the schema, a key no write
     /// in the chain wrote).
     pub keys: Vec<Vec<u8>>,
-    /// Tries the chain's writes already spent at the store (`Lost` re-sends,
-    /// sdk#265): ONE budget per write with `Db`'s re-runs, never one each.
-    pub tries: u8,
+    /// The most tries any write of the chain had spent in the engine
+    /// (dead-commit re-sends and earlier re-runs): its re-run draws on from
+    /// here -- ONE budget, sdk#265, never a count of `Db`'s own.
+    pub tries: u32,
+}
+
+/// Why a write was refused before it was applied anywhere.
+///
+/// Refused, not queued and not dropped: it reaches the app as an answer it
+/// can act on rather than as a write that quietly never happens. Each reason
+/// asks something different of the caller -- wait, reload, split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The page's write queue holds `bytes` of its `limit` (R-b; COMMIT-LIFE
+    /// K1). Nothing was applied. BACKPRESSURE: the queue drains as its writes
+    /// publish, and the same write made again then is taken -- the SDK's
+    /// `write()` waits for that, and says this only at the app's deadline.
+    QueueFull { bytes: usize, limit: usize },
+    /// The write, encoded, would be `bytes` against a wire limit of `limit`:
+    /// it cannot be SENT (craftworks-sdk#136).
+    TooLargeToSend { bytes: u64, limit: usize },
+    /// The ENGINE refused it as never acceptable: over `limit` of `bound` by
+    /// `got`. Sending it again is refused again, so splitting it is the
+    /// caller's call (craftworks-sdk#136).
+    TooLarge { bound: protocol::WriteBound, limit: u32, got: u32 },
+    /// The write changes a key it did not read (sdk#235, W8): refused at the
+    /// engine's door. The SDK's bug, never the person's.
+    Unread,
+    /// This page has NO SESSION: the browser gave it no randomness to mint one
+    /// (craftworks-sdk#146).
+    NoSession,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::QueueFull { bytes, limit } => {
+                write!(f, "{bytes} of {limit} bytes of writes are already waiting to be saved; wait for them, then try again")
+            }
+            Refused::NoSession => write!(
+                f,
+                "this page could not start a session (the browser gave it no randomness), so it cannot save; reload the page"
+            ),
+            Refused::TooLargeToSend { bytes, limit } => write!(
+                f,
+                "this write is {bytes} bytes as sent and the limit is {limit}; split it into smaller writes"
+            ),
+            Refused::TooLarge { bound, limit, got } => match bound {
+                protocol::WriteBound::CommitBlocks => write!(
+                    f,
+                    "this write would change {got} blocks at once and the limit is {limit}; split it into smaller writes"
+                ),
+                protocol::WriteBound::WriteBytes => write!(
+                    f,
+                    "this write is {got} bytes and the limit is {limit}; split it into smaller writes"
+                ),
+            },
+            Refused::Unread => write!(f, "the app's SDK wrote a key without reading it first; this is a bug in the SDK, not something you did"),
+        }
+    }
 }
 
 /// Sort by key and drop all but the LAST edit for each key.
@@ -352,7 +422,7 @@ pub fn sorted_edits(edits: Vec<(Vec<u8>, Edit)>) -> Vec<(Vec<u8>, Edit)> {
 pub struct MemStore(BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl Store for MemStore {
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
         for (k, e) in edits {
             match e {
                 Edit::Put(v) => {

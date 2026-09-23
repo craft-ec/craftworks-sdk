@@ -842,7 +842,6 @@ fn no_read_sequence_panics_and_every_read_answers() {
                 // Scaled, the fixed worst case is ~21 KiB, leaving the parked
                 // reads -- what this test parks -- the rest.
                 max_asks: 32,
-                max_parked_write_bytes: 4 * 1024,
                 max_commit_blocks: 16,
                 max_carried_ops_bytes: 2 * 1024,
                 max_subscriptions: 4,

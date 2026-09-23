@@ -44,7 +44,7 @@ fn cold() -> (PageNode, Tab) {
         }
     }
     publisher.seconds(10);
-    assert_eq!(publisher.db.store().writes.unsaved_writes(), 0, "the publisher's tree did not publish");
+    assert_eq!(publisher.db.store().unsaved_writes(), 0, "the publisher's tree did not publish");
     let page = Tab::open(&node, SystemEnv, [7u8; 4]);
     (node, page)
 }

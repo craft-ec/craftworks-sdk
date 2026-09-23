@@ -173,16 +173,17 @@ fn a_context_from_the_previous_version_is_refused() {
     );
 
     // The version sits at bytes [4..6], after the magic. The PREVIOUS one is
-    // 10: sdk#174's 11 counts a parked write's silence in ticks run
-    // (`idle_ticks`, `idle_at`) where 10 kept a `heard_at` stamp, a shape a
-    // v10 context would decode into as nonsense.
+    // 11: R-b's 12 carries the parked write as FETCH STATE only (its ops are
+    // in the page's queue) and a commit's `through`, a shape a v11 context
+    // (the parked write's ops, root and bytes inline) would decode into as
+    // nonsense.
     assert_eq!(
         u16::from_le_bytes([ctx[4], ctx[5]]),
-        11,
+        12,
         "this build's version moved: name the previous one here"
     );
     let mut old = ctx.clone();
-    old[4..6].copy_from_slice(&10u16.to_le_bytes());
+    old[4..6].copy_from_slice(&11u16.to_le_bytes());
     let (_, recovered) =
         engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
     assert!(

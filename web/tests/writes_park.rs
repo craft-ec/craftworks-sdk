@@ -117,7 +117,13 @@ fn control_the_reader_finds_real_bodies() {
     );
 }
 
-/// **THE PAGE'S TICK REACHES THE STORE'S TICK.**
+/// **THE PAGE'S TICK REACHES THE STORE'S TICK, AND TIMES NO WRITE OUT.**
+///
+/// R-b (sdk#291): the outbox is gone with its timeout. A write waiting its
+/// turn behind the engine's own commits is not "unanswered", and the tick must
+/// never roll one back: `Session::tick` runs the STORE's tick (its tickets'
+/// lifetimes) and nothing that times a write out. The history below is why
+/// the call site is checked at all.
 ///
 /// `Session::tick` called `self.db.store_mut().copy.time_out(now)` — straight
 /// to the COPY, which rolls back writes that waited too long and does nothing
@@ -139,11 +145,12 @@ fn control_the_reader_finds_real_bodies() {
 fn the_page_tick_goes_through_the_store_tick() {
     let body = body_of("tick");
     assert!(
-        body.contains("store_mut().writes.tick()"),
-        "`Session::tick` does not call the store's own tick. Whatever it calls \
-         instead, everything `CachedStore::tick` decides — draining the outbox \
-         of writes the engine refused `Busy`, which nothing else re-sends — \
-         does not happen on a page."
+        body.contains("self.db.store_mut().tick(now)"),
+        "`Session::tick` does not call the store's own tick (its tickets' lifetimes)."
+    );
+    assert!(
+        !body.contains("writes.tick()"),
+        "`Session::tick` calls a write-half tick: nothing may time a queued write out (sdk#291)."
     );
     assert!(
         !body.contains("copy.time_out"),
@@ -190,17 +197,17 @@ fn the_decision_is_delegated_to_the_sdk() {
     );
 }
 
-/// sdk#174: THE PAGE'S TICK ASKS AFTER A PARKED WRITE. A cold write the engine
-/// parks continues only when its client asks after it; nothing else asks. A
-/// `tick` that stopped calling `ask_unheard` leaves every such write parked
-/// until the engine releases it -- with every native test green, because they
-/// drive the store directly.
+/// sdk#174: THE PAGE'S TICK ASKS AFTER A WRITE STILL APPLYING. A cold write
+/// whose path needs more blocks than one chain fetches continues only when
+/// its client asks after it; nothing else asks. A `tick` that stopped asking
+/// leaves such a write `Applying` until the engine fails it -- with every
+/// native test green, because they drive the store directly.
 #[test]
 fn the_tick_asks_after_quiet_writes() {
     let body = body_of("tick");
     assert!(
-        calls(&body, ".ask_unheard(now);"),
-        "`Session::tick` no longer asks after the writes the engine went quiet on (sdk#174)"
+        calls(&body, ".ask_after_applying();"),
+        "`Session::tick` no longer asks after the write the engine is still applying (sdk#174)"
     );
 }
 

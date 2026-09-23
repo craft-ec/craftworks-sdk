@@ -73,18 +73,23 @@ fn a_write_with_no_reads_is_refused() {
 // an engine that has not read its head is a PAGE that has not asked
 // `Identity`, which the testkit fixture builds (fixture-gate).
 
-/// **During a commit: Unread, never Busy** — the door comes before Busy, so
-/// a malformed write is refused in the same words whatever the engine is doing.
+/// **During a commit: Unread** — the door comes before the queue, so a
+/// malformed write is refused in the same words whatever the engine is doing.
 #[test]
 fn during_a_commit_an_unread_write_is_unread_not_busy() {
     let mut e = recovered();
     let first = e.step(write(1, vec![("k/a", Op::Put(vec![1; 3000]))], vec![("k/a", Expect::Absent)]));
     assert!(told(&first, 1).contains(&State::Accepted), "{first:?}");
+    // The page keeps what the engine emits (its warm blocks among them).
+    e.blocks().absorb(&first);
     let fx = e.step(write(2, vec![("k/b", Op::Put(b"2".to_vec()))], vec![]));
-    assert_eq!(told(&fx, 2), vec![State::Unread], "judged after Busy, not at the door: {fx:?}");
-    // THE CONTROL: a well-formed write now is Busy, so a commit IS in flight.
-    let busy = e.step(write(3, vec![("k/c", Op::Put(b"3".to_vec()))], vec![("k/c", Expect::Absent)]));
-    assert_eq!(told(&busy, 3), vec![State::Busy], "THE CONTROL: no commit was in flight, so this proves nothing");
+    assert_eq!(told(&fx, 2), vec![State::Unread], "judged after the queue, not at the door: {fx:?}");
+    assert_eq!(e.queued_writes(), 1, "a write refused at the door joined the queue");
+    // THE CONTROL: a well-formed write now QUEUES behind the commit (R-b), so
+    // a commit IS in flight.
+    let queued = e.step(write(3, vec![("k/c", Op::Put(b"3".to_vec()))], vec![("k/c", Expect::Absent)]));
+    assert_eq!(told(&queued, 3), vec![State::Accepted], "THE CONTROL: a well-formed write was not taken");
+    assert_eq!(e.queued_writes(), 2, "THE CONTROL: no commit was in flight, so this proves nothing");
 }
 
 /// **`Any` is accepted, holds against any tree, and is COUNTED.**
