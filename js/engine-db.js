@@ -118,6 +118,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
   // is what knows when a message arrived, so when there is one this registers
   // with it and a parked read is woken by the answer rather than by a clock.
   const session = handle.session ?? handle;
+  // SCRATCH PROBE (#330 diagnosis): every session, for the demo's sampler.
+  (globalThis.__cwSessions ??= []).push(session);
   // Reads parked on a load, by ticket id. Resolved when the SESSION says the
   // load ended — which happens on the task that handles the websocket
   // message, not on a timer and not in a microtask.

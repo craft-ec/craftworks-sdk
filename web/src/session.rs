@@ -686,6 +686,47 @@ impl Session {
         }
     }
 
+    /// SCRATCH PROBE (#330 regression diagnosis; not for a PR): the read
+    /// side at this moment — every ticket (pinned root, age, end), the page's
+    /// waiting ops, the head this page reads at, and what the node answered
+    /// for each block a GET waits on.
+    pub fn read_probe(&self) -> String {
+        let hx = |c: &[u8]| c[..6].iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let (tickets, pinned) = self.db.store().probe();
+        let tickets: Vec<serde_json::Value> = tickets
+            .iter()
+            .map(|(id, root, age, ended, qw)| serde_json::json!({"id": id, "root": root.map(|r| hx(&r)), "ageMs": age, "ended": ended, "queueWait": qw}))
+            .collect();
+        let Some(p) = self.page() else {
+            return serde_json::json!({"tickets": tickets, "pinned": pinned.map(|r| hx(&r)), "page": null}).to_string();
+        };
+        let (waits, queued) = p.server.page.probe_waits();
+        let (seq, root) = p.server.page.published();
+        let reg = p.probe_register_id();
+        let mut answers = serde_json::Map::new();
+        for (w, ..) in &waits {
+            if let Some(h) = w.strip_prefix("Get(").and_then(|x| x.strip_suffix(')')) {
+                // the block's contract, by the short cid
+                let cid = p.server.page.probe_find_cid(h);
+                if let Some(k) = cid.and_then(|c| p.probe_contract_of(&c)) {
+                    answers.insert(h.to_string(), serde_json::json!(p.probe_answers.get(&k).copied().unwrap_or_default()));
+                }
+            }
+        }
+        serde_json::json!({
+            "tickets": tickets,
+            "pinned": pinned.map(|r| hx(&r)),
+            "readRoot": p.server.read_root().map(|r| hx(&r)),
+            "published": {"seq": seq, "root": hx(&root)},
+            "waits": waits.iter().map(|(w, a, ms, sent)| serde_json::json!({"w": w, "attempt": a, "ms": ms, "sent": sent})).collect::<Vec<_>>(),
+            "queued": queued,
+            "answersForWaits": answers,
+            "headAnswers": p.probe_answers.get(&reg).copied().unwrap_or_default(),
+            "headChanges": p.probe_head_changes,
+        })
+        .to_string()
+    }
+
     /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
     /// `{"state":"none"|"pending"|"put"|"refused"|"failed","said":"…"}`.
     /// It always ENDS (the page's budget): `refused` carries the node's words,

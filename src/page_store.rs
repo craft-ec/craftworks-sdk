@@ -409,6 +409,19 @@ impl<H: Host> PageStore<H> {
         self.tickets.retain(|_, t| t.ended.is_none() || now.saturating_sub(t.at_ms) < TICKET_LIFE_MS);
     }
 
+    /// SCRATCH PROBE (#330 diagnosis): every ticket `(id, root, age ms,
+    /// ended, waits on a write)`, and the pinned root.
+    pub fn probe(&self) -> (Vec<(u64, Option<Cid>, u64, Option<&'static str>, bool)>, Option<Cid>) {
+        let now = (self.now_ms)();
+        (
+            self.tickets
+                .iter()
+                .map(|(id, t)| (*id, t.root, now.saturating_sub(t.at_ms), t.ended.map(|e| e.code()), t.queue_wait.is_some()))
+                .collect(),
+            self.pinned,
+        )
+    }
+
     /// Tickets still open (not ended). What the model asserts is zero at rest.
     pub fn open_tickets(&self) -> usize {
         self.tickets.values().filter(|t| t.ended.is_none()).count()
