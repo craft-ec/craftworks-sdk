@@ -1133,6 +1133,57 @@ fn asking_whose_node_registers_mints_and_provisions_nothing() {
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
 }
 
+/// A VISITOR LEAVES NO TRACE, frame by frame: on a node without the signer
+/// (it answers EMPTY, as a real 0.2.136 node does), every frame the asking
+/// page sends is the Register QUERY, and none is a registration. And every
+/// EMPTY is an answer to a query: the page counts exactly as many as the node
+/// served. A page that took the first EMPTY for its signer's registration
+/// (the page never registered one) would ask one query more than it counts.
+#[test]
+fn asking_on_a_visitors_node_sends_only_the_query_and_counts_every_empty_answer() {
+    let mut node = WireNode::unprovisioned(&[11u8; 32]);
+    node.empty_signer_answers = usize::MAX;
+    let mut io = asker();
+    let mut now = 1_000u64;
+    let mut sent = Vec::new();
+    for _ in 0..2_000 {
+        let frames = io.take_frames();
+        if frames.is_empty() {
+            match io.next_due() {
+                Some(Ms(t)) => {
+                    now = now.max(t);
+                    io.tick(Ms(now));
+                    continue;
+                }
+                None => break,
+            }
+        }
+        sent.extend(kinds(&frames));
+        now += 1;
+        for f in frames {
+            if let Some(answer) = node.serve(&f) {
+                io.inbound(&answer, Ms(now));
+            }
+        }
+    }
+    assert!(!sent.is_empty(), "the asking page sent nothing: the check below could not fail");
+    assert!(sent.iter().all(|k| *k == "signer"), "asking sent a frame that is not the query: {sent:?}");
+    assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
+    assert!(!io.provisioned() && node.secrets.is_empty(), "asking provisioned the visitor's node");
+    let served = node.served.get("signer").copied().unwrap_or(0);
+    let counted = match io.asked() {
+        Some(page_io::Asked::Refused(w)) => w
+            .split("EMPTY ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("the refusal does not say how many EMPTY answers: {w}")),
+        other => panic!("a node without the signer was not refused: {other:?}"),
+    };
+    assert_eq!(counted, served, "the node answered {served} queries EMPTY and the page counted {counted}: an EMPTY was taken for something else");
+    assert_eq!(sent.len(), served, "frames sent {sent:?} against queries served {served}");
+}
+
 /// THE CONTROL: the page that OPENS (`begin`) does register the signer — so
 /// the "no registration" check above is one that can fail.
 #[test]
