@@ -40,6 +40,9 @@ async function own() {
   const sock = {};
   const h = await openSession(Session, {
     port: 7999,
+    // Every real session is an app's (open() requires one); a write with no
+    // app is refused for THAT before the tree's read-only is ever asked.
+    app: "notes-app",
     artefacts: { delegate: "d", block: "b", register: "r" },
     fetch: async url => ({ ok: true, arrayBuffer: async () => enc(`${url} code`).buffer }),
     connect: (engine, { onEvent }) => { sock.engine = engine; sock.emit = onEvent; return { pump() {}, close() {} }; },
@@ -62,7 +65,8 @@ await t("**tree() is a read-only Db on the SAME session: every write refused, th
     const bounded = () => Promise.race([write(), new Promise((_, no) => setTimeout(() => no(new Error("the write was not refused: it is waiting on the node")), 2000))]);
     await assert.rejects(bounded, e => e.code === "REFUSED" && /^read-only: /.test(e.message));
   }
-  assert.equal(h.readOnly(), false, "THE CONTROL: the person's own session still writes");
+  assert.equal(h.canWrite().answer, "yes", "THE CONTROL: the person's own session still writes");
+  assert.equal(h.canWrite(HEAD_A).answer !== "yes", true, "the own session may write somebody else's head");
 });
 
 await t("**a tree installs nothing on the node: its frames on the shared socket are GETs, its head watched**", async () => {

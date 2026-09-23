@@ -468,8 +468,17 @@ export async function openSession(Session, {
     provisioned: () => session.provisioned(),
     /** `provision: "ask"`'s answer (`openAsked`): this session's identity here. */
     asked: () => JSON.parse(session.asked()),
-    // This person's own session writes; a tree handle (below) is read-only.
-    readOnly: () => session.read_only(),
+    /**
+     * MAY THIS SESSION WRITE `head`? ("" = its own tree: a `viewer`
+     * component's.) `{answer: "yes"|"no"|"unknown", why}`, decided in Rust
+     * from the signer's answer each time it is asked -- a runtime ASKS it
+     * each render and keeps no copy (one owner). "unknown": show the inputs
+     * disabled, with `why`.
+     */
+    canWrite: (head = "") => JSON.parse(session.can_write(head)),
+    // `openAsked`'s `openOwn` in two halves: this one claims the tree and
+    // sends what that made (sync); `openAsked` waits for it to open.
+    claimOwn: () => { const r = JSON.parse(session.open_own()); conn.pump(); return r; },
     // The head this session stands on, as `tree()` takes it (hex; "" until
     // Identity has named it). What a publisher records so others can read it.
     headId: () => session.head_id(),
@@ -584,13 +593,27 @@ export async function openAsked(Session, { port, artefacts, pollMs = 100, ...res
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("openAsked() needs a port");
   if (!artefacts) throw new Error("openAsked() needs the artefacts: the signer's code names it");
   const handle = await openSession(Session, { ...rest, port, artefacts, provision: "ask" });
+  // The session's own db: the viewer's own tree once `openOwn` opened it, and
+  // the publisher's own tree on the publisher's node (the same tree).
+  const db = engineDb(handle);
+  /**
+   * OPEN THE VIEWER'S OWN TREE (DATA-SOURCE `viewer`): the node's key is used
+   * where it has one, minted where it has none (the existing provision path),
+   * and the tree's head is created by its first write. Resolves
+   * `canWrite("")` once the tree is open.
+   */
+  const openOwn = async () => {
+    const r = handle.claimOwn();
+    if (r.answer === "yes" && !handle.provisioned()) await untilProvisioned(handle, rest);
+    return handle.canWrite("");
+  };
   try {
     for (;;) {
       const a = handle.asked();
-      if (a.state === "register") return { ...handle, head: a.register, why: null };
-      if (a.state !== "pending") return { ...handle, head: null, why: a.said || a.state };
+      if (a.state === "register") return { ...handle, db, openOwn, head: a.register, why: null };
+      if (a.state !== "pending") return { ...handle, db, openOwn, head: null, why: a.said || a.state };
       // A node that never opened ends it too (sdk#292's rule).
-      if (handle.refusedBeforeOpen() >= 2) return { ...handle, head: null, why: "the node refused the connection" };
+      if (handle.refusedBeforeOpen() >= 2) return { ...handle, db, openOwn, head: null, why: "the node refused the connection" };
       await new Promise(r => setTimeout(r, pollMs));
     }
   } catch (e) {

@@ -100,7 +100,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     // socket — the head it names, that it writes nothing, and whose frames
     // are whose. An in-memory store is one tree and has no socket.
     "open_named",
-    "read_only",
+    // THE ONE DECISION (DATA-SOURCE): may this session write a head, and
+    // opening the viewer's own tree on an asked session. An in-memory store
+    // is one tree with no signer to ask.
+    "can_write",
+    "open_own",
     "head_id",
     "unowned",
     // How this session finds out the head moved, and whether it is being
