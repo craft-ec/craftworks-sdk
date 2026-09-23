@@ -69,4 +69,15 @@ await t("THE CONTROL: a hash that is not the file's is refused", async () => {
   assert.ok(found.some(d => /block: block\.wasm does not hash/.test(d)), `not refused: ${found}`);
 });
 
+await t("**`modules` names EVERY module the package needs, each present (sdk#312)**", async () => {
+  // A consumer that ships the SDK's JS (the builder's app container) takes
+  // this list instead of its own; a hand list missed rto.js the day it came.
+  const { reachable } = await import(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "tools", "reachable.mjs"));
+  const want = [...reachable(join(web, "index.js"), web)].sort();
+  assert.ok(Array.isArray(manifest.modules), "artefacts.json has no `modules` list");
+  assert.deepEqual([...manifest.modules].sort(), want, "`modules` is not what reachable.mjs computes");
+  assert.ok(manifest.modules.includes("rto.js"), "THE CONTROL: rto.js (sdk#312) is not named");
+  for (const m of manifest.modules) assert.ok(existsSync(join(web, m)), `${m} is named but not in pkg/web`);
+});
+
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }

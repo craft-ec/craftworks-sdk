@@ -237,7 +237,10 @@ export async function openSession(Session, {
       );
     }
     blockCode = block;
-    session.provision(signer, block, register);
+    // "ask": only ASK this node's signer whose it is (`openAsked`) —
+    // nothing registered, minted or provisioned.
+    if (provision === "ask") session.ask_signer(signer, block, register);
+    else session.provision(signer, block, register);
   }
 
   // THE UNSAVED-CHANGES GUARD (craftworks-sdk#163).
@@ -463,6 +466,8 @@ export async function openSession(Session, {
   return {
     session,
     provisioned: () => session.provisioned(),
+    /** `provision: "ask"`'s answer (`openAsked`): this session's identity here. */
+    asked: () => JSON.parse(session.asked()),
     // This person's own session writes; a tree handle (below) is read-only.
     readOnly: () => session.read_only(),
     // The head this session stands on, as `tree()` takes it (hex; "" until
@@ -565,6 +570,35 @@ export async function openSession(Session, {
  * So the SDK does it. `engineDb(session)` stays exported for tests, where
  * driving the parts separately is the whole point.
  */
+/**
+ * OPEN A SESSION THAT ASKS WHOSE NODE THIS IS: the node's existing signer is
+ * asked which Register (head) it signs for — registering, minting and
+ * provisioning NOTHING — and the SESSION STAYS OPEN: its `asked()` is this
+ * page's identity on this node, read from the session and cached nowhere
+ * else. Resolves the handle with `head` (the node's signer signs for it) or
+ * `head: null` and `why` (no signer, no key, refused, not answering: the
+ * first request's own ends). The handle reads trees (`tree`) like any other;
+ * a caller that is done with it closes it.
+ */
+export async function openAsked(Session, { port, artefacts, pollMs = 100, ...rest } = {}) {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("openAsked() needs a port");
+  if (!artefacts) throw new Error("openAsked() needs the artefacts: the signer's code names it");
+  const handle = await openSession(Session, { ...rest, port, artefacts, provision: "ask" });
+  try {
+    for (;;) {
+      const a = handle.asked();
+      if (a.state === "register") return { ...handle, head: a.register, why: null };
+      if (a.state !== "pending") return { ...handle, head: null, why: a.said || a.state };
+      // A node that never opened ends it too (sdk#292's rule).
+      if (handle.refusedBeforeOpen() >= 2) return { ...handle, head: null, why: "the node refused the connection" };
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+  } catch (e) {
+    handle.close();
+    throw e;
+  }
+}
+
 export async function open(Session, opts = {}) {
   // NO APP, NO SESSION: a person's tree is divided by app, and a session with
   // no app would write outside every app's space (the forest ruling).

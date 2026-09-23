@@ -454,6 +454,43 @@ impl Session {
         self.provision_page(block, register);
     }
 
+    /// WHOSE NODE IS THIS: ask the node's EXISTING signer which Register it
+    /// signs for, registering nothing (`PageIo::ask`). A publisher's page
+    /// compares the answer with the app's publisher head: equal, the person
+    /// opening it holds the key on this node, and it opens WRITABLE through
+    /// `provision`; otherwise it is a visitor, and nothing was installed or
+    /// minted here. The answer: [`Session::asked`].
+    pub fn ask_signer(&mut self, signer: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
+        if self.page().is_some() {
+            self.unusable.push("ask_signer: this session already has a page".into());
+            return;
+        }
+        let (_, key) = wire::delegate_from_code(&signer);
+        let art = page_io::Artefacts { block_code: block, register_code: register, register_params: Vec::new(), signer: key };
+        let server = page::server::Server::new(
+            page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
+            page::server::SignerFacts::default(),
+        );
+        let mut io = page_io::PageIo::new(server, art);
+        io.ask();
+        self.db.store_mut().set_host(io);
+        self.pump_page();
+    }
+
+    /// [`Session::ask_signer`]'s answer, as JSON:
+    /// `{"state":"pending"|"register"|"nokey"|"refused"|"silent","register":"<hex>","said":"…"}`.
+    pub fn asked(&self) -> String {
+        use page_io::Asked;
+        let (state, register, said) = match self.page().and_then(|p| p.asked()) {
+            None => ("pending", String::new(), String::new()),
+            Some(Asked::Register(id)) => ("register", craftworks_sdk::hex(id), String::new()),
+            Some(Asked::NoKey) => ("nokey", String::new(), String::new()),
+            Some(Asked::Refused(w)) => ("refused", String::new(), w.clone()),
+            Some(Asked::NotAnswering) => ("silent", String::new(), String::new()),
+        };
+        serde_json::json!({ "state": state, "register": register, "said": said }).to_string()
+    }
+
     /// The provisioning: a TEST key minted here and FORGOTTEN (as the
     /// delegate path's; real keys are sdk#14), the head Register named by it,
     /// and the SIGNER registered and provisioned — all through `page-io`. The
