@@ -75,4 +75,19 @@ await t("a gate that scanned NOTHING could not check: exit 2, never a pass", asy
   assert.match(r.out, /COULD NOT CHECK/);
 });
 
+await t("**run from a COPY in a temp dir (how the builder runs it), it still RUNS: never a silent exit 0**", async () => {
+  // A URL comparison for "am I the script?" missed under macOS's /var ->
+  // /private/var symlink, and the gate exited 0 having checked nothing.
+  const { copyFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "dup-gate-copy-"));
+  copyFileSync(GATE, join(dir, "dup-gate.mjs"));
+  const root = tree({ "a.rs": fnText("alpha", 3), "b.rs": fnText("alpha", 3) });
+  let r;
+  try { r = { code: 0, out: execFileSync("node", [join(dir, "dup-gate.mjs"), "--root", root], { encoding: "utf8" }) }; }
+  catch (e) { r = { code: e.status, out: String(e.stdout) }; }
+  rmSync(dir, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true });
+  assert.equal(r.code, 1, `the copied gate did not run: exit ${r.code}, output:\n${r.out}`);
+  assert.match(r.out, /^dup-gate: /m);
+});
+
 if (failures) { console.log(`${failures} failing`); process.exit(1); }

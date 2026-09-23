@@ -82,4 +82,18 @@ await t("no OWNERS file could not check: exit 2, never a pass", async () => {
   assert.equal(r.code, 2, r.out);
 });
 
+await t("run from a COPY in a temp dir, it still RUNS (never a silent exit 0)", async () => {
+  const { copyFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "owners-copy-"));
+  copyFileSync(CHECK, join(dir, "owners.mjs"));
+  const { root, change, done } = repo();
+  change("engine/a.rs", "engine");
+  change("signer/b.rs", "and the signer");
+  let r;
+  try { r = { code: 0, out: execFileSync("node", [join(dir, "owners.mjs"), "--root", root, "--base", "base"], { encoding: "utf8", env: { ...process.env, PR_BODY: "" } }) }; }
+  catch (e) { r = { code: e.status, out: String(e.stdout) }; }
+  done(); rmSync(dir, { recursive: true, force: true });
+  assert.equal(r.code, 1, `the copied check did not run: exit ${r.code}\n${r.out}`);
+});
+
 if (failures) { console.log(`${failures} failing`); process.exit(1); }

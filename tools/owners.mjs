@@ -19,8 +19,9 @@
 // with its own OWNERS.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const arg = (name, fallback = null) => {
   const i = process.argv.indexOf(name);
@@ -105,4 +106,7 @@ export function main() {
   return 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exit(main());
+// Run as a script, however it was reached: compared as REAL paths, because a
+// symlinked directory (macOS /var -> /private/var) made a URL comparison miss,
+// and a missed entry exits 0 having checked nothing.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) process.exit(main());

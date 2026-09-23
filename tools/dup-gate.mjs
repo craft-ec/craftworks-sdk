@@ -21,9 +21,10 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const JSCPD = "jscpd@4.0.9";
 
@@ -102,4 +103,7 @@ export function main() {
   return added.length ? 1 : 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exit(main());
+// Run as a script, however it was reached: compared as REAL paths, because a
+// symlinked directory (macOS /var -> /private/var) made a URL comparison miss,
+// and a missed entry exits 0 having checked nothing.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) process.exit(main());
