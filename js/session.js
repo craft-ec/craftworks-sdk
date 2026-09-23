@@ -143,7 +143,7 @@ export async function openSession(Session, {
   port,
   artefacts = null,
   // Provision this person's OWN tree on the node (install the engine and
-  // hand it a key). FALSE opens the socket and installs NOTHING: a visitor who
+  // hand it a key). FALSE opens the socket and installs NOTHING: a user who
   // only reads other people's trees (`tree`) leaves no trace on the node, and
   // their own tree is not created until they have something to write
   // (builder#104). The artefacts are still used — `tree` needs the Block code.
@@ -469,7 +469,7 @@ export async function openSession(Session, {
     /** `provision: "ask"`'s answer (`openAsked`): this session's identity here. */
     asked: () => JSON.parse(session.asked()),
     /**
-     * MAY THIS SESSION WRITE `head`? ("" = its own tree: a `viewer`
+     * MAY THIS SESSION WRITE `head`? ("" = its own tree: a `mine`
      * component's.) `{answer: "yes"|"no"|"unknown", why}`, decided in Rust
      * from the signer's answer each time it is asked -- a runtime ASKS it
      * each render and keeps no copy (one owner). "unknown": show the inputs
@@ -593,11 +593,11 @@ export async function openAsked(Session, { port, artefacts, pollMs = 100, ...res
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("openAsked() needs a port");
   if (!artefacts) throw new Error("openAsked() needs the artefacts: the signer's code names it");
   const handle = await openSession(Session, { ...rest, port, artefacts, provision: "ask" });
-  // The session's own db: the viewer's own tree once `openOwn` opened it, and
+  // The session's own db: the user's own tree once `openOwn` opened it, and
   // the publisher's own tree on the publisher's node (the same tree).
   const db = engineDb(handle);
   /**
-   * OPEN THE VIEWER'S OWN TREE (DATA-SOURCE `viewer`): the node's key is used
+   * OPEN THE USER'S OWN TREE (DATA-SOURCE `mine`): the node's key is used
    * where it has one, minted where it has none (the existing provision path),
    * and the tree's head is created by its first write. Resolves
    * `canWrite("")` once the tree is open.

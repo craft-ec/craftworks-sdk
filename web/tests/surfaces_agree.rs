@@ -101,7 +101,7 @@ const TRANSPORT_ONLY: &[&str] = &[
     // are whose. An in-memory store is one tree and has no socket.
     "open_named",
     // THE ONE DECISION (DATA-SOURCE): may this session write a head, and
-    // opening the viewer's own tree on an asked session. An in-memory store
+    // opening the user's own tree on an asked session. An in-memory store
     // is one tree with no signer to ask.
     "can_write",
     "open_own",
