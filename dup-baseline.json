@@ -1,0 +1,144 @@
+{
+ "tool": "jscpd@4.0.9",
+ "note": "known duplicates, to be worked DOWN (craftworks-sdk#320)",
+ "clones": [
+  {
+   "key": "c2cefdef6e9a44de",
+   "a": "engine/src/subs.rs:339-345",
+   "b": "engine/src/subs.rs:294-300",
+   "lines": 7
+  },
+  {
+   "key": "63b7296b24c92707",
+   "a": "page-io/src/lib.rs:759-764",
+   "b": "page-io/src/lib.rs:359-364",
+   "lines": 6
+  },
+  {
+   "key": "22de322bec262401",
+   "a": "probe/src/bin/live-page-writes.rs:216-222",
+   "b": "probe/src/bin/live-page-writes.rs:81-87",
+   "lines": 7
+  },
+  {
+   "key": "c0910e95c2f5e4ce",
+   "a": "probe/src/bin/live-page-writes.rs:32-38",
+   "b": "probe/src/bin/live-signer.rs:340-355",
+   "lines": 7
+  },
+  {
+   "key": "5ca0629cd797fd44",
+   "a": "probe/src/bin/live-signer.rs:44-53",
+   "b": "probe/src/bin/two-connections.rs:138-147",
+   "lines": 10
+  },
+  {
+   "key": "e2a3750844311d55",
+   "a": "probe/src/bin/platform-probe.rs:136-155",
+   "b": "probe/src/bin/two-connections.rs:58-77",
+   "lines": 20
+  },
+  {
+   "key": "d004905d6e22ccad",
+   "a": "probe/src/bin/platform-probe.rs:156-161",
+   "b": "probe/src/bin/two-connections.rs:78-83",
+   "lines": 6
+  },
+  {
+   "key": "9a5db9857ec324fc",
+   "a": "probe/src/bin/platform-probe.rs:264-273",
+   "b": "probe/src/bin/two-connections.rs:130-138",
+   "lines": 10
+  },
+  {
+   "key": "14e8a560d331cfc6",
+   "a": "probe/src/bin/platform-probe.rs:273-283",
+   "b": "probe/src/bin/two-connections.rs:138-148",
+   "lines": 11
+  },
+  {
+   "key": "c7e499dd221049a7",
+   "a": "probe/src/bin/platform-probe.rs:46-64",
+   "b": "probe/src/bin/two-connections.rs:37-55",
+   "lines": 19
+  },
+  {
+   "key": "03266b223c232e32",
+   "a": "probe/src/bin/platform-probe.rs:606-621",
+   "b": "probe/src/bin/platform-probe.rs:355-370",
+   "lines": 16
+  },
+  {
+   "key": "e22c301b465b18ab",
+   "a": "probe/src/lib.rs:497-507",
+   "b": "probe/src/lib.rs:469-479",
+   "lines": 11
+  },
+  {
+   "key": "a76c0fc830903317",
+   "a": "probe/src/node.rs:114-121",
+   "b": "probe/src/node.rs:83-90",
+   "lines": 8
+  },
+  {
+   "key": "99ae7adc771324fa",
+   "a": "src/engine_store.rs:434-440",
+   "b": "src/writes.rs:143-149",
+   "lines": 7
+  },
+  {
+   "key": "f553360aabb008e5",
+   "a": "src/engine_store.rs:459-473",
+   "b": "src/store.rs:442-514",
+   "lines": 15
+  },
+  {
+   "key": "fbed221ef6446351",
+   "a": "src/expected.rs:309-314",
+   "b": "src/expected.rs:296-301",
+   "lines": 6
+  },
+  {
+   "key": "95061662a04ad6b9",
+   "a": "src/live.rs:279-292",
+   "b": "src/live.rs:258-271",
+   "lines": 14
+  },
+  {
+   "key": "360a5624786fdc67",
+   "a": "src/store.rs:443-451",
+   "b": "src/tree_store.rs:501-510",
+   "lines": 9
+  },
+  {
+   "key": "891197a8a0f41647",
+   "a": "src/tree_store.rs:571-577",
+   "b": "engine/src/read.rs:386-391",
+   "lines": 7
+  },
+  {
+   "key": "2b71955a529be7ad",
+   "a": "testkit/src/page_node.rs:565-571",
+   "b": "testkit/src/page_node.rs:506-512",
+   "lines": 7
+  },
+  {
+   "key": "022cbf85204ee1bd",
+   "a": "web/src/lib.rs:253-266",
+   "b": "web/src/lib.rs:236-245",
+   "lines": 14
+  },
+  {
+   "key": "e9a091afd566b792",
+   "a": "wire/src/block.rs:34-43",
+   "b": "contract-keys/src/block.rs:26-35",
+   "lines": 10
+  },
+  {
+   "key": "355e24afb3876de2",
+   "a": "wire/src/lib.rs:622-628",
+   "b": "wire/src/lib.rs:605-611",
+   "lines": 7
+  }
+ ]
+}
