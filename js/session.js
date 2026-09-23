@@ -325,10 +325,15 @@ export async function openSession(Session, {
   // an unopened socket would otherwise be reported as "the signer is not
   // answering" when the node is simply not running (sdk#263 follow-up).
   let everOpened = false;
+  // How many times the socket was REFUSED before it ever opened: a close or
+  // an error with no open behind it. Two of them is a node that is not
+  // there, a fact available in about a second (builder#102's no-node shot).
+  let refusedBeforeOpen = 0;
   const conn = connectWith(socketEngine, {
     url: session.url(),
     onEvent: e => {
       if (e.kind === "open") everOpened = true;
+      if (!everOpened && (e.kind === "closed" || e.kind === "error")) refusedBeforeOpen += 1;
       // A new socket means the stream ids restart, so a half-received
       // chunked reply from the old one must not be completed with bytes
       // from this one.
@@ -506,6 +511,8 @@ export async function openSession(Session, {
     refused: () => session.refused(),
     /** Has a socket to this node EVER opened? See `everOpened`. */
     connectedOnce: () => everOpened,
+    /** Refusals of the socket before it ever opened. See `refusedBeforeOpen`. */
+    refusedBeforeOpen: () => refusedBeforeOpen,
     /** Which node this session is for, as the page named it. */
     url: () => session.url(),
     unusable: () => JSON.parse(session.unusable()),
@@ -594,7 +601,11 @@ export async function open(Session, opts = {}) {
  * The not-running end comes FIRST among the failures, because page-io counts
  * an unanswered ask the same way whether the node ignored it or was never
  * there — and "the signer is not answering" sends someone to look at a node
- * that is not running (sdk#263 follow-up).
+ * that is not running (sdk#263 follow-up). And it comes FAST: a socket that
+ * never opened and was refused twice is a node that is not there, known in
+ * about a second — not after page-io's re-asks are spent or the budget runs
+ * out, a person watching "setting up" the whole time (builder#102: the
+ * no-node publish shot waited 7.5 s and never saw it end).
  */
 export async function untilProvisioned(handle, {
   provisionBudgetMs = 60_000, provisionEveryMs = 100,
@@ -608,6 +619,9 @@ export async function untilProvisioned(handle, {
     if (refused) throw new Error(`the node refused to set up: ${refused}`);
     const never = handle.connectedOnce ? !handle.connectedOnce() : false;
     const at = handle.url?.() ? ` at ${handle.url()}` : "";
+    if (never && (handle.refusedBeforeOpen?.() ?? 0) >= 2) {
+      throw new Error(`nothing answered${at}: the connection was refused and never opened — is the node running?`);
+    }
     if (handle.exhausted?.()) {
       throw new Error(never
         ? `nothing answered${at}: no connection was ever made — is the node running?`

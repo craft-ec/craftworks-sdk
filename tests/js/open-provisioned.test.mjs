@@ -68,6 +68,24 @@ await t("**a node that is NOT RUNNING is named as that, not as a silent signer**
     /the signer is not answering/);
 });
 
+await t("**a node that is not there is named at once: two refusals, never opened — not the budget**", async () => {
+  // The clock moves 1 ms a poll: without the refusal end this reaches the
+  // BUDGET's message, not this one — the assertion then fails, never hangs.
+  let c = 0;
+  const frozen = { provisionBudgetMs: 2_000, provisionEveryMs: 1, now: () => (c += 1), setTimeout: r => setTimeout(r, 0) };
+  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => false, refusedBeforeOpen: () => 2, url: () => "ws://127.0.0.1:7999/" }, frozen),
+    /nothing answered at ws:\/\/127\.0\.0\.1:7999\/: the connection was refused and never opened — is the node running\?/);
+  // THE CONTROL: one refusal is a connection still being made — it waits.
+  let polls = 0;
+  const one = untilProvisioned({ provisioned: () => (polls += 1) > 3, connectedOnce: () => false, refusedBeforeOpen: () => 1 }, frozen);
+  await one;
+  assert.ok(polls > 3, "one refusal ended the wait");
+  // And through open(): a connect that reports two closes with no open.
+  const S = FakeSession({ after: 1e9 });
+  const refused = { connect: (_e, { onEvent } = {}) => { onEvent?.({ kind: "error" }); onEvent?.({ kind: "closed" }); return { pump() {}, close() {} }; } };
+  await assert.rejects(() => open(S, deps(refused)), /the connection was refused and never opened/);
+});
+
 await t("the BUDGET says which too: never connected, or connected and still setting up", async () => {
   let clock = 0;
   const tick = r => setTimeout(r, 0);
