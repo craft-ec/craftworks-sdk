@@ -193,6 +193,26 @@ fixture_rc=$?
 fixture_line=$(echo "$fixture_out" | tail -1)
 [ $fixture_rc -ne 0 ] && step_fail "fixture-gate failed: $fixture_line"
 
+# ---------------------------------------------- duplicates, owners ----
+# MACHINE checks for what people missed (craftworks-sdk#320): a NEW duplicate
+# block (tools/dup-gate.mjs, jscpd pinned, against dup-baseline.json), and a
+# branch that changes more than one owner's files (OWNERS) without a
+# `shared:` line. Each prints what it found; "could not check" is a failure.
+step "dup-gate"
+dup_out=$(node tools/dup-gate.mjs 2>&1)
+dup_rc=$?
+echo "$dup_out" | grep -E '^(NEW DUPLICATE|gone)' | head -20
+dup_line=$(echo "$dup_out" | tail -1)
+echo "$dup_line"
+[ $dup_rc -ne 0 ] && step_fail "dup-gate: $dup_line"
+
+step "owners"
+owners_out=$(node tools/owners.mjs 2>&1)
+owners_rc=$?
+echo "$owners_out"
+owners_line=$(echo "$owners_out" | tail -1)
+[ $owners_rc -ne 0 ] && step_fail "owners: $owners_line"
+
 # ----------------------------------------------------------- summary ----
 # WHAT IT RAN and the COUNTS, not a verdict on its own.
 step "summary"
@@ -270,7 +290,7 @@ echo
 # covered reads the same whether it covered one or both.
 echo "ran: cargo test per member ($total passing, ${#NAMES[@]} members vs baseline), \
 clippy --workspace --all-targets -D warnings ($clippy_warnings warnings), \
-npm test ($js_ok ok vs baseline ${js_base:-none}), fixture-gate ($fixture_line)"
+npm test ($js_ok ok vs baseline ${js_base:-none}), fixture-gate ($fixture_line), $dup_line, $owners_line"
 
 if [ $ACCEPT -eq 1 ]; then
   counts_file=$(mktemp)
