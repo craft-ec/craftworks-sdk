@@ -14,7 +14,7 @@ crate-type = ["rlib"]
 [dependencies]
 # Pinned by revision, not by path: this repo must build for anyone who checks
 # it out, and the tree's format decides what an app's data looks like.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
 blake3 = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,7 +51,7 @@ getrandom = { version = "0.2", features = ["js"] }
 # fixtures. Cargo allows exactly this for test-support crates, because the
 # cycle exists only in the test build, never in the library's own graph.
 testkit = { path = "testkit" }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
 wasmi = "0.32"
 bincode = "1"
 # Signing Register records, for the corpus the artefact gate freezes. A

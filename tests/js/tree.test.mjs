@@ -110,7 +110,7 @@ await t(`**bounded: at most ${MAX_OPEN_TREES} open trees, and ${MAX_TREE_SUBSCRI
   (await h.tree(HEAD_B)).close();
 });
 
-await t("**provision: false — a visitor opens the socket, installs NOTHING, and still reads trees**", async () => {
+await t("**provision: false — a reader opens the socket, installs NOTHING, and still reads trees**", async () => {
   const sock = {};
   const fetched = [];
   const h = await openSession(Session, {
@@ -122,12 +122,12 @@ await t("**provision: false — a visitor opens the socket, installs NOTHING, an
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     addEventListener: null, removeEventListener: null, documentOf: null,
   });
-  assert.deepEqual(fetched, [], "a visitor fetched provisioning artefacts it will not install");
+  assert.deepEqual(fetched, [], "a reader fetched provisioning artefacts it will not install");
   await h.tree(HEAD_A);
   assert.deepEqual(fetched, ["b"], "tree() did not fetch the Block code, or fetched more");
   const ops = [...new Set(frames(sock).map(x => x.op))];
-  assert.deepEqual(ops, ["get"], `a visitor's socket carried ${ops}: something was installed`);
-  assert.equal(h.provisioned(), false, "THE CONTROL: the visitor's own tree was not provisioned");
+  assert.deepEqual(ops, ["get"], `a reader's socket carried ${ops}: something was installed`);
+  assert.equal(h.provisioned(), false, "THE CONTROL: the reader's own tree was not provisioned");
 });
 
 await t("THE MEASUREMENT: one open tree reader's wasm memory, before any rows", async () => {

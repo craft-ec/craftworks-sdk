@@ -139,7 +139,7 @@ fn a_commit_manifest_round_trips_and_refuses_a_malformed_one() {
 #[test]
 fn an_oversized_member_is_refused_here_rather_than_at_the_node() {
     let raw = freenet_prolly::kind::RAW;
-    for kind in [raw, freenet_prolly::kind::PARITY, pack::PACK_KIND] {
+    for kind in [raw, freenet_prolly::kind::PARITY] {
         let limit = pack::max_body(kind);
 
         // Exactly at the limit is ACCEPTED. Without this the check could be
@@ -156,6 +156,30 @@ fn an_oversized_member_is_refused_here_rather_than_at_the_node() {
             }
             other => panic!("kind {kind} one byte over {limit} must be refused, got {other:?}"),
         }
+    }
+}
+
+/// A PACK-kind member at ITS limit (1 MiB) cannot ride in a pack: the pack
+/// around it is over the format's `MAX_PACK`, which the contract applies to
+/// every block's state (`MAX_STATE = 1 + MAX_PACK`). Before the format came
+/// from `freenet_prolly::pack` (sdk#305) the engine checked members only, and
+/// built this pack in silence for the node to refuse. Both sides of the
+/// member's own limit are refused here, each naming its reason.
+#[test]
+fn a_pack_sized_member_is_refused_by_the_pack_around_it() {
+    let limit = pack::max_body(pack::PACK_KIND);
+    match pack::build(&[member(pack::PACK_KIND, 1, limit)]) {
+        Err(pack::PackError::TooLarge { kind, len, limit: l }) => {
+            assert_eq!((kind, l), (pack::PACK_KIND, pack::MAX_PACK));
+            assert!(len > pack::MAX_PACK, "the reason is the whole pack: {len}");
+        }
+        other => panic!("a pack carrying a {limit} B member must be refused, got {other:?}"),
+    }
+    match pack::build(&[member(pack::PACK_KIND, 1, limit + 1)]) {
+        Err(pack::PackError::TooLarge { kind, len, limit: l }) => {
+            assert_eq!((kind, len, l), (pack::PACK_KIND, limit + 1, limit));
+        }
+        other => panic!("one byte over the member limit must be refused, got {other:?}"),
     }
 }
 
@@ -178,4 +202,42 @@ fn the_mirrored_limits_are_the_contracts_numbers() {
     assert_eq!(freenet_prolly::kind::RAW, 0);
     assert_eq!(freenet_prolly::kind::PARITY, 4);
     assert_eq!(pack::PACK_KIND, 6);
+}
+
+/// ONE FORMAT (sdk#305, the owner's rule 3): `pack.rs` keeps the engine's
+/// POLICY (the PACK kind, each kind's ceiling, the CM01 manifest) and takes the
+/// pack FORMAT from `freenet_prolly::pack`. It was a second implementation of
+/// the same bytes once; this reads its source so that it cannot quietly become
+/// one again.
+#[test]
+fn the_pack_format_is_freenet_prollys_not_a_second_copy() {
+    let src = include_str!("../src/pack.rs");
+    let body = |sig: &str| -> &str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("`{sig}` is not in pack.rs"));
+        let rest = &src[at..];
+        &rest[..rest.find("\n}\n").expect("the function ends")]
+    };
+    // The CONTROL: the reader finds the real bodies, so an empty read cannot
+    // pass the checks below.
+    let (build, members) = (body("pub fn build("), body("pub fn members("));
+    assert!(build.contains("max_body") && members.contains("Vec<(Cid, Vec<u8>)>"), "the reader did not find the real bodies");
+
+    assert!(!src.contains("b\"PK01\""), "pack.rs spells the pack magic itself");
+    for (name, want) in [
+        ("pub const PACK_MAGIC", "format::MAGIC"),
+        ("pub const PACK_HEADER", "format::HEADER"),
+        ("pub const MAX_PACK", "format::MAX_PACK"),
+    ] {
+        let line = src.lines().find(|l| l.starts_with(name)).unwrap_or_else(|| panic!("no `{name}`"));
+        assert!(line.contains(want), "`{name}` is defined locally, not from `{want}`: {line}");
+    }
+    assert!(build.contains("format::build("), "pack::build writes the bytes itself");
+    assert!(members.contains("format::members("), "pack::members walks the bytes itself");
+    assert!(!src.contains("split_at_checked"), "pack.rs walks a pack body itself");
+
+    // And the bytes agree: the engine's pack IS the library's pack.
+    let ms = [member(freenet_prolly::kind::RAW, 3, 900), member(freenet_prolly::kind::RAW, 9, 40)];
+    let ours = pack::build(&ms).expect("builds");
+    assert_eq!(ours, freenet_prolly::pack::build(&ms).expect("builds"));
+    assert_eq!(pack::members(&ours).len(), 2);
 }

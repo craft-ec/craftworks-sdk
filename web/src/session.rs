@@ -454,7 +454,7 @@ impl Session {
     /// signs for, registering nothing (`PageIo::ask`). A publisher's page
     /// compares the answer with the app's publisher head: equal, the person
     /// opening it holds the key on this node, and it opens WRITABLE through
-    /// `provision`; otherwise it is a visitor, and nothing was installed or
+    /// `provision`; otherwise it is another user's node, and nothing was installed or
     /// minted here. The answer: [`Session::asked`].
     pub fn ask_signer(&mut self, signer: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
         if self.page().is_some() {
@@ -618,7 +618,7 @@ impl Session {
     /// MAY THIS SESSION WRITE `head`? The ONE decision a runtime renders
     /// inputs from (DATA-SOURCE; the architect's point 5), and the same one
     /// every write is refused by: `head` is a head id in hex, or "" for this
-    /// session's OWN tree (a `viewer` component's). As JSON:
+    /// session's OWN tree (a `mine` component's). As JSON:
     /// `{"answer":"yes"|"no"|"unknown","why":"…"}`. Derived each time from
     /// what page-io holds (the signer's answer, the page's opening), and
     /// cached nowhere -- not here, not in JS.
@@ -631,7 +631,7 @@ impl Session {
         serde_json::json!({ "answer": answer, "why": why }).to_string()
     }
 
-    /// OPEN THE VIEWER'S OWN TREE on an asked session (DATA-SOURCE `viewer`):
+    /// OPEN THE USER'S OWN TREE on an asked session (DATA-SOURCE `mine`):
     /// `PageIo::claim`, then what opening does -- a key is minted only where
     /// the signer holds none (`mint_if_needed`), and the head is created by
     /// the first write. Answers `can_write("")` afterwards. A session opened
@@ -1265,7 +1265,7 @@ impl Session {
 
     /// Every write is refused by the SAME decision the runtime renders from
     /// (`can_write("")`), before it reaches the store. An asked session's
-    /// first write opens the viewer's own tree (`open_own`): the head is
+    /// first write opens the user's own tree (`open_own`): the head is
     /// created on first write.
     fn writable(&mut self) -> Result<(), JsValue> {
         if self.page().is_some_and(|p| p.asking()) {
