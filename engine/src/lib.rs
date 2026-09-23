@@ -1141,6 +1141,16 @@ impl Race {
 }
 
 impl Commit {
+    /// What the page holds the head for (`UpdateHead::after`): the blocks the
+    /// engine COUNTED when it judged the head ready -- this commit's acked
+    /// blocks -- and nothing else. Handing the page every data block instead
+    /// made it wait for all of them (the page holds a head until every id in
+    /// `after` is acked), which silently undid race put at the page while the
+    /// engine looked done.
+    fn race_set(&self) -> Vec<Cid> {
+        self.data.iter().copied().filter(|c| self.confirmed.contains(c)).collect()
+    }
+
     /// May the head be signed? (§P: race put; `all` is the control.)
     fn ready(&self, race: bool, unacked: &BTreeSet<Cid>) -> bool {
         if race {
@@ -3510,7 +3520,7 @@ impl<B: Blocks> Engine<B> {
             seq: c.seq,
             root: c.root,
             base: c.base,
-            after: c.data.iter().copied().collect(),
+            after: c.race_set(),
         }]
     }
 
@@ -3567,7 +3577,10 @@ impl<B: Blocks> Engine<B> {
             seq: c.seq,
             root: c.root,
             base: c.base,
-            after: c.data.iter().copied().collect(),
+            // head_before_packs (off by default) is the one mode that sends
+            // the head BEFORE the race rule holds, so the page must still hold
+            // it until every block is in.
+            after: if head_early { c.data.iter().copied().collect() } else { c.race_set() },
         });
         out
     }
@@ -3641,10 +3654,17 @@ impl<B: Blocks> Engine<B> {
             });
         }
         // SAVED is `Published`, just said. BACKED_UP (`ParityComplete`) when
-        // every block of the commit is acked (§P): now, or as the rest land.
-        // The stragglers stay in `send()` with their re-sends (the owner:
-        // stall retry is still the standard); the engine only counts.
-        let remaining: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
+        // ALL k+3 of every group the commit changed are acked (§P): its own
+        // blocks AND an earlier commit's stragglers in those groups (the
+        // members it counted in `earlier`). Counting only its own let a write
+        // be BACKED_UP while a group it changed still missed a block (the page
+        // model: "ParityComplete, but the root it was published at is not
+        // WHOLE"). Now, or as the rest land. The stragglers stay in `send()`
+        // with their re-sends (stall retry is still the standard); the engine
+        // only counts.
+        let still_out = self.unacked();
+        let mut remaining: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
+        remaining.extend(c.race.groups.iter().flat_map(|g| g.earlier.iter()).filter(|m| still_out.contains(*m)).copied());
         if remaining.is_empty() {
             for w in &c.writes {
                 out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });

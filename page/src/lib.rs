@@ -1405,10 +1405,6 @@ impl Page {
     /// and nothing more is asked or sent for it. Without this the page went on
     /// asking the signer for a dead commit from a stale prev (the model found
     /// it: `NotSuccessor`, hidden behind the retries that got round it).
-    fn engine_published(&self) -> (u64, Cid) {
-        (self.engine.published_seq(), self.engine.published_root())
-    }
-
     fn drop_dead_head(&mut self) {
         // Also dead: a head whose commit was built on a root the engine no
         // longer publishes (a foreign winner adopted under it).
