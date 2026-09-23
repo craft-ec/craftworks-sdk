@@ -1436,6 +1436,16 @@ impl Page {
                 // A queued write's warm-apply block (R-b): kept for reads of
                 // the warm root, never put -- its commit puts the same bytes.
                 Effect::Keep { id, ref bytes } => self.blocks.insert(id, bytes),
+                // SUPERSEDED (COMMIT-LIFE §P): a later root move re-coded the
+                // group this block was in. Its PUT is WITHDRAWN -- no more
+                // re-sends, not sent at all if still held back -- because
+                // nobody needs it; that is not a cut-off of one somebody does.
+                Effect::Withdraw { id } => {
+                    self.deadlines.remove(&Waiting::Put(id));
+                    self.attempt_of.remove(&Waiting::Put(id));
+                    self.put_again.remove(&id);
+                    self.held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
+                }
                 Effect::PutPack { id, .. } => {
                     // No packs in this phase, as the shell refuses them.
                     self.unusable.push("a pack was emitted; packs are off in this phase".into());

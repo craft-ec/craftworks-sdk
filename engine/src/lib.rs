@@ -491,6 +491,11 @@ pub enum Effect {
         bytes: Vec<u8>,
         after: Vec<Cid>,
     },
+    /// Stop putting this block: a later root move SUPERSEDED it (COMMIT-LIFE
+    /// §P). Withdrawal of a PUT nobody needs, never a cut-off of one that is.
+    Withdraw {
+        id: Cid,
+    },
     UpdateHead {
         seq: u64,
         root: Cid,
@@ -1236,6 +1241,11 @@ pub struct Engine<B: Blocks> {
     /// Published commits whose blocks are still being put (§P): BACKED_UP
     /// when a commit's `remaining` is empty.
     backing: Vec<Backing>,
+    /// Writes whose group a later root move RE-CODED (COMMIT-LIFE §P,
+    /// superseded stragglers): their data now lives in the newer version of
+    /// the group, so they wait for the NEXT own commit's `Backing`, which
+    /// takes them. Never BACKED_UP while here.
+    carry: BTreeSet<(ClientId, WriteId)>,
     /// Blocks being REBUILT from their groups, by the block's id (`repair`).
     repairs: BTreeMap<Cid, Repair>,
     /// Which repairs a group block is being fetched for.
@@ -1462,6 +1472,7 @@ impl<B: Blocks> Engine<B> {
             blocks,
             arrived: BTreeMap::new(),
             backing: Vec::new(),
+            carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
             repair_counts: (0, 0, 0),
@@ -2179,7 +2190,9 @@ impl<B: Blocks> Engine<B> {
         };
         self.published_seq = seq;
         self.next_seq = seq + 1;
-        self.notify_subs(was)
+        let mut out = self.supersede(was, root);
+        out.extend(self.notify_subs(was));
+        out
     }
 
     /// Tell every subscriber whose range a root move touched.
@@ -3524,6 +3537,104 @@ impl<B: Blocks> Engine<B> {
         }]
     }
 
+    /// These writes' Backing drained: each is BACKED_UP unless it still sits
+    /// in another Backing (a write carried onto a newer commit waits for that
+    /// one too) or in the carry (waiting for the next own commit).
+    fn backed_up(&mut self, writes: Vec<(ClientId, WriteId)>) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let mut told = BTreeSet::new();
+        for w in writes {
+            if !told.insert(w) || self.carry.contains(&w) || self.backing.iter().any(|b| b.writes.contains(&w)) {
+                continue;
+            }
+            out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
+        }
+        out
+    }
+
+    /// The nodes of `was` that `now` does not have (`diff(now, was)`'s
+    /// `new_blocks`, paged and unioned), or `None` if the diff could not be
+    /// completed from what is held -- then nothing is superseded, the
+    /// conservative side (a withdrawn block that was still needed is a hole
+    /// nothing tracks; a kept one costs only its re-sends).
+    fn removed_nodes(&self, was: Cid, now: Cid) -> Option<BTreeSet<Cid>> {
+        use freenet_prolly::range::Range;
+        use std::ops::Bound;
+        let src = self.source();
+        let r = Range { lo: Bound::Unbounded, hi: Bound::Unbounded, reverse: false, after: None, max_entries: usize::MAX, max_bytes: usize::MAX };
+        let mut removed = BTreeSet::new();
+        let mut resume = None;
+        for _ in 0..1_000_000 {
+            let page = freenet_prolly::diff::diff(&src, &now, &was, &r, resume.as_ref()).ok()?;
+            if !page.need.is_empty() {
+                return None;
+            }
+            removed.extend(page.new_blocks.iter().copied());
+            match page.next {
+                Some(next) => resume = Some(next),
+                None => return Some(removed),
+            }
+        }
+        None
+    }
+
+    /// COMMIT-LIFE §P, superseded stragglers, on EVERY published-root move
+    /// (own commit or foreign/merge) from `was` to `now`: a straggler that
+    /// is a NODE removed by the move, or the PARITY of a removed branch node
+    /// (a group over nodes), is garbage -- WITHDRAWN, and its commit's writes
+    /// carried onto the next own commit's Backing. Node bytes include their
+    /// keys, so a node is unique to its position and a removed one is needed
+    /// by nobody. VALUE blocks and the parity of VALUE groups (a leaf's) are
+    /// NEVER withdrawn: the same value under two keys is one block, and
+    /// telling it apart would need a whole-tree scan -- they retry until acked
+    /// (the architect's ruling).
+    fn supersede(&mut self, was: Cid, now: Cid) -> Vec<Effect> {
+        if was == now || self.backing.is_empty() {
+            return Vec::new();
+        }
+        let Some(removed) = self.removed_nodes(was, now) else {
+            return Vec::new();
+        };
+        let mut gone: BTreeSet<Cid> = BTreeSet::new();
+        {
+            let src = self.source();
+            for n in &removed {
+                gone.insert(*n);
+                if let Some(bytes) = src.get(n) {
+                    if let Ok(node) = Node::parse(bytes) {
+                        if !node.is_leaf() {
+                            gone.extend(node.parity());
+                        }
+                    }
+                }
+            }
+        }
+        let mut withdrawn: BTreeSet<Cid> = BTreeSet::new();
+        for b in self.backing.iter_mut() {
+            let hit: Vec<Cid> = b.remaining.intersection(&gone).copied().collect();
+            if hit.is_empty() {
+                continue;
+            }
+            for id in hit {
+                b.remaining.remove(&id);
+                withdrawn.insert(id);
+            }
+            self.carry.extend(b.writes.iter().copied());
+        }
+        let mut drained = Vec::new();
+        self.backing.retain(|b| {
+            if b.remaining.is_empty() {
+                drained.extend(b.writes.iter().copied());
+                false
+            } else {
+                true
+            }
+        });
+        let mut out: Vec<Effect> = withdrawn.into_iter().map(|id| Effect::Withdraw { id }).collect();
+        out.extend(self.backed_up(drained));
+        out
+    }
+
     fn on_confirmed(&mut self, id: Cid) -> Vec<Effect> {
         let head_early = self.params.head_before_packs;
         let mut out = Vec::new();
@@ -3536,9 +3647,7 @@ impl<B: Blocks> Engine<B> {
             }
             true
         });
-        for w in backed {
-            out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
-        }
+        out.extend(self.backed_up(backed));
 
         let unacked = self.unacked();
         let Some(c) = self.pending.as_mut() else {
@@ -3662,15 +3771,23 @@ impl<B: Blocks> Engine<B> {
         // WHOLE"). Now, or as the rest land. The stragglers stay in `send()`
         // with their re-sends (stall retry is still the standard); the engine
         // only counts.
+        // SUPERSEDED stragglers first: this commit may re-code a group an
+        // earlier one is still putting; those old blocks are withdrawn and the
+        // earlier writes are carried onto THIS commit's Backing.
+        out.extend(self.supersede(was, c.root));
         let still_out = self.unacked();
         let mut remaining: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
         remaining.extend(c.race.groups.iter().flat_map(|g| g.earlier.iter()).filter(|m| still_out.contains(*m)).copied());
-        if remaining.is_empty() {
-            for w in &c.writes {
-                out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
+        let mut writes = c.writes.clone();
+        for w in std::mem::take(&mut self.carry) {
+            if !writes.contains(&w) {
+                writes.push(w);
             }
+        }
+        if remaining.is_empty() {
+            out.extend(self.backed_up(writes));
         } else {
-            self.backing.push(Backing { writes: c.writes.clone(), remaining, since: self.now });
+            self.backing.push(Backing { writes, remaining, since: self.now });
         }
         debug_assert!(self.folded.is_empty());
         // OWN PUBLISH (R-b, footnote 4): the front leaves the queue
