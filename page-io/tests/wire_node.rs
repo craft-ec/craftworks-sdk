@@ -55,6 +55,9 @@ struct WireNode {
     /// `ContractError::Get`, whether the contract exists or not: not its
     /// NotFound, and not an answer about the contract.
     refuse_gets: usize,
+    /// This node does not hold the head LOCALLY (a fresh node of the identity): the signer's synchronous read finds
+    /// nothing, while a client GET is served from the network.
+    head_not_local: bool,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -67,6 +70,9 @@ impl signer::Host for Host<'_> {
         true
     }
     fn contract_state(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
+        if self.0.head_not_local && *id == self.0.register_id {
+            return None;
+        }
         self.0.contracts.get(id).cloned()
     }
 }
@@ -96,6 +102,7 @@ impl WireNode {
             delegate_absent: false,
             empty_until_registered: false,
             refuse_gets: 0,
+            head_not_local: false,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -125,6 +132,7 @@ impl WireNode {
             delegate_absent: false,
             empty_until_registered: false,
             refuse_gets: 0,
+            head_not_local: false,
         }
     }
 
@@ -470,18 +478,26 @@ fn a_refused_head_read_on_a_fresh_signer_is_re_asked_never_an_empty_tree() {
     // Another node of the same identity: its signer has signed nothing; the network holds the head and blocks.
     let mut y = WireNode::new(&seed);
     y.contracts = x.contracts.clone();
-    y.refuse_gets = 2;
+    y.head_not_local = true;
+    // Every read refused while the page opens and is asked for its rows: nothing may open.
+    y.refuse_gets = usize::MAX;
     let mut b = page_io(&y);
     client(&mut b, &mut y, &mut now, &Request::Identity);
     let range = Request::Range { req_id: 8, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
-    let r = client(&mut b, &mut y, &mut now, &range);
-    let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 8, entries, .. } = x { Some(entries.len()) } else { None }).collect();
-    assert_eq!(y.served.get("refused get"), Some(&2), "THE SETUP: the refusals were not all asked");
-    assert_eq!(pages, vec![2], "a refused head read opened {pages:?}");
+    let pages = |r: &[Reply]| r.iter().filter_map(|x| if let Reply::Page { req_id: 8, entries, .. } = x { Some(entries.len()) } else { None }).collect::<Vec<_>>();
+    let during = pages(&client(&mut b, &mut y, &mut now, &range));
+    let refused = usize::MAX - y.refuse_gets;
+    assert!(refused >= 2, "THE SETUP: the refusal was not re-asked ({refused} refused)");
+    assert_eq!(during, Vec::<usize>::new(), "{refused} refused head reads opened a tree: {during:?}");
+    // The node answers again: the SAME open reads the app's rows.
+    y.refuse_gets = 0;
+    let after = pages(&settle(&mut b, &mut y, &mut now));
+    assert_eq!(after, vec![2], "once answered, the page read {after:?}");
 }
 
-/// ONLY NotFound means absent, for a BLOCK too: a refused block GET is re-asked on the RTO and the read completes —
-/// never a miss the next ask could have served.
+/// ONLY NotFound means absent, for a BLOCK too: a refused block GET is re-asked on the RTO and the read completes.
+/// Stated limit: on this base the engine re-asks a MISS as well, so the old mapping (refusal → miss) ends in the same
+/// place; this is a regression test of the split, not a discriminating one (its mutant survives, recorded).
 #[test]
 fn a_refused_block_read_is_re_asked_not_missed() {
     let mut node = WireNode::new(&[10u8; 32]);
@@ -494,12 +510,12 @@ fn a_refused_block_read_is_re_asked_not_missed() {
     let mut b = page_io(&node);
     client(&mut b, &mut node, &mut now, &Request::Identity);
     let before = node.served.get("get block").copied().unwrap_or(0);
-    node.refuse_gets = 1;
+    node.refuse_gets = 2;
     let range = Request::Range { req_id: 9, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
     let r = client(&mut b, &mut node, &mut now, &range);
     let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 9, entries, .. } = x { Some(entries.len()) } else { None }).collect();
     assert!(node.served.get("get block").copied().unwrap_or(0) > before, "THE SETUP: the rows were not read by block GETs");
-    assert_eq!(node.served.get("refused get"), Some(&1), "THE SETUP: the refusal was not asked");
+    assert_eq!(node.served.get("refused get"), Some(&2), "THE SETUP: the refusals were not all asked");
     assert_eq!(pages, vec![2], "a refused block read gave {pages:?}: {r:?}");
 }
 
