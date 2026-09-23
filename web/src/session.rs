@@ -484,7 +484,7 @@ impl Session {
         // Back to the app-relative names JavaScript holds, as `take_stale`
         // does — the stored `<app>.<name>` is keyed by no binding (#267).
         let domains = craftworks_sdk::Db::<CachedStore, SystemEnv>::own_domains_of_keys(self.app.as_deref(), &keys);
-        serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into())
+        craftworks_sdk::app::to_js(&domains)
     }
 
     pub fn take_stale(&mut self) -> String {
@@ -498,8 +498,8 @@ impl Session {
             }
         }
         // Back to the app-relative keys JavaScript holds.
-        let changed: Vec<String> = self.refresh.take_changed().iter().filter_map(|k| self.own_name(k)).collect();
-        serde_json::to_string(&changed).unwrap_or_else(|_| "[]".into())
+        let changed: Vec<craftworks_sdk::app::AppName> = self.refresh.take_changed().iter().filter_map(|k| self.own_name(k)).collect();
+        craftworks_sdk::app::to_js(&changed)
     }
 
     /// Ask what changed in a domain since this client last saw it.
@@ -636,7 +636,7 @@ impl Session {
     /// what to reload is a decision.
     pub fn bind(&mut self, domain: &str) {
         if let Ok(key) = self.read_name(domain) {
-            self.bound.insert(key);
+            self.bound.insert(key.to_string());
         }
     }
 
@@ -653,7 +653,7 @@ impl Session {
 
     pub fn unbind(&mut self, domain: &str) {
         if let Ok(key) = self.read_name(domain) {
-            self.bound.remove(&key);
+            self.bound.remove(key.as_str());
         }
     }
 
@@ -1150,7 +1150,7 @@ impl Session {
 
     pub fn domains(&mut self) -> Result<String, JsValue> {
         // THIS app's domains, by the names it gave them.
-        let r = self.db.domains().map(|all| all.iter().filter_map(|d| self.own_name(d)).collect::<Vec<_>>());
+        let r = self.db.domains().map(|all| all.iter().filter_map(|d| self.own_name(d)).map(|n| n.as_str().to_string()).collect::<Vec<_>>());
         self.answer(r)
     }
 
@@ -1638,18 +1638,20 @@ const PRELOAD_REQ_BASE: u64 = 1 << 32;
 impl Session {
     /// A domain (or watch key) this app READS, as the tree stores it
     /// (`craftworks_sdk::app::read`).
-    fn read_name(&self, name: &str) -> Result<String, JsValue> {
+    fn read_name(&self, name: &str) -> Result<craftworks_sdk::app::StoredName, JsValue> {
         craftworks_sdk::app::read(self.app.as_deref(), name).map_err(|e| db_err(&e))
     }
 
     /// A domain this app WRITES: only its own (`craftworks_sdk::app::write`).
-    fn write_name(&self, name: &str) -> Result<String, JsValue> {
+    fn write_name(&self, name: &str) -> Result<craftworks_sdk::app::StoredName, JsValue> {
         craftworks_sdk::app::write(self.app.as_deref(), name).map_err(|e| db_err(&e))
     }
 
     /// A stored name back to what this app calls it; `None` for another app's.
-    fn own_name(&self, stored: &str) -> Option<String> {
-        craftworks_sdk::app::own(self.app.as_deref(), stored)
+    /// `stored` came out of the tree (a key's domain, a watch key, a schema),
+    /// which is where stored names live.
+    fn own_name(&self, stored: &str) -> Option<craftworks_sdk::app::AppName> {
+        craftworks_sdk::app::own(self.app.as_deref(), &craftworks_sdk::app::StoredName::of_tree(stored.to_string()))
     }
 }
 

@@ -506,11 +506,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// name (`<app>.notes`) — which no binding is keyed by — so a tab's own
     /// write never re-ran its bindings and a plain table said "saving" for
     /// good: builder#107, back (measured in the builder's two-tab control).
-    pub fn own_domains_of_keys(app: Option<&str>, keys: &[Vec<u8>]) -> Vec<String> {
-        let mut out: Vec<String> = keys
+    pub fn own_domains_of_keys(app: Option<&str>, keys: &[Vec<u8>]) -> Vec<crate::app::AppName> {
+        let mut out: Vec<crate::app::AppName> = keys
             .iter()
             .filter_map(|k| Self::domain_of_key(k))
-            .filter_map(|stored| crate::app::own(app, &stored))
+            .filter_map(|stored| crate::app::own(app, &crate::app::StoredName::of_tree(stored)))
             .collect();
         out.sort();
         out.dedup();
