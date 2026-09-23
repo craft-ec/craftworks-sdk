@@ -1136,7 +1136,7 @@ fn asking_whose_node_registers_mints_and_provisions_nothing() {
     node.empty_signer_answers = usize::MAX;
     let mut io = asker();
     settle(&mut io, &mut node, &mut now);
-    assert_eq!(io.asked(), Some(&page_io::Asked::NoSigner), "an EMPTY-answering node is not named as having no signer");
+    assert!(matches!(io.asked(), Some(page_io::Asked::NoSigner(_))), "an EMPTY-answering node is not named as having no signer: {:?}", io.asked());
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
 }
 
@@ -1179,13 +1179,15 @@ fn asking_on_a_visitors_node_sends_only_the_query_and_counts_every_empty_answer(
     assert!(!io.provisioned() && node.secrets.is_empty(), "asking provisioned the visitor's node");
     let served = node.served.get("signer").copied().unwrap_or(0);
     let counted = match io.asked() {
-        Some(page_io::Asked::Refused(w)) => w
+        // Named as a node with NO SIGNER (its own answer, not a refusal), in
+        // words that count the EMPTY answers.
+        Some(page_io::Asked::NoSigner(w)) => w
             .split("EMPTY ")
             .nth(1)
             .and_then(|r| r.split(' ').next())
             .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or_else(|| panic!("the refusal does not say how many EMPTY answers: {w}")),
-        other => panic!("a node without the signer was not refused: {other:?}"),
+            .unwrap_or_else(|| panic!("the answer does not say how many EMPTY answers: {w}")),
+        other => panic!("a node without the signer was not named as one: {other:?}"),
     };
     assert_eq!(counted, served, "the node answered {served} queries EMPTY and the page counted {counted}: an EMPTY was taken for something else");
     assert_eq!(sent.len(), served, "frames sent {sent:?} against queries served {served}");
@@ -1226,12 +1228,12 @@ fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
         let mut now = 1_000;
         let mut io = asker();
         settle(&mut io, &mut node, &mut now);
-        let want = match case {
-            "signs for their register" => page_io::Asked::Register(node.register_id),
-            "signer holds no key" => page_io::Asked::NoKey,
-            _ => page_io::Asked::NoSigner,
-        };
-        assert_eq!(io.asked(), Some(&want), "{case}");
+        match (case, io.asked()) {
+            ("signs for their register", Some(page_io::Asked::Register(r))) => assert_eq!(*r, node.register_id, "{case}"),
+            ("signer holds no key", Some(page_io::Asked::NoKey)) | ("no signer here", Some(page_io::Asked::NoSigner(_))) => {}
+            (_, other) => panic!("{case}: asked {other:?}"),
+        }
+        let want = io.asked().cloned();
         let (container, _) = wire::delegate_from_code(SIGNER_CODE);
         assert!(io.claim(container), "{case}: the claim was refused");
         settle(&mut io, &mut node, &mut now);
@@ -1244,7 +1246,7 @@ fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
         assert_eq!(io.register_id(), node.register_id, "{case}: the claimed page names another register");
         let registered = node.served.get("register delegate").copied().unwrap_or(0);
         assert_eq!(registered, usize::from(case == "no signer here"), "{case}: the signer was registered {registered} times");
-        assert_eq!(io.asked(), Some(&want), "{case}: the claim rewrote the answer (the identity's one owner)");
+        assert_eq!(io.asked().cloned(), want, "{case}: the claim rewrote the answer (the identity's one owner)");
         client(&mut io, &mut node, &mut now, &Request::Identity);
         let rs = client(&mut io, &mut node, &mut now, &write(1, "mine", "1"));
         assert!(states(&rs, 1).iter().any(|s| matches!(s, WriteState::Published)), "{case}: the viewer's first write did not publish: {:?}", states(&rs, 1));

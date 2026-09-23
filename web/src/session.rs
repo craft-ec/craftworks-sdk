@@ -483,7 +483,7 @@ impl Session {
             None => ("pending", String::new(), String::new()),
             Some(Asked::Register(id)) => ("register", craftworks_sdk::hex(id), String::new()),
             Some(Asked::NoKey) => ("nokey", String::new(), String::new()),
-            Some(Asked::NoSigner) => ("nosigner", String::new(), "no signer on this node".to_string()),
+            Some(Asked::NoSigner(w)) => ("nosigner", String::new(), w.clone()),
             Some(Asked::Refused(w)) => ("refused", String::new(), w.clone()),
             Some(Asked::NotAnswering) => ("silent", String::new(), String::new()),
         };

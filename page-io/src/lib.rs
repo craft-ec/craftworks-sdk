@@ -59,7 +59,8 @@ pub enum Asked {
     NoKey,
     /// The node has no signer delegate at all (a node that never opened this
     /// person's tree): measured on 0.2.136, it answers the request EMPTY.
-    NoSigner,
+    /// In its words, with how many EMPTY answers it took.
+    NoSigner(String),
     /// The node or the signer refused: in their words.
     Refused(String),
     /// Nothing answered within the first request's budget.
@@ -431,8 +432,8 @@ impl PageIo {
                 // Nothing of this person's here yet: their own tree is made on
                 // first use (a key minted, the head created by the first
                 // write); anyone else's head is not theirs to write.
-                (Some(Asked::NoKey | Asked::NoSigner), None) => MayWrite::Yes,
-                (Some(Asked::NoKey | Asked::NoSigner), Some(_)) => MayWrite::No("this node holds no key for that head".into()),
+                (Some(Asked::NoKey | Asked::NoSigner(_)), None) => MayWrite::Yes,
+                (Some(Asked::NoKey | Asked::NoSigner(_)), Some(_)) => MayWrite::No("this node holds no key for that head".into()),
                 (Some(Asked::Refused(w)), None) => MayWrite::Unknown(w.clone()),
                 (Some(Asked::Refused(w)), Some(_)) => MayWrite::No(w.clone()),
                 (Some(Asked::NotAnswering), _) => MayWrite::Unknown("this node's signer is not answering".into()),
@@ -491,7 +492,7 @@ impl PageIo {
                 self.needs_key = true;
                 true
             }
-            Some(Asked::NoSigner) => {
+            Some(Asked::NoSigner(_)) => {
                 self.claimed = true;
                 // The ask's own end (its EMPTY answers) is not opening's.
                 self.exhausted = false;
@@ -764,7 +765,7 @@ impl PageIo {
                         // Measured on 0.2.136: a node WITHOUT the signer
                         // delegate answers its request EMPTY — a visitor's.
                         if self.asking() {
-                            self.asked = Some(Asked::NoSigner);
+                            self.asked = Some(Asked::NoSigner(format!("no signer on this node: it answered EMPTY {} times", self.first_empties)));
                         }
                     }
                 }
