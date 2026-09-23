@@ -225,6 +225,11 @@ export function wrap(raw) {
     // for — nothing registered, minted or provisioned — and STAYS OPEN, its
     // `asked()` the identity (`openAsked`).
     openAsked: (opts = {}) => openAskedWith(raw.Session, { artefacts: SHIPPED_ARTEFACTS, ...opts }),
+    // WHAT A ROW STATE MEANS, from the SDK's one owner (`RowState`): saved,
+    // backed up, and every code there is. Never a string literal in an app.
+    rowSaved: code => raw.row_saved(String(code ?? "")),
+    rowBackedUp: code => raw.row_backed_up(String(code ?? "")),
+    rowStates: () => [...raw.row_states()],
     SHIPPED_ARTEFACTS,
     // PUBLISHING a web container (builder#104): `params(state)` is the
     // `webapp` contract's params (BLAKE3, which a page has no other way to
