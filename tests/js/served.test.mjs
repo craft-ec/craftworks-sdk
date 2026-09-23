@@ -70,6 +70,17 @@ await t("url AND urls is refused rather than silently dropping one; no url at al
   await assert.rejects(served({}, { fetch: node([404]).fetch }), /no url/);
 });
 
+await t("fetch OPTIONS go on every request, as given (a file read fresh: no-store)", async () => {
+  const c = clock();
+  const seen = [];
+  const fetch = async (u, init) => { seen.push(init); return seen.length < 2 ? new Response("", { status: 404 }) : new Response("x"); };
+  await served({ url: "/b" }, { fetch, sleep: c.sleep, now: c.now, init: { cache: "no-store" } });
+  assert.deepEqual(seen, [{ cache: "no-store" }, { cache: "no-store" }], "an option was dropped on a re-ask");
+  const plain = [];
+  await served({ url: "/b" }, { fetch: async (u, ...rest) => { plain.push(rest.length); return new Response("x"); } });
+  assert.deepEqual(plain, [0], "a request with no options was given some");
+});
+
 await t("servedText is the same fetch, decoded", async () => {
   const c = clock();
   assert.equal(await servedText({ url: "/j" }, { fetch: node([404, new TextEncoder().encode('{"a":1}')]).fetch, sleep: c.sleep, now: c.now }), '{"a":1}');
