@@ -640,10 +640,15 @@ fn a_write_to_a_reader_reaches_nothing_and_never_publishes() {
         assert_eq!(node.served.get(k), before.get(k), "a reader's write made the node serve a {k}");
     }
     assert_eq!(node.head(), head, "a reader's write moved the publisher's head");
-    // And provisioning a reader is refused, not sent.
+    // And provisioning a reader is refused, not sent. Frames already queued
+    // (a block GET the write's apply asked for -- a READ, which a reader may
+    // make) are drained first, so what is checked is exactly what the
+    // provisioning call framed.
+    let _ = v.take_frames();
     let (container, _) = wire::delegate_from_code(SIGNER_CODE);
     v.provision(container, vec![0u8; 32]);
-    assert!(v.take_frames().is_empty(), "a reader framed a provisioning");
+    let framed = v.take_frames();
+    assert!(framed.is_empty(), "a reader framed a provisioning: {} frame(s), first {:?}", framed.len(), framed.first().map(|f| String::from_utf8_lossy(&f[..f.len().min(120)]).into_owned()));
     assert!(v.unusable().iter().any(|u| u.contains("read-only")), "{:?}", v.unusable());
 }
 
