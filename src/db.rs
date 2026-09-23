@@ -182,6 +182,14 @@ pub enum DbError {
     /// NOTHING WAS WRITTEN. Each reason has its own code, because each asks something
     /// different of the caller — wait, reload, split.
     WriteRefused(crate::store::Refused),
+    /// NOT DECIDED YET whether this session may write here: the node's
+    /// signer has not answered whose node it is (still asking, or silent --
+    /// rule 8: silence is not an answer). Nothing was written; the SAME call
+    /// made once the signer answers takes the answered branch. A caller
+    /// WAITS -- on the session's own wake, with no deadline -- never gives
+    /// up on it (`engine-db.js`, the one wait path it shares with
+    /// `QUEUE_FULL`).
+    NotDecided(String),
 }
 
 impl DbError {
@@ -202,6 +210,7 @@ impl DbError {
             DbError::TooLarge(_) => "TOO_LARGE",
             DbError::NotDefined(_) => "NOT_DEFINED",
             DbError::Refused(_) => "REFUSED",
+            DbError::NotDecided(_) => "NOT_DECIDED",
             DbError::WriteRefused(r) => match r {
                 crate::store::Refused::QueueFull { .. } => "QUEUE_FULL",
                 crate::store::Refused::TooLargeToSend { .. } => "TOO_LARGE_TO_SEND",
@@ -244,6 +253,7 @@ impl std::fmt::Display for DbError {
                 "the engine could not reach a block this read needed; the key may well exist",
             ),
             DbError::TooLarge(m) | DbError::NotDefined(m) | DbError::Refused(m) => f.write_str(m),
+            DbError::NotDecided(m) => write!(f, "not decided yet: {m}"),
             DbError::WriteRefused(r) => write!(f, "not written: {r}"),
         }
     }

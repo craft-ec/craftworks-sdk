@@ -476,8 +476,8 @@ export async function openSession(Session, {
      * disabled, with `why`.
      */
     canWrite: (head = "") => JSON.parse(session.can_write(head)),
-    // `openAsked`'s `openOwn` in two halves: this one claims the tree and
-    // sends what that made (sync); `openAsked` waits for it to open.
+    // `openAsked`'s `openOwn`: opens the user's own tree where the node
+    // holds their key, and sends nothing otherwise (made on the first write).
     claimOwn: () => { const r = JSON.parse(session.open_own()); conn.pump(); return r; },
     // The head this session stands on, as `tree()` takes it (hex; "" until
     // Identity has named it). What a publisher records so others can read it.
@@ -597,16 +597,13 @@ export async function openAsked(Session, { port, artefacts, pollMs = 100, ...res
   // the publisher's own tree on the publisher's node (the same tree).
   const db = engineDb(handle);
   /**
-   * OPEN THE USER'S OWN TREE (DATA-SOURCE `mine`): the node's key is used
-   * where it has one, minted where it has none (the existing provision path),
-   * and the tree's head is created by its first write. Resolves
-   * `canWrite("")` once the tree is open.
+   * OPEN THE USER'S OWN TREE (DATA-SOURCE `mine`), WRITING NOTHING: where this
+   * node's signer holds the user's key their tree opens now; where it holds
+   * none (or there is no signer) the user has no tree yet, it reads as empty,
+   * and the key and the tree are made by the FIRST WRITE (the existing
+   * provision path, from that write). Resolves `canWrite("")`.
    */
-  const openOwn = async () => {
-    const r = handle.claimOwn();
-    if (r.answer === "yes" && !handle.provisioned()) await untilProvisioned(handle, rest);
-    return handle.canWrite("");
-  };
+  const openOwn = async () => handle.claimOwn();
   try {
     for (;;) {
       const a = handle.asked();

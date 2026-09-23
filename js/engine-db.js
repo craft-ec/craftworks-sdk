@@ -19,7 +19,9 @@
 /// `code` is from a fixed list — NOT_LOADED, UNAVAILABLE, TOO_LARGE,
 /// NOT_DEFINED, REFUSED, and for a write the store refused before making it
 /// (sdk#180): QUEUE_FULL (only once the app's deadline has passed: before it,
-/// a full queue is WAITED on, below), TOO_LARGE_TO_SEND, NO_SESSION, UNREAD.
+/// a full queue is WAITED on, below), TOO_LARGE_TO_SEND, NO_SESSION, UNREAD;
+/// and NOT_DECIDED (the node's signer has not answered yet: always WAITED on,
+/// below, never passed to the app).
 /// `message` is for a person to read.
 ///
 /// **Nothing in this file, and nothing in an app, branches on `message`.**
@@ -258,6 +260,15 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
         // passed one, and only past it fail,
         // named, with the bytes and the limit. Not a hop: waiting for room
         // is not a read chain.
+        // NOT DECIDED YET (the node's signer has not answered whose node it
+        // is -- asking, or silent): the same wake as QUEUE_FULL below, and
+        // NO deadline, not even the app's (rule 8: silence ends nothing).
+        // The call made again after the answer takes the answered branch.
+        if (e && e.code === "NOT_DECIDED") {
+          await new Promise(resolve => roomWaiters.push(resolve));
+          hop -= 1;
+          continue;
+        }
         if (e && e.code === "QUEUE_FULL") {
           waitedSince ??= now();
           const waited = now() - waitedSince;

@@ -357,6 +357,50 @@ await t("a FULL QUEUE is backpressure: the write waits for the session's wake an
   assert.deepEqual(r, { id: "x" });
 });
 
+await t("**NOT DECIDED YET waits for the signer's answer -- no deadline, not even the app's -- then takes the answered branch** (#342; rule 8)", async () => {
+  // The node's signer has not said whose node this is (asking, or silent):
+  // a define (or a write) is NOT DECIDED, not refused. The wrapper waits on
+  // the session's own wake, past any deadline, and makes the SAME call again;
+  // when the answer comes, the call takes its branch.
+  let clock = 0, wake, answered = null, asks = 0;
+  const undecided = { code: "NOT_DECIDED", message: "not decided yet: asking this node's signer whose node it is", transient: true };
+  const s = {
+    define() {
+      asks += 1;
+      if (answered === null) throw { ...undecided };
+      if (answered === "view, different") throw { code: "REFUSED", message: "read-only: `notes` is not defined like that here", transient: false };
+      return undefined;
+    },
+    take_loads: () => "[]",
+  };
+  const db = engineDb({ session: s, onReadsWake: fn => { wake = fn; } }, { writeDeadlineMs: 5_000, now: () => clock });
+  let failed, done = false;
+  const p = db.define("notes", { type: "Note", fields: [] }).then(() => { done = true; }, e => { failed = e; });
+  for (const at of [4_999, 5_000, 60_000, 3_600_000]) {
+    await new Promise(r => setImmediate(r));
+    clock = at;
+    wake();
+  }
+  await new Promise(r => setImmediate(r));
+  assert.equal(failed, undefined, `an undecided define ended after ${clock} ms: ${failed?.code}`);
+  assert.equal(done, false, "an undecided define resolved before any answer");
+  assert.ok(asks >= 4, `it was not asked again on each wake (${asks})`);
+  // The answer: the user's own tree -- the define is taken.
+  answered = "own";
+  wake();
+  await p;
+  assert.equal(failed, undefined);
+  assert.equal(done, true, "the answered define did not resolve");
+
+  // A VIEW whose published schema is different: the answered branch refuses, by name.
+  answered = null;
+  const q = db.define("notes", { type: "Note", fields: [] });
+  await new Promise(r => setImmediate(r));
+  answered = "view, different";
+  wake();
+  await assert.rejects(q, e => e.code === "REFUSED" && /not defined like that/.test(e.message));
+});
+
 await t("past the app's deadline a full queue fails NAMED, with the limit and how long it waited", async () => {
   let clock = 0, wake;
   const full = { code: "QUEUE_FULL", message: "4000 of 4096 bytes of writes are already waiting to be saved; wait for them, then try again", transient: false, retryable: true, cap: 4096 };
