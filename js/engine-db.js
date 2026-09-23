@@ -290,6 +290,14 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       try {
         await waitFor(ticket);
       } catch (ended) {
+        // SUPERSEDED (#330 ruling): a newer head arrived while this chain,
+        // pinned to an older root, had made no progress. Not an error and not
+        // a hop: the WHOLE chain runs again from its first call, UNPINNED, at
+        // the head (one tree per chain, inv. 2). Nothing is resumed.
+        if ((typeof ended === "string" ? ended : ended?.code) === "SUPERSEDED") {
+          hop = -1;
+          continue;
+        }
         // The load ENDED and did not deliver: the engine could not have the
         // data (an ANSWER — no time ends a load, rule 8). `why` is the
         // engine's reason, when it gave one.

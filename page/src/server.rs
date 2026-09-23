@@ -97,10 +97,14 @@ pub struct Server {
     /// The published head last seen, to tell an ADOPTION (it moved with no
     /// Published of ours at the new head) from a commit of ours.
     seen_head: (u64, freenet_prolly::Cid),
-    /// An adoption happened since the client last asked (sdk#266): the head
-    /// this page stands on moved and NOT by a commit of this page's. What
-    /// the client reads to know its loaded ranges are behind.
-    adopted: bool,
+    /// How many heads this page has ADOPTED — moved, and NOT by a commit of
+    /// this page's (sdk#266) — the one statement of that fact. Its readers
+    /// keep their own cursors: the client ([`Server::take_adopted`]) to know
+    /// its loaded ranges are behind, the page's store to supersede reads
+    /// pinned to an older root (#330 ruling).
+    adoptions: u64,
+    /// Where the client's `take_adopted` last read `adoptions`.
+    adoptions_taken: u64,
     /// Readers' fetches that ENDED, in order: each a ticket a walk is parked
     /// on (READ-STATE). Drained by [`Server::take_fetched`].
     fetched: Vec<(u64, Fetched)>,
@@ -271,7 +275,8 @@ impl Server {
             sent: BTreeMap::new(),
             tip: None,
             seen_head: (0, [0; 32]),
-            adopted: false,
+            adoptions: 0,
+            adoptions_taken: 0,
             fetched: Vec::new(),
             probe: None,
             next_probe: 1,
@@ -495,7 +500,9 @@ impl Server {
             // where the page starts, and the client holds nothing yet.
             let first = self.seen_head == (0, [0; 32]);
             let ours = published_here || self.tip.as_ref().is_some_and(|t| t.head == now);
-            self.adopted |= !ours && !first;
+            if !ours && !first {
+                self.adoptions += 1;
+            }
         }
         if now != self.seen_head && !published_here {
             if let Some(tip) = self.tip.take() {
@@ -724,6 +731,18 @@ impl Server {
         self.out.extend(out.replies);
     }
 
+    /// How many heads this page has ADOPTED (not its own commits) so far.
+    pub fn adoptions(&self) -> u64 {
+        self.adoptions
+    }
+
+    /// A newer head was adopted: supersede the reader's fetch under `ticket`
+    /// if it made no progress ([`Page::supersede_read`]). Whether it was; the
+    /// store ends the ticket, `Superseded`.
+    pub fn supersede_fetch(&mut self, ticket: u64) -> bool {
+        self.page.supersede_read(as_req_id(ticket))
+    }
+
     /// Readers' fetches that ended since the last call, in order. Drains.
     pub fn take_fetched(&mut self) -> Vec<(u64, Fetched)> {
         std::mem::take(&mut self.fetched)
@@ -732,7 +751,9 @@ impl Server {
     /// Has this page ADOPTED a head that was not its own commit since the
     /// last call (sdk#266)? Drains.
     pub fn take_adopted(&mut self) -> bool {
-        std::mem::take(&mut self.adopted)
+        let moved = self.adoptions > self.adoptions_taken;
+        self.adoptions_taken = self.adoptions;
+        moved
     }
 
     /// One of the Server's own reads answered: a probe's `Get`, or a page of

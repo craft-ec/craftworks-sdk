@@ -1479,6 +1479,17 @@ impl Page {
         }
     }
 
+    /// Supersede the engine's read `req` if it has made no progress
+    /// ([`engine::Engine::supersede_read`]); the GETs only it needed end with
+    /// it. Whether it was.
+    pub fn supersede_read(&mut self, req: engine::read::ReqId) -> bool {
+        let done = self.engine.supersede_read(req);
+        if done {
+            self.end_unneeded_gets();
+        }
+        done
+    }
+
     /// A GET nobody needs ENDS at once -- its deadline, its re-ask backoff and the engine's entry go together --
     /// rather than being re-sent at its next timeout for ever (sdk#303):
     /// * one the engine WITHDREW: a raced group block no read needs once its group resolved;

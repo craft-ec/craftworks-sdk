@@ -52,6 +52,11 @@ pub enum Ended {
     Loaded,
     /// A block could not be had: not "absent", and never answered as empty.
     Unavailable,
+    /// A newer head was adopted while this read, pinned to an older root,
+    /// had made no progress (#330 ruling): nothing arrived for its chain,
+    /// and it waits on a block unanswered or answered NotFound. The WHOLE
+    /// chain runs again, unpinned, at the head — one tree per chain (inv. 2).
+    Superseded,
 }
 
 impl Ended {
@@ -60,6 +65,7 @@ impl Ended {
         match self {
             Ended::Loaded => "LOADED",
             Ended::Unavailable => "UNAVAILABLE",
+            Ended::Superseded => "SUPERSEDED",
         }
     }
 }
@@ -94,6 +100,11 @@ struct Ticket {
     /// range (R-b), not on a fetch: it ends when no such write is left, and
     /// resumes UN-PINNED at the head that write has joined (the pin trap).
     queue_wait: Option<(Vec<u8>, Vec<u8>)>,
+    /// Its CHAIN has made progress: it was made by a walk resumed from a
+    /// ticket that ended `Loaded` (blocks arrived for an earlier hop). A
+    /// chain that progressed finishes on its tree; only one that has not may
+    /// be superseded (#330 ruling).
+    progressed: bool,
 }
 
 /// A fetch asked for before there was a page to ask (the store exists from
@@ -118,6 +129,12 @@ pub struct PageStore<H: Host> {
     last_ticket: Option<u64>,
     /// The root this call's walks are pinned to ([`PageStore::resume`]).
     pinned: Option<Cid>,
+    /// The pin came from a ticket that ended `Loaded`: a ticket this call
+    /// makes continues a chain that has made progress.
+    pinned_progressed: bool,
+    /// The Server's adoption count last seen: a newer one is a head moved
+    /// past older roots, when stalled tickets are superseded.
+    seen_adoptions: u64,
     deferred: Vec<Deferred>,
     /// Walks made — what a test and the cost measurement read.
     pub walks: u64,
@@ -152,6 +169,8 @@ impl<H: Host> PageStore<H> {
             ended: Vec::new(),
             last_ticket: None,
             pinned: None,
+            pinned_progressed: false,
+            seen_adoptions: 0,
             deferred: Vec::new(),
             walks: 0,
             answered_at: None,
@@ -219,6 +238,32 @@ impl<H: Host> PageStore<H> {
                 }
             };
             self.end(id, how, now);
+        }
+        // A NEWER HEAD (#330 ruling): every open ticket pinned to an older
+        // root whose chain has made no progress, and whose engine read has
+        // had no block since it started while it waits on one, ends
+        // SUPERSEDED — its read withdrawn — and the chain runs again at the
+        // head. Answer-driven (the head moved), never a clock (rule 8); a
+        // chain receiving blocks finishes on its tree (inv. 2).
+        let (adoptions, head) = {
+            let h = self.host.as_ref().expect("checked");
+            (h.peek(|s| s.adoptions()), h.peek(|s| s.read_root()))
+        };
+        if adoptions > self.seen_adoptions {
+            self.seen_adoptions = adoptions;
+            let candidates: Vec<u64> = self
+                .tickets
+                .iter()
+                .filter(|(_, t)| t.ended.is_none() && t.queue_wait.is_none() && !t.progressed)
+                .filter(|(_, t)| t.root.is_some() && t.root != head)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in candidates {
+                let h = self.host.as_mut().expect("checked");
+                if h.with_server(|s| s.supersede_fetch(id)) {
+                    self.end(id, Ended::Superseded, now);
+                }
+            }
         }
         // Reads waiting on this page's own write still applying: ended once
         // no such write is left in their range.
@@ -355,6 +400,7 @@ impl<H: Host> PageStore<H> {
             Some(Ticket { ended: Some(Ended::Loaded), root, .. }) => *root,
             _ => None,
         };
+        self.pinned_progressed = self.pinned.is_some();
         self.tickets.remove(&ticket);
     }
 
@@ -406,6 +452,7 @@ impl<H: Host> PageStore<H> {
     /// The call ended: its pin goes.
     pub fn unpin(&mut self) {
         self.pinned = None;
+        self.pinned_progressed = false;
     }
 
     // NO TICKET LIFETIME (rules 7, 8): a ticket ENDS only on its answer —
@@ -447,7 +494,7 @@ impl<H: Host> PageStore<H> {
         let id = self.next_ticket;
         self.next_ticket += 1;
         let now = (self.now_ms)();
-        self.tickets.insert(id, Ticket { root, at_ms: now, ended: None, queue_wait: None });
+        self.tickets.insert(id, Ticket { root, at_ms: now, ended: None, queue_wait: None, progressed: self.pinned_progressed });
         self.last_ticket = Some(id);
         match self.host.as_mut() {
             Some(h) => h.with_server(|s| s.fetch(id, root, range)),
@@ -504,7 +551,7 @@ impl<H: Host> PageStore<H> {
             let id = self.next_ticket;
             self.next_ticket += 1;
             let now = (self.now_ms)();
-            self.tickets.insert(id, Ticket { root: None, at_ms: now, ended: None, queue_wait: Some((lo.to_vec(), hi.to_vec())) });
+            self.tickets.insert(id, Ticket { root: None, at_ms: now, ended: None, queue_wait: Some((lo.to_vec(), hi.to_vec())), progressed: false });
             self.last_ticket = Some(id);
             return Err(StoreError::NotLoaded);
         }
@@ -680,7 +727,7 @@ mod ended_tickets {
     }
 
     fn open(s: &mut PageStore<NoHost>, id: u64, now: u64) {
-        s.tickets.insert(id, Ticket { root: None, at_ms: now, ended: None, queue_wait: None });
+        s.tickets.insert(id, Ticket { root: None, at_ms: now, ended: None, queue_wait: None, progressed: false });
     }
 
     /// An abandoned read's ticket is not kept for the life of the page: of

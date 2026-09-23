@@ -147,6 +147,35 @@ await t("a load that ENDS without delivering rejects — it is not 'not yet'", a
 });
 
 
+await t("**a SUPERSEDED load restarts the whole chain, UNPINNED**: nothing resumed, asked again at the head (#330 ruling)", async () => {
+  // The first ticket ends SUPERSEDED (a newer head while it waited on a block nobody serves); the chain asks again
+  // from its first call, gets a NEW ticket at the head, and that one loads.
+  let asks = 0, ticket = 0, loaded = false, ended = [];
+  const s = {
+    scan() {
+      asks += 1;
+      if (loaded) return JSON.stringify([{ id: "at the head" }]);
+      ticket += 1;
+      const mine = ticket;
+      setTimeout(() => {
+        if (mine === 1) ended.push({ id: 1, ok: false, code: "SUPERSEDED" });
+        else { loaded = true; ended.push({ id: mine, ok: true, code: "LOADED" }); }
+        s.pump();
+      }, 5);
+      throw Object.assign(new Error("not loaded"), { code: "NOT_LOADED", transient: true, wait: mine });
+    },
+    take_loads() { const out = ended; ended = []; return JSON.stringify(out); },
+    resumed: [],
+    resume(tk) { s.resumed.push(tk); },
+    pump: () => {},
+  };
+  const db = engineDb(s);
+  s.pump = db.drain;
+  assert.deepEqual(await db.scan("tasks"), [{ id: "at the head" }], "a superseded read did not answer at the head");
+  assert.equal(asks, 3, `asks ${asks}: the first, the restart, and the one after its load`);
+  assert.deepEqual(s.resumed, [2], "the SUPERSEDED ticket was resumed (pinned to the old root) — or the new one was not");
+});
+
 await t("a NOT_LOADED with no ticket rejects rather than hanging", async () => {
   const s = {
     scan() { const e = new Error("x"); e.code = "NOT_LOADED"; throw e; },

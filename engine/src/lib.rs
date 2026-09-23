@@ -2382,6 +2382,7 @@ impl<B: Blocks> Engine<B> {
                 rounds: 0,
                 held: BTreeSet::from([root]),
                 gets: 0,
+                arrived: 0,
             },
         );
         let out = self.drive(req_id);
@@ -2599,6 +2600,35 @@ impl<B: Blocks> Engine<B> {
             }
         }
         out
+    }
+
+    /// SUPERSEDE a parked read (#330 ruling) — the caller has seen a head
+    /// move past its root — ONLY IF it has made no progress: no block has
+    /// arrived for it since it started, and it waits on at least one (a GET
+    /// unanswered or answered NotFound). Then it is FORGOTTEN, never
+    /// answered, and each block only it waited on is WITHDRAWN (its group's
+    /// repair ended with it), so the page ends that GET instead of re-asking
+    /// it for ever. `false`: it is not parked, or it is making progress — it
+    /// finishes on its own tree (READ-STATE inv. 2). An answer-driven end:
+    /// the head moved; no clock is read (rule 8).
+    pub fn supersede_read(&mut self, req_id: read::ReqId) -> bool {
+        let Some(p) = self.reads.parked.get(&req_id) else { return false };
+        let blocks: Vec<Cid> = self.reads.waiting.iter().filter(|(_, reqs)| reqs.contains(&req_id)).map(|(id, _)| *id).collect();
+        if p.arrived > 0 || blocks.is_empty() {
+            return false;
+        }
+        self.reads.parked.remove(&req_id);
+        self.forget_waiting(req_id);
+        for id in blocks {
+            if self.reads.waiting.contains_key(&id) {
+                continue;
+            }
+            if self.repairs.contains_key(&id) {
+                self.end_repair(id);
+            }
+            self.withdraw_if_unwanted(id);
+        }
+        true
     }
 
     fn forget_waiting(&mut self, req_id: read::ReqId) {
@@ -4600,6 +4630,7 @@ impl<B: Blocks> Engine<B> {
                     // re-descend through this block on its next attempt.
                     if let Some(p) = self.reads.parked.get_mut(r) {
                         p.held.extend(landed.iter().copied());
+                        p.arrived = p.arrived.saturating_add(1);
                     }
                 }
                 woken.extend(reqs);
@@ -4848,9 +4879,15 @@ impl<B: Blocks> Engine<B> {
         // WITHDRAWN (sdk#303): a slot no repair asks for any more, no read waits on, and the page does not
         // hold is no longer wanted -- its GET is dropped, not re-asked for ever.
         for slot in freed {
-            if !self.reads.waiting.contains_key(&slot) && self.blocks.get(&slot).is_none() {
-                self.withdrawn.insert(slot);
-            }
+            self.withdraw_if_unwanted(slot);
+        }
+    }
+
+    /// A block no read waits on and the page does not hold is WITHDRAWN: its GET ends instead of being re-asked for
+    /// ever (sdk#303). The one statement of "unwanted", for a freed repair slot and a superseded read's blocks alike.
+    fn withdraw_if_unwanted(&mut self, id: Cid) {
+        if !self.reads.waiting.contains_key(&id) && self.blocks.get(&id).is_none() {
+            self.withdrawn.insert(id);
         }
     }
 
