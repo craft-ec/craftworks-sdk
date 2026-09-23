@@ -45,7 +45,7 @@ try {
     const WS = 17700 + 2 * i, NET = 37700 + 2 * i;
     if ([7509, 7609].includes(WS) || [7509, 7609].includes(NET)) throw new Error("refusing an owner's port");
     const dir = mkdtempSync(join(tmpdir(), "pmo-node-")); for (const d of ["data", "config", "log"]) mkdirSync(join(dir, d));
-    const n = spawn("freenet", ["network", "--is-gateway", "--skip-load-from-network", "--network-address", "127.0.0.1", "--network-port", String(NET), "--public-network-address", "127.0.0.1", "--public-network-port", String(NET), "--ws-api-address", "127.0.0.1", "--ws-api-port", String(WS), "--data-dir", join(dir, "data"), "--config-dir", join(dir, "config"), "--log-dir", join(dir, "log"), "--disable-auto-update"], { stdio: "ignore" }); kids.push(n);
+    const n = spawn("freenet", ["network", "--is-gateway", "--skip-load-from-network", "--network-address", "127.0.0.1", "--network-port", String(NET), "--public-network-address", "127.0.0.1", "--public-network-port", String(NET), "--ws-api-address", "127.0.0.1", "--ws-api-port", String(WS), "--data-dir", join(dir, "data"), "--config-dir", join(dir, "config"), "--log-dir", join(dir, "log"), "--disable-auto-update"], { stdio: "ignore", env: { ...process.env, FREENET_WEBAPP_CACHE_DIR: join(dir, "webapp_cache") } }); kids.push(n);
     await new Promise(r => setTimeout(r, 5000));
     const t = await (await fetch(`http://127.0.0.1:${debug}/json/new?about:blank`, { method: "PUT" })).json();
     const ws = new WebSocket(t.webSocketDebuggerUrl); await new Promise(r => (ws.onopen = r));
