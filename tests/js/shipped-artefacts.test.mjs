@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -78,6 +79,16 @@ await t("**`modules` names EVERY module the package needs, each present (sdk#312
   assert.deepEqual([...manifest.modules].sort(), want, "`modules` is not what reachable.mjs computes");
   assert.ok(manifest.modules.includes("rto.js"), "THE CONTROL: rto.js (sdk#312) is not named");
   for (const m of manifest.modules) assert.ok(existsSync(join(web, m)), `${m} is named but not in pkg/web`);
+});
+
+await t("**every module the build EMITS passes the one module rule its consumers check (core_types::name::module_ok)**", async () => {
+  // The rule binds BOTH ends: the SDK never writes a module name its own
+  // `sdk.ids.module` refuses, so a consumer never has to reject the SDK's manifest.
+  const require = createRequire(import.meta.url);
+  const raw = require(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "pkg", "node", "craftworks_sdk.js"));
+  const refused = manifest.modules.filter(m => !raw.module_name_ok(m));
+  assert.deepEqual(refused, [], `the build emitted module names its own rule refuses: ${refused.join(", ")}`);
+  assert.equal(raw.module_name_ok("../escape.js"), false, "THE CONTROL: the rule refuses a path");
 });
 
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }

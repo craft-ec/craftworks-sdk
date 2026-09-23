@@ -210,6 +210,9 @@ export async function served(
     check = null,
     name = null,
     refusal = "a refusal",
+    // Options for every request (e.g. `{ cache: "no-store" }` for a file that
+    // must be read fresh). Passed as given; never a reason to end.
+    init = null,
   } = {},
 ) {
   const label = name ?? (url ?? (urls ?? []).join(", "));
@@ -226,7 +229,7 @@ export async function served(
     for (const from of sources) {
       let res;
       try {
-        res = await fetchWith(from);
+        res = await (init ? fetchWith(from, init) : fetchWith(from));
       } catch (e) {
         failures.push(`${from}: ${e?.message ?? e}`);
         continue;

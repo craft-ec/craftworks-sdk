@@ -92,6 +92,12 @@ assert.strictEqual(ids.hex32("+f" + "ab".repeat(31)), false, "hex has no sign");
 assert.strictEqual(ids.loc("0".repeat(32)), true);
 assert.strictEqual(ids.loc("0".repeat(64)), true, "a record under a parent");
 assert.strictEqual(ids.loc("0".repeat(48)), false);
+const rk = "0123456789abcdef".repeat(2);
+assert.strictEqual(ids.slot(rk), rk, "a bare record id is its own slot");
+assert.strictEqual(ids.slot("f".repeat(32) + rk), rk, "a record under a parent: its slot is the last half");
+assert.strictEqual(ids.slot("not-a-record-id"), undefined);
+assert.strictEqual(ids.module("wrap.js"), true);
+for (const bad of ["../wrap.js", "a/b.js", ".x.js", "x.wasm", ""]) assert.strictEqual(ids.module(bad), false, bad);
 
 assert.match(sdk.version(), /^\d+\.\d+\.\d+$/);
 console.log(`ok ${n} content-hash vectors, ${m} block vectors, ids parse back, sdk ${sdk.version()}`);

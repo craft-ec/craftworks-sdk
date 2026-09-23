@@ -172,6 +172,20 @@ pub fn loc_ok(hex: &str) -> bool {
     id::loc_from_hex(hex).is_some()
 }
 
+/// A record id's own slot (its rkey, 32 hex), whether it is bare (32) or under
+/// a parent (64); `undefined` when it is not a record id (`sdk.ids.slot`).
+#[wasm_bindgen]
+pub fn loc_slot(hex: &str) -> Option<String> {
+    id::loc_from_hex(hex).map(|l| id::to_hex(&l.rkey))
+}
+
+/// Is `name` a module an app may carry beside the SDK's index.js
+/// (`sdk.ids.module`, `core_types::name::module_ok`): a file name, never a path.
+#[wasm_bindgen]
+pub fn module_name_ok(name: &str) -> bool {
+    core_types::name::module_ok(name)
+}
+
 fn err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }
