@@ -766,3 +766,14 @@ fn the_nodes_entry_passes_the_attested_origin() {
     assert!(code.contains("Some(MessageOrigin::WebApp(_)) => crate::Origin::WebApp"), "a served app is not named as one");
     assert!(code.contains("fn process("), "THE CONTROL: the reader did not find the entry");
 }
+
+/// A record that EXISTS but does not decode fails CLOSED: read as "no record", any version would be signed — the
+/// self-fork the record stops (engineer4, #332 review).
+#[test]
+fn an_undecodable_site_record_refuses_rather_than_signing_anew() {
+    let mut w = World::new();
+    assert!(matches!(site(&mut w, Origin::Unattested, "notes", 3, 1), Answer::Signed(_)), "THE SETUP");
+    w.host.secrets.insert(site_record_key("notes"), b"\x01garbage".to_vec());
+    assert_eq!(site(&mut w, Origin::Unattested, "notes", 1, 2), Answer::Refused(Why::CannotSign), "a corrupt record let an older version be signed");
+    assert!(matches!(site(&mut w, Origin::Unattested, "other", 1, 2), Answer::Signed(_)), "THE CONTROL: another label is unaffected");
+}

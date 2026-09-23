@@ -60,6 +60,15 @@ pub fn tar(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
 }
 
 /// The node's web-container framing (freenet 0.2.136 `app_packaging.rs`).
+pub fn container(metadata: &[u8], web: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16 + metadata.len() + web.len());
+    v.extend_from_slice(&(metadata.len() as u64).to_be_bytes());
+    v.extend_from_slice(metadata);
+    v.extend_from_slice(&(web.len() as u64).to_be_bytes());
+    v.extend_from_slice(web);
+    v
+}
+
 /// A state in the node's web framing, split into its metadata and web parts: exactly, or `None` (the inverse
 /// of [`container`]).
 pub fn split(state: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -69,15 +78,6 @@ pub fn split(state: &[u8]) -> Option<(&[u8], &[u8])> {
     let (wl, web) = rest.split_at_checked(8)?;
     let wlen = usize::try_from(u64::from_be_bytes(wl.try_into().ok()?)).ok()?;
     (wlen == web.len()).then_some((meta, web))
-}
-
-pub fn container(metadata: &[u8], web: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16 + metadata.len() + web.len());
-    v.extend_from_slice(&(metadata.len() as u64).to_be_bytes());
-    v.extend_from_slice(metadata);
-    v.extend_from_slice(&(web.len() as u64).to_be_bytes());
-    v.extend_from_slice(web);
-    v
 }
 
 /// `data` as a valid `.xz` stream whose one block holds LZMA2 STORED chunks:
@@ -134,10 +134,17 @@ pub fn xz_stored(data: &[u8]) -> Vec<u8> {
 /// An APP web container: `files` as a deterministic tar, stored-chunk xz,
 /// in the node's framing, with no metadata.
 pub fn app_container(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    Ok(container(&[], &app_web(files)?))
+}
+
+/// An app's WEB part — what its container carries after the framing — for a
+/// site, which frames it with its own metadata (builder#117). The builder never
+/// counts the framing's bytes: this is the one place that knows them.
+pub fn app_web(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     if files.is_empty() {
         return Err("an app container with no files".into());
     }
-    Ok(container(&[], &xz_stored(&tar(files)?)))
+    Ok(xz_stored(&tar(files)?))
 }
 
 fn varint(out: &mut Vec<u8>, mut v: u64) {

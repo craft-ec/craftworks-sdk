@@ -26,6 +26,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
 protocol = { path = "protocol" }
+# The app-id rule's one statement (`app_id_ok`, `MAX_APP`): the signer checks it
+# too and cannot link this crate, so it lives in the lowest crate both use.
+signer-proto = { path = "signer-proto" }
 # READ-STATE (design B): the page's store reads by WALKING the in-page engine's
 # tree over its blocks (`page_store`), so the store that `Db` reads through is
 # the engine's own host, not a copy of its rows. Neither depends on this crate.

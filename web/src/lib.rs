@@ -375,6 +375,13 @@ impl AppContainer {
         let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
         wire::webapp::app_container(&files).map_err(|e| JsError::new(&e))
     }
+
+    /// Its WEB part, unframed: what `Session.publish_site` takes (builder#117).
+    /// The framing is the SDK's to know; a page never counts its bytes.
+    pub fn web(&self) -> Result<Vec<u8>, JsError> {
+        let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        wire::webapp::app_web(&files).map_err(|e| JsError::new(&e))
+    }
 }
 
 /// This page's wasm linear memory, in bytes: what a tree reader costs is

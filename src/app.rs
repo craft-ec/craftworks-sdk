@@ -10,8 +10,9 @@
 
 use crate::db::DbError;
 
-/// The longest app id.
-pub const MAX_APP: usize = 32;
+/// The longest app id: the rule's one statement is signer-proto's, which the
+/// signer checks too.
+pub use signer_proto::MAX_APP;
 
 /// The longest name an app WRITES — a domain, relative to the app.
 ///
@@ -24,8 +25,7 @@ pub const MAX_NAME: usize = 32;
 
 /// Is `app` an app id: 1–32 of a-z 0-9 _ - (no `.`, no `@`, no `/`).
 pub fn check(app: &str) -> Result<(), DbError> {
-    let ok = (1..=MAX_APP).contains(&app.len()) && app.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b));
-    if ok { Ok(()) } else { Err(DbError::Refused(format!("app id `{app}` must be 1–{MAX_APP} of a-z 0-9 _ -"))) }
+    if signer_proto::app_id_ok(app) { Ok(()) } else { Err(DbError::Refused(format!("app id `{app}` must be 1–{MAX_APP} of a-z 0-9 _ -"))) }
 }
 
 /// Is `name` a name an app may use: 1–32 of a-z 0-9 _ - . — the same rule a

@@ -417,7 +417,16 @@ fn sign_site<H: Host>(host: &mut H, origin: Origin, app: &str, version: u64, bun
         return Answer::Refused(Why::CannotSign);
     };
     let name = site_record_key(app);
-    let record: Option<SiteRecord> = host.get_secret(&name).and_then(|b| bincode::deserialize(&b).ok());
+    // A record that EXISTS but does not decode is not "no record": read as
+    // none, `decide_site` would sign any version — the self-fork the record
+    // exists to stop (engineer4, #332 review). It fails CLOSED.
+    let record: Option<SiteRecord> = match host.get_secret(&name) {
+        None => None,
+        Some(b) => match bincode::deserialize(&b) {
+            Ok(r) => Some(r),
+            Err(_) => return Answer::Refused(Why::CannotSign),
+        },
+    };
     if let Err(a) = decide_site(record.as_ref(), version, &bundle) {
         return a;
     }

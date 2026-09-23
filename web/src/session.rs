@@ -597,8 +597,10 @@ impl Session {
     }
 
     /// Where the site publication stands, as JSON:
-    /// `{"state":"none"|"reading"|"signing"|"putting"|"published"|"refused","version":N,"key":"…","said":"…"}`.
-    /// `published` once the node has acknowledged the version's PUT.
+    /// `{"state":"none"|"reading"|"signing"|"putting"|"published"|"refused"|"cancelled","version":N,"key":"…","said":"…"}`.
+    /// `published` once the node has acknowledged the version's PUT;
+    /// `refused` in the signer's or the node's words; `cancelled` a person
+    /// stopped its PUT (engineer2, #332 review: not the node's refusal).
     pub fn site_status(&self) -> String {
         use page::AppPut;
         use page_io::SiteStage;
@@ -611,7 +613,7 @@ impl Session {
             SiteStage::Putting(v) => match self.page().and_then(|p| p.app_put(&key)) {
                 Some(AppPut::Put) => ("published", v, String::new()),
                 Some(AppPut::Refused(w)) => ("refused", v, w.clone()),
-                Some(AppPut::Cancelled) => ("refused", v, "cancelled".into()),
+                Some(AppPut::Cancelled) => ("cancelled", v, String::new()),
                 _ => ("putting", v, String::new()),
             },
             SiteStage::Refused(w) => ("refused", 0, w),

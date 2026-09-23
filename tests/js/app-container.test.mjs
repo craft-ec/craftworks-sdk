@@ -42,6 +42,14 @@ await t("**deterministic, whatever order the files are added in** — so one app
   assert.notDeepEqual(webapp_params(changed), webapp_params(a), "THE CONTROL: a different app got the same params");
 });
 
+await t("**web() is finish() without the node's framing** — the part a site frames itself (builder#117)", async () => {
+  const c = new AppContainer();
+  for (const [p, b] of FILES) c.add(p, b);
+  const state = c.finish(), web = c.web();
+  assert.deepEqual(web, state.subarray(16), "web() is not the container's web part");
+  assert.throws(() => new AppContainer().web(), /no files/);
+});
+
 await t("a path added twice, an unsafe path, and an empty container are refused", async () => {
   const c = new AppContainer();
   c.add("a.js", enc("1"));
