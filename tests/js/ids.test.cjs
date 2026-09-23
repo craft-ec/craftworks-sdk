@@ -79,5 +79,19 @@ const root = api.parseBlockId(db.root());
 assert.strictEqual(root.tag, "node", "a tree root is a tree-node block");
 assert.strictEqual(root.id, db.root());
 
+// THE SDK'S ID RULES for pages and tools (sdk.ids): each is Rust's one statement,
+// so a page never writes the rule again. Accept and refuse, both ways.
+const ids = api.ids;
+ids.app("notes-1_x");
+assert.throws(() => ids.app("Has.Dot"), /app id `Has\.Dot` must be 1–32 of a-z 0-9 _ -/);
+assert.throws(() => ids.app("a".repeat(33)), /must be 1–32/);
+assert.strictEqual(ids.hex32("ab".repeat(32)), true);
+assert.strictEqual(ids.hex32("AB".repeat(32)), true, "either case, as a head id's parse always took");
+assert.strictEqual(ids.hex32("ab".repeat(31)), false);
+assert.strictEqual(ids.hex32("+f" + "ab".repeat(31)), false, "hex has no sign");
+assert.strictEqual(ids.loc("0".repeat(32)), true);
+assert.strictEqual(ids.loc("0".repeat(64)), true, "a record under a parent");
+assert.strictEqual(ids.loc("0".repeat(48)), false);
+
 assert.match(sdk.version(), /^\d+\.\d+\.\d+$/);
 console.log(`ok ${n} content-hash vectors, ${m} block vectors, ids parse back, sdk ${sdk.version()}`);

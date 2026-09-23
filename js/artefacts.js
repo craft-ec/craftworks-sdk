@@ -77,6 +77,13 @@ async function best(effort, fallback = null) {
  * the cache OFF, which is the control proving the cache is what avoids the
  * second fetch rather than something else in the environment.
  */
+/** THE one wait between rounds: `ms`, or less if a person cancels (`sig`). */
+const sleepFor = (ms, sig) =>
+  new Promise(ok => {
+    const t = setTimeout(ok, ms);
+    sig?.addEventListener?.("abort", () => { clearTimeout(t); ok(); }, { once: true });
+  });
+
 /**
  * The page's Cache Storage, or `null` where it cannot be had. In a SANDBOXED
  * frame without `allow-same-origin` — which is how a node serves every web
@@ -104,11 +111,7 @@ export async function artefactBytes(
     onWait = null,
     // A person's cancel. Nothing else ends a wait.
     signal = null,
-    sleep = (ms, sig) =>
-      new Promise(ok => {
-        const t = setTimeout(ok, ms);
-        sig?.addEventListener?.("abort", () => { clearTimeout(t); ok(); }, { once: true });
-      }),
+    sleep = sleepFor,
     now = () => Date.now(),
   } = {},
 ) {
@@ -144,33 +147,82 @@ export async function artefactBytes(
   // because anything different does not hash to this.
   //
   // First one that VERIFIES wins, not first that answers: a source that
-  // returns 200 with the wrong bytes must not end the search. Every failure
-  // is kept, so a total failure can say what each source actually did rather
-  // than only naming the last.
-  // ONE OR THE OTHER, never both. Taking `urls` and ignoring `url` silently
-  // drops a source a caller believed it had supplied, and the symptom would
-  // be an artefact that resolves from the wrong place — or not at all, with
-  // no hint that half the request was discarded.
-  if (url && urls) {
-    throw new Error(
-      `artefact ${sha256} was given both \`url\` and \`urls\`; pass one. ` +
-        "Taking either silently would drop a source the caller supplied.",
-    );
-  }
-  const sources = urls ?? (url ? [url] : []);
-  if (sources.length === 0) {
-    throw new Error(`artefact ${sha256} has no url to fetch it from`);
-  }
-  let bytes = null;
-  const started = now();
+  // returns 200 with the wrong bytes must not end the search.
+  //
   // The wrong hash each source answered LAST round. A 200 whose bytes do not
   // hash is not yet a refusal: a node unpacking its web cache serves a TORN
   // (truncated) file for a moment (measured: 1,242,614 B of 1,259,519), which
   // hashes wrong and then right. The SAME wrong bytes twice is an answer.
   const wrongBefore = new Map();
+  const bytes = await served(
+    { url, urls },
+    {
+      fetch: fetchWith, signal, sleep, now,
+      name: `artefact ${sha256}`,
+      refusal: "a hash mismatch",
+      onWait: onWait && (w => onWait({ sha256, ...w })),
+      check: async (got, from) => {
+        const digest = await digestOf(got, subtle);
+        if (digest === sha256) return null;
+        // Never installed, never cached. A wrong artefact is not a smaller one.
+        const again = digest !== null && wrongBefore.get(from) === digest;
+        wrongBefore.set(from, digest);
+        return { says: `does not hash to ${sha256} (${got.length} B hashing to ${digest}${again ? ", the same again" : ""})`, answer: again };
+      },
+    },
+  );
+  // Storing is the OPTIONAL part: a full or refused cache costs the next app
+  // a fetch, which is what it would have paid anyway.
+  if (box) await best(() => box.put(key, new Response(bytes)));
+  return bytes;
+}
+
+/**
+ * THE ONE FETCH (#126 ruling): every file a page or a tool fetches from the
+ * node over HTTP comes through here — a web container's own files, the SDK's
+ * artefacts, a builder's files. Re-asked until answered on the PAGE'S back-off
+ * (`rto.js`, generated from page/src/rto.rs and pinned to it by a test), with
+ * no give-up of its own: a 404, a 5xx or a network error is "not held yet",
+ * never an end (rules 7, 8). While it waits it says so (`onWait`, naming the
+ * file). What ends it: a person's cancel (`signal`), or — only where the
+ * caller passes a `check` — every source ANSWERING with bytes the check
+ * refuses as final.
+ *
+ * THE BOOTSTRAP EXCEPTION to rule 5 (architect, #126): node DATA goes through
+ * the page's one sender, `Page::send`, which does not exist until the SDK's
+ * wasm is loaded. The files that load it — and the code and web files a node
+ * serves over HTTP — can only be fetched here. Nothing fetched AFTER load that
+ * is node data may come this way.
+ *
+ * `{ url }` or `{ urls }` (never both: taking either silently would drop a
+ * source the caller supplied). `check(bytes, from)`: `null` to accept, or
+ * `{ says, answer }` — `answer` true when this source has given its final word
+ * (then, from EVERY source, the fetch is refused, by `refusal`).
+ */
+export async function served(
+  { url, urls },
+  {
+    fetch: fetchWith = typeof fetch === "function" ? fetch : null,
+    onWait = null,
+    signal = null,
+    sleep = sleepFor,
+    now = () => Date.now(),
+    check = null,
+    name = null,
+    refusal = "a refusal",
+  } = {},
+) {
+  const label = name ?? (url ?? (urls ?? []).join(", "));
+  if (url && urls) {
+    throw new Error(`${label} was given both \`url\` and \`urls\`; pass one. Taking either silently would drop a source the caller supplied.`);
+  }
+  const sources = urls ?? (url ? [url] : []);
+  if (sources.length === 0) throw new Error(`${label} has no url to fetch it from`);
+  const started = now();
   for (let round = 0; ; round += 1) {
+    // Every failure is kept, so a wait can say what each source actually did.
     const failures = [];
-    let mismatched = 0;
+    let answered = 0;
     for (const from of sources) {
       let res;
       try {
@@ -180,7 +232,7 @@ export async function artefactBytes(
         continue;
       }
       if (!res.ok) {
-        // NOT AN ANSWER about the bytes: the node does not hold them yet.
+        // NOT AN ANSWER about the file: the node does not hold it yet.
         failures.push(`${from}: ${res.status}`);
         continue;
       }
@@ -193,34 +245,23 @@ export async function artefactBytes(
         failures.push(`${from}: ${e?.message ?? e}`);
         continue;
       }
-      const digest = await digestOf(got, subtle);
-      if (digest !== sha256) {
-        // Never installed, never cached. A wrong artefact is not a smaller one.
-        const again = digest !== null && wrongBefore.get(from) === digest;
-        if (again) mismatched += 1;
-        wrongBefore.set(from, digest);
-        failures.push(`${from}: does not hash to ${sha256} (${got.length} B hashing to ${digest}${again ? ", the same again" : ""})`);
-        continue;
-      }
-      bytes = got;
-      break;
+      const refused = check ? await check(got, from) : null;
+      if (!refused) return got;
+      if (refused.answer) answered += 1;
+      failures.push(`${from}: ${refused.says}`);
     }
-    if (bytes) break;
-    // NAMES WHICH ARTEFACT AND WHAT EACH SOURCE DID. An app that will not
-    // open is the symptom a person reports, so the first thing they can send
-    // has to identify the block and say what was tried.
+    // NAMES WHICH FILE AND WHAT EACH SOURCE DID: the first thing a person can
+    // send when an app will not open.
     const what = failures.join("\n  ");
-    if (mismatched === sources.length) {
-      // EVERY source ANSWERED the same wrong bytes twice: the one refusal.
-      throw new Error(`artefact ${sha256} refused: a hash mismatch from every source:\n  ${what}`);
+    if (answered === sources.length) {
+      throw new Error(`${label} refused: ${refusal} from every source:\n  ${what}`);
     }
     const waitedMs = now() - started;
     if (signal?.aborted) {
-      throw new Error(`artefact ${sha256}: cancelled after ${Math.round(waitedMs / 1000)} s unanswered:\n  ${what}`);
+      throw new Error(`${label}: cancelled after ${Math.round(waitedMs / 1000)} s unanswered:\n  ${what}`);
     }
     const nextMs = RTO_SCHEDULE_MS[Math.min(round, RTO_SCHEDULE_MS.length - 1)];
     onWait?.({
-      sha256,
       waitedMs,
       nextMs,
       failures,
@@ -228,13 +269,14 @@ export async function artefactBytes(
     });
     await sleep(nextMs, signal);
     if (signal?.aborted) {
-      throw new Error(`artefact ${sha256}: cancelled after ${Math.round((now() - started) / 1000)} s unanswered:\n  ${what}`);
+      throw new Error(`${label}: cancelled after ${Math.round((now() - started) / 1000)} s unanswered:\n  ${what}`);
     }
   }
-  // Storing is the OPTIONAL part: a full or refused cache costs the next app
-  // a fetch, which is what it would have paid anyway.
-  if (box) await best(() => box.put(key, new Response(bytes)));
-  return bytes;
+}
+
+/** A file's text, through the one fetch. */
+export async function servedText(source, deps) {
+  return new TextDecoder().decode(await served(source, deps));
 }
 
 async function digestOf(bytes, subtle) {
