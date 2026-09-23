@@ -355,10 +355,10 @@ impl Node {
                 return Ok(out);
             }
             for id in missing {
-                let g = engine::repair::find_group(&r, *root, id).ok_or_else(|| format!("block {} is in no held group", format!("{:?}", &id[..4])))?;
+                let g = engine::repair::find_group(&r, *root, id).ok_or_else(|| format!("block {:?} is in no held group", &id[..4]))?;
                 let have: Vec<Option<Vec<u8>>> = g.slots.iter().enumerate().map(|(i, s)| r.get(s).filter(|b| g.fits(i, b)).map(|b| g.stored(i, b))).collect();
                 let held = have.iter().filter(|h| h.is_some()).count();
-                let body = engine::repair::rebuild(&g, &have).map_err(|e| format!("block {} not rebuildable: {held} of k={} held: {e}", format!("{:?}", &id[..4]), g.k))?;
+                let body = engine::repair::rebuild(&g, &have).map_err(|e| format!("block {:?} not rebuildable: {held} of k={} held: {e}", &id[..4], g.k))?;
                 r.rebuilt.insert(id, body);
             }
         }
