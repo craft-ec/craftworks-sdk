@@ -1412,7 +1412,7 @@ fn a_site_is_published_at_one_address_and_each_publish_is_the_next_version() {
     assert_eq!(key2, key, "a republish moved the site's address");
     assert_eq!(stage, page_io::SiteStage::Putting(2), "{:?}", io.unusable());
     assert_eq!(v(&node), (2, blake3::hash(b"web v2").as_bytes().to_vec(), b"web v2".to_vec()));
-    assert!(node.served.get("signer").is_some(), "the signer never signed");
+    assert!(node.served.contains_key("signer"), "the signer never signed");
 }
 
 /// NO LIVELOCK (architect, #117): the signer's own record is AHEAD of what the node holds (a version signed whose

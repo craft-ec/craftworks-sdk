@@ -223,6 +223,21 @@ pub fn decode_answer(bytes: &[u8]) -> Option<(u32, Answer)> {
     decode(bytes, 1024 * 1024)
 }
 
+// ---- Sites (builder#117): the one statement of a site's name and params, for the signer and the page ----
+
+/// The app id rule (the SDK's `app::check`, the site contract's label): 1-32 of `[a-z0-9_-]`.
+pub fn app_id_ok(app: &str) -> bool {
+    (1..=32).contains(&app.len()) && app.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
+
+/// The site's params: this signer's Register params with the label `site:<app>` instead of its own. `None` unless
+/// they are ONE key's (`RG01 ‖ 0 ‖ key ‖ label`): a signer holds one key.
+pub fn site_params(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
+    let head = register_params.get(..4 + 1 + 32)?;
+    (head.starts_with(b"RG01") && head[4] == 0).then(|| [head, b"site:".as_slice(), app.as_bytes()].concat())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,19 +326,5 @@ mod tests {
             "an engine reply was read as a signer answer"
         );
     }
-}
-
-// ---- Sites (builder#117): the one statement of a site's name and params, for the signer and the page ----
-
-/// The app id rule (the SDK's `app::check`, the site contract's label): 1-32 of `[a-z0-9_-]`.
-pub fn app_id_ok(app: &str) -> bool {
-    (1..=32).contains(&app.len()) && app.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
-}
-
-/// The site's params: this signer's Register params with the label `site:<app>` instead of its own. `None` unless
-/// they are ONE key's (`RG01 ‖ 0 ‖ key ‖ label`): a signer holds one key.
-pub fn site_params(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
-    let head = register_params.get(..4 + 1 + 32)?;
-    (head.starts_with(b"RG01") && head[4] == 0).then(|| [head, b"site:".as_slice(), app.as_bytes()].concat())
 }
 
