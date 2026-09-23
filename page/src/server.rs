@@ -649,7 +649,7 @@ impl Server {
     }
 
     /// The (warm, published) roots: warm for this page's own editing,
-    /// published for its own-as-visitor. `None` before the head is recovered.
+    /// published for its own tree when read as another user. `None` before the head is recovered.
     pub fn heads(&self) -> Option<(freenet_prolly::Cid, freenet_prolly::Cid)> {
         self.page.recovered().then(|| (self.page.warm_root(), self.page.published().1))
     }

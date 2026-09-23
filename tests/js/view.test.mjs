@@ -1,7 +1,7 @@
 // A VIEW OF SOMEBODY'S PUBLISHED HEAD (sdk#239), through the REAL `Session`.
 //
 // Published data is readable by default; writing is access control, which a
-// visitor does not have. So a view reads the named head and its blocks, and:
+// reader does not have. So a view reads the named head and its blocks, and:
 //   - installs NOTHING on the node it reads from: no delegate registered, no
 //     signer message, no PUT, no UPDATE — only GETs (main's addition);
 //   - refuses every write before it reaches the store — the safety net under

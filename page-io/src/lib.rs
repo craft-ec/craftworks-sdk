@@ -354,7 +354,7 @@ impl PageIo {
     /// control, which a reader does not have.
     ///
     /// * NO SIGNER, and nothing provisioned or registered on the node: a
-    ///   visitor leaves no trace on the node it reads from beyond the blocks
+    ///   reader leaves no trace on the node it reads from beyond the blocks
     ///   it caches and its subscription to the head.
     /// * The head is read by GET with subscribe (a peered node serves a bare
     ///   GET of a delegate-created register falsely, F55; and the subscription
@@ -389,7 +389,7 @@ impl PageIo {
     /// request clock — WITHOUT registering it first. On the node that holds
     /// a person's key the answer names their Register; anywhere else the node
     /// has no such delegate (refused), or it holds no key: either way nothing
-    /// is installed, minted or provisioned, and a visitor leaves no trace.
+    /// is installed, minted or provisioned, and a reader leaves no trace.
     /// The answer: [`PageIo::asked`].
     pub fn ask(&mut self) {
         self.asking = true;
@@ -410,7 +410,7 @@ impl PageIo {
         self.asked.as_ref().filter(|_| self.asking)
     }
 
-    /// MAY THIS PAGE WRITE `head` (`None`: its OWN tree, a `viewer`
+    /// MAY THIS PAGE WRITE `head` (`None`: its OWN tree, a `mine`
     /// component's)? Derived each time from what this page holds -- the
     /// signer's answer, the opening -- and kept nowhere else.
     ///
@@ -465,7 +465,7 @@ impl PageIo {
         self.asking && !self.claimed
     }
 
-    /// OPEN THE PERSON'S OWN TREE ON AN ASKED PAGE (DATA-SOURCE `viewer`):
+    /// OPEN THE PERSON'S OWN TREE ON AN ASKED PAGE (DATA-SOURCE `mine`):
     /// the same opening as [`PageIo::begin`], from where the answer left it.
     /// - It signs for a Register: that is this person's tree on this node,
     ///   opened as it is. Nothing is registered or minted.
@@ -763,7 +763,7 @@ impl PageIo {
                         self.first = None;
                         self.exhausted = true;
                         // Measured on 0.2.136: a node WITHOUT the signer
-                        // delegate answers its request EMPTY — a visitor's.
+                        // delegate answers its request EMPTY — another user's node.
                         if self.asking() {
                             self.asked = Some(Asked::NoSigner(format!("no signer on this node: it answered EMPTY {} times", self.first_empties)));
                         }
