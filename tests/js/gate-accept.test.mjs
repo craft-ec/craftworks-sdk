@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -129,6 +129,100 @@ t("**gate.sh hands --accept to the helper WITH the step-failure flag, and writes
 t("THE CONTROL: the helper really runs under /bin/bash (3.2 on macOS)", () => {
   const v = execFileSync("/bin/bash", ["-c", "echo $BASH_VERSION"], { encoding: "utf8" }).trim();
   assert.ok(v.length > 0);
+});
+
+// ── ONE FILE PER MEMBER (sdk#279) ─────────────────────────────────────────
+// `gate.baseline.d/<member>` holds one count. The same rules as the file:
+// a failed step or a fall is refused byte-identically, the write is checked,
+// and what is written reads back — per member.
+
+/** A baseline DIRECTORY (`{member: count}`) and a run's counts; run the helper. */
+function acceptDir(members, counts, failed = 0, extra = []) {
+  const root = mkdtempSync(join(tmpdir(), "gate-accept-d-"));
+  const d = join(root, "gate.baseline.d"), c = join(root, "counts");
+  mkdirSync(d);
+  for (const [k, v] of Object.entries(members)) writeFileSync(join(d, k), `${v}\n`);
+  writeFileSync(c, counts);
+  const snap = () => readdirSync(d).sort().map(f => `${f}=${readFileSync(join(d, f), "utf8")}`).join("|");
+  const before = snap();
+  const r = spawnSync("/bin/bash", [helper, d, String(failed), c, ...extra], { encoding: "utf8", env: { ...process.env, GATE_FREE_GIB_FOR_TEST: "100" } });
+  const now = Object.fromEntries(readdirSync(d).sort().map(f => [f, readFileSync(join(d, f), "utf8").trim()]));
+  return { rc: r.status, out: r.stdout, err: r.stderr, unchanged: snap() === before, now };
+}
+
+t("**a green run that raises a count records ONE FILE PER MEMBER, and reads it back**", () => {
+  const r = acceptDir({ "craftworks-sdk": 221, engine: 78, npm: 146 }, "craftworks-sdk=222\nengine=78\nnpm=146\n");
+  assert.equal(r.rc, 0, r.err);
+  assert.deepEqual(r.now, { "craftworks-sdk": "222", engine: "78", npm: "146" });
+  assert.match(r.out, /recorded 3 counts in .*gate\.baseline\.d/);
+});
+
+t("**a count that FALLS is refused, and the directory is byte-identical**", () => {
+  const r = acceptDir({ "craftworks-sdk": 221, engine: 78 }, "craftworks-sdk=220\nengine=79\n");
+  assert.notEqual(r.rc, 0, "a fall was recorded");
+  assert.ok(r.unchanged, "a refused run changed the directory");
+  assert.match(r.err, /craftworks-sdk would fall 221 -> 220/);
+});
+
+t("a run whose STEP FAILED is refused, and the directory is byte-identical", () => {
+  const r = acceptDir({ engine: 78 }, "engine=90\n", 1);
+  assert.notEqual(r.rc, 0);
+  assert.ok(r.unchanged);
+});
+
+t("a member no longer counted LOSES its file — the directory says what the tree holds", () => {
+  const r = acceptDir({ engine: 78, gone: 5 }, "engine=78\n");
+  assert.equal(r.rc, 0, r.err);
+  assert.deepEqual(Object.keys(r.now), ["engine"], "a gone member's file outlived it");
+});
+
+/** A throwaway repository with `gate.baseline.d`, and a git that needs no config. */
+function repo(members) {
+  const dir = mkdtempSync(join(tmpdir(), "gate-merge-"));
+  const git = (...a) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@invalid", "-c", "commit.gpgsign=false", ...a], { cwd: dir, encoding: "utf8" });
+  git("init", "-q", "-b", "main");
+  mkdirSync(join(dir, "gate.baseline.d"));
+  for (const [k, v] of Object.entries(members)) writeFileSync(join(dir, "gate.baseline.d", k), `${v}\n`);
+  git("add", "-A"); git("commit", "-q", "-m", "base");
+  const branch = (name, member, value) => {
+    git("checkout", "-q", "-b", name, "main");
+    writeFileSync(join(dir, "gate.baseline.d", member), `${value}\n`);
+    git("commit", "-q", "-am", name);
+    git("checkout", "-q", "main");
+  };
+  return { dir, git, branch };
+}
+
+t("**two PRs that move DIFFERENT members merge with no conflict** — the reason for the split", () => {
+  const { git, branch, dir } = repo({ "craftworks-sdk": 349, engine: 125, npm: 229 });
+  branch("a", "engine", 129);
+  branch("b", "npm", 231);
+  assert.equal(git("merge", "-q", "--no-edit", "a").status, 0);
+  const m = git("merge", "-q", "--no-edit", "b");
+  assert.equal(m.status, 0, `independent count changes conflicted: ${m.stdout}${m.stderr}`);
+  assert.equal(readFileSync(join(dir, "gate.baseline.d", "engine"), "utf8").trim(), "129");
+  assert.equal(readFileSync(join(dir, "gate.baseline.d", "npm"), "utf8").trim(), "231");
+});
+
+t("THE CONTROL: two PRs that move the SAME member DO conflict — on that one file, as they should", () => {
+  const { git, branch } = repo({ engine: 125, npm: 229 });
+  branch("a", "engine", 129);
+  branch("b", "engine", 127);
+  assert.equal(git("merge", "-q", "--no-edit", "a").status, 0);
+  const m = git("merge", "-q", "--no-edit", "b");
+  assert.notEqual(m.status, 0, "two changes to one member's count merged silently");
+  assert.match(git("diff", "--name-only", "--diff-filter=U").stdout.trim(), /^gate\.baseline\.d\/engine$/);
+});
+
+t("**gate.sh reads the counts ONE FILE PER MEMBER, and a missing file is a FAILURE, not zero**", () => {
+  const src = readFileSync(join(root, "gate.sh"), "utf8");
+  assert.match(src, /^BASELINE=gate\.baseline\.d$/m);
+  assert.match(src, /base_for\(\) \{ \[ -f "\$BASELINE\/\$1" \]/, "the lookup is not per member");
+  // A member with no recorded count fails the gate by name (its file deleted
+  // reads exactly as a NEW member): the negative control is run live and its
+  // line is in the PR; this pins the branch that makes it fail.
+  assert.match(src, /fail "\$m is not in \$BASELINE/);
+  assert.match(src, /if \[ -e gate\.baseline \]; then/, "the old single file is not refused");
 });
 
 if (failures) { console.log(`\ngate accept: ${failures} FAILED`); process.exit(1); }
