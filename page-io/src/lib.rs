@@ -461,6 +461,16 @@ impl PageIo {
         self.asking && !self.claimed
     }
 
+    /// THE USER HAS NO TREE HERE YET (DATA-SOURCE `mine`: made on the first
+    /// WRITE): an asked page whose node's signer holds no key, or has no
+    /// signer, and which has not been provisioned. Its tree reads as EMPTY --
+    /// its head read is answered "missing" here, and nothing goes to the node
+    /// -- until a first write provisions it ([`PageIo::claim`], then the
+    /// existing provision path).
+    pub fn no_tree_yet(&self) -> bool {
+        self.asking && !self.provisioned && matches!(self.asked, Some(Asked::NoKey | Asked::NoSigner(_)))
+    }
+
     /// OPEN THE PERSON'S OWN TREE ON AN ASKED PAGE (DATA-SOURCE `mine`):
     /// the same opening as [`PageIo::begin`], from where the answer left it.
     /// - It signs for a Register: that is this person's tree on this node,
@@ -669,6 +679,21 @@ impl PageIo {
             return;
         }
         self.server.set_facts(SignerFacts { head_writable: true, head_id: self.register_id });
+        // The user's own tree was NOT yet theirs to sign (`no_tree_yet`)
+        // and now is: the queue held while it could not sign is cut, as ONE
+        // commit.
+        if self.asking && matches!(self.asked, Some(Asked::NoKey | Asked::NoSigner(_))) {
+            self.step_can_sign();
+        }
+    }
+
+    /// Tell the engine whether this page can SIGN its head now
+    /// (`engine::Event::CanSign`): derived from the ONE signer decision at
+    /// each of its changes -- the answer "no key here" / "no signer here"
+    /// (it cannot), and that tree's provisioning (it can). Kept nowhere else.
+    fn step_can_sign(&mut self) {
+        let can = !self.no_tree_yet();
+        self.server.page.event(engine::Event::CanSign(can));
     }
 
     /// A client protocol frame (what `sdk::Client` would have sent a delegate).
@@ -763,6 +788,7 @@ impl PageIo {
                         // delegate answers its request EMPTY — another user's node.
                         if self.asking() {
                             self.asked = Some(Asked::NoSigner(format!("no signer on this node: it answered EMPTY {} times", self.first_empties)));
+                            self.step_can_sign();
                         }
                     }
                 }
@@ -803,6 +829,7 @@ impl PageIo {
                                 }
                                 None => Asked::NoKey,
                             });
+                            self.step_can_sign();
                         }
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => match params {
                             Some(params) => {
@@ -1038,7 +1065,14 @@ impl PageIo {
         self.replies.extend(self.server.take_replies());
         let mut not_held = Vec::new();
         let mut not_sent = Vec::new();
+        let mut no_head = false;
         for op in self.server.take_ops() {
+            // No tree yet: there is no head to read, and asking the node for
+            // one would name a Register nobody has made. Answered here.
+            if matches!(op, Op::ReadHead) && self.no_tree_yet() {
+                no_head = true;
+                continue;
+            }
             if self.read_only() {
                 match op {
                     Op::AskHeld { id } => {
@@ -1111,7 +1145,7 @@ impl PageIo {
                 Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
             }
         }
-        if !not_held.is_empty() || !not_sent.is_empty() {
+        if !not_held.is_empty() || !not_sent.is_empty() || no_head {
             let now = self.now;
             for id in not_held {
                 self.server.node(Answer::Held { id, present: false }, now);
@@ -1124,6 +1158,9 @@ impl PageIo {
                     op => Answer::NotSent { op, why },
                 };
                 self.server.node(answer, now);
+            }
+            if no_head {
+                self.server.node(Answer::Head(None), now);
             }
             self.pump();
         }
