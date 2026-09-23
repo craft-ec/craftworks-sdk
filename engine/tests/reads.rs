@@ -10,7 +10,7 @@ use engine::{ClientId, Effect, Engine, Event, Params};
 use freenet_prolly::range::Range;
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 mod common;
@@ -214,7 +214,9 @@ fn fixture(n: u32) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks) {
             )
         })
         .collect();
-    let (root, all) = tree(&records);
+    let (root, mut all) = tree(&records);
+    // With its parity, as the network holds it: reads race (sdk#303).
+    common::publish_parity(root, &mut all);
     (records, root, all)
 }
 
@@ -316,14 +318,24 @@ fn every_warmth_state_answers_the_same() {
         }
     }
     let first = stepped!(e, get(1, 3, &key));
-    assert_eq!(
-        fetch_ids(&first).len(),
-        1,
-        "with only the leaf missing, exactly one block should be wanted"
-    );
-    assert_eq!(fetch_ids(&first)[0].0, leaf);
+    // RACE ON (sdk#303): the leaf, AND every other slot of its group this reader does not hold -- exactly.
+    let asked: BTreeSet<Cid> = fetch_ids(&first).iter().map(|(id, _, _)| *id).collect();
+    let expected: BTreeSet<Cid> = std::iter::once(leaf)
+        .chain(group_of(&all, &root, &leaf).into_iter().filter(|s| *s != leaf && freenet_prolly::store::Blocks::get(&store, s).is_none()))
+        .collect();
+    assert_eq!(asked, expected, "with only the leaf missing, the leaf and its group's unheld slots should be wanted");
+    assert_eq!(e.fetch_counts().0, 1, "with only the leaf missing, exactly one block should be WANTED");
     let got = settle(&mut e, &store, &all, first);
     assert_eq!(got, vec![(ReqId(3), ReadResult::Value(want.clone()))]);
+    // THE CONTROL, racing off: the walk alone asks exactly the leaf.
+    let (mut walk, wstore) = reader(root, Params { race_get: false, ..Params::default() });
+    for (id, bytes) in all.0.iter() {
+        if *id != leaf && !engine::pack::members(bytes).iter().any(|(m, _)| *m == leaf) {
+            wstore.put(*id, bytes);
+        }
+    }
+    let wfirst = stepped!(walk, get(1, 3, &key));
+    assert_eq!(fetch_ids(&wfirst).iter().map(|f| f.0).collect::<Vec<_>>(), vec![leaf], "the walk alone asked other than the leaf");
 
     // 4. Leaf warm via a PACK, branch cold. The pack carries the leaf, so one
     //    fetch of it answers what several reads were parked on.
@@ -351,6 +363,27 @@ fn every_warmth_state_answers_the_same() {
 }
 
 /// The leaf that holds `key`, found with everything present.
+/// Every slot (members and parity) of the group `id` belongs to in its parent, found from `root`.
+fn group_of(all: &MemBlocks, root: &Cid, id: &Cid) -> Vec<Cid> {
+    let mut at = vec![*root];
+    while let Some(p) = at.pop() {
+        let Ok(n) = freenet_prolly::node::Node::parse(all.get(&p).expect("held")) else { continue };
+        if n.is_leaf() {
+            continue;
+        }
+        let parity: Vec<Cid> = n.parity().collect();
+        let groups = freenet_prolly::parity::group_members(&n);
+        let m = parity.len() / groups.len().max(1);
+        for (g, (_, members)) in groups.into_iter().enumerate() {
+            if members.contains(id) {
+                return members.into_iter().chain(parity[m * g..m * g + m].iter().copied()).collect();
+            }
+        }
+        at.extend((0..n.len()).map(|i| n.child(i).0));
+    }
+    Vec::new()
+}
+
 fn leaf_for(all: &MemBlocks, root: &Cid, key: &[u8]) -> Cid {
     let mut cur = *root;
     loop {
@@ -432,28 +465,36 @@ fn a_block_that_is_not_what_was_asked_for_is_refused() {
     println!("  three hostile blocks refused, and none of them stuck");
 }
 
-/// A point lookup on a cold tree costs one block per level, not a scan.
+/// A point lookup on a cold tree costs one block per level, not a scan -- and, RACING (sdk#303, rule 11), each
+/// level below the root also asks the rest of its block's group, exactly.
 #[test]
 fn a_cold_point_lookup_costs_one_block_per_level() {
     let (_, root, all) = fixture(10_000);
     let key = b"k/05000".to_vec();
 
-    let depth = {
-        let mut d = 0;
+    // The path, and at each level below the root the size (k + m) of the wanted block's group in its parent.
+    let (depth, groups) = {
+        let (mut d, mut groups) = (0, Vec::new());
         let mut cur = root;
         loop {
             let bytes = all.get(&cur).expect("held");
             let n = freenet_prolly::node::Node::parse(bytes).expect("node");
             d += 1;
             if n.is_leaf() {
-                break d;
+                break (d, groups);
             }
             let i = match n.search(&key) {
                 Ok(i) => i,
-                Err(0) => break d,
+                Err(0) => break (d, groups),
                 Err(i) => i - 1,
             };
-            cur = n.child(i).0;
+            let child = n.child(i).0;
+            let parity = n.parity().count();
+            let gs = freenet_prolly::parity::group_members(&n);
+            let m = parity / gs.len().max(1);
+            let k = gs.iter().find(|(_, ms)| ms.contains(&child)).map_or(0, |(_, ms)| ms.len());
+            groups.push(if k == 0 { 1 } else { k + m });
+            cur = child;
         }
     };
 
@@ -471,12 +512,24 @@ fn a_cold_point_lookup_costs_one_block_per_level() {
         matches!(got.first(), Some((_, ReadResult::Value(Some(_))))),
         "the lookup did not find the key: {got:?}"
     );
-    // One fetch per level, plus at most one for a value stored by reference.
+    // RACE ON (production): the root asks 1; each level below asks its block AND the other k+m-1 slots of its
+    // group (none held: cold) -- exactly -- within 1 + (k+m)(depth-1).
+    let expected = 1 + groups.iter().sum::<usize>();
+    let widest = groups.iter().copied().max().unwrap_or(1);
+    println!("  cold lookup, {depth} levels, groups below the root {groups:?}: {} fetches (want {expected}); {:?} (wanted, raced)", e.fetches(), e.fetch_counts());
+    assert_eq!(e.fetches(), expected, "a cold racing lookup asked other than its path and its groups");
+    assert!(expected <= 1 + widest * (depth - 1), "{expected} fetches over the bound 1 + (k+m)(depth-1)");
+    assert_eq!(e.fetch_counts().0, depth, "the WANTED asks are not one per level");
+    // THE CONTROL, racing off: the walk alone, one fetch per level (plus at most one for a value by reference).
+    let (mut walk, wstore) = reader(root, Params { race_get: false, count_descent: true, ..Params::default() });
+    let first = stepped!(walk, get(1, 9, &key));
+    let got = settle(&mut walk, &wstore, &all, first);
+    assert!(matches!(got.first(), Some((_, ReadResult::Value(Some(_))))), "the walk alone did not find the key");
     assert!(
-        e.fetches() <= depth + 1,
+        walk.fetches() <= depth + 1,
         "a cold point lookup on a 10,000-key tree fetched {} blocks for a \
          tree {depth} levels deep",
-        e.fetches()
+        walk.fetches()
     );
     // Parses are per attempt, and there is one attempt per level, so the
     // bound is quadratic in depth at worst — still nothing like a scan.
@@ -1117,22 +1170,27 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
                 String::from_utf8_lossy(key)
             );
         }
-        if forget_every != 1 {
-            assert_eq!(
-                waiting, 0,
-                "forget_every={forget_every}: a node that retains anything at \
-                 all must answer every read"
-            );
+        // THE DELEGATE SHAPE'S LIMIT, NOT A PRODUCTION PROPERTY. This harness reads through the NODE's store, as a
+        // delegate engine did; in production the engine reads the page's own memory (PageBlocks), which keeps every
+        // block that arrived, and a read never waits for ever (rules 7/8: page/tests/race_get.rs
+        // `a_forgetful_node_does_not_starve_a_read_on_the_page`). Here, at ANY forget_every > 0, a by-reference read
+        // may still wait -- racing (sdk#303) adds serves, which move which block "every 3rd" forgets -- and an INLINE
+        // read left waiting fails above as a regression.
+        // This arm goes with the Context in the dead-code sweep (CONFORMANCE step 5).
+        if forget_every == 0 {
+            assert_eq!(waiting, 0, "a node that forgets nothing left a read waiting");
         } else {
             let inline = keys
                 .iter()
                 .step_by(400)
                 .filter(|k| !value_is_a_reference(k))
                 .count();
-            assert_eq!(
-                answered, inline,
+            // Every INLINE read answered (each waiting one is by reference, asserted above); a by-reference one
+            // may be answered too.
+            assert!(
+                answered >= inline,
                 "the acceptance row: every INLINE read must be answered by a \
-                 node that keeps nothing"
+                 node that keeps nothing ({answered} answered, {inline} inline)"
             );
             assert!(
                 answered > 0,
@@ -1222,20 +1280,19 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
 
     // The control, and it RUNS: an engine that re-drives every parked read on
     // every entry pays for the node being busy.
+    // It RACES, as production does (sdk#303). A race's state lives in the engine's memory (the engine is
+    // long-lived in the page, READ-STATE B), not in the context -- so the control's COUNT differs between the modes
+    // by design (a re-hydrated engine starts the race again), and what must hold in EACH is that it bites.
     let control = count(Mode::Rehydrate, true, 20);
     let control_live = count(Mode::Live, true, 20);
-    assert_eq!(
-        control, control_live,
-        "the control behaves differently in the two modes"
-    );
     assert!(
-        control > quiet,
-        "the control still cost {control} fetches against {quiet}: it is not \
+        control > quiet && control_live > quiet_live,
+        "the control still cost {control} (Rehydrate) / {control_live} (Live) fetches against {quiet}: it is not \
          re-asking, and this bound is not being tested against anything"
     );
     println!(
         "  {quiet} fetch(es) on a quiet node, {busy} on a busy one, \
-         {control} with both off (identical in Live and Rehydrate)"
+         {control} / {control_live} with both off (Rehydrate / Live)"
     );
 }
 

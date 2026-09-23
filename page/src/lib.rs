@@ -1608,6 +1608,11 @@ impl Page {
     }
 
     /// Read repairs through parity: `(started, rebuilt, given up)`.
+    /// The engine's asks so far, `(wanted, raced)` (sdk#303): a read's cap counts the wanted.
+    pub fn fetch_counts(&self) -> (usize, usize) {
+        self.engine.fetch_counts()
+    }
+
     pub fn repair_counts(&self) -> (u64, u64, u64) {
         self.engine.repair_counts()
     }

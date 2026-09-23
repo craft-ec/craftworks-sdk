@@ -18,6 +18,9 @@ struct Node_ {
     /// Answers on their way back, with when they land: kept ACROSS drive calls, or every answer still in flight at
     /// the end of a call would be lost (which, at 300 ms, is most of them).
     due: Vec<(u64, Answer)>,
+    /// A FORGETFUL node: it drops every `forget_every`-th block it serves, the moment it has served it (0: never).
+    forget_every: usize,
+    served: usize,
 }
 
 /// Drive `p` against `node` until nothing is waiting (or `for_ms` passes), answering after 5 ms; `silent` blocks
@@ -56,11 +59,14 @@ fn drive_slow(
                     if silent.contains(&id) {
                         None
                     } else {
-                        Some(match node.blocks.get(&id) {
-                            Some(b) => Answer::Got {
-                                id,
-                                bytes: b.clone(),
-                            },
+                        Some(match node.blocks.get(&id).cloned() {
+                            Some(bytes) => {
+                                node.served += 1;
+                                if node.forget_every > 0 && node.served.is_multiple_of(node.forget_every) {
+                                    node.blocks.remove(&id);
+                                }
+                                Answer::Got { id, bytes }
+                            }
                             None => Answer::GetMissed(id),
                         })
                     }
@@ -122,17 +128,22 @@ fn a_leaf_group(blocks: &BTreeMap<Cid, Vec<u8>>, root: Cid) -> (Vec<Cid>, Vec<Ci
 
 /// A writer page's real tree (6000 rows), with its parity, on a fake node: the node, the root, and the clock.
 fn written() -> (Node_, Cid, u64) {
+    written_with(500, |i| format!("value {i}").into_bytes())
+}
+
+/// [`written`], `per_batch` rows a write (a commit has a block cap), each row's value from `value_of(row)`.
+fn written_with(per_batch: u64, value_of: impl Fn(u64) -> Vec<u8>) -> (Node_, Cid, u64) {
     // The writer: a real tree, with its parity, on the node.
     let mut node = Node_::default();
     let mut now = 1_000u64;
     let mut gets = Vec::new();
     let mut w = Page::new(Params::default(), PutPath::Page);
-    for batch in 0..12u64 {
-        let ops = (0..500u64)
+    for batch in 0..6000 / per_batch {
+        let ops = (0..per_batch)
             .map(|i| {
                 (
-                    format!("k/{:06}", batch * 500 + i).into_bytes(),
-                    WriteOp::Put(format!("value {i}").into_bytes()),
+                    format!("k/{:06}", batch * per_batch + i).into_bytes(),
+                    WriteOp::Put(value_of(batch * per_batch + i)),
                 )
             })
             .collect();
@@ -146,7 +157,10 @@ fn written() -> (Node_, Cid, u64) {
             &mut gets,
         );
     }
-    let (_, root) = node.head.expect("the writer published");
+    let Some((_, root)) = node.head else {
+        let notices = w.take_notices();
+        panic!("the writer did not publish: unusable {:?}, waiting {}, last notices {:?}", w.unusable(), w.waiting(), notices.iter().rev().take(3).collect::<Vec<_>>())
+    };
     (node, root, now)
 }
 
@@ -204,6 +218,25 @@ fn a_rebuilt_block_is_put_back_and_the_next_reader_gets_it_directly() {
     println!("  second reader: {answered} answered; races started {}, rebuilt {}; GETs of the member {}", b.repair_counts().0, b.repair_counts().1, gets.iter().filter(|(_, id)| *id == member).count());
     assert_eq!(answered, keys.len(), "the second reader was not answered");
     assert_eq!(b.repair_counts().1, 0, "the second reader had to rebuild the member: the network is still damaged");
+}
+
+/// A FORGETFUL node does not starve a read on the page (the production shape of engine/tests/reads.rs'
+/// `a_forgetful_store_still_answers_every_read`, sdk#331): the engine reads the page's own memory (PageBlocks),
+/// which keeps every block that arrived, so a node that drops what it serves -- every block, or every third --
+/// still answers EVERY read, a value stored by reference included (it needs its leaf and its value block at once).
+#[test]
+fn a_forgetful_node_does_not_starve_a_read_on_the_page() {
+    for forget_every in [1usize, 3] {
+        // Every third row's value is 1400 bytes: stored by reference, in its own block.
+        let (mut node, _root, mut now) = written_with(100, |i| if i.is_multiple_of(3) { vec![(i % 251) as u8; 1400] } else { format!("value {i}").into_bytes() });
+        node.forget_every = forget_every;
+        let keys: Vec<Vec<u8>> = (0..6000u64).step_by(400).map(|i| format!("k/{i:06}").into_bytes()).collect();
+        let by_ref = (0..6000u64).step_by(400).filter(|i| i.is_multiple_of(3)).count();
+        let (_, gets, answered) = read_all(&mut node, &mut now, &keys, &BTreeSet::new());
+        println!("  node forgets every {forget_every}: {answered} of {} reads answered ({by_ref} by reference), {} GETs", keys.len(), gets.len());
+        assert!(by_ref > 0, "no read by reference: the test proves nothing about the pair");
+        assert_eq!(answered, keys.len(), "forget every {forget_every}: a read was left waiting on the page");
+    }
 }
 
 #[test]

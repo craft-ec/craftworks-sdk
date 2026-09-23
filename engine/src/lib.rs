@@ -29,25 +29,17 @@
 //!
 //! # THE RULE FOR ADDING ANYTHING HERE
 //!
-//! **Every call is a rehydration. State that only matters ACROSS calls has to
-//! be IN the context, or it does not exist.**
+//! **The engine is LONG-LIVED in the page (READ-STATE, design B).** The page holds one `Engine` for its life
+//! and drives it call by call, so a field keeps its value across calls, in memory. A race's and a repair's state
+//! live there (sdk#303), as the reads' own bookkeeping does.
 //!
-//! This engine reads as an ordinary long-lived state machine, and in its own
-//! tests it is one — a `Vec<Effect>` is driven to completion in a single
-//! process. In production it never is. A delegate gets a fresh linear memory
-//! on every `process()` call (F32); the engine is rebuilt from
-//! [`Engine::from_context_or_new`] and thrown away at the end of the call,
-//! and the only thing that survives is what [`Engine::to_context`] wrote.
+//! It was not always so. In the delegate era every `process()` call got a fresh linear memory (F32): the engine
+//! was rebuilt from [`Engine::from_context_or_new`], thrown away at the end of the call, and only what
+//! [`Engine::to_context`] wrote survived. That context code remains for the tests that still re-hydrate an
+//! engine, and goes with the dead-code sweep (CONFORMANCE step 5); nothing in production re-hydrates.
 //!
-//! So a field is not "state the engine keeps". It is state the engine keeps
-//! *for the rest of this call*, unless the context carries it. The failure
-//! mode is silent by construction: the field holds its default at the top of
-//! every call, the code reads it, takes the early return, and reports
-//! nothing.
-//!
-//! Four defects of exactly this shape have been found, and all four were
-//! invisible to every test in `engine/tests/` because those tests drive one
-//! process:
+//! In that era a field held its default at the top of every call but the one that set it, and four defects of
+//! exactly that shape were invisible to every test that drove one process:
 //!
 //! * `in_flight_since` (sdk#81) — the stall timer. `None` at the top of every
 //!   call but the one that started the commit, so `Stalled` could never be
@@ -62,11 +54,9 @@
 //!   acks in THIS call, so a `PutParity` gated `after: [published_root]` was
 //!   held on a dependency nothing would confirm, and dropped. Every call.
 //!
-//! The question to ask of any new field, effect dependency or deadline:
-//! **what does this hold at the top of a call that did not create it, and is
-//! that the right answer?** If the honest answer is "whatever it defaults
-//! to", either carry it — and bump `CONTEXT_VERSION` — or derive it from
-//! something already carried, which is better: two copies of one fact can
+//! The question that survives them, for any new field, effect dependency or deadline: **what does this hold
+//! after the page RELOADS, and is that the right answer?** A page's memory is gone then; what must outlive it
+//! lives on the network (the head, the blocks), and is derived from there -- two copies of one fact can
 //! disagree, and a derived one cannot.
 //!
 //! And an EMISSION is not a fact (sdk#150). An effect the engine returns can
@@ -74,8 +64,8 @@
 //! answered; "I asked, therefore it happened" made each of those a permanent
 //! loss. What is owed is derived from answers; `asks` only paces re-asking.
 //!
-//! And the test has to span calls. An assertion that passes on an engine
-//! driven straight through proves nothing about this.
+//! And the test has to span the RELOAD. An assertion that passes on an engine driven straight through proves
+//! nothing about what a fresh page recovers.
 
 use freenet_prolly::apply::{apply_with, ApplyError, Edit as TreeEdit, Options as ApplyOptions};
 use freenet_prolly::chunk::empty_leaf;
@@ -1198,6 +1188,17 @@ pub struct Engine<B: Blocks> {
     /// their GETs (a requester dropping what it no longer needs, not a cut-off) and does not keep them if they
     /// arrive late ([`Engine::take_all_withdrawn`]).
     withdrawn: BTreeSet<Cid>,
+    /// Asks that went out, by why (sdk#303): `.0` WANTED (a read waits on the block), `.1` RACED (only a race or a
+    /// repair asks it). A read's cap counts the wanted; its race rides inside its one fetch.
+    fetch_counts: (usize, usize),
+    /// This step's asks, by who pushed them: `true` a read (or a write, or a preload), `false` only a race or a
+    /// repair. Counted into `fetch_counts` where the step's asks leave (`one_ask_each`), then cleared.
+    step_asks: BTreeMap<Cid, bool>,
+    /// Blocks REBUILT this step, to land like arrivals once the step's own work is done (sdk#303). Landed by a
+    /// loop, never from inside the repair that rebuilt them: one arrival can finish many races, each landing wakes
+    /// reads that race and rebuild again, and done recursively that chain is as deep as a level is wide (a
+    /// fetch-ahead lookup overflowed the stack).
+    landing: Vec<(Cid, Vec<u8>)>,
     /// Repairs started, finished (verified, kept), and given up.
     repair_counts: (u64, u64, u64),
     /// Why the last repair was given up, in words (the read is answered
@@ -1462,6 +1463,9 @@ impl<B: Blocks> Engine<B> {
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
             withdrawn: BTreeSet::new(),
+            fetch_counts: (0, 0),
+            step_asks: BTreeMap::new(),
+            landing: Vec::new(),
             repair_counts: (0, 0, 0),
             repair_failed: None,
             root,
@@ -1789,6 +1793,7 @@ impl<B: Blocks> Engine<B> {
                 out.extend(self.drive(r));
             }
             out.extend(self.step_inner(event));
+            out.extend(self.land_rebuilt());
             out.extend(self.keep_saveable());
             self.cascade.clear();
             self.arrived.clear();
@@ -1796,6 +1801,7 @@ impl<B: Blocks> Engine<B> {
             return out;
         }
         let mut out = self.step_inner(event);
+        out.extend(self.land_rebuilt());
         out.extend(self.keep_saveable());
         self.cascade.clear();
         self.arrived.clear();
@@ -1815,6 +1821,13 @@ impl<B: Blocks> Engine<B> {
             _ => true,
         });
         self.reads.fetches = self.reads.fetches.saturating_sub(before - out.len());
+        for id in &seen {
+            match self.step_asks.get(id) {
+                Some(false) => self.fetch_counts.1 += 1,
+                _ => self.fetch_counts.0 += 1,
+            }
+        }
+        self.step_asks.clear();
     }
 
     /// What this engine shed to stay saveable, since the last `take_shed`.
@@ -2557,6 +2570,7 @@ impl<B: Blocks> Engine<B> {
                         if let Some(q) = self.reads.parked.get_mut(&req_id) {
                             q.gets += 1;
                         }
+                        self.step_asks.insert(id, true);
                         out.push(Effect::FetchBlock { id, via, attempt });
                         // RACE (rule 11, sdk#303): the rest of this block's group, at once.
                         out.extend(self.race(id, p.root));
@@ -4654,6 +4668,7 @@ impl<B: Blocks> Engine<B> {
         }
         let via = self.reads.in_pack.get(&id).copied().map_or(read::Via::Direct, read::Via::Pack);
         self.reads.fetches += 1;
+        self.step_asks.insert(id, true);
         out.push(Effect::FetchBlock { id, via, attempt });
         // Meanwhile the group is an ALTERNATIVE source (Phase 4, gap 1): a
         // verified rebuild lands exactly like an arrival.
@@ -4705,6 +4720,7 @@ impl<B: Blocks> Engine<B> {
                     self.withdrawn.remove(&slot);
                     if !in_flight {
                         self.reads.fetches += 1;
+                        self.step_asks.entry(slot).or_insert(false);
                         out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 0 });
                     }
                 }
@@ -4748,6 +4764,7 @@ impl<B: Blocks> Engine<B> {
         }
         if still_asked && self.repair_slots.contains_key(&slot) {
             self.reads.fetches += 1;
+            self.step_asks.entry(slot).or_insert(false);
             out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 1 });
         } else if !still_asked {
             // Nobody asks for this block any more (it came, or it is spent).
@@ -4777,8 +4794,8 @@ impl<B: Blocks> Engine<B> {
                     // The page KEEPS it (the node lost it; reads go on from
                     // the page's blocks), PUTs it back, and it lands like any
                     // arrival -- asked BEFORE the arrival, which ends the wait.
-                    let mut out = self.rebuilt(missing, &body);
-                    out.extend(self.on_arrived(missing, body));
+                    let out = self.rebuilt(missing, &body);
+                    self.landing.push((missing, body));
                     out
                 }
                 Err(why) => {
@@ -4940,6 +4957,11 @@ impl<B: Blocks> Engine<B> {
     /// Fetches emitted, for the cost gate.
     pub fn fetches(&self) -> usize {
         self.reads.fetches
+    }
+
+    /// Asks that went out since this engine began: `(wanted, raced)` ([`Engine`]'s `fetch_counts`).
+    pub fn fetch_counts(&self) -> (usize, usize) {
+        self.fetch_counts
     }
 }
 

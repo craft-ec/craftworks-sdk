@@ -444,6 +444,17 @@ fn a_finished_race_withdraws_what_it_no_longer_wants() {
         !run.e.awaits_block(&parity[0]),
         "the engine still awaits a block nobody needs"
     );
+    // And it STAYS resolved: N more ticks ask nothing of the group, and what the engine awaits of it does not grow.
+    let awaited = |e: &Engine<Store>| members.iter().chain(&parity).filter(|s| e.awaits_block(s)).count();
+    let mut e = run.e;
+    let before = awaited(&e);
+    let mut asked_after = 0;
+    for t in 0..50u64 {
+        asked_after += e.step(Event::Tick(10_000 + t)).iter().filter(|f| matches!(f, Effect::FetchBlock { .. })).count();
+    }
+    assert_eq!(asked_after, 0, "the resolved group was asked again on later ticks");
+    assert!(awaited(&e) <= before, "what the engine awaits of the resolved group grew: {before} -> {}", awaited(&e));
+    let run = Run { e, ..run };
     // Withdrawn means NOT WANTED: never a block the engine still awaits, and never the member the read needed.
     assert!(
         !run.e.is_withdrawn(&silent),

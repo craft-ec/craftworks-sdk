@@ -23,6 +23,7 @@
 use crate::{repair, Effect, Engine};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
+use std::collections::BTreeSet;
 
 impl<B: Blocks> Engine<B> {
     /// A read has just asked for `id` under `root`: race the rest of its group. Nothing when racing is off, when
@@ -67,7 +68,27 @@ impl<B: Blocks> Engine<B> {
             self.withdrawn.remove(&slot);
             if !in_flight {
                 self.reads.fetches += 1;
+                self.step_asks.entry(slot).or_insert(false);
                 out.push(Effect::FetchBlock { id: slot, via: crate::read::Via::Direct, attempt: 0 });
+            }
+        }
+        out
+    }
+
+    /// Land every block rebuilt this step, like an arrival, in a LOOP: a landing that finishes more races queues
+    /// their rebuilds behind it rather than recursing into them ([`Engine`]'s `landing`).
+    ///
+    /// A block lands ONCE per step. `on_arrived` clears `arrived` when it ends, and the page keeps a rebuilt block
+    /// only when it applies `Keep`, after the step -- so a read re-descending through it later in the same step
+    /// wants it again, races, and rebuilds it again; landed again, that loop never ends. Once is enough: the read
+    /// asks the block, and the next step reads it from the page.
+    pub(crate) fn land_rebuilt(&mut self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let mut landed: BTreeSet<Cid> = BTreeSet::new();
+        while !self.landing.is_empty() {
+            let (id, body) = self.landing.remove(0);
+            if landed.insert(id) {
+                out.extend(self.on_arrived(id, body));
             }
         }
         out
@@ -80,7 +101,7 @@ impl<B: Blocks> Engine<B> {
 
     /// Every block withdrawn since the last call, handed to the page, which ENDS their GETs (queued, in flight or
     /// waiting to re-ask): the engine keeps no entry after.
-    pub fn take_all_withdrawn(&mut self) -> std::collections::BTreeSet<Cid> {
+    pub fn take_all_withdrawn(&mut self) -> BTreeSet<Cid> {
         std::mem::take(&mut self.withdrawn)
     }
 
