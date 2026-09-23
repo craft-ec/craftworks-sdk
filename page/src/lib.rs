@@ -1444,6 +1444,7 @@ impl Page {
     /// rather than being re-sent at its next timeout for ever (sdk#303):
     /// * one the engine WITHDREW: a raced group block no read needs once its group resolved;
     /// * one for a block the page HOLDS: a member rebuilt from its group, which the node never answered.
+    ///
     /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
     /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
     fn end_unneeded_gets(&mut self) {

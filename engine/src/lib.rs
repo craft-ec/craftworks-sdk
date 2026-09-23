@@ -1000,6 +1000,12 @@ struct Repair {
     group: repair::Group,
     have: BTreeMap<usize, Vec<u8>>,
     asked: BTreeMap<usize, u32>,
+    /// The missing block itself was answered NotFound: a REPAIR, whose slots are asked until answered with their
+    /// bytes. Until then it is a RACE (sdk#303) beside a read still asking the block, and a slot answered NotFound
+    /// or with wrong bytes is DROPPED, not re-asked -- a healthy read must not spend GETs re-asking parity.
+    missed: bool,
+    /// Slots a race dropped: asked again the moment it becomes a repair.
+    dropped: BTreeSet<usize>,
 }
 
 /// One of a merge's writes for [`Engine::merge_front`]: its id, ops and reads.
@@ -4655,8 +4661,11 @@ impl<B: Blocks> Engine<B> {
             let roots: Vec<Cid> = reqs.iter().filter_map(|r| self.reads.parked.get(r).map(|p| p.root)).collect();
             let group = roots.into_iter().find_map(|root| repair::find_group(&self.source(), root, id));
             if let Some(group) = group {
-                out.extend(self.start_repair(group));
+                out.extend(self.start_repair(group, true));
             }
+        } else {
+            // The block a race was racing is answered NotFound: the race is a REPAIR now.
+            out.extend(self.race_missed(id));
         }
         out
     }
@@ -4673,10 +4682,10 @@ impl<B: Blocks> Engine<B> {
     /// Start rebuilding `group.missing`: what is held already counts, and
     /// every other block of the group is asked for at once (the first `k` to
     /// arrive are enough), through the same `FetchBlock` as any read.
-    fn start_repair(&mut self, group: repair::Group) -> Vec<Effect> {
+    fn start_repair(&mut self, group: repair::Group, missed: bool) -> Vec<Effect> {
         self.repair_counts.0 += 1;
         let missing = group.missing;
-        let mut r = Repair { group, have: BTreeMap::new(), asked: BTreeMap::new() };
+        let mut r = Repair { group, have: BTreeMap::new(), asked: BTreeMap::new(), missed, dropped: BTreeSet::new() };
         let mut out = Vec::new();
         for i in 0..r.group.slots.len() {
             if i == r.group.missing_ix {
@@ -4720,6 +4729,12 @@ impl<B: Blocks> Engine<B> {
                     let st = r.group.stored(i, b);
                     r.have.insert(i, st);
                     r.asked.remove(&i);
+                }
+                // A RACE drops a slot the node does not have (or answered wrong): the read's own block is
+                // still asked, and re-asking parity beside a healthy read is GETs for nothing (sdk#303).
+                _ if !r.missed => {
+                    r.asked.remove(&i);
+                    r.dropped.insert(i);
                 }
                 _ => {
                     // Still asked, and asked AGAIN: a group block that is slow

@@ -322,7 +322,7 @@ fn a_block_raced_and_read_in_different_steps_is_asked_once() {
     let twice: Vec<String> = group
         .iter()
         .filter(|s| after_b.get(*s).copied().unwrap_or(0) > 1)
-        .map(|s| hex(s))
+        .map(hex)
         .collect();
     assert!(twice.is_empty(), "asked twice before any answer: {twice:?}");
     assert_eq!(
@@ -332,6 +332,60 @@ fn a_block_raced_and_read_in_different_steps_is_asked_once() {
         after_miss.get(&b).map(|n| n - 1)
     );
     assert_eq!(answered, 0, "a read answered with its group held back");
+}
+
+/// A RACE beside a healthy read DROPS a slot the node does not have: a tree whose parity is not on the network
+/// (written before parity, or its parity lost) answers every read, and each parity block is asked ONCE -- not
+/// re-asked beside a read that needs nothing from it.
+#[test]
+fn a_race_drops_a_slot_the_node_does_not_have() {
+    let records = records();
+    let (root, mut all) = tree(&records);
+    let (members, parity) = a_leaf_group(&mut all, root);
+    for p in &parity {
+        all.0.remove(p);
+    }
+    let keys = keys_in(&all, &[members[0]]);
+    let run = read_cold(root, &all, &BTreeMap::new(), &keys, Params::default());
+    assert_eq!(run.answers.len(), keys.len(), "a read was not answered");
+    assert!(wrong(&run.answers, &records).is_empty());
+    let asked: Vec<usize> = parity.iter().map(|p| run.asked.get(p).copied().unwrap_or(0)).collect();
+    println!("  parity not on the network: {} reads answered; each parity block asked {asked:?} times", keys.len());
+    assert!(asked.iter().all(|n| *n == 1), "a parity block the node does not have was re-asked beside a healthy read: {asked:?}");
+}
+
+/// ...and once the raced block ITSELF is answered NotFound, the race is a REPAIR: a slot it dropped is asked
+/// again, now until answered (the node may have it back).
+#[test]
+fn a_race_whose_block_is_missed_asks_its_dropped_slots_again() {
+    let records = records();
+    let (root, mut all) = tree(&records);
+    let (members, parity) = a_leaf_group(&mut all, root);
+    let (a, p) = (members[0], parity[0]);
+    let (mut e, store) = cold_reader(root, Params::default());
+    let group: BTreeSet<Cid> = members.iter().chain(&parity).copied().collect();
+    // Serve the path; hold the group's blocks.
+    let mut held = Vec::new();
+    let mut queue = e.step(Event::Get { client: ClientId(1), req_id: ReqId(0), key: keys_in(&all, &[a])[0].clone() });
+    while let Some(f) = queue.pop() {
+        match f {
+            Effect::FetchBlock { id, .. } if group.contains(&id) => held.push(id),
+            Effect::FetchBlock { id, .. } => {
+                let bytes = all.get(&id).expect("held").to_vec();
+                store.put(id, &bytes);
+                queue.extend(e.step(Event::BlockArrived { id, bytes }));
+            }
+            _ => {}
+        }
+    }
+    assert!(held.contains(&p) && held.contains(&a), "the race did not ask the group");
+    // The parity block: NotFound. Dropped, not re-asked.
+    let out = e.step(Event::BlockMissed(p));
+    assert!(!out.iter().any(|f| matches!(f, Effect::FetchBlock { id, .. } if *id == p)), "the race re-asked a NotFound slot beside a healthy read");
+    // The block itself: NotFound. Now a repair: the dropped slot is asked again.
+    let out = e.step(Event::BlockMissed(a));
+    assert!(out.iter().any(|f| matches!(f, Effect::FetchBlock { id, .. } if *id == p)), "the repair did not ask the slot its race dropped");
+    assert!(e.awaits_block(&p), "the repair does not wait on the slot");
 }
 
 /// THE CONTROL: racing off (today's one-at-a-time), the same silent member -- the read is never answered, and the

@@ -2091,8 +2091,15 @@ fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
     }
     assert!(wrong.is_empty(), "{} reads wrong with 3 blocks of a group lost: {:?}", wrong.len(), &wrong[..wrong.len().min(3)]);
     assert!(reader.server.page.repair_counts().1 >= 3, "the lost leaves were not rebuilt: {:?}", reader.server.page.repair_counts());
-    // A FOURTH lost: a fresh page cannot rebuild the group any more.
-    node.blocks.remove(&members[3]);
+    // REPAIR IS A WRITE (sdk#331): the reader PUT the three rebuilt leaves back, so the node is whole again.
+    for (i, l) in members[..3].iter().enumerate() {
+        assert!(node.blocks.contains_key(l), "rebuilt leaf {i} was not PUT back to the node");
+    }
+    assert_eq!(node.blocks.get(&members[0]), Some(&first_leaf), "the leaf PUT back is not the leaf that was lost");
+    // FOUR lost (the three again, and a fourth): a fresh page cannot rebuild the group any more.
+    for l in &members[..4] {
+        node.blocks.remove(l);
+    }
     let mut late = PageRig::new();
     late.session = SESSION + 60;
     late.client_as(&mut node, &Request::Identity);

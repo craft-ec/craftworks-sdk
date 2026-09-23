@@ -32,7 +32,7 @@ impl<B: Blocks> Engine<B> {
             return Vec::new();
         }
         match repair::find_group(&self.source(), root, id) {
-            Some(group) => self.start_repair(group),
+            Some(group) => self.start_repair(group, false),
             None => Vec::new(),
         }
     }
@@ -44,6 +44,31 @@ impl<B: Blocks> Engine<B> {
         let mut out = vec![Effect::Keep { id, bytes: body.to_vec() }];
         if self.reads.waiting.contains_key(&id) && crate::read::matches_id(&id, body) {
             out.push(Effect::PutRepaired { id, bytes: body.to_vec() });
+        }
+        out
+    }
+
+    /// The block a race was racing is answered NotFound: the race becomes a REPAIR, and the slots it dropped
+    /// (NotFound or wrong beside a healthy read) are asked again, now until answered.
+    pub(crate) fn race_missed(&mut self, id: Cid) -> Vec<Effect> {
+        let Some(r) = self.repairs.get_mut(&id) else { return Vec::new() };
+        if r.missed {
+            return Vec::new();
+        }
+        r.missed = true;
+        let slots: Vec<(usize, Cid)> = std::mem::take(&mut r.dropped).into_iter().map(|i| (i, r.group.slots[i])).collect();
+        for (i, _) in &slots {
+            r.asked.insert(*i, 0);
+        }
+        let mut out = Vec::new();
+        for (_, slot) in slots {
+            let in_flight = self.repair_slots.contains_key(&slot) || self.reads.waiting.contains_key(&slot);
+            self.repair_slots.entry(slot).or_default().insert(id);
+            self.withdrawn.remove(&slot);
+            if !in_flight {
+                self.reads.fetches += 1;
+                out.push(Effect::FetchBlock { id: slot, via: crate::read::Via::Direct, attempt: 0 });
+            }
         }
         out
     }
