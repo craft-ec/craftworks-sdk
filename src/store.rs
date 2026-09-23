@@ -108,12 +108,6 @@ pub enum RowState {
     Pending,
     /// A write that was rolled back: it failed, or nothing ever answered it.
     RolledBack,
-    /// This client has not loaded the key, so it cannot say.
-    ///
-    /// **Not `Clean`.** "I have not looked" is not "there is nothing in
-    /// flight", and a row that said "saved" about a write it cannot see is
-    /// the exact failure `NOT_LOADED` exists to prevent, one layer up.
-    Unknown,
 }
 
 impl RowState {
@@ -124,7 +118,6 @@ impl RowState {
             RowState::Queued => "QUEUED",
             RowState::Pending => "PENDING",
             RowState::RolledBack => "ROLLED_BACK",
-            RowState::Unknown => "UNKNOWN",
         }
     }
 

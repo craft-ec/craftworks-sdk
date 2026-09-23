@@ -26,6 +26,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.2"
 protocol = { path = "protocol" }
+# READ-STATE (design B): the page's store reads by WALKING the in-page engine's
+# tree over its blocks (`page_store`), so the store that `Db` reads through is
+# the engine's own host, not a copy of its rows. Neither depends on this crate.
+page = { path = "page" }
+engine = { path = "engine" }
 instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "4b269b5ecb128b49590c5f072b395d68587b6b37" }
 
 # The JS surface exists only in the wasm build. The version is pinned to the
@@ -52,7 +57,6 @@ getrandom = { version = "0.2", features = ["js"] }
 # fixtures. Cargo allows exactly this for test-support crates, because the
 # cycle exists only in the test build, never in the library's own graph.
 testkit = { path = "testkit" }
-engine = { path = "engine" }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 wasmi = "0.32"
 bincode = "1"

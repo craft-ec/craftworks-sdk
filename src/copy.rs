@@ -1,41 +1,18 @@
-//! The browser's local copy: a cache that resolves NOTHING.
+//! This client's OWN writes, until the engine has them (READ-STATE, design B).
 //!
-//! `Db` and every component need synchronous reads, and in a browser a read
-//! cannot be a round trip. So the client keeps a copy of the ranges the app
-//! has bound: reads come from here, writes go to the engine AND here, and the
-//! engine's deltas are applied in.
+//! There are no rows here. Reads walk the tree from the engine's root over its
+//! blocks (`crate::page_store`); what this keeps is the write path's own
+//! bookkeeping: each write made and not yet settled, per key, in the order it
+//! was made — so a verdict is a small edit to one term, a write falls WHOLE
+//! with every write behind it, and the outbox re-sends in order.
 //!
-//! # What it is not
+//! **Not an authority.** Nothing here is "saved" until the engine says
+//! published.
 //!
-//! **Not an authority.** The SDK is correct when this is EMPTY — nothing here
-//! is "saved" until the engine says published, and every surface above keeps
-//! saying so. Recovery lives on the network.
-//!
-//! **Not a tree.** It needs ordered reads, delta application, pending writes,
-//! byte-capped eviction, and one thing more interesting than all of them; it
-//! needs no proofs and no canonical encoding, and it never COMPUTES a root —
-//! it RECORDS the one it reflects. A tree builder in the client would
-//! contradict §19's thin browser SDK for no capability.
-//!
-//! **Not a resolver.** Base is whatever the engine last told us; pending is
-//! our own unacknowledged writes. There is no last-writer-wins here and there
-//! must never be: in phase 8 resolution belongs to the contract or the CRDT,
-//! and a shortcut taken in the client would be a second, invisible merge rule
-//! that nothing on the network agrees with.
-//!
-//! # The one thing that is interesting
-//!
-//! **"Not loaded" is not "empty".** A map alone cannot tell them apart, and
-//! the difference is the whole reason a read can be trusted: a range nobody
-//! has fetched must not answer "there is nothing here". So the copy tracks the
-//! set of key INTERVALS it has loaded, and a read outside them says so.
-//!
-//! # Per key: `visible = base ⊕ pending-in-order`
-//!
-//! Not one pending value but an ordered LIST, so every verdict is a small edit
-//! to one term: published moves base forward, failed removes an entry. Rollback
-//! is then defined by construction rather than reconstructed from a history
-//! nobody kept.
+//! INTERIM (removed by R-b, READ-STATE § queue): a write the engine has NOT
+//! taken — held by the window, or queued after `Busy` — is in no root yet, so
+//! a read shows it from here ([`Copy::unaccepted`]). R-b moves the queue into
+//! the engine, and this file with it.
 
 use std::collections::BTreeMap;
 use std::ops::Bound as B;
@@ -194,63 +171,36 @@ pub struct Told {
     /// which id carried it, which is bookkeeping every caller would have to
     /// repeat and get right.
     pub rolled_back_keys: Vec<Vec<u8>>,
-    /// Keys where a delta moved BASE while a write was pending on them.
-    ///
-    /// Not preventable here — the pending write may have been computed from
-    /// the value the delta just changed — so it is made VISIBLE instead. Fires
-    /// once per key per delta.
-    pub moved_under_pending: Vec<Vec<u8>>,
 }
 
 impl Told {
     pub fn is_empty(&self) -> bool {
-        self.rolled_back.is_empty() && self.moved_under_pending.is_empty()
+        self.rolled_back.is_empty()
     }
 }
 
 #[derive(Debug, Default, Clone)]
 struct Entry {
-    base: Option<Vec<u8>>,
-    /// The write of THIS client that last set `base` here, if one did
-    /// (sdk#265): a `Lost` write older than it can no longer land in the
-    /// order the person made it, whatever the copy still holds.
-    base_write: Option<u64>,
+    /// The write of THIS client that last LANDED here (Published), if one
+    /// did while a write was still pending on the key (sdk#265): a `Lost`
+    /// write older than it can no longer land in the order the person made
+    /// it.
+    landed: Option<u64>,
     /// In the order they were made. The last one is what shows.
     pending: Vec<PendingWrite>,
 }
 
-/// One tree's copy, keyed by the root it reflects.
+/// This client's unsettled writes, per key.
 pub struct Copy {
-    /// What the engine last told us, per key.
     keys: BTreeMap<Vec<u8>, Entry>,
-    /// The key intervals that have been LOADED, as `[lo, hi)`, disjoint and
-    /// sorted. What makes "not loaded" different from "empty".
-    loaded: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Loaded intervals this copy knows it is BEHIND on, each with the root
-    /// it was last CURRENT at (sdk#266). Their rows are still here — a delta
-    /// from that root patches them — but a read of one is not answered from
-    /// the copy.
-    ///
-    /// The root is per RANGE because the copy has one root and many ranges:
-    /// the first range refreshed moves `root` to the head that won, and a
-    /// second range asked from THAT root is told nothing changed and shows
-    /// its old rows as current (measured in a browser: y's scan answered 0
-    /// rows for ever, with the node answering every re-ask).
-    stale: Vec<(Vec<u8>, Vec<u8>, [u8; 32])>,
-    /// The root this copy reflects. RECORDED, never computed.
-    root: Option<[u8; 32]>,
-    bytes: usize,
-    /// Over this, unbound ranges are evicted. A cache with no cap is a leak
-    /// with a nicer name.
-    pub max_bytes: usize,
     /// No verdict within this many milliseconds ⇒ `Unknown`, roll back.
     pub pending_timeout_ms: u64,
     /// Pending writes this client will hold at once.
     ///
-    /// Eviction deliberately never drops a pending write — it is not a cache
-    /// entry, it is something the app is waiting on — which left pending as
-    /// the only unbounded thing here. An app in a loop, or one whose engine
-    /// has stopped answering, would accumulate them with nothing to stop it.
+    /// A pending write is not a cache entry, it is something the app is
+    /// waiting on — so it is bounded here, or an app in a loop, or one whose
+    /// engine has stopped answering, would accumulate them with nothing to
+    /// stop it.
     pub max_pending: usize,
     /// And the same bound in BYTES, because a count is not a byte budget.
     pub max_pending_bytes: usize,
@@ -269,11 +219,6 @@ impl Copy {
     pub fn new() -> Copy {
         Copy {
             keys: BTreeMap::new(),
-            loaded: Vec::new(),
-            stale: Vec::new(),
-            root: None,
-            bytes: 0,
-            max_bytes: 8 * 1024 * 1024,
             pending_timeout_ms: 60_000,
             max_pending: 256,
             max_pending_bytes: 4 * 1024 * 1024,
@@ -282,312 +227,42 @@ impl Copy {
         }
     }
 
-    /// The root this copy reflects, if it reflects one.
-    pub fn root(&self) -> Option<[u8; 32]> {
-        self.root
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    /// Is this key inside a range that has been loaded — and not one this
-    /// copy knows it is BEHIND on (sdk#266)?
-    pub fn is_loaded(&self, key: &[u8]) -> bool {
-        self.holds(key) && !self.stale.iter().any(|(lo, hi, _)| key >= lo.as_slice() && key < hi.as_slice())
-    }
-
-    /// Is this key inside a range whose rows this copy HOLDS, stale or not?
-    /// What a delta patches: a stale range keeps its rows, because the delta
-    /// that refreshes it says only what CHANGED (sdk#266).
-    fn holds(&self, key: &[u8]) -> bool {
-        self.loaded
-            .iter()
-            .any(|(lo, hi)| key >= lo.as_slice() && key < hi.as_slice())
-    }
-
-    /// THE HEAD MOVED, AND NOT BY THIS PAGE'S OWN COMMIT (sdk#266).
-    ///
-    /// Every loaded range is now known to be behind: a read of one must not
-    /// be answered from the copy, because "read when needed" means a read
-    /// returns data at least as new as the head this page has adopted. The
-    /// rows STAY — the next read re-asks with a delta from the root the copy
-    /// stands on, which is cheap where a full reload is not — and the range
-    /// becomes current again when that delta lands ([`Copy::refreshed`]).
-    ///
-    /// Only a head that is NOT this page's own commit: after every commit of
-    /// this tab's the copy already holds those values, and marking then would
-    /// double the read traffic of ordinary writing.
-    pub fn mark_stale(&mut self) {
-        let Some(root) = self.root else { return };
-        let fresh: Vec<(Vec<u8>, Vec<u8>)> = self
-            .loaded
-            .iter()
-            .filter(|(l, h)| !self.stale.iter().any(|(sl, sh, _)| sl <= l && h <= sh))
-            .cloned()
-            .collect();
-        self.stale.extend(fresh.into_iter().map(|(l, h)| (l, h, root)));
-    }
-
-    /// Is any part of `[lo, hi)` stale?
-    pub fn is_stale(&self, lo: &[u8], hi: &[u8]) -> bool {
-        self.stale_from(lo, hi).is_some()
-    }
-
-    /// The root a stale part of `[lo, hi)` was last CURRENT at: what its
-    /// re-ask asks FROM. The oldest of them, so nothing is skipped.
-    pub fn stale_from(&self, lo: &[u8], hi: &[u8]) -> Option<[u8; 32]> {
-        self.stale
-            .iter()
-            .filter(|(l, h, _)| l.as_slice() < hi && lo < h.as_slice())
-            .map(|(_, _, root)| *root)
-            .next()
-    }
-
-    /// A delta from this copy's root has been applied over `[lo, hi)`: that
-    /// span is as new as the head the delta named.
-    ///
-    /// SUBTRACTED, not dropped. A page loads a wide range — the whole key
-    /// space, on an opening session — and READS a narrow one, a domain. With
-    /// only whole ranges cleared, the wide stale range survived every delta:
-    /// the read re-asked, was answered, and found the range stale again, for
-    /// ever (measured in a browser, sdk#266: `y.scan` threw "not loaded"
-    /// every 250 ms for 30 s while the node answered each re-ask).
-    pub fn refreshed(&mut self, lo: &[u8], hi: &[u8]) {
-        let mut out = Vec::with_capacity(self.stale.len() + 1);
-        for (l, h, root) in std::mem::take(&mut self.stale) {
-            // Disjoint: untouched.
-            if h.as_slice() <= lo || hi <= l.as_slice() {
-                out.push((l, h, root));
-                continue;
-            }
-            if l.as_slice() < lo {
-                out.push((l.clone(), lo.to_vec(), root));
-            }
-            if hi < h.as_slice() {
-                out.push((hi.to_vec(), h, root));
-            }
-        }
-        self.stale = out;
-    }
-
-    /// What a component sees, or `None` if this range was never loaded.
-    ///
-    /// The outer `None` is "I do not know", NOT "there is nothing here". A
-    /// caller told the wrong one of those shows an empty list for data that
-    /// exists.
+    /// What this client's own LAST write on `key` is doing, or `None` when
+    /// no write of this client's is pending there.
     pub fn get(&self, key: &[u8]) -> Option<Visible> {
-        if !self.is_loaded(key) {
-            return None;
-        }
-        Some(self.visible(key))
+        let w = self.keys.get(key)?.pending.last()?;
+        Some(if w.queued { Visible::Queued(w.value.clone(), w.write_id) } else { Visible::Pending(w.value.clone(), w.write_id) })
     }
 
-    fn visible(&self, key: &[u8]) -> Visible {
-        let Some(e) = self.keys.get(key) else {
-            return Visible::Clean(None);
-        };
-        match e.pending.last() {
-            None => Visible::Clean(e.base.clone()),
-            Some(w) if w.queued => Visible::Queued(w.value.clone(), w.write_id),
-            Some(w) => Visible::Pending(w.value.clone(), w.write_id),
-        }
-    }
-
-    /// Stop answering for `[lo, hi)`: it is no longer known.
-    ///
-    /// For the case where the engine says it CANNOT compute a delta. The
-    /// range must then stop being answered from cache — a copy that kept
-    /// serving it would answer confidently from a version the engine has
-    /// just said it cannot reconcile. Told nothing, the next read says
-    /// `NotLoaded` and the range is fetched in full, which is the honest
-    /// outcome.
-    ///
-    /// PENDING WRITES SURVIVE. They are this client's own, not the engine's
-    /// account of anything, and dropping them would silently discard writes a
-    /// person made and can still see.
-    pub fn forget(&mut self, lo: &[u8], hi: &[u8]) {
-        let doomed: Vec<Vec<u8>> = self
-            .keys
-            .range(lo.to_vec()..hi.to_vec())
-            .filter(|(_, e)| e.pending.is_empty())
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in doomed {
-            if let Some(e) = self.keys.remove(&k) {
-                self.bytes = self
-                    .bytes
-                    .saturating_sub(e.base.as_ref().map_or(0, |v| v.len()));
-            }
-        }
-        // And the interval itself: "loaded" is the claim that must go.
-        self.loaded
-            .retain(|(l, h)| !(l.as_slice() >= lo && h.as_slice() <= hi));
-    }
-
-    /// Forget ONE key, however wide the interval that loaded it (M2): its
-    /// entry goes (unless a write is pending on it) and a hole is punched in
-    /// every loaded interval that covers it, so the next read of it is
-    /// `NotLoaded` and fetches what the TREE holds. [`Copy::forget`] drops
-    /// only intervals lying wholly inside its range, which a single key never
-    /// covers.
-    pub fn forget_key(&mut self, key: &[u8]) {
-        if self.keys.get(key).is_some_and(|e| e.pending.is_empty()) {
-            if let Some(e) = self.keys.remove(key) {
-                self.bytes = self.bytes.saturating_sub(e.base.as_ref().map_or(0, |v| v.len()));
-            }
-        }
-        let mut after = key.to_vec();
-        after.push(0);
-        let mut out = Vec::with_capacity(self.loaded.len() + 1);
-        for (l, h) in std::mem::take(&mut self.loaded) {
-            if l.as_slice() <= key && key < h.as_slice() {
-                if l.as_slice() < key {
-                    out.push((l, key.to_vec()));
-                }
-                if after < h {
-                    out.push((after.clone(), h));
-                }
-            } else {
-                out.push((l, h));
-            }
-        }
-        self.loaded = out;
-    }
-
-    /// Rows in `[lo, hi)`, or `None` if any of that range was never loaded.
-    pub fn range(&self, lo: &[u8], hi: &[u8]) -> Option<Vec<(Vec<u8>, Visible)>> {
-        if !self.range_loaded(lo, hi) {
-            return None;
-        }
-        Some(
-            self.keys
-                .range::<[u8], _>((B::Included(lo), B::Excluded(hi)))
-                .map(|(k, _)| (k.clone(), self.visible(k)))
-                .filter(|(_, v)| v.value().is_some())
-                .collect(),
-        )
-    }
-
-    /// Is every part of `[lo, hi)` covered by loaded intervals?
-    pub fn range_loaded(&self, lo: &[u8], hi: &[u8]) -> bool {
+    /// INTERIM: removed by R-b (READ-STATE § queue). The writes the ENGINE HAS
+    /// NOT TAKEN — held by the window, queued after `Busy`, or SENT AND NOT
+    /// YET ANSWERED — in `[lo, hi)`, each key's LAST such value (`None`:
+    /// deleted). These are in no root, so a read shows them on top of its
+    /// walk. The third kind is a write the engine PARKED to fetch the blocks
+    /// it lands on: in a browser the node answers later, so a write to a cold
+    /// tree waits there with no verdict, and a read in between missed it
+    /// (measured: the notes acceptance's `put` after its own `define` read "no
+    /// schema"). A write the engine accepted is in the warm root and is NOT
+    /// here: two copies of one value is the defect this design removes. An
+    /// entry dies on the engine's verdict: `Accepted` (it is in the warm
+    /// root), or any refusal (it falls).
+    pub fn unaccepted(&self, lo: &[u8], hi: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         if lo >= hi {
-            return true;
+            return Vec::new();
         }
-        // Behind the head this page has adopted: not an answer (sdk#266).
-        if self.is_stale(lo, hi) {
-            return false;
-        }
-        let mut at = lo.to_vec();
-        loop {
-            let Some((_, end)) = self
-                .loaded
-                .iter()
-                .find(|(l, h)| at >= *l && at < *h)
-                .cloned()
-            else {
-                return false;
-            };
-            if end.as_slice() >= hi {
-                return true;
-            }
-            at = end;
-        }
-    }
-
-    /// Record that `[lo, hi)` has been read, with these rows.
-    ///
-    /// Everything in the interval and not in `rows` is known ABSENT, which is
-    /// a different fact from unknown and is why this takes the interval rather
-    /// than only the rows.
-    pub fn loaded_range(
-        &mut self,
-        lo: &[u8],
-        hi: &[u8],
-        rows: Vec<(Vec<u8>, Vec<u8>)>,
-        at_root: [u8; 32],
-    ) {
-        // A copy is per ROOT. Rows read at a different root than the one held
-        // describe a different tree state, so the base is replaced rather than
-        // merged — merging two roots' rows is the resolution this must never
-        // do.
-        if self.root != Some(at_root) {
-            self.forget_base();
-            self.root = Some(at_root);
-        }
-        let held: Vec<Vec<u8>> = self
-            .keys
+        self.keys
             .range::<[u8], _>((B::Included(lo), B::Excluded(hi)))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in held {
-            if let Some(e) = self.keys.get_mut(&k) {
-                self.bytes -= e.base.as_ref().map_or(0, |v| v.len());
-                e.base = None;
-                if e.pending.is_empty() {
-                    self.keys.remove(&k);
-                }
-            }
-        }
-        for (k, v) in rows {
-            self.bytes += v.len();
-            self.keys.entry(k).or_default().base = Some(v);
-        }
-        self.add_interval(lo.to_vec(), hi.to_vec());
-        self.evict();
+            .filter_map(|(k, e)| {
+                let w = e.pending.last()?;
+                (w.queued || w.held || w.at_node).then(|| (k.clone(), w.value.clone()))
+            })
+            .collect()
     }
 
-    fn add_interval(&mut self, lo: Vec<u8>, hi: Vec<u8>) {
-        self.loaded.push((lo, hi));
-        self.loaded.sort();
-        let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for (lo, hi) in std::mem::take(&mut self.loaded) {
-            match merged.last_mut() {
-                Some((_, end)) if lo <= *end => {
-                    if hi > *end {
-                        *end = hi;
-                    }
-                }
-                _ => merged.push((lo, hi)),
-            }
-        }
-        self.loaded = merged;
-    }
-
-    fn forget_base(&mut self) {
-        self.keys.retain(|_, e| {
-            e.base = None;
-            !e.pending.is_empty()
-        });
-        self.loaded.clear();
-        self.bytes = 0;
-    }
-
-    /// Drop loaded ranges until under the cap.
-    ///
-    /// Base only: a pending write is not a cache entry, it is something the
-    /// app is waiting on, and evicting it would show the row reverting for a
-    /// reason nobody can see.
-    fn evict(&mut self) {
-        while self.bytes > self.max_bytes {
-            let Some((lo, hi)) = self.loaded.pop() else {
-                return;
-            };
-            let victims: Vec<Vec<u8>> = self
-                .keys
-                .range::<[u8], _>((B::Included(lo.as_slice()), B::Excluded(hi.as_slice())))
-                .map(|(k, _)| k.clone())
-                .collect();
-            for k in victims {
-                if let Some(e) = self.keys.get_mut(&k) {
-                    self.bytes -= e.base.as_ref().map_or(0, |v| v.len());
-                    e.base = None;
-                    if e.pending.is_empty() {
-                        self.keys.remove(&k);
-                    }
-                }
-            }
-        }
+    /// INTERIM (R-b): is any write not yet taken by the engine (held, queued,
+    /// or sent and unanswered)?
+    pub fn any_unaccepted(&self) -> bool {
+        self.keys.values().flat_map(|e| e.pending.iter()).any(|w| w.queued || w.held || w.at_node)
     }
 
     /// A local write, applied optimistically — or REFUSED.
@@ -739,32 +414,22 @@ impl Copy {
         }
     }
 
-    /// The engine published this write: its value becomes base.
+    /// The engine published this write: it leaves the list, and the key
+    /// remembers it LANDED (sdk#265's overtaken rule).
     /// The keys this pending write touches.
     pub fn keys_of(&self, write_id: u64) -> Vec<Vec<u8>> {
         self.keys.iter().filter(|(_, e)| e.pending.iter().any(|w| w.write_id == write_id)).map(|(k, _)| k.clone()).collect()
     }
 
     pub fn published(&mut self, write_id: u64) {
-        let mut empty: Vec<Vec<u8>> = Vec::new();
-        for (k, e) in self.keys.iter_mut() {
+        for e in self.keys.values_mut() {
             let Some(i) = e.pending.iter().position(|w| w.write_id == write_id) else {
                 continue;
             };
-            let w = e.pending.remove(i);
-            e.base_write = Some(write_id);
-            // Base moves forward. Anything pending BEHIND it still shows on
-            // top, which is the point of keeping a list.
-            e.base = w.value;
-            if e.base.is_none() && e.pending.is_empty() {
-                empty.push(k.clone());
-            }
+            e.pending.remove(i);
+            e.landed = Some(write_id);
         }
-        for k in empty {
-            self.keys.remove(&k);
-        }
-        self.recount();
-        self.recount_pending();
+        self.drop_empty();
     }
 
     /// The engine refused this write — and with it every LATER write on the
@@ -865,54 +530,9 @@ impl Copy {
         self.fall(seeds)
     }
 
-    /// The engine moved to a new root: apply the changes to BASE.
-    ///
-    /// Pending writes stay on top. The copy can then show a combination that
-    /// exists nowhere yet — which is what optimistic UI IS — and the hazard,
-    /// a pending write derived from a value this delta just changed, is made
-    /// VISIBLE rather than pretended away.
-    pub fn apply_delta(
-        &mut self,
-        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        new_root: [u8; 32],
-    ) -> Told {
-        let mut told = Told::default();
-        for (k, v) in changes {
-            // Outside what is loaded, there is nothing to update: the copy
-            // does not accumulate rows it was never asked for. A STALE range
-            // still holds its rows, and this delta is exactly what brings it
-            // up to date (sdk#266) — `holds`, not `is_loaded`.
-            if !self.holds(&k) {
-                continue;
-            }
-            let e = self.keys.entry(k.clone()).or_default();
-            e.base = v;
-            e.base_write = None;
-            if !e.pending.is_empty() {
-                told.moved_under_pending.push(k.clone());
-            }
-            if e.base.is_none() && e.pending.is_empty() {
-                self.keys.remove(&k);
-            }
-        }
-        self.root = Some(new_root);
-        self.recount();
-        told
-    }
-
     fn drop_empty(&mut self) {
-        self.keys
-            .retain(|_, e| e.base.is_some() || !e.pending.is_empty());
-        self.recount();
+        self.keys.retain(|_, e| !e.pending.is_empty());
         self.recount_pending();
-    }
-
-    fn recount(&mut self) {
-        self.bytes = self
-            .keys
-            .values()
-            .map(|e| e.base.as_ref().map_or(0, |v| v.len()))
-            .sum();
     }
 
     /// Write ids still waiting on a verdict.
@@ -950,7 +570,7 @@ impl Copy {
         self.keys
             .values()
             .filter(|e| e.pending.iter().any(|w| w.write_id == write_id))
-            .any(|e| e.base_write.is_some_and(|b| b > write_id))
+            .any(|e| e.landed.is_some_and(|b| b > write_id))
     }
 
     /// Is this write queued to go again?

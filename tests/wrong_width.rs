@@ -143,15 +143,16 @@ fn a_wrong_width_write_refuses_and_names_the_width_wanted() {
     assert!(e.contains("wants a 32-hex id"), "got: {e}");
 }
 
-/// The browser session reads through `CachedStore`; its hook must reach its
+/// The browser session reads through `PageStore`; its hook must reach its
 /// client's recording, or the whole chain above records into nothing in the
 /// product.
 #[test]
-fn cached_store_forwards_the_hook_into_its_recording() {
+fn page_store_forwards_the_hook_into_its_recording() {
     // Through the probed fixture, not built bare (fixture-gate).
-    let (mut s, _clock) = testkit::cached_store();
-    s.client.record_into(16);
-    s.wrong_width(IdWidth::Bare, IdWidth::Parented);
-    let r = s.client.recording().expect("a recording");
+    let node = testkit::PageNode::new();
+    let (mut s, _conn, _clock) = testkit::page_store(&node);
+    s.writes.client.record_into(16);
+    craftworks_sdk::Reads::wrong_width(&s, IdWidth::Bare, IdWidth::Parented);
+    let r = s.writes.client.recording().expect("a recording");
     assert_eq!((r.total(Key::IdWidthGiven), r.total(Key::IdWidthWanted)), (32, 64));
 }

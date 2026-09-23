@@ -6,9 +6,10 @@
 //! layout hard-coded into apps could never change afterwards without breaking
 //! every one of them.
 
-use craftworks_sdk::{CachedStore, Db, SystemEnv};
+use craftworks_sdk::{Db, MemStore, SystemEnv};
 
-type D = Db<CachedStore, SystemEnv>;
+/// The key layout is `Db`'s, whatever store it reads through.
+type D = Db<MemStore, SystemEnv>;
 
 /// A domain's range contains its own records and stops before the next
 /// domain's.
@@ -56,37 +57,14 @@ fn a_domain_is_not_swallowed_by_one_whose_name_extends_it() {
     );
 }
 
-/// `domain_of_range` is the inverse, and ONLY of a whole domain's range: a
-/// completed load of anything narrower or wider must not be taken for the
-/// domain, or `Refresh` would ask for deltas from a root the copy only partly
-/// holds (sdk#142).
+/// The watch-key layout round-trips (a LIVE binding's key names the range its
+/// `RenderedAt` diff covers), and a string that is not a key names nothing.
 #[test]
-fn domain_of_range_names_a_domain_only_for_its_whole_range() {
-    let (lo, hi) = D::domain_range("tasks");
-    assert_eq!(D::domain_of_range(&lo, &hi).as_deref(), Some("tasks"));
-    let key = craftworks_sdk::db::record_key("tasks", [1u8; 16]);
-    let mut after = key.clone();
-    after.push(0);
-    assert_eq!(D::domain_of_range(&key, &after), None, "one record's span is not the domain");
-    assert_eq!(D::domain_of_range(&lo, &after), None, "nor is a prefix of it");
-    assert_eq!(D::domain_of_range(b"", &[0xFF; 8]), None, "nor everything");
-    let (task_lo, _) = D::domain_range("task");
-    assert_eq!(D::domain_of_range(&task_lo, &hi), None, "nor a span straddling two domains");
-}
-
-/// `watch_key_of_range` names a whole domain OR one parent's band — the
-/// spans a binding reads — and nothing else (sdk#137).
-#[test]
-fn watch_key_of_range_names_a_domain_or_a_band_and_nothing_else() {
-    let (lo, hi) = D::domain_range("tasks");
-    assert_eq!(D::watch_key_of_range(&lo, &hi).as_deref(), Some("tasks"));
-    let p = [3u8; 16];
-    let (blo, bhi) = D::parent_range("tasks", &p);
-    let key = D::watch_key_of_range(&blo, &bhi).expect("a band names its key");
-    assert_eq!(key, D::watch_key("tasks", Some(&p)));
-    assert_eq!(D::watch_range(&key), Some((blo.clone(), bhi.clone())), "and the key names the band back");
-    let mut past = blo.clone();
-    past.push(0);
-    assert_eq!(D::watch_key_of_range(&blo, &past), None, "a narrower span is not the band");
-    assert_eq!(D::watch_key_of_range(&blo, &hi), None, "nor one reaching the domain's end");
+fn a_watch_key_names_its_range_and_nothing_else_does() {
+    assert_eq!(D::watch_range("note"), Some(D::domain_range("note")));
+    let k = D::watch_key("note", Some(&[7u8; 16]));
+    assert_eq!(D::watch_range(&k), Some(D::parent_range("note", &[7u8; 16])));
+    for bad in ["", "No", "note#", "note#xyz", "note#0123", "a#b#c"] {
+        assert_eq!(D::watch_range(bad), None, "{bad:?}");
+    }
 }

@@ -52,6 +52,7 @@ function fakeRaw() {
     unowned() {},
     reconnected() {}, take_progress: () => "[]", provision() {},
     take_loads() { const o = ended; ended = []; return JSON.stringify(o); },
+    resume() {},
     provisioned: () => true, refused: () => "", exhausted: () => false,
     unusable: () => "[]",
     // A DISTINCTIVE RATE. 1000 would pass whether the page asked the session
@@ -169,8 +170,6 @@ function watchingRaw() {
     take_stale() { const s = stale; stale = []; return JSON.stringify(s); },
     take_state_changed() { const s = ownChanged; ownChanged = []; return JSON.stringify(s); },
     // A binding's reload asks the session to refresh what it reads first.
-    refreshes: 0,
-    refresh_domain() { session.refreshes += 1; },
     root: () => "00".repeat(32),
     live_mode: () => JSON.stringify({ mode: "HeadSubscribed", why: "", foreignNotifications: foreign }),
     scan() { scans += 1; return JSON.stringify([{ id: "a", title }]); },

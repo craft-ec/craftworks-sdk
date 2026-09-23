@@ -74,3 +74,24 @@ pub fn cached_store_at(start_ms: u64) -> (craftworks_sdk::CachedStore, Clock) {
     let clock = Clock::new(start_ms);
     (craftworks_sdk::CachedStore::new(clock.as_fn()), clock)
 }
+
+/// A tab's STORE (READ-STATE, design B): a `PageStore` lent a new tab on
+/// `node`, started (its `Identity` sent and answered), with the tab handed
+/// back so a test can drive its clock and look at its server, and the clock.
+pub fn page_store(node: &PageNode) -> (craftworks_sdk::PageStore<PageConn>, PageConn, Clock) {
+    let clock = Clock::new(0);
+    let conn = node.connect();
+    let mut store = craftworks_sdk::PageStore::new(clock.as_fn(), clock.as_fn());
+    store.writes.client.send(&protocol::Request::Identity);
+    store.set_host(conn.clone());
+    (store, conn, clock)
+}
+
+/// A `PageStore` over a host the caller built (a test's own rig), on a clock
+/// that can be driven, the clock handed back.
+pub fn page_store_over<H: page::server::Host>(host: H) -> (craftworks_sdk::PageStore<H>, Clock) {
+    let clock = Clock::new(0);
+    let mut store = craftworks_sdk::PageStore::new(clock.as_fn(), clock.as_fn());
+    store.set_host(host);
+    (store, clock)
+}

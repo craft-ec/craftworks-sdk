@@ -66,7 +66,7 @@ const fakeSession = () => ({
     preload: () => 0, trace: () => "null", trace_on: () => undefined,
     take_loads: () => "[]", take_stale: () => "[]", live_mode: () => "{}",
     bind: () => undefined, unbind: () => undefined,
-    refresh_domain: () => undefined, take_stale: () => "[]",
+    take_stale: () => "[]",
   },
 });
 

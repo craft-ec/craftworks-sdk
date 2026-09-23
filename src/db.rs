@@ -445,23 +445,6 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         }
     }
 
-    /// The watch key whose range is EXACTLY `[lo, hi)`: a whole domain, or
-    /// one parent's band — so a completed load of either establishes the root
-    /// a live binding of it asks deltas from (sdk#142 for domains, sdk#137 for
-    /// bands). A span that is neither names nothing.
-    pub fn watch_key_of_range(lo: &[u8], hi: &[u8]) -> Option<String> {
-        if let Some(d) = Self::domain_of_range(lo, hi) {
-            return Some(d);
-        }
-        let rest = lo.strip_prefix(&[T_RECORD])?;
-        let z = rest.iter().position(|b| *b == 0)?;
-        let domain = std::str::from_utf8(&rest[..z]).ok()?;
-        check_domain(domain).ok()?;
-        let parent: RKey = rest[z + 1..].try_into().ok()?;
-        (Self::parent_range(domain, &parent) == (lo.to_vec(), hi.to_vec()))
-            .then(|| Self::watch_key(domain, Some(&parent)))
-    }
-
     /// The range a [`Db::watch_key`] names, or `None` for a string that is
     /// not one.
     pub fn watch_range(key: &str) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -483,9 +466,6 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         (lo, hi)
     }
 
-    /// The domain whose WHOLE range is exactly `[lo, hi)`, if any — the
-    /// inverse of [`Db::domain_range`], kept beside it so the layout is
-    /// still known in one place. A narrower or wider span names no domain.
     /// The domain a RECORD key is in, or `None` for any other key (a schema,
     /// an index entry).
     pub fn domain_of_key(key: &[u8]) -> Option<String> {
@@ -515,13 +495,6 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         out.sort();
         out.dedup();
         out
-    }
-
-    pub fn domain_of_range(lo: &[u8], hi: &[u8]) -> Option<String> {
-        let name = lo.strip_prefix(&[T_RECORD])?.strip_suffix(&[0])?;
-        let domain = std::str::from_utf8(name).ok()?;
-        check_domain(domain).ok()?;
-        (Self::domain_range(domain) == (lo.to_vec(), hi.to_vec())).then(|| domain.to_string())
     }
 
     pub fn new(store: S, env: E, device: [u8; 4]) -> Self {

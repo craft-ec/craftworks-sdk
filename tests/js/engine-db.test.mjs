@@ -92,6 +92,10 @@ const lateSession = ({ afterMs = 20, rows = [{ id: "a" }], fail = false, failCod
     update(domain = "tasks") { return s.scan(domain); },
     delete(domain = "tasks") { s.scan(domain); return true; },
     take_loads() { const out = ended; ended = []; return JSON.stringify(out); },
+    // A woken read RESUMES its ticket before it asks again (READ-STATE: the
+    // next walk is pinned to that ticket's root).
+    resumed: [],
+    resume(ticket) { s.resumed.push(ticket); },
     pump: () => {},
   };
   return s;
@@ -105,6 +109,7 @@ await t("a read waits for the data and then answers — TWO asks, one request", 
   assert.deepEqual(rows, [{ id: "a" }]);
   assert.equal(s.asks(), 2, "the read did not ask exactly twice");
   assert.equal(s.requests(), 1, "the read issued more than one request for one range");
+  assert.deepEqual(s.resumed, [1], "the woken read did not resume the ticket it waited on, so its next walk chases the head");
 });
 
 await t("CONCURRENT reads of one unloaded range issue ONE request", async () => {
@@ -281,6 +286,7 @@ await t("and the retry is BOUNDED even when every attempt hands back a ticket", 
       throw e;
     },
     take_loads() { const out = ended.splice(0); return JSON.stringify(out); },
+    resume() {},
     pump: () => {},
   };
   const db = engineDb(s);

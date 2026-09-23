@@ -7,10 +7,10 @@
 //!
 //! * there is NO delegate path left to route to: no engine-delegate framing,
 //!   no install plan, no mode flag;
-//! * the store's protocol frames go to page-io; node frames go to page-io;
-//!   provisioning goes to the signer through page-io;
-//! * the page's own cold reads are off (the in-page engine fetches blocks
-//!   itself, through page-io, on the RTO estimator);
+//! * page-io is OWNED BY THE STORE (`PageStore`, READ-STATE): the store's
+//!   frames reach it there (`PageStore::sync`), node frames go to it,
+//!   provisioning goes to the signer through it;
+//! * the Session keeps no head, root, row or range (READ-STATE's inventory);
 //! * the one-shot timer and the tick drive page-io.
 
 use std::path::Path;
@@ -37,8 +37,8 @@ fn there_is_no_delegate_path_left() {
 #[test]
 fn every_path_to_the_node_is_page_io() {
     let src = session_src();
-    let env = body_of(&src, "envelope_engine_requests");
-    assert!(env.contains(".client(&bytes)"), "the store's frames do not go to page-io:\n{env}");
+    let pump = body_of(&src, "pump_page");
+    assert!(pump.contains("self.db.store_mut().sync()"), "the store's frames do not reach page-io:\n{pump}");
     let inbound = body_of(&src, "on_inbound");
     assert!(inbound.contains("p.inbound(bytes,"), "node frames do not go to page-io:\n{inbound}");
     let prov = body_of(&src, "provision");
@@ -46,7 +46,7 @@ fn every_path_to_the_node_is_page_io() {
     let page = body_of(&src, "provision_page");
     // It ASKS the signer first (`begin`); what it sends is tested on the real
     // Session in tests/js/page-identity.test.mjs.
-    assert!(page.contains("io.begin(container)") && page.contains("self.switch_cold(false"), "provision_page does not open through the signer or leaves cold reads on:\n{page}");
+    assert!(page.contains("io.begin(container)") && page.contains("self.db.store_mut().set_host(io)"), "provision_page does not open through the signer, or does not hand page-io to the store:\n{page}");
 }
 
 #[test]
@@ -65,49 +65,44 @@ fn control_the_reader_finds_the_bodies() {
     assert!(body_of(&src, "pump_page").contains("take_frames()"));
 }
 
-/// The page path tells the UI what the delegate path used to (builder#107):
-/// the in-page engine's PUBLISHED head moving sets `head_moved` (the delegate
-/// path's HeadChanged, which re-asks LIVE bindings), and this client's OWN
-/// writes changing state are reported by domain for every binding.
+/// ONE OWNER FOR THE HEAD (READ-STATE inv. 1): the Session stores no head,
+/// root, row or range — each was a copy of the engine's, and every defect of
+/// 2026-09-23 was one of them going stale. LIVE is the tree's diff from each
+/// binding's `RenderedAt` (`LiveBindings`, tested natively in
+/// `testkit/tests/read_state_model.rs`), and this client's OWN writes changing
+/// state are reported by the app-relative domain its bindings are keyed by.
 #[test]
-fn the_page_reports_head_moves_and_own_write_states() {
+fn the_session_keeps_no_copy_of_the_head_and_reports_changes_from_the_tree() {
     let src = session_src();
-    let pump = body_of(&src, "pump_page");
-    assert!(pump.contains("p.server.page.published()") && pump.contains("self.head_moved = true"), "a published head move does not mark the head moved:\n{pump}");
+    for gone in ["head_root", "seen_published", "head_moved", "head_named", "self.loads", "self.refresh", "self.cold", "take_adopted", "mark_stale", ".on_page(", ".on_delta("] {
+        assert!(!src.contains(gone), "the Session still keeps a copy the engine owns: `{gone}`");
+    }
+    let stale = body_of(&src, "take_stale");
+    assert!(stale.contains("self.bound.take_changed(") && stale.contains(".head()"), "LIVE is not the diff from each binding's RenderedAt to the engine's root:\n{stale}");
     let own = body_of(&src, "take_state_changed");
     // By the APP-RELATIVE domain (`own_domains_of_keys`, pinned natively in
-    // tests/cached_store.rs): this used to require `domain_of_key` here, which
-    // is the STORED `<app>.<name>` since craftworks-sdk#267 — keyed by no
-    // binding, so a plain table said "saving" for good (builder#107, back).
+    // tests/cached_store.rs): `domain_of_key` is the STORED `<app>.<name>`
+    // since craftworks-sdk#267 — keyed by no binding, so a plain table said
+    // "saving" for good (builder#107, back).
     assert!(
         own.contains(".take_state_changed()") && own.contains("own_domains_of_keys") && own.contains("self.app"),
         "own write states are not reported by the app-relative domain the bindings are keyed by:\n{own}"
     );
 }
 
-/// sdk#266: the Session ROUTES adoption and the re-ask. The decisions are
-/// tested natively (`craftworks-sdk/tests/stale_on_adopt.rs` for the copy and
-/// the delta, `testkit/tests/read_when_needed.rs` for a whole tab reading at
-/// a head it adopted); what only this file can see is whether the Session
-/// still calls them.
+/// A woken read is RESUMED at its ticket's root, so a chain of hops ends on
+/// one tree (READ-STATE inv. 2; the architect's chase). The decision is the
+/// store's (`PageStore::resume`, planted as a mutant in the model test; its
+/// pin ends in `PageStore::decide`); what only this file can see is that the
+/// Session exposes it and decides every result through the store.
 #[test]
-fn an_adopted_head_makes_the_ranges_stale_and_a_read_re_asks() {
+fn a_woken_read_resumes_at_its_tickets_root_and_every_call_unpins() {
     let src = session_src();
-    let pump = body_of(&src, "pump_page");
-    assert!(
-        pump.contains("take_adopted()") && pump.contains("mark_stale()"),
-        "a head this page ADOPTED does not make its loaded ranges stale, so a read answers at a head the page has left:\n{pump}"
-    );
-    let delta = body_of(&src, "on_delta");
-    assert!(
-        delta.contains("parking::delta_for_read"),
-        "a delta answering a READ's own ticket is not routed to it, so the read waits out its budget:\n{delta}"
-    );
-    let full = body_of(&src, "on_full_reload");
-    assert!(
-        full.contains("parking::full_reload_for_read"),
-        "a re-ask the engine could not diff does not fall back to a full load under the read's ticket:\n{full}"
-    );
+    assert!(body_of(&src, "resume").contains("self.db.store_mut().resume(ticket)"), "the Session does not resume a ticket");
+    let at = src.find("fn decide<").expect("fn decide");
+    let decide = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
+    // `PageStore::decide` ends the pin; it is called for every result.
+    assert!(decide.contains("store_mut().decide(r)"), "the Session decides a result itself:\n{decide}");
 }
 
 /// sdk#259: `live_mode` reports the PAGE PATH's subscription — page-io's head
@@ -138,18 +133,4 @@ fn live_mode_reports_the_pages_own_head_subscription() {
     for literal in ["\"HeadSubscribed\"", "\"Polled\""] {
         assert!(!body.contains(literal), "live_mode decides a mode itself ({literal}), outside the mapping the native test pins:\n{body}");
     }
-}
-
-/// A loaded page is recorded at the root it was READ at (`at.root`), never at
-/// `head_root` — which is set from `Identity` only and stays the first head
-/// on the page path. Recorded at the stale root, every load after a delta
-/// looked like another tree and wiped the whole copy (measured in sdk#282's
-/// acceptance run: a read of another app's notes answered NOT_LOADED for ever).
-#[test]
-fn a_loaded_page_is_recorded_at_the_root_it_was_read_at() {
-    let src = session_src();
-    let at = src.find("craftworks_sdk::loads::Page::Complete { lo, hi, rows, at } =>").expect("the page-complete arm");
-    let arm = &src[at..at + src[at..].find("craftworks_sdk::loads::Page::Restart").expect("the next arm")];
-    assert!(arm.contains("on_page(&lo, &hi, rows, at.root)"), "a completed page is not recorded at the root it was read at:\n{arm}");
-    assert!(!arm.contains("self.head_root"), "a completed page is recorded at head_root, the stale first head:\n{arm}");
 }

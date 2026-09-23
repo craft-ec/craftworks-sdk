@@ -21,7 +21,7 @@
 //! nor a session's writes out of order (W2). Checked at rest: nothing pending
 //! and every write ended exactly once (W4); what the person was TOLD is true —
 //! told rolled back ⇒ the node did not apply it, shown Published ⇒ it did
-//! (W4/W6 as revised); each key a session wrote shows the node's value (W6);
+//! (W4/W6 as revised); nothing a session wrote is still pending at rest (W6);
 //! no verdict arrived for a write the copy no longer had.
 //!
 //! THIS FILE IS RED ON TODAY'S CODE BY DESIGN. It is the gate the write path
@@ -277,11 +277,7 @@ fn state_name(s: &WriteState) -> String {
 impl Model {
     fn new(seed: u64, cfg: Config) -> Model {
         let clock = testkit::Clock::new(1_790_000_000_000);
-        let mut stores = [testkit::cached_store_on(&clock), testkit::cached_store_on(&clock)];
-        for s in &mut stores {
-            // Every key is LOADED and absent: a read of one answers "absent".
-            s.on_page(b"", &[0xff; 8], vec![], [0u8; 32]);
-        }
+        let stores = [testkit::cached_store_on(&clock), testkit::cached_store_on(&clock)];
         let sessions = [
             stores[0].client.session().expect("session 0 has a session"),
             stores[1].client.session().expect("session 1 has a session"),
@@ -1131,14 +1127,13 @@ impl Model {
                     _ => {}
                 }
             }
-            // W6: each key this session wrote shows the node's value. No escape by `rolled_back`.
+            // W6: at rest nothing this session wrote is still PENDING, so a
+            // read of its keys is the node's tree (READ-STATE: reads walk the
+            // tree; the write half holds only what is unsettled).
             for k in self.keys[i] {
-                let node = self.tree.get(k).cloned();
-                let copy = self.stores[i].copy.get(k).and_then(|v| v.value().map(|b| b.to_vec()));
-                if node != copy {
-                    let show = |v: &Option<Vec<u8>>| v.as_ref().map(|b| String::from_utf8_lossy(b).into_owned());
-                    let d = format!("session {i} key {}: the copy shows {:?}, the node has {:?}", String::from_utf8_lossy(k), show(&copy), show(&node));
-                    self.find("W6 COPY LIES", d);
+                if let Some(v) = self.stores[i].copy.get(k) {
+                    let d = format!("session {i} key {}: still pending at rest: {v:?}", String::from_utf8_lossy(k));
+                    self.find("W6 PENDING AT REST", d);
                 }
             }
             let late = self.stores[i].unknown_verdicts();
@@ -1370,7 +1365,6 @@ const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
     // again is applied first. ACROSS KEYS only — per key it is zero.
     ("W2 OUT OF ORDER", "re-sent after its Lost", 4, "sdk#265"),
     ("W5 NOT REFILLED AFTER A FALL", "", 198, "sdk#183"), // 302: cold, misroute run down; TooLarge, Lost up (inferred: more terminal verdicts, more falls)
-    ("W6 COPY LIES", "", 851, "sdk#183"), // 501: cold +387, misroute run +309
 ];
 
 /// The table as it stood BEFORE model v2 (sdk#174's pin, on a0c3ecc), kept
@@ -1403,7 +1397,6 @@ const KNOWN_V1: &[(&str, &str, usize, &str)] = &[
     ("W2 KEY ORDER", "after a write the client had rolled back", 100, "sdk#268"),
     ("W2 OUT OF ORDER", "Busy, then applied after a later write", 265, "sdk#183"),
     ("W5 NOT REFILLED AFTER A FALL", "", 302, "sdk#183"),
-    ("W6 COPY LIES", "", 501, "sdk#183"),
 ];
 
 #[test]
@@ -1526,10 +1519,18 @@ fn known_red_the_window_is_not_refilled_after_a_fall() {
     tripwire(TODAY, "W5 NOT REFILLED AFTER A FALL", "", "sdk#183");
 }
 
-/// W6 at rest: the copy shows a value the node does not have.
+/// W6 at rest, INVERTED (READ-STATE, design B): "the copy shows a value the
+/// node does not have" was 851 of 1,000 seeds (501 before model v2) while a
+/// row copy answered reads. Reads walk the tree now and the write half holds
+/// only what is unsettled, so what W6 can still see is a write left PENDING
+/// at rest — and no seed finds one.
 #[test]
-fn known_red_the_copy_lies_at_rest() {
-    tripwire(TODAY, "W6 COPY LIES", "", "sdk#183");
+fn w6_nothing_is_pending_at_rest() {
+    for seed in 0..TRIPWIRE_SEEDS {
+        let (f, _, _) = run(seed, TODAY);
+        let w6: Vec<_> = f.iter().filter(|x| x.class.starts_with("W6")).collect();
+        assert!(w6.is_empty(), "seed {seed}: {w6:?}");
+    }
 }
 
 /// THE HARNESS'S OWN CHECK — not a finding about today's client, which

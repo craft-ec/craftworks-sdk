@@ -154,8 +154,8 @@ fn json<T: serde::Serialize>(v: &T) -> Result<String, JsError> {
 /// The engine, as a browser drives it: bytes in, bytes out, nothing else.
 ///
 /// **Deliberately dumb, and that is the design.** Everything that DECIDES
-/// — the outbox, the `Lost` policy, retry, the pending cap, the local
-/// copy's rollback — is in Rust, where it is tested against a transport
+/// — the outbox, the `Lost` policy, retry, the pending cap, the
+/// rollback — is in Rust, where it is tested against a transport
 /// that reorders, duplicates and drops. The JavaScript around this owns a
 /// socket and nothing more: send what `takeOutbound` gives it, hand back
 /// what arrives. A decision that leaked out here would be one nothing
@@ -218,12 +218,6 @@ impl Engine {
         .unwrap_or_else(|_| "[]".into())
     }
 
-    /// Ask for `[lo, hi)`. The answer arrives through `on_inbound`.
-    pub fn request_range(&mut self, req_id: u64, lo: &str, hi: &str, max_entries: u32) {
-        self.0
-            .request_range(req_id, lo.as_bytes(), hi.as_bytes(), max_entries);
-    }
-
     /// Roll back anything that has waited too long for a verdict, and say
     /// what went. Without this a write lost with the engine's context
     /// leaves one tab showing a value no other tab will ever see.
@@ -233,7 +227,6 @@ impl Engine {
             "rolledBack": told.rolled_back.iter()
                 .map(|(id, why)| serde_json::json!({"writeId": id, "why": format!("{why:?}")}))
                 .collect::<Vec<_>>(),
-            "movedUnderPending": told.moved_under_pending.len(),
         })
         .to_string()
     }

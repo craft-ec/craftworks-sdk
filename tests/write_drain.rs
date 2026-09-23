@@ -13,14 +13,12 @@
 //! The rule it cost: for every state a thing can enter, name the code that
 //! takes it out.
 
-use craftworks_sdk::store::{Reads, RowState, Store as _};
+use craftworks_sdk::store::{RowState, Store as _};
 use craftworks_sdk::CachedStore;
 use protocol::WriteState;
 
 fn store() -> CachedStore {
-    let (mut s, _clock) = testkit::cached_store();
-    // Everything loaded and empty, so reads are answered rather than refused.
-    s.on_page(b"", &[0xFFu8; 64], Vec::new(), [0u8; 32]);
+    let (s, _clock) = testkit::cached_store();
     s
 }
 

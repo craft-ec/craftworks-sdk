@@ -1,23 +1,16 @@
-//! A store whose reads come from the local copy and whose writes go out on the
-//! pump.
+//! The WRITE half of the page's store: the outbox, and every verdict a write
+//! of this client's gets (READ-STATE, design B).
 //!
-//! This is what makes `Db` work in a browser. `Db` needs synchronous reads; in
-//! a browser a read cannot be a round trip; so reads are served from the copy
-//! of the ranges the app has bound, and the only part that crosses the wire is
-//! the reload.
-//!
-//! # The one thing it must never do
-//!
-//! Answer "empty" for a range it has not loaded. The two facts are one byte
-//! apart in a reply and a world apart in what an app does with them: told
-//! empty it draws an empty list and stops; told [`StoreError::NotLoaded`] it
-//! reloads. So a read outside the loaded intervals is an ERROR, and the app's
-//! recovery from it is a `reload()` — which is a Promise, which is the honest
-//! shape of a round trip.
+//! Reads are not here. They walk the tree from the engine's root over its
+//! blocks ([`crate::page_store::PageStore`], which owns one of these for its
+//! writes). What this keeps is each write made and not yet settled
+//! ([`Copy`]), the window, the `Busy` re-send, the `Lost` go-back-N and the
+//! verdicts the app is told — all of which R-b moves into the engine
+//! (READ-STATE § queue).
 
 use crate::copy::{Copy, Refused};
 use crate::engine_client::Client;
-use crate::store::{Delta, Edit, IdWidth, Read, Reads, RowState, Store, StoreError};
+use crate::store::{Edit, RowState, Store};
 use protocol::Request;
 
 /// Writes this session may have AT THE NODE, sent and not yet answered, at
@@ -67,7 +60,7 @@ pub const WRITE_TRIES: u8 = crate::db::RERUN_ROUNDS;
 /// most.
 pub const ASK_AFTER_MS: u64 = 1_000;
 
-/// Reads from the copy; writes to the pump and, optimistically, to the copy.
+/// Writes to the pump, each kept until it settles.
 pub struct CachedStore {
     /// Tries each write has spent going again ([`WRITE_TRIES`], sdk#265).
     tries: std::collections::BTreeMap<u64, u8>,
@@ -224,11 +217,6 @@ impl CachedStore {
         std::mem::take(&mut self.superseded)
     }
 
-    /// Forget a key in the copy: the next read fetches what the TREE holds.
-    fn forget_key(&mut self, key: &[u8]) {
-        self.copy.forget_key(key);
-    }
-
     pub fn new(now_ms: Box<dyn Fn() -> u64>) -> CachedStore {
         CachedStore {
             tries: std::collections::BTreeMap::new(),
@@ -312,50 +300,6 @@ impl CachedStore {
         self.copy.pending_writes()
     }
 
-    /// THE HEAD MOVED AND IT WAS NOT THIS PAGE'S COMMIT (sdk#266): every
-    /// loaded range is behind, and the next read of one re-asks.
-    pub fn mark_stale(&mut self) {
-        self.copy.mark_stale();
-    }
-
-    /// Queue the request that loads `[lo, hi)`. The host pumps; the answer
-    /// arrives at [`CachedStore::on_page`].
-    pub fn request_range(&mut self, req_id: u64, lo: &[u8], hi: &[u8], max_entries: u32) {
-        self.client.send(&Request::Range {
-            req_id,
-            lo: protocol::Bound::Included(lo.to_vec()),
-            hi: protocol::Bound::Excluded(hi.to_vec()),
-            reverse: false,
-            after: None,
-            max_entries,
-        });
-    }
-
-    /// A page arrived: record it, and record that the range is now LOADED.
-    ///
-    /// The interval is passed in rather than inferred from the rows, because
-    /// "everything in this span and not in this list is absent" is the fact
-    /// that makes a later read trustworthy, and a list of rows cannot state
-    /// it.
-    pub fn on_page(
-        &mut self,
-        lo: &[u8],
-        hi: &[u8],
-        rows: Vec<(Vec<u8>, Vec<u8>)>,
-        at_root: [u8; 32],
-    ) {
-        self.copy.loaded_range(lo, hi, rows, at_root);
-    }
-
-    /// A delta arrived: base moves, the pending overlay re-applies.
-    pub fn on_delta(
-        &mut self,
-        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        new_root: [u8; 32],
-    ) -> crate::copy::Told {
-        self.copy.apply_delta(changes, new_root)
-    }
-
     /// Everything waiting to go out.
     pub fn take_outbound(&mut self) -> Vec<Vec<u8>> {
         self.client.take_outbound()
@@ -416,9 +360,6 @@ impl CachedStore {
             // tell the app which rows.
             if let protocol::Reply::Superseded { session, write_id, keys, .. } = &r {
                 if self.client.session() == Some(*session) {
-                    for k in keys {
-                        self.forget_key(k);
-                    }
                     self.state_changed.extend(keys.iter().cloned());
                     self.superseded.push(Superseded { write_id: *write_id, keys: keys.clone() });
                 }
@@ -442,7 +383,6 @@ impl CachedStore {
                     if let Some(c) = self.chains.iter_mut().rev().find(|c| c.write_ids.contains(write_id)) {
                         c.keys.push(key.clone());
                     }
-                    self.forget_key(key);
                     self.conflicts.push(Conflicted { write_id: *write_id, key: key.clone(), current: *current });
                 }
             }
@@ -619,9 +559,6 @@ impl CachedStore {
                 // Tries its writes spent here go on with the chain: one budget.
                 let tries = ids.iter().filter_map(|id| self.tries.get(id)).copied().max().unwrap_or(0);
                 self.chains.push(crate::store::ConflictChain { write_ids: ids, keys: Vec::new(), tries });
-                for k in &told.rolled_back_keys {
-                    self.forget_key(k);
-                }
                 self.state_changed.extend(told.rolled_back_keys.iter().cloned());
                 self.rolled_back.extend(told.rolled_back_keys);
                 self.drain_queued();
@@ -929,81 +866,18 @@ impl Store for CachedStore {
     }
 }
 
-impl Reads for CachedStore {
-    fn wrong_width(&self, given: IdWidth, wanted: IdWidth) {
-        self.client.record_wrong_width(given, wanted);
-    }
-
-    /// What this key's own write is doing, from the local copy.
-    ///
-    /// `Unknown` when the key is not loaded — **never `Clean`**. "I have not
-    /// looked" is not "there is nothing in flight", and a row that said
-    /// "saved" about a write it cannot see is the exact failure `NOT_LOADED`
-    /// exists to prevent, one layer up.
-    fn row_state(&self, key: &[u8]) -> RowState {
+impl CachedStore {
+    /// What this key's OWN write is doing. `Clean` when no write of this
+    /// client's is pending there: a read walks the tree, so there is no
+    /// "not loaded" left to report.
+    pub fn row_state(&self, key: &[u8]) -> RowState {
         if self.rolled_back.contains(key) {
             return RowState::RolledBack;
         }
         match self.copy.get(key) {
-            None => RowState::Unknown,
-            Some(crate::copy::Visible::Clean(_)) => RowState::Clean,
+            None | Some(crate::copy::Visible::Clean(_)) => RowState::Clean,
             Some(crate::copy::Visible::Queued(_, _)) => RowState::Queued,
             Some(crate::copy::Visible::Pending(_, _)) => RowState::Pending,
         }
-    }
-
-    fn get(&mut self, key: &[u8]) -> Read<Option<Vec<u8>>> {
-        match self.copy.get(key) {
-            Some(v) => Ok(v.value().map(|b| b.to_vec())),
-            None => Err(StoreError::NotLoaded),
-        }
-    }
-
-    fn scan(
-        &mut self,
-        lo: &[u8],
-        hi: &[u8],
-        reverse: bool,
-        limit: usize,
-    ) -> Read<Vec<(Vec<u8>, Vec<u8>)>> {
-        let Some(rows) = self.copy.range(lo, hi) else {
-            return Err(StoreError::NotLoaded);
-        };
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = rows
-            .into_iter()
-            .filter_map(|(k, v)| v.value().map(|b| (k, b.to_vec())))
-            .collect();
-        if reverse {
-            out.reverse();
-        }
-        out.truncate(limit);
-        Ok(out)
-    }
-
-    fn root(&mut self) -> Read<[u8; 32]> {
-        self.copy.root().ok_or(StoreError::NotLoaded)
-    }
-
-    fn changes_since(
-        &mut self,
-        _from: [u8; 32],
-        _lo: &[u8],
-        _hi: &[u8],
-        _max_entries: u32,
-    ) -> Read<Delta> {
-        // The copy holds no history, so it cannot diff two roots itself. The
-        // DEFINED answer, not an error: the caller does a plain range read,
-        // which is the same recovery it would do against an engine whose old
-        // root has been evicted. The engine's own `ChangesSince` is what a
-        // delta actually comes from; this is the local fallback.
-        //
-        // With NOTHING loaded there is no root to name, and the first version
-        // answered with thirty-two zero bytes — a root-shaped value that is
-        // not a root. A caller would have recorded it as where it stands and
-        // asked for a delta against it for ever. `NotLoaded` is the same
-        // answer `root()` already gives, and it is the true one.
-        Ok(Delta::FullReloadRequired {
-            new_root: self.copy.root().ok_or(StoreError::NotLoaded)?,
-        })
     }
 }

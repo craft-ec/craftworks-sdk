@@ -1,91 +1,27 @@
-//! The browser's local copy: what it shows, and what it refuses to claim.
+//! This client's OWN unsettled writes (`copy::Copy`): what each key's last
+//! write is doing, what falls with a failure, what times out, and the caps.
 //!
-//! The copy is a CACHE. It resolves nothing, it is correct when empty, and the
-//! interesting cases are all about what it says when it does not know — which
-//! is why most of these tests are about absence rather than about values.
+//! There are no rows here (READ-STATE, design B): reads walk the tree. What
+//! the copy says about a key is only "a write of mine is still pending here",
+//! and `None` when none is — which is why a published or rolled-back write
+//! leaves nothing behind.
 
-use craftworks_sdk::copy::{Copy, Refused, RolledBack, Visible};
+use craftworks_sdk::copy::{Copy, Refused, RolledBack};
 
 fn v(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
-fn root(n: u8) -> [u8; 32] {
-    [n; 32]
-}
 
-/// A copy with `a/1..a/3` loaded at root 1.
-fn loaded() -> Copy {
+// ---------------------------------------------------------------------------
+// The last pending write is what shows.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pending_write_shows_and_says_it_is_pending_until_it_is_published() {
     let mut c = Copy::new();
-    c.loaded_range(
-        b"a/",
-        b"b/",
-        vec![(v("a/1"), v("one")), (v("a/2"), v("two"))],
-        root(1),
-    );
-    c
-}
+    c.write(b"a/1", Some(v("mine")), 1, 0).expect("under the cap");
 
-// ---------------------------------------------------------------------------
-// "Not loaded" is not "empty" — the distinction the whole structure is for.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_range_that_was_never_bound_says_it_does_not_know() {
-    let c = loaded();
-
-    // Inside the loaded range, absence is a FACT.
-    assert_eq!(
-        c.get(b"a/9"),
-        Some(Visible::Clean(None)),
-        "a key inside a loaded range must be reported absent, not unknown"
-    );
-    assert_eq!(c.range(b"a/", b"b/").map(|r| r.len()), Some(2));
-
-    // Outside it, absence is IGNORANCE, and saying "empty" would make a
-    // component show nothing for data that exists.
-    assert_eq!(
-        c.get(b"z/1"),
-        None,
-        "a key in a range nobody loaded was reported as absent"
-    );
-    assert_eq!(
-        c.range(b"z/", b"z0"),
-        None,
-        "an unloaded range answered as an EMPTY range"
-    );
-
-    // A range that only PARTLY overlaps what is loaded is not loaded either —
-    // answering with the part that is held would silently truncate.
-    assert_eq!(
-        c.range(b"a/", b"c/"),
-        None,
-        "a range half-covered by loaded intervals answered anyway"
-    );
-}
-
-#[test]
-fn two_abutting_loads_cover_the_span_between_them() {
-    let mut c = Copy::new();
-    c.loaded_range(b"a/", b"b/", vec![(v("a/1"), v("x"))], root(1));
-    assert_eq!(c.range(b"a/", b"c/"), None, "not loaded yet");
-    c.loaded_range(b"b/", b"c/", vec![(v("b/1"), v("y"))], root(1));
-    let rows = c
-        .range(b"a/", b"c/")
-        .expect("two abutting loads must cover the whole span");
-    assert_eq!(rows.len(), 2, "{rows:?}");
-}
-
-// ---------------------------------------------------------------------------
-// visible = base ⊕ pending-in-order
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_pending_write_shows_on_top_of_base_and_says_it_is_pending() {
-    let mut c = loaded();
-    c.write(b"a/1", Some(v("mine")), 1, 0)
-        .expect("under the cap");
-
-    let seen = c.get(b"a/1").expect("loaded");
+    let seen = c.get(b"a/1").expect("a write is pending");
     assert_eq!(seen.value(), Some(&b"mine"[..]));
     assert!(
         seen.is_pending(),
@@ -93,19 +29,16 @@ fn a_pending_write_shows_on_top_of_base_and_says_it_is_pending() {
          showing it would claim the data is saved"
     );
 
-    // Published: it becomes base, and stops being pending.
+    // Published: the tree has it now, and the copy keeps nothing.
     c.published(1);
-    let seen = c.get(b"a/1").expect("loaded");
-    assert_eq!(seen, Visible::Clean(Some(v("mine"))));
+    assert_eq!(c.get(b"a/1"), None, "a published write was still held as pending");
 }
 
 #[test]
 fn the_last_pending_write_is_what_shows_and_the_ones_under_it_survive() {
-    let mut c = loaded();
-    c.write(b"a/1", Some(v("first")), 1, 0)
-        .expect("under the cap");
-    c.write(b"a/1", Some(v("second")), 2, 0)
-        .expect("under the cap");
+    let mut c = Copy::new();
+    c.write(b"a/1", Some(v("first")), 1, 0).expect("under the cap");
+    c.write(b"a/1", Some(v("second")), 2, 0).expect("under the cap");
     assert_eq!(c.get(b"a/1").unwrap().value(), Some(&b"second"[..]));
 
     // The FIRST publishes. The second is still pending and still on top —
@@ -125,33 +58,24 @@ fn the_last_pending_write_is_what_shows_and_the_ones_under_it_survive() {
 /// are untouched, and each write id is named.
 #[test]
 fn a_failed_write_invalidates_every_later_write_on_that_key() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.write(b"a/1", Some(v("w1")), 1, 0).expect("under the cap");
     c.write(b"a/1", Some(v("w2")), 2, 0).expect("under the cap");
     c.write(b"a/1", Some(v("w3")), 3, 0).expect("under the cap");
     c.queued(3);
     // A write on ANOTHER key, which must survive.
-    c.write(b"a/2", Some(v("elsewhere")), 4, 0)
-        .expect("under the cap");
+    c.write(b"a/2", Some(v("elsewhere")), 4, 0).expect("under the cap");
 
     let told = c.failed(1);
     assert_eq!(
         told.rolled_back,
-        vec![
-            (1, RolledBack::Failed),
-            (2, RolledBack::AfterFailed),
-            (3, RolledBack::AfterFailed),
-        ],
+        vec![(1, RolledBack::Failed), (2, RolledBack::AfterFailed), (3, RolledBack::AfterFailed),],
         "each write id must be named, and WHY — the app redoes them"
     );
 
-    // The key is back to what the engine last said. Not to w1, and not to
-    // nothing.
-    assert_eq!(
-        c.get(b"a/1"),
-        Some(Visible::Clean(Some(v("one")))),
-        "the key did not roll back to base"
-    );
+    // Nothing of mine is pending on the key any more: a read of it is the
+    // tree's. Not w1, and not w2 or w3.
+    assert_eq!(c.get(b"a/1"), None, "a fallen write is still shown");
     // The other key is untouched.
     let other = c.get(b"a/2").unwrap();
     assert_eq!(other.value(), Some(&b"elsewhere"[..]));
@@ -164,14 +88,12 @@ fn a_failed_write_invalidates_every_later_write_on_that_key() {
 /// reveal it.
 #[test]
 fn rolling_back_only_the_failed_write_leaves_a_fabricated_value() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.write(b"a/1", Some(v("w1")), 1, 0).expect("under the cap");
     c.write(b"a/1", Some(v("w2")), 2, 0).expect("under the cap");
 
-    // Simulate the narrow rollback by publishing nothing and removing only
-    // w1's effect the way a one-entry design would: drop w1, keep w2.
-    // Done through the real API by failing w1 and re-applying w2, which is
-    // exactly the state the rejected design would have left.
+    // The state a one-entry design would leave: w1 dropped, w2 kept. Made
+    // through the real API by failing w1 and re-applying w2.
     c.failed(1);
     c.write(b"a/1", Some(v("w2")), 2, 0).expect("under the cap");
 
@@ -181,58 +103,6 @@ fn rolling_back_only_the_failed_write_leaves_a_fabricated_value() {
         "the control did not reproduce the fabricated value, so the test \
          above is not showing that the cascade prevents one"
     );
-    // And that is the point: w2 may have been computed FROM w1, which the
-    // engine refused. The copy cannot tell, so phase 3 does not keep it.
-}
-
-// ---------------------------------------------------------------------------
-// A delta under a pending write.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_delta_moves_base_leaves_pending_on_top_and_signals_once() {
-    let mut c = loaded();
-    c.write(b"a/1", Some(v("mine")), 1, 0)
-        .expect("under the cap");
-
-    let told = c.apply_delta(
-        vec![
-            (v("a/1"), Some(v("theirs"))),
-            (v("a/2"), Some(v("also theirs"))),
-        ],
-        root(2),
-    );
-
-    // Base moved for both...
-    assert_eq!(c.root(), Some(root(2)));
-    assert_eq!(c.get(b"a/2"), Some(Visible::Clean(Some(v("also theirs")))));
-    // ...and the pending write is still on top of the one it covers.
-    let seen = c.get(b"a/1").unwrap();
-    assert_eq!(seen.value(), Some(&b"mine"[..]), "{seen:?}");
-    assert!(seen.is_pending());
-
-    // The signal fires for the key with a pending write, EXACTLY ONCE, and
-    // not for the other.
-    assert_eq!(
-        told.moved_under_pending,
-        vec![v("a/1")],
-        "the signal did not fire exactly once for the contested key"
-    );
-
-    // Publishing the pending write now reveals what the copy was covering.
-    c.published(1);
-    assert_eq!(c.get(b"a/1"), Some(Visible::Clean(Some(v("mine")))));
-}
-
-#[test]
-fn a_delta_with_no_pending_writes_signals_nothing() {
-    let mut c = loaded();
-    let told = c.apply_delta(vec![(v("a/1"), Some(v("theirs")))], root(2));
-    assert!(
-        told.is_empty(),
-        "a delta over clean keys raised a signal: {told:?}"
-    );
-    assert_eq!(c.get(b"a/1"), Some(Visible::Clean(Some(v("theirs")))));
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +112,9 @@ fn a_delta_with_no_pending_writes_signals_nothing() {
 /// A write with no verdict is rolled back, so no tab shows a phantom for ever.
 #[test]
 fn a_pending_write_with_no_verdict_times_out_and_rolls_back() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.pending_timeout_ms = 1_000;
-    c.write(b"a/1", Some(v("phantom")), 1, 0)
-        .expect("under the cap");
+    c.write(b"a/1", Some(v("phantom")), 1, 0).expect("under the cap");
 
     // Before the timeout: still showing, still pending.
     let told = c.time_out(999);
@@ -255,11 +124,7 @@ fn a_pending_write_with_no_verdict_times_out_and_rolls_back() {
     // After: gone, and the app is told which write and why.
     let told = c.time_out(1_000);
     assert_eq!(told.rolled_back, vec![(1, RolledBack::Unknown)]);
-    assert_eq!(
-        c.get(b"a/1"),
-        Some(Visible::Clean(Some(v("one")))),
-        "the key did not return to what the engine last said"
-    );
+    assert_eq!(c.get(b"a/1"), None, "the phantom is still pending");
 }
 
 /// THE CONTROL: with the timeout off, the phantom survives for ever.
@@ -269,10 +134,9 @@ fn a_pending_write_with_no_verdict_times_out_and_rolls_back() {
 /// the system ever corrects it — the one permanent divergence.
 #[test]
 fn with_the_timeout_off_the_phantom_survives_for_ever() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.pending_timeout_ms = u64::MAX;
-    c.write(b"a/1", Some(v("phantom")), 1, 0)
-        .expect("under the cap");
+    c.write(b"a/1", Some(v("phantom")), 1, 0).expect("under the cap");
 
     // A year later.
     let told = c.time_out(365 * 24 * 60 * 60 * 1000);
@@ -291,116 +155,64 @@ fn with_the_timeout_off_the_phantom_survives_for_ever() {
 }
 
 // ---------------------------------------------------------------------------
-// Cache, not authority. Bounded. Per tree.
+// INTERIM (removed by R-b, READ-STATE § queue): the overlay a read lays over
+// its walk is ONLY what the engine has not taken.
 // ---------------------------------------------------------------------------
 
+/// A write the engine accepted is in the warm root; a second copy of it here
+/// would be two copies of one value. Only a write HELD by the window, or
+/// QUEUED after `Busy`, is in no root — and only those are overlaid. Each
+/// leaves the overlay on the door's verdict.
 #[test]
-fn an_empty_copy_says_it_knows_nothing_rather_than_that_there_is_nothing() {
-    let c = Copy::new();
-    assert_eq!(c.root(), None);
-    assert_eq!(c.get(b"a/1"), None, "an empty copy claimed a key is absent");
-    assert_eq!(
-        c.range(b"a/", b"b/"),
-        None,
-        "an empty copy claimed a range is empty"
-    );
-}
-
-#[test]
-fn rows_read_at_a_different_root_replace_base_rather_than_merging() {
-    let mut c = loaded();
-    assert_eq!(c.range(b"a/", b"b/").unwrap().len(), 2);
-
-    // The same range, read at a DIFFERENT root, with one row gone. Merging
-    // would leave the vanished row visible for ever — and merging two roots'
-    // rows is the resolution this must never do.
-    c.loaded_range(b"a/", b"b/", vec![(v("a/1"), v("one"))], root(2));
-    let rows = c.range(b"a/", b"b/").unwrap();
-    assert_eq!(rows.len(), 1, "a row from the OLD root survived: {rows:?}");
-    assert_eq!(c.root(), Some(root(2)));
-}
-
-#[test]
-fn eviction_keeps_it_under_the_cap_and_never_drops_a_pending_write() {
+fn interim_the_overlay_is_only_the_writes_the_engine_has_not_taken() {
     let mut c = Copy::new();
-    c.max_bytes = 100;
-    for i in 0..4u32 {
-        let lo = format!("r{i}/");
-        let hi = format!("r{i}0");
-        c.loaded_range(
-            lo.as_bytes(),
-            hi.as_bytes(),
-            (0..5)
-                .map(|j| (format!("r{i}/{j}").into_bytes(), vec![b'x'; 20]))
-                .collect(),
-            root(1),
-        );
-    }
-    assert!(c.bytes() <= 100, "over the cap: {} B", c.bytes());
+    c.write(b"a/1", Some(v("taken")), 1, 0).expect("under the cap");
+    c.sent(1, 0);
+    c.submitted(1);
+    c.write(b"a/2", Some(v("held")), 2, 0).expect("under the cap");
+    c.hold(2);
+    c.write(b"a/3", None, 3, 0).expect("under the cap");
+    c.sent(3, 0);
+    c.queued(3);
 
-    // A pending write is not a cache entry — it is something the app is
-    // waiting on, and evicting it would show a row reverting for a reason
-    // nobody can see.
-    c.write(b"r0/0", Some(v("mine")), 1, 0)
-        .expect("under the cap");
-    for i in 4..8u32 {
-        let lo = format!("r{i}/");
-        let hi = format!("r{i}0");
-        c.loaded_range(
-            lo.as_bytes(),
-            hi.as_bytes(),
-            (0..5)
-                .map(|j| (format!("r{i}/{j}").into_bytes(), vec![b'x'; 20]))
-                .collect(),
-            root(1),
-        );
-    }
     assert_eq!(
-        c.pending_ids(),
-        vec![1],
-        "eviction dropped a write the app is still waiting on"
+        c.unaccepted(b"a/", b"b/"),
+        vec![(v("a/2"), Some(v("held"))), (v("a/3"), None)],
+        "the overlay must be exactly the held and the Busy-queued writes, a delete as None"
     );
+    assert!(c.any_unaccepted());
+
+    // The held write goes out and is taken: it leaves the overlay.
+    c.sent(2, 0);
+    c.submitted(2);
+    // The queued one is refused for good: it falls, and leaves too.
+    c.failed(3);
+    assert_eq!(c.unaccepted(b"a/", b"b/"), Vec::new());
+    assert!(!c.any_unaccepted(), "nothing is held or queued, and yet something is overlaid");
 }
 
 // ---------------------------------------------------------------------------
-// Pending is the only unbounded thing left, so it has its own cap.
+// Pending is bounded: its own caps.
 // ---------------------------------------------------------------------------
 
 /// At the write cap a write is REFUSED, by name, and leaves no trace.
 #[test]
 fn past_the_pending_cap_a_write_is_refused_and_changes_nothing() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.max_pending = 3;
     for i in 0..3u64 {
-        c.write(format!("a/{i}").as_bytes(), Some(v("x")), i, 0)
-            .expect("under the cap");
+        c.write(format!("a/{i}").as_bytes(), Some(v("x")), i, 0).expect("under the cap");
     }
     assert_eq!(c.pending().0, 3);
 
-    let before = c.get(b"a/9");
     let refused = c.write(b"a/9", Some(v("over")), 9, 0).unwrap_err();
-    assert_eq!(
-        refused,
-        Refused::TooManyPending { cap: 3 },
-        "the refusal must name WHICH cap it hit"
-    );
-    assert!(
-        refused.to_string().contains("waiting for an answer"),
-        "unhelpful refusal: {refused}"
-    );
+    assert_eq!(refused, Refused::TooManyPending { cap: 3 }, "the refusal must name WHICH cap it hit");
+    assert!(refused.to_string().contains("waiting for an answer"), "unhelpful refusal: {refused}");
 
     // NO TRACE. A write half-applied and then reported refused is worse than
     // either outcome: the app is told nothing happened while something did.
-    assert_eq!(
-        c.get(b"a/9"),
-        before,
-        "the refused write left something behind"
-    );
-    assert_eq!(
-        c.pending(),
-        (3, c.pending().1),
-        "the refused write was counted"
-    );
+    assert_eq!(c.get(b"a/9"), None, "the refused write left something behind");
+    assert_eq!(c.pending().0, 3, "the refused write was counted");
     assert!(!c.pending_ids().contains(&9));
 }
 
@@ -408,14 +220,12 @@ fn past_the_pending_cap_a_write_is_refused_and_changes_nothing() {
 /// cap firing rather than writes failing generally.
 #[test]
 fn below_the_pending_cap_nothing_changes() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.max_pending = 3;
     for i in 0..2u64 {
-        c.write(format!("a/{i}").as_bytes(), Some(v("x")), i, 0)
-            .expect("under the cap");
+        c.write(format!("a/{i}").as_bytes(), Some(v("x")), i, 0).expect("under the cap");
     }
-    c.write(b"a/2", Some(v("third")), 2, 0)
-        .expect("the third write is AT the cap, not over it");
+    c.write(b"a/2", Some(v("third")), 2, 0).expect("the third write is AT the cap, not over it");
     assert_eq!(c.pending().0, 3);
     assert_eq!(c.get(b"a/2").unwrap().value(), Some(&b"third"[..]));
 }
@@ -427,12 +237,11 @@ fn below_the_pending_cap_nothing_changes() {
 /// only ever reached through the other is a cap nobody has tested.
 #[test]
 fn the_byte_cap_refuses_where_the_write_cap_would_not_have() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.max_pending = 1000;
     c.max_pending_bytes = 100;
 
-    c.write(b"a/1", Some(vec![b'x'; 60]), 1, 0)
-        .expect("under both caps");
+    c.write(b"a/1", Some(vec![b'x'; 60]), 1, 0).expect("under both caps");
     let refused = c.write(b"a/2", Some(vec![b'x'; 60]), 2, 0).unwrap_err();
     assert_eq!(
         refused,
@@ -446,17 +255,15 @@ fn the_byte_cap_refuses_where_the_write_cap_would_not_have() {
 /// Settling a write gives its room back.
 #[test]
 fn a_settled_write_frees_its_place_at_the_cap() {
-    let mut c = loaded();
+    let mut c = Copy::new();
     c.max_pending = 2;
     c.write(b"a/1", Some(v("a")), 1, 0).expect("under the cap");
     c.write(b"a/2", Some(v("b")), 2, 0).expect("under the cap");
     assert!(c.write(b"a/3", Some(v("c")), 3, 0).is_err());
 
     c.published(1);
-    c.write(b"a/3", Some(v("c")), 3, 0)
-        .expect("a published write must give its place back");
+    c.write(b"a/3", Some(v("c")), 3, 0).expect("a published write must give its place back");
 
     c.failed(2);
-    c.write(b"a/4", Some(v("d")), 4, 0)
-        .expect("a failed write must give its place back too");
+    c.write(b"a/4", Some(v("d")), 4, 0).expect("a failed write must give its place back too");
 }

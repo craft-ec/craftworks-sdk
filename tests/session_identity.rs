@@ -59,25 +59,11 @@ impl Tab {
     }
 }
 
-/// What the node holds at `key`, read by a fresh tab.
+/// What the node holds at `key`: its tree at its head, read from the node.
 fn stored(conn: &testkit::PageConn, key: &[u8]) -> Option<Vec<u8>> {
-    use craftworks_sdk::store::Reads;
-    let mut reader = Tab::on(conn.clone());
-    let mut hi = key.to_vec();
-    hi.push(0);
-    reader.store.request_range(1, key, &hi, 8);
-    let frames = reader.store.take_outbound();
-    let mut rows = Vec::new();
-    for frame in frames {
-        for reply in reader.conn.frame(&frame) {
-            if let Ok(protocol::Reply::Page { entries, at, .. }) = protocol::decode_reply(&reply) {
-                rows = entries.clone();
-                reader.store.on_page(key, &hi, entries, at.root);
-            }
-        }
-    }
-    let _ = rows;
-    reader.store.get(key).ok().flatten()
+    let node = conn.node();
+    let (_, root) = node.head()?;
+    node.tree(&root)?.get(key).cloned()
 }
 
 /// **Two tabs and a reload: three sessions, three distinct write keys, three

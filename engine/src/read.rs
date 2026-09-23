@@ -87,6 +87,28 @@ pub enum ReadResult {
     OutOfWarmSpace,
 }
 
+/// A walk a READER makes itself, over the engine's own blocks (READ-STATE,
+/// design B): the page's store walks the tree from the owner's root instead of
+/// keeping rows. The descent is the engine's (`attempt`), never a second one.
+#[derive(Clone, Debug)]
+pub enum Walk {
+    Get(Vec<u8>),
+    Scan(Box<ScanSpec>),
+    /// What changed in a range between `from` and the walk's root: a LIVE
+    /// binding's diff from the root it rendered at (READ-STATE inv. 5).
+    Delta(Box<DeltaSpec>),
+}
+
+/// How a walk ended: answered, or stopped on blocks this page does not hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Walked {
+    Done(ReadResult),
+    /// These blocks are missing; a parked read at the same root fetches them.
+    Need(Vec<Cid>),
+    /// The tree names a block whose content is not that block.
+    Broken(Cid),
+}
+
 /// What a client asked for, kept so the request can be retried as blocks land.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Want {

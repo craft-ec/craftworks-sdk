@@ -16,97 +16,48 @@
 //! ack answers the step in flight, when a write has waited too long, whether a
 //! reply is usable at all — is in Rust, where it is tested against a transport
 //! that reorders, duplicates and drops, and against a node.
+//!
+//! # One owner for the head, the tree and a write's fate (READ-STATE, design B)
+//!
+//! The engine runs in this page (`page::Server`, hosted by `page_io::PageIo`),
+//! and the store `Db` reads through OWNS that host
+//! ([`craftworks_sdk::PageStore`]): a read walks the engine's tree from its
+//! root over the blocks the page holds. This session keeps no head, no root,
+//! no rows and no ranges — each was a copy of the engine's, and every defect
+//! of 2026-09-23 was one of them going stale. The one head-shaped fact kept
+//! here is each LIVE binding's `RenderedAt`, which only the binding can know.
 
-use craftworks_sdk::{CachedStore, DbError, SystemEnv};
+use craftworks_sdk::{DbError, Outcome, PageStore, SystemEnv};
+use page_io::PageIo;
 use wasm_bindgen::prelude::*;
 use wire::{AckKind, Incoming};
 
-/// A block's contract id from its cid (the Block code hashed once).
-type ContractOf = Box<dyn Fn(&craftworks_sdk::Cid) -> craftworks_sdk::Cid>;
+/// The store a page's `Db` reads and writes through.
+type Store = PageStore<PageIo>;
 
 /// Everything one page-to-node connection needs.
 #[wasm_bindgen]
 pub struct Session {
-    /// The database AND the store it reads through. One object, because a
-    /// page has one connection and one tree: `Db` owns its store, and the
-    /// pump reaches it through `store_mut()` rather than through a second
-    /// handle that could drift out of step with it.
-    db: craftworks_sdk::Db<CachedStore, SystemEnv>,
+    /// The database AND the store it reads through — and the store owns the
+    /// page (`PageIo`, the in-page engine's host) once there is one. One
+    /// object, because a page has one connection and one tree.
+    db: craftworks_sdk::Db<Store, SystemEnv>,
     /// Frames waiting to go out. WIRE frames, already enveloped — the page
     /// sends bytes and never learns what a `ClientRequest` is.
     out: Vec<Vec<u8>>,
-    /// A counter, so each chunked request gets its own stream and two
-    /// concurrent ones cannot be reassembled into each other.
-    stream: u32,
     port: u16,
     /// Messages this build could not use, by reason.
     unusable: Vec<String>,
-    /// Ranges asked for and not yet answered. The bookkeeping lives in the
-    /// SDK, not here, so it can be tested on a machine rather than only in a
-    /// tab — which is what the first version of this recovery could not be.
-    loads: craftworks_sdk::Loads,
-    /// The head's contract instance id, once `Identity` has named it.
-    ///
-    /// Zero until then, and zero for ever on a delegate that is not
-    /// provisioned — there is no head to subscribe to.
-    head_id: [u8; 32],
-    /// The head's id as the node NAMES it, so a notification can be matched.
-    head_named: String,
-    /// Head notifications for a contract this session is not watching.
-    ///
-    /// COUNTED, not described. The node chooses what it sends, and a page
-    /// that reacted to any of them would reload on somebody else's contract.
-    /// A count is also the thing that says whether it is happening at all.
+    /// Frames on this socket that NO session took (`unowned`). COUNTED, not
+    /// described: the node chooses what it sends, and a count is the thing
+    /// that says whether it is happening at all.
     foreign_notifications: usize,
-    /// What this page has bound, so a head move can name what is stale: watch
-    /// keys (`Db::watch_key`) — a domain, or one parent's band of it.
-    bound: std::collections::BTreeSet<String>,
-    /// Asking what changed, and which answer belongs to which domain.
-    ///
-    /// In the SDK, not here, so it can be tested against a real engine
-    /// rather than through a fake session written in JavaScript — which
-    /// compiles this file and runs none of it.
-    refresh: craftworks_sdk::Refresh,
-    /// The head moved. Set by a notification, drained by the page.
-    ///
-    /// A HINT and never an authority: a fabricated one costs a reload, and a
-    /// reload can change nothing that the data does not verify. A SUPPRESSED
-    /// one costs nothing at all, because the tick re-reads the root anyway —
-    /// which is what makes being told an accelerator rather than the
-    /// mechanism.
-    head_moved: bool,
-    /// The in-page engine's PUBLISHED head as this session last saw it. A
-    /// move is the head moving — this tab's own commit, or another device's
-    /// head adopted — and sets `head_moved`, which is what the node's
-    /// HeadChanged push did on the delegate path. Without it a bound domain
-    /// was never re-asked after a write published, and its rows said
-    /// "saving" until something else re-rendered them (builder#102's
-    /// two-tab, measured on #260).
-    seen_published: (u64, [u8; 32]),
-    /// The root the engine last reported standing on.
-    ///
-    /// A page is recorded against the root it was read at, and a page
-    /// recorded against the wrong root would make a stale range look current.
-    /// Zero until `Identity` has answered, and a load that completes before
-    /// then is still recorded against zero — which is what a brand-new engine
-    /// actually stands on.
-    head_root: [u8; 32],
-    /// COLD READS IN THE PAGE (`craftworks_sdk::cold`): a range this node does
-    /// not hold, read by this page's own GETs with a short timeout and a
-    /// re-fetch, instead of by the engine's cold read and F52's stall.
-    cold: craftworks_sdk::cold::ColdReads,
-    /// A block's contract id from its cid — the Block contract's code hashed
-    /// once (`wire::block::contract_deriver`). `None` until the page hands the
-    /// code in with [`Session::set_cold_reads`]: without it no GET can be named.
-    cold_contract: Option<ContractOf>,
-    /// The builder called [`Session::set_cold_reads`]. Until then cold reads
-    /// are ON by default, switched on by [`Session::provision`] with the
-    /// Block code it hands in; after it, the builder's choice stands.
-    cold_chosen: bool,
+    /// What this page has bound LIVE, by watch key (`Db::watch_key`: a
+    /// domain, or one parent's band of it), each with its `RenderedAt`
+    /// (READ-STATE; `craftworks_sdk::LiveBindings`, where it is tested).
+    bound: craftworks_sdk::LiveBindings,
     /// The SIGNER delegate's wasm, handed in with [`Session::provision`].
     signer_code: Vec<u8>,
-    /// The page's I/O over the client API, from `provision` on.
-    page: Option<page_io::PageIo>,
     /// `Identity` sent to the in-page server once the signer is provisioned.
     page_identity_sent: bool,
     /// The signer's provisioning was reported by `take_progress`.
@@ -141,31 +92,19 @@ impl Session {
         wire::ws_url("127.0.0.1", port).map_err(|e| JsError::new(&e))?;
         Ok(Session {
             db: craftworks_sdk::Db::new(
-                CachedStore::new(Box::new(crate::js_now_ms)),
+                PageStore::new(Box::new(crate::js_now_ms), Box::new(crate::js_now_ms)),
                 SystemEnv,
                 device,
             ),
             out: Vec::new(),
-            stream: 1,
             port,
             unusable: Vec::new(),
-            loads: craftworks_sdk::Loads::new(),
-            head_root: [0u8; 32],
-            head_id: [0u8; 32],
-            head_named: String::new(),
             foreign_notifications: 0,
-            head_moved: false,
-            seen_published: (0, [0u8; 32]),
-            bound: std::collections::BTreeSet::new(),
-            refresh: craftworks_sdk::Refresh::new(),
-            cold: craftworks_sdk::cold::ColdReads::default(),
-            cold_contract: None,
-            cold_chosen: false,
+            bound: craftworks_sdk::LiveBindings::default(),
             puts: wire::puts::Puts::default(),
             read_only: false,
             app: None,
             signer_code: Vec::new(),
-            page: None,
             page_identity_sent: false,
             provision_told: false,
         })
@@ -183,7 +122,7 @@ impl Session {
     /// go — and a write made before the socket opens is the ordinary start of
     /// every session.
     pub fn outbound(&mut self) -> Vec<js_sys::Uint8Array> {
-        self.envelope_engine_requests();
+        self.pump_page();
         self.out
             .iter()
             .map(|b| js_sys::Uint8Array::from(&b[..]))
@@ -197,11 +136,6 @@ impl Session {
 
     /// A message arrived from the node.
     ///
-    /// Everything it can mean is decided here: an engine reply, a head that
-    /// moved, an ack for the step being provisioned, a refusal, a chunk of
-    /// something larger, or something this build cannot use — which is
-    /// counted rather than ignored.
-    ///
     /// Returns whether the frame was THIS session's. One socket carries a
     /// person's own session and every tree they read (`tree`, sdk#239); each
     /// is offered every frame and takes only what it asked for. A frame no
@@ -209,7 +143,7 @@ impl Session {
     pub fn on_inbound(&mut self, bytes: &[u8]) -> bool {
         // Every node frame is the page executor's (page-io): the engine runs
         // in this page and the node is reached only through it.
-        let owned = match self.page.as_mut() {
+        let owned = match self.page_mut() {
             Some(p) => p.inbound(bytes, page::Ms(crate::js_now_ms())),
             None => false,
         };
@@ -224,254 +158,72 @@ impl Session {
         self.foreign_notifications += 1;
     }
 
-    /// One protocol reply for this session's store, from the in-page
-    /// `page::Server`.
-    fn on_engine_reply(&mut self, m: Vec<u8>) {
-        // Read, not intercepted: the store still gets every byte.
-        // `Identity` is the only reply provisioning rests on, and
-        // it is the delegate's own report about its own secret
-        // store rather than an acknowledgement that a message
-        // arrived.
-        match protocol::decode_reply(&m) {
-            Ok(protocol::Reply::Identity {
-                head_root,
-                head_id,
-                head_seq,
-                ..
-            }) => {
-                // Which contract the head IS. Without it a tab
-                // that made no write can only poll: an
-                // engine-originated push returns to whoever
-                // invoked the delegate (F40).
-                self.head_id = head_id;
-                self.head_named = if head_id == [0u8; 32] {
-                    String::new()
-                } else {
-                    wire::contract_id(head_id).to_string()
-                };
-                // The root pages are recorded against. A page
-                // filed under the wrong root would make a stale
-                // range look current.
-                self.head_root = head_root;
-                if head_root != [0u8; 32] {
-                    self.cold.set_root(head_root);
-                }
-                // The newest head this client has heard of, from
-                // anywhere. A load that finishes behind it is not
-                // recorded.
-                self.loads.note_seq(head_seq);
-            }
-            Ok(protocol::Reply::Page {
-                req_id,
-                entries,
-                cursor,
-                at,
-                ..
-            }) => self.on_page(req_id, entries, cursor, at),
-            // A read the engine could not answer. The range is
-            // NOT recorded as loaded: an empty page here would
-            // say "this range is empty", which is a wrong answer
-            // wearing the shape of a right one.
-            // WHAT CHANGED since this client last looked.
-            //
-            // Every field BOUND, no `..`: a `cursor` dropped in
-            // one is how a first page was applied as the whole
-            // answer (sdk#140), and a field added later must
-            // fail to compile here rather than vanish.
-            Ok(protocol::Reply::Delta {
-                req_id,
-                changes,
-                cursor,
-                new_root,
-                at,
-            }) => {
-                self.loads.note_seq(at.seq);
-                self.on_delta(req_id, changes, cursor, new_root)
-            }
-            // The delta could not be computed. The interval is
-            // forgotten and re-requested in full, through the
-            // ordinary load path so it is bounded and ticketed
-            // like any other — NOT applied as if it were a delta,
-            // which would record a range as current on the
-            // strength of an answer that said it could not say.
-            Ok(protocol::Reply::FullReloadRequired { req_id, .. }) => {
-                self.on_full_reload(req_id)
-            }
-            Ok(protocol::Reply::Unavailable { req_id, .. }) => {
-                self.loads.on_unavailable(req_id)
-            }
-            _ => {}
-        }
-        self.db.store_mut().on_inbound(&m);
-    }
-
-    /// A read's answer, with a `NotLoaded` turned into a real request and a
-    /// ticket to wait on.
+    /// A read's answer, with a refusal for want of blocks given its ticket.
     fn answer<T: serde::Serialize>(&mut self, r: Result<T, DbError>) -> Result<String, JsValue> {
         match self.decide(r) {
-            craftworks_sdk::Outcome::Done(v) => {
+            Outcome::Done(v) => {
                 serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
             }
-            craftworks_sdk::Outcome::Wait(e, t) => Err(db_err_waiting(&e, Some(t))),
-            craftworks_sdk::Outcome::Told(e) => Err(db_err(&e)),
+            Outcome::Wait(e, t) => Err(db_err_waiting(&e, Some(t))),
+            Outcome::Told(e) => Err(db_err(&e)),
         }
     }
 
-    /// THE DECISION, which lives in the SDK so something native can run it.
-    ///
-    /// This type is `#[wasm_bindgen]` in a `cdylib`: nothing native can build
-    /// one, so a test that reached this method could only be a fake session
-    /// written in JavaScript — which compiles this file and runs none of it.
-    ///
-    /// Measured: with the recovery inline here, the sdk#89 defect could be
-    /// put back — `define` returning a ticketless `NotLoaded` — and the whole
-    /// suite stayed green. `craftworks_sdk::parking` carries it now, and
-    /// `tests/cold_write_native.rs` drives it against a real `Shell`.
-    fn decide<T>(&mut self, r: Result<T, DbError>) -> craftworks_sdk::Outcome<T> {
-        let now = crate::js_now_ms();
-        // Cold reads take a new load only when the page can name the GETs.
-        let cold = self.cold_contract.as_ref().map(|_| &mut self.cold);
-        let o = craftworks_sdk::decide_with(&mut self.loads, self.db.store_mut(), r, now, cold);
-        self.pump_cold();
-        o
+    /// THE DECISION, which lives in the SDK so something native can run it
+    /// (`PageStore::decide`; sdk#89).
+    fn decide<T>(&mut self, r: Result<T, DbError>) -> Outcome<T> {
+        self.db.store_mut().decide(r)
     }
 
-    /// A WRITE THAT HAD TO READ BEFORE IT COULD APPLY.
-    ///
-    /// Every write in this file reads first: `define` reads the existing
-    /// schema to check the new one against it, and `put`, `update` and
-    /// `delete` all go through `need_schema`. `update` and `delete` read the
-    /// record as well. So all four can fail with `NotLoaded`, and that
-    /// failure means **"I could not read what I needed in order to apply
-    /// this"** — never "this write is invalid".
-    ///
-    /// The difference is the whole bug. Unparked, `define` returned a
-    /// TICKETLESS `NotLoaded` that nothing could retry, and a published app
-    /// was left with a form on screen, a button saying Published, and every
-    /// put refused with `domain has no schema; define it first` — for ever,
-    /// because the next mount ran the same cold define. Measured against a
-    /// real node: 120 of 120 writes refused (sdk#89).
-    ///
-    /// # Retrying cannot double-apply
-    ///
-    /// In `Db`, every one of these reads happens BEFORE the single
-    /// `self.write(...)` that mutates, and `write` either applies the whole
-    /// edit or fails having applied none of it. A `NotLoaded` from any of
-    /// them therefore leaves the tree untouched, so asking again once the
-    /// range is loaded repeats the attempt rather than the effect.
-    ///
-    /// This is `answer`'s sibling and deliberately not `answer` itself: a
-    /// write's return type is its own (`()`, `bool`, a `Record`), and
-    /// serializing it to a string here would change four wasm signatures to
-    /// share one helper. `count` takes it for the same reason — it is a read,
-    /// but a read that answers a `usize`.
+    /// [`Session::answer`]'s sibling for calls whose value keeps its own type
+    /// (a write's `()`, `bool` or `Record`; `count`'s `usize`).
     fn decided<T>(&mut self, r: Result<T, DbError>) -> Result<T, JsValue> {
         match self.decide(r) {
-            craftworks_sdk::Outcome::Done(v) => Ok(v),
-            craftworks_sdk::Outcome::Wait(e, t) => Err(db_err_waiting(&e, Some(t))),
-            craftworks_sdk::Outcome::Told(e) => Err(db_err(&e)),
+            Outcome::Done(v) => Ok(v),
+            Outcome::Wait(e, t) => Err(db_err_waiting(&e, Some(t))),
+            Outcome::Told(e) => Err(db_err(&e)),
         }
     }
 
-    /// A page of a load arrived.
-    fn on_page(
-        &mut self,
-        req_id: u64,
-        entries: Vec<(Vec<u8>, Vec<u8>)>,
-        cursor: Option<Vec<u8>>,
-        at: protocol::At,
-    ) {
-        match self.loads.on_page(req_id, entries, cursor, at) {
-            craftworks_sdk::loads::Page::More { lo, hi, after } => {
-                // Not exhausted. Ask for the rest under the SAME ticket, so
-                // the read parked on it waits for the whole range rather than
-                // being woken by a part of it.
-                self.db
-                    .store_mut()
-                    .client
-                    .send(&craftworks_sdk::Loads::range_request(
-                        req_id,
-                        &lo,
-                        &hi,
-                        Some(after),
-                    ));
-            }
-            craftworks_sdk::loads::Page::Complete { lo, hi, rows, at } => {
-                // AT THE ROOT IT WAS READ AT — every page of this load agreed
-                // on `at` (`Loads` restarts a load whose pages disagree). Not
-                // the Session's `head_root` field: that is set from `Identity`
-                // only (the wiring test refuses the field in this arm), so on the
-                // page path it stays the FIRST head this session saw. The copy
-                // is per root, and a delta moves it to the delta's real root,
-                // so a page recorded at the stale one read as a different tree
-                // and `loaded_range` WIPED every loaded range — the page just
-                // loaded included. Measured (sdk#282's acceptance run): pages
-                // read at 61b37a53 recorded at 0e62cdb5, the copy wiped on every
-                // load, and a read of another app's notes answered a ticketless
-                // NOT_LOADED for ever. The refresh bookkeeping just below
-                // already used `at.root`; now the rows do too.
-                self.db.store_mut().on_page(&lo, &hi, rows, at.root);
-                // A whole domain, loaded at one root: the next question about
-                // it can be a real delta FROM that root (sdk#142).
-                if let Some(d) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key_of_range(&lo, &hi) {
-                    self.refresh.on_loaded(&d, at.root);
-                }
-            }
-            // The tree moved under this load, or it finished behind what
-            // this client already knows. Ask again from the top: what was
-            // gathered is half from one tree and half from another.
-            craftworks_sdk::loads::Page::Restart { lo, hi } => {
-                self.db
-                    .store_mut()
-                    .client
-                    .send(&craftworks_sdk::Loads::range_request(
-                        req_id, &lo, &hi, None,
-                    ));
-            }
-            craftworks_sdk::loads::Page::Nothing => {}
-        }
-    }
-
-    /// Loads that ended since this was last asked, as JSON.
+    /// Tickets that ended since this was last asked, as JSON:
+    /// `[{"id", "ok", "code", "why"}]`, `code` one of LOADED / UNAVAILABLE /
+    /// NOT_ANSWERING, `why` the engine's reason for an UNAVAILABLE (or null).
     ///
     /// The page resolves its parked reads from THIS, called when a message
     /// arrives. Never a timer: a timer either spins or answers late, and
     /// neither of those is a fact about the data.
     pub fn take_loads(&mut self) -> String {
         let out: Vec<serde_json::Value> = self
-            .loads
+            .db
+            .store_mut()
             .take_ended()
             .into_iter()
-            .map(|(id, how)| {
-                let ok = how == craftworks_sdk::Ended::Loaded;
-                let code = match how {
-                    craftworks_sdk::Ended::Loaded => "LOADED",
-                    craftworks_sdk::Ended::Unavailable => "UNAVAILABLE",
-                    craftworks_sdk::Ended::NotAnswering => "NOT_ANSWERING",
-                };
-                serde_json::json!({ "id": id, "ok": ok, "code": code })
-            })
+            .map(|(id, how)| (id, how, self.db.store_mut().why(id)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(id, how, why)| serde_json::json!({ "id": id, "ok": how == craftworks_sdk::Ended::Loaded, "code": how.code(), "why": why }))
             .collect();
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
     }
 
-    /// How many ranges are being loaded right now. For a page to show, and
-    /// for a test to assert that concurrent reads of one range issue ONE
-    /// request rather than one each.
-    pub fn loads_in_flight(&self) -> usize {
-        self.loads.in_flight()
+    /// A parked read woke on `ticket`: the NEXT call on this session walks
+    /// the root that ticket's read was made at, so a chain of hops ends on
+    /// one tree rather than chasing a head that keeps moving (READ-STATE
+    /// inv. 2). `engine-db.js`'s `once` calls this right before it asks again.
+    ///
+    /// A JavaScript NUMBER, as `take_loads` hands the id out: a `u64` here
+    /// crosses as a BigInt, the page's number THROWS, and the read failed as
+    /// UNAVAILABLE on every page (measured in the notes acceptance). Ticket
+    /// ids are a counter from 1, far inside 2^53.
+    pub fn resume(&mut self, ticket: f64) {
+        self.db.store_mut().resume(ticket as u64);
     }
 
-    /// Which bound domains are stale, because the head moved. Drains.
-    ///
-    /// **Rust decides which, not the page.** A page that reloaded
-    /// "everything" on every notification would turn one write anywhere into
-    /// a full refetch of every screen; one that guessed would miss the domain
-    /// that changed. The session knows which domains have been bound.
-    ///
-    /// The head moving is a HINT. A missed notification costs nothing — the
-    /// tick re-reads the root regardless — and a spurious one costs a reload.
-    /// What it is NOT is a root: nothing here goes into the copy.
+    /// How many reads are waiting on a ticket right now.
+    pub fn loads_in_flight(&self) -> usize {
+        self.db.store().open_tickets()
+    }
+
     /// The domains where one of THIS client's own writes changed state
     /// (published, parity-complete, lost, failed, conflict, superseded) since
     /// this was last asked, as JSON. Drains. Every binding of this client on
@@ -480,163 +232,40 @@ impl Session {
     /// (builder#107). LIVE governs only OTHER writers' changes
     /// ([`Session::take_stale`]).
     pub fn take_state_changed(&mut self) -> String {
-        let keys = self.db.store_mut().take_state_changed();
+        let keys = self.db.store_mut().writes.take_state_changed();
         // Back to the app-relative names JavaScript holds, as `take_stale`
         // does — the stored `<app>.<name>` is keyed by no binding (#267).
-        let domains = craftworks_sdk::Db::<CachedStore, SystemEnv>::own_domains_of_keys(self.app.as_deref(), &keys);
+        let domains = craftworks_sdk::Db::<Store, SystemEnv>::own_domains_of_keys(self.app.as_deref(), &keys);
         craftworks_sdk::app::to_js(&domains)
     }
 
+    /// Which LIVE bindings' ranges changed since each was last told, as JSON
+    /// (app-relative watch keys). Drains.
+    ///
+    /// **Rust decides which, not the page.** Per bound watch key: the diff
+    /// from its `RenderedAt` to the engine's root over the key's range — the
+    /// tree's own diff, walked here over the blocks the page holds. A key
+    /// whose range changed is named, and its `RenderedAt` moves to that root:
+    /// its binding re-reads at that root or a newer one, so no change is
+    /// missed; at worst one re-read finds nothing new. A diff that cannot be
+    /// walked (a block not held) counts as a change, and the re-read waits on
+    /// the fetch.
     pub fn take_stale(&mut self) -> String {
-        if std::mem::take(&mut self.head_moved) {
-            // The head moved, so every bound domain is worth ASKING about.
-            // Asking is not the same as having changed: what a binding
-            // re-runs on is the ANSWER, which arrives as a `Delta`.
-            let domains: Vec<String> = self.bound.iter().cloned().collect();
-            for d in domains {
-                self.refresh(&d);
-            }
-        }
+        let head = self.db.store_mut().head();
+        let changed = self.bound.take_changed(self.db.store_mut(), head, craftworks_sdk::Db::<Store, SystemEnv>::watch_range);
         // Back to the app-relative keys JavaScript holds.
-        let changed: Vec<craftworks_sdk::app::AppName> = self.refresh.take_changed().iter().filter_map(|k| self.own_name(k)).collect();
+        let changed: Vec<craftworks_sdk::app::AppName> = changed.iter().filter_map(|k| self.own_name(k.stored())).collect();
         craftworks_sdk::app::to_js(&changed)
     }
 
-    /// Ask what changed in a domain since this client last saw it.
-    ///
-    /// **This is the refresh path, and for a while there was none.** A
-    /// binding's `reload` read the LOCAL COPY, whose root moves only when a
-    /// delta or a page arrives — and nothing sent `ChangesSince`, so the root
-    /// never moved, `reload` always answered "nothing changed", and a tab
-    /// that made no write could never see another's. The engine had the
-    /// mechanism, `CachedStore::on_delta` had the mechanism, and no line
-    /// joined them.
-    ///
-    /// The client sends the root IT last saw. That is what makes a missed
-    /// notification recoverable: however many were dropped, the gap closes in
-    /// one call.
-    fn refresh(&mut self, domain: &str) {
-        // A watch KEY: a domain, or one parent's band (sdk#137) — so a live
-        // band asks what changed IN ITS BAND, and a change under a sibling
-        // parent is not a change to it.
-        let Some((lo, hi)) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_range(domain) else {
-            return;
-        };
-        // From the session's ONE request counter, shared with every load
-        // (sdk#166).
-        let id = self.loads.take_id();
-        if let Some(req) = self.refresh.ask(id, domain, &lo, &hi) {
-            self.db.store_mut().client.send(&req);
-        }
-    }
-
-    /// Local movement: rolled-back writes, in the domains that are bound.
-    ///
-    /// A component re-renders on its OWN write through the same drain as on
-    /// somebody else's. Without this a put changes `base + pending` but not
-    /// the root, so a bound component would not re-render on its own write
-    /// nor when it went PENDING -> CLEAN.
-    fn note_local(&mut self, told: &craftworks_sdk::Told) {
-        let bound: Vec<(String, Vec<u8>, Vec<u8>)> = self
-            .bound
-            .iter()
-            .filter_map(|d| {
-                let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_range(d)?;
-                Some((d.clone(), lo, hi))
-            })
-            .collect();
-        // EVERY watch containing the key, not the first: a domain binding and
-        // a band binding of the same domain both moved (sdk#137).
-        for (d, lo, hi) in &bound {
-            let keys = told
-                .rolled_back_keys
-                .iter()
-                .chain(told.moved_under_pending.iter());
-            self.refresh
-                .note_local(keys, |k| (k >= &lo[..] && k < &hi[..]).then(|| d.clone()));
-        }
-    }
-
-    /// A delta arrived: apply it through the copy — or, if `Refresh` says it
-    /// is only a first page, reload the domain INSTEAD. Never after: the copy
-    /// records the root in `apply_delta` too, so applying first would leave
-    /// it claiming a root it is not at (sdk#140).
-    fn on_delta(
-        &mut self,
-        req_id: u64,
-        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        cursor: Option<Vec<u8>>,
-        new_root: [u8; 32],
-    ) {
-        // A READ'S OWN re-ask of a stale range (sdk#266): the ticket is a
-        // load's, and this delta is its answer.
-        if self.loads.range_of(req_id).is_some() {
-            if let Some((root, lo, hi)) = craftworks_sdk::parking::delta_for_read(&mut self.loads, self.db.store_mut(), req_id, changes, cursor, new_root) {
-                // A whole domain is current again at this root: the next
-                // question about it can be a delta FROM here (sdk#142).
-                if let Some(d) = craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key_of_range(&lo, &hi) {
-                    self.refresh.on_loaded(&d, root);
-                }
-            }
-            return;
-        }
-        match self.refresh.on_delta(req_id, changes, cursor, new_root) {
-            craftworks_sdk::Answer::Delta {
-                changes, new_root, ..
-            } => {
-                self.db.store_mut().on_delta(changes, new_root);
-            }
-            craftworks_sdk::Answer::NotOurs => self.foreign_notifications += 1,
-            craftworks_sdk::Answer::Reload { domain } => self.reload(&domain),
-        }
-    }
-
-    /// The engine could not compute a delta: load the range again.
-    fn on_full_reload(&mut self, req_id: u64) {
-        // A stale range's re-ask the engine could not diff: load it in full,
-        // under the same ticket the read is parked on (sdk#266).
-        if craftworks_sdk::parking::full_reload_for_read(&mut self.loads, self.db.store_mut(), req_id) {
-            return;
-        }
-        let craftworks_sdk::Answer::Reload { domain } = self.refresh.on_full_reload(req_id) else {
-            self.foreign_notifications += 1;
-            return;
-        };
-        self.reload(&domain);
-    }
-
-    /// Forget a domain's range and load it again.
-    fn reload(&mut self, domain: &str) {
-        let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(domain);
-        // FORGOTTEN, then re-requested through `Loads` -- ticketed and bounded
-        // like any other load. The copy must not keep answering from a range
-        // the engine has just said it cannot reconcile.
-        self.db.store_mut().copy.forget(&lo, &hi);
-        if let Some((id, send)) = self.loads.want(&lo, &hi, crate::js_now_ms()) {
-            if send {
-                self.db
-                    .store_mut()
-                    .client
-                    .send(&craftworks_sdk::Loads::range_request(id, &lo, &hi, None));
-            }
-        }
-    }
-
-    pub fn refresh_domain(&mut self, domain: &str) {
-        // A watch key is a domain, or `domain#parent`: app-relative here too.
-        if let Ok(key) = self.read_name(domain) {
-            self.refresh(&key);
-        }
-    }
-
-    /// What this page is showing — a watch key from [`Session::watch_key`] —
-    /// so a head move can name it.
-    ///
-    /// Recorded by the session rather than tracked in JS, because deciding
-    /// what to reload is a decision.
+    /// What this page is showing LIVE — a watch key from
+    /// [`Session::watch_key`] — so a head move can name it. Its `RenderedAt`
+    /// starts at the root now: the binding's first read is at this root or a
+    /// newer one.
     pub fn bind(&mut self, domain: &str) {
         if let Ok(key) = self.read_name(domain) {
-            self.bound.insert(key.to_string());
+            let at = self.db.store_mut().head();
+            self.bound.bind(craftworks_sdk::live_bindings::WatchKey::of(key), at);
         }
     }
 
@@ -645,15 +274,15 @@ impl Session {
     /// what it MEANS is decided here.
     pub fn watch_key(&self, domain: &str, parent: &str) -> Result<String, JsValue> {
         if parent.is_empty() {
-            return Ok(craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key(domain, None));
+            return Ok(craftworks_sdk::Db::<Store, SystemEnv>::watch_key(domain, None));
         }
         let p = rkey_of(parent)?;
-        Ok(craftworks_sdk::Db::<CachedStore, SystemEnv>::watch_key(domain, Some(&p)))
+        Ok(craftworks_sdk::Db::<Store, SystemEnv>::watch_key(domain, Some(&p)))
     }
 
     pub fn unbind(&mut self, domain: &str) {
         if let Ok(key) = self.read_name(domain) {
-            self.bound.remove(key.as_str());
+            self.bound.unbind(&craftworks_sdk::live_bindings::WatchKey::of(key));
         }
     }
 
@@ -667,17 +296,13 @@ impl Session {
     pub fn live_mode(&self) -> String {
         // THE PAGE PATH'S SUBSCRIPTION IS PAGE-IO'S (sdk#259). The head is
         // read by GET with `subscribe`, and the node's answer to THAT is what
-        // makes this page live. This used to report the Session's own
-        // `watching`, set by the delegate path's `watch_head` — which the
-        // switch-over deleted, so it was false for ever: a page subscribed
-        // the whole time reported that it was polling, and the two-tab probe
-        // read its number as "the tick's number wearing a different name".
-        // The MAPPING is page-io's (`HeadSubscription::live_mode`), where a
-        // native test pins every branch; this only serializes it. (No mode is
-        // named in quotes anywhere in this function, comments included:
-        // the web crate's page-path wiring test refuses a quoted mode here, as one
-        // would be a second mapping no native test can reach.)
-        let m = self.page.as_ref().map(|p| p.head_subscription().live_mode()).unwrap_or_else(page_io::LiveMode::no_page);
+        // makes this page live. The MAPPING is page-io's
+        // (`HeadSubscription::live_mode`), where a native test pins every
+        // branch; this only serializes it. (No mode is named in quotes
+        // anywhere in this function, comments included: the web crate's
+        // page-path wiring test refuses a quoted mode here, as one would be a
+        // second mapping no native test can reach.)
+        let m = self.page().map(|p| p.head_subscription().live_mode()).unwrap_or_else(page_io::LiveMode::no_page);
         let (mode, why, changes) = (m.mode, m.why, m.head_changes);
         serde_json::json!({
             "mode": mode,
@@ -690,46 +315,20 @@ impl Session {
         .to_string()
     }
 
-    /// Hand the store's protocol frames to the in-page server. HELD (not
-    /// drained) until the page exists: an earlier version drained and dropped
-    /// what it could not deliver — the lose-the-queue defect already fixed
-    /// once in the page's socket pump.
-    fn envelope_engine_requests(&mut self) {
-        if self.page.is_some() {
-            for bytes in self.db.store_mut().take_outbound() {
-                self.page.as_mut().expect("checked").client(&bytes);
-            }
-            self.pump_page();
-        }
+    /// The page, once provisioning (or `open_named`) has made one. It lives
+    /// in the store: the store reads by walking its engine.
+    fn page(&self) -> Option<&PageIo> {
+        self.db.store().host()
     }
 
-    /// Cold reads on or off with the Block code — the one place both the
-    /// default (at provision) and the builder's choice go through.
-    fn switch_cold(&mut self, on: bool, block_code: Vec<u8>) {
-        if on && !self.cold.on {
-            // A fresh reader: the RTO and the window start where RFC 6298 and
-            // slow start say, at the head this session already knows.
-            self.cold = craftworks_sdk::cold::ColdReads::switched_on();
-            if self.head_root != [0u8; 32] {
-                self.cold.set_root(self.head_root);
-            }
-        }
-        self.cold.on = on;
-        self.cold_contract = if on && !block_code.is_empty() {
-            Some(Box::new(wire::block::contract_deriver(&block_code)))
-        } else {
-            None
-        };
+    fn page_mut(&mut self) -> Option<&mut PageIo> {
+        self.db.store_mut().host_mut()
     }
 
-    /// PAGE MODE: what `page-io` produced, carried out — its node frames go
-    /// out, its protocol replies reach this session exactly as a delegate's
-    /// did, and once the signer is provisioned the in-page engine is started
-    /// with `Identity`.
     /// The signer answered that it holds NO key: this person's first page on
     /// this node. Mint one and provision it — the only place a key is minted.
     fn mint_if_needed(&mut self) {
-        let Some(p) = self.page.as_mut() else { return };
+        let Some(p) = self.page_mut() else { return };
         if !p.needs_key() {
             return;
         }
@@ -740,33 +339,27 @@ impl Session {
         }
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
         let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
-        p.provision_with(sk.to_bytes().to_vec(), params);
+        if let Some(p) = self.page_mut() {
+            p.provision_with(sk.to_bytes().to_vec(), params);
+        }
     }
 
+    /// PAGE MODE: what `page-io` produced, carried out — the store's frames
+    /// reach the in-page server and its replies the store (`PageStore::sync`),
+    /// the page's node frames go out, and once the signer is provisioned the
+    /// in-page engine is started with `Identity`.
     fn pump_page(&mut self) {
         self.mint_if_needed();
-        let Some(p) = self.page.as_mut() else { return };
-        let published = p.server.page.published();
-        if published != self.seen_published {
-            self.seen_published = published;
-            self.head_moved = true;
+        if self.page().is_none() {
+            return;
         }
-        // A head this page ADOPTED — somebody else's commit, never its own:
-        // every loaded range is behind it, and the next read of one re-asks
-        // with a delta (sdk#266). Its OWN commits mark nothing: the copy
-        // already holds those values, and marking would double the read
-        // traffic of ordinary writing.
-        if p.server.take_adopted() {
-            self.db.store_mut().mark_stale();
-        }
+        self.db.store_mut().sync();
+        let sent = self.page_identity_sent;
+        let p = self.page_mut().expect("checked");
         let frames = p.take_frames();
-        let replies = p.take_replies();
-        let ready = p.provisioned() && !self.page_identity_sent;
+        let ready = p.provisioned() && !sent;
         let others = p.take_others();
         self.out.extend(frames);
-        for m in replies {
-            self.on_engine_reply(m);
-        }
         // The node's answers about contracts that are not the page's own: the
         // app's PUTs, by the key each names.
         for answer in others {
@@ -781,60 +374,9 @@ impl Session {
         }
         if ready {
             self.page_identity_sent = true;
-            match protocol::encode_request(1, &protocol::Request::Identity) {
-                Ok(frame) => {
-                    if let Some(p) = self.page.as_mut() {
-                        p.client(&frame);
-                    }
-                    self.pump_page();
-                }
-                Err(e) => self.unusable.push(format!("the identity request cannot be encoded: {e:?}")),
-            }
+            self.db.store_mut().writes.client.send(&protocol::Request::Identity);
+            self.pump_page();
         }
-    }
-
-    /// COLD READS: what the cold reader decided, carried out.
-    ///
-    /// * loads it handed back (the root is this node's own, F55; or the tree
-    ///   is not something a fetch fixes) go to the engine exactly as `decide`
-    ///   sends them;
-    /// * each GET goes out as a FRESH client GET of the block's contract —
-    ///   on this connection. ASSUMPTION (the live run tells): a re-GET on the
-    ///   same connection is not pinned behind the stalled one; client GETs
-    ///   are not deduplicated (F55, read), each is its own transaction;
-    /// * each finished load completes through the SAME path an engine page
-    ///   does (`on_page`), at the root it read.
-    fn pump_cold(&mut self) {
-        for (id, lo, hi) in self.cold.take_returned() {
-            self.db
-                .store_mut()
-                .client
-                .send(&craftworks_sdk::Loads::range_request(id, &lo, &hi, None));
-        }
-        let gets = self.cold.take_gets();
-        if let Some(contract) = self.cold_contract.as_ref() {
-            let ids: Vec<craftworks_sdk::Cid> = gets.iter().map(|g| contract(&g.block)).collect();
-            for id in ids {
-                let stream = self.next_stream();
-                match wire::frame_get(wire::contract_id(id), false, stream) {
-                    Ok(frames) => self.out.extend(frames),
-                    Err(e) => self.unusable.push(format!("a cold GET could not be framed: {e}")),
-                }
-            }
-        }
-        for id in self.cold.take_not_answering() {
-            self.loads.on_not_answering(id);
-        }
-        for (id, rows, root) in self.cold.take_done() {
-            let at = protocol::At { seq: self.loads.known_seq(), root };
-            self.on_page(id, rows, None, at);
-        }
-    }
-
-
-    fn next_stream(&mut self) -> u32 {
-        self.stream = self.stream.wrapping_add(1).max(1);
-        self.stream
     }
 
     /// Provisioning steps that completed since this was last asked, as JSON.
@@ -847,51 +389,36 @@ impl Session {
         "[]".into()
     }
 
-    /// The Session's OWN cold reads — the F52 mitigation for the engine
-    /// DELEGATE, whose cold read could stall ≈ 60 s — are OFF on the page
-    /// path: the in-page engine fetches every block itself through page-io,
-    /// each node call on its RTO (#227). Turning them ON is refused by name
-    /// rather than half-done (their answers would never reach this session,
-    /// page-io owning every node frame); their removal is sdk#258.
+    /// The Session's OWN cold reads are gone (sdk#258): the in-page engine
+    /// fetches every block itself through page-io, each node call on its RTO
+    /// (#227). Turning them ON is refused by name rather than half-done.
     pub fn set_cold_reads(&mut self, on: bool, block_code: Vec<u8>) {
         let _ = block_code;
         if on {
-            self.unusable.push("set_cold_reads(true): the in-page engine reads cold itself; the Session's own cold reads are off (sdk#258)".into());
+            self.unusable.push("set_cold_reads(true): the in-page engine reads cold itself; the Session's own cold reads are gone (sdk#258)".into());
         }
     }
 
-    /// Milliseconds until the cold reader's earliest fetch reaches its RTO,
-    /// or -1 when none is in flight. The page arms a one-shot timer for it
-    /// and calls [`Session::cold_tick`] then — so a late fetch is seen at its
-    /// own timeout even when no answer arrives and the 1 s tick is far off.
+    /// Milliseconds until the page executor's next timer (its every node call
+    /// retries on its RTO, and the page's 1 s tick is too coarse for it), or
+    /// -1 when none is due. The page arms a one-shot timer for it and calls
+    /// [`Session::cold_tick`] then.
     pub fn cold_due_ms(&self) -> i32 {
         let now = crate::js_now_ms();
-        // The page executor's next timer too (page mode): its every node call
-        // retries on its RTO, and the page's 1 s tick is too coarse for it.
-        let page = self.page.as_ref().and_then(|p| p.next_due()).map(|d| d.0.saturating_sub(now));
-        match [self.cold.next_due_ms(now), page].into_iter().flatten().min() {
+        match self.page().and_then(|p| p.next_due()).map(|d| d.0.saturating_sub(now)) {
             Some(ms) => ms.min(i32::MAX as u64) as i32,
             None => -1,
         }
     }
 
-    /// The cold reader's clock alone, at the moment [`Session::cold_due_ms`]
-    /// named: its late fetches re-sent, its give-ups reported.
+    /// The page executor's clock alone, at the moment
+    /// [`Session::cold_due_ms`] named.
     pub fn cold_tick(&mut self) {
         let now = crate::js_now_ms();
-        self.cold.tick(now);
-        self.pump_cold();
-        if let Some(p) = self.page.as_mut() {
+        if let Some(p) = self.page_mut() {
             p.tick(page::Ms(now));
         }
         self.pump_page();
-    }
-
-    /// Every cold GET's timeout, re-fetch and answer since this was last
-    /// asked, as JSON — what a live run reports, and what a support bundle
-    /// carries.
-    pub fn take_cold_log(&mut self) -> String {
-        serde_json::to_string(&std::mem::take(&mut self.cold.log)).unwrap_or_else(|_| "[]".into())
     }
 
     /// Messages this build could not use, by reason.
@@ -901,7 +428,7 @@ impl Session {
         // stopped from) is this session's to report. Kept apart, it was
         // invisible — core dev's M254 minted on every pump and nothing showed.
         let mut all = self.unusable.clone();
-        if let Some(p) = self.page.as_ref() {
+        if let Some(p) = self.page() {
             all.extend(p.unusable().iter().cloned());
         }
         serde_json::to_string(&all).unwrap_or_else(|_| "[]".into())
@@ -931,7 +458,7 @@ impl Session {
     /// page's own cold reads are OFF here: the in-page engine fetches blocks
     /// itself, through `page-io`, on the RTO estimator and the window.
     fn provision_page(&mut self, block: Vec<u8>, register: Vec<u8>) {
-        if self.page.is_some() {
+        if self.page().is_some() {
             return;
         }
         // NOT MINTED HERE. The page ASKS the signer which Register it signs
@@ -952,11 +479,8 @@ impl Session {
         );
         let mut io = page_io::PageIo::new(server, art);
         io.begin(container);
-        self.cold_chosen = true;
-        self.switch_cold(false, Vec::new());
-        self.page = Some(io);
+        self.db.store_mut().set_host(io);
         self.pump_page();
-        self.envelope_engine_requests();
     }
 
     /// Has provisioning finished — because the SIGNER said so: it answered
@@ -964,20 +488,20 @@ impl Session {
     /// reload, a second tab: nothing minted). `PageIo::provisioned`, and
     /// nothing else (engineer2's contract for `open()`, sdk#255).
     pub fn provisioned(&self) -> bool {
-        self.page.as_ref().is_some_and(|p| p.provisioned())
+        self.page().is_some_and(|p| p.provisioned())
     }
 
     /// Opening's re-asks are SPENT: the signer did not answer the first
     /// exchange (the Register query, or the provisioning) within its budget —
     /// "not answering" (page-io's `exhausted`). One of `open()`'s named ends.
     pub fn exhausted(&self) -> bool {
-        self.page.as_ref().is_some_and(|p| p.exhausted())
+        self.page().is_some_and(|p| p.exhausted())
     }
 
     /// Opening is STILL WAITING past its first RTO: the first exchange is
     /// being re-asked and not yet answered. Named for display; empty when not.
     pub fn stalled(&self) -> String {
-        match self.page.as_ref() {
+        match self.page() {
             Some(p) if p.stalled() => "the signer has not answered yet; asking again".into(),
             _ => String::new(),
         }
@@ -986,7 +510,7 @@ impl Session {
     /// Opening was REFUSED, by the signer or the node, in its own words
     /// (page-io's `refused`) — or empty. One of `open()`'s named ends.
     pub fn refused(&self) -> String {
-        self.page.as_ref().and_then(|p| p.refused()).unwrap_or_default().to_string()
+        self.page().and_then(|p| p.refused()).unwrap_or_default().to_string()
     }
 
     /// The socket dropped and a new one opened.
@@ -1018,7 +542,7 @@ impl Session {
     /// durability:** a publisher that must know reads it back.
     pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
         let (key, contract, state) = wire::puts::contract(&code, &params, &state);
-        let Some(p) = self.page.as_mut() else {
+        let Some(p) = self.page_mut() else {
             return Err(JsValue::from_str("provision first — there is no path to the node before it"));
         };
         p.put_contract(contract, state).map_err(|e| JsValue::from_str(&e))?;
@@ -1048,7 +572,7 @@ impl Session {
         for (i, b) in id.iter_mut().enumerate() {
             *b = u8::from_str_radix(&register_id[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
         }
-        if self.page.is_some() {
+        if self.page().is_some() {
             return Err(JsValue::from_str("open_named: this session is already open on its own head"));
         }
         self.read_only = true;
@@ -1056,11 +580,8 @@ impl Session {
             page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
             page::server::SignerFacts::default(),
         );
-        self.cold_chosen = true;
-        self.switch_cold(false, Vec::new());
-        self.page = Some(page_io::PageIo::reader(server, block_code, id, range));
+        self.db.store_mut().set_host(page_io::PageIo::reader(server, block_code, id, range));
         self.pump_page();
-        self.envelope_engine_requests();
         Ok(())
     }
 
@@ -1074,10 +595,11 @@ impl Session {
     /// Register's instance id in hex, or empty until `Identity` has named it.
     /// What a publisher records so a view can open the same head.
     pub fn head_id(&self) -> String {
-        if self.head_id == [0u8; 32] {
-            String::new()
-        } else {
-            self.head_id.iter().map(|b| format!("{b:02x}")).collect()
+        // page-io's: it names the Register it reads (sdk#239), and nothing
+        // here keeps a second copy of it.
+        match self.page().map(|p| p.register_id()) {
+            Some(id) if id != [0u8; 32] => id.iter().map(|b| format!("{b:02x}")).collect(),
+            _ => String::new(),
         }
     }
 
@@ -1150,7 +672,7 @@ impl Session {
 
     pub fn domains(&mut self) -> Result<String, JsValue> {
         // THIS app's domains, by the names it gave them.
-        let r = self.db.domains().map(|all| all.iter().filter_map(|d| self.own_name(d)).map(|n| n.as_str().to_string()).collect::<Vec<_>>());
+        let r = self.db.domains().map(|all| all.into_iter().filter_map(|d| self.own_name(&craftworks_sdk::app::StoredName::of_tree(d))).map(|n| n.as_str().to_string()).collect::<Vec<_>>());
         self.answer(r)
     }
 
@@ -1257,8 +779,8 @@ impl Session {
     /// What this client HOLDS — not what the tree contains.
     ///
     /// The in-memory store can answer `blocks`/`bytes`/`height` because it
-    /// IS the tree. This one holds a copy of the ranges the app has bound, on
-    /// a node that holds the rest, so those three are **`null` and not 0**.
+    /// IS the tree. This one holds the blocks it has walked or written, of a
+    /// tree the node holds, so those three are **`null` and not 0**.
     /// Zero would render as a real, empty database — the same
     /// not-loaded-versus-empty confusion this whole layer exists to prevent,
     /// arriving through a statistics panel instead of a read.
@@ -1269,19 +791,20 @@ impl Session {
     /// "saving N…" count. Not `Accepted` — an accepted write can still be
     /// lost with the tab.
     pub fn unsaved_writes(&self) -> usize {
-        self.db.store().unsaved_writes()
+        self.db.store().writes.unsaved_writes()
     }
 
     pub fn stats(&mut self) -> Result<String, JsValue> {
-        let (n_pending, pending_bytes) = self.db.store_mut().copy.pending();
-        let held = self.db.store_mut().copy.bytes();
+        let (n_pending, pending_bytes) = self.db.store().writes.copy.pending();
+        let held = self.page().map(|p| p.server.page.blocks().len());
         as_json::<serde_json::Value>(Ok(serde_json::json!({
             // Properties of the TREE, which lives on the node.
             "blocks": serde_json::Value::Null,
             "bytes": serde_json::Value::Null,
             "height": serde_json::Value::Null,
             // Properties of THIS CLIENT, which are the ones it can state.
-            "heldBytes": held,
+            // Blocks this page holds (the only cache it has, by content id).
+            "heldBlocks": held,
             "pendingWrites": n_pending,
             "pendingBytes": pending_bytes,
         })))
@@ -1359,18 +882,15 @@ impl Session {
                 Err(e) => return Err(db_err(&e)),
             }
         }
-        for (i, d) in domains.iter().enumerate() {
-            let (lo, hi) = craftworks_sdk::Db::<CachedStore, SystemEnv>::domain_range(d);
-            self.db
-                .store_mut()
-                .client
-                .send(&craftworks_sdk::Loads::range_request(
-                    PRELOAD_REQ_BASE + i as u64,
-                    &lo,
-                    &hi,
-                    None,
-                ));
+        // Each domain WALKED now: a range whose blocks are held answers at
+        // once and costs nothing more; one that is not has the engine fetch
+        // them, so the app's first read of it walks warm.
+        for d in &domains {
+            let (lo, hi) = craftworks_sdk::Db::<Store, SystemEnv>::domain_range(d);
+            let _ = craftworks_sdk::Reads::scan(self.db.store_mut(), &lo, &hi, false, usize::MAX);
+            self.db.store_mut().take_ticket();
         }
+        self.pump_page();
         Ok(domains.len())
     }
 
@@ -1385,12 +905,12 @@ impl Session {
         // The LAST write this session issued. `next_write_id` is the one the
         // next write will carry, so the last issued is one below it — and
         // before any write has been made there is nothing to trace.
-        let next = self.db.store_mut().next_write_id();
+        let next = self.db.store().writes.next_write_id();
         if next <= 1 {
             return "null".into();
         }
         let of = protocol::TraceOf::Write(next - 1);
-        let Some(t) = self.db.store_mut().client.trace(of) else {
+        let Some(t) = self.db.store_mut().writes.client.trace(of) else {
             return "null".into();
         };
         // Serialised FIELD BY FIELD, never derived.
@@ -1426,10 +946,11 @@ impl Session {
         if on {
             self.db
                 .store_mut()
+                .writes
                 .client
                 .trace_on(Box::new(crate::js_now_ms));
         } else {
-            self.db.store_mut().client.trace_off();
+            self.db.store_mut().writes.client.trace_off();
         }
     }
 
@@ -1448,10 +969,10 @@ impl Session {
         //
         // At most one unanswered tick per session (sdk#174): a refused one is
         // benign, the next carries the time as it is then.
-        self.db.store_mut().send_tick(now);
+        self.db.store_mut().writes.send_tick(now);
         // And the continuation of a write the engine parked: it runs when
         // its client asks after it, and nothing else asks (sdk#174).
-        self.db.store_mut().ask_unheard(now);
+        self.db.store_mut().writes.ask_unheard(now);
         // THROUGH THE STORE'S OWN TICK, not straight to the copy.
         //
         // This called `copy.time_out(now)` directly, which does the rolling
@@ -1465,10 +986,10 @@ impl Session {
         // entry point to one of its fields is how: the copy is a field, and
         // calling it directly skipped every decision the store makes around
         // it.
-        let told = self.db.store_mut().tick();
+        let told = self.db.store_mut().writes.tick();
         // A write told `Lost` with no tries left fell (sdk#265): said by name,
         // never a row that just vanished.
-        let lost_gave_up = self.db.store_mut().take_lost_gave_up();
+        let lost_gave_up = self.db.store_mut().writes.take_lost_gave_up();
         for id in &lost_gave_up {
             self.unusable.push(format!("write {id} was told Lost with its {} tries spent and was not saved", craftworks_sdk::cached_store::WRITE_TRIES));
         }
@@ -1477,6 +998,7 @@ impl Session {
         let unread: Vec<serde_json::Value> = self
             .db
             .store_mut()
+            .writes
             .take_unread()
             .into_iter()
             .map(|u| {
@@ -1493,37 +1015,33 @@ impl Session {
             })
             .collect();
         // A forced write told Lost falls, not re-sent (sdk#235): named.
-        let forced_lost = self.db.store_mut().take_forced_lost();
+        let forced_lost = self.db.store_mut().writes.take_forced_lost();
         for id in &forced_lost {
             self.unusable.push(format!("write {id} was forced past its reads and was lost; it was not sent again, because a forced write cannot be re-checked"));
         }
         // How many writes the engine took forced past their reads: the
         // transitional form, as a number a person can see (sdk#281 removes
         // `Any` at zero). Only the SDK's store-level batches build one.
-        let forced_writes = self.page.as_ref().map(|p| p.forced_writes()).unwrap_or(0);
-        // A LOCAL change is a change too: a write that rolled back moves the
-        // rows a component is showing, and the component finds out the same
-        // way it finds out about anybody else's.
-        self.note_local(&told);
-        // A load nobody answered ends as UNAVAILABLE rather than waiting for
-        // ever. The read parked on it gets a fact; a page can show it.
-        // A load the page's own cold read holds ends by its blocks' deadlines
-        // (the cold reader's), not by the load's age.
-        let cold = &self.cold;
-        self.loads.time_out_except(now, |id| cold.holds(id));
-        self.cold.tick(now);
-        if let Some(p) = self.page.as_mut() {
+        let forced_writes = self.page().map(|p| p.forced_writes()).unwrap_or(0);
+        // A rolled-back write's keys reach its bindings through
+        // `take_state_changed`, as every own-write state change does.
+        //
+        // A ticket nobody ended ends NOT_ANSWERING, and one ended and never
+        // resumed lets its root go (`TICKET_LIFE_MS`).
+        self.db.store_mut().tick(now);
+        if let Some(p) = self.page_mut() {
             p.tick(page::Ms(now));
         }
         self.pump_page();
-        self.pump_cold();
         // sdk#143/#144: a conflicted update or define is RE-RUN on the new
         // base. What it must load first goes through the ordinary load path
         // (and its timeout); what it could not keep is the app's news.
-        let rerun = self.db.rerun(now, self.loads.budget_ms);
-        for (lo, hi) in rerun.load {
-            let _ = self.decide::<()>(Err(DbError::NotLoaded { lo, hi }));
-        }
+        // What it must read first is fetched by the walk that stopped on it
+        // (its ticket, unwaited: the next tick walks again), bounded by the
+        // ticket's own lifetime.
+        let rerun = self.db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS);
+        self.db.store_mut().take_ticket();
+        self.db.store_mut().unpin();
         let reruns: Vec<serde_json::Value> = rerun
             .events
             .iter()
@@ -1554,6 +1072,7 @@ impl Session {
         let conflicts: Vec<serde_json::Value> = self
             .db
             .store_mut()
+            .writes
             .take_conflicts()
             .into_iter()
             .filter(|c| !rerun.taken.contains(&c.write_id))
@@ -1571,6 +1090,7 @@ impl Session {
         let superseded: Vec<serde_json::Value> = self
             .db
             .store_mut()
+            .writes
             .take_superseded()
             .into_iter()
             .map(|s| {
@@ -1590,7 +1110,7 @@ impl Session {
                 "count": forced_writes,
                 "line": format!("{forced_writes} write{} forced past their reads (by the SDK's store-level batches)", if forced_writes == 1 { "" } else { "s" }),
             },
-            "loadsInFlight": self.loads.in_flight(),
+            "loadsInFlight": self.db.store().open_tickets(),
             "conflicts": conflicts,
             "superseded": superseded,
             "reruns": reruns,
@@ -1616,7 +1136,8 @@ impl Session {
     /// pumps the socket after this, and a page that is already gone did what
     /// it could.
     pub fn flush(&mut self) {
-        self.db.store_mut().send_flush();
+        self.db.store_mut().writes.send_flush();
+        self.pump_page();
     }
 
     /// How often a page should call [`Session::tick`], in milliseconds.
@@ -1630,8 +1151,6 @@ impl Session {
 }
 
 
-/// The request ids preload uses, kept away from the app's own.
-const PRELOAD_REQ_BASE: u64 = 1 << 32;
 
 /// A `DbError` as JavaScript sees it: a stable `code` and a message that is
 /// for a person to read, never for code to branch on.
@@ -1648,10 +1167,8 @@ impl Session {
     }
 
     /// A stored name back to what this app calls it; `None` for another app's.
-    /// `stored` came out of the tree (a key's domain, a watch key, a schema),
-    /// which is where stored names live.
-    fn own_name(&self, stored: &str) -> Option<craftworks_sdk::app::AppName> {
-        craftworks_sdk::app::own(self.app.as_deref(), &craftworks_sdk::app::StoredName::of_tree(stored.to_string()))
+    fn own_name(&self, stored: &craftworks_sdk::app::StoredName) -> Option<craftworks_sdk::app::AppName> {
+        craftworks_sdk::app::own(self.app.as_deref(), stored)
     }
 }
 

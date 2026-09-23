@@ -1,11 +1,13 @@
-// THE REFRESH PATH: what makes a binding show data it did not have.
+// THE LIVE PATH: what makes a binding show data it did not have.
 //
 // A binding's `reload` used to read the LOCAL COPY and return early when its
-// root had not moved. The copy's root moves only when a delta or a page
-// arrives — and nothing sent `ChangesSince`, so the root never moved, a
-// loaded range was always answered from cache, and a tab that made no write
-// could never see another's. The engine had the mechanism and
-// `CachedStore::on_delta` had the mechanism; no line joined them.
+// root had not moved — and nothing moved the copy's root, so a tab that made
+// no write could never see another's. There is no copy now (READ-STATE): a
+// read walks the engine's tree, and on a head move the SESSION says which
+// LIVE ranges changed (the tree's diff from each binding's `RenderedAt`,
+// `LiveBindings`, tested natively in testkit/tests/read_state_model.rs). What
+// this pins is the JavaScript half: the page asks the session on every
+// message, and re-runs exactly the bindings it names.
 //
 // Driven through the ENTRY with a fake socket playing the engine, because
 // that is the path an app takes and the one every previous gate missed.
@@ -21,53 +23,37 @@ const t = async (name, fn) => {
 const settle = () => new Promise(r => setTimeout(r, 10));
 
 /**
- * A session that records what CROSSED and can be handed an answer.
- *
- * `asks` counts `ChangesSince` requests, which is the measurement: a binding
- * that never asks cannot be told.
+ * A session whose tree can MOVE, and that names a bound domain as changed
+ * only when it did — as `take_stale` does over the tree's diff.
  */
 function engineRaw() {
-  let rows = [], changed = [], bound = new Set(), asks = 0, foreign = 0;
-  const asked = new Set();
-  let pending = null;        // a delta the engine is holding, until asked
+  let rows = [], changed = [], bound = new Set(), foreign = 0, told = 0;
   const session = {
     url: () => "ws://127.0.0.1:17509/",
     set_app() {}, // the app a session is (the forest ruling); a fake needs no namespace
     outbound: () => [], sent() {}, reconnected() {}, provision() {},
-    take_progress: () => "[]", take_loads: () => "[]",
+    take_progress: () => "[]", take_loads: () => "[]", resume() {},
     provisioned: () => true, refused: () => "", exhausted: () => false, unusable: () => "[]",
     tick: () => JSON.stringify({ rolledBack: 0, stalled: null, loadsInFlight: 0 }),
     tick_ms: () => 7777, unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {},
     flush() {},
     bind: d => bound.add(d),
     unbind: d => bound.delete(d),
-    // THE ENGINE ONLY ANSWERS A QUESTION IT WAS ASKED.
-    //
-    // The first version of this fake set `changed` directly, so a delta
-    // arrived whether or not anything had sent `ChangesSince` — and deleting
-    // the send left all five tests green. A fake that answers unasked
-    // questions tests nothing about asking.
-    refresh_domain(d) { asks += 1; asked.add(d); },
     scan: () => JSON.stringify(rows),
     root: () => `root-${rows.length}`,
     put: () => { rows = [...rows, { id: `p${rows.length}`, updated: 1 }]; return "{}"; },
     live_mode: () => JSON.stringify({ mode: "HeadSubscribed", why: "", foreignNotifications: foreign }),
     take_stale() {
-      // Deliver a held delta ONLY if that domain asked since it was held.
-      if (pending && asked.has(pending.domain)) {
-        rows = pending.newRows;
-        changed = [pending.domain];
-        asked.delete(pending.domain);
-        pending = null;
-      }
-      const c = changed; changed = [];
+      told += 1;
+      const c = changed.filter(d => bound.has(d)); changed = [];
       return JSON.stringify(c);
     },
-    /// The engine HOLDS a delta. It is delivered only to a domain that
-    /// actually asked — which is the whole thing under test.
-    delta(domain, newRows) { pending = { domain, newRows }; },
-    emptyDelta() { pending = null; },
-    asks: () => asks,
+    take_state_changed: () => "[]",
+    /// Another tab's head is adopted: `domain`'s rows are now `newRows`.
+    moved(domain, newRows) { rows = newRows; changed.push(domain); },
+    /// A head move that changed nothing this page shows.
+    movedElsewhere() {},
+    told: () => told,
   };
   return {
     version: () => "0", buildInfo: () => "{}", blockId: () => "", parseBlockId: () => "{}",
@@ -92,40 +78,38 @@ async function openDb(raw) {
   return { db, deliver };
 }
 
-await t("**a head move makes a live binding ASK, and the delta shows**", async () => {
+await t("**a head move the session names re-runs a live binding, and the new rows show**", async () => {
   const raw = engineRaw();
   const { db, deliver } = await openDb(raw);
   const b = db.bind("tasks", { live: true });
   await settle();
-  const asksBefore = raw.__s.asks();
+  const toldBefore = raw.__s.told();
 
-  // The node says the head moved; the engine answers with one new row.
-  raw.__s.delta("tasks", [{ id: "from-A", updated: 2 }]);
+  // Another tab's head is adopted, and it changed `tasks`.
+  raw.__s.moved("tasks", [{ id: "from-A", updated: 2 }]);
   deliver();
   await settle();
 
-  assert.ok(raw.__s.asks() > asksBefore,
-    "nothing sent ChangesSince, so the engine was never asked what changed — " +
-    "a binding that does not ask cannot be told");
+  assert.ok(raw.__s.told() > toldBefore, "the page never asked the session which LIVE ranges changed");
   assert.deepEqual(b.getSnapshot(), [{ id: "from-A", updated: 2 }],
-    "the binding did not show the row the delta carried — with no app call, which is the point");
+    "the binding did not show the rows the head move carried — with no app call, which is the point");
 });
 
-await t("THE CONTROL: no answer, no change, and liveMode says so", async () => {
+await t("THE CONTROL: a head move that changed nothing shown re-renders nothing, and liveMode says so", async () => {
   // Without this, a binding that re-rendered on every notification would
-  // pass the test above whether or not a delta ever arrived.
+  // pass the test above whether or not its range changed.
   const raw = engineRaw();
   const { db, deliver } = await openDb(raw);
   const b = db.bind("tasks", { live: true });
   await settle();
   const before = b.getSnapshot();
 
-  raw.__s.emptyDelta();      // the engine answers: nothing moved
+  raw.__s.movedElsewhere();
   deliver();
   await settle();
 
   assert.strictEqual(b.getSnapshot(), before,
-    "an empty delta re-rendered the binding; every screen would re-render on every notification about anything");
+    "a head move that changed nothing re-rendered the binding; every screen would re-render on every notification about anything");
   assert.equal(typeof db.liveMode().why, "string");
 });
 
@@ -136,7 +120,7 @@ await t("a PLAIN binding takes out no watch and is not re-run by a head move", a
   await settle();
   const before = b.getSnapshot();
 
-  raw.__s.delta("tasks", [{ id: "from-A", updated: 2 }]);
+  raw.__s.moved("tasks", [{ id: "from-A", updated: 2 }]);
   deliver();
   await settle();
 
@@ -156,7 +140,7 @@ await t("a person's OWN write shows at once, without waiting for the network", a
   await settle();
 
   assert.equal(b.getSnapshot().length, 1,
-    "a write changed base+pending but not the root, so the component never re-rendered on its own write");
+    "the component never re-rendered on its own write");
   assert.ok(fired > 0, "no listener was called for the client's own write");
 });
 

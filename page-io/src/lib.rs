@@ -231,6 +231,22 @@ const UNHELD_ROOT: [u8; 32] = [0xA5; 32];
 /// sign ids (from 1) and from the `Held` ids (from 2³¹).
 const PROVISION_ID: u32 = (1 << 31) - 1;
 
+/// The page's I/O as the store's host (READ-STATE): a call on the server is
+/// carried out at once — its node ops framed, its replies kept for the client.
+impl page::server::Host for PageIo {
+    fn with_server<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let r = f(&mut self.server);
+        self.pump();
+        r
+    }
+    fn client(&mut self, frame: &[u8]) {
+        PageIo::client(self, frame);
+    }
+    fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        PageIo::take_replies(self)
+    }
+}
+
 impl PageIo {
     pub fn new(server: Server, art: Artefacts) -> PageIo {
         let register = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(

@@ -1393,6 +1393,18 @@ impl Page {
         &self.signer_records
     }
 
+    /// The WARM root: this page's accepted writes applied, published or not
+    /// (READ-STATE, design B). What an own-tree walk reads.
+    pub fn warm_root(&self) -> Cid {
+        self.engine.root()
+    }
+
+    /// Walk the tree at `root` over the blocks this page holds, now
+    /// (`engine::Engine::walk`).
+    pub fn walk(&self, root: &Cid, walk: &engine::read::Walk) -> engine::read::Walked {
+        self.engine.walk(root, walk)
+    }
+
     /// The blocks the page holds.
     pub fn blocks(&self) -> &PageBlocks {
         &self.blocks

@@ -64,23 +64,23 @@ const TRANSPORT_ONLY: &[&str] = &[
     "preload",
     "trace",
     "trace_on",
-    // How a parked read learns its range arrived. An in-memory store has no
-    // range that has not arrived, so there is nothing for these to report
-    // there — they are connection mechanics, not data.
+    // How a parked read learns the blocks its walk needed arrived, and how it
+    // RESUMES at that ticket's root (READ-STATE). An in-memory store holds
+    // every block, so there is nothing for these to report there — they are
+    // connection mechanics, not data.
     "take_loads",
+    "resume",
     "loads_in_flight",
     // WHICH APP this session is, in the person's ONE tree (the forest
     // ruling): the prefix that keeps apps apart on a shared register. An
     // in-memory store is one app's data and nobody else's, so there is no
     // tree to divide. `open({app})` requires it and calls it once.
     "set_app",
-    // COLD READS IN THE PAGE: how ranges this node does not hold are fetched
-    // — the page's own GETs, and their log. An in-memory store holds every
-    // block; there is nothing cold to fetch or to report on.
+    // The Session's own cold reads are gone (sdk#258); asking for them is
+    // refused by name. An in-memory store has nothing cold to fetch.
     "set_cold_reads",
-    "take_cold_log",
-    // The cold reader's one-shot timer: when its earliest fetch is due, and
-    // its clock alone at that moment.
+    // Page-io's one-shot timer: when its next node call is due, and its clock
+    // alone at that moment.
     "cold_due_ms",
     "cold_tick",
     // PUBLISHING a contract the app names (builder#104: its web container),
@@ -114,10 +114,6 @@ const TRANSPORT_ONLY: &[&str] = &[
     // The NAME of what a binding watches — a domain, or one parent's band
     // (sdk#137). Session bookkeeping for `bind`, not a read of data.
     "watch_key",
-    // Ask the engine what changed in a domain since this client last looked.
-    // An in-memory store IS the tree: nothing can have changed in it that
-    // this client did not do, so there is nothing to ask.
-    "refresh_domain",
     // Writes made and not yet PUBLISHED, for the page's unsaved-changes
     // guard (sdk#163). An in-memory store is not waiting on a network: it has
     // nothing "not yet published", only everything, lost with the tab — a

@@ -18,6 +18,8 @@ use craftworks_sdk::id::{created_ms, loc_from_hex, to_hex};
 use craftworks_sdk::*;
 use serde_json::{json, Map, Value};
 
+mod support;
+
 /// A clock the test sets.
 struct At(std::rc::Rc<std::cell::Cell<u64>>);
 impl Env for At {
@@ -110,39 +112,40 @@ fn two_sessions_creating_the_same_slot_store_exactly_one_record() {
 /// NOT LOADED IS NOT ABSENT (architect's amendment 2).
 ///
 /// A browser session starts holding nothing. `create_at` that read an
-/// unloaded slot as absent would write Preview's copy over the published
-/// record — including one edited since it was published.
+/// unread slot as absent would write Preview's copy over the published
+/// record — including one edited since it was published. The page's store
+/// WALKS the tree for the slot (READ-STATE), so a fresh tab on the node
+/// either answers from the published tree or waits on the blocks it needs —
+/// and writes nothing before it has looked.
 #[test]
 fn a_fresh_session_over_a_published_record_does_not_write_until_it_has_looked() {
-    // The published backend: one record, edited after it was published.
-    let mut published = mem();
-    published.create_at("tasks", slot(), &fields(json!({ "title": "as published" }))).unwrap();
+    let node = testkit::PageNode::new();
+    // The publisher: one record, edited after it was published.
+    let mut published = support::page_tab::Tab::open(&node, clock(NOW).0, [1, 1, 1, 1]);
+    published.call(|d| d.define("tasks", &task())).unwrap();
+    published.call(|d| d.create_at("tasks", slot(), &fields(json!({ "title": "as published" })))).unwrap();
     let id = to_hex(&slot());
-    published.update("tasks", loc_from_hex(&id).unwrap(), &fields(json!({ "title": "edited since" }))).unwrap();
-    let everything = published.store_mut().scan(b"", &[0xFF; 64], false, usize::MAX).unwrap();
-    let root = published.store_mut().root().unwrap();
+    published.call(|d| d.update("tasks", loc_from_hex(&id).unwrap(), &fields(json!({ "title": "edited since" })))).unwrap();
+    published.seconds(5);
+    assert!(published.db.store().writes.unsaved_writes() == 0, "the publisher's writes did not publish");
 
-    // A fresh session: everything loaded EXCEPT the domain's records.
-    let (mut s, _clock) = testkit::cached_store();
-    let (lo, hi) = Db::<CachedStore, At>::domain_range("tasks");
-    let outside: Vec<_> = everything.iter().filter(|(k, _)| k[..] < lo[..] || k[..] >= hi[..]).cloned().collect();
-    let inside: Vec<_> = everything.iter().filter(|(k, _)| k[..] >= lo[..] && k[..] < hi[..]).cloned().collect();
-    s.on_page(b"", &lo, outside.clone(), root);
-    s.on_page(&hi, &[0xFF; 64], Vec::new(), root);
-    let mut d = Db::new(s, clock(NOW).0, [9, 9, 9, 9]);
-
-    let e = d
-        .create_at("tasks", slot(), &fields(json!({ "title": "Preview's copy" })))
-        .expect_err("an unloaded slot was taken for absent");
-    assert!(matches!(e, DbError::NotLoaded { .. }), "{e:?}");
-    assert_eq!(d.store().copy.pending_writes(), 0, "a write went out before the slot was read");
-
-    // Loaded: the record is there, and it is the EDITED one, untouched.
-    d.store_mut().on_page(&lo, &hi, inside, root);
-    let again = d.create_at("tasks", slot(), &fields(json!({ "title": "Preview's copy" }))).unwrap();
+    // A fresh session on the same node: its own page, holding nothing.
+    let mut d = support::page_tab::Tab::open(&node, clock(NOW).0, [9, 9, 9, 9]);
+    // Its FIRST attempt, as made: either answered from the tree, or refused
+    // for want of blocks — and then nothing is written.
+    let first = d.db.create_at("tasks", slot(), &fields(json!({ "title": "Preview's copy" })));
+    if let Err(e) = &first {
+        assert!(matches!(e, DbError::NotLoaded { .. }), "{e:?}");
+        assert_eq!(d.db.store().writes.copy.pending_writes(), 0, "a write went out before the slot was read");
+    }
+    let _ = d.db.store_mut().decide(first);
+    // Asked the way a page asks, until it has looked: the record is there,
+    // and it is the EDITED one, untouched.
+    let again = d.call(|db| db.create_at("tasks", slot(), &fields(json!({ "title": "Preview's copy" })))).unwrap();
     let CreateAt::Exists(held) = again else { panic!("wrote over the published record: {again:?}") };
     assert_eq!(held.fields["title"], "edited since");
-    assert_eq!(d.store().copy.pending_writes(), 0, "stored bytes changed");
+    assert_eq!(d.db.store().writes.copy.pending_writes(), 0, "stored bytes changed");
+    assert!(d.log.borrow().sends.is_empty(), "the fresh session sent a write: {:?}", d.log.borrow().sends);
 }
 
 /// Minted and derived keys, one domain, listed by creation time.
