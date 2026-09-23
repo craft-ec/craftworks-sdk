@@ -12,8 +12,9 @@
 //! * §5.5 BACK-OFF — a timeout doubles the RTO (once per tick, however many
 //!   timed out in it), until a call answers on its first send;
 //! * the WINDOW — start [`WINDOW_INITIAL`], +1 per answer below the slow-start
-//!   threshold, +1 per window above it, halved (≥ 1) on a timeout, the
-//!   threshold set there.
+//!   threshold, +1 per window above it, halved on a LOSS EPISODE (the page
+//!   decides what one is: a GET's first timeout, sent after the last halving;
+//!   sdk#345), the threshold set there, never below [`WINDOW_FLOOR`].
 
 /// Before any sample (RFC 6298 §2.1).
 pub const RTO_INITIAL_MS: f64 = 1_000.0;
@@ -24,6 +25,9 @@ pub const RTO_FLOOR_MS: f64 = 100.0;
 pub const RTO_MAX_MS: f64 = 60_000.0;
 /// Block GETs in flight to start with.
 pub const WINDOW_INITIAL: f64 = 4.0;
+/// Block GETs the window always allows (sdk#345): one silent block never
+/// holds the whole pipe, so the reads behind it keep moving.
+pub const WINDOW_FLOOR: f64 = 2.0;
 
 #[derive(Debug, Clone)]
 pub struct Rto {
@@ -79,29 +83,44 @@ impl Rto {
 pub struct Window {
     w: f64,
     ssthresh: Option<f64>,
+    /// When the current loss episode began (the last halving): a GET sent
+    /// before it that is lost is part of that episode (sdk#345).
+    loss_since: u64,
 }
 
 impl Default for Window {
     fn default() -> Window {
-        Window { w: WINDOW_INITIAL, ssthresh: None }
+        Window { w: WINDOW_INITIAL, ssthresh: None, loss_since: 0 }
     }
 }
 
 impl Window {
     /// How many GETs may be in flight now.
     pub fn size(&self) -> usize {
-        self.w.max(1.0).floor() as usize
+        self.w.max(WINDOW_FLOOR).floor() as usize
     }
 
     /// A GET was answered.
     pub fn opened(&mut self) {
-        let w = self.w.max(1.0);
+        let w = self.w.max(WINDOW_FLOOR);
         self.w = if self.ssthresh.is_some_and(|t| w >= t) { w + 1.0 / w } else { w + 1.0 };
     }
 
-    /// A GET timed out this tick: halve, and remember where.
+    /// A GET sent at `sent_at` was lost at `now`, on its `attempt`-th send.
+    /// The window halves once per LOSS EPISODE (sdk#345, QUIC's rule): only a
+    /// GET's FIRST timeout, and only of a GET sent after the last halving. A
+    /// silent block timing out again backs off its own RTO and nothing else;
+    /// halving on every re-timeout shrank a window 9 -> 1 behind ONE block.
+    pub fn lost(&mut self, sent_at: u64, attempt: u32, now: u64) {
+        if attempt == 1 && sent_at >= self.loss_since {
+            self.halved();
+            self.loss_since = now;
+        }
+    }
+
+    /// Halve (never below the floor), and remember where.
     pub fn halved(&mut self) {
-        let half = (self.w.max(1.0) / 2.0).max(1.0);
+        let half = (self.w.max(WINDOW_FLOOR) / 2.0).max(WINDOW_FLOOR);
         self.w = half;
         self.ssthresh = Some(half);
     }

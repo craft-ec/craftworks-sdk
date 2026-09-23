@@ -645,16 +645,18 @@ impl Page {
         self.now = now;
         let late: Vec<Waiting> =
             self.deadlines.iter().filter(|(_, d)| now >= d.at).map(|(w, _)| w.clone()).collect();
-        // RFC 6298 §5.5 — ONCE per tick, however many timed out — and a GET
-        // that timed out halves the window. A PARKED GET coming due timed
-        // nothing out: the node answered it.
+        // RFC 6298 §5.5 — ONCE per tick, however many timed out. A PARKED GET
+        // coming due timed nothing out: the node answered it.
         let timed_out = |w: &Waiting| self.deadlines.get(w).is_some_and(|d| d.sent);
-        let (any, a_get) = (late.iter().any(timed_out), late.iter().any(|w| matches!(w, Waiting::Get(_)) && timed_out(w)));
-        if any {
+        if late.iter().any(timed_out) {
             self.rto.timed_out();
         }
-        if a_get {
-            self.window.halved();
+        // Every GET that timed out is LOST; the window decides whether that
+        // begins a loss episode (`rto::Window::lost`).
+        for w in &late {
+            if let (Waiting::Get(_), Some(d)) = (w, self.deadlines.get(w).filter(|d| d.sent)) {
+                self.window.lost(d.sent_at, d.attempt, now);
+            }
         }
         for w in late {
             let d = self.deadlines.remove(&w).expect("listed");
@@ -662,7 +664,7 @@ impl Page {
             // holds (a repair rebuilt it), ends here.
             if let Waiting::Get(id) = w {
                 if !d.sent && (self.blocks.get(&id).is_some() || !self.engine.awaits_block(&id)) {
-                    self.attempt_of.remove(&w);
+                    self.drop_get(id);
                     continue;
                 }
             }
@@ -675,7 +677,15 @@ impl Page {
                 // `Unavailable` ("block … could not be had"). The attempt
                 // count carries over, so "not answering for N s" counts
                 // from the first send.
-                Waiting::Get(id) => self.send(Waiting::Get(id), op),
+                // It is LOST: it left the in-flight count when its deadline
+                // was removed, and its re-send QUEUES for a place like any
+                // new ask (sdk#345) -- behind the GETs already waiting, and
+                // never outside the window (rule 9: every byte is paced).
+                Waiting::Get(id) => {
+                    if !self.get_queue.contains(&id) {
+                        self.get_queue.push_back(id);
+                    }
+                }
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
                 // A landing's request, or this commit's.
@@ -706,6 +716,8 @@ impl Page {
                 }
             }
         }
+        // The lost GETs queued above take free places, in queue order.
+        self.fill_gets();
         for (id, bytes) in std::mem::take(&mut self.put_again) {
             self.send(Waiting::Put(id), Op::Put { id, bytes });
         }
@@ -1351,10 +1363,31 @@ impl Page {
     }
 
     /// A GET's answer: [`Page::answered`], and which attempt it answered.
+    /// A LOST GET (timed out, its re-send queued for a place: sdk#345) is
+    /// still asked: a late answer to an earlier send answers it, and its
+    /// queued re-send is dropped. It held no place and is no RTO sample.
     fn answered_get(&mut self, id: Cid) -> Option<u32> {
-        let attempt = self.deadlines.get(&Waiting::Get(id))?.attempt;
-        self.answered(&Waiting::Get(id))?;
+        if let Some(d) = self.deadlines.get(&Waiting::Get(id)) {
+            // On the wire: `answered` takes the Karn sample and opens the
+            // window, which a queued GET must not do.
+            let attempt = d.attempt;
+            self.answered(&Waiting::Get(id))?;
+            self.drop_get(id);
+            return Some(attempt);
+        }
+        let attempt = self.get_queue.contains(&id).then(|| self.attempt_of.get(&Waiting::Get(id)).copied()).flatten()?;
+        self.drop_get(id);
         Some(attempt)
+    }
+
+    /// A GET ENDS: THE one definition of that. It leaves every holder a GET
+    /// has -- its deadline (on the wire or parked), the attempt its re-send
+    /// would continue from, and its place in the window's queue. An answer,
+    /// a withdrawal and a block the page already holds all end a GET here.
+    fn drop_get(&mut self, id: Cid) {
+        self.deadlines.remove(&Waiting::Get(id));
+        self.attempt_of.remove(&Waiting::Get(id));
+        self.get_queue.retain(|q| *q != id);
     }
 
     /// The node ANSWERED a GET without the block (NotFound, or bytes that are
@@ -1523,11 +1556,9 @@ impl Page {
                 .chain(self.get_queue.iter().copied())
                 .filter(|id| self.blocks.get(id).is_some()),
         );
-        for id in &ended {
-            self.deadlines.remove(&Waiting::Get(*id));
-            self.attempt_of.remove(&Waiting::Get(*id));
+        for id in ended {
+            self.drop_get(id);
         }
-        self.get_queue.retain(|id| !ended.contains(id));
     }
 
     /// What the engine publishes now, as a head.
@@ -2062,5 +2093,304 @@ mod not_sent {
             p.answer(Answer::NotSent { op: op.clone(), why: "refused".into() }, Ms(1));
             assert!(!p.deadlines.contains_key(&w), "a NotSent for {op:?} left {w:?} waiting");
         }
+    }
+}
+
+#[cfg(test)]
+mod window_loss {
+    //! THE GET WINDOW UNDER LOSS (sdk#345, the architect's construction): one
+    //! silent block must not collapse the window and starve every other read.
+    //! Measured on the real network: the window went 9 -> 5 -> 2 -> 1 as ONE
+    //! block timed out again and again, and the next head's root sat queued
+    //! behind it for 160 s.
+    use super::*;
+    use freenet_prolly::{block_id, kind};
+
+    /// `n` raw blocks: their ids and bytes.
+    fn blocks(n: usize) -> Vec<(Cid, Vec<u8>)> {
+        (0..n)
+            .map(|i| {
+                let bytes = format!("block {i}").into_bytes();
+                (block_id(kind::RAW, &bytes), bytes)
+            })
+            .collect()
+    }
+
+    /// A fake node over `held`: every GET it is sent is answered with the
+    /// block after 5 ms, unless the block is `silent` or the node is silent
+    /// (`quiet_until`). Checks after every step that the GETs on the wire
+    /// never exceed the window, and returns the most seen above it.
+    struct Node_ {
+        held: BTreeMap<Cid, Vec<u8>>,
+        silent: BTreeSet<Cid>,
+        quiet_until: u64,
+        /// Blocks answered after this many ms instead of 5.
+        slow: BTreeMap<Cid, u64>,
+        due: Vec<(u64, Answer)>,
+        sent: Vec<(u64, Cid)>,
+        over_window: usize,
+    }
+
+    impl Node_ {
+        fn new(held: &[(Cid, Vec<u8>)]) -> Node_ {
+            Node_ { held: held.iter().cloned().collect(), silent: BTreeSet::new(), quiet_until: 0, slow: BTreeMap::new(), due: Vec::new(), sent: Vec::new(), over_window: 0 }
+        }
+
+        /// Run `p` for `ms`, one ms at a time.
+        fn run(&mut self, p: &mut Page, now: &mut u64, ms: u64) {
+            for _ in 0..ms {
+                for op in p.take_ops() {
+                    if let Op::Get { id } = op {
+                        self.sent.push((*now, id));
+                        if !self.silent.contains(&id) && *now >= self.quiet_until {
+                            if let Some(bytes) = self.held.get(&id) {
+                                let delay = self.slow.get(&id).copied().unwrap_or(5);
+                                self.due.push((*now + delay, Answer::Got { id, bytes: bytes.clone() }));
+                            }
+                        }
+                    }
+                }
+                *now += 1;
+                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.due).into_iter().partition(|(t, _)| *t <= *now);
+                self.due = later;
+                for (_, a) in ready {
+                    p.answer(a, Ms(*now));
+                }
+                p.tick(Ms(*now));
+                self.over_window = self.over_window.max(p.gets_in_flight().saturating_sub(p.window.size()));
+            }
+        }
+    }
+
+    /// Ask for `id` at `now` (the page's clock is set first: a page that has
+    /// not ticked yet thinks it is 0, and would date the GET long past due).
+    fn ask(p: &mut Page, now: u64, id: Cid) {
+        p.now = now;
+        p.send(Waiting::Get(id), Op::Get { id });
+    }
+
+    /// ONE BLOCK SILENT FOR EVER, 20 AVAILABLE, asked one at a time while the
+    /// silent one keeps timing out: every one of the 20 is read, each within
+    /// a few RTOs of being asked -- never behind the silent block's backoff
+    /// (which reaches the 60 s ceiling), with the window at its floor.
+    /// Mutant "window floor 1" -> red: the silent block's re-send holds the
+    /// only place for its whole backoff.
+    #[test]
+    fn one_silent_block_does_not_starve_the_reads_behind_it() {
+        let all = blocks(21);
+        let (silent, rest) = (all[0].0, &all[1..]);
+        let mut node = Node_::new(&all);
+        node.silent.insert(silent);
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        // Earlier loss episodes have already taken the window to its floor:
+        // the place the floor keeps is the only one the reads get.
+        for _ in 0..3 {
+            p.window.halved();
+        }
+        assert_eq!(p.window.size(), rto::WINDOW_FLOOR as usize, "THE CONTROL: the window is not at its floor");
+        let mut now = 1_000u64;
+        ask(&mut p, now, silent);
+        // Let the silent block time out several times first: the window is
+        // under loss when the reads come.
+        node.run(&mut p, &mut now, 30_000);
+        let mut waited = Vec::new();
+        for (id, _) in rest {
+            let asked = now;
+            ask(&mut p, now, *id);
+            let mut t = 0;
+            while p.blocks.get(id).is_none() && t < 120_000 {
+                node.run(&mut p, &mut now, 100);
+                t += 100;
+            }
+            assert!(p.blocks.get(id).is_some(), "a block the node serves was not read in 120 s behind one silent block (window {})", p.window.size());
+            waited.push(now - asked);
+            node.run(&mut p, &mut now, 5_000);
+        }
+        let worst = *waited.iter().max().expect("20 reads");
+        println!("20 reads behind one silent block: waited {waited:?} ms, window {}", p.window.size());
+        assert!(worst <= 2_000, "a read waited {worst} ms behind one silent block: {waited:?}");
+        assert!(node.sent.iter().filter(|(_, id)| *id == silent).count() > 3, "THE CONTROL: the silent block did not keep timing out");
+    }
+
+    /// A LOST GET'S RE-SEND QUEUES BEHIND THE ASKS ALREADY WAITING, and a lost
+    /// GET leaves the in-flight count at once. Two silent blocks fill the
+    /// window's floor; a third ask waits. When the silent ones time out, the
+    /// waiting ask goes out FIRST. Mutant "re-send at once" (the old
+    /// `self.send` in `tick`) -> red: the silent re-sends take both places
+    /// again and the waiting ask never goes.
+    #[test]
+    fn a_lost_gets_resend_queues_behind_the_asks_already_waiting() {
+        let all = blocks(3);
+        let mut node = Node_::new(&all);
+        node.silent.extend([all[0].0, all[1].0]);
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.window.halved(); // 4 -> 2: the floor
+        assert_eq!(p.window.size(), 2, "THE CONTROL: the window is not at its floor");
+        let mut now = 1_000u64;
+        ask(&mut p, now, all[0].0);
+        ask(&mut p, now, all[1].0);
+        ask(&mut p, now, all[2].0);
+        assert_eq!(p.gets_in_flight(), 2);
+        assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![all[2].0], "THE CONTROL: the third ask did not wait");
+        node.run(&mut p, &mut now, 5_000);
+        assert!(p.blocks.get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
+        let first_resend = node.sent.iter().filter(|(_, id)| *id == all[0].0 || *id == all[1].0).nth(2).map(|(t, _)| *t).expect("a re-send");
+        let third = node.sent.iter().find(|(_, id)| *id == all[2].0).map(|(t, _)| *t).expect("the third ask went out");
+        assert!(third <= first_resend, "a lost GET was re-sent ({first_resend}) before the ask already waiting ({third})");
+    }
+
+    /// A LOST GET'S LATE ANSWER STILL ANSWERS IT. Three blocks the node
+    /// answers only after 1.5 s (past the 1 s first RTO) on a window of 2:
+    /// the first two time out and queue behind the third, and one of them is
+    /// still QUEUED when its first send's answer lands. That answer is taken,
+    /// and the queued re-send is dropped: each block is sent at most twice
+    /// and every one is read. Mutant "a queued GET's answer is ignored" ->
+    /// red: the block is sent again and read only a whole backoff later.
+    #[test]
+    fn a_lost_gets_late_answer_is_taken_while_its_resend_waits() {
+        let all = blocks(3);
+        let mut node = Node_::new(&all);
+        for (id, _) in &all {
+            node.slow.insert(*id, 1_500);
+        }
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.window.halved();
+        let mut now = 1_000u64;
+        for (id, _) in &all {
+            ask(&mut p, now, *id);
+        }
+        let mut queued_when_answered = false;
+        for _ in 0..3_000 {
+            let was_queued: Vec<Cid> = p.get_queue.iter().copied().filter(|q| p.attempt_of.contains_key(&Waiting::Get(*q))).collect();
+            node.run(&mut p, &mut now, 1);
+            queued_when_answered |= was_queued.iter().any(|id| p.blocks.get(id).is_some());
+        }
+        let sends: Vec<usize> = all.iter().map(|(id, _)| node.sent.iter().filter(|(_, s)| s == id).count()).collect();
+        println!("sends per block {sends:?}; a queued lost GET answered: {queued_when_answered}");
+        assert!(queued_when_answered, "THE CONTROL: no lost GET was still queued when its late answer landed");
+        assert!(all.iter().all(|(id, _)| p.blocks.get(id).is_some()), "not every block was read in 3 s: sends {sends:?}");
+        assert!(!p.get_queue.iter().any(|q| p.blocks.get(q).is_some()), "a block already read is still queued to be asked again");
+    }
+
+    /// ENDING A GET LEAVES NO TRACE, however it ends (`drop_get`, the one
+    /// definition). Two lost GETs are queued for a place with their attempt
+    /// kept: one is ended by its LATE ANSWER, the other by being WITHDRAWN
+    /// (its block is now held), and so is one still ON THE WIRE. None is left
+    /// in any of the three holders:
+    /// deadline, attempt, queue. Mutants "drop_get forgets one holder" (each
+    /// of the three) -> red.
+    #[test]
+    fn an_ended_get_is_in_no_holder() {
+        let all = blocks(4);
+        let mut node = Node_::new(&all);
+        let (late, withdrawn) = (all[0].0, all[1].0);
+        node.silent.extend([late, withdrawn, all[2].0, all[3].0]);
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.window.halved();
+        let mut now = 1_000u64;
+        // `late` and `withdrawn` take the floor's two places, time out, and
+        // queue behind the two asks that were waiting (which now hold the
+        // places, silent too).
+        for id in [late, withdrawn, all[2].0, all[3].0] {
+            ask(&mut p, now, id);
+        }
+        node.run(&mut p, &mut now, 1_100);
+        let holders = |p: &Page, id: Cid| {
+            (p.deadlines.contains_key(&Waiting::Get(id)), p.attempt_of.contains_key(&Waiting::Get(id)), p.get_queue.contains(&id))
+        };
+        for id in [late, withdrawn] {
+            assert!(p.get_queue.contains(&id) && p.attempt_of.contains_key(&Waiting::Get(id)) && !p.deadlines.contains_key(&Waiting::Get(id)), "THE CONTROL: {:?} is not a queued lost GET: {:?}", &id[..2], holders(&p, id));
+        }
+        // The late answer to `late`'s first send.
+        let bytes = all[0].1.clone();
+        p.answer(Answer::Got { id: late, bytes }, Ms(now));
+        assert!(p.blocks.get(&late).is_some(), "the late answer was not taken");
+        assert_eq!(holders(&p, late), (false, false, false), "a GET ended by its late answer left a trace (deadline, attempt, queue)");
+        // `withdrawn` (queued) and one ON THE WIRE: their blocks are held now
+        // (a repair rebuilt them), so nobody needs either GET.
+        let on_wire = all[2].0;
+        assert!(p.deadlines.get(&Waiting::Get(on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
+        p.blocks.insert(withdrawn, &all[1].1);
+        p.blocks.insert(on_wire, &all[2].1);
+        p.end_unneeded_gets();
+        assert_eq!(holders(&p, withdrawn), (false, false, false), "a withdrawn queued GET left a trace (deadline, attempt, queue)");
+        assert_eq!(holders(&p, on_wire), (false, false, false), "a withdrawn GET on the wire left a trace (deadline, attempt, queue)");
+    }
+
+    /// THE WINDOW HALVES ONCE PER LOSS EPISODE. One silent GET timing out
+    /// five times halves it ONCE (mutant "halve per re-timeout" -> red), and
+    /// three GETs sent together, lost in three different ticks, halve it ONCE
+    /// (mutant "every first timeout halves" -> red).
+    #[test]
+    fn the_window_halves_once_per_loss_episode() {
+        let all = blocks(40);
+        let mut node = Node_::new(&all);
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let mut now = 1_000u64;
+        // Grow the window: 30 answered GETs.
+        for (id, _) in &all[..30] {
+            ask(&mut p, now, *id);
+            node.run(&mut p, &mut now, 20);
+        }
+        node.run(&mut p, &mut now, 1_000);
+        let grown = p.window.size();
+        assert!(grown >= 16, "THE CONTROL: the window did not grow ({grown})");
+
+        // One silent block, five timeouts.
+        node.silent.insert(all[30].0);
+        ask(&mut p, now, all[30].0);
+        let mut t = 0;
+        while node.sent.iter().filter(|(_, id)| *id == all[30].0).count() < 6 && t < 600_000 {
+            node.run(&mut p, &mut now, 100);
+            t += 100;
+        }
+        assert_eq!(node.sent.iter().filter(|(_, id)| *id == all[30].0).count(), 6, "THE CONTROL: the silent GET did not time out five times");
+        let once = p.window.size();
+        println!("window {grown} -> {once} after one GET timed out five times");
+        assert_eq!(once, (grown / 2).max(2), "one silent GET's re-timeouts halved the window more than once");
+
+        // A fresh episode: three GETs sent 1 ms apart, all silent, lost in three ticks.
+        let before = p.window.size();
+        for (id, _) in &all[31..34] {
+            node.silent.insert(*id);
+            ask(&mut p, now, *id);
+            node.run(&mut p, &mut now, 1);
+        }
+        let firsts: BTreeSet<u64> = all[31..34]
+            .iter()
+            .map(|(id, _)| {
+                while node.sent.iter().filter(|(_, s)| s == id).count() < 2 {
+                    node.run(&mut p, &mut now, 1);
+                }
+                node.sent.iter().filter(|(_, s)| s == id).nth(1).map(|(t, _)| *t).expect("re-sent")
+            })
+            .collect();
+        println!("three lost GETs re-sent at {firsts:?}; window {before} -> {}", p.window.size());
+        assert!(before > 2, "THE CONTROL: the window is at its floor, a second halving could not show");
+        assert_eq!(p.window.size(), (before / 2).max(2), "three GETs lost in one episode halved the window more than once");
+    }
+
+    /// A 200-BLOCK SCAN WITH THE NODE SILENT FOR TWO RTO CEILINGS, then back:
+    /// the GETs on the wire never exceed the window, however many were lost
+    /// and re-sent, and every block is read once the node answers. Mutant
+    /// "re-send outside the window" -> red.
+    #[test]
+    fn a_scan_through_a_silent_node_never_sends_past_the_window() {
+        let all = blocks(200);
+        let mut node = Node_::new(&all);
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let mut now = 1_000u64;
+        node.quiet_until = now + 2 * rto::RTO_MAX_MS as u64;
+        for (id, _) in &all {
+            ask(&mut p, now, *id);
+        }
+        node.run(&mut p, &mut now, 2 * rto::RTO_MAX_MS as u64 + 600_000);
+        let read = all.iter().filter(|(id, _)| p.blocks.get(id).is_some()).count();
+        let lost = node.sent.len() - 200;
+        println!("200 blocks through a silent node: {read} read, {} GETs sent ({lost} re-sends), most over the window {}", node.sent.len(), node.over_window);
+        assert!(lost > 0, "THE CONTROL: nothing was lost and re-sent");
+        assert_eq!(node.over_window, 0, "GETs on the wire exceeded the window by {}", node.over_window);
+        assert_eq!(read, 200, "not every block was read after the node came back");
+        assert!(p.window.size() >= rto::WINDOW_FLOOR as usize);
     }
 }
