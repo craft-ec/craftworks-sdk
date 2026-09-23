@@ -81,7 +81,7 @@ fn spread(xs: &[u64]) -> String {
 /// something, that is a regression this catches, and an assertion says so
 /// better than a baseline file would.
 #[test]
-fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_five() {
+fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_eight() {
     let node = PageNode::new();
     let mut c = node.connect();
     c.client(&Request::Identity);
@@ -195,22 +195,23 @@ holding them — both are worth knowing.",
         "the DERIVED side must be non-zero, or the assertions above pass \
 because nothing was measured rather than because nothing was asked",
     );
-    // THE PAGE PATH'S COMMIT, per kind. On the Shell this was 3 (data
-    // nodes, head, parity: §7). The page makes the same three — two block
-    // PUTs and the head UPDATE — plus the two the design adds: the head is
-    // SIGNED by the signer delegate (one request; the engine no longer holds
-    // a key), and the head is READ after the UPDATE, because an UPDATE's
-    // answer says nothing about which record the Register kept (F56). Per
-    // kind, so a change to any one of them fails by name.
-    let want = vec![(Served::Put, 2), (Served::Get, 0), (Served::Head, 1), (Served::ReadHead, 1), (Served::Sign, 1)];
+    // THE PAGE PATH'S COMMIT, per kind. FIVE block PUTs since race put
+    // (COMMIT-LIFE §P): the changed path (root and leaf) AND the leaf's
+    // group's 3 parity, all in the SAME round -- before §P the parity went
+    // after the head and was counted elsewhere. Plus the head UPDATE, the
+    // signer's request (the engine holds no key), and the head READ after the
+    // UPDATE, because an UPDATE's answer says nothing about which record the
+    // Register kept (F56). Per kind, so a change to any one fails by name.
+    let want = vec![(Served::Put, 5), (Served::Get, 0), (Served::Head, 1), (Served::ReadHead, 1), (Served::Sign, 1)];
     assert!(
         commit_kinds.iter().all(|k| *k == want),
         "a commit took a different mix of node operations: {commit_kinds:?}. \
-Two PUTs (data, parity), one head UPDATE, one signer request, one head READ; \
-a change here is a change to what a write costs every app.",
+Five PUTs (root, leaf, the leaf group's 3 parity: one round, §P), one head \
+UPDATE, one signer request, one head READ; a change here is a change to \
+what a write costs every app.",
     );
     assert!(
-        commit_ops.iter().all(|&n| n == 5),
+        commit_ops.iter().all(|&n| n == 8),
         "a commit took a different number of node operations: {commit_ops:?}",
     );
     // Bytes are NOT asserted: they climb monotonically with the tree

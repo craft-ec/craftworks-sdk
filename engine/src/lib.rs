@@ -2951,11 +2951,23 @@ impl<B: Blocks> Engine<B> {
             let writes = std::mem::take(&mut self.folded);
             self.folded_bytes = 0;
             self.noop_published += writes.len() as u64;
-            // Nothing new was put: the tree it asks for is already on the
-            // network, so SAVED and BACKED_UP at once.
+            // Nothing new was put: the tree it asks for is the published one,
+            // so SAVED at once. BACKED_UP only when that tree IS: while a
+            // published commit's stragglers are still out (race put, §P) the
+            // no-op joins every pending Backing and hears ParityComplete when
+            // they drain -- the architect's #164 finding, not re-opened by
+            // race put.
             for w in &writes {
                 out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::Published });
-                out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
+                if self.backing.is_empty() {
+                    out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
+                } else {
+                    for b in self.backing.iter_mut() {
+                        if !b.writes.contains(w) {
+                            b.writes.push(*w);
+                        }
+                    }
+                }
             }
             for _ in 0..taken {
                 let q = self.queue.pop_front().expect("taken");
