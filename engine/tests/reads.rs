@@ -1308,7 +1308,7 @@ fn a_read_whose_block_keeps_missing_waits_then_answers_and_leaves_no_attempts_be
                 store.put(id, &bytes);
                 queue.extend(stepped!(e, Event::BlockArrived { id, bytes }));
             }
-            Effect::Reply { req_id, .. } if req_id == ReqId(1) => answered = true,
+            Effect::Reply { req_id: ReqId(1), .. } => answered = true,
             _ => {}
         }
     }
