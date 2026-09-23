@@ -183,6 +183,7 @@ impl PageNode {
             fetched: BTreeMap::new(),
             put_bytes: 0,
             replies: Vec::new(),
+            inbox: Vec::new(),
             asked: BTreeMap::new(),
         })))
     }
@@ -295,6 +296,9 @@ struct ConnState {
     /// Bytes this tab PUT to the node (block bodies), counted where they land.
     put_bytes: u64,
     replies: Vec<Vec<u8>>,
+    /// Replies not yet taken by a `PageStore` this tab is lent to
+    /// (`page::server::Host`).
+    inbox: Vec<Vec<u8>>,
     /// Requests sent and whether each has been answered, by `w<id>`/`r<id>`.
     asked: BTreeMap<String, bool>,
 }
@@ -400,6 +404,26 @@ impl PageConn {
     }
 }
 
+
+/// The tab as a `PageStore`'s host: every call runs the node to a standstill,
+/// as a tab's pump does, and the replies wait for the store to take them.
+impl page::server::Host for PageConn {
+    fn with_server<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let mut st = self.0.borrow_mut();
+        let r = f(&mut st.server);
+        let out = st.run();
+        st.inbox.extend(out);
+        r
+    }
+    fn client(&mut self, frame: &[u8]) {
+        let mut st = self.0.borrow_mut();
+        let out = st.frame(frame);
+        st.inbox.extend(out);
+    }
+    fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.0.borrow_mut().inbox)
+    }
+}
 
 impl ConnState {
     /// The page's clock now.

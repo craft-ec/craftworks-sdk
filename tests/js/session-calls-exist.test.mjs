@@ -102,5 +102,29 @@ t("and the two calls this gate was written for are among them", () => {
   }
 });
 
+/** Session methods whose parameters include a `bigint`, by name. */
+function bigintMethods(text, className) {
+  const open = text.indexOf(`export class ${className} {`);
+  const lines = text.slice(open).split("\n");
+  const end = lines.findIndex((l, i) => i > 0 && l === "}");
+  return new Set(lines.slice(1, end).map(l => /^\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/.exec(l)).filter(m => m && /bigint/.test(m[2])).map(m => m[1]));
+}
+
+t("**no session call the page makes takes a BigInt** — a JSON number would throw", () => {
+  // `resume(ticket: u64)` crossed as `bigint`; the page passed the number
+  // `take_loads` gave it, the call threw, and every read that waited on a
+  // ticket reported UNAVAILABLE. Every fake in this suite accepted it.
+  const big = bigintMethods(dts, "Session");
+  const called = new Set([...callsIn("js/session.js"), ...callsIn("js/engine-db.js")]);
+  const both = [...called].filter(n => big.has(n));
+  assert.deepEqual(both, [], `the page calls ${JSON.stringify(both)} with numbers, and the wasm declares a bigint parameter`);
+  assert.ok(called.has("resume"), "the reader no longer finds engine-db.js's resume() call, so it checks nothing");
+});
+
+t("THE CONTROL: a bigint parameter is found", () => {
+  const fake = "export class Session {\n  free(): void;\n  resume(ticket: bigint): void;\n}\n";
+  assert.deepEqual([...bigintMethods(fake, "Session")], ["resume"]);
+});
+
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");
 process.exit(failures ? 1 : 0);

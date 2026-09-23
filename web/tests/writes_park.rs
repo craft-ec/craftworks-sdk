@@ -139,7 +139,7 @@ fn control_the_reader_finds_real_bodies() {
 fn the_page_tick_goes_through_the_store_tick() {
     let body = body_of("tick");
     assert!(
-        body.contains("store_mut().tick()"),
+        body.contains("store_mut().writes.tick()"),
         "`Session::tick` does not call the store's own tick. Whatever it calls \
          instead, everything `CachedStore::tick` decides — draining the outbox \
          of writes the engine refused `Busy`, which nothing else re-sends — \
@@ -181,9 +181,8 @@ fn control_the_tick_body_is_really_read() {
 fn the_decision_is_delegated_to_the_sdk() {
     let body = body_of("decide");
     assert!(
-        // `decide_with` is the SDK's `decide` with the page's cold reads
-        // offered the load first — the decision is still the SDK's.
-        body.contains("craftworks_sdk::decide(") || body.contains("craftworks_sdk::decide_with("),
+        // `PageStore::decide` (READ-STATE): the ticket is the walk's fetch.
+        body.contains("self.db.store_mut().decide(r)"),
         "`Session::decide` no longer calls the SDK's. Inline here, nothing native can \
          reach it: `Session` is #[wasm_bindgen] in a cdylib, so the only test that could \
          run it is a fake session in JavaScript — which compiles this file and runs none \

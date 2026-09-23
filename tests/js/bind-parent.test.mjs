@@ -70,8 +70,7 @@ const recordingSession = () => {
   const s = {
     asked: [], bound: [], stale: [],
     watch_key: (d, p) => `${d}#${p}`,
-    bind: k => s.bound.push(k), unbind: () => {},
-    refresh_domain: k => s.asked.push(["refresh", k]),
+    bind: k => s.bound.push(k), unbind: () => {}, rendered: k => s.asked.push(["rendered", k]),
     children: (d, p) => { s.asked.push(["children", d, p]); return "[]"; },
     scan: d => { s.asked.push(["scan", d]); return "[]"; },
     take_stale: () => { const out = s.stale; s.stale = []; return JSON.stringify(out); },
@@ -88,7 +87,6 @@ await t("**engine: a parented binding reads its band and WATCHES its band**", as
   assert.equal(b.parent, P);
   assert.ok(s.asked.some(a => a[0] === "children" && a[2] === P), `asked ${JSON.stringify(s.asked)}`);
   assert.ok(!s.asked.some(a => a[0] === "scan"), "the band binding scanned the domain");
-  assert.ok(s.asked.some(a => a[0] === "refresh" && a[1] === `item#${P}`), "it asked what changed in the DOMAIN, not its band");
   assert.deepEqual(s.bound, [`item#${P}`], "it watches something other than its band");
 });
 

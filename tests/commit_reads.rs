@@ -1,15 +1,16 @@
-//! M2 on the DELEGATE path (sdk#148's SDK half): every `Db` write says what it
-//! READ, the Shell hands the reads to the engine, and the engine refuses a
-//! write whose read no longer holds. The client is told `Failed` here — the
-//! delegate path says `Conflict` only once v5 is current (main's ruling: an
-//! older v4 build would drop the new reply and time out), and the Shell NEVER
-//! sends `Conflicted`. Two sessions on one node.
+//! M2 (sdk#148's SDK half): every `Db` write says what it READ, the page's
+//! Server hands the reads to its engine, and the engine refuses a write whose
+//! read no longer holds. Two tabs on one node, each its own page and engine;
+//! each reads by WALKING its own engine's tree (READ-STATE, design B), so a
+//! tab that has not adopted the other's head reads — and writes from — its
+//! older view.
 
 use craftworks_sdk::store::{Reads, RowState};
 use craftworks_sdk::*;
 use serde_json::json;
-use std::collections::BTreeMap;
-use testkit::page_node::{PageConn, PageNode};
+use testkit::page_node::PageNode;
+
+mod support;
 
 struct At(u32);
 impl Env for At {
@@ -22,82 +23,11 @@ impl Env for At {
     }
 }
 
-const LOAD: u64 = 1;
-const EVERYTHING: [u8; 64] = [0xFF; 64];
+type Tab = support::page_tab::Tab<At>;
 
-struct Tab {
-    db: Db<CachedStore, At>,
-    clock: testkit::Clock,
-    conn: PageConn,
-    sends: BTreeMap<u64, usize>,
-    verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
-    conflicted_replies: usize,
-}
-
-impl Tab {
-    fn open(node: &PageNode, seed: u32) -> Tab {
-        let (store, clock) = testkit::cached_store();
-        let mut t = Tab {
-            db: Db::new(store, At(seed), [seed as u8, 2, 3, 4]),
-            clock,
-            conn: node.connect(),
-            sends: BTreeMap::new(),
-            verdicts: BTreeMap::new(),
-            conflicted_replies: 0,
-        };
-        t.db.store_mut().client.send(&protocol::Request::Identity);
-        t.pump();
-        t.load();
-        t
-    }
-
-    /// Load the whole key space again (an opening session, or a reload).
-    fn load(&mut self) {
-        self.db.store_mut().request_range(LOAD, b"", &EVERYTHING, 256);
-        self.pump();
-    }
-
-    fn pump(&mut self) {
-        for _ in 0..400 {
-            let frames = self.db.store_mut().take_outbound();
-            if frames.is_empty() {
-                return;
-            }
-            for f in &frames {
-                if let protocol::Incoming::Ok(env) = protocol::decode_request(f) {
-                    if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
-                        *self.sends.entry(write_id).or_default() += 1;
-                    }
-                }
-            }
-            for reply in self.conn.frames(&frames) {
-                let decoded = protocol::decode_reply(&reply);
-                if let Some((write_id, state)) = decoded.as_ref().ok().and_then(|r| self.db.store_mut().client.own_write_state(r)) {
-                    self.verdicts.entry(write_id).or_default().push(state);
-                }
-                if matches!(decoded, Ok(protocol::Reply::Conflicted { .. })) {
-                    self.conflicted_replies += 1;
-                }
-                if let Ok(protocol::Reply::Page { req_id: LOAD, entries, cursor: None, at, .. }) = decoded {
-                    self.db.store_mut().on_page(b"", &EVERYTHING, entries, at.root);
-                }
-                self.db.store_mut().on_inbound(&reply);
-            }
-        }
-        panic!("the tab never reached a standstill");
-    }
-
-    fn seconds(&mut self, n: u64) {
-        for _ in 0..n {
-            self.clock.advance(1000);
-            let _ = self.db.store_mut().tick();
-            self.pump();
-        }
-    }
-
-    fn told(&self, id: u64) -> Vec<protocol::WriteState> {
-        self.verdicts.get(&id).cloned().unwrap_or_default()
-    }
+/// A tab of its own on `node`: its own page, engine and session.
+fn tab(node: &PageNode, seed: u32) -> Tab {
+    Tab::open(node, At(seed), [seed as u8, 2, 3, 4])
 }
 
 fn schema() -> Schema {
@@ -124,32 +54,32 @@ fn published(v: &[protocol::WriteState]) -> bool {
 fn a_stale_update_is_refused_and_rolled_back_however_often_it_goes() {
     for interfere in [false, true] {
         let node = PageNode::new();
-        let mut a = Tab::open(&node, 1);
-        a.db.define("tasks", &schema()).expect("define");
+        let mut a = tab(&node, 1);
+        a.call(|d| d.define("tasks", &schema())).expect("define");
         a.pump();
         a.seconds(3);
-        let rec = a.db.put("tasks", &fields("first")).expect("put");
+        let rec = a.call(|d| d.put("tasks", &fields("first"))).expect("put");
         a.pump();
         a.seconds(3);
         let loc = id::loc_from_hex(&rec.id).expect("an id");
         let key = craftworks_sdk::db::record_key("tasks", loc);
-        let mut b = Tab::open(&node, 2);
+        let mut b = tab(&node, 2);
         if interfere {
-            a.db.update("tasks", loc, &fields("A's edit")).expect("A's update");
+            a.call(|d| d.update("tasks", loc, &fields("A's edit"))).expect("A's update");
             a.pump();
             a.seconds(3);
-            let wa = a.db.store_mut().next_write_id() - 1;
+            let wa = a.db.store().writes.next_write_id() - 1;
             assert!(published(&a.told(wa)), "A's update did not publish");
         }
-        let w = b.db.store_mut().next_write_id();
-        b.db.update("tasks", loc, &fields("B's edit")).expect("B's update is made");
+        let w = b.db.store().writes.next_write_id();
+        b.call(|d| d.update("tasks", loc, &fields("B's edit"))).expect("B's update is made");
         b.pump();
         b.seconds(10);
         // ONCE — unless B's engine judged it on its own older view and said
         // `Lost`, which is "nothing applied, the client still holds it": it
         // goes again, WITH ITS READS, and is refused where they are judged
         // (sdk#265). Bounded by the write's one budget, never unbounded.
-        let sent = b.sends.get(&w).copied().unwrap_or(0);
+        let sent = b.sends(w).unwrap_or(0);
         let tries = usize::from(craftworks_sdk::cached_store::WRITE_TRIES);
         if b.told(w).contains(&protocol::WriteState::Lost) {
             assert!((1..=1 + tries).contains(&sent), "interfere {interfere}: a Lost write went on the wire {sent} times, past its {tries} tries");
@@ -160,7 +90,7 @@ fn a_stale_update_is_refused_and_rolled_back_however_often_it_goes() {
         // whose read no longer held. It belongs to a write judged where its
         // reads are — the re-send — and to nothing else.
         let re_sent = sent > 1;
-        assert!(b.conflicted_replies <= usize::from(re_sent), "`Conflicted` arrived for a write that was never re-judged: {} of them", b.conflicted_replies);
+        assert!(b.conflicted_replies() <= usize::from(re_sent), "`Conflicted` arrived for a write that was never re-judged: {} of them", b.conflicted_replies());
         if interfere {
             // Refused where its read is judged (`Failed`), or — when B's
             // engine judged it on its own older view — lost to A's newer head
@@ -171,9 +101,9 @@ fn a_stale_update_is_refused_and_rolled_back_however_often_it_goes() {
                 b.told(w)
             );
             assert!(!published(&b.told(w)), "a stale update published over A's edit");
-            assert_eq!(Reads::row_state(b.db.store_mut(), &key), RowState::RolledBack);
-            let mut fresh = Tab::open(&node, 3);
-            let got = fresh.db.get("tasks", loc).expect("read").expect("present");
+            assert_eq!(Reads::row_state(b.db.store(), &key), RowState::RolledBack);
+            let mut fresh = tab(&node, 3);
+            let got = fresh.call(|d| d.get("tasks", loc)).expect("read").expect("present");
             assert_eq!(got.fields["title"], json!("A's edit"), "A's edit did not stand");
         } else {
             assert!(published(&b.told(w)), "an update from a true read did not publish: {:?}", b.told(w));
@@ -186,16 +116,16 @@ fn a_stale_update_is_refused_and_rolled_back_however_often_it_goes() {
 #[test]
 fn two_create_ats_of_one_slot_make_one_record() {
     let node = PageNode::new();
-    let mut a = Tab::open(&node, 1);
-    a.db.define("tasks", &schema()).expect("define");
+    let mut a = tab(&node, 1);
+    a.call(|d| d.define("tasks", &schema())).expect("define");
     a.pump();
     a.seconds(3);
-    let mut b = Tab::open(&node, 2);
+    let mut b = tab(&node, 2);
     let slot = slot_from(1_749_999_000_000, "ns", "source-1");
-    let wa = a.db.store_mut().next_write_id();
-    let wb = b.db.store_mut().next_write_id();
-    assert!(matches!(a.db.create_at("tasks", slot, &fields("from A")).expect("A"), CreateAt::Created(_)));
-    assert!(matches!(b.db.create_at("tasks", slot, &fields("from B")).expect("B"), CreateAt::Created(_)), "B read the slot absent too");
+    let wa = a.db.store().writes.next_write_id();
+    let wb = b.db.store().writes.next_write_id();
+    assert!(matches!(a.call(|d| d.create_at("tasks", slot, &fields("from A"))).expect("A"), CreateAt::Created(_)));
+    assert!(matches!(b.call(|d| d.create_at("tasks", slot, &fields("from B"))).expect("B"), CreateAt::Created(_)), "B read the slot absent too");
     a.pump();
     b.pump();
     a.seconds(5);
@@ -210,11 +140,11 @@ fn two_create_ats_of_one_slot_make_one_record() {
 #[test]
 fn two_sessions_defining_one_schema_both_succeed() {
     let node = PageNode::new();
-    let mut a = Tab::open(&node, 1);
-    let mut b = Tab::open(&node, 2);
-    let (wa, wb) = (a.db.store_mut().next_write_id(), b.db.store_mut().next_write_id());
-    a.db.define("tasks", &schema()).expect("A defines");
-    b.db.define("tasks", &schema()).expect("B defines");
+    let mut a = tab(&node, 1);
+    let mut b = tab(&node, 2);
+    let (wa, wb) = (a.db.store().writes.next_write_id(), b.db.store().writes.next_write_id());
+    a.call(|d| d.define("tasks", &schema())).expect("A defines");
+    b.call(|d| d.define("tasks", &schema())).expect("B defines");
     a.pump();
     b.pump();
     a.seconds(5);

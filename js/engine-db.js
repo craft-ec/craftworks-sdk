@@ -120,11 +120,11 @@ export function engineDb(handle) {
    * poll either spins or answers late and neither is a fact about the data.
    */
   const drain = () => {
-    for (const { id, ok, code } of JSON.parse(session.take_loads())) {
+    for (const { id, ok, code, why } of JSON.parse(session.take_loads())) {
       const waiters = parked.get(id);
       if (!waiters) continue;
       parked.delete(id);
-      for (const w of waiters) (ok ? w.resolve : w.reject)(code);
+      for (const w of waiters) (ok ? w.resolve(code) : w.reject({ code, why }));
     }
   };
 
@@ -236,20 +236,31 @@ export function engineDb(handle) {
       }
       try {
         await waitFor(ticket);
-      } catch (code) {
+      } catch (ended) {
         // The load ENDED and did not deliver: the engine could not reach the
         // data, or nothing answered within the session's bound. Either way
-        // it is not "not yet".
-        throw new DbError({
-          code: code ?? "UNAVAILABLE",
+        // it is not "not yet". `why` is the engine's reason, when it gave one.
+        const code = typeof ended === "string" ? ended : ended?.code;
+        const why = typeof ended === "string" ? null : ended?.why;
+        const base = code === "NOT_ANSWERING"
           // NOT_ANSWERING: the page read it itself and the node stopped
           // answering — not that the data is missing.
-          message: code === "NOT_ANSWERING"
-            ? "the node is not answering"
-            : "the range this read needed could not be loaded",
+          ? "the node is not answering"
+          : "the range this read needed could not be loaded";
+        throw new DbError({
+          code: code ?? "UNAVAILABLE",
+          message: why ? `${base}: ${why}` : base,
           transient: true,
         });
       }
+      // RESUMED: the next call walks the root this ticket's read was made
+      // at, so the chain ends on ONE tree instead of chasing a head that
+      // keeps moving (READ-STATE inv. 2). Synchronous with `call()` at the
+      // top of the loop: nothing else runs between them. OUTSIDE the catch
+      // above: a fault here is this layer's, never "the data could not be
+      // loaded" (it was once — a BigInt parameter threw, and every read
+      // reported UNAVAILABLE).
+      session.resume(ticket);
     }
   };
 
@@ -465,26 +476,31 @@ export function engineDb(handle) {
         /**
          * Bring the rows up to date.
          *
-         * It ASKS. The first version compared the copy's root and returned
-         * early when it had not moved — and the copy's root moves only when a
-         * delta or a page arrives, so a reload that only read could never
-         * show anything new. Nothing sent `ChangesSince`, so the root never
-         * moved, and a tab that made no write could never see another's.
+         * It READS: the scan walks the tree from the engine's root, so it is
+         * as new as the head this page has adopted (READ-STATE). Nothing is
+         * asked first — there is no copy to bring up to date. LIVE bindings
+         * are re-run by `drain` when the session says their range changed.
          *
-         * The answer comes back through `drain`, which re-runs this binding
-         * if the delta moved anything. So this returns whether the ROWS THIS
-         * CLIENT CAN SEE changed — which includes its own pending writes,
-         * because those are visible before any engine has confirmed them.
+         * Returns whether the ROWS THIS CLIENT CAN SEE changed — which
+         * includes its own pending writes, because those are visible before
+         * any engine has confirmed them.
          */
         async reload() {
-          session.refresh_domain(key);
           let next;
           try {
             // THE PAGE, not the domain. `limit: 0` is unbounded and is what
             // the scan has always done. With a parent, the PAGE OF ITS BAND.
-            next = parent
-              ? await self.children(domain, parent, { limit, reverse })
-              : await self.scan(domain, { limit, reverse });
+            next = await once(() => {
+              const rows = JSON.parse(parent
+                ? session.children(domain, parent, reverse, limit, "")
+                : session.scan(domain, reverse, limit, ""));
+              // RENDERED, in the same synchronous call as the read that
+              // answered: the session records the root that read walked as
+              // this binding's RenderedAt. A read that fails never gets here,
+              // so its change is reported again (the architect on sdk#289).
+              session.rendered(key);
+              return rows;
+            });
           } catch (e) {
             // UNREACHABLE IS AN ANSWER, not an exception to swallow.
             //
@@ -537,7 +553,17 @@ export function engineDb(handle) {
       // The rejection is handled INSIDE `reload` now, which records it as a
       // state rather than throwing. This stays deliberately fire-and-forget:
       // it is called from a notification, and there is nobody to await it.
-      const rerun = () => { b.reload(); };
+      //
+      // ONE re-read at a time. LIVE reports a changed binding on every
+      // message until its re-read has completed, so a re-read already in
+      // flight is followed by exactly one more — never a pile of them.
+      let running = false, again = false;
+      const rerun = async () => {
+        if (running) { again = true; return; }
+        running = true;
+        try { do { again = false; await b.reload(); } while (again); }
+        finally { running = false; }
+      };
       if (!mine.has(domain)) mine.set(domain, new Set());
       mine.get(domain).add(rerun);
 

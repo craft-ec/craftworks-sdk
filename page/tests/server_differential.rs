@@ -176,6 +176,8 @@ struct Faults {
     record_not_saved_once: bool,
     /// Hold every answer (FullNode's `hold_answers`).
     hold: bool,
+    /// Hold block GETs only (a cold node): what `run_holding_gets` starts.
+    hold_gets: bool,
 }
 
 /// `page::Server` over the scripted node, run to a standstill like `Conn`.
@@ -599,15 +601,71 @@ fn sibling_root(node: &mut Node, salt: u32) -> Cid {
     panic!("the sibling page never asked to sign");
 }
 
-/// A TAB: `Db` over `CachedStore`, its frames served by this rig's
-/// `page::Server` over the scripted node, its replies fed back — the whole page
-/// path, native.
+/// A TAB: `Db` over the page's store (READ-STATE: its reads WALK this rig's
+/// engine), the rig and its node LENT to the store for each call, and what
+/// crossed counted — the whole page path, native.
 struct Tab {
-    db: craftworks_sdk::Db<craftworks_sdk::CachedStore, TabEnv>,
+    db: TabDb,
     /// Per write id, how many times it went on the wire (a `Commit` or a `Write`).
     sends: BTreeMap<u64, usize>,
     /// Per write id, the states it was told, in order.
     verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
+    /// Tickets that ended, by id.
+    ended: BTreeMap<u64, craftworks_sdk::Ended>,
+}
+
+type TabDb = craftworks_sdk::Db<craftworks_sdk::PageStore<Lent>, TabEnv>;
+
+/// The rig while a tab's call runs: the store's host. What the server
+/// answered the tab waits in `inbox` for the store; `sent` and `seen` are
+/// what crossed, for the tab's counts.
+#[derive(Default)]
+struct Lent {
+    rig: Option<(PageRig, Node)>,
+    inbox: Vec<Vec<u8>>,
+    sent: Vec<Vec<u8>>,
+    seen: Vec<Vec<u8>>,
+}
+
+impl page::server::Host for Lent {
+    fn with_server<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
+        let Lent { rig: Some((rig, node)), inbox, .. } = self else { panic!("a tab's call runs with the rig lent") };
+        let r = f(&mut rig.server);
+        answer_ops(rig, node, inbox);
+        r
+    }
+    fn client(&mut self, frame: &[u8]) {
+        self.sent.push(frame.to_vec());
+        let Lent { rig: Some((rig, node)), inbox, .. } = self else { panic!("a tab's call runs with the rig lent") };
+        rig.server.client(frame);
+        answer_ops(rig, node, inbox);
+    }
+    fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        let r = std::mem::take(&mut self.inbox);
+        self.seen.extend(r.iter().cloned());
+        r
+    }
+}
+
+/// Every op the server has, answered — or HELD, under `faults.hold` — until
+/// none is left, the replies kept for the tab. No clock moves here.
+fn answer_ops(rig: &mut PageRig, node: &mut Node, inbox: &mut Vec<Vec<u8>>) {
+    for _ in 0..2_000 {
+        inbox.extend(rig.server.take_replies());
+        let ops = rig.server.take_ops();
+        if ops.is_empty() {
+            return;
+        }
+        for op in ops {
+            if rig.faults.hold || (rig.faults.hold_gets && matches!(op, Op::Get { .. })) {
+                rig.held.push(op);
+                continue;
+            }
+            if let Some(a) = rig.answer(node, op) {
+                rig.server.node(a, Ms(rig.now));
+            }
+        }
+    }
 }
 
 struct TabEnv(u32);
@@ -623,54 +681,115 @@ impl craftworks_sdk::Env for TabEnv {
 
 impl Tab {
     fn open(rig: &mut PageRig, node: &mut Node) -> Tab {
-        let (store, _clock) = testkit::cached_store();
-        let mut t = Tab { db: craftworks_sdk::Db::new(store, TabEnv(1), [1, 2, 3, 4]), sends: BTreeMap::new(), verdicts: BTreeMap::new() };
-        t.db.store_mut().client.send(&Request::Identity);
-        t.pump(rig, node);
-        t.db.store_mut().request_range(1, b"", &[0xFF; 64], 256);
+        // Lent from the start: handing the store its host carries out what
+        // it already holds.
+        let lent = Lent { rig: Some((std::mem::replace(rig, PageRig::new()), std::mem::replace(node, Node::new()))), ..Lent::default() };
+        let (store, _clock) = testkit::page_store_over(lent);
+        let mut t = Tab { db: craftworks_sdk::Db::new(store, TabEnv(1), [1, 2, 3, 4]), sends: BTreeMap::new(), verdicts: BTreeMap::new(), ended: BTreeMap::new() };
+        let (r, n) = t.host().rig.take().expect("lent");
+        *rig = r;
+        *node = n;
+        t.db.store_mut().writes.client.send(&Request::Identity);
         t.pump(rig, node);
         t
     }
 
+    fn host(&mut self) -> &mut Lent {
+        self.db.store_mut().host_mut().expect("a tab has its host")
+    }
+
+    /// LEND the rig to the tab's store for `f`, then take it back, counting
+    /// what crossed.
+    fn lend<R>(&mut self, rig: &mut PageRig, node: &mut Node, f: impl FnOnce(&mut TabDb) -> R) -> R {
+        let lent = (std::mem::replace(rig, PageRig::new()), std::mem::replace(node, Node::new()));
+        self.host().rig = Some(lent);
+        let out = f(&mut self.db);
+        self.db.store_mut().sync();
+        for (id, how) in self.db.store_mut().take_ended() {
+            self.ended.insert(id, how);
+        }
+        let (r, n) = self.host().rig.take().expect("lent");
+        *rig = r;
+        *node = n;
+        let session = self.db.store().writes.client.session();
+        let (sent, seen) = (std::mem::take(&mut self.host().sent), std::mem::take(&mut self.host().seen));
+        for f in sent {
+            if let protocol::Incoming::Ok(env) = protocol::decode_request(&f) {
+                if let Request::Write { write_id, .. } | Request::Commit { write_id, .. } = env.body {
+                    *self.sends.entry(write_id).or_default() += 1;
+                }
+            }
+        }
+        for r in seen {
+            if let Ok(Reply::SessionWriteState { session: s, write_id, state }) = protocol::decode_reply(&r) {
+                if Some(s) == session {
+                    self.verdicts.entry(write_id).or_default().push(state);
+                }
+            }
+        }
+        out
+    }
+
+    /// Run until nothing moves: the store's frames to the server, the ops to
+    /// the node, the replies back; when only silence is left and the page is
+    /// waiting, let its next deadline pass, as the page's own tick would.
     fn pump(&mut self, rig: &mut PageRig, node: &mut Node) {
-        for _ in 0..400 {
-            let frames = self.db.store_mut().take_outbound();
-            let mut moved = !frames.is_empty();
-            for f in &frames {
-                if let protocol::Incoming::Ok(env) = protocol::decode_request(f) {
-                    if let Request::Write { write_id, .. } | Request::Commit { write_id, .. } = env.body {
-                        *self.sends.entry(write_id).or_default() += 1;
-                    }
+        self.lend(rig, node, |db| {
+            for _ in 0..400 {
+                db.store_mut().sync();
+                let Lent { rig: Some((rig, node)), inbox, .. } = db.store_mut().host_mut().expect("host") else { panic!("lent") };
+                answer_ops(rig, node, inbox);
+                if !inbox.is_empty() {
+                    continue;
                 }
-                rig.server.client(f);
-            }
-            for op in rig.server.take_ops() {
-                moved = true;
-                if let Some(a) = rig.answer(node, op) {
-                    rig.server.node(a, Ms(rig.now));
-                }
-            }
-            for r in rig.server.take_replies() {
-                moved = true;
-                // What the HOST does with a page: the copy records a range as
-                // loaded only when told the interval it asked for.
-                let decoded = protocol::decode_reply(&r);
-                if let Some((w, st)) = decoded.as_ref().ok().and_then(|x| self.db.store_mut().client.own_write_state(x)) {
-                    self.verdicts.entry(w).or_default().push(st);
-                }
-                if let Ok(Reply::Page { req_id: 1, entries, cursor: None, at, .. }) = decoded {
-                    self.db.store_mut().on_page(b"", &[0xFF; 64], entries, at.root);
-                }
-                self.db.store_mut().on_inbound(&r);
-            }
-            if !moved {
-                if !rig.server.page.waiting() {
-                    return;
+                if rig.faults.hold || !rig.server.page.waiting() {
+                    break;
                 }
                 rig.now = rig.server.page.next_due().map_or(rig.now + 1, |d| d.0.max(rig.now + 1));
                 rig.server.tick(Ms(rig.now));
             }
+        });
+    }
+
+    /// A `Db` call as a page makes it (`engine-db.js`'s `once`): a walk that
+    /// stops on blocks waits on its ticket, then RESUMES at that ticket's
+    /// root; bounded as the page is (MAX_HOPS).
+    fn call<T>(&mut self, rig: &mut PageRig, node: &mut Node, f: impl Fn(&mut TabDb) -> Result<T, craftworks_sdk::DbError>) -> Result<T, craftworks_sdk::DbError> {
+        for _ in 0..8 {
+            match self.lend(rig, node, |db| {
+                let r = f(db);
+                db.store_mut().decide(r)
+            }) {
+                craftworks_sdk::Outcome::Done(v) => return Ok(v),
+                craftworks_sdk::Outcome::Told(e) => return Err(e),
+                craftworks_sdk::Outcome::Wait(e, t) => {
+                    let mut how = self.ended.remove(&t);
+                    for _ in 0..50 {
+                        if how.is_some() {
+                            break;
+                        }
+                        self.pump(rig, node);
+                        how = self.ended.remove(&t);
+                    }
+                    match how {
+                        Some(craftworks_sdk::Ended::Loaded) => self.db.store_mut().resume(t),
+                        _ => return Err(e),
+                    }
+                }
+            }
         }
+        panic!("a tab's call took more than eight hops");
+    }
+
+    /// One key as the tab reads it (a walk of its tree).
+    fn get(&mut self, rig: &mut PageRig, node: &mut Node, key: &[u8]) -> Option<Vec<u8>> {
+        self.call(rig, node, |db| {
+            craftworks_sdk::store::Reads::get(db.store_mut(), key).map_err(|e| match e {
+                craftworks_sdk::store::StoreError::NotLoaded => craftworks_sdk::DbError::NotLoaded { lo: key.to_vec(), hi: key.to_vec() },
+                other => craftworks_sdk::DbError::Refused(other.to_string()),
+            })
+        })
+        .expect("the tab reads the key")
     }
 }
 
@@ -678,64 +797,46 @@ fn tab_schema() -> craftworks_sdk::Schema {
     serde_json::from_value(serde_json::json!({ "type": "T", "fields": [{ "name": "title", "kind": "text", "required": true }] })).expect("a schema")
 }
 
-/// M2 on the PAGE path (sdk#148's SDK half): a tab's `update` over a record
-/// another session has since changed is a stale `Commit`. The engine applies
-/// NOTHING; the tab is told `Conflict` with `Conflicted` naming the key (a v4
-/// client of this same build decodes both); the write is rolled back, the key
-/// FORGOTTEN in the copy (no row shows a value the tree lacks), the conflict
-/// surfaced to the app, and the write NEVER re-sent. The other session's
-/// value stands. Control: the same update with nothing in between publishes,
-/// and nothing is conflicted.
+/// M2 on the PAGE path (sdk#148's SDK half): a tab's `update` whose READ is
+/// overtaken before it lands is a stale `Commit`. Reads walk the warm tree
+/// (READ-STATE), so the read is stale only if it is made and then WAITS: the
+/// engine is busy with another session's commit and answers `Busy`, the tab
+/// holds the write, and another session changes the record meanwhile
+/// ([`behind`]). The engine applies NOTHING; the tab is told `Conflict` with
+/// `Conflicted` naming the key; the write is rolled back, the conflict
+/// surfaced to the app, and the write NEVER re-sent as itself (one `Busy`
+/// re-send, then the verdict). The other session's value stands, and it is
+/// what the tab reads. Control: the same wait with nothing changed publishes
+/// the update, and nothing is conflicted.
 #[test]
-fn a_stale_update_is_told_conflict_rolled_back_forgotten_and_never_re_sent() {
+fn a_stale_update_is_told_conflict_rolled_back_and_never_re_sent() {
     for interfere in [false, true] {
         let mut node = Node::new();
         let mut rig = PageRig::new();
         let mut tab = Tab::open(&mut rig, &mut node);
-        tab.db.define("t", &tab_schema()).expect("define");
+        tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
         tab.pump(&mut rig, &mut node);
-        let rec = tab.db.put("t", &serde_json::json!({ "title": "first" }).as_object().unwrap().clone()).expect("put");
+        let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "first" }).as_object().unwrap().clone())).expect("put");
         tab.pump(&mut rig, &mut node);
         let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("a record's id parses");
         let key = craftworks_sdk::db::record_key("t", loc);
-        if interfere {
-            // ANOTHER session writes the record's key, blind, behind this tab's copy.
-            let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(1, vec![protocol::Op::Put(key.clone(), b"elsewhere".to_vec())])).expect("encodes");
-            rig.server.client(&other);
-            for _ in 0..200 {
-                let ops = rig.server.take_ops();
-                if ops.is_empty() && !rig.server.page.waiting() {
-                    break;
-                }
-                for op in ops {
-                    if let Some(a) = rig.answer(&mut node, op) {
-                        rig.server.node(a, Ms(rig.now));
-                    }
-                }
-                rig.now += 50;
-                rig.server.tick(Ms(rig.now));
-            }
-            let _ = rig.server.take_replies();
-        }
-        let w = tab.db.store_mut().next_write_id();
-        tab.db.update("t", loc, serde_json::json!({ "title": "second" }).as_object().unwrap()).expect("the update is made");
-        tab.pump(&mut rig, &mut node);
+        let w = tab.db.store().writes.next_write_id();
+        let theirs = if interfere { vec![protocol::Op::Put(key.clone(), b"elsewhere".to_vec())] } else { Vec::new() };
+        behind(&mut tab, &mut rig, &mut node, 1, theirs, |db| db.update("t", loc, serde_json::json!({ "title": "second" }).as_object().unwrap()));
         for _ in 0..5 {
             rig.now += 30_000;
             rig.server.tick(Ms(rig.now));
-            tab.db.store_mut().tick();
+            tab.db.store_mut().writes.tick();
             tab.pump(&mut rig, &mut node);
         }
-        let conflicts = tab.db.store_mut().take_conflicts();
-        assert_eq!(tab.sends.get(&w), Some(&1), "interfere {interfere}: the write went on the wire {:?} times", tab.sends.get(&w));
+        let conflicts = tab.db.store_mut().writes.take_conflicts();
+        assert_eq!(tab.sends.get(&w), Some(&2), "interfere {interfere}: the write went on the wire {:?} times (once, then once after Busy)", tab.sends.get(&w));
         if interfere {
             assert_eq!(tab.verdicts.get(&w).and_then(|v| v.last()), Some(&protocol::WriteState::Conflict), "not told Conflict: {:?}", tab.verdicts.get(&w));
             assert_eq!(conflicts.len(), 1, "a stale update was not told as ONE conflict: {conflicts:?}");
             assert_eq!((conflicts[0].write_id, &conflicts[0].key), (w, &key));
             assert_eq!(craftworks_sdk::store::Reads::row_state(tab.db.store_mut(), &key), craftworks_sdk::store::RowState::RolledBack);
-            assert!(matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &key), Err(craftworks_sdk::store::StoreError::NotLoaded)), "the conflicted key was not forgotten: the copy still shows a value");
-            let (_, root) = node.head().expect("a head");
-            let _ = root;
+            assert_eq!(tab.get(&mut rig, &mut node, &key), Some(b"elsewhere".to_vec()), "the tab does not read the tree's value at the conflicted key");
         } else {
             assert!(conflicts.is_empty(), "nothing moved and yet a conflict: {conflicts:?}");
             assert_eq!(craftworks_sdk::store::Reads::row_state(tab.db.store_mut(), &key), craftworks_sdk::store::RowState::Clean, "the unconflicted update did not publish");
@@ -744,59 +845,40 @@ fn a_stale_update_is_told_conflict_rolled_back_forgotten_and_never_re_sent() {
 }
 
 /// THE SCHEMA KEY (the architect's #1 on the slice): another session changes
-/// the domain's SCHEMA behind this tab's copy. The tab's update reads the
-/// record (unchanged) and the schema (stale): it conflicts ON THE SCHEMA KEY,
-/// which no rolled-back write names — and that key is FORGOTTEN too, so the
-/// next write reads the schema fresh instead of conflicting again for ever.
+/// the domain's SCHEMA while this tab's update waits ([`behind`]). The update
+/// read the record (unchanged) and the schema (stale): it conflicts ON THE
+/// SCHEMA KEY, which no rolled-back write names — and the tab's next read of
+/// it is the tree's, so the next write reads the schema fresh instead of
+/// conflicting again for ever.
 #[test]
-fn a_schema_changed_elsewhere_conflicts_on_the_schema_key_and_forgets_it() {
+fn a_schema_changed_elsewhere_conflicts_on_the_schema_key() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let mut tab = Tab::open(&mut rig, &mut node);
-    tab.db.define("t", &tab_schema()).expect("define");
+    tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
     tab.pump(&mut rig, &mut node);
-    let rec = tab.db.put("t", &serde_json::json!({ "title": "first" }).as_object().unwrap().clone()).expect("put");
+    let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "first" }).as_object().unwrap().clone())).expect("put");
     tab.pump(&mut rig, &mut node);
     let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
-    // The schema key, as `Db` names it.
-    let mut schema_key = vec![0u8];
-    schema_key.extend_from_slice(b"schema\0t");
+    let schema_key = schema_key_of("t");
     let wider: craftworks_sdk::Schema = serde_json::from_value(serde_json::json!({ "type": "T", "fields": [
         { "name": "title", "kind": "text", "required": true },
         { "name": "note", "kind": "text" }
     ] })).expect("a schema");
-    let other = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(1, vec![protocol::Op::Put(schema_key.clone(), serde_json::to_vec(&wider).unwrap())]))
-    .expect("encodes");
-    rig.server.client(&other);
-    for _ in 0..200 {
-        let ops = rig.server.take_ops();
-        if ops.is_empty() && !rig.server.page.waiting() {
-            break;
-        }
-        for op in ops {
-            if let Some(a) = rig.answer(&mut node, op) {
-                rig.server.node(a, Ms(rig.now));
-            }
-        }
-        rig.now += 50;
-        rig.server.tick(Ms(rig.now));
-    }
-    let _ = rig.server.take_replies();
-    let w = tab.db.store_mut().next_write_id();
-    tab.db.update("t", loc, serde_json::json!({ "title": "second" }).as_object().unwrap()).expect("the update is made");
+    let w = tab.db.store().writes.next_write_id();
+    let theirs = vec![protocol::Op::Put(schema_key.clone(), serde_json::to_vec(&wider).unwrap())];
+    behind(&mut tab, &mut rig, &mut node, 1, theirs, |db| db.update("t", loc, serde_json::json!({ "title": "second" }).as_object().unwrap()));
+    tab.db.store_mut().writes.tick();
     tab.pump(&mut rig, &mut node);
-    let conflicts = tab.db.store_mut().take_conflicts();
+    let conflicts = tab.db.store_mut().writes.take_conflicts();
     assert_eq!(conflicts.iter().map(|c| (c.write_id, c.key.clone())).collect::<Vec<_>>(), vec![(w, schema_key.clone())], "not a conflict on the SCHEMA key");
-    assert!(
-        matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &schema_key), Err(craftworks_sdk::store::StoreError::NotLoaded)),
-        "the stale schema was not forgotten: the next write would conflict on it again"
-    );
-    // And the fallen write's OWN key (the record: not the key that conflicted).
+    assert_eq!(tab.get(&mut rig, &mut node, &schema_key), Some(serde_json::to_vec(&wider).unwrap()), "the tab does not read the schema the tree holds");
+    // And the fallen write's OWN key (the record: not the key that conflicted)
+    // reads the tree's value, not the unsaved one.
     let key = craftworks_sdk::db::record_key("t", loc);
-    assert!(
-        matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &key), Err(craftworks_sdk::store::StoreError::NotLoaded)),
-        "the rolled-back record still shows its unsaved value"
-    );
+    let first = tab.get(&mut rig, &mut node, &key).expect("the record");
+    let d = craftworks_sdk::record::decode(&wider, &first).expect("decodes");
+    assert_eq!(d.fields.get("title"), Some(&serde_json::json!("first")), "the rolled-back record shows its unsaved value");
 }
 
 /// ANOTHER DEVICE'S TREE holding exactly `entries`, built by a fresh page from
@@ -827,8 +909,7 @@ fn device_tree(node: &mut Node, entries: &[(Vec<u8>, Vec<u8>)]) -> Cid {
 /// two devices are until #226); the tab reads it on the node's hint and adopts
 /// it (#225a). What it is TOLD depends on the winner's `prev` and contents:
 /// * a same-seq winner that lacks the record → `Superseded` naming the record's
-///   key, and the tab's copy forgets it (NotLoaded: the next read fetches the
-///   winner's value);
+///   key, and the tab's read of it is the winner's tree (absent);
 /// * a winner whose prev IS the tab's tip (they built on it) → nothing;
 /// * a winner two commits deep whose tree holds exactly the tab's value → nothing
 ///   (the architect's false-Superseded case: probed, equal, kept).
@@ -839,9 +920,9 @@ fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
         let mut node = Node::new();
         let mut rig = PageRig::new();
         let mut tab = Tab::open(&mut rig, &mut node);
-        tab.db.define("t", &tab_schema()).expect("define");
+        tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
         tab.pump(&mut rig, &mut node);
-        let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+        let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone())).expect("put");
         tab.pump(&mut rig, &mut node);
         let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
         let key = craftworks_sdk::db::record_key("t", loc);
@@ -885,15 +966,12 @@ fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
             tab.pump(&mut rig, &mut node);
         }
         assert_eq!(rig.server.page.published().0, seq, "{case}: the tab did not adopt the other device's head");
-        let told = tab.db.store_mut().take_superseded();
+        let told = tab.db.store_mut().writes.take_superseded();
         match case {
             "same-seq, record lost" => {
                 assert_eq!(told.len(), 1, "{case}: {told:?}");
                 assert_eq!(told[0].keys, vec![key.clone()], "{case}: the superseded rows are not the record");
-                assert!(
-                    matches!(craftworks_sdk::store::Reads::get(tab.db.store_mut(), &key), Err(craftworks_sdk::store::StoreError::NotLoaded)),
-                    "{case}: the replaced row still shows the tab's value"
-                );
+                assert_eq!(tab.get(&mut rig, &mut node, &key), None, "{case}: the replaced row still shows the tab's value, not the winner's (which lacks it)");
             }
             _ => assert!(told.is_empty(), "{case}: told Superseded for a value the winner holds: {told:?}"),
         }
@@ -913,22 +991,22 @@ fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let mut tab = Tab::open(&mut rig, &mut node);
-    tab.db.define("t", &tab_schema()).expect("define");
+    tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
     tab.pump(&mut rig, &mut node);
-    let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
-    let w1 = tab.db.store_mut().next_write_id() - 1;
+    let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone())).expect("put");
+    let w1 = tab.db.store().writes.next_write_id() - 1;
     tab.pump(&mut rig, &mut node);
     let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
     let key = craftworks_sdk::db::record_key("t", loc);
     let head = node.head().expect("published");
     let bytes = node.tree(&head.1).expect("whole").get(&key).cloned().expect("the record is in the tip");
     // The same bytes again: a no-op, Published at the same head.
-    let w2 = tab.db.store_mut().next_write_id();
-    craftworks_sdk::store::Store::apply_commit(
-        tab.db.store_mut(),
+    let w2 = tab.db.store().writes.next_write_id();
+    tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Store::apply_commit(
+        db.store_mut(),
         &[(key.clone(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(&bytes)))],
         &[(key.clone(), craftworks_sdk::store::Edit::Put(bytes.clone()))],
-    )
+    ))
     .expect("the store took it");
     tab.pump(&mut rig, &mut node);
     assert!(tab.verdicts.get(&w2).is_some_and(|v| v.contains(&protocol::WriteState::Published)), "the second write did not publish: {:?}", tab.verdicts.get(&w2));
@@ -949,7 +1027,7 @@ fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
     node.update(&st);
     rig.server.head_hint();
     tab.pump(&mut rig, &mut node);
-    let mut told: Vec<(u64, Vec<Vec<u8>>)> = tab.db.store_mut().take_superseded().into_iter().map(|s| (s.write_id, s.keys)).collect();
+    let mut told: Vec<(u64, Vec<Vec<u8>>)> = tab.db.store_mut().writes.take_superseded().into_iter().map(|s| (s.write_id, s.keys)).collect();
     told.sort();
     assert_eq!(told, vec![(w1, vec![key.clone()]), (w2, vec![key.clone()])], "each write of the tip was not told its row");
 }
@@ -971,9 +1049,9 @@ fn a_same_seq_race_is_merged_key_by_key() {
         let mut node = Node::new();
         let mut rig = PageRig::new();
         let mut tab = Tab::open(&mut rig, &mut node);
-        tab.db.define("t", &tab_schema()).expect("define");
+        tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
         tab.pump(&mut rig, &mut node);
-        let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+        let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone())).expect("put");
         tab.pump(&mut rig, &mut node);
         let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
         let key = craftworks_sdk::db::record_key("t", loc);
@@ -992,13 +1070,13 @@ fn a_same_seq_race_is_merged_key_by_key() {
             // complete would keep the record and write this page's value over
             // the winner's, the merge write carrying no read to refuse it.
             let _ = now_rec;
-            craftworks_sdk::store::Store::apply_batch(
-                tab.db.store_mut(),
+            tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Store::apply_batch(
+                db.store_mut(),
                 &[
                     (key.clone(), craftworks_sdk::store::Edit::Put(b"mine, again".to_vec())),
                     (extra.clone(), craftworks_sdk::store::Edit::Put(b"only mine".to_vec())),
                 ],
-            )
+            ))
             .expect("the store took it");
             tab.pump(&mut rig, &mut node);
         }
@@ -1041,7 +1119,7 @@ fn a_same_seq_race_is_merged_key_by_key() {
             rig.server.tick(Ms(rig.now));
             tab.pump(&mut rig, &mut node);
         }
-        let told = tab.db.store_mut().take_superseded();
+        let told = tab.db.store_mut().writes.take_superseded();
         let (fseq, froot) = node.head().expect("a head");
         let fin = node.tree(&froot).expect("the final tree is whole");
         match case {
@@ -1064,32 +1142,12 @@ fn a_same_seq_race_is_merged_key_by_key() {
 }
 
 /// Drive the rig, answering every op EXCEPT block GETs, which are held (a cold
-/// node). Returns when nothing else moves.
+/// node) — from now until the caller clears `faults.hold_gets` — and handed
+/// to `held`. Returns when nothing else moves.
 fn run_holding_gets(tab: &mut Tab, rig: &mut PageRig, node: &mut Node, held: &mut Vec<Op>) {
-    for _ in 0..400 {
-        let frames = tab.db.store_mut().take_outbound();
-        let mut moved = !frames.is_empty();
-        for f in &frames {
-            rig.server.client(f);
-        }
-        for op in rig.server.take_ops() {
-            moved = true;
-            if matches!(op, Op::Get { .. }) {
-                held.push(op);
-                continue;
-            }
-            if let Some(a) = rig.answer(node, op) {
-                rig.server.node(a, Ms(rig.now));
-            }
-        }
-        for r in rig.server.take_replies() {
-            moved = true;
-            tab.db.store_mut().on_inbound(&r);
-        }
-        if !moved {
-            return;
-        }
-    }
+    rig.faults.hold_gets = true;
+    tab.pump(rig, node);
+    held.append(&mut rig.held);
 }
 
 /// THE MERGE WRITE IS A COMMIT WITH READS, NEVER BLIND (the architect's #2 on
@@ -1105,9 +1163,9 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let mut tab = Tab::open(&mut rig, &mut node);
-    tab.db.define("t", &tab_schema()).expect("define");
+    tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
     tab.pump(&mut rig, &mut node);
-    let rec = tab.db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone()).expect("put");
+    let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "mine" }).as_object().unwrap().clone())).expect("put");
     tab.pump(&mut rig, &mut node);
     let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
     let key = craftworks_sdk::db::record_key("t", loc);
@@ -1136,8 +1194,11 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
     run_holding_gets(&mut tab, &mut rig, &mut node, &mut held);
     assert_eq!(rig.server.page.published().1, x_root, "the page did not adopt x");
     assert!(!held.is_empty(), "the merge's delta did not need a fetch: the window this test is about does not exist");
-    // A new write of this tab, parked on the same cold blocks: the engine is busy.
-    tab.db.put("t", &serde_json::json!({ "title": "later" }).as_object().unwrap().clone()).expect("a later put");
+    // A new write of this tab, parked by the ENGINE on the same cold blocks:
+    // the engine is busy. A store-level batch, so it reaches the engine at
+    // once — a `Db` put would first READ its schema on x, which is cold, and
+    // wait for it (READ-STATE: a read walks the tree the page stands on).
+    tab.lend(&mut rig, &mut node, |db| craftworks_sdk::store::Store::apply_batch(db.store_mut(), &[(b"later".to_vec(), craftworks_sdk::store::Edit::Put(b"l".to_vec()))])).expect("a later write");
     run_holding_gets(&mut tab, &mut rig, &mut node, &mut held);
     // x': ANOTHER head of the other device, on top of x, that changes the record.
     let x_tree = node.tree(&x_root).expect("whole");
@@ -1150,6 +1211,7 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
     node.update(&contract_keys::register::head_state(&node.register_params, &key_of, tip_seq + 1, &v2).expect("signs"));
     // Release the GETs: the delta completes, the merge write meets a busy engine,
     // the later write's sign meets x' and the page adopts it; the merge re-sends ON x'.
+    rig.faults.hold_gets = false;
     for op in held.drain(..) {
         if let Some(a) = rig.answer(&mut node, op) {
             rig.server.node(a, Ms(rig.now));
@@ -1163,7 +1225,7 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
     }
     let fin = node.tree(&node.head().expect("a head").1).expect("whole");
     assert_eq!(fin.get(&key), Some(&theirs), "the merge wrote this page's value over x-prime's: it went blind");
-    let told: Vec<Vec<Vec<u8>>> = tab.db.store_mut().take_superseded().into_iter().map(|s| s.keys).collect();
+    let told: Vec<Vec<Vec<u8>>> = tab.db.store_mut().writes.take_superseded().into_iter().map(|s| s.keys).collect();
     assert!(told.iter().any(|k| k.contains(&key)), "the record was not told Superseded: {told:?}");
 }
 
@@ -1210,10 +1272,50 @@ fn elsewhere(rig: &mut PageRig, node: &mut Node, write_id: u64, ops: Vec<protoco
     let _ = rig.server.take_replies();
 }
 
+/// A COMMIT IN FLIGHT: another session's write of a key nobody reads, with
+/// the node's answers HELD, so the engine is busy until [`release`].
+fn commit_in_flight(rig: &mut PageRig, node: &mut Node, write_id: u64) {
+    rig.faults.hold = true;
+    let filler = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(write_id, vec![protocol::Op::Put(b"\x00filler".to_vec(), write_id.to_be_bytes().to_vec())])).expect("encodes");
+    rig.server.client(&filler);
+    let _ = rig.run(node);
+    assert!(!rig.held.is_empty(), "the filler's commit went nowhere: nothing is in flight");
+}
+
+/// The node answers what it held; the commit in flight lands.
+fn release(rig: &mut PageRig, node: &mut Node) {
+    rig.faults.hold = false;
+    for op in std::mem::take(&mut rig.held) {
+        if let Some(a) = rig.answer(node, op) {
+            rig.server.node(a, Ms(rig.now));
+        }
+    }
+    let _ = rig.run(node);
+}
+
+/// A STALE WRITE, as one can still happen when reads walk the warm tree
+/// (READ-STATE): the tab's write `make` READS now — while the engine is busy
+/// with another session's commit, so it is told `Busy` and the tab holds it —
+/// then ANOTHER SESSION's `theirs` lands, and the tab's write goes again and
+/// meets it where it lands. (A write made AFTER theirs would read theirs: a
+/// premise is the tree's, never a copy's.) `theirs` empty is the control:
+/// the same wait, nothing changed.
+fn behind<T: std::fmt::Debug>(tab: &mut Tab, rig: &mut PageRig, node: &mut Node, write_id: u64, theirs: Vec<protocol::Op>, make: impl Fn(&mut TabDb) -> Result<T, craftworks_sdk::DbError>) -> T {
+    commit_in_flight(rig, node, 1_000 + write_id);
+    let w = tab.db.store().writes.next_write_id();
+    let r = tab.call(rig, node, make).expect("the write is made");
+    assert_eq!(tab.verdicts.get(&w).and_then(|v| v.last()), Some(&protocol::WriteState::Busy), "the tab's write did not wait behind the commit in flight: {:?}", tab.verdicts.get(&w));
+    release(rig, node);
+    if !theirs.is_empty() {
+        elsewhere(rig, node, write_id, theirs);
+    }
+    r
+}
+
 /// The record at `key` with `patch` over it, re-encoded as another session
 /// would write it.
-fn their_record(tab: &mut Tab, schema: &craftworks_sdk::Schema, key: &[u8], patch: serde_json::Value) -> Vec<u8> {
-    let old = craftworks_sdk::store::Reads::get(tab.db.store_mut(), key).expect("loaded").expect("present");
+fn their_record(tab: &mut Tab, rig: &mut PageRig, node: &mut Node, schema: &craftworks_sdk::Schema, key: &[u8], patch: serde_json::Value) -> Vec<u8> {
+    let old = tab.get(rig, node, key).expect("present");
     let mut d = craftworks_sdk::record::decode(schema, &old).expect("decodes");
     for (k, v) in obj(patch) {
         d.fields.insert(k, v);
@@ -1221,20 +1323,26 @@ fn their_record(tab: &mut Tab, schema: &craftworks_sdk::Schema, key: &[u8], patc
     craftworks_sdk::record::encode(schema, &d.fields, d.created, d.updated + 1, &d.author).expect("encodes")
 }
 
-/// What the HOST does on its tick, until nothing moves: re-run, load what the
-/// re-run needs (the whole range, as this rig loads), pump. Returns what the
-/// re-runs could not keep, and the raw conflicts no re-run took.
+/// What the HOST does on its tick, until nothing moves: send what waits
+/// (the store's tick re-sends a `Busy` write), re-run what conflicted, pump.
+/// Returns what the re-runs could not keep, and the raw conflicts no re-run
+/// took.
 fn settle(tab: &mut Tab, rig: &mut PageRig, node: &mut Node) -> (Vec<craftworks_sdk::RerunEvent>, Vec<u64>) {
     let mut events = Vec::new();
     let mut raw = Vec::new();
     for _ in 0..12 {
+        tab.db.store_mut().writes.tick();
         tab.pump(rig, node);
-        let step = tab.db.rerun(rig.now, craftworks_sdk::Loads::default().budget_ms);
+        let now = rig.now;
+        let step = tab.lend(rig, node, |db| {
+            let step = db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS);
+            // A re-run that stopped on blocks walks again on the next tick.
+            db.store_mut().take_ticket();
+            db.store_mut().unpin();
+            step
+        });
         events.extend(step.events);
-        raw.extend(tab.db.store_mut().take_conflicts().into_iter().map(|c| c.write_id).filter(|w| !step.taken.contains(w)));
-        if !step.load.is_empty() {
-            tab.db.store_mut().request_range(1, b"", &[0xFF; 64], 256);
-        }
+        raw.extend(tab.db.store_mut().writes.take_conflicts().into_iter().map(|c| c.write_id).filter(|w| !step.taken.contains(w)));
         tab.pump(rig, node);
     }
     (events, raw)
@@ -1250,9 +1358,9 @@ fn published_record(node: &Node, schema: &craftworks_sdk::Schema, key: &[u8]) ->
 
 fn tab_with_record(rig: &mut PageRig, node: &mut Node) -> (Tab, Vec<u8>, craftworks_sdk::id::Loc) {
     let mut tab = Tab::open(rig, node);
-    tab.db.define("t", &rerun_schema()).expect("define");
+    tab.call(rig, node, |db| db.define("t", &rerun_schema())).expect("define");
     tab.pump(rig, node);
-    let rec = tab.db.put("t", &obj(serde_json::json!({ "title": "t0", "body": "b0", "note": "n0" }))).expect("put");
+    let rec = tab.call(rig, node, |db| db.put("t", &obj(serde_json::json!({ "title": "t0", "body": "b0", "note": "n0" })))).expect("put");
     tab.pump(rig, node);
     let loc = craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id");
     (tab, craftworks_sdk::db::record_key("t", loc), loc)
@@ -1261,25 +1369,26 @@ fn tab_with_record(rig: &mut PageRig, node: &mut Node) -> (Tab, Vec<u8>, craftwo
 /// sdk#143 on the PAGE path: another session changes the record's `title`;
 /// this tab's stale update changes its `body`. The update conflicts, is
 /// RE-RUN on their version, and BOTH land: title t1, body b1. Nothing is told
-/// (nothing was lost), the conflict is not raw news, and the stale write went
-/// on the wire once — the re-run is a new write. Control: with nothing in
-/// between, the update publishes as itself and nothing is re-run.
+/// (nothing was lost), the conflict is not raw news, and the stale write was
+/// never sent again after its verdict — the re-run is a new write. Control:
+/// the same wait with nothing changed, and the update publishes as itself.
 #[test]
 fn a_stale_update_to_another_field_is_re_run_and_both_changes_land() {
     for interfere in [false, true] {
         let mut node = Node::new();
         let mut rig = PageRig::new();
         let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
-        if interfere {
-            let theirs = their_record(&mut tab, &rerun_schema(), &key, serde_json::json!({ "title": "t1" }));
-            elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)]);
-        }
-        let w = tab.db.store_mut().next_write_id();
-        tab.db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))).expect("the update is made");
+        let theirs = if interfere {
+            vec![protocol::Op::Put(key.clone(), their_record(&mut tab, &mut rig, &mut node, &rerun_schema(), &key, serde_json::json!({ "title": "t1" })))]
+        } else {
+            Vec::new()
+        };
+        let w = tab.db.store().writes.next_write_id();
+        behind(&mut tab, &mut rig, &mut node, 1, theirs, |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))));
         let (events, raw) = settle(&mut tab, &mut rig, &mut node);
         assert!(events.is_empty(), "interfere {interfere}: nothing was lost and yet {events:?}");
         assert!(raw.is_empty(), "interfere {interfere}: a raw conflict reached the app: {raw:?}");
-        assert_eq!(tab.sends.get(&w), Some(&1), "the stale write itself was re-sent");
+        assert_eq!(tab.sends.get(&w), Some(&2), "the stale write itself was re-sent after its Conflict (it goes twice: once told Busy, once to its verdict)");
         let rec = published_record(&node, &rerun_schema(), &key).expect("published");
         let want_title = if interfere { "t1" } else { "t0" };
         assert_eq!((rec.get("title"), rec.get("body")), (Some(&serde_json::json!(want_title)), Some(&serde_json::json!("b1"))), "interfere {interfere}");
@@ -1296,10 +1405,9 @@ fn a_stale_update_to_the_same_field_goes_to_the_other_side_told_once() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
-    let theirs = their_record(&mut tab, &rerun_schema(), &key, serde_json::json!({ "title": "t1" }));
-    elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)]);
-    let w = tab.db.store_mut().next_write_id();
-    tab.db.update("t", loc, &obj(serde_json::json!({ "title": "t2", "body": "b1" }))).expect("the update is made");
+    let theirs = their_record(&mut tab, &mut rig, &mut node, &rerun_schema(), &key, serde_json::json!({ "title": "t1" }));
+    let w = tab.db.store().writes.next_write_id();
+    behind(&mut tab, &mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)], |db| db.update("t", loc, &obj(serde_json::json!({ "title": "t2", "body": "b1" }))));
     let (events, raw) = settle(&mut tab, &mut rig, &mut node);
     assert_eq!(events, vec![craftworks_sdk::RerunEvent::Dropped { write_id: w, fields: vec!["title".into()] }]);
     assert!(raw.is_empty(), "{raw:?}");
@@ -1316,10 +1424,13 @@ fn a_chain_of_stale_updates_is_re_run_in_order_and_every_change_survives() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
-    let theirs = their_record(&mut tab, &rerun_schema(), &key, serde_json::json!({ "note": "n1" }));
+    let theirs = their_record(&mut tab, &mut rig, &mut node, &rerun_schema(), &key, serde_json::json!({ "note": "n1" }));
+    // Both updates read while a commit is in flight, and wait; theirs lands.
+    commit_in_flight(&mut rig, &mut node, 1_001);
+    tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "title": "t1" })))).expect("the first update");
+    tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" })))).expect("the second update");
+    release(&mut rig, &mut node);
     elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)]);
-    tab.db.update("t", loc, &obj(serde_json::json!({ "title": "t1" }))).expect("the first update");
-    tab.db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))).expect("the second update");
     let (events, raw) = settle(&mut tab, &mut rig, &mut node);
     assert!(events.is_empty(), "{events:?}");
     assert!(raw.is_empty(), "{raw:?}");
@@ -1339,7 +1450,7 @@ fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
-    let w = tab.db.store_mut().next_write_id();
+    let w = tab.db.store().writes.next_write_id();
     let mut events = Vec::new();
     let mut other_id = 1;
     let interfere = |tab: &mut Tab, rig: &mut PageRig, node: &mut Node, other_id: &mut u64| {
@@ -1353,18 +1464,24 @@ fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
         *other_id += 1;
         let _ = tab;
     };
+    // The update, and every re-run of it, READS while a commit is in flight
+    // and waits; the record is changed again before it lands.
+    commit_in_flight(&mut rig, &mut node, 2_000);
+    tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" })))).expect("the update is made");
+    release(&mut rig, &mut node);
     interfere(&mut tab, &mut rig, &mut node, &mut other_id);
-    tab.db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))).expect("the update is made");
-    for _ in 0..10 {
+    for round in 0..10u64 {
+        // The waiting write goes again and meets the change: Conflict.
+        tab.db.store_mut().writes.tick();
         tab.pump(&mut rig, &mut node);
-        let step = tab.db.rerun(rig.now, craftworks_sdk::Loads::default().budget_ms);
+        // Its re-run is made behind the next commit in flight...
+        commit_in_flight(&mut rig, &mut node, 2_001 + round);
+        let now = rig.now;
+        let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
         events.extend(step.events);
-        if !step.load.is_empty() {
-            tab.db.store_mut().request_range(1, b"", &[0xFF; 64], 256);
-            tab.pump(&mut rig, &mut node);
-            // Behind the reload, before the re-run is made: changed again.
-            interfere(&mut tab, &mut rig, &mut node, &mut other_id);
-        }
+        release(&mut rig, &mut node);
+        // ...and changed again before it lands.
+        interfere(&mut tab, &mut rig, &mut node, &mut other_id);
     }
     let rounds = usize::from(craftworks_sdk::RERUN_ROUNDS);
     assert_eq!(tab.sends.range(w + 1..).count(), rounds, "not exactly {rounds} re-runs went on the wire");
@@ -1382,9 +1499,8 @@ fn a_stale_update_of_a_record_deleted_elsewhere_is_told_deleted() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
-    elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Delete(key.clone())]);
-    let w = tab.db.store_mut().next_write_id();
-    tab.db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))).expect("the update is made");
+    let w = tab.db.store().writes.next_write_id();
+    behind(&mut tab, &mut rig, &mut node, 1, vec![protocol::Op::Delete(key.clone())], |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))));
     let (events, _) = settle(&mut tab, &mut rig, &mut node);
     assert_eq!(events, vec![craftworks_sdk::RerunEvent::Deleted { write_id: w }]);
     assert!(published_record(&node, &rerun_schema(), &key).is_none(), "the deleted record came back");
@@ -1407,8 +1523,7 @@ fn a_stale_schema_append_is_re_run_as_an_append_on_theirs() {
         }
         s
     };
-    elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(schema_key_of("t"), serde_json::to_vec(&with(&[("x", "text")])).unwrap())]);
-    tab.db.define("t", &with(&[("y", "int")])).expect("the define is made");
+    behind(&mut tab, &mut rig, &mut node, 1, vec![protocol::Op::Put(schema_key_of("t"), serde_json::to_vec(&with(&[("x", "text")])).unwrap())], |db| db.define("t", &with(&[("y", "int")])));
     let (events, raw) = settle(&mut tab, &mut rig, &mut node);
     assert!(events.is_empty(), "{events:?}");
     assert!(raw.is_empty(), "{raw:?}");
@@ -1437,9 +1552,8 @@ fn a_schema_field_appended_on_both_sides_is_skipped_or_refused_by_kind() {
         };
         // Theirs: + x. Mine: + x (text) and z, so mine is not identical and
         // must be judged field by field.
-        elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(schema_key_of("t"), serde_json::to_vec(&with("", their_kind)).unwrap())]);
-        let w = tab.db.store_mut().next_write_id();
-        tab.db.define("t", &with("and z", "text")).expect("the define is made");
+        let w = tab.db.store().writes.next_write_id();
+        behind(&mut tab, &mut rig, &mut node, 1, vec![protocol::Op::Put(schema_key_of("t"), serde_json::to_vec(&with("", their_kind)).unwrap())], |db| db.define("t", &with("and z", "text")));
         let (events, _) = settle(&mut tab, &mut rig, &mut node);
         let (_, root) = node.head().expect("a head");
         let stored: craftworks_sdk::Schema = serde_json::from_slice(node.tree(&root).expect("a tree").get(&schema_key_of("t")).expect("the schema")).expect("a schema");
@@ -1467,38 +1581,11 @@ fn a_patch_field_gone_from_the_schema_is_a_named_refusal() {
         { "name": "title", "kind": "text", "required": true }
     ] }))
     .expect("a schema");
-    elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(schema_key_of("t"), serde_json::to_vec(&narrow).unwrap())]);
-    let w = tab.db.store_mut().next_write_id();
-    tab.db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))).expect("the update is made");
+    let w = tab.db.store().writes.next_write_id();
+    behind(&mut tab, &mut rig, &mut node, 1, vec![protocol::Op::Put(schema_key_of("t"), serde_json::to_vec(&narrow).unwrap())], |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))));
     let (events, _) = settle(&mut tab, &mut rig, &mut node);
     assert!(matches!(events.as_slice(), [craftworks_sdk::RerunEvent::Failed { write_id, reason }] if *write_id == w && reason.contains("`body`") && reason.contains("no longer")), "{events:?}");
     let _ = key;
-}
-
-/// THE WAIT: a re-run needs its record loaded again (the Conflict forgot it).
-/// A host that never loads it does not hold the chain for ever: inside the
-/// load path's budget it waits (nothing told, nothing written), past it the
-/// write fails named.
-#[test]
-fn a_re_run_whose_record_never_loads_fails_at_the_load_budget() {
-    let mut node = Node::new();
-    let mut rig = PageRig::new();
-    let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
-    let theirs = their_record(&mut tab, &rerun_schema(), &key, serde_json::json!({ "title": "t1" }));
-    elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)]);
-    let w = tab.db.store_mut().next_write_id();
-    tab.db.update("t", loc, &obj(serde_json::json!({ "body": "b1" }))).expect("the update is made");
-    tab.pump(&mut rig, &mut node);
-    let budget = craftworks_sdk::Loads::default().budget_ms;
-    let t0 = rig.now;
-    let first = tab.db.rerun(t0, budget);
-    assert!(!first.load.is_empty() && first.events.is_empty(), "the re-run did not ask for its record: {first:?}");
-    let inside = tab.db.rerun(t0 + budget - 1, budget);
-    assert!(!inside.load.is_empty() && inside.events.is_empty(), "gave up inside the budget: {inside:?}");
-    let past = tab.db.rerun(t0 + budget, budget);
-    assert!(matches!(past.events.as_slice(), [craftworks_sdk::RerunEvent::Failed { write_id, .. }] if *write_id == w), "{past:?}");
-    assert!(tab.db.rerun(t0 + budget + 1, budget).events.is_empty(), "told twice");
-    assert_eq!(tab.sends.range(w + 1..).count(), 0, "a re-run was written without its record");
 }
 
 /// ALREADY SATISFIED (sdk#145's second layer): the other side made the SAME
@@ -1510,10 +1597,9 @@ fn a_stale_update_the_other_side_already_made_is_satisfied_silently() {
     let mut node = Node::new();
     let mut rig = PageRig::new();
     let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
-    let theirs = their_record(&mut tab, &rerun_schema(), &key, serde_json::json!({ "title": "t1", "note": "n1" }));
-    elsewhere(&mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)]);
-    let w = tab.db.store_mut().next_write_id();
-    tab.db.update("t", loc, &obj(serde_json::json!({ "title": "t1" }))).expect("the update is made");
+    let theirs = their_record(&mut tab, &mut rig, &mut node, &rerun_schema(), &key, serde_json::json!({ "title": "t1", "note": "n1" }));
+    let w = tab.db.store().writes.next_write_id();
+    behind(&mut tab, &mut rig, &mut node, 1, vec![protocol::Op::Put(key.clone(), theirs)], |db| db.update("t", loc, &obj(serde_json::json!({ "title": "t1" }))));
     let (events, raw) = settle(&mut tab, &mut rig, &mut node);
     assert!(events.is_empty(), "a change that is there was told lost: {events:?}");
     assert!(raw.is_empty(), "{raw:?}");

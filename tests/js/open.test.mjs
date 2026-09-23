@@ -52,6 +52,7 @@ function fakeSession({ deliverAfterMs = null } = {}) {
     reconnected() {},
     take_progress: () => "[]",
     take_loads() { const o = ended; ended = []; return JSON.stringify(o); },
+    resume() {},
     provisioned: () => true,
     refused: () => "",
     exhausted: () => false,

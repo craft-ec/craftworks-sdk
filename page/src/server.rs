@@ -88,6 +88,9 @@ pub struct Server {
     /// this page stands on moved and NOT by a commit of this page's. What
     /// the client reads to know its loaded ranges are behind.
     adopted: bool,
+    /// Readers' fetches that ENDED, in order: each a ticket a walk is parked
+    /// on (READ-STATE). Drained by [`Server::take_fetched`].
+    fetched: Vec<(u64, Fetched)>,
     /// A displaced tip being judged key by key at the winner.
     probe: Option<Probe>,
     next_probe: u64,
@@ -177,6 +180,36 @@ struct Probe {
     superseded: std::collections::BTreeSet<Vec<u8>>,
 }
 
+/// The engine client a READER's fetches go under (READ-STATE, design B): the
+/// page's store walks the tree itself and asks the engine only for the blocks
+/// a walk stopped on. Session 0, never a real session, so no client's reply
+/// is ever taken for one.
+const WALK_CLIENT: engine::ClientId = engine::ClientId(2);
+
+/// How a reader's fetch (its TICKET) ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    /// The engine's read at that root finished: the blocks it reached are here.
+    Loaded,
+    /// A block could not be had within the read's budget, or the read could
+    /// not be held: not "absent", and never answered as empty. WHY, in the
+    /// engine's words (a block id, the warm bound) — never a key or a value.
+    Unavailable(String),
+}
+
+/// The page ANSWERING for its own tree (READ-STATE, design B): whatever hosts
+/// a `Server` — `page-io` in a browser, the testkit's scripted node in a test
+/// — lends it to the store that reads through it, and carries out what each
+/// call produced (node ops go out, replies are kept for the client).
+pub trait Host {
+    /// Run `f` on the server, then carry out what it produced.
+    fn with_server<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R;
+    /// A protocol frame from the client.
+    fn client(&mut self, frame: &[u8]);
+    /// Protocol replies for the client, in order.
+    fn take_replies(&mut self) -> Vec<Vec<u8>>;
+}
+
 /// The engine client the Server reads under for itself: session 0 is never a
 /// real session (`protocol::session_is_valid`), so no client's reply is ever
 /// taken for a probe's.
@@ -209,6 +242,7 @@ impl Server {
             tip: None,
             seen_head: (0, [0; 32]),
             adopted: false,
+            fetched: Vec::new(),
             probe: None,
             next_probe: 1,
             merge: None,
@@ -355,6 +389,17 @@ impl Server {
                 own.push(f.clone());
                 false
             }
+            // A reader's fetch ended: its ticket's end, never a reply.
+            Effect::Reply { client, req_id, result } if *client == WALK_CLIENT => {
+                let how = match result {
+                    engine::read::ReadResult::Page { .. } => Fetched::Loaded,
+                    engine::read::ReadResult::Unavailable(cid) => Fetched::Unavailable(format!("block {} could not be had", cid.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())),
+                    engine::read::ReadResult::OutOfWarmSpace => Fetched::Unavailable("the read needs more than the warm bound holds".into()),
+                    _ => Fetched::Unavailable("the engine answered a walk's fetch with something other than a page".into()),
+                };
+                self.fetched.push((req_id.0, how));
+                false
+            }
             Effect::Notify { client, .. } if *client == MERGE_CLIENT => {
                 own.push(f.clone());
                 false
@@ -435,6 +480,42 @@ impl Server {
             effects.extend(more);
         }
         self.finish_probe(out);
+    }
+
+    /// The root a walk of THIS page's tree reads (READ-STATE inv. 6): the
+    /// warm root, this page's accepted writes applied. `None` until the head
+    /// is recovered — before it the only tree is the empty one, and a walk
+    /// of it would answer "nothing here" for a tree nobody has read.
+    pub fn read_root(&self) -> Option<freenet_prolly::Cid> {
+        self.page.recovered().then(|| self.page.warm_root())
+    }
+
+    /// Walk the tree at `root`, now, fetching nothing.
+    pub fn walk(&self, root: &freenet_prolly::Cid, walk: &engine::read::Walk) -> engine::read::Walked {
+        self.page.walk(root, walk)
+    }
+
+    /// A walk stopped on missing blocks: the engine reads `range` at `root`
+    /// (or, before the head is recovered, at the head once it is), fetching
+    /// what it needs, and its end is reported under `ticket` by
+    /// [`Server::take_fetched`]. Every such read ENDS: answered, or given up
+    /// within its rounds and GETs — never silent.
+    pub fn fetch(&mut self, ticket: u64, root: Option<freenet_prolly::Cid>, range: freenet_prolly::range::Range) {
+        let mut out = Outbound::default();
+        let req_id = as_req_id(ticket);
+        let range = Box::new(range);
+        self.page.event(match root {
+            Some(root) => Event::ScanAt { client: WALK_CLIENT, req_id, root, range },
+            None => Event::Scan { client: WALK_CLIENT, req_id, range },
+        });
+        self.drain(&mut out);
+        self.answer_call(&mut out);
+        self.out.extend(out.replies);
+    }
+
+    /// Readers' fetches that ended since the last call, in order. Drains.
+    pub fn take_fetched(&mut self) -> Vec<(u64, Fetched)> {
+        std::mem::take(&mut self.fetched)
     }
 
     /// Has this page ADOPTED a head that was not its own commit since the

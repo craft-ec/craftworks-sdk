@@ -299,6 +299,16 @@ pub enum Event {
         req_id: read::ReqId,
         range: Box<freenet_prolly::range::Range>,
     },
+    /// A scan AT A GIVEN ROOT (READ-STATE open item 3): the root a reader's
+    /// walk stopped at, so the blocks it fetches are that tree's. The page's
+    /// store sends it when its own walk found blocks missing; the reply is
+    /// the read's end (its TICKET), and the store walks again at that root.
+    ScanAt {
+        client: ClientId,
+        req_id: read::ReqId,
+        root: Cid,
+        range: Box<freenet_prolly::range::Range>,
+    },
     /// What changed in this range since the root the reader last saw?
     ///
     /// **No subscription is involved, and that is the point.** A delta is a
@@ -1528,6 +1538,20 @@ impl<B: Blocks> Engine<B> {
                 req_id,
                 read::Want::Scan(Box::new(range.as_ref().into())),
             ),
+            Event::ScanAt {
+                client,
+                req_id,
+                root,
+                range,
+            } => {
+                let want = read::Want::Scan(Box::new(range.as_ref().into()));
+                if self.recovered {
+                    self.on_read_at(client, req_id, want, root)
+                } else {
+                    // Only a recovered engine has a root a reader could name.
+                    self.read_or_wait(client, req_id, want)
+                }
+            }
             Event::ChangesSince {
                 client,
                 req_id,
@@ -1932,6 +1956,12 @@ impl<B: Blocks> Engine<B> {
 
     fn on_read(&mut self, client: ClientId, req_id: read::ReqId, want: read::Want) -> Vec<Effect> {
         let root = self.published_root;
+        self.on_read_at(client, req_id, want, root)
+    }
+
+    /// A read at `root`: the published head for a protocol read, the root a
+    /// reader's own walk stopped at for [`Event::ScanAt`].
+    fn on_read_at(&mut self, client: ClientId, req_id: read::ReqId, want: read::Want, root: Cid) -> Vec<Effect> {
         self.reads.parked.insert(
             req_id,
             read::Parked {
@@ -4066,6 +4096,31 @@ impl<B: Blocks> Engine<B> {
             empty_cid: self.empty.cid,
             empty_bytes: &self.empty.bytes,
             arrived: &self.arrived,
+        }
+    }
+
+    /// Has the head been recovered? Before it, the only tree is the empty
+    /// one, and a walk of it would answer "nothing here" for a tree nobody
+    /// has read (sdk#223).
+    pub fn recovered(&self) -> bool {
+        self.recovered
+    }
+
+    /// WALK the tree at `root` over this engine's blocks, now, fetching
+    /// nothing (READ-STATE, design B). The descent is `read::attempt`, the
+    /// same one a parked read makes, so a reader and the engine cannot
+    /// disagree about what a tree holds.
+    pub fn walk(&self, root: &Cid, walk: &read::Walk) -> read::Walked {
+        let want = match walk {
+            read::Walk::Get(k) => read::Want::Get(k.clone()),
+            read::Walk::Scan(s) => read::Want::Scan(s.clone()),
+            read::Walk::Delta(d) => read::Want::Delta(d.clone()),
+        };
+        let mut parsed = 0;
+        match read::attempt(&self.source(), &self.params, &want, root, &mut parsed) {
+            read::Attempt::Done(r) => read::Walked::Done(r),
+            read::Attempt::Need(ids) | read::Attempt::NeedFrom { ids, .. } => read::Walked::Need(ids),
+            read::Attempt::Broken(c) => read::Walked::Broken(c),
         }
     }
 

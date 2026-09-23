@@ -1,5 +1,5 @@
 //! craftworks-sdk#160: a write that changes NOTHING, through the path an app
-//! takes -- `Db` over `CachedStore` over the real engine (`PageNode`).
+//! takes -- `Db` over the page's store over the real engine (`PageNode`).
 //!
 //! `Db::define` writes the schema unconditionally, and an app defines every
 //! domain on every open. Traced here before the fix, LIVE, not latent: the
@@ -10,8 +10,10 @@
 use craftworks_sdk::store::{Edit, Store as _};
 use craftworks_sdk::*;
 use serde_json::json;
-use std::collections::BTreeMap;
-use testkit::page_node::{PageConn, PageNode};
+use testkit::page_node::PageNode;
+
+mod support;
+use support::page_tab::Tab;
 
 struct At;
 impl Env for At {
@@ -20,95 +22,6 @@ impl Env for At {
     }
     fn rand32(&mut self) -> u32 {
         7
-    }
-}
-
-const LOAD: u64 = 1;
-const EVERYTHING: [u8; 64] = [0xFF; 64];
-
-struct Page {
-    db: Db<CachedStore, At>,
-    clock: testkit::Clock,
-    _node: PageNode,
-    conn: PageConn,
-    /// Per write id, how many times it went on the wire.
-    sends: BTreeMap<u64, usize>,
-    verdicts: BTreeMap<u64, Vec<protocol::WriteState>>,
-}
-
-impl Page {
-    fn new() -> Page {
-        let node = PageNode::new();
-        let conn = node.connect();
-        let (store, clock) = testkit::cached_store();
-        let mut p = Page {
-            db: Db::new(store, At, [1, 2, 3, 4]),
-            clock,
-            _node: node,
-            conn,
-            sends: BTreeMap::new(),
-            verdicts: BTreeMap::new(),
-        };
-        p.db.store_mut().client.send(&protocol::Request::Identity);
-        p.pump();
-        // An opening session loads before it reads: the whole key space,
-        // over the wire, so `define`'s schema read is answered, not NotLoaded.
-        p.db.store_mut().request_range(LOAD, b"", &EVERYTHING, 256);
-        p.pump();
-        p
-    }
-
-    fn pump(&mut self) {
-        for _ in 0..200 {
-            let frames = self.db.store_mut().take_outbound();
-            if frames.is_empty() {
-                return;
-            }
-            for f in &frames {
-                if let protocol::Incoming::Ok(env) = protocol::decode_request(f) {
-                    if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
-                        *self.sends.entry(write_id).or_default() += 1;
-                    }
-                }
-            }
-            for reply in self
-                .conn
-                .frames(&frames)
-            {
-                let decoded = protocol::decode_reply(&reply);
-                // This page's OWN write states, as the store reads them: named
-                // by its session since sdk#146.
-                if let Some((write_id, state)) =
-                    decoded.as_ref().ok().and_then(|r| self.db.store_mut().client.own_write_state(r))
-                {
-                    self.verdicts.entry(write_id).or_default().push(state);
-                }
-                // What the HOST does with a page: `CachedStore` records a
-                // range as loaded only when told the interval it asked for.
-                if let Ok(protocol::Reply::Page {
-                    req_id: LOAD,
-                    entries,
-                    cursor: None,
-                    at,
-                    ..
-                }) = decoded
-                {
-                    self.db
-                        .store_mut()
-                        .on_page(b"", &EVERYTHING, entries, at.root);
-                }
-                self.db.store_mut().on_inbound(&reply);
-            }
-        }
-        panic!("the page never reached a standstill");
-    }
-
-    fn seconds(&mut self, n: u64) {
-        for _ in 0..n {
-            self.clock.advance(1000);
-            let _ = self.db.store_mut().tick();
-            self.pump();
-        }
     }
 }
 
@@ -123,32 +36,33 @@ fn schema() -> Schema {
 #[test]
 fn defining_a_domain_twice_publishes_and_the_next_write_goes() {
     use protocol::WriteState as W;
-    let mut p = Page::new();
-    let w1 = p.db.store_mut().next_write_id();
+    let node = PageNode::new();
+    let mut p = Tab::open(&node, At, [1, 2, 3, 4]);
+    let w1 = p.db.store().writes.next_write_id();
     p.db.define("tasks", &schema()).expect("the first define");
     p.pump();
     p.seconds(5);
     let puts_before = p.conn.served(testkit::page_node::Served::Put);
 
-    let w2 = p.db.store_mut().next_write_id();
+    let w2 = p.db.store().writes.next_write_id();
     p.db.define("tasks", &schema())
         .expect("the same define again");
     p.pump();
     p.seconds(90);
     let puts_for_w2 = p.conn.served(testkit::page_node::Served::Put) - puts_before;
 
-    let w3 = p.db.store_mut().next_write_id();
+    let w3 = p.db.store().writes.next_write_id();
     p.db.store_mut()
         .apply_batch(&[(b"d/other".to_vec(), Edit::Put(b"x".to_vec()))])
         .expect("the store took the write");
     p.pump();
     p.seconds(5);
 
-    let told = |id: u64| p.verdicts.get(&id).cloned().unwrap_or_default();
+    let told = |id: u64| p.told(id);
     assert_eq!(told(w1), vec![W::Accepted, W::Published, W::ParityComplete]);
     assert_eq!(
-        p.sends.get(&w2),
-        Some(&1),
+        p.sends(w2),
+        Some(1),
         "the identical define is not on the wire once -- this test no longer traces the engine"
     );
     assert_eq!(
@@ -167,5 +81,5 @@ fn defining_a_domain_twice_publishes_and_the_next_write_goes() {
         told(w3)
     );
     assert!(told(w3).contains(&W::Published), "{:?}", told(w3));
-    assert_eq!(p.sends.get(&w3), Some(&1), "the next write was re-sent");
+    assert_eq!(p.sends(w3), Some(1), "the next write was re-sent");
 }

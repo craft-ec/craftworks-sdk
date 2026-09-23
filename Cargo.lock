@@ -256,6 +256,7 @@ dependencies = [
  "getrandom 0.2.17",
  "instrument",
  "js-sys",
+ "page",
  "protocol",
  "serde",
  "serde_json",

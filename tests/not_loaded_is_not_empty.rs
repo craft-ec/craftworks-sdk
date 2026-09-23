@@ -9,29 +9,70 @@
 //!
 //! It did not. `Db`'s error was a `String`, so a browser app would have had
 //! to match on the TEXT of a message to tell recovery from refusal.
+//!
+//! The page's store WALKS the tree (READ-STATE, design B), so "not looked" is
+//! now "there is no tree to walk yet": a store before its page exists, or
+//! before the engine has recovered its head. Such a read is `NOT_LOADED`
+//! WITH a ticket — the engine read that ends when there is a tree — never an
+//! empty answer, and never a zero root.
 
-use craftworks_sdk::{CachedStore, Db, DbError, Scan, SystemEnv};
+use craftworks_sdk::{Db, DbError, PageStore, Reads, Scan, StoreError, SystemEnv};
+use testkit::{PageConn, PageNode};
 
-fn store() -> CachedStore {
-    testkit::cached_store().0
+type Store = PageStore<PageConn>;
+
+/// A store with NO page yet: what a session holds from its first line until
+/// provisioning (the web `Session` builds its `Db` before the page).
+fn store_before_its_page(clock: &testkit::Clock) -> Store {
+    PageStore::new(clock.as_fn(), clock.as_fn())
 }
 
-fn db(store: CachedStore) -> Db<CachedStore, SystemEnv> {
+fn db(store: Store) -> Db<Store, SystemEnv> {
     Db::new(store, SystemEnv, [0u8; 4])
 }
 
-/// Everything, as a range: the whole key space, loaded and genuinely empty.
-fn load_everything_empty(s: &mut CachedStore) {
-    s.on_page(b"", &[0xFFu8; 64], Vec::new(), [0u8; 32]);
+/// A store over a page whose head is read (an empty tree): a read of it WALKS.
+fn store_over_an_empty_tree(node: &PageNode) -> Store {
+    testkit::page_store(node).0
+}
+
+/// Nothing to walk: every read says NOT_LOADED and hands out a ticket; no
+/// root is named. Then the page comes, the ticket ENDS, and the same reads
+/// answer — empty is now a fact.
+#[test]
+fn an_unwalkable_store_is_not_an_empty_one() {
+    let clock = testkit::Clock::new(0);
+    let mut s = store_before_its_page(&clock);
+    assert_eq!(Reads::get(&mut s, b"a/1"), Err(StoreError::NotLoaded));
+    assert!(s.take_ticket().is_some(), "a NOT_LOADED with no ticket: nothing could ever end it");
+    assert_eq!(Reads::scan(&mut s, b"a/", b"b/", false, 10), Err(StoreError::NotLoaded));
+    let t = s.take_ticket().expect("a scan's NOT_LOADED carries a ticket");
+    // No root to name: `NotLoaded`, never thirty-two zero bytes a caller would
+    // record as where it stands and ask deltas from for ever.
+    assert_eq!(Reads::root(&mut s), Err(StoreError::NotLoaded));
+    assert_eq!(Reads::changes_since(&mut s, [0; 32], b"a/", b"b/", 100), Err(StoreError::NotLoaded));
+
+    // The page comes (as provisioning makes one): the waiting read ENDS.
+    let node = PageNode::new();
+    s.writes.client.send(&protocol::Request::Identity);
+    s.set_host(node.connect());
+    let ended = s.take_ended();
+    assert!(ended.iter().any(|(id, how)| *id == t && *how == craftworks_sdk::Ended::Loaded), "the scan's ticket did not end LOADED: {ended:?}");
+    s.resume(t);
+    assert_eq!(Reads::scan(&mut s, b"a/", b"b/", false, 10), Ok(vec![]), "the walk of an empty tree did not answer empty");
+    s.unpin();
+    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(None));
+    assert!(Reads::root(&mut s).is_ok(), "a walked store names its root");
 }
 
 /// A read the store has not loaded is `NOT_LOADED` — never an empty result.
 #[test]
 fn an_unloaded_read_says_not_loaded() {
-    let mut d = db(store());
+    let clock = testkit::Clock::new(0);
+    let mut d = db(store_before_its_page(&clock));
     let e = d
         .scan("note", Scan::default())
-        .expect_err("a store that has loaded nothing answered a scan");
+        .expect_err("a store with no tree to walk answered a scan");
     assert!(matches!(e, DbError::NotLoaded { .. }), "got {e:?}");
     assert_eq!(e.code(), "NOT_LOADED");
     assert!(
@@ -40,24 +81,23 @@ fn an_unloaded_read_says_not_loaded() {
     );
 }
 
-/// **THE CONTROL.** The SAME call, on a store that HAS loaded the range and
-/// found it empty, does not say `NOT_LOADED`.
+/// **THE CONTROL.** The SAME call, on a store that walks a tree and finds
+/// the range empty, does not say `NOT_LOADED`.
 ///
 /// Without this the test above passes against a `Db` that answers
 /// `NOT_LOADED` to everything for ever — which would be a database that
 /// never works, tested green.
 #[test]
 fn control_a_loaded_and_genuinely_empty_read_does_not_say_not_loaded() {
-    let mut s = store();
-    load_everything_empty(&mut s);
-    let mut d = db(s);
+    let node = PageNode::new();
+    let mut d = db(store_over_an_empty_tree(&node));
 
     let e = d
         .scan("note", Scan::default())
         .expect_err("a domain that was never defined answered a scan");
     assert!(
         !matches!(e, DbError::NotLoaded { .. }),
-        "a range that WAS loaded and is empty was reported as not loaded; \
+        "a range that WAS walked and is empty was reported as not loaded; \
          the app would reload for ever ({e:?})"
     );
     assert_eq!(
@@ -119,9 +159,8 @@ fn every_error_carries_a_code_from_the_fixed_list() {
 /// it by reloading and should not be told to.
 #[test]
 fn an_oversized_record_is_too_large_and_is_not_transient() {
-    let mut s = store();
-    load_everything_empty(&mut s);
-    let mut d = db(s);
+    let node = PageNode::new();
+    let mut d = db(store_over_an_empty_tree(&node));
 
     let schema: craftworks_sdk::Schema = serde_json::from_value(serde_json::json!({
         "type": "Note",
@@ -145,9 +184,7 @@ fn an_oversized_record_is_too_large_and_is_not_transient() {
 /// **The granularity is the read's OWN span**, and nothing wider: the exact
 /// key for a get, the exact range for a scan. Widen it to the domain and one
 /// `get` fetches every record in that domain, which is the page-freezing
-/// version of being helpful; the copy's loaded-interval bookkeeping means a
-/// later, wider read asks for whatever is still missing, so asking for
-/// exactly what was wanted costs nothing.
+/// version of being helpful.
 ///
 /// A cold read therefore reports a CHAIN of spans, not one. `scan` and `get`
 /// both read their domain's schema first, so on an empty store the first span
@@ -159,7 +196,8 @@ fn an_oversized_record_is_too_large_and_is_not_transient() {
 /// what the first version of it did: it requested nothing.
 #[test]
 fn a_not_loaded_names_the_span_the_read_needed() {
-    let mut d = db(store());
+    let clock = testkit::Clock::new(0);
+    let mut d = db(store_before_its_page(&clock));
     let scan = d
         .scan("note", Scan::default())
         .expect_err("answered a scan");

@@ -1,46 +1,16 @@
-//! `Db` over the engine, in a browser: reads from the local copy, writes on
-//! the pump.
+//! The page's WRITE half (`CachedStore`): the outbox, the frames it sends,
+//! and every verdict a write of this client's gets.
 //!
-//! The property under test throughout is the one that is easy to get wrong and
-//! invisible when you do: **a range nobody has loaded must not answer
-//! "empty".** An app told empty draws an empty list and stops; an app told
-//! `NotLoaded` reloads.
+//! Reads are not here (READ-STATE, design B): they walk the tree
+//! (`PageStore`, `not_loaded_is_not_empty.rs` and
+//! `testkit/tests/read_state_model.rs`). What this store can say about a key
+//! is only whether a write of its own is still pending there
+//! (`copy.get`) and that write's row state.
 
-use craftworks_sdk::{CachedStore, Reads, Store, StoreError};
+use craftworks_sdk::{CachedStore, Store, StoreError};
 
 fn store() -> CachedStore {
     CachedStore::new(Box::new(|| 0))
-}
-
-fn root(n: u8) -> [u8; 32] {
-    [n; 32]
-}
-
-#[test]
-fn an_unloaded_range_is_not_an_empty_one() {
-    let mut s = store();
-
-    // Nothing loaded: every read says so.
-    assert_eq!(Reads::get(&mut s, b"a/1"), Err(StoreError::NotLoaded));
-    assert_eq!(
-        Reads::scan(&mut s, b"a/", b"b/", false, 10),
-        Err(StoreError::NotLoaded)
-    );
-    assert_eq!(Reads::root(&mut s), Err(StoreError::NotLoaded));
-
-    // Load the range with NOTHING in it. Now "empty" is a fact, and the same
-    // calls answer it — which is the whole distinction.
-    s.on_page(b"a/", b"b/", vec![], root(1));
-    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(None));
-    assert_eq!(Reads::scan(&mut s, b"a/", b"b/", false, 10), Ok(vec![]));
-    assert_eq!(Reads::root(&mut s), Ok(root(1)));
-
-    // A DIFFERENT range is still unknown. The loaded fact does not spread.
-    assert_eq!(Reads::get(&mut s, b"z/1"), Err(StoreError::NotLoaded));
-    assert_eq!(
-        Reads::scan(&mut s, b"z/", b"z0", false, 10),
-        Err(StoreError::NotLoaded)
-    );
 }
 
 #[test]
@@ -56,18 +26,12 @@ fn the_error_says_what_to_do_about_it() {
 #[test]
 fn a_write_shows_at_once_and_goes_out_on_the_pump() {
     let mut s = store();
-    s.on_page(
-        b"a/",
-        b"b/",
-        vec![(b"a/1".to_vec(), b"one".to_vec())],
-        root(1),
-    );
 
     Store::put(&mut s, b"a/1", b"mine").expect("the store took the write");
-    // Visible immediately — that is what optimistic means.
-    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"mine".to_vec())));
-    // And it says it is not settled.
-    assert!(s.copy.get(b"a/1").unwrap().is_pending());
+    // Held at once, and it says it is not settled.
+    let seen = s.copy.get(b"a/1").expect("the write is held");
+    assert_eq!(seen.value(), Some(&b"mine"[..]));
+    assert!(seen.is_pending());
 
     // It really left, exactly once — as a FORCED write (sdk#235, W8): a
     // store-level `put` cannot read first, so it says so, key by key, as
@@ -94,7 +58,6 @@ fn a_write_shows_at_once_and_goes_out_on_the_pump() {
 #[test]
 fn a_write_the_copy_refuses_never_reaches_the_wire() {
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     s.copy.max_pending = 1;
 
     Store::put(&mut s, b"a/1", b"first").expect("the store took the write");
@@ -110,11 +73,7 @@ fn a_write_the_copy_refuses_never_reaches_the_wire() {
          nothing while the tree took it"
     );
     assert_eq!(s.refused.len(), 1, "the refusal was not reported");
-    assert_eq!(
-        Reads::get(&mut s, b"a/2"),
-        Ok(None),
-        "the refused write left a value behind"
-    );
+    assert_eq!(s.copy.get(b"a/2"), None, "the refused write left a value behind");
 }
 
 /// A multi-key write is all or nothing in the COPY too, not only on the wire.
@@ -122,7 +81,6 @@ fn a_write_the_copy_refuses_never_reaches_the_wire() {
 fn a_refused_multi_key_write_leaves_none_of_its_keys_changed() {
     use craftworks_sdk::Edit;
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     s.copy.max_pending = 2;
 
     // Three keys, a cap of two: the third is refused part-way through — and
@@ -138,93 +96,9 @@ fn a_refused_multi_key_write_leaves_none_of_its_keys_changed() {
     assert_eq!(refused, Err(craftworks_sdk::Refused::TooManyPending { cap: 2 }), "the batch was not refused");
     assert_eq!(s.refused.len(), 1, "the refusal was not counted");
     for k in [&b"a/1"[..], b"a/2", b"a/3"] {
-        assert_eq!(
-            Reads::get(&mut s, k),
-            Ok(None),
-            "{} kept part of a refused batch",
-            String::from_utf8_lossy(k)
-        );
+        assert_eq!(s.copy.get(k), None, "{} kept part of a refused batch", String::from_utf8_lossy(k));
     }
     assert_eq!(s.take_outbound().len(), 0, "a refused batch was sent");
-}
-
-#[test]
-fn a_delta_updates_what_is_loaded_and_leaves_pending_on_top() {
-    let mut s = store();
-    s.on_page(
-        b"a/",
-        b"b/",
-        vec![
-            (b"a/1".to_vec(), b"one".to_vec()),
-            (b"a/2".to_vec(), b"two".to_vec()),
-        ],
-        root(1),
-    );
-    Store::put(&mut s, b"a/1", b"mine").expect("the store took the write");
-
-    let told = s.on_delta(
-        vec![
-            (b"a/1".to_vec(), Some(b"theirs".to_vec())),
-            (b"a/2".to_vec(), None),
-        ],
-        root(2),
-    );
-
-    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"mine".to_vec())));
-    assert_eq!(
-        Reads::get(&mut s, b"a/2"),
-        Ok(None),
-        "a removal was not applied"
-    );
-    assert_eq!(Reads::root(&mut s), Ok(root(2)));
-    assert_eq!(
-        told.moved_under_pending,
-        vec![b"a/1".to_vec()],
-        "the contested key did not raise its signal"
-    );
-}
-
-/// The store's `changes_since` is the LOCAL fallback and says so.
-///
-/// The copy holds no history, so it cannot diff two roots. It answers with the
-/// defined outcome rather than an error, which is the same recovery a caller
-/// does against an engine whose old root has been evicted — one path, not two.
-#[test]
-fn the_local_copy_cannot_diff_and_asks_for_a_full_reload() {
-    use craftworks_sdk::Delta;
-    let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
-    assert_eq!(
-        Reads::changes_since(&mut s, root(0), b"a/", b"b/", 100),
-        Ok(Delta::FullReloadRequired { new_root: root(1) })
-    );
-}
-
-/// With nothing loaded there is no root to name, and it says so.
-///
-/// The first version answered with thirty-two zero bytes — a root-shaped value
-/// that is not a root. A caller would have recorded it as where it stands and
-/// asked for deltas against it for ever, and every one of those would come
-/// back `FullReloadRequired` with the same fake root: a loop that looks like
-/// work. `NotLoaded` is what `root()` already says, and it is true.
-#[test]
-fn a_delta_with_nothing_loaded_says_not_loaded_rather_than_naming_a_zero_root() {
-    use craftworks_sdk::Delta;
-    let mut s = store();
-    assert_eq!(Reads::root(&mut s), Err(StoreError::NotLoaded));
-    let answer = Reads::changes_since(&mut s, root(0), b"a/", b"b/", 100);
-    assert_eq!(
-        answer,
-        Err(StoreError::NotLoaded),
-        "a delta over an unloaded copy answered {answer:?} — a root of zeroes \
-         is a value a caller would keep"
-    );
-    assert_ne!(
-        answer,
-        Ok(Delta::FullReloadRequired {
-            new_root: [0u8; 32]
-        })
-    );
 }
 
 /// **THE TIME A PAGE SENDS IS THE WALL CLOCK, QUANTISED — not a count of
@@ -322,16 +196,15 @@ fn a_flush_is_queued_as_a_frame() {
 
 /// M2 (sdk#148), main's surviving mutant on #238: a write that CONFLICTS on
 /// one key (a/1) and also wrote another key nobody touched (a/2). After the
-/// Conflict the copy must not serve the fallen value at EITHER key — a/2 is
-/// not the conflicted key, so only the fall's own forgetting clears it: it is
-/// NotLoaded, and the next read fetches the tree's value. Control: the same
-/// write Published shows the new value at a/2.
+/// Conflict nothing of it is pending at EITHER key — a/2 is not the
+/// conflicted key, so only the fall itself clears it — and a/2's row says
+/// ROLLED BACK, never saved (W6). A read of either key is the tree's.
+/// Control: the same write Published leaves a/2 Clean.
 #[test]
-fn a_conflicted_write_leaves_none_of_its_own_keys_in_the_copy() {
+fn a_conflicted_write_leaves_none_of_its_own_keys_pending() {
     use craftworks_sdk::read_token::read_token;
     for verdict in [protocol::WriteState::Published, protocol::WriteState::Conflict] {
         let mut s = store();
-        s.on_page(b"a/", b"b/", vec![(b"a/1".to_vec(), b"old1".to_vec()), (b"a/2".to_vec(), b"old2".to_vec())], root(1));
         Store::apply_commit(
             &mut s,
             &[
@@ -361,10 +234,12 @@ fn a_conflicted_write_leaves_none_of_its_own_keys_in_the_copy() {
         if verdict == protocol::WriteState::Conflict {
             // What page::Server sends beside it, naming a/1 only.
             say(&mut s, protocol::Reply::Conflicted { session, write_id, key: b"a/1".to_vec(), current: Some(read_token(b"theirs")) });
-            assert_eq!(Reads::get(&mut s, b"a/1"), Err(StoreError::NotLoaded), "the conflicted key still shows a value");
-            assert_eq!(Reads::get(&mut s, b"a/2"), Err(StoreError::NotLoaded), "the fallen write's OTHER key still shows its unsaved value (W6)");
+            assert_eq!(s.copy.get(b"a/1"), None, "the conflicted key still holds the fallen value");
+            assert_eq!(s.copy.get(b"a/2"), None, "the fallen write's OTHER key still holds its unsaved value (W6)");
+            assert_eq!(s.row_state(b"a/2"), craftworks_sdk::store::RowState::RolledBack, "the fallen write's other key does not say rolled back");
         } else {
-            assert_eq!(Reads::get(&mut s, b"a/2"), Ok(Some(b"mine2".to_vec())), "control: the published write's value is not shown");
+            assert_eq!(s.copy.get(b"a/2"), None, "control: a published write is still pending");
+            assert_eq!(s.row_state(b"a/2"), craftworks_sdk::store::RowState::Clean, "control: the published write's row is not saved");
         }
     }
 }
@@ -379,7 +254,6 @@ fn a_conflicted_write_leaves_none_of_its_own_keys_in_the_copy() {
 fn an_own_writes_state_change_names_its_keys() {
     let verdict_of = |states: &[protocol::WriteState]| -> Vec<Vec<Vec<u8>>> {
         let mut s = store();
-        s.on_page(b"a/", b"b/", vec![], root(1));
         // WITH its reads, as a `Db` write makes it: a forced (`Any`) write
         // told Lost falls rather than going again (sdk#235), and this test is
         // about the write that DOES go again.
@@ -436,14 +310,13 @@ fn an_own_writes_state_change_names_its_keys() {
 fn a_superseded_write_names_its_keys() {
     let named = |ours: bool| -> Vec<Vec<u8>> {
         let mut s = store();
-        s.on_page(b"a/", b"b/", vec![], root(1));
         Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"mine".to_vec()))]).expect("taken");
         let _ = s.take_outbound();
         let session = s.client.session().expect("a session");
         let _ = s.take_state_changed();
         let to = if ours { session } else { session + 1 };
         let keys = vec![b"a/1".to_vec()];
-        s.on_inbound(&protocol::encode_reply(&protocol::Reply::Superseded { session: to, write_id: 1, seq: 2, root: root(2), keys }).expect("encodes"));
+        s.on_inbound(&protocol::encode_reply(&protocol::Reply::Superseded { session: to, write_id: 1, seq: 2, root: [2; 32], keys }).expect("encodes"));
         s.take_state_changed()
     };
     assert_eq!(named(true), vec![b"a/1".to_vec()], "a superseded write did not name its keys: its plain bindings keep showing this tab's forgotten value");
@@ -472,7 +345,6 @@ fn a_record_key_names_its_domain_and_a_schema_key_none() {
 #[test]
 fn a_lost_write_is_re_sent_and_falls_named_only_at_the_bound() {
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
     let sent = |s: &mut CachedStore| -> Vec<u64> {
         s.take_outbound()
@@ -494,7 +366,7 @@ fn a_lost_write_is_re_sent_and_falls_named_only_at_the_bound() {
     for n in 1..bound {
         lost(&mut s);
         assert_eq!(sent(&mut s), vec![write_id], "Lost #{n} did not re-send the write");
-        assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"v".to_vec())), "Lost #{n} rolled the row back");
+        assert_eq!(s.copy.get(b"a/1").and_then(|v| v.value().map(<[u8]>::to_vec)), Some(b"v".to_vec()), "Lost #{n} rolled the row back");
         assert!(s.take_lost_gave_up().is_empty(), "named before the bound");
     }
     lost(&mut s);
@@ -527,7 +399,6 @@ fn sent_ids(s: &mut CachedStore) -> Vec<u64> {
 fn a_write_behind_a_lost_one_is_pulled_back_and_lands_after_it() {
     use craftworks_sdk::read_token::read_token;
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![(b"a/1".to_vec(), b"old".to_vec())], root(1));
     Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Value(read_token(b"old")))], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"first".to_vec()))]).expect("taken");
     let w1 = *sent_ids(&mut s).first().expect("w1 went out");
     // Made and SENT before the Lost arrives: it is at the node, not in the
@@ -548,7 +419,8 @@ fn a_write_behind_a_lost_one_is_pulled_back_and_lands_after_it() {
     say(&mut s, w1, protocol::WriteState::Published);
     assert_eq!(sent_ids(&mut s), vec![w2], "the pulled-back write did not follow the Lost one");
     say(&mut s, w2, protocol::WriteState::Published);
-    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"second".to_vec())), "the key does not hold the LAST write the person made");
+    // The order they went in (w1, then w2) is the order they landed: the key
+    // holds the LAST write the person made.
     assert_eq!(s.copy.pending().0, 0, "a write is still unsaved");
 }
 
@@ -559,7 +431,6 @@ fn a_write_behind_a_lost_one_is_pulled_back_and_lands_after_it() {
 #[test]
 fn a_lost_write_a_later_one_landed_over_falls_named_rather_than_re_sent() {
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"first".to_vec()))]).expect("taken");
     let w1 = *sent_ids(&mut s).first().expect("w1 went out");
     Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(b"first")))], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"second".to_vec()))]).expect("taken");
@@ -572,7 +443,7 @@ fn a_lost_write_a_later_one_landed_over_falls_named_rather_than_re_sent() {
     say(&mut s, w1, protocol::WriteState::Lost);
     assert!(sent_ids(&mut s).is_empty(), "the Lost write went again over a later write that had landed: the older value would win");
     assert_eq!(s.take_lost_gave_up(), vec![w1], "the write that could no longer go was not named");
-    assert_eq!(Reads::get(&mut s, b"a/1"), Ok(Some(b"second".to_vec())), "the key does not hold the LAST write the person made");
+    assert_eq!(s.copy.pending().0, 0, "the fallen write is still held, over the LAST write the person made");
 }
 
 /// sdk#265, the architect's item 2 (ONE BUDGET). The tries a write spends on
@@ -583,7 +454,6 @@ fn a_lost_write_a_later_one_landed_over_falls_named_rather_than_re_sent() {
 fn the_lost_re_sends_and_the_conflict_re_runs_share_one_budget() {
     use craftworks_sdk::store::Store as _;
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
     let w1 = *sent_ids(&mut s).first().expect("w1 went out");
     let session = s.client.session().expect("a session");
@@ -600,7 +470,6 @@ fn the_lost_re_sends_and_the_conflict_re_runs_share_one_budget() {
     // And the other direction: a write `Db` made as re-run round N spends its
     // Lost tries from N, not from zero.
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     Store::apply_commit(&mut s, &[(b"a/2".to_vec(), protocol::Expect::Absent)], &[(b"a/2".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
     let w = *sent_ids(&mut s).first().expect("it went out");
     s.carry_tries(w, craftworks_sdk::cached_store::WRITE_TRIES);
@@ -648,7 +517,6 @@ fn own_state_changes_name_the_app_relative_domain_its_bindings_are_keyed_by() {
 #[test]
 fn a_forced_write_told_lost_falls_named_and_is_not_re_sent() {
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     // A store-level put: it cannot read first, so it is forced (`Any`).
     Store::apply_batch(&mut s, &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"v".to_vec()))]).expect("taken");
     let write_id = *sent_ids(&mut s).first().expect("the write went out");
@@ -667,7 +535,6 @@ fn a_forced_write_told_lost_falls_named_and_is_not_re_sent() {
 #[test]
 fn an_unread_write_falls_with_its_dependants_all_named_and_is_never_re_sent() {
     let mut s = store();
-    s.on_page(b"a/", b"b/", vec![], root(1));
     Store::apply_commit(&mut s, &[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), craftworks_sdk::store::Edit::Put(b"one".to_vec()))]).expect("taken");
     Store::apply_commit(
         &mut s,
@@ -687,5 +554,5 @@ fn an_unread_write_falls_with_its_dependants_all_named_and_is_never_re_sent() {
     assert!(told[0].write_ids.contains(&first));
     assert_eq!(told[0].key.as_deref(), Some(&b"a/1"[..]), "the key the node named was not attached");
     assert!(sent_ids(&mut s).is_empty(), "an Unread write (or one behind it) was sent again");
-    assert_eq!(Reads::get(&mut s, b"a/1").ok().flatten(), None, "the row still shows a value that was never saved");
+    assert_eq!(s.copy.get(b"a/1"), None, "the row still shows a value that was never saved");
 }
