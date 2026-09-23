@@ -40,6 +40,9 @@ async function own() {
   const sock = {};
   const h = await openSession(Session, {
     port: 7999,
+    // Every real session is an app's (open() requires one); a write with no
+    // app is refused for THAT before the tree's read-only is ever asked.
+    app: "notes-app",
     artefacts: { delegate: "d", block: "b", register: "r" },
     fetch: async url => ({ ok: true, arrayBuffer: async () => enc(`${url} code`).buffer }),
     connect: (engine, { onEvent }) => { sock.engine = engine; sock.emit = onEvent; return { pump() {}, close() {} }; },
