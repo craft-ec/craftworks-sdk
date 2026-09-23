@@ -69,6 +69,8 @@ pub struct Session {
     app: Option<String>,
     /// SCRATCH PROBE: the last define's domain and outcome.
     probe_last_define: String,
+    /// SCRATCH PROBE: the last reads, `verb domain: outcome` (at most 40).
+    probe_reads: Vec<String>,
 }
 
 #[wasm_bindgen]
@@ -99,6 +101,7 @@ impl Session {
             bound: craftworks_sdk::LiveBindings::default(),
             app: None,
             probe_last_define: String::new(),
+            probe_reads: Vec::new(),
             signer_code: Vec::new(),
             page_identity_sent: false,
             provision_told: false,
@@ -707,6 +710,7 @@ impl Session {
         let (waits, queued) = p.server.page.probe_waits();
         let (seq, root) = p.server.page.published();
         let reg = p.probe_register_id();
+        let p_reg_hex = reg.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let mut answers = serde_json::Map::new();
         for (w, ..) in &waits {
             if let Some(h) = w.strip_prefix("Get(").and_then(|x| x.strip_suffix(')')) {
@@ -730,6 +734,8 @@ impl Session {
             "window": {"size": win, "inflight": inflight},
             "mayWrite": serde_json::from_str::<serde_json::Value>(&self.can_write("")).unwrap_or_default(),
             "lastDefine": self.probe_last_define,
+            "registerId": p_reg_hex,
+            "reads": std::mem::take(&mut self.probe_reads),
             "log": self.page_mut().map(|p| p.server.page.probe_log.drain(..).collect::<Vec<_>>()).unwrap_or_default(),
         })
         .to_string()
@@ -870,7 +876,21 @@ impl Session {
             return Ok("null".into());
         };
         let r = self.db.get(domain, k);
-        self.answer(r)
+        let r = self.answer(r);
+        self.probe_read("get", domain, &r);
+        r
+    }
+
+    /// SCRATCH PROBE: one read's verb, domain and outcome.
+    fn probe_read<T>(&mut self, verb: &str, domain: &str, r: &Result<T, JsValue>) {
+        let outcome = match r {
+            Ok(_) => "ok".to_string(),
+            Err(e) => js_sys::JSON::stringify(e).ok().and_then(|v| v.as_string()).unwrap_or_default().chars().take(90).collect(),
+        };
+        self.probe_reads.push(format!("{verb} {domain}: {outcome}"));
+        if self.probe_reads.len() > 40 {
+            self.probe_reads.remove(0);
+        }
     }
 
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
@@ -926,7 +946,9 @@ impl Session {
                 after,
             },
         );
-        self.answer(r)
+        let r = self.answer(r);
+        self.probe_read("scan", &name, &r);
+        r
     }
 
     /// What this client HOLDS — not what the tree contains.
@@ -972,7 +994,9 @@ impl Session {
         // a count that worked left the done-set standing for the next call.
         let name = self.read_name(domain)?;
         let r = self.db.count(&name);
-        self.decided(r)
+        let r = self.decided(r);
+        self.probe_read("count", &name, &r);
+        r
     }
 
     /// The tree's root, as `node:<64 hex>`.
