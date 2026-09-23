@@ -44,7 +44,7 @@ pub const CONTRACTS_REV: &str = env!("SDK_CONTRACTS_REV");
 
 pub use blockid::{BlockId, ContentHash, IdError};
 pub use writes::Writes;
-pub use db::{CreateAt, Db, DbError, Record, RerunEvent, RerunStep, Scan, RERUN_ROUNDS, SLOT_SKEW_MS};
+pub use db::{CreateAt, Db, DbError, Record, RerunEvent, RerunStep, Scan, SLOT_SKEW_MS};
 pub use id::slot_from;
 pub use engine_client::{Client, Event as EngineEvent};
 pub use engine_store::{EngineStore, Page, Transport};

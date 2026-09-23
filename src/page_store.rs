@@ -141,6 +141,9 @@ pub struct PageStore<H: Host> {
     /// for it (R-b). Always on; off only as the model test's control, which
     /// must then see a read that misses its own write.
     pub wait_on_applying: bool,
+    /// Tries the next write made had already spent: a `Db` re-run's (ONE
+    /// budget, sdk#265). Handed to the engine with that write, then 0.
+    carry: u32,
 }
 
 impl<H: Host> PageStore<H> {
@@ -157,6 +160,7 @@ impl<H: Host> PageStore<H> {
             deferred: Vec::new(),
             walks: 0,
             answered_at: None,
+            carry: 0,
             view: false,
             why: BTreeMap::new(),
             wait_on_applying: true,
@@ -266,8 +270,12 @@ impl<H: Host> PageStore<H> {
     /// the same call: a refusal is the caller's return value, never a notice
     /// found later.
     fn hand_over(&mut self, made: Result<u64, Refused>) -> Result<(), Refused> {
+        let carry = std::mem::take(&mut self.carry);
         let write_id = made?;
         let Some(h) = self.host.as_mut() else { return Ok(()) };
+        if carry > 0 {
+            h.with_server(|s| s.carry_tries(carry));
+        }
         for f in self.writes.take_outbound() {
             h.client(&f);
         }
@@ -625,9 +633,15 @@ impl<H: Host> Store for PageStore<H> {
         self.writes.take_conflict_chains()
     }
 
-    /// The engine keeps each write's own `Lost` budget (R-b); a re-run is a
-    /// new write with its own. Nothing to carry.
-    fn carry_tries(&mut self, _write_id: u64, _tries: u8) {}
+    /// The next write made goes to the engine with these tries spent.
+    fn carry_tries(&mut self, tries: u32) {
+        self.carry = tries;
+    }
+
+    /// The engine's: the one budget every write draws on.
+    fn max_write_tries(&self) -> u32 {
+        self.host.as_ref().map_or(engine::Params::default().max_write_tries, |h| h.peek(|s| s.max_write_tries()))
+    }
 
     /// Made, then handed to the engine in the same call: the door's verdict
     /// (taken, or refused by name) is known when this returns.

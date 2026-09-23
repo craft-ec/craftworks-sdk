@@ -305,10 +305,17 @@ pub trait Store {
         Vec::new()
     }
 
-    /// A re-run made `write_id` as try `tries` of an earlier write: its
-    /// `Lost` re-sends count on from there (sdk#265, one budget).
-    fn carry_tries(&mut self, write_id: u64, tries: u8) {
-        let _ = (write_id, tries);
+    /// ONE BUDGET (sdk#265): the NEXT write made is a `Db` re-run of one
+    /// that had spent `tries`; the engine counts on from there. `0`: none.
+    fn carry_tries(&mut self, tries: u32) {
+        let _ = tries;
+    }
+
+    /// The one budget of tries a write has -- dead-commit re-sends and `Db`
+    /// re-runs together. The ENGINE owns the number; a store without one
+    /// never conflicts, and answers the engine's default.
+    fn max_write_tries(&self) -> u32 {
+        engine::Params::default().max_write_tries
     }
 
     /// Apply several edits as ONE change that says what it READ (M2,
@@ -335,9 +342,10 @@ pub struct ConflictChain {
     /// The keys whose reads no longer held (often the schema, a key no write
     /// in the chain wrote).
     pub keys: Vec<Vec<u8>>,
-    /// Tries the chain's writes already spent at the store (`Lost` re-sends,
-    /// sdk#265): ONE budget per write with `Db`'s re-runs, never one each.
-    pub tries: u8,
+    /// The most tries any write of the chain had spent in the engine
+    /// (dead-commit re-sends and earlier re-runs): its re-run draws on from
+    /// here -- ONE budget, sdk#265, never a count of `Db`'s own.
+    pub tries: u32,
 }
 
 /// Why a write was refused before it was applied anywhere.

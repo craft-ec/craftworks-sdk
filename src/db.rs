@@ -101,22 +101,8 @@ pub struct Db<S: Store + Reads, E: Env> {
 /// What an update or a define meant, so a Conflict can re-run it.
 #[derive(Debug, Clone)]
 enum Op {
-    Patch { domain: String, loc: Loc, base: Map<String, Value>, patch: Map<String, Value>, round: u8 },
-    Append { domain: String, appended: Vec<crate::schema::Field>, round: u8 },
-}
-
-impl Op {
-    fn round(&self) -> u8 {
-        match self {
-            Op::Patch { round, .. } | Op::Append { round, .. } => *round,
-        }
-    }
-
-    fn set_round(&mut self, to: u8) {
-        match self {
-            Op::Patch { round, .. } | Op::Append { round, .. } => *round = to,
-        }
-    }
+    Patch { domain: String, loc: Loc, base: Map<String, Value>, patch: Map<String, Value> },
+    Append { domain: String, appended: Vec<crate::schema::Field> },
 }
 
 /// A conflicted chain: its operations in the order they were made, and the
@@ -124,15 +110,12 @@ impl Op {
 #[derive(Debug)]
 struct Rerun {
     ops: std::collections::VecDeque<(u64, Op)>,
-    /// How many times this chain has been re-run already: ONE budget for the
-    /// whole chain, never one per write.
-    round: u8,
+    /// The tries the chain had spent in the ENGINE (dead-commit re-sends and
+    /// earlier re-runs alike): ONE budget, the engine's `max_write_tries`
+    /// (sdk#265). `Db` keeps no count of its own.
+    tries: u32,
     deadline_ms: u64,
 }
-
-/// How many times one chain may be re-run: a record rewritten under the
-/// writer every time ends here, the writes named — never a spin.
-pub const RERUN_ROUNDS: u8 = 3;
 
 /// What a re-run could NOT keep (sdk#143/#144), for the app to tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,7 +527,8 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// it can go on (the copy forgot the conflicted keys) and what it could not
     /// keep. A wait for a load is bounded by `wait_ms`, the LOAD PATH's own
     /// budget (the host passes it: one timeout, not two); the chain's re-runs
-    /// by [`RERUN_ROUNDS`].
+    /// by the ONE budget of tries every write has, the engine's (sdk#265): a
+    /// re-run is a try, drawn on from what the chain had already spent.
     ///
     /// Stated residual (the architect's #5): "unchanged" is per field, current
     /// against the value this write read. Another writer changing a field and
@@ -557,8 +541,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                 chain.write_ids.iter().filter_map(|id| self.ops.remove(id).map(|op| (*id, op))).collect();
             if !ops.is_empty() {
                 step.taken.extend(ops.iter().map(|(id, _)| *id));
-                let round = ops.iter().map(|(_, op)| op.round()).max().unwrap_or(0).max(chain.tries);
-                self.reruns.push_back(Rerun { ops, round, deadline_ms: now_ms + wait_ms });
+                self.reruns.push_back(Rerun { ops, tries: chain.tries, deadline_ms: now_ms + wait_ms });
             }
         }
         // What is no longer pending and did not conflict ended: forget it.
@@ -583,16 +566,19 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// Re-run a chain's operations in order. `Err` means "waiting for a load"
     /// (named in `step.load`); the chain keeps what is left.
     fn rerun_chain(&mut self, r: &mut Rerun, step: &mut RerunStep) -> std::result::Result<(), ()> {
-        if r.round >= RERUN_ROUNDS {
+        let budget = self.store.max_write_tries();
+        if r.tries >= budget {
             for (id, _) in r.ops.drain(..) {
                 step.events.push(RerunEvent::Failed {
                     write_id: id,
-                    reason: format!("the record was changed elsewhere again after {RERUN_ROUNDS} tries"),
+                    reason: format!("the record was changed elsewhere again after {budget} tries"),
                 });
             }
             return Ok(());
         }
-        let round = r.round + 1;
+        // This re-run is one more try of the same write: its new write goes to
+        // the engine with it spent, and counts on from there.
+        let tries = r.tries + 1;
         while let Some((id, op)) = r.ops.front().cloned() {
             match op {
                 Op::Patch { domain, loc, base, patch, .. } => {
@@ -667,17 +653,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                     if mine.is_empty() {
                         continue;
                     }
-                    match self.update(&domain, loc, &mine) {
-                        Ok(_) => {
-                            // The re-run's own op carries the chain's round.
-                            if let Some(new) = self.store.last_write_id() {
-                                if let Some(op) = self.ops.get_mut(&new) {
-                                    op.set_round(round);
-                                }
-                                self.store.carry_tries(new, round);
-                            }
-                        }
-                        Err(e) => step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() }),
+                    self.store.carry_tries(tries);
+                    let made = self.update(&domain, loc, &mine);
+                    self.store.carry_tries(0);
+                    if let Err(e) = made {
+                        step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() });
                     }
                 }
                 Op::Append { domain, appended, .. } => {
@@ -715,16 +695,11 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                         continue;
                     }
                     next.fields.extend(add);
-                    match self.define(&domain, &next) {
-                        Ok(()) => {
-                            if let Some(new) = self.store.last_write_id() {
-                                if let Some(op) = self.ops.get_mut(&new) {
-                                    op.set_round(round);
-                                }
-                                self.store.carry_tries(new, round);
-                            }
-                        }
-                        Err(e) => step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() }),
+                    self.store.carry_tries(tries);
+                    let made = self.define(&domain, &next);
+                    self.store.carry_tries(0);
+                    if let Err(e) = made {
+                        step.events.push(RerunEvent::Failed { write_id: id, reason: e.to_string() });
                     }
                 }
             }
@@ -809,7 +784,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             Some(b) => schema.fields.iter().filter(|f| !b.fields.iter().any(|g| g.name == f.name)).cloned().collect(),
             None => schema.fields.clone(),
         };
-        self.remember(Op::Append { domain: domain.to_string(), appended, round: 0 });
+        self.remember(Op::Append { domain: domain.to_string(), appended });
         Ok(())
     }
 
@@ -965,7 +940,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let reads = vec![(key.clone(), Expect::Value(crate::read_token::read_token(&old))), self.read_of(&schema_key(domain))?];
         let base = record::decode(&schema, &old)?.fields;
         self.write(reads, vec![(key.clone(), Edit::Put(bytes.clone()))])?;
-        self.remember(Op::Patch { domain: domain.to_string(), loc, base, patch: patch.clone(), round: 0 });
+        self.remember(Op::Patch { domain: domain.to_string(), loc, base, patch: patch.clone() });
         self.read(&schema, &loc, &key, &bytes)
     }
 

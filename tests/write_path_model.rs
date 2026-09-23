@@ -283,6 +283,17 @@ fn run(seed: u64) -> (Vec<Finding>, Counts) {
         if differs + rederived + impossible > 0 {
             found.push(Finding { class: "THE QUEUE'S OWN COUNTS ARE NOT ZERO", detail: format!("seed {seed} tab {p}: K9 differs {differs}, own-publish re-derived {rederived}, impossible {impossible}") });
         }
+        // NEVER APPLIED TWICE (W3; K9 §6: write_id -> seq is one-to-one). A
+        // write reaches a head once: carried by one own commit that published
+        // (`writes_published`), or witnessed landed unheard, or found already
+        // in the tree (a no-op group, #164). Each such is told Published once;
+        // a merge re-application publishes told to no one. A write carried by two commits counts twice here and breaks it
+        // -- value parity cannot see a second apply of the same assignment.
+        let told_published = tab.made.iter().filter(|m| m.end.first() == Some(&End::Published)).count() as u64;
+        let (carried, witnessed, noop, merged) = tab.conn.with_server(|s| (s.page.commits_and_writes().1, s.page.landed_by_witness(), s.page.noop_published(), s.merge_published()));
+        if carried + witnessed + noop != told_published + merged {
+            found.push(Finding { class: "A WRITE REACHED A HEAD TWICE (write_id -> seq not one-to-one)", detail: format!("seed {seed} tab {p}: carried by own commits {carried} + witnessed {witnessed} + no-op {noop}, told Published {told_published} + merge re-applications {merged}") });
+        }
         let busy = tab.conn.with_server(|s| s.busy_told());
         if busy > 0 {
             found.push(Finding { class: "A WRITE WAS TOLD BUSY", detail: format!("seed {seed} tab {p}: {busy}") });

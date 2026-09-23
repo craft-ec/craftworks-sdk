@@ -236,8 +236,8 @@ impl Writes {
     }
 
     /// Conflict chains the Server named for this client (`Db`'s re-run).
-    pub fn on_conflicted(&mut self, chains: Vec<(Vec<u64>, Vec<Vec<u8>>)>) {
-        self.chains.extend(chains.into_iter().map(|(write_ids, keys)| crate::store::ConflictChain { write_ids, keys, tries: 0 }));
+    pub fn on_conflicted(&mut self, chains: Vec<(Vec<u64>, Vec<Vec<u8>>, u32)>) {
+        self.chains.extend(chains.into_iter().map(|(write_ids, keys, tries)| crate::store::ConflictChain { write_ids, keys, tries }));
     }
 
     /// A reply arrived: the client's own bookkeeping (framing, the tick

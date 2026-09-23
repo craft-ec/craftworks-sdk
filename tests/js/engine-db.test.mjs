@@ -378,6 +378,45 @@ await t("past the app's deadline a full queue fails NAMED, with the limit and ho
   await p;
 });
 
+await t("with NO deadline passed a full queue waits for room however long it takes, and says it is waiting (the owner: no limit, managed by the core)", async () => {
+  let clock = 0, wake, room = false;
+  const full = { code: "QUEUE_FULL", message: "full", transient: false, retryable: true, cap: 4096 };
+  const s = { put() { if (!room) throw { ...full }; return JSON.stringify({ id: "x" }); }, take_loads: () => "[]" };
+  const db = engineDb({ session: s, onReadsWake: fn => { wake = fn; } }, { now: () => clock });
+  let failed;
+  const p = db.put("tasks", {}).catch(e => { failed = e; });
+  for (const at of [59_999, 60_000, 3_600_000, 86_400_000]) {
+    await new Promise(r => setImmediate(r));
+    clock = at;
+    wake();
+  }
+  await new Promise(r => setImmediate(r));
+  assert.equal(failed, undefined, `the SDK chose a deadline of its own: failed after ${clock} ms`);
+  assert.equal(db.waitingForRoom(), 1, "a write waiting for room is not shown as waiting");
+  room = true;
+  wake();
+  await p;
+  assert.equal(failed, undefined);
+  assert.equal(db.waitingForRoom(), 0, "a taken write is still shown as waiting");
+});
+
+await t("writes waiting for room are made again in the ORDER they waited (review sec. 2 on sdk#295)", async () => {
+  // The engine holds a session told QUEUE_FULL until its queue is empty;
+  // then the FIRST write made again is taken. That must be the oldest.
+  let wake, room = false;
+  const made = [];
+  const full = { code: "QUEUE_FULL", message: "full", transient: false, retryable: true, cap: 4096 };
+  const s = { put(_d, row) { if (!room) throw { ...full }; made.push(JSON.parse(row).v); return JSON.stringify({ id: JSON.parse(row).v }); }, take_loads: () => "[]" };
+  const db = engineDb({ session: s, onReadsWake: fn => { wake = fn; } });
+  const ps = ["a", "b", "c"].map(v => db.put("tasks", { v }));
+  await new Promise(r => setImmediate(r));
+  assert.equal(db.waitingForRoom(), 3);
+  room = true;
+  wake();
+  await Promise.all(ps);
+  assert.deepEqual(made, ["a", "b", "c"], "a later write was made before an older one that waited");
+});
+
 await t("nothing in the wrapper branches on a message, or waits on a timer", () => {
   const src = readFileSync(new URL("../../js/engine-db.js", import.meta.url), "utf8");
   const code = src.split("\n").filter(l => !l.trim().startsWith("//"));

@@ -83,6 +83,8 @@ pub struct Fates {
     pub dropped: u64,
     /// Conflicts not yet taken by `Db`'s re-run, in order.
     conflicts: Vec<FateKey>,
+    /// Tries each conflicted write had spent (ONE budget, sdk#265).
+    tries: BTreeMap<FateKey, u32>,
 }
 
 impl Fates {
@@ -123,7 +125,10 @@ impl Fates {
     }
 
     /// The key, value and cause beside a `Conflict` (`Effect::Conflicted`).
-    pub fn conflicted(&mut self, key: FateKey, k: Vec<u8>, current: Option<[u8; 32]>, after: Option<FateKey>) {
+    pub fn conflicted(&mut self, key: FateKey, k: Vec<u8>, current: Option<[u8; 32]>, after: Option<FateKey>, tries: u32) {
+        if self.conflicts.contains(&key) {
+            self.tries.insert(key, tries);
+        }
         if let Some(Fate::Conflict { key: kk, current: c, after: a }) = self.kept.get_mut(&key) {
             *kk = k;
             *c = current;
@@ -160,10 +165,13 @@ impl Fates {
     /// Conflicts of `session` not yet taken for a re-run, each with the
     /// writes that cascade from it (`after` naming it, transitively), in
     /// order. Drained; the fates themselves stay until read.
-    pub fn take_conflicted(&mut self, session: u64) -> Vec<(Vec<u64>, Vec<Vec<u8>>)> {
+    /// Each chain: its writes, the keys whose reads no longer held, and the
+    /// most tries any write of it had spent (the chain's re-run goes on
+    /// from there: ONE budget, sdk#265).
+    pub fn take_conflicted(&mut self, session: u64) -> Vec<(Vec<u64>, Vec<Vec<u8>>, u32)> {
         let (mine, rest): (Vec<FateKey>, Vec<FateKey>) = self.conflicts.drain(..).partition(|k| k.0 == session);
         self.conflicts = rest;
-        let mut chains: Vec<(Vec<u64>, Vec<Vec<u8>>)> = Vec::new();
+        let mut chains: Vec<(Vec<u64>, Vec<Vec<u8>>, u32)> = Vec::new();
         let mut chain_of: BTreeMap<FateKey, usize> = BTreeMap::new();
         for k in mine {
             let (key, after) = match self.kept.get(&k) {
@@ -173,11 +181,12 @@ impl Fates {
             match after.and_then(|a| chain_of.get(&a).copied()) {
                 Some(i) => {
                     chains[i].0.push(k.1);
+                    chains[i].2 = chains[i].2.max(self.tries.remove(&k).unwrap_or(0));
                     chain_of.insert(k, i);
                 }
                 None => {
                     chain_of.insert(k, chains.len());
-                    chains.push((vec![k.1], if key.is_empty() { Vec::new() } else { vec![key] }));
+                    chains.push((vec![k.1], if key.is_empty() { Vec::new() } else { vec![key] }, self.tries.remove(&k).unwrap_or(0)));
                 }
             }
         }
@@ -230,13 +239,14 @@ mod tests {
         let mut f = Fates::default();
         for (w, after) in [(1u64, None), (2, Some((1u64, 1u64))), (3, None), (4, Some((1, 2))), (5, Some((9, 9)))] {
             f.told((1, w), &State::Conflict, 0);
-            f.conflicted((1, w), format!("k{w}").into_bytes(), None, after);
+            f.conflicted((1, w), format!("k{w}").into_bytes(), None, after, w as u32);
         }
         f.told((2, 1), &State::Conflict, 0);
         let chains = f.take_conflicted(1);
         assert_eq!(
             chains,
-            vec![(vec![1, 2, 4], vec![b"k1".to_vec()]), (vec![3], vec![b"k3".to_vec()]), (vec![5], vec![b"k5".to_vec()])]
+            vec![(vec![1, 2, 4], vec![b"k1".to_vec()], 4), (vec![3], vec![b"k3".to_vec()], 3), (vec![5], vec![b"k5".to_vec()], 5)],
+            "a chain carries the MOST tries any write of it spent (ONE budget)"
         );
         assert!(f.take_conflicted(1).is_empty(), "conflicts were not drained");
         assert_eq!(f.take_conflicted(2).len(), 1, "another session's conflict was taken with this one's");

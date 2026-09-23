@@ -1521,7 +1521,8 @@ fn a_chain_of_stale_updates_is_re_run_in_order_and_every_change_survives() {
 }
 
 /// THE BUDGET: the record is changed elsewhere before every re-run lands.
-/// After RERUN_ROUNDS re-runs the chain ends as a named failure of its write —
+/// With the one budget spent (the engine's `max_write_tries`, no count of
+/// `Db`'s own) the chain ends as a named failure of its write —
 /// never a spin — and their last value stands.
 #[test]
 fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
@@ -1561,10 +1562,93 @@ fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
         interfere(&mut tab, &mut rig, &mut node, &mut other_id);
         release(&mut rig, &mut node);
     }
-    let rounds = usize::from(craftworks_sdk::RERUN_ROUNDS);
+    let rounds = Params::default().max_write_tries as usize;
     assert_eq!(tab.sends.range(w + 1..).count(), rounds, "not exactly {rounds} re-runs went on the wire");
     assert!(
         matches!(events.as_slice(), [craftworks_sdk::RerunEvent::Failed { reason, .. }] if reason.contains(&format!("after {rounds} tries"))),
+        "the chain did not end as ONE named failure: {events:?}"
+    );
+    let rec = published_record(&node, &rerun_schema(), &key).expect("published");
+    assert_eq!(rec.get("body"), Some(&serde_json::json!("b0")), "a failed chain wrote anyway");
+}
+
+/// **ONE BUDGET ACROSS THE ENGINE'S RE-SENDS AND `Db`'s RE-RUNS** (sdk#265;
+/// core dev on #295). The update's own commit dies to another device's head
+/// (the engine re-applies it at the front: one try spent), which also changed
+/// the record's `note`, so it conflicts there. `Db`'s re-run draws on from
+/// that one: with a budget of three it has TWO re-runs left, and when the
+/// record is changed under each the chain fails, named. A `Db` counting on
+/// its own would re-run three times -- four tries of one write.
+#[test]
+fn a_write_never_gets_more_than_the_one_budget_across_re_sends_and_re_runs() {
+    let budget = Params::default().max_write_tries as usize;
+    assert_eq!(budget, 3, "the test's arithmetic is for a budget of three");
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let (mut tab, key, loc) = tab_with_record(&mut rig, &mut node);
+    let schema = rerun_schema();
+    let note = |node: &Node, n: u64| {
+        let (_, root) = node.head().expect("a head");
+        let cur = node.tree(&root).expect("a tree").get(&key).cloned().expect("the record");
+        let mut d = craftworks_sdk::record::decode(&schema, &cur).expect("decodes");
+        d.fields.insert("note".into(), serde_json::json!(format!("n{n}")));
+        craftworks_sdk::record::encode(&schema, &d.fields, d.created, d.updated + 1, &d.author).expect("encodes")
+    };
+    let w = tab.db.store().writes.next_write_id();
+    // The update's own commit, in flight: its answers held.
+    rig.faults.hold = true;
+    tab.call(&mut rig, &mut node, |db| db.update("t", loc, &obj(serde_json::json!({ "body": "b1" })))).expect("the update is made");
+    assert!(!rig.held.is_empty(), "the update's commit is not in flight");
+    // A foreign head kills it and changes the record. Before it, the write is
+    // driven into a COMMIT (its fetches answered, its commit's puts and sign
+    // held), so the head kills a commit, never a re-apply.
+    for kill in 1..=1u64 {
+        let session = tab.db.store().writes.client.session().expect("the tab has a session");
+        let committing = |rig: &PageRig| rig.server.queued_of(session).iter().any(|(id, f)| *id == w && matches!(f, Fate::Committing));
+        for _ in 0..50 {
+            if committing(&rig) {
+                break;
+            }
+            let (commit, other): (Vec<Op>, Vec<Op>) = std::mem::take(&mut rig.held).into_iter().partition(|op| matches!(op, Op::Put { .. } | Op::Sign { .. } | Op::Update { .. }));
+            rig.held = commit;
+            for op in other {
+                if let Some(a) = rig.answer(&mut node, op) {
+                    rig.server.node(a, Ms(rig.now));
+                }
+            }
+            tab.pump(&mut rig, &mut node);
+        }
+        assert!(committing(&rig), "kill {kill}: the write is not in a commit: {:?}", rig.server.queued_of(session));
+        let ops = vec![protocol::Op::Put(key.clone(), note(&node, kill))];
+        elsewhere(&mut rig, &mut node, kill, ops);
+        for op in std::mem::take(&mut rig.held) {
+            if let Some(a) = rig.answer(&mut node, op) {
+                rig.server.node(a, Ms(rig.now));
+            }
+        }
+        tab.pump(&mut rig, &mut node);
+    }
+    rig.faults.hold = false;
+    release(&mut rig, &mut node);
+    // Every re-run is made behind a commit in flight and changed again before it lands.
+    let mut events = Vec::new();
+    for round in 0..10u64 {
+        tab.lend(&mut rig, &mut node, |db| db.store_mut().sync());
+        tab.pump(&mut rig, &mut node);
+        commit_in_flight(&mut rig, &mut node, 3_001 + round);
+        let now = rig.now;
+        let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
+        events.extend(step.events);
+        let theirs = note(&node, 10 + round);
+        elsewhere(&mut rig, &mut node, 10 + round, vec![protocol::Op::Put(key.clone(), theirs)]);
+        release(&mut rig, &mut node);
+    }
+    let reruns = tab.sends.range(w + 1..).count();
+    let resent_by_engine = 1usize;
+    println!("  one budget {budget}: engine re-sends {resent_by_engine} + Db re-runs {reruns}");
+    assert_eq!(resent_by_engine + reruns, budget, "one write got {} tries, the budget is {budget}", resent_by_engine + reruns);
+    assert!(
+        matches!(events.as_slice(), [craftworks_sdk::RerunEvent::Failed { reason, .. }] if reason.contains(&format!("after {budget} tries"))),
         "the chain did not end as ONE named failure: {events:?}"
     );
     let rec = published_record(&node, &rerun_schema(), &key).expect("published");
@@ -1759,4 +1843,118 @@ fn a_group_that_wrote_one_key_twice_merges_by_its_final_value() {
         }
         assert!(fin.contains_key(b"other".as_slice()), "their change did not survive the merge");
     }
+}
+
+/// **A FULL `through` LIST OF OLDER ENTRIES: A FIRST COMMIT THAT DIES IS
+/// RE-APPLIED, NEVER `Unknown`** (review §3 on sdk#295). A device is minted
+/// per page load, so a household's list reaches `THROUGH_MAX` and stays
+/// there. This page's first commit (seq 2) dies to another device's head at
+/// seq 2 whose list is full -- of entries last written at seq 1, older than
+/// our commit. Ours cannot have been evicted (eviction takes the lowest
+/// `last`), so absent means NOT THERE: the write is re-applied on the winner
+/// and publishes. Read as `Unknown` it would end there, its value never
+/// landing.
+#[test]
+fn a_dying_first_commit_under_a_full_list_of_older_entries_is_re_applied() {
+    use signer_proto::head::{value, Ledger, Through, THROUGH_MAX};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
+    let (s1, root1) = node.head().expect("published");
+    // This page's next commit, at s1 + 1: nothing of it reaches the node.
+    rig.faults.hold = true;
+    let mine = Request::Commit { write_id: 2, reads: vec![(b"b".to_vec(), protocol::Expect::Absent)], ops: vec![protocol::Op::Put(b"b".to_vec(), b"2".to_vec())] };
+    rig.client_as(&mut node, &mine);
+    assert_eq!(rig.server.page.committing_seq(), Some(s1 + 1), "the commit is not in flight at s1 + 1");
+    rig.held.clear();
+    rig.faults.hold = false;
+    // Another device's head at the same seq, built on ours, with a FULL list
+    // of entries older than our commit.
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = node.tree(&root1).expect("whole").into_iter().collect();
+    entries.push((b"theirs".to_vec(), b"x".to_vec()));
+    let theirs = device_tree(&mut node, &entries);
+    let through: Vec<Through> = (0..THROUGH_MAX)
+        .map(|i| {
+            let mut d = [0u8; 16];
+            d[..8].copy_from_slice(&(i as u64 + 1000).to_le_bytes());
+            Through { device: d, seq: 1, last: s1 }
+        })
+        .collect();
+    let v = value(&theirs, &Ledger { prev: Some(signer_proto::Head { seq: s1, root: root1 }), through, ..Ledger::default() });
+    let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let st = contract_keys::register::head_state(&node.register_params, &key, s1 + 1, &v).expect("signs");
+    node.update(&st);
+    assert_eq!(node.head(), Some((s1 + 1, theirs)), "their head did not take the register");
+    rig.server.head_hint();
+    let mut rs = rig.run(&mut node);
+    for _ in 0..10 {
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        rs.extend(rig.run(&mut node));
+    }
+    let told = states(&rs, 2);
+    assert!(!told.contains(&WriteState::Unknown), "a dying first commit under a full list of OLDER entries was told Unknown: {told:?}");
+    assert!(published(&told), "the write was not re-applied and published on the winner: {told:?}");
+    let (_, root) = node.head().expect("a head");
+    let tree = tree_of(&node, &root);
+    assert_eq!(tree.get(&b"b"[..]).map(Vec::as_slice), Some(&b"2"[..]), "the write's value never landed");
+    assert_eq!(tree.get(&b"theirs"[..]).map(Vec::as_slice), Some(&b"x"[..]), "the winner's value was lost");
+}
+
+/// **THE MERGE GOES AT THE FRONT, BEFORE A LATER OWN WRITE** (review §1 on
+/// sdk#295; K9 §2). The tip W1 (forced, k = a) publishes at s; W2 (k = b,
+/// read k = a: after W1 in app order) is in flight behind it. Another device
+/// wins at s from the same base, leaving k alone. The displaced W1 must be
+/// re-applied BEFORE W2: then W2's read holds and the tree ends at the LATER
+/// value b, nothing told superseded. Queued behind (the defect), W2 is judged
+/// on the winner first -- k absent there, so it conflicts -- and W1' lands a
+/// after it: the older value wins, and the page's own later write is lost.
+#[test]
+fn a_merge_goes_before_a_later_own_write_and_the_later_value_stands() {
+    use signer_proto::head::{value, Ledger};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("base", Some("0"))])), 1)));
+    let (base_seq, base_root) = node.head().expect("the base");
+    assert!(published(&states(&rig.client_as(&mut node, &write(2, &[("k", Some("a"))])), 2)));
+    let hr = node.head_read().expect("the tip");
+    let (tip_seq, _) = node.head().expect("the tip");
+    // W2, in flight behind the tip: nothing of it reaches the node.
+    rig.faults.hold = true;
+    let w2 = Request::Commit { write_id: 3, reads: vec![(b"k".to_vec(), protocol::Expect::Value(engine::leaf_hash(b"a")))], ops: vec![protocol::Op::Put(b"k".to_vec(), b"b".to_vec())] };
+    let mut rs = rig.client_as(&mut node, &w2);
+    rig.held.clear();
+    rig.faults.hold = false;
+    // The other device's head at the tip's seq, from the same base, leaving k alone.
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let base_tree = node.tree(&base_root).expect("whole");
+    let mut salt = 0u8;
+    let st = loop {
+        let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
+        e.push((b"other".to_vec(), vec![salt]));
+        let r = device_tree(&mut node, &e);
+        let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base_seq, root: base_root }), ..Ledger::default() });
+        if page::beats(&v, hr.value()) {
+            break contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+        }
+        salt += 1;
+    };
+    node.update(&st);
+    rig.server.head_hint();
+    rs.extend(rig.run(&mut node));
+    for _ in 0..20 {
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        rs.extend(rig.run(&mut node));
+    }
+    let told = states(&rs, 3);
+    let fin = node.tree(&node.head().expect("a head").1).expect("whole");
+    assert_eq!(fin.get(&b"k"[..]).map(Vec::as_slice), Some(&b"b"[..]), "the older value landed over the later one (W2 told {told:?})");
+    assert!(published(&told), "the later write did not publish: {told:?}");
+    assert!(fin.contains_key(&b"other"[..]), "their change did not survive");
+    let superseded: Vec<&Reply> = rs.iter().filter(|r| format!("{r:?}").contains("Superseded")).collect();
+    assert!(superseded.is_empty(), "a key was told superseded by the page's own later write: {superseded:?}");
+    assert_eq!(rig.server.page.queue_counts().2, 0, "an impossible transition was counted (the hold was not in place)");
 }

@@ -104,12 +104,14 @@ export const sameRows = (a, b) => {
 };
 
 /**
- * `writeDeadlineMs`: how long a write WAITS for room in the page's queue
+ * `writeDeadlineMs`: how long a write may WAIT for room in the page's queue
  * before it fails, named QUEUE_FULL (R-b; COMMIT-LIFE K1: a full queue is
- * BACKPRESSURE, TCP-style, never a refusal the moment it is met). The app's
- * own deadline; 60 s unless it says.
+ * BACKPRESSURE, TCP-style, never a refusal the moment it is met). The APP's
+ * own deadline, and only if it passes one: by default a write waits until
+ * there is room, however long -- the core manages the queue, and the SDK
+ * picks no timing of its own. `waitingForRoom()` says how many are waiting.
  */
-export function engineDb(handle, { writeDeadlineMs = 60_000, now = () => Date.now() } = {}) {
+export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.now() } = {}) {
   // Either the object `openSession` returns, or a bare session. The wrapper
   // is what knows when a message arrived, so when there is one this registers
   // with it and a parked read is woken by the answer rather than by a clock.
@@ -137,7 +139,11 @@ export function engineDb(handle, { writeDeadlineMs = 60_000, now = () => Date.no
 
   // Writes WAITING for room in the page's queue (backpressure): woken on the
   // same task as a parked read -- every message the session handled may have
-  // published a commit and drained the queue -- and then made again.
+  // published a commit and drained the queue -- and then made again, in the
+  // order they waited (each resumes in its own microtask, oldest first, and
+  // makes its write synchronously). A put made while others wait is told
+  // QUEUE_FULL by the engine too (it holds the session until its queue is
+  // empty), so it waits behind them: order within the session holds.
   let roomWaiters = [];
   const wakeRoom = () => {
     const w = roomWaiters;
@@ -248,8 +254,8 @@ export function engineDb(handle, { writeDeadlineMs = 60_000, now = () => Date.no
         // byte bound. Nothing was written; the same write made again once a
         // commit publishes is taken. Wait for that -- on the session's own
         // wake: every message it handled, and its tick, a second apart, so
-        // the deadline is kept to a tick -- up to the app's deadline, and
-        // only then fail,
+        // the deadline is kept to a tick -- with no deadline unless the app
+        // passed one, and only past it fail,
         // named, with the bytes and the limit. Not a hop: waiting for room
         // is not a read chain.
         if (e && e.code === "QUEUE_FULL") {
@@ -663,6 +669,9 @@ export function engineDb(handle, { writeDeadlineMs = 60_000, now = () => Date.no
     // blocks/bytes/height are NULL here — they are properties of the tree,
     // which lives on the node. Zero would render as a real empty database.
     stats: () => JSON.parse(session.stats()),
+    // Writes waiting for room in the page's queue (QUEUE_FULL, no deadline
+    // unless the app passed one): what a save indicator shows while it waits.
+    waitingForRoom: () => roomWaiters.length,
 
     // ---- what only the engine-backed one has ----
 

@@ -291,3 +291,42 @@ fn a_group_that_landed_unheard_is_published_and_not_committed_twice() {
     assert_eq!(e.commits_and_writes().0, commits_before, "a second commit was counted for a landed group");
     assert_eq!(e.root(), winner);
 }
+
+/// **ORDER WITHIN A SESSION HOLDS AT THE BYTE BOUND** (review §2 on sdk#295).
+/// A session's large A is told `QueueFull`; its smaller B, which WOULD fit,
+/// must be told `QueueFull` too -- taken, B would land and A, made again when
+/// room frees, would land over it (the older value winning). Once the
+/// session's queue is empty, A made again is taken, then B: the tree ends at
+/// B's value. Another session with nothing queued is taken meanwhile (its
+/// fair share: the hold is per session).
+#[test]
+fn a_write_told_queue_full_is_not_overtaken_by_a_smaller_later_one() {
+    let params = Params { max_queue_bytes: 155, ..Params::default() };
+    let mut e = common::new_store_params(params);
+    let put = |id: u64, client: u64, k: &[u8], v: &[u8]| Event::forced_write(ClientId(client), WriteId(id), vec![(k.to_vec(), Op::Put(v.to_vec()))]);
+    // Sizes (ops + 34 per read; a forced write reads `Any`): the first 45, A 115, B 40. A fits with B (155), not behind the first (160); B fits behind the first (85).
+    let first = stepped!(e, w(1, 0, b"z", &[0u8; 10], Expect::Absent));
+    let a = stepped!(e, put(1, 1, b"k", &[b'a'; 80]));
+    assert!(matches!(told(&a, 1)[..], [State::QueueFull { .. }]), "the large write was not held back: {:?}", told(&a, 1));
+    let b = stepped!(e, put(2, 1, b"k", b"bbbbb"));
+    assert!(matches!(told(&b, 2)[..], [State::QueueFull { .. }]), "a smaller LATER write of the same session was taken ahead of the one told QueueFull: {:?}", told(&b, 2));
+    let other = stepped!(e, put(9, 2, b"o", b"x"));
+    assert!(!told(&other, 9).iter().any(|s| matches!(s, State::QueueFull { .. })), "another session with nothing queued was held by this one's hold");
+    let out = drive(&mut e, first);
+    let _ = drive(&mut e, out);
+    assert_eq!(e.queued_writes(), 0, "the queue did not drain");
+    // Made again, in order: A, then B.
+    let a2 = stepped!(e, put(3, 1, b"k", &[b'a'; 80]));
+    assert!(!told(&a2, 3).iter().any(|s| matches!(s, State::QueueFull { .. })), "the held write was not taken with its session's queue empty");
+    let b2 = stepped!(e, put(4, 1, b"k", b"bbbbb"));
+    assert!(!told(&b2, 4).iter().any(|s| matches!(s, State::QueueFull { .. })), "the hold outlived the write it held for: {:?} queued {}", told(&b2, 4), e.queued_writes());
+    let mut fx = a2;
+    fx.extend(b2);
+    let out = drive(&mut e, fx);
+    let _ = drive(&mut e, out);
+    let mut want = BTreeMap::new();
+    want.insert(b"z".to_vec(), vec![0u8; 10]);
+    want.insert(b"o".to_vec(), b"x".to_vec());
+    want.insert(b"k".to_vec(), b"bbbbb".to_vec());
+    assert_eq!(e.root(), common::rebuild(&want), "the older value landed over the later one");
+}

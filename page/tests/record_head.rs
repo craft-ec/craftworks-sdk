@@ -92,10 +92,40 @@ fn a_heads_witness_of_a_page_is_through_not_there_or_unknown() {
     };
     let head = |through: Vec<Through>| page::HeadRead::from_value(5, &value(&[1; 32], &Ledger { through, ..Ledger::default() })).expect("a head");
     let mine = Through { device: me, seq: 42, last: 5 };
-    assert_eq!(head(vec![other(0), mine]).witness_of(&me), engine::Witness::Through(42));
-    assert_eq!(head(vec![other(0), other(1)]).witness_of(&me), engine::Witness::NotThere, "absent from a list never at its bound");
+    assert_eq!(head(vec![other(0), mine]).witness_of(&me, Some(5)), engine::Witness::Through(42));
+    assert_eq!(head(vec![other(0), other(1)]).witness_of(&me, Some(5)), engine::Witness::NotThere, "absent from a list never at its bound");
     let full: Vec<Through> = (0..THROUGH_MAX).map(other).collect();
     let h = head(full);
     assert_eq!(h.through().len(), THROUGH_MAX, "the fixture's list is not at its bound");
-    assert_eq!(h.witness_of(&me), engine::Witness::Unknown, "absent from a FULL list was read as not there");
+    assert_eq!(h.witness_of(&me, Some(1)), engine::Witness::Unknown, "absent from a FULL list whose every entry is at or past our commit was read as not there");
+    assert_eq!(h.witness_of(&me, None), engine::Witness::Unknown, "absent from a FULL list with no commit to compare was read as not there");
+}
+
+/// **A FULL LIST OF OLDER ENTRIES STILL WITNESSES `NotThere`** (review §3 on
+/// sdk#295). A device is minted per page LOAD, so after `THROUGH_MAX` loads
+/// the list is full for good; read as `Unknown`, every first commit that dies
+/// would end `Unknown`. Eviction takes the lowest `last`: an entry left with
+/// `last` below our commit's seq s proves ours was never evicted. Only a list
+/// whose every entry is past s -- `THROUGH_MAX` other commits between our cut
+/// and our read -- is `Unknown`; a tie at s is too (broken by device id).
+#[test]
+fn absent_from_a_full_list_of_older_entries_is_not_there() {
+    use signer_proto::head::{value, Ledger, Through, THROUGH_MAX};
+    let me = [7u8; 16];
+    let at = |i: usize, last: u64| {
+        let mut d = [0u8; 16];
+        d[..8].copy_from_slice(&(i as u64 + 1000).to_le_bytes());
+        Through { device: d, seq: 1, last }
+    };
+    let head = |through: Vec<Through>| page::HeadRead::from_value(500, &value(&[1; 32], &Ledger { through, ..Ledger::default() })).expect("a head");
+    // Our commit would have landed at 300; the list's lasts run 200..200+MAX.
+    let full = head((0..THROUGH_MAX).map(|i| at(i, 200 + i as u64)).collect());
+    assert_eq!(full.through().len(), THROUGH_MAX, "the fixture's list is not at its bound");
+    assert_eq!(full.witness_of(&me, Some(300)), engine::Witness::NotThere, "a full list holding entries older than our commit read as Unknown");
+    // Every entry past our commit: ours may have been evicted.
+    let past = head((0..THROUGH_MAX).map(|i| at(i, 301 + i as u64)).collect());
+    assert_eq!(past.witness_of(&me, Some(300)), engine::Witness::Unknown, "every entry past our commit: absent was read as not there");
+    // The lowest AT our commit's seq: a tie, broken by device id -- Unknown.
+    let tie = head((0..THROUGH_MAX).map(|i| at(i, 300 + i as u64)).collect());
+    assert_eq!(tie.witness_of(&me, Some(300)), engine::Witness::Unknown, "a tie at our seq was read as not there");
 }

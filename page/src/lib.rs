@@ -323,17 +323,19 @@ impl HeadRead {
         h.ledger.through.iter().find(|t| &t.device == device).map(|t| t.seq)
     }
 
-    /// What this head WITNESSES of `device`'s commits (COMMIT-LIFE ⁵): its
-    /// `through` entry; or, with none, `NotThere` only when the list was
-    /// never at its bound (entries leave only by eviction there) --
-    /// otherwise, or with a ledger that cannot be read, `Unknown`. Absent is
-    /// never read as below.
-    pub fn witness_of(&self, device: &[u8; 16]) -> engine::Witness {
+    /// What this head WITNESSES of `device`'s commits (COMMIT-LIFE ⁵), for a
+    /// commit that would have landed at seq `commit_seq`: its `through`
+    /// entry; or, with none, `NotThere` whenever that can be KNOWN -- the list
+    /// was never at its bound, or its entries show ours cannot have been
+    /// evicted -- otherwise, or with a ledger that cannot be read, `Unknown`.
+    /// Absent is never read as below.
+    pub fn witness_of(&self, device: &[u8; 16], commit_seq: Option<u64>) -> engine::Witness {
         let Some(h) = signer_proto::head::read_value(&self.value) else { return engine::Witness::Unknown };
         if h.refused {
             return engine::Witness::Unknown;
         }
-        match h.ledger.through.iter().find(|t| &t.device == device) {
+        let through = &h.ledger.through;
+        match through.iter().find(|t| &t.device == device) {
             Some(t) => engine::Witness::Through(t.seq),
             // SAFE because the list never SHRINKS on a chain: every page's
             // head copies its prev's list forward (`sign_ledger_of`), LRU
@@ -341,7 +343,15 @@ impl HeadRead {
             // is signed on the winner, which built on the same base and so
             // carries that base's list. So an entry absent from a list still
             // below its bound was never in this chain: NotThere, not Unknown.
-            None if h.ledger.through.len() < signer_proto::head::THROUGH_MAX => engine::Witness::NotThere,
+            None if through.len() < signer_proto::head::THROUGH_MAX => engine::Witness::NotThere,
+            // A FULL list (review §3 on sdk#295: a device is minted per page
+            // load, so a list fills and stays full). Eviction takes the lowest
+            // (`last`, device); had our commit landed at s its entry would
+            // carry `last` >= s, and every entry evicted before it sits at or
+            // below it. So an entry left with `last` < s proves ours was never
+            // evicted: absent means not there. STRICTLY below: at `last` == s
+            // the tie is broken by device id, and ours could have gone first.
+            None if commit_seq.is_some_and(|s| through.iter().any(|t| t.last < s)) => engine::Witness::NotThere,
             None => engine::Witness::Unknown,
         }
     }
@@ -390,6 +400,11 @@ pub struct Page {
     /// This page's id in heads' `through` (COMMIT-LIFE ⁵): set once, from
     /// its first session; zeros until then.
     device: [u8; 16],
+    /// Hold the engine's cut when a head displaces this page's published one
+    /// at the SAME seq (review §1 on sdk#295): the Server may merge the
+    /// displaced group, which must go at the front. Only a Server that
+    /// releases the hold sets this.
+    hold_on_displace: bool,
     /// The id of the sign request in flight, if one is (SG02); an answer under
     /// any other id answers something else, a superseded ask included.
     sign_id: Option<u32>,
@@ -482,6 +497,7 @@ impl Page {
         Page {
             path,
             device: [0; 16],
+            hold_on_displace: false,
             engine,
             blocks,
             confirmed: BTreeSet::new(),
@@ -1288,9 +1304,17 @@ impl Page {
             // No read of that head (it came some other way): nothing is
             // witnessed, which is the old rule -- not landed.
             let witness = (self.device != [0; 16])
-                .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device)))
+                .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, self.engine.committing_seq())))
                 .flatten();
             self.engine.set_witness(witness);
+        }
+        // A SAME-SEQ DISPLACEMENT of this page's head: the Server may merge
+        // the displaced group, so no cut is made until it has placed it (or
+        // decided not to) -- set BEFORE the step that re-derives the queue.
+        if let Event::HeadConflict { seq, root } = &ev {
+            if self.hold_on_displace && (*seq, *root) != self.published() && *seq == self.published().0 {
+                self.engine.hold_cut();
+            }
         }
         // The engine has a head once it is TOLD one, whoever tells it: the
         // held writes go the moment it is, onto the tree it now stands on.
@@ -1505,6 +1529,56 @@ impl Page {
     /// per commit, what group commit is measured by).
     pub fn commits_and_writes(&self) -> (u64, u64) {
         self.engine.commits_and_writes()
+    }
+
+    /// Writes told `Published` because a head's ledger witnessed their group
+    /// landed unheard (COMMIT-LIFE ⁵).
+    pub fn landed_by_witness(&self) -> u64 {
+        self.engine.landed_by_witness()
+    }
+
+    /// Writes told `Published` by a no-op group: the tree already held them.
+    pub fn noop_published(&self) -> u64 {
+        self.engine.noop_published()
+    }
+
+    /// See `hold_on_displace`: the Server that merges turns it on.
+    pub fn hold_on_displace(&mut self) {
+        self.hold_on_displace = true;
+    }
+
+    pub fn cut_held(&self) -> bool {
+        self.engine.cut_held()
+    }
+
+    /// The hold ends with nothing to merge.
+    pub fn release_cut(&mut self) {
+        let fx = self.engine.release_cut();
+        self.carry_out(fx);
+    }
+
+    /// A merge's writes, at the FRONT of the queue (review §1 on sdk#295).
+    pub fn merge_front(&mut self, client: ClientId, writes: Vec<engine::MergeWrite>) {
+        let fx = self.engine.merge_front(client, writes);
+        self.carry_out(fx);
+    }
+
+    /// The next write taken is a re-run that spent `tries` (ONE budget).
+    pub fn carry_tries(&mut self, tries: u32) {
+        self.engine.carry_tries(tries);
+    }
+
+    pub fn clear_carried_tries(&mut self) {
+        self.engine.clear_carried_tries();
+    }
+
+    pub fn max_write_tries(&self) -> u32 {
+        self.engine.max_write_tries()
+    }
+
+    /// The seq the commit in flight would land at (`None`: none in flight).
+    pub fn committing_seq(&self) -> Option<u64> {
+        self.engine.committing_seq()
     }
 
     /// The engine's own counts the model reads (R-b): K9 rebuilds that

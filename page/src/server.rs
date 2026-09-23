@@ -59,6 +59,9 @@ pub struct Server {
     /// model's check; it decides nothing. A `Cell` because verdicts are
     /// told from `reply_from(&self)`.
     busy_told: std::cell::Cell<u64>,
+    /// Merge writes (sdk#225b) that published: re-applications of writes
+    /// already told `Published`, told to no client.
+    merge_published: u64,
     /// Every write's terminal fate until the app reads it (R-b; the pull
     /// API). Recorded in `drain`, the one place every verdict passes.
     fates: crate::fates::Fates,
@@ -230,14 +233,24 @@ impl Server {
         self.busy_told.get()
     }
 
+    /// Merge writes that published (see the field).
+    pub fn merge_published(&self) -> u64 {
+        self.merge_published
+    }
+
     /// Writes taken forced past their reads (sdk#235).
     pub fn forced_writes(&self) -> u64 {
         self.page.forced_writes()
     }
 
     pub fn new(page: Page, facts: SignerFacts) -> Server {
+        let mut page = page;
+        // This Server merges a same-seq race (sdk#225b) and releases the hold
+        // when it does not (`same_identity`).
+        page.hold_on_displace();
         Server {
             busy_told: std::cell::Cell::new(0),
+            merge_published: 0,
             fates: crate::fates::Fates::default(),
             moved_seen: None,
             page,
@@ -295,9 +308,22 @@ impl Server {
                 out.replies.push(reply_bytes(&reply));
             }
         }
+        // A carried try count belongs to the write this call made, if any.
+        self.page.clear_carried_tries();
         self.drain(&mut out);
         self.answer_call(&mut out);
         self.out.extend(out.replies);
+    }
+
+    /// ONE BUDGET (sdk#265): the next write this Server takes is a `Db`
+    /// re-run of a write that had spent `tries`; it draws on from there.
+    pub fn carry_tries(&mut self, tries: u32) {
+        self.page.carry_tries(tries);
+    }
+
+    /// Every write's tries -- dead-commit re-sends and `Db` re-runs alike.
+    pub fn max_write_tries(&self) -> u32 {
+        self.page.max_write_tries()
     }
 
     /// Something the NODE (or the signer) answered, as the web layer decoded it.
@@ -492,6 +518,11 @@ impl Server {
         if merge_done {
             self.finish_merge(out);
         }
+        // The cut is held (a same-seq displacement, `Page::hold_on_displace`)
+        // only while a merge waits for its delta; with none, it goes on.
+        if self.page.cut_held() && !self.merge.as_ref().is_some_and(|m| m.sent.is_empty()) {
+            self.page.release_cut();
+        }
         // The Server's own reads (or the merge write) may have answered at once.
         let more = self.page.take_client();
         if !more.is_empty() {
@@ -510,11 +541,12 @@ impl Server {
                 Effect::Notify { client, write_id, state } => {
                     self.fates.told((session_of(*client), write_id.0), state, seq);
                 }
-                Effect::Conflicted { client, write_id, key, current, after } => self.fates.conflicted(
+                Effect::Conflicted { client, write_id, key, current, after, tries } => self.fates.conflicted(
                     (session_of(*client), write_id.0),
                     key.clone(),
                     current.as_ref().map(|f| f.hash()),
                     after.map(|(c, w)| (session_of(c), w.0)),
+                    *tries,
                 ),
                 Effect::Unread { client, write_id, key } => self.fates.unread((session_of(*client), write_id.0), key.clone()),
                 _ => {}
@@ -570,7 +602,7 @@ impl Server {
 
     /// `session`'s conflicts not yet taken for `Db`'s re-run (#249), each
     /// with the writes that cascade from it: `(write ids, keys)`. Drained.
-    pub fn take_conflicted(&mut self, session: u64) -> Vec<(Vec<u64>, Vec<Vec<u8>>)> {
+    pub fn take_conflicted(&mut self, session: u64) -> Vec<(Vec<u64>, Vec<Vec<u8>>, u32)> {
         self.fates.take_conflicted(session)
     }
 
@@ -794,11 +826,13 @@ impl Server {
             let wid = self.next_probe;
             self.next_probe += 1;
             m.sent.push((wid, i));
-            events.push(Event::Write { client: MERGE_CLIENT, write_id: as_write_id(wid), ops, reads });
+            events.push((as_write_id(wid), ops, reads));
         }
         let nothing = events.is_empty();
-        for ev in events {
-            self.page.event(ev);
+        if !nothing {
+            // At the FRONT, before every later write of this page (review §1
+            // on sdk#295): the cut was held since the displacing head.
+            self.page.merge_front(MERGE_CLIENT, events);
         }
         if nothing {
             let mut out = Outbound::default();
@@ -815,11 +849,14 @@ impl Server {
             State::Published => {
                 m.landed.insert(i, true);
                 m.published_at = Some(now);
+                self.merge_published += 1;
                 true
             }
             // It could not land where it was judged (or its fate cannot be
-            // known): its keys are superseded, told -- never blind.
-            State::Lost | State::Conflict | State::Unread | State::Failed | State::TooLarge { .. } | State::QueueFull { .. } | State::Unknown => {
+            // known): its keys are superseded, told -- never blind. Never
+            // `QueueFull`: a merge write goes in at the front, past the bound
+            // (its bytes were counted when first taken).
+            State::Lost | State::Conflict | State::Unread | State::Failed | State::TooLarge { .. } | State::Unknown => {
                 m.landed.insert(i, false);
                 false
             }

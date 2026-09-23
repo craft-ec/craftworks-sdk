@@ -520,6 +520,9 @@ pub enum Effect {
         /// earlier write, of the same re-derivation, that wrote `key` and
         /// itself conflicted or fell. `None`: this write's own read moved.
         after: Option<(ClientId, WriteId)>,
+        /// Tries this write had spent (ONE budget, sdk#265): a `Db` re-run of
+        /// it draws on from here, never from a count of its own.
+        tries: u32,
     },
 
     /// Beside a `Notify{Unread}`: the key the write changes and did not read
@@ -976,6 +979,9 @@ pub enum Stage {
 
 /// A write the engine has TAKEN and not yet committed (R-b; COMMIT-LIFE §
 /// A write's stage in the page's queue).
+/// One of a merge's writes for [`Engine::merge_front`]: its id, ops and reads.
+pub type MergeWrite = (WriteId, Vec<(Vec<u8>, Op)>, Vec<(Vec<u8>, Expect)>);
+
 #[derive(Clone, Debug)]
 struct Queued {
     client: ClientId,
@@ -1255,6 +1261,24 @@ pub struct Engine<B: Blocks> {
     in_own_publish: bool,
     /// The next arrival number (K9).
     next_arrival: u64,
+    /// Sessions told `QueueFull` that have not been taken since (review §2 on
+    /// sdk#295): each later write of theirs is `QueueFull` too, until the
+    /// session has nothing queued, so a smaller later write never lands before
+    /// the refused one. Transient: not in a context (a restored engine holds
+    /// no queue to overtake).
+    queue_blocked: BTreeSet<ClientId>,
+    /// Tries the NEXT write taken has already spent: set by a `Db` re-run
+    /// just before it makes the write (ONE budget, sdk#265), taken by that
+    /// write, cleared by the call that set it.
+    next_tries: Option<u32>,
+    /// Writes told `Published` by a NO-OP group (#164): no commit carried
+    /// them, the tree already held them.
+    noop_published: u64,
+    /// Nothing is applied or cut while set (review §1 on sdk#295): a same-seq
+    /// race is being MERGED, and the displaced group must go at the FRONT,
+    /// before any later write is judged or commits. Set by the page before the displacing head is
+    /// stepped; cleared by [`Engine::merge_front`] or [`Engine::release_cut`].
+    cut_held: bool,
     /// The cut being shipped (K9 §1, §4, §6): the arrival number of its last
     /// write, until every write of it has published. A later piece, and a
     /// re-send after `Lost`, take no write past it.
@@ -1421,6 +1445,10 @@ impl<B: Blocks> Engine<B> {
             own_publish_rederived: 0,
             in_own_publish: false,
             next_arrival: 1,
+            queue_blocked: BTreeSet::new(),
+            next_tries: None,
+            noop_published: 0,
+            cut_held: false,
             cut_until: None,
             witness: None,
             cascade: Vec::new(),
@@ -1577,6 +1605,26 @@ impl<B: Blocks> Engine<B> {
     }
 
     /// Dead commits' writes the witness showed landed (told Published, ⁵).
+    /// THE ONE BUDGET (sdk#265): the next write taken is a `Db` re-run of a
+    /// write that had spent `tries` -- it goes on from there, and falls
+    /// `Lost` past [`Params::max_write_tries`] as any write does.
+    pub fn carry_tries(&mut self, tries: u32) {
+        self.next_tries = Some(tries);
+    }
+
+    pub fn clear_carried_tries(&mut self) {
+        self.next_tries = None;
+    }
+
+    pub fn max_write_tries(&self) -> u32 {
+        self.params.max_write_tries
+    }
+
+    /// Writes told `Published` by a no-op group (see the field).
+    pub fn noop_published(&self) -> u64 {
+        self.noop_published
+    }
+
     pub fn landed_by_witness(&self) -> u64 {
         self.landed_by_witness
     }
@@ -1591,6 +1639,63 @@ impl<B: Blocks> Engine<B> {
     /// ledger records as this page's `through`.
     pub fn committing_through(&self) -> Option<u64> {
         self.pending.as_ref().map(|c| c.through).filter(|t| *t > 0)
+    }
+
+    /// HOLD THE QUEUE (review §1 on sdk#295): until [`Engine::merge_front`]
+    /// or [`Engine::release_cut`], writes are taken but none is applied or
+    /// committed -- a merge's displaced group is about to go at the front.
+    pub fn hold_cut(&mut self) {
+        self.cut_held = true;
+    }
+
+    pub fn cut_held(&self) -> bool {
+        self.cut_held
+    }
+
+    /// The hold ends with nothing to merge: the queue moves on.
+    pub fn release_cut(&mut self) -> Vec<Effect> {
+        self.cut_held = false;
+        self.advance()
+    }
+
+    /// THE MERGE'S WRITES GO AT THE FRONT (sdk#225b; review §1 on sdk#295):
+    /// the displaced group is re-applied onto the winner BEFORE every write
+    /// that came after it, in its order -- the same path as a dead cut
+    /// (`requeue_from(0)`). Queued behind, a later own write would commit
+    /// first and the older value land over it (or be told superseded by the
+    /// page's own write). Its bytes were counted when first taken: no bound.
+    /// Arrival numbers are given again from here, in the new order (none of
+    /// these writes is in a head: the cut was held), so arrival order stays
+    /// apply order and the witness's `through` stays one number.
+    pub fn merge_front(&mut self, client: ClientId, writes: Vec<MergeWrite>) -> Vec<Effect> {
+        self.cut_held = false;
+        let at = self.queue.iter().take_while(|q| q.committing).count();
+        if at > 0 {
+            // The hold was not in place when the cut was made.
+            self.impossible_transitions += 1;
+        }
+        for (n, (write_id, ops, reads)) in writes.into_iter().enumerate() {
+            let size = ops.iter().map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 }).sum::<usize>()
+                + reads.iter().map(|(k, _)| k.len() + 33).sum::<usize>();
+            self.queue.insert(at + n, Queued { client, write_id, ops, reads, size, tries: 0, told_accepted: true, warm_after: None, committing: false, arrival: 0 });
+        }
+        for q in self.queue.iter_mut().skip(at) {
+            q.arrival = self.next_arrival;
+            self.next_arrival += 1;
+        }
+        if at == 0 {
+            self.cut_until = None;
+        }
+        self.root = self.queue.iter().take(at).next_back().and_then(|q| q.warm_after).unwrap_or(self.published_root);
+        self.requeue_from(at);
+        self.advance()
+    }
+
+    /// The seq the commit in flight would land at: what a head's `through`
+    /// list is compared against to tell an evicted entry from one never
+    /// there (review §3 on sdk#295).
+    pub fn committing_seq(&self) -> Option<u64> {
+        self.pending.as_ref().map(|c| c.seq)
     }
 
     /// Writes that fell `Lost` in the engine: `(forced, tries spent)`.
@@ -2413,6 +2518,7 @@ impl<B: Blocks> Engine<B> {
         ops: Vec<(Vec<u8>, Op)>,
         reads: Vec<(Vec<u8>, Expect)>,
     ) -> Vec<Effect> {
+        let tries = self.next_tries.take().unwrap_or(0);
         // AT THE DOOR (sdk#235, W8): a write names what it read. SYNTACTIC —
         // the write's own op keys against its own read keys — so it reads no
         // state and comes before every other answer: before Busy, before the
@@ -2448,18 +2554,27 @@ impl<B: Blocks> Engine<B> {
         // K1) -- a refusal only at the app's own deadline. A session with
         // nothing queued is always taken (its fair share: one tab's burst
         // cannot starve another's write).
+        //
+        // ORDER WITHIN A SESSION (review §2 on sdk#295): `QueueFull` is not
+        // terminal -- the refused write comes again. So once a session is told
+        // it, every later write of that session is told it too, even one that
+        // would fit, until the session has nothing queued: a smaller later
+        // write never lands before the older one it followed. With nothing
+        // queued the session is taken (its fair share) and unblocked.
         let bytes = self.queue.iter().map(|q| q.size).sum::<usize>();
         let has_one = self.queue.iter().any(|q| q.client == client);
-        if has_one && bytes + size > self.params.max_queue_bytes {
+        if has_one && (self.queue_blocked.contains(&client) || bytes + size > self.params.max_queue_bytes) {
+            self.queue_blocked.insert(client);
             return vec![Effect::Notify { client, write_id, state: State::QueueFull { bytes, limit: self.params.max_queue_bytes } }];
         }
+        self.queue_blocked.remove(&client);
         self.queue.push_back(Queued {
             client,
             write_id,
             ops,
             reads,
             size,
-            tries: 0,
+            tries,
             told_accepted: false,
             warm_after: None,
             committing: false,
@@ -2485,7 +2600,10 @@ impl<B: Blocks> Engine<B> {
     /// exit of the first `Applying` write tries the next (footnote 8).
     fn advance(&mut self) -> Vec<Effect> {
         let mut out = Vec::new();
-        if !self.recovered {
+        // Held (a merge's group is about to go at the front): NOTHING is
+        // judged -- a later write re-judged on the winner now would be judged
+        // without the displaced writes it came after.
+        if !self.recovered || self.cut_held {
             return out;
         }
         loop {
@@ -2553,7 +2671,7 @@ impl<B: Blocks> Engine<B> {
                     .find(|(_, _, keys)| keys.contains(&key))
                     .map(|(c, w, _)| (*c, *w));
                 let mut out = self.end_queued(i, State::Conflict);
-                out.push(Effect::Conflicted { client: q.client, write_id: q.write_id, key, current, after });
+                out.push(Effect::Conflicted { client: q.client, write_id: q.write_id, key, current, after, tries: q.tries });
                 return (out, true);
             }
             Err(ReadsCheck::Unreadable) => return (self.end_queued(i, State::Failed), true),
@@ -2637,9 +2755,13 @@ impl<B: Blocks> Engine<B> {
     /// ended without a commit (a no-op group is `Published` at once, #164),
     /// so the next may go.
     fn commit_front(&mut self) -> (Vec<Effect>, bool) {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.cut_held {
             return (Vec::new(), false);
         }
+        // A dead cut's writes can leave the queue while being re-applied (a
+        // conflict, a failed fetch): with none of them left the cut is over,
+        // or its bound would hold every later write back for ever.
+        self.close_cut();
         let until = self.cut_until;
         let cut: Vec<(ClientId, WriteId)> = self
             .queue
@@ -2683,7 +2805,7 @@ impl<B: Blocks> Engine<B> {
                 Err(ReadsCheck::Differs { key, current }) => {
                     let after = self.cascade.iter().rev().find(|(_, _, keys)| keys.contains(&key)).map(|(c, w, _)| (*c, *w));
                     out.extend(self.end_queued(idx, State::Conflict));
-                    out.push(Effect::Conflicted { client: q.client, write_id: q.write_id, key, current, after });
+                    out.push(Effect::Conflicted { client: q.client, write_id: q.write_id, key, current, after, tries: q.tries });
                     dropped = true;
                     continue;
                 }
@@ -2761,6 +2883,7 @@ impl<B: Blocks> Engine<B> {
         if self.root == base && self.unpublished.is_empty() {
             let writes = std::mem::take(&mut self.folded);
             self.folded_bytes = 0;
+            self.noop_published += writes.len() as u64;
             let owed: BTreeSet<ParityIds> = self.owed.keys().copied().collect();
             for w in &writes {
                 out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::Published });
