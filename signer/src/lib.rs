@@ -31,6 +31,7 @@
 //! driven natively with nothing but a map. `delegate` (the entry the node calls) is `serve` over the real ctx.
 
 use serde::{Deserialize, Serialize};
+pub use signer_proto::{app_id_ok, site_params};
 
 // The wire types live in `signer-proto`, so the page can speak them without linking this delegate.
 pub use signer_proto::{
@@ -383,18 +384,6 @@ pub struct SiteRecord {
 /// Its secret-store name.
 pub fn site_record_key(app: &str) -> Vec<u8> {
     [b"signer_site/".as_slice(), app.as_bytes()].concat()
-}
-
-/// The app id rule (the SDK's `app::check`, the site contract's label): 1-32 of `[a-z0-9_-]`.
-pub fn app_id_ok(app: &str) -> bool {
-    (1..=32).contains(&app.len()) && app.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
-}
-
-/// The site's params: this signer's Register params with the label `site:<app>` instead of its own. `None` unless
-/// they are ONE key's (`RG01 ‖ 0 ‖ key ‖ label`): a signer holds one key.
-pub fn site_params(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
-    let head = register_params.get(..4 + 1 + 32)?;
-    (head.starts_with(b"RG01") && head[4] == 0).then(|| [head, b"site:".as_slice(), app.as_bytes()].concat())
 }
 
 /// THE SITE RULE, pure (the head's sign-if-next, per label): sign a version only AFTER the last one signed for

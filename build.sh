@@ -148,6 +148,13 @@ rm -rf "$unpacked"
 # (builder#104). Not IN the container, and not an artefact an app names: an
 # app never runs it, the node does.
 cp "$contracts/build/webapp.wasm" pkg/web/
+# THE `site` CODE (builder#117): a published app's ONE stable address, updated
+# in place. Shipped like `webapp`: a builder PUTs it, an app never fetches it.
+if [ ! -f "$contracts/build/site.wasm" ]; then
+  echo "no site.wasm in $contracts/build (freenet-contracts f24ecf5 or later)" >&2
+  exit 1
+fi
+cp "$contracts/build/site.wasm" pkg/web/
 
 # The signer's hash cannot be inside the SDK's own wasm — a build cannot
 # contain its own digest — and the CONTRACT hashes are in `buildInfo()`,
@@ -180,6 +187,8 @@ cat > pkg/web/artefacts.json <<JSON
   "modules":  $modules_json,
   "webapp":   { "file": "webapp.wasm",          "sha256": "$(hash_of pkg/web/webapp.wasm)",
                 "bytes": $(size_of pkg/web/webapp.wasm) },
+  "site":     { "file": "site.wasm",            "sha256": "$(hash_of pkg/web/site.wasm)",
+                "bytes": $(size_of pkg/web/site.wasm) },
   "note": "hashes key the shared artefact cache and are verified before use (sdk#5)"
 }
 JSON

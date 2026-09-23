@@ -60,6 +60,17 @@ pub fn tar(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
 }
 
 /// The node's web-container framing (freenet 0.2.136 `app_packaging.rs`).
+/// A state in the node's web framing, split into its metadata and web parts: exactly, or `None` (the inverse
+/// of [`container`]).
+pub fn split(state: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (m, rest) = state.split_at_checked(8)?;
+    let mlen = usize::try_from(u64::from_be_bytes(m.try_into().ok()?)).ok()?;
+    let (meta, rest) = rest.split_at_checked(mlen)?;
+    let (wl, web) = rest.split_at_checked(8)?;
+    let wlen = usize::try_from(u64::from_be_bytes(wl.try_into().ok()?)).ok()?;
+    (wlen == web.len()).then_some((meta, web))
+}
+
 pub fn container(metadata: &[u8], web: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(16 + metadata.len() + web.len());
     v.extend_from_slice(&(metadata.len() as u64).to_be_bytes());

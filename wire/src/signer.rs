@@ -45,6 +45,19 @@ pub fn frame_sign(
     frame(key, id, &SignerRequest::Sign { prev, next }, stream_id)
 }
 
+/// Ask the signer to sign version `version` of app `app`'s site, naming the web bundle whose blake3 is `bundle`
+/// (builder#117).
+pub fn frame_sign_site(
+    key: &DelegateKey,
+    id: u32,
+    app: &str,
+    version: u64,
+    bundle: [u8; 32],
+    stream_id: u32,
+) -> Result<Vec<Vec<u8>>, String> {
+    frame(key, id, &SignerRequest::SignSite { app: app.into(), version, bundle }, stream_id)
+}
+
 /// Provision the signer: the head's key, the Register it signs for, and the Block contract's code (for its root check
 /// and PUT-WITH-CODE). Carries two contracts' code, so it is chunked like any large request.
 pub fn frame_provision(

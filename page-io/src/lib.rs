@@ -146,6 +146,8 @@ impl HeadSubscription {
 }
 
 pub struct PageIo {
+    /// The site publication in flight, if any (builder#117).
+    site: Option<Site>,
     pub server: Server,
     art: Artefacts,
     register: ContractContainer,
@@ -260,6 +262,33 @@ const UNHELD_ROOT: [u8; 32] = [0xA5; 32];
 /// The id a provisioning request goes out under: far from the executor's own
 /// sign ids (from 1) and from the `Held` ids (from 2³¹).
 const PROVISION_ID: u32 = (1 << 31) - 1;
+/// The id of the signer's site signature (builder#117).
+const SITE_SIGN_ID: u32 = (1 << 31) - 4;
+
+/// Where a site publication stands ([`PageIo::publish_site`]). Every step
+/// waits on the page's sender (rule 5), never a clock (rule 8); each ends only
+/// on an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteStage {
+    /// Reading the site's current version from the node.
+    Reading,
+    /// Asking the signer for this version.
+    Signing(u64),
+    /// PUTting this version (the app PUT's own state says the rest).
+    Putting(u64),
+    /// Refused, in the signer's or the node's words.
+    Refused(String),
+}
+
+/// One site publication in flight.
+struct Site {
+    app: String,
+    web: Vec<u8>,
+    bundle: [u8; 32],
+    contract: ContractContainer,
+    id: [u8; 32],
+    stage: SiteStage,
+}
 
 /// The page's I/O as the store's host (READ-STATE): a call on the server is
 /// carried out at once — its node ops framed, its replies kept for the client.
@@ -290,6 +319,7 @@ impl PageIo {
         register_id.copy_from_slice(&register.key().id().as_bytes()[..32]);
         let register_key = register.key().to_string();
         PageIo {
+            site: None,
             server,
             art,
             register,
@@ -549,6 +579,80 @@ impl PageIo {
         Ok(())
     }
 
+    /// PUBLISH A SITE (builder#117): app `app`'s web part `web` at ONE stable
+    /// address — the site contract (`code`) under this identity's Register
+    /// params labelled `site:<app>`. Reads the current version, has the signer
+    /// sign the next, PUTs it; every step on the page's sender. Returns the
+    /// site's contract key: known before anything is sent, the same every
+    /// time. One publication at a time.
+    pub fn publish_site(&mut self, app: &str, code: Vec<u8>, web: Vec<u8>, now: Ms) -> Result<String, String> {
+        if self.read_only {
+            return Err("read-only: a reader publishes nothing".into());
+        }
+        if self.site.as_ref().is_some_and(|x| matches!(x.stage, SiteStage::Reading | SiteStage::Signing(_))) {
+            return Err("a site publication is already in progress".into());
+        }
+        if !signer_proto::app_id_ok(app) {
+            return Err(format!("{app:?} is not an app id"));
+        }
+        let params = signer_proto::site_params(&self.art.register_params, app)
+            .ok_or_else(|| "this page has no identity to publish a site under yet".to_string())?;
+        let contract = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(code)),
+            Parameters::from(params),
+        )));
+        let key = contract.key().to_string();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&contract.key().id().as_bytes()[..32]);
+        let bundle = *blake3::hash(&web).as_bytes();
+        self.site = Some(Site { app: app.into(), web, bundle, contract, id, stage: SiteStage::Reading });
+        self.server.page.send_ext(Ext::GetSite, now);
+        self.pump();
+        Ok(key)
+    }
+
+    /// Where the site publication stands, and its key: `None` before one.
+    pub fn site(&self) -> Option<(SiteStage, String)> {
+        self.site.as_ref().map(|x| (x.stage.clone(), x.contract.key().to_string()))
+    }
+
+    fn site_read(&mut self, next: u64, now: Ms) {
+        self.server.page.ext_answered(Ext::GetSite, now);
+        if let Some(x) = self.site.as_mut() {
+            if x.stage == SiteStage::Reading {
+                x.stage = SiteStage::Signing(next);
+                self.server.page.send_ext(Ext::SignSite, now);
+            }
+        }
+    }
+
+    /// The signer's answer to the site's signature: PUT it, ask again after
+    /// the version it recorded, or say why not.
+    fn site_signed(&mut self, answer: signer_proto::Answer, now: Ms) {
+        let Some(x) = self.site.as_mut() else { return };
+        let SiteStage::Signing(v) = x.stage else { return };
+        match answer {
+            signer_proto::Answer::Signed(meta) | signer_proto::Answer::AlreadySigned(meta) => {
+                let state = wire::webapp::container(&meta, &x.web);
+                x.stage = SiteStage::Putting(v);
+                let contract = x.contract.clone();
+                if let Err(e) = self.put_contract(contract, WrappedState::new(state), now) {
+                    if let Some(x) = self.site.as_mut() {
+                        x.stage = SiteStage::Refused(e);
+                    }
+                }
+            }
+            // ITS record is further on (another tab signed, or its PUT was
+            // lost): ask at the version after it — skipping is harmless, and
+            // it never loops on one it cannot get (architect, #117).
+            signer_proto::Answer::Refused(signer_proto::Why::SiteNotNext { recorded }) => {
+                x.stage = SiteStage::Signing(recorded + 1);
+                self.server.page.send_ext(Ext::SignSite, now);
+            }
+            other => x.stage = SiteStage::Refused(format!("the signer refused the site's version {v}: {other:?}")),
+        }
+    }
+
     /// A person cancels the pending PUT of `key` (the page's, named).
     pub fn cancel_app_put(&mut self, key: &str) {
         self.server.page.cancel_app_put(key);
@@ -634,6 +738,20 @@ impl PageIo {
             return false;
         }
         match incoming {
+            Incoming::Got { id, state } if self.site.as_ref().is_some_and(|x| x.id == id) => {
+                // The site's current state: its record's version (0 for one
+                // that says none). Signed next at version + 1.
+                let version = wire::webapp::split(&state)
+                    .and_then(|(meta, _)| signer_proto::head::record_of(meta).map(|(v, _)| v))
+                    .unwrap_or(0);
+                self.site_read(version + 1, now);
+            }
+            Incoming::GetFailed { id } if self.site.as_ref().is_some_and(|x| x.id == id) => {
+                // No such site yet: its first version. (A PEERED node can
+                // answer NotFound falsely, F55: then the signer's own record
+                // still refuses a version it passed, and says which.)
+                self.site_read(1, now);
+            }
             Incoming::Got { id, state } => {
                 if id == self.register_id {
                     self.register_seen = true;
@@ -733,6 +851,11 @@ impl PageIo {
                     }
                     if matches!(answer, Some((RECORD_QUERY_ID, _))) {
                         self.server.page.ext_answered(Ext::AskRecord, now);
+                    }
+                    if let Some((SITE_SIGN_ID, a)) = &answer {
+                        self.server.page.ext_answered(Ext::SignSite, now);
+                        self.site_signed(a.clone(), now);
+                        continue;
                     }
                     match answer {
                         // `begin`'s question: which Register? Named: open it,
@@ -836,7 +959,7 @@ impl PageIo {
     /// its blocks; a writer also owns its signer's answers, answers that name
     /// nothing, and PUT answers for the app's own contracts (handed back).
     fn owns(&self, incoming: &Incoming) -> bool {
-        let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id);
+        let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id) || self.site.as_ref().is_some_and(|x| x.id == *id);
         let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k);
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id } => mine(id),
@@ -997,6 +1120,16 @@ impl PageIo {
                         stream,
                     ),
                     None => Ok(Vec::new()),
+                },
+                Op::Ext(Ext::GetSite) => match self.site.as_ref() {
+                    Some(x) => wire::frame_get(wire::contract_id(x.id), false, stream),
+                    None => Ok(Vec::new()),
+                },
+                Op::Ext(Ext::SignSite) => match self.site.as_ref() {
+                    Some(Site { app, bundle, stage: SiteStage::Signing(v), .. }) => {
+                        wire::signer::frame_sign_site(&self.art.signer, SITE_SIGN_ID, app, *v, *bundle, stream)
+                    }
+                    _ => Ok(Vec::new()),
                 },
                 Op::Ext(Ext::AskRecord) => wire::signer::frame_sign(
                     &self.art.signer,

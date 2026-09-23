@@ -1376,3 +1376,68 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     assert!(yes(io.may_write(Some(node.register_id))), "a claimed page may not write the register it minted: {:?}", io.may_write(Some(node.register_id)));
     assert!(no(io.may_write(Some(stranger))));
 }
+
+// ---- Sites (builder#117): one stable address, a new version per publish ----
+
+const SITE_CODE: &[u8] = b"the site contract's code, as the builder ships it";
+
+/// Run until the site's publication has left Reading/Signing (or nothing is left to do).
+fn publish(io: &mut PageIo, node: &mut WireNode, now: &mut u64, web: &[u8]) -> (page_io::SiteStage, String) {
+    let key = io.publish_site("notes", SITE_CODE.to_vec(), web.to_vec(), Ms(*now)).expect("publish_site");
+    settle(io, node, now);
+    let (stage, k) = io.site().expect("a site");
+    assert_eq!(k, key, "the site's key moved during its publication");
+    (stage, k)
+}
+
+/// A site is published at ONE address: the first publish signs and PUTs version 1, the next reads it back and
+/// PUTs version 2 at the same key — each version the signer's own record, naming its bundle's hash.
+#[test]
+fn a_site_is_published_at_one_address_and_each_publish_is_the_next_version() {
+    let mut node = WireNode::new(&[41u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    client(&mut io, &mut node, &mut now, &Request::Identity);
+    let (stage, key) = publish(&mut io, &mut node, &mut now, b"web v1");
+    assert_eq!(stage, page_io::SiteStage::Putting(1), "{:?}", io.unusable());
+    assert!(matches!(io.app_put(&key), Some(page::AppPut::Put)), "the site's PUT was not acknowledged: {:?}", io.app_put(&key));
+    let site_id = *node.contracts.iter().find(|(_, st)| wire::webapp::split(st).is_some()).map(|(id, _)| id).expect("the node holds the site");
+    let v = |node: &WireNode| {
+        let (meta, web) = wire::webapp::split(&node.contracts[&site_id]).expect("framed");
+        let (v, value) = signer_proto::head::record_of(meta).expect("a record");
+        (v, value.to_vec(), web.to_vec())
+    };
+    assert_eq!(v(&node), (1, blake3::hash(b"web v1").as_bytes().to_vec(), b"web v1".to_vec()));
+    let (stage, key2) = publish(&mut io, &mut node, &mut now, b"web v2");
+    assert_eq!(key2, key, "a republish moved the site's address");
+    assert_eq!(stage, page_io::SiteStage::Putting(2), "{:?}", io.unusable());
+    assert_eq!(v(&node), (2, blake3::hash(b"web v2").as_bytes().to_vec(), b"web v2".to_vec()));
+    assert!(node.served.get("signer").is_some(), "the signer never signed");
+}
+
+/// NO LIVELOCK (architect, #117): the signer's own record is AHEAD of what the node holds (a version signed whose
+/// PUT never landed). The page asks at the version the node says, is told the one recorded, and publishes AFTER
+/// it — skipping is harmless — instead of asking the refused one for ever.
+#[test]
+fn a_signer_record_ahead_of_the_node_is_published_after_not_retried() {
+    let mut node = WireNode::new(&[42u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    client(&mut io, &mut node, &mut now, &Request::Identity);
+    // The signer signed version 5 of another bundle; nothing of it reached the node.
+    let ahead = signer::serve(&mut Host(&mut node), &signer::encode_request(9, &signer::Request::SignSite { app: "notes".into(), version: 5, bundle: [9u8; 32] }));
+    assert!(matches!(ahead, signer::Answer::Signed(_)), "THE SETUP: {ahead:?}");
+    let (stage, _) = publish(&mut io, &mut node, &mut now, b"web");
+    assert_eq!(stage, page_io::SiteStage::Putting(6), "the page did not publish after the recorded version: {:?}", io.unusable());
+}
+
+/// A reader publishes nothing, and a name that is not an app id is refused before anything is sent.
+#[test]
+fn a_reader_and_a_bad_app_id_publish_no_site() {
+    let node = WireNode::new(&[43u8; 32]);
+    let mut r = reader(&node);
+    assert!(r.publish_site("notes", SITE_CODE.to_vec(), b"w".to_vec(), Ms(1)).is_err());
+    let mut io = page_io(&node);
+    assert!(io.publish_site("Not An Id", SITE_CODE.to_vec(), b"w".to_vec(), Ms(1)).is_err());
+    assert!(io.take_frames().is_empty(), "something was sent for a refused site");
+}

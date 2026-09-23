@@ -233,6 +233,10 @@ pub enum Ext {
     SignerFirst,
     /// Ask the signer whether it holds a record for this register.
     AskRecord,
+    /// Read a site's current state: its version (builder#117).
+    GetSite,
+    /// Ask the signer to sign a site's next version (builder#117).
+    SignSite,
 }
 
 /// What a waiting request is, in words a page can show.
@@ -248,6 +252,8 @@ fn waiting_name(w: &Waiting) -> String {
         Waiting::Ext(Ext::RegisterSigner) => "the signer's registration".into(),
         Waiting::Ext(Ext::SignerFirst) => "the signer".into(),
         Waiting::Ext(Ext::AskRecord) => "the signer's record".into(),
+        Waiting::Ext(Ext::GetSite) => "the site's current version".into(),
+        Waiting::Ext(Ext::SignSite) => "the signer, for the site's version".into(),
     }
 }
 

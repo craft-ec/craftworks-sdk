@@ -582,6 +582,43 @@ impl Session {
         Ok(key)
     }
 
+    /// PUBLISH A SITE (builder#117): app `app`'s web part `web` at ONE stable
+    /// address — the site contract (`code`) under this identity's Register
+    /// params labelled `site:<app>`. The address (the returned key) is the
+    /// same for every version; each call publishes the next version. Watch it
+    /// with [`Session::site_status`]; nothing here ends it on a clock.
+    pub fn publish_site(&mut self, app: &str, code: Vec<u8>, web: Vec<u8>) -> Result<String, JsValue> {
+        let Some(p) = self.page_mut() else {
+            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
+        };
+        let key = p.publish_site(app, code, web, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
+        self.pump_page();
+        Ok(key)
+    }
+
+    /// Where the site publication stands, as JSON:
+    /// `{"state":"none"|"reading"|"signing"|"putting"|"published"|"refused","version":N,"key":"…","said":"…"}`.
+    /// `published` once the node has acknowledged the version's PUT.
+    pub fn site_status(&self) -> String {
+        use page::AppPut;
+        use page_io::SiteStage;
+        let Some((stage, key)) = self.page().and_then(|p| p.site()) else {
+            return serde_json::json!({ "state": "none", "version": 0, "key": "", "said": "" }).to_string();
+        };
+        let (state, version, said) = match stage {
+            SiteStage::Reading => ("reading", 0, String::new()),
+            SiteStage::Signing(v) => ("signing", v, String::new()),
+            SiteStage::Putting(v) => match self.page().and_then(|p| p.app_put(&key)) {
+                Some(AppPut::Put) => ("published", v, String::new()),
+                Some(AppPut::Refused(w)) => ("refused", v, w.clone()),
+                Some(AppPut::Cancelled) => ("refused", v, "cancelled".into()),
+                _ => ("putting", v, String::new()),
+            },
+            SiteStage::Refused(w) => ("refused", 0, w),
+        };
+        serde_json::json!({ "state": state, "version": version, "key": key, "said": said }).to_string()
+    }
+
     /// Open a VIEW of somebody's PUBLISHED head (sdk#239): the Register whose
     /// instance id is `register_id` (hex, as [`Session::head_id`] gives it on
     /// the publisher's session). Published data is readable by default;
