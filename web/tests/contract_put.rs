@@ -3,7 +3,8 @@
 //!
 //! Its behaviour is tested on the real `Session` in
 //! `tests/js/contract-put.test.mjs`: the frames sent, `put_status` through
-//! none → pending → put / refused, a dropped socket.
+//! none → pending → put / refused, and re-sent by the page after a dropped
+//! socket.
 //!
 //! What that cannot see: the PUT must be framed BY page-io, on
 //! page-io's stream counter, not by the Session on its own. Both produce the
@@ -24,7 +25,7 @@ fn body_of(name: &str) -> &'static str {
 
 /// The rule, as a check the tests below apply to a body.
 fn framed_by_page_io(body: &str) -> bool {
-    body.contains("p.put_contract(contract, state)") && !body.contains("frame_put") && !body.contains("self.out")
+    body.contains("p.put_contract(contract, state,") && !body.contains("frame_put") && !body.contains("self.out")
 }
 
 #[test]
@@ -40,6 +41,6 @@ fn the_put_is_framed_by_page_io() {
 fn control_the_reader_finds_the_body_and_the_check_can_fail() {
     let put = body_of("put_contract");
     assert!(put.contains("wire::puts::contract(&code, &params, &state)"), "the reader did not find put_contract's body");
-    let delegate_era = "p.put_contract(contract, state)?; let frames = wire::frame_put(contract, state, stream)?; self.out.extend(frames);";
+    let delegate_era = "p.put_contract(contract, state, now)?; let frames = wire::frame_put(contract, state, stream)?; self.out.extend(frames);";
     assert!(!framed_by_page_io(delegate_era), "the check passes a body that frames the PUT on the Session's own stream");
 }

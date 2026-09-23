@@ -62,9 +62,6 @@ pub struct Session {
     page_identity_sent: bool,
     /// The signer's provisioning was reported by `take_progress`.
     provision_told: bool,
-    /// PUTs of contracts the APP names (`put_contract`, builder#104), and
-    /// what the node said about each — matched by the key it names.
-    puts: wire::puts::Puts,
     /// A VIEW of somebody's published head (`open_named`, sdk#239): reads
     /// only, and every write refused before it reaches the store.
     read_only: bool,
@@ -101,7 +98,6 @@ impl Session {
             unusable: Vec::new(),
             foreign_notifications: 0,
             bound: craftworks_sdk::LiveBindings::default(),
-            puts: wire::puts::Puts::default(),
             read_only: false,
             app: None,
             signer_code: Vec::new(),
@@ -373,17 +369,10 @@ impl Session {
         let ready = p.provisioned() && !sent;
         let others = p.take_others();
         self.out.extend(frames);
-        // The node's answers about contracts that are not the page's own: the
-        // app's PUTs, by the key each names.
+        // The app's own PUTs are the page's (`put_status`): what is left is
+        // an answer about a contract this session never put.
         for answer in others {
-            let ours = match &answer {
-                Incoming::Ack(AckKind::Put(key)) => self.puts.acked(key),
-                Incoming::PutFailed { key, said } => self.puts.refused(key, said),
-                _ => false,
-            };
-            if !ours {
-                self.unusable.push(format!("a PUT answer for a contract this session never put: {answer:?}"));
-            }
+            self.unusable.push(format!("a PUT answer for a contract this session never put: {answer:?}"));
         }
         if ready {
             self.page_identity_sent = true;
@@ -539,9 +528,9 @@ impl Session {
     /// may have been sent before the socket dropped and arrive on the new one.
     pub fn reconnected(&mut self) {
         // The head subscription is page-io's, and it re-reads the head on the
-        // new connection: nothing to reset here (sdk#259).
-        // An app PUT's answer sent on the old socket never arrives on this one.
-        self.puts.connection_lost();
+        // new connection: nothing to reset here (sdk#259). An app PUT whose
+        // answer went with the old socket is re-sent at its deadline, as every
+        // op is.
     }
 
     /// PUT a contract the APP names — its code, params and state (builder#104:
@@ -549,17 +538,16 @@ impl Session {
     /// its key: the contract instance id, as the node names it and serves a
     /// web container under (`/v1/contract/web/<key>/`).
     ///
-    /// The frames go out with the next `outbound`, through page-io (the only
-    /// path to the node). [`Session::put_status`] says
-    /// what the node answered, matched by this key. **An ack is not
-    /// durability:** a publisher that must know reads it back.
+    /// The PAGE sends it, like every op: on its deadline, re-sent while
+    /// unanswered, and ENDED by `page::APP_PUT_BUDGET_MS` at the latest.
+    /// [`Session::put_status`] says where it stands, matched by this key.
+    /// **An ack is not durability:** a publisher that must know reads it back.
     pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
         let (key, contract, state) = wire::puts::contract(&code, &params, &state);
         let Some(p) = self.page_mut() else {
             return Err(JsValue::from_str("provision first — there is no path to the node before it"));
         };
-        p.put_contract(contract, state).map_err(|e| JsValue::from_str(&e))?;
-        self.puts.begin(key.clone());
+        p.put_contract(contract, state, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
         self.pump_page();
         Ok(key)
     }
@@ -631,16 +619,17 @@ impl Session {
     }
 
     /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
-    /// `{"state":"none"|"pending"|"put"|"refused"|"unanswered","said":"…"}`.
-    /// `said` is the node's own words for a refusal: display only.
+    /// `{"state":"none"|"pending"|"put"|"refused"|"failed","said":"…"}`.
+    /// It always ENDS (the page's budget): `refused` carries the node's words,
+    /// `failed` what was tried. `said` is display only.
     pub fn put_status(&self, key: &str) -> String {
-        use wire::puts::PutState;
-        let (state, said) = match self.puts.state(key) {
+        use page::AppPut;
+        let (state, said) = match self.page().and_then(|p| p.app_put(key)) {
             None => ("none", ""),
-            Some(PutState::Pending) => ("pending", ""),
-            Some(PutState::Put) => ("put", ""),
-            Some(PutState::Refused(w)) => ("refused", w.as_str()),
-            Some(PutState::Unanswered) => ("unanswered", ""),
+            Some(AppPut::Pending) => ("pending", ""),
+            Some(AppPut::Put) => ("put", ""),
+            Some(AppPut::Refused(w)) => ("refused", w.as_str()),
+            Some(AppPut::GaveUp(w)) => ("failed", w.as_str()),
         };
         serde_json::json!({ "state": state, "said": said }).to_string()
     }

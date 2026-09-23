@@ -501,8 +501,8 @@ fn a_head_changed_from_the_node_makes_an_idle_page_read_and_adopt_the_new_head()
 
 /// An APP's PUT (builder#104: a web container) goes out through page-io — the
 /// only path to the node — beside the page's own writes, and its answer comes
-/// back to the CALLER by key through `take_others`: never taken as one of the
-/// page's block or register answers, never dropped.
+/// back to the PAGE by key, which ends the PUT it sent: never taken as one of
+/// the page's block or register answers, never dropped.
 #[test]
 fn an_apps_put_crosses_the_wire_and_its_answer_is_handed_back_by_key() {
     let mut node = WireNode::new(&[5u8; 32]);
@@ -511,17 +511,19 @@ fn an_apps_put_crosses_the_wire_and_its_answer_is_handed_back_by_key() {
     client(&mut io, &mut node, &mut now, &Request::Identity);
     let (key, c, state) = wire::puts::contract(b"an app's contract", b"its params", b"its state");
     let cid = id_of(&c.key());
-    io.put_contract(c, state).expect("frames");
+    io.put_contract(c, state, Ms(now)).expect("frames");
     let r = client(&mut io, &mut node, &mut now, &write(1, "a", "1"));
     assert!(states(&r, 1).contains(&WriteState::Published), "the page's own write did not publish beside it: {r:?}");
     assert_eq!(node.contracts.get(&cid).map(Vec::as_slice), Some(b"its state".as_slice()), "the app's PUT never reached the node");
-    assert_eq!(io.take_others(), vec![wire::Incoming::Ack(wire::AckKind::Put(key))], "the app's ack was not handed back, or others' were");
-    assert!(io.take_others().is_empty(), "handed back twice");
+    // The PAGE sent it, so the page takes its answer: the PUT ENDED, as put.
+    assert_eq!(io.app_put(&key), Some(&page::AppPut::Put), "the app's ack did not end its PUT");
+    assert!(io.take_others().is_empty(), "the app's own ack was handed back as somebody else's");
     assert!(io.unusable().is_empty(), "{:?}", io.unusable());
 }
 
-/// A PUT refusal NAMING the app's contract is handed back; one naming the
-/// page's own register is the page's (reported), not handed back.
+/// A PUT refusal NAMING a contract this page never PUT is handed back; one
+/// naming the app's PUT ends it; one naming the page's own register is the
+/// page's (reported), not handed back.
 #[test]
 fn a_put_refusal_goes_to_whoever_owns_the_contract_it_names() {
     use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
@@ -531,16 +533,23 @@ fn a_put_refusal_goes_to_whoever_owns_the_contract_it_names() {
         let e: Err = ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key, cause: "invalid put".into() })).into();
         bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes")
     };
+    // A contract this page never PUT: handed back unread.
     let (key, c, _) = wire::puts::contract(b"an app's contract", b"p", b"s");
     io.inbound(&refusal(c.key()), Ms(1));
     assert_eq!(io.take_others(), vec![wire::Incoming::PutFailed { key, said: "invalid put".into() }]);
     assert!(io.unusable().is_empty(), "{:?}", io.unusable());
+    // One it did PUT: the refusal ENDS it, in the node's words.
+    let (mine, c, s) = wire::puts::contract(b"an app's contract", b"mine", b"s");
+    io.put_contract(c.clone(), s, Ms(1)).expect("frames");
+    io.inbound(&refusal(c.key()), Ms(2));
+    assert_eq!(io.app_put(&mine), Some(&page::AppPut::Refused("invalid put".into())));
+    assert!(io.take_others().is_empty(), "the app's own refusal was handed back as somebody else's");
 
     let register = ContractKey::from_id_and_code(
         ContractInstanceId::new(node.register_id),
         CodeHash::new([0u8; 32]),
     );
-    io.inbound(&refusal(register), Ms(2));
+    io.inbound(&refusal(register), Ms(3));
     assert!(io.take_others().is_empty(), "the page's own register refusal was handed to the app");
     assert_eq!(io.unusable(), ["the node refused: invalid put".to_string()]);
 }

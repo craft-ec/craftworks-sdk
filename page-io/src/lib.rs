@@ -162,6 +162,9 @@ pub struct PageIo {
     /// Node answers about contracts that are not this page's register or
     /// blocks — the app's own PUTs — handed back unread (`take_others`).
     others: Vec<Incoming>,
+    /// The app's PUTs by contract key: the exact contract and state, framed
+    /// again whenever the page re-sends [`Op::PutApp`].
+    app_contracts: BTreeMap<String, (ContractContainer, WrappedState)>,
     /// A READER of a NAMED head ([`PageIo::reader`], sdk#239): no signer, so
     /// nothing is signed, PUT or updated, and nothing is installed on the node.
     read_only: bool,
@@ -284,6 +287,7 @@ impl PageIo {
             signer_has_record: None,
             head_failed_pending: false,
             others: Vec::new(),
+            app_contracts: BTreeMap::new(),
             read_only: false,
             now: Ms(0),
             stream_base: 0,
@@ -436,11 +440,21 @@ impl PageIo {
     /// the node (main's condition 3) and two chunked requests on one stream id
     /// would be reassembled into each other. The answer comes back through
     /// [`PageIo::take_others`], named by the contract's key.
-    pub fn put_contract(&mut self, contract: ContractContainer, state: WrappedState) -> Result<(), String> {
-        let stream = self.next_stream();
-        let f = wire::frame_put(contract, state, stream)?;
-        self.out.extend(f);
+    pub fn put_contract(&mut self, contract: ContractContainer, state: WrappedState, now: Ms) -> Result<(), String> {
+        if self.read_only {
+            return Err("read-only: a reader PUTs nothing".into());
+        }
+        let key = contract.key().to_string();
+        self.app_contracts.insert(key.clone(), (contract, state));
+        // THE PAGE SENDS IT (its deadline, re-send and end), like every op.
+        self.server.page.put_app(key, now);
+        self.pump();
         Ok(())
+    }
+
+    /// Where the app's PUT of `key` stands (the page's [`page::AppPut`]).
+    pub fn app_put(&self, key: &str) -> Option<&page::AppPut> {
+        self.server.page.app_put(key)
     }
 
     /// Node answers this page did not own (see `others`), oldest first.
@@ -588,12 +602,19 @@ impl PageIo {
                     }
                 }
             }
-            // Someone else's PUT answer: the app's, handed back unread.
+            // The app's PUT: the page ends its deadline.
+            Incoming::Ack(wire::AckKind::Put(key)) if self.app_contracts.contains_key(&key) => {
+                self.server.node(Answer::AppPutOk(key), now)
+            }
+            // A PUT answer nobody here sent: handed back unread.
             answer @ Incoming::Ack(wire::AckKind::Put(_)) => self.others.push(answer),
             // A refused PUT of our own register or block is what a refusal
             // naming nothing was before `PutFailed` existed: reported.
             Incoming::PutFailed { key, said } if key == self.register_key || self.by_key.contains_key(&key) => {
                 self.unusable.push(format!("the node refused: {said}"))
+            }
+            Incoming::PutFailed { key, said } if self.app_contracts.contains_key(&key) => {
+                self.server.node(Answer::AppPutRefused { key, said }, now)
             }
             answer @ Incoming::PutFailed { .. } => self.others.push(answer),
             Incoming::EngineBytes(msgs) => {
@@ -838,7 +859,7 @@ impl PageIo {
                         not_held.push(id);
                         continue;
                     }
-                    Op::Put { .. } | Op::Update { .. } | Op::Sign { .. } => {
+                    Op::Put { .. } | Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
                         self.unusable.push(format!("read-only: a {} was not sent", op_name(&op)));
                         continue;
                     }
@@ -882,6 +903,10 @@ impl PageIo {
                     signer_proto::Next { seq, root, ledger },
                     stream,
                 ),
+                Op::PutApp { key } => match self.app_contracts.get(&key) {
+                    Some((c, st)) => wire::frame_put(c.clone(), st.clone(), stream),
+                    None => Err(format!("an app PUT of {key}, whose contract this page does not hold")),
+                },
                 Op::AskHeld { id } => {
                     let hid = self.next_held_id;
                     self.next_held_id = self.next_held_id.wrapping_add(1).max(1 << 31);
@@ -912,5 +937,6 @@ fn op_name(op: &Op) -> &'static str {
         Op::Get { .. } => "block GET",
         Op::ReadHead => "head read",
         Op::AskHeld { .. } => "held query",
+        Op::PutApp { .. } => "app PUT",
     }
 }

@@ -38,6 +38,7 @@ fn warmed(writes: u64, delay: u64) -> (Page, u64) {
                     }
                     Op::Update { .. } => Answer::Updated,
                     Op::AskHeld { id } => Answer::Held { id, present: true },
+                    Op::PutApp { key } => Answer::AppPutOk(key),
                 };
                 due.push((now + delay, a));
             }
