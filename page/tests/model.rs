@@ -355,10 +355,10 @@ impl Node {
                 return Ok(out);
             }
             for id in missing {
-                let g = engine::repair::find_group(&r, *root, id).ok_or_else(|| format!("block {} is in no held group", id[..4].iter().map(|b| format!("{b:02x}")).collect::<String>()))?;
+                let g = engine::repair::find_group(&r, *root, id).ok_or_else(|| format!("block {} is in no held group", format!("{:?}", &id[..4])))?;
                 let have: Vec<Option<Vec<u8>>> = g.slots.iter().enumerate().map(|(i, s)| r.get(s).filter(|b| g.fits(i, b)).map(|b| g.stored(i, b))).collect();
                 let held = have.iter().filter(|h| h.is_some()).count();
-                let body = engine::repair::rebuild(&g, &have).map_err(|e| format!("block {} not rebuildable: {held} of k={} held: {e}", id[..4].iter().map(|b| format!("{b:02x}")).collect::<String>(), g.k))?;
+                let body = engine::repair::rebuild(&g, &have).map_err(|e| format!("block {} not rebuildable: {held} of k={} held: {e}", format!("{:?}", &id[..4]), g.k))?;
                 r.rebuilt.insert(id, body);
             }
         }
@@ -861,7 +861,10 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
     let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
     let mut most = 0;
     let mut landings = 0;
-    for seed in 1..=20 {
+    // 60 seeds, not 20: race put signs a head as soon as its groups are
+    // recoverable, so heads land sooner and a twice-lost UPDATE is rarer per
+    // seed (20 seeds reached at most 2). The coverage floor below is unchanged.
+    for seed in 1..=60 {
         let s = run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write published");
         most = most.max(s.most_landing_updates);
