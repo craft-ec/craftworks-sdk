@@ -9,12 +9,6 @@
    "lines": 7
   },
   {
-   "key": "63b7296b24c92707",
-   "a": "page-io/src/lib.rs:759-764",
-   "b": "page-io/src/lib.rs:359-364",
-   "lines": 6
-  },
-  {
    "key": "22de322bec262401",
    "a": "probe/src/bin/live-page-writes.rs:216-222",
    "b": "probe/src/bin/live-page-writes.rs:81-87",
@@ -89,7 +83,7 @@
   {
    "key": "f553360aabb008e5",
    "a": "src/engine_store.rs:459-473",
-   "b": "src/store.rs:442-514",
+   "b": "src/store.rs:459-514",
    "lines": 15
   },
   {
@@ -106,7 +100,7 @@
   },
   {
    "key": "360a5624786fdc67",
-   "a": "src/store.rs:443-451",
+   "a": "src/store.rs:460-468",
    "b": "src/tree_store.rs:501-510",
    "lines": 9
   },
@@ -124,8 +118,8 @@
   },
   {
    "key": "022cbf85204ee1bd",
-   "a": "web/src/lib.rs:253-266",
-   "b": "web/src/lib.rs:236-245",
+   "a": "web/src/lib.rs:275-288",
+   "b": "web/src/lib.rs:258-267",
    "lines": 14
   },
   {
