@@ -42,7 +42,10 @@ const refusedAsReadOnly = fn => {
   assert.match(err.message, /^read-only: /);
 };
 
-const view = () => { const s = new Session(7999); s.open_named(BLOCK, HEAD, 1); return s; };
+// A view carries its app, as `tree()` gives it one: whose data a write names
+// is decided before whether this session may write (a name no app owns is
+// refused by name first).
+const view = () => { const s = new Session(7999); s.set_app("notes-app"); s.open_named(BLOCK, HEAD, 1); return s; };
 
 await t("**a view may write nothing -- the ONE decision says no -- and stands on the NAMED head**", async () => {
   const s = view();
