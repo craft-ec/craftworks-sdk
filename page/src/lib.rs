@@ -175,6 +175,11 @@ pub enum Op {
     /// [`PutPath::Wrapper`] only: ask the signer's read-local verb whether the
     /// node holds this block now.
     AskHeld { id: Cid },
+    /// PUT a contract the APP names (a published web container, builder#104),
+    /// by its key. The bytes stay with the web layer, which frames the same
+    /// PUT again at every deadline; the PAGE owns the deadline, the re-send
+    /// and the end ([`AppPut`]), as for every other op.
+    PutApp { key: String },
 }
 
 /// What arrived, as the web layer decoded it.
@@ -196,7 +201,28 @@ pub enum Answer {
     Head(Option<HeadRead>),
     /// [`PutPath::Wrapper`]: the signer's synchronous local read of a block.
     Held { id: Cid, present: bool },
+    /// The node acknowledged the app's PUT of this contract key.
+    AppPutOk(String),
+    /// The node refused the app's PUT of this contract key, in its words.
+    AppPutRefused { key: String, said: String },
 }
+
+/// Where an app's PUT ([`Op::PutApp`]) stands. It always ENDS: acknowledged,
+/// refused in the node's words, or given up at [`APP_PUT_BUDGET_MS`] — never
+/// a wait nobody bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppPut {
+    Pending,
+    Put,
+    Refused(String),
+    GaveUp(String),
+}
+
+/// How long an app's PUT is re-sent before it ends as [`AppPut::GaveUp`].
+/// Measured on the real network (2026-09-23, a datacentre node behind a
+/// tunnel): a web container was acknowledged in up to ~40 s; the RTO caps
+/// at 60 s, so this leaves at least two re-sends past the slowest seen.
+pub const APP_PUT_BUDGET_MS: u64 = 120_000;
 
 /// An op in flight.
 #[derive(Debug, Clone)]
@@ -229,6 +255,8 @@ enum Waiting {
     /// backstop ([`HEAD_BACKSTOP_MS`]): is there a head this page has not
     /// adopted?
     Hint,
+    /// An app's PUT of this contract key ([`Op::PutApp`]).
+    PutApp(String),
 }
 
 /// The head this page owes the network: a commit's `(seq, root)` from the
@@ -449,6 +477,9 @@ pub struct Page {
     /// Every op in flight: when it is due again, the op to re-send, when it
     /// went out and on which attempt (Karn: only an attempt-1 answer samples).
     deadlines: BTreeMap<Waiting, Deadline>,
+    /// The app's PUTs: where each stands, and when it was first sent (its
+    /// budget runs from there).
+    app_puts: BTreeMap<String, (AppPut, u64)>,
     /// The retry clock of every node call (`rto`), and the GET window.
     rto: rto::Rto,
     window: rto::Window,
@@ -515,6 +546,7 @@ impl Page {
             last_head: None,
             put_again: BTreeMap::new(),
             deadlines: BTreeMap::new(),
+            app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
             window: rto::Window::default(),
             get_queue: Default::default(),
@@ -604,6 +636,20 @@ impl Page {
                 // A landing's request, or this commit's.
                 Waiting::Sign if self.verify.as_ref().is_some_and(|v| v.landing) => self.ask_land(),
                 Waiting::Sign => self.ask_sign(),
+                Waiting::PutApp(key) => {
+                    let since = self.app_puts.get(&key).map_or(now, |(_, at)| *at);
+                    if now.saturating_sub(since) >= APP_PUT_BUDGET_MS {
+                        self.attempt_of.remove(&Waiting::PutApp(key.clone()));
+                        let why = format!(
+                            "the node did not acknowledge the PUT of {key} in {} s ({} attempts)",
+                            APP_PUT_BUDGET_MS / 1000,
+                            d.attempt
+                        );
+                        self.app_puts.insert(key, (AppPut::GaveUp(why), since));
+                    } else {
+                        self.send(Waiting::PutApp(key), op);
+                    }
+                }
                 _ => {
                     if w == Waiting::Update {
                         if let Some(v) = self.verify.as_mut().filter(|v| v.landing) {
@@ -680,6 +726,20 @@ impl Page {
         let now = now.0;
         self.now = now;
         match a {
+            Answer::AppPutOk(key) => {
+                if self.answered(&Waiting::PutApp(key.clone())).is_some() {
+                    if let Some(p) = self.app_puts.get_mut(&key) {
+                        p.0 = AppPut::Put;
+                    }
+                }
+            }
+            Answer::AppPutRefused { key, said } => {
+                if self.answered(&Waiting::PutApp(key.clone())).is_some() {
+                    if let Some(p) = self.app_puts.get_mut(&key) {
+                        p.0 = AppPut::Refused(said);
+                    }
+                }
+            }
             Answer::PutOk(id) => {
                 if self.answered(&Waiting::Put(id)).is_none() && self.confirmed.contains(&id) {
                     return; // a second answer to a re-sent PUT
@@ -1439,6 +1499,23 @@ impl Page {
     }
 
     /// Ops to send, in order.
+    /// PUT a contract the app names, by key: sent now, re-sent on the RTO,
+    /// and ended by [`APP_PUT_BUDGET_MS`] if nothing answers. Asking again
+    /// for a key that ENDED starts it over; one still pending is left alone.
+    pub fn put_app(&mut self, key: String, now: Ms) {
+        self.now = now.0;
+        if matches!(self.app_puts.get(&key), Some((AppPut::Pending, _))) {
+            return;
+        }
+        self.app_puts.insert(key.clone(), (AppPut::Pending, self.now));
+        self.send(Waiting::PutApp(key.clone()), Op::PutApp { key });
+    }
+
+    /// Where the app's PUT of `key` stands; `None` if it was never asked.
+    pub fn app_put(&self, key: &str) -> Option<&AppPut> {
+        self.app_puts.get(key).map(|(p, _)| p)
+    }
+
     pub fn take_ops(&mut self) -> Vec<Op> {
         std::mem::take(&mut self.out)
     }

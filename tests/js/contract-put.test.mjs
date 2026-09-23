@@ -90,15 +90,24 @@ await t("**a refusal naming the contract: → refused, in the node's words, and 
   assert.equal(status(s, key).state, "refused", "a late answer flipped a settled PUT");
 });
 
-await t("**a dropped socket → unanswered; an answer on the new socket still settles it; a settled one stays**", async () => {
+await t("**a dropped socket: the PUT stays pending and the PAGE sends it again at its deadline; the new answer settles it; a settled one stays**", async () => {
   const s = provisioned();
   const done = s.put_contract(OTHER, PARAMS, STATE);
   const key = s.put_contract(CODE, PARAMS, STATE);
   flush(s);
   s.on_inbound(them.ack);
   s.reconnected();
-  assert.deepEqual(status(s, key), { state: "unanswered", said: "" });
+  assert.deepEqual(status(s, key), { state: "pending", said: "" }, "a drop ended a PUT the page still owns");
   assert.equal(status(s, done).state, "put", "a drop reopened a PUT already answered");
+  // Nothing answers: the page's clock sends it again (the RTO, from 1 s).
+  let again = [];
+  const end = Date.now() + 15_000;
+  while (Date.now() < end && again.length === 0) {
+    await new Promise(r => setTimeout(r, 200));
+    s.tick();
+    again = flush(s, "puts").filter(f => f.op === "put" && f.key === key);
+  }
+  assert.equal(again.length, 1, "the unanswered PUT was never sent again");
   s.on_inbound(us.ack);
   assert.deepEqual(status(s, key), { state: "put", said: "" });
 });

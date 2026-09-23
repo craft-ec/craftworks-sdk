@@ -286,6 +286,7 @@ impl PageRig {
             }
             Op::ReadHead => Answer::Head(node.head_read()),
             Op::AskHeld { id } => Answer::Held { id, present: node.blocks.contains_key(&id) },
+            Op::PutApp { key } => Answer::AppPutOk(key),
         })
     }
 }

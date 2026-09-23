@@ -544,6 +544,8 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         Some(Answer::Held { id, present: node.blocks.contains_key(&id) })
                     }
                 }
+                // The engine never makes an app PUT; this model sends none.
+                Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                 Op::ReadHead => {
                     if s_head.chance(faults.head_lost) {
                         None
@@ -852,6 +854,7 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                 }
                 Op::Get { id } => p.answer(Answer::GetMissed(id), Ms(0)),
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, Ms(0)),
+                Op::PutApp { key } => p.answer(Answer::AppPutOk(key), Ms(0)),
             }
         }
     }
@@ -922,6 +925,7 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                     }
                     Op::ReadHead => Some(Answer::Head(node.head_read())),
                     Op::AskHeld { id } => Some(Answer::Held { id, present: node.blocks.contains_key(&id) }),
+                    Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                 };
                 if let Some(ans) = ans {
                     p.answer(ans, Ms(*now));
