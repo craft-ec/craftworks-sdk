@@ -130,6 +130,12 @@ export const MAX_OPEN_TREES = 32;
 /** Tree subscriptions on one socket: F57 allows 500, and the rest is headroom. */
 export const MAX_TREE_SUBSCRIPTIONS = 400;
 
+/** The contract id (base58) a node serves this page under (`/v1/contract/web/<id>/…`), or null. */
+export function appIdOf(loc) {
+  const m = /\/contract\/web\/([1-9A-HJ-NP-Za-km-z]+)\//.exec(loc?.pathname ?? "");
+  return m ? m[1] : null;
+}
+
 export async function openSession(Session, {
   // NO DEFAULT. Publishing provisions a signer and hands it a signing key,
   // so which node receives one is a decision, and a default makes it by
@@ -178,9 +184,16 @@ export async function openSession(Session, {
   removeEventListener: offWindow = (typeof removeEventListener === "function" ? removeEventListener : null),
   // What a page reads to know it is being hidden rather than shown.
   documentOf = (typeof document === "object" ? document : null),
+  // THE OWNER CAPABILITY (sdk#318) the builder kept for this node (hex). Given, every sign of this session
+  // carries it; the builder reads it back with `capability()` after a first open provisions the node.
+  capability = null,
+  // This app's contract id (base58, as in its URL), named in a `needsApproval` event so the user's builder
+  // can ask "Allow <app> …?". Read from the page's own address when it is served by a node.
+  appId = appIdOf(typeof location === "object" ? location : null),
 } = {}) {
   const session = new Session(port);
   if (app !== null) session.set_app(app);
+  if (capability) session.set_capability(capability);
   // A tree reader's stream-id range, 1..=255 and never reused while open.
   let rangeCursor = 0;
   const nextRange = () => {
@@ -392,6 +405,7 @@ export async function openSession(Session, {
   // on it. Set by `engineDb` when one is built over this session.
   let drainReads = () => {};
 
+  let waitingConsent = false;
   const timer = everyMs(() => {
     const report = JSON.parse(session.tick());
     if (report.rolledBack > 0) onEvent({ kind: "rolledBack", count: report.rolledBack });
@@ -406,6 +420,11 @@ export async function openSession(Session, {
     for (const r of report.reruns ?? []) onEvent({ kind: "rerun", ...r });
     const done = JSON.parse(session.take_progress());
     for (const step of done) onEvent({ kind: "provisioned", step });
+    // WAITING ON CONSENT (sdk#318): said once when it starts, again only after it ended. The app shows the user
+    // how to allow it in their builder; the write itself waits (and saves once allowed).
+    const na = session.needs_approval();
+    if (na && !waitingConsent) onEvent({ kind: "needsApproval", app: appId });
+    waitingConsent = na;
     // The tick is also where a load that nobody answered is given up on, so
     // the reads parked on it are woken with a fact rather than left hanging.
     // Nothing else exercises this path: every other route delivers a message.
@@ -447,6 +466,9 @@ export async function openSession(Session, {
     conn.pump();
   };
   const onHide = () => { if (documentOf?.visibilityState === "hidden") flush(); };
+  // THE USER CAME BACK (sdk#318): perhaps from allowing this app in their builder. A write waiting on consent is
+  // asked again NOW, not at its backoff. An event, not a timer; a no-op when nothing waits.
+  const nudge = () => { if (documentOf?.visibilityState !== "hidden") { session.nudge(); conn.pump(); } };
   const listeners = [];
 
   if (onWindow) {
@@ -457,15 +479,30 @@ export async function openSession(Session, {
     // exists to avoid.
     if (documentOf?.addEventListener) {
       documentOf.addEventListener("visibilitychange", onHide);
+      documentOf.addEventListener("visibilitychange", nudge);
     } else {
       onWindow("visibilitychange", onHide);
       listeners.push(["visibilitychange", onHide]);
+      onWindow("visibilitychange", nudge);
+      listeners.push(["visibilitychange", nudge]);
     }
+    onWindow("focus", nudge);
+    listeners.push(["focus", nudge]);
   }
 
   return {
     session,
     provisioned: () => session.provisioned(),
+    /** The owner capability (hex) for the builder to KEEP for this node, or null (sdk#318). */
+    capability: () => session.capability() || null,
+    /** Allow the app `id` (base58 contract id) to write this user's data: the builder's consent page only. */
+    approve: id => { session.approve(id, true); conn.pump(); },
+    /** Withdraw an app's approval. */
+    unapprove: id => { session.approve(id, false); conn.pump(); },
+    /** The approved apps (hex ids), as the signer last said; null until an approval change was answered. */
+    approved: () => JSON.parse(session.approved()),
+    /** Is a write waiting on the user's consent? */
+    needsApproval: () => session.needs_approval(),
     /** `provision: "ask"`'s answer (`openAsked`): this session's identity here. */
     asked: () => JSON.parse(session.asked()),
     /**
@@ -558,6 +595,7 @@ export async function openSession(Session, {
       if (offWindow) for (const [name, fn] of listeners) offWindow(name, fn);
       if (guarded) { offWindow?.("beforeunload", onBeforeUnload); guarded = false; }
       documentOf?.removeEventListener?.("visibilitychange", onHide);
+      documentOf?.removeEventListener?.("visibilitychange", nudge);
       conn.close();
     },
   };

@@ -293,6 +293,15 @@ pub fn frame_engine_request(
     frame_delegate_op(key, &Parameters::from(vec![]), payload, stream_id)
 }
 
+/// An app's 32-byte contract instance id from the base58 form a node serves it under
+/// (`/v1/contract/web/<id>/`): what the signer approves (sdk#318).
+pub fn instance_id_from_base58(id: &str) -> Result<[u8; 32], String> {
+    let parsed = ContractInstanceId::from_base58(id).map_err(|e| format!("`{id}` is not a contract id: {e}"))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&parsed.as_bytes()[..32]);
+    Ok(out)
+}
+
 /// A contract's instance id, from the 32 bytes that name it.
 ///
 /// So a caller can hold one without depending on freenet itself — the same

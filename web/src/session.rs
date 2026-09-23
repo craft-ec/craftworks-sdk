@@ -58,6 +58,8 @@ pub struct Session {
     bound: craftworks_sdk::LiveBindings,
     /// The SIGNER delegate's wasm, handed in with [`Session::provision`].
     signer_code: Vec<u8>,
+    /// The owner capability the host gave (`set_capability`, sdk#318), for every page this session makes.
+    capability: Option<[u8; 32]>,
     /// `Identity` sent to the in-page server once the signer is provisioned.
     page_identity_sent: bool,
     /// The signer's provisioning was reported by `take_progress`.
@@ -97,6 +99,7 @@ impl Session {
             bound: craftworks_sdk::LiveBindings::default(),
             app: None,
             signer_code: Vec::new(),
+            capability: None,
             page_identity_sent: false,
             provision_told: false,
         })
@@ -470,6 +473,9 @@ impl Session {
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
+        if let Some(cap) = self.capability {
+            io.set_capability(cap);
+        }
         io.ask();
         self.db.store_mut().set_host(io);
         self.pump_page();
@@ -516,8 +522,69 @@ impl Session {
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
+        if let Some(cap) = self.capability {
+            io.set_capability(cap);
+        }
         io.begin(container);
         self.db.store_mut().set_host(io);
+        self.pump_page();
+    }
+
+    /// THE OWNER CAPABILITY (sdk#318), as the builder keeps it per node: hex, or empty when this session has none
+    /// (it provisioned nothing and was given none).
+    pub fn capability(&self) -> String {
+        self.page().and_then(|p| p.capability()).map(|c| craftworks_sdk::hex(&c)).unwrap_or_default()
+    }
+
+    /// The capability the builder kept for this node (hex, 64 chars), given BEFORE `provision` / `open_own` or
+    /// after: every sign from then on carries it. A malformed one is refused by name.
+    pub fn set_capability(&mut self, hex: &str) {
+        let Some(cap) = craftworks_sdk::id::from_hex(hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) else {
+            self.unusable.push("set_capability: not 32 bytes of hex".into());
+            return;
+        };
+        self.capability = Some(cap);
+        if let Some(p) = self.page_mut() {
+            p.set_capability(cap);
+        }
+    }
+
+    /// Allow (`true`) or withdraw (`false`) the app `app` (its contract id, base58 as in its URL) to write this
+    /// user's tree (sdk#318). Only a session holding the capability can, and the refusal says so.
+    pub fn approve(&mut self, app: &str, allow: bool) {
+        let id = match wire::instance_id_from_base58(app) {
+            Ok(id) => id,
+            Err(e) => {
+                self.unusable.push(format!("approve: {e}"));
+                return;
+            }
+        };
+        match self.page_mut() {
+            Some(p) => p.approve(id, allow),
+            None => self.unusable.push("approve: this session has no page yet".into()),
+        }
+        self.pump_page();
+    }
+
+    /// The apps approved to write, as the signer last said (JSON list of hex ids); `null` until asked.
+    pub fn approved(&self) -> String {
+        match self.page().and_then(|p| p.approved()) {
+            Some(apps) => serde_json::json!(apps.iter().map(|a| craftworks_sdk::hex(a)).collect::<Vec<_>>()).to_string(),
+            None => "null".into(),
+        }
+    }
+
+    /// Is a write waiting on the user's CONSENT (sdk#318)? The app's sign was refused as not approved.
+    pub fn needs_approval(&self) -> bool {
+        self.page().is_some_and(|p| p.server.page.needs_approval())
+    }
+
+    /// The user may have just allowed this app (the page became visible or focused again): re-ask a sign that
+    /// waits on approval NOW. An event, not a timer (sdk#318).
+    pub fn nudge(&mut self) {
+        if let Some(p) = self.page_mut() {
+            p.server.page.nudge_sign();
+        }
         self.pump_page();
     }
 
