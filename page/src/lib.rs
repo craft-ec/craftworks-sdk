@@ -391,6 +391,13 @@ impl HeadRead {
         signer_proto::head::read_value(&self.value).filter(|h| !h.refused).map(|h| h.ledger.through).unwrap_or_default()
     }
 
+    /// Does it carry race put's §P mark (an EMPTY `TAG_PARITY` in a v2
+    /// ledger): every group it lists was recoverable when it was signed? A
+    /// head without it is pre-§P, or its ledger was refused: `false`.
+    pub fn parity_marked(&self) -> bool {
+        signer_proto::head::read_value(&self.value).is_some_and(|h| !h.refused && h.ledger.parity.as_deref() == Some(&[][..]))
+    }
+
     /// The head it was signed from, if its ledger says (a refused ledger says
     /// nothing: never "built on" anything).
     pub fn prev(&self) -> Option<(u64, Cid)> {
@@ -412,7 +419,8 @@ impl From<(u64, Cid)> for HeadRead {
 pub fn sign_ledger(prev_seq: u64, prev_root: Cid, root: Cid) -> Vec<u8> {
     use signer_proto::head::{value, Ledger};
     let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
-    value(&root, &Ledger { prev, ..Ledger::default() })[32..].to_vec()
+    // The §P mark: every head this build signs is race put's (COMMIT-LIFE §P).
+    value(&root, &Ledger { prev, parity: Some(Vec::new()), ..Ledger::default() })[32..].to_vec()
 }
 
 /// F56's equal-seq rule as the Register decides it: of two heads at ONE seq,
@@ -1346,7 +1354,8 @@ impl Page {
                 through.push(Through { device: self.device, seq: t, last: seq });
             }
         }
-        value(&root, &Ledger { prev, through, ..Ledger::default() })[32..].to_vec()
+        // The §P mark: every head this build signs is race put's.
+        value(&root, &Ledger { prev, through, parity: Some(Vec::new()) })[32..].to_vec()
     }
 
     /// This page's device id in heads' `through` (COMMIT-LIFE ⁵). Zeros:
@@ -1373,6 +1382,10 @@ impl Page {
                 .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, self.engine.committing_seq())))
                 .flatten();
             self.engine.set_witness(witness);
+            // The §P MARK of the head about to be adopted: the engine's parity
+            // scan is Done for a marked head, NotScanned for an unmarked one.
+            let marked = self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).is_some_and(HeadRead::parity_marked);
+            self.engine.set_head_marked(marked);
         }
         // A SAME-SEQ DISPLACEMENT of this page's head: the Server may merge
         // the displaced group, so no cut is made until it has placed it (or

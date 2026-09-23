@@ -553,11 +553,14 @@ fn a_same_key_displacement_is_adopted_on_the_page() {
     assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
     let (seq, mine) = node.head().expect("published");
     let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
-    // The other device's REAL tree, whose root WINS the equal-seq rule (the
-    // lower BLAKE3 of the value): the fork would otherwise be invisible to
-    // the signer's read, and a fake root would leave nothing to build on.
-    let beats = |a: &Cid, b: &Cid| blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes();
-    let winner = (0u32..512).map(|salt| sibling_root(&mut node, salt)).find(|r| beats(r, &mine)).expect("some tree wins");
+    // The other device's REAL tree, whose head WINS the equal-seq rule (the
+    // lower BLAKE3 of the whole VALUE -- root AND ledger: this page's head
+    // carries a ledger, the other's is a bare root): the fork would otherwise
+    // be invisible to the signer's read, and a fake root would leave nothing
+    // to build on.
+    let mine_value = node.head_read().expect("read").value().to_vec();
+    let _ = mine;
+    let winner = (0u32..512).map(|salt| sibling_root(&mut node, salt)).find(|r| page::beats(r.as_slice(), &mine_value)).expect("some tree wins");
     let other = contract_keys::register::head_state(&node.register_params, &key, seq, &winner).expect("signs");
     node.update(&other);
     assert_eq!(node.head(), Some((seq, winner)), "the winner did not take the register");

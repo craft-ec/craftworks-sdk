@@ -59,11 +59,12 @@ fn an_unknown_trailing_field_is_skipped_and_the_root_and_known_fields_still_read
 #[test]
 fn an_unknown_version_reads_root_only_never_no_head() {
     let mut v = ROOT.to_vec();
-    v.extend_from_slice(&[2, TAG_PREV, 40, 0]);
+    // 3: the first version this build does not know (2 is race put's).
+    v.extend_from_slice(&[3, TAG_PREV, 40, 0]);
     v.extend_from_slice(&[0; 40]);
     let h = read_value(&v).expect("a head, never 'no head'");
     assert_eq!((h.root, h.refused, h.ledger.is_empty()), (ROOT, true, true));
-    assert_eq!(check(&v), Err(Malformed::Version(2)));
+    assert_eq!(check(&v), Err(Malformed::Version(3)));
 }
 
 /// main's ruling (1): a refused ledger is NO prev, so the merge's conservative cell, never "built on mine". A prev
@@ -199,4 +200,24 @@ fn record_of_reads_the_registers_framing() {
     let (seq, v) = record_of(&st).expect("a record");
     assert_eq!((seq, v), (7, &ROOT[..]));
     assert!(record_of(b"RG02").is_none());
+}
+
+/// LEDGER VERSION 2 (race put, COMMIT-LIFE §P): `TAG_PARITY`'s meaning changed
+/// to the §P mark, so the version bumped. This build WRITES v2; a reader still
+/// READS v1 but drops its parity field (#119's scan front, not the mark); the
+/// SIGNER's strict check signs only v2.
+#[test]
+fn ledger_v2_writes_the_mark_and_a_v1_parity_field_is_dropped_on_read() {
+    let v = value(&ROOT, &Ledger { parity: Some(Vec::new()), ..Ledger::default() });
+    assert_eq!(v[32], LEDGER_VERSION);
+    assert_eq!(LEDGER_VERSION, 2);
+    assert_eq!(read_value(&v).expect("a head").ledger.parity, Some(Vec::new()), "the mark does not read back");
+    assert!(check(&v).is_ok());
+
+    let mut v1 = ROOT.to_vec();
+    v1.extend_from_slice(&[LEDGER_VERSION_V1, TAG_PARITY, 1, 0, b'x']);
+    let h = read_value(&v1).expect("a head");
+    assert!(!h.refused, "a v1 ledger is still READ");
+    assert_eq!(h.ledger.parity, None, "a v1 parity field (the scan front) was taken for the §P mark");
+    assert_eq!(check(&v1), Err(Malformed::Version(LEDGER_VERSION_V1)), "the signer would sign a v1 ledger");
 }

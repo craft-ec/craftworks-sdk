@@ -1354,6 +1354,8 @@ pub struct Engine<B: Blocks> {
     /// that a dead commit's group LANDED (COMMIT-LIFE ⁵). Consumed by that
     /// step.
     witness: Option<Witness>,
+    /// The next adopted head's §P mark (see [`Engine::set_head_marked`]).
+    head_marked: bool,
     /// Writes that ended in THIS step with keys a later write may have read:
     /// a later write's conflict on one of those keys names it as `after`
     /// (footnote 3). Cleared at the end of every step, like `arrived`.
@@ -1506,6 +1508,7 @@ impl<B: Blocks> Engine<B> {
             cut_held: false,
             cut_until: None,
             witness: None,
+            head_marked: false,
             cascade: Vec::new(),
             forced_lost: 0,
             tries_spent_lost: 0,
@@ -1712,6 +1715,13 @@ impl<B: Blocks> Engine<B> {
     /// (its ledger's entry), before the foreign move is stepped (⁵).
     pub fn set_witness(&mut self, witness: Option<Witness>) {
         self.witness = witness;
+    }
+
+    /// Does the head about to be adopted carry race put's §P mark (every group
+    /// it lists was recoverable when signed)? Told by the shell before the
+    /// step, like the witness; read once by `adopt`.
+    pub fn set_head_marked(&mut self, marked: bool) {
+        self.head_marked = marked;
     }
 
     /// The last arrival number of the commit in flight: what its head's
@@ -2181,9 +2191,12 @@ impl<B: Blocks> Engine<B> {
         self.root = root;
         self.published_root = root;
         // A root taken from OUTSIDE — a head read, another writer's head —
-        // was made by commits this engine did not code, so nothing here knows
-        // their parity. Only the empty tree is known in full: it lists none.
-        self.parity_scan = if root == self.empty.cid {
+        // was made by commits this engine did not code. The empty tree is
+        // known in full (it lists none); a head carrying race put's §P mark
+        // had every group it lists recoverable when it was signed
+        // (COMMIT-LIFE §P); anything else is pre-§P, and NotScanned.
+        let marked = std::mem::take(&mut self.head_marked);
+        self.parity_scan = if root == self.empty.cid || marked {
             ParityScan::Done { root }
         } else {
             ParityScan::NotScanned
