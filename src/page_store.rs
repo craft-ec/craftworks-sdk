@@ -438,7 +438,7 @@ impl<H: Host> Reads for PageStore<H> {
         // INTERIM: removed by R-b (READ-STATE § queue) — a write the engine
         // has not taken shows over the tree.
         if self.interim_overlay {
-            if let Some((_, v)) = self.writes.copy.unaccepted(key, &next_key(key)).pop() {
+            if let Some(v) = self.writes.copy.unaccepted_at(key) {
                 return Ok(v);
             }
         }

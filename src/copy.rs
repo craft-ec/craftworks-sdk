@@ -271,6 +271,15 @@ impl Copy {
             .collect()
     }
 
+    /// INTERIM (R-b): the ONE value the overlay shows at `key` — its last
+    /// write, if that write is not yet taken (`Some(None)`: a delete) — or
+    /// `None` when nothing untaken is there. What `get` reads, so it never
+    /// picks one entry out of a list.
+    pub fn unaccepted_at(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let w = self.keys.get(key)?.pending.last()?;
+        (w.queued || w.held || w.at_node).then(|| w.value.clone())
+    }
+
     /// INTERIM (R-b): is any write not yet taken by the engine (held, queued,
     /// or sent and unanswered)?
     pub fn any_unaccepted(&self) -> bool {
