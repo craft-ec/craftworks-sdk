@@ -105,7 +105,7 @@ fn pack_ids(effects: &[Effect]) -> Vec<Cid> {
 
 fn head_of(effects: &[Effect]) -> Option<(u64, Cid, Vec<Cid>)> {
     effects.iter().find_map(|e| match e {
-        Effect::UpdateHead { seq, root, after } => Some((*seq, *root, after.clone())),
+        Effect::UpdateHead { seq, root, after, .. } => Some((*seq, *root, after.clone())),
         _ => None,
     })
 }
@@ -554,23 +554,6 @@ fn dropping_one_context_field_makes_the_two_modes_disagree() {
     println!("  control: all 24 seeds diverged with one context field dropped");
 }
 
-/// Drive one write all the way to published, confirming in order.
-fn commit(e: &mut Engine<Store>, seen: &mut Seen, ev: Event) -> Vec<Effect> {
-    let out = stepped!(e, ev);
-    seen.absorb(&out);
-    let mut all = out.clone();
-    for id in ids(&out) {
-        let o = stepped!(e, Event::PutConfirmed(id));
-        seen.absorb(&o);
-        all.extend(o.clone());
-        if let Some((seq, _, _)) = head_of(&o) {
-            let o = stepped!(e, Event::HeadConfirmed(seq));
-            seen.absorb(&o);
-            all.extend(o);
-        }
-    }
-    all
-}
 
 fn parity_puts(effects: &[Effect]) -> Vec<(engine::ParityIds, Cid)> {
     effects
@@ -582,126 +565,7 @@ fn parity_puts(effects: &[Effect]) -> Vec<(engine::ParityIds, Cid)> {
         .collect()
 }
 
-/// Two commits touching one group pay for its redundancy ONCE.
-///
-/// Parity is a pure function of a group's members, so parity coded for
-/// members that have already moved on protects bytes no reader will ask for.
-/// Putting it is a PUT bought for nothing — and on a hot key that is every
-/// commit, for ever.
-///
-/// The control is not a description: `coalesce_parity: false` puts each
-/// commit's parity as it is published, and the test asserts it really does
-/// pay twice. Without that, "one put" could be one because nothing was
-/// emitted at all.
-#[test]
-fn two_commits_touching_one_group_put_its_parity_once() {
-    // Values over 1 KiB are stored by reference, so the leaf carries parity
-    // members and a rewrite re-codes a group.
-    let big = |b: u8| vec![b; 1500];
-    let seed: Vec<(Vec<u8>, Op)> = (0..24u32)
-        .map(|i| (format!("k/{i:03}").into_bytes(), Op::Put(big(i as u8))))
-        .collect();
 
-    let count = |coalesce: bool| -> usize {
-        let mut e = common::new_store_params(Params {
-            coalesce_parity: coalesce,
-            ..Params::default()
-        });
-        let mut seen = Seen::default();
-        // Counted from the FIRST commit, not from the rewrites. The two modes
-        // put a group's parity at different moments -- one when its commit is
-        // published, the other on a later tick -- so a window that starts
-        // after the seed commit counts one mode's work and not the other's.
-        // That is not a comparison; it is two different questions. (It is also
-        // what this test asserted at first, and it reported coalescing as
-        // being more expensive.)
-        let mut n = parity_puts(&commit(&mut e, &mut seen, write(1, 1, seed.clone()))).len();
-        // Two further commits, each rewriting the SAME key, so the same group
-        // is re-coded twice.
-        n += parity_puts(&commit(
-            &mut e,
-            &mut seen,
-            write(1, 2, vec![put("k/005", &big(0xAA))]),
-        ))
-        .len();
-        n += parity_puts(&commit(
-            &mut e,
-            &mut seen,
-            write(1, 3, vec![put("k/005", &big(0xBB))]),
-        ))
-        .len();
-        // With coalescing on, the parity goes out on a tick once the group has
-        // settled — which is the point: it waits to see whether the group is
-        // still moving. Both modes are given the same ticks, so neither is
-        // measured over a shorter window than the other.
-        for t in 1..=3 {
-            let out = stepped!(e, Event::Tick(t));
-            seen.absorb(&out);
-            n += parity_puts(&out).len();
-        }
-        n
-    };
-
-    let coalesced = count(true);
-    let every_time = count(false);
-    assert!(
-        coalesced > 0,
-        "no parity was put at all, so this measures nothing"
-    );
-    assert!(
-        every_time > coalesced,
-        "the control put {every_time} blocks and coalescing put {coalesced}: \
-         coalescing bought nothing, so either it is not working or this \
-         fixture never re-codes a group"
-    );
-    println!(
-        "  coalesced {coalesced} parity blocks, every-commit control {every_time} \
-         ({} saved)",
-        every_time - coalesced
-    );
-}
-
-/// A group rewritten on every tick still gets its redundancy.
-///
-/// Coalescing defers a group that is still moving. Left at that, the hottest
-/// key in the store — the one most worth protecting — would be the one that
-/// never is. The age bound is what stops "wait until it settles" from meaning
-/// "wait for ever".
-#[test]
-fn a_group_written_continuously_is_still_protected_within_the_age_bound() {
-    let age = 5u64;
-    let mut e = common::new_store_params(Params {
-        parity_age: age,
-        ..Params::default()
-    });
-    let mut seen = Seen::default();
-    let big = |b: u8| vec![b; 1500];
-    let seed: Vec<(Vec<u8>, Op)> = (0..24u32)
-        .map(|i| (format!("k/{i:03}").into_bytes(), Op::Put(big(i as u8))))
-        .collect();
-    commit(&mut e, &mut seen, write(1, 1, seed));
-
-    // Rewrite the same key on every tick, so the group is never still.
-    let mut emitted = 0;
-    for t in 1..=(age * 3) {
-        let out = commit(
-            &mut e,
-            &mut seen,
-            write(1, 100 + t, vec![put("k/005", &big(t as u8))]),
-        );
-        emitted += parity_puts(&out).len();
-        let out = stepped!(e, Event::Tick(t));
-        seen.absorb(&out);
-        emitted += parity_puts(&out).len();
-    }
-    assert!(
-        emitted > 0,
-        "a group rewritten on every one of {} ticks was never protected: \
-         the age bound does not fire under continuous writes",
-        age * 3
-    );
-    println!("  {emitted} parity block(s) under continuous rewriting");
-}
 
 /// The core never looks inside a value.
 ///
@@ -776,7 +640,6 @@ fn no_event_sequence_panics() {
         let mut r = rng(seed);
         let mut e = common::new_store_params(Params {
             max_write_bytes: 4096,
-            parity_age: 2,
             ..Params::default()
         });
         let mut known: Vec<Cid> = Vec::new();
@@ -854,69 +717,6 @@ fn past_the_queue_byte_bound_a_write_waits_and_another_session_is_still_taken() 
     }
 }
 
-/// The write path is proportional to the tree's DEPTH, not to its size.
-///
-/// This is a correctness property of the delegate, not a nicety: a delegate
-/// call is bounded at 5 s, and the version of this engine that scanned the
-/// whole tree for superseded groups would have parsed on the order of 10^5
-/// nodes per keystroke at a million keys. It was correct, and it passed every
-/// other test in this file.
-///
-/// The bound is stated against the tree's depth with room to spare, and the
-/// whole-tree scan is kept as a parameter so the control can blow it. A bound
-/// nothing can exceed is not a bound.
-#[test]
-fn a_single_key_write_parses_nodes_in_proportion_to_depth() {
-    let seed: Vec<(Vec<u8>, Op)> = (0..10_000u32)
-        .map(|i| {
-            (
-                format!("k/{i:06}").into_bytes(),
-                Op::Put(vec![(i % 251) as u8; 60]),
-            )
-        })
-        .collect();
-
-    let measure = |whole: bool| -> usize {
-        let mut e = common::new_store_params(Params {
-            whole_tree_supersede_scan: whole,
-            // The 10,000-key SEED below is a fixture, not a live commit. The
-            // commit cap exists because a pack's bytes do not survive the
-            // `process()` return that made them, and nothing here returns;
-            // capping the seed would mean this test could only ever measure
-            // a tree one commit deep, which is the opposite of what it is
-            // for. The single-key write it then measures IS under the cap.
-            max_commit_blocks: usize::MAX,
-            // And it never saves a context, so it has no bound to keep.
-            max_context_bytes: usize::MAX,
-            ..Params::default()
-        });
-        let mut seen = Seen::default();
-        commit(&mut e, &mut seen, write(1, 1, seed.clone()));
-        // Measure ONE key changing, on a tree that is already large.
-        e.reset_cost();
-        let _ = stepped!(e, write(1, 2, vec![put("k/005000", b"changed")]));
-        e.nodes_parsed()
-    };
-
-    let diff_walk = measure(false);
-    let whole_tree = measure(true);
-
-    // A 10k-key tree is 3 levels; 8 per level is generous and still nowhere
-    // near a scan.
-    const DEPTH: usize = 3;
-    const PER_LEVEL: usize = 8;
-    assert!(
-        diff_walk <= DEPTH * PER_LEVEL,
-        "a one-key write parsed {diff_walk} nodes on a 10,000-key tree; the \
-         walk is not following only what changed"
-    );
-    assert!(
-        whole_tree > DEPTH * PER_LEVEL * 4,
-        "the control parsed only {whole_tree} nodes, so it is not the \
-         whole-tree scan and this bound is not being tested against anything"
-    );
-    println!("  one-key write: {diff_walk} nodes parsed (whole-tree control: {whole_tree})");
-}
 
 /// Settings a caller can choose must not panic the core three steps later.
 ///
@@ -989,104 +789,6 @@ fn a_packed_value_over_its_kinds_limit_is_refused_where_it_is_set() {
     let _ = Engine::new(ok, Store::default());
 }
 
-/// A write whose group is re-coded before its parity goes out waits for the
-/// NEW coding, not for the one that was abandoned.
-///
-/// `ParityComplete` means *every group that currently covers what this write
-/// changed has its parity on the network*. It must never mean *nothing is
-/// outstanding under this write's name*: when a later write re-codes a group,
-/// the earlier write's data has not gone anywhere — it now sits in the newer
-/// coding, whose parity is not out either. Reporting completion there tells a
-/// client that redundancy exists for its data when none does, and a client
-/// that believes it has no reason ever to check again.
-///
-/// The control is the old behaviour, and it runs: with the transfer off, A is
-/// reported complete while B's parity is still owed.
-#[test]
-fn a_write_whose_group_is_re_coded_waits_for_the_new_coding() {
-    let big = |b: u8| vec![b; 1500];
-    let seed: Vec<(Vec<u8>, Op)> = (0..24u32)
-        .map(|i| (format!("k/{i:03}").into_bytes(), Op::Put(big(i as u8))))
-        .collect();
-
-    // Returns: was A complete before B's parity was confirmed, and how many
-    // ParityComplete notifications A got in total.
-    let run = |transfer: bool| -> (bool, usize) {
-        let mut e = common::new_store_params(Params {
-            transfer_superseded_waiters: transfer,
-            ..Params::default()
-        });
-        let mut seen = Seen::default();
-        commit(&mut e, &mut seen, write(1, 1, seed.clone()));
-
-        // A: touches one key. Its commit codes the group holding it.
-        let a = commit(
-            &mut e,
-            &mut seen,
-            write(1, 2, vec![put("k/005", &big(0xAA))]),
-        );
-        assert!(
-            parity_puts(&a).is_empty(),
-            "A's parity went out immediately, so it was never superseded and \
-             this test is about nothing"
-        );
-        // B: re-codes the SAME group, before any parity has been put.
-        let b = commit(
-            &mut e,
-            &mut seen,
-            write(1, 3, vec![put("k/005", &big(0xBB))]),
-        );
-        let _ = b;
-
-        let a_done_early = seen.of(1, 2).contains(&State::ParityComplete);
-
-        // Now let the parity go out and be confirmed.
-        let mut queue: Vec<Effect> = Vec::new();
-        for t in 1..=4 {
-            let out = stepped!(e, Event::Tick(t));
-            seen.absorb(&out);
-            queue.extend(out);
-        }
-        let mut guard = 0;
-        while let Some(f) = queue.pop() {
-            guard += 1;
-            assert!(guard < 5_000, "the run did not settle");
-            if let Effect::PutParity { id, .. } = f {
-                let out = stepped!(e, Event::PutConfirmed(id));
-                seen.absorb(&out);
-                queue.extend(out);
-            }
-        }
-        let total = seen
-            .of(1, 2)
-            .iter()
-            .filter(|s| **s == State::ParityComplete)
-            .count();
-        (a_done_early, total)
-    };
-
-    let (early_with_transfer, total_with_transfer) = run(true);
-    let (early_without, _) = run(false);
-
-    assert!(
-        !early_with_transfer,
-        "A was reported ParityComplete while the group covering its data had \
-         no parity on the network"
-    );
-    assert_eq!(
-        total_with_transfer, 1,
-        "A must reach ParityComplete exactly once, after the coding that now \
-         covers it is confirmed"
-    );
-    // The control: without the transfer, A completes early. If this does not
-    // happen the two runs are the same run and the assertion above is idle.
-    assert!(
-        early_without,
-        "the control did not complete A early, so it is not the old behaviour \
-         and proves nothing about the new one"
-    );
-    println!("  with transfer: A completes once, after the new coding; control completes it early");
-}
 
 /// The page-closed promise, with no clock at all.
 ///
@@ -1108,7 +810,6 @@ fn after_a_disconnect_every_write_publishes_and_its_parity_is_put_without_a_tick
         let store = Store::fresh();
         let mut e = Engine::new(
             Params {
-                coalesce_parity: true,
                 ..Params::default()
             },
             store.clone(),
