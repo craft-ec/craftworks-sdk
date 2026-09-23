@@ -18,9 +18,10 @@
 //! | answer | becomes |
 //! |---|---|
 //! | `Got` of the Register | `Head(record)`; the register now exists |
-//! | `GetFailed` / NotFound of the Register | `Head(None)` ONLY if the signer holds no record for it (asked once, `ask_record`); otherwise silence — re-asked on the RTO, "not answering" at its budget (sdk#175; a peered NotFound can be false, F55) |
+//! | NotFound of the Register | `Head(None)` ONLY if the signer holds no record for it (asked once, `ask_record`); otherwise silence — re-asked on the RTO, "not answering" at its budget (sdk#175; a peered NotFound can be false, F55) |
+//! | a REFUSED GET (`ContractError::Get`) of anything | nothing: it says nothing about the contract, so it is not an answer — re-asked on the RTO (rule 7), never read as absent |
 //! | `Got` of a block | `Got { id, body }` (the executor verifies it against its id) |
-//! | `GetFailed` of a block | `GetMissed` |
+//! | NotFound of a block | `GetMissed` |
 //! | `Ack(Put)` of a block | `PutOk` |
 //! | `Ack(Put)` / `Ack(Updated)` of the Register | `Updated` (it says nothing more, F56); the register exists |
 //! | a signer answer | `Signer { id, answer }`; a `Held { present }` goes back to the blocks its id asked about |
@@ -711,12 +712,22 @@ impl PageIo {
                     self.unusable.push("a GET answer for a contract this page never asked".into());
                 }
             }
-            Incoming::GetFailed { id } => {
+            // A REFUSAL is not an answer about the contract: only the node's
+            // NotFound says it is absent (#332 ruling). A refused GET stays
+            // unanswered and the page's sender re-asks it on the RTO (rule 7);
+            // read as absent, a head refusal on a signer with no record would
+            // open an empty tree over an app that exists, and a block
+            // refusal would end a read the next ask could serve.
+            Incoming::GetFailed { id, why: wire::GetFail::Refused(_) } => {
                 if id == self.register_id {
                     self.head_failed += 1;
-                    // A failed read of the head — a refusal, or 0.2.136's
-                    // explicit NotFound, which a PEERED node can answer
-                    // falsely (F55) — is "no head" ONLY if the signer holds no
+                }
+            }
+            Incoming::GetFailed { id, why: wire::GetFail::NotFound } => {
+                if id == self.register_id {
+                    self.head_failed += 1;
+                    // The node's explicit NotFound for the head — which a
+                    // PEERED node can answer falsely (F55) — is "no head" ONLY if the signer holds no
                     // record for this register. Otherwise the head exists and
                     // this is SILENCE: re-asked on the RTO, "not answering" at
                     // its budget. Opening an empty tree over an existing app
@@ -897,7 +908,7 @@ impl PageIo {
         let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id);
         let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k);
         match incoming {
-            Incoming::Got { id, .. } | Incoming::GetFailed { id } => mine(id),
+            Incoming::Got { id, .. } | Incoming::GetFailed { id, .. } => mine(id),
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only,
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             Incoming::HeadChanged { key } => *key == self.register_key,

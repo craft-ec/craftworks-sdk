@@ -33,8 +33,8 @@ struct WireNode {
     served: BTreeMap<&'static str, usize>,
     /// PUTs of the Register (creations), counted.
     register_puts: usize,
-    /// The next this many GETs of the Register FAIL, as an unreachable node's
-    /// do (sdk#175).
+    /// The next this many GETs of the Register are answered NotFound though it
+    /// exists — a peered node's false NotFound (F55, sdk#175).
     fail_register_gets: usize,
     /// The next this many signer requests are answered EMPTY — a
     /// DelegateResponse carrying no message — as the real node answered a
@@ -51,6 +51,10 @@ struct WireNode {
     /// answered EMPTY (as 0.2.136 answers a delegate it does not have), and
     /// a registration makes it present.
     empty_until_registered: bool,
+    /// The next this many GETs (of anything) are REFUSED — the node's
+    /// `ContractError::Get`, whether the contract exists or not: not its
+    /// NotFound, and not an answer about the contract.
+    refuse_gets: usize,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -91,6 +95,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            refuse_gets: 0,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -119,6 +124,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            refuse_gets: 0,
         }
     }
 
@@ -184,6 +190,18 @@ impl WireNode {
                 } else {
                     *self.served.entry("get block").or_default() += 1;
                 }
+                if self.refuse_gets > 0 {
+                    self.refuse_gets -= 1;
+                    *self.served.entry("refused get").or_default() += 1;
+                    let e: Err = freenet_stdlib::client_api::ErrorKind::RequestError(
+                        freenet_stdlib::client_api::RequestError::ContractError(freenet_stdlib::client_api::ContractError::Get {
+                            key: ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32])),
+                            cause: "the node is busy".into(),
+                        }),
+                    )
+                    .into();
+                    return Some(bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes"));
+                }
                 match self.contracts.get(&id).filter(|_| !failing) {
                     Some(state) => {
                         let ckey = ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32]));
@@ -193,18 +211,10 @@ impl WireNode {
                             state: WrappedState::new(state.clone()),
                         })))
                     }
-                    None => {
-                        let e: Err = freenet_stdlib::client_api::ErrorKind::RequestError(
-                            freenet_stdlib::client_api::RequestError::ContractError(
-                                freenet_stdlib::client_api::ContractError::Get {
-                                    key: ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32])),
-                                    cause: "not found".into(),
-                                },
-                            ),
-                        )
-                        .into();
-                        Some(bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes"))
-                    }
+                    // What 0.2.136 answers for a contract it has nowhere —
+                    // and, FALSELY, for a delegate-put one on a peered node
+                    // (F55, `fail_register_gets`): an explicit NotFound.
+                    None => Some(ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id: key }))),
                 }
             }
             ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, inbound, .. }) => {
@@ -441,6 +451,56 @@ fn a_false_not_found_on_an_existing_app_never_opens_an_empty_tree() {
     let r = client(&mut b, &mut node, &mut now, &range);
     let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 6, entries, .. } = x { Some(entries.len()) } else { None }).collect();
     assert_eq!(pages, vec![2], "a false NotFound on an existing app opened {pages:?}");
+}
+
+/// ONLY NotFound means absent (#332 ruling): a node REFUSES the first head reads (`ContractError::Get`) of an app
+/// that EXISTS, on a FRESH signer — one that holds no record, the very case where a NotFound opens an empty tree. A
+/// refusal says nothing about the head: it is re-asked on the RTO and the app's rows are read, never an empty tree
+/// whose first commit would sign seq 1 over the real head.
+#[test]
+fn a_refused_head_read_on_a_fresh_signer_is_re_asked_never_an_empty_tree() {
+    let seed = [9u8; 32];
+    let mut x = WireNode::new(&seed);
+    let mut a = page_io(&x);
+    let mut now = 1_000;
+    client(&mut a, &mut x, &mut now, &Request::Identity);
+    for (n, k) in ["p", "q"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut x, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    // Another node of the same identity: its signer has signed nothing; the network holds the head and blocks.
+    let mut y = WireNode::new(&seed);
+    y.contracts = x.contracts.clone();
+    y.refuse_gets = 2;
+    let mut b = page_io(&y);
+    client(&mut b, &mut y, &mut now, &Request::Identity);
+    let range = Request::Range { req_id: 8, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client(&mut b, &mut y, &mut now, &range);
+    let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 8, entries, .. } = x { Some(entries.len()) } else { None }).collect();
+    assert_eq!(y.served.get("refused get"), Some(&2), "THE SETUP: the refusals were not all asked");
+    assert_eq!(pages, vec![2], "a refused head read opened {pages:?}");
+}
+
+/// ONLY NotFound means absent, for a BLOCK too: a refused block GET is re-asked on the RTO and the read completes —
+/// never a miss the next ask could have served.
+#[test]
+fn a_refused_block_read_is_re_asked_not_missed() {
+    let mut node = WireNode::new(&[10u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["p", "q"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    let mut b = page_io(&node);
+    client(&mut b, &mut node, &mut now, &Request::Identity);
+    let before = node.served.get("get block").copied().unwrap_or(0);
+    node.refuse_gets = 1;
+    let range = Request::Range { req_id: 9, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client(&mut b, &mut node, &mut now, &range);
+    let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 9, entries, .. } = x { Some(entries.len()) } else { None }).collect();
+    assert!(node.served.get("get block").copied().unwrap_or(0) > before, "THE SETUP: the rows were not read by block GETs");
+    assert_eq!(node.served.get("refused get"), Some(&1), "THE SETUP: the refusal was not asked");
+    assert_eq!(pages, vec![2], "a refused block read gave {pages:?}: {r:?}");
 }
 
 /// THE CONTROL: a genuinely NEW app (the signer holds no record) whose head

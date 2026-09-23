@@ -117,6 +117,17 @@ pub const MAX_CHUNK: usize = freenet_stdlib::client_api::streaming::CHUNK_SIZE;
 /// using theirs would be accepting a bound for a case we do not have.
 pub const MAX_REASSEMBLED: usize = 8 * 1024 * 1024;
 
+/// Why a GET that names its contract was not answered with a state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetFail {
+    /// The node's explicit NotFound: no such contract. The only answer that
+    /// says the contract is absent.
+    NotFound,
+    /// The node refused the GET, in its cause's words. Says nothing about
+    /// whether the contract exists: re-asked, never read as absent.
+    Refused(String),
+}
+
 /// What arrived, once it has been understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
@@ -151,7 +162,12 @@ pub enum Incoming {
     /// GETs this answers. A page GET of a block this node's own delegate wrote
     /// is refused on a node with a peer (F55) — that is how a cold read learns
     /// a root is local. A refusal that names nothing stays [`Incoming::Refused`].
-    GetFailed { id: [u8; 32] },
+    ///
+    /// `why` tells the node's two answers apart (#332 review): an explicit
+    /// NotFound — no such contract, "after exhaustive search" — and a
+    /// refusal, in its cause's words. Only the first says the contract is
+    /// ABSENT; a refusal says nothing about it.
+    GetFailed { id: [u8; 32], why: GetFail },
     /// A contract PUT the node REFUSED, naming the contract (its
     /// `ContractError::Put { key, cause }`) as [`AckKind::Put`] names one it
     /// accepted — so a refusal is attributed to its PUT by key, never by
@@ -488,7 +504,8 @@ fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
         Ok(d) => Ok(d),
         // A GET refusal that names its contract: which GET it answers.
         Err(Unusable::NodeSaidNo) if get_refused(bytes).is_some() => {
-            Err(Incoming::GetFailed { id: get_refused(bytes).expect("just checked") })
+            let (id, cause) = get_refused(bytes).expect("just checked");
+            Err(Incoming::GetFailed { id, why: GetFail::Refused(cause) })
         }
         // A PUT refusal that names its contract: which PUT it answers.
         Err(Unusable::NodeSaidNo) if put_refused(bytes).is_some() => {
@@ -558,7 +575,7 @@ fn classify(r: HostResponse) -> Incoming {
         HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => {
             let mut id = [0u8; 32];
             id.copy_from_slice(&instance_id.as_bytes()[..32]);
-            Incoming::GetFailed { id }
+            Incoming::GetFailed { id, why: GetFail::NotFound }
         }
         HostResponse::Ok => Incoming::Ack(AckKind::Ok),
         // A kind this build has no use for. NAMED, so a failure says which:
@@ -602,16 +619,16 @@ fn frames(req: &ClientRequest<'static>, stream_id: u32) -> Result<Vec<Vec<u8>>, 
 }
 
 /// The contract a node's GET refusal names, if the bytes are one.
-fn get_refused(bytes: &[u8]) -> Option<[u8; 32]> {
+fn get_refused(bytes: &[u8]) -> Option<([u8; 32], String)> {
     use freenet_stdlib::client_api::{ClientError, ContractError, ErrorKind, RequestError};
     let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
         return None;
     };
     match e.kind() {
-        ErrorKind::RequestError(RequestError::ContractError(ContractError::Get { key, .. })) => {
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Get { key, cause })) => {
             let mut id = [0u8; 32];
             id.copy_from_slice(&key.id().as_bytes()[..32]);
-            Some(id)
+            Some((id, cause.to_string()))
         }
         _ => None,
     }
