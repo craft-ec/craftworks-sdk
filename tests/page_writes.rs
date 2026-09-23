@@ -145,7 +145,6 @@ fn a_queue_waiting_past_a_minute_rolls_nothing_back() {
         let now = clock.now_ms();
         let _ = conn.tick_at(now);
         let _ = s.ask_after_applying();
-        s.tick(now);
         s.sync();
     }
     assert!(s.writes.take_ended().is_empty(), "a queued write was ended while it waited its turn (sdk#291)");

@@ -146,18 +146,6 @@ await t("a load that ENDS without delivering rejects — it is not 'not yet'", a
   });
 });
 
-await t("a cold read the NODE stopped answering says so — not that the data could not be loaded", async () => {
-  const s = lateSession({ afterMs: 10, fail: true, failCode: "NOT_ANSWERING" });
-  const db = engineDb(s);
-  s.pump = db.drain;
-  await assert.rejects(() => db.scan("tasks"), e => {
-    assert.ok(e instanceof DbError);
-    assert.equal(e.code, "NOT_ANSWERING");
-    assert.equal(e.message, "the node is not answering");
-    assert.equal(e.transient, true, "a node not answering is not a permanent failure");
-    return true;
-  });
-});
 
 await t("a NOT_LOADED with no ticket rejects rather than hanging", async () => {
   const s = {

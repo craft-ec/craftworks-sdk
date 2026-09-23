@@ -108,7 +108,7 @@ enum Fail {
     Ticketless(String),
     /// Still not answered after the bounded number of hops: a loop.
     Stuck(usize),
-    /// Its ticket ended without the blocks (UNAVAILABLE / NOT_ANSWERING).
+    /// Its ticket ended without the blocks (UNAVAILABLE).
     Ended(String),
     /// Refused for another reason.
     Other(String),
@@ -299,7 +299,6 @@ impl Walks {
         let r = self.conn.tick_at(now_ms);
         self.feed(r);
         let _ = self.store.ask_after_applying();
-        self.store.tick(now_ms);
         self.store.sync();
         self.drain();
         self.live_pump();

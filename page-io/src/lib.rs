@@ -36,7 +36,7 @@
 use freenet_prolly::Cid;
 use freenet_stdlib::prelude::*;
 use page::server::{Server, SignerFacts};
-use page::{Answer, Ms, Op};
+use page::{Answer, Ext, Ms, Op};
 use std::collections::BTreeMap;
 use wire::{DelegateKey, Incoming};
 
@@ -59,12 +59,10 @@ pub enum Asked {
     NoKey,
     /// The node has no signer delegate at all (a node that never opened this
     /// person's tree): measured on 0.2.136, it answers the request EMPTY.
-    /// In its words, with how many EMPTY answers it took.
+    /// In its words.
     NoSigner(String),
     /// The node or the signer refused: in their words.
     Refused(String),
-    /// Nothing answered within the first request's budget.
-    NotAnswering,
 }
 
 /// What every refusal of a view says first (a reader, `PageIo::reader`).
@@ -217,25 +215,18 @@ pub struct PageIo {
     /// registration is answered: sent together with it, the node answered it
     /// with an EMPTY response 7 times in 12 (#260, measured), and the page
     /// waited for ever.
+    /// SENT, RE-SENT AND ANSWERED THROUGH THE PAGE'S SENDER (rule 5): the
+    /// registration ([`Ext::RegisterSigner`]) and this first request
+    /// ([`Ext::SignerFirst`]) wait on the page's deadline and RTO until the
+    /// node answers (rules 7, 8) — no timer, count or budget of page-io's own.
     first: Option<First>,
-    first_sent: bool,
-    /// Empty responses to the outstanding first request: each is "no
-    /// answer", and the request goes again, at most [`FIRST_EMPTIES`] times.
-    first_empties: u8,
-    /// EVERY NODE CALL ON THE RTO (the ruling since #227): the signer's
-    /// registration and its first request are asked again on a doubling
-    /// interval until answered, bounded by `VERIFY_BUDGET_MS` — the empty-reply
-    /// re-send above covers one failure; this covers a reply that never comes.
-    /// `first_started`/`first_next_at` are anchored by the page's clock.
-    first_started: Option<Ms>,
-    first_next_at: Ms,
-    first_gap_ms: u64,
-    /// The signer's container, to register it again on the RTO.
+    /// The signer's container, framed again whenever the page re-sends its
+    /// registration.
     signer_container: Option<DelegateContainer>,
     /// WHY OPENING ENDED, by name (what `open()` reports): the signer's or the
-    /// node's refusal of the first exchange, in its words; or its re-asks spent.
+    /// node's refusal of the first exchange, in its words — a real answer,
+    /// never time.
     refused: Option<String>,
-    exhausted: bool,
     /// [`PageIo::ask`]: this page only ASKS the node's signer which Register
     /// it holds — nothing is registered, minted or provisioned — and the
     /// answer ends here ([`Asked`]).
@@ -254,10 +245,6 @@ enum First {
     /// Provision with this signing key (`provision`).
     Provision(Vec<u8>),
 }
-
-/// How many EMPTY responses to the signer's first request are taken as "no
-/// answer, ask again" before the page says so by name.
-const FIRST_EMPTIES: u8 = 3;
 
 /// The counter part of a reader's stream id; the top byte is its range.
 const STREAM_COUNTER: u32 = 0x00FF_FFFF;
@@ -335,14 +322,8 @@ impl PageIo {
             needs_key: false,
             signer_registered: false,
             first: None,
-            first_sent: false,
-            first_empties: 0,
-            first_started: None,
-            first_next_at: Ms(0),
-            first_gap_ms: page::rto::RTO_INITIAL_MS as u64,
             signer_container: None,
             refused: None,
-            exhausted: false,
             asking: false,
             asked: None,
             claimed: false,
@@ -398,12 +379,8 @@ impl PageIo {
         // at once, and a node without the delegate says so.
         self.signer_registered = true;
         self.first = Some(First::Query);
-        self.first_sent = false;
-        self.first_empties = 0;
-        self.first_started = None;
-        self.first_next_at = Ms(0);
-        self.first_gap_ms = page::rto::RTO_INITIAL_MS as u64;
-        self.send_first();
+        self.server.page.send_ext(Ext::SignerFirst, self.now);
+        self.pump();
     }
 
     /// [`PageIo::ask`]'s answer, once there is one.
@@ -437,14 +414,10 @@ impl PageIo {
                 (Some(Asked::NoKey | Asked::NoSigner(_)), Some(_)) => MayWrite::No("this node holds no key for that head".into()),
                 (Some(Asked::Refused(w)), None) => MayWrite::Unknown(w.clone()),
                 (Some(Asked::Refused(w)), Some(_)) => MayWrite::No(w.clone()),
-                (Some(Asked::NotAnswering), _) => MayWrite::Undecided("this node's signer is not answering".into()),
             };
         }
         if let Some(r) = self.refused.as_ref() {
             return if head.is_none() { MayWrite::Unknown(r.clone()) } else { MayWrite::No(r.clone()) };
-        }
-        if self.exhausted {
-            return MayWrite::Undecided("this node's signer is not answering".into());
         }
         if self.provisioned {
             return match head {
@@ -484,7 +457,7 @@ impl PageIo {
     ///   (`provision_with`), as `begin`'s.
     /// - There is no signer here: it is registered and asked, as `begin`'s.
     ///
-    /// Refused, not answering, or not answered yet: nothing is claimed, and
+    /// Refused, or not answered yet: nothing is claimed, and
     /// `false` says so. The head itself is created on the first write, by
     /// the first commit's PUT (as `begin`'s).
     pub fn claim(&mut self, signer: DelegateContainer) -> bool {
@@ -505,13 +478,11 @@ impl PageIo {
             }
             Some(Asked::NoSigner(_)) => {
                 self.claimed = true;
-                // The ask's own end (its EMPTY answers) is not opening's.
-                self.exhausted = false;
                 self.signer_registered = false;
                 self.register_signer(signer, First::Query);
                 true
             }
-            Some(Asked::Refused(_)) | Some(Asked::NotAnswering) | None => false,
+            Some(Asked::Refused(_)) | None => false,
         }
     }
 
@@ -529,43 +500,10 @@ impl PageIo {
     /// Register the signer ALONE; its first request goes once the node has
     /// answered the registration (`inbound`, `Ack(Registered)`).
     fn register_signer(&mut self, signer: DelegateContainer, first: First) {
-        self.signer_container = Some(signer.clone());
-        let stream = self.next_stream();
-        match wire::frame_register_delegate(signer, stream) {
-            Ok(f) => self.out.extend(f),
-            Err(e) => self.unusable.push(format!("could not frame the signer's registration: {e}")),
-        }
+        self.signer_container = Some(signer);
         self.first = Some(first);
-        self.first_sent = false;
-        self.first_empties = 0;
-        self.first_started = None;
-        self.first_next_at = Ms(0);
-        self.first_gap_ms = page::rto::RTO_INITIAL_MS as u64;
-    }
-
-    /// Send the signer's first request (again).
-    fn send_first(&mut self) {
-        let stream = self.next_stream();
-        let framed = match self.first.as_ref() {
-            None => return,
-            Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
-            Some(First::Provision(key)) => wire::signer::frame_provision(
-                &self.art.signer,
-                PROVISION_ID,
-                key.clone(),
-                self.art.register_code.clone(),
-                self.art.register_params.clone(),
-                self.art.block_code.clone(),
-                stream,
-            ),
-        };
-        match framed {
-            Ok(f) => {
-                self.out.extend(f);
-                self.first_sent = true;
-            }
-            Err(e) => self.unusable.push(format!("could not frame the signer's first request: {e}")),
-        }
+        self.server.page.send_ext(Ext::RegisterSigner, self.now);
+        self.pump();
     }
 
     /// The signer holds no key (`begin`'s answer): mint one and `provision_with` it.
@@ -582,14 +520,10 @@ impl PageIo {
         }
         self.set_register(register_params);
         // The signer is registered already (it answered the query): the
-        // Provision is the first request now, re-asked like one.
+        // Provision is the first request now, sent and re-sent like one.
         self.first = Some(First::Provision(signing_key));
-        self.first_sent = false;
-        self.first_empties = 0;
-        self.first_started = None;
-        self.first_next_at = Ms(0);
-        self.first_gap_ms = page::rto::RTO_INITIAL_MS as u64;
-        self.send_first();
+        self.server.page.send_ext(Ext::SignerFirst, self.now);
+        self.pump();
     }
 
     /// Name the Register this page's head lives in.
@@ -625,6 +559,11 @@ impl PageIo {
         self.server.page.put_app(key, now);
         self.pump();
         Ok(())
+    }
+
+    /// A person cancels the pending PUT of `key` (the page's, named).
+    pub fn cancel_app_put(&mut self, key: &str) {
+        self.server.page.cancel_app_put(key);
     }
 
     /// Where the app's PUT of `key` stands (the page's [`page::AppPut`]).
@@ -670,7 +609,7 @@ impl PageIo {
             failed: self.head_failed,
             // Opening ended — refused in someone's words, or its re-asks spent:
             // there is no head read coming, so no subscription either.
-            ended: self.refused.clone().or_else(|| self.exhausted.then(|| "the signer is not answering".to_string())),
+            ended: self.refused.clone(),
         }
     }
 
@@ -775,27 +714,24 @@ impl PageIo {
             // EMPTY response to its outstanding first request. `wire::unframe`
             // maps ANY empty DelegateResponse to `Ack(Registered)`, so the two
             // look alike: the first is the registration, and any after it,
-            // while the first request is out, is "no answer" — asked again, at
-            // most FIRST_EMPTIES times — never a second registration.
+            // while the first request is out, is "no answer" — re-sent by the
+            // page's sender on its RTO — never a second registration.
+            //
+            // Except when this page only ASKS: then it registered nothing, and
+            // (measured on 0.2.136) a node WITHOUT the signer delegate answers
+            // a request to it EMPTY — the node's own answer, "no such signer
+            // here" (another user's node). A page that registered the signer itself
+            // reads an EMPTY as a request that arrived before the registration
+            // took (#260) — NOT an answer — and leaves it to the RTO.
             Incoming::Ack(wire::AckKind::Registered(key)) if key == self.art.signer.to_string() => {
                 if !self.signer_registered {
                     self.signer_registered = true;
-                    self.send_first();
-                } else if self.first.is_some() && self.first_sent {
-                    self.first_empties += 1;
-                    if self.first_empties <= FIRST_EMPTIES {
-                        self.send_first();
-                    } else {
-                        self.unusable.push(format!("the signer answered its first request EMPTY {} times", self.first_empties));
-                        self.first = None;
-                        self.exhausted = true;
-                        // Measured on 0.2.136: a node WITHOUT the signer
-                        // delegate answers its request EMPTY — another user's node.
-                        if self.asking() {
-                            self.asked = Some(Asked::NoSigner(format!("no signer on this node: it answered EMPTY {} times", self.first_empties)));
-                            self.step_can_sign();
-                        }
-                    }
+                    self.server.page.ext_answered(Ext::RegisterSigner, now);
+                    self.server.page.send_ext(Ext::SignerFirst, now);
+                } else if self.asking() && self.first.is_some() && self.server.page.ext_waiting(Ext::SignerFirst) {
+                    self.first = None;
+                    self.server.page.ext_answered(Ext::SignerFirst, now);
+                    self.asked = Some(Asked::NoSigner("no signer on this node: it answered EMPTY".into()));
                 }
             }
             // The app's PUT: the page ends its deadline.
@@ -820,6 +756,10 @@ impl PageIo {
                     // more re-sends, and a later empty response is nobody's.
                     if matches!(answer, Some((REGISTER_QUERY_ID | PROVISION_ID, _))) {
                         self.first = None;
+                        self.server.page.ext_answered(Ext::SignerFirst, now);
+                    }
+                    if matches!(answer, Some((RECORD_QUERY_ID, _))) {
+                        self.server.page.ext_answered(Ext::AskRecord, now);
                     }
                     match answer {
                         // `begin`'s question: which Register? Named: open it,
@@ -905,6 +845,7 @@ impl PageIo {
                 // nothing is the node refusing IT: opening ends, by name.
                 if self.first.is_some() {
                     self.first = None;
+                    self.server.page.ext_answered(Ext::SignerFirst, now);
                     self.refused = Some(format!("the node refused: {}", r.said));
                     if self.asking() {
                         self.asked = Some(Asked::Refused(format!("the node refused: {}", r.said)));
@@ -938,50 +879,8 @@ impl PageIo {
     /// The page's clock.
     pub fn tick(&mut self, now: Ms) {
         self.now = now;
-        self.tick_first(now);
         self.server.tick(now);
         self.pump();
-    }
-
-    /// The first exchange on the page's clock: anchored at its first tick,
-    /// asked again when due (the registration if it was never answered, else
-    /// the first request, through `send_first`), doubling to 8 s, and past
-    /// `VERIFY_BUDGET_MS` named "not answering" — never asked for ever.
-    fn tick_first(&mut self, now: Ms) {
-        if self.first.is_none() {
-            return;
-        }
-        let started = *self.first_started.get_or_insert(now);
-        if self.first_next_at.0 == 0 {
-            self.first_next_at = Ms(now.0 + self.first_gap_ms);
-            return;
-        }
-        if now.0 < self.first_next_at.0 {
-            return;
-        }
-        if now.0.saturating_sub(started.0) >= page::VERIFY_BUDGET_MS {
-            let what = match self.first { Some(First::Query) => "which Register it signs for", _ => "provisioning" };
-            self.unusable.push(format!("the signer is not answering: no answer to {what} within {} ms", page::VERIFY_BUDGET_MS));
-            self.first = None;
-            self.exhausted = true;
-            if self.asking() {
-                self.asked = Some(Asked::NotAnswering);
-            }
-            return;
-        }
-        self.first_gap_ms = (self.first_gap_ms * 2).min(8_000);
-        self.first_next_at = Ms(now.0 + self.first_gap_ms);
-        if !self.signer_registered {
-            if let Some(signer) = self.signer_container.clone() {
-                let stream = self.next_stream();
-                match wire::frame_register_delegate(signer, stream) {
-                    Ok(f) => self.out.extend(f),
-                    Err(e) => self.unusable.push(format!("could not frame the signer's registration: {e}")),
-                }
-            }
-        } else {
-            self.send_first();
-        }
     }
 
     /// Opening was REFUSED — by the signer or the node, in its words.
@@ -989,25 +888,23 @@ impl PageIo {
         self.refused.as_deref()
     }
 
-    /// Opening's re-asks are spent: the signer is "not answering".
-    pub fn exhausted(&self) -> bool {
-        self.exhausted
+    /// The request that has waited longest for an answer, and for how long
+    /// (ms): what a page shows as "not answering for N s" (rule 8). The
+    /// page's sender keeps re-sending it; this never ends anything.
+    pub fn not_answering(&self) -> Option<(String, u64)> {
+        self.server.page.not_answering()
     }
 
     /// Still waiting on the first exchange past its first RTO.
     pub fn stalled(&self) -> bool {
-        self.first.is_some() && self.first_started.is_some_and(|s| self.now.0.saturating_sub(s.0) >= page::rto::RTO_INITIAL_MS as u64)
+        (self.server.page.ext_waiting(Ext::RegisterSigner) || self.server.page.ext_waiting(Ext::SignerFirst))
+            && self.server.page.not_answering().is_some_and(|(_, ms)| ms >= page::rto::RTO_INITIAL_MS as u64)
     }
 
-    /// When the page's next timer falls (a host arms a one-shot for it) —
-    /// the engine's, or the first exchange's re-ask. Unanchored, it is due
-    /// NOW, so the host ticks once and the real clock anchors it.
+    /// When the page's next timer falls (a host arms a one-shot for it): the
+    /// page's own deadlines, which the signer's requests are among.
     pub fn next_due(&self) -> Option<Ms> {
-        let first = self.first.as_ref().map(|_| if self.first_next_at.0 == 0 { self.now } else { self.first_next_at });
-        match (self.server.page.next_due(), first) {
-            (Some(a), Some(b)) => Some(Ms(a.0.min(b.0))),
-            (a, b) => a.or(b),
-        }
+        self.server.page.next_due()
     }
 
     /// Frames for the node, in order.
@@ -1039,18 +936,8 @@ impl PageIo {
     /// of its own would be clearer; the signer's owner may add one): the
     /// order of `decide` stays as it is, which signer/tests pin.
     fn ask_record(&mut self) {
-        let genesis_root = self.server.page.published().1;
-        let stream = self.next_stream();
-        match wire::signer::frame_sign(
-            &self.art.signer,
-            RECORD_QUERY_ID,
-            signer_proto::Head { seq: 0, root: genesis_root },
-            signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
-            stream,
-        ) {
-            Ok(f) => self.out.extend(f),
-            Err(e) => self.unusable.push(format!("could not frame the record query: {e}")),
-        }
+        let now = self.now;
+        self.server.page.send_ext(Ext::AskRecord, now);
     }
 
     fn next_stream(&mut self) -> u32 {
@@ -1087,7 +974,7 @@ impl PageIo {
                     // A view's page makes no commit op; one that arrives is
                     // REFUSED BY NAME and handed back as the op's answer --
                     // loud, and ended: nothing waits on a frame never sent.
-                    Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
+                    Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } | Op::Ext(_) => {
                         let why = format!("read-only: a {} is never sent from a view", op_name(&op));
                         self.unusable.push(why.clone());
                         not_sent.push((op, why));
@@ -1132,6 +1019,32 @@ impl PageIo {
                     id,
                     signer_proto::Head { seq: prev_seq, root: prev_root },
                     signer_proto::Next { seq, root, ledger },
+                    stream,
+                ),
+                // Page-io's own requests, sent and re-sent by the page's
+                // sender (rule 5): framed HERE and nowhere else.
+                Op::Ext(Ext::RegisterSigner) => match self.signer_container.clone() {
+                    Some(c) => wire::frame_register_delegate(c, stream),
+                    None => Err("the signer's registration, with no signer to register".into()),
+                },
+                Op::Ext(Ext::SignerFirst) => match self.first.as_ref() {
+                    Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
+                    Some(First::Provision(key)) => wire::signer::frame_provision(
+                        &self.art.signer,
+                        PROVISION_ID,
+                        key.clone(),
+                        self.art.register_code.clone(),
+                        self.art.register_params.clone(),
+                        self.art.block_code.clone(),
+                        stream,
+                    ),
+                    None => Ok(Vec::new()),
+                },
+                Op::Ext(Ext::AskRecord) => wire::signer::frame_sign(
+                    &self.art.signer,
+                    RECORD_QUERY_ID,
+                    signer_proto::Head { seq: 0, root: self.server.page.published().1 },
+                    signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
                     stream,
                 ),
                 Op::PutApp { key } => match self.app_contracts.get(&key) {
@@ -1181,6 +1094,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::ReadHead => "head read",
         Op::AskHeld { .. } => "held query",
         Op::PutApp { .. } => "app PUT",
+        Op::Ext(_) => "signer request",
     }
 }
 

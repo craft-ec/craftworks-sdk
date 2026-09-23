@@ -160,7 +160,6 @@ impl Tab {
         let now = self.clock.now_ms();
         let _ = self.conn.tick_at(now);
         let _ = self.store.ask_after_applying();
-        self.store.tick(now);
         self.collect();
     }
 }

@@ -39,6 +39,7 @@ fn warmed(writes: u64, delay: u64) -> (Page, u64) {
                     Op::Update { .. } => Answer::Updated,
                     Op::AskHeld { id } => Answer::Held { id, present: true },
                     Op::PutApp { key } => Answer::AppPutOk(key),
+                    Op::Ext(_) => continue,
                 };
                 due.push((now + delay, a));
             }
@@ -146,8 +147,8 @@ fn with_no_answers_the_rto_backs_off() {
 
 /// sdk#175 at the executor: the engine's own head read that is never
 /// answered is asked again on its RTO for as long as it takes — it never
-/// becomes `HeadMissing`, which would open an EMPTY tree — and past the
-/// register's budget the page says it is not answering.
+/// becomes `HeadMissing`, which would open an EMPTY tree — and nothing ENDS
+/// it (rule 8): the page says "not answering for N s" and keeps asking.
 #[test]
 fn an_unanswered_head_read_is_never_an_empty_tree() {
     let mut p = Page::new(Params::default(), PutPath::Page);
@@ -177,9 +178,10 @@ fn an_unanswered_head_read_is_never_an_empty_tree() {
             }
         }
     }
-    assert!(
-        p.unusable().iter().any(|u| u.contains("not answering")),
-        "no 'not answering' after 40 s of silence: {:?}",
-        p.unusable()
-    );
+    // RULE 8: silence ENDS nothing. The page says what it waits on and for
+    // how long, and keeps asking; it is not made unusable by a clock.
+    assert!(p.unusable().is_empty(), "silence ended the page: {:?}", p.unusable());
+    let (what, ms) = p.not_answering().expect("40 s of silence and the page does not say what it waits on");
+    assert_eq!(what, "the head read", "the page names the wrong wait");
+    assert!(ms >= 40_000, "the head read has been silent since the first tick, but the page says {ms} ms");
 }

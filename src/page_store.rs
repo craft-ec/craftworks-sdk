@@ -52,8 +52,6 @@ pub enum Ended {
     Loaded,
     /// A block could not be had: not "absent", and never answered as empty.
     Unavailable,
-    /// Nothing ended it within [`TICKET_LIFE_MS`].
-    NotAnswering,
 }
 
 impl Ended {
@@ -62,7 +60,6 @@ impl Ended {
         match self {
             Ended::Loaded => "LOADED",
             Ended::Unavailable => "UNAVAILABLE",
-            Ended::NotAnswering => "NOT_ANSWERING",
         }
     }
 }
@@ -79,12 +76,6 @@ pub enum Outcome<T> {
     /// Nothing more is coming.
     Told(crate::db::DbError),
 }
-
-/// How long a ticket may stay open, and how long an ENDED one keeps its root
-/// pinned for a resume that may never come (a read the app abandoned). A
-/// ticket's root is a pin (READ-STATE § The block cache's bound), so it
-/// expires.
-pub const TICKET_LIFE_MS: u64 = 60_000;
 
 /// Entries a walk asks for per page. A walk loops pages until its limit or the
 /// range's end; this bounds only one step's working set.
@@ -393,21 +384,11 @@ impl<H: Host> PageStore<H> {
         self.pinned = None;
     }
 
-    /// Tickets not yet ended, and ended ones never resumed: both expire at
-    /// [`TICKET_LIFE_MS`] — an open one ENDS, named, and an ended one lets
-    /// its root go.
-    pub fn tick(&mut self, now: u64) {
-        let open: Vec<u64> = self
-            .tickets
-            .iter()
-            .filter(|(_, t)| t.ended.is_none() && now.saturating_sub(t.at_ms) >= TICKET_LIFE_MS)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in open {
-            self.end(id, Ended::NotAnswering, now);
-        }
-        self.tickets.retain(|_, t| t.ended.is_none() || now.saturating_sub(t.at_ms) < TICKET_LIFE_MS);
-    }
+    // NO TICKET LIFETIME (rules 7, 8): a ticket ENDS only on its answer —
+    // the engine's read finished (`Loaded`) or could not have a block
+    // (`Unavailable`) — and is removed when the read resumes. While it waits,
+    // the page's sender re-sends the node request under it, and the page's
+    // `not_answering` says for how long.
 
     /// Tickets still open (not ended). What the model asserts is zero at rest.
     pub fn open_tickets(&self) -> usize {
