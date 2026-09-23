@@ -44,11 +44,20 @@ const refusedAsReadOnly = fn => {
 
 const view = () => { const s = new Session(7999); s.open_named(BLOCK, HEAD, 1); return s; };
 
-await t("**a view says it is read-only and stands on the NAMED head**", async () => {
+await t("**a view may write nothing -- the ONE decision says no -- and stands on the NAMED head**", async () => {
   const s = view();
-  assert.equal(s.read_only(), true);
+  for (const head of ["", HEAD]) {
+    const w = JSON.parse(s.can_write(head));
+    assert.equal(w.answer, "no", `a view may write ${head || "its own tree"}: ${JSON.stringify(w)}`);
+    assert.match(w.why, /^read-only: /);
+  }
   assert.equal(s.head_id(), HEAD, "the view does not stand on the head it was given");
-  assert.equal(new Session(7999).read_only(), false, "THE CONTROL: an ordinary session is not read-only");
+  // THE CONTROL: a session opening its own tree may write it -- the "no"
+  // above is the view's, not the decision's only answer.
+  const own = new Session(7999);
+  own.provision(new TextEncoder().encode("signer code"), BLOCK, new TextEncoder().encode("register"));
+  assert.equal(JSON.parse(own.can_write("")).answer, "yes", "THE CONTROL: an opening session may not write its own tree");
+  assert.equal(JSON.parse(new Session(7999).can_write("")).answer, "unknown", "a session with no page was decided");
 });
 
 await t("**a view installs NOTHING on the node: its only frames are GETs, the head read with a subscription**", async () => {

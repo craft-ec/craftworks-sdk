@@ -62,7 +62,8 @@ await t("**tree() is a read-only Db on the SAME session: every write refused, th
     const bounded = () => Promise.race([write(), new Promise((_, no) => setTimeout(() => no(new Error("the write was not refused: it is waiting on the node")), 2000))]);
     await assert.rejects(bounded, e => e.code === "REFUSED" && /^read-only: /.test(e.message));
   }
-  assert.equal(h.readOnly(), false, "THE CONTROL: the person's own session still writes");
+  assert.equal(h.canWrite().answer, "yes", "THE CONTROL: the person's own session still writes");
+  assert.equal(h.canWrite(HEAD_A).answer !== "yes", true, "the own session may write somebody else's head");
 });
 
 await t("**a tree installs nothing on the node: its frames on the shared socket are GETs, its head watched**", async () => {

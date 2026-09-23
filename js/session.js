@@ -468,8 +468,20 @@ export async function openSession(Session, {
     provisioned: () => session.provisioned(),
     /** `provision: "ask"`'s answer (`openAsked`): this session's identity here. */
     asked: () => JSON.parse(session.asked()),
-    // This person's own session writes; a tree handle (below) is read-only.
-    readOnly: () => session.read_only(),
+    /**
+     * MAY THIS SESSION WRITE `head`? ("" = its own tree: a `viewer`
+     * component's.) `{answer: "yes"|"no"|"unknown", why}`, decided in Rust
+     * from the signer's answer each time it is asked -- a runtime ASKS it
+     * each render and keeps no copy (one owner). "unknown": show the inputs
+     * disabled, with `why`.
+     */
+    canWrite: (head = "") => JSON.parse(session.can_write(head)),
+    /**
+     * OPEN THE VIEWER'S OWN TREE on an asked session (`openAsked`): the
+     * node's key is used where it has one, minted where it has none, and the
+     * head is created by the first write. Returns `canWrite("")`.
+     */
+    openOwn: () => { const r = JSON.parse(session.open_own()); conn.pump(); return r; },
     // The head this session stands on, as `tree()` takes it (hex; "" until
     // Identity has named it). What a publisher records so others can read it.
     headId: () => session.head_id(),
