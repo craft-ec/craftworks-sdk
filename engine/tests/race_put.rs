@@ -267,3 +267,114 @@ fn repeated_values_in_one_group_publish() {
     assert!(states(&all, 2).contains(&State::Published), "{:?}", states(&all, 2));
     assert!(states(&all, 2).contains(&State::ParityComplete), "{:?}", states(&all, 2));
 }
+
+// ---------------------------------------------------------------------------
+// COMMIT-LIFE §P's gate tests.
+// ---------------------------------------------------------------------------
+
+fn is_parity(id: &Cid, bytes: &[u8]) -> bool {
+    freenet_prolly::block_id(freenet_prolly::kind::PARITY, bytes) == *id
+}
+
+impl Rig {
+    fn base_with(params: Params) -> Rig {
+        let mut r = Rig { e: common::new_store_params(params), known: BTreeMap::new() };
+        let ops: Vec<(Vec<u8>, Op)> = (0..600u32).map(|i| put(&format!("k/{i:06}"), &[(i % 251) as u8; 20])).collect();
+        let _ = r.commit(1, ops, |_, _| true);
+        r
+    }
+}
+
+/// §P 1: a commit whose slowest PUTs never answer -- every PARITY block of the
+/// commit (3 per changed group, so each group keeps exactly its k members) --
+/// still PUBLISHES, and is SAVED, not BACKED_UP. The CONTROL, run here: with
+/// race put off (wait for every PUT) the same commit does NOT sign.
+#[test]
+fn a_commit_whose_slowest_puts_never_answer_still_publishes_saved_not_backed_up() {
+    for race in [true, false] {
+        let mut r = Rig::base_with(Params { race_put: race, ..Params::default() });
+        let all = r.commit(2, vec![put("k/000100", b"two")], |id, b| !is_parity(id, b));
+        let held = puts(&all).iter().filter(|(id, b)| is_parity(id, b)).count();
+        assert!(held >= 3, "race={race}: the commit coded {held} parity block(s): nothing to hold back");
+        if race {
+            assert!(states(&all, 2).contains(&State::Published), "race put: {held} slow parity PUTs held the head back");
+            assert!(!states(&all, 2).contains(&State::ParityComplete), "BACKED_UP with {held} PUTs never answered");
+        } else {
+            assert!(head(&all).is_none(), "the CONTROL (wait for all) signed with {held} PUTs un-acked: this test cannot tell race put from it");
+        }
+    }
+}
+
+/// §P 3: NO parity PUT is sequenced after a data block's ack. Every block the
+/// commit needs -- its data AND the parity its new nodes list -- is in its
+/// FIRST send, and no confirmation afterwards makes a new PUT.
+#[test]
+fn every_put_of_a_commit_leaves_in_its_first_send() {
+    let mut r = Rig::base();
+    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two"), put("k/000400", b"four")]));
+    let sent = puts(&first);
+    let listed: BTreeSet<Cid> = sent.values().filter_map(|b| Node::parse(b).ok()).flat_map(|n| n.parity().collect::<Vec<_>>()).collect();
+    let coded: BTreeSet<Cid> = sent.iter().filter(|(id, b)| is_parity(id, b)).map(|(id, _)| *id).collect();
+    assert!(!coded.is_empty(), "the commit put no parity in its first send");
+    // Every parity id a new node lists that is not already on the node (a
+    // reused group's) is in the first send.
+    let missing: Vec<&Cid> = listed.iter().filter(|p| !coded.contains(*p) && !r.known.contains_key(*p)).collect();
+    assert!(missing.is_empty(), "{} parity block(s) a new node lists were not in the commit's first send", missing.len());
+    for id in sent.keys() {
+        let fx = r.step(Event::PutConfirmed(*id));
+        assert!(puts(&fx).is_empty(), "a PUT was sequenced after a data ack: {:?}", puts(&fx).keys().collect::<Vec<_>>());
+    }
+}
+
+/// §P 4: a commit whose ROOT is un-acked does not sign (nothing can rebuild a
+/// root), and neither does one with a changed group missing k+1 -- here its
+/// new leaf AND its 3 parity (k-1 of k+3 left).
+#[test]
+fn neither_an_unacked_root_nor_a_group_below_k_signs() {
+    // The root: everything acked but it.
+    let mut r = Rig::base();
+    let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let root = r.e.root();
+    let mut all = fx.clone();
+    for id in puts(&fx).keys().filter(|id| **id != root) {
+        all.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    assert!(head(&all).is_none(), "the head was signed with the ROOT un-acked");
+    let more = r.step(Event::PutConfirmed(root));
+    assert!(head(&more).is_some(), "with the root acked too, the head did not sign");
+
+    // A group below k: its new leaf and all 3 of its parity held.
+    let l2 = l2();
+    let mut r = Rig::base();
+    let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let sent = puts(&fx);
+    let parent = sent.values().filter_map(|b| Node::parse(b).ok()).find(|n| !n.is_leaf() && parity::group_members(n).iter().any(|(_, m)| m.contains(&l2))).expect("the leaf's parent");
+    let g = parity::group_members(&parent).into_iter().position(|(_, m)| m.contains(&l2)).unwrap();
+    let pids: Vec<Cid> = parent.parity().collect();
+    let hold: BTreeSet<Cid> = std::iter::once(l2).chain(pids[3 * g..3 * g + 3].iter().copied()).collect();
+    let mut all = fx.clone();
+    for id in sent.keys().filter(|id| !hold.contains(*id)) {
+        all.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    assert!(head(&all).is_none(), "the head was signed with a changed group at k-1 of k+3");
+}
+
+/// §P 6: the largest write that fit before still publishes, with its parity
+/// on top (parity rides above `max_commit_blocks`: ≤ 3 per changed group).
+#[test]
+fn the_largest_pre_race_put_write_still_publishes_with_its_parity() {
+    let p = Params::default();
+    let mut r = Rig { e: common::new_store_params(p), known: BTreeMap::new() };
+    // Values by reference: one block each, so the data blocks approach the cap.
+    let n = (p.max_commit_blocks as u32).saturating_sub(12);
+    let ops: Vec<(Vec<u8>, Op)> = (0..n).map(|i| put(&format!("v/{i:06}"), &vec![(i % 251) as u8; 2000])).collect();
+    let all = r.commit(1, ops, |_, _| true);
+    let sent = puts(&all);
+    let parity = sent.iter().filter(|(id, b)| is_parity(id, b)).count();
+    let data = sent.len() - parity;
+    println!("  {n} rows: {data} data block(s) (cap {}), {parity} parity", p.max_commit_blocks);
+    assert!(data + 12 >= p.max_commit_blocks, "the fixture put {data} data blocks: not near the cap");
+    assert!(parity > 0);
+    assert!(states(&all, 1).contains(&State::Published), "{:?}", states(&all, 1));
+    assert!(states(&all, 1).contains(&State::ParityComplete), "{:?}", states(&all, 1));
+}
