@@ -95,6 +95,15 @@ pub fn new_store_params(params: Params) -> Engine<Store> {
     e
 }
 
+/// A COLD READER of `root`: an engine that has adopted it and holds none of
+/// its blocks, on a store of its own (returned, for what the page keeps).
+pub fn cold_reader(root: Cid, params: Params) -> (Engine<Store>, Store) {
+    let store = Store::fresh();
+    let mut e = Engine::new(params, store.clone());
+    e.adopt_root_for_test(root);
+    (e, store)
+}
+
 impl Store {
     /// A store of its very own, for a test that wants two.
     pub fn fresh() -> Self {
