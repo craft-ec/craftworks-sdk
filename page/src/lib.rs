@@ -205,10 +205,10 @@ pub enum Answer {
     AppPutOk(String),
     /// The node refused the app's PUT of this contract key, in its words.
     AppPutRefused { key: String, said: String },
-    /// An op this page produced that its HOST will not send (a read-only
-    /// page's commit op: never produced, so this is loud), in the host's
-    /// words. It ENDS the op's wait -- nothing waits on a frame that never
-    /// left.
+    /// An op this page sent that its HOST will not send (a read-only page's
+    /// `Update` or `Sign`: never produced, so this is loud), in the host's
+    /// words. It ENDS every wait on that op -- nothing waits on a frame that
+    /// never left. (An app's PUT has its own: [`Answer::AppPutRefused`].)
     NotSent { op: Op, why: String },
 }
 
@@ -764,22 +764,14 @@ impl Page {
         self.now = now;
         match a {
             Answer::NotSent { op, why } => {
-                let w = match &op {
-                    Op::Put { id, .. } => Some(Waiting::Put(*id)),
-                    Op::Update { .. } => Some(Waiting::Update),
-                    Op::Sign { .. } => Some(Waiting::Sign),
-                    Op::PutApp { key } => Some(Waiting::PutApp(key.clone())),
-                    _ => None,
-                };
-                if let Some(w) = w {
-                    self.answered(&w);
+                // WHICH WAIT AN OP HAS is stated once: the deadline `send`
+                // recorded for it (an op alone does not say -- a head read
+                // is sent for five different waits). Every wait on this op
+                // ends; there is no kind for which nothing does.
+                let ended: Vec<Waiting> = self.deadlines.iter().filter(|(_, d)| d.op == op).map(|(w, _)| w.clone()).collect();
+                for w in &ended {
+                    self.answered(w);
                 }
-                if let Op::PutApp { key } = &op {
-                    if let Some(p) = self.app_puts.get_mut(key) {
-                        p.0 = AppPut::Refused(why.clone());
-                    }
-                }
-                self.repair_puts.retain(|id| !matches!(&op, Op::Put { id: o, .. } if o == id));
                 self.unusable.push(format!("not sent: {why}"));
             }
             Answer::AppPutOk(key) => {
@@ -1987,5 +1979,42 @@ mod parked_get {
         // The engine here waits on nothing: the parked GET ends rather than going out.
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
+    }
+}
+
+#[cfg(test)]
+mod not_sent {
+    use super::*;
+
+    /// AN OP THE HOST WILL NOT SEND ENDS ITS WAIT, whatever its kind: the
+    /// wait is found through the deadline `send` recorded, so no kind is left
+    /// waiting (a match on the op's kind with a `_ => None` arm left a Get or
+    /// a head read waiting for ever). Every op kind, and a head read under
+    /// each of its five waits.
+    #[test]
+    fn a_not_sent_answer_ends_the_wait_of_every_op_kind() {
+        let id = [9u8; 32];
+        let sign = Op::Sign { id: 1, prev_seq: 0, prev_root: [0u8; 32], seq: 1, root: id, ledger: Vec::new() };
+        let cases = vec![
+            (Waiting::Put(id), Op::Put { id, bytes: b"x".to_vec() }),
+            (Waiting::Get(id), Op::Get { id }),
+            (Waiting::Held(id), Op::AskHeld { id }),
+            (Waiting::Sign, sign),
+            (Waiting::Update, Op::Update { state: b"s".to_vec() }),
+            (Waiting::PutApp("k".into()), Op::PutApp { key: "k".into() }),
+            (Waiting::Warm, Op::ReadHead),
+            (Waiting::RecoverHead, Op::ReadHead),
+            (Waiting::Verify, Op::ReadHead),
+            (Waiting::ReadBack, Op::ReadHead),
+            (Waiting::Hint, Op::ReadHead),
+        ];
+        for (w, op) in cases {
+            let mut p = Page::new(Params::default(), PutPath::Page);
+            p.send(w.clone(), op.clone());
+            let _ = p.take_ops();
+            assert!(p.deadlines.contains_key(&w), "THE CONTROL: {w:?} was not waiting after its send");
+            p.answer(Answer::NotSent { op: op.clone(), why: "refused".into() }, Ms(1));
+            assert!(!p.deadlines.contains_key(&w), "a NotSent for {op:?} left {w:?} waiting");
+        }
     }
 }
