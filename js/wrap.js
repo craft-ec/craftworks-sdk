@@ -237,6 +237,11 @@ export function wrap(raw) {
     // `AppContainer` builds an app's container in the page. The PUT itself is
     // the session's `put_contract`.
     webapp: { params: raw.webapp_params, address: raw.webapp_address, AppContainer: raw.AppContainer },
+    // THE SDK'S OWN ID RULES (#126 ruling), each from its one owner in Rust:
+    // `app(id)` throws in `app::check`'s words; `hex32(s)` is a 32-byte id in
+    // hex (a head's, a sha256); `loc(s)` a record id (32 hex, 64 under a
+    // parent). A page or tool asks these; it never writes the rule again.
+    ids: { app: raw.app_check, hex32: raw.hex32_ok, loc: raw.loc_ok },
     // The halves, for tests that drive the parts and for a host running its
     // own loop. NOT app-facing: handing an app the two things it can wire
     // wrongly, beside the one call it cannot, is how the wiring gets done by

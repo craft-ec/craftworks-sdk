@@ -76,7 +76,12 @@ await t("**db.other(app) READS through `@app/name` and never WRITES — the node
     await assert.rejects(() => other[w]("notes", {}), e => e.code === "REFUSED" && /another app's data/.test(e.message), `${w} was not refused by name`);
   }
   assert.equal(calls.length, 2, `a refused write reached the session: ${JSON.stringify(calls.slice(2))}`);
-  assert.throws(() => engineDb(session).other("Has.Dot"), /not an app id/);
+  // A bad app id is refused where every name is: the session's `app::read`
+  // (tests/app_namespace.rs: "@BAD/notes" is refused). The db writes no second
+  // copy of the rule; it hands the name over as given.
+  calls.length = 0;
+  await engineDb(session).other("Has.Dot").scan("notes");
+  assert.deepEqual(calls.map(c => c.slice(0, 2)), [["scan", "@Has.Dot/notes"]], "the db decided the app id itself instead of the session");
 });
 
 await t("the IN-MEMORY db has the same other(), and says it holds only this app's data — never an empty answer", async () => {
