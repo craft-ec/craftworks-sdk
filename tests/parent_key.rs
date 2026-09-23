@@ -12,6 +12,7 @@
 //! with no evidence.
 use craftworks_sdk::id::{from_hex, loc_from_hex};
 use craftworks_sdk::*;
+use testkit::MemStore;
 use serde_json::{json, Map, Value};
 
 struct FakeEnv {

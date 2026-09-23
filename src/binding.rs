@@ -107,8 +107,6 @@ pub struct Binding {
     lo: Vec<u8>,
     hi: Vec<u8>,
     live: bool,
-    /// The client-chosen subscription id, if this binding asked for one.
-    sub_id: Option<u64>,
     /// The root the rows were read at. The client owns this, not the engine —
     /// which is what makes a missed notification recoverable: whatever was
     /// dropped, the next reload diffs across the whole gap in one call.
@@ -134,7 +132,6 @@ impl Binding {
             lo: lo.to_vec(),
             hi: hi.to_vec(),
             live,
-            sub_id: None,
             at: None,
             rows: std::rc::Rc::new(Vec::new()),
             delta_above: DELTA_WORTH_IT_ABOVE,
@@ -174,10 +171,6 @@ impl Binding {
         (&self.lo, &self.hi)
     }
 
-    pub fn sub_id(&self) -> Option<u64> {
-        self.sub_id
-    }
-
     /// The rows, as the same object until they change.
     pub fn snapshot(&self) -> Rows {
         self.rows.clone()
@@ -200,35 +193,10 @@ impl Binding {
         self.listeners.retain(|(i, _)| *i != id);
     }
 
-    /// Record that the engine accepted (or refused) a subscription.
-    ///
-    /// The engine decides the MECHANISM; the binding only declared that it
-    /// wants notifications. A refusal is a downgrade to the backstop, and it
-    /// is recorded rather than swallowed.
-    pub fn note_subscribed(&mut self, sub_id: u64, accepted: bool) {
-        if !self.live {
-            return;
-        }
-        self.sub_id = accepted.then_some(sub_id);
-        self.mode = if accepted {
-            LiveMode::Notified
-        } else {
-            LiveMode::Polled
-        };
-    }
-
     /// Record how this binding is being kept current.
     pub fn note_mode(&mut self, mode: LiveMode) {
         if self.live {
             self.mode = mode;
-        }
-    }
-
-    /// The engine could not, or would not, keep notifying this range.
-    pub fn note_downgraded(&mut self) {
-        if self.live {
-            self.mode = LiveMode::Polled;
-            self.sub_id = None;
         }
     }
 

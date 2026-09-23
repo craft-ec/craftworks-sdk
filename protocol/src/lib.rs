@@ -24,7 +24,6 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod outbox;
 pub mod record;
 pub mod session;
 

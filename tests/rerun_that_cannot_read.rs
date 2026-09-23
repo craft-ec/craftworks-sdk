@@ -13,7 +13,8 @@
 
 use craftworks_sdk::page_store::TICKET_LIFE_MS;
 use craftworks_sdk::store::{ConflictChain, Delta, Edit, Read, Reads, Store, StoreError};
-use craftworks_sdk::{Db, Env, MemStore, RerunEvent};
+use craftworks_sdk::{Db, Env, RerunEvent};
+use testkit::MemStore;
 use serde_json::{json, Map, Value};
 
 struct FakeEnv(u64);

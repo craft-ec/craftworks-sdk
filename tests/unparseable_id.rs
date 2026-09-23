@@ -19,6 +19,7 @@
 //! before #122 is 32 hex where the domain now wants 64.
 use craftworks_sdk::id::Loc;
 use craftworks_sdk::*;
+use testkit::MemStore;
 use serde_json::{json, Map, Value};
 
 struct FakeEnv {
