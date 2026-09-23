@@ -1139,7 +1139,13 @@ impl PageIo {
                 self.server.node(Answer::Held { id, present: false }, now);
             }
             for (op, why) in not_sent {
-                self.server.node(Answer::NotSent { op, why }, now);
+                // An app's PUT has its refusal already (`AppPutRefused`); the
+                // commit ops a view never makes have none, so `NotSent`.
+                let answer = match op {
+                    Op::PutApp { key } => Answer::AppPutRefused { key, said: why },
+                    op => Answer::NotSent { op, why },
+                };
+                self.server.node(answer, now);
             }
             self.pump();
         }
