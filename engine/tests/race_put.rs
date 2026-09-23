@@ -224,3 +224,31 @@ fn an_earlier_straggler_is_never_counted_present_and_after_names_only_this_commi
     }
     assert!(!after.is_empty(), "after is empty: the check above is vacuous");
 }
+
+/// SUPERSESSION ON A FOREIGN MOVE (the architect: "every published-root
+/// move"): another device of the same identity publishes a head whose tree
+/// re-codes the group this engine's straggler is in. Adopting it withdraws
+/// the straggler, and the write is CARRIED -- never BACKED_UP on the foreign
+/// tree's say-so, whose stragglers nothing here tracks -- until this engine's
+/// next own commit backs it up.
+#[test]
+fn a_foreign_head_re_coding_the_group_withdraws_the_straggler_and_the_write_waits_for_the_next_own_commit() {
+    // The foreign tree: the same base, then k/000100 := "foreign" (seq 2),
+    // built by another engine and held by the same node.
+    let foreign = {
+        let mut p = Rig::base();
+        let all = p.commit(2, vec![put("k/000100", b"foreign")], |_, _| true);
+        assert!(states(&all, 2).contains(&State::Published));
+        p.e.published_root()
+    };
+    let (mut r, l2) = with_straggler();
+    // A newer head (seq 3) arrives with no commit in flight: adopted.
+    let fx = r.step(Event::HeadRead { epoch: engine::Epoch(1), seq: 3, root: foreign });
+    assert!(withdrawn(&fx).contains(&l2), "a foreign move re-coding the group did not withdraw the straggler: {:?}", withdrawn(&fx));
+    assert!(!states(&fx, 2).contains(&State::ParityComplete), "write 2 BACKED_UP on a FOREIGN tree's say-so");
+    assert_eq!(r.e.backing(), 0, "the withdrawn straggler's Backing is still waiting");
+    // The next own commit, fully acked, takes the carried write with it.
+    let all = r.commit(4, vec![put("k/000200", b"four")], |_, _| true);
+    assert!(states(&all, 4).contains(&State::ParityComplete));
+    assert!(states(&all, 2).contains(&State::ParityComplete), "the carried write was never BACKED_UP by the next own commit");
+}
