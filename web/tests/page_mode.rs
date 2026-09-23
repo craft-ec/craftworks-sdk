@@ -98,7 +98,7 @@ fn the_session_keeps_no_copy_of_the_head_and_reports_changes_from_the_tree() {
 #[test]
 fn a_woken_read_resumes_at_its_tickets_root_and_every_call_unpins() {
     let src = session_src();
-    assert!(body_of(&src, "resume").contains("self.db.store_mut().resume(ticket)"), "the Session does not resume a ticket");
+    assert!(body_of(&src, "resume").contains("self.db.store_mut().resume(ticket as u64)"), "the Session does not resume a ticket");
     let at = src.find("fn decide<").expect("fn decide");
     let decide = &src[at..at + src[at..].find("\n    }\n").expect("its end")];
     // `PageStore::decide` ends the pin; it is called for every result.

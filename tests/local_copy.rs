@@ -160,35 +160,46 @@ fn with_the_timeout_off_the_phantom_survives_for_ever() {
 // ---------------------------------------------------------------------------
 
 /// A write the engine accepted is in the warm root; a second copy of it here
-/// would be two copies of one value. Only a write HELD by the window, or
-/// QUEUED after `Busy`, is in no root — and only those are overlaid. Each
-/// leaves the overlay on the door's verdict.
+/// would be two copies of one value. A write HELD by the window, QUEUED after
+/// `Busy`, or SENT AND NOT YET ANSWERED (the engine parked it to fetch the
+/// blocks it lands on — in a browser the node answers later) is in no root,
+/// and only those are overlaid. Each leaves the overlay on the engine's
+/// verdict. A verdict is `answered` then classified, as
+/// `CachedStore::on_write_state` does.
 #[test]
 fn interim_the_overlay_is_only_the_writes_the_engine_has_not_taken() {
     let mut c = Copy::new();
     c.write(b"a/1", Some(v("taken")), 1, 0).expect("under the cap");
     c.sent(1, 0);
+    c.answered(1);
     c.submitted(1);
     c.write(b"a/2", Some(v("held")), 2, 0).expect("under the cap");
     c.hold(2);
     c.write(b"a/3", None, 3, 0).expect("under the cap");
     c.sent(3, 0);
+    c.answered(3);
     c.queued(3);
+    c.write(b"a/4", Some(v("parked")), 4, 0).expect("under the cap");
+    c.sent(4, 0);
 
     assert_eq!(
         c.unaccepted(b"a/", b"b/"),
-        vec![(v("a/2"), Some(v("held"))), (v("a/3"), None)],
-        "the overlay must be exactly the held and the Busy-queued writes, a delete as None"
+        vec![(v("a/2"), Some(v("held"))), (v("a/3"), None), (v("a/4"), Some(v("parked")))],
+        "the overlay must be exactly the held, the Busy-queued and the unanswered writes, a delete as None"
     );
     assert!(c.any_unaccepted());
 
     // The held write goes out and is taken: it leaves the overlay.
     c.sent(2, 0);
+    c.answered(2);
     c.submitted(2);
     // The queued one is refused for good: it falls, and leaves too.
     c.failed(3);
+    // The parked one is applied and answered Accepted: it leaves.
+    c.answered(4);
+    c.submitted(4);
     assert_eq!(c.unaccepted(b"a/", b"b/"), Vec::new());
-    assert!(!c.any_unaccepted(), "nothing is held or queued, and yet something is overlaid");
+    assert!(!c.any_unaccepted(), "nothing is held, queued or unanswered, and yet something is overlaid");
 }
 
 // ---------------------------------------------------------------------------
