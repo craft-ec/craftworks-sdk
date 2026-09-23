@@ -85,6 +85,7 @@ use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod asks;
+pub mod keep;
 pub mod pack;
 pub mod read;
 pub mod repair;
