@@ -1837,3 +1837,23 @@ fn answers_a_sign(a: &signer_proto::Answer) -> bool {
         A::Provisioned | A::Putting { .. } | A::Put { .. } | A::Held { .. } | A::Register { .. } => false,
     }
 }
+
+#[cfg(test)]
+mod unneeded_gets {
+    use super::*;
+
+    /// A GET still QUEUED for the window when nobody needs it any more is ended with the rest (sdk#303): it never
+    /// goes out. Tested here, on the page's own queue, because no fixture through the public surface leaves a
+    /// block queued at the moment it stops being needed (the window refills before the engine hears the answer
+    /// that ends the need; page/tests/race_get.rs).
+    #[test]
+    fn a_queued_get_nobody_needs_is_ended() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let (held, wanted) = ([1u8; 32], [2u8; 32]);
+        p.blocks.insert(held, b"held");
+        p.get_queue.push_back(held);
+        p.get_queue.push_back(wanted);
+        p.end_unneeded_gets();
+        assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![wanted], "the held block's queued GET was not ended, or the wanted one was");
+    }
+}

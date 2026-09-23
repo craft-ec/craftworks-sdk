@@ -125,10 +125,10 @@ fn a_withdrawn_get_is_not_asked_again() {
     withdrawn_gets(false);
 }
 
-/// The same with every OTHER leaf read at once and answered slowly (300 ms), so the race runs while the window is
-/// busy with unrelated GETs: still every read answered, nothing withdrawn re-sent, nothing left waiting.
-/// NOT REACHED here: a withdrawn block still QUEUED for the window when its group resolves (all 11 of the group's
-/// blocks went out before it resolved); `end_unneeded_gets`' `get_queue` clause is untested.
+/// The same with every OTHER leaf read first and answered slowly (300 ms, packs included), so the race runs on a
+/// window the slow GETs have shrunk (to 3): still every read answered, nothing withdrawn re-sent, nothing left
+/// waiting. It does NOT leave a group block queued when the group resolves (the window refills before the engine
+/// hears the resolving answer); the queue clause of `end_unneeded_gets` is tested inside the page crate.
 #[test]
 fn withdrawal_holds_with_slow_reads_in_flight() {
     withdrawn_gets(true);
@@ -173,27 +173,49 @@ fn withdrawn_gets(busy: bool) {
     // Busy: one key from each OTHER leaf too, those leaves answered slowly, so their GETs hold the window and the
     // race's slots wait in the queue behind them.
     let mut slow = BTreeSet::new();
-    let mut keys = keys;
+    let member_keys_v = keys;
+    let mut keys = Vec::new();
     if busy {
         let mut at = vec![root];
         while let Some(id) = at.pop() {
             let n = Node::parse(&node.blocks[&id]).expect("a node");
             if n.is_leaf() {
                 if !members.contains(&id) {
-                    slow.insert(id);
                     keys.push(n.key(0));
                 }
             } else {
                 at.extend((0..n.len()).map(|i| n.child(i).0));
             }
         }
+        // Slow: every block but the member's path (the root, its parent) and its group -- packs included, which is
+        // how the other leaves mostly come.
+        // The path a_leaf_group took: child 0 down to the level-1 node that holds the group.
+        let mut path = BTreeSet::new();
+        let mut at = root;
+        loop {
+            path.insert(at);
+            let n = Node::parse(&node.blocks[&at]).expect("a node");
+            if n.level() == 1 {
+                break;
+            }
+            at = n.child(0).0;
+        }
+        slow = node.blocks.keys().copied().filter(|id| !path.contains(id) && !members.contains(id) && !parity.contains(id)).collect();
     }
+    // The member's reads LAST: the race's slots then queue behind the slow leaves' GETs, and go out one freed place
+    // at a time -- so some are still queued when the first k have come back.
+    keys.extend(member_keys_v);
 
     // The reader, cold.
     let mut r = Page::new(Params::default(), PutPath::Page);
     let mut gets = Vec::new();
     drive(&mut r, &mut node, &silent, &mut now, 500, &mut gets);
+    let first = keys.len() - member_keys;
     for (n, key) in keys.iter().enumerate() {
+        // Busy: the other leaves' slow GETs hold the window and fill the queue BEFORE the member is read.
+        if n == first && busy {
+            drive_slow(&mut r, &mut node, &silent, &slow, &mut now, 400, &mut gets);
+        }
         r.event(Event::Get {
             client: ClientId(2),
             req_id: engine::read::ReqId(n as u64),
@@ -219,7 +241,7 @@ fn withdrawn_gets(busy: bool) {
             .filter(|n| !replied.contains(n))
             .map(|n| format!("#{n} {}", String::from_utf8_lossy(&keys[n as usize])))
             .collect();
-        panic!("{answered} of {} reads answered in 60 s (the member's are #0..#{}); unanswered: {missing:?}; waiting {}", keys.len(), member_keys, r.waiting())
+        panic!("{answered} of {} reads answered in 60 s (the member's are the last {}); unanswered: {missing:?}; waiting {}", keys.len(), member_keys, r.waiting())
     });
     let spare_gets = gets.iter().filter(|(_, id)| *id == spare).count();
     // A GET the RTO had already timed out may go once more before the engine withdrew it; after that, none.
