@@ -36,7 +36,14 @@ rm -f pkg/web-symbols/craftworks_sdk_bg.*.wasm
 cp "$shipped" "pkg/web-symbols/craftworks_sdk_bg.$stripped_hash.wasm"
 mv "$stripped_tmp" "$shipped"
 echo "pkg/web/craftworks_sdk_bg.wasm: $names_before -> $(wc -c < "$shipped" | tr -d ' ') B, name section stripped; names kept at pkg/web-symbols/craftworks_sdk_bg.$stripped_hash.wasm"
-cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js pkg/web/
+# THE PAGE'S RTO BACK-OFF, FOR THE JS THAT FETCHES THE WASM (sdk#312). The
+# app-code fetch runs before the wasm exists, so it walks a schedule the real
+# `page::rto::Rto` produced rather than a second back-off written in JS.
+# Generated at every build into js/ (gitignored), so the tests read it too.
+cargo run -q -p page --example rto_js > js/rto.js.tmp
+grep -q '^export const RTO_SCHEDULE_MS = ' js/rto.js.tmp || { echo "the rto_js example wrote no schedule" >&2; exit 1; }
+mv js/rto.js.tmp js/rto.js
+cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js js/rto.js pkg/web/
 
 # EVERY MODULE THE ENTRY CAN REACH IS IN THE PACKAGE.
 #
