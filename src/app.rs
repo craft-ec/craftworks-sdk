@@ -44,14 +44,14 @@ pub fn check_name(name: &str) -> Result<(), DbError> {
 /// A name this app READS, as the tree stores it: its own `<app>.name`, another
 /// app's through `@other/name`, or — with no app — the name as given (data
 /// from before apps, readable, never written).
-pub fn read(app: Option<&str>, name: &str) -> Result<String, DbError> {
+pub fn read(app: Option<&str>, name: &str) -> Result<StoredName, DbError> {
     if let Some(abs) = name.strip_prefix('@') {
         let (other, rest) = abs.split_once('/').ok_or_else(|| DbError::Refused(format!("`{name}` is not `@app/name`")))?;
         check(other)?;
         check_name(rest)?;
-        return Ok(format!("{other}.{rest}"));
+        return Ok(StoredName(format!("{other}.{rest}")));
     }
-    Ok(match app {
+    Ok(StoredName(match app {
         Some(a) => {
             check_name(name)?;
             format!("{a}.{name}")
@@ -59,19 +59,19 @@ pub fn read(app: Option<&str>, name: &str) -> Result<String, DbError> {
         // No app: a name as the tree stores it, which may carry an app's
         // prefix and so be longer than an app's own name; `db` bounds it.
         None => name.to_string(),
-    })
+    }))
 }
 
 /// A name this app WRITES: only its own. Another app's (`@other/…`) is refused
 /// by name, and so is every write by a session with no app.
-pub fn write(app: Option<&str>, name: &str) -> Result<String, DbError> {
+pub fn write(app: Option<&str>, name: &str) -> Result<StoredName, DbError> {
     if name.starts_with('@') {
         return Err(DbError::Refused(format!("`{name}` is another app's: an app writes only its own")));
     }
     match app {
         Some(a) => {
             check_name(name)?;
-            Ok(format!("{a}.{name}"))
+            Ok(StoredName(format!("{a}.{name}")))
         }
         None => Err(DbError::Refused(
             "no app: open the session with { app } before writing — a write with no app would land outside every app's space".into(),
@@ -80,9 +80,85 @@ pub fn write(app: Option<&str>, name: &str) -> Result<String, DbError> {
 }
 
 /// A stored name back to what this app calls it; `None` for another app's.
-pub fn own(app: Option<&str>, stored: &str) -> Option<String> {
+///
+/// THE ONLY WAY to an [`AppName`] from anything the tree holds — so a name
+/// headed for JavaScript has been through here, or it does not compile.
+pub fn own(app: Option<&str>, stored: &StoredName) -> Option<AppName> {
+    let s = stored.as_str();
     match app {
-        Some(a) => stored.strip_prefix(a).and_then(|r| r.strip_prefix('.')).map(str::to_string),
-        None => Some(stored.to_string()),
+        Some(a) => s.strip_prefix(a).and_then(|r| r.strip_prefix('.')).map(|r| AppName(r.to_string())),
+        None => Some(AppName(s.to_string())),
     }
+}
+
+/// A name as the TREE stores it — `<app>.<name>`, what record keys hold (or,
+/// with no app, a name from before apps as given). What the core `Db` takes:
+/// it derefs to `&str` for exactly that. It is NEVER what JavaScript holds;
+/// [`own`] is the one way back, and [`to_js`] takes only [`AppName`]s.
+///
+/// Two types because both forms were `String` and #282 handed JavaScript the
+/// stored one: no binding is keyed by it, so a tab's own write never
+/// re-rendered. With two types that mistake does not compile:
+///
+/// ```compile_fail
+/// use craftworks_sdk::app::{self, StoredName};
+/// let stored: StoredName = app::write(Some("notes-app"), "notes").unwrap();
+/// // A stored name where JavaScript's app name is expected:
+/// let _ = app::to_js(&[stored]);
+/// ```
+///
+/// The control, which DOES compile — the same name through [`own`]:
+///
+/// ```
+/// use craftworks_sdk::app;
+/// let stored = app::write(Some("notes-app"), "notes").unwrap();
+/// let mine = app::own(Some("notes-app"), &stored).unwrap();
+/// assert_eq!(app::to_js(&[mine]), r#"["notes"]"#);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StoredName(String);
+
+impl StoredName {
+    /// A name read out of the TREE — a key's domain, a range's watch key, a
+    /// schema's domain. Stored by definition: it came from where stored names
+    /// live. Not for anything an app or JavaScript supplied (that goes through
+    /// [`read`] / [`write`], which check and prefix it).
+    pub fn of_tree(name: String) -> StoredName {
+        StoredName(name)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StoredName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for StoredName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A name as the APP writes it — relative to its app; what JavaScript and its
+/// bindings hold. Made ONLY by [`own`], from a stored name. Deliberately NOT
+/// `Deref<str>`, so it is never mistaken for a stored name on the way in either.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AppName(String);
+
+impl AppName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The ONE way names reach JavaScript: a JSON array of app names. A stored
+/// name here is a compile error (see [`StoredName`]).
+pub fn to_js(names: &[AppName]) -> String {
+    serde_json::to_string(&names.iter().map(AppName::as_str).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into())
 }

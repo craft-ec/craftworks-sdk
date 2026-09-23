@@ -628,15 +628,18 @@ fn own_state_changes_name_the_app_relative_domain_its_bindings_are_keyed_by() {
     let mut schema = vec![0u8];
     schema.extend_from_slice(format!("schema\0{app}.notes").as_bytes());
 
+    // App names, as JavaScript holds them (`app::AppName`, sdk#287): read out
+    // as strings to compare.
+    let names = |v: Vec<craftworks_sdk::app::AppName>| v.iter().map(|a| a.as_str().to_string()).collect::<Vec<_>>();
     assert_eq!(
-        D::own_domains_of_keys(Some(app), &[mine.clone(), also_mine.clone(), mine.clone(), theirs.clone(), schema]),
+        names(D::own_domains_of_keys(Some(app), &[mine.clone(), also_mine.clone(), mine.clone(), theirs.clone(), schema])),
         vec!["craftworks.published".to_string(), "notes".to_string()],
         "a tab's own state change did not name the domains its bindings are keyed by (once each, app-relative), or named another app's"
     );
     // THE CONTROL: the stored name is NOT what a binding is keyed by.
-    assert!(!D::own_domains_of_keys(Some(app), std::slice::from_ref(&mine)).contains(&format!("{app}.notes")), "the stored name leaked through");
+    assert!(!names(D::own_domains_of_keys(Some(app), std::slice::from_ref(&mine))).contains(&format!("{app}.notes")), "the stored name leaked through");
     // No app (data from before apps): the name as stored, as `app::own` says.
-    assert_eq!(D::own_domains_of_keys(None, &[record_key("notes", loc)]), vec!["notes".to_string()]);
+    assert_eq!(names(D::own_domains_of_keys(None, &[record_key("notes", loc)])), vec!["notes".to_string()]);
 }
 
 /// **A FORCED write told `Lost` falls, NAMED, and is NOT re-sent** (sdk#235,
