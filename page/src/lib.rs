@@ -1607,12 +1607,12 @@ impl Page {
         self.engine.forced_writes()
     }
 
-    /// Read repairs through parity: `(started, rebuilt, given up)`.
     /// The engine's asks so far, `(wanted, raced)` (sdk#303): a read's cap counts the wanted.
     pub fn fetch_counts(&self) -> (usize, usize) {
         self.engine.fetch_counts()
     }
 
+    /// Read repairs through parity: `(started, rebuilt, given up)`.
     pub fn repair_counts(&self) -> (u64, u64, u64) {
         self.engine.repair_counts()
     }
@@ -1626,14 +1626,14 @@ impl Page {
         self.engine.owed_groups()
     }
 
-    /// Is anything still owed an answer or a re-send — an op in flight, a
-    /// backed-off retry? `false` means this page is at rest until something
-    /// new arrives.
     /// GETs the engine withdrew that this page has not ended yet (sdk#303): 0 after every step.
     pub fn withdrawn(&self) -> usize {
         self.engine.withdrawn_count()
     }
 
+    /// Is anything still owed an answer or a re-send — an op in flight, a
+    /// backed-off retry? `false` means this page is at rest until something
+    /// new arrives.
     pub fn waiting(&self) -> bool {
         !self.deadlines.is_empty()
             || !self.put_again.is_empty()
