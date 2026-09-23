@@ -1959,3 +1959,87 @@ fn a_merge_goes_before_a_later_own_write_and_the_later_value_stands() {
     assert!(superseded.is_empty(), "a key was told superseded by the page's own later write: {superseded:?}");
     assert_eq!(rig.server.page.queue_counts().2, 0, "an impossible transition was counted (the hold was not in place)");
 }
+
+/// **A READ REPAIRS THROUGH PARITY, ON THE PAGE PATH** (Phase 4,
+/// DURABILITY-STATE gap 1; the owner's test: data survives when the nodes
+/// that held it go away). A page writes 6,000 rows and PUTS ITS OWN PARITY;
+/// the node then LOSES blocks of one sibling group; a fresh page reads every
+/// row of the lost leaves through `Page::send`. Three lost: every value right,
+/// rebuilt from the group. A fourth lost: those reads end `Unavailable`.
+#[test]
+fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
+    use freenet_prolly::node::Node as TreeNode;
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let value = |n: u32| format!("value {n}");
+    for b in 0..30u32 {
+        let rows: Vec<(String, String)> = (0..200u32).map(|i| (format!("k/{:06}", b * 200 + i), value(b * 200 + i))).collect();
+        let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+        assert!(published(&states(&rig.client_as(&mut node, &write(u64::from(b) + 1, &ops)), u64::from(b) + 1)), "batch {b} did not publish");
+    }
+    for _ in 0..100 {
+        if rig.server.page.owed_groups() == 0 {
+            break;
+        }
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        rig.run(&mut node);
+    }
+    assert_eq!(rig.server.page.owed_groups(), 0, "the writer's parity never landed");
+    // One level above the leaves, its largest group.
+    let (_, root) = node.head().expect("published");
+    let mut at = root;
+    let (members, parity) = loop {
+        let n = TreeNode::parse(node.blocks.get(&at).expect("held")).expect("a node");
+        assert!(!n.is_leaf(), "one leaf: no groups");
+        if n.level() == 1 {
+            let ids: Vec<Cid> = n.parity().collect();
+            let (g, (_, m)) = freenet_prolly::parity::group_members(&n).into_iter().enumerate().max_by_key(|(_, (_, m))| m.len()).expect("a group");
+            break (m, ids[3 * g..3 * g + 3].to_vec());
+        }
+        at = n.child(0).0;
+    };
+    assert!(members.len() >= 7, "a group of {}", members.len());
+    assert!(parity.iter().all(|p| node.blocks.contains_key(p)), "the writer's parity for the group is not on the node");
+    let keys_of = |node: &Node, leaf: &Cid| -> Vec<Vec<u8>> {
+        let n = TreeNode::parse(node.blocks.get(leaf).expect("held")).expect("a leaf");
+        (0..n.len()).map(|i| n.key(i)).collect()
+    };
+    let three_keys: Vec<Vec<u8>> = members[..3].iter().flat_map(|l| keys_of(&node, l)).collect();
+    let first_leaf_keys = keys_of(&node, &members[0]);
+    // THE NODE LOSES three members of the group.
+    for l in &members[..3] {
+        node.blocks.remove(l);
+    }
+    let mut reader = PageRig::new();
+    reader.session = SESSION + 50;
+    reader.client_as(&mut node, &Request::Identity);
+    let mut req = 1_000u64;
+    let mut read = |reader: &mut PageRig, node: &mut Node, key: &[u8]| -> Option<Reply> {
+        req += 1;
+        let id = req;
+        let rs = reader.client_as(node, &Request::Get { req_id: id, key: key.to_vec() });
+        rs.into_iter().find(|r| matches!(r, Reply::Value { req_id, .. } | Reply::Unavailable { req_id, .. } if *req_id == id))
+    };
+    let mut wrong = Vec::new();
+    for key in &three_keys {
+        let n: u32 = std::str::from_utf8(&key[2..]).expect("utf8").parse().expect("a number");
+        match read(&mut reader, &mut node, key) {
+            Some(Reply::Value { value: Some(v), .. }) if v == value(n).into_bytes() => {}
+            other => wrong.push(format!("{}: {other:?}", String::from_utf8_lossy(key))),
+        }
+    }
+    assert!(wrong.is_empty(), "{} reads wrong with 3 blocks of a group lost: {:?}", wrong.len(), &wrong[..wrong.len().min(3)]);
+    assert!(reader.server.page.repair_counts().1 >= 3, "the lost leaves were not rebuilt: {:?}", reader.server.page.repair_counts());
+    // A FOURTH lost: a fresh page cannot rebuild the group any more.
+    node.blocks.remove(&members[3]);
+    let mut late = PageRig::new();
+    late.session = SESSION + 60;
+    late.client_as(&mut node, &Request::Identity);
+    match read(&mut late, &mut node, &first_leaf_keys[0]) {
+        Some(Reply::Unavailable { .. }) => {}
+        other => panic!("with 4 of a group lost a read answered {other:?}"),
+    }
+    assert!(late.server.page.repair_failed().is_some_and(|w| w.contains("cannot rebuild it")), "{:?}", late.server.page.repair_failed());
+}

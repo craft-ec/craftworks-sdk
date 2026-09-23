@@ -87,6 +87,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod asks;
 pub mod pack;
 pub mod read;
+pub mod repair;
 pub mod subs;
 
 /// Which client a write came from. Two tabs are two clients.
@@ -692,6 +693,10 @@ pub struct Params {
     /// How many times a block is asked for before the read is answered
     /// `Unavailable`. Attempts are RE-ISSUED, not waited on (ARCHITECTURE §7).
     pub max_attempts: u32,
+    /// A block no attempt could fetch is REBUILT from its sibling group
+    /// (`repair`: any k of the group's k+3, verified by hash) before its read
+    /// is answered `Unavailable` (Phase 4, gap 1). Off only as the control.
+    pub repair_reads: bool,
     /// Fetch rounds one read may make before it is answered `Unavailable`.
     ///
     /// Bounds the read itself, which `max_attempts` cannot: that counts a
@@ -888,6 +893,7 @@ impl Default for Params {
             max_fetch_per_round: 4,
             max_gets_per_request: 64,
             max_attempts: 3,
+            repair_reads: true,
             max_read_rounds: 64,
             share_fetches: true,
             preload_roots: 4,
@@ -979,6 +985,16 @@ pub enum Stage {
 
 /// A write the engine has TAKEN and not yet committed (R-b; COMMIT-LIFE §
 /// A write's stage in the page's queue).
+/// A block being rebuilt from its group (`repair`): what is held of the
+/// group, and how many times each block still missing has been asked for.
+#[derive(Clone, Debug)]
+struct Repair {
+    group: repair::Group,
+    have: BTreeMap<usize, Vec<u8>>,
+    asked: BTreeMap<usize, u32>,
+    failed: BTreeSet<usize>,
+}
+
 /// One of a merge's writes for [`Engine::merge_front`]: its id, ops and reads.
 pub type MergeWrite = (WriteId, Vec<(Vec<u8>, Op)>, Vec<(Vec<u8>, Expect)>);
 
@@ -1161,6 +1177,15 @@ pub struct Engine<B: Blocks> {
     /// Blocks handed to this engine during the CURRENT call, and dropped when
     /// it ends (sdk#34). Never in the context — see [`WithEmptyLeaf::arrived`].
     arrived: BTreeMap<Cid, Vec<u8>>,
+    /// Blocks being REBUILT from their groups, by the block's id (`repair`).
+    repairs: BTreeMap<Cid, Repair>,
+    /// Which repairs a group block is being fetched for.
+    repair_slots: BTreeMap<Cid, BTreeSet<Cid>>,
+    /// Repairs started, finished (verified, kept), and given up.
+    repair_counts: (u64, u64, u64),
+    /// Why the last repair was given up, in words (the read is answered
+    /// `Unavailable` naming the block; this says why the group could not).
+    repair_failed: Option<String>,
     params: Params,
     /// The warm tree: every block this engine has written. In slice 1 it is
     /// also the only place they exist, because there is no node yet.
@@ -1417,6 +1442,10 @@ impl<B: Blocks> Engine<B> {
             empty,
             blocks,
             arrived: BTreeMap::new(),
+            repairs: BTreeMap::new(),
+            repair_slots: BTreeMap::new(),
+            repair_counts: (0, 0, 0),
+            repair_failed: None,
             root,
             published_seq: 0,
             published_root: root,
@@ -1623,6 +1652,16 @@ impl<B: Blocks> Engine<B> {
     /// Writes told `Published` by a no-op group (see the field).
     pub fn noop_published(&self) -> u64 {
         self.noop_published
+    }
+
+    /// Read repairs through parity: `(started, rebuilt, given up)`.
+    pub fn repair_counts(&self) -> (u64, u64, u64) {
+        self.repair_counts
+    }
+
+    /// Why the last read repair was given up, if one was.
+    pub fn repair_failed(&self) -> Option<&str> {
+        self.repair_failed.as_deref()
     }
 
     pub fn landed_by_witness(&self) -> u64 {
@@ -4407,6 +4446,11 @@ fn batch_of(ops: &[(Vec<u8>, Op)]) -> Vec<(Vec<u8>, TreeEdit)> {
         .collect()
 }
 
+/// A block id's first bytes, for a message.
+fn short_id(id: &Cid) -> String {
+    id.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
 fn kind_raw() -> u8 {
     freenet_prolly::kind::RAW
 }
@@ -4420,10 +4464,19 @@ impl<B: Blocks> Engine<B> {
     /// node that sends rubbish must not be able to break a reader that asked
     /// for something real.
     fn on_arrived(&mut self, id: Cid, bytes: Vec<u8>) -> Vec<Effect> {
-        if !read::matches_id(&id, &bytes) {
-            return self.on_missed(id);
-        }
+        // A block of a group being repaired (a parity block among them, which
+        // no read asks for by itself).
         let mut out = Vec::new();
+        if self.repair_slots.contains_key(&id) {
+            out.extend(self.on_repair_block(id, Some(&bytes)));
+            if !self.reads.waiting.contains_key(&id) {
+                return out;
+            }
+        }
+        if !read::matches_id(&id, &bytes) {
+            out.extend(self.on_missed(id));
+            return out;
+        }
         let mut landed: Vec<Cid> = vec![id];
         // A pack carries many blocks, and one fetch of it can answer several
         // parked reads at once. Its members are checked the same way: a pack
@@ -4494,6 +4547,15 @@ impl<B: Blocks> Engine<B> {
     /// never answers is indistinguishable from a wedged node, and the caller
     /// can do nothing about either.
     fn on_missed(&mut self, id: Cid) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if self.repair_slots.contains_key(&id) {
+            out.extend(self.on_repair_block(id, None));
+        }
+        out.extend(self.on_missed_parked(id));
+        out
+    }
+
+    fn on_missed_parked(&mut self, id: Cid) -> Vec<Effect> {
         // A miss is the round the parked write spent. Re-ask rather than wait:
         // the same block may be held by the time the next call runs, and the
         // round bound is what stops this, not the node's willingness to answer.
@@ -4532,7 +4594,24 @@ impl<B: Blocks> Engine<B> {
             self.reads.fetches += 1;
             return vec![Effect::FetchBlock { id, via, attempt }];
         }
-        // Out of attempts. Everyone waiting on this block is told, once.
+        // Out of attempts. Before anyone is told: REBUILD it from its group
+        // (Phase 4, gap 1). The readers keep waiting on it; a verified
+        // rebuild lands exactly like an arrival.
+        if self.params.repair_reads && !self.repairs.contains_key(&id) {
+            let roots: Vec<Cid> = reqs.iter().filter_map(|r| self.reads.parked.get(r).map(|p| p.root)).collect();
+            let group = roots.into_iter().find_map(|root| repair::find_group(&self.source(), root, id));
+            if let Some(group) = group {
+                return self.start_repair(group);
+            }
+        }
+        self.fail_waiting(id)
+    }
+
+    /// Everyone waiting on `id` is told, once: it could not be had.
+    fn fail_waiting(&mut self, id: Cid) -> Vec<Effect> {
+        let Some(reqs) = self.reads.waiting.get(&id).cloned() else {
+            return Vec::new();
+        };
         self.reads.waiting.remove(&id);
         self.reads.attempts.remove(&id);
         let mut out = Vec::new();
@@ -4548,6 +4627,124 @@ impl<B: Blocks> Engine<B> {
             }
         }
         out
+    }
+
+    /// Start rebuilding `group.missing`: what is held already counts, and
+    /// every other block of the group is asked for at once (the first `k` to
+    /// arrive are enough), through the same `FetchBlock` as any read.
+    fn start_repair(&mut self, group: repair::Group) -> Vec<Effect> {
+        self.repair_counts.0 += 1;
+        let missing = group.missing;
+        let mut r = Repair { group, have: BTreeMap::new(), asked: BTreeMap::new(), failed: BTreeSet::new() };
+        let mut out = Vec::new();
+        for i in 0..r.group.slots.len() {
+            if i == r.group.missing_ix {
+                continue;
+            }
+            let slot = r.group.slots[i];
+            match self.source().get(&slot) {
+                Some(b) if r.group.fits(i, b) => {
+                    r.have.insert(i, r.group.stored(i, b));
+                }
+                _ => {
+                    r.asked.insert(i, 0);
+                    self.repair_slots.entry(slot).or_default().insert(missing);
+                    self.reads.fetches += 1;
+                    out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 0 });
+                }
+            }
+        }
+        self.repairs.insert(missing, r);
+        out.extend(self.try_repair(missing));
+        out
+    }
+
+    /// A group block came back (`Some`, hash-checked here against its slot)
+    /// or an attempt at it ended empty (`None`).
+    fn on_repair_block(&mut self, slot: Cid, bytes: Option<&[u8]>) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let for_: Vec<Cid> = self.repair_slots.get(&slot).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        let mut refetch = false;
+        for missing in for_ {
+            let Some(r) = self.repairs.get_mut(&missing) else { continue };
+            let Some(i) = r.group.slots.iter().position(|s| *s == slot) else { continue };
+            match bytes {
+                Some(b) if r.group.fits(i, b) => {
+                    let st = r.group.stored(i, b);
+                    r.have.insert(i, st);
+                    r.asked.remove(&i);
+                }
+                _ => {
+                    let n = r.asked.entry(i).or_insert(0);
+                    *n += 1;
+                    if *n < self.params.max_attempts {
+                        refetch = true;
+                    } else {
+                        r.asked.remove(&i);
+                        r.failed.insert(i);
+                    }
+                }
+            }
+            out.extend(self.try_repair(missing));
+        }
+        if refetch && self.repair_slots.contains_key(&slot) {
+            self.reads.fetches += 1;
+            out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 1 });
+        } else if !refetch {
+            // Nobody asks for this block any more (it came, or it is spent).
+            if let Some(set) = self.repair_slots.get_mut(&slot) {
+                set.retain(|m| self.repairs.get(m).is_some_and(|r| r.asked.keys().any(|i| r.group.slots[*i] == slot)));
+                if set.is_empty() {
+                    self.repair_slots.remove(&slot);
+                }
+            }
+        }
+        out
+    }
+
+    /// With `k` of the group held, rebuild and VERIFY; with too few left to
+    /// ever reach `k`, give up -- and the readers are told `Unavailable`,
+    /// naming the block, as before repair existed.
+    fn try_repair(&mut self, missing: Cid) -> Vec<Effect> {
+        let Some(r) = self.repairs.get(&missing) else { return Vec::new() };
+        let k = r.group.k;
+        if r.have.len() >= k {
+            let have: Vec<Option<Vec<u8>>> = (0..r.group.slots.len()).map(|i| r.have.get(&i).cloned()).collect();
+            let rebuilt = repair::rebuild(&r.group, &have);
+            self.end_repair(missing);
+            return match rebuilt {
+                Ok(body) => {
+                    self.repair_counts.1 += 1;
+                    // The page KEEPS it (the node lost it; reads go on from
+                    // the page's blocks), and it lands like any arrival.
+                    let mut out = vec![Effect::Keep { id: missing, bytes: body.clone() }];
+                    out.extend(self.on_arrived(missing, body));
+                    out
+                }
+                Err(why) => {
+                    self.repair_counts.2 += 1;
+                    self.repair_failed = Some(format!("block {} could not be repaired: {why}", short_id(&missing)));
+                    self.fail_waiting(missing)
+                }
+            };
+        }
+        let could = r.have.len() + r.asked.len();
+        if could < k {
+            let why = format!("block {} is lost and its group cannot rebuild it: {} of the {k} needed could be had", short_id(&missing), r.have.len());
+            self.end_repair(missing);
+            self.repair_counts.2 += 1;
+            self.repair_failed = Some(why);
+            return self.fail_waiting(missing);
+        }
+        Vec::new()
+    }
+
+    fn end_repair(&mut self, missing: Cid) {
+        self.repairs.remove(&missing);
+        self.repair_slots.retain(|_, set| {
+            set.remove(&missing);
+            !set.is_empty()
+        });
     }
 
     /// Rule 7: preload is advisory and budgeted.

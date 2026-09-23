@@ -1487,6 +1487,16 @@ impl Page {
         self.engine.forced_writes()
     }
 
+    /// Read repairs through parity: `(started, rebuilt, given up)`.
+    pub fn repair_counts(&self) -> (u64, u64, u64) {
+        self.engine.repair_counts()
+    }
+
+    /// Why the last read repair was given up, if one was.
+    pub fn repair_failed(&self) -> Option<&str> {
+        self.engine.repair_failed()
+    }
+
     pub fn owed_groups(&self) -> usize {
         self.engine.owed_groups()
     }
