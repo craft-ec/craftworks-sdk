@@ -27,6 +27,28 @@ use serde_json::{Map, Value};
 use wasm_bindgen::prelude::*;
 
 /// SDK version, so an app can tell which build it loaded.
+/// THE MEANING of a row's state code, from the one owner (`RowState`): is
+/// this row SAVED? True for `CLEAN` and `BACKED_UP`; false for anything else,
+/// a code this build does not know included. An app asks this, never a
+/// string literal of its own (the builder's `=== "CLEAN"` stalled every
+/// publish once the SDK reported `BACKED_UP`).
+#[wasm_bindgen]
+pub fn row_saved(code: &str) -> bool {
+    craftworks_sdk::store::RowState::from_code(code).is_some_and(|s| s.is_settled())
+}
+
+/// Saved AND backed up (its parity on the network).
+#[wasm_bindgen]
+pub fn row_backed_up(code: &str) -> bool {
+    craftworks_sdk::store::RowState::from_code(code).is_some_and(|s| s.is_backed_up())
+}
+
+/// Every row-state code this build can report.
+#[wasm_bindgen]
+pub fn row_states() -> Vec<String> {
+    craftworks_sdk::store::RowState::ALL.iter().map(|s| s.code().to_string()).collect()
+}
+
 #[wasm_bindgen]
 pub fn version() -> String {
     craftworks_sdk::VERSION.to_string()

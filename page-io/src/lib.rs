@@ -50,6 +50,38 @@ pub struct Artefacts {
     pub signer: DelegateKey,
 }
 
+/// What the node's signer said to [`PageIo::ask`]: whose node this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Asked {
+    /// It signs for this Register (instance id): the node holds this key.
+    Register([u8; 32]),
+    /// The signer is there and holds no key.
+    NoKey,
+    /// The node has no signer delegate at all (a node that never opened this
+    /// person's tree): measured on 0.2.136, it answers the request EMPTY.
+    /// In its words, with how many EMPTY answers it took.
+    NoSigner(String),
+    /// The node or the signer refused: in their words.
+    Refused(String),
+    /// Nothing answered within the first request's budget.
+    NotAnswering,
+}
+
+/// What every refusal of a view says first (a reader, `PageIo::reader`).
+pub const READ_ONLY: &str = "read-only: this is a view of somebody's published data, and writing needs write access";
+
+/// MAY THIS PAGE WRITE a head ([`PageIo::may_write`]): the ONE decision
+/// inputs are shown from and writes are refused by (DATA-SOURCE; the
+/// architect's point 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MayWrite {
+    Yes,
+    No(String),
+    /// Cannot be known now (the signer not answered yet, not answering, or
+    /// refused to say): inputs are shown DISABLED, with this reason.
+    Unknown(String),
+}
+
 /// The head subscription as page-io can honestly report it (sdk#259).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadSubscription {
@@ -202,6 +234,14 @@ pub struct PageIo {
     /// node's refusal of the first exchange, in its words; or its re-asks spent.
     refused: Option<String>,
     exhausted: bool,
+    /// [`PageIo::ask`]: this page only ASKS the node's signer which Register
+    /// it holds — nothing is registered, minted or provisioned — and the
+    /// answer ends here ([`Asked`]).
+    asking: bool,
+    asked: Option<Asked>,
+    /// [`PageIo::claim`]: this asked page opens the person's OWN tree after
+    /// all. The answer stays what it was; the page carries on as `begin`'s.
+    claimed: bool,
 }
 
 /// The signer's first request, kept so it can be sent once the registration
@@ -302,6 +342,9 @@ impl PageIo {
             signer_container: None,
             refused: None,
             exhausted: false,
+            asking: false,
+            asked: None,
+            claimed: false,
         }
     }
 
@@ -311,7 +354,7 @@ impl PageIo {
     /// control, which a reader does not have.
     ///
     /// * NO SIGNER, and nothing provisioned or registered on the node: a
-    ///   visitor leaves no trace on the node it reads from beyond the blocks
+    ///   reader leaves no trace on the node it reads from beyond the blocks
     ///   it caches and its subscription to the head.
     /// * The head is read by GET with subscribe (a peered node serves a bare
     ///   GET of a delegate-created register falsely, F55; and the subscription
@@ -339,6 +382,126 @@ impl PageIo {
         io.signer_has_record = Some(true);
         io.server.set_facts(SignerFacts { head_writable: false, head_id: register_id });
         io
+    }
+
+    /// WHOSE NODE IS THIS? Ask the node's EXISTING signer which Register it
+    /// signs for — the same query [`PageIo::begin`] sends, on the same first-
+    /// request clock — WITHOUT registering it first. On the node that holds
+    /// a person's key the answer names their Register; anywhere else the node
+    /// has no such delegate (refused), or it holds no key: either way nothing
+    /// is installed, minted or provisioned, and a reader leaves no trace.
+    /// The answer: [`PageIo::asked`].
+    pub fn ask(&mut self) {
+        self.asking = true;
+        // Not registered by this page, and never will be: the query goes out
+        // at once, and a node without the delegate says so.
+        self.signer_registered = true;
+        self.first = Some(First::Query);
+        self.first_sent = false;
+        self.first_empties = 0;
+        self.first_started = None;
+        self.first_next_at = Ms(0);
+        self.first_gap_ms = page::rto::RTO_INITIAL_MS as u64;
+        self.send_first();
+    }
+
+    /// [`PageIo::ask`]'s answer, once there is one.
+    pub fn asked(&self) -> Option<&Asked> {
+        self.asked.as_ref().filter(|_| self.asking)
+    }
+
+    /// MAY THIS PAGE WRITE `head` (`None`: its OWN tree, a `mine`
+    /// component's)? Derived each time from what this page holds -- the
+    /// signer's answer, the opening -- and kept nowhere else.
+    ///
+    /// A display gate, not the enforcement: the signer refuses to sign for
+    /// anyone else whatever this says, so a wrong answer can only show or hide
+    /// inputs. "Yes" means THIS NODE'S SIGNER SIGNS FOR that head; a keyset
+    /// (a device key among an identity's keys) is Phase 6.
+    pub fn may_write(&self, head: Option<[u8; 32]>) -> MayWrite {
+        if self.read_only {
+            return MayWrite::No(READ_ONLY.into());
+        }
+        let other = |r: &[u8; 32]| MayWrite::No(format!("this node signs for another head ({})", hex(r)));
+        if self.asking() {
+            return match (&self.asked, head) {
+                (None, _) => MayWrite::Unknown("asking this node's signer whose node it is".into()),
+                (Some(Asked::Register(_)), None) => MayWrite::Yes,
+                (Some(Asked::Register(r)), Some(h)) if h == *r => MayWrite::Yes,
+                (Some(Asked::Register(r)), Some(_)) => other(r),
+                // Nothing of this person's here yet: their own tree is made on
+                // first use (a key minted, the head created by the first
+                // write); anyone else's head is not theirs to write.
+                (Some(Asked::NoKey | Asked::NoSigner(_)), None) => MayWrite::Yes,
+                (Some(Asked::NoKey | Asked::NoSigner(_)), Some(_)) => MayWrite::No("this node holds no key for that head".into()),
+                (Some(Asked::Refused(w)), None) => MayWrite::Unknown(w.clone()),
+                (Some(Asked::Refused(w)), Some(_)) => MayWrite::No(w.clone()),
+                (Some(Asked::NotAnswering), _) => MayWrite::Unknown("this node's signer is not answering".into()),
+            };
+        }
+        if let Some(r) = self.refused.as_ref() {
+            return if head.is_none() { MayWrite::Unknown(r.clone()) } else { MayWrite::No(r.clone()) };
+        }
+        if self.exhausted {
+            return MayWrite::Unknown("this node's signer is not answering".into());
+        }
+        if self.provisioned {
+            return match head {
+                None => MayWrite::Yes,
+                Some(h) if h == self.register_id => MayWrite::Yes,
+                Some(_) => other(&self.register_id),
+            };
+        }
+        // Still opening its own tree: a write waits in the engine for the
+        // head, as it always has; another head is not known to be ours yet.
+        match head {
+            None => MayWrite::Yes,
+            Some(_) => MayWrite::Unknown("opening: this node's signer has not said whose node it is yet".into()),
+        }
+    }
+
+    /// Was this page only asked (`ask`), and not (yet) claimed?
+    pub fn asking(&self) -> bool {
+        self.asking && !self.claimed
+    }
+
+    /// OPEN THE PERSON'S OWN TREE ON AN ASKED PAGE (DATA-SOURCE `mine`):
+    /// the same opening as [`PageIo::begin`], from where the answer left it.
+    /// - It signs for a Register: that is this person's tree on this node,
+    ///   opened as it is. Nothing is registered or minted.
+    /// - It holds no key: [`PageIo::needs_key`], and the caller mints one
+    ///   (`provision_with`), as `begin`'s.
+    /// - There is no signer here: it is registered and asked, as `begin`'s.
+    ///
+    /// Refused, not answering, or not answered yet: nothing is claimed, and
+    /// `false` says so. The head itself is created on the first write, by
+    /// the first commit's PUT (as `begin`'s).
+    pub fn claim(&mut self, signer: DelegateContainer) -> bool {
+        if !self.asking() {
+            return self.asking && self.claimed;
+        }
+        match self.asked.clone() {
+            Some(Asked::Register(_)) => {
+                self.claimed = true;
+                self.provisioned = true;
+                self.signer_provisioned();
+                true
+            }
+            Some(Asked::NoKey) => {
+                self.claimed = true;
+                self.needs_key = true;
+                true
+            }
+            Some(Asked::NoSigner(_)) => {
+                self.claimed = true;
+                // The ask's own end (its EMPTY answers) is not opening's.
+                self.exhausted = false;
+                self.signer_registered = false;
+                self.register_signer(signer, First::Query);
+                true
+            }
+            Some(Asked::Refused(_)) | Some(Asked::NotAnswering) | None => false,
+        }
     }
 
     /// OPEN THE PERSON'S OWN TREE (a switch-over blocker): register the signer
@@ -599,6 +762,11 @@ impl PageIo {
                         self.unusable.push(format!("the signer answered its first request EMPTY {} times", self.first_empties));
                         self.first = None;
                         self.exhausted = true;
+                        // Measured on 0.2.136: a node WITHOUT the signer
+                        // delegate answers its request EMPTY — another user's node.
+                        if self.asking() {
+                            self.asked = Some(Asked::NoSigner(format!("no signer on this node: it answered EMPTY {} times", self.first_empties)));
+                        }
                     }
                 }
             }
@@ -628,6 +796,17 @@ impl PageIo {
                     match answer {
                         // `begin`'s question: which Register? Named: open it,
                         // provisioned already. None: the caller mints a key.
+                        // Only ASKED (`ask`): the answer is recorded, and
+                        // nothing is opened, minted or provisioned.
+                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) if self.asking() => {
+                            self.asked = Some(match params {
+                                Some(params) => {
+                                    self.set_register(params);
+                                    Asked::Register(self.register_id)
+                                }
+                                None => Asked::NoKey,
+                            });
+                        }
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => match params {
                             Some(params) => {
                                 self.set_register(params);
@@ -646,6 +825,9 @@ impl PageIo {
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
                             self.refused = Some(format!("the signer refused provisioning: {why:?}"));
                             self.unusable.push(format!("the signer refused provisioning: {why:?}"));
+                        }
+                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Refused(why))) if self.asking() => {
+                            self.asked = Some(Asked::Refused(format!("the signer refused to say which Register it signs for: {why:?}")));
                         }
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Refused(why))) => {
                             self.refused = Some(format!("the signer refused to say which Register it signs for: {why:?}"));
@@ -695,6 +877,9 @@ impl PageIo {
                 if self.first.is_some() {
                     self.first = None;
                     self.refused = Some(format!("the node refused: {}", r.said));
+                    if self.asking() {
+                        self.asked = Some(Asked::Refused(format!("the node refused: {}", r.said)));
+                    }
                 }
                 self.unusable.push(format!("the node refused: {}", r.said))
             }
@@ -750,6 +935,9 @@ impl PageIo {
             self.unusable.push(format!("the signer is not answering: no answer to {what} within {} ms", page::VERIFY_BUDGET_MS));
             self.first = None;
             self.exhausted = true;
+            if self.asking() {
+                self.asked = Some(Asked::NotAnswering);
+            }
             return;
         }
         self.first_gap_ms = (self.first_gap_ms * 2).min(8_000);
@@ -939,4 +1127,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::AskHeld { .. } => "held query",
         Op::PutApp { .. } => "app PUT",
     }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }

@@ -1394,6 +1394,11 @@ impl Page {
         }
     }
 
+    /// What the engine publishes now, as a head.
+    fn engine_published(&self) -> (u64, Cid) {
+        (self.engine.published_seq(), self.engine.published_root())
+    }
+
     /// An owed head is LIVE only while it is ahead of what the engine has
     /// published. Once the engine adopts another head (a conflict, a recovery
     /// read), the commit that owed it is dead — its writes were told `Lost` —
@@ -1405,6 +1410,8 @@ impl Page {
     }
 
     fn drop_dead_head(&mut self) {
+        // Also dead: a head whose commit was built on a root the engine no
+        // longer publishes (a foreign winner adopted under it).
         let published = self.engine_published();
         if self.owed.as_ref().is_some_and(|o| o.seq <= published.0 || (o.seq - 1, o.base) != published) {
             self.owed = None;

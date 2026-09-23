@@ -1,0 +1,8 @@
+{
+  "note": "tools/dup-gate.mjs (craftworks-sdk#320): production Rust and the JS the package ships. Tests are out of scope.",
+  "dirs": ["src", "engine/src", "page/src", "page-io/src", "protocol/src", "wire/src", "web/src", "signer/src", "signer-proto/src", "contract-keys/src", "testkit/src", "probe/src", "probe-delegate/src", "js"],
+  "formats": "rust:rs;javascript:js,mjs",
+  "ignore": ["**/target/**", "**/node_modules/**", "**/pkg/**", "js/rto.js"],
+  "minTokens": 50,
+  "baseline": "dup-baseline.json"
+}
