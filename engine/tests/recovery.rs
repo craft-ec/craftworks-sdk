@@ -45,7 +45,12 @@ enum Cut {
     AfterAllPacks,
     AfterHeadEmitted,
     AfterHeadConfirmed,
-    MidParity,
+    /// SAVED, not BACKED_UP (race put, COMMIT-LIFE §P): the head is signed
+    /// and confirmed while some of the commit's PARITY was never acked, and
+    /// the engine is dropped then. Before §P this was "mid-parity", reached
+    /// by ticking; parity now goes with the data, so it is reached by
+    /// withholding parity acks.
+    SavedNotBackedUp,
 }
 
 const CUTS: [Cut; 6] = [
@@ -54,7 +59,7 @@ const CUTS: [Cut; 6] = [
     Cut::AfterAllPacks,
     Cut::AfterHeadEmitted,
     Cut::AfterHeadConfirmed,
-    Cut::MidParity,
+    Cut::SavedNotBackedUp,
 ];
 
 fn boot(net: &Network, params: Params) -> Engine<Store> {
@@ -154,12 +159,21 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
 
             // Drive the commit, cutting where the case says.
             let mut packs_confirmed = 0usize;
+            let mut withheld_parity = 0usize;
             let mut dropped = false;
             let mut guard = 0;
             while let Some(f) = queue.pop() {
                 guard += 1;
                 assert!(guard < 200_000, "commit {commit} did not settle");
                 match f {
+                    // SavedNotBackedUp: the commit's parity is lost with the
+                    // engine -- never acked. The head still signs (every
+                    // group's members are in: k of k+3).
+                    Effect::PutBlock { id, ref bytes, .. }
+                        if cutting && *cut == Cut::SavedNotBackedUp && freenet_prolly::block_id(freenet_prolly::kind::PARITY, bytes) == id =>
+                    {
+                        withheld_parity += 1;
+                    }
                     Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
                         net.confirm(id, &bytes);
                         let out = stepped!(e, Event::PutConfirmed(id));
@@ -197,35 +211,10 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             dropped = true;
                             break;
                         }
-                        // Parity goes out on a tick, once a group has
-                        // settled, so reaching the mid-parity boundary means
-                        // ticking here. Breaking out first is why the
-                        // boundary counter reported five of six.
-                        if cutting && *cut == Cut::MidParity {
+                        if cutting && *cut == Cut::SavedNotBackedUp {
+                            assert!(withheld_parity > 0, "{cut:?}: the commit put no parity, so there was nothing to lose with the engine");
                             published.extend(will_publish.iter().cloned());
                             accepted_only.remove(&wid);
-                            let mut parity: Vec<(Cid, Vec<u8>)> = Vec::new();
-                            for _ in 0..3 {
-                                clock += 1;
-                                for f in stepped!(e, Event::Tick(clock)) {
-                                    if let Effect::PutParity { id, bytes, .. } = f {
-                                        parity.push((id, bytes));
-                                    }
-                                }
-                            }
-                            assert!(
-                                parity.len() >= 2,
-                                "{cut:?}: only {} parity block(s) were offered, so \
-                                 there is no mid-point to cut at",
-                                parity.len()
-                            );
-                            // Half of it lands; the rest is lost with the
-                            // engine. Redundancy is not correctness: the tree
-                            // must still read.
-                            for (id, bytes) in parity.iter().take(parity.len() / 2) {
-                                net.confirm(*id, bytes);
-                                let _ = stepped!(e, Event::PutConfirmed(*id));
-                            }
                             dropped = true;
                             break;
                         }
