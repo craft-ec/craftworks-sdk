@@ -687,3 +687,82 @@ fn the_signer_names_the_register_it_signs_for_and_only_with_a_key() {
     orphan.secrets.insert(REGISTER_PARAMS.to_vec(), w.params.clone());
     assert_eq!(serve(&mut orphan, &encode_request(7, &Request::Register)), Answer::Register { params: None }, "params with no key named a Register");
 }
+
+// ---- SignSite (builder#117): a site's version, signed per label, never from a served app ----
+
+fn site(w: &mut World, origin: Origin, app: &str, version: u64, bundle: u8) -> Answer {
+    serve_from(
+        &mut w.host,
+        &encode_request(40, &Request::SignSite { app: app.into(), version, bundle: [bundle; 32] }),
+        origin,
+    )
+    .answer
+}
+
+/// The builder signs a site version: the Register's own record, `(seq = version, value = the bundle's hash)`,
+/// under this signer's key and the label `site:<app>` — exactly the site contract's metadata.
+#[test]
+fn the_builder_signs_a_site_version_as_the_registers_record_under_the_site_label() {
+    let mut w = World::new();
+    let Answer::Signed(state) = site(&mut w, Origin::Unattested, "notes", 1, 0xab) else { panic!("not signed") };
+    let (seq, value) = contract_keys::register::record_of(&state).expect("a Register state");
+    assert_eq!((seq, value), (1, [0xab; 32].as_slice()), "the version or the bundle is not what was asked");
+    let params = site_params(&w.params, "notes").expect("site params");
+    assert!(params.ends_with(b"site:notes") && params.starts_with(&w.params[..37]), "not this key's site params");
+    let again = contract_keys::register::head_state(&params, &[7u8; 32], 1, &[0xab; 32]).expect("signs");
+    assert_eq!(state, again, "not signed under the site params by this signer's key");
+}
+
+/// RULE 13 until single sign-on: a SERVED APP may not sign its owner's site — refused by name, nothing recorded.
+#[test]
+fn a_served_app_is_refused_a_site_signature_and_nothing_is_recorded() {
+    let mut w = World::new();
+    assert_eq!(site(&mut w, Origin::WebApp, "notes", 1, 1), Answer::Refused(Why::FromApp));
+    assert_eq!(w.host.get_secret(&site_record_key("notes")), None, "a refused request left a record");
+    assert!(matches!(site(&mut w, Origin::Unattested, "notes", 1, 1), Answer::Signed(_)), "THE CONTROL: the builder is refused too");
+}
+
+/// Never two bundles at one version, and an answer the page can act on (architect, #117: no livelock): the same
+/// version and bundle return the same bytes; another bundle, or an older version, says what was recorded.
+#[test]
+fn a_site_is_signed_only_after_its_last_version_and_says_what_was_recorded() {
+    let mut w = World::new();
+    let Answer::Signed(v1) = site(&mut w, Origin::Unattested, "notes", 1, 1) else { panic!() };
+    assert_eq!(site(&mut w, Origin::Unattested, "notes", 1, 1), Answer::AlreadySigned(v1), "a re-ask did not get its own bytes");
+    assert_eq!(site(&mut w, Origin::Unattested, "notes", 1, 2), Answer::Refused(Why::SiteNotNext { recorded: 1 }), "two bundles signed at one version");
+    assert!(matches!(site(&mut w, Origin::Unattested, "notes", 2, 2), Answer::Signed(_)), "recorded + 1 was refused");
+    assert_eq!(site(&mut w, Origin::Unattested, "notes", 1, 3), Answer::Refused(Why::SiteNotNext { recorded: 2 }), "an older version was signed");
+    assert_eq!(site(&mut w, Origin::Unattested, "notes", 0, 3), Answer::Refused(Why::NotSuccessor));
+    // Skipping ahead is fine: versions only order.
+    assert!(matches!(site(&mut w, Origin::Unattested, "notes", 9, 4), Answer::Signed(_)));
+}
+
+/// One record PER LABEL: one app's versions do not guard another's.
+#[test]
+fn each_site_label_has_its_own_record() {
+    let mut w = World::new();
+    assert!(matches!(site(&mut w, Origin::Unattested, "one", 5, 1), Answer::Signed(_)));
+    assert!(matches!(site(&mut w, Origin::Unattested, "two", 1, 1), Answer::Signed(_)), "another app's version 5 blocked this one's version 1");
+}
+
+#[test]
+fn a_bad_app_id_and_an_unprovisioned_signer_are_refused_by_name() {
+    let mut w = World::new();
+    for bad in ["", "Notes", "a.b", "x/y", &"a".repeat(33)] {
+        assert_eq!(site(&mut w, Origin::Unattested, bad, 1, 1), Answer::Refused(Why::BadAppId), "{bad:?}");
+    }
+    let mut empty = Mem::default();
+    let a = serve_from(&mut empty, &encode_request(1, &Request::SignSite { app: "notes".into(), version: 1, bundle: [1; 32] }), Origin::Unattested).answer;
+    assert_eq!(a, Answer::Refused(Why::NotProvisioned));
+}
+
+/// The node's entry (`delegate.rs`, wasm only) PASSES the origin the node attests: read from its source, because
+/// it cannot be built natively. With its control: the reader finds the real call.
+#[test]
+fn the_nodes_entry_passes_the_attested_origin() {
+    let src = include_str!("../src/delegate.rs");
+    let code: String = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    assert!(code.contains("serve_from(") && !code.contains("serve_full("), "the node's entry does not pass the origin: {code}");
+    assert!(code.contains("Some(MessageOrigin::WebApp(_)) => crate::Origin::WebApp"), "a served app is not named as one");
+    assert!(code.contains("fn process("), "THE CONTROL: the reader did not find the entry");
+}

@@ -159,9 +159,25 @@ pub struct Served {
     pub puts: Puts,
 }
 
+/// WHO IS ASKING, as the node attests it: a SERVED APP (`WebApp`) or anything else (the builder's page, a native
+/// tool: unattested). Only `SignSite` consults it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A web app the node serves (freenet's `MessageOrigin::WebApp`).
+    WebApp,
+    /// Not a served app: the builder's own page, or a native tool.
+    Unattested,
+}
+
 /// One request, answered: `serve_full` without the puts or the id. What every non-`PutBlocks` request needs.
 pub fn serve<H: Host>(host: &mut H, request: &[u8]) -> Answer {
     serve_full(host, request).answer
+}
+
+/// [`serve_from`] for an UNATTESTED caller: the builder's page and the native fixtures that stand in for it. The
+/// node's own entry (`delegate.rs`) never uses this: it passes the origin the node attests.
+pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
+    serve_from(host, request, Origin::Unattested)
 }
 
 /// The bytes the entry sends back for a served request: its answer, under ITS id.
@@ -170,8 +186,8 @@ pub fn reply(served: &Served) -> Vec<u8> {
 }
 
 /// One request, served: gather the facts, decide, and -- on `Sign` -- sign, save the record, reply; on `PutBlocks`
-/// name each block's contract and hand the entry the PUTs.
-pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
+/// name each block's contract and hand the entry the PUTs. `origin` is who asks, as the node attests it.
+pub fn serve_from<H: Host>(host: &mut H, request: &[u8], origin: Origin) -> Served {
     let Some((id, req)) = decode_request(request) else {
         return Served {
             id: request_id(request),
@@ -202,6 +218,7 @@ pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
         Request::Register => Answer::Register {
             params: host.get_secret(KEY).and(host.get_secret(REGISTER_PARAMS)),
         },
+        Request::SignSite { app, version, bundle } => sign_site(host, origin, &app, version, bundle),
     };
     Served {
         id,
@@ -351,6 +368,78 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
                 Answer::Refused(Why::RecordNotSaved)
             }
         }
+    }
+}
+
+/// The record a signer keeps PER SITE: the last version it signed for `site:<app>`, which bundle, and the exact
+/// bytes returned. One per label, so each app's versions are guarded on their own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteRecord {
+    pub version: u64,
+    pub bundle: [u8; 32],
+    pub signed: Vec<u8>,
+}
+
+/// Its secret-store name.
+pub fn site_record_key(app: &str) -> Vec<u8> {
+    [b"signer_site/".as_slice(), app.as_bytes()].concat()
+}
+
+/// The app id rule (the SDK's `app::check`, the site contract's label): 1-32 of `[a-z0-9_-]`.
+pub fn app_id_ok(app: &str) -> bool {
+    (1..=32).contains(&app.len()) && app.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
+
+/// The site's params: this signer's Register params with the label `site:<app>` instead of its own. `None` unless
+/// they are ONE key's (`RG01 ‖ 0 ‖ key ‖ label`): a signer holds one key.
+pub fn site_params(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
+    let head = register_params.get(..4 + 1 + 32)?;
+    (head.starts_with(b"RG01") && head[4] == 0).then(|| [head, b"site:".as_slice(), app.as_bytes()].concat())
+}
+
+/// THE SITE RULE, pure (the head's sign-if-next, per label): sign a version only AFTER the last one signed for
+/// this site; the same version with the same bundle returns the same bytes; anything else says what was
+/// recorded, so the page asks at `recorded + 1` and never loops on a version it cannot get (architect, #117).
+pub fn decide_site(record: Option<&SiteRecord>, version: u64, bundle: &[u8; 32]) -> Result<(), Answer> {
+    if version == 0 {
+        return Err(Answer::Refused(Why::NotSuccessor));
+    }
+    match record {
+        None => Ok(()),
+        Some(r) if version > r.version => Ok(()),
+        Some(r) if version == r.version && &r.bundle == bundle => Err(Answer::AlreadySigned(r.signed.clone())),
+        Some(r) => Err(Answer::Refused(Why::SiteNotNext { recorded: r.version })),
+    }
+}
+
+/// `SignSite`: refused from a served app (rule 13 until single sign-on); then the site rule; then sign, SAVE the
+/// record, and only then reply -- a reply without its record could sign the version again (as `sign`'s order).
+fn sign_site<H: Host>(host: &mut H, origin: Origin, app: &str, version: u64, bundle: [u8; 32]) -> Answer {
+    if origin == Origin::WebApp {
+        return Answer::Refused(Why::FromApp);
+    }
+    if !app_id_ok(app) {
+        return Answer::Refused(Why::BadAppId);
+    }
+    let (Some(key), Some(rparams)) = (host.get_secret(KEY), host.get_secret(REGISTER_PARAMS)) else {
+        return Answer::Refused(Why::NotProvisioned);
+    };
+    let Some(params) = site_params(&rparams, app) else {
+        return Answer::Refused(Why::CannotSign);
+    };
+    let name = site_record_key(app);
+    let record: Option<SiteRecord> = host.get_secret(&name).and_then(|b| bincode::deserialize(&b).ok());
+    if let Err(a) = decide_site(record.as_ref(), version, &bundle) {
+        return a;
+    }
+    let Ok(signed) = contract_keys::register::head_state(&params, &key, version, &bundle) else {
+        return Answer::Refused(Why::CannotSign);
+    };
+    let rec = SiteRecord { version, bundle, signed: signed.clone() };
+    if host.set_secret(&name, &bincode::serialize(&rec).expect("a site record encodes")) {
+        Answer::Signed(signed)
+    } else {
+        Answer::Refused(Why::RecordNotSaved)
     }
 }
 

@@ -28,12 +28,17 @@ impl DelegateInterface for Signer {
     fn process(
         ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _origin: Option<MessageOrigin>,
+        origin: Option<MessageOrigin>,
         inbound: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match inbound {
             InboundDelegateMsg::ApplicationMessage(m) => {
-                let served = crate::serve_full(&mut Ctx(ctx), &m.payload);
+                // WHO ASKS, as the node attests it: a served app is refused a site signature (rule 13).
+                let from = match origin {
+                    Some(MessageOrigin::WebApp(_)) => crate::Origin::WebApp,
+                    _ => crate::Origin::Unattested,
+                };
+                let served = crate::serve_from(&mut Ctx(ctx), &m.payload, from);
                 let mut out = vec![message(crate::reply(&served))];
                 if !served.puts.is_empty() {
                     // `serve_full` checked the code is provisioned before it named a single contract.

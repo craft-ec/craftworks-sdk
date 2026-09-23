@@ -90,6 +90,17 @@ pub enum Why {
     /// The value to sign carries a ledger that is not the format ([`head::check`]): nothing is signed, because a
     /// malformed ledger, once signed, degrades every reader's merge for that head's life and nobody is told.
     BadLedger,
+    /// `SignSite` from a SERVED APP (a `WebApp` origin): only the builder signs a site, so no app republishes
+    /// its owner's site (rule 13; single sign-on replaces this in Phase 6). Appended LAST.
+    FromApp,
+    /// `SignSite` for a name that is not an app id (`app::check`: 1-32 of `[a-z0-9_-]`).
+    BadAppId,
+    /// `SignSite` at a version this signer already passed, or already signed with ANOTHER bundle: it signs only
+    /// after `recorded` (ask again at `recorded + 1`). Never two bundles at one version: a device does not fork
+    /// its own site.
+    SiteNotNext {
+        recorded: u64,
+    },
 }
 
 /// What the signer answers. See `signer::decide` for the rule behind `Signed` / `NotNext` / `AlreadySigned`.
@@ -159,6 +170,14 @@ pub enum Request {
     /// nothing; answers [`Answer::Register`]. The key itself never leaves the signer. Appended LAST, so every earlier
     /// request keeps its encoding.
     Register,
+    /// SIGN A SITE VERSION (builder#117): the site contract's metadata for app `app` at `version`, naming the web
+    /// bundle whose blake3 is `bundle` -- the Register's own record encoding, under this signer's key and the label
+    /// `site:<app>`. Answers `Signed(state)` / `AlreadySigned(state)` / `Refused(..)`. Appended LAST.
+    SignSite {
+        app: String,
+        version: u64,
+        bundle: [u8; 32],
+    },
 }
 
 fn encode<T: Serialize>(t: &T) -> Vec<u8> {
