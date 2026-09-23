@@ -74,6 +74,27 @@ fn define_never_provisions_and_a_views_define_queues_nothing() {
     }
 }
 
+/// NOT DECIDED YET IS NOT "NO" (#342; rule 8): before the node's signer has
+/// answered -- asking, or silent -- a define and a data write are told
+/// `NotDecided` (engine-db waits on it and asks again), never refused. The
+/// refusal branches are for ANSWERS only. Mutant (Undecided refused like
+/// Unknown) red here; page-io's classification (asking / silent = Undecided,
+/// a real refusal = Unknown) is `may_write_is_one_decision_read_from_the_signers_answer`,
+/// and the wait is engine-db.test.mjs "NOT DECIDED YET waits…".
+#[test]
+fn not_decided_waits_and_is_never_refused() {
+    let d = body_of("define");
+    let wait = d.find("MayWrite::Undecided").unwrap_or_else(|| panic!("`define` does not wait on an undecided signer:\n{d}"));
+    let refuse = d.find("MayWrite::No").unwrap_or_else(|| panic!("`define` has no view door:\n{d}"));
+    assert!(wait < refuse, "`define` reaches a refusal before it waits on an undecided signer:\n{d}");
+    assert!(d[wait..refuse].contains("DbError::NotDecided("), "`define` does not answer NotDecided while undecided:\n{d}");
+    assert!(!d[refuse..].contains("Undecided"), "`define` refuses an undecided signer:\n{d}");
+    let w = body_of("writable");
+    assert!(w.contains("MayWrite::Undecided(why) => Err(db_err(&DbError::NotDecided(why)))"), "`writable` does not wait on an undecided signer:\n{w}");
+    let refusing = w.lines().find(|l| l.contains("DbError::Refused(")).unwrap_or("");
+    assert!(!refusing.contains("Undecided"), "`writable` refuses an undecided signer: {refusing}");
+}
+
 /// `openOwn` resolves at once: nothing waits on a provisioning that, for a
 /// user with no tree yet, only their first write starts.
 #[test]

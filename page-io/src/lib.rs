@@ -77,9 +77,14 @@ pub const READ_ONLY: &str = "read-only: this is a view of somebody's published d
 pub enum MayWrite {
     Yes,
     No(String),
-    /// Cannot be known now (the signer not answered yet, not answering, or
-    /// refused to say): inputs are shown DISABLED, with this reason.
+    /// The signer ANSWERED and did not say yes or no for this head (it
+    /// refused to say, or refused the provisioning): inputs are shown
+    /// DISABLED, with this reason.
     Unknown(String),
+    /// NOT DECIDED YET: the signer has not answered (still asking, or silent
+    /// -- rule 8, silence is not an answer). A write WAITS for the answer;
+    /// inputs are shown disabled meanwhile, with this reason.
+    Undecided(String),
 }
 
 /// The head subscription as page-io can honestly report it (sdk#259).
@@ -421,7 +426,7 @@ impl PageIo {
         let other = |r: &[u8; 32]| MayWrite::No(format!("this node signs for another head ({})", hex(r)));
         if self.asking() {
             return match (&self.asked, head) {
-                (None, _) => MayWrite::Unknown("asking this node's signer whose node it is".into()),
+                (None, _) => MayWrite::Undecided("asking this node's signer whose node it is".into()),
                 (Some(Asked::Register(_)), None) => MayWrite::Yes,
                 (Some(Asked::Register(r)), Some(h)) if h == *r => MayWrite::Yes,
                 (Some(Asked::Register(r)), Some(_)) => other(r),
@@ -432,14 +437,14 @@ impl PageIo {
                 (Some(Asked::NoKey | Asked::NoSigner(_)), Some(_)) => MayWrite::No("this node holds no key for that head".into()),
                 (Some(Asked::Refused(w)), None) => MayWrite::Unknown(w.clone()),
                 (Some(Asked::Refused(w)), Some(_)) => MayWrite::No(w.clone()),
-                (Some(Asked::NotAnswering), _) => MayWrite::Unknown("this node's signer is not answering".into()),
+                (Some(Asked::NotAnswering), _) => MayWrite::Undecided("this node's signer is not answering".into()),
             };
         }
         if let Some(r) = self.refused.as_ref() {
             return if head.is_none() { MayWrite::Unknown(r.clone()) } else { MayWrite::No(r.clone()) };
         }
         if self.exhausted {
-            return MayWrite::Unknown("this node's signer is not answering".into());
+            return MayWrite::Undecided("this node's signer is not answering".into());
         }
         if self.provisioned {
             return match head {
@@ -452,7 +457,7 @@ impl PageIo {
         // head, as it always has; another head is not known to be ours yet.
         match head {
             None => MayWrite::Yes,
-            Some(_) => MayWrite::Unknown("opening: this node's signer has not said whose node it is yet".into()),
+            Some(_) => MayWrite::Undecided("opening: this node's signer has not said whose node it is yet".into()),
         }
     }
 

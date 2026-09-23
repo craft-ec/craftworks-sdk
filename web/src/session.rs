@@ -629,7 +629,7 @@ impl Session {
         let (answer, why) = match self.may_write(head) {
             page_io::MayWrite::Yes => ("yes", String::new()),
             page_io::MayWrite::No(w) => ("no", w),
-            page_io::MayWrite::Unknown(w) => ("unknown", w),
+            page_io::MayWrite::Unknown(w) | page_io::MayWrite::Undecided(w) => ("unknown", w),
         };
         serde_json::json!({ "answer": answer, "why": why }).to_string()
     }
@@ -723,6 +723,11 @@ impl Session {
         // the same app); any other is a write, refused. The schema is READ
         // through the same decision, so an unloaded one parks, never "none".
         self.write_name(domain)?;
+        // NOT DECIDED YET is not "no" (rule 8): the define WAITS for the
+        // signer's answer, then takes the answered branch.
+        if let page_io::MayWrite::Undecided(why) = self.may_write("") {
+            return Err(db_err(&DbError::NotDecided(why)));
+        }
         if let page_io::MayWrite::No(why) | page_io::MayWrite::Unknown(why) = self.may_write("") {
             let name = self.read_name(domain)?;
             let r = self.db.schema(&name).and_then(|old| match old {
@@ -1277,7 +1282,7 @@ impl Session {
     /// THE DECISION, page-io's (`PageIo::may_write`): `head` in hex, or "" for
     /// this session's own tree. No page yet: not known.
     fn may_write(&self, head: &str) -> page_io::MayWrite {
-        let Some(p) = self.page() else { return page_io::MayWrite::Unknown("this session is not open on a node yet".into()) };
+        let Some(p) = self.page() else { return page_io::MayWrite::Undecided("this session is not open on a node yet".into()) };
         if head.is_empty() {
             return p.may_write(None);
         }
@@ -1295,6 +1300,8 @@ impl Session {
         self.claim_own();
         match self.may_write("") {
             page_io::MayWrite::Yes => Ok(()),
+            // Not decided yet: the write WAITS for the answer (rule 8).
+            page_io::MayWrite::Undecided(why) => Err(db_err(&DbError::NotDecided(why))),
             page_io::MayWrite::No(why) | page_io::MayWrite::Unknown(why) => Err(db_err(&DbError::Refused(why))),
         }
     }

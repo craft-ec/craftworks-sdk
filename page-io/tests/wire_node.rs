@@ -1295,6 +1295,7 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     let yes = |m: page_io::MayWrite| m == Yes;
     let no = |m: page_io::MayWrite| matches!(m, No(_));
     let unknown = |m: page_io::MayWrite| matches!(m, Unknown(_));
+    let undecided = |m: page_io::MayWrite| matches!(m, page_io::MayWrite::Undecided(_));
     let stranger = [0xAB; 32];
     let mut now = 1_000;
 
@@ -1303,9 +1304,9 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     let view = reader(&node);
     assert!(no(view.may_write(None)) && no(view.may_write(Some(node.register_id))), "a view may write");
 
-    // ASKED, not answered yet: not known, for any head.
+    // ASKED, not answered yet: NOT DECIDED (a write waits), for any head.
     let io = asker();
-    assert!(unknown(io.may_write(None)) && unknown(io.may_write(Some(stranger))), "an unanswered ask was decided");
+    assert!(undecided(io.may_write(None)) && undecided(io.may_write(Some(stranger))), "an unanswered ask was decided");
 
     // It signs for their Register: that head, and the own tree, yes; another, no.
     let mut node = WireNode::new(&[41u8; 32]);
@@ -1324,12 +1325,12 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
         assert!(no(io.may_write(Some(stranger))), "empty={empty}: a node with no key may write a head");
     }
 
-    // Not answering: not known, for any head.
+    // Not answering: NOT DECIDED (rule 8, silence is not an answer), for any head.
     let mut node = WireNode::new(&[43u8; 32]);
     node.drop_signer_answers = usize::MAX;
     let mut io = asker();
     settle(&mut io, &mut node, &mut now);
-    assert!(unknown(io.may_write(None)) && unknown(io.may_write(Some(node.register_id))), "{:?}", io.asked());
+    assert!(undecided(io.may_write(None)) && undecided(io.may_write(Some(node.register_id))), "{:?}", io.asked());
 
     // Refused by the node: the own tree not known; a named head no.
     let mut node = WireNode::unprovisioned(&[44u8; 32]);
