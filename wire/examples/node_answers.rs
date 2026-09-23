@@ -12,12 +12,10 @@
 use freenet_stdlib::client_api::{ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, ErrorKind, HostResponse, RequestError};
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+    core_types::hex::decode(s).expect("hex")
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
+use core_types::hex::encode as hex;
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();

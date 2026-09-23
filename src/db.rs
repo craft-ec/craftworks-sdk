@@ -293,11 +293,7 @@ impl DbError {
 pub type Result<T> = std::result::Result<T, DbError>;
 
 fn check_domain(d: &str) -> Result<()> {
-    let ok = !d.is_empty()
-        && d.len() <= MAX_DOMAIN
-        && d.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b));
-    if ok {
+    if core_types::name::domain_ok(d, MAX_DOMAIN) {
         Ok(())
     } else {
         Err(DbError::NotDefined(format!(

@@ -1129,6 +1129,4 @@ fn op_name(op: &Op) -> &'static str {
     }
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
+use core_types::hex::encode as hex;

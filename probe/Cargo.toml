@@ -6,6 +6,7 @@ publish = false
 description = "Platform probes against a pinned Freenet: the import gate, and the delegate experiments."
 
 [dependencies]
+core-types = { path = "../core-types" }
 anyhow = "1"
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,9 @@
+[package]
+name = "core-types"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The SDK's layer 0: the basic facts every crate uses (hex, names). No dependencies."
+
+[dependencies]

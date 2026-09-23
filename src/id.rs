@@ -103,14 +103,7 @@ pub fn to_hex(id: &RKey) -> String {
 }
 
 pub fn from_hex(s: &str) -> Option<RKey> {
-    if s.len() != 32 || !s.is_ascii() {
-        return None;
-    }
-    let mut id = [0u8; 16];
-    for (i, b) in id.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(id)
+    core_types::hex::decode_array(s)
 }
 
 /// WHERE a record is, which is not the same as WHAT it is.

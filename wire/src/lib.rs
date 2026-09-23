@@ -367,7 +367,7 @@ pub fn delegate_from_code(wasm: &[u8]) -> (DelegateContainer, DelegateKey) {
 /// by hand in the live driver and would have been written out again in the
 /// page; a second copy is a silent fork of an id.
 pub fn register_params(verifying_key: &[u8; 32], name: &[u8]) -> Vec<u8> {
-    let mut p = Vec::from(*b"RG01");
+    let mut p = Vec::from(*signer_proto::head::RECORD_MAGIC);
     p.push(0u8);
     p.extend_from_slice(verifying_key);
     p.extend_from_slice(name);

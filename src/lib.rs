@@ -70,10 +70,8 @@ pub const BUILD_REV: &str = env!("SDK_BUILD_REV");
 /// The `freenet-prolly` revision this build LINKS, from `Cargo.lock`.
 pub const PROLLY_REV: &str = env!("SDK_PROLLY_REV");
 
-/// Lower-case hex of `bytes`.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+/// Lower-case hex of `bytes` (layer 0's one encoder).
+pub use core_types::hex::encode as hex;
 
 // `cid` and `cid_hex` were here, returning `BLAKE3(bytes)` under a name that
 // reads like an address. Nothing in this crate called them — the tree makes its
@@ -86,9 +84,7 @@ mod tests {
     use super::{BlockId, ContentHash};
 
     fn bytes(input: &str) -> Vec<u8> {
-        (0..input.len() / 2)
-            .map(|i| u8::from_str_radix(&input[i * 2..i * 2 + 2], 16).unwrap())
-            .collect()
+        core_types::hex::decode(input).unwrap()
     }
 
     /// The same vectors are checked from JavaScript (`tests/js/ids.test.cjs`), so

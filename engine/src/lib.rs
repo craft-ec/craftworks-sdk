@@ -4493,9 +4493,9 @@ fn batch_of(ops: &[(Vec<u8>, Op)]) -> Vec<(Vec<u8>, TreeEdit)> {
         .collect()
 }
 
-/// A block id's first bytes, for a message.
-fn short_id(id: &Cid) -> String {
-    id.iter().take(4).map(|b| format!("{b:02x}")).collect()
+/// A block id's first bytes, for a message: the one short form every message uses.
+pub fn short_id(id: &Cid) -> String {
+    core_types::hex::encode(&id[..4])
 }
 
 fn kind_raw() -> u8 {
