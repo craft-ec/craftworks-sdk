@@ -231,6 +231,11 @@ struct Deadline {
     op: Op,
     sent_at: u64,
     attempt: u32,
+    /// `false`: PARKED -- a GET the node answered NotFound (or with bytes
+    /// that are not its id), due to be sent again at `at` on the same
+    /// per-op backoff as a silent one. Not on the wire: it holds no window
+    /// place, and coming due is not a timeout.
+    sent: bool,
 }
 
 /// Which op a deadline is for.
@@ -475,6 +480,9 @@ pub struct Page {
     last_head: Option<HeadRead>,
     /// A PUT to repeat at the next tick (a transient refusal).
     put_again: BTreeMap<Cid, Vec<u8>>,
+    /// Blocks rebuilt from their group and PUT back (sdk#303): sent like a commit's PUT, but answered for NO
+    /// commit -- an answer confirms nothing a commit or a head waits on. Left when a commit puts the same block.
+    repair_puts: BTreeSet<Cid>,
     /// Deadlines of the ops in flight, and each op to re-send.
     /// Every op in flight: when it is due again, the op to re-send, when it
     /// went out and on which attempt (Karn: only an attempt-1 answer samples).
@@ -547,6 +555,7 @@ impl Page {
             last_head_at: 0,
             last_head: None,
             put_again: BTreeMap::new(),
+            repair_puts: BTreeSet::new(),
             deadlines: BTreeMap::new(),
             app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -618,21 +627,36 @@ impl Page {
         let late: Vec<Waiting> =
             self.deadlines.iter().filter(|(_, d)| now >= d.at).map(|(w, _)| w.clone()).collect();
         // RFC 6298 §5.5 — ONCE per tick, however many timed out — and a GET
-        // that timed out halves the window.
-        if !late.is_empty() {
+        // that timed out halves the window. A PARKED GET coming due timed
+        // nothing out: the node answered it.
+        let timed_out = |w: &Waiting| self.deadlines.get(w).is_some_and(|d| d.sent);
+        let (any, a_get) = (late.iter().any(timed_out), late.iter().any(|w| matches!(w, Waiting::Get(_)) && timed_out(w)));
+        if any {
             self.rto.timed_out();
         }
-        if late.iter().any(|w| matches!(w, Waiting::Get(_))) {
+        if a_get {
             self.window.halved();
         }
         for w in late {
             let d = self.deadlines.remove(&w).expect("listed");
+            // A parked GET the engine no longer needs, or that the page now
+            // holds (a repair rebuilt it), ends here.
+            if let Waiting::Get(id) = w {
+                if !d.sent && (self.blocks.get(&id).is_some() || !self.engine.awaits_block(&id)) {
+                    self.attempt_of.remove(&w);
+                    continue;
+                }
+            }
             let op = d.op.clone();
             self.attempt_of.insert(w.clone(), d.attempt);
             match w {
-                // A GET that did not answer is the engine's to re-issue: it
-                // counts attempts and gives up within its own budget.
-                Waiting::Get(id) => self.step(Event::BlockMissed(id)),
+                // A GET nobody answered is SENT AGAIN on the RTO (rule 7),
+                // never turned into a miss: silence is not an answer, and a
+                // miss is what the engine used to count down to
+                // `Unavailable` ("block … could not be had"). The attempt
+                // count carries over, so "not answering for N s" counts
+                // from the first send.
+                Waiting::Get(id) => self.send(Waiting::Get(id), op),
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
                 // A landing's request, or this commit's.
@@ -747,6 +771,10 @@ impl Page {
                     return; // a second answer to a re-sent PUT
                 }
                 self.put_again.remove(&id);
+                // A repaired block's PUT is done: it confirms nothing (the architect's (b)).
+                if self.repair_puts.contains(&id) {
+                    return;
+                }
                 match self.path {
                     PutPath::Page => self.confirm(id),
                     // An answer is not a confirmation on this path: ask.
@@ -780,23 +808,37 @@ impl Page {
                     if let Op::Put { bytes, .. } = op {
                         self.put_again.insert(id, bytes);
                     }
-                } else {
+                } else if !self.repair_puts.contains(&id) {
                     self.step(Event::PutFailed(id));
                 }
             }
             Answer::Got { id, bytes } => {
-                if self.answered(&Waiting::Get(id)).is_none() {
-                    return;
-                }
+                let Some(attempt) = self.answered_get(id) else { return };
                 // Verified BEFORE it joins the page's memory: a block that is
                 // not its id is not kept, and the engine hears a miss.
-                if engine::read::matches_id(&id, &bytes) {
+                let good = engine::read::matches_id(&id, &bytes);
+                if good {
                     self.blocks.insert(id, &bytes);
+                } else {
+                    // Parked BEFORE the engine hears it: the engine re-asks
+                    // inside that step, and must already see the GET pending,
+                    // or the re-ask goes out at once.
+                    self.park_get(id, attempt);
                 }
                 self.step(Event::BlockArrived { id, bytes });
             }
             Answer::GetMissed(id) => {
-                if self.answered(&Waiting::Get(id)).is_some() {
+                if let Some(attempt) = self.answered_get(id) {
+                    // A real answer: the engine hears it (a NotFound starts a
+                    // repair from the block's group), and the block itself is
+                    // asked again on a backoff -- a node that has not got it
+                    // YET is the ordinary case, and one that lost it may have
+                    // it back from a keeper or a late PUT.
+                    // Parked BEFORE the engine hears it: the engine re-asks
+                    // inside that step, and must already see the GET pending,
+                    // or the re-ask goes out at the speed of the answers
+                    // (3,001 GETs in 5 min, measured).
+                    self.park_get(id, attempt);
                     self.step(Event::BlockMissed(id));
                 }
             }
@@ -1247,8 +1289,7 @@ impl Page {
     /// in the window.
     fn send(&mut self, w: Waiting, op: Op) {
         if let Waiting::Get(id) = w {
-            let in_flight = self.deadlines.keys().filter(|k| matches!(k, Waiting::Get(_))).count();
-            if in_flight >= self.window.size() && !self.deadlines.contains_key(&w) {
+            if self.gets_in_flight() >= self.window.size() && !self.deadlines.contains_key(&w) {
                 if !self.get_queue.contains(&id) {
                     self.get_queue.push_back(id);
                 }
@@ -1256,9 +1297,44 @@ impl Page {
             }
         }
         let attempt = self.attempt_of.remove(&w).map_or(1, |a| a + 1);
-        let d = Deadline { at: self.now + self.rto.rto_ms(), op: op.clone(), sent_at: self.now, attempt };
+        // PER-OP backoff on top of the shared RTO (TCP backs off per
+        // segment): the n-th send of one op waits RTO x 2^(n-1), capped at
+        // the RTO's ceiling. The shared RTO alone is pulled back down by every
+        // other op's answers, so an op nobody answers was re-sent at that
+        // small RTO for ever -- thousands of GETs in five minutes (measured
+        // on a silent node once silence stopped ending a read).
+        let d = Deadline { at: self.now + self.backoff(attempt), op: op.clone(), sent_at: self.now, attempt, sent: true };
         self.deadlines.insert(w, d);
         self.out.push(op);
+    }
+
+    /// The wait after the `attempt`-th send of one op: RTO x 2^(attempt-1),
+    /// capped at the RTO's ceiling. THE one backoff of a sent op, silent or
+    /// answered NotFound.
+    fn backoff(&self, attempt: u32) -> u64 {
+        (self.rto.rto_ms() << (attempt - 1).min(16)).min(rto::RTO_MAX_MS as u64)
+    }
+
+    /// GETs on the wire (parked ones are not).
+    fn gets_in_flight(&self) -> usize {
+        self.deadlines.iter().filter(|(k, d)| matches!(k, Waiting::Get(_)) && d.sent).count()
+    }
+
+    /// A GET's answer: [`Page::answered`], and which attempt it answered.
+    fn answered_get(&mut self, id: Cid) -> Option<u32> {
+        let attempt = self.deadlines.get(&Waiting::Get(id))?.attempt;
+        self.answered(&Waiting::Get(id))?;
+        Some(attempt)
+    }
+
+    /// The node ANSWERED a GET without the block (NotFound, or bytes that are
+    /// not its id): the GET stays pending on its own deadline, sent again at
+    /// the same backoff a silent one would be (rule 7: retry until answered),
+    /// never at the speed of the answers.
+    fn park_get(&mut self, id: Cid, attempt: u32) {
+        let at = self.now + self.backoff(attempt);
+        self.attempt_of.insert(Waiting::Get(id), attempt);
+        self.deadlines.insert(Waiting::Get(id), Deadline { at, op: Op::Get { id }, sent_at: self.now, attempt, sent: false });
     }
 
     /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
@@ -1267,10 +1343,10 @@ impl Page {
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
         let d = self.deadlines.remove(w)?;
         self.attempt_of.remove(w);
-        if d.attempt == 1 {
+        if d.sent && d.attempt == 1 {
             self.rto.sample(self.now.saturating_sub(d.sent_at));
         }
-        if matches!(w, Waiting::Get(_)) {
+        if d.sent && matches!(w, Waiting::Get(_)) {
             self.window.opened();
             self.fill_gets();
         }
@@ -1280,8 +1356,7 @@ impl Page {
     /// GETs waiting on the window take the places that are free.
     fn fill_gets(&mut self) {
         while let Some(id) = self.get_queue.front().copied() {
-            let in_flight = self.deadlines.keys().filter(|k| matches!(k, Waiting::Get(_))).count();
-            if in_flight >= self.window.size() {
+            if self.gets_in_flight() >= self.window.size() {
                 break;
             }
             self.get_queue.pop_front();
@@ -1394,6 +1469,32 @@ impl Page {
         }
     }
 
+    /// A GET nobody needs ENDS at once -- its deadline, its re-ask backoff and the engine's entry go together --
+    /// rather than being re-sent at its next timeout for ever (sdk#303):
+    /// * one the engine WITHDREW: a raced group block no read needs once its group resolved;
+    /// * one for a block the page HOLDS: a member rebuilt from its group, which the node never answered.
+    ///
+    /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
+    /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
+    fn end_unneeded_gets(&mut self) {
+        let mut ended = self.engine.take_all_withdrawn();
+        ended.extend(
+            self.deadlines
+                .keys()
+                .filter_map(|w| match w {
+                    Waiting::Get(id) => Some(*id),
+                    _ => None,
+                })
+                .chain(self.get_queue.iter().copied())
+                .filter(|id| self.blocks.get(id).is_some()),
+        );
+        for id in &ended {
+            self.deadlines.remove(&Waiting::Get(*id));
+            self.attempt_of.remove(&Waiting::Get(*id));
+        }
+        self.get_queue.retain(|id| !ended.contains(id));
+    }
+
     /// What the engine publishes now, as a head.
     fn engine_published(&self) -> (u64, Cid) {
         (self.engine.published_seq(), self.engine.published_root())
@@ -1436,6 +1537,15 @@ impl Page {
                 // A queued write's warm-apply block (R-b): kept for reads of
                 // the warm root, never put -- its commit puts the same bytes.
                 Effect::Keep { id, ref bytes } => self.blocks.insert(id, bytes),
+                // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
+                // op, deadline and re-send), unless it is on its way or there already.
+                Effect::PutRepaired { id, ref bytes } => {
+                    self.blocks.insert(id, bytes);
+                    if !self.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.put_again.contains_key(&id) {
+                        self.repair_puts.insert(id);
+                        self.send(Waiting::Put(id), Op::Put { id, bytes: bytes.clone() });
+                    }
+                }
                 Effect::PutPack { id, .. } => {
                     // No packs in this phase, as the shell refuses them.
                     self.unusable.push("a pack was emitted; packs are off in this phase".into());
@@ -1447,6 +1557,13 @@ impl Page {
                         let bytes = self.blocks.get(&id).expect("held").to_vec();
                         let more = self.engine.step(Event::BlockArrived { id, bytes });
                         self.carry_out(more);
+                    } else if self.deadlines.contains_key(&Waiting::Get(id)) || self.get_queue.contains(&id) {
+                        // ONE GET per block while one is out: its answer
+                        // serves every reader, and its re-send is the RTO's
+                        // (with its backoff). A second send here would reset
+                        // that clock -- the engine re-asks on every tick and
+                        // re-descent, so a silent block was re-sent on every
+                        // one of them (2,001 GETs in 5 min, measured).
                     } else {
                         self.send(Waiting::Get(id), Op::Get { id });
                     }
@@ -1456,6 +1573,9 @@ impl Page {
             }
         }
         self.release();
+        // Every engine step's effects come through here, so no GET the engine stopped needing outlives the call
+        // that stopped needing it (sdk#303).
+        self.end_unneeded_gets();
     }
 
     /// Effects whose `after` set is now confirmed go out, in emitted order.
@@ -1471,6 +1591,8 @@ impl Page {
                             let more = self.engine.step(Event::PutConfirmed(id));
                             self.carry_out(more);
                         } else {
+                            // A commit's own now: its answer is the commit's.
+                            self.repair_puts.remove(&id);
                             self.send(Waiting::Put(id), Op::Put { id, bytes });
                         }
                     }
@@ -1506,6 +1628,11 @@ impl Page {
         self.engine.forced_writes()
     }
 
+    /// The engine's asks so far, `(wanted, raced)` (sdk#303): a read's cap counts the wanted.
+    pub fn fetch_counts(&self) -> (usize, usize) {
+        self.engine.fetch_counts()
+    }
+
     /// Read repairs through parity: `(started, rebuilt, given up)`.
     pub fn repair_counts(&self) -> (u64, u64, u64) {
         self.engine.repair_counts()
@@ -1520,11 +1647,19 @@ impl Page {
         self.engine.owed_groups()
     }
 
+    /// GETs the engine withdrew that this page has not ended yet (sdk#303): 0 after every step.
+    pub fn withdrawn(&self) -> usize {
+        self.engine.withdrawn_count()
+    }
+
     /// Is anything still owed an answer or a re-send — an op in flight, a
     /// backed-off retry? `false` means this page is at rest until something
     /// new arrives.
     pub fn waiting(&self) -> bool {
-        !self.deadlines.is_empty() || !self.put_again.is_empty() || self.sign_again.is_some() || !self.held_again.is_empty()
+        !self.deadlines.is_empty()
+            || !self.put_again.is_empty()
+            || self.sign_again.is_some()
+            || !self.held_again.is_empty()
     }
 
     /// Ops to send, in order.
@@ -1723,5 +1858,81 @@ fn answers_a_sign(a: &signer_proto::Answer) -> bool {
             Why::BlockCount { .. } | Why::NotABlock { .. } | Why::KeyAlreadyProvisioned | Why::RegisterChanged
         ),
         A::Provisioned | A::Putting { .. } | A::Put { .. } | A::Held { .. } | A::Register { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod unneeded_gets {
+    use super::*;
+
+    /// A GET still QUEUED for the window when nobody needs it any more is ended with the rest (sdk#303): it never
+    /// goes out. Tested here, on the page's own queue, because no fixture through the public surface leaves a
+    /// block queued at the moment it stops being needed (the window refills before the engine hears the answer
+    /// that ends the need; page/tests/race_get.rs).
+    #[test]
+    fn a_queued_get_nobody_needs_is_ended() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let (held, wanted) = ([1u8; 32], [2u8; 32]);
+        p.blocks.insert(held, b"held");
+        p.get_queue.push_back(held);
+        p.get_queue.push_back(wanted);
+        p.end_unneeded_gets();
+        assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![wanted], "the held block's queued GET was not ended, or the wanted one was");
+    }
+}
+
+#[cfg(test)]
+mod repair_put {
+    use super::*;
+
+    /// A block rebuilt from its group is PUT through the one sender, and its answer is NOBODY's commit (the
+    /// architect's (b) on sdk#331): it confirms nothing a commit or a head's `after` waits on. When a commit puts
+    /// the same block, the answer is the commit's again.
+    #[test]
+    fn a_repair_puts_answer_confirms_nothing() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let (id, bytes) = ([7u8; 32], b"rebuilt".to_vec());
+        p.carry_out(vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
+        let puts: Vec<Op> = p.take_ops().into_iter().filter(|o| matches!(o, Op::Put { .. })).collect();
+        assert_eq!(puts, vec![Op::Put { id, bytes: bytes.clone() }], "the repair was not PUT through the sender");
+        assert!(p.deadlines.contains_key(&Waiting::Put(id)), "the repair PUT has no deadline: it would not be re-sent");
+        p.answer(Answer::PutOk(id), Ms(1));
+        assert!(!p.confirmed.contains(&id), "a repair PUT's answer confirmed the block for the commits");
+        assert!(!p.deadlines.contains_key(&Waiting::Put(id)), "the answered repair PUT is still waiting");
+
+        // The same block, then put by a commit: its answer is the commit's.
+        p.carry_out(vec![Effect::PutBlock { id, bytes: bytes.clone(), after: Vec::new() }]);
+        p.answer(Answer::PutOk(id), Ms(2));
+        assert!(p.confirmed.contains(&id), "a commit's PUT of a once-repaired block was not confirmed");
+    }
+}
+
+#[cfg(test)]
+mod parked_get {
+    use super::*;
+
+    /// A GET the node ANSWERED without the block is PARKED on its own deadline, at the same per-op backoff as a
+    /// silent one (one backoff, `send`'s): not re-sent at once, holding no window place, and not a timeout when
+    /// it comes due. One the engine no longer needs ends there instead of going out again.
+    #[test]
+    fn a_get_answered_notfound_waits_on_its_own_deadline() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let id = [9u8; 32];
+        p.send(Waiting::Get(id), Op::Get { id });
+        assert!(p.take_ops().contains(&Op::Get { id }), "the GET did not go out");
+        p.answer(Answer::GetMissed(id), Ms(10));
+        // After the answer: an attempt-1 answer is an RTO sample, and it opens the window.
+        let (rto_before, window_before) = (p.rto.rto_ms(), p.window.size());
+        let (sent, due) = p.deadlines.get(&Waiting::Get(id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
+        assert!(!sent, "a parked GET counts as on the wire");
+        assert_eq!(due, 10 + p.backoff(1), "parked at a backoff other than send()'s");
+        assert_eq!(p.gets_in_flight(), 0, "a parked GET holds a window place");
+        assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "a NotFound GET was re-sent at once");
+        p.tick(Ms(due));
+        assert_eq!(p.rto.rto_ms(), rto_before, "a parked GET coming due was counted as a timeout");
+        assert_eq!(p.window.size(), window_before, "a parked GET coming due halved the window");
+        // The engine here waits on nothing: the parked GET ends rather than going out.
+        assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
+        assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
     }
 }
