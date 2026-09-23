@@ -676,7 +676,7 @@ impl Session {
     /// side at this moment — every ticket (pinned root, age, end), the page's
     /// waiting ops, the head this page reads at, and what the node answered
     /// for each block a GET waits on.
-    pub fn read_probe(&self) -> String {
+    pub fn read_probe(&mut self) -> String {
         let hx = |c: &[u8]| c[..6].iter().map(|b| format!("{b:02x}")).collect::<String>();
         let (tickets, pinned) = self.db.store().probe();
         let tickets: Vec<serde_json::Value> = tickets
@@ -686,6 +686,7 @@ impl Session {
         let Some(p) = self.page() else {
             return serde_json::json!({"tickets": tickets, "pinned": pinned.map(|r| hx(&r)), "page": null}).to_string();
         };
+        let (win, inflight) = p.server.page.probe_window();
         let (waits, queued) = p.server.page.probe_waits();
         let (seq, root) = p.server.page.published();
         let reg = p.probe_register_id();
@@ -709,6 +710,8 @@ impl Session {
             "answersForWaits": answers,
             "headAnswers": p.probe_answers.get(&reg).copied().unwrap_or_default(),
             "headChanges": p.probe_head_changes,
+            "window": {"size": win, "inflight": inflight},
+            "log": self.page_mut().map(|p| p.server.page.probe_log.drain(..).collect::<Vec<_>>()).unwrap_or_default(),
         })
         .to_string()
     }

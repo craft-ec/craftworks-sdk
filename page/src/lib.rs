@@ -493,6 +493,8 @@ pub struct Page {
     /// The retry clock of every node call (`rto`), and the GET window.
     rto: rto::Rto,
     window: rto::Window,
+    /// SCRATCH PROBE (step-2 diagnosis): send / answered / timeout events.
+    pub probe_log: std::collections::VecDeque<String>,
     /// GETs waiting for a place in the window, in the order asked.
     get_queue: std::collections::VecDeque<Cid>,
     /// The attempt a re-send continues from (set when an op times out).
@@ -560,6 +562,7 @@ impl Page {
             app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
             window: rto::Window::default(),
+            probe_log: std::collections::VecDeque::new(),
             get_queue: Default::default(),
             attempt_of: BTreeMap::new(),
             recover_since: None,
@@ -636,6 +639,10 @@ impl Page {
         }
         if a_get {
             self.window.halved();
+        }
+        for w in &late {
+            let n = self.probe_name(w);
+            self.probe(format!("timeout {n}"));
         }
         for w in late {
             let d = self.deadlines.remove(&w).expect("listed");
@@ -1293,9 +1300,12 @@ impl Page {
                 if !self.get_queue.contains(&id) {
                     self.get_queue.push_back(id);
                 }
+                self.probe(format!("queue {} inflight={} win={}", self.probe_name(&w), self.gets_in_flight(), self.window.size()));
                 return;
             }
         }
+        let attempt = self.attempt_of.get(&w).map_or(1, |a| a + 1);
+        self.probe(format!("send {} att={} inflight={} win={} rto={}", self.probe_name(&w), attempt, self.gets_in_flight(), self.window.size(), self.rto.rto_ms()));
         let attempt = self.attempt_of.remove(&w).map_or(1, |a| a + 1);
         // PER-OP backoff on top of the shared RTO (TCP backs off per
         // segment): the n-th send of one op waits RTO x 2^(n-1), capped at
@@ -1341,7 +1351,11 @@ impl Page {
     /// (Karn: a re-sent call never is), and a GET opens the window. `None`:
     /// nothing was waiting on it.
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
-        let d = self.deadlines.remove(w)?;
+        let Some(d) = self.deadlines.remove(w) else {
+            self.probe(format!("answered-nowait {}", self.probe_name(w)));
+            return None;
+        };
+        self.probe(format!("answered {} att={} after={}ms", self.probe_name(w), d.attempt, self.now.saturating_sub(d.sent_at)));
         self.attempt_of.remove(w);
         if d.sent && d.attempt == 1 {
             self.rto.sample(self.now.saturating_sub(d.sent_at));
@@ -1739,6 +1753,29 @@ impl Page {
             .map(|(w, d)| (name(w), d.attempt, self.now.saturating_sub(d.sent_at), d.sent))
             .collect();
         (waits, self.get_queue.iter().map(short).collect())
+    }
+
+    /// SCRATCH PROBE: log one event, stamped with the page's clock (bounded).
+    fn probe(&mut self, e: String) {
+        if self.probe_log.len() >= 4000 {
+            self.probe_log.pop_front();
+        }
+        self.probe_log.push_back(format!("{} {e}", self.now));
+    }
+
+    fn probe_name(&self, w: &Waiting) -> String {
+        let short = |c: &Cid| c[..6].iter().map(|b| format!("{b:02x}")).collect::<String>();
+        match w {
+            Waiting::Get(c) => format!("Get({})", short(c)),
+            Waiting::Put(c) => format!("Put({})", short(c)),
+            Waiting::Held(c) => format!("Held({})", short(c)),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// SCRATCH PROBE: the GET window: `(size, in flight)`.
+    pub fn probe_window(&self) -> (usize, usize) {
+        (self.window.size(), self.gets_in_flight())
     }
 
     /// SCRATCH PROBE: the full cid of a waited GET, by its short hex.
