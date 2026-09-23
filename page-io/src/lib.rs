@@ -148,6 +148,10 @@ impl HeadSubscription {
 }
 
 pub struct PageIo {
+    /// SCRATCH PROBE (#330 diagnosis): per contract id, what the node
+    /// answered GETs of it: [got, get-failed]; and head changes heard.
+    pub probe_answers: BTreeMap<[u8; 32], [u32; 2]>,
+    pub probe_head_changes: u32,
     pub server: Server,
     art: Artefacts,
     register: ContractContainer,
@@ -303,6 +307,8 @@ impl PageIo {
         register_id.copy_from_slice(&register.key().id().as_bytes()[..32]);
         let register_key = register.key().to_string();
         PageIo {
+            probe_answers: BTreeMap::new(),
+            probe_head_changes: 0,
             server,
             art,
             register,
@@ -366,6 +372,16 @@ impl PageIo {
     ///
     /// `range` (1..=255) is this reader's stream-id range on the socket it
     /// shares: one per tree, so their chunked frames can never be joined.
+    /// SCRATCH PROBE: the contract id a block is asked under.
+    pub fn probe_contract_of(&self, cid: &Cid) -> Option<[u8; 32]> {
+        self.by_contract.iter().find(|(_, c)| *c == cid).map(|(k, _)| *k)
+    }
+
+    /// SCRATCH PROBE: this page's head register id.
+    pub fn probe_register_id(&self) -> [u8; 32] {
+        self.register_id
+    }
+
     pub fn reader(server: Server, block_code: Vec<u8>, register_id: [u8; 32], range: u8) -> PageIo {
         let (_, no_signer) = wire::delegate_from_code(&[]);
         let mut io = PageIo::new(
@@ -693,6 +709,12 @@ impl PageIo {
         let incoming = wire::unframe(&mut self.frames, bytes);
         if !self.owns(&incoming) {
             return false;
+        }
+        match &incoming {
+            Incoming::Got { id, .. } => self.probe_answers.entry(*id).or_default()[0] += 1,
+            Incoming::GetFailed { id } => self.probe_answers.entry(*id).or_default()[1] += 1,
+            Incoming::HeadChanged { .. } => self.probe_head_changes += 1,
+            _ => {}
         }
         match incoming {
             Incoming::Got { id, state } => {

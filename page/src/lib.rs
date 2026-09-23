@@ -1722,6 +1722,33 @@ impl Page {
     }
 
     /// The head the engine last saw published.
+    /// SCRATCH PROBE (#330 regression diagnosis; never committed to a PR):
+    /// every op waiting, `(what, attempt, ms since first sent, on the wire)`,
+    /// and the GETs queued behind the window.
+    pub fn probe_waits(&self) -> (Vec<(String, u32, u64, bool)>, Vec<String>) {
+        let short = |c: &Cid| c[..6].iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let name = |w: &Waiting| match w {
+            Waiting::Get(c) => format!("Get({})", short(c)),
+            Waiting::Put(c) => format!("Put({})", short(c)),
+            Waiting::Held(c) => format!("Held({})", short(c)),
+            other => format!("{other:?}"),
+        };
+        let waits = self
+            .deadlines
+            .iter()
+            .map(|(w, d)| (name(w), d.attempt, self.now.saturating_sub(d.sent_at), d.sent))
+            .collect();
+        (waits, self.get_queue.iter().map(short).collect())
+    }
+
+    /// SCRATCH PROBE: the full cid of a waited GET, by its short hex.
+    pub fn probe_find_cid(&self, short: &str) -> Option<Cid> {
+        self.deadlines.keys().find_map(|w| match w {
+            Waiting::Get(c) if c[..6].iter().map(|b| format!("{b:02x}")).collect::<String>() == short => Some(*c),
+            _ => None,
+        })
+    }
+
     pub fn published(&self) -> (u64, Cid) {
         (self.engine.published_seq(), self.engine.published_root())
     }
