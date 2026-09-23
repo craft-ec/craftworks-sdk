@@ -325,15 +325,20 @@ export async function openSession(Session, {
   // an unopened socket would otherwise be reported as "the signer is not
   // answering" when the node is simply not running (sdk#263 follow-up).
   let everOpened = false;
-  // How many times the socket was REFUSED before it ever opened: a close or
-  // an error with no open behind it. Two of them is a node that is not
-  // there, a fact available in about a second (builder#102's no-node shot).
+  // How many connection ATTEMPTS were refused before any opened. An attempt
+  // ends with exactly one `closed` (connection.js's `onclose`, which also
+  // schedules the next attempt), whether or not an `error` came first — a
+  // refused WebSocket fires BOTH, so counting events would make one refused
+  // attempt look like two, and a builder opened while its node is still
+  // starting would be told "is the node running?" at once. Two refused
+  // ATTEMPTS is a node that is not there, known in about a second
+  // (builder#102's no-node shot).
   let refusedBeforeOpen = 0;
   const conn = connectWith(socketEngine, {
     url: session.url(),
     onEvent: e => {
       if (e.kind === "open") everOpened = true;
-      if (!everOpened && (e.kind === "closed" || e.kind === "error")) refusedBeforeOpen += 1;
+      if (!everOpened && e.kind === "closed") refusedBeforeOpen += 1;
       // A new socket means the stream ids restart, so a half-received
       // chunked reply from the old one must not be completed with bytes
       // from this one.
@@ -511,7 +516,7 @@ export async function openSession(Session, {
     refused: () => session.refused(),
     /** Has a socket to this node EVER opened? See `everOpened`. */
     connectedOnce: () => everOpened,
-    /** Refusals of the socket before it ever opened. See `refusedBeforeOpen`. */
+    /** Refused connection ATTEMPTS before any opened. See `refusedBeforeOpen`. */
     refusedBeforeOpen: () => refusedBeforeOpen,
     /** Which node this session is for, as the page named it. */
     url: () => session.url(),
