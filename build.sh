@@ -59,6 +59,11 @@ cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/arte
 node tools/reachable.mjs pkg/web/index.js pkg/web > /tmp/reach.$$ || {
   echo "pkg/web is not closed under its own imports — see above" >&2; rm -f /tmp/reach.$$; exit 1; }
 echo "pkg/web: $(wc -l < /tmp/reach.$$ | tr -d ' ') modules reachable from index.js, all present"
+# …and NAMED in artefacts.json (`modules`, below), so a consumer that ships the
+# SDK's JS (the builder's published app container) takes this computed list
+# instead of keeping its own: a hand list missed `rto.js` the day it arrived
+# (sdk#312's real-network run: the published app stayed on "Loading…").
+modules_json=$(python3 -c 'import json,sys; print(json.dumps(sorted(l.strip() for l in open(sys.argv[1]) if l.strip())))' /tmp/reach.$$)
 rm -f /tmp/reach.$$
 
 # THE ARTEFACTS THE SDK PROVISIONS WITH.
@@ -172,6 +177,7 @@ cat > pkg/web/artefacts.json <<JSON
   "sdk":      { "file": "craftworks_sdk_bg.wasm", "sha256": "$sdk_hash",
                 "bytes": $(size_of pkg/web/craftworks_sdk_bg.wasm) },
   "container": $container_json,
+  "modules":  $modules_json,
   "webapp":   { "file": "webapp.wasm",          "sha256": "$(hash_of pkg/web/webapp.wasm)",
                 "bytes": $(size_of pkg/web/webapp.wasm) },
   "note": "hashes key the shared artefact cache and are verified before use (sdk#5)"
