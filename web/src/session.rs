@@ -71,6 +71,9 @@ pub struct Session {
     probe_last_define: String,
     /// SCRATCH PROBE: the last reads, `verb domain: outcome` (at most 40).
     probe_reads: Vec<String>,
+    /// SCRATCH PROBE: every claim_own, by caller, with what the signer had
+    /// answered and whether page-io then needed a key.
+    probe_claims: Vec<String>,
 }
 
 #[wasm_bindgen]
@@ -102,6 +105,7 @@ impl Session {
             app: None,
             probe_last_define: String::new(),
             probe_reads: Vec::new(),
+            probe_claims: Vec::new(),
             signer_code: Vec::new(),
             page_identity_sent: false,
             provision_told: false,
@@ -343,6 +347,7 @@ impl Session {
         if !p.needs_key() {
             return;
         }
+        self.probe_claims.push("mint_if_needed: MINTING".into());
         let mut seed = [0u8; 32];
         if getrandom::getrandom(&mut seed).is_err() {
             self.unusable.push("no randomness to mint a key".into());
@@ -648,7 +653,11 @@ impl Session {
     /// (`mint_if_needed`), the head created by that write. Answers
     /// `can_write("")`. A session opened with `provision` is open already.
     pub fn open_own(&mut self) -> String {
+        let asked = format!("{:?}", self.page().and_then(|p| p.asked().cloned()));
+        let stack = js_sys::Reflect::get(&js_sys::Error::new(""), &"stack".into()).ok().and_then(|v| v.as_string()).unwrap_or_default().chars().take(900).collect::<String>();
+        self.probe_claims.push(format!("open_own called; asked={}; js stack: {stack}", asked.chars().take(60).collect::<String>()));
         if self.page().is_some_and(|p| matches!(p.asked(), Some(page_io::Asked::Register(_)))) {
+            self.probe_claims.push("open_own -> claim_own".into());
             self.claim_own();
         }
         self.can_write("")
@@ -711,6 +720,7 @@ impl Session {
         let (seq, root) = p.server.page.published();
         let reg = p.probe_register_id();
         let p_reg_hex = reg.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let p_asked = format!("{:?}", p.asked()).chars().take(80).collect::<String>();
         let mut answers = serde_json::Map::new();
         for (w, ..) in &waits {
             if let Some(h) = w.strip_prefix("Get(").and_then(|x| x.strip_suffix(')')) {
@@ -736,6 +746,8 @@ impl Session {
             "lastDefine": self.probe_last_define,
             "registerId": p_reg_hex,
             "reads": std::mem::take(&mut self.probe_reads),
+            "claims": self.probe_claims.clone(),
+            "asked": p_asked,
             "log": self.page_mut().map(|p| p.server.page.probe_log.drain(..).collect::<Vec<_>>()).unwrap_or_default(),
         })
         .to_string()
@@ -1379,6 +1391,9 @@ impl Session {
     /// first write opens the user's own tree (`open_own`): the head is
     /// created on first write.
     fn writable(&mut self) -> Result<(), JsValue> {
+        let asked = format!("{:?}", self.page().and_then(|p| p.asked().cloned()));
+        let stack = js_sys::Reflect::get(&js_sys::Error::new(""), &"stack".into()).ok().and_then(|v| v.as_string()).unwrap_or_default().chars().take(900).collect::<String>();
+        self.probe_claims.push(format!("writable -> claim_own; asked={}; js stack: {stack}", asked.chars().take(60).collect::<String>()));
         self.claim_own();
         match self.may_write("") {
             page_io::MayWrite::Yes => Ok(()),
