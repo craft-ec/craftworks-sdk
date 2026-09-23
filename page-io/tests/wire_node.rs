@@ -47,6 +47,10 @@ struct WireNode {
     /// No signer delegate on this node at all (a visitor's): a signer
     /// request is answered with the node's error.
     delegate_absent: bool,
+    /// No signer delegate UNTIL one is registered here: its requests are
+    /// answered EMPTY (as 0.2.136 answers a delegate it does not have), and
+    /// a registration makes it present.
+    empty_until_registered: bool,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -86,6 +90,7 @@ impl WireNode {
             empty_signer_answers: 0,
             drop_signer_answers: 0,
             delegate_absent: false,
+            empty_until_registered: false,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -113,6 +118,7 @@ impl WireNode {
             empty_signer_answers: 0,
             drop_signer_answers: 0,
             delegate_absent: false,
+            empty_until_registered: false,
         }
     }
 
@@ -211,8 +217,8 @@ impl WireNode {
                     *self.served.entry("signer answer lost").or_default() += 1;
                     return None;
                 }
-                if self.empty_signer_answers > 0 {
-                    self.empty_signer_answers -= 1;
+                if self.empty_until_registered || self.empty_signer_answers > 0 {
+                    self.empty_signer_answers = self.empty_signer_answers.saturating_sub(1);
                     return Some(ok(HostResponse::DelegateResponse { key, values: Vec::new() }));
                 }
                 let mut values = Vec::new();
@@ -232,6 +238,7 @@ impl WireNode {
             // before, which no page ever sees from a node.
             ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { delegate, .. }) => {
                 *self.served.entry("register delegate").or_default() += 1;
+                self.empty_until_registered = false;
                 Some(ok(HostResponse::DelegateResponse { key: delegate.key().clone(), values: Vec::new() }))
             }
             other => panic!("page-io sent a request the node does not expect: {other:?}"),
@@ -1129,7 +1136,7 @@ fn asking_whose_node_registers_mints_and_provisions_nothing() {
     node.empty_signer_answers = usize::MAX;
     let mut io = asker();
     settle(&mut io, &mut node, &mut now);
-    assert!(matches!(io.asked(), Some(page_io::Asked::Refused(w)) if w.contains("no signer on this node")), "{:?}", io.asked());
+    assert!(matches!(io.asked(), Some(page_io::Asked::NoSigner(_))), "an EMPTY-answering node is not named as having no signer: {:?}", io.asked());
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
 }
 
@@ -1172,13 +1179,15 @@ fn asking_on_a_visitors_node_sends_only_the_query_and_counts_every_empty_answer(
     assert!(!io.provisioned() && node.secrets.is_empty(), "asking provisioned the visitor's node");
     let served = node.served.get("signer").copied().unwrap_or(0);
     let counted = match io.asked() {
-        Some(page_io::Asked::Refused(w)) => w
+        // Named as a node with NO SIGNER (its own answer, not a refusal), in
+        // words that count the EMPTY answers.
+        Some(page_io::Asked::NoSigner(w)) => w
             .split("EMPTY ")
             .nth(1)
             .and_then(|r| r.split(' ').next())
             .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or_else(|| panic!("the refusal does not say how many EMPTY answers: {w}")),
-        other => panic!("a node without the signer was not refused: {other:?}"),
+            .unwrap_or_else(|| panic!("the answer does not say how many EMPTY answers: {w}")),
+        other => panic!("a node without the signer was not named as one: {other:?}"),
     };
     assert_eq!(counted, served, "the node answered {served} queries EMPTY and the page counted {counted}: an EMPTY was taken for something else");
     assert_eq!(sent.len(), served, "frames sent {sent:?} against queries served {served}");
@@ -1198,4 +1207,145 @@ fn control_opening_registers_the_signer() {
     let mut now = 1_000;
     settle(&mut io, &mut node, &mut now);
     assert_eq!(node.served.get("register delegate"), Some(&1), "{:?}", node.served);
+}
+
+/// THE VIEWER'S OWN TREE (DATA-SOURCE `viewer`, sdk#241): an ASKED page is
+/// claimed as the person's own, on each kind of node, through `begin`'s own
+/// opening from where the answer left it:
+/// * the node signs for their Register: it is opened as it is, nothing
+///   registered or minted;
+/// * its signer holds no key: one is minted (`needs_key`), nothing registered;
+/// * there is no signer here: it is registered and asked, then a key minted.
+///
+/// On every one the first write CREATES the head, and a reopened page reads
+/// the row back (a reload keeps the viewer's rows).
+#[test]
+fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
+    for case in ["signs for their register", "signer holds no key", "no signer here"] {
+        let key = [31u8; 32];
+        let mut node = if case == "signs for their register" { WireNode::new(&key) } else { WireNode::unprovisioned(&key) };
+        node.empty_until_registered = case == "no signer here";
+        let mut now = 1_000;
+        let mut io = asker();
+        settle(&mut io, &mut node, &mut now);
+        match (case, io.asked()) {
+            ("signs for their register", Some(page_io::Asked::Register(r))) => assert_eq!(*r, node.register_id, "{case}"),
+            ("signer holds no key", Some(page_io::Asked::NoKey)) | ("no signer here", Some(page_io::Asked::NoSigner(_))) => {}
+            (_, other) => panic!("{case}: asked {other:?}"),
+        }
+        let want = io.asked().cloned();
+        let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+        assert!(io.claim(container), "{case}: the claim was refused");
+        settle(&mut io, &mut node, &mut now);
+        if io.needs_key() {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+            io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+            settle(&mut io, &mut node, &mut now);
+        }
+        assert!(io.provisioned(), "{case}: the claimed page never opened: {:?}", io.unusable());
+        assert_eq!(io.register_id(), node.register_id, "{case}: the claimed page names another register");
+        let registered = node.served.get("register delegate").copied().unwrap_or(0);
+        assert_eq!(registered, usize::from(case == "no signer here"), "{case}: the signer was registered {registered} times");
+        assert_eq!(io.asked().cloned(), want, "{case}: the claim rewrote the answer (the identity's one owner)");
+        client(&mut io, &mut node, &mut now, &Request::Identity);
+        let rs = client(&mut io, &mut node, &mut now, &write(1, "mine", "1"));
+        assert!(states(&rs, 1).iter().any(|s| matches!(s, WriteState::Published)), "{case}: the viewer's first write did not publish: {:?}", states(&rs, 1));
+        assert!(node.contracts.contains_key(&node.register_id), "{case}: the first write did not create the viewer's head");
+        let mut again = page_io(&node);
+        client(&mut again, &mut node, &mut now, &Request::Identity);
+        assert_eq!(row_count(&mut again, &mut node, &mut now, 70), Some(1), "{case}: a reopened page does not read the viewer's row");
+    }
+}
+
+/// NOTHING IS CLAIMED ON AN ANSWER NOT HAD: before the signer answers, and
+/// when it never does, a claim says `false` and nothing is registered,
+/// minted or opened -- the runtime shows the inputs disabled, with why.
+#[test]
+fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
+    let key = [32u8; 32];
+    let mut node = WireNode::new(&key);
+    let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = asker();
+    assert_eq!(io.asked(), None, "answered before the node was asked");
+    assert!(!io.claim(container.clone()), "a page claimed its tree before the signer said whose node it is");
+    let mut now = 1_000;
+    node.drop_signer_answers = usize::MAX;
+    settle(&mut io, &mut node, &mut now);
+    assert_eq!(io.asked(), Some(&page_io::Asked::NotAnswering), "{:?}", io.unusable());
+    assert!(!io.claim(container), "a silent signer's page was claimed");
+    assert!(!io.provisioned() && !io.needs_key(), "a refused claim opened or minted");
+    assert_eq!(node.served.get("register delegate"), None, "a refused claim registered the signer");
+}
+
+/// THE ONE DECISION (`PageIo::may_write`; DATA-SOURCE, the architect's point
+/// 5): every cell of the table, answered from what the page holds -- a view,
+/// the signer's answer to an ask, or an opened page -- for the page's OWN
+/// tree (`None`, a `viewer` component's) and for a named head.
+#[test]
+fn may_write_is_one_decision_read_from_the_signers_answer() {
+    use page_io::MayWrite::{No, Unknown, Yes};
+    let yes = |m: page_io::MayWrite| m == Yes;
+    let no = |m: page_io::MayWrite| matches!(m, No(_));
+    let unknown = |m: page_io::MayWrite| matches!(m, Unknown(_));
+    let stranger = [0xAB; 32];
+    let mut now = 1_000;
+
+    // A VIEW (`reader`): never, whose ever head.
+    let node = WireNode::new(&[40u8; 32]);
+    let view = reader(&node);
+    assert!(no(view.may_write(None)) && no(view.may_write(Some(node.register_id))), "a view may write");
+
+    // ASKED, not answered yet: not known, for any head.
+    let io = asker();
+    assert!(unknown(io.may_write(None)) && unknown(io.may_write(Some(stranger))), "an unanswered ask was decided");
+
+    // It signs for their Register: that head, and the own tree, yes; another, no.
+    let mut node = WireNode::new(&[41u8; 32]);
+    let mut io = asker();
+    settle(&mut io, &mut node, &mut now);
+    assert!(yes(io.may_write(None)) && yes(io.may_write(Some(node.register_id))), "{:?}", io.may_write(Some(node.register_id)));
+    assert!(no(io.may_write(Some(stranger))), "a node that signs for one head may write another");
+
+    // No key, and no signer: the own tree yes (made on first use); another head no.
+    for empty in [false, true] {
+        let mut node = WireNode::unprovisioned(&[42u8; 32]);
+        node.empty_until_registered = empty;
+        let mut io = asker();
+        settle(&mut io, &mut node, &mut now);
+        assert!(yes(io.may_write(None)), "empty={empty}: {:?}", io.asked());
+        assert!(no(io.may_write(Some(stranger))), "empty={empty}: a node with no key may write a head");
+    }
+
+    // Not answering: not known, for any head.
+    let mut node = WireNode::new(&[43u8; 32]);
+    node.drop_signer_answers = usize::MAX;
+    let mut io = asker();
+    settle(&mut io, &mut node, &mut now);
+    assert!(unknown(io.may_write(None)) && unknown(io.may_write(Some(node.register_id))), "{:?}", io.asked());
+
+    // Refused by the node: the own tree not known; a named head no.
+    let mut node = WireNode::unprovisioned(&[44u8; 32]);
+    node.delegate_absent = true;
+    let mut io = asker();
+    settle(&mut io, &mut node, &mut now);
+    assert!(unknown(io.may_write(None)) && no(io.may_write(Some(stranger))), "{:?}", io.asked());
+
+    // OPENED (`begin`'s, or a claimed ask): its register yes, another no.
+    let mut node = WireNode::new(&[45u8; 32]);
+    let (io, _) = opening(&mut node, &mut now, &[45u8; 32], false);
+    assert!(io.provisioned(), "the opening did not open: {:?}", io.unusable());
+    assert!(yes(io.may_write(None)) && yes(io.may_write(Some(node.register_id))) && no(io.may_write(Some(stranger))));
+
+    // Claimed where there was no key: the MINTED register is then its own.
+    let key = [46u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    let mut io = asker();
+    settle(&mut io, &mut node, &mut now);
+    assert!(io.claim(wire::delegate_from_code(SIGNER_CODE).0));
+    settle(&mut io, &mut node, &mut now);
+    let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+    io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+    settle(&mut io, &mut node, &mut now);
+    assert!(yes(io.may_write(Some(node.register_id))), "a claimed page may not write the register it minted: {:?}", io.may_write(Some(node.register_id)));
+    assert!(no(io.may_write(Some(stranger))));
 }
