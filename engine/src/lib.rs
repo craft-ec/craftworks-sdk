@@ -496,6 +496,11 @@ pub enum Effect {
     UpdateHead {
         seq: u64,
         root: Cid,
+        /// The root this commit was BUILT ON: its head's prev is
+        /// `(seq - 1, base)` and nothing else. A head signed with any other
+        /// prev claims to contain a tree it does not (a foreign winner
+        /// adopted after the commit was built: two devices, same seq).
+        base: Cid,
         after: Vec<Cid>,
     },
     PutParity {
@@ -3740,6 +3745,7 @@ impl<B: Blocks> Engine<B> {
         vec![Effect::UpdateHead {
             seq: c.seq,
             root: c.root,
+            base: c.base,
             after: c.data.iter().copied().collect(),
         }]
     }
@@ -3788,6 +3794,7 @@ impl<B: Blocks> Engine<B> {
         out.push(Effect::UpdateHead {
             seq: c.seq,
             root: c.root,
+            base: c.base,
             after: c.data.iter().copied().collect(),
         });
         out
