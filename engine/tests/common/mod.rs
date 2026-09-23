@@ -166,7 +166,7 @@ impl Store {
                     self.put(*id, bytes);
                 }
                 // A queued write's warm-apply block (R-b): the page keeps it.
-                Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } | Effect::Keep { id, bytes } => {
+                Effect::PutBlock { id, bytes, .. } | Effect::Keep { id, bytes } => {
                     self.put(*id, bytes);
                 }
                 _ => {}
@@ -375,12 +375,6 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
             }
             Effect::UpdateHead { seq, .. } => {
                 let o = w.step(Event::HeadConfirmed(seq));
-                ws.absorb(&o);
-                queue.extend(o);
-            }
-            Effect::PutParity { id, bytes, .. } => {
-                all.insert(id, &bytes);
-                let o = w.step(Event::PutConfirmed(id));
                 ws.absorb(&o);
                 queue.extend(o);
             }

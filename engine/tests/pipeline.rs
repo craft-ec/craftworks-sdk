@@ -199,7 +199,7 @@ fn drive(e: &mut Engine<Store>, seen: &mut Seen, first: Vec<Effect>) {
         guard += 1;
         assert!(guard < 100_000, "the engine did not settle");
         let ev = match f {
-            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } | Effect::PutParity { id, .. } => Event::PutConfirmed(id),
+            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => Event::PutConfirmed(id),
             Effect::UpdateHead { seq, .. } => Event::HeadConfirmed(seq),
             _ => continue,
         };
@@ -564,15 +564,6 @@ fn dropping_one_context_field_makes_the_two_modes_disagree() {
 }
 
 
-fn parity_puts(effects: &[Effect]) -> Vec<(engine::ParityIds, Cid)> {
-    effects
-        .iter()
-        .filter_map(|e| match e {
-            Effect::PutParity { group, id, .. } => Some((*group, *id)),
-            _ => None,
-        })
-        .collect()
-}
 
 
 
@@ -673,9 +664,6 @@ fn no_event_sequence_panics() {
             };
             let out = stepped!(e, ev);
             known.extend(ids(&out));
-            for (_, id) in parity_puts(&out) {
-                known.push(id);
-            }
             if known.len() > 200 {
                 known.drain(..100);
             }

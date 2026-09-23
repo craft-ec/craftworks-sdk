@@ -33,7 +33,7 @@ impl Store {
                     }
                     self.put(*id, bytes);
                 }
-                Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } => {
+                Effect::PutBlock { id, bytes, .. } => {
                     self.put(*id, bytes)
                 }
                 _ => {}
@@ -235,7 +235,7 @@ fn the_context_costs_what_it_is_budgeted() {
         .filter(|f| {
             matches!(
                 f,
-                Effect::PutPack { .. } | Effect::PutBlock { .. } | Effect::PutParity { .. }
+                Effect::PutPack { .. } | Effect::PutBlock { .. }
             )
         })
         .count();

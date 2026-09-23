@@ -65,7 +65,7 @@ fn settle(h: &mut Harness, mut fx: Vec<Effect>) -> Vec<Effect> {
         let mut next = Vec::new();
         for f in &fx {
             match f {
-                Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } | Effect::PutParity { id, .. } => {
+                Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => {
                     next.extend(h.step(Event::PutConfirmed(*id)))
                 }
                 Effect::UpdateHead { seq, .. } => next.extend(h.step(Event::HeadConfirmed(*seq))),

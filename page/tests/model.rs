@@ -25,8 +25,8 @@
 //! 3. A published root is RECOVERABLE on the node: a reader that repairs
 //!    (#300) reads every block it reaches, because race put signs a head
 //!    when every changed group has k of its k+3 (COMMIT-LIFE §P: SAVED).
-//! 3b. At a write's `ParityComplete` (BACKED_UP), the root it was published
-//!    at is WHOLE on the node: every block held, no repair needed.
+//!    And (3b) at a write's `ParityComplete` (BACKED_UP), the root it was
+//!    published at is WHOLE on the node: every block held, no repair needed.
 //! 4. Once the faults stop, every write is published, and the final tree
 //!    holds every key both pages wrote.
 

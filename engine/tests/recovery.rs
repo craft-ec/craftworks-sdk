@@ -219,10 +219,6 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             break;
                         }
                     }
-                    Effect::PutParity { id, bytes, .. } => {
-                        net.confirm(id, &bytes);
-                        queue.extend(stepped!(e, Event::PutConfirmed(id)));
-                    }
                     Effect::Notify {
                         write_id,
                         state: State::Published,
@@ -234,17 +230,12 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                     _ => {}
                 }
             }
-            // Let parity settle for the commits that are not being cut.
+            // Time passes between commits (parity went out WITH each commit,
+            // §P, so there is nothing for a tick to put).
             if !dropped {
                 for _ in 0..4 {
                     clock += 1;
-                    let out = stepped!(e, Event::Tick(clock));
-                    for f in out {
-                        if let Effect::PutParity { id, bytes, .. } = f {
-                            net.confirm(id, &bytes);
-                            let _ = stepped!(e, Event::PutConfirmed(id));
-                        }
-                    }
+                    let _ = stepped!(e, Event::Tick(clock));
                 }
             }
             if dropped {
@@ -925,8 +916,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
             assert!(guard < 100_000, "the commit did not reach a head");
             match f {
                 Effect::PutPack { id, bytes, .. }
-                | Effect::PutBlock { id, bytes, .. }
-                | Effect::PutParity { id, bytes, .. } => {
+                | Effect::PutBlock { id, bytes, .. } => {
                     net.confirm(id, &bytes);
                     queue.extend(stepped!(e, Event::PutConfirmed(id)));
                 }

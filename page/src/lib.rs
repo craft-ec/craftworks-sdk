@@ -17,7 +17,7 @@
 //!
 //! | effect / answer | what the page does |
 //! |---|---|
-//! | `PutBlock` / `PutParity` | the bytes join [`PageBlocks`] (the page is now the memory a node was); held until its `after` set is confirmed, then [`Op::Put`] |
+//! | `PutBlock` (data AND parity, §P) | the bytes join [`PageBlocks`] (the page is now the memory a node was); held until its `after` set is confirmed, then [`Op::Put`] |
 //! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → asked again on a doubling backoff, the PUT again only after [`HELD_ABSENTS`] absents in a row |
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
@@ -1423,7 +1423,7 @@ impl Page {
     fn carry_out(&mut self, fx: Vec<Effect>) {
         for f in fx {
             match f {
-                Effect::PutBlock { id, ref bytes, ref after } | Effect::PutParity { id, ref bytes, ref after, .. } => {
+                Effect::PutBlock { id, ref bytes, ref after } => {
                     // The page is the memory now: the engine keeps no bytes.
                     self.blocks.insert(id, bytes);
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
@@ -1475,7 +1475,7 @@ impl Page {
             if self.held[i].0.iter().all(|c| self.confirmed.contains(c)) {
                 let (_, f) = self.held.remove(i);
                 match f {
-                    Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } => {
+                    Effect::PutBlock { id, bytes, .. } => {
                         if self.confirmed.contains(&id) {
                             // Already on the node: the engine hears it again.
                             let more = self.engine.step(Event::PutConfirmed(id));

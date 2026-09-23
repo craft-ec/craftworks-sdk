@@ -50,20 +50,13 @@ fn boot(net: &Network, params: Params) -> Engine<Store> {
 /// Answer every effect as a node that holds everything would, and record
 /// every state each write is told.
 fn drive(e: &mut Engine<Store>, net: &mut Network, first: Vec<Effect>, told: &mut BTreeMap<u64, Vec<State>>) {
-    drive_with(e, net, first, told, false)
-}
-
-/// `withhold_parity`: parity puts are dropped unanswered, as a page that
-/// closed before they went out would leave them.
-fn drive_with(e: &mut Engine<Store>, net: &mut Network, first: Vec<Effect>, told: &mut BTreeMap<u64, Vec<State>>, withhold_parity: bool) {
     let mut queue = first;
     let mut guard = 0usize;
     while let Some(f) = queue.pop() {
         guard += 1;
         assert!(guard < 5_000_000, "the engine never settled");
         match f {
-            Effect::PutParity { .. } if withhold_parity => {}
-            Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } => {
+            Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
                 for (mid, mbytes) in engine::pack::members(&bytes) {
                     net.blocks.insert(mid, &mbytes);
                 }
@@ -92,13 +85,9 @@ fn write(e: &mut Engine<Store>, net: &mut Network, id: u64, ops: Vec<(Vec<u8>, O
 }
 
 fn ticks(e: &mut Engine<Store>, net: &mut Network, from: u64, n: u64, told: &mut BTreeMap<u64, Vec<State>>) {
-    ticks_with(e, net, from, n, told, false)
-}
-
-fn ticks_with(e: &mut Engine<Store>, net: &mut Network, from: u64, n: u64, told: &mut BTreeMap<u64, Vec<State>>, withhold_parity: bool) {
     for t in from..from + n {
         let out = stepped!(e, Event::Tick(t));
-        drive_with(e, net, out, told, withhold_parity);
+        drive(e, net, out, told);
     }
 }
 

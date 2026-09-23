@@ -59,7 +59,7 @@
 //!   three blocks went out on every tick for ever;
 //! * the delegate scheduler's `confirmed` set (sdk#83) — not engine state,
 //!   but the same rule one layer out. It learns what the node holds from
-//!   acks in THIS call, so a `PutParity` gated `after: [published_root]` was
+//!   acks in THIS call, so a parity put gated `after: [published_root]` was
 //!   held on a dependency nothing would confirm, and dropped. Every call.
 //!
 //! The question to ask of any new field, effect dependency or deadline:
@@ -504,12 +504,6 @@ pub enum Effect {
         /// prev claims to contain a tree it does not (a foreign winner
         /// adopted after the commit was built: two devices, same seq).
         base: Cid,
-        after: Vec<Cid>,
-    },
-    PutParity {
-        group: ParityIds,
-        id: Cid,
-        bytes: Vec<u8>,
         after: Vec<Cid>,
     },
     Notify {

@@ -87,7 +87,6 @@ fn commit(h: &mut Harness, write_id: u64, ops: Vec<(Vec<u8>, Op)>) -> Vec<Effect
             Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => {
                 Some(Event::PutConfirmed(*id))
             }
-            Effect::PutParity { id, .. } => Some(Event::PutConfirmed(*id)),
             Effect::UpdateHead { seq, .. } => Some(Event::HeadConfirmed(*seq)),
             _ => None,
         };
