@@ -12,6 +12,7 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { shippedArtefacts } from "../../js/session.js";
 import { artefactBytes, allArtefactBytes, CACHE_NAME, ambientCaches } from "../../js/artefacts.js";
+import { RTO_SCHEDULE_MS } from "../../js/rto.js";
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -147,9 +148,16 @@ await t("bytes that do not hash to what was promised are never installed", async
   const caches = fakeCaches();
   const net = countingFetch(new Uint8Array([4, 5, 6]));
   const promised = await sha(PAYLOAD);
+  // Bounded (sdk#312): the same wrong bytes twice are refused; were they
+  // waited on instead, the third wait cancels and the match below fails.
+  const c = new AbortController();
+  let waits = 0;
   await assert.rejects(
-    () => artefactBytes({ url: "/u", sha256: promised }, { fetch: net.fetch, caches, subtle }),
-    /does not hash to/,
+    () => artefactBytes({ url: "/u", sha256: promised }, {
+      fetch: net.fetch, caches, subtle,
+      sleep: async () => {}, signal: c.signal, onWait: () => { if ((waits += 1) > 2) c.abort(); },
+    }),
+    /refused: a hash mismatch[\s\S]*does not hash to/,
     "a wrong artefact is not a smaller one: it must be refused",
   );
   assert.equal(caches.boxes.get(CACHE_NAME)?.size ?? 0, 0, "and never cached");
@@ -303,23 +311,139 @@ await t("a source that is DOWN is skipped, not fatal", async () => {
   assert.deepEqual([...bytes], [...good], "one unreachable source killed the lot");
 });
 
-await t("**a total failure names the artefact AND what each source did**", async () => {
-  // An app that will not open is the symptom a person reports, so the first
-  // thing they can send must identify the block and say what was tried.
+await t("**a wait names the artefact AND what each source did**", async () => {
+  // An app that will not open is the symptom a person reports, so what it
+  // shows must identify the block and say what was tried. A 404 beside a
+  // mismatch is a WAIT (the 404 source may yet serve it), not an end.
   const sha256 = await sha(new Uint8Array([7]));
   const fetchWith = async url => {
     if (url === "missing") return new Response("", { status: 404 });
     return new Response(new Uint8Array([8]));      // wrong bytes
   };
+  const c = new AbortController();
+  const waits = [];
   await assert.rejects(
-    () => artefactBytes({ urls: ["missing", "wrong"], sha256 }, { fetch: fetchWith, caches: null, subtle: crypto.subtle }),
+    () => artefactBytes({ urls: ["missing", "wrong"], sha256 }, {
+      fetch: fetchWith, caches: null, subtle: crypto.subtle,
+      signal: c.signal, onWait: w => { waits.push(w); c.abort(); }, sleep: async () => {},
+    }),
     e => {
+      assert.equal(waits.length, 1, "a 404 beside a mismatch ended the fetch instead of waiting");
+      assert.match(waits[0].failures.join("\n"), /missing: 404/, "the wait does not say what the first source did");
       assert.match(e.message, new RegExp(sha256), "the message does not name WHICH artefact");
+      assert.match(e.message, /cancelled/, "only a person's cancel ends a wait");
       assert.match(e.message, /missing: 404/, "it does not say what the first source did");
       assert.match(e.message, /wrong: does not hash/, "it does not say what the second source did");
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// A NODE THAT DOES NOT HOLD IT YET HAS NOT ANSWERED (sdk#312).
+// ---------------------------------------------------------------------------
+
+/** A source that answers `status` for its first `n` asks, then the bytes. */
+const notYet = (n, good, status = 404) => {
+  const asked = { n: 0 };
+  return { asked, fetch: async () => (++asked.n <= n ? new Response("", { status }) : new Response(good)) };
+};
+
+await t("**the first 3 fetches 404, then 200: the app's code arrives, re-asked on the page's RTO**", async () => {
+  const good = new Uint8Array([3, 1, 2]);
+  const sha256 = await sha(good);
+  const src = notYet(3, good);
+  const waits = [];
+  const slept = [];
+  const bytes = await artefactBytes({ url: "node", sha256 }, {
+    fetch: src.fetch, caches: null, subtle: crypto.subtle,
+    onWait: w => waits.push(w), sleep: async ms => { slept.push(ms); },
+  });
+  assert.deepEqual([...bytes], [...good], "the artefact did not arrive after the node came to hold it");
+  assert.equal(src.asked.n, 4, "it did not ask again after each 404");
+  assert.deepEqual(slept, RTO_SCHEDULE_MS.slice(0, 3), "the waits are not the page's RTO back-off");
+  assert.equal(waits.length, 3);
+  assert.match(waits[2].says, /^loading the app… not available on this node yet \(\d+ s\)$/, waits[2].says);
+});
+
+await t("a 503, a 400 and a network error are NOT answers either", async () => {
+  const good = new Uint8Array([5]);
+  const sha256 = await sha(good);
+  for (const fail of [503, 400, "network"]) {
+    let n = 0;
+    const fetchWith = async () => {
+      n += 1;
+      if (n === 1) { if (fail === "network") throw new Error("connection reset"); return new Response("", { status: fail }); }
+      return new Response(good);
+    };
+    const bytes = await artefactBytes({ url: "x", sha256 }, { fetch: fetchWith, caches: null, subtle: crypto.subtle, sleep: async () => {} });
+    assert.deepEqual([...bytes], [...good], `${fail} ended the fetch`);
+  }
+});
+
+await t("the wait is the page's RTO back-off to its ceiling, then the ceiling for ever", async () => {
+  assert.ok(RTO_SCHEDULE_MS.length > 2 && RTO_SCHEDULE_MS[0] < RTO_SCHEDULE_MS.at(-1), `a schedule that does not back off: ${RTO_SCHEDULE_MS}`);
+  const good = new Uint8Array([6]);
+  const sha256 = await sha(good);
+  const src = notYet(RTO_SCHEDULE_MS.length + 5, good, 503);
+  const slept = [];
+  await artefactBytes({ url: "x", sha256 }, { fetch: src.fetch, caches: null, subtle: crypto.subtle, sleep: async ms => { slept.push(ms); } });
+  assert.deepEqual(slept.slice(0, RTO_SCHEDULE_MS.length), [...RTO_SCHEDULE_MS]);
+  assert.ok(slept.slice(RTO_SCHEDULE_MS.length).every(ms => ms === RTO_SCHEDULE_MS.at(-1)), `past the ceiling: ${slept}`);
+});
+
+await t("**a hash MISMATCH from every source, the SAME wrong bytes twice, is the one refusal: named**", async () => {
+  const sha256 = await sha(new Uint8Array([1]));
+  let waited = 0;
+  // Bounded: were the same wrong answer waited on past its second showing, the
+  // next wait cancels it, and the rejection says `cancelled` rather than
+  // `refused`, so it fails here instead of spinning.
+  const c = new AbortController();
+  await assert.rejects(
+    () => artefactBytes({ urls: ["a", "b"], sha256 }, {
+      fetch: async () => new Response(new Uint8Array([2])), caches: null, subtle: crypto.subtle,
+      onWait: () => { if ((waited += 1) > 1) c.abort(); }, signal: c.signal, sleep: async () => {},
+    }),
+    e => /refused: a hash mismatch/.test(e.message) && e.message.includes(sha256) && /a: does not hash.*the same again/.test(e.message),
+  );
+  assert.equal(waited, 1, "the same wrong bytes were not asked for exactly once more before refusing");
+});
+
+await t("**a TORN 200 (truncated, hashing wrong) is not a refusal: re-asked, and the whole file opens**", async () => {
+  // A node unpacking its web cache served 1,242,614 of 1,259,519 bytes for a
+  // moment (engineer1, measured). One wrong hash is a torn read, not an answer.
+  const good = new Uint8Array([1, 2, 3, 4, 5, 6]);
+  const sha256 = await sha(good);
+  let n = 0;
+  const bytes = await artefactBytes({ url: "node", sha256 }, {
+    fetch: async () => new Response((n += 1) === 1 ? good.slice(0, 4) : good),
+    caches: null, subtle: crypto.subtle, sleep: async () => {},
+  });
+  assert.deepEqual([...bytes], [...good]);
+  assert.equal(n, 2, "the torn read was not re-asked");
+});
+
+await t("DIFFERENT wrong bytes each round keep it waiting: only the same wrong answer twice ends it", async () => {
+  const sha256 = await sha(new Uint8Array([0]));
+  let n = 0;
+  const c = new AbortController();
+  let waits = 0;
+  await assert.rejects(
+    () => artefactBytes({ url: "node", sha256 }, {
+      fetch: async () => new Response(new Uint8Array([(n += 1)])), caches: null, subtle: crypto.subtle,
+      onWait: () => { if ((waits += 1) === 3) c.abort(); }, signal: c.signal, sleep: async () => {},
+    }),
+    /cancelled/,
+  );
+  assert.equal(waits, 3, "a changing wrong answer was refused as though it were the same one");
+});
+
+await t("THE rto.js SCHEDULE IS THE ONE page/src/rto.rs PRODUCES, not a copy", async () => {
+  // Generated by `build.sh` from the real `Rto`; re-run here, so a hand edit
+  // of js/rto.js (or a stale one) is caught.
+  const { execFileSync } = await import("node:child_process");
+  const out = execFileSync("cargo", ["run", "-q", "-p", "page", "--example", "rto_js"], { encoding: "utf8" });
+  assert.equal(await readFile(new URL("../../js/rto.js", import.meta.url), "utf8"), out, "js/rto.js is not what the Rto produces");
 });
 
 await t("THE CONTROL: a single `url` still works, unchanged", async () => {
@@ -426,6 +550,8 @@ await t("**THE CONTROL THAT MATTERS: bytes that do not match the named hash are 
   // safe because the hash is checked — an app must not load something
   // unverified, it must not load at all.
   const sha256 = await sha(new Uint8Array([1, 2, 3]));
+  const cancel = new AbortController();
+  let waits = 0;
   await assert.rejects(
     () =>
       artefactBytes(
@@ -434,9 +560,15 @@ await t("**THE CONTROL THAT MATTERS: bytes that do not match the named hash are 
           fetch: async () => new Response(new Uint8Array([9, 9, 9])),
           caches: null,
           subtle: crypto.subtle,
+          // Bounded (sdk#312): refused on the same wrong bytes' second
+          // showing; waited on instead, the third wait cancels and fails here.
+          sleep: async () => {},
+          signal: cancel.signal,
+          onWait: () => { if ((waits += 1) > 2) cancel.abort(); },
         },
       ),
     e => {
+      assert.match(e.message, /refused: a hash mismatch/, "it was not REFUSED");
       assert.match(e.message, /does not hash/, "it did not say the bytes failed verification");
       assert.match(e.message, new RegExp(sha256), "it did not name the artefact");
       return true;
