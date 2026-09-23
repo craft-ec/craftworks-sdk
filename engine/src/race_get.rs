@@ -38,12 +38,16 @@ impl<B: Blocks> Engine<B> {
         }
     }
 
-    /// A block rebuilt from its group: the page KEEPS it, and it is PUT BACK (sdk#303) when
-    /// - a reader WAITED on it (a rebuild nobody asked for is not written: the architect's (c)), and
-    /// - its bytes ARE its id, checked here at the put and not only inside the rebuild (the architect's (a)).
+    /// A block rebuilt from its group. Its bytes must BE its id, checked here and not only inside the rebuild
+    /// (the architect's (a)): otherwise nothing -- the page never holds bytes under a wrong id. Verified, the
+    /// page KEEPS it, and PUTs it back (sdk#303) when a reader WAITED on it (a rebuild nobody asked for is not
+    /// written: the architect's (c)).
     pub(crate) fn rebuilt(&self, id: Cid, body: &[u8]) -> Vec<Effect> {
+        if !crate::read::matches_id(&id, body) {
+            return Vec::new();
+        }
         let mut out = vec![Effect::Keep { id, bytes: body.to_vec() }];
-        if self.reads.waiting.contains_key(&id) && crate::read::matches_id(&id, body) {
+        if self.reads.waiting.contains_key(&id) {
             out.push(Effect::PutRepaired { id, bytes: body.to_vec() });
         }
         out
@@ -122,8 +126,8 @@ mod put_back {
         fx.iter().filter(|f| matches!(f, Effect::PutRepaired { .. })).count()
     }
 
-    /// The put-back decision, each condition on its own: wanted AND verified is put; unverified or unwanted is
-    /// only kept. (Through the engine, a rebuild never yields bytes that are not its id -- `repair::rebuild`
+    /// The put-back decision, each condition on its own: wanted AND verified is put; verified but unwanted is
+    /// only kept; unverified is neither. (Through the engine, a rebuild never yields bytes that are not its id -- `repair::rebuild`
     /// refuses them first -- so (a) is reachable only here.)
     #[test]
     fn a_rebuilt_block_is_put_back_only_when_wanted_and_verified() {
@@ -134,6 +138,6 @@ mod put_back {
         e.reads.want(id, ReqId(1), true);
         assert_eq!(put(&e.rebuilt(id, &body)), 1, "a wanted, verified rebuild was not put");
         assert_eq!(put(&e.rebuilt(id, b"not its bytes")), 0, "(a) an unverified rebuild was put");
-        assert!(e.rebuilt(id, b"not its bytes").iter().any(|f| matches!(f, Effect::Keep { .. })));
+        assert!(e.rebuilt(id, b"not its bytes").is_empty(), "(a) an unverified rebuild was KEPT: the page would hold bytes under a wrong id");
     }
 }
