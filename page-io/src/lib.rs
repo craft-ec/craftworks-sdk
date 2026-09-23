@@ -157,6 +157,8 @@ pub struct PageIo {
     /// answered GETs of it: [got, get-failed]; and head changes heard.
     pub probe_answers: BTreeMap<[u8; 32], [u32; 2]>,
     pub probe_head_changes: u32,
+    /// SCRATCH PROBE: every signer answer this page took, with the time.
+    pub probe_signer: Vec<String>,
     pub server: Server,
     art: Artefacts,
     register: ContractContainer,
@@ -310,6 +312,7 @@ impl PageIo {
         let register_key = register.key().to_string();
         PageIo {
             probe_answers: BTreeMap::new(),
+            probe_signer: Vec::new(),
             probe_head_changes: 0,
             server,
             art,
@@ -838,6 +841,14 @@ impl PageIo {
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
                     let answer = wire::signer::read_answer(&m);
+                    {
+                        let what = match &answer {
+                            Some((id, signer_proto::Answer::Register { params: Some(p) })) => format!("id {id} Register(Some params {} B, {:02x?})", p.len(), &p[..p.len().min(8)]),
+                            Some((id, a)) => format!("id {id} {:?}", a).chars().take(80).collect(),
+                            None => "unreadable".into(),
+                        };
+                        self.probe_signer.push(format!("{} asking={} claimed={} {what}", now.0, self.asking, self.claimed));
+                    }
                     // A REAL answer to the signer's first request ends it: no
                     // more re-sends, and a later empty response is nobody's.
                     if matches!(answer, Some((REGISTER_QUERY_ID | PROVISION_ID, _))) {

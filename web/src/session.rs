@@ -657,7 +657,8 @@ impl Session {
         let stack = js_sys::Reflect::get(&js_sys::Error::new(""), &"stack".into()).ok().and_then(|v| v.as_string()).unwrap_or_default().chars().take(900).collect::<String>();
         self.probe_claims.push(format!("open_own called; asked={}; js stack: {stack}", asked.chars().take(60).collect::<String>()));
         if self.page().is_some_and(|p| matches!(p.asked(), Some(page_io::Asked::Register(_)))) {
-            self.probe_claims.push("open_own -> claim_own".into());
+            let seq = self.page().map(|p| p.server.page.published().0);
+            self.probe_claims.push(format!("open_own -> claim_own; own published seq at claim = {seq:?}"));
             self.claim_own();
         }
         self.can_write("")
@@ -721,6 +722,7 @@ impl Session {
         let reg = p.probe_register_id();
         let p_reg_hex = reg.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let p_asked = format!("{:?}", p.asked()).chars().take(80).collect::<String>();
+        let p_signer = p.probe_signer.clone();
         let mut answers = serde_json::Map::new();
         for (w, ..) in &waits {
             if let Some(h) = w.strip_prefix("Get(").and_then(|x| x.strip_suffix(')')) {
@@ -748,6 +750,7 @@ impl Session {
             "reads": std::mem::take(&mut self.probe_reads),
             "claims": self.probe_claims.clone(),
             "asked": p_asked,
+            "signerAnswers": p_signer,
             "log": self.page_mut().map(|p| p.server.page.probe_log.drain(..).collect::<Vec<_>>()).unwrap_or_default(),
         })
         .to_string()
