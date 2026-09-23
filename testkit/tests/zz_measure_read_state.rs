@@ -133,5 +133,5 @@ fn measure_design_b_costs() {
     }
 }
 fn hex4(r: &[u8; 32]) -> String {
-    r.iter().take(4).map(|b| format!("{b:02x}")).collect()
+    engine::short_id(r)
 }

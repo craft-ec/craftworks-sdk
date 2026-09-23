@@ -58,6 +58,10 @@ mod tests {
         assert_eq!(decode("0g"), None);
         assert_eq!(decode("abc"), None);
         assert_eq!(decode("é1"), None);
+        // STRICTER than the `u8::from_str_radix` copies it replaced, which took a
+        // sign: "+f" parsed as 15. Hex has no sign.
+        assert_eq!(decode("+f"), None);
+        assert_eq!(decode_array::<1>("+f"), None);
         assert!(is_lower("000fa5ff", 4));
         assert!(!is_lower("000FA5FF", 4));
         assert!(!is_lower("000fa5", 4));

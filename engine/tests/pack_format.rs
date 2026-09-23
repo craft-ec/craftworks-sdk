@@ -47,9 +47,7 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
+use core_types::hex::encode as hex;
 
 #[test]
 fn the_engine_builds_the_bytes_the_contract_defines() {
