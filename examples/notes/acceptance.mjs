@@ -1,6 +1,7 @@
 // sdk#234's ACCEPTANCE, live: the notes page on the SDK alone, against a
 // PRIVATE local 0.2.136 node (explicit dirs, --disable-auto-update, loopback,
-// named ports that refuse the owner's 7509/7609), in headless Chrome.
+// ports the OS picks free, never the owner's 7509/7609), in headless Chrome.
+// Two sessions can run it at once: each run's first line names its ports.
 //
 //   node examples/notes/acceptance.mjs        (build.sh first; BUDGET_MS to extend)
 //
@@ -10,6 +11,7 @@
 import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync } from "node:fs";
 import { createServer, connect } from "node:net";
+import { createSocket } from "node:dgram";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +35,18 @@ setTimeout(() => { console.log(`FAIL  the run exceeded its ${BUDGET_MS / 1000} s
 process.on("exit", () => { for (const k of kids) { try { process.kill(k.pid, "SIGKILL"); } catch (_) {} } });
 
 const free = port => new Promise(ok => { const s = createServer().once("error", () => ok(false)).listen(port, "127.0.0.1", () => s.close(() => ok(true))); });
+// The node's network port is UDP, and a port free for TCP can be held for UDP.
+const udpFree = port => new Promise(ok => { const s = createSocket("udp4"); s.once("error", () => ok(false)); s.bind(port, "127.0.0.1", () => s.close(() => ok(true))); });
+// A port the OS hands out (sdk#284), free for TCP and UDP, never the owner's
+// and never one this run already chose. node() still refuses a busy or owner's
+// port: that is the guard for a port taken between choosing and spawning.
+async function freePort(taken) {
+  for (let i = 0; i < 50; i += 1) {
+    const p = await new Promise((ok, bad) => { const s = createServer().once("error", bad).listen(0, "127.0.0.1", () => { const { port } = s.address(); s.close(() => ok(port)); }); });
+    if (!OWNERS.includes(p) && !taken.includes(p) && (await free(p)) && (await udpFree(p))) return p;
+  }
+  throw new Error("no port free for TCP and UDP in 50 asks");
+}
 const answers = port => new Promise(ok => { const s = connect({ port, host: "127.0.0.1" }); const d = v => { s.destroy(); ok(v); }; s.once("connect", () => d(true)); s.once("error", () => d(false)); });
 const announced = (child, re, ms) => new Promise((ok, bad) => {
   const t = setTimeout(() => bad(new Error(`not announced in ${ms} ms`)), ms);
@@ -42,15 +56,21 @@ const announced = (child, re, ms) => new Promise((ok, bad) => {
 
 async function node(ws, net) {
   for (const p of [ws, net]) if (OWNERS.includes(p)) throw new Error(`${p} is the owner's; refusing`);
-  if (!(await free(ws)) || !(await free(net))) throw new Error(`port ${ws}/${net} is busy; refusing`);
+  if (!(await free(ws)) || !(await free(net)) || !(await udpFree(net))) throw new Error(`port ${ws}/${net} is busy; refusing`);
   const dir = mkdtempSync(join(tmpdir(), "notes-node-"));
-  for (const d of ["data", "config", "log"]) mkdirSync(join(dir, d));
+  for (const d of ["data", "config", "log", "webapp-cache"]) mkdirSync(join(dir, d));
   const child = spawn("freenet", ["network", "--is-gateway", "--skip-load-from-network",
     "--network-address", "127.0.0.1", "--network-port", String(net),
     "--public-network-address", "127.0.0.1", "--public-network-port", String(net),
     "--ws-api-address", "127.0.0.1", "--ws-api-port", String(ws),
     "--data-dir", join(dir, "data"), "--config-dir", join(dir, "config"), "--log-dir", join(dir, "log"),
-    "--disable-auto-update"], { stdio: "ignore" });
+    "--disable-auto-update"], {
+    stdio: "ignore",
+    // ITS OWN web-app cache: the default is one per-USER directory, so a test
+    // node would share, and sweep, the owner's node's cache (craftworks
+    // CLAUDE.md; freenet-core config.rs:3330).
+    env: { ...process.env, FREENET_WEBAPP_CACHE_DIR: join(dir, "webapp-cache") },
+  });
   kids.push(child);
   for (let i = 0; i < 180 && !(await answers(ws)); i += 1) await sleep(250);
   console.log(`node pid ${child.pid} ws ${ws} (${dir})`);
@@ -70,6 +90,9 @@ async function tab(debug) {
 }
 
 try {
+  const WS = await freePort([]);
+  const NET = await freePort([WS]);
+  console.log(`ports: ws ${WS}, network ${NET} (free, chosen by the OS; never ${OWNERS.join("/")})`);
   const server = spawn("python3", ["-u", "-m", "http.server", "0", "--bind", "127.0.0.1"], { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"] });
   kids.push(server);
   const page = await announced(server, /port (\d+)/, 10_000);
@@ -77,7 +100,7 @@ try {
   kids.push(chrome);
   const debug = await announced(chrome, /DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//, 30_000);
 
-  for (const [path, ws, net, hash] of [["page path", 17551, 37551, ""]]) {
+  for (const [path, ws, net, hash] of [["page path", WS, NET, ""]]) {
     console.log(`\n── ${path} ──`);
     await node(ws, net);
     const url = `http://127.0.0.1:${page}/examples/notes/#node=${ws}${hash}`;

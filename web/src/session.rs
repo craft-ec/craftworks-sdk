@@ -62,9 +62,6 @@ pub struct Session {
     page_identity_sent: bool,
     /// The signer's provisioning was reported by `take_progress`.
     provision_told: bool,
-    /// A VIEW of somebody's published head (`open_named`, sdk#239): reads
-    /// only, and every write refused before it reaches the store.
-    read_only: bool,
     /// THE APP this session is (the forest ruling): a person has ONE tree,
     /// divided by app. Every domain name crossing into this session is
     /// app-relative and gains `<app>.` here, so an app has no name for
@@ -98,7 +95,6 @@ impl Session {
             unusable: Vec::new(),
             foreign_notifications: 0,
             bound: craftworks_sdk::LiveBindings::default(),
-            read_only: false,
             app: None,
             signer_code: Vec::new(),
             page_identity_sent: false,
@@ -446,12 +442,52 @@ impl Session {
     /// that only reads somebody's head calls [`Session::open_named`] instead.
     pub fn provision(&mut self, signer: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
         // A VIEW installs nothing on the node it reads from (sdk#239).
-        if self.read_only {
+        if self.page().is_some_and(|p| p.read_only()) {
             self.unusable.push(format!("{READ_ONLY}: provisioning refused"));
             return;
         }
         self.signer_code = signer;
         self.provision_page(block, register);
+    }
+
+    /// WHOSE NODE IS THIS: ask the node's EXISTING signer which Register it
+    /// signs for, registering nothing (`PageIo::ask`). A publisher's page
+    /// compares the answer with the app's publisher head: equal, the person
+    /// opening it holds the key on this node, and it opens WRITABLE through
+    /// `provision`; otherwise it is another user's node, and nothing was installed or
+    /// minted here. The answer: [`Session::asked`].
+    pub fn ask_signer(&mut self, signer: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
+        if self.page().is_some() {
+            self.unusable.push("ask_signer: this session already has a page".into());
+            return;
+        }
+        let (_, key) = wire::delegate_from_code(&signer);
+        // Kept for `open_own`: a node with no signer gets this one then.
+        self.signer_code = signer;
+        let art = page_io::Artefacts { block_code: block, register_code: register, register_params: Vec::new(), signer: key };
+        let server = page::server::Server::new(
+            page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
+            page::server::SignerFacts::default(),
+        );
+        let mut io = page_io::PageIo::new(server, art);
+        io.ask();
+        self.db.store_mut().set_host(io);
+        self.pump_page();
+    }
+
+    /// [`Session::ask_signer`]'s answer, as JSON:
+    /// `{"state":"pending"|"register"|"nokey"|"nosigner"|"refused"|"silent","register":"<hex>","said":"…"}`.
+    pub fn asked(&self) -> String {
+        use page_io::Asked;
+        let (state, register, said) = match self.page().and_then(|p| p.asked()) {
+            None => ("pending", String::new(), String::new()),
+            Some(Asked::Register(id)) => ("register", craftworks_sdk::hex(id), String::new()),
+            Some(Asked::NoKey) => ("nokey", String::new(), String::new()),
+            Some(Asked::NoSigner(w)) => ("nosigner", String::new(), w.clone()),
+            Some(Asked::Refused(w)) => ("refused", String::new(), w.clone()),
+            Some(Asked::NotAnswering) => ("silent", String::new(), String::new()),
+        };
+        serde_json::json!({ "state": state, "register": register, "said": said }).to_string()
     }
 
     /// The provisioning: a TEST key minted here and FORGOTTEN (as the
@@ -560,23 +596,15 @@ impl Session {
     /// Instead of `provision`: the in-page engine reads that head
     /// and its blocks through page-io's READER — no signer, nothing installed
     /// or registered on this node — and every write is refused before it
-    /// reaches the store ([`Session::read_only`]).
+    /// reaches the store ([`Session::can_write`] says "no").
     ///
     /// `range` (1..=255): this reader's stream-id range on the shared socket,
     /// one per open tree.
     pub fn open_named(&mut self, block_code: Vec<u8>, register_id: &str, range: u8) -> Result<(), JsValue> {
-        let bad = || JsValue::from_str("open_named: a register id is 64 hex characters");
-        if register_id.len() != 64 || !register_id.is_ascii() {
-            return Err(bad());
-        }
-        let mut id = [0u8; 32];
-        for (i, b) in id.iter_mut().enumerate() {
-            *b = u8::from_str_radix(&register_id[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
-        }
+        let id = head_of_hex(register_id).ok_or_else(|| JsValue::from_str("open_named: a register id is 64 hex characters"))?;
         if self.page().is_some() {
             return Err(JsValue::from_str("open_named: this session is already open on its own head"));
         }
-        self.read_only = true;
         let server = page::server::Server::new(
             page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
             page::server::SignerFacts::default(),
@@ -587,10 +615,36 @@ impl Session {
         Ok(())
     }
 
-    /// This session is a VIEW (`open_named`): nothing can be written. What a
-    /// runtime renders from — a view shows no inputs.
-    pub fn read_only(&self) -> bool {
-        self.read_only
+    /// MAY THIS SESSION WRITE `head`? The ONE decision a runtime renders
+    /// inputs from (DATA-SOURCE; the architect's point 5), and the same one
+    /// every write is refused by: `head` is a head id in hex, or "" for this
+    /// session's OWN tree (a `mine` component's). As JSON:
+    /// `{"answer":"yes"|"no"|"unknown","why":"…"}`. Derived each time from
+    /// what page-io holds (the signer's answer, the page's opening), and
+    /// cached nowhere -- not here, not in JS.
+    pub fn can_write(&self, head: &str) -> String {
+        let (answer, why) = match self.may_write(head) {
+            page_io::MayWrite::Yes => ("yes", String::new()),
+            page_io::MayWrite::No(w) => ("no", w),
+            page_io::MayWrite::Unknown(w) => ("unknown", w),
+        };
+        serde_json::json!({ "answer": answer, "why": why }).to_string()
+    }
+
+    /// OPEN THE USER'S OWN TREE on an asked session (DATA-SOURCE `mine`):
+    /// `PageIo::claim`, then what opening does -- a key is minted only where
+    /// the signer holds none (`mint_if_needed`), and the head is created by
+    /// the first write. Answers `can_write("")` afterwards. A session opened
+    /// with `provision` is open on its own tree already: nothing to do.
+    pub fn open_own(&mut self) -> String {
+        if self.page().is_some_and(|p| p.asking()) {
+            let (container, _) = wire::delegate_from_code(&self.signer_code);
+            if let Some(p) = self.page_mut() {
+                p.claim(container);
+            }
+            self.pump_page();
+        }
+        self.can_write("")
     }
 
     /// The head this session stands on, as `open_named` takes it: the head
@@ -654,11 +708,12 @@ impl Session {
         // one is a no-op (an app defines its domains on open, and a view runs
         // the same app); any other is a write, refused. The schema is READ
         // through the same decision, so an unloaded one parks, never "none".
-        if self.read_only {
+        self.write_name(domain)?;
+        if let page_io::MayWrite::No(why) | page_io::MayWrite::Unknown(why) = self.may_write("") {
             let name = self.read_name(domain)?;
             let r = self.db.schema(&name).and_then(|old| match old {
                 Some(o) if o == s => Ok(()),
-                _ => Err(DbError::Refused(format!("{READ_ONLY}: `{domain}` is not defined like that here"))),
+                _ => Err(DbError::Refused(format!("{why}: `{domain}` is not defined like that here"))),
             });
             return self.decided(r);
         }
@@ -680,8 +735,10 @@ impl Session {
     }
 
     pub fn put(&mut self, domain: &str, fields: &str) -> Result<String, JsValue> {
-        self.writable()?;
+        // The NAME first: whose data it is decides before whether this node
+        // may write (another app's is never written, wherever).
         let name = self.write_name(domain)?;
+        self.writable()?;
         let f = fields_of(fields)?;
         let r = self.db.put(&name, &f);
         json_of(self.decided(r)?)
@@ -692,8 +749,10 @@ impl Session {
     /// parked `NotLoaded` like any read — never taken for absent, which in a
     /// fresh session would write over the published record.
     pub fn create_at(&mut self, domain: &str, slot: &str, fields: &str) -> Result<String, JsValue> {
-        self.writable()?;
+        // The NAME first: whose data it is decides before whether this node
+        // may write (another app's is never written, wherever).
         let name = self.write_name(domain)?;
+        self.writable()?;
         let f = fields_of(fields)?;
         let s = rkey_of(slot)?;
         let r = self.db.create_at(&name, s, &f);
@@ -701,8 +760,10 @@ impl Session {
     }
 
     pub fn update(&mut self, domain: &str, id: &str, patch: &str) -> Result<String, JsValue> {
-        self.writable()?;
+        // The NAME first: whose data it is decides before whether this node
+        // may write (another app's is never written, wherever).
         let name = self.write_name(domain)?;
+        self.writable()?;
         let p = fields_of(patch)?;
         let k = loc_of(id)?;
         let r = self.db.update(&name, k, &p);
@@ -726,8 +787,10 @@ impl Session {
     }
 
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsValue> {
-        self.writable()?;
+        // The NAME first: whose data it is decides before whether this node
+        // may write (another app's is never written, wherever).
         let name = self.write_name(domain)?;
+        self.writable()?;
         let k = loc_of(id)?;
         let r = self.db.delete(&name, k);
         self.decided(r)
@@ -1184,18 +1247,47 @@ impl Session {
     }
 }
 
-/// What every refusal of a view says first.
-const READ_ONLY: &str = "read-only: this is a view of somebody's published data, and writing needs write access";
+use page_io::READ_ONLY;
 
 impl Session {
-    /// A view refuses every write, before it reaches the store: the safety
-    /// net under a runtime that renders a view with no inputs at all.
-    fn writable(&self) -> Result<(), JsValue> {
-        if self.read_only {
-            return Err(db_err(&DbError::Refused(READ_ONLY.into())));
+    /// THE DECISION, page-io's (`PageIo::may_write`): `head` in hex, or "" for
+    /// this session's own tree. No page yet: not known.
+    fn may_write(&self, head: &str) -> page_io::MayWrite {
+        let Some(p) = self.page() else { return page_io::MayWrite::Unknown("this session is not open on a node yet".into()) };
+        if head.is_empty() {
+            return p.may_write(None);
         }
-        Ok(())
+        match head_of_hex(head) {
+            Some(h) => p.may_write(Some(h)),
+            None => page_io::MayWrite::No(format!("`{head}` is not a head id (64 hex characters)")),
+        }
     }
+
+    /// Every write is refused by the SAME decision the runtime renders from
+    /// (`can_write("")`), before it reaches the store. An asked session's
+    /// first write opens the user's own tree (`open_own`): the head is
+    /// created on first write.
+    fn writable(&mut self) -> Result<(), JsValue> {
+        if self.page().is_some_and(|p| p.asking()) {
+            self.open_own();
+        }
+        match self.may_write("") {
+            page_io::MayWrite::Yes => Ok(()),
+            page_io::MayWrite::No(why) | page_io::MayWrite::Unknown(why) => Err(db_err(&DbError::Refused(why))),
+        }
+    }
+}
+
+/// A head id as `head_id()` gives it: 64 hex characters.
+fn head_of_hex(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.is_ascii() {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (i, b) in id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(id)
 }
 
 fn db_err(e: &DbError) -> JsValue {

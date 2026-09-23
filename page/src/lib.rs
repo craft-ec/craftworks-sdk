@@ -265,6 +265,8 @@ enum Waiting {
 struct Owed {
     seq: u64,
     root: Cid,
+    /// The root the commit was built on: its head's prev is `(seq - 1, base)`.
+    base: Cid,
     /// The exact record to UPDATE, once the signer returned it.
     record: Option<Vec<u8>>,
     /// Register reads since the last UPDATE that still showed an older head.
@@ -1261,7 +1263,11 @@ impl Page {
         let id = self.next_request;
         self.next_request = self.next_request.checked_add(1).unwrap_or(1);
         self.sign_id = Some(id);
-        let (prev_seq, prev_root, seq, root) = (self.engine.published_seq(), self.engine.published_root(), o.seq, o.root);
+        // The prev is the commit's BASE, never "whatever the engine
+        // publishes now": signed after a foreign winner was adopted, that
+        // would name the winner as prev of a root built without it, and the
+        // winner's rows would be lost from every later head.
+        let (prev_seq, prev_root, seq, root) = (o.seq - 1, o.base, o.seq, o.root);
         let ledger = self.sign_ledger_of(prev_seq, prev_root, seq, root);
         let op = Op::Sign { id, prev_seq, prev_root, seq, root, ledger };
         self.send(Waiting::Sign, op);
@@ -1426,6 +1432,11 @@ impl Page {
         }
     }
 
+    /// What the engine publishes now, as a head.
+    fn engine_published(&self) -> (u64, Cid) {
+        (self.engine.published_seq(), self.engine.published_root())
+    }
+
     /// An owed head is LIVE only while it is ahead of what the engine has
     /// published. Once the engine adopts another head (a conflict, a recovery
     /// read), the commit that owed it is dead — its writes were told `Lost` —
@@ -1433,7 +1444,10 @@ impl Page {
     /// asking the signer for a dead commit from a stale prev (the model found
     /// it: `NotSuccessor`, hidden behind the retries that got round it).
     fn drop_dead_head(&mut self) {
-        if self.owed.as_ref().is_some_and(|o| o.seq <= self.engine.published_seq()) {
+        // Also dead: a head whose commit was built on a root the engine no
+        // longer publishes (a foreign winner adopted under it).
+        let published = self.engine_published();
+        if self.owed.as_ref().is_some_and(|o| o.seq <= published.0 || (o.seq - 1, o.base) != published) {
             self.owed = None;
             self.sign_again = None;
             self.sign_refusals = 0;
@@ -1516,8 +1530,13 @@ impl Page {
                     // the engine now publishes, and asking for it would name a
                     // prev it does not follow (the model: `NotSuccessor`).
                     Effect::UpdateHead { seq, .. } if seq <= self.engine.published_seq() => {}
-                    Effect::UpdateHead { seq, root, .. } => {
-                        self.owed = Some(Owed { seq, root, record: None, stale_reads: 0 });
+                    // A head whose commit was built on a root the engine no
+                    // longer publishes is DEAD: a foreign winner was adopted
+                    // under it. The engine re-derives the commit on the new
+                    // root and emits a new head.
+                    Effect::UpdateHead { seq, base, .. } if (seq - 1, base) != self.engine_published() => {}
+                    Effect::UpdateHead { seq, root, base, .. } => {
+                        self.owed = Some(Owed { seq, root, base, record: None, stale_reads: 0 });
                         self.ask_sign();
                     }
                     _ => unreachable!("only puts and heads are held"),

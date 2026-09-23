@@ -2160,3 +2160,95 @@ fn a_block_silent_for_five_minutes_then_answering_is_read() {
     }
     println!("  5 min silent: {sent} GETs re-sent, no Unavailable; node answers -> the read answers");
 }
+
+/// **A HEAD IS SIGNED AS THE SUCCESSOR OF ITS OWN BASE, NEVER OF WHATEVER IS
+/// PUBLISHED NOW** (data loss found by the page model, two devices, seed 10:
+/// "the final tree lost p0/004"; reached there through race put's early head).
+/// The page publishes `a` at seq s. Its next commit (`b`, seq s+1, built on
+/// its own s) puts its blocks, but the node's ACKS are held back, so the engine
+/// settles them by fact and emits the head while the page still holds it for
+/// its acks. Another device of the same identity then wins seq s with `other`,
+/// and the page adopts it. When the acks arrive and the held head is released,
+/// it must not be signed with the WINNER as its prev: the signer would accept
+/// (the prev matches the register), and `other` would be gone from every
+/// later head. The commit is re-derived on the winner instead.
+#[test]
+fn a_commit_built_before_a_foreign_winner_is_never_signed_as_its_successor() {
+    use signer_proto::head::{value, Ledger};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("base", Some("0"))])), 1)));
+    let (base_seq, base_root) = node.head().expect("the base");
+    assert!(published(&states(&rig.client_as(&mut node, &write(2, &[("a", Some("1"))])), 2)));
+    let hr = node.head_read().expect("our head at s");
+    let (s, ours) = node.head().expect("our head at s");
+    let mut signs: Vec<(Cid, Cid)> = Vec::new();
+    let mut withheld: Vec<Answer> = Vec::new();
+    // Every op the page sends is answered, the signer's included, and every
+    // sign request is recorded first; a PUT's ACK is held back while
+    // `withhold` (the block itself does reach the node).
+    let pump = |rig: &mut PageRig, node: &mut Node, withhold: bool, signs: &mut Vec<(Cid, Cid)>, withheld: &mut Vec<Answer>| {
+        for op in std::mem::take(&mut rig.held) {
+            if let Op::Sign { prev_root, root, .. } = &op {
+                signs.push((*prev_root, *root));
+            }
+            let put = matches!(op, Op::Put { .. });
+            if let Some(a) = rig.answer(node, op) {
+                if put && withhold {
+                    withheld.push(a);
+                } else {
+                    rig.server.node(a, Ms(rig.now));
+                }
+            }
+        }
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        rig.run(node)
+    };
+    // A CHECKED write (it read `b` absent): a dead commit's checked write is
+    // re-applied on the winner, where a forced one would end `Lost`.
+    rig.faults.hold = true;
+    let w3 = Request::Commit { write_id: 3, reads: vec![(b"b".to_vec(), protocol::Expect::Absent)], ops: vec![protocol::Op::Put(b"b".to_vec(), b"2".to_vec())] };
+    let mut rs = rig.client_as(&mut node, &w3);
+    for _ in 0..40 {
+        rs.extend(pump(&mut rig, &mut node, true, &mut signs, &mut withheld));
+    }
+    assert!(!withheld.is_empty(), "no put ack was held back: the case this test is about did not happen");
+    assert!(signs.is_empty(), "the head was signed before its acks arrived: {signs:?}");
+    // Another device wins seq s, from the same base, with `other`.
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let base_tree = node.tree(&base_root).expect("whole");
+    let mut salt = 0u8;
+    let (winner, st) = loop {
+        let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
+        e.push((b"other".to_vec(), vec![salt]));
+        let r = device_tree(&mut node, &e);
+        let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base_seq, root: base_root }), ..Ledger::default() });
+        if page::beats(&v, hr.value()) {
+            break (r, contract_keys::register::head_state(&node.register_params, &key_of, s, &v).expect("signs"));
+        }
+        salt += 1;
+    };
+    node.update(&st);
+    assert_eq!(node.head(), Some((s, winner)), "the winner did not take the register");
+    rig.server.head_hint();
+    for _ in 0..10 {
+        rs.extend(pump(&mut rig, &mut node, true, &mut signs, &mut withheld));
+    }
+    assert_eq!(rig.server.page.published(), (s, winner), "the page did not adopt the winner");
+    // The held-back acks arrive now: the held head is released.
+    for a in std::mem::take(&mut withheld) {
+        rig.server.node(a, Ms(rig.now));
+    }
+    for _ in 0..40 {
+        rs.extend(pump(&mut rig, &mut node, false, &mut signs, &mut withheld));
+    }
+    let lying: Vec<_> = signs.iter().filter(|(p, _)| *p == winner).filter(|(_, r)| !node.tree(r).is_some_and(|t| t.contains_key(&b"other"[..]))).collect();
+    assert!(lying.is_empty(), "a root WITHOUT the winner's row was signed as the winner's successor: {} time(s)", lying.len());
+    let (_, root) = node.head().expect("a head");
+    let fin = tree_of(&node, &root);
+    assert!(fin.contains_key(&b"other"[..]), "the winner's row is gone from the final tree");
+    assert_eq!(fin.get(&b"b"[..]).map(Vec::as_slice), Some(&b"2"[..]), "the later write never landed (told {:?})", states(&rs, 3));
+    let _ = ours;
+}

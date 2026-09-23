@@ -143,7 +143,7 @@ export async function openSession(Session, {
   port,
   artefacts = null,
   // Provision this person's OWN tree on the node (install the engine and
-  // hand it a key). FALSE opens the socket and installs NOTHING: a visitor who
+  // hand it a key). FALSE opens the socket and installs NOTHING: a user who
   // only reads other people's trees (`tree`) leaves no trace on the node, and
   // their own tree is not created until they have something to write
   // (builder#104). The artefacts are still used — `tree` needs the Block code.
@@ -237,7 +237,10 @@ export async function openSession(Session, {
       );
     }
     blockCode = block;
-    session.provision(signer, block, register);
+    // "ask": only ASK this node's signer whose it is (`openAsked`) —
+    // nothing registered, minted or provisioned.
+    if (provision === "ask") session.ask_signer(signer, block, register);
+    else session.provision(signer, block, register);
   }
 
   // THE UNSAVED-CHANGES GUARD (craftworks-sdk#163).
@@ -463,8 +466,19 @@ export async function openSession(Session, {
   return {
     session,
     provisioned: () => session.provisioned(),
-    // This person's own session writes; a tree handle (below) is read-only.
-    readOnly: () => session.read_only(),
+    /** `provision: "ask"`'s answer (`openAsked`): this session's identity here. */
+    asked: () => JSON.parse(session.asked()),
+    /**
+     * MAY THIS SESSION WRITE `head`? ("" = its own tree: a `mine`
+     * component's.) `{answer: "yes"|"no"|"unknown", why}`, decided in Rust
+     * from the signer's answer each time it is asked -- a runtime ASKS it
+     * each render and keeps no copy (one owner). "unknown": show the inputs
+     * disabled, with `why`.
+     */
+    canWrite: (head = "") => JSON.parse(session.can_write(head)),
+    // `openAsked`'s `openOwn` in two halves: this one claims the tree and
+    // sends what that made (sync); `openAsked` waits for it to open.
+    claimOwn: () => { const r = JSON.parse(session.open_own()); conn.pump(); return r; },
     // The head this session stands on, as `tree()` takes it (hex; "" until
     // Identity has named it). What a publisher records so others can read it.
     headId: () => session.head_id(),
@@ -565,6 +579,49 @@ export async function openSession(Session, {
  * So the SDK does it. `engineDb(session)` stays exported for tests, where
  * driving the parts separately is the whole point.
  */
+/**
+ * OPEN A SESSION THAT ASKS WHOSE NODE THIS IS: the node's existing signer is
+ * asked which Register (head) it signs for — registering, minting and
+ * provisioning NOTHING — and the SESSION STAYS OPEN: its `asked()` is this
+ * page's identity on this node, read from the session and cached nowhere
+ * else. Resolves the handle with `head` (the node's signer signs for it) or
+ * `head: null` and `why` (no signer, no key, refused, not answering: the
+ * first request's own ends). The handle reads trees (`tree`) like any other;
+ * a caller that is done with it closes it.
+ */
+export async function openAsked(Session, { port, artefacts, pollMs = 100, ...rest } = {}) {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error("openAsked() needs a port");
+  if (!artefacts) throw new Error("openAsked() needs the artefacts: the signer's code names it");
+  const handle = await openSession(Session, { ...rest, port, artefacts, provision: "ask" });
+  // The session's own db: the user's own tree once `openOwn` opened it, and
+  // the publisher's own tree on the publisher's node (the same tree).
+  const db = engineDb(handle);
+  /**
+   * OPEN THE USER'S OWN TREE (DATA-SOURCE `mine`): the node's key is used
+   * where it has one, minted where it has none (the existing provision path),
+   * and the tree's head is created by its first write. Resolves
+   * `canWrite("")` once the tree is open.
+   */
+  const openOwn = async () => {
+    const r = handle.claimOwn();
+    if (r.answer === "yes" && !handle.provisioned()) await untilProvisioned(handle, rest);
+    return handle.canWrite("");
+  };
+  try {
+    for (;;) {
+      const a = handle.asked();
+      if (a.state === "register") return { ...handle, db, openOwn, head: a.register, why: null };
+      if (a.state !== "pending") return { ...handle, db, openOwn, head: null, why: a.said || a.state };
+      // A node that never opened ends it too (sdk#292's rule).
+      if (handle.refusedBeforeOpen() >= 2) return { ...handle, db, openOwn, head: null, why: "the node refused the connection" };
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+  } catch (e) {
+    handle.close();
+    throw e;
+  }
+}
+
 export async function open(Session, opts = {}) {
   // NO APP, NO SESSION: a person's tree is divided by app, and a session with
   // no app would write outside every app's space (the forest ruling).

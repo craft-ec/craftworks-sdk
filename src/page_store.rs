@@ -131,7 +131,7 @@ pub struct PageStore<H: Host> {
     answered_at: Option<Cid>,
     /// A VIEW of somebody's published head (`open_named`): it writes nothing,
     /// so its warm root IS its published root — asserted where `head()`
-    /// answers, so a future "preview as a visitor" of one's OWN tree cannot
+    /// answers, so a future "preview as another user" of one's OWN tree cannot
     /// inherit the warm root silently (READ-STATE inv. 6).
     view: bool,
     /// Why a ticket ended UNAVAILABLE, in the engine's words, until it is
@@ -343,7 +343,7 @@ impl<H: Host> PageStore<H> {
         self.tickets.remove(&ticket);
     }
 
-    /// This store is a VIEW (READ-STATE inv. 6: a visitor's walk takes the
+    /// This store is a VIEW (READ-STATE inv. 6: another user's walk takes the
     /// published root).
     pub fn set_view(&mut self) {
         self.view = true;
@@ -426,7 +426,7 @@ impl<H: Host> PageStore<H> {
             let warm = s.read_root()?;
             if view {
                 // A view writes nothing: its warm root is its published one,
-                // and it is the published root a visitor's walk takes.
+                // and it is the published root another user's walk takes.
                 let published = s.page.published().1;
                 assert_eq!(warm, published, "a VIEW's warm root differs from its published root: something wrote into a view");
                 return Some(published);
