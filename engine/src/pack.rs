@@ -1,13 +1,11 @@
 //! A commit's blocks in one PUT, and the manifest that makes the network the
 //! journal.
 //!
-//! **The pack format is defined by the Block contract** (freenet-contracts,
-//! `block/src/pack.rs`), which is what actually refuses a malformed one. This
-//! is a second implementation of the same bytes, and that is a real hazard:
-//! two spellings of one format drift, and the drift shows up as a host
-//! refusing a commit. It is here because the engine cannot depend on the
-//! contracts repo, and it is pinned by a vector test against the format as
-//! documented. A shared crate is the eventual answer.
+//! **The pack FORMAT lives in `freenet_prolly::pack`, once** (sdk#305). This
+//! file used to be a second implementation of the same bytes; what is left
+//! here is what the format deliberately does not decide: the kind a pack is
+//! stored under, each kind's ceiling (the Block contract's numbers), and the
+//! commit manifest.
 //!
 //! ```text
 //! pack     = "PK01" ‖ count:u16 ‖ member*
@@ -19,9 +17,9 @@
 //! Members are strictly ascending BY BLOCK ID, so a set has one encoding and
 //! two writers packing the same commit produce the same pack.
 
-use freenet_prolly::{block_id, kind, Cid};
+use freenet_prolly::{block_id, kind, pack as format, Cid};
 
-pub const PACK_MAGIC: &[u8; 4] = b"PK01";
+pub const PACK_MAGIC: &[u8; 4] = format::MAGIC;
 pub const MANIFEST_MAGIC: &[u8; 4] = b"CM01";
 
 /// The kind byte a pack is stored under. Not a kind this crate may invent:
@@ -52,8 +50,9 @@ pub const MAX_BODY: usize = 256 * 1024 + 64;
 /// A parity symbol is as long as the longest member it codes, plus its framing.
 pub const MAX_PARITY: usize = 4 + 1 + MAX_BODY;
 
-/// The largest pack, as a container. Agrees with the contract.
-pub const MAX_PACK: usize = 1024 * 1024;
+/// The largest pack, as a container: the format's own ceiling, which the
+/// contract applies too.
+pub const MAX_PACK: usize = format::MAX_PACK;
 
 /// The largest body the contract accepts for a block of `kind`.
 ///
@@ -136,42 +135,35 @@ pub enum PackError {
 }
 
 /// Build one pack body. Members are sorted and de-duplicated by block id,
-/// because a pack is a SET and the same block offered twice is one member.
+/// because a pack is a SET and the same block offered twice is one member —
+/// which is `freenet_prolly::pack::build`'s to do; this adds the contract's
+/// per-kind ceiling in front of it.
 pub fn build(members: &[(u8, Vec<u8>)]) -> Result<Vec<u8>, PackError> {
-    let mut ordered: Vec<&(u8, Vec<u8>)> = members.iter().collect();
-    ordered.sort_by_key(|(k, b)| block_id(*k, b));
-    ordered.dedup_by_key(|(k, b)| block_id(*k, b));
-    if ordered.is_empty() {
-        return Err(PackError::Empty);
-    }
-    if ordered.len() > u16::MAX as usize {
-        return Err(PackError::TooManyMembers(ordered.len()));
-    }
     // THE MISSING COMPARISON. Checked per MEMBER against its own kind's limit,
     // because that is what the contract applies — a pack whose total fits can
     // still carry a member the network refuses, and that refusal happens
     // remotely where it is hardest to see.
-    if let Some((kind, body)) = ordered.iter().find(|(k, b)| b.len() > max_body(*k)) {
+    if let Some((kind, body)) = members.iter().find(|(k, b)| b.len() > max_body(*k)) {
         return Err(PackError::TooLarge { kind: *kind, len: body.len(), limit: max_body(*kind) });
     }
-    let mut out = Vec::from(&PACK_MAGIC[..]);
-    out.extend_from_slice(&(ordered.len() as u16).to_le_bytes());
-    for (k, b) in ordered {
-        out.push(*k);
-        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
-        out.extend_from_slice(b);
-    }
-    Ok(out)
+    format::build(members).map_err(|e| match e {
+        format::BuildError::Empty => PackError::Empty,
+        format::BuildError::TooManyMembers(n) => PackError::TooManyMembers(n),
+        // Unreachable behind the per-kind check above (every kind's ceiling is
+        // far below u32::MAX), and named rather than assumed.
+        format::BuildError::MemberTooLong(len) => PackError::TooLarge { kind: 0, len, limit: MAX_BODY },
+        format::BuildError::TooLarge(len) => PackError::TooLarge { kind: PACK_KIND, len, limit: MAX_PACK },
+    })
 }
 
 /// What one member costs inside a pack: its bytes plus the header the format
 /// puts in front of it. Used to plan a pack without building it first.
 pub fn member_cost(bytes: usize) -> usize {
-    1 + 4 + bytes
+    format::MIN_MEMBER + bytes
 }
 
 /// The header every pack carries, whatever is in it.
-pub const PACK_HEADER: usize = 4 + 2;
+pub const PACK_HEADER: usize = format::HEADER;
 
 /// The id a pack body will have.
 pub fn pack_id(body: &[u8]) -> Cid {
@@ -193,29 +185,12 @@ pub fn member_kind(bytes: &[u8]) -> u8 {
 
 /// The members of a pack body, as `(id, bytes)`.
 ///
-/// Returns what it can read and stops at the first thing that does not parse:
-/// a pack from a stranger is bytes, not a promise, and the caller
-/// hash-checks every member anyway.
+/// `freenet_prolly::pack::members` walks the format, and a body it refuses
+/// (bad magic, truncated, out of order) yields NOTHING here rather than the
+/// prefix a hand-rolled walk could read: a pack from a stranger is bytes, not a
+/// promise, and the caller hash-checks every member anyway.
 pub fn members(body: &[u8]) -> Vec<(Cid, Vec<u8>)> {
-    let mut out = Vec::new();
-    let Some((head, mut rest)) = body.split_at_checked(PACK_HEADER) else {
-        return out;
-    };
-    if &head[..4] != PACK_MAGIC {
-        return out;
-    }
-    let count = u16::from_le_bytes([head[4], head[5]]) as usize;
-    for _ in 0..count {
-        let Some((h, tail)) = rest.split_at_checked(5) else {
-            return out;
-        };
-        let k = h[0];
-        let len = u32::from_le_bytes([h[1], h[2], h[3], h[4]]) as usize;
-        let Some((bytes, tail)) = tail.split_at_checked(len) else {
-            return out;
-        };
-        rest = tail;
-        out.push((freenet_prolly::block_id(k, bytes), bytes.to_vec()));
-    }
-    out
+    format::members(body)
+        .map(|ms| ms.into_iter().map(|m| (m.id, m.body.to_vec())).collect())
+        .unwrap_or_default()
 }
