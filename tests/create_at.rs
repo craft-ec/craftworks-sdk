@@ -127,7 +127,7 @@ fn a_fresh_session_over_a_published_record_does_not_write_until_it_has_looked() 
     let id = to_hex(&slot());
     published.call(|d| d.update("tasks", loc_from_hex(&id).unwrap(), &fields(json!({ "title": "edited since" })))).unwrap();
     published.seconds(5);
-    assert!(published.db.store().writes.unsaved_writes() == 0, "the publisher's writes did not publish");
+    assert!(published.db.store().unsaved_writes() == 0, "the publisher's writes did not publish");
 
     // A fresh session on the same node: its own page, holding nothing.
     let mut d = support::page_tab::Tab::open(&node, clock(NOW).0, [9, 9, 9, 9]);
@@ -136,7 +136,7 @@ fn a_fresh_session_over_a_published_record_does_not_write_until_it_has_looked() 
     let first = d.db.create_at("tasks", slot(), &fields(json!({ "title": "Preview's copy" })));
     if let Err(e) = &first {
         assert!(matches!(e, DbError::NotLoaded { .. }), "{e:?}");
-        assert_eq!(d.db.store().writes.copy.pending_writes(), 0, "a write went out before the slot was read");
+        assert_eq!(d.db.store().writes.open_writes(), 0, "a write went out before the slot was read");
     }
     let _ = d.db.store_mut().decide(first);
     // Asked the way a page asks, until it has looked: the record is there,
@@ -144,7 +144,7 @@ fn a_fresh_session_over_a_published_record_does_not_write_until_it_has_looked() 
     let again = d.call(|db| db.create_at("tasks", slot(), &fields(json!({ "title": "Preview's copy" })))).unwrap();
     let CreateAt::Exists(held) = again else { panic!("wrote over the published record: {again:?}") };
     assert_eq!(held.fields["title"], "edited since");
-    assert_eq!(d.db.store().writes.copy.pending_writes(), 0, "stored bytes changed");
+    assert_eq!(d.db.store().writes.open_writes(), 0, "stored bytes changed");
     assert!(d.log.borrow().sends.is_empty(), "the fresh session sent a write: {:?}", d.log.borrow().sends);
 }
 

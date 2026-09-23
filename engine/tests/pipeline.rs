@@ -120,31 +120,6 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
     }
 }
 
-/// Drive a commit from its puts to `published`, confirming in the given order.
-fn settle(
-    e: &mut Engine<Store>,
-    seen: &mut Seen,
-    effects: Vec<Effect>,
-    order: &[usize],
-) -> Vec<Effect> {
-    // The caller has already absorbed `effects`; absorbing them again would
-    // record every notification in them twice and make "once per state" read
-    // as a duplicate.
-    let mut all = effects.clone();
-    let pending = ids(&effects);
-    for i in order {
-        let out = stepped!(e, Event::PutConfirmed(pending[*i]));
-        seen.absorb(&out);
-        all.extend(out.clone());
-        if let Some((seq, _, _)) = head_of(&out) {
-            let out = stepped!(e, Event::HeadConfirmed(seq));
-            seen.absorb(&out);
-            all.extend(out);
-        }
-    }
-    all
-}
-
 #[test]
 fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
     // Two values too large to ride in a pack, so the commit has SEVERAL
@@ -223,56 +198,69 @@ fn one_write_reaches_published_and_the_head_waits_for_its_packs() {
     );
 }
 
+/// Confirm every put and head the engine asks for, until it asks for none.
+fn drive(e: &mut Engine<Store>, seen: &mut Seen, first: Vec<Effect>) {
+    let mut queue = first;
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 100_000, "the engine did not settle");
+        let ev = match f {
+            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } | Effect::PutParity { id, .. } => Event::PutConfirmed(id),
+            Effect::UpdateHead { seq, .. } => Event::HeadConfirmed(seq),
+            _ => continue,
+        };
+        let out = stepped!(e, ev);
+        seen.absorb(&out);
+        queue.extend(out);
+    }
+}
+
+/// A write during a commit is QUEUED (R-b; COMMIT-LIFE § A write's stage):
+/// `Accepted` into the warm root at once, nothing put on the network, and
+/// committed -- one write per commit, rebuilt on the root the first one
+/// published -- when the first publishes. It used to be refused `Busy`, and
+/// an outbox re-sent it for ever.
 #[test]
-fn a_write_during_a_commit_is_refused_and_leaves_no_trace() {
-    // One commit at a time. Folding needed the folded write's blocks to
-    // survive until the next commit, and the core keeps no blocks — so a
-    // write that arrives mid-commit is REFUSED rather than quietly carried.
-    // Buffering is the client's job: it has a page and an outbox, and the
-    // delegate has neither.
+fn a_write_during_a_commit_is_queued_and_commits_after_it() {
     let mut e = common::new_store_params(Params::default());
     let mut seen = Seen::default();
 
     let first = stepped!(e, write(1, 1, vec![put("k/1", b"one")]));
     seen.absorb(&first);
     assert!(!ids(&first).is_empty(), "the first write shipped nothing");
-    let root_after_first = e.root();
+    let published_before = e.published_root();
 
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    expected.insert(b"k/1".to_vec(), b"one".to_vec());
     for (client, id, key) in [(1u64, 2u64, "k/2"), (2, 3, "k/3")] {
         let out = stepped!(e, write(client, id, vec![put(key, b"v")]));
         seen.absorb(&out);
-        assert_eq!(
-            seen.of(client, id),
-            &[State::Busy],
-            "a write during a commit was not refused"
-        );
-        assert!(
-            ids(&out).is_empty(),
-            "a refused write put blocks on the network"
-        );
-        assert_eq!(
-            e.root(),
-            root_after_first,
-            "a refused write changed the tree anyway: it left a trace"
-        );
+        assert_eq!(seen.of(client, id), &[State::Accepted], "a write during a commit was not taken");
+        assert!(ids(&out).is_empty(), "a queued write put blocks on the network before its turn");
+        assert!(head_of(&out).is_none(), "a queued write moved a head before its turn");
+        expected.insert(key.as_bytes().to_vec(), b"v".to_vec());
+        assert_eq!(e.root(), common::rebuild(&expected), "the warm root is not every write taken, in order");
+        assert_eq!(e.published_root(), published_before, "a queued write moved the published root");
     }
 
-    // The first write still completes normally.
-    let n = ids(&first).len();
-    let _ = settle(&mut e, &mut seen, first, &(0..n).collect::<Vec<_>>());
-    assert!(
-        seen.of(1, 1).contains(&State::Published),
-        "the in-flight write did not publish: {:?}",
-        seen.of(1, 1)
-    );
-    // And once it has, the next write is accepted.
-    let out = stepped!(e, write(1, 4, vec![put("k/4", b"after")]));
-    seen.absorb(&out);
-    assert_eq!(
-        seen.of(1, 4).first(),
-        Some(&State::Accepted),
-        "a write after the commit published was still refused"
-    );
+    // Every write publishes, each in its own commit, in order.
+    drive(&mut e, &mut seen, first);
+    for (client, id) in [(1u64, 1u64), (1, 2), (2, 3)] {
+        assert!(
+            seen.of(client, id).contains(&State::Published),
+            "write ({client}, {id}) did not publish: {:?}",
+            seen.of(client, id)
+        );
+    }
+    assert_eq!(e.published_root(), common::rebuild(&expected), "the published tree is not every write");
+    // GROUP COMMIT (K9): the first write's commit, then the two queued behind
+    // it cut together when it publishes -- two commits for three writes.
+    assert_eq!(e.published_seq(), 2, "the two writes queued behind the first did not go as one group");
+    assert_eq!(e.commits_and_writes(), (2, 3), "writes per commit");
+    assert_eq!(e.rebuild_differs(), 0, "K9: a rebuilt commit's root differed from its warm root");
+    assert_eq!(e.own_publish_rederived(), 0, "the warm root was re-derived on own publish");
+    assert_eq!(e.queued_writes(), 0, "the queue did not drain");
 }
 
 /// One seed of the interleaving sweep, driven in one mode.
@@ -834,44 +822,36 @@ fn pick(r: &mut impl FnMut() -> u64, known: &[Cid]) -> Cid {
     }
 }
 
-/// Beyond the backlog bound a write is refused, and refused CLEANLY.
-///
-/// A queue with no bound eventually eats the node. The refusal must leave no
-/// trace: the client will send it again, and a write that was both applied
-/// and refused is the worst of both.
+/// Beyond the QUEUE's BYTE bound a write is told `QueueFull` (R-b; COMMIT-LIFE
+/// K1): nothing applied, nothing put, the warm root as it was -- backpressure
+/// the SDK waits on, not a verdict. There is NO count bound (K9: 300 small
+/// writes all queue). And a session with nothing queued is always taken: one
+/// tab's burst cannot starve another tab's write (its fair share).
 #[test]
-fn a_full_backlog_refuses_a_write_without_applying_it() {
-    let mut e = common::new_store_params(Params {
-        max_write_bytes: 4000,
-        ..Params::default()
-    });
+fn past_the_queue_byte_bound_a_write_waits_and_another_session_is_still_taken() {
+    let mut e = common::new_store_params(Params { max_queue_bytes: 4000, ..Params::default() });
     let mut seen = Seen::default();
-    let out = stepped!(
-        e,
-        write(1, 1, vec![(b"a".to_vec(), Op::Put(vec![1u8; 3000]))])
-    );
+    let out = stepped!(e, write(1, 1, vec![(b"a1".to_vec(), Op::Put(vec![1u8; 3000]))]));
     seen.absorb(&out);
+    assert_eq!(seen.of(1, 1).first(), Some(&State::Accepted), "a write under the bound was not taken");
     let root_before = e.root();
-
-    let out = stepped!(
-        e,
-        write(1, 2, vec![(b"b".to_vec(), Op::Put(vec![2u8; 3000]))])
-    );
+    let out = stepped!(e, write(1, 2, vec![(b"a2".to_vec(), Op::Put(vec![2u8; 3000]))]));
     seen.absorb(&out);
-    assert_eq!(
-        seen.of(1, 2),
-        &[State::Busy],
-        "an over-budget write was accepted"
-    );
-    assert_eq!(
-        e.root(),
-        root_before,
-        "a refused write changed the tree anyway"
-    );
-    assert!(
-        ids(&out).is_empty(),
-        "a refused write put blocks on the network"
-    );
+    assert_eq!(seen.of(1, 2), &[State::QueueFull { bytes: 2 + 3000 + 2 + 33, limit: 4000 }], "past the byte bound the write was not told QueueFull, with the bytes");
+    assert_eq!(e.root(), root_before, "a write past the bound changed the warm root");
+    assert!(ids(&out).is_empty(), "a write past the bound put blocks on the network");
+    // ANOTHER session, nothing queued: taken, over the bound or not.
+    let out = stepped!(e, write(2, 1, vec![(b"b1".to_vec(), Op::Put(vec![3u8; 3000]))]));
+    seen.absorb(&out);
+    assert_eq!(seen.of(2, 1).first(), Some(&State::Accepted), "one session's burst starved another session's first write");
+    // No COUNT bound: many small writes all queue.
+    let mut e = common::new_store_params(Params::default());
+    let mut seen = Seen::default();
+    for id in 1..=300u64 {
+        let out = stepped!(e, write(1, id, vec![(format!("k{id}").into_bytes(), Op::Put(b"v".to_vec()))]));
+        seen.absorb(&out);
+        assert_eq!(seen.of(1, id).first(), Some(&State::Accepted), "write {id} of 300 small ones was not taken: a count cap");
+    }
 }
 
 /// The write path is proportional to the tree's DEPTH, not to its size.

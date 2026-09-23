@@ -90,7 +90,7 @@ fn past_the_owed_cap_writes_still_publish_and_their_parity_is_left_to_the_scrub(
 fn caps_that_cannot_fit_the_bound_are_refused_at_construction() {
     let _ = engine::Engine::new(
         Params {
-            max_parked_write_bytes: 300 * 1024,
+            max_carried_ops_bytes: 400 * 1024,
             ..Params::default()
         },
         Store::fresh(),

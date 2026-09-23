@@ -1,56 +1,46 @@
-//! THE WRITE PATH'S GATE: a model test, not a list of cases (WRITE-PATH.md,
-//! revision 3, "The gate"; build order step 1 — written BEFORE the code).
+//! THE WRITE PATH'S MODEL, over the REAL engine queue (R-b).
 //!
-//! A seeded PRNG (splitmix64 — no new dependency) drives the REAL
-//! `CachedStore`, two sessions of it, against a SCRIPTED node that follows the
-//! engine's rule (today's, `Rule::Today`) and misbehaves the ways a real node
-//! does: answers `Busy`; drops a verdict (F39); delivers one to the WRONG
-//! session (F49); refuses a request with no verdict — past 101 queued (F51),
-//! or past 8 queued while parked (F50); delays and reorders its answers;
-//! FORGETS EVERYTHING mid-run (a context loss: it keeps its tree, nothing
-//! else); and the client's clock jumps. Then the faults stop and the run is
-//! driven to rest.
+//! Before R-b this model drove the client's outbox (`CachedStore`) against a
+//! SCRIPTED node that answered `Busy`, dropped and misrouted verdicts, refused
+//! past its queue and forgot its context; its pinned sweep table was what
+//! sdk#265, #249 and #235 were proven against. The outbox and the delegate it
+//! was a client of are gone: the engine owns the queue in the page, a write's
+//! fate is PULLED, and nothing on the client times out, re-sends or holds a
+//! write back. So the scripted node is replaced by the real one -- two TABS
+//! OF ONE PERSON (two pages, one node, one signer, one Register) racing, whose
+//! same-seq races are real foreign moves -- and the faults are the ones a
+//! node still has: answers HELD and released one at a time (reordered across
+//! the two tabs), answers LOST (the page's own deadlines re-ask), and the
+//! clock JUMPING forward. The PROPERTIES are kept (the mapping table in the PR
+//! says where each old assertion lives now):
 //!
-//! Every check is on OBSERVABLE behaviour — frames on the wire, what the
-//! node applied, the copy, what the person is told — never on an API the
-//! fix will add, so the same file runs on the tree before the fix.
+//! * NO WRITE IS LOST SILENTLY (W4, sdk#291): every write made ends exactly
+//!   once -- refused at its door by name, Published, or in a NAMED fate the
+//!   app was told. "Vanished, never told" is counted and must be 0.
+//! * VALUE PARITY WITH THE TREE (W4/W6 as revised, the false rollback): at
+//!   rest, each key holds the value of the LAST write made on it that ended
+//!   Published -- so a write told it fell is not in the tree, and one told
+//!   Published is (unless the same tab wrote the key again after it).
+//! * ORDER (W2, go-back-N): per key, the tree never holds an older write's
+//!   value over a later Published one of the same tab (the parity check,
+//!   which knows make order).
+//! * FORCED -> LOST NAMED (sdk#235): a forced write whose commit dies is told
+//!   so, as forced; it never lands after being told.
+//! * AT REST: nothing unsaved, the queue empty, no `Busy`, and no rebuilt
+//!   commit that differed from its warm root (K9).
 //!
-//! Checked at every step: W5 (≤ 16 of a session's writes at the node); every
-//! Write frame carries exactly the ops its write was made with (W1); the node
-//! never applied a (session, write_id) twice — across a context loss too — (W3)
-//! nor a session's writes out of order (W2). Checked at rest: nothing pending
-//! and every write ended exactly once (W4); what the person was TOLD is true —
-//! told rolled back ⇒ the node did not apply it, shown Published ⇒ it did
-//! (W4/W6 as revised); nothing a session wrote is still pending at rest (W6);
-//! no verdict arrived for a write the copy no longer had.
+//! Not here, and where they are: dependants re-run in app order is `Db`'s
+//! (page/tests/server_differential.rs, the chain and budget tests); a write's
+//! frame carrying exactly its ops is `tests/writes.rs`.
 //!
-//! THIS FILE IS RED ON TODAY'S CODE BY DESIGN. It is the gate the write path
-//! is rebuilt against (sdk#183); the classes it finds today are pinned below
-//! as TRIPWIRES — each asserts that its defect is still found, so the suite
-//! stays green until a fix makes one disappear, and then that test names the
-//! issue and asks to be inverted.
+//! THE LOOP RULE: every loop that waits advances the clock or is bounded, and
+//! fails by name.
 
-//! THE LOOP RULE (twice now a drive-until loop cost real time: an 8-minute
-//! mutant on sdk#179, a 22-minute hang in model v2): EVERY loop that waits on
-//! the model's state either ADVANCES THE MODEL'S CLOCK or is BOUNDED and fails
-//! by name. A cold commit makes no progress until the clock moves; a loop that
-//! does neither spins for ever and says nothing.
-//!
-//! THE STREAM RULE (model v2's re-pin): a new fault NEVER draws from an
-//! existing generator. It gets its own, derived from the seed, and a switch
-//! (`Config::v2`). Drawn inline from `rng`, one fault shifted every later draw,
-//! so "seed N" after it was a different run from "seed N" before it, and a
-//! count's move could not be traced to anything. With its own stream and its
-//! switch off, every seed is the run it was before -- which a test holds
-//! (`with_every_v2_behaviour_off_the_model_is_the_node_before_v2`).
+use craftworks_sdk::store::{Edit, Reads, Store};
+use craftworks_sdk::PageStore;
+use std::collections::{BTreeMap, BTreeSet};
+use testkit::{PageConn, PageNode};
 
-use craftworks_sdk::{CachedStore, Store};
-use protocol::{Op, Reply, Request, WriteState};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-// ---------------------------------------------------------------- the dice
-
-/// splitmix64: a seed is the whole run.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -63,1967 +53,275 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
-    fn chance(&mut self, percent: u64) -> bool {
-        self.below(100) < percent
-    }
 }
 
-// ------------------------------------------------------------- the config
-
-/// The engine's rule, behind one switch so revision 3 slots in without
-/// touching a single check.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Rule {
-    /// Today's engine: a write that arrives while a commit is pending is
-    /// `Busy`; any other is taken, whatever its id — no order, no dedupe.
-    Today,
-    /// Revision 3's order rule (floor, ledger, `Duplicate`, `OutOfOrder`).
-    /// Arrives with wire v5 in build step 2: today's client sends no floor
-    /// and its ids have gaps (sdk#186), so a rev-3 node fed v4 frames would
-    /// answer `OutOfOrder` for ever and every red would be an artefact.
-    #[allow(dead_code)]
-    Rev3,
+/// How a write of the model ended, as the tab was told.
+#[derive(Debug, Clone, PartialEq)]
+enum End {
+    RefusedAtDoor(String),
+    Published,
+    Named(String),
 }
 
-/// Who drives the client.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Driver {
-    /// Today's client, exactly: it re-sends a write only after `Busy`.
-    Today,
-    /// NOT TODAY'S CLIENT — what a RECOVERING client would do: a write at the
-    /// node that has heard nothing for `RESEND_AFTER_MS` is sent again, the
-    /// same frame. On the scripted node this is a SELF-CHECK of the harness:
-    /// it shows the W3-across-a-context-loss check fires. It is not evidence
-    /// that today's real engine applies twice — that is the architect's
-    /// executed run (ledger attack §4); it becomes the gate's own at build
-    /// step 4, when the real `Engine` runs under the same seeds.
-    ResendOnSilence,
+struct Made {
+    id: u64,
+    ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    forced: bool,
+    end: Vec<End>,
 }
 
-const RESEND_AFTER_MS: u64 = 20_000;
-
-#[derive(Clone, Copy, Debug)]
-struct Config {
-    rule: Rule,
-    driver: Driver,
-    steps: usize,
-    /// Misbehaviour on. Off, the node is HEALTHY: it answers every frame, in
-    /// order, to the right session, and never forgets; the clock never jumps.
-    faults: bool,
-    /// Which of model v2's node behaviours are ON (the `V2_*` bits). Each draws
-    /// from its OWN generator, never from `rng`, so switching one on changes a
-    /// run only where it fires: with all of them off a seed is exactly the run
-    /// it was before v2 (`diagnostic_per_seed_findings`, WPM_V2=0), and a
-    /// count that moves when one is switched on moved BECAUSE of it.
-    v2: u16,
+struct Tab {
+    store: PageStore<PageConn>,
+    conn: PageConn,
+    clock: testkit::Clock,
+    prefix: &'static str,
+    made: Vec<Made>,
 }
 
-/// A cold (parked) write: its commit waits on reads; later writes meet Busy.
-const V2_COLD: u16 = 1 << 0;
-/// A write that changes nothing is answered at the door (sdk#160/#164).
-const V2_NOOP: u16 = 1 << 1;
-/// The engine says TooLarge where an Accepted would be.
-const V2_TOOLARGE: u16 = 1 << 2;
-/// Stalled, said once at 64 s in flight.
-const V2_STALLED: u16 = 1 << 3;
-/// A commit ends Lost without landing.
-const V2_LOST: u16 = 1 << 4;
-/// The context rolls back one step (step slot 97).
-const V2_ROLLBACK: u16 = 1 << 5;
-/// A structural misroute run (step slot 98).
-const V2_MISROUTE_RUN: u16 = 1 << 6;
-/// A third connection floods the node's queue (step slot 99).
-const V2_FLOOD: u16 = 1 << 7;
-const V2_ALL: u16 = (1 << 8) - 1;
-
-const TODAY: Config = Config { rule: Rule::Today, driver: Driver::Today, steps: 200, faults: true, v2: V2_ALL };
-const HEALTHY: Config = Config { faults: false, ..TODAY };
-
-/// The node's request queue per key: 100 waiting + 1 in service (F51).
-const NODE_ADMITS: usize = 101;
-/// Requests the node queues for a delegate that is parked, before refusing (F50).
-const PARKED_ADMITS: usize = 8;
-/// W5.
-const WINDOW: usize = 16;
-/// One node action (take a request, or move the commit one step).
-const NODE_ACTION_MS: u64 = 100;
-/// Drive-to-rest gives up — BY NAME — after this many rounds.
-const REST_CAP: usize = 2_000;
-
-// --------------------------------------------------------------- findings
-
-/// A violation, by class — the class is what a pinned test asserts on.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Finding {
     class: &'static str,
-    /// What happened to the write first — the cause a pinned test names.
-    tag: &'static str,
     detail: String,
 }
 
-// ------------------------------------------------------------- the model
+const KEYS: u64 = 8;
+const STEPS: usize = 150;
 
-#[derive(Clone, Debug)]
-struct Commit {
-    session: usize,
-    write_id: u64,
-    ops: Vec<Op>,
-    /// The head PUT landed: the ops are in the tree, not yet answered.
-    landed: bool,
-    /// A COLD write: the engine parked it on reads (its path is not in
-    /// memory) until this time; every later write meets `Busy` meanwhile.
-    cold_until: Option<u64>,
-    /// When it was taken, for `Stalled` (64 s in flight).
-    taken_ms: u64,
-    stalled_said: bool,
-    /// Re-sent after the context rolled back one step, and ALREADY landed
-    /// once: its head PUT is the same one again — no second apply.
-    replayed: bool,
-}
-
-/// How a write ended, as the PERSON was told it.
-#[derive(Clone, Debug)]
-enum End {
-    Published { step: usize },
-    RolledBack { why: String, step: usize },
-    RefusedAtMake,
-}
-
-struct Model {
-    rng: Rng,
-    /// One generator per v2 behaviour (bit index of `V2_*`), seeded from the
-    /// run's seed: a behaviour's draws never move the main stream.
-    v2rng: [Rng; 8],
-    cfg: Config,
-    clock: testkit::Clock,
-    stores: [CachedStore; 2],
-    sessions: [u64; 2],
-    /// Keys each session writes: DISJOINT, so W6 needs no deltas. Its price,
-    /// stated: a cross-session effect on one key is invisible here — a
-    /// double apply shows as W3 only, never as W6, and two writers of one key
-    /// are not modelled at all (M2's `Commit{reads,writes}`; `COVERAGE` reads 0).
-    keys: [[&'static [u8]; 4]; 2],
-    // --- the node ---
-    tree: BTreeMap<Vec<u8>, Vec<u8>>,
-    commit: Option<Commit>,
-    inbound: VecDeque<(usize, Vec<u8>)>,
-    parked: bool,
-    queued_while_parked: usize,
-    /// The commit as it was at the start of this step — what a context that
-    /// ROLLS BACK one step (sdk#162's unsaved call) returns to.
-    prev_commit: Option<Commit>,
-    /// A STRUCTURAL misroute: every verdict for session `.0` goes to the
-    /// other session until step `.1` — a quiet tab's tick-decided verdicts
-    /// all reach the tab that ticks, not a 6 % coin each.
-    misroute_run: Option<(usize, usize)>,
-    /// Verdicts on their way to a session: (addressed to, bytes, about).
-    outbound: VecDeque<(usize, Vec<u8>, u64)>,
-    /// (session, write_id) → the step it was APPLIED at.
-    ///
-    /// APPLIED = TAKEN AND NOT WITHDRAWN (the Rev3Node's rule, here too). This
-    /// node records a take only where nothing can withdraw it: at its head
-    /// PUT's landing, which puts it in the tree, or at the no-op door, which
-    /// changes nothing. A commit that ends Lost, or is forgotten with its
-    /// context, before landing was never recorded; one replayed after a
-    /// rolled-back context re-sends the same head PUT and is not recorded again.
-    applied: BTreeMap<(usize, u64), usize>,
-    last_applied: [u64; 2],
-    /// The last write of a session APPLIED on each key: the per-key order
-    /// the client owns even where the engine has no floor (sdk#265).
-    last_on_key: [BTreeMap<Vec<u8>, u64>; 2],
-    // --- the harness's view of each write ---
-    made: [BTreeMap<u64, Vec<Op>>; 2],
-    ended: [BTreeMap<u64, End>; 2],
-    /// Sent, and no verdict heard by that session yet: (write_id → when sent).
-    at_node: [BTreeMap<u64, u64>; 2],
-    /// The last frame of each write the client sent, for `ResendOnSilence`.
-    last_frame: [BTreeMap<u64, Vec<u8>>; 2],
-    /// What happened to each write on the way — the causes a finding names.
-    notes: BTreeMap<(usize, u64), Vec<&'static str>>,
-    /// Writes whose last verdict heard was `Busy`: queued at the CLIENT.
-    queued: [BTreeSet<u64>; 2],
-    findings: Vec<Finding>,
-    trace: Vec<String>,
-    /// What this run's mix actually REACHED (see `COVERAGE`).
-    saw: BTreeSet<&'static str>,
-    /// Fault-phase time that passed WITHOUT a jump.
-    honest_ms: u64,
-    /// Time the node has not yet spent on work.
-    node_budget: u64,
-    /// A rollback carried by a verdict, and nothing since that refills the
-    /// window (the session's next verdict or tick).
-    fell_at_node: [bool; 2],
-    step: usize,
-    faults: bool,
-}
-
-fn ops_of(edits: &[(Vec<u8>, craftworks_sdk::store::Edit)]) -> Vec<Op> {
-    edits
-        .iter()
-        .map(|(k, e)| match e {
-            craftworks_sdk::store::Edit::Put(v) => Op::Put(k.clone(), v.clone()),
-            craftworks_sdk::store::Edit::Delete => Op::Delete(k.clone()),
-        })
-        .collect()
-}
-
-fn state_name(s: &WriteState) -> String {
-    match s {
-        WriteState::TooLarge { .. } => "TooLarge".into(),
-        other => format!("{other:?}"),
-    }
-}
-
-impl Model {
-    fn new(seed: u64, cfg: Config) -> Model {
-        let clock = testkit::Clock::new(1_790_000_000_000);
-        let stores = [testkit::cached_store_on(&clock), testkit::cached_store_on(&clock)];
-        let sessions = [
-            stores[0].client.session().expect("session 0 has a session"),
-            stores[1].client.session().expect("session 1 has a session"),
-        ];
-        Model {
-            rng: Rng(seed),
-            v2rng: std::array::from_fn(|k| Rng(seed ^ (0xC0FF_EE00_0000_0000 | ((k as u64 + 1) << 32)))),
-            cfg,
-            clock,
-            stores,
-            sessions,
-            keys: [[b"a", b"b", b"c", b"d"], [b"e", b"f", b"g", b"h"]],
-            tree: BTreeMap::new(),
-            commit: None,
-            inbound: VecDeque::new(),
-            parked: false,
-            queued_while_parked: 0,
-            prev_commit: None,
-            misroute_run: None,
-            outbound: VecDeque::new(),
-            applied: BTreeMap::new(),
-            last_applied: [0, 0],
-            last_on_key: [BTreeMap::new(), BTreeMap::new()],
-            made: [BTreeMap::new(), BTreeMap::new()],
-            ended: [BTreeMap::new(), BTreeMap::new()],
-            at_node: [BTreeMap::new(), BTreeMap::new()],
-            last_frame: [BTreeMap::new(), BTreeMap::new()],
-            notes: BTreeMap::new(),
-            queued: [BTreeSet::new(), BTreeSet::new()],
-            findings: Vec::new(),
-            trace: Vec::new(),
-            saw: BTreeSet::new(),
-            fell_at_node: [false, false],
-            honest_ms: 0,
-            node_budget: 0,
-            step: 0,
-            faults: cfg.faults,
-        }
+impl Tab {
+    fn open(node: &PageNode, prefix: &'static str) -> Tab {
+        let (mut store, conn, clock) = testkit::page_store(node);
+        store.sync();
+        Tab { store, conn, clock, prefix, made: Vec::new() }
     }
 
-    fn find(&mut self, class: &'static str, detail: String) {
-        self.find_tagged(class, "", detail);
+    fn key(&self, i: u64) -> Vec<u8> {
+        format!("{}/{i}", self.prefix).into_bytes()
     }
 
-    fn find_tagged(&mut self, class: &'static str, tag: &'static str, detail: String) {
-        self.trace.push(format!("  !! {class} [{tag}]: {detail}"));
-        self.findings.push(Finding { class, tag, detail });
-    }
-
-    fn note(&mut self, session: usize, write_id: u64, what: &'static str) {
-        self.notes.entry((session, write_id)).or_default().push(what);
-    }
-
-    /// The first cause on a write's record that explains a finding, in the
-    /// order a reader should look.
-    fn cause(&self, session: usize, write_id: u64) -> &'static str {
-        const ORDER: &[&str] = &[
-            "re-sent after its Lost",
-            "Busy, then applied after a later write",
-            "its Published went to the other session",
-            "the node lost its context after the head PUT",
-            "the context rolled back past its head PUT",
-            "its verdict was dropped",
-            "left the client after it was rolled back",
-            "the client's clock jumped while it was at the node",
-            "timed out while its frame waited in the node's queue",
-            "timed out while its verdict was on its way",
-            "timed out while its commit was in flight",
-            "the node refused its frame",
-            "rolled back behind another write of its keys",
-            "Busy",
-        ];
-        let notes = self.notes.get(&(session, write_id));
-        ORDER.iter().copied().find(|c| notes.is_some_and(|n| n.contains(c))).unwrap_or("")
-    }
-
-    fn log(&mut self, s: String) {
-        self.trace.push(format!("{:>4} t={:>7} {s}", self.step, self.clock.now_ms() - 1_790_000_000_000));
-    }
-
-    fn pending(&self, i: usize) -> BTreeSet<u64> {
-        self.stores[i].copy.pending_ids().into_iter().collect()
-    }
-
-    /// Ids that left the pending list across `f`, and how the person was told.
-    fn ends_across(&mut self, i: usize, told: impl FnOnce(&mut Model) -> BTreeMap<u64, String>) {
-        let before = self.pending(i);
-        let label = told(self);
-        let after = self.pending(i);
-        for id in before.difference(&after) {
-            let why = match label.get(id) {
-                Some(w) => w.clone(),
-                None => {
-                    self.note(i, *id, "rolled back behind another write of its keys");
-                    "rolled back behind another write of its keys".into()
-                }
-            };
-            let end = if why == "Published" || why == "ParityComplete" {
-                End::Published { step: self.step }
-            } else {
-                End::RolledBack { why, step: self.step }
-            };
-            self.at_node[i].remove(id);
-            // A rollback carried by a VERDICT frees the slots of every write it
-            // takes, sent or still in the outbox — and today the window was
-            // refilled before it (the tick refills after its rollbacks).
-            if matches!(&end, End::RolledBack { why, .. } if !why.contains("(by the tick)")) {
-                self.fell_at_node[i] = true;
-            }
-            if let Some(prev) = self.ended[i].insert(*id, end.clone()) {
-                self.find("W4 ENDED TWICE", format!("session {i} w{id}: {prev:?}, then {end:?}"));
+    /// Everything the tab was told since the last call, onto its writes.
+    fn collect(&mut self) {
+        self.store.sync();
+        let mut told: Vec<(u64, End)> = Vec::new();
+        told.extend(self.store.writes.take_published().into_iter().map(|id| (id, End::Published)));
+        told.extend(self.store.writes.take_ended().into_iter().map(|(id, e)| (id, End::Named(format!("{e:?}")))));
+        told.extend(self.store.writes.take_conflicts().into_iter().map(|c| (c.write_id, End::Named("Conflict".into()))));
+        told.extend(self.store.writes.take_unread().into_iter().flat_map(|u| u.write_ids.into_iter().map(|id| (id, End::Named("Unread".into())))));
+        for (id, end) in told {
+            match self.made.iter_mut().find(|m| m.id == id) {
+                Some(m) => m.end.push(end),
+                None => self.made.push(Made { id, ops: Vec::new(), forced: false, end: vec![End::Named(format!("STRANGER {end:?}"))] }),
             }
         }
     }
 
-    // ----------------------------------------------------------- the client
-
-    fn make_write(&mut self, i: usize) {
-        let n = 1 + self.rng.below(3) as usize;
-        let mut ks: Vec<&[u8]> = self.keys[i].to_vec();
-        let mut edits = Vec::new();
+    /// A write of 1-2 keys: CHECKED (its reads the warm root's values, as a
+    /// `Db` write makes them) or FORCED (`Expect::Any`, a store-level batch).
+    fn write(&mut self, rng: &mut Rng, step: usize) {
+        let n = 1 + rng.below(2);
+        let mut ops: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         for _ in 0..n {
-            let k = ks.remove(self.rng.below(ks.len() as u64) as usize);
-            let e = if self.rng.chance(20) {
-                craftworks_sdk::store::Edit::Delete
-            } else {
-                craftworks_sdk::store::Edit::Put(format!("v{}", self.rng.below(1000)).into_bytes())
-            };
-            edits.push((k.to_vec(), e));
+            let k = self.key(rng.below(KEYS));
+            let v = if rng.below(6) == 0 { None } else { Some(format!("{}{step}", self.prefix).into_bytes()) };
+            ops.insert(k, v);
         }
-        edits.sort_by(|a, b| a.0.cmp(&b.0));
-        let id = self.stores[i].next_write_id();
-        let refused_before = self.stores[i].refused.len();
-        // An APP's write, which always says what it read (sdk#235): NOT a
-        // store-level `apply_batch`, which is forced (`Expect::Any`) and falls
-        // on Lost instead of going again — the path this model exists to
-        // check. The model's node checks no reads, so the premise's value
-        // does not matter here; that it is a premise, not `Any`, does.
-        let reads: Vec<(Vec<u8>, protocol::Expect)> = edits.iter().map(|(k, _)| (k.clone(), protocol::Expect::Present)).collect();
-        let _ = Store::apply_commit(&mut self.stores[i], &reads, &edits);
-        self.made[i].insert(id, ops_of(&edits));
-        if self.stores[i].refused.len() > refused_before {
-            self.ended[i].insert(id, End::RefusedAtMake);
-            self.log(format!("s{i} makes w{id} — refused at make"));
-        } else {
-            self.log(format!("s{i} makes w{id} {:?}", self.made[i][&id]));
-        }
-    }
-
-    /// Everything a session has decided to send, onto the node's queue.
-    fn pump(&mut self, i: usize) {
-        for f in self.stores[i].take_outbound() {
-            self.send_to_node(i, f, false);
-        }
-        if self.stores[i].held_count() > 0 {
-            self.saw.insert("the window bound (writes held)");
-            // The other half of W5: held writes leave while there is ROOM. A
-            // client holding writes with fewer than the window at the node
-            // has a slot it thinks is taken — the leaked-slot family (a
-            // verdict that frees nothing, a timeout that frees nothing).
-            let at = self.at_node[i].len();
-            if at < WINDOW {
-                let d = format!("session {i} holds {} writes with only {at} at the node (window {WINDOW}); queued {}", self.stores[i].held_count(), self.stores[i].queued_count());
-                if self.fell_at_node[i] {
-                    // Today's order in `on_write_state`: the window is refilled
-                    // BEFORE `copy.failed` takes the later writes down with the
-                    // failed one — their slots come free after the refill ran.
-                    self.find("W5 NOT REFILLED AFTER A FALL", d);
-                } else {
-                    self.find("W5 HELD WITH ROOM", d);
-                }
-            }
-        }
-        let at = self.at_node[i].len();
-        if at > WINDOW {
-            let ids: Vec<u64> = self.at_node[i].keys().copied().collect();
-            let d = format!("session {i} has {at} writes at the node (bound {WINDOW}): {ids:?}");
-            self.find("W5 WINDOW", d);
-        }
-    }
-
-    fn send_to_node(&mut self, i: usize, f: Vec<u8>, resent: bool) {
-        if let protocol::Incoming::Ok(env) = protocol::decode_request(&f) {
-            if let Request::Write { write_id, ops } | Request::Commit { write_id, ops, .. } = &env.body {
-                // W1: the frame carries exactly the ops the write was made with.
-                if let Some(made) = self.made[i].get(write_id) {
-                    if made != ops {
-                        let d = format!("session {i} w{write_id}: made with {made:?}, sent with {ops:?}");
-                        self.find("W1 NOT WHOLE", d);
-                    }
-                }
-                // W5 counts the writes the client still HOLDS. A frame can
-                // leave for a write the client has already ended — its tick
-                // rolled it back while the frame sat in the outbox — and
-                // that is not a window slot; if the node then applies it, the
-                // truth check at rest says so (FALSE ROLLBACK).
-                if self.stores[i].copy.pending_ids().contains(write_id) {
-                    self.at_node[i].insert(*write_id, self.clock.now_ms());
-                } else {
-                    self.log(format!("s{i} → node w{write_id}, a write it has ALREADY ENDED"));
-                    self.note(i, *write_id, "left the client after it was rolled back");
-                }
-                self.queued[i].remove(write_id);
-                self.last_frame[i].insert(*write_id, f.clone());
-                self.log(format!("s{i} → node w{write_id}{}", if resent { " (RE-SENT on silence)" } else { "" }));
-            }
-        }
-        // F51 / F50: refused with a host error — no verdict, to anyone.
-        if self.inbound.len() >= NODE_ADMITS || (self.parked && self.faults && self.queued_while_parked >= PARKED_ADMITS) {
-            self.log(format!("node REFUSES a frame from s{i} (queue {}, parked {})", self.inbound.len(), self.parked));
-            self.saw.insert(if self.parked { "a request refused while parked (F50)" } else { "a request refused past 101 (F51)" });
-            if let protocol::Incoming::Ok(env) = protocol::decode_request(&f) {
-                if let Request::Write { write_id, .. } | Request::Commit { write_id, .. } = env.body {
-                    self.note(i, write_id, "the node refused its frame");
-                }
-            }
-            // The host error reaches the SENDER's connection: the page counts
-            // it as its frame's answer (sdk#196 review, 1b).
-            self.stores[i].client.frame_refused();
-            return;
-        }
-        if self.parked {
-            self.queued_while_parked += 1;
-        }
-        self.inbound.push_back((i, f));
-    }
-
-    fn resend_on_silence(&mut self, i: usize) {
-        let now = self.clock.now_ms();
-        let silent: Vec<u64> = self.at_node[i]
-            .iter()
-            .filter(|(_, at)| now.saturating_sub(**at) >= RESEND_AFTER_MS)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in silent {
-            if let Some(f) = self.last_frame[i].get(&id).cloned() {
-                self.send_to_node(i, f, true);
-            }
-        }
-    }
-
-    fn tick(&mut self, i: usize) {
-        self.fell_at_node[i] = false; // the tick refills after its own rollbacks
-        let now = self.clock.now_ms();
-        // At most one unanswered tick per session (sdk#174): what the gate
-        // withheld, and what it gave up on, are situations the sweep must
-        // show it reaches.
-        let forgotten = self.stores[i].client.ticks.forgotten;
-        if !self.stores[i].send_tick(now) {
-            self.saw.insert("a tick withheld (one unanswered)");
-        }
-        if self.stores[i].client.ticks.forgotten > forgotten {
-            self.saw.insert("a tick forgotten after FORGET_MS");
-        }
-        // And the page asks after its oldest quiet write, as Session::tick
-        // does (sdk#174): the path the model must SEE.
-        if self.stores[i].ask_unheard(now).is_some() {
-            self.saw.insert("an AskWrite sent");
-        }
-        let queued_before = self.queued[i].clone();
-        let mut timed_out = Vec::new();
-        self.ends_across(i, |m| {
-            let told = m.stores[i].tick();
-            timed_out = told.rolled_back.iter().filter(|(_, why)| matches!(why, craftworks_sdk::RolledBack::Unknown)).map(|(id, _)| *id).collect();
-            told.rolled_back
-                .iter()
-                .map(|(id, why)| {
-                    if matches!(why, craftworks_sdk::RolledBack::AfterFailed) {
-                        m.note(i, *id, "rolled back behind another write of its keys");
-                    }
-                    (*id, format!("{why:?} (by the tick)"))
-                })
-                .collect()
-        });
-        for id in timed_out {
-            let waiting = self.inbound.iter().any(|(s, f)| {
-                *s == i && matches!(protocol::decode_request(f), protocol::Incoming::Ok(env) if matches!(env.body, Request::Write { write_id, .. } | Request::Commit { write_id, .. } if write_id == id))
-            });
-            if waiting {
-                self.note(i, id, "timed out while its frame waited in the node's queue");
-            }
-            if self.outbound.iter().any(|(to, _, about)| *to == i && *about == id) {
-                self.note(i, id, "timed out while its verdict was on its way");
-            }
-            if self.commit.as_ref().is_some_and(|c| c.session == i && c.write_id == id) {
-                self.note(i, id, "timed out while its commit was in flight");
-            }
-            if queued_before.contains(&id) {
-                // The node ANSWERED it (`Busy`); it sat queued at the client,
-                // never re-offered, and a timer called it Unknown.
-                let d = format!("session {i} w{id}: answered Busy, never re-sent, rolled back Unknown by the timer at step {}", self.step);
-                self.find_tagged("STALE CLOCK", "Busy", d);
-            }
-            self.queued[i].remove(&id);
-        }
-    }
-
-    // ------------------------------------------------------------- the node
-
-    fn reply(&mut self, session: usize, write_id: u64, state: WriteState) {
-        let bytes = protocol::encode_reply(&Reply::SessionWriteState { session: self.sessions[session], write_id, state })
-            .expect("a verdict encodes");
-        self.log(format!("node answers s{session} w{write_id}: {}", state_name(&state)));
-        self.outbound.push_back((session, bytes, write_id));
-    }
-
-    /// The node takes ONE request from its queue, as it runs one delegate
-    /// call at a time.
-    fn serve(&mut self) {
-        if self.parked {
-            return;
-        }
-        // A real node runs one delegate call at a time, so a request waits in
-        // the node's queue until the commit in flight is done and meets an
-        // idle engine (sdk#176: 0 Busy in every live L4 run). `Busy` is what a
-        // request meets when it reaches the engine mid-commit anyway — a
-        // FAULT here, never on a healthy node.
-        //
-        // A COLD commit is different: the engine parked it on reads and
-        // returned, so the node goes on delivering calls — and every write
-        // that reaches the engine meanwhile is answered `Busy` (a Busy STORM:
-        // `on_write`, read by the architect).
-        let cold = self.commit.as_ref().is_some_and(|c| c.cold_until.is_some_and(|t| self.clock.now_ms() < t));
-        if self.commit.is_some() && !cold && !(self.faults && self.rng.chance(30)) {
-            return;
-        }
-        let Some((i, f)) = self.inbound.pop_front() else { return };
-        // Every client frame the delegate RUNS is answered by its per-call
-        // report (entry.rs emits one per call, on the sender's connection) --
-        // what a page counts its frames against (sdk#174: at most one
-        // unanswered tick per session). The third connection's report goes to
-        // the third connection, which this model does not run.
-        if let Some(s) = self.stores.get_mut(i) {
-            s.on_inbound(&call_report());
-        }
-        let protocol::Incoming::Ok(env) = protocol::decode_request(&f) else { return };
-        // ASKWRITE, answered as the engine answers it (sdk#174, the sdk#196
-        // review): a write the engine does not know -- never taken, or
-        // published and forgotten -- gets NO verdict; `Lost` is said only on
-        // positive evidence, which this node's rule never has. A write it
-        // holds (its commit in flight) is answered by the commit, not the ask.
-        // Nothing here parks, so an ask never continues a chain.
-        if let Request::AskWrite { .. } = env.body {
-            self.saw.insert("an AskWrite served");
-            return;
-        }
-        let (Request::Write { write_id, ops } | Request::Commit { write_id, ops, .. }) = env.body else { return };
-        if i > 1 {
-            return; // the third connection sends no writes
-        }
-        match self.cfg.rule {
-            Rule::Today => {
-                if self.commit.is_some() {
-                    self.note(i, write_id, "Busy");
-                    self.saw.insert("a Busy");
-                    if cold {
-                        self.saw.insert("a Busy behind a cold (parked) write");
-                    }
-                    self.reply(i, write_id, WriteState::Busy);
-                } else if self.on(V2_NOOP) && self.is_no_op(&ops) {
-                    // THE NO-OP FAST PATH (sdk#160/#164): a write that changes
-                    // nothing is answered at the door — Accepted, Published,
-                    // ParityComplete in one call, no commit, nothing for a
-                    // later write to be Busy behind. It is TAKEN (the ruling:
-                    // "applied" = taken under the rule, tree changed or not).
-                    self.saw.insert("a no-op write answered at the door");
-                    self.take(i, write_id, "answered at the door (no-op)");
-                    self.reply(i, write_id, WriteState::Accepted);
-                    self.reply(i, write_id, WriteState::Published);
-                    self.reply(i, write_id, WriteState::ParityComplete);
-                } else if self.faults && self.rng.chance(3) {
-                    // The engine refuses it as invalid: nothing applied.
-                    self.reply(i, write_id, WriteState::Failed);
-                } else if self.on(V2_TOOLARGE) && self.faults && self.v2r(V2_TOOLARGE).chance(2) {
-                    // TooLarge from the ENGINE (CommitBlocks is decided after
-                    // the apply is computed): where an Accepted would be.
-                    self.saw.insert("TooLarge said by the engine");
-                    self.reply(i, write_id, WriteState::too_large(protocol::WriteBound::CommitBlocks, 128, 129));
-                } else {
-                    let now = self.clock.now_ms();
-                    let cold_until = (self.on(V2_COLD) && self.faults && self.v2r(V2_COLD).chance(12)).then(|| now + 2_000 + self.v2r(V2_COLD).below(90_000));
-                    if cold_until.is_some() {
-                        self.saw.insert("a cold (parked) write");
-                    }
-                    self.commit = Some(Commit { session: i, write_id, ops, landed: false, cold_until, taken_ms: now, stalled_said: false, replayed: false });
-                    self.reply(i, write_id, WriteState::Accepted);
-                }
-            }
-            Rule::Rev3 => unimplemented!("rev 3's order rule arrives with wire v5 (build step 2)"),
-        }
-    }
-
-    /// Is this v2 behaviour switched on?
-    fn on(&self, bit: u16) -> bool {
-        self.cfg.v2 & bit != 0
-    }
-
-    /// The generator of v2 behaviour `bit`.
-    fn v2r(&mut self, bit: u16) -> &mut Rng {
-        &mut self.v2rng[bit.trailing_zeros() as usize]
-    }
-
-    /// Would these ops change nothing in the node's tree?
-    fn is_no_op(&self, ops: &[Op]) -> bool {
-        ops.iter().all(|op| match op {
-            Op::Put(k, v) => self.tree.get(k) == Some(v),
-            Op::Delete(k) => !self.tree.contains_key(k),
-        })
-    }
-
-    /// The node TAKES (session, write_id) under its rule — the W2 and W3
-    /// checks, and the apply log, in one place for every path that takes.
-    fn take(&mut self, session: usize, write_id: u64, how: &str) {
-        let key = (session, write_id);
-        if let Some(first) = self.applied.get(&key) {
-            let d = format!("session {session} w{write_id} applied at step {first} and again at step {}", self.step);
-            let tag = self.cause(session, write_id);
-            self.find_tagged("W3 APPLIED TWICE", tag, d);
-        }
-        if write_id < self.last_applied[session] {
-            let busy = self.notes.get(&key).is_some_and(|n| n.contains(&"Busy"));
-            if busy {
-                self.note(session, write_id, "Busy, then applied after a later write");
-            }
-            let d = format!("session {session} w{write_id} applied after w{} — a later write of the session landed first", self.last_applied[session]);
-            let tag = self.cause(session, write_id);
-            self.find_tagged("W2 OUT OF ORDER", tag, d);
-        }
-        // PER KEY (sdk#265's property): whatever the engine's order rule, a
-        // session's LAST write on a key must be the one that lands last there
-        // — that is what the person sees. A `Lost` write re-sent after a later
-        // write of its own keys landed would put the older value back.
-        for op in self.made[session].get(&write_id).cloned().unwrap_or_default() {
-            let key = match &op {
-                Op::Put(k, _) | Op::Delete(k) => k.clone(),
-            };
-            if self.last_on_key[session].get(&key).is_some_and(|last| write_id < *last) {
-                let last = self.last_on_key[session][&key];
-                let d = format!("session {session} w{write_id} applied on key {key:?} after its own later w{last}");
-                // WHOSE inversion it is. A later write the client had already
-                // ROLLED BACK is not in the copy to be pulled back behind this
-                // one, so the order it lands in is owned by the false rollback
-                // (sdk#183), not by the re-send (sdk#265).
-                let tag = if matches!(self.ended[session].get(&last), Some(End::RolledBack { .. })) {
-                    "after a write the client had rolled back"
-                } else {
-                    self.cause(session, write_id)
-                };
-                self.find_tagged("W2 KEY ORDER", tag, d);
-            }
-            let at = self.last_on_key[session].entry(key).or_default();
-            *at = (*at).max(write_id);
-        }
-        self.last_applied[session] = self.last_applied[session].max(write_id);
-        self.applied.insert(key, self.step);
-        self.log(format!("node APPLIES s{session} w{write_id} ({how})"));
-    }
-
-    /// The commit in flight moves one step: its head PUT lands (the ops are
-    /// APPLIED), then — in a later step — it is answered `Published`.
-    fn advance_commit(&mut self) {
-        let Some(c) = self.commit.clone() else { return };
-        let now = self.clock.now_ms();
-        // STALLED at 64 s in flight — said once, the write stays in flight.
-        if self.on(V2_STALLED) && !c.stalled_said && now.saturating_sub(c.taken_ms) >= 64_000 {
-            self.saw.insert("Stalled said");
-            self.commit.as_mut().expect("the commit").stalled_said = true;
-            self.reply(c.session, c.write_id, WriteState::Stalled);
-        }
-        if c.cold_until.is_some_and(|t| now < t) {
-            return; // parked on reads
-        }
-        if self.on(V2_LOST) && !c.landed && self.faults && self.v2r(V2_LOST).chance(2) {
-            // LOST: the commit ends without landing (a head conflict, settle
-            // rounds exhausted). Nothing applied.
-            self.saw.insert("Lost said");
-            self.commit = None;
-            self.reply(c.session, c.write_id, WriteState::Lost);
-            return;
-        }
-        if !c.landed {
-            if c.replayed {
-                // The same head PUT again, after the context rolled back: the
-                // tree already holds it. No second apply.
-                self.log(format!("node re-sends s{} w{}'s head PUT (context rolled back)", c.session, c.write_id));
-                self.commit.as_mut().expect("the commit").landed = true;
-                return;
-            }
-            for op in &c.ops {
-                match op {
-                    Op::Put(k, v) => {
-                        self.tree.insert(k.clone(), v.clone());
-                    }
-                    Op::Delete(k) => {
-                        self.tree.remove(k);
+        let mut forced = rng.below(3) == 0;
+        let mut reads = Vec::new();
+        if !forced {
+            for k in ops.keys() {
+                match self.store.get(k) {
+                    Ok(Some(v)) => reads.push((k.clone(), protocol::Expect::Value(craftworks_sdk::read_token::read_token(&v)))),
+                    Ok(None) => reads.push((k.clone(), protocol::Expect::Absent)),
+                    // Not walkable now (its path cold, or a write of its own
+                    // still applying): the store-level form, forced.
+                    Err(_) => {
+                        forced = true;
+                        break;
                     }
                 }
             }
-            self.take(c.session, c.write_id, "head PUT landed");
-            self.commit.as_mut().expect("the commit").landed = true;
-        } else {
-            self.commit = None;
-            self.reply(c.session, c.write_id, WriteState::Published);
-            // As the real engine does for every coded write: ParityComplete
-            // AFTER Published — for a write the client has, by then, already
-            // settled (cached_store.rs counts it as a verdict for a write it
-            // no longer has).
-            self.reply(c.session, c.write_id, WriteState::ParityComplete);
+            self.store.take_ticket();
+            self.store.unpin();
         }
-    }
-
-    /// Hand one verdict to a session — the right one, or not.
-    fn deliver(&mut self, faults: bool) {
-        if self.outbound.is_empty() {
-            return;
+        if forced {
+            reads = ops.keys().map(|k| (k.clone(), protocol::Expect::Any)).collect();
         }
-        // Out of order: any of the waiting answers, not only the oldest.
-        let at = if faults { self.rng.below(self.outbound.len() as u64) as usize } else { 0 };
-        let (mut to, bytes, about) = self.outbound.remove(at).expect("an answer");
-        let state = match protocol::decode_reply(&bytes) {
-            Ok(Reply::SessionWriteState { state, .. }) => state,
-            _ => unreachable!("the node only sends write states"),
+        let edits: Vec<(Vec<u8>, Edit)> = ops.iter().map(|(k, v)| (k.clone(), v.clone().map_or(Edit::Delete, Edit::Put))).collect();
+        let id = self.store.writes.next_write_id();
+        let r = self.store.apply_commit(&reads, &edits);
+        let end = match r {
+            Ok(()) => Vec::new(),
+            Err(why) => vec![End::RefusedAtDoor(format!("{why:?}"))],
         };
-        if faults && self.rng.chance(6) {
-            self.log(format!("verdict for s{to} w{about} DROPPED (F39)"));
-            self.saw.insert("a verdict dropped (F39)");
-            self.note(to, about, "its verdict was dropped");
-            return;
-        }
-        let structural = faults && self.misroute_run.is_some_and(|(from, until)| from == to && self.step < until);
-        if structural || (faults && self.rng.chance(6)) {
-            if structural {
-                self.saw.insert("a structural misroute run");
-            }
-            if matches!(state, WriteState::Published | WriteState::ParityComplete) {
-                self.note(to, about, "its Published went to the other session");
-            }
-            to = 1 - to;
-            self.log(format!("verdict about w{about} delivered to the WRONG session s{to} (F49)"));
-            self.saw.insert("a verdict misrouted (F49)");
-        }
-        // A session hears about its OWN writes only: a misrouted verdict names
-        // the other session, and the client drops it as foreign.
-        let own = match protocol::decode_reply(&bytes) {
-            Ok(Reply::SessionWriteState { session, .. }) => session == self.sessions[to],
-            _ => false,
-        };
-        if own {
-            // The client HEARD `Lost` for its own write: from here a re-send of
-            // it is sdk#265's, which is what the per-key order check is about.
-            // A dropped or misrouted Lost is not — nothing told the client.
-            if matches!(state, WriteState::Lost) {
-                self.note(to, about, "re-sent after its Lost");
-            }
-            self.at_node[to].remove(&about);
-            if matches!(state, WriteState::Busy) {
-                self.queued[to].insert(about);
-            } else {
-                self.queued[to].remove(&about);
-            }
-        }
-        let label = state_name(&state);
-        // The session's OWN verdict refills the window — before whatever this
-        // one falls. A misrouted one is dropped as foreign and refills nothing.
-        if own {
-            self.fell_at_node[to] = false;
-        }
-        self.ends_across(to, |m| {
-            m.stores[to].on_inbound(&bytes);
-            BTreeMap::from([(about, if own { label.clone() } else { format!("(foreign) {label}") })])
-        });
+        self.made.push(Made { id, ops: ops.into_iter().collect(), forced, end });
     }
 
-    /// The node does work in proportion to TIME: one action (take a request,
-    /// or move the commit a step) per `NODE_ACTION_MS` — a write is three
-    /// actions, so about 3.4 commits a second, as measured live.
-    fn node_works(&mut self, dt: u64) {
-        self.node_budget += dt;
-        while self.node_budget >= NODE_ACTION_MS {
-            self.node_budget -= NODE_ACTION_MS;
-            if self.commit.is_some() {
-                self.advance_commit();
-            } else {
-                self.serve();
-            }
-        }
-    }
-
-    /// The context ROLLS BACK one step: the commit is what it was at the start
-    /// of this step. A commit that had landed and been answered comes back
-    /// landed-not-answered, and says Published a second time; one that had
-    /// landed is REPLAYED (same head PUT, no second apply).
-    fn context_rolls_back(&mut self) {
-        // A commit that LANDED this step and is rolled back past: its head is
-        // in the tree, and the context no longer knows it exists.
-        if let Some(c) = self.commit.clone().filter(|c| c.landed) {
-            if self.prev_commit.as_ref().is_none_or(|p| (p.session, p.write_id) != (c.session, c.write_id)) {
-                self.note(c.session, c.write_id, "the context rolled back past its head PUT");
-            }
-        }
-        let back = self.prev_commit.clone();
-        let mut back = back.map(|mut c| {
-            if self.applied.contains_key(&(c.session, c.write_id)) && !c.landed {
-                c.replayed = true;
-            }
-            c
-        });
-        if let Some(c) = back.as_mut() {
-            if self.applied.contains_key(&(c.session, c.write_id)) {
-                self.saw.insert("a verdict said twice (context rolled back)");
-            }
-        }
-        self.saw.insert("a context rolled back one step");
-        self.log(format!("node's context ROLLS BACK one step (commit {:?})", back.as_ref().map(|c| (c.session, c.write_id, c.landed))));
-        self.commit = back;
-    }
-
-    /// The delegate FORGETS EVERYTHING — its context is gone. The tree (with
-    /// whatever head PUT landed) stays; the commit in flight does not.
-    fn context_loss(&mut self) {
-        self.saw.insert(match &self.commit {
-            None => "a context lost with no commit",
-            Some(c) if !c.landed => "a context lost with a commit taken, not landed",
-            Some(_) => "a context lost AFTER a head PUT",
-        });
-        if let Some(c) = self.commit.clone().filter(|c| c.landed) {
-            self.note(c.session, c.write_id, "the node lost its context after the head PUT");
-        }
-        let what = match &self.commit {
-            Some(c) if c.landed => format!("commit s{} w{} LANDED, not answered", c.session, c.write_id),
-            Some(c) => format!("commit s{} w{} taken, not landed", c.session, c.write_id),
-            None => "no commit".into(),
-        };
-        self.log(format!("node LOSES ITS CONTEXT ({what})"));
-        self.commit = None;
-        self.parked = false;
-        self.queued_while_parked = 0;
-    }
-
-    // ------------------------------------------------------------- the run
-
-    fn fault_step(&mut self) {
-        self.step += 1;
-        self.prev_commit = self.commit.clone();
-        // Time passes on every step — honestly, so a write can sit at the node
-        // past the timeout with no jump involved.
-        let dt = self.rng.below(600);
-        self.clock.advance(dt);
-        self.honest_ms += dt;
-        self.node_works(dt);
-        let i = self.rng.below(2) as usize;
-        match self.rng.below(100) {
-            0..=29 => self.make_write(i),
-            30..=44 => self.pump(i),
-            45..=59 => self.serve(),
-            60..=69 => self.advance_commit(),
-            70..=81 => self.deliver(self.faults),
-            82..=89 => {
-                let dt = self.rng.below(3_000);
-                self.clock.advance(dt);
-                self.honest_ms += dt;
-                self.node_works(dt);
-                self.tick(i);
-            }
-            // The client's clock JUMPS — the machine slept. RARE (1 in 500
-            // steps): the architect measured every Unknown rollback downstream
-            // of a jump when it was 1 in 50, and no seed's HONEST time ever
-            // crossed the 60 s timeout. Time now also passes on every step.
-            90..=91 if self.faults && self.rng.chance(10) => {
-                // The client's clock JUMPS: the machine slept.
-                let ms = 61_000 + self.rng.below(3_600_000);
-                self.log(format!("the client's clock JUMPS {ms} ms"));
-                self.saw.insert("the client's clock jumped");
-                for j in 0..2 {
-                    let ids: Vec<u64> = self.at_node[j].keys().copied().collect();
-                    for id in ids {
-                        self.note(j, id, "the client's clock jumped while it was at the node");
-                    }
-                }
-                self.clock.advance(ms);
-                self.tick(i);
-            }
-            92..=93 if self.faults => self.context_loss(),
-            94..=95 => {
-                // A BURST — a publish's handoff, a paste: more writes at once
-                // than the window holds, so the window is what paces them.
-                let n = 17 + self.rng.below(24);
-                self.log(format!("s{i} makes a BURST of {n} writes"));
-                self.saw.insert("a burst");
-                for _ in 0..n {
-                    self.make_write(i);
-                }
-            }
-            96 if self.faults => {
-                self.parked = !self.parked;
-                self.queued_while_parked = 0;
-                let p = self.parked;
-                self.log(format!("node {}", if p { "PARKS (a cold write)" } else { "unparks" }));
-                self.saw.insert("the node parked");
-            }
-            // The context ROLLS BACK one step (sdk#162's unsaved call): the
-            // commit is what it was a step ago. A landed-and-answered commit
-            // comes back, and says its verdicts AGAIN.
-            97 if self.faults && self.on(V2_ROLLBACK) => self.context_rolls_back(),
-            // A STRUCTURAL misroute: one session's verdicts all go to the other
-            // for a while.
-            98 if self.faults && self.on(V2_MISROUTE_RUN) => {
-                    let from = self.v2r(V2_MISROUTE_RUN).below(2) as usize;
-                    let until = self.step + 10 + self.v2r(V2_MISROUTE_RUN).below(50) as usize;
-                    self.log(format!("every verdict for s{from} goes to the other session until step {until}"));
-                    self.misroute_run = Some((from, until));
-                }
-            // A THIRD connection (another tab's reads and ticks) floods the
-            // node's queue: the sessions' frames meet the 101 (F51).
-            99 if self.faults && self.on(V2_FLOOD) => {
-                    let n = 40 + self.v2r(V2_FLOOD).below(80);
-                    let tick = protocol::encode_request(3, &Request::Tick { now: 1 }).expect("a tick encodes");
-                    let mut refused = 0;
-                    for _ in 0..n {
-                        if self.inbound.len() >= NODE_ADMITS {
-                            refused += 1;
-                        } else {
-                            self.inbound.push_back((2, tick.clone()));
-                        }
-                    }
-                    self.saw.insert("a third connection flooded the queue");
-                    self.log(format!("a third connection sends {n} frames ({refused} refused)"));
-                }
-            _ => {
-                self.pump(0);
-                self.pump(1);
-            }
-        }
-        if self.cfg.driver == Driver::ResendOnSilence {
-            self.resend_on_silence(i);
-        }
-        // A page sends what it has at once, and answers arrive as they come:
-        // both happen EVERY step. Under faults an answer may be held back a
-        // step (delay; out of order), dropped or misrouted — in `deliver`.
-        self.pump(0);
-        self.pump(1);
-        let ready = self.outbound.len();
-        for _ in 0..ready {
-            if self.faults && self.rng.chance(30) {
-                continue; // delayed: stays for a later step
-            }
-            self.deliver(self.faults);
-        }
-    }
-
-    /// Move the commit in flight while it CAN move, at most 4 steps. A cold
-    /// one waits on the clock, which the caller advances — never spin on it.
-    fn advance_while_warm(&mut self) {
-        for _ in 0..4 {
-            let cold = self.commit.as_ref().is_some_and(|c| c.cold_until.is_some_and(|t| self.clock.now_ms() < t));
-            if self.commit.is_none() || cold {
-                break;
-            }
-            self.advance_commit();
-        }
-    }
-
-    /// Faults off; everything delivered, every second ticked, until nothing
-    /// is pending anywhere — or FAIL BY NAME.
-    fn drive_to_rest(&mut self) {
-        self.faults = false;
-        self.parked = false;
-        self.log("—— faults stop; driving to rest ——".into());
-        for round in 0..REST_CAP {
-            self.step += 1;
-            for i in 0..2 {
-                self.pump(i);
-                if self.cfg.driver == Driver::ResendOnSilence {
-                    self.resend_on_silence(i);
-                }
-            }
-            // A commit in flight moves on the node's own answers, not on a
-            // client's next frame: advance it whether or not anything is
-            // queued (sdk#196). Bounded, and never on a cold commit, which
-            // waits on the clock this round advances below (the loop rule).
-            self.advance_while_warm();
-            let mut spins = 0;
-            while !self.inbound.is_empty() {
-                spins += 1;
-                if spins > 10_000 {
-                    break; // the node cannot take more this round; time moves below
-                }
-                self.serve();
-                self.advance_while_warm();
-                for i in 0..2 {
-                    self.pump(i);
-                }
-            }
-            while !self.outbound.is_empty() {
-                self.deliver(false);
-            }
-            self.clock.advance(1_000);
-            for i in 0..2 {
-                self.tick(i);
-                self.pump(i);
-            }
-            // The tick frames just pumped are not work: only a WRITE still
-            // queued at the node, an answer on its way, or a commit is.
-            let writes_queued = self.inbound.iter().any(|(_, f)| {
-                matches!(protocol::decode_request(f), protocol::Incoming::Ok(env) if matches!(env.body, Request::Write { .. } | Request::Commit { .. }))
-            });
-            let quiet = self.pending(0).is_empty()
-                && self.pending(1).is_empty()
-                && !writes_queued
-                && self.outbound.is_empty()
-                && self.commit.is_none();
-            if quiet {
-                self.log(format!("at rest after {round} rounds"));
-                return;
-            }
-        }
-        let d = format!(
-            "still pending after {REST_CAP} rounds of delivering everything and ticking every second: s0 {:?} (held {}), s1 {:?} (held {})",
-            self.pending(0),
-            self.stores[0].held_count(),
-            self.pending(1),
-            self.stores[1].held_count()
-        );
-        self.find("W4 NEVER AT REST", d);
-    }
-
-    fn check_at_rest(&mut self) {
-        for i in 0..2 {
-            // Every write made ended exactly once (ENDED TWICE is caught as it happens).
-            let unended: Vec<u64> = self.made[i].keys().filter(|id| !self.ended[i].contains_key(id)).copied().collect();
-            if !unended.is_empty() {
-                self.find("W4 NEVER ENDED", format!("session {i}: {unended:?} made and never ended"));
-            }
-            // What the person was told is TRUE.
-            let ends: Vec<(u64, End)> = self.ended[i].iter().map(|(k, v)| (*k, v.clone())).collect();
-            for (id, end) in ends {
-                let applied = self.applied.get(&(i, id)).copied();
-                match (&end, applied) {
-                    (End::RolledBack { why, step }, Some(at)) => {
-                        let tag = self.cause(i, id);
-                        let d = format!("session {i} w{id}: told {why} at step {step}, applied at step {at}");
-                        self.find_tagged("FALSE ROLLBACK", tag, d);
-                    }
-                    (End::Published { step }, None) => {
-                        self.find("FALSE PUBLISHED", format!("session {i} w{id}: shown Published at step {step}, never applied"));
-                    }
-                    _ => {}
-                }
-            }
-            // W6: at rest nothing this session wrote is still PENDING, so a
-            // read of its keys is the node's tree (READ-STATE: reads walk the
-            // tree; the write half holds only what is unsettled).
-            for k in self.keys[i] {
-                if let Some(v) = self.stores[i].copy.get(k) {
-                    let d = format!("session {i} key {}: still pending at rest: {v:?}", String::from_utf8_lossy(k));
-                    self.find("W6 PENDING AT REST", d);
-                }
-            }
-            let late = self.stores[i].unknown_verdicts();
-            if late > 0 {
-                self.find("LATE VERDICT", format!("session {i}: {late} verdict(s) for a write the copy no longer had"));
-            }
-        }
+    fn tick(&mut self, ms: u64) {
+        self.clock.advance(ms);
+        let now = self.clock.now_ms();
+        let _ = self.conn.tick_at(now);
+        let _ = self.store.ask_after_applying();
+        self.store.tick(now);
+        self.collect();
     }
 }
 
-/// What the step mix can reach. A situation no run reaches is one the model
-/// is BLIND to — whatever defect lives there, the sweep cannot find it — so
-/// every one is counted and printed, zeros included. (908feb6 ran identically
-/// to main, seed for seed, until bursts were in the mix: the window never
-/// bound, so its leaked slot was invisible.)
-const COVERAGE: &[&str] = &[
-    "the window bound (writes held)",
-    "a burst",
-    "a Busy",
-    "a verdict dropped (F39)",
-    "a verdict misrouted (F49)",
-    "a request refused past 101 (F51)",
-    "a request refused while parked (F50)",
-    "the node parked",
-    "a tick withheld (one unanswered)",
-    "a tick forgotten after FORGET_MS",
-    "an AskWrite sent",
-    "an AskWrite served",
-    "a context lost with no commit",
-    "a context lost with a commit taken, not landed",
-    "a context lost AFTER a head PUT",
-    "the client's clock jumped",
-    "honest time crossed the 60 s timeout (no jump)",
-    "a cold (parked) write",
-    "a Busy behind a cold (parked) write",
-    "a no-op write answered at the door",
-    "Stalled said",
-    "Lost said",
-    "TooLarge said by the engine",
-    "a structural misroute run",
-    "a context rolled back one step",
-    "a verdict said twice (context rolled back)",
-    "a third connection flooded the queue",
-    // NOT MODELLED: the sessions write disjoint keys, so W6 holds without
-    // deltas. Two writers of one key are M2's business (`Commit{reads,
-    // writes}`); this model is blind to them, and says so.
-    "two sessions writing one key",
-];
-
-/// How the writes of a run ended, over both sessions.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Tally {
+/// What a run's writes came to: made, Published, ended named (by fate),
+/// refused at the door, forced.
+#[derive(Default, Debug)]
+struct Counts {
     made: usize,
-    refused_at_make: usize,
     published: usize,
-    rolled_back: usize,
+    named: BTreeMap<String, usize>,
+    door: usize,
+    forced: usize,
 }
 
-/// Situations in `COVERAGE` this model does NOT reach, and why — printed, so
-/// the blindness is on the page, not discovered later.
-const NOT_REACHED: &[(&str, &str)] = &[
-    ("two sessions writing one key", "the sessions' keys are disjoint (see `keys`); two writers of one key are M2's `Commit{reads,writes}`"),
-];
-
-/// One seeded run: its findings, its trace, what its mix reached, and how its
-/// writes ended.
-fn run_full(seed: u64, cfg: Config) -> (Vec<Finding>, Vec<String>, BTreeSet<&'static str>, Tally) {
-    let mut m = Model::new(seed, cfg);
-    for _ in 0..cfg.steps {
-        m.fault_step();
-    }
-    if m.honest_ms >= 60_000 {
-        m.saw.insert("honest time crossed the 60 s timeout (no jump)");
-    }
-    m.drive_to_rest();
-    m.check_at_rest();
-    let mut t = Tally::default();
-    for i in 0..2 {
-        t.made += m.made[i].len();
-        for e in m.ended[i].values() {
-            match e {
-                End::Published { .. } => t.published += 1,
-                End::RolledBack { .. } => t.rolled_back += 1,
-                End::RefusedAtMake => t.refused_at_make += 1,
-            }
-        }
-    }
-    (m.findings, m.trace, m.saw, t)
-}
-
-fn run(seed: u64, cfg: Config) -> (Vec<Finding>, Vec<String>, BTreeSet<&'static str>) {
-    let (f, trace, saw, _) = run_full(seed, cfg);
-    (f, trace, saw)
-}
-
-type Found = BTreeMap<(&'static str, &'static str), (u64, String)>;
-
-/// Every (class, cause) found across `seeds`, with the first seed that found
-/// it — and how many runs reached each situation in `COVERAGE`.
-struct Sweep {
-    first: Found,
-    /// Runs in which each (class, cause) appeared at least once.
-    runs_with: BTreeMap<(&'static str, &'static str), usize>,
-    reached: BTreeMap<&'static str, usize>,
-}
-
-fn sweep_all(seeds: std::ops::Range<u64>, cfg: Config) -> Sweep {
-    let mut first = BTreeMap::new();
-    let mut runs_with: BTreeMap<(&'static str, &'static str), usize> = BTreeMap::new();
-    let mut reached: BTreeMap<&'static str, usize> = COVERAGE.iter().map(|c| (*c, 0)).collect();
-    for seed in seeds {
-        let (f, _, saw) = run(seed, cfg);
-        let mut here = BTreeSet::new();
-        for x in f {
-            here.insert((x.class, x.tag));
-            first.entry((x.class, x.tag)).or_insert((seed, x.detail));
-        }
-        for c in here {
-            *runs_with.entry(c).or_insert(0) += 1;
-        }
-        for c in saw {
-            *reached.entry(c).or_insert(0) += 1;
-        }
-    }
-    Sweep { first, runs_with, reached }
-}
-
-/// Every (class, cause) whose run count differs from `table`, named.
-fn moved_from(table: &[(&str, &str, usize, &str)], sw: &Sweep) -> Vec<String> {
-    let want: BTreeMap<(&str, &str), usize> = table.iter().map(|(c, t, n, _)| ((*c, *t), *n)).collect();
-    let mut moved = Vec::new();
-    for k in want.keys().chain(sw.runs_with.keys()).collect::<BTreeSet<_>>() {
-        let (was, now) = (want.get(k).copied(), sw.runs_with.get(k).copied().unwrap_or(0));
-        match was {
-            None => moved.push(format!("NEW {} [{}]: {now} runs — a defect nobody has named", k.0, k.1)),
-            Some(w) if w != now => moved.push(format!("{} [{}]: {w} → {now} runs", k.0, k.1)),
-            _ => {}
-        }
-    }
-    moved
-}
-
-/// THE CONTROL for every count model v2 moved: with each v2 behaviour switched
-/// off the model is the node before v2, seed for seed, so it finds exactly the
-/// table pinned then (`KNOWN_V1`). A behaviour that draws from a shared stream,
-/// or runs when switched off, moves this -- and then no move in
-/// `KNOWN_RED_TODAY` can be traced to the behaviour said to cause it.
-#[test]
-fn with_every_v2_behaviour_off_the_model_is_the_node_before_v2() {
-    let moved = moved_from(KNOWN_V1, &sweep_all(0..1_000, Config { v2: 0, ..TODAY }));
-    assert!(moved.is_empty(), "v2 switched off is not the node before v2:\n  {}", moved.join("\n  "));
-}
-
-fn sweep(seeds: std::ops::Range<u64>, cfg: Config) -> Found {
-    sweep_all(seeds, cfg).first
-}
-
-fn show(seed: u64, cfg: Config) -> String {
-    let (f, trace, _) = run(seed, cfg);
-    let keep: usize = std::env::var("WPM_TAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(80);
-    let tail: Vec<&String> = trace.iter().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
-    format!(
-        "seed {seed} ({:?}/{:?}): {:?}\n{}",
-        cfg.rule,
-        cfg.driver,
-        f.iter().map(|x| format!("{}: {}", x.class, x.detail)).collect::<Vec<_>>(),
-        tail.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
-    )
-}
-
-// ------------------------------------------------------------- the gate
-
-/// What today's client and today's engine rule are KNOWN to break: each
-/// (class, cause) PAIR, the number of the 1,000 fixed seeds that find it, and
-/// the issue it belongs to. The runs are deterministic, so the COUNT is
-/// pinned, not only the class — and per CAUSE, not only per class: a new
-/// defect that lands inside a known class (a verdict that frees no slot shows
-/// up as more STALE CLOCK and FALSE ROLLBACK; a frame that leaves after its
-/// rollback is a new cause of a known FALSE ROLLBACK) moves a count, and a
-/// fix moves one DOWN. Either way the sweep fails and says which pair —
-/// update this table in the same change, and invert a tripwire whose pair
-/// reaches 0.
-///
-/// Issues: FALSE ROLLBACK, STALE CLOCK, W2, W5 refill, W6 — sdk#183; a
-/// misrouted Published — sdk#184; LATE VERDICT — sdk#183 (on a HEALTHY node
-/// it is gone: `a_healthy_node_finds_nothing`).
-const KNOWN_RED_TODAY: &[(&str, &str, usize, &str)] = &[
-    // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
-    // Re-pinned ONCE for model v2's node (eight behaviours, each on its own
-    // stream: the stream rule above). Argued SEED BY SEED against `KNOWN_V1`,
-    // one behaviour switched on at a time (`diagnostic_per_seed_findings`,
-    // WPM_V2=<bit>), McNemar per pair, Bonferroni over the 16 pairs
-    // (p < 0.0031). Each MOVED pair below names the behaviours that move it
-    // alone; the no-op door, Stalled and the flood move NONE (their flips are
-    // balanced) -- the control that the test tells a perturbation from an effect.
-    //
-    // Re-pinned for sdk#265 (a `Lost` write is RE-SENT with its reads, bounded
-    // by one budget, instead of falling). Only the `Lost` paths move: with
-    // every v2 behaviour off — no `Lost` said — `KNOWN_V1` is unchanged except
-    // the class newly NAMED below, which is the control that this is the
-    // re-send moving these counts and nothing else.
-    // A `Lost` write with no tries left, or one a later write of its own keys
-    // has already landed over, falls NAMED — and its last re-send can still be
-    // at the node and be applied after: the re-send's own residual (sdk#265).
-    ("FALSE ROLLBACK", "", 1, "sdk#265"),
-    ("FALSE ROLLBACK", "re-sent after its Lost", 2, "sdk#265"),
-    ("FALSE ROLLBACK", "Busy, then applied after a later write", 5, "sdk#183"), // 11: no behaviour alone past the bar
-    ("FALSE ROLLBACK", "its Published went to the other session", 824, "sdk#184"), // 874: misroute run +97/-0 up; cold -354 down
-    ("FALSE ROLLBACK", "its verdict was dropped", 594, "sdk#183"), // 844: cold, misroute run, rollback down; TooLarge, Lost up
-    ("FALSE ROLLBACK", "left the client after it was rolled back", 323, "sdk#183"), // 712: cold, misroute run down; TooLarge, Lost up
-    ("FALSE ROLLBACK", "rolled back behind another write of its keys", 851, "sdk#183"), // 892: cold, misroute run down; TooLarge, Lost up
-    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 299, "sdk#183"), // 181: cold up (inferred: a parked commit keeps the write at the node across a jump)
-    // NEW, and owned by one behaviour: the context rollback (0 -> 190 alone).
-    ("FALSE ROLLBACK", "the context rolled back past its head PUT", 63, "sdk#183"),
-    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 132, "sdk#183"), // 411: cold down, misroute run down
-    ("FALSE ROLLBACK", "timed out while its commit was in flight", 133, "sdk#183"), // 1: cold +148/-0 (inferred: a parked commit outlives the client's timeout)
-    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 38, "sdk#183"), // 8: no behaviour alone past the bar (cold p 0.0033); together, up
-    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 11, "sdk#183"), // 23: no behaviour alone past the bar
-    // Under faults: a Published (or Failed) arriving after the copy rolled the
-    // write back — the false rollbacks above, seen from the other side.
-    ("LATE VERDICT", "", 1000, "sdk#183"),
-    ("STALE CLOCK", "Busy", 835, "sdk#183"), // 287: cold +651/-10 (inferred: the Busy storm behind a parked write); Lost, misroute run down
-    // PER KEY, the property a person sees (sdk#265's own cause is asserted
-    // ZERO above): both of these are the tree's, not the re-send's — sdk#268.
-    ("W2 KEY ORDER", "Busy, then applied after a later write", 64, "sdk#268"),
-    ("W2 KEY ORDER", "after a write the client had rolled back", 50, "sdk#268"),
-    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 117, "sdk#183"), // 265: cold, rollback, misroute run down
-    // The v4 engine has no floor: a write taken while a `Lost` one waits to go
-    // again is applied first. ACROSS KEYS only — per key it is zero.
-    ("W2 OUT OF ORDER", "re-sent after its Lost", 4, "sdk#265"),
-    ("W5 NOT REFILLED AFTER A FALL", "", 198, "sdk#183"), // 302: cold, misroute run down; TooLarge, Lost up (inferred: more terminal verdicts, more falls)
-];
-
-/// The table as it stood BEFORE model v2 (sdk#174's pin, on a0c3ecc), kept
-/// as the control: with every v2 behaviour off, the model must find exactly
-/// this -- seed for seed it is the same run.
-const KNOWN_V1: &[(&str, &str, usize, &str)] = &[
-    // (class, cause, runs of 1,000 fixed seeds, issue) — rows as the sweep prints them.
-    // Re-pinned ONCE for sdk#174's client (the tick gate, the AskWrite sender,
-    // a refusal answering its frame): its timing moves these exact counts. No
-    // class new, none gone; argued SEED BY SEED in that commit -- over 5,000
-    // seeds every pair's flips are balanced (smallest paired sign-test p 0.07,
-    // of 15 pairs). `diagnostic_per_seed_findings` makes the table again.
-    ("FALSE ROLLBACK", "Busy, then applied after a later write", 11, "sdk#183"),
-    ("FALSE ROLLBACK", "its Published went to the other session", 874, "sdk#184"),
-    ("FALSE ROLLBACK", "its verdict was dropped", 844, "sdk#183"),
-    ("FALSE ROLLBACK", "left the client after it was rolled back", 712, "sdk#183"),
-    ("FALSE ROLLBACK", "rolled back behind another write of its keys", 892, "sdk#183"),
-    ("FALSE ROLLBACK", "the client's clock jumped while it was at the node", 181, "sdk#183"),
-    ("FALSE ROLLBACK", "the node lost its context after the head PUT", 411, "sdk#183"),
-    ("FALSE ROLLBACK", "timed out while its commit was in flight", 1, "sdk#183"),
-    ("FALSE ROLLBACK", "timed out while its frame waited in the node's queue", 8, "sdk#183"),
-    ("FALSE ROLLBACK", "timed out while its verdict was on its way", 23, "sdk#183"),
-    // Under faults: a Published (or Failed) arriving after the copy rolled the
-    // write back — the false rollbacks above, seen from the other side.
-    ("LATE VERDICT", "", 1000, "sdk#183"),
-    ("STALE CLOCK", "Busy", 287, "sdk#183"),
-    // NAMED by sdk#265's per-key check; the behaviour is older than it, and
-    // with no `Lost` said these are the only rows it adds here (sdk#268).
-    ("W2 KEY ORDER", "Busy, then applied after a later write", 192, "sdk#268"),
-    ("W2 KEY ORDER", "after a write the client had rolled back", 100, "sdk#268"),
-    ("W2 OUT OF ORDER", "Busy, then applied after a later write", 265, "sdk#183"),
-    ("W5 NOT REFILLED AFTER A FALL", "", 302, "sdk#183"),
-];
-
-#[test]
-fn the_sweep_finds_exactly_the_known_classes_and_counts() {
-    let sw = sweep_all(0..1_000, TODAY);
-    for ((class, tag), (seed, detail)) in &sw.first {
-        println!("  {class:<16} [{tag}] first at seed {seed:>4}: {detail}");
-    }
-    println!("  COVERAGE over 1,000 runs — a situation no run reaches is one the model is blind to:");
-    for c in COVERAGE {
-        println!("    {:>5}  {c}", sw.reached[c]);
-    }
-    // Every situation the model CLAIMS to cover is reached; the one it does
-    // not model reads 0, visibly, rather than being left off the list.
-    let blind: Vec<&&str> = COVERAGE.iter().filter(|c| !NOT_REACHED.iter().any(|(n, _)| n == *c) && sw.reached[*c] == 0).collect();
-    for (c, why) in NOT_REACHED {
-        println!("    NOT REACHED, by design: {c} — {why}");
-    }
-    assert!(blind.is_empty(), "the step mix never reaches {blind:?}: the model is blind there");
-
-    // W1 and W5 hold on today's client in EVERY seed — a write is whole on
-    // the wire, never more than the window at the node, never held with room
-    // except right after a fall (its own known class). Checked on this same
-    // sweep: a second 1,000-seed pass for it cost 18 s of a debug gate.
-    let broken: Vec<_> = sw.first.keys().filter(|(c, _)| c.starts_with("W1") || *c == "W5 WINDOW" || *c == "W5 HELD WITH ROOM").collect();
-    assert!(broken.is_empty(), "W1/W5 broken on today's client: {broken:?}");
-
-    // sdk#265's PROPERTY: a `Lost` write is re-sent, and a re-send must never
-    // land after a LATER write of the person's on the same key — the older
-    // value would be the one they are left with. (Out of order across
-    // DIFFERENT keys is the v4 engine's own, `W2 OUT OF ORDER`: it has no
-    // floor, so a write taken while the Lost one waits is applied first.)
-    let key_order: Vec<_> = sw.first.iter().filter(|((c, t), _)| *c == "W2 KEY ORDER" && *t == "re-sent after its Lost").collect();
-    assert!(key_order.is_empty(), "a re-sent Lost write landed after a later write of its own keys (sdk#265): {key_order:?}");
-
-    println!("  RUNS PER (CLASS, CAUSE) OF 1,000 — as table rows:");
-    for ((c, t), n) in &sw.runs_with {
-        println!("    ({c:?}, {t:?}, {n}, \"\"),");
-    }
-    let moved = moved_from(KNOWN_RED_TODAY, &sw);
-    assert!(
-        moved.is_empty(),
-        "the classes the model finds on this tree MOVED — a new defect (up, or a new class) or a fix (down; invert a tripwire whose class reaches 0):\n  {}",
-        moved.join("\n  ")
-    );
-}
-
-/// A pinned finding: some seed in `0..TRIPWIRE_SEEDS` must still find
-/// `class` with cause `tag` — TODAY. The FIRST such seed is printed, so the
-/// repro stays deterministic, but the pin does not churn when a timing
-/// change moves which seed it is. When this fails, the defect is gone: invert
-/// the tripwire (assert no seed finds it) and take the pair off
-/// `KNOWN_RED_TODAY` once its count is 0.
-const TRIPWIRE_SEEDS: u64 = 50;
-
-fn tripwire(cfg: Config, class: &str, tag: &str, issue: &str) {
-    for seed in 0..TRIPWIRE_SEEDS {
-        let (f, _, _) = run(seed, cfg);
-        if f.iter().any(|x| x.class == class && x.tag == tag) {
-            println!("  {class} [{tag}] ({issue}): first at seed {seed} — WPM_SEED={seed} for its trace");
-            return;
-        }
-    }
-    panic!("no seed in 0..{TRIPWIRE_SEEDS} finds {class} [{tag}] ({issue}) — if a fix for it landed, INVERT this tripwire");
-}
-
-/// sdk#179 c, found unaided: a write answered Busy, re-sent after a later
-/// write of the same session had landed — the older value lands last.
-/// Model v2, the context rollback alone (0 -> 190 of 1,000): a commit that
-/// LANDED is rolled back past by its context, and the client, told nothing
-/// more, rolls the write back while its head is in the tree.
-#[test]
-fn known_red_a_context_rolled_back_past_its_head_put_is_a_false_rollback() {
-    tripwire(TODAY, "FALSE ROLLBACK", "the context rolled back past its head PUT", "sdk#183");
-}
-
-#[test]
-fn known_red_busy_reorder_k_old_after_k_new() {
-    tripwire(TODAY, "W2 OUT OF ORDER", "Busy, then applied after a later write", "sdk#183");
-}
-
-/// A Busy'd write, queued at the client with its original clock, never
-/// re-offered while others were pending, rolled back Unknown by the timer.
-#[test]
-fn known_red_stale_clock_of_a_queued_write() {
-    tripwire(TODAY, "STALE CLOCK", "Busy", "sdk#183");
-}
-
-/// Run (a): the node's context is lost after the head PUT landed and before
-/// its answer. Today's client never asks again: at 60 s it is told Unknown,
-/// and the node HAS it.
-#[test]
-fn known_red_context_loss_after_the_head_put_is_a_false_rollback() {
-    tripwire(TODAY, "FALSE ROLLBACK", "the node lost its context after the head PUT", "sdk#183 run (a)");
-}
-
-/// sdk#184: a Published delivered to the OTHER session (F49); this one is
-/// told Unknown at 60 s, and the node has it.
-#[test]
-fn known_red_misrouted_published_is_a_false_rollback() {
-    tripwire(TODAY, "FALSE ROLLBACK", "its Published went to the other session", "sdk#184");
-}
-
-/// A dropped verdict (F39): the same false rollback by a different road.
-#[test]
-fn known_red_dropped_verdict_is_a_false_rollback() {
-    tripwire(TODAY, "FALSE ROLLBACK", "its verdict was dropped", "sdk#183");
-}
-
-/// A frame that sat in the client's outbox leaves AFTER its write was rolled
-/// back, and the node applies it.
-#[test]
-fn known_red_a_rolled_back_write_still_leaves_and_lands() {
-    tripwire(TODAY, "FALSE ROLLBACK", "left the client after it was rolled back", "sdk#183");
-}
-
-/// The window refilled before the fall it should follow (`on_write_state`).
-#[test]
-fn known_red_the_window_is_not_refilled_after_a_fall() {
-    tripwire(TODAY, "W5 NOT REFILLED AFTER A FALL", "", "sdk#183");
-}
-
-/// W6 at rest, INVERTED (READ-STATE, design B): "the copy shows a value the
-/// node does not have" was 851 of 1,000 seeds (501 before model v2) while a
-/// row copy answered reads. Reads walk the tree now and the write half holds
-/// only what is unsettled, so what W6 can still see is a write left PENDING
-/// at rest — and no seed finds one.
-#[test]
-fn w6_nothing_is_pending_at_rest() {
-    for seed in 0..TRIPWIRE_SEEDS {
-        let (f, _, _) = run(seed, TODAY);
-        let w6: Vec<_> = f.iter().filter(|x| x.class.starts_with("W6")).collect();
-        assert!(w6.is_empty(), "seed {seed}: {w6:?}");
-    }
-}
-
-/// THE HARNESS'S OWN CHECK — not a finding about today's client, which
-/// never re-sends on silence. With a driver that DOES (what a recovering
-/// client would do), today's rule applies a write twice across a context
-/// loss, and the W3 check must see it. On the scripted node this proves the
-/// CHECK works; that today's real engine applies twice is the architect's
-/// executed run (ledger attack §4), and build step 4 runs the real Engine
-/// under these seeds.
-#[test]
-fn harness_check_resend_on_silence_makes_today_apply_twice() {
-    let cfg = Config { driver: Driver::ResendOnSilence, ..TODAY };
-    let found = sweep(0..300, cfg);
-    let twice: Vec<_> = found.iter().filter(|((c, _), _)| *c == "W3 APPLIED TWICE").collect();
-    for ((c, t), (seed, d)) in &twice {
-        println!("  {c} [{t}] first at seed {seed}: {d}");
-    }
-    // The run the design names: the context lost BETWEEN the head PUT and its
-    // answer, the write re-sent, applied again.
-    assert!(
-        twice.iter().any(|((_, t), _)| *t == "the node lost its context after the head PUT"),
-        "no seed applied a write twice ACROSS A CONTEXT LOSS: the W3 check does not see it, or the model never loses a context between the head PUT and its answer"
-    );
-}
-
-
-/// THE LIVENESS FLOOR. Every rest check is a SAFETY check: a client that
-/// rolls everything back, or never sends, passes them all (executed by the
-/// architect: "a node that swallows every frame: 50 writes made, applied 0,
-/// findings []"). On a HEALTHY node — no fault of any kind — every write
-/// made and not refused at make is PUBLISHED, and none is rolled back.
-#[test]
-fn liveness_on_a_healthy_node_every_write_is_published() {
-    let mut total = Tally::default();
-    let mut short = Vec::new();
-    for seed in 0..300 {
-        let (_, _, _, t) = run_full(seed, HEALTHY);
-        if t.rolled_back != 0 || t.published != t.made - t.refused_at_make {
-            short.push((seed, t));
-        }
-        total.made += t.made;
-        total.refused_at_make += t.refused_at_make;
-        total.published += t.published;
-        total.rolled_back += t.rolled_back;
-    }
-    println!("  healthy, 300 seeds: {total:?}");
-    assert!(short.is_empty(), "{} healthy runs did not publish every write: first {:?}", short.len(), short.first());
-}
-
-/// A HEALTHY node finds NOTHING: no fault, so no class of any kind. The
-/// last one standing on today's client was LATE VERDICT — the engine's
-/// `ParityComplete` after `Published`, counted as a stranger's verdict for
-/// a write the client had already settled (fixed with this test).
-#[test]
-fn a_healthy_node_finds_nothing() {
-    let mut found: BTreeMap<&str, (u64, String)> = BTreeMap::new();
-    for seed in 0..300 {
-        let (f, _, _) = run(seed, HEALTHY);
-        for x in f {
-            found.entry(x.class).or_insert((seed, x.detail));
-        }
-    }
-    assert!(found.is_empty(), "a node with no fault still produced findings: {found:?}");
-}
-
-/// A run is a function of its seed — or no seed can be pinned.
-#[test]
-fn a_seed_is_the_whole_run() {
-    for seed in [1u64, 77, 999] {
-        let a = run(seed, TODAY);
-        let b = run(seed, TODAY);
-        assert_eq!(a.1, b.1, "seed {seed} ran two different ways");
-    }
-}
-
-#[test]
-#[ignore = "diagnostic: print one seed's trace — WPM_SEED=<n> [WPM_RESEND=1] [WPM_TAIL=<lines>] cargo test --test write_path_model trace -- --ignored --nocapture"]
-fn trace() {
-    let seed: u64 = std::env::var("WPM_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let driver = if std::env::var("WPM_RESEND").is_ok() { Driver::ResendOnSilence } else { Driver::Today };
-    println!("{}", show(seed, Config { driver, ..TODAY }));
-}
-
-// ====================================================================
-// RULE::REV3 — the scripted node's rule for wire v5, at the FRAME level
-// (WRITE-PATH.md revision 3, "The rule"). Fed v5 frames by hand, no client:
-// today's client speaks v4, and the client that speaks v5 is build step 3,
-// which wires this node into the model above. Types from sdk#193.
-// ====================================================================
-
-/// The rev-3 node: the order rule over a tree, a HEAD (root + ledger) that
-/// survives a forget, and a CONTEXT (the commit in flight, what was taken,
-/// what frames were seen) that does not.
-#[derive(Default)]
-struct Rev3Node {
-    tree: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// THE HEAD'S LEDGER: `published_through[S]`, written with the head PUT —
-    /// the same signed record — so it is atomic with the commit and read by
-    /// an engine that has just lost everything.
-    ledger: BTreeMap<u64, u64>,
-    // --- the context: gone on a forget ---
-    commit: Option<Rev3Commit>,
-    taken_through: BTreeMap<u64, u64>,
-    frames_seen: BTreeMap<u64, u64>,
-    /// Every (session, write_id) APPLIED, for W3. APPLIED = TAKEN under the
-    /// rule AND NOT WITHDRAWN: a take whose commit died un-landed — Failed,
-    /// Lost, or a forget before its head PUT — is withdrawn, so the write
-    /// sent again and taken again is a correct recovery, not a double apply.
-    applied: Vec<(u64, u64)>,
-}
-
-#[derive(Clone)]
-struct Rev3Commit {
-    session: u64,
-    write_id: u64,
-    ops: Vec<Op>,
-    landed: bool,
-}
-
-impl Rev3Node {
-    fn next(&self, s: u64) -> u64 {
-        self.ledger.get(&s).copied().unwrap_or(0) + 1
-    }
-
-    fn ack(&self, s: u64, answering: Option<u64>) -> protocol::Ack {
-        protocol::Ack {
-            session: s,
-            published_through: self.ledger.get(&s).copied().unwrap_or(0),
-            taken_through: self.taken_through.get(&s).copied().unwrap_or(0),
-            // The scripted node does not model parity: it does not KNOW, and
-            // says so — never "0 owed".
-            parity: None,
-            frames_seen: self.frames_seen.get(&s).copied().unwrap_or(0),
-            answering,
-        }
-    }
-
-    /// A verdict to session `s`, wrapped with `s`'s Ack. `caller` is the
-    /// session whose frame started this call, and `frame` that frame.
-    fn verdict(&self, s: u64, write_id: u64, state: WriteState, caller: u64, frame: u64) -> Vec<u8> {
-        let answering = (caller == s).then_some(frame);
-        protocol::encode_reply(&Reply::Acked {
-            ack: self.ack(s, answering),
-            body: Box::new(Reply::SessionWriteState { session: s, write_id, state }),
-        })
-        .expect("a verdict encodes")
-    }
-
-    /// One call: a v5 frame in, the replies out.
-    fn call(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
-        let env = match protocol::decode_request(frame) {
-            protocol::Incoming::Ok(env) if env.version >= protocol::FLOOR_SINCE => env,
-            other => panic!("the rev-3 node is fed v5 frames only: {other:?}"),
-        };
-        let (s, f) = (env.session, env.frame.expect("a v5 frame carries its sequence"));
-        let seen = self.frames_seen.entry(s).or_insert(0);
-        *seen = (*seen).max(f);
-        match env.body {
-            Request::WriteFrom { write_id, floor, ops } => {
-                let next = self.next(s);
-                // 1. Below next: already PUBLISHED. Nothing applied; the Ack says so.
-                if write_id < next {
-                    return vec![self.verdict(s, write_id, WriteState::Duplicate, s, f)];
-                }
-                // 1b. The write IS the commit in flight for this session —
-                //     taken, not yet published: a re-send (after silence, a
-                //     reconnect) is told so, not Busy while its own Ack says
-                //     taken (WRITE-PATH rev 3, rulings: Q4).
-                if self.commit.as_ref().is_some_and(|c| c.session == s && c.write_id == write_id) {
-                    return vec![self.verdict(s, write_id, WriteState::Duplicate, s, f)];
-                }
-                // 2. A commit pending: Busy, `next` untouched.
-                if self.commit.is_some() {
-                    return vec![self.verdict(s, write_id, WriteState::Busy, s, f)];
-                }
-                // 3. The expected one: take it. (`floor > next` is ordinary —
-                //    ids have gaps where a write was refused at make.)
-                let expected = next.max(floor);
-                if write_id == expected {
-                    self.applied.push((s, write_id));
-                    self.taken_through.insert(s, write_id);
-                    self.commit = Some(Rev3Commit { session: s, write_id, ops, landed: false });
-                    return vec![self.verdict(s, write_id, WriteState::Accepted, s, f)];
-                }
-                // 4. Anything else: OutOfOrder, nothing applied.
-                vec![self.verdict(s, write_id, WriteState::OutOfOrder { expected }, s, f)]
-            }
-            // A tick moves the commit one step — and its verdict goes to the
-            // COMMIT's session, whoever ticked (F49's shape).
-            Request::Tick { .. } => self.step(s, f),
-            other => panic!("the rev-3 node's frame tests send WriteFrom and Tick only: {other:?}"),
-        }
-    }
-
-    /// The commit moves one step: its head PUT lands — the tree AND the
-    /// ledger, one record — then it is answered Published.
-    fn step(&mut self, caller: u64, frame: u64) -> Vec<Vec<u8>> {
-        let Some(c) = self.commit.clone() else { return Vec::new() };
-        if !c.landed {
-            for op in &c.ops {
-                match op {
-                    Op::Put(k, v) => {
-                        self.tree.insert(k.clone(), v.clone());
-                    }
-                    Op::Delete(k) => {
-                        self.tree.remove(k);
-                    }
+fn run(seed: u64) -> (Vec<Finding>, Counts) {
+    let mut rng = Rng(seed);
+    let node = PageNode::new();
+    let mut tabs = [Tab::open(&node, "a"), Tab::open(&node, "b")];
+    for step in 0..STEPS {
+        let t = rng.below(2) as usize;
+        match rng.below(10) {
+            0..=4 => tabs[t].write(&mut rng, step),
+            5 => tabs[t].conn.hold_answers(),
+            6 => tabs[t].conn.stop_holding(),
+            7 => {
+                if tabs[t].conn.held() > 0 {
+                    let _ = tabs[t].conn.release_one();
                 }
             }
-            // ONLY A PUBLISH CONSUMES A NUMBER.
-            self.ledger.insert(c.session, c.write_id);
-            self.commit.as_mut().expect("the commit").landed = true;
-            return Vec::new();
+            // An answer LOST (its request's deadline re-asks).
+            8 => {
+                if rng.below(3) == 0 {
+                    tabs[t].conn.lose_one_held();
+                }
+            }
+            // Time passes: a second, or (rarely) a jump of ten minutes.
+            _ => {
+                let ms = if rng.below(8) == 0 { 600_000 } else { 1_000 };
+                tabs[t].tick(ms);
+            }
         }
-        self.commit = None;
-        vec![self.verdict(c.session, c.write_id, WriteState::Published, caller, frame)]
+        tabs[t].collect();
     }
-
-    /// The commit FAILS (the engine refused it): nothing applied, and the
-    /// number is RELEASED — the ledger does not move.
-    fn fail(&mut self, caller: u64, frame: u64) -> Vec<Vec<u8>> {
-        let Some(c) = self.commit.take() else { return Vec::new() };
-        assert!(!c.landed, "a landed commit does not fail");
-        self.applied.retain(|a| *a != (c.session, c.write_id));
-        vec![self.verdict(c.session, c.write_id, WriteState::Failed, caller, frame)]
+    // TO REST: faults stop, every held answer is delivered, time passes.
+    for tab in tabs.iter_mut() {
+        tab.conn.stop_holding();
     }
-
-    /// The commit is LOST (a head conflict, settle rounds exhausted) before
-    /// its head lands: nothing applied, and — like Failed — the number is
-    /// RELEASED; only a publish consumes one.
-    fn lose(&mut self, caller: u64, frame: u64) -> Vec<Vec<u8>> {
-        let Some(c) = self.commit.take() else { return Vec::new() };
-        assert!(!c.landed, "a landed commit is not lost: its head holds it");
-        self.applied.retain(|a| *a != (c.session, c.write_id));
-        vec![self.verdict(c.session, c.write_id, WriteState::Lost, caller, frame)]
-    }
-
-    /// The context is LOST: the commit in flight, what was taken, what frames
-    /// were seen. The tree and its head's ledger stay.
-    fn forget(&mut self) {
-        // A take whose head never landed is WITHDRAWN: nothing of it is in the
-        // tree or the ledger. (A landed one stays applied: its head holds it.)
-        if let Some(c) = self.commit.as_ref().filter(|c| !c.landed) {
-            let taken = (c.session, c.write_id);
-            self.applied.retain(|a| *a != taken);
+    for round in 0..400 {
+        let mut busy = false;
+        for tab in tabs.iter_mut() {
+            while tab.conn.held() > 0 {
+                let _ = tab.conn.release_one();
+                busy = true;
+            }
+            tab.tick(1_000);
+            busy |= tab.store.unsaved_writes() > 0 || tab.store.queue_load().0 > 0;
         }
-        self.commit = None;
-        self.taken_through.clear();
-        self.frames_seen.clear();
+        if !busy && round > 5 {
+            break;
+        }
     }
+    let mut found = Vec::new();
+    let mut counts = Counts::default();
+    let tree = node.head().and_then(|(_, r)| node.tree(&r)).unwrap_or_default();
+    for tab in tabs.iter_mut() {
+        tab.collect();
+        let p = tab.prefix;
+        // Every write ended exactly once.
+        for m in &tab.made {
+            counts.made += 1;
+            counts.forced += usize::from(m.forced);
+            match m.end.first() {
+                Some(End::Published) => counts.published += 1,
+                Some(End::RefusedAtDoor(_)) => counts.door += 1,
+                Some(End::Named(s)) => *counts.named.entry(s.clone()).or_default() += 1,
+                None => {}
+            }
+            match m.end.len() {
+                0 => found.push(Finding { class: "A WRITE VANISHED, NEVER TOLD", detail: format!("seed {seed} tab {p} write {} {:?}", m.id, m.ops) }),
+                1 => {}
+                _ => found.push(Finding { class: "A WRITE WAS TOLD TWICE", detail: format!("seed {seed} tab {p} write {}: {:?}", m.id, m.end) }),
+            }
+            if m.end.iter().any(|e| matches!(e, End::Named(s) if s.starts_with("STRANGER"))) {
+                found.push(Finding { class: "A FATE FOR A WRITE NEVER MADE", detail: format!("seed {seed} tab {p}: {:?}", m.end) });
+            }
+            if m.end.iter().any(|e| matches!(e, End::Named(s) if s == "Lost")) && m.forced {
+                found.push(Finding { class: "A FORCED WRITE FELL, NOT NAMED AS FORCED", detail: format!("seed {seed} tab {p} write {}", m.id) });
+            }
+        }
+        // VALUE PARITY: each key holds its last Published write's value.
+        for i in 0..KEYS {
+            let k = tab.key(i);
+            let want: Option<Vec<u8>> = tab
+                .made
+                .iter()
+                .filter(|m| m.end == [End::Published])
+                .filter_map(|m| m.ops.iter().find(|(kk, _)| *kk == k).map(|(_, v)| v.clone()))
+                .next_back()
+                .flatten();
+            let got = tree.get(&k).cloned();
+            if got != want {
+                // Which write's value is it? The finding names the cause.
+                let whose: Vec<String> = tab
+                    .made
+                    .iter()
+                    .filter_map(|m| m.ops.iter().find(|(kk, _)| *kk == k).map(|(_, v)| format!("w{}={:?}{}:{:?}", m.id, v.as_deref().map(String::from_utf8_lossy), if m.forced { "(forced)" } else { "" }, m.end)))
+                    .collect();
+                found.push(Finding {
+                    class: "THE TREE IS NOT WHAT THE TAB WAS TOLD",
+                    detail: format!("seed {seed} key {}: tree {:?}, told {:?}; writes of it, in order: {whose:?}", String::from_utf8_lossy(&k), got.as_deref().map(String::from_utf8_lossy), want.as_deref().map(String::from_utf8_lossy)),
+                });
+            }
+        }
+        let unsaved = tab.store.unsaved_writes();
+        if unsaved > 0 || tab.store.queue_load().0 > 0 {
+            found.push(Finding { class: "NOT AT REST: WRITES STILL QUEUED", detail: format!("seed {seed} tab {p}: {unsaved} unsaved") });
+        }
+        let (differs, rederived, impossible) = tab.conn.with_server(|s| s.page.queue_counts());
+        if differs + rederived + impossible > 0 {
+            found.push(Finding { class: "THE QUEUE'S OWN COUNTS ARE NOT ZERO", detail: format!("seed {seed} tab {p}: K9 differs {differs}, own-publish re-derived {rederived}, impossible {impossible}") });
+        }
+        let busy = tab.conn.with_server(|s| s.busy_told());
+        if busy > 0 {
+            found.push(Finding { class: "A WRITE WAS TOLD BUSY", detail: format!("seed {seed} tab {p}: {busy}") });
+        }
+    }
+    (found, counts)
 }
 
-mod rev3 {
-    use super::*;
-
-    const A: u64 = 0x0000_1234_5678_9abc;
-    const B: u64 = 0x0000_2345_6789_abcd;
-
-    fn write(s: u64, frame: u64, write_id: u64, floor: u64, v: &str) -> Vec<u8> {
-        protocol::encode_v5_request(s, 1_790_000_000_000, frame, &Request::WriteFrom { write_id, floor, ops: vec![Op::Put(b"k".to_vec(), v.as_bytes().to_vec())] })
-            .expect("encodes")
-    }
-    fn tick(s: u64, frame: u64) -> Vec<u8> {
-        protocol::encode_v5_request(s, 1_790_000_000_000, frame, &Request::Tick { now: 1 }).expect("encodes")
-    }
-    /// (whose Ack, the Ack, whose write, which write, the state) of each reply.
-    fn read(replies: &[Vec<u8>]) -> Vec<(protocol::Ack, u64, u64, WriteState)> {
-        replies
-            .iter()
-            .map(|b| match protocol::decode_reply(b).expect("decodes") {
-                Reply::Acked { ack, body } => match *body {
-                    Reply::SessionWriteState { session, write_id, state } => (ack, session, write_id, state),
-                    other => panic!("{other:?}"),
-                },
-                other => panic!("a reply to a v5 client that is not Acked: {other:?}"),
-            })
-            .collect()
-    }
-    fn one(replies: Vec<Vec<u8>>) -> (protocol::Ack, WriteState) {
-        let r = read(&replies);
-        assert_eq!(r.len(), 1, "{r:?}");
-        (r[0].0, r[0].3)
-    }
-    /// Take, land, publish w`id` of `s` with ticks from `s`.
-    fn publish(n: &mut Rev3Node, s: u64, frame: &mut u64, id: u64, floor: u64) {
-        *frame += 1;
-        assert_eq!(one(n.call(&write(s, *frame, id, floor, "v"))).1, WriteState::Accepted);
-        *frame += 1;
-        assert!(n.call(&tick(s, *frame)).is_empty());
-        *frame += 1;
-        assert_eq!(one(n.call(&tick(s, *frame))).1, WriteState::Published);
-    }
-
-    /// Rule 3, then the ledger: taken in order, published, and the Ack says
-    /// how far — on EVERY reply, with the frame it answers, parity unknown.
-    #[test]
-    fn in_order_writes_are_taken_and_the_ack_says_how_far() {
-        let mut n = Rev3Node::default();
-        let (ack, st) = one(n.call(&write(A, 1, 1, 1, "a")));
-        assert_eq!(st, WriteState::Accepted);
-        assert_eq!((ack.session, ack.published_through, ack.taken_through, ack.frames_seen, ack.answering, ack.parity), (A, 0, 1, 1, Some(1), None));
-        assert!(n.call(&tick(A, 2)).is_empty());
-        let (ack, st) = one(n.call(&tick(A, 3)));
-        assert_eq!(st, WriteState::Published);
-        assert_eq!((ack.published_through, ack.answering), (1, Some(3)));
-    }
-
-    /// Rule 1: a write at or below what is published is a DUPLICATE —
-    /// nothing applied, and the Ack says it published.
-    #[test]
-    fn a_published_write_sent_again_is_a_duplicate_and_applied_once() {
-        let mut n = Rev3Node::default();
-        let mut f = 0;
-        publish(&mut n, A, &mut f, 1, 1);
-        let (ack, st) = one(n.call(&write(A, 10, 1, 1, "a")));
-        assert_eq!(st, WriteState::Duplicate);
-        assert_eq!(ack.published_through, 1, "the Duplicate's Ack must say it PUBLISHED");
-        assert_eq!(n.applied, vec![(A, 1)], "applied twice");
-    }
-
-    /// Rule 1b: the write IS this session's commit in flight — a re-send of
-    /// a TAKEN write is a Duplicate whose Ack says taken, not Busy, and it is
-    /// applied once.
-    #[test]
-    fn a_taken_write_sent_again_is_a_duplicate_that_says_taken() {
-        let mut n = Rev3Node::default();
-        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
-        let (ack, st) = one(n.call(&write(A, 2, 1, 1, "a")));
-        assert_eq!(st, WriteState::Duplicate, "a taken write re-sent was not told it is taken");
-        assert_eq!((ack.taken_through, ack.published_through), (1, 0), "the Duplicate's Ack must say TAKEN, not published");
-        assert_eq!(n.applied, vec![(A, 1)]);
-        // CONTROL: another session's write during the same commit is still Busy.
-        assert_eq!(one(n.call(&write(B, 1, 1, 1, "b"))).1, WriteState::Busy);
-    }
-
-    /// Rule 2: while a commit is pending, Busy — and `next` does not move.
-    #[test]
-    fn a_write_while_a_commit_is_pending_is_busy() {
-        let mut n = Rev3Node::default();
-        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
-        assert_eq!(one(n.call(&write(B, 1, 1, 1, "b"))).1, WriteState::Busy);
-        assert_eq!(n.next(B), 1);
-    }
-
-    /// Rule 3's floor arm: a gap (an id refused at make, never sent) is
-    /// ORDINARY — `floor > next` takes the floor.
-    #[test]
-    fn a_gap_below_the_floor_is_ordinary() {
-        let mut n = Rev3Node::default();
-        let mut f = 0;
-        publish(&mut n, A, &mut f, 1, 1);
-        // w2 was refused at make; the client's floor is now 3.
-        assert_eq!(one(n.call(&write(A, 20, 3, 3, "c"))).1, WriteState::Accepted);
-    }
-
-    /// Rule 4: anything else is OutOfOrder{expected} — nothing applied. THE
-    /// sdk#179 c case: W2 Busy'd, W3 already at the node → W3 is refused, not
-    /// applied ahead of W2.
-    #[test]
-    fn a_write_ahead_of_its_turn_is_out_of_order_and_not_applied() {
-        let mut n = Rev3Node::default();
-        let mut f = 0;
-        publish(&mut n, A, &mut f, 1, 1);
-        // The client still holds w2 un-ended (floor 2) and sends w3.
-        let (_, st) = one(n.call(&write(A, 30, 3, 2, "new")));
-        assert_eq!(st, WriteState::OutOfOrder { expected: 2 });
-        assert_eq!(n.applied, vec![(A, 1)], "w3 was applied ahead of w2");
-        // w2, then w3, in order.
-        let mut f2 = 30;
-        publish(&mut n, A, &mut f2, 2, 2);
-        publish(&mut n, A, &mut f2, 3, 3);
-        assert_eq!(n.applied, vec![(A, 1), (A, 2), (A, 3)]);
-    }
-
-    /// ONLY A PUBLISH CONSUMES A NUMBER: a Failed releases it, and the same
-    /// write sent again gets a TRUE second attempt.
-    #[test]
-    fn a_failed_write_releases_its_number() {
-        let mut n = Rev3Node::default();
-        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
-        let (ack, st) = one(n.fail(A, 1));
-        assert_eq!(st, WriteState::Failed);
-        assert_eq!(ack.published_through, 0, "a failed write was counted published");
-        assert_eq!(one(n.call(&write(A, 2, 1, 1, "a"))).1, WriteState::Accepted, "no second attempt after Failed");
-    }
-
-    /// Lost releases its number too: nothing published, a true second attempt.
-    #[test]
-    fn a_lost_write_releases_its_number() {
-        let mut n = Rev3Node::default();
-        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
-        let (ack, st) = one(n.lose(A, 1));
-        assert_eq!(st, WriteState::Lost);
-        assert_eq!(ack.published_through, 0, "a lost write was counted published");
-        assert_eq!(one(n.call(&write(A, 2, 1, 1, "a"))).1, WriteState::Accepted, "no second attempt after Lost");
-    }
-
-    /// The ledger moves WITH the head, not before: a context lost after the
-    /// take and BEFORE the head PUT published nothing, so the write sent again
-    /// is TAKEN — not answered Duplicate for a write that never landed.
-    #[test]
-    fn a_context_lost_before_the_head_lands_publishes_nothing() {
-        let mut n = Rev3Node::default();
-        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
-        n.forget(); // before any tick: the head PUT never went
-        assert_eq!(n.taken_through.get(&A), None, "taken_through survived the forget: it is the context's");
-        assert!(n.applied.is_empty(), "the un-landed take was not withdrawn");
-        let (ack, st) = one(n.call(&write(A, 2, 1, 1, "a")));
-        assert_eq!(st, WriteState::Accepted, "a write that never landed was told Duplicate");
-        assert_eq!(ack.published_through, 0);
-        assert_eq!(ack.taken_through, 1, "the re-send is taken again");
-        assert!(!n.tree.contains_key(b"k".as_slice()), "the tree changed without a head PUT");
-        // …and that is ONE apply, not two: the forgotten take was withdrawn.
-        assert!(n.call(&tick(A, 3)).is_empty());
-        assert_eq!(one(n.call(&tick(A, 4))).1, WriteState::Published);
-        assert_eq!(n.applied, vec![(A, 1)], "a correct recovery was counted as a double apply");
-        assert_eq!(n.tree.get(b"k".as_slice()).map(|v| v.as_slice()), Some(b"a".as_slice()));
-    }
-
-    /// THE LEDGER SURVIVES A FORGET — run (a): the head PUT landed, the
-    /// context died before its answer, the write is sent again. A fresh
-    /// engine reads the ledger: Duplicate, published — NOT applied twice.
-    #[test]
-    fn the_ledger_survives_a_forget_and_nothing_is_applied_twice() {
-        let mut n = Rev3Node::default();
-        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
-        assert!(n.call(&tick(A, 2)).is_empty()); // the head PUT lands
-        n.forget(); // …and the context dies before the Published
-        // B writes the key in between.
-        let mut fb = 0;
-        publish(&mut n, B, &mut fb, 1, 1);
-        let (ack, st) = one(n.call(&write(A, 3, 1, 1, "a")));
-        assert_eq!(st, WriteState::Duplicate, "run (a): the write was taken again");
-        assert_eq!(ack.published_through, 1);
-        assert_eq!(n.applied.iter().filter(|a| **a == (A, 1)).count(), 1, "applied twice across the forget");
-        // …and taken_through went BACKWARDS with the context: it says 0.
-        assert_eq!(ack.taken_through, 0);
-    }
-
-    /// A verdict decided in ANOTHER session's call (F49's shape) carries its
-    /// OWN session's Ack — and answers none of that session's frames.
-    #[test]
-    fn a_verdict_decided_in_anothers_call_answers_none_of_its_frames() {
-        let mut n = Rev3Node::default();
-        assert_eq!(one(n.call(&write(A, 1, 1, 1, "a"))).1, WriteState::Accepted);
-        assert!(n.call(&tick(B, 1)).is_empty());
-        let r = read(&n.call(&tick(B, 2)));
-        assert_eq!(r.len(), 1);
-        let (ack, session, _, state) = r[0];
-        assert_eq!((session, state), (A, WriteState::Published));
-        assert_eq!(ack.session, A, "the Ack names the WRITE's session");
-        assert_eq!(ack.answering, None, "B's frame was reported as A's");
-    }
-}
-
-/// DIAGNOSTIC, not a gate: every seed's (class|cause) set, one line a seed,
-/// so two clients can be compared SEED BY SEED -- the re-pin's argument. The
-/// pins are exact counts of a chaotic system, so any client timing change
-/// moves most of them; a re-pin carries information only with the PAIRED
-/// table this dump makes (seeds that flip each way, per pair), never with a
-/// difference of totals (the architect's sdk#196 review).
-///
-/// `SEEDS=5000 cargo test --test write_path_model diagnostic_per_seed_findings -- --ignored --nocapture > arm.txt`
-/// on each tree, then compare the `SEED` lines.
+/// **THE WRITE PATH'S PROPERTIES HOLD ON THE REAL QUEUE**: 200 seeds of two
+/// tabs of one person racing under held, reordered and lost answers and
+/// clock jumps -- nothing vanishes untold, nothing is told twice, the tree is
+/// what each tab was told, and the queue comes to rest. COVERAGE is printed
+/// and asserted beside it: the runs really made the situations the
+/// properties are about, or a green sweep would be a sweep of nothing.
 #[test]
-#[ignore = "diagnostic: a per-seed dump for a paired comparison of two clients"]
-fn diagnostic_per_seed_findings() {
-    let n: u64 = std::env::var("SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5_000);
-    // WPM_V2=<mask of V2_* bits> (default all): 0 is the node before model v2.
-    let v2: u16 = std::env::var("WPM_V2").ok().and_then(|s| s.parse().ok()).unwrap_or(V2_ALL);
-    let cfg = Config { v2, ..TODAY };
-    for seed in 0..n {
-        let (f, _, _) = run(seed, cfg);
-        let mut pairs: Vec<String> = f.iter().map(|x| format!("{}|{}", x.class, x.tag)).collect();
-        pairs.sort();
-        pairs.dedup();
-        println!("SEED\t{seed}\t{}", pairs.join("\t"));
+fn the_write_path_properties_hold_on_the_real_queue() {
+    let mut classes: BTreeMap<&'static str, (usize, String)> = BTreeMap::new();
+    let mut total = Counts::default();
+    for seed in 0..200 {
+        let (found, c) = run(seed);
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+        for f in found {
+            if seen.insert(f.class) {
+                classes.entry(f.class).or_insert((0, f.detail.clone())).0 += 1;
+            }
+        }
+        total.made += c.made;
+        total.published += c.published;
+        total.door += c.door;
+        total.forced += c.forced;
+        for (k, v) in c.named {
+            *total.named.entry(k).or_default() += v;
+        }
     }
-}
-
-/// The per-call report a delegate emits for every client frame it runs.
-fn call_report() -> Vec<u8> {
-    protocol::encode_reply(&Reply::Call {
-        saw: protocol::Saw::Client,
-        effects: 0,
-        ops: 0,
-        awaiting: 0,
-        read_back: 0,
-        stranded: 0,
-        dropped: 0,
-        head_put: 0,
-        head_update: 0,
-        note: String::new(),
-    })
-    .expect("a per-call report encodes")
+    println!("  200 seeds: {} writes made, {} Published, ended named {:?}, {} refused at the door, {} forced", total.made, total.published, total.named, total.door, total.forced);
+    for (class, (n, first)) in &classes {
+        println!("  {class}: {n} of 200 seeds — first: {first}");
+    }
+    assert!(total.made > 5_000 && total.published > 0 && total.forced > 0, "the model made too little to check anything: {total:?}");
+    assert!(!total.named.is_empty(), "no write ever ended named: the races never killed a commit, so 'nothing vanishes untold' was never tested");
+    assert!(classes.is_empty(), "the write path failed its model: {classes:?}");
 }

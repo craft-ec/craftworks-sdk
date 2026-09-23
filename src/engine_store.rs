@@ -420,12 +420,12 @@ impl<T: Transport> EngineStore<T> {
 impl<T: Transport> Store for EngineStore<T> {
     /// A store-level batch that cannot read first: it says so, key by key, as
     /// `Expect::Any` (sdk#235, W8) — counted by the engine and shown.
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::store::Refused> {
         let reads: Vec<(Vec<u8>, protocol::Expect)> = edits.iter().map(|(k, _)| (k.clone(), protocol::Expect::Any)).collect();
         self.apply_commit(&reads, edits)
     }
 
-    fn apply_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
+    fn apply_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::store::Refused> {
         // ONE write, so the engine applies them as one commit — which is what
         // makes a record and its index entries one fact rather than several —
         // with what it READ, checked where it lands (M2).

@@ -327,7 +327,11 @@ fn two_pages_racing_the_first_put_create_one_register() {
     let (mut a, mut b) = (page_io(&node), page_io(&node));
     let mut now = 1_000;
     client(&mut a, &mut node, &mut now, &Request::Identity);
-    client(&mut b, &mut node, &mut now, &Request::Identity);
+    // Page b is its own page LOAD: its own session (and so its own device id
+    // in heads' `through`, COMMIT-LIFE ⁵ -- two pages under one session would
+    // read each other's `through` as their own).
+    b.client(&protocol::encode_session_request(4, 10, &Request::Identity).expect("encodes"));
+    settle(&mut b, &mut node, &mut now);
     // Both write before either has heard anything back: interleave their frames.
     a.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
     b.client(&protocol::encode_session_request(4, 10, &write(1, "b", "1")).expect("encodes"));

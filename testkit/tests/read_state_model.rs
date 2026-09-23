@@ -21,8 +21,8 @@
 //! Checked on every read: it equals the oracle (inv. 2), and it ENDS — an
 //! answer within a bounded number of hops, never a ticketless refusal or a
 //! loop (inv. 8). Checked at rest: y's writes settled, y on the final head,
-//! y's full read is the node's final tree; no ticket left open; nothing left
-//! in the INTERIM overlay.
+//! y's full read is the node's final tree; no ticket left open; the engine's
+//! queue drained; no write told `Busy` (R-b).
 //!
 //! A FAST phase: x writes on EVERY step while y reads on every step, so the
 //! head moves faster than walks finish (the architect's chase).
@@ -128,9 +128,10 @@ enum Mutant {
     /// A woken read NOT resumed: the next walk chases the moving head, and
     /// each hop may find another block missing (the architect's chase).
     NoResume,
-    /// The interim overlay dropped: a write the engine refused `Busy` is in
-    /// no root, and a read no longer shows it (read-your-writes).
-    NoOverlay,
+    /// A read covering this page's own write still APPLYING (in no root yet,
+    /// R-b) no longer waits for it: it misses its own write
+    /// (read-your-writes; the overlay's third case, R-a's live find).
+    NoWaitOnApplying,
     /// LIVE never asked: the page does not diff its bindings on a head move
     /// (a tab that made no write could never see another's).
     DeafLive,
@@ -167,7 +168,7 @@ struct Walks {
 impl Walks {
     fn open(node: &PageNode, mutant: Option<Mutant>) -> Walks {
         let (mut store, conn, _clock) = testkit::page_store(node);
-        store.interim_overlay = mutant != Some(Mutant::NoOverlay);
+        store.wait_on_applying = mutant != Some(Mutant::NoWaitOnApplying);
         let mut w = Walks { store, conn, ended: BTreeMap::new(), mutant, stale: None, live: Default::default(), rendered: None, live_failed: Vec::new() };
         w.drain();
         w.live.bind(live_key());
@@ -297,7 +298,7 @@ impl Walks {
     fn tick(&mut self, now_ms: u64) {
         let r = self.conn.tick_at(now_ms);
         self.feed(r);
-        self.store.writes.tick();
+        let _ = self.store.ask_after_applying();
         self.store.tick(now_ms);
         self.store.sync();
         self.drain();
@@ -507,9 +508,18 @@ fn run(seed: u64, mutant: Option<Mutant>, steps: usize, fast: usize) -> Vec<Find
     if busy > 0 {
         found.push(Finding { class: "A WRITE WAS TOLD BUSY ON THE PAGE PATH", detail: format!("seed {seed}: {busy} Busy verdict(s)") });
     }
-    // INTERIM (R-b): nothing held or queued at rest, so nothing overlaid.
-    if y.store.writes.copy.any_unaccepted() {
-        found.push(Finding { class: "OVERLAY NOT EMPTY AT REST", detail: format!("seed {seed}") });
+    // THE QUEUE DRAINS (R-b): at rest nothing of y's is left in the engine's
+    // queue -- every write ended, Published or in a named fate.
+    // K9 and footnote 4, counted where they happen: a rebuilt commit whose
+    // root differed from its warm root, a re-derivation on own publish, an
+    // impossible stage move -- each must be 0.
+    let (differs, rederived, impossible) = y.conn.with_server(|s| s.page.queue_counts());
+    if differs + rederived + impossible > 0 {
+        found.push(Finding { class: "THE QUEUE'S OWN COUNTS ARE NOT ZERO", detail: format!("seed {seed}: K9 differs {differs}, own-publish re-derived {rederived}, impossible {impossible}") });
+    }
+    let (queued, _) = y.store.queue_load();
+    if queued != 0 {
+        found.push(Finding { class: "THE QUEUE DID NOT DRAIN AT REST", detail: format!("seed {seed}: {queued} write(s) still queued") });
     }
     found
 }
@@ -601,7 +611,7 @@ fn slice_r_reader_is_green() {
 /// the model must see every one — or it is blind, not the reader right.
 #[test]
 fn the_model_sees_each_planted_defect() {
-    for m in [Mutant::HeadCopy, Mutant::NoResume, Mutant::NoOverlay, Mutant::DeafLive] {
+    for m in [Mutant::HeadCopy, Mutant::NoResume, Mutant::NoWaitOnApplying, Mutant::DeafLive] {
         let found = sweep(0..40, Some(m), 120, 40);
         println!("{m:?}:");
         print(&found, 40);

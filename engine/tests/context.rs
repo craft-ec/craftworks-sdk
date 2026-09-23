@@ -379,7 +379,9 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
     let per_block = (commit - idle) / commit_blocks;
     // What the cap costs, at the per-block rate this just measured.
     let commit_worst = idle + per_block * p.max_commit_blocks;
-    let write_worst = idle + p.max_parked_write_bytes;
+    // The parked write is fetch state only (R-b: its ops are in the page's
+    // queue): the path it waits on.
+    let write_worst = idle + 64 * 32 + 128;
     let worst = reads + commit_worst.max(write_worst);
 
     println!("  idle:                        {idle:6} B");

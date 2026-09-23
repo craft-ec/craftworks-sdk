@@ -18,7 +18,8 @@
 ///
 /// `code` is from a fixed list — NOT_LOADED, UNAVAILABLE, TOO_LARGE,
 /// NOT_DEFINED, REFUSED, and for a write the store refused before making it
-/// (sdk#180): NO_ROOM, NO_ROOM_BYTES, TOO_LARGE_TO_SEND, NO_SESSION.
+/// (sdk#180): QUEUE_FULL (only once the app's deadline has passed: before it,
+/// a full queue is WAITED on, below), TOO_LARGE_TO_SEND, NO_SESSION, UNREAD.
 /// `message` is for a person to read.
 ///
 /// **Nothing in this file, and nothing in an app, branches on `message`.**
@@ -32,8 +33,8 @@ export class DbError extends Error {
     // Whether a RELOAD is the recovery. Rust decides this, not the caller,
     // and not a list of codes kept in sync by hand over here.
     this.transient = transient;
-    // Whether the SAME write, made again after the node confirms earlier
-    // ones, may succeed — a NO_ROOM. Rust decides this too (sdk#180).
+    // Whether the SAME write, made again once the queue drains, may succeed
+    // — a QUEUE_FULL. Rust decides this too (sdk#180).
     this.retryable = retryable;
     if (cap !== undefined) this.cap = cap;
   }
@@ -102,7 +103,13 @@ export const sameRows = (a, b) => {
   return true;
 };
 
-export function engineDb(handle) {
+/**
+ * `writeDeadlineMs`: how long a write WAITS for room in the page's queue
+ * before it fails, named QUEUE_FULL (R-b; COMMIT-LIFE K1: a full queue is
+ * BACKPRESSURE, TCP-style, never a refusal the moment it is met). The app's
+ * own deadline; 60 s unless it says.
+ */
+export function engineDb(handle, { writeDeadlineMs = 60_000, now = () => Date.now() } = {}) {
   // Either the object `openSession` returns, or a bare session. The wrapper
   // is what knows when a message arrived, so when there is one this registers
   // with it and a parked read is woken by the answer rather than by a clock.
@@ -128,8 +135,18 @@ export function engineDb(handle) {
     }
   };
 
+  // Writes WAITING for room in the page's queue (backpressure): woken on the
+  // same task as a parked read -- every message the session handled may have
+  // published a commit and drained the queue -- and then made again.
+  let roomWaiters = [];
+  const wakeRoom = () => {
+    const w = roomWaiters;
+    roomWaiters = [];
+    for (const r of w) r();
+  };
+
   // Woken by the page, on the task that handled the message.
-  handle.onReadsWake?.(() => { drain(); reloadStale(); reloadOwnStates(); });
+  handle.onReadsWake?.(() => { drain(); wakeRoom(); reloadStale(); reloadOwnStates(); });
 
   // Bindings this app is showing, by domain, so a head move can re-run them.
   const bound = new Map();   // domain -> Set<callback>
@@ -221,11 +238,30 @@ export function engineDb(handle) {
   const MAX_HOPS = 8;
 
   const once = async call => {
+    let waitedSince;
     for (let hop = 0; ; hop += 1) {
       let ticket;
       try {
         return call();
       } catch (e) {
+        // BACKPRESSURE (R-b; COMMIT-LIFE K1): the page's queue holds its
+        // byte bound. Nothing was written; the same write made again once a
+        // commit publishes is taken. Wait for that -- on the session's own
+        // wake: every message it handled, and its tick, a second apart, so
+        // the deadline is kept to a tick -- up to the app's deadline, and
+        // only then fail,
+        // named, with the bytes and the limit. Not a hop: waiting for room
+        // is not a read chain.
+        if (e && e.code === "QUEUE_FULL") {
+          waitedSince ??= now();
+          const waited = now() - waitedSince;
+          if (waited >= writeDeadlineMs) {
+            throw new DbError({ ...e, message: `${e.message} (waited ${waited} ms: the app's deadline)` });
+          }
+          await new Promise(resolve => roomWaiters.push(resolve));
+          hop -= 1;
+          continue;
+        }
         if (!e || e.code !== "NOT_LOADED") rethrow(e);
         // No ticket: either the session could not queue the load, or this
         // span was loaded already and the read still cannot be answered.

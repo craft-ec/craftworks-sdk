@@ -194,12 +194,11 @@ pub enum DbError {
     NotDefined(String),
     /// Anything else the caller could have got right, in words.
     Refused(String),
-    /// The STORE refused this write before applying it anywhere — no room
-    /// for another unconfirmed write, no session, too large to send
-    /// (craftworks-sdk#180). NOTHING WAS WRITTEN: not in the copy, not on the
-    /// wire. Each reason has its own code, because each asks something
+    /// The STORE refused this write before applying it anywhere — the queue
+    /// full, no session, too large to send (craftworks-sdk#180; R-b).
+    /// NOTHING WAS WRITTEN. Each reason has its own code, because each asks something
     /// different of the caller — wait, reload, split.
-    WriteRefused(crate::copy::Refused),
+    WriteRefused(crate::store::Refused),
 }
 
 impl DbError {
@@ -221,36 +220,26 @@ impl DbError {
             DbError::NotDefined(_) => "NOT_DEFINED",
             DbError::Refused(_) => "REFUSED",
             DbError::WriteRefused(r) => match r {
-                crate::copy::Refused::TooManyPending { .. } => "NO_ROOM",
-                crate::copy::Refused::TooManyPendingBytes { .. } => "NO_ROOM_BYTES",
-                crate::copy::Refused::TooLargeToSend { .. } => "TOO_LARGE_TO_SEND",
-                crate::copy::Refused::TooLarge { .. } => "TOO_LARGE",
-                crate::copy::Refused::NoSession => "NO_SESSION",
+                crate::store::Refused::QueueFull { .. } => "QUEUE_FULL",
+                crate::store::Refused::TooLargeToSend { .. } => "TOO_LARGE_TO_SEND",
+                crate::store::Refused::TooLarge { .. } => "TOO_LARGE",
+                crate::store::Refused::NoSession => "NO_SESSION",
+                crate::store::Refused::Unread => "UNREAD",
             },
         }
     }
 
-    /// Whether the SAME write, made again once the node has confirmed earlier
-    /// ones, may succeed: the copy's room frees as confirmations arrive. Not
-    /// a reload — the recovery is to wait for a confirmation and retry.
+    /// Whether the SAME write, made again once the queue has drained, may
+    /// succeed (`QUEUE_FULL`, R-b). Not a reload -- the recovery is to wait
+    /// for writes to publish and retry.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            DbError::WriteRefused(
-                crate::copy::Refused::TooManyPending { .. }
-                    | crate::copy::Refused::TooManyPendingBytes { .. }
-            )
-        )
+        matches!(self, DbError::WriteRefused(crate::store::Refused::QueueFull { .. }))
     }
 
-    /// The bound a `NO_ROOM` refusal met: how many writes, or bytes, the
-    /// copy holds unconfirmed.
+    /// The bound a `QUEUE_FULL` refusal met: the bytes the page's queue holds.
     pub fn cap(&self) -> Option<usize> {
         match self {
-            DbError::WriteRefused(
-                crate::copy::Refused::TooManyPending { cap }
-                | crate::copy::Refused::TooManyPendingBytes { cap },
-            ) => Some(*cap),
+            DbError::WriteRefused(crate::store::Refused::QueueFull { limit, .. }) => Some(*limit),
             _ => None,
         }
     }
@@ -1200,7 +1189,7 @@ mod tests {
     fn a_key_past_the_trees_limit_is_refused_before_the_store_is_touched() {
         struct Panics;
         impl Store for Panics {
-            fn apply_batch(&mut self, _: &[(Vec<u8>, Edit)]) -> std::result::Result<(), crate::copy::Refused> {
+            fn apply_batch(&mut self, _: &[(Vec<u8>, Edit)]) -> std::result::Result<(), crate::store::Refused> {
                 panic!("the store must not be reached")
             }
         }

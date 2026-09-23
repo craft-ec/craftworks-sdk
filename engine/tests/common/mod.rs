@@ -156,7 +156,8 @@ impl Store {
                     }
                     self.put(*id, bytes);
                 }
-                Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } => {
+                // A queued write's warm-apply block (R-b): the page keeps it.
+                Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } | Effect::Keep { id, bytes } => {
                     self.put(*id, bytes);
                 }
                 _ => {}

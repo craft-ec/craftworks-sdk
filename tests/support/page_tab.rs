@@ -37,6 +37,9 @@ impl Host for Watched {
     fn with_server<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
         Host::with_server(&mut self.conn, f)
     }
+    fn peek<R>(&self, f: impl FnOnce(&Server) -> R) -> R {
+        Host::peek(&self.conn, f)
+    }
     fn client(&mut self, frame: &[u8]) {
         if let protocol::Incoming::Ok(env) = protocol::decode_request(frame) {
             if let protocol::Request::Write { write_id, .. } | protocol::Request::Commit { write_id, .. } = env.body {
@@ -65,8 +68,13 @@ impl<E: Env> Tab<E> {
     /// A new tab on `node`, started (its `Identity` sent and answered), as
     /// `testkit::page_store` starts one.
     pub fn open(node: &PageNode, env: E, device: [u8; 4]) -> Tab<E> {
+        Tab::open_with(node, engine::Params::default(), env, device)
+    }
+
+    /// The same, its page's engine on these parameters (a small queue bound).
+    pub fn open_with(node: &PageNode, params: engine::Params, env: E, device: [u8; 4]) -> Tab<E> {
         let clock = Clock::new(0);
-        let conn = node.connect();
+        let conn = node.connect_with(params);
         let log = Rc::new(RefCell::new(Log::default()));
         let mut store = PageStore::new(clock.as_fn(), clock.as_fn());
         store.writes.client.send(&protocol::Request::Identity);
@@ -111,12 +119,12 @@ impl<E: Env> Tab<E> {
         self.db.store_mut().sync();
     }
 
-    /// `n` seconds pass: the store's tick (the outbox's re-sends and
-    /// timeouts), then a pump.
+    /// `n` seconds pass: the store's tick (tickets' lifetimes, the ask after
+    /// an applying write), then a pump. Nothing times a write out (R-b).
     pub fn seconds(&mut self, n: u64) {
         for _ in 0..n {
             self.clock.advance(1000);
-            let _ = self.db.store_mut().writes.tick();
+            let _ = self.db.store_mut().ask_after_applying();
             let now = self.clock.now_ms();
             self.db.store_mut().tick(now);
             self.pump();

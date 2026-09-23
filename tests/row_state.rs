@@ -7,7 +7,7 @@
 //! exists to prevent.
 
 use craftworks_sdk::store::{RowState, Store as _};
-use craftworks_sdk::{CachedStore, Db, PageStore, SystemEnv, TreeStore};
+use craftworks_sdk::{Db, PageStore, SystemEnv, TreeStore};
 use testkit::{PageConn, PageNode};
 
 fn schema() -> craftworks_sdk::Schema {
@@ -60,33 +60,28 @@ fn a_record_reports_its_own_write_both_before_and_after_it_lands() {
 
     let id = craftworks_sdk::id::from_hex(&r.id).expect("an id");
 
-    // QUEUED is the engine saying it is busy with another write. A distinct
-    // fact from pending — "yours has not gone yet" rather than "yours has
-    // gone and nothing has answered" — and the row says which.
-    d.store_mut().writes.copy.queued(write_id);
+    // QUEUED: a write behind the commit in flight (R-b: the engine's queue).
+    // A distinct fact from pending -- "yours has not gone yet" rather than
+    // "yours has gone and nothing has answered" -- and the row says which.
+    let second = d.put("note", &fields("behind it")).expect("put");
+    assert_eq!(second.state, RowState::Queued, "a write behind the commit in flight is reported as if it had gone");
     assert_eq!(
         d.get("note", id).expect("get").expect("there").state,
-        RowState::Queued,
-        "a write the engine has not taken yet is reported as if it had"
-    );
-    d.store_mut().writes.copy.submitted(write_id);
-    assert_eq!(
-        d.get("note", id).expect("get").expect("there").state,
-        RowState::Pending
+        RowState::Pending,
+        "the write in flight stopped saying so"
     );
 
     // The node answers: the commit lands and the write is published.
     conn.stop_holding();
     while conn.held() > 0 {
-        let replies = conn.release_one();
-        for r in &replies {
-            d.store_mut().writes.on_inbound(r);
-        }
+        let _ = conn.release_one();
         d.store_mut().sync();
     }
-    assert!(!d.store().writes.is_pending_write(write_id), "the write never published");
+    d.store_mut().sync();
+    assert!(!d.store().is_pending_write(write_id), "the write never published");
     let after = d.get("note", id).expect("get").expect("there");
-    assert_eq!(after.state, RowState::Clean);
+    // Saved: CLEAN, or BACKED_UP once no parity is owed (sdk#294).
+    assert!(matches!(after.state, RowState::Clean | RowState::BackedUp), "{:?}", after.state);
     assert!(
         after.state.is_settled(),
         "a published row still says it is in flight"
@@ -95,72 +90,39 @@ fn a_record_reports_its_own_write_both_before_and_after_it_lands() {
 
 /// A write that was ROLLED BACK does not go back to reporting `Clean`.
 ///
-/// The moment a write is rolled back it stops being pending, so a row asking
-/// afterwards would be told "saved" about a write that never landed. That is
-/// the worst answer available.
+/// The moment a write ENDS unpublished (R-b: a named fate the page pulled --
+/// `Failed`, `Lost`, `Conflict`...) it stops being in the queue, so a row
+/// asking afterwards would be told "saved" about a write that never landed.
+/// That is the worst answer available: the key stays ROLLED_BACK until it is
+/// written again.
 #[test]
-fn a_rolled_back_write_is_not_reported_as_saved() {
-    // A clock the test drives, so the timeout is reached by DECIDING it has
-    // been rather than by waiting.
-    let now = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    let c = now.clone();
-    let mut s = CachedStore::new(Box::new(move || c.get()));
-    s.copy.pending_timeout_ms = 10;
-
-    let key = b"d\0note\0x".to_vec();
-    craftworks_sdk::store::Store::put(&mut s, &key, b"v").expect("the store took the write");
-    assert_eq!(s.row_state(&key), RowState::Pending);
-
-    // Nothing ever answers it, and the client gives up.
-    now.set(1_000);
-    let told = s.tick();
-    assert!(
-        !told.rolled_back.is_empty(),
-        "the write was never rolled back"
-    );
-    assert_eq!(
-        told.rolled_back_keys,
-        vec![key.clone()],
-        "the rollback did not say which ROW it was about, so no row could show it"
-    );
-
-    assert_eq!(
-        s.row_state(&key),
-        RowState::RolledBack,
-        "a write that was rolled back went back to reporting 'saved'"
-    );
-    assert!(!s.row_state(&key).is_settled());
-
-    // Writing again replaces the failure with something in flight, which is
-    // a truer answer than the old failure.
-    craftworks_sdk::store::Store::put(&mut s, &key, b"v2").expect("the store took the write");
-    assert_eq!(s.row_state(&key), RowState::Pending);
+fn a_write_that_ended_unpublished_is_not_reported_as_saved() {
+    for fate in [page::fates::Fate::Failed, page::fates::Fate::Lost, page::fates::Fate::Conflict { key: b"d\0note\0x".to_vec(), current: None, after: None }] {
+        let mut w = craftworks_sdk::Writes::new(Box::new(|| 0));
+        let key = b"d\0note\0x".to_vec();
+        let edit = [(key.clone(), craftworks_sdk::Edit::Put(b"v".to_vec()))];
+        let id = w.make(&[(key.clone(), protocol::Expect::Absent)], &edit).expect("made");
+        assert!(!w.rolled_back(&key), "{fate:?}: a write in flight already says rolled back");
+        w.on_fate(id, fate.clone());
+        assert!(w.rolled_back(&key), "{fate:?}: a write that ended unpublished went back to reporting 'saved'");
+        assert!(w.take_state_changed().contains(&key), "{fate:?}: the row was not told its write ended");
+        // Writing again replaces the failure with something in flight.
+        w.make(&[(key.clone(), protocol::Expect::Absent)], &edit).expect("made again");
+        assert!(!w.rolled_back(&key), "{fate:?}: a key written again still says rolled back");
+    }
 }
 
-/// THE CONTROL for the rollback: a write that IS answered never reports
-/// `RolledBack`.
-///
-/// Without it, a `row_state` that reported every key rolled back would pass
+/// THE CONTROL: a write that PUBLISHED is never reported rolled back.
+/// Without it, a store that marked every ended write rolled back would pass
 /// the test above.
 #[test]
-fn control_an_answered_write_is_never_reported_rolled_back() {
-    let now = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    let c = now.clone();
-    let mut s = CachedStore::new(Box::new(move || c.get()));
-    s.copy.pending_timeout_ms = 10;
-
+fn control_a_published_write_is_never_reported_rolled_back() {
+    let mut w = craftworks_sdk::Writes::new(Box::new(|| 0));
     let key = b"d\0note\0x".to_vec();
-    let write_id = s.next_write_id();
-    craftworks_sdk::store::Store::put(&mut s, &key, b"v").expect("the store took the write");
-    s.copy.published(write_id);
-
-    now.set(1_000);
-    let told = s.tick();
-    assert!(
-        told.rolled_back.is_empty(),
-        "a published write was rolled back"
-    );
-    assert_eq!(s.row_state(&key), RowState::Clean);
+    let id = w.make(&[(key.clone(), protocol::Expect::Absent)], &[(key.clone(), craftworks_sdk::Edit::Put(b"v".to_vec()))]).expect("made");
+    w.on_fate(id, page::fates::Fate::Published { seq: 1, backed_up: false });
+    assert!(!w.rolled_back(&key), "a published write was reported rolled back");
+    assert!(w.take_ended().is_empty(), "a published write was told as ended unpublished");
 }
 
 /// The in-memory store answers `Clean`, always, and that is the TRUTH.
@@ -181,12 +143,13 @@ fn the_in_memory_store_answers_clean_because_it_has_nothing_in_flight() {
 /// The codes are a fixed list, distinct, and every variant has one.
 #[test]
 fn every_row_state_has_a_distinct_stable_code() {
-    const KNOWN: &[&str] = &["CLEAN", "QUEUED", "PENDING", "ROLLED_BACK"];
+    const KNOWN: &[&str] = &["CLEAN", "QUEUED", "PENDING", "ROLLED_BACK", "BACKED_UP"];
     let all = [
         RowState::Clean,
         RowState::Queued,
         RowState::Pending,
         RowState::RolledBack,
+        RowState::BackedUp,
     ];
     let mut codes: Vec<&str> = all.iter().map(|s| s.code()).collect();
     for c in &codes {
@@ -197,11 +160,11 @@ fn every_row_state_has_a_distinct_stable_code() {
     codes.dedup();
     assert_eq!(codes.len(), n, "two states share a code");
 
-    // Only CLEAN may claim to be saved.
+    // Only CLEAN and BACKED_UP may claim to be saved.
     for s in all {
         assert_eq!(
             s.is_settled(),
-            s == RowState::Clean,
+            matches!(s, RowState::Clean | RowState::BackedUp),
             "{s:?} settled wrongly"
         );
     }

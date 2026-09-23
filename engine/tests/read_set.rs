@@ -211,7 +211,9 @@ fn an_inline_value_spelling_a_reference_is_not_that_reference() {
 /// and on resume — the reads carried in the parked write — it conflicts.
 #[test]
 fn a_cold_read_that_is_wrong_parks_then_conflicts_on_resume() {
-    for mode in [Mode::Live, Mode::Rehydrate] {
+    // LIVE ONLY (R-b): a parked write waits in the page's queue, which is
+    // page memory and never in a context.
+    for mode in [Mode::Live] {
         let mut h = fresh(mode);
         let ops: Vec<(Vec<u8>, Vec<u8>)> = (0..400).map(|i| (format!("k/{i:04}").into_bytes(), vec![b'a'; 200])).collect();
         let op_refs: Vec<(&[u8], Option<&[u8]>)> = ops.iter().map(|(k, v)| (k.as_slice(), Some(v.as_slice()))).collect();
@@ -246,10 +248,11 @@ fn a_cold_read_that_is_wrong_parks_then_conflicts_on_resume() {
 
 /// A read key whose path is not held PARKS the write (never a Conflict:
 /// nothing proved it differs), and it is checked on the root it resumes on.
-/// Through a context round trip too: the reads ride in the parked write.
+/// LIVE ONLY (R-b): the write and its reads wait in the page's queue, which
+/// is page memory and never in a context.
 #[test]
 fn a_read_whose_path_is_not_held_parks_and_is_checked_when_it_resumes() {
-    for mode in [Mode::Live, Mode::Rehydrate] {
+    for mode in [Mode::Live] {
         let mut h = fresh(mode);
         let ops: Vec<(Vec<u8>, Vec<u8>)> = (0..400).map(|i| (format!("k/{i:04}").into_bytes(), vec![b'a'; 200])).collect();
         let op_refs: Vec<(&[u8], Option<&[u8]>)> = ops.iter().map(|(k, v)| (k.as_slice(), Some(v.as_slice()))).collect();

@@ -112,10 +112,6 @@ fn over_the_commit_block_budget_is_too_large_with_its_count_and_the_boundary_is_
         answer(
             Params {
                 max_commit_blocks: got,
-                // A commit cap above the default needs room in the context
-                // (sdk#162: the caps sum under the bound); the parked write
-                // gives it.
-                max_parked_write_bytes: 64 * 1024,
                 ..Params::default()
             },
             ops.clone()
@@ -127,10 +123,6 @@ fn over_the_commit_block_budget_is_too_large_with_its_count_and_the_boundary_is_
         answer(
             Params {
                 max_commit_blocks: got - 1,
-                // A commit cap above the default needs room in the context
-                // (sdk#162: the caps sum under the bound); the parked write
-                // gives it.
-                max_parked_write_bytes: 64 * 1024,
                 ..Params::default()
             },
             ops.clone()
@@ -249,17 +241,18 @@ fn a_too_large_refusal_leaves_the_whole_context_byte_identical() {
     }
 }
 
-/// `Busy` is still what a commit in flight answers -- the transient case the
-/// outbox SHOULD re-send.
+/// THE CONTROL: a write under every bound, during a commit, is TAKEN into
+/// the page's queue (R-b) -- `Accepted`, nothing put -- never `TooLarge`, so
+/// the refusals above are the bounds and not the commit in flight.
 #[test]
-fn control_a_write_during_a_commit_is_still_busy() {
+fn control_a_write_during_a_commit_is_queued() {
     let mut e = common::new_store_params(Params::default());
     let _ = stepped!(e, write(1, vec![(b"a".to_vec(), Op::Put(vec![1u8; 100]))]));
-    assert_eq!(
-        states(&stepped!(
-            e,
-            write(2, vec![(b"b".to_vec(), Op::Put(vec![2u8; 100]))])
-        )),
-        vec![State::Busy]
+    let out = stepped!(e, write(2, vec![(b"b".to_vec(), Op::Put(vec![2u8; 100]))]));
+    assert_eq!(states(&out), vec![State::Accepted]);
+    assert!(
+        !out.iter().any(|f| matches!(f, Effect::PutBlock { .. } | Effect::PutPack { .. } | Effect::UpdateHead { .. })),
+        "a queued write put something on the network before its turn"
     );
+    assert_eq!(e.queued_writes(), 2, "the write was not queued behind the commit");
 }

@@ -75,3 +75,27 @@ fn a_sign_carries_its_prev_and_the_genesis_carries_none() {
     let h = page::HeadRead::from_value(4, &[[5u8; 32].as_slice(), &l].concat()).expect("a head");
     assert_eq!(h.prev(), Some((3, [8; 32])));
 }
+
+/// THE WITNESS (COMMIT-LIFE ⁵): a head's ledger says how far a page's writes
+/// are in it. This page's entry → `Through`; absent from a list that was
+/// never at its bound → `NotThere`; absent from a FULL list (an entry may
+/// have been evicted) → `Unknown`, never `NotThere` (core dev on docs#27:
+/// absent is not below).
+#[test]
+fn a_heads_witness_of_a_page_is_through_not_there_or_unknown() {
+    use signer_proto::head::{value, Ledger, Through, THROUGH_MAX};
+    let me = [7u8; 16];
+    let other = |i: usize| {
+        let mut d = [0u8; 16];
+        d[..8].copy_from_slice(&(i as u64 + 1000).to_le_bytes());
+        Through { device: d, seq: 1, last: i as u64 + 1 }
+    };
+    let head = |through: Vec<Through>| page::HeadRead::from_value(5, &value(&[1; 32], &Ledger { through, ..Ledger::default() })).expect("a head");
+    let mine = Through { device: me, seq: 42, last: 5 };
+    assert_eq!(head(vec![other(0), mine]).witness_of(&me), engine::Witness::Through(42));
+    assert_eq!(head(vec![other(0), other(1)]).witness_of(&me), engine::Witness::NotThere, "absent from a list never at its bound");
+    let full: Vec<Through> = (0..THROUGH_MAX).map(other).collect();
+    let h = head(full);
+    assert_eq!(h.through().len(), THROUGH_MAX, "the fixture's list is not at its bound");
+    assert_eq!(h.witness_of(&me), engine::Witness::Unknown, "absent from a FULL list was read as not there");
+}

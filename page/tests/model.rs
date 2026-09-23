@@ -257,10 +257,10 @@ impl Node {
 
     /// The REAL signer's answer, exactly as it encodes it and the page's
     /// `wire::signer::read_answer` decodes it.
-    fn sign(&mut self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> (u32, signer_proto::Answer) {
+    fn sign(&mut self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid, ledger: Vec<u8>) -> (u32, signer_proto::Answer) {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
-            next: signer::Next { seq, root, ledger: page::sign_ledger(prev_seq, prev_root, root) },
+            next: signer::Next { seq, root, ledger },
         };
         // Through the BYTES both ways: the request under the page's id, the answer under the id the signer echoes.
         let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
@@ -497,13 +497,13 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         })
                     }
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root } => {
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
                     if s_sign.chance(faults.sign_lost) {
                         None
                     } else {
                         node.record_fails = s_rec.chance(faults.record_not_saved);
                         node.dev = dev_of(f.page);
-                        let (id, a) = node.sign(id, prev_seq, prev_root, seq, root);
+                        let (id, a) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         node.record_fails = false;
                         if let Some(rec) = node.secrets[node.dev].get(signer::RECORD) {
                             let rec: signer::Record = bincode::deserialize(rec).expect("the signer's record");
@@ -842,8 +842,8 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                     p.answer(Answer::PutOk(id), Ms(0));
                 }
                 Op::ReadHead => p.answer(Answer::Head(node.head_read()), Ms(0)),
-                Op::Sign { id, prev_seq, prev_root, seq, root } => {
-                    let (id, a) = node.sign(id, prev_seq, prev_root, seq, root);
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                    let (id, a) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                     p.answer(Answer::Signer { id, answer: a }, Ms(0));
                 }
                 Op::Update { state } => {
@@ -908,8 +908,8 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                         Some(b) => Answer::Got { id, bytes: b.clone() },
                         None => Answer::GetMissed(id),
                     }),
-                    Op::Sign { id, prev_seq, prev_root, seq, root } => {
-                        let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root);
+                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                        let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         Some(Answer::Signer { id, answer })
                     }
                     Op::Update { state } => {
@@ -946,8 +946,8 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                     node.put(id, &bytes);
                     Some(Answer::PutOk(id))
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root } => {
-                        let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root);
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                        let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         Some(Answer::Signer { id, answer })
                     }
                 _ => None,

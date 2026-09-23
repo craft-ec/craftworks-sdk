@@ -419,7 +419,7 @@ impl Store for TreeStore {
     /// One `apply`, so a record and everything written with it become one new
     /// root. Writing them one at a time would mint a root for a state the app
     /// never had.
-    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::copy::Refused> {
+    fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), crate::store::Refused> {
         if edits.is_empty() {
             return Ok(());
         }

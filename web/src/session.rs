@@ -800,16 +800,18 @@ impl Session {
     /// arriving through a statistics panel instead of a read.
     ///
     /// The numbers that ARE this client's own are reported beside them.
-    /// Writes made here and not yet PUBLISHED, held ones included
-    /// (craftworks-sdk#163): what the page's unsaved-changes guard and its
-    /// "saving N…" count. Not `Accepted` — an accepted write can still be
-    /// lost with the tab.
+    /// Writes made here and not yet PUBLISHED (craftworks-sdk#163): this
+    /// session's writes in the engine's queue, pulled (R-b) -- what the
+    /// page's unsaved-changes guard and its "saving N…" count. A queued write
+    /// is still lost with the tab.
     pub fn unsaved_writes(&self) -> usize {
-        self.db.store().writes.unsaved_writes()
+        self.db.store().unsaved_writes()
     }
 
     pub fn stats(&mut self) -> Result<String, JsValue> {
-        let (n_pending, pending_bytes) = self.db.store().writes.copy.pending();
+        // The page's write queue (R-b): every session's writes not yet
+        // committed, and their bytes -- what `QUEUE_FULL` is measured on.
+        let (n_pending, pending_bytes) = self.db.store().queue_load();
         let held = self.page().map(|p| p.server.page.blocks().len());
         as_json::<serde_json::Value>(Ok(serde_json::json!({
             // Properties of the TREE, which lives on the node.
@@ -986,27 +988,38 @@ impl Session {
         self.db.store_mut().writes.send_tick(now);
         // And the continuation of a write the engine parked: it runs when
         // its client asks after it, and nothing else asks (sdk#174).
-        self.db.store_mut().writes.ask_unheard(now);
-        // THROUGH THE STORE'S OWN TICK, not straight to the copy.
-        //
-        // This called `copy.time_out(now)` directly, which does the rolling
-        // back and nothing else — so everything else `CachedStore::tick` does
-        // never ran on a page. What it does besides rolling back is drain the
-        // OUTBOX: the queue of writes the engine refused with `Busy` while a
-        // commit was in flight, which nothing else re-sends (sdk#106).
-        //
-        // That backstop exists because notifications are lossy (F39), and it
-        // was dead here the day it was written. Reaching past a type's own
-        // entry point to one of its fields is how: the copy is a field, and
-        // calling it directly skipped every decision the store makes around
-        // it.
-        let told = self.db.store_mut().writes.tick();
-        // A write told `Lost` with no tries left fell (sdk#265): said by name,
-        // never a row that just vanished.
-        let lost_gave_up = self.db.store_mut().writes.take_lost_gave_up();
-        for id in &lost_gave_up {
-            self.unusable.push(format!("write {id} was told Lost with its {} tries spent and was not saved", craftworks_sdk::cached_store::WRITE_TRIES));
-        }
+        self.db.store_mut().ask_after_applying();
+        // NOTHING HERE TIMES A WRITE OUT (R-b, sdk#291). The engine owns the
+        // queue, and a write waiting its turn behind the engine's own commits
+        // is not "unanswered": the outbox's 60 s timeout rolled such writes
+        // back -- 34 of 3,000 paced puts gone while "saving" read 0. A write's
+        // only exits are the named fates the engine gives it, pulled here.
+        self.db.store_mut().sync();
+        let ended = self.db.store_mut().writes.take_ended();
+        let mut lost_gave_up = Vec::new();
+        let mut forced_lost = Vec::new();
+        let ended: Vec<serde_json::Value> = ended
+            .into_iter()
+            .map(|(id, how)| {
+                use craftworks_sdk::writes::Ended as E;
+                let (fate, line, extra) = match how {
+                    E::Lost => {
+                        lost_gave_up.push(id);
+                        ("LOST", format!("write {id} was told Lost with its tries spent and was not saved"), serde_json::json!({}))
+                    }
+                    E::ForcedLost => {
+                        forced_lost.push(id);
+                        ("LOST", format!("write {id} was forced past its reads and was lost; it was not sent again, because a forced write cannot be re-checked"), serde_json::json!({}))
+                    }
+                    E::Failed => ("FAILED", format!("write {id} could not be saved"), serde_json::json!({})),
+                    E::Unknown => ("UNKNOWN", format!("write {id} may or may not have been saved (its confirmation was lost); check it"), serde_json::json!({})),
+                    E::TooLarge { limit, got, .. } => ("TOO_LARGE", format!("write {id} is over the engine's limit ({got} against {limit}); split it into smaller writes"), serde_json::json!({ "limit": limit, "got": got })),
+                    E::QueueFull { bytes, limit } => ("QUEUE_FULL", format!("write {id} was not taken: {bytes} of {limit} bytes of writes were already waiting to be saved; wait for them, then try again"), serde_json::json!({ "bytes": bytes, "limit": limit })),
+                };
+                self.unusable.push(line.clone());
+                serde_json::json!({ "writeId": id, "fate": fate, "line": line, "detail": extra })
+            })
+            .collect();
         // sdk#235: writes refused at the door — OUR bug, never the person's —
         // each with every write that fell with it, NAMED.
         let unread: Vec<serde_json::Value> = self
@@ -1028,11 +1041,6 @@ impl Session {
                 serde_json::json!({ "writeIds": u.write_ids, "key": key, "line": line })
             })
             .collect();
-        // A forced write told Lost falls, not re-sent (sdk#235): named.
-        let forced_lost = self.db.store_mut().writes.take_forced_lost();
-        for id in &forced_lost {
-            self.unusable.push(format!("write {id} was forced past its reads and was lost; it was not sent again, because a forced write cannot be re-checked"));
-        }
         // How many writes the engine took forced past their reads: the
         // transitional form, as a number a person can see (sdk#281 removes
         // `Any` at zero). Only the SDK's store-level batches build one.
@@ -1116,7 +1124,8 @@ impl Session {
             })
             .collect();
         serde_json::json!({
-            "rolledBack": told.rolled_back.len(),
+            "rolledBack": ended.len() + unread.len() + conflicts.len(),
+            "ended": ended,
             "lostGaveUp": lost_gave_up,
             "unread": unread,
             "forcedLost": forced_lost,
@@ -1205,8 +1214,9 @@ fn db_err(e: &DbError) -> JsValue {
     let _ = js_sys::Reflect::set(&o, &"code".into(), &e.code().into());
     let _ = js_sys::Reflect::set(&o, &"message".into(), &e.to_string().into());
     let _ = js_sys::Reflect::set(&o, &"transient".into(), &e.is_transient().into());
-    // Whether waiting for a confirmation and making the SAME write again may
-    // succeed (NO_ROOM), with the bound it met (sdk#180).
+    // Whether the SAME write made again once the queue drains may succeed
+    // (QUEUE_FULL: `engine-db.js` waits on it up to the app's deadline), with
+    // the bound it met (sdk#180; R-b).
     let _ = js_sys::Reflect::set(&o, &"retryable".into(), &e.is_retryable().into());
     if let Some(cap) = e.cap() {
         let _ = js_sys::Reflect::set(&o, &"cap".into(), &JsValue::from_f64(cap as f64));
