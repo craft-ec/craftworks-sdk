@@ -2160,3 +2160,134 @@ fn a_block_silent_for_five_minutes_then_answering_is_read() {
     }
     println!("  5 min silent: {sent} GETs re-sent, no Unavailable; node answers -> the read answers");
 }
+
+/// **A HEAD IS SIGNED AS THE SUCCESSOR OF ITS OWN BASE, NEVER OF WHATEVER IS
+/// PUBLISHED NOW** (data loss found by the page model, two devices, seed 10:
+/// "the final tree lost p0/004"; reached there through race put's early head).
+/// The page publishes `a` at seq s. Its next commit (`b`, seq s+1, built on
+/// its own s) puts its blocks, but the node's ACKS are held back, so the engine
+/// settles them by fact and emits the head while the page still holds it for
+/// its acks. Another device of the same identity then wins seq s with `other`,
+/// and the page adopts it. When the acks arrive and the held head is released,
+/// it must not be signed with the WINNER as its prev: the signer would accept
+/// (the prev matches the register), and `other` would be gone from every
+/// later head. The commit is re-derived on the winner instead.
+#[test]
+fn a_commit_built_before_a_foreign_winner_is_never_signed_as_its_successor() {
+    use signer_proto::head::{value, Ledger};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("base", Some("0"))])), 1)));
+    let (base_seq, base_root) = node.head().expect("the base");
+    assert!(published(&states(&rig.client_as(&mut node, &write(2, &[("a", Some("1"))])), 2)));
+    let hr = node.head_read().expect("our head at s");
+    let (s, ours) = node.head().expect("our head at s");
+    let mut signs: Vec<(Cid, Cid)> = Vec::new();
+    let mut withheld: Vec<Answer> = Vec::new();
+    // Every op the page sends is answered, the signer's included, and every
+    // sign request is recorded first; a PUT's ACK is held back while
+    // `withhold` (the block itself does reach the node).
+    let pump = |rig: &mut PageRig, node: &mut Node, withhold: bool, signs: &mut Vec<(Cid, Cid)>, withheld: &mut Vec<Answer>| {
+        for op in std::mem::take(&mut rig.held) {
+            if let Op::Sign { prev_root, root, .. } = &op {
+                signs.push((*prev_root, *root));
+            }
+            let put = matches!(op, Op::Put { .. });
+            if let Some(a) = rig.answer(node, op) {
+                if put && withhold {
+                    withheld.push(a);
+                } else {
+                    rig.server.node(a, Ms(rig.now));
+                }
+            }
+        }
+        rig.now += 1_000;
+        rig.server.tick(Ms(rig.now));
+        rig.run(node)
+    };
+    // A CHECKED write (it read `b` absent): a dead commit's checked write is
+    // re-applied on the winner, where a forced one would end `Lost`.
+    rig.faults.hold = true;
+    let w3 = Request::Commit { write_id: 3, reads: vec![(b"b".to_vec(), protocol::Expect::Absent)], ops: vec![protocol::Op::Put(b"b".to_vec(), b"2".to_vec())] };
+    let mut rs = rig.client_as(&mut node, &w3);
+    for _ in 0..40 {
+        rs.extend(pump(&mut rig, &mut node, true, &mut signs, &mut withheld));
+    }
+    assert!(!withheld.is_empty(), "no put ack was held back: the case this test is about did not happen");
+    assert!(signs.is_empty(), "the head was signed before its acks arrived: {signs:?}");
+    // Another device wins seq s, from the same base, with `other`.
+    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let base_tree = node.tree(&base_root).expect("whole");
+    let mut salt = 0u8;
+    let (winner, st) = loop {
+        let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
+        e.push((b"other".to_vec(), vec![salt]));
+        let r = device_tree(&mut node, &e);
+        let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base_seq, root: base_root }), ..Ledger::default() });
+        if page::beats(&v, hr.value()) {
+            break (r, contract_keys::register::head_state(&node.register_params, &key_of, s, &v).expect("signs"));
+        }
+        salt += 1;
+    };
+    node.update(&st);
+    assert_eq!(node.head(), Some((s, winner)), "the winner did not take the register");
+    rig.server.head_hint();
+    for _ in 0..10 {
+        rs.extend(pump(&mut rig, &mut node, true, &mut signs, &mut withheld));
+    }
+    assert_eq!(rig.server.page.published(), (s, winner), "the page did not adopt the winner");
+    // The held-back acks arrive now: the held head is released.
+    for a in std::mem::take(&mut withheld) {
+        rig.server.node(a, Ms(rig.now));
+    }
+    for _ in 0..40 {
+        rs.extend(pump(&mut rig, &mut node, false, &mut signs, &mut withheld));
+    }
+    let lying: Vec<_> = signs.iter().filter(|(p, _)| *p == winner).filter(|(_, r)| !node.tree(r).is_some_and(|t| t.contains_key(&b"other"[..]))).collect();
+    assert!(lying.is_empty(), "a root WITHOUT the winner's row was signed as the winner's successor: {} time(s)", lying.len());
+    let (_, root) = node.head().expect("a head");
+    let fin = tree_of(&node, &root);
+    assert!(fin.contains_key(&b"other"[..]), "the winner's row is gone from the final tree");
+    assert_eq!(fin.get(&b"b"[..]).map(Vec::as_slice), Some(&b"2"[..]), "the later write never landed (told {:?})", states(&rs, 3));
+    let _ = ours;
+}
+
+/// **A DELTA WHOSE BLOCK IS SILENT WAITS** (rule 7). A delta answers
+/// `FullReloadRequired` on a real NotFound -- the old root is most likely gone
+/// -- but SILENCE is not an answer: a node that has not replied yet says
+/// nothing about whether the block exists. So over five minutes of silence
+/// the delta is answered nothing at all, and when the node answers, it is
+/// answered the real `Delta`. (Turning silence into a miss -- the old tick --
+/// answers it `FullReloadRequired` at once: the mutant this test kills.)
+#[test]
+fn a_delta_whose_block_is_silent_waits_and_is_answered_the_delta() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..600u32).map(|i| (format!("k/{i:06}"), format!("value {i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &ops)), 1)), "the first write did not publish");
+    let (_, from) = node.head().expect("published");
+    assert!(published(&states(&rig.client_as(&mut node, &write(2, &[("k/000321", Some("changed"))])), 2)), "the second write did not publish");
+    // A fresh page asks what changed since the first root; the node is SILENT
+    // about every block.
+    let mut reader = PageRig::new();
+    reader.session = SESSION + 80;
+    reader.client_as(&mut node, &Request::Identity);
+    reader.silent = node.blocks.keys().copied().collect();
+    let id = 8_000u64;
+    reader.send_only(&Request::ChangesSince { req_id: id, from, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, max_entries: 100 });
+    let answer = |rs: &[Reply]| rs.iter().find(|r| matches!(r, Reply::Delta { req_id, .. } | Reply::FullReloadRequired { req_id, .. } | Reply::Unavailable { req_id, .. } if *req_id == id)).cloned();
+    let mut rs = reader.run_for(&mut node, 300_000);
+    assert_eq!(answer(&rs), None, "a delta over a SILENT node was answered: {:?}", answer(&rs));
+    let sent: usize = reader.gets.values().sum();
+    assert!((1..=60).contains(&sent), "{sent} GETs in 5 min of silence");
+    reader.silent.clear();
+    rs.extend(reader.run_for(&mut node, 120_000));
+    match answer(&rs) {
+        Some(Reply::Delta { changes, .. }) if changes.iter().any(|(k, v)| k == b"k/000321" && v.as_deref() == Some(&b"changed"[..])) => {}
+        other => panic!("the node answered again and the delta was answered {other:?} ({sent} GETs while silent)"),
+    }
+    println!("  delta over 5 min of silence: {sent} GETs, no answer; node answers -> the Delta");
+}

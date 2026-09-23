@@ -124,6 +124,20 @@ pub fn private_network_args(ws: u16, net: u16, dir: &Path, extra: &[String]) -> 
     args
 }
 
+/// The node's ENVIRONMENT: its own web-container cache, inside its dir.
+///
+/// A node serves web containers from ONE per-user cache directory unless
+/// `FREENET_WEBAPP_CACHE_DIR` says otherwise (freenet-core 0.2.136,
+/// `config.rs` `default_webapp_cache_dir`), and that cache's locks and
+/// eviction guards are per-PROCESS. A test node without it unpacks into, and
+/// sweeps, the OWNER's node's web cache on this machine: an unpack there made
+/// the SDK's artefacts container 404 on two nodes at once, the failure the
+/// owner hit. So it is set with the three dirs, by the one door that starts
+/// a node.
+pub fn node_env(dir: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![("FREENET_WEBAPP_CACHE_DIR", dir.join("webapp_cache"))]
+}
+
 pub struct Node {
     child: Option<Child>,
     pub port: u16,
@@ -187,11 +201,12 @@ impl Node {
     /// Create the node's tree and start it with `args`; ready or an error.
     /// Callers have refused their ports already.
     fn start(port: u16, dir: &Path, mode: Mode, args: Vec<String>) -> Result<Self> {
-        for sub in ["data", "config", "log"] {
+        for sub in ["data", "config", "log", "webapp_cache"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
         let child = Command::new("freenet")
             .args(&args)
+            .envs(node_env(dir))
             // Captured to the temp tree rather than discarded: the node's
             // FILE log carries no DEBUG lines even at `--log-level debug`, so
             // the only place its own account of a delegate PUT can be is the

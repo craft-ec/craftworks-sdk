@@ -37,6 +37,21 @@
 // bug a person reports rather than a test catches. So every storage touch is
 // best-effort — a failure degrades to fetching, which is exactly what the
 // code did before there was a cache.
+//
+// # A node that does not hold it YET has not answered (sdk#312)
+//
+// A 404, a 503, a 400 or a network error for an artefact the app names is NOT
+// an end: a node serves a web container only once it holds it, and one that
+// is still fetching or re-storing it answers "not found" in the meantime (the
+// owner saw an app fail on a 404 and open on a reload). This fetch is a path
+// to the node like any other, so it keeps the owner's rules 7 and 8: re-asked
+// until answered, on the PAGE'S back-off (`rto.js`, generated from
+// page/src/rto.rs — not a second one written here), with no give-up timer.
+// While it waits it says so (`onWait`). What ends it: bytes that do not hash
+// to the name (a MISMATCH, refused by name), or a person cancelling
+// (`signal`).
+
+import { RTO_SCHEDULE_MS } from "./rto.js";
 
 /** Where cached artefacts live. One name, so every app finds the same ones. */
 export const CACHE_NAME = "craftworks-artefacts";
@@ -84,6 +99,17 @@ export async function artefactBytes(
     fetch: fetchWith = typeof fetch === "function" ? fetch : null,
     caches: cacheStorage = ambientCaches(),
     subtle = typeof crypto === "object" ? crypto.subtle : null,
+    // Told after every round nothing verified: { sha256, waitedMs, nextMs,
+    // failures, says }. `says` is the line a loader shows.
+    onWait = null,
+    // A person's cancel. Nothing else ends a wait.
+    signal = null,
+    sleep = (ms, sig) =>
+      new Promise(ok => {
+        const t = setTimeout(ok, ms);
+        sig?.addEventListener?.("abort", () => { clearTimeout(t); ok(); }, { once: true });
+      }),
+    now = () => Date.now(),
   } = {},
 ) {
   if (!sha256) {
@@ -136,44 +162,74 @@ export async function artefactBytes(
     throw new Error(`artefact ${sha256} has no url to fetch it from`);
   }
   let bytes = null;
-  const failures = [];
-  for (const from of sources) {
-    let res;
-    try {
-      res = await fetchWith(from);
-    } catch (e) {
-      failures.push(`${from}: ${e?.message ?? e}`);
-      continue;
+  const started = now();
+  // The wrong hash each source answered LAST round. A 200 whose bytes do not
+  // hash is not yet a refusal: a node unpacking its web cache serves a TORN
+  // (truncated) file for a moment (measured: 1,242,614 B of 1,259,519), which
+  // hashes wrong and then right. The SAME wrong bytes twice is an answer.
+  const wrongBefore = new Map();
+  for (let round = 0; ; round += 1) {
+    const failures = [];
+    let mismatched = 0;
+    for (const from of sources) {
+      let res;
+      try {
+        res = await fetchWith(from);
+      } catch (e) {
+        failures.push(`${from}: ${e?.message ?? e}`);
+        continue;
+      }
+      if (!res.ok) {
+        // NOT AN ANSWER about the bytes: the node does not hold them yet.
+        failures.push(`${from}: ${res.status}`);
+        continue;
+      }
+      // `fetch` resolves on the HEADERS; the body can still fail, and that is
+      // this source's failure too — the next source is asked.
+      let got;
+      try {
+        got = new Uint8Array(await res.arrayBuffer());
+      } catch (e) {
+        failures.push(`${from}: ${e?.message ?? e}`);
+        continue;
+      }
+      const digest = await digestOf(got, subtle);
+      if (digest !== sha256) {
+        // Never installed, never cached. A wrong artefact is not a smaller one.
+        const again = digest !== null && wrongBefore.get(from) === digest;
+        if (again) mismatched += 1;
+        wrongBefore.set(from, digest);
+        failures.push(`${from}: does not hash to ${sha256} (${got.length} B hashing to ${digest}${again ? ", the same again" : ""})`);
+        continue;
+      }
+      bytes = got;
+      break;
     }
-    if (!res.ok) {
-      failures.push(`${from}: ${res.status}`);
-      continue;
-    }
-    // `fetch` resolves on the HEADERS; the body can still fail, and that is
-    // this source's failure too — the next source is asked.
-    let got;
-    try {
-      got = new Uint8Array(await res.arrayBuffer());
-    } catch (e) {
-      failures.push(`${from}: ${e?.message ?? e}`);
-      continue;
-    }
-    if (!(await matches(got, sha256, subtle))) {
-      // Never installed, never cached. A wrong artefact is not a smaller one.
-      failures.push(`${from}: does not hash to ${sha256}`);
-      continue;
-    }
-    bytes = got;
-    break;
-  }
-  if (!bytes) {
+    if (bytes) break;
     // NAMES WHICH ARTEFACT AND WHAT EACH SOURCE DID. An app that will not
     // open is the symptom a person reports, so the first thing they can send
     // has to identify the block and say what was tried.
-    throw new Error(
-      `could not resolve artefact ${sha256} from any source:\n  ` +
-        failures.join("\n  "),
-    );
+    const what = failures.join("\n  ");
+    if (mismatched === sources.length) {
+      // EVERY source ANSWERED the same wrong bytes twice: the one refusal.
+      throw new Error(`artefact ${sha256} refused: a hash mismatch from every source:\n  ${what}`);
+    }
+    const waitedMs = now() - started;
+    if (signal?.aborted) {
+      throw new Error(`artefact ${sha256}: cancelled after ${Math.round(waitedMs / 1000)} s unanswered:\n  ${what}`);
+    }
+    const nextMs = RTO_SCHEDULE_MS[Math.min(round, RTO_SCHEDULE_MS.length - 1)];
+    onWait?.({
+      sha256,
+      waitedMs,
+      nextMs,
+      failures,
+      says: `loading the app… not available on this node yet (${Math.round(waitedMs / 1000)} s)`,
+    });
+    await sleep(nextMs, signal);
+    if (signal?.aborted) {
+      throw new Error(`artefact ${sha256}: cancelled after ${Math.round((now() - started) / 1000)} s unanswered:\n  ${what}`);
+    }
   }
   // Storing is the OPTIONAL part: a full or refused cache costs the next app
   // a fetch, which is what it would have paid anyway.
@@ -181,10 +237,13 @@ export async function artefactBytes(
   return bytes;
 }
 
-async function matches(bytes, sha256, subtle) {
+async function digestOf(bytes, subtle) {
   if (!subtle) throw new Error("no crypto.subtle: cannot verify an artefact");
-  const got = await best(async () => hex(await subtle.digest("SHA-256", bytes)));
-  return got === sha256;
+  return best(async () => hex(await subtle.digest("SHA-256", bytes)));
+}
+
+async function matches(bytes, sha256, subtle) {
+  return (await digestOf(bytes, subtle)) === sha256;
 }
 
 /**

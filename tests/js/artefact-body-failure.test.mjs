@@ -28,6 +28,13 @@ const ok = bytes => () => new Response(bytes);
 const bodyThrows = message => () => ({ ok: true, status: 200, arrayBuffer: async () => { throw new Error(message); } });
 const status = code => () => new Response("", { status: code });
 const resolve = (n, urls) => artefactBytes({ urls, sha256 }, { fetch: n.fetch, caches: null, subtle });
+/** A person who cancels after the first unanswered round (sdk#312: nothing
+ * else ends a wait), with no real sleeping. */
+const cancelFirst = () => {
+  const c = new AbortController();
+  const waits = [];
+  return { waits, signal: c.signal, onWait: w => { waits.push(w); c.abort(); }, sleep: async () => {} };
+};
 
 await t("a 200 whose BODY is interrupted is that source's failure: the next source is asked and wins", async () => {
   const n = net({ broken: bodyThrows("stream interrupted"), healthy: ok(GOOD) });
@@ -50,9 +57,11 @@ await t("invalid bytes, then a body failure, then valid bytes: every source is a
   assert.deepEqual([...got], [1, 2, 3]);
 });
 
-await t("EVERY body failing: the error names the artefact and what EACH source did, not only the last", async () => {
+await t("EVERY body failing: the wait names the artefact and what EACH source did, not only the last", async () => {
   const n = net({ a: bodyThrows("stream interrupted"), b: bodyThrows("reset by peer"), c: status(503), d: ok(new Uint8Array([7])) });
-  await assert.rejects(resolve(n, ["a", "b", "c", "d"]), e => {
+  const p = cancelFirst();
+  await assert.rejects(artefactBytes({ urls: ["a", "b", "c", "d"], sha256 }, { fetch: n.fetch, caches: null, subtle, ...p }), e => {
+    assert.equal(p.waits.length, 1, "it was not a WAIT: a failure that is not a mismatch ended the fetch");
     assert.deepEqual(n.asked, ["a", "b", "c", "d"], "a body failure ended the search early");
     for (const part of [sha256, "a: ", "stream interrupted", "b: ", "reset by peer", "c: 503", "d: does not hash"]) {
       assert.ok(e.message.includes(part), `the error does not say \`${part}\`:\n${e.message}`);
@@ -65,7 +74,7 @@ await t("a body failure is never CACHED as an artefact, and never served", async
   const stored = new Map();
   const caches = { open: async () => ({ match: async k => stored.get(k), put: async (k, r) => { stored.set(k, r); }, delete: async k => stored.delete(k) }) };
   const n = net({ broken: bodyThrows("stream interrupted") });
-  await assert.rejects(artefactBytes({ urls: ["broken"], sha256 }, { fetch: n.fetch, caches, subtle }));
+  await assert.rejects(artefactBytes({ urls: ["broken"], sha256 }, { fetch: n.fetch, caches, subtle, ...cancelFirst() }));
   assert.equal(stored.size, 0, "something was cached for an artefact that never arrived");
 });
 

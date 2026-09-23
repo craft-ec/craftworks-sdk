@@ -134,6 +134,23 @@ impl RowState {
     pub fn is_settled(self) -> bool {
         matches!(self, RowState::Clean | RowState::BackedUp)
     }
+
+    /// Saved, and its redundancy on the network too.
+    pub fn is_backed_up(self) -> bool {
+        self == RowState::BackedUp
+    }
+
+    /// Every state a row can report, in one list: what an app that labels
+    /// states checks itself against, so a state added here cannot reach a
+    /// person unlabelled (the builder's publish stalled on `BACKED_UP`, which
+    /// its own copy of this vocabulary did not have).
+    pub const ALL: [RowState; 5] =
+        [RowState::Clean, RowState::Queued, RowState::Pending, RowState::RolledBack, RowState::BackedUp];
+
+    /// The state a code names; `None` for a code this build does not know.
+    pub fn from_code(code: &str) -> Option<RowState> {
+        RowState::ALL.into_iter().find(|s| s.code() == code)
+    }
 }
 
 /// The two widths a record id comes in: a bare record's rkey (32 hex) or a

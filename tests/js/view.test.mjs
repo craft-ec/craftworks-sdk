@@ -1,7 +1,7 @@
 // A VIEW OF SOMEBODY'S PUBLISHED HEAD (sdk#239), through the REAL `Session`.
 //
 // Published data is readable by default; writing is access control, which a
-// visitor does not have. So a view reads the named head and its blocks, and:
+// reader does not have. So a view reads the named head and its blocks, and:
 //   - installs NOTHING on the node it reads from: no delegate registered, no
 //     signer message, no PUT, no UPDATE — only GETs (main's addition);
 //   - refuses every write before it reaches the store — the safety net under
@@ -42,13 +42,25 @@ const refusedAsReadOnly = fn => {
   assert.match(err.message, /^read-only: /);
 };
 
-const view = () => { const s = new Session(7999); s.open_named(BLOCK, HEAD, 1); return s; };
+// A view carries its app, as `tree()` gives it one: whose data a write names
+// is decided before whether this session may write (a name no app owns is
+// refused by name first).
+const view = () => { const s = new Session(7999); s.set_app("notes-app"); s.open_named(BLOCK, HEAD, 1); return s; };
 
-await t("**a view says it is read-only and stands on the NAMED head**", async () => {
+await t("**a view may write nothing -- the ONE decision says no -- and stands on the NAMED head**", async () => {
   const s = view();
-  assert.equal(s.read_only(), true);
+  for (const head of ["", HEAD]) {
+    const w = JSON.parse(s.can_write(head));
+    assert.equal(w.answer, "no", `a view may write ${head || "its own tree"}: ${JSON.stringify(w)}`);
+    assert.match(w.why, /^read-only: /);
+  }
   assert.equal(s.head_id(), HEAD, "the view does not stand on the head it was given");
-  assert.equal(new Session(7999).read_only(), false, "THE CONTROL: an ordinary session is not read-only");
+  // THE CONTROL: a session opening its own tree may write it -- the "no"
+  // above is the view's, not the decision's only answer.
+  const own = new Session(7999);
+  own.provision(new TextEncoder().encode("signer code"), BLOCK, new TextEncoder().encode("register"));
+  assert.equal(JSON.parse(own.can_write("")).answer, "yes", "THE CONTROL: an opening session may not write its own tree");
+  assert.equal(JSON.parse(new Session(7999).can_write("")).answer, "unknown", "a session with no page was decided");
 });
 
 await t("**a view installs NOTHING on the node: its only frames are GETs, the head read with a subscription**", async () => {

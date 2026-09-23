@@ -36,7 +36,14 @@ rm -f pkg/web-symbols/craftworks_sdk_bg.*.wasm
 cp "$shipped" "pkg/web-symbols/craftworks_sdk_bg.$stripped_hash.wasm"
 mv "$stripped_tmp" "$shipped"
 echo "pkg/web/craftworks_sdk_bg.wasm: $names_before -> $(wc -c < "$shipped" | tr -d ' ') B, name section stripped; names kept at pkg/web-symbols/craftworks_sdk_bg.$stripped_hash.wasm"
-cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js pkg/web/
+# THE PAGE'S RTO BACK-OFF, FOR THE JS THAT FETCHES THE WASM (sdk#312). The
+# app-code fetch runs before the wasm exists, so it walks a schedule the real
+# `page::rto::Rto` produced rather than a second back-off written in JS.
+# Generated at every build into js/ (gitignored), so the tests read it too.
+cargo run -q -p page --example rto_js > js/rto.js.tmp
+grep -q '^export const RTO_SCHEDULE_MS = ' js/rto.js.tmp || { echo "the rto_js example wrote no schedule" >&2; exit 1; }
+mv js/rto.js.tmp js/rto.js
+cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js js/rto.js pkg/web/
 
 # EVERY MODULE THE ENTRY CAN REACH IS IN THE PACKAGE.
 #
@@ -52,6 +59,11 @@ cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/arte
 node tools/reachable.mjs pkg/web/index.js pkg/web > /tmp/reach.$$ || {
   echo "pkg/web is not closed under its own imports — see above" >&2; rm -f /tmp/reach.$$; exit 1; }
 echo "pkg/web: $(wc -l < /tmp/reach.$$ | tr -d ' ') modules reachable from index.js, all present"
+# …and NAMED in artefacts.json (`modules`, below), so a consumer that ships the
+# SDK's JS (the builder's published app container) takes this computed list
+# instead of keeping its own: a hand list missed `rto.js` the day it arrived
+# (sdk#312's real-network run: the published app stayed on "Loading…").
+modules_json=$(python3 -c 'import json,sys; print(json.dumps(sorted(l.strip() for l in open(sys.argv[1]) if l.strip())))' /tmp/reach.$$)
 rm -f /tmp/reach.$$
 
 # THE ARTEFACTS THE SDK PROVISIONS WITH.
@@ -165,6 +177,7 @@ cat > pkg/web/artefacts.json <<JSON
   "sdk":      { "file": "craftworks_sdk_bg.wasm", "sha256": "$sdk_hash",
                 "bytes": $(size_of pkg/web/craftworks_sdk_bg.wasm) },
   "container": $container_json,
+  "modules":  $modules_json,
   "webapp":   { "file": "webapp.wasm",          "sha256": "$(hash_of pkg/web/webapp.wasm)",
                 "bytes": $(size_of pkg/web/webapp.wasm) },
   "note": "hashes key the shared artefact cache and are verified before use (sdk#5)"
