@@ -215,6 +215,124 @@ fn write_arm_cases() -> Vec<Case> {
         cases.push(Case::of(what, kind::TREE_NODE, bytes.clone()));
     }
     let _ = root;
+
+    // --- a tree whose leaves REFERENCE their values ---
+    //
+    // The tree above keeps every value inline, so its leaves list no parity
+    // and every group it has is a branch's. Values in each size class, with
+    // enough at MAX_VALUE that their group codes the largest parity the
+    // format produces: a symbol as long as a MAX_VALUE member plus framing.
+    let mut refs = MemBlocks::default();
+    let mut b = TreeBuilder::new(|c, bytes: &[u8]| {
+        refs.insert(c, bytes);
+    });
+    let sizes = [2 * 1024, 8 * 1024, 32 * 1024, node::MAX_VALUE];
+    for i in 0..96u32 {
+        let len = sizes[(i % 4) as usize];
+        b.push_bytes(format!("r/{i:04}").as_bytes(), &vec![(i % 251) as u8; len])
+            .expect("push");
+    }
+    b.finish().expect("finish");
+    let ref_leaves: Vec<Vec<u8>> = refs
+        .0
+        .values()
+        .filter(|b| node::Node::parse(b).is_ok_and(|n| n.is_leaf()))
+        .cloned()
+        .collect();
+    assert!(!ref_leaves.is_empty(), "the referencing tree wrote no leaf");
+    for bytes in ref_leaves.iter().take(4) {
+        cases.push(Case::of(
+            "tree node: a leaf listing parity over referenced values",
+            kind::TREE_NODE,
+            bytes.clone(),
+        ));
+    }
+
+    // --- parity, coded by this SDK's prolly over both trees' real groups ---
+    //
+    // `blocks_of` is the one function a writer, a keeper and a repairer all
+    // use to produce parity bytes, so these are exactly what goes on the wire.
+    let mut parity: Vec<Vec<u8>> = Vec::new();
+    let (mut from_branches, mut from_leaves) = (0usize, 0usize);
+    for store in [&sink, &refs] {
+        for bytes in store.0.values() {
+            let Ok(n) = node::Node::parse(bytes) else {
+                continue;
+            };
+            let blocks = freenet_prolly::parity::blocks_of(&n, store)
+                .expect("every member of the fixture is held, so its parity codes");
+            if n.is_leaf() {
+                from_leaves += blocks.len();
+            } else {
+                from_branches += blocks.len();
+            }
+            parity.extend(blocks.into_iter().map(|(_, p)| p));
+        }
+    }
+    assert!(
+        from_branches > 0 && from_leaves > 0,
+        "the fixtures coded {from_branches} branch and {from_leaves} leaf parity \
+         block(s); both group shapes must be represented"
+    );
+    parity.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    parity.dedup();
+    let largest_parity = parity[0].len();
+    assert!(
+        largest_parity > node::MAX_VALUE,
+        "the largest parity coded is {largest_parity} B, so no group held a \
+         MAX_VALUE member and the size boundary is not exercised"
+    );
+    for (i, p) in parity.iter().take(24).enumerate() {
+        let what = if i == 0 {
+            "parity: the largest this build coded"
+        } else {
+            "parity"
+        };
+        cases.push(Case::of(what, kind::PARITY, p.clone()));
+    }
+    // Parity is stored with trailing zeros trimmed, so a group whose
+    // combination cancels stores an EMPTY body. The contract must keep it.
+    cases.push(Case::of(
+        "parity: empty (a fully cancelled group)",
+        kind::PARITY,
+        Vec::new(),
+    ));
+
+    // --- packs, built by the engine's own pack builder ---
+    //
+    // One pack of a commit's nodes, and one filled as close to MAX_PACK as the
+    // fixture's members allow (the largest the format takes).
+    use engine::pack::{self, MAX_PACK, PACK_HEADER, PACK_KIND};
+    let nodes_pack: Vec<(u8, Vec<u8>)> = nodes
+        .iter()
+        .take(16)
+        .map(|(_, b)| (kind::TREE_NODE, b.clone()))
+        .collect();
+    cases.push(Case::of(
+        "pack: a commit's nodes",
+        PACK_KIND,
+        pack::build(&nodes_pack).expect("the nodes pack builds"),
+    ));
+    let mut pool: Vec<Vec<u8>> = refs.0.values().chain(sink.0.values()).cloned().collect();
+    pool.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    let (mut full, mut used) = (Vec::new(), PACK_HEADER);
+    for bytes in pool {
+        if used + pack::member_cost(bytes.len()) <= MAX_PACK {
+            used += pack::member_cost(bytes.len());
+            full.push((pack::member_kind(&bytes), bytes));
+        }
+    }
+    let full = pack::build(&full).expect("the full pack builds");
+    assert!(
+        full.len() + 1024 > MAX_PACK,
+        "the fullest pack is {} B, not within 1 KiB of MAX_PACK ({MAX_PACK})",
+        full.len()
+    );
+    cases.push(Case::of(
+        "pack: the fullest the fixture fills",
+        PACK_KIND,
+        full,
+    ));
     cases
 }
 
@@ -259,6 +377,21 @@ fn every_block_this_sdk_writes_is_accepted_by_the_released_contract() {
         sizes.push(case.state.len());
     }
 
+    // Every kind this SDK writes is in the arm. A floor on the TOTAL passed
+    // for months over RAW and TREE_NODE alone while the doc above promised
+    // parity and packs; a per-kind floor is what notices a kind going missing.
+    use freenet_prolly::kind;
+    let per_kind = |k: u8| cases.iter().filter(|c| c.state[0] == k).count();
+    let counts = [
+        ("RAW", per_kind(kind::RAW)),
+        ("TREE_NODE", per_kind(kind::TREE_NODE)),
+        ("PARITY", per_kind(kind::PARITY)),
+        ("PACK", per_kind(engine::pack::PACK_KIND)),
+    ];
+    for (name, n) in counts {
+        assert!(n > 0, "the write arm has no {name} case: {counts:?}");
+    }
+
     // The control, and it must EXECUTE: a node one byte over the format's
     // limit is refused. Without it, "everything was accepted" is also what a
     // contract that accepts everything looks like — and the same harness bug
@@ -275,10 +408,38 @@ fn every_block_this_sdk_writes_is_accepted_by_the_released_contract() {
          the bound and neither is this arm"
     );
 
+    // The same for the two kinds added here: parity one byte over its bound,
+    // and a pack carrying a member the contract would refuse on its own.
+    let over_parity = Case::of(
+        "parity one byte over MAX_PARITY",
+        kind::PARITY,
+        vec![7u8; engine::pack::MAX_PARITY + 1],
+    );
+    assert_eq!(
+        c.validate(&over_parity.params(), &over_parity.state),
+        Verdict::Invalid,
+        "the contract ACCEPTED parity over MAX_PARITY"
+    );
+    let bad_pack = Case::of(
+        "a pack with a malformed TREE_NODE member",
+        engine::pack::PACK_KIND,
+        engine::pack::build(&[
+            (kind::RAW, b"ok".to_vec()),
+            (kind::TREE_NODE, vec![0xFF; 64]),
+        ])
+        .expect("builds: the builder does not validate members, the contract does"),
+    );
+    assert_eq!(
+        c.validate(&bad_pack.params(), &bad_pack.state),
+        Verdict::Invalid,
+        "the contract ACCEPTED a pack whose member it would refuse on its own"
+    );
+
     let biggest = sizes.iter().copied().max().unwrap_or(0);
     println!(
-        "  write arm: {} case(s) accepted, largest {biggest} B; control (one \
-         byte over MAX_NODE) refused",
+        "  write arm: {} case(s) accepted {counts:?}, largest {biggest} B; \
+         controls (node over MAX_NODE, parity over MAX_PARITY, pack with a \
+         malformed member) refused",
         cases.len()
     );
 }

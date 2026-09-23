@@ -91,6 +91,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     // node to put anything on.
     "put_contract",
     "put_status",
+    // WHOSE NODE: ask the node's signer which head it signs for, registering
+    // nothing (a published app opens writable for its publisher). An
+    // in-memory store has no node and no signer to ask.
+    "ask_signer",
+    "asked",
     // READING SOMEBODY'S TREE (sdk#239): a reader session on the shared
     // socket — the head it names, that it writes nothing, and whose frames
     // are whose. An in-memory store is one tree and has no socket.
