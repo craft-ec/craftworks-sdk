@@ -173,6 +173,9 @@ struct Faults {
     lose_first_put_answers: bool,
     /// The first GET of each block goes unanswered.
     lose_first_gets: bool,
+    /// Each PARITY block's first put lands and its answer is lost (race put's
+    /// STRAGGLER: the data acks, the head signs, the parity is re-sent).
+    lose_first_parity_answers: bool,
     /// The signer fails to save its record on the first sign.
     record_not_saved_once: bool,
     /// Hold every answer (FullNode's `hold_answers`).
@@ -257,7 +260,8 @@ impl PageRig {
         Some(match op {
             Op::Put { id, bytes } => {
                 node.put(id, &bytes);
-                if self.faults.lose_first_put_answers && self.put_once.insert(id) {
+                let parity = freenet_prolly::block_id(freenet_prolly::kind::PARITY, &bytes) == id;
+                if (self.faults.lose_first_put_answers || (self.faults.lose_first_parity_answers && parity)) && self.put_once.insert(id) {
                     return None;
                 }
                 Answer::PutOk(id)
@@ -403,6 +407,28 @@ fn a_lost_put_answer_publishes_once_the_node_answers() {
     let kv = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
     assert_eq!(tree_of(&node, &root), BTreeMap::from([kv("a", "1"), kv("b", "2")]));
     assert!(!rig.put_once.is_empty(), "no put answer was lost: the fault never fired");
+}
+
+/// RACE PUT's STRAGGLER (COMMIT-LIFE §P gate): every parity block's first
+/// answer is lost, so the data acks and the head signs with the parity still
+/// out -- SAVED, not BACKED_UP. The page re-sends each straggler on its RTO
+/// (stall retry is the standard; nothing stops at the sign), and the write
+/// reaches BACKED_UP.
+#[test]
+fn a_straggler_dropped_after_the_sign_is_re_sent_and_reaches_backed_up() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.faults.lose_first_parity_answers = true;
+    rig.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..400).map(|i| (format!("k/{i:04}"), format!("value {i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    let st = states(&rig.client_as(&mut node, &write(1, &ops)), 1);
+    let pub_at = st.iter().position(|s| *s == WriteState::Published);
+    let backed_at = st.iter().position(|s| *s == WriteState::ParityComplete);
+    assert!(!rig.put_once.is_empty(), "no parity answer was lost: the fault never fired (no parity coded?)");
+    assert!(pub_at.is_some(), "the write never published: {st:?}");
+    assert!(backed_at.is_some(), "the stragglers were never re-sent to BACKED_UP: {st:?} ({} parity answer(s) lost)", rig.put_once.len());
+    assert!(pub_at < backed_at, "BACKED_UP before SAVED: {st:?}");
 }
 
 /// A COLD read: the rows are only on the network, and the page's first GET of
