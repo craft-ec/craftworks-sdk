@@ -3487,9 +3487,14 @@ impl<B: Blocks> Engine<B> {
             |id, b: &[u8]| emitted.push((id, b.to_vec())),
         );
         match applied {
+            // The commit's PARITY is its blocks too (§P: put in the same
+            // round as the data), so a re-put from the carried ops re-derives
+            // it from the same apply -- or the commit could never be
+            // recoverable again after its puts were lost.
             Ok(a) if a.root == root => Some(
                 emitted
                     .into_iter()
+                    .chain(a.parity.iter().cloned())
                     .filter(|(id, _)| missing.contains(id))
                     .map(|(id, bytes)| Effect::PutBlock {
                         id,
