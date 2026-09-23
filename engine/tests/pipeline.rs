@@ -105,7 +105,7 @@ fn pack_ids(effects: &[Effect]) -> Vec<Cid> {
 
 fn head_of(effects: &[Effect]) -> Option<(u64, Cid, Vec<Cid>)> {
     effects.iter().find_map(|e| match e {
-        Effect::UpdateHead { seq, root, after } => Some((*seq, *root, after.clone())),
+        Effect::UpdateHead { seq, root, after, .. } => Some((*seq, *root, after.clone())),
         _ => None,
     })
 }
