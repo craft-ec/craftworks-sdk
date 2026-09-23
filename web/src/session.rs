@@ -362,7 +362,10 @@ impl Session {
         let sent = self.page_identity_sent;
         let p = self.page_mut().expect("checked");
         let frames = p.take_frames();
-        let ready = p.provisioned() && !sent;
+        // A user with NO TREE here yet is started too: its head reads as
+        // missing (page-io answers that itself), so every read answers empty
+        // through the one read path, and nothing is sent to the node.
+        let ready = (p.provisioned() || p.no_tree_yet()) && !sent;
         let others = p.take_others();
         self.out.extend(frames);
         // The app's own PUTs are the page's (`put_status`): what is left is
@@ -626,17 +629,29 @@ impl Session {
         let (answer, why) = match self.may_write(head) {
             page_io::MayWrite::Yes => ("yes", String::new()),
             page_io::MayWrite::No(w) => ("no", w),
-            page_io::MayWrite::Unknown(w) => ("unknown", w),
+            page_io::MayWrite::Unknown(w) | page_io::MayWrite::Undecided(w) => ("unknown", w),
         };
         serde_json::json!({ "answer": answer, "why": why }).to_string()
     }
 
-    /// OPEN THE USER'S OWN TREE on an asked session (DATA-SOURCE `mine`):
-    /// `PageIo::claim`, then what opening does -- a key is minted only where
-    /// the signer holds none (`mint_if_needed`), and the head is created by
-    /// the first write. Answers `can_write("")` afterwards. A session opened
-    /// with `provision` is open on its own tree already: nothing to do.
+    /// OPEN THE USER'S OWN TREE on an asked session (DATA-SOURCE `mine`),
+    /// WRITING NOTHING. Where this node's signer already holds the user's key
+    /// the tree is theirs and opens now (`PageIo::claim` sends no PUT). Where
+    /// it holds none, or there is no signer, the user has no tree yet: it
+    /// reads as empty, and the first WRITE claims it -- the key minted there
+    /// (`mint_if_needed`), the head created by that write. Answers
+    /// `can_write("")`. A session opened with `provision` is open already.
     pub fn open_own(&mut self) -> String {
+        if self.page().is_some_and(|p| matches!(p.asked(), Some(page_io::Asked::Register(_)))) {
+            self.claim_own();
+        }
+        self.can_write("")
+    }
+
+    /// Claim the user's own tree on an asked session, whatever the signer
+    /// answered: the first write's step (`writable`), and `open_own`'s where
+    /// the key is already here.
+    fn claim_own(&mut self) {
         if self.page().is_some_and(|p| p.asking()) {
             let (container, _) = wire::delegate_from_code(&self.signer_code);
             if let Some(p) = self.page_mut() {
@@ -644,7 +659,6 @@ impl Session {
             }
             self.pump_page();
         }
-        self.can_write("")
     }
 
     /// The head this session stands on, as `open_named` takes it: the head
@@ -654,7 +668,7 @@ impl Session {
         // page-io's: it names the Register it reads (sdk#239), and nothing
         // here keeps a second copy of it.
         match self.page().map(|p| p.register_id()) {
-            Some(id) if id != [0u8; 32] => id.iter().map(|b| format!("{b:02x}")).collect(),
+            Some(id) if id != [0u8; 32] => core_types::hex::encode(&id),
             _ => String::new(),
         }
     }
@@ -709,6 +723,11 @@ impl Session {
         // the same app); any other is a write, refused. The schema is READ
         // through the same decision, so an unloaded one parks, never "none".
         self.write_name(domain)?;
+        // NOT DECIDED YET is not "no" (rule 8): the define WAITS for the
+        // signer's answer, then takes the answered branch.
+        if let page_io::MayWrite::Undecided(why) = self.may_write("") {
+            return Err(db_err(&DbError::NotDecided(why)));
+        }
         if let page_io::MayWrite::No(why) | page_io::MayWrite::Unknown(why) = self.may_write("") {
             let name = self.read_name(domain)?;
             let r = self.db.schema(&name).and_then(|old| match old {
@@ -717,7 +736,16 @@ impl Session {
             });
             return self.decided(r);
         }
+        // AN ORDINARY WRITE (the ruling on #338): queued on the engine and
+        // seen by every read through the warm root. Where the user has no
+        // tree yet the engine cannot sign (`CanSign(false)`), so it is held,
+        // not put; a define never provisions (only a data write does,
+        // `writable`). Identical to what the tree holds is nothing to write.
         let name = self.write_name(domain)?;
+        let stored = self.db.schema(&name);
+        if self.decided(stored)?.as_ref() == Some(&s) {
+            return Ok(());
+        }
         let r = self.db.define(&name, &s);
         self.decided(r)
     }
@@ -774,6 +802,7 @@ impl Session {
     /// and is not there (craftworks-sdk#118).
     pub fn get(&mut self, domain: &str, id: &str) -> Result<String, JsValue> {
         let name = self.read_name(domain)?;
+
         let domain = name.as_str();
         let Some(k) = craftworks_sdk::id::loc_from_hex(id) else {
             // The domain is still checked: a read of a domain that does not
@@ -1142,7 +1171,7 @@ impl Session {
         // M2 (sdk#148): writes that did not apply because what they READ had
         // moved, and were not re-run (a create, a delete). Facts and one
         // default line; how to show them is the page's.
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let hex = core_types::hex::encode;
         let conflicts: Vec<serde_json::Value> = self
             .db
             .store_mut()
@@ -1253,7 +1282,7 @@ impl Session {
     /// THE DECISION, page-io's (`PageIo::may_write`): `head` in hex, or "" for
     /// this session's own tree. No page yet: not known.
     fn may_write(&self, head: &str) -> page_io::MayWrite {
-        let Some(p) = self.page() else { return page_io::MayWrite::Unknown("this session is not open on a node yet".into()) };
+        let Some(p) = self.page() else { return page_io::MayWrite::Undecided("this session is not open on a node yet".into()) };
         if head.is_empty() {
             return p.may_write(None);
         }
@@ -1268,11 +1297,11 @@ impl Session {
     /// first write opens the user's own tree (`open_own`): the head is
     /// created on first write.
     fn writable(&mut self) -> Result<(), JsValue> {
-        if self.page().is_some_and(|p| p.asking()) {
-            self.open_own();
-        }
+        self.claim_own();
         match self.may_write("") {
             page_io::MayWrite::Yes => Ok(()),
+            // Not decided yet: the write WAITS for the answer (rule 8).
+            page_io::MayWrite::Undecided(why) => Err(db_err(&DbError::NotDecided(why))),
             page_io::MayWrite::No(why) | page_io::MayWrite::Unknown(why) => Err(db_err(&DbError::Refused(why))),
         }
     }
@@ -1280,14 +1309,7 @@ impl Session {
 
 /// A head id as `head_id()` gives it: 64 hex characters.
 fn head_of_hex(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 || !hex.is_ascii() {
-        return None;
-    }
-    let mut id = [0u8; 32];
-    for (i, b) in id.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(id)
+    core_types::hex::decode_array(hex)
 }
 
 fn db_err(e: &DbError) -> JsValue {

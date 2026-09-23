@@ -150,6 +150,42 @@ pub fn slot_from(created_ms: f64, namespace: &str, source_id: &str) -> Result<St
     Ok(id::to_hex(&craftworks_sdk::slot_from(created_ms as u64, namespace, source_id)))
 }
 
+/// THE app-id rule (`app::check`, over `core_types::name`), for JavaScript
+/// (`sdk.ids.app`): refused in its words, or nothing. A page or tool asks this;
+/// it never writes the rule again.
+#[wasm_bindgen]
+pub fn app_check(app: &str) -> Result<(), JsError> {
+    craftworks_sdk::app::check(app).map_err(err)
+}
+
+/// Is `hex` 32 bytes in hex -- a head's instance id, a sha256 (`sdk.ids.hex32`),
+/// by `core_types::hex`.
+#[wasm_bindgen]
+pub fn hex32_ok(hex: &str) -> bool {
+    core_types::hex::decode_array::<32>(hex).is_some()
+}
+
+/// Is `hex` a record id as an app holds it -- 32 hex, or 64 under a parent
+/// (`sdk.ids.loc`), by `id::loc_from_hex`.
+#[wasm_bindgen]
+pub fn loc_ok(hex: &str) -> bool {
+    id::loc_from_hex(hex).is_some()
+}
+
+/// A record id's own slot (its rkey, 32 hex), whether it is bare (32) or under
+/// a parent (64); `undefined` when it is not a record id (`sdk.ids.slot`).
+#[wasm_bindgen]
+pub fn loc_slot(hex: &str) -> Option<String> {
+    id::loc_from_hex(hex).map(|l| id::to_hex(&l.rkey))
+}
+
+/// Is `name` a module an app may carry beside the SDK's index.js
+/// (`sdk.ids.module`, `core_types::name::module_ok`): a file name, never a path.
+#[wasm_bindgen]
+pub fn module_name_ok(name: &str) -> bool {
+    core_types::name::module_ok(name)
+}
+
 fn err(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }

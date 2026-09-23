@@ -1,7 +1,7 @@
 // Web entry point: `import { load } from "./sdk/index.js"; const sdk = await load();`
 import init, * as raw from "./craftworks_sdk.js";
 import { wrap } from "./wrap.js";
-import { artefactBytes } from "./artefacts.js";
+import { artefactBytes, servedText } from "./artefacts.js";
 
 let ready;
 /** Load once. `wasm` is optional bytes or a URL; by default the module fetches its own. */
@@ -27,9 +27,8 @@ export async function loadShared({
   ...deps
 } = {}) {
   const at = f => new URL(f, import.meta.url).href;
-  const r = await fetchWith(at("./artefacts.json"));
-  if (!r.ok) throw new Error(`could not fetch artefacts.json: ${r.status}`);
-  const m = await r.json();
+  // Through the one fetch: waited on, never ended by a status (#126 ruling).
+  const m = JSON.parse(await servedText({ url: at("./artefacts.json") }, { fetch: fetchWith, ...deps }));
   if (!m.sdk || !m.sdk.file || !m.sdk.sha256) {
     throw new Error("artefacts.json has no usable sdk entry");
   }

@@ -11,13 +11,8 @@ description = "App-facing SDK. Every substrate capability is exposed here the ph
 # core stays a library the boundary gate checks rather than one it excuses.
 crate-type = ["rlib"]
 
-[features]
-# The client's write path rebuilt from WRITE-PATH.md revision 3 (build step 3).
-# OFF: structure only, until the behaviour lands; `cargo check --features
-# write-path-v5` compiles and lints it.
-write-path-v5 = []
-
 [dependencies]
+core-types = { path = "core-types" }
 # Pinned by revision, not by path: this repo must build for anyone who checks
 # it out, and the tree's format decides what an app's data looks like.
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
@@ -66,7 +61,7 @@ bincode = "1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
-members = ["contract-keys", "engine", "page", "page-io", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
+members = ["contract-keys", "core-types", "engine", "page", "page-io", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
 
 [profile.release]
 opt-level = "s"

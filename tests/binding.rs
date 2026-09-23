@@ -7,7 +7,8 @@
 //! test here, and it is one that a test asserting only VALUES would not see.
 
 use craftworks_sdk::store::{Delta, Read, Reads};
-use craftworks_sdk::{Binding, LiveMode, MemStore, Store, TreeStore};
+use craftworks_sdk::{Binding, LiveMode, Store, TreeStore};
+use testkit::MemStore;
 
 fn put(s: &mut impl Store, k: &str, v: &str) {
     s.put(k.as_bytes(), v.as_bytes()).expect("the store took the write");
@@ -147,47 +148,6 @@ fn a_live_binding_and_a_plain_one_look_identical_to_a_component() {
         "a live binding that has not been granted a subscription must NOT \
          claim it is being notified"
     );
-    assert_eq!(
-        live.sub_id(),
-        None,
-        "a live binding took out an engine subscription nobody granted it"
-    );
-    assert_eq!(
-        plain.sub_id(),
-        None,
-        "a NON-live binding took out an engine subscription"
-    );
-}
-
-/// A refused subscription is a DOWNGRADE, reported, never a silent poll.
-#[test]
-fn a_refused_subscription_is_reported_as_a_downgrade() {
-    let mut live = Binding::new(b"a/", b"b/", true);
-    assert_eq!(
-        live.mode(),
-        LiveMode::Polled,
-        "it claimed to be notified \
-        before anything had accepted a subscription"
-    );
-
-    live.note_subscribed(7, true);
-    assert_eq!(live.mode(), LiveMode::Notified);
-    assert_eq!(live.sub_id(), Some(7));
-
-    live.note_downgraded();
-    assert_eq!(
-        live.mode(),
-        LiveMode::Polled,
-        "an engine that stopped notifying left the binding claiming it was \
-         still being told"
-    );
-    assert_eq!(live.sub_id(), None);
-
-    // A refusal at subscribe time is the same outcome by a different door.
-    let mut other = Binding::new(b"a/", b"b/", true);
-    other.note_subscribed(9, false);
-    assert_eq!(other.mode(), LiveMode::Polled);
-    assert_eq!(other.sub_id(), None);
 }
 
 /// A reload takes the DELTA where the backend can give one, and the full read

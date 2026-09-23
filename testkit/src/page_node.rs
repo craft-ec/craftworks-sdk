@@ -669,8 +669,3 @@ fn answered(r: &protocol::Reply) -> Option<String> {
     }
 }
 
-impl craftworks_sdk::Transport for PageConn {
-    fn exchange(&mut self, request: &[u8]) -> Vec<Vec<u8>> {
-        self.0.borrow_mut().frame(request)
-    }
-}

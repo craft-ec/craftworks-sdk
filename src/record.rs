@@ -33,15 +33,6 @@ fn tag(k: Kind) -> u8 {
     }
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) || !s.is_ascii() {
-        return None;
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
-        .collect()
-}
-
 fn payload(kind: Kind, v: &Value) -> Option<Vec<u8>> {
     Some(match kind {
         Kind::Text | Kind::Ref => v.as_str()?.as_bytes().to_vec(),
@@ -49,7 +40,7 @@ fn payload(kind: Kind, v: &Value) -> Option<Vec<u8>> {
         Kind::Float => v.as_f64()?.to_bits().to_le_bytes().to_vec(),
         Kind::Bool => vec![v.as_bool()? as u8],
         Kind::Time => v.as_u64()?.to_le_bytes().to_vec(),
-        Kind::Bytes => unhex(v.as_str()?)?,
+        Kind::Bytes => core_types::hex::decode(v.as_str()?)?,
     })
 }
 

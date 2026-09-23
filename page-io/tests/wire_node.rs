@@ -646,9 +646,13 @@ fn a_write_to_a_reader_reaches_nothing_and_never_publishes() {
     // provisioning call framed.
     let _ = v.take_frames();
     let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+    // What was already queued is the view's own READS (nothing it may not
+    // send); what `provision` adds is what this asks about.
+    let queued = v.take_frames();
+    assert!(kinds(&queued).iter().all(|k| *k == "other"), "a reader had a delegate frame queued: {:?}", kinds(&queued));
     v.provision(container, vec![0u8; 32]);
-    let framed = v.take_frames();
-    assert!(framed.is_empty(), "a reader framed a provisioning: {} frame(s), first {:?}", framed.len(), framed.first().map(|f| String::from_utf8_lossy(&f[..f.len().min(120)]).into_owned()));
+    let fr = v.take_frames();
+    assert!(fr.is_empty(), "a reader framed a provisioning");
     assert!(v.unusable().iter().any(|u| u.contains("read-only")), "{:?}", v.unusable());
 }
 
@@ -725,9 +729,12 @@ fn the_own_page_and_a_reader_read_the_same_tree_identically_intact_and_corrupted
     client(&mut v, &mut node, &mut now, &Request::Identity);
     let theirs = answers_to(&client(&mut v, &mut node, &mut now, &range(22)), 22);
     // REFUSED, not an empty page: a block that does not hash to its id is
-    // Unavailable (blocked on it), never read as "no rows".
-    assert!(mine.len() == 1 && mine[0].starts_with("Unavailable { req_id: 22"), "the own page did not refuse corrupted blocks: {mine:?}");
-    assert_eq!(theirs, mine, "a reader and the own page refused a corrupted tree differently");
+    // not the block, so nothing is read from it -- never "no rows". And the
+    // read does not END on it either (rule 7): the block is asked for again
+    // (another copy, a repair), so the answer is NONE yet, identically on
+    // both paths.
+    assert!(mine.is_empty(), "the own page answered from corrupted blocks: {mine:?}");
+    assert_eq!(theirs, mine, "a reader and the own page treated a corrupted tree differently");
 }
 
 /// A page that OPENS as the Session does now (`begin`): it knows nothing of
@@ -1292,6 +1299,7 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     let yes = |m: page_io::MayWrite| m == Yes;
     let no = |m: page_io::MayWrite| matches!(m, No(_));
     let unknown = |m: page_io::MayWrite| matches!(m, Unknown(_));
+    let undecided = |m: page_io::MayWrite| matches!(m, page_io::MayWrite::Undecided(_));
     let stranger = [0xAB; 32];
     let mut now = 1_000;
 
@@ -1300,9 +1308,9 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     let view = reader(&node);
     assert!(no(view.may_write(None)) && no(view.may_write(Some(node.register_id))), "a view may write");
 
-    // ASKED, not answered yet: not known, for any head.
+    // ASKED, not answered yet: NOT DECIDED (a write waits), for any head.
     let io = asker();
-    assert!(unknown(io.may_write(None)) && unknown(io.may_write(Some(stranger))), "an unanswered ask was decided");
+    assert!(undecided(io.may_write(None)) && undecided(io.may_write(Some(stranger))), "an unanswered ask was decided");
 
     // It signs for their Register: that head, and the own tree, yes; another, no.
     let mut node = WireNode::new(&[41u8; 32]);
@@ -1321,12 +1329,12 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
         assert!(no(io.may_write(Some(stranger))), "empty={empty}: a node with no key may write a head");
     }
 
-    // Not answering: not known, for any head.
+    // Not answering: NOT DECIDED (rule 8, silence is not an answer), for any head.
     let mut node = WireNode::new(&[43u8; 32]);
     node.drop_signer_answers = usize::MAX;
     let mut io = asker();
     settle(&mut io, &mut node, &mut now);
-    assert!(unknown(io.may_write(None)) && unknown(io.may_write(Some(node.register_id))), "{:?}", io.asked());
+    assert!(undecided(io.may_write(None)) && undecided(io.may_write(Some(node.register_id))), "{:?}", io.asked());
 
     // Refused by the node: the own tree not known; a named head no.
     let mut node = WireNode::unprovisioned(&[44u8; 32]);
@@ -1353,4 +1361,241 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     settle(&mut io, &mut node, &mut now);
     assert!(yes(io.may_write(Some(node.register_id))), "a claimed page may not write the register it minted: {:?}", io.may_write(Some(node.register_id)));
     assert!(no(io.may_write(Some(stranger))));
+}
+
+/// A VIEW PUTS BACK A BLOCK IT REBUILT, AND NOTHING WAITS ON IT (read-only
+/// has one owner, the page). The publisher's first leaf is gone from the
+/// node; a VIEW reading the tree rebuilds it from its group (race get) and
+/// the page puts it back -- a repair restores existing content-addressed
+/// bytes, no key, no head moved -- so the node serves exactly ONE block PUT
+/// from the view, it is answered, and the view waits on nothing after. The
+/// mutant (page-io drops a read-only page's PUT, the page keeps its
+/// deadline) leaves the block un-put and the view waiting: red.
+#[test]
+fn a_view_puts_back_a_block_it_rebuilt_and_waits_on_nothing() {
+    let mut node = WireNode::new(&[35u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    let big = "v".repeat(900);
+    let ops: Vec<protocol::Op> = (0..60).map(|i| protocol::Op::Put(format!("row/{i:03}").into_bytes(), big.clone().into_bytes())).collect();
+    let rs = client(&mut a, &mut node, &mut now, &Request::forced_write(1, ops));
+    assert!(states(&rs, 1).contains(&WriteState::Published), "the publisher's tree did not publish");
+    let (_, root) = node.head().expect("a head");
+    let root_bytes = freenet_prolly::store::Blocks::get(a.server.page.blocks(), &root).expect("the writer holds its root").to_vec();
+    let root_node = freenet_prolly::node::Node::parse(&root_bytes).expect("a node");
+    assert!(!root_node.is_leaf() && root_node.parity_count() > 0, "THE CONTROL: the tree has no grouped children to rebuild from");
+    let (lost, _) = root_node.child(0);
+    let gone = wire::block::contract_for(BLOCK_CODE, &lost);
+    assert!(node.contracts.remove(&gone).is_some(), "the lost leaf was not on the node");
+
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let served_before = node.served.clone();
+    let before = node.served.get("put block").copied().unwrap_or(0);
+    assert_eq!(rows(&mut v, &mut node, &mut now, 21), vec![60], "the view did not read every row through the rebuild");
+    for _ in 0..20 {
+        now += 1_000;
+        v.tick(Ms(now));
+        settle(&mut v, &mut node, &mut now);
+    }
+    let put = node.served.get("put block").copied().unwrap_or(0) - before;
+    assert_eq!(put, 1, "the view put back {put} block(s); a rebuilt block is put back exactly once ({:?})", v.unusable());
+    assert!(node.contracts.contains_key(&gone), "the rebuilt leaf is not on the node again");
+    assert!(!v.server.page.waiting(), "the view still waits on something after its repair PUT was answered");
+    for k in ["put register", "update", "signer", "register delegate"] {
+        let by_view = node.served.get(k).copied().unwrap_or(0) - served_before.get(k).copied().unwrap_or(0);
+        assert_eq!(by_view, 0, "a view made the node serve a {k}");
+    }
+}
+
+/// READ-ONLY HAS ONE OWNER, THE PAGE: the door's refusal (`may_write`, what
+/// the web Session asks) and the page's filter (no commit op) answer from the
+/// same flag. A view is refused at the door by name, and a write that
+/// reaches its page anyway makes no commit op -- named, not sent, nothing
+/// waited on. Mutants that flip ONE alone go red: the door answering "yes"
+/// on a view, or the page making a view's commit ops.
+#[test]
+fn a_views_door_refusal_and_its_pages_filter_agree() {
+    let mut node = WireNode::new(&[36u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "x", "v")), 1).contains(&WriteState::Published));
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert!(v.read_only() && v.server.page.read_only(), "page-io's read-only is not the page's");
+    for head in [None, Some(node.register_id)] {
+        assert_eq!(v.may_write(head), page_io::MayWrite::No(page_io::READ_ONLY.into()), "the door let a view write {head:?}");
+    }
+    let before = node.served.clone();
+    let wr = client(&mut v, &mut node, &mut now, &write(2, "intruder", "v"));
+    for _ in 0..200 {
+        now += 1_000;
+        v.tick(Ms(now));
+        settle(&mut v, &mut node, &mut now);
+    }
+    assert!(states(&wr, 2).contains(&WriteState::Failed), "a view's write was not refused at the door: {wr:?}");
+    assert!(v.server.page.unusable().iter().any(|u| u.starts_with("read-only: write 2 refused at the door")), "the view's refusal was not named: {:?}", v.server.page.unusable());
+    for k in ["put block", "put register", "update", "signer"] {
+        assert_eq!(node.served.get(k), before.get(k), "a view's write reached the node as a {k}");
+    }
+}
+
+/// A VIEW'S DEFINE IS REFUSED AT THE DOOR, AND NOTHING IS QUEUED (the
+/// architect's precision 2 on #338). A schema define is an ordinary write;
+/// on a VIEW it is told `Failed` at the page's door, named, and the engine's
+/// queue is EMPTY after -- beside the user's own no-tree define, which is
+/// queued and visible (#342, `with_no_tree_writes_wait_visible_…`).
+#[test]
+fn a_views_define_is_refused_at_the_door_and_nothing_is_queued() {
+    let mut node = WireNode::new(&[38u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "x", "v")), 1).contains(&WriteState::Published));
+    let mut v = reader(&node);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert_eq!(v.server.page.queue_load().0, 0, "THE CONTROL: the view's queue was not empty before");
+    let r = client(&mut v, &mut node, &mut now, &write(2, "schema/notes", "{}"));
+    assert!(states(&r, 2).contains(&WriteState::Failed), "a view's define was not refused at the door: {r:?}");
+    assert!(v.server.page.unusable().iter().any(|u| u.starts_with("read-only: write 2 refused at the door")), "not named: {:?}", v.server.page.unusable());
+    assert_eq!(v.server.page.queue_load().0, 0, "a view's define was queued on the engine");
+}
+
+/// OPENING THE USER'S OWN TREE WRITES NOTHING (DATA-SOURCE `mine`: the tree
+/// is made on the first WRITE). On every kind of node an asked page opens
+/// and READS the user's tree -- their rows where the node's signer holds
+/// their key (claimed: nothing to make), EMPTY where it holds none or there
+/// is no signer (nothing claimed: `no_tree_yet`) -- and the node serves no
+/// PUT and no UPDATE. Then the first write claims, provisions and lands.
+#[test]
+fn opening_and_reading_the_users_own_tree_sends_no_put_and_the_first_write_lands() {
+    for case in ["signs for their register", "signer holds no key", "no signer here"] {
+        let key = [33u8; 32];
+        let mut node = if case == "signs for their register" { WireNode::new(&key) } else { WireNode::unprovisioned(&key) };
+        node.empty_until_registered = case == "no signer here";
+        let mut now = 1_000;
+        let mut io = asker();
+        settle(&mut io, &mut node, &mut now);
+        let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+        // What `Session::open_own` does: claim only an identity already here.
+        if case == "signs for their register" {
+            assert!(io.claim(container.clone()), "{case}: the claim was refused");
+        } else {
+            assert!(io.no_tree_yet(), "{case}: a user with no key here was not taken as having no tree yet");
+        }
+        settle(&mut io, &mut node, &mut now);
+        client(&mut io, &mut node, &mut now, &Request::Identity);
+        let read = row_count(&mut io, &mut node, &mut now, 71);
+        let writes: BTreeMap<&str, usize> =
+            node.served.iter().filter(|(k, _)| ["put block", "put register", "update"].contains(k)).map(|(k, n)| (*k, *n)).collect();
+        assert!(writes.is_empty(), "{case}: opening and reading the user's own tree wrote to the node: {writes:?} (all served {:?})", node.served);
+        assert_eq!(read, Some(0), "{case}: the user's own tree did not read as empty");
+        // THE FIRST WRITE: what `Session::writable` does -- claim, and mint
+        // where there is no key (the existing provision path) -- then it lands.
+        if case != "signs for their register" {
+            assert!(io.claim(container), "{case}: the first write's claim was refused");
+            settle(&mut io, &mut node, &mut now);
+            if io.needs_key() {
+                let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+                io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+                settle(&mut io, &mut node, &mut now);
+            }
+        }
+        let rs = client(&mut io, &mut node, &mut now, &write(1, "mine", "1"));
+        let mut st = states(&rs, 1);
+        for _ in 0..200 {
+            if st.iter().any(|s| matches!(s, WriteState::Published)) { break; }
+            now += 500;
+            io.tick(page::Ms(now));
+            st.extend(states(&settle(&mut io, &mut node, &mut now), 1));
+        }
+        assert!(st.iter().any(|s| matches!(s, WriteState::Published)), "{case}: the first write did not publish: {st:?} ({:?})", io.unusable());
+        assert!(node.contracts.contains_key(&io.register_id()), "{case}: the first write did not create the user's head");
+        let mut again = page_io(&node);
+        client(&mut again, &mut node, &mut now, &Request::Identity);
+        assert_eq!(row_count(&mut again, &mut node, &mut now, 73), Some(1), "{case}: a reopened page does not read the user's row");
+    }
+}
+
+/// A RETURNING identity (its tree already has rows, written by another page
+/// of the same person): opened and read through an asked page, the node
+/// serves no PUT and no UPDATE.
+#[test]
+fn a_returning_identity_reads_its_rows_with_no_put() {
+    let key = [34u8; 32];
+    let mut node = WireNode::new(&key);
+    let mut now = 1_000;
+    let mut writer = page_io(&node);
+    client(&mut writer, &mut node, &mut now, &Request::Identity);
+    for i in 0..40u64 {
+        let rs = client(&mut writer, &mut node, &mut now, &write(i + 1, &format!("mine/{i:03}"), "v"));
+        assert!(states(&rs, i + 1).iter().any(|s| matches!(s, WriteState::Published)), "row {i} did not publish");
+    }
+    let before = node.served.clone();
+    let mut io = asker();
+    settle(&mut io, &mut node, &mut now);
+    let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+    assert!(io.claim(container));
+    settle(&mut io, &mut node, &mut now);
+    client(&mut io, &mut node, &mut now, &Request::Identity);
+    let read = row_count(&mut io, &mut node, &mut now, 72);
+    for _ in 0..50 { now += 1_000; io.tick(page::Ms(now)); settle(&mut io, &mut node, &mut now); }
+    let delta: BTreeMap<&str, usize> = node.served.iter().map(|(k, n)| (*k, n - before.get(k).copied().unwrap_or(0))).filter(|(_, n)| *n > 0).collect();
+    println!("returning: read {read:?}; served since open {delta:?}");
+    assert_eq!(read, Some(40), "the returning identity did not read its rows");
+    let writes: Vec<_> = delta.iter().filter(|(k, _)| ["put block", "put register", "update"].contains(k)).collect();
+    assert!(writes.is_empty(), "opening a returning identity's tree wrote to the node: {writes:?}");
+}
+
+/// NO TREE YET: WRITES WAIT, VISIBLE, UNPUT; PROVISIONING CUTS ONE COMMIT
+/// (#338; engine `CanSign`). An asked page whose node holds no key (or has no
+/// signer) cannot sign, so writes -- a schema define, then a data write --
+/// queue on the engine and apply to the warm root: a read sees both, and the
+/// node is sent NOTHING. The first data write's claim provisions; the
+/// provisioning is what turns `CanSign` true, and ONE commit carries the
+/// whole queue: one head, both writes published.
+#[test]
+fn with_no_tree_writes_wait_visible_and_provisioning_cuts_one_commit() {
+    for case in ["signer holds no key", "no signer here"] {
+        let key = [37u8; 32];
+        let mut node = WireNode::unprovisioned(&key);
+        node.empty_until_registered = case == "no signer here";
+        let mut now = 1_000;
+        let mut io = asker();
+        settle(&mut io, &mut node, &mut now);
+        assert!(io.no_tree_yet(), "{case}: not taken as no tree yet");
+        client(&mut io, &mut node, &mut now, &Request::Identity);
+        let r1 = client(&mut io, &mut node, &mut now, &write(1, "schema/notes", "{}"));
+        let r2 = client(&mut io, &mut node, &mut now, &write(2, "mine", "1"));
+        // What the web Session's reads walk (R-a): the WARM root.
+        let warm = io.server.page.warm_root();
+        let leaf = freenet_prolly::store::Blocks::get(io.server.page.blocks(), &warm).map(|b| b.to_vec());
+        let entries = leaf.as_deref().and_then(|b| freenet_prolly::node::Node::parse(b).ok()).map(|n| n.len());
+        assert_eq!(entries, Some(2), "{case}: the queued writes are not in the warm root ({:?}, {:?})", states(&r1, 1), states(&r2, 2));
+        let writes: BTreeMap<&str, usize> =
+            node.served.iter().filter(|(k, _)| ["put block", "put register", "update"].contains(k)).map(|(k, n)| (*k, *n)).collect();
+        assert!(writes.is_empty(), "{case}: writes were sent while the page could not sign: {writes:?}");
+        assert!(![&r1, &r2].iter().any(|r| states(r, 1).contains(&WriteState::Published) || states(r, 2).contains(&WriteState::Published)), "{case}: published without a key");
+        // The first data write's claim (what `Session::writable` does).
+        let (container, _) = wire::delegate_from_code(SIGNER_CODE);
+        assert!(io.claim(container), "{case}: the claim was refused");
+        let mut st = settle(&mut io, &mut node, &mut now);
+        if io.needs_key() {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+            io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+            st.extend(settle(&mut io, &mut node, &mut now));
+        }
+        for _ in 0..100 {
+            if [1, 2].iter().all(|id| states(&st, *id).contains(&WriteState::Published)) { break; }
+            now += 500;
+            io.tick(Ms(now));
+            st.extend(settle(&mut io, &mut node, &mut now));
+        }
+        assert!([1, 2].iter().all(|id| states(&st, *id).contains(&WriteState::Published)), "{case}: the queue did not publish after provisioning: {:?}", io.unusable());
+        let heads = node.served.get("put register").copied().unwrap_or(0) + node.served.get("update").copied().unwrap_or(0);
+        assert_eq!(heads, 1, "{case}: {heads} head writes: the held queue was not ONE commit");
+        assert_eq!(node.head().map(|(s, _)| s), Some(1), "{case}: the head is not seq 1");
+    }
 }

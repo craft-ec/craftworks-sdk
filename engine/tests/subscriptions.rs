@@ -1061,35 +1061,33 @@ fn a_delta_across_a_vanished_root_asks_for_a_reload_and_a_get_still_does_not() {
     );
 
     // THE CONTROL. The same engine cannot answer this `Get` either, and it
-    // must still say so as a failure — otherwise `FullReloadRequired` is just
-    // what this engine says when anything goes wrong.
+    // must NOT say `FullReloadRequired` -- otherwise that is just what this
+    // engine says when anything goes wrong. A Get WAITS (rule 7): it is never
+    // answered while its blocks are NotFound, and the block stays awaited so
+    // the page keeps asking.
     let mut out = reader.step(Event::Get {
         client: c(1),
         req_id: engine::read::ReqId(2),
         key: b"a/0001".to_vec(),
     });
-    let mut guard = 0;
     let mut answer = None;
-    let mut i = 0;
-    while i < out.len() {
-        guard += 1;
-        assert!(guard < 10_000, "the get never settled");
-        match &out[i] {
-            Effect::FetchBlock { id, .. } => {
-                let id = *id;
-                i += 1;
-                let more = reader.step(Event::BlockMissed(id));
-                out.extend(more);
-                continue;
-            }
-            Effect::Reply { result, .. } => answer = Some(result.clone()),
-            _ => {}
+    let mut asked = None;
+    for _ in 0..16 {
+        let fetch = out.iter().find_map(|f| match f {
+            Effect::FetchBlock { id, .. } => Some(*id),
+            _ => None,
+        });
+        if let Some(r) = out.iter().find_map(|f| match f {
+            Effect::Reply { result, .. } => Some(result.clone()),
+            _ => None,
+        }) {
+            answer = Some(r);
         }
-        i += 1;
+        let Some(id) = fetch else { break };
+        asked = Some(id);
+        out = reader.step(Event::BlockMissed(id));
     }
-    assert!(
-        matches!(answer, Some(engine::read::ReadResult::Unavailable(_))),
-        "a Get that could not be answered said {answer:?} — the degraded \
-         answer is supposed to be specific to a DELTA"
-    );
+    assert_eq!(answer, None, "a Get whose blocks are NotFound was answered {answer:?}: the degraded answer is a DELTA's, and a Get waits");
+    let asked = asked.expect("the Get asked for a block");
+    assert!(reader.awaits_block(&asked), "the Get's block is no longer awaited: nothing would ask for it again");
 }

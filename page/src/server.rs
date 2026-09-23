@@ -437,7 +437,7 @@ impl Server {
             Effect::Reply { client, req_id, result } if *client == WALK_CLIENT => {
                 let how = match result {
                     engine::read::ReadResult::Page { .. } => Fetched::Loaded,
-                    engine::read::ReadResult::Unavailable(cid) => Fetched::Unavailable(format!("block {} could not be had", cid.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())),
+                    engine::read::ReadResult::Unavailable(cid) => Fetched::Unavailable(format!("block {} could not be had", engine::short_id(cid))),
                     engine::read::ReadResult::OutOfWarmSpace => Fetched::Unavailable("the read needs more than the warm bound holds".into()),
                     _ => Fetched::Unavailable("the engine answered a walk's fetch with something other than a page".into()),
                 };
@@ -966,6 +966,17 @@ impl Server {
                 protocol::Bound::Unbounded => B::Unbounded,
                 protocol::Bound::Included(k) => B::Included(k),
                 protocol::Bound::Excluded(k) => B::Excluded(k),
+            }
+        }
+        // A VIEW WRITES NOTHING, at the door (read-only has one owner, the
+        // page): its write is told `Failed` -- terminal, nothing applied --
+        // by name, and the engine never queues it.
+        if self.page.read_only() {
+            if let P::Write { write_id, .. } | P::Commit { write_id, .. } = &r {
+                let id = *write_id;
+                self.page.unusable.push(format!("read-only: write {id} refused at the door (a view writes nothing)"));
+                self.page.client_fx.push(Effect::Notify { client: self.speaker, write_id: as_write_id(id), state: State::Failed });
+                return Vec::new();
             }
         }
         let ev = match r {

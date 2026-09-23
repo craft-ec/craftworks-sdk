@@ -6,7 +6,8 @@
 //! layout hard-coded into apps could never change afterwards without breaking
 //! every one of them.
 
-use craftworks_sdk::{Db, MemStore, SystemEnv};
+use craftworks_sdk::{Db, SystemEnv};
+use testkit::MemStore;
 
 /// The key layout is `Db`'s, whatever store it reads through.
 type D = Db<MemStore, SystemEnv>;

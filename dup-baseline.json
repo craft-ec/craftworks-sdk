@@ -75,18 +75,6 @@
    "lines": 8
   },
   {
-   "key": "99ae7adc771324fa",
-   "a": "src/engine_store.rs:434-440",
-   "b": "src/writes.rs:143-149",
-   "lines": 7
-  },
-  {
-   "key": "f553360aabb008e5",
-   "a": "src/engine_store.rs:459-473",
-   "b": "src/store.rs:459-514",
-   "lines": 15
-  },
-  {
    "key": "fbed221ef6446351",
    "a": "src/expected.rs:309-314",
    "b": "src/expected.rs:296-301",
@@ -99,14 +87,14 @@
    "lines": 14
   },
   {
-   "key": "360a5624786fdc67",
-   "a": "src/store.rs:460-468",
-   "b": "src/tree_store.rs:501-510",
-   "lines": 9
+   "key": "d616e243ba42d99a",
+   "a": "src/tree_store.rs:263-272",
+   "b": "testkit/src/mem_store.rs:34-42",
+   "lines": 10
   },
   {
    "key": "891197a8a0f41647",
-   "a": "src/tree_store.rs:571-577",
+   "a": "src/tree_store.rs:333-339",
    "b": "engine/src/read.rs:386-391",
    "lines": 7
   },
@@ -130,8 +118,8 @@
   },
   {
    "key": "355e24afb3876de2",
-   "a": "wire/src/lib.rs:622-628",
-   "b": "wire/src/lib.rs:605-611",
+   "a": "wire/src/lib.rs:607-613",
+   "b": "wire/src/lib.rs:590-596",
    "lines": 7
   }
  ]

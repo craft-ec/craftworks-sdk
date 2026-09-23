@@ -12,3 +12,6 @@ description = "The SDK <-> engine protocol. Versioned from its first message, an
 # from it.
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 bincode = "1"
+
+[dev-dependencies]
+core-types = { path = "../core-types" }

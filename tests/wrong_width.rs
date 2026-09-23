@@ -16,6 +16,7 @@ use craftworks_sdk::engine_client::Client;
 use craftworks_sdk::id::{loc_from_hex, Loc};
 use craftworks_sdk::store::IdWidth;
 use craftworks_sdk::*;
+use testkit::MemStore;
 use instrument::{vocab::Key, Record as _};
 use serde_json::{json, Map, Value};
 

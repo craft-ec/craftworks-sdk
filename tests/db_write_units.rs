@@ -2,8 +2,9 @@
 //! every backend shares (moved from `outbox_multi_key.rs`, whose outbox went
 //! with R-b; the count still says what a write's size is).
 
-use craftworks_sdk::store::{Delta, Edit, MemStore, Read, Reads, Store};
+use craftworks_sdk::store::{Delta, Edit, Read, Reads, Store};
 use craftworks_sdk::{id::loc_from_hex, Db, SystemEnv};
+use testkit::MemStore;
 use serde_json::{json, Map, Value};
 
 

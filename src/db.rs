@@ -182,6 +182,14 @@ pub enum DbError {
     /// NOTHING WAS WRITTEN. Each reason has its own code, because each asks something
     /// different of the caller — wait, reload, split.
     WriteRefused(crate::store::Refused),
+    /// NOT DECIDED YET whether this session may write here: the node's
+    /// signer has not answered whose node it is (still asking, or silent --
+    /// rule 8: silence is not an answer). Nothing was written; the SAME call
+    /// made once the signer answers takes the answered branch. A caller
+    /// WAITS -- on the session's own wake, with no deadline -- never gives
+    /// up on it (`engine-db.js`, the one wait path it shares with
+    /// `QUEUE_FULL`).
+    NotDecided(String),
 }
 
 impl DbError {
@@ -202,6 +210,7 @@ impl DbError {
             DbError::TooLarge(_) => "TOO_LARGE",
             DbError::NotDefined(_) => "NOT_DEFINED",
             DbError::Refused(_) => "REFUSED",
+            DbError::NotDecided(_) => "NOT_DECIDED",
             DbError::WriteRefused(r) => match r {
                 crate::store::Refused::QueueFull { .. } => "QUEUE_FULL",
                 crate::store::Refused::TooLargeToSend { .. } => "TOO_LARGE_TO_SEND",
@@ -244,6 +253,7 @@ impl std::fmt::Display for DbError {
                 "the engine could not reach a block this read needed; the key may well exist",
             ),
             DbError::TooLarge(m) | DbError::NotDefined(m) | DbError::Refused(m) => f.write_str(m),
+            DbError::NotDecided(m) => write!(f, "not decided yet: {m}"),
             DbError::WriteRefused(r) => write!(f, "not written: {r}"),
         }
     }
@@ -293,11 +303,7 @@ impl DbError {
 pub type Result<T> = std::result::Result<T, DbError>;
 
 fn check_domain(d: &str) -> Result<()> {
-    let ok = !d.is_empty()
-        && d.len() <= MAX_DOMAIN
-        && d.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b));
-    if ok {
+    if core_types::name::domain_ok(d, MAX_DOMAIN) {
         Ok(())
     } else {
         Err(DbError::NotDefined(format!(
@@ -1134,14 +1140,14 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemStore;
+    use crate::tree_store::TreeStore;
 
     /// **An app's write is never forced** (sdk#235 ruling 1): a `Db` write
     /// carrying `Expect::Any` is REFUSED by name — a real refusal, not a
     /// debug assertion — and the store is never reached.
     #[test]
     fn a_db_write_carrying_any_is_refused_and_the_store_is_untouched() {
-        let mut d = Db::new(MemStore::default(), crate::id::SystemEnv, *b"dev1");
+        let mut d = Db::new(TreeStore::new(), crate::id::SystemEnv, *b"dev1");
         let key = b"\x01notes\x00k".to_vec();
         let e = d
             .write(vec![(key.clone(), Expect::Any)], vec![(key.clone(), Edit::Put(b"v".to_vec()))])
@@ -1208,7 +1214,7 @@ mod tests {
         assert!(e.to_string().contains(&MAX_KEY.to_string()), "{e}");
         // The longest legal key is accepted — so the refusal is the length and
         // not the screen refusing everything.
-        let mut d = Db::new(MemStore::default(), crate::id::SystemEnv, *b"dev1");
+        let mut d = Db::new(TreeStore::new(), crate::id::SystemEnv, *b"dev1");
         d.write(vec![(vec![b'k'; MAX_KEY], protocol::Expect::Absent)], vec![(vec![b'k'; MAX_KEY], Edit::Put(b"v".to_vec()))])
             .unwrap();
     }

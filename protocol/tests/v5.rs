@@ -8,7 +8,7 @@ use protocol::*;
 const S: u64 = 0x0000_1234_5678_9abc;
 
 fn hex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+    core_types::hex::decode(s).expect("hex")
 }
 
 fn ack() -> Ack {

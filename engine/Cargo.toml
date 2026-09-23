@@ -7,6 +7,7 @@ publish = false
 description = "The write pipeline as a pure state machine: no I/O, no clock, no randomness."
 
 [dependencies]
+core-types = { path = "../core-types" }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
 # The context is a wire format: it leaves this process and comes back. serde
 # gives it a decoder that REFUSES malformed bytes instead of trusting them,

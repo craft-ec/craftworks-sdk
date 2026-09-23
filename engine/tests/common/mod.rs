@@ -310,6 +310,24 @@ impl Harness {
 ///
 /// Built by driving a real engine, so the fixture is the tree this code
 /// actually writes rather than one a second builder agrees it should be.
+/// Put every internal node's PARITY on the network too, as a writer's race put does (rule 10): a fixture read with
+/// racing on (sdk#303) then asks real groups, not ids the network never had.
+#[allow(dead_code)]
+pub fn publish_parity(root: Cid, all: &mut MemBlocks) {
+    let mut at = vec![root];
+    while let Some(id) = at.pop() {
+        let bytes = all.get(&id).expect("a tree block").to_vec();
+        let Ok(n) = freenet_prolly::node::Node::parse(&bytes) else { continue };
+        // A leaf's groups are its values stored by reference.
+        for (pid, pb) in freenet_prolly::parity::blocks_of(&n, &*all).expect("every member held") {
+            all.insert(pid, &pb);
+        }
+        if !n.is_leaf() {
+            at.extend((0..n.len()).map(|i| n.child(i).0));
+        }
+    }
+}
+
 pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
     // The writer gets a store of ITS OWN. Sharing the thread's store would put
     // the whole tree where the reader can see it, and every "cold" read below

@@ -297,9 +297,3 @@ pub fn record_of(state: &[u8]) -> Option<(u64, &[u8])> {
     }
     Some((seq, rest.get(..vlen)?))
 }
-
-/// The head a Register record names, tolerantly: `(seq, root, the whole value)`.
-pub fn head_of_record(state: &[u8]) -> Option<(u64, HeadValue, &[u8])> {
-    let (seq, v) = record_of(state)?;
-    Some((seq, read_value(v)?, v))
-}

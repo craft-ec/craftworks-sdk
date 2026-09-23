@@ -77,9 +77,14 @@ pub const READ_ONLY: &str = "read-only: this is a view of somebody's published d
 pub enum MayWrite {
     Yes,
     No(String),
-    /// Cannot be known now (the signer not answered yet, not answering, or
-    /// refused to say): inputs are shown DISABLED, with this reason.
+    /// The signer ANSWERED and did not say yes or no for this head (it
+    /// refused to say, or refused the provisioning): inputs are shown
+    /// DISABLED, with this reason.
     Unknown(String),
+    /// NOT DECIDED YET: the signer has not answered (still asking, or silent
+    /// -- rule 8, silence is not an answer). A write WAITS for the answer;
+    /// inputs are shown disabled meanwhile, with this reason.
+    Undecided(String),
 }
 
 /// The head subscription as page-io can honestly report it (sdk#259).
@@ -197,9 +202,6 @@ pub struct PageIo {
     /// The app's PUTs by contract key: the exact contract and state, framed
     /// again whenever the page re-sends [`Op::PutApp`].
     app_contracts: BTreeMap<String, (ContractContainer, WrappedState)>,
-    /// A READER of a NAMED head ([`PageIo::reader`], sdk#239): no signer, so
-    /// nothing is signed, PUT or updated, and nothing is installed on the node.
-    read_only: bool,
     /// The last time the node or the clock spoke, for answers made locally.
     now: Ms,
     /// A reader's stream-id range (`reader`), in the top byte; 0 for the
@@ -328,7 +330,6 @@ impl PageIo {
             head_failed_pending: false,
             others: Vec::new(),
             app_contracts: BTreeMap::new(),
-            read_only: false,
             now: Ms(0),
             stream_base: 0,
             needs_key: false,
@@ -374,7 +375,7 @@ impl PageIo {
         );
         io.register_id = register_id;
         io.register_key = wire::contract_id(register_id).to_string();
-        io.read_only = true;
+        io.server.page.set_read_only();
         io.stream_base = u32::from(range.max(1)) << 24;
         io.provisioned = true;
         // "The head exists": a failed read of it is silence, and the signer
@@ -419,13 +420,13 @@ impl PageIo {
     /// inputs. "Yes" means THIS NODE'S SIGNER SIGNS FOR that head; a keyset
     /// (a device key among an identity's keys) is Phase 6.
     pub fn may_write(&self, head: Option<[u8; 32]>) -> MayWrite {
-        if self.read_only {
+        if self.read_only() {
             return MayWrite::No(READ_ONLY.into());
         }
         let other = |r: &[u8; 32]| MayWrite::No(format!("this node signs for another head ({})", hex(r)));
         if self.asking() {
             return match (&self.asked, head) {
-                (None, _) => MayWrite::Unknown("asking this node's signer whose node it is".into()),
+                (None, _) => MayWrite::Undecided("asking this node's signer whose node it is".into()),
                 (Some(Asked::Register(_)), None) => MayWrite::Yes,
                 (Some(Asked::Register(r)), Some(h)) if h == *r => MayWrite::Yes,
                 (Some(Asked::Register(r)), Some(_)) => other(r),
@@ -436,14 +437,14 @@ impl PageIo {
                 (Some(Asked::NoKey | Asked::NoSigner(_)), Some(_)) => MayWrite::No("this node holds no key for that head".into()),
                 (Some(Asked::Refused(w)), None) => MayWrite::Unknown(w.clone()),
                 (Some(Asked::Refused(w)), Some(_)) => MayWrite::No(w.clone()),
-                (Some(Asked::NotAnswering), _) => MayWrite::Unknown("this node's signer is not answering".into()),
+                (Some(Asked::NotAnswering), _) => MayWrite::Undecided("this node's signer is not answering".into()),
             };
         }
         if let Some(r) = self.refused.as_ref() {
             return if head.is_none() { MayWrite::Unknown(r.clone()) } else { MayWrite::No(r.clone()) };
         }
         if self.exhausted {
-            return MayWrite::Unknown("this node's signer is not answering".into());
+            return MayWrite::Undecided("this node's signer is not answering".into());
         }
         if self.provisioned {
             return match head {
@@ -456,13 +457,23 @@ impl PageIo {
         // head, as it always has; another head is not known to be ours yet.
         match head {
             None => MayWrite::Yes,
-            Some(_) => MayWrite::Unknown("opening: this node's signer has not said whose node it is yet".into()),
+            Some(_) => MayWrite::Undecided("opening: this node's signer has not said whose node it is yet".into()),
         }
     }
 
     /// Was this page only asked (`ask`), and not (yet) claimed?
     pub fn asking(&self) -> bool {
         self.asking && !self.claimed
+    }
+
+    /// THE USER HAS NO TREE HERE YET (DATA-SOURCE `mine`: made on the first
+    /// WRITE): an asked page whose node's signer holds no key, or has no
+    /// signer, and which has not been provisioned. Its tree reads as EMPTY --
+    /// its head read is answered "missing" here, and nothing goes to the node
+    /// -- until a first write provisions it ([`PageIo::claim`], then the
+    /// existing provision path).
+    pub fn no_tree_yet(&self) -> bool {
+        self.asking && !self.provisioned && matches!(self.asked, Some(Asked::NoKey | Asked::NoSigner(_)))
     }
 
     /// OPEN THE PERSON'S OWN TREE ON AN ASKED PAGE (DATA-SOURCE `mine`):
@@ -595,7 +606,8 @@ impl PageIo {
 
     /// A reader of a named head (`reader`): nothing can be written.
     pub fn read_only(&self) -> bool {
-        self.read_only
+        // THE PAGE's: the one owner of "read-only" (it makes no commit op).
+        self.server.page.read_only()
     }
 
     /// PUT a contract the APP names (builder#104: a web container). Framed
@@ -604,7 +616,7 @@ impl PageIo {
     /// would be reassembled into each other. The answer comes back through
     /// [`PageIo::take_others`], named by the contract's key.
     pub fn put_contract(&mut self, contract: ContractContainer, state: WrappedState, now: Ms) -> Result<(), String> {
-        if self.read_only {
+        if self.read_only() {
             return Err("read-only: a reader PUTs nothing".into());
         }
         let key = contract.key().to_string();
@@ -632,7 +644,7 @@ impl PageIo {
     /// signer answers `Provisioned`.
     pub fn provision(&mut self, signer: DelegateContainer, signing_key: Vec<u8>) {
         // A READER installs nothing on the node it reads from (sdk#239).
-        if self.read_only {
+        if self.read_only() {
             self.unusable.push("read-only: provisioning refused — a reader installs nothing".into());
             return;
         }
@@ -668,10 +680,25 @@ impl PageIo {
 
     /// Tell the server what the signer holds, once it is provisioned.
     pub fn signer_provisioned(&mut self) {
-        if self.read_only {
+        if self.read_only() {
             return;
         }
         self.server.set_facts(SignerFacts { head_writable: true, head_id: self.register_id });
+        // The user's own tree was NOT yet theirs to sign (`no_tree_yet`)
+        // and now is: the queue held while it could not sign is cut, as ONE
+        // commit.
+        if self.asking && matches!(self.asked, Some(Asked::NoKey | Asked::NoSigner(_))) {
+            self.step_can_sign();
+        }
+    }
+
+    /// Tell the engine whether this page can SIGN its head now
+    /// (`engine::Event::CanSign`): derived from the ONE signer decision at
+    /// each of its changes -- the answer "no key here" / "no signer here"
+    /// (it cannot), and that tree's provisioning (it can). Kept nowhere else.
+    fn step_can_sign(&mut self) {
+        let can = !self.no_tree_yet();
+        self.server.page.event(engine::Event::CanSign(can));
     }
 
     /// A client protocol frame (what `sdk::Client` would have sent a delegate).
@@ -766,6 +793,7 @@ impl PageIo {
                         // delegate answers its request EMPTY — another user's node.
                         if self.asking() {
                             self.asked = Some(Asked::NoSigner(format!("no signer on this node: it answered EMPTY {} times", self.first_empties)));
+                            self.step_can_sign();
                         }
                     }
                 }
@@ -806,6 +834,7 @@ impl PageIo {
                                 }
                                 None => Asked::NoKey,
                             });
+                            self.step_can_sign();
                         }
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => match params {
                             Some(params) => {
@@ -898,11 +927,11 @@ impl PageIo {
         let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k);
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id } => mine(id),
-            Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only,
+            Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             Incoming::HeadChanged { key } => *key == self.register_key,
             Incoming::Partial => true,
-            Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::Refused(_) | Incoming::Unusable(_) => !self.read_only,
+            Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::Refused(_) | Incoming::Unusable(_) => !self.read_only(),
         }
     }
 
@@ -1040,18 +1069,32 @@ impl PageIo {
     fn pump(&mut self) {
         self.replies.extend(self.server.take_replies());
         let mut not_held = Vec::new();
+        let mut not_sent = Vec::new();
+        let mut no_head = false;
         for op in self.server.take_ops() {
-            if self.read_only {
+            // No tree yet: there is no head to read, and asking the node for
+            // one would name a Register nobody has made. Answered here.
+            if matches!(op, Op::ReadHead) && self.no_tree_yet() {
+                no_head = true;
+                continue;
+            }
+            if self.read_only() {
                 match op {
                     Op::AskHeld { id } => {
                         not_held.push(id);
                         continue;
                     }
-                    Op::Put { .. } | Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
-                        self.unusable.push(format!("read-only: a {} was not sent", op_name(&op)));
+                    // A view's page makes no commit op; one that arrives is
+                    // REFUSED BY NAME and handed back as the op's answer --
+                    // loud, and ended: nothing waits on a frame never sent.
+                    Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } => {
+                        let why = format!("read-only: a {} is never sent from a view", op_name(&op));
+                        self.unusable.push(why.clone());
+                        not_sent.push((op, why));
                         continue;
                     }
-                    Op::Get { .. } | Op::ReadHead => {}
+                    // A repair PUT (the only PUT a view's page makes), reads.
+                    Op::Put { .. } | Op::Get { .. } | Op::ReadHead => {}
                 }
             }
             let stream = self.next_stream();
@@ -1107,10 +1150,22 @@ impl PageIo {
                 Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
             }
         }
-        if !not_held.is_empty() {
+        if !not_held.is_empty() || !not_sent.is_empty() || no_head {
             let now = self.now;
             for id in not_held {
                 self.server.node(Answer::Held { id, present: false }, now);
+            }
+            for (op, why) in not_sent {
+                // An app's PUT has its refusal already (`AppPutRefused`); the
+                // commit ops a view never makes have none, so `NotSent`.
+                let answer = match op {
+                    Op::PutApp { key } => Answer::AppPutRefused { key, said: why },
+                    op => Answer::NotSent { op, why },
+                };
+                self.server.node(answer, now);
+            }
+            if no_head {
+                self.server.node(Answer::Head(None), now);
             }
             self.pump();
         }
@@ -1129,6 +1184,4 @@ fn op_name(op: &Op) -> &'static str {
     }
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
+use core_types::hex::encode as hex;

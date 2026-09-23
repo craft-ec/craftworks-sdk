@@ -76,7 +76,12 @@ await t("**db.other(app) READS through `@app/name` and never WRITES — the node
     await assert.rejects(() => other[w]("notes", {}), e => e.code === "REFUSED" && /another app's data/.test(e.message), `${w} was not refused by name`);
   }
   assert.equal(calls.length, 2, `a refused write reached the session: ${JSON.stringify(calls.slice(2))}`);
-  assert.throws(() => engineDb(session).other("Has.Dot"), /not an app id/);
+  // A bad app id is refused where every name is: the session's `app::read`
+  // (tests/app_namespace.rs: "@BAD/notes" is refused). The db writes no second
+  // copy of the rule; it hands the name over as given.
+  calls.length = 0;
+  await engineDb(session).other("Has.Dot").scan("notes");
+  assert.deepEqual(calls.map(c => c.slice(0, 2)), [["scan", "@Has.Dot/notes"]], "the db decided the app id itself instead of the session");
 });
 
 await t("the IN-MEMORY db has the same other(), and says it holds only this app's data — never an empty answer", async () => {
@@ -97,12 +102,14 @@ await t("**the in-tab db holds the SAME name rule as a Session: 32 is a name, 33
   assert.equal((await db.scan(ok)).length, 1, "THE CONTROL: a 32-character name writes and scans");
   await assert.rejects(() => db.define(long, schema), e => e.message.includes(`domain \`${long}\` must be 1–32`), "a 33-character name was not refused in the node's words");
   // And a Session with an app at the LONGEST id: its longest name passes the
-  // name rule and reaches the store — which, holding nothing loaded, answers
-  // NOT_LOADED. That answer is the proof: a name refusal comes first.
+  // name rule and goes on to the next question -- a session on no node yet is
+  // NOT_DECIDED (#342: whether it may write is not known, and it waits), one
+  // holding nothing loaded answers NOT_LOADED. Either answer is the proof: a
+  // name refusal comes first.
   const s = new Session(7999);
   s.set_app("a".repeat(32));
   const got = (() => { try { s.define(ok, JSON.stringify(schema)); return null; } catch (e) { return e; } })();
-  assert.ok(!got || got.code === "NOT_LOADED", `a 32-character name at a 32-character app id was refused: ${JSON.stringify(got)}`);
+  assert.ok(!got || got.code === "NOT_LOADED" || got.code === "NOT_DECIDED", `a 32-character name at a 32-character app id was refused: ${JSON.stringify(got)}`);
   const past = (() => { try { s.define(long, JSON.stringify(schema)); return null; } catch (e) { return e; } })();
   assert.ok(past && /domain `n{33}` must be 1–32/.test(past.message), `a 33-character name was not refused in the node's words: ${JSON.stringify(past)}`);
   assert.ok(!past.message.includes("aaaa."), `the refusal names the PREFIXED name: ${past.message}`);

@@ -74,7 +74,6 @@ use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 
 pub mod block;
-pub mod provision;
 pub mod puts;
 pub mod signer;
 pub mod webapp;
@@ -82,7 +81,6 @@ pub mod reassemble;
 /// The delegate's identity, so a caller can hold one without depending on
 /// freenet itself. Opaque everywhere outside this crate.
 pub use freenet_stdlib::prelude::DelegateKey;
-pub use provision::{Did, Provisioned, Step};
 pub use reassemble::Reassembler;
 
 /// The largest single frame this build will decode before looking inside.
@@ -302,19 +300,6 @@ pub fn contract_id(bytes: [u8; 32]) -> ContractInstanceId {
     ContractInstanceId::new(bytes)
 }
 
-/// Frame a client-API subscription to a contract.
-///
-/// This is the notifier that reaches a connection which made no write: an
-/// engine-originated push returns to whoever invoked the delegate, so it
-/// cannot (F40).
-pub fn frame_subscribe(id: ContractInstanceId, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
-    let req = ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Subscribe {
-        key: id,
-        summary: None,
-    });
-    frames(&req, stream_id)
-}
-
 /// Frame a contract PUT.
 pub fn frame_put(
     contract: ContractContainer,
@@ -382,7 +367,7 @@ pub fn delegate_from_code(wasm: &[u8]) -> (DelegateContainer, DelegateKey) {
 /// by hand in the live driver and would have been written out again in the
 /// page; a second copy is a silent fork of an id.
 pub fn register_params(verifying_key: &[u8; 32], name: &[u8]) -> Vec<u8> {
-    let mut p = Vec::from(*b"RG01");
+    let mut p = Vec::from(*signer_proto::head::RECORD_MAGIC);
     p.push(0u8);
     p.extend_from_slice(verifying_key);
     p.extend_from_slice(name);
