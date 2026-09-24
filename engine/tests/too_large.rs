@@ -243,10 +243,7 @@ fn a_too_large_refusal_leaves_the_whole_context_byte_identical() {
             "{label}: a refused write put something on the network"
         );
         assert_eq!(e.root(), root, "{label}: the tree moved");
-        assert!(
-            common::fingerprint(&e) == before,
-            "{label}: the refusal changed the engine's state"
-        );
+        assert_eq!(common::fingerprint(&e), before, "{label}: the refusal changed the engine's state");
     }
 }
 
