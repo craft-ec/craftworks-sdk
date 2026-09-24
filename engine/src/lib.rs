@@ -277,6 +277,10 @@ pub enum Event {
         /// key outside its reads is refused at the door as `Unread`; a forced
         /// write says so per key with [`Expect::Any`] ([`Event::forced_write`]).
         reads: Vec<(Vec<u8>, Expect)>,
+        /// Commit only IN COMPANY (sdk#350): held, `Accepted`, until the queue
+        /// holds a non-deferred write that is applied; then it rides that
+        /// write's cut. Never committed alone ([`Event::deferred`]).
+        deferred: bool,
     },
     /// A block was READ BACK from our own node. Never an ack: W1 says an
     /// acknowledgement is not evidence the block is there.
@@ -412,7 +416,16 @@ impl Event {
     /// an implicit reads-less write (which the engine refuses as `Unread`).
     pub fn forced_write(client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, Op)>) -> Event {
         let reads = ops.iter().map(|(k, _)| (k.clone(), Expect::Any)).collect();
-        Event::Write { client, write_id, ops, reads }
+        Event::Write { client, write_id, ops, reads, deferred: false }
+    }
+
+    /// The same write, DEFERRED: it commits only in company (sdk#350). Any
+    /// other event is returned as it is.
+    pub fn deferred(self) -> Event {
+        match self {
+            Event::Write { client, write_id, ops, reads, .. } => Event::Write { client, write_id, ops, reads, deferred: true },
+            other => other,
+        }
     }
 }
 
@@ -986,6 +999,16 @@ struct Queued {
     /// ledger records as this page's `through`, the witness that a group
     /// landed.
     arrival: u64,
+    /// Commits only in company (sdk#350): see [`Event::Write`].
+    deferred: bool,
+}
+
+impl Queued {
+    /// UNSAVED: taken and not yet published, except a DEFERRED write no cut
+    /// has taken (sdk#350) -- THE one statement of it.
+    fn is_unsaved(&self) -> bool {
+        !(self.deferred && !self.committing)
+    }
 }
 
 /// A write whose apply stopped on a block the node does not hold.
@@ -1044,6 +1067,12 @@ struct Commit {
     root: Cid,
     /// Pack and block ids this commit must land before its head may move.
     data: BTreeSet<Cid>,
+    /// The root's parity ids (sdk#335), for its head's ledger. In the page's
+    /// memory, not the context (nothing rehydrates in production): a
+    /// rehydrated commit signs an EMPTY list, and its root is then fetched
+    /// singly, as before.
+    #[serde(skip)]
+    root_parity: Vec<Cid>,
     /// The pack bodies, for THIS call only.
     ///
     /// A pack is never carried in the context — it is the largest thing the
@@ -1084,8 +1113,17 @@ struct Commit {
     pack_members: BTreeMap<Cid, Vec<Cid>>,
 }
 
+/// The ROOT's parity blocks for a commit that emitted `root` (sdk#335): its
+/// group of one, coded by [`repair::root_parity`]. None when the commit did not
+/// emit the root. The one derivation, for a commit's first send and for a
+/// re-put from its carried ops alike.
+fn root_parity_blocks(root: Cid, emitted: &[(Cid, Vec<u8>)]) -> Vec<(Cid, Vec<u8>)> {
+    emitted.iter().find(|(id, _)| *id == root).and_then(|(_, bytes)| repair::root_parity(bytes)).unwrap_or_default()
+}
+
 /// RACE PUT's accounting for one commit (COMMIT-LIFE §P): the blocks that
-/// must be acked whatever (the root: no group can rebuild it), and each
+/// must be acked whatever (anything in no group: a root coded without
+/// parity), and each
 /// changed group's count toward k.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Race {
@@ -1115,9 +1153,11 @@ struct RaceGroup {
 impl Race {
     /// The accounting for a commit putting `data` (its new blocks) and
     /// `parity` (its coded parity). Groups are read from the NODES being put
-    /// (the format states the grouping); a block in no group -- the root, or
-    /// anything not found -- must be acked itself.
-    fn of(data: &[(Cid, Vec<u8>)], parity: &[(Cid, Vec<u8>)], unacked: &BTreeSet<Cid>) -> Race {
+    /// (the format states the grouping), and the ROOT is a group of one with
+    /// `root.1` its parity (sdk#335: any 1 of its 1 + m); a block in no group
+    /// -- a root coded without parity, or anything not found -- must be acked
+    /// itself.
+    fn of(data: &[(Cid, Vec<u8>)], parity: &[(Cid, Vec<u8>)], unacked: &BTreeSet<Cid>, root: (Cid, &[Cid])) -> Race {
         let new_ids: BTreeSet<Cid> = data.iter().chain(parity).map(|(c, _)| *c).collect();
         let mut covered: BTreeSet<Cid> = BTreeSet::new();
         let mut groups = Vec::new();
@@ -1136,6 +1176,12 @@ impl Race {
                 covered.extend(new.iter().copied());
                 groups.push(RaceGroup { k, present, earlier, new });
             }
+        }
+        let (root, root_parity) = root;
+        if !root_parity.is_empty() && new_ids.contains(&root) {
+            let new: Vec<Cid> = std::iter::once(root).chain(root_parity.iter().copied()).collect();
+            covered.extend(new.iter().copied());
+            groups.push(RaceGroup { k: 1, present: 0, earlier: Vec::new(), new });
         }
         let must = new_ids.into_iter().filter(|c| !covered.contains(c)).collect();
         Race { must, groups }
@@ -1382,8 +1428,13 @@ pub struct Engine<B: Blocks> {
     /// that a dead commit's group LANDED (COMMIT-LIFE ⁵). Consumed by that
     /// step.
     witness: Option<Witness>,
-    /// The next adopted head's §P mark (see [`Engine::set_head_marked`]).
-    head_marked: bool,
+    /// The next adopted head's §P mark and root parity (see
+    /// [`Engine::set_head_mark`]).
+    head_mark: Option<Vec<Cid>>,
+    /// Each known root's parity ids (sdk#335): what makes a root a group of
+    /// one for a read. Kept for the published root and the roots reads are
+    /// pinned to, nothing else.
+    root_parity: BTreeMap<Cid, Vec<Cid>>,
     /// Writes that ended in THIS step with keys a later write may have read:
     /// a later write's conflict on one of those keys names it as `after`
     /// (footnote 3). Cleared at the end of every step, like `arrived`.
@@ -1541,7 +1592,8 @@ impl<B: Blocks> Engine<B> {
             cut_held: false,
             cut_until: None,
             witness: None,
-            head_marked: false,
+            head_mark: None,
+            root_parity: BTreeMap::new(),
             cascade: Vec::new(),
             forced_lost: 0,
             tries_spent_lost: 0,
@@ -1630,6 +1682,31 @@ impl<B: Blocks> Engine<B> {
     /// Writes in the page's queue (R-b): `Applying`, `Queued` or `Committing`.
     pub fn queued_writes(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Writes taken and not yet published -- WHAT IS UNSAVED, its one owner
+    /// (sdk#350): every queued write but a DEFERRED one still held (a define
+    /// no commit has taken is nothing the person made; it is unsaved only
+    /// once a cut carries it).
+    pub fn unsaved_writes(&self) -> usize {
+        self.queue.iter().filter(|q| q.is_unsaved()).count()
+    }
+
+    /// The client of every UNSAVED write ([`Engine::unsaved_writes`]'s rule,
+    /// per write): what a session counts as its own unsaved writes -- the
+    /// unsaved-changes guard and "saving N…" -- so a held define never makes
+    /// a viewer's close say "unsaved changes" (sdk#350).
+    pub fn unsaved_clients(&self) -> impl Iterator<Item = ClientId> + '_ {
+        self.queue.iter().filter(|q| q.is_unsaved()).map(|q| q.client)
+    }
+
+    /// May a commit be cut (sdk#350)? Only with a NON-deferred write applied
+    /// in the queue: judged on the queue, not per cut piece, so a byte-limit
+    /// split whose first piece is defines only still goes. A non-deferred
+    /// write still applying does not count -- it may yet be refused, and a
+    /// define must never commit alone.
+    fn in_company(&self) -> bool {
+        self.queue.iter().any(|q| !q.deferred && q.warm_after.is_some())
     }
 
     /// Every write in the queue, in order, with its stage (R-b).
@@ -1750,11 +1827,24 @@ impl<B: Blocks> Engine<B> {
         self.witness = witness;
     }
 
-    /// Does the head about to be adopted carry race put's §P mark (every group
-    /// it lists was recoverable when signed)? Told by the shell before the
-    /// step, like the witness; read once by `adopt`.
-    pub fn set_head_marked(&mut self, marked: bool) {
-        self.head_marked = marked;
+    /// The head about to be adopted: does it carry race put's §P mark (every
+    /// group it lists was recoverable when signed), and its ROOT's parity ids
+    /// (sdk#335; empty when the mark lists none)? `None`: unmarked. Told by
+    /// the shell before the step, like the witness; read once by `adopt`.
+    pub fn set_head_mark(&mut self, mark: Option<Vec<Cid>>) {
+        self.head_mark = mark;
+    }
+
+    /// The ROOT's parity ids for a head naming `root` (sdk#335): the root is
+    /// a group of ONE, coded like any group (k = 1, [`PARITY`] parity), and
+    /// its ids ride in the head's ledger, signed with it -- the one place a
+    /// reader of that head learns them. The commit in flight's, or a known
+    /// root's; empty for a root this engine did not code or learn.
+    pub fn root_parity_of(&self, root: &Cid) -> Vec<Cid> {
+        match &self.pending {
+            Some(c) if c.root == *root => c.root_parity.clone(),
+            _ => self.root_parity.get(root).cloned().unwrap_or_default(),
+        }
     }
 
     /// The last arrival number of the commit in flight: what its head's
@@ -1799,7 +1889,9 @@ impl<B: Blocks> Engine<B> {
         for (n, (write_id, ops, reads)) in writes.into_iter().enumerate() {
             let size = ops.iter().map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 }).sum::<usize>()
                 + reads.iter().map(|(k, _)| k.len() + 33).sum::<usize>();
-            self.queue.insert(at + n, Queued { client, write_id, ops, reads, size, tries: 0, told_accepted: true, warm_after: None, committing: false, arrival: 0 });
+            // Never deferred (sdk#350): a displaced group was cut, so it was
+            // already in company, and it must land again on its own.
+            self.queue.insert(at + n, Queued { client, write_id, ops, reads, size, tries: 0, told_accepted: true, warm_after: None, committing: false, arrival: 0, deferred: false });
         }
         for q in self.queue.iter_mut().skip(at) {
             q.arrival = self.next_arrival;
@@ -1977,7 +2069,8 @@ impl<B: Blocks> Engine<B> {
                 write_id,
                 ops,
                 reads,
-            } => self.on_write(client, write_id, ops, reads),
+                deferred,
+            } => self.on_write(client, write_id, ops, reads, deferred),
             Event::PutConfirmed(id) => self.on_confirmed(id),
             Event::PutFailed(id) => self.on_failed(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
@@ -2262,7 +2355,11 @@ impl<B: Blocks> Engine<B> {
         // known in full (it lists none); a head carrying race put's §P mark
         // had every group it lists recoverable when it was signed
         // (COMMIT-LIFE §P); anything else is pre-§P, and NotScanned.
-        let marked = std::mem::take(&mut self.head_marked);
+        let mark = self.head_mark.take();
+        let marked = mark.is_some();
+        if let Some(ids) = mark.filter(|ids| !ids.is_empty()) {
+            self.root_parity.insert(root, ids);
+        }
         self.parity_scan = if root == self.empty.cid || marked {
             ParityScan::Done { root }
         } else {
@@ -2271,8 +2368,24 @@ impl<B: Blocks> Engine<B> {
         self.published_seq = seq;
         self.next_seq = seq + 1;
         let mut out = self.supersede(was, root);
+        self.keep_root_parity();
         out.extend(self.notify_subs(was));
         out
+    }
+
+    /// Forget the parity of roots nobody stands on: kept for the published
+    /// root and every root a parked read is pinned to.
+    fn keep_root_parity(&mut self) {
+        let keep: BTreeSet<Cid> = std::iter::once(self.published_root).chain(self.reads.parked.values().map(|p| p.root)).collect();
+        self.root_parity.retain(|r, _| keep.contains(r));
+    }
+
+    /// The group `id` is rebuilt from under `root`: its sibling group in a
+    /// held node, or -- `id` BEING the root -- the root's group of one
+    /// (sdk#335), when its parity is known.
+    pub(crate) fn group_for(&self, root: Cid, id: Cid) -> Option<repair::Group> {
+        repair::find_group(&self.source(), root, id)
+            .or_else(|| (id == root).then(|| self.root_parity.get(&root)).flatten().map(|p| repair::root_group(root, p)))
     }
 
     /// Tell every subscriber whose range a root move touched.
@@ -2694,6 +2807,7 @@ impl<B: Blocks> Engine<B> {
         write_id: WriteId,
         ops: Vec<(Vec<u8>, Op)>,
         reads: Vec<(Vec<u8>, Expect)>,
+        deferred: bool,
     ) -> Vec<Effect> {
         let tries = self.next_tries.take().unwrap_or(0);
         // AT THE DOOR (sdk#235, W8): a write names what it read. SYNTACTIC —
@@ -2756,6 +2870,7 @@ impl<B: Blocks> Engine<B> {
             warm_after: None,
             committing: false,
             arrival: self.next_arrival,
+            deferred,
         });
         self.next_arrival += 1;
         let mut out = Vec::new();
@@ -2797,9 +2912,10 @@ impl<B: Blocks> Engine<B> {
                     moved |= applied_or_gone;
                 }
             }
-            // THE GATE: no commit is cut while this page cannot sign; the
-            // writes keep applying to the warm root above.
-            if self.can_sign {
+            // THE GATE: no commit is cut while this page cannot sign, nor while
+            // nothing but DEFERRED writes is ready (sdk#350: they commit only
+            // in company); the writes keep applying to the warm root above.
+            if self.can_sign && self.in_company() {
                 let (fx, popped) = self.commit_front();
                 out.extend(fx);
                 moved |= popped;
@@ -3386,7 +3502,15 @@ impl<B: Blocks> Engine<B> {
         parity: Vec<(Cid, Vec<u8>)>,
         ops: Option<Vec<(Vec<u8>, Op)>>,
     ) -> Vec<Effect> {
-        let race = Race::of(&emitted, &parity, &self.unacked());
+        // THE ROOT IS A GROUP OF ONE (sdk#335): its parity is coded here, put
+        // in the same round as everything else, counted by the race like any
+        // group (any 1 of its 1 + m), and listed in the head. A root this
+        // commit did not emit (none new) has none.
+        let mut parity = parity;
+        let blocks = root_parity_blocks(self.root, &emitted);
+        let root_parity: Vec<Cid> = blocks.iter().map(|(id, _)| *id).collect();
+        parity.extend(blocks);
+        let race = Race::of(&emitted, &parity, &self.unacked(), (self.root, &root_parity));
         let seq = self.next_seq;
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
@@ -3515,6 +3639,7 @@ impl<B: Blocks> Engine<B> {
             through: 0,
             race,
             pack_members,
+            root_parity,
         });
         out
     }
@@ -3597,9 +3722,11 @@ impl<B: Blocks> Engine<B> {
             // round as the data), so a re-put from the carried ops re-derives
             // it from the same apply -- or the commit could never be
             // recoverable again after its puts were lost.
+            // The ROOT's parity (sdk#335) is re-derived the same way.
             Ok(a) if a.root == root => Some(
-                emitted
+                root_parity_blocks(root, &emitted)
                     .into_iter()
+                    .chain(emitted)
                     .chain(a.parity.iter().cloned())
                     .filter(|(id, _)| missing.contains(id))
                     .map(|(id, bytes)| Effect::PutBlock {
@@ -3729,6 +3856,10 @@ impl<B: Blocks> Engine<B> {
             let src = self.source();
             for n in &removed {
                 gone.insert(*n);
+                // The ROOT's parity (sdk#335) is listed in its head, not a node.
+                if let Some(p) = self.root_parity.get(n) {
+                    gone.extend(p.iter().copied());
+                }
                 if let Some(bytes) = src.get(n) {
                     if let Ok(node) = Node::parse(bytes) {
                         if !node.is_leaf() {
@@ -3903,7 +4034,11 @@ impl<B: Blocks> Engine<B> {
         // SUPERSEDED stragglers first: this commit may re-code a group an
         // earlier one is still putting; those old blocks are withdrawn and the
         // earlier writes are carried onto THIS commit's Backing.
+        if !c.root_parity.is_empty() {
+            self.root_parity.insert(c.root, c.root_parity.clone());
+        }
         out.extend(self.supersede(was, c.root));
+        self.keep_root_parity();
         let still_out = self.unacked();
         let mut remaining: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
         remaining.extend(c.race.groups.iter().flat_map(|g| g.earlier.iter()).filter(|m| still_out.contains(*m)).copied());
@@ -4399,7 +4534,7 @@ impl<B: Blocks> Engine<B> {
         // verified rebuild lands exactly like an arrival.
         if self.params.repair_reads && !self.repairs.contains_key(&id) {
             let roots: Vec<Cid> = reqs.iter().filter_map(|r| self.reads.parked.get(r).map(|p| p.root)).collect();
-            let group = roots.into_iter().find_map(|root| repair::find_group(&self.source(), root, id));
+            let group = roots.into_iter().find_map(|root| self.group_for(root, id));
             if let Some(group) = group {
                 out.extend(self.start_repair(group, true));
             }

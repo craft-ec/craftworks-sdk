@@ -81,7 +81,7 @@ fn spread(xs: &[u64]) -> String {
 /// something, that is a regression this catches, and an assertion says so
 /// better than a baseline file would.
 #[test]
-fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_eight() {
+fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_its_named_mix() {
     let node = PageNode::new();
     let mut c = node.connect();
     c.client(&Request::Identity);
@@ -195,24 +195,26 @@ holding them — both are worth knowing.",
         "the DERIVED side must be non-zero, or the assertions above pass \
 because nothing was measured rather than because nothing was asked",
     );
-    // THE PAGE PATH'S COMMIT, per kind. FIVE block PUTs since race put
-    // (COMMIT-LIFE §P): the changed path (root and leaf) AND the leaf's
-    // group's 3 parity, all in the SAME round -- before §P the parity went
-    // after the head and was counted elsewhere. Plus the head UPDATE, the
+    // THE PAGE PATH'S COMMIT, per kind. 2 + 2 x PARITY block PUTs: the
+    // changed path (root and leaf), the leaf's group's PARITY parity (race
+    // put, COMMIT-LIFE §P: all in the SAME round), and the ROOT's own PARITY
+    // parity (sdk#335: the root is a group of one, so a reader whose root
+    // block is silent reads it from any one of them). Plus the head UPDATE, the
     // signer's request (the engine holds no key), and the head READ after the
     // UPDATE, because an UPDATE's answer says nothing about which record the
     // Register kept (F56). Per kind, so a change to any one fails by name.
-    let want = vec![(Served::Put, 5), (Served::Get, 0), (Served::Head, 1), (Served::ReadHead, 1), (Served::Sign, 1)];
+    let want = vec![(Served::Put, 2 + 2 * engine::PARITY), (Served::Get, 0), (Served::Head, 1), (Served::ReadHead, 1), (Served::Sign, 1)];
     assert!(
         commit_kinds.iter().all(|k| *k == want),
         "a commit took a different mix of node operations: {commit_kinds:?}. \
-Five PUTs (root, leaf, the leaf group's 3 parity: one round, §P), one head \
+2 + 2 x PARITY PUTs (root, leaf, the leaf group's parity, the root's parity: one round, §P, sdk#335), one head \
 UPDATE, one signer request, one head READ; a change here is a change to \
 what a write costs every app.",
     );
     assert!(
-        commit_ops.iter().all(|&n| n == 8),
-        "a commit took a different number of node operations: {commit_ops:?}",
+        commit_ops.iter().all(|&n| n == want.iter().map(|(_, n)| n).sum::<usize>() as u64),
+        "a commit took a different number of node operations: {commit_ops:?} (the mix above sums to {})",
+        want.iter().map(|(_, n)| n).sum::<usize>(),
     );
     // Bytes are NOT asserted: they climb monotonically with the tree
     // (2192 → 2512 over five consecutive writes), so any figure pinned here

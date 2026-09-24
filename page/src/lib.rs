@@ -422,11 +422,21 @@ impl HeadRead {
         signer_proto::head::read_value(&self.value).filter(|h| !h.refused).map(|h| h.ledger.through).unwrap_or_default()
     }
 
-    /// Does it carry race put's §P mark (an EMPTY `TAG_PARITY` in a v2
-    /// ledger): every group it lists was recoverable when it was signed? A
-    /// head without it is pre-§P, or its ledger was refused: `false`.
+    /// Does it carry race put's §P mark (a `TAG_PARITY` in a v2 ledger):
+    /// every group it lists was recoverable when it was signed? A head without
+    /// it is pre-§P, or its ledger was refused: `false`.
     pub fn parity_marked(&self) -> bool {
-        signer_proto::head::read_value(&self.value).is_some_and(|h| !h.refused && h.ledger.parity.as_deref() == Some(&[][..]))
+        self.mark().is_some()
+    }
+
+    /// Its §P mark and the ROOT's parity ids the mark lists (sdk#335): `None`
+    /// unmarked; `Some(ids)`, ids empty when the mark lists none (or not as
+    /// whole ids -- then the root is fetched singly, never rebuilt from a
+    /// guess).
+    pub fn mark(&self) -> Option<Vec<Cid>> {
+        let h = signer_proto::head::read_value(&self.value).filter(|h| !h.refused)?;
+        let body = h.ledger.parity?;
+        Some(if body.len() % 32 == 0 { body.chunks_exact(32).map(|c| c.try_into().expect("32")).collect() } else { Vec::new() })
     }
 
     /// The head it was signed from, if its ledger says (a refused ledger says
@@ -445,14 +455,27 @@ impl From<(u64, Cid)> for HeadRead {
 }
 
 /// The ledger a head signed from `prev` carries: its PREV, omitted at the
-/// genesis (`prev_seq == 0`), never zeros. The bytes after the root in
-/// `signer_proto::Next`'s value; the one rule for every sign request.
-pub fn sign_ledger(prev_seq: u64, prev_root: Cid, root: Cid) -> Vec<u8> {
+/// genesis (`prev_seq == 0`), never zeros, and the §P mark listing the root's
+/// parity ids. The bytes after the root in `signer_proto::Next`'s value; the
+/// one rule for every sign request.
+pub fn sign_ledger(prev_seq: u64, prev_root: Cid, root: Cid, root_parity: &[Cid]) -> Vec<u8> {
     use signer_proto::head::{value, Ledger};
     let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
-    // The §P mark: every head this build signs is race put's (COMMIT-LIFE §P).
-    value(&root, &Ledger { prev, parity: Some(Vec::new()), ..Ledger::default() })[32..].to_vec()
+    value(&root, &Ledger { prev, parity: Some(mark(root_parity)), ..Ledger::default() })[32..].to_vec()
 }
+
+/// The §P mark's bytes: every head this build signs is race put's
+/// (COMMIT-LIFE §P), and the mark lists its ROOT's parity ids (sdk#335), the
+/// root's group of one.
+fn mark(root_parity: &[Cid]) -> Vec<u8> {
+    root_parity.concat()
+}
+
+/// The root's parity ids always fit the mark: `PARITY` ids of 32 B within the
+/// ledger's `PARITY_MAX`, which the value budget (`THROUGH_MAX`) already
+/// reserves. At compile time, so a tree with more parity per group cannot
+/// sign a mark the ledger would cut.
+const _: () = assert!(engine::PARITY * 32 <= signer_proto::head::PARITY_MAX);
 
 /// F56's equal-seq rule as the Register decides it: of two heads at ONE seq,
 /// the one whose VALUE has the lower BLAKE3 wins (`(terminal, seq,
@@ -652,7 +675,7 @@ impl Page {
         ops: Vec<(Vec<u8>, WriteOp)>,
         reads: Vec<(Vec<u8>, engine::Expect)>,
     ) {
-        self.client_event(Event::Write { client, write_id, ops, reads });
+        self.client_event(Event::Write { client, write_id, ops, reads, deferred: false });
     }
 
     /// Straight to the engine, WRITES INCLUDED.
@@ -1510,8 +1533,7 @@ impl Page {
                 through.push(Through { device: self.device, seq: t, last: seq });
             }
         }
-        // The §P mark: every head this build signs is race put's.
-        value(&root, &Ledger { prev, through, parity: Some(Vec::new()) })[32..].to_vec()
+        value(&root, &Ledger { prev, through, parity: Some(mark(&self.engine.root_parity_of(&root))) })[32..].to_vec()
     }
 
     /// This page's device id in heads' `through` (COMMIT-LIFE ⁵). Zeros:
@@ -1539,9 +1561,10 @@ impl Page {
                 .flatten();
             self.engine.set_witness(witness);
             // The §P MARK of the head about to be adopted: the engine's parity
-            // scan is Done for a marked head, NotScanned for an unmarked one.
-            let marked = self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).is_some_and(HeadRead::parity_marked);
-            self.engine.set_head_marked(marked);
+            // scan is Done for a marked head, NotScanned for an unmarked one,
+            // and the root's parity the mark lists makes it a group of one.
+            let mark = self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).and_then(HeadRead::mark);
+            self.engine.set_head_mark(mark);
         }
         // A SAME-SEQ DISPLACEMENT of this page's head: the Server may merge
         // the displaced group, so no cut is made until it has placed it (or
@@ -1963,9 +1986,22 @@ impl Page {
         self.engine.stage_of_key(key)
     }
 
-    /// Writes queued and their bytes (what `QueueFull` measures).
+    /// Writes queued and their bytes (what `QueueFull` measures; a held
+    /// deferred write takes room like any other).
     pub fn queue_load(&self) -> (usize, usize) {
         self.engine.queue_load()
+    }
+
+    /// WHAT IS UNSAVED (sdk#350), its one owner the engine: writes taken
+    /// and not published, a held DEFERRED write not among them. What a
+    /// session's "unsaved changes" is derived from, never a tally of its own.
+    pub fn unsaved_writes(&self) -> usize {
+        self.engine.unsaved_writes()
+    }
+
+    /// The client of every unsaved write (the engine's rule, per write).
+    pub fn unsaved_clients(&self) -> Vec<engine::ClientId> {
+        self.engine.unsaved_clients().collect()
     }
 
     /// Own commits published and the queued writes they carried (K9: writes

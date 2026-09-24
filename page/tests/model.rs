@@ -204,7 +204,7 @@ impl Node {
         };
         for d in 0..devices {
             n.dev = d;
-            assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+            assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req), signer::Origin::Local), signer::Answer::Provisioned);
         }
         n.dev = 0;
         (n, params)
@@ -265,9 +265,10 @@ impl Node {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger },
+            label: signer::Label::Head,
         };
         // Through the BYTES both ways: the request under the page's id, the answer under the id the signer echoes.
-        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
+        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req), signer::Origin::Local);
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
     }
 

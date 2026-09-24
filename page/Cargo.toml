@@ -8,7 +8,7 @@ description = "The engine library IN THE PAGE: the real engine, and a sans-IO ex
 
 [dependencies]
 engine = { path = "../engine" }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
 # An append-only map that inserts through `&self` and hands out `&[u8]` that
 # stay valid: the engine owns its `Blocks` and only ever lends `&B`, while the
 # page must keep adding the blocks it writes and fetches. MIT OR Apache-2.0.

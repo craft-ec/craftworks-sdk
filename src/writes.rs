@@ -133,6 +133,13 @@ impl Writes {
     /// engine's own door verdict is the caller's to collect
     /// ([`crate::page_store::PageStore`] does, in the same call).
     pub fn make(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<u64, Refused> {
+        self.make_as(reads, edits, false)
+    }
+
+    /// [`Writes::make`], DEFERRED or not (sdk#350): a deferred write goes as
+    /// `DeferredCommit`, the wire's form of the one flag -- same id, same
+    /// refusals, same fate bookkeeping.
+    pub fn make_as(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)], deferred: bool) -> Result<u64, Refused> {
         let write_id = self.next_write_id;
         self.next_write_id += 1;
         // NO SESSION, NO WRITE (sdk#146): refused by name, rather than sent
@@ -147,7 +154,9 @@ impl Writes {
                 Edit::Delete => protocol::Op::Delete(k.clone()),
             })
             .collect();
-        let request = if reads.is_empty() {
+        let request = if deferred {
+            Request::DeferredCommit { write_id, reads: reads.to_vec(), ops }
+        } else if reads.is_empty() {
             Request::Write { write_id, ops }
         } else {
             Request::Commit { write_id, reads: reads.to_vec(), ops }

@@ -18,9 +18,10 @@
 //! | answer | becomes |
 //! |---|---|
 //! | `Got` of the Register | `Head(record)`; the register now exists |
-//! | `GetFailed` / NotFound of the Register | `Head(None)` ONLY if the signer holds no record for it (asked once, `ask_record`); otherwise silence — re-asked on the RTO, "not answering" at its budget (sdk#175; a peered NotFound can be false, F55) |
+//! | NotFound of the Register | `Head(None)` ONLY if the signer holds no record for it (asked once, `ask_record`); otherwise silence — re-asked on the RTO with no end, shown as "not answering for N s" (sdk#175; a peered NotFound can be false, F55) |
+//! | a REFUSED GET (`ContractError::Get`) of anything | nothing: it says nothing about the contract, so it is not an answer — re-asked on the RTO (rule 7), never read as absent |
 //! | `Got` of a block | `Got { id, body }` (the executor verifies it against its id) |
-//! | `GetFailed` of a block | `GetMissed` |
+//! | NotFound of a block | `GetMissed` |
 //! | `Ack(Put)` of a block | `PutOk` |
 //! | `Ack(Put)` / `Ack(Updated)` of the Register | `Updated` (it says nothing more, F56); the register exists |
 //! | a signer answer | `Signer { id, answer }`; a `Held { present }` goes back to the blocks its id asked about |
@@ -208,6 +209,11 @@ pub struct PageIo {
     /// `begin` asked the signer which Register it signs for, and it holds
     /// none: the caller mints a key and calls `provision_with`.
     needs_key: bool,
+    /// The Provision in flight carries a key THIS page minted (`provision_with`
+    /// after "no key"), not one it was given: a `KeyAlreadyProvisioned` then
+    /// means another page provisioned first, and this one opens that Register
+    /// (sdk#343).
+    minted: bool,
     /// The signer's registration was answered (its `Ack(Registered)`).
     signer_registered: bool,
     /// The signer's FIRST request — the Register query (`begin`) or
@@ -320,6 +326,7 @@ impl PageIo {
             now: Ms(0),
             stream_base: 0,
             needs_key: false,
+            minted: false,
             signer_registered: false,
             first: None,
             signer_container: None,
@@ -519,6 +526,7 @@ impl PageIo {
             return;
         }
         self.set_register(register_params);
+        self.minted = true;
         // The signer is registered already (it answered the query): the
         // Provision is the first request now, sent and re-sent like one.
         self.first = Some(First::Provision(signing_key));
@@ -687,15 +695,25 @@ impl PageIo {
                     self.unusable.push("a GET answer for a contract this page never asked".into());
                 }
             }
-            Incoming::GetFailed { id } => {
+            // A REFUSAL is not an answer about the contract: only the node's
+            // NotFound says it is absent (#332 ruling). A refused GET stays
+            // unanswered and the page's sender re-asks it on the RTO (rule 7);
+            // read as absent, a head refusal on a signer with no record would
+            // open an empty tree over an app that exists, and a block
+            // refusal would end a read the next ask could serve.
+            Incoming::GetFailed { id, why: wire::GetFail::Refused(_) } => {
                 if id == self.register_id {
                     self.head_failed += 1;
-                    // A failed read of the head — a refusal, or 0.2.136's
-                    // explicit NotFound, which a PEERED node can answer
-                    // falsely (F55) — is "no head" ONLY if the signer holds no
+                }
+            }
+            Incoming::GetFailed { id, why: wire::GetFail::NotFound } => {
+                if id == self.register_id {
+                    self.head_failed += 1;
+                    // The node's explicit NotFound for the head — which a
+                    // PEERED node can answer falsely (F55) — is "no head" ONLY if the signer holds no
                     // record for this register. Otherwise the head exists and
-                    // this is SILENCE: re-asked on the RTO, "not answering" at
-                    // its budget. Opening an empty tree over an existing app
+                    // this is SILENCE: re-asked on the RTO with no end (rule 8),
+                    // shown as "not answering for N s". Opening an empty tree over an existing app
                     // would have its first commit PUT a second register that
                     // F56 then merges against the real one (sdk#175).
                     match (self.register_seen, self.signer_has_record) {
@@ -803,6 +821,19 @@ impl PageIo {
                             self.provisioned = true;
                             self.signer_provisioned();
                         }
+                        // A KEY IS HERE ALREADY (sdk#343): another page, told
+                        // "no key" as this one was, provisioned first. An
+                        // ANSWER, not an end: ask again which Register the
+                        // signer holds and open THAT one -- one identity per
+                        // node (rule 15); the key this page minted is dropped.
+                        // Only for a minted key: a key the page was GIVEN
+                        // (`provision`) is refused as before.
+                        Some((PROVISION_ID, signer_proto::Answer::Refused(signer_proto::Why::KeyAlreadyProvisioned)))
+                            if std::mem::take(&mut self.minted) =>
+                        {
+                            self.first = Some(First::Query);
+                            self.server.page.send_ext(Ext::SignerFirst, now);
+                        }
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
                             self.refused = Some(format!("the signer refused provisioning: {why:?}"));
                             self.unusable.push(format!("the signer refused provisioning: {why:?}"));
@@ -879,7 +910,7 @@ impl PageIo {
         let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id);
         let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k);
         match incoming {
-            Incoming::Got { id, .. } | Incoming::GetFailed { id } => mine(id),
+            Incoming::Got { id, .. } | Incoming::GetFailed { id, .. } => mine(id),
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             Incoming::HeadChanged { key } => *key == self.register_key,
@@ -1031,6 +1062,7 @@ impl PageIo {
                     id,
                     signer_proto::Head { seq: prev_seq, root: prev_root },
                     signer_proto::Next { seq, root, ledger },
+                    signer_proto::Label::Head,
                     stream,
                 ),
                 // Page-io's own requests, sent and re-sent by the page's
@@ -1057,6 +1089,7 @@ impl PageIo {
                     RECORD_QUERY_ID,
                     signer_proto::Head { seq: 0, root: self.server.page.published().1 },
                     signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
+                    signer_proto::Label::Head,
                     stream,
                 ),
                 Op::PutApp { key } => match self.app_contracts.get(&key) {

@@ -95,7 +95,7 @@ impl Node {
             register_params: params,
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req), signer::Origin::Local), signer::Answer::Provisioned);
         n
     }
 
@@ -158,8 +158,9 @@ impl Node {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger },
+            label: signer::Label::Head,
         };
-        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
+        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req), signer::Origin::Local);
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
     }
 }
@@ -509,6 +510,56 @@ fn a_cold_read_with_a_lost_get_returns_every_row() {
     let want: Vec<(Vec<u8>, Vec<u8>)> = rows.iter().map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())).collect();
     assert_eq!(page_entries(&p, 20), Some(want), "the page's cold read returned different rows");
     assert!(!rr.got_once.is_empty(), "no GET went unanswered: the fault never fired");
+}
+
+/// THE ROOT IS A GROUP OF ONE (sdk#335): a cold reader on another node whose
+/// head's ROOT block never answers (measured live: ~60 s, and ~4 min then
+/// NotFound) still reads every row -- the head lists the root's parity, and
+/// the first of the root's 1 + m to arrive answers.
+#[test]
+fn a_cold_reader_reads_every_row_through_a_silent_root() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..200).map(|i| (format!("k/{i:04}"), format!("v{i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &ops)), 1)));
+    let (_, root) = node.head().expect("published");
+    let listed = node.head_read().and_then(|h| h.mark()).unwrap_or_default();
+    assert_eq!(listed.len(), engine::PARITY, "the signed head lists {} root parity ids", listed.len());
+    let mut rnode = Node::new();
+    rnode.network = Some(std::mem::take(&mut node.blocks));
+    rnode.register = node.register.clone();
+    let mut rr = PageRig::new();
+    rr.silent.insert(root);
+    rr.client_as(&mut rnode, &Request::Identity);
+    let p = rr.client_as(&mut rnode, &range(20));
+    let want: Vec<(Vec<u8>, Vec<u8>)> = rows.iter().map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())).collect();
+    assert_eq!(page_entries(&p, 20), Some(want), "a cold read through a silent root did not return the rows");
+    assert!(rr.gets.get(&root).copied().unwrap_or(0) >= 1, "the root was never asked: the silence never fired");
+}
+
+/// DEFERRED ON THE WIRE (sdk#350): a `DeferredCommit` frame is held --
+/// `Accepted`, no block PUT, no head -- and the next data `Commit` carries it
+/// in ONE commit. What a published app's open sends is its defines; a viewer
+/// who never writes commits nothing.
+#[test]
+fn a_deferred_commit_frame_is_held_until_a_data_commit_carries_it() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let deferred = Request::DeferredCommit { write_id: 1, reads: vec![(b"s/notes".to_vec(), protocol::Expect::Any)], ops: vec![protocol::Op::Put(b"s/notes".to_vec(), b"schema".to_vec())] };
+    let held = states(&rig.client_as(&mut node, &deferred), 1);
+    assert_eq!(held, vec![WriteState::Accepted], "a deferred define was told more than Accepted");
+    assert!(node.blocks.is_empty(), "a deferred define put {} block(s)", node.blocks.len());
+    assert!(node.head().is_none(), "a deferred define moved the head");
+    assert_eq!(rig.server.page.unsaved_writes(), 0, "a held define counts as unsaved");
+    let rs = rig.client_as(&mut node, &write(2, &[("r/1", Some("row"))]));
+    assert!(published(&states(&rs, 2)), "the data write did not publish: {:?}", states(&rs, 2));
+    let (seq, root) = node.head().expect("published");
+    assert_eq!(seq, 1, "not ONE commit for the define and the write");
+    let kv = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    assert_eq!(tree_of(&node, &root), BTreeMap::from([kv("r/1", "row"), kv("s/notes", "schema")]), "the published tree");
 }
 
 /// One commit at a time, and a write while one is in flight is QUEUED
@@ -2370,7 +2421,10 @@ fn move_head(rig: &mut PageRig, node: &mut Node, salt: u32) {
 /// again unpinned at the new head, where it answers — the row, and the other device's row with it.
 #[test]
 fn a_read_pinned_to_a_root_whose_block_never_comes_moves_on_at_a_newer_head() {
-    let (mut node, mut rig, mut tab) = published_rows_and_reader(71, |n| n.head().map(|h| h.1).into_iter().collect());
+    // The ROOT GROUP silent: the root and its parity (sdk#335: the root is a group of one, and with any one of its
+    // 1 + m answering the read would not wait at all).
+    let root_group = |n: &Node| n.head().map(|h| h.1).into_iter().chain(n.head_read().and_then(|h| h.mark()).unwrap_or_default()).collect();
+    let (mut node, mut rig, mut tab) = published_rows_and_reader(71, root_group);
     let t = match decided_get(&mut tab, &mut rig, &mut node, b"k/000321") {
         craftworks_sdk::Outcome::Wait(_, t) => t,
         other => panic!("THE SETUP: the read over a silent root did not wait: {other:?}"),

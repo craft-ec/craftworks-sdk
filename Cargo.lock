@@ -196,6 +196,7 @@ name = "contract-keys"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "core-types",
  "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",
@@ -544,7 +545,7 @@ dependencies = [
 [[package]]
 name = "freenet-prolly"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=d8716d3#d8716d39479e3deccb952b97a111b37009e9e1b6"
+source = "git+https://github.com/craft-ec/freenet-prolly?rev=d61a030#d61a030711c3ccf1843a10d766391ee899e92e01"
 dependencies = [
  "blake3",
 ]
@@ -1465,7 +1466,9 @@ name = "signer"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "contract-keys",
+ "craftec-register-contract",
  "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",

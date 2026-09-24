@@ -33,8 +33,8 @@ struct WireNode {
     served: BTreeMap<&'static str, usize>,
     /// PUTs of the Register (creations), counted.
     register_puts: usize,
-    /// The next this many GETs of the Register FAIL, as an unreachable node's
-    /// do (sdk#175).
+    /// The next this many GETs of the Register are answered NotFound though it
+    /// exists — a peered node's false NotFound (F55, sdk#175).
     fail_register_gets: usize,
     /// The next this many signer requests are answered EMPTY — a
     /// DelegateResponse carrying no message — as the real node answered a
@@ -54,6 +54,16 @@ struct WireNode {
     /// The next this many GETs of the Register are answered with THIS older
     /// state: a node serving its cached copy from before a publish (sdk#349).
     stale_register: Option<(Vec<u8>, usize)>,
+    /// The next this many GETs (of anything) are REFUSED — the node's
+    /// `ContractError::Get`, whether the contract exists or not: not its
+    /// NotFound, and not an answer about the contract.
+    refuse_gets: usize,
+    /// The next this many GETs of a BLOCK (never the head) are REFUSED, as
+    /// `refuse_gets` refuses them.
+    refuse_block_gets: usize,
+    /// This node does not hold the head LOCALLY (a fresh node of the identity): the signer's synchronous read finds
+    /// nothing, while a client GET is served from the network.
+    head_not_local: bool,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -66,6 +76,9 @@ impl signer::Host for Host<'_> {
         true
     }
     fn contract_state(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
+        if self.0.head_not_local && *id == self.0.register_id {
+            return None;
+        }
         self.0.contracts.get(id).cloned()
     }
 }
@@ -95,6 +108,9 @@ impl WireNode {
             delegate_absent: false,
             empty_until_registered: false,
             stale_register: None,
+            refuse_gets: 0,
+            refuse_block_gets: 0,
+            head_not_local: false,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -102,7 +118,7 @@ impl WireNode {
             register_params: params,
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req), signer::Origin::Local), signer::Answer::Provisioned);
         n
     }
 
@@ -124,6 +140,9 @@ impl WireNode {
             delegate_absent: false,
             empty_until_registered: false,
             stale_register: None,
+            refuse_gets: 0,
+            refuse_block_gets: 0,
+            head_not_local: false,
         }
     }
 
@@ -189,6 +208,23 @@ impl WireNode {
                 } else {
                     *self.served.entry("get block").or_default() += 1;
                 }
+                let refuse_block = id != self.register_id && self.refuse_block_gets > 0;
+                if self.refuse_gets > 0 || refuse_block {
+                    if refuse_block {
+                        self.refuse_block_gets -= 1;
+                    } else {
+                        self.refuse_gets -= 1;
+                    }
+                    *self.served.entry("refused get").or_default() += 1;
+                    let e: Err = freenet_stdlib::client_api::ErrorKind::RequestError(
+                        freenet_stdlib::client_api::RequestError::ContractError(freenet_stdlib::client_api::ContractError::Get {
+                            key: ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32])),
+                            cause: "the node is busy".into(),
+                        }),
+                    )
+                    .into();
+                    return Some(bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes"));
+                }
                 let stale = match &mut self.stale_register {
                     Some((st, n)) if id == self.register_id && *n > 0 => {
                         *n -= 1;
@@ -205,18 +241,10 @@ impl WireNode {
                             state: WrappedState::new(state.clone()),
                         })))
                     }
-                    None => {
-                        let e: Err = freenet_stdlib::client_api::ErrorKind::RequestError(
-                            freenet_stdlib::client_api::RequestError::ContractError(
-                                freenet_stdlib::client_api::ContractError::Get {
-                                    key: ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32])),
-                                    cause: "not found".into(),
-                                },
-                            ),
-                        )
-                        .into();
-                        Some(bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes"))
-                    }
+                    // What 0.2.136 answers for a contract it has nowhere —
+                    // and, FALSELY, for a delegate-put one on a peered node
+                    // (F55, `fail_register_gets`): an explicit NotFound.
+                    None => Some(ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id: key }))),
                 }
             }
             ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { key, inbound, .. }) => {
@@ -236,7 +264,7 @@ impl WireNode {
                 let mut values = Vec::new();
                 for m in inbound {
                     if let InboundDelegateMsg::ApplicationMessage(am) = m {
-                        let served = signer::serve_full(&mut Host(self), &am.payload);
+                        let served = signer::serve_full(&mut Host(self), &am.payload, signer::Origin::Local);
                         values.push(OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(signer::reply(&served))));
                     }
                 }
@@ -453,6 +481,94 @@ fn a_false_not_found_on_an_existing_app_never_opens_an_empty_tree() {
     let r = client(&mut b, &mut node, &mut now, &range);
     let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 6, entries, .. } = x { Some(entries.len()) } else { None }).collect();
     assert_eq!(pages, vec![2], "a false NotFound on an existing app opened {pages:?}");
+}
+
+/// ONLY NotFound means absent (#332 ruling): a node REFUSES the first head reads (`ContractError::Get`) of an app
+/// that EXISTS, on a FRESH signer — one that holds no record, the very case where a NotFound opens an empty tree. A
+/// refusal says nothing about the head: it is re-asked on the RTO and the app's rows are read, never an empty tree
+/// whose first commit would sign seq 1 over the real head.
+#[test]
+fn a_refused_head_read_on_a_fresh_signer_is_re_asked_never_an_empty_tree() {
+    let seed = [9u8; 32];
+    let mut x = WireNode::new(&seed);
+    let mut a = page_io(&x);
+    let mut now = 1_000;
+    client(&mut a, &mut x, &mut now, &Request::Identity);
+    for (n, k) in ["p", "q"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut x, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    // Another node of the same identity: its signer has signed nothing; the network holds the head and blocks.
+    let mut y = WireNode::new(&seed);
+    y.contracts = x.contracts.clone();
+    y.head_not_local = true;
+    // Every read refused while the page opens and is asked for its rows: nothing may open.
+    y.refuse_gets = usize::MAX;
+    let mut b = page_io(&y);
+    client(&mut b, &mut y, &mut now, &Request::Identity);
+    let range = Request::Range { req_id: 8, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let pages = |r: &[Reply]| r.iter().filter_map(|x| if let Reply::Page { req_id: 8, entries, .. } = x { Some(entries.len()) } else { None }).collect::<Vec<_>>();
+    let during = pages(&client(&mut b, &mut y, &mut now, &range));
+    let refused = usize::MAX - y.refuse_gets;
+    assert!(refused >= 2, "THE SETUP: the refusal was not re-asked ({refused} refused)");
+    assert_eq!(during, Vec::<usize>::new(), "{refused} refused head reads opened a tree: {during:?}");
+    // The node answers again: the SAME open reads the app's rows.
+    y.refuse_gets = 0;
+    let after = pages(&settle(&mut b, &mut y, &mut now));
+    assert_eq!(after, vec![2], "once answered, the page read {after:?}");
+}
+
+/// ONLY NotFound means absent, for a BLOCK too: a refused block GET is re-asked on the RTO and the read completes.
+/// For a RANGE the engine re-asks a MISS as well, so here the old mapping (refusal → miss) ends in the same place:
+/// this one is a regression test; the delta test below is the one the mutant fails.
+#[test]
+fn a_refused_block_read_is_re_asked_not_missed() {
+    let mut node = WireNode::new(&[10u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["p", "q"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    let mut b = page_io(&node);
+    client(&mut b, &mut node, &mut now, &Request::Identity);
+    let before = node.served.get("get block").copied().unwrap_or(0);
+    node.refuse_gets = 2;
+    let range = Request::Range { req_id: 9, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client(&mut b, &mut node, &mut now, &range);
+    let pages: Vec<usize> = r.iter().filter_map(|x| if let Reply::Page { req_id: 9, entries, .. } = x { Some(entries.len()) } else { None }).collect();
+    assert!(node.served.get("get block").copied().unwrap_or(0) > before, "THE SETUP: the rows were not read by block GETs");
+    assert_eq!(node.served.get("refused get"), Some(&2), "THE SETUP: the refusals were not all asked");
+    assert_eq!(pages, vec![2], "a refused block read gave {pages:?}: {r:?}");
+}
+
+/// THE KILLING CASE for a block: a DELTA read turns a block MISS into `FullReloadRequired` at once (a NotFound block
+/// of a delta is most likely an old root's, gone for good). So a REFUSED block read, if read as a miss, ends a delta
+/// the next ask would have served; read as it is — not an answer — it is re-asked and the delta is computed.
+#[test]
+fn a_refused_block_under_a_delta_is_re_asked_never_a_full_reload() {
+    let mut node = WireNode::new(&[11u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for (n, k) in ["p", "q"].iter().enumerate() {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(n as u64 + 1, k, "v")), n as u64 + 1).contains(&WriteState::Published));
+    }
+    let range = Request::Range { req_id: 9, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let from = client(&mut a, &mut node, &mut now, &range)
+        .iter()
+        .find_map(|x| if let Reply::Page { req_id: 9, at, .. } = x { Some(at.root) } else { None })
+        .expect("THE SETUP: the range was read");
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(3, "r", "v")), 3).contains(&WriteState::Published));
+    // A page that has read nothing: the delta needs both trees' blocks from the node.
+    let mut b = page_io(&node);
+    client(&mut b, &mut node, &mut now, &Request::Identity);
+    node.refuse_block_gets = 2;
+    let since = Request::ChangesSince { req_id: 12, from, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, max_entries: 100 };
+    let r = client(&mut b, &mut node, &mut now, &since);
+    assert_eq!(node.refuse_block_gets, 0, "THE SETUP: the delta's block reads were not refused");
+    assert!(!r.iter().any(|x| matches!(x, Reply::FullReloadRequired { req_id: 12, .. })), "a refused block read ended the delta: {r:?}");
+    let changes = r.iter().find_map(|x| if let Reply::Delta { req_id: 12, changes, .. } = x { Some(changes.clone()) } else { None });
+    assert_eq!(changes.map(|c| c.into_iter().map(|(k, _)| k).collect::<Vec<_>>()), Some(vec![b"r".to_vec()]), "the delta after the refusals: {r:?}");
 }
 
 /// THE CONTROL: a genuinely NEW app (the signer holds no record) whose head
@@ -828,6 +944,48 @@ fn control_a_page_that_always_mints_loses_the_persons_tree() {
     assert_eq!(minted, 1);
     assert!(!again.provisioned(), "a second key was accepted: the check above could not have told the difference");
     assert!(again.register_id() != node.register_id, "the minting page is not on another register");
+}
+
+/// TWO PAGES TOLD "NO KEY" (sdk#343): both asked the signer before either
+/// provisioned -- two tabs opened together, the builder and a published app,
+/// a Provision re-sent after a lost answer -- so both mint, and the second
+/// Provision is refused `KeyAlreadyProvisioned`. That is an ANSWER: the second
+/// page asks again which Register the signer holds and opens it. Both end on
+/// ONE register, neither refused, and both write the one tree.
+#[test]
+fn two_pages_told_no_key_both_open_the_one_register_the_signer_took() {
+    let first_key = [23u8; 32];
+    let mut node = WireNode::unprovisioned(&first_key);
+    let mut now = 1_000;
+    let page = || {
+        let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+        let mut io = PageIo::new(
+            Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+            Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+        );
+        io.begin(container);
+        io
+    };
+    let (mut a, mut b) = (page(), page());
+    settle(&mut a, &mut node, &mut now);
+    settle(&mut b, &mut node, &mut now);
+    assert!(a.needs_key() && b.needs_key(), "both pages must be told 'no key' before either provisions, or this is not the race");
+    for (io, k) in [(&mut a, first_key), (&mut b, [24u8; 32])] {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&k);
+        io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+    }
+    settle(&mut a, &mut node, &mut now);
+    settle(&mut b, &mut node, &mut now);
+    for (label, io) in [("the first page", &a), ("the second page", &b)] {
+        assert!(io.refused().is_none(), "{label} ended refused: {:?}", io.refused());
+        assert!(io.provisioned(), "{label} is not provisioned: {:?}", io.unusable());
+        assert_eq!(io.register_id(), node.register_id, "{label} is not on the register the signer took");
+    }
+    for (n, io) in [(1u64, &mut a), (2, &mut b)] {
+        client(io, &mut node, &mut now, &Request::Identity);
+        assert!(states(&client(io, &mut node, &mut now, &write(n, &format!("k{n}"), "v")), n).contains(&WriteState::Published), "page {n} cannot write the one tree");
+    }
+    assert_eq!(node.register_puts, 1, "a second register was created");
 }
 
 /// What each frame asks the node, by kind (a delegate registration, a signer
@@ -1441,6 +1599,16 @@ fn a_view_puts_back_a_block_it_rebuilt_and_waits_on_nothing() {
     let put = node.served.get("put block").copied().unwrap_or(0) - before;
     assert_eq!(put, 1, "the view put back {put} block(s); a rebuilt block is put back exactly once ({:?})", v.unusable());
     assert!(node.contracts.contains_key(&gone), "the rebuilt leaf is not on the node again");
+    // `settle` never goes idle on a page that has its head -- the head
+    // backstop is always due next -- so it stops at its step cap, and
+    // whether a backstop ReadHead is in flight there is the cap's parity,
+    // not the view's. Answer what was last sent, with no clock moved, and
+    // THEN nothing may be waited on.
+    for f in v.take_frames() {
+        if let Some(a) = node.serve(&f) {
+            v.inbound(&a, Ms(now));
+        }
+    }
     assert!(!v.server.page.waiting(), "the view still waits on something after its repair PUT was answered");
     for k in ["put register", "update", "signer", "register delegate"] {
         let by_view = node.served.get(k).copied().unwrap_or(0) - served_before.get(k).copied().unwrap_or(0);

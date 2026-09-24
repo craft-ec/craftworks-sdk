@@ -589,6 +589,12 @@ impl Server {
             .collect()
     }
 
+    /// This session's UNSAVED writes: the engine's one rule (a held deferred
+    /// write is not one, sdk#350), counted for this session.
+    pub fn unsaved_of(&self, session: u64) -> usize {
+        self.page.unsaved_clients().into_iter().filter(|c| session_of(*c) == session).count()
+    }
+
     fn stage_of(&self, session: u64, write_id: u64) -> Option<crate::fates::Fate> {
         self.page
             .queue_stages()
@@ -993,7 +999,7 @@ impl Server {
         // page): its write is told `Failed` -- terminal, nothing applied --
         // by name, and the engine never queues it.
         if self.page.read_only() {
-            if let P::Write { write_id, .. } | P::Commit { write_id, .. } = &r {
+            if let P::Write { write_id, .. } | P::Commit { write_id, .. } | P::DeferredCommit { write_id, .. } = &r {
                 let id = *write_id;
                 self.page.unusable.push(format!("read-only: write {id} refused at the door (a view writes nothing)"));
                 self.page.client_fx.push(Effect::Notify { client: self.speaker, write_id: as_write_id(id), state: State::Failed });
@@ -1031,45 +1037,12 @@ impl Server {
                 req_id: as_req_id(req_id),
                 key,
             },
-            P::Write { write_id, ops } => Event::Write {
-                client: self.speaker,
-                write_id: as_write_id(write_id),
-                ops: ops
-                    .into_iter()
-                    .map(|o| match o {
-                        protocol::Op::Put(k, v) => (k, engine::Op::Put(v)),
-                        protocol::Op::Delete(k) => (k, engine::Op::Delete),
-                    })
-                    .collect(),
-                reads: Vec::new(),
-            },
+            P::Write { write_id, ops } => write_event(self.speaker, write_id, Vec::new(), ops, false),
             // M2 (sdk#148): a write that says what it READ. The reads go to the
             // engine, which checks them where the ops land.
-            P::Commit { write_id, reads, ops } => Event::Write {
-                client: self.speaker,
-                write_id: as_write_id(write_id),
-                ops: ops
-                    .into_iter()
-                    .map(|o| match o {
-                        protocol::Op::Put(k, v) => (k, engine::Op::Put(v)),
-                        protocol::Op::Delete(k) => (k, engine::Op::Delete),
-                    })
-                    .collect(),
-                reads: reads
-                    .into_iter()
-                    .map(|(k, e)| {
-                        (
-                            k,
-                            match e {
-                                protocol::Expect::Absent => engine::Expect::Absent,
-                                protocol::Expect::Present => engine::Expect::Present,
-                                protocol::Expect::Value(h) => engine::Expect::Value(h),
-                                protocol::Expect::Any => engine::Expect::Any,
-                            },
-                        )
-                    })
-                    .collect(),
-            },
+            P::Commit { write_id, reads, ops } => write_event(self.speaker, write_id, reads, ops, false),
+            // sdk#350: the same write, committed only IN COMPANY.
+            P::DeferredCommit { write_id, reads, ops } => write_event(self.speaker, write_id, reads, ops, true),
             // UNUSED BY ANY CLIENT (sdk#146): `src/`, `web/src/` and `js/` send
             // no `AskWrite` (read at all three, against 3 `Request::Write`
             // senders as the control). Served, and keyed by the asking
@@ -1201,7 +1174,7 @@ impl Server {
         // `Page::take_client` by the caller, as `handle` read `effects`.
         // sdk#225b: what each write leaves at each key, in case its commit is
         // displaced by another device's.
-        if let Event::Write { client, write_id, ops, reads } = &ev {
+        if let Event::Write { client, write_id, ops, reads, .. } = &ev {
             let mut finals: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
             for (k, o) in ops {
                 finals.insert(k.clone(), match o {
@@ -1408,7 +1381,7 @@ impl Server {
             // A write is traced whatever its shape: since sdk#235 every write
             // the SDK sends is a `Commit` (a forced one reads `Any`), so a
             // trace that started only on `Write` went silent.
-            protocol::Request::Write { write_id, ops } | protocol::Request::Commit { write_id, ops, .. } => {
+            protocol::Request::Write { write_id, ops } | protocol::Request::Commit { write_id, ops, .. } | protocol::Request::DeferredCommit { write_id, ops, .. } => {
                 (protocol::TraceOf::Write(*write_id), ops.len() as u64)
             }
             protocol::Request::Get { req_id, .. }
@@ -1420,6 +1393,37 @@ impl Server {
         };
         self.tracing_of = Some(of);
         self.step(0, protocol::Step::Began, began);
+    }
+}
+
+/// Every write shape on the wire as the ONE engine write event: a
+/// `DeferredCommit` (sdk#350) is only the wire's form of the flag.
+fn write_event(speaker: engine::ClientId, write_id: u64, reads: Vec<(Vec<u8>, protocol::Expect)>, ops: Vec<protocol::Op>, deferred: bool) -> Event {
+    Event::Write {
+        client: speaker,
+        write_id: as_write_id(write_id),
+        ops: ops
+            .into_iter()
+            .map(|o| match o {
+                protocol::Op::Put(k, v) => (k, engine::Op::Put(v)),
+                protocol::Op::Delete(k) => (k, engine::Op::Delete),
+            })
+            .collect(),
+        reads: reads
+            .into_iter()
+            .map(|(k, e)| {
+                (
+                    k,
+                    match e {
+                        protocol::Expect::Absent => engine::Expect::Absent,
+                        protocol::Expect::Present => engine::Expect::Present,
+                        protocol::Expect::Value(h) => engine::Expect::Value(h),
+                        protocol::Expect::Any => engine::Expect::Any,
+                    },
+                )
+            })
+            .collect(),
+        deferred,
     }
 }
 
