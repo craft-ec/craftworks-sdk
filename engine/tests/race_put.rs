@@ -86,15 +86,30 @@ impl Rig {
     fn commit(&mut self, id: u64, ops: Vec<(Vec<u8>, Op)>, ack: impl Fn(&Cid, &[u8]) -> bool) -> Vec<Effect> {
         let fx = self.step(Event::forced_write(ClientId(1), WriteId(id), ops));
         let mut all = fx.clone();
-        for (bid, bytes) in puts(&fx) {
-            if ack(&bid, &bytes) {
-                all.extend(self.step(Event::PutConfirmed(bid)));
+        // Every PUT any step emits, answered by `ack` -- the first wave AND the parity that follows the head
+        // (#378 P1-hybrid), which is emitted as the head lands.
+        let mut queue: std::collections::VecDeque<(Cid, Vec<u8>)> = puts(&fx).into_iter().collect();
+        let mut done: BTreeSet<Cid> = BTreeSet::new();
+        let mut landed = false;
+        loop {
+            while let Some((bid, bytes)) = queue.pop_front() {
+                if !done.insert(bid) || !ack(&bid, &bytes) {
+                    continue;
+                }
+                let more = self.step(Event::PutConfirmed(bid));
+                queue.extend(puts(&more));
+                all.extend(more);
+            }
+            match head(&all) {
+                Some((seq, _)) if !landed => {
+                    landed = true;
+                    let more = self.step(Event::HeadConfirmed(seq));
+                    queue.extend(puts(&more));
+                    all.extend(more);
+                }
+                _ => return all,
             }
         }
-        if let Some((seq, _)) = head(&all) {
-            all.extend(self.step(Event::HeadConfirmed(seq)));
-        }
-        all
     }
 }
 
@@ -305,25 +320,69 @@ fn a_commit_whose_slowest_puts_never_answer_still_publishes_saved_not_backed_up(
     }
 }
 
-/// §P 3: NO parity PUT is sequenced after a data block's ack. Every block the
-/// commit needs -- its data AND the parity its new nodes list -- is in its
-/// FIRST send, and no confirmation afterwards makes a new PUT.
+/// §P 3, RULE 10 as decided on #378 (the P1-hybrid): a commit's FIRST WAVE is its data and ONE parity per changed
+/// group -- the root's group of one included (sdk#335) -- so the Sign, sent at k, queues behind at most one extra PUT
+/// per group on the node's one queue (F61), not m. No data ack sequences a PUT, nor does the head: the head LANDING
+/// sends every group's OTHER m - 1 parity, so the head's UPDATE is not queued behind them either; nothing is dropped,
+/// and all of it acked is BACKED_UP.
 #[test]
-fn every_put_of_a_commit_leaves_in_its_first_send() {
+fn the_first_wave_is_the_data_and_one_parity_per_changed_group_and_the_rest_follow_the_sign() {
     let mut r = Rig::base();
     let first = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two"), put("k/000400", b"four")]));
     let sent = puts(&first);
-    let listed: BTreeSet<Cid> = sent.values().filter_map(|b| Node::parse(b).ok()).flat_map(|n| n.parity().collect::<Vec<_>>()).collect();
-    let coded: BTreeSet<Cid> = sent.iter().filter(|(id, b)| is_parity(id, b)).map(|(id, _)| *id).collect();
-    assert!(!coded.is_empty(), "the commit put no parity in its first send");
-    // Every parity id a new node lists that is not already on the node (a
-    // reused group's) is in the first send.
-    let missing: Vec<&Cid> = listed.iter().filter(|p| !coded.contains(*p) && !r.known.contains_key(*p)).collect();
-    assert!(missing.is_empty(), "{} parity block(s) a new node lists were not in the commit's first send", missing.len());
-    for id in sent.keys() {
-        let fx = r.step(Event::PutConfirmed(*id));
-        assert!(puts(&fx).is_empty(), "a PUT was sequenced after a data ack: {:?}", puts(&fx).keys().collect::<Vec<_>>());
+    let root = r.e.root();
+    // Every changed group, as the new nodes list them: its parity ids (the root: its own group of one).
+    let mut groups: Vec<Vec<Cid>> = sent
+        .values()
+        .filter_map(|b| Node::parse(b).ok())
+        .filter(|n| !n.is_leaf())
+        .flat_map(|n| {
+            let ids: Vec<Cid> = n.parity().collect();
+            parity::group_members(&n)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(g, (_, members))| {
+                    let par = ids.get(PARITY * g..PARITY * (g + 1))?.to_vec();
+                    members.iter().chain(&par).any(|c| sent.contains_key(c)).then_some(par)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    groups.push(r.e.root_parity_of(&root));
+    let changed: Vec<&Vec<Cid>> = groups.iter().filter(|par| par.iter().any(|p| sent.contains_key(p))).collect();
+    assert!(changed.len() >= 2, "THE SETUP: {} changed group(s) (a leaf's parent group and the root's)", changed.len());
+    for par in &groups {
+        let in_first = par.iter().filter(|p| sent.contains_key(*p)).count();
+        assert!(in_first <= 1, "a group put {in_first} parity in its first wave, not one");
     }
+    let coded: usize = sent.iter().filter(|(id, b)| is_parity(id, b)).count();
+    assert_eq!(coded, changed.len(), "the first wave's parity is not exactly one per changed group");
+
+    // No data ack sequences a PUT, the step that sends the head included: acks for everything but the root, then
+    // the root.
+    let mut headed: Option<u64> = None;
+    let order: Vec<Cid> = sent.keys().copied().filter(|c| *c != root).chain(std::iter::once(root)).collect();
+    for id in order {
+        let fx = r.step(Event::PutConfirmed(id));
+        if let Some((seq, _)) = head(&fx) {
+            headed = Some(seq);
+        }
+        assert!(puts(&fx).is_empty(), "a PUT was sequenced after a data ack (the head's UPDATE would queue behind it)");
+    }
+    let seq = headed.expect("the head never went");
+    // The head LANDS: the rest of the parity goes, and before the commit is told `Published`.
+    let mut fx = r.step(Event::HeadConfirmed(seq));
+    let told = fx.iter().position(|f| matches!(f, Effect::Notify { .. })).expect("Published");
+    let after_head: Vec<Cid> = puts(&fx[..told]).into_keys().collect();
+    // NOTHING DROPPED: the follow-ups are exactly every changed group's parity not in the first wave.
+    let want: BTreeSet<Cid> = changed.iter().flat_map(|par| par.iter().copied()).filter(|p| !sent.contains_key(p)).collect();
+    let got: BTreeSet<Cid> = after_head.iter().copied().collect();
+    assert_eq!(got, want, "the parity that follows the Sign is not every group's other m - 1");
+    // And BACKED_UP once they are acked.
+    for p in after_head {
+        fx.extend(r.step(Event::PutConfirmed(p)));
+    }
+    assert!(states(&fx, 2).contains(&State::ParityComplete), "every parity acked, and still not BACKED_UP: {:?}", states(&fx, 2));
 }
 
 /// §P 4: a commit with NONE of its root group acked does not sign (the root
@@ -363,33 +422,64 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     assert!(head(&all).is_none(), "the head was signed with a changed group at k-1 of k+m");
 }
 
-/// The GROUPING BY THE TREE'S PARITY (the architect, #351): the leaf's parent
-/// lists `PARITY` ids per group, the commit puts every one in its first send,
-/// and the group signs with ANY `PARITY` of its `PARITY + 1` new blocks still
-/// out -- exactly k -- where one more (the test above) does not. A count
-/// written by hand is right only while it equals the tree's.
+/// NOTHING HELD BACK IS RE-DERIVED (#378 P1-hybrid, rule 7): a commit whose ops are too large to carry has nothing
+/// to re-derive its held-back parity from, and still puts every one of them as its head lands, from the bytes it
+/// held since the first send -- and is BACKED_UP when they are acked.
 #[test]
-fn a_group_signs_with_exactly_parity_of_its_new_blocks_out() {
-    let l2 = l2();
+fn the_held_back_parity_of_a_commit_too_large_to_carry_is_sent_from_its_own_bytes() {
     let mut r = Rig::base();
-    let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
-    let sent = puts(&fx);
-    let parent = sent.values().filter_map(|b| Node::parse(b).ok()).find(|n| !n.is_leaf() && parity::group_members(n).iter().any(|(_, m)| m.contains(&l2))).expect("the leaf's parent");
-    let groups = parity::group_members(&parent);
-    let pids: Vec<Cid> = parent.parity().collect();
-    assert_eq!(pids.len(), PARITY * groups.len(), "the parent lists {} parity ids for {} group(s)", pids.len(), groups.len());
-    let g = groups.iter().position(|(_, m)| m.contains(&l2)).unwrap();
-    let group_par = &pids[PARITY * g..PARITY * (g + 1)];
-    assert!(group_par.iter().all(|p| sent.contains_key(p)), "the group's parity is not all in the first send");
-    // The new blocks of the group: the re-written leaf and its PARITY parity.
-    // Hold PARITY of them -- all the parity -- and ack the rest: k is met.
-    let hold: BTreeSet<Cid> = group_par.iter().copied().collect();
-    assert_eq!(hold.len(), PARITY);
-    let mut all = fx.clone();
-    for id in sent.keys().filter(|id| !hold.contains(*id)) {
+    let big = vec![put("k/000100", &[7u8; 30 * 1024])];
+    let size: usize = big.iter().map(|(k, op)| k.len() + if let Op::Put(v) = op { v.len() } else { 0 }).sum();
+    assert!(size > Params::default().max_carried_ops_bytes, "THE SETUP: {size} B of ops is carried");
+    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), big));
+    let mut all = first.clone();
+    for id in puts(&first).keys() {
         all.extend(r.step(Event::PutConfirmed(*id)));
     }
-    assert!(head(&all).is_some(), "the head did not sign with exactly PARITY of the group's new blocks out");
+    let (seq, _) = head(&all).expect("every first-wave PUT acked, and no head");
+    let landed = r.step(Event::HeadConfirmed(seq));
+    let told = landed.iter().position(|f| matches!(f, Effect::Notify { .. })).expect("Published");
+    let follow = puts(&landed[..told]);
+    let first_parity = puts(&first).iter().filter(|(id, b)| is_parity(id, b)).count();
+    println!("first wave: {first_parity} parity; sent as the head landed: {}", follow.len());
+    assert_eq!(follow.len(), first_parity * (PARITY - 1), "not every changed group's other m - 1 parity was sent");
+    let mut fx = landed.clone();
+    for id in follow.keys() {
+        fx.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    assert!(states(&fx, 2).contains(&State::ParityComplete), "every parity acked, and not BACKED_UP: {:?}", states(&fx, 2));
+}
+
+/// §P 5: A SINGLE STALL PER GROUP IS STILL RACED (#378 P1-hybrid: k of k + 1). The first wave holds the group's
+/// new leaf and ONE parity: with the leaf held back and its parity acked, the group is at k and the head signs.
+/// THE CONTROL: with BOTH held, it does not (the rest of the parity follows only the Sign).
+#[test]
+fn a_single_stall_per_group_is_still_raced_by_its_first_wave_parity() {
+    let l2 = l2();
+    for hold_parity in [false, true] {
+        let mut r = Rig::base();
+        let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+        let sent = puts(&fx);
+        let parent = sent.values().filter_map(|b| Node::parse(b).ok()).find(|n| !n.is_leaf() && parity::group_members(n).iter().any(|(_, m)| m.contains(&l2))).expect("the leaf's parent");
+        let groups = parity::group_members(&parent);
+        let pids: Vec<Cid> = parent.parity().collect();
+        let g = groups.iter().position(|(_, m)| m.contains(&l2)).unwrap();
+        let first: Vec<Cid> = pids[PARITY * g..PARITY * (g + 1)].iter().copied().filter(|p| sent.contains_key(p)).collect();
+        assert_eq!(first.len(), 1, "the leaf's group put {} parity in its first wave, not one", first.len());
+        let mut hold: BTreeSet<Cid> = BTreeSet::from([l2]);
+        if hold_parity {
+            hold.insert(first[0]);
+        }
+        let mut all = fx.clone();
+        for id in sent.keys().filter(|id| !hold.contains(*id)) {
+            all.extend(r.step(Event::PutConfirmed(*id)));
+        }
+        if hold_parity {
+            assert!(head(&all).is_none(), "THE CONTROL: the head signed with the group at k - 1");
+        } else {
+            assert!(head(&all).is_some(), "one stalled leaf, its first-wave parity acked: the head did not sign at k of k + 1");
+        }
+    }
 }
 
 /// §P 6: the largest write that fit before still publishes, with its parity
