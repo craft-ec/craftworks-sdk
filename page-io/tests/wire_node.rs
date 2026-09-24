@@ -2048,7 +2048,7 @@ fn a_refused_site_put_ends_the_publication_by_name() {
             let req: ClientRequest = bincode::deserialize(&f).expect("a request");
             let answer = match req {
                 ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) if contract.key() == site => {
-                    let e: Err = ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key: site.clone(), cause: "invalid put".into() })).into();
+                    let e: Err = ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key: site, cause: "invalid put".into() })).into();
                     Some(bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes"))
                 }
                 _ => node.serve(&f),
