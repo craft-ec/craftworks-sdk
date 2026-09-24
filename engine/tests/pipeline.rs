@@ -157,46 +157,54 @@ fn one_write_reaches_published_when_its_root_and_groups_are_recoverable() {
     let root: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::TREE_NODE, x)).map(|x| x.0).collect();
     let values: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::RAW, x)).map(|x| x.0).collect();
     let parity: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::PARITY, x)).map(|x| x.0).collect();
-    assert_eq!((root.len(), values.len(), parity.len()), (1, 2, 2 * PARITY), "the fixture is not root + 2 values + their group's PARITY parity + the root's PARITY parity");
+    // THE FIRST WAVE (#378 P1-hybrid): ONE parity per changed group -- the value group's and the root's (sdk#335).
+    assert_eq!((root.len(), values.len(), parity.len()), (1, 2, 2), "the first send is not root + 2 values + ONE parity per group");
     assert!(head_of(&out).is_none(), "the head moved before a single block was confirmed");
 
-    // The ROOT's parity (sdk#335) and the value group's.
-    let rp: BTreeSet<Cid> = e.root_parity_of(&root[0]).into_iter().collect();
-    let gp: Vec<Cid> = parity.iter().copied().filter(|p| !rp.contains(p)).collect();
-    let rp: Vec<Cid> = rp.into_iter().collect();
-    assert_eq!((gp.len(), rp.len()), (PARITY, PARITY));
+    let rp_all: BTreeSet<Cid> = e.root_parity_of(&root[0]).into_iter().collect();
+    assert_eq!(rp_all.len(), PARITY, "the root's parity is not PARITY blocks");
+    let fw_rp: Vec<Cid> = parity.iter().copied().filter(|p| rp_all.contains(p)).collect();
+    let fw_gp: Vec<Cid> = parity.iter().copied().filter(|p| !rp_all.contains(p)).collect();
+    assert_eq!((fw_gp.len(), fw_rp.len()), (1, 1), "not one parity of each group in the first wave");
 
-    // The value group at k = 2 (a value and a parity), the root group at 0 of
-    // its 1 + PARITY: NO head -- nothing yet can rebuild the root.
-    for id in [values[0], gp[0], gp[1]] {
+    // The value group at k = 2 (a value and its first-wave parity), the root group at 0 of its 1 + PARITY: NO head.
+    for id in [values[0], fw_gp[0]] {
         let out = stepped!(e, Event::PutConfirmed(id));
         seen.absorb(&out);
         assert!(head_of(&out).is_none(), "the head moved with none of the root group acked");
     }
-    // ONE of the root's parity lands, the root itself still out: the head goes
-    // out -- the root group is recoverable (any 1 of its 1 + PARITY).
-    let out = stepped!(e, Event::PutConfirmed(rp[0]));
+    // The root's first-wave parity lands, the root itself still out: the head goes out (any 1 of its 1 + PARITY).
+    let out = stepped!(e, Event::PutConfirmed(fw_rp[0]));
     seen.absorb(&out);
     let (seq, head_root, after) = head_of(&out).expect("root group and value group at k: the head must move (race put)");
     assert_eq!(seq, 1);
     assert_eq!(head_root, e.root());
-    // `after` is the race set: only what was counted, all acked.
-    let acked: BTreeSet<Cid> = [values[0], gp[0], gp[1], rp[0]].into_iter().collect();
+    let acked: BTreeSet<Cid> = [values[0], fw_gp[0], fw_rp[0]].into_iter().collect();
     let named: BTreeSet<Cid> = after.into_iter().collect();
     assert!(named.is_subset(&acked), "UpdateHead names a block that is not acked: {:?}", named.difference(&acked).collect::<Vec<_>>());
-    assert!(named.contains(&rp[0]), "UpdateHead does not name the root parity it depends on");
+    assert!(named.contains(&fw_rp[0]), "UpdateHead does not name the root parity it depends on");
+    assert!(puts_of(&out).is_empty(), "a follow-up parity PUT went with the Sign: the head's UPDATE would queue behind it");
     assert_eq!(seen.of(1, 1), &[State::Accepted]);
 
     let out = stepped!(e, Event::HeadConfirmed(seq));
     seen.absorb(&out);
     assert_eq!(seen.of(1, 1), &[State::Accepted, State::Published], "SAVED at k, not BACKED_UP");
-    // The stragglers land -- the root among them: BACKED_UP.
-    let rest: Vec<Cid> = std::iter::once(values[1]).chain(gp[2..].iter().copied()).chain(std::iter::once(root[0])).chain(rp[1..].iter().copied()).collect();
+    // THE REST OF THE PARITY follows when the head LANDS: every group's other m - 1.
+    let follow = puts_of(&out);
+    assert_eq!(follow.len(), 2 * (PARITY - 1), "not every group's other m - 1 parity followed the head");
+    assert!(follow.iter().all(|p| !parity.contains(p)), "a first-wave parity was sent again");
+    // The stragglers land -- the root, the other value and the follow-up parity: BACKED_UP.
+    let rest: Vec<Cid> = [values[1], root[0]].into_iter().chain(follow).collect();
     for id in rest {
         let out = stepped!(e, Event::PutConfirmed(id));
         seen.absorb(&out);
     }
     assert_eq!(seen.of(1, 1), &[State::Accepted, State::Published, State::ParityComplete], "states must arrive once each, in order");
+}
+
+/// The blocks `out` puts, in order.
+fn puts_of(out: &[Effect]) -> Vec<Cid> {
+    out.iter().filter_map(|f| if let Effect::PutBlock { id, .. } = f { Some(*id) } else { None }).collect()
 }
 
 /// Confirm every put and head the engine asks for, until it asks for none.
@@ -361,11 +369,17 @@ fn sweep_seed(params: Params, seed: u64) -> SweepSeed {
             if let Some((seq, _, _)) = head_of(&out) {
                 let out = h.step(Event::HeadConfirmed(seq));
                 seen.absorb(&out);
-                // A published commit can open the next one.
-                let mut more = ids(&out);
+                // The parity that follows the head (#378 P1-hybrid) goes out as it lands, BEFORE the commit's
+                // `Published`: answered too. A published commit can open the next one, after it.
+                let told = out.iter().position(|f| matches!(f, Effect::Notify { .. })).unwrap_or(out.len());
+                let follow = ids(&out[..told]);
+                let mut more = ids(&out[told..]);
                 for i in (1..more.len()).rev() {
                     more.swap(i, (r() % (i as u64 + 1)) as usize);
                 }
+                // After the shuffle, so the seed's random stream is the same in both modes: a rehydrated commit
+                // without carried ops cannot re-derive its follow-up parity, so the two modes' lists differ in length.
+                more.extend(follow);
                 for id in more {
                     let out = h.step(Event::PutConfirmed(id));
                     seen.absorb(&out);
@@ -775,3 +789,4 @@ fn after_a_disconnect_every_write_publishes_and_is_backed_up_with_no_tick_and_no
         assert_eq!(flush_puts, 0, "flush={flush}: a Flush after the commits put {flush_puts} block(s): parity is still paid late");
     }
 }
+

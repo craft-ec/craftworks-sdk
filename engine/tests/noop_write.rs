@@ -164,6 +164,17 @@ fn a_no_op_while_parity_is_owed_is_parity_complete_only_when_it_is() {
     }) {
         all.extend(h.step(Event::HeadConfirmed(seq)));
     }
+    // The parity that FOLLOWS the Sign (#378 P1-hybrid) is acked too: only `held` stays out.
+    let follow: Vec<Cid> = all
+        .iter()
+        .filter_map(|f| match f {
+            Effect::PutBlock { id, .. } if *id != held && !first.iter().any(|g| matches!(g, Effect::PutBlock { id: x, .. } if x == id)) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for id in follow {
+        all.extend(h.step(Event::PutConfirmed(id)));
+    }
     assert_eq!(states(&all, 1), vec![State::Accepted, State::Published], "write 1 with a straggler out");
 
     let again = h.step(write(2, b"k/big", &big));
