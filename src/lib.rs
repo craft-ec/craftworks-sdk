@@ -6,13 +6,11 @@
 //! [`js`], so the builder and apps get it the phase it lands.
 
 pub mod app;
-pub mod binding;
 pub mod blockid;
 pub mod db;
 pub mod engine_client;
 pub mod expected;
 pub mod id;
-pub mod live;
 pub mod live_bindings;
 pub mod page_store;
 pub mod read_token;
@@ -24,7 +22,6 @@ pub mod trace;
 pub mod tree_store;
 pub mod writes;
 
-pub use binding::{Binding, LiveMode, Reloads};
 /// What this build IS, baked from the source by `build.rs`.
 ///
 /// Consts rather than `env!` at each use site, because `build.rs` runs for
@@ -44,7 +41,6 @@ pub use id::slot_from;
 pub use engine_client::{Client, Event as EngineEvent};
 pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
-pub use live::{HeadId, HeadWatch, Recorder, Trees};
 pub use live_bindings::LiveBindings;
 pub use page_store::{Ended, Outcome, PageStore};
 pub use schema::{Field, Kind, Schema};
