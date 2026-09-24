@@ -904,9 +904,9 @@ impl Page {
                 // a row put it again — never at the speed of the answers.
                 let absents = self.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
                 let bytes = self.blocks.get(&id).map(<[u8]>::to_vec);
-                if absents >= HELD_ABSENTS && bytes.is_some() {
+                if let (true, Some(bytes)) = (absents >= HELD_ABSENTS, bytes) {
                     self.held_again.remove(&id);
-                    self.put_again.insert(id, bytes.expect("checked"));
+                    self.put_again.insert(id, bytes);
                 } else {
                     // A block this page has no bytes for (a FOREIGN member it only asks about, safety gap class 2)
                     // is never put from here: it is asked again, for as long as it takes (rule 7).
