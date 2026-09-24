@@ -196,6 +196,7 @@ name = "contract-keys"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "core-types",
  "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",
@@ -1465,6 +1466,7 @@ name = "signer"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "contract-keys",
  "ed25519-dalek",
  "freenet-prolly",
