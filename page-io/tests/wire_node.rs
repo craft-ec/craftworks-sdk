@@ -72,6 +72,12 @@ struct WireNode {
     site_hidden: bool,
     /// The next this many GETs of the SITE are refused (`ContractError::Get`).
     refuse_site_gets: usize,
+    /// The node PUSHES the head register's full new state to this page (an `UpdateNotification`, as its GET's
+    /// subscription asked) BEFORE it answers the UPDATE -- the order measured on 0.2.136 (sdk#378: HeadChanged
+    /// 1-4 ms before the UpdateResponse).
+    push_updates: bool,
+    /// Frames the node sends unasked (pushes), delivered before the answer to the request that caused them.
+    pushes: Vec<Vec<u8>>,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -125,6 +131,8 @@ impl WireNode {
             site_blind_signs: 0,
             site_hidden: false,
             refuse_site_gets: 0,
+            push_updates: false,
+            pushes: Vec::new(),
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -160,6 +168,8 @@ impl WireNode {
             site_blind_signs: 0,
             site_hidden: false,
             refuse_site_gets: 0,
+            push_updates: false,
+            pushes: Vec::new(),
         }
     }
 
@@ -252,6 +262,13 @@ impl WireNode {
                 *self.served.entry("update").or_default() += 1;
                 assert_eq!(id_of(&key), self.register_id, "an UPDATE of something other than the head");
                 self.merge_register(s.as_ref());
+                if self.push_updates {
+                    let state = self.contracts.get(&self.register_id).cloned().expect("merged");
+                    self.pushes.push(ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                        key,
+                        update: UpdateData::State(State::from(state)),
+                    })));
+                }
                 Some(ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                     key,
                     summary: StateSummary::from(Vec::new()),
@@ -393,7 +410,11 @@ fn settle(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
         }
         *now += 1;
         for f in frames {
-            if let Some(answer) = node.serve(&f) {
+            let answer = node.serve(&f);
+            for push in std::mem::take(&mut node.pushes) {
+                io.inbound(&push, Ms(*now));
+            }
+            if let Some(answer) = answer {
                 io.inbound(&answer, Ms(*now));
             }
         }
@@ -669,7 +690,11 @@ fn pump(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
         }
         *now += 1;
         for f in frames {
-            if let Some(answer) = node.serve(&f) {
+            let answer = node.serve(&f);
+            for push in std::mem::take(&mut node.pushes) {
+                io.inbound(&push, Ms(*now));
+            }
+            if let Some(answer) = answer {
                 io.inbound(&answer, Ms(*now));
             }
         }
@@ -2127,4 +2152,38 @@ fn a_reader_or_a_bad_app_id_publishes_nothing() {
     let _ = r.take_frames();
     assert!(r.publish_site(APP, SITE_CODE, web(1), Ms(1)).is_err_and(|e| e.starts_with("read-only")), "a reader published");
     assert!(r.take_frames().is_empty(), "a reader sent a frame");
+}
+
+/// **sdk#378 P3 through real frames:** the node pushes the head register's FULL new state (an
+/// `UpdateNotification`, the GET's subscription) before it answers the UPDATE, and that push IS the save's
+/// read-back: the write is Published and page-io sends NO register GET for it. THE CONTROL, the same write with
+/// no push: one register GET (the read-back). Mutant "page-io takes a push as a bare hint" -> a GET -> red.
+#[test]
+fn a_pushed_full_state_is_the_saves_read_back_and_no_register_get_is_sent() {
+    let mut gets = Vec::new();
+    for push in [true, false] {
+        let mut node = WireNode::new(&[8u8; 32]);
+        let mut io = page_io(&node);
+        let mut now = 1_000;
+        client(&mut io, &mut node, &mut now, &Request::Identity);
+        assert!(states(&client(&mut io, &mut node, &mut now, &write(1, "a", "1")), 1).contains(&WriteState::Published), "THE SETUP: the first write (the register's creation) did not publish");
+        node.push_updates = push;
+        let before = node.served.get("get register").copied().unwrap_or(0);
+        // Counted until the write is PUBLISHED, not until the page is idle: an idle page reads the register on
+        // its backstop, and `settle` would jump the clock through hundreds of those.
+        io.client(&protocol::encode_session_request(4, 9, &write(2, "b", "2")).expect("encodes"));
+        let mut r = Vec::new();
+        for _ in 0..200 {
+            r.extend(pump(&mut io, &mut node, &mut now));
+            if states(&r, 2).contains(&WriteState::Published) {
+                break;
+            }
+            now += 50;
+            io.tick(Ms(now));
+        }
+        assert!(states(&r, 2).contains(&WriteState::Published), "push={push}: the write did not publish: {r:?}");
+        assert_eq!(node.served.get("update").copied(), Some(1), "push={push}: THE SETUP: the second head was not an UPDATE");
+        gets.push(node.served.get("get register").copied().unwrap_or(0) - before);
+    }
+    assert_eq!(gets, vec![0, 1], "register GETs for the save (with the push, without): the push did not stand in for the read-back");
 }
