@@ -7,20 +7,16 @@
 //! It proves same-key convergence across two nodes; it is NOT how a person
 //! adds a second device (that is the keyset, Phase 6).
 //!
-//! Through the page's own path, never a second encoder: `PageIo::provision`
-//! registers the signer delegate and sends its `Provision`, with the Register
-//! named as the page names a minted key's (`wire::register_params(pubkey,
-//! HEAD_NAME)`, `Session::mint_if_needed`). The key is the only difference: given
-//! here (hex seed), random there.
+//! Through the page's own path, never a second encoder (`probe::page::for_key`,
+//! the one construction live-page-writes also uses). The key is the only
+//! difference: given here (hex seed), random there.
 //!
 //! usage: provision-signer <ws-url> <seed-hex-32> <signer.wasm> <block.wasm> <register.wasm>
 //! Prints `register <hex>` once the signer answers Provisioned (or names the
 //! Register it already holds for this key); refuses the owner's 7509/7609.
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
-use page::server::{Server, SignerFacts};
-use page::{Ms, Page, PutPath};
-use page_io::{Artefacts, PageIo};
+use page::Ms;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -36,17 +32,12 @@ async fn main() -> Result<()> {
     let signer_wasm = std::fs::read(signer).with_context(|| format!("reading {signer}"))?;
     probe::check(&signer_wasm).map_err(|e| anyhow::anyhow!("the signer is refused by the import gate: {e}"))?;
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let (container, signer_key) = wire::delegate_from_code(&signer_wasm);
-    let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
-        Artefacts {
-            block_code: std::fs::read(block).with_context(|| format!("reading {block}"))?,
-            register_code: std::fs::read(register).with_context(|| format!("reading {register}"))?,
-            register_params: wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME),
-            signer: signer_key,
-        },
+    let mut io = probe::page::for_key(
+        &sk,
+        &signer_wasm,
+        std::fs::read(block).with_context(|| format!("reading {block}"))?,
+        std::fs::read(register).with_context(|| format!("reading {register}"))?,
     );
-    io.provision(container, sk.to_bytes().to_vec());
 
     let (mut sock, _) = tokio_tungstenite::connect_async(ws.as_str()).await.with_context(|| format!("connecting to {ws}"))?;
     let t0 = Instant::now();

@@ -77,17 +77,7 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
     getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
     seed[0] ^= run as u8;
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let (container, signer) = wire::delegate_from_code(signer_wasm);
-    let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
-        Artefacts {
-            block_code: block_code.to_vec(),
-            register_code: register_code.to_vec(),
-            register_params: wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME),
-            signer,
-        },
-    );
-    io.provision(container, sk.to_bytes().to_vec());
+    let mut io = probe::page::for_key(&sk, signer_wasm, block_code.to_vec(), register_code.to_vec());
 
     // Drive until `done` says so, or the budget runs out. Every frame out as
     // it is, every message in as it came; the page's timers on its own clock.
