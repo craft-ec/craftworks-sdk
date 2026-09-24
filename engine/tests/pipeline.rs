@@ -87,7 +87,8 @@ fn ids(effects: &[Effect]) -> Vec<Cid> {
     effects
         .iter()
         .filter_map(|e| match e {
-            Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => Some(*id),
+            // A changed group's other member the node is asked about (class 2) is answered like a PUT: held.
+            Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } | Effect::ConfirmHeld { id } => Some(*id),
             _ => None,
         })
         .collect()
@@ -215,7 +216,7 @@ fn drive(e: &mut Engine<Store>, seen: &mut Seen, first: Vec<Effect>) {
         guard += 1;
         assert!(guard < 100_000, "the engine did not settle");
         let ev = match f {
-            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => Event::PutConfirmed(id),
+            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } | Effect::ConfirmHeld { id } => Event::PutConfirmed(id),
             Effect::UpdateHead { seq, .. } => Event::HeadConfirmed(seq),
             _ => continue,
         };
@@ -754,7 +755,7 @@ fn after_a_disconnect_every_write_publishes_and_is_backed_up_with_no_tick_and_no
                         }
                         stepped!(e, Event::PutConfirmed(*id))
                     }
-                    Effect::PutPack { id, .. } => stepped!(e, Event::PutConfirmed(*id)),
+                    Effect::PutPack { id, .. } | Effect::ConfirmHeld { id } => stepped!(e, Event::PutConfirmed(*id)),
                     Effect::UpdateHead { seq, .. } => stepped!(e, Event::HeadConfirmed(*seq)),
                     _ => Vec::new(),
                 };

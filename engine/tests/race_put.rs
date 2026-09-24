@@ -48,6 +48,16 @@ fn states(fx: &[Effect], id: u64) -> Vec<State> {
         .collect()
 }
 
+/// The foreign blocks a published commit asks the node about before BACKED_UP (safety gap class 2).
+fn asked_held(fx: &[Effect]) -> BTreeSet<Cid> {
+    fx.iter()
+        .filter_map(|f| match f {
+            Effect::ConfirmHeld { id } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
 fn withdrawn(fx: &[Effect]) -> BTreeSet<Cid> {
     fx.iter()
         .filter_map(|f| match f {
@@ -105,6 +115,10 @@ impl Rig {
                     landed = true;
                     let more = self.step(Event::HeadConfirmed(seq));
                     queue.extend(puts(&more));
+                    // The node holds every block in these rigs: a changed group's other member it is asked about is held.
+                    for id in asked_held(&more) {
+                        all.extend(self.step(Event::PutConfirmed(id)));
+                    }
                     all.extend(more);
                 }
                 _ => return all,
@@ -240,6 +254,49 @@ fn an_earlier_straggler_is_never_counted_present_and_after_names_only_this_commi
     assert!(!after.is_empty(), "after is empty: the check above is vacuous");
 }
 
+/// SAFETY GAP CLASS 2 (the architect's ruling): a commit over a FOREIGN tree -- another engine's commit, adopted --
+/// changes a group whose other members include a block another engine put. Its own blocks all acked and its head
+/// landed, it is SAVED, and NOT BACKED_UP until the node answers for EVERY other member of the groups it changed
+/// (`ConfirmHeld` -> `PutConfirmed`; the page answers at once from what it confirmed, else asks the node): one
+/// unanswered holds it back. The engine keeps no copy of what the node confirmed (rule 3).
+#[test]
+fn a_foreign_member_of_a_changed_group_holds_back_backed_up_until_the_node_holds_it() {
+    let (foreign, foreign_leaf) = {
+        let mut p = Rig::base();
+        let all = p.commit(2, vec![put("k/000100", b"foreign")], |_, _| true);
+        assert!(states(&all, 2).contains(&State::Published));
+        (p.e.published_root(), leaf_with(&all, b"k/000100"))
+    };
+    let mut r = Rig::base();
+    let _ = r.step(Event::HeadRead { epoch: engine::Epoch(1), seq: 2, root: foreign });
+    assert_eq!(r.e.published_root(), foreign, "THE SETUP: the foreign head was not adopted");
+    // A commit in a SIBLING leaf of the foreign change's, in the same parent group: that group changes, and the
+    // foreign leaf (k/000100's, put by the other engine) is one of its members.
+    let first = r.step(Event::forced_write(ClientId(1), WriteId(3), vec![put("k/000160", b"three")]));
+    let mut all = first.clone();
+    for id in puts(&first).keys() {
+        all.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    let (seq, _) = head(&all).expect("every own block acked, and no head");
+    let landed = r.step(Event::HeadConfirmed(seq));
+    let mut fx = landed.clone();
+    for id in puts(&landed).keys() {
+        fx.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    let asked: Vec<Cid> = asked_held(&landed).into_iter().collect();
+    println!("other members of the changed groups asked about: {}", asked.len());
+    assert!(asked.contains(&foreign_leaf), "the leaf the other engine put, a member of a changed group, was not asked about");
+    assert!(states(&landed, 3).contains(&State::Published), "not SAVED");
+    assert!(!states(&fx, 3).contains(&State::ParityComplete), "BACKED_UP with {} member(s) never confirmed on the node", asked.len());
+    // Every one but the last answered: still not.
+    for id in &asked[..asked.len() - 1] {
+        fx.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    assert!(!states(&fx, 3).contains(&State::ParityComplete), "BACKED_UP with one member unanswered");
+    let last = r.step(Event::PutConfirmed(asked[asked.len() - 1]));
+    assert!(states(&last, 3).contains(&State::ParityComplete), "every member held, and not BACKED_UP");
+}
+
 /// SUPERSESSION ON A FOREIGN MOVE (the architect: "every published-root
 /// move"): another device of the same identity publishes a head whose tree
 /// re-codes the group this engine's straggler is in. Adopting it withdraws
@@ -262,8 +319,10 @@ fn a_foreign_head_re_coding_the_group_withdraws_the_straggler_and_the_write_wait
     assert!(withdrawn(&fx).contains(&l2), "a foreign move re-coding the group did not withdraw the straggler: {:?}", withdrawn(&fx));
     assert!(!states(&fx, 2).contains(&State::ParityComplete), "write 2 BACKED_UP on a FOREIGN tree's say-so");
     assert_eq!(r.e.backing(), 0, "the withdrawn straggler's Backing is still waiting");
-    // The next own commit, fully acked, takes the carried write with it.
+    // The next own commit, fully acked, takes the carried write with it -- once the node has answered for the
+    // other members of the groups it changed (safety gap class 2), the foreign tree's among them.
     let all = r.commit(4, vec![put("k/000200", b"four")], |_, _| true);
+    assert!(!asked_held(&all).is_empty(), "a commit over a foreign tree asked the node about none of its changed groups' other members");
     assert!(states(&all, 4).contains(&State::ParityComplete));
     assert!(states(&all, 2).contains(&State::ParityComplete), "the carried write was never BACKED_UP by the next own commit");
 }
@@ -378,8 +437,9 @@ fn the_first_wave_is_the_data_and_one_parity_per_changed_group_and_the_rest_foll
     let want: BTreeSet<Cid> = changed.iter().flat_map(|par| par.iter().copied()).filter(|p| !sent.contains_key(p)).collect();
     let got: BTreeSet<Cid> = after_head.iter().copied().collect();
     assert_eq!(got, want, "the parity that follows the Sign is not every group's other m - 1");
-    // And BACKED_UP once they are acked.
-    for p in after_head {
+    // And BACKED_UP once they are acked, and the node has answered for the changed groups' other members.
+    let held = asked_held(&fx);
+    for p in after_head.into_iter().chain(held) {
         fx.extend(r.step(Event::PutConfirmed(p)));
     }
     assert!(states(&fx, 2).contains(&State::ParityComplete), "every parity acked, and still not BACKED_UP: {:?}", states(&fx, 2));
@@ -444,8 +504,8 @@ fn the_held_back_parity_of_a_commit_too_large_to_carry_is_sent_from_its_own_byte
     println!("first wave: {first_parity} parity; sent as the head landed: {}", follow.len());
     assert_eq!(follow.len(), first_parity * (PARITY - 1), "not every changed group's other m - 1 parity was sent");
     let mut fx = landed.clone();
-    for id in follow.keys() {
-        fx.extend(r.step(Event::PutConfirmed(*id)));
+    for id in follow.keys().copied().chain(asked_held(&landed)) {
+        fx.extend(r.step(Event::PutConfirmed(id)));
     }
     assert!(states(&fx, 2).contains(&State::ParityComplete), "every parity acked, and not BACKED_UP: {:?}", states(&fx, 2));
 }

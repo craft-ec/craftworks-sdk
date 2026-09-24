@@ -68,6 +68,8 @@ fn ack_all_but(e: &mut Engine<Store>, fx: &[Effect], skip: &BTreeSet<Cid>) -> Ve
                 landed = true;
                 let more = e.step(Event::HeadConfirmed(seq));
                 queue.extend(puts(&more).into_keys());
+                // A changed group's other members the node is asked about (class 2): all held here.
+                queue.extend(more.iter().filter_map(|f| if let Effect::ConfirmHeld { id } = f { Some(*id) } else { None }));
                 all.extend(more);
             }
             _ => return all,
