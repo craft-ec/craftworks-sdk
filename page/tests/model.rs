@@ -328,14 +328,8 @@ impl Node {
     /// root's group of one (the root and the parity its head's mark lists). A group of a new node whose parity
     /// ids are all the replaced nodes' own is unchanged (parity ids are a function of the members). Whether the
     /// whole TREE is whole is the assets dashboard's question (KEEPER §4), not a write's.
-    ///
-    /// A block a LATER head no longer references is SUPERSEDED, not missing: a root move that re-codes a group
-    /// withdraws the old version's stragglers (the old root's parity among them) and carries the write onto the
-    /// newer commit, whose own groups then hold its data. So a missing block counts only while the register's
-    /// current tree (`live`) still references it.
     fn changed_groups_whole(&self, prev: (u64, Cid), root: &Cid, mark: Option<Vec<Cid>>) -> Result<(), String> {
-        let live = self.live_refs();
-        let missing = |b: &Cid| !self.blocks.contains_key(b) && live.contains(b);
+        let missing = |b: &Cid| !self.blocks.contains_key(b);
         if missing(root) {
             return Err("the root is not on the node".into());
         }
@@ -369,33 +363,6 @@ impl Node {
             }
         }
         Ok(())
-    }
-
-    /// Every block the register's CURRENT head references: its root and the root's parity (its mark), and for each
-    /// node held, its children, its values and its parity. A node not held is named but not opened.
-    fn live_refs(&self) -> std::collections::BTreeSet<Cid> {
-        let mut out = std::collections::BTreeSet::new();
-        let Some(h) = self.head_read() else { return out };
-        let root = h.root();
-        out.insert(root);
-        out.extend(h.mark().unwrap_or_default());
-        let mut at = vec![root];
-        while let Some(id) = at.pop() {
-            let Some(b) = self.blocks.get(&id) else { continue };
-            let Ok(node) = freenet_prolly::node::Node::parse(b) else { continue };
-            out.extend(node.parity());
-            for i in 0..node.len() {
-                if node.level() > 0 {
-                    let c = node.child(i).0;
-                    if out.insert(c) {
-                        at.push(c);
-                    }
-                } else if let freenet_prolly::node::Value::Ref { cid, .. } = node.value(i) {
-                    out.insert(cid);
-                }
-            }
-        }
-        out
     }
 
     /// Every node of the tree at `root` (the first commit changed all of them).
@@ -998,12 +965,24 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64, hel
             // that published the write CHANGED is whole on the node, with no repair. The whole TREE is the assets
             // dashboard's question (KEEPER §4): a straggler of an older write in a group this commit did not touch
             // keeps THAT write un-BACKED_UP, not this one.
+            //
+            // A CARRIED write (a later root move re-coded its groups: `supersede` withdrew the old version's
+            // stragglers and moved the write onto a newer own commit's Backing) is judged by its CARRIER: a later
+            // commit of this page with every group IT changed whole. Never by what the current head references --
+            // that trusted the carry instead of checking it (the architect's mutant: a carried write told at once
+            // survived).
             State::ParityComplete if !a.nothing_changed.contains(&wid.0) => {
-                if let Some((_, _, (seq, root), _)) = seen.published_at.iter().rev().find(|(p, w, _, _)| *p == i && *w == wid.0) {
-                    if let Some(prev) = edges.get(&(*seq, *root)) {
-                        let mark = node.held_values.get(&(*seq, *root)).and_then(|v| page::HeadRead::from_value(*seq, v)).and_then(|h| h.mark());
-                        if let Err(why) = node.changed_groups_whole(*prev, root, mark) {
-                            return Err(format!("page {i}: write {} is ParityComplete, but a group its commit changed is not WHOLE on the node: {why}", wid.0));
+                let judge = |h: (u64, Cid)| -> Result<(), String> {
+                    let Some(prev) = edges.get(&h) else { return Ok(()) };
+                    let mark = node.held_values.get(&h).and_then(|v| page::HeadRead::from_value(h.0, v)).and_then(|r| r.mark());
+                    node.changed_groups_whole(*prev, &h.1, mark)
+                };
+                if let Some((_, _, own, _)) = seen.published_at.iter().rev().find(|(p, w, _, _)| *p == i && *w == wid.0) {
+                    if let Err(why) = judge(*own) {
+                        let carriers: std::collections::BTreeSet<(u64, Cid)> =
+                            seen.published_at.iter().filter(|(p, _, h, _)| *p == i && h.0 > own.0).map(|(_, _, h, _)| *h).collect();
+                        if !carriers.into_iter().any(|h| judge(h).is_ok()) {
+                            return Err(format!("page {i}: write {} is ParityComplete, but a group its commit changed is not WHOLE on the node, and no later commit of this page that could carry it is whole: {why}", wid.0));
                         }
                     }
                 }
