@@ -8,6 +8,8 @@ description = "A Block contract's instance id and the head's Register record: sh
 [dependencies]
 # The head value's ONE format (root ‖ ledger) and the record parser.
 signer-proto = { path = "../signer-proto" }
+# The ONE app-id rule, for a site label (builder#117).
+core-types = { path = "../core-types" }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
 # Signing a Register record. Pinned exactly and default-features off for the
 # same reason the Register contract pins it: `default-features = false`

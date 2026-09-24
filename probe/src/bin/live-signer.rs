@@ -424,6 +424,7 @@ async fn main() -> Result<()> {
     // 2. THE RACE.
     let mut c2 = connect(&node.ws()).await?;
     let ra = Request::Sign {
+        label: signer::Label::Head,
         prev: genesis,
         next: Next {
             seq: 1,
@@ -432,6 +433,7 @@ async fn main() -> Result<()> {
         },
     };
     let rb = Request::Sign {
+        label: signer::Label::Head,
         prev: genesis,
         next: Next {
             seq: 1,
@@ -495,6 +497,7 @@ async fn main() -> Result<()> {
         &mut c1,
         &key,
         &Request::Sign {
+            label: signer::Label::Head,
             prev: Head {
                 seq: 1,
                 root: wroot,
@@ -529,6 +532,7 @@ async fn main() -> Result<()> {
         &mut c1,
         &key,
         &Request::Sign {
+            label: signer::Label::Head,
             prev: Head { seq: 5, root: r(5) },
             next: Next {
                 seq: 6,
@@ -558,6 +562,7 @@ async fn main() -> Result<()> {
                 &mut c1,
                 &key,
                 &Request::Sign {
+                    label: signer::Label::Head,
                     prev: Head { seq: 6, root: r(6) },
                     next: Next {
                         seq: 7,
@@ -575,6 +580,7 @@ async fn main() -> Result<()> {
                 &mut c1,
                 &key,
                 &Request::Sign {
+                    label: signer::Label::Head,
                     prev: Head { seq: 2, root: r(3) },
                     next: Next {
                         seq: 3,
@@ -601,6 +607,7 @@ async fn main() -> Result<()> {
         &mut c3,
         &key,
         &Request::Sign {
+            label: signer::Label::Head,
             prev: prev_d,
             next: Next {
                 seq: prev_d.seq + 1,

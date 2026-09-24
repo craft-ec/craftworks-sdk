@@ -90,6 +90,23 @@ pub enum Why {
     /// The value to sign carries a ledger that is not the format ([`head::check`]): nothing is signed, because a
     /// malformed ledger, once signed, degrades every reader's merge for that head's life and nobody is told.
     BadLedger,
+    /// A SITE's signature was asked for by a web app the node attests (builder#117, rule 13): a site is signed only
+    /// for the person's own tools, never for a served app -- which could otherwise republish its visitor's site.
+    FromApp,
+    /// The label names no site this signer can sign: its app id is not one (`core_types::name::app_ok`).
+    BadLabel,
+}
+
+/// WHICH record a signature is for (builder#117): the person's data HEAD, or one of their SITES -- a published app's
+/// one stable address. ONE sign verb and ONE rule (`signer::decide`) for both; the label chooses the params, the
+/// record kept, and the contract read as the truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Label {
+    Head,
+    /// `app`'s site. `contract` is the site contract's id, which the page derives (the signer holds no site code):
+    /// the signer READS it only after verifying what it holds under the site's own params, so a wrong id can do no
+    /// more than raise the version it signs from (architect, builder#117 Q1).
+    Site { app: String, contract: [u8; 32] },
 }
 
 /// What the signer answers. See `signer::decide` for the rule behind `Signed` / `NotNext` / `AlreadySigned`.
@@ -134,6 +151,8 @@ pub enum Request {
     Sign {
         prev: Head,
         next: Next,
+        /// Which record (builder#117): the head, or a site.
+        label: Label,
     },
     Provision {
         signing_key: Vec<u8>,
@@ -221,6 +240,7 @@ mod tests {
                     root: [2; 32],
                     ledger: vec![9],
                 },
+                label: Label::Site { app: "notes".into(), contract: [7; 32] },
             },
             Request::Provision {
                 signing_key: vec![1],

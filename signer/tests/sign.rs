@@ -49,7 +49,7 @@ impl World {
                     register_params: params.clone(),
                     block_code: BCODE.to_vec(),
                 },
-            ),
+            ), Origin::Local,
         );
         assert_eq!(a, Answer::Provisioned);
         World { host, params }
@@ -78,8 +78,9 @@ impl World {
                 &Request::Sign {
                     prev,
                     next: next.clone(),
+                    label: Label::Head,
                 },
-            ),
+            ), Origin::Local,
         )
     }
 }
@@ -299,10 +300,10 @@ fn every_refusal_is_named() {
         Answer::Refused(Why::HeadUnknown)
     );
     assert_eq!(
-        serve(&mut w.host, b"\x09junk"),
+        serve(&mut w.host, b"\x09junk", Origin::Local),
         Answer::Refused(Why::Unreadable)
     );
-    assert_eq!(serve(&mut w.host, &[]), Answer::Refused(Why::Unreadable));
+    assert_eq!(serve(&mut w.host, &[], Origin::Local), Answer::Refused(Why::Unreadable));
     let mut bare = Mem::default();
     assert_eq!(
         serve(
@@ -311,10 +312,11 @@ fn every_refusal_is_named() {
                 1,
                 &Request::Sign {
                     prev: genesis(),
-                    next: next(1, 1)
+                    next: next(1, 1),
+                    label: Label::Head,
                 }
             )
-        ),
+        , Origin::Local),
         Answer::Refused(Why::NotProvisioned)
     );
     let other = Request::Provision {
@@ -324,7 +326,7 @@ fn every_refusal_is_named() {
         block_code: BCODE.to_vec(),
     };
     assert_eq!(
-        serve(&mut w.host, &encode_request(1, &other)),
+        serve(&mut w.host, &encode_request(1, &other), Origin::Local),
         Answer::Refused(Why::KeyAlreadyProvisioned)
     );
 }
@@ -419,7 +421,7 @@ fn the_same_key_with_another_register_is_refused() {
     };
     let same = serve(
         &mut w.host,
-        &encode_request(1, &again(w.params.clone(), RCODE)),
+        &encode_request(1, &again(w.params.clone(), RCODE)), Origin::Local,
     );
     assert_eq!(
         same,
@@ -430,14 +432,14 @@ fn the_same_key_with_another_register_is_refused() {
     let last = other.len() - 1;
     other[last] ^= 1;
     assert_eq!(
-        serve(&mut w.host, &encode_request(1, &again(other, RCODE))),
+        serve(&mut w.host, &encode_request(1, &again(other, RCODE)), Origin::Local),
         Answer::Refused(Why::RegisterChanged)
     );
     assert_eq!(
         serve(
             &mut w.host,
             &encode_request(1, &again(w.params.clone(), b"another register code"))
-        ),
+        , Origin::Local),
         Answer::Refused(Why::RegisterChanged)
     );
 }
@@ -455,7 +457,7 @@ fn put_blocks_names_each_block_by_its_hash_and_hands_the_entry_the_puts() {
             &Request::PutBlocks {
                 states: states.clone(),
             },
-        ),
+        ), Origin::Local,
     );
     let ids: Vec<[u8; 32]> = (1..=3u8).map(block_root).collect();
     let contracts: Vec<[u8; 32]> = ids
@@ -472,7 +474,7 @@ fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
     let ask = |w: &mut World, states: Vec<Vec<u8>>| {
         serve_full(
             &mut w.host,
-            &encode_request(1, &Request::PutBlocks { states }),
+            &encode_request(1, &Request::PutBlocks { states }), Origin::Local,
         )
     };
     let none = ask(&mut w, vec![]);
@@ -501,7 +503,7 @@ fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
             &Request::PutBlocks {
                 states: vec![block_state(1)],
             },
-        ),
+        ), Origin::Local,
     );
     assert_eq!(
         (r.answer, r.puts.len()),
@@ -520,7 +522,7 @@ fn held_says_which_contracts_this_node_holds_in_the_order_asked() {
     let ask = |host: &mut Mem, contracts: Vec<[u8; 32]>| {
         serve(
             &mut host.clone(),
-            &encode_request(1, &Request::Held { contracts }),
+            &encode_request(1, &Request::Held { contracts }), Origin::Local,
         )
     };
     assert_eq!(
@@ -569,8 +571,8 @@ fn two_requests_in_flight_are_each_answered_under_their_own_id() {
     );
     // Served B first, as a node may: the answers arrive in the other order from the asks.
     let replies = [
-        reply(&serve_full(&mut host, &ask_b)),
-        reply(&serve_full(&mut host, &ask_a)),
+        reply(&serve_full(&mut host, &ask_b, Origin::Local)),
+        reply(&serve_full(&mut host, &ask_a, Origin::Local)),
     ];
     let by_id: std::collections::BTreeMap<u32, Answer> = replies
         .iter()
@@ -594,7 +596,7 @@ fn two_requests_in_flight_are_each_answered_under_their_own_id() {
     // A refusal is attributed the same way, and one that does not decode still names the id it carried.
     let bare = reply(&serve_full(
         &mut Mem::default(),
-        &encode_request(11, &Request::Held { contracts: vec![] }),
+        &encode_request(11, &Request::Held { contracts: vec![] }), Origin::Local,
     ));
     assert_eq!(
         wire::signer::read_answer(&bare),
@@ -608,7 +610,7 @@ fn two_requests_in_flight_are_each_answered_under_their_own_id() {
     );
     broken.push(0);
     assert_eq!(
-        wire::signer::read_answer(&reply(&serve_full(&mut host, &broken))),
+        wire::signer::read_answer(&reply(&serve_full(&mut host, &broken, Origin::Local))),
         Some((12, Answer::Refused(Why::Unreadable)))
     );
 }
@@ -676,14 +678,14 @@ fn a_ledgered_register_head_with_no_record_of_mine_is_read_by_its_root() {
 #[test]
 fn the_signer_names_the_register_it_signs_for_and_only_with_a_key() {
     let mut fresh = Mem::default();
-    assert_eq!(serve(&mut fresh, &encode_request(5, &Request::Register)), Answer::Register { params: None });
+    assert_eq!(serve(&mut fresh, &encode_request(5, &Request::Register), Origin::Local), Answer::Register { params: None });
     let w = World::new();
     let mut host = w.host.clone();
-    let a = serve(&mut host, &encode_request(6, &Request::Register));
+    let a = serve(&mut host, &encode_request(6, &Request::Register), Origin::Local);
     assert_eq!(a, Answer::Register { params: Some(w.params.clone()) });
     let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     assert!(!format!("{a:?}").contains(&format!("{:?}", sk.to_bytes().to_vec())), "the key left the signer");
     let mut orphan = Mem::default();
     orphan.secrets.insert(REGISTER_PARAMS.to_vec(), w.params.clone());
-    assert_eq!(serve(&mut orphan, &encode_request(7, &Request::Register)), Answer::Register { params: None }, "params with no key named a Register");
+    assert_eq!(serve(&mut orphan, &encode_request(7, &Request::Register), Origin::Local), Answer::Register { params: None }, "params with no key named a Register");
 }
