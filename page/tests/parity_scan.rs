@@ -9,8 +9,8 @@ use page::{Answer, Ms, Op, Page, PutPath};
 fn opened_on(head: Option<(u64, [u8; 32])>) -> Page {
     let mut p = Page::new(Params::default(), PutPath::Page);
     let ops = p.take_ops();
-    assert!(ops.iter().any(|o| matches!(o, Op::ReadHead)), "a page reads its head first: {ops:?}");
-    p.answer(Answer::Head(head.map(Into::into)), Ms(1));
+    assert!(ops.iter().any(|o| matches!(o, Op::ReadHead { label: page::Label::Head })), "a page reads its head first: {ops:?}");
+    p.answer(Answer::Head { label: page::Label::Head, read: head.map(Into::into) }, Ms(1));
     p
 }
 
@@ -43,7 +43,7 @@ fn a_page_opened_on_a_marked_head_says_done_and_a_v1_parity_field_is_not_the_mar
     assert!(head.parity_marked(), "this build's signed head carries no §P mark");
     let mut p = Page::new(Params::default(), PutPath::Page);
     let _ = p.take_ops();
-    p.answer(Answer::Head(Some(head)), Ms(1));
+    p.answer(Answer::Head { label: page::Label::Head, read: Some(head) }, Ms(1));
     assert_eq!(p.published().0, 7, "the head was not taken, so this proves nothing");
     assert_eq!(p.parity_scan(), &ParityScan::Done { root }, "a marked head was not taken as scanned");
 
@@ -56,7 +56,7 @@ fn a_page_opened_on_a_marked_head_says_done_and_a_v1_parity_field_is_not_the_mar
     assert!(!old.parity_marked(), "a v1 parity field was read as the §P mark");
     let mut q = Page::new(Params::default(), PutPath::Page);
     let _ = q.take_ops();
-    q.answer(Answer::Head(Some(old)), Ms(1));
+    q.answer(Answer::Head { label: page::Label::Head, read: Some(old) }, Ms(1));
     assert_eq!(q.parity_scan(), &ParityScan::NotScanned);
 }
 

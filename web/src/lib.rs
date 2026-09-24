@@ -411,6 +411,22 @@ impl AppContainer {
         let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
         wire::webapp::app_container(&files).map_err(|e| JsError::new(&e))
     }
+
+    /// The container's WEB part alone: what `Session.publish_site` publishes as the app's SITE (builder#117), the
+    /// exact bytes `finish` frames.
+    pub fn web(&self) -> Result<Vec<u8>, JsError> {
+        let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        wire::webapp::app_web(&files).map_err(|e| JsError::new(&e))
+    }
+}
+
+/// Piece `index` of a LOAD BUNDLE's cut (sdk#347): a loader that rebuilt the SDK from `k` of its `k + m` pieces
+/// re-derives each piece it asked and did not get, to PUT it back (the post-load repair). The same bytes
+/// `load-pieces` cut at build time, from the same code (`pieces::piece`); the caller checks them against the
+/// manifest's sha256 before they go anywhere.
+#[wasm_bindgen]
+pub fn load_piece(bundle: &[u8], payload: usize, m: usize, index: usize) -> Result<Vec<u8>, JsError> {
+    pieces::piece(bundle, payload, m, index).map_err(|e| JsError::new(&format!("{e:?}")))
 }
 
 /// This page's wasm linear memory, in bytes: what a tree reader costs is

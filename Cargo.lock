@@ -197,6 +197,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "core-types",
+ "craftec-register-contract",
  "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",
@@ -234,7 +235,7 @@ dependencies = [
 [[package]]
 name = "craftec-register-contract"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-contracts?rev=0a8cb05#0a8cb051d9592d4b4fbfc5a4399b3b99118e5ad6"
+source = "git+https://github.com/craft-ec/freenet-contracts?rev=0fbb5c7#0fbb5c7c96b1a84653ea9c2e09d16e870c2a4486"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -365,6 +366,13 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "decoder"
+version = "0.1.0"
+dependencies = [
+ "pieces",
+]
 
 [[package]]
 name = "defmt"
@@ -545,7 +553,7 @@ dependencies = [
 [[package]]
 name = "freenet-prolly"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=d61a030#d61a030711c3ccf1843a10d766391ee899e92e01"
+source = "git+https://github.com/craft-ec/freenet-prolly?rev=17d67d8#17d67d84f29b346bee8e2795d874a5ac0c3b5ebe"
 dependencies = [
  "blake3",
 ]
@@ -1023,6 +1031,7 @@ name = "page-io"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "contract-keys",
  "core-types",
  "craftec-register-contract",
@@ -1065,6 +1074,14 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pieces"
+version = "0.1.0"
+dependencies = [
+ "core-types",
+ "freenet-prolly",
+]
 
 [[package]]
 name = "pin-project-lite"
@@ -1482,6 +1499,7 @@ name = "signer-proto"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "craftec-register-contract",
  "serde",
 ]
 
@@ -1929,6 +1947,7 @@ dependencies = [
  "js-sys",
  "page",
  "page-io",
+ "pieces",
  "protocol",
  "serde",
  "serde_json",
@@ -2022,9 +2041,12 @@ dependencies = [
  "blake3",
  "contract-keys",
  "core-types",
+ "craftec-register-contract",
  "craftec-webapp-contract",
+ "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",
+ "pieces",
  "signer-proto",
 ]
 

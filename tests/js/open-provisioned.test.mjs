@@ -43,6 +43,26 @@ await t("**open() returns only once the node says it is provisioned**", async ()
   assert.ok(h.db, "no db");
 });
 
+await t("**a RE-open re-subscribes (session.reconnected), the FIRST open does not** (sdk#376)", async () => {
+  // On the first open there is no old connection whose reassembly or head
+  // subscription could be gone; on every re-open there is, and the page must
+  // read its head again with subscribe at once (page-io), not at the backstop.
+  let reconnects = 0, fire = null;
+  const Base = FakeSession({ after: 3 });
+  const S = function () { const s = Base(); s.reconnected = () => { reconnects += 1; }; return s; };
+  const h = await open(S, deps({ connect: (_engine, o) => { fire = o.onEvent; return { pump() {}, close() {} }; } }));
+  assert.ok(fire, "THE SETUP: the socket's events were not captured");
+  fire({ kind: "open" });
+  assert.equal(reconnects, 0, "the FIRST open was treated as a reconnect");
+  fire({ kind: "closed" });
+  fire({ kind: "open" });
+  assert.equal(reconnects, 1, "a RE-open did not re-subscribe: a live page would poll for up to 120 s");
+  fire({ kind: "closed" });
+  fire({ kind: "open" });
+  assert.equal(reconnects, 2, "a second re-open did not re-subscribe");
+  assert.ok(h.db, "no db");
+});
+
 await t("a REFUSAL ends it in the node's words, and the session is closed", async () => {
   deps.closed = 0;
   await assert.rejects(() => open(FakeSession({ refuse: "a second install" }), deps()), /the node refused to set up: a second install/);

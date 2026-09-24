@@ -71,7 +71,7 @@ fn drive_slow(
                         })
                     }
                 }
-                Op::ReadHead => Some(Answer::Head(node.head.map(Into::into))),
+                Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head.map(Into::into) }),
                 // Page-io's own requests (signer, register): not this test's subject.
                 Op::Ext(_) => None,
                 Op::Sign { id, seq, root, .. } => {
@@ -82,7 +82,7 @@ fn drive_slow(
                         answer: signer_proto::Answer::Signed(record),
                     })
                 }
-                Op::Update { .. } => Some(Answer::Updated),
+                Op::Update { .. } => Some(Answer::Updated { label: page::Label::Head }),
                 Op::AskHeld { id } => Some(Answer::Held {
                     id,
                     present: node.blocks.contains_key(&id),

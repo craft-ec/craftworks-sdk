@@ -15,7 +15,7 @@ crate-type = ["rlib"]
 core-types = { path = "core-types" }
 # Pinned by revision, not by path: this repo must build for anyone who checks
 # it out, and the tree's format decides what an app's data looks like.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 blake3 = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -52,7 +52,7 @@ getrandom = { version = "0.2", features = ["js"] }
 # fixtures. Cargo allows exactly this for test-support crates, because the
 # cycle exists only in the test build, never in the library's own graph.
 testkit = { path = "testkit" }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 wasmi = "0.32"
 bincode = "1"
 # Signing Register records, for the corpus the artefact gate freezes. A
@@ -61,7 +61,25 @@ bincode = "1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
-members = ["contract-keys", "core-types", "engine", "page", "page-io", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
+members = ["contract-keys", "core-types", "decoder", "engine", "page", "page-io", "pieces", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
+
+# The decoder a published app's starter carries (sdk#347): its size is per-app storage, so it is built for size
+# alone, and apart from the SDK's own release build (whose wasm hash must not move with it).
+[profile.decoder]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# THE REGISTER CRATE, pinned ONCE (sdk#364): the Register's own read/parse/verify/encode, the code every node
+# validates with -- every RG01 read in this workspace goes through it. `default-features = false` + `library` is the
+# LIBRARY: it links no freenet-stdlib (freenet-contracts#53), so the sans-IO crates may use it, and `library` adds
+# `wire::record_head`, the params-free read (freenet-contracts#55), compiled out of the contract. A member that
+# needs the CONTRACT (a test driving the real merge) adds `features = ["freenet-main-contract"]`, in a test-only
+# place (signer-proto/tests/rg01_one_home.rs checks both).
+[workspace.dependencies]
+craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "0fbb5c7", default-features = false, features = ["library"] }
 
 [profile.release]
 opt-level = "s"

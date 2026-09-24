@@ -60,6 +60,12 @@ await t("the SDK ENTRY hands a page the same three (wrap), not only the raw modu
   const c = new webapp.AppContainer();
   for (const [p, b] of FILES) c.add(p, b);
   assert.deepEqual(c.finish(), build(FILES), "the entry's AppContainer is not the module's");
+  // Its WEB part (builder#117: what a site publishes) is exactly what `finish` frames: [0 u64][][len u64][web].
+  const web = c.web(), whole = c.finish();
+  const head = new DataView(whole.buffer, whole.byteOffset);
+  assert.equal(head.getBigUint64(0), 0n, "an app container carries no metadata");
+  assert.equal(head.getBigUint64(8), BigInt(web.length), "finish frames a web part of another length");
+  assert.deepEqual(whole.slice(16), web, "web() is not the web part finish frames");
   assert.deepEqual(webapp.params(build(FILES)), webapp_params(build(FILES)));
 });
 

@@ -3,7 +3,7 @@
 // (rto.js, generated from page/src/rto.rs), with no give-up of its own; only a
 // person's cancel, or a `check` that every source refuses as final, ends it.
 import assert from "node:assert/strict";
-import { served, servedText } from "../../js/artefacts.js";
+import { served, servedText } from "../../js/served.js";
 import { RTO_SCHEDULE_MS } from "../../js/rto.js";
 
 let failures = 0;

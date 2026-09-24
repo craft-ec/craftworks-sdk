@@ -15,12 +15,20 @@ freenet-stdlib = { version = "0.10.0", features = ["net"] }
 bincode = "1"
 # A block's contract and state (`block.rs`): the tree's own ids, so the page
 # and the delegate name a block's contract the same way.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 blake3 = "1"
 # The signer's wire types (serde only): `wire::signer` frames them.
 signer-proto = { path = "../signer-proto" }
+# The ONE restatement of the node's contract-id derivation (sdk#334):
+# `block::contract_deriver` is it. And the web framing's ONE statement (`contract_keys::site::frame`, builder#117).
+contract-keys = { path = "../contract-keys" }
+# The SDK's load pieces (sdk#347): the `load-pieces` tool cuts a bundle with the ONE implementation of the format.
+pieces = { path = "../pieces" }
+# The Register crate as a LIBRARY (sdk#364): its MAGIC, for the one params writer.
+craftec-register-contract = { workspace = true }
 
 [dev-dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 core-types = { path = "../core-types" }
 # THE ORACLE for `webapp::params` and the framing (builder#104): the webapp
 # contract's own check, at its released rev (epoch 2). Our params agreeing
@@ -28,8 +36,6 @@ core-types = { path = "../core-types" }
 # wrong one is what every real PUT would meet.
 craftec-webapp-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "9ff9d22", default-features = false }
 bincode = "1"
-# The block functions here are pinned equal to the contract id the signer and the page derive.
-contract-keys = { path = "../contract-keys" }
 # The tests assert against stdlib's OWN caps rather than restating them: a
 # number copied here would agree with itself while the real bound moved.
 freenet-stdlib = { version = "0.10.0", features = ["net"] }

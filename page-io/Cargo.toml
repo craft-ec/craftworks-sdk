@@ -13,14 +13,15 @@ engine = { path = "../engine" }
 wire = { path = "../wire" }
 signer-proto = { path = "../signer-proto" }
 protocol = { path = "../protocol" }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+# A site's params (the ONE relabelling) and its web framing (builder#117).
+contract-keys = { path = "../contract-keys" }
+blake3 = { version = "1", default-features = false }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 
 [dev-dependencies]
-# The scripted node's own record reader, beside the page's.
-contract-keys = { path = "../contract-keys" }
 bincode = "1"
 # The far side of the wire-level node: the REAL signer and Register contract.
 signer = { path = "../signer" }
-craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "0a8cb05", default-features = false }
+craftec-register-contract = { workspace = true, features = ["freenet-main-contract"] }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }

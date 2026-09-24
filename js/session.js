@@ -17,11 +17,20 @@ import { allArtefactBytes, artefactBytes } from "./artefacts.js";
  * and a page that spelled one of them wrong would fetch a 404, hand in an
  * empty array and provision a signer with no contract code behind it.
  */
-export const SHIPPED_ARTEFACTS = {
-  signer: new URL("./signer.wasm", import.meta.url).href,
-  block: new URL("./block.wasm", import.meta.url).href,
-  register: new URL("./register.wasm", import.meta.url).href,
-};
+export const SHIPPED_ARTEFACTS = besideThis(["signer", "block", "register"]);
+
+/**
+ * `{ name: URL of name.wasm beside this file }`, or `null` when NOTHING is beside it: a module linked from a
+ * published app's load pieces (sdk#347) has a blob: URL, which no relative path resolves against, so it ships no
+ * artefacts and its caller names them (`openAsked` refuses without). Computed at load, so it must not throw there.
+ */
+function besideThis(names) {
+  try {
+    return Object.fromEntries(names.map(n => [n, new URL(`./${n}.wasm`, import.meta.url).href]));
+  } catch {
+    return null;
+  }
+}
 
 /**
  * The shipped artefacts WITH their hashes, read from `artefacts.json`.
@@ -340,16 +349,20 @@ export async function openSession(Session, {
   const conn = connectWith(socketEngine, {
     url: session.url(),
     onEvent: e => {
+      // A RE-open, not the first: only then is there an old connection whose
+      // reassembly and head subscription are gone (sdk#376).
+      const reopened = e.kind === "open" && everOpened;
       if (e.kind === "open") everOpened = true;
       if (!everOpened && e.kind === "closed") refusedBeforeOpen += 1;
-      // A new socket means the stream ids restart, so a half-received
-      // chunked reply from the old one must not be completed with bytes
-      // from this one.
-      if (e.kind === "open") {
+      // A new socket means the stream ids restart, so a half-received chunked
+      // reply from the old one must not be completed with bytes from this one;
+      // and the node's subscriptions went with the old socket, so every page
+      // (this session and each tree) reads its head again WITH subscribe, now.
+      if (reopened) {
         session.reconnected();
         for (const t of trees) t.session.reconnected();
-        treeSubscriptions = trees.size;
       }
+      if (e.kind === "open") treeSubscriptions = trees.size;
       // A message arrived and has been handed to the session: any load it
       // completed can now wake the reads parked on it. On the task that
       // handled the message, not on a timer.
@@ -542,6 +555,17 @@ export async function openSession(Session, {
     notAnswering: () => JSON.parse(session.not_answering()),
     /** A person cancels the pending PUT of `key` (named `cancelled`). */
     cancelPut: key => session.cancel_put(key),
+    /**
+     * PUBLISH `web` as `app`'s site (builder#117) under the site contract `code` (`site.wasm`); returns its
+     * LINK, the same for every publish. `siteStatus(app)` says how it ends.
+     */
+    publishSite: (app, code, web) => session.publish_site(app, code, web),
+    /** `{ state, version, said }`: none | publishing | published | superseded | refused | cancelled. */
+    siteStatus: app => JSON.parse(session.site_status(app)),
+    /** `app`'s site link under `code`, published or not. */
+    siteLink: (app, code) => session.site_link(app, code),
+    /** A person cancels `app`'s publication (named `cancelled`). */
+    cancelSite: app => session.cancel_site(app),
     refused: () => session.refused(),
     /** Has a socket to this node EVER opened? See `everOpened`. */
     connectedOnce: () => everOpened,

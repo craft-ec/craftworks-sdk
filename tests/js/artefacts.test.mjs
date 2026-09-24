@@ -265,6 +265,12 @@ await t("the manifest's hashes ARE the shipped files", async () => {
   assert.notEqual(webapp_address(wbytes, tampered), c.address, "THE CONTROL: a different container got the same address");
   const otherCode = wbytes.slice(); otherCode[0] ^= 1;
   assert.notEqual(webapp_address(otherCode, cbytes), c.address, "THE CONTROL: other contract code got the same address");
+  // The `site` CODE (builder#117) ships beside it too: an app's stable link is a site contract under it.
+  const st = manifest.site;
+  assert.ok(st && st.file === "site.wasm", `artefacts.json has no site entry: ${JSON.stringify(st)}`);
+  const sbytes = new Uint8Array(await readFile(new URL(st.file, dir)));
+  assert.equal(await sha(sbytes), st.sha256, "site.wasm does not hash to what artefacts.json claims");
+  assert.equal(sbytes.length, st.bytes);
 });
 
 // ---------------------------------------------------------------------------

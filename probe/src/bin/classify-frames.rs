@@ -10,20 +10,27 @@
 //! - A delegate message's payload goes to `signer_proto::decode_request`
 //!   (re-exported by `signer`): SG02 and the signer's request kind.
 //! - A PUT is classified by its contract CODE: the Block contract's code hash
-//!   (`--block-code <block.wasm>`) or any other.
+//!   (`--block-code <block.wasm>`) or any other -- except an SDK LOAD PIECE
+//!   (sdk#347's repair after load), with `--pieces <pieces.json> --webapp-code
+//!   <webapp.wasm>`: a PUT at an address the published pieces list names is a
+//!   REPAIR only when its state IS that piece's container, proved the way the
+//!   list's address was made: `wire::webapp::address(webapp code, the state
+//!   sent)` equals it (the address commits to `blake3(state)`, so only the
+//!   exact container the manifest's piece was hashed into gives it). Any other
+//!   state at a piece's address FAILS, as does any other non-Block PUT.
 //!
 //! What a VIEW-ONLY step may send, and what FAILS it (the ruling):
 //! GET/SUBSCRIBE, and signer QUERIES (Register, Held), pass; a Block-code PUT
-//! is REPORTED (a repair; content-addressed, so a view may send one); a PUT of
-//! ANY other contract, an UPDATE, a delegate REGISTRATION and a signer
-//! Sign / Provision / PutBlocks FAIL.
+//! and a VERIFIED load-piece PUT are REPORTED (repairs; content-addressed, so a
+//! view may send one); a PUT of ANY other contract, an UPDATE, a delegate
+//! REGISTRATION and a signer Sign / Provision FAIL.
 //!
 //! In:  JSONL lines `{"t":…, "window":…, "socket":…, "data":"<base64>"}`.
 //! Out: JSONL lines `{"t", "window", "socket", "op", "contract"?, "code"?,
 //!       "signer"?, "verdict": "pass"|"report"|"fail", "why"?}`; a frame that
 //!       does not decode is `op: "undecodable"`, verdict `fail` (never skipped).
 //!
-//! usage: classify-frames --block-code <block.wasm> < frames.jsonl > classified.jsonl
+//! usage: classify-frames --block-code <block.wasm> [--pieces <pieces.json> --webapp-code <webapp.wasm>] < frames.jsonl > classified.jsonl
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use freenet_stdlib::client_api::streaming::ReassemblyBuffer;
@@ -45,20 +52,36 @@ fn hex(b: &[u8]) -> String {
     core_types::hex::encode(b)
 }
 
+/// What a PUT is judged against: the Block code, and the SDK's published load
+/// pieces (address -> `bundle#index`) with the `webapp` code they are PUT under.
+struct Known {
+    block: CodeHash,
+    pieces: BTreeMap<String, String>,
+    webapp: Option<Vec<u8>>,
+}
+
 /// One request's classification (without the frame's own fields).
-fn classify(req: &ClientRequest<'_>, block_code: &CodeHash) -> Vec<serde_json::Value> {
+fn classify(req: &ClientRequest<'_>, known: &Known) -> Vec<serde_json::Value> {
     use serde_json::json;
     match req {
-        ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) => {
+        ClientRequest::ContractOp(ContractRequest::Put { contract, state, .. }) => {
             let key = contract.key();
-            let block = key.code_hash() == block_code;
-            vec![json!({
-                "op": "put",
-                "contract": key.to_string(),
-                "code": if block { "block" } else { "other" },
-                "verdict": if block { "report" } else { "fail" },
-                "why": if block { "a Block-contract PUT (repair; content-addressed)" } else { "a PUT of a non-Block contract" },
-            })]
+            let at = key.to_string();
+            if key.code_hash() == &known.block {
+                return vec![json!({ "op": "put", "contract": at, "code": "block", "verdict": "report", "why": "a Block-contract PUT (repair; content-addressed)" })];
+            }
+            if let (Some(piece), Some(webapp)) = (known.pieces.get(&at), &known.webapp) {
+                let exact = wire::webapp::address(webapp, state.as_ref()) == at;
+                return vec![json!({
+                    "op": "put",
+                    "contract": at,
+                    "code": "piece",
+                    "piece": piece,
+                    "verdict": if exact { "report" } else { "fail" },
+                    "why": if exact { "a verified SDK load piece (repair after load, sdk#347)" } else { "a PUT at a load piece's address whose state is NOT that piece" },
+                })];
+            }
+            vec![json!({ "op": "put", "contract": at, "code": "other", "verdict": "fail", "why": "a PUT of a non-Block contract" })]
         }
         ClientRequest::ContractOp(ContractRequest::Update { key, .. }) => {
             vec![json!({ "op": "update", "contract": key.to_string(), "verdict": "fail", "why": "an UPDATE" })]
@@ -83,7 +106,6 @@ fn classify(req: &ClientRequest<'_>, block_code: &CodeHash) -> Vec<serde_json::V
                         let (name, fail) = match r {
                             signer::Request::Sign { .. } => ("sign", true),
                             signer::Request::Provision { .. } => ("provision", true),
-                            signer::Request::PutBlocks { .. } => ("put-blocks", true),
                             signer::Request::Held { .. } => ("held", false),
                             signer::Request::Register => ("register-query", false),
                         };
@@ -108,11 +130,29 @@ fn classify(req: &ClientRequest<'_>, block_code: &CodeHash) -> Vec<serde_json::V
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let block_path = match args.as_slice() {
-        [flag, p] if flag == "--block-code" => p,
-        _ => bail!("usage: classify-frames --block-code <block.wasm> < frames.jsonl"),
+    let usage = "usage: classify-frames --block-code <block.wasm> [--pieces <pieces.json> --webapp-code <webapp.wasm>] < frames.jsonl";
+    let opt = |name: &str| args.iter().position(|a| a == name).map(|i| args.get(i + 1).cloned().with_context(|| format!("{name} needs a path; {usage}"))).transpose();
+    let block_path = opt("--block-code")?.context(usage)?;
+    let block = *ContractCode::from(std::fs::read(&block_path).with_context(|| format!("reading {block_path}"))?).hash();
+    let (pieces, webapp) = match (opt("--pieces")?, opt("--webapp-code")?) {
+        (None, None) => (BTreeMap::new(), None),
+        (Some(p), Some(w)) => {
+            let list: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("reading {p}"))?).with_context(|| format!("{p}: JSON"))?;
+            let mut pieces = BTreeMap::new();
+            for (bundle, spec) in list.as_object().with_context(|| format!("{p}: not an object of bundles"))? {
+                for (i, piece) in spec["pieces"].as_array().with_context(|| format!("{p}: {bundle} has no pieces"))?.iter().enumerate() {
+                    let a = piece["address"].as_str().with_context(|| format!("{p}: {bundle} piece {i} has no address"))?;
+                    pieces.insert(a.to_string(), format!("{bundle}#{i}"));
+                }
+            }
+            if pieces.is_empty() {
+                bail!("{p} names no pieces: nothing to judge a piece PUT against");
+            }
+            (pieces, Some(std::fs::read(&w).with_context(|| format!("reading {w}"))?))
+        }
+        _ => bail!("--pieces and --webapp-code go together: a piece is proved by its address under the webapp code; {usage}"),
     };
-    let block_code = *ContractCode::from(std::fs::read(block_path).with_context(|| format!("reading {block_path}"))?).hash();
+    let known = Known { block, pieces, webapp };
     let mut streams: BTreeMap<String, ReassemblyBuffer> = BTreeMap::new();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
@@ -157,7 +197,7 @@ fn main() -> Result<()> {
                 Ok(Some(whole)) => match bincode::deserialize::<ClientRequest<'_>>(&whole) {
                     Ok(inner) => {
                         requests += 1;
-                        emit(&mut out, classify(&inner, &block_code))?;
+                        emit(&mut out, classify(&inner, &known))?;
                     }
                     Err(e) => emit(&mut out, vec![serde_json::json!({ "op": "undecodable", "verdict": "fail", "why": format!("a reassembled stream is not a ClientRequest: {e}") })])?,
                 },
@@ -166,7 +206,7 @@ fn main() -> Result<()> {
             continue;
         }
         requests += 1;
-        emit(&mut out, classify(&req, &block_code))?;
+        emit(&mut out, classify(&req, &known))?;
     }
     eprintln!("classify-frames: {frames} frame(s), {requests} whole request(s)");
     Ok(())

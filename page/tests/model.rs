@@ -24,7 +24,7 @@
 //! 2. Every UPDATE carries bytes the signer returned.
 //! 3. A published root is RECOVERABLE on the node: a reader that repairs
 //!    (#300) reads every block it reaches, because race put signs a head
-//!    when every changed group has k of its k+3 (COMMIT-LIFE §P: SAVED).
+//!    when every changed group has k of its k+m (COMMIT-LIFE §P: SAVED).
 //!    And (3b) at a write's `ParityComplete` (BACKED_UP), the root it was
 //!    published at is WHOLE on the node: every block held, no repair needed.
 //! 4. Once the faults stop, every write is published, and the final tree
@@ -171,7 +171,7 @@ fn seq_of(node: &Node) -> u64 {
 }
 
 fn head_of(state: &[u8]) -> (u64, Cid) {
-    let (seq, v) = contract_keys::register::record_of(state).expect("a register record");
+    let (seq, v) = signer_proto::head::record_of(state).expect("a register record");
     (seq, v[..32].try_into().expect("32"))
 }
 
@@ -304,7 +304,7 @@ impl Node {
 
 /// The node's blocks, plus blocks REBUILT from their sibling groups (#300):
 /// what a reader that repairs can read. Race put signs a head when every
-/// changed group is RECOVERABLE (k of k+3), not when every block is held
+/// changed group is RECOVERABLE (k of k+m), not when every block is held
 /// (COMMIT-LIFE §P), so a published tree may be readable only this way until
 /// its stragglers land.
 struct Repairing<'a> {
@@ -522,7 +522,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         for (i, a) in apps.iter_mut().enumerate() {
             for op in a.page.take_ops() {
                 // INVARIANT 2.
-                if let Op::Update { state } = &op {
+                if let Op::Update { label: page::Label::Head, state } = &op {
                     if !a.page.signer_records().contains(state) {
                         return Err(format!("page {i} UPDATEd bytes the signer never returned"));
                     }
@@ -567,7 +567,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         })
                     }
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                     if s_sign.chance(faults.sign_lost) {
                         None
                     } else {
@@ -585,7 +585,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         Some(Answer::Signer { id, answer: a })
                     }
                 }
-                Op::Update { state } => {
+                Op::Update { state, .. } => {
                     seen.updates += 1;
                     if s_upd.chance(faults.update_lost) {
                         None
@@ -604,7 +604,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                                 }
                             }
                         }
-                        Some(Answer::Updated)
+                        Some(Answer::Updated { label: page::Label::Head })
                     }
                 }
                 Op::AskHeld { id } => {
@@ -617,11 +617,11 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                 // The engine never makes an app PUT; this model sends none.
                 Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                 Op::Ext(_) => None,
-                Op::ReadHead => {
+                Op::ReadHead { .. } => {
                     if s_head.chance(faults.head_lost) {
                         None
                     } else {
-                        Some(Answer::Head(node.head_read()))
+                        Some(Answer::Head { label: page::Label::Head, read: node.head_read() })
                     }
                 }
             };
@@ -761,7 +761,7 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                 }
                 if let Some((k, v)) = a.inflight.get(&wid.0) {
                     // As a REPAIRING reader reads it (§P: SAVED is k of
-                    // k+3 per group; its stragglers may still be in flight).
+                    // k+m per group; its stragglers may still be in flight).
                     match node.tree_repairing(&root) {
                         Ok(t) if t.get(k) == Some(v) => {}
                         Ok(_) => return Err(format!("page {i}: write {} Published at ({seq}, ..) whose tree does not hold its value, even repaired", wid.0)),
@@ -968,14 +968,14 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                     puts.push(id);
                     p.answer(Answer::PutOk(id), Ms(0));
                 }
-                Op::ReadHead => p.answer(Answer::Head(node.head_read()), Ms(0)),
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                Op::ReadHead { .. } => p.answer(Answer::Head { label: page::Label::Head, read: node.head_read() }, Ms(0)),
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                     let (id, a) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                     p.answer(Answer::Signer { id, answer: a }, Ms(0));
                 }
-                Op::Update { state } => {
+                Op::Update { state, .. } => {
                     node.update(&state);
-                    p.answer(Answer::Updated, Ms(0));
+                    p.answer(Answer::Updated { label: page::Label::Head }, Ms(0));
                 }
                 Op::Get { id } => p.answer(Answer::GetMissed(id), Ms(0)),
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, Ms(0)),
@@ -1038,19 +1038,19 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                         Some(b) => Answer::Got { id, bytes: b.clone() },
                         None => Answer::GetMissed(id),
                     }),
-                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                         let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         Some(Answer::Signer { id, answer })
                     }
-                    Op::Update { state } => {
+                    Op::Update { state, .. } => {
                         if drop_updates {
                             None
                         } else {
                             node.update(&state);
-                            Some(Answer::Updated)
+                            Some(Answer::Updated { label: page::Label::Head })
                         }
                     }
-                    Op::ReadHead => Some(Answer::Head(node.head_read())),
+                    Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
                     Op::AskHeld { id } => Some(Answer::Held { id, present: node.blocks.contains_key(&id) }),
                     Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                     Op::Ext(_) => None,
@@ -1078,7 +1078,7 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                     node.put(id, &bytes);
                     Some(Answer::PutOk(id))
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                         let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         Some(Answer::Signer { id, answer })
                     }

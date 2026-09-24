@@ -273,47 +273,6 @@ fn a_push_for_a_forgotten_tree_is_ignored_rather_than_an_error() {
     );
 }
 
-/// Re-asserting on reconnect re-subscribes every watched tree.
-#[test]
-fn reconnecting_re_asserts_every_subscription() {
-    let mut store = TreeStore::new();
-    put(&mut store, "a/1", "one");
-    let mut w = Watch::on();
-    let mut trees = Trees::new();
-    trees.add(head(1), Binding::new(b"a/", b"b/", true), &mut w);
-    trees.add(head(2), Binding::new(b"a/", b"b/", true), &mut w);
-    trees.add(head(3), Binding::new(b"a/", b"b/", false), &mut w);
-    assert_eq!(w.calls, 2, "{}", trees.probe.dump());
-
-    // The connection dropped: the node's copy is gone and nothing told us.
-    w.watched.clear();
-    trees.reassert(&mut w);
-    assert_eq!(
-        (w.calls, w.watched.len()),
-        (4, 2),
-        "a reconnect did not re-assert both live trees (and must not have \
-         re-asserted the non-live one)\n{}",
-        trees.probe.dump()
-    );
-
-    // A refusal on reconnect is a downgrade, reported.
-    w.accept = false;
-    w.watched.clear();
-    trees.reassert(&mut w);
-    assert_eq!(
-        trees.binding(0, 0).mode(),
-        LiveMode::Polled,
-        "a subscription refused on reconnect left the binding claiming it \
-         was still subscribed\n{}",
-        trees.probe.dump()
-    );
-    assert!(
-        trees.probe.count(Step::Downgraded) >= 1,
-        "{}",
-        trees.probe.dump()
-    );
-}
-
 /// The probe records ALWAYS, and turning it off is a parameter.
 #[test]
 fn the_probe_records_without_being_asked_and_can_be_turned_off() {

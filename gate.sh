@@ -117,6 +117,7 @@ CONTROLS=(
   "one_parity|cargo test -p engine --test one_parity"
   "client_api_allowlist|cargo test -p probe --lib only_allowlisted_crates_may_know_freenets_client_api"
   "node_path_rules|cargo test -p web --test node_path_rules"
+  "rg01_one_home|cargo test -p signer-proto --test rg01_one_home"
   "fixture-gate|./fixture-gate.sh"
   "dup-gate|node tools/dup-gate.mjs"
   "owners|node tools/owners.mjs"

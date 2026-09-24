@@ -26,18 +26,11 @@ pub fn contract_for(code: &[u8], cid: &Cid) -> [u8; 32] {
 }
 
 /// `contract_for` with the code hashed ONCE: matching answers to blocks
-/// hashes ~100 KiB of contract code per candidate otherwise. The node's
-/// derivation, restated: `blake3(code_hash ‖ params)` (freenet-stdlib
-/// `generate_id`), pinned equal to `contract_for` by the tests.
+/// hashes ~100 KiB of contract code per candidate otherwise. The ONE
+/// restatement of the node's derivation is `contract_keys` (sdk#334); this is
+/// it, pinned equal to `contract_for` (the stdlib's own) by the tests.
 pub fn contract_deriver(code: &[u8]) -> impl Fn(&Cid) -> Cid {
-    let code_hash = CodeHash::from_code(code);
-    let code_hash: [u8; 32] = code_hash.as_ref().try_into().expect("a code hash is 32 bytes");
-    move |cid: &Cid| {
-        let mut h = blake3::Hasher::new();
-        h.update(&code_hash);
-        h.update(cid);
-        *h.finalize().as_bytes()
-    }
+    contract_keys::block::contract_deriver(code)
 }
 
 /// The Block contract, instantiated for the block whose id is `cid`.

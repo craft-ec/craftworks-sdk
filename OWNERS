@@ -12,6 +12,7 @@ probe/                   craftworks-engineer1
 signer/                  craftworks-engineer4
 signer-proto/            craftworks-engineer4
 js/artefacts.js          craftworks-engineer4
+js/served.js             craftworks-engineer4
 examples/notes/          craftworks-engineer4
 tools/dup-gate.mjs       craftworks-engineer4
 tools/owners.mjs         craftworks-engineer4
