@@ -620,8 +620,9 @@ pub struct Page {
 impl Page {
     /// A page with a fresh engine. It reads its head first (`ReadHead`), as a
     /// delegate's engine did.
+    /// Its clock starts at 0: a test page, whose clock the test moves from there.
     pub fn new(params: Params, path: PutPath) -> Page {
-        let mut p = Page::unstarted(params, path);
+        let mut p = Page::unstarted(params, path, Ms(0));
         // The key is in the SIGNER's secret store; the engine only states
         // where its authority comes from.
         p.step(Event::Start { key: KeySource::SecretStore, epochs: vec![EPOCH] });
@@ -630,7 +631,12 @@ impl Page {
 
     /// A page whose engine has not been STARTED: [`crate::server::Server`]
     /// starts it on the client's `Identity`, as the delegate's shell did.
-    pub fn unstarted(params: Params, path: PutPath) -> Page {
+    ///
+    /// `now` is the page's clock when it is made, in the clock's own origin (a browser page's is `Date.now()`,
+    /// EPOCH ms): every op is dated by it. A page whose clock started at 0 dated its first requests at 0 and took
+    /// their answers as a round trip of ~1.8e12 ms -- an SRTT no later sample could bring down, the RTO pinned at
+    /// its 60 s ceiling for the page's life, so a lost PUT waited a minute (V's first save, Phase 4 realnet).
+    pub fn unstarted(params: Params, path: PutPath, now: Ms) -> Page {
         let blocks = PageBlocks::default();
         let engine = Engine::new(params, blocks.clone());
         Page {
@@ -669,7 +675,7 @@ impl Page {
             read_only: false,
             head_floor: 0,
             below_floor: None,
-            now: 0,
+            now: now.0,
             signer_records: BTreeSet::new(),
             next_request: 1,
         }
@@ -1835,6 +1841,11 @@ impl Page {
         let puts = (!self.put_again.is_empty()).then_some(self.now);
         let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
         deadlines.chain(sign).chain(held).chain(verify).chain(puts).chain(backstop).min().map(Ms)
+    }
+
+    /// The page's clock: the last time it was told.
+    pub fn now(&self) -> Ms {
+        Ms(self.now)
     }
 
     /// The retry clock now: `(RTO ms, SRTT ms, GET window)`.

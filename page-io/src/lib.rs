@@ -324,6 +324,7 @@ impl PageIo {
         let mut register_id = [0u8; 32];
         register_id.copy_from_slice(&register.key().id().as_bytes()[..32]);
         let register_key = register.key().to_string();
+        let now = server.page.now();
         PageIo {
             server,
             art,
@@ -351,7 +352,8 @@ impl PageIo {
             others: Vec::new(),
             app_contracts: BTreeMap::new(),
             sites: BTreeMap::new(),
-            now: Ms(0),
+            // The page's clock, never 0: requests sent before the first tick are dated by it (sdk#386 live).
+            now,
             stream_base: 0,
             needs_key: false,
             minted: false,

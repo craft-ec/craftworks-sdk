@@ -260,7 +260,7 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
     let (mut sock2, _) = tokio_tungstenite::connect_async(ws).await.context("connecting again")?;
     let (container2, signer2) = wire::delegate_from_code(signer_wasm);
     let mut io2 = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(now_ms(t0))), SignerFacts::default()),
         Artefacts {
             block_code: block_code.to_vec(),
             register_code: register_code.to_vec(),
