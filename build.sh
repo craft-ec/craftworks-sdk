@@ -95,6 +95,12 @@ if [ ! -f "$contracts/build/block.wasm" ]; then
   echo "no contracts build at $contracts/build (set CRAFTWORKS_CONTRACTS)" >&2
   exit 1
 fi
+# THE CONTRACTS ARE THE RELEASED ONES: every contract copied below must hash to its row in the LATEST epoch of
+# that checkout's released.toml, or nothing is copied (tools/contracts-released.mjs, the one check). An SDK built
+# on a stale contracts checkout ships code that addresses other contracts -- an epoch-2 Block refused epoch-3
+# writes and read as a platform bug (2026-09-24). A PR that builds a NEW epoch sets
+# CRAFTWORKS_CONTRACTS_UNRELEASED=1, and the build says so.
+node tools/contracts-released.mjs "$contracts" block register webapp site || exit 1
 # THE SIGNER: the one delegate (the engine runs in the page, ruling B). A
 # published app opened on another node fetches it from the artefacts
 # container like the other three (builder#104). Built and import-gated by its
