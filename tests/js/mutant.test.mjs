@@ -59,7 +59,7 @@ await t("**a mutant the test catches is `mutant killed` (exit 0), and the file c
   assert.match(r.stdout, /mutant killed \(rc=\d+\)$/m);
   assert.doesNotMatch(r.stdout, /COMPILE ERROR/);
   assert.match(r.stdout, /value_is_forty_two/, "the test's own output is not shown");
-  assert.match(r.stdout, /restored tree rebuilt/, "the restored tree was not rebuilt");
+  assert.match(r.stdout, /mutant: control passed/, "the unmutated control did not run");
   unchanged();
   assert.ok(statSync(lib).mtimeMs > before, "the restore did not give the file a fresh mtime");
 });
@@ -93,6 +93,14 @@ await t("**search text not there EXACTLY ONCE is REFUSED (exit 2) and the file i
   assert.equal(statSync(lib).mtimeMs, mtime, "a refused mutant touched the file");
 });
 
+await t("**a command that FAILS ON THE ORIGINAL is `could not judge` (exit 2), never a kill: nothing was measured**", () => {
+  const r = mutant("41 + 1", "41 + 2", ["/usr/bin/false"]);
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stdout, /COULD NOT JUDGE: the command fails WITHOUT the mutant too/);
+  assert.doesNotMatch(r.stdout, /mutant killed/, "a command that always fails was reported as a kill");
+  unchanged();
+});
+
 await t("**INTERRUPTED mid-run (TERM, after the mutant was BUILT): the file comes back byte-identical, and a later plain `cargo test` builds the ORIGINAL** (sdk#389's mtime case)", async () => {
   const built = join(fx, "built");
   rmSync(built, { force: true });
@@ -110,11 +118,73 @@ await t("**INTERRUPTED mid-run (TERM, after the mutant was BUILT): the file come
   p.kill("SIGTERM");
   const { code } = await exited;
   assert.equal(code, 143, `the helper did not exit as interrupted (${code}): ${err}`);
-  assert.match(err, /interrupted \(TERM\); restoring/);
+  assert.match(err, /interrupted \(TERM\); ending the command's process group, then restoring/);
   unchanged();
   // The case that bit: the mutant's artefacts are newer than the source unless the restore
   // wrote a fresh mtime. A plain run must rebuild and pass on the ORIGINAL.
   const after = spawnSync(cargoTest[0], cargoTest.slice(1), { encoding: "utf8", env });
+  assert.equal(after.status, 0, `a later cargo test ran the MUTANT, not the original: ${after.stdout}${after.stderr}`);
+});
+
+// A crate SLOW TO COMPILE (a const the compiler spins on), so a TERM can land while rustc is
+// still building the mutant: the grandchild the helper must end before it restores.
+const slow = join(fx, "slowfix");
+const slowLib = join(slow, "src", "lib.rs");
+const SLOW = `#![allow(long_running_const_eval)]
+pub const SPIN: u64 = {
+    let mut i = 0u64;
+    let mut a = 0u64;
+    while i < 1_500_000 {
+        a = a.wrapping_mul(6364136223846793005).wrapping_add(i);
+        i += 1;
+    }
+    a
+};
+pub fn value() -> u32 {
+    41 + 1
+}
+#[cfg(test)]
+mod t {
+    #[test]
+    fn value_is_forty_two() {
+        let _ = super::SPIN;
+        assert_eq!(super::value(), 42);
+    }
+}
+`;
+mkdirSync(join(slow, "src"), { recursive: true });
+writeFileSync(join(slow, "Cargo.toml"), `[package]\nname = "slowfix"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n`);
+writeFileSync(slowLib, SLOW);
+const slowTest = ["cargo", "test", "-q", "--manifest-path", join(slow, "Cargo.toml")];
+// This fixture's own rustc processes: its crate name, writing into this test's own target dir
+// (a unique temp path; cargo hands rustc a RELATIVE source path).
+const compiling = () =>
+  spawnSync("/bin/ps", ["-Ao", "command"], { encoding: "utf8" }).stdout.split("\n")
+    .filter(l => /\brustc\b/.test(l) && l.includes("--crate-name slowfix") && l.includes(env.CARGO_TARGET_DIR)).length;
+
+await t("**TERM MID-COMPILE: while rustc is still building the mutant, the helper ends the WHOLE process group before it restores, and a later plain `cargo test` builds the ORIGINAL**", async () => {
+  const p = spawn("/bin/bash", [helper, slowLib, "41 + 1", "41 + 2", "--", ...slowTest], { env, cwd: fx });
+  let err = "";
+  p.stderr.on("data", d => (err += d));
+  const exited = new Promise(res => p.on("exit", code => res(code)));
+  const deadline = Date.now() + 120_000;
+  while (compiling() === 0) {
+    assert.ok(Date.now() < deadline, "rustc never started on the mutant");
+    await new Promise(r => setTimeout(r, 50));
+  }
+  p.kill("SIGTERM");
+  const code = await exited;
+  assert.equal(code, 143, `the helper did not exit as interrupted (${code}): ${err}`);
+  assert.equal(readFileSync(slowLib, "utf8"), SLOW, "the file is not byte-identical to its original");
+  const left = compiling();
+  // An orphan rustc (a helper that ended only its direct child) is let finish, so the next
+  // run meets whatever it wrote -- the case this test is for.
+  while (compiling() > 0) {
+    assert.ok(Date.now() < deadline + 120_000, "a rustc on the mutant never ended");
+    await new Promise(r => setTimeout(r, 100));
+  }
+  assert.equal(left, 0, `${left} rustc process(es) on the mutant outlived the helper`);
+  const after = spawnSync(slowTest[0], slowTest.slice(1), { encoding: "utf8", env });
   assert.equal(after.status, 0, `a later cargo test ran the MUTANT, not the original: ${after.stdout}${after.stderr}`);
 });
 
