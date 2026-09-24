@@ -830,6 +830,48 @@ fn control_a_page_that_always_mints_loses_the_persons_tree() {
     assert!(again.register_id() != node.register_id, "the minting page is not on another register");
 }
 
+/// TWO PAGES TOLD "NO KEY" (sdk#343): both asked the signer before either
+/// provisioned -- two tabs opened together, the builder and a published app,
+/// a Provision re-sent after a lost answer -- so both mint, and the second
+/// Provision is refused `KeyAlreadyProvisioned`. That is an ANSWER: the second
+/// page asks again which Register the signer holds and opens it. Both end on
+/// ONE register, neither refused, and both write the one tree.
+#[test]
+fn two_pages_told_no_key_both_open_the_one_register_the_signer_took() {
+    let first_key = [23u8; 32];
+    let mut node = WireNode::unprovisioned(&first_key);
+    let mut now = 1_000;
+    let page = || {
+        let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+        let mut io = PageIo::new(
+            Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+            Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+        );
+        io.begin(container);
+        io
+    };
+    let (mut a, mut b) = (page(), page());
+    settle(&mut a, &mut node, &mut now);
+    settle(&mut b, &mut node, &mut now);
+    assert!(a.needs_key() && b.needs_key(), "both pages must be told 'no key' before either provisions, or this is not the race");
+    for (io, k) in [(&mut a, first_key), (&mut b, [24u8; 32])] {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&k);
+        io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+    }
+    settle(&mut a, &mut node, &mut now);
+    settle(&mut b, &mut node, &mut now);
+    for (label, io) in [("the first page", &a), ("the second page", &b)] {
+        assert!(io.refused().is_none(), "{label} ended refused: {:?}", io.refused());
+        assert!(io.provisioned(), "{label} is not provisioned: {:?}", io.unusable());
+        assert_eq!(io.register_id(), node.register_id, "{label} is not on the register the signer took");
+    }
+    for (n, io) in [(1u64, &mut a), (2, &mut b)] {
+        client(io, &mut node, &mut now, &Request::Identity);
+        assert!(states(&client(io, &mut node, &mut now, &write(n, &format!("k{n}"), "v")), n).contains(&WriteState::Published), "page {n} cannot write the one tree");
+    }
+    assert_eq!(node.register_puts, 1, "a second register was created");
+}
+
 /// What each frame asks the node, by kind (a delegate registration, a signer
 /// request, or anything else).
 fn kinds(frames: &[Vec<u8>]) -> Vec<&'static str> {
