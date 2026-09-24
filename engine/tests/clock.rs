@@ -14,7 +14,7 @@
 use engine::{ClientId, Effect, Event, Op, Params, State, WriteId};
 
 mod common;
-use common::{Harness, Mode, Store};
+use common::{Harness, Store};
 
 fn stalled(fx: &[Effect]) -> bool {
     fx.iter().any(|f| {
@@ -38,7 +38,7 @@ const T0: u64 = 1_790_000_000;
 #[test]
 fn a_commit_is_stalled_exactly_max_accept_age_ticks_after_it_started() {
     let age = Params::default().max_accept_age;
-    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    let mut h = Harness::new(Params::default(), Store::fresh());
     // The clock is known BEFORE the write, and the write's own call has no
     // tick: only a carried clock can date the commit's start.
     let _ = h.step(Event::Tick(T0));
@@ -60,7 +60,7 @@ fn a_commit_is_stalled_exactly_max_accept_age_ticks_after_it_started() {
 #[test]
 fn a_commit_started_before_any_clock_is_dated_from_the_first_one() {
     let age = Params::default().max_accept_age;
-    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    let mut h = Harness::new(Params::default(), Store::fresh());
     let _ = h.step(write()); // no tick has ever arrived
     assert!(
         !stalled(&h.step(Event::Tick(T0))),

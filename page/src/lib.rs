@@ -34,11 +34,13 @@
 //! | a signer answer under any id but the in-flight sign's (SG02), or not shaped like a sign's | ignored: it does NOT clear the sign's deadline |
 //! | any other `Refused(why)` | nothing more is asked; recorded in [`Page::unusable`]; the engine's own clock reports the write `Stalled` |
 //! | `Updated` | a register read ([`Op::ReadHead { label: Label::Head }`]) — this commit's read-back, or a landing's verify read: an UpdateResponse carries nothing (F56). On a peered node the register is read through the head SUBSCRIPTION (F55); the web layer frames it so |
-//! | `Head(Some(mine))` while a head is owed | `HeadConfirmed(seq)` — the only way a commit is Published |
+//! | `Head(Some(mine))` while a head is owed | `HeadConfirmed(seq)` — the only way a commit is Published (a pushed FULL state showing exactly mine is judged by this same row: below) |
 //! | `Head(older seq)` while owed | not visible yet: the head is read again next tick, and after [`HEAD_READS`] reads the UPDATE is re-sent |
 //! | `Head(newer seq, or same seq another root)` while owed | `HeadConflict` |
 //! | `Head(None)` while owed | the UPDATE is re-sent |
 //! | `Head(..)` for the engine's own `ReadHead` | `HeadRead` / `HeadMissing` (recovery) — kept apart from a read-back, which only judges the owed head |
+//! | `HeadChanged` hint (no full state, or not this page's owed head) | a register read (`Waiting::Hint`) — unless a verify or this page's own READ-BACK is owed: that read judges whatever the register holds, so a second is only a node op on the node's one queue (sdk#378 P2, F61) |
+//! | `HeadChanged` with a FULL state showing EXACTLY this page's owed (seq, root) | the read-back is done: `HeadConfirmed(seq)` through the read-back rule; the UPDATE's and read-back's waits end with no RTT sample, and the UPDATE's later answer asks nothing. Any other pushed state is the hint above; a dropped push leaves the read-back GET to its deadline (sdk#378 P3, the architect's three conditions) |
 //! | `FetchBlock` | [`Op::Get`]; `Got` → verified, joins [`PageBlocks`], `BlockArrived`; `GetMissed` → `BlockMissed` |
 //! | any op unanswered for its RTO ([`rto`]: RFC 6298 over this page's own completed calls, Karn, §5.5 back-off; GETs also in a congestion window) | re-sent as it was — every op here is idempotent (a block is its hash, a sign re-ask is answered AlreadySigned, a record is the same record). No fixed deadline anywhere: the 30 s budgets are give-ups, not retry timers |
 //!
@@ -266,6 +268,9 @@ fn waiting_name(w: &Waiting) -> String {
 #[derive(Debug, Clone)]
 struct Deadline {
     at: u64,
+    /// The deadline it was given when SENT: a re-arm never moves it past this
+    /// (sdk#378).
+    armed: u64,
     op: Op,
     sent_at: u64,
     attempt: u32,
@@ -422,17 +427,6 @@ impl HeadRead {
         &self.value
     }
 
-    /// The `through` its ledger records for `device`: the last arrival number
-    /// of that page's writes this head carries (COMMIT-LIFE ⁵, the witness).
-    /// `None`: no entry, or a refused ledger.
-    pub fn through_of(&self, device: &[u8; 16]) -> Option<u64> {
-        let h = signer_proto::head::read_value(&self.value)?;
-        if h.refused {
-            return None;
-        }
-        h.ledger.through.iter().find(|t| &t.device == device).map(|t| t.seq)
-    }
-
     /// What this head WITNESSES of `device`'s commits (COMMIT-LIFE ⁵), for a
     /// commit that would have landed at seq `commit_seq`: its `through`
     /// entry; or, with none, `NotThere` whenever that can be KNOWN -- the list
@@ -471,13 +465,6 @@ impl HeadRead {
         signer_proto::head::read_value(&self.value).filter(|h| !h.refused).map(|h| h.ledger.through).unwrap_or_default()
     }
 
-    /// Does it carry race put's §P mark (a `TAG_PARITY` in a v2 ledger):
-    /// every group it lists was recoverable when it was signed? A head without
-    /// it is pre-§P, or its ledger was refused: `false`.
-    pub fn parity_marked(&self) -> bool {
-        self.mark().is_some()
-    }
-
     /// Its §P mark and the ROOT's parity ids the mark lists (sdk#335): `None`
     /// unmarked; `Some(ids)`, ids empty when the mark lists none (or not as
     /// whole ids -- then the root is fetched singly, never rebuilt from a
@@ -501,16 +488,6 @@ impl From<(u64, Cid)> for HeadRead {
     fn from((seq, root): (u64, Cid)) -> HeadRead {
         HeadRead { seq, value: root.to_vec() }
     }
-}
-
-/// The ledger a head signed from `prev` carries: its PREV, omitted at the
-/// genesis (`prev_seq == 0`), never zeros, and the §P mark listing the root's
-/// parity ids. The bytes after the root in `signer_proto::Next`'s value; the
-/// one rule for every sign request.
-pub fn sign_ledger(prev_seq: u64, prev_root: Cid, root: Cid, root_parity: &[Cid]) -> Vec<u8> {
-    use signer_proto::head::{value, Ledger};
-    let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
-    value(&root, &Ledger { prev, parity: Some(mark(root_parity)), ..Ledger::default() })[32..].to_vec()
 }
 
 /// The §P mark's bytes: every head this build signs is race put's
@@ -1011,6 +988,8 @@ impl Page {
                 }
             }
             Answer::Updated { label: Label::Head } => {
+                // Its read-back already done by the pushed state (sdk#378 P3): the
+                // UPDATE's wait ended there, so this answer asks nothing more.
                 if self.answered(&Waiting::Update(Label::Head)).is_some() {
                     // A LANDING's UPDATE is judged by its own read — does the
                     // register now hold the head the signer named — never by
@@ -1352,6 +1331,7 @@ impl Page {
             let at = self.now + self.backoff(self.deadlines[&w].attempt);
             let d = self.deadlines.get_mut(&w).expect("listed");
             d.at = at;
+            d.armed = at;
             d.sent_at = self.now;
             d.resent = true;
             // Every label's in-flight read is re-sent (each re-subscribes its own register);
@@ -1367,12 +1347,47 @@ impl Page {
 
     /// The node said the head register changed (`HeadChanged`, a HINT a node
     /// can fabricate or drop): read it. ALWAYS — owed parity, an owed head
-    /// or idle alike (the architect's #5): only a verify in progress, which
-    /// reads the register itself, makes it redundant.
+    /// or idle alike (the architect's #5) — except while a read of the same
+    /// register is already owed: a verify in progress, or this page's own
+    /// READ-BACK (sdk#378 P2: its UPDATE is out, and the read-back that
+    /// follows its answer reads the register and judges whatever it holds —
+    /// this page's head, a newer one, a same-seq winner — so a second read
+    /// adds nothing but a node op on the node's one queue, F61).
     pub fn head_hint(&mut self) {
-        if self.verify.is_none() && !self.deadlines.contains_key(&Waiting::Hint) {
+        if self.verify.is_none() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
+    }
+
+    /// Is this page's own read-back owed: a head signed, its UPDATE sent, not yet confirmed (sdk#378)?
+    fn read_back_owed(&self) -> bool {
+        self.head.owed.as_ref().is_some_and(|o| o.record.is_some())
+    }
+
+    /// The node pushed the head register's FULL state (sdk#378 P3, the
+    /// architect's three conditions): (1) only a full state gets here
+    /// (`wire`'s `HeadChanged.state`); (2) it is judged by the ONE read-back
+    /// rule, and only as THIS page's own owed head -- exactly the owed seq and
+    /// root confirms it, as a read-back GET showing it would; anything else is
+    /// the hint it always was, answered by a real register read; (3) a dropped
+    /// push changes nothing: the read-back GET after the UPDATE's answer does
+    /// the job on its deadline. Nothing is ever ADOPTED from a push.
+    pub fn head_pushed(&mut self, read: HeadRead) {
+        let confirms = self.verify.is_none()
+            && self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && (o.seq, o.root) == (read.seq, read.root()));
+        if !confirms {
+            return self.head_hint();
+        }
+        self.last_head_at = self.now;
+        let h = Some((read.seq, read.root()));
+        self.last_head = Some(read);
+        // The read-back this push stands in for is no longer owed: whatever
+        // is on the wire for it -- the UPDATE whose answer would ask it, or the
+        // GET itself -- ends here, with no RTT sample (a push is not an answer
+        // to either request).
+        self.deadlines.remove(&Waiting::Update(Label::Head));
+        self.deadlines.remove(&Waiting::ReadBack(Label::Head));
+        self.on_read_back(h);
     }
 
     /// A record the signer returned (`Signed`, or `AlreadySigned`: the one it
@@ -1667,7 +1682,8 @@ impl Page {
         // other op's answers, so an op nobody answers was re-sent at that
         // small RTO for ever -- thousands of GETs in five minutes (measured
         // on a silent node once silence stopped ending a read).
-        let d = Deadline { at: self.now + self.backoff(attempt), op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false };
+        let at = self.now + self.backoff(attempt);
+        let d = Deadline { at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false };
         self.deadlines.insert(w, d);
         self.out.push(op);
     }
@@ -1737,7 +1753,7 @@ impl Page {
     fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
-        self.deadlines.insert(w, Deadline { at, op, sent_at: self.now, attempt, sent: false, resent: false });
+        self.deadlines.insert(w, Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false });
     }
 
     /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
@@ -1749,12 +1765,37 @@ impl Page {
         self.first_of.remove(w);
         if d.sent && d.attempt == 1 && !d.resent {
             self.rto.sample(self.now.saturating_sub(d.sent_at));
+            self.rearm_first_sends(self.rto.rto_ms());
         }
         if d.sent && matches!(w, Waiting::Get(_)) {
             self.window.opened();
             self.fill_gets();
         }
         Some(d.op)
+    }
+
+    /// EVERY first-send sample restarts the timer of every op still on its
+    /// FIRST send from THIS answer, never later than the deadline it was sent
+    /// with: `min(armed, now + rto)` (sdk#378; RFC 6298 §5.3, the architect).
+    ///
+    /// A deadline fixed at send let an op sent while a cold phase had backed
+    /// the shared RTO to its 60 s ceiling wait out the full minute though its
+    /// siblings kept answering (measured: V's first save, one lost PUT re-sent
+    /// at +59,999 ms, 12 siblings answered on first send within 2.1 s). Timed
+    /// from the SEND instead (`sent_at + rto`), the first -- fastest -- answer
+    /// of a batch the node serialises (F61, ~37 ms an op) would declare every
+    /// sibling queued past a few places lost while still being answered:
+    /// duplicate PUTs into the same queue. From the ANSWER, nothing is lost
+    /// while its siblings keep answering within one RTO of each other; a
+    /// re-arm may move a deadline later than a previous one, never past
+    /// `armed`. A RE-SEND keeps its backoff, and so does a reconnect re-send.
+    fn rearm_first_sends(&mut self, rto: u64) {
+        let now = self.now;
+        for d in self.deadlines.values_mut() {
+            if d.sent && d.attempt == 1 && !d.resent {
+                d.at = d.armed.min(now + rto);
+            }
+        }
     }
 
     /// GETs waiting on the window take the places that are free.
@@ -1772,14 +1813,6 @@ impl Page {
     /// what a merge reads a winner's `prev` from (sdk#225b).
     pub fn last_read(&self) -> Option<&HeadRead> {
         self.last_head.as_ref()
-    }
-
-    /// The signer answering this page predates sdk#225's rule (a stale
-    /// bundle: in page mode the signer's code ships with the page), and it
-    /// refuses every sign until the register moves on. The host asks for the
-    /// current version rather than letting the page sit.
-    pub fn needs_signer_upgrade(&self) -> bool {
-        self.old_signer_fork_at.is_some()
     }
 
     /// Has the engine recovered its head (its own head read answered)? A read
@@ -2188,20 +2221,6 @@ impl Page {
         std::mem::take(&mut self.client_fx)
     }
 
-    /// Effects this executor does not act on, for the caller.
-    pub fn take_other(&mut self) -> Vec<Effect> {
-        let mut out = Vec::new();
-        self.client_fx.retain(|f| {
-            if matches!(f, Effect::Notify { .. }) {
-                true
-            } else {
-                out.push(f.clone());
-                false
-            }
-        });
-        out
-    }
-
     /// Things this page could not do, by reason.
     /// Make this page a VIEW ([`Page::read_only`]): for good, set once when
     /// the page is made a reader of somebody's head.
@@ -2476,6 +2495,9 @@ mod parked_get {
         p.send(Waiting::Get(id), Op::Get { id });
         assert!(p.take_ops().contains(&Op::Get { id }), "the GET did not go out");
         p.answer(Answer::GetMissed(id), Ms(10));
+        // The page's OPENING head read is on the wire too; answered here, through the real path, so the tick
+        // below tests only the parked GET (a first-send sample re-arms every first send, sdk#378).
+        p.answered(&Waiting::RecoverHead);
         // After the answer: an attempt-1 answer is an RTO sample, and it opens the window.
         let (rto_before, window_before) = (p.rto.rto_ms(), p.window.size());
         let (sent, due) = p.deadlines.get(&Waiting::Get(id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
@@ -2489,6 +2511,98 @@ mod parked_get {
         // The engine here waits on nothing: the parked GET ends rather than going out.
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
+    }
+}
+
+#[cfg(test)]
+mod rto_rearm {
+    use super::*;
+
+    /// sdk#378: an op sent while the RTO was backed off to its ceiling is
+    /// re-sent one NEW RTO after its sibling's answer -- not after the minute
+    /// it was first given -- while a RE-SEND keeps its backoff.
+    #[test]
+    fn a_first_send_is_rearmed_when_a_sample_lowers_the_rto_and_a_resend_is_not() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        // A cold phase timed out tick after tick: the shared RTO at its ceiling.
+        for _ in 0..10 {
+            p.rto.timed_out();
+        }
+        assert_eq!(p.rto.rto_ms(), rto::RTO_MAX_MS as u64, "THE SETUP: the RTO is not at its ceiling");
+        let (answered, lost, resend) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        p.now = 1_000;
+        p.send(Waiting::Put(answered), Op::Put { id: answered, bytes: vec![1] });
+        p.send(Waiting::Put(lost), Op::Put { id: lost, bytes: vec![2] });
+        // A re-send: its first send went unanswered.
+        p.attempt_of.insert(Waiting::Put(resend), 1);
+        p.send(Waiting::Put(resend), Op::Put { id: resend, bytes: vec![3] });
+        let _ = p.take_ops();
+        let resend_at = p.deadlines[&Waiting::Put(resend)].at;
+        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_000 + rto::RTO_MAX_MS as u64, "THE SETUP: the lost PUT was not given the ceiling");
+        assert_eq!(p.deadlines[&Waiting::Put(resend)].attempt, 2, "THE SETUP: the re-send is not a second attempt");
+
+        // Its sibling is answered on its first send after 100 ms: a sample, and the RTO falls.
+        p.now = 1_100;
+        p.answered(&Waiting::Put(answered));
+        let rto = p.rto.rto_ms();
+        assert!(rto < 1_000, "THE SETUP: the sample did not lower the RTO ({rto} ms)");
+        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_100 + rto, "the lost PUT is not due one new RTO after its sibling's answer");
+        assert_eq!(p.deadlines[&Waiting::Put(resend)].at, resend_at, "a RE-SEND was pulled in: it keeps its backoff");
+
+        // And it is re-sent one RTO after that answer, not after a minute.
+        p.tick(Ms(1_100 + rto));
+        let again = p.take_ops();
+        assert!(again.contains(&Op::Put { id: lost, bytes: vec![2] }), "the lost PUT was not re-sent at the new RTO: {again:?}");
+        assert!(!again.iter().any(|o| matches!(o, Op::Put { id, .. } if *id == resend)), "the re-send went again early");
+    }
+}
+
+#[cfg(test)]
+mod rto_rearm_queue {
+    use super::*;
+
+    /// THE QUEUE (the architect, sdk#378): the node answers one client's ops
+    /// one at a time (F61), so a batch's answers arrive spread out, the first
+    /// the fastest. With the RTO at its ceiling, 13 PUTs go at once; 12 are
+    /// answered every 175 ms from 100 ms on, one never is. No answered
+    /// sibling is ever re-sent -- none is declared lost while the others keep
+    /// answering -- and the lost one is re-sent one RTO after the LAST answer.
+    #[test]
+    fn a_serialised_batch_re_sends_only_the_lost_put_one_rto_after_the_last_answer() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        // THE COLD OPEN, through the real path: the opening head read times out until the RTO is at its
+        // ceiling, then is answered on a RE-send -- no sample (Karn), so the batch meets the ceiling.
+        while p.rto.rto_ms() < rto::RTO_MAX_MS as u64 {
+            let due = p.deadlines[&Waiting::RecoverHead].at;
+            p.tick(Ms(due));
+            let _ = p.take_ops();
+        }
+        let start = p.now;
+        p.answered(&Waiting::RecoverHead);
+        assert_eq!(p.rto.rto_ms(), rto::RTO_MAX_MS as u64, "THE SETUP: the RTO is not at its ceiling");
+        assert!(p.rto.srtt_ms().is_none(), "THE SETUP: a sample was taken before the batch");
+        let ids: Vec<[u8; 32]> = (1..=13u8).map(|i| [i; 32]).collect();
+        let lost = ids[12];
+        for id in &ids {
+            p.send(Waiting::Put(*id), Op::Put { id: *id, bytes: vec![id[0]] });
+        }
+        let _ = p.take_ops();
+        let mut resent: Vec<u8> = Vec::new();
+        let mut last = 0;
+        for (i, id) in ids[..12].iter().enumerate() {
+            let t = start + 100 + 175 * i as u64;
+            p.tick(Ms(t));
+            resent.extend(p.take_ops().iter().filter_map(|o| match o { Op::Put { id, .. } => Some(id[0]), _ => None }));
+            p.now = t;
+            p.answered(&Waiting::Put(*id));
+            last = t;
+        }
+        assert!(resent.is_empty(), "answered siblings were declared lost and re-sent: {resent:?}");
+        let rto = p.rto.rto_ms();
+        println!("  12 answered 175 ms apart, last at {last}; rto {rto}; the lost PUT due at {}", p.deadlines[&Waiting::Put(lost)].at);
+        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, last + rto, "the lost PUT is not due one RTO after the last answer");
+        p.tick(Ms(last + rto));
+        assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at last answer + RTO");
     }
 }
 

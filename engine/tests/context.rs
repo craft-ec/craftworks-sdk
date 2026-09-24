@@ -1,9 +1,10 @@
-//! What survives a `process()` call, and what must not.
+//! The engine's own bounds: the empty leaf, the context BUDGET its
+//! bookkeeping is still held to (`context_len`, `keep_saveable`; whether that
+//! budget still earns its verdicts is sdk#385), the commit block cap, no
+//! global state, and what a fresh engine (a page reload) answers.
 //!
-//! A delegate's memory is fresh every time — measured, not assumed: fifty
-//! calls and the guest's own counter reads 1 every time, while the context's
-//! reads 50. So the context is the whole of what the engine carries forward,
-//! and it has 400 KiB to do it in.
+//! The context CARRY (`to_context` / `from_context`, a delegate rebuilt from
+//! its bytes each call) was deleted in #305: the engine lives in the page.
 
 use engine::{ClientId, Effect, Engine, Event, Op, Params, WriteId};
 use freenet_prolly::store::{Blocks, MemBlocks};
@@ -96,98 +97,6 @@ fn the_empty_leaf_is_the_only_block_the_core_knows_and_it_hashes_to_its_id() {
     );
 }
 
-/// The context round-trips, and refuses what it cannot read.
-#[test]
-fn a_context_round_trips_and_refuses_what_it_cannot_read() {
-    let mut store = Store::default();
-    // ABOUT the pack path: the property is that a pack's BYTES never ride in
-    // the context. Phase 3 leaves packing off the write path, so this turns
-    // it on to have a pack to look for at all.
-    let packed = Params {
-        pack_on_write: true,
-        ..Params::default()
-    };
-    let mut e = Engine::new(packed, store.clone());
-    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
-    let _ = e.step(Event::HeadMissing);
-    let out = e.step(Event::forced_write(
-        ClientId(1),
-        WriteId(1),
-        // Big enough that the pack is the dominant thing in the commit. With
-        // a tiny write the bookkeeping is legitimately larger than the pack,
-        // and "context < pack" would be the wrong property to assert.
-        (0..40u32)
-            .map(|i| {
-                (
-                    format!("k/{i:03}").into_bytes(),
-                    Op::Put(vec![(i % 251) as u8; 1400]),
-                )
-            })
-            .collect(),
-    ));
-    store.absorb(&out);
-
-    let bytes = e.to_context().expect("a context");
-    let root = e.root();
-    let back =
-        Engine::from_context(&bytes, packed, store.clone()).expect("its own context reads back");
-    assert_eq!(back.root(), root, "the root did not survive the round trip");
-
-    // Garbage, truncation and a wrong version are REFUSED, never a panic:
-    // these bytes come from outside the call.
-    for bad in [
-        vec![],
-        vec![0u8; 8],
-        b"not a context at all".to_vec(),
-        bytes[..bytes.len() / 2].to_vec(),
-    ] {
-        assert!(
-            Engine::from_context(&bad, packed, store.clone()).is_err(),
-            "a context of {} byte(s) was accepted",
-            bad.len()
-        );
-    }
-
-    // A context carries NO pack. That is the budget's whole premise.
-    let packed: usize = out
-        .iter()
-        .filter_map(|f| match f {
-            Effect::PutPack { bytes, .. } => Some(bytes.len()),
-            _ => None,
-        })
-        .sum();
-    assert!(
-        packed > 16 * 1024,
-        "the commit shipped only {packed} B of pack, so this proves nothing"
-    );
-    // The property is not "smaller" — it is that the pack is NOT IN THERE.
-    // A context that carried it would blow the 400 KiB budget on one commit.
-    let pack_bytes: Vec<Vec<u8>> = out
-        .iter()
-        .filter_map(|f| match f {
-            Effect::PutPack { bytes, .. } => Some(bytes.clone()),
-            _ => None,
-        })
-        .collect();
-    for p in &pack_bytes {
-        let probe = &p[..64.min(p.len())];
-        assert!(
-            !bytes.windows(probe.len()).any(|w| w == probe),
-            "the context contains a pack's bytes"
-        );
-    }
-    assert!(
-        bytes.len() * 4 < packed,
-        "the context ({} B) is the same order as the pack it must not carry \
-         ({packed} B); bookkeeping should not scale with payload",
-        bytes.len()
-    );
-    println!(
-        "  context {} B for a commit whose pack is {packed} B",
-        bytes.len()
-    );
-}
-
 /// What the context actually costs, for the shapes that can grow.
 ///
 /// Numbers, not adjectives: the platform gives a delegate 400 KiB of context
@@ -206,7 +115,7 @@ fn the_context_costs_what_it_is_budgeted() {
         key: engine::KeySource::SecretStore,
         epochs: vec![engine::Epoch(1)],
     });
-    let idle = e.to_context().expect("idle").len();
+    let idle = e.context_len();
 
     // One commit in flight over ~1 MiB of values. This is the shape that
     // grows with the SIZE of a write: the commit's bookkeeping names every
@@ -229,7 +138,7 @@ fn the_context_costs_what_it_is_budgeted() {
     let _ = e.step(Event::HeadMissing);
     let out = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
     store.absorb(&out);
-    let in_flight = e.to_context().expect("in flight").len();
+    let in_flight = e.context_len();
     let blocks = out
         .iter()
         .filter(|f| {
@@ -279,8 +188,9 @@ fn the_context_costs_what_it_is_budgeted() {
 /// The measured costs: an idle engine is 125 B, a parked read about 131 B,
 /// and a commit's bookkeeping about 60 B per block in flight. Unbounded, ten
 /// thousand parked reads make a 1.31 MB context — over three times the
-/// platform's 400 KiB — and `to_context` then fails, taking the IN-FLIGHT
-/// COMMIT with it. A read burst must not be able to destroy a write.
+/// platform's 400 KiB — and in the delegate era saving it failed, taking the
+/// IN-FLIGHT COMMIT with it. The budget still holds (sdk#385 asks whether it
+/// should).
 ///
 /// The shapes are measured APART and summed, because they cannot be built
 /// together: a commit needs a tree path it can read, and a parked read is one
@@ -298,7 +208,7 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
             key: engine::KeySource::SecretStore,
             epochs: vec![engine::Epoch(1)],
         });
-        e.to_context().expect("idle").len()
+        e.context_len()
     };
 
     // --- reads at their cap, and a burst well past it ---
@@ -334,7 +244,7 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
             refused += 1;
         }
     }
-    let reads = e.to_context().expect("the cap must keep it writable").len();
+    let reads = e.context_len();
     assert_eq!(
         refused,
         burst - p.max_parked_reads,
@@ -375,7 +285,7 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
         "the commit named {commit_blocks} block(s) for {n} oversized values, \
          so this does not measure per-block bookkeeping"
     );
-    let commit = e2.to_context().expect("a commit in flight").len();
+    let commit = e2.context_len();
     let per_block = (commit - idle) / commit_blocks;
     // What the cap costs, at the per-block rate this just measured.
     let commit_worst = idle + per_block * p.max_commit_blocks;
@@ -548,8 +458,8 @@ fn no_global_state_in_the_engine() {
     );
     assert!(
         found.is_empty(),
-        "the engine holds state outside its context, which a delegate's fresh \
-         linear memory throws away on every call:\n{}",
+        "the engine holds global state, which every engine in the process \
+         would share:\n{}",
         found.join("\n")
     );
 
@@ -608,112 +518,24 @@ fn no_global_state_in_the_engine() {
 }
 
 
-/// A damaged context is REFUSED, not decoded into a plausible engine.
+/// A page RELOAD costs a restart, not correctness.
 ///
-/// The context comes back from outside: a node's cache, as bytes, with no
-/// guarantee beyond their length. A version check plus `bincode::deserialize`
-/// is not enough, and this is the measurement that says so — core dev's probe
-/// overwrote every 8-byte window of a valid context with a large integer and
-/// **656 of 876 damaged contexts were ACCEPTED**. No panic and no runaway
-/// allocation, which is why nothing else caught it: the engine came back in
-/// whatever state the damage described, and since the context carries the
-/// `(seq, root)` of the commit in flight, it could then emit `UpdateHead`
-/// naming a root nobody has.
-///
-/// Refusal is free in this design — an engine with no context starts from its
-/// head and reports its in-flight writes `Lost` — so the bar is exact: accept
-/// only what this build wrote, byte for byte.
-#[test]
-fn a_damaged_context_is_refused_without_panicking_or_allocating_the_world() {
-    let store = Store::default();
-    let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
-    let ops: Vec<(Vec<u8>, Op)> = (0..200)
-        .map(|i| (format!("k{i:04}").into_bytes(), Op::Put(vec![7u8; 100])))
-        .collect();
-    // A new tree: nothing to recover. A write before recovery waits (sdk#223).
-    let _ = e.step(Event::HeadMissing);
-    let _ = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
-    let good = e.to_context().expect("context");
-
-    let (mut refused, mut accepted) = (0usize, 0usize);
-    for at in 0..good.len().saturating_sub(8) {
-        for fill in [u64::MAX, 3_000_000_000u64] {
-            let mut bad = good.clone();
-            bad[at..at + 8].copy_from_slice(&fill.to_le_bytes());
-            match Engine::from_context(&bad, Params::default(), store.clone()) {
-                Ok(_) => accepted += 1,
-                Err(_) => refused += 1,
-            }
-        }
-    }
-    // Truncations and the empty context: neither may panic.
-    let mut short = 0usize;
-    for cut in 0..good.len() {
-        if Engine::from_context(&good[..cut], Params::default(), store.clone()).is_err() {
-            short += 1;
-        }
-    }
-    assert!(
-        Engine::from_context(&[], Params::default(), store.clone()).is_err(),
-        "an empty context was accepted"
-    );
-
-    println!("  {} B context: {refused} damaged refused, {accepted} accepted, {short} truncations refused", good.len());
-    assert_eq!(
-        accepted, 0,
-        "{accepted} damaged context(s) were accepted and re-hydrated an \
-         engine in whatever state the damage described"
-    );
-    assert_eq!(
-        short,
-        good.len(),
-        "a truncated context was accepted: every prefix of a valid context is \
-         a context this build did not write"
-    );
-    // The probe must have RUN. Without this, `accepted == 0` is also what a
-    // zero-length context would report.
-    assert!(
-        refused > 800,
-        "only {refused} damaged context(s) were tried, so this is not the \
-         sweep the number above claims"
-    );
-    // ...and the undamaged one still round-trips, or the refusal is just a
-    // decoder that says no to everything.
-    assert!(
-        Engine::from_context(&good, Params::default(), store.clone()).is_ok(),
-        "the UNDAMAGED context was refused too"
-    );
-}
-
-/// A refused context costs a restart, not correctness.
-///
-/// This is the other half of refusing: it is only free if what follows is
-/// right. The engine starts from `Start`, re-reads its head, and gives a
-/// client asking about the write that was in flight NO verdict: a fresh
+/// A fresh engine starts from `Start`, re-reads its head, and gives a client
+/// asking about the write the old engine had in flight NO verdict: a fresh
 /// engine cannot tell a write that died from one whose head landed before the
 /// loss, so `Lost` would be a guess (WRITE-PATH.md session table; sdk#196).
 /// The client's own timeout hands the write back.
 #[test]
-fn a_refused_context_recovers_from_the_head_and_gives_the_unknown_write_no_verdict() {
+fn a_fresh_engine_recovers_from_the_head_and_gives_the_unknown_write_no_verdict() {
     let mut store = Store::default();
     let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
     let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![5u8; 40]))]));
     store.absorb(&out);
-    let good = e.to_context().expect("context");
     let published = e.published_root();
 
-    // One byte of the body, flipped. Nothing else about it is wrong.
-    let mut bad = good.clone();
-    let last = bad.len() - 1;
-    bad[last] ^= 0xFF;
-    assert!(
-        Engine::from_context(&bad, Params::default(), store.clone()).is_err(),
-        "a one-bit change to the body was accepted"
-    );
-
-    // So the delegate starts fresh, as it must.
+    // The page reloads: a new engine over the node's blocks.
     let mut e2: Engine<Store> = Engine::new(Params::default(), store.clone());
     let out = e2.step(Event::Start {
         key: engine::KeySource::SecretStore,
@@ -721,8 +543,8 @@ fn a_refused_context_recovers_from_the_head_and_gives_the_unknown_write_no_verdi
     });
     assert!(
         out.iter().any(|f| matches!(f, Effect::ReadHead { .. })),
-        "a fresh engine did not re-read its head, so a refused context loses \
-         the tree as well as the bookkeeping"
+        "a fresh engine did not re-read its head, so a reload loses the tree \
+         as well as the bookkeeping"
     );
     let _ = e2.step(Event::HeadRead {
         epoch: engine::Epoch(1),
@@ -754,6 +576,6 @@ fn a_refused_context_recovers_from_the_head_and_gives_the_unknown_write_no_verdi
          client's own timeout decides"
     );
     println!(
-        "  refused context: fresh start, head re-read, the unknown write answered with no verdict"
+        "  reload: fresh start, head re-read, the unknown write answered with no verdict"
     );
 }

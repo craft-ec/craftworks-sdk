@@ -34,7 +34,11 @@
 //!   suppress it. Fabrication is contained because the data is
 //!   content-addressed and must verify — so it is a confusion and denial
 //!   vector, not corruption — but **a root supplied by the node is never
-//!   authoritative until data verifies against it.**
+//!   authoritative until data verifies against it.** Its FULL state, when it
+//!   carries one, may do exactly one more thing (sdk#378 P3, the architect's
+//!   conditions): CONFIRM the head this page itself owes, judged by the page's
+//!   one read-back rule — never adopt anything, and a dropped push leaves the
+//!   read-back GET to do its job on its deadline.
 //! * [`Refused`] carries a reason the NODE chose. It may drive at most a
 //!   bounded retry, and **it may never lead to a credential prompt.**
 //!   "Refused: bad key → ask the person to re-enter their passphrase" is a
@@ -141,8 +145,11 @@ pub enum Incoming {
     /// A subscribed contract changed.
     ///
     /// **A HINT, never an authority.** See the module docs: a root from the
-    /// node means "look", not "this is where the tree is".
-    HeadChanged { key: String },
+    /// node means "look", not "this is where the tree is". `state` is the
+    /// contract's FULL new state when the node pushed one (`UpdateData::State`),
+    /// else `None` (a delta or a related-state push): only a full state may
+    /// confirm this page's own owed head (sdk#378 P3).
+    HeadChanged { key: String, state: Option<Vec<u8>> },
     /// A contract GET answered (ENGINE-SHAPE §2: the page reads blocks and the
     /// head itself). `id` is the contract's INSTANCE id, 32 bytes, as the node
     /// names it: the page matches it against the head it subscribed to. For a
@@ -290,21 +297,6 @@ pub fn frame_delegate_op(
         )],
     });
     frames(&req, stream_id)
-}
-
-/// Frame an engine message to a delegate registered with empty parameters.
-///
-/// The parameters are part of what the delegate's key is DERIVED from, so
-/// addressing it with different ones names a delegate that was never
-/// registered. `delegate_from_code` registers with empty parameters and this
-/// addresses with empty parameters; keeping the pair in one file is what
-/// stops them drifting apart.
-pub fn frame_engine_request(
-    key: &DelegateKey,
-    payload: Vec<u8>,
-    stream_id: u32,
-) -> Result<Vec<Vec<u8>>, String> {
-    frame_delegate_op(key, &Parameters::from(vec![]), payload, stream_id)
 }
 
 /// A contract's instance id, from the 32 bytes that name it.
@@ -546,9 +538,14 @@ fn classify(r: HostResponse) -> Incoming {
         HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
             Incoming::Ack(AckKind::Updated(key.to_string()))
         }
-        HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, .. }) => {
+        HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update }) => {
+            let state = match update {
+                UpdateData::State(s) => Some(s.as_ref().to_vec()),
+                _ => None,
+            };
             Incoming::HeadChanged {
                 key: key.to_string(),
+                state,
             }
         }
         HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {

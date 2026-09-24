@@ -19,7 +19,6 @@
 
 use freenet_prolly::{block_id, kind, pack as format, Cid};
 
-pub const PACK_MAGIC: &[u8; 4] = format::MAGIC;
 pub const MANIFEST_MAGIC: &[u8; 4] = b"CM01";
 
 /// The kind byte a pack is stored under. Not a kind this crate may invent:

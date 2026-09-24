@@ -10,6 +10,8 @@
 //! writes of `PER_WRITE`, each waited on until `Published`, then reads the
 //! whole range back through the same page and checks every row.
 //!
+//! SETTLE=backed: each write waits for the last to be BACKED_UP (a save on an idle node), not back to back.
+//!
 //! usage: PAGE_PORT=<port> PAGE_TMP=<dir> live-page-writes <signer.wasm> <block.wasm> <register.wasm>
 //! The node's data, config and log dirs are all under PAGE_TMP (explicit, no
 //! default); the node runs with --disable-auto-update (probe::node).
@@ -25,6 +27,35 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 const PER_WRITE: usize = 10;
+
+thread_local! {
+    /// THE OP ORDER (#378): every frame sent, one letter each -- `P` a contract PUT, `U` an UPDATE, `G` a GET,
+    /// `S` a delegate op (during a write: the Sign), `c` a chunk of a larger request.
+    static OPS: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The writes told `ParityComplete` (BACKED_UP): every parity PUT still sent and acked.
+    static BACKED: std::cell::RefCell<std::collections::BTreeSet<u64>> = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+fn note_backed(r: &Reply) {
+    let r = match r {
+        Reply::Acked { body, .. } => body,
+        r => r,
+    };
+    if let Reply::SessionWriteState { write_id, state: protocol::WriteState::ParityComplete, .. } | Reply::WriteState { write_id, state: protocol::WriteState::ParityComplete } = r {
+        BACKED.with(|b| b.borrow_mut().insert(*write_id));
+    }
+}
+
+fn op_letter(frame: &[u8]) -> char {
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+    match bincode::deserialize::<ClientRequest>(frame) {
+        Ok(ClientRequest::ContractOp(ContractRequest::Put { .. })) => 'P',
+        Ok(ClientRequest::ContractOp(ContractRequest::Update { .. })) => 'U',
+        Ok(ClientRequest::ContractOp(ContractRequest::Get { .. })) => 'G',
+        Ok(ClientRequest::DelegateOp(_)) => 'S',
+        _ => 'c',
+    }
+}
 const SESSION: u64 = 11;
 
 fn now_ms(t0: Instant) -> u64 {
@@ -98,10 +129,13 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
         let mut held: Vec<Vec<u8>> = Vec::new();
         loop {
             for f in io.take_frames() {
+                OPS.with(|o| o.borrow_mut().push(op_letter(&f)));
                 sock.send(Message::Binary(f.into())).await.context("send")?;
             }
             for r in io.take_replies() {
-                replies.push(protocol::decode_reply(&r).map_err(|d| anyhow::anyhow!("a reply that does not decode: {d:?}"))?);
+                let r = protocol::decode_reply(&r).map_err(|d| anyhow::anyhow!("a reply that does not decode: {d:?}"))?;
+                note_backed(&r);
+                replies.push(r);
             }
             if done(&replies, io) {
                 return Ok(replies);
@@ -141,11 +175,24 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
     io.client(&protocol::encode_session_request(4, SESSION, &Request::Identity).expect("encodes"));
     drive(&mut sock, &mut io, t0, Duration::from_secs(60), &mut 0, |r, _| r.iter().any(|x| matches!(x, Reply::Identity { .. }))).await.context("identity")?;
 
+    BACKED.with(|b| b.borrow_mut().clear()); // per run: the writes' ids restart at 1
     let mut write_ms = Vec::new();
+    // Per write: the PUTs sent before its Sign, and after it (while the write is waited on).
+    let mut sign_at: Vec<(usize, usize)> = Vec::new();
+    // SETTLE=backed: each write waits for the one before it to be BACKED_UP, so it is saved on an idle node (the
+    // one-row save a person makes); unset, the writes go back to back (throughput: each queues behind the last one's
+    // parity).
+    let settle = std::env::var("SETTLE").is_ok_and(|v| v == "backed");
     for (w, chunk) in (0..n).collect::<Vec<_>>().chunks(PER_WRITE).enumerate() {
         let id = w as u64 + 1;
+        if settle && id > 1 {
+            drive(&mut sock, &mut io, t0, Duration::from_secs(60), &mut 0, |_, _| BACKED.with(|b| b.borrow().contains(&(id - 1))))
+                .await
+                .with_context(|| format!("write {} never BACKED_UP", id - 1))?;
+        }
         let ops = chunk.iter().map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), format!("value {i} of run {run}").into_bytes())).collect();
         let t = Instant::now();
+        OPS.with(|o| o.borrow_mut().clear());
         // A write that does not read what it changes is sent FORCED
         // (sdk#283): a reads-less `Request::Write` is refused `Unread`.
         io.client(&protocol::encode_session_request(4, SESSION, &Request::forced_write(id, ops)).expect("encodes"));
@@ -158,7 +205,23 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
             bail!("{why}");
         }
         write_ms.push(t.elapsed().as_millis());
+        let ops = OPS.with(|o| o.borrow().clone());
+        if let Some(at) = ops.find('S') {
+            sign_at.push((ops[..at].matches('P').count(), ops[at..].matches('P').count()));
+        }
+        if w < 2 {
+            println!("write {id} op order: {ops}");
+        }
     }
+
+    // BACKED_UP: every write, its follow-up parity included, acked -- waited on here, and the PUTs it took.
+    let t = Instant::now();
+    OPS.with(|o| o.borrow_mut().clear());
+    let writes = write_ms.len() as u64;
+    drive(&mut sock, &mut io, t0, Duration::from_secs(60), &mut 0, |_, _| BACKED.with(|b| (1..=writes).all(|w| b.borrow().contains(&w))))
+        .await
+        .with_context(|| format!("BACKED_UP: {} of {writes} writes; ops while waiting: {}", BACKED.with(|b| b.borrow().len()), OPS.with(|o| o.borrow().clone())))?;
+    let backed_line = format!("BACKED_UP: {writes} of {writes} writes, the last {} ms after the last Published, {} PUT(s) after it", t.elapsed().as_millis(), OPS.with(|o| o.borrow().matches('P').count()));
 
     // READ BACK: the whole range, through the same page.
     let req = Request::Range { req_id: 900, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 256 };
@@ -223,13 +286,22 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
         bail!("reopen: the first page read {first} rows after 3 lost head reads (want {}): an empty tree?", n.min(256));
     }
     let (rto, srtt, window) = io.server.page.clock();
+    let mut before: Vec<usize> = sign_at.iter().map(|x| x.0).collect();
+    let mut after: Vec<usize> = sign_at.iter().map(|x| x.1).collect();
+    before.sort();
+    after.sort();
+    let med = |v: &[usize]| v.get(v.len() / 2).copied().unwrap_or(0);
     let mut sorted = write_ms.clone();
     sorted.sort();
+    println!("{backed_line}");
     Ok(format!(
-        "GREEN: {n} rows in {} writes: every write Published and every row read back; a reopened page with 3 lost head reads read {first} rows. provisioned in {provisioned_ms} ms; per write median {} ms, max {} ms; total {} ms; page clock at the end: RTO {rto} ms, SRTT {:.1?} ms, GET window {window}; unusable {:?}",
+        "GREEN: {n} rows in {} writes: every write Published and every row read back; a reopened page with 3 lost head reads read {first} rows. provisioned in {provisioned_ms} ms; per write median {} ms, max {} ms; the Sign after a median {} PUT(s) of the write, {} after it ({} writes); total {} ms; page clock at the end: RTO {rto} ms, SRTT {:.1?} ms, GET window {window}; unusable {:?}",
         write_ms.len(),
         sorted[sorted.len() / 2],
         sorted.last().copied().unwrap_or(0),
+        med(&before),
+        med(&after),
+        sign_at.len(),
         t0.elapsed().as_millis(),
         srtt,
         io.unusable()

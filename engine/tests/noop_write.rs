@@ -10,7 +10,7 @@ use engine::{ClientId, Effect, Event, Op, Params, State, WriteId};
 use freenet_prolly::Cid;
 
 mod common;
-use common::{Harness, Mode, Store};
+use common::{Harness, Store};
 
 fn write(id: u64, key: &[u8], value: &[u8]) -> Event {
     Event::forced_write(ClientId(1), WriteId(id), vec![(key.to_vec(), Op::Put(value.to_vec()))])
@@ -63,7 +63,7 @@ fn settle(h: &mut Harness, mut fx: Vec<Effect>) -> Vec<Effect> {
 
 #[test]
 fn an_identical_write_is_published_at_once_and_the_next_write_is_accepted() {
-    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    let mut h = Harness::new(Params::default(), Store::fresh());
     let first = h.step(write(1, b"schema/tasks", b"v1"));
     let all = settle(&mut h, first);
     assert!(states(&all, 1).contains(&State::Published));
@@ -97,7 +97,7 @@ fn an_identical_write_is_published_at_once_and_the_next_write_is_accepted() {
 /// and nothing more, however many ticks pass under `max_accept_age`.
 #[test]
 fn a_real_change_is_not_published_without_its_head() {
-    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    let mut h = Harness::new(Params::default(), Store::fresh());
     let first = h.step(write(1, b"schema/tasks", b"v1"));
     let _ = settle(&mut h, first);
 
@@ -133,11 +133,10 @@ fn a_real_change_is_not_published_without_its_head() {
 /// still to come.
 #[test]
 fn a_no_op_while_parity_is_owed_is_parity_complete_only_when_it_is() {
-    // LIVE: the page's engine, which keeps its Backing in memory across calls
-    // (the architect's correction (c): never in the context). A RELOAD loses
-    // the stragglers by design -- COMMIT-LIFE §P's stated residual, which the
-    // keeper covers -- so this is not a Rehydrate question.
-    let mut h = Harness::new(Mode::Live, Params::default(), Store::fresh());
+    // The page's engine keeps its Backing in memory across calls. A RELOAD
+    // loses the stragglers by design -- COMMIT-LIFE §P's stated residual,
+    // which the keeper covers.
+    let mut h = Harness::new(Params::default(), Store::fresh());
     let big = vec![7u8; 30 * 1024];
     // Write 1: every block acked but ONE parity block -- published (its group
     // is recoverable), not backed up.
@@ -165,6 +164,17 @@ fn a_no_op_while_parity_is_owed_is_parity_complete_only_when_it_is() {
     }) {
         all.extend(h.step(Event::HeadConfirmed(seq)));
     }
+    // The parity that FOLLOWS the Sign (#378 P1-hybrid) is acked too: only `held` stays out.
+    let follow: Vec<Cid> = all
+        .iter()
+        .filter_map(|f| match f {
+            Effect::PutBlock { id, .. } if *id != held && !first.iter().any(|g| matches!(g, Effect::PutBlock { id: x, .. } if x == id)) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for id in follow {
+        all.extend(h.step(Event::PutConfirmed(id)));
+    }
     assert_eq!(states(&all, 1), vec![State::Accepted, State::Published], "write 1 with a straggler out");
 
     let again = h.step(write(2, b"k/big", &big));
@@ -189,7 +199,7 @@ fn a_no_op_while_parity_is_owed_is_parity_complete_only_when_it_is() {
 /// would return through here.
 #[test]
 fn a_write_back_to_an_earlier_value_commits_and_publishes() {
-    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    let mut h = Harness::new(Params::default(), Store::fresh());
     for (id, v) in [(1u64, b"A"), (2, b"B")] {
         let fx = h.step(write(id, b"k/v", v));
         assert!(states(&settle(&mut h, fx), id).contains(&State::Published));

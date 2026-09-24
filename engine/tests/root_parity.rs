@@ -47,6 +47,34 @@ fn states(fx: &[Effect], id: u64) -> Vec<State> {
         .collect()
 }
 
+/// Ack every PUT the first send and every later step emit except `skip`, and land the head when it goes (the parity
+/// that follows it, #378 P1-hybrid, is emitted as it lands). Every effect, in order.
+fn ack_all_but(e: &mut Engine<Store>, fx: &[Effect], skip: &BTreeSet<Cid>) -> Vec<Effect> {
+    let mut all = fx.to_vec();
+    let mut queue: Vec<Cid> = puts(fx).into_keys().collect();
+    let mut done: BTreeSet<Cid> = BTreeSet::new();
+    let mut landed = false;
+    loop {
+        while let Some(id) = queue.pop() {
+            if skip.contains(&id) || !done.insert(id) {
+                continue;
+            }
+            let more = e.step(Event::PutConfirmed(id));
+            queue.extend(puts(&more).into_keys());
+            all.extend(more);
+        }
+        match head(&all) {
+            Some(seq) if !landed => {
+                landed = true;
+                let more = e.step(Event::HeadConfirmed(seq));
+                queue.extend(puts(&more).into_keys());
+                all.extend(more);
+            }
+            _ => return all,
+        }
+    }
+}
+
 /// The root's parity blocks as the tree's own rule codes a group of one node.
 fn coded(root_bytes: &[u8]) -> Vec<Cid> {
     let mut st = vec![kind::TREE_NODE];
@@ -64,7 +92,7 @@ fn first_commit(n: u32) -> (Engine<Store>, Vec<Effect>) {
 }
 
 #[test]
-fn the_root_is_coded_as_a_group_of_one_and_put_in_the_first_send() {
+fn the_root_is_coded_as_a_group_of_one_and_one_of_its_parity_is_in_the_first_send() {
     let (e, fx) = first_commit(600);
     let sent = puts(&fx);
     let root = e.root();
@@ -72,7 +100,8 @@ fn the_root_is_coded_as_a_group_of_one_and_put_in_the_first_send() {
     assert_eq!(ids.len(), PARITY, "the root's parity is not PARITY blocks");
     assert_eq!(ids, coded(&sent[&root]), "the root's parity is not the tree's k = 1 code of the root");
     assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), PARITY, "the root's parity blocks are not distinct");
-    assert!(ids.iter().all(|p| sent.contains_key(p)), "the root's parity is not in the commit's first send");
+    // THE FIRST WAVE (#378 P1-hybrid): ONE of the root's parity in the first send; the rest follow the Sign.
+    assert_eq!(ids.iter().filter(|p| sent.contains_key(*p)).count(), 1, "not exactly one root parity in the first send");
     assert!(!ids.contains(&root));
 }
 
@@ -99,12 +128,7 @@ fn backed_up_waits_for_every_block_of_the_root_group() {
     let (mut e, fx) = first_commit(600);
     let root = e.root();
     let last = *e.root_parity_of(&root).last().unwrap();
-    let mut all = fx.clone();
-    for id in puts(&fx).keys().filter(|id| **id != last) {
-        all.extend(e.step(Event::PutConfirmed(*id)));
-    }
-    let seq = head(&all).expect("signed");
-    all.extend(e.step(Event::HeadConfirmed(seq)));
+    let all = ack_all_but(&mut e, &fx, &BTreeSet::from([last]));
     assert!(states(&all, 1).contains(&State::Published));
     assert!(!states(&all, 1).contains(&State::ParityComplete), "BACKED_UP with a root parity block out");
     let more = e.step(Event::PutConfirmed(last));
@@ -118,18 +142,10 @@ fn a_root_move_withdraws_the_old_roots_parity() {
     let r1 = e.root();
     let rp1 = e.root_parity_of(&r1);
     let straggler = rp1[0];
-    let mut all = fx.clone();
-    for id in puts(&fx).keys().filter(|id| **id != straggler) {
-        all.extend(e.step(Event::PutConfirmed(*id)));
-    }
-    all.extend(e.step(Event::HeadConfirmed(head(&all).expect("signed"))));
+    ack_all_but(&mut e, &fx, &BTreeSet::from([straggler]));
     let fx2 = e.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     e.blocks().absorb(&fx2);
-    let mut all2 = fx2.clone();
-    for id in puts(&fx2).keys() {
-        all2.extend(e.step(Event::PutConfirmed(*id)));
-    }
-    all2.extend(e.step(Event::HeadConfirmed(head(&all2).expect("signed"))));
+    let all2 = ack_all_but(&mut e, &fx2, &BTreeSet::new());
     assert_ne!(e.root(), r1);
     let withdrawn: BTreeSet<Cid> = all2.iter().filter_map(|f| match f { Effect::Withdraw { id } => Some(*id), _ => None }).collect();
     assert!(withdrawn.contains(&straggler), "the superseded root's parity was not withdrawn");

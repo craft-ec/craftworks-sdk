@@ -98,13 +98,10 @@ pub struct Server {
     /// Published of ours at the new head) from a commit of ours.
     seen_head: (u64, freenet_prolly::Cid),
     /// How many heads this page has ADOPTED — moved, and NOT by a commit of
-    /// this page's (sdk#266) — the one statement of that fact. Its readers
-    /// keep their own cursors: the client ([`Server::take_adopted`]) to know
-    /// its loaded ranges are behind, the page's store to supersede reads
-    /// pinned to an older root (#330 ruling).
+    /// this page's (sdk#266) — the one statement of that fact. Its reader
+    /// keeps its own cursor: the page's store, to supersede reads pinned to
+    /// an older root (#330 ruling).
     adoptions: u64,
-    /// Where the client's `take_adopted` last read `adoptions`.
-    adoptions_taken: u64,
     /// Readers' fetches that ENDED, in order: each a ticket a walk is parked
     /// on (READ-STATE). Drained by [`Server::take_fetched`].
     fetched: Vec<(u64, Fetched)>,
@@ -276,7 +273,6 @@ impl Server {
             tip: None,
             seen_head: (0, [0; 32]),
             adoptions: 0,
-            adoptions_taken: 0,
             fetched: Vec::new(),
             probe: None,
             next_probe: 1,
@@ -346,6 +342,17 @@ impl Server {
     pub fn head_hint(&mut self) {
         let mut out = Outbound::default();
         self.page.head_hint();
+        self.drain(&mut out);
+        self.answer_call(&mut out);
+        self.out.extend(out.replies);
+    }
+
+    /// The node's `HeadChanged` for the head register WITH its full state
+    /// (sdk#378 P3): the page may take it as its own owed head's read-back,
+    /// and otherwise treats it as the hint it always was.
+    pub fn head_pushed(&mut self, read: crate::HeadRead) {
+        let mut out = Outbound::default();
+        self.page.head_pushed(read);
         self.drain(&mut out);
         self.answer_call(&mut out);
         self.out.extend(out.replies);
@@ -603,45 +610,10 @@ impl Server {
             .map(|(_, _, s)| stage_fate(s))
     }
 
-    /// Unread terminal fates dropped past the bound (never silently).
-    pub fn fates_dropped(&self) -> u64 {
-        self.fates.dropped
-    }
-
-    /// Unread terminal fates held.
-    pub fn fates_unread(&self) -> usize {
-        self.fates.unread_count()
-    }
-
     /// `session`'s conflicts not yet taken for `Db`'s re-run (#249), each
     /// with the writes that cascade from it: `(write ids, keys)`. Drained.
     pub fn take_conflicted(&mut self, session: u64) -> Vec<(Vec<u64>, Vec<Vec<u8>>, u32)> {
         self.fates.take_conflicted(session)
-    }
-
-    /// The keys in `[lo, hi)` where the warm root and the published root
-    /// differ: this page's writes not yet published. `None` when a block the
-    /// diff needs is not held (never a shorter list).
-    pub fn pending_keys(&self, lo: &[u8], hi: &[u8]) -> Option<Vec<Vec<u8>>> {
-        let (warm, published) = self.heads()?;
-        if warm == published {
-            return Some(Vec::new());
-        }
-        let mut out = Vec::new();
-        let mut lo = std::ops::Bound::Included(lo.to_vec());
-        loop {
-            let spec = engine::read::DeltaSpec { from: published, lo: lo.clone(), hi: std::ops::Bound::Excluded(hi.to_vec()), max_entries: 4096 };
-            match self.page.walk(&warm, &engine::read::Walk::Delta(Box::new(spec))) {
-                engine::read::Walked::Done(engine::read::ReadResult::Delta { changes, cursor, .. }) => {
-                    out.extend(changes.into_iter().map(|(k, _)| k));
-                    match cursor {
-                        Some(c) => lo = std::ops::Bound::Excluded(c),
-                        None => return Some(out),
-                    }
-                }
-                _ => return None,
-            }
-        }
     }
 
     /// Where `key` stands (R-b): `Saving` while the warm and published roots
@@ -752,14 +724,6 @@ impl Server {
     /// Readers' fetches that ended since the last call, in order. Drains.
     pub fn take_fetched(&mut self) -> Vec<(u64, Fetched)> {
         std::mem::take(&mut self.fetched)
-    }
-
-    /// Has this page ADOPTED a head that was not its own commit since the
-    /// last call (sdk#266)? Drains.
-    pub fn take_adopted(&mut self) -> bool {
-        let moved = self.adoptions > self.adoptions_taken;
-        self.adoptions_taken = self.adoptions;
-        moved
     }
 
     /// One of the Server's own reads answered: a probe's `Get`, or a page of

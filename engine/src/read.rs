@@ -188,6 +188,35 @@ impl From<&Range> for ScanSpec {
     }
 }
 
+/// A parked DELTA's own progress (sdk#135, apply-and-resume): the prefix it has established, and where it resumes.
+///
+/// In MEMORY only (the architect's ruling): the engine Context is test-only, delegate-era code slated for deletion,
+/// and a delta rehydrated without this simply restarts from `from` -- correct, only slower.
+///
+/// **The stall rule** (K = 2, the architect's ruling with engineer4's correction): a delta below the node's
+/// retention floor livelocks on ANSWERED re-fetches -- the node evicts what it served before the next attempt can use
+/// it. A fetch CYCLE (from the asks made while no earlier ask was outstanding, until every one of them has arrived)
+/// is NO PROGRESS when `(after, acc.len())` did not move AND every block it asked had already arrived at this resume
+/// position (`seen`). Two in a row answer `FullReloadRequired`, the delta's defined answer (the reload is a scan,
+/// which resumes by `frontier` and finishes under eviction). A descent asks NEW blocks, so it never counts; a cycle
+/// with an unanswered ask never ends (silence is re-asked, rule 8), so a slow network never trips it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DeltaProgress {
+    /// Resume strictly after this key; `None`: from the start.
+    pub after: Option<Vec<u8>>,
+    /// The established prefix, in key order: final, never re-delivered or rewritten.
+    pub acc: Changes,
+    /// Blocks that have arrived for this read at the current resume position. Cleared when `after` advances, so it
+    /// is bounded by the descent it tracks (a few spines and a page's values), never by the delta's size.
+    pub seen: BTreeSet<Cid>,
+    /// This cycle asked at least one block not in `seen`: a descent, so progress.
+    pub cycle_new: bool,
+    /// `(after, acc.len())` when the current cycle began; `None` before the first.
+    pub cycle_start: Option<(Option<Vec<u8>>, usize)>,
+    /// No-progress cycles in a row.
+    pub stalled: u8,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Parked {
     pub client: ClientId,
@@ -216,6 +245,9 @@ pub(crate) struct Parked {
     /// read parks, and the frontier is a node of that same tree, so a head
     /// that moves underneath changes nothing about what this read answers.
     pub frontier: Option<Cid>,
+    /// A DELTA's prefix and resume point (sdk#135). Not in the Context (see [`DeltaProgress`]).
+    #[serde(skip)]
+    pub delta: DeltaProgress,
     pub levels_done: usize,
     /// Fetch rounds this read has made without finishing.
     ///
@@ -344,94 +376,15 @@ pub(crate) fn attempt<B: Blocks>(
                 }
             }
         }
-        Want::Delta(spec) => {
-            let r = Range {
-                lo: spec.lo.clone(),
-                hi: spec.hi.clone(),
-                reverse: false,
-                after: None,
-                max_entries: spec.max_entries,
-                max_bytes: usize::MAX,
-            };
-            match freenet_prolly::diff::diff(blocks, &spec.from, root, &r, None) {
-                Ok(page) => {
-                    if !page.need.is_empty() {
-                        // The diff stopped on blocks it does not hold. Its
-                        // change list is "what was found BEFORE it stopped",
-                        // which is not the answer to the question, so it is
-                        // not returned as one.
-                        return Attempt::Need(
-                            page.need
-                                .into_iter()
-                                .take(params.max_fetch_per_round)
-                                .collect(),
-                        );
-                    }
-                    // A changed entry whose value lives in its own block is
-                    // the same hazard as in a scan: materialising what is not
-                    // warm yields an EMPTY value for a key that has one.
-                    let missing: Vec<Cid> = page
-                        .changes
-                        .iter()
-                        .filter_map(|c| match c {
-                            freenet_prolly::diff::Change::Added { new, .. }
-                            | freenet_prolly::diff::Change::Changed { new, .. } => match new {
-                                Value::Ref { cid, .. } if blocks.get(cid).is_none() => Some(*cid),
-                                _ => None,
-                            },
-                            freenet_prolly::diff::Change::Removed { .. } => None,
-                        })
-                        .collect();
-                    if !missing.is_empty() {
-                        return Attempt::Need(
-                            missing
-                                .into_iter()
-                                .take(params.max_fetch_per_round)
-                                .collect(),
-                        );
-                    }
-                    let next = page.next.as_ref().map(|n| n.after.clone());
-                    let changes = page
-                        .changes
-                        .into_iter()
-                        .map(|c| match c {
-                            freenet_prolly::diff::Change::Added { key, new } => {
-                                (key, Some(materialise(blocks, new)))
-                            }
-                            freenet_prolly::diff::Change::Changed { key, new, .. } => {
-                                (key, Some(materialise(blocks, new)))
-                            }
-                            // A removal carries no value. `None` IS the
-                            // change — a reader that dropped the key is
-                            // correct, and one told an empty value is not.
-                            freenet_prolly::diff::Change::Removed { key, .. } => (key, None),
-                        })
-                        .collect();
-                    Attempt::Done(ReadResult::Delta {
-                        changes,
-                        cursor: next,
-                        new_root: *root,
-                    })
-                }
-                Err(freenet_prolly::diff::DiffError::Read(ReadError::Need(ids))) => {
-                    Attempt::Need(ids)
-                }
-                Err(freenet_prolly::diff::DiffError::Read(ReadError::Corrupt(cid, _)))
-                | Err(freenet_prolly::diff::DiffError::Read(ReadError::Mismatch(cid))) => {
-                    Attempt::Broken(cid)
-                }
-                // A resume token from another pair of roots, or an
-                // instruction a diff has no answer for. Neither is a missing
-                // block, so neither is fixed by fetching: it is an empty,
-                // complete delta rather than a retry for ever.
-                // A resume token from another pair of roots, or an
-                // instruction a diff has no answer for. Neither is fixed by
-                // fetching, and an EMPTY delta would tell the reader it is up
-                // to date when nobody checked — so it is sent to the full
-                // read, which is always correct.
-                Err(_) => Attempt::Done(ReadResult::FullReloadRequired { new_root: *root }),
-            }
-        }
+        // The walk's delta (and a delta's first attempt) is `delta_step` from the start; a PREFIX it establishes is
+        // not an answer to the whole question, so here it is only a need. A parked delta keeps the prefix instead
+        // (`Engine::drive`, sdk#135).
+        Want::Delta(spec) => match delta_step(blocks, params, spec, root, None, spec.max_entries) {
+            DeltaStep::Done { changes, cursor } => Attempt::Done(ReadResult::Delta { changes, cursor, new_root: *root }),
+            DeltaStep::Prefix { need, .. } | DeltaStep::Need(need) => Attempt::Need(need),
+            DeltaStep::Broken(cid) => Attempt::Broken(cid),
+            DeltaStep::Reload => Attempt::Done(ReadResult::FullReloadRequired { new_root: *root }),
+        },
         Want::Scan(spec) => {
             let opts = RangeOptions::default();
             let r: Range = spec.as_ref().into();
@@ -516,6 +469,98 @@ pub(crate) fn short_page<B: Blocks>(blocks: &B, want: &Want, root: &Cid) -> Opti
         cursor: Some(last),
         complete: false,
     })
+}
+
+/// A delta's changes as the reply carries them: key, and the new value (`None`: removed).
+pub type Changes = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
+/// One attempt of a DELTA, resumed after `after` (sdk#135, apply-and-resume).
+pub(crate) enum DeltaStep {
+    /// Finished for the range, or its page limit (`cursor`).
+    Done { changes: Changes, cursor: Option<Vec<u8>> },
+    /// A correct PREFIX was established (freenet_prolly::diff's page contract, prolly#51) and the diff stopped on
+    /// blocks it does not hold: apply `changes`, resume after `after`, fetch `need`.
+    Prefix { changes: Changes, after: Option<Vec<u8>>, need: Vec<Cid> },
+    /// Nothing established: fetch these (a changed value not warm, or a block before any decided key).
+    Need(Vec<Cid>),
+    Broken(Cid),
+    /// Not answerable by fetching (another pair of roots, an instruction a diff has no answer for): the full read.
+    Reload,
+}
+
+/// The diff from `spec.from` to `root`, resumed strictly after `after`, at most `room` changes.
+///
+/// A page is a correct PREFIX of the full diff (freenet_prolly::diff, "Paging, and what a page means"): every change
+/// up to where it stopped is final, and `next` never passes the first key it could not establish. So a page that
+/// stopped on missing blocks is KEPT, not discarded -- which is what lets a delta finish on a node that evicts what
+/// it serves (sdk#135: discarding needed the diff's whole working set co-resident, and never got it). A prefix is
+/// taken only once every changed value in it is warm: materialising a value that is not yields an EMPTY value for a
+/// key that has one.
+pub(crate) fn delta_step<B: Blocks>(
+    blocks: &B,
+    params: &Params,
+    spec: &DeltaSpec,
+    root: &Cid,
+    after: Option<&[u8]>,
+    room: usize,
+) -> DeltaStep {
+    use freenet_prolly::diff::{Change, DiffError, Resume};
+    let r = Range {
+        lo: spec.lo.clone(),
+        hi: spec.hi.clone(),
+        reverse: false,
+        after: None,
+        max_entries: room,
+        max_bytes: usize::MAX,
+    };
+    // Both roots travel with the resume key, so a resume against another pair is refused, never mixed.
+    let resume = after.map(|a| Resume { a: spec.from, b: *root, after: a.to_vec() });
+    match freenet_prolly::diff::diff(blocks, &spec.from, root, &r, resume.as_ref()) {
+        Ok(page) => {
+            let missing: Vec<Cid> = page
+                .changes
+                .iter()
+                .filter_map(|c| match c {
+                    Change::Added { new, .. } | Change::Changed { new, .. } => match new {
+                        Value::Ref { cid, .. } if blocks.get(cid).is_none() => Some(*cid),
+                        _ => None,
+                    },
+                    Change::Removed { .. } => None,
+                })
+                .collect();
+            if !missing.is_empty() {
+                return DeltaStep::Need(missing.into_iter().take(params.max_fetch_per_round).collect());
+            }
+            let next = page.next.as_ref().map(|n| n.after.clone());
+            let changes: Changes = page
+                .changes
+                .into_iter()
+                .map(|c| match c {
+                    Change::Added { key, new } | Change::Changed { key, new, .. } => (key, Some(materialise(blocks, new))),
+                    // A removal carries no value. `None` IS the change -- a reader that dropped the key is correct,
+                    // and one told an empty value is not.
+                    Change::Removed { key, .. } => (key, None),
+                })
+                .collect();
+            if page.need.is_empty() {
+                return DeltaStep::Done { changes, cursor: next };
+            }
+            let need: Vec<Cid> = page.need.into_iter().take(params.max_fetch_per_round).collect();
+            if changes.is_empty() && next.is_none() {
+                DeltaStep::Need(need)
+            } else {
+                DeltaStep::Prefix { changes, after: next, need }
+            }
+        }
+        Err(DiffError::Read(ReadError::Need(ids))) => DeltaStep::Need(ids),
+        Err(DiffError::Read(ReadError::Corrupt(cid, _))) | Err(DiffError::Read(ReadError::Mismatch(cid))) => {
+            DeltaStep::Broken(cid)
+        }
+        // A resume token from another pair of roots, or an instruction a diff has no answer for. Neither is fixed by
+        // fetching, and an EMPTY delta would tell the reader it is up to date when nobody checked -- so it is sent
+        // to the full read, which is always correct.
+        Err(_) => DeltaStep::Reload,
+    }
 }
 
 /// The bytes of a value, wherever the format put it.
