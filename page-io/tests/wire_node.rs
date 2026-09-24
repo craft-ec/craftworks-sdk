@@ -436,6 +436,9 @@ fn settle(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
             }
         }
     }
+    // Frames still unserved at the cap (a backstop read emitted by the last tick) are served here, clock unmoved,
+    // so no phase's leftover frame is counted in the next phase's window.
+    replies.extend(pump(io, node, now));
     replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
     replies
 }
