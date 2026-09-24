@@ -102,7 +102,7 @@ impl WireNode {
             register_params: params,
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req), signer::Origin::Local), signer::Answer::Provisioned);
         n
     }
 
@@ -236,7 +236,7 @@ impl WireNode {
                 let mut values = Vec::new();
                 for m in inbound {
                     if let InboundDelegateMsg::ApplicationMessage(am) = m {
-                        let served = signer::serve_full(&mut Host(self), &am.payload);
+                        let served = signer::serve_full(&mut Host(self), &am.payload, signer::Origin::Local);
                         values.push(OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(signer::reply(&served))));
                     }
                 }

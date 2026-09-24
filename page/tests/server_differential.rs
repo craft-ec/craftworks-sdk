@@ -95,7 +95,7 @@ impl Node {
             register_params: params,
             block_code: BLOCK_CODE.to_vec(),
         };
-        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req)), signer::Answer::Provisioned);
+        assert_eq!(signer::serve(&mut Host(&mut n), &signer::encode_request(1, &req), signer::Origin::Local), signer::Answer::Provisioned);
         n
     }
 
@@ -158,8 +158,9 @@ impl Node {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger },
+            label: signer::Label::Head,
         };
-        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req));
+        let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req), signer::Origin::Local);
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
     }
 }

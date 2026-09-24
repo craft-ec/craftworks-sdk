@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 // The wire types live in `signer-proto`, so the page can speak them without linking this delegate.
 pub use signer_proto::{
-    decode_answer, decode_request, encode_answer, encode_request, request_id, Answer, Head, Next,
+    decode_answer, decode_request, encode_answer, encode_request, request_id, Answer, Head, Label, Next,
     Request, Why, MAGIC, MAX_PUT_BLOCKS, UNATTRIBUTED,
 };
 
@@ -159,9 +159,18 @@ pub struct Served {
     pub puts: Puts,
 }
 
+/// WHO ASKED, as the node attests it (builder#117, rule 13). `Local`: no attestation -- the person's own tools on
+/// their own node. `Served`: a web app the node serves, or a delegate (which may be relaying for one: the node then
+/// REPLACES the app's origin with the delegate's). A site is never signed for `Served`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Local,
+    Served,
+}
+
 /// One request, answered: `serve_full` without the puts or the id. What every non-`PutBlocks` request needs.
-pub fn serve<H: Host>(host: &mut H, request: &[u8]) -> Answer {
-    serve_full(host, request).answer
+pub fn serve<H: Host>(host: &mut H, request: &[u8], origin: Origin) -> Answer {
+    serve_full(host, request, origin).answer
 }
 
 /// The bytes the entry sends back for a served request: its answer, under ITS id.
@@ -171,7 +180,7 @@ pub fn reply(served: &Served) -> Vec<u8> {
 
 /// One request, served: gather the facts, decide, and -- on `Sign` -- sign, save the record, reply; on `PutBlocks`
 /// name each block's contract and hand the entry the PUTs.
-pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
+pub fn serve_full<H: Host>(host: &mut H, request: &[u8], origin: Origin) -> Served {
     let Some((id, req)) = decode_request(request) else {
         return Served {
             id: request_id(request),
@@ -197,7 +206,7 @@ pub fn serve_full<H: Host>(host: &mut H, request: &[u8]) -> Served {
             register_params,
             block_code,
         ),
-        Request::Sign { prev, next } => sign(host, prev, next),
+        Request::Sign { prev, next, label } => sign(host, prev, next, label, origin),
         // The Register it signs for, only if it holds a key for it: params left behind without a key name nothing.
         Request::Register => Answer::Register {
             params: host.get_secret(KEY).and(host.get_secret(REGISTER_PARAMS)),
@@ -292,7 +301,22 @@ fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> (Answer, Puts) {
     (Answer::Putting { contracts }, puts)
 }
 
-fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
+/// The secret a label's ONE record is kept under: the head's is `signer_record` (unchanged, so nothing migrates);
+/// a site's is `signer_record/site:<app>` -- one record type, keyed by label (builder#117).
+pub fn record_name(label: &Label) -> Vec<u8> {
+    match label {
+        Label::Head => RECORD.to_vec(),
+        Label::Site { app, .. } => [RECORD, b"/site:", app.as_bytes()].concat(),
+    }
+}
+
+/// THE sign verb, for every label: the label chooses the params, the record and the contract read as the truth,
+/// and `decide` is the one rule over them (builder#117).
+fn sign<H: Host>(host: &mut H, prev: Head, next: Next, label: Label, origin: Origin) -> Answer {
+    // A site is signed only for the person's own tools (rule 13): a served app could republish its visitor's site.
+    if matches!(label, Label::Site { .. }) && origin == Origin::Served {
+        return Answer::Refused(Why::FromApp);
+    }
     let (key, rcode, rparams, bcode) = (
         host.get_secret(KEY),
         host.get_secret(REGISTER_CODE),
@@ -300,36 +324,66 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
         host.get_secret(BLOCK_CODE),
     );
     let provisioned = key.is_some() && rcode.is_some() && rparams.is_some() && bcode.is_some();
-    let record: Option<Record> = host
-        .get_secret(RECORD)
-        .and_then(|b| bincode::deserialize(&b).ok());
-    let head_read = match (&rcode, &rparams) {
-        (Some(c), Some(p)) => host
-            .contract_state(&register_id(c, p))
-            // TOLERANT (signer_proto::head): the root is the value's first 32
-            // bytes, whatever ledger follows.
-            .and_then(|st| {
-                let (seq, v) = signer_proto::head::record_of(&st)?;
-                Some(Head { seq, root: signer_proto::head::read_value(v)?.root })
-            }),
-        _ => None,
+    // The label's params: the head's own, or the same authority relabelled `site:<app>` (contract_keys::site).
+    let params = match (&label, &rparams) {
+        (Label::Head, p) => p.clone(),
+        (Label::Site { app, .. }, Some(p)) => match contract_keys::site::site_params(p, app) {
+            Some(sp) => Some(sp),
+            None => return Answer::Refused(Why::BadLabel),
+        },
+        (Label::Site { .. }, None) => None,
+    };
+    // FAIL CLOSED: a record that is there and does not decode is not "no record" -- read as none, any seq could be
+    // signed again from a prev already signed from (sdk#332's review).
+    let record: Option<Record> = match host.get_secret(&record_name(&label)) {
+        None => None,
+        Some(b) => match bincode::deserialize(&b) {
+            Ok(r) => Some(r),
+            Err(_) => return Answer::Refused(Why::CannotSign),
+        },
+    };
+    let head_read = match &label {
+        Label::Head => match (&rcode, &params) {
+            (Some(c), Some(p)) => host
+                .contract_state(&register_id(c, p))
+                // TOLERANT (signer_proto::head): the root is the value's first 32
+                // bytes, whatever ledger follows.
+                .and_then(|st| {
+                    let (seq, v) = signer_proto::head::record_of(&st)?;
+                    Some(Head { seq, root: signer_proto::head::read_value(v)?.root })
+                }),
+            _ => None,
+        },
+        // The page names the site contract; what it holds counts only if it VERIFIES under this site's params (Q1):
+        // an unsigned record is nothing, a genuinely signed newer one is a legitimate skip.
+        Label::Site { contract, .. } => params.as_deref().and_then(|p| {
+            let st = host.contract_state(contract)?;
+            let (meta, _web) = contract_keys::site::framing(&st)?;
+            let (seq, value) = contract_keys::site::verified_record(p, meta)?;
+            Some(Head { seq, root: value.as_slice().try_into().ok()? })
+        }),
     };
     // Held AND the right block: the state is `kind ‖ body` and must hash to the root it is named by (as
-    // entry.rs::block_state names a block), not merely be present.
-    let root_held = bcode.as_deref().is_some_and(|c| {
-        host.contract_state(&contract_keys::block::contract_for(c, &next.root))
-            .is_some_and(|s| matches!(s.split_first(), Some((&k, body)) if freenet_prolly::block_id(k, body) == next.root))
-    });
+    // entry.rs::block_state names a block), not merely be present. A HEAD fact: a site's value is blake3(web), and
+    // no block holds it.
+    let root_held = match &label {
+        Label::Head => bcode.as_deref().is_some_and(|c| {
+            host.contract_state(&contract_keys::block::contract_for(c, &next.root))
+                .is_some_and(|s| matches!(s.split_first(), Some((&k, body)) if freenet_prolly::block_id(k, body) == next.root))
+        }),
+        Label::Site { .. } => true,
+    };
     let facts = Facts {
         provisioned,
         record,
         head_read,
         root_held,
     };
+    let rec_label = label;
     match decide(&facts, &prev, &next) {
         Decision::Reply(a) => a,
         Decision::Sign => {
-            let (Some(key), Some(params)) = (key, rparams) else {
+            let (Some(key), Some(params)) = (key, params) else {
                 return Answer::Refused(Why::NotProvisioned);
             };
             let Ok(signed) =
@@ -345,7 +399,7 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next) -> Answer {
             // THE ORDER: the record is written BEFORE the signature leaves. A reply without its record could be signed
             // again from the same prev after a restart -- two signatures at one seq, the fork this exists to prevent.
             let bytes = bincode::serialize(&rec).expect("a record encodes");
-            if host.set_secret(RECORD, &bytes) {
+            if host.set_secret(&record_name(&rec_label), &bytes) {
                 Answer::Signed(signed)
             } else {
                 Answer::Refused(Why::RecordNotSaved)

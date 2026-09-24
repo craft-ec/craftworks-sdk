@@ -31,3 +31,5 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8
 [dev-dependencies]
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 wire = { path = "../wire" }
+blake3 = { version = "1", default-features = false }
+contract-keys = { path = "../contract-keys" }

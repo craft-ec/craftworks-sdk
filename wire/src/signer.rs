@@ -40,9 +40,10 @@ pub fn frame_sign(
     id: u32,
     prev: Head,
     next: Next,
+    label: signer_proto::Label,
     stream_id: u32,
 ) -> Result<Vec<Vec<u8>>, String> {
-    frame(key, id, &SignerRequest::Sign { prev, next }, stream_id)
+    frame(key, id, &SignerRequest::Sign { prev, next, label }, stream_id)
 }
 
 /// Provision the signer: the head's key, the Register it signs for, and the Block contract's code (for its root check
@@ -155,19 +156,20 @@ mod tests {
             root: [2; 32],
             ledger: vec![],
         };
-        let p = payload(&frame_sign(&key(), 41, prev, next.clone(), 1).unwrap());
+        let p = payload(&frame_sign(&key(), 41, prev, next.clone(), signer_proto::Label::Head, 1).unwrap());
         assert_eq!(
             signer_proto::decode_request(&p),
             Some((
                 41,
                 SignerRequest::Sign {
                     prev,
-                    next: next.clone()
+                    next: next.clone(),
+                    label: signer_proto::Label::Head,
                 }
             ))
         );
         assert!(
-            frame_sign(&key(), UNATTRIBUTED, prev, next, 1).is_err(),
+            frame_sign(&key(), UNATTRIBUTED, prev, next, signer_proto::Label::Head, 1).is_err(),
             "a request framed under UNATTRIBUTED"
         );
     }

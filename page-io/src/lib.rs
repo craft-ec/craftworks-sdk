@@ -1031,6 +1031,7 @@ impl PageIo {
                     id,
                     signer_proto::Head { seq: prev_seq, root: prev_root },
                     signer_proto::Next { seq, root, ledger },
+                    signer_proto::Label::Head,
                     stream,
                 ),
                 // Page-io's own requests, sent and re-sent by the page's
@@ -1057,6 +1058,7 @@ impl PageIo {
                     RECORD_QUERY_ID,
                     signer_proto::Head { seq: 0, root: self.server.page.published().1 },
                     signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
+                    signer_proto::Label::Head,
                     stream,
                 ),
                 Op::PutApp { key } => match self.app_contracts.get(&key) {

@@ -85,7 +85,7 @@ fn every_frame_the_sdk_sends_gets_the_rulings_verdict() {
     input.extend(lines("register-delegate", wire::frame_register_delegate(delegate, 9).unwrap()));
     let head = signer::Head { seq: 1, root: [2u8; 32] };
     let next = signer::Next { seq: 2, root: [3u8; 32], ledger: Vec::new() };
-    input.extend(lines("sign", wire::signer::frame_sign(&signer, 10, head, next, 10).unwrap()));
+    input.extend(lines("sign", wire::signer::frame_sign(&signer, 10, head, next, signer::Label::Head, 10).unwrap()));
     input.push(serde_json::json!({ "t": 1, "window": "garbage", "socket": "ws-1", "data": base64::engine::general_purpose::STANDARD.encode([0xffu8; 12]) }).to_string());
 
     let rows = classify(&input);

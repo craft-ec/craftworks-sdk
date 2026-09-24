@@ -28,12 +28,15 @@ impl DelegateInterface for Signer {
     fn process(
         ctx: &mut DelegateCtx,
         _params: Parameters<'static>,
-        _origin: Option<MessageOrigin>,
+        origin: Option<MessageOrigin>,
         inbound: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match inbound {
             InboundDelegateMsg::ApplicationMessage(m) => {
-                let served = crate::serve_full(&mut Ctx(ctx), &m.payload);
+                // WHO ASKED, as the node attests it (builder#117): nothing attested is the person's own tools;
+                // a served web app or a delegate (possibly relaying one) is `Served`, and signs no site.
+                let who = if origin.is_some() { crate::Origin::Served } else { crate::Origin::Local };
+                let served = crate::serve_full(&mut Ctx(ctx), &m.payload, who);
                 let mut out = vec![message(crate::reply(&served))];
                 if !served.puts.is_empty() {
                     // `serve_full` checked the code is provisioned before it named a single contract.
