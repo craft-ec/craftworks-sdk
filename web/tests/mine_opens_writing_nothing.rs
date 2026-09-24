@@ -129,3 +129,22 @@ fn only_the_asked_session_defers_its_schema_writes() {
         assert!(!b.contains("set_defer_schema"), "`{name}` defers schema writes: a builder's or a view's define must not be held");
     }
 }
+
+/// WHY `openAsked` NEEDS THE SIGNER'S BYTES AT OPEN (sdk#347, the architect's
+/// question): only for its delegate KEY (`delegate_from_code`), which names the
+/// delegate the Register query is sent to. `ask_signer` ASKS (`PageIo::ask`),
+/// and never registers, provisions or claims: nothing reaches the node but the
+/// query. The behaviour under it -- a node with no signer answers `NoSigner` and
+/// sees NO RegisterDelegate frame -- is page-io's
+/// (`asking_whose_node_registers_mints_and_provisions_nothing`,
+/// `asking_on_a_node_without_the_signer_sends_only_the_query_…`). Mutant
+/// (ask_signer calling `provision`) red here.
+#[test]
+fn ask_signer_uses_the_signer_only_for_its_key_and_only_asks() {
+    let b = body_of("ask_signer");
+    assert!(b.contains("wire::delegate_from_code(&signer)"), "`ask_signer` no longer takes the signer's KEY from its code:\n{b}");
+    assert!(b.contains("io.ask()"), "`ask_signer` does not ASK:\n{b}");
+    for never in ["provision", ".begin(", "claim", "mint", "register_delegate"] {
+        assert!(!b.contains(never), "`ask_signer` calls `{never}`: opening an app would install something on the node:\n{b}");
+    }
+}

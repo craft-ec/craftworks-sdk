@@ -237,6 +237,9 @@ export function wrap(raw) {
     // `AppContainer` builds an app's container in the page. The PUT itself is
     // the session's `put_contract`.
     webapp: { params: raw.webapp_params, address: raw.webapp_address, AppContainer: raw.AppContainer },
+    // THE LOAD PIECES (sdk#347): `load(bundle, payload, m, i)` re-derives piece i of a rebuilt bundle, for the
+    // loader's repair after load (`repairPieces`).
+    pieces: { load: raw.load_piece },
     // THE SDK'S OWN ID RULES (#126 ruling), each from its one owner in Rust:
     // `app(id)` throws in `app::check`'s words; `hex32(s)` is a 32-byte id in
     // hex (a head's, a sha256); `loc(s)` a record id (32 hex, 64 under a

@@ -17,11 +17,20 @@ import { allArtefactBytes, artefactBytes } from "./artefacts.js";
  * and a page that spelled one of them wrong would fetch a 404, hand in an
  * empty array and provision a signer with no contract code behind it.
  */
-export const SHIPPED_ARTEFACTS = {
-  signer: new URL("./signer.wasm", import.meta.url).href,
-  block: new URL("./block.wasm", import.meta.url).href,
-  register: new URL("./register.wasm", import.meta.url).href,
-};
+export const SHIPPED_ARTEFACTS = besideThis(["signer", "block", "register"]);
+
+/**
+ * `{ name: URL of name.wasm beside this file }`, or `null` when NOTHING is beside it: a module linked from a
+ * published app's load pieces (sdk#347) has a blob: URL, which no relative path resolves against, so it ships no
+ * artefacts and its caller names them (`openAsked` refuses without). Computed at load, so it must not throw there.
+ */
+function besideThis(names) {
+  try {
+    return Object.fromEntries(names.map(n => [n, new URL(`./${n}.wasm`, import.meta.url).href]));
+  } catch {
+    return null;
+  }
+}
 
 /**
  * The shipped artefacts WITH their hashes, read from `artefacts.json`.

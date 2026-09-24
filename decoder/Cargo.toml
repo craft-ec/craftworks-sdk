@@ -1,0 +1,14 @@
+[package]
+name = "decoder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The DECODE-ONLY wasm a published app's starter carries (sdk#347): any k of the SDK's k + m load pieces -> the bundle's files. Raw exports over linear memory, no wasm-bindgen: it is the only per-app storage the piece design adds, so its size is a stated number."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The ONE implementation of the format and the code: the same crate the SDK and the tools link.
+pieces = { path = "../pieces" }
