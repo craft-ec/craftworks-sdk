@@ -462,9 +462,14 @@ enum ReadsCheck {
     Unreadable,
 }
 
-/// A group's three parity ids. The unit redundancy comes in: three blocks are
-/// one group's protection and are worth nothing separately.
-pub type ParityIds = [Cid; 3];
+/// A group's parity ids, [`PARITY`] of them. The unit redundancy comes in:
+/// they are one group's protection and are worth nothing separately.
+pub type ParityIds = [Cid; PARITY];
+
+/// Parity blocks per group: the TREE's number (freenet-prolly `rs::PARITY`), its
+/// one owner. Never written by hand here -- `tests/one_parity.rs` fails the build
+/// on a hand-written count.
+pub use freenet_prolly::rs::PARITY;
 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -675,12 +680,12 @@ pub struct Params {
     /// releases the delegate between pages.
     pub max_gets_per_request: u32,
     /// A block the node answered NotFound is ALSO rebuilt from its sibling
-    /// group (`repair`: any k of the group's k+3, verified by hash) while the
+    /// group (`repair`: any k of the group's k+m, verified by hash) while the
     /// page keeps asking for it (Phase 4, gap 1): an alternative source,
     /// never a reason to stop. Off only as the control.
     pub repair_reads: bool,
     /// RACE PUT (COMMIT-LIFE §P): the head is signed once the root is in and
-    /// every changed group has ANY k of its k+3 blocks on the network; the
+    /// every changed group has ANY k of its k+m blocks on the network; the
     /// rest go on to BACKED_UP. Off only as the control: wait for every PUT.
     pub race_put: bool,
     /// RACE GET (the owner's rule 11, sdk#303): the FIRST time a read wants a block of a sibling group, every
@@ -1120,8 +1125,8 @@ impl Race {
             let Ok(node) = Node::parse(bytes) else { continue };
             let ids: Vec<Cid> = node.parity().collect();
             for (g, (_, members)) in freenet_prolly::parity::group_members(&node).into_iter().enumerate() {
-                let Some(trio) = ids.get(3 * g..3 * g + 3) else { continue };
-                let new: Vec<Cid> = members.iter().chain(trio).copied().filter(|c| new_ids.contains(c)).collect();
+                let Some(par) = ids.get(PARITY * g..PARITY * (g + 1)) else { continue };
+                let new: Vec<Cid> = members.iter().chain(par).copied().filter(|c| new_ids.contains(c)).collect();
                 if new.is_empty() {
                     continue;
                 }
@@ -3857,7 +3862,7 @@ impl<B: Blocks> Engine<B> {
             });
         }
         // SAVED is `Published`, just said. BACKED_UP (`ParityComplete`) when
-        // ALL k+3 of every group the commit changed are acked (§P): its own
+        // ALL k+m of every group the commit changed are acked (§P): its own
         // blocks AND an earlier commit's stragglers in those groups (the
         // members it counted in `earlier`). Counting only its own let a write
         // be BACKED_UP while a group it changed still missed a block (the page
@@ -4136,7 +4141,7 @@ pub(crate) fn worst_case_fixed_bytes(params: &Params) -> usize {
     let enc = |n: Result<u64, bincode::Error>| n.map_or(usize::MAX / 16, |n| n as usize);
     let o = || bincode::DefaultOptions::new().with_fixint_encoding();
     let cid: Cid = [0u8; 32];
-    let group: ParityIds = [cid; 3];
+    let group: ParityIds = [cid; PARITY];
 
     // The commit in flight, at its caps: data and confirmed ids, one group per
     // block at most, the carried ops, and its few writes and scalars.

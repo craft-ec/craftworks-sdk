@@ -1,13 +1,13 @@
 //! A READ REPAIRS THROUGH PARITY (Phase 4, DURABILITY-STATE gap 1): a block
 //! that no attempt could fetch is rebuilt from its sibling group -- any `k`
-//! of the group's `k + 3` blocks -- and kept only if it hashes to the id that
+//! of the group's `k + PARITY` blocks -- and kept only if it hashes to the id that
 //! was asked for. Nothing here reaches the network: the engine asks for the
 //! group's blocks with the same `FetchBlock` every read uses (the page's one
 //! sender), and hands what it rebuilt to the page as a block to keep.
 //!
 //! The group is found in a node the engine already HOLDS: the read that
 //! missed a block descended through its parent, and the parent lists both the
-//! group's members and its three parity ids (freenet-prolly `parity.rs`, the
+//! group's members and its `PARITY` parity ids (freenet-prolly `parity.rs`, the
 //! rule; a leaf's groups are over its referenced values, a branch's over its
 //! children). The root is in no group: a lost root is not repairable here.
 
@@ -15,6 +15,7 @@ use freenet_prolly::node::Node;
 use freenet_prolly::parity;
 use freenet_prolly::store::Blocks;
 use freenet_prolly::{block_id, kind, Cid};
+use crate::PARITY;
 
 /// How many held nodes the group search may visit. It walks only what the
 /// engine already holds, from the root the read stands on.
@@ -29,7 +30,7 @@ pub struct Group {
     /// The members' kind (`RAW` for a leaf's values, `TREE_NODE` for a
     /// branch's children): a member's SYMBOL is `kind ‖ body`.
     pub kind: u8,
-    /// `k` data members, then the 3 parity blocks, in the code's column order.
+    /// `k` data members, then the group's [`PARITY`] parity blocks, in the code's column order.
     pub slots: Vec<Cid>,
     pub k: usize,
     /// The longest a rebuilt member of this group may be (a stranger's
@@ -78,7 +79,7 @@ pub fn find_group(blocks: &dyn Blocks, root: Cid, missing: Cid) -> Option<Group>
         let ids: Vec<Cid> = node.parity().collect();
         for (g, (_, members)) in parity::group_members(&node).into_iter().enumerate() {
             let Some(missing_ix) = members.iter().position(|m| *m == missing) else { continue };
-            let par = ids.get(3 * g..3 * g + 3)?;
+            let par = ids.get(PARITY * g..PARITY * (g + 1))?;
             let leaf = node.is_leaf();
             let k = members.len();
             let mut slots = members;

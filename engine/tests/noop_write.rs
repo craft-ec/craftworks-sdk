@@ -127,7 +127,7 @@ fn a_real_change_is_not_published_without_its_head() {
 }
 
 /// ParityComplete only when TRUE. A no-op made while the published tree still
-/// has a STRAGGLER out (race put, COMMIT-LIFE §P: the head signs at k of k+3)
+/// has a STRAGGLER out (race put, COMMIT-LIFE §P: the head signs at k of k+m)
 /// waits for it and hears ParityComplete when it lands. Executed by the
 /// architect on #164: told ParityComplete at once while parity puts were
 /// still to come.

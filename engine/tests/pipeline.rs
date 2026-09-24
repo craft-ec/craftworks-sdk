@@ -4,7 +4,7 @@
 //! not seeded and printed. That is the whole point of a sans-IO core — an
 //! interleaving a live network produces once a week is an ordinary test here.
 
-use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId};
+use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId, PARITY};
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -123,7 +123,7 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
 /// RACE PUT (COMMIT-LIFE §P): the head is signed when the ROOT is acked and
 /// every changed group has k of its k+m -- not when every block is. Two
 /// values too large to ride in the leaf, so the leaf's value group has k = 2
-/// members and 3 parity; the leaf IS the root (in no group), so it must be
+/// members and PARITY parity; the leaf IS the root (in no group), so it must be
 /// acked itself.
 #[test]
 fn one_write_reaches_published_when_its_root_and_groups_are_recoverable() {
@@ -157,7 +157,7 @@ fn one_write_reaches_published_when_its_root_and_groups_are_recoverable() {
     let root: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::TREE_NODE, x)).map(|x| x.0).collect();
     let values: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::RAW, x)).map(|x| x.0).collect();
     let parity: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::PARITY, x)).map(|x| x.0).collect();
-    assert_eq!((root.len(), values.len(), parity.len()), (1, 2, 3), "the fixture is not root + 2 values + their group's 3 parity");
+    assert_eq!((root.len(), values.len(), parity.len()), (1, 2, PARITY), "the fixture is not root + 2 values + their group's PARITY parity");
     assert!(head_of(&out).is_none(), "the head moved before a single block was confirmed");
 
     // The group has k = 2 of its 5 acked (a value and a parity), the root not:

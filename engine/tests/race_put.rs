@@ -11,7 +11,7 @@
 //!   present toward a group's k, and `after` names only this commit's acked
 //!   blocks.
 
-use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId};
+use engine::{ClientId, Effect, Engine, Event, Op, Params, State, WriteId, PARITY};
 use freenet_prolly::node::Node;
 use freenet_prolly::{parity, Cid};
 use std::collections::{BTreeMap, BTreeSet};
@@ -116,7 +116,7 @@ fn l2() -> Cid {
 }
 
 /// Write 2 published with ITS LEAF as the only straggler (race put: the head
-/// signs at k of k+3).
+/// signs at k of k+m).
 fn with_straggler() -> (Rig, Cid) {
     let l2 = l2();
     let mut r = Rig::base();
@@ -200,8 +200,8 @@ fn an_earlier_straggler_is_never_counted_present_and_after_names_only_this_commi
     let g = parity::group_members(&pn).into_iter().position(|(_, m)| m.contains(&l2)).unwrap();
     let pids: Vec<Cid> = pn.parity().collect();
     let (_, gm) = parity::group_members(&pn).into_iter().nth(g).unwrap();
-    let group_new: BTreeSet<Cid> = gm.iter().chain(&pids[3 * g..3 * g + 3]).copied().filter(|c| new3.contains_key(c)).collect();
-    // Write 3's own blocks in that group: its new leaf and 3 new parity.
+    let group_new: BTreeSet<Cid> = gm.iter().chain(&pids[PARITY * g..PARITY * (g + 1)]).copied().filter(|c| new3.contains_key(c)).collect();
+    // Write 3's own blocks in that group: its new leaf and PARITY new parity.
     assert!(group_new.len() >= 2, "write 3 put {} block(s) of the group", group_new.len());
     // Ack everything of write 3 EXCEPT all but one of its blocks in that
     // group. Counting l2 would make it (k-2 present) + 1 (l2) + 1 = k: the
@@ -328,7 +328,7 @@ fn every_put_of_a_commit_leaves_in_its_first_send() {
 
 /// §P 4: a commit whose ROOT is un-acked does not sign (nothing can rebuild a
 /// root), and neither does one with a changed group missing k+1 -- here its
-/// new leaf AND its 3 parity (k-1 of k+3 left).
+/// new leaf AND its PARITY parity (k-1 of k+PARITY left).
 #[test]
 fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     // The root: everything acked but it.
@@ -343,7 +343,7 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     let more = r.step(Event::PutConfirmed(root));
     assert!(head(&more).is_some(), "with the root acked too, the head did not sign");
 
-    // A group below k: its new leaf and all 3 of its parity held.
+    // A group below k: its new leaf and all PARITY of its parity held.
     let l2 = l2();
     let mut r = Rig::base();
     let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
@@ -351,16 +351,45 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     let parent = sent.values().filter_map(|b| Node::parse(b).ok()).find(|n| !n.is_leaf() && parity::group_members(n).iter().any(|(_, m)| m.contains(&l2))).expect("the leaf's parent");
     let g = parity::group_members(&parent).into_iter().position(|(_, m)| m.contains(&l2)).unwrap();
     let pids: Vec<Cid> = parent.parity().collect();
-    let hold: BTreeSet<Cid> = std::iter::once(l2).chain(pids[3 * g..3 * g + 3].iter().copied()).collect();
+    let hold: BTreeSet<Cid> = std::iter::once(l2).chain(pids[PARITY * g..PARITY * (g + 1)].iter().copied()).collect();
     let mut all = fx.clone();
     for id in sent.keys().filter(|id| !hold.contains(*id)) {
         all.extend(r.step(Event::PutConfirmed(*id)));
     }
-    assert!(head(&all).is_none(), "the head was signed with a changed group at k-1 of k+3");
+    assert!(head(&all).is_none(), "the head was signed with a changed group at k-1 of k+m");
+}
+
+/// The GROUPING BY THE TREE'S PARITY (the architect, #351): the leaf's parent
+/// lists `PARITY` ids per group, the commit puts every one in its first send,
+/// and the group signs with ANY `PARITY` of its `PARITY + 1` new blocks still
+/// out -- exactly k -- where one more (the test above) does not. A count
+/// written by hand is right only while it equals the tree's.
+#[test]
+fn a_group_signs_with_exactly_parity_of_its_new_blocks_out() {
+    let l2 = l2();
+    let mut r = Rig::base();
+    let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let sent = puts(&fx);
+    let parent = sent.values().filter_map(|b| Node::parse(b).ok()).find(|n| !n.is_leaf() && parity::group_members(n).iter().any(|(_, m)| m.contains(&l2))).expect("the leaf's parent");
+    let groups = parity::group_members(&parent);
+    let pids: Vec<Cid> = parent.parity().collect();
+    assert_eq!(pids.len(), PARITY * groups.len(), "the parent lists {} parity ids for {} group(s)", pids.len(), groups.len());
+    let g = groups.iter().position(|(_, m)| m.contains(&l2)).unwrap();
+    let group_par = &pids[PARITY * g..PARITY * (g + 1)];
+    assert!(group_par.iter().all(|p| sent.contains_key(p)), "the group's parity is not all in the first send");
+    // The new blocks of the group: the re-written leaf and its PARITY parity.
+    // Hold PARITY of them -- all the parity -- and ack the rest: k is met.
+    let hold: BTreeSet<Cid> = group_par.iter().copied().collect();
+    assert_eq!(hold.len(), PARITY);
+    let mut all = fx.clone();
+    for id in sent.keys().filter(|id| !hold.contains(*id)) {
+        all.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    assert!(head(&all).is_some(), "the head did not sign with exactly PARITY of the group's new blocks out");
 }
 
 /// §P 6: the largest write that fit before still publishes, with its parity
-/// on top (parity rides above `max_commit_blocks`: ≤ 3 per changed group).
+/// on top (parity rides above `max_commit_blocks`: ≤ PARITY per changed group).
 #[test]
 fn the_largest_pre_race_put_write_still_publishes_with_its_parity() {
     let p = Params::default();

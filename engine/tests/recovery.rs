@@ -168,7 +168,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                 match f {
                     // SavedNotBackedUp: the commit's parity is lost with the
                     // engine -- never acked. The head still signs (every
-                    // group's members are in: k of k+3).
+                    // group's members are in: k of k+m).
                     Effect::PutBlock { id, ref bytes, .. }
                         if cutting && *cut == Cut::SavedNotBackedUp && freenet_prolly::block_id(freenet_prolly::kind::PARITY, bytes) == id =>
                     {
