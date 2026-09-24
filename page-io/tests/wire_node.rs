@@ -1441,6 +1441,16 @@ fn a_view_puts_back_a_block_it_rebuilt_and_waits_on_nothing() {
     let put = node.served.get("put block").copied().unwrap_or(0) - before;
     assert_eq!(put, 1, "the view put back {put} block(s); a rebuilt block is put back exactly once ({:?})", v.unusable());
     assert!(node.contracts.contains_key(&gone), "the rebuilt leaf is not on the node again");
+    // `settle` never goes idle on a page that has its head -- the head
+    // backstop is always due next -- so it stops at its step cap, and
+    // whether a backstop ReadHead is in flight there is the cap's parity,
+    // not the view's. Answer what was last sent, with no clock moved, and
+    // THEN nothing may be waited on.
+    for f in v.take_frames() {
+        if let Some(a) = node.serve(&f) {
+            v.inbound(&a, Ms(now));
+        }
+    }
     assert!(!v.server.page.waiting(), "the view still waits on something after its repair PUT was answered");
     for k in ["put register", "update", "signer", "register delegate"] {
         let by_view = node.served.get(k).copied().unwrap_or(0) - served_before.get(k).copied().unwrap_or(0);

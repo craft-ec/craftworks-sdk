@@ -97,6 +97,13 @@ pub fn new_store_params(params: Params) -> Engine<Store> {
 
 /// A COLD READER of `root`: an engine that has adopted it and holds none of
 /// its blocks, on a store of its own (returned, for what the page keeps).
+/// A reader on a store of its own that has NOT adopted anything: it learns
+/// its head the way a page does, by a `HeadRead` (with the head's mark told
+/// first, as the page tells it).
+pub fn fresh_reader(params: Params) -> Engine<Store> {
+    Engine::new(params, Store::fresh())
+}
+
 pub fn cold_reader(root: Cid, params: Params) -> (Engine<Store>, Store) {
     let store = Store::fresh();
     let mut e = Engine::new(params, store.clone());

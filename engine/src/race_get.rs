@@ -15,24 +15,25 @@
 //! - what a finished race no longer wants is WITHDRAWN (`Engine::take_withdrawn`): the page drops its GET instead
 //!   of re-asking it for ever, and does not keep it if it arrives late;
 //! - the group is found in the parent held under the read's OWN pinned root (another root's parity would not
-//!   match); the root itself is in no group and is fetched singly.
+//!   match); the root is a group of ONE (sdk#335) when its head listed its parity -- the first of its `1 + m` to
+//!   arrive answers -- and is fetched singly when it did not.
 //!
 //! Stragglers need nothing here: the page re-sends a GET on its RTO with no count (rule 7), and a block that
 //! arrives after its group resolved is either used (someone still waits) or dropped (withdrawn).
 
-use crate::{repair, Effect, Engine};
+use crate::{Effect, Engine};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::collections::BTreeSet;
 
 impl<B: Blocks> Engine<B> {
     /// A read has just asked for `id` under `root`: race the rest of its group. Nothing when racing is off, when
-    /// `id` is already being raced or repaired, or when it is in no group (the root).
+    /// `id` is already being raced or repaired, or when it is in no group (a root whose head listed no parity).
     pub(crate) fn race(&mut self, id: Cid, root: Cid) -> Vec<Effect> {
         if !self.params.race_get || !self.params.repair_reads || self.repairs.contains_key(&id) {
             return Vec::new();
         }
-        match repair::find_group(&self.source(), root, id) {
+        match self.group_for(root, id) {
             Some(group) => self.start_repair(group, false),
             None => Vec::new(),
         }
