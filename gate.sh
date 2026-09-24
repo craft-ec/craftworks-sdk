@@ -57,19 +57,29 @@ STEP_FAILED=0
 BASELINE=gate.baseline.d
 
 # `--accept [--accept-loss MEMBER]...`: see tools/gate-accept.sh.
+# `--pr [--dry-run] [--accept-loss MEMBER]...`: the one command every PR runs (below).
+# `--controls`: only the structural controls (below).
 ACCEPT=0
 ACCEPT_ARGS=()
+MODE=full
+DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --accept) ACCEPT=1; shift ;;
+    --pr) MODE=pr; shift ;;
+    --controls) MODE=controls; shift ;;
+    --dry-run) DRY=1; shift ;;
     --accept-loss)
       [ $# -ge 2 ] || { echo "gate: --accept-loss needs a member name" >&2; exit 2; }
       ACCEPT_ARGS+=(--accept-loss "$2"); shift 2 ;;
     *) echo "gate: unknown argument \`$1\`" >&2; exit 2 ;;
   esac
 done
-if [ ${#ACCEPT_ARGS[@]} -gt 0 ] && [ $ACCEPT -eq 0 ]; then
-  echo "gate: --accept-loss only means something with --accept" >&2; exit 2
+if [ ${#ACCEPT_ARGS[@]} -gt 0 ] && [ $ACCEPT -eq 0 ] && [ "$MODE" != pr ]; then
+  echo "gate: --accept-loss only means something with --accept or --pr" >&2; exit 2
+fi
+if [ "$MODE" != full ] && [ $ACCEPT -eq 1 ]; then
+  echo "gate: --accept is the batch gate's (the full run); a PR never records counts" >&2; exit 2
 fi
 
 # THE OLD FORM IS REFUSED, not merged with the new (sdk#279). A branch made
@@ -98,6 +108,133 @@ if [ "$free_gib" -lt "$MIN_GIB" ]; then
   echo "An ENOSPC inside a build voids the run rather than failing it honestly," >&2
   echo "and a voided run reads as a passing one." >&2
   exit 1
+fi
+
+# --------------------------------------------- the structural controls ----
+# THE ONE LIST of the checks that read the WHOLE workspace's source (or the whole branch), whatever a change touches:
+# a violation planted in a crate a PR never touches must still fail that PR. `name|command`; a new control is added
+# HERE and nowhere else, and `--controls`, `--pr` and the full gate all run this list. A cargo control must report
+# at least one passing test: a filter that matches nothing exits 0 and would pass as a control that checked nothing.
+CONTROLS=(
+  "one_home|cargo test -p core-types --test one_home"
+  "one_parity|cargo test -p engine --test one_parity"
+  "client_api_allowlist|cargo test -p probe --lib only_allowlisted_crates_may_know_freenets_client_api"
+  "node_path_rules|cargo test -p web --test node_path_rules"
+  "fixture-gate|./fixture-gate.sh"
+  "dup-gate|node tools/dup-gate.mjs"
+  "owners|node tools/owners.mjs"
+)
+run_controls() {
+  for c in "${CONTROLS[@]}"; do
+    name=${c%%|*}; cmd=${c#*|}
+    # Only for the controls' own test (a planted violation, run cheaply): never a way to skip one in a real run.
+    [ -n "${GATE_CONTROLS_ONLY:-}" ] && [ "$name" != "$GATE_CONTROLS_ONLY" ] && continue
+    out=$(eval "$cmd" 2>&1); rc=$?
+    case "$cmd" in
+      cargo*)
+        n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
+        if [ $rc -ne 0 ]; then step_fail "control $name FAILED: $cmd"; echo "$out" | grep -E "^(error|---- |thread .* panicked)" -A3 | head -12 >&2
+        elif [ "$n" -eq 0 ]; then step_fail "control $name ran ZERO tests ($cmd): a control that checks nothing"
+        else echo "control $name: ok ($n test(s))"; fi ;;
+      *)
+        if [ $rc -ne 0 ]; then step_fail "control $name FAILED: $(echo "$out" | tail -1)"; else echo "control $name: ok — $(echo "$out" | tail -1)"; fi ;;
+    esac
+  done
+}
+
+# ONE TARGET PER WORKTREE (the team's rule): a CARGO_TARGET_DIR shared by two worktrees of this workspace builds one
+# checkout's code for the other (measured: `unresolved import` in a worktree whose source has it). A target outside
+# this tree is claimed by the first worktree that uses it (`.craftworks-worktree`), and any other is refused.
+target_guard() {
+  local t here mark
+  t=$(tools/target-dir.sh) || { echo "${RED}gate: cannot ask cargo where the target is${OFF}" >&2; exit 1; }
+  here=$(pwd -P)
+  case "$t" in "$here"/*) return 0 ;; esac
+  mark="$t/.craftworks-worktree"
+  if [ -f "$mark" ] && [ "$(cat "$mark")" != "$here" ]; then
+    echo "${RED}gate: CARGO_TARGET_DIR $t belongs to $(cat "$mark"), another worktree.${OFF}" >&2
+    echo "${RED}gate: a shared target links the other checkout's code; use one per worktree.${OFF}" >&2
+    exit 1
+  fi
+  mkdir -p "$t" && echo "$here" > "$mark"
+}
+
+if [ "$MODE" = controls ]; then
+  target_guard
+  step "structural controls"
+  run_controls
+  [ "$FAILED" -ne 0 ] && { echo "${RED}gate: controls FAILED${OFF}" >&2; exit 1; }
+  echo "${GREEN}gate: controls ok (${#CONTROLS[@]})${OFF}"; exit 0
+fi
+
+# -------------------------------------------------------------- --pr ----
+# THE ONE COMMAND EVERY PR RUNS. The full gate (every member, --accept) is the BATCH gate, run once on the batch
+# integration. A PR runs: every structural control; the members its files belong to PLUS their reverse dependents
+# (tools/pr-scope.mjs, from cargo metadata), each tested with its count printed `before -> after` against the base's
+# baseline (a DROP fails, unless named with --accept-loss); clippy on that set; and npm when JS or pkg/ changes.
+if [ "$MODE" = pr ]; then
+  base=${GATE_PR_BASE:-origin/main}
+  git rev-parse -q --verify "$base^{commit}" >/dev/null || { echo "${RED}gate: no base $base — fetch it${OFF}" >&2; exit 1; }
+  # The branch's commits AND what is not committed yet: a PR gate run before the commit must see the edit.
+  # GATE_PR_CHANGED (space-separated paths) stands in for the diff: the scoping's own test.
+  if [ -n "${GATE_PR_CHANGED:-}" ]; then
+    changed=$(printf '%s\n' $GATE_PR_CHANGED)
+  else
+    changed=$({ git diff --name-only "$base"...HEAD; git diff --name-only HEAD; git ls-files --others --exclude-standard; } | sort -u)
+  fi
+  meta=$(mktemp)
+  cargo metadata --format-version 1 --no-deps > "$meta" 2>/dev/null || { echo "${RED}gate: cargo metadata failed${OFF}" >&2; exit 1; }
+  plan=$(printf '%s\n' "$changed" | node tools/pr-scope.mjs plan "$meta")
+  rm -f "$meta"
+  field() { node -e 'const p=JSON.parse(process.argv[1]); const v=p[process.argv[2]]; process.stdout.write(String(Array.isArray(v)?v.join(" "):v)+"\n")' "$plan" "$1"; }
+  scope=$(field members); npm_needed=$(field npm)
+  echo "gate --pr: base $base; changed files: $(printf '%s\n' "$changed" | grep -c .)"
+  echo "gate --pr: controls: $(for c in "${CONTROLS[@]}"; do printf '%s ' "${c%%|*}"; done)"
+  echo "gate --pr: changed members: $(field changed)"
+  echo "gate --pr: members tested (with reverse dependents): ${scope:-(none)}"
+  echo "gate --pr: npm: $npm_needed"
+  [ "$DRY" -eq 1 ] && exit 0
+  target_guard
+  step "structural controls"
+  run_controls
+  drop_ok() { local a; for a in ${ACCEPT_ARGS[@]+"${ACCEPT_ARGS[@]}"}; do [ "$a" = "$1" ] && return 0; done; return 1; }
+  base_count() { git show "$base:$BASELINE/$1" 2>/dev/null | head -1 | tr -d '[:space:]'; }
+  lines=()
+  if [ -n "$scope" ]; then
+    step "cargo test, the PR's members (before -> after, against $base)"
+    for m in $scope; do
+      out=$(cargo test -p "$m" --no-fail-fast 2>&1); rc=$?
+      n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
+      [ $rc -ne 0 ] && { step_fail "cargo test -p $m FAILED"; echo "$out" | grep -E "^(error|test result: FAILED|---- )" | head -5 >&2; }
+      b=$(base_count "$m"); [ -z "$b" ] && b=-
+      if drop_ok "$m"; then l=$(node tools/pr-scope.mjs count "$m" "$b" "$n" --drop-ok); else l=$(node tools/pr-scope.mjs count "$m" "$b" "$n") || fail "$m: count DROPPED"; fi
+      echo "$l"; lines+=("$l")
+    done
+    step "cargo clippy on the PR's members"
+    pargs=(); for m in $scope; do pargs+=(-p "$m"); done
+    if ! cargo clippy "${pargs[@]}" --all-targets -- -D warnings > /tmp/gate-clippy.$$ 2>&1; then
+      step_fail "clippy failed"; grep -E "^(error|warning)" /tmp/gate-clippy.$$ | head -8 >&2
+    fi
+    rm -f /tmp/gate-clippy.$$
+  fi
+  if [ "$npm_needed" = true ]; then
+    step "build.sh + npm test (JS or pkg/ changed)"
+    if ! ./build.sh > /tmp/gate-build.$$ 2>&1; then step_fail "build.sh failed"; tail -5 /tmp/gate-build.$$ >&2
+    else
+      npm test > /tmp/gate-npm.$$ 2>&1 || { step_fail "npm test failed"; grep -E "FAIL|Error" /tmp/gate-npm.$$ | head -8 >&2; }
+      js=$(grep -c "^  ok " /tmp/gate-npm.$$ || true)
+      [ "$js" -eq 0 ] && step_fail "npm test reported ZERO passing tests"
+      b=$(base_count npm); [ -z "$b" ] && b=-
+      if drop_ok npm; then l=$(node tools/pr-scope.mjs count npm "$b" "$js" --drop-ok); else l=$(node tools/pr-scope.mjs count npm "$b" "$js") || fail "npm: count DROPPED"; fi
+      echo "$l"; lines+=("$l")
+    fi
+    rm -f /tmp/gate-build.$$ /tmp/gate-npm.$$
+  fi
+  step "for the PR body"
+  echo "gate --pr ($base): controls ${#CONTROLS[@]}; members ${scope:-none}; npm $npm_needed"
+  for l in ${lines[@]+"${lines[@]}"}; do echo "  $l"; done
+  [ "$FAILED" -ne 0 ] && { echo "${RED}gate --pr: FAILED${OFF}" >&2; exit 1; }
+  echo "${GREEN}gate --pr: ok${OFF}"; exit 0
 fi
 
 # ----------------------------------------------------------- members ----
