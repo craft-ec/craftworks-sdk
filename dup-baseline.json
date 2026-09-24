@@ -9,20 +9,14 @@
    "lines": 7
   },
   {
-   "key": "22de322bec262401",
-   "a": "probe/src/bin/live-page-writes.rs:216-222",
-   "b": "probe/src/bin/live-page-writes.rs:81-87",
-   "lines": 7
-  },
-  {
    "key": "c0910e95c2f5e4ce",
    "a": "probe/src/bin/live-page-writes.rs:32-38",
-   "b": "probe/src/bin/live-signer.rs:340-355",
+   "b": "probe/src/bin/live-signer.rs:154-169",
    "lines": 7
   },
   {
    "key": "5ca0629cd797fd44",
-   "a": "probe/src/bin/live-signer.rs:44-53",
+   "a": "probe/src/bin/live-signer.rs:39-48",
    "b": "probe/src/bin/two-connections.rs:138-147",
    "lines": 10
   },
@@ -64,14 +58,14 @@
   },
   {
    "key": "e22c301b465b18ab",
-   "a": "probe/src/lib.rs:497-507",
-   "b": "probe/src/lib.rs:469-479",
+   "a": "probe/src/lib.rs:498-508",
+   "b": "probe/src/lib.rs:470-480",
    "lines": 11
   },
   {
    "key": "a76c0fc830903317",
-   "a": "probe/src/node.rs:114-121",
-   "b": "probe/src/node.rs:83-90",
+   "a": "probe/src/node.rs:128-135",
+   "b": "probe/src/node.rs:97-104",
    "lines": 8
   },
   {
@@ -82,8 +76,8 @@
   },
   {
    "key": "95061662a04ad6b9",
-   "a": "src/live.rs:279-292",
-   "b": "src/live.rs:258-271",
+   "a": "src/live.rs:250-263",
+   "b": "src/live.rs:229-242",
    "lines": 14
   },
   {
@@ -95,32 +89,20 @@
   {
    "key": "891197a8a0f41647",
    "a": "src/tree_store.rs:333-339",
-   "b": "engine/src/read.rs:386-391",
+   "b": "engine/src/read.rs:393-398",
    "lines": 7
   },
   {
    "key": "2b71955a529be7ad",
-   "a": "testkit/src/page_node.rs:565-571",
-   "b": "testkit/src/page_node.rs:506-512",
+   "a": "testkit/src/page_node.rs:566-572",
+   "b": "testkit/src/page_node.rs:507-513",
    "lines": 7
   },
   {
    "key": "022cbf85204ee1bd",
-   "a": "web/src/lib.rs:275-288",
-   "b": "web/src/lib.rs:258-267",
+   "a": "web/src/lib.rs:311-324",
+   "b": "web/src/lib.rs:294-303",
    "lines": 14
-  },
-  {
-   "key": "e9a091afd566b792",
-   "a": "wire/src/block.rs:34-43",
-   "b": "contract-keys/src/block.rs:26-35",
-   "lines": 10
-  },
-  {
-   "key": "355e24afb3876de2",
-   "a": "wire/src/lib.rs:607-613",
-   "b": "wire/src/lib.rs:590-596",
-   "lines": 7
   }
  ]
 }
