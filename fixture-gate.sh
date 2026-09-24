@@ -35,6 +35,11 @@ allow() {
     # round-trip (owed ids without bytes, the walk resuming, ParityScan). The
     # fixture runs a whole page, which never round-trips a context.
     engine/tests/parity_scan.rs) return 0 ;;
+    # sdk#135: the ENGINE's delta over a node that EVICTS what it serves, block by
+    # block (the issue's probe: a FIFO of N blocks, roots evictable). The fixtures
+    # run a whole page over a node that keeps everything, which cannot script
+    # eviction per block -- and eviction is the whole subject.
+    engine/tests/delta_under_eviction.rs) return 0 ;;
     *) return 1 ;;
   esac
 }
