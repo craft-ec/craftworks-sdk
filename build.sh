@@ -6,8 +6,10 @@ cd "$(dirname "$0")"
 # The BROWSER build is the `web` crate: the core plus the framing. The core
 # itself is an rlib, so it stays a crate the boundary gate checks rather than
 # one it has to excuse.
+# WHERE THE BUILD OUTPUT IS: cargo's answer, so CARGO_TARGET_DIR is honoured (tools/target-dir.sh).
+target=$(tools/target-dir.sh)
 cargo build --release -p web --target wasm32-unknown-unknown
-wasm=target/wasm32-unknown-unknown/release/web.wasm
+wasm=$target/wasm32-unknown-unknown/release/web.wasm
 # Emptied first, so what ships is only what this build wrote (sdk#263).
 tools/pkg-reset.sh pkg
 # `--out-name`, so the artefact keeps the name every consumer already
@@ -90,7 +92,7 @@ fi
 # container like the other three (builder#104). Built and import-gated by its
 # own script.
 ./signer/build.sh >/dev/null
-cp target/wasm32-unknown-unknown/release/signer.stripped.wasm pkg/web/signer.wasm
+cp "$target/wasm32-unknown-unknown/release/signer.stripped.wasm" pkg/web/signer.wasm
 cp "$contracts/build/block.wasm" "$contracts/build/register.wasm" pkg/web/
 
 # THE ARTEFACTS CONTAINER (craftworks-builder#104): the artefacts in ONE
@@ -117,7 +119,7 @@ if [ "$got_xz" != "$WANT_XZ" ]; then
   exit 1
 fi
 cargo build -q --release -p wire --bin artefacts-container
-container_tool=target/release/artefacts-container
+container_tool=$target/release/artefacts-container
 container_json=$("$container_tool" pkg/web "$contracts/build/webapp.wasm" pkg/web/artefacts.webapp)
 # DETERMINISM, checked on every build: made twice, it must be the same bytes,
 # or its address is a function of the moment rather than of the build.
