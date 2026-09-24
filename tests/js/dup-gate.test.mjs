@@ -35,8 +35,12 @@ const tree = files => {
   mkdirSync(join(root, "src"));
   writeFileSync(join(root, "dup-gate.json"), JSON.stringify({ dirs: ["src"], formats: "rust:rs", ignore: [], minTokens: 50, baseline: "dup-baseline.json" }));
   for (const [f, text] of Object.entries(files)) writeFileSync(join(root, "src", f), text);
+  // A repo, its files TRACKED: the gate scans what git tracks.
+  git(root, "init", "-q");
+  git(root, "add", "-A");
   return root;
 };
+const git = (root, ...a) => execFileSync("git", ["-C", root, ...a], { stdio: "ignore" });
 
 await t("THE CONTROL: two DIFFERENT functions are not a duplicate", async () => {
   const root = tree({ "a.rs": fnText("alpha", 3), "b.rs": fnText("beta", 1).replace(/wrapping_add/g, "saturating_add").replace(/total \/= 3/, "total >>= 2").replace("best = *x", "best = best.max(*x) + 1") });
@@ -62,9 +66,37 @@ await t("a KNOWN duplicate (in the baseline) passes, even after it MOVES within 
   assert.equal(r.code, 0, `a known clone that moved was reported new (keyed by line?):\n${r.out}`);
   // …and a THIRD copy elsewhere is new.
   writeFileSync(join(root, "src", "c.rs"), fnText("alpha", 3));
+  git(root, "add", "-A");
   const r3 = run(root);
   rmSync(root, { recursive: true, force: true });
   assert.equal(r3.code, 1, `a third copy passed because its text was known:\n${r3.out}`);
+});
+
+await t("**only TRACKED code is scanned: a planted copy left UNTRACKED or in an IGNORED dir (a killed run's leftover) is not reported; the same file tracked is red**", async () => {
+  const root = tree({ "a.rs": fnText("alpha", 3) });
+  try {
+    writeFileSync(join(root, "src", "leftover.rs"), fnText("alpha", 3));
+    mkdirSync(join(root, "src", "scratch"));
+    writeFileSync(join(root, ".gitignore"), "src/scratch/\n");
+    writeFileSync(join(root, "src", "scratch", "copy.rs"), fnText("alpha", 3));
+    const r = run(root);
+    assert.equal(r.code, 0, `an untracked or ignored copy was reported:\n${r.out}`);
+    assert.match(r.out, /over 1 file/, `the scan's count is not the tracked files': ${r.out}`);
+    // THE CONTROL: the leftover, tracked, is a new duplicate.
+    git(root, "add", "src/leftover.rs");
+    const r2 = run(root);
+    assert.equal(r2.code, 1, `a TRACKED copy passed:\n${r2.out}`);
+    assert.match(r2.out, /NEW DUPLICATE .*leftover\.rs/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+await t("**outside a git checkout (an archive with no .git) the gate COULD NOT CHECK — exit 2, never \"0 clones\"**", async () => {
+  const root = tree({ "a.rs": fnText("alpha", 3), "b.rs": fnText("alpha", 3) });
+  rmSync(join(root, ".git"), { recursive: true, force: true });
+  const r = run(root);
+  rmSync(root, { recursive: true, force: true });
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /COULD NOT CHECK \(git could not list the tracked files/);
 });
 
 await t("a gate that scanned NOTHING could not check: exit 2, never a pass", async () => {

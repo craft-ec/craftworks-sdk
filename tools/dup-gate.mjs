@@ -44,7 +44,28 @@ export function keyOf(c) {
 
 const where = f => `${f.name}:${f.start}-${f.end}`;
 
-/** Run jscpd over `dirs` under `root`; the clones it reports. Throws when it
+/**
+ * The files the gate scans: those git TRACKS under `dirs`, with the config's
+ * extensions — the code IN the repo. Never a walk of the dirs: a killed run's
+ * leftovers in an ignored or scratch dir (a test's copy of a module) were
+ * flagged as new duplicates, and a copy nobody tracks cannot ship anyway.
+ * Throws when git cannot list them, or lists none (never "nothing found").
+ */
+export function tracked(root, cfg) {
+  const exts = new Set(cfg.formats.split(";").flatMap(f => (f.split(":")[1] ?? "").split(",")));
+  const dirs = cfg.dirs.filter(d => existsSync(join(root, d)));
+  let listed;
+  try {
+    listed = execFileSync("git", ["-C", root, "ls-files", "-z", "--", ...dirs], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    throw new Error(`git could not list the tracked files under ${root} (${String(e.stderr ?? e.message).trim().split("\n")[0]})`);
+  }
+  const files = listed.split("\0").filter(f => f && exts.has(f.split(".").pop()) && existsSync(join(root, f)));
+  if (!files.length) throw new Error(`git tracks no ${[...exts].join("/")} file under ${cfg.dirs.join(", ")}`);
+  return files;
+}
+
+/** Run jscpd over the TRACKED files under `dirs`; the clones it reports. Throws when it
  * could not run or wrote no report. */
 export function clones(root, cfg) {
   const out = mkdtempSync(join(tmpdir(), "dup-gate-"));
@@ -55,7 +76,7 @@ export function clones(root, cfg) {
       "--min-tokens", String(cfg.minTokens ?? 50),
       "--formats-exts", cfg.formats,
       "--ignore", (cfg.ignore ?? []).join(","),
-      ...cfg.dirs.filter(d => existsSync(join(root, d))),
+      ...tracked(root, cfg),
     ];
     execFileSync("npx", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
     const report = join(out, "jscpd-report.json");
