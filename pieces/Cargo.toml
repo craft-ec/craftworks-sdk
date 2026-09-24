@@ -9,6 +9,6 @@ description = "The SDK's LOAD PIECES (sdk#347): the bundle format and its k + m 
 [dependencies]
 # ONLY the tree library's RS codec (freenet_prolly::rs), at the SDK's one pin: the decoder wasm links this crate, so
 # nothing heavier may come in (no freenet-stdlib, no serde).
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 # Hex has one home (the vectors file is hex).
 core-types = { path = "../core-types" }
