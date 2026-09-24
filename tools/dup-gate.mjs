@@ -54,13 +54,19 @@ const where = f => `${f.name}:${f.start}-${f.end}`;
 export function tracked(root, cfg) {
   const exts = new Set(cfg.formats.split(";").flatMap(f => (f.split(":")[1] ?? "").split(",")));
   const dirs = cfg.dirs.filter(d => existsSync(join(root, d)));
-  let listed;
-  try {
-    listed = execFileSync("git", ["-C", root, "ls-files", "-z", "--", ...dirs], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  } catch (e) {
-    throw new Error(`git could not list the tracked files under ${root} (${String(e.stderr ?? e.message).trim().split("\n")[0]})`);
+  // DIR BY DIR, in the config's order: jscpd takes a clone's text from the
+  // file it scanned first, and a clone's key is that text, so one sorted list
+  // of every dir re-keyed known clones (2 NEW + 2 gone on the SDK's tree).
+  const files = [];
+  for (const d of dirs) {
+    let listed;
+    try {
+      listed = execFileSync("git", ["-C", root, "ls-files", "-z", "--", d], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      throw new Error(`git could not list the tracked files under ${root} (${String(e.stderr ?? e.message).trim().split("\n")[0]})`);
+    }
+    files.push(...listed.split("\0").filter(f => f && exts.has(f.split(".").pop()) && existsSync(join(root, f)) && !files.includes(f)));
   }
-  const files = listed.split("\0").filter(f => f && exts.has(f.split(".").pop()) && existsSync(join(root, f)));
   if (!files.length) throw new Error(`git tracks no ${[...exts].join("/")} file under ${cfg.dirs.join(", ")}`);
   return files;
 }
