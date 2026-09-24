@@ -84,6 +84,9 @@ export async function served(
   for (let round = 0; ; round += 1) {
     // Every failure is kept, so a wait can say what each source actually did.
     const failures = [];
+    // The HTTP statuses of the answers that were not the file (a node that does not hold it answers one): told to
+    // `onWait`, so a caller can tell "answered, not held" from "no answer yet" (the load pieces' repair, sdk#347).
+    const statuses = [];
     let answered = 0;
     for (const from of sources) {
       let res;
@@ -96,6 +99,7 @@ export async function served(
       if (!res.ok) {
         // NOT AN ANSWER about the file: the node does not hold it yet.
         failures.push(`${from}: ${res.status}`);
+        statuses.push(res.status);
         continue;
       }
       // `fetch` resolves on the HEADERS; the body can still fail, and that is
@@ -127,6 +131,7 @@ export async function served(
       waitedMs,
       nextMs,
       failures,
+      statuses,
       says: `loading the app… not available on this node yet (${Math.round(waitedMs / 1000)} s)`,
     });
     await sleep(nextMs, signal);
@@ -147,7 +152,9 @@ export async function served(
  * No time cut-off (rule 8): while fewer than `k` have verified, it waits and `onWait` says so. It rejects only
  * when every piece has REFUSED (wrong bytes from every source), or on the person's cancel (`signal`).
  *
- * Resolves `{ pieces, verified, asked }`: `pieces[i]` the verified bytes of piece `i` or `null`; `asked` the
+ * Resolves `{ pieces, verified, asked, notHeld }`: `notHeld` the pieces a source answered NOT FOUND (404) and that
+ * never arrived -- the only ones a repair may PUT back (a piece cancelled at k was not missing). `pieces[i]` the
+ * verified bytes of piece `i` or `null`; `asked` the
  * indices that were asked (the rest were never needed). What the loader's repair later re-PUTs is what was asked
  * and did not arrive.
  */
@@ -172,6 +179,9 @@ export async function raceK(
   signal?.addEventListener?.("abort", cancel, { once: true });
   const got = new Array(k + m).fill(null);
   const asked = [];
+  // Pieces the node ANSWERED "not held" (404) at least once: the only ones the repair may PUT back. A piece
+  // still in flight when the k-th verified was cancelled by this race, not missing, and is never repaired.
+  const notHeld = new Set();
   let verified = 0;
   let refused = 0;
   let answers = 0;
@@ -183,7 +193,7 @@ export async function raceK(
       const settle = () => {
         if (verified >= k) {
           stop.abort();
-          resolve({ pieces: got, verified, asked });
+          resolve({ pieces: got, verified, asked, notHeld: [...notHeld].filter(i => !got[i]).sort((a, b) => a - b) });
         } else if (stop.signal.aborted) {
           reject(new Error(`the SDK's pieces: cancelled with ${verified} of ${k} verified`));
         } else if (refused > m) {
@@ -209,7 +219,12 @@ export async function raceK(
             name: `SDK piece ${i}`,
             refusal: "bytes that do not hash to the piece's sha256",
             check: async bytes => ((await matches(bytes, p.sha256, subtle)) ? null : { answer: true, says: "the wrong bytes" }),
-            onWait: onWait ? w => onWait({ ...w, piece: i, verified, k }) : null,
+            onWait: w => {
+              // A source's own NOT FOUND (404) only: a 503 is "not ready" (a node still joining), and silence or a
+              // network error is no answer at all (rule 8: re-asked, never taken for "missing").
+              if (w.statuses?.includes(404)) notHeld.add(i);
+              onWait?.({ ...w, piece: i, verified, k });
+            },
           }).then(
             bytes => {
               got[i] = bytes;
