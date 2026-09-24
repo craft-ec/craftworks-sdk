@@ -1,9 +1,10 @@
 //! Known-answer vectors for the Register's wire format.
 //!
-//! The format is implemented in `contract_keys::register` rather than
-//! imported, because sdk#35 deliberately decouples this repository's revision
-//! from the contracts' and a path dependency would re-couple them. A second
-//! copy of a wire format drifts, and care is not what stops it — THESE are.
+//! Since sdk#364 `head_state` builds its state with the Register crate's own
+//! types and `encode`, so these vectors no longer guard a hand-written copy:
+//! they pin that the head the SDK signs is byte-for-byte the one the
+//! authority produced for these inputs, and the round-trip test below reads
+//! it back with the crate's verifying `read`.
 //!
 //! Every byte below was produced by the AUTHORITATIVE implementation
 //! (`craftec-register-contract`, mode 0, single writer) and pasted here. They
@@ -130,7 +131,8 @@ fn a_quorum_register_is_refused_not_signed_as_if_it_were_one_writer() {
 /// HEAD — an empty app. Pinned here, on this reader, not only in the codec.
 #[test]
 fn head_of_reads_the_root_of_a_ledgered_head() {
-    use contract_keys::register::{head_of, record_of};
+    use contract_keys::register::head_of;
+    use signer_proto::head::record_of;
     use signer_proto::head::{value, Ledger};
     let root = [0x5A; 32];
     let v = value(&root, &Ledger { prev: Some(signer_proto::Head { seq: 6, root: [3; 32] }), ..Ledger::default() });
@@ -143,4 +145,18 @@ fn head_of_reads_the_root_of_a_ledgered_head() {
     unknown.extend_from_slice(&[250, 1, 0, 9]);
     let st = head_state(&params(), &SIGNING_KEY, 8, &unknown).expect("signs");
     assert_eq!(head_of(&st), Some((8, root)));
+}
+
+/// THE ONE WRITER, round-tripped (sdk#364): what `head_state` signs is read back by the Register crate's FULL `read`
+/// (every signature verified) as the same `(seq, value)`, and re-encoding the crate's parse gives the same bytes.
+#[test]
+fn head_state_round_trips_through_the_register_crate() {
+    use craftec_register_contract::read;
+    for (seq, v) in [(1u64, vec![0x11u8; 32]), (7, vec![0xAB; 32]), (9, [vec![0x5A; 32], vec![2, 1, 0, 9]].concat())] {
+        let st = head_state(&params(), &SIGNING_KEY, seq, &v).expect("signs");
+        let (p, parsed) = read(&params(), &st).expect("the Register crate's full read refuses the SDK's head");
+        let r = parsed.record.as_ref().expect("a record");
+        assert_eq!((r.signed.seq, r.value.clone()), (seq, v.clone()));
+        assert_eq!(parsed.encode(&p.authority), st, "the crate's encode of its parse is not the SDK's bytes");
+    }
 }

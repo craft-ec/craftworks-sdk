@@ -382,8 +382,12 @@ pub fn delegate_from_code(wasm: &[u8]) -> (DelegateContainer, DelegateKey) {
 /// contract and finds an empty head rather than an error. It was written out
 /// by hand in the live driver and would have been written out again in the
 /// page; a second copy is a silent fork of an id.
+///
+/// **The ONE RG01 writer outside the Register crate** (sdk#364): the crate parses params (`Params::parse`) but has
+/// no encoder, so they are laid out here, from its own `MAGIC`, and a round-trip test reads them back with its parser
+/// (`the_one_params_writer_round_trips_through_the_register_crate`). signer-proto/tests/rg01_one_home.rs counts this.
 pub fn register_params(verifying_key: &[u8; 32], name: &[u8]) -> Vec<u8> {
-    let mut p = Vec::from(*signer_proto::head::RECORD_MAGIC);
+    let mut p = Vec::from(*craftec_register_contract::wire::MAGIC);
     p.push(0u8);
     p.extend_from_slice(verifying_key);
     p.extend_from_slice(name);

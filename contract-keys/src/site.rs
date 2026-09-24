@@ -3,23 +3,22 @@
 //! `(seq = version, value = blake3(web))`. The site contract (freenet-contracts site/) holds it as its web
 //! framing's metadata. Mode 0 only, as `register::head_state` is.
 
-use signer_proto::head::RECORD_MAGIC;
+use craftec_register_contract::wire::{Authority, Params};
 
 /// A site label's prefix: `site:` then the app id.
 pub const LABEL_PREFIX: &[u8] = b"site:";
-const KEY_LEN: usize = 32;
-
 /// THE ONE relabelling (builder#117): the same authority, another label. `None` when `params` are not a mode-0
 /// Register's -- a k-of-n keyset is Phase 6's, refused rather than guessed.
+/// The params are parsed by the Register crate; the label is their TAIL, so the same authority under another label is
+/// the params minus their label, plus the new one -- no RG01 layout written here (sdk#364).
 pub fn relabel(params: &[u8], label: &[u8]) -> Option<Vec<u8>> {
-    let rest = params.strip_prefix(RECORD_MAGIC)?;
-    let (&mode, rest) = rest.split_first()?;
-    if mode != 0 || rest.len() < KEY_LEN {
+    let p = Params::parse(params)?;
+    if !matches!(p.authority, Authority::One(_)) {
         return None;
     }
-    let mut out = params[..RECORD_MAGIC.len() + 1 + KEY_LEN].to_vec();
+    let mut out = params[..params.len() - p.label.len()].to_vec();
     out.extend_from_slice(label);
-    Some(out)
+    Params::parse(&out).is_some().then_some(out)
 }
 
 /// `app`'s site params, from the person's Register params: `None` when `app` is not an app id

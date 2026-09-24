@@ -1,7 +1,7 @@
-//! THE HEAD VALUE: what a Register record says the head is. The ONE reader and writer of its layout.
+//! THE HEAD VALUE: what a Register record says the head is. The ONE reader and writer of the VALUE's layout; the
+//! RECORD around it (the Register's own framing) is the Register crate's alone, read by [`record_of`] (sdk#364).
 //!
 //! ```text
-//! record = RG01 | flags | terminal | seq (u64 LE) | vlen (u16 LE) | value | sig      (the Register's own framing)
 //! value  = root [32] ‖ ledger
 //! ledger = (empty) | version u8 ‖ field*       field = tag u8 ‖ len u16 LE ‖ bytes, tags strictly ascending
 //! ```
@@ -40,13 +40,8 @@
 
 use crate::Head;
 
-/// The Register record's magic, at the front of every encoded state.
-pub const RECORD_MAGIC: &[u8; 4] = b"RG01";
-/// The flag bit that says a state carries a record.
-pub const FLAG_RECORD: u8 = 0b01;
-
-/// The Register contract's cap on a record's value.
-pub const VALUE_MAX: usize = 4096;
+/// The Register contract's cap on a record's value: the contract's own number, never restated.
+pub const VALUE_MAX: usize = craftec_register_contract::wire::MAX_VALUE;
 /// The root, at the front of every value.
 pub const ROOT_LEN: usize = 32;
 /// The ledger's version, the first byte after the root when a ledger is present. 2 since race put:
@@ -281,21 +276,12 @@ pub fn merge(winner: &Ledger, loser: &Ledger) -> Ledger {
     Ledger { prev: winner.prev, parity, through: normalise(&through) }
 }
 
-/// A Register record's framing: `(seq, value)`, the one parser of `RG01 | flags | terminal | seq | vlen | value`. It
-/// does NOT verify the signature (the contract did, before the node stored it).
+/// A Register state's record, `(seq, value)`, read by THE REGISTER CRATE (`wire::record_head`, sdk#364): the
+/// record's authority-free prefix, so it needs no params -- a page reading a head it knows only by contract id can
+/// read it. A state also carrying fork EVIDENCE is read (a hand-written copy refused it -- F56 -- and would have
+/// locked a device out after a same-version race). It does NOT verify the signatures: the contract did, before the
+/// node stored it. `None`: no record in it, or not a Register state.
 pub fn record_of(state: &[u8]) -> Option<(u64, &[u8])> {
-    let rest = state.strip_prefix(RECORD_MAGIC)?;
-    let (&flags, rest) = rest.split_first()?;
-    if flags & FLAG_RECORD == 0 {
-        return None;
-    }
-    let (_terminal, rest) = rest.split_first()?;
-    let (seq, rest) = rest.split_at_checked(8)?;
-    let seq = u64::from_le_bytes(seq.try_into().ok()?);
-    let (vlen, rest) = rest.split_at_checked(2)?;
-    let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
-    if vlen > VALUE_MAX {
-        return None;
-    }
-    Some((seq, rest.get(..vlen)?))
+    let (_terminal, seq, value) = craftec_register_contract::wire::record_head(state)?;
+    Some((seq, value))
 }

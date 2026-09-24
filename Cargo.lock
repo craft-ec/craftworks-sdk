@@ -197,6 +197,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "core-types",
+ "craftec-register-contract",
  "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",
@@ -234,7 +235,7 @@ dependencies = [
 [[package]]
 name = "craftec-register-contract"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-contracts?rev=0a8cb05#0a8cb051d9592d4b4fbfc5a4399b3b99118e5ad6"
+source = "git+https://github.com/craft-ec/freenet-contracts?rev=0fbb5c7#0fbb5c7c96b1a84653ea9c2e09d16e870c2a4486"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -1498,6 +1499,7 @@ name = "signer-proto"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "craftec-register-contract",
  "serde",
 ]
 
@@ -2039,7 +2041,9 @@ dependencies = [
  "blake3",
  "contract-keys",
  "core-types",
+ "craftec-register-contract",
  "craftec-webapp-contract",
+ "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",
  "pieces",
