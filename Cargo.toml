@@ -84,3 +84,10 @@ craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contrac
 [profile.release]
 opt-level = "s"
 lto = true
+
+# THE BATCH-ONLY TESTS' profile (gate.sh): release speed WITH debug assertions, so the page model's seeds run every
+# `debug_assert!` the unit tests do -- the clock-origin guard (sdk#397) first: compiled out of plain release, it would
+# watch nothing exactly where the model drives every path at an epoch origin.
+[profile.model]
+inherits = "release"
+debug-assertions = true
