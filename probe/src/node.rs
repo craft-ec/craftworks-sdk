@@ -16,6 +16,20 @@ use std::time::{Duration, Instant};
 /// Ports this probe must never touch: the user's own nodes.
 pub const RESERVED: &[u16] = &[7509, 7609];
 
+/// The port a node URL names, REFUSED when it is one of [`RESERVED`]: parsed
+/// from the URL, never matched as text (a text match on ":7509/" passed
+/// "ws://127.0.0.1:7509" straight through). A URL whose port cannot be read
+/// is refused too: an unreadable target is never assumed to be someone else's.
+pub fn allowed_port(url: &str) -> Result<u16> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let port = authority.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).with_context(|| format!("{url}: no port to check against the owner's nodes"))?;
+    if RESERVED.contains(&port) {
+        bail!("{url} is the owner's node (port {port}): never touched by a probe");
+    }
+    Ok(port)
+}
+
 const BOOT: Duration = Duration::from_secs(45);
 
 /// How the node is run.

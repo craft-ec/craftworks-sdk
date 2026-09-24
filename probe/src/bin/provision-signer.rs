@@ -25,9 +25,7 @@ async fn main() -> Result<()> {
     let usage = "usage: provision-signer <ws-url> <seed-hex-32> <signer.wasm> <block.wasm> <register.wasm>";
     let a: Vec<String> = std::env::args().skip(1).collect();
     let [ws, seed, signer, block, register] = a.as_slice() else { bail!("{usage}") };
-    if [":7509/", ":7609/"].iter().any(|p| ws.contains(p)) {
-        bail!("{ws} is the owner's node: never provisioned by a harness");
-    }
+    probe::node::allowed_port(ws)?;
     let seed: [u8; 32] = core_types::hex::decode(seed).context("seed: hex")?.try_into().map_err(|_| anyhow::anyhow!("seed: 32 bytes"))?;
     let signer_wasm = std::fs::read(signer).with_context(|| format!("reading {signer}"))?;
     probe::check(&signer_wasm).map_err(|e| anyhow::anyhow!("the signer is refused by the import gate: {e}"))?;

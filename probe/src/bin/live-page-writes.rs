@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let v = std::process::Command::new("freenet").arg("--version").output().context("freenet --version")?;
     println!("freenet: {}", String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or_default());
     let port: u16 = std::env::var("PAGE_PORT").ok().and_then(|p| p.parse().ok()).context("PAGE_PORT=<port> is required; there is no default")?;
-    if port == 7509 || port == 7609 {
+    if probe::node::RESERVED.contains(&port) {
         bail!("port {port} is the owner's node");
     }
     let tmp = std::env::var("PAGE_TMP").context("PAGE_TMP=<dir> is required: the node's three dirs go under it")?;
