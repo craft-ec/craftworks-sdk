@@ -472,7 +472,7 @@ pub(crate) fn short_page<B: Blocks>(blocks: &B, want: &Want, root: &Cid) -> Opti
 }
 
 /// A delta's changes as the reply carries them: key, and the new value (`None`: removed).
-pub(crate) type Changes = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+pub type Changes = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
 /// One attempt of a DELTA, resumed after `after` (sdk#135, apply-and-resume).
 pub(crate) enum DeltaStep {

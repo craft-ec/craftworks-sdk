@@ -1284,6 +1284,9 @@ impl<B: Blocks> Blocks for WithEmptyLeaf<'_, B> {
     }
 }
 
+/// A parked delta's resume key and established prefix (`Engine::delta_prefix_for_test`, sdk#135).
+pub type DeltaPrefix = (Option<Vec<u8>>, read::Changes);
+
 pub struct Engine<B: Blocks> {
     /// The empty leaf, which a device with no head has as its root and which
     /// nothing on the network holds until the first commit publishes it.
@@ -4847,7 +4850,7 @@ impl<B: Blocks> Engine<B> {
 
     /// A parked DELTA's established prefix and resume key (sdk#135): only for tests that check every step is a
     /// correct prefix of the true diff.
-    pub fn delta_prefix_for_test(&self, req_id: read::ReqId) -> Option<(Option<Vec<u8>>, Vec<(Vec<u8>, Option<Vec<u8>>)>)> {
+    pub fn delta_prefix_for_test(&self, req_id: read::ReqId) -> Option<DeltaPrefix> {
         self.reads.parked.get(&req_id).map(|p| (p.delta.after.clone(), p.delta.acc.clone()))
     }
 

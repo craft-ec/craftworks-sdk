@@ -51,7 +51,7 @@ impl Node {
 
 /// Two trees of `n` keys, `b` changing every `every`-th key: every block of both, the roots, and the TRUE diff.
 fn trees(n: u32, every: u32) -> (MemBlocks, Cid, Cid, Changes) {
-    let val = |i: u32, g: u8| vec![g.wrapping_add((i % 251) as u8); if i % 5 == 0 { 700 } else { 24 }];
+    let val = |i: u32, g: u8| vec![g.wrapping_add((i % 251) as u8); if i.is_multiple_of(5) { 700 } else { 24 }];
     let a: Vec<(Vec<u8>, Vec<u8>)> = (0..n).map(|i| (format!("k/{i:06}").into_bytes(), val(i, 0))).collect();
     let b: Vec<(Vec<u8>, Vec<u8>)> = (0..n).map(|i| (format!("k/{i:06}").into_bytes(), val(i, if i % every == 7 { 9 } else { 0 }))).collect();
     let truth: Changes = (0..n).filter(|i| i % every == 7).map(|i| (b[i as usize].0.clone(), Some(b[i as usize].1.clone()))).collect();
