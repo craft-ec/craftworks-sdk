@@ -220,9 +220,10 @@ fn the_pack_format_is_freenet_prollys_not_a_second_copy() {
     let (build, members) = (body("pub fn build("), body("pub fn members("));
     assert!(build.contains("max_body") && members.contains("Vec<(Cid, Vec<u8>)>"), "the reader did not find the real bodies");
 
+    // The magic has no name here at all (sdk#305: nothing read one), so the
+    // literal is what a second copy would have to spell.
     assert!(!src.contains("b\"PK01\""), "pack.rs spells the pack magic itself");
     for (name, want) in [
-        ("pub const PACK_MAGIC", "format::MAGIC"),
         ("pub const PACK_HEADER", "format::HEADER"),
         ("pub const MAX_PACK", "format::MAX_PACK"),
     ] {
