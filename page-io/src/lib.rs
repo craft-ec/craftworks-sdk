@@ -697,6 +697,22 @@ impl PageIo {
         self.provisioned
     }
 
+    /// THE SOCKET WAS REPLACED (sdk#376). Everything that belonged to the old
+    /// connection is dropped or asked again, in THIS call, so the frames leave
+    /// with the caller's next `take_frames`:
+    /// - the reassembly of a chunked reply half-received on the old socket (its
+    ///   stream ids restart; joined to the new connection's it would decode as a
+    ///   message nobody sent);
+    /// - the head subscription: the node held it for the old connection, so it
+    ///   is not "answered" on this one until the re-sent head read is
+    ///   (`Page::reconnected` re-sends it: a GET with subscribe, the one path).
+    pub fn reconnected(&mut self, now: Ms) {
+        self.frames = wire::Reassembler::default();
+        self.head_answered = false;
+        self.server.page.reconnected(now);
+        self.tick(now);
+    }
+
     /// The head Register's instance id (what `Identity` reports as `head_id`).
     /// THE HEAD SUBSCRIPTION AS IT REALLY IS (sdk#259): asked, answered, and
     /// how many head moves it has delivered. The page path's `LiveMode` is

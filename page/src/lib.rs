@@ -274,6 +274,10 @@ struct Deadline {
     /// per-op backoff as a silent one. Not on the wire: it holds no window
     /// place, and coming due is not a timeout.
     sent: bool,
+    /// Re-sent on a NEW socket after a reconnect (sdk#376): its answer can only
+    /// be to that re-send, but it is still not a first send, so (Karn) its
+    /// answer is no RTT sample.
+    resent: bool,
 }
 
 /// Which op a deadline is for.
@@ -1330,6 +1334,35 @@ impl Page {
         self.step(Event::HeadConflict { seq, root });
     }
 
+    /// The socket was REPLACED (sdk#376): EVERY op on the wire went out on the
+    /// socket that is gone -- block GETs, PUTs, the sign, the update, the head
+    /// reads and the subscription they carry -- so each is sent again NOW, on
+    /// the new one. Not a timeout: nothing was lost on the PATH, so no loss is
+    /// recorded, the window is not halved, the RTO does not back off, and the
+    /// attempt stays what it was (a re-send is no RTT sample, Karn). Parked
+    /// ops (`sent == false`) were not on the wire and keep their backoff. With
+    /// no head read among them, a page that has a head reads it now: a GET
+    /// with subscribe, the one path, so the new connection is subscribed at
+    /// once and not at the 120 s backstop.
+    pub fn reconnected(&mut self, now: Ms) {
+        self.now = now.0;
+        let on_wire: Vec<Waiting> = self.deadlines.iter().filter(|(_, d)| d.sent).map(|(w, _)| w.clone()).collect();
+        let mut head_read = false;
+        for w in on_wire {
+            let at = self.now + self.backoff(self.deadlines[&w].attempt);
+            let d = self.deadlines.get_mut(&w).expect("listed");
+            d.at = at;
+            d.sent_at = self.now;
+            d.resent = true;
+            head_read |= d.op == Op::ReadHead;
+            self.out.push(d.op.clone());
+        }
+        if !head_read && self.engine_has_head {
+            self.last_head_at = self.now;
+            self.send(Waiting::Hint, Op::ReadHead);
+        }
+    }
+
     /// The node said the head register changed (`HeadChanged`, a HINT a node
     /// can fabricate or drop): read it. ALWAYS — owed parity, an owed head
     /// or idle alike (the architect's #5): only a verify in progress, which
@@ -1632,7 +1665,7 @@ impl Page {
         // other op's answers, so an op nobody answers was re-sent at that
         // small RTO for ever -- thousands of GETs in five minutes (measured
         // on a silent node once silence stopped ending a read).
-        let d = Deadline { at: self.now + self.backoff(attempt), op: op.clone(), sent_at: self.now, attempt, sent: true };
+        let d = Deadline { at: self.now + self.backoff(attempt), op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false };
         self.deadlines.insert(w, d);
         self.out.push(op);
     }
@@ -1702,7 +1735,7 @@ impl Page {
     fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
-        self.deadlines.insert(w, Deadline { at, op, sent_at: self.now, attempt, sent: false });
+        self.deadlines.insert(w, Deadline { at, op, sent_at: self.now, attempt, sent: false, resent: false });
     }
 
     /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
@@ -1712,7 +1745,7 @@ impl Page {
         let d = self.deadlines.remove(w)?;
         self.attempt_of.remove(w);
         self.first_of.remove(w);
-        if d.sent && d.attempt == 1 {
+        if d.sent && d.attempt == 1 && !d.resent {
             self.rto.sample(self.now.saturating_sub(d.sent_at));
         }
         if d.sent && matches!(w, Waiting::Get(_)) {
@@ -2454,6 +2487,51 @@ mod parked_get {
         // The engine here waits on nothing: the parked GET ends rather than going out.
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
+    }
+}
+
+#[cfg(test)]
+mod reconnect {
+    use super::*;
+
+    /// A RECONNECT (sdk#376, the architect): every op ON THE WIRE went out on
+    /// the socket that is gone, so each is sent again in the SAME call -- and
+    /// it is not a timeout: nothing was lost on the path, so the window is not
+    /// halved, the RTO does not back off, the attempt is what it was, and the
+    /// re-send's answer is no RTT sample (Karn). A PARKED op was not on the
+    /// wire and keeps its backoff.
+    #[test]
+    fn a_reconnect_resends_every_op_on_the_wire_at_once_and_is_not_a_timeout() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let ids: Vec<[u8; 32]> = (1..=3u8).map(|i| [i; 32]).collect();
+        for id in &ids {
+            p.send(Waiting::Get(*id), Op::Get { id: *id });
+        }
+        let parked = [9u8; 32];
+        p.send(Waiting::Get(parked), Op::Get { id: parked });
+        let first = p.take_ops();
+        assert_eq!(first.iter().filter(|o| matches!(o, Op::Get { .. })).count(), 4, "THE SETUP: the GETs did not go out (within the window)");
+        p.answer(Answer::GetMissed(parked), Ms(10));
+        let parked_at = p.deadlines[&Waiting::Get(parked)].at;
+        let (rto, window) = (p.rto.rto_ms(), p.window.size());
+        let attempts: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(*id)].attempt).collect();
+
+        p.reconnected(Ms(50));
+        let again = p.take_ops();
+        for id in &ids {
+            assert!(again.contains(&Op::Get { id: *id }), "a GET on the wire was not re-sent on the reconnect: {again:?}");
+        }
+        assert!(!again.contains(&Op::Get { id: parked }), "a PARKED GET (not on the wire) was re-sent");
+        assert_eq!(p.deadlines[&Waiting::Get(parked)].at, parked_at, "a parked GET lost its backoff");
+        assert_eq!(p.window.size(), window, "the reconnect halved the window, as if the path were congested");
+        assert_eq!(p.rto.rto_ms(), rto, "the reconnect backed the RTO off");
+        let after: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(*id)].attempt).collect();
+        assert_eq!(after, attempts, "a re-send on the new socket was counted as another attempt");
+
+        // KARN: the re-send's answer, however late, is no RTT sample.
+        p.now = 50_000;
+        p.answered(&Waiting::Get(ids[0]));
+        assert_eq!(p.rto.rto_ms(), rto, "a re-sent op's answer was taken as an RTT sample");
     }
 }
 

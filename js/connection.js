@@ -14,13 +14,12 @@
 // What it does do:
 //   * send what `takeOutbound()` gives it
 //   * feed `onInbound()` what arrives
-//   * reconnect, and re-assert the head subscriptions on the way back
+//   * reconnect (the page re-subscribes its trees itself: page-io, sdk#376)
 //   * resolve the promise for a request when its answer arrives
 
 /** Open a connection to a node's client API and drive an engine over it. */
 export function connect(engine, { url, delegateKey, onEvent = () => {} } = {}) {
   let ws = null, closed = false, backoff = 250;
-  const watched = new Set();          // head contracts to re-assert on reconnect
   let pumping = false;
 
   const send = bytes => {
@@ -60,17 +59,10 @@ export function connect(engine, { url, delegateKey, onEvent = () => {} } = {}) {
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
       backoff = 250;
-      // Subscriptions are CLIENT state: the node's copy outlives the engine's
-      // context and can be evicted without anyone being told, so they are
-      // re-asserted on every connect. Re-subscribing is idempotent at the
-      // node, so this costs nothing when nothing was lost.
-      for (const head of watched) subscribeHead(head);
       onEvent({ kind: "open" });
       pump();
     };
 
-    // The heads this connection intends to watch, so a test — and a caller —
-    // can see that a reconnect re-asserts them.
     ws.onmessage = e => {
       const bytes = new Uint8Array(e.data);
       engine.on_inbound(bytes);
@@ -88,45 +80,9 @@ export function connect(engine, { url, delegateKey, onEvent = () => {} } = {}) {
     ws.onerror = () => onEvent({ kind: "error" });
   };
 
-  /**
-   * Remember that a tree's head should be watched.
-   *
-   * **It does not subscribe yet, and it must not pretend to.** The notifier
-   * that reaches a tab which made no write is a CLIENT-API subscription — an
-   * engine-originated push returns to whoever invoked the delegate, so it
-   * cannot (F40) — and a client-API request is a `ClientRequest`, framed the
-   * way the node's own client library frames it.
-   *
-   * This file cannot produce that frame. The first version invented one
-   * (`JSON.stringify({subscribe, delegate})`) on a socket carrying the native
-   * encoding; nothing would have accepted it, and the failure would have been
-   * a subscription that silently never existed — which is indistinguishable,
-   * from inside the app, from a tree that simply stopped changing.
-   *
-   * THE ENCODER NOW EXISTS AND IT IS IN RUST. `wire` frames the subscribe,
-   * the session decides when to send one, and the bytes arrive here through
-   * the ordinary outbound queue like everything else. So this file does not
-   * subscribe to anything: it moves bytes, and the decision about which
-   * contract to watch, and whether the node accepted, belongs where every
-   * other decision does.
-   *
-   * What remains here is the RE-ASSERTION on reconnect, which is a property
-   * of this socket rather than of the engine: the node's copy of a
-   * subscription outlives the engine's context and can be evicted at its cap
-   * without anyone being told (F39). The session is told the connection is
-   * new and asks again.
-   */
-  const subscribeHead = head => {
-    watched.add(head);
-    onEvent({ kind: "head-watch-recorded", head });
-    return true;
-  };
-
   open();
   return {
     pump,
-    subscribeHead,
-    get watching() { return [...watched]; },
     get connected() { return ws?.readyState === 1; },
     close() { closed = true; ws?.close(); },
   };

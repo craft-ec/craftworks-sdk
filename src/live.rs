@@ -205,35 +205,6 @@ impl Trees {
         self.trees[i].bindings.len() - 1
     }
 
-    /// Re-assert every subscription. Called on (re)connect.
-    ///
-    /// The node's copy outlives the engine's context and can be evicted
-    /// without anyone being told, so a client that never re-asserted would
-    /// go quiet permanently and have no way to notice. Re-subscribing is
-    /// idempotent at the node, so this is free.
-    pub fn reassert<W: HeadWatch>(&mut self, w: &mut W) {
-        for t in &mut self.trees {
-            if t.bindings.iter().any(|b| b.is_live()) {
-                let ok = w.watch(t.head);
-                self.probe.note(Step::HeadWatch, ok as u64);
-                t.watched = ok;
-                let mode = if ok {
-                    LiveMode::HeadSubscribed
-                } else {
-                    LiveMode::Polled
-                };
-                if !ok {
-                    self.probe.note(Step::Downgraded, 0);
-                }
-                for b in &mut t.bindings {
-                    if b.is_live() {
-                        b.note_mode(mode);
-                    }
-                }
-            }
-        }
-    }
-
     /// Heads the node has pushed: reload the live bindings on those trees.
     ///
     /// Returns how many bindings actually changed. A push is a TRIGGER for

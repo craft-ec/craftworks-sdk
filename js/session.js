@@ -349,16 +349,20 @@ export async function openSession(Session, {
   const conn = connectWith(socketEngine, {
     url: session.url(),
     onEvent: e => {
+      // A RE-open, not the first: only then is there an old connection whose
+      // reassembly and head subscription are gone (sdk#376).
+      const reopened = e.kind === "open" && everOpened;
       if (e.kind === "open") everOpened = true;
       if (!everOpened && e.kind === "closed") refusedBeforeOpen += 1;
-      // A new socket means the stream ids restart, so a half-received
-      // chunked reply from the old one must not be completed with bytes
-      // from this one.
-      if (e.kind === "open") {
+      // A new socket means the stream ids restart, so a half-received chunked
+      // reply from the old one must not be completed with bytes from this one;
+      // and the node's subscriptions went with the old socket, so every page
+      // (this session and each tree) reads its head again WITH subscribe, now.
+      if (reopened) {
         session.reconnected();
         for (const t of trees) t.session.reconnected();
-        treeSubscriptions = trees.size;
       }
+      if (e.kind === "open") treeSubscriptions = trees.size;
       // A message arrived and has been handed to the session: any load it
       // completed can now wake the reads parked on it. On the task that
       // handled the message, not on a timer.

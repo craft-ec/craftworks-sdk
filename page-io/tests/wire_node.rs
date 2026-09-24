@@ -712,6 +712,57 @@ fn a_head_changed_from_the_node_makes_an_idle_page_read_and_adopt_the_new_head()
     assert!(got, "the idle tab did not adopt the head the node pushed: {r:?}");
 }
 
+/// sdk#376: after a RECONNECT the page is subscribed again AT ONCE. The head
+/// read (a GET with subscribe, the one path) goes out in the SAME call as the
+/// reconnect -- no clock passes, so neither a re-send nor the 120 s backstop is
+/// what sends it -- the subscription reads unanswered until the node answers
+/// it, and a push after the reconnect reaches the page, which adopts the head.
+#[test]
+fn a_reconnect_re_subscribes_the_head_at_once_and_a_push_after_it_reaches_the_page() {
+    let mut node = WireNode::new(&[31u8; 32]);
+    let (mut a, mut b) = (page_io(&node), page_io(&node));
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "a", "1")), 1).contains(&WriteState::Published));
+    assert!(a.head_subscription().answered, "THE SETUP: the page was never subscribed");
+    assert!(a.take_frames().is_empty(), "THE SETUP: the page was not idle");
+
+    // The socket dropped and a new one opened: the node's subscription went with the old one.
+    let served_before = node.served.get("get register").copied().unwrap_or(0);
+    a.reconnected(Ms(now));
+    assert!(!a.head_subscription().answered, "a subscription the old socket held was still reported answered on the new one");
+    let frames = a.take_frames();
+    assert!(!frames.is_empty(), "nothing was sent on the reconnect: the page waits for the 120 s backstop");
+    for f in frames {
+        if let Some(answer) = node.serve(&f) {
+            a.inbound(&answer, Ms(now));
+        }
+    }
+    let served_after = node.served.get("get register").copied().unwrap_or(0);
+    // `WireNode` asserts `subscribe` on every head GET: this one carried it.
+    assert_eq!(served_after, served_before + 1, "the reconnect did not read the head (with subscribe) at once");
+    pump(&mut a, &mut node, &mut now);
+    assert!(a.head_subscription().answered, "the re-sent head read was answered and the subscription still not reported");
+
+    // A push AFTER the reconnect reaches the page: another tab moves the head, the node notifies `a`.
+    client(&mut b, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut b, &mut node, &mut now, &write(1, "b", "2")), 1).contains(&WriteState::Published));
+    let key = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(REGISTER_CODE.to_vec())),
+        Parameters::from(node.register_params.clone()),
+    )))
+    .key();
+    let state = node.contracts.get(&node.register_id).cloned().expect("a register");
+    let push = ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update: UpdateData::State(State::from(state)) }));
+    let changes = a.head_subscription().changes;
+    a.inbound(&push, Ms(now));
+    pump(&mut a, &mut node, &mut now);
+    assert_eq!(a.head_subscription().changes, changes + 1, "the push after the reconnect was not counted as delivered");
+    a.client(&protocol::encode_session_request(4, 9, &Request::Get { req_id: 7, key: b"b".to_vec() }).expect("encodes"));
+    let r = pump(&mut a, &mut node, &mut now);
+    assert!(r.iter().any(|x| matches!(x, Reply::Value { req_id: 7, value: Some(v) } if v == b"2")), "the page did not adopt the head pushed after the reconnect: {r:?}");
+}
+
 /// An APP's PUT (builder#104: a web container) goes out through page-io — the
 /// only path to the node — beside the page's own writes, and its answer comes
 /// back to the PAGE by key, which ends the PUT it sent: never taken as one of
