@@ -333,8 +333,8 @@ fn the_first_wave_is_the_data_and_one_parity_per_changed_group_and_the_rest_foll
     let root = r.e.root();
     // Every changed group, as the new nodes list them: its parity ids (the root: its own group of one).
     let mut groups: Vec<Vec<Cid>> = sent
-        .iter()
-        .filter_map(|(_, b)| Node::parse(b).ok())
+        .values()
+        .filter_map(|b| Node::parse(b).ok())
         .filter(|n| !n.is_leaf())
         .flat_map(|n| {
             let ids: Vec<Cid> = n.parity().collect();

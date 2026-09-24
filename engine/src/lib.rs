@@ -616,6 +616,9 @@ pub enum Effect {
     },
 }
 
+/// A block as the commit makes it: its id and bytes.
+type Block = (Cid, Vec<u8>);
+
 /// Everything tunable, in one place, so nothing downstream reads a literal.
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -3525,7 +3528,7 @@ impl<B: Blocks> Engine<B> {
         let race = Race::of(&emitted, &parity, &self.unacked(), (self.root, &root_parity));
         // THE FIRST WAVE (#378 P1-hybrid): one parity per changed group goes now, the rest when the head lands --
         // so the Sign, sent at k, queues behind at most ~1 extra PUT per group on the node's one queue (F61), not m.
-        let (parity, deferred): (Vec<(Cid, Vec<u8>)>, Vec<(Cid, Vec<u8>)>) = if self.params.race_put && self.params.first_wave_parity {
+        let (parity, deferred): (Vec<Block>, Vec<Block>) = if self.params.race_put && self.params.first_wave_parity {
             let ids: BTreeSet<Cid> = parity.iter().map(|(c, _)| *c).collect();
             let first: BTreeSet<Cid> = race.groups.iter().filter_map(|g| g.new.iter().find(|c| ids.contains(*c)).copied()).collect();
             parity.into_iter().partition(|(c, _)| first.contains(c))
