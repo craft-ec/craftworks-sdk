@@ -314,6 +314,9 @@ echo "gate: batch-only targets, run here: ${BATCH_ONLY[*]}"
 step "cargo test, per member"
 declare -a NAMES COUNTS
 total=0
+# A failing member's WHOLE output is kept (tools/gate-member-tests.sh): a
+# failure that a rerun does not reproduce is still evidence (sdk#360).
+failures_dir=${GATE_FAILURES_DIR:-target/gate-failures}
 FULL_META=$(mktemp)
 cargo metadata --format-version 1 --no-deps > "$FULL_META" 2>/dev/null
 for m in $MEMBERS; do
@@ -330,14 +333,15 @@ for m in $MEMBERS; do
       out="$out"$'\n'"$rout"
       bo_counts="$bo_counts $t=$(echo "$rout" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')"
     done
+    n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
+    # (its exit is the member's status, already in rc)
+    printf '%s\n' "$out" | ./tools/gate-member-tests.sh --keep "$m" "$failures_dir" "$rc" || true
   else
-    out=$(cargo test -p "$m" --no-fail-fast 2>&1)
+    n=$(./tools/gate-member-tests.sh "$m" "$failures_dir")
     rc=$?
   fi
-  n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
   if [ $rc -ne 0 ]; then
     step_fail "cargo test -p $m FAILED"
-    echo "$out" | grep -E "^(error|test result: FAILED|---- )" | head -5 >&2
   fi
   if [ "$n" -eq 0 ] && ! no_host_tests "$m"; then
     step_fail "$m has NO tests and no reason recorded — add tests, or add it to \
