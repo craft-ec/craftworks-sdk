@@ -13,6 +13,8 @@ crate-type = ["cdylib"]
 core-types = { path = "../core-types" }
 craftworks-sdk = { path = ".." }
 wire = { path = "../wire" }
+# The load pieces (sdk#347): a loader that rebuilt the SDK re-derives a missing piece to PUT it back.
+pieces = { path = "../pieces" }
 protocol = { path = "../protocol" }
 # PAGE MODE (ruling B): the in-page engine, and its I/O over the client API.
 page = { path = "../page" }

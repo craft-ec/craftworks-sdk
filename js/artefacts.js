@@ -38,51 +38,13 @@
 // best-effort — a failure degrades to fetching, which is exactly what the
 // code did before there was a cache.
 //
-// # A node that does not hold it YET has not answered (sdk#312)
-//
-// A 404, a 503, a 400 or a network error for an artefact the app names is NOT
-// an end: a node serves a web container only once it holds it, and one that
-// is still fetching or re-storing it answers "not found" in the meantime (the
-// owner saw an app fail on a 404 and open on a reload). This fetch is a path
-// to the node like any other, so it keeps the owner's rules 7 and 8: re-asked
-// until answered, on the PAGE'S back-off (`rto.js`, generated from
-// page/src/rto.rs — not a second one written here), with no give-up timer.
-// While it waits it says so (`onWait`). What ends it: bytes that do not hash
-// to the name (a MISMATCH, refused by name), or a person cancelling
-// (`signal`).
+// The fetch itself — re-asked on the page's back-off until answered — is the one fetch, `served`
+// (served.js); this file only adds the cache in front of it.
 
-import { RTO_SCHEDULE_MS } from "./rto.js";
+import { best, digestOf, matches, served, sleepFor } from "./served.js";
 
 /** Where cached artefacts live. One name, so every app finds the same ones. */
 export const CACHE_NAME = "craftworks-artefacts";
-
-const hex = bytes =>
-  [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, "0")).join("");
-
-/** Storage may throw for reasons that are not this app's fault. */
-async function best(effort, fallback = null) {
-  try {
-    return await effort();
-  } catch {
-    return fallback;
-  }
-}
-
-/**
- * The bytes for one artefact: from the shared cache if they are there AND
- * correct, otherwise fetched, checked, and left there for the next app.
- *
- * `caches` and `fetch` are injected so the wiring can be tested without a
- * browser — the same reason `openSession` injects them. `caches: null` turns
- * the cache OFF, which is the control proving the cache is what avoids the
- * second fetch rather than something else in the environment.
- */
-/** THE one wait between rounds: `ms`, or less if a person cancels (`sig`). */
-const sleepFor = (ms, sig) =>
-  new Promise(ok => {
-    const t = setTimeout(ok, ms);
-    sig?.addEventListener?.("abort", () => { clearTimeout(t); ok(); }, { once: true });
-  });
 
 /**
  * The page's Cache Storage, or `null` where it cannot be had. In a SANDBOXED
@@ -100,6 +62,15 @@ export function ambientCaches() {
   }
 }
 
+/**
+ * The bytes for one artefact: from the shared cache if they are there AND
+ * correct, otherwise fetched, checked, and left there for the next app.
+ *
+ * `caches` and `fetch` are injected so the wiring can be tested without a
+ * browser — the same reason `openSession` injects them. `caches: null` turns
+ * the cache OFF, which is the control proving the cache is what avoids the
+ * second fetch rather than something else in the environment.
+ */
 export async function artefactBytes(
   { url, urls, sha256 },
   {
@@ -175,120 +146,6 @@ export async function artefactBytes(
   // a fetch, which is what it would have paid anyway.
   if (box) await best(() => box.put(key, new Response(bytes)));
   return bytes;
-}
-
-/**
- * THE ONE FETCH (#126 ruling): every file a page or a tool fetches from the
- * node over HTTP comes through here — a web container's own files, the SDK's
- * artefacts, a builder's files. Re-asked until answered on the PAGE'S back-off
- * (`rto.js`, generated from page/src/rto.rs and pinned to it by a test), with
- * no give-up of its own: a 404, a 5xx or a network error is "not held yet",
- * never an end (rules 7, 8). While it waits it says so (`onWait`, naming the
- * file). What ends it: a person's cancel (`signal`), or — only where the
- * caller passes a `check` — every source ANSWERING with bytes the check
- * refuses as final.
- *
- * THE BOOTSTRAP EXCEPTION to rule 5 (architect, #126): node DATA goes through
- * the page's one sender, `Page::send`, which does not exist until the SDK's
- * wasm is loaded. The files that load it — and the code and web files a node
- * serves over HTTP — can only be fetched here. Nothing fetched AFTER load that
- * is node data may come this way.
- *
- * `{ url }` or `{ urls }` (never both: taking either silently would drop a
- * source the caller supplied). `check(bytes, from)`: `null` to accept, or
- * `{ says, answer }` — `answer` true when this source has given its final word
- * (then, from EVERY source, the fetch is refused, by `refusal`).
- */
-export async function served(
-  { url, urls },
-  {
-    fetch: fetchWith = typeof fetch === "function" ? fetch : null,
-    onWait = null,
-    signal = null,
-    sleep = sleepFor,
-    now = () => Date.now(),
-    check = null,
-    name = null,
-    refusal = "a refusal",
-    // Options for every request (e.g. `{ cache: "no-store" }` for a file that
-    // must be read fresh). Passed as given; never a reason to end.
-    init = null,
-  } = {},
-) {
-  const label = name ?? (url ?? (urls ?? []).join(", "));
-  if (url && urls) {
-    throw new Error(`${label} was given both \`url\` and \`urls\`; pass one. Taking either silently would drop a source the caller supplied.`);
-  }
-  const sources = urls ?? (url ? [url] : []);
-  if (sources.length === 0) throw new Error(`${label} has no url to fetch it from`);
-  const started = now();
-  for (let round = 0; ; round += 1) {
-    // Every failure is kept, so a wait can say what each source actually did.
-    const failures = [];
-    let answered = 0;
-    for (const from of sources) {
-      let res;
-      try {
-        res = await (init ? fetchWith(from, init) : fetchWith(from));
-      } catch (e) {
-        failures.push(`${from}: ${e?.message ?? e}`);
-        continue;
-      }
-      if (!res.ok) {
-        // NOT AN ANSWER about the file: the node does not hold it yet.
-        failures.push(`${from}: ${res.status}`);
-        continue;
-      }
-      // `fetch` resolves on the HEADERS; the body can still fail, and that is
-      // this source's failure too — the next source is asked.
-      let got;
-      try {
-        got = new Uint8Array(await res.arrayBuffer());
-      } catch (e) {
-        failures.push(`${from}: ${e?.message ?? e}`);
-        continue;
-      }
-      const refused = check ? await check(got, from) : null;
-      if (!refused) return got;
-      if (refused.answer) answered += 1;
-      failures.push(`${from}: ${refused.says}`);
-    }
-    // NAMES WHICH FILE AND WHAT EACH SOURCE DID: the first thing a person can
-    // send when an app will not open.
-    const what = failures.join("\n  ");
-    if (answered === sources.length) {
-      throw new Error(`${label} refused: ${refusal} from every source:\n  ${what}`);
-    }
-    const waitedMs = now() - started;
-    if (signal?.aborted) {
-      throw new Error(`${label}: cancelled after ${Math.round(waitedMs / 1000)} s unanswered:\n  ${what}`);
-    }
-    const nextMs = RTO_SCHEDULE_MS[Math.min(round, RTO_SCHEDULE_MS.length - 1)];
-    onWait?.({
-      waitedMs,
-      nextMs,
-      failures,
-      says: `loading the app… not available on this node yet (${Math.round(waitedMs / 1000)} s)`,
-    });
-    await sleep(nextMs, signal);
-    if (signal?.aborted) {
-      throw new Error(`${label}: cancelled after ${Math.round((now() - started) / 1000)} s unanswered:\n  ${what}`);
-    }
-  }
-}
-
-/** A file's text, through the one fetch. */
-export async function servedText(source, deps) {
-  return new TextDecoder().decode(await served(source, deps));
-}
-
-async function digestOf(bytes, subtle) {
-  if (!subtle) throw new Error("no crypto.subtle: cannot verify an artefact");
-  return best(async () => hex(await subtle.digest("SHA-256", bytes)));
-}
-
-async function matches(bytes, sha256, subtle) {
-  return (await digestOf(bytes, subtle)) === sha256;
 }
 
 /**

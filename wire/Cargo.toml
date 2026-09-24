@@ -19,6 +19,8 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d6
 blake3 = "1"
 # The signer's wire types (serde only): `wire::signer` frames them.
 signer-proto = { path = "../signer-proto" }
+# The SDK's load pieces (sdk#347): the `load-pieces` tool cuts a bundle with the ONE implementation of the format.
+pieces = { path = "../pieces" }
 
 [dev-dependencies]
 core-types = { path = "../core-types" }

@@ -19,6 +19,13 @@ tools/pkg-reset.sh pkg
 wasm-bindgen --target web    --out-name craftworks_sdk --out-dir pkg/web  "$wasm"
 wasm-bindgen --target nodejs --out-name craftworks_sdk --out-dir pkg/node "$wasm"
 
+# THE DECODER a published app's starter carries (sdk#347): any k of the SDK's k + m load pieces -> the bundle's
+# files. Raw exports, no wasm-bindgen; built with its own profile (size alone), apart from the SDK's release build.
+# Its size is per-app storage, so it is recorded below and stated in the PR that changes it.
+cargo build --profile decoder -p decoder --target wasm32-unknown-unknown
+# And through wasm-opt -Oz, pinned to binaryen 125: missing or different is a named FAILURE (the script says why).
+tools/optimise-decoder.sh "$target/wasm32-unknown-unknown/decoder/decoder.wasm" pkg/web/decoder.wasm
+
 # THE SHIPPED WASM CARRIES NO FUNCTION NAMES (sdk#228): its `name` section is
 # ~25% of the page's first load and nothing at run time reads it. Only that
 # section is removed — nothing the loader or wasm-bindgen reads. The names are
@@ -44,8 +51,9 @@ echo "pkg/web/craftworks_sdk_bg.wasm: $names_before -> $(wc -c < "$shipped" | tr
 # Generated at every build into js/ (gitignored), so the tests read it too.
 cargo run -q -p page --example rto_js > js/rto.js.tmp
 grep -q '^export const RTO_SCHEDULE_MS = ' js/rto.js.tmp || { echo "the rto_js example wrote no schedule" >&2; exit 1; }
+grep -q '^export const WINDOW_AFTER_ANSWERS = ' js/rto.js.tmp || { echo "the rto_js example wrote no window" >&2; exit 1; }
 mv js/rto.js.tmp js/rto.js
-cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js js/rto.js pkg/web/
+cp js/wrap.js js/index.js js/connection.js js/session.js js/engine-db.js js/artefacts.js js/served.js js/rto.js js/pieces.js pkg/web/
 
 # EVERY MODULE THE ENTRY CAN REACH IS IN THE PACKAGE.
 #
@@ -119,6 +127,10 @@ if [ "$got_xz" != "$WANT_XZ" ]; then
   exit 1
 fi
 cargo build -q --release -p wire --bin artefacts-container
+# The LOAD PIECES tool (sdk#347): the builder's build cuts each app's load bundle with it (the SDK's one
+# implementation of the format). Shipped in pkg/tools/, so its users read the package, never a target dir.
+cargo build -q --release -p wire --bin load-pieces
+mkdir -p pkg/tools && cp "$target/release/load-pieces" pkg/tools/load-pieces
 container_tool=$target/release/artefacts-container
 container_json=$("$container_tool" pkg/web "$contracts/build/webapp.wasm" pkg/web/artefacts.webapp)
 # DETERMINISM, checked on every build: made twice, it must be the same bytes,
@@ -182,6 +194,8 @@ cat > pkg/web/artefacts.json <<JSON
   "modules":  $modules_json,
   "webapp":   { "file": "webapp.wasm",          "sha256": "$(hash_of pkg/web/webapp.wasm)",
                 "bytes": $(size_of pkg/web/webapp.wasm) },
+  "decoder":  { "file": "decoder.wasm",         "sha256": "$(hash_of pkg/web/decoder.wasm)",
+                "bytes": $(size_of pkg/web/decoder.wasm) },
   "note": "hashes key the shared artefact cache and are verified before use (sdk#5)"
 }
 JSON

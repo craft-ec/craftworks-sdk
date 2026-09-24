@@ -367,6 +367,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
+name = "decoder"
+version = "0.1.0"
+dependencies = [
+ "pieces",
+]
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1065,6 +1072,14 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pieces"
+version = "0.1.0"
+dependencies = [
+ "core-types",
+ "freenet-prolly",
+]
 
 [[package]]
 name = "pin-project-lite"
@@ -1929,6 +1944,7 @@ dependencies = [
  "js-sys",
  "page",
  "page-io",
+ "pieces",
  "protocol",
  "serde",
  "serde_json",
@@ -2025,6 +2041,7 @@ dependencies = [
  "craftec-webapp-contract",
  "freenet-prolly",
  "freenet-stdlib",
+ "pieces",
  "signer-proto",
 ]
 

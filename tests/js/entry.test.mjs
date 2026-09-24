@@ -36,6 +36,7 @@ const PROMISED = {
   open: "function",
   SHIPPED_ARTEFACTS: "object",
   webapp: "object",
+  pieces: "object",
   internals: "object",
 };
 

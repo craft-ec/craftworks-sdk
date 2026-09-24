@@ -413,6 +413,15 @@ impl AppContainer {
     }
 }
 
+/// Piece `index` of a LOAD BUNDLE's cut (sdk#347): a loader that rebuilt the SDK from `k` of its `k + m` pieces
+/// re-derives each piece it asked and did not get, to PUT it back (the post-load repair). The same bytes
+/// `load-pieces` cut at build time, from the same code (`pieces::piece`); the caller checks them against the
+/// manifest's sha256 before they go anywhere.
+#[wasm_bindgen]
+pub fn load_piece(bundle: &[u8], payload: usize, m: usize, index: usize) -> Result<Vec<u8>, JsError> {
+    pieces::piece(bundle, payload, m, index).map_err(|e| JsError::new(&format!("{e:?}")))
+}
+
 /// This page's wasm linear memory, in bytes: what a tree reader costs is
 /// MEASURED against it (`tests/js/tree.test.mjs`), and the open-tree cap is
 /// set from that measurement, not from a guess.

@@ -26,4 +26,18 @@ fn main() {
     println!("// The page's RTO back-off from no sample (page/src/rto.rs, RFC 6298 §5.5):");
     println!("// each wait after an unanswered ask, the last repeating for ever.");
     println!("export const RTO_SCHEDULE_MS = Object.freeze([{list}]);");
+
+    // THE WINDOW (sdk#347): how many GETs may be in flight after n answers, from a new page's window
+    // (page::rto::Window, slow start, no loss yet). The load-piece race walks this list; it keeps no window rule of
+    // its own. 64 entries: more than any k + m the codec allows (MAX_K + MAX_M = 44).
+    let mut w = page::rto::Window::default();
+    let mut sizes = Vec::new();
+    for _ in 0..64 {
+        sizes.push(w.size());
+        w.opened();
+    }
+    let sizes = sizes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    println!("// How many GETs a new page keeps in flight after n answers (page/src/rto.rs `Window`, slow start):");
+    println!("// the load-piece race's pacing (sdk#347). The last entry holds from then on.");
+    println!("export const WINDOW_AFTER_ANSWERS = Object.freeze([{sizes}]);");
 }
