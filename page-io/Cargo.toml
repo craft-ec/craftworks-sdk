@@ -13,7 +13,7 @@ engine = { path = "../engine" }
 wire = { path = "../wire" }
 signer-proto = { path = "../signer-proto" }
 protocol = { path = "../protocol" }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 
 [dev-dependencies]

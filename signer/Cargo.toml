@@ -26,7 +26,7 @@ freenet-stdlib = { version = "0.10.0", features = ["contract"] }
 contract-keys = { path = "../contract-keys" }
 # The root check hashes the root block the way the tree does (kind + block_id): the SAME rev as every other
 # freenet-prolly pin in this repo.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d8716d3" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
 
 [dev-dependencies]
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
