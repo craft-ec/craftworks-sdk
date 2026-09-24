@@ -1354,12 +1354,14 @@ impl Page {
             d.at = at;
             d.sent_at = self.now;
             d.resent = true;
-            head_read |= d.op == Op::ReadHead;
+            // Every label's in-flight read is re-sent (each re-subscribes its own register);
+            // only an in-flight HEAD read stands in for the fallback below.
+            head_read |= matches!(d.op, Op::ReadHead { label: Label::Head });
             self.out.push(d.op.clone());
         }
         if !head_read && self.engine_has_head {
             self.last_head_at = self.now;
-            self.send(Waiting::Hint, Op::ReadHead);
+            self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
     }
 
