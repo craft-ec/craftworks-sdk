@@ -218,7 +218,7 @@ impl WireNode {
     fn site(&self) -> Option<(u64, Vec<u8>, Vec<u8>)> {
         let st = self.contracts.get(&self.site_id())?;
         let (meta, web) = contract_keys::site::framing(st)?;
-        let (seq, v) = contract_keys::register::record_of(meta)?;
+        let (seq, v) = signer_proto::head::record_of(meta)?;
         Some((seq, v.to_vec(), web.to_vec()))
     }
 
