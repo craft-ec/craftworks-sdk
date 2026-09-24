@@ -124,6 +124,18 @@ CONTROLS=(
   "dup-gate|node tools/dup-gate.mjs"
   "owners|node tools/owners.mjs"
 )
+# BATCH-ONLY TESTS (the owner: a PR runs what is relevant to it): test targets too slow for every PR, as
+# `member@target`, each with its measured time. `--pr` skips them BY NAME and prints them ("batch-only, skipped");
+# the batch gate (the full run) runs them, and records each one's own count as `gate.baseline.d/member@target`, so a
+# PR's count for that member compares against the baseline minus them.
+#
+# They run in RELEASE: measured 2026-09-24, one model test at CRAFTWORKS_MODEL_SEEDS=2, the same result in both
+# profiles, at load ~106-110: debug 35.7 s wall / 13.5 s CPU, release 0.86 s wall / 0.54 s CPU.
+BATCH_ONLY=(
+  "page@model"
+)
+batch_only_of() { local e; for e in "${BATCH_ONLY[@]}"; do [ "${e%%@*}" = "$1" ] && echo "${e#*@}"; done; }
+
 run_controls() {
   for c in "${CONTROLS[@]}"; do
     name=${c%%|*}; cmd=${c#*|}
@@ -185,13 +197,14 @@ if [ "$MODE" = pr ]; then
   meta=$(mktemp)
   cargo metadata --format-version 1 --no-deps > "$meta" 2>/dev/null || { echo "${RED}gate: cargo metadata failed${OFF}" >&2; exit 1; }
   plan=$(printf '%s\n' "$changed" | node tools/pr-scope.mjs plan "$meta")
-  rm -f "$meta"
+  trap 'rm -f "$meta"' EXIT
   field() { node -e 'const p=JSON.parse(process.argv[1]); const v=p[process.argv[2]]; process.stdout.write(String(Array.isArray(v)?v.join(" "):v)+"\n")' "$plan" "$1"; }
   scope=$(field members); npm_needed=$(field npm)
   echo "gate --pr: base $base; changed files: $(printf '%s\n' "$changed" | grep -c .)"
   echo "gate --pr: controls: $(for c in "${CONTROLS[@]}"; do printf '%s ' "${c%%|*}"; done)"
   echo "gate --pr: changed members: $(field changed)"
-  echo "gate --pr: members tested (with reverse dependents): ${scope:-(none)}"
+  echo "gate --pr: members tested (changed only; dependents run at the batch gate): ${scope:-(none)}"
+  echo "gate --pr: batch-only (skipped here, run by the batch gate): ${BATCH_ONLY[*]}"
   echo "gate --pr: npm: $npm_needed"
   [ "$DRY" -eq 1 ] && exit 0
   target_guard
@@ -200,13 +213,39 @@ if [ "$MODE" = pr ]; then
   drop_ok() { local a; for a in ${ACCEPT_ARGS[@]+"${ACCEPT_ARGS[@]}"}; do [ "$a" = "$1" ] && return 0; done; return 1; }
   base_count() { git show "$base:$BASELINE/$1" 2>/dev/null | head -1 | tr -d '[:space:]'; }
   lines=()
+  # EVERY dependent still BUILDS (the architect): compile only, the whole workspace, all targets. Measured warm at
+  # load ~113-125: 0.56 s unchanged, 3.3 s after touching engine/src/lib.rs.
+  step "cargo check --workspace --all-targets"
+  t0=$(date +%s)
+  if [ -n "${GATE_CONTROLS_ONLY:-}" ]; then
+    echo "cargo check SKIPPED: GATE_CONTROLS_ONLY is the controls' own test, never a PR run"
+  elif ! cargo check --workspace --all-targets > /tmp/gate-check.$$ 2>&1; then
+    step_fail "cargo check --workspace --all-targets failed: a dependent no longer builds"; grep -E "^error" -A5 /tmp/gate-check.$$ | head -12 >&2
+  fi
+  rm -f /tmp/gate-check.$$
+  echo "cargo check --workspace --all-targets: $(( $(date +%s) - t0 )) s"
   if [ -n "$scope" ]; then
     step "cargo test, the PR's members (before -> after, against $base)"
     for m in $scope; do
-      out=$(cargo test -p "$m" --no-fail-fast 2>&1); rc=$?
+      skip=$(batch_only_of "$m" | tr '\n' ' ')
+      if [ -n "$skip" ]; then
+        ta=$(node tools/pr-scope.mjs test-args "$meta" "$m" $skip)
+        targs=$(echo "$ta" | sed -n 1p); tdoc=$(echo "$ta" | sed -n 2p)
+        echo "batch-only, skipped: $(for t in $skip; do printf '%s@%s ' "$m" "$t"; done)"
+        # shellcheck disable=SC2086
+        out=$(cargo test -p "$m" --no-fail-fast $targs 2>&1); rc=$?
+        if [ "$tdoc" = doc ]; then dout=$(cargo test -p "$m" --doc 2>&1) || rc=1; out="$out"$'\n'"$dout"; fi
+      else
+        out=$(cargo test -p "$m" --no-fail-fast 2>&1); rc=$?
+      fi
       n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
       [ $rc -ne 0 ] && { step_fail "cargo test -p $m FAILED"; echo "$out" | grep -E "^(error|test result: FAILED|---- )" | head -5 >&2; }
       b=$(base_count "$m"); [ -z "$b" ] && b=-
+      for t in $skip; do
+        bt=$(base_count "$m@$t")
+        if [ -z "$bt" ] || [ "$b" = - ]; then b="?"; break; fi
+        b=$((b - bt))
+      done
       if drop_ok "$m"; then l=$(node tools/pr-scope.mjs count "$m" "$b" "$n" --drop-ok); else l=$(node tools/pr-scope.mjs count "$m" "$b" "$n") || fail "$m: count DROPPED"; fi
       echo "$l"; lines+=("$l")
     done
@@ -251,6 +290,12 @@ if [ -z "$MEMBERS" ]; then
   exit 1
 fi
 echo "gate: $(echo "$MEMBERS" | wc -l | tr -d ' ') workspace members, from cargo metadata"
+# Only for the gate's OWN test (its batch-only path, run cheaply): never a way to skip members in a batch run, and
+# said on every run that uses it.
+if [ -n "${GATE_ONLY_MEMBERS:-}" ]; then
+  MEMBERS=$(printf '%s\n' $GATE_ONLY_MEMBERS)
+  echo "${RED}gate: GATE_ONLY_MEMBERS=$GATE_ONLY_MEMBERS: NOT a batch run — only these members are tested${OFF}"
+fi
 
 # Members that legitimately have NO host tests, and why. Not a list of
 # exceptions to tidy up later: each line is a claim a reviewer can check.
@@ -264,12 +309,34 @@ no_host_tests() {
 }
 
 # ------------------------------------------------------------- tests ----
+# THE MODEL'S SEEDS (page/tests/model.rs, CRAFTWORKS_MODEL_SEEDS): the batch gate runs the full count, stated.
+export CRAFTWORKS_MODEL_SEEDS=${CRAFTWORKS_MODEL_SEEDS:-40}
+echo "gate: model seeds $CRAFTWORKS_MODEL_SEEDS (CRAFTWORKS_MODEL_SEEDS)"
+echo "gate: batch-only targets, run here: ${BATCH_ONLY[*]}"
+[ "$DRY" -eq 1 ] && { echo "gate: --dry-run, nothing run"; exit 0; }
 step "cargo test, per member"
 declare -a NAMES COUNTS
 total=0
+FULL_META=$(mktemp)
+cargo metadata --format-version 1 --no-deps > "$FULL_META" 2>/dev/null
 for m in $MEMBERS; do
-  out=$(cargo test -p "$m" --no-fail-fast 2>&1)
-  rc=$?
+  skip=$(batch_only_of "$m" | tr '\n' ' ')
+  bo_counts=""
+  if [ -n "$skip" ]; then
+    # Its batch-only targets apart, in RELEASE (above); the rest of the member as usual.
+    ta=$(node tools/pr-scope.mjs test-args "$FULL_META" "$m" $skip)
+    # shellcheck disable=SC2086
+    out=$(cargo test -p "$m" --no-fail-fast $(echo "$ta" | sed -n 1p) 2>&1); rc=$?
+    if [ "$(echo "$ta" | sed -n 2p)" = doc ]; then dout=$(cargo test -p "$m" --doc 2>&1) || rc=1; out="$out"$'\n'"$dout"; fi
+    for t in $skip; do
+      rout=$(cargo test --release -p "$m" --no-fail-fast --test "$t" 2>&1) || rc=1
+      out="$out"$'\n'"$rout"
+      bo_counts="$bo_counts $t=$(echo "$rout" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')"
+    done
+  else
+    out=$(cargo test -p "$m" --no-fail-fast 2>&1)
+    rc=$?
+  fi
   n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
   if [ $rc -ne 0 ]; then
     step_fail "cargo test -p $m FAILED"
@@ -281,6 +348,12 @@ no_host_tests() WITH its reason. An uncovered member is what this gate is for."
   fi
   NAMES+=("$m"); COUNTS+=("$n")
   total=$((total + n))
+  # A batch-only target's OWN count, recorded beside its member's, so `--pr` (which skips it) compares like with like.
+  for t in $skip; do
+    nt=$(printf '%s\n' $bo_counts | grep "^$t=" | cut -d= -f2)
+    [ -n "$nt" ] && [ "$nt" -gt 0 ] || { step_fail "batch-only $m@$t ran no tests in the full run"; nt=0; }
+    NAMES+=("$m@$t"); COUNTS+=("$nt")
+  done
 done
 
 # ------------------------------------------------------------ clippy ----
@@ -417,7 +490,7 @@ if [ -d "$BASELINE" ]; then
     # No pipe (sdk#138): under pipefail, `echo | grep -q` can report FAILURE
     # exactly when the match succeeds — grep exits on the first match and
     # echo takes SIGPIPE (5 misfires in 3000 at load ~10, reproduced).
-    grep -qx -- "$k" <<< "$MEMBERS" || fail "$k is in $BASELINE but is no longer a workspace member"
+    grep -qx -- "${k%%@*}" <<< "$MEMBERS" || fail "$k is in $BASELINE but is no longer a workspace member"
   done
 fi
 
