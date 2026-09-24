@@ -76,8 +76,19 @@ struct WireNode {
     /// subscription asked) BEFORE it answers the UPDATE -- the order measured on 0.2.136 (sdk#378: HeadChanged
     /// 1-4 ms before the UpdateResponse).
     push_updates: bool,
+    /// How the push carries the new state (sdk#378 P3's condition 1): the full `State`, or -- what must NOT be
+    /// judged as a state -- a `Delta` or `StateAndDelta` carrying the same bytes.
+    push_kind: PushKind,
     /// Frames the node sends unasked (pushes), delivered before the answer to the request that caused them.
     pushes: Vec<Vec<u8>>,
+}
+
+/// How the node's push carries the new state (see `WireNode::push_kind`).
+#[derive(Clone, Copy, Debug)]
+enum PushKind {
+    State,
+    Delta,
+    StateAndDelta,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -132,6 +143,7 @@ impl WireNode {
             site_hidden: false,
             refuse_site_gets: 0,
             push_updates: false,
+            push_kind: PushKind::State,
             pushes: Vec::new(),
         };
         let req = signer::Request::Provision {
@@ -169,6 +181,7 @@ impl WireNode {
             site_hidden: false,
             refuse_site_gets: 0,
             push_updates: false,
+            push_kind: PushKind::State,
             pushes: Vec::new(),
         }
     }
@@ -264,10 +277,14 @@ impl WireNode {
                 self.merge_register(s.as_ref());
                 if self.push_updates {
                     let state = self.contracts.get(&self.register_id).cloned().expect("merged");
-                    self.pushes.push(ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                        key,
-                        update: UpdateData::State(State::from(state)),
-                    })));
+                    // The DELTA kinds carry the record's own bytes: the worst case, bytes that WOULD parse as a
+                    // plausible record if the decoder judged a delta as a state.
+                    let update = match self.push_kind {
+                        PushKind::State => UpdateData::State(State::from(state)),
+                        PushKind::Delta => UpdateData::Delta(StateDelta::from(state)),
+                        PushKind::StateAndDelta => UpdateData::StateAndDelta { state: State::from(state.clone()), delta: StateDelta::from(state) },
+                    };
+                    self.pushes.push(ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update })));
                 }
                 Some(ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
                     key,
@@ -2186,4 +2203,43 @@ fn a_pushed_full_state_is_the_saves_read_back_and_no_register_get_is_sent() {
         gets.push(node.served.get("get register").copied().unwrap_or(0) - before);
     }
     assert_eq!(gets, vec![0, 1], "register GETs for the save (with the push, without): the push did not stand in for the read-back");
+}
+
+/// **sdk#378 P3, condition 1: ONLY a full state is ever judged** (the architect). A push carrying the record's
+/// bytes as a DELTA, or as `StateAndDelta`, is decoded with no state (`HeadChanged { state: None }`), so it is a
+/// hint: the save's read-back GET still goes. The delta carries the register's own record, the bytes that WOULD
+/// parse as a plausible head. Mutant "wire takes any update kind's bytes as the state" -> red.
+#[test]
+fn a_delta_push_is_never_judged_as_a_state_and_the_read_back_still_reads() {
+    for kind in [PushKind::Delta, PushKind::StateAndDelta] {
+        let mut node = WireNode::new(&[8u8; 32]);
+        let mut io = page_io(&node);
+        let mut now = 1_000;
+        client(&mut io, &mut node, &mut now, &Request::Identity);
+        assert!(states(&client(&mut io, &mut node, &mut now, &write(1, "a", "1")), 1).contains(&WriteState::Published), "THE SETUP: the first write did not publish");
+        node.push_updates = true;
+        node.push_kind = kind;
+        let before = node.served.get("get register").copied().unwrap_or(0);
+        io.client(&protocol::encode_session_request(4, 9, &write(2, "b", "2")).expect("encodes"));
+        let mut r = Vec::new();
+        for _ in 0..200 {
+            r.extend(pump(&mut io, &mut node, &mut now));
+            if states(&r, 2).contains(&WriteState::Published) {
+                break;
+            }
+            now += 50;
+            io.tick(Ms(now));
+        }
+        assert!(states(&r, 2).contains(&WriteState::Published), "{kind:?}: the write did not publish: {r:?}");
+        let gets = node.served.get("get register").copied().unwrap_or(0) - before;
+        assert_eq!(gets, 1, "{kind:?}: a push whose state is not a FULL state stood in for the read-back ({gets} register GETs)");
+    }
+    // And at the decoder itself: the same bytes as a Delta give no state; as a State, they do.
+    let key = ContractKey::from_id_and_code(ContractInstanceId::new([3u8; 32]), CodeHash::new([0u8; 32]));
+    let decode = |update: UpdateData<'static>| match wire::unframe(&mut wire::Reassembler::default(), &ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update }))) {
+        wire::Incoming::HeadChanged { state, .. } => state,
+        other => panic!("not a HeadChanged: {other:?}"),
+    };
+    assert_eq!(decode(UpdateData::Delta(StateDelta::from(vec![1u8, 2, 3]))), None, "a delta was decoded as a state");
+    assert_eq!(decode(UpdateData::State(State::from(vec![1u8, 2, 3]))), Some(vec![1u8, 2, 3]), "THE CONTROL: a full state was not decoded as one");
 }
