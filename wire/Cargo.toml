@@ -19,6 +19,9 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d6
 blake3 = "1"
 # The signer's wire types (serde only): `wire::signer` frames them.
 signer-proto = { path = "../signer-proto" }
+# The ONE restatement of the node's contract-id derivation (sdk#334):
+# `block::contract_deriver` is it.
+contract-keys = { path = "../contract-keys" }
 
 [dev-dependencies]
 core-types = { path = "../core-types" }
@@ -28,8 +31,6 @@ core-types = { path = "../core-types" }
 # wrong one is what every real PUT would meet.
 craftec-webapp-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "9ff9d22", default-features = false }
 bincode = "1"
-# The block functions here are pinned equal to the contract id the signer and the page derive.
-contract-keys = { path = "../contract-keys" }
 # The tests assert against stdlib's OWN caps rather than restating them: a
 # number copied here would agree with itself while the real bound moved.
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
