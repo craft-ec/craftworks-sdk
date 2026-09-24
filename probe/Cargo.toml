@@ -12,6 +12,9 @@ freenet-stdlib = { version = "0.10.0", features = ["net"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 bincode = "1"
+# classify-frames reads the harness's captured frames, base64 as CDP hands them over.
+base64 = "0.23"
+serde_json = "1"
 futures = "0.3"
 getrandom = "0.2"
 blake3 = "1"
