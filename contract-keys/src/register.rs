@@ -72,7 +72,7 @@ fn writer_key(params: &[u8]) -> Result<[u8; KEY_LEN], HeadError> {
 /// Bound to the PARAMS and not to the contract code, so that after a code
 /// upgrade the latest record can be re-published under the new code and still
 /// verify.
-pub(crate) fn signed_message(params_hash: &[u8; HASH_LEN], seq: u64, value_hash: &[u8; HASH_LEN]) -> Vec<u8> {
+fn signed_message(params_hash: &[u8; HASH_LEN], seq: u64, value_hash: &[u8; HASH_LEN]) -> Vec<u8> {
     let mut m = Vec::with_capacity(SIG_DOMAIN.len() + HASH_LEN + 1 + 8 + HASH_LEN);
     m.extend_from_slice(SIG_DOMAIN);
     m.extend_from_slice(params_hash);

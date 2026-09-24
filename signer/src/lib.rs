@@ -301,6 +301,19 @@ fn put_blocks<H: Host>(host: &mut H, states: Vec<Vec<u8>>) -> (Answer, Puts) {
     (Answer::Putting { contracts }, puts)
 }
 
+/// A record `(seq, value)` read out of a Register state ONLY IF it verifies under exactly `params`: the Register
+/// crate's own `read` (the format's one owner, the library the site contract links) parses the state and verifies
+/// every signature in it, the record's and any fork evidence's, under the params' authority (mode 0 or a keyset).
+/// A state carrying VALID fork evidence still yields its record: two publishers at one version is the race a site
+/// is built to settle, the Register keeps the winner and the evidence (sticky, F56), and the signer needs only the
+/// record as truth. This is what lets the signer take a page-named site contract as truth (architect, builder#117
+/// Q1): an unverified record never counts.
+pub fn verified_record(params: &[u8], state: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let (_, s) = craftec_register_contract::read(params, state)?;
+    let r = s.record?;
+    Some((r.decision().seq, r.value))
+}
+
 /// The secret a label's ONE record is kept under: the head's is `signer_record` (unchanged, so nothing migrates);
 /// a site's is `signer_record/site:<app>` -- one record type, keyed by label (builder#117).
 pub fn record_name(label: &Label) -> Vec<u8> {
@@ -359,7 +372,7 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next, label: Label, origin: Ori
         Label::Site { contract, .. } => params.as_deref().and_then(|p| {
             let st = host.contract_state(contract)?;
             let (meta, _web) = contract_keys::site::framing(&st)?;
-            let (seq, value) = contract_keys::site::verified_record(p, meta)?;
+            let (seq, value) = verified_record(p, meta)?;
             Some(Head { seq, root: value.as_slice().try_into().ok()? })
         }),
     };

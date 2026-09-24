@@ -1,7 +1,7 @@
 //! A SITE THROUGH THE ONE SIGN VERB (builder#117): `Sign { prev, next, label: Site { app, contract } }` is decided
 //! by the head's own rule (`decide`), under the SAME authority relabelled `site:<app>`, with its own record. No
 //! site verb, record type or stage machine of its own.
-use contract_keys::site::{frame, site_params, verified_record};
+use contract_keys::site::{frame, site_params};
 use signer::*;
 use std::collections::BTreeMap;
 

@@ -1468,6 +1468,7 @@ dependencies = [
  "bincode",
  "blake3",
  "contract-keys",
+ "craftec-register-contract",
  "ed25519-dalek",
  "freenet-prolly",
  "freenet-stdlib",
