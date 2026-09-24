@@ -18,7 +18,7 @@ use freenet_prolly::Cid;
 use std::ops::Bound;
 
 mod common;
-use common::{Harness, Mode, Store};
+use common::{Harness, Store};
 
 fn c(n: u64) -> ClientId {
     ClientId(n)
@@ -110,57 +110,55 @@ fn params(notify_without_diff: bool) -> Params {
 /// notifies not at all — and the control proves that silence is the FILTER.
 #[test]
 fn one_changed_per_commit_in_range_and_none_outside_it() {
-    for mode in [Mode::Live, Mode::Rehydrate] {
-        // Seed a tree so the ranges have something on either side of them.
-        let mut h = Harness::new(mode, params(false), Store::fresh());
-        let seeded = commit(
-            &mut h,
-            1,
-            (0..8)
-                .map(|i| put(&format!("a/{i:02}"), b"seed"))
-                .chain((0..8).map(|i| put(&format!("z/{i:02}"), b"seed")))
-                .collect(),
-        );
-        assert!(
-            changes(&seeded).is_empty(),
-            "{mode:?}: a commit before anyone subscribed notified somebody"
-        );
+    // Seed a tree so the ranges have something on either side of them.
+    let mut h = Harness::new(params(false), Store::fresh());
+    let seeded = commit(
+        &mut h,
+        1,
+        (0..8)
+            .map(|i| put(&format!("a/{i:02}"), b"seed"))
+            .chain((0..8).map(|i| put(&format!("z/{i:02}"), b"seed")))
+            .collect(),
+    );
+    assert!(
+        changes(&seeded).is_empty(),
+        "a commit before anyone subscribed notified somebody"
+    );
 
-        // Watch only the `a/` half.
-        let out = h.step(subscribe(1, 7, range("a/", "b/")));
-        assert_eq!(accepted(&out), [engine::subs::Accepted::Yes]);
+    // Watch only the `a/` half.
+    let out = h.step(subscribe(1, 7, range("a/", "b/")));
+    assert_eq!(accepted(&out), [engine::subs::Accepted::Yes]);
 
-        // A write INSIDE the range: exactly one notification.
-        let inside = commit(&mut h, 2, vec![put("a/03", b"changed")]);
-        let cs = changes(&inside);
-        assert_eq!(
-            cs.len(),
-            1,
-            "{mode:?}: expected exactly one Changed for one commit, got {cs:?}"
-        );
-        let (client, sub_id, why, new_root) = cs[0];
-        assert_eq!((client, sub_id), (1, 7));
-        assert_eq!(
-            why,
-            Why::Diffed,
-            "{mode:?}: the tree was held, so the comparison could be \
-             COMPLETED — anything else means the engine guessed, and the \
-             range filter is then not being exercised at all"
-        );
-        assert_eq!(
-            new_root,
-            h.published_root(),
-            "{mode:?}: a Changed named a root the engine is not standing on"
-        );
+    // A write INSIDE the range: exactly one notification.
+    let inside = commit(&mut h, 2, vec![put("a/03", b"changed")]);
+    let cs = changes(&inside);
+    assert_eq!(
+        cs.len(),
+        1,
+        "expected exactly one Changed for one commit, got {cs:?}"
+    );
+    let (client, sub_id, why, new_root) = cs[0];
+    assert_eq!((client, sub_id), (1, 7));
+    assert_eq!(
+        why,
+        Why::Diffed,
+        "the tree was held, so the comparison could be \
+         COMPLETED — anything else means the engine guessed, and the \
+         range filter is then not being exercised at all"
+    );
+    assert_eq!(
+        new_root,
+        h.published_root(),
+        "a Changed named a root the engine is not standing on"
+    );
 
-        // A write OUTSIDE it: nothing.
-        let outside = commit(&mut h, 3, vec![put("z/03", b"changed")]);
-        assert!(
-            changes(&outside).is_empty(),
-            "{mode:?}: a commit outside the range notified: {:?}",
-            changes(&outside)
-        );
-    }
+    // A write OUTSIDE it: nothing.
+    let outside = commit(&mut h, 3, vec![put("z/03", b"changed")]);
+    assert!(
+        changes(&outside).is_empty(),
+        "a commit outside the range notified: {:?}",
+        changes(&outside)
+    );
 }
 
 /// THE CONTROL for the test above.
@@ -171,7 +169,7 @@ fn one_changed_per_commit_in_range_and_none_outside_it() {
 /// filter it names was never exercised.
 #[test]
 fn with_the_range_filter_off_the_same_commit_notifies() {
-    let mut h = Harness::new(Mode::Live, params(true), Store::fresh());
+    let mut h = Harness::new(params(true), Store::fresh());
     commit(
         &mut h,
         1,
@@ -206,7 +204,7 @@ fn with_the_range_filter_off_the_same_commit_notifies() {
 fn a_reader_that_only_re_read_the_head_is_notified() {
     let store = Store::fresh();
     // Writer: builds a tree, publishes, then changes one key in `a/`.
-    let mut writer = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer = Harness::new(params(false), store.clone());
     commit(
         &mut writer,
         1,
@@ -279,7 +277,7 @@ fn a_reader_that_only_re_read_the_head_is_notified() {
 #[test]
 fn an_unchanged_root_costs_nothing_and_says_nothing() {
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer = Harness::new(params(false), store.clone());
     commit(
         &mut writer,
         1,
@@ -321,7 +319,7 @@ fn an_unchanged_root_costs_nothing_and_says_nothing() {
 
     // THE CONTROL. A root that really moved must cost reads through the same
     // counter, or the zero above is an instrument that cannot see anything.
-    let mut writer2 = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer2 = Harness::new(params(false), store.clone());
     writer2.step(Event::HeadRead {
         epoch: engine::Epoch(1),
         seq: 1,
@@ -356,7 +354,7 @@ fn the_subscription_cap_refuses_and_says_so() {
         max_subscriptions: 3,
         ..params(false)
     };
-    let mut h = Harness::new(Mode::Live, p, Store::fresh());
+    let mut h = Harness::new(p, Store::fresh());
     for i in 0..3u64 {
         let out = h.step(subscribe(1, i, range("a/", "b/")));
         assert_eq!(
@@ -396,7 +394,7 @@ fn an_oversized_bound_is_refused_rather_than_trimmed() {
         max_sub_key: 16,
         ..params(false)
     };
-    let mut h = Harness::new(Mode::Live, p, Store::fresh());
+    let mut h = Harness::new(p, Store::fresh());
     let huge = SubRange {
         lo: Bound::Included(vec![b'k'; 17]),
         hi: Bound::Unbounded,
@@ -428,7 +426,7 @@ fn an_oversized_bound_is_refused_rather_than_trimmed() {
 /// A client that went away stops costing anything.
 #[test]
 fn a_departed_clients_subscriptions_go_with_it() {
-    let mut h = Harness::new(Mode::Live, params(false), Store::fresh());
+    let mut h = Harness::new(params(false), Store::fresh());
     commit(
         &mut h,
         1,
@@ -454,11 +452,11 @@ fn a_departed_clients_subscriptions_go_with_it() {
 /// Writes still behave. A subscription must not change what a write does.
 #[test]
 fn subscribing_does_not_change_what_a_write_reports() {
-    let mut with = Harness::new(Mode::Live, params(false), Store::fresh());
+    let mut with = Harness::new(params(false), Store::fresh());
     with.step(subscribe(1, 1, range("a/", "b/")));
     let a = commit(&mut with, 1, vec![put("a/01", b"v")]);
 
-    let mut without = Harness::new(Mode::Live, params(false), Store::fresh());
+    let mut without = Harness::new(params(false), Store::fresh());
     let b = commit(&mut without, 1, vec![put("a/01", b"v")]);
 
     let states = |fs: &[Effect]| -> Vec<State> {
@@ -522,7 +520,7 @@ fn deltas(effects: &[Effect]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 #[test]
 fn a_reload_reads_the_delta_not_the_range_and_the_full_read_is_the_control() {
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer = Harness::new(params(false), store.clone());
     commit(
         &mut writer,
         1,
@@ -633,7 +631,7 @@ fn a_reload_reads_the_delta_not_the_range_and_the_full_read_is_the_control() {
 #[test]
 fn a_small_tree_has_no_delta_to_save() {
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer = Harness::new(params(false), store.clone());
     commit(
         &mut writer,
         1,
@@ -692,7 +690,7 @@ fn a_small_tree_has_no_delta_to_save() {
 #[test]
 fn a_deleted_key_comes_back_as_a_removal() {
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer = Harness::new(params(false), store.clone());
     commit(
         &mut writer,
         1,
@@ -725,7 +723,7 @@ fn a_deleted_key_comes_back_as_a_removal() {
 #[test]
 fn a_delta_from_the_current_root_is_empty_and_reads_nothing() {
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer = Harness::new(params(false), store.clone());
     commit(
         &mut writer,
         1,
@@ -767,7 +765,7 @@ fn a_delta_from_the_current_root_is_empty_and_reads_nothing() {
 /// is all it has.
 #[test]
 fn one_root_move_seen_twice_notifies_once() {
-    let mut h = Harness::new(Mode::Live, params(false), Store::fresh());
+    let mut h = Harness::new(params(false), Store::fresh());
     commit(
         &mut h,
         1,
@@ -813,7 +811,7 @@ fn a_range_that_cannot_be_compared_goes_stale_and_stops() {
         ..params(false)
     };
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, p, store.clone());
+    let mut writer = Harness::new(p, store.clone());
     commit(
         &mut writer,
         1,
@@ -878,7 +876,7 @@ fn a_reader_that_holds_the_tree_keeps_being_notified() {
         ..params(false)
     };
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, p, store.clone());
+    let mut writer = Harness::new(p, store.clone());
     commit(
         &mut writer,
         1,
@@ -933,7 +931,7 @@ fn a_reload_revives_a_stale_range() {
         ..params(false)
     };
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, p, store.clone());
+    let mut writer = Harness::new(p, store.clone());
     commit(
         &mut writer,
         1,
@@ -1008,7 +1006,7 @@ fn a_reload_revives_a_stale_range() {
 #[test]
 fn a_delta_across_a_vanished_root_asks_for_a_reload_and_a_get_still_does_not() {
     let store = Store::fresh();
-    let mut writer = Harness::new(Mode::Live, params(false), store.clone());
+    let mut writer = Harness::new(params(false), store.clone());
     commit(
         &mut writer,
         1,

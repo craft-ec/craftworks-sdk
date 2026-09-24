@@ -7,11 +7,6 @@
 //! that fires in neither is a finding of its own. A commit is held STUCK by
 //! holding the node's answers: its puts land, and nothing is acknowledged.
 
-use freenet_prolly::store::Blocks;
-use freenet_prolly::Cid;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
 use testkit::page_node::Served;
 use testkit::{PageConn, PageNode};
 
@@ -129,77 +124,6 @@ fn with_nothing_owed_a_tick_or_a_flush_causes_no_put() {
         c.served(Served::Put) - before
     };
     assert_eq!((run(false, false), run(true, false), run(false, true)), (0, 0, 0), "a put WAS caused with nothing owed");
-}
-
-/// The engine's own block store, for the engine-level test below.
-#[derive(Clone, Default)]
-struct Store(Rc<RefCell<BTreeMap<Cid, &'static [u8]>>>);
-impl Blocks for Store {
-    fn get(&self, cid: &Cid) -> Option<&[u8]> {
-        self.0.borrow().get(cid).copied()
-    }
-}
-
-/// A context written by the PREVIOUS version is refused, and the engine
-/// starts fresh.
-///
-/// Refused rather than read: bincode reads the fields it is asked for, so a
-/// v2 context would decode into the v3 shape as something nobody chose. The
-/// version is what stops it, and a refused context is a fresh start — which
-/// is always safe, because the head is the journal.
-///
-/// Driven at the ENGINE's own level. The first version of this fed it the
-/// SHELL's context — a different wrapper entirely — so the engine refused it
-/// for the wrong reason and the test passed while proving nothing. Its
-/// control is what caught that.
-#[test]
-fn a_context_from_the_previous_version_is_refused() {
-    let mut e: engine::Engine<Store> =
-        engine::Engine::new(engine::Params::default(), Store::default());
-    let _ = e.step(engine::Event::Start {
-        key: engine::KeySource::Provisioned(engine::Provisioned::Test),
-        epochs: vec![],
-    });
-    let ctx = e.to_context().expect("a context");
-
-    // THE CONTROL FIRST: this build's own context IS accepted, so a refusal
-    // below is about the version rather than about everything being refused.
-    let (_, recovered) =
-        engine::Engine::from_context_or_new(&ctx, engine::Params::default(), Store::default());
-    assert!(
-        recovered,
-        "a context this build just wrote was refused, so the refusal below \
-         would say nothing about versions"
-    );
-
-    // The version sits at bytes [4..6], after the magic. The PREVIOUS one is
-    // 13: sdk#321's 14 makes a group's parity ids `[Cid; 8]` (the tree's
-    // PARITY, a format epoch), and a fixed array's length is its shape, so a
-    // v13 context's groups would decode into as nonsense.
-    assert_eq!(
-        u16::from_le_bytes([ctx[4], ctx[5]]),
-        14,
-        "this build's version moved: name the previous one here"
-    );
-    let mut old = ctx.clone();
-    old[4..6].copy_from_slice(&13u16.to_le_bytes());
-    let (_, recovered) =
-        engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
-    assert!(
-        !recovered,
-        "a context from the previous version was ACCEPTED and read into the \
-         new shape; bincode would have filled the new fields with whatever \
-         followed"
-    );
-
-    // And a DAMAGED context of the current version is still refused, which
-    // is the door the checksum guards rather than the version.
-    let mut damaged = ctx.clone();
-    let n = damaged.len();
-    damaged[n - 1] ^= 0xFF;
-    let (_, recovered) =
-        engine::Engine::from_context_or_new(&damaged, engine::Params::default(), Store::default());
-    assert!(!recovered, "a damaged context was accepted");
 }
 
 /// **THE ENGINE'S DEADLINES ARE COUNTS OF `protocol::TICK_MS`.**

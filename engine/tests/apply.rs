@@ -13,7 +13,7 @@ use freenet_prolly::Cid;
 use std::collections::BTreeMap;
 
 mod common;
-use common::{rebuild, tree, Harness, Mode, Store};
+use common::{rebuild, tree, Harness, Store};
 
 /// A tree of `n` keys, and every block in it.
 fn fixture(n: u32) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks) {
@@ -24,8 +24,8 @@ fn fixture(n: u32) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks) {
     (records, root, all)
 }
 
-fn started(mode: Mode, params: Params, store: Store, root: Cid) -> Harness {
-    let mut h = Harness::new(mode, params, store);
+fn started(params: Params, store: Store, root: Cid) -> Harness {
+    let mut h = Harness::new(params, store);
     let _ = h.step(Event::Start {
         key: engine::KeySource::SecretStore,
         epochs: vec![engine::Epoch(1)],
@@ -74,87 +74,85 @@ fn a_write_onto_a_cold_path_is_parked_and_then_applies() {
     // LIVE ONLY (R-b): the write waits in the page's queue, which is page
     // memory and never in a context -- the page keeps its engine; no delegate
     // rebuilds one between steps any more.
-    for mode in [Mode::Live] {
-        let (mut records, root, all) = fixture(400);
+    let (mut records, root, all) = fixture(400);
 
-        // --- the control: a warm store ---
-        let warm = Store::fresh();
-        for (id, bytes) in all.0.iter() {
-            warm.put(*id, bytes);
-        }
-        let mut hw = started(mode, Params::default(), warm, root);
-        let out = hw.step(write_one("k/00100", b"warm"));
-        assert!(
-            fetches(&out).is_empty(),
-            "{mode:?}: a write against a store holding the whole tree asked \
-             for {} block(s), so parking is not what the cold case shows",
-            fetches(&out).len()
-        );
-        assert_eq!(
-            states(&out).first(),
-            Some(&State::Accepted),
-            "{mode:?}: a warm write was not accepted in one step"
-        );
-
-        // --- the case: only the root is held ---
-        let cold = Store::fresh();
-        cold.put(root, all.get(&root).expect("the root"));
-        let mut h = started(mode, Params::default(), cold.clone(), root);
-
-        let out = h.step(write_one("k/00100", b"cold"));
-        assert!(
-            !fetches(&out).is_empty(),
-            "{mode:?}: a write onto a path the node does not hold asked for \
-             nothing"
-        );
-        assert!(
-            states(&out).is_empty(),
-            "{mode:?}: a parked write was told {:?} before it had applied",
-            states(&out)
-        );
-
-        // Feed it what it asks for, one block at a time, until it applies.
-        let mut queue = fetches(&out);
-        let mut rounds = 0;
-        let mut accepted = false;
-        let mut delivered = 0usize;
-        while let Some(id) = queue.pop() {
-            rounds += 1;
-            assert!(rounds < 1000, "{mode:?}: the parked write never settled");
-            let bytes = all.get(&id).expect("the fixture holds every block");
-            cold.put(id, bytes);
-            delivered += 1;
-            let out = h.step(Event::BlockArrived {
-                id,
-                bytes: bytes.to_vec(),
-            });
-            queue.extend(fetches(&out));
-            if states(&out).contains(&State::Accepted) {
-                accepted = true;
-                break;
-            }
-        }
-        assert!(
-            accepted,
-            "{mode:?}: the parked write was fed every block it asked for and \
-             was never accepted"
-        );
-        // It read a PATH, not the tree: 400 keys is several levels, and a
-        // write that pulled the whole thing would be hundreds of blocks.
-        assert!(
-            delivered < 20,
-            "{mode:?}: the parked write pulled {delivered} blocks to apply one \
-             key, which is a whole-tree walk rather than a path"
-        );
-
-        records.insert(b"k/00100".to_vec(), b"cold".to_vec());
-        assert_eq!(
-            h.root(),
-            rebuild(&records),
-            "{mode:?}: the parked write applied to the wrong tree"
-        );
-        println!("  {mode:?}: cold write parked, {delivered} blocks, then applied");
+    // --- the control: a warm store ---
+    let warm = Store::fresh();
+    for (id, bytes) in all.0.iter() {
+        warm.put(*id, bytes);
     }
+    let mut hw = started(Params::default(), warm, root);
+    let out = hw.step(write_one("k/00100", b"warm"));
+    assert!(
+        fetches(&out).is_empty(),
+        "a write against a store holding the whole tree asked \
+         for {} block(s), so parking is not what the cold case shows",
+        fetches(&out).len()
+    );
+    assert_eq!(
+        states(&out).first(),
+        Some(&State::Accepted),
+        "a warm write was not accepted in one step"
+    );
+
+    // --- the case: only the root is held ---
+    let cold = Store::fresh();
+    cold.put(root, all.get(&root).expect("the root"));
+    let mut h = started(Params::default(), cold.clone(), root);
+
+    let out = h.step(write_one("k/00100", b"cold"));
+    assert!(
+        !fetches(&out).is_empty(),
+        "a write onto a path the node does not hold asked for \
+         nothing"
+    );
+    assert!(
+        states(&out).is_empty(),
+        "a parked write was told {:?} before it had applied",
+        states(&out)
+    );
+
+    // Feed it what it asks for, one block at a time, until it applies.
+    let mut queue = fetches(&out);
+    let mut rounds = 0;
+    let mut accepted = false;
+    let mut delivered = 0usize;
+    while let Some(id) = queue.pop() {
+        rounds += 1;
+        assert!(rounds < 1000, "the parked write never settled");
+        let bytes = all.get(&id).expect("the fixture holds every block");
+        cold.put(id, bytes);
+        delivered += 1;
+        let out = h.step(Event::BlockArrived {
+            id,
+            bytes: bytes.to_vec(),
+        });
+        queue.extend(fetches(&out));
+        if states(&out).contains(&State::Accepted) {
+            accepted = true;
+            break;
+        }
+    }
+    assert!(
+        accepted,
+        "the parked write was fed every block it asked for and \
+         was never accepted"
+    );
+    // It read a PATH, not the tree: 400 keys is several levels, and a
+    // write that pulled the whole thing would be hundreds of blocks.
+    assert!(
+        delivered < 20,
+        "the parked write pulled {delivered} blocks to apply one \
+         key, which is a whole-tree walk rather than a path"
+    );
+
+    records.insert(b"k/00100".to_vec(), b"cold".to_vec());
+    assert_eq!(
+        h.root(),
+        rebuild(&records),
+        "the parked write applied to the wrong tree"
+    );
+    println!("  cold write parked, {delivered} blocks, then applied");
 }
 
 /// A write whose blocks never arrive is refused, not left waiting.
@@ -167,7 +165,7 @@ fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
     // Two different bounds. One run stopping at its bound could be a
     // coincidence of the fixture's depth; two runs each stopping at their own
     // shows the bound is the thing doing it.
-    for (mode, rounds_allowed) in [(Mode::Live, 8u32), (Mode::Rehydrate, 3)] {
+    for rounds_allowed in [8u32, 3] {
         let params = Params {
             max_apply_rounds: rounds_allowed,
             ..Params::default()
@@ -175,11 +173,11 @@ fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
         let (_, root, all) = fixture(400);
         let cold = Store::fresh();
         cold.put(root, all.get(&root).expect("the root"));
-        let mut h = started(mode, params, cold, root);
+        let mut h = started(params, cold, root);
         let before = h.root();
 
         let mut queue = fetches(&h.step(write_one("k/00100", b"never")));
-        assert!(!queue.is_empty(), "{mode:?}: the write asked for nothing");
+        assert!(!queue.is_empty(), "the write asked for nothing");
         let mut asked = 1u32;
         let mut failed = 0usize;
         while let Some(id) = queue.pop() {
@@ -192,30 +190,30 @@ fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
             asked += 1;
             assert!(
                 asked <= rounds_allowed,
-                "{mode:?}: the write has been re-asked {asked} times against a \
+                "the write has been re-asked {asked} times against a \
                  bound of {rounds_allowed}"
             );
             queue = next;
         }
         assert_eq!(
             failed, 1,
-            "{mode:?}: a write that could never apply was reported Failed \
+            "a write that could never apply was reported Failed \
              {failed} times; a client needs exactly one answer"
         );
         assert_eq!(
             h.root(),
             before,
-            "{mode:?}: the write was reported Failed and changed the tree \
+            "the write was reported Failed and changed the tree \
              anyway, so a client that re-submits applies it twice"
         );
         // The control for the bound: it stopped where the bound put it, not
         // on the first miss and not at some fixed depth of its own.
         assert_eq!(
             asked, rounds_allowed,
-            "{mode:?}: the write was refused after {asked} round(s) against a \
+            "the write was refused after {asked} round(s) against a \
              bound of {rounds_allowed}, so the bound is not what stops it"
         );
-        println!("  {mode:?}: refused after {asked} rounds, tree unchanged");
+        println!("  bound {rounds_allowed}: refused after {asked} rounds, tree unchanged");
     }
 }
 
@@ -230,7 +228,7 @@ fn a_second_write_while_one_is_parked_waits_its_turn_and_applies_after_it() {
     let (mut records, root, all) = fixture(400);
     let cold = Store::fresh();
     cold.put(root, all.get(&root).expect("the root"));
-    let mut h = started(Mode::Live, Params::default(), cold.clone(), root);
+    let mut h = started(Params::default(), cold.clone(), root);
 
     let out = h.step(write_one("k/00100", b"first"));
     let mut queue = fetches(&out);
@@ -284,7 +282,7 @@ fn a_cold_write_of_any_size_parks_and_applies() {
     for (name, ops) in [("one 256 KiB value", big), ("4096 tiny ops", tiny)] {
         let cold = Store::fresh();
         cold.put(root, all.get(&root).expect("the root"));
-        let mut h = started(Mode::Live, Params::default(), cold.clone(), root);
+        let mut h = started(Params::default(), cold.clone(), root);
         let out = h.step(Event::forced_write(ClientId(1), WriteId(1), ops));
         assert!(
             states(&out).is_empty() && !fetches(&out).is_empty(),
@@ -320,7 +318,7 @@ fn one_arrival_answers_both_a_parked_read_and_a_parked_write() {
     let cold = Store::fresh();
     cold.put(root, all.get(&root).expect("the root"));
     // Live: the write waits in the page's queue (R-b), never in a context.
-    let mut h = started(Mode::Live, Params::default(), cold.clone(), root);
+    let mut h = started(Params::default(), cold.clone(), root);
 
     // A read of the key the write is about to touch: both descend the same
     // path, so they stop on the same block.

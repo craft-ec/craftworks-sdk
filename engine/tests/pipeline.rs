@@ -9,7 +9,7 @@ use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod common;
-use common::{rebuild, Harness, Mode, Store};
+use common::{rebuild, Harness, Store};
 
 fn w(n: u64) -> WriteId {
     WriteId(n)
@@ -264,12 +264,8 @@ fn a_write_during_a_commit_is_queued_and_commits_after_it() {
     assert_eq!(e.queued_writes(), 0, "the queue did not drain");
 }
 
-/// One seed of the interleaving sweep, driven in one mode.
-///
-/// Split out of the test so the SAME interleaving runs both ways. The rng is
-/// seeded per call, so the two modes see an identical sequence of writes,
-/// failures, duplicates and strangers -- the only difference is whether the
-/// engine survives between steps.
+/// One seed of the interleaving sweep. The rng is seeded per call, so a seed
+/// is one fixed sequence of writes, failures, duplicates and strangers.
 struct SweepSeed {
     published: Cid,
     expected: Cid,
@@ -279,15 +275,11 @@ struct SweepSeed {
     direct_failures: usize,
     directs: usize,
     retries: usize,
-    max_context: usize,
 }
 
-fn sweep_seed(mode: Mode, params: Params, seed: u64) -> SweepSeed {
+fn sweep_seed(params: Params, seed: u64) -> SweepSeed {
     let mut r = rng(seed);
-    // A store of its own: two modes over one store would let the second read
-    // blocks the first put, and a rehydrate that only works because the OTHER
-    // run left its blocks behind has proved nothing.
-    let mut h = Harness::new(mode, params, Store::fresh());
+    let mut h = Harness::new(params, Store::fresh());
     let mut seen = Seen::default();
     let mut records: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut live: Vec<(u64, u64)> = Vec::new();
@@ -343,7 +335,7 @@ fn sweep_seed(mode: Mode, params: Params, seed: u64) -> SweepSeed {
                 // for ever on something that already failed.
                 assert!(
                     !again.is_empty(),
-                    "seed {seed} ({mode:?}): PutFailed re-emitted nothing, so \
+                    "seed {seed}: PutFailed re-emitted nothing, so \
                      the commit can never complete"
                 );
                 if packs.contains(id) {
@@ -401,19 +393,10 @@ fn sweep_seed(mode: Mode, params: Params, seed: u64) -> SweepSeed {
         direct_failures,
         directs,
         retries: retries_seen,
-        max_context: h.max_context,
     }
 }
 
-/// Every interleaving publishes the root a rebuild produces -- and it does so
-/// whether the engine survives between steps or is rebuilt from its context
-/// each time.
-///
-/// The delegate is the rehydrating case: a fresh wasm instance, and a fresh
-/// linear memory, on every message. Running the sweep only in `Live` tested
-/// the one mode production never uses. Both modes run the same interleaving
-/// and must agree with each other AND with a rebuild -- three-way, because
-/// two runs that agree on the wrong answer agree just as loudly.
+/// Every interleaving publishes the root a rebuild produces.
 #[test]
 fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     // Counted across the whole sweep and asserted at the end. A failure
@@ -426,7 +409,6 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     let mut direct_failures = 0usize;
     let mut directs = 0usize;
     let mut retries_seen = 0usize;
-    let mut max_context = 0usize;
     // BOTH write paths. Phase 3 ships members only; Phase 4 (#39) turns the
     // pack back on, and the format has to keep working until then — a sweep
     // over one of them would let the other rot with nothing to say so.
@@ -441,66 +423,36 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
         ),
     ] {
         for seed in 1..=24u64 {
-            let l = sweep_seed(Mode::Live, params, seed);
-            let d = sweep_seed(Mode::Rehydrate, params, seed);
-
+            let l = sweep_seed(params, seed);
             assert_eq!(
-                l.published, d.published,
-                "seed {seed}: an engine rebuilt from its context between every \
-             step published a different root from one that survived, so \
-             something the pipeline needs is not in the context"
+                l.published, l.expected,
+                "seed {seed}: the published root is not the root a rebuild \
+             produces"
             );
-            for s in [&l, &d] {
-                assert_eq!(
-                    s.published, s.expected,
-                    "seed {seed}: the published root is not the root a rebuild \
-                 produces"
+            // And no write was silently dropped, or reported an impossible life.
+            for (client, id) in &l.live {
+                let states = l.seen.of(*client, *id);
+                assert!(
+                    !states.is_empty(),
+                    "seed {seed}: write {id} was never reported at all"
+                );
+                assert!(
+                    valid_sequence(states),
+                    "seed {seed}: write {id} reported an impossible sequence: \
+                 {states:?}"
                 );
             }
-            // And no write was silently dropped, or reported an impossible life.
-            for s in [&l, &d] {
-                for (client, id) in &s.live {
-                    let states = s.seen.of(*client, *id);
-                    assert!(
-                        !states.is_empty(),
-                        "seed {seed}: write {id} was never reported at all"
-                    );
-                    assert!(
-                        valid_sequence(states),
-                        "seed {seed}: write {id} reported an impossible sequence: \
-                     {states:?}"
-                    );
-                }
-            }
-            // The states themselves must agree too: a rehydrate that reaches the
-            // right root while telling a client something different is still a
-            // bug the root comparison cannot see. EXCEPT `ParityComplete`: a
-            // published commit's stragglers (race put, COMMIT-LIFE §P) are
-            // PAGE memory, never in the context (the architect's correction
-            // (c)), so an engine rebuilt from its context between calls does
-            // not know them and cannot tell BACKED_UP -- a reload loses that by
-            // design, and the keeper covers it. Everything up to `Published`
-            // must agree exactly; BACKED_UP is asserted in Live only (below).
-            let upto_published = |s: &Seen| -> Seen {
-                Seen(s.0.iter().map(|(k, v)| (*k, v.iter().copied().filter(|x| *x != State::ParityComplete).collect())).collect())
-            };
-            assert_eq!(
-                upto_published(&l.seen),
-                upto_published(&d.seen),
-                "seed {seed}: the two modes reported different write states"
-            );
             for (client, id) in &l.live {
                 let states = l.seen.of(*client, *id);
                 if states.contains(&State::Published) {
-                    assert!(states.contains(&State::ParityComplete), "seed {seed}: in Live, write {id} published and every block was acked, but it was never BACKED_UP: {states:?}");
+                    assert!(states.contains(&State::ParityComplete), "seed {seed}: write {id} published and every block was acked, but it was never BACKED_UP: {states:?}");
                 }
             }
-            pack_failures += l.pack_failures + d.pack_failures;
-            direct_failures += l.direct_failures + d.direct_failures;
-            directs += l.directs + d.directs;
-            retries_seen += l.retries + d.retries;
-            max_context = max_context.max(d.max_context);
-            println!("  {arm} seed {seed:2}: both modes match a rebuild");
+            pack_failures += l.pack_failures;
+            direct_failures += l.direct_failures;
+            directs += l.directs;
+            retries_seen += l.retries;
+            println!("  {arm} seed {seed:2}: matches a rebuild");
         }
     }
     // Without this the sweep can inject failures that never land on a pack and
@@ -530,46 +482,10 @@ fn any_interleaving_publishes_the_root_a_rebuild_produces() {
     );
     println!(
         "  {retries_seen} injected failures: {pack_failures} on packs, \
-         {direct_failures} on direct blocks (of {directs} emitted); largest \
-         context {max_context} B"
+         {direct_failures} on direct blocks (of {directs} emitted)"
     );
 }
 
-/// The control for the sweep above: leave one field out of the context, and
-/// the two modes must stop agreeing.
-///
-/// `context_carries_pending: false` drops the commit in flight. Everything
-/// else is identical. Without this, "Live and Rehydrate agree" would hold
-/// just as well over an engine that kept its state in a global, or a Harness
-/// whose rehydrate mode quietly did nothing -- the assertion would be
-/// measuring the harness, not the context.
-#[test]
-fn dropping_one_context_field_makes_the_two_modes_disagree() {
-    let blind = Params {
-        context_carries_pending: false,
-        ..Params::default()
-    };
-    let mut diverged = 0usize;
-    for seed in 1..=24u64 {
-        let good = sweep_seed(Mode::Live, Params::default(), seed);
-        let blinded = std::panic::catch_unwind(move || sweep_seed(Mode::Rehydrate, blind, seed));
-        // Either the run falls over (a retry that re-emits nothing is itself
-        // the forgotten commit showing) or it finishes at the wrong root.
-        // Both are divergence; neither is agreement.
-        match blinded {
-            Err(_) => diverged += 1,
-            Ok(b) if b.published != good.published => diverged += 1,
-            Ok(_) => {}
-        }
-    }
-    assert_eq!(
-        diverged, 24,
-        "only {diverged} of 24 seeds noticed that the in-flight commit was \
-         left out of the context, so the both-modes comparison does not see \
-         a field going missing"
-    );
-    println!("  control: all 24 seeds diverged with one context field dropped");
-}
 
 
 

@@ -16,7 +16,7 @@ use freenet_prolly::Cid;
 use std::collections::BTreeMap;
 
 mod common;
-use common::{Harness, Mode, Store};
+use common::{Harness, Store};
 
 /// A write with these reads. Every op key the test does NOT read is FORCED
 /// (`Expect::Any`, sdk#235 W8): these tests are about the reads they declare —
@@ -82,8 +82,8 @@ fn settle(h: &mut Harness, mut fx: Vec<Effect>) -> Vec<Effect> {
     panic!("never settled");
 }
 
-fn fresh(mode: Mode) -> Harness {
-    Harness::new(mode, Params::default(), Store::fresh())
+fn fresh() -> Harness {
+    Harness::new(Params::default(), Store::fresh())
 }
 
 /// What key `k` holds in the tree at `root`, as bytes (a reference resolved).
@@ -94,44 +94,40 @@ fn value_at(store: &Store, root: &Cid, k: &[u8]) -> Option<Vec<u8>> {
 
 #[test]
 fn a_write_whose_reads_hold_applies_exactly_as_a_blind_one() {
-    for mode in [Mode::Live, Mode::Rehydrate] {
-        let (mut a, mut b) = (fresh(mode), fresh(mode));
-        for h in [&mut a, &mut b] {
-            let fx = h.step(write(1, &[(b"k", Some(b"v1"))], vec![]));
-            settle(h, fx);
-        }
-        let fx = a.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], vec![]));
-        settle(&mut a, fx);
-        let reads = vec![(b"k".to_vec(), Expect::Value(leaf_hash(b"v1"))), (b"j".to_vec(), Expect::Absent)];
-        let fx = b.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], reads));
-        let all = settle(&mut b, fx);
-        assert!(states(&all, 2).contains(&State::Published), "{mode:?}: a write whose reads held did not publish");
-        assert_eq!(a.published_root(), b.published_root(), "{mode:?}: reads that hold changed what the write produced");
+    let (mut a, mut b) = (fresh(), fresh());
+    for h in [&mut a, &mut b] {
+        let fx = h.step(write(1, &[(b"k", Some(b"v1"))], vec![]));
+        settle(h, fx);
     }
+    let fx = a.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], vec![]));
+    settle(&mut a, fx);
+    let reads = vec![(b"k".to_vec(), Expect::Value(leaf_hash(b"v1"))), (b"j".to_vec(), Expect::Absent)];
+    let fx = b.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], reads));
+    let all = settle(&mut b, fx);
+    assert!(states(&all, 2).contains(&State::Published), "a write whose reads held did not publish");
+    assert_eq!(a.published_root(), b.published_root(), "reads that hold changed what the write produced");
 }
 
 #[test]
 fn a_write_whose_read_changed_applies_nothing_and_says_what_is_there() {
-    for mode in [Mode::Live, Mode::Rehydrate] {
-        let mut h = fresh(mode);
-        let fx = h.step(write(1, &[(b"k", Some(b"v1"))], vec![]));
-        settle(&mut h, fx);
-        let before = h.published_root();
-        // It read v0 — a copy from before v1 landed.
-        let fx = h.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], vec![(b"k".to_vec(), Expect::Value(leaf_hash(b"v0")))]));
-        assert_eq!(states(&fx, 2), vec![State::Conflict], "{mode:?}");
-        assert_eq!(conflicted(&fx, 2), Some((b"k".to_vec(), Some(LeafForm::Inline(b"v1".to_vec())))), "{mode:?}");
-        assert!(!fx.iter().any(|f| matches!(f, Effect::PutBlock { .. } | Effect::UpdateHead { .. })), "{mode:?}: a conflict wrote something");
-        assert_eq!(h.root(), before, "{mode:?}: R1 — a conflicting write changed the tree");
-        // And the engine is not left busy: the next write goes through.
-        let fx = h.step(write(3, &[(b"k", Some(b"v3"))], vec![(b"k".to_vec(), Expect::Value(leaf_hash(b"v1")))]));
-        assert!(settle(&mut h, fx).iter().any(|f| matches!(f, Effect::Notify { write_id, state: State::Published, .. } if write_id.0 == 3)));
-    }
+    let mut h = fresh();
+    let fx = h.step(write(1, &[(b"k", Some(b"v1"))], vec![]));
+    settle(&mut h, fx);
+    let before = h.published_root();
+    // It read v0 — a copy from before v1 landed.
+    let fx = h.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], vec![(b"k".to_vec(), Expect::Value(leaf_hash(b"v0")))]));
+    assert_eq!(states(&fx, 2), vec![State::Conflict]);
+    assert_eq!(conflicted(&fx, 2), Some((b"k".to_vec(), Some(LeafForm::Inline(b"v1".to_vec())))));
+    assert!(!fx.iter().any(|f| matches!(f, Effect::PutBlock { .. } | Effect::UpdateHead { .. })), "a conflict wrote something");
+    assert_eq!(h.root(), before, "R1 — a conflicting write changed the tree");
+    // And the engine is not left busy: the next write goes through.
+    let fx = h.step(write(3, &[(b"k", Some(b"v3"))], vec![(b"k".to_vec(), Expect::Value(leaf_hash(b"v1")))]));
+    assert!(settle(&mut h, fx).iter().any(|f| matches!(f, Effect::Notify { write_id, state: State::Published, .. } if write_id.0 == 3)));
 }
 
 #[test]
 fn create_at_twice_on_one_key_creates_once_and_conflicts_once() {
-    let mut h = fresh(Mode::Live);
+    let mut h = fresh();
     let fx = h.step(write(1, &[(b"id/7", Some(b"first"))], vec![(b"id/7".to_vec(), Expect::Absent)]));
     assert!(states(&settle(&mut h, fx), 1).contains(&State::Published));
     let fx = h.step(write(2, &[(b"id/7", Some(b"second"))], vec![(b"id/7".to_vec(), Expect::Absent)]));
@@ -141,7 +137,7 @@ fn create_at_twice_on_one_key_creates_once_and_conflicts_once() {
 
 #[test]
 fn two_updates_from_one_stale_view_one_applies_and_the_other_conflicts() {
-    let mut h = fresh(Mode::Live);
+    let mut h = fresh();
     let fx = h.step(write(1, &[(b"n", Some(b"1"))], vec![]));
     settle(&mut h, fx);
     // Two tabs both read "1" and both write "2".
@@ -155,7 +151,7 @@ fn two_updates_from_one_stale_view_one_applies_and_the_other_conflicts() {
 
 #[test]
 fn present_holds_for_any_value_and_fails_on_an_absent_key() {
-    let mut h = fresh(Mode::Live);
+    let mut h = fresh();
     let fx = h.step(write(1, &[(b"parent", Some(b"p"))], vec![]));
     settle(&mut h, fx);
     let fx = h.step(write(2, &[(b"parent", Some(b"edited"))], vec![]));
@@ -173,7 +169,7 @@ fn present_holds_for_any_value_and_fails_on_an_absent_key() {
 /// here, with the block gone from the node entirely.
 #[test]
 fn a_large_value_is_compared_by_its_reference_and_never_fetched() {
-    let mut h = fresh(Mode::Live);
+    let mut h = fresh();
     let big = vec![7u8; 5_000];
     let fx = h.step(write(1, &[(b"doc", Some(&big))], vec![]));
     settle(&mut h, fx);
@@ -196,7 +192,7 @@ fn a_large_value_is_compared_by_its_reference_and_never_fetched() {
 /// must not satisfy an expectation of the reference (and the reverse).
 #[test]
 fn an_inline_value_spelling_a_reference_is_not_that_reference() {
-    let mut h = fresh(Mode::Live);
+    let mut h = fresh();
     let big = vec![9u8; 5_000];
     let fx = h.step(write(1, &[(b"doc", Some(&big))], vec![]));
     settle(&mut h, fx);
@@ -214,37 +210,35 @@ fn an_inline_value_spelling_a_reference_is_not_that_reference() {
 fn a_cold_read_that_is_wrong_parks_then_conflicts_on_resume() {
     // LIVE ONLY (R-b): a parked write waits in the page's queue, which is
     // page memory and never in a context.
-    for mode in [Mode::Live] {
-        let mut h = fresh(mode);
-        let ops: Vec<(Vec<u8>, Vec<u8>)> = (0..400).map(|i| (format!("k/{i:04}").into_bytes(), vec![b'a'; 200])).collect();
-        let op_refs: Vec<(&[u8], Option<&[u8]>)> = ops.iter().map(|(k, v)| (k.as_slice(), Some(v.as_slice()))).collect();
-        let fx = h.step(write(1, &op_refs, vec![]));
-        settle(&mut h, fx);
-        let root = h.published_root();
-        for c in held_blocks(&h.store, &root).iter().filter(|c| **c != root) {
-            h.store.forget(*c);
-        }
-        let fx = h.step(write(2, &[(b"z", Some(b"1"))], vec![(b"k/0123".to_vec(), Expect::Value(leaf_hash(b"not what is there")))]));
-        assert!(states(&fx, 2).is_empty(), "{mode:?}: a cold read conflicted before its path was read");
-        let mut out = fx;
-        let mut all = Vec::new();
-        for _ in 0..20 {
-            let asks: Vec<Cid> = out.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect();
-            all.extend(out.iter().cloned());
-            if asks.is_empty() {
-                break;
-            }
-            let mut next = Vec::new();
-            for id in asks {
-                h.store.remember(&id);
-                let bytes = freenet_prolly::store::Blocks::get(&h.store, &id).expect("held").to_vec();
-                next.extend(h.step(Event::BlockArrived { id, bytes }));
-            }
-            out = next;
-        }
-        assert_eq!(states(&all, 2), vec![State::Conflict], "{mode:?}: the parked write's reads were not checked on resume");
-        assert_eq!(h.published_root(), root);
+    let mut h = fresh();
+    let ops: Vec<(Vec<u8>, Vec<u8>)> = (0..400).map(|i| (format!("k/{i:04}").into_bytes(), vec![b'a'; 200])).collect();
+    let op_refs: Vec<(&[u8], Option<&[u8]>)> = ops.iter().map(|(k, v)| (k.as_slice(), Some(v.as_slice()))).collect();
+    let fx = h.step(write(1, &op_refs, vec![]));
+    settle(&mut h, fx);
+    let root = h.published_root();
+    for c in held_blocks(&h.store, &root).iter().filter(|c| **c != root) {
+        h.store.forget(*c);
     }
+    let fx = h.step(write(2, &[(b"z", Some(b"1"))], vec![(b"k/0123".to_vec(), Expect::Value(leaf_hash(b"not what is there")))]));
+    assert!(states(&fx, 2).is_empty(), "a cold read conflicted before its path was read");
+    let mut out = fx;
+    let mut all = Vec::new();
+    for _ in 0..20 {
+        let asks: Vec<Cid> = out.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect();
+        all.extend(out.iter().cloned());
+        if asks.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for id in asks {
+            h.store.remember(&id);
+            let bytes = freenet_prolly::store::Blocks::get(&h.store, &id).expect("held").to_vec();
+            next.extend(h.step(Event::BlockArrived { id, bytes }));
+        }
+        out = next;
+    }
+    assert_eq!(states(&all, 2), vec![State::Conflict], "the parked write's reads were not checked on resume");
+    assert_eq!(h.published_root(), root);
 }
 
 /// A read key whose path is not held PARKS the write (never a Conflict:
@@ -253,39 +247,37 @@ fn a_cold_read_that_is_wrong_parks_then_conflicts_on_resume() {
 /// is page memory and never in a context.
 #[test]
 fn a_read_whose_path_is_not_held_parks_and_is_checked_when_it_resumes() {
-    for mode in [Mode::Live] {
-        let mut h = fresh(mode);
-        let ops: Vec<(Vec<u8>, Vec<u8>)> = (0..400).map(|i| (format!("k/{i:04}").into_bytes(), vec![b'a'; 200])).collect();
-        let op_refs: Vec<(&[u8], Option<&[u8]>)> = ops.iter().map(|(k, v)| (k.as_slice(), Some(v.as_slice()))).collect();
-        let fx = h.step(write(1, &op_refs, vec![]));
-        settle(&mut h, fx);
-        // Forget every block but the root: the read's path is cold.
-        let root = h.published_root();
-        let held: Vec<Cid> = held_blocks(&h.store, &root);
-        for c in held.iter().filter(|c| **c != root) {
-            h.store.forget(*c);
-        }
-        let fx = h.step(write(2, &[(b"z", Some(b"1"))], vec![(b"k/0123".to_vec(), Expect::Value(leaf_hash(&[b'a'; 200])))]));
-        assert!(states(&fx, 2).is_empty(), "{mode:?}: a cold read was answered {:?} instead of parking", states(&fx, 2));
-        let fetches: Vec<Cid> = fx.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect();
-        assert!(!fetches.is_empty(), "{mode:?}: parked without asking for the read's path");
-        // Deliver until it resolves.
-        let mut out = fx;
-        for _ in 0..20 {
-            let asks: Vec<Cid> = out.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect();
-            if asks.is_empty() {
-                break;
-            }
-            let mut next = Vec::new();
-            for id in asks {
-                h.store.remember(&id);
-                let bytes = freenet_prolly::store::Blocks::get(&h.store, &id).expect("held").to_vec();
-                next.extend(h.step(Event::BlockArrived { id, bytes }));
-            }
-            out = next;
-        }
-        assert!(settle(&mut h, out).iter().any(|f| matches!(f, Effect::Notify { write_id, state: State::Published, .. } if write_id.0 == 2)), "{mode:?}: the resumed write did not publish");
+    let mut h = fresh();
+    let ops: Vec<(Vec<u8>, Vec<u8>)> = (0..400).map(|i| (format!("k/{i:04}").into_bytes(), vec![b'a'; 200])).collect();
+    let op_refs: Vec<(&[u8], Option<&[u8]>)> = ops.iter().map(|(k, v)| (k.as_slice(), Some(v.as_slice()))).collect();
+    let fx = h.step(write(1, &op_refs, vec![]));
+    settle(&mut h, fx);
+    // Forget every block but the root: the read's path is cold.
+    let root = h.published_root();
+    let held: Vec<Cid> = held_blocks(&h.store, &root);
+    for c in held.iter().filter(|c| **c != root) {
+        h.store.forget(*c);
     }
+    let fx = h.step(write(2, &[(b"z", Some(b"1"))], vec![(b"k/0123".to_vec(), Expect::Value(leaf_hash(&[b'a'; 200])))]));
+    assert!(states(&fx, 2).is_empty(), "a cold read was answered {:?} instead of parking", states(&fx, 2));
+    let fetches: Vec<Cid> = fx.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect();
+    assert!(!fetches.is_empty(), "parked without asking for the read's path");
+    // Deliver until it resolves.
+    let mut out = fx;
+    for _ in 0..20 {
+        let asks: Vec<Cid> = out.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect();
+        if asks.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for id in asks {
+            h.store.remember(&id);
+            let bytes = freenet_prolly::store::Blocks::get(&h.store, &id).expect("held").to_vec();
+            next.extend(h.step(Event::BlockArrived { id, bytes }));
+        }
+        out = next;
+    }
+    assert!(settle(&mut h, out).iter().any(|f| matches!(f, Effect::Notify { write_id, state: State::Published, .. } if write_id.0 == 2)), "the resumed write did not publish");
 }
 
 /// Every block reachable from `root`.
@@ -324,7 +316,7 @@ fn model_stale_views_never_overwrite_and_conflicts_name_the_truth() {
             rng ^= rng << 17;
             rng
         };
-        let mut h = fresh(if seed % 2 == 0 { Mode::Rehydrate } else { Mode::Live });
+        let mut h = fresh();
         // A fresh device's root is the EMPTY LEAF, a constant of the format
         // that no store holds until the first commit publishes.
         let empty = h.published_root();
@@ -381,7 +373,7 @@ fn model_stale_views_never_overwrite_and_conflicts_name_the_truth() {
 /// Control: the same race with DIFFERENT bytes still conflicts.
 #[test]
 fn a_write_that_is_already_there_at_its_conflicting_key_succeeds() {
-    let mut h = fresh(Mode::Live);
+    let mut h = fresh();
     let fx = h.step(write(1, &[(b"schema/x", Some(b"S"))], vec![(b"schema/x".to_vec(), Expect::Absent)]));
     assert!(states(&settle(&mut h, fx), 1).contains(&State::Published));
     // The second tab read Absent too, and writes EXACTLY what is there.
@@ -402,7 +394,7 @@ fn a_write_that_is_already_there_at_its_conflicting_key_succeeds() {
 /// silent "nothing to do".
 #[test]
 fn a_delete_of_a_record_read_absent_that_now_exists_conflicts() {
-    let mut h = fresh(Mode::Live);
+    let mut h = fresh();
     let fx = h.step(write(1, &[(b"r", Some(b"made elsewhere"))], vec![]));
     settle(&mut h, fx);
     let fx = h.step(write(2, &[(b"r", None)], vec![(b"r".to_vec(), Expect::Absent)]));
@@ -422,25 +414,23 @@ fn a_delete_of_a_record_read_absent_that_now_exists_conflicts() {
 /// the write read, not by its bytes.
 #[test]
 fn a_re_sent_write_whose_answer_was_lost_applies_nothing_and_undoes_nothing() {
-    for mode in [Mode::Live, Mode::Rehydrate] {
-        let mut h = fresh(mode);
-        let fx = h.step(write(1, &[(b"rec", Some(b"t0 b0"))], vec![]));
-        settle(&mut h, fx);
-        let w3 = |id| write(id, &[(b"rec", Some(b"t1 b0"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t0 b0")))]);
-        let fx = h.step(w3(3));
-        assert!(states(&settle(&mut h, fx), 3).contains(&State::Published), "{mode:?}");
-        let fx = h.step(write(4, &[(b"rec", Some(b"t1 b1"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t1 b0")))]));
-        assert!(states(&settle(&mut h, fx), 4).contains(&State::Published), "{mode:?}");
-        let before = h.published_root();
-        let fx = h.step(w3(3));
-        assert_eq!(states(&fx, 3), vec![State::Conflict], "{mode:?}: the re-send was not refused");
-        assert!(!fx.iter().any(|f| matches!(f, Effect::PutBlock { .. } | Effect::UpdateHead { .. })), "{mode:?}: the re-send wrote something");
-        let all = settle(&mut h, fx);
-        assert!(!states(&all, 3).contains(&State::Published), "{mode:?}");
-        assert_eq!(h.published_root(), before, "{mode:?}: the re-send moved the tree");
-        assert_eq!(value_at(&h.store, &h.published_root(), b"rec").as_deref(), Some(&b"t1 b1"[..]), "{mode:?}: w4 was undone");
-        // The control: a NEW write, its read holding, applies.
-        let fx = h.step(write(5, &[(b"rec", Some(b"t1 b0"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t1 b1")))]));
-        assert!(states(&settle(&mut h, fx), 5).contains(&State::Published), "{mode:?}: the control did not apply");
-    }
+    let mut h = fresh();
+    let fx = h.step(write(1, &[(b"rec", Some(b"t0 b0"))], vec![]));
+    settle(&mut h, fx);
+    let w3 = |id| write(id, &[(b"rec", Some(b"t1 b0"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t0 b0")))]);
+    let fx = h.step(w3(3));
+    assert!(states(&settle(&mut h, fx), 3).contains(&State::Published));
+    let fx = h.step(write(4, &[(b"rec", Some(b"t1 b1"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t1 b0")))]));
+    assert!(states(&settle(&mut h, fx), 4).contains(&State::Published));
+    let before = h.published_root();
+    let fx = h.step(w3(3));
+    assert_eq!(states(&fx, 3), vec![State::Conflict], "the re-send was not refused");
+    assert!(!fx.iter().any(|f| matches!(f, Effect::PutBlock { .. } | Effect::UpdateHead { .. })), "the re-send wrote something");
+    let all = settle(&mut h, fx);
+    assert!(!states(&all, 3).contains(&State::Published));
+    assert_eq!(h.published_root(), before, "the re-send moved the tree");
+    assert_eq!(value_at(&h.store, &h.published_root(), b"rec").as_deref(), Some(&b"t1 b1"[..]), "w4 was undone");
+    // The control: a NEW write, its read holding, applies.
+    let fx = h.step(write(5, &[(b"rec", Some(b"t1 b0"))], vec![(b"rec".to_vec(), Expect::Value(leaf_hash(b"t1 b1")))]));
+    assert!(states(&settle(&mut h, fx), 5).contains(&State::Published), "the control did not apply");
 }
