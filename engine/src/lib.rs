@@ -1003,6 +1003,14 @@ struct Queued {
     deferred: bool,
 }
 
+impl Queued {
+    /// UNSAVED: taken and not yet published, except a DEFERRED write no cut
+    /// has taken (sdk#350) -- THE one statement of it.
+    fn is_unsaved(&self) -> bool {
+        !(self.deferred && !self.committing)
+    }
+}
+
 /// A write whose apply stopped on a block the node does not hold.
 ///
 /// The tree is a persistent structure over content-addressed blocks, so an
@@ -1681,7 +1689,15 @@ impl<B: Blocks> Engine<B> {
     /// no commit has taken is nothing the person made; it is unsaved only
     /// once a cut carries it).
     pub fn unsaved_writes(&self) -> usize {
-        self.queue.iter().filter(|q| !(q.deferred && !q.committing)).count()
+        self.queue.iter().filter(|q| q.is_unsaved()).count()
+    }
+
+    /// The client of every UNSAVED write ([`Engine::unsaved_writes`]'s rule,
+    /// per write): what a session counts as its own unsaved writes -- the
+    /// unsaved-changes guard and "saving N…" -- so a held define never makes
+    /// a viewer's close say "unsaved changes" (sdk#350).
+    pub fn unsaved_clients(&self) -> impl Iterator<Item = ClientId> + '_ {
+        self.queue.iter().filter(|q| q.is_unsaved()).map(|q| q.client)
     }
 
     /// May a commit be cut (sdk#350)? Only with a NON-deferred write applied

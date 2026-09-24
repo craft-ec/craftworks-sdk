@@ -589,6 +589,12 @@ impl Server {
             .collect()
     }
 
+    /// This session's UNSAVED writes: the engine's one rule (a held deferred
+    /// write is not one, sdk#350), counted for this session.
+    pub fn unsaved_of(&self, session: u64) -> usize {
+        self.page.unsaved_clients().into_iter().filter(|c| session_of(*c) == session).count()
+    }
+
     fn stage_of(&self, session: u64, write_id: u64) -> Option<crate::fates::Fate> {
         self.page
             .queue_stages()

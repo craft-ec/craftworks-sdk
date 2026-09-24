@@ -112,3 +112,20 @@ fn control_the_reader_finds_the_bodies() {
     assert!(body_of("open_own").contains("can_write"), "open_own's body was not read");
     assert!(body_of("define").contains("self.db.schema("), "define's body was not read");
 }
+
+/// DEFINES ON OPEN ARE DEFERRED ON A PUBLISHED APP'S OWN TREE, AND ONLY THERE (sdk#350). The asked session
+/// (`ask_signer`: a published app opening the user's own tree) tells its Db to defer schema writes, once, so
+/// opening commits nothing even on a node that holds the user's key; the provisioned session (the builder's)
+/// and a view never do. The behaviour under it is `tests/deferred_schema.rs` (a real page and engine).
+/// Mutant "ask_signer does not defer" -> red.
+#[test]
+fn only_the_asked_session_defers_its_schema_writes() {
+    let asked = body_of("ask_signer");
+    assert!(asked.contains("io.ask()"), "THE CONTROL: the reader did not find ask_signer's real body");
+    assert!(asked.contains("self.db.set_defer_schema(true)"), "a published app's own tree does not defer its defines: opening commits them");
+    for name in ["provision", "open_named"] {
+        let b = body_of(name);
+        assert!(!b.is_empty(), "THE CONTROL: no body for {name}");
+        assert!(!b.contains("set_defer_schema"), "`{name}` defers schema writes: a builder's or a view's define must not be held");
+    }
+}
