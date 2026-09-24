@@ -569,6 +569,9 @@ pub struct Page {
     /// What an equal-seq sighting is judged against — this page's claim at
     /// that seq, whose bytes it can land again if they win the tie-break.
     my_records: BTreeMap<u64, (Cid, Vec<u8>)>,
+    /// Every `HeadConfirmed` this page stepped, in order (tests only: a commit is confirmed ONCE, #378).
+    #[cfg(test)]
+    confirmed_steps: Vec<u64>,
     /// When the register was last read (any head answer), for the backstop.
     last_head_at: u64,
     /// That read, whole: what an equal-seq tie-break hashes.
@@ -675,6 +678,8 @@ impl Page {
             most_landing_updates: 0,
             old_signer_fork_at: None,
             my_records: BTreeMap::new(),
+            #[cfg(test)]
+            confirmed_steps: Vec::new(),
             last_head_at: 0,
             last_head: None,
             put_again: BTreeMap::new(),
@@ -1914,6 +1919,10 @@ impl Page {
     }
 
     fn step(&mut self, ev: Event) {
+        #[cfg(test)]
+        if let Event::HeadConfirmed(seq) = ev {
+            self.confirmed_steps.push(seq);
+        }
         // THE WITNESS (COMMIT-LIFE ⁵): a head about to be adopted says, in its
         // ledger, how far THIS page's writes are in it -- whether a commit
         // the engine is about to call dead in fact landed unheard.
@@ -3225,5 +3234,73 @@ mod head_judgement_cells {
         assert_ne!(p.published(), (theirs.seq, theirs.root()), "the read-back adopted a head this page's own record beats");
         let o = p.head.owed.as_ref().expect("the owed commit was dropped for a head this page's own record beats");
         assert_eq!((o.seq, o.stale_reads), (1, 1), "the read-back did not read again (one stale read counted)");
+    }
+}
+
+#[cfg(test)]
+mod confirmed_once {
+    //! A commit is confirmed ONCE, whichever of its two confirmations lands first (#378, after #393): its read-back
+    //! GET's answer (E4) or the node's push of exactly its head (E1, P3). #393 emits the held-back parity at the
+    //! confirmation, so a second `HeadConfirmed` would send it twice. FOUR guards hold it, three on the page: (A) the
+    //! read-back takes the owed head (`on_read_back`), (B) the push ends the read-back's deadline (`head_pushed`),
+    //! (C) `drop_dead_head` clears the owed head and its deadlines once the engine has published its seq -- and the
+    //! engine's `on_head` takes `pending`. This counts the page's own steps. MEASURED, every combination of A/B/C off
+    //! (#378 PR body): each alone, A+B and B+C -> both tests pass (masked); A+C -> E4-then-E1 red; A+B+C -> both red.
+    use super::*;
+
+    const KEY: [u8; 32] = [7u8; 32];
+
+    /// A page whose one write's UPDATE is out; its record, read as a head.
+    fn at_update() -> (Page, HeadRead) {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&KEY);
+        let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
+        for _ in 0..20 {
+            for op in p.take_ops() {
+                match op {
+                    Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: None }, Ms(10)),
+                    Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(10)),
+                    Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(10)),
+                    Op::Sign { id, seq, root, ledger, .. } => {
+                        let value = [root.as_slice(), &ledger].concat();
+                        let record = contract_keys::register::head_state(&params, &sk.to_bytes(), seq, &value).expect("signs");
+                        p.answer(Answer::Signer { id, answer: signer_proto::Answer::Signed(record.clone()) }, Ms(10));
+                        let _ = p.take_ops();
+                        return (p, HeadRead::from_record(&record).expect("reads"));
+                    }
+                    other => panic!("unexpected before the sign: {other:?}"),
+                }
+            }
+        }
+        panic!("the page never asked the signer");
+    }
+
+    /// The UPDATE answered: the read-back GET goes out (the setup asserts it).
+    fn read_back_out(p: &mut Page) {
+        p.answer(Answer::Updated { label: Label::Head }, Ms(11));
+        assert!(p.take_ops().contains(&Op::ReadHead { label: Label::Head }), "THE SETUP: the read-back GET did not go out");
+    }
+
+    /// **E1 then E4:** the push confirms; the read-back GET, already on the wire, answers after. One step.
+    /// Red only with A, B and C all off: each alone is enough here.
+    #[test]
+    fn a_push_then_the_read_backs_answer_confirm_once() {
+        let (mut p, mine) = at_update();
+        read_back_out(&mut p);
+        p.head_pushed(mine.clone());
+        p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
+        assert_eq!(p.confirmed_steps, vec![mine.seq], "the commit was not confirmed exactly once (E1 then E4)");
+    }
+
+    /// **E4 then E1:** the read-back's answer confirms; the node's push of the same head arrives after. One step.
+    /// Red with A and C off (B does not act on this order): either alone is enough here.
+    #[test]
+    fn a_read_backs_answer_then_the_push_confirm_once() {
+        let (mut p, mine) = at_update();
+        read_back_out(&mut p);
+        p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
+        p.head_pushed(mine.clone());
+        assert_eq!(p.confirmed_steps, vec![mine.seq], "the commit was not confirmed exactly once (E4 then E1)");
     }
 }
