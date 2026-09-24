@@ -14,7 +14,10 @@
 //! Fields (the architect's review, docs 2026-09-23-ledger-format-attack.md, ruled by main):
 //! * [`TAG_PREV`] `prev_seq u64 LE ‖ prev_root [32]`: the head this one was signed from. Omitted at the genesis,
 //!   never zeros.
-//! * [`TAG_PARITY`]: the parity scan's front (#119 PR2 fixes its meaning), at most [`PARITY_MAX`] bytes.
+//! * [`TAG_PARITY`]: since ledger version 2, the race-put MARK (COMMIT-LIFE §P): an EMPTY field means "every group
+//!   this head lists was recoverable (k of k+m) when it was signed". A head without it is pre-§P, and a reader says
+//!   `NotScanned` for it. In version 1 the tag carried #119's scan front, a different meaning, so a v1 parity field
+//!   is DROPPED on read, never taken for the mark. At most [`PARITY_MAX`] bytes.
 //! * [`TAG_THROUGH`] `n u16 ‖ n × (device [16] ‖ seq u64 LE ‖ last u64 LE)`, sorted by device, unique: how far each
 //!   device's writes are published, and when each last wrote. `device` is a per-INSTALL id minted once and kept in the
 //!   signer's secret store, never derived from the key (one key can be shared across devices until #226).
@@ -45,8 +48,11 @@ pub const FLAG_RECORD: u8 = 0b01;
 pub const VALUE_MAX: usize = 4096;
 /// The root, at the front of every value.
 pub const ROOT_LEN: usize = 32;
-/// The ledger's version, the first byte after the root when a ledger is present.
-pub const LEDGER_VERSION: u8 = 1;
+/// The ledger's version, the first byte after the root when a ledger is present. 2 since race put:
+/// [`TAG_PARITY`]'s MEANING changed (the §P mark, not #119's scan front). Version 1 is still READ.
+pub const LEDGER_VERSION: u8 = 2;
+/// The version before [`LEDGER_VERSION`], still read: its [`TAG_PARITY`] meant something else and is dropped.
+pub const LEDGER_VERSION_V1: u8 = 1;
 pub const TAG_PREV: u8 = 1;
 pub const TAG_PARITY: u8 = 2;
 pub const TAG_THROUGH: u8 = 3;
@@ -143,7 +149,8 @@ pub fn check(value: &[u8]) -> Result<(), Malformed> {
 
 fn parse(rest: &[u8], strict: bool) -> Result<Ledger, Malformed> {
     let (&version, mut rest) = rest.split_first().ok_or(Malformed::Truncated)?;
-    if version != LEDGER_VERSION {
+    // The signer signs only what this build writes; a reader still reads v1.
+    if version != LEDGER_VERSION && (strict || version != LEDGER_VERSION_V1) {
         return Err(Malformed::Version(version));
     }
     let mut ledger = Ledger::default();
@@ -171,7 +178,10 @@ fn parse(rest: &[u8], strict: bool) -> Result<Ledger, Malformed> {
                 if strict && body.len() > PARITY_MAX {
                     return Err(Malformed::ParityTooLong);
                 }
-                ledger.parity = Some(body.to_vec());
+                // v1's parity field was #119's scan front, not the §P mark.
+                if version == LEDGER_VERSION {
+                    ledger.parity = Some(body.to_vec());
+                }
             }
             TAG_THROUGH => {
                 let (n, entries) = body.split_at_checked(2).ok_or(Malformed::ThroughShape)?;

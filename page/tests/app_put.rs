@@ -1,12 +1,12 @@
 //! An app's PUT (a published web container) goes through the PAGE's sender:
-//! the same RTO deadline and re-send as every op, and an END — acknowledged,
-//! refused in the node's words, or given up at `APP_PUT_BUDGET_MS`. On the
-//! real network the builder's own 60 s wait with one re-PUT "on a dropped
-//! socket" left a silent node pending for ever (2026-09-23 rehearsal).
+//! the same RTO deadline and re-send as every op, until the node ANSWERS —
+//! acknowledged, or refused in its words — or a person CANCELS it (rules 7,
+//! 8). No time ends it: a slow node only means it waits longer, and the page
+//! says how long ("not answering for N s").
 
 use engine::Params;
 use page::rto::RTO_MAX_MS;
-use page::{AppPut, Answer, Ms, Op, Page, PutPath, APP_PUT_BUDGET_MS};
+use page::{AppPut, Answer, Ms, Op, Page, PutPath};
 
 const RTO_MAX: u64 = RTO_MAX_MS as u64;
 const KEY: &str = "8YwvenTZJgTESoiutjWRR2zYZVg1HkNBYoQ347ST66Du";
@@ -32,25 +32,38 @@ fn silent(p: &mut Page, from: u64, to: u64) -> Vec<u64> {
 }
 
 #[test]
-fn a_put_nobody_answers_is_re_sent_and_ends_named_within_its_budget() {
+fn a_put_nobody_answers_for_five_minutes_is_re_sent_throughout_and_put_when_answered() {
     let mut p = Page::new(Params::default(), PutPath::Page);
     p.tick(Ms(0));
     p.put_app(KEY.into(), Ms(0));
     assert_eq!(app_puts(&p.take_ops(), KEY), 1, "the PUT did not go out at once");
-    assert_eq!(p.app_put(KEY), Some(&AppPut::Pending));
+    let resent = silent(&mut p, 100, 300_000);
+    let waited = p.not_answering();
+    println!("silent 5 min: re-sent {} times, at {:?} ms; not answering {:?}", resent.len(), resent, waited);
+    assert_eq!(p.app_put(KEY), Some(&AppPut::Pending), "five minutes of silence ENDED the PUT");
+    assert!(resent.len() >= 5, "a silent node's PUT was re-sent {} time(s) in five minutes", resent.len());
+    assert!(resent.last().is_some_and(|t| *t >= 240_000), "it stopped being sent: last at {:?}", resent.last());
+    assert!(waited.as_ref().is_some_and(|(_, ms)| *ms >= 299_000), "the page did not say how long it waited: {waited:?}");
+    // The node answers at last.
+    p.answer(Answer::AppPutOk(KEY.into()), Ms(300_050));
+    assert_eq!(p.app_put(KEY), Some(&AppPut::Put));
+    // What still waits is not the PUT (this bare page's own head read is).
+    assert!(p.not_answering().is_none_or(|(what, _)| what != "the app's publication"), "still 'not answering' for the PUT after its answer: {:?}", p.not_answering());
+}
 
-    let end = APP_PUT_BUDGET_MS + RTO_MAX;
-    let resent = silent(&mut p, 100, end);
-    println!("re-sent {} times, at {:?} ms; ended as {:?}", resent.len(), resent, p.app_put(KEY));
-    assert!(resent.len() >= 2, "a silent node's PUT was re-sent {} time(s)", resent.len());
-    match p.app_put(KEY) {
-        Some(AppPut::GaveUp(why)) => {
-            assert!(why.contains(KEY) && why.contains("did not acknowledge"), "the end does not say what: {why}");
-        }
-        other => panic!("{} ms of silence did not end the PUT: {other:?}", end),
-    }
-    // Ended means ENDED: nothing more goes out for it.
-    assert!(silent(&mut p, end + 100, end + 3 * RTO_MAX).is_empty(), "a given-up PUT was still sent");
+#[test]
+fn a_person_cancels_a_pending_put_and_nothing_more_is_sent() {
+    let mut p = Page::new(Params::default(), PutPath::Page);
+    p.tick(Ms(0));
+    p.put_app(KEY.into(), Ms(0));
+    let _ = p.take_ops();
+    assert!(!silent(&mut p, 100, 10_000).is_empty(), "not re-sent before the cancel");
+    p.cancel_app_put(KEY);
+    assert_eq!(p.app_put(KEY), Some(&AppPut::Cancelled));
+    assert!(silent(&mut p, 10_100, 200_000).is_empty(), "a cancelled PUT was still sent");
+    // A late answer does not flip it.
+    p.answer(Answer::AppPutOk(KEY.into()), Ms(200_100));
+    assert_eq!(p.app_put(KEY), Some(&AppPut::Cancelled));
 }
 
 #[test]

@@ -9,7 +9,7 @@
 //! in flight, which completed then and must still.
 
 use protocol::{Op, Reply, Request, WriteState};
-use testkit::page_node::{PageConn, PageNode, Served};
+use testkit::page_node::{PageConn, PageNode};
 
 fn value(i: u64, size: usize) -> Vec<u8> {
     let mut v = vec![0u8; size];
@@ -33,9 +33,10 @@ fn drain(c: &mut PageConn, out: &mut Vec<Vec<u8>>) {
     }
 }
 
-/// (what write 1 was told, PUTs after its publish, whether the page is still
-/// waiting on an op once everything has settled)
-fn first_commit(ticks_in_flight: bool) -> (Vec<WriteState>, usize, bool) {
+/// (what write 1 was told, how many parity ids the published root lists and
+/// how many of them the node HOLDS, whether the page is still waiting on an op
+/// once everything has settled)
+fn first_commit(ticks_in_flight: bool) -> (Vec<WriteState>, (usize, usize), bool) {
     let node = PageNode::new();
     let mut c = node.connect();
     c.client(&Request::Identity);
@@ -53,23 +54,28 @@ fn first_commit(ticks_in_flight: bool) -> (Vec<WriteState>, usize, bool) {
         all.extend(c.release_one());
         k += 1;
     }
-    let at_publish = c.served(Served::Put);
     for j in 0..10u64 {
         all.extend(c.tick_at(base + (k + j) * 1000));
         drain(&mut c, &mut all);
     }
-    (
-        told(&all, 1),
-        c.served(Served::Put) - at_publish,
-        c.with_server(|s| s.page.waiting()),
-    )
+    // The redundancy IS on the node: every parity id the published root lists
+    // is held. (Since race put, COMMIT-LIFE §P, the parity goes out in the
+    // commit's own round, so "PUTs after the publish" is 0 by design; what
+    // was promised is that the parity exists, and this asks the node.)
+    let (_, root) = node.head().expect("published");
+    let listed: Vec<_> = {
+        let bytes = freenet_prolly::store::Blocks::get(&node, &root).expect("the root is held").to_vec();
+        freenet_prolly::node::Node::parse(&bytes).expect("a node").parity().collect()
+    };
+    let held = listed.iter().filter(|p| node.holds(p)).count();
+    (told(&all, 1), (listed.len(), held), c.with_server(|s| s.page.waiting()))
 }
 
 #[test]
 fn the_first_commit_gets_its_parity_with_or_without_a_tick_in_flight() {
     for ticks in [true, false] {
-        let (st, puts, waiting) = first_commit(ticks);
-        println!("  ticks in flight: {ticks:<5}  PUTs after publish +{puts}  still waiting {waiting}  told {st:?}");
+        let (st, (listed, held), waiting) = first_commit(ticks);
+        println!("  ticks in flight: {ticks:<5}  parity listed {listed}, held {held}  still waiting {waiting}  told {st:?}");
         assert!(
             st.contains(&WriteState::Published),
             "ticks={ticks}: never published: {st:?}"
@@ -79,7 +85,8 @@ fn the_first_commit_gets_its_parity_with_or_without_a_tick_in_flight() {
         // end, so the same claim is that once everything has settled the page
         // is waiting on NO op — a put or a sign it made and never had answered.
         assert!(!waiting, "ticks={ticks}: the page is still waiting on an op it made");
-        assert!(puts > 0, "ticks={ticks}: no parity PUT after the publish");
+        assert!(listed > 0, "ticks={ticks}: the published root lists no parity: the test is empty");
+        assert_eq!(held, listed, "ticks={ticks}: the node holds {held} of the {listed} parity blocks the published root lists");
         assert!(
             st.contains(&WriteState::ParityComplete),
             "ticks={ticks}: published and never ParityComplete: {st:?}"

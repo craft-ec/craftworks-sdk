@@ -137,23 +137,6 @@ fn a_dropped_commit_too_large_to_carry_is_lost_and_the_engine_released() {
     assert_eq!(told(&next, 2), vec![State::Accepted], "the engine was not released");
 }
 
-/// CONTROL: acks lost but the puts LANDED. Settled by fact: confirmed from
-/// what the node holds, nothing re-put, published once the head is.
-#[test]
-fn a_commit_whose_acks_were_lost_publishes_by_fact_with_nothing_re_put() {
-    let p = Params::default();
-    let mut h = harness();
-    let first = h.step(write(1, large()));
-    let (at, fx) = tick_until(&mut h, 0, 2 * p.reask_after, 1);
-    assert!(puts(&fx).is_empty(), "a data put was repeated (at tick {at})");
-    assert!(
-        fx.iter().any(|f| matches!(f, Effect::UpdateHead { .. })),
-        "no head sent from fact by tick {at}"
-    );
-    let all = answer(&mut h, fx);
-    assert!(told(&all, 1).contains(&State::Published));
-    let _ = first;
-}
 
 /// E1: the head was sent and never landed -- the read back shows the OLDER
 /// seq. That is not a conflict: the same head is issued again, and the
@@ -231,22 +214,3 @@ fn answer_blocks_only(h: &mut Harness, mut fx: Vec<Effect>) -> Vec<Effect> {
     panic!("never settled");
 }
 
-/// A commit released `Lost` coded parity groups for a tree that never
-/// published: they are no longer owed.
-#[test]
-fn a_lost_commit_s_parity_groups_are_forgotten() {
-    let p = Params::default();
-    let mut h = harness();
-    // A write with values by reference, so it codes groups, too big to carry.
-    let ops: Vec<(Vec<u8>, Op)> = (0..64u32)
-        .map(|i| (format!("k/{i:05}").into_bytes(), Op::Put(vec![(i % 251) as u8; 1400])))
-        .collect();
-    let first = h.step(write(1, ops));
-    assert!(h.owed_groups() > 0, "the write coded no groups: the test is empty");
-    for id in puts(&first) {
-        h.store.forget(id);
-    }
-    let (_, fx) = tick_until(&mut h, 0, 2 * p.reask_after, 1);
-    assert_eq!(told(&fx, 1), vec![State::Lost]);
-    assert_eq!(h.owed_groups(), 0, "a Lost commit's groups are still owed");
-}

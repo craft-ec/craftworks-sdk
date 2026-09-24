@@ -114,7 +114,7 @@ fn drive(e: &mut Engine<Store>, first: Vec<Effect>) {
     for _ in 0..100_000 {
         let Some(f) = queue.pop() else { return };
         let next = match f {
-            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } | Effect::PutParity { id, .. } => Event::PutConfirmed(id),
+            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => Event::PutConfirmed(id),
             Effect::UpdateHead { seq, .. } => Event::HeadConfirmed(seq),
             _ => continue,
         };

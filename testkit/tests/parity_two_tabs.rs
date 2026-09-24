@@ -28,10 +28,21 @@ fn run(two: bool) -> (usize, usize, usize) {
             }
         }
     }
-    // THE CONTROL: before any tick has put the owed parity, a row does not
-    // claim to be backed up -- or `BACKED_UP` would be a constant.
+    // THE CONTROL: a row whose blocks the node has NOT acknowledged does not
+    // claim to be backed up -- or `BACKED_UP` would be a constant. Since race
+    // put (COMMIT-LIFE §P) the parity is acked in the commit's own round, so
+    // "before the tick" is no longer that moment; holding the node's answers is.
     a.sync();
-    let early = keys.iter().filter(|k| a.row_state(k) == RowState::BackedUp).count();
+    let held_key = b"n/held".to_vec();
+    conn_a.clone().hold_answers();
+    a.apply_batch(&[(held_key.clone(), Edit::Put(vec![9u8; 1500]))]).expect("taken");
+    a.sync();
+    let early = usize::from(a.row_state(&held_key) == RowState::BackedUp);
+    conn_a.clone().stop_holding();
+    while conn_a.held() > 0 {
+        let _ = conn_a.clone().release_one();
+    }
+    let keys: Vec<Vec<u8>> = keys.into_iter().chain(std::iter::once(held_key)).collect();
     let mut saving = 0;
     for _ in 0..40 {
         now += 1_000;
@@ -56,9 +67,9 @@ fn run(two: bool) -> (usize, usize, usize) {
 fn a_saved_row_whose_parity_is_on_the_network_says_backed_up_with_one_tab_and_two() {
     for two in [false, true] {
         let (backed_up, saving, early) = run(two);
-        println!("  two tabs={two}: {backed_up} of 120 rows BACKED_UP, {saving} still saving; {early} backed up before parity settled");
-        assert!(early < 120, "two={two}: every row claimed backed up before its parity was put: the state is a constant");
+        println!("  two tabs={two}: {backed_up} of 121 rows BACKED_UP, {saving} still saving; held row backed up early: {early}");
+        assert_eq!(early, 0, "two={two}: a row whose blocks the node never acknowledged claimed backed up: the state is a constant");
         assert_eq!(saving, 0, "two={two}: rows still saving after 40 s of ticks");
-        assert_eq!(backed_up, 120, "two={two}: rows whose parity was written do not say backed up");
+        assert_eq!(backed_up, 121, "two={two}: rows whose parity was written do not say backed up");
     }
 }

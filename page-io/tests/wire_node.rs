@@ -51,6 +51,9 @@ struct WireNode {
     /// answered EMPTY (as 0.2.136 answers a delegate it does not have), and
     /// a registration makes it present.
     empty_until_registered: bool,
+    /// The next this many GETs of the Register are answered with THIS older
+    /// state: a node serving its cached copy from before a publish (sdk#349).
+    stale_register: Option<(Vec<u8>, usize)>,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -91,6 +94,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            stale_register: None,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -119,6 +123,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            stale_register: None,
         }
     }
 
@@ -184,7 +189,14 @@ impl WireNode {
                 } else {
                     *self.served.entry("get block").or_default() += 1;
                 }
-                match self.contracts.get(&id).filter(|_| !failing) {
+                let stale = match &mut self.stale_register {
+                    Some((st, n)) if id == self.register_id && *n > 0 => {
+                        *n -= 1;
+                        Some(st.clone())
+                    }
+                    _ => None,
+                };
+                match stale.as_ref().or(self.contracts.get(&id)).filter(|_| !failing) {
                     Some(state) => {
                         let ckey = ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32]));
                         Some(ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -640,7 +652,11 @@ fn a_write_to_a_reader_reaches_nothing_and_never_publishes() {
         assert_eq!(node.served.get(k), before.get(k), "a reader's write made the node serve a {k}");
     }
     assert_eq!(node.head(), head, "a reader's write moved the publisher's head");
-    // And provisioning a reader is refused, not sent.
+    // And provisioning a reader is refused, not sent. Frames already queued
+    // (a block GET the write's apply asked for -- a READ, which a reader may
+    // make) are drained first, so what is checked is exactly what the
+    // provisioning call framed.
+    let _ = v.take_frames();
     let (container, _) = wire::delegate_from_code(SIGNER_CODE);
     // What was already queued is the view's own READS (nothing it may not
     // send); what `provision` adds is what this asks about.
@@ -868,17 +884,20 @@ fn an_empty_reply_to_the_query_is_no_answer_and_the_re_ask_opens() {
     assert!(node.served["signer"] >= 3, "the query was not asked again after the empty reply ({} signer requests)", node.served["signer"]);
 }
 
-/// And it is BOUNDED: a node that only ever answers empty ends the open BY
-/// NAME, never a silent wait.
+/// And an EMPTY reply, after this page registered the signer, is NOT an
+/// answer (#260): the page's sender keeps asking — no count ends it (rule 8,
+/// the old cap of three is gone) — the page says how long, and when the node
+/// answers properly the opening goes on.
 #[test]
-fn a_signer_that_only_answers_empty_is_named_not_waited_on() {
+fn a_signer_that_answers_only_empty_is_asked_on_and_opens_when_it_answers() {
     let key = [25u8; 32];
     let mut node = WireNode::unprovisioned(&key);
-    node.empty_signer_answers = usize::MAX;
+    node.empty_signer_answers = 50;
     let mut now = 1_000;
     let (io, _) = opening(&mut node, &mut now, &key, false);
-    assert!(!io.provisioned());
-    assert!(io.unusable().iter().any(|u| u.contains("answered its first request EMPTY")), "not named: {:?}", io.unusable());
+    assert_eq!(node.empty_signer_answers, 0, "the node did not answer empty 50 times: the case did not happen");
+    assert!(io.provisioned(), "fifty empty replies ended the open: {:?}", io.unusable());
+    assert!(io.unusable().iter().all(|u| !u.contains("EMPTY")), "an empty reply was reported as an end: {:?}", io.unusable());
 }
 
 /// EVERY NODE CALL ON THE RTO (the ruling since #227): a lost answer to the
@@ -918,20 +937,52 @@ fn a_lost_provisioning_answer_is_asked_again() {
     assert!(io.provisioned(), "a lost provisioning answer was never asked again: {:?}", node.served);
 }
 
-/// BOUNDED: a signer that never answers is asked a bounded number of times,
-/// then named "not answering" — never re-asked for ever, never a silent hang.
+/// NO CUT-OFF (rules 7, 8): a signer silent for FIVE MINUTES is asked again
+/// on the page's RTO the whole time — never given up, never named ended — the
+/// page says how long it has not answered, and when it answers at last the
+/// opening goes on. A fixed cut-off anywhere on this path fails this test.
 #[test]
-fn a_signer_that_never_answers_is_named_not_answering_and_not_asked_for_ever() {
+fn a_signer_silent_for_five_minutes_then_answering_is_never_given_up() {
     let key = [25u8; 32];
     let mut node = WireNode::unprovisioned(&key);
-    node.drop_signer_answers = 10_000;
-    let mut now = 1_000;
-    let (page, _) = opening(&mut node, &mut now, &key, false);
-    assert!(!page.provisioned());
-    assert!(page.unusable().iter().any(|u| u.starts_with("the signer is not answering")), "{:?}", page.unusable());
-    let asked = node.served["signer"];
-    assert!((2..=10).contains(&asked), "asked {asked} times within the budget");
-    assert!(now >= 1_000 + page::VERIFY_BUDGET_MS, "gave up before its budget, at {now}");
+    node.drop_signer_answers = usize::MAX;
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+    );
+    io.begin(container);
+    let mut now = 1_000u64;
+    let silent_until = now + 300_000;
+    let mut longest = 0;
+    while now < silent_until {
+        let frames = io.take_frames();
+        if frames.is_empty() {
+            let Some(Ms(t)) = io.next_due() else { break };
+            now = now.max(t).min(silent_until);
+            io.tick(Ms(now));
+            if let Some((_, ms)) = io.not_answering() {
+                longest = longest.max(ms);
+            }
+            continue;
+        }
+        now += 1;
+        for f in frames {
+            if let Some(a) = node.serve(&f) {
+                io.inbound(&a, Ms(now));
+            }
+        }
+    }
+    let asked = node.served.get("signer").copied().unwrap_or(0);
+    println!("silent 5 min: asked {asked} times, longest not answering {longest} ms, refused {:?}", io.refused());
+    assert!(!io.provisioned() && io.refused().is_none(), "a silent signer was ended: {:?}", io.refused());
+    assert!(asked >= 5, "the silent signer was asked only {asked} times in five minutes");
+    assert!(longest >= 290_000, "the page never said it had waited: {longest} ms");
+    assert!(io.unusable().iter().all(|u| !u.contains("not answering")), "a silence was reported as an END: {:?}", io.unusable());
+    // It answers at last: opening goes on.
+    node.drop_signer_answers = 0;
+    settle(&mut io, &mut node, &mut now);
+    assert!(io.needs_key(), "the signer answered after five minutes and the page did not take it: {:?}", node.served);
 }
 
 /// OPENING ENDS BY NAME (what `open()` reports): REFUSED — the signer's own
@@ -950,14 +1001,13 @@ fn opening_that_the_signer_refuses_is_refused_in_its_words() {
     settle(&mut io, &mut node, &mut now);
     assert!(!io.provisioned());
     assert!(io.refused().is_some_and(|r| r.contains("KeyAlreadyProvisioned")), "{:?}", io.refused());
-    assert!(!io.exhausted() && !io.stalled(), "a refusal is not also 'not answering' or 'still waiting'");
+    assert!(!io.stalled(), "a refusal is not also 'still waiting'");
 }
 
-/// ...EXHAUSTED when its re-asks are spent, and STALLED while it is still
-/// waiting past the first RTO — and neither once it is answered.
+/// STALLED while the opening is still waiting past its first RTO — and not
+/// once it is answered. (There is no "exhausted": nothing gives up.)
 #[test]
-fn opening_is_stalled_while_unanswered_and_exhausted_when_the_reasks_are_spent() {
-    // Stalled, stepped by hand: the first answer is lost.
+fn opening_is_stalled_while_unanswered_and_not_once_answered() {
     let key = [28u8; 32];
     let mut node = WireNode::unprovisioned(&key);
     node.drop_signer_answers = 1;
@@ -966,24 +1016,19 @@ fn opening_is_stalled_while_unanswered_and_exhausted_when_the_reasks_are_spent()
         Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
+    io.tick(Ms(1_000));
     io.begin(container);
     for f in io.take_frames() {
         if let Some(a) = node.serve(&f) { io.inbound(&a, Ms(1_000)); }
     }
-    io.tick(Ms(1_000)); // anchors the first exchange
+    let _ = io.take_frames(); // the first request, whose answer is lost
+    io.tick(Ms(1_000));
     assert!(!io.stalled(), "stalled before its first RTO");
-    io.tick(Ms(2_000)); // past it, and re-asked
+    io.tick(Ms(2_500)); // past it, re-sent by the page's sender
     assert!(io.stalled(), "not stalled past its first RTO, unanswered");
-    let mut now = 2_000;
+    let mut now = 2_500;
     settle(&mut io, &mut node, &mut now);
-    assert!(io.needs_key() && !io.stalled() && !io.exhausted(), "answered, and still stalled or exhausted");
-
-    // Exhausted: a signer that never answers.
-    let mut silent = WireNode::unprovisioned(&[29u8; 32]);
-    silent.drop_signer_answers = 10_000;
-    let mut now = 1_000;
-    let (page, _) = opening(&mut silent, &mut now, &[29u8; 32], false);
-    assert!(page.exhausted() && page.refused().is_none() && !page.stalled(), "exhausted {} refused {:?} stalled {}", page.exhausted(), page.refused(), page.stalled());
+    assert!(io.needs_key() && !io.stalled(), "answered, and still stalled");
 }
 
 /// sdk#259: page-io reports the head subscription AS IT IS — asked, answered,
@@ -1148,14 +1193,15 @@ fn asking_whose_node_registers_mints_and_provisions_nothing() {
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
 }
 
-/// A READER LEAVES NO TRACE, frame by frame: on a node without the signer
-/// (it answers EMPTY, as a real 0.2.136 node does), every frame the asking
-/// page sends is the Register QUERY, and none is a registration. And every
-/// EMPTY is an answer to a query: the page counts exactly as many as the node
-/// served. A page that took the first EMPTY for its signer's registration
-/// (the page never registered one) would ask one query more than it counts.
+/// ASKING LEAVES NO TRACE, frame by frame: on a node without the signer (it
+/// answers EMPTY, as a real 0.2.136 node does), the asking page sends the
+/// Register QUERY and nothing else — never a registration — and that one
+/// EMPTY IS the node's answer ("no signer here"): one query, one answer, done
+/// (rule 8: an answer ends it; no count, no clock). A page that took the
+/// EMPTY for its signer's registration (it never registered one) would ask
+/// the query a second time.
 #[test]
-fn asking_on_a_node_without_the_signer_sends_only_the_query_and_counts_every_empty_answer() {
+fn asking_on_a_node_without_the_signer_sends_one_query_and_takes_its_empty_answer() {
     let mut node = WireNode::unprovisioned(&[11u8; 32]);
     node.empty_signer_answers = usize::MAX;
     let mut io = asker();
@@ -1185,20 +1231,11 @@ fn asking_on_a_node_without_the_signer_sends_only_the_query_and_counts_every_emp
     assert!(sent.iter().all(|k| *k == "signer"), "asking sent a frame that is not the query: {sent:?}");
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
     assert!(!io.provisioned() && node.secrets.is_empty(), "asking provisioned the node");
+    // Named as a node with NO SIGNER: its own answer, not a refusal.
+    assert!(matches!(io.asked(), Some(page_io::Asked::NoSigner(_))), "a node without the signer was not named as one: {:?}", io.asked());
     let served = node.served.get("signer").copied().unwrap_or(0);
-    let counted = match io.asked() {
-        // Named as a node with NO SIGNER (its own answer, not a refusal), in
-        // words that count the EMPTY answers.
-        Some(page_io::Asked::NoSigner(w)) => w
-            .split("EMPTY ")
-            .nth(1)
-            .and_then(|r| r.split(' ').next())
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or_else(|| panic!("the answer does not say how many EMPTY answers: {w}")),
-        other => panic!("a node without the signer was not named as one: {other:?}"),
-    };
-    assert_eq!(counted, served, "the node answered {served} queries EMPTY and the page counted {counted}: an EMPTY was taken for something else");
-    assert_eq!(sent.len(), served, "frames sent {sent:?} against queries served {served}");
+    assert_eq!(served, 1, "the node answered EMPTY and was asked again ({served} queries): an EMPTY was taken for something else");
+    assert_eq!(sent, ["signer"], "frames sent: {sent:?}");
 }
 
 /// THE CONTROL: the page that OPENS (`begin`) does register the signer — so
@@ -1266,7 +1303,8 @@ fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
 }
 
 /// NOTHING IS CLAIMED ON AN ANSWER NOT HAD: before the signer answers, and
-/// when it never does, a claim says `false` and nothing is registered,
+/// while it stays silent (which ends nothing: rule 8), a claim says `false`
+/// and nothing is registered,
 /// minted or opened -- the runtime shows the inputs disabled, with why.
 #[test]
 fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
@@ -1279,7 +1317,12 @@ fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
     let mut now = 1_000;
     node.drop_signer_answers = usize::MAX;
     settle(&mut io, &mut node, &mut now);
-    assert_eq!(io.asked(), Some(&page_io::Asked::NotAnswering), "{:?}", io.unusable());
+    // RULE 8: silence is not an answer and ends nothing. The ask stays
+    // unanswered, the page says what it waits on, and nothing is claimed.
+    assert_eq!(io.asked(), None, "a silent signer was taken as an answer: {:?}", io.asked());
+    let (what, ms) = io.not_answering().expect("a silent signer, and the page does not say what it waits on");
+    assert!(what.contains("signer"), "the page names the wrong wait: {what}");
+    assert!(ms > 0, "the wait has no length");
     assert!(!io.claim(container), "a silent signer's page was claimed");
     assert!(!io.provisioned() && !io.needs_key(), "a refused claim opened or minted");
     assert_eq!(node.served.get("register delegate"), None, "a refused claim registered the signer");
@@ -1594,4 +1637,103 @@ fn with_no_tree_writes_wait_visible_and_provisioning_cuts_one_commit() {
         assert_eq!(heads, 1, "{case}: {heads} head writes: the held queue was not ONE commit");
         assert_eq!(node.head().map(|(s, _)| s), Some(1), "{case}: the head is not seq 1");
     }
+}
+
+/// THE PUBLISHED-HEAD FLOOR (sdk#349): a view opened with the seq its app was
+/// published at never adopts a head below it. The node first serves its
+/// cached copy from BEFORE the publish (seq 1); the view shows nothing from
+/// it -- no rows, not "empty" -- and says it is waiting for the published
+/// version, re-asking the head on its RTO (a GET with subscribe). When the
+/// node answers seq 2, the view reads it. Mutant "accept any head" (no
+/// floor) -> red: the view reads the pre-publish rows.
+#[test]
+fn a_view_never_adopts_a_head_below_its_published_seq() {
+    let mut node = WireNode::new(&[39u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "before", "v")), 1).contains(&WriteState::Published));
+    let before_publish = node.contracts[&node.register_id].clone();
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(2, "published", "v")), 2).contains(&WriteState::Published));
+    assert_eq!(node.head().map(|(s, _)| s), Some(2), "THE CONTROL: the published version is seq 2");
+
+    node.stale_register = Some((before_publish, usize::MAX));
+    let mut v = reader(&node);
+    v.server.page.set_head_floor(2);
+    let t0 = now;
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let early = rows(&mut v, &mut node, &mut now, 91);
+    println!("stale phase lasted {} s of page time", (now - t0) / 1000);
+    let asked = node.served.get("get register").copied().unwrap_or(0);
+    let wait = v.server.page.head_floor_wait();
+    println!("below the floor: rows {early:?}, head GETs {asked}, wait {wait:?}");
+    assert!(early.is_empty(), "the view showed rows {early:?} from a head below its published seq");
+    assert!(asked >= 2, "THE CONTROL: the head was not asked again while below the floor ({asked} GETs)");
+    assert!(matches!(wait, Some((2, Some(1), n)) if n >= 2), "the view does not say it waits for the published version: {wait:?}");
+
+    node.stale_register = None;
+    let mut read = Vec::new();
+    for q in 0..200u64 {
+        read = rows(&mut v, &mut node, &mut now, 100 + q);
+        if read == vec![2] {
+            break;
+        }
+        now += 1_000;
+        v.tick(Ms(now));
+    }
+    assert_eq!(read, vec![2], "the view did not read the published version once the node served it");
+    assert_eq!(v.server.page.head_floor_wait(), None, "the view still says it waits after adopting the published version");
+}
+
+/// THE FLOOR IS A SEQ, NOT A ROOT (sdk#349, #225b): a head AT the published
+/// seq is the published version whatever its root (a same-seq race may have
+/// replaced it), so it is read at once, with no wait. Mutant "strictly above
+/// the floor" -> red: the view waits for ever on the version it was given.
+#[test]
+fn a_head_at_the_published_seq_is_read_at_once() {
+    let mut node = WireNode::new(&[40u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for i in 1..=2u64 {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(i, &format!("k{i}"), "v")), i).contains(&WriteState::Published));
+    }
+    let mut v = reader(&node);
+    v.server.page.set_head_floor(2);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert_eq!(rows(&mut v, &mut node, &mut now, 92), vec![2], "a head at the published seq was not read");
+    assert_eq!(v.server.page.head_floor_wait(), None, "a view at its published seq says it is still waiting");
+}
+
+/// WHAT A PUBLISHER RECORDS AS ITS APP'S FLOOR IS THE ACKNOWLEDGED SEQ
+/// (sdk#349, the architect's condition): with a second commit in flight --
+/// signed and UPDATEd, its read-back not yet showing it -- `published_seq`
+/// is still the FIRST commit's, so a publish at that moment never names a
+/// head that may not land. Once the register shows it, it moves. Mutant
+/// "the in-flight commit's seq" -> red.
+#[test]
+fn published_seq_is_the_acknowledged_head_never_one_in_flight() {
+    let mut node = WireNode::new(&[41u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "first", "v")), 1).contains(&WriteState::Published));
+    assert_eq!(a.published_seq(), 1);
+    // The register's reads fail: the second commit is signed and UPDATEd, and
+    // its read-back never shows it.
+    node.fail_register_gets = usize::MAX;
+    let r = client(&mut a, &mut node, &mut now, &write(2, "second", "v"));
+    assert!(!states(&r, 2).contains(&WriteState::Published), "THE CONTROL: the second commit was acknowledged anyway");
+    assert_eq!(node.head().map(|(s, _)| s), Some(2), "THE CONTROL: the second commit's head is not on the node");
+    assert_eq!(a.published_seq(), 1, "the publisher's seq moved to a commit the network has not acknowledged");
+    node.fail_register_gets = 0;
+    let mut st = Vec::new();
+    for _ in 0..100 {
+        if st.contains(&WriteState::Published) { break; }
+        now += 1_000;
+        a.tick(Ms(now));
+        st.extend(states(&settle(&mut a, &mut node, &mut now), 2));
+    }
+    assert!(st.contains(&WriteState::Published), "the second commit never published: {:?}", a.unusable());
+    assert_eq!(a.published_seq(), 2, "the acknowledged seq did not move with the read-back");
 }

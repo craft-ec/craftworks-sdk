@@ -114,7 +114,6 @@ struct Rerun {
     /// earlier re-runs alike): ONE budget, the engine's `max_write_tries`
     /// (sdk#265). `Db` keeps no count of its own.
     tries: u32,
-    deadline_ms: u64,
 }
 
 /// What a re-run could NOT keep (sdk#143/#144), for the app to tell.
@@ -531,23 +530,23 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     ///
     /// The host calls this on its tick: it answers what must be LOADED before
     /// it can go on (the copy forgot the conflicted keys) and what it could not
-    /// keep. A wait for a load is bounded by `wait_ms`, the LOAD PATH's own
-    /// budget (the host passes it: one timeout, not two); the chain's re-runs
-    /// by the ONE budget of tries every write has, the engine's (sdk#265): a
-    /// re-run is a try, drawn on from what the chain had already spent.
+    /// keep. A wait for a load ENDS on the node's answer, never on time (rule
+    /// 8); the chain's re-runs are bounded by the ONE budget of tries every
+    /// write has, the engine's (sdk#265): a re-run is a try, drawn on from
+    /// what the chain had already spent.
     ///
     /// Stated residual (the architect's #5): "unchanged" is per field, current
     /// against the value this write read. Another writer changing a field and
     /// changing it BACK across two of its writes reads as unchanged, and this
     /// patch then wins over their final value.
-    pub fn rerun(&mut self, now_ms: u64, wait_ms: u64) -> RerunStep {
+    pub fn rerun(&mut self) -> RerunStep {
         let mut step = RerunStep::default();
         for chain in self.store.take_conflict_chains() {
             let ops: std::collections::VecDeque<(u64, Op)> =
                 chain.write_ids.iter().filter_map(|id| self.ops.remove(id).map(|op| (*id, op))).collect();
             if !ops.is_empty() {
                 step.taken.extend(ops.iter().map(|(id, _)| *id));
-                self.reruns.push_back(Rerun { ops, tries: chain.tries, deadline_ms: now_ms + wait_ms });
+                self.reruns.push_back(Rerun { ops, tries: chain.tries });
             }
         }
         // What is no longer pending and did not conflict ended: forget it.
@@ -557,12 +556,10 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         while let Some(mut r) = self.reruns.pop_front() {
             match self.rerun_chain(&mut r, &mut step) {
                 Ok(()) => {}
-                Err(()) if now_ms < r.deadline_ms => waiting.push_back(r),
-                Err(()) => {
-                    for (id, _) in r.ops {
-                        step.events.push(RerunEvent::Failed { write_id: id, reason: "the record could not be read again in time".into() });
-                    }
-                }
+                // Waiting for a load: it ENDS on the node's answer (a record
+                // that cannot be had fails by name, above) — never on time
+                // (rule 8).
+                Err(()) => waiting.push_back(r),
             }
         }
         self.reruns = waiting;

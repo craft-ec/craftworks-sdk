@@ -12,7 +12,7 @@
 //!   above are the repair's, not a network that still had the block.
 
 use engine::read::{ReadResult, ReqId};
-use engine::{ClientId, Effect, Engine, Event, Params};
+use engine::{ClientId, Effect, Engine, Event, Params, PARITY};
 use freenet_prolly::node::Node;
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
@@ -47,8 +47,8 @@ fn a_leaf_group(all: &mut MemBlocks, root: Cid) -> (Vec<Cid>, Vec<Cid>) {
             }
             let groups = freenet_prolly::parity::group_members(&n);
             let (g, (_, members)) = groups.into_iter().enumerate().max_by_key(|(_, (_, m))| m.len()).expect("a group");
-            assert!(ids.len() >= 3 * (g + 1), "the node lists no parity for its groups: pcount {}", ids.len());
-            return (members, ids[3 * g..3 * g + 3].to_vec());
+            assert!(ids.len() >= PARITY * (g + 1), "the node lists no parity for its groups: pcount {}", ids.len());
+            return (members, ids[PARITY * g..PARITY * (g + 1)].to_vec());
         }
         at = n.child(0).0;
     }

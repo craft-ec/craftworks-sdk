@@ -7,6 +7,8 @@
 
 use engine::{ClientId, Effect, Event, Op, Params, State, WriteId};
 
+use freenet_prolly::Cid;
+
 mod common;
 use common::{Harness, Mode, Store};
 
@@ -124,49 +126,59 @@ fn a_real_change_is_not_published_without_its_head() {
     );
 }
 
-/// ParityComplete only when TRUE. A no-op made while the published tree's
-/// parity is still owed -- a re-send after a lost `Published`, the shortcut's
-/// main customer -- waits on those groups and hears it with the write that
-/// coded them. Executed by the architect on #164: told ParityComplete at once
-/// while three parity puts were still to come.
+/// ParityComplete only when TRUE. A no-op made while the published tree still
+/// has a STRAGGLER out (race put, COMMIT-LIFE §P: the head signs at k of k+m)
+/// waits for it and hears ParityComplete when it lands. Executed by the
+/// architect on #164: told ParityComplete at once while parity puts were
+/// still to come.
 #[test]
 fn a_no_op_while_parity_is_owed_is_parity_complete_only_when_it_is() {
-    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    // LIVE: the page's engine, which keeps its Backing in memory across calls
+    // (the architect's correction (c): never in the context). A RELOAD loses
+    // the stragglers by design -- COMMIT-LIFE §P's stated residual, which the
+    // keeper covers -- so this is not a Rehydrate question.
+    let mut h = Harness::new(Mode::Live, Params::default(), Store::fresh());
     let big = vec![7u8; 30 * 1024];
-    // No tick yet: published, and its parity still owed.
+    // Write 1: every block acked but ONE parity block -- published (its group
+    // is recoverable), not backed up.
     let first = h.step(write(1, b"k/big", &big));
-    let all = settle(&mut h, first);
-    assert_eq!(states(&all, 1), vec![State::Accepted, State::Published]);
+    let parity: Vec<Cid> = first
+        .iter()
+        .filter_map(|f| match f {
+            Effect::PutBlock { id, bytes, .. } if freenet_prolly::block_id(freenet_prolly::kind::PARITY, bytes) == *id => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert!(!parity.is_empty(), "write 1 put no parity: there is nothing to hold back");
+    let held = parity[0];
+    let mut all = first.clone();
+    for f in &first {
+        if let Effect::PutBlock { id, .. } = f {
+            if *id != held {
+                all.extend(h.step(Event::PutConfirmed(*id)));
+            }
+        }
+    }
+    if let Some(seq) = all.iter().find_map(|f| match f {
+        Effect::UpdateHead { seq, .. } => Some(*seq),
+        _ => None,
+    }) {
+        all.extend(h.step(Event::HeadConfirmed(seq)));
+    }
+    assert_eq!(states(&all, 1), vec![State::Accepted, State::Published], "write 1 with a straggler out");
 
     let again = h.step(write(2, b"k/big", &big));
     assert_eq!(
         states(&again, 2),
         vec![State::Accepted, State::Published],
-        "a no-op was told ParityComplete while the tree's parity is still owed"
+        "a no-op was told ParityComplete while the tree's parity is still out"
     );
     assert_eq!(to_node(&again), 0);
 
-    // Time passes and the node answers the parity puts.
-    let mut later = Vec::new();
-    for t in 1..=40 {
-        let out = h.step(Event::Tick(1_790_000_000 + t));
-        for f in &out {
-            if let Effect::PutParity { id, .. } = f {
-                later.extend(h.step(Event::PutConfirmed(*id)));
-            }
-        }
-        later.extend(out);
-    }
-    assert!(
-        states(&later, 1).contains(&State::ParityComplete),
-        "{:?}",
-        states(&later, 1)
-    );
-    assert_eq!(
-        states(&later, 2),
-        vec![State::ParityComplete],
-        "the no-op never heard ParityComplete once the parity landed"
-    );
+    // The straggler lands.
+    let later = h.step(Event::PutConfirmed(held));
+    assert!(states(&later, 1).contains(&State::ParityComplete), "{:?}", states(&later, 1));
+    assert_eq!(states(&later, 2), vec![State::ParityComplete], "the no-op never heard ParityComplete once the parity landed");
 }
 
 /// A CONTROL, named because it is a door: a write BACK to an earlier value

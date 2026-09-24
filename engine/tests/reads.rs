@@ -897,8 +897,6 @@ fn no_read_sequence_panics_and_every_read_answers() {
                 max_commit_blocks: 16,
                 max_carried_ops_bytes: 2 * 1024,
                 max_subscriptions: 4,
-                max_owed_groups: 16,
-                max_parity_waiting_refs: 16,
                 shell_context_reserve: 2 * 1024,
                 min_parked_read_bytes: 4 * 1024,
                 ..Params::default()

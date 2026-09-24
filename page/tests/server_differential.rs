@@ -173,6 +173,9 @@ struct Faults {
     lose_first_put_answers: bool,
     /// The first GET of each block goes unanswered.
     lose_first_gets: bool,
+    /// Each PARITY block's first put lands and its answer is lost (race put's
+    /// STRAGGLER: the data acks, the head signs, the parity is re-sent).
+    lose_first_parity_answers: bool,
     /// The signer fails to save its record on the first sign.
     record_not_saved_once: bool,
     /// Hold every answer (FullNode's `hold_answers`).
@@ -308,7 +311,8 @@ impl PageRig {
         Some(match op {
             Op::Put { id, bytes } => {
                 node.put(id, &bytes);
-                if self.faults.lose_first_put_answers && self.put_once.insert(id) {
+                let parity = freenet_prolly::block_id(freenet_prolly::kind::PARITY, &bytes) == id;
+                if (self.faults.lose_first_put_answers || (self.faults.lose_first_parity_answers && parity)) && self.put_once.insert(id) {
                     return None;
                 }
                 Answer::PutOk(id)
@@ -343,6 +347,7 @@ impl PageRig {
             Op::ReadHead => Answer::Head(node.head_read()),
             Op::AskHeld { id } => Answer::Held { id, present: node.blocks.contains_key(&id) },
             Op::PutApp { key } => Answer::AppPutOk(key),
+            Op::Ext(_) => return None,
         })
     }
 }
@@ -459,6 +464,28 @@ fn a_lost_put_answer_publishes_once_the_node_answers() {
     let kv = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
     assert_eq!(tree_of(&node, &root), BTreeMap::from([kv("a", "1"), kv("b", "2")]));
     assert!(!rig.put_once.is_empty(), "no put answer was lost: the fault never fired");
+}
+
+/// RACE PUT's STRAGGLER (COMMIT-LIFE §P gate): every parity block's first
+/// answer is lost, so the data acks and the head signs with the parity still
+/// out -- SAVED, not BACKED_UP. The page re-sends each straggler on its RTO
+/// (stall retry is the standard; nothing stops at the sign), and the write
+/// reaches BACKED_UP.
+#[test]
+fn a_straggler_dropped_after_the_sign_is_re_sent_and_reaches_backed_up() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.faults.lose_first_parity_answers = true;
+    rig.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..400).map(|i| (format!("k/{i:04}"), format!("value {i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    let st = states(&rig.client_as(&mut node, &write(1, &ops)), 1);
+    let pub_at = st.iter().position(|s| *s == WriteState::Published);
+    let backed_at = st.iter().position(|s| *s == WriteState::ParityComplete);
+    assert!(!rig.put_once.is_empty(), "no parity answer was lost: the fault never fired (no parity coded?)");
+    assert!(pub_at.is_some(), "the write never published: {st:?}");
+    assert!(backed_at.is_some(), "the stragglers were never re-sent to BACKED_UP: {st:?} ({} parity answer(s) lost)", rig.put_once.len());
+    assert!(pub_at < backed_at, "BACKED_UP before SAVED: {st:?}");
 }
 
 /// A COLD read: the rows are only on the network, and the page's first GET of
@@ -609,11 +636,14 @@ fn a_same_key_displacement_is_adopted_on_the_page() {
     assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
     let (seq, mine) = node.head().expect("published");
     let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
-    // The other device's REAL tree, whose root WINS the equal-seq rule (the
-    // lower BLAKE3 of the value): the fork would otherwise be invisible to
-    // the signer's read, and a fake root would leave nothing to build on.
-    let beats = |a: &Cid, b: &Cid| blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes();
-    let winner = (0u32..512).map(|salt| sibling_root(&mut node, salt)).find(|r| beats(r, &mine)).expect("some tree wins");
+    // The other device's REAL tree, whose head WINS the equal-seq rule (the
+    // lower BLAKE3 of the whole VALUE -- root AND ledger: this page's head
+    // carries a ledger, the other's is a bare root): the fork would otherwise
+    // be invisible to the signer's read, and a fake root would leave nothing
+    // to build on.
+    let mine_value = node.head_read().expect("read").value().to_vec();
+    let _ = mine;
+    let winner = (0u32..512).map(|salt| sibling_root(&mut node, salt)).find(|r| page::beats(r.as_slice(), &mine_value)).expect("some tree wins");
     let other = contract_keys::register::head_state(&node.register_params, &key, seq, &winner).expect("signs");
     node.update(&other);
     assert_eq!(node.head(), Some((seq, winner)), "the winner did not take the register");
@@ -893,6 +923,8 @@ impl Tab {
                     }
                     match how {
                         Some(craftworks_sdk::Ended::Loaded) => self.db.store_mut().resume(t),
+                        // As `engine-db.js`: the whole chain again, unpinned, at the head.
+                        Some(craftworks_sdk::Ended::Superseded) => {}
                         _ => return Err(e),
                     }
                 }
@@ -1467,9 +1499,8 @@ fn settle(tab: &mut Tab, rig: &mut PageRig, node: &mut Node) -> (Vec<craftworks_
     for _ in 0..12 {
         tab.lend(rig, node, |db| db.store_mut().sync());
         tab.pump(rig, node);
-        let now = rig.now;
         let step = tab.lend(rig, node, |db| {
-            let step = db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS);
+            let step = db.rerun();
             // A re-run that stopped on blocks walks again on the next tick.
             db.store_mut().take_ticket();
             db.store_mut().unpin();
@@ -1612,8 +1643,7 @@ fn a_record_changed_under_every_re_run_fails_named_after_the_budget() {
         tab.pump(&mut rig, &mut node);
         // Its re-run is made behind the next commit in flight...
         commit_in_flight(&mut rig, &mut node, 2_001 + round);
-        let now = rig.now;
-        let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
+        let step = tab.lend(&mut rig, &mut node, |db| db.rerun());
         events.extend(step.events);
         // ...and changed again before it lands.
         interfere(&mut tab, &mut rig, &mut node, &mut other_id);
@@ -1693,8 +1723,7 @@ fn a_write_never_gets_more_than_the_one_budget_across_re_sends_and_re_runs() {
         tab.lend(&mut rig, &mut node, |db| db.store_mut().sync());
         tab.pump(&mut rig, &mut node);
         commit_in_flight(&mut rig, &mut node, 3_001 + round);
-        let now = rig.now;
-        let step = tab.lend(&mut rig, &mut node, |db| db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS));
+        let step = tab.lend(&mut rig, &mut node, |db| db.rerun());
         events.extend(step.events);
         let theirs = note(&node, 10 + round);
         elsewhere(&mut rig, &mut node, 10 + round, vec![protocol::Op::Put(key.clone(), theirs)]);
@@ -2297,4 +2326,120 @@ fn a_delta_whose_block_is_silent_waits_and_is_answered_the_delta() {
         other => panic!("the node answered again and the delta was answered {other:?} ({sent} GETs while silent)"),
     }
     println!("  delta over 5 min of silence: {sent} GETs, no answer; node answers -> the Delta");
+}
+
+// ---- SUPERSEDED READS (#330 ruling): a read pinned to a root nobody serves moves on at a newer head ----
+
+/// A tab's point read of `key`, decided as a page decides it.
+fn decided_get(tab: &mut Tab, rig: &mut PageRig, node: &mut Node, key: &[u8]) -> craftworks_sdk::Outcome<Option<Vec<u8>>> {
+    tab.lend(rig, node, |db| {
+        let r = craftworks_sdk::store::Reads::get(db.store_mut(), key).map_err(|e| match e {
+            craftworks_sdk::store::StoreError::NotLoaded => craftworks_sdk::DbError::NotLoaded { lo: key.to_vec(), hi: key.to_vec() },
+            other => craftworks_sdk::DbError::Refused(other.to_string()),
+        });
+        db.store_mut().decide(r)
+    })
+}
+
+/// 600 rows published by one page, and a READER tab on a fresh page of the same node (session `off`), its `silent`
+/// set before it opens.
+fn published_rows_and_reader(off: u64, silent: impl FnOnce(&Node) -> std::collections::BTreeSet<Cid>) -> (Node, PageRig, Tab) {
+    let mut node = Node::new();
+    let mut w = PageRig::new();
+    w.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..600u32).map(|i| (format!("k/{i:06}"), format!("value {i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    assert!(published(&states(&w.client_as(&mut node, &write(1, &ops)), 1)), "the write did not publish");
+    let mut rig = PageRig::new();
+    rig.session = SESSION + off;
+    rig.silent = silent(&node);
+    let tab = Tab::open(&mut rig, &mut node);
+    (node, rig, tab)
+}
+
+/// Another device moves the head (a row of its own), and the page hears it.
+fn move_head(rig: &mut PageRig, node: &mut Node, salt: u32) {
+    elsewhere(rig, node, 0, vec![protocol::Op::Put(format!("x/{salt:06}").into_bytes(), b"theirs".to_vec())]);
+    rig.server.head_hint();
+}
+
+/// **A READ PINNED TO A ROOT WHOSE BLOCK NEVER COMES MOVES ON AT A NEWER HEAD** (#330's realnet regression, measured:
+/// A's view parked for 347 s on seq 74's root block, silent then NotFound, while seq 75 and 76 were readable). The
+/// node is SILENT about the published root: the read waits on it — nothing ends it, no clock (rule 8). Another
+/// device moves the head: the read, pinned to the old root with nothing arrived, ends SUPERSEDED, and the chain runs
+/// again unpinned at the new head, where it answers — the row, and the other device's row with it.
+#[test]
+fn a_read_pinned_to_a_root_whose_block_never_comes_moves_on_at_a_newer_head() {
+    let (mut node, mut rig, mut tab) = published_rows_and_reader(71, |n| n.head().map(|h| h.1).into_iter().collect());
+    let t = match decided_get(&mut tab, &mut rig, &mut node, b"k/000321") {
+        craftworks_sdk::Outcome::Wait(_, t) => t,
+        other => panic!("THE SETUP: the read over a silent root did not wait: {other:?}"),
+    };
+    tab.pump(&mut rig, &mut node);
+    assert_eq!(tab.ended.get(&t), None, "a read over a silent root ENDED with no newer head (a clock?)");
+    move_head(&mut rig, &mut node, 1);
+    tab.pump(&mut rig, &mut node);
+    assert_eq!(tab.ended.get(&t), Some(&craftworks_sdk::Ended::Superseded), "a newer head did not move the stuck read on");
+    assert_eq!(tab.get(&mut rig, &mut node, b"k/000321"), Some(b"value 321".to_vec()), "the chain again, at the new head");
+    assert_eq!(tab.get(&mut rig, &mut node, b"x/000001"), Some(b"theirs".to_vec()), "the read is not at the new head");
+}
+
+/// A point read as a page makes it, on a SLOW node: every GET is held and answered only at a step for which
+/// `answer_at(step)` is true; after each step's answers another device moves the head. Returns the value and how
+/// many times the chain was superseded. At most `steps` steps.
+fn read_under_moving_heads(tab: &mut Tab, rig: &mut PageRig, node: &mut Node, key: &[u8], steps: u32, answer_at: impl Fn(u32) -> bool) -> (Option<Option<Vec<u8>>>, u32) {
+    rig.faults.hold_gets = true;
+    let (mut step, mut superseded) = (0u32, 0u32);
+    loop {
+        let t = match decided_get(tab, rig, node, key) {
+            craftworks_sdk::Outcome::Done(v) => return (Some(v), superseded),
+            craftworks_sdk::Outcome::Told(e) => panic!("the read was told {e:?}"),
+            craftworks_sdk::Outcome::Wait(_, t) => t,
+        };
+        loop {
+            if step >= steps {
+                return (None, superseded);
+            }
+            step += 1;
+            if answer_at(step) {
+                for op in std::mem::take(&mut rig.held) {
+                    if let Some(a) = rig.answer(node, op) {
+                        rig.server.node(a, Ms(rig.now));
+                    }
+                }
+            }
+            move_head(rig, node, 1_000 + step);
+            tab.lend(rig, node, |db| db.store_mut().sync());
+            match tab.ended.remove(&t) {
+                None => continue,
+                Some(craftworks_sdk::Ended::Loaded) => tab.db.store_mut().resume(t),
+                Some(craftworks_sdk::Ended::Superseded) => superseded += 1,
+                Some(other) => panic!("the read ended {other:?}"),
+            }
+            break;
+        }
+    }
+}
+
+/// **A READ RECEIVING BLOCKS FINISHES ON ITS TREE, HOWEVER FAST THE HEAD MOVES** (#330 ruling, progress-based). Every
+/// block is there, one step late; the head moves at EVERY step. Each step brings the read a block, so it is never
+/// superseded, and it answers. (The mutant "supersede on any GET in flight" restarts it at every head: it never
+/// answers.)
+#[test]
+fn a_read_receiving_blocks_finishes_on_its_tree_under_fast_heads() {
+    let (mut node, mut rig, mut tab) = published_rows_and_reader(72, |_| Default::default());
+    let (v, superseded) = read_under_moving_heads(&mut tab, &mut rig, &mut node, b"k/000321", 40, |_| true);
+    assert_eq!(v, Some(Some(b"value 321".to_vec())), "the read did not answer in 40 steps with the head moving at each ({superseded} superseded)");
+    assert_eq!(superseded, 0, "a read that received a block at every step was superseded");
+}
+
+/// **SLOWER BLOCKS, THE SAME HEADS: THE READ STILL ANSWERS.** Blocks come every OTHER step, the head moves at every
+/// one. A (re)started read with nothing arrived yet is superseded at the next head (that is the fix), and once its
+/// first block has come it finishes on its tree. (Under "supersede on any GET in flight" it never answers.)
+#[test]
+fn a_read_with_slow_blocks_still_answers_under_fast_heads() {
+    let (mut node, mut rig, mut tab) = published_rows_and_reader(73, |_| Default::default());
+    let (v, superseded) = read_under_moving_heads(&mut tab, &mut rig, &mut node, b"k/000321", 60, |s| s % 2 == 0);
+    assert_eq!(v, Some(Some(b"value 321".to_vec())), "the read did not answer in 60 steps ({superseded} superseded)");
+    println!("  slow blocks, a head per step: answered after {superseded} supersede(s)");
 }

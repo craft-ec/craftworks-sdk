@@ -1,12 +1,12 @@
 //! THE PARITY ROWS, ON THE PAGE PATH (re-stated from the Shell's
 //! `what_a_flush_causes.rs`, deleted with the Shell).
 //!
-//! Parity is owed per GROUP, and a group is a trio listed by a tree NODE — so
-//! it needs a node with enough children (ARCHITECTURE §7: 7–12, mean ~9,
-//! three parity blocks). This grows the tree until the engine actually owes
-//! something, ASSERTS that it does, and only then measures what a `Tick` and
-//! a `Flush` cause — through a real tab (`page::Server` over the page path's
-//! node), counting the block PUTs the node served.
+//! Parity is per GROUP, and a group is a trio listed by a tree NODE, so it
+//! needs a node with enough children (ARCHITECTURE §7: 7–12, mean ~9, three
+//! parity blocks). Since race put (COMMIT-LIFE §P) a commit puts its groups'
+//! parity in the SAME round as its data; this grows a tree with groups and
+//! measures, through a real tab, that a commit carries its parity and that a
+//! `Tick` or a `Flush` afterwards puts nothing.
 
 use testkit::page_node::Served;
 use testkit::{PageConn, PageNode};
@@ -18,108 +18,79 @@ fn write(n: u64) -> protocol::Request {
     protocol::Request::forced_write(n, vec![protocol::Op::Put(format!("k/{n:06}").into_bytes(), vec![(n % 251) as u8; 512])])
 }
 
-fn owed(c: &PageConn) -> usize {
-    c.with_server(|s| s.page.owed_groups())
-}
-
 fn puts(c: &PageConn) -> usize {
     c.served(Served::Put)
 }
 
-/// A tab, and the tree grown until its engine owes at least one group (or
-/// `None`). Returns how many records it took, so the cost of reaching the
-/// condition is reported rather than hidden.
-fn grow_until_owed(cap: u64) -> (PageConn, Option<u64>) {
+/// A tab over a tree of `n` records: deep enough (a branch over leaves) that
+/// a commit changes a GROUP, which is what carries parity.
+fn grown(n: u64) -> PageConn {
     let node = PageNode::new();
     let mut c = node.connect();
     c.client(&protocol::Request::Identity);
-    for i in 1..=cap {
+    for i in 1..=n {
         c.client(&write(i));
-        if owed(&c) > 0 {
-            return (c, Some(i));
-        }
     }
-    (c, None)
+    c
 }
 
-/// **THE MEASUREMENT.** What a Tick and a Flush cause once something IS owed:
-/// nothing with no time sent, a PUT with a tick past `parity_age`, a PUT with
-/// a Flush whatever the age.
+/// **PARITY RIDES THE COMMIT** (COMMIT-LIFE §P, race put): a commit that
+/// changes a group puts that group's 3 parity blocks IN THE SAME ROUND as its
+/// data, so there is nothing left for a Tick or a Flush to put. Before §P the
+/// parity was OWED after the head and paced by Tick/Flush; these rows measured
+/// that machinery, which is gone.
 #[test]
 fn the_parity_rows() {
-    let (c, records) = grow_until_owed(400);
-    let Some(records) = records else {
-        panic!(
-            "400 records of 512 B owed no parity group at all. The rows this \
-             file exists to measure still cannot be measured, and reporting a \
-             zero for them would say 'a Tick causes nothing' when the truth is \
-             'nothing was owed'."
-        );
-    };
-    println!("\n  reached the condition: {records} records, {} group(s) owed", owed(&c));
-
-    // With NO time and NO flush: asking about a write again costs no put.
-    let (mut quiet, _) = grow_until_owed(400);
-    let before = puts(&quiet);
-    quiet.client(&protocol::Request::AskWrite { write_id: 1 });
-    let no_time = puts(&quiet) - before;
-
-    // With a TICK well past `parity_age`: the page's clock AND the SDK's Tick.
-    let (mut ticked, _) = grow_until_owed(400);
-    let before = puts(&ticked);
-    let t = ticked.now_ms() + 10_000_000;
-    ticked.tick_at(t);
-    let with_tick = puts(&ticked) - before;
-
-    // With a FLUSH: every group, whatever its age.
-    let (mut flushed, _) = grow_until_owed(400);
-    let before = puts(&flushed);
-    flushed.client(&protocol::Request::Flush);
-    let with_flush = puts(&flushed) - before;
-
+    let mut c = grown(400);
+    // One more commit, in a tree with groups: at least the changed path
+    // (root and leaf, 2) plus the leaf group's 3 parity.
+    let before = puts(&c);
+    c.client(&write(401));
+    let commit = puts(&c) - before;
+    // With NO time, with a TICK well past any age, with a FLUSH: nothing more.
+    let before = puts(&c);
+    c.client(&protocol::Request::AskWrite { write_id: 401 });
+    let no_time = puts(&c) - before;
+    let t = c.now_ms() + 10_000_000;
+    c.tick_at(t);
+    let with_tick = puts(&c) - before - no_time;
+    c.client(&protocol::Request::Flush);
+    let with_flush = puts(&c) - before - no_time - with_tick;
+    println!("\n  400 records; one commit put {commit} block(s)");
     println!("  behaviour            | no time | with tick | with flush");
     println!("  ---------------------|---------|-----------|-----------");
     println!("  puts caused          | {no_time:<7} | {with_tick:<9} | {with_flush}");
-
-    assert_eq!(no_time, 0, "owed parity went out with no time sent at all, so it does not need a Tick and the table is wrong about it");
-    assert!(with_tick > 0, "a Tick well past parity_age caused no put, though a group was owed: the redundancy would never be written");
-    assert!(with_flush > 0, "a Flush caused no put though a group was owed: closing a tab would leave the redundancy unwritten");
+    assert!(commit >= 5, "a commit in a tree with groups put {commit} block(s): its group's parity did not ride the commit (§P)");
+    assert_eq!((no_time, with_tick, with_flush), (0, 0, 0), "a put after the commit: parity is still being paid later instead of in the commit's round");
 }
 
-/// **AND IT STOPS.** A group that has been put is not put again: after its
-/// parity is put and acknowledged it is no longer owed, and the next ticks put
-/// nothing.
+/// **AND IT STOPS.** A published commit whose blocks are all acked is not put
+/// again by later ticks.
 #[test]
 fn a_settled_group_is_not_put_again() {
-    let (mut c, records) = grow_until_owed(400);
-    let records = records.expect("a group forms");
+    let mut c = grown(400);
+    c.client(&write(401));
     let t0 = c.now_ms() + 10_000_000;
     let before = puts(&c);
     c.tick_at(t0);
-    let first = puts(&c) - before;
-    let owed_after_first = owed(&c);
     c.tick_at(t0 + 10_000_000);
-    let second = puts(&c) - before - first;
     c.tick_at(t0 + 20_000_000);
-    let third = puts(&c) - before - first - second;
-    println!("\n  {records} records; puts per tick: {first}, {second}, {third} (owed after the first: {owed_after_first})");
-    assert!(first > 0, "the first tick put nothing: see `the_parity_rows`");
-    assert_eq!(owed_after_first, 0, "the group is still owed after its parity was put AND acknowledged: it can never settle");
-    assert_eq!((second, third), (0, 0), "a settled group was put again on the next tick ({second}) and the one after ({third})");
+    assert_eq!(puts(&c) - before, 0, "an acked commit's blocks were put again by later ticks");
 }
 
-/// The control: with nothing owed, the same tick and flush cause nothing. This
-/// pins the cause to the OWED GROUP rather than to the tick.
+/// The control: a tree that is ONE leaf has no groups, so its commit puts ONE
+/// block and no parity. This pins the extra puts above to the GROUP.
 #[test]
 fn nothing_owed_puts_nothing() {
     let node = PageNode::new();
     let mut c = node.connect();
     c.client(&protocol::Request::Identity);
-    c.client(&write(1));
-    assert_eq!(owed(&c), 0, "the control needs an engine owing nothing");
     let before = puts(&c);
+    c.client(&write(1));
+    let commit = puts(&c) - before;
     let t = c.now_ms() + 10_000_000;
     c.tick_at(t);
     c.client(&protocol::Request::Flush);
-    assert_eq!(puts(&c) - before, 0, "a Tick and a Flush caused puts with no group owed, so the puts the other tests count are not evidence of parity");
+    assert_eq!(commit, 1, "a one-leaf tree's commit put {commit} block(s): parity with no group to code");
+    assert_eq!(puts(&c) - before, 1, "a Tick and a Flush caused puts with nothing owed");
 }

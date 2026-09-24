@@ -72,6 +72,8 @@ fn drive_slow(
                     }
                 }
                 Op::ReadHead => Some(Answer::Head(node.head.map(Into::into))),
+                // Page-io's own requests (signer, register): not this test's subject.
+                Op::Ext(_) => None,
                 Op::Sign { id, seq, root, .. } => {
                     node.head = Some((seq, root));
                     let record = [seq.to_le_bytes().as_slice(), &root].concat();

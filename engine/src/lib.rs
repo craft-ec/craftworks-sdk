@@ -51,7 +51,7 @@
 //!   three blocks went out on every tick for ever;
 //! * the delegate scheduler's `confirmed` set (sdk#83) — not engine state,
 //!   but the same rule one layer out. It learns what the node holds from
-//!   acks in THIS call, so a `PutParity` gated `after: [published_root]` was
+//!   acks in THIS call, so a parity put gated `after: [published_root]` was
 //!   held on a dependency nothing would confirm, and dropped. Every call.
 //!
 //! The question that survives them, for any new field, effect dependency or deadline: **what does this hold
@@ -462,12 +462,15 @@ enum ReadsCheck {
     Unreadable,
 }
 
-/// A group's three parity ids. The unit redundancy comes in: three blocks are
-/// one group's protection and are worth nothing separately.
-pub type ParityIds = [Cid; 3];
+/// A group's parity ids, [`PARITY`] of them. The unit redundancy comes in:
+/// they are one group's protection and are worth nothing separately.
+pub type ParityIds = [Cid; PARITY];
 
-/// A parity group's three blocks, as `(id, bytes)`.
-type ParityBlocks = Vec<(Cid, Vec<u8>)>;
+/// Parity blocks per group: the TREE's number (freenet-prolly `rs::PARITY`), its
+/// one owner. Never written by hand here -- `tests/one_parity.rs` fails the build
+/// on a hand-written count.
+pub use freenet_prolly::rs::PARITY;
+
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -498,6 +501,11 @@ pub enum Effect {
         bytes: Vec<u8>,
         after: Vec<Cid>,
     },
+    /// Stop putting this block: a later root move SUPERSEDED it (COMMIT-LIFE
+    /// §P). Withdrawal of a PUT nobody needs, never a cut-off of one that is.
+    Withdraw {
+        id: Cid,
+    },
     UpdateHead {
         seq: u64,
         root: Cid,
@@ -506,12 +514,6 @@ pub enum Effect {
         /// prev claims to contain a tree it does not (a foreign winner
         /// adopted after the commit was built: two devices, same seq).
         base: Cid,
-        after: Vec<Cid>,
-    },
-    PutParity {
-        group: ParityIds,
-        id: Cid,
-        bytes: Vec<u8>,
         after: Vec<Cid>,
     },
     Notify {
@@ -627,9 +629,6 @@ pub struct Params {
     /// this is checked there is no backlog at all: it bounds a single write
     /// (craftworks-sdk#136), and a write over it is `TooLarge`, not `Busy`.
     pub max_write_bytes: usize,
-    /// Ticks after which an owed group's parity is put even while its members
-    /// keep changing, so a hot group cannot stay unprotected for ever.
-    pub parity_age: u64,
     /// Ticks an ask goes unanswered before it is asked again (sdk#150).
     ///
     /// An ask is not a fact: the effect may have been stranded, cut by a
@@ -653,14 +652,6 @@ pub struct Params {
     pub max_carried_ops_bytes: usize,
     /// How many settle rounds a commit gets before it is released `Lost`.
     pub max_settle_rounds: u32,
-    /// The most parity groups owed at once. Unit: one group -- its three
-    /// ids, two ages, and up to two confirmed blocks. Past it the OLDEST is
-    /// abandoned, counted: data outranks redundancy (sdk#162).
-    pub max_owed_groups: usize,
-    /// The most (write, group) waits for `ParityComplete`. Unit: one group,
-    /// named by its first parity id (32 B), in a waiter's set. Past it the
-    /// oldest WAITER is dropped, counted.
-    pub max_parity_waiting_refs: usize,
     /// What of `max_context_bytes` the SHELL's own state may take beside the
     /// engine's: its read-backs (up to one commit's blocks), the head, the
     /// tracing flags, and the wrapper. Checked by the shell's tests.
@@ -668,18 +659,6 @@ pub struct Params {
     /// The least the parked reads may be left, once every fixed cap is
     /// counted. Construction refuses params that leave less.
     pub min_parked_read_bytes: usize,
-    /// Off = the negative control for coalescing.
-    pub coalesce_parity: bool,
-    /// Find superseded groups by scanning the WHOLE tree instead of only what
-    /// changed. This is what the engine used to do: correct, and proportional
-    /// to the tree's size on every write. Kept as the control for the cost
-    /// bound — a bound nothing can blow is not a bound.
-    pub whole_tree_supersede_scan: bool,
-    /// Move a superseded group's waiters onto the groups that replaced it.
-    /// Off, a write whose group is re-coded is reported `ParityComplete`
-    /// immediately — which is the control, and a false durability claim: its
-    /// data now sits in a coding whose parity is not on the network.
-    pub transfer_superseded_waiters: bool,
 
     // ---- the read path ----
     /// How many blocks one attempt may ask for. `Page::need` can name the
@@ -701,10 +680,14 @@ pub struct Params {
     /// releases the delegate between pages.
     pub max_gets_per_request: u32,
     /// A block the node answered NotFound is ALSO rebuilt from its sibling
-    /// group (`repair`: any k of the group's k+3, verified by hash) while the
+    /// group (`repair`: any k of the group's k+m, verified by hash) while the
     /// page keeps asking for it (Phase 4, gap 1): an alternative source,
     /// never a reason to stop. Off only as the control.
     pub repair_reads: bool,
+    /// RACE PUT (COMMIT-LIFE §P): the head is signed once the root is in and
+    /// every changed group has ANY k of its k+m blocks on the network; the
+    /// rest go on to BACKED_UP. Off only as the control: wait for every PUT.
+    pub race_put: bool,
     /// RACE GET (the owner's rule 11, sdk#303): the FIRST time a read wants a block of a sibling group, every
     /// other block of that group -- members and parity -- is asked at once, and the read finishes on the member
     /// itself or on any `k` of the group (rebuilt, verified), whichever comes first. Point reads too. Off only as
@@ -817,13 +800,6 @@ pub struct Params {
     /// that had been read as a platform constant; this is a measurement, and
     /// it stays a measurement rather than becoming the next inherited number.
     pub max_commit_blocks: usize,
-    /// Blocks one call may read while recomputing owed parity.
-    ///
-    /// The context carries owed groups as IDS, so a rehydrated engine has to
-    /// find the node that lists them before it can code anything — a walk of
-    /// the tree, which is a READ and must be bounded like one. What it does
-    /// not finish this call, it finishes on the next: the groups stay owed.
-    pub max_parity_scan_blocks: usize,
     /// Emit the head as soon as the commit is planned, without waiting for
     /// its packs to be read back. The control for (c): a head that names a
     /// root whose blocks are not all there is a tree no reader can walk, and
@@ -883,21 +859,16 @@ impl Default for Params {
             max_packed_value: 64 * 1024,
             pack_on_write: false,
             max_write_bytes: 8 * 1024 * 1024,
-            parity_age: 32,
             reask_after: 16,
             max_asks: 132,
             max_carried_ops_bytes: 16 * 1024,
             max_settle_rounds: 3,
-            max_owed_groups: 128,
-            max_parity_waiting_refs: 1024,
             shell_context_reserve: 12 * 1024,
             min_parked_read_bytes: 32 * 1024,
-            coalesce_parity: true,
-            whole_tree_supersede_scan: false,
-            transfer_superseded_waiters: true,
             max_fetch_per_round: 4,
             max_gets_per_request: 64,
             repair_reads: true,
+            race_put: true,
             race_get: true,
             share_fetches: true,
             preload_roots: 4,
@@ -918,7 +889,6 @@ impl Default for Params {
             max_write_tries: 3,
             max_parked_reads: 1000,
             max_commit_blocks: 128,
-            max_parity_scan_blocks: 512,
             head_before_packs: false,
             stale_after_missing: 3,
             max_delta_entries: 256,
@@ -930,20 +900,6 @@ impl Default for Params {
     }
 }
 
-/// One group's owed redundancy: the blocks to put, and when it was first owed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Owed {
-    blocks: Vec<(Cid, Vec<u8>)>,
-    /// The last tick at which this group was re-coded. A group that changed
-    /// this tick is still moving, so putting its parity now buys redundancy
-    /// for members that are about to be superseded.
-    last_changed: u64,
-    /// The tick this group was first owed, for the age bound. Re-coding a
-    /// group does NOT reset it: what the bound protects is how long a group
-    /// has gone unprotected, and a group rewritten every tick has gone
-    /// unprotected the whole time.
-    since: u64,
-}
 
 /// What an engine shed to keep its context saveable (sdk#162), per call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1098,10 +1054,6 @@ struct Commit {
     /// before: the core holds no tree, so nothing of that write is anywhere.
     #[serde(skip)]
     packs: BTreeMap<Cid, Vec<u8>>,
-    /// The parity groups this commit coded. A write is parity-complete when
-    /// none of ITS commit's groups is still owed — not when some later
-    /// commit's groups are done.
-    groups: BTreeSet<ParityIds>,
     confirmed: BTreeSet<Cid>,
     /// The writes folded into it, in arrival order.
     writes: Vec<(ClientId, WriteId)>,
@@ -1119,13 +1071,122 @@ struct Commit {
     /// block: a commit's data puts would fill the asks table's slots.
     settle_at: u64,
     settle_rounds: u32,
-    /// Its parity was left uncoded (the owed cap, sdk#162): its writes are
-    /// never told ParityComplete.
-    uncoded: bool,
     /// The last arrival number in this commit's group (K9): the `through`
     /// its head's ledger records for this page.
     #[serde(default)]
     through: u64,
+    /// What must be on the network before the head is signed (§P).
+    #[serde(default)]
+    race: Race,
+    /// Each pack's member ids: a pack's ack is its members' ack (the node
+    /// holds a pack's members under their own ids), so they count toward k.
+    #[serde(default)]
+    pack_members: BTreeMap<Cid, Vec<Cid>>,
+}
+
+/// RACE PUT's accounting for one commit (COMMIT-LIFE §P): the blocks that
+/// must be acked whatever (the root: no group can rebuild it), and each
+/// changed group's count toward k.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Race {
+    must: BTreeSet<Cid>,
+    groups: Vec<RaceGroup>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct RaceGroup {
+    k: usize,
+    /// Members this commit did not change and an earlier commit's acks put
+    /// on the network: present.
+    present: usize,
+    /// Members this commit did not change but an EARLIER commit is still
+    /// putting (its stragglers): not known to be on the network until acked
+    /// (the architect, rule 10's count). One entry per SLOT.
+    #[serde(default)]
+    earlier: Vec<Cid>,
+    /// The group's blocks this commit puts (new members and new parity), one
+    /// entry per SLOT: the same value under two keys of one leaf is ONE
+    /// block filling TWO slots, and counted as a set it filled one -- a
+    /// group of repeated values could never reach k, and its commit never
+    /// published.
+    new: Vec<Cid>,
+}
+
+impl Race {
+    /// The accounting for a commit putting `data` (its new blocks) and
+    /// `parity` (its coded parity). Groups are read from the NODES being put
+    /// (the format states the grouping); a block in no group -- the root, or
+    /// anything not found -- must be acked itself.
+    fn of(data: &[(Cid, Vec<u8>)], parity: &[(Cid, Vec<u8>)], unacked: &BTreeSet<Cid>) -> Race {
+        let new_ids: BTreeSet<Cid> = data.iter().chain(parity).map(|(c, _)| *c).collect();
+        let mut covered: BTreeSet<Cid> = BTreeSet::new();
+        let mut groups = Vec::new();
+        for (_, bytes) in data {
+            let Ok(node) = Node::parse(bytes) else { continue };
+            let ids: Vec<Cid> = node.parity().collect();
+            for (g, (_, members)) in freenet_prolly::parity::group_members(&node).into_iter().enumerate() {
+                let Some(par) = ids.get(PARITY * g..PARITY * (g + 1)) else { continue };
+                let new: Vec<Cid> = members.iter().chain(par).copied().filter(|c| new_ids.contains(c)).collect();
+                if new.is_empty() {
+                    continue;
+                }
+                let k = members.len();
+                let earlier: Vec<Cid> = members.iter().copied().filter(|m| !new_ids.contains(m) && unacked.contains(m)).collect();
+                let present = members.iter().filter(|m| !new_ids.contains(*m) && !unacked.contains(*m)).count();
+                covered.extend(new.iter().copied());
+                groups.push(RaceGroup { k, present, earlier, new });
+            }
+        }
+        let must = new_ids.into_iter().filter(|c| !covered.contains(c)).collect();
+        Race { must, groups }
+    }
+
+    /// Every block that must be in is, and every changed group has k: its
+    /// present members, what of this commit is acked, and what of an earlier
+    /// commit's stragglers has been acked since (`unacked` is what still is
+    /// not).
+    fn recoverable(&self, confirmed: &BTreeSet<Cid>, unacked: &BTreeSet<Cid>) -> bool {
+        self.must.is_subset(confirmed)
+            && self.groups.iter().all(|g| {
+                g.present + g.new.iter().filter(|c| confirmed.contains(*c)).count() + g.earlier.iter().filter(|c| !unacked.contains(*c)).count() >= g.k
+            })
+    }
+
+}
+
+impl Commit {
+    /// What the page holds the head for (`UpdateHead::after`): the blocks the
+    /// engine COUNTED when it judged the head ready -- this commit's acked
+    /// blocks -- and nothing else. Handing the page every data block instead
+    /// made it wait for all of them (the page holds a head until every id in
+    /// `after` is acked), which silently undid race put at the page while the
+    /// engine looked done.
+    fn race_set(&self) -> Vec<Cid> {
+        self.data.iter().copied().filter(|c| self.confirmed.contains(c)).collect()
+    }
+
+    /// May the head be signed? (§P: race put; `all` is the control.)
+    fn ready(&self, race: bool, unacked: &BTreeSet<Cid>) -> bool {
+        if race {
+            self.race.recoverable(&self.confirmed, unacked)
+        } else {
+            self.confirmed.len() >= self.data.len()
+        }
+    }
+}
+
+/// A published commit's blocks still being put (§P): BACKED_UP when none is
+/// left. Kept by the engine for this page's life; the page keeps the bytes.
+/// Kept in the PAGE's engine memory only, never in the delegate-era context
+/// (the architect, rules check): page memory and the keeper cover a reload
+/// (rule 12).
+#[derive(Clone, Debug)]
+struct Backing {
+    writes: Vec<(ClientId, WriteId)>,
+    remaining: BTreeSet<Cid>,
+    /// When its head was published: how long its stragglers have been
+    /// re-sending ("not answering for N s", rule 8).
+    since: u64,
 }
 
 /// The write pipeline.
@@ -1186,6 +1247,14 @@ pub struct Engine<B: Blocks> {
     /// Blocks handed to this engine during the CURRENT call, and dropped when
     /// it ends (sdk#34). Never in the context — see [`WithEmptyLeaf::arrived`].
     arrived: BTreeMap<Cid, Vec<u8>>,
+    /// Published commits whose blocks are still being put (§P): BACKED_UP
+    /// when a commit's `remaining` is empty.
+    backing: Vec<Backing>,
+    /// Writes whose group a later root move RE-CODED (COMMIT-LIFE §P,
+    /// superseded stragglers): their data now lives in the newer version of
+    /// the group, so they wait for the NEXT own commit's `Backing`, which
+    /// takes them. Never BACKED_UP while here.
+    carry: BTreeSet<(ClientId, WriteId)>,
     /// Blocks being REBUILT from their groups, by the block's id (`repair`).
     repairs: BTreeMap<Cid, Repair>,
     /// Which repairs a group block is being fetched for.
@@ -1227,42 +1296,14 @@ pub struct Engine<B: Blocks> {
     /// whether they took effect.
     folded: Vec<(ClientId, WriteId)>,
     folded_bytes: usize,
-    /// Every group whose parity is coded but not put. A MAP, newest wins: if a
-    /// group is re-coded before its parity goes out, the old parity is
-    /// superseded and must never be put.
-    owed: BTreeMap<ParityIds, Owed>,
-    /// Parity blocks of owed groups the node has CONFIRMED -- the fact a
-    /// group settles on, when all three are in. What was merely emitted is
-    /// in `asks`, which paces and decides nothing.
-    parity_confirmed: BTreeSet<Cid>,
-    /// Whether `owed` covers the WHOLE published tree (sdk#119). Not carried
-    /// in the context: a rehydrated engine says `NotScanned`, which is the
-    /// honest answer when nothing re-derived it.
+    /// Whether every group of the published tree is known recoverable
+    /// (sdk#119): an engine that tracked the tree from empty, through its own
+    /// race-put commits (§P). Not carried in the context.
     parity_scan: ParityScan,
-    /// Where `recompute_owed`'s walk stopped (sdk#181). It RESUMES here on
-    /// the next call instead of restarting at the root, so a group listed
-    /// beyond the first `max_parity_scan_blocks` nodes is reached in a few
-    /// calls rather than never. Kept in memory only: the page keeps its
-    /// engine between calls, and a rehydrated delegate restarts as before.
-    parity_walk: Option<ParityWalk>,
     /// Unanswered asks, for pacing only (`asks`).
     asks: asks::Asks,
     /// Shed this call to stay saveable (`keep_saveable`); not carried.
     shed: Shed,
-    /// The write being applied had its parity left uncoded (the owed cap);
-    /// handed to its commit by `start_commit`.
-    uncoded: bool,
-    /// The groups each write is still waiting on.
-    ///
-    /// A SET and not a count, because a superseded group is replaced by the
-    /// groups that now cover the same members, and a count cannot express
-    /// "swap one for two" without drifting. `ParityComplete` is a state of the
-    /// WRITE — reported once, when this set empties.
-    /// Each group named by its FIRST parity id: a group is identified by any
-    /// of its three ids, and 32 B a reference instead of 96 is what lets the
-    /// cap hold an ordinary burst of writes (sdk#187 review: at 256 full ids,
-    /// 112 of 200 one-row writes never heard ParityComplete).
-    parity_waiting: BTreeMap<(ClientId, WriteId), BTreeSet<Cid>>,
     /// A write whose tree path is not held, waiting for the blocks it needs.
     ///
     /// At most ONE, and it costs the context its ops. That is affordable only
@@ -1341,6 +1382,8 @@ pub struct Engine<B: Blocks> {
     /// that a dead commit's group LANDED (COMMIT-LIFE ⁵). Consumed by that
     /// step.
     witness: Option<Witness>,
+    /// The next adopted head's §P mark (see [`Engine::set_head_marked`]).
+    head_marked: bool,
     /// Writes that ended in THIS step with keys a later write may have read:
     /// a later write's conflict on one of those keys names it as `after`
     /// (footnote 3). Cleared at the end of every step, like `arrived`.
@@ -1363,24 +1406,12 @@ pub struct Engine<B: Blocks> {
     /// reads (sdk#235). Shown to a person, so the transitional form is a
     /// number someone can act on (sdk#281 removes `Any` at zero).
     forced_writes: u64,
-    /// Notifications raised while applying a write — a group superseded part
-    /// way through — collected here so `on_write` can return them with the
-    /// rest rather than dropping them.
-    pending_notifications: Vec<Effect>,
     /// Blocks written since the last commit shipped. Accumulated as each
     /// write emits them rather than recovered later by comparing two trees:
     /// the emitting is where the answer is already known, and walking for it
     /// afterwards is the same answer computed again, more expensively and
     /// with a chance of disagreeing.
     unpublished: Vec<(Cid, Vec<u8>)>,
-    /// Groups CODED since the last commit shipped.
-    ///
-    /// Not "everything currently owed": that includes groups an earlier
-    /// commit coded and has not yet put, and waiting on those makes a write's
-    /// `ParityComplete` depend on redundancy for data it never touched. It
-    /// also hides a superseded group behind the others, so the write never
-    /// notices the one covering ITS data was replaced.
-    coded_since_commit: BTreeSet<ParityIds>,
     /// Everything the read path is waiting on.
     reads: read::Reads,
     /// Who is watching which range.
@@ -1470,6 +1501,8 @@ impl<B: Blocks> Engine<B> {
             empty,
             blocks,
             arrived: BTreeMap::new(),
+            backing: Vec::new(),
+            carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
             withdrawn: BTreeSet::new(),
@@ -1485,14 +1518,9 @@ impl<B: Blocks> Engine<B> {
             pending: None,
             folded: Vec::new(),
             folded_bytes: 0,
-            owed: BTreeMap::new(),
-            parity_confirmed: BTreeSet::new(),
             parity_scan: ParityScan::NotScanned,
-            parity_walk: None,
             asks: asks::Asks::default(),
             shed: Shed::default(),
-            uncoded: false,
-            parity_waiting: BTreeMap::new(),
             in_flight_since: None,
             parked_write: None,
             told_stalled: BTreeSet::new(),
@@ -1513,6 +1541,7 @@ impl<B: Blocks> Engine<B> {
             cut_held: false,
             cut_until: None,
             witness: None,
+            head_marked: false,
             cascade: Vec::new(),
             forced_lost: 0,
             tries_spent_lost: 0,
@@ -1522,9 +1551,7 @@ impl<B: Blocks> Engine<B> {
             commits_published: 0,
             writes_published: 0,
             forced_writes: 0,
-            pending_notifications: Vec::new(),
             unpublished: Vec::new(),
-            coded_since_commit: BTreeSet::new(),
             reads: read::Reads::default(),
             subs: subs::Subs::default(),
             nodes_parsed: 0,
@@ -1567,9 +1594,6 @@ impl<B: Blocks> Engine<B> {
         w.extend(self.reads.waiting.keys().copied());
         if let Some(p) = &self.parked_write {
             w.extend(p.needs.iter().copied());
-        }
-        for key in self.owed.keys() {
-            w.extend(key.iter().filter(|id| !self.parity_confirmed.contains(*id)));
         }
         w
     }
@@ -1687,6 +1711,25 @@ impl<B: Blocks> Engine<B> {
         self.noop_published
     }
 
+    /// Published commits still putting blocks toward BACKED_UP (§P).
+    pub fn backing(&self) -> usize {
+        self.backing.len()
+    }
+
+    /// Blocks published commits are still putting (not yet acked).
+    fn unacked(&self) -> BTreeSet<Cid> {
+        self.backing.iter().flat_map(|b| b.remaining.iter().copied()).collect()
+    }
+
+    /// Writes SAVED and not yet BACKED_UP, with when (engine time) their
+    /// commit published: how long its stragglers have been re-sending, what
+    /// the page shows as "not answering for N s" (rule 8). Never a fate: they
+    /// retry until acked.
+    pub fn backing_since(&self) -> Vec<((ClientId, WriteId), u64)> {
+        self.backing.iter().flat_map(|b| b.writes.iter().map(move |w| (*w, b.since))).collect()
+    }
+
+
     /// Read repairs through parity: `(started, rebuilt, given up)`.
     pub fn repair_counts(&self) -> (u64, u64, u64) {
         self.repair_counts
@@ -1705,6 +1748,13 @@ impl<B: Blocks> Engine<B> {
     /// (its ledger's entry), before the foreign move is stepped (⁵).
     pub fn set_witness(&mut self, witness: Option<Witness>) {
         self.witness = witness;
+    }
+
+    /// Does the head about to be adopted carry race put's §P mark (every group
+    /// it lists was recoverable when signed)? Told by the shell before the
+    /// step, like the witness; read once by `adopt`.
+    pub fn set_head_marked(&mut self, marked: bool) {
+        self.head_marked = marked;
     }
 
     /// The last arrival number of the commit in flight: what its head's
@@ -1775,8 +1825,11 @@ impl<B: Blocks> Engine<B> {
         (self.forced_lost, self.tries_spent_lost)
     }
 
+    /// Groups with parity not yet on the network: under race put (§P) a
+    /// commit's parity goes with it and nothing is owed, so what is left is
+    /// the published commits still putting toward BACKED_UP.
     pub fn owed_groups(&self) -> usize {
-        self.owed.len()
+        self.backing.len()
     }
 
     /// Nodes parsed on the write path since the last [`Engine::reset_cost`].
@@ -1876,15 +1929,6 @@ impl<B: Blocks> Engine<B> {
     /// test: 0.30 -> 10.4 s; every other engine suite within +0.8 s.
     fn keep_saveable(&mut self) -> Vec<Effect> {
         let mut out = Vec::new();
-        while self.parity_waiting.values().map(BTreeSet::len).sum::<usize>()
-            > self.params.max_parity_waiting_refs
-        {
-            let Some(w) = self.parity_waiting.keys().next().copied() else {
-                break;
-            };
-            self.parity_waiting.remove(&w);
-            self.shed.waits += 1;
-        }
         let limit = self
             .params
             .max_context_bytes
@@ -2135,18 +2179,12 @@ impl<B: Blocks> Engine<B> {
             return self.head_not_landed();
         }
         let dead = self.pending.take();
-        // The dead commit's groups describe a tree that never published.
-        if let Some(c) = &dead {
-            let groups = c.groups.clone();
-            self.forget_dead_groups(&groups);
-        }
         let group_through = dead.as_ref().map_or(0, |c| c.through);
         let dead_writes: Vec<(ClientId, WriteId)> = dead.map(|c| c.writes).unwrap_or_default();
         self.folded.clear();
         self.folded_bytes = 0;
         self.in_flight_since = None;
         self.unpublished.clear();
-        self.coded_since_commit.clear();
         let mut out = self.adopt(seq, root);
         // A FOREIGN MOVE (R-b): the dead commit's write goes again at the
         // front with a try spent (or falls `Lost`, named), and the whole queue
@@ -2220,16 +2258,21 @@ impl<B: Blocks> Engine<B> {
         self.root = root;
         self.published_root = root;
         // A root taken from OUTSIDE — a head read, another writer's head —
-        // was made by commits this engine did not code, so nothing here knows
-        // their parity. Only the empty tree is known in full: it lists none.
-        self.parity_scan = if root == self.empty.cid {
+        // was made by commits this engine did not code. The empty tree is
+        // known in full (it lists none); a head carrying race put's §P mark
+        // had every group it lists recoverable when it was signed
+        // (COMMIT-LIFE §P); anything else is pre-§P, and NotScanned.
+        let marked = std::mem::take(&mut self.head_marked);
+        self.parity_scan = if root == self.empty.cid || marked {
             ParityScan::Done { root }
         } else {
             ParityScan::NotScanned
         };
         self.published_seq = seq;
         self.next_seq = seq + 1;
-        self.notify_subs(was)
+        let mut out = self.supersede(was, root);
+        out.extend(self.notify_subs(was));
+        out
     }
 
     /// Tell every subscriber whose range a root move touched.
@@ -2382,6 +2425,7 @@ impl<B: Blocks> Engine<B> {
                 rounds: 0,
                 held: BTreeSet::from([root]),
                 gets: 0,
+                arrived: 0,
             },
         );
         let out = self.drive(req_id);
@@ -2599,6 +2643,35 @@ impl<B: Blocks> Engine<B> {
             }
         }
         out
+    }
+
+    /// SUPERSEDE a parked read (#330 ruling) — the caller has seen a head
+    /// move past its root — ONLY IF it has made no progress: no block has
+    /// arrived for it since it started, and it waits on at least one (a GET
+    /// unanswered or answered NotFound). Then it is FORGOTTEN, never
+    /// answered, and each block only it waited on is WITHDRAWN (its group's
+    /// repair ended with it), so the page ends that GET instead of re-asking
+    /// it for ever. `false`: it is not parked, or it is making progress — it
+    /// finishes on its own tree (READ-STATE inv. 2). An answer-driven end:
+    /// the head moved; no clock is read (rule 8).
+    pub fn supersede_read(&mut self, req_id: read::ReqId) -> bool {
+        let Some(p) = self.reads.parked.get(&req_id) else { return false };
+        let blocks: Vec<Cid> = self.reads.waiting.iter().filter(|(_, reqs)| reqs.contains(&req_id)).map(|(id, _)| *id).collect();
+        if p.arrived > 0 || blocks.is_empty() {
+            return false;
+        }
+        self.reads.parked.remove(&req_id);
+        self.forget_waiting(req_id);
+        for id in blocks {
+            if self.reads.waiting.contains_key(&id) {
+                continue;
+            }
+            if self.repairs.contains_key(&id) {
+                self.end_repair(id);
+            }
+            self.withdraw_if_unwanted(id);
+        }
+        true
     }
 
     fn forget_waiting(&mut self, req_id: read::ReqId) {
@@ -2898,6 +2971,7 @@ impl<B: Blocks> Engine<B> {
         let mut blocks = 0usize;
         let mut last_warm = None;
         let mut through = 0u64;
+        let mut cut_parity: Vec<(Cid, Vec<u8>)> = Vec::new();
         for id in cut {
             // Its index now: every earlier write of the cut is either taken
             // (in front) or dropped (gone).
@@ -2944,11 +3018,11 @@ impl<B: Blocks> Engine<B> {
             if taken > 0 && blocks + emitted.len() > self.params.max_commit_blocks {
                 break;
             }
-            // `record_owed` reads `self.root` as the NEW root (the survivors
-            // of the supersede walk), so it moves first.
-            let before = self.root;
             self.root = applied.root;
-            self.record_owed(before, &applied.parity, &emitted);
+            // THIS WRITE'S PARITY, coded by the apply: it goes out with the
+            // commit (§P). A group a later write of the cut recodes is
+            // dropped below, by what the final tree lists.
+            cut_parity.extend(applied.parity.iter().cloned());
             blocks += emitted.len();
             self.unpublished.extend(emitted.iter().cloned());
             for (id, bytes) in &emitted {
@@ -2965,9 +3039,6 @@ impl<B: Blocks> Engine<B> {
             self.queue[idx].committing = true;
             taken += 1;
         }
-        // What `record_owed` decided to tell (a superseded group's waiters),
-        // told in this step -- never left for a later one.
-        out.extend(std::mem::take(&mut self.pending_notifications));
         // A write whose path on the published root was evicted: it and every
         // write behind it go back to `Applying` (arrival order), fetching.
         let cold = |e: &mut Self, need: Vec<Cid>| -> Vec<Effect> {
@@ -2992,13 +3063,22 @@ impl<B: Blocks> Engine<B> {
             let writes = std::mem::take(&mut self.folded);
             self.folded_bytes = 0;
             self.noop_published += writes.len() as u64;
-            let owed: BTreeSet<ParityIds> = self.owed.keys().copied().collect();
+            // Nothing new was put: the tree it asks for is the published one,
+            // so SAVED at once. BACKED_UP only when that tree IS: while a
+            // published commit's stragglers are still out (race put, §P) the
+            // no-op joins every pending Backing and hears ParityComplete when
+            // they drain -- the architect's #164 finding, not re-opened by
+            // race put.
             for w in &writes {
                 out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::Published });
-                if owed.is_empty() {
+                if self.backing.is_empty() {
                     out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
                 } else {
-                    self.parity_waiting.insert(*w, owed.iter().map(|k| k[0]).collect());
+                    for b in self.backing.iter_mut() {
+                        if !b.writes.contains(w) {
+                            b.writes.push(*w);
+                        }
+                    }
                 }
             }
             for _ in 0..taken {
@@ -3019,7 +3099,12 @@ impl<B: Blocks> Engine<B> {
         }
         let committed = self.root;
         let to_ship = self.take_unpublished();
-        out.extend(self.start_commit(to_ship, Some(ops_all)));
+        // Only the parity the FINAL tree lists: a group a later write of the
+        // cut recoded superseded the earlier coding.
+        let listed: BTreeSet<Cid> = to_ship.iter().filter_map(|(_, b)| Node::parse(b).ok()).flat_map(|n| n.parity().collect::<Vec<_>>()).collect();
+        let mut seen_parity = BTreeSet::new();
+        let parity: Vec<(Cid, Vec<u8>)> = cut_parity.into_iter().filter(|(c, _)| listed.contains(c) && seen_parity.insert(*c)).collect();
+        out.extend(self.start_commit(to_ship, parity, Some(ops_all)));
         if let Some(c) = self.pending.as_mut() {
             c.through = through;
         }
@@ -3129,8 +3214,6 @@ impl<B: Blocks> Engine<B> {
             } else {
                 self.tries_spent_lost += 1;
             }
-            let w = (q.client, q.write_id);
-            self.parity_waiting.remove(&w);
             out.extend(self.end_queued(i, State::Lost));
         }
         self.close_cut();
@@ -3149,10 +3232,7 @@ impl<B: Blocks> Engine<B> {
         let mut out: Vec<Effect> = dead
             .iter()
             .filter(|w| !queued.contains(w))
-            .map(|w| {
-                self.parity_waiting.remove(w);
-                Effect::Notify { client: w.0, write_id: w.1, state: State::Lost }
-            })
+            .map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Lost })
             .collect();
         out.extend(self.dead_front(witness, group_through));
         self.root = self.published_root;
@@ -3296,247 +3376,17 @@ impl<B: Blocks> Engine<B> {
     }
 
 
-    /// Record what a commit coded, newest wins.
-    ///
-    /// The map is keyed by the group's three parity ids, which ARE the group's
-    /// identity: parity is a pure function of the members and the class, so
-    /// two codings with the same ids are the same redundancy and one put
-    /// serves both. When a group is re-coded its ids change, and the entry it
-    /// replaces is found through the node that lists them.
-    fn record_owed(
-        &mut self,
-        old_root: Cid,
-        parity: &[(Cid, Vec<u8>)],
-        emitted: &[(Cid, Vec<u8>)],
-    ) {
-        // Which three ids belong together is stated by the NODE that lists
-        // them — the same place a checker reads the grouping from, so the
-        // engine cannot drift from the format.
-        let mut by_group: BTreeMap<ParityIds, Vec<(Cid, Vec<u8>)>> = BTreeMap::new();
-        let have: BTreeMap<&Cid, &Vec<u8>> = parity.iter().map(|(c, b)| (c, b)).collect();
-        for (_, bytes) in emitted {
-            let Ok(node) = Node::parse(bytes) else {
-                continue;
-            };
-            let ids: Vec<Cid> = node.parity().collect();
-            for trio in ids.chunks_exact(3) {
-                let key: ParityIds = [trio[0], trio[1], trio[2]];
-                // A group whose blocks this commit coded is owed. One whose
-                // blocks it did not is either already out or owed from before.
-                if trio.iter().all(|c| have.contains_key(c)) {
-                    let blocks: Vec<(Cid, Vec<u8>)> =
-                        trio.iter().map(|c| (*c, have[c].clone())).collect();
-                    by_group.insert(key, blocks);
-                }
-            }
-        }
 
-        // A group still owed but no longer listed by ANY node in the warm tree
-        // has been SUPERSEDED: its members moved on, and putting its parity
-        // now would buy redundancy for bytes no reader will ever ask for.
-        // That is the coalescing rule, and it is decided against the whole
-        // tree rather than against one node, because a shifting boundary can
-        // carry a group into a different node than it started in.
-        // Which groups this write SUPERSEDED, found by walking only what
-        // changed.
-        //
-        // A whole-tree scan answers the same question and is what this used to
-        // do; at a million keys that is about 10^5 node parses on every write.
-        // The old tree and the new one share everything except the path that
-        // changed, and the new nodes are already in hand -- so the nodes the
-        // write REPLACED are exactly those reachable from the old root that
-        // the new tree does not contain, and the walk stops the moment it
-        // meets a node that survived.
-        let mut survivors: BTreeSet<Cid> = BTreeSet::new();
-        survivors.insert(self.root);
-        let mut fresh: BTreeSet<Cid> = BTreeSet::new();
-        for (id, bytes) in emitted {
-            if let Ok(n) = Node::parse(bytes) {
-                fresh.insert(*id);
-                if !n.is_leaf() {
-                    for i in 0..n.len() {
-                        survivors.insert(n.child(i).0);
-                    }
-                }
-            }
-        }
-        // A node the write emitted is not a survivor of the OLD tree even if
-        // an old node had the same id; it is the new tree's own.
-        for id in &fresh {
-            survivors.remove(id);
-        }
-        let mut was_listed: BTreeSet<Cid> = BTreeSet::new();
-        if self.params.whole_tree_supersede_scan {
-            survivors.clear();
-        }
-        let mut stack = vec![old_root];
-        let mut seen: BTreeSet<Cid> = BTreeSet::new();
-        while let Some(cid) = stack.pop() {
-            if survivors.contains(&cid) || !seen.insert(cid) {
-                continue;
-            }
-            let Some(bytes) = self.blocks.get(&cid) else {
-                continue;
-            };
-            self.nodes_parsed += 1;
-            let Ok(n) = Node::parse(bytes) else {
-                continue;
-            };
-            was_listed.extend(n.parity());
-            if !n.is_leaf() {
-                for i in 0..n.len() {
-                    stack.push(n.child(i).0);
-                }
-            }
-        }
-        // Still listed by what replaced them? Then the group survived the
-        // rewrite and is not superseded.
-        let mut now_listed: BTreeSet<Cid> = BTreeSet::new();
-        for (_, bytes) in emitted {
-            if let Ok(n) = Node::parse(bytes) {
-                now_listed.extend(n.parity());
-            }
-        }
-        let gone: BTreeSet<Cid> = was_listed.difference(&now_listed).copied().collect();
-        let now = self.now;
-        let dropped: Vec<ParityIds> = self
-            .owed
-            .iter()
-            // Never drop one already asked for or partly confirmed: its
-            // answers are coming, and forgetting it would lose the
-            // ParityComplete it owes.
-            .filter(|(key, _)| !self.parity_touched(key) && gone.contains(&key[0]))
-            .map(|(key, _)| *key)
-            .collect();
-        // PAST THE OWED CAP, THIS WRITE'S NEW GROUPS ARE NOT CODED (sdk#162).
-        // Data outranks redundancy: the write is not refused -- a Busy here
-        // closes the engine for good when parity never confirms -- and nothing
-        // already owed is forgotten, because `owed` is not re-derivable from
-        // the tree today (sdk#181). The commit publishes without parity for
-        // what it changed, counted and reported "left to the scrub", and its
-        // writes are never told ParityComplete.
-        let new_groups = by_group.keys().filter(|k| !self.owed.contains_key(*k)).count();
-        let uncoded = new_groups > 0
-            && self.owed.len() - dropped.len() + new_groups > self.params.max_owed_groups;
-        if uncoded {
-            by_group.retain(|k, _| self.owed.contains_key(k));
-            self.shed.uncoded += new_groups;
-            self.uncoded = true;
-        }
-        // What now covers the members those groups held.
-        let replacements: BTreeSet<ParityIds> = by_group.keys().copied().collect();
-        for key in dropped {
-            self.forget_group(&key);
-            self.coded_since_commit.remove(&key);
-            if uncoded {
-                // Their replacements were not coded: a waiter on them would be
-                // "complete" with no redundancy behind it. Dropped, counted.
-                let mut empty = Vec::new();
-                for (w, waiting) in self.parity_waiting.iter_mut() {
-                    if waiting.remove(&key[0]) && waiting.is_empty() {
-                        empty.push(*w);
-                    }
-                }
-                for w in empty {
-                    self.parity_waiting.remove(&w);
-                    self.shed.waits += 1;
-                }
-                continue;
-            }
-            let n = self.transfer_waiters(key, &replacements);
-            self.pending_notifications.extend(n);
-        }
 
-        for (key, blocks) in by_group {
-            self.coded_since_commit.insert(key);
-            let e = self.owed.entry(key).or_insert(Owed {
-                blocks: blocks.clone(),
-                last_changed: now,
-                since: now,
-            });
-            e.blocks = blocks;
-            e.last_changed = now;
-        }
-    }
-
-    /// A group stopped being owed: credit every write waiting on it, and tell
-    /// the ones with nothing left to wait for.
-    ///
-    /// Called when a group's three blocks are all confirmed, and when a group
-    /// is SUPERSEDED — re-coded by a later write before its parity went out.
-    /// Both end the wait honestly: `ParityComplete` says *nothing is
-    /// outstanding on this write's behalf*, and a superseded group has been
-    /// replaced by a newer coding of the same members, which the write that
-    /// caused it is now waiting on. Treating a supersede as still-pending
-    /// would leave the earlier write waiting for a put that will never
-    /// happen, on purpose.
-    fn settle_group(&mut self, group: ParityIds) -> Vec<Effect> {
-        let mut out = Vec::new();
-        let mut done: Vec<(ClientId, WriteId)> = Vec::new();
-        for (w, waiting) in self.parity_waiting.iter_mut() {
-            if waiting.remove(&group[0]) && waiting.is_empty() {
-                done.push(*w);
-            }
-        }
-        for w in done {
-            self.parity_waiting.remove(&w);
-            out.push(Effect::Notify {
-                client: w.0,
-                write_id: w.1,
-                state: State::ParityComplete,
-            });
-        }
-        out
-    }
-
-    /// A group was re-coded before its parity went out. The write that is
-    /// waiting on it must now wait on whatever covers those members INSTEAD.
-    ///
-    /// Not settled. The write's data did not go away — it sits in the newer
-    /// coding, whose parity is not on the network either, so reporting
-    /// `ParityComplete` here would tell a client that redundancy exists for
-    /// its data when none does. `ParityComplete` means *every group that
-    /// currently covers what this write changed has its parity on the
-    /// network*, never *nothing is outstanding under this write's name*.
-    ///
-    /// The transfer is deliberately generous: every group the superseding
-    /// write coded, not an attempt to work out which one inherited these
-    /// members. Over-waiting delays a notification; a false completion is a
-    /// durability claim that is not true.
-    fn transfer_waiters(&mut self, from: ParityIds, to: &BTreeSet<ParityIds>) -> Vec<Effect> {
-        if !self.params.transfer_superseded_waiters {
-            return self.settle_group(from);
-        }
-        let mut out = Vec::new();
-        let mut done: Vec<(ClientId, WriteId)> = Vec::new();
-        for (w, waiting) in self.parity_waiting.iter_mut() {
-            if !waiting.remove(&from[0]) {
-                continue;
-            }
-            waiting.extend(to.iter().map(|k| k[0]));
-            // Nothing covers those members any more — the write was a delete,
-            // or what it wrote is gone. There is no redundancy left to owe.
-            if waiting.is_empty() {
-                done.push(*w);
-            }
-        }
-        for w in done {
-            self.parity_waiting.remove(&w);
-            out.push(Effect::Notify {
-                client: w.0,
-                write_id: w.1,
-                state: State::ParityComplete,
-            });
-        }
-        out
-    }
 
     /// Plan the packs for what a commit emitted, and send them.
     fn start_commit(
         &mut self,
         emitted: Vec<(Cid, Vec<u8>)>,
+        parity: Vec<(Cid, Vec<u8>)>,
         ops: Option<Vec<(Vec<u8>, Op)>>,
     ) -> Vec<Effect> {
+        let race = Race::of(&emitted, &parity, &self.unacked());
         let seq = self.next_seq;
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
@@ -3590,6 +3440,17 @@ impl<B: Blocks> Engine<B> {
                 after: Vec::new(),
             });
         }
+        // THE PARITY, IN THE SAME ROUND (§P, the owner): computed before the
+        // send, put with the data, through the same window -- never after a
+        // data block's ack.
+        for (id, b) in &parity {
+            data.insert(*id);
+            out.push(Effect::PutBlock {
+                id: *id,
+                bytes: b.clone(),
+                after: Vec::new(),
+            });
+        }
 
         // Every pack carries the manifest, so recovery can read any one of a
         // commit's packs and know the whole commit.
@@ -3615,6 +3476,7 @@ impl<B: Blocks> Engine<B> {
         }
 
         let mut pack_bodies: BTreeMap<Cid, Vec<u8>> = BTreeMap::new();
+        let mut pack_members: BTreeMap<Cid, Vec<Cid>> = BTreeMap::new();
         for members in packs {
             let body = match pack::build(&members) {
                 Ok(b) => b,
@@ -3625,6 +3487,7 @@ impl<B: Blocks> Engine<B> {
             };
             let id = pack::pack_id(&body);
             data.insert(id);
+            pack_members.insert(id, pack::members(&body).into_iter().map(|(mid, _)| mid).collect());
             pack_bodies.insert(id, body.clone());
             out.push(Effect::PutPack {
                 id,
@@ -3633,16 +3496,12 @@ impl<B: Blocks> Engine<B> {
             });
         }
 
-        // The groups this commit CODED. A write waits on these and on nothing
-        // else.
-        let groups = std::mem::take(&mut self.coded_since_commit);
         self.next_seq += 1;
         self.pending = Some(Commit {
             seq,
             root: self.root,
             data,
             packs: pack_bodies,
-            groups,
             confirmed: BTreeSet::new(),
             writes,
             head_sent: false,
@@ -3653,8 +3512,9 @@ impl<B: Blocks> Engine<B> {
             }),
             settle_at: self.now,
             settle_rounds: 0,
-            uncoded: std::mem::take(&mut self.uncoded),
             through: 0,
+            race,
+            pack_members,
         });
         out
     }
@@ -3686,23 +3546,20 @@ impl<B: Blocks> Engine<B> {
         if now.saturating_sub(c.settle_at) < wait {
             return Vec::new();
         }
-        let held: Vec<Cid> = c
-            .data
-            .difference(&c.confirmed)
-            .copied()
-            .filter(|id| self.blocks.get(id).is_some())
-            .collect();
+        // A block is CONFIRMED only by the node's answer. "Held here" is not
+        // one on the page path: `self.blocks` is the PAGE's own memory, so
+        // every block the page made read as held, and a head could be signed
+        // over blocks the node never took (engineer1, on sdk#296's terminal).
+        // Under race put (§P) that would count toward k.
         let mut out = Vec::new();
-        for id in held {
-            out.extend(self.on_confirmed(id));
-        }
+        let unacked = self.unacked();
         let Some(c) = self.pending.as_mut() else {
             return out;
         };
         c.settle_at = now;
         c.settle_rounds += 1;
         let missing: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
-        if missing.is_empty() {
+        if missing.is_empty() || c.ready(self.params.race_put, &unacked) {
             if c.head_sent {
                 out.push(Effect::ReadHead {
                     epoch: self.head_epoch.unwrap_or(Epoch(1)),
@@ -3736,9 +3593,14 @@ impl<B: Blocks> Engine<B> {
             |id, b: &[u8]| emitted.push((id, b.to_vec())),
         );
         match applied {
+            // The commit's PARITY is its blocks too (§P: put in the same
+            // round as the data), so a re-put from the carried ops re-derives
+            // it from the same apply -- or the commit could never be
+            // recoverable again after its puts were lost.
             Ok(a) if a.root == root => Some(
                 emitted
                     .into_iter()
+                    .chain(a.parity.iter().cloned())
                     .filter(|(id, _)| missing.contains(id))
                     .map(|(id, bytes)| Effect::PutBlock {
                         id,
@@ -3775,7 +3637,6 @@ impl<B: Blocks> Engine<B> {
         self.unpublished.clear();
         self.root = self.published_root;
         self.next_seq = self.published_seq + 1;
-        self.forget_dead_groups(&c.groups);
         for w in &c.writes {
             self.told_stalled.remove(w);
         }
@@ -3783,25 +3644,16 @@ impl<B: Blocks> Engine<B> {
         self.rederive_after_foreign_move(&c.writes, c.through)
     }
 
-    /// Groups a commit that will never publish coded: not owed, and nothing
-    /// waits on them.
-    fn forget_dead_groups(&mut self, groups: &BTreeSet<ParityIds>) {
-        for g in groups.iter().chain(std::mem::take(&mut self.coded_since_commit).iter()) {
-            self.forget_group(g);
-            for waiting in self.parity_waiting.values_mut() {
-                waiting.remove(&g[0]);
-            }
-        }
-    }
 
     /// The head read back shows the commit's head is NOT there (an older seq,
     /// or none): the write of it never landed. Re-issue it -- the same seq and
     /// root, which the Register takes or refuses on its own terms.
     fn head_not_landed(&mut self) -> Vec<Effect> {
+        let unacked = self.unacked();
         let Some(c) = self.pending.as_mut() else {
             return Vec::new();
         };
-        if c.confirmed.len() < c.data.len() {
+        if !c.ready(self.params.race_put, &unacked) {
             c.head_sent = false;
             return Vec::new();
         }
@@ -3810,38 +3662,142 @@ impl<B: Blocks> Engine<B> {
             seq: c.seq,
             root: c.root,
             base: c.base,
-            after: c.data.iter().copied().collect(),
+            after: c.race_set(),
         }]
+    }
+
+    /// These writes' Backing drained: each is BACKED_UP unless it still sits
+    /// in another Backing (a write carried onto a newer commit waits for that
+    /// one too) or in the carry (waiting for the next own commit).
+    fn backed_up(&mut self, writes: Vec<(ClientId, WriteId)>) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let mut told = BTreeSet::new();
+        for w in writes {
+            if !told.insert(w) || self.carry.contains(&w) || self.backing.iter().any(|b| b.writes.contains(&w)) {
+                continue;
+            }
+            out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
+        }
+        out
+    }
+
+    /// The nodes of `was` that `now` does not have (`diff(now, was)`'s
+    /// `new_blocks`, paged and unioned), or `None` if the diff could not be
+    /// completed from what is held -- then nothing is superseded, the
+    /// conservative side (a withdrawn block that was still needed is a hole
+    /// nothing tracks; a kept one costs only its re-sends).
+    fn removed_nodes(&self, was: Cid, now: Cid) -> Option<BTreeSet<Cid>> {
+        use freenet_prolly::range::Range;
+        use std::ops::Bound;
+        let src = self.source();
+        let r = Range { lo: Bound::Unbounded, hi: Bound::Unbounded, reverse: false, after: None, max_entries: usize::MAX, max_bytes: usize::MAX };
+        let mut removed = BTreeSet::new();
+        let mut resume = None;
+        for _ in 0..1_000_000 {
+            let page = freenet_prolly::diff::diff(&src, &now, &was, &r, resume.as_ref()).ok()?;
+            if !page.need.is_empty() {
+                return None;
+            }
+            removed.extend(page.new_blocks.iter().copied());
+            match page.next {
+                Some(next) => resume = Some(next),
+                None => return Some(removed),
+            }
+        }
+        None
+    }
+
+    /// COMMIT-LIFE §P, superseded stragglers, on EVERY published-root move
+    /// (own commit or foreign/merge) from `was` to `now`: a straggler that
+    /// is a NODE removed by the move, or the PARITY of a removed branch node
+    /// (a group over nodes), is garbage -- WITHDRAWN, and its commit's writes
+    /// carried onto the next own commit's Backing. Node bytes include their
+    /// keys, so a node is unique to its position and a removed one is needed
+    /// by nobody. VALUE blocks and the parity of VALUE groups (a leaf's) are
+    /// NEVER withdrawn: the same value under two keys is one block, and
+    /// telling it apart would need a whole-tree scan -- they retry until acked
+    /// (the architect's ruling).
+    fn supersede(&mut self, was: Cid, now: Cid) -> Vec<Effect> {
+        if was == now || self.backing.is_empty() {
+            return Vec::new();
+        }
+        let Some(removed) = self.removed_nodes(was, now) else {
+            return Vec::new();
+        };
+        let mut gone: BTreeSet<Cid> = BTreeSet::new();
+        {
+            let src = self.source();
+            for n in &removed {
+                gone.insert(*n);
+                if let Some(bytes) = src.get(n) {
+                    if let Ok(node) = Node::parse(bytes) {
+                        if !node.is_leaf() {
+                            gone.extend(node.parity());
+                        }
+                    }
+                }
+            }
+        }
+        let mut withdrawn: BTreeSet<Cid> = BTreeSet::new();
+        for b in self.backing.iter_mut() {
+            let hit: Vec<Cid> = b.remaining.intersection(&gone).copied().collect();
+            if hit.is_empty() {
+                continue;
+            }
+            for id in hit {
+                b.remaining.remove(&id);
+                withdrawn.insert(id);
+            }
+            self.carry.extend(b.writes.iter().copied());
+        }
+        let mut drained = Vec::new();
+        self.backing.retain(|b| {
+            if b.remaining.is_empty() {
+                drained.extend(b.writes.iter().copied());
+                false
+            } else {
+                true
+            }
+        });
+        let mut out: Vec<Effect> = withdrawn.into_iter().map(|id| Effect::Withdraw { id }).collect();
+        out.extend(self.backed_up(drained));
+        out
     }
 
     fn on_confirmed(&mut self, id: Cid) -> Vec<Effect> {
         let head_early = self.params.head_before_packs;
         let mut out = Vec::new();
-        // A parity block landing: the group it belongs to is that much closer
-        // to having redundancy.
-        //
-        // The group is found among the OWED groups, which are their own ids,
-        // so nothing maps a parity block to its group but the fact itself.
-        if let Some(group) = self.owed_group_of(&id) {
-            self.asks.settled(&asks::Ask::Parity(id));
-            self.parity_confirmed.insert(id);
-            if group.iter().all(|m| self.parity_confirmed.contains(m)) {
-                self.forget_group(&group);
-                out.extend(self.settle_group(group));
+        // A published commit's straggler landing: one closer to BACKED_UP.
+        let mut backed = Vec::new();
+        self.backing.retain_mut(|b| {
+            if b.remaining.remove(&id) && b.remaining.is_empty() {
+                backed.extend(b.writes.iter().copied());
+                return false;
             }
-            return out;
-        }
+            true
+        });
+        out.extend(self.backed_up(backed));
 
+        let unacked = self.unacked();
         let Some(c) = self.pending.as_mut() else {
             // A confirmation for something no commit is waiting on. Duplicates
             // and stragglers are normal on a network; they are not errors and
             // they are not events.
             return out;
         };
-        if !c.data.contains(&id) || !c.confirmed.insert(id) {
+        // This commit's block, or an EARLIER commit's straggler that a group
+        // of this one was counting on (rule 10: it counts once it is acked).
+        let mine = c.data.contains(&id) && c.confirmed.insert(id);
+        if mine {
+            if let Some(members) = c.pack_members.get(&id).cloned() {
+                c.confirmed.extend(members);
+            }
+        }
+        let earlier = c.race.groups.iter().any(|g| g.earlier.contains(&id));
+        if !mine && !earlier {
             return out;
         }
-        if c.head_sent || (!head_early && c.confirmed.len() < c.data.len()) {
+        if c.head_sent || (!head_early && !c.ready(self.params.race_put, &unacked)) {
             return out;
         }
         // Every block of this commit has been READ BACK from our own node.
@@ -3859,27 +3815,26 @@ impl<B: Blocks> Engine<B> {
             seq: c.seq,
             root: c.root,
             base: c.base,
-            after: c.data.iter().copied().collect(),
+            // head_before_packs (off by default) is the one mode that sends
+            // the head BEFORE the race rule holds, so the page must still hold
+            // it until every block is in.
+            after: if head_early { c.data.iter().copied().collect() } else { c.race_set() },
         });
         out
     }
 
     fn on_failed(&mut self, id: Cid) -> Vec<Effect> {
-        // Re-emit exactly what is missing, and nothing else. A retry that
-        // re-sends the whole commit pays for every block again, and a retry
-        // that re-sends nothing stalls it for ever.
-        if self.owed_group_of(&id).is_some() {
-            // A FAILURE IS PACED LIKE SILENCE, never faster (sdk#150 review A).
-            // Re-putting on the spot -- or erasing the pace so the next emit
-            // re-asks -- turned a node answering every parity put FAILED into
-            // a put on every call (2100 PUTs in 100 ticks, executed), where
-            // silence re-asks once a window. The failure is recorded as an
-            // attempt made now; `emit_parity` re-asks when the pace says.
-            if !self.parity_confirmed.contains(&id) {
-                self.asks.failed(asks::Ask::Parity(id), self.now);
+        // A published commit's straggler the node refused: put it again from
+        // the page's blocks (the page keeps them until BACKED_UP).
+        if self.backing.iter().any(|b| b.remaining.contains(&id)) {
+            if let Some(bytes) = self.blocks.get(&id) {
+                return vec![Effect::PutBlock { id, bytes: bytes.to_vec(), after: Vec::new() }];
             }
             return Vec::new();
         }
+        // Re-emit exactly what is missing, and nothing else. A retry that
+        // re-sends the whole commit pays for every block again, and a retry
+        // that re-sends nothing stalls it for ever.
         let Some(c) = self.pending.as_ref() else {
             return Vec::new();
         };
@@ -3906,6 +3861,7 @@ impl<B: Blocks> Engine<B> {
         }
         Vec::new()
     }
+
 
     fn on_head(&mut self, seq: u64) -> Vec<Effect> {
         let mut out = Vec::new();
@@ -3935,47 +3891,32 @@ impl<B: Blocks> Engine<B> {
                 state: State::Published,
             });
         }
-        // Only the groups THIS commit coded. Assigning every currently-owed
-        // group to it would make a write wait on redundancy for data it never
-        // touched, coded by a commit it has nothing to do with.
-        //
-        // Groups already confirmed between the commit shipping and its head
-        // landing are not waited on: `owed` no longer holds them.
-        let still: BTreeSet<ParityIds> = c
-            .groups
-            .iter()
-            .filter(|g| self.owed.contains_key(*g))
-            .copied()
-            .collect();
-        for w in &c.writes {
-            // Parity for part of what it changed was never coded (the owed
-            // cap): it is not redundant and will not be told it is.
-            if c.uncoded {
-                self.parity_waiting.remove(w);
-                continue;
-            }
-            if still.is_empty() {
-                // A commit that coded no groups — a small write with no
-                // referenced values — owes nothing, so its writes are
-                // parity-complete as soon as they are published. Waiting for a
-                // group that does not exist is how a state gets skipped
-                // without `failed`.
-                self.parity_waiting.remove(w);
-                out.push(Effect::Notify {
-                    client: w.0,
-                    write_id: w.1,
-                    state: State::ParityComplete,
-                });
-            } else {
-                self.parity_waiting
-                    .insert(*w, still.iter().map(|k| k[0]).collect());
+        // SAVED is `Published`, just said. BACKED_UP (`ParityComplete`) when
+        // ALL k+m of every group the commit changed are acked (§P): its own
+        // blocks AND an earlier commit's stragglers in those groups (the
+        // members it counted in `earlier`). Counting only its own let a write
+        // be BACKED_UP while a group it changed still missed a block (the page
+        // model: "ParityComplete, but the root it was published at is not
+        // WHOLE"). Now, or as the rest land. The stragglers stay in `send()`
+        // with their re-sends (stall retry is still the standard); the engine
+        // only counts.
+        // SUPERSEDED stragglers first: this commit may re-code a group an
+        // earlier one is still putting; those old blocks are withdrawn and the
+        // earlier writes are carried onto THIS commit's Backing.
+        out.extend(self.supersede(was, c.root));
+        let still_out = self.unacked();
+        let mut remaining: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
+        remaining.extend(c.race.groups.iter().flat_map(|g| g.earlier.iter()).filter(|m| still_out.contains(*m)).copied());
+        let mut writes = c.writes.clone();
+        for w in std::mem::take(&mut self.carry) {
+            if !writes.contains(&w) {
+                writes.push(w);
             }
         }
-        // Coalescing off is the control: put each group's parity the moment
-        // its commit is published, so two commits touching one group pay
-        // twice.
-        if !self.params.coalesce_parity {
-            out.extend(self.emit_parity(|_| true));
+        if remaining.is_empty() {
+            out.extend(self.backed_up(writes));
+        } else {
+            self.backing.push(Backing { writes, remaining, since: self.now });
         }
         debug_assert!(self.folded.is_empty());
         // OWN PUBLISH (R-b, footnote 4): the front leaves the queue
@@ -4037,10 +3978,8 @@ impl<B: Blocks> Engine<B> {
         // sign there is nothing here to ship.
         if self.pending.is_none() && !self.unpublished.is_empty() {
             let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship, None));
+            out.extend(self.start_commit(to_ship, Vec::new(), None));
         }
-        // Every group, whatever its age and whether or not it settled.
-        out.extend(self.emit_parity(|_| true));
         out
     }
 
@@ -4075,13 +4014,6 @@ impl<B: Blocks> Engine<B> {
                     c.settle_at = now;
                 }
             }
-            // A group first owed before any clock is dated from the first,
-            // or its age bound would fire at once.
-            for o in self.owed.values_mut() {
-                if o.since == 0 {
-                    o.since = now;
-                }
-            }
         } else if now < self.now || now - self.now > CLOCK_RESET_TICKS {
             // A CLOCK RESET (sdk#150 review B). `now` is whatever the client
             // sends, and every deadline is measured against it: one tick ten
@@ -4101,24 +4033,11 @@ impl<B: Blocks> Engine<B> {
             if let Some(p) = self.parked_write.as_mut() {
                 p.idle_at = now;
             }
-            for o in self.owed.values_mut() {
-                o.since = now;
-                o.last_changed = o.last_changed.min(now);
-            }
         }
         self.now = now;
         let mut out = self.age_out_accepted(now);
         out.extend(self.release_silent_parked_write(now));
         out.extend(self.settle_by_fact(now));
-        if !self.params.coalesce_parity {
-            return out;
-        }
-        let age = self.params.parity_age;
-        // A group that did not change this tick has settled; one that keeps
-        // changing goes out anyway once it has been unprotected long enough.
-        out.extend(self.emit_parity(move |o: &Owed| {
-            o.last_changed < now || now.saturating_sub(o.since) >= age
-        }));
         out
     }
 
@@ -4218,209 +4137,10 @@ impl<B: Blocks> Engine<B> {
         out
     }
 
-    /// Recover the BYTES behind owed groups the context carried as ids only.
-    ///
-    /// Parity is a pure function of a group's members, so the same group
-    /// gives the same three blocks under the same three ids whoever computes
-    /// them. What the context cannot carry is which NODE lists a given trio,
-    /// and that is found by walking the tree — so this is a READ, and it is
-    /// bounded and resumable like one. Blocks it could not read are fetched
-    /// and the groups stay owed; the next call picks up where this stopped.
-    ///
-    /// Without it a rehydrated engine marked every owed group sent and put
-    /// nothing behind it. In production EVERY call is a rehydration, so that
-    /// was not an edge case: it was all of them, and the redundancy the tree
-    /// promised was silently never written.
-    fn recompute_owed(&mut self, of: BTreeSet<ParityIds>) -> Vec<Effect> {
-        let wanted: BTreeSet<ParityIds> = of
-            .into_iter()
-            .filter(|k| self.owed.get(k).is_some_and(|o| o.blocks.is_empty()))
-            .collect();
-        if wanted.is_empty() {
-            return Vec::new();
-        }
-        let mut found: Vec<(ParityIds, ParityBlocks)> = Vec::new();
-        let mut need: BTreeSet<Cid> = BTreeSet::new();
-        let mut left = self.params.max_parity_scan_blocks;
-        // RESUME where the last call stopped (sdk#181). A fresh walk only when
-        // there is none, or the root it was walking is no longer ours.
-        let mut walk = match self.parity_walk.take() {
-            Some(w) if w.root == self.root => w,
-            _ => ParityWalk::from(self.root),
-        };
-        // Nodes not held THIS call: asked for, and put back on the walk so a
-        // later call visits them once they arrive — dropping them would skip
-        // their subtree for the rest of the walk.
-        let mut deferred: Vec<Cid> = Vec::new();
-        {
-            let source = self.source();
-            let stack = &mut walk.stack;
-            let seen = &mut walk.seen;
-            let mut still: BTreeSet<ParityIds> = wanted.clone();
-            while let Some(cid) = stack.pop() {
-                if still.is_empty() || left == 0 {
-                    stack.push(cid);
-                    break;
-                }
-                if !seen.insert(cid) {
-                    continue;
-                }
-                let Some(bytes) = source.get(&cid) else {
-                    // The walk stopped here. Ask for it; the group stays owed
-                    // and a later call comes back to it.
-                    need.insert(cid);
-                    seen.remove(&cid);
-                    deferred.push(cid);
-                    continue;
-                };
-                left -= 1;
-                let Ok(node) = Node::parse(bytes) else {
-                    continue;
-                };
-                // Does this node list any trio still wanted?
-                let lists: Vec<Cid> = node.parity().collect();
-                let here: BTreeSet<ParityIds> = lists
-                    .chunks_exact(3)
-                    .map(|t| [t[0], t[1], t[2]])
-                    .filter(|k| still.contains(k))
-                    .collect();
-                if !here.is_empty() {
-                    match freenet_prolly::parity::blocks_of(&node, &source) {
-                        Some(all) => {
-                            // Matched by the ids the coding PRODUCES, not by
-                            // position: a group is identified by its three
-                            // parity ids, and checking them makes the match
-                            // self-verifying rather than order-dependent.
-                            for trio in all.chunks_exact(3) {
-                                let key: ParityIds = [trio[0].0, trio[1].0, trio[2].0];
-                                if still.remove(&key) {
-                                    found.push((key, trio.to_vec()));
-                                }
-                            }
-                        }
-                        None => {
-                            // A member is not held. Parity over a member whose
-                            // bytes nobody has is parity over nothing, so ask
-                            // for the members and leave the group owed.
-                            for (_, members) in freenet_prolly::parity::group_members(&node) {
-                                for m in members {
-                                    if source.get(&m).is_none() {
-                                        need.insert(m);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if !node.is_leaf() {
-                    for i in 0..node.len() {
-                        stack.push(node.child(i).0);
-                    }
-                }
-            }
-        }
-        walk.stack.extend(deferred);
-        // A walk that has visited the whole tree starts again at the root on
-        // the next call: a group still wanted may be listed by a node that
-        // was not held on the way past.
-        if !walk.stack.is_empty() {
-            self.parity_walk = Some(walk);
-        }
-        for (key, blocks) in found {
-            if let Some(o) = self.owed.get_mut(&key) {
-                o.blocks = blocks;
-            }
-        }
-        need.into_iter()
-            .map(|id| Effect::FetchBlock {
-                id,
-                via: read::Via::Direct,
-                attempt: 1,
-            })
-            .collect()
-    }
 
-    fn emit_parity(&mut self, want: impl Fn(&Owed) -> bool) -> Vec<Effect> {
-        // NOTHING FOR A COMMIT THAT IS NOT PUBLISHED (sdk#150). A parity put
-        // goes out `after` the published root, and a group coded by the
-        // commit in flight has members that root does not hold. For the FIRST
-        // commit that root is the empty tree's, which nobody puts or
-        // confirms: the puts were held and dropped with the call, and under
-        // `sent` the first save's redundancy was lost for good. The group
-        // goes out on the first emit after its commit publishes.
-        //
-        // (A `published_seq == 0` guard beside this was killed by no test --
-        // this filter already covers the first commit -- so it is not here.)
-        let unpublished: BTreeSet<ParityIds> = self
-            .pending
-            .as_ref()
-            .map(|c| c.groups.clone())
-            .unwrap_or_default();
-        let (now, every) = (self.now, self.params.reask_after);
-        // What is owed, from fact: a block not confirmed. Whether to ask for
-        // it NOW is the pacing table's only question.
-        let due: Vec<ParityIds> = self
-            .owed
-            .iter()
-            .filter(|(k, o)| !unpublished.contains(*k) && want(o))
-            .filter(|(k, _)| {
-                k.iter().any(|id| {
-                    !self.parity_confirmed.contains(id)
-                        && self.asks.due(&asks::Ask::Parity(*id), now, every)
-                })
-            })
-            .map(|(k, _)| *k)
-            .collect();
-        // A rehydrated engine owes groups it has no bytes for: recover the
-        // ones about to be asked for.
-        let mut out = self.recompute_owed(due.iter().copied().collect());
-        for key in due {
-            let blocks = self
-                .owed
-                .get(&key)
-                .map(|o| o.blocks.clone())
-                .unwrap_or_default();
-            for (id, bytes) in blocks {
-                let ask = asks::Ask::Parity(id);
-                if self.parity_confirmed.contains(&id) || !self.asks.due(&ask, now, every) {
-                    continue;
-                }
-                // Full: a NEW ask waits for a place; it stays owed.
-                if self.asks.get(&ask).is_none() && self.asks.len() >= self.params.max_asks {
-                    continue;
-                }
-                self.asks.asked(ask, now);
-                out.push(Effect::PutParity {
-                    group: key,
-                    id,
-                    bytes,
-                    after: vec![self.published_root],
-                });
-            }
-        }
-        out
-    }
 
-    /// The owed group a parity block belongs to. A group IS its three ids.
-    fn owed_group_of(&self, id: &Cid) -> Option<ParityIds> {
-        self.owed.keys().find(|k| k.contains(id)).copied()
-    }
 
-    /// Whether anything of this group has been asked for or confirmed.
-    fn parity_touched(&self, key: &ParityIds) -> bool {
-        key.iter().any(|id| {
-            self.parity_confirmed.contains(id) || self.asks.get(&asks::Ask::Parity(*id)).is_some()
-        })
-    }
 
-    /// A group stopped being owed: its facts and its asks go with it.
-    fn forget_group(&mut self, key: &ParityIds) {
-        self.owed.remove(key);
-        for id in key {
-            self.parity_confirmed.remove(id);
-            self.asks.settled(&asks::Ask::Parity(*id));
-        }
-    }
 }
 
 /// Whether an engine's owed parity covers the WHOLE published tree (sdk#119).
@@ -4440,22 +4160,7 @@ pub enum ParityScan {
     Done { root: Cid },
 }
 
-/// `recompute_owed`'s walk, kept between calls so it RESUMES (sdk#181).
-#[derive(Clone, Debug)]
-struct ParityWalk {
-    /// The root being walked; a different root starts a new walk.
-    root: Cid,
-    /// Nodes still to visit.
-    stack: Vec<Cid>,
-    /// Nodes already visited in this walk.
-    seen: BTreeSet<Cid>,
-}
 
-impl ParityWalk {
-    fn from(root: Cid) -> Self {
-        ParityWalk { root, stack: vec![root], seen: BTreeSet::new() }
-    }
-}
 
 /// The worst case, in context bytes, of everything carried that is not a
 /// parked read, at `params`' caps. Each unit's size is MEASURED by encoding
@@ -4466,14 +4171,8 @@ pub(crate) fn worst_case_fixed_bytes(params: &Params) -> usize {
     let enc = |n: Result<u64, bincode::Error>| n.map_or(usize::MAX / 16, |n| n as usize);
     let o = || bincode::DefaultOptions::new().with_fixint_encoding();
     let cid: Cid = [0u8; 32];
-    let group: ParityIds = [cid; 3];
-    // An owed group: its ids and ages, and up to two of its blocks confirmed.
-    let owed_unit = enc(o().serialized_size(&(group, 0u64, 0u64))) + 2 * enc(o().serialized_size(&cid));
-    // A parity wait: one group id in a waiter's set, and (at worst, one per
-    // ref) the waiter's own key and set length.
-    let wait_unit = enc(o().serialized_size(&cid))
-        + enc(o().serialized_size(&(ClientId(0), WriteId(0))))
-        + 8;
+    let group: ParityIds = [cid; PARITY];
+
     // The commit in flight, at its caps: data and confirmed ids, one group per
     // block at most, the carried ops, and its few writes and scalars.
     let m = |a: usize, b: usize| a.saturating_mul(b);
@@ -4494,8 +4193,6 @@ pub(crate) fn worst_case_fixed_bytes(params: &Params) -> usize {
         parked_write,
         subs,
         asks,
-        m(params.max_owed_groups, owed_unit),
-        m(params.max_parity_waiting_refs, wait_unit),
         scalars,
     ]
     .into_iter()
@@ -4600,6 +4297,7 @@ impl<B: Blocks> Engine<B> {
                     // re-descend through this block on its next attempt.
                     if let Some(p) = self.reads.parked.get_mut(r) {
                         p.held.extend(landed.iter().copied());
+                        p.arrived = p.arrived.saturating_add(1);
                     }
                 }
                 woken.extend(reqs);
@@ -4848,9 +4546,15 @@ impl<B: Blocks> Engine<B> {
         // WITHDRAWN (sdk#303): a slot no repair asks for any more, no read waits on, and the page does not
         // hold is no longer wanted -- its GET is dropped, not re-asked for ever.
         for slot in freed {
-            if !self.reads.waiting.contains_key(&slot) && self.blocks.get(&slot).is_none() {
-                self.withdrawn.insert(slot);
-            }
+            self.withdraw_if_unwanted(slot);
+        }
+    }
+
+    /// A block no read waits on and the page does not hold is WITHDRAWN: its GET ends instead of being re-asked for
+    /// ever (sdk#303). The one statement of "unwanted", for a freed repair slot and a superseded read's blocks alike.
+    fn withdraw_if_unwanted(&mut self, id: Cid) {
+        if !self.reads.waiting.contains_key(&id) && self.blocks.get(&id).is_none() {
+            self.withdrawn.insert(id);
         }
     }
 
@@ -5012,17 +4716,6 @@ struct Context {
     root: Cid,
     next_seq: u64,
     pending: Option<Commit>,
-    /// Groups whose parity is owed, by their ids. The BYTES are not here:
-    /// parity is a pure function of a group's members, so a re-hydrated
-    /// engine recomputes them from the node's blocks and puts the same bytes
-    /// under the same ids. Idempotent by construction.
-    /// With each group's ages, `(ids, last_changed, since)`: rebuilt as 0 on
-    /// every rehydrate, they made a group's parity fire on the first tick
-    /// after ANY call boundary, whatever `parity_age` said (sdk#150).
-    owed_groups: Vec<(ParityIds, u64, u64)>,
-    /// Parity blocks of owed groups the node CONFIRMED. A group settles when
-    /// all three are in; the ack for each arrives in its own later call.
-    parity_confirmed: Vec<Cid>,
     /// Asks not yet answered, and when each last went out: PACING only
     /// (`asks`). It replaced `in_flight_parity`, from which `Owed::sent` was
     /// re-derived on every call -- so an emission recorded as a fact was
@@ -5031,7 +4724,6 @@ struct Context {
     parked: Vec<(read::ReqId, read::Parked)>,
     waiting: Vec<(Cid, Vec<read::ReqId>)>,
     attempts: Vec<(Cid, u32)>,
-    parity_waiting: Vec<((ClientId, WriteId), Vec<Cid>)>,
     head_epoch: Option<Epoch>,
     /// The fetch state of the write waiting on a cold tree path (its ops are
     /// in the page's queue, R-b, never here).
@@ -5116,7 +4808,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 12;
+const CONTEXT_VERSION: u16 = 13;
 
 /// What a context this build wrote begins with.
 ///
@@ -5205,7 +4897,6 @@ impl<B: Blocks> Engine<B> {
         let carries = self.params.context_carries_pending;
         let none_u64: Option<u64> = None;
         let none_commit: Option<Commit> = None;
-        let owed_entry = sz(o.serialized_size(&([[0u8; 32]; 3], 0u64, 0u64)));
         let told: Vec<(ClientId, WriteId)> = Vec::new();
         CONTEXT_HEADER
             + sz(o.serialized_size(&CONTEXT_VERSION))
@@ -5215,14 +4906,10 @@ impl<B: Blocks> Engine<B> {
             } else {
                 sz(o.serialized_size(&none_commit))
             }
-            + 8
-            + self.owed.len() * owed_entry
-            + sz(o.serialized_size(&self.parity_confirmed))
             + sz(o.serialized_size(&self.asks.to_vec()))
             + sz(o.serialized_size(&self.reads.parked))
             + sz(o.serialized_size(&self.reads.waiting))
             + sz(o.serialized_size(&self.reads.attempts))
-            + sz(o.serialized_size(&self.parity_waiting))
             + sz(o.serialized_size(&self.head_epoch))
             + sz(o.serialized_size(&self.parked_write))
             + sz(o.serialized_size(&self.subs))
@@ -5247,12 +4934,6 @@ impl<B: Blocks> Engine<B> {
             } else {
                 None
             },
-            owed_groups: self
-                .owed
-                .iter()
-                .map(|(k, o)| (*k, o.last_changed, o.since))
-                .collect(),
-            parity_confirmed: self.parity_confirmed.iter().copied().collect(),
             asks: self.asks.to_vec(),
             parked: self
                 .reads
@@ -5267,11 +4948,6 @@ impl<B: Blocks> Engine<B> {
                 .map(|(c, r)| (*c, r.iter().copied().collect()))
                 .collect(),
             attempts: self.reads.attempts.iter().map(|(c, n)| (*c, *n)).collect(),
-            parity_waiting: self
-                .parity_waiting
-                .iter()
-                .map(|(w, g)| (*w, g.iter().copied().collect()))
-                .collect(),
             head_epoch: self.head_epoch,
             parked_write: self.parked_write.clone(),
             subs: self.subs.clone(),
@@ -5369,23 +5045,6 @@ impl<B: Blocks> Engine<B> {
         e.told_stalled = c.told_stalled.into_iter().collect();
         e.now = c.now;
         e.recovered = true;
-        // The owed groups come back as ids with no bytes. They are recomputed
-        // on demand from the node's blocks, which is sound because parity is a
-        // pure function of its members: the same group gives the same three
-        // blocks under the same three ids, whoever computes them.
-        // Nothing about an ask is re-derived here: what was confirmed is
-        // carried as the node said it, and what was asked only paces.
-        for (key, last_changed, since) in c.owed_groups {
-            e.owed.insert(
-                key,
-                Owed {
-                    blocks: Vec::new(),
-                    last_changed,
-                    since,
-                },
-            );
-        }
-        e.parity_confirmed = c.parity_confirmed.into_iter().collect();
         e.asks = asks::Asks::from_vec(c.asks);
         for (r, p) in c.parked {
             e.reads.parked.insert(r, p);
@@ -5395,9 +5054,6 @@ impl<B: Blocks> Engine<B> {
         }
         for (cid, n) in c.attempts {
             e.reads.attempts.insert(cid, n);
-        }
-        for (w, gs) in c.parity_waiting {
-            e.parity_waiting.insert(w, gs.into_iter().collect());
         }
         e
     }

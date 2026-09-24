@@ -15,7 +15,7 @@ fn put(k: &str, v: &str) -> (Vec<u8>, Op) {
 
 fn to_node(fx: &[Effect]) -> usize {
     fx.iter()
-        .filter(|f| matches!(f, Effect::PutBlock { .. } | Effect::PutPack { .. } | Effect::PutParity { .. } | Effect::UpdateHead { .. }))
+        .filter(|f| matches!(f, Effect::PutBlock { .. } | Effect::PutPack { .. } | Effect::UpdateHead { .. }))
         .count()
 }
 
@@ -73,7 +73,7 @@ fn nothing_is_cut_while_it_cannot_sign_and_one_commit_carries_the_queue_when_it_
         guard += 1;
         assert!(guard < 10_000, "the commit did not settle");
         let more = match f {
-            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } | Effect::PutParity { id, .. } => e.step(Event::PutConfirmed(id)),
+            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => e.step(Event::PutConfirmed(id)),
             Effect::UpdateHead { seq, .. } => {
                 heads.push(seq);
                 e.step(Event::HeadConfirmed(seq))
