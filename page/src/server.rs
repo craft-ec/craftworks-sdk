@@ -351,6 +351,17 @@ impl Server {
         self.out.extend(out.replies);
     }
 
+    /// The node's `HeadChanged` for the head register WITH its full state
+    /// (sdk#378 P3): the page may take it as its own owed head's read-back,
+    /// and otherwise treats it as the hint it always was.
+    pub fn head_pushed(&mut self, read: crate::HeadRead) {
+        let mut out = Outbound::default();
+        self.page.head_pushed(read);
+        self.drain(&mut out);
+        self.answer_call(&mut out);
+        self.out.extend(out.replies);
+    }
+
     pub fn tick(&mut self, now_ms: Ms) {
         let mut out = Outbound::default();
         self.page.tick(now_ms);

@@ -998,12 +998,17 @@ impl PageIo {
             }
             // The head moved on the node (the subscription the head read
             // took): the RELOAD TRIGGER. A hint only — the page READS the
-            // register and adopts only what that read shows (sdk#225).
-            Incoming::HeadChanged { key } if key == self.register_key => {
+            // register and adopts only what that read shows (sdk#225). A FULL
+            // state may confirm this page's OWN owed head (sdk#378 P3); the
+            // page decides, through its one read-back rule.
+            Incoming::HeadChanged { key, state } if key == self.register_key => {
                 // What the subscription DELIVERED: counted, so "subscribed"
                 // can be told from "subscribed and being told" (sdk#259).
                 self.head_changes += 1;
-                self.server.head_hint();
+                match state.as_deref().and_then(page::HeadRead::from_record) {
+                    Some(read) => self.server.head_pushed(read),
+                    None => self.server.head_hint(),
+                }
             }
             Incoming::Refused(r) => {
                 // While the first exchange is unanswered, a refusal that names
@@ -1036,7 +1041,7 @@ impl PageIo {
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             // A site's change is its own (taken, and read by nobody: the page does not follow a site).
-            Incoming::HeadChanged { key } => *key == self.register_key || self.sites.values().any(|s| s.key == *key),
+            Incoming::HeadChanged { key, .. } => *key == self.register_key || self.sites.values().any(|s| s.key == *key),
             Incoming::Partial => true,
             Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::Refused(_) | Incoming::Unusable(_) => !self.read_only(),
         }

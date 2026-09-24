@@ -34,11 +34,13 @@
 //! | a signer answer under any id but the in-flight sign's (SG02), or not shaped like a sign's | ignored: it does NOT clear the sign's deadline |
 //! | any other `Refused(why)` | nothing more is asked; recorded in [`Page::unusable`]; the engine's own clock reports the write `Stalled` |
 //! | `Updated` | a register read ([`Op::ReadHead { label: Label::Head }`]) — this commit's read-back, or a landing's verify read: an UpdateResponse carries nothing (F56). On a peered node the register is read through the head SUBSCRIPTION (F55); the web layer frames it so |
-//! | `Head(Some(mine))` while a head is owed | `HeadConfirmed(seq)` — the only way a commit is Published |
+//! | `Head(Some(mine))` while a head is owed | `HeadConfirmed(seq)` — the only way a commit is Published (a pushed FULL state showing exactly mine is judged by this same row: below) |
 //! | `Head(older seq)` while owed | not visible yet: the head is read again next tick, and after [`HEAD_READS`] reads the UPDATE is re-sent |
 //! | `Head(newer seq, or same seq another root)` while owed | `HeadConflict` |
 //! | `Head(None)` while owed | the UPDATE is re-sent |
 //! | `Head(..)` for the engine's own `ReadHead` | `HeadRead` / `HeadMissing` (recovery) — kept apart from a read-back, which only judges the owed head |
+//! | `HeadChanged` hint (no full state, or not this page's owed head) | a register read (`Waiting::Hint`) — unless a verify or this page's own READ-BACK is owed: that read judges whatever the register holds, so a second is only a node op on the node's one queue (sdk#378 P2, F61) |
+//! | `HeadChanged` with a FULL state showing EXACTLY this page's owed (seq, root) | the read-back is done: `HeadConfirmed(seq)` through the read-back rule; the UPDATE's and read-back's waits end with no RTT sample, and the UPDATE's later answer asks nothing. Any other pushed state is the hint above; a dropped push leaves the read-back GET to its deadline (sdk#378 P3, the architect's three conditions) |
 //! | `FetchBlock` | [`Op::Get`]; `Got` → verified, joins [`PageBlocks`], `BlockArrived`; `GetMissed` → `BlockMissed` |
 //! | any op unanswered for its RTO ([`rto`]: RFC 6298 over this page's own completed calls, Karn, §5.5 back-off; GETs also in a congestion window) | re-sent as it was — every op here is idempotent (a block is its hash, a sign re-ask is answered AlreadySigned, a record is the same record). No fixed deadline anywhere: the 30 s budgets are give-ups, not retry timers |
 //!
@@ -1011,6 +1013,8 @@ impl Page {
                 }
             }
             Answer::Updated { label: Label::Head } => {
+                // Its read-back already done by the pushed state (sdk#378 P3): the
+                // UPDATE's wait ended there, so this answer asks nothing more.
                 if self.answered(&Waiting::Update(Label::Head)).is_some() {
                     // A LANDING's UPDATE is judged by its own read — does the
                     // register now hold the head the signer named — never by
@@ -1367,12 +1371,47 @@ impl Page {
 
     /// The node said the head register changed (`HeadChanged`, a HINT a node
     /// can fabricate or drop): read it. ALWAYS — owed parity, an owed head
-    /// or idle alike (the architect's #5): only a verify in progress, which
-    /// reads the register itself, makes it redundant.
+    /// or idle alike (the architect's #5) — except while a read of the same
+    /// register is already owed: a verify in progress, or this page's own
+    /// READ-BACK (sdk#378 P2: its UPDATE is out, and the read-back that
+    /// follows its answer reads the register and judges whatever it holds —
+    /// this page's head, a newer one, a same-seq winner — so a second read
+    /// adds nothing but a node op on the node's one queue, F61).
     pub fn head_hint(&mut self) {
-        if self.verify.is_none() && !self.deadlines.contains_key(&Waiting::Hint) {
+        if self.verify.is_none() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
+    }
+
+    /// Is this page's own read-back owed: a head signed, its UPDATE sent, not yet confirmed (sdk#378)?
+    fn read_back_owed(&self) -> bool {
+        self.head.owed.as_ref().is_some_and(|o| o.record.is_some())
+    }
+
+    /// The node pushed the head register's FULL state (sdk#378 P3, the
+    /// architect's three conditions): (1) only a full state gets here
+    /// (`wire`'s `HeadChanged.state`); (2) it is judged by the ONE read-back
+    /// rule, and only as THIS page's own owed head -- exactly the owed seq and
+    /// root confirms it, as a read-back GET showing it would; anything else is
+    /// the hint it always was, answered by a real register read; (3) a dropped
+    /// push changes nothing: the read-back GET after the UPDATE's answer does
+    /// the job on its deadline. Nothing is ever ADOPTED from a push.
+    pub fn head_pushed(&mut self, read: HeadRead) {
+        let confirms = self.verify.is_none()
+            && self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && (o.seq, o.root) == (read.seq, read.root()));
+        if !confirms {
+            return self.head_hint();
+        }
+        self.last_head_at = self.now;
+        let h = Some((read.seq, read.root()));
+        self.last_head = Some(read);
+        // The read-back this push stands in for is no longer owed: whatever
+        // is on the wire for it -- the UPDATE whose answer would ask it, or the
+        // GET itself -- ends here, with no RTT sample (a push is not an answer
+        // to either request).
+        self.deadlines.remove(&Waiting::Update(Label::Head));
+        self.deadlines.remove(&Waiting::ReadBack(Label::Head));
+        self.on_read_back(h);
     }
 
     /// A record the signer returned (`Signed`, or `AlreadySigned`: the one it
