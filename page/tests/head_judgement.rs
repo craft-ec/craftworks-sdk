@@ -101,6 +101,12 @@ const LIB: &str = include_str!("../src/lib.rs");
 const JUDGE: &str = include_str!("../src/judge.rs");
 const OTHERS: [(&str, &str); 3] = [("fates.rs", include_str!("../src/fates.rs")), ("rto.rs", include_str!("../src/rto.rs")), ("server.rs", include_str!("../src/server.rs"))];
 
+/// The PRODUCTION part of a source file: everything before its first `#[cfg(test)]` (test modules sit at the end
+/// and may use the tie-break to BUILD inputs; the rule is about what the page does, not how a test makes a head).
+fn production(src: &str) -> &str {
+    src.split("\n#[cfg(test)]").next().expect("a first part")
+}
+
 /// The body of `fn <name>(` in `src`, by brace matching from the signature: `None` if there is no such fn.
 fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     let start = src.find(&format!("fn {name}("))?;
@@ -133,24 +139,26 @@ fn builds(src: &str, variant: &str) -> usize {
 /// Each assertion has its control: the reader finds the real bodies, or the counts could be zero over nothing.
 #[test]
 fn every_register_answer_is_judged_in_one_place_and_adopted_through_one_door() {
-    let adopt = body_of(LIB, "adopt").expect("THE CONTROL: the reader found no `fn adopt` in page/src/lib.rs");
+    let lib = production(LIB);
+    assert!(lib.contains("fn adopt(") && lib.contains("fn step(") && lib.len() * 2 > LIB.len(), "THE CONTROL: the production cut of lib.rs lost the code it judges ({} of {} bytes)", lib.len(), LIB.len());
+    let adopt = body_of(lib, "adopt").expect("THE CONTROL: the reader found no `fn adopt` in page/src/lib.rs");
     for v in ["HeadRead", "HeadConflict"] {
         assert_eq!(builds(adopt, v), 1, "THE CONTROL: `fn adopt` does not build Event::{v} exactly once (the reader read no real body)");
-        assert_eq!(builds(LIB, v), 1, "Event::{v} is built outside `fn adopt`: a head can be adopted without the one judgement");
+        assert_eq!(builds(lib, v), 1, "Event::{v} is built outside `fn adopt`: a head can be adopted without the one judgement");
         for (name, src) in OTHERS {
-            assert_eq!(builds(src, v), 0, "page/src/{name} builds Event::{v}: a head adopted outside `fn adopt`");
+            assert_eq!(builds(production(src), v), 0, "page/src/{name} builds Event::{v}: a head adopted outside `fn adopt`");
         }
     }
     // The `Heard` a head is adopted from: built only by the judgement.
     assert!(body_of(JUDGE, "judge").is_some_and(|b| b.contains("Heard {")), "THE CONTROL: `judge` does not build a Heard");
     assert_eq!(JUDGE.matches("Heard {").count(), 3, "a Heard is built somewhere in judge.rs other than `judge` (struct, impl, the one literal)");
-    assert_eq!(LIB.matches("Heard {").count(), 0, "page/src/lib.rs builds a Heard: only the judgement may");
+    assert_eq!(lib.matches("Heard {").count(), 0, "page/src/lib.rs builds a Heard: only the judgement may");
     // The tie-break: called only in judge.rs (its definition stays in lib.rs, pinned against the Register).
     let calls = |src: &str| src.matches("beats(").count() - src.matches("fn beats(").count();
     assert!(calls(JUDGE) >= 2, "THE CONTROL: judge.rs calls the tie-break {} time(s); it is where the head's and the site's are judged", calls(JUDGE));
-    assert_eq!(calls(LIB), 0, "page/src/lib.rs calls the tie-break itself: a second judgement");
+    assert_eq!(calls(lib), 0, "page/src/lib.rs calls the tie-break itself: a second judgement");
     for (name, src) in OTHERS {
-        assert_eq!(calls(src), 0, "page/src/{name} calls the tie-break itself: a second judgement");
+        assert_eq!(calls(production(src)), 0, "page/src/{name} calls the tie-break itself: a second judgement");
     }
-    assert!(!LIB.contains("fn my_winning_record"), "the per-site tie-break check is back in lib.rs");
+    assert!(!lib.contains("fn my_winning_record"), "the per-site tie-break check is back in lib.rs");
 }

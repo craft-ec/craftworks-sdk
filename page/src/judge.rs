@@ -53,27 +53,27 @@ impl Heard {
     }
 }
 
-/// THE judgement of one register answer `h`, against this page's own signed records (`my_records`: seq -> (root,
-/// record bytes)) and the head as just read (`last_head`, whose whole value the tie-break compares).
-pub(crate) fn judge(h: Option<(u64, Cid)>, my_records: &BTreeMap<u64, (Cid, Vec<u8>)>, last_head: Option<&HeadRead>) -> Judged {
-    let Some((seq, root)) = h else { return Judged::NoHead };
-    match winning_record(seq, &root, my_records, last_head) {
+/// THE judgement of one register answer: the head as READ (`read`, whole -- the Register's tie-break is over
+/// VALUES, so a bare (seq, root) cannot be judged and cannot be passed), against this page's own signed records
+/// (`my_records`: seq -> (root, record bytes)). A path that has only a (seq, root) reads the head first.
+pub(crate) fn judge(read: Option<&HeadRead>, my_records: &BTreeMap<u64, (Cid, Vec<u8>)>) -> Judged {
+    let Some(read) = read else { return Judged::NoHead };
+    let (seq, root) = (read.seq, read.root());
+    match winning_record(read, my_records) {
         Some(record) => Judged::MineWins { seq, root, record },
         None => Judged::Head(Heard { seq, root }),
     }
 }
 
-/// THIS page's own record at `seq`, if it is another root than `root` and WINS the tie-break against it.
-fn winning_record(seq: u64, root: &Cid, my_records: &BTreeMap<u64, (Cid, Vec<u8>)>, last_head: Option<&HeadRead>) -> Option<Vec<u8>> {
-    let (mine_root, bytes) = my_records.get(&seq)?;
-    if mine_root == root {
+/// THIS page's own record at the read's seq, if it is another root and WINS the tie-break against the read's
+/// whole value.
+fn winning_record(read: &HeadRead, my_records: &BTreeMap<u64, (Cid, Vec<u8>)>) -> Option<Vec<u8>> {
+    let (mine_root, bytes) = my_records.get(&read.seq)?;
+    if *mine_root == read.root() {
         return None;
     }
-    // Theirs by its whole value, as just read (a bare root if it came some other way); mine by the value the
-    // signer signed.
-    let theirs = last_head.filter(|h| h.seq == seq && h.root() == *root).map_or_else(|| root.to_vec(), |h| h.value().to_vec());
     let mine = HeadRead::from_record(bytes)?;
-    beats(mine.value(), &theirs).then(|| bytes.clone())
+    beats(mine.value(), read.value()).then(|| bytes.clone())
 }
 
 /// What a SITE's register read IS, to the site this page owes (the module table's Site column). A site adopts

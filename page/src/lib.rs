@@ -1052,7 +1052,7 @@ impl Page {
                     }
                 }
                 // THE ONE JUDGEMENT (sdk#396): every head read this answer ends acts on this verdict, never on `h`.
-                let j = judge(h, &self.my_records, self.last_head.as_ref());
+                let j = judge(self.last_head.as_ref(), &self.my_records);
                 let recover_attempt = self.deadlines.get(&Waiting::RecoverHead).map(|d| d.attempt);
                 if self.answered(&Waiting::RecoverHead).is_some() {
                     match &j {
@@ -1406,7 +1406,6 @@ impl Page {
             return self.head_hint();
         }
         self.last_head_at = self.now;
-        let h = Some((read.seq, read.root()));
         self.last_head = Some(read);
         // The read-back this push stands in for is no longer owed: whatever
         // is on the wire for it -- the UPDATE whose answer would ask it, or the
@@ -1414,7 +1413,7 @@ impl Page {
         // to either request).
         self.deadlines.remove(&Waiting::Update(Label::Head));
         self.deadlines.remove(&Waiting::ReadBack(Label::Head));
-        let j = judge(h, &self.my_records, self.last_head.as_ref());
+        let j = judge(self.last_head.as_ref(), &self.my_records);
         self.on_read_back(&j);
     }
 
@@ -3034,5 +3033,81 @@ mod head_floor {
         p.answer(Answer::Head { label: Label::Head, read: Some(HeadRead::from((2, [2u8; 32]))) }, Ms(due + 10));
         assert!(p.recovered(), "a head at the floor was not adopted");
         assert_eq!(p.head_floor_wait(), None);
+    }
+}
+
+#[cfg(test)]
+mod head_judgement_cells {
+    //! The two cells the one judgement (sdk#396) changed beyond the gap, each forced: a register answer showing a
+    //! head THIS page's record beats, at a seq ABOVE the one the path was asked about, is never adopted.
+    use super::*;
+
+    const KEY: [u8; 32] = [7u8; 32];
+
+    /// THIS page's signed record at `seq` over `value` (the real Register format), and it read as a head.
+    fn my_record(seq: u64, value: &[u8]) -> (Vec<u8>, HeadRead) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&KEY);
+        let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
+        let record = contract_keys::register::head_state(&params, &sk.to_bytes(), seq, value).expect("signs");
+        let read = HeadRead::from_record(&record).expect("reads as a head");
+        (record, read)
+    }
+
+    /// A head at `mine.seq` under another root whose whole value LOSES the tie-break to `mine`.
+    fn a_losing_head(mine: &HeadRead) -> HeadRead {
+        (1u8..=255)
+            .map(|b| HeadRead::from_value(mine.seq, &[b; 32]).expect("a head"))
+            .find(|h| h.root() != mine.root() && beats(mine.value(), h.value()))
+            .expect("some root loses to mine")
+    }
+
+    /// A page whose opening head read is answered away (so an answer reaches only the path under test).
+    fn page() -> Page {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.answered(&Waiting::RecoverHead);
+        let _ = p.take_ops();
+        p
+    }
+
+    /// **VERIFY, above the signer's seq.** The signer named seq 0 (`NotNext`), the register shows seq 1 under a root
+    /// THIS page's record at seq 1 beats. Mine is LANDED (its UPDATE, my record's bytes), never adopted. The old
+    /// verify judged the tie-break only AT the signer's seq and adopted above it. Mutant "land only at the signer's
+    /// seq (`==`)" -> no UPDATE of mine -> red.
+    #[test]
+    fn a_verify_above_the_signers_seq_lands_a_head_my_record_beats_and_adopts_nothing() {
+        let mut p = page();
+        let (record, mine) = my_record(1, &[0xAA; 32]);
+        p.my_records.insert(1, (mine.root(), record.clone()));
+        let theirs = a_losing_head(&mine);
+        p.verify = Some(Verify { seq: 0, root: [0u8; 32], landing: false, again_at: None, tries: 0, updates: 0, from: None });
+        p.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
+        let _ = p.take_ops();
+        let before = p.published();
+        p.answer(Answer::Head { label: Label::Head, read: Some(theirs.clone()) }, Ms(10));
+        assert_ne!(p.published(), (theirs.seq, theirs.root()), "verify adopted a head this page's own record beats");
+        assert_eq!(p.published(), before, "verify moved the head on a head this page's own record beats");
+        let ops = p.take_ops();
+        assert!(ops.iter().any(|o| matches!(o, Op::Update { label: Label::Head, state } if *state == record)), "my winning record was not landed (its UPDATE): {ops:?}");
+    }
+
+    /// **READ-BACK, above the owed seq.** This page owes seq 1; the register shows seq 2 under a root THIS page's
+    /// record at seq 2 beats. Not adopted: the commit stays owed, and it is read again (a stale read counted). The
+    /// old read-back judged the tie-break only AT the owed seq and took anything above it as a conflict. Mutant "the
+    /// read-back adopts MineWins (HeadConflict)" -> the owed commit is dropped -> red.
+    #[test]
+    fn a_read_back_above_the_owed_seq_never_adopts_a_head_my_record_beats() {
+        let mut p = page();
+        let (record1, owed) = my_record(1, &[0xAA; 32]);
+        let (record2, mine2) = my_record(2, &[0xBB; 32]);
+        p.my_records.insert(1, (owed.root(), record1.clone()));
+        p.my_records.insert(2, (mine2.root(), record2));
+        p.head.owed = Some(Owed { seq: 1, root: owed.root(), base: [0u8; 32], record: Some(record1), stale_reads: 0 });
+        let theirs = a_losing_head(&mine2);
+        p.send(Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head });
+        let _ = p.take_ops();
+        p.answer(Answer::Head { label: Label::Head, read: Some(theirs.clone()) }, Ms(10));
+        assert_ne!(p.published(), (theirs.seq, theirs.root()), "the read-back adopted a head this page's own record beats");
+        let o = p.head.owed.as_ref().expect("the owed commit was dropped for a head this page's own record beats");
+        assert_eq!((o.seq, o.stale_reads), (1, 1), "the read-back did not read again (one stale read counted)");
     }
 }
