@@ -27,6 +27,7 @@ fn every_terminal_state_ends_the_wait() {
         WriteState::Unknown,
         WriteState::OutOfOrder { expected: 1 },
         WriteState::QueueFull { bytes: 1, limit: 1 },
+        WriteState::TooLarge { bound: protocol::WriteBound::WriteBytes, limit: 1, got: 2 },
     ];
     for s in terminal {
         assert!(matches!(write_outcome(1, &[state(1, s)]), Some(Err(_))), "{s:?} must end the wait as a failure");
