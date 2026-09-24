@@ -20,19 +20,41 @@ const t = (name, fn) => {
 const sha = b => createHash("sha256").update(b).digest("hex");
 const bytes = (name, epoch) => Buffer.from(`${name} code of epoch ${epoch}`);
 
-/** A contracts checkout: released.toml's epochs 1 and 2 (`site` only in 2), and build/ holding `built`'s code. */
-function checkout(built, { table = true, siteIn2 = true } = {}) {
+/** A contracts checkout: released.toml's epochs `upTo` (1..upTo; `site` from 2 on), and build/ holding `built`'s code. */
+function checkout(built, { table = true, siteIn2 = true, upTo = 2 } = {}) {
   const d = mkdtempSync(join(tmpdir(), "contracts-released-"));
   mkdirSync(join(d, "build"));
   for (const [n, e] of Object.entries(built)) writeFileSync(join(d, "build", `${n}.wasm`), bytes(n, e));
   const row = (n, e) => `[epoch.contract.${n}]\nlock_sha256 = "sha256:${"0".repeat(64)}"\nsha256      = "sha256:${sha(bytes(n, e))}"\nbytes       = 1\n\n`;
   const epoch = (e, names) => `[[epoch]]\nnumber   = ${e}\nreleased = "2026-09-2${e}"\ntag      = "v0.${e}.0"\n\n[epoch.source]\ncommit = "abc"\n\n${names.map(n => row(n, e)).join("")}`;
-  if (table) writeFileSync(join(d, "released.toml"), `# header\n\n${epoch(1, ["block", "register", "webapp"])}${epoch(2, siteIn2 ? NAMES : ["block", "register", "webapp"])}`);
+  const rows = [epoch(1, ["block", "register", "webapp"]), epoch(2, siteIn2 ? NAMES : ["block", "register", "webapp"])];
+  for (let e = 3; e <= upTo; e += 1) rows.push(epoch(e, NAMES));
+  if (table) writeFileSync(join(d, "released.toml"), `# header\n\n${rows.slice(0, upTo).join("")}`);
   return d;
 }
-const run = (dir, env = {}) => spawnSync(process.execPath, [tool, dir, ...NAMES], { encoding: "utf8", env: { ...process.env, CRAFTWORKS_CONTRACTS_UNRELEASED: "", ...env } });
+const run = (dir, env = {}, need = 2) => spawnSync(process.execPath, [tool, dir, String(need), ...NAMES], { encoding: "utf8", env: { ...process.env, CRAFTWORKS_CONTRACTS_UNRELEASED: "", ...env } });
 
-t("**the latest epoch's released code passes**", () => {
+t("**THE INCIDENT: a checkout BEHIND the release is REFUSED** -- its table ends at epoch 2, its build IS epoch 2's released code, and this SDK needs epoch 3 (the architect, sdk#388: \"the latest epoch of that table\" passed it). Mutant \"latest epoch\" -> red", () => {
+  const d = checkout({ block: 2, register: 2, webapp: 2, site: 2 }, { upTo: 2 });
+  const r = run(d, {}, 3);
+  assert.equal(r.status, 1, `a checkout behind the release passed: ${r.stdout}`);
+  assert.match(r.stderr, /has epochs 1, 2; this SDK needs epoch 3/, r.stderr);
+  assert.match(r.stderr, /fix: build the contracts at a release that has epoch 3/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+t("**needing epoch 3 means 3, not the latest**: a table with epochs 1-4 and a build of 3 passes", () => {
+  const d = checkout({ block: 3, register: 3, webapp: 3, site: 3 }, { upTo: 4 });
+  const r = run(d, {}, 3);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /are epoch 3's released code \(v0\.3\.0\)/);
+  // THE CONTROL: the same checkout's epoch-4 build is not what this SDK needs.
+  const e = checkout({ block: 4, register: 4, webapp: 4, site: 4 }, { upTo: 4 });
+  assert.equal(run(e, {}, 3).status, 1, "a later epoch's code passed for an SDK that needs epoch 3");
+  for (const x of [d, e]) rmSync(x, { recursive: true, force: true });
+});
+
+t("**the needed epoch's released code passes**", () => {
   const d = checkout({ block: 2, register: 2, webapp: 2, site: 2 });
   const r = run(d);
   assert.equal(r.status, 0, r.stderr);
@@ -52,7 +74,7 @@ t("**a STALE block (an earlier epoch's) is REFUSED by name**: the contract, expe
   rmSync(d, { recursive: true, force: true });
 });
 
-t("**a contract with no row in the latest epoch is refused** (unreleased code), and so is a missing build", () => {
+t("**a contract with no row in the needed epoch is refused** (unreleased code), and so is a missing build", () => {
   const d = checkout({ block: 2, register: 2, webapp: 2, site: 2 }, { siteIn2: false });
   const r = run(d);
   assert.equal(r.status, 1);
@@ -81,10 +103,13 @@ t("**the override** (a PR that builds a NEW epoch) passes, and says LOUDLY what 
   rmSync(d, { recursive: true, force: true });
 });
 
-t("**build.sh runs the check BEFORE it copies any contract**, and stops on its refusal (the one home)", () => {
+t("**build.sh states CONTRACTS_EPOCH exactly once, passes it to the check, and runs the check BEFORE it copies any contract** (the one home)", () => {
   const src = readFileSync(join(root, "build.sh"), "utf8");
-  const checkAt = src.indexOf(`node tools/contracts-released.mjs "$contracts" block register webapp site || exit 1`);
-  assert.ok(checkAt > 0, "build.sh does not run tools/contracts-released.mjs over the contracts it copies");
+  const sets = [...src.matchAll(/^CONTRACTS_EPOCH=(\d+)$/gm)];
+  assert.equal(sets.length, 1, `build.sh sets CONTRACTS_EPOCH ${sets.length} times`);
+  assert.equal(src.match(/CONTRACTS_EPOCH=/g).length, 1, "CONTRACTS_EPOCH is assigned somewhere else too");
+  const checkAt = src.indexOf(`node tools/contracts-released.mjs "$contracts" "$CONTRACTS_EPOCH" block register webapp site || exit 1`);
+  assert.ok(checkAt > 0, "build.sh does not run tools/contracts-released.mjs with CONTRACTS_EPOCH over the contracts it copies");
   const firstCopy = src.search(/\bcp "\$contracts\/build\//);
   assert.ok(firstCopy > 0, "THE CONTROL: build.sh copies no contract (the source read found nothing)");
   assert.ok(checkAt < firstCopy, "build.sh copies a contract before checking it");
