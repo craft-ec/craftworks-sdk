@@ -96,6 +96,11 @@ pub struct Db<S: Store + Reads, E: Env> {
     ops: std::collections::BTreeMap<u64, Op>,
     /// Conflicted chains being re-run, oldest first.
     reruns: std::collections::VecDeque<Rerun>,
+    /// SCHEMA WRITES ARE DEFERRED (sdk#350): set once, at open, on a published
+    /// app's own tree (an asked session). A define then commits only in the
+    /// company of a data write, so opening an app commits nothing. A builder's
+    /// Db never sets it: a publisher's schema edit commits as it always did.
+    defer_schema: bool,
 }
 
 /// What an update or a define meant, so a Conflict can re-run it.
@@ -482,7 +487,14 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             author: [0; 32],
             ops: std::collections::BTreeMap::new(),
             reruns: std::collections::VecDeque::new(),
+            defer_schema: false,
         }
+    }
+
+    /// Defer this Db's schema writes (sdk#350): see `defer_schema`. Set once,
+    /// at open, by the session that knows it is a published app's own tree.
+    pub fn set_defer_schema(&mut self, on: bool) {
+        self.defer_schema = on;
     }
 
     pub fn store(&self) -> &S {
@@ -728,6 +740,12 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// every key in `edits` (so `writes ⊆ keys(reads)` by construction), and
     /// the engine checks them where the edits land.
     fn write(&mut self, reads: Vec<(Vec<u8>, Expect)>, edits: Vec<(Vec<u8>, Edit)>) -> Result<()> {
+        self.write_as(reads, edits, false)
+    }
+
+    /// [`Db::write`], DEFERRED or not (sdk#350): one body, so a deferred
+    /// write is refused by exactly the rules an ordinary one is.
+    fn write_as(&mut self, reads: Vec<(Vec<u8>, Expect)>, edits: Vec<(Vec<u8>, Edit)>, deferred: bool) -> Result<()> {
         debug_assert!(edits.iter().all(|(k, _)| reads.iter().any(|(r, _)| r == k)), "a write without a read of its key");
         // AN APP'S WRITE IS NEVER FORCED (sdk#235 ruling 1). `Expect::Any` is
         // the transitional form for store-level batches that cannot read
@@ -760,9 +778,9 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         // THE REFUSAL IS THE ANSWER (sdk#180). A write the store refused was
         // not made; answering `Created` for it told the caller its data was
         // written when it had been dropped.
-        self.store
-            .apply_commit(&reads, &sorted_edits(edits))
-            .map_err(DbError::WriteRefused)
+        let edits = sorted_edits(edits);
+        let applied = if deferred { self.store.apply_deferred_commit(&reads, &edits) } else { self.store.apply_commit(&reads, &edits) };
+        applied.map_err(DbError::WriteRefused)
     }
 
     pub fn env_mut(&mut self) -> &mut E {
@@ -782,7 +800,8 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         // the same schema from one Absent base both succeed: a write already
         // there is not a conflict (the engine's rule, sdk#148).
         let read = self.read_of(&schema_key(domain))?;
-        self.write(vec![read], vec![(schema_key(domain), Edit::Put(bytes))])?;
+        let deferred = self.defer_schema;
+        self.write_as(vec![read], vec![(schema_key(domain), Edit::Put(bytes))], deferred)?;
         let appended: Vec<crate::schema::Field> = match &base {
             Some(b) => schema.fields.iter().filter(|f| !b.fields.iter().any(|g| g.name == f.name)).cloned().collect(),
             None => schema.fields.clone(),

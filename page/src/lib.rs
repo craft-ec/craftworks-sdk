@@ -1999,6 +1999,11 @@ impl Page {
         self.engine.unsaved_writes()
     }
 
+    /// The client of every unsaved write (the engine's rule, per write).
+    pub fn unsaved_clients(&self) -> Vec<engine::ClientId> {
+        self.engine.unsaved_clients().collect()
+    }
+
     /// Own commits published and the queued writes they carried (K9: writes
     /// per commit, what group commit is measured by).
     pub fn commits_and_writes(&self) -> (u64, u64) {

@@ -294,9 +294,11 @@ impl<H: Host> PageStore<H> {
 
     /// This client's writes the page has not finished: every write not yet
     /// `Published` or ended (craftworks-sdk#163) -- what a closing tab loses.
+    /// A held DEFERRED write (an app's define on open, sdk#350) is not one:
+    /// the engine's rule, counted for this session, not a second tally.
     pub fn unsaved_writes(&self) -> usize {
         match (self.host.as_ref(), self.writes.client.session()) {
-            (Some(h), Some(session)) => h.peek(|s| s.queued_of(session).len()),
+            (Some(h), Some(session)) => h.peek(|s| s.unsaved_of(session)),
             _ => 0,
         }
     }
@@ -699,6 +701,11 @@ impl<H: Host> Store for PageStore<H> {
     /// (taken, or refused by name) is known when this returns.
     fn apply_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
         let made = self.writes.make(reads, edits);
+        self.hand_over(made)
+    }
+
+    fn apply_deferred_commit(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
+        let made = self.writes.make_as(reads, edits, true);
         self.hand_over(made)
     }
 }

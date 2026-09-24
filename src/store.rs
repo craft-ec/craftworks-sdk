@@ -349,6 +349,18 @@ pub trait Store {
         let _ = reads;
         self.apply_batch(edits)
     }
+
+    /// [`Store::apply_commit`], DEFERRED (sdk#350): a write that commits only
+    /// in the company of a non-deferred one (an app's schema on open). Only a
+    /// store that holds writes for a page's ENGINE can defer; for every other
+    /// store -- the truth itself -- a deferred write is simply a write.
+    fn apply_deferred_commit(
+        &mut self,
+        reads: &[(Vec<u8>, protocol::Expect)],
+        edits: &[(Vec<u8>, Edit)],
+    ) -> Result<(), Refused> {
+        self.apply_commit(reads, edits)
+    }
 }
 
 /// A write that CONFLICTED (a key it read had moved) and the later writes that

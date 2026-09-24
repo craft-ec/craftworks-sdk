@@ -475,6 +475,10 @@ impl Session {
         let mut io = page_io::PageIo::new(server, art);
         io.ask();
         self.db.store_mut().set_host(io);
+        // A PUBLISHED APP'S OWN TREE (sdk#350): its schema writes are DEFERRED,
+        // so opening the app commits nothing -- they ride the person's first
+        // data write. Decided once, here, where "asked" is known.
+        self.db.set_defer_schema(true);
         self.pump_page();
     }
 
