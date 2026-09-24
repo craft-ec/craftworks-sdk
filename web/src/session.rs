@@ -603,8 +603,13 @@ impl Session {
     ///
     /// `range` (1..=255): this reader's stream-id range on the shared socket,
     /// one per open tree.
-    pub fn open_named(&mut self, block_code: Vec<u8>, register_id: &str, range: u8) -> Result<(), JsValue> {
+    pub fn open_named(&mut self, block_code: Vec<u8>, register_id: &str, range: u8, published_seq: f64) -> Result<(), JsValue> {
         let id = head_of_hex(register_id).ok_or_else(|| JsValue::from_str("open_named: a register id is 64 hex characters"))?;
+        // The PUBLISHED-HEAD FLOOR (sdk#349): the seq the app was published
+        // at (its app.json), 0 for none. A whole number a JS number holds.
+        if !(published_seq >= 0.0 && published_seq.fract() == 0.0 && published_seq <= 9_007_199_254_740_991.0) {
+            return Err(JsValue::from_str("open_named: the published seq is a whole number, 0 for none"));
+        }
         if self.page().is_some() {
             return Err(JsValue::from_str("open_named: this session is already open on its own head"));
         }
@@ -613,9 +618,24 @@ impl Session {
             page::server::SignerFacts::default(),
         );
         self.db.store_mut().set_view();
-        self.db.store_mut().set_host(page_io::PageIo::reader(server, block_code, id, range));
+        let mut reader = page_io::PageIo::reader(server, block_code, id, range);
+        reader.server.page.set_head_floor(published_seq as u64);
+        self.db.store_mut().set_host(reader);
         self.pump_page();
         Ok(())
+    }
+
+    /// What a VIEW is waiting on because of its published-head floor
+    /// (sdk#349), in words -- or empty. The node answering a head from
+    /// before the app's publish is "not yet", never an empty or undefined
+    /// screen: the head is asked again until the published version comes.
+    pub fn head_floor_wait(&self) -> String {
+        match self.page().and_then(|p| p.server.page.head_floor_wait()) {
+            None => String::new(),
+            Some((floor, Some(seen), n)) => format!("waiting for the published version (seq {floor}); the node answered seq {seen} ({n} time{})", if n == 1 { "" } else { "s" }),
+            Some((floor, None, 0)) => format!("waiting for the published version (seq {floor})"),
+            Some((floor, None, n)) => format!("waiting for the published version (seq {floor}); the node answered no head ({n} time{})", if n == 1 { "" } else { "s" }),
+        }
     }
 
     /// MAY THIS SESSION WRITE `head`? The ONE decision a runtime renders

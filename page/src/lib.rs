@@ -524,6 +524,16 @@ pub struct Page {
     /// restores existing content-addressed bytes: no key, no head moved).
     /// THE one owner of "read-only": page-io and the web Session ask here.
     read_only: bool,
+    /// THE PUBLISHED-HEAD FLOOR (sdk#349): the seq an app was published at,
+    /// or 0 for none. A head read below it is "not yet" -- the node served a
+    /// copy from before the publish -- and is never adopted: it ends no wait,
+    /// so the head is asked again on the RTO (a GET with subscribe). SEQ
+    /// ONLY: a same-seq race may replace the published root (#225b), so seq N
+    /// with any root is the published version.
+    head_floor: u64,
+    /// The last head read that came in BELOW the floor (`None`: missing), and
+    /// how many did: what a view says while it waits.
+    below_floor: Option<(Option<u64>, u32)>,
     now: u64,
     /// Every record the signer returned — invariant 2's evidence.
     signer_records: BTreeSet<Vec<u8>>,
@@ -580,6 +590,8 @@ impl Page {
             client_fx: Vec::new(),
             unusable: Vec::new(),
             read_only: false,
+            head_floor: 0,
+            below_floor: None,
             now: 0,
             signer_records: BTreeSet::new(),
             sign_id: None,
@@ -909,6 +921,14 @@ impl Page {
             // One register read can answer both a recovery read and a
             // read-back: a head is a head, whoever asked.
             Answer::Head(read) => {
+                // Below the published-head floor: not yet. Adopted by nothing
+                // and ending no wait -- the head is asked again on its RTO.
+                if self.head_floor > 0 && read.as_ref().is_none_or(|r| r.seq < self.head_floor) {
+                    let seen = read.as_ref().map(|r| r.seq);
+                    let n = self.below_floor.map_or(0, |(_, n)| n);
+                    self.below_floor = Some((seen, n + 1));
+                    return;
+                }
                 self.last_head_at = self.now;
                 let h = read.as_ref().map(|r| (r.seq, r.root()));
                 self.last_head = read;
@@ -1786,6 +1806,27 @@ impl Page {
     /// the page is made a reader of somebody's head.
     pub fn set_read_only(&mut self) {
         self.read_only = true;
+    }
+
+    /// THE PUBLISHED-HEAD FLOOR (sdk#349): no head below `seq` is adopted.
+    /// Set before the first head read; 0 is none.
+    pub fn set_head_floor(&mut self, seq: u64) {
+        self.head_floor = seq;
+    }
+
+    /// What this page WAITS on because of its floor: `(floor, last seq the
+    /// node answered, how many answers were below it)` while the adopted head
+    /// is below the floor; `None` once a head at or above it is adopted, or
+    /// with no floor.
+    pub fn head_floor_wait(&self) -> Option<(u64, Option<u64>, u32)> {
+        if self.head_floor == 0 || self.published_seq_at_least(self.head_floor) {
+            return None;
+        }
+        self.below_floor.map(|(seen, n)| (self.head_floor, seen, n)).or(Some((self.head_floor, None, 0)))
+    }
+
+    fn published_seq_at_least(&self, seq: u64) -> bool {
+        self.recovered && self.engine.published_seq() >= seq
     }
 
     /// Is this page a VIEW: it makes no commit op, only repair PUTs.

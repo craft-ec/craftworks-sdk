@@ -100,6 +100,9 @@ const TRANSPORT_ONLY: &[&str] = &[
     // socket — the head it names, that it writes nothing, and whose frames
     // are whose. An in-memory store is one tree and has no socket.
     "open_named",
+    // What a view waits on because of its published-head floor (sdk#349):
+    // a head on a node. An in-memory store has no node to lag behind.
+    "head_floor_wait",
     // THE ONE DECISION (DATA-SOURCE): may this session write a head, and
     // opening the user's own tree on an asked session. An in-memory store
     // is one tree with no signer to ask.

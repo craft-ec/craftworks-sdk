@@ -51,6 +51,9 @@ struct WireNode {
     /// answered EMPTY (as 0.2.136 answers a delegate it does not have), and
     /// a registration makes it present.
     empty_until_registered: bool,
+    /// The next this many GETs of the Register are answered with THIS older
+    /// state: a node serving its cached copy from before a publish (sdk#349).
+    stale_register: Option<(Vec<u8>, usize)>,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -91,6 +94,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            stale_register: None,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -119,6 +123,7 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            stale_register: None,
         }
     }
 
@@ -184,7 +189,14 @@ impl WireNode {
                 } else {
                     *self.served.entry("get block").or_default() += 1;
                 }
-                match self.contracts.get(&id).filter(|_| !failing) {
+                let stale = match &mut self.stale_register {
+                    Some((st, n)) if id == self.register_id && *n > 0 => {
+                        *n -= 1;
+                        Some(st.clone())
+                    }
+                    _ => None,
+                };
+                match stale.as_ref().or(self.contracts.get(&id)).filter(|_| !failing) {
                     Some(state) => {
                         let ckey = ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32]));
                         Some(ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -1594,4 +1606,70 @@ fn with_no_tree_writes_wait_visible_and_provisioning_cuts_one_commit() {
         assert_eq!(heads, 1, "{case}: {heads} head writes: the held queue was not ONE commit");
         assert_eq!(node.head().map(|(s, _)| s), Some(1), "{case}: the head is not seq 1");
     }
+}
+
+/// THE PUBLISHED-HEAD FLOOR (sdk#349): a view opened with the seq its app was
+/// published at never adopts a head below it. The node first serves its
+/// cached copy from BEFORE the publish (seq 1); the view shows nothing from
+/// it -- no rows, not "empty" -- and says it is waiting for the published
+/// version, re-asking the head on its RTO (a GET with subscribe). When the
+/// node answers seq 2, the view reads it. Mutant "accept any head" (no
+/// floor) -> red: the view reads the pre-publish rows.
+#[test]
+fn a_view_never_adopts_a_head_below_its_published_seq() {
+    let mut node = WireNode::new(&[39u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "before", "v")), 1).contains(&WriteState::Published));
+    let before_publish = node.contracts[&node.register_id].clone();
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(2, "published", "v")), 2).contains(&WriteState::Published));
+    assert_eq!(node.head().map(|(s, _)| s), Some(2), "THE CONTROL: the published version is seq 2");
+
+    node.stale_register = Some((before_publish, usize::MAX));
+    let mut v = reader(&node);
+    v.server.page.set_head_floor(2);
+    let t0 = now;
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let early = rows(&mut v, &mut node, &mut now, 91);
+    println!("stale phase lasted {} s of page time", (now - t0) / 1000);
+    let asked = node.served.get("get register").copied().unwrap_or(0);
+    let wait = v.server.page.head_floor_wait();
+    println!("below the floor: rows {early:?}, head GETs {asked}, wait {wait:?}");
+    assert!(early.is_empty(), "the view showed rows {early:?} from a head below its published seq");
+    assert!(asked >= 2, "THE CONTROL: the head was not asked again while below the floor ({asked} GETs)");
+    assert!(matches!(wait, Some((2, Some(1), n)) if n >= 2), "the view does not say it waits for the published version: {wait:?}");
+
+    node.stale_register = None;
+    let mut read = Vec::new();
+    for q in 0..200u64 {
+        read = rows(&mut v, &mut node, &mut now, 100 + q);
+        if read == vec![2] {
+            break;
+        }
+        now += 1_000;
+        v.tick(Ms(now));
+    }
+    assert_eq!(read, vec![2], "the view did not read the published version once the node served it");
+    assert_eq!(v.server.page.head_floor_wait(), None, "the view still says it waits after adopting the published version");
+}
+
+/// THE FLOOR IS A SEQ, NOT A ROOT (sdk#349, #225b): a head AT the published
+/// seq is the published version whatever its root (a same-seq race may have
+/// replaced it), so it is read at once, with no wait. Mutant "strictly above
+/// the floor" -> red: the view waits for ever on the version it was given.
+#[test]
+fn a_head_at_the_published_seq_is_read_at_once() {
+    let mut node = WireNode::new(&[40u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    for i in 1..=2u64 {
+        assert!(states(&client(&mut a, &mut node, &mut now, &write(i, &format!("k{i}"), "v")), i).contains(&WriteState::Published));
+    }
+    let mut v = reader(&node);
+    v.server.page.set_head_floor(2);
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    assert_eq!(rows(&mut v, &mut node, &mut now, 92), vec![2], "a head at the published seq was not read");
+    assert_eq!(v.server.page.head_floor_wait(), None, "a view at its published seq says it is still waiting");
 }

@@ -55,6 +55,15 @@ async function own() {
 }
 const frames = sock => { const out = sock.engine.outbound(); sock.engine.sent(out.length); return stdlib(out).frames; };
 
+await t("**tree(id, { seq }) opens the view with its PUBLISHED-HEAD FLOOR (sdk#349): it says it waits for that version**", async () => {
+  const { h } = await own();
+  const floored = await h.tree(HEAD_A, { seq: 7 });
+  assert.equal(floored.waitingFor(), "waiting for the published version (seq 7)", "the seq did not reach the view's floor");
+  // THE CONTROL: with no published seq there is no floor, and nothing is said.
+  const plain = await h.tree(HEAD_B);
+  assert.equal(plain.waitingFor(), "", "a view with no published seq says it waits");
+});
+
 await t("**tree() is a read-only Db on the SAME session: every write refused, the head it names**", async () => {
   const { h } = await own();
   const tr = await h.tree(HEAD_A);
@@ -138,7 +147,7 @@ await t("THE MEASUREMENT: one open tree reader's wasm memory, before any rows", 
   const readers = [];
   for (let i = 0; i < n; i += 1) {
     const s = new Session(7999);
-    s.open_named(enc("block code"), (i + 1).toString(16).padStart(64, "0"), (i % 255) + 1);
+    s.open_named(enc("block code"), (i + 1).toString(16).padStart(64, "0"), (i % 255) + 1, 0);
     readers.push(s);
   }
   const grew = wasm_memory_bytes() - before;

@@ -45,7 +45,7 @@ const refusedAsReadOnly = fn => {
 // A view carries its app, as `tree()` gives it one: whose data a write names
 // is decided before whether this session may write (a name no app owns is
 // refused by name first).
-const view = () => { const s = new Session(7999); s.set_app("notes-app"); s.open_named(BLOCK, HEAD, 1); return s; };
+const view = () => { const s = new Session(7999); s.set_app("notes-app"); s.open_named(BLOCK, HEAD, 1, 0); return s; };
 
 await t("**a view may write nothing -- the ONE decision says no -- and stands on the NAMED head**", async () => {
   const s = view();
@@ -90,12 +90,20 @@ await t("**every write on a view is refused before it reaches the store**", asyn
   assert.deepEqual(sent(s).filter(f => f.op !== "get"), [], "a refused write reached the node");
 });
 
+await t("a published seq that is not a whole number is refused by name (sdk#349)", async () => {
+  for (const seq of [-1, 1.5, NaN, 2 ** 60]) {
+    assert.throws(() => new Session(7999).open_named(BLOCK, HEAD, 1, seq), /published seq is a whole number/, `seq ${seq} was taken`);
+  }
+  // THE CONTROL: a whole number opens, and so does 0 (no floor).
+  for (const seq of [0, 3]) new Session(7999).open_named(BLOCK, HEAD, 1, seq);
+});
+
 await t("a malformed head, and a view over a session already on its own head, are refused", async () => {
-  assert.throws(() => new Session(7999).open_named(BLOCK, "abc", 1), /64 hex/);
-  assert.throws(() => new Session(7999).open_named(BLOCK, "zz".repeat(32), 1), /64 hex/);
+  assert.throws(() => new Session(7999).open_named(BLOCK, "abc", 1, 0), /64 hex/);
+  assert.throws(() => new Session(7999).open_named(BLOCK, "zz".repeat(32), 1, 0), /64 hex/);
   const s = new Session(7999);
   s.provision(new TextEncoder().encode("signer code"), BLOCK, new TextEncoder().encode("register"));
-  assert.throws(() => s.open_named(BLOCK, HEAD, 1), /already open/);
+  assert.throws(() => s.open_named(BLOCK, HEAD, 1, 0), /already open/);
 });
 
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }
