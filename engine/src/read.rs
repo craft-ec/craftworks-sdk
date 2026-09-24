@@ -241,6 +241,13 @@ pub(crate) struct Parked {
     /// it has with a cursor, and the next page is a new request.
     #[serde(default)]
     pub gets: u32,
+    /// Blocks that have ARRIVED for this read since it started (#330
+    /// ruling): its progress, which decides whether a head that moves past
+    /// its root may supersede it ([`crate::Engine::supersede_read`]). A read
+    /// receiving blocks finishes on its tree; one stuck on a silent or
+    /// absent block does not hold the reader on a superseded root.
+    #[serde(default)]
+    pub arrived: u32,
 }
 
 /// The read side of the engine's state.

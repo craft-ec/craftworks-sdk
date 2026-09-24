@@ -1,7 +1,9 @@
 // open() HANDS OVER A DB THAT CAN BE READ (sdk#234): when it provisions the
-// node, it returns only once the node says it is provisioned — or fails
-// saying why. Measured on the notes site: a read straight after an open()
-// that returned early failed as UNAVAILABLE every time.
+// node, it returns only once the node says it is provisioned — or ends on an
+// ANSWER (refused; the connection refused twice, never opened) or a person
+// CANCELLING. No time ends it (rule 8): a slow node is waited on, and how long
+// it has not answered is reported. Measured on the notes site: a read straight
+// after an open() that returned early failed as UNAVAILABLE every time.
 import assert from "node:assert/strict";
 import { open, untilProvisioned } from "../../js/session.js";
 
@@ -13,14 +15,15 @@ const t = async (name, fn) => {
 const tick = (r, ms) => setTimeout(r, 0);
 
 /** A session that is provisioned after `after` polls, or refuses, or never is. */
-function FakeSession({ after = 3, refuse = "", exhaust = false } = {}) {
+function FakeSession({ after = 3, refuse = "" } = {}) {
   let polls = 0;
   return function () {
     return {
       url: () => "ws://127.0.0.1:1/", outbound: () => [], sent() {}, on_inbound: () => true, unowned() {}, set_app() {},
       reconnected() {}, take_progress: () => "[]", take_loads: () => "[]", tick_ms: () => 1000, tick: () => "{}",
       unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {}, flush() {}, provision() {},
-      provisioned: () => (polls += 1) > after && !refuse && !exhaust, refused: () => refuse, exhausted: () => exhaust,
+      provisioned: () => (polls += 1) > after && !refuse, refused: () => refuse,
+      not_answering: () => JSON.stringify({ what: "the signer", ms: polls * 100 }),
       polls: () => polls,
     };
   };
@@ -46,33 +49,32 @@ await t("a REFUSAL ends it in the node's words, and the session is closed", asyn
   assert.equal(deps.closed, 1, "the socket of a failed open() was left open");
 });
 
-await t("EXHAUSTED and the BUDGET each end it, saying which", async () => {
-  // The socket OPENS here: this is the signer failing to answer, not a node
-  // that is not there — the two are told apart by the test below.
-  const opens = () => ({ connect: (_e, { onEvent } = {}) => { onEvent?.({ kind: "open" }); return { pump() {}, close() {} }; } });
-  await assert.rejects(() => open(FakeSession({ exhaust: true }), deps(opens())), /the signer is not answering/);
-  let clock = 0;
-  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => true }, { provisionBudgetMs: 5000, provisionEveryMs: 1000, now: () => (clock += 1000), setTimeout: tick }),
-    /did not finish setting up in 5 s/);
+await t("**NO TIME ENDS IT: a signer silent for five minutes is waited on, says how long, and opens when it answers**", async () => {
+  let polls = 0;
+  const heard = [];
+  const handle = {
+    provisioned: () => (polls += 1) > 3_000,
+    connectedOnce: () => true,
+    notAnswering: () => ({ what: "the signer", ms: polls * 100 }),
+  };
+  await untilProvisioned(handle, { provisionEveryMs: 0, setTimeout: tick, onWaiting: w => heard.push(w.ms) });
+  assert.ok(polls > 3_000, `it stopped waiting after ${polls} polls`);
+  assert.ok(Math.max(...heard) >= 299_900, `it never said it had waited five minutes: ${Math.max(...heard)} ms`);
 });
 
-await t("**a node that is NOT RUNNING is named as that, not as a silent signer**", async () => {
-  // Nothing ever opened: page-io spends its re-asks exactly as it would
-  // against a node that ignores them, so only the socket tells them apart.
-  const S = FakeSession({ exhaust: true });
-  await assert.rejects(() => open(S, deps({ connect: () => ({ pump() {}, close() {} }) })),
-    /nothing answered at ws:\/\/127\.0\.0\.1:1\/: no connection was ever made — is the node running\?/);
-  // THE CONTROL: the same exhaustion, with a socket that DID open, is the
-  // signer's failure and says so.
-  await assert.rejects(() => open(S, deps({ connect: (_e, { onEvent } = {}) => { onEvent?.({ kind: "open" }); return { pump() {}, close() {} }; } })),
-    /the signer is not answering/);
+await t("**a person CANCELS: the wait ends, named — the one end that is not the node's**", async () => {
+  const ac = new AbortController();
+  let polls = 0;
+  const p = untilProvisioned({ provisioned: () => { if ((polls += 1) === 50) ac.abort(); return false; }, connectedOnce: () => true },
+    { provisionEveryMs: 0, setTimeout: tick, signal: ac.signal });
+  await assert.rejects(p, /cancelled: setting up was stopped/);
+  assert.ok(polls >= 50 && polls < 60, `cancelled at poll ${polls}`);
 });
 
-await t("**a node that is not there is named at once: two refused ATTEMPTS, never opened — not the budget**", async () => {
-  // The clock moves 1 ms a poll: without the refusal end this reaches the
-  // BUDGET's message, not this one — the assertion then fails, never hangs.
-  let c = 0;
-  const frozen = { provisionBudgetMs: 2_000, provisionEveryMs: 1, now: () => (c += 1), setTimeout: r => setTimeout(r, 0) };
+await t("**a node that is not there is named at once: two refused ATTEMPTS, never opened**", async () => {
+  // Without the refusal end this would wait for ever: the assertion's own
+  // guard is the test runner's.
+  const frozen = { provisionEveryMs: 1, setTimeout: r => setTimeout(r, 0) };
   await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => false, refusedBeforeOpen: () => 2, url: () => "ws://127.0.0.1:7999/" }, frozen),
     /nothing answered at ws:\/\/127\.0\.0\.1:7999\/: the connection was refused and never opened — is the node running\?/);
   // THE CONTROL: one refused attempt is a node still starting — it waits.
@@ -88,17 +90,6 @@ await t("**a node that is not there is named at once: two refused ATTEMPTS, neve
   assert.ok(h.db, "one refused attempt (error + closed) ended open(): a node still starting is not a node that is not there");
   // TWO attempts: the node is not there, named.
   await assert.rejects(() => open(FakeSession({ after: 1e9 }), deps(attempts(2))), /the connection was refused and never opened/);
-});
-
-await t("the BUDGET says which too: never connected, or connected and still setting up", async () => {
-  let clock = 0;
-  const tick = r => setTimeout(r, 0);
-  const budget = { provisionBudgetMs: 5000, provisionEveryMs: 1000, now: () => (clock += 1000), setTimeout: tick };
-  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => false, url: () => "ws://127.0.0.1:7999/" }, budget),
-    /nothing answered at ws:\/\/127\.0\.0\.1:7999\/ in 5 s: no connection was ever made/);
-  clock = 0;
-  await assert.rejects(() => untilProvisioned({ provisioned: () => false, connectedOnce: () => true }, budget),
-    /did not finish setting up in 5 s/);
 });
 
 await t("THE CONTROL: provision: false does not wait — nothing is being set up", async () => {

@@ -178,8 +178,8 @@ impl Session {
     }
 
     /// Tickets that ended since this was last asked, as JSON:
-    /// `[{"id", "ok", "code", "why"}]`, `code` one of LOADED / UNAVAILABLE /
-    /// NOT_ANSWERING, `why` the engine's reason for an UNAVAILABLE (or null).
+    /// `[{"id", "ok", "code", "why"}]`, `code` LOADED or UNAVAILABLE, and
+    /// `why` the engine's reason for an UNAVAILABLE (or null).
     ///
     /// The page resolves its parked reads from THIS, called when a message
     /// arrives. Never a timer: a timer either spins or answers late, and
@@ -479,7 +479,7 @@ impl Session {
     }
 
     /// [`Session::ask_signer`]'s answer, as JSON:
-    /// `{"state":"pending"|"register"|"nokey"|"nosigner"|"refused"|"silent","register":"<hex>","said":"…"}`.
+    /// `{"state":"pending"|"register"|"nokey"|"nosigner"|"refused","register":"<hex>","said":"…"}`.
     pub fn asked(&self) -> String {
         use page_io::Asked;
         let (state, register, said) = match self.page().and_then(|p| p.asked()) {
@@ -488,7 +488,6 @@ impl Session {
             Some(Asked::NoKey) => ("nokey", String::new(), String::new()),
             Some(Asked::NoSigner(w)) => ("nosigner", String::new(), w.clone()),
             Some(Asked::Refused(w)) => ("refused", String::new(), w.clone()),
-            Some(Asked::NotAnswering) => ("silent", String::new(), String::new()),
         };
         serde_json::json!({ "state": state, "register": register, "said": said }).to_string()
     }
@@ -532,12 +531,6 @@ impl Session {
         self.page().is_some_and(|p| p.provisioned())
     }
 
-    /// Opening's re-asks are SPENT: the signer did not answer the first
-    /// exchange (the Register query, or the provisioning) within its budget —
-    /// "not answering" (page-io's `exhausted`). One of `open()`'s named ends.
-    pub fn exhausted(&self) -> bool {
-        self.page().is_some_and(|p| p.exhausted())
-    }
 
     /// Opening is STILL WAITING past its first RTO: the first exchange is
     /// being re-asked and not yet answered. Named for display; empty when not.
@@ -577,8 +570,9 @@ impl Session {
     /// its key: the contract instance id, as the node names it and serves a
     /// web container under (`/v1/contract/web/<key>/`).
     ///
-    /// The PAGE sends it, like every op: on its deadline, re-sent while
-    /// unanswered, and ENDED by `page::APP_PUT_BUDGET_MS` at the latest.
+    /// The PAGE sends it, like every op: on its deadline, re-sent until the
+    /// node answers (rule 7), or a person cancels (`cancel_put`); no time ends
+    /// it (rule 8).
     /// [`Session::put_status`] says where it stands, matched by this key.
     /// **An ack is not durability:** a publisher that must know reads it back.
     pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
@@ -686,10 +680,30 @@ impl Session {
         }
     }
 
+    /// A PERSON cancels a pending PUT of `key` (a publish they stopped): the
+    /// one end that is not the node's answer, named `cancelled` (rule 8).
+    pub fn cancel_put(&mut self, key: &str) {
+        if let Some(p) = self.page_mut() {
+            p.cancel_app_put(key);
+        }
+    }
+
+    /// NOT ANSWERING FOR N s: the request that has waited longest, as JSON
+    /// `{"what":"…","ms":N}`, or `null` when nothing waits. What a page shows
+    /// while the node is slow (rule 8); nothing is ended by it.
+    pub fn not_answering(&self) -> String {
+        match self.page().and_then(|p| p.not_answering()) {
+            Some((what, ms)) => serde_json::json!({ "what": what, "ms": ms }).to_string(),
+            None => "null".into(),
+        }
+    }
+
     /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
-    /// `{"state":"none"|"pending"|"put"|"refused"|"failed","said":"…"}`.
-    /// It always ENDS (the page's budget): `refused` carries the node's words,
-    /// `failed` what was tried. `said` is display only.
+    /// `{"state":"none"|"pending"|"put"|"refused"|"cancelled","said":"…"}`.
+    /// It ends only on an answer (rule 8: no budget): `put` the node's ack,
+    /// `refused` in the node's words, `cancelled` a person stopped it; while
+    /// `pending` the page re-sends it and `not_answering` says for how long.
+    /// `said` is display only.
     pub fn put_status(&self, key: &str) -> String {
         use page::AppPut;
         let (state, said) = match self.page().and_then(|p| p.app_put(key)) {
@@ -697,7 +711,7 @@ impl Session {
             Some(AppPut::Pending) => ("pending", ""),
             Some(AppPut::Put) => ("put", ""),
             Some(AppPut::Refused(w)) => ("refused", w.as_str()),
-            Some(AppPut::GaveUp(w)) => ("failed", w.as_str()),
+            Some(AppPut::Cancelled) => ("cancelled", ""),
         };
         serde_json::json!({ "state": state, "said": said }).to_string()
     }
@@ -1128,21 +1142,16 @@ impl Session {
         let forced_writes = self.page().map(|p| p.forced_writes()).unwrap_or(0);
         // A rolled-back write's keys reach its bindings through
         // `take_state_changed`, as every own-write state change does.
-        //
-        // A ticket nobody ended ends NOT_ANSWERING, and one ended and never
-        // resumed lets its root go (`TICKET_LIFE_MS`).
-        self.db.store_mut().tick(now);
         if let Some(p) = self.page_mut() {
             p.tick(page::Ms(now));
         }
         self.pump_page();
         // sdk#143/#144: a conflicted update or define is RE-RUN on the new
-        // base. What it must load first goes through the ordinary load path
-        // (and its timeout); what it could not keep is the app's news.
-        // What it must read first is fetched by the walk that stopped on it
-        // (its ticket, unwaited: the next tick walks again), bounded by the
-        // ticket's own lifetime.
-        let rerun = self.db.rerun(now, craftworks_sdk::page_store::TICKET_LIFE_MS);
+        // base. What it must load first goes through the ordinary load path;
+        // what it could not keep is the app's news. What it must read first is
+        // fetched by the walk that stopped on it (its ticket, unwaited: the
+        // next tick walks again), until the node answers (rule 8).
+        let rerun = self.db.rerun();
         self.db.store_mut().take_ticket();
         self.db.store_mut().unpin();
         let reruns: Vec<serde_json::Value> = rerun

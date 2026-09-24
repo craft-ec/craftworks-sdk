@@ -28,7 +28,7 @@
 //! | … the register holds `current`, or a later head | `HeadConflict` onto it: the engine adopts it and reports the dead commit's writes `Lost`; the app submits them again, each checked against its READS where it lands (#218) |
 //! | … the register is ONE behind (the signer's record is ahead, its UPDATE unlanded) | LAND it: Sign from the register's head with `next.seq = register.seq + 1` (any root) under a fresh id → `AlreadySigned(record)` (`signer::decide`'s `r.prev == *prev` arm; signer/tests/sign.rs `two_requests_from_one_prev_in_sequence_get_one_signature`) → [`Op::Update`] those bytes → read; adopted once the register shows it. Safe by invariant 0; two pages landing the same bytes is an equal decision, held bytes win. RESIDUAL: a page whose signer answered before ITS blocks were stored leaves holes, surfacing here |
 //! | … the register is 2+ behind | a NAMED failure in [`Page::unusable`] — unrecoverable (one record per signer) and unreachable by 1b |
-//! | … the register does not answer | read again on its deadline; after [`VERIFY_BUDGET_MS`], "the register is not answering" — nothing adopted |
+//! | … the register does not answer | read again on its deadline, for as long as it takes (rules 7, 8); [`Page::not_answering`] says for how long — nothing adopted |
 //! | `Refused(RootNotHeld / HeadUnknown / RecordNotSaved)` | the same sign request after a doubling backoff from [`BACKOFF_MS`]; for `HeadUnknown` the register is READ first, which makes the signer's node hold it |
 //! | `Refused(Forked { read, .. })` (an OLD signer: the new one answers `NotNext`, sdk#225) | the same identity never forks: as `NotNext { current: read }` — read, then adopt. If the page already stands on `read`, the old rule refuses every ask until the register passes that seq: NOT re-asked, named once in [`Page::unusable`], and asked again when a head read shows the register past it |
 //! | a signer answer under any id but the in-flight sign's (SG02), or not shaped like a sign's | ignored: it does NOT clear the sign's deadline |
@@ -180,6 +180,8 @@ pub enum Op {
     /// PUT again at every deadline; the PAGE owns the deadline, the re-send
     /// and the end ([`AppPut`]), as for every other op.
     PutApp { key: String },
+    /// A request page-io frames ([`Ext`]); the page owns its deadline.
+    Ext(Ext),
 }
 
 /// What arrived, as the web layer decoded it.
@@ -212,22 +214,47 @@ pub enum Answer {
     NotSent { op: Op, why: String },
 }
 
-/// Where an app's PUT ([`Op::PutApp`]) stands. It always ENDS: acknowledged,
-/// refused in the node's words, or given up at [`APP_PUT_BUDGET_MS`] — never
-/// a wait nobody bounds.
+/// Where an app's PUT ([`Op::PutApp`]) stands. It is re-sent on the RTO
+/// until the node ANSWERS (rule 7) — acknowledged, or refused in the node's
+/// words — or a person CANCELS it: no time ends it (rule 8). While it waits,
+/// [`Page::not_answering`] says for how long.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppPut {
     Pending,
     Put,
     Refused(String),
-    GaveUp(String),
+    Cancelled,
 }
 
-/// How long an app's PUT is re-sent before it ends as [`AppPut::GaveUp`].
-/// Measured on the real network (2026-09-23, a datacentre node behind a
-/// tunnel): a web container was acknowledged in up to ~40 s; the RTO caps
-/// at 60 s, so this leaves at least two re-sends past the slowest seen.
-pub const APP_PUT_BUDGET_MS: u64 = 120_000;
+/// A request page-io frames that is not an engine op — the signer's
+/// registration, its first request, the record query — sent, re-sent and
+/// answered through THIS page's sender like every op (rule 5): one deadline,
+/// one RTO, no timer of page-io's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Ext {
+    /// Register the signer delegate.
+    RegisterSigner,
+    /// The signer's first request: which Register it signs for, or provision.
+    SignerFirst,
+    /// Ask the signer whether it holds a record for this register.
+    AskRecord,
+}
+
+/// What a waiting request is, in words a page can show.
+fn waiting_name(w: &Waiting) -> String {
+    match w {
+        Waiting::Put(_) => "a block's save".into(),
+        Waiting::Held(_) => "a block check".into(),
+        Waiting::Get(_) => "a block read".into(),
+        Waiting::Sign => "the signer".into(),
+        Waiting::Update => "the head's update".into(),
+        Waiting::Warm | Waiting::RecoverHead | Waiting::Verify | Waiting::ReadBack | Waiting::Hint => "the head read".into(),
+        Waiting::PutApp(_) => "the app's publication".into(),
+        Waiting::Ext(Ext::RegisterSigner) => "the signer's registration".into(),
+        Waiting::Ext(Ext::SignerFirst) => "the signer".into(),
+        Waiting::Ext(Ext::AskRecord) => "the signer's record".into(),
+    }
+}
 
 /// An op in flight.
 #[derive(Debug, Clone)]
@@ -267,6 +294,8 @@ enum Waiting {
     Hint,
     /// An app's PUT of this contract key ([`Op::PutApp`]).
     PutApp(String),
+    /// A page-io request ([`Op::Ext`]).
+    Ext(Ext),
 }
 
 /// The head this page owes the network: a commit's `(seq, root)` from the
@@ -297,15 +326,7 @@ struct Verify {
     updates: u32,
     /// The register head a landing asks FROM (its prev).
     from: Option<(u64, Cid)>,
-    /// When the first read went out: the register's own budget (like a cold
-    /// fetch's, [`VERIFY_BUDGET_MS`]) runs from here.
-    first_at: u64,
 }
-
-/// How long the register may stay unreadable, or behind a head the signer
-/// named, before this page says "the register is not answering" — and still
-/// adopts nothing. The cold reads' per-block budget.
-pub const VERIFY_BUDGET_MS: u64 = 30_000;
 
 /// With nothing else reading the register, a head read at least this often:
 /// the subscription's renewal cadence. A `HeadChanged` from the node is a
@@ -510,10 +531,9 @@ pub struct Page {
     get_queue: std::collections::VecDeque<Cid>,
     /// The attempt a re-send continues from (set when an op times out).
     attempt_of: BTreeMap<Waiting, u32>,
-    /// When the engine's own head read first went out and got no answer — the
-    /// register's budget runs from here — and whether "not answering" was said.
-    recover_since: Option<u64>,
-    recover_told: bool,
+    /// When each op still unanswered was FIRST sent: what "not answering for
+    /// N s" counts from. Never a deadline (rule 8).
+    first_of: BTreeMap<Waiting, u64>,
     /// The engine's own head read has been ANSWERED (a head, or certainly
     /// none): until then its tree is the empty one it started on, and a read
     /// answered from it would say "empty" about data that exists.
@@ -580,8 +600,7 @@ impl Page {
             window: rto::Window::default(),
             get_queue: Default::default(),
             attempt_of: BTreeMap::new(),
-            recover_since: None,
-            recover_told: false,
+            first_of: BTreeMap::new(),
             recovered: false,
             engine_has_head: false,
             out: Vec::new(),
@@ -691,20 +710,7 @@ impl Page {
                 // A landing's request, or this commit's.
                 Waiting::Sign if self.verify.as_ref().is_some_and(|v| v.landing) => self.ask_land(),
                 Waiting::Sign => self.ask_sign(),
-                Waiting::PutApp(key) => {
-                    let since = self.app_puts.get(&key).map_or(now, |(_, at)| *at);
-                    if now.saturating_sub(since) >= APP_PUT_BUDGET_MS {
-                        self.attempt_of.remove(&Waiting::PutApp(key.clone()));
-                        let why = format!(
-                            "the node did not acknowledge the PUT of {key} in {} s ({} attempts)",
-                            APP_PUT_BUDGET_MS / 1000,
-                            d.attempt
-                        );
-                        self.app_puts.insert(key, (AppPut::GaveUp(why), since));
-                    } else {
-                        self.send(Waiting::PutApp(key), op);
-                    }
-                }
+                Waiting::PutApp(key) => self.send(Waiting::PutApp(key), op),
                 _ => {
                     if w == Waiting::Update {
                         if let Some(v) = self.verify.as_mut().filter(|v| v.landing) {
@@ -737,30 +743,12 @@ impl Page {
             self.last_head_at = now;
             self.send(Waiting::Hint, Op::ReadHead);
         }
-        // The engine's OWN head read (recovery) has the same budget: it is
-        // asked again on its RTO for as long as it takes, and past the budget
-        // this page says the register is not answering. It is NEVER turned
-        // into `HeadMissing` — that would open an empty tree over a register
-        // that is merely unreachable (sdk#175).
-        if self.deadlines.contains_key(&Waiting::RecoverHead) {
-            let since = *self.recover_since.get_or_insert(now);
-            if !self.recover_told && now.saturating_sub(since) >= VERIFY_BUDGET_MS {
-                self.recover_told = true;
-                self.unusable.push(format!("the register is not answering: no head read within {VERIFY_BUDGET_MS} ms"));
-            }
-        } else {
-            self.recover_since = None;
-        }
-        // The register's own budget: past it, "not answering" — named, and
-        // nothing adopted.
-        if self.verify.as_ref().is_some_and(|v| now.saturating_sub(v.first_at) >= VERIFY_BUDGET_MS) {
-            let v = self.verify.take().expect("checked");
-            self.deadlines.remove(&Waiting::Verify);
-            self.unusable.push(format!(
-                "the register is not answering: the signer named seq {} and the register never showed it within {} ms",
-                v.seq, VERIFY_BUDGET_MS
-            ));
-        }
+        // A register that does not answer is asked again on the RTO for as
+        // long as it takes (rules 7, 8) — the engine's own recovery read, and
+        // the read that decides what a `NotNext` means — and `not_answering`
+        // says for how long. Never turned into `HeadMissing` (that would open
+        // an empty tree over a register merely unreachable, sdk#175), and
+        // never given up.
         let due: Vec<Cid> = self.held_again.iter().filter(|(_, (at, _))| now >= *at).map(|(id, _)| *id).collect();
         for id in due {
             self.send(Waiting::Held(id), Op::AskHeld { id });
@@ -1041,8 +1029,7 @@ impl Page {
             // it was, a later write was told Published at a head no reader
             // can see (the model, seed 10). So the register is read first.
             A::NotNext { current } => {
-                let now = self.now;
-                self.verify = Some(Verify { seq: current.seq, root: current.root, landing: false, again_at: None, tries: 0, updates: 0, from: None, first_at: now });
+                self.verify = Some(Verify { seq: current.seq, root: current.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
                 self.send(Waiting::Verify, Op::ReadHead);
             }
             // RETRYABLE, on a doubling backoff (engineer2's table):
@@ -1076,8 +1063,7 @@ impl Page {
                         ));
                     }
                 } else {
-                    let now = self.now;
-                    self.verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None, first_at: now });
+                    self.verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
                     self.send(Waiting::Verify, Op::ReadHead);
                 }
             }
@@ -1339,6 +1325,7 @@ impl Page {
             }
         }
         let attempt = self.attempt_of.remove(&w).map_or(1, |a| a + 1);
+        self.first_of.entry(w.clone()).or_insert(self.now);
         // PER-OP backoff on top of the shared RTO (TCP backs off per
         // segment): the n-th send of one op waits RTO x 2^(n-1), capped at
         // the RTO's ceiling. The shared RTO alone is pulled back down by every
@@ -1406,6 +1393,7 @@ impl Page {
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
         let d = self.deadlines.remove(w)?;
         self.attempt_of.remove(w);
+        self.first_of.remove(w);
         if d.sent && d.attempt == 1 {
             self.rto.sample(self.now.saturating_sub(d.sent_at));
         }
@@ -1535,6 +1523,17 @@ impl Page {
             self.engine_has_head = true;
             self.last_head_at = self.now;
         }
+    }
+
+    /// Supersede the engine's read `req` if it has made no progress
+    /// ([`engine::Engine::supersede_read`]); the GETs only it needed end with
+    /// it. Whether it was.
+    pub fn supersede_read(&mut self, req: engine::read::ReqId) -> bool {
+        let done = self.engine.supersede_read(req);
+        if done {
+            self.end_unneeded_gets();
+        }
+        done
     }
 
     /// A GET nobody needs ENDS at once -- its deadline, its re-ask backoff and the engine's entry go together --
@@ -1750,9 +1749,10 @@ impl Page {
     }
 
     /// Ops to send, in order.
-    /// PUT a contract the app names, by key: sent now, re-sent on the RTO,
-    /// and ended by [`APP_PUT_BUDGET_MS`] if nothing answers. Asking again
-    /// for a key that ENDED starts it over; one still pending is left alone.
+    /// PUT a contract the app names, by key: sent now, re-sent on the RTO
+    /// until the node answers or a person cancels ([`Page::cancel_app_put`]).
+    /// Asking again for a key that ENDED starts it over; one still pending is
+    /// left alone.
     pub fn put_app(&mut self, key: String, now: Ms) {
         self.now = now.0;
         if matches!(self.app_puts.get(&key), Some((AppPut::Pending, _))) {
@@ -1765,6 +1765,51 @@ impl Page {
     /// Where the app's PUT of `key` stands; `None` if it was never asked.
     pub fn app_put(&self, key: &str) -> Option<&AppPut> {
         self.app_puts.get(key).map(|(p, _)| p)
+    }
+
+    /// A PERSON cancels a pending app PUT — the one end that is not the
+    /// node's answer (rule 8), and it is named. Nothing more is sent for it.
+    pub fn cancel_app_put(&mut self, key: &str) {
+        if matches!(self.app_puts.get(key), Some((AppPut::Pending, _))) {
+            let w = Waiting::PutApp(key.to_string());
+            self.deadlines.remove(&w);
+            self.attempt_of.remove(&w);
+            self.first_of.remove(&w);
+            if let Some(p) = self.app_puts.get_mut(key) {
+                p.0 = AppPut::Cancelled;
+            }
+        }
+    }
+
+    /// Send a page-io request ([`Ext`]) through this page's sender: its
+    /// deadline, RTO and re-send are the page's, like every op's (rule 5).
+    pub fn send_ext(&mut self, e: Ext, now: Ms) {
+        self.now = now.0;
+        self.send(Waiting::Ext(e), Op::Ext(e));
+    }
+
+    /// Its answer arrived: the deadline ends (and an attempt-1 answer is an
+    /// RTO sample, as for every op).
+    pub fn ext_answered(&mut self, e: Ext, now: Ms) {
+        self.now = now.0;
+        self.answered(&Waiting::Ext(e));
+    }
+
+    /// Is this request still waiting on an answer?
+    pub fn ext_waiting(&self, e: Ext) -> bool {
+        self.deadlines.contains_key(&Waiting::Ext(e))
+    }
+
+    /// NOT ANSWERING FOR N s: the request that has waited longest for an
+    /// answer, and for how long (ms) — what a page shows while the node is
+    /// slow ("not answering for N s", rule 8). Never an end: the request is
+    /// still being re-sent. `None` when nothing waits.
+    pub fn not_answering(&self) -> Option<(String, u64)> {
+        self.first_of
+            .iter()
+            .filter(|(w, _)| self.deadlines.contains_key(*w))
+            .min_by_key(|(_, at)| **at)
+            .map(|(w, at)| (waiting_name(w), self.now.saturating_sub(*at)))
     }
 
     pub fn take_ops(&mut self) -> Vec<Op> {

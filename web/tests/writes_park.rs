@@ -117,13 +117,15 @@ fn control_the_reader_finds_real_bodies() {
     );
 }
 
-/// **THE PAGE'S TICK REACHES THE STORE'S TICK, AND TIMES NO WRITE OUT.**
+/// **THE PAGE'S TICK TIMES NOTHING OUT: no write, and no read.**
 ///
 /// R-b (sdk#291): the outbox is gone with its timeout. A write waiting its
 /// turn behind the engine's own commits is not "unanswered", and the tick must
-/// never roll one back: `Session::tick` runs the STORE's tick (its tickets'
-/// lifetimes) and nothing that times a write out. The history below is why
-/// the call site is checked at all.
+/// never roll one back. And (rule 8, sdk#302) the store's own tick went too:
+/// its only work was ending a read's ticket at `TICKET_LIFE_MS`, a time
+/// cut-off. A ticket now ends only on its answer, so the store has NO tick and
+/// the Session must not grow one back. The history below is why the call site
+/// is checked at all.
 ///
 /// `Session::tick` called `self.db.store_mut().copy.time_out(now)` — straight
 /// to the COPY, which rolls back writes that waited too long and does nothing
@@ -142,11 +144,17 @@ fn control_the_reader_finds_real_bodies() {
 /// to watch: the copy IS a field of the store, and touching it directly
 /// skipped every decision the store makes around it.
 #[test]
-fn the_page_tick_goes_through_the_store_tick() {
+fn the_page_tick_times_nothing_out() {
     let body = body_of("tick");
+    // The reader found the real tick: it tells the page's writes the time.
+    assert!(body.contains("writes.send_tick(now)"), "the body read is not Session::tick");
     assert!(
-        body.contains("self.db.store_mut().tick(now)"),
-        "`Session::tick` does not call the store's own tick (its tickets' lifetimes)."
+        !body.contains("store_mut().tick("),
+        "`Session::tick` calls a store tick again: the store's only tick ended reads by a clock (rule 8)."
+    );
+    assert!(
+        !include_str!("../../src/page_store.rs").contains("pub fn tick("),
+        "the page store has a tick again: its only work was a ticket LIFETIME, a time cut-off (rule 8)."
     );
     assert!(
         !body.contains("writes.tick()"),

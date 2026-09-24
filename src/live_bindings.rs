@@ -72,7 +72,7 @@ impl LiveBindings {
     /// The binding's read of `key` COMPLETED, answered at `root` (the pinned
     /// root it resumed at, or the head): what it shows now is that tree. Set
     /// on completion, never at report time (the architect on sdk#289): a
-    /// re-read that parks and ends UNAVAILABLE / NOT_ANSWERING, or answers at
+    /// re-read that parks and ends UNAVAILABLE, or answers at
     /// an older pinned root, leaves `RenderedAt` where the binding really is,
     /// so the change is reported again.
     pub fn rendered(&mut self, key: &WatchKey, root: Option<Cid>) {

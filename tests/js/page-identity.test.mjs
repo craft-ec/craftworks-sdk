@@ -90,7 +90,6 @@ await t("**opening REFUSED by the signer ends by name: Session.refused() says so
   const s = page();
   const [q] = signerRequests(s);
   assert.equal(s.refused(), "", "THE CONTROL: refused before anything was answered");
-  assert.equal(s.exhausted(), false);
   s.on_inbound(new Uint8Array(Buffer.from(stdlib([], `refused:${q.id}:`).signer_answer, "hex")));
   assert.match(s.refused(), /KeyAlreadyProvisioned/, "the signer's refusal did not reach Session.refused()");
   assert.equal(s.provisioned(), false);

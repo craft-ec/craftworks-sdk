@@ -872,17 +872,20 @@ fn an_empty_reply_to_the_query_is_no_answer_and_the_re_ask_opens() {
     assert!(node.served["signer"] >= 3, "the query was not asked again after the empty reply ({} signer requests)", node.served["signer"]);
 }
 
-/// And it is BOUNDED: a node that only ever answers empty ends the open BY
-/// NAME, never a silent wait.
+/// And an EMPTY reply, after this page registered the signer, is NOT an
+/// answer (#260): the page's sender keeps asking — no count ends it (rule 8,
+/// the old cap of three is gone) — the page says how long, and when the node
+/// answers properly the opening goes on.
 #[test]
-fn a_signer_that_only_answers_empty_is_named_not_waited_on() {
+fn a_signer_that_answers_only_empty_is_asked_on_and_opens_when_it_answers() {
     let key = [25u8; 32];
     let mut node = WireNode::unprovisioned(&key);
-    node.empty_signer_answers = usize::MAX;
+    node.empty_signer_answers = 50;
     let mut now = 1_000;
     let (io, _) = opening(&mut node, &mut now, &key, false);
-    assert!(!io.provisioned());
-    assert!(io.unusable().iter().any(|u| u.contains("answered its first request EMPTY")), "not named: {:?}", io.unusable());
+    assert_eq!(node.empty_signer_answers, 0, "the node did not answer empty 50 times: the case did not happen");
+    assert!(io.provisioned(), "fifty empty replies ended the open: {:?}", io.unusable());
+    assert!(io.unusable().iter().all(|u| !u.contains("EMPTY")), "an empty reply was reported as an end: {:?}", io.unusable());
 }
 
 /// EVERY NODE CALL ON THE RTO (the ruling since #227): a lost answer to the
@@ -922,20 +925,52 @@ fn a_lost_provisioning_answer_is_asked_again() {
     assert!(io.provisioned(), "a lost provisioning answer was never asked again: {:?}", node.served);
 }
 
-/// BOUNDED: a signer that never answers is asked a bounded number of times,
-/// then named "not answering" — never re-asked for ever, never a silent hang.
+/// NO CUT-OFF (rules 7, 8): a signer silent for FIVE MINUTES is asked again
+/// on the page's RTO the whole time — never given up, never named ended — the
+/// page says how long it has not answered, and when it answers at last the
+/// opening goes on. A fixed cut-off anywhere on this path fails this test.
 #[test]
-fn a_signer_that_never_answers_is_named_not_answering_and_not_asked_for_ever() {
+fn a_signer_silent_for_five_minutes_then_answering_is_never_given_up() {
     let key = [25u8; 32];
     let mut node = WireNode::unprovisioned(&key);
-    node.drop_signer_answers = 10_000;
-    let mut now = 1_000;
-    let (page, _) = opening(&mut node, &mut now, &key, false);
-    assert!(!page.provisioned());
-    assert!(page.unusable().iter().any(|u| u.starts_with("the signer is not answering")), "{:?}", page.unusable());
-    let asked = node.served["signer"];
-    assert!((2..=10).contains(&asked), "asked {asked} times within the budget");
-    assert!(now >= 1_000 + page::VERIFY_BUDGET_MS, "gave up before its budget, at {now}");
+    node.drop_signer_answers = usize::MAX;
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+    );
+    io.begin(container);
+    let mut now = 1_000u64;
+    let silent_until = now + 300_000;
+    let mut longest = 0;
+    while now < silent_until {
+        let frames = io.take_frames();
+        if frames.is_empty() {
+            let Some(Ms(t)) = io.next_due() else { break };
+            now = now.max(t).min(silent_until);
+            io.tick(Ms(now));
+            if let Some((_, ms)) = io.not_answering() {
+                longest = longest.max(ms);
+            }
+            continue;
+        }
+        now += 1;
+        for f in frames {
+            if let Some(a) = node.serve(&f) {
+                io.inbound(&a, Ms(now));
+            }
+        }
+    }
+    let asked = node.served.get("signer").copied().unwrap_or(0);
+    println!("silent 5 min: asked {asked} times, longest not answering {longest} ms, refused {:?}", io.refused());
+    assert!(!io.provisioned() && io.refused().is_none(), "a silent signer was ended: {:?}", io.refused());
+    assert!(asked >= 5, "the silent signer was asked only {asked} times in five minutes");
+    assert!(longest >= 290_000, "the page never said it had waited: {longest} ms");
+    assert!(io.unusable().iter().all(|u| !u.contains("not answering")), "a silence was reported as an END: {:?}", io.unusable());
+    // It answers at last: opening goes on.
+    node.drop_signer_answers = 0;
+    settle(&mut io, &mut node, &mut now);
+    assert!(io.needs_key(), "the signer answered after five minutes and the page did not take it: {:?}", node.served);
 }
 
 /// OPENING ENDS BY NAME (what `open()` reports): REFUSED — the signer's own
@@ -954,14 +989,13 @@ fn opening_that_the_signer_refuses_is_refused_in_its_words() {
     settle(&mut io, &mut node, &mut now);
     assert!(!io.provisioned());
     assert!(io.refused().is_some_and(|r| r.contains("KeyAlreadyProvisioned")), "{:?}", io.refused());
-    assert!(!io.exhausted() && !io.stalled(), "a refusal is not also 'not answering' or 'still waiting'");
+    assert!(!io.stalled(), "a refusal is not also 'still waiting'");
 }
 
-/// ...EXHAUSTED when its re-asks are spent, and STALLED while it is still
-/// waiting past the first RTO — and neither once it is answered.
+/// STALLED while the opening is still waiting past its first RTO — and not
+/// once it is answered. (There is no "exhausted": nothing gives up.)
 #[test]
-fn opening_is_stalled_while_unanswered_and_exhausted_when_the_reasks_are_spent() {
-    // Stalled, stepped by hand: the first answer is lost.
+fn opening_is_stalled_while_unanswered_and_not_once_answered() {
     let key = [28u8; 32];
     let mut node = WireNode::unprovisioned(&key);
     node.drop_signer_answers = 1;
@@ -970,24 +1004,19 @@ fn opening_is_stalled_while_unanswered_and_exhausted_when_the_reasks_are_spent()
         Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
+    io.tick(Ms(1_000));
     io.begin(container);
     for f in io.take_frames() {
         if let Some(a) = node.serve(&f) { io.inbound(&a, Ms(1_000)); }
     }
-    io.tick(Ms(1_000)); // anchors the first exchange
+    let _ = io.take_frames(); // the first request, whose answer is lost
+    io.tick(Ms(1_000));
     assert!(!io.stalled(), "stalled before its first RTO");
-    io.tick(Ms(2_000)); // past it, and re-asked
+    io.tick(Ms(2_500)); // past it, re-sent by the page's sender
     assert!(io.stalled(), "not stalled past its first RTO, unanswered");
-    let mut now = 2_000;
+    let mut now = 2_500;
     settle(&mut io, &mut node, &mut now);
-    assert!(io.needs_key() && !io.stalled() && !io.exhausted(), "answered, and still stalled or exhausted");
-
-    // Exhausted: a signer that never answers.
-    let mut silent = WireNode::unprovisioned(&[29u8; 32]);
-    silent.drop_signer_answers = 10_000;
-    let mut now = 1_000;
-    let (page, _) = opening(&mut silent, &mut now, &[29u8; 32], false);
-    assert!(page.exhausted() && page.refused().is_none() && !page.stalled(), "exhausted {} refused {:?} stalled {}", page.exhausted(), page.refused(), page.stalled());
+    assert!(io.needs_key() && !io.stalled(), "answered, and still stalled");
 }
 
 /// sdk#259: page-io reports the head subscription AS IT IS — asked, answered,
@@ -1152,14 +1181,15 @@ fn asking_whose_node_registers_mints_and_provisions_nothing() {
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
 }
 
-/// A READER LEAVES NO TRACE, frame by frame: on a node without the signer
-/// (it answers EMPTY, as a real 0.2.136 node does), every frame the asking
-/// page sends is the Register QUERY, and none is a registration. And every
-/// EMPTY is an answer to a query: the page counts exactly as many as the node
-/// served. A page that took the first EMPTY for its signer's registration
-/// (the page never registered one) would ask one query more than it counts.
+/// ASKING LEAVES NO TRACE, frame by frame: on a node without the signer (it
+/// answers EMPTY, as a real 0.2.136 node does), the asking page sends the
+/// Register QUERY and nothing else — never a registration — and that one
+/// EMPTY IS the node's answer ("no signer here"): one query, one answer, done
+/// (rule 8: an answer ends it; no count, no clock). A page that took the
+/// EMPTY for its signer's registration (it never registered one) would ask
+/// the query a second time.
 #[test]
-fn asking_on_a_node_without_the_signer_sends_only_the_query_and_counts_every_empty_answer() {
+fn asking_on_a_node_without_the_signer_sends_one_query_and_takes_its_empty_answer() {
     let mut node = WireNode::unprovisioned(&[11u8; 32]);
     node.empty_signer_answers = usize::MAX;
     let mut io = asker();
@@ -1189,20 +1219,11 @@ fn asking_on_a_node_without_the_signer_sends_only_the_query_and_counts_every_emp
     assert!(sent.iter().all(|k| *k == "signer"), "asking sent a frame that is not the query: {sent:?}");
     assert_eq!(node.served.get("register delegate"), None, "asking registered the signer: {:?}", node.served);
     assert!(!io.provisioned() && node.secrets.is_empty(), "asking provisioned the node");
+    // Named as a node with NO SIGNER: its own answer, not a refusal.
+    assert!(matches!(io.asked(), Some(page_io::Asked::NoSigner(_))), "a node without the signer was not named as one: {:?}", io.asked());
     let served = node.served.get("signer").copied().unwrap_or(0);
-    let counted = match io.asked() {
-        // Named as a node with NO SIGNER (its own answer, not a refusal), in
-        // words that count the EMPTY answers.
-        Some(page_io::Asked::NoSigner(w)) => w
-            .split("EMPTY ")
-            .nth(1)
-            .and_then(|r| r.split(' ').next())
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or_else(|| panic!("the answer does not say how many EMPTY answers: {w}")),
-        other => panic!("a node without the signer was not named as one: {other:?}"),
-    };
-    assert_eq!(counted, served, "the node answered {served} queries EMPTY and the page counted {counted}: an EMPTY was taken for something else");
-    assert_eq!(sent.len(), served, "frames sent {sent:?} against queries served {served}");
+    assert_eq!(served, 1, "the node answered EMPTY and was asked again ({served} queries): an EMPTY was taken for something else");
+    assert_eq!(sent, ["signer"], "frames sent: {sent:?}");
 }
 
 /// THE CONTROL: the page that OPENS (`begin`) does register the signer — so
@@ -1270,7 +1291,8 @@ fn a_claimed_page_opens_the_persons_own_tree_on_each_kind_of_node() {
 }
 
 /// NOTHING IS CLAIMED ON AN ANSWER NOT HAD: before the signer answers, and
-/// when it never does, a claim says `false` and nothing is registered,
+/// while it stays silent (which ends nothing: rule 8), a claim says `false`
+/// and nothing is registered,
 /// minted or opened -- the runtime shows the inputs disabled, with why.
 #[test]
 fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
@@ -1283,7 +1305,12 @@ fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
     let mut now = 1_000;
     node.drop_signer_answers = usize::MAX;
     settle(&mut io, &mut node, &mut now);
-    assert_eq!(io.asked(), Some(&page_io::Asked::NotAnswering), "{:?}", io.unusable());
+    // RULE 8: silence is not an answer and ends nothing. The ask stays
+    // unanswered, the page says what it waits on, and nothing is claimed.
+    assert_eq!(io.asked(), None, "a silent signer was taken as an answer: {:?}", io.asked());
+    let (what, ms) = io.not_answering().expect("a silent signer, and the page does not say what it waits on");
+    assert!(what.contains("signer"), "the page names the wrong wait: {what}");
+    assert!(ms > 0, "the wait has no length");
     assert!(!io.claim(container), "a silent signer's page was claimed");
     assert!(!io.provisioned() && !io.needs_key(), "a refused claim opened or minted");
     assert_eq!(node.served.get("register delegate"), None, "a refused claim registered the signer");
