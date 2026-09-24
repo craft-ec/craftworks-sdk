@@ -2505,6 +2505,9 @@ mod parked_get {
         assert_eq!(due, 10 + p.backoff(1), "parked at a backoff other than send()'s");
         assert_eq!(p.gets_in_flight(), 0, "a parked GET holds a window place");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "a NotFound GET was re-sent at once");
+        // The page's OPENING head read is on the wire too, and the GET's sample re-armed it to the new RTO
+        // (sdk#378), so it would time out at this very tick -- a real timeout, and not this test's subject.
+        p.deadlines.remove(&Waiting::RecoverHead);
         p.tick(Ms(due));
         assert_eq!(p.rto.rto_ms(), rto_before, "a parked GET coming due was counted as a timeout");
         assert_eq!(p.window.size(), window_before, "a parked GET coming due halved the window");
