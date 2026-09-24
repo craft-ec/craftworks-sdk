@@ -542,6 +542,17 @@ export async function openSession(Session, {
     notAnswering: () => JSON.parse(session.not_answering()),
     /** A person cancels the pending PUT of `key` (named `cancelled`). */
     cancelPut: key => session.cancel_put(key),
+    /**
+     * PUBLISH `web` as `app`'s site (builder#117) under the site contract `code` (`site.wasm`); returns its
+     * LINK, the same for every publish. `siteStatus(app)` says how it ends.
+     */
+    publishSite: (app, code, web) => session.publish_site(app, code, web),
+    /** `{ state, version, said }`: none | publishing | published | superseded | refused | cancelled. */
+    siteStatus: app => JSON.parse(session.site_status(app)),
+    /** `app`'s site link under `code`, published or not. */
+    siteLink: (app, code) => session.site_link(app, code),
+    /** A person cancels `app`'s publication (named `cancelled`). */
+    cancelSite: app => session.cancel_site(app),
     refused: () => session.refused(),
     /** Has a socket to this node EVER opened? See `everOpened`. */
     connectedOnce: () => everOpened,

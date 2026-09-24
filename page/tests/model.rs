@@ -522,7 +522,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         for (i, a) in apps.iter_mut().enumerate() {
             for op in a.page.take_ops() {
                 // INVARIANT 2.
-                if let Op::Update { state } = &op {
+                if let Op::Update { label: page::Label::Head, state } = &op {
                     if !a.page.signer_records().contains(state) {
                         return Err(format!("page {i} UPDATEd bytes the signer never returned"));
                     }
@@ -567,7 +567,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         })
                     }
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                     if s_sign.chance(faults.sign_lost) {
                         None
                     } else {
@@ -585,7 +585,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         Some(Answer::Signer { id, answer: a })
                     }
                 }
-                Op::Update { state } => {
+                Op::Update { state, .. } => {
                     seen.updates += 1;
                     if s_upd.chance(faults.update_lost) {
                         None
@@ -604,7 +604,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                                 }
                             }
                         }
-                        Some(Answer::Updated)
+                        Some(Answer::Updated { label: page::Label::Head })
                     }
                 }
                 Op::AskHeld { id } => {
@@ -617,11 +617,11 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                 // The engine never makes an app PUT; this model sends none.
                 Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                 Op::Ext(_) => None,
-                Op::ReadHead => {
+                Op::ReadHead { .. } => {
                     if s_head.chance(faults.head_lost) {
                         None
                     } else {
-                        Some(Answer::Head(node.head_read()))
+                        Some(Answer::Head { label: page::Label::Head, read: node.head_read() })
                     }
                 }
             };
@@ -968,14 +968,14 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                     puts.push(id);
                     p.answer(Answer::PutOk(id), Ms(0));
                 }
-                Op::ReadHead => p.answer(Answer::Head(node.head_read()), Ms(0)),
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                Op::ReadHead { .. } => p.answer(Answer::Head { label: page::Label::Head, read: node.head_read() }, Ms(0)),
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                     let (id, a) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                     p.answer(Answer::Signer { id, answer: a }, Ms(0));
                 }
-                Op::Update { state } => {
+                Op::Update { state, .. } => {
                     node.update(&state);
-                    p.answer(Answer::Updated, Ms(0));
+                    p.answer(Answer::Updated { label: page::Label::Head }, Ms(0));
                 }
                 Op::Get { id } => p.answer(Answer::GetMissed(id), Ms(0)),
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, Ms(0)),
@@ -1038,19 +1038,19 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                         Some(b) => Answer::Got { id, bytes: b.clone() },
                         None => Answer::GetMissed(id),
                     }),
-                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                         let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         Some(Answer::Signer { id, answer })
                     }
-                    Op::Update { state } => {
+                    Op::Update { state, .. } => {
                         if drop_updates {
                             None
                         } else {
                             node.update(&state);
-                            Some(Answer::Updated)
+                            Some(Answer::Updated { label: page::Label::Head })
                         }
                     }
-                    Op::ReadHead => Some(Answer::Head(node.head_read())),
+                    Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
                     Op::AskHeld { id } => Some(Answer::Held { id, present: node.blocks.contains_key(&id) }),
                     Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                     Op::Ext(_) => None,
@@ -1078,7 +1078,7 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                     node.put(id, &bytes);
                     Some(Answer::PutOk(id))
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                         let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         Some(Answer::Signer { id, answer })
                     }

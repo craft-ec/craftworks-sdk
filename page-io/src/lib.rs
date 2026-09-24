@@ -37,7 +37,7 @@
 use freenet_prolly::Cid;
 use freenet_stdlib::prelude::*;
 use page::server::{Server, SignerFacts};
-use page::{Answer, Ext, Ms, Op};
+use page::{Answer, Ext, Label, Ms, Op, Publication};
 use std::collections::BTreeMap;
 use wire::{DelegateKey, Incoming};
 
@@ -151,6 +151,29 @@ impl HeadSubscription {
     }
 }
 
+/// A site in flight: its contract (code + relabelled params), id and key, and its web part.
+struct Site {
+    contract: ContractContainer,
+    id: [u8; 32],
+    key: String,
+    web: Vec<u8>,
+}
+
+/// Why a site cannot be published or linked yet: the node's signer has not named the Register (the key) this
+/// page signs under, so there is no authority to relabel. Not a "no": it waits on the signer's answer.
+pub const NO_REGISTER_YET: &str = "not yet: the node's signer has not said which key this head signs under";
+
+/// A site's contract: `site_code` under `app`'s site params, derived from the person's Register params
+/// (`contract_keys::site::site_params`, the ONE relabelling). `None` for a bad app id or a keyset that is not
+/// mode 0. Its id is the site's stable link (builder#117).
+pub fn site_contract(site_code: &[u8], register_params: &[u8], app: &str) -> Option<ContractContainer> {
+    let params = contract_keys::site::site_params(register_params, app)?;
+    Some(ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(site_code.to_vec())),
+        Parameters::from(params),
+    ))))
+}
+
 pub struct PageIo {
     pub server: Server,
     art: Artefacts,
@@ -201,6 +224,10 @@ pub struct PageIo {
     /// The app's PUTs by contract key: the exact contract and state, framed
     /// again whenever the page re-sends [`Op::PutApp`].
     app_contracts: BTreeMap<String, (ContractContainer, WrappedState)>,
+    /// SITES being published (builder#117), by app: the site contract and the web part the page's record is
+    /// framed around. The page owns the publication; these bytes are page-io's only while it is `Publishing`
+    /// and are dropped when it ends (no app PUT entry: the site's PUT is the page's `Update`).
+    sites: BTreeMap<String, Site>,
     /// The last time the node or the clock spoke, for answers made locally.
     now: Ms,
     /// A reader's stream-id range (`reader`), in the top byte; 0 for the
@@ -323,6 +350,7 @@ impl PageIo {
             head_failed_pending: false,
             others: Vec::new(),
             app_contracts: BTreeMap::new(),
+            sites: BTreeMap::new(),
             now: Ms(0),
             stream_base: 0,
             needs_key: false,
@@ -579,6 +607,62 @@ impl PageIo {
         Ok(())
     }
 
+    /// PUBLISH `web` as `app`'s site (builder#117): the page reads the site, signs the next version through the
+    /// ONE head path, PUTs the record framed around `web`, and reads it back ([`PageIo::publication`]). A reader,
+    /// a bad app id or a Register that is not this person's own key publishes nothing, by name.
+    pub fn publish_site(&mut self, app: &str, site_code: &[u8], web: Vec<u8>, now: Ms) -> Result<(), String> {
+        self.now = now;
+        if self.read_only() {
+            return Err("read-only: a reader publishes nothing".into());
+        }
+        if self.art.register_params.is_empty() {
+            return Err(NO_REGISTER_YET.into());
+        }
+        let Some(contract) = site_contract(site_code, &self.art.register_params, app) else {
+            return Err(format!("no site for {app:?}: not an app id, or this head has no single key to sign it"));
+        };
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&contract.key().id().as_bytes()[..32]);
+        let key = contract.key().to_string();
+        let value = *blake3::hash(&web).as_bytes();
+        self.sites.insert(app.to_string(), Site { contract, id, key, web });
+        self.server.page.publish_site(app, value, now);
+        self.pump();
+        Ok(())
+    }
+
+    /// `app`'s site LINK: its contract's instance id, as the node serves it (`/v1/contract/web/<link>/`). The same
+    /// for every publish (builder#117). `None`: not an app id, or this head has no single key.
+    pub fn site_link(&self, site_code: &[u8], app: &str) -> Option<String> {
+        site_contract(site_code, &self.art.register_params, app).map(|c| c.key().id().encode())
+    }
+
+    /// Has the node's signer named the Register this page signs under (so a site has an authority)?
+    pub fn register_params_known(&self) -> bool {
+        !self.art.register_params.is_empty()
+    }
+
+    /// How `app`'s site publication stands: the page's, the one owner. `None`: never published here.
+    pub fn publication(&self, app: &str) -> Option<&Publication> {
+        self.server.page.publication(app)
+    }
+
+    /// The person cancels `app`'s publication: it ends `Cancelled` and its bytes go.
+    pub fn cancel_site(&mut self, app: &str) {
+        self.server.page.cancel_site(app);
+        self.pump();
+    }
+
+    /// The site in flight whose contract id is `id`, by app.
+    fn site_by_id(&self, id: &[u8; 32]) -> Option<String> {
+        self.sites.iter().find(|(_, s)| s.id == *id).map(|(a, _)| a.clone())
+    }
+
+    /// The site in flight whose contract key is `key`, by app.
+    fn site_by_key(&self, key: &str) -> Option<String> {
+        self.sites.iter().find(|(_, s)| s.key == key).map(|(a, _)| a.clone())
+    }
+
     /// A person cancels the pending PUT of `key` (the page's, named).
     pub fn cancel_app_put(&mut self, key: &str) {
         self.server.page.cancel_app_put(key);
@@ -687,7 +771,17 @@ impl PageIo {
                     self.head_answered = true;
                     // The head WHOLE (root ‖ ledger), tolerantly: the root is
                     // the value's first 32 bytes whatever ledger follows.
-                    self.server.node(Answer::Head(page::HeadRead::from_record(&state)), now);
+                    self.server.node(Answer::Head { label: Label::Head, read: page::HeadRead::from_record(&state) }, now);
+                } else if let Some(app) = self.site_by_id(&id) {
+                    // A site's record is its framing's META. A state that does not frame is no answer (the site
+                    // contract admits none): named, and the read stays silent, re-asked on the RTO.
+                    match contract_keys::site::framing(&state) {
+                        Some((meta, _)) => {
+                            let read = page::HeadRead::from_record(meta);
+                            self.server.node(Answer::Head { label: Label::Site(app), read }, now)
+                        }
+                        None => self.unusable.push(format!("a site state for {app} that is not a web framing")),
+                    }
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
                     let body = wire::block::block_of_state(&state).map(|(_, b)| b.to_vec()).unwrap_or_default();
                     self.server.node(Answer::Got { id: cid, bytes: body }, now);
@@ -707,7 +801,10 @@ impl PageIo {
                 }
             }
             Incoming::GetFailed { id, why: wire::GetFail::NotFound } => {
-                if id == self.register_id {
+                if let Some(app) = self.site_by_id(&id) {
+                    // No site at this address: the genesis (only a NotFound says so).
+                    self.server.node(Answer::Head { label: Label::Site(app), read: None }, now);
+                } else if id == self.register_id {
                     self.head_failed += 1;
                     // The node's explicit NotFound for the head — which a
                     // PEERED node can answer falsely (F55) — is "no head" ONLY if the signer holds no
@@ -717,7 +814,7 @@ impl PageIo {
                     // would have its first commit PUT a second register that
                     // F56 then merges against the real one (sdk#175).
                     match (self.register_seen, self.signer_has_record) {
-                        (false, Some(false)) => self.server.node(Answer::Head(None), now),
+                        (false, Some(false)) => self.server.node(Answer::Head { label: Label::Head, read: None }, now),
                         (false, None) => {
                             self.head_failed_pending = true;
                             self.ask_record();
@@ -733,7 +830,7 @@ impl PageIo {
             {
                 if key == self.register_key {
                     self.register_seen = true;
-                    self.server.node(Answer::Updated, now);
+                    self.server.node(Answer::Updated { label: Label::Head }, now);
                 } else if let Some(cid) = self.by_key.get(&key).copied() {
                     self.server.node(Answer::PutOk(cid), now);
                 }
@@ -763,6 +860,15 @@ impl PageIo {
                     // What the engine may do now depends on it (#342: no tree yet → writes wait, unput).
                     self.step_can_sign();
                 }
+            }
+            // A site's PUT was answered: the page reads it back (it says nothing about which record was kept).
+            Incoming::Ack(wire::AckKind::Put(key)) | Incoming::Ack(wire::AckKind::Updated(key)) if self.site_by_key(&key).is_some() => {
+                let app = self.site_by_key(&key).expect("matched");
+                self.server.node(Answer::Updated { label: Label::Site(app) }, now)
+            }
+            Incoming::PutFailed { key, said } if self.site_by_key(&key).is_some() => {
+                let app = self.site_by_key(&key).expect("matched");
+                self.server.node(Answer::SiteRefused { app, said }, now)
             }
             // The app's PUT: the page ends its deadline.
             Incoming::Ack(wire::AckKind::Put(key)) if self.app_contracts.contains_key(&key) => {
@@ -859,7 +965,7 @@ impl PageIo {
                             if let Some(h) = has {
                                 self.signer_has_record = Some(h);
                                 if !h && std::mem::take(&mut self.head_failed_pending) && !self.register_seen {
-                                    self.server.node(Answer::Head(None), now);
+                                    self.server.node(Answer::Head { label: Label::Head, read: None }, now);
                                 }
                             }
                         }
@@ -907,13 +1013,14 @@ impl PageIo {
     /// its blocks; a writer also owns its signer's answers, answers that name
     /// nothing, and PUT answers for the app's own contracts (handed back).
     fn owns(&self, incoming: &Incoming) -> bool {
-        let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id);
-        let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k);
+        let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id) || self.sites.values().any(|s| s.id == *id);
+        let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k) || self.sites.values().any(|s| s.key == *k);
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id, .. } => mine(id),
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
-            Incoming::HeadChanged { key } => *key == self.register_key,
+            // A site's change is its own (taken, and read by nobody: the page does not follow a site).
+            Incoming::HeadChanged { key } => *key == self.register_key || self.sites.values().any(|s| s.key == *key),
             Incoming::Partial => true,
             Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::Refused(_) | Incoming::Unusable(_) => !self.read_only(),
         }
@@ -1004,7 +1111,7 @@ impl PageIo {
         for op in self.server.take_ops() {
             // No tree yet: there is no head to read, and asking the node for
             // one would name a Register nobody has made. Answered here.
-            if matches!(op, Op::ReadHead) && self.no_tree_yet() {
+            if matches!(op, Op::ReadHead { label: Label::Head }) && self.no_tree_yet() {
                 no_head = true;
                 continue;
             }
@@ -1024,7 +1131,7 @@ impl PageIo {
                         continue;
                     }
                     // A repair PUT (the only PUT a view's page makes), reads.
-                    Op::Put { .. } | Op::Get { .. } | Op::ReadHead => {}
+                    Op::Put { .. } | Op::Get { .. } | Op::ReadHead { .. } => {}
                 }
             }
             let stream = self.next_stream();
@@ -1043,11 +1150,20 @@ impl PageIo {
                     self.by_contract.insert(contract, id);
                     wire::frame_get(wire::contract_id(contract), false, stream)
                 }
-                Op::ReadHead => {
+                Op::ReadHead { label: Label::Head } => {
                     self.head_asked = true;
                     wire::frame_get(wire::contract_id(self.register_id), true, stream)
                 }
-                Op::Update { state } => {
+                Op::ReadHead { label: Label::Site(app) } => match self.sites.get(&app) {
+                    Some(site) => wire::frame_get(wire::contract_id(site.id), true, stream),
+                    None => Err(format!("a read of {app}'s site, which is not being published")),
+                },
+                // A site's write is a PUT of its framing around exactly the signer's record (invariant 2).
+                Op::Update { label: Label::Site(app), state } => match self.sites.get(&app) {
+                    Some(site) => wire::frame_put(site.contract.clone(), WrappedState::new(contract_keys::site::frame(&state, &site.web)), stream),
+                    None => Err(format!("a PUT of {app}'s site, which is not being published")),
+                },
+                Op::Update { label: Label::Head, state } => {
                     if self.register_seen {
                         wire::frame_update(self.register.key(), state, stream)
                     } else {
@@ -1057,14 +1173,25 @@ impl PageIo {
                         wire::frame_put(self.register.clone(), WrappedState::new(state), stream)
                     }
                 }
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => wire::signer::frame_sign(
-                    &self.art.signer,
-                    id,
-                    signer_proto::Head { seq: prev_seq, root: prev_root },
-                    signer_proto::Next { seq, root, ledger },
-                    signer_proto::Label::Head,
-                    stream,
-                ),
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } => {
+                    let label = match label {
+                        Label::Head => Ok(signer_proto::Label::Head),
+                        Label::Site(app) => match self.sites.get(&app) {
+                            Some(site) => Ok(signer_proto::Label::Site { app, contract: site.id }),
+                            None => Err(format!("a sign for {app}'s site, which is not being published")),
+                        },
+                    };
+                    label.and_then(|label| {
+                        wire::signer::frame_sign(
+                            &self.art.signer,
+                            id,
+                            signer_proto::Head { seq: prev_seq, root: prev_root },
+                            signer_proto::Next { seq, root, ledger },
+                            label,
+                            stream,
+                        )
+                    })
+                }
                 // Page-io's own requests, sent and re-sent by the page's
                 // sender (rule 5): framed HERE and nowhere else.
                 Op::Ext(Ext::RegisterSigner) => match self.signer_container.clone() {
@@ -1123,10 +1250,13 @@ impl PageIo {
                 self.server.node(answer, now);
             }
             if no_head {
-                self.server.node(Answer::Head(None), now);
+                self.server.node(Answer::Head { label: Label::Head, read: None }, now);
             }
             self.pump();
         }
+        // A site's bytes are page-io's only while its publication is in flight.
+        let page = &self.server.page;
+        self.sites.retain(|app, _| matches!(page.publication(app), Some(Publication::Publishing)));
     }
 }
 
@@ -1136,7 +1266,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Update { .. } => "head update",
         Op::Sign { .. } => "sign request",
         Op::Get { .. } => "block GET",
-        Op::ReadHead => "head read",
+        Op::ReadHead { .. } => "head read",
         Op::AskHeld { .. } => "held query",
         Op::PutApp { .. } => "app PUT",
         Op::Ext(_) => "signer request",

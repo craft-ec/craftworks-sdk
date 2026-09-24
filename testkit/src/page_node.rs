@@ -26,7 +26,7 @@ use engine::Params;
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use page::server::{Server, SignerFacts};
-use page::{Answer, Ms, Op, Page, PutPath};
+use page::{Answer, Label, Ms, Op, Page, PutPath};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
@@ -619,20 +619,22 @@ impl ConnState {
                     None => Answer::GetMissed(id),
                 }
             }
-            Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+            // This node serves the person's HEAD; a site (builder#117) is not its to answer.
+            Op::Sign { label: Label::Site(_), .. } | Op::Update { label: Label::Site(_), .. } | Op::ReadHead { label: Label::Site(_) } => return None,
+            Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label: Label::Head } => {
                 self.count(Served::Sign);
                 let (id, answer) = self.node.sign(id, prev_seq, prev_root, seq, root, ledger);
                 self.node.record_fails.set(false);
                 Answer::Signer { id, answer }
             }
-            Op::Update { state } => {
+            Op::Update { label: Label::Head, state } => {
                 self.count(Served::Head);
                 self.node.update(&state);
-                Answer::Updated
+                Answer::Updated { label: Label::Head }
             }
-            Op::ReadHead => {
+            Op::ReadHead { label: Label::Head } => {
                 self.count(Served::ReadHead);
-                Answer::Head(self.node.head_read())
+                Answer::Head { label: Label::Head, read: self.node.head_read() }
             }
             Op::AskHeld { id } => Answer::Held { id, present: self.node.holds(&id) },
             // A node that takes every app PUT (a web container) it is sent.

@@ -92,6 +92,12 @@ const TRANSPORT_ONLY: &[&str] = &[
     // node to put anything on.
     "put_contract",
     "put_status",
+    // PUBLISHING A SITE (builder#117): the app's stable link, signed through the node's signer. An in-memory
+    // store has no node and no signer.
+    "publish_site",
+    "site_link",
+    "site_status",
+    "cancel_site",
     // WHOSE NODE: ask the node's signer which head it signs for, registering
     // nothing (a published app opens writable for its publisher). An
     // in-memory store has no node and no signer to ask.

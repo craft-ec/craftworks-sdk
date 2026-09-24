@@ -335,17 +335,17 @@ impl PageRig {
                     Answer::GetMissed(id)
                 }
             }
-            Op::Sign { id, prev_seq, prev_root, seq, root, ledger } => {
+            Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
                 node.record_fails = std::mem::take(&mut self.faults.record_not_saved_once);
                 let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                 node.record_fails = false;
                 Answer::Signer { id, answer }
             }
-            Op::Update { state } => {
+            Op::Update { state, .. } => {
                 node.update(&state);
-                Answer::Updated
+                Answer::Updated { label: page::Label::Head }
             }
-            Op::ReadHead => Answer::Head(node.head_read()),
+            Op::ReadHead { .. } => Answer::Head { label: page::Label::Head, read: node.head_read() },
             Op::AskHeld { id } => Answer::Held { id, present: node.blocks.contains_key(&id) },
             Op::PutApp { key } => Answer::AppPutOk(key),
             Op::Ext(_) => return None,
@@ -784,7 +784,7 @@ fn sibling_root(node: &mut Node, salt: u32) -> Cid {
     for _ in 0..50 {
         for op in p.take_ops() {
             match op {
-                Op::ReadHead => p.answer(Answer::Head(None), Ms(1)),
+                Op::ReadHead { .. } => p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(1)),
                 Op::Put { id, bytes } => {
                     node.put(id, &bytes);
                     p.answer(Answer::PutOk(id), Ms(1));
@@ -1094,7 +1094,7 @@ fn device_tree(node: &mut Node, entries: &[(Vec<u8>, Vec<u8>)]) -> Cid {
     for _ in 0..50 {
         for op in p.take_ops() {
             match op {
-                Op::ReadHead => p.answer(Answer::Head(None), Ms(1)),
+                Op::ReadHead { .. } => p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(1)),
                 Op::Put { id, bytes } => {
                     node.put(id, &bytes);
                     p.answer(Answer::PutOk(id), Ms(1));

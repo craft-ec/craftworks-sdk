@@ -27,7 +27,7 @@ fn warmed(writes: u64, delay: u64) -> (Page, u64) {
                 let a = match op {
                     Op::Put { id, .. } => Answer::PutOk(id),
                     Op::Get { id } => Answer::GetMissed(id),
-                    Op::ReadHead => Answer::Head(head.map(Into::into)),
+                    Op::ReadHead { .. } => Answer::Head { label: page::Label::Head, read: head.map(Into::into) },
                     // A signer that signs whatever it is asked: the clock is
                     // the subject here, not the signing rule.
                     Op::Sign { id, seq, root, .. } => {
@@ -36,7 +36,7 @@ fn warmed(writes: u64, delay: u64) -> (Page, u64) {
                         state = Some(record.clone());
                         Answer::Signer { id, answer: signer_proto::Answer::Signed(record) }
                     }
-                    Op::Update { .. } => Answer::Updated,
+                    Op::Update { .. } => Answer::Updated { label: page::Label::Head },
                     Op::AskHeld { id } => Answer::Held { id, present: true },
                     Op::PutApp { key } => Answer::AppPutOk(key),
                     Op::Ext(_) => continue,
@@ -157,7 +157,7 @@ fn an_unanswered_head_read_is_never_an_empty_tree() {
     for _ in 0..40_000 {
         now += 1;
         p.tick(Ms(now));
-        asked += p.take_ops().iter().filter(|o| **o == Op::ReadHead).count();
+        asked += p.take_ops().iter().filter(|o| **o == Op::ReadHead { label: page::Label::Head }).count();
     }
     assert!(asked >= 3, "the head read was not asked again ({asked})");
     // A write now: had the engine taken "no head", it would commit onto the

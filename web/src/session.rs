@@ -589,6 +589,57 @@ impl Session {
         Ok(key)
     }
 
+    /// PUBLISH `web` as `app`'s SITE (builder#117) and return its LINK: the site contract's instance id, the
+    /// same for every publish (`site_link`). The page reads the site, has the signer sign the next version
+    /// through the one head path, PUTs it and reads it back; [`Session::site_status`] says how it ends. `code`
+    /// is the site contract's (`pkg/web/site.wasm`). A reader, or a label that is no app id, is refused by name.
+    pub fn publish_site(&mut self, app: &str, code: Vec<u8>, web: Vec<u8>) -> Result<String, JsValue> {
+        let Some(p) = self.page_mut() else {
+            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
+        };
+        // The page-io refusals first (a reader, no Register named yet, a bad app id), each by name.
+        p.publish_site(app, &code, web, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
+        let link = p.site_link(&code, app).expect("a site page-io just published has a link");
+        self.pump_page();
+        Ok(link)
+    }
+
+    /// `app`'s site LINK under the site contract `code`, published or not: `null`-like error when there is no
+    /// page yet or `app` is not an app id.
+    pub fn site_link(&self, app: &str, code: Vec<u8>) -> Result<String, JsValue> {
+        let Some(p) = self.page() else {
+            return Err(JsValue::from_str("provision first — there is no head to link a site under"));
+        };
+        p.site_link(&code, app).ok_or_else(|| {
+            JsValue::from_str(&if p.register_params_known() { format!("no site link for {app:?}: not an app id, or this head has no single key") } else { page_io::NO_REGISTER_YET.to_string() })
+        })
+    }
+
+    /// How `app`'s site publication stands, as JSON
+    /// `{"state":"none"|"publishing"|"published"|"superseded"|"refused"|"cancelled","version":N,"said":"…"}`.
+    /// `published`: the read-back shows this publication at `version`. `superseded`: another publication is live
+    /// at `version` (another device, or a later one): reported, never overwritten; publishing again is the
+    /// person's act. It ends only on an answer or a cancel (rule 8). `said` is display only.
+    pub fn site_status(&self, app: &str) -> String {
+        use page::Publication as P;
+        let (state, version, said) = match self.page().and_then(|p| p.publication(app)) {
+            None => ("none", 0, ""),
+            Some(P::Publishing) => ("publishing", 0, ""),
+            Some(P::Published { version }) => ("published", *version, ""),
+            Some(P::Superseded { version }) => ("superseded", *version, ""),
+            Some(P::Refused(w)) => ("refused", 0, w.as_str()),
+            Some(P::Cancelled) => ("cancelled", 0, ""),
+        };
+        serde_json::json!({ "state": state, "version": version, "said": said }).to_string()
+    }
+
+    /// A PERSON cancels `app`'s site publication (named `cancelled`).
+    pub fn cancel_site(&mut self, app: &str) {
+        if let Some(p) = self.page_mut() {
+            p.cancel_site(app);
+        }
+    }
+
     /// Open a VIEW of somebody's PUBLISHED head (sdk#239): the Register whose
     /// instance id is `register_id` (hex, as [`Session::head_id`] gives it on
     /// the publisher's session). Published data is readable by default;
