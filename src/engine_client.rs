@@ -301,20 +301,6 @@ impl Client {
         true
     }
 
-    /// The node REFUSED one of this connection's frames with a host error
-    /// (a full queue behind a parked delegate, F50; the 102nd, F51): that
-    /// frame will never run, so the refusal IS its answer. Counted as one, or
-    /// every refusal left the one-at-a-time gates a frame behind for good and
-    /// two of them shut both for `FORGET_MS` (the architect's sdk#196 review,
-    /// executed: 2 refused → 22 ticks and 22 asks in 120 s, against 121).
-    ///
-    /// The host error does not say WHICH request it refuses, and a refused
-    /// client-API request (a subscribe) is counted too: the gate may then open
-    /// one frame early once, never shut.
-    pub fn frame_refused(&mut self) {
-        self.frames.answered();
-    }
-
     /// TELL THE DELEGATE THE TIME — unless a tick of ours is unanswered.
     ///
     /// AT MOST ONE UNANSWERED TICK PER SESSION, ALWAYS. A refused tick costs
@@ -374,10 +360,6 @@ impl Client {
     /// would take the whole SDK instance down for it.
     pub fn sent(&mut self, n: usize) {
         self.outbound.drain(..n.min(self.outbound.len()));
-    }
-
-    pub fn outbound_len(&self) -> usize {
-        self.outbound.len()
     }
 
     /// A message arrived.
@@ -562,20 +544,6 @@ impl Client {
                 value: reason.code(),
             },
         });
-    }
-
-    /// The replies that have arrived since this was last called.
-    pub fn drain_replies(&mut self) -> Vec<Reply> {
-        std::mem::take(&mut self.replies)
-    }
-
-    pub fn has_replies(&self) -> bool {
-        !self.replies.is_empty()
-    }
-
-    /// Take the events that have accumulated. Drained, never dropped.
-    pub fn take_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
     }
 
     /// Turn the call tree on, with the clock the app already uses.

@@ -299,21 +299,6 @@ pub fn frame_delegate_op(
     frames(&req, stream_id)
 }
 
-/// Frame an engine message to a delegate registered with empty parameters.
-///
-/// The parameters are part of what the delegate's key is DERIVED from, so
-/// addressing it with different ones names a delegate that was never
-/// registered. `delegate_from_code` registers with empty parameters and this
-/// addresses with empty parameters; keeping the pair in one file is what
-/// stops them drifting apart.
-pub fn frame_engine_request(
-    key: &DelegateKey,
-    payload: Vec<u8>,
-    stream_id: u32,
-) -> Result<Vec<Vec<u8>>, String> {
-    frame_delegate_op(key, &Parameters::from(vec![]), payload, stream_id)
-}
-
 /// A contract's instance id, from the 32 bytes that name it.
 ///
 /// So a caller can hold one without depending on freenet itself — the same

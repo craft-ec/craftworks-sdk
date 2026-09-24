@@ -219,9 +219,9 @@ fn the_tick_asks_after_quiet_writes() {
     );
 }
 
-/// Does this code CALL `statement` (e.g. `.client.frame_refused();`)? Line
+/// Does this code CALL `statement` (e.g. `.ask_after_applying();`)? Line
 /// comments, block comments and string literals are removed first: `body_of`
-/// strips only `//`, so a `/* frame_refused() */` or a string naming it would
+/// strips only `//`, so a `/* ask_after_applying() */` or a string naming it would
 /// otherwise pass a gate about what the code DOES (sdk#196 merge review).
 fn calls(code: &str, statement: &str) -> bool {
     let mut out = String::new();
@@ -255,26 +255,17 @@ fn calls(code: &str, statement: &str) -> bool {
 
 /// THE CONTROL for the reader above: it finds a real call, and refuses the
 /// same words in a line comment, a block comment, a string, or mentioned
-/// without being called -- so `a_refusal_answers_its_frame` can fail.
+/// without being called -- so `the_tick_asks_after_quiet_writes` can fail.
 #[test]
-fn control_only_a_real_call_counts_as_frame_refused() {
-    assert!(calls(
-        "self.db.store_mut().client.frame_refused();",
-        ".client.frame_refused();"
-    ));
-    assert!(calls(
-        "self.db\n    .store_mut()\n    .client\n    .frame_refused();",
-        ".client.frame_refused();"
-    ));
+fn control_only_a_real_call_counts_as_asking_after_applying() {
+    assert!(calls("self.db.store_mut().ask_after_applying();", ".ask_after_applying();"));
+    assert!(calls("self.db\n    .store_mut()\n    .ask_after_applying();", ".ask_after_applying();"));
     for fake in [
-        "// self.db.store_mut().client.frame_refused();",
-        "/* self.db.store_mut().client.frame_refused(); */",
-        "let s = \"self.db.store_mut().client.frame_refused();\";",
-        "let f = Client::frame_refused;",
+        "// self.db.store_mut().ask_after_applying();",
+        "/* self.db.store_mut().ask_after_applying(); */",
+        "let s = \"self.db.store_mut().ask_after_applying();\";",
+        "let f = Store::ask_after_applying;",
     ] {
-        assert!(
-            !calls(fake, ".client.frame_refused();"),
-            "the reader counted a non-call: {fake}"
-        );
+        assert!(!calls(fake, ".ask_after_applying();"), "the reader counted a non-call: {fake}");
     }
 }

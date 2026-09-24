@@ -10,7 +10,6 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { shippedArtefacts } from "../../js/session.js";
 import { artefactBytes, allArtefactBytes, CACHE_NAME, ambientCaches } from "../../js/artefacts.js";
 import { RTO_SCHEDULE_MS } from "../../js/rto.js";
 
@@ -473,61 +472,8 @@ await t("THE CONTROL: no url at all is refused, not silently empty", async () =>
 });
 
 // ---------------------------------------------------------------------------
-// AN APP NAMES ITS ARTEFACTS AND CARRIES NONE OF THEM (§19, sdk#108).
+// FETCHING A NAMED ARTEFACT: where caches cannot be read, and what refuses.
 // ---------------------------------------------------------------------------
-
-const MANIFEST = JSON.stringify({
-  signer: { file: "signer.wasm", sha256: "d".repeat(64), bytes: 1 },
-  block: { file: "block.wasm", sha256: "b".repeat(64), bytes: 1 },
-  register: { file: "register.wasm", sha256: "r".repeat(64), bytes: 1 },
-  sdk: { file: "craftworks_sdk_bg.wasm", sha256: "5".repeat(64), bytes: 1 },
-});
-
-const manifestFetch = async url =>
-  url.endsWith("artefacts.json")
-    ? new Response(MANIFEST)
-    : new Response("", { status: 404 });
-
-await t("**an app that names a contract key points at it FIRST**", async () => {
-  const spec = await shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {
-    artefactsKey: "ARTEFACTS",
-    origin: "https://node",
-  });
-  assert.deepEqual(spec.signer.urls, [
-    "https://node/v1/contract/web/ARTEFACTS/signer.wasm",
-    "https://node/v1/contract/web/theapp/sdk/signer.wasm",
-  ], "the shared copy is not tried first, or the local one is not kept as a fallback");
-  assert.equal(spec.signer.sha256, "d".repeat(64), "the hash from the manifest is gone");
-});
-
-await t("THE CONTROL: with no key, it is the local file and nothing else", async () => {
-  // The development path, and what every existing caller gets. If naming a
-  // contract had REPLACED the local file rather than joined it, a build with
-  // no published artefacts would resolve nothing.
-  const spec = await shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {});
-  assert.deepEqual(spec.block.urls, ["https://node/v1/contract/web/theapp/sdk/block.wasm"]);
-});
-
-await t("**NO CIRCULARITY: resolving the artefacts consumes none of them**", async () => {
-  // A bootstrap route is only interesting if it bootstraps from NOTHING.
-  // Every url is a plain HTTP GET to the node already serving the page; none
-  // of them resolves a Block contract, which would need `block.wasm` — one
-  // of the very four being fetched.
-  const asked = [];
-  const spec = await shippedArtefacts(
-    async url => { asked.push(url); return manifestFetch(url); },
-    "https://node/v1/contract/web/theapp/sdk/session.js",
-    { artefactsKey: "ARTEFACTS", origin: "https://node" },
-  );
-  assert.deepEqual(asked, ["https://node/v1/contract/web/theapp/sdk/artefacts.json"],
-    "reading the manifest itself fetched something other than the manifest");
-  for (const [name, e] of Object.entries(spec)) {
-    for (const u of e.urls) {
-      assert.match(u, /^https:\/\/node\/v1\/contract\/web\//,
-        `${name} is fetched from ${u}, which is not a plain GET to this node`);
-    }
-  }
-});
 
 await t("**in a SANDBOXED frame, where even READING `caches` throws, an artefact is still fetched and verified**", async () => {
   // How a node serves every web app (builder#104): an iframe sandboxed without
@@ -580,34 +526,6 @@ await t("**THE CONTROL THAT MATTERS: bytes that do not match the named hash are 
       return true;
     },
   );
-});
-
-await t("**naming a key with no origin is a REFUSAL, not a quiet fallback**", async () => {
-  // An app that names a contract carries none of the artefacts, so the only
-  // remaining source is a file it does not ship: it 404s, and the failure
-  // names a missing LOCAL file — pointing at the app's own bundle when the
-  // real fault is that there was nowhere to ask. Fatal and misleading
-  // together.
-  await assert.rejects(
-    () => shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {
-      artefactsKey: "ARTEFACTS",
-      origin: null,
-    }),
-    e => {
-      assert.match(e.message, /ARTEFACTS/, "the refusal does not name the contract");
-      assert.match(e.message, /no origin/, "it does not say what is missing");
-      return true;
-    },
-  );
-});
-
-await t("THE CONTROL: no key and no origin is fine — that is the local path", async () => {
-  // Without this, refusing whenever `origin` is absent would break every
-  // development build and every test that passes no origin at all.
-  const spec = await shippedArtefacts(manifestFetch, "https://node/v1/contract/web/theapp/sdk/session.js", {
-    origin: null,
-  });
-  assert.deepEqual(spec.block.urls, ["https://node/v1/contract/web/theapp/sdk/block.wasm"]);
 });
 
 await t("`url` and `urls` together is refused, not silently half-used", async () => {

@@ -217,22 +217,20 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
     let id2 = id2.expect("the second write asked the signer");
     p.answer(Answer::Signer { id: id2, answer: fork() }, Ms(now + 4));
     let named = p.unusable().iter().filter(|u| u.contains("SIGNER UPGRADE NEEDED")).count();
-    assert!(p.needs_signer_upgrade(), "the host was not asked for the current signer");
     assert_eq!(named, 1, "the old signer's refusal was not named once: {:?}", p.unusable());
     for k in 1..=20 {
         p.tick(Ms(now + 4 + k * page::rto::RTO_INITIAL_MS as u64));
         assert_eq!(signs(&p.take_ops()), 0, "re-asked an old signer that refuses every ask: a loop");
     }
     // The register moves past seq 1: the page is not left waiting. The newer
-    // head is adopted, the commit built on seq 1 is dead and handed back
-    // `Lost` for the app to send again, and the upgrade ask is withdrawn.
+    // head is adopted, and the commit built on seq 1 is dead and handed back
+    // `Lost` for the app to send again.
     let later = now + 30 * page::rto::RTO_INITIAL_MS as u64;
     p.answer(Answer::Head { label: page::Label::Head, read: Some((2, [9; 32]).into()) }, Ms(later));
     p.tick(Ms(later + 1));
     assert_eq!(p.published().0, 2, "the register's newer head was not adopted");
     let lost = p.take_notices().into_iter().any(|(_, w, s)| w == WriteId(2) && s == State::Lost);
     assert!(lost, "the commit on the old seq was left waiting instead of handed back");
-    assert!(!p.needs_signer_upgrade(), "still asking for an upgrade after the register moved");
 }
 
 /// A `HeadChanged` hint is READ even while a commit is owed (the architect's
