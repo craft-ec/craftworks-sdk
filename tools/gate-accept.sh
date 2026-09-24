@@ -82,8 +82,9 @@ done
 [ $refused -eq 0 ] || { echo "gate --accept: $baseline is unchanged." >&2; exit 1; }
 # THE WRITE IS CHECKED, not assumed (craftworks-sdk#252): on a full disk this
 # once left the baseline unchanged while the run looked accepted. So: the free
-# space is checked again RIGHT BEFORE writing (the gate's own floor, handed in
-# as GATE_MIN_GIB; the start-of-run check is minutes stale by now), a failed
+# space is checked again RIGHT BEFORE writing (room to write the baseline NOW:
+# a different question from the disk guard's at the start of the run, which is
+# minutes stale by now; GATE_MIN_GIB overrides it for tests), a failed
 # copy or rename is a failure naming the file, and the baseline must READ BACK
 # byte-identical to what was meant — or this says so and exits non-zero.
 min_gib=${GATE_MIN_GIB:-5}
