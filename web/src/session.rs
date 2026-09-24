@@ -563,10 +563,16 @@ impl Session {
     /// The step in flight is re-issued by `tick`, not here, because a reply
     /// may have been sent before the socket dropped and arrive on the new one.
     pub fn reconnected(&mut self) {
-        // The head subscription is page-io's, and it re-reads the head on the
-        // new connection: nothing to reset here (sdk#259). An app PUT whose
-        // answer went with the old socket is re-sent at its deadline, as every
-        // op is.
+        // page-io's (sdk#376): its reassembly is reset and its head read
+        // re-sent WITH subscribe now, so a live page is told of a head move on
+        // the new connection at once, not at the 120 s backstop. An app PUT
+        // whose answer went with the old socket is re-sent at its deadline, as
+        // every op is.
+        let now = page::Ms(crate::js_now_ms());
+        if let Some(p) = self.page_mut() {
+            p.reconnected(now);
+        }
+        self.pump_page();
     }
 
     /// PUT a contract the APP names — its code, params and state (builder#104:

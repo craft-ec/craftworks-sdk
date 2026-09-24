@@ -1243,6 +1243,27 @@ impl Page {
         self.step(Event::HeadConflict { seq, root });
     }
 
+    /// The socket was REPLACED (sdk#376): every head read in flight went out on
+    /// the one that is gone -- and with it the subscription that read carried --
+    /// so each is re-sent NOW (its deadline brought to this moment; the tick
+    /// that follows sends it as a re-send). With none in flight, a page that
+    /// has a head reads it now: a GET with subscribe, the one path, so the new
+    /// connection is subscribed at once and not at the 120 s backstop.
+    pub fn reconnected(&mut self, now: Ms) {
+        self.now = now.0;
+        let mut in_flight = false;
+        for w in [Waiting::Warm, Waiting::RecoverHead, Waiting::Verify, Waiting::ReadBack, Waiting::Hint] {
+            if let Some(d) = self.deadlines.get_mut(&w) {
+                d.at = self.now;
+                in_flight = true;
+            }
+        }
+        if !in_flight && self.engine_has_head {
+            self.last_head_at = self.now;
+            self.send(Waiting::Hint, Op::ReadHead);
+        }
+    }
+
     /// The node said the head register changed (`HeadChanged`, a HINT a node
     /// can fabricate or drop): read it. ALWAYS — owed parity, an owed head
     /// or idle alike (the architect's #5): only a verify in progress, which
