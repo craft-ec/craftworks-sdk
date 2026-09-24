@@ -701,6 +701,11 @@ pub struct Params {
     /// every changed group has ANY k of its k+m blocks on the network; the
     /// rest go on to BACKED_UP. Off only as the control: wait for every PUT.
     pub race_put: bool,
+    /// THE FIRST WAVE (#378 P1-hybrid, rule 10): a commit's first send is its data and ONE parity per changed group
+    /// (so one stall per group is still raced: k of k + 1); the other m - 1 follow the Sign, sent when the head lands. Every parity PUT is
+    /// still sent and retried until acked; BACKED_UP is unchanged. Off only as the control: all parity at once.
+    /// Applies only with `race_put` (waiting for every PUT cannot hold any back).
+    pub first_wave_parity: bool,
     /// RACE GET (the owner's rule 11, sdk#303): the FIRST time a read wants a block of a sibling group, every
     /// other block of that group -- members and parity -- is asked at once, and the read finishes on the member
     /// itself or on any `k` of the group (rebuilt, verified), whichever comes first. Point reads too. Off only as
@@ -878,6 +883,7 @@ impl Default for Params {
             max_gets_per_request: 64,
             repair_reads: true,
             race_put: true,
+            first_wave_parity: true,
             race_get: true,
             share_fetches: true,
             preload_roots: 4,
@@ -1103,6 +1109,15 @@ struct Commit {
     /// What must be on the network before the head is signed (§P).
     #[serde(default)]
     race: Race,
+    /// THE PARITY HELD BACK for after the Sign (#378 P1-hybrid): every changed group's parity but the ONE in the
+    /// first wave. Sent when the head lands (`follow_ups`), behind the Sign and the head's UPDATE on the node's one
+    /// queue (F61). The IDS are
+    /// in the context (32 B each), so a rehydrated commit still sends them; the bytes are page memory only
+    /// (`deferred_bytes`), and one without them is re-derived from the carried ops (`reput_from_ops`).
+    #[serde(default)]
+    deferred: Vec<Cid>,
+    #[serde(skip)]
+    deferred_bytes: BTreeMap<Cid, Vec<u8>>,
     /// Each pack's member ids: a pack's ack is its members' ack (the node
     /// holds a pack's members under their own ids), so they count toward k.
     #[serde(default)]
@@ -3508,6 +3523,15 @@ impl<B: Blocks> Engine<B> {
         let root_parity: Vec<Cid> = blocks.iter().map(|(id, _)| *id).collect();
         parity.extend(blocks);
         let race = Race::of(&emitted, &parity, &self.unacked(), (self.root, &root_parity));
+        // THE FIRST WAVE (#378 P1-hybrid): one parity per changed group goes now, the rest when the head lands --
+        // so the Sign, sent at k, queues behind at most ~1 extra PUT per group on the node's one queue (F61), not m.
+        let (parity, deferred): (Vec<(Cid, Vec<u8>)>, Vec<(Cid, Vec<u8>)>) = if self.params.race_put && self.params.first_wave_parity {
+            let ids: BTreeSet<Cid> = parity.iter().map(|(c, _)| *c).collect();
+            let first: BTreeSet<Cid> = race.groups.iter().filter_map(|g| g.new.iter().find(|c| ids.contains(*c)).copied()).collect();
+            parity.into_iter().partition(|(c, _)| first.contains(c))
+        } else {
+            (parity, Vec::new())
+        };
         let seq = self.next_seq;
         let writes = std::mem::take(&mut self.folded);
         let bytes = std::mem::take(&mut self.folded_bytes);
@@ -3561,9 +3585,12 @@ impl<B: Blocks> Engine<B> {
                 after: Vec::new(),
             });
         }
-        // THE PARITY, IN THE SAME ROUND (§P, the owner): computed before the
-        // send, put with the data, through the same window -- never after a
-        // data block's ack.
+        // THE FIRST WAVE'S PARITY (§P, #378 P1-hybrid): one per changed group, computed before the send and put with
+        // the data. The rest (`deferred`) are this commit's blocks too -- in `data`, counted toward k if they land,
+        // needed for BACKED_UP -- and are put when the head lands (`follow_ups`).
+        for (id, _) in &deferred {
+            data.insert(*id);
+        }
         for (id, b) in &parity {
             data.insert(*id);
             out.push(Effect::PutBlock {
@@ -3635,6 +3662,8 @@ impl<B: Blocks> Engine<B> {
             settle_rounds: 0,
             through: 0,
             race,
+            deferred: deferred.iter().map(|(c, _)| *c).collect(),
+            deferred_bytes: deferred.into_iter().collect(),
             pack_members,
             root_parity,
         });
@@ -3680,7 +3709,9 @@ impl<B: Blocks> Engine<B> {
         };
         c.settle_at = now;
         c.settle_rounds += 1;
-        let missing: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
+        // The parity held back behind the Sign (#378 P1-hybrid) is not re-put ahead of it: until the head lands it
+        // was never sent, and after, the commit is Backing and a straggler is re-put like any block.
+        let missing: BTreeSet<Cid> = c.data.difference(&c.confirmed).filter(|id| !c.deferred.contains(id)).copied().collect();
         if missing.is_empty() || c.ready(self.params.race_put, &unacked) {
             if c.head_sent {
                 out.push(Effect::ReadHead {
@@ -3991,6 +4022,32 @@ impl<B: Blocks> Engine<B> {
     }
 
 
+    /// THE REST OF THE PARITY (#378 P1-hybrid), sent when the head LANDS: behind the Sign AND the head's UPDATE,
+    /// which would otherwise queue behind them on the node's one queue (F61; live: `PPSPPPPPPPU` put the UPDATE
+    /// seven PUTs back). Each is put and retried until acked like any PUT; the commit is BACKED_UP only when they are.
+    fn follow_ups(&mut self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let Some(c) = self.pending.as_mut() else {
+            return out;
+        };
+        let rest: Vec<Cid> = std::mem::take(&mut c.deferred).into_iter().filter(|id| !c.confirmed.contains(id)).collect();
+        let mut bytes = std::mem::take(&mut c.deferred_bytes);
+        let mut rederive: BTreeSet<Cid> = BTreeSet::new();
+        for id in rest {
+            match bytes.remove(&id) {
+                Some(b) => out.push(Effect::PutBlock { id, bytes: b, after: Vec::new() }),
+                None => {
+                    rederive.insert(id);
+                }
+            }
+        }
+        // A rehydrated commit holds the ids, not the bytes: the same ops on the same base make the same parity.
+        if !rederive.is_empty() {
+            out.extend(self.reput_from_ops(&rederive).unwrap_or_default());
+        }
+        out
+    }
+
     fn on_head(&mut self, seq: u64) -> Vec<Effect> {
         let mut out = Vec::new();
         let Some(c) = self.pending.as_ref() else {
@@ -3999,6 +4056,7 @@ impl<B: Blocks> Engine<B> {
         if c.seq != seq {
             return out;
         }
+        out.extend(self.follow_ups());
         let c = self.pending.take().expect("checked");
         let was = self.published_root;
         self.published_seq = c.seq;
