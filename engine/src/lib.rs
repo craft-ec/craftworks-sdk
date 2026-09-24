@@ -34,9 +34,9 @@
 //! live there (sdk#303), as the reads' own bookkeeping does.
 //!
 //! It was not always so. In the delegate era every `process()` call got a fresh linear memory (F32): the engine
-//! was rebuilt from [`Engine::from_context_or_new`], thrown away at the end of the call, and only what
-//! [`Engine::to_context`] wrote survived. That context code remains for the tests that still re-hydrate an
-//! engine, and goes with the dead-code sweep (CONFORMANCE step 5); nothing in production re-hydrates.
+//! was rebuilt from a CONTEXT the last call wrote, thrown away at the end of the call, and only what that
+//! context carried survived. Nothing re-hydrates any more, and the carry was deleted (#305); the context
+//! BUDGET it left behind (`keep_saveable`, `context_len`) is sdk#385's question.
 //!
 //! In that era a field held its default at the top of every call but the one that set it, and four defects of
 //! exactly that shape were invisible to every test that drove one process:
@@ -767,14 +767,10 @@ pub struct Params {
     pub max_accept_age: u64,
     /// Off = the control: writes fold for ever behind a stuck commit.
     pub bound_accept_age: bool,
-    /// Whether the context carries the commit in flight.
-    ///
-    /// Always true in production. It exists as a CONTROL: a both-modes test
-    /// asserts Live and Rehydrate agree, and an assertion that two runs agree
-    /// is worth nothing until something can make them disagree. Turning this
-    /// off leaves one field out of the context, which is exactly the defect
-    /// class the comparison is there to catch, and the control asserts the
-    /// run really does diverge.
+    /// Whether the context BUDGET counts the commit in flight
+    /// (`context_len`). Always true in production. It was the control for the
+    /// Live-vs-Rehydrate comparison, which went with the carry (#305); what is
+    /// left is sdk#385's.
     pub context_carries_pending: bool,
     /// Rounds a write may spend waiting for a cold tree path before it is
     /// refused. Each round is one fetch-and-retry of the whole apply.
@@ -791,8 +787,8 @@ pub struct Params {
     ///
     /// Each costs the context about 130 B, measured. Unbounded, ten thousand
     /// of them make a 1.3 MB context -- three times what the platform will
-    /// store -- and `to_context` then fails, which loses the IN-FLIGHT COMMIT
-    /// as well. A read burst must not be able to destroy a write, so reads
+    /// store -- and in the delegate era saving it failed, which lost the
+    /// IN-FLIGHT COMMIT as well. A read burst must not be able to destroy a write, so reads
     /// get a slice of the budget and are refused at its edge.
     pub max_parked_reads: usize,
     /// Blocks one commit may name.
@@ -1976,8 +1972,9 @@ impl<B: Blocks> Engine<B> {
     ///      it grows -- past its cap a write's parity is left uncoded
     ///      (`record_owed`) -- and never forgotten here.
     ///
-    /// If none of that fits it, `to_context` fails -- a bug, reported loudly
-    /// by the host, never a silent `None`.
+    /// If none of that fits it, the backstop below is a loud debug assert.
+    /// No context is written any more (#305): whether this budget still
+    /// earns its verdicts is sdk#385.
     ///
     /// ITS COST, MEASURED (sdk#187 review), so nobody optimises it blind: it
     /// sizes the live state by reference each step (`context_len`). Release,
@@ -4877,78 +4874,6 @@ impl<B: Blocks> Engine<B> {
     }
 }
 
-/// Everything that must survive a `process()` call.
-///
-/// The delegate's memory is fresh every time, so this is the ONLY thing the
-/// engine carries forward — and it has 400 KiB to do it in (F32). So what is
-/// here is bookkeeping, never payload: ids, sequence numbers, and what each
-/// client is waiting on. No block bytes, and above all no PACK: a pack is the
-/// largest thing the engine touches and would blow the budget on its own.
-///
-/// Versioned, because a delegate upgrade meets a context written by the
-/// previous code. A context whose version is not understood is REFUSED, and
-/// the engine starts from its head instead — which is always safe, because
-/// the head is the journal.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Context {
-    version: u16,
-    published_seq: u64,
-    published_root: Cid,
-    root: Cid,
-    next_seq: u64,
-    pending: Option<Commit>,
-    /// Asks not yet answered, and when each last went out: PACING only
-    /// (`asks`). It replaced `in_flight_parity`, from which `Owed::sent` was
-    /// re-derived on every call -- so an emission recorded as a fact was
-    /// re-recorded by the context itself (sdk#150).
-    asks: Vec<(asks::Ask, asks::Pace)>,
-    parked: Vec<(read::ReqId, read::Parked)>,
-    waiting: Vec<(Cid, Vec<read::ReqId>)>,
-    attempts: Vec<(Cid, u32)>,
-    head_epoch: Option<Epoch>,
-    /// The fetch state of the write waiting on a cold tree path (its ops are
-    /// in the page's queue, R-b, never here).
-    parked_write: Option<ParkedWrite>,
-    /// Standing range subscriptions. Bounded by `max_subscriptions` and
-    /// `max_sub_key`, because this is a slice of the same 400 KiB.
-    subs: subs::Subs,
-    /// WHEN THE COMMIT IN FLIGHT STARTED, in the engine's own terms.
-    ///
-    /// Carried because a delegate is rebuilt from its context on every call
-    /// (F32), and this is the state that measures HOW LONG something has
-    /// been stuck. Left out, it was `None` at the top of every call but the
-    /// one that started the commit — so `age_out_accepted` returned early
-    /// every time and `Stalled` could never be reported at all. A stuck
-    /// commit spans many calls by definition; that is the whole situation it
-    /// is for.
-    ///
-    /// 8 bytes, and only while a commit is in flight.
-    in_flight_since: Option<u64>,
-    /// Which writes have already been told `Stalled`.
-    ///
-    /// Carried for the same reason, and it is why both had to move together:
-    /// without it the notice would be repeated on every tick, which is noise
-    /// a caller learns to ignore — and this one matters. It only has anything
-    /// in it while a commit is stuck, and it is emptied when one publishes.
-    told_stalled: Vec<(ClientId, WriteId)>,
-    /// THE CLOCK the two fields above are measured against: the `now` of the
-    /// last tick this engine saw.
-    ///
-    /// `in_flight_since` joined the context in sdk#81 and the clock it is
-    /// compared with did not. So a write started in a call with no `Tick`
-    /// took `in_flight_since = 0`, the next real tick was seconds since 1970,
-    /// and every write that outlived one tick was told `Stalled` after about
-    /// a second instead of `max_accept_age` (sdk#150, W4 in the cross-call
-    /// matrix).
-    ///
-    /// It does NOT make owed parity coalesce across calls: `Owed`'s
-    /// `last_changed` and `since` are rebuilt as 0 on every rehydrate, so on a
-    /// real node a group's parity fires on the first tick after any call
-    /// boundary, whatever `parity_age` says. That is what fires W4's parity
-    /// mid-commit; it is sdk#150 PR 3's.
-    now: u64,
-}
-
 /// A tick more than this after the last one, or before it, is a different
 /// clock, not the same one moving on: a delegate context lives 600 s (F32),
 /// so no engine sees a real gap longer than that. A smaller step BACK is
@@ -4956,297 +4881,98 @@ struct Context {
 /// (`protocol::tick_of`).
 const CLOCK_RESET_TICKS: u64 = 600;
 
-/// The version this build writes. Bumped when the shape changes.
-///
-/// 14: a group's parity ids are `[Cid; PARITY]` and the tree's PARITY is 8
-/// (sdk#321, a format epoch): a fixed array's length is its shape, so a
-/// 13-context's groups do not decode as this one's.
-///
-/// 10: a parked read counts its request's GETs, and a parked write its
-/// chain's and when it last heard anything (sdk#174).
-///
-/// 9: a commit says whether its parity was left uncoded at the owed cap
-/// (sdk#162).
-///
-/// 8: a commit carries what settles it from fact: its base root, its ops
-/// when they are small, and its own settle pace (sdk#150 E1/E2).
-///
-/// 7: `in_flight_parity` left it for `parity_confirmed` (the answers) and
-/// `asks` (pacing), and owed groups carry their ages: an emission is not a
-/// fact (sdk#150).
-///
-/// 6: a subscription carries its birth order, under a per-client cap
-/// (sdk#146).
-///
-/// 5: the engine's clock joined it -- `now`, which `in_flight_since` and the
-/// parity ages are measured against (sdk#150).
-///
-/// 4: the parity in flight joined it — without it a confirmed parity block
-/// could not be attributed to its group, so no group ever settled and every
-/// tick re-put the same three blocks for ever (sdk#83).
-///
-/// 3: the stall timer joined it — `in_flight_since` and `told_stalled`.
-/// Without them `Stalled` could never be reported (sdk#81): the state that
-/// measures how long a commit has been stuck did not survive the call.
-///
-/// 2: subscriptions joined the context. A v1 context decodes to a DIFFERENT
-/// shape rather than failing — bincode reads the fields it was asked for —
-/// so the version is what refuses it, and a refused context is a fresh start
-/// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 14;
-
-/// What a context this build wrote begins with.
-///
-/// The context comes back from OUTSIDE the engine -- from a node's cache, as
-/// bytes, with no guarantee beyond their length. Anything that is not
-/// byte-for-byte what this build wrote must be refused, and refusal is FREE
-/// here: an engine with no context is correct, it starts from its head and
-/// reports its in-flight writes `Lost`. A context that is merely PLAUSIBLE is
-/// the dangerous one -- it carries the (seq, root) of a commit in flight, so
-/// an engine re-hydrated from a damaged one can emit `UpdateHead` naming a
-/// root nobody has.
-const CONTEXT_MAGIC: [u8; 4] = *b"CWE1";
-
-/// magic + version + checksum, before the encoded body.
+/// The header the delegate-era context began with (magic 4 + version 2 +
+/// checksum 8). No context is written any more (#305); the context BUDGET
+/// still counts it until sdk#385 decides that budget.
 const CONTEXT_HEADER: usize = 4 + 2 + 8;
 
-/// The first 8 bytes of BLAKE3 over the encoded body.
-///
-/// Truncated because this defends against DAMAGE, not against an adversary
-/// who can also rewrite the checksum: the node's context cache is not a trust
-/// boundary the engine can police, and a full 32 bytes would buy nothing a
-/// version check and a fresh start do not already give.
-fn context_checksum(body: &[u8]) -> [u8; 8] {
-    let h = blake3::hash(body);
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&h.as_bytes()[..8]);
-    out
-}
-
-/// Encoding options shared by both directions.
-///
-/// `with_fixint_encoding` because that is what `bincode::serialize` does and
-/// the two must agree. `with_limit` makes the allocation bound STRUCTURAL: a
-/// damaged length field cannot ask the decoder for more than the context
-/// budget, whatever today's types happen to make reachable.
-fn context_opts(limit: usize) -> impl bincode::Options {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(limit as u64)
-}
-
-/// Why a context could not be used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ContextError {
-    /// Not something this build can read — a different version, or not a
-    /// context at all. Never a panic: the bytes come from outside.
-    Unreadable,
-    /// Bigger than the budget allows.
-    TooLarge(usize),
+/// Visits each field of [`Engine::state_fields`]: sized by `context_len`,
+/// hashed by `state_digest`.
+trait StateVisitor {
+    fn field<T: serde::Serialize>(&mut self, v: &T);
 }
 
 impl<B: Blocks> Engine<B> {
-    /// What this engine must carry to its next call.
-    pub fn to_context(&self) -> Result<Vec<u8>, ContextError> {
-        let c = self.context_value();
-        use bincode::Options;
-        let body = context_opts(self.params.max_context_bytes)
-            .serialize(&c)
-            .map_err(|_| ContextError::Unreadable)?;
-        let total = CONTEXT_HEADER + body.len();
-        if total > self.params.max_context_bytes {
-            return Err(ContextError::TooLarge(total));
-        }
-        let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&CONTEXT_MAGIC);
-        out.extend_from_slice(&CONTEXT_VERSION.to_le_bytes());
-        out.extend_from_slice(&context_checksum(&body));
-        out.extend_from_slice(&body);
-        Ok(out)
-    }
-
-    /// The size `to_context` would write, header included, without writing it.
+    /// The size the delegate-era context would have been, header included
+    /// (#305 deleted the carry; `keep_saveable` still bounds by it, sdk#385).
     ///
     /// Sized field by field FROM THE LIVE STATE, never by building the
     /// `Context` -- that clones every collection (a commit's pack bodies
     /// among them) and, run at the end of every step, made the engine's own
     /// suites ~4x slower (sdk#162 review, measured). With fixint bincode a
     /// map encodes exactly as a sequence of its pairs and a set as a sequence,
-    /// so the sum is the length `to_context` writes; every engine test that
-    /// rehydrates checks the two are equal (`common::Harness::step`).
+    /// so the sum was exactly the length the carry wrote (checked every step
+    /// while the carry existed).
     pub fn context_len(&self) -> usize {
-        use bincode::Options;
-        let o = bincode::DefaultOptions::new().with_fixint_encoding();
-        let sz = |r: Result<u64, bincode::Error>| r.map_or(usize::MAX / 64, |n| n as usize);
+        struct Size(usize);
+        impl StateVisitor for Size {
+            fn field<T: serde::Serialize>(&mut self, v: &T) {
+                use bincode::Options;
+                let o = bincode::DefaultOptions::new().with_fixint_encoding();
+                self.0 += o.serialized_size(v).map_or(usize::MAX / 64, |n| n as usize);
+            }
+        }
+        let mut size = Size(0);
+        self.state_fields(&mut size);
+        CONTEXT_HEADER + 2 + size.0
+    }
+
+    /// BLAKE3 over the bytes of every field [`Engine::state_fields`] walks, in
+    /// its order, each prefixed with its length: the bookkeeping, BYTE FOR
+    /// BYTE, so a refusal test can assert nothing moved -- whatever it grows
+    /// later, since a new field joins the one walk. Only those tests call it;
+    /// `context_len` sizes the same walk every step without encoding it.
+    #[doc(hidden)]
+    pub fn state_digest(&self) -> [u8; 32] {
+        struct Digest(blake3::Hasher);
+        impl StateVisitor for Digest {
+            fn field<T: serde::Serialize>(&mut self, v: &T) {
+                use bincode::Options;
+                let o = bincode::DefaultOptions::new().with_fixint_encoding();
+                match o.serialize(v) {
+                    Ok(b) => {
+                        self.0.update(&(b.len() as u64).to_le_bytes());
+                        self.0.update(&b);
+                    }
+                    // Never for these types; a field that cannot encode is
+                    // still a DIFFERENT digest from one that can.
+                    Err(_) => {
+                        self.0.update(&u64::MAX.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut d = Digest(blake3::Hasher::new());
+        self.state_fields(&mut d);
+        *d.0.finalize().as_bytes()
+    }
+
+    /// THE ONE LIST of the engine's bookkeeping fields, in one fixed order:
+    /// what the delegate-era context carried. `context_len` (the budget,
+    /// sdk#385) sizes it and `state_digest` hashes it, so the two cannot
+    /// disagree about what the state is.
+    fn state_fields(&self, v: &mut impl StateVisitor) {
         let carries = self.params.context_carries_pending;
-        let none_u64: Option<u64> = None;
-        let none_commit: Option<Commit> = None;
-        let told: Vec<(ClientId, WriteId)> = Vec::new();
-        CONTEXT_HEADER
-            + sz(o.serialized_size(&CONTEXT_VERSION))
-            + sz(o.serialized_size(&(self.published_seq, self.published_root, self.root, self.next_seq)))
-            + if carries {
-                sz(o.serialized_size(&self.pending))
-            } else {
-                sz(o.serialized_size(&none_commit))
-            }
-            + sz(o.serialized_size(&self.asks.to_vec()))
-            + sz(o.serialized_size(&self.reads.parked))
-            + sz(o.serialized_size(&self.reads.waiting))
-            + sz(o.serialized_size(&self.reads.attempts))
-            + sz(o.serialized_size(&self.head_epoch))
-            + sz(o.serialized_size(&self.parked_write))
-            + sz(o.serialized_size(&self.subs))
-            + if carries {
-                sz(o.serialized_size(&self.in_flight_since))
-                    + sz(o.serialized_size(&self.told_stalled))
-            } else {
-                sz(o.serialized_size(&none_u64)) + sz(o.serialized_size(&told))
-            }
-            + sz(o.serialized_size(&self.now))
-    }
-
-    fn context_value(&self) -> Context {
-        Context {
-            version: CONTEXT_VERSION,
-            published_seq: self.published_seq,
-            published_root: self.published_root,
-            root: self.root,
-            next_seq: self.next_seq,
-            pending: if self.params.context_carries_pending {
-                self.pending.clone()
-            } else {
-                None
-            },
-            asks: self.asks.to_vec(),
-            parked: self
-                .reads
-                .parked
-                .iter()
-                .map(|(r, p)| (*r, p.clone()))
-                .collect(),
-            waiting: self
-                .reads
-                .waiting
-                .iter()
-                .map(|(c, r)| (*c, r.iter().copied().collect()))
-                .collect(),
-            attempts: self.reads.attempts.iter().map(|(c, n)| (*c, *n)).collect(),
-            head_epoch: self.head_epoch,
-            parked_write: self.parked_write.clone(),
-            subs: self.subs.clone(),
-            // Only meaningful alongside the commit itself: a timer for a
-            // commit that was not carried would measure the age of nothing.
-            in_flight_since: if self.params.context_carries_pending {
-                self.in_flight_since
-            } else {
-                None
-            },
-            told_stalled: if self.params.context_carries_pending {
-                self.told_stalled.iter().copied().collect()
-            } else {
-                Vec::new()
-            },
-            now: self.now,
+        v.field(&(self.published_seq, self.published_root, self.root, self.next_seq));
+        if carries {
+            v.field(&self.pending);
+        } else {
+            v.field(&None::<Commit>);
         }
-    }
-
-    /// Rebuild an engine from what the last call carried.
-    ///
-    /// Refuses rather than panics: these bytes come from outside this call and
-    /// may be from another version, truncated, or nothing to do with us. A
-    /// refusal is not a disaster — the caller starts from `Start` and reads
-    /// its head, which is the only authority anyway.
-    /// Resume from a context, or start fresh if it cannot be used.
-    ///
-    /// The pair `from_context(...).unwrap_or_else(|_| Engine::new(...))` does
-    /// not compile: `from_context` consumes `blocks`, so a caller cannot
-    /// reach for them again on the error arm. That shape pushed one caller
-    /// into an `unreachable!()`, which is a PANIC on a path a damaged context
-    /// reaches — and a delegate that panics on input is one a malformed
-    /// context can take down. So the fallback lives here, where the blocks
-    /// are still in hand.
-    ///
-    /// The bool says which happened. A caller that wants to report "this
-    /// engine started from nothing" needs it, and inferring it from a state
-    /// that merely looks fresh would be a guess.
-    pub fn from_context_or_new(bytes: &[u8], params: Params, blocks: B) -> (Self, bool) {
-        match Self::read_context(bytes, params) {
-            Some(c) => (Self::hydrate(c, params, blocks), true),
-            None => (Engine::new(params, blocks), false),
+        v.field(&self.asks.to_vec());
+        v.field(&self.reads.parked);
+        v.field(&self.reads.waiting);
+        v.field(&self.reads.attempts);
+        v.field(&self.head_epoch);
+        v.field(&self.parked_write);
+        v.field(&self.subs);
+        if carries {
+            v.field(&self.in_flight_since);
+            v.field(&self.told_stalled);
+        } else {
+            v.field(&None::<u64>);
+            v.field(&Vec::<(ClientId, WriteId)>::new());
         }
-    }
-
-    /// Read and VERIFY a context, without needing the blocks.
-    ///
-    /// Split out so a caller can fall back to a fresh engine without having
-    /// already given its blocks away.
-    fn read_context(bytes: &[u8], params: Params) -> Option<Context> {
-        use bincode::Options;
-        // Every check below happens BEFORE the decoder sees a byte of the
-        // body. A decoder that refuses malformed input is not the same thing
-        // as one that refuses input this build did not write: bincode read
-        // 656 of 876 single-window corruptions as a perfectly good context
-        // and handed back an engine in whatever state the damage described.
-        if bytes.len() < CONTEXT_HEADER || bytes.len() > params.max_context_bytes {
-            return None;
-        }
-        if bytes[..4] != CONTEXT_MAGIC {
-            return None;
-        }
-        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != CONTEXT_VERSION {
-            return None;
-        }
-        let body = &bytes[CONTEXT_HEADER..];
-        if bytes[6..CONTEXT_HEADER] != context_checksum(body) {
-            return None;
-        }
-        let c: Context = context_opts(params.max_context_bytes)
-            .deserialize(body)
-            .ok()?;
-        // Kept as well as the header's: two independent statements of the
-        // same fact cost two bytes and catch a build that changed the shape
-        // without changing the constant.
-        if c.version != CONTEXT_VERSION {
-            return None;
-        }
-        Some(c)
-    }
-
-    /// Build an engine from a context already verified by `read_context`.
-    fn hydrate(c: Context, params: Params, blocks: B) -> Self {
-        let mut e = Engine::new(params, blocks);
-        e.published_seq = c.published_seq;
-        e.published_root = c.published_root;
-        e.subs = c.subs;
-        e.root = c.root;
-        e.next_seq = c.next_seq;
-        e.pending = c.pending;
-        e.head_epoch = c.head_epoch;
-        e.parked_write = c.parked_write;
-        e.in_flight_since = c.in_flight_since;
-        e.told_stalled = c.told_stalled.into_iter().collect();
-        e.now = c.now;
-        e.recovered = true;
-        e.asks = asks::Asks::from_vec(c.asks);
-        for (r, p) in c.parked {
-            e.reads.parked.insert(r, p);
-        }
-        for (cid, reqs) in c.waiting {
-            e.reads.waiting.insert(cid, reqs.into_iter().collect());
-        }
-        for (cid, n) in c.attempts {
-            e.reads.attempts.insert(cid, n);
-        }
-        e
-    }
-
-    pub fn from_context(bytes: &[u8], params: Params, blocks: B) -> Result<Self, ContextError> {
-        match Self::read_context(bytes, params) {
-            Some(c) => Ok(Self::hydrate(c, params, blocks)),
-            None => Err(ContextError::Unreadable),
-        }
+        v.field(&self.now);
     }
 }

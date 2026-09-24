@@ -95,6 +95,21 @@ pub fn new_store_params(params: Params) -> Engine<Store> {
     e
 }
 
+/// What a refusal must leave untouched: the engine's bookkeeping BYTE FOR
+/// BYTE (`state_digest`, the one field walk `context_len` also sizes), plus
+/// what lives outside it -- the commit in flight's seq, the queue stage by
+/// stage, owed parity and the counters a taken write moves.
+#[allow(dead_code)]
+pub fn fingerprint(e: &Engine<Store>) -> impl PartialEq + std::fmt::Debug {
+    (
+        e.state_digest(),
+        e.committing_seq(),
+        e.queue_stages().collect::<Vec<_>>(),
+        (e.queue_load(), e.queued_writes(), e.unsaved_writes()),
+        (e.owed_groups(), e.commits_and_writes(), e.forced_writes()),
+    )
+}
+
 /// A COLD READER of `root`: an engine that has adopted it and holds none of
 /// its blocks, on a store of its own (returned, for what the page keeps).
 /// A reader on a store of its own that has NOT adopted anything: it learns
@@ -195,117 +210,47 @@ impl Store {
     }
 }
 
-/// How the harness drives the engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// One engine value for the whole run — how slices 1-3 were written.
-    Live,
-    /// The engine is DROPPED and rebuilt from its context between every step,
-    /// which is what a delegate actually does. Both modes must agree.
-    Rehydrate,
-}
-
-/// An engine driven in one of the two modes, so a test can be written once.
+/// One long-lived engine, driven step by step as the page drives it (the
+/// engine lives in the page, READ-STATE design B), with the node's store
+/// absorbing whatever each step put.
 pub struct Harness {
-    mode: Mode,
-    params: Params,
     pub store: Store,
-    live: Option<Engine<Store>>,
-    ctx: Vec<u8>,
-    /// Contexts written, and the largest seen — the budget's own evidence.
-    pub max_context: usize,
+    engine: Engine<Store>,
     /// What the engine shed, summed over every step (sdk#162).
     pub shed: engine::Shed,
 }
 
 impl Harness {
-    pub fn new(mode: Mode, params: Params, store: Store) -> Self {
-        let mut e = Engine::new(params, store.clone());
+    pub fn new(params: Params, store: Store) -> Self {
+        let mut engine = Engine::new(params, store.clone());
         // A NEW tree, and the engine is told so: a write before recovery
         // waits for it (sdk#223). A test that reads a head (`Start` then
         // `HeadRead`) resets and redoes this, as `Start` does.
-        let _ = e.step(Event::HeadMissing);
-        let ctx = e.to_context().expect("a fresh engine has a context");
-        Harness {
-            mode,
-            params,
-            store,
-            live: (mode == Mode::Live).then_some(e),
-            ctx,
-            max_context: 0,
-            shed: engine::Shed::default(),
-        }
+        let _ = engine.step(Event::HeadMissing);
+        Harness { store, engine, shed: engine::Shed::default() }
     }
 
     pub fn step(&mut self, ev: Event) -> Vec<Effect> {
-        let out = match self.mode {
-            Mode::Live => {
-                let e = self.live.as_mut().expect("a live engine");
-                let out = e.step(ev);
-                let s = e.take_shed();
-                add(&mut self.shed, s);
-                out
-            }
-            Mode::Rehydrate => {
-                let mut e = Engine::from_context(&self.ctx, self.params, self.store.clone())
-                    .expect("the engine's own context must read back");
-                let out = e.step(ev);
-                add(&mut self.shed, e.take_shed());
-                // `context_len` sizes the live state field by field; it must be
-                // exactly what `to_context` writes (sdk#162), in every state any
-                // engine test reaches.
-                if let Ok(c) = e.to_context() {
-                    assert_eq!(
-                        e.context_len(),
-                        c.len(),
-                        "context_len drifted from to_context"
-                    );
-                }
-                self.ctx = e.to_context().expect("a context after every step");
-                self.max_context = self.max_context.max(self.ctx.len());
-                out
-            }
-        };
-        // The node holds what the commit put, whichever mode this is.
+        let out = self.engine.step(ev);
+        let s = self.engine.take_shed();
+        add(&mut self.shed, s);
+        // The node holds what the commit put.
         self.store.absorb(&out);
         out
     }
 
-    /// Owed parity groups, as the engine stands (rebuilt from its context in
-    /// Rehydrate mode, as a delegate would be).
+    /// Owed parity groups, as the engine stands.
     pub fn owed_groups(&self) -> usize {
-        match self.mode {
-            Mode::Live => self.live.as_ref().expect("a live engine").owed_groups(),
-            Mode::Rehydrate => Engine::from_context(&self.ctx, self.params, self.store.clone())
-                .expect("its own context")
-                .owed_groups(),
-        }
+        self.engine.owed_groups()
     }
 
-    /// The context's size as last written (Rehydrate mode).
-    pub fn context_len(&self) -> usize {
-        self.ctx.len()
-    }
-
-    /// The root the engine would report. In rehydrate mode that means
-    /// rebuilding it, which is the point: nothing is remembered outside the
-    /// context.
+    /// The root the engine would report.
     pub fn root(&self) -> Cid {
-        match self.mode {
-            Mode::Live => self.live.as_ref().expect("a live engine").root(),
-            Mode::Rehydrate => Engine::from_context(&self.ctx, self.params, self.store.clone())
-                .expect("its own context")
-                .root(),
-        }
+        self.engine.root()
     }
 
     pub fn published_root(&self) -> Cid {
-        match self.mode {
-            Mode::Live => self.live.as_ref().expect("a live engine").published_root(),
-            Mode::Rehydrate => Engine::from_context(&self.ctx, self.params, self.store.clone())
-                .expect("its own context")
-                .published_root(),
-        }
+        self.engine.published_root()
     }
 }
 

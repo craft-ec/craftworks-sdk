@@ -37,17 +37,11 @@ fn batch(n: usize, size: usize) -> Vec<(Vec<u8>, Op)> {
         .collect()
 }
 
-/// An engine with history: three writes committed and published, so its
-/// context carries owed parity, a head, seen writes -- more than an empty one
-/// would, and more for a leaked half-commit to disturb.
-///
-/// The history is ALWAYS built at the default params, then the same context is
-/// reopened under `params`. Building it under the params being tested made the
-/// tree depend on the budget -- under a budget of one block the history's own
-/// writes were refused -- and the block count under test moved with it
-/// (205 vs 206, measured).
-fn lived_in(params: Params) -> Engine<Store> {
-    let mut e = common::new_store_params(Params::default());
+/// An engine with history, built under `params`: three writes committed and
+/// published, so it holds owed parity, a head, seen writes -- more than an
+/// empty one would, and more for a leaked half-commit to disturb.
+fn history(params: Params) -> Engine<Store> {
+    let mut e = common::new_store_params(params);
     for w in 1..=3u64 {
         let out = stepped!(
             e,
@@ -71,9 +65,24 @@ fn lived_in(params: Params) -> Engine<Store> {
             }
         }
     }
-    let ctx = e.to_context().expect("the history encodes");
-    Engine::from_context(&ctx, params, e.blocks().clone())
-        .expect("the history reopens under these params")
+    e
+}
+
+/// The same history, REOPENED under `params` the way a page reload reopens
+/// it: a new engine recovering from the published head, over the node's
+/// blocks.
+///
+/// The history is ALWAYS built at the default params. Building it under the
+/// params being tested made the tree depend on the budget -- under a budget of
+/// one block the history's own writes were refused -- and the block count
+/// under test moved with it (205 vs 206, measured).
+fn lived_in(params: Params) -> Engine<Store> {
+    let h = history(Params::default());
+    let mut e = Engine::new(params, h.blocks().clone());
+    let _ = e.step(Event::Start { key: engine::KeySource::SecretStore, epochs: vec![engine::Epoch(1)] });
+    let _ = e.step(Event::HeadRead { epoch: engine::Epoch(1), seq: h.published_seq(), root: h.published_root() });
+    assert_eq!((e.published_seq(), e.root()), (h.published_seq(), h.published_root()), "the reopened engine is not on the history's head");
+    e
 }
 
 /// What one write is answered on a lived-in engine with `params`.
@@ -217,8 +226,8 @@ fn a_too_large_refusal_leaves_the_whole_context_byte_identical() {
             vec![(b"k".to_vec(), Op::Put(vec![1u8; 5000]))],
         ),
     ] {
-        let mut e = lived_in(params);
-        let before = e.to_context().expect("the lived-in context encodes");
+        let mut e = history(params);
+        let before = common::fingerprint(&e);
         let root = e.root();
         let out = stepped!(e, write(99, ops));
         assert!(
@@ -234,10 +243,7 @@ fn a_too_large_refusal_leaves_the_whole_context_byte_identical() {
             "{label}: a refused write put something on the network"
         );
         assert_eq!(e.root(), root, "{label}: the tree moved");
-        assert!(
-            e.to_context().expect("encodes") == before,
-            "{label}: the refusal changed the engine's context"
-        );
+        assert_eq!(common::fingerprint(&e), before, "{label}: the refusal changed the engine's state");
     }
 }
 

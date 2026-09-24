@@ -11,7 +11,7 @@ use freenet_prolly::Cid;
 use std::collections::BTreeSet;
 
 mod common;
-use common::{Harness, Mode, Store};
+use common::{Harness, Store};
 
 const T0: u64 = 1_790_000_000;
 
@@ -50,7 +50,7 @@ fn large() -> Vec<(Vec<u8>, Op)> {
 }
 
 fn harness() -> Harness {
-    let mut h = Harness::new(Mode::Rehydrate, Params::default(), Store::fresh());
+    let mut h = Harness::new(Params::default(), Store::fresh());
     let _ = h.step(Event::Tick(T0));
     h
 }
