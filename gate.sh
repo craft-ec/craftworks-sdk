@@ -95,20 +95,17 @@ fi
 
 # ---------------------------------------------------------------- disk ----
 # Before anything, because the failure it prevents is the one that does not
-# look like a failure.
-MIN_GIB=5
-free_gib=$(df -g . 2>/dev/null | awk 'NR==2 {print $4}')
-if [ -z "$free_gib" ]; then
-  # BSD df -g is macOS; fall back to POSIX blocks.
-  free_gib=$(df -k . | awk 'NR==2 {printf "%d", $4/1048576}')
-fi
-echo "gate: ${free_gib} GiB free"
-if [ "$free_gib" -lt "$MIN_GIB" ]; then
-  echo "${RED}gate: under ${MIN_GIB} GiB free — refusing to start.${OFF}" >&2
-  echo "An ENOSPC inside a build voids the run rather than failing it honestly," >&2
-  echo "and a voided run reads as a passing one." >&2
+# look like a failure. THE DISK GUARD is ONE script, this repo's
+# scripts/disk-guard.sh: its floor, its table of who holds the space, and
+# "could not check is a failure" live there once. The builder's gate and
+# realnet call the same file through $CRAFTWORKS_SDK. A guard that is not
+# there FAILS the gate; it is never skipped.
+guard=${DISK_GUARD:-./scripts/disk-guard.sh}
+if [ ! -x "$guard" ]; then
+  echo "${RED}gate: no disk guard at $guard -- cannot check the disk, and will not skip it${OFF}" >&2
   exit 1
 fi
+"$guard" "the SDK gate" || exit 1
 
 # --------------------------------------------- the structural controls ----
 # THE ONE LIST of the checks that read the WHOLE workspace's source (or the whole branch), whatever a change touches:
@@ -506,7 +503,7 @@ if [ $ACCEPT -eq 1 ]; then
   counts_file=$(mktemp)
   for i in "${!NAMES[@]}"; do echo "${NAMES[$i]}=${COUNTS[$i]}" >> "$counts_file"; done
   echo "npm=$js_ok" >> "$counts_file"
-  GATE_MIN_GIB=$MIN_GIB ./tools/gate-accept.sh "$BASELINE" "$STEP_FAILED" "$counts_file" ${ACCEPT_ARGS[@]+"${ACCEPT_ARGS[@]}"}
+  ./tools/gate-accept.sh "$BASELINE" "$STEP_FAILED" "$counts_file" ${ACCEPT_ARGS[@]+"${ACCEPT_ARGS[@]}"}
   rc=$?
   rm -f "$counts_file"
   exit $rc
