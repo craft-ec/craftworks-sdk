@@ -1622,12 +1622,6 @@ impl<B: Blocks> Engine<B> {
         self.published_seq
     }
 
-    /// The seq the next commit of this engine's will sign. A refusal must not
-    /// consume one; the refusal tests' state fingerprint reads it.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
-    }
-
     /// Blocks of the commit in flight that this engine has already seen
     /// confirmed ON THE NODE -- carried in the context, so true at the top of
     /// a call that did not see the confirmation (sdk#150). The head bump is
@@ -4846,6 +4840,12 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// still counts it until sdk#385 decides that budget.
 const CONTEXT_HEADER: usize = 4 + 2 + 8;
 
+/// Visits each field of [`Engine::state_fields`]: sized by `context_len`,
+/// hashed by `state_digest`.
+trait StateVisitor {
+    fn field<T: serde::Serialize>(&mut self, v: &T);
+}
+
 impl<B: Blocks> Engine<B> {
     /// The size the delegate-era context would have been, header included
     /// (#305 deleted the carry; `keep_saveable` still bounds by it, sdk#385).
@@ -4858,34 +4858,75 @@ impl<B: Blocks> Engine<B> {
     /// so the sum was exactly the length the carry wrote (checked every step
     /// while the carry existed).
     pub fn context_len(&self) -> usize {
-        use bincode::Options;
-        let o = bincode::DefaultOptions::new().with_fixint_encoding();
-        let sz = |r: Result<u64, bincode::Error>| r.map_or(usize::MAX / 64, |n| n as usize);
+        struct Size(usize);
+        impl StateVisitor for Size {
+            fn field<T: serde::Serialize>(&mut self, v: &T) {
+                use bincode::Options;
+                let o = bincode::DefaultOptions::new().with_fixint_encoding();
+                self.0 += o.serialized_size(v).map_or(usize::MAX / 64, |n| n as usize);
+            }
+        }
+        let mut size = Size(0);
+        self.state_fields(&mut size);
+        CONTEXT_HEADER + 2 + size.0
+    }
+
+    /// BLAKE3 over the bytes of every field [`Engine::state_fields`] walks, in
+    /// its order, each prefixed with its length: the bookkeeping, BYTE FOR
+    /// BYTE, so a refusal test can assert nothing moved -- whatever it grows
+    /// later, since a new field joins the one walk. Only those tests call it;
+    /// `context_len` sizes the same walk every step without encoding it.
+    #[doc(hidden)]
+    pub fn state_digest(&self) -> [u8; 32] {
+        struct Digest(blake3::Hasher);
+        impl StateVisitor for Digest {
+            fn field<T: serde::Serialize>(&mut self, v: &T) {
+                use bincode::Options;
+                let o = bincode::DefaultOptions::new().with_fixint_encoding();
+                match o.serialize(v) {
+                    Ok(b) => {
+                        self.0.update(&(b.len() as u64).to_le_bytes());
+                        self.0.update(&b);
+                    }
+                    // Never for these types; a field that cannot encode is
+                    // still a DIFFERENT digest from one that can.
+                    Err(_) => {
+                        self.0.update(&u64::MAX.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut d = Digest(blake3::Hasher::new());
+        self.state_fields(&mut d);
+        *d.0.finalize().as_bytes()
+    }
+
+    /// THE ONE LIST of the engine's bookkeeping fields, in one fixed order:
+    /// what the delegate-era context carried. `context_len` (the budget,
+    /// sdk#385) sizes it and `state_digest` hashes it, so the two cannot
+    /// disagree about what the state is.
+    fn state_fields(&self, v: &mut impl StateVisitor) {
         let carries = self.params.context_carries_pending;
-        let none_u64: Option<u64> = None;
-        let none_commit: Option<Commit> = None;
-        let told: Vec<(ClientId, WriteId)> = Vec::new();
-        CONTEXT_HEADER
-            + sz(o.serialized_size(&0u16))
-            + sz(o.serialized_size(&(self.published_seq, self.published_root, self.root, self.next_seq)))
-            + if carries {
-                sz(o.serialized_size(&self.pending))
-            } else {
-                sz(o.serialized_size(&none_commit))
-            }
-            + sz(o.serialized_size(&self.asks.to_vec()))
-            + sz(o.serialized_size(&self.reads.parked))
-            + sz(o.serialized_size(&self.reads.waiting))
-            + sz(o.serialized_size(&self.reads.attempts))
-            + sz(o.serialized_size(&self.head_epoch))
-            + sz(o.serialized_size(&self.parked_write))
-            + sz(o.serialized_size(&self.subs))
-            + if carries {
-                sz(o.serialized_size(&self.in_flight_since))
-                    + sz(o.serialized_size(&self.told_stalled))
-            } else {
-                sz(o.serialized_size(&none_u64)) + sz(o.serialized_size(&told))
-            }
-            + sz(o.serialized_size(&self.now))
+        v.field(&(self.published_seq, self.published_root, self.root, self.next_seq));
+        if carries {
+            v.field(&self.pending);
+        } else {
+            v.field(&None::<Commit>);
+        }
+        v.field(&self.asks.to_vec());
+        v.field(&self.reads.parked);
+        v.field(&self.reads.waiting);
+        v.field(&self.reads.attempts);
+        v.field(&self.head_epoch);
+        v.field(&self.parked_write);
+        v.field(&self.subs);
+        if carries {
+            v.field(&self.in_flight_since);
+            v.field(&self.told_stalled);
+        } else {
+            v.field(&None::<u64>);
+            v.field(&Vec::<(ClientId, WriteId)>::new());
+        }
+        v.field(&self.now);
     }
 }

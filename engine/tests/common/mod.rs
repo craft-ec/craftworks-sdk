@@ -95,16 +95,15 @@ pub fn new_store_params(params: Params) -> Engine<Store> {
     e
 }
 
-/// What a refusal must leave untouched, from the engine's own accessors (the
-/// context bytes were this before #305 deleted the carry): the size of every
-/// bookkeeping collection the budget counts (`context_len`), the trees and
-/// head, the next seq (a number consumed), the commit in flight, the queue
-/// stage by stage, owed parity and the counters a taken write moves.
+/// What a refusal must leave untouched: the engine's bookkeeping BYTE FOR
+/// BYTE (`state_digest`, the one field walk `context_len` also sizes), plus
+/// what lives outside it -- the commit in flight's seq, the queue stage by
+/// stage, owed parity and the counters a taken write moves.
 #[allow(dead_code)]
 pub fn fingerprint(e: &Engine<Store>) -> impl PartialEq + std::fmt::Debug {
     (
-        e.context_len(),
-        (e.root(), e.published_root(), e.published_seq(), e.next_seq(), e.committing_seq()),
+        e.state_digest(),
+        e.committing_seq(),
         e.queue_stages().collect::<Vec<_>>(),
         (e.queue_load(), e.queued_writes(), e.unsaved_writes()),
         (e.owed_groups(), e.commits_and_writes(), e.forced_writes()),
