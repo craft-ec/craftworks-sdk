@@ -511,6 +511,33 @@ fn a_cold_read_with_a_lost_get_returns_every_row() {
     assert!(!rr.got_once.is_empty(), "no GET went unanswered: the fault never fired");
 }
 
+/// THE ROOT IS A GROUP OF ONE (sdk#335): a cold reader on another node whose
+/// head's ROOT block never answers (measured live: ~60 s, and ~4 min then
+/// NotFound) still reads every row -- the head lists the root's parity, and
+/// the first of the root's 1 + m to arrive answers.
+#[test]
+fn a_cold_reader_reads_every_row_through_a_silent_root() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let rows: Vec<(String, String)> = (0..200).map(|i| (format!("k/{i:04}"), format!("v{i}"))).collect();
+    let ops: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), Some(v.as_str()))).collect();
+    assert!(published(&states(&rig.client_as(&mut node, &write(1, &ops)), 1)));
+    let (_, root) = node.head().expect("published");
+    let listed = node.head_read().and_then(|h| h.mark()).unwrap_or_default();
+    assert_eq!(listed.len(), engine::PARITY, "the signed head lists {} root parity ids", listed.len());
+    let mut rnode = Node::new();
+    rnode.network = Some(std::mem::take(&mut node.blocks));
+    rnode.register = node.register.clone();
+    let mut rr = PageRig::new();
+    rr.silent.insert(root);
+    rr.client_as(&mut rnode, &Request::Identity);
+    let p = rr.client_as(&mut rnode, &range(20));
+    let want: Vec<(Vec<u8>, Vec<u8>)> = rows.iter().map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())).collect();
+    assert_eq!(page_entries(&p, 20), Some(want), "a cold read through a silent root did not return the rows");
+    assert!(rr.gets.get(&root).copied().unwrap_or(0) >= 1, "the root was never asked: the silence never fired");
+}
+
 /// One commit at a time, and a write while one is in flight is QUEUED
 /// (R-b): `Accepted` at once, never `Busy`; it commits when the first lands.
 #[test]

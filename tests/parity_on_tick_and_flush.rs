@@ -78,8 +78,9 @@ fn a_settled_group_is_not_put_again() {
     assert_eq!(puts(&c) - before, 0, "an acked commit's blocks were put again by later ticks");
 }
 
-/// The control: a tree that is ONE leaf has no groups, so its commit puts ONE
-/// block and no parity. This pins the extra puts above to the GROUP.
+/// The control: a tree that is ONE leaf has no groups, so its commit puts its
+/// ONE block and the root's own PARITY parity (sdk#335: the root is a group of
+/// one) -- no group parity. This pins the extra puts above to the GROUP.
 #[test]
 fn nothing_owed_puts_nothing() {
     let node = PageNode::new();
@@ -91,6 +92,7 @@ fn nothing_owed_puts_nothing() {
     let t = c.now_ms() + 10_000_000;
     c.tick_at(t);
     c.client(&protocol::Request::Flush);
-    assert_eq!(commit, 1, "a one-leaf tree's commit put {commit} block(s): parity with no group to code");
-    assert_eq!(puts(&c) - before, 1, "a Tick and a Flush caused puts with nothing owed");
+    let one = 1 + engine::PARITY;
+    assert_eq!(commit, one, "a one-leaf tree's commit put {commit} block(s): parity with no group to code");
+    assert_eq!(puts(&c) - before, one, "a Tick and a Flush caused puts with nothing owed");
 }

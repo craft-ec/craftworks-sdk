@@ -123,8 +123,8 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
 /// RACE PUT (COMMIT-LIFE §P): the head is signed when the ROOT is acked and
 /// every changed group has k of its k+m -- not when every block is. Two
 /// values too large to ride in the leaf, so the leaf's value group has k = 2
-/// members and PARITY parity; the leaf IS the root (in no group), so it must be
-/// acked itself.
+/// members and PARITY parity; the leaf IS the root, a group of ONE (sdk#335)
+/// with its own PARITY parity, so any one of the root's 1 + PARITY must be acked.
 #[test]
 fn one_write_reaches_published_when_its_root_and_groups_are_recoverable() {
     let mut e = common::new_store_params(Params {
@@ -157,34 +157,42 @@ fn one_write_reaches_published_when_its_root_and_groups_are_recoverable() {
     let root: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::TREE_NODE, x)).map(|x| x.0).collect();
     let values: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::RAW, x)).map(|x| x.0).collect();
     let parity: Vec<Cid> = blocks.iter().filter(|x| is(freenet_prolly::kind::PARITY, x)).map(|x| x.0).collect();
-    assert_eq!((root.len(), values.len(), parity.len()), (1, 2, PARITY), "the fixture is not root + 2 values + their group's PARITY parity");
+    assert_eq!((root.len(), values.len(), parity.len()), (1, 2, 2 * PARITY), "the fixture is not root + 2 values + their group's PARITY parity + the root's PARITY parity");
     assert!(head_of(&out).is_none(), "the head moved before a single block was confirmed");
 
-    // The group has k = 2 of its 5 acked (a value and a parity), the root not:
-    // NO head -- the root is in no group and nothing can rebuild it.
-    for id in [values[0], parity[0], parity[1]] {
+    // The ROOT's parity (sdk#335) and the value group's.
+    let rp: BTreeSet<Cid> = e.root_parity_of(&root[0]).into_iter().collect();
+    let gp: Vec<Cid> = parity.iter().copied().filter(|p| !rp.contains(p)).collect();
+    let rp: Vec<Cid> = rp.into_iter().collect();
+    assert_eq!((gp.len(), rp.len()), (PARITY, PARITY));
+
+    // The value group at k = 2 (a value and a parity), the root group at 0 of
+    // its 1 + PARITY: NO head -- nothing yet can rebuild the root.
+    for id in [values[0], gp[0], gp[1]] {
         let out = stepped!(e, Event::PutConfirmed(id));
         seen.absorb(&out);
-        assert!(head_of(&out).is_none(), "the head moved with the ROOT un-acked");
+        assert!(head_of(&out).is_none(), "the head moved with none of the root group acked");
     }
-    // The root lands: the head goes out, with a value and a parity still out.
-    let out = stepped!(e, Event::PutConfirmed(root[0]));
+    // ONE of the root's parity lands, the root itself still out: the head goes
+    // out -- the root group is recoverable (any 1 of its 1 + PARITY).
+    let out = stepped!(e, Event::PutConfirmed(rp[0]));
     seen.absorb(&out);
-    let (seq, head_root, after) = head_of(&out).expect("root acked and the group at k: the head must move (race put)");
+    let (seq, head_root, after) = head_of(&out).expect("root group and value group at k: the head must move (race put)");
     assert_eq!(seq, 1);
     assert_eq!(head_root, e.root());
     // `after` is the race set: only what was counted, all acked.
-    let acked: BTreeSet<Cid> = [values[0], parity[0], parity[1], root[0]].into_iter().collect();
+    let acked: BTreeSet<Cid> = [values[0], gp[0], gp[1], rp[0]].into_iter().collect();
     let named: BTreeSet<Cid> = after.into_iter().collect();
     assert!(named.is_subset(&acked), "UpdateHead names a block that is not acked: {:?}", named.difference(&acked).collect::<Vec<_>>());
-    assert!(named.contains(&root[0]), "UpdateHead does not name the root it depends on");
+    assert!(named.contains(&rp[0]), "UpdateHead does not name the root parity it depends on");
     assert_eq!(seen.of(1, 1), &[State::Accepted]);
 
     let out = stepped!(e, Event::HeadConfirmed(seq));
     seen.absorb(&out);
     assert_eq!(seen.of(1, 1), &[State::Accepted, State::Published], "SAVED at k, not BACKED_UP");
-    // The stragglers land: BACKED_UP.
-    for id in [values[1], parity[2]] {
+    // The stragglers land -- the root among them: BACKED_UP.
+    let rest: Vec<Cid> = std::iter::once(values[1]).chain(gp[2..].iter().copied()).chain(std::iter::once(root[0])).chain(rp[1..].iter().copied()).collect();
+    for id in rest {
         let out = stepped!(e, Event::PutConfirmed(id));
         seen.absorb(&out);
     }

@@ -71,11 +71,11 @@ fn the_old_exact_root_reader_is_what_breaks_once() {
 /// carries race put's §P mark (COMMIT-LIFE §P), the genesis too.
 #[test]
 fn a_sign_carries_its_prev_and_the_genesis_carries_none() {
-    let g = page::sign_ledger(0, [0; 32], [5; 32]);
+    let g = page::sign_ledger(0, [0; 32], [5; 32], &[]);
     let gh = page::HeadRead::from_value(1, &[[5u8; 32].as_slice(), &g].concat()).expect("a head");
     assert_eq!(gh.prev(), None, "the genesis carries a PREV");
     assert!(gh.parity_marked(), "the genesis head carries no §P mark");
-    let l = page::sign_ledger(3, [8; 32], [5; 32]);
+    let l = page::sign_ledger(3, [8; 32], [5; 32], &[]);
     let h = page::HeadRead::from_value(4, &[[5u8; 32].as_slice(), &l].concat()).expect("a head");
     assert_eq!(h.prev(), Some((3, [8; 32])));
 }

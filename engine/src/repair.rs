@@ -9,7 +9,8 @@
 //! missed a block descended through its parent, and the parent lists both the
 //! group's members and its `PARITY` parity ids (freenet-prolly `parity.rs`, the
 //! rule; a leaf's groups are over its referenced values, a branch's over its
-//! children). The root is in no group: a lost root is not repairable here.
+//! children). The ROOT is a group of one (sdk#335): its parity ids ride in its
+//! head, so [`root_group`] builds its group from those, not from a node.
 
 use freenet_prolly::node::Node;
 use freenet_prolly::parity;
@@ -62,6 +63,27 @@ impl Group {
             parity::symbol(&st)
         }
     }
+}
+
+/// The root's group of ONE (sdk#335): `k = 1`, the root then its parity, coded
+/// like a branch's child (a node, `TREE_NODE`). [`root_parity`] makes the
+/// blocks; this is what a read rebuilds the root from.
+pub fn root_group(root: Cid, parity_ids: &[Cid]) -> Group {
+    let mut slots = vec![root];
+    slots.extend_from_slice(parity_ids);
+    Group { missing: root, missing_ix: 0, kind: kind::TREE_NODE, slots, k: 1, max_len: parity::MAX_MEMBER_NODE }
+}
+
+/// The root's parity blocks (sdk#335): its group of one, coded by the tree's
+/// own rule for a group of nodes (`kind ‖ bytes`, then `encode_group`), so a
+/// root is repairable by anyone the way every other node is. `None` only if
+/// the code refuses (it does not for k = 1).
+pub fn root_parity(root_bytes: &[u8]) -> Option<Vec<(Cid, Vec<u8>)>> {
+    let mut st = Vec::with_capacity(1 + root_bytes.len());
+    st.push(kind::TREE_NODE);
+    st.extend_from_slice(root_bytes);
+    let blocks = parity::encode_group(&[st]).ok()?;
+    Some(blocks.into_iter().map(|p| (block_id(kind::PARITY, &p), p)).collect())
 }
 
 /// The group `missing` belongs to, found in a node held under `root`.

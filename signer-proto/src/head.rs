@@ -14,9 +14,10 @@
 //! Fields (the architect's review, docs 2026-09-23-ledger-format-attack.md, ruled by main):
 //! * [`TAG_PREV`] `prev_seq u64 LE ‖ prev_root [32]`: the head this one was signed from. Omitted at the genesis,
 //!   never zeros.
-//! * [`TAG_PARITY`]: since ledger version 2, the race-put MARK (COMMIT-LIFE §P): an EMPTY field means "every group
-//!   this head lists was recoverable (k of k+m) when it was signed". A head without it is pre-§P, and a reader says
-//!   `NotScanned` for it. In version 1 the tag carried #119's scan front, a different meaning, so a v1 parity field
+//! * [`TAG_PARITY`]: since ledger version 2, the race-put MARK (COMMIT-LIFE §P): the field's presence means "every
+//!   group this head lists was recoverable (k of k+m) when it was signed"; its body is the ROOT's parity ids
+//!   (sdk#335: the root is a group of one), `m × 32` bytes, or empty when the writer listed none. A head without it is
+//!   pre-§P, and a reader says `NotScanned` for it. In version 1 the tag carried #119's scan front, a different meaning, so a v1 parity field
 //!   is DROPPED on read, never taken for the mark. At most [`PARITY_MAX`] bytes.
 //! * [`TAG_THROUGH`] `n u16 ‖ n × (device [16] ‖ seq u64 LE ‖ last u64 LE)`, sorted by device, unique: how far each
 //!   device's writes are published, and when each last wrote. `device` is a per-INSTALL id minted once and kept in the
@@ -59,7 +60,7 @@ pub const TAG_THROUGH: u8 = 3;
 /// Bytes of one field's header: tag and length.
 const FIELD_HEADER: usize = 3;
 const PREV_LEN: usize = 8 + 32;
-/// The parity mark's cap (a key rounded to a node separator).
+/// The parity mark's cap: the root's parity ids, 8 × 32 B (sdk#335). The page asserts the tree's parity per group fits.
 pub const PARITY_MAX: usize = 256;
 /// Bytes of one device entry.
 pub const THROUGH_ENTRY: usize = 16 + 8 + 8;
@@ -267,8 +268,9 @@ fn normalise(through: &[Through]) -> Vec<Through> {
 }
 
 /// LEDGERS MERGE (the architect's #1, ruled by main): two heads at one seq under one root differ only in their
-/// ledgers, and the loser's entries must not vanish with its head. Per device the max; the parity mark that is
-/// further on (the greater key); `prev` is the winner's. Pure; the ledger-only commit that carries it is #225b's.
+/// ledgers, and the loser's entries must not vanish with its head. Per device the max; of two parity marks the greater
+/// (one root has one parity list, so they differ only when one side listed none -- and a list beats none); `prev` is
+/// the winner's. Pure; the ledger-only commit that carries it is #225b's.
 pub fn merge(winner: &Ledger, loser: &Ledger) -> Ledger {
     let mut through = winner.through.clone();
     through.extend_from_slice(&loser.through);

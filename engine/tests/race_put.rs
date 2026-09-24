@@ -326,20 +326,24 @@ fn every_put_of_a_commit_leaves_in_its_first_send() {
     }
 }
 
-/// §P 4: a commit whose ROOT is un-acked does not sign (nothing can rebuild a
-/// root), and neither does one with a changed group missing k+1 -- here its
+/// §P 4: a commit with NONE of its root group acked does not sign (the root
+/// is a group of one, sdk#335: nothing can rebuild it), and neither does one
+/// with a changed group missing k+1 -- here its
 /// new leaf AND its PARITY parity (k-1 of k+PARITY left).
 #[test]
 fn neither_an_unacked_root_nor_a_group_below_k_signs() {
-    // The root: everything acked but it.
+    // The root group (sdk#335: the root and its PARITY parity): everything
+    // acked but all 1 + PARITY of it.
     let mut r = Rig::base();
     let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     let root = r.e.root();
+    let group: BTreeSet<Cid> = std::iter::once(root).chain(r.e.root_parity_of(&root)).collect();
+    assert_eq!(group.len(), 1 + PARITY);
     let mut all = fx.clone();
-    for id in puts(&fx).keys().filter(|id| **id != root) {
+    for id in puts(&fx).keys().filter(|id| !group.contains(*id)) {
         all.extend(r.step(Event::PutConfirmed(*id)));
     }
-    assert!(head(&all).is_none(), "the head was signed with the ROOT un-acked");
+    assert!(head(&all).is_none(), "the head was signed with NONE of the root group acked");
     let more = r.step(Event::PutConfirmed(root));
     assert!(head(&more).is_some(), "with the root acked too, the head did not sign");
 

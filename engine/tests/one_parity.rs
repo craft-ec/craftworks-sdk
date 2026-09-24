@@ -1,4 +1,4 @@
-//! ONE OWNER FOR PARITY PER GROUP (the architect, #351): the engine takes the
+//! ONE OWNER FOR PARITY PER GROUP (the architect, #351): the engine and the page take the
 //! TREE's number, `freenet_prolly::rs::PARITY` (re-exported as
 //! `engine::PARITY`), and never writes it by hand. A hand-written 3 was right
 //! only while the tree's number was 3; this fails the build on one.
@@ -53,6 +53,9 @@ fn the_engine_writes_no_parity_count_by_hand() {
     let mut found = Vec::new();
     scan(&root.join("src"), true, &mut found);
     scan(&root.join("tests"), false, &mut found);
+    // The PAGE counts group blocks too (a head's `after`, its held effects):
+    // a page-side literal is the same copy.
+    scan(&root.join("../page/src"), true, &mut found);
     assert!(found.is_empty(), "a hand-written parity count; use engine::PARITY (the tree's):\n{}", found.join("\n"));
 }
 
