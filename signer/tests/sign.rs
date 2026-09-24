@@ -118,6 +118,23 @@ fn signed(a: &Answer) -> Vec<u8> {
     }
 }
 
+/// FAIL CLOSED FOR THE HEAD too (engineer4, the same class #332 closed for sites): a head RECORD that is there and
+/// does not decode refuses `CannotSign` and writes nothing -- read as "no record yet", a damaged record would let a
+/// prev already signed from be signed again (a fork). THE CONTROL: with no record at all, the same genesis signs.
+#[test]
+fn an_undecodable_head_record_refuses_and_writes_nothing() {
+    let mut w = World::new();
+    w.hold_root(root(1));
+    let mut damaged = w.host.clone();
+    damaged.secrets.insert(RECORD.to_vec(), b"garbage".to_vec());
+    let before = damaged.secrets.clone();
+    let got = serve(&mut damaged, &encode_request(1, &Request::Sign { prev: genesis(), next: next(1, 1), label: Label::Head }), Origin::Local);
+    assert_eq!(got, Answer::Refused(Why::CannotSign), "a damaged head record was read as none");
+    assert_eq!(damaged.secrets, before, "a refused sign changed the secrets");
+    let a = w.sign(genesis(), &next(1, 1));
+    assert!(matches!(a, Answer::Signed(_)), "THE CONTROL: with no record the genesis did not sign: {a:?}");
+}
+
 #[test]
 fn a_head_is_signed_from_genesis_and_reads_back_as_that_head() {
     let mut w = World::new();
