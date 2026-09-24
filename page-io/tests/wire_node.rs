@@ -426,13 +426,54 @@ fn page_io(node: &WireNode) -> PageIo {
 }
 
 /// Run the page against the node until nothing is left to send.
+#[track_caller]
 fn settle(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
+    // Until QUIESCENT (the architect, after #383 x #393): no frame to serve and nothing owed an answer or a re-send
+    // -- only the idle page's backstop read is left on its clock, and it is not run. A phase's count never depends
+    // on where a round cap fell (a cap ended every settle mid-backstop-cycle, ~33 simulated hours in, and #393's
+    // one extra round moved a Hint read into the next phase's window). The cap is now a failure, never an end.
     let mut replies = Vec::new();
     for _ in 0..2_000 {
         let frames = io.take_frames();
         replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
         if frames.is_empty() {
+            if !io.waiting() {
+                replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
+                return replies;
+            }
             // Only timers left: go to the next one (or now, if it is due).
+            match io.next_due() {
+                Some(Ms(t)) => {
+                    *now = (*now).max(t);
+                    io.tick(Ms(*now));
+                    continue;
+                }
+                None => panic!("settle: the page is waiting with no timer to wake it"),
+            }
+        }
+        *now += 1;
+        for f in frames {
+            let answer = node.serve(&f);
+            for push in std::mem::take(&mut node.pushes) {
+                io.inbound(&push, Ms(*now));
+            }
+            if let Some(answer) = answer {
+                io.inbound(&answer, Ms(*now));
+            }
+        }
+    }
+    panic!("settle: the page did not settle in 2,000 rounds (still waiting: {:?})", io.not_answering());
+}
+
+/// A page the test KEEPS from settling (a signer that never answers, register reads refused or failed for ever, a
+/// corrupted block re-asked): the clock runs timer to timer for 2,000 rounds and stops there -- what every settle
+/// did before it ended at quiescence. Named, so a count read after it says how long it ran.
+fn run_unsettled(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
+    let mut replies = Vec::new();
+    for _ in 0..2_000 {
+        let frames = io.take_frames();
+        replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
+        if frames.is_empty() {
             match io.next_due() {
                 Some(Ms(t)) => {
                     *now = (*now).max(t);
@@ -454,13 +495,17 @@ fn settle(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
             }
         }
     }
-    // Frames still unserved at the cap (a backstop read emitted by the last tick) are served here, clock unmoved,
-    // so no phase's leftover frame is counted in the next phase's window.
-    replies.extend(pump(io, node, now));
     replies.extend(io.take_replies().iter().map(|r| protocol::decode_reply(r).expect("a reply")));
     replies
 }
 
+/// A request to a page the test keeps from settling ([`run_unsettled`]).
+fn client_unsettled(io: &mut PageIo, node: &mut WireNode, now: &mut u64, r: &Request) -> Vec<Reply> {
+    io.client(&protocol::encode_session_request(4, 9, r).expect("encodes"));
+    run_unsettled(io, node, now)
+}
+
+#[track_caller]
 fn client(io: &mut PageIo, node: &mut WireNode, now: &mut u64, r: &Request) -> Vec<Reply> {
     io.client(&protocol::encode_session_request(4, 9, r).expect("encodes"));
     settle(io, node, now)
@@ -633,10 +678,10 @@ fn a_refused_head_read_on_a_fresh_signer_is_re_asked_never_an_empty_tree() {
     // Every read refused while the page opens and is asked for its rows: nothing may open.
     y.refuse_gets = usize::MAX;
     let mut b = page_io(&y);
-    client(&mut b, &mut y, &mut now, &Request::Identity);
+    client_unsettled(&mut b, &mut y, &mut now, &Request::Identity);
     let range = Request::Range { req_id: 8, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
     let pages = |r: &[Reply]| r.iter().filter_map(|x| if let Reply::Page { req_id: 8, entries, .. } = x { Some(entries.len()) } else { None }).collect::<Vec<_>>();
-    let during = pages(&client(&mut b, &mut y, &mut now, &range));
+    let during = pages(&client_unsettled(&mut b, &mut y, &mut now, &range));
     let refused = usize::MAX - y.refuse_gets;
     assert!(refused >= 2, "THE SETUP: the refusal was not re-asked ({refused} refused)");
     assert_eq!(during, Vec::<usize>::new(), "{refused} refused head reads opened a tree: {during:?}");
@@ -891,9 +936,17 @@ fn reader(node: &WireNode) -> PageIo {
     )
 }
 
+#[track_caller]
 fn rows(io: &mut PageIo, node: &mut WireNode, now: &mut u64, req_id: u64) -> Vec<usize> {
     let range = Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
     let r = client(io, node, now, &range);
+    r.iter().filter_map(|x| if let Reply::Page { req_id: q, entries, .. } = x { (*q == req_id).then_some(entries.len()) } else { None }).collect()
+}
+
+/// [`rows`] on a page the test keeps from settling ([`run_unsettled`]).
+fn rows_unsettled(io: &mut PageIo, node: &mut WireNode, now: &mut u64, req_id: u64) -> Vec<usize> {
+    let range = Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
+    let r = client_unsettled(io, node, now, &range);
     r.iter().filter_map(|x| if let Reply::Page { req_id: q, entries, .. } = x { (*q == req_id).then_some(entries.len()) } else { None }).collect()
 }
 
@@ -1036,11 +1089,11 @@ fn the_own_page_and_a_reader_read_the_same_tree_identically_intact_and_corrupted
         }
     }
     let mut own = page_io(&node);
-    client(&mut own, &mut node, &mut now, &Request::Identity);
-    let mine = answers_to(&client(&mut own, &mut node, &mut now, &range(22)), 22);
+    client_unsettled(&mut own, &mut node, &mut now, &Request::Identity);
+    let mine = answers_to(&client_unsettled(&mut own, &mut node, &mut now, &range(22)), 22);
     let mut v = reader(&node);
-    client(&mut v, &mut node, &mut now, &Request::Identity);
-    let theirs = answers_to(&client(&mut v, &mut node, &mut now, &range(22)), 22);
+    client_unsettled(&mut v, &mut node, &mut now, &Request::Identity);
+    let theirs = answers_to(&client_unsettled(&mut v, &mut node, &mut now, &range(22)), 22);
     // REFUSED, not an empty page: a block that does not hash to its id is
     // not the block, so nothing is read from it -- never "no rows". And the
     // read does not END on it either (rule 7): the block is asked for again
@@ -1713,7 +1766,7 @@ fn a_claim_before_an_answer_or_on_a_silent_signer_claims_nothing() {
     assert!(!io.claim(container.clone()), "a page claimed its tree before the signer said whose node it is");
     let mut now = 1_000;
     node.drop_signer_answers = usize::MAX;
-    settle(&mut io, &mut node, &mut now);
+    run_unsettled(&mut io, &mut node, &mut now);
     // RULE 8: silence is not an answer and ends nothing. The ask stays
     // unanswered, the page says what it waits on, and nothing is claimed.
     assert_eq!(io.asked(), None, "a silent signer was taken as an answer: {:?}", io.asked());
@@ -1769,7 +1822,7 @@ fn may_write_is_one_decision_read_from_the_signers_answer() {
     let mut node = WireNode::new(&[43u8; 32]);
     node.drop_signer_answers = usize::MAX;
     let mut io = asker();
-    settle(&mut io, &mut node, &mut now);
+    run_unsettled(&mut io, &mut node, &mut now);
     assert!(undecided(io.may_write(None)) && undecided(io.may_write(Some(node.register_id))), "{:?}", io.asked());
 
     // Refused by the node: the own tree not known; a named head no.
@@ -2068,8 +2121,8 @@ fn a_view_never_adopts_a_head_below_its_published_seq() {
     let mut v = reader(&node);
     v.server.page.set_head_floor(2);
     let t0 = now;
-    client(&mut v, &mut node, &mut now, &Request::Identity);
-    let early = rows(&mut v, &mut node, &mut now, 91);
+    client_unsettled(&mut v, &mut node, &mut now, &Request::Identity);
+    let early = rows_unsettled(&mut v, &mut node, &mut now, 91);
     println!("stale phase lasted {} s of page time", (now - t0) / 1000);
     let asked = node.served.get("get register").copied().unwrap_or(0);
     let wait = v.server.page.head_floor_wait();
@@ -2129,7 +2182,7 @@ fn published_seq_is_the_acknowledged_head_never_one_in_flight() {
     // The register's reads fail: the second commit is signed and UPDATEd, and
     // its read-back never shows it.
     node.fail_register_gets = usize::MAX;
-    let r = client(&mut a, &mut node, &mut now, &write(2, "second", "v"));
+    let r = client_unsettled(&mut a, &mut node, &mut now, &write(2, "second", "v"));
     assert!(!states(&r, 2).contains(&WriteState::Published), "THE CONTROL: the second commit was acknowledged anyway");
     assert_eq!(node.head().map(|(s, _)| s), Some(2), "THE CONTROL: the second commit's head is not on the node");
     assert_eq!(a.published_seq(), 1, "the publisher's seq moved to a commit the network has not acknowledged");
@@ -2139,7 +2192,7 @@ fn published_seq_is_the_acknowledged_head_never_one_in_flight() {
         if st.contains(&WriteState::Published) { break; }
         now += 1_000;
         a.tick(Ms(now));
-        st.extend(states(&settle(&mut a, &mut node, &mut now), 2));
+        st.extend(states(&run_unsettled(&mut a, &mut node, &mut now), 2));
     }
     assert!(st.contains(&WriteState::Published), "the second commit never published: {:?}", a.unusable());
     assert_eq!(a.published_seq(), 2, "the acknowledged seq did not move with the read-back");
