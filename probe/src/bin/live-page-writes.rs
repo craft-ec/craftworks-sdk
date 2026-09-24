@@ -127,7 +127,7 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
                     held.push(b.to_vec());
                     match wire::unframe(&mut seen, &b) {
                         wire::Incoming::Partial => continue,
-                        wire::Incoming::Got { id, .. } | wire::Incoming::GetFailed { id } if *drop_heads > 0 && id == io.register_id() => {
+                        wire::Incoming::Got { id, .. } | wire::Incoming::GetFailed { id, .. } if *drop_heads > 0 && id == io.register_id() => {
                             *drop_heads -= 1;
                             held.clear();
                         }
