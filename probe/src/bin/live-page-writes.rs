@@ -24,7 +24,61 @@ use protocol::{Reply, Request};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
-const PER_WRITE: usize = 10;
+const PER_WRITE_DEFAULT: usize = 10;
+
+/// OPLOG=1 (scratch, the op count for the node's one queue, F61): every frame out and every message in, one line
+/// each, `OP <ms> out|in <what>`, the ms on the page clock. Frames are decoded by stdlib's own request types and the
+/// signer's own `decode_request`; inbound by page-io's decoder (`wire::unframe`).
+fn oplog() -> bool {
+    std::env::var("OPLOG").is_ok_and(|v| v == "1")
+}
+
+static CODES: std::sync::OnceLock<(freenet_stdlib::prelude::CodeHash, freenet_stdlib::prelude::CodeHash)> = std::sync::OnceLock::new();
+/// The Block and Register code hashes, set once per process (every run uses the same two codes).
+fn codes() -> &'static (freenet_stdlib::prelude::CodeHash, freenet_stdlib::prelude::CodeHash) {
+    CODES.get().expect("codes set")
+}
+
+fn describe_out(f: &[u8], block_code: &freenet_stdlib::prelude::CodeHash, register_code: &freenet_stdlib::prelude::CodeHash) -> String {
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest, DelegateRequest};
+    use freenet_stdlib::prelude::*;
+    match bincode::deserialize::<ClientRequest>(f) {
+        Ok(ClientRequest::ContractOp(ContractRequest::Put { contract, subscribe, .. })) => {
+            let h = contract.key().code_hash().clone();
+            let kind = if &h == block_code { "block" } else if &h == register_code { "REGISTER" } else { "other" };
+            format!("PUT {kind}{}", if subscribe { " +subscribe" } else { "" })
+        }
+        Ok(ClientRequest::ContractOp(ContractRequest::Update { .. })) => "UPDATE (register)".into(),
+        Ok(ClientRequest::ContractOp(ContractRequest::Get { subscribe, .. })) => format!("GET{}", if subscribe { " +subscribe" } else { "" }),
+        Ok(ClientRequest::ContractOp(ContractRequest::Subscribe { .. })) => "SUBSCRIBE".into(),
+        Ok(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. })) => {
+            let kinds: Vec<String> = inbound
+                .iter()
+                .map(|m| match m {
+                    InboundDelegateMsg::ApplicationMessage(am) => match signer::decode_request(am.payload.as_ref()) {
+                        Some((id, r)) => format!("signer#{id} {}", format!("{r:?}").split([' ', '{', '(']).next().unwrap_or("?")),
+                        None => "undecodable signer message".into(),
+                    },
+                    other => format!("{other:?}").split([' ', '{', '(']).next().unwrap_or("?").to_string(),
+                })
+                .collect();
+            format!("DELEGATE {}", kinds.join(", "))
+        }
+        Ok(ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { .. })) => "DELEGATE register".into(),
+        Ok(other) => format!("{other:?}").split([' ', '{', '(']).next().unwrap_or("?").to_string(),
+        Err(_) => "chunk/undecodable (StreamChunk)".into(),
+    }
+}
+
+fn describe_in(i: &wire::Incoming) -> String {
+    match i {
+        wire::Incoming::EngineBytes(m) => {
+            let kinds: Vec<String> = m.iter().map(|b| wire::signer::read_answer(b).map_or("?".into(), |(id, a)| format!("signer#{id} {}", format!("{a:?}").split([' ', '{', '(']).next().unwrap_or("?")))).collect();
+            format!("signer answer {}", kinds.join(", "))
+        }
+        other => format!("{other:?}").chars().take(60).collect(),
+    }
+}
 const SESSION: u64 = 11;
 
 fn now_ms(t0: Instant) -> u64 {
@@ -77,6 +131,10 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
     getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
     seed[0] ^= run as u8;
     let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let _ = CODES.set((
+        freenet_stdlib::prelude::CodeHash::from_code(block_code),
+        freenet_stdlib::prelude::CodeHash::from_code(register_code),
+    ));
     let (container, signer) = wire::delegate_from_code(signer_wasm);
     let mut io = PageIo::new(
         Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
@@ -108,6 +166,9 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
         let mut held: Vec<Vec<u8>> = Vec::new();
         loop {
             for f in io.take_frames() {
+                if oplog() {
+                    println!("OP {} out {}", now_ms(t0), describe_out(&f, &codes().0, &codes().1));
+                }
                 sock.send(Message::Binary(f.into())).await.context("send")?;
             }
             for r in io.take_replies() {
@@ -125,7 +186,11 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
                     // The LOST-HEAD-READ case (sdk#175): a whole answer to the
                     // head Register's GET is discarded, as a lost read's.
                     held.push(b.to_vec());
-                    match wire::unframe(&mut seen, &b) {
+                    let inc = wire::unframe(&mut seen, &b);
+                    if oplog() && !matches!(inc, wire::Incoming::Partial) {
+                        println!("OP {} in {}", now_ms(t0), describe_in(&inc));
+                    }
+                    match inc {
                         wire::Incoming::Partial => continue,
                         wire::Incoming::Got { id, .. } | wire::Incoming::GetFailed { id, .. } if *drop_heads > 0 && id == io.register_id() => {
                             *drop_heads -= 1;
@@ -152,10 +217,22 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
     drive(&mut sock, &mut io, t0, Duration::from_secs(60), &mut 0, |r, _| r.iter().any(|x| matches!(x, Reply::Identity { .. }))).await.context("identity")?;
 
     let mut write_ms = Vec::new();
-    for (w, chunk) in (0..n).collect::<Vec<_>>().chunks(PER_WRITE).enumerate() {
+    let per_write: usize = std::env::var("PER_WRITE").ok().and_then(|v| v.parse().ok()).unwrap_or(PER_WRITE_DEFAULT);
+    // PREFILL=<rows>: one write of that many rows first (a realistic tree), then `per_write`-row writes.
+    let prefill: usize = std::env::var("PREFILL").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(n);
+    let all: Vec<usize> = (0..n).collect();
+    let mut chunks: Vec<&[usize]> = Vec::new();
+    if prefill > 0 {
+        chunks.push(&all[..prefill]);
+    }
+    chunks.extend(all[prefill..].chunks(per_write));
+    for (w, chunk) in chunks.into_iter().enumerate() {
         let id = w as u64 + 1;
         let ops = chunk.iter().map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), format!("value {i} of run {run}").into_bytes())).collect();
         let t = Instant::now();
+        if oplog() {
+            println!("OP {} WRITE {id} sent ({} row(s))", now_ms(t0), chunk.len());
+        }
         // A write that does not read what it changes is sent FORCED
         // (sdk#283): a reads-less `Request::Write` is refused `Unread`.
         io.client(&protocol::encode_session_request(4, SESSION, &Request::forced_write(id, ops)).expect("encodes"));
@@ -168,6 +245,12 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
             bail!("{why}");
         }
         write_ms.push(t.elapsed().as_millis());
+        if oplog() {
+            println!("OP {} WRITE {id} PUBLISHED", now_ms(t0));
+            // What follows Published (parity, read-backs, re-reads) before the next write: 2 s of the page's own traffic.
+            let _ = drive(&mut sock, &mut io, t0, Duration::from_secs(2), &mut 0, |_, _| false).await;
+            println!("OP {} WRITE {id} quiet window ends", now_ms(t0));
+        }
     }
 
     // READ BACK: the whole range, through the same page.
