@@ -38,9 +38,10 @@ fn a_page_opened_on_no_head_knows_the_empty_tree_in_full() {
 #[test]
 fn a_page_opened_on_a_marked_head_says_done_and_a_v1_parity_field_is_not_the_mark() {
     let root = [9u8; 32];
-    let marked: Vec<u8> = root.iter().copied().chain(page::sign_ledger(6, [8; 32], root, &[])).collect();
+    let signer = Page::new(Params::default(), PutPath::Page);
+    let marked: Vec<u8> = root.iter().copied().chain(signer.sign_ledger_of(6, [8; 32], 7, root)).collect();
     let head = page::HeadRead::from_value(7, &marked).expect("a head");
-    assert!(head.parity_marked(), "this build's signed head carries no §P mark");
+    assert!(head.mark().is_some(), "this build's signed head carries no §P mark");
     let mut p = Page::new(Params::default(), PutPath::Page);
     let _ = p.take_ops();
     p.answer(Answer::Head { label: page::Label::Head, read: Some(head) }, Ms(1));
@@ -53,7 +54,7 @@ fn a_page_opened_on_a_marked_head_says_done_and_a_v1_parity_field_is_not_the_mar
     let mut v1 = root.to_vec();
     v1.extend_from_slice(&[LEDGER_VERSION_V1, TAG_PARITY, 0, 0]);
     let old = page::HeadRead::from_value(7, &v1).expect("a head");
-    assert!(!old.parity_marked(), "a v1 parity field was read as the §P mark");
+    assert!(old.mark().is_none(), "a v1 parity field was read as the §P mark");
     let mut q = Page::new(Params::default(), PutPath::Page);
     let _ = q.take_ops();
     q.answer(Answer::Head { label: page::Label::Head, read: Some(old) }, Ms(1));
@@ -67,7 +68,8 @@ fn a_page_opened_on_a_marked_head_says_done_and_a_v1_parity_field_is_not_the_mar
 fn the_mark_lists_the_roots_parity_and_reads_it_back() {
     let root = [9u8; 32];
     let ids: Vec<[u8; 32]> = (1..=engine::PARITY as u8).map(|i| [i; 32]).collect();
-    let v: Vec<u8> = root.iter().copied().chain(page::sign_ledger(6, [8; 32], root, &ids)).collect();
+    use signer_proto::head::{value, Ledger};
+    let v = value(&root, &Ledger { parity: Some(ids.concat()), ..Ledger::default() });
     let head = page::HeadRead::from_value(7, &v).expect("a head");
     assert_eq!(head.mark(), Some(ids), "the root's parity did not round-trip through the head");
     use signer_proto::head::{LEDGER_VERSION, TAG_PARITY};

@@ -67,15 +67,16 @@ fn the_old_exact_root_reader_is_what_breaks_once() {
     assert_eq!(head_of(&ledgered(2, [4; 32])), Some((2, [4; 32])));
 }
 
-/// `sign_ledger`: PREV from the prev, omitted at the genesis; every head
-/// carries race put's §P mark (COMMIT-LIFE §P), the genesis too.
+/// `Page::sign_ledger_of`: PREV from the prev, omitted at the genesis; every
+/// head carries race put's §P mark (COMMIT-LIFE §P), the genesis too.
 #[test]
 fn a_sign_carries_its_prev_and_the_genesis_carries_none() {
-    let g = page::sign_ledger(0, [0; 32], [5; 32], &[]);
+    let p = page::Page::new(engine::Params::default(), page::PutPath::Page);
+    let g = p.sign_ledger_of(0, [0; 32], 1, [5; 32]);
     let gh = page::HeadRead::from_value(1, &[[5u8; 32].as_slice(), &g].concat()).expect("a head");
     assert_eq!(gh.prev(), None, "the genesis carries a PREV");
-    assert!(gh.parity_marked(), "the genesis head carries no §P mark");
-    let l = page::sign_ledger(3, [8; 32], [5; 32], &[]);
+    assert!(gh.mark().is_some(), "the genesis head carries no §P mark");
+    let l = p.sign_ledger_of(3, [8; 32], 4, [5; 32]);
     let h = page::HeadRead::from_value(4, &[[5u8; 32].as_slice(), &l].concat()).expect("a head");
     assert_eq!(h.prev(), Some((3, [8; 32])));
 }

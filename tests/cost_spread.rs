@@ -21,7 +21,10 @@
 //!   kind — different keys, different ranges. That is the variation a ratchet
 //!   actually meets, because the next PR's run is not a replay of this one.
 
-use craftworks_sdk::expected::{expected, Op, DEFAULT_BATCH};
+use craftworks_sdk::expected::{expected, Op};
+
+/// Blocks fetched per round trip: a property of the transport, not the tree.
+const BATCH: u64 = 16;
 use protocol::Request;
 use std::ops::Bound;
 use testkit::page_node::Served;
@@ -153,7 +156,7 @@ fn a_warm_read_costs_the_node_nothing_and_a_commit_costs_its_named_mix() {
                 Op::Scan {
                     lo: Bound::Included(&lo),
                     hi: Bound::Included(&hi),
-                    batch: DEFAULT_BATCH,
+                    batch: BATCH,
                 },
             )
             .blocks,

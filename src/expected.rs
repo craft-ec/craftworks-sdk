@@ -53,7 +53,7 @@
 //! is the one that pays for it.
 
 use freenet_prolly::diff::diff;
-use freenet_prolly::node::{Value, HEADER, MAX_NODE};
+use freenet_prolly::node::{Value, MAX_NODE};
 use freenet_prolly::proof::prove;
 use freenet_prolly::range::{range, Range};
 use freenet_prolly::read::get;
@@ -69,23 +69,6 @@ use std::ops::Bound;
 /// charging it to every write overstated a commit by three orders of magnitude
 /// (F38).
 pub const HEAD_UPDATE: u64 = 112;
-
-/// Bytes of one parity id, as the node format stores them.
-const REF_LEN: u64 = 32;
-
-/// Nodes one insert rewrites, 99th percentile, at the height it was measured.
-///
-/// **A point in a parameter space, not a constant**: measured at 20k entries,
-/// height 3 (§5, 2000 trials). [`write_estimate`] takes the height so the
-/// figure is never silently reused at another shape.
-pub const WRITE_TAIL_P99_AT_HEIGHT_3: u64 = 11;
-const MEASURED_AT_HEIGHT: u64 = 3;
-
-/// How many blocks a caller fetches per round trip.
-///
-/// A property of the TRANSPORT, not of the tree, which is why it is a parameter
-/// and not a constant derived here. This is only the default.
-pub const DEFAULT_BATCH: u64 = 16;
 
 /// How much of an expectation was read, and how much was taken on trust.
 ///
@@ -141,18 +124,6 @@ impl Expected {
             blocks: self.blocks + o.blocks,
             rounds: self.rounds + o.rounds,
             basis: self.basis.max(o.basis),
-        }
-    }
-
-    /// How a ratio against this expectation should be READ OUT.
-    ///
-    /// "at least 8.0x" when the denominator was rounded up, because the real
-    /// ratio can then only be larger.
-    pub fn phrase(self, ratio: f64) -> String {
-        match self.basis {
-            Basis::Exact => format!("{ratio:.1}x"),
-            Basis::Claimed => format!("{ratio:.1}x (on the tree's own word)"),
-            Basis::AtMost => format!("at least {ratio:.1}x"),
         }
     }
 }
@@ -211,35 +182,6 @@ impl<B: Blocks> Blocks for Watch<'_, B> {
         self.seen.borrow_mut().insert(*cid, b.len());
         Some(b)
     }
-}
-
-/// The largest a node can encode to, given what a PARENT says about it.
-///
-/// Four corrections, each of which makes a naive `child_agg.bytes` wrong in a
-/// direction that matters:
-///
-/// - The aggregate is the fold of its ENTRIES. **Parity ids sit outside it**
-///   (`entries_end = len - pcount * REF_LEN`), so up to 4 KiB per node that a
-///   reader really transfers is missing from it. Omitting that understates the
-///   expectation, which OVERSTATES the ratio — the one direction this whole
-///   design exists to avoid. It is added here as `pcount * REF_LEN`.
-/// - It omits the 28-byte header and the 6 bytes of index per entry.
-/// - It counts every entry's key in FULL, though prefix compression stores the
-///   shared prefix once — so it also overstates, in the other direction.
-/// - It counts a `Ref` at its REFERENCED length, which can be 256 KiB where the
-///   node stores 32 bytes.
-///
-/// Because those pull both ways, `child_agg.bytes` is neither the encoded size
-/// nor a bound in either direction. This returns a genuine upper bound, capped
-/// at [`MAX_NODE`] — a cap the format guarantees
-/// (`MAX_LOGICAL + 4096 <= MAX_NODE`).
-///
-/// An expectation using this is [`Basis::Claimed`] at best: it rests on the
-/// parent's word.
-pub fn node_bytes_bound(count: u64, logical: u64, pcount: u64) -> u64 {
-    let index_and_fixed = count * (6 + 7);
-    let parity = pcount * REF_LEN;
-    (HEADER as u64 + index_and_fixed + logical + parity).min(MAX_NODE as u64)
 }
 
 fn ceil_div(n: u64, d: u64) -> u64 {
@@ -377,31 +319,5 @@ pub fn commit(emitted: &[(Cid, usize)], parity: &[(Cid, Vec<u8>)]) -> Expected {
         // Data nodes, then the head, then parity (§7).
         rounds: 3,
         basis: Basis::Exact,
-    }
-}
-
-/// What a write that has NOT happened yet should cost.
-///
-/// Separate from [`expected`] on purpose: a commit that exists is derived
-/// exactly, and only a write still to come needs the distribution. The p99 is
-/// used rather than the mean, because the mean would make a legitimate p99
-/// write report 3x waste — and this must never cry wolf. Always
-/// [`Basis::AtMost`]: it is a bound, not a reading.
-///
-/// The measured figure is a point in a parameter space. Away from the height it
-/// was measured at, the tail is scaled by height rather than reused, and the
-/// basis keeps saying `AtMost`.
-///
-/// For a RUN of writes, compare DISTRIBUTIONS rather than points: observed
-/// p50/p99 against expected p50/p99 is both more sensitive and less prone to
-/// false alarms than any single-write rule.
-pub fn write_estimate(height: u64) -> Expected {
-    let scaled = WRITE_TAIL_P99_AT_HEIGHT_3 * height.max(1) / MEASURED_AT_HEIGHT;
-    let nodes = scaled.max(height);
-    Expected {
-        bytes: nodes * MAX_NODE as u64 + HEAD_UPDATE,
-        blocks: nodes + 1,
-        rounds: 3,
-        basis: Basis::AtMost,
     }
 }

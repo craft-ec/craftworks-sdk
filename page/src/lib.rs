@@ -460,13 +460,6 @@ impl HeadRead {
         signer_proto::head::read_value(&self.value).filter(|h| !h.refused).map(|h| h.ledger.through).unwrap_or_default()
     }
 
-    /// Does it carry race put's §P mark (a `TAG_PARITY` in a v2 ledger):
-    /// every group it lists was recoverable when it was signed? A head without
-    /// it is pre-§P, or its ledger was refused: `false`.
-    pub fn parity_marked(&self) -> bool {
-        self.mark().is_some()
-    }
-
     /// Its §P mark and the ROOT's parity ids the mark lists (sdk#335): `None`
     /// unmarked; `Some(ids)`, ids empty when the mark lists none (or not as
     /// whole ids -- then the root is fetched singly, never rebuilt from a
@@ -490,16 +483,6 @@ impl From<(u64, Cid)> for HeadRead {
     fn from((seq, root): (u64, Cid)) -> HeadRead {
         HeadRead { seq, value: root.to_vec() }
     }
-}
-
-/// The ledger a head signed from `prev` carries: its PREV, omitted at the
-/// genesis (`prev_seq == 0`), never zeros, and the §P mark listing the root's
-/// parity ids. The bytes after the root in `signer_proto::Next`'s value; the
-/// one rule for every sign request.
-pub fn sign_ledger(prev_seq: u64, prev_root: Cid, root: Cid, root_parity: &[Cid]) -> Vec<u8> {
-    use signer_proto::head::{value, Ledger};
-    let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
-    value(&root, &Ledger { prev, parity: Some(mark(root_parity)), ..Ledger::default() })[32..].to_vec()
 }
 
 /// The §P mark's bytes: every head this build signs is race put's
@@ -1761,14 +1744,6 @@ impl Page {
     /// what a merge reads a winner's `prev` from (sdk#225b).
     pub fn last_read(&self) -> Option<&HeadRead> {
         self.last_head.as_ref()
-    }
-
-    /// The signer answering this page predates sdk#225's rule (a stale
-    /// bundle: in page mode the signer's code ships with the page), and it
-    /// refuses every sign until the register moves on. The host asks for the
-    /// current version rather than letting the page sit.
-    pub fn needs_signer_upgrade(&self) -> bool {
-        self.old_signer_fork_at.is_some()
     }
 
     /// Has the engine recovered its head (its own head read answered)? A read

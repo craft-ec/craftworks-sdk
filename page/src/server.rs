@@ -98,13 +98,10 @@ pub struct Server {
     /// Published of ours at the new head) from a commit of ours.
     seen_head: (u64, freenet_prolly::Cid),
     /// How many heads this page has ADOPTED — moved, and NOT by a commit of
-    /// this page's (sdk#266) — the one statement of that fact. Its readers
-    /// keep their own cursors: the client ([`Server::take_adopted`]) to know
-    /// its loaded ranges are behind, the page's store to supersede reads
-    /// pinned to an older root (#330 ruling).
+    /// this page's (sdk#266) — the one statement of that fact. Its reader
+    /// keeps its own cursor: the page's store, to supersede reads pinned to
+    /// an older root (#330 ruling).
     adoptions: u64,
-    /// Where the client's `take_adopted` last read `adoptions`.
-    adoptions_taken: u64,
     /// Readers' fetches that ENDED, in order: each a ticket a walk is parked
     /// on (READ-STATE). Drained by [`Server::take_fetched`].
     fetched: Vec<(u64, Fetched)>,
@@ -276,7 +273,6 @@ impl Server {
             tip: None,
             seen_head: (0, [0; 32]),
             adoptions: 0,
-            adoptions_taken: 0,
             fetched: Vec::new(),
             probe: None,
             next_probe: 1,
@@ -717,14 +713,6 @@ impl Server {
     /// Readers' fetches that ended since the last call, in order. Drains.
     pub fn take_fetched(&mut self) -> Vec<(u64, Fetched)> {
         std::mem::take(&mut self.fetched)
-    }
-
-    /// Has this page ADOPTED a head that was not its own commit since the
-    /// last call (sdk#266)? Drains.
-    pub fn take_adopted(&mut self) -> bool {
-        let moved = self.adoptions > self.adoptions_taken;
-        self.adoptions_taken = self.adoptions;
-        moved
     }
 
     /// One of the Server's own reads answered: a probe's `Get`, or a page of
