@@ -921,12 +921,21 @@ impl Page {
             // One register read can answer both a recovery read and a
             // read-back: a head is a head, whoever asked.
             Answer::Head(read) => {
-                // Below the published-head floor: not yet. Adopted by nothing
-                // and ending no wait -- the head is asked again on its RTO.
+                // Below the published-head floor: not yet. A REAL answer (the
+                // node is answering, with a copy from before the publish), so
+                // it ends each head read it answers -- and adopts nothing:
+                // each is PARKED at the one backoff and asked again (a GET with
+                // subscribe), as a GET answered without its block is.
                 if self.head_floor > 0 && read.as_ref().is_none_or(|r| r.seq < self.head_floor) {
                     let seen = read.as_ref().map(|r| r.seq);
                     let n = self.below_floor.map_or(0, |(_, n)| n);
                     self.below_floor = Some((seen, n + 1));
+                    let reads = [Waiting::Warm, Waiting::RecoverHead, Waiting::ReadBack, Waiting::Verify, Waiting::Hint];
+                    for w in reads {
+                        let Some(attempt) = self.deadlines.get(&w).filter(|d| d.sent).map(|d| d.attempt) else { continue };
+                        self.answered(&w);
+                        self.park(w, Op::ReadHead, attempt);
+                    }
                     return;
                 }
                 self.last_head_at = self.now;
@@ -1407,9 +1416,18 @@ impl Page {
     /// the same backoff a silent one would be (rule 7: retry until answered),
     /// never at the speed of the answers.
     fn park_get(&mut self, id: Cid, attempt: u32) {
+        self.park(Waiting::Get(id), Op::Get { id }, attempt);
+    }
+
+    /// The node ANSWERED `w`, but not with what it waits for (a GET without
+    /// its block; a head below the published-head floor, sdk#349): it stays
+    /// pending on its own deadline, sent again at the one backoff. PARKED --
+    /// not on the wire, so coming due is no timeout: the RTO does not back
+    /// off and the window does not halve, because the node IS answering.
+    fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
         let at = self.now + self.backoff(attempt);
-        self.attempt_of.insert(Waiting::Get(id), attempt);
-        self.deadlines.insert(Waiting::Get(id), Deadline { at, op: Op::Get { id }, sent_at: self.now, attempt, sent: false });
+        self.attempt_of.insert(w.clone(), attempt);
+        self.deadlines.insert(w, Deadline { at, op, sent_at: self.now, attempt, sent: false });
     }
 
     /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
@@ -2387,5 +2405,41 @@ mod window_loss {
         assert_eq!(node.over_window, 0, "GETs on the wire exceeded the window by {}", node.over_window);
         assert_eq!(read, 200, "not every block was read after the node came back");
         assert!(p.window.size() >= rto::WINDOW_FLOOR as usize);
+    }
+}
+
+#[cfg(test)]
+mod head_floor {
+    use super::*;
+
+    /// A HEAD BELOW THE PUBLISHED-HEAD FLOOR IS AN ANSWER, NOT SILENCE (the
+    /// architect on sdk#354): it ends the head read it answers and adopts
+    /// nothing -- the read is PARKED at the one backoff, as a GET answered
+    /// without its block is. So coming due is no timeout: the RTO does not
+    /// back off and the window does not halve, and the head is asked again.
+    /// A later answer at the floor is adopted. Mutant "drop the answer before
+    /// it ends the read" -> red: the read times out as silence.
+    #[test]
+    fn a_head_below_the_floor_parks_the_read_and_a_later_one_at_it_is_adopted() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.set_head_floor(2);
+        assert!(p.take_ops().contains(&Op::ReadHead), "THE CONTROL: the page did not read its head");
+        let sent = p.deadlines.get(&Waiting::RecoverHead).map(|d| d.sent);
+        assert_eq!(sent, Some(true), "THE CONTROL: the head read is not on the wire");
+
+        p.answer(Answer::Head(Some(HeadRead::from((1, [1u8; 32])))), Ms(10));
+        let parked = p.deadlines.get(&Waiting::RecoverHead).map(|d| (d.sent, d.at));
+        let (sent, due) = parked.expect("a head below the floor dropped the head read instead of parking it");
+        assert!(!sent, "a head below the floor left the read on the wire, to time out as silence");
+        assert!(!p.recovered(), "a head below the floor was adopted");
+        let (rto, window) = (p.rto.rto_ms(), p.window.size());
+        p.tick(Ms(due));
+        assert_eq!((p.rto.rto_ms(), p.window.size()), (rto, window), "the parked head read coming due was counted as a timeout");
+        assert!(p.take_ops().contains(&Op::ReadHead), "the parked head read was not asked again");
+        assert_eq!(p.head_floor_wait(), Some((2, Some(1), 1)));
+
+        p.answer(Answer::Head(Some(HeadRead::from((2, [2u8; 32])))), Ms(due + 10));
+        assert!(p.recovered(), "a head at the floor was not adopted");
+        assert_eq!(p.head_floor_wait(), None);
     }
 }
