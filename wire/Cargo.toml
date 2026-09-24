@@ -19,8 +19,11 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d6
 blake3 = "1"
 # The signer's wire types (serde only): `wire::signer` frames them.
 signer-proto = { path = "../signer-proto" }
+# The Register crate as a LIBRARY (sdk#364): its MAGIC, for the one params writer.
+craftec-register-contract = { workspace = true }
 
 [dev-dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 core-types = { path = "../core-types" }
 # THE ORACLE for `webapp::params` and the framing (builder#104): the webapp
 # contract's own check, at its released rev (epoch 2). Our params agreeing

@@ -63,6 +63,15 @@ ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std
 [workspace]
 members = ["contract-keys", "core-types", "engine", "page", "page-io", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
 
+# THE REGISTER CRATE, pinned ONCE (sdk#364): the Register's own read/parse/verify/encode, the code every node
+# validates with -- every RG01 read in this workspace goes through it. `default-features = false` + `library` is the
+# LIBRARY: it links no freenet-stdlib (freenet-contracts#53), so the sans-IO crates may use it, and `library` adds
+# `wire::record_head`, the params-free read (freenet-contracts#55), compiled out of the contract. A member that
+# needs the CONTRACT (a test driving the real merge) adds `features = ["freenet-main-contract"]`, in a test-only
+# place (signer-proto/tests/rg01_one_home.rs checks both).
+[workspace.dependencies]
+craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "0fbb5c7", default-features = false, features = ["library"] }
+
 [profile.release]
 opt-level = "s"
 lto = true

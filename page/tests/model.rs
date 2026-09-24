@@ -171,7 +171,7 @@ fn seq_of(node: &Node) -> u64 {
 }
 
 fn head_of(state: &[u8]) -> (u64, Cid) {
-    let (seq, v) = contract_keys::register::record_of(state).expect("a register record");
+    let (seq, v) = signer_proto::head::record_of(state).expect("a register record");
     (seq, v[..32].try_into().expect("32"))
 }
 
