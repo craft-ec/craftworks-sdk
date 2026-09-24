@@ -207,7 +207,7 @@ fn drive(e: &mut engine::Engine<Store>, first: Vec<Effect>) -> Vec<Effect> {
         guard += 1;
         assert!(guard < 100_000, "the engine did not settle");
         let ev = match f {
-            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } | Effect::PutParity { id, .. } => Event::PutConfirmed(id),
+            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => Event::PutConfirmed(id),
             Effect::UpdateHead { seq, .. } => Event::HeadConfirmed(seq),
             _ => continue,
         };

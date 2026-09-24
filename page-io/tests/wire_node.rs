@@ -640,7 +640,11 @@ fn a_write_to_a_reader_reaches_nothing_and_never_publishes() {
         assert_eq!(node.served.get(k), before.get(k), "a reader's write made the node serve a {k}");
     }
     assert_eq!(node.head(), head, "a reader's write moved the publisher's head");
-    // And provisioning a reader is refused, not sent.
+    // And provisioning a reader is refused, not sent. Frames already queued
+    // (a block GET the write's apply asked for -- a READ, which a reader may
+    // make) are drained first, so what is checked is exactly what the
+    // provisioning call framed.
+    let _ = v.take_frames();
     let (container, _) = wire::delegate_from_code(SIGNER_CODE);
     // What was already queued is the view's own READS (nothing it may not
     // send); what `provision` adds is what this asks about.

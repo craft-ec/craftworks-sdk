@@ -22,7 +22,11 @@
 //! INVARIANTS, checked on every step:
 //! 1. `Published` only while the node's register holds the page's (seq, root).
 //! 2. Every UPDATE carries bytes the signer returned.
-//! 3. A published root is WHOLE on the node (every block it reaches is held).
+//! 3. A published root is RECOVERABLE on the node: a reader that repairs
+//!    (#300) reads every block it reaches, because race put signs a head
+//!    when every changed group has k of its k+3 (COMMIT-LIFE §P: SAVED).
+//!    And (3b) at a write's `ParityComplete` (BACKED_UP), the root it was
+//!    published at is WHOLE on the node: every block held, no repair needed.
 //! 4. Once the faults stop, every write is published, and the final tree
 //!    holds every key both pages wrote.
 
@@ -294,6 +298,71 @@ impl Node {
             }
             after = page.next.clone();
         }
+    }
+}
+
+/// The node's blocks, plus blocks REBUILT from their sibling groups (#300):
+/// what a reader that repairs can read. Race put signs a head when every
+/// changed group is RECOVERABLE (k of k+3), not when every block is held
+/// (COMMIT-LIFE §P), so a published tree may be readable only this way until
+/// its stragglers land.
+struct Repairing<'a> {
+    node: &'a Node,
+    rebuilt: BTreeMap<Cid, Vec<u8>>,
+}
+
+impl Blocks for Repairing<'_> {
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        self.node.blocks.get(cid).or_else(|| self.rebuilt.get(cid)).map(Vec::as_slice)
+    }
+}
+
+impl Node {
+    /// Every entry of the tree at `root` as a REPAIRING reader reads it, or
+    /// why not: the first block no group could rebuild.
+    fn tree_repairing(&self, root: &Cid) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
+        use freenet_prolly::range::{range, Range};
+        use freenet_prolly::node::Value;
+        use std::ops::Bound;
+        let mut r = Repairing { node: self, rebuilt: BTreeMap::new() };
+        for _ in 0..10_000 {
+            let mut missing: Vec<Cid> = Vec::new();
+            let mut out = BTreeMap::new();
+            let mut after = None;
+            loop {
+                let q = Range { lo: Bound::Unbounded, hi: Bound::Unbounded, reverse: false, after: after.clone(), max_entries: 4096, max_bytes: usize::MAX };
+                let page = range(&r, root, &q).map_err(|e| format!("range: {e:?}"))?;
+                if !page.need.is_empty() {
+                    missing.extend(page.need.iter().copied());
+                    break;
+                }
+                for (k, v) in &page.entries {
+                    match v {
+                        Value::Ref { cid, .. } if r.get(cid).is_none() => missing.push(*cid),
+                        _ => {
+                            if let Ok(b) = freenet_prolly::range::read_value(&r, *v) {
+                                out.insert(k.clone(), b.to_vec());
+                            }
+                        }
+                    }
+                }
+                if page.finished() {
+                    break;
+                }
+                after = page.next.clone();
+            }
+            if missing.is_empty() {
+                return Ok(out);
+            }
+            for id in missing {
+                let g = engine::repair::find_group(&r, *root, id).ok_or_else(|| format!("block {:?} is in no held group", &id[..4]))?;
+                let have: Vec<Option<Vec<u8>>> = g.slots.iter().enumerate().map(|(i, s)| r.get(s).filter(|b| g.fits(i, b)).map(|b| g.stored(i, b))).collect();
+                let held = have.iter().filter(|h| h.is_some()).count();
+                let body = engine::repair::rebuild(&g, &have).map_err(|e| format!("block {:?} not rebuildable: {held} of k={} held: {e}", &id[..4], g.k))?;
+                r.rebuilt.insert(id, body);
+            }
+        }
+        Err("the repairing walk did not finish".into())
     }
 }
 
@@ -689,14 +758,17 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                     ));
                 }
                 if let Some((k, v)) = a.inflight.get(&wid.0) {
-                    let tree = node.tree(&root).unwrap_or_default();
-                    if tree.get(k) != Some(v) {
-                        return Err(format!("page {i}: write {} Published at ({seq}, ..) whose tree does not hold its value", wid.0));
+                    // As a REPAIRING reader reads it (§P: SAVED is k of
+                    // k+3 per group; its stragglers may still be in flight).
+                    match node.tree_repairing(&root) {
+                        Ok(t) if t.get(k) == Some(v) => {}
+                        Ok(_) => return Err(format!("page {i}: write {} Published at ({seq}, ..) whose tree does not hold its value, even repaired", wid.0)),
+                        Err(why) => return Err(format!("page {i}: write {} Published at ({seq}, ..) whose tree is not readable, even repaired: {why}", wid.0)),
                     }
                 }
-                // INVARIANT 3.
-                if node.tree(&root).is_none() {
-                    return Err(format!("page {i}: Published at a root that is not whole on the node"));
+                // INVARIANT 3: recoverable, not necessarily whole (§P).
+                if let Err(why) = node.tree_repairing(&root) {
+                    return Err(format!("page {i}: Published at a root that is not RECOVERABLE on the node: {why}"));
                 }
                 seen.published_at.push((i, wid.0, (seq, root), a.inflight.get(&wid.0).cloned()));
                 if a.inflight.remove(&wid.0).is_some() {
@@ -740,6 +812,15 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                     return Err(format!("page {i}: write {} told Stalled {age} ms after it was submitted (budget 64 engine seconds, over 63 s)", wid.0));
                 }
             }
+            // INVARIANT 3b: BACKED_UP = every block of the root it was
+            // published at is on the node, with no repair.
+            State::ParityComplete => {
+                if let Some((_, _, (_, root), _)) = seen.published_at.iter().rev().find(|(p, w, _, _)| *p == i && *w == wid.0) {
+                    if node.tree(root).is_none() {
+                        return Err(format!("page {i}: write {} is ParityComplete, but the root it was published at is not WHOLE on the node", wid.0));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -780,7 +861,10 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
     let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
     let mut most = 0;
     let mut landings = 0;
-    for seed in 1..=20 {
+    // 60 seeds, not 20: race put signs a head as soon as its groups are
+    // recoverable, so heads land sooner and a twice-lost UPDATE is rarer per
+    // seed (20 seeds reached at most 2). The coverage floor below is unchanged.
+    for seed in 1..=60 {
         let s = run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write published");
         most = most.max(s.most_landing_updates);

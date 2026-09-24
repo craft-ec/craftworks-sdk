@@ -173,17 +173,16 @@ fn a_context_from_the_previous_version_is_refused() {
     );
 
     // The version sits at bytes [4..6], after the magic. The PREVIOUS one is
-    // 11: R-b's 12 carries the parked write as FETCH STATE only (its ops are
-    // in the page's queue) and a commit's `through`, a shape a v11 context
-    // (the parked write's ops, root and bytes inline) would decode into as
-    // nonsense.
+    // 12: race put's 13 (COMMIT-LIFE §P) drops the owed-parity fields (owed
+    // groups, confirmed parity, parity waiters) and adds each commit's race
+    // accounting, a shape a v12 context would decode into as nonsense.
     assert_eq!(
         u16::from_le_bytes([ctx[4], ctx[5]]),
-        12,
+        13,
         "this build's version moved: name the previous one here"
     );
     let mut old = ctx.clone();
-    old[4..6].copy_from_slice(&11u16.to_le_bytes());
+    old[4..6].copy_from_slice(&12u16.to_le_bytes());
     let (_, recovered) =
         engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
     assert!(
@@ -205,38 +204,25 @@ fn a_context_from_the_previous_version_is_refused() {
 
 /// **THE ENGINE'S DEADLINES ARE COUNTS OF `protocol::TICK_MS`.**
 ///
-/// `parity_age` is 32 and `max_accept_age` is 64, and they read as 32 and 64
-/// SECONDS only because the page quantises its clock at a second. Move
-/// `TICK_MS` and every deadline in the engine rescales at once, silently,
-/// with nothing failing — 64 would become 64 of whatever the new quantum is.
+/// `max_accept_age` is 64, and it reads as 64 SECONDS only because the page
+/// quantises its clock at a second. Move `TICK_MS` and every deadline in the
+/// engine rescales at once, silently, with nothing failing. (`parity_age`
+/// went with the owed-parity machine: under race put, COMMIT-LIFE §P, parity
+/// goes with its commit and nothing is paced.)
 ///
 /// Two crates, no shared dependency (`engine` does not depend on `protocol`),
 /// so nothing but this can hold them together. It is a tripwire, not a
-/// calculation: it does not say what the right numbers are, only that
-/// changing one side without the other is a decision somebody has to make
-/// rather than a default they can walk past.
+/// calculation.
 #[test]
 fn the_engine_s_bounds_are_stated_in_the_page_s_unit() {
     let p = engine::Params::default();
     assert_eq!(
         protocol::TICK_MS,
         1_000,
-        "TICK_MS moved. `parity_age` ({}) and `max_accept_age` ({}) are COUNTS \
-         of it, so they now mean {} and {} of the new quantum rather than the \
-         seconds their docs claim. Convert them in the same commit, or say in \
-         `Params` what the unit is now — and then update this test to the new \
-         pair.",
-        p.parity_age,
+        "TICK_MS moved. `max_accept_age` ({}) is a COUNT of it, so it now means {} of the new quantum rather \
+         than the seconds its doc claims. Convert it in the same commit, or say in `Params` what the unit is now.",
         p.max_accept_age,
-        p.parity_age,
         p.max_accept_age
-    );
-    // The seconds those two numbers are asserted to mean, spelled out so the
-    // failure above can name them.
-    assert_eq!(
-        p.parity_age * protocol::TICK_MS / 1_000,
-        32,
-        "parity_age is documented as 32 seconds"
     );
     assert_eq!(
         p.max_accept_age * protocol::TICK_MS / 1_000,

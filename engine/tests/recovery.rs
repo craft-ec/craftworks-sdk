@@ -45,7 +45,12 @@ enum Cut {
     AfterAllPacks,
     AfterHeadEmitted,
     AfterHeadConfirmed,
-    MidParity,
+    /// SAVED, not BACKED_UP (race put, COMMIT-LIFE §P): the head is signed
+    /// and confirmed while some of the commit's PARITY was never acked, and
+    /// the engine is dropped then. Before §P this was "mid-parity", reached
+    /// by ticking; parity now goes with the data, so it is reached by
+    /// withholding parity acks.
+    SavedNotBackedUp,
 }
 
 const CUTS: [Cut; 6] = [
@@ -54,7 +59,7 @@ const CUTS: [Cut; 6] = [
     Cut::AfterAllPacks,
     Cut::AfterHeadEmitted,
     Cut::AfterHeadConfirmed,
-    Cut::MidParity,
+    Cut::SavedNotBackedUp,
 ];
 
 fn boot(net: &Network, params: Params) -> Engine<Store> {
@@ -154,12 +159,21 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
 
             // Drive the commit, cutting where the case says.
             let mut packs_confirmed = 0usize;
+            let mut withheld_parity = 0usize;
             let mut dropped = false;
             let mut guard = 0;
             while let Some(f) = queue.pop() {
                 guard += 1;
                 assert!(guard < 200_000, "commit {commit} did not settle");
                 match f {
+                    // SavedNotBackedUp: the commit's parity is lost with the
+                    // engine -- never acked. The head still signs (every
+                    // group's members are in: k of k+m).
+                    Effect::PutBlock { id, ref bytes, .. }
+                        if cutting && *cut == Cut::SavedNotBackedUp && freenet_prolly::block_id(freenet_prolly::kind::PARITY, bytes) == id =>
+                    {
+                        withheld_parity += 1;
+                    }
                     Effect::PutPack { id, bytes, .. } | Effect::PutBlock { id, bytes, .. } => {
                         net.confirm(id, &bytes);
                         let out = stepped!(e, Event::PutConfirmed(id));
@@ -197,42 +211,13 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                             dropped = true;
                             break;
                         }
-                        // Parity goes out on a tick, once a group has
-                        // settled, so reaching the mid-parity boundary means
-                        // ticking here. Breaking out first is why the
-                        // boundary counter reported five of six.
-                        if cutting && *cut == Cut::MidParity {
+                        if cutting && *cut == Cut::SavedNotBackedUp {
+                            assert!(withheld_parity > 0, "{cut:?}: the commit put no parity, so there was nothing to lose with the engine");
                             published.extend(will_publish.iter().cloned());
                             accepted_only.remove(&wid);
-                            let mut parity: Vec<(Cid, Vec<u8>)> = Vec::new();
-                            for _ in 0..3 {
-                                clock += 1;
-                                for f in stepped!(e, Event::Tick(clock)) {
-                                    if let Effect::PutParity { id, bytes, .. } = f {
-                                        parity.push((id, bytes));
-                                    }
-                                }
-                            }
-                            assert!(
-                                parity.len() >= 2,
-                                "{cut:?}: only {} parity block(s) were offered, so \
-                                 there is no mid-point to cut at",
-                                parity.len()
-                            );
-                            // Half of it lands; the rest is lost with the
-                            // engine. Redundancy is not correctness: the tree
-                            // must still read.
-                            for (id, bytes) in parity.iter().take(parity.len() / 2) {
-                                net.confirm(*id, bytes);
-                                let _ = stepped!(e, Event::PutConfirmed(*id));
-                            }
                             dropped = true;
                             break;
                         }
-                    }
-                    Effect::PutParity { id, bytes, .. } => {
-                        net.confirm(id, &bytes);
-                        queue.extend(stepped!(e, Event::PutConfirmed(id)));
                     }
                     Effect::Notify {
                         write_id,
@@ -245,17 +230,12 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
                     _ => {}
                 }
             }
-            // Let parity settle for the commits that are not being cut.
+            // Time passes between commits (parity went out WITH each commit,
+            // §P, so there is nothing for a tick to put).
             if !dropped {
                 for _ in 0..4 {
                     clock += 1;
-                    let out = stepped!(e, Event::Tick(clock));
-                    for f in out {
-                        if let Effect::PutParity { id, bytes, .. } = f {
-                            net.confirm(id, &bytes);
-                            let _ = stepped!(e, Event::PutConfirmed(id));
-                        }
-                    }
+                    let _ = stepped!(e, Event::Tick(clock));
                 }
             }
             if dropped {
@@ -936,8 +916,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
             assert!(guard < 100_000, "the commit did not reach a head");
             match f {
                 Effect::PutPack { id, bytes, .. }
-                | Effect::PutBlock { id, bytes, .. }
-                | Effect::PutParity { id, bytes, .. } => {
+                | Effect::PutBlock { id, bytes, .. } => {
                     net.confirm(id, &bytes);
                     queue.extend(stepped!(e, Event::PutConfirmed(id)));
                 }
@@ -1016,131 +995,3 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
     }
 }
 
-/// Recomputing owed parity is a READ: bounded, resumable, and it ends.
-///
-/// The context carries owed groups as ids, so a rehydrated engine must walk
-/// the tree to find the node that lists a trio before it can code anything.
-/// A walk reads blocks, and the node may not hold them — F33: a sync read
-/// does not refresh hosting, so a block used on one call can be gone on the
-/// next. The walk must therefore ask for what it cannot read and stop, not
-/// spin and not give up.
-#[test]
-fn recomputing_owed_parity_is_bounded_and_resumes() {
-    let params = Params {
-        coalesce_parity: true,
-        ..Params::default()
-    };
-    let mut net = Network::default();
-    let mut e = boot(&net, params);
-
-    // Values by reference, so leaves carry parity over them.
-    let ops: Vec<(Vec<u8>, Op)> = (0..64u32)
-        .map(|i| {
-            (
-                format!("k/{i:05}").into_bytes(),
-                Op::Put(vec![(i % 251) as u8; 1400]),
-            )
-        })
-        .collect();
-    let mut queue = stepped!(
-        e,
-        Event::forced_write(ClientId(1), WriteId(1), ops)
-    );
-    let mut guard = 0;
-    while let Some(f) = queue.pop() {
-        guard += 1;
-        assert!(guard < 100_000, "the commit did not settle");
-        match f {
-            Effect::PutPack { id, bytes, .. }
-            | Effect::PutBlock { id, bytes, .. }
-            | Effect::PutParity { id, bytes, .. } => {
-                net.confirm(id, &bytes);
-                queue.extend(stepped!(e, Event::PutConfirmed(id)));
-            }
-            Effect::UpdateHead { seq, root, .. } => {
-                net.head = Some((seq, root));
-                queue.extend(stepped!(e, Event::HeadConfirmed(seq)));
-            }
-            _ => {}
-        }
-    }
-    let owed = e.owed_groups();
-    assert!(owed > 0, "the commit left no parity owed");
-    let ctx = e.to_context().expect("a context");
-
-    // The node has evicted everything but the root. The rehydrated engine
-    // must ask, not hang and not silently drop the groups.
-    let store = Store::default();
-    let cold = Store::fresh();
-    cold.put(
-        e.published_root(),
-        store.get(&e.published_root()).expect("the root"),
-    );
-    let mut e2 = Engine::from_context(&ctx, params, cold.clone()).expect("its own context");
-    assert_eq!(e2.owed_groups(), owed, "the groups did not survive");
-
-    let mut asked: BTreeSet<Cid> = BTreeSet::new();
-    let mut put = 0usize;
-    let mut calls = 0usize;
-    for t in 1..=(params.parity_age * 8) {
-        calls += 1;
-        let out = e2.step(Event::Tick(t));
-        for f in &out {
-            match f {
-                Effect::FetchBlock { id, .. } => {
-                    asked.insert(*id);
-                }
-                Effect::PutParity { .. } => put += 1,
-                _ => {}
-            }
-        }
-        // Serve what it asked for, one call's worth at a time, exactly as a
-        // node would: put it where the engine reads, THEN tell it.
-        for f in out {
-            if let Effect::FetchBlock { id, .. } = f {
-                if let Some(bytes) = store.get(&id) {
-                    cold.put(id, bytes);
-                    let more = e2.step(Event::BlockArrived {
-                        id,
-                        bytes: bytes.to_vec(),
-                    });
-                    for f in &more {
-                        if let Effect::PutParity { .. } = f {
-                            put += 1;
-                        }
-                    }
-                }
-            }
-        }
-        if put == owed * 3 {
-            // Every group is out. `owed_groups()` still counts them -- a sent
-            // group stays in the map so a later commit can supersede it -- so
-            // the stopping condition is what was PUT, not what is listed.
-            break;
-        }
-    }
-
-    assert!(
-        !asked.is_empty(),
-        "the recompute read nothing at all from a node holding only the root, \
-         so it is not walking the tree"
-    );
-    assert_eq!(
-        put,
-        owed * 3,
-        "{owed} group(s) owed and {put} parity block(s) put after resuming; a \
-         group is three blocks"
-    );
-    // Bounded: it did not read the whole tree over and over to get there.
-    assert!(
-        asked.len() <= params.max_parity_scan_blocks,
-        "the recompute asked for {} block(s) against a scan bound of {}",
-        asked.len(),
-        params.max_parity_scan_blocks
-    );
-    println!(
-        "  owed parity recomputed cold: {} block(s) asked for over {calls} \
-         call(s), all {put} parity block(s) put",
-        asked.len()
-    );
-}

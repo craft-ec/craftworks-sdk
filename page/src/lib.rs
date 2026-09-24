@@ -17,7 +17,7 @@
 //!
 //! | effect / answer | what the page does |
 //! |---|---|
-//! | `PutBlock` / `PutParity` | the bytes join [`PageBlocks`] (the page is now the memory a node was); held until its `after` set is confirmed, then [`Op::Put`] |
+//! | `PutBlock` (data AND parity, §P) | the bytes join [`PageBlocks`] (the page is now the memory a node was); held until its `after` set is confirmed, then [`Op::Put`] |
 //! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → asked again on a doubling backoff, the PUT again only after [`HELD_ABSENTS`] absents in a row |
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
@@ -401,6 +401,13 @@ impl HeadRead {
         signer_proto::head::read_value(&self.value).filter(|h| !h.refused).map(|h| h.ledger.through).unwrap_or_default()
     }
 
+    /// Does it carry race put's §P mark (an EMPTY `TAG_PARITY` in a v2
+    /// ledger): every group it lists was recoverable when it was signed? A
+    /// head without it is pre-§P, or its ledger was refused: `false`.
+    pub fn parity_marked(&self) -> bool {
+        signer_proto::head::read_value(&self.value).is_some_and(|h| !h.refused && h.ledger.parity.as_deref() == Some(&[][..]))
+    }
+
     /// The head it was signed from, if its ledger says (a refused ledger says
     /// nothing: never "built on" anything).
     pub fn prev(&self) -> Option<(u64, Cid)> {
@@ -422,7 +429,8 @@ impl From<(u64, Cid)> for HeadRead {
 pub fn sign_ledger(prev_seq: u64, prev_root: Cid, root: Cid) -> Vec<u8> {
     use signer_proto::head::{value, Ledger};
     let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
-    value(&root, &Ledger { prev, ..Ledger::default() })[32..].to_vec()
+    // The §P mark: every head this build signs is race put's (COMMIT-LIFE §P).
+    value(&root, &Ledger { prev, parity: Some(Vec::new()), ..Ledger::default() })[32..].to_vec()
 }
 
 /// F56's equal-seq rule as the Register decides it: of two heads at ONE seq,
@@ -1476,7 +1484,8 @@ impl Page {
                 through.push(Through { device: self.device, seq: t, last: seq });
             }
         }
-        value(&root, &Ledger { prev, through, ..Ledger::default() })[32..].to_vec()
+        // The §P mark: every head this build signs is race put's.
+        value(&root, &Ledger { prev, through, parity: Some(Vec::new()) })[32..].to_vec()
     }
 
     /// This page's device id in heads' `through` (COMMIT-LIFE ⁵). Zeros:
@@ -1503,6 +1512,10 @@ impl Page {
                 .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, self.engine.committing_seq())))
                 .flatten();
             self.engine.set_witness(witness);
+            // The §P MARK of the head about to be adopted: the engine's parity
+            // scan is Done for a marked head, NotScanned for an unmarked one.
+            let marked = self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).is_some_and(HeadRead::parity_marked);
+            self.engine.set_head_marked(marked);
         }
         // A SAME-SEQ DISPLACEMENT of this page's head: the Server may merge
         // the displaced group, so no cut is made until it has placed it (or
@@ -1580,16 +1593,15 @@ impl Page {
                 // A VIEW makes no commit op: nothing of it is held, sent or
                 // waited on. The door refuses a view's writes first, so this
                 // is loud -- a commit on a view is a defect, named.
-                Effect::PutBlock { .. } | Effect::PutParity { .. } | Effect::UpdateHead { .. } | Effect::PutPack { .. } if self.read_only => {
+                Effect::PutBlock { .. } | Effect::UpdateHead { .. } | Effect::PutPack { .. } if self.read_only => {
                     let what = match f {
                         Effect::PutBlock { .. } => "block PUT",
-                        Effect::PutParity { .. } => "parity PUT",
                         Effect::PutPack { .. } => "pack PUT",
                         _ => "head update",
                     };
                     self.unusable.push(format!("read-only: a commit's {what} was not made (a view writes nothing but a repair)"));
                 }
-                Effect::PutBlock { id, ref bytes, ref after } | Effect::PutParity { id, ref bytes, ref after, .. } => {
+                Effect::PutBlock { id, ref bytes, ref after } => {
                     // The page is the memory now: the engine keeps no bytes.
                     self.blocks.insert(id, bytes);
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
@@ -1602,6 +1614,16 @@ impl Page {
                 // A queued write's warm-apply block (R-b): kept for reads of
                 // the warm root, never put -- its commit puts the same bytes.
                 Effect::Keep { id, ref bytes } => self.blocks.insert(id, bytes),
+                // SUPERSEDED (COMMIT-LIFE §P): a later root move re-coded the
+                // group this block was in. Its PUT is WITHDRAWN -- no more
+                // re-sends, not sent at all if still held back -- because
+                // nobody needs it; that is not a cut-off of one somebody does.
+                Effect::Withdraw { id } => {
+                    self.deadlines.remove(&Waiting::Put(id));
+                    self.attempt_of.remove(&Waiting::Put(id));
+                    self.put_again.remove(&id);
+                    self.held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
+                }
                 // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
                 // op, deadline and re-send), unless it is on its way or there already.
                 Effect::PutRepaired { id, ref bytes } => {
@@ -1650,7 +1672,7 @@ impl Page {
             if self.held[i].0.iter().all(|c| self.confirmed.contains(c)) {
                 let (_, f) = self.held.remove(i);
                 match f {
-                    Effect::PutBlock { id, bytes, .. } | Effect::PutParity { id, bytes, .. } => {
+                    Effect::PutBlock { id, bytes, .. } => {
                         if self.confirmed.contains(&id) {
                             // Already on the node: the engine hears it again.
                             let more = self.engine.step(Event::PutConfirmed(id));
@@ -1980,6 +2002,30 @@ mod repair_put {
         p.carry_out(vec![Effect::PutBlock { id, bytes: bytes.clone(), after: Vec::new() }]);
         p.answer(Answer::PutOk(id), Ms(2));
         assert!(p.confirmed.contains(&id), "a commit's PUT of a once-repaired block was not confirmed");
+    }
+
+    /// RACE PUT's condition (a) (COMMIT-LIFE §P, the architect): a repair
+    /// re-PUT is NEVER in the race set a head waits on. The engine builds
+    /// `UpdateHead::after` from what it was told is confirmed, and the page
+    /// never tells it a repair's answer; here the page's side: a head whose
+    /// `after` names a block that only a REPAIR has put stays held -- no
+    /// signer request -- until a commit's own PUT of it is answered.
+    #[test]
+    fn a_head_is_never_released_by_a_repair_puts_answer() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let _ = p.take_ops();
+        let (id, bytes) = ([7u8; 32], b"rebuilt".to_vec());
+        p.carry_out(vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
+        p.answer(Answer::PutOk(id), Ms(1));
+        let _ = p.take_ops();
+        let (pseq, base) = p.engine_published();
+        p.held.push((BTreeSet::from([id]), Effect::UpdateHead { seq: pseq + 1, root: [3u8; 32], base, after: vec![id] }));
+        p.release();
+        assert!(!p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "a head was released by a REPAIR PUT's answer");
+        // The commit's own PUT of the block is answered: the head goes.
+        p.carry_out(vec![Effect::PutBlock { id, bytes, after: Vec::new() }]);
+        p.answer(Answer::PutOk(id), Ms(2));
+        assert!(p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "the commit's own PUT answer did not release the head to be signed");
     }
 }
 

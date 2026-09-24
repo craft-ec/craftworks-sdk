@@ -82,7 +82,7 @@ fn parity_complete_fires_once_per_write() {
         match f {
             Effect::PutPack { id, .. }
             | Effect::PutBlock { id, .. }
-            | Effect::PutParity { id, .. } => q.extend(stepped!(e, Event::PutConfirmed(id))),
+ => q.extend(stepped!(e, Event::PutConfirmed(id))),
             Effect::UpdateHead { seq, .. } => q.extend(stepped!(e, Event::HeadConfirmed(seq))),
             Effect::Notify {
                 state: State::ParityComplete,

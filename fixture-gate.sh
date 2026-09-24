@@ -30,7 +30,7 @@ allow() {
     tests/cached_store.rs) return 0 ;;
     # sdk#162: its construction tests are of Engine::new's cap-sum assertion
     # (refuses caps that cannot fit the bound; the defaults fit).
-    engine/tests/owed_cap.rs) return 0 ;;
+    engine/tests/context_bound.rs) return 0 ;;
     # sdk#181/#119: a test of the ENGINE's own parity state across ONE context
     # round-trip (owed ids without bytes, the walk resuming, ParityScan). The
     # fixture runs a whole page, which never round-trips a context.
