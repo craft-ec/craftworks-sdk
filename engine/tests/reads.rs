@@ -1036,7 +1036,7 @@ fn a_store_that_keeps_nothing_at_all_still_answers() {
 }
 
 fn forgetful(records_in_tree: u32, evict_root: bool) {
-    use common::{Harness, Mode};
+    use common::Harness;
 
     let (records, root, all) = fixture(records_in_tree);
     let keys: Vec<Vec<u8>> = records.keys().cloned().collect();
@@ -1044,7 +1044,7 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
 
     for forget_every in [0usize, 1, 3] {
         let store = Store::fresh();
-        let mut h = Harness::new(Mode::Rehydrate, Params::default(), store.clone());
+        let mut h = Harness::new(Params::default(), store.clone());
         store.put(root, all.get(&root).expect("the root"));
         let _ = h.step(Event::Start {
             key: engine::KeySource::SecretStore,
@@ -1210,7 +1210,7 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
 
 #[test]
 fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
-    use common::{Harness, Mode};
+    use common::Harness;
 
     let (_, root, all) = fixture(2_000);
     let key = b"k/01000".to_vec();
@@ -1221,10 +1221,9 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
     // nothing because nothing re-descends. Measured separately each looked
     // inert — the same shape as a new guard hiding the guards behind it, seen
     // from the other side. So the control turns both off.
-    let count = |mode: Mode, broken: bool, unrelated: usize| -> usize {
+    let count = |broken: bool, unrelated: usize| -> usize {
         let store = Store::fresh();
         let mut h = Harness::new(
-            mode,
             Params {
                 redescend_on_entry: broken,
                 dedupe_in_flight: !broken,
@@ -1232,9 +1231,7 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
             },
             store.clone(),
         );
-        // A recovered engine learns its root from its head, which is also the
-        // only way to give the harness a root: it re-hydrates every step, so
-        // nothing set on a value in memory would survive.
+        // A recovered engine learns its root from its head.
         store.put(root, all.get(&root).expect("the root"));
         let _ = h.step(Event::Start {
             key: engine::KeySource::SecretStore,
@@ -1263,22 +1260,8 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
         fetches
     };
 
-    // BOTH MODES, and they must agree. The bookkeeping that makes this bound
-    // hold — which reads are parked and which blocks are already asked for —
-    // has to come out of the CONTEXT. A version living in memory would pass
-    // in `Live` and fail only here, which is the one place this design is
-    // weak, so the numbers are taken in both and compared.
-    let quiet = count(Mode::Rehydrate, false, 0);
-    let busy = count(Mode::Rehydrate, false, 20);
-    let quiet_live = count(Mode::Live, false, 0);
-    let busy_live = count(Mode::Live, false, 20);
-    assert_eq!(
-        (quiet, busy),
-        (quiet_live, busy_live),
-        "the two modes disagree: re-hydrating changed what a read costs, so \
-         some of what makes this bound hold is living in memory rather than \
-         in the context"
-    );
+    let quiet = count(false, 0);
+    let busy = count(false, 20);
     assert_eq!(
         quiet, busy,
         "a read cost {busy} fetches on a busy node and {quiet} on a quiet one: \
@@ -1287,19 +1270,16 @@ fn a_waiting_read_does_not_re_ask_however_often_the_engine_is_entered() {
 
     // The control, and it RUNS: an engine that re-drives every parked read on
     // every entry pays for the node being busy.
-    // It RACES, as production does (sdk#303). A race's state lives in the engine's memory (the engine is
-    // long-lived in the page, READ-STATE B), not in the context -- so the control's COUNT differs between the modes
-    // by design (a re-hydrated engine starts the race again), and what must hold in EACH is that it bites.
-    let control = count(Mode::Rehydrate, true, 20);
-    let control_live = count(Mode::Live, true, 20);
+    // It RACES, as production does (sdk#303).
+    let control = count(true, 20);
     assert!(
-        control > quiet && control_live > quiet_live,
-        "the control still cost {control} (Rehydrate) / {control_live} (Live) fetches against {quiet}: it is not \
+        control > quiet,
+        "the control still cost {control} fetches against {quiet}: it is not \
          re-asking, and this bound is not being tested against anything"
     );
     println!(
         "  {quiet} fetch(es) on a quiet node, {busy} on a busy one, \
-         {control} / {control_live} with both off (Rehydrate / Live)"
+         {control} with both off"
     );
 }
 

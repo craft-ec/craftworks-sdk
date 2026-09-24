@@ -49,12 +49,12 @@ fn recovered() -> Engine<Store> {
 #[test]
 fn a_key_written_unread_is_refused_at_the_door_and_nothing_moves() {
     let mut e = recovered();
-    let before = e.to_context().expect("a context");
+    let before = common::fingerprint(&e);
     let fx = e.step(write(1, vec![("k/a", Op::Put(b"1".to_vec())), ("k/b", Op::Put(b"2".to_vec()))], vec![("k/a", Expect::Absent)]));
     assert_eq!(told(&fx, 1), vec![State::Unread], "not refused as Unread: {fx:?}");
     assert_eq!(unread_key(&fx).as_deref(), Some(&b"k/b"[..]), "the refusal does not name the unread key");
     assert_eq!(fx.len(), 2, "anything but the verdict and its key was emitted: {fx:?}");
-    assert_eq!(e.to_context().expect("a context"), before, "the context moved for a write refused at the door");
+    assert_eq!(common::fingerprint(&e), before, "the engine's state moved for a write refused at the door");
     assert_eq!(e.forced_writes(), 0);
     // THE CONTROL: the same write with both reads is taken.
     let ok = e.step(write(1, vec![("k/a", Op::Put(b"1".to_vec())), ("k/b", Op::Put(b"2".to_vec()))], vec![("k/a", Expect::Absent), ("k/b", Expect::Absent)]));
