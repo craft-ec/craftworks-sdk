@@ -68,6 +68,7 @@
 //! * the web Session over [`server::Server`], and provisioning the signer (B2);
 
 pub mod fates;
+mod judge;
 pub mod rto;
 pub mod server;
 
@@ -76,6 +77,15 @@ use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use judge::{judge, judge_site, Heard, Judged, SiteJudged};
+
+/// How a judged head is told to the engine: the answer to its own recovery read (`HeadRead`), or another writer's
+/// head found on a read (`HeadConflict`).
+#[derive(Clone, Copy)]
+enum Adopt {
+    Recovery,
+    Conflict,
+}
 
 /// Register reads that may still show the OLDER head after an UPDATE before
 /// the UPDATE itself is re-sent. ASSUMPTION (the live run tells): a page's
@@ -1041,21 +1051,33 @@ impl Page {
                         }
                     }
                 }
+                // THE ONE JUDGEMENT (sdk#396): every head read this answer ends acts on this verdict, never on `h`.
+                let j = judge(h, &self.my_records, self.last_head.as_ref());
+                let recover_attempt = self.deadlines.get(&Waiting::RecoverHead).map(|d| d.attempt);
                 if self.answered(&Waiting::RecoverHead).is_some() {
-                    match h {
-                        Some((seq, root)) => self.step(Event::HeadRead { epoch: EPOCH, seq, root }),
-                        None => self.step(Event::HeadMissing),
+                    match &j {
+                        Judged::NoHead => {
+                            self.step(Event::HeadMissing);
+                            self.recovered = true;
+                        }
+                        Judged::Head(heard) => {
+                            self.adopt(*heard, Adopt::Recovery);
+                            self.recovered = true;
+                        }
+                        // The engine's own re-read, mid-commit, shows a head THIS page's record beats: my UPDATE has
+                        // not merged there yet. Not adopted (the commit would die for a head about to lose): the
+                        // engine's read is asked again at the one backoff, and the read-back owns the landing.
+                        Judged::MineWins { .. } => self.park(Waiting::RecoverHead, Op::ReadHead { label: Label::Head }, recover_attempt.unwrap_or(1)),
                     }
-                    self.recovered = true;
                 }
                 if self.answered(&Waiting::ReadBack(Label::Head)).is_some() {
-                    self.on_read_back(h);
+                    self.on_read_back(&j);
                 }
                 if self.answered(&Waiting::Verify).is_some() {
-                    self.on_verify(h);
+                    self.on_verify(&j);
                 }
                 if self.answered(&Waiting::Hint).is_some() {
-                    self.on_hint(h);
+                    self.on_hint(&j);
                 }
             }
         }
@@ -1222,30 +1244,33 @@ impl Page {
     /// On a peered node the register is read through the head SUBSCRIPTION
     /// (F55: a delegate-created register is not served to a bare client GET);
     /// the web layer frames `Op::ReadHead { label: Label::Head }` as that.
-    fn on_verify(&mut self, h: Option<(u64, Cid)>) {
+    fn on_verify(&mut self, j: &Judged) {
         let Some(v) = self.verify.clone() else { return };
+        let h = j.shown();
         let reg_seq = h.map_or(0, |(s, _)| s);
-        // The register at the signer's seq, and THIS page's own record there
-        // is another root that wins the tie-break: LAND it (its UPDATE has not
-        // merged here yet) rather than adopt a head about to lose. Judged by
-        // the record, never by what the signer named: at an equal seq the
-        // signer names the REGISTER's head (rule c), so `v.root` is theirs.
-        if let Some((seq, root)) = h.filter(|(s, _)| *s == v.seq) {
-            if let Some(bytes) = self.my_winning_record(seq, &root) {
+        // THIS page's own record at the register's seq is another root that
+        // wins the tie-break: LAND it (its UPDATE has not merged here yet)
+        // rather than adopt a head about to lose. Judged by the record, never
+        // by what the signer named: at an equal seq the signer names the
+        // REGISTER's head (rule c), so `v.root` is theirs.
+        if let Judged::MineWins { seq, record, .. } = j {
+            if *seq >= v.seq {
                 if let Some(v) = self.verify.as_mut() {
                     v.landing = true;
                     v.updates += 1;
                     self.most_landing_updates = self.most_landing_updates.max(v.updates);
                 }
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: bytes });
+                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() });
                 return;
             }
         }
-        if let Some((seq, root)) = h.filter(|(s, _)| *s >= v.seq) {
-            self.verify = None;
-            self.head.owed = None;
-            self.step(Event::HeadConflict { seq, root });
-            return;
+        if let Judged::Head(heard) = j {
+            if heard.seq() >= v.seq {
+                self.verify = None;
+                self.head.owed = None;
+                self.adopt(*heard, Adopt::Conflict);
+                return;
+            }
         }
         if v.seq > reg_seq + 1 {
             self.verify = None;
@@ -1292,8 +1317,8 @@ impl Page {
     ///   UPDATE has not merged here), never displaced.
     /// * Otherwise a newer head, or a same-seq winner: ADOPTED
     ///   (`HeadConflict`). A commit in flight dies `Lost`, as in any conflict.
-    fn on_hint(&mut self, h: Option<(u64, Cid)>) {
-        let Some((seq, root)) = h else { return };
+    fn on_hint(&mut self, j: &Judged) {
+        let Some((seq, root)) = j.shown() else { return };
         if !self.engine_has_head || self.verify.is_some() {
             return;
         }
@@ -1302,15 +1327,17 @@ impl Page {
             return;
         }
         if self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && o.seq == seq) {
-            self.on_read_back(h);
+            self.on_read_back(j);
             return;
         }
-        if let Some(bytes) = self.my_winning_record(seq, &root) {
-            self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: bytes });
-            return;
+        match j {
+            Judged::MineWins { record, .. } => self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() }),
+            Judged::Head(heard) => {
+                self.head.owed = None;
+                self.adopt(*heard, Adopt::Conflict);
+            }
+            Judged::NoHead => {}
         }
-        self.head.owed = None;
-        self.step(Event::HeadConflict { seq, root });
     }
 
     /// The socket was REPLACED (sdk#376): EVERY op on the wire went out on the
@@ -1387,7 +1414,8 @@ impl Page {
         // to either request).
         self.deadlines.remove(&Waiting::Update(Label::Head));
         self.deadlines.remove(&Waiting::ReadBack(Label::Head));
-        self.on_read_back(h);
+        let j = judge(h, &self.my_records, self.last_head.as_ref());
+        self.on_read_back(&j);
     }
 
     /// A record the signer returned (`Signed`, or `AlreadySigned`: the one it
@@ -1400,22 +1428,6 @@ impl Page {
         }
     }
 
-    /// THIS page's own record at `seq`, if it is another root than `root` and
-    /// WINS the tie-break against it: the bytes to land. A head that loses to
-    /// such a record is never adopted — the register will hold mine once my
-    /// UPDATE merges (the architect's attack on sdk#225, case 1).
-    fn my_winning_record(&self, seq: u64, root: &Cid) -> Option<Vec<u8>> {
-        let (mine_root, bytes) = self.my_records.get(&seq)?;
-        if mine_root == root {
-            return None;
-        }
-        // Theirs by its whole value, as just read (a bare root if it came some
-        // other way); mine by the value the signer signed.
-        let theirs = self.last_head.as_ref().filter(|h| h.seq == seq && h.root() == *root).map_or_else(|| root.to_vec(), |h| h.value().to_vec());
-        let mine = HeadRead::from_record(bytes)?;
-        beats(mine.value(), &theirs).then(|| bytes.clone())
-    }
-
     /// Is a register read already in flight?
     fn reading_head(&self) -> bool {
         [Waiting::Warm, Waiting::RecoverHead, Waiting::Verify, Waiting::ReadBack(Label::Head), Waiting::Hint]
@@ -1425,36 +1437,23 @@ impl Page {
 
     /// The register read back after an UPDATE: the only way a commit is
     /// Published (F56: the UPDATE's answer says nothing).
-    fn on_read_back(&mut self, h: Option<(u64, Cid)>) {
+    fn on_read_back(&mut self, j: &Judged) {
         let Some(owed) = self.head.owed.as_mut() else { return };
         if owed.record.is_none() {
             return; // a read-back outlived its commit
         }
         let want = (owed.seq, owed.root);
-        let mine_wins = matches!(h, Some((s, r)) if s == want.0 && self.my_winning_record(s, &r).is_some());
-        let Some(owed) = self.head.owed.as_mut() else { return };
-        match h {
-            Some(read) if read == want => {
+        match j {
+            Judged::Head(heard) if heard.pair() == want => {
                 let owed = self.head.owed.take().expect("owed");
                 self.step(Event::HeadConfirmed(owed.seq));
             }
-            // Not visible yet: read again; after HEAD_READS, UPDATE again.
-            Some((seq, _)) if seq < want.0 => {
-                owed.stale_reads += 1;
-                if owed.stale_reads >= HEAD_READS {
-                    owed.stale_reads = 0;
-                    let state = owed.record.clone().expect("an UPDATE was sent");
-                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-                } else {
-                    // Asked at the next tick (tick() re-reads while stale).
-                }
-            }
-            // THE SAME SEQ, ANOTHER ROOT, and THIS page's record there wins
-            // the tie-break: the register will hold mine once my UPDATE
-            // merges (the node has not merged it yet). Adopting theirs would
-            // drop a head that is about to win (the architect's attack on
-            // sdk#225, case 1). Read again; after HEAD_READS, UPDATE again.
-            Some((seq, _)) if seq == want.0 && mine_wins => {
+            // Not visible yet -- or THIS page's record wins the tie-break
+            // against what the register shows (the node has not merged my
+            // UPDATE; adopting theirs would drop a head that is about to win,
+            // the architect's attack on sdk#225, case 1): read again; after
+            // HEAD_READS, UPDATE again.
+            Judged::Head(heard) if heard.seq() < want.0 => {
                 owed.stale_reads += 1;
                 if owed.stale_reads >= HEAD_READS {
                     owed.stale_reads = 0;
@@ -1462,11 +1461,19 @@ impl Page {
                     self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
                 }
             }
-            Some((seq, root)) => {
+            Judged::MineWins { .. } => {
+                owed.stale_reads += 1;
+                if owed.stale_reads >= HEAD_READS {
+                    owed.stale_reads = 0;
+                    let state = owed.record.clone().expect("an UPDATE was sent");
+                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
+                }
+            }
+            Judged::Head(heard) => {
                 self.head.owed = None;
-                self.step(Event::HeadConflict { seq, root });
+                self.adopt(*heard, Adopt::Conflict);
             }
-            None => {
+            Judged::NoHead => {
                 let state = owed.record.clone().expect("an UPDATE was sent");
                 self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
             }
@@ -1646,13 +1653,10 @@ impl Page {
             return self.rebase_site(app, seq, value);
         }
         let Some(record) = owed.record.clone() else { return };
-        match read {
-            Some(h) if h.seq == owed.seq && h.value() == owed.root.as_slice() => self.end_site(app, Publication::Published { version: owed.seq }),
-            Some(h) if h.seq > owed.seq || (h.seq == owed.seq && !beats(owed.root.as_slice(), h.value())) => {
-                self.end_site(app, Publication::Superseded { version: h.seq })
-            }
-            // Older, none, or mine wins the tie-break: not merged yet.
-            _ => {
+        match judge_site(owed.seq, owed.root.as_slice(), read.as_ref()) {
+            SiteJudged::Mine => self.end_site(app, Publication::Published { version: owed.seq }),
+            SiteJudged::Superseded(version) => self.end_site(app, Publication::Superseded { version }),
+            SiteJudged::NotYet => {
                 let o = self.pub_mut(&label).owed.as_mut().expect("owed");
                 o.stale_reads += 1;
                 if o.stale_reads >= HEAD_READS {
@@ -1871,6 +1875,16 @@ impl Page {
     pub fn set_device(&mut self, device: [u8; 16]) {
         if self.device == [0; 16] {
             self.device = device;
+        }
+    }
+
+    /// THE ONLY WAY a head read from the register is adopted (sdk#396): from a [`Heard`], which only the one
+    /// judgement makes -- so no answer path can adopt a head this page's own record beats.
+    fn adopt(&mut self, heard: Heard, how: Adopt) {
+        let (seq, root) = heard.pair();
+        match how {
+            Adopt::Recovery => self.step(Event::HeadRead { epoch: EPOCH, seq, root }),
+            Adopt::Conflict => self.step(Event::HeadConflict { seq, root }),
         }
     }
 
