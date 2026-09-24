@@ -107,6 +107,36 @@ fn production(src: &str) -> &str {
     src.split("\n#[cfg(test)]").next().expect("a first part")
 }
 
+/// The TOP-LEVEL items of `src` after its production cut that are NOT a `#[cfg(test)]` module: each `(line, text)`.
+/// A top-level item is a line in column 0 that is not a comment, an attribute, a closing brace or blank; its
+/// attributes are the `#[...]` lines right above it. Rust allows production items after a test module, and one
+/// there would escape `production()` -- so the part after the cut may hold test modules and nothing else.
+fn items_after_the_cut(src: &str) -> Vec<(usize, String)> {
+    let cut = production(src).lines().count();
+    let lines: Vec<&str> = src.lines().collect();
+    let mut attrs: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate().skip(cut) {
+        let top = !l.is_empty() && !l.starts_with(char::is_whitespace);
+        if !top || l.starts_with('}') || l.starts_with("//") {
+            if !l.trim().is_empty() && !l.trim_start().starts_with("//") && top {
+                attrs.clear();
+            }
+            continue;
+        }
+        if l.starts_with("#[") || l.starts_with("#![") {
+            attrs.push(l);
+            continue;
+        }
+        let test_mod = l.starts_with("mod ") && attrs.iter().any(|a| a.trim() == "#[cfg(test)]");
+        if !test_mod {
+            out.push((i + 1, l.to_string()));
+        }
+        attrs.clear();
+    }
+    out
+}
+
 /// The body of `fn <name>(` in `src`, by brace matching from the signature: `None` if there is no such fn.
 fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     let start = src.find(&format!("fn {name}("))?;
@@ -141,6 +171,12 @@ fn builds(src: &str, variant: &str) -> usize {
 fn every_register_answer_is_judged_in_one_place_and_adopted_through_one_door() {
     let lib = production(LIB);
     assert!(lib.contains("fn adopt(") && lib.contains("fn step(") && lib.len() * 2 > LIB.len(), "THE CONTROL: the production cut of lib.rs lost the code it judges ({} of {} bytes)", lib.len(), LIB.len());
+    // Nothing of production hides AFTER the cut (the architect): past it, only `#[cfg(test)]` modules.
+    for (name, src) in [("lib.rs", LIB)].into_iter().chain(OTHERS) {
+        let stray = items_after_the_cut(src);
+        assert!(stray.is_empty(), "page/src/{name}: production items after the first #[cfg(test)], where the one-door control does not look: {stray:?}");
+    }
+    assert!(LIB.lines().skip(production(LIB).lines().count()).filter(|l| l.starts_with("mod ")).count() >= 3, "THE CONTROL: the scan after the cut found no test modules in lib.rs (it read nothing)");
     let adopt = body_of(lib, "adopt").expect("THE CONTROL: the reader found no `fn adopt` in page/src/lib.rs");
     for v in ["HeadRead", "HeadConflict"] {
         assert_eq!(builds(adopt, v), 1, "THE CONTROL: `fn adopt` does not build Event::{v} exactly once (the reader read no real body)");
