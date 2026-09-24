@@ -479,10 +479,10 @@ enum ReadsCheck {
 /// they are one group's protection and are worth nothing separately.
 pub type ParityIds = [Cid; PARITY];
 
-/// Parity blocks per group: the TREE's number (freenet-prolly `rs::PARITY`), its
+/// Parity blocks per group: the TREE's number (freenet-prolly `parity::PARITY`), its
 /// one owner. Never written by hand here -- `tests/one_parity.rs` fails the build
 /// on a hand-written count.
-pub use freenet_prolly::rs::PARITY;
+pub use freenet_prolly::parity::PARITY;
 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4912,6 +4912,10 @@ const CLOCK_RESET_TICKS: u64 = 600;
 
 /// The version this build writes. Bumped when the shape changes.
 ///
+/// 14: a group's parity ids are `[Cid; PARITY]` and the tree's PARITY is 8
+/// (sdk#321, a format epoch): a fixed array's length is its shape, so a
+/// 13-context's groups do not decode as this one's.
+///
 /// 10: a parked read counts its request's GETs, and a parked write its
 /// chain's and when it last heard anything (sdk#174).
 ///
@@ -4943,7 +4947,7 @@ const CLOCK_RESET_TICKS: u64 = 600;
 /// shape rather than failing — bincode reads the fields it was asked for —
 /// so the version is what refuses it, and a refused context is a fresh start
 /// rather than an engine in a state nobody chose.
-const CONTEXT_VERSION: u16 = 13;
+const CONTEXT_VERSION: u16 = 14;
 
 /// What a context this build wrote begins with.
 ///

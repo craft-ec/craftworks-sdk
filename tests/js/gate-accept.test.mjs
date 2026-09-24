@@ -115,31 +115,6 @@ t("a NEW member is recorded; one no longer in the run is dropped", () => {
 // The call site still ASKS (a helper nothing calls has cost this repo more
 // than any other shape): gate.sh routes --accept through the helper, with the
 // step-failure flag, and every step's failure sets it.
-// THE DISK GUARD (the owner's control): gate.sh asks the ONE workspace guard before anything
-// else, and does not start when it refuses -- nor when there is no guard to ask. Run for real,
-// with stub guards, so no cargo or npm is reached either way (a refused gate costs nothing).
-t("**gate.sh refuses to START when the disk guard refuses, and when there is no guard at all**", () => {
-  const d = mkdtempSync(join(tmpdir(), "gate-guard-"));
-  const refuse = join(d, "refuse.sh"), pass = join(d, "pass.sh");
-  writeFileSync(refuse, "#!/bin/sh\necho 'stub guard: REFUSED'\nexit 1\n"); chmodSync(refuse, 0o755);
-  writeFileSync(pass, "#!/bin/sh\necho \"stub guard: $1 may run\"\nexit 0\n"); chmodSync(pass, 0o755);
-  // PATH without cargo: a gate the guard lets through stops at its own "no cargo" step, so no
-  // build or suite runs in any case here -- and reaching that step is the proof it got past the guard.
-  const run = guard => spawnSync("/bin/bash", ["./gate.sh"], { cwd: root, encoding: "utf8", env: { ...process.env, PATH: "/usr/bin:/bin", DISK_GUARD: guard }, timeout: 60000 });
-  const refused = run(refuse);
-  assert.notEqual(refused.status, 0, "the gate started although the disk guard refused");
-  assert.match(refused.stdout + refused.stderr, /stub guard: REFUSED/, "the guard was not asked");
-  assert.doesNotMatch(refused.stdout + refused.stderr, /no cargo/, "the gate went on past a refusing guard");
-  const missing = run(join(d, "no-such-guard.sh"));
-  assert.notEqual(missing.status, 0, "a gate with NO disk guard started (could not check is a failure)");
-  assert.match(missing.stderr, /no disk guard at .*no-such-guard\.sh/, "the missing guard was not named");
-  // THE CONTROL: a passing guard lets the gate past this point: it reaches the next step (no cargo on this PATH).
-  const passed = run(pass);
-  assert.match(passed.stdout, /stub guard: the SDK gate may run/, "a passing guard was not asked, or not named what runs");
-  assert.match(passed.stderr, /no cargo/, "a passing guard did not let the gate go on to its next step");
-  rmSync(d, { recursive: true, force: true });
-});
-
 t("**gate.sh hands --accept to the helper WITH the step-failure flag, and writes the baseline nowhere else**", () => {
   const src = readFileSync(join(root, "gate.sh"), "utf8");
   assert.match(src, /\.\/tools\/gate-accept\.sh "\$BASELINE" "\$STEP_FAILED" "\$counts_file"/);

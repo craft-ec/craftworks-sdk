@@ -1672,9 +1672,18 @@ impl Page {
     /// would continue from, and its place in the window's queue. An answer,
     /// a withdrawal and a block the page already holds all end a GET here.
     fn drop_get(&mut self, id: Cid) {
-        self.deadlines.remove(&Waiting::Get(id));
+        let ended = self.deadlines.remove(&Waiting::Get(id));
         self.attempt_of.remove(&Waiting::Get(id));
         self.get_queue.retain(|q| *q != id);
+        // A GET ended while ON THE WIRE held a place in the window: the next
+        // queued GET takes it. Only an ANSWER grows the window (`answered`);
+        // an end frees the place it held. Without this a read whose silent
+        // block was rebuilt from its group ended that GET and left the GETs
+        // queued behind it stranded, with nothing in flight to free a place
+        // (sdk#321: at m = 8 a race queues past the window).
+        if ended.is_some_and(|d| d.sent) {
+            self.fill_gets();
+        }
     }
 
     /// The node ANSWERED a GET without the block (NotFound, or bytes that are

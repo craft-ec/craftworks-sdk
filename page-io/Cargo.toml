@@ -16,7 +16,7 @@ protocol = { path = "../protocol" }
 # A site's params (the ONE relabelling) and its web framing (builder#117).
 contract-keys = { path = "../contract-keys" }
 blake3 = { version = "1", default-features = false }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 
 [dev-dependencies]

@@ -173,16 +173,16 @@ fn a_context_from_the_previous_version_is_refused() {
     );
 
     // The version sits at bytes [4..6], after the magic. The PREVIOUS one is
-    // 12: race put's 13 (COMMIT-LIFE §P) drops the owed-parity fields (owed
-    // groups, confirmed parity, parity waiters) and adds each commit's race
-    // accounting, a shape a v12 context would decode into as nonsense.
+    // 13: sdk#321's 14 makes a group's parity ids `[Cid; 8]` (the tree's
+    // PARITY, a format epoch), and a fixed array's length is its shape, so a
+    // v13 context's groups would decode into as nonsense.
     assert_eq!(
         u16::from_le_bytes([ctx[4], ctx[5]]),
-        13,
+        14,
         "this build's version moved: name the previous one here"
     );
     let mut old = ctx.clone();
-    old[4..6].copy_from_slice(&12u16.to_le_bytes());
+    old[4..6].copy_from_slice(&13u16.to_le_bytes());
     let (_, recovered) =
         engine::Engine::from_context_or_new(&old, engine::Params::default(), Store::default());
     assert!(

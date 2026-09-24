@@ -1,7 +1,7 @@
 //! sdk#150 PR 3: a person's FIRST save on a fresh tree gets its redundancy.
 //!
 //! The architect's probe, as a test. Before PR 3, with a tick while the
-//! first commit was in flight, its three parity puts went out `after` the
+//! first commit was in flight, its parity puts went out `after` the
 //! empty tree's root -- which nobody puts or confirms -- were held, dropped
 //! with the call, and (recorded as `sent`) never asked for again: not after
 //! 130 ticks, a Flush, or a second write. Write 1 was told `Published` and

@@ -1063,12 +1063,20 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
 
         let (mut answered, mut unavailable, mut waiting) = (0, 0, 0);
         let mut unanswered_keys: Vec<Vec<u8>> = Vec::new();
+        // GETs the harness stopped feeding (past PACED in an earlier read) are
+        // still IN FLIGHT to the engine -- ONE fetch per block, so a later read
+        // that needs the same block asks nothing new. The page's RTO re-sends
+        // such a GET; this clockless harness re-sends it once at the next
+        // read's start (at m = 8 a stuck by-reference read shares blocks with
+        // the next read, sdk#321).
+        let mut in_flight: BTreeSet<Cid> = BTreeSet::new();
         for (n, key) in keys.iter().step_by(400).enumerate() {
             let mut queue = h.step(Event::Get {
                 client: ClientId(1),
                 req_id: ReqId(n as u64),
                 key: key.clone(),
             });
+            queue.extend(std::mem::take(&mut in_flight).into_iter().map(|id| Effect::FetchBlock { id, via: engine::read::Via::Direct, attempt: 1 }));
             let mut steps = 0;
             let mut served = 0usize;
             // The engine re-asks with no count that ends a read (rule 7);
@@ -1091,6 +1099,7 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
                         let times = asked.entry(id).or_insert(0);
                         *times += 1;
                         if *times > PACED {
+                            in_flight.insert(id);
                             continue;
                         }
                         let ev = match all.get(&id) {

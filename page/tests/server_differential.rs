@@ -2134,7 +2134,7 @@ fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
         if n.level() == 1 {
             let ids: Vec<Cid> = n.parity().collect();
             let (g, (_, m)) = freenet_prolly::parity::group_members(&n).into_iter().enumerate().max_by_key(|(_, (_, m))| m.len()).expect("a group");
-            break (m, ids[3 * g..3 * g + 3].to_vec());
+            break (m, ids[engine::PARITY * g..engine::PARITY * (g + 1)].to_vec());
         }
         at = n.child(0).0;
     };
@@ -2176,8 +2176,9 @@ fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
         assert!(node.blocks.contains_key(l), "rebuilt leaf {i} was not PUT back to the node");
     }
     assert_eq!(node.blocks.get(&members[0]), Some(&first_leaf), "the leaf PUT back is not the leaf that was lost");
-    // FOUR lost (the three again, and a fourth): a fresh page cannot rebuild the group any more.
-    for l in &members[..4] {
+    // PARITY + 1 lost (the three again, and more): a fresh page cannot rebuild the group any more.
+    assert!(members.len() > engine::PARITY, "the group has {} members: too small to lose PARITY + 1", members.len());
+    for l in &members[..engine::PARITY + 1] {
         node.blocks.remove(l);
     }
     let mut late = PageRig::new();
@@ -2206,7 +2207,7 @@ fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
         Some(Reply::Value { value: Some(v), .. }) if v == value(want).into_bytes() => {}
         other => panic!("the block came back and the read answered {other:?} (asked {asked} times while it was gone)"),
     }
-    println!("  4 of a group lost: 5 min NotFound, {asked} GETs, no Unavailable; block back -> the read answers");
+    println!("  {} of a group lost: 5 min NotFound, {asked} GETs, no Unavailable; block back -> the read answers", engine::PARITY + 1);
 }
 
 /// **A BLOCK THE NODE IS SILENT ABOUT FOR FIVE MINUTES IS STILL READ** (the

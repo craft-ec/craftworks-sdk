@@ -9,7 +9,7 @@ description = "The probed fixtures. The only supported way to build the thing un
 engine = { path = "../engine" }
 protocol = { path = "../protocol" }
 craftworks-sdk = { path = ".." }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 # THE PAGE PATH'S NODE (`page_node`): the in-page engine's Server, over a
 # scripted client API that runs the REAL signer and the REAL Register merge.
 page = { path = "../page" }
