@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const { Session } = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
@@ -41,7 +42,17 @@ function stdlib(frames = [], signerAnswer = null) {
   return JSON.parse(r.stdout);
 }
 /** Register params as `wire::register_params` lays them out: RG01, mode 0, the key, the name. */
-const params = keyByte => new Uint8Array([...enc("RG01"), 0, ...new Array(32).fill(keyByte), ...enc("head")]);
+// A REAL ed25519 public key per `keyByte` (the Register crate's params reader refuses a key that is no
+// usable point, sdk#364), the same key each time for one `keyByte`.
+const keys = new Map();
+const pubKey = keyByte => {
+  if (!keys.has(keyByte)) {
+    const { publicKey } = generateKeyPairSync("ed25519");
+    keys.set(keyByte, Buffer.from(publicKey.export({ format: "jwk" }).x, "base64url"));
+  }
+  return keys.get(keyByte);
+};
+const params = keyByte => new Uint8Array([...enc("RG01"), 0, ...pubKey(keyByte), ...enc("head")]);
 /** A page whose registration was answered, its Register query not yet. */
 const asking = () => {
   const s = new Session(7999);
