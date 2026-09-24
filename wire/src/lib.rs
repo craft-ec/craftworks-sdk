@@ -603,14 +603,24 @@ fn frames(req: &ClientRequest<'static>, stream_id: u32) -> Result<Vec<Vec<u8>>, 
         .collect()
 }
 
-/// The contract a node's GET refusal names, if the bytes are one.
-fn get_refused(bytes: &[u8]) -> Option<([u8; 32], String)> {
-    use freenet_stdlib::client_api::{ClientError, ContractError, ErrorKind, RequestError};
+/// The node's `ContractError`, if the bytes are one: the one decode both
+/// refusals below read.
+fn contract_error(bytes: &[u8]) -> Option<freenet_stdlib::client_api::ContractError> {
+    use freenet_stdlib::client_api::{ClientError, ErrorKind, RequestError};
     let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
         return None;
     };
     match e.kind() {
-        ErrorKind::RequestError(RequestError::ContractError(ContractError::Get { key, cause })) => {
+        ErrorKind::RequestError(RequestError::ContractError(c)) => Some(c.clone()),
+        _ => None,
+    }
+}
+
+/// The contract a node's GET refusal names, and the node's cause, if the bytes
+/// are one.
+fn get_refused(bytes: &[u8]) -> Option<([u8; 32], String)> {
+    match contract_error(bytes)? {
+        freenet_stdlib::client_api::ContractError::Get { key, cause } => {
             let mut id = [0u8; 32];
             id.copy_from_slice(&key.id().as_bytes()[..32]);
             Some((id, cause.to_string()))
@@ -622,14 +632,8 @@ fn get_refused(bytes: &[u8]) -> Option<([u8; 32], String)> {
 /// The contract (named as [`AckKind::Put`] names it) and the node's cause, if
 /// the bytes are a PUT refusal.
 fn put_refused(bytes: &[u8]) -> Option<(String, String)> {
-    use freenet_stdlib::client_api::{ClientError, ContractError, ErrorKind, RequestError};
-    let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
-        return None;
-    };
-    match e.kind() {
-        ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key, cause })) => {
-            Some((key.to_string(), cause.to_string()))
-        }
+    match contract_error(bytes)? {
+        freenet_stdlib::client_api::ContractError::Put { key, cause } => Some((key.to_string(), cause.to_string())),
         _ => None,
     }
 }
