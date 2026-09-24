@@ -369,17 +369,12 @@ fn sweep_seed(params: Params, seed: u64) -> SweepSeed {
             if let Some((seq, _, _)) = head_of(&out) {
                 let out = h.step(Event::HeadConfirmed(seq));
                 seen.absorb(&out);
-                // The parity that follows the head (#378 P1-hybrid) goes out as it lands, BEFORE the commit's
-                // `Published`: answered too. A published commit can open the next one, after it.
-                let told = out.iter().position(|f| matches!(f, Effect::Notify { .. })).unwrap_or(out.len());
-                let follow = ids(&out[..told]);
-                let mut more = ids(&out[told..]);
+                // A published commit can open the next one; the parity that follows the head (#378 P1-hybrid)
+                // goes out as it lands, and is answered too.
+                let mut more = ids(&out);
                 for i in (1..more.len()).rev() {
                     more.swap(i, (r() % (i as u64 + 1)) as usize);
                 }
-                // After the shuffle, so the seed's random stream is the same in both modes: a rehydrated commit
-                // without carried ops cannot re-derive its follow-up parity, so the two modes' lists differ in length.
-                more.extend(follow);
                 for id in more {
                     let out = h.step(Event::PutConfirmed(id));
                     seen.absorb(&out);
