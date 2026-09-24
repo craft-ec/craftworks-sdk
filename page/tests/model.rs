@@ -24,7 +24,7 @@
 //! 2. Every UPDATE carries bytes the signer returned.
 //! 3. A published root is RECOVERABLE on the node: a reader that repairs
 //!    (#300) reads every block it reaches, because race put signs a head
-//!    when every changed group has k of its k+3 (COMMIT-LIFE §P: SAVED).
+//!    when every changed group has k of its k+m (COMMIT-LIFE §P: SAVED).
 //!    And (3b) at a write's `ParityComplete` (BACKED_UP), the root it was
 //!    published at is WHOLE on the node: every block held, no repair needed.
 //! 4. Once the faults stop, every write is published, and the final tree
@@ -304,7 +304,7 @@ impl Node {
 
 /// The node's blocks, plus blocks REBUILT from their sibling groups (#300):
 /// what a reader that repairs can read. Race put signs a head when every
-/// changed group is RECOVERABLE (k of k+3), not when every block is held
+/// changed group is RECOVERABLE (k of k+m), not when every block is held
 /// (COMMIT-LIFE §P), so a published tree may be readable only this way until
 /// its stragglers land.
 struct Repairing<'a> {
@@ -761,7 +761,7 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                 }
                 if let Some((k, v)) = a.inflight.get(&wid.0) {
                     // As a REPAIRING reader reads it (§P: SAVED is k of
-                    // k+3 per group; its stragglers may still be in flight).
+                    // k+m per group; its stragglers may still be in flight).
                     match node.tree_repairing(&root) {
                         Ok(t) if t.get(k) == Some(v) => {}
                         Ok(_) => return Err(format!("page {i}: write {} Published at ({seq}, ..) whose tree does not hold its value, even repaired", wid.0)),

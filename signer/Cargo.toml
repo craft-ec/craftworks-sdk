@@ -26,7 +26,7 @@ freenet-stdlib = { version = "0.10.0", features = ["contract"] }
 contract-keys = { path = "../contract-keys" }
 # The root check hashes the root block the way the tree does (kind + block_id): the SAME rev as every other
 # freenet-prolly pin in this repo.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "d61a030" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 # The Register state format's ONE owner (builder#117 review): a page-named site's record is read and verified by its
 # `read`, the library the site contract itself links -- never a second parser. The SDK's one pin of it (the same
 # source as the released register.wasm); `default-features = false`: no contract entry points. HERE and not in

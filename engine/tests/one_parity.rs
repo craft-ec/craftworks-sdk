@@ -1,5 +1,5 @@
 //! ONE OWNER FOR PARITY PER GROUP (the architect, #351): the engine and the page take the
-//! TREE's number, `freenet_prolly::rs::PARITY` (re-exported as
+//! TREE's number, `freenet_prolly::parity::PARITY` (re-exported as
 //! `engine::PARITY`), and never writes it by hand. A hand-written 3 was right
 //! only while the tree's number was 3; this fails the build on one.
 //!
@@ -54,8 +54,16 @@ fn the_engine_writes_no_parity_count_by_hand() {
     scan(&root.join("src"), true, &mut found);
     scan(&root.join("tests"), false, &mut found);
     // The PAGE counts group blocks too (a head's `after`, its held effects):
-    // a page-side literal is the same copy.
+    // a page-side literal is the same copy. And every other crate's source
+    // and tests (sdk#321: a page TEST sliced `ids[3 * g..3 * g + 3]` and read
+    // the wrong parity once the tree's number moved).
     scan(&root.join("../page/src"), true, &mut found);
+    for dir in ["page/tests", "page-io/src", "page-io/tests", "web/src", "web/tests", "testkit/src", "testkit/tests", "src", "tests", "wire/src", "signer/src", "probe/src"] {
+        let d = root.join("..").join(dir);
+        if d.is_dir() {
+            scan(&d, dir.ends_with("src"), &mut found);
+        }
+    }
     assert!(found.is_empty(), "a hand-written parity count; use engine::PARITY (the tree's):\n{}", found.join("\n"));
 }
 

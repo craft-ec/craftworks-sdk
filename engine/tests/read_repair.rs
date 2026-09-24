@@ -126,16 +126,19 @@ fn right(answers: &BTreeMap<Vec<u8>, ReadResult>, records: &BTreeMap<Vec<u8>, Ve
 }
 
 #[test]
-fn up_to_three_lost_blocks_of_a_group_are_rebuilt_and_every_read_is_right() {
+fn up_to_parity_lost_blocks_of_a_group_are_rebuilt_and_every_read_is_right() {
     let records = records();
     let (root, mut all) = tree(&records);
     let (members, parity) = a_leaf_group(&mut all, root);
     let k = members.len();
-    assert!(k >= 7, "the group has {k} members: too small to be a real group");
+    assert!(k > PARITY, "the group has {k} members: too small to lose PARITY of them");
+    // PARITY lost, spread evenly from the group's first member to its last.
+    let spread: Vec<Cid> = (0..PARITY).map(|i| members[i * (k - 1) / (PARITY - 1)]).collect();
+    let mixed: Vec<Cid> = members[1..PARITY].iter().copied().chain(std::iter::once(parity[0])).collect();
     for (case, lost) in [
-        ("1 member", vec![members[0]]),
-        ("3 members", vec![members[0], members[k / 2], members[k - 1]]),
-        ("2 members and 1 parity", vec![members[1], members[2], parity[0]]),
+        ("1 member".to_string(), vec![members[0]]),
+        (format!("{PARITY} members"), spread),
+        (format!("{} members and 1 parity", PARITY - 1), mixed),
     ] {
         let lost: BTreeSet<Cid> = lost.into_iter().collect();
         let lost_leaves: Vec<Cid> = members.iter().copied().filter(|m| lost.contains(m)).collect();
@@ -158,17 +161,17 @@ fn up_to_three_lost_blocks_of_a_group_are_rebuilt_and_every_read_is_right() {
 /// (a keeper's repair, a late PUT); `Unavailable` would have thrown away the
 /// read that could then be answered.
 #[test]
-fn four_lost_blocks_of_a_group_wait_and_are_never_answered_unavailable() {
+fn parity_plus_one_lost_blocks_of_a_group_wait_and_are_never_answered_unavailable() {
     let records = records();
     let (root, mut all) = tree(&records);
     let (members, _) = a_leaf_group(&mut all, root);
-    let lost: BTreeSet<Cid> = members[..4].iter().copied().collect();
+    let lost: BTreeSet<Cid> = members[..PARITY + 1].iter().copied().collect();
     let keys = keys_in(&all, &members[..1]);
     let (answers, e) = read_cold(root, &all, &lost, &keys, Params::default());
     assert!(answers.is_empty(), "past the group's reach a read ended: {answers:?}");
     assert!(e.awaits_block(&members[0]), "the engine stopped waiting on the lost block: nothing would ask for it again");
     assert_eq!(e.repair_counts().1, 0, "a group short of k rebuilt something");
-    println!("  4 lost: {} read(s) waiting, block still awaited, repairs {:?}", keys.len(), e.repair_counts());
+    println!("  {} lost: {} read(s) waiting, block still awaited, repairs {:?}", PARITY + 1, keys.len(), e.repair_counts());
 }
 
 /// THE CONTROL: the same network, repair off -- one lost member is a read
