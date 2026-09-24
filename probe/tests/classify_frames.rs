@@ -103,3 +103,65 @@ fn every_frame_the_sdk_sends_gets_the_rulings_verdict() {
     assert_eq!(v("sign"), one("signer:sign", "fail"));
     assert_eq!(v("garbage"), one("undecodable", "fail"), "a frame that does not decode is FAILED, never skipped");
 }
+
+const WEBAPP_CODE: &[u8] = b"the webapp contract's code, as the harness reads it from webapp.wasm";
+
+/// `classify` with the load-piece inputs: the published list and the webapp code.
+fn classify_with_pieces(input: &[String], pieces_json: &serde_json::Value) -> Vec<serde_json::Value> {
+    let dir = std::env::temp_dir().join(format!("classify-frames-pieces-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (block, webapp, pieces) = (dir.join("block.wasm"), dir.join("webapp.wasm"), dir.join("pieces.json"));
+    std::fs::write(&block, BLOCK_CODE).unwrap();
+    std::fs::write(&webapp, WEBAPP_CODE).unwrap();
+    std::fs::write(&pieces, pieces_json.to_string()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_classify-frames"))
+        .args(["--block-code", block.to_str().unwrap(), "--pieces", pieces.to_str().unwrap(), "--webapp-code", webapp.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    child.stdin.take().unwrap().write_all((input.join("\n") + "\n").as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "classify-frames failed");
+    String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+/// A web container PUT, as the SDK frames it (`wire::webapp` + `wire::frame_put`).
+fn webapp_put(state: &[u8]) -> Vec<Vec<u8>> {
+    let params = wire::webapp::params(state);
+    wire::frame_put(container(WEBAPP_CODE, &params), WrappedState::new(state.to_vec()), 1).unwrap()
+}
+
+/// A LOAD PIECE's repair (sdk#347) is judged by the published pieces list: a
+/// PUT at a listed address whose state IS that piece's container is a repair
+/// (reported); ANY other state at that address fails; a web container the list
+/// does not name fails. Proved by the address the list names, which commits
+/// to blake3(state): only the exact container gives it.
+#[test]
+fn a_load_piece_put_is_a_repair_only_when_its_state_is_the_listed_piece() {
+    let piece = b"piece 3 of the core bundle".to_vec();
+    let state = wire::webapp::app_container(&[("piece", piece.as_slice())]).unwrap();
+    let at = wire::webapp::address(WEBAPP_CODE, &state);
+    let list = serde_json::json!({ "core": { "k": 1, "m": 1, "pieces": [{ "address": at, "sha256": "not read: the address is the proof" }] } });
+
+    // A real piece re-PUT.
+    let rows = classify_with_pieces(&lines("real", webapp_put(&state)), &list);
+    let real: Vec<_> = rows.iter().filter(|r| r["window"] == "real").collect();
+    assert_eq!(real.len(), 1, "{rows:?}");
+    assert_eq!((real[0]["code"].as_str(), real[0]["verdict"].as_str(), real[0]["piece"].as_str()), (Some("piece"), Some("report"), Some("core#0")), "a verified piece re-PUT was not a repair: {:?}", real[0]);
+    assert_eq!(real[0]["contract"].as_str(), Some(at.as_str()), "THE SETUP: the PUT is not at the listed address");
+
+    // TAMPERED: the listed address's contract, a different state.
+    let other = wire::webapp::app_container(&[("piece", b"not that piece".as_slice())]).unwrap();
+    let tampered = wire::frame_put(container(WEBAPP_CODE, &wire::webapp::params(&state)), WrappedState::new(other), 1).unwrap();
+    let rows = classify_with_pieces(&lines("tampered", tampered), &list);
+    let t: Vec<_> = rows.iter().filter(|r| r["window"] == "tampered").collect();
+    assert_eq!(t[0]["contract"].as_str(), Some(at.as_str()), "THE SETUP: the tampered PUT is not at the listed address");
+    assert_eq!(t[0]["verdict"].as_str(), Some("fail"), "a state that is not the listed piece passed as its repair: {:?}", t[0]);
+
+    // A web container the list does not name.
+    let unknown = wire::webapp::app_container(&[("index.html", b"an app".as_slice())]).unwrap();
+    let rows = classify_with_pieces(&lines("unknown", webapp_put(&unknown)), &list);
+    let u: Vec<_> = rows.iter().filter(|r| r["window"] == "unknown").collect();
+    assert_eq!((u[0]["code"].as_str(), u[0]["verdict"].as_str()), (Some("other"), Some("fail")), "an unlisted webapp PUT was not a failure: {:?}", u[0]);
+}
