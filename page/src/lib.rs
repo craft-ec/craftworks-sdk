@@ -266,6 +266,9 @@ fn waiting_name(w: &Waiting) -> String {
 #[derive(Debug, Clone)]
 struct Deadline {
     at: u64,
+    /// The deadline it was given when SENT: a re-arm never moves it past this
+    /// (sdk#378).
+    armed: u64,
     op: Op,
     sent_at: u64,
     attempt: u32,
@@ -1352,6 +1355,7 @@ impl Page {
             let at = self.now + self.backoff(self.deadlines[&w].attempt);
             let d = self.deadlines.get_mut(&w).expect("listed");
             d.at = at;
+            d.armed = at;
             d.sent_at = self.now;
             d.resent = true;
             // Every label's in-flight read is re-sent (each re-subscribes its own register);
@@ -1667,7 +1671,8 @@ impl Page {
         // other op's answers, so an op nobody answers was re-sent at that
         // small RTO for ever -- thousands of GETs in five minutes (measured
         // on a silent node once silence stopped ending a read).
-        let d = Deadline { at: self.now + self.backoff(attempt), op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false };
+        let at = self.now + self.backoff(attempt);
+        let d = Deadline { at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false };
         self.deadlines.insert(w, d);
         self.out.push(op);
     }
@@ -1737,7 +1742,7 @@ impl Page {
     fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
-        self.deadlines.insert(w, Deadline { at, op, sent_at: self.now, attempt, sent: false, resent: false });
+        self.deadlines.insert(w, Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false });
     }
 
     /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
@@ -1748,12 +1753,8 @@ impl Page {
         self.attempt_of.remove(w);
         self.first_of.remove(w);
         if d.sent && d.attempt == 1 && !d.resent {
-            let before = self.rto.rto_ms();
             self.rto.sample(self.now.saturating_sub(d.sent_at));
-            let rto = self.rto.rto_ms();
-            if rto < before {
-                self.rearm_first_sends(rto);
-            }
+            self.rearm_first_sends(self.rto.rto_ms());
         }
         if d.sent && matches!(w, Waiting::Get(_)) {
             self.window.opened();
@@ -1762,19 +1763,26 @@ impl Page {
         Some(d.op)
     }
 
-    /// A sample LOWERED the RTO (sdk#378, the architect's ruling): every op
-    /// still on its FIRST send was given a deadline from the RTO it went out
-    /// under, and a deadline is fixed at send -- so an op sent while the RTO
-    /// was backed off to its 60 s ceiling waited out the full minute although
-    /// the path had long come back (measured: V's first save, one lost PUT
-    /// re-sent at +59,999 ms while its 12 siblings were answered in 2.1 s).
-    /// Each such deadline becomes `min(current, sent_at + rto)`. A RE-SEND
-    /// keeps its backoff (it was sent because its first send went
-    /// unanswered), and so does an op re-sent on a reconnect.
+    /// EVERY first-send sample restarts the timer of every op still on its
+    /// FIRST send from THIS answer, never later than the deadline it was sent
+    /// with: `min(armed, now + rto)` (sdk#378; RFC 6298 §5.3, the architect).
+    ///
+    /// A deadline fixed at send let an op sent while a cold phase had backed
+    /// the shared RTO to its 60 s ceiling wait out the full minute though its
+    /// siblings kept answering (measured: V's first save, one lost PUT re-sent
+    /// at +59,999 ms, 12 siblings answered on first send within 2.1 s). Timed
+    /// from the SEND instead (`sent_at + rto`), the first -- fastest -- answer
+    /// of a batch the node serialises (F61, ~37 ms an op) would declare every
+    /// sibling queued past a few places lost while still being answered:
+    /// duplicate PUTs into the same queue. From the ANSWER, nothing is lost
+    /// while its siblings keep answering within one RTO of each other; a
+    /// re-arm may move a deadline later than a previous one, never past
+    /// `armed`. A RE-SEND keeps its backoff, and so does a reconnect re-send.
     fn rearm_first_sends(&mut self, rto: u64) {
+        let now = self.now;
         for d in self.deadlines.values_mut() {
             if d.sent && d.attempt == 1 && !d.resent {
-                d.at = d.at.min(d.sent_at + rto);
+                d.at = d.armed.min(now + rto);
             }
         }
     }
@@ -2498,6 +2506,9 @@ mod parked_get {
         p.send(Waiting::Get(id), Op::Get { id });
         assert!(p.take_ops().contains(&Op::Get { id }), "the GET did not go out");
         p.answer(Answer::GetMissed(id), Ms(10));
+        // The page's OPENING head read is on the wire too; answered here, through the real path, so the tick
+        // below tests only the parked GET (a first-send sample re-arms every first send, sdk#378).
+        p.answered(&Waiting::RecoverHead);
         // After the answer: an attempt-1 answer is an RTO sample, and it opens the window.
         let (rto_before, window_before) = (p.rto.rto_ms(), p.window.size());
         let (sent, due) = p.deadlines.get(&Waiting::Get(id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
@@ -2505,9 +2516,6 @@ mod parked_get {
         assert_eq!(due, 10 + p.backoff(1), "parked at a backoff other than send()'s");
         assert_eq!(p.gets_in_flight(), 0, "a parked GET holds a window place");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "a NotFound GET was re-sent at once");
-        // The page's OPENING head read is on the wire too, and the GET's sample re-armed it to the new RTO
-        // (sdk#378), so it would time out at this very tick -- a real timeout, and not this test's subject.
-        p.deadlines.remove(&Waiting::RecoverHead);
         p.tick(Ms(due));
         assert_eq!(p.rto.rto_ms(), rto_before, "a parked GET coming due was counted as a timeout");
         assert_eq!(p.window.size(), window_before, "a parked GET coming due halved the window");
@@ -2522,7 +2530,7 @@ mod rto_rearm {
     use super::*;
 
     /// sdk#378: an op sent while the RTO was backed off to its ceiling is
-    /// re-sent at the NEW RTO once a sample lowers it -- not after the minute
+    /// re-sent one NEW RTO after its sibling's answer -- not after the minute
     /// it was first given -- while a RE-SEND keeps its backoff.
     #[test]
     fn a_first_send_is_rearmed_when_a_sample_lowers_the_rto_and_a_resend_is_not() {
@@ -2549,14 +2557,63 @@ mod rto_rearm {
         p.answered(&Waiting::Put(answered));
         let rto = p.rto.rto_ms();
         assert!(rto < 1_000, "THE SETUP: the sample did not lower the RTO ({rto} ms)");
-        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_000 + rto, "the lost PUT still waits out the ceiling it was sent under");
+        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_100 + rto, "the lost PUT is not due one new RTO after its sibling's answer");
         assert_eq!(p.deadlines[&Waiting::Put(resend)].at, resend_at, "a RE-SEND was pulled in: it keeps its backoff");
 
-        // And it is re-sent at the new RTO, not after a minute.
-        p.tick(Ms(1_000 + rto));
+        // And it is re-sent one RTO after that answer, not after a minute.
+        p.tick(Ms(1_100 + rto));
         let again = p.take_ops();
         assert!(again.contains(&Op::Put { id: lost, bytes: vec![2] }), "the lost PUT was not re-sent at the new RTO: {again:?}");
         assert!(!again.iter().any(|o| matches!(o, Op::Put { id, .. } if *id == resend)), "the re-send went again early");
+    }
+}
+
+#[cfg(test)]
+mod rto_rearm_queue {
+    use super::*;
+
+    /// THE QUEUE (the architect, sdk#378): the node answers one client's ops
+    /// one at a time (F61), so a batch's answers arrive spread out, the first
+    /// the fastest. With the RTO at its ceiling, 13 PUTs go at once; 12 are
+    /// answered every 175 ms from 100 ms on, one never is. No answered
+    /// sibling is ever re-sent -- none is declared lost while the others keep
+    /// answering -- and the lost one is re-sent one RTO after the LAST answer.
+    #[test]
+    fn a_serialised_batch_re_sends_only_the_lost_put_one_rto_after_the_last_answer() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        // THE COLD OPEN, through the real path: the opening head read times out until the RTO is at its
+        // ceiling, then is answered on a RE-send -- no sample (Karn), so the batch meets the ceiling.
+        while p.rto.rto_ms() < rto::RTO_MAX_MS as u64 {
+            let due = p.deadlines[&Waiting::RecoverHead].at;
+            p.tick(Ms(due));
+            let _ = p.take_ops();
+        }
+        let start = p.now;
+        p.answered(&Waiting::RecoverHead);
+        assert_eq!(p.rto.rto_ms(), rto::RTO_MAX_MS as u64, "THE SETUP: the RTO is not at its ceiling");
+        assert!(p.rto.srtt_ms().is_none(), "THE SETUP: a sample was taken before the batch");
+        let ids: Vec<[u8; 32]> = (1..=13u8).map(|i| [i; 32]).collect();
+        let lost = ids[12];
+        for id in &ids {
+            p.send(Waiting::Put(*id), Op::Put { id: *id, bytes: vec![id[0]] });
+        }
+        let _ = p.take_ops();
+        let mut resent: Vec<u8> = Vec::new();
+        let mut last = 0;
+        for (i, id) in ids[..12].iter().enumerate() {
+            let t = start + 100 + 175 * i as u64;
+            p.tick(Ms(t));
+            resent.extend(p.take_ops().iter().filter_map(|o| match o { Op::Put { id, .. } => Some(id[0]), _ => None }));
+            p.now = t;
+            p.answered(&Waiting::Put(*id));
+            last = t;
+        }
+        assert!(resent.is_empty(), "answered siblings were declared lost and re-sent: {resent:?}");
+        let rto = p.rto.rto_ms();
+        println!("  12 answered 175 ms apart, last at {last}; rto {rto}; the lost PUT due at {}", p.deadlines[&Waiting::Put(lost)].at);
+        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, last + rto, "the lost PUT is not due one RTO after the last answer");
+        p.tick(Ms(last + rto));
+        assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at last answer + RTO");
     }
 }
 
