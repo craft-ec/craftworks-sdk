@@ -692,6 +692,9 @@ pub struct Params {
     /// (~400 GETs); this keeps a chain an order of magnitude under that and
     /// releases the delegate between pages.
     pub max_gets_per_request: u32,
+    /// A DELTA's no-progress fetch cycles before it answers `FullReloadRequired` (sdk#135, the architect's K = 2):
+    /// cycles of answered RE-fetches only, below the node's retention floor. See `read::DeltaProgress`.
+    pub delta_stall_cycles: u8,
     /// A block the node answered NotFound is ALSO rebuilt from its sibling
     /// group (`repair`: any k of the group's k+m, verified by hash) while the
     /// page keeps asking for it (Phase 4, gap 1): an alternative source,
@@ -880,6 +883,7 @@ impl Default for Params {
             min_parked_read_bytes: 32 * 1024,
             max_fetch_per_round: 4,
             max_gets_per_request: 64,
+            delta_stall_cycles: 2,
             repair_reads: true,
             race_put: true,
             race_get: true,
@@ -2534,6 +2538,7 @@ impl<B: Blocks> Engine<B> {
                 want,
                 root,
                 frontier: None,
+                delta: read::DeltaProgress::default(),
                 levels_done: 0,
                 rounds: 0,
                 held: BTreeSet::from([root]),
@@ -2590,11 +2595,74 @@ impl<B: Blocks> Engine<B> {
         // a node evicting what it serves can make it impossible rather than
         // merely slow.
         let start = p.frontier.unwrap_or(p.root);
-        let outcome = {
-            let source = self.source();
-            read::attempt(&source, &self.params, &p.want, &start, &mut parsed)
+        let outcome = match &p.want {
+            // A DELTA resumes after the prefix it has established and KEEPS every prefix a page gives it (sdk#135): a
+            // node that evicts what it serves would otherwise make it re-fetch its whole working set for ever.
+            read::Want::Delta(spec) => {
+                let room = spec.max_entries.saturating_sub(p.delta.acc.len());
+                let step = if room == 0 {
+                    // The page limit, reached by prefixes: answered with a cursor, as a page limit always is.
+                    read::DeltaStep::Done { changes: Vec::new(), cursor: p.delta.after.clone() }
+                } else {
+                    let source = self.source();
+                    read::delta_step(&source, &self.params, spec, &p.root, p.delta.after.as_deref(), room)
+                };
+                let q = self.reads.parked.get_mut(&req_id).expect("parked");
+                match step {
+                    read::DeltaStep::Done { changes, cursor } => {
+                        let mut all = std::mem::take(&mut q.delta.acc);
+                        all.extend(changes);
+                        read::Attempt::Done(read::ReadResult::Delta { changes: all, cursor, new_root: p.root })
+                    }
+                    read::DeltaStep::Prefix { changes, after, need } => {
+                        q.delta.acc.extend(changes);
+                        // Never backwards (I2): a page's `next` is where it has decided up to.
+                        if after.is_some() && after != q.delta.after {
+                            q.delta.after = after;
+                            // A new resume position: what arrived for the old one no longer tells a re-fetch.
+                            q.delta.seen.clear();
+                        }
+                        read::Attempt::Need(need)
+                    }
+                    read::DeltaStep::Need(ids) => read::Attempt::Need(ids),
+                    read::DeltaStep::Broken(cid) => read::Attempt::Broken(cid),
+                    read::DeltaStep::Reload => read::Attempt::Done(read::ReadResult::FullReloadRequired { new_root: p.root }),
+                }
+            }
+            _ => {
+                let source = self.source();
+                read::attempt(&source, &self.params, &p.want, &start, &mut parsed)
+            }
         };
         self.nodes_parsed = parsed;
+        // THE DELTA'S STALL RULE (sdk#135; `read::DeltaProgress`): at the end of a fetch cycle -- every block it
+        // asked has ARRIVED, none still waited on -- a cycle that moved nothing and asked only blocks that had
+        // already arrived at this resume position is a livelock of answered re-fetches. Two in a row: the full read.
+        if matches!(p.want, read::Want::Delta(_)) && matches!(outcome, read::Attempt::Need(_) | read::Attempt::NeedFrom { .. }) {
+            let waiting = self.reads.waiting.values().any(|reqs| reqs.contains(&req_id));
+            if !waiting {
+                let q = self.reads.parked.get_mut(&req_id).expect("parked");
+                let marker = (q.delta.after.clone(), q.delta.acc.len());
+                if let Some(began) = q.delta.cycle_start.take() {
+                    if began == marker && !q.delta.cycle_new {
+                        q.delta.stalled += 1;
+                    } else {
+                        q.delta.stalled = 0;
+                    }
+                }
+                if q.delta.stalled >= self.params.delta_stall_cycles {
+                    self.reads.parked.remove(&req_id);
+                    self.forget_waiting(req_id);
+                    return vec![Effect::Reply {
+                        client: p.client,
+                        req_id,
+                        result: read::ReadResult::FullReloadRequired { new_root: p.root },
+                    }];
+                }
+                q.delta.cycle_start = Some(marker);
+                q.delta.cycle_new = false;
+            }
+        }
         // Only a missing CHILD is a resume point; see `Attempt::NeedFrom`.
         // Read from a borrow, so the two Need shapes can share one arm below
         // rather than needing a branch that cannot happen.
@@ -2729,6 +2797,13 @@ impl<B: Blocks> Engine<B> {
                     // fetch is emitted again every time the engine re-descends
                     // and finds the same block missing.
                     let first = self.reads.want(id, req_id, self.params.share_fetches);
+                    // A DELTA asking a block that has not arrived at this resume position is descending (progress);
+                    // one it had and lost is a re-fetch (sdk#135's stall rule).
+                    if let Some(q) = self.reads.parked.get_mut(&req_id) {
+                        if matches!(q.want, read::Want::Delta(_)) && !q.delta.seen.contains(&id) {
+                            q.delta.cycle_new = true;
+                        }
+                    }
                     // Wanted again: no longer withdrawn (sdk#303).
                     self.withdrawn.remove(&id);
                     // A race for a sibling asked this block already (sdk#303): that GET answers this read too.
@@ -4432,6 +4507,9 @@ impl<B: Blocks> Engine<B> {
                     // re-descend through this block on its next attempt.
                     if let Some(p) = self.reads.parked.get_mut(r) {
                         p.held.extend(landed.iter().copied());
+                        if matches!(p.want, read::Want::Delta(_)) {
+                            p.delta.seen.extend(landed.iter().copied());
+                        }
                         p.arrived = p.arrived.saturating_add(1);
                     }
                 }
@@ -4765,6 +4843,12 @@ impl<B: Blocks> Engine<B> {
             }
         }
         out
+    }
+
+    /// A parked DELTA's established prefix and resume key (sdk#135): only for tests that check every step is a
+    /// correct prefix of the true diff.
+    pub fn delta_prefix_for_test(&self, req_id: read::ReqId) -> Option<(Option<Vec<u8>>, Vec<(Vec<u8>, Option<Vec<u8>>)>)> {
+        self.reads.parked.get(&req_id).map(|p| (p.delta.after.clone(), p.delta.acc.clone()))
     }
 
     /// Start from a published root this engine did not write.
