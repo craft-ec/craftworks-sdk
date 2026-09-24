@@ -828,13 +828,45 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
     Ok(())
 }
 
-const SEEDS: u64 = 40;
+/// THE ONE KNOB for how many random fault schedules the model runs: `CRAFTWORKS_MODEL_SEEDS` (the batch gate runs
+/// FULL_SEEDS and prints it; `gate.sh --pr` runs a few). Every loop below derives its seeds from it, as a SHARE of
+/// the count ([`seed_range`]).
+const FULL_SEEDS: u64 = 40;
 const WRITES: usize = 12;
+
+/// The knob's value: a positive integer, else the full count.
+fn seeds_from(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse().ok()).filter(|&n: &u64| n > 0).unwrap_or(FULL_SEEDS)
+}
+
+fn seeds() -> u64 {
+    seeds_from(std::env::var("CRAFTWORKS_MODEL_SEEDS").ok().as_deref())
+}
+
+/// One loop's seeds, as `num/den` of the knob: AT LEAST that many (`min`), then on while the loop's coverage floor
+/// is not reached, NEVER past the same share of the full count (`cap`). So a small count is still a real check --
+/// every floor is still reached, or the loop runs to what it always ran and the floor assert says so -- and the full
+/// count runs exactly what it always ran.
+fn seed_range(num: u64, den: u64) -> (u64, u64) {
+    let min = (seeds() * num / den).max(1);
+    (min, (FULL_SEEDS * num / den).max(min))
+}
+
+#[test]
+fn the_seed_knob_is_a_positive_count_or_the_full_one() {
+    assert_eq!(seeds_from(None), FULL_SEEDS);
+    assert_eq!(seeds_from(Some("4")), 4);
+    assert_eq!(seeds_from(Some("0")), FULL_SEEDS);
+    assert_eq!(seeds_from(Some("many")), FULL_SEEDS);
+}
 
 #[test]
 fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_hold() {
     let mut total = Seen::default();
-    for seed in 1..=SEEDS {
+    let (min, cap) = seed_range(1, 1);
+    let mut seed = 0;
+    while seed < min || (seed < cap && (total.lost == 0 || total.record_not_saved == 0 || total.landings == 0)) {
+        seed += 1;
         let s = run(seed, WRITES, PutPath::Page).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         total.published += s.published;
         total.lost += s.lost;
@@ -844,9 +876,9 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
         total.landings += s.landings;
         total.most_landing_updates = total.most_landing_updates.max(s.most_landing_updates);
     }
-    println!("{SEEDS} seeds × 2 pages × {WRITES} writes: {total:?}");
+    println!("{seed} seeds (CRAFTWORKS_MODEL_SEEDS={}) × 2 pages × {WRITES} writes: {total:?}", seeds());
     // The model is not vacuous: the race and the faults were reached.
-    assert_eq!(total.published, SEEDS as usize * 2 * WRITES, "not every write was published once");
+    assert_eq!(total.published, seed as usize * 2 * WRITES, "not every write was published once");
     assert!(total.lost > 0, "no rebase was ever reached: the two pages never raced");
     assert!(total.updates > total.published / 2, "too few UPDATEs for the writes published");
     assert!(total.record_not_saved > 0, "the signer never failed to save its record: RecordNotSaved unexercised");
@@ -862,16 +894,19 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
     let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
     let mut most = 0;
     let mut landings = 0;
-    // 60 seeds, not 20: race put signs a head as soon as its groups are
-    // recoverable, so heads land sooner and a twice-lost UPDATE is rarer per
-    // seed (20 seeds reached at most 2). The coverage floor below is unchanged.
-    for seed in 1..=60 {
+    // 3/2 of the seeds (60 at the full count), not 1/2: race put signs a head as soon as its groups are
+    // recoverable, so heads land sooner and a twice-lost UPDATE is rarer per seed (20 seeds reached at most 2).
+    // The coverage floor below is unchanged; a small count runs on until it is reached.
+    let (min, cap) = seed_range(3, 2);
+    let mut seed = 0;
+    while seed < min || (seed < cap && (most < 3 || landings == 0)) {
+        seed += 1;
         let s = run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write published");
         most = most.max(s.most_landing_updates);
         landings += s.landings;
     }
-    println!("harsh: {landings} landings, most UPDATEs one landing needed: {most}");
+    println!("harsh: {seed} seeds, {landings} landings, most UPDATEs one landing needed: {most}");
     assert!(landings > 0, "nothing landed");
     assert!(most >= 3, "no landing's UPDATE was lost twice (most: {most})");
 }
@@ -887,14 +922,17 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
 fn two_devices_on_one_key_race_and_no_page_is_ever_unusable() {
     let cfg = Cfg { devices: 2, ..NORMAL };
     let (mut races, mut displaced, mut lost) = (0, 0, 0);
-    for seed in 1..=SEEDS / 2 {
+    let (min, cap) = seed_range(1, 2);
+    let mut seed = 0;
+    while seed < min || (seed < cap && races == 0) {
+        seed += 1;
         let s = run_with(seed, WRITES, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write was published once");
         races += s.races;
         displaced += s.displaced;
         lost += s.lost;
     }
-    println!("two devices: {races} raced seqs, {lost} Lost and re-sent, {displaced} Published writes displaced by a winner (#225b keeps them)");
+    println!("two devices: {seed} seeds, {races} raced seqs, {lost} Lost and re-sent, {displaced} Published writes displaced by a winner (#225b keeps them)");
     assert!(races > 0, "the two devices never raced at a seq: the test is vacuous");
 }
 
@@ -905,7 +943,8 @@ fn two_devices_on_one_key_race_and_no_page_is_ever_unusable() {
 #[test]
 fn with_every_hint_lost_an_idle_device_still_learns_by_the_backstop() {
     let cfg = Cfg { devices: 2, no_hints: true, ..NORMAL };
-    for seed in 1..=6 {
+    let (min, _) = seed_range(6, FULL_SEEDS);
+    for seed in 1..=min {
         run_with(seed, WRITES, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     }
 }
@@ -956,11 +995,12 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
 #[test]
 fn on_the_wrapper_path_a_put_is_confirmed_by_held_and_the_invariants_hold() {
     let mut published = 0;
-    for seed in 1..=SEEDS / 2 {
+    let (min, _) = seed_range(1, 2);
+    for seed in 1..=min {
         let s = run(seed, WRITES, PutPath::Wrapper).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         published += s.published;
     }
-    assert_eq!(published, (SEEDS / 2) as usize * 2 * WRITES);
+    assert_eq!(published, min as usize * 2 * WRITES);
 }
 
 /// THE LAND CELL, where it is needed: page A signs its commit, its UPDATE
