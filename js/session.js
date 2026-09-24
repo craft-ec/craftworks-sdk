@@ -482,6 +482,10 @@ export async function openSession(Session, {
     // The head this session stands on, as `tree()` takes it (hex; "" until
     // Identity has named it). What a publisher records so others can read it.
     headId: () => session.head_id(),
+    // The seq of the head this session has PUBLISHED, network-acknowledged
+    // (0 before the first): what a publisher records in its app.json as the
+    // views' published-head floor (sdk#349).
+    headSeq: () => session.head_seq(),
     /**
      * READ SOMEBODY'S TREE (sdk#239): the data forest, one tree per identity.
      * `registerId` is that tree's head Register (their `headId()`). Returns

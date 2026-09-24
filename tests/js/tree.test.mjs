@@ -62,6 +62,9 @@ await t("**tree(id, { seq }) opens the view with its PUBLISHED-HEAD FLOOR (sdk#3
   // THE CONTROL: with no published seq there is no floor, and nothing is said.
   const plain = await h.tree(HEAD_B);
   assert.equal(plain.waitingFor(), "", "a view with no published seq says it waits");
+  // What a publisher records as that seq: the ACKNOWLEDGED head's (page-io's
+  // published_seq, tested in wire_node), 0 before anything is published.
+  assert.equal(h.headSeq(), 0, "a session that has published nothing names a published seq");
 });
 
 await t("**tree() is a read-only Db on the SAME session: every write refused, the head it names**", async () => {

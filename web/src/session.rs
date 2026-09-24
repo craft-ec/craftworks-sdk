@@ -625,6 +625,13 @@ impl Session {
         Ok(())
     }
 
+    /// The seq of the head this session has PUBLISHED, as the network
+    /// acknowledged it (`PageIo::published_seq`), 0 before the first: what a
+    /// publisher records as its app's published-head floor (sdk#349).
+    pub fn head_seq(&self) -> f64 {
+        self.page().map_or(0, |p| p.published_seq()) as f64
+    }
+
     /// What a VIEW is waiting on because of its published-head floor
     /// (sdk#349), in words -- or empty. The node answering a head from
     /// before the app's publish is "not yet", never an empty or undefined

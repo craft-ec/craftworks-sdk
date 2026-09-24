@@ -1673,3 +1673,36 @@ fn a_head_at_the_published_seq_is_read_at_once() {
     assert_eq!(rows(&mut v, &mut node, &mut now, 92), vec![2], "a head at the published seq was not read");
     assert_eq!(v.server.page.head_floor_wait(), None, "a view at its published seq says it is still waiting");
 }
+
+/// WHAT A PUBLISHER RECORDS AS ITS APP'S FLOOR IS THE ACKNOWLEDGED SEQ
+/// (sdk#349, the architect's condition): with a second commit in flight --
+/// signed and UPDATEd, its read-back not yet showing it -- `published_seq`
+/// is still the FIRST commit's, so a publish at that moment never names a
+/// head that may not land. Once the register shows it, it moves. Mutant
+/// "the in-flight commit's seq" -> red.
+#[test]
+fn published_seq_is_the_acknowledged_head_never_one_in_flight() {
+    let mut node = WireNode::new(&[41u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    assert!(states(&client(&mut a, &mut node, &mut now, &write(1, "first", "v")), 1).contains(&WriteState::Published));
+    assert_eq!(a.published_seq(), 1);
+    // The register's reads fail: the second commit is signed and UPDATEd, and
+    // its read-back never shows it.
+    node.fail_register_gets = usize::MAX;
+    let r = client(&mut a, &mut node, &mut now, &write(2, "second", "v"));
+    assert!(!states(&r, 2).contains(&WriteState::Published), "THE CONTROL: the second commit was acknowledged anyway");
+    assert_eq!(node.head().map(|(s, _)| s), Some(2), "THE CONTROL: the second commit's head is not on the node");
+    assert_eq!(a.published_seq(), 1, "the publisher's seq moved to a commit the network has not acknowledged");
+    node.fail_register_gets = 0;
+    let mut st = Vec::new();
+    for _ in 0..100 {
+        if st.contains(&WriteState::Published) { break; }
+        now += 1_000;
+        a.tick(Ms(now));
+        st.extend(states(&settle(&mut a, &mut node, &mut now), 2));
+    }
+    assert!(st.contains(&WriteState::Published), "the second commit never published: {:?}", a.unusable());
+    assert_eq!(a.published_seq(), 2, "the acknowledged seq did not move with the read-back");
+}
