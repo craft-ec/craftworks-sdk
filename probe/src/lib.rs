@@ -344,6 +344,33 @@ mod tests {
         assert_eq!(c.delegate[0].1, DEFINED_BY_NODE[0]);
     }
 
+    /// **NO DELEGATE REACHES THE INSTRUMENT** (the architect's check 5 on sdk#386's instrument work).
+    ///
+    /// A delegate's wasm hash is its key: a dependency's identity alone moves it, so a recording spine in a
+    /// delegate's closure would re-key the signer. The signer and the probe delegate are compiled by the node; the
+    /// ENGINE is built into a delegate too while one builds from it. None of them may have `instrument` in its
+    /// NORMAL closure. THE CONTROL: `page`, which records, must -- or the check could not see it at all.
+    #[test]
+    fn no_delegate_reaches_the_instrument() {
+        let here = std::env::current_dir().expect("a working directory");
+        let root = here.parent().expect("the workspace root is the probe's parent");
+        for (pkg, may) in [("signer", false), ("probe-delegate", false), ("engine", false), ("page", true)] {
+            let out = std::process::Command::new(env!("CARGO"))
+                .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
+                .current_dir(root)
+                .output()
+                .expect("cargo tree must run: a gate that cannot check has not checked");
+            assert!(out.status.success(), "cargo tree failed for {pkg}, so NOTHING was checked: {}", String::from_utf8_lossy(&out.stderr));
+            let tree = String::from_utf8_lossy(&out.stdout);
+            let has = tree.lines().any(|l| l.split_whitespace().next() == Some("instrument"));
+            assert_eq!(
+                has, may,
+                "`{pkg}`: instrument in its normal closure is {has}, must be {may}. A delegate's wasm hash is its key, \
+                 so the recording spine must never reach one; `page` records, so it must (THE CONTROL)."
+            );
+        }
+    }
+
     /// **A positive allowlist over EVERY workspace crate.**
     ///
     /// `freenet-stdlib` — and the client stack that comes with it — may appear

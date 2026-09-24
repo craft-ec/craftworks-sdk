@@ -825,7 +825,7 @@ checksum = "8e04e2fd2b8188ea827b32ef11de88377086d690286ab35747ef7f9bf3ccb590"
 [[package]]
 name = "instrument"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/craftworks-instrument?rev=4b269b5ecb128b49590c5f072b395d68587b6b37#4b269b5ecb128b49590c5f072b395d68587b6b37"
+source = "git+https://github.com/craft-ec/craftworks-instrument?rev=356f67d#356f67d506ebfed1bdcbbe25e48642f81507ab24"
 
 [[package]]
 name = "itoa"
@@ -1018,6 +1018,7 @@ dependencies = [
  "engine",
  "freenet-prolly",
  "freenet-stdlib",
+ "instrument",
  "protocol",
  "serde_json",
  "signer",

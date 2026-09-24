@@ -19,6 +19,9 @@ signer-proto = { path = "../signer-proto" }
 protocol = { path = "../protocol" }
 # F56's equal-seq tie-break is the lower BLAKE3 of the head's value (sdk#225).
 blake3 = { version = "1", default-features = false }
+# The page's own recording (sdk#386's instrument work): every op it sends, answered, timed out or withdrawn, with the
+# retry clock it used. Never an input: the trait returns unit and has no read-back.
+instrument = { workspace = true }
 
 [dev-dependencies]
 # The OLD side of the differential: the Shell over a scripted node.

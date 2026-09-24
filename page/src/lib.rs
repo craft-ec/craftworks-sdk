@@ -294,6 +294,39 @@ struct Deadline {
     /// be to that re-send, but it is still not a first send, so (Karn) its
     /// answer is no RTT sample.
     resent: bool,
+    /// The send this deadline is for, in the page's own SEND ORDER: the recording's label for it
+    /// (`Label { Request, ordinal }`). A re-send is a new send. Never the op's block id (a foreign id).
+    seq: u32,
+}
+
+/// How an op on the wire ENDED, as the page's recording says it (sdk#386's instrument work).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// The node answered it.
+    Answered,
+    /// Its deadline passed unanswered: it is sent again (rule 7).
+    TimedOut,
+    /// Nobody needs it any more (superseded, cancelled, stood in for by a push, the socket replaced).
+    Withdrawn,
+}
+
+/// The recording's SITE for an op: its kind, a compile-time name, and nothing of what it is about.
+fn op_site(w: &Waiting) -> instrument::Site {
+    use instrument::Site;
+    match w {
+        Waiting::Put(_) => Site::of("page::op::put"),
+        Waiting::Held(_) => Site::of("page::op::held"),
+        Waiting::Get(_) => Site::of("page::op::get"),
+        Waiting::Sign(_) => Site::of("page::op::sign"),
+        Waiting::Update(_) => Site::of("page::op::update"),
+        Waiting::Warm => Site::of("page::op::warm"),
+        Waiting::RecoverHead => Site::of("page::op::recover-head"),
+        Waiting::Verify => Site::of("page::op::verify"),
+        Waiting::ReadBack(_) => Site::of("page::op::read-back"),
+        Waiting::Hint => Site::of("page::op::hint"),
+        Waiting::PutApp(_) => Site::of("page::op::put-app"),
+        Waiting::Ext(_) => Site::of("page::op::ext"),
+    }
 }
 
 /// Which op a deadline is for.
@@ -627,6 +660,17 @@ pub struct Page {
     /// The clock when the page was made. No round trip can be longer than the page has existed: a sample that is
     /// was dated against another clock's origin (sdk#397), and `answered` says so.
     born: u64,
+    /// THE PAGE'S RECORDING (sdk#386's instrument work), `None` until a host attaches one: every op it sends, how it
+    /// ended, and the retry clock it used. Bounded (it drops and counts, never grows), and never an input: the page
+    /// holds it only as a `Probe`, which returns nothing.
+    rec: Option<instrument::Recorder>,
+    /// The page's clock when the recorder was attached: where the recording's offsets count from.
+    rec_start: u64,
+    /// Sends so far: the last send's label ordinal.
+    sends: u32,
+    /// The first send the recording saw: an op sent before the recorder was attached is not in it, and neither is
+    /// its end (it would be an answer to a request the recording never made).
+    rec_from: u32,
     /// Every record the signer returned — invariant 2's evidence.
     signer_records: BTreeSet<Vec<u8>>,
 }
@@ -642,10 +686,16 @@ impl Page {
     /// [`Page::new`] with its clock starting at `now` (the page model varies the origin per seed, sdk#397).
     pub fn new_at(params: Params, path: PutPath, now: Ms) -> Page {
         let mut p = Page::unstarted(params, path, now);
+        p.start();
+        p
+    }
+
+    /// START the engine: it reads its head first. Apart from [`Page::unstarted`] so a host can attach the page's
+    /// recording ([`Page::record_into`]) before the first op goes out.
+    pub fn start(&mut self) {
         // The key is in the SIGNER's secret store; the engine only states
         // where its authority comes from.
-        p.step(Event::Start { key: KeySource::SecretStore, epochs: vec![EPOCH] });
-        p
+        self.step(Event::Start { key: KeySource::SecretStore, epochs: vec![EPOCH] });
     }
 
     /// A page whose engine has not been STARTED: [`crate::server::Server`]
@@ -696,6 +746,10 @@ impl Page {
             below_floor: None,
             now: now.0,
             born: now.0,
+            rec: None,
+            rec_start: now.0,
+            sends: 0,
+            rec_from: 1,
             signer_records: BTreeSet::new(),
             next_request: 1,
         }
@@ -765,7 +819,7 @@ impl Page {
             }
         }
         for w in late {
-            let d = self.deadlines.remove(&w).expect("listed");
+            let d = self.end(&w, End::TimedOut).expect("listed");
             // A parked GET the engine no longer needs, or that the page now
             // holds (a repair rebuilt it), ends here.
             if let Waiting::Get(id) = w {
@@ -1373,15 +1427,20 @@ impl Page {
         let mut head_read = false;
         for w in on_wire {
             let at = self.now + self.backoff(self.deadlines[&w].attempt);
+            // The send on the old socket is WITHDRAWN (its answer cannot come), and the re-send is a new send.
+            self.record_end(&w, &self.deadlines[&w], End::Withdrawn);
+            let seq = self.next_send();
             let d = self.deadlines.get_mut(&w).expect("listed");
             d.at = at;
             d.armed = at;
             d.sent_at = self.now;
             d.resent = true;
+            d.seq = seq;
             // Every label's in-flight read is re-sent (each re-subscribes its own register);
             // only an in-flight HEAD read stands in for the fallback below.
             head_read |= matches!(d.op, Op::ReadHead { label: Label::Head });
             self.out.push(d.op.clone());
+            self.record_send(&w, &self.deadlines[&w]);
         }
         if !head_read && self.engine_has_head {
             self.last_head_at = self.now;
@@ -1428,8 +1487,8 @@ impl Page {
         // is on the wire for it -- the UPDATE whose answer would ask it, or the
         // GET itself -- ends here, with no RTT sample (a push is not an answer
         // to either request).
-        self.deadlines.remove(&Waiting::Update(Label::Head));
-        self.deadlines.remove(&Waiting::ReadBack(Label::Head));
+        self.end(&Waiting::Update(Label::Head), End::Withdrawn);
+        self.end(&Waiting::ReadBack(Label::Head), End::Withdrawn);
         let j = judge(self.last_head.as_ref(), &self.my_records);
         self.on_read_back(&j);
     }
@@ -1557,7 +1616,7 @@ impl Page {
         self.now = now.0;
         let label = Label::Site(app.to_string());
         for w in [Waiting::Sign(label.clone()), Waiting::Update(label.clone()), Waiting::ReadBack(label.clone())] {
-            self.deadlines.remove(&w);
+            self.end(&w, End::Withdrawn);
             self.attempt_of.remove(&w);
         }
         // `seq == 0`: the site's version is not read yet (its first read decides it).
@@ -1575,7 +1634,7 @@ impl Page {
     pub fn cancel_site(&mut self, app: &str) {
         let label = Label::Site(app.to_string());
         for w in [Waiting::Sign(label.clone()), Waiting::Update(label.clone()), Waiting::ReadBack(label.clone())] {
-            self.deadlines.remove(&w);
+            self.end(&w, End::Withdrawn);
             self.attempt_of.remove(&w);
         }
         if self.sites.remove(app).is_some() {
@@ -1703,9 +1762,65 @@ impl Page {
         // small RTO for ever -- thousands of GETs in five minutes (measured
         // on a silent node once silence stopped ending a read).
         let at = self.now + self.backoff(attempt);
-        let d = Deadline { at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false };
-        self.deadlines.insert(w, d);
+        let seq = self.next_send();
+        let d = Deadline { at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq };
+        self.record_send(&w, &d);
+        // A send still on the wire for the same op is SUPERSEDED by this one: its end is said, never overwritten.
+        if let Some(old) = self.deadlines.insert(w.clone(), d) {
+            self.record_end(&w, &old, End::Withdrawn);
+        }
         self.out.push(op);
+    }
+
+    /// The next send's place in the page's send order (the recording's label ordinal).
+    fn next_send(&mut self) -> u32 {
+        self.sends = self.sends.wrapping_add(1);
+        self.sends
+    }
+
+    /// AN OP ENDS: THE one way a deadline leaves (a control counts this crate's removals). What the recording
+    /// says of it is decided here, once: answered, timed out, or withdrawn.
+    fn end(&mut self, w: &Waiting, how: End) -> Option<Deadline> {
+        let d = self.deadlines.remove(w)?;
+        self.record_end(w, &d, how);
+        Some(d)
+    }
+
+    /// Where the recording's offsets count from: the page's clock when the recorder was attached, never 0 and
+    /// never the page's own origin (the architect on instrument#14). Coarsened by the vocabulary's rule.
+    fn offset(&self, t: u64) -> u64 {
+        instrument::vocab::coarsen_ms(t.saturating_sub(self.rec_start))
+    }
+
+    /// A SEND: its Request edge, labelled by its place in the send order, and the retry clock it went out on.
+    fn record_send(&self, w: &Waiting, d: &Deadline) {
+        use instrument::{vocab::coarsen_ms, Dir, Entry, Event, Key, Kind, Probe};
+        let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
+        let (site, id) = (op_site(w), instrument::Label { kind: Kind::Request, ordinal: d.seq });
+        rec.event(Event::Edge { site, dir: Dir::Request, id });
+        for entry in [
+            Entry { key: Key::Attempts, value: u64::from(d.attempt) },
+            Entry { key: Key::OffsetMs, value: self.offset(d.sent_at) },
+            Entry { key: Key::ArmedAtMs, value: self.offset(d.at) },
+            Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) },
+        ] {
+            rec.event(Event::Counter { site, op: id.op(), entry });
+        }
+    }
+
+    /// An END of an op on the wire (a parked one is not on the wire: its answer was recorded when it came).
+    fn record_end(&self, w: &Waiting, d: &Deadline, how: End) {
+        use instrument::{Dir, Event, Kind, Outcome, Probe};
+        let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
+        if !d.sent {
+            return;
+        }
+        let (site, id) = (op_site(w), instrument::Label { kind: Kind::Request, ordinal: d.seq });
+        rec.event(match how {
+            End::Answered => Event::Edge { site, dir: Dir::Response, id },
+            End::TimedOut => Event::Exit { site, op: id.op(), outcome: Outcome::Timeout },
+            End::Withdrawn => Event::Exit { site, op: id.op(), outcome: Outcome::Blocked },
+        });
     }
 
     /// The wait after the `attempt`-th send of one op: RTO x 2^(attempt-1),
@@ -1743,7 +1858,7 @@ impl Page {
     /// would continue from, and its place in the window's queue. An answer,
     /// a withdrawal and a block the page already holds all end a GET here.
     fn drop_get(&mut self, id: Cid) {
-        let ended = self.deadlines.remove(&Waiting::Get(id));
+        let ended = self.end(&Waiting::Get(id), End::Withdrawn);
         self.attempt_of.remove(&Waiting::Get(id));
         self.get_queue.retain(|q| *q != id);
         // A GET ended while ON THE WIRE held a place in the window: the next
@@ -1773,14 +1888,16 @@ impl Page {
     fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
-        self.deadlines.insert(w, Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false });
+        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0 }) {
+            self.record_end(&w, &old, End::Withdrawn);
+        }
     }
 
     /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
     /// (Karn: a re-sent call never is), and a GET opens the window. `None`:
     /// nothing was waiting on it.
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
-        let d = self.deadlines.remove(w)?;
+        let d = self.end(w, End::Answered)?;
         self.attempt_of.remove(w);
         self.first_of.remove(w);
         if d.sent && d.attempt == 1 && !d.resent {
@@ -1789,6 +1906,13 @@ impl Page {
             // origin -- the defect that pinned the RTO at its ceiling for a page's life (sdk#397).
             debug_assert!(r <= self.now.saturating_sub(self.born), "an RTT sample of {r} ms on a page {} ms old: a request was dated against another clock's origin", self.now.saturating_sub(self.born));
             self.rto.sample(r);
+            // The sample AS COMPUTED, before anything clamps it (the architect): a wrong clock shows here.
+            if let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) {
+                use instrument::{vocab::coarsen_ms, Entry, Event, Key, Kind, Probe};
+                let (site, op) = (op_site(w), instrument::Label { kind: Kind::Request, ordinal: d.seq }.op());
+                rec.event(Event::Counter { site, op, entry: Entry { key: Key::SampleMs, value: coarsen_ms(r) } });
+                rec.event(Event::Counter { site, op, entry: Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) } });
+            }
             self.rearm_first_sends(self.rto.rto_ms());
         }
         if d.sent && matches!(w, Waiting::Get(_)) {
@@ -1814,10 +1938,20 @@ impl Page {
     /// re-arm may move a deadline later than a previous one, never past
     /// `armed`. A RE-SEND keeps its backoff, and so does a reconnect re-send.
     fn rearm_first_sends(&mut self, rto: u64) {
+        use instrument::{Entry, Event, Key, Kind, Probe};
         let now = self.now;
-        for d in self.deadlines.values_mut() {
+        let (rec, start, from) = (&self.rec, self.rec_start, self.rec_from);
+        for (w, d) in self.deadlines.iter_mut() {
             if d.sent && d.attempt == 1 && !d.resent {
-                d.at = d.armed.min(now + rto);
+                let at = d.armed.min(now + rto);
+                if at != d.at && d.seq >= from {
+                    if let Some(rec) = rec {
+                        let op = instrument::Label { kind: Kind::Request, ordinal: d.seq }.op();
+                        let value = instrument::vocab::coarsen_ms(at.saturating_sub(start));
+                        rec.event(Event::Counter { site: op_site(w), op, entry: Entry { key: Key::ReArmedAtMs, value } });
+                    }
+                }
+                d.at = at;
             }
         }
     }
@@ -1864,6 +1998,35 @@ impl Page {
     /// The page's clock: the last time it was told.
     pub fn now(&self) -> Ms {
         Ms(self.now)
+    }
+
+    /// Ops on the wire now that the recording saw go out (sent since it was attached, unanswered, not parked): what
+    /// its open Requests must equal.
+    #[doc(hidden)]
+    pub fn ops_on_wire(&self) -> usize {
+        self.deadlines.values().filter(|d| d.sent && d.seq >= self.rec_from).count()
+    }
+
+    /// Attach the page's recording: `capacity` events, then it DROPS and counts (never grows, never panics). Its
+    /// offsets count from now. Ops sent before this are not in it.
+    pub fn record_into(&mut self, capacity: usize) {
+        self.rec = Some(instrument::Recorder::with_capacity(capacity));
+        self.rec_start = self.now;
+        self.rec_from = self.sends.wrapping_add(1);
+    }
+
+    /// The recording, for a test or a local dump: a SEPARATE read handle -- the page itself only ever writes.
+    pub fn recording(&self) -> Option<instrument::Recording<'_>> {
+        self.rec.as_ref().map(|r| r.recording())
+    }
+
+    /// The tail of the recording, rendered in the instrument's vocabulary (no user content can be in it: the
+    /// events carry sites, labels by send order, and numbers from the reviewed keys). Read locally, never published.
+    pub fn dump(&self, last: usize) -> String {
+        match &self.rec {
+            Some(r) => instrument::dump::render(&r.recording(), "page ops", last),
+            None => "no page recording attached\n".into(),
+        }
     }
 
     /// The retry clock now: `(RTO ms, SRTT ms, GET window)`.
@@ -2006,7 +2169,7 @@ impl Page {
             self.head.sign_refusals = 0;
             self.head.sign_id = None;
             for w in [Waiting::Sign(Label::Head), Waiting::Update(Label::Head), Waiting::ReadBack(Label::Head)] {
-                self.deadlines.remove(&w);
+                self.end(&w, End::Withdrawn);
             }
         }
     }
@@ -2043,9 +2206,9 @@ impl Page {
                 // re-sends, not sent at all if still held back -- because
                 // nobody needs it; that is not a cut-off of one somebody does.
                 Effect::Withdraw { id } => {
-                    self.deadlines.remove(&Waiting::Put(id));
+                    self.end(&Waiting::Put(id), End::Withdrawn);
                     self.attempt_of.remove(&Waiting::Put(id));
-                    self.deadlines.remove(&Waiting::Held(id));
+                    self.end(&Waiting::Held(id), End::Withdrawn);
                     self.attempt_of.remove(&Waiting::Held(id));
                     self.held_again.remove(&id);
                     self.put_again.remove(&id);
@@ -2211,7 +2374,7 @@ impl Page {
     pub fn cancel_app_put(&mut self, key: &str) {
         if matches!(self.app_puts.get(key), Some((AppPut::Pending, _))) {
             let w = Waiting::PutApp(key.to_string());
-            self.deadlines.remove(&w);
+            self.end(&w, End::Withdrawn);
             self.attempt_of.remove(&w);
             self.first_of.remove(&w);
             if let Some(p) = self.app_puts.get_mut(key) {
@@ -2640,6 +2803,73 @@ mod clock_origin {
         p.send_ext(Ext::SignerFirst, Ms(EPOCH_MS + 100));
         p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 110));
         assert_eq!(p.rto.srtt_ms(), Some(10.0), "the sample was not the 10 ms round trip");
+    }
+}
+
+#[cfg(test)]
+mod recording {
+    use super::*;
+    use instrument::{Dir, Entry, Event, Key, Kind, Outcome, Record};
+
+    const EPOCH_MS: u64 = 1_790_253_181_367;
+
+    fn counters(r: &instrument::Recording<'_>, ordinal: u32, key: Key) -> Vec<u64> {
+        let op = instrument::Label { kind: Kind::Request, ordinal }.op();
+        r.events().into_iter().filter_map(|e| match e { Event::Counter { op: o, entry: Entry { key: k, value }, .. } if o == op && k == key => Some(value), _ => None }).collect()
+    }
+
+    /// WHAT THE PAGE'S RECORDING SAYS OF AN OP (sdk#386's instrument work), on a page at the browser's epoch clock
+    /// with the recorder attached 5 s after it was made: a send is a Request labelled by send order, with its
+    /// attempt, when it went and when it is due as OFFSETS from the attach (never the page's clock), and the RTO it
+    /// used; unanswered, it is closed Timeout and its re-send is a NEW Request; a first-send answer is a Response
+    /// and records its sample as computed and the RTO after it. The block's id is in none of it.
+    #[test]
+    fn a_send_its_timeout_its_resend_and_an_answer_are_recorded_by_send_order_and_offset() {
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        p.now = EPOCH_MS + 5_000;
+        p.record_into(1024);
+        let id = [7u8; 32];
+        p.send(Waiting::Put(id), Op::Put { id, bytes: vec![1] });
+        let r = p.recording().expect("attached");
+        let reqs: Vec<u32> = r.events().into_iter().filter_map(|e| match e { Event::Edge { dir: Dir::Request, id, .. } => Some(id.ordinal), _ => None }).collect();
+        assert_eq!(reqs, vec![1], "the send is not req#1");
+        assert_eq!(counters(&r, 1, Key::OffsetMs), vec![0], "the send's offset does not count from the attach");
+        assert_eq!(counters(&r, 1, Key::ArmedAtMs), vec![1_000], "armed at the initial RTO after the attach");
+        assert_eq!(counters(&r, 1, Key::RtoMs), vec![1_000]);
+        assert_eq!(counters(&r, 1, Key::Attempts), vec![1]);
+        // Unanswered: it times out and is sent again -- a new send.
+        p.tick(Ms(EPOCH_MS + 6_000));
+        let r = p.recording().expect("attached");
+        assert!(r.events().contains(&Event::Exit { site: op_site(&Waiting::Put(id)), op: instrument::OpId(1), outcome: Outcome::Timeout }), "the timeout was not recorded");
+        assert_eq!(counters(&r, 2, Key::Attempts), vec![2], "the re-send is not req#2 on its second attempt");
+        // An op answered on its first send: its sample as computed, and the RTO after it.
+        p.now = EPOCH_MS + 6_100;
+        p.send_ext(Ext::SignerFirst, Ms(EPOCH_MS + 6_100));
+        p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 6_140));
+        let r = p.recording().expect("attached");
+        assert_eq!(counters(&r, 3, Key::SampleMs), vec![40], "the sample is not the 40 ms round trip");
+        assert_eq!(counters(&r, 3, Key::RtoMs).last(), Some(&coarse(p.rto.rto_ms())));
+        assert!(r.events().contains(&Event::Edge { site: op_site(&Waiting::Ext(Ext::SignerFirst)), dir: Dir::Response, id: instrument::Label { kind: Kind::Request, ordinal: 3 } }));
+        let dump = p.dump(40);
+        assert!(!dump.contains("0707"), "the block id leaked into the dump:\n{dump}");
+        println!("{dump}");
+    }
+
+    fn coarse(ms: u64) -> u64 {
+        instrument::vocab::coarsen_ms(ms)
+    }
+
+    /// ONE SITE (the architect's check 2), held by the source: a deadline leaves only through `end`, arrives only
+    /// through `send` and `park`, and an op reaches the wire only from `send` and `reconnected` -- each of which
+    /// records. A new path that bypassed them would be an op the recording never saw.
+    #[test]
+    fn a_deadline_ends_only_through_end_and_an_op_goes_out_only_from_send_or_reconnected() {
+        let src = include_str!("lib.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("the tests follow the code")];
+        let count = |pat: &str| body.matches(pat).count();
+        assert_eq!(count(concat!("deadlines", ".remove(")), 1, "a deadline is removed outside `end`: its end is not recorded");
+        assert_eq!(count(concat!("deadlines", ".insert(")), 2, "a deadline is made outside `send`/`park`");
+        assert_eq!(count(concat!("self.out", ".push(")), 2, "an op is put on the wire outside `send`/`reconnected`: it is not recorded");
     }
 }
 
