@@ -17,6 +17,7 @@ fn write(id: u64, ops: Vec<(&str, Op)>, reads: Vec<(&str, Expect)>) -> Event {
         write_id: WriteId(id),
         ops: ops.into_iter().map(|(k, o)| (k.as_bytes().to_vec(), o)).collect(),
         reads: reads.into_iter().map(|(k, e)| (k.as_bytes().to_vec(), e)).collect(),
+        deferred: false,
     }
 }
 

@@ -539,6 +539,29 @@ fn a_cold_reader_reads_every_row_through_a_silent_root() {
     assert!(rr.gets.get(&root).copied().unwrap_or(0) >= 1, "the root was never asked: the silence never fired");
 }
 
+/// DEFERRED ON THE WIRE (sdk#350): a `DeferredCommit` frame is held --
+/// `Accepted`, no block PUT, no head -- and the next data `Commit` carries it
+/// in ONE commit. What a published app's open sends is its defines; a viewer
+/// who never writes commits nothing.
+#[test]
+fn a_deferred_commit_frame_is_held_until_a_data_commit_carries_it() {
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.client_as(&mut node, &Request::Identity);
+    let deferred = Request::DeferredCommit { write_id: 1, reads: vec![(b"s/notes".to_vec(), protocol::Expect::Any)], ops: vec![protocol::Op::Put(b"s/notes".to_vec(), b"schema".to_vec())] };
+    let held = states(&rig.client_as(&mut node, &deferred), 1);
+    assert_eq!(held, vec![WriteState::Accepted], "a deferred define was told more than Accepted");
+    assert!(node.blocks.is_empty(), "a deferred define put {} block(s)", node.blocks.len());
+    assert!(node.head().is_none(), "a deferred define moved the head");
+    assert_eq!(rig.server.page.unsaved_writes(), 0, "a held define counts as unsaved");
+    let rs = rig.client_as(&mut node, &write(2, &[("r/1", Some("row"))]));
+    assert!(published(&states(&rs, 2)), "the data write did not publish: {:?}", states(&rs, 2));
+    let (seq, root) = node.head().expect("published");
+    assert_eq!(seq, 1, "not ONE commit for the define and the write");
+    let kv = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+    assert_eq!(tree_of(&node, &root), BTreeMap::from([kv("r/1", "row"), kv("s/notes", "schema")]), "the published tree");
+}
+
 /// One commit at a time, and a write while one is in flight is QUEUED
 /// (R-b): `Accepted` at once, never `Busy`; it commits when the first lands.
 #[test]

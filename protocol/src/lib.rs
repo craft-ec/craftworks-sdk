@@ -329,6 +329,18 @@ pub enum Request {
         reads: Vec<(Vec<u8>, Expect)>,
         ops: Vec<Op>,
     },
+    /// A [`Request::Commit`] that commits only IN COMPANY (sdk#350): the
+    /// engine holds it until a non-deferred write is queued with it, and it
+    /// rides that write's cut -- so opening an app, whose schema defines are
+    /// deferred, commits nothing. A VARIANT, not a field on `Commit`: the
+    /// wire is bincode-exact, and a field would make every frame an older
+    /// build sends undecodable (this module's rule: messages are appended as
+    /// variants). The engine sees ONE write event either way, with a flag.
+    DeferredCommit {
+        write_id: u64,
+        reads: Vec<(Vec<u8>, Expect)>,
+        ops: Vec<Op>,
+    },
 }
 
 impl Request {

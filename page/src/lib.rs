@@ -675,7 +675,7 @@ impl Page {
         ops: Vec<(Vec<u8>, WriteOp)>,
         reads: Vec<(Vec<u8>, engine::Expect)>,
     ) {
-        self.client_event(Event::Write { client, write_id, ops, reads });
+        self.client_event(Event::Write { client, write_id, ops, reads, deferred: false });
     }
 
     /// Straight to the engine, WRITES INCLUDED.
@@ -1986,9 +1986,17 @@ impl Page {
         self.engine.stage_of_key(key)
     }
 
-    /// Writes queued and their bytes (what `QueueFull` measures).
+    /// Writes queued and their bytes (what `QueueFull` measures; a held
+    /// deferred write takes room like any other).
     pub fn queue_load(&self) -> (usize, usize) {
         self.engine.queue_load()
+    }
+
+    /// WHAT IS UNSAVED (sdk#350), its one owner the engine: writes taken
+    /// and not published, a held DEFERRED write not among them. What a
+    /// session's "unsaved changes" is derived from, never a tally of its own.
+    pub fn unsaved_writes(&self) -> usize {
+        self.engine.unsaved_writes()
     }
 
     /// Own commits published and the queued writes they carried (K9: writes
