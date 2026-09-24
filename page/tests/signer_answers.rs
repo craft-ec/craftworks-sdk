@@ -18,7 +18,7 @@ fn at_sign(path: PutPath) -> (Page, u64, u32) {
     for _ in 0..20 {
         for op in p.take_ops() {
             match op {
-                Op::ReadHead => p.answer(Answer::Head(None), Ms(now)),
+                Op::ReadHead { label: page::Label::Head } => p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(now)),
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
                 Op::Sign { id, .. } => return (p, now, id),
@@ -79,8 +79,8 @@ fn a_fork_answer_is_recovered_as_not_next_and_nothing_is_unusable() {
     let fork = Why::Forked { mine: Head { seq: 1, root: [1; 32] }, read: theirs };
     p.answer(Answer::Signer { id, answer: A::Refused(fork) }, Ms(now + 1));
     let ops = p.take_ops();
-    assert!(ops.contains(&Op::ReadHead), "the register was not read after a Forked answer: {ops:?}");
-    p.answer(Answer::Head(Some((theirs.seq, theirs.root).into())), Ms(now + 2));
+    assert!(ops.contains(&Op::ReadHead { label: page::Label::Head }), "the register was not read after a Forked answer: {ops:?}");
+    p.answer(Answer::Head { label: page::Label::Head, read: Some((theirs.seq, theirs.root).into()) }, Ms(now + 2));
     assert_eq!(p.published(), (theirs.seq, theirs.root), "the register's head was not adopted");
     let lost = p.take_notices().into_iter().any(|(_, w, s)| w == WriteId(1) && s == State::Lost);
     assert!(lost, "the write built on the displaced head was not handed back as Lost");
@@ -94,7 +94,7 @@ fn head_unknown_reads_the_register_then_asks_again_after_a_backoff() {
     let (mut p, now, id) = at_sign(PutPath::Page);
     p.answer(Answer::Signer { id, answer: A::Refused(Why::HeadUnknown) }, Ms(now));
     let ops = p.take_ops();
-    assert!(ops.contains(&Op::ReadHead), "the register was not read to make it held: {ops:?}");
+    assert!(ops.contains(&Op::ReadHead { label: page::Label::Head }), "the register was not read to make it held: {ops:?}");
     p.tick(Ms(now + 1));
     assert_eq!(signs(&p.take_ops()), 0, "asked again with no backoff");
     p.tick(Ms(now + 2 * BACKOFF_MS));
@@ -125,7 +125,7 @@ fn a_held_absent_is_asked_again_and_re_put_only_after_several() {
     for _ in 0..200 {
         for op in p.take_ops() {
             match op {
-                Op::ReadHead => p.answer(Answer::Head(None), Ms(now)),
+                Op::ReadHead { label: page::Label::Head } => p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(now)),
                 Op::Put { id, .. } => {
                     puts += 1;
                     blocks.insert(id);
@@ -163,8 +163,8 @@ fn the_engine_hears_the_page_clock_in_seconds() {
     let mut now = 1_000_000;
     p.tick(Ms(now));
     for op in p.take_ops() {
-        if op == Op::ReadHead {
-            p.answer(Answer::Head(None), Ms(now));
+        if op == (Op::ReadHead { label: page::Label::Head }) {
+            p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(now));
         }
     }
     p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
@@ -194,7 +194,7 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
     // theirs, and the old signer still says Forked.
     p.answer(Answer::Signer { id, answer: fork() }, Ms(now + 1));
     let _ = p.take_ops();
-    p.answer(Answer::Head(Some((theirs.seq, theirs.root).into())), Ms(now + 2));
+    p.answer(Answer::Head { label: page::Label::Head, read: Some((theirs.seq, theirs.root).into()) }, Ms(now + 2));
     let _ = p.take_notices();
     p.write(ClientId(1), WriteId(2), vec![(b"k2".to_vec(), WriteOp::Put(b"v2".to_vec()))]);
     let mut id2 = None;
@@ -227,7 +227,7 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
     // head is adopted, the commit built on seq 1 is dead and handed back
     // `Lost` for the app to send again, and the upgrade ask is withdrawn.
     let later = now + 30 * page::rto::RTO_INITIAL_MS as u64;
-    p.answer(Answer::Head(Some((2, [9; 32]).into())), Ms(later));
+    p.answer(Answer::Head { label: page::Label::Head, read: Some((2, [9; 32]).into()) }, Ms(later));
     p.tick(Ms(later + 1));
     assert_eq!(p.published().0, 2, "the register's newer head was not adopted");
     let lost = p.take_notices().into_iter().any(|(_, w, s)| w == WriteId(2) && s == State::Lost);
@@ -243,5 +243,5 @@ fn a_hint_is_read_while_a_commit_is_owed() {
     let (mut p, _, _) = at_sign(PutPath::Page);
     let _ = p.take_ops();
     p.head_hint();
-    assert!(p.take_ops().contains(&Op::ReadHead), "a hint was dropped because a commit is owed");
+    assert!(p.take_ops().contains(&Op::ReadHead { label: page::Label::Head }), "a hint was dropped because a commit is owed");
 }

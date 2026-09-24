@@ -20,6 +20,8 @@ use std::collections::BTreeMap;
 const BLOCK_CODE: &[u8] = b"wire-node block code";
 const REGISTER_CODE: &[u8] = b"wire-node register code";
 const SIGNER_CODE: &[u8] = b"wire-node signer code";
+const SITE_CODE: &[u8] = b"wire-node site code";
+const APP: &str = "notes";
 
 type Err = freenet_stdlib::client_api::ClientError;
 
@@ -64,6 +66,12 @@ struct WireNode {
     /// This node does not hold the head LOCALLY (a fresh node of the identity): the signer's synchronous read finds
     /// nothing, while a client GET is served from the network.
     head_not_local: bool,
+    /// The next this many signer requests find the SITE not held locally (a new device's node before it fetched
+    /// it): the signer's synchronous read of the site finds nothing.
+    site_blind_signs: usize,
+    site_hidden: bool,
+    /// The next this many GETs of the SITE are refused (`ContractError::Get`).
+    refuse_site_gets: usize,
 }
 
 struct Host<'a>(&'a mut WireNode);
@@ -77,6 +85,9 @@ impl signer::Host for Host<'_> {
     }
     fn contract_state(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
         if self.0.head_not_local && *id == self.0.register_id {
+            return None;
+        }
+        if self.0.site_hidden && *id == self.0.site_id() {
             return None;
         }
         self.0.contracts.get(id).cloned()
@@ -111,6 +122,9 @@ impl WireNode {
             refuse_gets: 0,
             refuse_block_gets: 0,
             head_not_local: false,
+            site_blind_signs: 0,
+            site_hidden: false,
+            refuse_site_gets: 0,
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -143,6 +157,9 @@ impl WireNode {
             refuse_gets: 0,
             refuse_block_gets: 0,
             head_not_local: false,
+            site_blind_signs: 0,
+            site_hidden: false,
+            refuse_site_gets: 0,
         }
     }
 
@@ -164,6 +181,47 @@ impl WireNode {
         self.contracts.insert(self.register_id, next);
     }
 
+    /// `APP`'s site contract: its id, derived as page-io derives it.
+    fn site_id(&self) -> [u8; 32] {
+        let c = page_io::site_contract(SITE_CODE, &self.register_params, APP).expect("a site contract");
+        id_of(&c.key())
+    }
+
+    /// A site PUT, merged as the site contract merges: the META by the Register's own merge under the site's
+    /// params, the web part the one whose hash the kept record names.
+    fn merge_site(&mut self, state: &[u8]) {
+        let id = self.site_id();
+        let (meta, web) = contract_keys::site::framing(state).expect("page-io framed the site");
+        let next = match self.contracts.get(&id) {
+            None => state.to_vec(),
+            Some(cur) => {
+                let (cur_meta, cur_web) = contract_keys::site::framing(cur).expect("a framed site");
+                let params = contract_keys::site::site_params(&self.register_params, APP).expect("site params");
+                let kept = <craftec_register_contract::Register as ContractInterface>::update_state(
+                    Parameters::from(params),
+                    State::from(cur_meta.to_vec()),
+                    vec![UpdateData::State(State::from(meta.to_vec()))],
+                )
+                .expect("merges")
+                .new_state
+                .expect("a state")
+                .as_ref()
+                .to_vec();
+                let web = if kept == meta { web } else { cur_web };
+                contract_keys::site::frame(&kept, web)
+            }
+        };
+        self.contracts.insert(id, next);
+    }
+
+    /// The site as the node holds it: `(version, value, web)`.
+    fn site(&self) -> Option<(u64, Vec<u8>, Vec<u8>)> {
+        let st = self.contracts.get(&self.site_id())?;
+        let (meta, web) = contract_keys::site::framing(st)?;
+        let (seq, v) = contract_keys::register::record_of(meta)?;
+        Some((seq, v.to_vec(), web.to_vec()))
+    }
+
     fn head(&self) -> Option<(u64, Cid)> {
         let st = self.contracts.get(&self.register_id)?;
         let (seq, v) = contract_keys::register::record_of(st)?;
@@ -181,6 +239,9 @@ impl WireNode {
                     *self.served.entry("put register").or_default() += 1;
                     self.register_puts += 1;
                     self.merge_register(state.as_ref());
+                } else if id == self.site_id() {
+                    *self.served.entry("put site").or_default() += 1;
+                    self.merge_site(state.as_ref());
                 } else {
                     *self.served.entry("put block").or_default() += 1;
                     self.contracts.insert(id, state.as_ref().to_vec());
@@ -205,12 +266,19 @@ impl WireNode {
                 if id == self.register_id {
                     assert!(subscribe, "the head was read WITHOUT a subscription (F55)");
                     *self.served.entry("get register").or_default() += 1;
+                } else if id == self.site_id() {
+                    assert!(subscribe, "the site was read WITHOUT a subscription");
+                    *self.served.entry("get site").or_default() += 1;
                 } else {
                     *self.served.entry("get block").or_default() += 1;
                 }
-                let refuse_block = id != self.register_id && self.refuse_block_gets > 0;
-                if self.refuse_gets > 0 || refuse_block {
-                    if refuse_block {
+                let refuse_block = id != self.register_id && id != self.site_id() && self.refuse_block_gets > 0;
+                let refuse_site = id == self.site_id() && self.refuse_site_gets > 0;
+                if self.refuse_gets > 0 || refuse_block || refuse_site {
+                    if refuse_site {
+                        self.refuse_site_gets -= 1;
+                        *self.served.entry("refused site get").or_default() += 1;
+                    } else if refuse_block {
                         self.refuse_block_gets -= 1;
                     } else {
                         self.refuse_gets -= 1;
@@ -261,6 +329,8 @@ impl WireNode {
                     self.empty_signer_answers = self.empty_signer_answers.saturating_sub(1);
                     return Some(ok(HostResponse::DelegateResponse { key, values: Vec::new() }));
                 }
+                self.site_hidden = self.site_blind_signs > 0;
+                self.site_blind_signs = self.site_blind_signs.saturating_sub(1);
                 let mut values = Vec::new();
                 for m in inbound {
                     if let InboundDelegateMsg::ApplicationMessage(am) = m {
@@ -1904,4 +1974,106 @@ fn published_seq_is_the_acknowledged_head_never_one_in_flight() {
     }
     assert!(st.contains(&WriteState::Published), "the second commit never published: {:?}", a.unusable());
     assert_eq!(a.published_seq(), 2, "the acknowledged seq did not move with the read-back");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// A SITE through page-io (builder#117): real frames, the REAL signer, the Register's merge under the site params.
+
+fn web(n: u8) -> Vec<u8> {
+    vec![n; 300]
+}
+
+fn publish(io: &mut PageIo, node: &mut WireNode, now: &mut u64, n: u8) -> Option<page::Publication> {
+    io.publish_site(APP, SITE_CODE, web(n), Ms(*now)).expect("publishes");
+    settle(io, node, now);
+    io.publication(APP).cloned()
+}
+
+/// **One address, each publish the next version.** The node holds the signer's record framed around exactly the
+/// web part it names, at the same contract every time (the stable link), and page-io keeps no bytes once each
+/// publication ends.
+#[test]
+fn a_site_publishes_each_version_at_one_address() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    for v in 1..=2u8 {
+        assert_eq!(publish(&mut io, &mut node, &mut now, v), Some(page::Publication::Published { version: v as u64 }));
+        let (seq, value, w) = node.site().expect("the node holds the site");
+        assert_eq!((seq, value, w.clone()), (v as u64, blake3::hash(&web(v)).as_bytes().to_vec(), web(v)), "v{v} is not (seq, blake3(web), web)");
+    }
+    assert_eq!(node.served.get("put site"), Some(&2), "{:?}", node.served);
+    assert_eq!(node.contracts.keys().filter(|id| **id == node.site_id()).count(), 1);
+    assert_eq!(node.register_puts, 0, "publishing a site PUT the person's head");
+    assert!(io.unusable().is_empty(), "{:?}", io.unusable());
+    // Another device of the person follows it: v3 at the same address.
+    let mut other = page_io(&node);
+    assert_eq!(publish(&mut other, &mut node, &mut now, 3), Some(page::Publication::Published { version: 3 }));
+}
+
+/// **A REFUSED site read is silence, never "no site"** (the GetFail split): a new device whose node does not hold
+/// the site yet has its read refused once; the re-ask reads v2 and it publishes v3. Mutant "a refused site read is
+/// NotFound" -> it signs v1 from the genesis, the merge keeps v2 -> Superseded -> red.
+#[test]
+fn a_refused_site_read_is_re_asked_never_the_genesis() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut now = 1_000;
+    let mut first = page_io(&node);
+    for v in 1..=2u8 {
+        publish(&mut first, &mut node, &mut now, v);
+    }
+    // A NEW device: its signer holds no record of the site (the first device's signer kept it).
+    let label = signer::Label::Site { app: APP.into(), contract: node.site_id() };
+    assert!(node.secrets.remove(&signer::record_name(&label)).is_some(), "THE SETUP: the first device kept no site record");
+    let mut io = page_io(&node);
+    node.refuse_site_gets = 1;
+    node.site_blind_signs = 2;
+    assert_eq!(publish(&mut io, &mut node, &mut now, 9), Some(page::Publication::Published { version: 3 }));
+    assert_eq!(node.served.get("refused site get"), Some(&1), "THE SETUP: the site read was not refused: {:?}", node.served);
+}
+
+/// **A site's PUT refused by the node ENDS the publication, in its words.**
+#[test]
+fn a_refused_site_put_ends_the_publication_by_name() {
+    use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    io.publish_site(APP, SITE_CODE, web(1), Ms(now)).expect("publishes");
+    // Serve until the site's PUT goes out, and refuse it.
+    let site = page_io::site_contract(SITE_CODE, &node.register_params, APP).expect("site").key();
+    for _ in 0..50 {
+        now += 1;
+        for f in io.take_frames() {
+            let req: ClientRequest = bincode::deserialize(&f).expect("a request");
+            let answer = match req {
+                ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) if contract.key() == site => {
+                    let e: Err = ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key: site, cause: "invalid put".into() })).into();
+                    Some(bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes"))
+                }
+                _ => node.serve(&f),
+            };
+            if let Some(a) = answer {
+                io.inbound(&a, Ms(now));
+            }
+        }
+    }
+    assert!(matches!(io.publication(APP), Some(page::Publication::Refused(w)) if w.contains("invalid put")), "{:?}", io.publication(APP));
+    assert_eq!(node.site(), None);
+    assert!(io.take_others().is_empty(), "the site's refusal was handed back as somebody else's");
+}
+
+/// **A reader, and a label that is no app id, publish nothing** -- by name, and no frame leaves.
+#[test]
+fn a_reader_or_a_bad_app_id_publishes_nothing() {
+    let node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let _ = io.take_frames();
+    let bad = io.publish_site("Not An App!", SITE_CODE, web(1), Ms(1));
+    assert!(bad.is_err_and(|e| e.contains("not an app id")), "a bad app id was published");
+    assert!(io.take_frames().is_empty(), "a bad app id sent a frame");
+    let mut r = reader(&node);
+    let _ = r.take_frames();
+    assert!(r.publish_site(APP, SITE_CODE, web(1), Ms(1)).is_err_and(|e| e.starts_with("read-only")), "a reader published");
+    assert!(r.take_frames().is_empty(), "a reader sent a frame");
 }
