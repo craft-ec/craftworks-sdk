@@ -59,14 +59,10 @@ pub fn tar(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// The node's web-container framing (freenet 0.2.136 `app_packaging.rs`).
+/// The node's web-container framing (freenet 0.2.136 `app_packaging.rs`): the ONE statement of it is
+/// `contract_keys::site::frame` (a site's state is the same framing, builder#117).
 pub fn container(metadata: &[u8], web: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16 + metadata.len() + web.len());
-    v.extend_from_slice(&(metadata.len() as u64).to_be_bytes());
-    v.extend_from_slice(metadata);
-    v.extend_from_slice(&(web.len() as u64).to_be_bytes());
-    v.extend_from_slice(web);
-    v
+    contract_keys::site::frame(metadata, web)
 }
 
 /// `data` as a valid `.xz` stream whose one block holds LZMA2 STORED chunks:
@@ -123,10 +119,16 @@ pub fn xz_stored(data: &[u8]) -> Vec<u8> {
 /// An APP web container: `files` as a deterministic tar, stored-chunk xz,
 /// in the node's framing, with no metadata.
 pub fn app_container(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    Ok(container(&[], &app_web(files)?))
+}
+
+/// An app's WEB part: `files` as a deterministic tar in stored-chunk xz -- what the node unpacks and serves, and
+/// what a SITE carries under its record (builder#117). `app_container` frames exactly this.
+pub fn app_web(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     if files.is_empty() {
         return Err("an app container with no files".into());
     }
-    Ok(container(&[], &xz_stored(&tar(files)?)))
+    Ok(xz_stored(&tar(files)?))
 }
 
 fn varint(out: &mut Vec<u8>, mut v: u64) {

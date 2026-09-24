@@ -20,7 +20,7 @@ blake3 = "1"
 # The signer's wire types (serde only): `wire::signer` frames them.
 signer-proto = { path = "../signer-proto" }
 # The ONE restatement of the node's contract-id derivation (sdk#334):
-# `block::contract_deriver` is it.
+# `block::contract_deriver` is it. And the web framing's ONE statement (`contract_keys::site::frame`, builder#117).
 contract-keys = { path = "../contract-keys" }
 # The SDK's load pieces (sdk#347): the `load-pieces` tool cuts a bundle with the ONE implementation of the format.
 pieces = { path = "../pieces" }

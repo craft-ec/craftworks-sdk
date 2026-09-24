@@ -175,7 +175,7 @@ fn run(ps: &mut [&mut Publisher], node: &mut Node, now: &mut u64, rounds: usize,
         for p in ps.iter_mut() {
             p.step(node, *now, fate);
         }
-        if ps.iter().all(|p| !matches!(p.publication(), Some(Publication::Publishing))) {
+        if ps.iter().all(|p| !matches!(p.publication(), Some(Publication::Publishing { .. }))) {
             return;
         }
     }
@@ -384,7 +384,7 @@ fn every_publication_ends_once_faults_stop() {
         }
         run(&mut [&mut a, &mut b], &mut node, &mut now, 2_000, &mut always);
         for (who, p) in [("a", &a), ("b", &b)] {
-            assert!(!matches!(p.publication(), Some(Publication::Publishing) | None), "seed {seed}: {who}'s publication never ended");
+            assert!(!matches!(p.publication(), Some(Publication::Publishing { .. }) | None), "seed {seed}: {who}'s publication never ended");
         }
         // At most one of them is Published at a version the node does not hold.
         let live = node.read().map(|h| h.seq);
@@ -414,6 +414,15 @@ fn a_new_device_follows_the_site_it_reads() {
     let mut a = Publisher::new(device());
     a.blind_signs = 1;
     a.page.publish_site(APP, bundle(9), Ms(now));
-    run(&mut [&mut a], &mut node, &mut now, 200, &mut always);
+    // While the node has not fetched the site, the publication SAYS so (the signer answered: not "not answering").
+    let mut saw_wait = false;
+    for _ in 0..200 {
+        run(&mut [&mut a], &mut node, &mut now, 1, &mut always);
+        saw_wait |= a.publication() == Some(Publication::Publishing { waiting_for: Some(page::WAITING_FOR_SITE) });
+        if !matches!(a.publication(), Some(Publication::Publishing { .. })) {
+            break;
+        }
+    }
+    assert!(saw_wait, "the HeadUnknown wait was never stated");
     assert_eq!(a.publication(), Some(Publication::Published { version: 4 }));
 }
