@@ -479,7 +479,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     // THE CLOCK'S ORIGIN, varied per seed (sdk#397): a browser page's clock is Date.now(), EPOCH ms, and a model
     // whose pages always started at 0 could not see a request dated against another origin -- the defect that
     // pinned the RTO at its ceiling live. The model's own `now` counts from 0; every page sees `origin + now`.
-    let origin: u64 = if seed % 2 == 0 { 0 } else { 1_790_253_181_367 };
+    let origin: u64 = if seed.is_multiple_of(2) { 0 } else { 1_790_253_181_367 };
 
     let mut apps: Vec<App> = (0..2)
         .map(|i| App {
