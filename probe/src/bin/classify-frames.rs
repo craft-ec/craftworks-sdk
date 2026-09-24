@@ -112,7 +112,7 @@ fn main() -> Result<()> {
         [flag, p] if flag == "--block-code" => p,
         _ => bail!("usage: classify-frames --block-code <block.wasm> < frames.jsonl"),
     };
-    let block_code = ContractCode::from(std::fs::read(block_path).with_context(|| format!("reading {block_path}"))?).hash().clone();
+    let block_code = *ContractCode::from(std::fs::read(block_path).with_context(|| format!("reading {block_path}"))?).hash();
     let mut streams: BTreeMap<String, ReassemblyBuffer> = BTreeMap::new();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
@@ -151,7 +151,7 @@ fn main() -> Result<()> {
         // A CHUNK of a request the SDK split (stdlib's own rule): reassembled
         // per socket; classified once whole.
         if let ClientRequest::StreamChunk { stream_id, index, total, data } = &req {
-            let buf = streams.entry(f.socket.clone()).or_insert_with(ReassemblyBuffer::new);
+            let buf = streams.entry(f.socket.clone()).or_default();
             match buf.receive_chunk(*stream_id, *index, *total, data.clone()) {
                 Ok(None) => continue,
                 Ok(Some(whole)) => match bincode::deserialize::<ClientRequest<'_>>(&whole) {
