@@ -45,7 +45,7 @@ await t("**a SLOW test is batch-only: --pr skips it BY NAME and says so; the bat
 await t("**EVERY control is in the plan whatever the PR touches; a README-only PR tests no member and runs no npm**", async () => {
   const r = gate(root, ["--pr", "--dry-run"], { GATE_PR_CHANGED: "README.md" });
   const gateSrc = readFileSync(join(root, "gate.sh"), "utf8");
-  const listed = [...gateSrc.matchAll(/^ {2}"([a-z_-]+)\|/gm)].map(m => m[1]);
+  const listed = [...gateSrc.matchAll(/^ {2}"([a-z0-9_-]+)\|/gm)].map(m => m[1]);
   assert.ok(listed.length >= 7, `the CONTROLS list read nothing: ${listed}`);
   assert.deepEqual(planLine(r.stdout, "controls").split(" "), listed);
   assert.equal(planLine(r.stdout, "members tested (changed only; dependents run at the batch gate)"), "(none)");
