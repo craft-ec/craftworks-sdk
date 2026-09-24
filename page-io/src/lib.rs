@@ -18,7 +18,7 @@
 //! | answer | becomes |
 //! |---|---|
 //! | `Got` of the Register | `Head(record)`; the register now exists |
-//! | NotFound of the Register | `Head(None)` ONLY if the signer holds no record for it (asked once, `ask_record`); otherwise silence — re-asked on the RTO, "not answering" at its budget (sdk#175; a peered NotFound can be false, F55) |
+//! | NotFound of the Register | `Head(None)` ONLY if the signer holds no record for it (asked once, `ask_record`); otherwise silence — re-asked on the RTO with no end, shown as "not answering for N s" (sdk#175; a peered NotFound can be false, F55) |
 //! | a REFUSED GET (`ContractError::Get`) of anything | nothing: it says nothing about the contract, so it is not an answer — re-asked on the RTO (rule 7), never read as absent |
 //! | `Got` of a block | `Got { id, body }` (the executor verifies it against its id) |
 //! | NotFound of a block | `GetMissed` |
@@ -705,8 +705,8 @@ impl PageIo {
                     // The node's explicit NotFound for the head — which a
                     // PEERED node can answer falsely (F55) — is "no head" ONLY if the signer holds no
                     // record for this register. Otherwise the head exists and
-                    // this is SILENCE: re-asked on the RTO, "not answering" at
-                    // its budget. Opening an empty tree over an existing app
+                    // this is SILENCE: re-asked on the RTO with no end (rule 8),
+                    // shown as "not answering for N s". Opening an empty tree over an existing app
                     // would have its first commit PUT a second register that
                     // F56 then merges against the real one (sdk#175).
                     match (self.register_seen, self.signer_has_record) {
