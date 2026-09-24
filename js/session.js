@@ -482,17 +482,21 @@ export async function openSession(Session, {
     // The head this session stands on, as `tree()` takes it (hex; "" until
     // Identity has named it). What a publisher records so others can read it.
     headId: () => session.head_id(),
+    // The seq of the head this session has PUBLISHED, network-acknowledged
+    // (0 before the first): what a publisher records in its app.json as the
+    // views' published-head floor (sdk#349).
+    headSeq: () => session.head_seq(),
     /**
      * READ SOMEBODY'S TREE (sdk#239): the data forest, one tree per identity.
      * `registerId` is that tree's head Register (their `headId()`). Returns
-     * `{ db, headId, close }`: `db` is the same engine-backed surface as this
+     * `{ db, headId, waitingFor, close }`: `db` is the same engine-backed surface as this
      * session's own, reading through the SAME path, and refusing every write.
      * Nothing is installed on the node; the head is watched on this socket.
      *
      * BOUNDED, and a refusal past either bound says which: MAX_OPEN_TREES
      * engines at once (memory), and MAX_TREE_SUBSCRIPTIONS per socket (F57).
      */
-    tree: async (registerId, { app: treeApp = app } = {}) => {
+    tree: async (registerId, { app: treeApp = app, seq = 0 } = {}) => {
       if (closed) throw new Error("tree(): this session is closed");
       if (trees.size >= MAX_OPEN_TREES) {
         throw new Error(`tree(): ${MAX_OPEN_TREES} trees are already open, each its own engine — close one first`);
@@ -507,7 +511,9 @@ export async function openSession(Session, {
       const range = nextRange();
       // The SAME app's space in that person's tree, unless told another.
       if (treeApp !== null) reader.set_app(treeApp);
-      reader.open_named(block, registerId, range);
+      // `seq`: the head seq the app was PUBLISHED at (its app.json), a
+      // floor -- no head below it is shown (sdk#349). 0: none.
+      reader.open_named(block, registerId, range, seq);
       const t = { session: reader, drain: () => {}, range };
       trees.add(t);
       treeSubscriptions += 1;
@@ -517,6 +523,8 @@ export async function openSession(Session, {
       return {
         db,
         headId: () => reader.head_id(),
+        // What the view waits on because of its floor, in words; "" when not.
+        waitingFor: () => reader.head_floor_wait(),
         close: () => {
           if (!trees.delete(t)) return;
           reader.free();

@@ -538,6 +538,16 @@ impl PageIo {
         self.art.register_params = params;
     }
 
+    /// THE SEQ THIS PAGE'S HEAD IS PUBLISHED AT, as the network acknowledged
+    /// it: the page's published seq, which moves only when the register's
+    /// read-back shows this page's own head (`HeadConfirmed`) or a head is
+    /// read from the network. A commit signed or in flight, or one that is
+    /// later Lost, never moves it -- so a publisher that records it (an app's
+    /// published-head floor, sdk#349) names a head that exists. 0: none.
+    pub fn published_seq(&self) -> u64 {
+        self.server.page.published().0
+    }
+
     /// A reader of a named head (`reader`): nothing can be written.
     pub fn read_only(&self) -> bool {
         // THE PAGE's: the one owner of "read-only" (it makes no commit op).
