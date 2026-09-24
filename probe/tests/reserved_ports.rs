@@ -140,3 +140,29 @@ fn control_the_freenet_a_spawn_would_run_is_the_stub() {
         "the real freenet is first on PATH: {first:?}"
     );
 }
+
+/// A node URL is checked by its PORT, parsed, never by its text (the
+/// architect, sdk#375): ":7509/" as text missed "ws://127.0.0.1:7509", which
+/// then went straight to the owner's node. Every shape of an owner URL is
+/// refused; a harness node's is allowed and its port returned; a URL whose
+/// port cannot be read is refused, never assumed to be someone else's.
+#[test]
+fn a_node_url_is_refused_by_its_parsed_port_whatever_its_text() {
+    for url in [
+        "ws://127.0.0.1:7509",
+        "ws://127.0.0.1:7509/",
+        "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native",
+        "ws://127.0.0.1:7609",
+        "ws://127.0.0.1:7609?x=1",
+        "ws://localhost:7509#frag",
+    ] {
+        let e = probe::node::allowed_port(url).expect_err(url);
+        assert!(e.to_string().contains("owner's node"), "{url}: {e}");
+    }
+    assert_eq!(probe::node::allowed_port("ws://127.0.0.1:17711/v1/contract/command?encodingProtocol=native").unwrap(), 17711);
+    assert_eq!(probe::node::allowed_port("ws://127.0.0.1:17509").unwrap(), 17509, "a port that merely CONTAINS 7509 is not the owner's");
+    for url in ["ws://127.0.0.1", "not a url", "ws://127.0.0.1:port/"] {
+        assert!(probe::node::allowed_port(url).is_err(), "{url}: an unreadable port was allowed");
+    }
+    assert_eq!(RESERVED, &[7509, 7609]);
+}
