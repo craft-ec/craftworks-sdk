@@ -209,6 +209,11 @@ pub struct PageIo {
     /// `begin` asked the signer which Register it signs for, and it holds
     /// none: the caller mints a key and calls `provision_with`.
     needs_key: bool,
+    /// The Provision in flight carries a key THIS page minted (`provision_with`
+    /// after "no key"), not one it was given: a `KeyAlreadyProvisioned` then
+    /// means another page provisioned first, and this one opens that Register
+    /// (sdk#343).
+    minted: bool,
     /// The signer's registration was answered (its `Ack(Registered)`).
     signer_registered: bool,
     /// The signer's FIRST request — the Register query (`begin`) or
@@ -321,6 +326,7 @@ impl PageIo {
             now: Ms(0),
             stream_base: 0,
             needs_key: false,
+            minted: false,
             signer_registered: false,
             first: None,
             signer_container: None,
@@ -520,6 +526,7 @@ impl PageIo {
             return;
         }
         self.set_register(register_params);
+        self.minted = true;
         // The signer is registered already (it answered the query): the
         // Provision is the first request now, sent and re-sent like one.
         self.first = Some(First::Provision(signing_key));
@@ -813,6 +820,19 @@ impl PageIo {
                         Some((_, signer_proto::Answer::Provisioned)) => {
                             self.provisioned = true;
                             self.signer_provisioned();
+                        }
+                        // A KEY IS HERE ALREADY (sdk#343): another page, told
+                        // "no key" as this one was, provisioned first. An
+                        // ANSWER, not an end: ask again which Register the
+                        // signer holds and open THAT one -- one identity per
+                        // node (rule 15); the key this page minted is dropped.
+                        // Only for a minted key: a key the page was GIVEN
+                        // (`provision`) is refused as before.
+                        Some((PROVISION_ID, signer_proto::Answer::Refused(signer_proto::Why::KeyAlreadyProvisioned)))
+                            if std::mem::take(&mut self.minted) =>
+                        {
+                            self.first = Some(First::Query);
+                            self.server.page.send_ext(Ext::SignerFirst, now);
                         }
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
                             self.refused = Some(format!("the signer refused provisioning: {why:?}"));
