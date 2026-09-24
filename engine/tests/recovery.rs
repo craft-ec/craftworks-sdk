@@ -776,7 +776,7 @@ fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
             let ev = if forced && n == 1 {
                 Event::forced_write(ClientId(1), WriteId(n), ops)
             } else {
-                Event::Write { client: ClientId(1), write_id: WriteId(n), ops, reads: vec![(key.to_vec(), Expect::Absent)] }
+                Event::Write { client: ClientId(1), write_id: WriteId(n), ops, reads: vec![(key.to_vec(), Expect::Absent)], deferred: false }
             };
             for f in stepped!(e, ev) {
                 if let Effect::Notify { write_id, state, .. } = f {

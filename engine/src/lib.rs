@@ -277,6 +277,10 @@ pub enum Event {
         /// key outside its reads is refused at the door as `Unread`; a forced
         /// write says so per key with [`Expect::Any`] ([`Event::forced_write`]).
         reads: Vec<(Vec<u8>, Expect)>,
+        /// Commit only IN COMPANY (sdk#350): held, `Accepted`, until the queue
+        /// holds a non-deferred write that is applied; then it rides that
+        /// write's cut. Never committed alone ([`Event::deferred`]).
+        deferred: bool,
     },
     /// A block was READ BACK from our own node. Never an ack: W1 says an
     /// acknowledgement is not evidence the block is there.
@@ -412,7 +416,16 @@ impl Event {
     /// an implicit reads-less write (which the engine refuses as `Unread`).
     pub fn forced_write(client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, Op)>) -> Event {
         let reads = ops.iter().map(|(k, _)| (k.clone(), Expect::Any)).collect();
-        Event::Write { client, write_id, ops, reads }
+        Event::Write { client, write_id, ops, reads, deferred: false }
+    }
+
+    /// The same write, DEFERRED: it commits only in company (sdk#350). Any
+    /// other event is returned as it is.
+    pub fn deferred(self) -> Event {
+        match self {
+            Event::Write { client, write_id, ops, reads, .. } => Event::Write { client, write_id, ops, reads, deferred: true },
+            other => other,
+        }
     }
 }
 
@@ -986,6 +999,8 @@ struct Queued {
     /// ledger records as this page's `through`, the witness that a group
     /// landed.
     arrival: u64,
+    /// Commits only in company (sdk#350): see [`Event::Write`].
+    deferred: bool,
 }
 
 /// A write whose apply stopped on a block the node does not hold.
@@ -1661,6 +1676,23 @@ impl<B: Blocks> Engine<B> {
         self.queue.len()
     }
 
+    /// Writes taken and not yet published -- WHAT IS UNSAVED, its one owner
+    /// (sdk#350): every queued write but a DEFERRED one still held (a define
+    /// no commit has taken is nothing the person made; it is unsaved only
+    /// once a cut carries it).
+    pub fn unsaved_writes(&self) -> usize {
+        self.queue.iter().filter(|q| !(q.deferred && !q.committing)).count()
+    }
+
+    /// May a commit be cut (sdk#350)? Only with a NON-deferred write applied
+    /// in the queue: judged on the queue, not per cut piece, so a byte-limit
+    /// split whose first piece is defines only still goes. A non-deferred
+    /// write still applying does not count -- it may yet be refused, and a
+    /// define must never commit alone.
+    fn in_company(&self) -> bool {
+        self.queue.iter().any(|q| !q.deferred && q.warm_after.is_some())
+    }
+
     /// Every write in the queue, in order, with its stage (R-b).
     pub fn queue_stages(&self) -> impl Iterator<Item = (ClientId, WriteId, Stage)> + '_ {
         self.queue.iter().map(|q| {
@@ -1841,7 +1873,9 @@ impl<B: Blocks> Engine<B> {
         for (n, (write_id, ops, reads)) in writes.into_iter().enumerate() {
             let size = ops.iter().map(|(k, o)| k.len() + if let Op::Put(v) = o { v.len() } else { 0 }).sum::<usize>()
                 + reads.iter().map(|(k, _)| k.len() + 33).sum::<usize>();
-            self.queue.insert(at + n, Queued { client, write_id, ops, reads, size, tries: 0, told_accepted: true, warm_after: None, committing: false, arrival: 0 });
+            // Never deferred (sdk#350): a displaced group was cut, so it was
+            // already in company, and it must land again on its own.
+            self.queue.insert(at + n, Queued { client, write_id, ops, reads, size, tries: 0, told_accepted: true, warm_after: None, committing: false, arrival: 0, deferred: false });
         }
         for q in self.queue.iter_mut().skip(at) {
             q.arrival = self.next_arrival;
@@ -2019,7 +2053,8 @@ impl<B: Blocks> Engine<B> {
                 write_id,
                 ops,
                 reads,
-            } => self.on_write(client, write_id, ops, reads),
+                deferred,
+            } => self.on_write(client, write_id, ops, reads, deferred),
             Event::PutConfirmed(id) => self.on_confirmed(id),
             Event::PutFailed(id) => self.on_failed(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
@@ -2756,6 +2791,7 @@ impl<B: Blocks> Engine<B> {
         write_id: WriteId,
         ops: Vec<(Vec<u8>, Op)>,
         reads: Vec<(Vec<u8>, Expect)>,
+        deferred: bool,
     ) -> Vec<Effect> {
         let tries = self.next_tries.take().unwrap_or(0);
         // AT THE DOOR (sdk#235, W8): a write names what it read. SYNTACTIC —
@@ -2818,6 +2854,7 @@ impl<B: Blocks> Engine<B> {
             warm_after: None,
             committing: false,
             arrival: self.next_arrival,
+            deferred,
         });
         self.next_arrival += 1;
         let mut out = Vec::new();
@@ -2859,9 +2896,10 @@ impl<B: Blocks> Engine<B> {
                     moved |= applied_or_gone;
                 }
             }
-            // THE GATE: no commit is cut while this page cannot sign; the
-            // writes keep applying to the warm root above.
-            if self.can_sign {
+            // THE GATE: no commit is cut while this page cannot sign, nor while
+            // nothing but DEFERRED writes is ready (sdk#350: they commit only
+            // in company); the writes keep applying to the warm root above.
+            if self.can_sign && self.in_company() {
                 let (fx, popped) = self.commit_front();
                 out.extend(fx);
                 moved |= popped;

@@ -12,7 +12,7 @@ mod common;
 use common::Store;
 
 fn w(client: u64, id: u64, key: &[u8], value: &[u8], read: Expect) -> Event {
-    Event::Write { client: ClientId(client), write_id: WriteId(id), ops: vec![(key.to_vec(), Op::Put(value.to_vec()))], reads: vec![(key.to_vec(), read)] }
+    Event::Write { client: ClientId(client), write_id: WriteId(id), ops: vec![(key.to_vec(), Op::Put(value.to_vec()))], reads: vec![(key.to_vec(), read)], deferred: false }
 }
 
 fn told(fx: &[Effect], id: u64) -> Vec<State> {

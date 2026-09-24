@@ -39,6 +39,7 @@ fn write(id: u64, ops: &[(&[u8], Option<&[u8]>)], reads: Vec<(Vec<u8>, Expect)>)
         write_id: WriteId(id),
         ops,
         reads,
+        deferred: false,
     }
 }
 
