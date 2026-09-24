@@ -40,6 +40,7 @@ t("**THE INCIDENT: a checkout BEHIND the release is REFUSED** -- its table ends 
   assert.equal(r.status, 1, `a checkout behind the release passed: ${r.stdout}`);
   assert.match(r.stderr, /has epochs 1, 2; this SDK needs epoch 3/, r.stderr);
   assert.match(r.stderr, /fix: build the contracts at a release that has epoch 3/);
+  assert.match(r.stderr, /a PR building a NEW epoch keeps CONTRACTS_EPOCH at the released one and sets CRAFTWORKS_CONTRACTS_UNRELEASED=1/, "the refusal does not say how a new epoch's PR builds");
   rmSync(d, { recursive: true, force: true });
 });
 

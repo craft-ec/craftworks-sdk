@@ -60,6 +60,7 @@ export function check(contracts, need, names, { override = false, head = null } 
       lines: [
         `contracts: REFUSED -- ${table}${at} has ${has}; this SDK needs epoch ${need}: the checkout is BEHIND the release this SDK is built for`,
         `  fix: build the contracts at a release that has epoch ${need} -- in a worktree of your own: git -C ${contracts} fetch && git -C ${contracts} worktree add --detach <dir> origin/main && (cd <dir> && ./build.sh), then CRAFTWORKS_CONTRACTS=<dir>`,
+        `  (a PR building a NEW epoch keeps CONTRACTS_EPOCH at the released one and sets CRAFTWORKS_CONTRACTS_UNRELEASED=1; the bump lands with the release)`,
       ],
     };
   }
