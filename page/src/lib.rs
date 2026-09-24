@@ -422,17 +422,6 @@ impl HeadRead {
         &self.value
     }
 
-    /// The `through` its ledger records for `device`: the last arrival number
-    /// of that page's writes this head carries (COMMIT-LIFE ⁵, the witness).
-    /// `None`: no entry, or a refused ledger.
-    pub fn through_of(&self, device: &[u8; 16]) -> Option<u64> {
-        let h = signer_proto::head::read_value(&self.value)?;
-        if h.refused {
-            return None;
-        }
-        h.ledger.through.iter().find(|t| &t.device == device).map(|t| t.seq)
-    }
-
     /// What this head WITNESSES of `device`'s commits (COMMIT-LIFE ⁵), for a
     /// commit that would have landed at seq `commit_seq`: its `through`
     /// entry; or, with none, `NotThere` whenever that can be KNOWN -- the list
@@ -2186,20 +2175,6 @@ impl Page {
     /// Every client-facing effect, in the order the engine emitted it.
     pub fn take_client(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.client_fx)
-    }
-
-    /// Effects this executor does not act on, for the caller.
-    pub fn take_other(&mut self) -> Vec<Effect> {
-        let mut out = Vec::new();
-        self.client_fx.retain(|f| {
-            if matches!(f, Effect::Notify { .. }) {
-                true
-            } else {
-                out.push(f.clone());
-                false
-            }
-        });
-        out
     }
 
     /// Things this page could not do, by reason.

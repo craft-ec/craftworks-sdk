@@ -1230,9 +1230,6 @@ impl Commit {
 struct Backing {
     writes: Vec<(ClientId, WriteId)>,
     remaining: BTreeSet<Cid>,
-    /// When its head was published: how long its stragglers have been
-    /// re-sending ("not answering for N s", rule 8).
-    since: u64,
 }
 
 /// The write pipeline.
@@ -1626,36 +1623,6 @@ impl<B: Blocks> Engine<B> {
         self.published_seq
     }
 
-    /// Blocks of the commit in flight that this engine has already seen
-    /// confirmed ON THE NODE -- carried in the context, so true at the top of
-    /// a call that did not see the confirmation (sdk#150). The head bump is
-    /// emitted only once every one of them is here, naming them as `after`.
-    /// Every block this engine is waiting on the NODE to answer about: the
-    /// commit's unconfirmed data, the blocks parked reads wait on, the parked
-    /// write's path, and owed parity not yet confirmed (sdk#150).
-    ///
-    /// Derived, never recorded. An answer names a CONTRACT, and the host
-    /// matches it back to a block by deriving each of these blocks' contract
-    /// ids -- so no map of "what went out" is carried, and nothing that was
-    /// asked for can be evicted from one.
-    pub fn waiting_on(&self) -> BTreeSet<Cid> {
-        let mut w: BTreeSet<Cid> = BTreeSet::new();
-        if let Some(c) = &self.pending {
-            w.extend(c.data.difference(&c.confirmed).copied());
-        }
-        w.extend(self.reads.waiting.keys().copied());
-        if let Some(p) = &self.parked_write {
-            w.extend(p.needs.iter().copied());
-        }
-        w
-    }
-
-    pub fn confirmed_in_flight(&self) -> impl Iterator<Item = Cid> + '_ {
-        self.pending
-            .iter()
-            .flat_map(|c| c.confirmed.iter().copied())
-    }
-
     pub fn published_root(&self) -> Cid {
         self.published_root
     }
@@ -1796,14 +1763,6 @@ impl<B: Blocks> Engine<B> {
     /// Blocks published commits are still putting (not yet acked).
     fn unacked(&self) -> BTreeSet<Cid> {
         self.backing.iter().flat_map(|b| b.remaining.iter().copied()).collect()
-    }
-
-    /// Writes SAVED and not yet BACKED_UP, with when (engine time) their
-    /// commit published: how long its stragglers have been re-sending, what
-    /// the page shows as "not answering for N s" (rule 8). Never a fate: they
-    /// retry until acked.
-    pub fn backing_since(&self) -> Vec<((ClientId, WriteId), u64)> {
-        self.backing.iter().flat_map(|b| b.writes.iter().map(move |w| (*w, b.since))).collect()
     }
 
 
@@ -4051,7 +4010,7 @@ impl<B: Blocks> Engine<B> {
         if remaining.is_empty() {
             out.extend(self.backed_up(writes));
         } else {
-            self.backing.push(Backing { writes, remaining, since: self.now });
+            self.backing.push(Backing { writes, remaining });
         }
         debug_assert!(self.folded.is_empty());
         // OWN PUBLISH (R-b, footnote 4): the front leaves the queue

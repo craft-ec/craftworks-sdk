@@ -603,45 +603,10 @@ impl Server {
             .map(|(_, _, s)| stage_fate(s))
     }
 
-    /// Unread terminal fates dropped past the bound (never silently).
-    pub fn fates_dropped(&self) -> u64 {
-        self.fates.dropped
-    }
-
-    /// Unread terminal fates held.
-    pub fn fates_unread(&self) -> usize {
-        self.fates.unread_count()
-    }
-
     /// `session`'s conflicts not yet taken for `Db`'s re-run (#249), each
     /// with the writes that cascade from it: `(write ids, keys)`. Drained.
     pub fn take_conflicted(&mut self, session: u64) -> Vec<(Vec<u64>, Vec<Vec<u8>>, u32)> {
         self.fates.take_conflicted(session)
-    }
-
-    /// The keys in `[lo, hi)` where the warm root and the published root
-    /// differ: this page's writes not yet published. `None` when a block the
-    /// diff needs is not held (never a shorter list).
-    pub fn pending_keys(&self, lo: &[u8], hi: &[u8]) -> Option<Vec<Vec<u8>>> {
-        let (warm, published) = self.heads()?;
-        if warm == published {
-            return Some(Vec::new());
-        }
-        let mut out = Vec::new();
-        let mut lo = std::ops::Bound::Included(lo.to_vec());
-        loop {
-            let spec = engine::read::DeltaSpec { from: published, lo: lo.clone(), hi: std::ops::Bound::Excluded(hi.to_vec()), max_entries: 4096 };
-            match self.page.walk(&warm, &engine::read::Walk::Delta(Box::new(spec))) {
-                engine::read::Walked::Done(engine::read::ReadResult::Delta { changes, cursor, .. }) => {
-                    out.extend(changes.into_iter().map(|(k, _)| k));
-                    match cursor {
-                        Some(c) => lo = std::ops::Bound::Excluded(c),
-                        None => return Some(out),
-                    }
-                }
-                _ => return None,
-            }
-        }
     }
 
     /// Where `key` stands (R-b): `Saving` while the warm and published roots

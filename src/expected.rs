@@ -134,10 +134,6 @@ impl Expected {
         basis: Basis::Exact,
     };
 
-    pub fn is_exact(self) -> bool {
-        self.basis == Basis::Exact
-    }
-
     /// Add two expectations, keeping the weaker basis.
     pub fn and(self, o: Expected) -> Expected {
         Expected {

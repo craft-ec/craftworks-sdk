@@ -564,20 +564,6 @@ impl Client {
         });
     }
 
-    /// The replies that have arrived since this was last called.
-    pub fn drain_replies(&mut self) -> Vec<Reply> {
-        std::mem::take(&mut self.replies)
-    }
-
-    pub fn has_replies(&self) -> bool {
-        !self.replies.is_empty()
-    }
-
-    /// Take the events that have accumulated. Drained, never dropped.
-    pub fn take_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
-    }
-
     /// Turn the call tree on, with the clock the app already uses.
     ///
     /// The clock is HANDED IN. The engine has none — it is sans-IO, which is
