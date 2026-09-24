@@ -48,7 +48,8 @@ const text = (dec, ptr, len) => new TextDecoder().decode(new Uint8Array(dec.memo
 
 /**
  * REPAIR AFTER LOAD (sdk#347; the owner: parity also REPAIRS): a loader that rebuilt the SDK's bundle from `k`
- * pieces PUTs back each piece it ASKED and did not get, so a lost piece is restored by the next app that loads it.
+ * pieces PUTs back each piece a source answered NOT FOUND and that never arrived (`raced.notHeld`), so a lost piece is
+ * restored by the next app that loads it -- never one the race merely cancelled at k.
  * Only those (never a piece this load did not wait on); each re-derived from the rebuilt bundle by the SDK
  * (`load_piece`), checked against the manifest's sha256 AND its container's address before it goes anywhere, and
  * PUT by `session.put_contract` (the page's one app-PUT path: its deadline and re-send). Never a user write.
@@ -59,7 +60,10 @@ const text = (dec, ptr, len) => new TextDecoder().decode(new Uint8Array(dec.memo
 export async function repairPieces({ spec, bundle, raced, sdk, session, webappCode, subtle }) {
   const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
   const out = [];
-  for (const i of raced.asked.filter(i => !raced.pieces[i])) {
+  // ONLY the pieces the node answered "not held" and that never arrived (`raced.notHeld`): a piece the race CANCELLED
+  // at k was not missing, just slower, and re-PUTting it is a needless PUT through the node's one queue (F61;
+  // measured on the final realnet as ~every piece of both bundles PUT per open, before this).
+  for (const i of raced.notHeld ?? []) {
     const want = spec.pieces[i];
     const piece = sdk.pieces.load(bundle, spec.payload, spec.m, i);
     if (hex(await subtle.digest("SHA-256", piece)) !== want.sha256) {

@@ -15,7 +15,8 @@ const subtle = webcrypto.subtle;
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
 const sha = async b => hex(await subtle.digest("SHA-256", b));
 
-/** k + m pieces of random bytes, and a node whose answer per piece `how(i)` decides: "ok", "silent", "wrong". */
+/** k + m pieces of random bytes, and a node whose answer per piece `how(i)` decides: "ok", "silent", "wrong",
+ * "notfound" (404 every time: the node does not hold it), "notready" (503 every time: a node still joining). */
 async function rig(k, m, how, { delayMs = 1 } = {}) {
   const bytes = Array.from({ length: k + m }, (_, i) => webcrypto.getRandomValues(new Uint8Array(64 + i)));
   const pieces = await Promise.all(bytes.map(async (b, i) => ({ url: `http://node/p${i}`, sha256: await sha(b) })));
@@ -34,6 +35,10 @@ async function rig(k, m, how, { delayMs = 1 } = {}) {
       setTimeout(() => {
         if (init?.signal?.aborted) return;
         done();
+        if (how(i) === "notfound" || how(i) === "notready") {
+          resolve({ ok: false, status: how(i) === "notfound" ? 404 : 503, arrayBuffer: async () => new ArrayBuffer(0) });
+          return;
+        }
         const body = how(i) === "wrong" ? new Uint8Array(bytes[i].length) : bytes[i];
         resolve({ ok: true, status: 200, arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.length) });
       }, delayMs);
@@ -54,6 +59,9 @@ await t("every piece answers: resolves at the first k, and NOTHING is asked afte
   await new Promise(ok => setTimeout(ok, 40));
   process.stdout.write(`    asked ${out.asked.length} of 31 (answers open the window), ${atResolve} requests, max in flight ${r.stats.maxInFlight}\n`);
   assert.equal(r.stats.started, atResolve, "a request started after the race had resolved");
+  // Pieces CANCELLED at k were not missing: none is marked for repair.
+  assert.ok(out.asked.length > 23, `THE SETUP: nothing was cancelled at k (asked ${out.asked.length})`);
+  assert.deepEqual(out.notHeld, [], "a piece the race cancelled at k was marked not-held (it would be re-PUT)");
   assert.equal(r.stats.inFlight, 0, "a request still in flight after the race resolved");
 });
 
@@ -63,6 +71,7 @@ await t("m pieces SILENT for ever: resolves from the others, and the silent ones
   const out = await raceK(r.spec, { fetch: r.fetch, subtle, sleep: fastSleep });
   assert.equal(out.verified, 23);
   for (const i of silent) assert.equal(out.pieces[i], null);
+  assert.deepEqual(out.notHeld, [], "SILENCE was taken for not-held (rule 8: silence is re-asked, never missing)");
   await new Promise(ok => setTimeout(ok, 20));
   assert.equal(r.stats.inFlight, 0, `${r.stats.inFlight} requests still in flight after the race resolved`);
 });
@@ -99,6 +108,18 @@ await t("fewer than k can ever arrive: it WAITS (no time cut-off) and says so, u
   await new Promise(ok => setTimeout(ok, 50));
   cancel.abort();
   await assert.rejects(p, /cancelled with 3 of 4 verified/);
+});
+
+await t("**a piece the node answers NOT FOUND is marked not-held (the repair's set); a 503 (not ready) is not**", async () => {
+  const gone = new Set([2, 9, 17]);
+  const busy = new Set([4, 25]);
+  const r = await rig(23, 8, i => (gone.has(i) ? "notfound" : busy.has(i) ? "notready" : "ok"), { delayMs: 3 });
+  const out = await raceK(r.spec, { fetch: r.fetch, subtle, sleep: fastSleep });
+  assert.equal(out.verified, 23);
+  process.stdout.write(`    asked ${out.asked.length}, not held ${JSON.stringify(out.notHeld)}\n`);
+  assert.deepEqual(out.notHeld, [...gone].filter(i => out.asked.includes(i)).sort((a, b) => a - b), "not exactly the 404s");
+  assert.ok(out.notHeld.length >= 1, "THE SETUP: no 404 piece was asked");
+  for (const i of busy) assert.ok(!out.notHeld.includes(i), `a 503 (not ready) was taken for not-held: ${i}`);
 });
 
 if (failures) { process.stdout.write(`race-pieces: ${failures} FAILED\n`); process.exit(1); }

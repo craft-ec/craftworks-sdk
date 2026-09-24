@@ -49,10 +49,11 @@ function session() {
   return { puts, put_contract: (code, params, state) => { puts.push({ code, params, state }); return `key-${puts.length}`; } };
 }
 
-await t("only the pieces ASKED and not got are PUT back, each byte-identical to the tool's container", async () => {
+await t("**only the pieces answered NOT HELD and not got are PUT back** — never one the race cancelled at k — each byte-identical to the tool's container", async () => {
   const lost = new Set([1, 5, 12]);
+  const cancelled = new Set([7, 9]); // asked, never arrived, never answered not-found: the race ended at k
   const asked = [...Array(n).keys()].filter(i => i !== 14); // piece 14 was never asked: not this load's to repair
-  const raced = { asked, pieces: pieceBytes.map((b, i) => (lost.has(i) || i === 14 ? null : b)) };
+  const raced = { asked, notHeld: [1, 5, 12], pieces: pieceBytes.map((b, i) => (lost.has(i) || cancelled.has(i) || i === 14 ? null : b)) };
   const s = session();
   const done = await repairPieces({ spec, bundle, raced, sdk, session: s, webappCode, subtle });
   assert.deepEqual(done.map(d => d.piece), [1, 5, 12], `repaired ${JSON.stringify(done)}`);
@@ -67,7 +68,7 @@ await t("only the pieces ASKED and not got are PUT back, each byte-identical to 
 
 await t("a piece whose re-derived bytes do not match the manifest is REFUSED, not PUT", async () => {
   const bad = { ...spec, pieces: spec.pieces.map((p, i) => (i === 3 ? { ...p, sha256: "00".repeat(32) } : p)) };
-  const raced = { asked: [3, 4], pieces: pieceBytes.map((b, i) => (i === 3 || i === 4 ? null : b)) };
+  const raced = { asked: [3, 4], notHeld: [3, 4], pieces: pieceBytes.map((b, i) => (i === 3 || i === 4 ? null : b)) };
   const s = session();
   const done = await repairPieces({ spec: bad, bundle, raced, sdk, session: s, webappCode, subtle });
   assert.deepEqual(done.map(d => [d.piece, !!d.put]), [[3, false], [4, true]]);
@@ -78,7 +79,7 @@ await t("a piece whose re-derived bytes do not match the manifest is REFUSED, no
 await t("a piece whose container is not at the manifest's ADDRESS is refused, not PUT", async () => {
   const bad = { ...spec, pieces: spec.pieces.map((p, i) => (i === 6 ? { ...p, address: spec.pieces[7].address } : p)) };
   const s = session();
-  const done = await repairPieces({ spec: bad, bundle, raced: { asked: [6], pieces: pieceBytes.map((b, i) => (i === 6 ? null : b)) }, sdk, session: s, webappCode, subtle });
+  const done = await repairPieces({ spec: bad, bundle, raced: { asked: [6], notHeld: [6], pieces: pieceBytes.map((b, i) => (i === 6 ? null : b)) }, sdk, session: s, webappCode, subtle });
   assert.equal(done.length, 1);
   assert.match(done[0].refused ?? "", /address/);
   assert.equal(s.puts.length, 0);
@@ -86,7 +87,7 @@ await t("a piece whose container is not at the manifest's ADDRESS is refused, no
 
 await t("nothing missing: nothing PUT", async () => {
   const s = session();
-  const done = await repairPieces({ spec, bundle, raced: { asked: [...Array(n).keys()], pieces: pieceBytes }, sdk, session: s, webappCode, subtle });
+  const done = await repairPieces({ spec, bundle, raced: { asked: [...Array(n).keys()], notHeld: [], pieces: pieceBytes }, sdk, session: s, webappCode, subtle });
   assert.deepEqual(done, []);
   assert.equal(s.puts.length, 0);
 });
