@@ -10,7 +10,7 @@
 
 use crate::{frame_delegate_op, DelegateKey, Parameters};
 pub use signer_proto::{
-    Answer as SignerAnswer, Head, Next, Request as SignerRequest, Why, MAX_PUT_BLOCKS, UNATTRIBUTED,
+    Answer as SignerAnswer, Head, Next, Request as SignerRequest, Why, MAX_HELD, UNATTRIBUTED,
 };
 
 fn frame(
@@ -46,8 +46,9 @@ pub fn frame_sign(
     frame(key, id, &SignerRequest::Sign { prev, next, label }, stream_id)
 }
 
-/// Provision the signer: the head's key, the Register it signs for, and the Block contract's code (for its root check
-/// and PUT-WITH-CODE). Carries two contracts' code, so it is chunked like any large request.
+/// Provision the signer: the head's key, the Register it signs for, and the Block contract's code (it keeps the codes'
+/// HASHES, to name the Register and a root block). Carries two contracts' code, so it is chunked like any large
+/// request.
 pub fn frame_provision(
     key: &DelegateKey,
     id: u32,
@@ -70,37 +71,17 @@ pub fn frame_provision(
     )
 }
 
-/// PUT-WITH-CODE, for a node that is not the page's own: block STATES only (`kind ‖ body`), at most
-/// [`MAX_PUT_BLOCKS`]; the signer names each contract and PUTs it inside the node. Answered `Putting{contracts}` at
-/// once, then one `Put{contract, ok, note}` per PUT. Refused HERE, before anything is framed, when the count is out
-/// of range -- the signer would refuse it whole anyway.
-pub fn frame_put_blocks(
-    key: &DelegateKey,
-    id: u32,
-    states: Vec<Vec<u8>>,
-    stream_id: u32,
-) -> Result<Vec<Vec<u8>>, String> {
-    if states.is_empty() || states.len() > MAX_PUT_BLOCKS {
-        return Err(format!(
-            "PUT-WITH-CODE carries 1..={MAX_PUT_BLOCKS} blocks, not {}",
-            states.len()
-        ));
-    }
-    frame(key, id, &SignerRequest::PutBlocks { states }, stream_id)
-}
-
-/// READ-LOCAL: ask whether the signer's node holds these contracts (1..=[`MAX_PUT_BLOCKS`]). Answered
-/// `Held{present}`, in order. How the page confirms PUT-WITH-CODE blocks: a client GET of one is answered NotFound on a
-/// node with a peer (F55). Refused HERE when the count is out of range.
+/// READ-LOCAL: ask whether the signer's node holds these contracts (1..=[`MAX_HELD`]). Answered
+/// `Held{present}`, in order. Refused HERE when the count is out of range.
 pub fn frame_held(
     key: &DelegateKey,
     id: u32,
     contracts: Vec<[u8; 32]>,
     stream_id: u32,
 ) -> Result<Vec<Vec<u8>>, String> {
-    if contracts.is_empty() || contracts.len() > MAX_PUT_BLOCKS {
+    if contracts.is_empty() || contracts.len() > MAX_HELD {
         return Err(format!(
-            "Held asks about 1..={MAX_PUT_BLOCKS} contracts, not {}",
+            "Held asks about 1..={MAX_HELD} contracts, not {}",
             contracts.len()
         ));
     }
@@ -175,23 +156,6 @@ mod tests {
     }
 
     #[test]
-    fn put_blocks_is_framed_and_its_count_is_refused_before_framing() {
-        let p = payload(&frame_put_blocks(&key(), 2, vec![vec![1, 2, 3]], 1).unwrap());
-        assert_eq!(
-            signer_proto::decode_request(&p),
-            Some((
-                2,
-                SignerRequest::PutBlocks {
-                    states: vec![vec![1, 2, 3]]
-                }
-            ))
-        );
-        assert!(frame_put_blocks(&key(), 2, vec![], 1).is_err());
-        assert!(frame_put_blocks(&key(), 2, vec![vec![1]; MAX_PUT_BLOCKS + 1], 1).is_err());
-        assert!(frame_put_blocks(&key(), 2, vec![vec![1]; MAX_PUT_BLOCKS], 1).is_ok());
-    }
-
-    #[test]
     fn held_is_framed_and_its_count_is_refused_before_framing() {
         let p = payload(&frame_held(&key(), 3, vec![[4; 32], [5; 32]], 1).unwrap());
         assert_eq!(
@@ -204,8 +168,8 @@ mod tests {
             ))
         );
         assert!(frame_held(&key(), 3, vec![], 1).is_err());
-        assert!(frame_held(&key(), 3, vec![[1; 32]; MAX_PUT_BLOCKS + 1], 1).is_err());
-        assert!(frame_held(&key(), 3, vec![[1; 32]; MAX_PUT_BLOCKS], 1).is_ok());
+        assert!(frame_held(&key(), 3, vec![[1; 32]; MAX_HELD + 1], 1).is_err());
+        assert!(frame_held(&key(), 3, vec![[1; 32]; MAX_HELD], 1).is_ok());
     }
 
     #[test]

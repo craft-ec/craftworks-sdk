@@ -62,7 +62,7 @@ fn verdict_of(rows: &[serde_json::Value], window: &str) -> Vec<(String, String)>
 
 /// **Every kind, its verdict.** Reads and signer QUERIES pass; a Block-code PUT (small, or chunked) is REPORTED; a
 /// PUT of any other contract, an UPDATE, a delegate REGISTRATION (always chunked: reassembly is exercised) and a
-/// signer Sign / Provision / PutBlocks FAIL.
+/// signer Sign / Provision FAIL.
 #[test]
 fn every_frame_the_sdk_sends_gets_the_rulings_verdict() {
     let (_, signer) = wire::delegate_from_code(b"the signer delegate's code");

@@ -23,13 +23,13 @@ pub fn contract_for(code: &[u8], cid: &Cid) -> [u8; 32] {
 /// per candidate is what a map was avoiding; hashing it once per call makes
 /// each candidate one 64-byte blake3.
 pub fn contract_deriver(code: &[u8]) -> impl Fn(&Cid) -> Cid {
-    let code_hash: [u8; 32] = *blake3::hash(code).as_bytes();
-    move |cid: &Cid| {
-        let mut h = blake3::Hasher::new();
-        h.update(&code_hash);
-        h.update(cid);
-        *h.finalize().as_bytes()
-    }
+    contract_deriver_of_hash(crate::code_hash(code))
+}
+
+/// `contract_deriver` from the code's HASH (sdk#334: the signer keeps the
+/// hash, never the code).
+pub fn contract_deriver_of_hash(code_hash: [u8; 32]) -> impl Fn(&Cid) -> Cid {
+    move |cid: &Cid| crate::instance(&code_hash, cid)
 }
 
 #[cfg(test)]

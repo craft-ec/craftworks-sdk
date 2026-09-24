@@ -12,10 +12,9 @@
 //!
 //! After the magic comes the request's `id` (u32), and the signer ECHOES it on the answer. An answer's variant does
 //! not say which request it answers: `Held{present}` names no contract, `Refused(NotProvisioned)` answers a sign or a
-//! put, `Refused(BlockCount)` a put or a held. With two requests in flight only the id attributes an answer -- a pacing
-//! rule (one request of each kind at a time) would stand in for an identity. The page's ids are its own; `0` is
-//! [`UNATTRIBUTED`], never a page's: the answer to a request whose id could not be read, and the `Put` answers, which
-//! arrive after the request that caused them and name their contract instead.
+//! provision. With two requests in flight only the id attributes an answer -- a pacing rule (one request of each kind
+//! at a time) would stand in for an identity. The page's ids are its own; `0` is [`UNATTRIBUTED`], never a page's:
+//! the answer to a request whose id could not be read.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +26,8 @@ pub const MAGIC: [u8; 4] = *b"SG02";
 /// The id no page request carries: an answer that cannot be attributed to one (see the crate docs).
 pub const UNATTRIBUTED: u32 = 0;
 
-/// Most blocks one `PutBlocks` may carry: one return's worth of PUTs (the node's per-return limit, schedule.rs).
-pub const MAX_PUT_BLOCKS: usize = 128;
+/// Most contracts one `Held` may ask about.
+pub const MAX_HELD: usize = 128;
 
 /// A head: `(seq, root)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,14 +77,10 @@ pub enum Why {
         read: Head,
     },
     RegisterChanged,
-    /// A `PutBlocks` or `Held` with none, or more than [`MAX_PUT_BLOCKS`].
+    /// A `Held` with none, or more than [`MAX_HELD`].
     BlockCount {
         max: u32,
         got: u32,
-    },
-    /// A `PutBlocks` state that is not a block (empty).
-    NotABlock {
-        index: u32,
     },
     /// The value to sign carries a ledger that is not the format ([`head::check`]): nothing is signed, because a
     /// malformed ledger, once signed, degrades every reader's merge for that head's life and nobody is told.
@@ -121,18 +116,6 @@ pub enum Answer {
     /// `prev` was already signed from: the FIRST record's bytes.
     AlreadySigned(Vec<u8>),
     Provisioned,
-    /// PUT-WITH-CODE accepted: one PUT is on its way per block, in order, to these Block contracts (the page names a
-    /// block's contract the same way, `contract_for(block_code, block_id)`). Confirm them with `Held`: the node's
-    /// answer to each PUT is relayed as `Put`, but no `Put` reached the ASKING connection in the live run (#214).
-    Putting {
-        contracts: Vec<[u8; 32]>,
-    },
-    /// The node's answer to one of those PUTs.
-    Put {
-        contract: [u8; 32],
-        ok: bool,
-        note: String,
-    },
     /// READ-LOCAL: for each contract asked, in order, whether THIS node holds its state.
     Held {
         present: Vec<bool>,
@@ -160,16 +143,8 @@ pub enum Request {
         register_params: Vec<u8>,
         block_code: Vec<u8>,
     },
-    /// PUT-WITH-CODE (ENGINE-SHAPE, for a remote gateway): the page sends only block STATES (`kind ‖ body`); the
-    /// signer, which holds the Block contract's code, names each contract and PUTs it from inside the node, so the
-    /// ≈100 KB of code never crosses the page's socket (arm A, measured: 98.4 % of a client PUT is code).
-    PutBlocks {
-        states: Vec<Vec<u8>>,
-    },
     /// READ-LOCAL: does this node hold these contracts' state? The signer's synchronous local read, per contract --
-    /// never a network fetch, so it cannot park. How the page confirms a PUT-WITH-CODE block: on a node WITH A PEER a
-    /// client GET of a delegate-put block is answered NotFound (F55), and the `Put` answers do not reach the page.
-    /// 1..=[`MAX_PUT_BLOCKS`] contracts.
+    /// never a network fetch, so it cannot park. 1..=[`MAX_HELD`] contracts.
     Held {
         contracts: Vec<[u8; 32]>,
     },
@@ -248,9 +223,6 @@ mod tests {
                 register_params: vec![3],
                 block_code: vec![4],
             },
-            Request::PutBlocks {
-                states: vec![vec![1, 2], vec![3]],
-            },
             Request::Held {
                 contracts: vec![[6; 32], [7; 32]],
             },
@@ -261,11 +233,7 @@ mod tests {
             assert_eq!(request_id(&b), id);
             assert_eq!(decode_request(&b), Some((id, r)));
         }
-        let a = Answer::Put {
-            contract: [5; 32],
-            ok: false,
-            note: "no".into(),
-        };
+        let a = Answer::Register { params: Some(vec![5]) };
         assert_eq!(decode_answer(&encode_answer(7, &a)), Some((7, a)));
         let h = Answer::Held {
             present: vec![true, false],

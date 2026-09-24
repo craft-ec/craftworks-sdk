@@ -686,7 +686,7 @@ fn a_same_key_displacement_is_adopted_on_the_page() {
     rig.client_as(&mut node, &Request::Identity);
     assert!(published(&states(&rig.client_as(&mut node, &write(1, &[("a", Some("1"))])), 1)));
     let (seq, mine) = node.head().expect("published");
-    let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let key = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     // The other device's REAL tree, whose head WINS the equal-seq rule (the
     // lower BLAKE3 of the whole VALUE -- root AND ledger: this page's head
     // carries a ledger, the other's is a bare root): the fork would otherwise
@@ -1132,7 +1132,7 @@ fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
         let key = craftworks_sdk::db::record_key("t", loc);
         let (tip_seq, tip_root) = node.head().expect("the tab published");
         let tip_tree = node.tree(&tip_root).expect("the tip is whole");
-        let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+        let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
         let (seq, root, prev) = match case {
             "same-seq, record lost" => {
                 // The other device's commit at the tip's seq, built on the
@@ -1219,7 +1219,7 @@ fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
     // Displaced at its own seq by a winner without the record.
     let hr = node.head_read().expect("a head");
     let base = hr.prev().expect("a prev");
-    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     let mut salt = 0u8;
     let st = loop {
         let r = device_tree(&mut node, &[(b"other".to_vec(), vec![salt])]);
@@ -1291,7 +1291,7 @@ fn a_same_seq_race_is_merged_key_by_key() {
         let hr = node.head_read().expect("a head");
         let base = hr.prev().expect("the tip has a prev");
         let base_tree = node.tree(&base.1).expect("the base is whole");
-        let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+        let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
         let theirs_record = b"their bytes for the record".to_vec();
         let mut salt = 0u8;
         let st = loop {
@@ -1379,7 +1379,7 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
     let hr = node.head_read().expect("a head");
     let base = hr.prev().expect("a prev");
     let base_tree = node.tree(&base.1).expect("whole");
-    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     // x: the same-seq winner, P plus an unrelated key (so the record is one-sided mine).
     let mut salt = 0u8;
     let (x_root, x_state) = loop {
@@ -1480,7 +1480,7 @@ fn elsewhere(_rig: &mut PageRig, node: &mut Node, _write_id: u64, ops: Vec<proto
     }
     let entries: Vec<(Vec<u8>, Vec<u8>)> = tree.into_iter().collect();
     let root = device_tree(node, &entries);
-    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     let v = value(&root, &Ledger { prev: Some(signer_proto::Head { seq: tip_seq, root: tip_root }), ..Ledger::default() });
     let st = contract_keys::register::head_state(&node.register_params, &key_of, tip_seq + 1, &v).expect("signs");
     node.update(&st);
@@ -1945,7 +1945,7 @@ fn a_group_that_wrote_one_key_twice_merges_by_its_final_value() {
         let base = hr.prev().expect("the tip has a prev");
         let base_tree = node.tree(&base.1).expect("the base is whole");
         assert!(!base_tree.contains_key(&k) && base_tree.contains_key(b"k/first".as_slice()), "W1 and W2 were not ONE commit on top of the first: this is not a group");
-        let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+        let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
         let mut salt = 0u8;
         let st = loop {
             let mut entries: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
@@ -2019,7 +2019,7 @@ fn a_dying_first_commit_under_a_full_list_of_older_entries_is_re_applied() {
         })
         .collect();
     let v = value(&theirs, &Ledger { prev: Some(signer_proto::Head { seq: s1, root: root1 }), through, ..Ledger::default() });
-    let key = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let key = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     let st = contract_keys::register::head_state(&node.register_params, &key, s1 + 1, &v).expect("signs");
     node.update(&st);
     assert_eq!(node.head(), Some((s1 + 1, theirs)), "their head did not take the register");
@@ -2065,7 +2065,7 @@ fn a_merge_goes_before_a_later_own_write_and_the_later_value_stands() {
     rig.held.clear();
     rig.faults.hold = false;
     // The other device's head at the tip's seq, from the same base, leaving k alone.
-    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     let base_tree = node.tree(&base_root).expect("whole");
     let mut salt = 0u8;
     let st = loop {
@@ -2304,7 +2304,7 @@ fn a_commit_built_before_a_foreign_winner_is_never_signed_as_its_successor() {
     assert!(!withheld.is_empty(), "no put ack was held back: the case this test is about did not happen");
     assert!(signs.is_empty(), "the head was signed before its acks arrived: {signs:?}");
     // Another device wins seq s, from the same base, with `other`.
-    let key_of = node.secrets.get(signer::KEY).cloned().expect("provisioned");
+    let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     let base_tree = node.tree(&base_root).expect("whole");
     let mut salt = 0u8;
     let (winner, st) = loop {

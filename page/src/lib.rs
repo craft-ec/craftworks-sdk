@@ -2085,17 +2085,17 @@ impl Page {
 }
 
 /// Is this the kind of answer a SIGN request gets? `Signed`, `AlreadySigned`,
-/// `NotNext`, or a refusal the sign verb gives; not `Putting`, `Put`, `Held`,
-/// `Provisioned`, `Register`, or a refusal only PUT-WITH-CODE or Provision gives.
+/// `NotNext`, or a refusal the sign verb gives; not `Held`, `Provisioned`,
+/// `Register`, or a refusal only Held or Provision gives.
 fn answers_a_sign(a: &signer_proto::Answer) -> bool {
     use signer_proto::{Answer as A, Why};
     match a {
         A::Signed(_) | A::AlreadySigned(_) | A::NotNext { .. } => true,
         A::Refused(w) => !matches!(
             w,
-            Why::BlockCount { .. } | Why::NotABlock { .. } | Why::KeyAlreadyProvisioned | Why::RegisterChanged
+            Why::BlockCount { .. } | Why::KeyAlreadyProvisioned | Why::RegisterChanged
         ),
-        A::Provisioned | A::Putting { .. } | A::Put { .. } | A::Held { .. } | A::Register { .. } => false,
+        A::Provisioned | A::Held { .. } | A::Register { .. } => false,
     }
 }
 

@@ -40,13 +40,10 @@ fn signs(ops: &[Op]) -> usize {
 #[test]
 fn a_misrouted_answer_does_not_stop_the_sign_being_asked_again() {
     let stale = A::NotNext { current: Head { seq: 7, root: [7; 32] } };
-    let put = A::Put { contract: [1; 32], ok: true, note: String::new() };
     for (other_id, misrouted) in [
         (true, stale.clone()),
         (true, A::Refused(Why::NotSuccessor)),
-        (true, put),
         (false, A::Held { present: vec![true] }),
-        (false, A::Putting { contracts: vec![[1; 32]] }),
         (false, A::Provisioned),
         (false, A::Refused(Why::BlockCount { max: 128, got: 200 })),
     ] {

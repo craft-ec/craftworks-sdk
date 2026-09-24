@@ -444,73 +444,6 @@ fn the_same_key_with_another_register_is_refused() {
     );
 }
 
-/// PUT-WITH-CODE: block STATES in, each named by its own hash; the contracts are answered in order and the entry is
-/// handed exactly those PUTs.
-#[test]
-fn put_blocks_names_each_block_by_its_hash_and_hands_the_entry_the_puts() {
-    let mut w = World::new();
-    let states: Vec<Vec<u8>> = (1..=3u8).map(block_state).collect();
-    let served = serve_full(
-        &mut w.host,
-        &encode_request(
-            1,
-            &Request::PutBlocks {
-                states: states.clone(),
-            },
-        ), Origin::Local,
-    );
-    let ids: Vec<[u8; 32]> = (1..=3u8).map(block_root).collect();
-    let contracts: Vec<[u8; 32]> = ids
-        .iter()
-        .map(|id| contract_keys::block::contract_for(BCODE, id))
-        .collect();
-    assert_eq!(served.answer, Answer::Putting { contracts });
-    assert_eq!(served.puts, ids.into_iter().zip(states).collect::<Vec<_>>());
-}
-
-#[test]
-fn put_blocks_is_refused_whole_when_it_cannot_be_done() {
-    let mut w = World::new();
-    let ask = |w: &mut World, states: Vec<Vec<u8>>| {
-        serve_full(
-            &mut w.host,
-            &encode_request(1, &Request::PutBlocks { states }), Origin::Local,
-        )
-    };
-    let none = ask(&mut w, vec![]);
-    assert_eq!(
-        none.answer,
-        Answer::Refused(Why::BlockCount { max: 128, got: 0 })
-    );
-    let many = ask(&mut w, vec![block_state(1); 129]);
-    assert_eq!(
-        many.answer,
-        Answer::Refused(Why::BlockCount { max: 128, got: 129 })
-    );
-    let bad = ask(&mut w, vec![block_state(1), vec![]]);
-    assert_eq!(bad.answer, Answer::Refused(Why::NotABlock { index: 1 }));
-    for s in [none, many, bad] {
-        assert!(
-            s.puts.is_empty(),
-            "a refused PutBlocks still handed the entry PUTs"
-        );
-    }
-    let mut bare = Mem::default();
-    let r = serve_full(
-        &mut bare,
-        &encode_request(
-            1,
-            &Request::PutBlocks {
-                states: vec![block_state(1)],
-            },
-        ), Origin::Local,
-    );
-    assert_eq!(
-        (r.answer, r.puts.len()),
-        (Answer::Refused(Why::NotProvisioned), 0)
-    );
-}
-
 /// READ-LOCAL: present / absent per contract, in order, from the node's local states alone -- so a block the node
 /// holds is `true` and one it does not is `false`, whatever order they are asked in. Needs no provisioning.
 #[test]
@@ -673,8 +606,9 @@ fn a_ledgered_register_head_with_no_record_of_mine_is_read_by_its_root() {
 }
 
 /// "WHICH REGISTER DO YOU SIGN FOR?" — none before a key is provisioned; its
-/// Register's params after; and never the key. Params left behind with no key
-/// name nothing (a half-written store must not open a tree it cannot sign for).
+/// Register's params after; and never the key. A provisioning record that is
+/// not one (a truncated or foreign value) names nothing: never a tree it
+/// cannot sign for.
 #[test]
 fn the_signer_names_the_register_it_signs_for_and_only_with_a_key() {
     let mut fresh = Mem::default();
@@ -685,7 +619,8 @@ fn the_signer_names_the_register_it_signs_for_and_only_with_a_key() {
     assert_eq!(a, Answer::Register { params: Some(w.params.clone()) });
     let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     assert!(!format!("{a:?}").contains(&format!("{:?}", sk.to_bytes().to_vec())), "the key left the signer");
-    let mut orphan = Mem::default();
-    orphan.secrets.insert(REGISTER_PARAMS.to_vec(), w.params.clone());
-    assert_eq!(serve(&mut orphan, &encode_request(7, &Request::Register), Origin::Local), Answer::Register { params: None }, "params with no key named a Register");
+    let mut cut = w.host.clone();
+    let whole = cut.secrets[PROVISION].clone();
+    cut.secrets.insert(PROVISION.to_vec(), whole[..whole.len() - 1].to_vec());
+    assert_eq!(serve(&mut cut, &encode_request(7, &Request::Register), Origin::Local), Answer::Register { params: None }, "a cut provisioning record named a Register");
 }

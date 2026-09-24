@@ -16,7 +16,7 @@
 //! GET/SUBSCRIBE, and signer QUERIES (Register, Held), pass; a Block-code PUT
 //! is REPORTED (a repair; content-addressed, so a view may send one); a PUT of
 //! ANY other contract, an UPDATE, a delegate REGISTRATION and a signer
-//! Sign / Provision / PutBlocks FAIL.
+//! Sign / Provision FAIL.
 //!
 //! In:  JSONL lines `{"t":…, "window":…, "socket":…, "data":"<base64>"}`.
 //! Out: JSONL lines `{"t", "window", "socket", "op", "contract"?, "code"?,
@@ -83,7 +83,6 @@ fn classify(req: &ClientRequest<'_>, block_code: &CodeHash) -> Vec<serde_json::V
                         let (name, fail) = match r {
                             signer::Request::Sign { .. } => ("sign", true),
                             signer::Request::Provision { .. } => ("provision", true),
-                            signer::Request::PutBlocks { .. } => ("put-blocks", true),
                             signer::Request::Held { .. } => ("held", false),
                             signer::Request::Register => ("register-query", false),
                         };
