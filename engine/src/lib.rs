@@ -1114,13 +1114,11 @@ struct Commit {
     race: Race,
     /// THE PARITY HELD BACK for after the Sign (#378 P1-hybrid): every changed group's parity but the ONE in the
     /// first wave. Sent when the head lands (`follow_ups`), behind the Sign and the head's UPDATE on the node's one
-    /// queue (F61). The IDS are
-    /// in the context (32 B each), so a rehydrated commit still sends them; the bytes are page memory only
-    /// (`deferred_bytes`), and one without them is re-derived from the carried ops (`reput_from_ops`).
-    #[serde(default)]
-    deferred: Vec<Cid>,
+    /// queue (F61). Held WITH their bytes, so nothing is re-derived and nothing can fail to be sent. Page memory,
+    /// like `packs`: skipped by the state walk (`context_len`, `state_digest`), where m - 1 blocks per group would
+    /// be counted as bookkeeping; their ids are in `data`, which the walk covers, and each id is its bytes' hash.
     #[serde(skip)]
-    deferred_bytes: BTreeMap<Cid, Vec<u8>>,
+    deferred: Vec<Block>,
     /// Each pack's member ids: a pack's ack is its members' ack (the node
     /// holds a pack's members under their own ids), so they count toward k.
     #[serde(default)]
@@ -3665,8 +3663,7 @@ impl<B: Blocks> Engine<B> {
             settle_rounds: 0,
             through: 0,
             race,
-            deferred: deferred.iter().map(|(c, _)| *c).collect(),
-            deferred_bytes: deferred.into_iter().collect(),
+            deferred,
             pack_members,
             root_parity,
         });
@@ -3714,7 +3711,7 @@ impl<B: Blocks> Engine<B> {
         c.settle_rounds += 1;
         // The parity held back behind the Sign (#378 P1-hybrid) is not re-put ahead of it: until the head lands it
         // was never sent, and after, the commit is Backing and a straggler is re-put like any block.
-        let missing: BTreeSet<Cid> = c.data.difference(&c.confirmed).filter(|id| !c.deferred.contains(id)).copied().collect();
+        let missing: BTreeSet<Cid> = c.data.difference(&c.confirmed).filter(|id| !c.deferred.iter().any(|(d, _)| d == *id)).copied().collect();
         if missing.is_empty() || c.ready(self.params.race_put, &unacked) {
             if c.head_sent {
                 out.push(Effect::ReadHead {
@@ -4033,20 +4030,10 @@ impl<B: Blocks> Engine<B> {
         let Some(c) = self.pending.as_mut() else {
             return out;
         };
-        let rest: Vec<Cid> = std::mem::take(&mut c.deferred).into_iter().filter(|id| !c.confirmed.contains(id)).collect();
-        let mut bytes = std::mem::take(&mut c.deferred_bytes);
-        let mut rederive: BTreeSet<Cid> = BTreeSet::new();
-        for id in rest {
-            match bytes.remove(&id) {
-                Some(b) => out.push(Effect::PutBlock { id, bytes: b, after: Vec::new() }),
-                None => {
-                    rederive.insert(id);
-                }
+        for (id, bytes) in std::mem::take(&mut c.deferred) {
+            if !c.confirmed.contains(&id) {
+                out.push(Effect::PutBlock { id, bytes, after: Vec::new() });
             }
-        }
-        // A rehydrated commit holds the ids, not the bytes: the same ops on the same base make the same parity.
-        if !rederive.is_empty() {
-            out.extend(self.reput_from_ops(&rederive).unwrap_or_default());
         }
         out
     }

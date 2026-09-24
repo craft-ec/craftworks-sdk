@@ -422,6 +422,34 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     assert!(head(&all).is_none(), "the head was signed with a changed group at k-1 of k+m");
 }
 
+/// NOTHING HELD BACK IS RE-DERIVED (#378 P1-hybrid, rule 7): a commit whose ops are too large to carry has nothing
+/// to re-derive its held-back parity from, and still puts every one of them as its head lands, from the bytes it
+/// held since the first send -- and is BACKED_UP when they are acked.
+#[test]
+fn the_held_back_parity_of_a_commit_too_large_to_carry_is_sent_from_its_own_bytes() {
+    let mut r = Rig::base();
+    let big = vec![put("k/000100", &[7u8; 30 * 1024])];
+    let size: usize = big.iter().map(|(k, op)| k.len() + if let Op::Put(v) = op { v.len() } else { 0 }).sum();
+    assert!(size > Params::default().max_carried_ops_bytes, "THE SETUP: {size} B of ops is carried");
+    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), big));
+    let mut all = first.clone();
+    for id in puts(&first).keys() {
+        all.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    let (seq, _) = head(&all).expect("every first-wave PUT acked, and no head");
+    let landed = r.step(Event::HeadConfirmed(seq));
+    let told = landed.iter().position(|f| matches!(f, Effect::Notify { .. })).expect("Published");
+    let follow = puts(&landed[..told]);
+    let first_parity = puts(&first).iter().filter(|(id, b)| is_parity(id, b)).count();
+    println!("first wave: {first_parity} parity; sent as the head landed: {}", follow.len());
+    assert_eq!(follow.len(), first_parity * (PARITY - 1), "not every changed group's other m - 1 parity was sent");
+    let mut fx = landed.clone();
+    for id in follow.keys() {
+        fx.extend(r.step(Event::PutConfirmed(*id)));
+    }
+    assert!(states(&fx, 2).contains(&State::ParityComplete), "every parity acked, and not BACKED_UP: {:?}", states(&fx, 2));
+}
+
 /// §P 5: A SINGLE STALL PER GROUP IS STILL RACED (#378 P1-hybrid: k of k + 1). The first wave holds the group's
 /// new leaf and ONE parity: with the leaf held back and its parity acked, the group is at k and the head signs.
 /// THE CONTROL: with BOTH held, it does not (the rest of the parity follows only the Sign).
