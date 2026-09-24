@@ -2397,7 +2397,10 @@ fn move_head(rig: &mut PageRig, node: &mut Node, salt: u32) {
 /// again unpinned at the new head, where it answers — the row, and the other device's row with it.
 #[test]
 fn a_read_pinned_to_a_root_whose_block_never_comes_moves_on_at_a_newer_head() {
-    let (mut node, mut rig, mut tab) = published_rows_and_reader(71, |n| n.head().map(|h| h.1).into_iter().collect());
+    // The ROOT GROUP silent: the root and its parity (sdk#335: the root is a group of one, and with any one of its
+    // 1 + m answering the read would not wait at all).
+    let root_group = |n: &Node| n.head().map(|h| h.1).into_iter().chain(n.head_read().and_then(|h| h.mark()).unwrap_or_default()).collect();
+    let (mut node, mut rig, mut tab) = published_rows_and_reader(71, root_group);
     let t = match decided_get(&mut tab, &mut rig, &mut node, b"k/000321") {
         craftworks_sdk::Outcome::Wait(_, t) => t,
         other => panic!("THE SETUP: the read over a silent root did not wait: {other:?}"),
