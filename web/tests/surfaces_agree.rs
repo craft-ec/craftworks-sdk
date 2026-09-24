@@ -64,6 +64,8 @@ const TRANSPORT_ONLY: &[&str] = &[
     // preload from, or to trace, behind the in-memory one.
     "preload",
     "trace",
+    // The page's own recording (sdk#386's instrument work): there are no ops sent behind the in-memory surface.
+    "page_trace",
     "trace_on",
     // How a parked read learns the blocks its walk needed arrived, and how it
     // RESUMES at that ticket's root (READ-STATE). An in-memory store holds
