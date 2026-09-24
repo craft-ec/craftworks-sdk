@@ -411,6 +411,13 @@ impl AppContainer {
         let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
         wire::webapp::app_container(&files).map_err(|e| JsError::new(&e))
     }
+
+    /// The container's WEB part alone: what `Session.publish_site` publishes as the app's SITE (builder#117), the
+    /// exact bytes `finish` frames.
+    pub fn web(&self) -> Result<Vec<u8>, JsError> {
+        let files: Vec<(&str, &[u8])> = self.0.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        wire::webapp::app_web(&files).map_err(|e| JsError::new(&e))
+    }
 }
 
 /// This page's wasm linear memory, in bytes: what a tree reader costs is

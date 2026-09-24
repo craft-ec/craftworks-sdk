@@ -624,7 +624,7 @@ impl Session {
         use page::Publication as P;
         let (state, version, said) = match self.page().and_then(|p| p.publication(app)) {
             None => ("none", 0, ""),
-            Some(P::Publishing) => ("publishing", 0, ""),
+            Some(P::Publishing { waiting_for }) => ("publishing", 0, waiting_for.unwrap_or("")),
             Some(P::Published { version }) => ("published", *version, ""),
             Some(P::Superseded { version }) => ("superseded", *version, ""),
             Some(P::Refused(w)) => ("refused", 0, w.as_str()),

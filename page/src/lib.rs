@@ -322,10 +322,16 @@ struct Pub {
     sign_refusals: u32,
 }
 
+/// What a site publication waits on while the signer answers `HeadUnknown` (builder#117).
+pub const WAITING_FOR_SITE: &str = "waiting for this node to fetch the site";
+
 /// A SITE's publication (builder#117): how it ended, or that it has not -- the ONE owner of that fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Publication {
-    Publishing,
+    /// In flight. `waiting_for`: what it waits on when that is not the node's silence -- the signer said
+    /// `HeadUnknown` (a record ahead of anything its node holds: this node has not fetched the site yet), re-asked
+    /// on the backoff with no end (rule 8). `None` while it is simply out.
+    Publishing { waiting_for: Option<&'static str> },
     /// The site record read back is this publication's: `version` is live.
     Published { version: u64 },
     /// Another publication is live at `version` (another device, or a later one): reported, never overwritten
@@ -1483,7 +1489,7 @@ impl Page {
         }
         // `seq == 0`: the site's version is not read yet (its first read decides it).
         self.sites.insert(app.to_string(), Pub { owed: Some(Owed { seq: 0, root: value, base: [0u8; 32], record: None, stale_reads: 0 }), ..Pub::default() });
-        self.publications.insert(app.to_string(), Publication::Publishing);
+        self.publications.insert(app.to_string(), Publication::Publishing { waiting_for: None });
         self.send(Waiting::ReadBack(label.clone()), Op::ReadHead { label });
     }
 
@@ -1521,6 +1527,11 @@ impl Page {
         let Some(owed) = self.sites.get(app).and_then(|p| p.owed.clone()) else { return };
         if !matches!(s, A::Refused(Why::HeadUnknown | Why::RecordNotSaved)) {
             self.pub_mut(&label).sign_refusals = 0;
+        }
+        // What the publication waits on, stated (not "not answering": the signer answered).
+        let waiting_for = matches!(s, A::Refused(Why::HeadUnknown)).then_some(WAITING_FOR_SITE);
+        if let Some(Publication::Publishing { waiting_for: w }) = self.publications.get_mut(app) {
+            *w = waiting_for;
         }
         match s {
             A::Signed(state) => self.site_write(app, state),

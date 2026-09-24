@@ -1256,7 +1256,7 @@ impl PageIo {
         }
         // A site's bytes are page-io's only while its publication is in flight.
         let page = &self.server.page;
-        self.sites.retain(|app, _| matches!(page.publication(app), Some(Publication::Publishing)));
+        self.sites.retain(|app, _| matches!(page.publication(app), Some(Publication::Publishing { .. })));
     }
 }
 
