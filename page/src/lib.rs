@@ -1748,13 +1748,35 @@ impl Page {
         self.attempt_of.remove(w);
         self.first_of.remove(w);
         if d.sent && d.attempt == 1 && !d.resent {
+            let before = self.rto.rto_ms();
             self.rto.sample(self.now.saturating_sub(d.sent_at));
+            let rto = self.rto.rto_ms();
+            if rto < before {
+                self.rearm_first_sends(rto);
+            }
         }
         if d.sent && matches!(w, Waiting::Get(_)) {
             self.window.opened();
             self.fill_gets();
         }
         Some(d.op)
+    }
+
+    /// A sample LOWERED the RTO (sdk#378, the architect's ruling): every op
+    /// still on its FIRST send was given a deadline from the RTO it went out
+    /// under, and a deadline is fixed at send -- so an op sent while the RTO
+    /// was backed off to its 60 s ceiling waited out the full minute although
+    /// the path had long come back (measured: V's first save, one lost PUT
+    /// re-sent at +59,999 ms while its 12 siblings were answered in 2.1 s).
+    /// Each such deadline becomes `min(current, sent_at + rto)`. A RE-SEND
+    /// keeps its backoff (it was sent because its first send went
+    /// unanswered), and so does an op re-sent on a reconnect.
+    fn rearm_first_sends(&mut self, rto: u64) {
+        for d in self.deadlines.values_mut() {
+            if d.sent && d.attempt == 1 && !d.resent {
+                d.at = d.at.min(d.sent_at + rto);
+            }
+        }
     }
 
     /// GETs waiting on the window take the places that are free.
@@ -2489,6 +2511,49 @@ mod parked_get {
         // The engine here waits on nothing: the parked GET ends rather than going out.
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
+    }
+}
+
+#[cfg(test)]
+mod rto_rearm {
+    use super::*;
+
+    /// sdk#378: an op sent while the RTO was backed off to its ceiling is
+    /// re-sent at the NEW RTO once a sample lowers it -- not after the minute
+    /// it was first given -- while a RE-SEND keeps its backoff.
+    #[test]
+    fn a_first_send_is_rearmed_when_a_sample_lowers_the_rto_and_a_resend_is_not() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        // A cold phase timed out tick after tick: the shared RTO at its ceiling.
+        for _ in 0..10 {
+            p.rto.timed_out();
+        }
+        assert_eq!(p.rto.rto_ms(), rto::RTO_MAX_MS as u64, "THE SETUP: the RTO is not at its ceiling");
+        let (answered, lost, resend) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        p.now = 1_000;
+        p.send(Waiting::Put(answered), Op::Put { id: answered, bytes: vec![1] });
+        p.send(Waiting::Put(lost), Op::Put { id: lost, bytes: vec![2] });
+        // A re-send: its first send went unanswered.
+        p.attempt_of.insert(Waiting::Put(resend), 1);
+        p.send(Waiting::Put(resend), Op::Put { id: resend, bytes: vec![3] });
+        let _ = p.take_ops();
+        let resend_at = p.deadlines[&Waiting::Put(resend)].at;
+        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_000 + rto::RTO_MAX_MS as u64, "THE SETUP: the lost PUT was not given the ceiling");
+        assert_eq!(p.deadlines[&Waiting::Put(resend)].attempt, 2, "THE SETUP: the re-send is not a second attempt");
+
+        // Its sibling is answered on its first send after 100 ms: a sample, and the RTO falls.
+        p.now = 1_100;
+        p.answered(&Waiting::Put(answered));
+        let rto = p.rto.rto_ms();
+        assert!(rto < 1_000, "THE SETUP: the sample did not lower the RTO ({rto} ms)");
+        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_000 + rto, "the lost PUT still waits out the ceiling it was sent under");
+        assert_eq!(p.deadlines[&Waiting::Put(resend)].at, resend_at, "a RE-SEND was pulled in: it keeps its backoff");
+
+        // And it is re-sent at the new RTO, not after a minute.
+        p.tick(Ms(1_000 + rto));
+        let again = p.take_ops();
+        assert!(again.contains(&Op::Put { id: lost, bytes: vec![2] }), "the lost PUT was not re-sent at the new RTO: {again:?}");
+        assert!(!again.iter().any(|o| matches!(o, Op::Put { id, .. } if *id == resend)), "the re-send went again early");
     }
 }
 
