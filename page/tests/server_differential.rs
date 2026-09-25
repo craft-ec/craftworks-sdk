@@ -775,6 +775,26 @@ fn a_read_before_the_head_is_read_waits_for_it() {
 }
 
 /// ANOTHER DEVICE'S TREE, for real: a fresh page from the same genesis writes
+/// THE TIE-BREAK SEARCH (sdk#404): the first `salt` for which `make` builds a head that beats the page's -- the
+/// page's own value varies per run (fresh record and device ids), so on some runs a winner is rare. Up to
+/// `WINNING_TRIES` salts; running out FAILS naming the search, never overflows a counter.
+const WINNING_TRIES: u32 = 1 << 20;
+
+fn winning<T>(case: &str, make: impl FnMut(u32) -> Option<T>) -> T {
+    winning_within(case, WINNING_TRIES, make)
+}
+
+fn winning_within<T>(case: &str, tries: u32, mut make: impl FnMut(u32) -> Option<T>) -> T {
+    (0..tries).find_map(&mut make).unwrap_or_else(|| panic!("{case}: no salt in 0..{tries} built a head that beats the page's"))
+}
+
+/// THE CONTROL for the search's bound (sdk#404): one that never finds a winner fails NAMING the search.
+#[test]
+#[should_panic(expected = "the control: no salt in 0..300 built a head that beats the page's")]
+fn a_tie_break_search_that_runs_out_fails_naming_its_case() {
+    winning_within("the control", 300, |_| None::<()>);
+}
+
 /// `salt`, and its blocks go onto the node; returns its root (never signed —
 /// the caller signs a head for it as the other device's signer would).
 fn sibling_root(node: &mut Node, salt: u32) -> Cid {
@@ -1139,15 +1159,14 @@ fn a_displaced_tip_is_told_superseded_only_for_the_keys_the_winner_replaced() {
                 // tip's prev, WITHOUT the record — and winning the tie-break.
                 let hr = node.head_read().expect("a head");
                 let base = hr.prev().expect("the tip has a prev");
-                let mut salt = 0u8;
-                loop {
-                    let r = device_tree(&mut node, &[(b"other".to_vec(), vec![salt])]);
+                winning(&format!("{}:{}", file!(), line!()), |salt| {
+                    let r = device_tree(&mut node, &[(b"other".to_vec(), salt.to_le_bytes().to_vec())]);
                     let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
                     if page::beats(&v, hr.value()) {
-                        break (tip_seq, r, Some(base));
+                        return Some((tip_seq, r, Some(base)));
                     }
-                    salt += 1;
-                }
+                    None
+                })
             }
             "built on the tip" => (tip_seq + 1, device_tree(&mut node, &[(b"other".to_vec(), b"x".to_vec())]), Some((tip_seq, tip_root))),
             _ => {
@@ -1220,15 +1239,14 @@ fn a_tip_of_two_writes_to_one_key_tells_both_superseded() {
     let hr = node.head_read().expect("a head");
     let base = hr.prev().expect("a prev");
     let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
-    let mut salt = 0u8;
-    let st = loop {
-        let r = device_tree(&mut node, &[(b"other".to_vec(), vec![salt])]);
+    let st = winning(&format!("{}:{}", file!(), line!()), |salt| {
+        let r = device_tree(&mut node, &[(b"other".to_vec(), salt.to_le_bytes().to_vec())]);
         let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
         if page::beats(&v, hr.value()) {
-            break contract_keys::register::head_state(&node.register_params, &key_of, head.0, &v).expect("signs");
+            return Some(contract_keys::register::head_state(&node.register_params, &key_of, head.0, &v).expect("signs"));
         }
-        salt += 1;
-    };
+        None
+    });
     node.update(&st);
     rig.server.head_hint();
     tab.pump(&mut rig, &mut node);
@@ -1293,10 +1311,9 @@ fn a_same_seq_race_is_merged_key_by_key() {
         let base_tree = node.tree(&base.1).expect("the base is whole");
         let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
         let theirs_record = b"their bytes for the record".to_vec();
-        let mut salt = 0u8;
-        let st = loop {
+        let st = winning(&format!("{}:{}", file!(), line!()), |salt| {
             let mut entries: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
-            entries.push((b"other".to_vec(), vec![salt]));
+            entries.push((b"other".to_vec(), salt.to_le_bytes().to_vec()));
             if case.starts_with("both changed the record") {
                 entries.push((key.clone(), theirs_record.clone()));
             }
@@ -1313,10 +1330,10 @@ fn a_same_seq_race_is_merged_key_by_key() {
             let r = device_tree(&mut node, &entries);
             let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
             if page::beats(&v, hr.value()) {
-                break contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+                return Some(contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs"));
             }
-            salt += 1;
-        };
+            None
+        });
         node.update(&st);
         rig.server.head_hint();
         tab.pump(&mut rig, &mut node);
@@ -1381,17 +1398,16 @@ fn a_merge_that_lands_on_a_newer_head_is_judged_by_its_reads_there() {
     let base_tree = node.tree(&base.1).expect("whole");
     let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     // x: the same-seq winner, P plus an unrelated key (so the record is one-sided mine).
-    let mut salt = 0u8;
-    let (x_root, x_state) = loop {
+    let (x_root, x_state) = winning(&format!("{}:{}", file!(), line!()), |salt| {
         let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
-        e.push((b"other".to_vec(), vec![salt]));
+        e.push((b"other".to_vec(), salt.to_le_bytes().to_vec()));
         let r = device_tree(&mut node, &e);
         let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
         if page::beats(&v, hr.value()) {
-            break (r, contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs"));
+            return Some((r, contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs")));
         }
-        salt += 1;
-    };
+        None
+    });
     node.update(&x_state);
     // The page learns of x, adopts it and starts the merge; x's blocks are cold,
     // so the merge's delta waits on GETs (held).
@@ -1946,20 +1962,19 @@ fn a_group_that_wrote_one_key_twice_merges_by_its_final_value() {
         let base_tree = node.tree(&base.1).expect("the base is whole");
         assert!(!base_tree.contains_key(&k) && base_tree.contains_key(b"k/first".as_slice()), "W1 and W2 were not ONE commit on top of the first: this is not a group");
         let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
-        let mut salt = 0u8;
-        let st = loop {
+        let st = winning(&format!("{}:{}", file!(), line!()), |salt| {
             let mut entries: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
-            entries.push((b"other".to_vec(), vec![salt]));
+            entries.push((b"other".to_vec(), salt.to_le_bytes().to_vec()));
             if they_change_k {
                 entries.push((k.clone(), b"theirs".to_vec()));
             }
             let r = device_tree(&mut node, &entries);
             let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base.0, root: base.1 }), ..Ledger::default() });
             if page::beats(&v, hr.value()) {
-                break contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+                return Some(contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs"));
             }
-            salt += 1;
-        };
+            None
+        });
         node.update(&st);
         rig.server.head_hint();
         tab.pump(&mut rig, &mut node);
@@ -2067,17 +2082,16 @@ fn a_merge_goes_before_a_later_own_write_and_the_later_value_stands() {
     // The other device's head at the tip's seq, from the same base, leaving k alone.
     let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     let base_tree = node.tree(&base_root).expect("whole");
-    let mut salt = 0u8;
-    let st = loop {
+    let st = winning(&format!("{}:{}", file!(), line!()), |salt| {
         let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
-        e.push((b"other".to_vec(), vec![salt]));
+        e.push((b"other".to_vec(), salt.to_le_bytes().to_vec()));
         let r = device_tree(&mut node, &e);
         let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base_seq, root: base_root }), ..Ledger::default() });
         if page::beats(&v, hr.value()) {
-            break contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs");
+            return Some(contract_keys::register::head_state(&node.register_params, &key_of, tip_seq, &v).expect("signs"));
         }
-        salt += 1;
-    };
+        None
+    });
     node.update(&st);
     rig.server.head_hint();
     rs.extend(rig.run(&mut node));
@@ -2307,17 +2321,16 @@ fn a_commit_built_before_a_foreign_winner_is_never_signed_as_its_successor() {
     // Another device wins seq s, from the same base, with `other`.
     let key_of = node.secrets.get(signer::PROVISION).and_then(|b| signer::Provisioned::decode(b)).map(|p| p.key).expect("provisioned");
     let base_tree = node.tree(&base_root).expect("whole");
-    let mut salt = 0u8;
-    let (winner, st) = loop {
+    let (winner, st) = winning(&format!("{}:{}", file!(), line!()), |salt| {
         let mut e: Vec<(Vec<u8>, Vec<u8>)> = base_tree.clone().into_iter().collect();
-        e.push((b"other".to_vec(), vec![salt]));
+        e.push((b"other".to_vec(), salt.to_le_bytes().to_vec()));
         let r = device_tree(&mut node, &e);
         let v = value(&r, &Ledger { prev: Some(signer_proto::Head { seq: base_seq, root: base_root }), ..Ledger::default() });
         if page::beats(&v, hr.value()) {
-            break (r, contract_keys::register::head_state(&node.register_params, &key_of, s, &v).expect("signs"));
+            return Some((r, contract_keys::register::head_state(&node.register_params, &key_of, s, &v).expect("signs")));
         }
-        salt += 1;
-    };
+        None
+    });
     node.update(&st);
     assert_eq!(node.head(), Some((s, winner)), "the winner did not take the register");
     rig.server.head_hint();
