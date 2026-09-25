@@ -17,17 +17,13 @@ use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::ContractRequest;
 use freenet_stdlib::prelude::*;
 use probe::node::{Mode, Node, TempTree};
-use probe::signer::{answer_to, ask, connect, container, contract_op, register_delegate, send_signer};
+use probe::signer::{answer_to, ask, connect, container, contract_op, raw_block, register_delegate, send_signer};
 use signer::{Answer, Head, Next, Request};
 
 
 /// A raw block the page PUTs, and its id (= the root a head names).
 fn block(n: u8) -> ([u8; 32], Vec<u8>) {
-    let body = vec![n; 700];
-    let id = freenet_prolly::block_id(freenet_prolly::kind::RAW, &body);
-    let mut st = vec![freenet_prolly::kind::RAW];
-    st.extend_from_slice(&body);
-    (id, st)
+    raw_block(vec![n; 700])
 }
 
 fn signed_bytes(a: &Answer) -> Option<Vec<u8>> {

@@ -5,9 +5,10 @@
 //! hash by instance id, then `state_store_db.get_state_sync`: the node's own store, never a GET. This measures it.
 //!
 //! On node A (the asker; its signer is registered here, `Held` needs no provisioning), three ARMS of `--n` blocks:
-//!   * `held`: PUT through A;
-//!   * `elsewhere`: PUT through B only (it exists on the network; A is asked whether IT holds it);
-//!   * `never`: random ids no one ever PUT.
+//! * `held`: PUT through A;
+//! * `elsewhere`: PUT through B only (it exists on the network; A is asked whether IT holds it);
+//! * `never`: random ids no one ever PUT.
+//!
 //! Each block is asked ONCE PER OP (as the page asks), `--repeats` times, and then all of an arm in ONE op (up to
 //! MAX_HELD), to show the per-op cost. After the Held asks (a GET makes the node hold what it fetches, F6), one
 //! plain GET per `elsewhere` and `never` id, for contrast: what a SEARCH costs.
@@ -26,7 +27,7 @@
 use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::{ContractRequest, HostResponse, WebApi, ContractResponse, ClientRequest};
 use freenet_stdlib::prelude::*;
-use probe::signer::{ask, connect, container, contract_op_within, register_delegate};
+use probe::signer::{ask, connect, container, contract_op_within, raw_block, register_delegate};
 use signer::{Answer, Request};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -37,10 +38,7 @@ const PUT_WAIT: Duration = Duration::from_secs(180);
 fn random_block() -> ([u8; 32], Vec<u8>) {
     let mut body = vec![0u8; 700];
     getrandom::getrandom(&mut body).expect("random");
-    let id = freenet_prolly::block_id(freenet_prolly::kind::RAW, &body);
-    let mut st = vec![freenet_prolly::kind::RAW];
-    st.extend_from_slice(&body);
-    (id, st)
+    raw_block(body)
 }
 
 fn random_id() -> [u8; 32] {

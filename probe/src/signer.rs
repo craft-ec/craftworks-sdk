@@ -128,3 +128,11 @@ pub async fn contract_op_within(c: &mut WebApi, r: ContractRequest<'static>, wit
     bail!("no answer to a contract op within {within:?}")
 }
 
+
+/// A raw block a probe PUTs (`kind::RAW` ‖ `body`) and its id: the state and the id the node will derive.
+pub fn raw_block(body: Vec<u8>) -> ([u8; 32], Vec<u8>) {
+    let id = freenet_prolly::block_id(freenet_prolly::kind::RAW, &body);
+    let mut st = vec![freenet_prolly::kind::RAW];
+    st.extend_from_slice(&body);
+    (id, st)
+}
