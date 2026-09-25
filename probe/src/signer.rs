@@ -11,10 +11,11 @@ use tokio::time::timeout;
 /// Each step's wait for an answer.
 pub const STEP: Duration = Duration::from_secs(20);
 
+/// Connect to a node's client API. REFUSES the owner's nodes (7509/7609) BEFORE any socket opens: the guard is
+/// here, once, so every probe that connects through this is safe by construction.
 pub async fn connect(ws: &str) -> Result<WebApi> {
-    let (stream, _) = tokio_tungstenite::connect_async(ws)
-        .await
-        .context("connecting")?;
+    crate::node::allowed_port(ws)?;
+    let (stream, _) = tokio_tungstenite::connect_async(ws).await.context("connecting")?;
     Ok(WebApi::start(stream))
 }
 
@@ -135,4 +136,21 @@ pub fn raw_block(body: Vec<u8>) -> ([u8; 32], Vec<u8>) {
     let mut st = vec![freenet_prolly::kind::RAW];
     st.extend_from_slice(&body);
     (id, st)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The guard runs before any socket: the owner's port is refused with the GUARD's words (a network error would
+    /// say "connecting"), and a free, closed port -- the control -- fails as a connection, so the guard is not
+    /// refusing everything.
+    #[tokio::test]
+    async fn connect_refuses_the_owners_nodes_before_opening_a_socket() {
+        for port in [7509, 7609] {
+            let e = super::connect(&format!("ws://127.0.0.1:{port}/v1/contract/command")).await.err().expect("refused");
+            assert!(format!("{e:#}").contains("the owner's node"), "not refused by the guard: {e:#}");
+        }
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let e = super::connect(&format!("ws://127.0.0.1:{free}/v1/contract/command")).await.err().expect("nothing listens there");
+        assert!(format!("{e:#}").contains("connecting"), "CONTROL: a closed port did not fail as a connection: {e:#}");
+    }
 }

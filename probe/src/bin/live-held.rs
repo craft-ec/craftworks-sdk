@@ -98,10 +98,6 @@ async fn main() -> Result<()> {
     let (Some(wa), Some(wb), Some(sw), Some(bw)) = (a.first(), a.get(1), a.get(2), a.get(3)) else { bail!("{usage}") };
     let n: usize = arg(&a, "--n").map(|v| v.parse()).transpose()?.unwrap_or(5);
     let repeats: usize = arg(&a, "--repeats").map(|v| v.parse()).transpose()?.unwrap_or(3);
-    probe::node::allowed_port(wa)?;
-    if wb != "-" {
-        probe::node::allowed_port(wb)?;
-    }
     let signer_wasm = std::fs::read(sw).with_context(|| format!("reading {sw}"))?;
     let bcode = std::fs::read(bw).with_context(|| format!("reading {bw}"))?;
     let mut ca = connect(wa).await?;
