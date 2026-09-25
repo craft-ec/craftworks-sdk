@@ -302,6 +302,95 @@ impl Node {
     }
 }
 
+impl Node {
+    /// Every node of `b` that `a` does not have (a paged diff, unioned), or why it could not be completed.
+    fn nodes_not_in(&self, a: &Cid, b: &Cid) -> Result<std::collections::BTreeSet<Cid>, String> {
+        use freenet_prolly::range::Range;
+        use std::ops::Bound;
+        let r = Range { lo: Bound::Unbounded, hi: Bound::Unbounded, reverse: false, after: None, max_entries: usize::MAX, max_bytes: usize::MAX };
+        let mut out = std::collections::BTreeSet::new();
+        let mut resume = None;
+        loop {
+            let page = freenet_prolly::diff::diff(self, a, b, &r, resume.as_ref()).map_err(|e| format!("diff: {e:?}"))?;
+            if let Some(n) = page.need.first() {
+                return Err(format!("block {:?} of the commit's path is not on the node", &n[..4]));
+            }
+            out.extend(page.new_blocks.iter().copied());
+            match page.next {
+                Some(n) => resume = Some(n),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// INVARIANT 3b as the architect ruled it (rule 10, BACKED_UP is a WRITE state): every group the commit that
+    /// moved `prev` to `root` CHANGED is whole on the node -- each member and each parity block -- and so is the
+    /// root's group of one (the root and the parity its head's mark lists). A group of a new node whose parity
+    /// ids are all the replaced nodes' own is unchanged (parity ids are a function of the members). Whether the
+    /// whole TREE is whole is the assets dashboard's question (KEEPER §4), not a write's.
+    fn changed_groups_whole(&self, prev: (u64, Cid), root: &Cid, mark: Option<Vec<Cid>>) -> Result<(), Unwhole> {
+        let missing = |b: &Cid| !self.blocks.contains_key(b);
+        let unplaced = |why: String| Unwhole { hole: Hole::Unplaced, why };
+        if missing(root) {
+            return Err(Unwhole { hole: Hole::Root, why: "the root is not on the node".into() });
+        }
+        for p in mark.unwrap_or_default() {
+            if missing(&p) {
+                return Err(Unwhole { hole: Hole::Root, why: format!("root parity {:?} is not on the node", &p[..4]) });
+            }
+        }
+        let new_nodes = if prev.0 == 0 { self.all_nodes(root).map_err(unplaced)? } else { self.nodes_not_in(&prev.1, root).map_err(unplaced)? };
+        let old_parity = if prev.0 == 0 { Default::default() } else { self.parity_of(&self.nodes_not_in(root, &prev.1).map_err(unplaced)?) };
+        for n in &new_nodes {
+            let b = self.blocks.get(n).ok_or_else(|| unplaced(format!("new node {:?} is not on the node", &n[..4])))?;
+            let node = freenet_prolly::node::Node::parse(b).map_err(|e| unplaced(format!("a node that does not parse: {e:?}")))?;
+            let ids: Vec<Cid> = node.parity().collect();
+            for (g, (_, members)) in freenet_prolly::parity::group_members(&node).into_iter().enumerate() {
+                let par = ids.get(engine::PARITY * g..engine::PARITY * (g + 1)).unwrap_or(&[]);
+                if !par.is_empty() && par.iter().all(|p| old_parity.contains(p)) {
+                    continue;
+                }
+                if let Some(m) = members.iter().chain(par).find(|m| missing(m)) {
+                    let why = format!("block {:?} of a group the commit changed (node {:?}, group {g}) is not on the node", &m[..4], &n[..4]);
+                    let hole = if par.is_empty() { Hole::Unplaced } else { Hole::Group(par.iter().copied().collect()) };
+                    return Err(Unwhole { hole, why });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The parity ids the given nodes list (those held).
+    fn parity_of(&self, nodes: &std::collections::BTreeSet<Cid>) -> std::collections::BTreeSet<Cid> {
+        nodes.iter().filter_map(|n| self.blocks.get(n)).filter_map(|b| freenet_prolly::node::Node::parse(b).ok()).flat_map(|n| n.parity().collect::<Vec<_>>()).collect()
+    }
+
+    /// Did the commit `prev` → `root` RE-CODE the group whose parity ids are `par`: a node it replaced listed that
+    /// parity, and none of its new nodes lists it any more?
+    fn recoded(&self, prev: (u64, Cid), root: &Cid, par: &std::collections::BTreeSet<Cid>) -> bool {
+        if prev.0 == 0 {
+            return false;
+        }
+        let (Ok(old), Ok(new)) = (self.nodes_not_in(root, &prev.1), self.nodes_not_in(&prev.1, root)) else { return false };
+        par.is_subset(&self.parity_of(&old)) && par.is_disjoint(&self.parity_of(&new))
+    }
+
+    /// Every node of the tree at `root` (the first commit changed all of them).
+    fn all_nodes(&self, root: &Cid) -> Result<std::collections::BTreeSet<Cid>, String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut at = vec![*root];
+        while let Some(id) = at.pop() {
+            let b = self.blocks.get(&id).ok_or_else(|| format!("node {:?} is not on the node", &id[..4]))?;
+            let node = freenet_prolly::node::Node::parse(b).map_err(|e| format!("{e:?}"))?;
+            out.insert(id);
+            if node.level() > 0 {
+                at.extend((0..node.len()).map(|i| node.child(i).0));
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// The node's blocks, plus blocks REBUILT from their sibling groups (#300):
 /// what a reader that repairs can read. Race put signs a head when every
 /// changed group is RECOVERABLE (k of k+m), not when every block is held
@@ -388,6 +477,10 @@ struct App {
     /// Every key this app wrote and its LAST value.
     wrote: BTreeMap<Vec<u8>, Vec<u8>>,
     published: usize,
+    /// Writes that CHANGED NOTHING (their value already in the tree): told Published in the same step as Accepted,
+    /// or ParityComplete in the same step as Published -- a committing write can do neither (its blocks are acked,
+    /// and its parity follows the head, in later steps). They changed no group, so 3b judges nothing of theirs.
+    nothing_changed: std::collections::BTreeSet<u64>,
 }
 
 impl App {
@@ -422,6 +515,10 @@ struct Seen {
     displaced: usize,
     /// Seqs the register held under two roots: the devices really raced.
     races: usize,
+    /// Sends of the forced straggler dropped (`Cfg::hold_page0_first_value`).
+    held_drops: usize,
+    /// Writes of page 1 told Published while the forced straggler was off the node, at a root not whole.
+    over_the_hole: usize,
 }
 
 /// What a run plays.
@@ -435,9 +532,16 @@ struct Cfg {
     /// Every `HeadChanged` push is dropped, calm or not: an idle page learns
     /// only by the backstop read.
     no_hints: bool,
+    /// THE FORCED STRAGGLER (safety gap class 2): the VALUE block page 0 puts for its FIRST write (`p0/000`) is
+    /// lost on every send until the calm, so that commit publishes at k (race put) with its own block off the
+    /// node. Page 1 starts only once page 0 has published every write, and OVERWRITES page 0's other keys: a value
+    /// replaced in the straggler's group is a ONE-OFF change, its parity updated from the old parity (prolly's
+    /// `update_group`) without reading the straggler -- so page 1 commits a changed group holding a foreign block
+    /// that is not on the node.
+    hold_page0_first_value: bool,
 }
 
-const NORMAL: Cfg = Cfg { faults: FAULTS, devices: 1, no_hints: false };
+const NORMAL: Cfg = Cfg { faults: FAULTS, devices: 1, no_hints: false, hold_page0_first_value: false };
 
 /// Does `later` descend from `h` through the signer's records (next → prev)?
 fn descends(edges: &BTreeMap<(u64, Cid), (u64, Cid)>, later: (u64, Cid), h: (u64, Cid)) -> bool {
@@ -500,24 +604,52 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                 .collect(),
             wrote: BTreeMap::new(),
             published: 0,
+            nothing_changed: Default::default(),
         })
         .collect();
+    if cfg.hold_page0_first_value {
+        // Page 1 overwrites page 0's keys but the first (the straggler's); its values, written after, are the
+        // final ones.
+        for (n, w) in apps[1].todo.iter_mut().enumerate() {
+            w.0 = format!("p0/{:03}", n + 1).into_bytes();
+        }
+    }
     for a in &mut apps {
         let todo = a.todo.clone();
         for (k, v) in todo {
             a.wrote.insert(k, v);
         }
     }
+    if cfg.hold_page0_first_value {
+        let over: Vec<Vec<u8>> = apps[1].wrote.keys().cloned().collect();
+        for k in over {
+            apps[0].wrote.remove(&k);
+        }
+    }
 
     let mut flights: Vec<Flight> = Vec::new();
     let mut seen = Seen::default();
+    let mut held: Option<Cid> = None;
+    let mut page1_read = false;
     let mut now = 0u64;
     let calm_at = 400_000u64;
     let end = calm_at + 600_000;
     while now < end {
         let faults = if now < calm_at { cfg.faults } else { CALM };
         // The apps submit.
-        for a in &mut apps {
+        let page0_done = apps[0].todo.is_empty() && apps[0].inflight.is_empty();
+        if cfg.hold_page0_first_value && page0_done && !page1_read {
+            // Page 1 READS the straggler's key first: its value is NotFound on the node, and the read path
+            // rebuilds it from its group (race put published it at k) into page 1's memory -- so page 1's writes
+            // apply over it without the node ever holding it.
+            page1_read = true;
+            let client = apps[1].client;
+            apps[1].page.event(engine::Event::Get { client, req_id: engine::read::ReqId(1), key: b"p0/000".to_vec() });
+        }
+        for (i, a) in apps.iter_mut().enumerate() {
+            if cfg.hold_page0_first_value && i == 1 && !page0_done {
+                continue;
+            }
             if a.inflight.is_empty() && !a.todo.is_empty() && s_app.chance(300) {
                 a.submit(now);
             }
@@ -542,6 +674,15 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         };
         for f in due {
             let answer = match f.op {
+                Op::Put { id, bytes } if held.is_none() && f.page == 0 && cfg.hold_page0_first_value && freenet_prolly::block_id(freenet_prolly::kind::RAW, &bytes) == id => {
+                    held = Some(id);
+                    seen.held_drops += 1;
+                    None
+                }
+                Op::Put { id, .. } if held == Some(id) && now < calm_at => {
+                    seen.held_drops += 1;
+                    None
+                }
                 Op::Put { id, bytes } => {
                     if s_put_lost.chance(faults.put_lost) {
                         // On the wrapper path an answer is no evidence: a
@@ -631,15 +772,18 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
             };
             let Some(answer) = answer else { continue };
             apps[f.page].page.answer(answer, Ms(origin + now));
-            check(&mut apps, f.page, &node, &mut seen, now)?;
+            check(&mut apps, f.page, &node, &mut seen, now, held, &edges)?;
         }
         now += 5;
         for i in 0..apps.len() {
             apps[i].page.tick(Ms(origin + now));
-            check(&mut apps, i, &node, &mut seen, now)?;
+            check(&mut apps, i, &node, &mut seen, now, held, &edges)?;
         }
         let converged = apps.iter().all(|a| Some(a.page.published()) == node.head());
-        if now > calm_at && apps.iter().all(|a| a.todo.is_empty() && a.inflight.is_empty()) && flights.is_empty() && converged {
+        // The forced straggler was held off the node for the whole write phase: its page re-sends it on a
+        // backoff long by then, so the run also waits for it to land.
+        let whole = !cfg.hold_page0_first_value || node.head().is_some_and(|h| node.tree(&h.1).is_some());
+        if now > calm_at && apps.iter().all(|a| a.todo.is_empty() && a.inflight.is_empty()) && flights.is_empty() && converged && whole {
             break;
         }
     }
@@ -733,7 +877,73 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     Ok(seen)
 }
 
-fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> Result<(), String> {
+/// Where a commit's changed groups are not whole.
+enum Hole {
+    /// The root, or the parity its head's mark lists (the root's group of one).
+    Root,
+    /// A group, named by its parity ids.
+    Group(std::collections::BTreeSet<Cid>),
+    /// Somewhere the check could not place in a group (a node of the commit's path missing).
+    Unplaced,
+}
+
+struct Unwhole {
+    hole: Hole,
+    why: String,
+}
+
+/// Which later commit may CARRY a write whose own changed groups are not whole.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Carrier {
+    /// A later commit of the page that DESCENDS from the write's head through a step that RE-CODED the hole's
+    /// group (for the root's group: any step -- every commit replaces the root), with every group IT changed
+    /// whole: what `supersede`'s carry is. The re-coding step may be another page's head adopted in between: that
+    /// is the root move that withdrew the stragglers, and the next own commit is the carrier.
+    Recoded,
+    /// ANY later whole commit of the page: too loose (the architect), kept only as the control's other side.
+    Any,
+}
+
+/// INVARIANT 3b for one write told ParityComplete: its commit (`own`) has every group it changed whole on the
+/// node, or a later commit of the same page (`later`) CARRIED it (`how`).
+fn judge_backed_up(node: &Node, edges: &BTreeMap<(u64, Cid), (u64, Cid)>, own: (u64, Cid), later: &[(u64, Cid)], how: Carrier) -> Result<(), String> {
+    let mark = |h: (u64, Cid)| node.held_values.get(&h).and_then(|v| page::HeadRead::from_value(h.0, v)).and_then(|r| r.mark());
+    let Some(prev) = edges.get(&own) else { return Ok(()) };
+    let Err(u) = node.changed_groups_whole(*prev, &own.1, mark(own)) else { return Ok(()) };
+    // Did some step of the chain own -> ... -> h (the signers' records) re-code the hole's group?
+    let recoded_on_the_way = |h: (u64, Cid)| -> bool {
+        let mut cur = h;
+        let mut recoded = false;
+        while cur != own {
+            let Some(p) = edges.get(&cur) else { return false };
+            if cur.0 <= own.0 {
+                return false; // not a descendant of the write's head
+            }
+            recoded |= match &u.hole {
+                Hole::Root => true,
+                Hole::Group(par) => node.recoded(*p, &cur.1, par),
+                Hole::Unplaced => false,
+            };
+            cur = *p;
+        }
+        recoded
+    };
+    let carried = later.iter().filter(|h| h.0 > own.0).any(|h| {
+        let Some(hp) = edges.get(h) else { return false };
+        let replaced = match how {
+            Carrier::Any => true,
+            Carrier::Recoded => recoded_on_the_way(*h),
+        };
+        replaced && node.changed_groups_whole(*hp, &h.1, mark(*h)).is_ok()
+    });
+    if carried {
+        Ok(())
+    } else {
+        Err(format!("a group its commit changed is not WHOLE on the node, and no later commit of this page re-coded it whole: {}", u.why))
+    }
+}
+
+fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64, held: Option<Cid>, edges: &BTreeMap<(u64, Cid), (u64, Cid)>) -> Result<(), String> {
     // THE REGISTER IS NEVER 2+ BEHIND THE SIGNER'S RECORD (1b on the sign
     // side, the architect's attack): past one, the record for the seq between
     // is overwritten and no page could land it.
@@ -747,7 +957,17 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
         }
     }
     let a = &mut apps[i];
-    for (_, wid, state) in a.page.take_notices() {
+    let notices = a.page.take_notices();
+    // A write that CHANGES NOTHING (its value already in the tree) commits nothing: it is told Published at the
+    // engine's head -- someone else's commit, judged by its own writes -- in the same step as Accepted or as
+    // ParityComplete (`App::nothing_changed`).
+    for (_, w, st) in &notices {
+        let with = |s: State| notices.iter().any(|(_, w2, st2)| w2 == w && *st2 == s);
+        if *st == State::Published && (with(State::Accepted) || with(State::ParityComplete)) {
+            a.nothing_changed.insert(w.0);
+        }
+    }
+    for (_, wid, state) in notices {
         match state {
             State::Published => {
                 // INVARIANT 1: Published at a head the register was READ to
@@ -775,6 +995,9 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                 // INVARIANT 3: recoverable, not necessarily whole (§P).
                 if let Err(why) = node.tree_repairing(&root) {
                     return Err(format!("page {i}: Published at a root that is not RECOVERABLE on the node: {why}"));
+                }
+                if i == 1 && held.is_some_and(|h| !node.blocks.contains_key(&h) && node.tree(&root).is_none()) {
+                    seen.over_the_hole += 1;
                 }
                 seen.published_at.push((i, wid.0, (seq, root), a.inflight.get(&wid.0).cloned()));
                 if a.inflight.remove(&wid.0).is_some() {
@@ -818,12 +1041,21 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64) -> 
                     return Err(format!("page {i}: write {} told Stalled {age} ms after it was submitted (budget 64 engine seconds, over 63 s)", wid.0));
                 }
             }
-            // INVARIANT 3b: BACKED_UP = every block of the root it was
-            // published at is on the node, with no repair.
-            State::ParityComplete => {
-                if let Some((_, _, (_, root), _)) = seen.published_at.iter().rev().find(|(p, w, _, _)| *p == i && *w == wid.0) {
-                    if node.tree(root).is_none() {
-                        return Err(format!("page {i}: write {} is ParityComplete, but the root it was published at is not WHOLE on the node", wid.0));
+            // INVARIANT 3b (the architect's ruling: BACKED_UP is a WRITE state, rule 10): every group the commit
+            // that published the write CHANGED is whole on the node, with no repair. The whole TREE is the assets
+            // dashboard's question (KEEPER §4): a straggler of an older write in a group this commit did not touch
+            // keeps THAT write un-BACKED_UP, not this one.
+            //
+            // A CARRIED write (a later root move re-coded its groups: `supersede` withdrew the old version's
+            // stragglers and moved the write onto a newer own commit's Backing) is judged by its CARRIER: the later
+            // commit of this page that RE-CODED the hole's group, with every group IT changed whole
+            // (`judge_backed_up`). Never by what the current head references, nor by any unrelated later commit
+            // that finished (the architect: both trust the carry instead of checking it).
+            State::ParityComplete if !a.nothing_changed.contains(&wid.0) => {
+                if let Some((_, _, own, _)) = seen.published_at.iter().rev().find(|(p, w, _, _)| *p == i && *w == wid.0) {
+                    let later: Vec<(u64, Cid)> = seen.published_at.iter().filter(|(p, _, _, _)| *p == i).map(|(_, _, h, _)| *h).collect();
+                    if let Err(why) = judge_backed_up(node, edges, *own, &later, Carrier::Recoded) {
+                        return Err(format!("page {i}: write {} is ParityComplete, but {why}", wid.0));
                     }
                 }
             }
@@ -941,6 +1173,29 @@ fn two_devices_on_one_key_race_and_no_page_is_ever_unusable() {
     assert!(races > 0, "the two devices never raced at a seq: the test is vacuous");
 }
 
+/// SAFETY GAP CLASS 2, FORCED (the architect's ruling; engineer3 found it by the model under #390's timing): a
+/// straggler of ONE page's commit -- its own new value block, lost on every send until the calm, so the commit
+/// publishes at k -- while the OTHER page adopts that head and commits on top. The other page's own blocks all ack,
+/// and BACKED_UP must still wait for the foreign block: invariant 3b (at `ParityComplete` the root is WHOLE on the
+/// node). No random fault: the hold is the whole schedule. Non-vacuous: the block was dropped, and page 1 published
+/// at a root that was not whole while it was.
+#[test]
+fn a_foreign_straggler_in_flight_holds_back_the_other_pages_backed_up() {
+    let cfg = Cfg { faults: CALM, hold_page0_first_value: true, ..NORMAL };
+    let writes = WRITES;
+    let (mut drops, mut over) = (0, 0);
+    let (min, _) = seed_range(4, FULL_SEEDS);
+    for seed in 1..=min {
+        let s = run_with(seed, writes, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_eq!(s.published, 2 * writes, "seed {seed}: not every write was published once");
+        drops += s.held_drops;
+        over += s.over_the_hole;
+    }
+    println!("forced straggler: {min} seeds, {drops} sends dropped, {over} page-1 writes Published over the hole");
+    assert!(drops > 0, "the straggler was never held: the test is vacuous");
+    assert!(over > 0, "page 1 never published over the hole: the interleaving was not forced");
+}
+
 /// AN IDLE PAGE LEARNS WITH EVERY HINT LOST: no `HeadChanged` ever reaches a
 /// page, so only the backstop read (HEAD_BACKSTOP_MS) tells a device that
 /// stopped writing that the other one moved the register. Both still end on
@@ -993,6 +1248,76 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
     let gone = *puts.iter().find(|b| **b != root).expect("a block under the root");
     node.blocks.remove(&gone);
     assert!(node.tree(&root).is_none(), "the whole-tree check passed over a missing block");
+    // And the re-stated 3b (the commit's changed groups): the first commit changed every group.
+    assert!(node.changed_groups_whole((0, [0u8; 32]), &root, None).is_err(), "the changed-groups check passed over a missing block");
+}
+
+/// One page's write, driven to a standstill against the node with every op answered; the signer's record edge
+/// (next -> prev) recorded as the model's `edges`. The head it ends on.
+fn drive_one(p: &mut Page, node: &mut Node, edges: &mut BTreeMap<(u64, Cid), (u64, Cid)>, w: u64, key: &str, value: Vec<u8>) -> (u64, Cid) {
+    p.write(ClientId(1), WriteId(w), vec![(key.as_bytes().to_vec(), WriteOp::Put(value))]);
+    for _ in 0..40 {
+        for op in p.take_ops() {
+            match op {
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    p.answer(Answer::PutOk(id), Ms(0));
+                }
+                Op::ReadHead { .. } => p.answer(Answer::Head { label: page::Label::Head, read: node.head_read() }, Ms(0)),
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                    let (id, a) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                    if let Some(rec) = node.secrets[0].get(signer::RECORD) {
+                        let rec: signer::Record = bincode::deserialize(rec).expect("the signer's record");
+                        edges.insert((rec.next.seq, rec.next.root), (rec.prev.seq, rec.prev.root));
+                    }
+                    p.answer(Answer::Signer { id, answer: a }, Ms(0));
+                }
+                Op::Update { state, .. } => {
+                    node.update(&state);
+                    p.answer(Answer::Updated { label: page::Label::Head }, Ms(0));
+                }
+                Op::Get { id } => match node.blocks.get(&id) {
+                    Some(b) => p.answer(Answer::Got { id, bytes: b.clone() }, Ms(0)),
+                    None => p.answer(Answer::GetMissed(id), Ms(0)),
+                },
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, Ms(0)),
+                Op::PutApp { key } => p.answer(Answer::AppPutOk(key), Ms(0)),
+                Op::Ext(_) => {}
+            }
+        }
+    }
+    node.head().expect("the write published")
+}
+
+/// THE CONTROL for 3b's CARRIER (the architect's narrowing): a write whose changed group is left NOT whole (its
+/// value block gone from the node) is not carried by a later commit that finished in ANOTHER group -- only by
+/// one that RE-CODED the hole's group. Here write 3 adds a much larger value (another size class: another value
+/// group of the same leaf) and is whole: the loose carrier (`Any`) excuses write 2, the narrow one (`Recoded`)
+/// does not. Write 4 then overwrites write 2's key: its group is re-coded without the lost block, and THAT
+/// carries write 2.
+#[test]
+fn a_later_commit_in_another_group_does_not_carry_a_broken_write() {
+    let (mut node, _) = Node::new();
+    let mut edges = BTreeMap::new();
+    let mut p = Page::new(Params::default(), PutPath::Page);
+    let _ = drive_one(&mut p, &mut node, &mut edges, 1, "a", vec![1u8; 3_000]);
+    let before: std::collections::BTreeSet<Cid> = node.blocks.keys().copied().collect();
+    let two = drive_one(&mut p, &mut node, &mut edges, 2, "b", vec![2u8; 3_000]);
+    let value_b = *node
+        .blocks
+        .iter()
+        .find(|(id, b)| !before.contains(*id) && freenet_prolly::block_id(freenet_prolly::kind::RAW, b) == **id)
+        .expect("write 2's value block")
+        .0;
+    node.blocks.remove(&value_b);
+    assert!(judge_backed_up(&node, &edges, two, &[], Carrier::Recoded).is_err(), "THE SETUP: write 2's changed groups are whole with its value gone");
+    let three = drive_one(&mut p, &mut node, &mut edges, 3, "c", vec![3u8; 60_000]);
+    assert!(node.changed_groups_whole(edges[&three], &three.1, None).is_ok(), "THE SETUP: write 3's own changed groups are not whole");
+    assert!(judge_backed_up(&node, &edges, two, &[three], Carrier::Any).is_ok(), "THE SETUP: the loose carrier did not excuse write 2 -- the case does not show the gap");
+    let why = judge_backed_up(&node, &edges, two, &[three], Carrier::Recoded).expect_err("a later commit in ANOTHER group carried a write whose group is not whole");
+    println!("narrow carrier, write 3 in another group: {why}");
+    let four = drive_one(&mut p, &mut node, &mut edges, 4, "b", vec![4u8; 3_000]);
+    assert!(judge_backed_up(&node, &edges, two, &[three, four], Carrier::Recoded).is_ok(), "a commit that RE-CODED the hole's group without the lost block did not carry write 2");
 }
 
 /// THE WRAPPER PATH: a PUT's answer confirms nothing, only the signer's

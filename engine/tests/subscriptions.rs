@@ -87,6 +87,8 @@ fn commit(h: &mut Harness, write_id: u64, ops: Vec<(Vec<u8>, Op)>) -> Vec<Effect
             Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => {
                 Some(Event::PutConfirmed(*id))
             }
+            // The node holds every block: a changed group's other member it is asked about is held.
+            Effect::ConfirmHeld { id } => Some(Event::PutConfirmed(*id)),
             Effect::UpdateHead { seq, .. } => Some(Event::HeadConfirmed(*seq)),
             _ => None,
         };

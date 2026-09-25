@@ -63,6 +63,12 @@ fn drive(e: &mut Engine<Store>, net: &mut Network, first: Vec<Effect>, told: &mu
                 net.blocks.insert(id, &bytes);
                 queue.extend(stepped!(e, Event::PutConfirmed(id)));
             }
+            // A changed group's other member: held, if the network holds it.
+            Effect::ConfirmHeld { id } => {
+                if freenet_prolly::store::Blocks::get(&net.blocks, &id).is_some() {
+                    queue.extend(stepped!(e, Event::PutConfirmed(id)));
+                }
+            }
             Effect::UpdateHead { seq, root, .. } => {
                 net.head = Some((seq, root));
                 queue.extend(stepped!(e, Event::HeadConfirmed(seq)));

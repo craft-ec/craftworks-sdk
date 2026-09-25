@@ -508,6 +508,15 @@ pub enum Effect {
         bytes: Vec<u8>,
         after: Vec<Cid>,
     },
+    /// A member of a group the published commit changed that is not the commit's own block nor its own straggler
+    /// (safety gap class 2, the architect's ruling): BACKED_UP ("all k+m of every group the commit changed",
+    /// rule 10) waits for the node to hold it. A block in page memory is not one on the node -- a READ may have
+    /// REBUILT it from its group, and another page's straggler may still be in flight. The engine keeps no copy
+    /// of what the node confirmed: the page (its `confirmed`, the one holder) answers `PutConfirmed(id)` at once
+    /// when it knows, or asks the node until it does (rule 7).
+    ConfirmHeld {
+        id: Cid,
+    },
     /// A value too large to ride in a pack.
     PutBlock {
         id: Cid,
@@ -4075,6 +4084,25 @@ impl<B: Blocks> Engine<B> {
         out
     }
 
+    /// The members of the groups commit `c` changed that are neither its own blocks nor an own straggler still
+    /// out (`still_out`, counted in `earlier`). Read off the commit's new nodes (the format states the grouping).
+    fn foreign_members(&self, c: &Commit, still_out: &BTreeSet<Cid>) -> BTreeSet<Cid> {
+        let src = self.source();
+        let mut foreign = BTreeSet::new();
+        for id in &c.data {
+            let Some(Ok(node)) = src.get(id).map(Node::parse) else { continue };
+            let ids: Vec<Cid> = node.parity().collect();
+            for (g, (_, members)) in freenet_prolly::parity::group_members(&node).into_iter().enumerate() {
+                let Some(par) = ids.get(PARITY * g..PARITY * (g + 1)) else { continue };
+                if !members.iter().chain(par).any(|m| c.data.contains(m)) {
+                    continue;
+                }
+                foreign.extend(members.into_iter().filter(|m| !c.data.contains(m) && !still_out.contains(m)));
+            }
+        }
+        foreign
+    }
+
     fn on_head(&mut self, seq: u64) -> Vec<Effect> {
         let mut out = Vec::new();
         let Some(c) = self.pending.as_ref() else {
@@ -4124,6 +4152,14 @@ impl<B: Blocks> Engine<B> {
         let still_out = self.unacked();
         let mut remaining: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
         remaining.extend(c.race.groups.iter().flat_map(|g| g.earlier.iter()).filter(|m| still_out.contains(*m)).copied());
+        // THE OTHER MEMBERS of the groups this commit changed (safety gap class 2): counted `present` toward k,
+        // but in page memory is not on the node. BACKED_UP waits for the node to hold each one; the page answers
+        // at once for what it has confirmed.
+        let foreign = self.foreign_members(&c, &still_out);
+        for id in &foreign {
+            out.push(Effect::ConfirmHeld { id: *id });
+        }
+        remaining.extend(foreign);
         let mut writes = c.writes.clone();
         for w in std::mem::take(&mut self.carry) {
             if !writes.contains(&w) {

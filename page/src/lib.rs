@@ -21,6 +21,7 @@
 //! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → asked again on a doubling backoff, the PUT again only after [`HELD_ABSENTS`] absents in a row |
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
+//! | `ConfirmHeld { id }` (a FOREIGN member of a changed group, safety gap class 2) | already confirmed here: `PutConfirmed` at once, no op. Else [`Op::AskHeld`]; `Held { present: true }` → `PutConfirmed`; absent → asked again on a doubling backoff for as long as it takes (rule 7), put from here only if the page holds its bytes |
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
 //! | `Signed(state)` (`signer_proto::Answer` under the in-flight sign's id, as `wire::signer::read_answer` decodes it; any other id is ignored) | [`Op::Update`] with exactly those bytes |
 //! | `AlreadySigned(state)` | [`Op::Update`] with exactly those bytes (the signer's requirement 2: at most one signature per prev). If its root is another page's, the read-back shows this seq under that root: `HeadConflict` |
@@ -927,13 +928,14 @@ impl Page {
                 // again on a doubling backoff, and only after HELD_ABSENTS in
                 // a row put it again — never at the speed of the answers.
                 let absents = self.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
-                if absents >= HELD_ABSENTS {
+                let bytes = self.blocks.get(&id).map(<[u8]>::to_vec);
+                if let (true, Some(bytes)) = (absents >= HELD_ABSENTS, bytes) {
                     self.held_again.remove(&id);
-                    if let Some(bytes) = self.blocks.get(&id).map(<[u8]>::to_vec) {
-                        self.put_again.insert(id, bytes);
-                    }
+                    self.put_again.insert(id, bytes);
                 } else {
-                    let wait = (BACKOFF_MS << absents).min(rto::RTO_MAX_MS as u64);
+                    // A block this page has no bytes for (a FOREIGN member it only asks about, safety gap class 2)
+                    // is never put from here: it is asked again, for as long as it takes (rule 7).
+                    let wait = (BACKOFF_MS << absents.min(16)).min(rto::RTO_MAX_MS as u64);
                     self.held_again.insert(id, (now + wait, absents));
                 }
             }
@@ -2043,8 +2045,21 @@ impl Page {
                 Effect::Withdraw { id } => {
                     self.deadlines.remove(&Waiting::Put(id));
                     self.attempt_of.remove(&Waiting::Put(id));
+                    self.deadlines.remove(&Waiting::Held(id));
+                    self.attempt_of.remove(&Waiting::Held(id));
+                    self.held_again.remove(&id);
                     self.put_again.remove(&id);
                     self.held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
+                }
+                // A FOREIGN member of a changed group (safety gap class 2): the node answers for it before BACKED_UP.
+                // Known here already (a PUT answered, a Held answered): told at once, no op. Else asked, once.
+                Effect::ConfirmHeld { id } => {
+                    if self.confirmed.contains(&id) {
+                        let more = self.engine.step(Event::PutConfirmed(id));
+                        self.carry_out(more);
+                    } else if !self.deadlines.contains_key(&Waiting::Held(id)) && !self.held_again.contains_key(&id) {
+                        self.send(Waiting::Held(id), Op::AskHeld { id });
+                    }
                 }
                 // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
                 // op, deadline and re-send), unless it is on its way or there already.
@@ -2515,6 +2530,56 @@ mod repair_put {
         p.carry_out(vec![Effect::PutBlock { id, bytes, after: Vec::new() }]);
         p.answer(Answer::PutOk(id), Ms(2));
         assert!(p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "the commit's own PUT answer did not release the head to be signed");
+    }
+}
+
+#[cfg(test)]
+mod confirm_held {
+    use super::*;
+
+    fn asks(p: &mut Page) -> usize {
+        p.take_ops().iter().filter(|o| matches!(o, Op::AskHeld { .. })).count()
+    }
+
+    /// Safety gap class 2: `ConfirmHeld` is answered from what the NODE confirmed (`confirmed`, the one holder),
+    /// never from what the page holds. A block this page's PUT had answered is told at once, with no op; a block in
+    /// page memory only -- a READ rebuilt it from its group -- is asked of the node.
+    #[test]
+    fn a_block_is_confirmed_by_the_node_never_by_page_memory() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let _ = p.take_ops();
+        let (put, rebuilt) = ([7u8; 32], [8u8; 32]);
+        p.confirmed.insert(put);
+        p.carry_out(vec![Effect::ConfirmHeld { id: put }]);
+        assert_eq!(asks(&mut p), 0, "a block the node confirmed was asked about again");
+        p.blocks.insert(rebuilt, b"rebuilt from its group");
+        p.carry_out(vec![Effect::ConfirmHeld { id: rebuilt }]);
+        assert_eq!(asks(&mut p), 1, "a block only in page memory was taken as on the node");
+        p.answer(Answer::Held { id: rebuilt, present: true }, Ms(1));
+        assert!(p.confirmed.contains(&rebuilt), "the node's Held answer did not confirm it");
+    }
+
+    /// RULE 7 for a block the page has NO bytes for (a foreign member it only asks about): absent, it is asked
+    /// again on the backoff for as long as it takes -- past HELD_ABSENTS, where a block with bytes would be PUT --
+    /// and never dropped.
+    #[test]
+    fn a_foreign_block_absent_is_asked_again_for_as_long_as_it_takes() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let _ = p.take_ops();
+        let id = [9u8; 32];
+        p.carry_out(vec![Effect::ConfirmHeld { id }]);
+        assert_eq!(asks(&mut p), 1);
+        let mut now = 0u64;
+        for n in 0..(HELD_ABSENTS + 3) {
+            now += 1;
+            p.answer(Answer::Held { id, present: false }, Ms(now));
+            now += rto::RTO_MAX_MS as u64 + 1;
+            p.tick(Ms(now));
+            assert_eq!(asks(&mut p), 1, "absent answer {}: the block was not asked again", n + 1);
+        }
+        assert!(p.put_again.is_empty(), "a block the page has no bytes for was queued to be PUT");
+        p.answer(Answer::Held { id, present: true }, Ms(now + 1));
+        assert!(p.confirmed.contains(&id));
     }
 }
 
