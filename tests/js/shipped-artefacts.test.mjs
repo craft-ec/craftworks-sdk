@@ -81,6 +81,18 @@ await t("**`modules` names EVERY module the package needs, each present (sdk#312
   for (const m of manifest.modules) assert.ok(existsSync(join(web, m)), `${m} is named but not in pkg/web`);
 });
 
+await t("**`starter` names the SDK's pre-SDK modules: what its starter ENTRIES reach, computed (the one owner of the list)**", async () => {
+  // The builder's starter container and its loader's `external` read this list; nobody keeps a copy (the architect:
+  // it lived in three places, and adding a module was three edits). Its ENTRIES are the SDK's own fact: the modules
+  // that declare themselves the starter's.
+  const { reachable } = await import(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "tools", "reachable.mjs"));
+  const want = [...new Set(["served.js", "pieces.js"].flatMap(e => [...reachable(join(web, e), web)]))].sort();
+  assert.ok(Array.isArray(manifest.starter), "artefacts.json has no `starter` list");
+  assert.deepEqual([...manifest.starter].sort(), want, "`starter` is not what the starter entries reach");
+  assert.deepEqual([...manifest.starter].sort(), ["pieces.js", "rto.js", "served.js"], "THE CONTROL: the starter is not the three modules it is today");
+  for (const m of manifest.starter) assert.ok(existsSync(join(web, m)), `${m} is named in starter but not in pkg/web`);
+});
+
 await t("**every module the build EMITS passes the one module rule its consumers check (core_types::name::module_ok)**", async () => {
   // The rule binds BOTH ends: the SDK never writes a module name its own
   // `sdk.ids.module` refuses, so a consumer never has to reject the SDK's manifest.

@@ -75,6 +75,18 @@ echo "pkg/web: $(wc -l < /tmp/reach.$$ | tr -d ' ') modules reachable from index
 # (sdk#312's real-network run: the published app stayed on "Loading…").
 modules_json=$(python3 -c 'import json,sys; print(json.dumps(sorted(l.strip() for l in open(sys.argv[1]) if l.strip())))' /tmp/reach.$$)
 rm -f /tmp/reach.$$
+# THE STARTER (craftworks-sdk#347): the SDK's JS that runs BEFORE the SDK exists, carried in a published app's own
+# container rather than its pieces. ONE owner of that list (the architect): its ENTRIES are the SDK's to say -- the
+# modules that declare themselves the starter's -- and its contents are what they reach, COMPUTED like `modules`.
+# The builder (its starter files, its loader's `external`) and this repo's tests read `starter` from artefacts.json;
+# nobody keeps a copy.
+STARTER_ENTRIES="served.js pieces.js"
+for e in $STARTER_ENTRIES; do
+  node tools/reachable.mjs "pkg/web/$e" pkg/web || { echo "the starter entry $e does not close under its imports" >&2; exit 1; }
+done > /tmp/starter.$$
+starter_json=$(python3 -c 'import json,sys; print(json.dumps(sorted({l.strip() for l in open(sys.argv[1]) if l.strip()})))' /tmp/starter.$$)
+rm -f /tmp/starter.$$
+echo "starter: $starter_json (reachable from $STARTER_ENTRIES)"
 
 # THE ARTEFACTS THE SDK PROVISIONS WITH.
 #
@@ -209,6 +221,7 @@ cat > pkg/web/artefacts.json <<JSON
                 "bytes": $(size_of pkg/web/craftworks_sdk_bg.wasm) },
   "container": $container_json,
   "modules":  $modules_json,
+  "starter":  $starter_json,
   "webapp":   { "file": "webapp.wasm",          "sha256": "$(hash_of pkg/web/webapp.wasm)",
                 "bytes": $(size_of pkg/web/webapp.wasm) },
   "site":     { "file": "site.wasm",            "sha256": "$(hash_of pkg/web/site.wasm)",
