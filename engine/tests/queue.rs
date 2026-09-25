@@ -124,11 +124,12 @@ fn a_cold_write_that_fails_its_fetch_lets_the_next_one_go() {
     assert!(told(&first, 1).is_empty() && told(&second, 2).is_empty(), "a cold write was answered before its path came");
     let fetch = |fx: &[Effect]| fx.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect::<Vec<_>>();
     assert!(fetch(&second).is_empty(), "the second write fetched before its turn: arrival order is apply order");
-    // The first write's blocks never come.
-    let mut asked = fetch(&first);
+    // The first write's blocks never come. FIFO, as a paced page answers: every ask takes its turn, so the lost
+    // block's group repair (sdk#405) re-asking its members never starves the write's own re-ask.
+    let mut asked: std::collections::VecDeque<freenet_prolly::Cid> = fetch(&first).into_iter().collect();
     let mut exit = Vec::new();
-    for _ in 0..20 {
-        let Some(id) = asked.pop() else { break };
+    for _ in 0..500 {
+        let Some(id) = asked.pop_front() else { break };
         let out = stepped!(e, Event::BlockMissed(id));
         asked.extend(fetch(&out));
         if told(&out, 1).contains(&State::Failed) {

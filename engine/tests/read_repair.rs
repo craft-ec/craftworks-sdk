@@ -233,3 +233,66 @@ fn a_group_block_that_does_not_hash_to_its_slot_is_not_used() {
     assert_eq!(e.repair_counts().1, 0, "a block was rebuilt from forged parity");
     assert!(e.awaits_block(&members[0]), "the lost block is no longer awaited");
 }
+
+/// sdk#405, RULE 11 FOR A WRITE (rule 4: one read path): a write whose path needs a block the network LOST is
+/// applied from the block REBUILT from its group, as a read of it would be -- it never waits on the straggler.
+/// A cold engine over the tree writes a key in a lost leaf: the leaf is answered NotFound every time it is asked
+/// (it never arrives), and the write is Published with the leaf rebuilt from the other members and the parity.
+/// THE CONTROL: repair off, the same write stays parked (the page would keep re-asking).
+#[test]
+fn a_write_whose_path_lost_a_block_is_applied_from_its_group() {
+    let records = records();
+    let (root, mut all) = tree(&records);
+    let (members, _) = a_leaf_group(&mut all, root);
+    let lost: BTreeSet<Cid> = BTreeSet::from([members[0]]);
+    let key = keys_in(&all, &members[..1]).into_iter().next().expect("a key in the lost leaf");
+    for repair in [true, false] {
+        let params = Params { repair_reads: repair, ..Params::default() };
+        let (mut e, store) = common::cold_reader(root, params);
+        let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
+        let mut published = false;
+        let mut arrived_lost = false;
+        let mut queue = e.step(Event::forced_write(ClientId(1), engine::WriteId(1), vec![(key.clone(), engine::Op::Put(b"written over a lost leaf".to_vec()))]));
+        let mut steps = 0;
+        while let Some(f) = queue.pop() {
+            steps += 1;
+            assert!(steps < 50_000, "repair={repair}: the write did not settle");
+            match f {
+                Effect::FetchBlock { id, .. } => {
+                    let times = asked.entry(id).or_insert(0);
+                    *times += 1;
+                    if *times > PACED {
+                        continue;
+                    }
+                    let ev = match all.get(&id).filter(|_| !lost.contains(&id)) {
+                        Some(b) => {
+                            store.put(id, b);
+                            Event::BlockArrived { id, bytes: b.to_vec() }
+                        }
+                        None => Event::BlockMissed(id),
+                    };
+                    arrived_lost |= lost.contains(&id) && matches!(ev, Event::BlockArrived { .. });
+                    queue.extend(e.step(ev));
+                }
+                Effect::Keep { id, bytes } => store.put(id, &bytes),
+                Effect::PutBlock { id, bytes, .. } => {
+                    store.put(id, &bytes);
+                    queue.extend(e.step(Event::PutConfirmed(id)));
+                }
+                Effect::PutRepaired { id, bytes } => store.put(id, &bytes),
+                Effect::UpdateHead { seq, .. } => queue.extend(e.step(Event::HeadConfirmed(seq))),
+                Effect::Notify { state: engine::State::Published, .. } => published = true,
+                _ => {}
+            }
+        }
+        let (started, rebuilt, _) = e.repair_counts();
+        println!("repair={repair}: published {published}; repairs started {started}, rebuilt {rebuilt}; the lost leaf asked {} time(s)", asked.get(&members[0]).copied().unwrap_or(0));
+        assert!(!arrived_lost, "THE SETUP: the lost leaf arrived");
+        if repair {
+            assert!(published, "a write over a lost leaf waited on the straggler instead of rebuilding it from its group");
+            assert!(rebuilt >= 1, "published without a rebuild: the leaf was not needed, the test is vacuous");
+        } else {
+            assert!(!published, "THE CONTROL: with repair off the write published without the lost leaf");
+        }
+    }
+}

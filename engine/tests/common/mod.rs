@@ -291,6 +291,12 @@ impl Harness {
         self.engine.root()
     }
 
+    /// The engine's read repairs so far: `(started, rebuilt, given up)`.
+    #[allow(dead_code)]
+    pub fn repair_counts(&self) -> (u64, u64, u64) {
+        self.engine.repair_counts()
+    }
+
     pub fn published_root(&self) -> Cid {
         self.engine.published_root()
     }
