@@ -2372,3 +2372,16 @@ fn a_delta_push_is_never_judged_as_a_state_and_the_read_back_still_reads() {
     assert_eq!(decode(UpdateData::Delta(StateDelta::from(vec![1u8, 2, 3]))), None, "a delta was decoded as a state");
     assert_eq!(decode(UpdateData::State(State::from(vec![1u8, 2, 3]))), Some(vec![1u8, 2, 3]), "THE CONTROL: a full state was not decoded as one");
 }
+
+/// **settle's CAP IS A FAILURE, never an end** (main, on #403): a page the test keeps from quiescence -- its signer
+/// never answers, so the ask stays owed -- driven through `settle` ITSELF (not `run_unsettled`) must panic "did not
+/// settle". Without this, a settle that quietly returned at its cap would pass every count test as before.
+#[test]
+#[should_panic(expected = "did not settle")]
+fn control_settle_panics_on_a_page_that_never_settles() {
+    let mut node = WireNode::new(&[44u8; 32]);
+    node.drop_signer_answers = usize::MAX;
+    let mut io = asker();
+    let mut now = 1_000;
+    settle(&mut io, &mut node, &mut now);
+}
