@@ -2859,6 +2859,24 @@ mod recording {
         instrument::vocab::coarsen_ms(ms)
     }
 
+    /// A send that SUPERSEDES one still on the wire (the same op sent again before its answer) ENDS the old one,
+    /// Withdrawn: the recording never holds a request that nothing closed and nothing will answer. Found by the
+    /// page model's accounting; pinned here, where no seed decides whether the path is reached. Mutant "the
+    /// superseded send's end not recorded" -> red.
+    #[test]
+    fn a_send_superseding_one_on_the_wire_closes_it_withdrawn() {
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        p.record_into(64);
+        p.send(Waiting::Ext(Ext::SignerFirst), Op::Ext(Ext::SignerFirst));
+        p.send(Waiting::Ext(Ext::SignerFirst), Op::Ext(Ext::SignerFirst));
+        let r = p.recording().expect("attached");
+        let site = op_site(&Waiting::Ext(Ext::SignerFirst));
+        assert!(r.events().contains(&Event::Exit { site, op: instrument::OpId(1), outcome: Outcome::Withdrawn }), "the superseded send req#1 was not closed");
+        let open: Vec<_> = r.answers().into_iter().filter(|(_, a)| *a == instrument::Answered::Never).map(|(l, _)| l.ordinal).collect();
+        assert_eq!(open, vec![1, 2], "req#1 closed-unanswered and req#2 on the wire");
+        assert_eq!(p.ops_on_wire(), 1, "one op on the wire");
+    }
+
     /// ONE SITE (the architect's check 2), held by the source: a deadline leaves only through `end`, arrives only
     /// through `send` and `park`, and an op reaches the wire only from `send` and `reconnected` -- each of which
     /// records. A new path that bypassed them would be an op the recording never saw.
