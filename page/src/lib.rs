@@ -1819,7 +1819,7 @@ impl Page {
         rec.event(match how {
             End::Answered => Event::Edge { site, dir: Dir::Response, id },
             End::TimedOut => Event::Exit { site, op: id.op(), outcome: Outcome::Timeout },
-            End::Withdrawn => Event::Exit { site, op: id.op(), outcome: Outcome::Blocked },
+            End::Withdrawn => Event::Exit { site, op: id.op(), outcome: Outcome::Withdrawn },
         });
     }
 
