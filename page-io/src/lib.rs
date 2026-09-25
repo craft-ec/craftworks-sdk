@@ -228,8 +228,6 @@ pub struct PageIo {
     /// framed around. The page owns the publication; these bytes are page-io's only while it is `Publishing`
     /// and are dropped when it ends (no app PUT entry: the site's PUT is the page's `Update`).
     sites: BTreeMap<String, Site>,
-    /// The last time the node or the clock spoke, for answers made locally.
-    now: Ms,
     /// A reader's stream-id range (`reader`), in the top byte; 0 for the
     /// person's own page, which keeps the whole space below it.
     stream_base: u32,
@@ -351,7 +349,6 @@ impl PageIo {
             others: Vec::new(),
             app_contracts: BTreeMap::new(),
             sites: BTreeMap::new(),
-            now: Ms(0),
             stream_base: 0,
             needs_key: false,
             minted: false,
@@ -414,7 +411,7 @@ impl PageIo {
         // at once, and a node without the delegate says so.
         self.signer_registered = true;
         self.first = Some(First::Query);
-        self.server.page.send_ext(Ext::SignerFirst, self.now);
+        self.server.page.send_ext(Ext::SignerFirst, self.server.page.now());
         self.pump();
     }
 
@@ -537,7 +534,7 @@ impl PageIo {
     fn register_signer(&mut self, signer: DelegateContainer, first: First) {
         self.signer_container = Some(signer);
         self.first = Some(first);
-        self.server.page.send_ext(Ext::RegisterSigner, self.now);
+        self.server.page.send_ext(Ext::RegisterSigner, self.server.page.now());
         self.pump();
     }
 
@@ -558,7 +555,7 @@ impl PageIo {
         // The signer is registered already (it answered the query): the
         // Provision is the first request now, sent and re-sent like one.
         self.first = Some(First::Provision(signing_key));
-        self.server.page.send_ext(Ext::SignerFirst, self.now);
+        self.server.page.send_ext(Ext::SignerFirst, self.server.page.now());
         self.pump();
     }
 
@@ -611,7 +608,6 @@ impl PageIo {
     /// ONE head path, PUTs the record framed around `web`, and reads it back ([`PageIo::publication`]). A reader,
     /// a bad app id or a Register that is not this person's own key publishes nothing, by name.
     pub fn publish_site(&mut self, app: &str, site_code: &[u8], web: Vec<u8>, now: Ms) -> Result<(), String> {
-        self.now = now;
         if self.read_only() {
             return Err("read-only: a reader publishes nothing".into());
         }
@@ -773,7 +769,6 @@ impl PageIo {
     /// caller. So a frame that is not this page's is left alone here, not
     /// counted as unusable.
     pub fn inbound(&mut self, bytes: &[u8], now: Ms) -> bool {
-        self.now = now;
         let incoming = wire::unframe(&mut self.frames, bytes);
         if !self.owns(&incoming) {
             return false;
@@ -833,7 +828,7 @@ impl PageIo {
                         (false, Some(false)) => self.server.node(Answer::Head { label: Label::Head, read: None }, now),
                         (false, None) => {
                             self.head_failed_pending = true;
-                            self.ask_record();
+                            self.ask_record(now);
                         }
                         _ => {}
                     }
@@ -1049,7 +1044,6 @@ impl PageIo {
 
     /// The page's clock.
     pub fn tick(&mut self, now: Ms) {
-        self.now = now;
         self.server.tick(now);
         self.pump();
     }
@@ -1106,8 +1100,7 @@ impl PageIo {
     /// signed: the root check comes before any signature. ASSUMPTION (a verb
     /// of its own would be clearer; the signer's owner may add one): the
     /// order of `decide` stays as it is, which signer/tests pin.
-    fn ask_record(&mut self) {
-        let now = self.now;
+    fn ask_record(&mut self, now: Ms) {
         self.server.page.send_ext(Ext::AskRecord, now);
     }
 
@@ -1257,7 +1250,8 @@ impl PageIo {
             }
         }
         if !not_held.is_empty() || !not_sent.is_empty() || no_head {
-            let now = self.now;
+            // THE PAGE'S clock: page-io keeps no copy of it (one owner; a copy with another origin was sdk#397).
+            let now = self.server.page.now();
             for id in not_held {
                 self.server.node(Answer::Held { id, present: false }, now);
             }

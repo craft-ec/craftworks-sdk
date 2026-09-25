@@ -10,7 +10,7 @@
 
 use engine::Params;
 use page::server::{Server, SignerFacts};
-use page::{Page, PutPath};
+use page::{Ms, Page, PutPath};
 use protocol::{Reply, Request};
 use testkit::PageNode;
 
@@ -75,7 +75,7 @@ fn what_the_page_cannot_understand_is_refused_by_name() {
 #[test]
 fn identity_reports_whether_a_head_can_be_written_and_names_its_contract() {
     let identity = |facts: SignerFacts| {
-        let mut s = Server::new(Page::unstarted(Params::default(), PutPath::Page), facts);
+        let mut s = Server::new(Page::unstarted(Params::default(), PutPath::Page, Ms(0)), facts);
         s.client(&protocol::encode_request(1, &Request::Identity).expect("encodes"));
         decode(&s.take_replies())
             .into_iter()

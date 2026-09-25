@@ -172,11 +172,12 @@ impl PageNode {
 
     /// A new tab whose engine runs with these parameters.
     pub fn connect_with(&self, params: Params) -> PageConn {
-        let page = Page::unstarted(params, PutPath::Page);
+        let now = 1_000;
+        let page = Page::unstarted(params, PutPath::Page, Ms(now));
         PageConn(Rc::new(RefCell::new(ConnState {
             node: self.clone(),
             server: Server::new(page, SignerFacts { head_writable: true, head_id: self.register_id }),
-            now: 1_000,
+            now,
             hold: false,
             held: VecDeque::new(),
             served: BTreeMap::new(),

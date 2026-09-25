@@ -613,6 +613,9 @@ pub struct Page {
     /// how many did: what a view says while it waits.
     below_floor: Option<(Option<u64>, u32)>,
     now: u64,
+    /// The clock when the page was made. No round trip can be longer than the page has existed: a sample that is
+    /// was dated against another clock's origin (sdk#397), and `answered` says so.
+    born: u64,
     /// Every record the signer returned — invariant 2's evidence.
     signer_records: BTreeSet<Vec<u8>>,
 }
@@ -620,8 +623,14 @@ pub struct Page {
 impl Page {
     /// A page with a fresh engine. It reads its head first (`ReadHead`), as a
     /// delegate's engine did.
+    /// Its clock starts at 0: a test page, whose clock the test moves from there.
     pub fn new(params: Params, path: PutPath) -> Page {
-        let mut p = Page::unstarted(params, path);
+        Page::new_at(params, path, Ms(0))
+    }
+
+    /// [`Page::new`] with its clock starting at `now` (the page model varies the origin per seed, sdk#397).
+    pub fn new_at(params: Params, path: PutPath, now: Ms) -> Page {
+        let mut p = Page::unstarted(params, path, now);
         // The key is in the SIGNER's secret store; the engine only states
         // where its authority comes from.
         p.step(Event::Start { key: KeySource::SecretStore, epochs: vec![EPOCH] });
@@ -630,7 +639,12 @@ impl Page {
 
     /// A page whose engine has not been STARTED: [`crate::server::Server`]
     /// starts it on the client's `Identity`, as the delegate's shell did.
-    pub fn unstarted(params: Params, path: PutPath) -> Page {
+    ///
+    /// `now` is the page's clock when it is made, in the clock's own origin (a browser page's is `Date.now()`,
+    /// EPOCH ms): every op is dated by it. A page whose clock started at 0 dated its first requests at 0 and took
+    /// their answers as a round trip of ~1.8e12 ms -- an SRTT no later sample could bring down, the RTO pinned at
+    /// its 60 s ceiling for the page's life, so a lost PUT waited a minute (V's first save, Phase 4 realnet).
+    pub fn unstarted(params: Params, path: PutPath, now: Ms) -> Page {
         let blocks = PageBlocks::default();
         let engine = Engine::new(params, blocks.clone());
         Page {
@@ -669,7 +683,8 @@ impl Page {
             read_only: false,
             head_floor: 0,
             below_floor: None,
-            now: 0,
+            now: now.0,
+            born: now.0,
             signer_records: BTreeSet::new(),
             next_request: 1,
         }
@@ -1764,7 +1779,11 @@ impl Page {
         self.attempt_of.remove(w);
         self.first_of.remove(w);
         if d.sent && d.attempt == 1 && !d.resent {
-            self.rto.sample(self.now.saturating_sub(d.sent_at));
+            let r = self.now.saturating_sub(d.sent_at);
+            // IMPOSSIBLE, so loud: a round trip longer than the page has existed was dated against another clock's
+            // origin -- the defect that pinned the RTO at its ceiling for a page's life (sdk#397).
+            debug_assert!(r <= self.now.saturating_sub(self.born), "an RTT sample of {r} ms on a page {} ms old: a request was dated against another clock's origin", self.now.saturating_sub(self.born));
+            self.rto.sample(r);
             self.rearm_first_sends(self.rto.rto_ms());
         }
         if d.sent && matches!(w, Waiting::Get(_)) {
@@ -1835,6 +1854,11 @@ impl Page {
         let puts = (!self.put_again.is_empty()).then_some(self.now);
         let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
         deadlines.chain(sign).chain(held).chain(verify).chain(puts).chain(backstop).min().map(Ms)
+    }
+
+    /// The page's clock: the last time it was told.
+    pub fn now(&self) -> Ms {
+        Ms(self.now)
     }
 
     /// The retry clock now: `(RTO ms, SRTT ms, GET window)`.
@@ -2511,6 +2535,33 @@ mod parked_get {
         // The engine here waits on nothing: the parked GET ends rather than going out.
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
+    }
+}
+
+#[cfg(test)]
+mod clock_origin {
+    use super::*;
+
+    const EPOCH_MS: u64 = 1_790_253_181_367;
+
+    /// sdk#397's guard: a round trip longer than the page has existed is IMPOSSIBLE, and says so. A page made at
+    /// the browser's epoch clock answers a request that was dated 0 -- against another clock's origin, as page-io's
+    /// copy of the clock once did -- and the sample trips the assert. Mutant "no assert" -> red.
+    #[test]
+    #[should_panic(expected = "dated against another clock's origin")]
+    fn a_sample_longer_than_the_page_has_existed_is_refused_loudly() {
+        let mut p = Page::new_at(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        p.send_ext(Ext::SignerFirst, Ms(0));
+        p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 10));
+    }
+
+    /// THE CONTROL: the same request dated by the page's own clock is a 10 ms sample.
+    #[test]
+    fn a_request_dated_by_the_pages_clock_is_its_round_trip() {
+        let mut p = Page::new_at(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        p.send_ext(Ext::SignerFirst, Ms(EPOCH_MS + 100));
+        p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 110));
+        assert_eq!(p.rto.srtt_ms(), Some(10.0), "the sample was not the 10 ms round trip");
     }
 }
 

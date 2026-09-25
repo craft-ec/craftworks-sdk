@@ -127,7 +127,8 @@ CONTROLS=(
 # the batch gate (the full run) runs them, and records each one's own count as `gate.baseline.d/member@target`, so a
 # PR's count for that member compares against the baseline minus them.
 #
-# They run in RELEASE: measured 2026-09-24, one model test at CRAFTWORKS_MODEL_SEEDS=2, the same result in both
+# They run in RELEASE speed with debug assertions ON (`--profile model`, Cargo.toml: sdk#397's clock-origin guard is a
+# debug_assert). Release measured 2026-09-24, one model test at CRAFTWORKS_MODEL_SEEDS=2, the same result in both
 # profiles, at load ~106-110: debug 35.7 s wall / 13.5 s CPU, release 0.86 s wall / 0.54 s CPU.
 BATCH_ONLY=(
   "page@model"
@@ -330,7 +331,7 @@ for m in $MEMBERS; do
     out=$(cargo test -p "$m" --no-fail-fast $(echo "$ta" | sed -n 1p) 2>&1); rc=$?
     if [ "$(echo "$ta" | sed -n 2p)" = doc ]; then dout=$(cargo test -p "$m" --doc 2>&1) || rc=1; out="$out"$'\n'"$dout"; fi
     for t in $skip; do
-      rout=$(cargo test --release -p "$m" --no-fail-fast --test "$t" 2>&1) || rc=1
+      rout=$(cargo test --profile model -p "$m" --no-fail-fast --test "$t" 2>&1) || rc=1
       out="$out"$'\n'"$rout"
       bo_counts="$bo_counts $t=$(echo "$rout" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')"
     done
