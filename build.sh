@@ -81,11 +81,12 @@ rm -f /tmp/reach.$$
 # The builder (its starter files, its loader's `external`) and this repo's tests read `starter` from artefacts.json;
 # nobody keeps a copy.
 STARTER_ENTRIES="served.js pieces.js"
+starter_tmp=$(mktemp)
 for e in $STARTER_ENTRIES; do
-  node tools/reachable.mjs "pkg/web/$e" pkg/web || { echo "the starter entry $e does not close under its imports" >&2; exit 1; }
-done > /tmp/starter.$$
-starter_json=$(python3 -c 'import json,sys; print(json.dumps(sorted({l.strip() for l in open(sys.argv[1]) if l.strip()})))' /tmp/starter.$$)
-rm -f /tmp/starter.$$
+  node tools/reachable.mjs "pkg/web/$e" pkg/web || { echo "the starter entry $e does not close under its imports" >&2; rm -f "$starter_tmp"; exit 1; }
+done > "$starter_tmp"
+starter_json=$(python3 -c 'import json,sys; print(json.dumps(sorted({l.strip() for l in open(sys.argv[1]) if l.strip()})))' "$starter_tmp")
+rm -f "$starter_tmp"
 echo "starter: $starter_json (reachable from $STARTER_ENTRIES)"
 
 # THE ARTEFACTS THE SDK PROVISIONS WITH.
