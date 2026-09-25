@@ -328,41 +328,51 @@ impl Node {
     /// root's group of one (the root and the parity its head's mark lists). A group of a new node whose parity
     /// ids are all the replaced nodes' own is unchanged (parity ids are a function of the members). Whether the
     /// whole TREE is whole is the assets dashboard's question (KEEPER §4), not a write's.
-    fn changed_groups_whole(&self, prev: (u64, Cid), root: &Cid, mark: Option<Vec<Cid>>) -> Result<(), String> {
+    fn changed_groups_whole(&self, prev: (u64, Cid), root: &Cid, mark: Option<Vec<Cid>>) -> Result<(), Unwhole> {
         let missing = |b: &Cid| !self.blocks.contains_key(b);
+        let unplaced = |why: String| Unwhole { hole: Hole::Unplaced, why };
         if missing(root) {
-            return Err("the root is not on the node".into());
+            return Err(Unwhole { hole: Hole::Root, why: "the root is not on the node".into() });
         }
         for p in mark.unwrap_or_default() {
             if missing(&p) {
-                return Err(format!("root parity {:?} is not on the node", &p[..4]));
+                return Err(Unwhole { hole: Hole::Root, why: format!("root parity {:?} is not on the node", &p[..4]) });
             }
         }
-        let new_nodes = if prev.0 == 0 { self.all_nodes(root)? } else { self.nodes_not_in(&prev.1, root)? };
-        let old_nodes = if prev.0 == 0 { Default::default() } else { self.nodes_not_in(root, &prev.1)? };
-        let mut old_parity = std::collections::BTreeSet::new();
-        for n in &old_nodes {
-            let Some(b) = self.blocks.get(n) else { continue };
-            let Ok(node) = freenet_prolly::node::Node::parse(b) else { continue };
-            old_parity.extend(node.parity());
-        }
+        let new_nodes = if prev.0 == 0 { self.all_nodes(root).map_err(unplaced)? } else { self.nodes_not_in(&prev.1, root).map_err(unplaced)? };
+        let old_parity = if prev.0 == 0 { Default::default() } else { self.parity_of(&self.nodes_not_in(root, &prev.1).map_err(unplaced)?) };
         for n in &new_nodes {
-            let b = self.blocks.get(n).ok_or_else(|| format!("new node {:?} is not on the node", &n[..4]))?;
-            let node = freenet_prolly::node::Node::parse(b).map_err(|e| format!("a node that does not parse: {e:?}"))?;
+            let b = self.blocks.get(n).ok_or_else(|| unplaced(format!("new node {:?} is not on the node", &n[..4])))?;
+            let node = freenet_prolly::node::Node::parse(b).map_err(|e| unplaced(format!("a node that does not parse: {e:?}")))?;
             let ids: Vec<Cid> = node.parity().collect();
             for (g, (_, members)) in freenet_prolly::parity::group_members(&node).into_iter().enumerate() {
                 let par = ids.get(engine::PARITY * g..engine::PARITY * (g + 1)).unwrap_or(&[]);
                 if !par.is_empty() && par.iter().all(|p| old_parity.contains(p)) {
                     continue;
                 }
-                for m in members.iter().chain(par) {
-                    if missing(m) {
-                        return Err(format!("block {:?} of a group the commit changed (node {:?}, group {g}) is not on the node", &m[..4], &n[..4]));
-                    }
+                if let Some(m) = members.iter().chain(par).find(|m| missing(m)) {
+                    let why = format!("block {:?} of a group the commit changed (node {:?}, group {g}) is not on the node", &m[..4], &n[..4]);
+                    let hole = if par.is_empty() { Hole::Unplaced } else { Hole::Group(par.iter().copied().collect()) };
+                    return Err(Unwhole { hole, why });
                 }
             }
         }
         Ok(())
+    }
+
+    /// The parity ids the given nodes list (those held).
+    fn parity_of(&self, nodes: &std::collections::BTreeSet<Cid>) -> std::collections::BTreeSet<Cid> {
+        nodes.iter().filter_map(|n| self.blocks.get(n)).filter_map(|b| freenet_prolly::node::Node::parse(b).ok()).flat_map(|n| n.parity().collect::<Vec<_>>()).collect()
+    }
+
+    /// Did the commit `prev` → `root` RE-CODE the group whose parity ids are `par`: a node it replaced listed that
+    /// parity, and none of its new nodes lists it any more?
+    fn recoded(&self, prev: (u64, Cid), root: &Cid, par: &std::collections::BTreeSet<Cid>) -> bool {
+        if prev.0 == 0 {
+            return false;
+        }
+        let (Ok(old), Ok(new)) = (self.nodes_not_in(root, &prev.1), self.nodes_not_in(&prev.1, root)) else { return false };
+        par.is_subset(&self.parity_of(&old)) && par.is_disjoint(&self.parity_of(&new))
     }
 
     /// Every node of the tree at `root` (the first commit changed all of them).
@@ -863,6 +873,72 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     Ok(seen)
 }
 
+/// Where a commit's changed groups are not whole.
+enum Hole {
+    /// The root, or the parity its head's mark lists (the root's group of one).
+    Root,
+    /// A group, named by its parity ids.
+    Group(std::collections::BTreeSet<Cid>),
+    /// Somewhere the check could not place in a group (a node of the commit's path missing).
+    Unplaced,
+}
+
+struct Unwhole {
+    hole: Hole,
+    why: String,
+}
+
+/// Which later commit may CARRY a write whose own changed groups are not whole.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Carrier {
+    /// A later commit of the page that DESCENDS from the write's head through a step that RE-CODED the hole's
+    /// group (for the root's group: any step -- every commit replaces the root), with every group IT changed
+    /// whole: what `supersede`'s carry is. The re-coding step may be another page's head adopted in between: that
+    /// is the root move that withdrew the stragglers, and the next own commit is the carrier.
+    Recoded,
+    /// ANY later whole commit of the page: too loose (the architect), kept only as the control's other side.
+    Any,
+}
+
+/// INVARIANT 3b for one write told ParityComplete: its commit (`own`) has every group it changed whole on the
+/// node, or a later commit of the same page (`later`) CARRIED it (`how`).
+fn judge_backed_up(node: &Node, edges: &BTreeMap<(u64, Cid), (u64, Cid)>, own: (u64, Cid), later: &[(u64, Cid)], how: Carrier) -> Result<(), String> {
+    let mark = |h: (u64, Cid)| node.held_values.get(&h).and_then(|v| page::HeadRead::from_value(h.0, v)).and_then(|r| r.mark());
+    let Some(prev) = edges.get(&own) else { return Ok(()) };
+    let Err(u) = node.changed_groups_whole(*prev, &own.1, mark(own)) else { return Ok(()) };
+    // Did some step of the chain own -> ... -> h (the signers' records) re-code the hole's group?
+    let recoded_on_the_way = |h: (u64, Cid)| -> bool {
+        let mut cur = h;
+        let mut recoded = false;
+        while cur != own {
+            let Some(p) = edges.get(&cur) else { return false };
+            if cur.0 <= own.0 {
+                return false; // not a descendant of the write's head
+            }
+            recoded |= match &u.hole {
+                Hole::Root => true,
+                Hole::Group(par) => node.recoded(*p, &cur.1, par),
+                Hole::Unplaced => false,
+            };
+            cur = *p;
+        }
+        recoded
+    };
+    let carried = later.iter().filter(|h| h.0 > own.0).any(|h| {
+        let Some(hp) = edges.get(h) else { return false };
+        let replaced = match how {
+            Carrier::Any => true,
+            Carrier::Recoded => recoded_on_the_way(*h),
+        };
+        replaced && node.changed_groups_whole(*hp, &h.1, mark(*h)).is_ok()
+    });
+    if carried {
+        Ok(())
+    } else {
+        Err(format!("a group its commit changed is not WHOLE on the node, and no later commit of this page re-coded it whole: {}", u.why))
+    }
+}
+
 fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64, held: Option<Cid>, edges: &BTreeMap<(u64, Cid), (u64, Cid)>) -> Result<(), String> {
     // THE REGISTER IS NEVER 2+ BEHIND THE SIGNER'S RECORD (1b on the sign
     // side, the architect's attack): past one, the record for the seq between
@@ -967,23 +1043,15 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64, hel
             // keeps THAT write un-BACKED_UP, not this one.
             //
             // A CARRIED write (a later root move re-coded its groups: `supersede` withdrew the old version's
-            // stragglers and moved the write onto a newer own commit's Backing) is judged by its CARRIER: a later
-            // commit of this page with every group IT changed whole. Never by what the current head references --
-            // that trusted the carry instead of checking it (the architect's mutant: a carried write told at once
-            // survived).
+            // stragglers and moved the write onto a newer own commit's Backing) is judged by its CARRIER: the later
+            // commit of this page that RE-CODED the hole's group, with every group IT changed whole
+            // (`judge_backed_up`). Never by what the current head references, nor by any unrelated later commit
+            // that finished (the architect: both trust the carry instead of checking it).
             State::ParityComplete if !a.nothing_changed.contains(&wid.0) => {
-                let judge = |h: (u64, Cid)| -> Result<(), String> {
-                    let Some(prev) = edges.get(&h) else { return Ok(()) };
-                    let mark = node.held_values.get(&h).and_then(|v| page::HeadRead::from_value(h.0, v)).and_then(|r| r.mark());
-                    node.changed_groups_whole(*prev, &h.1, mark)
-                };
                 if let Some((_, _, own, _)) = seen.published_at.iter().rev().find(|(p, w, _, _)| *p == i && *w == wid.0) {
-                    if let Err(why) = judge(*own) {
-                        let carriers: std::collections::BTreeSet<(u64, Cid)> =
-                            seen.published_at.iter().filter(|(p, _, h, _)| *p == i && h.0 > own.0).map(|(_, _, h, _)| *h).collect();
-                        if !carriers.into_iter().any(|h| judge(h).is_ok()) {
-                            return Err(format!("page {i}: write {} is ParityComplete, but a group its commit changed is not WHOLE on the node, and no later commit of this page that could carry it is whole: {why}", wid.0));
-                        }
+                    let later: Vec<(u64, Cid)> = seen.published_at.iter().filter(|(p, _, _, _)| *p == i).map(|(_, _, h, _)| *h).collect();
+                    if let Err(why) = judge_backed_up(node, edges, *own, &later, Carrier::Recoded) {
+                        return Err(format!("page {i}: write {} is ParityComplete, but {why}", wid.0));
                     }
                 }
             }
@@ -1178,6 +1246,74 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
     assert!(node.tree(&root).is_none(), "the whole-tree check passed over a missing block");
     // And the re-stated 3b (the commit's changed groups): the first commit changed every group.
     assert!(node.changed_groups_whole((0, [0u8; 32]), &root, None).is_err(), "the changed-groups check passed over a missing block");
+}
+
+/// One page's write, driven to a standstill against the node with every op answered; the signer's record edge
+/// (next -> prev) recorded as the model's `edges`. The head it ends on.
+fn drive_one(p: &mut Page, node: &mut Node, edges: &mut BTreeMap<(u64, Cid), (u64, Cid)>, w: u64, key: &str, value: Vec<u8>) -> (u64, Cid) {
+    p.write(ClientId(1), WriteId(w), vec![(key.as_bytes().to_vec(), WriteOp::Put(value))]);
+    for _ in 0..40 {
+        for op in p.take_ops() {
+            match op {
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    p.answer(Answer::PutOk(id), Ms(0));
+                }
+                Op::ReadHead { .. } => p.answer(Answer::Head { label: page::Label::Head, read: node.head_read() }, Ms(0)),
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                    let (id, a) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                    if let Some(rec) = node.secrets[0].get(signer::RECORD) {
+                        let rec: signer::Record = bincode::deserialize(rec).expect("the signer's record");
+                        edges.insert((rec.next.seq, rec.next.root), (rec.prev.seq, rec.prev.root));
+                    }
+                    p.answer(Answer::Signer { id, answer: a }, Ms(0));
+                }
+                Op::Update { state, .. } => {
+                    node.update(&state);
+                    p.answer(Answer::Updated { label: page::Label::Head }, Ms(0));
+                }
+                Op::Get { id } => match node.blocks.get(&id) {
+                    Some(b) => p.answer(Answer::Got { id, bytes: b.clone() }, Ms(0)),
+                    None => p.answer(Answer::GetMissed(id), Ms(0)),
+                },
+                Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, Ms(0)),
+                Op::PutApp { key } => p.answer(Answer::AppPutOk(key), Ms(0)),
+                Op::Ext(_) => {}
+            }
+        }
+    }
+    node.head().expect("the write published")
+}
+
+/// THE CONTROL for 3b's CARRIER (the architect's narrowing): a write whose changed group is left NOT whole (its
+/// value block gone from the node) is not carried by a later commit that finished in ANOTHER group -- only by
+/// one that RE-CODED the hole's group. Here write 3 adds a much larger value (another size class: another value
+/// group of the same leaf) and is whole: the loose carrier (`Any`) excuses write 2, the narrow one (`Recoded`)
+/// does not. Write 4 then overwrites write 2's key: its group is re-coded without the lost block, and THAT
+/// carries write 2.
+#[test]
+fn a_later_commit_in_another_group_does_not_carry_a_broken_write() {
+    let (mut node, _) = Node::new();
+    let mut edges = BTreeMap::new();
+    let mut p = Page::new(Params::default(), PutPath::Page);
+    let _ = drive_one(&mut p, &mut node, &mut edges, 1, "a", vec![1u8; 3_000]);
+    let before: std::collections::BTreeSet<Cid> = node.blocks.keys().copied().collect();
+    let two = drive_one(&mut p, &mut node, &mut edges, 2, "b", vec![2u8; 3_000]);
+    let value_b = *node
+        .blocks
+        .iter()
+        .find(|(id, b)| !before.contains(*id) && freenet_prolly::block_id(freenet_prolly::kind::RAW, b) == **id)
+        .expect("write 2's value block")
+        .0;
+    node.blocks.remove(&value_b);
+    assert!(judge_backed_up(&node, &edges, two, &[], Carrier::Recoded).is_err(), "THE SETUP: write 2's changed groups are whole with its value gone");
+    let three = drive_one(&mut p, &mut node, &mut edges, 3, "c", vec![3u8; 60_000]);
+    assert!(node.changed_groups_whole(edges[&three], &three.1, None).is_ok(), "THE SETUP: write 3's own changed groups are not whole");
+    assert!(judge_backed_up(&node, &edges, two, &[three], Carrier::Any).is_ok(), "THE SETUP: the loose carrier did not excuse write 2 -- the case does not show the gap");
+    let why = judge_backed_up(&node, &edges, two, &[three], Carrier::Recoded).expect_err("a later commit in ANOTHER group carried a write whose group is not whole");
+    println!("narrow carrier, write 3 in another group: {why}");
+    let four = drive_one(&mut p, &mut node, &mut edges, 4, "b", vec![4u8; 3_000]);
+    assert!(judge_backed_up(&node, &edges, two, &[three, four], Carrier::Recoded).is_ok(), "a commit that RE-CODED the hole's group without the lost block did not carry write 2");
 }
 
 /// THE WRAPPER PATH: a PUT's answer confirms nothing, only the signer's
