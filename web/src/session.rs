@@ -469,7 +469,7 @@ impl Session {
         self.signer_code = signer;
         let art = page_io::Artefacts { block_code: block, register_code: register, register_params: Vec::new(), signer: key };
         let server = page::server::Server::new(
-            page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
+            page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms())),
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
@@ -518,7 +518,7 @@ impl Session {
             signer,
         };
         let server = page::server::Server::new(
-            page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
+            page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms())),
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
@@ -669,7 +669,7 @@ impl Session {
             return Err(JsValue::from_str("open_named: this session is already open on its own head"));
         }
         let server = page::server::Server::new(
-            page::Page::unstarted(engine::Params::default(), page::PutPath::Page),
+            page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms())),
             page::server::SignerFacts::default(),
         );
         self.db.store_mut().set_view();

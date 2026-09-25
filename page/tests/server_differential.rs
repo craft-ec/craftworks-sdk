@@ -213,7 +213,7 @@ impl PageRig {
     }
 
     fn with(params: Params) -> PageRig {
-        let page = Page::unstarted(params, PutPath::Page);
+        let page = Page::unstarted(params, PutPath::Page, Ms(0));
         PageRig {
             server: Server::new(page, SignerFacts { head_writable: true, head_id: [0; 32] }),
             session: SESSION,

@@ -72,6 +72,12 @@ struct WireNode {
     site_hidden: bool,
     /// The next this many GETs of the SITE are refused (`ContractError::Get`).
     refuse_site_gets: usize,
+    /// The next this many BLOCK PUTs are LOST: not stored, never answered -- only the page's RTO re-sends them.
+    lose_block_puts: usize,
+    /// Every block PUT that reached the node: (the clock when it did, the block contract's id).
+    block_puts: Vec<(u64, [u8; 32])>,
+    /// The clock the harness serves at (set before each frame).
+    now: u64,
     /// The node PUSHES the head register's full new state to this page (an `UpdateNotification`, as its GET's
     /// subscription asked) BEFORE it answers the UPDATE -- the order measured on 0.2.136 (sdk#378: HeadChanged
     /// 1-4 ms before the UpdateResponse).
@@ -142,6 +148,9 @@ impl WireNode {
             site_blind_signs: 0,
             site_hidden: false,
             refuse_site_gets: 0,
+            lose_block_puts: 0,
+            block_puts: Vec::new(),
+            now: 0,
             push_updates: false,
             push_kind: PushKind::State,
             pushes: Vec::new(),
@@ -180,6 +189,9 @@ impl WireNode {
             site_blind_signs: 0,
             site_hidden: false,
             refuse_site_gets: 0,
+            lose_block_puts: 0,
+            block_puts: Vec::new(),
+            now: 0,
             push_updates: false,
             push_kind: PushKind::State,
             pushes: Vec::new(),
@@ -266,6 +278,11 @@ impl WireNode {
                     *self.served.entry("put site").or_default() += 1;
                     self.merge_site(state.as_ref());
                 } else {
+                    self.block_puts.push((self.now, id));
+                    if self.lose_block_puts > 0 {
+                        self.lose_block_puts -= 1;
+                        return None;
+                    }
                     *self.served.entry("put block").or_default() += 1;
                     self.contracts.insert(id, state.as_ref().to_vec());
                 }
@@ -395,7 +412,7 @@ impl WireNode {
 fn page_io(node: &WireNode) -> PageIo {
     let (_, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts {
             block_code: BLOCK_CODE.to_vec(),
             register_code: REGISTER_CODE.to_vec(),
@@ -426,6 +443,7 @@ fn settle(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
             }
         }
         *now += 1;
+        node.now = *now;
         for f in frames {
             let answer = node.serve(&f);
             for push in std::mem::take(&mut node.pushes) {
@@ -709,6 +727,7 @@ fn pump(io: &mut PageIo, node: &mut WireNode, now: &mut u64) -> Vec<Reply> {
             break;
         }
         *now += 1;
+        node.now = *now;
         for f in frames {
             let answer = node.serve(&f);
             for push in std::mem::take(&mut node.pushes) {
@@ -865,7 +884,7 @@ fn a_put_refusal_goes_to_whoever_owns_the_contract_it_names() {
 
 fn reader(node: &WireNode) -> PageIo {
     PageIo::reader(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         BLOCK_CODE.to_vec(),
         node.register_id,
         1,
@@ -1037,7 +1056,7 @@ fn the_own_page_and_a_reader_read_the_same_tree_identically_intact_and_corrupted
 fn opening(node: &mut WireNode, now: &mut u64, mint: &[u8; 32], always_mint: bool) -> (PageIo, usize) {
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(*now)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
     io.begin(container);
@@ -1049,7 +1068,7 @@ fn opening(node: &mut WireNode, now: &mut u64, mint: &[u8; 32], always_mint: boo
         if always_mint && !io.needs_key() {
             // THE MUTANT'S PATH: a page that mints whatever the signer said.
             io = PageIo::new(
-                Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+                Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
                 Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME), signer: wire::delegate_from_code(SIGNER_CODE).1 },
             );
             io.provision(wire::delegate_from_code(SIGNER_CODE).0, sk.to_bytes().to_vec());
@@ -1064,6 +1083,60 @@ fn opening(node: &mut WireNode, now: &mut u64, mint: &[u8; 32], always_mint: boo
 fn row_count(io: &mut PageIo, node: &mut WireNode, now: &mut u64, req_id: u64) -> Option<usize> {
     let range = Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: None, max_entries: 100 };
     client(io, node, now, &range).iter().find_map(|x| match x { Reply::Page { req_id: q, entries, .. } if *q == req_id => Some(entries.len()), _ => None })
+}
+
+/// A LOST PUT IS RE-SENT ON THE PAGE'S RTO, whatever clock the page opened at (#386 did not act live).
+///
+/// The browser's clock is `Date.now()`: EPOCH milliseconds. A page opens (`begin`), provisions, reads its head and
+/// writes one row, the node answering each request 1 ms later and the clock moving in 100 ms ticks as a browser
+/// page's does -- no long timer jumps, so the page lives on a few samples, as V's did. The node LOSES the write's
+/// first block PUT: it is re-sent once its siblings' answers have set the RTO, within a second or two, at the
+/// epoch clock as at a small one (THE CONTROL). Measured live (Phase 4 realnet, V's first save): four of five
+/// PUTs answered on their first send, the fifth re-sent 59,999 ms after it went.
+#[test]
+fn a_lost_put_is_re_sent_on_the_rto_when_the_page_opened_at_an_epoch_clock() {
+    for (label, start) in [("small clock (THE CONTROL)", 1_000u64), ("epoch clock (the browser's)", 1_790_253_181_367)] {
+        let key = [31u8; 32];
+        let mut node = WireNode::unprovisioned(&key);
+        let mut now = start;
+        let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+        let mut io = PageIo::new(
+            Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(now)), SignerFacts::default()),
+            Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+        );
+        io.begin(container);
+        // A browser page's life: every frame answered 1 ms later, the clock in 100 ms ticks.
+        let live = |io: &mut PageIo, node: &mut WireNode, now: &mut u64, ms: u64| {
+            let mut replies = pump(io, node, now);
+            for _ in 0..ms / 100 {
+                *now += 100;
+                io.tick(Ms(*now));
+                replies.extend(pump(io, node, now));
+            }
+            replies
+        };
+        live(&mut io, &mut node, &mut now, 1_000);
+        if io.needs_key() {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+            io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+            live(&mut io, &mut node, &mut now, 1_000);
+        }
+        assert!(io.provisioned(), "{label}: THE SETUP: the page did not provision");
+        io.client(&protocol::encode_session_request(4, 9, &Request::Identity).expect("encodes"));
+        live(&mut io, &mut node, &mut now, 1_000);
+        let before = node.block_puts.len();
+        node.lose_block_puts = 1;
+        io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
+        let r = live(&mut io, &mut node, &mut now, 70_000);
+        assert!(states(&r, 1).contains(&WriteState::Published), "{label}: THE SETUP: the write did not publish: {r:?}");
+        let puts = &node.block_puts[before..];
+        let lost = puts.first().expect("THE SETUP: the write PUT no block").1;
+        let sends: Vec<u64> = puts.iter().filter(|(_, id)| *id == lost).map(|(t, _)| *t).collect();
+        let (rto, srtt, _) = io.server.page.clock();
+        println!("  {label}: {} block PUTs; the lost one reached the node {:?} ms after its first send; page clock rto {rto} ms, srtt {srtt:?}", puts.len(), sends.iter().map(|t| t - sends[0]).collect::<Vec<_>>());
+        assert!(sends.len() >= 2, "{label}: THE SETUP: the lost PUT was never re-sent");
+        assert!(sends[1] - sends[0] < 5_000, "{label}: the lost PUT waited {} ms for its re-send (rto {rto} ms, srtt {srtt:?})", sends[1] - sends[0]);
+    }
 }
 
 /// A RELOAD AND A SECOND TAB ARE THE SAME PERSON (the switch-over blocker): a
@@ -1126,7 +1199,7 @@ fn two_pages_told_no_key_both_open_the_one_register_the_signer_took() {
     let page = || {
         let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
         let mut io = PageIo::new(
-            Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+            Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
             Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
         );
         io.begin(container);
@@ -1177,7 +1250,7 @@ fn the_signers_first_request_waits_for_its_registration_to_be_answered() {
     let mut node = WireNode::unprovisioned(&key);
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
     io.begin(container);
@@ -1248,7 +1321,7 @@ fn a_lost_provisioning_answer_is_asked_again() {
     let mut now = 1_000;
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
     io.begin(container);
@@ -1272,7 +1345,7 @@ fn a_signer_silent_for_five_minutes_then_answering_is_never_given_up() {
     node.drop_signer_answers = usize::MAX;
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
     io.begin(container);
@@ -1318,7 +1391,7 @@ fn opening_that_the_signer_refuses_is_refused_in_its_words() {
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let other = ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: wire::register_params(&other.verifying_key().to_bytes(), wire::HEAD_NAME), signer },
     );
     io.provision(container, other.to_bytes().to_vec());
@@ -1337,7 +1410,7 @@ fn opening_is_stalled_while_unanswered_and_not_once_answered() {
     node.drop_signer_answers = 1;
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
     io.tick(Ms(1_000));
@@ -1396,7 +1469,7 @@ fn an_opening_that_ended_is_reported_as_the_reason_there_is_no_subscription() {
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let other = ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: wire::register_params(&other.verifying_key().to_bytes(), wire::HEAD_NAME), signer },
     );
     io.provision(container, other.to_bytes().to_vec());
@@ -1465,7 +1538,7 @@ fn the_live_mode_mapping_says_subscribed_only_when_answered_and_otherwise_why() 
 fn asker() -> PageIo {
     let (_, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
     io.ask();
@@ -1569,7 +1642,7 @@ fn control_opening_registers_the_signer() {
     let mut node = WireNode::new(&[7u8; 32]);
     let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
     let mut io = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page), SignerFacts::default()),
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(0)), SignerFacts::default()),
         Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
     );
     io.begin(container);

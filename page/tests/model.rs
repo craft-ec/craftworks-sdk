@@ -580,10 +580,14 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     let mut s_app = Rng::new(seed, 10);
     let mut s_rec = Rng::new(seed, 11);
     let mut s_hint = Rng::new(seed, 12);
+    // THE CLOCK'S ORIGIN, varied per seed (sdk#397): a browser page's clock is Date.now(), EPOCH ms, and a model
+    // whose pages always started at 0 could not see a request dated against another origin -- the defect that
+    // pinned the RTO at its ceiling live. The model's own `now` counts from 0; every page sees `origin + now`.
+    let origin: u64 = if seed.is_multiple_of(2) { 0 } else { 1_790_253_181_367 };
 
     let mut apps: Vec<App> = (0..2)
         .map(|i| App {
-            page: Page::new(Params::default(), path),
+            page: Page::new_at(Params::default(), path, Ms(origin)),
             client: ClientId(i as u64 + 1),
             next_id: 0,
             inflight: BTreeMap::new(),
@@ -767,12 +771,12 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                 }
             };
             let Some(answer) = answer else { continue };
-            apps[f.page].page.answer(answer, Ms(now));
+            apps[f.page].page.answer(answer, Ms(origin + now));
             check(&mut apps, f.page, &node, &mut seen, now, held, &edges)?;
         }
         now += 5;
         for i in 0..apps.len() {
-            apps[i].page.tick(Ms(now));
+            apps[i].page.tick(Ms(origin + now));
             check(&mut apps, i, &node, &mut seen, now, held, &edges)?;
         }
         let converged = apps.iter().all(|a| Some(a.page.published()) == node.head());
