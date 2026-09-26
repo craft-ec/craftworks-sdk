@@ -311,6 +311,8 @@ pub struct PageIo {
     /// (sdk#343).
     minted: bool,
     /// The signer's registration was answered (its `Ack(Registered)`).
+    /// Whether this page has a signer to ask (`Held` is its read). A reader's page has none (`PageIo::reader`).
+    has_signer: bool,
     signer_registered: bool,
     /// The signer's FIRST request — the Register query (`begin`) or
     /// Provision (`provision`) — and whether it is out. HELD until the
@@ -424,6 +426,7 @@ impl PageIo {
             stream_base: 0,
             needs_key: false,
             minted: false,
+            has_signer: true,
             signer_registered: false,
             first: None,
             signer_container: None,
@@ -461,6 +464,7 @@ impl PageIo {
         io.register_id = register_id;
         io.register_key = wire::contract_id(register_id).to_string();
         io.server.page.set_read_only();
+        io.has_signer = false;
         io.stream_base = u32::from(range.max(1)) << 24;
         io.provisioned = true;
         // "The head exists": a failed read of it is silence, and the signer
@@ -1261,7 +1265,7 @@ impl PageIo {
     /// queued for the client.
     fn pump(&mut self) {
         self.replies.extend(self.server.take_replies());
-        let mut not_held = Vec::new();
+        let mut unasked = Vec::new();
         let mut not_sent = Vec::new();
         let mut no_head = false;
         for op in self.server.take_ops() {
@@ -1271,12 +1275,16 @@ impl PageIo {
                 no_head = true;
                 continue;
             }
+            // NO SIGNER TO ASK (a reader's page, `PageIo::reader`): a `Held` cannot be asked here, and the page is
+            // told exactly that -- never a made-up "not held" (the architect, dashboard step 2).
+            if let (Op::AskHeld { batch, .. }, false) = (&op, self.has_signer) {
+                unasked.push(*batch);
+                continue;
+            }
             if self.read_only() {
                 match op {
-                    Op::AskHeld { batch, ids } => {
-                        not_held.push((batch, ids.len()));
-                        continue;
-                    }
+                    // `Held` is a READ (the node's own store): read-only refuses writes, not it.
+                    Op::AskHeld { .. } => {}
                     // A view's page makes no commit op; one that arrives is
                     // REFUSED BY NAME and handed back as the op's answer --
                     // loud, and ended: nothing waits on a frame never sent.
@@ -1393,11 +1401,11 @@ impl PageIo {
                 Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
             }
         }
-        if !not_held.is_empty() || !not_sent.is_empty() || no_head {
+        if !unasked.is_empty() || !not_sent.is_empty() || no_head {
             // THE PAGE'S clock: page-io keeps no copy of it (one owner; a copy with another origin was sdk#397).
             let now = self.server.page.now();
-            for (batch, n) in not_held {
-                self.server.node(Answer::Held { batch, present: vec![false; n] }, now);
+            for batch in unasked {
+                self.server.node(Answer::HeldUnasked { batch }, now);
             }
             for (op, why) in not_sent {
                 // An app's PUT has its refusal already (`AppPutRefused`); the
@@ -1499,5 +1507,89 @@ mod held_batch {
         assert!(io.inbound(&bytes, Ms(2)), "the signer's Held answer was not taken");
         assert!(io.held.is_empty(), "the answered batch is still mapped");
         assert!(!io.server.page.waiting(), "a block of the answered batch is still owed an ask");
+    }
+}
+
+/// A READER's page has no signer: its `Held` is not asked and not made up (the architect, dashboard step 2) -- the page
+/// is told `HeldUnasked`, and its audit reports the asset UNMEASURED.
+#[cfg(test)]
+mod reader_held {
+    use super::*;
+
+    #[test]
+    fn a_readers_held_is_unasked_never_a_made_up_not_held() {
+        let server = page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Page, Ms(0)), page::server::SignerFacts::default());
+        use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, WrappedState};
+        let register = [3u8; 32];
+        let mut io = PageIo::reader(server, b"reader block code".to_vec(), register, 1);
+        // The node answers the register read with a signed head naming that tree.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
+        // A real tree: another page writes one row; its PUT blocks and the root it asks to sign.
+        let mut w = page::Page::new(engine::Params::default(), page::PutPath::Page);
+        w.write(engine::ClientId(1), engine::WriteId(1), vec![(b"k".to_vec(), engine::Op::Put(vec![7u8; 2_000]))]);
+        let (mut blocks, mut root) = (std::collections::BTreeMap::new(), None);
+        for _ in 0..20 {
+            for op in w.take_ops() {
+                match op {
+                    Op::ReadHead { label: Label::Head } => w.answer(Answer::Head { label: Label::Head, read: None }, Ms(1)),
+                    Op::Put { id, bytes } => {
+                        blocks.insert(id, bytes);
+                        w.answer(Answer::PutOk(id), Ms(1));
+                    }
+                    Op::Sign { root: r, .. } => root = Some(r),
+                    _ => {}
+                }
+            }
+        }
+        let root = root.expect("THE SETUP: the writer asked no sign");
+        let record = contract_keys::register::head_state(&params, &sk.to_bytes(), 1, &root).expect("signs");
+        io.client(&protocol::encode_session_request(4, 9, &protocol::Request::Identity).expect("encodes"));
+        let _ = io.take_frames();
+        let got = HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key: ContractKey::from_id_and_code(ContractInstanceId::new(register), CodeHash::new([0u8; 32])),
+            contract: None,
+            state: WrappedState::new(record),
+        });
+        io.inbound(&bincode::serialize(&Ok::<HostResponse, ClientError>(got)).expect("encodes"), Ms(1));
+        assert_eq!(io.server.page.published(), (1, root), "THE SETUP: the reader did not adopt the head");
+        let _ = io.take_frames();
+        // An audit of that tree: its blocks served as the node serves a GET; any signer request counted.
+        io.server.page.audit();
+        let mut helds = 0;
+        for round in 0..50 {
+            io.pump();
+            for f in io.take_frames() {
+                match bincode::deserialize::<freenet_stdlib::client_api::ClientRequest>(&f) {
+                    Ok(freenet_stdlib::client_api::ClientRequest::DelegateOp(_)) => helds += 1,
+                    Ok(freenet_stdlib::client_api::ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Get { key, .. })) => {
+                        let id = *key.as_bytes().first_chunk::<32>().expect("32");
+                        let cid = self::by_contract_of(&io, &id);
+                        let resp = match cid.and_then(|c| blocks.get(&c).map(|b| (c, b))) {
+                            Some((c, b)) => HostResponse::ContractResponse(ContractResponse::GetResponse {
+                                key: ContractKey::from_id_and_code(key, CodeHash::new([0u8; 32])),
+                                contract: None,
+                                state: WrappedState::new(wire::block::block_state(&c, b).expect("a block")),
+                            }),
+                            None => HostResponse::ContractResponse(ContractResponse::NotFound { instance_id: key }),
+                        };
+                        io.inbound(&bincode::serialize(&Ok::<HostResponse, ClientError>(resp)).expect("encodes"), Ms(2 + round));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let r = io.server.page.take_audit().expect("the pass did not end");
+        println!("reader audit: {helds} signer frame(s), measured {}, groups {}", r.measured, r.groups);
+        assert_eq!(helds, 0, "a reader's page sent a signer request");
+        assert!(!r.measured, "a reader's page reported its asset measured: its Held was made up");
+        assert_eq!((r.whole, r.degraded, r.damaged.len()), (0, 0, 0));
+        assert!(r.groups >= 1, "THE SETUP: the audit found no group to ask about");
+    }
+
+    /// The block a GET's contract id names, as page-io recorded it when framing the GET.
+    fn by_contract_of(io: &PageIo, id: &[u8; 32]) -> Option<Cid> {
+        io.by_contract.get(id).copied()
     }
 }

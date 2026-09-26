@@ -297,6 +297,9 @@ pub enum Answer {
     /// The label's record as read: its seq and whole VALUE ([`HeadRead`]), or
     /// `None` if there is none (a NotFound: the GetFail split).
     Head { label: Label, read: Option<HeadRead> },
+    /// An [`Op::AskHeld`] this page has NO SIGNER to ask (a reader's page): not an answer about any block -- the audit
+    /// reports its asset UNMEASURED, never absent.
+    HeldUnasked { batch: u32 },
     /// The signer's synchronous local read of an [`Op::AskHeld`]'s blocks: `present[i]` answers the op's `ids[i]`
     /// (the signer's own frame, 1:1). A short answer leaves the rest UNKNOWN: asked again, counted, loud in debug.
     Held { batch: u32, present: Vec<bool> },
@@ -1177,6 +1180,19 @@ impl Page {
                     PutPath::Page => self.confirm(id),
                     // An answer is not a confirmation on this path: ask.
                     PutPath::Wrapper => self.ask_held(id),
+                }
+            }
+            // NO SIGNER TO ASK: the audit measures nothing it cannot ask -- UNMEASURED, no GET, nothing absent.
+            Answer::HeldUnasked { batch } => {
+                if self.answered(&Waiting::AuditHeld(batch)).is_some() {
+                    if let Some(a) = self.audit.as_mut() {
+                        a.unmeasured = true;
+                        a.to_hold.clear();
+                        a.to_get.clear();
+                    }
+                } else {
+                    // A commit's ask on a page with no signer: a reader makes no commit, so none is waiting.
+                    self.answered(&Waiting::Held(batch));
                 }
             }
             // THE AUDIT's batch (KEEPER §4): measured only -- no backoff, no re-PUT, nothing confirmed.
