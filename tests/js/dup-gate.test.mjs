@@ -72,6 +72,24 @@ await t("a KNOWN duplicate (in the baseline) passes, even after it MOVES within 
   assert.equal(r3.code, 1, `a third copy passed because its text was known:\n${r3.out}`);
 });
 
+await t("**a baseline entry that is GONE is red (a stale entry would let that clone come back unseen); refreshing the baseline makes it green**", async () => {
+  const root = tree({ "a.rs": fnText("alpha", 3), "b.rs": fnText("alpha", 3) });
+  try {
+    assert.equal(run(root, "--write-baseline").code, 0);
+    // The clone is REMOVED (one copy made distinct), and the baseline is left as it was.
+    writeFileSync(join(root, "src", "b.rs"), fnText("beta", 1).replace(/wrapping_add/g, "saturating_add").replace(/total \/= 3/, "total >>= 2").replace("best = *x", "best = best.max(*x) + 1"));
+    const r = run(root);
+    assert.equal(r.code, 1, `a gone baseline entry passed the gate:\n${r.out}`);
+    assert.match(r.out, /BASELINE ENTRY GONE \(drop it with --write-baseline\): src\/a\.rs:\d+-\d+ == src\/b\.rs:\d+-\d+/, r.out);
+    assert.match(r.out, /0 NEW, 1 gone/, r.out);
+    // THE CONTROL: the baseline refreshed, the same tree is green.
+    assert.equal(run(root, "--write-baseline").code, 0);
+    const r2 = run(root);
+    assert.equal(r2.code, 0, `a refreshed baseline still failed:\n${r2.out}`);
+    assert.match(r2.out, /0 known, 0 NEW, 0 gone/, r2.out);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 await t("**only TRACKED code is scanned: a planted copy left UNTRACKED or in an IGNORED dir (a killed run's leftover) is not reported; the same file tracked is red**", async () => {
   const root = tree({ "a.rs": fnText("alpha", 3) });
   try {

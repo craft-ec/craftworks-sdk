@@ -124,10 +124,12 @@ export function main() {
   for (const [, c] of added) {
     console.log(`NEW DUPLICATE (${c.lines} lines, ${c.format}): ${where(c.firstFile)}  ==  ${where(c.secondFile)}`);
   }
-  for (const e of gone) console.log(`gone from the baseline (drop it with --write-baseline): ${e.a} == ${e.b}`);
+  // A GONE entry FAILS too: left in the baseline it would let that exact clone come back later as "known", unseen.
+  // The PR that removes a clone refreshes the baseline in the same change.
+  for (const e of gone) console.log(`BASELINE ENTRY GONE (drop it with --write-baseline): ${e.a} == ${e.b}`);
   const line = `dup-gate: ${now.size} clone(s) by ${JSCPD} over ${found.total.sources} file(s), ${known.size} known, ${added.length} NEW, ${gone.length} gone`;
   console.log(line);
-  return added.length ? 1 : 0;
+  return added.length || gone.length ? 1 : 0;
 }
 
 // Run as a script, however it was reached: compared as REAL paths, because a

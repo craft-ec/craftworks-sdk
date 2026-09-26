@@ -39,15 +39,9 @@
    "lines": 16
   },
   {
-   "key": "e22c301b465b18ab",
-   "a": "probe/src/lib.rs:499-509",
-   "b": "probe/src/lib.rs:471-481",
-   "lines": 11
-  },
-  {
    "key": "a76c0fc830903317",
-   "a": "probe/src/node.rs:128-135",
-   "b": "probe/src/node.rs:97-104",
+   "a": "probe/src/node.rs:145-152",
+   "b": "probe/src/node.rs:114-121",
    "lines": 8
   },
   {
@@ -64,8 +58,8 @@
   },
   {
    "key": "2b71955a529be7ad",
-   "a": "testkit/src/page_node.rs:566-572",
-   "b": "testkit/src/page_node.rs:507-513",
+   "a": "testkit/src/page_node.rs:567-573",
+   "b": "testkit/src/page_node.rs:508-514",
    "lines": 7
   },
   {
