@@ -546,23 +546,11 @@ impl Audit {
     /// The report, from the two states, as of `now` (the page's clock). `pending` = `Pending` + `Putting` (a repair PUT
     /// has no deadline: it is pending only when the pass was cancelled or replaced).
     pub fn report(&self, now: u64) -> Report {
-        let mut r = Report {
-            root: self.root(),
-            full: self.since().is_none(),
-            measured: true,
-            health: Health::Unmeasured,
-            groups: self.groups().len(),
-            whole: 0,
-            degraded: 0,
-            damaged: Vec::new(),
-            margins: BTreeMap::new(),
-            pending: 0,
-            rejected: Vec::new(),
-            repaired: 0,
-            bytes: 0,
-            started_at: self.started_at(),
-            finished_at: now,
-        };
+        // The unmeasured report's fields, then what was measured.
+        let mut r = Audit::unmeasured(self.root(), self.since(), self.started_at());
+        r.measured = true;
+        r.groups = self.groups().len();
+        r.finished_at = now;
         for g in self.groups() {
             let margin = self.margin(g);
             *r.margins.entry(margin).or_default() += 1;

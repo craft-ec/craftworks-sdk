@@ -9,6 +9,7 @@
 //! 2. that page is closed (a page closed before BACKED_UP: the keeper's case, COMMIT-LIFE §P);
 //! 3. a second page on the same key and node reopens, and runs ONE full pass with the arm's policy;
 //! 4. a second pass, `off` (watch only), measures what the node holds now.
+//!
 //! ARM `always`: the first pass repairs the 7 (`repaired` = 7) and the second finds the group whole (margin m).
 //! ARM `off` (the control): nothing repaired, and the second pass still finds the 7 absent (margin m - 7).
 //!
@@ -19,11 +20,11 @@
 //!
 //! usage: PAGE_PORT=<port> PAGE_TMP=<dir> live-repair <signer.wasm> <block.wasm> <register.wasm>
 use anyhow::{bail, Context, Result};
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
 use page::audit::{Report, Repair};
-use page::server::{Server, SignerFacts};
-use page::{Ms, Page, PutPath};
-use page_io::{Artefacts, PageIo};
+use page::Ms;
+use page_io::PageIo;
+use probe::live::{now_ms, Sock};
 use probe::node::{Mode, Node, TempTree};
 use protocol::{Reply, Request};
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,12 +37,6 @@ const ROWS: usize = 30;
 const MEMBERS: usize = 1;
 const PARITY: usize = 6;
 const WITHHELD: usize = MEMBERS + PARITY;
-
-fn now_ms(t0: Instant) -> u64 {
-    1_000 + t0.elapsed().as_millis() as u64
-}
-
-type Sock = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Frames out, with the WITHHOLDING rule: a whole request (reassembled if chunked) that PUTs a block the rule names
 /// is never sent -- all its frames dropped -- and counted.
@@ -106,24 +101,15 @@ async fn drive(sock: &mut Sock, io: &mut PageIo, out: &mut Out, t0: Instant, bud
         for f in io.take_frames() {
             out.send(sock, f).await?;
         }
-        for r in io.take_replies() {
-            replies.push(protocol::decode_reply(&r).map_err(|d| anyhow::anyhow!("a reply that does not decode: {d:?}"))?);
-        }
+        replies.extend(probe::live::replies(io)?);
         if done(&replies, io) {
             return Ok(replies);
         }
         if start.elapsed() > budget {
             bail!("not within {budget:?}; unusable: {:?}", io.unusable());
         }
-        let wait = io.next_due().map_or(50, |d| d.0.saturating_sub(now_ms(t0)).clamp(1, 50));
-        match tokio::time::timeout(Duration::from_millis(wait), sock.next()).await {
-            Ok(Some(Ok(Message::Binary(b)))) => {
-                io.inbound(&b, Ms(now_ms(t0)));
-            }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(e))) => bail!("the socket: {e}"),
-            Ok(None) => bail!("the node closed the socket"),
-            Err(_) => io.tick(Ms(now_ms(t0))),
+        if let Some(b) = probe::live::next_frame(sock, io, t0).await? {
+            io.inbound(&b, Ms(now_ms(t0)));
         }
     }
 }
@@ -143,17 +129,7 @@ async fn pass(sock: &mut Sock, io: &mut PageIo, out: &mut Out, t0: Instant, poli
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let v = std::process::Command::new("freenet").arg("--version").output().context("freenet --version")?;
-    println!("freenet: {}", String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or_default());
-    let port: u16 = std::env::var("PAGE_PORT").ok().and_then(|p| p.parse().ok()).context("PAGE_PORT=<port> is required; there is no default")?;
-    probe::node::allowed_ports(&[port, port + 1])?;
-    let tmp = std::env::var("PAGE_TMP").context("PAGE_TMP=<dir> is required: the node's three dirs go under it")?;
-    let usage = "usage: live-repair <signer.wasm> <block.wasm> <register.wasm>";
-    let mut a = std::env::args().skip(1);
-    let signer_wasm = std::fs::read(a.next().context(usage)?)?;
-    probe::check(&signer_wasm).map_err(|e| anyhow::anyhow!("the signer is refused by the import gate: {e}"))?;
-    let block_code = std::fs::read(a.next().context(usage)?)?;
-    let register_code = std::fs::read(a.next().context(usage)?)?;
+    let probe::live::Args { port, tmp, signer_wasm, block_code, register_code } = probe::live::args("live-repair")?;
 
     let mut verdict = Ok(());
     for (run, policy) in [Repair::Always, Repair::Off].into_iter().enumerate() {
@@ -229,11 +205,7 @@ async fn arm(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code: &[u
 
     // 3. REOPEN on the same key and node; a fresh page, its signer provisioned already.
     let (mut sock2, _) = tokio_tungstenite::connect_async(ws).await.context("connecting again")?;
-    let (container2, signer2) = wire::delegate_from_code(signer_wasm);
-    let mut io2 = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(now_ms(t0))), SignerFacts::default()),
-        Artefacts { block_code: block_code.to_vec(), register_code: register_code.to_vec(), register_params: wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME), signer: signer2 },
-    );
+    let (container2, mut io2) = probe::live::reopened(&sk, signer_wasm, block_code, register_code, t0);
     io2.provision(container2, sk.to_bytes().to_vec());
     let mut out2 = Out { requests: Default::default(), pending: Vec::new(), withheld: BTreeSet::new(), members_left: 0, parity_left: 0, landed: true, dropped: 0 };
     drive(&mut sock2, &mut io2, &mut out2, t0, Duration::from_secs(60), |_, io| io.provisioned()).await.context("reopen: provisioning")?;
