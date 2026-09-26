@@ -1600,12 +1600,12 @@ impl<B: Blocks> Engine<B> {
     /// (craftworks-sdk#117).
     pub fn new(params: Params, blocks: B) -> Self {
         assert!(
-            params.max_packed_value <= pack::max_body(freenet_prolly::kind::RAW),
+            params.max_packed_value <= pack::max_body(core_types::kind::BlockKind::Raw),
             "max_packed_value ({}) is above what the network accepts for one \
              member of its kind ({}): the pack would be built here and refused \
              THERE, per member, where nothing local says why",
             params.max_packed_value,
-            pack::max_body(freenet_prolly::kind::RAW)
+            pack::max_body(core_types::kind::BlockKind::Raw)
         );
         assert!(
             params.max_packed_value + pack::member_cost(0) + pack::PACK_HEADER <= params.max_pack,
@@ -3751,7 +3751,7 @@ impl<B: Blocks> Engine<B> {
                 used = pack::PACK_HEADER + pack::member_cost(manifest.len());
             }
             used += cost;
-            current.push((pack::member_kind(&b), b));
+            current.push((pack::member_kind(&b).byte(), b));
         }
         // A commit that emitted nothing packable still ships its manifest: the
         // journal entry is the point, not the payload. With packing off the
@@ -4631,7 +4631,7 @@ pub fn short_id(id: &Cid) -> String {
 }
 
 fn kind_raw() -> u8 {
-    freenet_prolly::kind::RAW
+    core_types::kind::BlockKind::Raw.byte()
 }
 
 impl<B: Blocks> Engine<B> {

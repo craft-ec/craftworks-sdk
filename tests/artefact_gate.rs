@@ -319,7 +319,7 @@ fn write_arm_cases() -> Vec<Case> {
     for bytes in pool {
         if used + pack::member_cost(bytes.len()) <= MAX_PACK {
             used += pack::member_cost(bytes.len());
-            full.push((pack::member_kind(&bytes), bytes));
+            full.push((pack::member_kind(&bytes).byte(), bytes));
         }
     }
     let full = pack::build(&full).expect("the full pack builds");

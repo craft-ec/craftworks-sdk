@@ -45,10 +45,10 @@ impl Group {
         i >= self.k
     }
 
-    /// Does `bytes` belong in slot `i` (checked by hash, like every arrival)?
+    /// Does `bytes` belong in slot `i`? Checked by hash like every arrival: [`crate::read::matches_id`], the one check
+    /// (the architect: not a second hash check of its own; engineer2's sweep).
     pub fn fits(&self, i: usize, bytes: &[u8]) -> bool {
-        let kind = if self.is_parity(i) { kind::PARITY } else { self.kind };
-        block_id(kind, bytes) == self.slots[i]
+        crate::read::matches_id(&self.slots[i], bytes)
     }
 
     /// Slot `i`'s block as the code takes it: a member as its length-prefixed

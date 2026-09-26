@@ -42,15 +42,11 @@ pub fn block_contract(code: &[u8], cid: &Cid) -> ContractContainer {
 }
 
 /// The Block contract's STATE for a block: `kind ‖ body`, with the kind
-/// RECOVERED by trying the four — at most four BLAKE3 passes, and exact,
-/// because the id is a hash over the kind byte and only the right one can
-/// match. `None`: the id does not hash these bytes under any kind, and the
-/// contract would refuse it.
+/// RECOVERED by trying every kind in the one list ([`BlockKind::ALL`](core_types::kind::BlockKind::ALL)) — one
+/// BLAKE3 pass each, and exact, because the id is a hash over the kind byte and only the right one can match.
+/// `None`: the id does not hash these bytes under any kind, and the contract would refuse it.
 pub fn block_state(id: &Cid, body: &[u8]) -> Option<Vec<u8>> {
-    use freenet_prolly::kind;
-    // 6 is the Block contract's PACK kind, which freenet-prolly does not
-    // export: packs are a transport the tree itself never holds.
-    for k in [kind::TREE_NODE, kind::RAW, kind::PARITY, 6u8] {
+    for k in core_types::kind::BlockKind::ALL.map(|k| k.byte()) {
         if freenet_prolly::block_id(k, body) == *id {
             let mut v = Vec::with_capacity(1 + body.len());
             v.push(k);
