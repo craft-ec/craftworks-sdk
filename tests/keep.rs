@@ -65,3 +65,21 @@ fn the_warning_counts_the_groups_below_warn_below() {
     assert_eq!(keep::warning(&margins, 0), 1, "only the damaged group is below 0");
     assert_eq!(keep::warning(&margins, 9), 16);
 }
+
+/// **A policy is 0 ..= m, and every one that passes `check` round-trips.** `below N` is stored as 2 + N in one byte, so
+/// an unbounded N (254, 255) would be read back as another policy. Control: m + 1 is refused for both fields, by name.
+#[test]
+fn a_policy_is_bounded_by_m_and_every_checked_one_round_trips() {
+    assert_eq!(keep::M, 8, "m moved: the bound's meaning changed");
+    for n in 0..=keep::M {
+        for repair in [Repair::Off, Repair::Always, Repair::Below(n)] {
+            let k = Keep { repair, warn_below: n, ..Keep::APP_DEFAULT };
+            assert_eq!(k.check(), Ok(()));
+            assert_eq!(keep::decode(&keep::encode(&k)), Some(k), "a checked policy did not round-trip");
+        }
+    }
+    let over = keep::M + 1;
+    assert!(Keep { warn_below: over, ..Keep::APP_DEFAULT }.check().unwrap_err().contains("warn_below"));
+    assert!(Keep { repair: Repair::Below(over), ..Keep::APP_DEFAULT }.check().unwrap_err().contains("repair below"));
+    assert!(Keep { repair: Repair::Below(254), ..Keep::APP_DEFAULT }.check().is_err(), "the lossy encoding is reachable");
+}
