@@ -9,12 +9,6 @@
    "lines": 7
   },
   {
-   "key": "c0910e95c2f5e4ce",
-   "a": "probe/src/bin/live-page-writes.rs:63-69",
-   "b": "probe/src/bin/live-signer.rs:34-49",
-   "lines": 7
-  },
-  {
    "key": "e2a3750844311d55",
    "a": "probe/src/bin/platform-probe.rs:136-155",
    "b": "probe/src/bin/two-connections.rs:58-77",
