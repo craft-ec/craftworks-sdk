@@ -42,6 +42,8 @@ async fn pipe(client: TcpStream, node_port: u16) -> Result<()> {
     Ok(())
 }
 
+// The handshake callback's `Result<Response, ErrorResponse>` is tungstenite's signature, not ours to shrink.
+#[allow(clippy::result_large_err)]
 async fn websocket(client: TcpStream, node_port: u16, conn: u64) -> Result<()> {
     let mut path = String::new();
     let client = tokio_tungstenite::accept_hdr_async(client, |req: &Request, resp: Response| {
