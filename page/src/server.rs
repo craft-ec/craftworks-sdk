@@ -1336,6 +1336,12 @@ impl Server {
                             req_id: req_id.0,
                             blocked_on: [0u8; 32],
                         },
+                        // Only the page's own audit asks for nodes (ClientId::BACKGROUND), and the page takes that
+                        // reply itself; one addressed to a client is a read no client can make: unavailable.
+                        engine::read::ReadResult::Nodes { .. } => protocol::Reply::Unavailable {
+                            req_id: req_id.0,
+                            blocked_on: [0u8; 32],
+                        },
                         engine::read::ReadResult::Delta {
                             changes,
                             cursor,
@@ -1548,6 +1554,7 @@ fn rows_in(r: &engine::read::ReadResult) -> u64 {
         R::Value(v) => v.is_some() as u64,
         R::Page { entries, .. } => entries.len() as u64,
         R::Delta { changes, .. } => changes.len() as u64,
+        R::Nodes { nodes, .. } => nodes.len() as u64,
         R::FullReloadRequired { .. } | R::Unavailable(_) | R::OutOfWarmSpace => 0,
     }
 }
