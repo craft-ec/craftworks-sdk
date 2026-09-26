@@ -4835,6 +4835,18 @@ impl<B: Blocks> Engine<B> {
         out
     }
 
+    /// Would a `PutConfirmed(id)` count for anything NOW (sdk#455)? A block of the pending commit not yet confirmed,
+    /// an earlier commit's straggler a group of it counts on, another member of a changed group not yet held
+    /// (sdk#416), or a published commit's block still owed for BACKED_UP -- read from those records, the ones
+    /// `on_confirmed` reads. The page stops asking `Held` about a block nobody waits on.
+    pub fn awaits_confirmation(&self, id: &Cid) -> bool {
+        self.backing.iter().any(|b| b.remaining.contains(id))
+            || self.pending.as_ref().is_some_and(|c| {
+                (c.data.contains(id) && !c.confirmed.contains(id))
+                    || c.race.groups.iter().any(|g| g.earlier.contains(id) || (g.others.contains(id) && !c.held.contains(id)))
+            })
+    }
+
     /// Does this engine still wait on block `id` -- a parked read, a repair
     /// slot, or a parked write? The page re-asks a NotFound block only while
     /// this is true, so a block nobody needs any more is not asked for ever.
