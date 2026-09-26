@@ -1101,6 +1101,30 @@ impl Session {
         self.db.store().unsaved_writes()
     }
 
+    /// READS WAITING ON A DAMAGED GROUP (sdk#524), as JSON `[{"block", "j", "k", "health", "why"}]`: a block this page
+    /// reads was answered NotFound and its group has `j < k` slots NOT answered NotFound -- the audit's own derivation
+    /// and word (`engine::repair::GroupHealth::Damaged`). A STATE, not an end: the block and its slots are still
+    /// asked, and a later answer still lands (rule 8). This reader's count is OPTIMISTIC (a slot not answered may be
+    /// there); the keeper's audit counts only what it verified. Page-level: no binding's status is changed by it.
+    pub fn damaged(&self) -> String {
+        let damaged = self.page().map(|p| p.server.page.damaged()).unwrap_or_default();
+        let health = engine::repair::GroupHealth::Damaged.code();
+        let out: Vec<serde_json::Value> = damaged
+            .iter()
+            .map(|d| {
+                let block = craftworks_sdk::hex(&d.block);
+                serde_json::json!({
+                    "block": block,
+                    "j": d.j,
+                    "k": d.k,
+                    "health": health,
+                    "why": format!("block {}: its group has {} of {} (damaged as this reader sees it: j counts every slot not answered NotFound)", &block[..16.min(block.len())], d.j, d.k),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(out).to_string()
+    }
+
     pub fn stats(&mut self) -> Result<String, JsValue> {
         // The page's write queue (R-b): every session's writes not yet
         // committed, and their bytes -- what `QUEUE_FULL` is measured on.

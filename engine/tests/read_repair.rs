@@ -395,3 +395,60 @@ fn a_member_this_page_rebuilt_counts_toward_k_once_the_node_says_it_holds_it() {
         assert!(published, "landed={landed}: a write beside a rebuilt leaf never published");
     }
 }
+
+/// DAMAGED IS REACHED IN THE ORDER THE RACE GIVES (the architect on sdk#524): a race asks all `k + m` at once, so the
+/// lost slots' NotFounds land BEFORE the read's own block is answered NotFound -- while the repair is still a RACE.
+/// `absent` records ANSWERS in every state, so the moment the read's own block misses, the group is named DAMAGED
+/// (`Engine::damaged`: `j = k - 1` of its slots not answered NotFound), with no re-ask needed first. With `m` lost it
+/// never is. Mutant "record absent only when missed" -> red (the racing NotFounds are forgotten; j over-counted).
+#[test]
+fn m_plus_one_lost_is_named_damaged_even_when_every_slot_misses_before_the_block_itself() {
+    let records = records();
+    let (root, mut all) = tree(&records);
+    let (members, parity) = a_leaf_group(&mut all, root);
+    let k = members.len();
+    let own = members[0];
+    let key = keys_in(&all, &[own])[0].clone();
+    for (lost_n, want_damaged) in [(PARITY, false), (PARITY + 1, true)] {
+        // `lost_n` of the group lost: the read's own member first, then members, then parity.
+        let lost: BTreeSet<Cid> = members.iter().chain(parity.iter()).take(lost_n).copied().collect();
+        assert!(lost.contains(&own));
+        let (mut e, store) = cold_reader(root, Params::default());
+        let mut queue: Vec<Effect> = e.step(Event::Get { client: ClientId(1), req_id: ReqId(0), key: key.clone() });
+        let mut own_asked = false;
+        let mut steps = 0;
+        // Answer EVERYTHING except the read's own block; that one waits until nothing else is left.
+        while let Some(f) = queue.pop() {
+            steps += 1;
+            assert!(steps < 20_000, "the read did not settle");
+            match f {
+                Effect::FetchBlock { id, .. } if id == own => own_asked = true,
+                Effect::FetchBlock { id, .. } => {
+                    let ev = match all.get(&id).filter(|_| !lost.contains(&id)) {
+                        Some(b) => {
+                            store.put(id, b);
+                            Event::BlockArrived { id, bytes: b.to_vec() }
+                        }
+                        None => Event::BlockMissed(id),
+                    };
+                    queue.extend(e.step(ev));
+                }
+                Effect::Keep { id, bytes } => store.put(id, &bytes),
+                other => common::no_answer_owed(&other),
+            }
+        }
+        assert!(own_asked, "THE SETUP: the read never asked its own block");
+        assert!(e.damaged().is_empty(), "{lost_n} lost: named damaged BEFORE the read's own block was answered");
+        // Now the read's own block misses: the race becomes a repair. Checked in THIS step, before any re-ask lands.
+        let _ = e.step(Event::BlockMissed(own));
+        let damaged = e.damaged();
+        if want_damaged {
+            assert_eq!(damaged.len(), 1, "m + 1 lost, every other slot answered first: not named damaged: {damaged:?}");
+            assert_eq!((damaged[0].block, damaged[0].j, damaged[0].k), (own, k + PARITY - lost_n, k), "the wrong block, or the wrong j of k");
+            assert!(damaged[0].j < k);
+        } else {
+            assert!(damaged.is_empty(), "m lost is recoverable, yet named damaged: {damaged:?}");
+        }
+        println!("  {lost_n} lost of k = {k} + {PARITY}: damaged {damaged:?}");
+    }
+}

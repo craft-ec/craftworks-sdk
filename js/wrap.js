@@ -21,6 +21,7 @@ export function wrap(raw) {
       appPublish: group(said.appPublishStatus),
       canWrite: group(said.canWrite),
       asked: group(said.asked),
+      groupHealth: group(said.groupHealth),
       binding: BINDING,
     });
   };

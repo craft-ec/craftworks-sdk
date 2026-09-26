@@ -65,6 +65,39 @@ impl Group {
     }
 }
 
+/// A GROUP'S MARGIN (sdk#524; one owner with the assets audit, engineer2's #478 port): of its `k` members and its
+/// parity, `present` are there -- margin = present - k. The CALLER says what "present" means, in its own doc: the audit
+/// counts what it VERIFIED (Held, Fetched); a reader counts what is NOT answered NotFound (a silent block may be there).
+pub fn margin(present: usize, k: usize) -> i64 {
+    present as i64 - k as i64
+}
+
+core_types::vocabulary! {
+    /// A group's health from its margin (KEEPER §4): WHOLE (all `k + m` there), DEGRADED (at least `k`: recoverable),
+    /// DAMAGED (below `k`: no decode can rebuild a member). THE one derivation and its words: the audit's DAMAGED and a
+    /// reader's damaged group are this (sdk#524).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum GroupHealth {
+        Whole => "WHOLE",
+        Degraded => "DEGRADED",
+        Damaged => "DAMAGED",
+    }
+}
+
+impl GroupHealth {
+    /// `present` of a group of `k` members + `m` parity.
+    pub fn of(present: usize, k: usize, m: usize) -> GroupHealth {
+        let margin = margin(present, k);
+        if margin >= m as i64 {
+            GroupHealth::Whole
+        } else if margin >= 0 {
+            GroupHealth::Degraded
+        } else {
+            GroupHealth::Damaged
+        }
+    }
+}
+
 /// The root's group of ONE (sdk#335): `k = 1`, the root then its parity, coded
 /// like a branch's child (a node, `TREE_NODE`). [`root_parity`] makes the
 /// blocks; this is what a read rebuilds the root from.

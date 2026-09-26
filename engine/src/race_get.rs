@@ -64,6 +64,7 @@ impl<B: Blocks> Engine<B> {
             return Vec::new();
         }
         r.missed = true;
+        r.absent.insert(r.group.missing_ix);
         let slots: Vec<(usize, Cid)> = std::mem::take(&mut r.dropped).into_iter().map(|i| (i, r.group.slots[i])).collect();
         for (i, _) in &slots {
             r.asked.insert(*i, 0);

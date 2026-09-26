@@ -7,3 +7,4 @@
 pub mod hex;
 pub mod kind;
 pub mod name;
+pub mod vocabulary;

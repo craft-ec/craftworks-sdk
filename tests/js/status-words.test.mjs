@@ -13,7 +13,7 @@ const sdk = wrap(raw);
 const said = JSON.parse(raw.status_words());
 
 // ---- every group is its owner's list, keyed by the word upper-cased ----------
-const groups = { row: "rowState", put: "putStatus", site: "siteStatus", appPublish: "appPublishStatus", canWrite: "canWrite", asked: "asked" };
+const groups = { row: "rowState", put: "putStatus", site: "siteStatus", appPublish: "appPublishStatus", canWrite: "canWrite", asked: "asked", groupHealth: "groupHealth" };
 assert.deepStrictEqual(Object.keys(sdk.status).sort(), [...Object.keys(groups), "binding"].sort(), "sdk.status has exactly these groups");
 for (const [group, name] of Object.entries(groups)) {
   assert.deepStrictEqual(Object.values(sdk.status[group]), said[name], `status.${group} is the Rust ${name} list`);

@@ -4,35 +4,7 @@
 
 use crate::store::RowState;
 
-/// ONE LIST PER VOCABULARY, BY CONSTRUCTION (the architect on #523): the enum, its `code()` and its `ALL` are all
-/// declared from ONE `Variant => "word"` list, so a variant cannot be left out of `ALL` (or `from_code`) -- there is
-/// no second list to forget. Attributes (docs, `#[default]`, derives) pass through.
-macro_rules! vocabulary {
-    ($(#[$m:meta])* $vis:vis enum $name:ident { $($(#[$vm:meta])* $v:ident => $code:literal),+ $(,)? }) => {
-        $(#[$m])*
-        $vis enum $name {
-            $($(#[$vm])* $v),+
-        }
-
-        impl $name {
-            /// Every word, in declaration order: the same token list as the enum.
-            pub const ALL: [$name; [$(stringify!($v)),+].len()] = [$($name::$v),+];
-
-            /// The stable code that crosses the boundary.
-            pub fn code(self) -> &'static str {
-                match self {
-                    $($name::$v => $code),+
-                }
-            }
-
-            /// The word a code names; `None` for a code this build does not know.
-            pub fn from_code(code: &str) -> Option<$name> {
-                $name::ALL.into_iter().find(|w| w.code() == code)
-            }
-        }
-    };
-}
-pub(crate) use vocabulary;
+use core_types::vocabulary;
 
 vocabulary! {
     /// Where an app's contract PUT stands (`Session::put_status`'s `state`).
@@ -98,8 +70,8 @@ vocabulary! {
     }
 }
 
-/// Every list, as the JSON `status_words` exports: `{"rowState":[..], "putStatus":[..], "siteStatus":[..], "appPublishStatus":[..],
-/// "canWrite":[..], "asked":[..]}`.
+/// Every list, as the JSON `status_words` exports: `{"rowState":[..], "putStatus":[..], "siteStatus":[..],
+/// "appPublishStatus":[..], "canWrite":[..], "asked":[..], "groupHealth":[..]}` (the last the engine's, sdk#524).
 pub fn words() -> serde_json::Value {
     fn list<T: Copy>(all: &[T], code: fn(T) -> &'static str) -> Vec<&'static str> {
         all.iter().map(|w| code(*w)).collect()
@@ -111,6 +83,7 @@ pub fn words() -> serde_json::Value {
         "appPublishStatus": list(&AppPublishStatus::ALL, AppPublishStatus::code),
         "canWrite": list(&CanWrite::ALL, CanWrite::code),
         "asked": list(&AskedState::ALL, AskedState::code),
+        "groupHealth": list(&engine::repair::GroupHealth::ALL, engine::repair::GroupHealth::code),
     })
 }
 
@@ -130,6 +103,7 @@ mod tests {
             ("appPublishStatus", AppPublishStatus::ALL.iter().map(|w| w.code()).collect()),
             ("canWrite", CanWrite::ALL.iter().map(|w| w.code()).collect()),
             ("asked", AskedState::ALL.iter().map(|w| w.code()).collect()),
+            ("groupHealth", engine::repair::GroupHealth::ALL.iter().map(|w| w.code()).collect()),
         ];
         assert_eq!(v.as_object().map(|o| o.len()), Some(want.len()), "words() carries a list no enum owns: {v}");
         for (name, list) in want {
@@ -154,6 +128,7 @@ mod tests {
         round(&SiteStatus::ALL, SiteStatus::code, SiteStatus::from_code);
         round(&CanWrite::ALL, CanWrite::code, CanWrite::from_code);
         round(&AskedState::ALL, AskedState::code, AskedState::from_code);
+        round(&engine::repair::GroupHealth::ALL, engine::repair::GroupHealth::code, engine::repair::GroupHealth::from_code);
     }
 
     /// Lost is the rolled-back state, and nothing else.
