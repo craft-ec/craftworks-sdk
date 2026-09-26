@@ -5,7 +5,7 @@
 // it has not answered is reported. Measured on the notes site: a read straight
 // after an open() that returned early failed as UNAVAILABLE every time.
 import assert from "node:assert/strict";
-import { open, untilProvisioned } from "../../js/session.js";
+import { open, reopen, untilProvisioned } from "../../js/session.js";
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -15,7 +15,7 @@ const t = async (name, fn) => {
 const tick = (r, ms) => setTimeout(r, 0);
 
 /** A session that is provisioned after `after` polls, or refuses, or never is. */
-function FakeSession({ after = 3, refuse = "" } = {}) {
+function FakeSession({ after = 3, refuse = "", follows = [], followRefuses = "" } = {}) {
   let polls = 0;
   return function () {
     return {
@@ -25,6 +25,12 @@ function FakeSession({ after = 3, refuse = "" } = {}) {
       provisioned: () => (polls += 1) > after && !refuse, refused: () => refuse,
       not_answering: () => JSON.stringify({ what: "the signer", ms: polls * 100 }),
       polls: () => polls,
+      // sdk#520: the follow, recorded with how many provisioning polls had passed when it was asked.
+      follow_site: (app, code) => {
+        if (followRefuses) throw new Error(followRefuses);
+        follows.push({ app, code: [...code], atPoll: polls });
+        return "the-site-link";
+      },
     };
   };
 }
@@ -116,6 +122,31 @@ await t("THE CONTROL: provision: false does not wait — nothing is being set up
   const S = FakeSession({ after: 1e9 });
   const h = await open(S, deps({ provision: false }));
   assert.equal(h.session.polls(), 0, "open() waited on provisioning it was told not to do");
+});
+
+// ---- REOPEN (sdk#520): open() -- the one wait -- then the site FOLLOWED, publishing nothing ----------------------
+
+const SITE_CODE = new Uint8Array([5, 6, 7]);
+
+await t("**reopen() follows the app's site ONCE, only after open() says provisioned**, and hands back the session", async () => {
+  const follows = [];
+  const h = await reopen(FakeSession({ after: 3, follows }), deps({ siteCode: SITE_CODE }));
+  assert.deepEqual(follows.map(f => [f.app, f.code]), [["test-app", [5, 6, 7]]], "not exactly one follow of this app's site under its code");
+  assert.ok(follows[0].atPoll > 3, `the follow was asked at poll ${follows[0].atPoll}, before the node was provisioned`);
+  assert.ok(h.db && h.session, "reopen did not hand back the opened session");
+});
+
+await t("**reopen() with no siteCode is refused BY NAME before anything opens**", async () => {
+  deps.closed = 0;
+  let connected = 0;
+  await assert.rejects(() => reopen(FakeSession(), deps({ connect: () => { connected += 1; return { pump() {}, close() {} }; } })), /needs \{ siteCode \}/);
+  assert.equal(connected, 0, "reopen() connected before refusing a missing siteCode");
+});
+
+await t("**a refused follow CLOSES the session and is thrown in its words** (never a half-open reopen)", async () => {
+  deps.closed = 0;
+  await assert.rejects(() => reopen(FakeSession({ after: 0, followRefuses: "no site for \"x\": not an app id" }), deps({ siteCode: SITE_CODE })), /not an app id/);
+  assert.equal(deps.closed, 1, "the session of a refused follow was left open");
 });
 
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }

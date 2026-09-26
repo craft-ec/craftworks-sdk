@@ -2493,6 +2493,38 @@ fn a_site_publishes_each_version_at_one_address() {
     assert_eq!(publish(&mut other, &mut node, &mut now, 3), Some(page::Publication::Published { version: 3 }));
 }
 
+/// **A REOPEN FOLLOWS THE SITE AND SENDS NOTHING BUT READS (sdk#520, PUBLISH-LIFE P7; the architect's widened
+/// check).** `follow_site` returns at once, while the site's read is still unanswered, and says `Reading`; the node's
+/// answer moves it to `Published` at the version the node holds. Counted from what the NODE served, after the page
+/// was open and idle: a follow adds GETs (the site's, and the head's own) and NOTHING else -- no PUT, no UPDATE, no
+/// signer message, no delegate registration. THE CONTROL: a publish from the same page adds a site PUT and signer
+/// messages, so the counters can see one.
+#[test]
+fn a_reopen_follows_the_site_and_sends_nothing_but_reads() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut now = 1_000;
+    let mut first = page_io(&node);
+    for v in 1..=2u8 {
+        publish(&mut first, &mut node, &mut now, v);
+    }
+    let mut io = page_io(&node);
+    client(&mut io, &mut node, &mut now, &Request::Identity);
+    settle(&mut io, &mut node, &mut now);
+    let before = node.served.clone();
+    let link = io.follow_site(APP, SITE_CODE, Ms(now)).expect("follows");
+    assert_eq!(page_io::site_id_of_address(&link), Ok(node.site_id()), "the link is not the site's");
+    assert_eq!(io.publication(APP), Some(page::Publication::Reading), "a reopen is not `reading` while its read is unanswered");
+    settle(&mut io, &mut node, &mut now);
+    assert_eq!(io.publication(APP), Some(page::Publication::Published { version: 2 }), "the follow did not show the node's version");
+    let grew: Vec<(&str, usize)> = node.served.iter().filter(|(k, n)| before.get(*k) != Some(n)).map(|(k, n)| (*k, n - before.get(k).copied().unwrap_or(0))).collect();
+    assert!(grew.iter().any(|(k, _)| *k == "get site"), "THE SETUP: the site was never read: {grew:?}");
+    assert!(grew.iter().all(|(k, _)| matches!(*k, "get site" | "get register")), "P7: a reopen sent more than reads: {grew:?}");
+    // THE CONTROL: a publish from this page is seen by the same counters.
+    let before = node.served.clone();
+    assert_eq!(publish(&mut io, &mut node, &mut now, 3), Some(page::Publication::Published { version: 3 }));
+    assert!(node.served.get("put site") > before.get("put site") && node.served.get("signer") > before.get("signer"), "THE CONTROL: a publish was not counted: {:?}", node.served);
+}
+
 /// **A REFUSED site read is silence, never "no site"** (the GetFail split): a new device whose node does not hold
 /// the site yet has its read refused once; the re-ask reads v2 and it publishes v3. Mutant "a refused site read is
 /// NotFound" -> it signs v1 from the genesis, the merge keeps v2 -> Superseded -> red.

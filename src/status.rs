@@ -51,6 +51,8 @@ vocabulary! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum SiteStatus {
         None => "none",
+        /// A reopen is reading the site (sdk#520): nothing is known yet, and a NotFound is read again.
+        Reading => "reading",
         Publishing => "publishing",
         Published => "published",
         Superseded => "superseded",
