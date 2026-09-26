@@ -192,6 +192,33 @@ if [ "$MODE" = controls ]; then
   echo "${GREEN}gate: controls ok (${#CONTROLS[@]})${OFF}"; exit 0
 fi
 
+# Members that legitimately have NO host tests, and why. Not a list of
+# exceptions to tidy up later: each line is a claim a reviewer can check.
+no_host_tests() {
+  case "$1" in
+    # A `cdylib` for wasm32, loaded into a node. There is no host binary to
+    # test; what it answers is answered by RUNNING it, which `probe` does.
+    probe-delegate) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A member's directory relative to the workspace root ("." for the root package), from the cargo metadata file $1.
+member_dir() {
+  node -e 'const [f, m] = process.argv.slice(1); const md = JSON.parse(require("fs").readFileSync(f, "utf8"));
+    const p = md.packages.find(p => p.name === m); if (!p) process.exit(1);
+    const d = require("path").relative(md.workspace_root, require("path").dirname(p.manifest_path)); console.log(d || ".")' "$1" "$2"
+}
+# TESTS THAT NEVER RAN (sdk#475, tools/test-targets.mjs): a member's count is the sum of its targets, so a target that
+# compiles to nothing natively (`web` is wasm32-only: a #[cfg(test)] module in its src/ ran 0 tests, green) hid behind
+# the member's other targets. Fails, by name, any target whose source declares a #[test] and which ran 0 tests.
+silent_targets() {
+  local m=$1 dir=$2 out=$3 s
+  if ! s=$(printf '%s\n' "$out" | node tools/test-targets.mjs silent "$dir"); then
+    step_fail "$m: a test target ran 0 tests though its source declares tests (sdk#475)"; printf '  %s\n' "$s" >&2
+  fi
+}
+
 # -------------------------------------------------------------- --pr ----
 # THE ONE COMMAND EVERY PR RUNS. The full gate (every member, --accept) is the BATCH gate, run once on the batch
 # integration. A PR runs: every structural control; the members its files belong to PLUS their reverse dependents
@@ -261,6 +288,24 @@ if [ "$MODE" = pr ]; then
       done
       if drop_ok "$m"; then l=$(node tools/pr-scope.mjs count "$m" "$b" "$n" --drop-ok); else l=$(node tools/pr-scope.mjs count "$m" "$b" "$n") || fail "$m: count DROPPED"; fi
       echo "$l"; lines+=("$l")
+      [ "$n" -eq 0 ] && ! no_host_tests "$m" && step_fail "$m ran NO tests and is not in no_host_tests() (sdk#475)"
+      mdir=$(member_dir "$meta" "$m")
+      silent_targets "$m" "$mdir" "$out"
+      # Every test the PR ADDS in this member ran (sdk#475): also catches a test behind a cfg inside a target that runs
+      # others. The diff is the branch's commits, what is not committed yet, and new untracked files.
+      if [ "$mdir" = . ]; then paths=(src tests examples benches build.rs ':(exclude)tests/js'); else paths=("$mdir"); fi
+      # A batch-only target is not run here (the batch gate runs it), so the tests it gains are not asked for here.
+      for t in $skip; do paths+=(":(exclude)$mdir/tests/$t.rs" ":(exclude)$mdir/tests/$t"); done
+      mb=$(git merge-base "$base" HEAD)
+      outf=$(mktemp); printf '%s\n' "$out" > "$outf"
+      if ! u=$({ git diff "$mb" -- "${paths[@]}"
+                 git ls-files --others --exclude-standard -- "${paths[@]}" | while read -r f; do git diff --no-index /dev/null "$f"; done
+               } | node tools/test-targets.mjs unran "$outf"); then
+        step_fail "$m: a test this PR adds never ran (sdk#475)"; printf '  %s\n' "$u" >&2
+      else
+        echo "$m: $u"
+      fi
+      rm -f "$outf"
     done
     step "cargo clippy on the PR's members"
     pargs=(); for m in $scope; do pargs+=(-p "$m"); done
@@ -310,16 +355,6 @@ if [ -n "${GATE_ONLY_MEMBERS:-}" ]; then
   echo "${RED}gate: GATE_ONLY_MEMBERS=$GATE_ONLY_MEMBERS: NOT a batch run — only these members are tested${OFF}"
 fi
 
-# Members that legitimately have NO host tests, and why. Not a list of
-# exceptions to tidy up later: each line is a claim a reviewer can check.
-no_host_tests() {
-  case "$1" in
-    # A `cdylib` for wasm32, loaded into a node. There is no host binary to
-    # test; what it answers is answered by RUNNING it, which `probe` does.
-    probe-delegate) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
 # ------------------------------------------------------------- tests ----
 # THE MODEL'S SEEDS (page/tests/model.rs, CRAFTWORKS_MODEL_SEEDS): the batch gate runs the full count, stated.
@@ -353,8 +388,10 @@ for m in $MEMBERS; do
     # (its exit is the member's status, already in rc)
     printf '%s\n' "$out" | ./tools/gate-member-tests.sh --keep "$m" "$failures_dir" "$rc" || true
   else
-    n=$(./tools/gate-member-tests.sh "$m" "$failures_dir")
+    outf=$(mktemp)
+    n=$(./tools/gate-member-tests.sh "$m" "$failures_dir" "$outf")
     rc=$?
+    out=$(cat "$outf"); rm -f "$outf"
   fi
   if [ $rc -ne 0 ]; then
     step_fail "cargo test -p $m FAILED"
@@ -363,6 +400,7 @@ for m in $MEMBERS; do
     step_fail "$m has NO tests and no reason recorded — add tests, or add it to \
 no_host_tests() WITH its reason. An uncovered member is what this gate is for."
   fi
+  silent_targets "$m" "$(member_dir "$FULL_META" "$m")" "$out"
   NAMES+=("$m"); COUNTS+=("$n")
   total=$((total + n))
   # A batch-only target's OWN count, recorded beside its member's, so `--pr` (which skips it) compares like with like.
