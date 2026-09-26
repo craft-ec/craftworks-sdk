@@ -958,7 +958,7 @@ impl Page {
         // A WITHDRAWN Background op whose deadline came due: its slot frees; nothing is re-sent or recorded.
         let (expired, late): (Vec<Waiting>, Vec<Waiting>) = late.into_iter().partition(|w| self.deadlines.get(w).is_some_and(|d| d.withdrawn));
         for w in expired {
-            self.deadlines.remove(&w);
+            self.end(&w, End::TimedOut);
         }
         // A GET ON THE WIRE whose node GET is not over is SILENT, not lost (sdk#447): nothing is sent, the RTO does not
         // back off, the window does not halve -- the loopback lost nothing and the node is still fetching. Its deadline
@@ -2168,14 +2168,10 @@ impl Page {
     fn end(&mut self, w: &Waiting, how: End) -> Option<Deadline> {
         // A queued Background op that ends never goes out.
         self.bg_queue.retain(|(q, _)| q != w);
-        // An op already WITHDRAWN said its end then: its entry leaves now, recording nothing.
-        if self.deadlines.get(w).is_some_and(|d| d.withdrawn) {
-            return self.deadlines.remove(w);
-        }
         // A BACKGROUND op withdrawn ON THE WIRE keeps the lane's slot: the node still holds it (the architect). It stays
         // in its ONE record, marked withdrawn, until its answer or its deadline; its end is recorded ONCE, here.
         if how == End::Withdrawn {
-            if let Some(d) = self.deadlines.get_mut(w).filter(|d| d.sent && d.lane == Lane::Background) {
+            if let Some(d) = self.deadlines.get_mut(w).filter(|d| d.sent && d.lane == Lane::Background && !d.withdrawn) {
                 d.withdrawn = true;
                 let d = d.clone();
                 self.record_end(w, &d, how);
@@ -2183,7 +2179,10 @@ impl Page {
             }
         }
         let d = self.deadlines.remove(w)?;
-        self.record_end(w, &d, how);
+        // An op already WITHDRAWN said its end then: its entry leaves now (its answer, or its deadline), recording nothing.
+        if !d.withdrawn {
+            self.record_end(w, &d, how);
+        }
         Some(d)
     }
 
@@ -2341,7 +2340,7 @@ impl Page {
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
         // The answer to a WITHDRAWN Background op: nobody waits on it -- dropped; its slot frees for the next.
         if self.deadlines.get(w).is_some_and(|d| d.withdrawn) {
-            self.deadlines.remove(w);
+            self.end(w, End::Answered);
             self.pump_background();
             return None;
         }
