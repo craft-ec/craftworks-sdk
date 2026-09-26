@@ -1062,7 +1062,7 @@ impl PageIo {
             // the page reads the register and adopts only what it shows -- Published, or Lost to a writer that won),
             // never by the PUT's answer. A refusal, validation words included (a stale seq another writer beat), is
             // reported, and the op stays waiting -- re-sent on its RTO (sdk#431's pin) -- until the read-back decides.
-            Incoming::PutFailed { key, said } if key == self.register_key => self.unusable.push(format!("the node refused: {said}")),
+            Incoming::PutFailed { key, said } if key == self.register_key => self.say(page::unusable::Site::of("page-io::said::register-put-refused"), format!("the node refused: {said}")),
             answer @ Incoming::PutFailed { .. } => self.others.push(answer),
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
@@ -1197,19 +1197,19 @@ impl PageIo {
         let fin = wire::is_validation_refusal(&said);
         match (whose, fin) {
             (Refused::Block(cid), true) => {
-                self.unusable.push(format!(
+                self.say(page::unusable::Site::of("page-io::said::block-invalid"), format!(
                     "the node's Block contract refused block {} as invalid (\"{said}\"): an encoding defect, or a node on another contract epoch",
                     engine::short_id(&cid)
                 ));
                 self.server.node(Answer::PutRefused { id: cid, transient: false }, now)
             }
-            (Refused::Block(cid), false) => self.unusable.push(format!("the node refused block {}: {said}", engine::short_id(&cid))),
+            (Refused::Block(cid), false) => self.say(page::unusable::Site::of("page-io::said::block-refused"), format!("the node refused block {}: {said}", engine::short_id(&cid))),
             (Refused::App(key), true) => self.server.node(Answer::AppPutRefused { key, said }, now),
-            (Refused::App(key), false) => self.unusable.push(format!("the node refused app contract {key} (not final; re-sent): {said}")),
+            (Refused::App(key), false) => self.say(page::unusable::Site::of("page-io::said::app-put-refused"), format!("the node refused app contract {key} (not final; re-sent): {said}")),
             // A site's FINAL refusal ends its publication (the page's consequence, `Publication::Refused`); a transient
             // one is reported, and the site's PUT is re-sent on its RTO.
             (Refused::Site(app), true) => self.server.node(Answer::SiteRefused { app, said }, now),
-            (Refused::Site(app), false) => self.unusable.push(format!("the node refused site {app}'s PUT (not final; re-sent): {said}")),
+            (Refused::Site(app), false) => self.say(page::unusable::Site::of("page-io::said::site-put-refused"), format!("the node refused site {app}'s PUT (not final; re-sent): {said}")),
         }
     }
 
