@@ -44,7 +44,8 @@ export function targetsRun(out) {
 
 /** The source a target's tests live in: the lib (or `src/main.rs`) is the member's src/ WITHOUT src/bin/, whose
  * files are each their own bin target; any other target (`src/bin/x.rs`, `tests/x.rs`) is that file plus the
- * directory of the same name (its modules). */
+ * directory of the same name (its modules). No member has src/main.rs yet: when one has BOTH lib.rs and main.rs, the
+ * main bin must own only main.rs and what it declares with `mod`, not the lib's files (or a lib test is blamed on it). */
 function sourcesOf(memberDir, src) {
   if (src === "src/lib.rs" || src === "src/main.rs") return rustFiles(join(memberDir, "src"), [join(memberDir, "src", "bin")]);
   const file = join(memberDir, src);
