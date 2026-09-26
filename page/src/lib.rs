@@ -5114,3 +5114,71 @@ mod background_lane {
         assert_eq!(p.deadlines[&get(7).0].lane, Lane::Interactive, "a promoted op was demoted back");
     }
 }
+
+#[cfg(test)]
+mod head_refused_order {
+    //! PUBLISH-LIFE ⁵ with sdk#502: a refused head's `fail_commit` WITHDRAWS the dead commit's unconfirmed blocks (its
+    //! held-back parity), and the writes behind it re-derive a new commit IN THE SAME STEP -- one that, over the same
+    //! content, PUTs the SAME content-addressed blocks. The step's effects are `[Withdraw b, …, PutBlock b]`, applied IN
+    //! ORDER: the withdraw ends the dead commit's claim, and the new PUT stands.
+    use super::*;
+
+    fn kv() -> Vec<(Vec<u8>, WriteOp)> {
+        vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]
+    }
+
+    /// Is `id` still on its way: held back for its commit, or a PUT on the wire?
+    fn owed(p: &Page, id: &Cid) -> bool {
+        p.held.iter().any(|(_, f)| matches!(f, Effect::PutBlock { id: x, .. } if x == id)) || p.deadlines.contains_key(&Waiting::Put(*id))
+    }
+
+    /// **A refused head's withdraw does not eat the re-derived commit's PUT of the same block.** Write 1 is at its Sign
+    /// with its held-back parity unconfirmed; write 2 (the same content) waits behind it. The signer refuses write 1's
+    /// head, finally: write 1 is Failed, write 2 goes again on the published root -- the same blocks -- and every block
+    /// the dead commit had held back is on its way again. Mutant "Withdraw applied after the step's other effects"
+    /// (or de-duplicated against the PutBlock) -> the re-derived commit's PUT is dropped -> red.
+    #[test]
+    fn a_refused_heads_withdraw_does_not_eat_the_next_commits_put_of_the_same_block() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.write(ClientId(1), WriteId(1), kv());
+        let mut sign = None;
+        // ONE first-wave PUT left unanswered (the last of the first batch with two or more): the group still has k acked
+        // (race put, rule 10), so the head is signed with that block unconfirmed -- what the refusal withdraws.
+        let mut unanswered: Option<Cid> = None;
+        for _ in 0..20 {
+            let ops = p.take_ops();
+            if unanswered.is_none() && ops.iter().filter(|o| matches!(o, Op::Put { .. })).count() >= 2 {
+                unanswered = ops.iter().rev().find_map(|o| match o {
+                    Op::Put { id, .. } => Some(*id),
+                    _ => None,
+                });
+            }
+            for op in ops {
+                match op {
+                    Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: None }, Ms(10)),
+                    Op::Put { id, .. } if Some(id) == unanswered => {}
+                    Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(10)),
+                    Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(10)),
+                    Op::Sign { id, .. } => sign = Some(id),
+                    other => panic!("unexpected before the sign: {other:?}"),
+                }
+            }
+            if sign.is_some() {
+                break;
+            }
+        }
+        let id = sign.expect("THE SETUP: the page never asked the signer");
+        p.write(ClientId(1), WriteId(2), kv());
+        let _ = p.take_ops();
+        let _ = p.take_notices();
+        let held_back: BTreeSet<Cid> = unanswered.into_iter().collect();
+        assert!(held_back.iter().all(|id| !p.confirmed.contains(id) && p.deadlines.contains_key(&Waiting::Put(*id))) && !held_back.is_empty(), "THE SETUP: no first-wave PUT is unconfirmed on the wire at the sign (nothing for the withdraw to name)");
+        p.answer(Answer::Signer { id, answer: signer_proto::Answer::Refused(signer_proto::Why::CannotSign) }, Ms(11));
+        let told: Vec<(WriteId, State)> = p.take_notices().into_iter().map(|(_, w, s)| (w, s)).collect();
+        assert!(told.contains(&(WriteId(1), State::Failed)), "THE SETUP: write 1 was not Failed by the refusal: {told:?}");
+        assert!(!told.contains(&(WriteId(2), State::Failed)), "write 2 was failed with the refused commit: {told:?}");
+        assert!(p.engine.has_writes_in_flight(), "THE SETUP: write 2 did not go again");
+        let lost: Vec<String> = held_back.iter().filter(|id| !owed(&p, id)).map(engine::short_id).collect();
+        assert!(lost.is_empty(), "the withdraw ate the re-derived commit's PUT of {} of {} shared blocks: {lost:?}", lost.len(), held_back.len());
+    }
+}
