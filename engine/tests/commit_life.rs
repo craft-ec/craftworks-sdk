@@ -486,7 +486,6 @@ fn the_engine_follows_the_commit_table() {
 /// **A6, Racing × E12:** a Racing commit whose PUTs are never answered is NEVER ended by time (rule 8, C5): no try
 /// spent, no `Lost`, the same commit in flight; when the acks come, it publishes.
 #[test]
-#[should_panic(expected = "ended on time")] // PINNED: known defect A6, flipped by #510
 fn a6_a_silent_racing_commit_is_never_ended_on_time() {
     let mut h = harness(Params::default());
     let first = h.step(write(1));
