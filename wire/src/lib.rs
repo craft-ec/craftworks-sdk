@@ -189,6 +189,15 @@ pub enum Incoming {
     /// "the delegate registered" from "the contract went in" while doing both
     /// in one session.
     Ack(AckKind),
+    /// A delegate request answered "no such delegate on this node", NAMING the delegate (freenet 0.2.137+, #5729:
+    /// `DelegateError::Missing(key)`; 0.2.136 answered EMPTY). `key` is the delegate key as [`AckKind::Registered`]
+    /// names one. What it means is the caller's: to a page only ASKING whose node this is, the answer; to a page
+    /// that registered the signer itself, not an answer yet (sdk#439).
+    DelegateMissing { key: String },
+    /// A delegate request the node would not run yet: its per-connection BACKOFF after a failure (freenet 0.2.137+,
+    /// `DelegateError::ExecutionError("delegate … is rate limited after repeated failures; retry in … ms")`). Not
+    /// an answer to anything: the request is re-sent on the page's clock. `said`: the node's words.
+    DelegateThrottled { said: String },
     /// The node refused. The reason is the NODE's word; see [`Refused`].
     Refused(Refused),
     /// Not something this build can use. Counted, never silently dropped.
@@ -493,6 +502,14 @@ fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
             let (key, said) = put_refused(bytes).expect("just checked");
             Err(Incoming::PutFailed { key, said })
         }
+        // "No such delegate here", naming it (0.2.137+): which delegate request it answers.
+        Err(Unusable::NodeSaidNo) if delegate_missing(bytes).is_some() => {
+            Err(Incoming::DelegateMissing { key: delegate_missing(bytes).expect("just checked") })
+        }
+        // The node's delegate backoff (0.2.137+): not an answer, re-sent on the clock.
+        Err(Unusable::NodeSaidNo) if delegate_throttled(bytes).is_some() => {
+            Err(Incoming::DelegateThrottled { said: delegate_throttled(bytes).expect("just checked") })
+        }
         // A node's own error reply is a MESSAGE, not a failure to read one.
         Err(Unusable::NodeSaidNo) => Err(Incoming::Refused(Refused {
             said: "the node refused the request".into(),
@@ -632,6 +649,39 @@ fn get_refused(bytes: &[u8]) -> Option<([u8; 32], String)> {
 
 /// The contract (named as [`AckKind::Put`] names it) and the node's cause, if
 /// the bytes are a PUT refusal.
+/// The node's delegate error, if the bytes are one.
+fn delegate_error(bytes: &[u8]) -> Option<freenet_stdlib::client_api::DelegateError> {
+    use freenet_stdlib::client_api::{ClientError, ErrorKind, RequestError};
+    let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
+        return None;
+    };
+    match e.kind() {
+        ErrorKind::RequestError(RequestError::DelegateError(d)) => Some(d.clone()),
+        _ => None,
+    }
+}
+
+/// The delegate a node's "missing delegate" names, as `DelegateKey`'s Display (the form `AckKind::Registered` uses).
+fn delegate_missing(bytes: &[u8]) -> Option<String> {
+    match delegate_error(bytes)? {
+        freenet_stdlib::client_api::DelegateError::Missing(key) => Some(key.to_string()),
+        _ => None,
+    }
+}
+
+/// THE NODE'S DELEGATE BACKOFF, by its words: freenet-core 0.2.138
+/// crates/core/src/client_events/websocket.rs:1970 sends `ExecutionError("delegate {key} is rate limited after
+/// repeated failures; retry in {ms} ms")` -- an ExecutionError carries no key, so the words are all there is.
+/// Any OTHER ExecutionError stays a refusal.
+pub const DELEGATE_THROTTLED: &str = "is rate limited after repeated failures";
+
+fn delegate_throttled(bytes: &[u8]) -> Option<String> {
+    match delegate_error(bytes)? {
+        freenet_stdlib::client_api::DelegateError::ExecutionError(said) if said.contains(DELEGATE_THROTTLED) => Some(said.to_string()),
+        _ => None,
+    }
+}
+
 fn put_refused(bytes: &[u8]) -> Option<(String, String)> {
     match contract_error(bytes)? {
         freenet_stdlib::client_api::ContractError::Put { key, cause } => Some((key.to_string(), cause.to_string())),
