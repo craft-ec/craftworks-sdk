@@ -1,102 +1,50 @@
-//! ONE WRITER of "who wants a block" (WANTED-LIFE, sdk#480 part 3; the owner's "Structure before code"): the three
-//! reader indexes -- `reads.waiting`, `repair_slots`, `parked_write.needs` -- change only inside the engine's four
-//! transitions `want`, `drop_reader`, `served` and `release_write`. Any other write is a reader nobody's `Unwanted`
-//! accounts for: the defect sdk#480 part 1 found five times over. Held by the SOURCE of the engine's production code.
-//!
-//! THE CONTROL: the four transitions themselves hold writes of each index -- the scan finds what it forbids elsewhere.
+//! ONE WRITER, BY TYPE (WANTED-LIFE, sdk#480 part 3; CLAUDE.md "One writer, by type"): the three reader indexes live
+//! in `engine::wanted::Wanted`, whose fields are PRIVATE to that module, so the compiler refuses any write outside its
+//! four transitions -- no list of spellings to walk around (the architect on #504). What the compiler cannot hold is
+//! the TYPE ITSELF being opened up, so this test holds that: every field of `Wanted` stays private, and no other engine
+//! source declares a reader index of its own.
 
-const SOURCES: [(&str, &str); 3] = [
+const WANTED: &str = include_str!("../src/wanted.rs");
+const OTHERS: [(&str, &str); 3] = [
     ("src/lib.rs", include_str!("../src/lib.rs")),
-    ("src/race_get.rs", include_str!("../src/race_get.rs")),
     ("src/read.rs", include_str!("../src/read.rs")),
+    ("src/race_get.rs", include_str!("../src/race_get.rs")),
 ];
 
-/// Writes of the three reader indexes, as the engine spells them.
-const WRITES: [&str; 14] = [
-    "reads.waiting.entry(",
-    "reads.waiting.insert(",
-    "reads.waiting.remove(",
-    "reads.waiting.retain(",
-    "reads.waiting.get_mut(",
-    "repair_slots.entry(",
-    "repair_slots.insert(",
-    "repair_slots.remove(",
-    "repair_slots.retain(",
-    "repair_slots.get_mut(",
-    "needs.insert(",
-    "needs.remove(",
-    "parked_write = None",
-    "parked_write.take()",
-];
-
-const TRANSITIONS: [&str; 4] = ["fn want(", "fn drop_reader(", "fn served(", "fn release_write("];
-
-/// The production part of a source file: everything before its first top-level `#[cfg(test)]` module.
-fn production(src: &str) -> &str {
-    src.find("\n#[cfg(test)]\nmod ").map_or(src, |at| &src[..at])
-}
-
-/// `src` split into (the four transitions' bodies, everything else). A body runs from its `fn` line to the first
-/// line closing it at the same indentation.
-fn split(src: &str) -> (String, String) {
-    let (mut inside, mut outside) = (String::new(), String::new());
-    let mut closing: Option<String> = None;
-    for line in src.lines() {
-        if let Some(close) = &closing {
-            inside.push_str(line);
-            inside.push('\n');
-            if line == close {
-                closing = None;
-            }
-            continue;
-        }
-        let trimmed = line.trim_start();
-        if TRANSITIONS.iter().any(|t| trimmed.starts_with(t)) {
-            closing = Some(format!("{}}}", &line[..line.len() - trimmed.len()]));
-            inside.push_str(line);
-            inside.push('\n');
-            continue;
-        }
-        outside.push_str(line);
-        outside.push('\n');
-    }
-    (inside, outside)
+/// The fields of `pub(crate) struct Wanted { .. }`, as written.
+fn wanted_fields(src: &str) -> Vec<&str> {
+    let start = src.find("pub(crate) struct Wanted {").expect("THE CONTROL: `struct Wanted` not found in wanted.rs");
+    let body = &src[start..src[start..].find("\n}\n").map(|e| start + e).expect("the struct's end")];
+    body.lines().skip(1).map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).collect()
 }
 
 #[test]
-fn only_the_four_transitions_write_who_wants_a_block() {
-    let mut stray = Vec::new();
-    let mut inside_all = String::new();
-    for (path, src) in SOURCES {
-        let (inside, outside) = split(production(src));
-        inside_all.push_str(&inside);
-        for (n, line) in outside.lines().enumerate() {
-            if line.trim_start().starts_with("//") {
+fn the_reader_indexes_are_private_to_their_one_type() {
+    let fields = wanted_fields(WANTED);
+    // THE CONTROL: the three indexes are the fields found.
+    for name in ["waiting:", "slots:", "needs:"] {
+        // By its NAME, whatever its visibility: the control finds the field, the assertion below judges it.
+        let named = |f: &&str| f.trim_start_matches("pub(crate) ").trim_start_matches("pub ").starts_with(name);
+        assert!(fields.iter().any(named), "THE CONTROL: `Wanted` has no `{name}` field: {fields:?}");
+    }
+    let opened: Vec<&&str> = fields.iter().filter(|f| f.starts_with("pub")).collect();
+    assert!(opened.is_empty(), "a field of `Wanted` is not private -- code outside its four transitions could write it: {opened:?}");
+    // No second home: another engine source declaring a block -> readers map or a write's needs set of its own.
+    for (path, src) in OTHERS {
+        for (n, line) in src.lines().enumerate() {
+            let l = line.trim();
+            if l.starts_with("//") {
                 continue;
             }
-            for w in WRITES {
-                if line.contains(w) {
-                    stray.push(format!("{path}: `{w}` outside want/drop_reader/served/release_write (line {} of the rest): {}", n + 1, line.trim()));
-                }
-            }
+            let second = l.starts_with("waiting: BTreeMap<Cid") || l.starts_with("pub waiting:") || l.starts_with("repair_slots:") || l.starts_with("needs: BTreeSet<Cid>");
+            assert!(!second, "{path}:{}: a reader index declared outside `Wanted`: {l}", n + 1);
         }
     }
-    // THE CONTROL: each index IS written inside the transitions (so the scan can see a write when there is one), and all
-    // four transitions were found.
-    for t in TRANSITIONS {
-        assert!(inside_all.contains(t), "THE CONTROL: the transition `{t}` was not found in the engine's production source");
-    }
-    for index in ["reads.waiting.", "repair_slots.", "needs."] {
-        assert!(inside_all.contains(index), "THE CONTROL: no write of `{index}` inside the transitions: the scan cannot see one");
-    }
-    assert!(stray.is_empty(), "a reader index is written outside the one writer:\n{}", stray.join("\n"));
 }
 
-/// The scan's own control: a write placed outside the transitions is found, and one inside is not.
+/// The reader's own control: a `pub` field is seen, and a private one is not flagged.
 #[test]
-fn the_scan_finds_a_write_outside_and_not_inside() {
-    let src = "impl E {\n    fn want(&mut self) {\n        self.repair_slots.entry(x);\n    }\n    fn other(&mut self) {\n        self.repair_slots.remove(&x);\n    }\n}\n";
-    let (inside, outside) = split(src);
-    assert!(inside.contains("repair_slots.entry(") && !inside.contains("repair_slots.remove("), "the transition's body was not cut: {inside}");
-    assert!(outside.contains("repair_slots.remove(") && !outside.contains("repair_slots.entry("), "a write outside was hidden: {outside}");
+fn the_field_reader_sees_a_pub_field() {
+    let open = "pub(crate) struct Wanted {\n    pub(crate) waiting: X,\n    slots: Y,\n}\n";
+    assert_eq!(wanted_fields(open), vec!["pub(crate) waiting: X,", "slots: Y,"]);
 }

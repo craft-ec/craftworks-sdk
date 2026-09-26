@@ -80,6 +80,8 @@ pub mod read;
 pub mod race_get;
 pub mod repair;
 pub mod subs;
+mod wanted;
+use wanted::{Reader, Wanted};
 
 /// Which client a write came from. Two tabs are two clients.
 #[derive(
@@ -969,14 +971,6 @@ impl Readers {
     }
 }
 
-/// ONE reader of a block, as [`Engine::want`] and [`Engine::drop_reader`] take it (WANTED-LIFE, sdk#480 part 3): a
-/// parked read, a repair (by the block it rebuilds), or the one parked write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Reader {
-    Read(read::ReqId),
-    Repair(Cid),
-    Write,
-}
 
 /// What an engine shed to keep its context saveable (sdk#162), per call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1133,9 +1127,7 @@ struct ParkedWrite {
     /// the block: F14 reads what is held and registers no demand, so "fetch
     /// and try again" can be true for ever.
     rounds: u32,
-    /// Blocks this write is waiting on, so an arrival for something else does
-    /// not re-run the apply.
-    needs: BTreeSet<Cid>,
+    // Its NEEDS are held with every other reader in `Engine::wanted` (WANTED-LIFE: one writer, by type).
     /// GETs this write's CURRENT chain has caused (sdk#174). At
     /// `max_gets_per_request` it asks for nothing more until its client
     /// asks after it (`AskWrite`), which starts a new chain.
@@ -1442,8 +1434,9 @@ pub struct Engine<B: Blocks> {
     carry: BTreeSet<(ClientId, WriteId)>,
     /// Blocks being REBUILT from their groups, by the block's id (`repair`).
     repairs: BTreeMap<Cid, Repair>,
-    /// Which repairs a group block is being fetched for.
-    repair_slots: BTreeMap<Cid, BTreeSet<Cid>>,
+    /// WHO WANTS each block (WANTED-LIFE): the parked reads, the repair slots and the parked write's needs, in one type
+    /// only its four transitions can change.
+    wanted: Wanted,
     /// Blocks whose LAST reader dropped during THIS call (WANTED-LIFE): settled at the call's end into
     /// [`Effect::Unwanted`] for those still unwanted and not held ([`Engine::settle_unwanted`]), and empty between
     /// calls -- the withdrawal is an effect, never stored state.
@@ -1696,7 +1689,7 @@ impl<B: Blocks> Engine<B> {
             reput_missing: 0,
             carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
-            repair_slots: BTreeMap::new(),
+            wanted: Wanted::default(),
             dropped: BTreeSet::new(),
             fetch_counts: (0, 0),
             step_asks: BTreeMap::new(),
@@ -2407,7 +2400,7 @@ impl<B: Blocks> Engine<B> {
                 // A new chain holds only what IT fetches: `held` stays within one chain's GETs (sdk#411).
                 p.held.clear();
                 p.idle_ticks = 0;
-                if !p.needs.is_empty() {
+                if !self.wanted.write_needs().is_empty() {
                     // ITS ROUND IS STILL OUT -- and cannot be: the node runs
                     // no ask while this write's chain is live, so a block
                     // still needed when its client asks is an answer that
@@ -2419,10 +2412,11 @@ impl<B: Blocks> Engine<B> {
                     // never hears them (F49; the architect's sdk#196 v4-bridge
                     // review, executed). Paced by the asks themselves: at most
                     // one unanswered per session, a second apart.
-                    p.gets = p.needs.len() as u32;
+                    p.gets = self.wanted.write_needs().len() as u32;
                     let attempt = p.rounds;
-                    return p
-                        .needs
+                    return self
+                        .wanted
+                        .write_needs()
                         .iter()
                         .map(|id| Effect::FetchBlock {
                             id: *id,
@@ -2745,7 +2739,7 @@ impl<B: Blocks> Engine<B> {
         // asked has ARRIVED, none still waited on -- a cycle that moved nothing and asked only blocks that had
         // already arrived at this resume position is a livelock of answered re-fetches. Two in a row: the full read.
         if matches!(p.want, read::Want::Delta(_)) && matches!(outcome, read::Attempt::Need(_) | read::Attempt::NeedFrom { .. }) {
-            let waiting = self.reads.waiting.values().any(|reqs| reqs.contains(&req_id));
+            let waiting = !self.wanted.waited_by(req_id).is_empty();
             if !waiting {
                 let q = self.reads.parked.get_mut(&req_id).expect("parked");
                 let marker = (q.delta.after.clone(), q.delta.acc.len());
@@ -2913,7 +2907,7 @@ impl<B: Blocks> Engine<B> {
                         }
                     }
                     // A race for a sibling asked this block already (sdk#303): that GET answers this read too.
-                    let raced = self.params.dedupe_in_flight && self.repair_slots.contains_key(&id);
+                    let raced = self.params.dedupe_in_flight && self.wanted.is_slot(&id);
                     if raced {
                         out.extend(self.race(id, p.root));
                     } else if first || !self.params.dedupe_in_flight {
@@ -2950,7 +2944,7 @@ impl<B: Blocks> Engine<B> {
     /// the head moved; no clock is read (rule 8).
     pub fn supersede_read(&mut self, req_id: read::ReqId) -> Option<Vec<Effect>> {
         let p = self.reads.parked.get(&req_id)?;
-        let blocks: Vec<Cid> = self.reads.waiting.iter().filter(|(_, reqs)| reqs.contains(&req_id)).map(|(id, _)| *id).collect();
+        let blocks: Vec<Cid> = self.wanted.waited_by(req_id);
         if p.arrived > 0 || blocks.is_empty() {
             return None;
         }
@@ -2970,7 +2964,7 @@ impl<B: Blocks> Engine<B> {
     }
 
     fn forget_waiting(&mut self, req_id: read::ReqId) {
-        let waited: Vec<Cid> = self.reads.waiting.iter().filter(|(_, reqs)| reqs.contains(&req_id)).map(|(id, _)| *id).collect();
+        let waited: Vec<Cid> = self.wanted.waited_by(req_id);
         for id in waited {
             self.drop_reader(id, Reader::Read(req_id));
         }
@@ -2979,8 +2973,8 @@ impl<B: Blocks> Engine<B> {
         // the read that asked -- shed, given up or capped -- in no cap and in
         // no sum, and a context with ZERO parked reads went over its bound
         // (sdk#187 review, executed).
-        let waiting = &self.reads.waiting;
-        self.reads.attempts.retain(|id, _| waiting.contains_key(id));
+        let wanted = &self.wanted;
+        self.reads.attempts.retain(|id, _| wanted.read_waits_on(id));
     }
 
     fn on_write(
@@ -3087,7 +3081,7 @@ impl<B: Blocks> Engine<B> {
                 let fetching = self
                     .parked_write
                     .as_ref()
-                    .is_some_and(|p| (p.client, p.write_id) == (q.client, q.write_id) && !p.needs.is_empty());
+                    .is_some_and(|p| (p.client, p.write_id) == (q.client, q.write_id)) && !self.wanted.write_needs().is_empty();
                 if !fetching {
                     let (fx, applied_or_gone) = self.warm_apply(i);
                     out.extend(fx);
@@ -3584,7 +3578,6 @@ impl<B: Blocks> Engine<B> {
             write_id,
             rounds,
             gets: gets + needs.len() as u32,
-            needs: BTreeSet::new(),
             idle_ticks: 0,
             idle_at: self.now,
             held,
@@ -3606,7 +3599,7 @@ impl<B: Blocks> Engine<B> {
     /// own confirmations, and the cost of a cold write would be the number of
     /// blocks moving on the node rather than the depth of the tree.
     fn resume_parked_write(&mut self, id: Cid) -> Vec<Effect> {
-        if !self.parked_write.as_ref().is_some_and(|p| p.needs.contains(&id)) {
+        if self.parked_write.is_none() || !self.wanted.write_needs().contains(&id) {
             return Vec::new();
         }
         // Arrived: the write's need of it is met (the block is held, so never `Unwanted`).
@@ -3616,7 +3609,7 @@ impl<B: Blocks> Engine<B> {
         };
         p.held.insert(id);
         p.idle_ticks = 0;
-        if !p.needs.is_empty() {
+        if !self.wanted.write_needs().is_empty() {
             // Still waiting on the rest of this round's blocks. Running now
             // would spend a round to stop at the very next one.
             return Vec::new();
@@ -4685,9 +4678,9 @@ impl<B: Blocks> Engine<B> {
         // A block of a group being repaired (a parity block among them, which
         // no read asks for by itself).
         let mut out = Vec::new();
-        if self.repair_slots.contains_key(&id) {
+        if self.wanted.is_slot(&id) {
             out.extend(self.on_repair_block(id, Some(&bytes)));
-            if !self.reads.waiting.contains_key(&id) {
+            if !self.wanted.read_waits_on(&id) {
                 return out;
             }
         }
@@ -4777,7 +4770,7 @@ impl<B: Blocks> Engine<B> {
     /// can do nothing about either.
     fn on_missed(&mut self, id: Cid) -> Vec<Effect> {
         let mut out = Vec::new();
-        if self.repair_slots.contains_key(&id) {
+        if self.wanted.is_slot(&id) {
             out.extend(self.on_repair_block(id, None));
         }
         out.extend(self.on_missed_parked(id));
@@ -4794,8 +4787,9 @@ impl<B: Blocks> Engine<B> {
         // miss and the bound would never be reached.
         let mut out = Vec::new();
         if let Some(p) = self.parked_write.clone() {
-            if p.needs.contains(&id) {
-                out.extend(self.park_write(p.client, p.write_id, p.needs.into_iter().collect()));
+            if self.wanted.write_needs().contains(&id) {
+                let needs: Vec<Cid> = self.wanted.write_needs().iter().copied().collect();
+                out.extend(self.park_write(p.client, p.write_id, needs));
                 out.extend(self.after_park(p.client, p.write_id));
                 // RULE 11 FOR A WRITE (sdk#405; rule 4, one read path): the group is an alternative source here as
                 // for a read -- a write never waits on a straggler its group can rebuild. The rebuilt block lands
@@ -4821,7 +4815,7 @@ impl<B: Blocks> Engine<B> {
     }
 
     fn on_missed_read(&mut self, id: Cid) -> Vec<Effect> {
-        let Some(reqs) = self.reads.waiting.get(&id).cloned() else {
+        let Some(reqs) = self.wanted.reads_on(&id).cloned() else {
             return Vec::new();
         };
         // The node answered NotFound. The readers keep waiting and the block
@@ -4852,7 +4846,7 @@ impl<B: Blocks> Engine<B> {
                 out.push(Effect::Reply { client: p.client, req_id: *req, result });
             }
         }
-        if !self.reads.waiting.contains_key(&id) {
+        if !self.wanted.read_waits_on(&id) {
             return out;
         }
         let via = self.reads.in_pack.get(&id).copied().map_or(read::Via::Direct, read::Via::Pack);
@@ -4892,11 +4886,7 @@ impl<B: Blocks> Engine<B> {
     /// disagreed (`awaits_block` counted all three; `withdraw_if_unwanted` only reads), so a block the parked write
     /// needed could be withdrawn when a read on it was superseded.
     pub fn readers_of(&self, id: &Cid) -> Readers {
-        Readers {
-            reads: self.reads.waiting.contains_key(id),
-            repairs: self.repair_slots.contains_key(id),
-            parked_write: self.parked_write.as_ref().is_some_and(|p| p.needs.contains(id)),
-        }
+        self.wanted.readers_of(id)
     }
 
     /// Start rebuilding `group.missing`: what is held already counts, and
@@ -4938,7 +4928,7 @@ impl<B: Blocks> Engine<B> {
     /// or an attempt at it ended empty (`None`).
     fn on_repair_block(&mut self, slot: Cid, bytes: Option<&[u8]>) -> Vec<Effect> {
         let mut out = Vec::new();
-        let for_: Vec<Cid> = self.repair_slots.get(&slot).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        let for_: Vec<Cid> = self.wanted.repairs_on(&slot);
         let mut still_asked = false;
         for missing in for_ {
             // A repair nobody wants any more ENDS here, rather than asking its group for ever: a write that started
@@ -4971,15 +4961,18 @@ impl<B: Blocks> Engine<B> {
             }
             out.extend(self.try_repair(missing));
         }
-        if still_asked && self.repair_slots.contains_key(&slot) {
+        if still_asked && self.wanted.is_slot(&slot) {
             self.reads.fetches += 1;
             self.step_asks.entry(slot).or_insert(false);
             out.push(Effect::FetchBlock { id: slot, via: read::Via::Direct, attempt: 1 });
         } else if !still_asked {
             // Nobody asks for this block any more (it came, or it is spent).
-            let spent: Vec<Cid> = self.repair_slots.get(&slot).map_or(Vec::new(), |set| {
-                set.iter().copied().filter(|m| !self.repairs.get(m).is_some_and(|r| r.asked.keys().any(|i| r.group.slots[*i] == slot))).collect()
-            });
+            let spent: Vec<Cid> = self
+                .wanted
+                .repairs_on(&slot)
+                .into_iter()
+                .filter(|m| !self.repairs.get(m).is_some_and(|r| r.asked.keys().any(|i| r.group.slots[*i] == slot)))
+                .collect();
             for m in spent {
                 self.drop_reader(slot, Reader::Repair(m));
             }
@@ -5020,7 +5013,7 @@ impl<B: Blocks> Engine<B> {
     fn end_repair(&mut self, missing: Cid) {
         self.repairs.remove(&missing);
         // Its slots lose this reader; a slot nobody wants any more is a candidate for `Unwanted` (sdk#303).
-        let slots: Vec<Cid> = self.repair_slots.iter().filter(|(_, set)| set.contains(&missing)).map(|(slot, _)| *slot).collect();
+        let slots: Vec<Cid> = self.wanted.slots_of(&missing);
         for slot in slots {
             self.drop_reader(slot, Reader::Repair(missing));
         }
@@ -5035,73 +5028,33 @@ impl<B: Blocks> Engine<B> {
     /// [`served`]: Self::served
     /// [`release_write`]: Self::release_write
     fn want(&mut self, id: Cid, reader: Reader) -> Readers {
-        let before = self.readers_of(&id);
-        match reader {
-            Reader::Read(req) => {
-                self.reads.waiting.entry(id).or_default().insert(req);
-            }
-            Reader::Repair(missing) => {
-                self.repair_slots.entry(id).or_default().insert(missing);
-            }
-            Reader::Write => {
-                if let Some(p) = self.parked_write.as_mut() {
-                    p.needs.insert(id);
-                }
-            }
-        }
-        before
+        self.wanted.want(id, reader)
     }
 
     /// THE DROP: `reader` no longer wants `id`. If nobody does now, `id` is a candidate for [`Effect::Unwanted`] at
     /// the end of this call -- decided then, net, never here (the architect's T3).
     fn drop_reader(&mut self, id: Cid, reader: Reader) {
-        match reader {
-            Reader::Read(req) => {
-                if let Some(reqs) = self.reads.waiting.get_mut(&id) {
-                    reqs.remove(&req);
-                    if reqs.is_empty() {
-                        self.reads.waiting.remove(&id);
-                    }
-                }
-                // A block nobody waits on any more has no attempts to count. Left behind, one entry per block asked
-                // for and never answered outlived the read that asked (sdk#187 review, executed).
-                if !self.reads.waiting.contains_key(&id) {
-                    self.reads.attempts.remove(&id);
-                }
-            }
-            Reader::Repair(missing) => {
-                if let Some(set) = self.repair_slots.get_mut(&id) {
-                    set.remove(&missing);
-                    if set.is_empty() {
-                        self.repair_slots.remove(&id);
-                    }
-                }
-            }
-            Reader::Write => {
-                if let Some(p) = self.parked_write.as_mut() {
-                    p.needs.remove(&id);
-                }
-            }
-        }
-        if !self.readers_of(&id).any() {
+        if self.wanted.drop_reader(id, reader) {
             self.dropped.insert(id);
+        }
+        // A block no read waits on any more has no attempts to count. Left behind, one entry per block asked for and
+        // never answered outlived the read that asked (sdk#187 review, executed).
+        if !self.wanted.read_waits_on(&id) {
+            self.reads.attempts.remove(&id);
         }
     }
 
     /// `id` ARRIVED: the reads waiting on it are SERVED (they re-descend) -- the readers it had, taken. Not a drop: the
     /// block is here, so it is never `Unwanted`.
     fn served(&mut self, id: Cid) -> Option<BTreeSet<read::ReqId>> {
-        self.reads.waiting.remove(&id)
+        self.wanted.served(id)
     }
 
     /// The parked write is RELEASED (applied, refused, re-queued, out of rounds or room): its needs lose their reader,
     /// and each block nobody else wants is a candidate for `Unwanted` -- before, its GETs ran on until the page's
     /// due-time check. The released write, for its caller.
     fn release_write(&mut self) -> Option<ParkedWrite> {
-        let needs: Vec<Cid> = self.parked_write.as_ref().map_or(Vec::new(), |p| p.needs.iter().copied().collect());
-        for id in needs {
-            self.drop_reader(id, Reader::Write);
-        }
+        self.dropped.extend(self.wanted.release_write());
         self.parked_write.take()
     }
 
@@ -5154,7 +5107,7 @@ impl<B: Blocks> Engine<B> {
                 }
                 let Some(b) = self.blocks.get(&cid) else {
                     // Not held: this is what a preload is FOR.
-                    if self.reads.waiting.contains_key(&cid) {
+                    if self.wanted.read_waits_on(&cid) {
                         continue;
                     }
                     work += 1;
@@ -5254,11 +5207,11 @@ impl<B: Blocks> Engine<B> {
                 pin(id, Pin::Backing);
             }
         }
-        for id in self.reads.waiting.keys().chain(self.reads.parked.values().flat_map(|p| p.held.iter())) {
+        for id in self.wanted.read_blocks().chain(self.reads.parked.values().flat_map(|p| p.held.iter())) {
             pin(id, Pin::ParkedRead);
         }
         if let Some(p) = self.parked_write.as_ref() {
-            for id in p.held.iter().chain(p.needs.iter()) {
+            for id in p.held.iter().chain(self.wanted.write_needs().iter()) {
                 pin(id, Pin::ParkedWrite);
             }
         }
@@ -5412,10 +5365,11 @@ impl<B: Blocks> Engine<B> {
         }
         v.field(&self.asks.to_vec());
         v.field(&self.reads.parked);
-        v.field(&self.reads.waiting);
+        v.field(self.wanted.waiting());
         v.field(&self.reads.attempts);
         v.field(&self.head_epoch);
         v.field(&self.parked_write);
+        v.field(self.wanted.write_needs());
         v.field(&self.subs);
         if carries {
             v.field(&self.in_flight_since);

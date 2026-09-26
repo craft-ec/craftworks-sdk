@@ -286,10 +286,7 @@ pub(crate) struct Parked {
 #[derive(Default)]
 pub(crate) struct Reads {
     pub parked: BTreeMap<ReqId, Parked>,
-    /// Who is waiting on each outstanding block. Two requests needing one
-    /// block share its fetch: the second does not pay for the first's round
-    /// trip, and a popular branch is fetched once however many readers want it.
-    pub waiting: BTreeMap<Cid, BTreeSet<ReqId>>,
+    // Who waits on each block is in `Engine::wanted` (WANTED-LIFE: one writer, by type).
     /// Attempts already made per block, for the bounded re-issue.
     pub attempts: BTreeMap<Cid, u32>,
     /// Which pack is known to carry a block, newest first.
