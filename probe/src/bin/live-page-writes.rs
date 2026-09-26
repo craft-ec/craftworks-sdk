@@ -18,9 +18,8 @@
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
-use page::server::{Server, SignerFacts};
-use page::{Ms, Page, PutPath};
-use page_io::{Artefacts, PageIo};
+use page::Ms;
+use page_io::PageIo;
 use probe::node::{Mode, Node, TempTree};
 use protocol::{Reply, Request};
 use std::time::{Duration, Instant};
@@ -64,19 +63,7 @@ fn now_ms(t0: Instant) -> u64 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let v = std::process::Command::new("freenet").arg("--version").output().context("freenet --version")?;
-    println!("freenet: {}", String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or_default());
-    let port: u16 = std::env::var("PAGE_PORT").ok().and_then(|p| p.parse().ok()).context("PAGE_PORT=<port> is required; there is no default")?;
-    if probe::node::RESERVED.contains(&port) {
-        bail!("port {port} is the owner's node");
-    }
-    let tmp = std::env::var("PAGE_TMP").context("PAGE_TMP=<dir> is required: the node's three dirs go under it")?;
-    let usage = "usage: live-page-writes <signer.wasm> <block.wasm> <register.wasm>";
-    let mut a = std::env::args().skip(1);
-    let signer_wasm = std::fs::read(a.next().context(usage)?)?;
-    probe::check(&signer_wasm).map_err(|e| anyhow::anyhow!("the signer is refused by the import gate: {e}"))?;
-    let block_code = std::fs::read(a.next().context(usage)?)?;
-    let register_code = std::fs::read(a.next().context(usage)?)?;
+    let probe::live::Args { port, tmp, signer_wasm, block_code, register_code } = probe::live::args("live-page-writes")?;
     let rows: Vec<usize> = std::env::var("ROWS").ok().map(|r| r.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| vec![100, 300]);
 
     let mut verdict = Ok(());
@@ -258,16 +245,7 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
     // node and key — its signer provisioned already — whose first THREE head
     // reads are lost. It must ask again and read every row, never an empty tree.
     let (mut sock2, _) = tokio_tungstenite::connect_async(ws).await.context("connecting again")?;
-    let (container2, signer2) = wire::delegate_from_code(signer_wasm);
-    let mut io2 = PageIo::new(
-        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(now_ms(t0))), SignerFacts::default()),
-        Artefacts {
-            block_code: block_code.to_vec(),
-            register_code: register_code.to_vec(),
-            register_params: wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME),
-            signer: signer2,
-        },
-    );
+    let (container2, mut io2) = probe::live::reopened(&sk, signer_wasm, block_code, register_code, t0);
     // Registered again (the same delegate), provisioned again with the SAME
     // key (accepted: a key is never replaced, only re-stated).
     io2.provision(container2, sk.to_bytes().to_vec());

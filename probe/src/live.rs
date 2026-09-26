@@ -33,18 +33,36 @@ pub struct Args {
 /// no defaults: the port refused if it is the owner's (or `port + 1` is), the signer refused by the import gate.
 /// Prints the freenet version the probe runs against.
 pub fn args(name: &str) -> Result<Args> {
-    let v = std::process::Command::new("freenet").arg("--version").output().context("freenet --version")?;
-    println!("freenet: {}", String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or_default());
-    let port: u16 = std::env::var("PAGE_PORT").ok().and_then(|p| p.parse().ok()).context("PAGE_PORT=<port> is required; there is no default")?;
+    print_freenet_version()?;
+    let port = port_from("PAGE_PORT")?;
     crate::node::allowed_ports(&[port, port + 1])?;
     let tmp = std::env::var("PAGE_TMP").context("PAGE_TMP=<dir> is required: the node's three dirs go under it")?;
+    let (signer_wasm, block_code, register_code) = contracts(name)?;
+    Ok(Args { port, tmp, signer_wasm, block_code, register_code })
+}
+
+/// Print the freenet version the probe runs against (the first line of `freenet --version`).
+pub fn print_freenet_version() -> Result<()> {
+    let v = std::process::Command::new("freenet").arg("--version").output().context("freenet --version")?;
+    println!("freenet: {}", String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or_default());
+    Ok(())
+}
+
+/// The node port named by `var`, required: there is no default.
+pub fn port_from(var: &str) -> Result<u16> {
+    std::env::var(var).ok().and_then(|p| p.parse().ok()).with_context(|| format!("{var}=<port> is required; there is no default"))
+}
+
+/// The three contracts named on the command line (`<signer.wasm> <block.wasm> <register.wasm>`), the signer refused
+/// by the import gate.
+pub fn contracts(name: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let usage = format!("usage: {name} <signer.wasm> <block.wasm> <register.wasm>");
     let mut a = std::env::args().skip(1);
     let signer_wasm = std::fs::read(a.next().context(usage.clone())?)?;
     crate::check(&signer_wasm).map_err(|e| anyhow::anyhow!("the signer is refused by the import gate: {e}"))?;
     let block_code = std::fs::read(a.next().context(usage.clone())?)?;
     let register_code = std::fs::read(a.next().context(usage)?)?;
-    Ok(Args { port, tmp, signer_wasm, block_code, register_code })
+    Ok((signer_wasm, block_code, register_code))
 }
 
 /// A page REOPENED on `sk`'s key (its signer provisioned already on this node), unstarted at `t0`'s clock, and the

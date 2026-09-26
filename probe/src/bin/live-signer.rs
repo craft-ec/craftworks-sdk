@@ -35,28 +35,9 @@ fn signed_bytes(a: &Answer) -> Option<Vec<u8>> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let v = std::process::Command::new("freenet")
-        .arg("--version")
-        .output()
-        .context("freenet --version")?;
-    println!(
-        "freenet: {}",
-        String::from_utf8_lossy(&v.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-    );
-    let port: u16 = std::env::var("SIGNER_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .context("SIGNER_PORT=<port> is required; there is no default")?;
-    let mut a = std::env::args().skip(1);
-    let usage = "usage: live-signer <signer.wasm> <block.wasm> <register.wasm>";
-    let wasm = std::fs::read(a.next().context(usage)?)?;
-    probe::check(&wasm)
-        .map_err(|e| anyhow::anyhow!("the signer is refused by the import gate: {e}"))?;
-    let bcode = std::fs::read(a.next().context(usage)?)?;
-    let rcode = std::fs::read(a.next().context(usage)?)?;
+    probe::live::print_freenet_version()?;
+    let port = probe::live::port_from("SIGNER_PORT")?;
+    let (wasm, bcode, rcode) = probe::live::contracts("live-signer")?;
 
     let dir = std::env::temp_dir().join(format!("live-signer-{}", std::process::id()));
     let _tree = TempTree(dir.clone());
