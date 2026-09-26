@@ -221,11 +221,12 @@ impl<H: Host> PageStore<H> {
         // WHAT BECAME OF THIS CLIENT'S WRITES, pulled (R-b): conflicts first
         // (their chains read the fates), then every terminal fate, read.
         if let Some(session) = self.writes.client.session() {
-            let (chains, fates) = h.with_server(|s| (s.take_conflicted(session), s.take_fates(session)));
+            let (chains, fates, backed) = h.with_server(|s| (s.take_conflicted(session), s.take_fates(session), s.take_backed_up(session)));
             self.writes.on_conflicted(chains);
             for (write_id, fate) in fates {
                 self.writes.on_fate(write_id, fate);
             }
+            self.writes.on_backed_up(backed);
         }
         let fetched = h.with_server(|s| s.take_fetched());
         let now = (self.now_ms)();

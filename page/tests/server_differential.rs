@@ -2559,6 +2559,13 @@ fn backed_up_timeline(case: &str, faults: Faults) {
     let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "gamma" }).as_object().unwrap().clone())).expect("put");
     let gamma = craftworks_sdk::db::record_key("t", craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id"));
     let owed_mid = rig.server.page.owed_groups();
+    // gamma's row, watched from here: its save returned, its own state change so far told and drained. From now
+    // on every change of it must reach its bindings (`state_changed`), the move to backed up included.
+    let _ = tab.db.store_mut().writes.take_state_changed();
+    let mut gamma_seen = state(&mut tab, &mut rig, &mut node, &gamma);
+    if case == "first parity answers lost" {
+        assert_ne!(gamma_seen, RowState::BackedUp, "THE SETUP: gamma was backed up the moment it saved: the move to backed up is not watched");
+    }
     for (name, k) in [("alpha", &alpha), ("beta", &beta)] {
         let s = state(&mut tab, &mut rig, &mut node, k);
         assert_eq!(s, RowState::BackedUp, "{case}: {name} REGRESSED to {s:?} as gamma saved ({owed_mid} group(s) owed by gamma's commit): a later save demoted a row its own commit backed up");
@@ -2572,7 +2579,14 @@ fn backed_up_timeline(case: &str, faults: Faults) {
             let s = state(&mut tab, &mut rig, &mut node, k);
             assert_eq!(s, RowState::BackedUp, "{case}: {name} REGRESSED to {s:?} {} ms after gamma was written: a later save demoted a row its own commit backed up", step * 5_000);
         }
+        let told = tab.db.store_mut().writes.take_state_changed();
         let g = state(&mut tab, &mut rig, &mut node, &gamma);
+        // A row whose state CHANGED is told to its bindings (they re-read on it; builder#107): the move to backed
+        // up moves no root, so without this the table shows "saved" for ever (engineer1's live run on sdk#415).
+        if g != gamma_seen {
+            assert!(told.contains(&gamma), "{case}: gamma moved {gamma_seen:?} -> {g:?} and its binding was not told (state_changed: {} key(s))", told.len());
+            gamma_seen = g;
+        }
         match (g == RowState::BackedUp, gamma_backed_at) {
             (true, None) => gamma_backed_at = Some(step),
             (false, Some(at)) => panic!("{case}: gamma REGRESSED to {g:?} at {} ms, after reading backed up at {} ms", step * 5_000, at * 5_000),

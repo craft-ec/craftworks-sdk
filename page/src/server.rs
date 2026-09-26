@@ -117,6 +117,9 @@ pub struct Server {
     last_write: BTreeMap<Vec<u8>, LastWrite>,
     /// The keys whose last write each Published write is, until its `ParityComplete`.
     last_keys: BTreeMap<WriteKey, Vec<Vec<u8>>>,
+    /// Per session, keys whose last write just became BACKED_UP, until the client pulls them
+    /// ([`Server::take_backed_up`]): a row's state changed with no root moving, so its binding must be told.
+    backed_up_keys: BTreeMap<u64, Vec<Vec<u8>>>,
 }
 
 /// A key's last write here (`Server::last_write`).
@@ -293,6 +296,7 @@ impl Server {
             merge: None,
             last_write: BTreeMap::new(),
             last_keys: BTreeMap::new(),
+            backed_up_keys: BTreeMap::new(),
         }
     }
 
@@ -581,6 +585,7 @@ impl Server {
                         for k in self.last_keys.remove(&(client.0, write_id.0)).unwrap_or_default() {
                             if let Some(l) = self.last_write.get_mut(&k).filter(|l| l.write == (client.0, write_id.0)) {
                                 l.backed_up = true;
+                                self.backed_up_keys.entry(session_of(*client)).or_default().push(k);
                             }
                         }
                     }
@@ -614,6 +619,13 @@ impl Server {
     /// Every unread terminal fate of `session`, in the order they ended. READ.
     pub fn take_fates(&mut self, session: u64) -> Vec<(u64, crate::fates::Fate)> {
         self.fates.take_session(session)
+    }
+
+    /// `session`'s keys whose last write became BACKED_UP since this was last asked (sdk#415). Drains. The write
+    /// itself ended at `Published` (its fate is read and gone), so this is the one way its row's move to "backed
+    /// up" -- which moves no root -- reaches the client's bindings.
+    pub fn take_backed_up(&mut self, session: u64) -> Vec<Vec<u8>> {
+        self.backed_up_keys.remove(&session).unwrap_or_default()
     }
 
     /// `session`'s writes in the queue, in order, with their stages.
