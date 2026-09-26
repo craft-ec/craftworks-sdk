@@ -1208,7 +1208,7 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
     let mut total = Seen::default();
     let (min, cap) = seed_range(1, 1);
     let mut seed = 0;
-    while seed < min || (seed < cap && (total.lost == 0 || total.record_not_saved == 0 || total.landings == 0)) {
+    while seed < min || (seed < cap && (total.lost == 0 || total.record_not_saved == 0)) {
         seed += 1;
         let s = run(seed, WRITES, PutPath::Page).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         total.published += s.published;
@@ -1225,31 +1225,74 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
     assert!(total.lost > 0, "no rebase was ever reached: the two pages never raced");
     assert!(total.updates > total.published / 2, "too few UPDATEs for the writes published");
     assert!(total.record_not_saved > 0, "the signer never failed to save its record: RecordNotSaved unexercised");
-    // The LAND cell is exercised.
-    assert!(total.landings > 0, "no page ever landed a signer's record: the cell is unexercised");
+    // The LAND cell is NOT floored here: a random run reached it only by schedule luck (1 landing in 80 seeds at
+    // budget 1 on main, lost entirely to a correct back-off change). It is reached BY CONSTRUCTION, at every seed
+    // and budget, in `a_landing_whose_update_is_lost_twice_still_lands` (the architect, 2026-09-26).
 }
 
-/// LANDING UNDER LOSS: UPDATEs lost three times as often, at random. Everything still publishes with every
-/// invariant, and a landing happens. The twice-lost UPDATE is the forced case above, by construction (sdk#425):
-/// a seed reaching it was schedule luck, which a change to the op sequence moved (sdk#424). See
-/// `a_stale_pages_landing_whose_update_is_lost_twice_still_lands`.
+/// LANDING UNDER LOSS, BY CONSTRUCTION AT EVERY SEED AND BUDGET (the architect, 2026-09-26). A random run reached
+/// a landing only by schedule luck (1 in 80 seeds at budget 1 on main), and a correct back-off change (OP-LIFE's Q4)
+/// took that luck away. So every seed plays the stale-page landing (`a_gone_with_its_record_unlanded`: A's record
+/// signed, its UPDATE never landed, A gone) with B's landing UPDATE lost `seed % 4` times, on the MODEL's params
+/// (so `CRAFTWORKS_MODEL_BLOCK_BUDGET` applies): B must land A's record, needing exactly those re-sends, and publish
+/// its own write on top.
 #[test]
 fn a_landing_whose_update_is_lost_twice_still_lands() {
-    let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
+    let (min, _) = seed_range(1, 2);
     let mut most = 0;
-    let mut landings = 0;
-    // 1/2 of the seeds: the random run only has to reach A landing (the twice-lost UPDATE is forced, sdk#425).
-    let (min, cap) = seed_range(1, 2);
-    let mut seed = 0;
-    while seed < min || (seed < cap && landings == 0) {
-        seed += 1;
+    for seed in 1..=min {
+        let lose = (seed % 4) as u32;
+        let (landings, needed) = a_stale_page_lands_losing(lose);
+        assert_eq!(landings, 1, "seed {seed}: B did not land A's record exactly once (losing {lose})");
+        assert!(needed > lose, "seed {seed}: the landing needed {needed} UPDATEs, but {lose} were lost");
+        most = most.max(needed);
+    }
+    println!("forced landing: {min} seeds, each landed; most UPDATEs one landing needed: {most}");
+    assert!(most >= 4, "no seed lost the landing's UPDATE three times: the harshest case was not reached");
+}
+
+/// TWO LIVE PAGES UNDER HEAVY UPDATE LOSS (UPDATEs lost three times as often, at random): every write still
+/// publishes, with every invariant the run checks. Its landing count is PRINTED, not floored: a landing here was
+/// schedule luck (the LAND cell is owned by `a_landing_whose_update_is_lost_twice_still_lands`, by construction),
+/// but a drop to zero stays visible in the output.
+#[test]
+fn two_live_pages_under_heavy_update_loss_publish_every_write() {
+    let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
+    let (min, _) = seed_range(1, 2);
+    let (mut landings, mut most) = (0, 0);
+    for seed in 1..=min {
         let s = run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write published");
-        most = most.max(s.most_landing_updates);
         landings += s.landings;
+        most = most.max(s.most_landing_updates);
     }
-    println!("harsh: {seed} seeds, {landings} landings, most UPDATEs one landing needed: {most}");
-    assert!(landings > 0, "nothing landed");
+    println!("harsh, two live pages: {min} seeds, every write published; {landings} landings (information, not a floor), most UPDATEs one needed: {most}");
+}
+
+/// The stale-page landing on the model's params, B's landing UPDATE lost `lose` times: (B's landings, the most
+/// UPDATEs one needed).
+fn a_stale_page_lands_losing(lose: u32) -> (u32, u32) {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(model_params(), PutPath::Page);
+    let mut b = Page::new(model_params(), PutPath::Page);
+    let mut now = 1_000u64;
+    serve(&mut a, &mut node, &mut now, &mut 0);
+    serve(&mut b, &mut node, &mut now, &mut 0);
+    a_gone_with_its_record_unlanded(a, &mut node, &mut now);
+    b.write(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    let mut left = lose;
+    serve(&mut b, &mut node, &mut now, &mut left);
+    assert_eq!(left, 0, "B did not re-send its landing's UPDATE: {} of {lose} losses unused", left);
+    assert_eq!(node.head().map(|h| h.0), Some(2), "A's record was never landed");
+    b.write(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    serve(&mut b, &mut node, &mut now, &mut 0);
+    let (_, root) = node.head().expect("a head");
+    let tree = node.tree(&root).expect("whole");
+    for (k, v) in [(&b"a1"[..], &b"x"[..]), (b"a2", b"y"), (b"b1", b"z")] {
+        assert_eq!(tree.get(k).map(Vec::as_slice), Some(v), "{:?} missing from the final tree", String::from_utf8_lossy(k));
+    }
+    assert!(b.unusable().is_empty(), "{:?}", b.unusable());
+    b.landings()
 }
 
 /// TWO DEVICES OF ONE IDENTITY (sdk#225): two signers, one key, one
@@ -1506,6 +1549,14 @@ fn a_gone_with_its_record_unlanded(mut a: Page, node: &mut Node, now: &mut u64) 
                         let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
                         Some(Answer::Signer { id, answer })
                     }
+                // Reads are answered as a node answers them: under a small block budget (the model's
+                // CRAFTWORKS_MODEL_BLOCK_BUDGET) A evicts, and its second commit must read its blocks back.
+                Op::Get { id } => Some(match node.blocks.get(&id) {
+                    Some(b) => Answer::Got { id, bytes: b.clone() },
+                    None => Answer::GetMissed(id),
+                }),
+                Op::AskHeld { batch, ids } => Some(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() }),
+                // The UPDATE is the one thing never answered: A is gone before it lands.
                 _ => None,
             };
             if let Some(ans) = ans {
