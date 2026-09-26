@@ -1318,13 +1318,13 @@ impl Page {
                         _ => None,
                     })
                     .collect();
-                self.unusable.push(format!("the signer refused commit seq {seq} (writes {}): {why}", failed.join(", ")));
+                self.say(instrument::Site::of("page::said::head-refused"), format!("the signer refused commit seq {seq} (writes {}): {why}", failed.join(", ")));
             }
             Act::Note(state) => self.note_record(&state),
             Act::Forked(seq) => {
                 if self.old_signer_fork_at != Some(seq) {
                     self.old_signer_fork_at = Some(seq);
-                    self.unusable.push(format!(
+                    self.say(instrument::Site::of("page::said::old-signer-fork"), format!(
                         "SIGNER UPGRADE NEEDED: this signer predates the same-identity rule (sdk#225) and refuses every sign while its record and the register differ at seq {seq}; load the current version (its signer ships with the page). It signs again once the register moves past that seq"
                     ));
                 }
@@ -5194,6 +5194,8 @@ mod head_refused_order {
         assert!(p.engine.has_writes_in_flight(), "THE SETUP: write 2 did not go again");
         let lost: Vec<String> = held_back.iter().filter(|id| !owed(&p, id)).map(engine::short_id).collect();
         assert!(lost.is_empty(), "the withdraw ate the re-derived commit's PUT of {} of {} shared blocks: {lost:?}", lost.len(), held_back.len());
+    }
+}
 
 /// A LINE SAID IS RECORDED AT ITS SITE, WITH NO TEXT (sdk#482; the architect): `say` counts one `Key::Said` at the site
 /// and keeps the line for the app -- and nothing of the line enters the recording.

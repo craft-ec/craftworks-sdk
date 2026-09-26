@@ -1034,7 +1034,7 @@ impl Server {
         if self.page.read_only() {
             if let P::Write { write_id, .. } | P::Commit { write_id, .. } | P::DeferredCommit { write_id, .. } = &r {
                 let id = *write_id;
-                self.page.unusable.push(format!("read-only: write {id} refused at the door (a view writes nothing)"));
+                self.page.say(instrument::Site::of("page::said::read-only-write"), format!("read-only: write {id} refused at the door (a view writes nothing)"));
                 self.page.client_fx.push(Effect::Notify { client: self.speaker, write_id: as_write_id(id), state: State::Failed });
                 return Vec::new();
             }

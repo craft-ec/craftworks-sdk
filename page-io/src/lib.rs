@@ -634,7 +634,7 @@ impl PageIo {
                 OpenEffect::SetRegister(params) => self.set_register(params),
                 OpenEffect::SignerProvisioned => self.signer_provisioned(),
                 OpenEffect::StepCanSign => self.step_can_sign(),
-                OpenEffect::Unusable(why) => self.unusable.push(why),
+                OpenEffect::Unusable(why) => self.say(page::unusable::Site::of("page-io::said::opening"), why),
             }
         }
         self.pump();
@@ -1148,17 +1148,17 @@ impl PageIo {
                 // While the first exchange is unanswered, a refusal that names
                 // nothing is the node refusing IT: opening ends, by name (Machine 1's NodeRefused column).
                 self.open(OpenEvent::NodeRefused(r.said.clone()));
-                self.unusable.push(format!("the node refused: {}", r.said))
+                self.say(page::unusable::Site::of("page-io::said::node-refused-reply"), format!("the node refused: {}", r.said))
             }
-            Incoming::Unusable(u) => self.unusable.push(format!("{u:?}")),
+            Incoming::Unusable(u) => self.say(page::unusable::Site::of("page-io::said::incoming-unusable"), format!("{u:?}")),
             // EVERY KIND owns() claims is DECIDED here, with no catch-all (sdk#483, "Structure before code"): a new
             // wire answer fails to compile until it is handled, never falls into `_` and vanishes.
             // A registration of a delegate that is not this page's signer: this page registered no other, so it is
             // named, and it answers nothing here.
-            Incoming::Ack(wire::AckKind::Registered(key)) => self.unusable.push(format!("the node registered a delegate this page did not register: {key}")),
+            Incoming::Ack(wire::AckKind::Registered(key)) => self.say(page::unusable::Site::of("page-io::said::foreign-registered"), format!("the node registered a delegate this page did not register: {key}")),
             // An UPDATE answer for a contract this page did not update (owns() claims only its own keys, so this is a
             // key of its own it has no update out for): named.
-            Incoming::Ack(wire::AckKind::Updated(key)) => self.unusable.push(format!("an UPDATE answer this page has no update out for: {key}")),
+            Incoming::Ack(wire::AckKind::Updated(key)) => self.say(page::unusable::Site::of("page-io::said::update-unasked"), format!("an UPDATE answer this page has no update out for: {key}")),
             // The node confirms the HEAD subscription (the GET-with-subscribe's own answer already says so): the same
             // fact, recorded where `head_subscription()` reads it (sdk#259).
             Incoming::Ack(wire::AckKind::Subscribed(key)) if key == self.register_key => self.sub(SubEvent::SubscribedAck),
@@ -1824,7 +1824,6 @@ mod site_audit {
         assert!(io.site_read("kept").is_err(), "the audit ended and the site is still read");
     }
 }
-
 
 /// THE LINES SAID TO THE APP ARE BOUNDED with NO reader (sdk#482; the architect): page-io's list, driven through its
 /// own inbound -- 10,000 frames it cannot read, and nothing ever reads the list -- holds the newest
