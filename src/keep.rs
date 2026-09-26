@@ -45,9 +45,29 @@ pub struct Keep {
     pub health: Health,
 }
 
+/// m, the parity blocks per group: a group's margin is at most m, so `warn_below` and `below N` are 0 ..= m (KEEPER §3).
+pub const M: u8 = freenet_prolly::parity::PARITY as u8;
+
 impl Keep {
     /// The person's OWN tree, with no record until they change it: keep BACKED_UP, warn below 2 (KEEPER §3).
     pub const OWN_DEFAULT: Keep = Keep { repair: Repair::Always, warn_below: 2, audited_at: 0, health: Health { groups: 0, whole: 0, degraded: 0, damaged: 0 } };
+    /// An app's record as its FIRST publish writes it (KEEPER §2: the one way an app enters the list), until the person
+    /// changes it: the own tree's defaults, never audited.
+    pub const APP_DEFAULT: Keep = Keep::OWN_DEFAULT;
+
+    /// A policy this record can hold, or why not, by name: `warn_below` and `below N` are 0 ..= [`M`] (a margin is
+    /// never above m). The one check -- a policy edit is refused here, never stored and read back as another.
+    pub fn check(&self) -> Result<(), String> {
+        if self.warn_below > M {
+            return Err(format!("warn_below {} is above m = {M}", self.warn_below));
+        }
+        if let Repair::Below(n) = self.repair {
+            if n > M {
+                return Err(format!("repair below {n} is above m = {M}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The record's key for the asset whose Register is `target`.
@@ -62,7 +82,9 @@ pub fn target_of(key: &[u8]) -> Option<[u8; 32]> {
     key.strip_prefix(PREFIX)?.try_into().ok()
 }
 
+/// `k` must pass [`Keep::check`]: `below N` is stored as 2 + N in one byte.
 pub fn encode(k: &Keep) -> Vec<u8> {
+    debug_assert!(k.check().is_ok(), "an unchecked policy was stored: {k:?}");
     let mut v = Vec::with_capacity(LEN);
     v.push(VERSION);
     v.push(match k.repair {
