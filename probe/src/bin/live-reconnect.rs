@@ -301,17 +301,7 @@ async fn main() {
 }
 
 async fn run() -> Result<i32> {
-    let v = std::process::Command::new("freenet")
-        .arg("--version")
-        .output()
-        .context("freenet --version")?;
-    println!(
-        "freenet: {}",
-        String::from_utf8_lossy(&v.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-    );
+    println!("freenet: {}", probe::node::freenet_version()?);
     let port: u16 = std::env::var("PAGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
