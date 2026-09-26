@@ -299,7 +299,7 @@ if [ "$MODE" = pr ]; then
       mb=$(git merge-base "$base" HEAD)
       outf=$(mktemp); printf '%s\n' "$out" > "$outf"
       if ! u=$({ git diff "$mb" -- "${paths[@]}"
-                 git ls-files --others --exclude-standard -- "${paths[@]}" | while read -r f; do git diff --no-index /dev/null "$f"; done
+                 git ls-files --others --exclude-standard -- "${paths[@]}" | while read -r f; do git diff --no-index /dev/null "$f" || true; done
                } | node tools/test-targets.mjs unran "$outf"); then
         step_fail "$m: a test this PR adds never ran (sdk#475)"; printf '  %s\n' "$u" >&2
       else
