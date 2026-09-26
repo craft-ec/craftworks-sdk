@@ -271,6 +271,12 @@ pub enum Event {
     /// The page cannot confirm a changed group's other member at once (sdk#416): it is asking the node
     /// (`Held`), and the engine releases one more of that group's parity meanwhile. See [`Effect::ConfirmHeld`].
     HeldUnknown(Cid),
+    /// The node's Block contract REFUSED this block as invalid (sdk#433): a final answer -- the same
+    /// content-addressed bytes are refused again, for ever (an encoding defect, or a node on another contract
+    /// epoch). Never re-put. A commit that needs it and has not sent its head ends its writes `Failed` (never
+    /// `Lost`: re-sent, they would re-derive the same block); a published commit's straggler stays owed (never
+    /// BACKED_UP) and is recorded ([`Engine::rejected_blocks`]). [`Event::PutFailed`] keeps its meaning: put again.
+    PutRejected(Cid),
     Write {
         client: ClientId,
         write_id: WriteId,
@@ -1342,6 +1348,8 @@ pub struct Engine<B: Blocks> {
     /// Published commits whose blocks are still being put (§P): BACKED_UP
     /// when a commit's `remaining` is empty.
     backing: Vec<Backing>,
+    /// Blocks the node's Block contract rejected (`Event::PutRejected`, sdk#433): never put again.
+    rejected: BTreeSet<Cid>,
     /// Writes whose group a later root move RE-CODED (COMMIT-LIFE §P,
     /// superseded stragglers): their data now lives in the newer version of
     /// the group, so they wait for the NEXT own commit's `Backing`, which
@@ -1599,6 +1607,7 @@ impl<B: Blocks> Engine<B> {
             blocks,
             arrived: BTreeMap::new(),
             backing: Vec::new(),
+            rejected: BTreeSet::new(),
             carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
@@ -2083,6 +2092,7 @@ impl<B: Blocks> Engine<B> {
             Event::PutConfirmed(id) => self.on_confirmed(id),
             Event::HeldUnknown(id) => self.on_held_unknown(id),
             Event::PutFailed(id) => self.on_failed(id),
+            Event::PutRejected(id) => self.on_rejected(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
             Event::Tick(now) => self.on_tick(now),
             Event::Flush => self.on_flush(),
@@ -4074,7 +4084,43 @@ impl<B: Blocks> Engine<B> {
         out
     }
 
+    /// `id` was REJECTED by the node's Block contract (`Event::PutRejected`, sdk#433; the architect's rulings).
+    fn on_rejected(&mut self, id: Cid) -> Vec<Effect> {
+        self.rejected.insert(id);
+        let ends = self.pending.as_ref().is_some_and(|c| !c.head_sent && (c.data.contains(&id) || c.packs.contains_key(&id)));
+        if !ends {
+            // A published commit's straggler (or one whose head is out: it may land at k): the Backing stays, so
+            // BACKED_UP never lies; nothing is put again.
+            return Vec::new();
+        }
+        let c = self.pending.take().expect("checked");
+        self.in_flight_since = None;
+        self.unpublished.clear();
+        self.next_seq = self.published_seq + 1;
+        for w in &c.writes {
+            self.told_stalled.remove(w);
+        }
+        // A REAL END (rule 8): the commit's writes are Failed and leave the queue -- re-applied they would
+        // re-derive the same block and be rejected again. The writes behind them go again on the published root.
+        self.queue.retain(|q| !(q.committing && c.writes.contains(&(q.client, q.write_id))));
+        let mut out: Vec<Effect> = c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed }).collect();
+        self.root = self.published_root;
+        self.requeue_from(0);
+        out.extend(self.advance());
+        out
+    }
+
+    /// Blocks the node's Block contract rejected (sdk#433): what the assets dashboard reads as DAMAGED -- a repair
+    /// would recompute the same bytes and be rejected again.
+    pub fn rejected_blocks(&self) -> &BTreeSet<Cid> {
+        &self.rejected
+    }
+
     fn on_failed(&mut self, id: Cid) -> Vec<Effect> {
+        // A block the node's contract REJECTED is never put again (sdk#433).
+        if self.rejected.contains(&id) {
+            return Vec::new();
+        }
         // A published commit's straggler the node refused: put it again from
         // the page's blocks (the page keeps them until BACKED_UP).
         if self.backing.iter().any(|b| b.remaining.contains(&id)) {

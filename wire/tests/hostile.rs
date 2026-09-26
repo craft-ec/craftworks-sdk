@@ -218,7 +218,7 @@ fn no_refusal_may_ever_lead_to_a_credential_prompt() {
         "your session expired, sign in again",
         "please re-enter your passphrase",
     ] {
-        let r = wire::Refused { said: said.into() };
+        let r = wire::Refused { said: said.into(), code: "unhandled" };
         assert!(
             !r.may_prompt_for_credentials(),
             "a node-supplied reason ({said}) was allowed to prompt for a credential"

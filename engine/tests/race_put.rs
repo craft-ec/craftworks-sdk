@@ -579,3 +579,29 @@ fn the_largest_pre_race_put_write_still_publishes_with_its_parity() {
     assert!(states(&all, 1).contains(&State::Published), "{:?}", states(&all, 1));
     assert!(states(&all, 1).contains(&State::ParityComplete), "{:?}", states(&all, 1));
 }
+
+/// A BLOCK THE NODE'S CONTRACT REJECTS (sdk#433; the architect's rulings): `PutRejected` is a REAL END, never a
+/// re-put. A commit in flight needing it (its head not sent) ends: its write is `Failed` -- never `Lost`, whose
+/// re-send would re-derive the same block -- and the block is never put again, even on a later `PutFailed`. A
+/// published commit's straggler rejected stays owed: never BACKED_UP, recorded as damaged, never put again.
+#[test]
+fn a_rejected_block_ends_its_commit_failed_and_is_never_put_again() {
+    // In flight.
+    let mut r = Rig::base();
+    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let victim = *puts(&first).keys().next().expect("a block PUT");
+    let fx = r.step(Event::PutRejected(victim));
+    assert_eq!(states(&fx, 2), vec![State::Failed], "the write needing a rejected block was not told Failed (and only that)");
+    assert!(!puts(&fx).contains_key(&victim), "the rejected block was put again");
+    assert!(!puts(&r.step(Event::PutFailed(victim))).contains_key(&victim), "a later PutFailed put the rejected block again");
+    assert!(r.e.rejected_blocks().contains(&victim));
+    // A published commit's straggler.
+    let mut r = Rig::base();
+    let all = r.commit(3, vec![put("k/000200", b"three")], |id, b| !is_parity(id, b));
+    assert!(states(&all, 3).contains(&State::Published), "THE SETUP: not published with its parity held");
+    let straggler = puts(&all).into_iter().find(|(id, b)| is_parity(id, b)).expect("a parity straggler").0;
+    let fx = r.step(Event::PutRejected(straggler));
+    assert!(fx.is_empty(), "a rejected straggler produced {:?}", fx);
+    assert!(!puts(&r.step(Event::PutFailed(straggler))).contains_key(&straggler), "a rejected straggler was put again");
+    assert!(r.e.rejected_blocks().contains(&straggler), "the rejected straggler is not recorded for the dashboard");
+}

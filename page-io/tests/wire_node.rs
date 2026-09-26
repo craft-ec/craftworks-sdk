@@ -85,6 +85,14 @@ struct WireNode {
     /// (`ContractError::Put`) when `err_keyed`, or naming nothing (`ErrorKind::OperationError`, the live bytes).
     err_block_puts: usize,
     err_keyed: bool,
+    /// The node's words for that error (default: sdk#431's live "No such file or directory (os error 2)").
+    err_cause: &'static str,
+    /// Error the FIRST block PUT of any kind (a data block too), not only a parity one.
+    err_any_block: bool,
+    /// Answer in the KEYLESS text form 0.2.136/0.2.138 use (sdk#433): `OperationError` whose cause is
+    /// `put error for contract {key}, reason: {err_cause}` -- naming `err_text_key` instead when that is set.
+    err_text_form: bool,
+    err_text_key: Option<&'static str>,
     /// The block whose PUTs are answered with the error.
     err_block: Option<[u8; 32]>,
     /// Every block PUT that reached the node: (the clock when it did, the block contract's id).
@@ -147,14 +155,22 @@ fn delegate_error(e: DelegateError) -> Vec<u8> {
 
 /// The node's answer to a PUT it failed on its own side (sdk#431, seen live on 0.2.136): "No such file or directory
 /// (os error 2)", naming the contract (`ContractError::Put`) or naming nothing (`ErrorKind::OperationError`).
-fn put_error(key: ContractKey, keyed: bool) -> Vec<u8> {
+fn put_error(key: ContractKey, keyed: bool, cause: &'static str) -> Vec<u8> {
     use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
-    let cause = "No such file or directory (os error 2)";
     let kind = if keyed {
         ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key, cause: cause.into() }))
     } else {
         ErrorKind::OperationError { cause: cause.into() }
     };
+    bincode::serialize(&Err::<HostResponse, Err>(kind.into())).expect("encodes")
+}
+
+/// The KEYLESS form of a PUT refusal the node sends (sdk#433, probed on 0.2.136 and 0.2.138): an `OperationError`
+/// whose cause is the pinned format `put error for contract {key}, reason: {reason}`.
+fn put_error_text(key: String, reason: &str) -> Vec<u8> {
+    use freenet_stdlib::client_api::ErrorKind;
+    let (prefix, sep) = wire::PUT_ERROR_FORMAT;
+    let kind = ErrorKind::OperationError { cause: format!("{prefix}{key}{sep}{reason}").into() };
     bincode::serialize(&Err::<HostResponse, Err>(kind.into())).expect("encodes")
 }
 
@@ -186,6 +202,10 @@ impl WireNode {
             lose_block_puts: 0,
             err_block_puts: 0,
             err_keyed: false,
+            err_cause: "No such file or directory (os error 2)",
+            err_any_block: false,
+            err_text_form: false,
+            err_text_key: None,
             err_block: None,
             block_puts: Vec::new(),
             now: 0,
@@ -232,6 +252,10 @@ impl WireNode {
             lose_block_puts: 0,
             err_block_puts: 0,
             err_keyed: false,
+            err_cause: "No such file or directory (os error 2)",
+            err_any_block: false,
+            err_text_form: false,
+            err_text_key: None,
             err_block: None,
             block_puts: Vec::new(),
             now: 0,
@@ -327,11 +351,14 @@ impl WireNode {
                         return None;
                     }
                     let parity = state.as_ref().first() == Some(&freenet_prolly::kind::PARITY);
-                    if self.err_block_puts > 0 && parity && self.err_block.is_none_or(|b| b == id) {
+                    if self.err_block_puts > 0 && (parity || self.err_any_block) && self.err_block.is_none_or(|b| b == id) {
                         self.err_block = Some(id);
                         self.err_block_puts -= 1;
                         *self.served.entry("put block answered with an error").or_default() += 1;
-                        return Some(put_error(key, self.err_keyed));
+                        if self.err_text_form {
+                            return Some(put_error_text(self.err_text_key.map(str::to_string).unwrap_or_else(|| key.to_string()), self.err_cause));
+                        }
+                        return Some(put_error(key, self.err_keyed, self.err_cause));
                     }
                     *self.served.entry("put block").or_default() += 1;
                     self.contracts.insert(id, state.as_ref().to_vec());
@@ -1294,6 +1321,82 @@ fn a_block_put_answered_only_with_an_error_is_re_sent_and_never_backed_up() {
             }
         }
     }
+}
+
+/// OUR BLOCK REJECTED BY THE NODE'S BLOCK CONTRACT (sdk#433; the architect's rulings): the node answers the first
+/// block PUT with a pinned VALIDATION refusal -- each of `wire::VALIDATION_REFUSED` -- so it is FINAL: that block is
+/// sent ONCE and never again, the commit that needs it ends, its write is told `Failed` (never `Lost`: re-sent it
+/// would re-derive the same block), and the refusal is named. (An unrecognised keyed refusal stays transient and is
+/// re-sent: the test above, sdk#431's pin.)
+#[test]
+fn a_block_the_nodes_contract_rejects_is_sent_once_and_its_write_fails() {
+    for (text_form, cause) in [false, true].into_iter().flat_map(|t| wire::VALIDATION_REFUSED.into_iter().map(move |c| (t, c))) {
+        let (mut io, mut node, mut now) = opened_at(1_790_253_181_367, cause);
+        node.err_text_form = text_form;
+        let before = node.block_puts.len();
+        node.err_block_puts = usize::MAX;
+        node.err_keyed = true;
+        node.err_cause = cause;
+        node.err_any_block = true;
+        io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
+        let r = live(&mut io, &mut node, &mut now, 70_000);
+        let rejected = node.err_block.unwrap_or_else(|| panic!("{cause:?}: THE SETUP: no block PUT was answered with the refusal"));
+        let sends = node.block_puts[before..].iter().filter(|(_, id)| *id == rejected).count();
+        println!("  {cause:?}: the rejected block reached the node {sends} time(s); states {:?}; unusable {:?}", states(&r, 1), io.unusable());
+        assert_eq!(sends, 1, "{cause:?}: a block the node's contract rejected was sent again ({sends} sends in 70 s)");
+        assert!(states(&r, 1).contains(&WriteState::Failed), "{cause:?}: the write needing a rejected block was not told Failed: {:?}", states(&r, 1));
+        assert!(!states(&r, 1).iter().any(|s| matches!(s, WriteState::Lost | WriteState::Published)), "{cause:?}: told {:?}", states(&r, 1));
+        assert!(io.unusable().iter().any(|u| u.contains("refused block") && u.contains(cause)), "{cause:?}: the rejection was not named: {:?}", io.unusable());
+    }
+}
+
+/// THE NODE'S TEXT NEVER NAMES AN OP WE DO NOT HAVE, AND ONLY A PINNED REASON IS FINAL (sdk#433, the architect's
+/// conditions on the keyless text form): (a) the pinned format naming ANOTHER contract's key is unattributed --
+/// counted, and it ends nothing (the write still publishes); (b) the format naming OUR block with a reason that is
+/// not a pinned validation refusal is attributed but transient -- re-sent on the RTO, never `Failed`.
+#[test]
+fn a_text_named_refusal_is_attributed_only_to_our_put_and_final_only_for_a_pinned_reason() {
+    // (a) A foreign key, a pinned reason.
+    let (mut io, mut node, mut now) = opened_at(1_790_253_181_367, "foreign key");
+    node.err_block_puts = 1;
+    node.err_any_block = true;
+    node.err_text_form = true;
+    node.err_cause = "invalid put";
+    node.err_text_key = Some("11111111111111111111111111111111");
+    io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
+    let r = live(&mut io, &mut node, &mut now, 70_000);
+    println!("  (a) foreign key: states {:?}; node errors {:?}", states(&r, 1), io.node_errors());
+    assert_eq!(io.node_errors().get("put_error_unattributed"), Some(&1), "a text-named refusal of a PUT we do not have was not counted as unattributed");
+    assert!(states(&r, 1).contains(&WriteState::Published), "a refusal naming another contract ended our write: {:?}", states(&r, 1));
+    // (b) Our key, a reason that is not a pinned validation refusal.
+    let (mut io, mut node, mut now) = opened_at(1_790_253_181_367, "our key, i/o reason");
+    let before = node.block_puts.len();
+    node.err_block_puts = usize::MAX;
+    node.err_any_block = true;
+    node.err_text_form = true;
+    io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
+    let r = live(&mut io, &mut node, &mut now, 70_000);
+    let errored = node.err_block.expect("THE SETUP: no block PUT was answered with the error");
+    let sends = node.block_puts[before..].iter().filter(|(_, id)| *id == errored).count();
+    println!("  (b) our key, i/o reason: {sends} send(s); states {:?}", states(&r, 1));
+    assert!(sends >= 3, "a transient text-named refusal was not re-sent on the RTO ({sends} send(s) in 70 s)");
+    assert!(!states(&r, 1).contains(&WriteState::Failed), "a refusal with a reason that is not pinned ended the write Failed");
+}
+
+/// A NODE ERROR NAMING NO OP (sdk#433): COUNTED by its reason code, and it ends nothing and re-arms nothing -- with
+/// the write's PUTs on the wire, the page sends nothing because of it (the RTO stays the one clock).
+#[test]
+fn a_keyless_node_error_is_counted_and_re_arms_nothing() {
+    use freenet_stdlib::client_api::ErrorKind;
+    let (mut io, _node, _now) = opened_at(1_790_253_181_367, "keyless");
+    io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
+    let sent = io.take_frames();
+    assert!(!sent.is_empty(), "THE SETUP: the write put nothing on the wire");
+    let keyless = bincode::serialize(&Err::<HostResponse, Err>(ErrorKind::OperationError { cause: "the node could not".into() }.into())).expect("encodes");
+    io.inbound(&keyless, Ms(1_790_253_181_400));
+    assert_eq!(io.node_errors().get("operation_error"), Some(&1), "the keyless error was not counted by its code: {:?}", io.node_errors());
+    let after = io.take_frames();
+    assert!(after.is_empty(), "a keyless node error sent {} frame(s): it re-armed ops on the wire", after.len());
 }
 
 /// A RELOAD AND A SECOND TAB ARE THE SAME PERSON (the switch-over blocker): a

@@ -208,6 +208,8 @@ pub struct PageIo {
     out: Vec<Vec<u8>>,
     replies: Vec<Vec<u8>>,
     unusable: Vec<String>,
+    /// Node errors that named no op (sdk#433), counted by reason code ([`wire::Refused::code`]).
+    node_errors: BTreeMap<&'static str, u64>,
     /// The signer answered `Provisioned`: it holds the key and the naming.
     provisioned: bool,
     /// Does the SIGNER hold a record for this register (main's ruling on
@@ -343,6 +345,7 @@ impl PageIo {
             out: Vec::new(),
             replies: Vec::new(),
             unusable: Vec::new(),
+            node_errors: BTreeMap::new(),
             provisioned: false,
             signer_has_record: None,
             head_failed_pending: false,
@@ -894,8 +897,35 @@ impl PageIo {
             }
             // A PUT answer nobody here sent: handed back unread.
             answer @ Incoming::Ack(wire::AckKind::Put(_)) => self.others.push(answer),
-            // A refused PUT of our own register or block is what a refusal
-            // naming nothing was before `PutFailed` existed: reported.
+            // OUR OWN BLOCK REJECTED by the node's Block contract (sdk#433): its words match a pinned validation
+            // refusal EXACTLY, so it is final -- `PutRefused { transient: false }`, never put again (rule 8).
+            Incoming::PutFailed { key, said } if self.by_key.contains_key(&key) && wire::is_validation_refusal(&said) => {
+                let cid = self.by_key[&key];
+                self.unusable.push(format!(
+                    "the node's Block contract refused block {} as invalid (\"{said}\"): an encoding defect, or a node on another contract epoch",
+                    engine::short_id(&cid)
+                ));
+                self.server.node(Answer::PutRefused { id: cid, transient: false }, now)
+            }
+            // THE NODE'S TEXT names a PUT (sdk#433, the keyless form 0.2.136/0.2.138 use): attributed ONLY to a PUT of
+            // ours on the wire; FINAL only for a pinned validation reason, else transient (the op stays waiting).
+            Incoming::PutFailedByText { key, said } => {
+                let ours = self.by_key.get(&key).copied().filter(|cid| self.server.page.put_waiting(cid));
+                match ours {
+                    Some(cid) if wire::is_validation_refusal(&said) => {
+                        self.unusable.push(format!(
+                            "the node's Block contract refused block {} as invalid (\"{said}\"): an encoding defect, or a node on another contract epoch",
+                            engine::short_id(&cid)
+                        ));
+                        self.server.node(Answer::PutRefused { id: cid, transient: false }, now)
+                    }
+                    Some(cid) => self.unusable.push(format!("the node refused block {}: {said}", engine::short_id(&cid))),
+                    // A string from the node never names an op this page does not have: counted, ends nothing.
+                    None => *self.node_errors.entry("put_error_unattributed").or_insert(0) += 1,
+                }
+            }
+            // Any other refusal of our own register or block is not known to be final: reported, and the op stays
+            // waiting -- re-sent on its RTO (sdk#431's pin), shown "not answering", the safe side.
             Incoming::PutFailed { key, said } if key == self.register_key || self.by_key.contains_key(&key) => {
                 self.unusable.push(format!("the node refused: {said}"))
             }
@@ -1013,6 +1043,9 @@ impl PageIo {
                 }
             }
             Incoming::Refused(r) => {
+                // A node error naming NO op (sdk#433): COUNTED by its reason code, and it ends nothing and re-arms
+                // nothing -- the RTO stays the one clock for every op on the wire.
+                *self.node_errors.entry(r.code).or_insert(0) += 1;
                 // While the first exchange is unanswered, a refusal that names
                 // nothing is the node refusing IT: opening ends, by name.
                 if self.first.is_some() {
@@ -1041,6 +1074,7 @@ impl PageIo {
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id, .. } => mine(id),
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
+            Incoming::PutFailedByText { key, .. } => my_key(key) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             // A site's change is its own (taken, and read by nobody: the page does not follow a site).
             Incoming::HeadChanged { key, .. } => *key == self.register_key || self.sites.values().any(|s| s.key == *key),
@@ -1116,7 +1150,12 @@ impl PageIo {
         self.server.forced_writes()
     }
 
-    pub fn unusable(&self) -> &[String] {
+    /// Node errors that named no op, by reason code (sdk#433): the unattributed-node-error diagnostic.
+    pub fn node_errors(&self) -> &BTreeMap<&'static str, u64> {
+        &self.node_errors
+    }
+
+        pub fn unusable(&self) -> &[String] {
         &self.unusable
     }
 

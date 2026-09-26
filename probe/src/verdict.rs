@@ -89,3 +89,37 @@ pub fn write_outcome(id: u64, replies: &[protocol::Reply]) -> Option<Result<(), 
         None => format!("write {id} ended {state:?} without Published"),
     }))
 }
+
+/// THE DETECT CHECK for sdk#433's pinned validation refusal (WORKAROUNDS: re-run at every freenet version bump):
+/// `version` is the node's `freenet --version` line, `said` the cause of its answer to a Block PUT its contract must
+/// refuse as invalid. Green only when the node is the version the text was read on AND said one of the pinned texts;
+/// a new version says so by name (confirm the text, then move `VALIDATION_REFUSED_READ_ON`), and drifted words fail
+/// -- a release that changed them would otherwise turn every rejection into an endless re-send.
+pub fn refusal_text(version: &str, said: Option<&str>) -> Result<String, String> {
+    let read_on = wire::VALIDATION_REFUSED_READ_ON;
+    if !version.split_whitespace().any(|w| read_on.contains(&w)) {
+        return Err(format!("the node is {version:?}, and the pinned validation texts were read on {read_on:?}: confirm the text on this version, then add it to VALIDATION_REFUSED_READ_ON"));
+    }
+    match said {
+        Some(s) if wire::is_validation_refusal(s) => Ok(format!("the node's validation refusal says {s:?}, pinned")),
+        Some(s) => Err(format!("the node refused the invalid block saying {s:?}, which is NOT a pinned validation text {:?}: every rejection would be re-sent for ever", wire::VALIDATION_REFUSED)),
+        None => Err("the node did not refuse a Block PUT its contract must reject (no keyed PutFailed)".into()),
+    }
+}
+
+#[cfg(test)]
+mod refusal_text {
+    use super::refusal_text;
+
+    #[test]
+    fn green_only_on_the_version_read_and_a_pinned_text() {
+        assert!(refusal_text("Freenet version: 0.2.136 (7fa2c6605b99)", Some("not valid")).is_ok());
+        assert!(refusal_text("Freenet version: 0.2.136 (7fa2c6605b99)", Some("invalid put")).is_ok());
+        assert!(refusal_text("Freenet version: 0.2.138 (5fb1aa93e15c)", Some("invalid put")).is_ok());
+        // DRIFT: the words changed.
+        assert!(refusal_text("Freenet version: 0.2.136 (7fa2c6605b99)", Some("contract state not valid")).is_err());
+        // A NEW VERSION: named, even with the same words.
+        assert!(refusal_text("Freenet version: 0.2.139 (abc)", Some("not valid")).is_err());
+        assert!(refusal_text("Freenet version: 0.2.136 (7fa2c6605b99)", None).is_err());
+    }
+}

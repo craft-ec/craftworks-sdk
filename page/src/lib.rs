@@ -19,7 +19,7 @@
 //! |---|---|
 //! | `PutBlock` (data AND parity, §P) | the bytes join [`PageBlocks`] (the page is now the memory a node was); held until its `after` set is confirmed, then [`Op::Put`] |
 //! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → asked again on a doubling backoff, the PUT again only after [`HELD_ABSENTS`] absents in a row |
-//! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
+//! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent (the node's Block contract rejected the bytes, sdk#433): `PutRejected`, never put again -- a repair PUT's is dropped and counted |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
 //! | `ConfirmHeld { id }` (another member of a changed group, asked at the commit's start: SAVED and BACKED_UP need the node's word, sdk#416 / class 2) | already confirmed here: `PutConfirmed` at once, no op. Else `HeldUnknown` (the engine counts it absent and sends one more of its group's parity) and [`Op::AskHeld`]; `Held { present: true }` → `PutConfirmed`; absent → asked again on a doubling backoff for as long as it takes (rule 7), put from here only if the page holds its bytes |
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
@@ -595,6 +595,8 @@ pub struct Page {
     /// Landings started, and the most UPDATEs one landing needed.
     landings: u32,
     most_landing_updates: u32,
+    /// Repair PUTs the node's Block contract rejected (sdk#433): dropped, counted.
+    repairs_rejected: u64,
     /// An OLD signer refused on a same-seq record while this page already
     /// stood on the register's head at that seq: the sign waits until a head
     /// read shows the register past it (sdk#225's S1b).
@@ -726,6 +728,7 @@ impl Page {
             verify: None,
             landings: 0,
             most_landing_updates: 0,
+            repairs_rejected: 0,
             old_signer_fork_at: None,
             my_records: BTreeMap::new(),
             last_head_at: 0,
@@ -1003,8 +1006,12 @@ impl Page {
                     if let Op::Put { bytes, .. } = op {
                         self.put_again.insert(id, bytes);
                     }
-                } else if !self.repair_puts.contains(&id) {
-                    self.step(Event::PutFailed(id));
+                } else if self.repair_puts.remove(&id) {
+                    // A REPAIR's PUT rejected (sdk#433): dropped, and counted -- never silently.
+                    self.repairs_rejected += 1;
+                } else {
+                    // FINAL (sdk#433): the node's Block contract refused these bytes; never put again.
+                    self.step(Event::PutRejected(id));
                 }
             }
             Answer::Got { id, bytes } => {
@@ -2562,6 +2569,22 @@ impl Page {
     /// means it never looked — until sdk#119's probe re-derives it.
     pub fn parity_scan(&self) -> &engine::ParityScan {
         self.engine.parity_scan()
+    }
+
+    /// Is this page's PUT of `id` on the wire, or waiting to be sent again (sdk#433: what a node's text-named
+    /// refusal may be attributed to)?
+    pub fn put_waiting(&self, id: &Cid) -> bool {
+        self.deadlines.contains_key(&Waiting::Put(*id)) || self.put_again.contains_key(id)
+    }
+
+    /// Repair PUTs the node's Block contract rejected (sdk#433), dropped.
+    pub fn repairs_rejected(&self) -> u64 {
+        self.repairs_rejected
+    }
+
+    /// Blocks the node's Block contract rejected (sdk#433): damaged, for the assets dashboard.
+    pub fn rejected_blocks(&self) -> &std::collections::BTreeSet<Cid> {
+        self.engine.rejected_blocks()
     }
 
     /// Landings of a signer's record this page started, and the most UPDATEs
