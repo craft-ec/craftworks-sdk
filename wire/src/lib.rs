@@ -474,8 +474,9 @@ pub const HEAD_NAME: &[u8] = b"head";
 
 /// The name the OBSERVATION tree's head is kept under (craftworks-docs OBSERVABILITY §1, sdk#399): the same identity
 /// and the same one [`register_params`], a second fixed name, so support finds a person's recordings from their
-/// identity alone -- no list, no pointer, no inbox.
-pub const OBS_NAME: &[u8] = b"obs";
+/// identity alone -- no list, no pointer, no inbox. ONE owner: the signer's label (`contract_keys::site::OBS_LABEL`,
+/// which can't depend on wire), so the page's name and the signer's are one constant, not two pinned equal.
+pub const OBS_NAME: &[u8] = contract_keys::site::OBS_LABEL;
 
 /// Frame a delegate registration. This is the one that is always chunked.
 pub fn frame_register_delegate(

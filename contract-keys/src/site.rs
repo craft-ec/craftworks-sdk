@@ -32,8 +32,7 @@ pub fn site_params(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
     relabel(register_params, &label)
 }
 
-/// The observation tree's head label (OBSERVABILITY §1, sdk#399): the SAME bytes as `wire::OBS_NAME` (pinned equal by
-/// signer-proto/tests/obs_one_home.rs; this crate can't depend on wire).
+/// The observation tree's head label (OBSERVABILITY §1, sdk#399): its ONE owner; `wire::OBS_NAME` is this constant.
 pub const OBS_LABEL: &[u8] = b"obs";
 
 /// The person's observation-tree head params, from their Register params: the same authority, the label `obs`.

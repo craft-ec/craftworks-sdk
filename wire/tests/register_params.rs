@@ -23,7 +23,6 @@ fn the_one_params_writer_round_trips_through_the_register_crate() {
 /// same bytes, and so the same contract. A drift would sign one register and read another.
 #[test]
 fn the_obs_head_params_are_one_derivation_on_both_sides() {
-    assert_eq!(contract_keys::site::OBS_LABEL, wire::OBS_NAME, "the signer's obs label is not the page's");
     for seed in [1u8, 2, 3] {
         let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes();
         let head = wire::register_params(&key, wire::HEAD_NAME);
