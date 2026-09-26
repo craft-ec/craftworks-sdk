@@ -41,6 +41,9 @@ use page::{Answer, Ext, Label, Ms, Op, Publication};
 use std::collections::BTreeMap;
 use wire::{DelegateKey, Incoming};
 
+mod opening;
+use opening::{Cell, First, HeadEffect, HeadEvent, HeadKnownState, OpenEffect, OpenEvent, Opening, OpeningState, Via};
+
 /// What the page needs to know about the platform: the Block contract's code
 /// (a page PUT carries it), the head Register's code and params, and the
 /// signer delegate's key.
@@ -249,9 +252,9 @@ pub struct PageIo {
     register: ContractContainer,
     register_id: [u8; 32],
     register_key: String,
-    /// The Register exists on the node: this page read it, or its PUT was
-    /// answered. Until then a head goes out as a PUT, which creates it.
-    register_seen: bool,
+    /// DOES THE HEAD EXIST (OPENING.md, Machine 2): read, "no head" said, the signer's record, or named. Changed
+    /// only by [`PageIo::head`].
+    head_known: HeadKnownState,
     /// THE HEAD SUBSCRIPTION, as page-io can honestly report it (sdk#259):
     /// whether the GET-with-subscribe has been SENT, whether the node has
     /// ANSWERED it, and how many head moves it has delivered. A page that
@@ -279,16 +282,14 @@ pub struct PageIo {
     unusable: Vec<String>,
     /// Node errors that named no op (sdk#433), counted by reason code ([`wire::Refused::code`]).
     node_errors: BTreeMap<&'static str, u64>,
-    /// The signer answered `Provisioned`: it holds the key and the naming.
-    provisioned: bool,
-    /// Does the SIGNER hold a record for this register (main's ruling on
-    /// sdk#175)? `None`: not asked yet. Only a signer with NO record — and no
-    /// head it can read — makes a failed head read "no head"; otherwise the
-    /// head exists and a NotFound (which a peered node can answer FALSELY,
-    /// F55) is only silence.
-    signer_has_record: Option<bool>,
-    /// A failed head read waiting on that answer.
-    head_failed_pending: bool,
+    /// THE PAGE'S STANDING WITH ITS NODE'S SIGNER (OPENING.md, Machine 1): new, asking, an owner registering /
+    /// querying / needing a key / provisioning / open / refused, or a reader. Changed only by [`PageIo::open`].
+    opening: OpeningState,
+    /// Events that landed in an IMPOSSIBLE cell of either machine (an answer to a request that state never sent):
+    /// a diagnostic, never a panic (#450); the model test holds it at 0.
+    impossible_cells: u64,
+    /// "No head" was said and then the signer held a record (another tab or device signed first; H1's premise moved).
+    no_head_contradicted: u64,
     /// Node answers about contracts that are not this page's register or
     /// blocks — the app's own PUTs — handed back unread (`take_others`).
     others: Vec<Incoming>,
@@ -302,50 +303,9 @@ pub struct PageIo {
     /// A reader's stream-id range (`reader`), in the top byte; 0 for the
     /// person's own page, which keeps the whole space below it.
     stream_base: u32,
-    /// `begin` asked the signer which Register it signs for, and it holds
-    /// none: the caller mints a key and calls `provision_with`.
-    needs_key: bool,
-    /// The Provision in flight carries a key THIS page minted (`provision_with`
-    /// after "no key"), not one it was given: a `KeyAlreadyProvisioned` then
-    /// means another page provisioned first, and this one opens that Register
-    /// (sdk#343).
-    minted: bool,
-    /// The signer's registration was answered (its `Ack(Registered)`).
-    signer_registered: bool,
-    /// The signer's FIRST request — the Register query (`begin`) or
-    /// Provision (`provision`) — and whether it is out. HELD until the
-    /// registration is answered: sent together with it, the node answered it
-    /// with an EMPTY response 7 times in 12 (#260, measured), and the page
-    /// waited for ever.
-    /// SENT, RE-SENT AND ANSWERED THROUGH THE PAGE'S SENDER (rule 5): the
-    /// registration ([`Ext::RegisterSigner`]) and this first request
-    /// ([`Ext::SignerFirst`]) wait on the page's deadline and RTO until the
-    /// node answers (rules 7, 8) — no timer, count or budget of page-io's own.
-    first: Option<First>,
     /// The signer's container, framed again whenever the page re-sends its
     /// registration.
     signer_container: Option<DelegateContainer>,
-    /// WHY OPENING ENDED, by name (what `open()` reports): the signer's or the
-    /// node's refusal of the first exchange, in its words — a real answer,
-    /// never time.
-    refused: Option<String>,
-    /// [`PageIo::ask`]: this page only ASKS the node's signer which Register
-    /// it holds — nothing is registered, minted or provisioned — and the
-    /// answer ends here ([`Asked`]).
-    asking: bool,
-    asked: Option<Asked>,
-    /// [`PageIo::claim`]: this asked page opens the person's OWN tree after
-    /// all. The answer stays what it was; the page carries on as `begin`'s.
-    claimed: bool,
-}
-
-/// The signer's first request, kept so it can be sent once the registration
-/// is answered, and again after an empty response.
-enum First {
-    /// "Which Register do you sign for?" (`begin`).
-    Query,
-    /// Provision with this signing key (`provision`).
-    Provision(Vec<u8>),
 }
 
 /// The counter part of a reader's stream id; the top byte is its range.
@@ -386,6 +346,12 @@ impl page::server::Host for PageIo {
 
 impl PageIo {
     pub fn new(server: Server, art: Artefacts) -> PageIo {
+        PageIo::build(server, art, OpeningState::owner(), HeadKnownState::unknown())
+    }
+
+    /// The ONE constructor: each machine starts in the state its kind of page starts in (an owner's page `New` /
+    /// `Unknown`, a reader `Reader` / `Named`), and from then on only its transition function changes it.
+    fn build(server: Server, art: Artefacts, opening: OpeningState, head_known: HeadKnownState) -> PageIo {
         let register = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
             std::sync::Arc::new(ContractCode::from(art.register_code.clone())),
             Parameters::from(art.register_params.clone()),
@@ -399,7 +365,7 @@ impl PageIo {
             register,
             register_id,
             register_key,
-            register_seen: false,
+            head_known,
             head_asked: false,
             head_answered: false,
             head_changes: 0,
@@ -415,22 +381,14 @@ impl PageIo {
             replies: Vec::new(),
             unusable: Vec::new(),
             node_errors: BTreeMap::new(),
-            provisioned: false,
-            signer_has_record: None,
-            head_failed_pending: false,
+            opening,
+            impossible_cells: 0,
+            no_head_contradicted: 0,
             others: Vec::new(),
             app_contracts: BTreeMap::new(),
             sites: BTreeMap::new(),
             stream_base: 0,
-            needs_key: false,
-            minted: false,
-            signer_registered: false,
-            first: None,
             signer_container: None,
-            refused: None,
-            asking: false,
-            asked: None,
-            claimed: false,
         }
     }
 
@@ -454,18 +412,18 @@ impl PageIo {
     /// shares: one per tree, so their chunked frames can never be joined.
     pub fn reader(server: Server, block_code: Vec<u8>, register_id: [u8; 32], range: u8) -> PageIo {
         let (_, no_signer) = wire::delegate_from_code(&[]);
-        let mut io = PageIo::new(
+        // A reader: provisioned by construction (nothing of its own to open), and its head was NAMED because it was
+        // published, so a failed read of it is silence and the signer is never asked (there is none).
+        let mut io = PageIo::build(
             server,
             Artefacts { block_code, register_code: Vec::new(), register_params: Vec::new(), signer: no_signer },
+            OpeningState::reader(),
+            HeadKnownState::named(),
         );
         io.register_id = register_id;
         io.register_key = wire::contract_id(register_id).to_string();
         io.server.page.set_read_only();
         io.stream_base = u32::from(range.max(1)) << 24;
-        io.provisioned = true;
-        // "The head exists": a failed read of it is silence, and the signer
-        // is never asked (there is none).
-        io.signer_has_record = Some(true);
         io.server.set_facts(SignerFacts { head_writable: false, head_id: register_id });
         io
     }
@@ -478,35 +436,37 @@ impl PageIo {
     /// is installed, minted or provisioned, and a reader leaves no trace.
     /// The answer: [`PageIo::asked`].
     pub fn ask(&mut self) {
-        self.asking = true;
-        // Not registered by this page, and never will be: the query goes out
-        // at once, and a node without the delegate says so.
-        self.signer_registered = true;
-        self.first = Some(First::Query);
-        self.server.page.send_ext(Ext::SignerFirst, self.server.page.now());
-        self.pump();
+        self.open(OpenEvent::Ask);
     }
 
-    /// [`PageIo::ask`]'s answer, once there is one.
+    /// [`PageIo::ask`]'s answer, once there is one -- and after a claim, still the answer it was.
     pub fn asked(&self) -> Option<&Asked> {
-        self.asked.as_ref().filter(|_| self.asking)
+        match self.opening.get() {
+            Opening::Asking { answer } => answer.as_ref(),
+            Opening::New | Opening::Reader => None,
+            owner @ (Opening::Registering { .. } | Opening::Querying { .. } | Opening::NeedsKey { .. } | Opening::Provisioning { .. } | Opening::Open { .. } | Opening::Refused { .. }) => {
+                match owner.via() {
+                    Some(Via::Claimed(a)) => Some(a),
+                    Some(Via::Begun) | None => None,
+                }
+            }
+        }
     }
 
     /// MAY THIS PAGE WRITE `head` (`None`: its OWN tree, a `mine`
     /// component's)? Derived each time from what this page holds -- the
-    /// signer's answer, the opening -- and kept nowhere else.
+    /// signer's answer, the opening -- and kept nowhere else: ONE match over
+    /// [`Opening`], with no reading order.
     ///
     /// A display gate, not the enforcement: the signer refuses to sign for
     /// anyone else whatever this says, so a wrong answer can only show or hide
     /// inputs. "Yes" means THIS NODE'S SIGNER SIGNS FOR that head; a keyset
     /// (a device key among an identity's keys) is Phase 6.
     pub fn may_write(&self, head: Option<[u8; 32]>) -> MayWrite {
-        if self.read_only() {
-            return MayWrite::No(READ_ONLY.into());
-        }
         let other = |r: &[u8; 32]| MayWrite::No(format!("this node signs for another head ({})", hex(r)));
-        if self.asking() {
-            return match (&self.asked, head) {
+        match self.opening.get() {
+            Opening::Reader => MayWrite::No(READ_ONLY.into()),
+            Opening::Asking { answer } => match (answer, head) {
                 (None, _) => MayWrite::Undecided("asking this node's signer whose node it is".into()),
                 (Some(Asked::Register(_)), None) => MayWrite::Yes,
                 (Some(Asked::Register(r)), Some(h)) if h == *r => MayWrite::Yes,
@@ -518,39 +478,48 @@ impl PageIo {
                 (Some(Asked::NoKey | Asked::NoSigner(_)), Some(_)) => MayWrite::No("this node holds no key for that head".into()),
                 (Some(Asked::Refused(w)), None) => MayWrite::Unknown(w.clone()),
                 (Some(Asked::Refused(w)), Some(_)) => MayWrite::No(w.clone()),
-            };
-        }
-        if let Some(r) = self.refused.as_ref() {
-            return if head.is_none() { MayWrite::Unknown(r.clone()) } else { MayWrite::No(r.clone()) };
-        }
-        if self.provisioned {
-            return match head {
+            },
+            Opening::Refused { why, .. } => {
+                if head.is_none() {
+                    MayWrite::Unknown(why.clone())
+                } else {
+                    MayWrite::No(why.clone())
+                }
+            }
+            Opening::Open { .. } => match head {
                 None => MayWrite::Yes,
                 Some(h) if h == self.register_id => MayWrite::Yes,
                 Some(_) => other(&self.register_id),
-            };
-        }
-        // Still opening its own tree: a write waits in the engine for the
-        // head, as it always has; another head is not known to be ours yet.
-        match head {
-            None => MayWrite::Yes,
-            Some(_) => MayWrite::Undecided("opening: this node's signer has not said whose node it is yet".into()),
+            },
+            // Still opening its own tree: a write waits in the engine for the
+            // head, as it always has; another head is not known to be ours yet.
+            Opening::New | Opening::Registering { .. } | Opening::Querying { .. } | Opening::NeedsKey { .. } | Opening::Provisioning { .. } => match head {
+                None => MayWrite::Yes,
+                Some(_) => MayWrite::Undecided("opening: this node's signer has not said whose node it is yet".into()),
+            },
         }
     }
 
     /// Was this page only asked (`ask`), and not (yet) claimed?
     pub fn asking(&self) -> bool {
-        self.asking && !self.claimed
+        matches!(self.opening.get(), Opening::Asking { .. })
     }
 
     /// THE USER HAS NO TREE HERE YET (DATA-SOURCE `mine`: made on the first
     /// WRITE): an asked page whose node's signer holds no key, or has no
-    /// signer, and which has not been provisioned. Its tree reads as EMPTY --
-    /// its head read is answered "missing" here, and nothing goes to the node
-    /// -- until a first write provisions it ([`PageIo::claim`], then the
-    /// existing provision path).
+    /// signer, and which has not been provisioned -- asked still, or claimed
+    /// and not yet open. Its tree reads as EMPTY -- its head read is answered
+    /// "missing" here, and nothing goes to the node -- until a first write
+    /// provisions it ([`PageIo::claim`], then the existing provision path).
     pub fn no_tree_yet(&self) -> bool {
-        self.asking && !self.provisioned && matches!(self.asked, Some(Asked::NoKey | Asked::NoSigner(_)))
+        let none_here = |a: &Asked| matches!(a, Asked::NoKey | Asked::NoSigner(_));
+        match self.opening.get() {
+            Opening::Asking { answer } => answer.as_ref().is_some_and(none_here),
+            Opening::Open { .. } | Opening::Reader | Opening::New => false,
+            Opening::Registering { via, .. } | Opening::Querying { via } | Opening::NeedsKey { via } | Opening::Provisioning { via, .. } | Opening::Refused { via, .. } => {
+                matches!(via, Via::Claimed(a) if none_here(a))
+            }
+        }
     }
 
     /// OPEN THE PERSON'S OWN TREE ON AN ASKED PAGE (DATA-SOURCE `mine`):
@@ -563,31 +532,9 @@ impl PageIo {
     ///
     /// Refused, or not answered yet: nothing is claimed, and
     /// `false` says so. The head itself is created on the first write, by
-    /// the first commit's PUT (as `begin`'s).
+    /// the first commit's PUT (as `begin`'s). A page claimed already answers `true`.
     pub fn claim(&mut self, signer: DelegateContainer) -> bool {
-        if !self.asking() {
-            return self.asking && self.claimed;
-        }
-        match self.asked.clone() {
-            Some(Asked::Register(_)) => {
-                self.claimed = true;
-                self.provisioned = true;
-                self.signer_provisioned();
-                true
-            }
-            Some(Asked::NoKey) => {
-                self.claimed = true;
-                self.needs_key = true;
-                true
-            }
-            Some(Asked::NoSigner(_)) => {
-                self.claimed = true;
-                self.signer_registered = false;
-                self.register_signer(signer, First::Query);
-                true
-            }
-            Some(Asked::Refused(_)) | None => false,
-        }
+        self.open(OpenEvent::Claim(signer))
     }
 
     /// OPEN THE PERSON'S OWN TREE (a switch-over blocker): register the signer
@@ -598,37 +545,85 @@ impl PageIo {
     /// signer holds no key: [`PageIo::needs_key`], and the caller mints one
     /// and calls [`PageIo::provision_with`]. The key never leaves the signer.
     pub fn begin(&mut self, signer: DelegateContainer) {
-        self.register_signer(signer, First::Query);
-    }
-
-    /// Register the signer ALONE; its first request goes once the node has
-    /// answered the registration (`inbound`, `Ack(Registered)`).
-    fn register_signer(&mut self, signer: DelegateContainer, first: First) {
-        self.signer_container = Some(signer);
-        self.first = Some(first);
-        self.server.page.send_ext(Ext::RegisterSigner, self.server.page.now());
-        self.pump();
+        self.open(OpenEvent::Begin(signer));
     }
 
     /// The signer holds no key (`begin`'s answer): mint one and `provision_with` it.
     pub fn needs_key(&self) -> bool {
-        self.needs_key
+        matches!(self.opening.get(), Opening::NeedsKey { .. })
     }
 
     /// Provision a signer that holds no key, for the Register `register_params`
     /// names (the minted key's). Only after `begin` said it needs one.
     pub fn provision_with(&mut self, signing_key: Vec<u8>, register_params: Vec<u8>) {
-        if !std::mem::take(&mut self.needs_key) {
-            self.unusable.push("provision_with: the signer was not asked, or already holds a key".into());
-            return;
+        self.open(OpenEvent::ProvisionWith(signing_key, register_params));
+    }
+
+    /// THE ONE WRITER OF [`Opening`] (a source test holds it): the table's step, applied -- the state set, then its
+    /// effects carried out in order. Returns `claim`'s answer.
+    fn open(&mut self, ev: OpenEvent) -> bool {
+        let now = self.server.page.now();
+        let step = self.opening.step(ev);
+        if step.cell == Cell::Impossible {
+            self.impossible_cells += 1;
         }
-        self.set_register(register_params);
-        self.minted = true;
-        // The signer is registered already (it answered the query): the
-        // Provision is the first request now, sent and re-sent like one.
-        self.first = Some(First::Provision(signing_key));
-        self.server.page.send_ext(Ext::SignerFirst, self.server.page.now());
+        for effect in step.effects {
+            match effect {
+                OpenEffect::Register(c) => {
+                    self.signer_container = Some(c);
+                    self.server.page.send_ext(Ext::RegisterSigner, now);
+                }
+                OpenEffect::RegistrationAnswered => {
+                    self.server.page.ext_answered(Ext::RegisterSigner, now);
+                    self.server.page.send_ext(Ext::SignerFirst, now);
+                }
+                OpenEffect::SendFirst => self.server.page.send_ext(Ext::SignerFirst, now),
+                OpenEffect::FirstAnswered => self.server.page.ext_answered(Ext::SignerFirst, now),
+                OpenEffect::SetRegister(params) => self.set_register(params),
+                OpenEffect::SignerProvisioned => self.signer_provisioned(),
+                OpenEffect::StepCanSign => self.step_can_sign(),
+                OpenEffect::Unusable(why) => self.unusable.push(why),
+            }
+        }
         self.pump();
+        step.claimed
+    }
+
+    /// THE ONE WRITER OF [`HeadKnown`] (a source test holds it).
+    fn head(&mut self, ev: HeadEvent, now: Ms) {
+        let (effects, cell) = self.head_known.step(ev);
+        if cell == Cell::Impossible {
+            self.impossible_cells += 1;
+        }
+        for effect in effects {
+            match effect {
+                HeadEffect::AskRecord => self.ask_record(now),
+                HeadEffect::NoHead => self.server.node(Answer::Head { label: Label::Head, read: None }, now),
+                HeadEffect::Contradicted => self.no_head_contradicted += 1,
+            }
+        }
+    }
+
+    /// Events that landed in an impossible cell of the opening tables (a diagnostic; 0 on any real node's answers).
+    pub fn impossible_cells(&self) -> u64 {
+        self.impossible_cells
+    }
+
+    /// Times "no head" was said and the signer then held a record (another tab or device signed first).
+    pub fn no_head_contradicted(&self) -> u64 {
+        self.no_head_contradicted
+    }
+
+    /// The instance id of the Register `params` name (under this page's Register code): what an asked page's answer
+    /// records, derived by the same construction `set_register` makes.
+    fn register_id_of(&self, params: &[u8]) -> [u8; 32] {
+        let register = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(self.art.register_code.clone())),
+            Parameters::from(params.to_vec()),
+        )));
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&register.key().id().as_bytes()[..32]);
+        id
     }
 
     /// Name the Register this page's head lives in.
@@ -756,17 +751,13 @@ impl PageIo {
     /// (real device keys are sdk#14). `provisioned()` turns true when the
     /// signer answers `Provisioned`.
     pub fn provision(&mut self, signer: DelegateContainer, signing_key: Vec<u8>) {
-        // A READER installs nothing on the node it reads from (sdk#239).
-        if self.read_only() {
-            self.unusable.push("read-only: provisioning refused — a reader installs nothing".into());
-            return;
-        }
-        self.register_signer(signer, First::Provision(signing_key));
+        // A READER installs nothing on the node it reads from (sdk#239): the table's refused call, named.
+        self.open(OpenEvent::Provide(signer, signing_key));
     }
 
-    /// The signer said it holds the key and the naming.
+    /// The signer said it holds the key and the naming (or this is a reader: nothing of its own to open).
     pub fn provisioned(&self) -> bool {
-        self.provisioned
+        matches!(self.opening.get(), Opening::Open { .. } | Opening::Reader)
     }
 
     /// THE SOCKET WAS REPLACED (sdk#376). Everything that belonged to the old
@@ -781,6 +772,10 @@ impl PageIo {
     pub fn reconnected(&mut self, now: Ms) {
         self.frames = wire::Reassembler::default();
         self.head_answered = false;
+        // Both tables' Reconnected columns: nothing of the opening is lost (the signer's install survives; what is
+        // out is re-sent on the RTO), and the head exists or not whatever the socket did.
+        self.open(OpenEvent::Reconnected);
+        self.head(HeadEvent::Reconnected, now);
         self.server.page.reconnected(now);
         self.tick(now);
     }
@@ -799,7 +794,7 @@ impl PageIo {
             failed: self.head_failed,
             // Opening ended — refused in someone's words, or its re-asks spent:
             // there is no head read coming, so no subscription either.
-            ended: self.refused.clone(),
+            ended: self.refused().map(str::to_string),
         }
     }
 
@@ -816,7 +811,7 @@ impl PageIo {
         // The user's own tree was NOT yet theirs to sign (`no_tree_yet`)
         // and now is: the queue held while it could not sign is cut, as ONE
         // commit.
-        if self.asking && matches!(self.asked, Some(Asked::NoKey | Asked::NoSigner(_))) {
+        if matches!(self.asked(), Some(Asked::NoKey | Asked::NoSigner(_))) {
             self.step_can_sign();
         }
     }
@@ -852,7 +847,7 @@ impl PageIo {
         match incoming {
             Incoming::Got { id, state } => {
                 if id == self.register_id {
-                    self.register_seen = true;
+                    self.head(HeadEvent::Got, now);
                     // The GET that carried `subscribe` was answered: the node
                     // holds this page's subscription to the head (sdk#259).
                     self.head_answered = true;
@@ -899,15 +894,8 @@ impl PageIo {
                     // this is SILENCE: re-asked on the RTO with no end (rule 8),
                     // shown as "not answering for N s". Opening an empty tree over an existing app
                     // would have its first commit PUT a second register that
-                    // F56 then merges against the real one (sdk#175).
-                    match (self.register_seen, self.signer_has_record) {
-                        (false, Some(false)) => self.server.node(Answer::Head { label: Label::Head, read: None }, now),
-                        (false, None) => {
-                            self.head_failed_pending = true;
-                            self.ask_record(now);
-                        }
-                        _ => {}
-                    }
+                    // F56 then merges against the real one (sdk#175). Machine 2 decides which.
+                    self.head(HeadEvent::NotFound, now);
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
                     self.server.node(Answer::GetMissed(cid), now);
                 }
@@ -916,7 +904,7 @@ impl PageIo {
                 if key == self.register_key || self.by_key.contains_key(&key) =>
             {
                 if key == self.register_key {
-                    self.register_seen = true;
+                    self.head(HeadEvent::PutAcked, now);
                     self.server.node(Answer::Updated { label: Label::Head }, now);
                 } else if let Some(cid) = self.by_key.get(&key).copied() {
                     self.server.node(Answer::PutOk(cid), now);
@@ -936,20 +924,14 @@ impl PageIo {
             // reads an EMPTY as a request that arrived before the registration
             // took (#260) — NOT an answer — and leaves it to the RTO.
             Incoming::Ack(wire::AckKind::Registered(key)) if key == self.art.signer.to_string() => {
-                if !self.signer_registered {
-                    self.signer_registered = true;
-                    self.server.page.ext_answered(Ext::RegisterSigner, now);
-                    self.server.page.send_ext(Ext::SignerFirst, now);
-                } else {
-                    self.no_signer_here("no signer on this node: it answered EMPTY", now);
-                }
+                self.open(OpenEvent::EmptyAck("no signer on this node: it answered EMPTY".into()));
             }
             // "NO SUCH DELEGATE HERE", naming it: what 0.2.137+ answers where 0.2.136 answered EMPTY (#5729, sdk#439).
             // The same two readings as the EMPTY above: to a page only ASKING, the answer; to a page that registered
             // the signer itself, a request that arrived before the registration took -- not an answer, re-sent on
             // the RTO.
             Incoming::DelegateMissing { key } if key == self.art.signer.to_string() => {
-                self.no_signer_here("no signer on this node: it answered Missing", now);
+                self.open(OpenEvent::DelegateMissing("no signer on this node: it answered Missing".into()));
             }
             Incoming::DelegateMissing { key } => self.unusable.push(format!("the node has no delegate {key}")),
             // The node's delegate BACKOFF after a failure: not an answer to anything; the request it throttled is
@@ -1012,65 +994,31 @@ impl PageIo {
                     // A REAL answer to the signer's first request ends it: no
                     // more re-sends, and a later empty response is nobody's.
                     if matches!(answer, Some((REGISTER_QUERY_ID | PROVISION_ID, _))) {
-                        self.first = None;
                         self.server.page.ext_answered(Ext::SignerFirst, now);
                     }
                     if matches!(answer, Some((RECORD_QUERY_ID, _))) {
                         self.server.page.ext_answered(Ext::AskRecord, now);
                     }
                     match answer {
-                        // `begin`'s question: which Register? Named: open it,
-                        // provisioned already. None: the caller mints a key.
-                        // Only ASKED (`ask`): the answer is recorded, and
-                        // nothing is opened, minted or provisioned.
-                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) if self.asking() => {
-                            self.asked = Some(match params {
-                                Some(params) => {
-                                    self.set_register(params);
-                                    Asked::Register(self.register_id)
-                                }
-                                None => Asked::NoKey,
+                        // The first exchange's answers: Machine 1 decides what each means in the page's state.
+                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => {
+                            let named = params.map(|p| {
+                                let id = self.register_id_of(&p);
+                                (p, id)
                             });
-                            self.step_can_sign();
+                            self.open(OpenEvent::Register(named));
                         }
-                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Register { params })) => match params {
-                            Some(params) => {
-                                self.set_register(params);
-                                // Whether it has SIGNED anything is the record
-                                // query's to say (`ask_record`): provisioned is
-                                // not "has a head".
-                                self.provisioned = true;
-                                self.signer_provisioned();
-                            }
-                            None => self.needs_key = true,
-                        },
                         Some((_, signer_proto::Answer::Provisioned)) => {
-                            self.provisioned = true;
-                            self.signer_provisioned();
+                            self.open(OpenEvent::Provisioned);
                         }
-                        // A KEY IS HERE ALREADY (sdk#343): another page, told
-                        // "no key" as this one was, provisioned first. An
-                        // ANSWER, not an end: ask again which Register the
-                        // signer holds and open THAT one -- one identity per
-                        // node (rule 15); the key this page minted is dropped.
-                        // Only for a minted key: a key the page was GIVEN
-                        // (`provision`) is refused as before.
-                        Some((PROVISION_ID, signer_proto::Answer::Refused(signer_proto::Why::KeyAlreadyProvisioned)))
-                            if std::mem::take(&mut self.minted) =>
-                        {
-                            self.first = Some(First::Query);
-                            self.server.page.send_ext(Ext::SignerFirst, now);
+                        Some((PROVISION_ID, signer_proto::Answer::Refused(signer_proto::Why::KeyAlreadyProvisioned))) => {
+                            self.open(OpenEvent::KeyAlreadyHere);
                         }
                         Some((PROVISION_ID, signer_proto::Answer::Refused(why))) => {
-                            self.refused = Some(format!("the signer refused provisioning: {why:?}"));
-                            self.unusable.push(format!("the signer refused provisioning: {why:?}"));
-                        }
-                        Some((REGISTER_QUERY_ID, signer_proto::Answer::Refused(why))) if self.asking() => {
-                            self.asked = Some(Asked::Refused(format!("the signer refused to say which Register it signs for: {why:?}")));
+                            self.open(OpenEvent::ProvisionRefused(format!("{why:?}")));
                         }
                         Some((REGISTER_QUERY_ID, signer_proto::Answer::Refused(why))) => {
-                            self.refused = Some(format!("the signer refused to say which Register it signs for: {why:?}"));
-                            self.unusable.push(format!("the signer refused the register query: {why:?}"));
+                            self.open(OpenEvent::QueryRefused(format!("{why:?}")));
                         }
                         // The record query's answer (`ask_record`).
                         Some((RECORD_QUERY_ID, answer)) => {
@@ -1083,12 +1031,7 @@ impl PageIo {
                                 A::AlreadySigned(_) | A::NotNext { .. } | A::Refused(Why::Forked { .. }) => Some(true),
                                 _ => None,
                             };
-                            if let Some(h) = has {
-                                self.signer_has_record = Some(h);
-                                if !h && std::mem::take(&mut self.head_failed_pending) && !self.register_seen {
-                                    self.server.node(Answer::Head { label: Label::Head, read: None }, now);
-                                }
-                            }
+                            self.head(HeadEvent::Record(has), now);
                         }
                         Some((id, signer_proto::Answer::Held { present })) => {
                             // As the signer said it: `present[i]` answers the op's `ids[i]`; a short one is the page's
@@ -1121,15 +1064,8 @@ impl PageIo {
                 // nothing -- the RTO stays the one clock for every op on the wire.
                 *self.node_errors.entry(r.code).or_insert(0) += 1;
                 // While the first exchange is unanswered, a refusal that names
-                // nothing is the node refusing IT: opening ends, by name.
-                if self.first.is_some() {
-                    self.first = None;
-                    self.server.page.ext_answered(Ext::SignerFirst, now);
-                    self.refused = Some(format!("the node refused: {}", r.said));
-                    if self.asking() {
-                        self.asked = Some(Asked::Refused(format!("the node refused: {}", r.said)));
-                    }
-                }
+                // nothing is the node refusing IT: opening ends, by name (Machine 1's NodeRefused column).
+                self.open(OpenEvent::NodeRefused(r.said.clone()));
                 self.unusable.push(format!("the node refused: {}", r.said))
             }
             Incoming::Unusable(u) => self.unusable.push(format!("{u:?}")),
@@ -1179,19 +1115,6 @@ impl PageIo {
         }
     }
 
-    /// THE NODE SAYS IT HAS NO SIGNER (EMPTY on 0.2.136, Missing on 0.2.137+). Only an ASKING page's outstanding
-    /// first request is answered by it -- the definite "no signer here" that lets a visitor make their own tree.
-    /// Anywhere else it is not an answer, and the page's sender re-sends on its RTO.
-    fn no_signer_here(&mut self, said: &str, now: Ms) {
-        if self.asking() && self.first.is_some() && self.server.page.ext_waiting(Ext::SignerFirst) {
-            self.first = None;
-            self.server.page.ext_answered(Ext::SignerFirst, now);
-            self.asked = Some(Asked::NoSigner(said.into()));
-            // What the engine may do now depends on it (#342: no tree yet → writes wait, unput).
-            self.step_can_sign();
-        }
-    }
-
     /// The page's clock.
     pub fn tick(&mut self, now: Ms) {
         self.server.tick(now);
@@ -1200,7 +1123,10 @@ impl PageIo {
 
     /// Opening was REFUSED — by the signer or the node, in its words.
     pub fn refused(&self) -> Option<&str> {
-        self.refused.as_deref()
+        match self.opening.get() {
+            Opening::Refused { why, .. } => Some(why),
+            Opening::New | Opening::Registering { .. } | Opening::Querying { .. } | Opening::NeedsKey { .. } | Opening::Provisioning { .. } | Opening::Open { .. } | Opening::Asking { .. } | Opening::Reader => None,
+        }
     }
 
     /// The request that has waited longest for an answer, and for how long
@@ -1339,7 +1265,7 @@ impl PageIo {
                     None => Err(format!("a PUT of {app}'s site, which is not being published")),
                 },
                 Op::Update { label: Label::Head, state } => {
-                    if self.register_seen {
+                    if self.head_known.get().seen() {
                         wire::frame_update(self.register.key(), state, stream)
                     } else {
                         // The first head: the Register does not exist yet, and
@@ -1373,12 +1299,12 @@ impl PageIo {
                     Some(c) => wire::frame_register_delegate(c, stream),
                     None => Err("the signer's registration, with no signer to register".into()),
                 },
-                Op::Ext(Ext::SignerFirst) => match self.first.as_ref() {
+                Op::Ext(Ext::SignerFirst) => match self.opening.get().first() {
                     Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
                     Some(First::Provision(key)) => wire::signer::frame_provision(
                         &self.art.signer,
                         PROVISION_ID,
-                        key.clone(),
+                        key,
                         self.art.register_code.clone(),
                         self.art.register_params.clone(),
                         self.art.block_code.clone(),
@@ -1518,5 +1444,68 @@ mod held_batch {
         assert!(io.inbound(&bytes, Ms(2)), "the signer's Held answer was not taken");
         assert!(io.held.is_empty(), "the answered batch is still mapped");
         assert!(!io.server.page.waiting(), "a block of the answered batch is still owed an ask");
+    }
+}
+
+/// THE OPENING TABLES' WIRING (sdk#484): a reader starts where its provenance says (each machine's ONE writer is by TYPE,
+/// in opening.rs: a private field whose only `&mut` method is `step`), and
+/// the Reconnected column holds through PageIo (its live gate is the probe live-reconnect, sdk#491).
+#[cfg(test)]
+mod opening_wiring {
+    use super::*;
+
+    fn owner() -> PageIo {
+        let (_, signer) = wire::delegate_from_code(b"opening wiring signer");
+        PageIo::new(
+            page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Page, Ms(0)), page::server::SignerFacts::default()),
+            Artefacts { block_code: b"b".to_vec(), register_code: b"r".to_vec(), register_params: wire::register_params(&[1u8; 32], wire::HEAD_NAME), signer },
+        )
+    }
+
+    /// Frames that register a delegate or carry a signer request: what a reconnect must NOT re-send for an open page.
+    fn signer_frames(frames: &[Vec<u8>]) -> usize {
+        use freenet_stdlib::client_api::{ClientRequest, DelegateRequest};
+        frames
+            .iter()
+            .filter(|f| matches!(bincode::deserialize::<ClientRequest>(f), Ok(ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate { .. } | DelegateRequest::ApplicationMessages { .. }))))
+            .count()
+    }
+
+    /// A READER's head is NAMED (someone published it), never "the signer has a record" (nobody said so).
+    #[test]
+    fn a_reader_starts_named_and_reader() {
+        let io = PageIo::reader(page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Page, Ms(0)), page::server::SignerFacts::default()), b"b".to_vec(), [4; 32], 1);
+        assert_eq!(io.head_known.get(), opening::HeadKnown::Named);
+        assert_eq!(*io.opening.get(), Opening::Reader);
+        assert!(io.provisioned() && io.read_only());
+    }
+
+    /// THE RECONNECTED COLUMN through PageIo: an OPEN page re-registers nothing and asks the signer nothing (the install
+    /// survives; freenet v0.2.138 client_events.rs 1712-1730) and stays open (its head's re-read WITH subscribe is the
+    /// live probe's to show, live-reconnect). THE CONTROL: a page still QUERYING keeps its query out (re-sent on its RTO), and is not open.
+    #[test]
+    fn a_reconnect_keeps_an_open_page_open_and_sends_the_signer_nothing() {
+        let mut io = owner();
+        let (c, _) = wire::delegate_from_code(b"opening wiring signer");
+        io.begin(c);
+        io.open(OpenEvent::EmptyAck("registered".into()));
+        assert!(matches!(io.opening.get(), Opening::Querying { .. }), "THE SETUP: the registration's answer did not move to Querying");
+        let mut querying = owner();
+        let (c2, _) = wire::delegate_from_code(b"opening wiring signer");
+        querying.begin(c2);
+        querying.open(OpenEvent::EmptyAck("registered".into()));
+        let params = wire::register_params(&[2u8; 32], wire::HEAD_NAME);
+        let id = io.register_id_of(&params);
+        io.open(OpenEvent::Register(Some((params, id))));
+        assert!(io.provisioned(), "THE SETUP: the page is not open");
+        io.take_frames();
+        querying.take_frames();
+        io.reconnected(Ms(5_000));
+        let frames = io.take_frames();
+        assert!(io.provisioned() && matches!(io.opening.get(), Opening::Open { .. }), "a reconnect changed an open page's opening");
+        assert_eq!(signer_frames(&frames), 0, "an open page re-registered or asked the signer on a reconnect");
+        assert_eq!(io.impossible_cells(), 0);
+        querying.reconnected(Ms(5_000));
+        assert!(matches!(querying.opening.get(), Opening::Querying { .. }) && !querying.provisioned(), "THE CONTROL: a querying page's opening moved on a reconnect");
     }
 }
