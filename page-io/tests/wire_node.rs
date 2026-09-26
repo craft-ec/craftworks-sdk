@@ -2686,3 +2686,35 @@ fn an_errored_parity_superseded_by_a_later_commit_is_withdrawn_and_backed_up_onl
         }
     }
 }
+
+/// EVERY FRAME KIND `owns()` CLAIMS IS DECIDED (sdk#483): the ones that fell into `inbound`'s `_ => {}` and vanished
+/// now each have an arm, and each arm's decision is visible. (That no new kind can vanish is the COMPILER's: the match
+/// has no catch-all.)
+#[test]
+fn every_frame_kind_the_page_claims_is_decided_never_dropped() {
+    let node = WireNode::new(&[4u8; 32]);
+    let register = ContractKey::from_id_and_code(ContractInstanceId::new(node.register_id), CodeHash::new([0u8; 32]));
+
+    // The node confirms the HEAD subscription: recorded as answered, where `head_subscription()` reads it.
+    let mut io = page_io(&node);
+    assert!(!io.head_subscription().answered, "THE SETUP: the head was answered before the ack");
+    assert!(io.inbound(&ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key: register, subscribed: true })), Ms(1)), "the head's subscription answer was not claimed");
+    assert!(io.head_subscription().answered, "the node's Subscribed for the head was dropped");
+
+    // `Ok` names nothing: taken, and nothing is made of it (no op ends on it, nothing is reported).
+    let mut io = page_io(&node);
+    assert!(io.inbound(&ok(HostResponse::Ok), Ms(1)));
+    assert!(io.unusable().is_empty() && io.take_others().is_empty(), "an Ok was read as something: {:?}", io.unusable());
+
+    // A registration of a delegate this page did not register: NAMED, not dropped.
+    let mut io = page_io(&node);
+    let (_, other) = wire::delegate_from_code(b"a delegate this page never registered");
+    assert!(io.inbound(&ok(HostResponse::DelegateResponse { key: other.clone(), values: Vec::new() }), Ms(1)));
+    assert_eq!(io.unusable(), [format!("the node registered a delegate this page did not register: {other}")]);
+
+    // A CHUNK of a larger message: taken, and nothing handed on until the message is whole.
+    let mut io = page_io(&node);
+    let chunk = ok(HostResponse::StreamChunk { stream_id: 7, index: 0, total: 2, data: vec![1, 2, 3].into() });
+    assert!(io.inbound(&chunk, Ms(1)), "a chunk was not claimed");
+    assert!(io.unusable().is_empty(), "a first chunk was reported: {:?}", io.unusable());
+}
