@@ -12,34 +12,12 @@
 //!
 //! usage: ws-lose <listen-port> <node-ws-port> --group data|root --lose m|m+1
 //!        (both ports on 127.0.0.1; `probe::node::RESERVED` refused)
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
-use futures::{SinkExt, StreamExt};
 use probe::lose::{chosen_line, not_found_line, parse_lose, Lose, Target, Verdict};
-use std::sync::atomic::{AtomicU64, Ordering};
+use probe::proxy::{serve, Hooks};
 use std::sync::{Arc, Mutex};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
-
-/// Is this the first packet of a WebSocket upgrade? (Peeked, not consumed.)
-async fn is_upgrade(s: &TcpStream) -> bool {
-    let mut buf = [0u8; 2048];
-    match s.peek(&mut buf).await {
-        Ok(n) => String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase().contains("upgrade: websocket"),
-        Err(_) => false,
-    }
-}
-
-async fn pipe(client: TcpStream, node_port: u16) -> Result<()> {
-    let node = TcpStream::connect(("127.0.0.1", node_port)).await.context("the node")?;
-    let (mut cr, mut cw) = client.into_split();
-    let (mut nr, mut nw) = node.into_split();
-    let a = tokio::io::copy(&mut cr, &mut nw);
-    let b = tokio::io::copy(&mut nr, &mut cw);
-    let _ = tokio::join!(a, b);
-    Ok(())
-}
 
 /// The answer this proxy sends in place of `m`: the node's own `NotFound` for a lost block, or `m` itself.
 fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
@@ -83,33 +61,12 @@ fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
     }
 }
 
-// The handshake callback's `Result<Response, ErrorResponse>` is tungstenite's signature, not ours to shrink.
-#[allow(clippy::result_large_err)]
-async fn websocket(client: TcpStream, node_port: u16, lose: Arc<Mutex<Lose>>) -> Result<()> {
-    let mut path = String::new();
-    let client = tokio_tungstenite::accept_hdr_async(client, |req: &Request, resp: Response| {
-        path = req.uri().to_string();
-        Ok(resp)
-    })
-    .await
-    .context("accepting the page's WebSocket")?;
-    let (node, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{node_port}{path}")).await.context("the node's WebSocket")?;
-    let (mut c_tx, mut c_rx) = client.split();
-    let (mut n_tx, mut n_rx) = node.split();
-    let up = async move {
-        while let Some(m) = c_rx.next().await {
-            n_tx.send(m?).await?;
-        }
-        anyhow::Ok(())
-    };
-    let down = async move {
-        while let Some(m) = n_rx.next().await {
-            c_tx.send(answer(&lose, m?)).await?;
-        }
-        anyhow::Ok(())
-    };
-    let _ = tokio::join!(up, down);
-    Ok(())
+struct LoseHooks(Mutex<Lose>);
+
+impl Hooks for LoseHooks {
+    fn down(&self, _conn: u64, m: Message) -> Option<Message> {
+        Some(answer(&self.0, m))
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -121,22 +78,6 @@ async fn main() -> Result<()> {
         bail!(USAGE);
     }
     let (target, n) = (Target::parse(group)?, parse_lose(lose)?);
-    // Both ports go through the probes' one guard against the owner's nodes.
-    let listen = probe::node::allowed_port(&format!("ws://127.0.0.1:{listen}"))?;
-    let node = probe::node::allowed_port(&format!("ws://127.0.0.1:{node}"))?;
-    let l = TcpListener::bind(("127.0.0.1", listen)).await.with_context(|| format!("binding {listen}"))?;
-    eprintln!("{}", serde_json::json!({ "listening": listen, "node": node, "group": group, "lose": n }));
-    let state = Arc::new(Mutex::new(Lose::new(target, n)));
-    let conns = AtomicU64::new(0);
-    loop {
-        let (s, _) = l.accept().await?;
-        let conn = conns.fetch_add(1, Ordering::Relaxed);
-        let state = state.clone();
-        tokio::spawn(async move {
-            let r = if is_upgrade(&s).await { websocket(s, node, state).await } else { pipe(s, node).await };
-            if let Err(e) = r {
-                eprintln!("{}", serde_json::json!({ "connection": conn, "ended": e.to_string() }));
-            }
-        });
-    }
+    let said = serde_json::json!({ "group": group, "lose": n });
+    serve(listen.parse()?, node.parse()?, said, Arc::new(LoseHooks(Mutex::new(Lose::new(target, n))))).await
 }

@@ -128,9 +128,9 @@ impl Lose {
     }
 }
 
-/// A block id as the log names it: its first 8 bytes in hex.
+/// A block id as the log names it: its first 8 bytes in hex (core_types::hex, the one owner).
 pub fn short(id: &Cid) -> String {
-    id.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    core_types::hex::encode(&id[..8])
 }
 
 /// THE LOG LINE for a group chosen (`group`: `"data"` or `"root"`). LOAD-BEARING: the realnet step's VOID check reads
@@ -245,7 +245,7 @@ mod tests {
         // A real Register state, signed as the page's head is (contract-keys' one writer).
         let key = [7u8; 32];
         let vk = ed25519_dalek::SigningKey::from_bytes(&key).verifying_key().to_bytes();
-        let params = [b"RG01".as_slice(), &[0u8], &vk, b"head"].concat();
+        let params = wire::register_params(&vk, wire::HEAD_NAME);
         let record = contract_keys::register::head_state(&params, &key, 7, &value).expect("a head state");
         let mut l = Lose::new(Target::Root, PARITY);
         l.head(&record);

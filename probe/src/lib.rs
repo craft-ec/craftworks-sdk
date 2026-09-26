@@ -5,6 +5,7 @@ pub mod live;
 pub mod lose;
 pub mod node;
 pub mod page;
+pub mod proxy;
 pub mod signer;
 pub mod silent;
 pub mod site_probe;
