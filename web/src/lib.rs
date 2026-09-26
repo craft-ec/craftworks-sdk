@@ -381,6 +381,13 @@ pub fn webapp_address(code: &[u8], state: &[u8]) -> String {
     wire::webapp::address(code, state)
 }
 
+/// A LOAD PIECE's web container state (sdk#347): `wire::webapp::piece_container`, the one owner, for the loader's
+/// repair after load and the keeper's repair (sdk#493).
+#[wasm_bindgen]
+pub fn piece_container(piece: &[u8]) -> Result<Vec<u8>, JsError> {
+    wire::webapp::piece_container(piece).map_err(|e| JsError::new(&e))
+}
+
 /// An APP web container (builder#104), built in the page: the files as a
 /// deterministic tar (sorted, whatever order they are added in), in xz of
 /// stored LZMA2 chunks (no compression: the page has no xz encoder, and the

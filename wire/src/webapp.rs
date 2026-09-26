@@ -122,6 +122,17 @@ pub fn app_container(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     Ok(container(&[], &app_web(files)?))
 }
 
+/// The ONE file a LOAD PIECE's web container holds (sdk#347): a node serves it at `/v1/contract/web/<address>/piece`.
+pub const PIECE_FILE: &str = "piece";
+
+/// A LOAD PIECE's web container state (sdk#347, sdk#493): the ONE owner of "a piece -> its container". The build
+/// (`load-pieces`), the loader's repair after load (`js/pieces.js`, through `sdk.pieces.container`) and the keeper's
+/// repair all call it, so a rebuilt piece is framed exactly as it was published and lands at the address the
+/// starter names (the one-home test counts every other framing of `PIECE_FILE`).
+pub fn piece_container(piece: &[u8]) -> Result<Vec<u8>, String> {
+    app_container(&[(PIECE_FILE, piece)])
+}
+
 /// An app's WEB part: `files` as a deterministic tar in stored-chunk xz -- what the node unpacks and serves, and
 /// what a SITE carries under its record (builder#117). `app_container` frames exactly this.
 pub fn app_web(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {

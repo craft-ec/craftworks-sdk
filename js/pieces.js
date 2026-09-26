@@ -71,9 +71,7 @@ export async function repairPieces({ spec, bundle, raced, sdk, session, webappCo
       out.push({ piece: i, refused: "the re-derived piece does not hash to the manifest's sha256" });
       continue;
     }
-    const c = new sdk.webapp.AppContainer();
-    c.add("piece", piece);
-    const state = c.finish();
+    const state = sdk.pieces.container(piece);
     if (sdk.webapp.address(webappCode, state) !== want.address) {
       out.push({ piece: i, refused: "the re-derived container is not at the manifest's address" });
       continue;

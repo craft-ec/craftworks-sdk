@@ -154,12 +154,30 @@ impl HeadSubscription {
     }
 }
 
-/// A site in flight: its contract (code + relabelled params), id and key, and its web part.
+/// A site this page reads: its instance id, and WHY it holds it (one list of sites, sdk#493).
 struct Site {
-    contract: ContractContainer,
     id: [u8; 32],
-    key: String,
-    web: Vec<u8>,
+    role: SiteRole,
+}
+
+impl Site {
+    /// Its contract key, when this page PUBLISHES it (a PUT's or a change's answer names it); an audited site has none
+    /// this page follows.
+    fn published_key(&self) -> Option<&str> {
+        match &self.role {
+            SiteRole::Publishing { key, .. } => Some(key),
+            SiteRole::Auditing => None,
+        }
+    }
+}
+
+/// Why a page holds a site. ONE read (rule 4): a site is read by the same GET whether it is published or audited;
+/// only a publisher PUTs, signs and follows it.
+enum SiteRole {
+    /// Being published from this page (builder#117): its contract (code + relabelled params), key and web part.
+    Publishing { contract: ContractContainer, key: String, web: Vec<u8> },
+    /// Being AUDITED (a keeper's pass, sdk#493): read only, never put, signed or followed.
+    Auditing,
 }
 
 /// Why a site cannot be published or linked yet: the node's signer has not named the Register (the key) this
@@ -275,6 +293,10 @@ pub struct PageIo {
     /// `Held` asks in flight, by signer request id: the page's batch it answers (the ids are the batch's op's, sdk#455).
     held: BTreeMap<u32, u32>,
     next_held_id: u32,
+    /// A READER's own node's signer, for `Held` ONLY (sdk#493: a keeper auditing someone else's app). By TYPE it frames
+    /// nothing else, so a reader still cannot Sign, Update or provision. `None`: a plain reader, whose `Held` asks are
+    /// answered "not held" here and fetched.
+    held_signer: Option<wire::signer::HeldSigner>,
     frames: wire::Reassembler,
     stream: u32,
     out: Vec<Vec<u8>>,
@@ -374,6 +396,7 @@ impl PageIo {
             held: BTreeMap::new(),
             // High, so it never meets the executor's own sign ids (from 1).
             next_held_id: 1 << 31,
+            held_signer: None,
             frames: wire::Reassembler::default(),
             stream: 0,
             out: Vec::new(),
@@ -423,8 +446,28 @@ impl PageIo {
         io.register_key = wire::contract_id(register_id).to_string();
         io.server.page.set_read_only();
         io.stream_base = u32::from(range.max(1)) << 24;
+        io.next_held_id = (1u32 << 31) | (io.stream_base >> 1);
         io.server.set_facts(SignerFacts { head_writable: false, head_id: register_id });
         io
+    }
+
+    /// A READER that may ask its OWN node's signer `Held` (sdk#493): a keeper auditing SOMEONE ELSE's app measures
+    /// presence in the node it runs on, and that is a read, not a signature. By type it can ask nothing else
+    /// ([`wire::signer::HeldSigner`]): it is still a reader, and cannot Sign, Update or provision.
+    pub fn reader_with_held(server: Server, block_code: Vec<u8>, register_id: [u8; 32], range: u8, held: wire::signer::HeldSigner) -> PageIo {
+        let mut io = PageIo::reader(server, block_code, register_id, range);
+        io.held_signer = Some(held);
+        io
+    }
+
+    /// The next `Held` request id, in THIS page's own space: `2^31 | range << 23 | counter`. The pages on one socket
+    /// (the person's own, range 0, and each reader's range) never share an id, so an answer reaches only the page that
+    /// asked (sdk#493: a reader with a HeldSigner asks the same node's signer as the person's own page).
+    fn take_held_id(&mut self) -> u32 {
+        let base = (1u32 << 31) | (self.stream_base >> 1);
+        let hid = self.next_held_id;
+        self.next_held_id = base | (hid.wrapping_add(1) & 0x007F_FFFF);
+        hid
     }
 
     /// WHOSE NODE IS THIS? Ask the node's EXISTING signer which Register it
@@ -694,7 +737,7 @@ impl PageIo {
         id.copy_from_slice(&contract.key().id().as_bytes()[..32]);
         let key = contract.key().to_string();
         let value = *blake3::hash(&web).as_bytes();
-        self.sites.insert(app.to_string(), Site { contract, id, key, web });
+        self.sites.insert(app.to_string(), Site { id, role: SiteRole::Publishing { contract, key, web } });
         self.server.page.publish_site(app, value, now);
         self.pump();
         Ok(())
@@ -733,7 +776,21 @@ impl PageIo {
 
     /// The site in flight whose contract key is `key`, by app.
     fn site_by_key(&self, key: &str) -> Option<String> {
-        self.sites.iter().find(|(_, s)| s.key == key).map(|(a, _)| a.clone())
+        self.sites.iter().find(|(_, s)| s.published_key() == Some(key)).map(|(a, _)| a.clone())
+    }
+
+    /// READ `id`'s SITE FOR AN AUDIT, under `label` (sdk#493): the site's `ReadHead` is then framed, by the same GET a
+    /// publisher's is (never subscribed, never PUT or signed), and its answer comes back as that label's `Head`. A
+    /// site this page PUBLISHES is read already. Ended by [`PageIo::end_site_audit`].
+    pub fn audit_site(&mut self, label: &str, id: [u8; 32]) {
+        self.sites.entry(label.to_string()).or_insert(Site { id, role: SiteRole::Auditing });
+    }
+
+    /// The audit of `label`'s site is over: it is no longer read (a site being published stays).
+    pub fn end_site_audit(&mut self, label: &str) {
+        if self.sites.get(label).is_some_and(|s| matches!(s.role, SiteRole::Auditing)) {
+            self.sites.remove(label);
+        }
     }
 
     /// A person cancels the pending PUT of `key` (the page's, named).
@@ -999,6 +1056,10 @@ impl PageIo {
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
                     let answer = wire::signer::read_answer(&m);
+                    // A READER (with a HeldSigner) takes only the Held answers it asked for; the rest is another page's.
+                    if self.read_only() && !matches!(answer, Some((id, signer_proto::Answer::Held { .. })) if self.held.contains_key(&id)) {
+                        continue;
+                    }
                     // A REAL answer to the signer's first request ends it: no
                     // more re-sends, and a later empty response is nobody's.
                     if matches!(answer, Some((REGISTER_QUERY_ID | PROVISION_ID, _))) {
@@ -1109,16 +1170,21 @@ impl PageIo {
     /// nothing, and PUT answers for the app's own contracts (handed back).
     fn owns(&self, incoming: &Incoming) -> bool {
         let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id) || self.sites.values().any(|s| s.id == *id);
-        let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k) || self.sites.values().any(|s| s.key == *k);
+        let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k) || self.sites.values().any(|s| s.published_key() == Some(k.as_str()));
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id, .. } => mine(id),
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::PutFailedByText { key, .. } => my_key(key) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             // A site's change is its own (taken, and read by nobody: the page does not follow a site).
-            Incoming::HeadChanged { key, .. } => *key == self.register_key || self.sites.values().any(|s| s.key == *key),
+            Incoming::HeadChanged { key, .. } => *key == self.register_key || self.sites.values().any(|s| s.published_key() == Some(key.as_str())),
             Incoming::Partial => true,
             Incoming::DelegateMissing { key } => *key == self.art.signer.to_string() || !self.read_only(),
+            // A reader takes a signer message only if it answers a `Held` it asked (its HeldSigner, sdk#493): the
+            // person's own page on the same socket asks the same signer, and its answers are its own.
+            Incoming::EngineBytes(msgs) if self.read_only() => {
+                self.held_signer.is_some() && msgs.iter().any(|m| matches!(wire::signer::read_answer(m), Some((id, signer_proto::Answer::Held { .. })) if self.held.contains_key(&id)))
+            }
             Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::DelegateThrottled { .. } | Incoming::Refused(_) | Incoming::Unusable(_) => {
                 !self.read_only()
             }
@@ -1212,6 +1278,110 @@ impl PageIo {
         self.stream_base | self.stream
     }
 
+    /// ONE OP AS ITS FRAMES (the one place an op becomes client-API bytes, rule 5): what `pump` sends for every op the
+    /// server emitted, and what a test frames directly.
+    fn frame_op(&mut self, op: Op, stream: u32) -> Result<Vec<Vec<u8>>, String> {
+        match op {
+            Op::Put { id, bytes } => match wire::block::block_state(&id, &bytes) {
+                Some(state) => {
+                    let c = wire::block::block_contract(&self.art.block_code, &id);
+                    self.by_key.insert(c.key().to_string(), id);
+                    self.by_contract.insert(wire::block::contract_for(&self.art.block_code, &id), id);
+                    wire::frame_put(c, WrappedState::new(state), stream)
+                }
+                None => Err("a block whose bytes hash under no kind".into()),
+            },
+            Op::Get { id } => {
+                let contract = wire::block::contract_for(&self.art.block_code, &id);
+                self.by_contract.insert(contract, id);
+                wire::frame_get(wire::contract_id(contract), false, stream)
+            }
+            Op::ReadHead { label: Label::Head } => {
+                self.sub(SubEvent::ReadSent);
+                wire::frame_get(wire::contract_id(self.register_id), true, stream)
+            }
+            // ONE read of a site, published or audited (rule 4); only a publisher follows it (subscribe).
+            Op::ReadHead { label: Label::Site(app) } => match self.sites.get(&app) {
+                Some(site) => wire::frame_get(wire::contract_id(site.id), site.published_key().is_some(), stream),
+                None => Err(format!("a read of {app}'s site, which is not being published or audited")),
+            },
+            // A site's write is a PUT of its framing around exactly the signer's record (invariant 2).
+            Op::Update { label: Label::Site(app), state } => match self.sites.get(&app).map(|s| &s.role) {
+                Some(SiteRole::Publishing { contract, web, .. }) => wire::frame_put(contract.clone(), WrappedState::new(contract_keys::site::frame(&state, web)), stream),
+                Some(SiteRole::Auditing) => Err(format!("a PUT of {app}'s site, which is only being audited")),
+                None => Err(format!("a PUT of {app}'s site, which is not being published")),
+            },
+            Op::Update { label: Label::Head, state } => {
+                if self.head_known.get().seen() {
+                    wire::frame_update(self.register.key(), state, stream)
+                } else {
+                    // The first head: the Register does not exist yet, and
+                    // a PUT is what creates it (no delegate Install on this
+                    // path). An existing one merges a PUT like an UPDATE.
+                    wire::frame_put(self.register.clone(), WrappedState::new(state), stream)
+                }
+            }
+            Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } => {
+                let label = match label {
+                    Label::Head => Ok(signer_proto::Label::Head),
+                    Label::Site(app) => match self.sites.get(&app) {
+                        Some(Site { id, role: SiteRole::Publishing { .. } }) => Ok(signer_proto::Label::Site { contract: *id, app }),
+                        Some(Site { role: SiteRole::Auditing, .. }) => Err(format!("a sign for {app}'s site, which is only being audited")),
+                        None => Err(format!("a sign for {app}'s site, which is not being published")),
+                    },
+                };
+                label.and_then(|label| {
+                    wire::signer::frame_sign(
+                        &self.art.signer,
+                        id,
+                        signer_proto::Head { seq: prev_seq, root: prev_root },
+                        signer_proto::Next { seq, root, ledger },
+                        label,
+                        stream,
+                    )
+                })
+            }
+            // Page-io's own requests, sent and re-sent by the page's
+            // sender (rule 5): framed HERE and nowhere else.
+            Op::Ext(Ext::RegisterSigner) => match self.signer_container.clone() {
+                Some(c) => wire::frame_register_delegate(c, stream),
+                None => Err("the signer's registration, with no signer to register".into()),
+            },
+            Op::Ext(Ext::SignerFirst) => match self.opening.get().first() {
+                Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
+                Some(First::Provision(key)) => wire::signer::frame_provision(
+                    &self.art.signer,
+                    PROVISION_ID,
+                    key,
+                    self.art.register_code.clone(),
+                    self.art.register_params.clone(),
+                    self.art.block_code.clone(),
+                    stream,
+                ),
+                None => Ok(Vec::new()),
+            },
+            Op::Ext(Ext::AskRecord) => wire::signer::frame_sign(
+                &self.art.signer,
+                RECORD_QUERY_ID,
+                signer_proto::Head { seq: 0, root: self.server.page.published().1 },
+                signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
+                signer_proto::Label::Head,
+                stream,
+            ),
+            Op::PutApp { key } => match self.app_contracts.get(&key) {
+                Some((c, st)) => wire::frame_put(c.clone(), st.clone(), stream),
+                None => Err(format!("an app PUT of {key}, whose contract this page does not hold")),
+            },
+            // ONE `Held` request of every id's contract, in the op's order (sdk#455).
+            Op::AskHeld { batch, ids } => {
+                let hid = self.take_held_id();
+                self.held.insert(hid, batch);
+                let contracts = ids.iter().map(|id| wire::block::contract_for(&self.art.block_code, id)).collect();
+                wire::signer::frame_held(&self.art.signer, hid, contracts, stream)
+            }
+        }
+    }
+
     /// Every op the server emitted becomes a frame; every reply it made is
     /// queued for the client.
     fn pump(&mut self) {
@@ -1228,8 +1398,23 @@ impl PageIo {
             }
             if self.read_only() {
                 match op {
+                    // A reader with its own node's HeldSigner asks it (a keeper's audit, sdk#493); any other reader
+                    // has no signer to ask, so the blocks are "not held" here and fetched.
                     Op::AskHeld { batch, ids } => {
-                        not_held.push((batch, ids.len()));
+                        if self.held_signer.is_some() {
+                            let hid = self.take_held_id();
+                            self.held.insert(hid, batch);
+                            let contracts = ids.iter().map(|id| wire::block::contract_for(&self.art.block_code, id)).collect();
+                            let stream = self.next_stream();
+                            if let Some(held) = self.held_signer.as_ref() {
+                                match held.frame_held(hid, contracts, stream) {
+                                    Ok(f) => self.out.extend(f),
+                                    Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
+                                }
+                            }
+                        } else {
+                            not_held.push((batch, ids.len()));
+                        }
                         continue;
                     }
                     // A view's page makes no commit op; one that arrives is
@@ -1246,103 +1431,7 @@ impl PageIo {
                 }
             }
             let stream = self.next_stream();
-            let framed = match op {
-                Op::Put { id, bytes } => match wire::block::block_state(&id, &bytes) {
-                    Some(state) => {
-                        let c = wire::block::block_contract(&self.art.block_code, &id);
-                        self.by_key.insert(c.key().to_string(), id);
-                        self.by_contract.insert(wire::block::contract_for(&self.art.block_code, &id), id);
-                        wire::frame_put(c, WrappedState::new(state), stream)
-                    }
-                    None => Err("a block whose bytes hash under no kind".into()),
-                },
-                Op::Get { id } => {
-                    let contract = wire::block::contract_for(&self.art.block_code, &id);
-                    self.by_contract.insert(contract, id);
-                    wire::frame_get(wire::contract_id(contract), false, stream)
-                }
-                Op::ReadHead { label: Label::Head } => {
-                    self.sub(SubEvent::ReadSent);
-                    wire::frame_get(wire::contract_id(self.register_id), true, stream)
-                }
-                Op::ReadHead { label: Label::Site(app) } => match self.sites.get(&app) {
-                    Some(site) => wire::frame_get(wire::contract_id(site.id), true, stream),
-                    None => Err(format!("a read of {app}'s site, which is not being published")),
-                },
-                // A site's write is a PUT of its framing around exactly the signer's record (invariant 2).
-                Op::Update { label: Label::Site(app), state } => match self.sites.get(&app) {
-                    Some(site) => wire::frame_put(site.contract.clone(), WrappedState::new(contract_keys::site::frame(&state, &site.web)), stream),
-                    None => Err(format!("a PUT of {app}'s site, which is not being published")),
-                },
-                Op::Update { label: Label::Head, state } => {
-                    if self.head_known.get().seen() {
-                        wire::frame_update(self.register.key(), state, stream)
-                    } else {
-                        // The first head: the Register does not exist yet, and
-                        // a PUT is what creates it (no delegate Install on this
-                        // path). An existing one merges a PUT like an UPDATE.
-                        wire::frame_put(self.register.clone(), WrappedState::new(state), stream)
-                    }
-                }
-                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } => {
-                    let label = match label {
-                        Label::Head => Ok(signer_proto::Label::Head),
-                        Label::Site(app) => match self.sites.get(&app) {
-                            Some(site) => Ok(signer_proto::Label::Site { app, contract: site.id }),
-                            None => Err(format!("a sign for {app}'s site, which is not being published")),
-                        },
-                    };
-                    label.and_then(|label| {
-                        wire::signer::frame_sign(
-                            &self.art.signer,
-                            id,
-                            signer_proto::Head { seq: prev_seq, root: prev_root },
-                            signer_proto::Next { seq, root, ledger },
-                            label,
-                            stream,
-                        )
-                    })
-                }
-                // Page-io's own requests, sent and re-sent by the page's
-                // sender (rule 5): framed HERE and nowhere else.
-                Op::Ext(Ext::RegisterSigner) => match self.signer_container.clone() {
-                    Some(c) => wire::frame_register_delegate(c, stream),
-                    None => Err("the signer's registration, with no signer to register".into()),
-                },
-                Op::Ext(Ext::SignerFirst) => match self.opening.get().first() {
-                    Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
-                    Some(First::Provision(key)) => wire::signer::frame_provision(
-                        &self.art.signer,
-                        PROVISION_ID,
-                        key,
-                        self.art.register_code.clone(),
-                        self.art.register_params.clone(),
-                        self.art.block_code.clone(),
-                        stream,
-                    ),
-                    None => Ok(Vec::new()),
-                },
-                Op::Ext(Ext::AskRecord) => wire::signer::frame_sign(
-                    &self.art.signer,
-                    RECORD_QUERY_ID,
-                    signer_proto::Head { seq: 0, root: self.server.page.published().1 },
-                    signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
-                    signer_proto::Label::Head,
-                    stream,
-                ),
-                Op::PutApp { key } => match self.app_contracts.get(&key) {
-                    Some((c, st)) => wire::frame_put(c.clone(), st.clone(), stream),
-                    None => Err(format!("an app PUT of {key}, whose contract this page does not hold")),
-                },
-                // ONE `Held` request of every id's contract, in the op's order (sdk#455).
-                Op::AskHeld { batch, ids } => {
-                    let hid = self.next_held_id;
-                    self.next_held_id = self.next_held_id.wrapping_add(1).max(1 << 31);
-                    self.held.insert(hid, batch);
-                    let contracts = ids.iter().map(|id| wire::block::contract_for(&self.art.block_code, id)).collect();
-                    wire::signer::frame_held(&self.art.signer, hid, contracts, stream)
-                }
-            };
+            let framed = self.frame_op(op, stream);
             match framed {
                 Ok(f) => self.out.extend(f),
                 Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
@@ -1370,7 +1459,11 @@ impl PageIo {
         }
         // A site's bytes are page-io's only while its publication is in flight.
         let page = &self.server.page;
-        self.sites.retain(|app, _| matches!(page.publication(app), Some(Publication::Publishing { .. })));
+        self.sites.retain(|app, site| match site.role {
+            SiteRole::Publishing { .. } => matches!(page.publication(app), Some(Publication::Publishing { .. })),
+            // An audit ends by `end_site_audit`, not by a publication.
+            SiteRole::Auditing => true,
+        });
     }
 }
 
@@ -1519,3 +1612,151 @@ mod opening_wiring {
         assert!(matches!(querying.opening.get(), Opening::Querying { .. }) && !querying.provisioned(), "THE CONTROL: a querying page's opening moved on a reconnect");
     }
 }
+
+/// A READER WITH ITS OWN NODE'S HeldSigner (sdk#493: a keeper auditing someone else's app). It asks `Held` through
+/// that signer and nothing else; on a socket it shares with the person's own page, each page takes only its own answers.
+#[cfg(test)]
+mod reader_held {
+    use super::*;
+    use freenet_stdlib::client_api::{ClientError, ClientRequest, DelegateRequest, HostResponse};
+    use freenet_stdlib::prelude::{ApplicationMessage, InboundDelegateMsg, OutboundDelegateMsg};
+
+    const SIGNER: &[u8] = b"reader held signer code";
+
+    fn server() -> page::server::Server {
+        page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Wrapper, Ms(0)), page::server::SignerFacts::default())
+    }
+
+    fn reader(held: bool) -> PageIo {
+        let (_, key) = wire::delegate_from_code(SIGNER);
+        if held {
+            PageIo::reader_with_held(server(), b"block code".to_vec(), [5; 32], 3, wire::signer::HeldSigner::of(key))
+        } else {
+            PageIo::reader(server(), b"block code".to_vec(), [5; 32], 3)
+        }
+    }
+
+    fn owner() -> PageIo {
+        let (_, signer) = wire::delegate_from_code(SIGNER);
+        let mut io = PageIo::new(server(), Artefacts { block_code: b"block code".to_vec(), register_code: b"r".to_vec(), register_params: wire::register_params(&[1u8; 32], wire::HEAD_NAME), signer });
+        io.signer_provisioned();
+        io
+    }
+
+    /// The signer requests in `frames`, as the node reads them: (request id, is it a `Held`).
+    fn requests(frames: &[Vec<u8>]) -> Vec<(u32, bool)> {
+        let mut out = Vec::new();
+        for f in frames {
+            let Ok(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. })) = bincode::deserialize::<ClientRequest>(f) else { continue };
+            for m in inbound {
+                if let InboundDelegateMsg::ApplicationMessage(am) = m {
+                    if let Some((id, req)) = signer_proto::decode_request(&am.payload) {
+                        out.push((id, matches!(req, signer_proto::Request::Held { .. })));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn answer(id: u32, a: &signer_proto::Answer) -> Vec<u8> {
+        let (_, key) = wire::delegate_from_code(SIGNER);
+        bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse {
+            key,
+            values: vec![OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(signer_proto::encode_answer(id, a)))],
+        }))
+        .expect("encodes")
+    }
+
+    fn ask(io: &mut PageIo, n: u64) {
+        for i in 0..n {
+            let mut c = [0u8; 32];
+            c[..8].copy_from_slice(&(i + 1).to_be_bytes());
+            io.server.page.answer(Answer::PutOk(c), Ms(1));
+        }
+        io.pump();
+    }
+
+    /// The reader asks `Held` through its OWN node's signer, and the answer lands on its page. THE CONTROL: a plain
+    /// reader frames no signer request at all (its blocks are "not held" and fetched).
+    #[test]
+    fn a_reader_with_a_held_signer_asks_held_and_nothing_else() {
+        let mut io = reader(true);
+        io.server.page.answer(Answer::PutOk([9; 32]), Ms(1));
+        io.pump();
+        let asked = requests(&io.take_frames());
+        assert_eq!(asked.len(), 1, "one Held request: {asked:?}");
+        assert!(asked[0].1, "the reader framed a signer request that is not a Held");
+        assert!(asked[0].0 >= (1 << 31) | (3 << 23), "the reader's id is not in its own range: {:#x}", asked[0].0);
+        assert!(io.inbound(&answer(asked[0].0, &signer_proto::Answer::Held { present: vec![true] }), Ms(2)), "its own Held answer was not taken");
+        assert!(io.held.is_empty(), "the answered batch is still mapped");
+        let mut plain = reader(false);
+        plain.server.page.answer(Answer::PutOk([9; 32]), Ms(1));
+        plain.pump();
+        assert!(requests(&plain.take_frames()).is_empty(), "THE CONTROL: a plain reader asked a signer");
+    }
+
+    /// ONE SOCKET, TWO PAGES, ONE SIGNER: the person's own page and a keeper's reader never share a `Held` id, and each
+    /// takes only its own answer. A reader never takes a signing answer. THE CONTROL: each takes its own.
+    #[test]
+    fn each_page_on_a_socket_takes_only_its_own_signer_answers() {
+        let (mut me, mut keeper) = (owner(), reader(true));
+        ask(&mut me, 1);
+        ask(&mut keeper, 1);
+        let mine = requests(&me.take_frames());
+        let theirs = requests(&keeper.take_frames());
+        assert_eq!((mine.len(), theirs.len()), (1, 1));
+        assert_ne!(mine[0].0, theirs[0].0, "the two pages asked under one id: an answer would reach both");
+        let to_me = answer(mine[0].0, &signer_proto::Answer::Held { present: vec![true] });
+        let to_keeper = answer(theirs[0].0, &signer_proto::Answer::Held { present: vec![false] });
+        assert!(!keeper.inbound(&to_me, Ms(2)), "the reader took the owner page's Held answer");
+        assert!(keeper.inbound(&to_keeper, Ms(2)), "THE CONTROL: the reader did not take its own");
+        assert!(me.inbound(&to_me, Ms(2)), "THE CONTROL: the owner page did not take its own");
+        let signed = answer(1, &signer_proto::Answer::AlreadySigned(vec![1; 96]));
+        assert!(!keeper.inbound(&signed, Ms(3)), "a reader took a signing answer");
+    }
+}
+
+/// AN AUDIT'S SITE READ IS THE PUBLISHER'S (sdk#493; rule 4, one read path): an audited site is read by the same GET,
+/// never subscribed, PUT or signed, and its answer comes back as its label's `Head`.
+#[cfg(test)]
+mod site_audit {
+    use super::*;
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+
+    fn page() -> PageIo {
+        let (_, signer) = wire::delegate_from_code(b"site audit signer");
+        PageIo::new(
+            page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Page, Ms(0)), page::server::SignerFacts::default()),
+            Artefacts { block_code: b"b".to_vec(), register_code: b"r".to_vec(), register_params: wire::register_params(&[1u8; 32], wire::HEAD_NAME), signer },
+        )
+    }
+
+    fn read(io: &mut PageIo, label: &str) -> Result<Vec<Vec<u8>>, String> {
+        io.frame_op(Op::ReadHead { label: Label::Site(label.into()) }, 1)
+    }
+
+    #[test]
+    fn an_audited_sites_read_is_the_publishers_get_never_followed_put_or_signed() {
+        let mut io = page();
+        let id = [0x51; 32];
+        // THE CONTROL: a site neither published nor audited is refused by name.
+        assert!(read(&mut io, "kept").expect_err("refused").contains("not being published or audited"));
+        io.audit_site("kept", id);
+        let frames = read(&mut io, "kept").expect("an audited site is read");
+        let gets: Vec<(Vec<u8>, bool)> = frames
+            .iter()
+            .filter_map(|f| match bincode::deserialize::<ClientRequest>(f) {
+                Ok(ClientRequest::ContractOp(ContractRequest::Get { key, subscribe, .. })) => Some((key.as_bytes().to_vec(), subscribe)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gets, vec![(id.to_vec(), false)], "not ONE unsubscribed GET of the site's id");
+        assert!(io.frame_op(Op::Update { label: Label::Site("kept".into()), state: vec![1] }, 2).expect_err("refused").contains("only being audited"), "an audited site was PUT");
+        // Its answer is this page's, as the label's head (an audited site is in the ONE list of sites).
+        assert_eq!(io.site_by_id(&id).as_deref(), Some("kept"));
+        io.end_site_audit("kept");
+        assert!(read(&mut io, "kept").is_err(), "the audit ended and the site is still read");
+    }
+}
+

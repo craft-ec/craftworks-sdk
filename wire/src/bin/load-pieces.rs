@@ -47,7 +47,7 @@ fn main() -> Result<(), String> {
     std::fs::write(format!("{out}/bundle.bin"), &bundle).map_err(|e| e.to_string())?;
     let mut addrs = Vec::new();
     for (i, p) in cut.pieces.iter().enumerate() {
-        let state = wire::webapp::app_container(&[("piece", p)])?;
+        let state = wire::webapp::piece_container(p)?;
         addrs.push(wire::webapp::address(&code, &state));
         std::fs::write(format!("{out}/piece-{i}.bin"), p).map_err(|e| e.to_string())?;
         std::fs::write(format!("{out}/piece-{i}.webapp"), &state).map_err(|e| e.to_string())?;

@@ -140,7 +140,7 @@ fn webapp_put(state: &[u8]) -> Vec<Vec<u8>> {
 #[test]
 fn a_load_piece_put_is_a_repair_only_when_its_state_is_the_listed_piece() {
     let piece = b"piece 3 of the core bundle".to_vec();
-    let state = wire::webapp::app_container(&[("piece", piece.as_slice())]).unwrap();
+    let state = wire::webapp::piece_container(&piece).unwrap();
     let at = wire::webapp::address(WEBAPP_CODE, &state);
     let list = serde_json::json!({ "core": { "k": 1, "m": 1, "pieces": [{ "address": at, "sha256": "not read: the address is the proof" }] } });
 
@@ -152,7 +152,7 @@ fn a_load_piece_put_is_a_repair_only_when_its_state_is_the_listed_piece() {
     assert_eq!(real[0]["contract"].as_str(), Some(at.as_str()), "THE SETUP: the PUT is not at the listed address");
 
     // TAMPERED: the listed address's contract, a different state.
-    let other = wire::webapp::app_container(&[("piece", b"not that piece".as_slice())]).unwrap();
+    let other = wire::webapp::piece_container(b"not that piece").unwrap();
     let tampered = wire::frame_put(container(WEBAPP_CODE, &wire::webapp::params(&state)), WrappedState::new(other), 1).unwrap();
     let rows = classify_with_pieces(&lines("tampered", tampered), &list);
     let t: Vec<_> = rows.iter().filter(|r| r["window"] == "tampered").collect();
