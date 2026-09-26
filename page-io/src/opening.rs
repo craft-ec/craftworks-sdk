@@ -162,6 +162,12 @@ fn go(next: Opening, effects: Vec<OpenEffect>) -> Step {
 fn stay(cell: Cell) -> Step {
     Step { next: None, effects: Vec::new(), cell, claimed: false }
 }
+/// The signer refused this page's provision, in its words: opening ends, named.
+fn provision_refused(via: &Via, why: &str) -> Step {
+    let why = format!("the signer refused provisioning: {why}");
+    go(Opening::Refused { why: why.clone(), via: via.clone() }, vec![OpenEffect::Unusable(why)])
+}
+
 fn refuse(why: &str) -> Step {
     Step { next: None, effects: vec![OpenEffect::Unusable(why.into())], cell: Cell::RefusedCall, claimed: false }
 }
@@ -193,6 +199,15 @@ impl Opening {
             Opening::Provisioning { key, .. } => Some(First::Provision(key.clone())),
             Opening::Registering { then, .. } => Some(then.clone()),
             Opening::New | Opening::NeedsKey { .. } | Opening::Open { .. } | Opening::Refused { .. } | Opening::Asking { answer: Some(_) } | Opening::Reader => None,
+        }
+    }
+
+    /// A provision's answer where no provision is out: the twin of one already answered where a provision was ever
+    /// sent (an owner's states), impossible where none ever is (new, asking, a reader).
+    fn no_provision_out(&self) -> Step {
+        match self {
+            Opening::Registering { .. } | Opening::Querying { .. } | Opening::NeedsKey { .. } | Opening::Open { .. } | Opening::Refused { .. } | Opening::Provisioning { .. } => stay(Cell::Late),
+            Opening::New | Opening::Asking { .. } | Opening::Reader => stay(Cell::Impossible),
         }
     }
 
@@ -290,27 +305,18 @@ impl Opening {
             },
             E::Provisioned => match self {
                 S::Provisioning { via, .. } => go(S::Open { via: via.clone() }, vec![F::SignerProvisioned]),
-                S::Registering { .. } | S::Querying { .. } | S::NeedsKey { .. } | S::Open { .. } | S::Refused { .. } => stay(Cell::Late),
-                S::New | S::Asking { .. } | S::Reader => stay(Cell::Impossible),
+                S::New | S::Registering { .. } | S::Querying { .. } | S::NeedsKey { .. } | S::Open { .. } | S::Refused { .. } | S::Asking { .. } | S::Reader => self.no_provision_out(),
             },
             E::KeyAlreadyHere => match self {
                 // Another page, told "no key" as this one was, provisioned first (sdk#343): ask again and open THAT
                 // Register -- one identity per node (rule 15); the minted key is dropped.
                 S::Provisioning { minted: true, via, .. } => go(S::Querying { via: via.clone() }, vec![F::SendFirst]),
-                S::Provisioning { minted: false, via, .. } => {
-                    let why = "the signer refused provisioning: KeyAlreadyProvisioned".to_string();
-                    go(S::Refused { why: why.clone(), via: via.clone() }, vec![F::Unusable(why)])
-                }
-                S::Registering { .. } | S::Querying { .. } | S::NeedsKey { .. } | S::Open { .. } | S::Refused { .. } => stay(Cell::Late),
-                S::New | S::Asking { .. } | S::Reader => stay(Cell::Impossible),
+                S::Provisioning { minted: false, via, .. } => provision_refused(via, "KeyAlreadyProvisioned"),
+                S::New | S::Registering { .. } | S::Querying { .. } | S::NeedsKey { .. } | S::Open { .. } | S::Refused { .. } | S::Asking { .. } | S::Reader => self.no_provision_out(),
             },
             E::ProvisionRefused(why) => match self {
-                S::Provisioning { via, .. } => {
-                    let why = format!("the signer refused provisioning: {why}");
-                    go(S::Refused { why: why.clone(), via: via.clone() }, vec![F::Unusable(why)])
-                }
-                S::Registering { .. } | S::Querying { .. } | S::NeedsKey { .. } | S::Open { .. } | S::Refused { .. } => stay(Cell::Late),
-                S::New | S::Asking { .. } | S::Reader => stay(Cell::Impossible),
+                S::Provisioning { via, .. } => provision_refused(via, &why),
+                S::New | S::Registering { .. } | S::Querying { .. } | S::NeedsKey { .. } | S::Open { .. } | S::Refused { .. } | S::Asking { .. } | S::Reader => self.no_provision_out(),
             },
             E::NodeRefused(said) => match self {
                 S::Querying { via } | S::Provisioning { via, .. } => go(S::Refused { why: format!("the node refused: {said}"), via: via.clone() }, vec![F::FirstAnswered]),
