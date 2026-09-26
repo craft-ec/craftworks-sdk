@@ -372,3 +372,27 @@ fn withdrawn_gets(busy: bool) {
     assert_eq!(r.withdrawn(), 0);
     assert!(!r.waiting());
 }
+
+/// A PARITY BLOCK A READ FETCHES IS A BLOCK LIKE ANY OTHER (engine `read::matches_id`, main's report from engineer2's
+/// step-3 model): a member LOST (NotFound) is rebuilt from its group. The one member lost needs ONE parity block,
+/// and the parity block the race took is KEPT in the page's memory under its id -- not judged "not its id" and
+/// dropped. The group's other parity blocks come after the race resolved and are WITHDRAWN (a finished race keeps
+/// nothing late, sdk#303), so they are not kept; every parity block is asked ONCE. RED on 200ce38: none kept.
+#[test]
+fn a_parity_block_a_read_fetches_is_kept_and_asked_once() {
+    let (mut node, root, mut now) = written();
+    let (members, parity) = a_leaf_group(&node.blocks, root);
+    let member = members[members.len() / 2];
+    let lost = node.blocks.remove(&member).expect("on the node");
+    let keys = keys_of(&Node_ { blocks: [(member, lost)].into_iter().collect(), ..Node_::default() }, member);
+    let (r, gets, answered) = read_all(&mut node, &mut now, &keys, &BTreeSet::new());
+    assert_eq!(answered, keys.len(), "THE SETUP: the reads over a lost member were not answered");
+    assert_eq!(r.repair_counts().1, 1, "THE SETUP: the member was not rebuilt from its group");
+    let fetched: Vec<Cid> = parity.iter().copied().filter(|p| gets.iter().any(|(_, id)| id == p)).collect();
+    assert!(!fetched.is_empty(), "THE SETUP: the race fetched no parity block");
+    let asked: Vec<usize> = fetched.iter().map(|p| gets.iter().filter(|(_, id)| id == p).count()).collect();
+    let kept: Vec<bool> = fetched.iter().map(|p| freenet_prolly::store::Blocks::get(r.blocks(), p).is_some()).collect();
+    println!("  parity fetched {}: GETs each {asked:?}, kept {kept:?}", fetched.len());
+    assert!(kept.iter().any(|k| *k), "no parity block the race took was kept under its id: {kept:?}");
+    assert!(asked.iter().all(|n| *n == 1), "a parity block the node answered was asked again: {asked:?}");
+}

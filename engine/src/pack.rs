@@ -17,13 +17,14 @@
 //! Members are strictly ascending BY BLOCK ID, so a set has one encoding and
 //! two writers packing the same commit produce the same pack.
 
-use freenet_prolly::{block_id, kind, pack as format, Cid};
+use core_types::kind::BlockKind;
+use freenet_prolly::{block_id, pack as format, Cid};
 
 pub const MANIFEST_MAGIC: &[u8; 4] = b"CM01";
 
 /// The kind byte a pack is stored under. Not a kind this crate may invent:
-/// it is the value the Block contract assigns to PACK.
-pub const PACK_KIND: u8 = 6;
+/// it is the value the Block contract assigns to PACK -- stated once, in the one list of kinds.
+pub const PACK_KIND: u8 = BlockKind::Pack.byte();
 
 // ---------------------------------------------------------------------------
 // What the network will accept, PER MEMBER — mirrored, not imported.
@@ -58,11 +59,12 @@ pub const MAX_PACK: usize = format::MAX_PACK;
 /// The limit that bites a packed member is THIS, not the pack's: packed members
 /// are `RAW`, so the ceiling is 262,208 and not the pack's 1 MiB. Confusing the
 /// two is the error this function exists to stop being made twice.
-pub const fn max_body(kind: u8) -> usize {
+pub const fn max_body(kind: BlockKind) -> usize {
+    // EXHAUSTIVE over the one list of kinds: a new kind does not compile until its limit is stated here.
     match kind {
-        PACK_KIND => MAX_PACK,
-        kind::PARITY => MAX_PARITY,
-        _ => MAX_BODY,
+        BlockKind::Raw | BlockKind::TreeNode => MAX_BODY,
+        BlockKind::Parity => MAX_PARITY,
+        BlockKind::Pack => MAX_PACK,
     }
 }
 
@@ -131,6 +133,9 @@ pub enum PackError {
     /// rendered into a panic message by the one caller, so what it says is
     /// the entire diagnosis available at the moment it fires.
     TooLarge { kind: u8, len: usize, limit: usize },
+    /// A member's kind byte is no kind at all ([`BlockKind::of_byte`]): the contract refuses it, so it is refused
+    /// here, where it can be named.
+    UnknownKind(u8),
 }
 
 /// Build one pack body. Members are sorted and de-duplicated by block id,
@@ -142,8 +147,11 @@ pub fn build(members: &[(u8, Vec<u8>)]) -> Result<Vec<u8>, PackError> {
     // because that is what the contract applies — a pack whose total fits can
     // still carry a member the network refuses, and that refusal happens
     // remotely where it is hardest to see.
-    if let Some((kind, body)) = members.iter().find(|(k, b)| b.len() > max_body(*k)) {
-        return Err(PackError::TooLarge { kind: *kind, len: body.len(), limit: max_body(*kind) });
+    for (byte, body) in members {
+        let Some(kind) = BlockKind::of_byte(*byte) else { return Err(PackError::UnknownKind(*byte)) };
+        if body.len() > max_body(kind) {
+            return Err(PackError::TooLarge { kind: *byte, len: body.len(), limit: max_body(kind) });
+        }
     }
     format::build(members).map_err(|e| match e {
         format::BuildError::Empty => PackError::Empty,
@@ -169,16 +177,16 @@ pub fn pack_id(body: &[u8]) -> Cid {
     block_id(PACK_KIND, body)
 }
 
-/// The kind byte for a member: a node is a TREE_NODE, anything else is RAW.
+/// The kind of a member: a node is a TREE_NODE, anything else is RAW.
 ///
 /// Decided from the BYTES rather than from where they came from, because that
 /// is how the contract decides: it parses each member and refuses one whose
 /// kind does not match its content.
-pub fn member_kind(bytes: &[u8]) -> u8 {
+pub fn member_kind(bytes: &[u8]) -> BlockKind {
     if freenet_prolly::node::Node::parse(bytes).is_ok() {
-        kind::TREE_NODE
+        BlockKind::TreeNode
     } else {
-        kind::RAW
+        BlockKind::Raw
     }
 }
 

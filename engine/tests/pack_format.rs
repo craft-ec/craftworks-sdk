@@ -136,9 +136,9 @@ fn a_commit_manifest_round_trips_and_refuses_a_malformed_one() {
 /// ceiling that bites one is 262,208 and not the pack's 1 MiB.
 #[test]
 fn an_oversized_member_is_refused_here_rather_than_at_the_node() {
-    let raw = freenet_prolly::kind::RAW;
-    for kind in [raw, freenet_prolly::kind::PARITY] {
-        let limit = pack::max_body(kind);
+    use core_types::kind::BlockKind;
+    for bk in [BlockKind::Raw, BlockKind::Parity] {
+        let (kind, limit) = (bk.byte(), pack::max_body(bk));
 
         // Exactly at the limit is ACCEPTED. Without this the check could be
         // off by one in the safe direction and refuse what the network takes.
@@ -165,7 +165,7 @@ fn an_oversized_member_is_refused_here_rather_than_at_the_node() {
 /// member's own limit are refused here, each naming its reason.
 #[test]
 fn a_pack_sized_member_is_refused_by_the_pack_around_it() {
-    let limit = pack::max_body(pack::PACK_KIND);
+    let limit = pack::max_body(core_types::kind::BlockKind::Pack);
     match pack::build(&[member(pack::PACK_KIND, 1, limit)]) {
         Err(pack::PackError::TooLarge { kind, len, limit: l }) => {
             assert_eq!((kind, l), (pack::PACK_KIND, pack::MAX_PACK));
@@ -189,8 +189,8 @@ fn the_mirrored_limits_are_the_contracts_numbers() {
     assert_eq!(pack::MAX_BODY, 262_208);
     assert_eq!(pack::MAX_PACK, 1_048_576);
     assert_eq!(pack::MAX_PARITY, 262_213);
-    assert_eq!(pack::max_body(freenet_prolly::kind::RAW), 262_208);
-    assert_eq!(pack::max_body(pack::PACK_KIND), 1_048_576);
+    assert_eq!(pack::max_body(core_types::kind::BlockKind::Raw), 262_208);
+    assert_eq!(pack::max_body(core_types::kind::BlockKind::Pack), 1_048_576);
 
     // And the KINDS the dispatch turns on. `max_body` selects by kind, so the
     // limits being right is worth nothing if the engine and the contract

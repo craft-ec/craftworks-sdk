@@ -17,6 +17,8 @@ bincode = "1"
 # and the delegate name a block's contract the same way.
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 blake3 = "1"
+# The one list of block kinds (core_types::kind): `block_state` recovers a kind from it, never from a list of its own.
+core-types = { path = "../core-types" }
 # The signer's wire types (serde only): `wire::signer` frames them.
 signer-proto = { path = "../signer-proto" }
 # The ONE restatement of the node's contract-id derivation (sdk#334):

@@ -695,7 +695,7 @@ fn impossible_params_are_refused_where_they_are_set() {
 /// a value picked from the middle cannot tell those apart.
 #[test]
 fn a_packed_value_over_its_kinds_limit_is_refused_where_it_is_set() {
-    let raw_limit = engine::pack::max_body(freenet_prolly::kind::RAW);
+    let raw_limit = engine::pack::max_body(core_types::kind::BlockKind::Raw);
     assert_eq!(raw_limit, 262_208, "the contract's RAW ceiling");
 
     // Inside the old band: it fits a 1 MiB pack, so the pack-size check passes
