@@ -31,7 +31,6 @@ fn a_block_the_parked_write_needs_is_not_withdrawn_when_a_read_on_it_is_supersed
     let asked = fetches(&out);
     assert!(!asked.is_empty(), "THE SETUP: the write did not park on a cold block");
     let needed = asked[0];
-    assert!(e.readers_of(&needed).any(), "THE SETUP: the parked write does not await the block it asked for");
     let _ = e.step(Event::Get { client: ClientId(2), req_id: ReqId(7), key: b"k/00100".to_vec() });
     assert!(e.supersede_read(ReqId(7)), "THE SETUP: the read waiting on the write's block was not superseded");
     assert!(!e.is_withdrawn(&needed), "a block the parked write still needs was WITHDRAWN when a read on it was superseded");
@@ -77,7 +76,6 @@ fn a_repair_the_parked_write_needs_stands_when_the_read_that_raced_it_is_superse
     let _ = e.step(Event::Get { client: ClientId(2), req_id: ReqId(7), key });
     assert!(parity.iter().all(|p| e.readers_of(p).repairs), "THE SETUP: the read did not race the member's group");
     assert!(e.supersede_read(ReqId(7)), "THE SETUP: the read was not superseded");
-    assert!(e.readers_of(&member).parked_write, "THE SETUP: the parked write no longer needs the member");
     assert!(parity.iter().all(|p| e.readers_of(p).repairs), "the repair of a block the parked write needs ended when the read that raced it was superseded");
     assert!(parity.iter().all(|p| !e.is_withdrawn(p)), "a slot of a repair the parked write needs was withdrawn");
 }
@@ -102,7 +100,9 @@ fn a_freed_repair_slot_the_parked_write_needs_is_not_withdrawn() {
     let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(key_of(&a), Op::Put(b"new".to_vec()))]));
     assert!(fetches(&out).contains(&a), "THE SETUP: the write did not park on A");
     let _ = e.step(Event::Get { client: ClientId(2), req_id: ReqId(7), key: key_of(&b) });
-    assert!(e.readers_of(&a).repairs && e.readers_of(&a).parked_write, "THE SETUP: A is not both a slot of B's race and the write's");
+    // The write's own need of A is shown by its FetchBlock above, never read back through `readers_of` here: the
+    // property below is what must see a `readers_of` that ignores the write (the architect on #495).
+    assert!(e.readers_of(&a).repairs, "THE SETUP: A is not a slot of B's race");
     let bytes = all.get(&b).expect("held").to_vec();
     store.put(b, &bytes);
     let _ = e.step(Event::BlockArrived { id: b, bytes });
