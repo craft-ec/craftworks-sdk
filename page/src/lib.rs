@@ -357,6 +357,8 @@ fn waiting_name(w: &Waiting) -> String {
 /// An op in flight.
 #[derive(Debug, Clone)]
 struct Deadline {
+    /// Its LANE, classed once when it went out ([`Page::lane_of`]); only ever PROMOTED to Interactive after.
+    lane: Lane,
     at: u64,
     /// The deadline it was given when SENT: a re-arm never moves it past this
     /// (sdk#378).
@@ -429,6 +431,16 @@ fn op_site(w: &Waiting) -> instrument::Site {
         Waiting::PutApp(_) => Site::of("page::op::put-app"),
         Waiting::Ext(_) => Site::of("page::op::ext"),
     }
+}
+
+/// WHICH WORK AN OP IS (KEEPER §7, OBSERVABILITY §3): the person's INTERACTIVE work, or BACKGROUND work -- an
+/// audit, an observation commit -- that the page keeps to ONE op on the node's one queue, outside the interactive GET
+/// window, so interactive work waits behind at most one background op. One lane for all background work: two lanes
+/// would put two background ops on the node's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    Interactive,
+    Background,
 }
 
 /// Which op a deadline is for.
@@ -740,6 +752,11 @@ pub struct Page {
     /// key, is the known overlap (the architect) -- dropped, counted, and recorded as
     /// `DroppedMsgs = DropReason::AnsweredAfterReask`. Forgotten once no earlier node GET can still be running.
     reasked: BTreeMap<Cid, (u64, bool)>,
+    /// BACKGROUND ops waiting for the one background slot ([`Lane`]), in the order asked.
+    bg_queue: std::collections::VecDeque<(Waiting, Op)>,
+    /// Waits the in-crate tests class as Background (nothing on main is Background yet).
+    #[cfg(test)]
+    test_background: BTreeSet<Waiting>,
     /// The attempt a re-send continues from (set when an op times out).
     attempt_of: BTreeMap<Waiting, u32>,
     /// When each op still unanswered was FIRST sent: what "not answering for
@@ -858,6 +875,9 @@ impl Page {
             window: rto::Window::default(),
             get_queue: Default::default(),
             reasked: BTreeMap::new(),
+            bg_queue: Default::default(),
+            #[cfg(test)]
+            test_background: BTreeSet::new(),
             attempt_of: BTreeMap::new(),
             first_of: BTreeMap::new(),
             recovered: false,
@@ -954,7 +974,7 @@ impl Page {
         // Every GET that timed out is LOST; the window decides whether that
         // begins a loss episode (`rto::Window::lost`).
         for w in &late {
-            if let (Waiting::Get(_), Some(d)) = (w, self.deadlines.get(w).filter(|d| d.sent)) {
+            if let (Waiting::Get(_), Some(d)) = (w, self.deadlines.get(w).filter(|d| d.sent && d.lane == Lane::Interactive)) {
                 self.window.lost(d.sent_at, d.attempt, now);
             }
         }
@@ -981,6 +1001,8 @@ impl Page {
                 // was removed, and its re-send QUEUES for a place like any
                 // new ask (sdk#345) -- behind the GETs already waiting, and
                 // never outside the window (rule 9: every byte is paced).
+                // A BACKGROUND GET's re-send goes back through its lane (the slot, or behind it), never the window.
+                Waiting::Get(_) if d.lane == Lane::Background => self.send_in(w, op, Lane::Background),
                 Waiting::Get(id) => {
                     // A node GET LOST (past its bound): the one re-asked beside it may overlap it (sdk#447).
                     if d.sent {
@@ -1928,8 +1950,6 @@ impl Page {
         }
     }
 
-    /// An op goes out, due again one RTO from now. A GET waits for a place
-    /// in the window.
     /// Ask `Held` about `id` at the next flush (sdk#455). One already in a batch in flight joins it there.
     fn ask_held(&mut self, id: Cid) {
         self.held_asks.insert(id);
@@ -1969,7 +1989,81 @@ impl Page {
         }
     }
 
+    /// THE ONE CLASS OF AN OP ([`Lane`]): decided here, when it is sent, and stored on its deadline -- with ONE
+    /// exception, PROMOTION: an op sent as Background that an INTERACTIVE waiter then joins (an app read needing the
+    /// block an audit's GET asked for) is re-classed Interactive, once, where the join is sent ([`Page::send_in`]); it
+    /// is never demoted back. Everything is Interactive until background work names its waits here (the observation
+    /// tree's, sdk#399; the dashboard audit's, KEEPER §7).
+    ///
+    /// Promotion is checked where WAITERS change -- after every engine step ([`Page::promote_joined`]) -- not only
+    /// where a new send shows up: the engine de-duplicates a joining read (one wait per block), so it may emit no new
+    /// fetch for it.
+    fn lane_of(&self, w: &Waiting) -> Lane {
+        #[cfg(test)]
+        if self.test_background.contains(w) {
+            return Lane::Background;
+        }
+        let _ = w;
+        Lane::Interactive
+    }
+
+    /// PROMOTION where waiters change: every Background op -- queued, or on the wire -- whose class is now
+    /// Interactive is re-classed, once: a queued one is sent now as interactive work, an on-wire one moves to the
+    /// interactive count and frees the slot. Then the slot takes the next queued Background op.
+    fn promote_joined(&mut self) {
+        let joined: Vec<Waiting> = self
+            .bg_queue
+            .iter()
+            .map(|(w, _)| w.clone())
+            .chain(self.deadlines.iter().filter(|(_, d)| d.sent && d.lane == Lane::Background).map(|(w, _)| w.clone()))
+            .filter(|w| self.lane_of(w) == Lane::Interactive)
+            .collect();
+        for w in joined {
+            if let Some(at) = self.bg_queue.iter().position(|(q, _)| *q == w) {
+                let (w, op) = self.bg_queue.remove(at).expect("found");
+                self.send_in(w, op, Lane::Interactive);
+            } else if let Some(d) = self.deadlines.get_mut(&w) {
+                d.lane = Lane::Interactive;
+            }
+        }
+        self.pump_background();
+    }
+
+    /// An op goes out, due again one RTO from now. A GET waits for a place
+    /// in the window.
     fn send(&mut self, w: Waiting, op: Op) {
+        let lane = self.lane_of(&w);
+        self.send_in(w, op, lane);
+    }
+
+    /// Background ops on the wire (parked ones hold no slot): at most one.
+    pub(crate) fn background_in_flight(&self) -> usize {
+        self.deadlines.values().filter(|d| d.sent && d.lane == Lane::Background).count()
+    }
+
+    /// The next queued Background op goes out when the slot is free; one that has meanwhile turned Interactive (a
+    /// waiter joined it) goes out as that.
+    fn pump_background(&mut self) {
+        while self.background_in_flight() == 0 {
+            let Some((w, op)) = self.bg_queue.pop_front() else { return };
+            let lane = self.lane_of(&w);
+            self.send_in(w, op, lane);
+        }
+    }
+
+    /// Send `w` in `lane`.
+    fn send_in(&mut self, w: Waiting, op: Op, lane: Lane) {
+        // PROMOTION (the one exception to "classed once"): an interactive waiter joining a Background op. Queued, it
+        // leaves the background queue and is sent below as interactive work; on the wire, it moves to the
+        // interactive count and frees the background slot -- its answer serves the new waiter too.
+        if lane == Lane::Interactive {
+            self.bg_queue.retain(|(q, _)| *q != w);
+            if let Some(d) = self.deadlines.get_mut(&w).filter(|d| d.sent && d.lane == Lane::Background) {
+                d.lane = Lane::Interactive;
+                self.pump_background();
+                return;
+            }
+        }
         // A send of an op that is PARKED JOINS its wait (the deadline table's (d), the architect and main): the parked
         // deadline and back-off stand, and it goes out, as this op, when that deadline comes due. The rule a GET already
         // follows (`FetchBlock` sends nothing while one is pending); a parked head read waits BECAUSE the register
@@ -1983,7 +2077,15 @@ impl Page {
         if matches!(w, Waiting::Get(_)) && self.deadlines.contains_key(&w) {
             return;
         }
-        if let Waiting::Get(id) = w {
+        // ONE BACKGROUND OP ON THE WIRE: behind it, in order. Never in the interactive GET window below.
+        if lane == Lane::Background {
+            if self.background_in_flight() >= 1 && !self.deadlines.get(&w).is_some_and(|d| d.sent) {
+                if !self.bg_queue.iter().any(|(q, _)| *q == w) {
+                    self.bg_queue.push_back((w, op));
+                }
+                return;
+            }
+        } else if let Waiting::Get(id) = w {
             if self.gets_in_flight() >= self.window.size() && !self.deadlines.contains_key(&w) {
                 if !self.get_queue.contains(&id) {
                     self.get_queue.push_back(id);
@@ -2005,7 +2107,7 @@ impl Page {
         let ahead = self.deadlines.iter().filter(|(k, d)| d.sent && !d.silent && **k != w).count() as u64;
         let at = self.now + if attempt == 1 { queued_wait(self.rto.rto_ms(), ahead) } else { self.backoff(attempt) };
         let seq = self.next_send();
-        let d = Deadline { at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq, alone: ahead == 0, silent: false };
+        let d = Deadline { lane, at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq, alone: ahead == 0, silent: false };
         self.record_send(&w, &d);
         // A send still on the wire for the same op is SUPERSEDED by this one: its end is said, never overwritten.
         if let Some(old) = self.deadlines.insert(w.clone(), d) {
@@ -2039,6 +2141,8 @@ impl Page {
     /// AN OP ENDS: THE one way a deadline leaves (a control counts this crate's removals). What the recording
     /// says of it is decided here, once: answered, timed out, or withdrawn.
     fn end(&mut self, w: &Waiting, how: End) -> Option<Deadline> {
+        // A queued Background op that ends never goes out.
+        self.bg_queue.retain(|(q, _)| q != w);
         let d = self.deadlines.remove(w)?;
         self.record_end(w, &d, how);
         Some(d)
@@ -2105,7 +2209,7 @@ impl Page {
 
     /// GETs on the wire (parked ones are not).
     fn gets_in_flight(&self) -> usize {
-        self.deadlines.iter().filter(|(k, d)| matches!(k, Waiting::Get(_)) && d.sent).count()
+        self.deadlines.iter().filter(|(k, d)| matches!(k, Waiting::Get(_)) && d.sent && d.lane == Lane::Interactive).count()
     }
 
     /// A GET's answer: [`Page::answered`], and which attempt it answered.
@@ -2185,7 +2289,8 @@ impl Page {
         debug_assert!(self.deadlines.get(&w).is_none_or(|d| d.sent), "park of an op that is already parked: {w:?}");
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
-        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0, alone: false, silent: false }) {
+        let lane = self.deadlines.get(&w).map_or_else(|| self.lane_of(&w), |d| d.lane);
+        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { lane, at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0, alone: false, silent: false }) {
             self.record_end(&w, &old, End::Withdrawn);
         }
     }
@@ -2226,9 +2331,13 @@ impl Page {
         if d.sent {
             self.rearm_first_sends();
         }
-        if d.sent && matches!(w, Waiting::Get(_)) {
+        if d.sent && d.lane == Lane::Interactive && matches!(w, Waiting::Get(_)) {
             self.window.opened();
             self.fill_gets();
+        }
+        // A Background op answered frees the slot for the next.
+        if d.lane == Lane::Background {
+            self.pump_background();
         }
         Some(d.op)
     }
@@ -2546,6 +2655,10 @@ impl Page {
                     _ => None,
                 })
                 .chain(self.get_queue.iter().copied())
+                .chain(self.bg_queue.iter().filter_map(|(w, _)| match w {
+                    Waiting::Get(id) => Some(*id),
+                    _ => None,
+                }))
                 .filter(|id| self.engine.blocks().get(id).is_some()),
         );
         for id in ended {
@@ -2681,6 +2794,8 @@ impl Page {
         // Every engine step's effects come through here, so no GET the engine stopped needing outlives the call
         // that stopped needing it (sdk#303).
         self.end_unneeded_gets();
+        // Every engine step can change who waits on a fetch: the one place promotion is checked.
+        self.promote_joined();
     }
 
     /// Effects whose `after` set is now confirmed go out, in emitted order.
@@ -2831,7 +2946,8 @@ impl Page {
     pub fn not_answering(&self) -> Option<(String, u64)> {
         self.first_of
             .iter()
-            .filter(|(w, _)| self.deadlines.contains_key(*w))
+            // What a PERSON is shown: never background work (an audit, an observation commit).
+            .filter(|(w, _)| self.deadlines.get(*w).is_some_and(|d| d.lane == Lane::Interactive))
             .min_by_key(|(_, at)| **at)
             .map(|(w, at)| (waiting_name(w), self.now.saturating_sub(*at)))
     }
@@ -5124,5 +5240,153 @@ mod confirmed_once {
     #[test]
     fn the_next_commits_head_survives_a_push_confirming_the_one_before() {
         the_next_head_survives_the_confirming_step(true);
+    }
+}
+
+#[cfg(test)]
+mod background_lane {
+    //! THE ONE BACKGROUND LANE (KEEPER §7, OBSERVABILITY §3; the architect's design): one Background op on the node's
+    //! one queue at a time, outside the interactive GET window, and PROMOTED -- once, never back -- when an
+    //! interactive waiter joins it. Nothing on main is Background yet, so these tests class waits Background through
+    //! `test_background`, the stand-in for the audit's and the observation tree's arms of `lane_of`.
+    use super::*;
+
+    /// A page whose opening head read is answered: nothing on the wire.
+    fn page() -> Page {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.answered(&Waiting::RecoverHead);
+        let _ = p.take_ops();
+        p
+    }
+
+    fn put(i: u8) -> (Waiting, Op) {
+        (Waiting::Put([i; 32]), Op::Put { id: [i; 32], bytes: vec![i] })
+    }
+
+    fn get(i: u8) -> (Waiting, Op) {
+        (Waiting::Get([i; 32]), Op::Get { id: [i; 32] })
+    }
+
+    fn background(p: &mut Page, (w, op): (Waiting, Op)) {
+        p.test_background.insert(w.clone());
+        p.send(w, op);
+    }
+
+    /// (a) **ONE Background op on the wire**, across a burst of ten, in order: each answer lets the next out.
+    #[test]
+    fn a_burst_of_background_ops_goes_one_at_a_time_in_order() {
+        let mut p = page();
+        for i in 1..=10 {
+            background(&mut p, put(i));
+        }
+        let mut sent = Vec::new();
+        for i in 1..=10u8 {
+            let ops = p.take_ops();
+            assert_eq!(p.background_in_flight(), 1, "{} Background ops on the wire", p.background_in_flight());
+            assert_eq!(ops, vec![put(i).1], "the {i}th Background op did not go out alone and in order");
+            sent.push(i);
+            p.answered(&put(i).0);
+        }
+        assert_eq!(sent, (1..=10).collect::<Vec<_>>());
+        assert_eq!((p.background_in_flight(), p.bg_queue.len()), (0, 0));
+    }
+
+    /// (b) **A Background GET never takes the interactive window**: with the window full and an interactive GET
+    /// queued behind it, a Background GET goes out on its own slot, and the window's next place goes to the
+    /// interactive GET.
+    #[test]
+    fn a_background_get_never_takes_an_interactive_place() {
+        let mut p = page();
+        let n = p.window.size();
+        for i in 1..=(n as u8 + 1) {
+            let (w, op) = get(i);
+            p.send(w, op);
+        }
+        assert_eq!((p.gets_in_flight(), p.get_queue.len()), (n, 1), "THE SETUP: the window is not full with one queued");
+        background(&mut p, get(200));
+        assert!(p.deadlines.get(&get(200).0).is_some_and(|d| d.sent), "the Background GET waited on the interactive window");
+        assert_eq!(p.gets_in_flight(), n, "the Background GET counts in the interactive window");
+        let _ = p.take_ops();
+        p.answered(&get(1).0);
+        let queued = get(n as u8 + 1).0;
+        assert!(p.deadlines.get(&queued).is_some_and(|d| d.sent && d.lane == Lane::Interactive), "the freed place did not go to the queued interactive GET");
+    }
+
+    /// (c) **A Background GET neither grows nor shrinks the interactive window**: answered, or timed out.
+    #[test]
+    fn a_background_gets_answer_and_loss_leave_the_window_alone() {
+        let mut p = page();
+        let size = p.window.size();
+        background(&mut p, get(1));
+        p.answered(&get(1).0);
+        assert_eq!(p.window.size(), size, "a Background GET's answer grew the interactive window");
+        background(&mut p, get(2));
+        let due = p.deadlines[&get(2).0].at;
+        p.tick(Ms(due));
+        assert_eq!(p.window.size(), size, "a Background GET's loss shrank the interactive window");
+        assert!(p.deadlines.get(&get(2).0).is_some_and(|d| d.lane == Lane::Background), "the lost Background GET's re-send left its lane");
+        assert!(!p.get_queue.contains(&[2; 32]), "the lost Background GET's re-send queued for the interactive window");
+    }
+
+    /// (d) **A queued Background op that is withdrawn never goes out.**
+    #[test]
+    fn a_withdrawn_queued_background_op_is_never_sent() {
+        let mut p = page();
+        background(&mut p, put(1));
+        background(&mut p, put(2));
+        let _ = p.take_ops();
+        p.end(&put(2).0, End::Withdrawn);
+        p.answered(&put(1).0);
+        assert!(p.take_ops().is_empty(), "the withdrawn queued Background op went out");
+    }
+
+    /// (e) **The person is never shown background work waiting.**
+    #[test]
+    fn not_answering_never_names_background_work() {
+        let mut p = page();
+        background(&mut p, put(1));
+        assert_eq!(p.not_answering(), None, "a Background op was shown as not answering");
+        let (w, op) = put(2);
+        p.send(w, op);
+        assert!(p.not_answering().is_some(), "THE CONTROL: an interactive op was not shown");
+    }
+
+    /// (f) **PROMOTION, queued**: a Background GET of X waits behind another Background op; an interactive waiter
+    /// joins X (the engine may emit no new fetch for it) -- at the next engine step X goes out NOW, as interactive
+    /// work, counted in the interactive window.
+    #[test]
+    fn a_queued_background_get_an_interactive_waiter_joins_goes_out_now() {
+        let mut p = page();
+        background(&mut p, put(1));
+        background(&mut p, get(7));
+        assert!(p.bg_queue.iter().any(|(w, _)| *w == get(7).0), "THE SETUP: X is not queued behind the slot");
+        let before = p.gets_in_flight();
+        // An app read joins X: its class is now Interactive.
+        p.test_background.remove(&get(7).0);
+        let now = p.now;
+        p.tick(Ms(now));
+        let d = p.deadlines.get(&get(7).0).expect("X was not sent");
+        assert!(d.sent && d.lane == Lane::Interactive, "X did not go out as interactive work");
+        assert_eq!(p.gets_in_flight(), before + 1, "the promoted GET is not counted in the interactive window");
+        assert_eq!(p.background_in_flight(), 1, "THE CONTROL: the other Background op lost its slot");
+    }
+
+    /// (f) **PROMOTION, on the wire**: the joined op moves to the interactive count and FREES the slot, which the
+    /// next queued Background op takes; it is never demoted back.
+    #[test]
+    fn an_on_wire_background_op_an_interactive_waiter_joins_frees_the_slot() {
+        let mut p = page();
+        background(&mut p, get(7));
+        background(&mut p, put(2));
+        let _ = p.take_ops();
+        p.test_background.remove(&get(7).0);
+        let now = p.now;
+        p.tick(Ms(now));
+        assert_eq!(p.deadlines[&get(7).0].lane, Lane::Interactive, "the joined on-wire op was not promoted");
+        assert!(p.deadlines.get(&put(2).0).is_some_and(|d| d.sent), "the freed slot did not take the next Background op");
+        // Never demoted: classing it Background again changes nothing.
+        p.test_background.insert(get(7).0);
+        p.tick(Ms(now));
+        assert_eq!(p.deadlines[&get(7).0].lane, Lane::Interactive, "a promoted op was demoted back");
     }
 }
