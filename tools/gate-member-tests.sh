@@ -4,7 +4,8 @@
 # assertion message -- in <dir>/<member>-<utc time>.log and names that file on stderr, so a failure that does
 # not come back on a rerun is still evidence, not a shrug (sdk#360: a page test failed once in a gate and its
 # panic text was gone; five reruns could say nothing about why).
-#   gate-member-tests.sh <member> <dir>
+#   gate-member-tests.sh <member> <dir> [<out-file>]   (<out-file>: the whole output, for gate.sh's check that no
+#                                                       test target ran 0 tests while declaring some, sdk#475)
 #   gate-member-tests.sh --keep <member> <dir> <rc>    (the output on stdin: a member gate.sh ran its own way,
 #                                                       e.g. with batch-only targets apart -- the SAME keeping)
 set -uo pipefail
@@ -32,6 +33,7 @@ m=$1
 dir=$2
 out=$(cargo test -p "$m" --no-fail-fast 2>&1)
 rc=$?
+[ -n "${3:-}" ] && printf '%s\n' "$out" > "$3"
 echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}'
 keep "$m" "$dir" "$rc" "$out"
 exit $rc
