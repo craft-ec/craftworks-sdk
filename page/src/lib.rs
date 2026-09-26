@@ -2040,20 +2040,32 @@ impl Page {
         }
     }
 
-    /// START an audit pass over THIS page's tree at its published root (KEEPER §4, §5): the asset is the tree the page
-    /// stands on (a kept TREE asset on its own `tree()` reader's page; an app's or the SDK's PIECES need the pieces audit, KEEPER §2, not built), repaired by `repair`. It runs as the ops
-    /// leave ([`Page::take_ops`]), ONE audit op at a time, and its report is [`Page::take_audit`]'s. A pass already
-    /// running is replaced (its waits WITHDRAWN). `signer`: can this page ask `Held` (page-io's `has_signer`, fixed when
-    /// the PageIo is built)? Without one the pass is over at once, UNMEASURED, with no op at all (KEEPER §5 ¹⁰).
+    /// START a FULL audit pass over THIS page's tree at its published root (KEEPER §4, §5): every node it reaches. The
+    /// asset is the tree the page stands on -- a kept TREE asset on its own `tree()` reader's page; an app's or the
+    /// SDK's PIECES need the pieces audit (KEEPER §2, not built). Repaired by `repair`. It runs as the ops leave
+    /// ([`Page::take_ops`]), ONE audit op at a time, and its report is [`Page::take_audit`]'s. A pass already running is
+    /// replaced (its waits WITHDRAWN). `signer`: can this page ask `Held` (page-io's `has_signer`, fixed when the
+    /// PageIo is built)? Without one the pass is over at once, UNMEASURED, with no op at all (KEEPER §5 ¹⁰).
     pub fn audit(&mut self, repair: audit::Repair, signer: bool) {
+        self.start_audit(repair, signer, None);
+    }
+
+    /// START an INCREMENTAL pass (KEEPER §5: on a head move): only the nodes the page's published root has that `old`
+    /// (the root seen before the move) does not -- freenet-prolly's diff `new_blocks`. As [`Page::audit`] otherwise; its
+    /// report says `full: false`, and only a full pass's is written back (K5), so auditing your own tree cannot loop.
+    pub fn audit_since(&mut self, repair: audit::Repair, signer: bool, old: Cid) {
+        self.start_audit(repair, signer, Some(old));
+    }
+
+    fn start_audit(&mut self, repair: audit::Repair, signer: bool, since: Option<Cid>) {
         self.end_audit_waits();
         let root = self.published().1;
         if signer {
-            self.audit = Some(audit::Audit::new(root, repair, self.now));
+            self.audit = Some(audit::Audit::new(root, since, repair, self.now));
             self.audit_report = None;
         } else {
             self.audit = None;
-            self.audit_report = Some(audit::Audit::unmeasured(root, self.now));
+            self.audit_report = Some(audit::Audit::unmeasured(root, since, self.now));
         }
     }
 
@@ -2107,8 +2119,8 @@ impl Page {
         let acts = a.on(ev, &cx);
         for act in acts {
             match act {
-                audit::Act::Walk { req, at } => {
-                    let spec = engine::read::NodesSpec { at, max_nodes: AUDIT_NODES_PER_PAGE };
+                audit::Act::Walk { req, at, since } => {
+                    let spec = engine::read::NodesSpec { at, max_nodes: AUDIT_NODES_PER_PAGE, since };
                     self.step(Event::Nodes { client: ClientId::BACKGROUND, req_id: engine::read::ReqId(req), spec });
                 }
                 audit::Act::AskHeld(ids) => {

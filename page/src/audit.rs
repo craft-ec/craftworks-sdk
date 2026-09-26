@@ -76,6 +76,8 @@ impl Seen {
 /// One group the walk found.
 #[derive(Clone, Debug)]
 pub(crate) struct Grp {
+    /// The node that lists it (the root's group of one: the root) -- what a walk that names a node twice is keyed by.
+    pub node: Cid,
     pub members: Vec<Cid>,
     pub parity: Vec<Cid>,
     /// A leaf's group (its values, `RAW`) or a branch's (its children, `TREE_NODE`; the root's group of one too).
@@ -152,8 +154,8 @@ pub(crate) enum Ev {
 /// What the pass asks the page to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Act {
-    /// Read the walk's next page (request id, its spec).
-    Walk { req: u64, at: Option<NodesAt> },
+    /// Read the walk's next page (request id, where it starts, and -- an incremental pass -- the old root).
+    Walk { req: u64, at: Option<NodesAt>, since: Option<Cid> },
     AskHeld(Vec<Cid>),
     Get(Cid),
     Put(Cid, Vec<u8>),
@@ -176,6 +178,9 @@ pub(crate) struct Ctx<'a> {
 /// A pass in progress.
 pub(crate) struct Audit {
     root: Cid,
+    /// `None`: a FULL pass (every node); `Some(old)`: an INCREMENTAL pass over the nodes `root` has that `old` does not
+    /// (KEEPER §5: on a head move). Only a full pass's report is written back (K5).
+    since: Option<Cid>,
     policy: Repair,
     started_at: u64,
     groups: Vec<Grp>,
@@ -189,9 +194,10 @@ pub(crate) struct Audit {
 
 impl Audit {
     /// A pass at `root`, walking (KEEPER §5: a page WITH a signer; one without never starts one).
-    pub fn new(root: Cid, policy: Repair, now: u64) -> Audit {
+    pub fn new(root: Cid, since: Option<Cid>, policy: Repair, now: u64) -> Audit {
         Audit {
             root,
+            since,
             policy,
             started_at: now,
             groups: Vec::new(),
@@ -223,7 +229,7 @@ impl Audit {
             // ---- Walking
             (Phase::Walking { reading: None, at }, Ev::Free) => {
                 self.reqs += 1;
-                acts.push(Act::Walk { req: self.reqs, at: at.clone() });
+                acts.push(Act::Walk { req: self.reqs, at: at.clone(), since: self.since });
                 Phase::Walking { at, reading: Some(self.reqs) }
             }
             (p @ Phase::Walking { reading: Some(_), .. }, Ev::Free) => p,
@@ -232,12 +238,14 @@ impl Audit {
                     self.impossible += 1;
                     return (Phase::Walking { reading: Some(r), at }, acts, false);
                 }
-                if let Some(parity) = root_parity {
-                    self.add_group(vec![self.root], parity, false, cx.rejected);
+                // A node already walked is not walked again (an incremental walk's resumed page may name one twice).
+                let walked: BTreeSet<Cid> = self.groups.iter().map(|g| g.node).collect();
+                if let Some(parity) = root_parity.filter(|_| !walked.contains(&self.root)) {
+                    self.add_group(self.root, vec![self.root], parity, false, cx.rejected);
                 }
-                for n in nodes {
+                for n in nodes.into_iter().filter(|n| !walked.contains(&n.id)) {
                     for (members, parity) in n.groups {
-                        self.add_group(members, parity, n.level == 0, cx.rejected);
+                        self.add_group(n.id, members, parity, n.level == 0, cx.rejected);
                     }
                 }
                 let next = match next {
@@ -390,13 +398,13 @@ impl Audit {
         self.seen.insert(id, s);
     }
 
-    fn add_group(&mut self, members: Vec<Cid>, parity: Vec<Cid>, leaf: bool, rejected: &BTreeSet<Cid>) {
+    fn add_group(&mut self, node: Cid, members: Vec<Cid>, parity: Vec<Cid>, leaf: bool, rejected: &BTreeSet<Cid>) {
         for id in members.iter().chain(parity.iter()) {
             if rejected.contains(id) {
                 self.seen.insert(*id, Seen::Rejected);
             }
         }
-        self.groups.push(Grp { members, parity, leaf });
+        self.groups.push(Grp { node, members, parity, leaf });
     }
 
     // ---- DERIVED (KEEPER §5): read the two states, write nothing.
@@ -506,6 +514,7 @@ impl Audit {
     pub fn report(&self, now: u64) -> Report {
         let mut r = Report {
             root: self.root,
+            full: self.since.is_none(),
             measured: true,
             health: Health::Unmeasured,
             groups: self.groups.len(),
@@ -547,9 +556,10 @@ impl Audit {
     }
 
     /// A signer-less page's report (KEEPER §5 ¹⁰): UNMEASURED, from nothing -- no walk, no op.
-    pub fn unmeasured(root: Cid, now: u64) -> Report {
+    pub fn unmeasured(root: Cid, since: Option<Cid>, now: u64) -> Report {
         Report {
             root,
+            full: since.is_none(),
             measured: false,
             health: Health::Unmeasured,
             groups: 0,
@@ -606,6 +616,9 @@ pub struct Report {
     pub finished_at: u64,
     /// The root the pass measured (the page's published root when it began).
     pub root: Cid,
+    /// A FULL pass (every node the root reaches), or an INCREMENTAL one (only what a head move added). Only a full
+    /// pass's report is written back (`audited_at`, `health`: KEEPER §5 K5), so auditing your own tree cannot loop.
+    pub full: bool,
     /// `false`: the page had no signer to ask (a reader's page) -- the asset is UNMEASURED, and its counts say
     /// nothing (never all-absent).
     pub measured: bool,
@@ -674,7 +687,7 @@ mod tests {
         let mut ids: Vec<Cid> = published.iter().map(|p| block_id(kind::PARITY, p)).collect();
         ids[2] = [0xee; 32];
         let node: BTreeMap<Cid, Vec<u8>> = members.iter().copied().zip(values.iter().cloned()).collect();
-        let mut a = Audit::new([1; 32], Repair::Always, 0);
+        let mut a = Audit::new([1; 32], None, Repair::Always, 0);
         let rejected = BTreeSet::new();
         let none = |_: &Cid| None;
         let cx = Ctx { stored: &none, rejected: &rejected, max_held: 128 };
@@ -689,6 +702,24 @@ mod tests {
         assert!(!puts.iter().any(|(id, _)| *id == ids[2]), "a recompute was PUT under an id it does not hash to");
         assert_eq!(said.len(), 1, "the forged id was not said: {said:?}");
         assert_eq!(a.impossible(), 0, "the pass met an impossible cell");
+    }
+
+    /// **A node named twice is walked ONCE** (KEEPER §5 "Two walks, one table": an incremental walk's resumed page may
+    /// name a node again): two walk pages both naming the same node leave its group counted once. CONTROL: two
+    /// different nodes are two groups.
+    #[test]
+    fn a_node_named_twice_is_walked_once() {
+        let rejected = BTreeSet::new();
+        let none = |_: &Cid| None;
+        let cx = Ctx { stored: &none, rejected: &rejected, max_held: 128 };
+        let node = |id: u8| NodeGroups { id: [id; 32], level: 0, groups: vec![(vec![[id + 100; 32]], Vec::new())] };
+        for (second, want) in [(1u8, 1usize), (2, 2)] {
+            let mut a = Audit::new([1; 32], Some([2; 32]), Repair::Off, 0);
+            let _ = a.on(Ev::Free, &cx);
+            let _ = a.on(Ev::WalkPage { req: 1, nodes: vec![node(1)], next: Some(NodesAt::After(b"k".to_vec())), root_parity: None }, &cx);
+            let _ = a.on(Ev::WalkPage { req: 2, nodes: vec![node(second)], next: None, root_parity: None }, &cx);
+            assert_eq!((a.report(0).groups, a.impossible()), (want, 0), "node {second} named after node 1: groups");
+        }
     }
 
     /// **ONE WRITER** (KEEPER §5; "Structure before code"): in this file only the transition function and its own

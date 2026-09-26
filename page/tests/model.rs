@@ -1763,6 +1763,12 @@ fn audited_tree(rows: usize) -> (Node, Page, u64) {
 
 /// [`audited_tree`] under `params` (the model's, [`model_params`]: its block budget).
 fn audited_tree_with(params: Params, rows: usize) -> (Node, Page, u64) {
+    let (node, _a, b, now) = audited_pair(params, rows);
+    (node, b, now)
+}
+
+/// [`audited_tree_with`], keeping the writer A too: (node, A, B, now).
+fn audited_pair(params: Params, rows: usize) -> (Node, Page, Page, u64) {
     let (mut node, _) = Node::new();
     let mut a = Page::new(params, PutPath::Page);
     let mut b = Page::new(params, PutPath::Page);
@@ -1780,7 +1786,7 @@ fn audited_tree_with(params: Params, rows: usize) -> (Node, Page, u64) {
     b.head_hint();
     audit_serve(&mut b, &mut node, &mut now, &Default::default(), 400);
     assert_eq!(b.published().0, seq, "THE SETUP: B did not adopt A's head");
-    (node, b, now)
+    (node, a, b, now)
 }
 
 /// Serve `p` as the node does, ONE ROUND BEHIND: the ops a `take_ops` returns are answered at the next round, so an
@@ -2316,4 +2322,49 @@ fn every_repair_puts_the_ids_own_bytes_back() {
     }
     println!("{seed} seeds: {repaired} blocks repaired; {whole_after} `always` passes left the asset whole");
     assert!(repaired > 0, "no seed repaired anything: the invariant is vacuous");
+}
+
+
+/// **An INCREMENTAL pass audits and repairs only what the head move ADDED** (KEEPER §5; P2): B has audited A's 90 rows
+/// at root r1; A writes 30 more (a head move to r2) and B adopts it. The node loses one block the move added and one it
+/// did not touch. B's pass `since r1` walks only the move's new nodes: it repairs the new block, never asks about the
+/// untouched one, and says `full: false` over fewer groups. CONTROL: a FULL pass then repairs the untouched one too.
+#[test]
+fn an_incremental_pass_repairs_only_what_the_move_added() {
+    let (mut node, mut a, mut b, mut now) = audited_pair(Params::default(), 90);
+    let r1 = b.published().1;
+    // Each value DISTINCT (content-addressed: 30 equal values would be ONE block listed 30 times).
+    let added: Vec<(Vec<u8>, WriteOp)> = (0..30u8)
+        .map(|i| {
+            let mut v = vec![0xab; 2_000];
+            v[1] = i;
+            (format!("w/{i:03}").into_bytes(), WriteOp::Put(v))
+        })
+        .collect();
+    a.write(ClientId(1), WriteId(100), added);
+    audit_serve(&mut a, &mut node, &mut now, &Default::default(), 5_000);
+    b.head_hint();
+    audit_serve(&mut b, &mut node, &mut now, &Default::default(), 400);
+    assert_ne!(b.published().1, r1, "THE SETUP: B did not adopt the move");
+    let new_value = node.blocks.iter().find(|(_, v)| v.len() == 2_000 && v[0] == 0xab).map(|(k, _)| *k).expect("a value the move added");
+    let old_value = node.blocks.iter().find(|(_, v)| v.len() == 2_000 && v[0] == 3).map(|(k, _)| *k).expect("a value from before the move");
+    let (new_bytes, old_bytes) = (node.blocks.remove(&new_value).expect("held"), node.blocks.remove(&old_value).expect("held"));
+
+    b.audit_since(page::audit::Repair::Always, true, r1);
+    let mut puts = Vec::new();
+    let asks = audit_serve_puts(&mut b, &mut node, &mut now, &Default::default(), 20_000, &mut puts);
+    let inc = b.take_audit().expect("the incremental pass did not end");
+    println!("incremental: full {}, {} groups (whole {}, degraded {}, damaged {}), margins {:?}, pending {}, repaired {}, PUTs {:?}", inc.full, inc.groups, inc.whole, inc.degraded, inc.damaged.len(), inc.margins, inc.pending, inc.repaired, puts.iter().map(|(id, b)| (engine::short_id(id), b.len())).collect::<Vec<_>>());
+    assert!(asks <= 1);
+    assert!(!inc.full, "an incremental pass said it was full");
+    assert!(puts.len() == 1 && puts[0] == (new_value, new_bytes), "the incremental pass did not repair exactly the move's lost block {}", engine::short_id(&new_value));
+    assert!(!node.blocks.contains_key(&old_value), "the incremental pass touched a block the move did not");
+
+    b.audit(page::audit::Repair::Always, true);
+    let mut puts = Vec::new();
+    audit_serve_puts(&mut b, &mut node, &mut now, &Default::default(), 20_000, &mut puts);
+    let full = b.take_audit().expect("the full pass did not end");
+    println!("full: {} groups, repaired {}", full.groups, full.repaired);
+    assert!(full.full && full.groups > inc.groups, "THE CONTROL: the full pass is not full, or no wider ({} vs {})", full.groups, inc.groups);
+    assert!(puts.len() == 1 && puts[0] == (old_value, old_bytes), "THE CONTROL: the full pass did not repair the untouched block: PUTs {:?}", puts.iter().map(|(id, b)| (engine::short_id(id), b.len())).collect::<Vec<_>>());
 }

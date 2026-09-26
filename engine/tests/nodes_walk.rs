@@ -63,7 +63,7 @@ fn the_nodes_walk_pages_through_every_node_once_with_its_groups() {
     loop {
         pages += 1;
         assert!(pages < 1_000, "the walk never ended");
-        match e.walk(&root, &Walk::Nodes(NodesSpec { at: at.clone(), max_nodes: 5 })) {
+        match e.walk(&root, &Walk::Nodes(NodesSpec { at: at.clone(), max_nodes: 5, since: None })) {
             Walked::Done(ReadResult::Nodes { nodes, next }) => {
                 got.extend(nodes);
                 match next {
@@ -98,7 +98,7 @@ fn a_cold_nodes_walk_fetches_through_the_read_path_as_background_work() {
     let mut got = 0usize;
     let mut fetched = 0usize;
     for req in 1..1_000u64 {
-        let mut fx = e.step(Event::Nodes { client: ClientId::BACKGROUND, req_id: ReqId(req), spec: NodesSpec { at: at.clone(), max_nodes: 16 } });
+        let mut fx = e.step(Event::Nodes { client: ClientId::BACKGROUND, req_id: ReqId(req), spec: NodesSpec { at: at.clone(), max_nodes: 16, since: None } });
         let mut done = None;
         for _ in 0..10_000 {
             let mut next = Vec::new();
@@ -138,4 +138,64 @@ fn a_cold_nodes_walk_fetches_through_the_read_path_as_background_work() {
     let fx = app.step(Event::Get { client: ClientId(7), req_id: ReqId(1), key: b"k/00300".to_vec() });
     let first = fx.iter().find_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).expect("a cold read fetches");
     assert!(!app.fetch_is_background(&first), "an app read's fetch was taken as background work");
+}
+
+/// **An INCREMENTAL walk names every node the new root has that the old does not** (KEEPER §5, a head move;
+/// freenet-prolly's diff `new_blocks`): the fixture, then 100 consecutive values changed and 10 keys added -- more than one page, so
+/// it RESUMES. The union of its pages holds all of `nodes(new) ∖ nodes(old)` (found by the independent descent), each
+/// node with its own groups, and anything else it names is a node of BOTH trees (a resumed page's bounded extra); no
+/// value is fetched or needed. CONTROL: `since` the root itself names nothing.
+#[test]
+fn an_incremental_walk_names_every_node_the_new_root_added_and_only_nodes_of_both_trees_besides() {
+    let mut records: BTreeMap<Vec<u8>, Vec<u8>> = (0..600u32).map(|i| (format!("k/{i:05}").into_bytes(), vec![(i % 251) as u8; 2_000])).collect();
+    let (old, old_blocks) = tree(&records);
+    // 100 changes over the tree: more than one diff page (NODES_SINCE_CHANGES_PER_PAGE), so the walk RESUMES.
+    for i in 400..500u32 {
+        records.insert(format!("k/{i:05}").into_bytes(), [vec![0xee], i.to_be_bytes().to_vec(), vec![0; 1_995]].concat());
+    }
+    for i in 0..10u32 {
+        records.insert(format!("n/{i:05}").into_bytes(), vec![0xdd; 2_000]);
+    }
+    let (new, new_blocks) = tree(&records);
+    let (had, has) = (all_nodes(&old_blocks, old), all_nodes(&new_blocks, new));
+    let want: BTreeMap<Cid, Groups> = has.iter().filter(|(id, _)| !had.contains_key(*id)).map(|(k, v)| (*k, v.clone())).collect();
+    assert!(!want.is_empty() && want.len() < has.len(), "THE SETUP: the move added {} of {} nodes", want.len(), has.len());
+    let e = started(new);
+    for (id, _) in had.iter() {
+        e.blocks().put(*id, old_blocks.get(id).expect("held"));
+    }
+    for (id, _) in has.iter() {
+        e.blocks().put(*id, new_blocks.get(id).expect("held"));
+    }
+    let walk_since = |since: Cid| {
+        let (mut got, mut at, mut pages) = (Vec::<NodeGroups>::new(), None, 0);
+        for _ in 0..1_000 {
+            pages += 1;
+            match e.walk(&new, &Walk::Nodes(NodesSpec { at: at.clone(), max_nodes: 5, since: Some(since) })) {
+                Walked::Done(ReadResult::Nodes { nodes, next }) => {
+                    got.extend(nodes);
+                    match next {
+                        Some(n) => at = Some(n),
+                        None => return (got, pages),
+                    }
+                }
+                other => panic!("a warm incremental walk did not answer (a value was wanted?): {other:?}"),
+            }
+        }
+        panic!("the incremental walk never ended");
+    };
+    let (got, pages) = walk_since(old);
+    let named: BTreeMap<Cid, Groups> = got.iter().map(|n| (n.id, n.groups.clone())).collect();
+    let extra: Vec<&Cid> = named.keys().filter(|id| !want.contains_key(*id)).collect();
+    println!("incremental: {} names over {pages} pages, {} distinct nodes (the move added {}; {} extra; the new tree has {})", got.len(), named.len(), want.len(), extra.len(), has.len());
+    assert!(pages >= 2, "THE SETUP: one page -- the walk never resumed");
+    // COMPLETE: every node the move added, with its own groups.
+    for (id, groups) in &want {
+        assert_eq!(named.get(id), Some(groups), "a node the move added was not named, or not with its groups");
+    }
+    // SOUND: anything else named is a node of the new tree the old one holds too (a resumed page's bounded extra).
+    assert!(extra.iter().all(|id| has.contains_key(*id) && had.contains_key(*id)), "the walk named a node that is not in both trees");
+
+    // CONTROL: since the root itself -> nothing.
+    assert!(walk_since(new).0.is_empty(), "a walk since the same root named nodes");
 }

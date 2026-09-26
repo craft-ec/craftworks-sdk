@@ -156,21 +156,25 @@ pub struct DeltaSpec {
     pub max_entries: usize,
 }
 
-/// A page of a tree's NODES, LEVEL BY LEVEL from the root down, left to right within a level: `at` names where the
-/// page starts (`None`: the root's level, its first node), `max_nodes` how many it holds. What the assets dashboard's
-/// audit walks (KEEPER §4): every group a node carries, and its parity ids.
+/// A page of a tree's NODES and their groups -- what the assets dashboard's audit walks (KEEPER §4, §5). `since`:
+/// `None` walks EVERY node, LEVEL BY LEVEL from the root down, left to right within a level (a FULL pass); `Some(old)`
+/// walks only the nodes the root has that `old` does not (an INCREMENTAL pass on a head move: freenet-prolly's diff
+/// `new_blocks`, exactly `nodes(root) ∖ nodes(old)`). `at` names where the page starts (`None`: the start),
+/// `max_nodes` bounds a full walk's page.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NodesSpec {
     pub at: Option<NodesAt>,
     pub max_nodes: usize,
+    pub since: Option<Cid>,
 }
 
-/// Where a [`NodesSpec`] page starts: the first node of `level` that can hold `from` (a level's smallest key, as its
-/// parent records it).
+/// Where a [`NodesSpec`] page starts.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NodesAt {
-    pub level: u8,
-    pub from: Vec<u8>,
+pub enum NodesAt {
+    /// A FULL walk: the first node of `level` that can hold `from` (a level's smallest key, as its parent records it).
+    Level { level: u8, from: Vec<u8> },
+    /// An INCREMENTAL walk: strictly after this key (the diff's resume token; its two roots are the spec's).
+    After(Vec<u8>),
 }
 
 /// One node and its GROUPS: each group's members (children for a branch, referenced values for a leaf) and its
@@ -378,33 +382,49 @@ pub(crate) enum Attempt {
     Broken(Cid),
 }
 
-/// One page of [`NodesSpec`]: from `spec.at` (or the root's level), up to `max_nodes` nodes, level by level down to the
-/// leaves. A cold node is a `Need` (the parked read fetches it and walks the page again from the same start).
-fn nodes_page<B: Blocks>(blocks: &B, root: &Cid, spec: &NodesSpec) -> Result<(Vec<NodeGroups>, Option<NodesAt>), ReadError> {
-    use freenet_prolly::cursor::LevelCursor;
+/// A node and its GROUPS: each group's members and its parity ids, in the node's group order. The ONE derivation, for
+/// both walks.
+fn groups_of(node: &freenet_prolly::node::Node<'_>, id: Cid, level: u8) -> NodeGroups {
     use freenet_prolly::parity::{group_members, PARITY};
+    let parity: Vec<Cid> = node.parity().collect();
+    let groups = group_members(node)
+        .into_iter()
+        .enumerate()
+        .map(|(g, (_, members))| (members, parity.iter().skip(g * PARITY).take(PARITY).copied().collect()))
+        .collect();
+    NodeGroups { id, level, groups }
+}
+
+/// One page of [`NodesSpec`]: a full walk ([`full_nodes_page`]) or an incremental one ([`since_nodes_page`]).
+fn nodes_page<B: Blocks>(blocks: &B, root: &Cid, spec: &NodesSpec) -> Result<(Vec<NodeGroups>, Option<NodesAt>), ReadError> {
+    match (&spec.since, &spec.at) {
+        (None, None) => full_nodes_page(blocks, root, None, spec.max_nodes),
+        (None, Some(NodesAt::Level { level, from })) => full_nodes_page(blocks, root, Some((*level, from.clone())), spec.max_nodes),
+        (Some(old), None) => since_nodes_page(blocks, old, root, None),
+        (Some(old), Some(NodesAt::After(after))) => since_nodes_page(blocks, old, root, Some(after)),
+        // A start of the other walk's kind names no place in this one: this walk from its start (idempotent: a pass
+        // is a walk, KEEPER §5).
+        (None, Some(NodesAt::After(_))) => full_nodes_page(blocks, root, None, spec.max_nodes),
+        (Some(old), Some(NodesAt::Level { .. })) => since_nodes_page(blocks, old, root, None),
+    }
+}
+
+/// A FULL walk's page: from `at` (or the root's level), up to `max_nodes` nodes, level by level down to the leaves. A
+/// cold node is a `Need` (the parked read fetches it and walks the page again from the same start).
+fn full_nodes_page<B: Blocks>(blocks: &B, root: &Cid, at: Option<(u8, Vec<u8>)>, max_nodes: usize) -> Result<(Vec<NodeGroups>, Option<NodesAt>), ReadError> {
+    use freenet_prolly::cursor::LevelCursor;
     let top = freenet_prolly::store::Held::root(blocks, root)?.level();
-    let (mut level, mut from) = match &spec.at {
-        Some(at) => (at.level, at.from.clone()),
-        None => (top, Vec::new()),
-    };
+    let (mut level, mut from) = at.unwrap_or((top, Vec::new()));
     let mut nodes = Vec::new();
     loop {
         let Some(mut c) = LevelCursor::seek(blocks, root, level, &from)? else { return Ok((nodes, None)) };
         loop {
-            let node = c.node();
-            let parity: Vec<Cid> = node.parity().collect();
-            let groups = group_members(node)
-                .into_iter()
-                .enumerate()
-                .map(|(g, (_, members))| (members, parity.iter().skip(g * PARITY).take(PARITY).copied().collect()))
-                .collect();
-            nodes.push(NodeGroups { id: c.id(), level, groups });
+            nodes.push(groups_of(c.node(), c.id(), level));
             let next = c.next_min_key();
-            if nodes.len() >= spec.max_nodes.max(1) {
+            if nodes.len() >= max_nodes.max(1) {
                 let at = match next {
-                    Some(key) => Some(NodesAt { level, from: key }),
-                    None => level.checked_sub(1).map(|l| NodesAt { level: l, from: Vec::new() }),
+                    Some(key) => Some(NodesAt::Level { level, from: key }),
+                    None => level.checked_sub(1).map(|l| NodesAt::Level { level: l, from: Vec::new() }),
                 };
                 return Ok((nodes, at));
             }
@@ -420,6 +440,40 @@ fn nodes_page<B: Blocks>(blocks: &B, root: &Cid, spec: &NodesSpec) -> Result<(Ve
             None => return Ok((nodes, None)),
         }
     }
+}
+
+/// How many CHANGES one incremental walk page covers (the diff's page): its nodes are the ones those changes' paths
+/// opened.
+pub const NODES_SINCE_CHANGES_PER_PAGE: usize = 64;
+
+/// An INCREMENTAL walk's page: the nodes of `root` that `old` does not have -- freenet-prolly's diff `new_blocks`
+/// (complete and sound; exactly `nodes(root) ∖ nodes(old)` in one page from the roots, and under a resume a page may
+/// also name a few nodes `old` holds too -- at most the tree's height -- so a reader keys what it walked by node id).
+/// A diff page that still NEEDS blocks is a
+/// `Need`: the read fetches them and runs the page again from the same resume token (its changes are not taken, so
+/// nothing is half-applied). Values are never fetched: the walk wants nodes, not changes.
+fn since_nodes_page<B: Blocks>(blocks: &B, old: &Cid, root: &Cid, after: Option<&Vec<u8>>) -> Result<(Vec<NodeGroups>, Option<NodesAt>), ReadError> {
+    use freenet_prolly::diff::{diff, DiffError, Resume};
+    let range = Range { lo: std::ops::Bound::Unbounded, hi: std::ops::Bound::Unbounded, reverse: false, after: None, max_entries: NODES_SINCE_CHANGES_PER_PAGE, max_bytes: usize::MAX };
+    let resume = after.map(|a| Resume { a: *old, b: *root, after: a.clone() });
+    let page = match diff(blocks, old, root, &range, resume.as_ref()) {
+        Ok(page) => page,
+        Err(DiffError::Read(e)) => return Err(e),
+        // Roots changed under a resume, or an instruction the diff has no answer for: the incremental walk cannot be
+        // trusted, so it names the ROOT broken -- the pass says so, and the next full pass covers it.
+        Err(_) => return Err(ReadError::Mismatch(*root)),
+    };
+    if !page.need.is_empty() {
+        return Err(ReadError::Need(page.need));
+    }
+    let mut nodes = Vec::with_capacity(page.new_blocks.len());
+    for id in page.new_blocks {
+        let bytes = blocks.get(&id).ok_or_else(|| ReadError::Need(vec![id]))?;
+        let node = freenet_prolly::node::Node::parse(bytes).map_err(|e| ReadError::Corrupt(id, e))?;
+        let level = node.level();
+        nodes.push(groups_of(&node, id, level));
+    }
+    Ok((nodes, page.next.map(|n| NodesAt::After(n.after))))
 }
 
 pub(crate) fn attempt<B: Blocks>(

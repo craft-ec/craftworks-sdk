@@ -420,6 +420,11 @@ impl PageIo {
         self.server.page.audit(repair, self.can_ask_held());
     }
 
+    /// Start an INCREMENTAL pass (KEEPER §5, on a head move from `old`): see [`page::Page::audit_since`].
+    pub fn audit_since(&mut self, repair: page::audit::Repair, old: [u8; 32]) {
+        self.server.page.audit_since(repair, self.has_signer, old);
+    }
+
     /// A READER of somebody's published head (sdk#239): the page reads the
     /// Register `register_id` names and the blocks under it, and can do
     /// nothing else. Published data is readable by default; writing is access
