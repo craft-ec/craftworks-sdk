@@ -53,9 +53,9 @@ fn absent_until_put_again(p: &mut Page, id: [u8; 32], mut now: u64) -> Vec<Op> {
     for _ in 0..100 {
         for op in p.take_ops() {
             match op {
-                Op::AskHeld { id: x } if x == id && absents < HELD_ABSENTS => {
+                Op::AskHeld { batch, ids } if ids.contains(&id) && absents < HELD_ABSENTS => {
                     absents += 1;
-                    p.answer(Answer::Held { id, present: false }, Ms(now));
+                    p.answer(Answer::Held { batch, present: ids.iter().map(|x| *x != id).collect() }, Ms(now));
                 }
                 other => after.push(other),
             }
@@ -102,7 +102,7 @@ fn published_with_a_straggler() -> (Page, Put) {
                 // The straggler's re-sends: never answered (it is the straggler).
                 Op::Put { .. } => {}
                 // The Wrapper path confirms an acked PUT by `Held`: every block but the straggler is there.
-                Op::AskHeld { id } if id != straggler.0 => p.answer(Answer::Held { id, present: true }, Ms(34)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: ids.iter().map(|x| *x != straggler.0).collect() }, Ms(34)),
                 other => common::unanswered_op(&other),
             }
         }
