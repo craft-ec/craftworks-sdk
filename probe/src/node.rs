@@ -301,6 +301,12 @@ impl Node {
         Ok(())
     }
 
+    /// The node process's id while it runs: a probe that pauses its OWN node (SIGSTOP, a silent peer) names it by
+    /// this handle, never by a search.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     pub fn ws(&self) -> String {
         format!(
             "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
