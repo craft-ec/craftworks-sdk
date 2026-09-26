@@ -123,6 +123,7 @@ fn a_published_commits_straggler_absent_is_put_again_from_page_memory_after_evic
     p.answer(Answer::PutOk(id), Ms(40));
     let after = absent_until_put_again(&mut p, id, 41);
     let again: Vec<Vec<u8>> = after.into_iter().filter_map(|o| match o { Op::Put { id: x, bytes } if x == id => Some(bytes), _ => None }).collect();
+    assert_eq!(p.reput_missing(), 0, "a straggler our commit PUT had its bytes gone at its re-put (the model property)");
     assert_eq!(again.first(), Some(&bytes), "a backing straggler, absent on the node, was not put again with its bytes: evicted");
     assert!(p.blocks().stats().evicted > 0, "THE SETUP: nothing was evicted, so no pass ran over unpinned blocks here");
 }
