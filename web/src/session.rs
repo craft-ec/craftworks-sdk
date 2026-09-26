@@ -1242,7 +1242,6 @@ impl Session {
                     E::Failed => ("FAILED", format!("write {id} could not be saved"), serde_json::json!({})),
                     E::Unknown => ("UNKNOWN", format!("write {id} may or may not have been saved (its confirmation was lost); check it"), serde_json::json!({})),
                     E::TooLarge { limit, got, .. } => ("TOO_LARGE", format!("write {id} is over the engine's limit ({got} against {limit}); split it into smaller writes"), serde_json::json!({ "limit": limit, "got": got })),
-                    E::QueueFull { bytes, limit } => ("QUEUE_FULL", format!("write {id} was not taken: {bytes} of {limit} bytes of writes were already waiting to be saved; wait for them, then try again"), serde_json::json!({ "bytes": bytes, "limit": limit })),
                 };
                 self.unusable.push(line.clone());
                 serde_json::json!({ "writeId": id, "fate": fate, "line": line, "detail": extra })

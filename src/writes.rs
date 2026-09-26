@@ -63,7 +63,6 @@ pub enum Ended {
     Lost,
     ForcedLost,
     TooLarge { bound: engine::WriteBound, limit: usize, got: usize },
-    QueueFull { bytes: usize, limit: usize },
     /// It may have landed: the app is told to check (COMMIT-LIFE ⁵).
     Unknown,
 }
@@ -229,7 +228,10 @@ impl Writes {
                 return;
             }
             Fate::TooLarge { bound, limit, got } => Ended::TooLarge { bound, limit, got },
-            Fate::QueueFull { bytes, limit } => Ended::QueueFull { bytes, limit },
+            // THE DOOR'S VERDICT ONLY (sdk#450): the engine says `QueueFull` at admission, in the step that took the
+            // write's frame, and `hand_over` takes it in that same call (`refused_at_door` closes the write, so an
+            // open write never reaches here with it). Not an end: the SDK waits for room and makes the write again.
+            Fate::QueueFull { .. } => unreachable!("QueueFull is the door's verdict, taken by hand_over"),
             Fate::Failed => Ended::Failed,
             Fate::Lost if forced => Ended::ForcedLost,
             Fate::Lost => Ended::Lost,
