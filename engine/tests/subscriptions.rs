@@ -1089,5 +1089,5 @@ fn a_delta_across_a_vanished_root_asks_for_a_reload_and_a_get_still_does_not() {
     }
     assert_eq!(answer, None, "a Get whose blocks are NotFound was answered {answer:?}: the degraded answer is a DELTA's, and a Get waits");
     let asked = asked.expect("the Get asked for a block");
-    assert!(reader.awaits_block(&asked), "the Get's block is no longer awaited: nothing would ask for it again");
+    assert!(reader.readers_of(&asked).any(), "the Get's block is no longer awaited: nothing would ask for it again");
 }

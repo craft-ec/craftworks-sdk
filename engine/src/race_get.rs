@@ -49,7 +49,8 @@ impl<B: Blocks> Engine<B> {
         }
         let mut out = vec![Effect::Keep { id, bytes: body.to_vec() }];
         // PUT back for whoever needed it: a read, or a parked write (sdk#405) -- the network is whole again.
-        if self.reads.waiting.contains_key(&id) || self.parked_write.as_ref().is_some_and(|p| p.needs.contains(&id)) {
+        let wants = self.readers_of(&id);
+        if wants.reads || wants.parked_write {
             out.push(Effect::PutRepaired { id, bytes: body.to_vec() });
         }
         out
@@ -69,7 +70,7 @@ impl<B: Blocks> Engine<B> {
         }
         let mut out = Vec::new();
         for (_, slot) in slots {
-            let in_flight = self.repair_slots.contains_key(&slot) || self.reads.waiting.contains_key(&slot);
+            let in_flight = self.readers_of(&slot).any();
             self.repair_slots.entry(slot).or_default().insert(id);
             self.withdrawn.remove(&slot);
             if !in_flight {

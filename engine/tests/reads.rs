@@ -1338,7 +1338,7 @@ fn a_read_whose_block_keeps_missing_waits_then_answers_and_leaves_no_attempts_be
         );
         assert!(fetched(&out).contains(&asked[0]), "miss {}: the block was not asked for again", n + 1);
     }
-    assert!(e.awaits_block(&asked[0]), "the engine stopped waiting on the block");
+    assert!(e.readers_of(&asked[0]).any(), "the engine stopped waiting on the block");
     // Now the node has it: serve everything the read asks for.
     let mut queue: Vec<Effect> = asked.iter().map(|id| Effect::FetchBlock { id: *id, via: engine::read::Via::Direct, attempt: 0 }).collect();
     let mut answered = false;
