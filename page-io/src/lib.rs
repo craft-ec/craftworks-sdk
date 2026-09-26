@@ -1136,107 +1136,6 @@ impl PageIo {
         self.server.page.next_due()
     }
 
-    /// One op, framed for the node (the one place an op becomes frames). `AskHeld` is ONE `Held` frame of all its
-    /// ids (sdk#455), its signer id mapped to the page's batch.
-    fn frame_op(&mut self, op: Op, stream: u32) -> Result<Vec<Vec<u8>>, String> {
-        match op {
-            Op::Put { id, bytes } => match wire::block::block_state(&id, &bytes) {
-                Some(state) => {
-                    let c = wire::block::block_contract(&self.art.block_code, &id);
-                    self.by_key.insert(c.key().to_string(), id);
-                    self.by_contract.insert(wire::block::contract_for(&self.art.block_code, &id), id);
-                    wire::frame_put(c, WrappedState::new(state), stream)
-                }
-                None => Err("a block whose bytes hash under no kind".into()),
-            },
-            Op::Get { id } => {
-                let contract = wire::block::contract_for(&self.art.block_code, &id);
-                self.by_contract.insert(contract, id);
-                wire::frame_get(wire::contract_id(contract), false, stream)
-            }
-            Op::ReadHead { label: Label::Head } => {
-                self.head_asked = true;
-                wire::frame_get(wire::contract_id(self.register_id), true, stream)
-            }
-            Op::ReadHead { label: Label::Site(app) } => match self.sites.get(&app) {
-                Some(site) => wire::frame_get(wire::contract_id(site.id), true, stream),
-                None => Err(format!("a read of {app}'s site, which is not being published")),
-            },
-            // A site's write is a PUT of its framing around exactly the signer's record (invariant 2).
-            Op::Update { label: Label::Site(app), state } => match self.sites.get(&app) {
-                Some(site) => wire::frame_put(site.contract.clone(), WrappedState::new(contract_keys::site::frame(&state, &site.web)), stream),
-                None => Err(format!("a PUT of {app}'s site, which is not being published")),
-            },
-            Op::Update { label: Label::Head, state } => {
-                if self.register_seen {
-                    wire::frame_update(self.register.key(), state, stream)
-                } else {
-                    // The first head: the Register does not exist yet, and
-                    // a PUT is what creates it (no delegate Install on this
-                    // path). An existing one merges a PUT like an UPDATE.
-                    wire::frame_put(self.register.clone(), WrappedState::new(state), stream)
-                }
-            }
-            Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } => {
-                let label = match label {
-                    Label::Head => Ok(signer_proto::Label::Head),
-                    Label::Site(app) => match self.sites.get(&app) {
-                        Some(site) => Ok(signer_proto::Label::Site { app, contract: site.id }),
-                        None => Err(format!("a sign for {app}'s site, which is not being published")),
-                    },
-                };
-                label.and_then(|label| {
-                    wire::signer::frame_sign(
-                        &self.art.signer,
-                        id,
-                        signer_proto::Head { seq: prev_seq, root: prev_root },
-                        signer_proto::Next { seq, root, ledger },
-                        label,
-                        stream,
-                    )
-                })
-            }
-            // Page-io's own requests, sent and re-sent by the page's
-            // sender (rule 5): framed HERE and nowhere else.
-            Op::Ext(Ext::RegisterSigner) => match self.signer_container.clone() {
-                Some(c) => wire::frame_register_delegate(c, stream),
-                None => Err("the signer's registration, with no signer to register".into()),
-            },
-            Op::Ext(Ext::SignerFirst) => match self.first.as_ref() {
-                Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
-                Some(First::Provision(key)) => wire::signer::frame_provision(
-                    &self.art.signer,
-                    PROVISION_ID,
-                    key.clone(),
-                    self.art.register_code.clone(),
-                    self.art.register_params.clone(),
-                    self.art.block_code.clone(),
-                    stream,
-                ),
-                None => Ok(Vec::new()),
-            },
-            Op::Ext(Ext::AskRecord) => wire::signer::frame_sign(
-                &self.art.signer,
-                RECORD_QUERY_ID,
-                signer_proto::Head { seq: 0, root: self.server.page.published().1 },
-                signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
-                signer_proto::Label::Head,
-                stream,
-            ),
-            Op::PutApp { key } => match self.app_contracts.get(&key) {
-                Some((c, st)) => wire::frame_put(c.clone(), st.clone(), stream),
-                None => Err(format!("an app PUT of {key}, whose contract this page does not hold")),
-            },
-            Op::AskHeld { batch, ids } => {
-                let hid = self.next_held_id;
-                self.next_held_id = self.next_held_id.wrapping_add(1).max(1 << 31);
-                self.held.insert(hid, batch);
-                let contracts = ids.iter().map(|id| wire::block::contract_for(&self.art.block_code, id)).collect();
-                wire::signer::frame_held(&self.art.signer, hid, contracts, stream)
-            }
-        }
-    }
-
     /// Frames for the node, in order.
     pub fn take_frames(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.out)
@@ -1319,7 +1218,103 @@ impl PageIo {
                 }
             }
             let stream = self.next_stream();
-            let framed = self.frame_op(op, stream);
+            let framed = match op {
+                Op::Put { id, bytes } => match wire::block::block_state(&id, &bytes) {
+                    Some(state) => {
+                        let c = wire::block::block_contract(&self.art.block_code, &id);
+                        self.by_key.insert(c.key().to_string(), id);
+                        self.by_contract.insert(wire::block::contract_for(&self.art.block_code, &id), id);
+                        wire::frame_put(c, WrappedState::new(state), stream)
+                    }
+                    None => Err("a block whose bytes hash under no kind".into()),
+                },
+                Op::Get { id } => {
+                    let contract = wire::block::contract_for(&self.art.block_code, &id);
+                    self.by_contract.insert(contract, id);
+                    wire::frame_get(wire::contract_id(contract), false, stream)
+                }
+                Op::ReadHead { label: Label::Head } => {
+                    self.head_asked = true;
+                    wire::frame_get(wire::contract_id(self.register_id), true, stream)
+                }
+                Op::ReadHead { label: Label::Site(app) } => match self.sites.get(&app) {
+                    Some(site) => wire::frame_get(wire::contract_id(site.id), true, stream),
+                    None => Err(format!("a read of {app}'s site, which is not being published")),
+                },
+                // A site's write is a PUT of its framing around exactly the signer's record (invariant 2).
+                Op::Update { label: Label::Site(app), state } => match self.sites.get(&app) {
+                    Some(site) => wire::frame_put(site.contract.clone(), WrappedState::new(contract_keys::site::frame(&state, &site.web)), stream),
+                    None => Err(format!("a PUT of {app}'s site, which is not being published")),
+                },
+                Op::Update { label: Label::Head, state } => {
+                    if self.register_seen {
+                        wire::frame_update(self.register.key(), state, stream)
+                    } else {
+                        // The first head: the Register does not exist yet, and
+                        // a PUT is what creates it (no delegate Install on this
+                        // path). An existing one merges a PUT like an UPDATE.
+                        wire::frame_put(self.register.clone(), WrappedState::new(state), stream)
+                    }
+                }
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } => {
+                    let label = match label {
+                        Label::Head => Ok(signer_proto::Label::Head),
+                        Label::Site(app) => match self.sites.get(&app) {
+                            Some(site) => Ok(signer_proto::Label::Site { app, contract: site.id }),
+                            None => Err(format!("a sign for {app}'s site, which is not being published")),
+                        },
+                    };
+                    label.and_then(|label| {
+                        wire::signer::frame_sign(
+                            &self.art.signer,
+                            id,
+                            signer_proto::Head { seq: prev_seq, root: prev_root },
+                            signer_proto::Next { seq, root, ledger },
+                            label,
+                            stream,
+                        )
+                    })
+                }
+                // Page-io's own requests, sent and re-sent by the page's
+                // sender (rule 5): framed HERE and nowhere else.
+                Op::Ext(Ext::RegisterSigner) => match self.signer_container.clone() {
+                    Some(c) => wire::frame_register_delegate(c, stream),
+                    None => Err("the signer's registration, with no signer to register".into()),
+                },
+                Op::Ext(Ext::SignerFirst) => match self.first.as_ref() {
+                    Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
+                    Some(First::Provision(key)) => wire::signer::frame_provision(
+                        &self.art.signer,
+                        PROVISION_ID,
+                        key.clone(),
+                        self.art.register_code.clone(),
+                        self.art.register_params.clone(),
+                        self.art.block_code.clone(),
+                        stream,
+                    ),
+                    None => Ok(Vec::new()),
+                },
+                Op::Ext(Ext::AskRecord) => wire::signer::frame_sign(
+                    &self.art.signer,
+                    RECORD_QUERY_ID,
+                    signer_proto::Head { seq: 0, root: self.server.page.published().1 },
+                    signer_proto::Next { seq: 1, root: UNHELD_ROOT, ledger: Vec::new() },
+                    signer_proto::Label::Head,
+                    stream,
+                ),
+                Op::PutApp { key } => match self.app_contracts.get(&key) {
+                    Some((c, st)) => wire::frame_put(c.clone(), st.clone(), stream),
+                    None => Err(format!("an app PUT of {key}, whose contract this page does not hold")),
+                },
+                // ONE `Held` request of every id's contract, in the op's order (sdk#455).
+                Op::AskHeld { batch, ids } => {
+                    let hid = self.next_held_id;
+                    self.next_held_id = self.next_held_id.wrapping_add(1).max(1 << 31);
+                    self.held.insert(hid, batch);
+                    let contracts = ids.iter().map(|id| wire::block::contract_for(&self.art.block_code, id)).collect();
+                    wire::signer::frame_held(&self.art.signer, hid, contracts, stream)
+                }
+            };
             match framed {
                 Ok(f) => self.out.extend(f),
                 Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
@@ -1366,8 +1361,9 @@ fn op_name(op: &Op) -> &'static str {
 
 use core_types::hex::encode as hex;
 
-/// THE BATCHED `Held` ON THE WIRE (sdk#455): one `Op::AskHeld` of MAX_HELD ids is ONE signer `Held` request carrying
-/// every id's Block contract in the op's order, and the signer's answer comes back to the page under the op's batch.
+/// THE BATCHED `Held` ON THE WIRE (sdk#455), through `pump` (rule 5: the one place an op is framed). Batching is per
+/// page STEP: asks made in separate steps go one per op; the re-asks that come due in ONE tick go as ONE signer `Held`
+/// request of every id's contract, and its answer reaches the page under the op's batch.
 #[cfg(test)]
 mod held_batch {
     use super::*;
@@ -1377,20 +1373,20 @@ mod held_batch {
     fn io() -> PageIo {
         let (_, signer) = wire::delegate_from_code(b"held batch signer code");
         PageIo::new(
-            page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Page, Ms(0)), page::server::SignerFacts::default()),
+            page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Wrapper, Ms(0)), page::server::SignerFacts { head_writable: true, head_id: [0; 32] }),
             Artefacts { block_code: b"held batch block code".to_vec(), register_code: b"held batch register code".to_vec(), register_params: wire::register_params(&[1u8; 32], wire::HEAD_NAME), signer },
         )
     }
 
-    /// The signer requests in page-io's frames, as the node reads them.
-    fn signer_requests(frames: &[Vec<u8>]) -> Vec<(u32, signer_proto::Request)> {
+    /// The signer `Held` requests in page-io's frames, as the node reads them: (signer id, contracts).
+    fn helds(io: &mut PageIo) -> Vec<(u32, Vec<[u8; 32]>)> {
         let mut out = Vec::new();
-        for f in frames {
-            let req: ClientRequest = bincode::deserialize(f).expect("page-io framed a real ClientRequest");
-            if let ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. }) = req {
-                for m in inbound {
-                    if let InboundDelegateMsg::ApplicationMessage(am) = m {
-                        out.push(signer_proto::decode_request(&am.payload).expect("a signer request"));
+        for f in io.take_frames() {
+            let Ok(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. })) = bincode::deserialize::<ClientRequest>(&f) else { continue };
+            for m in inbound {
+                if let InboundDelegateMsg::ApplicationMessage(am) = m {
+                    if let Some((id, signer_proto::Request::Held { contracts })) = signer_proto::decode_request(&am.payload) {
+                        out.push((id, contracts));
                     }
                 }
             }
@@ -1398,27 +1394,45 @@ mod held_batch {
         out
     }
 
-    #[test]
-    fn one_ask_held_of_max_held_ids_is_one_held_request_answered_under_its_batch() {
-        let mut io = io();
-        let ids: Vec<Cid> = (0..signer_proto::MAX_HELD).map(|i| { let mut c = [0u8; 32]; c[..8].copy_from_slice(&(i as u64).to_be_bytes()); c }).collect();
-        let frames = io.frame_op(Op::AskHeld { batch: 7, ids: ids.clone() }, 1).expect("framed");
-        let reqs = signer_requests(&frames);
-        println!("AskHeld of {} ids: {} frame(s), {} signer request(s)", ids.len(), frames.len(), reqs.len());
-        assert_eq!(reqs.len(), 1, "one AskHeld was not ONE signer request");
-        let (hid, req) = reqs.into_iter().next().expect("one");
-        let want: Vec<[u8; 32]> = ids.iter().map(|id| wire::block::contract_for(&io.art.block_code, id)).collect();
-        assert_eq!(req, signer_proto::Request::Held { contracts: want }, "the request does not carry every id's contract in the op's order");
-        assert_eq!(io.held.get(&hid), Some(&7), "the signer id is not mapped to the page's batch");
-        // The signer's answer, as a node delivers it: routed to the page under batch 7, then forgotten.
-        let present: Vec<bool> = (0..ids.len()).map(|i| i % 3 == 0).collect();
+    /// The signer's `Held` answer, as a node delivers it.
+    fn held_answer(io: &PageIo, hid: u32, present: Vec<bool>) -> Vec<u8> {
         let answer = signer_proto::encode_answer(hid, &signer_proto::Answer::Held { present });
-        let bytes = bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse {
+        bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse {
             key: io.art.signer.clone(),
             values: vec![OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(answer))],
         }))
-        .expect("encodes");
-        assert!(io.inbound(&bytes, Ms(1)), "the signer's Held answer was not taken");
-        assert!(io.held.is_empty(), "the answered batch is still mapped: its answer did not reach the page");
+        .expect("encodes")
+    }
+
+    #[test]
+    fn the_re_asks_due_in_one_tick_are_one_held_request_of_every_id() {
+        let mut io = io();
+        let ids: Vec<Cid> = (0..signer_proto::MAX_HELD).map(|i| { let mut c = [0u8; 32]; c[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes()); c }).collect();
+        // Each PUT answered in its own step: each asks alone (a wrapper-path PutOk, as before).
+        for id in &ids {
+            io.server.node(Answer::PutOk(*id), Ms(0));
+        }
+        io.pump();
+        let singles = helds(&mut io);
+        assert_eq!(singles.len(), ids.len(), "THE SETUP: the PUT answers did not each ask Held");
+        // Every one answered ABSENT at the same time: all come due again together.
+        for (hid, _) in &singles {
+            let bytes = held_answer(&io, *hid, vec![false]);
+            assert!(io.inbound(&bytes, Ms(1)), "a Held answer was not taken");
+        }
+        io.tick(Ms(page::rto::RTO_MAX_MS as u64 + 10));
+        let batch = helds(&mut io);
+        println!("{} ids due in one tick: {} Held request(s) of {:?} contract(s)", ids.len(), batch.len(), batch.iter().map(|(_, c)| c.len()).collect::<Vec<_>>());
+        assert_eq!(batch.len(), 1, "the re-asks due in one tick were not ONE Held request");
+        let mut want: Vec<[u8; 32]> = ids.iter().map(|id| wire::block::contract_for(&io.art.block_code, id)).collect();
+        let mut got = batch[0].1.clone();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "the one request does not carry every id's contract");
+        // Its answer, all present: every block confirmed, nothing left to ask.
+        let bytes = held_answer(&io, batch[0].0, vec![true; ids.len()]);
+        assert!(io.inbound(&bytes, Ms(page::rto::RTO_MAX_MS as u64 + 20)));
+        assert!(io.held.is_empty(), "the answered batch is still mapped");
+        assert!(!io.server.page.waiting(), "a block of the answered batch is still owed an ask");
     }
 }
