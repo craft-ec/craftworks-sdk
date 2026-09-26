@@ -498,6 +498,11 @@ export async function openSession(Session, {
     wrote: guard,
     /// Writes made here and not yet published, held ones included.
     unsaved: () => session.unsaved_writes(),
+    /// THE PAGE'S OPS (sdk#434): the tail of the page's recording, in the instrument's vocabulary -- each op by its
+    /// send order, how it ENDED (Response, Timeout, Withdrawn), and the retry clock it used. The recording is on from
+    /// the page's first op (sdk#407); this is its one local reader, for a person or a harness. Nothing is published,
+    /// and no user content is in it (sites, send-order labels and numbers only).
+    pageTrace: () => session.page_trace(),
     /// Ship what is waiting, now. Wired to the page lifecycle above; exposed
     /// because an app that knows it is finishing can say so sooner.
     flush,
