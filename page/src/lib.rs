@@ -675,24 +675,10 @@ pub fn beats(a: &[u8], b: &[u8]) -> bool {
     blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes()
 }
 
-/// One page's writes: the engine, the executor state, and what to send.
-pub struct Page {
-    path: PutPath,
-    /// This page's id in heads' `through` (COMMIT-LIFE ⁵): set once, from
-    /// its first session; zeros until then.
-    device: [u8; 16],
-    /// Hold the engine's cut when a head displaces this page's published one
-    /// at the SAME seq (review §1 on sdk#295): the Server may merge the
-    /// displaced group, which must go at the front. Only a Server that
-    /// releases the hold sets this.
-    hold_on_displace: bool,
-    /// The next signer request id this page issues: from 1, as `0` is
-    /// `signer_proto::UNATTRIBUTED`.
-    next_request: u32,
+/// ONE TREE's head flow (sdk#399 step 4): its engine (over its own blocks) and every field of its head's publication,
+/// in ONE struct per tree -- never parallel fields per tree (the architect).
+struct TreeState {
     engine: Engine<PageBlocks>,
-    /// Blocks a queued write's warm apply made (`Effect::Keep`): the only copy while any write is queued or a commit
-    /// is pending (the W pin, sdk#411); forgotten once neither is.
-    kept: BTreeSet<Cid>,
     /// Blocks whose PUT was answered ok (an effect's `after` is judged here).
     confirmed: BTreeSet<Cid>,
     /// Effects held until their `after` set is confirmed, in emitted order.
@@ -702,18 +688,9 @@ pub struct Page {
     /// something else, a superseded ask included), and a retryable refusal's
     /// backoff. The SAME type, and the same functions, as each site's.
     head: Pub,
-    /// Each SITE's publication in flight, by app id (builder#117).
-    sites: BTreeMap<String, Pub>,
-    /// How each site's publication ended, or that it has not: the one owner.
-    publications: BTreeMap<String, Publication>,
     /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
-    /// Blocks to ask `Held` about at the next flush (sdk#455): asked in BATCHES of up to MAX_HELD, one op each, when
-    /// the ops leave ([`Page::take_ops`]). An id already in a batch in flight joins it there.
-    held_asks: BTreeSet<Cid>,
-    /// The next `Held` batch's number.
-    next_held_batch: u32,
     /// A `NotNext{current}` not yet ADOPTED: the register must be read to hold
     /// it first (invariant 1b).
     verify: Option<Verify>,
@@ -739,6 +716,70 @@ pub struct Page {
     /// Blocks rebuilt from their group and PUT back (sdk#303): sent like a commit's PUT, but answered for NO
     /// commit -- an answer confirms nothing a commit or a head waits on. Left when a commit puts the same block.
     repair_puts: BTreeSet<Cid>,
+    /// The engine's own head read has been ANSWERED (a head, or certainly
+    /// none): until then its tree is the empty one it started on, and a read
+    /// answered from it would say "empty" about data that exists.
+    recovered: bool,
+    /// Has the engine been told its head (`HeadRead` / `HeadMissing`)?
+    engine_has_head: bool,
+    /// Every record the signer returned — invariant 2's evidence.
+    signer_records: BTreeSet<Vec<u8>>,
+}
+
+impl TreeState {
+    /// A tree with a fresh engine: not started, no head read.
+    fn new(params: Params) -> TreeState {
+        TreeState {
+            engine: Engine::new(params, PageBlocks::default()),
+            confirmed: BTreeSet::new(),
+            held: Vec::new(),
+            head: Pub::default(),
+            held_again: BTreeMap::new(),
+            verify: None,
+            landings: 0,
+            most_landing_updates: 0,
+            repairs_rejected: 0,
+            old_signer_fork_at: None,
+            my_records: BTreeMap::new(),
+            last_head_at: 0,
+            last_head: None,
+            put_again: BTreeMap::new(),
+            repair_puts: BTreeSet::new(),
+            recovered: false,
+            engine_has_head: false,
+            signer_records: BTreeSet::new(),
+        }
+    }
+}
+
+/// One page's writes: the engine, the executor state, and what to send.
+pub struct Page {
+    path: PutPath,
+    /// This page's id in heads' `through` (COMMIT-LIFE ⁵): set once, from
+    /// its first session; zeros until then.
+    device: [u8; 16],
+    /// Hold the engine's cut when a head displaces this page's published one
+    /// at the SAME seq (review §1 on sdk#295): the Server may merge the
+    /// displaced group, which must go at the front. Only a Server that
+    /// releases the hold sets this.
+    hold_on_displace: bool,
+    /// The next signer request id this page issues: from 1, as `0` is
+    /// `signer_proto::UNATTRIBUTED`.
+    next_request: u32,
+    /// THE DATA TREE: its engine and every per-head field (sdk#399 step 4: one struct per tree, the architect).
+    data: TreeState,
+    /// Blocks a queued write's warm apply made (`Effect::Keep`): the only copy while any write is queued or a commit
+    /// is pending (the W pin, sdk#411); forgotten once neither is.
+    kept: BTreeSet<Cid>,
+    /// Each SITE's publication in flight, by app id (builder#117).
+    sites: BTreeMap<String, Pub>,
+    /// How each site's publication ended, or that it has not: the one owner.
+    publications: BTreeMap<String, Publication>,
+    /// Blocks to ask `Held` about at the next flush (sdk#455): asked in BATCHES of up to MAX_HELD, one op each, when
+    /// the ops leave ([`Page::take_ops`]). An id already in a batch in flight joins it there.
+    held_asks: BTreeSet<Cid>,
+    /// The next `Held` batch's number.
+    next_held_batch: u32,
     /// Deadlines of the ops in flight, and each op to re-send.
     /// Every op in flight: when it is due again, the op to re-send, when it
     /// went out and on which attempt (Karn: only an attempt-1 answer samples).
@@ -766,12 +807,6 @@ pub struct Page {
     /// When each op still unanswered was FIRST sent: what "not answering for
     /// N s" counts from. Never a deadline (rule 8).
     first_of: BTreeMap<Waiting, u64>,
-    /// The engine's own head read has been ANSWERED (a head, or certainly
-    /// none): until then its tree is the empty one it started on, and a read
-    /// answered from it would say "empty" about data that exists.
-    recovered: bool,
-    /// Has the engine been told its head (`HeadRead` / `HeadMissing`)?
-    engine_has_head: bool,
     out: Vec<Op>,
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
@@ -813,8 +848,6 @@ pub struct Page {
     rec_from: u32,
     /// The send order outran what a label carries, and the recording was told (once).
     rec_overflowed: std::cell::Cell<bool>,
-    /// Every record the signer returned — invariant 2's evidence.
-    signer_records: BTreeSet<Vec<u8>>,
 }
 
 impl Page {
@@ -848,31 +881,15 @@ impl Page {
     /// their answers as a round trip of ~1.8e12 ms -- an SRTT no later sample could bring down, the RTO pinned at
     /// its 60 s ceiling for the page's life, so a lost PUT waited a minute (V's first save, Phase 4 realnet).
     pub fn unstarted(params: Params, path: PutPath, now: Ms) -> Page {
-        let engine = Engine::new(params, PageBlocks::default());
         Page {
             path,
             device: [0; 16],
             hold_on_displace: false,
-            engine,
             kept: BTreeSet::new(),
-            confirmed: BTreeSet::new(),
-            held: Vec::new(),
-            head: Pub::default(),
             sites: BTreeMap::new(),
             publications: BTreeMap::new(),
-            held_again: BTreeMap::new(),
             held_asks: BTreeSet::new(),
             next_held_batch: 0,
-            verify: None,
-            landings: 0,
-            most_landing_updates: 0,
-            repairs_rejected: 0,
-            old_signer_fork_at: None,
-            my_records: BTreeMap::new(),
-            last_head_at: 0,
-            last_head: None,
-            put_again: BTreeMap::new(),
-            repair_puts: BTreeSet::new(),
             deadlines: BTreeMap::new(),
             app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -884,8 +901,6 @@ impl Page {
             test_background: BTreeSet::new(),
             attempt_of: BTreeMap::new(),
             first_of: BTreeMap::new(),
-            recovered: false,
-            engine_has_head: false,
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
@@ -900,8 +915,8 @@ impl Page {
             sends: 0,
             rec_from: 1,
             rec_overflowed: std::cell::Cell::new(false),
-            signer_records: BTreeSet::new(),
             next_request: 1,
+            data: TreeState::new(params),
         }
     }
 
@@ -992,7 +1007,7 @@ impl Page {
             // A parked GET the engine no longer needs, or that the page now
             // holds (a repair rebuilt it), ends here.
             if let Waiting::Get(id) = w {
-                if !d.sent && (self.engine.blocks().get(&id).is_some() || !self.engine.awaits_block(&id)) {
+                if !d.sent && (self.data.engine.blocks().get(&id).is_some() || !self.data.engine.awaits_block(&id)) {
                     self.drop_get(id);
                     continue;
                 }
@@ -1026,14 +1041,14 @@ impl Page {
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
                 // A landing's request, or this commit's.
-                Waiting::Sign(Label::Head) if self.verify.as_ref().is_some_and(|v| v.landing) => self.ask_land(),
+                Waiting::Sign(Label::Head) if self.data.verify.as_ref().is_some_and(|v| v.landing) => self.ask_land(),
                 Waiting::Sign(Label::Head) => self.ask_sign(),
                 Waiting::PutApp(key) => self.send(Waiting::PutApp(key), op),
                 _ => {
                     if w == Waiting::Update(Label::Head) {
-                        if let Some(v) = self.verify.as_mut().filter(|v| v.landing) {
+                        if let Some(v) = self.data.verify.as_mut().filter(|v| v.landing) {
                             v.updates += 1;
-                            self.most_landing_updates = self.most_landing_updates.max(v.updates);
+                            self.data.most_landing_updates = self.data.most_landing_updates.max(v.updates);
                         }
                     }
                     self.send(w, op)
@@ -1042,11 +1057,11 @@ impl Page {
         }
         // The lost GETs queued above take free places, in queue order.
         self.fill_gets();
-        for (id, bytes) in std::mem::take(&mut self.put_again) {
+        for (id, bytes) in std::mem::take(&mut self.data.put_again) {
             self.send(Waiting::Put(id), Op::Put { id, bytes });
         }
-        if self.head.sign_again.is_some_and(|at| now >= at) {
-            self.head.sign_again = None;
+        if self.data.head.sign_again.is_some_and(|at| now >= at) {
+            self.data.head.sign_again = None;
             self.ask_sign();
         }
         let due: Vec<String> = self.sites.iter().filter(|(_, p)| p.sign_again.is_some_and(|at| now >= at)).map(|(a, _)| a.clone()).collect();
@@ -1054,16 +1069,16 @@ impl Page {
             self.pub_mut(&Label::Site(app.clone())).sign_again = None;
             self.ask_sign_for(Label::Site(app));
         }
-        if self.verify.as_ref().is_some_and(|v| v.again_at.is_some_and(|at| now >= at)) {
-            if let Some(v) = self.verify.as_mut() {
+        if self.data.verify.as_ref().is_some_and(|v| v.again_at.is_some_and(|at| now >= at)) {
+            if let Some(v) = self.data.verify.as_mut() {
                 v.again_at = None;
             }
             self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
         }
         // THE BACKSTOP: a hint can be dropped, so an idle page reads the
         // register at least every HEAD_BACKSTOP_MS.
-        if self.engine_has_head && self.verify.is_none() && !self.reading_head() && now.saturating_sub(self.last_head_at) >= HEAD_BACKSTOP_MS {
-            self.last_head_at = now;
+        if self.data.engine_has_head && self.data.verify.is_none() && !self.reading_head() && now.saturating_sub(self.data.last_head_at) >= HEAD_BACKSTOP_MS {
+            self.data.last_head_at = now;
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
         // A register that does not answer is asked again on the RTO for as
@@ -1072,16 +1087,16 @@ impl Page {
         // says for how long. Never turned into `HeadMissing` (that would open
         // an empty tree over a register merely unreachable, sdk#175), and
         // never given up.
-        let due: Vec<Cid> = self.held_again.iter().filter(|(_, (at, _))| now >= *at).map(|(id, _)| *id).collect();
+        let due: Vec<Cid> = self.data.held_again.iter().filter(|(_, (at, _))| now >= *at).map(|(id, _)| *id).collect();
         for id in due {
             // Its count of absents in a row stays (HELD_ABSENTS reads it); it is not due again while this ask is out:
             // the answer sets its next time.
-            if let Some(e) = self.held_again.get_mut(&id) {
+            if let Some(e) = self.data.held_again.get_mut(&id) {
                 e.0 = u64::MAX;
             }
             self.ask_held(id);
         }
-        let stale: Vec<Label> = std::iter::once((Label::Head, &self.head))
+        let stale: Vec<Label> = std::iter::once((Label::Head, &self.data.head))
             .chain(self.sites.iter().map(|(a, p)| (Label::Site(a.clone()), p)))
             .filter(|(l, p)| p.owed.as_ref().is_some_and(|o| o.record.is_some() && o.stale_reads > 0) && !self.deadlines.contains_key(&Waiting::ReadBack(l.clone())))
             .map(|(l, _)| l)
@@ -1139,12 +1154,12 @@ impl Page {
                 }
             }
             Answer::PutOk(id) => {
-                if self.answered(&Waiting::Put(id)).is_none() && self.confirmed.contains(&id) {
+                if self.answered(&Waiting::Put(id)).is_none() && self.data.confirmed.contains(&id) {
                     return; // a second answer to a re-sent PUT
                 }
-                self.put_again.remove(&id);
+                self.data.put_again.remove(&id);
                 // A repaired block's PUT is done: it confirms nothing (the architect's (b)).
-                if self.repair_puts.contains(&id) {
+                if self.data.repair_puts.contains(&id) {
                     return;
                 }
                 match self.path {
@@ -1161,14 +1176,14 @@ impl Page {
                 for (i, id) in ids.into_iter().enumerate() {
                     match present.get(i) {
                         Some(true) => {
-                            self.held_again.remove(&id);
+                            self.data.held_again.remove(&id);
                             self.confirm(id);
                         }
                         // Absent, and still waited on: asked again (the backoff). Nobody waits on it any more (a
                         // withdrawn block a batch in flight still carried): the ask ends here.
-                        Some(false) if self.engine.awaits_confirmation(&id) => self.held_absent(id, now),
+                        Some(false) if self.data.engine.awaits_confirmation(&id) => self.held_absent(id, now),
                         Some(false) => {
-                            self.held_again.remove(&id);
+                            self.data.held_again.remove(&id);
                         }
                         None => {
                             self.held_asks.insert(id);
@@ -1184,11 +1199,11 @@ impl Page {
                 let Some(op) = self.answered(&Waiting::Put(id)) else { return };
                 if transient {
                     if let Op::Put { bytes, .. } = op {
-                        self.put_again.insert(id, bytes);
+                        self.data.put_again.insert(id, bytes);
                     }
-                } else if self.repair_puts.remove(&id) {
+                } else if self.data.repair_puts.remove(&id) {
                     // A REPAIR's PUT rejected (sdk#433): dropped, and counted -- never silently.
-                    self.repairs_rejected += 1;
+                    self.data.repairs_rejected += 1;
                 } else {
                     // FINAL (sdk#433): the node's Block contract refused these bytes; never put again.
                     self.step(Event::PutRejected(id));
@@ -1200,7 +1215,7 @@ impl Page {
                 // not its id is not kept, and the engine hears a miss.
                 let good = engine::read::matches_id(&id, &bytes);
                 if good {
-                    self.engine.blocks_mut().insert(id, &bytes);
+                    self.data.engine.blocks_mut().insert(id, &bytes);
                 } else {
                     // Parked BEFORE the engine hears it: the engine re-asks
                     // inside that step, and must already see the GET pending,
@@ -1237,7 +1252,7 @@ impl Page {
                     return;
                 }
                 // Which label's sign it answers: the one whose sign in flight has this id.
-                let label = if self.head.sign_id == Some(id) {
+                let label = if self.data.head.sign_id == Some(id) {
                     Label::Head
                 } else if let Some(app) = self.sites.iter().find(|(_, p)| p.sign_id == Some(id)).map(|(a, _)| a.clone()) {
                     Label::Site(app)
@@ -1266,7 +1281,7 @@ impl Page {
                     // A LANDING's UPDATE is judged by its own read — does the
                     // register now hold the head the signer named — never by
                     // this commit's read-back.
-                    if self.verify.as_ref().is_some_and(|v| v.landing) {
+                    if self.data.verify.as_ref().is_some_and(|v| v.landing) {
                         self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
                     } else {
                         self.send(Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head });
@@ -1299,32 +1314,32 @@ impl Page {
                     }
                     return;
                 }
-                self.last_head_at = self.now;
+                self.data.last_head_at = self.now;
                 let h = read.as_ref().map(|r| (r.seq, r.root()));
-                self.last_head = read;
+                self.data.last_head = read;
                 self.answered(&Waiting::Warm);
                 // S1b: the register moved past an old signer's same-seq
                 // record, so it signs again.
-                if let (Some(at), Some((seq, _))) = (self.old_signer_fork_at, h) {
+                if let (Some(at), Some((seq, _))) = (self.data.old_signer_fork_at, h) {
                     if seq > at {
-                        self.old_signer_fork_at = None;
-                        if self.head.owed.is_some() {
-                            self.head.sign_again = Some(self.now);
+                        self.data.old_signer_fork_at = None;
+                        if self.data.head.owed.is_some() {
+                            self.data.head.sign_again = Some(self.now);
                         }
                     }
                 }
                 // THE ONE JUDGEMENT (sdk#396): every head read this answer ends acts on this verdict, never on `h`.
-                let j = judge(self.last_head.as_ref(), &self.my_records);
+                let j = judge(self.data.last_head.as_ref(), &self.data.my_records);
                 let recover_attempt = self.deadlines.get(&Waiting::RecoverHead).map(|d| d.attempt);
                 if self.answered(&Waiting::RecoverHead).is_some() {
                     match &j {
                         Judged::NoHead => {
                             self.step(Event::HeadMissing);
-                            self.recovered = true;
+                            self.data.recovered = true;
                         }
                         Judged::Head(heard) => {
                             self.adopt(*heard, Adopt::Recovery);
-                            self.recovered = true;
+                            self.data.recovered = true;
                         }
                         // The engine's own re-read, mid-commit, shows a head THIS page's record beats: my UPDATE has
                         // not merged there yet. Not adopted (the commit would die for a head about to lose): the
@@ -1347,7 +1362,7 @@ impl Page {
 
         /// A block is on the node: the one place `PutConfirmed` comes from.
     fn confirm(&mut self, id: Cid) {
-        if self.confirmed.insert(id) {
+        if self.data.confirmed.insert(id) {
             self.step(Event::PutConfirmed(id));
             self.release();
         }
@@ -1358,7 +1373,7 @@ impl Page {
         // A LANDING's answer (see `on_verify`): the record's bytes, UPDATEd as
         // they are, then read — the same deadline and backoff as a publish of
         // this page's own.
-        if self.verify.as_ref().is_some_and(|v| v.landing) {
+        if self.data.verify.as_ref().is_some_and(|v| v.landing) {
             let backoff = |v: &mut Verify, now: u64| {
                 v.tries += 1;
                 v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
@@ -1367,13 +1382,13 @@ impl Page {
                 A::Signed(state) | A::AlreadySigned(state) => {
                     self.note_record(&state);
                     self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-                    let v = self.verify.as_mut().expect("checked");
+                    let v = self.data.verify.as_mut().expect("checked");
                     v.updates += 1;
-                    self.most_landing_updates = self.most_landing_updates.max(v.updates);
+                    self.data.most_landing_updates = self.data.most_landing_updates.max(v.updates);
                 }
                 A::NotNext { current } => {
                     let now = self.now;
-                    let v = self.verify.as_mut().expect("checked");
+                    let v = self.data.verify.as_mut().expect("checked");
                     v.seq = v.seq.max(current.seq);
                     v.root = current.root;
                     v.landing = false;
@@ -1381,7 +1396,7 @@ impl Page {
                 }
                 A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved | Why::NotSuccessor) => {
                     let now = self.now;
-                    let v = self.verify.as_mut().expect("checked");
+                    let v = self.data.verify.as_mut().expect("checked");
                     v.landing = false;
                     backoff(v, now);
                 }
@@ -1391,22 +1406,22 @@ impl Page {
                 // mutant that dropped such an arm survived, as dead weight.)
                 A::Refused(why) => {
                     self.unusable.push(format!("the signer refused a landing: {why:?}"));
-                    self.verify = None;
+                    self.data.verify = None;
                 }
                 other => self.unusable.push(format!("the signer answered a landing with {other:?}")),
             }
             return;
         }
-        let Some(owed) = self.head.owed.as_mut() else { return };
-        self.head.sign_refusals = match &s {
-            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved) => self.head.sign_refusals,
+        let Some(owed) = self.data.head.owed.as_mut() else { return };
+        self.data.head.sign_refusals = match &s {
+            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved) => self.data.head.sign_refusals,
             _ => 0,
         };
         match s {
             A::Signed(state) => {
-                self.signer_records.insert(state.clone());
+                self.data.signer_records.insert(state.clone());
                 if let Some(h) = HeadRead::from_record(&state) {
-                    self.my_records.insert(h.seq, (h.root(), state.clone()));
+                    self.data.my_records.insert(h.seq, (h.root(), state.clone()));
                 }
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
@@ -1415,9 +1430,9 @@ impl Page {
             A::AlreadySigned(state) => {
                 // Requirement 2: ONE signature per prev, and it is landed as
                 // it is — its blocks were stored before it was signed.
-                self.signer_records.insert(state.clone());
+                self.data.signer_records.insert(state.clone());
                 if let Some(h) = HeadRead::from_record(&state) {
-                    self.my_records.insert(h.seq, (h.root(), state.clone()));
+                    self.data.my_records.insert(h.seq, (h.root(), state.clone()));
                 }
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
@@ -1435,7 +1450,7 @@ impl Page {
             // it was, a later write was told Published at a head no reader
             // can see (the model, seed 10). So the register is read first.
             A::NotNext { current } => {
-                self.verify = Some(Verify { seq: current.seq, root: current.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
+                self.data.verify = Some(Verify { seq: current.seq, root: current.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
                 self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
             }
             // RETRYABLE, on a doubling backoff (engineer2's table):
@@ -1448,9 +1463,9 @@ impl Page {
                 if why == Why::HeadUnknown {
                     self.send(Waiting::Warm, Op::ReadHead { label: Label::Head });
                 }
-                self.head.sign_refusals += 1;
-                let wait = (BACKOFF_MS << self.head.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
-                self.head.sign_again = Some(self.now + wait);
+                self.data.head.sign_refusals += 1;
+                let wait = (BACKOFF_MS << self.data.head.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
+                self.data.head.sign_again = Some(self.now + wait);
             }
             // THE SAME IDENTITY NEVER FORKS (owner, sdk#225). Only an OLD
             // signer says this (the new one answers `NotNext{read}`): another
@@ -1460,16 +1475,16 @@ impl Page {
             // every ask until the Register passes this seq, so the sign is NOT
             // re-asked (a loop otherwise) and that is named, once.
             A::Refused(Why::Forked { read, .. }) => {
-                if self.engine.published_seq() == read.seq && self.engine.published_root() == read.root {
-                    if self.old_signer_fork_at != Some(read.seq) {
-                        self.old_signer_fork_at = Some(read.seq);
+                if self.data.engine.published_seq() == read.seq && self.data.engine.published_root() == read.root {
+                    if self.data.old_signer_fork_at != Some(read.seq) {
+                        self.data.old_signer_fork_at = Some(read.seq);
                         self.unusable.push(format!(
                             "SIGNER UPGRADE NEEDED: this signer predates the same-identity rule (sdk#225) and refuses every sign while its record and the register differ at seq {}; load the current version (its signer ships with the page). It signs again once the register moves past that seq",
                             read.seq
                         ));
                     }
                 } else {
-                    self.verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
+                    self.data.verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
                     self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
                 }
             }
@@ -1507,7 +1522,7 @@ impl Page {
     /// (F55: a delegate-created register is not served to a bare client GET);
     /// the web layer frames `Op::ReadHead { label: Label::Head }` as that.
     fn on_verify(&mut self, j: &Judged) {
-        let Some(v) = self.verify.clone() else { return };
+        let Some(v) = self.data.verify.clone() else { return };
         let h = j.shown();
         let reg_seq = h.map_or(0, |(s, _)| s);
         // THIS page's own record at the register's seq is another root that
@@ -1517,10 +1532,10 @@ impl Page {
         // REGISTER's head (rule c), so `v.root` is theirs.
         if let Judged::MineWins { seq, record, .. } = j {
             if *seq >= v.seq {
-                if let Some(v) = self.verify.as_mut() {
+                if let Some(v) = self.data.verify.as_mut() {
                     v.landing = true;
                     v.updates += 1;
-                    self.most_landing_updates = self.most_landing_updates.max(v.updates);
+                    self.data.most_landing_updates = self.data.most_landing_updates.max(v.updates);
                 }
                 self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() });
                 return;
@@ -1528,14 +1543,14 @@ impl Page {
         }
         if let Judged::Head(heard) = j {
             if heard.seq() >= v.seq {
-                self.verify = None;
-                self.head.owed = None;
+                self.data.verify = None;
+                self.data.head.owed = None;
                 self.adopt(*heard, Adopt::Conflict);
                 return;
             }
         }
         if v.seq > reg_seq + 1 {
-            self.verify = None;
+            self.data.verify = None;
             self.unusable.push(format!(
                 "the signer's record (seq {}) is {} ahead of the register (seq {reg_seq}): unrecoverable, and 1b says unreachable",
                 v.seq,
@@ -1547,18 +1562,18 @@ impl Page {
             Some(h) => h,
             // No head at all: the record's prev is the genesis (the empty
             // tree), which is where this engine stands if it has adopted none.
-            None if self.engine.published_seq() == 0 => (0, self.engine.published_root()),
+            None if self.data.engine.published_seq() == 0 => (0, self.data.engine.published_root()),
             None => {
                 let now = self.now;
-                let v = self.verify.as_mut().expect("present");
+                let v = self.data.verify.as_mut().expect("present");
                 v.tries += 1;
                 v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
                 return;
             }
         };
-        if let Some(v) = self.verify.as_mut() {
+        if let Some(v) = self.data.verify.as_mut() {
             if !v.landing {
-                self.landings += 1;
+                self.data.landings += 1;
             }
             v.landing = true;
             v.from = Some((prev_seq, prev_root));
@@ -1581,21 +1596,21 @@ impl Page {
     ///   (`HeadConflict`). A commit in flight dies `Lost`, as in any conflict.
     fn on_hint(&mut self, j: &Judged) {
         let Some((seq, root)) = j.shown() else { return };
-        if !self.engine_has_head || self.verify.is_some() {
+        if !self.data.engine_has_head || self.data.verify.is_some() {
             return;
         }
-        let (pseq, proot) = (self.engine.published_seq(), self.engine.published_root());
+        let (pseq, proot) = (self.data.engine.published_seq(), self.data.engine.published_root());
         if (seq, root) == (pseq, proot) || seq < pseq {
             return;
         }
-        if self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && o.seq == seq) {
+        if self.data.head.owed.as_ref().is_some_and(|o| o.record.is_some() && o.seq == seq) {
             self.on_read_back(j);
             return;
         }
         match j {
             Judged::MineWins { record, .. } => self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() }),
             Judged::Head(heard) => {
-                self.head.owed = None;
+                self.data.head.owed = None;
                 self.adopt(*heard, Adopt::Conflict);
             }
             Judged::NoHead => {}
@@ -1637,8 +1652,8 @@ impl Page {
             self.out.push(d.op.clone());
             self.record_send(&w, &self.deadlines[&w]);
         }
-        if !head_read && self.engine_has_head {
-            self.last_head_at = self.now;
+        if !head_read && self.data.engine_has_head {
+            self.data.last_head_at = self.now;
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
     }
@@ -1652,14 +1667,14 @@ impl Page {
     /// this page's head, a newer one, a same-seq winner — so a second read
     /// adds nothing but a node op on the node's one queue, F61).
     pub fn head_hint(&mut self) {
-        if self.verify.is_none() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
+        if self.data.verify.is_none() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
     }
 
     /// Is this page's own read-back owed: a head signed, its UPDATE sent, not yet confirmed (sdk#378)?
     fn read_back_owed(&self) -> bool {
-        self.head.owed.as_ref().is_some_and(|o| o.record.is_some())
+        self.data.head.owed.as_ref().is_some_and(|o| o.record.is_some())
     }
 
     /// The node pushed the head register's FULL state (sdk#378 P3, the
@@ -1671,25 +1686,25 @@ impl Page {
     /// push changes nothing: the read-back GET after the UPDATE's answer does
     /// the job on its deadline. Nothing is ever ADOPTED from a push.
     pub fn head_pushed(&mut self, read: HeadRead) {
-        let confirms = self.verify.is_none() && self.confirms(&read);
+        let confirms = self.data.verify.is_none() && self.confirms(&read);
         if !confirms {
             // ALREADY KNOWN (the architect's done x E1 cell, #378): a full state that IS the head this page last
             // read -- the whole value, not only (seq, root) -- and the engine stands on, is news to nobody. No
             // read (one op on the node's one queue, F61); the backstop's clock restarts, as for a read. A DELTA
             // push carries no state and never gets here (`head_hint`, one read), nor does any other head.
-            let known = self.last_head.as_ref().is_some_and(|h| h.seq == read.seq && h.value() == read.value());
+            let known = self.data.last_head.as_ref().is_some_and(|h| h.seq == read.seq && h.value() == read.value());
             if known && (read.seq, read.root()) == self.published() {
-                self.last_head_at = self.now;
+                self.data.last_head_at = self.now;
                 return;
             }
             return self.head_hint();
         }
-        self.last_head_at = self.now;
-        self.last_head = Some(read);
+        self.data.last_head_at = self.now;
+        self.data.last_head = Some(read);
         // Whatever is still on the wire for the read-back this push stands in for -- the UPDATE whose answer would
         // ask it, or the GET itself -- ends with the owed head, in `drop_dead_head`, once the engine has published
         // its seq (COMMIT-LIFE ⁹): no RTT sample (a push is not an answer to either request).
-        let j = judge(self.last_head.as_ref(), &self.my_records);
+        let j = judge(self.data.last_head.as_ref(), &self.data.my_records);
         self.on_read_back(&j);
     }
 
@@ -1697,9 +1712,9 @@ impl Page {
     /// already made for that prev, under THIS page's key): kept whole for
     /// invariant 2, and by the head it names for the tie-break.
     fn note_record(&mut self, state: &[u8]) {
-        self.signer_records.insert(state.to_vec());
+        self.data.signer_records.insert(state.to_vec());
         if let Some(h) = HeadRead::from_record(state) {
-            self.my_records.insert(h.seq, (h.root(), state.to_vec()));
+            self.data.my_records.insert(h.seq, (h.root(), state.to_vec()));
         }
     }
 
@@ -1718,11 +1733,11 @@ impl Page {
     /// the same seq is not this commit (`AlreadySigned`), and the engine's take checks the seq only.
     fn confirms(&self, read: &HeadRead) -> bool {
         let pair = (read.seq, read.root());
-        match self.head.owed.as_ref() {
+        match self.data.head.owed.as_ref() {
             Some(o) => o.record.is_some() && (o.seq, o.root) == pair,
             None => {
                 pair == self.engine_published()
-                    && self.my_records.get(&read.seq).and_then(|(_, record)| HeadRead::from_record(record)).is_some_and(|mine| mine.value() == read.value())
+                    && self.data.my_records.get(&read.seq).and_then(|(_, record)| HeadRead::from_record(record)).is_some_and(|mine| mine.value() == read.value())
             }
         }
     }
@@ -1731,12 +1746,12 @@ impl Page {
     /// Published (F56: the UPDATE's answer says nothing).
     fn on_read_back(&mut self, j: &Judged) {
         // `last_head` is the read `j` was judged from (both callers judge it just before).
-        if let (Judged::Head(heard), Some(read)) = (j, self.last_head.as_ref()) {
+        if let (Judged::Head(heard), Some(read)) = (j, self.data.last_head.as_ref()) {
             if self.confirms(read) {
                 return self.step(Event::HeadConfirmed(heard.seq()));
             }
         }
-        let Some(owed) = self.head.owed.as_mut() else { return };
+        let Some(owed) = self.data.head.owed.as_mut() else { return };
         if owed.record.is_none() {
             return; // a read-back outlived its commit
         }
@@ -1764,7 +1779,7 @@ impl Page {
                 }
             }
             Judged::Head(heard) => {
-                self.head.owed = None;
+                self.data.head.owed = None;
                 self.adopt(*heard, Adopt::Conflict);
             }
             Judged::NoHead => {
@@ -1778,12 +1793,12 @@ impl Page {
     /// own head, with `next.seq = register.seq + 1` — the signer checks the
     /// successor FIRST — and any root.
     fn ask_land(&mut self) {
-        let Some((prev_seq, prev_root, root)) = self.verify.as_ref().and_then(|v| v.from.map(|(s, r)| (s, r, v.root))) else {
+        let Some((prev_seq, prev_root, root)) = self.data.verify.as_ref().and_then(|v| v.from.map(|(s, r)| (s, r, v.root))) else {
             return;
         };
         let id = self.next_request;
         self.next_request = self.next_request.checked_add(1).unwrap_or(1);
-        self.head.sign_id = Some(id);
+        self.data.head.sign_id = Some(id);
         let ledger = self.sign_ledger_of(prev_seq, prev_root, prev_seq + 1, root);
         self.send(Waiting::Sign(Label::Head), Op::Sign { id, prev_seq, prev_root, seq: prev_seq + 1, root, ledger, label: Label::Head });
     }
@@ -1815,14 +1830,14 @@ impl Page {
     /// A label's publication: the head's, or a site's (made on first use).
     fn pub_mut(&mut self, label: &Label) -> &mut Pub {
         match label {
-            Label::Head => &mut self.head,
+            Label::Head => &mut self.data.head,
             Label::Site(app) => self.sites.entry(app.clone()).or_default(),
         }
     }
 
     fn pub_ref(&self, label: &Label) -> Option<&Pub> {
         match label {
-            Label::Head => Some(&self.head),
+            Label::Head => Some(&self.data.head),
             Label::Site(app) => self.sites.get(app),
         }
     }
@@ -1986,17 +2001,17 @@ impl Page {
     /// Not there YET is the ordinary answer to an early ask: ask again on a doubling backoff, and only after
     /// HELD_ABSENTS in a row put it again -- never at the speed of the answers.
     fn held_absent(&mut self, id: Cid, now: u64) {
-        let absents = self.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
+        let absents = self.data.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
         // Read (and, gone, counted) only when it is due to be put again: the one re-PUT from page memory (sdk#411).
-        let bytes = if absents >= HELD_ABSENTS { self.engine.reput_bytes(&id) } else { None };
+        let bytes = if absents >= HELD_ABSENTS { self.data.engine.reput_bytes(&id) } else { None };
         if let (true, Some(bytes)) = (absents >= HELD_ABSENTS, bytes) {
-            self.held_again.remove(&id);
-            self.put_again.insert(id, bytes);
+            self.data.held_again.remove(&id);
+            self.data.put_again.insert(id, bytes);
         } else {
             // A block this page has no bytes for (a FOREIGN member it only asks about, safety gap class 2)
             // is never put from here: it is asked again, for as long as it takes (rule 7).
             let wait = (BACKOFF_MS << absents.min(16)).min(rto::RTO_MAX_MS as u64);
-            self.held_again.insert(id, (now + wait, absents));
+            self.data.held_again.insert(id, (now + wait, absents));
         }
     }
 
@@ -2446,13 +2461,13 @@ impl Page {
     /// The register as this page last READ it (any head answer), whole —
     /// what a merge reads a winner's `prev` from (sdk#225b).
     pub fn last_read(&self) -> Option<&HeadRead> {
-        self.last_head.as_ref()
+        self.data.last_head.as_ref()
     }
 
     /// Has the engine recovered its head (its own head read answered)? A read
     /// before this would be answered from the empty tree it started on.
     pub fn recovered(&self) -> bool {
-        self.recovered
+        self.data.recovered
     }
 
     /// When the next deadline falls (a host sets a one-shot timer for it, as
@@ -2463,11 +2478,11 @@ impl Page {
         // the next tick. A host that armed only for deadlines would sleep
         // through a back-off (the differential's RecordNotSaved case did).
         let deadlines = self.deadlines.values().map(|d| d.at);
-        let sign = self.head.sign_again.into_iter().chain(self.sites.values().filter_map(|p| p.sign_again)).min();
-        let held = self.held_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
-        let verify = self.verify.as_ref().and_then(|v| v.again_at);
-        let puts = (!self.put_again.is_empty()).then_some(self.now);
-        let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
+        let sign = self.data.head.sign_again.into_iter().chain(self.sites.values().filter_map(|p| p.sign_again)).min();
+        let held = self.data.held_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
+        let verify = self.data.verify.as_ref().and_then(|v| v.again_at);
+        let puts = (!self.data.put_again.is_empty()).then_some(self.now);
+        let backstop = self.data.engine_has_head.then_some(self.data.last_head_at + HEAD_BACKSTOP_MS);
         deadlines.chain(sign).chain(held).chain(verify).chain(puts).chain(backstop).min().map(Ms)
     }
 
@@ -2553,12 +2568,12 @@ impl Page {
         let mut through: Vec<Through> =
             self.last_read().filter(|r| (r.seq, r.root()) == (prev_seq, prev_root)).map(|r| r.through()).unwrap_or_default();
         if self.device != [0; 16] {
-            if let Some(t) = self.engine.committing_through() {
+            if let Some(t) = self.data.engine.committing_through() {
                 through.retain(|e| e.device != self.device);
                 through.push(Through { device: self.device, seq: t, last: seq });
             }
         }
-        value(&root, &Ledger { prev, through, parity: Some(mark(&self.engine.root_parity_of(&root))) })[32..].to_vec()
+        value(&root, &Ledger { prev, through, parity: Some(mark(&self.data.engine.root_parity_of(&root))) })[32..].to_vec()
     }
 
     /// This page's device id in heads' `through` (COMMIT-LIFE ⁵). Zeros:
@@ -2588,22 +2603,23 @@ impl Page {
     /// and only what [`Engine::pinned`] does not pin (the one pin rule, given the page's three facts). A block
     /// dropped here is on the node or referenced by nothing; a later need fetches it.
     fn evict(&mut self) {
-        let budget = self.engine.params().max_page_block_bytes;
-        let bytes = self.engine.blocks().bytes();
-        let peak = bytes.max(self.engine.blocks().stats.peak_bytes);
-        self.engine.blocks_mut().stats.peak_bytes = peak;
-        if bytes <= budget.max(self.engine.blocks().rearm_at) {
+        let budget = self.data.engine.params().max_page_block_bytes;
+        let bytes = self.data.engine.blocks().bytes();
+        let peak = bytes.max(self.data.engine.blocks().stats.peak_bytes);
+        self.data.engine.blocks_mut().stats.peak_bytes = peak;
+        if bytes <= budget.max(self.data.engine.blocks().rearm_at) {
             return;
         }
         // W is the only copy only while a write is queued or a commit pending: past that, forgotten.
-        if !self.engine.has_writes_in_flight() {
+        if !self.data.engine.has_writes_in_flight() {
             self.kept.clear();
         }
-        let order = self.engine.blocks_mut().eviction_order();
-        self.engine.blocks_mut().stats.scanned += order.len() as u64;
+        let order = self.data.engine.blocks_mut().eviction_order();
+        self.data.engine.blocks_mut().stats.scanned += order.len() as u64;
         // HF: every block a `Held` ask is out for -- backing off, queued for the next batch, or in a batch on the wire
         // (its ids are the batch op's, sdk#455).
         let asked: BTreeSet<Cid> = self
+            .data
             .held_again
             .keys()
             .chain(self.held_asks.iter())
@@ -2613,8 +2629,8 @@ impl Page {
             }).flatten())
             .copied()
             .collect();
-        let pins = self.engine.pins(&engine::PagePins { kept: &self.kept, held_asks: &asked });
-        let store = self.engine.blocks();
+        let pins = self.data.engine.pins(&engine::PagePins { kept: &self.kept, held_asks: &asked });
+        let store = self.data.engine.blocks();
         let mut over = bytes - budget;
         let mut drop = Vec::new();
         let mut pinned_bytes = 0usize;
@@ -2627,7 +2643,7 @@ impl Page {
                 over = over.saturating_sub(len);
             }
         }
-        let blocks = self.engine.blocks_mut();
+        let blocks = self.data.engine.blocks_mut();
         for id in &drop {
             blocks.remove(id);
         }
@@ -2643,33 +2659,33 @@ impl Page {
             // No read of that head (it came some other way): nothing is
             // witnessed, which is the old rule -- not landed.
             let witness = (self.device != [0; 16])
-                .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, self.engine.committing_seq())))
+                .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, self.data.engine.committing_seq())))
                 .flatten();
-            self.engine.set_witness(witness);
+            self.data.engine.set_witness(witness);
             // The §P MARK of the head about to be adopted: the engine's parity
             // scan is Done for a marked head, NotScanned for an unmarked one,
             // and the root's parity the mark lists makes it a group of one.
             let mark = self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).and_then(HeadRead::mark);
-            self.engine.set_head_mark(mark);
+            self.data.engine.set_head_mark(mark);
         }
         // A SAME-SEQ DISPLACEMENT of this page's head: the Server may merge
         // the displaced group, so no cut is made until it has placed it (or
         // decided not to) -- set BEFORE the step that re-derives the queue.
         if let Event::HeadConflict { seq, root } = &ev {
             if self.hold_on_displace && (*seq, *root) != self.published() && *seq == self.published().0 {
-                self.engine.hold_cut();
+                self.data.engine.hold_cut();
             }
         }
         // The engine has a head once it is TOLD one, whoever tells it: the
         // held writes go the moment it is, onto the tree it now stands on.
         let recovery = matches!(ev, Event::HeadRead { .. } | Event::HeadMissing);
-        let fx = self.engine.step(ev);
+        let fx = self.data.engine.step(ev);
         self.carry_out(fx);
         self.drop_dead_head();
         self.evict();
-        if recovery && !self.engine_has_head {
-            self.engine_has_head = true;
-            self.last_head_at = self.now;
+        if recovery && !self.data.engine_has_head {
+            self.data.engine_has_head = true;
+            self.data.last_head_at = self.now;
         }
     }
 
@@ -2677,7 +2693,7 @@ impl Page {
     /// ([`engine::Engine::supersede_read`]); the GETs only it needed end with
     /// it. Whether it was.
     pub fn supersede_read(&mut self, req: engine::read::ReqId) -> bool {
-        let done = self.engine.supersede_read(req);
+        let done = self.data.engine.supersede_read(req);
         if done {
             self.end_unneeded_gets();
         }
@@ -2692,7 +2708,7 @@ impl Page {
     /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
     /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
     fn end_unneeded_gets(&mut self) {
-        let mut ended = self.engine.take_all_withdrawn();
+        let mut ended = self.data.engine.take_all_withdrawn();
         ended.extend(
             self.deadlines
                 .keys()
@@ -2705,7 +2721,7 @@ impl Page {
                     Waiting::Get(id) => Some(*id),
                     _ => None,
                 }))
-                .filter(|id| self.engine.blocks().get(id).is_some()),
+                .filter(|id| self.data.engine.blocks().get(id).is_some()),
         );
         for id in ended {
             self.drop_get(id);
@@ -2714,7 +2730,7 @@ impl Page {
 
     /// What the engine publishes now, as a head.
     fn engine_published(&self) -> (u64, Cid) {
-        (self.engine.published_seq(), self.engine.published_root())
+        (self.data.engine.published_seq(), self.data.engine.published_root())
     }
 
     /// An owed head is LIVE only while it is ahead of what the engine has
@@ -2731,11 +2747,11 @@ impl Page {
         // Also dead: a head whose commit was built on a root the engine no
         // longer publishes (a foreign winner adopted under it).
         let published = self.engine_published();
-        if self.head.owed.as_ref().is_some_and(|o| o.seq <= published.0 || (o.seq - 1, o.base) != published) {
-            self.head.owed = None;
-            self.head.sign_again = None;
-            self.head.sign_refusals = 0;
-            self.head.sign_id = None;
+        if self.data.head.owed.as_ref().is_some_and(|o| o.seq <= published.0 || (o.seq - 1, o.base) != published) {
+            self.data.head.owed = None;
+            self.data.head.sign_again = None;
+            self.data.head.sign_refusals = 0;
+            self.data.head.sign_id = None;
             for w in [Waiting::Sign(Label::Head), Waiting::Update(Label::Head), Waiting::ReadBack(Label::Head)] {
                 self.end(&w, End::Withdrawn);
             }
@@ -2758,18 +2774,18 @@ impl Page {
                 }
                 Effect::PutBlock { id, ref bytes, ref after } => {
                     // The page is the memory now: the engine keeps no bytes.
-                    self.engine.blocks_mut().insert(id, bytes);
+                    self.data.engine.blocks_mut().insert(id, bytes);
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
-                    self.held.push((after, f.clone()));
+                    self.data.held.push((after, f.clone()));
                 }
                 Effect::UpdateHead { ref after, .. } => {
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
-                    self.held.push((after, f.clone()));
+                    self.data.held.push((after, f.clone()));
                 }
                 // A queued write's warm-apply block (R-b): kept for reads of
                 // the warm root, never put -- its commit puts the same bytes.
                 Effect::Keep { id, ref bytes } => {
-                    self.engine.blocks_mut().insert(id, bytes);
+                    self.data.engine.blocks_mut().insert(id, bytes);
                     self.kept.insert(id);
                 }
                 // SUPERSEDED (COMMIT-LIFE §P): a later root move re-coded the
@@ -2782,44 +2798,44 @@ impl Page {
                     // Not asked again; a batch in flight still carrying it asks for its batch-mates too, and its
                     // answer for this id confirms a block nobody waits on (a no-op in the engine).
                     self.held_asks.remove(&id);
-                    self.held_again.remove(&id);
-                    self.put_again.remove(&id);
-                    self.held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
+                    self.data.held_again.remove(&id);
+                    self.data.put_again.remove(&id);
+                    self.data.held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
                 }
                 // A FOREIGN member of a changed group (safety gap class 2): the node answers for it before BACKED_UP.
                 // Known here already (a PUT answered, a Held answered): told at once, no op. Else asked, once.
                 Effect::ConfirmHeld { id } => {
-                    if self.confirmed.contains(&id) {
-                        let more = self.engine.step(Event::PutConfirmed(id));
+                    if self.data.confirmed.contains(&id) {
+                        let more = self.data.engine.step(Event::PutConfirmed(id));
                         self.carry_out(more);
                     } else {
-                        if !self.held_again.contains_key(&id) {
+                        if !self.data.held_again.contains_key(&id) {
                             self.ask_held(id);
                         }
                         // Not known here: the engine counts it absent and sends more of its group's parity (sdk#416).
-                        let more = self.engine.step(Event::HeldUnknown(id));
+                        let more = self.data.engine.step(Event::HeldUnknown(id));
                         self.carry_out(more);
                     }
                 }
                 // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
                 // op, deadline and re-send), unless it is on its way or there already.
                 Effect::PutRepaired { id, ref bytes } => {
-                    self.engine.blocks_mut().insert(id, bytes);
-                    if !self.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.put_again.contains_key(&id) {
-                        self.repair_puts.insert(id);
+                    self.data.engine.blocks_mut().insert(id, bytes);
+                    if !self.data.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.data.put_again.contains_key(&id) {
+                        self.data.repair_puts.insert(id);
                         self.send(Waiting::Put(id), Op::Put { id, bytes: bytes.clone() });
                     }
                 }
                 Effect::PutPack { id, .. } => {
                     // No packs in this phase, as the shell refuses them.
                     self.unusable.push("a pack was emitted; packs are off in this phase".into());
-                    let more = self.engine.step(Event::PutFailed(id));
+                    let more = self.data.engine.step(Event::PutFailed(id));
                     self.carry_out(more);
                 }
                 Effect::FetchBlock { id, .. } => {
-                    if self.engine.blocks().get(&id).is_some() {
-                        let bytes = self.engine.blocks().get(&id).expect("held").to_vec();
-                        let more = self.engine.step(Event::BlockArrived { id, bytes });
+                    if self.data.engine.blocks().get(&id).is_some() {
+                        let bytes = self.data.engine.blocks().get(&id).expect("held").to_vec();
+                        let more = self.data.engine.step(Event::BlockArrived { id, bytes });
                         self.carry_out(more);
                     } else if self.deadlines.get(&Waiting::Get(id)).is_some_and(|d| !d.withdrawn) || self.get_queue.contains(&id) {
                         // ONE GET per block while one is out: its answer
@@ -2847,18 +2863,18 @@ impl Page {
     /// Effects whose `after` set is now confirmed go out, in emitted order.
     fn release(&mut self) {
         let mut i = 0;
-        while i < self.held.len() {
-            if self.held[i].0.iter().all(|c| self.confirmed.contains(c)) {
-                let (_, f) = self.held.remove(i);
+        while i < self.data.held.len() {
+            if self.data.held[i].0.iter().all(|c| self.data.confirmed.contains(c)) {
+                let (_, f) = self.data.held.remove(i);
                 match f {
                     Effect::PutBlock { id, bytes, .. } => {
-                        if self.confirmed.contains(&id) {
+                        if self.data.confirmed.contains(&id) {
                             // Already on the node: the engine hears it again.
-                            let more = self.engine.step(Event::PutConfirmed(id));
+                            let more = self.data.engine.step(Event::PutConfirmed(id));
                             self.carry_out(more);
                         } else {
                             // A commit's own now: its answer is the commit's.
-                            self.repair_puts.remove(&id);
+                            self.data.repair_puts.remove(&id);
                             self.send(Waiting::Put(id), Op::Put { id, bytes });
                         }
                     }
@@ -2866,7 +2882,7 @@ impl Page {
                     // (its writes were told `Lost`): it is at or behind what
                     // the engine now publishes, and asking for it would name a
                     // prev it does not follow (the model: `NotSuccessor`).
-                    Effect::UpdateHead { seq, .. } if seq <= self.engine.published_seq() => {}
+                    Effect::UpdateHead { seq, .. } if seq <= self.data.engine.published_seq() => {}
                     // A head whose commit was built on a root the engine no
                     // longer publishes is DEAD: a foreign winner was adopted
                     // under it. The engine re-derives the commit on the new
@@ -2876,7 +2892,7 @@ impl Page {
                         // The owed head this one replaces is dead (the engine published it, or adopted over it):
                         // its waits end with it, before this head's own go out under the same labels.
                         self.drop_dead_head();
-                        self.head.owed = Some(Owed { seq, root, base, record: None, stale_reads: 0 });
+                        self.data.head.owed = Some(Owed { seq, root, base, record: None, stale_reads: 0 });
                         self.ask_sign();
                     }
                     _ => unreachable!("only puts and heads are held"),
@@ -2894,31 +2910,31 @@ impl Page {
     /// sdk#235): shown to a person, so the transitional form is a number
     /// someone can act on.
     pub fn forced_writes(&self) -> u64 {
-        self.engine.forced_writes()
+        self.data.engine.forced_writes()
     }
 
     /// The engine's asks so far, `(wanted, raced)` (sdk#303): a read's cap counts the wanted.
     pub fn fetch_counts(&self) -> (usize, usize) {
-        self.engine.fetch_counts()
+        self.data.engine.fetch_counts()
     }
 
     /// Read repairs through parity: `(started, rebuilt, given up)`.
     pub fn repair_counts(&self) -> (u64, u64, u64) {
-        self.engine.repair_counts()
+        self.data.engine.repair_counts()
     }
 
     /// Why the last read repair was given up, if one was.
     pub fn repair_failed(&self) -> Option<&str> {
-        self.engine.repair_failed()
+        self.data.engine.repair_failed()
     }
 
     pub fn owed_groups(&self) -> usize {
-        self.engine.owed_groups()
+        self.data.engine.owed_groups()
     }
 
     /// GETs the engine withdrew that this page has not ended yet (sdk#303): 0 after every step.
     pub fn withdrawn(&self) -> usize {
-        self.engine.withdrawn_count()
+        self.data.engine.withdrawn_count()
     }
 
     /// Is anything still owed an answer or a re-send — an op in flight, a
@@ -2926,10 +2942,10 @@ impl Page {
     /// new arrives.
     pub fn waiting(&self) -> bool {
         !self.deadlines.is_empty()
-            || !self.put_again.is_empty()
-            || self.head.sign_again.is_some()
+            || !self.data.put_again.is_empty()
+            || self.data.head.sign_again.is_some()
             || self.sites.values().any(|p| p.sign_again.is_some())
-            || !self.held_again.is_empty()
+            || !self.data.held_again.is_empty()
             || !self.held_asks.is_empty()
     }
 
@@ -3055,7 +3071,7 @@ impl Page {
     }
 
     fn published_seq_at_least(&self, seq: u64) -> bool {
-        self.recovered && self.engine.published_seq() >= seq
+        self.data.recovered && self.data.engine.published_seq() >= seq
     }
 
     /// Is this page a VIEW: it makes no commit op, only repair PUTs.
@@ -3069,7 +3085,7 @@ impl Page {
 
     /// The head the engine last saw published.
     pub fn published(&self) -> (u64, Cid) {
-        (self.engine.published_seq(), self.engine.published_root())
+        (self.data.engine.published_seq(), self.data.engine.published_root())
     }
 
     /// Whether this page's owed parity covers the whole published tree
@@ -3077,85 +3093,85 @@ impl Page {
     /// page that opened on a non-empty head says `NotScanned` — its "0 owed"
     /// means it never looked — until sdk#119's probe re-derives it.
     pub fn parity_scan(&self) -> &engine::ParityScan {
-        self.engine.parity_scan()
+        self.data.engine.parity_scan()
     }
 
     /// Is this page's PUT of `id` on the wire, or waiting to be sent again (sdk#433: what a node's text-named
     /// refusal may be attributed to)?
     pub fn put_waiting(&self, id: &Cid) -> bool {
-        self.deadlines.contains_key(&Waiting::Put(*id)) || self.put_again.contains_key(id)
+        self.deadlines.contains_key(&Waiting::Put(*id)) || self.data.put_again.contains_key(id)
     }
 
     /// Repair PUTs the node's Block contract rejected (sdk#433), dropped.
     pub fn repairs_rejected(&self) -> u64 {
-        self.repairs_rejected
+        self.data.repairs_rejected
     }
 
     /// Blocks the node's Block contract rejected (sdk#433): damaged, for the assets dashboard.
     pub fn rejected_blocks(&self) -> &std::collections::BTreeSet<Cid> {
-        self.engine.rejected_blocks()
+        self.data.engine.rejected_blocks()
     }
 
     /// Landings of a signer's record this page started, and the most UPDATEs
     /// one of them needed (a lost UPDATE is re-sent at its deadline).
     pub fn landings(&self) -> (u32, u32) {
-        (self.landings, self.most_landing_updates)
+        (self.data.landings, self.data.most_landing_updates)
     }
 
 
     /// Every record the signer returned (invariant 2's evidence).
     pub fn signer_records(&self) -> &BTreeSet<Vec<u8>> {
-        &self.signer_records
+        &self.data.signer_records
     }
 
     /// Every write in the engine's queue with its stage (R-b).
     pub fn queue_stages(&self) -> Vec<(engine::ClientId, engine::WriteId, engine::Stage)> {
-        self.engine.queue_stages().collect()
+        self.data.engine.queue_stages().collect()
     }
 
     /// Does a write still applying write a key in `[lo, hi)`?
     pub fn applying_touches(&self, lo: &[u8], hi: &[u8]) -> bool {
-        self.engine.applying_touches(lo, hi)
+        self.data.engine.applying_touches(lo, hi)
     }
 
     /// The stage of the last queued write that writes `key`.
     pub fn stage_of_key(&self, key: &[u8]) -> Option<engine::Stage> {
-        self.engine.stage_of_key(key)
+        self.data.engine.stage_of_key(key)
     }
 
     /// Writes queued and their bytes (what `QueueFull` measures; a held
     /// deferred write takes room like any other).
     pub fn queue_load(&self) -> (usize, usize) {
-        self.engine.queue_load()
+        self.data.engine.queue_load()
     }
 
     /// WHAT IS UNSAVED (sdk#350), its one owner the engine: writes taken
     /// and not published, a held DEFERRED write not among them. What a
     /// session's "unsaved changes" is derived from, never a tally of its own.
     pub fn unsaved_writes(&self) -> usize {
-        self.engine.unsaved_writes()
+        self.data.engine.unsaved_writes()
     }
 
     /// The client of every unsaved write (the engine's rule, per write).
     pub fn unsaved_clients(&self) -> Vec<engine::ClientId> {
-        self.engine.unsaved_clients().collect()
+        self.data.engine.unsaved_clients().collect()
     }
 
     /// Own commits published and the queued writes they carried (K9: writes
     /// per commit, what group commit is measured by).
     pub fn commits_and_writes(&self) -> (u64, u64) {
-        self.engine.commits_and_writes()
+        self.data.engine.commits_and_writes()
     }
 
     /// Writes told `Published` because a head's ledger witnessed their group
     /// landed unheard (COMMIT-LIFE ⁵).
     pub fn landed_by_witness(&self) -> u64 {
-        self.engine.landed_by_witness()
+        self.data.engine.landed_by_witness()
     }
 
     /// Writes told `Published` by a no-op group: the tree already held them.
     pub fn noop_published(&self) -> u64 {
-        self.engine.noop_published()
+        self.data.engine.noop_published()
     }
 
     /// See `hold_on_displace`: the Server that merges turns it on.
@@ -3164,70 +3180,70 @@ impl Page {
     }
 
     pub fn cut_held(&self) -> bool {
-        self.engine.cut_held()
+        self.data.engine.cut_held()
     }
 
     /// The hold ends with nothing to merge.
     pub fn release_cut(&mut self) {
-        let fx = self.engine.release_cut();
+        let fx = self.data.engine.release_cut();
         self.carry_out(fx);
     }
 
     /// A merge's writes, at the FRONT of the queue (review §1 on sdk#295).
     pub fn merge_front(&mut self, client: ClientId, writes: Vec<engine::MergeWrite>) {
-        let fx = self.engine.merge_front(client, writes);
+        let fx = self.data.engine.merge_front(client, writes);
         self.carry_out(fx);
     }
 
     /// The next write taken is a re-run that spent `tries` (ONE budget).
     pub fn carry_tries(&mut self, tries: u32) {
-        self.engine.carry_tries(tries);
+        self.data.engine.carry_tries(tries);
     }
 
     pub fn clear_carried_tries(&mut self) {
-        self.engine.clear_carried_tries();
+        self.data.engine.clear_carried_tries();
     }
 
     pub fn max_write_tries(&self) -> u32 {
-        self.engine.max_write_tries()
+        self.data.engine.max_write_tries()
     }
 
     /// The seq the commit in flight would land at (`None`: none in flight).
     pub fn committing_seq(&self) -> Option<u64> {
-        self.engine.committing_seq()
+        self.data.engine.committing_seq()
     }
 
     /// The engine's own counts the model reads (R-b): K9 rebuilds that
     /// differed, re-derivations on own publish, impossible stage moves.
     pub fn queue_counts(&self) -> (u64, u64, u64) {
-        (self.engine.rebuild_differs(), self.engine.own_publish_rederived(), self.engine.impossible_transitions())
+        (self.data.engine.rebuild_differs(), self.data.engine.own_publish_rederived(), self.data.engine.impossible_transitions())
     }
 
     /// The WARM root: this page's accepted writes applied, published or not
     /// (READ-STATE, design B). What an own-tree walk reads.
     pub fn warm_root(&self) -> Cid {
-        self.engine.root()
+        self.data.engine.root()
     }
 
     /// Walk the tree at `root` over the blocks this page holds, now
     /// (`engine::Engine::walk`).
     pub fn walk(&self, root: &Cid, walk: &engine::read::Walk) -> engine::read::Walked {
-        self.engine.walk(root, walk)
+        self.data.engine.walk(root, walk)
     }
 
     /// The blocks the page holds.
     /// Re-puts that found their block's bytes gone (sdk#411): 0 while the pin rule holds.
     pub fn reput_missing(&self) -> u64 {
-        self.engine.reput_missing()
+        self.data.engine.reput_missing()
     }
 
     /// Whether the engine's parked write, if any, still has its owner (sdk#411's "no pin outlives its owner").
     pub fn parked_write_is_live(&self) -> bool {
-        self.engine.parked_write_is_live()
+        self.data.engine.parked_write_is_live()
     }
 
     pub fn blocks(&self) -> &PageBlocks {
-        self.engine.blocks()
+        self.data.engine.blocks()
     }
 }
 
@@ -3258,7 +3274,7 @@ mod unneeded_gets {
     fn a_queued_get_nobody_needs_is_ended() {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let (held, wanted) = ([1u8; 32], [2u8; 32]);
-        p.engine.blocks_mut().insert(held, b"held");
+        p.data.engine.blocks_mut().insert(held, b"held");
         p.get_queue.push_back(held);
         p.get_queue.push_back(wanted);
         p.end_unneeded_gets();
@@ -3282,13 +3298,13 @@ mod repair_put {
         assert_eq!(puts, vec![Op::Put { id, bytes: bytes.clone() }], "the repair was not PUT through the sender");
         assert!(p.deadlines.contains_key(&Waiting::Put(id)), "the repair PUT has no deadline: it would not be re-sent");
         p.answer(Answer::PutOk(id), Ms(1));
-        assert!(!p.confirmed.contains(&id), "a repair PUT's answer confirmed the block for the commits");
+        assert!(!p.data.confirmed.contains(&id), "a repair PUT's answer confirmed the block for the commits");
         assert!(!p.deadlines.contains_key(&Waiting::Put(id)), "the answered repair PUT is still waiting");
 
         // The same block, then put by a commit: its answer is the commit's.
         p.carry_out(vec![Effect::PutBlock { id, bytes: bytes.clone(), after: Vec::new() }]);
         p.answer(Answer::PutOk(id), Ms(2));
-        assert!(p.confirmed.contains(&id), "a commit's PUT of a once-repaired block was not confirmed");
+        assert!(p.data.confirmed.contains(&id), "a commit's PUT of a once-repaired block was not confirmed");
     }
 
     /// RACE PUT's condition (a) (COMMIT-LIFE §P, the architect): a repair
@@ -3306,7 +3322,7 @@ mod repair_put {
         p.answer(Answer::PutOk(id), Ms(1));
         let _ = p.take_ops();
         let (pseq, base) = p.engine_published();
-        p.held.push((BTreeSet::from([id]), Effect::UpdateHead { seq: pseq + 1, root: [3u8; 32], base, after: vec![id] }));
+        p.data.held.push((BTreeSet::from([id]), Effect::UpdateHead { seq: pseq + 1, root: [3u8; 32], base, after: vec![id] }));
         p.release();
         assert!(!p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "a head was released by a REPAIR PUT's answer");
         // The commit's own PUT of the block is answered: the head goes.
@@ -3355,11 +3371,11 @@ mod held_batch {
         }
         for id in &all {
             if id[7] % 2 == 0 {
-                assert!(p.confirmed.contains(id), "an id answered present was not confirmed");
-                assert!(!p.held_again.contains_key(id));
+                assert!(p.data.confirmed.contains(id), "an id answered present was not confirmed");
+                assert!(!p.data.held_again.contains_key(id));
             } else {
-                assert!(!p.confirmed.contains(id), "an id answered absent was confirmed (another id's answer)");
-                assert!(!p.held_again.contains_key(id), "an absent id nobody waits on is still asked");
+                assert!(!p.data.confirmed.contains(id), "an id answered absent was confirmed (another id's answer)");
+                assert!(!p.data.held_again.contains_key(id), "an absent id nobody waits on is still asked");
             }
         }
         assert!(held_ops(&mut p).is_empty(), "an id nobody waits on was asked again");
@@ -3383,12 +3399,12 @@ mod held_batch {
             }
         }
         let id = put.expect("THE SETUP: no block PUT went out");
-        assert!(p.engine.awaits_confirmation(&id), "THE SETUP: the engine does not wait on its own pending block");
+        assert!(p.data.engine.awaits_confirmation(&id), "THE SETUP: the engine does not wait on its own pending block");
         p.answer(Answer::PutOk(id), Ms(20));
         let ops = held_ops(&mut p);
         assert_eq!(ops.iter().map(|(_, i)| i.clone()).collect::<Vec<_>>(), vec![vec![id]], "THE SETUP: the answered PUT was not asked Held");
         p.answer(Answer::Held { batch: ops[0].0, present: vec![false] }, Ms(21));
-        assert_eq!(p.held_again.get(&id).map(|(_, n)| *n), Some(1), "an absent block the engine waits on did not back off");
+        assert_eq!(p.data.held_again.get(&id).map(|(_, n)| *n), Some(1), "an absent block the engine waits on did not back off");
         p.tick(Ms(21 + rto::RTO_MAX_MS as u64 + 1));
         assert!(held_ops(&mut p).iter().any(|(_, i)| i.contains(&id)), "an absent block the engine waits on was not asked again");
     }
@@ -3406,7 +3422,7 @@ mod held_batch {
         assert_eq!(ops.len(), 1, "THE SETUP: x was not asked");
         p.carry_out(vec![Effect::Withdraw { id: x }]);
         p.answer(Answer::Held { batch: ops[0].0, present: vec![false] }, Ms(1));
-        assert!(!p.held_again.contains_key(&x), "a withdrawn id answered absent was queued to be asked again");
+        assert!(!p.data.held_again.contains_key(&x), "a withdrawn id answered absent was queued to be asked again");
         p.tick(Ms(rto::RTO_MAX_MS as u64 * 4));
         assert!(held_ops(&mut p).is_empty(), "a withdrawn id was asked again");
     }
@@ -3436,7 +3452,7 @@ mod held_batch {
         p.ask_held(two[0]);
         assert!(held_ops(&mut p).is_empty(), "an id already in flight was asked in a second op");
         p.answer(Answer::Held { batch: ops[0].0, present: vec![true, true] }, Ms(1));
-        assert!(two.iter().all(|id| p.confirmed.contains(id)));
+        assert!(two.iter().all(|id| p.data.confirmed.contains(id)));
     }
 
     /// **A SHORT answer is never silent** (the architect): the ids past its end are UNKNOWN -- neither confirmed nor
@@ -3454,8 +3470,8 @@ mod held_batch {
         use instrument::Record;
         let short = p.recording().expect("recording").events().into_iter().filter(|e| matches!(e, instrument::Event::Counter { entry: instrument::Entry { key: instrument::vocab::Key::DroppedMsgs, value }, .. } if *value == instrument::vocab::DropReason::ShortAnswer.code())).count();
         assert_eq!(short, 2, "the 2 unanswered ids were not recorded as ShortAnswer");
-        assert!(p.confirmed.contains(&five[0]) && p.confirmed.contains(&five[2]));
-        assert!(!p.confirmed.contains(&five[3]) && !p.held_again.contains_key(&five[3]), "an unknown id was taken as present or absent");
+        assert!(p.data.confirmed.contains(&five[0]) && p.data.confirmed.contains(&five[2]));
+        assert!(!p.data.confirmed.contains(&five[3]) && !p.data.held_again.contains_key(&five[3]), "an unknown id was taken as present or absent");
         let again = held_ops(&mut p);
         assert_eq!(again.iter().map(|(_, i)| i.clone()).collect::<Vec<_>>(), vec![vec![five[3], five[4]]], "the unknown ids were not asked again in one op");
     }
@@ -3477,14 +3493,14 @@ mod confirm_held {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let _ = p.take_ops();
         let (put, rebuilt) = ([7u8; 32], [8u8; 32]);
-        p.confirmed.insert(put);
+        p.data.confirmed.insert(put);
         p.carry_out(vec![Effect::ConfirmHeld { id: put }]);
         assert_eq!(asks(&mut p), 0, "a block the node confirmed was asked about again");
-        p.engine.blocks_mut().insert(rebuilt, b"rebuilt from its group");
+        p.data.engine.blocks_mut().insert(rebuilt, b"rebuilt from its group");
         p.carry_out(vec![Effect::ConfirmHeld { id: rebuilt }]);
         assert_eq!(asks(&mut p), 1, "a block only in page memory was taken as on the node");
         p.answer(Answer::Held { batch: p.next_held_batch, present: vec![true] }, Ms(1));
-        assert!(p.confirmed.contains(&rebuilt), "the node's Held answer did not confirm it");
+        assert!(p.data.confirmed.contains(&rebuilt), "the node's Held answer did not confirm it");
     }
 
     /// RULE 7 for a block the page has NO bytes for (a foreign member it only asks about): absent, it is asked
@@ -3508,9 +3524,9 @@ mod confirm_held {
             p.tick(Ms(now));
             assert_eq!(asks(&mut p), 1, "absent answer {}: the block was not asked again", n + 1);
         }
-        assert!(p.put_again.is_empty(), "a block the page has no bytes for was queued to be PUT");
+        assert!(p.data.put_again.is_empty(), "a block the page has no bytes for was queued to be PUT");
         p.answer(Answer::Held { batch: p.next_held_batch, present: vec![true] }, Ms(now + 1));
-        assert!(p.confirmed.contains(&id));
+        assert!(p.data.confirmed.contains(&id));
     }
 
     /// **HF (sdk#411, the architect):** a FOREIGN member this page FETCHED (its bytes in the store) with a `Held`
@@ -3522,7 +3538,7 @@ mod confirm_held {
         let mut p = Page::new(Params { max_page_block_bytes: 1, ..Params::default() }, PutPath::Page);
         let _ = p.take_ops();
         let (id, bytes) = ([9u8; 32], b"another page's straggler, fetched here".to_vec());
-        p.engine.blocks_mut().insert(id, &bytes);
+        p.data.engine.blocks_mut().insert(id, &bytes);
         p.carry_out(vec![Effect::ConfirmHeld { id }]);
         assert_eq!(asks(&mut p), 1, "THE SETUP: the foreign member was not asked about");
         let mut now = 0u64;
@@ -4002,7 +4018,7 @@ mod deadline_table {
         let _ = p.take_ops();
         let (rto, window) = (p.rto.rto_ms(), p.window.size());
         // Nobody needs it: its block is held now (a repair rebuilt it).
-        p.engine.blocks_mut().insert([1; 32], &[1u8]);
+        p.data.engine.blocks_mut().insert([1; 32], &[1u8]);
         p.end_unneeded_gets();
         assert!(!p.deadlines.contains_key(&Waiting::Get([1; 32])) && !p.attempt_of.contains_key(&Waiting::Get([1; 32])), "the unneeded parked GET is still held");
         assert!(p.take_ops().is_empty(), "ending a parked GET sent something");
@@ -4177,7 +4193,7 @@ mod node_get_silent {
         silence(&mut p, a);
         let (rto, window) = (p.rto.rto_ms(), p.window.size());
         p.answer(Answer::Got { id: a, bytes }, Ms(p.now + 40_000));
-        assert!(p.engine.blocks().get(&a).is_some(), "THE SETUP: the answer was not taken");
+        assert!(p.data.engine.blocks().get(&a).is_some(), "THE SETUP: the answer was not taken");
         assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms()), (None, rto), "a silent GET's answer moved the RTO");
         assert!(p.window.size() > window, "a silent GET's answer did not open the window");
         assert!(!p.deadlines.contains_key(&Waiting::Get(a)), "the answered GET still waits");
@@ -4256,7 +4272,7 @@ mod node_get_silent {
         p.tick(Ms(over));
         assert_eq!(gets_of(&p.take_ops(), a), 1, "THE SETUP: the GET was not asked again past B");
         p.answer(Answer::Got { id: a, bytes: bytes.clone() }, Ms(over + 10));
-        assert!(p.engine.blocks().get(&a).is_some(), "THE SETUP: the first answer was not taken");
+        assert!(p.data.engine.blocks().get(&a).is_some(), "THE SETUP: the first answer was not taken");
         assert_eq!(overlaps(&p), 0, "the FIRST answer after a re-ask was recorded as the overlap");
         p.answer(Answer::Got { id: a, bytes }, Ms(over + 20));
         assert_eq!(overlaps(&p), 1, "the second answer after a re-ask past B was not recorded as DroppedMsgs = AnsweredAfterReask");
@@ -4763,11 +4779,11 @@ mod window_loss {
             let asked = now;
             ask(&mut p, now, *id);
             let mut t = 0;
-            while p.engine.blocks().get(id).is_none() && t < 120_000 {
+            while p.data.engine.blocks().get(id).is_none() && t < 120_000 {
                 node.run(&mut p, &mut now, 100);
                 t += 100;
             }
-            assert!(p.engine.blocks().get(id).is_some(), "a block the node serves was not read in 120 s behind one silent block (window {})", p.window.size());
+            assert!(p.data.engine.blocks().get(id).is_some(), "a block the node serves was not read in 120 s behind one silent block (window {})", p.window.size());
             waited.push(now - asked);
             node.run(&mut p, &mut now, 5_000);
         }
@@ -4799,7 +4815,7 @@ mod window_loss {
         assert_eq!(p.gets_in_flight(), 2);
         assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![all[2].0], "THE CONTROL: the third ask did not wait");
         node.run(&mut p, &mut now, PAST_B + 5_000);
-        assert!(p.engine.blocks().get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
+        assert!(p.data.engine.blocks().get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
         let first_resend = node.sent.iter().filter(|(_, id)| *id == all[0].0 || *id == all[1].0).nth(2).map(|(t, _)| *t).expect("a re-send");
         let third = node.sent.iter().find(|(_, id)| *id == all[2].0).map(|(t, _)| *t).expect("the third ask went out");
         assert!(third <= first_resend, "a lost GET was re-sent ({first_resend}) before the ask already waiting ({third})");
@@ -4832,13 +4848,13 @@ mod window_loss {
         for _ in 0..2 * PAST_B + 20_000 {
             let was_queued: Vec<Cid> = p.get_queue.iter().copied().filter(|q| p.attempt_of.contains_key(&Waiting::Get(*q))).collect();
             node.run(&mut p, &mut now, 1);
-            queued_when_answered |= was_queued.iter().any(|id| p.engine.blocks().get(id).is_some());
+            queued_when_answered |= was_queued.iter().any(|id| p.data.engine.blocks().get(id).is_some());
         }
         let sends: Vec<usize> = all.iter().map(|(id, _)| node.sent.iter().filter(|(_, s)| s == id).count()).collect();
         println!("sends per block {sends:?}; a queued lost GET answered: {queued_when_answered}");
         assert!(queued_when_answered, "THE CONTROL: no lost GET was still queued when its late answer landed");
-        assert!(all.iter().all(|(id, _)| p.engine.blocks().get(id).is_some()), "not every block was read: sends {sends:?}");
-        assert!(!p.get_queue.iter().any(|q| p.engine.blocks().get(q).is_some()), "a block already read is still queued to be asked again");
+        assert!(all.iter().all(|(id, _)| p.data.engine.blocks().get(id).is_some()), "not every block was read: sends {sends:?}");
+        assert!(!p.get_queue.iter().any(|q| p.data.engine.blocks().get(q).is_some()), "a block already read is still queued to be asked again");
     }
 
     /// ENDING A GET LEAVES NO TRACE, however it ends (`drop_get`, the one
@@ -4879,14 +4895,14 @@ mod window_loss {
         // The late answer to `late`'s first send.
         let bytes = all[0].1.clone();
         p.answer(Answer::Got { id: late, bytes }, Ms(now));
-        assert!(p.engine.blocks().get(&late).is_some(), "the late answer was not taken");
+        assert!(p.data.engine.blocks().get(&late).is_some(), "the late answer was not taken");
         assert_eq!(holders(&p, late), (false, false, false), "a GET ended by its late answer left a trace (deadline, attempt, queue)");
         // `withdrawn` (queued) and one ON THE WIRE: their blocks are held now
         // (a repair rebuilt them), so nobody needs either GET.
         let on_wire = all[2].0;
         assert!(p.deadlines.get(&Waiting::Get(on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
-        p.engine.blocks_mut().insert(withdrawn, &all[1].1);
-        p.engine.blocks_mut().insert(on_wire, &all[2].1);
+        p.data.engine.blocks_mut().insert(withdrawn, &all[1].1);
+        p.data.engine.blocks_mut().insert(on_wire, &all[2].1);
         p.end_unneeded_gets();
         assert_eq!(holders(&p, withdrawn), (false, false, false), "a withdrawn queued GET left a trace (deadline, attempt, queue)");
         assert_eq!(holders(&p, on_wire), (false, false, false), "a withdrawn GET on the wire left a trace (deadline, attempt, queue)");
@@ -4963,7 +4979,7 @@ mod window_loss {
             ask(&mut p, now, *id);
         }
         node.run(&mut p, &mut now, 2 * rto::RTO_MAX_MS as u64 + 600_000);
-        let read = all.iter().filter(|(id, _)| p.engine.blocks().get(id).is_some()).count();
+        let read = all.iter().filter(|(id, _)| p.data.engine.blocks().get(id).is_some()).count();
         let lost = node.sent.len() - 200;
         println!("200 blocks through a silent node: {read} read, {} GETs sent ({lost} re-sends), most past the window when one was sent {}", node.sent.len(), node.sent_past_window);
         assert!(lost > 0, "THE CONTROL: nothing was lost and re-sent");
@@ -5050,9 +5066,9 @@ mod head_judgement_cells {
     fn a_verify_above_the_signers_seq_lands_a_head_my_record_beats_and_adopts_nothing() {
         let mut p = page();
         let (record, mine) = my_record(1, &[0xAA; 32]);
-        p.my_records.insert(1, (mine.root(), record.clone()));
+        p.data.my_records.insert(1, (mine.root(), record.clone()));
         let theirs = a_losing_head(&mine);
-        p.verify = Some(Verify { seq: 0, root: [0u8; 32], landing: false, again_at: None, tries: 0, updates: 0, from: None });
+        p.data.verify = Some(Verify { seq: 0, root: [0u8; 32], landing: false, again_at: None, tries: 0, updates: 0, from: None });
         p.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
         let _ = p.take_ops();
         let before = p.published();
@@ -5072,15 +5088,15 @@ mod head_judgement_cells {
         let mut p = page();
         let (record1, owed) = my_record(1, &[0xAA; 32]);
         let (record2, mine2) = my_record(2, &[0xBB; 32]);
-        p.my_records.insert(1, (owed.root(), record1.clone()));
-        p.my_records.insert(2, (mine2.root(), record2));
-        p.head.owed = Some(Owed { seq: 1, root: owed.root(), base: [0u8; 32], record: Some(record1), stale_reads: 0 });
+        p.data.my_records.insert(1, (owed.root(), record1.clone()));
+        p.data.my_records.insert(2, (mine2.root(), record2));
+        p.data.head.owed = Some(Owed { seq: 1, root: owed.root(), base: [0u8; 32], record: Some(record1), stale_reads: 0 });
         let theirs = a_losing_head(&mine2);
         p.send(Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head });
         let _ = p.take_ops();
         p.answer(Answer::Head { label: Label::Head, read: Some(theirs.clone()) }, Ms(10));
         assert_ne!(p.published(), (theirs.seq, theirs.root()), "the read-back adopted a head this page's own record beats");
-        let o = p.head.owed.as_ref().expect("the owed commit was dropped for a head this page's own record beats");
+        let o = p.data.head.owed.as_ref().expect("the owed commit was dropped for a head this page's own record beats");
         assert_eq!((o.seq, o.stale_reads), (1, 1), "the read-back did not read again (one stale read counted)");
     }
 }
@@ -5266,13 +5282,13 @@ mod confirmed_once {
         let (mut p, mine, _) = at_update(true);
         read_back_out(&mut p);
         // The second commit's blocks are on the node already (answered earlier): its head waits on nothing.
-        p.confirmed.extend(next.iter().copied());
+        p.data.confirmed.extend(next.iter().copied());
         if by_push {
             p.head_pushed(mine.clone());
         } else {
             p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
         }
-        let o = p.head.owed.as_ref().expect("the next commit's owed head was dropped by the confirming step");
+        let o = p.data.head.owed.as_ref().expect("the next commit's owed head was dropped by the confirming step");
         assert_eq!(o.seq, mine.seq + 1, "THE SETUP: the confirming step did not release the next commit's head");
         assert!(p.deadlines.contains_key(&Waiting::Sign(Label::Head)), "the next commit's sign wait was ended with the confirmed head");
         assert!(!p.deadlines.contains_key(&Waiting::ReadBack(Label::Head)), "the confirmed head's read-back wait outlived it");
