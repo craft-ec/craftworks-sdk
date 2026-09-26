@@ -4101,7 +4101,7 @@ mod node_get_silent {
         get(&mut p, id);
         assert_eq!(gets_of(&p.take_ops(), id), 1, "THE SETUP: the GET did not go out");
         p.answer(Answer::Got { id, bytes: bytes.clone() }, Ms(T0 + 5));
-        assert_eq!(p.blocks.get(&id), Some(&bytes[..]), "the parity block was not kept");
+        assert_eq!(freenet_prolly::store::Blocks::get(p.blocks(), &id), Some(&bytes[..]), "the parity block was not kept");
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "the parity GET still waits (taken for a miss)");
 
         // CONTROL: bytes that are not the id -> a miss, parked.
@@ -4110,7 +4110,7 @@ mod node_get_silent {
         get(&mut p, other);
         let _ = p.take_ops();
         p.answer(Answer::Got { id: other, bytes: bytes.clone() }, Ms(T0 + 5));
-        assert!(p.blocks.get(&other).is_none(), "THE CONTROL: bytes that are not the id were kept");
+        assert!(freenet_prolly::store::Blocks::get(p.blocks(), &other).is_none(), "THE CONTROL: bytes that are not the id were kept");
         assert!(p.deadlines.contains_key(&Waiting::Get(other)), "THE CONTROL: a wrong answer ended the GET");
     }
 
