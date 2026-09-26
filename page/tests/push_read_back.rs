@@ -90,3 +90,46 @@ fn control_a_dropped_push_leaves_the_read_back_get() {
     p.answer(Answer::Updated { label: Label::Head }, Ms(now + 1));
     assert_eq!(head_reads(&p.take_ops()), 1, "the read-back was not asked");
 }
+
+/// The page's write published by its read-back GET (the GET's answer shows exactly its head): the page at rest,
+/// standing on its own head, and that head as read.
+fn published_by_the_read_back() -> (Page, u64, HeadRead) {
+    let (mut p, now, record) = at_update();
+    let mine = HeadRead::from_record(&record).expect("reads");
+    p.answer(Answer::Updated { label: Label::Head }, Ms(now + 1));
+    assert_eq!(head_reads(&p.take_ops()), 1, "THE SETUP: the read-back GET did not go out");
+    p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(now + 2));
+    assert_eq!(p.published(), (mine.seq, mine.root()), "THE SETUP: the write was not published by its read-back");
+    let _ = p.take_ops();
+    (p, now + 2, mine)
+}
+
+/// **Done x E1 (the architect, #378): a full-state push of the head this page already stands on reads nothing.**
+/// The read-back answered first, then the node's push of that same head arrives: it is news to nobody, so no
+/// register GET (one op on the node's one queue, F61). Mutant "a known head is a hint like any push" -> 1 read -> red.
+#[test]
+fn a_push_of_the_head_already_known_reads_nothing() {
+    let (mut p, _, mine) = published_by_the_read_back();
+    p.head_pushed(mine);
+    assert_eq!(head_reads(&p.take_ops()), 0, "a push of the head this page already stands on sent a register read");
+}
+
+/// **THE CONTROLS: anything else is still the hint it was, one read each.** A DELTA push (no state: `head_hint`);
+/// a NEWER head; and the SAME (seq, root) with another value (another ledger: the Register's tie-break is over
+/// values, so it is not the head this page knows). Mutant "known by (seq, root) alone" -> the last is 0 reads -> red.
+#[test]
+fn control_a_delta_a_newer_head_or_another_value_is_still_read() {
+    let (mut p, _, _) = published_by_the_read_back();
+    p.head_hint();
+    assert_eq!(head_reads(&p.take_ops()), 1, "a delta push (no state) did not read the register");
+    let (mut p, _, mine) = published_by_the_read_back();
+    p.head_pushed(HeadRead::from_value(mine.seq + 1, &[9u8; 32]).expect("a head"));
+    assert_eq!(head_reads(&p.take_ops()), 1, "a push of a NEWER head did not read the register");
+    let (mut p, _, mine) = published_by_the_read_back();
+    let other_value = [mine.root().as_slice(), b"another ledger"].concat();
+    let same_root = HeadRead::from_value(mine.seq, &other_value).expect("a head");
+    assert_eq!((same_root.seq, same_root.root()), (mine.seq, mine.root()), "THE SETUP: not the same (seq, root)");
+    assert_ne!(same_root.value(), mine.value(), "THE SETUP: not another value");
+    p.head_pushed(same_root);
+    assert_eq!(head_reads(&p.take_ops()), 1, "a push of the same (seq, root) under ANOTHER value was taken as known");
+}

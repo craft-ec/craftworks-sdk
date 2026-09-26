@@ -1425,6 +1425,15 @@ impl Page {
         let confirms = self.verify.is_none()
             && self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && (o.seq, o.root) == (read.seq, read.root()));
         if !confirms {
+            // ALREADY KNOWN (the architect's done x E1 cell, #378): a full state that IS the head this page last
+            // read -- the whole value, not only (seq, root) -- and the engine stands on, is news to nobody. No
+            // read (one op on the node's one queue, F61); the backstop's clock restarts, as for a read. A DELTA
+            // push carries no state and never gets here (`head_hint`, one read), nor does any other head.
+            let known = self.last_head.as_ref().is_some_and(|h| h.seq == read.seq && h.value() == read.value());
+            if known && (read.seq, read.root()) == self.published() {
+                self.last_head_at = self.now;
+                return;
+            }
             return self.head_hint();
         }
         self.last_head_at = self.now;
