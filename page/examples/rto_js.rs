@@ -40,4 +40,11 @@ fn main() {
     println!("// How many GETs a new page keeps in flight after n answers (page/src/rto.rs `Window`, slow start):");
     println!("// the load-piece race's pacing (sdk#347). The last entry holds from then on.");
     println!("export const WINDOW_AFTER_ANSWERS = Object.freeze([{sizes}]);");
+
+    // THE NODE'S OWN BOUNDS on a GET (sdk#447, FREENET-CONSTRAINTS F64): the page re-asks a GET the node has not
+    // answered only once B has passed since it was sent; the loader's served() reads the same facts from here.
+    println!("// The node's own bounds on a GET (page/src/rto.rs, FREENET-CONSTRAINTS F64): its web path answers 503 after");
+    println!("// NODE_WEB_BOUND_MS and leaves its GET running; one node GET against silent peers runs at most NODE_GET_BOUND_MS (B).");
+    println!("export const NODE_WEB_BOUND_MS = {};", page::rto::NODE_WEB_BOUND_MS);
+    println!("export const NODE_GET_BOUND_MS = {};", page::rto::NODE_GET_BOUND_MS);
 }

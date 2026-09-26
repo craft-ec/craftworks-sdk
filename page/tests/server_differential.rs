@@ -2225,9 +2225,14 @@ fn a_fresh_page_reads_rows_whose_blocks_the_node_lost_rebuilt_from_parity() {
     println!("  {} of a group lost: 5 min NotFound, {asked} GETs, no Unavailable; block back -> the read answers", engine::PARITY + 1);
 }
 
+/// Long enough after a GET's send that the node's own GET is certainly over, whatever the RTO (sdk#447): a GET the
+/// node never answered is asked again only then.
+const PAST_B: u64 = page::rto::NODE_GET_BOUND_MS as u64 + page::rto::RTO_MAX_MS as u64;
+
 /// **A BLOCK THE NODE IS SILENT ABOUT FOR FIVE MINUTES IS STILL READ** (the
 /// owner's rule 7; the owner's "block … could not be had"). Silence is not
-/// an answer: the page re-sends the GET on the RTO, the read never ends
+/// an answer: the page asks again once the node's own GET is over (sdk#447:
+/// never beside it, the node does not dedupe), the read never ends
 /// `Unavailable`, and when the node answers, the read answers.
 #[test]
 fn a_block_silent_for_five_minutes_then_answering_is_read() {
@@ -2250,13 +2255,14 @@ fn a_block_silent_for_five_minutes_then_answering_is_read() {
     let answer = |rs: &[Reply]| rs.iter().find(|r| matches!(r, Reply::Value { req_id, .. } | Reply::Unavailable { req_id, .. } if *req_id == id)).cloned();
     assert_eq!(answer(&rs), None, "a read over a silent node ended: {:?}", answer(&rs));
     let sent: usize = reader.gets.values().sum();
-    assert!(sent >= 5, "{sent} GETs in 5 min of silence: the page did not re-send");
+    // One node GET per bound (sdk#447): sent, and sent again once the node's own GET is over (B + an RTO < 5 min).
+    assert!(sent >= 2, "{sent} GETs in 5 min of silence: the page did not ask again after the node's GET was over");
     // ...each on its OWN backoff (RTO x 2^(n-1), to the 60 s ceiling), not at
     // a shared RTO other answers keep pulling down.
     assert!(sent <= 60, "{sent} GETs in 5 min of silence: re-sent without a per-op backoff; first at {:?}, last at {:?}", &reader.get_at[..reader.get_at.len().min(12)], &reader.get_at[reader.get_at.len().saturating_sub(4)..]);
-    // The node answers again.
+    // The node answers again: the GET still out is silent until its node GET is over, then asked again and answered.
     reader.silent.clear();
-    rs.extend(reader.run_for(&mut node, 120_000));
+    rs.extend(reader.run_for(&mut node, PAST_B));
     match answer(&rs) {
         Some(Reply::Value { value: Some(v), .. }) if v == b"value 321" => {}
         other => panic!("the node answered again and the read answered {other:?} ({sent} GETs while silent)"),
@@ -2385,8 +2391,9 @@ fn a_delta_whose_block_is_silent_waits_and_is_answered_the_delta() {
     assert_eq!(answer(&rs), None, "a delta over a SILENT node was answered: {:?}", answer(&rs));
     let sent: usize = reader.gets.values().sum();
     assert!((1..=60).contains(&sent), "{sent} GETs in 5 min of silence");
+    // The GET still out is silent until its node GET is over (sdk#447), then asked again and answered.
     reader.silent.clear();
-    rs.extend(reader.run_for(&mut node, 120_000));
+    rs.extend(reader.run_for(&mut node, PAST_B));
     match answer(&rs) {
         Some(Reply::Delta { changes, .. }) if changes.iter().any(|(k, v)| k == b"k/000321" && v.as_deref() == Some(&b"changed"[..])) => {}
         other => panic!("the node answered again and the delta was answered {other:?} ({sent} GETs while silent)"),

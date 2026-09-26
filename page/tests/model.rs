@@ -893,6 +893,15 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
             }
         }
     }
+    // Ops the LAST tick sent (the loop ends after a tick, before the next take): sent all the same, and recorded, so
+    // counted and hashed like every other. A run that converged on a tick that also re-sent something left them
+    // uncounted, and the recording then held more Request edges than "ops sent" (sdk#447's re-derived timing).
+    for (i, a) in apps.iter_mut().enumerate() {
+        for op in a.page.take_ops() {
+            (now, i, format!("{op:?}")).hash(&mut digest);
+            seen.ops_sent[i] += 1;
+        }
+    }
     seen.ops_digest = digest.finish();
     if cfg.record {
         for (i, a) in apps.iter().enumerate() {

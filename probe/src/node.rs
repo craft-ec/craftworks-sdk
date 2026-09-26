@@ -30,6 +30,16 @@ pub fn allowed_port(url: &str) -> Result<u16> {
     Ok(port)
 }
 
+/// EVERY port a run derives, refused BEFORE anything starts if one is someone else's (the architect's review of
+/// sdk#444: a base a few below 7509 derives 7509). Each probe keeps its own layout (its offsets, and their overflow);
+/// this is the one rule, through [`allowed_port`], so a refusal names the port the same way everywhere.
+pub fn allowed_ports(ports: &[u16]) -> Result<()> {
+    for port in ports {
+        allowed_port(&format!("ws://127.0.0.1:{port}"))?;
+    }
+    Ok(())
+}
+
 const BOOT: Duration = Duration::from_secs(45);
 
 /// How the node is run.
@@ -299,6 +309,15 @@ impl Node {
         let mut fresh = Node::start(port, &dir, mode, self.args.clone())?;
         self.child = fresh.child.take();
         Ok(())
+    }
+
+    /// The node process's id WHILE IT IS OURS AND ALIVE, else `None` (after `stop`, or once it exited): a probe that
+    /// pauses its OWN node (SIGSTOP, a silent peer) names it by this handle, never by a search. While this handle holds
+    /// the child unreaped the pid cannot be reused by another process, so a signal sent by it reaches this node only;
+    /// `try_wait` reaps a child that exited, and from then on there is no pid to signal.
+    pub fn pid(&mut self) -> Option<u32> {
+        let c = self.child.as_mut()?;
+        matches!(c.try_wait(), Ok(None)).then(|| c.id())
     }
 
     pub fn ws(&self) -> String {
