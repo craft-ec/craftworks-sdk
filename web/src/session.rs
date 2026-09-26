@@ -69,6 +69,21 @@ pub struct Session {
     app: Option<String>,
 }
 
+
+/// Events the page's recording keeps: the LAST this many (older ones are overwritten and counted as dropped; it never grows): ~8 per op, so the last
+/// few hundred ops -- a first save's, with its retries.
+const PAGE_RECORDING: usize = 4096;
+/// Events `page_trace` renders.
+const PAGE_TRACE_LAST: usize = 200;
+
+/// A page for this session, RECORDING from before its first op (sdk#386's instrument work): its clock starts now
+/// (sdk#397), and the recorder is attached before anything can be sent.
+fn recorded_page() -> page::Page {
+    let mut p = page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms()));
+    p.record_into(PAGE_RECORDING);
+    p
+}
+
 #[wasm_bindgen]
 impl Session {
     /// A session against a node on THIS machine.
@@ -469,7 +484,7 @@ impl Session {
         self.signer_code = signer;
         let art = page_io::Artefacts { block_code: block, register_code: register, register_params: Vec::new(), signer: key };
         let server = page::server::Server::new(
-            page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms())),
+            recorded_page(),
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
@@ -518,7 +533,7 @@ impl Session {
             signer,
         };
         let server = page::server::Server::new(
-            page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms())),
+            recorded_page(),
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
@@ -669,7 +684,7 @@ impl Session {
             return Err(JsValue::from_str("open_named: this session is already open on its own head"));
         }
         let server = page::server::Server::new(
-            page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms())),
+            recorded_page(),
             page::server::SignerFacts::default(),
         );
         self.db.store_mut().set_view();
@@ -1091,6 +1106,20 @@ impl Session {
         }
         self.pump_page();
         Ok(domains.len())
+    }
+
+    /// THE PAGE'S OPS, in the instrument VOCABULARY (sdk#386's instrument work): the tail of the page's recording
+    /// -- each op by its SEND ORDER (`req#n`), how it ended, and the retry clock it used (attempt, RTO, samples,
+    /// deadlines as offsets from when the page was made). Local only: rendered for a person or a harness to read,
+    /// never sent anywhere. `null` with no page yet.
+    ///
+    /// No user content crosses it for the same reason as [`Session::trace`]: its events carry compile-time site
+    /// names, send-order labels and numbers from the instrument's reviewed keys -- never a block id or a key.
+    pub fn page_trace(&self) -> String {
+        match self.page() {
+            Some(io) => io.server.page.dump(PAGE_TRACE_LAST),
+            None => "null".into(),
+        }
     }
 
     /// The call tree of the last operation, in the instrument VOCABULARY.

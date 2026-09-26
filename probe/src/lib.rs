@@ -344,6 +344,38 @@ mod tests {
         assert_eq!(c.delegate[0].1, DEFINED_BY_NODE[0]);
     }
 
+    /// The crates in `pkg`'s NORMAL dependency closure, by name: THE one reading of `cargo tree` every closure
+    /// check here makes. A `cargo tree` that fails is a failure -- a gate that could not check has not checked.
+    fn normal_closure(root: &std::path::Path, pkg: &str) -> std::collections::BTreeSet<String> {
+        let out = std::process::Command::new(env!("CARGO"))
+            .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
+            .current_dir(root)
+            .output()
+            .expect("cargo tree must run: a gate that cannot check has not checked");
+        assert!(out.status.success(), "cargo tree failed for {pkg}, so it was NOT checked: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.split_whitespace().next()).map(str::to_string).collect()
+    }
+
+    /// **NO DELEGATE REACHES THE INSTRUMENT** (the architect's check 5 on sdk#386's instrument work).
+    ///
+    /// A delegate's wasm hash is its key: a dependency's identity alone moves it, so a recording spine in a
+    /// delegate's closure would re-key the signer. The signer and the probe delegate are compiled by the node; the
+    /// ENGINE is built into a delegate too while one builds from it. None of them may have `instrument` in its
+    /// NORMAL closure. THE CONTROL: `page`, which records, must -- or the check could not see it at all.
+    #[test]
+    fn no_delegate_reaches_the_instrument() {
+        let here = std::env::current_dir().expect("a working directory");
+        let root = here.parent().expect("the workspace root is the probe's parent");
+        for (pkg, may) in [("signer", false), ("probe-delegate", false), ("engine", false), ("page", true)] {
+            let has = normal_closure(root, pkg).contains("instrument");
+            assert_eq!(
+                has, may,
+                "`{pkg}`: instrument in its normal closure is {has}, must be {may}. A delegate's wasm hash is its key, \
+                 so the recording spine must never reach one; `page` records, so it must (THE CONTROL)."
+            );
+        }
+    }
+
     /// **A positive allowlist over EVERY workspace crate.**
     ///
     /// `freenet-stdlib` — and the client stack that comes with it — may appear
@@ -470,21 +502,8 @@ mod tests {
             if pkg == "testkit" {
                 continue;
             }
-            let out = std::process::Command::new(env!("CARGO"))
-                .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
-                .current_dir(root)
-                .output()
-                .expect("cargo tree must run: a gate that cannot check has not checked");
             assert!(
-                out.status.success(),
-                "cargo tree failed for {pkg}, so the testkit check did NOT run: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let tree = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                !tree
-                    .lines()
-                    .any(|l| l.split_whitespace().next() == Some("testkit")),
+                !normal_closure(root, pkg).contains("testkit"),
                 "`testkit` is in `{pkg}`'s NORMAL dependency closure. It is on the \
                  client-API allowlist only because it is test support that nothing \
                  ships — a real dependency on it would carry the client stack into \
@@ -498,20 +517,10 @@ mod tests {
             if ALLOWED.contains(&pkg.as_str()) {
                 continue;
             }
-            let out = std::process::Command::new(env!("CARGO"))
-                .args(["tree", "-p", pkg, "--edges", "normal", "--prefix", "none"])
-                .current_dir(root)
-                .output()
-                .expect("cargo tree must run: a gate that cannot check has not checked");
-            assert!(
-                out.status.success(),
-                "cargo tree failed for {pkg}, so it was NOT checked: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let tree = String::from_utf8_lossy(&out.stdout);
+            let closure = normal_closure(root, pkg);
             for f in FORBIDDEN {
                 assert!(
-                    !tree.lines().any(|l| l.split_whitespace().next() == Some(f)),
+                    !closure.contains(f),
                     "`{f}` is in `{pkg}`'s normal dependency closure, and `{pkg}` \
                      is not on the allowlist. Either it belongs there — say so, \
                      with the reason — or this is the mistake the gate exists \

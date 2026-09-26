@@ -35,6 +35,7 @@ use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use page::{Answer, Ms, Op, Page, PutPath};
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
 const BLOCK_CODE: &[u8] = b"model block code";
 const REGISTER_CODE: &[u8] = b"model register code";
@@ -500,6 +501,11 @@ type PublishedAt = (usize, u64, (u64, Cid), Option<(Vec<u8>, Vec<u8>)>);
 
 #[derive(Default, Debug)]
 struct Seen {
+    /// Every op every page sent, in order, with when and which page: the run's op sequence, hashed. A recorder that
+    /// became an input would change it.
+    ops_digest: u64,
+    /// Ops each page sent.
+    ops_sent: [usize; 2],
     published: usize,
     lost: usize,
     busy: usize,
@@ -539,9 +545,11 @@ struct Cfg {
     /// `update_group`) without reading the straggler -- so page 1 commits a changed group holding a foreign block
     /// that is not on the node.
     hold_page0_first_value: bool,
+    /// Each page RECORDS its ops (sdk#386's instrument work), and the run checks the recording accounts for every op.
+    record: bool,
 }
 
-const NORMAL: Cfg = Cfg { faults: FAULTS, devices: 1, no_hints: false, hold_page0_first_value: false };
+const NORMAL: Cfg = Cfg { faults: FAULTS, devices: 1, no_hints: false, hold_page0_first_value: false, record: false };
 
 /// Does `later` descend from `h` through the signer's records (next → prev)?
 fn descends(edges: &BTreeMap<(u64, Cid), (u64, Cid)>, later: (u64, Cid), h: (u64, Cid)) -> bool {
@@ -587,7 +595,15 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
 
     let mut apps: Vec<App> = (0..2)
         .map(|i| App {
-            page: Page::new_at(Params::default(), path, Ms(origin)),
+            page: {
+                // Recording from before the first op (the architect's check 2 counts every one).
+                let mut p = Page::unstarted(Params::default(), path, Ms(origin));
+                if cfg.record {
+                    p.record_into(1 << 20);
+                }
+                p.start();
+                p
+            },
             client: ClientId(i as u64 + 1),
             next_id: 0,
             inflight: BTreeMap::new(),
@@ -631,6 +647,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
     let mut seen = Seen::default();
     let mut held: Option<Cid> = None;
     let mut page1_read = false;
+    let mut digest = std::collections::hash_map::DefaultHasher::new();
     let mut now = 0u64;
     let calm_at = 400_000u64;
     let end = calm_at + 600_000;
@@ -657,6 +674,8 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         // Ops leave the pages.
         for (i, a) in apps.iter_mut().enumerate() {
             for op in a.page.take_ops() {
+                (now, i, format!("{op:?}")).hash(&mut digest);
+                seen.ops_sent[i] += 1;
                 // INVARIANT 2.
                 if let Op::Update { label: page::Label::Head, state } = &op {
                     if !a.page.signer_records().contains(state) {
@@ -874,6 +893,12 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
             }
         }
     }
+    seen.ops_digest = digest.finish();
+    if cfg.record {
+        for (i, a) in apps.iter().enumerate() {
+            recording_accounts_for_every_op(&a.page, seen.ops_sent[i]).map_err(|e| format!("page {i}'s recording: {e}"))?;
+        }
+    }
     Ok(seen)
 }
 
@@ -940,6 +965,56 @@ fn judge_backed_up(node: &Node, edges: &BTreeMap<(u64, Cid), (u64, Cid)>, own: (
         Ok(())
     } else {
         Err(format!("a group its commit changed is not WHOLE on the node, and no later commit of this page re-coded it whole: {}", u.why))
+    }
+}
+
+/// THE RECORDING ACCOUNTS FOR EVERY OP (the architect's check 2): one Request edge per op the page sent, and every
+/// Request is answered (a Response), closed (an Exit: timed out or withdrawn), or still on the wire at the end --
+/// exactly as many as the page holds on the wire. Nothing dropped, and no answer for a request never made.
+fn recording_accounts_for_every_op(p: &Page, sent: usize) -> Result<(), String> {
+    use instrument::{Dir, Event, Record};
+    let r = p.recording().ok_or("no recording attached")?;
+    if r.dropped() > 0 {
+        return Err(format!("{} events dropped: the ring is too small for the run", r.dropped()));
+    }
+    let (mut requests, mut responses, mut exits) = (Vec::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    for e in r.events() {
+        match e {
+            Event::Edge { dir: Dir::Request, id, .. } => requests.push(id.ordinal),
+            Event::Edge { dir: Dir::Response, id, .. } => {
+                responses.insert(id.ordinal);
+            }
+            Event::Exit { op, .. } => {
+                exits.insert(op.0);
+            }
+            _ => {}
+        }
+    }
+    if requests.len() != sent {
+        return Err(format!("{} ops sent, {} Request edges", sent, requests.len()));
+    }
+    if let Some(f) = responses.iter().find(|o| !requests.contains(o)) {
+        return Err(format!("a Response for req#{f}, never requested"));
+    }
+    let open = requests.iter().filter(|o| !responses.contains(o) && !exits.contains(o)).count();
+    if open != p.ops_on_wire() {
+        return Err(format!("{open} Requests neither answered nor closed, but {} ops on the wire", p.ops_on_wire()));
+    }
+    Ok(())
+}
+
+/// THE PROBE IS NEVER AN INPUT (the architect's check 4): the same seeds, recording OFF and ON, send the same ops at
+/// the same times -- the op sequences hash equal -- and the ON run's recording accounts for every op. Both clock
+/// origins (odd and even seeds). Mutant "a branch reads the recorder" -> red.
+#[test]
+fn a_recording_page_sends_exactly_what_a_silent_one_does_and_records_every_op() {
+    let (min, _) = seed_range(4, FULL_SEEDS);
+    for seed in 1..=min.max(2) {
+        let off = run_with(seed, WRITES, PutPath::Page, NORMAL).unwrap_or_else(|e| panic!("seed {seed}, off: {e}"));
+        let on = run_with(seed, WRITES, PutPath::Page, Cfg { record: true, ..NORMAL }).unwrap_or_else(|e| panic!("seed {seed}, on: {e}"));
+        println!("seed {seed}: ops sent {:?}, digest off {:x} on {:x}", on.ops_sent, off.ops_digest, on.ops_digest);
+        assert_eq!(off.ops_sent, on.ops_sent, "seed {seed}: recording changed how many ops the pages sent");
+        assert_eq!(off.ops_digest, on.ops_digest, "seed {seed}: recording changed what the pages sent, or when");
     }
 }
 
