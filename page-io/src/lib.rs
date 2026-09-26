@@ -180,8 +180,7 @@ pub fn site_contract(site_code: &[u8], register_params: &[u8], app: &str) -> Opt
 /// from their own params names). STRICT: the link must decode to the 32-byte id AND encode back to itself
 /// (`from_base58` zero-pads a short text into a well-formed wrong id); anything else is `None`, never a guess.
 pub fn site_id_of_path(path: &str) -> Option<[u8; 32]> {
-    let link = path.strip_prefix("/v1/contract/web/")?.split(['/', '?', '#']).next()?;
-    site_id_of_link(link)
+    site_path(path).ok()
 }
 
 /// A site ADDRESS as a person gives one (sdk#472's keepSet; the loader handover uses [`site_id_of_path`]): a bare link
@@ -210,6 +209,7 @@ pub fn site_id_of_address(text: &str) -> Result<[u8; 32], AddressRefused> {
     site_id_of_link(text).ok_or(AddressRefused::NotASiteLink)
 }
 
+/// THE path form, parsed in ONE place (both [`site_id_of_path`] and [`site_id_of_address`] come through here).
 fn site_path(path: &str) -> Result<[u8; 32], AddressRefused> {
     let link = path.strip_prefix("/v1/contract/web/").ok_or(AddressRefused::NotASitePath)?.split(['/', '?', '#']).next().unwrap_or("");
     site_id_of_link(link).ok_or(AddressRefused::NotASiteLink)
@@ -240,7 +240,7 @@ fn site_id_of_link(link: &str) -> Option<[u8; 32]> {
         return None;
     }
     let id = freenet_stdlib::prelude::ContractInstanceId::from_base58(link).ok()?;
-    (id.encode() == link).then(|| *id)
+    (site_text(&id) == link).then(|| *id)
 }
 
 pub struct PageIo {
@@ -702,7 +702,11 @@ impl PageIo {
     /// `app`'s site LINK: its contract's instance id, as the node serves it (`/v1/contract/web/<link>/`). The same
     /// for every publish (builder#117). `None`: not an app id, or this head has no single key.
     pub fn site_link(&self, site_code: &[u8], app: &str) -> Option<String> {
-        site_contract(site_code, &self.art.register_params, app).map(|c| c.key().id().encode())
+        site_contract(site_code, &self.art.register_params, app).map(|c| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&c.key().id().as_bytes()[..32]);
+            site_text(&id)
+        })
     }
 
     /// Has the node's signer named the Register this page signs under (so a site has an authority)?
