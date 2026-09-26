@@ -1998,6 +1998,9 @@ impl Page {
     /// Promotion is checked where WAITERS change -- after every engine step ([`Page::promote_joined`]) -- not only
     /// where a new send shows up: the engine de-duplicates a joining read (one wait per block), so it may emit no new
     /// fetch for it.
+    ///
+    /// A stated consequence (the architect): an ON-WIRE GET promoted while the interactive window is full puts the
+    /// interactive count one over the window for its lifetime. Accepted: it is a GET the person is now waiting on.
     fn lane_of(&self, w: &Waiting) -> Lane {
         #[cfg(test)]
         if self.test_background.contains(w) {
