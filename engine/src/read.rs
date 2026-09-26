@@ -316,19 +316,6 @@ pub fn kind_of(id: &Cid, bytes: &[u8]) -> Option<core_types::kind::BlockKind> {
     core_types::kind::BlockKind::ALL.into_iter().find(|k| block_id(k.byte(), bytes) == *id)
 }
 
-impl Reads {
-    /// Record who is waiting, and say whether a fetch must be emitted.
-    ///
-    /// Returns false when someone else is already waiting on this block — the
-    /// caller then emits nothing and both requests resume on the one arrival.
-    pub fn want(&mut self, id: Cid, req: ReqId, share: bool) -> bool {
-        let waiters = self.waiting.entry(id).or_default();
-        let first = waiters.is_empty();
-        waiters.insert(req);
-        first || !share
-    }
-}
-
 /// Try a request against what is warm, and say what it still needs.
 pub(crate) enum Attempt {
     Done(ReadResult),

@@ -317,6 +317,12 @@ impl Harness {
         self.engine.owed_groups()
     }
 
+    /// Who wants block `id` (WANTED-LIFE: a read, a repair, the parked write).
+    #[allow(dead_code)]
+    pub fn readers_of(&self, id: &Cid) -> engine::Readers {
+        self.engine.readers_of(id)
+    }
+
     /// The root the engine would report.
     pub fn root(&self) -> Cid {
         self.engine.root()
