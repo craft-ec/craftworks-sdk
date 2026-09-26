@@ -637,7 +637,7 @@ impl ConnState {
                 self.count(Served::ReadHead);
                 Answer::Head { label: Label::Head, read: self.node.head_read() }
             }
-            Op::AskHeld { id } => Answer::Held { id, present: self.node.holds(&id) },
+            Op::AskHeld { batch, ids } => Answer::Held { batch, present: ids.iter().map(|id| self.node.holds(id)).collect() },
             // A node that takes every app PUT (a web container) it is sent.
             Op::PutApp { key } => Answer::AppPutOk(key),
             // Page-io's signer requests: the page alone never makes one.

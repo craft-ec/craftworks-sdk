@@ -22,7 +22,7 @@ fn at_update() -> (Page, u64, Vec<u8>) {
             match op {
                 Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: None }, Ms(now)),
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(now)),
                 Op::Sign { id, seq, root, ledger, .. } => {
                     let value = [root.as_slice(), &ledger].concat();
                     let record = contract_keys::register::head_state(&params, &sk.to_bytes(), seq, &value).expect("signs");
@@ -86,7 +86,7 @@ fn a_mid_commit_recovery_read_never_adopts_a_head_this_pages_record_beats() {
                 Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(now)),
                 Op::Update { label: Label::Head, .. } => p.answer(Answer::Updated { label: Label::Head }, Ms(now)),
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(now)),
                 other => common::unanswered_op(&other),
             }
         }

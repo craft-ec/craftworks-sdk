@@ -38,7 +38,7 @@ fn warmed(writes: u64, delay: u64) -> (Page, u64) {
                         Answer::Signer { id, answer: signer_proto::Answer::Signed(record) }
                     }
                     Op::Update { .. } => Answer::Updated { label: page::Label::Head },
-                    Op::AskHeld { id } => Answer::Held { id, present: true },
+                    Op::AskHeld { batch, ids } => Answer::Held { batch, present: vec![true; ids.len()] },
                     Op::PutApp { key } => Answer::AppPutOk(key),
                     Op::Ext(_) => continue,
                 };
@@ -173,7 +173,7 @@ fn an_unanswered_head_read_is_never_an_empty_tree() {
         for op in p.take_ops() {
             match op {
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(now)),
                 Op::Sign { .. } => panic!("a write was signed onto a tree nobody read"),
                 other => common::unanswered_op(&other),
             }
