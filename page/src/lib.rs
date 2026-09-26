@@ -79,7 +79,6 @@ use engine::{ClientId, Effect, Engine, Epoch, Event, KeySource, Op as WriteOp, P
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
 use judge::{judge, judge_site, Heard, Judged, SiteJudged};
 
 /// How a judged head is told to the engine: the answer to its own recovery read (`HeadRead`), or another writer's
@@ -120,38 +119,114 @@ fn engine_seconds(now: Ms) -> u64 {
 /// The only code epoch this build writes under.
 const EPOCH: Epoch = Epoch(1);
 
-/// The blocks the page holds: every block it wrote and every block it
-/// fetched, each verified against its id.
+/// The blocks the page holds: every block it wrote and every block it fetched, each verified against its id.
 ///
-/// APPEND-ONLY for the page's life: the engine owns its `Blocks` and only
-/// lends `&B`, and a `&[u8]` it was handed must stay valid, so nothing is ever
-/// removed. The BOUND this implies: a page holds every block of every commit
-/// it made and every block it read in this session — for a long session over
-/// a large tree that is the tree's size in memory, until the page is closed.
-/// An LRU needs the engine to stop holding borrows across calls (a follow-up,
-/// not this PR).
-#[derive(Clone, Default)]
-pub struct PageBlocks(Rc<elsa::FrozenBTreeMap<Cid, Box<[u8]>>>);
+/// OWNED BY THE ENGINE (sdk#411): the engine's `B`, reached through `Engine::blocks` / `blocks_mut`, so no borrow
+/// of it outlives an engine call -- the borrow checker's fact. That is what lets the page EVICT: past its budget
+/// (`Params::max_page_block_bytes`), at the end of a page step, the least recently used blocks that
+/// [`Engine::pinned`] does not pin are dropped; a later need fetches them from the node, which holds them. The
+/// budget bounds the PEAK (a wasm memory never shrinks: bytes are reused under the budget, not handed back).
+#[derive(Default)]
+pub struct PageBlocks {
+    map: BTreeMap<Cid, Stored>,
+    /// THE ONE eviction order, TIERED (the architect's ruling on sdk#411, from the thrash measurement): first to
+    /// go, tier 0, blocks stored and never read (a race get's unread siblings); then tier 1, blocks read; last,
+    /// tier 2, INTERNAL tree nodes (the upper tree every read walks; recognised at insert). Insertion order within
+    /// a tier. Measured at a third of the working set: LRU re-fetched the root 35 times, FIFO 15, tiered once -- a
+    /// client read makes ~130 store reads (re-descents, a race get's group rebuilt), so recency cannot single out
+    /// the tree's top, and LRU within a tier added nothing.
+    tiers: [BTreeMap<u64, Cid>; 3],
+    stamp: u64,
+    bytes: usize,
+    /// A pass that could not get under the budget (all that is left is pinned) re-arms only past this many bytes
+    /// (the store at its end + budget/16): without it every step re-scanned the whole store to drop nothing --
+    /// quadratic over a long queue (measured: a 40k-write queue, 227 MB all pinned, never finished in 5 h).
+    rearm_at: usize,
+    stats: StoreStats,
+}
+
+struct Stored {
+    bytes: Box<[u8]>,
+    stamp: u64,
+    tier: usize,
+    /// Read since stored: set by `get` (one bit, no borrow of the order), acted on by the next eviction pass.
+    read: std::cell::Cell<bool>,
+}
+
+/// What the page's block store has done (sdk#411): printed by the probes, asserted by the tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    /// Blocks and bytes evicted, in all.
+    pub evicted: u64,
+    pub evicted_bytes: u64,
+    /// The most bytes the store has held at the end of a step.
+    pub peak_bytes: usize,
+    /// The most bytes PINNED at the end of an eviction pass: outside the budget by construction.
+    pub peak_pinned_bytes: usize,
+    /// Blocks visited by eviction passes, in all: the WORK eviction costs (bounded by the re-arm, sdk#411).
+    pub scanned: u64,
+}
 
 impl PageBlocks {
-    fn insert(&self, id: Cid, bytes: &[u8]) {
-        if self.0.get(&id).is_none() {
-            self.0.insert(id, bytes.to_vec().into_boxed_slice());
+    fn insert(&mut self, id: Cid, bytes: &[u8]) {
+        if self.map.contains_key(&id) {
+            return;
+        }
+        let internal = freenet_prolly::block_id(freenet_prolly::kind::TREE_NODE, bytes) == id
+            && freenet_prolly::node::Node::parse(bytes).is_ok_and(|n| !n.is_leaf());
+        let tier = if internal { 2 } else { 0 };
+        self.stamp += 1;
+        self.tiers[tier].insert(self.stamp, id);
+        self.bytes += bytes.len();
+        self.map.insert(id, Stored { bytes: bytes.to_vec().into_boxed_slice(), stamp: self.stamp, tier, read: std::cell::Cell::new(false) });
+    }
+
+    fn remove(&mut self, id: &Cid) {
+        if let Some(s) = self.map.remove(id) {
+            self.tiers[s.tier].remove(&s.stamp);
+            self.bytes -= s.bytes.len();
+            self.stats.evicted += 1;
+            self.stats.evicted_bytes += s.bytes.len() as u64;
         }
     }
 
+    /// Every id, first to go first: tier 0, 1, 2, each in insertion order. Blocks READ since the last pass move
+    /// from tier 0 to tier 1 here, where the store is `&mut` (a read never takes a borrow of the order).
+    fn eviction_order(&mut self) -> Vec<Cid> {
+        let read: Vec<(u64, Cid)> = self.tiers[0].iter().filter(|(_, id)| self.map.get(*id).is_some_and(|s| s.read.get())).map(|(t, id)| (*t, *id)).collect();
+        for (t, id) in read {
+            self.tiers[0].remove(&t);
+            self.tiers[1].insert(t, id);
+            if let Some(s) = self.map.get_mut(&id) {
+                s.tier = 1;
+            }
+        }
+        self.tiers.iter().flat_map(|t| t.values().copied()).collect()
+    }
+
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.map.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Bytes held now.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn stats(&self) -> StoreStats {
+        self.stats
+    }
 }
 
 impl Blocks for PageBlocks {
     fn get(&self, cid: &Cid) -> Option<&[u8]> {
-        self.0.get(cid)
+        let s = self.map.get(cid)?;
+        s.read.set(true);
+        Some(&s.bytes)
     }
 }
 
@@ -596,7 +671,9 @@ pub struct Page {
     /// `signer_proto::UNATTRIBUTED`.
     next_request: u32,
     engine: Engine<PageBlocks>,
-    blocks: PageBlocks,
+    /// Blocks a queued write's warm apply made (`Effect::Keep`): the only copy while any write is queued or a commit
+    /// is pending (the W pin, sdk#411); forgotten once neither is.
+    kept: BTreeSet<Cid>,
     /// Blocks whose PUT was answered ok (an effect's `after` is judged here).
     confirmed: BTreeSet<Cid>,
     /// Effects held until their `after` set is confirmed, in emitted order.
@@ -742,14 +819,13 @@ impl Page {
     /// their answers as a round trip of ~1.8e12 ms -- an SRTT no later sample could bring down, the RTO pinned at
     /// its 60 s ceiling for the page's life, so a lost PUT waited a minute (V's first save, Phase 4 realnet).
     pub fn unstarted(params: Params, path: PutPath, now: Ms) -> Page {
-        let blocks = PageBlocks::default();
-        let engine = Engine::new(params, blocks.clone());
+        let engine = Engine::new(params, PageBlocks::default());
         Page {
             path,
             device: [0; 16],
             hold_on_displace: false,
             engine,
-            blocks,
+            kept: BTreeSet::new(),
             confirmed: BTreeSet::new(),
             held: Vec::new(),
             head: Pub::default(),
@@ -877,7 +953,7 @@ impl Page {
             // A parked GET the engine no longer needs, or that the page now
             // holds (a repair rebuilt it), ends here.
             if let Waiting::Get(id) = w {
-                if !d.sent && (self.blocks.get(&id).is_some() || !self.engine.awaits_block(&id)) {
+                if !d.sent && (self.engine.blocks().get(&id).is_some() || !self.engine.awaits_block(&id)) {
                     self.drop_get(id);
                     continue;
                 }
@@ -1040,7 +1116,8 @@ impl Page {
                 // again on a doubling backoff, and only after HELD_ABSENTS in
                 // a row put it again — never at the speed of the answers.
                 let absents = self.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
-                let bytes = self.blocks.get(&id).map(<[u8]>::to_vec);
+                // Read (and, gone, counted) only when it is due to be put again: the one re-PUT from page memory.
+                let bytes = if absents >= HELD_ABSENTS { self.engine.reput_bytes(&id) } else { None };
                 if let (true, Some(bytes)) = (absents >= HELD_ABSENTS, bytes) {
                     self.held_again.remove(&id);
                     self.put_again.insert(id, bytes);
@@ -1071,7 +1148,7 @@ impl Page {
                 // not its id is not kept, and the engine hears a miss.
                 let good = engine::read::matches_id(&id, &bytes);
                 if good {
-                    self.blocks.insert(id, &bytes);
+                    self.engine.blocks_mut().insert(id, &bytes);
                 } else {
                     // Parked BEFORE the engine hears it: the engine re-asks
                     // inside that step, and must already see the GET pending,
@@ -2281,6 +2358,54 @@ impl Page {
         }
     }
 
+    /// EVICT past the budget (sdk#411), at the end of a page step -- never inside one. Least recently used first,
+    /// and only what [`Engine::pinned`] does not pin (the one pin rule, given the page's three facts). A block
+    /// dropped here is on the node or referenced by nothing; a later need fetches it.
+    fn evict(&mut self) {
+        let budget = self.engine.params().max_page_block_bytes;
+        let bytes = self.engine.blocks().bytes();
+        let peak = bytes.max(self.engine.blocks().stats.peak_bytes);
+        self.engine.blocks_mut().stats.peak_bytes = peak;
+        if bytes <= budget.max(self.engine.blocks().rearm_at) {
+            return;
+        }
+        // W is the only copy only while a write is queued or a commit pending: past that, forgotten.
+        if !self.engine.has_writes_in_flight() {
+            self.kept.clear();
+        }
+        let order = self.engine.blocks_mut().eviction_order();
+        self.engine.blocks_mut().stats.scanned += order.len() as u64;
+        let held_asks: BTreeSet<Cid> = self
+            .held_again
+            .keys()
+            .copied()
+            .chain(self.deadlines.keys().filter_map(|w| match w {
+                Waiting::Held(id) => Some(*id),
+                _ => None,
+            }))
+            .collect();
+        let pins = self.engine.pins(&engine::PagePins { kept: &self.kept, held_asks: &held_asks });
+        let store = self.engine.blocks();
+        let mut over = bytes - budget;
+        let mut drop = Vec::new();
+        let mut pinned_bytes = 0usize;
+        for id in order {
+            let len = store.map.get(&id).map_or(0, |s| s.bytes.len());
+            if pins.contains_key(&id) {
+                pinned_bytes += len;
+            } else if over > 0 {
+                drop.push(id);
+                over = over.saturating_sub(len);
+            }
+        }
+        let blocks = self.engine.blocks_mut();
+        for id in &drop {
+            blocks.remove(id);
+        }
+        blocks.rearm_at = if blocks.bytes() > budget { blocks.bytes() + (budget / 16).max(1) } else { 0 };
+        blocks.stats.peak_pinned_bytes = blocks.stats.peak_pinned_bytes.max(pinned_bytes);
+    }
+
     fn step(&mut self, ev: Event) {
         // THE WITNESS (COMMIT-LIFE ⁵): a head about to be adopted says, in its
         // ledger, how far THIS page's writes are in it -- whether a commit
@@ -2312,6 +2437,7 @@ impl Page {
         let fx = self.engine.step(ev);
         self.carry_out(fx);
         self.drop_dead_head();
+        self.evict();
         if recovery && !self.engine_has_head {
             self.engine_has_head = true;
             self.last_head_at = self.now;
@@ -2346,7 +2472,7 @@ impl Page {
                     _ => None,
                 })
                 .chain(self.get_queue.iter().copied())
-                .filter(|id| self.blocks.get(id).is_some()),
+                .filter(|id| self.engine.blocks().get(id).is_some()),
         );
         for id in ended {
             self.drop_get(id);
@@ -2399,7 +2525,7 @@ impl Page {
                 }
                 Effect::PutBlock { id, ref bytes, ref after } => {
                     // The page is the memory now: the engine keeps no bytes.
-                    self.blocks.insert(id, bytes);
+                    self.engine.blocks_mut().insert(id, bytes);
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
                     self.held.push((after, f.clone()));
                 }
@@ -2409,7 +2535,10 @@ impl Page {
                 }
                 // A queued write's warm-apply block (R-b): kept for reads of
                 // the warm root, never put -- its commit puts the same bytes.
-                Effect::Keep { id, ref bytes } => self.blocks.insert(id, bytes),
+                Effect::Keep { id, ref bytes } => {
+                    self.engine.blocks_mut().insert(id, bytes);
+                    self.kept.insert(id);
+                }
                 // SUPERSEDED (COMMIT-LIFE §P): a later root move re-coded the
                 // group this block was in. Its PUT is WITHDRAWN -- no more
                 // re-sends, not sent at all if still held back -- because
@@ -2441,7 +2570,7 @@ impl Page {
                 // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
                 // op, deadline and re-send), unless it is on its way or there already.
                 Effect::PutRepaired { id, ref bytes } => {
-                    self.blocks.insert(id, bytes);
+                    self.engine.blocks_mut().insert(id, bytes);
                     if !self.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.put_again.contains_key(&id) {
                         self.repair_puts.insert(id);
                         self.send(Waiting::Put(id), Op::Put { id, bytes: bytes.clone() });
@@ -2454,8 +2583,8 @@ impl Page {
                     self.carry_out(more);
                 }
                 Effect::FetchBlock { id, .. } => {
-                    if self.blocks.get(&id).is_some() {
-                        let bytes = self.blocks.get(&id).expect("held").to_vec();
+                    if self.engine.blocks().get(&id).is_some() {
+                        let bytes = self.engine.blocks().get(&id).expect("held").to_vec();
                         let more = self.engine.step(Event::BlockArrived { id, bytes });
                         self.carry_out(more);
                     } else if self.deadlines.contains_key(&Waiting::Get(id)) || self.get_queue.contains(&id) {
@@ -2839,8 +2968,18 @@ impl Page {
     }
 
     /// The blocks the page holds.
+    /// Re-puts that found their block's bytes gone (sdk#411): 0 while the pin rule holds.
+    pub fn reput_missing(&self) -> u64 {
+        self.engine.reput_missing()
+    }
+
+    /// Whether the engine's parked write, if any, still has its owner (sdk#411's "no pin outlives its owner").
+    pub fn parked_write_is_live(&self) -> bool {
+        self.engine.parked_write_is_live()
+    }
+
     pub fn blocks(&self) -> &PageBlocks {
-        &self.blocks
+        self.engine.blocks()
     }
 }
 
@@ -2871,7 +3010,7 @@ mod unneeded_gets {
     fn a_queued_get_nobody_needs_is_ended() {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let (held, wanted) = ([1u8; 32], [2u8; 32]);
-        p.blocks.insert(held, b"held");
+        p.engine.blocks_mut().insert(held, b"held");
         p.get_queue.push_back(held);
         p.get_queue.push_back(wanted);
         p.end_unneeded_gets();
@@ -2948,7 +3087,7 @@ mod confirm_held {
         p.confirmed.insert(put);
         p.carry_out(vec![Effect::ConfirmHeld { id: put }]);
         assert_eq!(asks(&mut p), 0, "a block the node confirmed was asked about again");
-        p.blocks.insert(rebuilt, b"rebuilt from its group");
+        p.engine.blocks_mut().insert(rebuilt, b"rebuilt from its group");
         p.carry_out(vec![Effect::ConfirmHeld { id: rebuilt }]);
         assert_eq!(asks(&mut p), 1, "a block only in page memory was taken as on the node");
         p.answer(Answer::Held { id: rebuilt, present: true }, Ms(1));
@@ -2976,6 +3115,34 @@ mod confirm_held {
         assert!(p.put_again.is_empty(), "a block the page has no bytes for was queued to be PUT");
         p.answer(Answer::Held { id, present: true }, Ms(now + 1));
         assert!(p.confirmed.contains(&id));
+    }
+
+    /// **HF (sdk#411, the architect):** a FOREIGN member this page FETCHED (its bytes in the store) with a `Held`
+    /// ask out is pinned: after `HELD_ABSENTS` absent answers the page re-puts it from the store -- its self-heal of
+    /// another page's straggler -- even at a 1-byte budget, where an eviction pass runs every tick. Mutant "HF
+    /// unpinned" -> evicted at the first tick -> no heal PUT, only asks for ever -> red.
+    #[test]
+    fn a_fetched_foreign_member_with_an_ask_out_is_re_put_from_the_store_under_eviction() {
+        let mut p = Page::new(Params { max_page_block_bytes: 1, ..Params::default() }, PutPath::Page);
+        let _ = p.take_ops();
+        let (id, bytes) = ([9u8; 32], b"another page's straggler, fetched here".to_vec());
+        p.engine.blocks_mut().insert(id, &bytes);
+        p.carry_out(vec![Effect::ConfirmHeld { id }]);
+        assert_eq!(asks(&mut p), 1, "THE SETUP: the foreign member was not asked about");
+        let mut now = 0u64;
+        let mut healed = false;
+        for _ in 0..(HELD_ABSENTS + 3) {
+            now += 1;
+            p.answer(Answer::Held { id, present: false }, Ms(now));
+            now += rto::RTO_MAX_MS as u64 + 1;
+            p.tick(Ms(now));
+            healed |= p.take_ops().iter().any(|o| matches!(o, Op::Put { id: x, bytes: b } if *x == id && *b == bytes));
+            if healed {
+                break;
+            }
+        }
+        assert!(p.blocks().stats().peak_pinned_bytes > 0, "THE SETUP: no eviction pass ran over the pinned block");
+        assert!(healed, "a fetched foreign member absent from the node was never re-put from the store (its bytes were evicted)");
     }
 }
 
@@ -3437,7 +3604,7 @@ mod deadline_table {
         let _ = p.take_ops();
         let (rto, window) = (p.rto.rto_ms(), p.window.size());
         // Nobody needs it: its block is held now (a repair rebuilt it).
-        p.blocks.insert([1; 32], &[1u8]);
+        p.engine.blocks_mut().insert([1; 32], &[1u8]);
         p.end_unneeded_gets();
         assert!(!p.deadlines.contains_key(&Waiting::Get([1; 32])) && !p.attempt_of.contains_key(&Waiting::Get([1; 32])), "the unneeded parked GET is still held");
         assert!(p.take_ops().is_empty(), "ending a parked GET sent something");
@@ -3612,7 +3779,7 @@ mod node_get_silent {
         silence(&mut p, a);
         let (rto, window) = (p.rto.rto_ms(), p.window.size());
         p.answer(Answer::Got { id: a, bytes }, Ms(p.now + 40_000));
-        assert!(p.blocks.get(&a).is_some(), "THE SETUP: the answer was not taken");
+        assert!(p.engine.blocks().get(&a).is_some(), "THE SETUP: the answer was not taken");
         assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms()), (None, rto), "a silent GET's answer moved the RTO");
         assert!(p.window.size() > window, "a silent GET's answer did not open the window");
         assert!(!p.deadlines.contains_key(&Waiting::Get(a)), "the answered GET still waits");
@@ -3691,7 +3858,7 @@ mod node_get_silent {
         p.tick(Ms(over));
         assert_eq!(gets_of(&p.take_ops(), a), 1, "THE SETUP: the GET was not asked again past B");
         p.answer(Answer::Got { id: a, bytes: bytes.clone() }, Ms(over + 10));
-        assert!(p.blocks.get(&a).is_some(), "THE SETUP: the first answer was not taken");
+        assert!(p.engine.blocks().get(&a).is_some(), "THE SETUP: the first answer was not taken");
         assert_eq!(overlaps(&p), 0, "the FIRST answer after a re-ask was recorded as the overlap");
         p.answer(Answer::Got { id: a, bytes }, Ms(over + 20));
         assert_eq!(overlaps(&p), 1, "the second answer after a re-ask past B was not recorded as DroppedMsgs = AnsweredAfterReask");
@@ -4198,11 +4365,11 @@ mod window_loss {
             let asked = now;
             ask(&mut p, now, *id);
             let mut t = 0;
-            while p.blocks.get(id).is_none() && t < 120_000 {
+            while p.engine.blocks().get(id).is_none() && t < 120_000 {
                 node.run(&mut p, &mut now, 100);
                 t += 100;
             }
-            assert!(p.blocks.get(id).is_some(), "a block the node serves was not read in 120 s behind one silent block (window {})", p.window.size());
+            assert!(p.engine.blocks().get(id).is_some(), "a block the node serves was not read in 120 s behind one silent block (window {})", p.window.size());
             waited.push(now - asked);
             node.run(&mut p, &mut now, 5_000);
         }
@@ -4234,7 +4401,7 @@ mod window_loss {
         assert_eq!(p.gets_in_flight(), 2);
         assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![all[2].0], "THE CONTROL: the third ask did not wait");
         node.run(&mut p, &mut now, PAST_B + 5_000);
-        assert!(p.blocks.get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
+        assert!(p.engine.blocks().get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
         let first_resend = node.sent.iter().filter(|(_, id)| *id == all[0].0 || *id == all[1].0).nth(2).map(|(t, _)| *t).expect("a re-send");
         let third = node.sent.iter().find(|(_, id)| *id == all[2].0).map(|(t, _)| *t).expect("the third ask went out");
         assert!(third <= first_resend, "a lost GET was re-sent ({first_resend}) before the ask already waiting ({third})");
@@ -4267,13 +4434,13 @@ mod window_loss {
         for _ in 0..2 * PAST_B + 20_000 {
             let was_queued: Vec<Cid> = p.get_queue.iter().copied().filter(|q| p.attempt_of.contains_key(&Waiting::Get(*q))).collect();
             node.run(&mut p, &mut now, 1);
-            queued_when_answered |= was_queued.iter().any(|id| p.blocks.get(id).is_some());
+            queued_when_answered |= was_queued.iter().any(|id| p.engine.blocks().get(id).is_some());
         }
         let sends: Vec<usize> = all.iter().map(|(id, _)| node.sent.iter().filter(|(_, s)| s == id).count()).collect();
         println!("sends per block {sends:?}; a queued lost GET answered: {queued_when_answered}");
         assert!(queued_when_answered, "THE CONTROL: no lost GET was still queued when its late answer landed");
-        assert!(all.iter().all(|(id, _)| p.blocks.get(id).is_some()), "not every block was read: sends {sends:?}");
-        assert!(!p.get_queue.iter().any(|q| p.blocks.get(q).is_some()), "a block already read is still queued to be asked again");
+        assert!(all.iter().all(|(id, _)| p.engine.blocks().get(id).is_some()), "not every block was read: sends {sends:?}");
+        assert!(!p.get_queue.iter().any(|q| p.engine.blocks().get(q).is_some()), "a block already read is still queued to be asked again");
     }
 
     /// ENDING A GET LEAVES NO TRACE, however it ends (`drop_get`, the one
@@ -4314,14 +4481,14 @@ mod window_loss {
         // The late answer to `late`'s first send.
         let bytes = all[0].1.clone();
         p.answer(Answer::Got { id: late, bytes }, Ms(now));
-        assert!(p.blocks.get(&late).is_some(), "the late answer was not taken");
+        assert!(p.engine.blocks().get(&late).is_some(), "the late answer was not taken");
         assert_eq!(holders(&p, late), (false, false, false), "a GET ended by its late answer left a trace (deadline, attempt, queue)");
         // `withdrawn` (queued) and one ON THE WIRE: their blocks are held now
         // (a repair rebuilt them), so nobody needs either GET.
         let on_wire = all[2].0;
         assert!(p.deadlines.get(&Waiting::Get(on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
-        p.blocks.insert(withdrawn, &all[1].1);
-        p.blocks.insert(on_wire, &all[2].1);
+        p.engine.blocks_mut().insert(withdrawn, &all[1].1);
+        p.engine.blocks_mut().insert(on_wire, &all[2].1);
         p.end_unneeded_gets();
         assert_eq!(holders(&p, withdrawn), (false, false, false), "a withdrawn queued GET left a trace (deadline, attempt, queue)");
         assert_eq!(holders(&p, on_wire), (false, false, false), "a withdrawn GET on the wire left a trace (deadline, attempt, queue)");
@@ -4398,7 +4565,7 @@ mod window_loss {
             ask(&mut p, now, *id);
         }
         node.run(&mut p, &mut now, 2 * rto::RTO_MAX_MS as u64 + 600_000);
-        let read = all.iter().filter(|(id, _)| p.blocks.get(id).is_some()).count();
+        let read = all.iter().filter(|(id, _)| p.engine.blocks().get(id).is_some()).count();
         let lost = node.sent.len() - 200;
         println!("200 blocks through a silent node: {read} read, {} GETs sent ({lost} re-sends), most past the window when one was sent {}", node.sent.len(), node.sent_past_window);
         assert!(lost > 0, "THE CONTROL: nothing was lost and re-sent");
