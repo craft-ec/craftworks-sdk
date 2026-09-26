@@ -92,6 +92,26 @@ await t("**BOUNDED: the last N events kept, older ones overwritten and COUNTED; 
   assert.equal(ring.events().length, seg.events.length, "the ring recorded after it was handed over");
 });
 
+await t("**RECORDING IS NEVER AN INPUT: a full ring, a taken ring or no ring -- served() returns the same, after the same waits**", async () => {
+  // engineer4's condition (js/served.js's owner): what served() fetches, waits and returns cannot depend on the ring.
+  const run = async rec => {
+    const c = clock();
+    let asked = 0;
+    const fetch = async () => { asked += 1; return asked < 3 ? new Response("", { status: 404 }) : new Response(new Uint8Array([7, 7])); };
+    const waits = [];
+    const bytes = await served({ url: "/f" }, { fetch, sleep: async ms => { waits.push(ms); await c.sleep(ms); }, now: c.now, rec });
+    return { bytes: [...bytes], asked, waits };
+  };
+  const full = new LoaderRing(1, clock().now);
+  for (let r = 0; r < 5; r += 1) full.asked(r); // full, dropping
+  const taken = new LoaderRing(8, clock().now);
+  taken.take();
+  const none = await run(null);
+  assert.deepEqual(await run(full), none, "a FULL ring changed what served() did");
+  assert.deepEqual(await run(taken), none, "a TAKEN ring changed what served() did");
+  assert.ok(full.dropped > 0, "THE SETUP: the ring was not full");
+});
+
 await t("the generated rules: coarsening and the HTTP classes are instrument's own", async () => {
   assert.deepEqual([0, 999, 1_000, 59_999, 60_000, 1_790_253_181_367].map(coarsenMs), [0, 990, 1_000, 59_900, 60_000, 1_790_253_181_000]);
   assert.deepEqual([200, 206, 404, 503, 403].map(statusClassOf), [STATUS.Ok, STATUS.Ok, STATUS.NotFound, STATUS.ServerError, STATUS.OtherHttp]);
