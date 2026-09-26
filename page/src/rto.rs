@@ -43,6 +43,28 @@ pub const GET_ATTEMPT_MS: f64 = 60_000.0;
 /// node answered NotFound at ~120 s, inside B; B stays the source's upper bound (main), since an earlier answer
 /// re-arms the page at once and B governs only a node still silent.
 pub const NODE_GET_BOUND_MS: f64 = GET_ATTEMPTS * GET_ATTEMPT_MS;
+/// A non-200 that took at least this long is the web bound's 503: the node's GET is still in flight. DERIVED, one
+/// RTO floor below the bound: the node answers at its own deadline, and a loopback answer arrives within a floor of it
+/// (V20: 30,002 ms for a 30,000 ms bound); anything faster did not wait the bound out (the join window's immediate 503,
+/// a refusal), so no GET of the node's is left running.
+pub const STILL_FETCHING_AFTER_MS: f64 = NODE_WEB_BOUND_MS - RTO_FLOOR_MS;
+/// WHEN A SOURCE WHOSE NODE IS STILL FETCHING IS ASKED AGAIN (main's re-rule of sdk#447, after batch 4's realnet):
+/// each wait counts from that source's LAST slow answer, the n-th wait the n-th entry, the last repeating. The first is
+/// one RTO floor: a re-ask of a node that has meanwhile FINISHED reads its local store and answers at once (it looks
+/// there before it routes), so the piece is taken the moment the node has it, not up to B later. While the node is
+/// still fetching, that re-ask costs one duplicate node GET, and the waits then double from the web bound up to B, so
+/// the duplicates over one B are few (three) rather than one per RTO. The page can't ask the node's store directly at
+/// this point: the loader races its bundles before the SDK's wasm, its session and its signer exist.
+pub fn still_fetching_reask_ms() -> Vec<f64> {
+    let mut waits = vec![RTO_FLOOR_MS];
+    let mut w = NODE_WEB_BOUND_MS;
+    while w < NODE_GET_BOUND_MS {
+        waits.push(w);
+        w *= 2.0;
+    }
+    waits.push(NODE_GET_BOUND_MS);
+    waits
+}
 /// Block GETs in flight to start with.
 pub const WINDOW_INITIAL: f64 = 4.0;
 /// Block GETs the window always allows (sdk#345): one silent block never

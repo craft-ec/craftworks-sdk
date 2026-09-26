@@ -15,7 +15,7 @@
 // to the name (a MISMATCH, refused by name), or a person cancelling
 // (`signal`).
 
-import { RTO_SCHEDULE_MS, WINDOW_AFTER_ANSWERS } from "./rto.js";
+import { RTO_SCHEDULE_MS, STILL_FETCHING_AFTER_MS, STILL_FETCHING_REASK_MS, WINDOW_AFTER_ANSWERS } from "./rto.js";
 import { COARSEN_BANDS, COARSEN_LAST_GRAIN, EVENT, HTTP_CLASSES, KEY, OUTCOME, SITE, STATUS, STRIDE } from "./instrument-vocab.js";
 
 /** A time, coarsened by the recording vocabulary's own rule (generated from craftworks-instrument's bands). */
@@ -186,6 +186,16 @@ export async function served(
   const sources = urls ?? (url ? [url] : []);
   if (sources.length === 0) throw new Error(`${label} has no url to fetch it from`);
   const started = now();
+  // THE NODE IS STILL FETCHING IT (sdk#447; main's re-rule after batch 4's realnet): a non-200 that took the node's
+  // web bound (its 503 at ~30 s) leaves the node's GET RUNNING, and asking again starts ANOTHER network GET of the same
+  // key beside it (the node shares none: the stall review, V20's four concurrent streams). So such a source is not
+  // re-asked on the RTO: after its n-th slow answer it waits `STILL_FETCHING_REASK_MS[n]` (the last repeating). The
+  // first wait is one RTO floor, because a node that has FINISHED answers a re-ask from its own store at once, and a
+  // hold of B took a piece the node already had up to B late (V at "still fetching (49 s)"). The waits then double up
+  // to B, so a node truly still fetching gets few duplicates. A FAST non-200 (a node still joining, a refusal) left no
+  // GET running: re-asked on the RTO as before. One classification: builder#153's waiting page takes it from here.
+  const heldUntil = new Map();
+  const slowAnswers = new Map();
   for (let round = 0; ; round += 1) {
     // Every failure is kept, so a wait can say what each source actually did.
     const failures = [];
@@ -194,6 +204,13 @@ export async function served(
     const statuses = [];
     let answered = 0;
     for (const from of sources) {
+      const hold = heldUntil.get(from);
+      if (hold !== undefined && now() < hold) {
+        failures.push(`${from}: the node is still fetching it`);
+        continue;
+      }
+      heldUntil.delete(from);
+      const sentAt = now();
       let res;
       // THE ONE SITE of the loader's recording: every request this fetch makes, and its end.
       const asked = rec?.asked(round);
@@ -209,6 +226,13 @@ export async function served(
         // NOT AN ANSWER about the file: the node does not hold it yet.
         failures.push(`${from}: ${res.status}`);
         statuses.push(res.status);
+        if (now() - sentAt >= STILL_FETCHING_AFTER_MS) {
+          const n = slowAnswers.get(from) ?? 0;
+          slowAnswers.set(from, n + 1);
+          heldUntil.set(from, now() + STILL_FETCHING_REASK_MS[Math.min(n, STILL_FETCHING_REASK_MS.length - 1)]);
+        } else {
+          slowAnswers.delete(from);
+        }
         continue;
       }
       // `fetch` resolves on the HEADERS; the body can still fail, and that is
@@ -235,13 +259,21 @@ export async function served(
     if (signal?.aborted) {
       throw new Error(`${label}: cancelled after ${Math.round(waitedMs / 1000)} s unanswered:\n  ${what}`);
     }
-    const nextMs = RTO_SCHEDULE_MS[Math.min(round, RTO_SCHEDULE_MS.length - 1)];
+    // The wait still TICKS on the RTO while every source is held (main's (B)): `onWait` keeps counting the seconds
+    // unanswered, and the next ask is never later than the earliest hold's end.
+    const holds = sources.map(s => heldUntil.get(s)).filter(h => h !== undefined && h > now());
+    const stillFetching = holds.length === sources.length;
+    const rto = RTO_SCHEDULE_MS[Math.min(round, RTO_SCHEDULE_MS.length - 1)];
+    const nextMs = stillFetching ? Math.min(rto, Math.min(...holds) - now()) : rto;
     onWait?.({
       waitedMs,
       nextMs,
       failures,
       statuses,
-      says: `loading the app… not available on this node yet (${Math.round(waitedMs / 1000)} s)`,
+      stillFetching,
+      says: stillFetching
+        ? `loading the app… the node is still fetching it (${Math.round(waitedMs / 1000)} s)`
+        : `loading the app… not available on this node yet (${Math.round(waitedMs / 1000)} s)`,
     });
     await sleep(nextMs, signal);
     if (signal?.aborted) {
