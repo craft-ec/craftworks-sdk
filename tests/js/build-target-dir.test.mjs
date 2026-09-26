@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import { childEnv } from "./common/child-env.mjs";
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -45,9 +46,9 @@ await t("THE CONTROL: a hard-coded target/ path, and an unset CARGO_TARGET_DIR, 
 });
 
 await t("**tools/target-dir.sh answers CARGO_TARGET_DIR when it is set, and the workspace's own target when not**", async () => {
-  const set = execFileSync(join(root, "tools/target-dir.sh"), { encoding: "utf8", env: { ...process.env, CARGO_TARGET_DIR: "/tmp/somewhere-else" } }).trim();
+  const set = execFileSync(join(root, "tools/target-dir.sh"), { encoding: "utf8", env: childEnv({ CARGO_TARGET_DIR: "/tmp/somewhere-else" }) }).trim();
   assert.equal(set, "/tmp/somewhere-else");
-  const env = { ...process.env };
+  const env = childEnv();
   delete env.CARGO_TARGET_DIR;
   const unset = execFileSync(join(root, "tools/target-dir.sh"), { encoding: "utf8", env }).trim();
   assert.equal(unset, join(root, "target").replace(/\/$/, ""));

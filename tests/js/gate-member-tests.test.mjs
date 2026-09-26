@@ -7,6 +7,7 @@ import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { childEnv } from "./common/child-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const helper = process.env.GATE_MEMBER_TESTS_UNDER_TEST ?? join(root, "tools", "gate-member-tests.sh");
@@ -23,7 +24,7 @@ const stub = (body, rc) => {
   chmodSync(join(bin, "cargo"), 0o755);
   return bin;
 };
-const run = (bin, dir) => spawnSync("/bin/bash", [helper, "page", dir], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:/usr/bin:/bin` } });
+const run = (bin, dir) => spawnSync("/bin/bash", [helper, "page", dir], { encoding: "utf8", env: childEnv({ PATH: `${bin}:/usr/bin:/bin` }) });
 
 t("**a failing member: its WHOLE output is kept in a file the gate names, the count and cargo's status are kept**", () => {
   const marker = "MARKER-a3f9 left == right failed: the panic text a rerun would lose";

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ownerOf, parseOwners } from "../../tools/owners.mjs";
+import { childEnv } from "./common/child-env.mjs";
 
 const CHECK = fileURLToPath(new URL("../../tools/owners.mjs", import.meta.url));
 let failures = 0;
@@ -30,7 +31,7 @@ function repo() {
   return { root, change, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 const check = root => {
-  try { return { code: 0, out: execFileSync("node", [CHECK, "--root", root, "--base", "base"], { encoding: "utf8", env: { ...process.env, PR_BODY: "" } }) }; }
+  try { return { code: 0, out: execFileSync("node", [CHECK, "--root", root, "--base", "base"], { encoding: "utf8", env: childEnv({ PR_BODY: "" }) }) }; }
   catch (e) { return { code: e.status, out: String(e.stdout) }; }
 };
 
@@ -90,7 +91,7 @@ await t("run from a COPY in a temp dir, it still RUNS (never a silent exit 0)", 
   change("engine/a.rs", "engine");
   change("signer/b.rs", "and the signer");
   let r;
-  try { r = { code: 0, out: execFileSync("node", [join(dir, "owners.mjs"), "--root", root, "--base", "base"], { encoding: "utf8", env: { ...process.env, PR_BODY: "" } }) }; }
+  try { r = { code: 0, out: execFileSync("node", [join(dir, "owners.mjs"), "--root", root, "--base", "base"], { encoding: "utf8", env: childEnv({ PR_BODY: "" }) }) }; }
   catch (e) { r = { code: e.status, out: String(e.stdout) }; }
   done(); rmSync(dir, { recursive: true, force: true });
   assert.equal(r.code, 1, `the copied check did not run: exit ${r.code}\n${r.out}`);

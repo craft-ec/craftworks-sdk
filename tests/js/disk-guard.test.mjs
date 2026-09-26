@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { childEnv } from "./common/child-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const guard = process.env.DISK_GUARD_UNDER_TEST ?? join(root, "scripts", "disk-guard.sh");
@@ -26,7 +27,7 @@ writeFileSync(join(fx, "jobs", "bbbb2222", "state.json"), JSON.stringify({ name:
 put(join(fx, "ws", "some-repo", "target"), 3072);             // the largest: a repo's target/
 put(join(fx, "ws", "other-repo", ".claude", "worktrees"), 512);
 put(join(fx, "caches", "craftworks-sdk-x"), 2048);
-const env = extra => ({ ...process.env, DISK_GUARD_JOBS: join(fx, "jobs"), DISK_GUARD_WORKSPACE: join(fx, "ws"), DISK_GUARD_CACHES: join(fx, "caches"), ...extra });
+const env = extra => childEnv({ DISK_GUARD_JOBS: join(fx, "jobs"), DISK_GUARD_WORKSPACE: join(fx, "ws"), DISK_GUARD_CACHES: join(fx, "caches"), ...extra });
 const run = (args, extra) => spawnSync("/bin/bash", [guard, ...args], { encoding: "utf8", env: env(extra) });
 const freeGb = Math.floor(Number(execFileSync("/bin/sh", ["-c", `df -Pk "${homedir()}" | awk 'NR == 2 { print $4 }'`], { encoding: "utf8" })) / 1048576);
 const above = String(freeGb + 1000);

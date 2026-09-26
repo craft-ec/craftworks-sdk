@@ -8,6 +8,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { childEnv } from "./common/child-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const tool = join(root, "tools", "contracts-released.mjs");
@@ -32,7 +33,7 @@ function checkout(built, { table = true, siteIn2 = true, upTo = 2 } = {}) {
   if (table) writeFileSync(join(d, "released.toml"), `# header\n\n${rows.slice(0, upTo).join("")}`);
   return d;
 }
-const run = (dir, env = {}, need = 2) => spawnSync(process.execPath, [tool, dir, String(need), ...NAMES], { encoding: "utf8", env: { ...process.env, CRAFTWORKS_CONTRACTS_UNRELEASED: "", ...env } });
+const run = (dir, env = {}, need = 2) => spawnSync(process.execPath, [tool, dir, String(need), ...NAMES], { encoding: "utf8", env: childEnv({ CRAFTWORKS_CONTRACTS_UNRELEASED: "", ...env }) });
 
 t("**THE INCIDENT: a checkout BEHIND the release is REFUSED** -- its table ends at epoch 2, its build IS epoch 2's released code, and this SDK needs epoch 3 (the architect, sdk#388: \"the latest epoch of that table\" passed it). Mutant \"latest epoch\" -> red", () => {
   const d = checkout({ block: 2, register: 2, webapp: 2, site: 2 }, { upTo: 2 });
