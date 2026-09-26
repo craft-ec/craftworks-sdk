@@ -45,7 +45,8 @@
 //! nobody here uses, at the cost of a vocabulary this codebase does not own).
 
 use crate::hex;
-use freenet_prolly::{kind, Cid};
+use core_types::kind::BlockKind;
+use freenet_prolly::Cid;
 use std::fmt;
 use std::str::FromStr;
 
@@ -102,19 +103,21 @@ impl std::error::Error for IdError {}
 /// Kinds come from `freenet_prolly::kind`, so the vocabulary is the substrate's
 /// and not a second list that can drift from it.
 pub fn tag_of(kind: u8) -> Option<&'static str> {
+    tag(BlockKind::of_byte(kind)?)
+}
+
+/// The tag a kind is NAMED by in a public id, or `None` for a kind no public id names. EXHAUSTIVE over the one list
+/// of kinds (core_types::kind): a new kind does not compile until it is decided here whether ids name it.
+fn tag(kind: BlockKind) -> Option<&'static str> {
     match kind {
-        kind::RAW => Some("raw"),
-        kind::TREE_NODE => Some("node"),
-        _ => None,
+        BlockKind::Raw => Some("raw"),
+        BlockKind::TreeNode => Some("node"),
+        BlockKind::Parity | BlockKind::Pack => None,
     }
 }
 
-fn kind_of(tag: &str) -> Option<u8> {
-    match tag {
-        "raw" => Some(kind::RAW),
-        "node" => Some(kind::TREE_NODE),
-        _ => None,
-    }
+fn kind_of(tag_text: &str) -> Option<u8> {
+    BlockKind::ALL.into_iter().find(|k| tag(*k) == Some(tag_text)).map(BlockKind::byte)
 }
 
 /// `<tag>:<64 hex>` split into its parts, with the shape checked once for both
@@ -153,12 +156,12 @@ impl BlockId {
 
     /// The id of a block of opaque bytes — what an app's own bytes become.
     pub fn raw(body: &[u8]) -> Self {
-        Self::of(kind::RAW, body)
+        Self::of(BlockKind::Raw.byte(), body)
     }
 
     /// The id of a tree-node block.
     pub fn node(body: &[u8]) -> Self {
-        Self::of(kind::TREE_NODE, body)
+        Self::of(BlockKind::TreeNode.byte(), body)
     }
 
     /// An id whose bytes are already known — a root the tree handed back, an id

@@ -4089,6 +4089,31 @@ mod node_get_silent {
         ops.iter().filter(|o| **o == Op::Get { id }).count()
     }
 
+    /// **A PARITY block a GET brings is KEPT, and its GET ends** (`matches_id` reads the one list of kinds, parity
+    /// in it; engineer2's test): a race get or a repair GETs a group's parity, and a check that knew no parity took
+    /// the answer for a miss -- not kept, the GET parked. CONTROL: bytes that are not the id are still a miss (parked,
+    /// the GET waits: that cell is the OP-LIFE table's, unchanged here). Mutant "PARITY missing from the list" -> red.
+    #[test]
+    fn a_parity_block_a_get_brings_is_kept_and_not_asked_again() {
+        let mut p = page();
+        let bytes = vec![3u8; 40];
+        let id = block_id(kind::PARITY, &bytes);
+        get(&mut p, id);
+        assert_eq!(gets_of(&p.take_ops(), id), 1, "THE SETUP: the GET did not go out");
+        p.answer(Answer::Got { id, bytes: bytes.clone() }, Ms(T0 + 5));
+        assert_eq!(p.blocks.get(&id), Some(&bytes[..]), "the parity block was not kept");
+        assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "the parity GET still waits (taken for a miss)");
+
+        // CONTROL: bytes that are not the id -> a miss, parked.
+        let mut p = page();
+        let other = block_id(kind::PARITY, &[4u8; 40]);
+        get(&mut p, other);
+        let _ = p.take_ops();
+        p.answer(Answer::Got { id: other, bytes: bytes.clone() }, Ms(T0 + 5));
+        assert!(p.blocks.get(&other).is_none(), "THE CONTROL: bytes that are not the id were kept");
+        assert!(p.deadlines.contains_key(&Waiting::Get(other)), "THE CONTROL: a wrong answer ended the GET");
+    }
+
     /// Tick to the GET's deadline: it goes SILENT.
     fn silence(p: &mut Page, id: Cid) {
         let at = p.deadlines[&Waiting::Get(id)].at;

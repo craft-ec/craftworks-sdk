@@ -5,4 +5,5 @@
 //! a fact at least two crates need.
 
 pub mod hex;
+pub mod kind;
 pub mod name;

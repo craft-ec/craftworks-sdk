@@ -18,7 +18,7 @@ use freenet_prolly::node::Value;
 use freenet_prolly::range::{range_with, Options as RangeOptions, PageEnd, Range, RangeError};
 use freenet_prolly::read::get;
 use freenet_prolly::store::{Blocks, ReadError};
-use freenet_prolly::{block_id, kind, Cid};
+use freenet_prolly::{block_id, Cid};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A client's own id for a read, echoed in its reply.
@@ -297,16 +297,20 @@ pub(crate) struct Reads {
     pub fetches: usize,
 }
 
-/// Does this block's content match the id it was fetched under?
+/// Does this block's content match the id it was fetched under -- under ANY kind a block can be
+/// ([`BlockKind::ALL`](core_types::kind::BlockKind::ALL), the one list)?
 ///
-/// Checked BEFORE it touches the warm tree, against both kinds it could
-/// legitimately be. A block that fails this is not cached and not parsed: a
-/// content-addressed store whose contents are not their addresses is a store
-/// where one bad answer poisons every later read of the same key.
+/// Checked BEFORE it touches the warm tree. A block that fails this is not cached and not parsed: a
+/// content-addressed store whose contents are not their addresses is a store where one bad answer poisons every
+/// later read of the same key. It listed three kinds by hand and missed PARITY, so a fetched parity block was
+/// judged "not its id" and never kept; the list is no longer written here.
 pub fn matches_id(id: &Cid, bytes: &[u8]) -> bool {
-    block_id(kind::TREE_NODE, bytes) == *id
-        || block_id(kind::RAW, bytes) == *id
-        || block_id(crate::pack::PACK_KIND, bytes) == *id
+    kind_of(id, bytes).is_some()
+}
+
+/// The kind under which `bytes` ARE the block `id`, or `None` when they are not it under any kind.
+pub fn kind_of(id: &Cid, bytes: &[u8]) -> Option<core_types::kind::BlockKind> {
+    core_types::kind::BlockKind::ALL.into_iter().find(|k| block_id(k.byte(), bytes) == *id)
 }
 
 impl Reads {
@@ -601,5 +605,26 @@ fn count_nodes<B: Blocks>(blocks: &B, root: &Cid, key: &[u8], out: &mut usize) {
             Err(i) => i - 1,
         };
         cur = node.child(i).0;
+    }
+}
+
+#[cfg(test)]
+mod matches_id_tests {
+    use super::*;
+    use core_types::kind::BlockKind;
+
+    /// **EVERY kind matches its own id** -- a PARITY block included (a race get, a repair and the audit all GET
+    /// parity; the hand-written list missed it) -- and the kind it is found under is its own. CONTROL: no kind lets
+    /// bytes pass under ANOTHER block's id. Mutant "a kind missing from BlockKind::ALL" -> red.
+    #[test]
+    fn every_kind_matches_its_own_id_and_no_other() {
+        let bytes = vec![7u8; 64];
+        for k in BlockKind::ALL {
+            let id = block_id(k.byte(), &bytes);
+            assert!(matches_id(&id, &bytes), "a {k:?} block did not match its own id");
+            assert_eq!(kind_of(&id, &bytes), Some(k), "a {k:?} block was found under another kind");
+            let other = block_id(k.byte(), &[9u8; 64]);
+            assert!(!matches_id(&other, &bytes), "bytes matched another {k:?} block's id");
+        }
     }
 }
