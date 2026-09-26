@@ -131,13 +131,19 @@ const EPOCH: Epoch = Epoch(1);
 /// An LRU needs the engine to stop holding borrows across calls (a follow-up,
 /// not this PR).
 #[derive(Clone, Default)]
-pub struct PageBlocks(Rc<elsa::FrozenBTreeMap<Cid, Box<[u8]>>>);
+pub struct PageBlocks(Rc<elsa::FrozenBTreeMap<Cid, Box<[u8]>>>, Rc<std::cell::Cell<usize>>);
 
 impl PageBlocks {
     fn insert(&self, id: Cid, bytes: &[u8]) {
         if self.0.get(&id).is_none() {
             self.0.insert(id, bytes.to_vec().into_boxed_slice());
+            self.1.set(self.1.get() + bytes.len());
         }
+    }
+
+    /// The bytes held: what a tree's block budget is judged by.
+    pub fn bytes(&self) -> usize {
+        self.1.get()
     }
 
     pub fn len(&self) -> usize {
@@ -260,13 +266,16 @@ pub enum Ext {
 
 /// What a waiting request is, in words a page can show.
 fn waiting_name(w: &Waiting) -> String {
+    if w.tree() == Some(Tree::Obs) {
+        return "the diagnostics record".into();
+    }
     match w {
-        Waiting::Put(_) => "a block's save".into(),
-        Waiting::Held(_) => "a block check".into(),
-        Waiting::Get(_) => "a block read".into(),
-        Waiting::Sign(Label::Head) => "the signer".into(),
-        Waiting::Update(Label::Head) => "the head's update".into(),
-        Waiting::Warm | Waiting::RecoverHead | Waiting::Verify | Waiting::ReadBack(Label::Head) | Waiting::Hint => "the head read".into(),
+        Waiting::Put(..) => "a block's save".into(),
+        Waiting::Held(..) => "a block check".into(),
+        Waiting::Get(..) => "a block read".into(),
+        Waiting::Sign(Label::Head | Label::Obs) => "the signer".into(),
+        Waiting::Update(Label::Head | Label::Obs) => "the head's update".into(),
+        Waiting::Warm(_) | Waiting::RecoverHead(_) | Waiting::Verify(_) | Waiting::ReadBack(Label::Head | Label::Obs) | Waiting::Hint(_) => "the head read".into(),
         Waiting::Sign(Label::Site(app)) => format!("the signer (site {app})"),
         Waiting::Update(Label::Site(app)) => format!("site {app}'s publication"),
         Waiting::ReadBack(Label::Site(app)) => format!("site {app}'s read"),
@@ -326,17 +335,34 @@ enum End {
 /// The recording's SITE for an op: its kind, a compile-time name, and nothing of what it is about.
 fn op_site(w: &Waiting) -> instrument::Site {
     use instrument::Site;
+    // THE OBSERVATION TREE's ops are recorded under their OWN sites (OBSERVABILITY §3: "its own ops are recorded under
+    // their own Site"), so a recording never reads an observation write as the person's data traffic.
+    if w.tree() == Some(Tree::Obs) {
+        return match w {
+            Waiting::Put(..) => Site::of("page::obs::put"),
+            Waiting::Held(..) => Site::of("page::obs::held"),
+            Waiting::Get(..) => Site::of("page::obs::get"),
+            Waiting::Sign(_) => Site::of("page::obs::sign"),
+            Waiting::Update(_) => Site::of("page::obs::update"),
+            Waiting::Warm(_) => Site::of("page::obs::warm"),
+            Waiting::RecoverHead(_) => Site::of("page::obs::recover-head"),
+            Waiting::Verify(_) => Site::of("page::obs::verify"),
+            Waiting::ReadBack(_) => Site::of("page::obs::read-back"),
+            Waiting::Hint(_) => Site::of("page::obs::hint"),
+            Waiting::PutApp(_) | Waiting::Ext(_) => unreachable!("not a tree's op"),
+        };
+    }
     match w {
-        Waiting::Put(_) => Site::of("page::op::put"),
-        Waiting::Held(_) => Site::of("page::op::held"),
-        Waiting::Get(_) => Site::of("page::op::get"),
+        Waiting::Put(..) => Site::of("page::op::put"),
+        Waiting::Held(..) => Site::of("page::op::held"),
+        Waiting::Get(..) => Site::of("page::op::get"),
         Waiting::Sign(_) => Site::of("page::op::sign"),
         Waiting::Update(_) => Site::of("page::op::update"),
-        Waiting::Warm => Site::of("page::op::warm"),
-        Waiting::RecoverHead => Site::of("page::op::recover-head"),
-        Waiting::Verify => Site::of("page::op::verify"),
+        Waiting::Warm(_) => Site::of("page::op::warm"),
+        Waiting::RecoverHead(_) => Site::of("page::op::recover-head"),
+        Waiting::Verify(_) => Site::of("page::op::verify"),
         Waiting::ReadBack(_) => Site::of("page::op::read-back"),
-        Waiting::Hint => Site::of("page::op::hint"),
+        Waiting::Hint(_) => Site::of("page::op::hint"),
         Waiting::PutApp(_) => Site::of("page::op::put-app"),
         Waiting::Ext(_) => Site::of("page::op::ext"),
     }
@@ -345,25 +371,25 @@ fn op_site(w: &Waiting) -> instrument::Site {
 /// Which op a deadline is for.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Waiting {
-    Put(Cid),
-    Held(Cid),
-    Get(Cid),
+    Put(Tree, Cid),
+    Held(Tree, Cid),
+    Get(Tree, Cid),
     Sign(Label),
     Update(Label),
     /// A register read whose answer nobody judges: it only makes the node
     /// hold the register, so the signer's synchronous read can see a head
     /// (`Refused(HeadUnknown)`).
-    Warm,
+    Warm(Tree),
     /// The engine's own head read (recovery, `Effect::ReadHead`).
-    RecoverHead,
+    RecoverHead(Tree),
     /// A register read that decides what a `NotNext` means (invariant 1b).
-    Verify,
+    Verify(Tree),
     /// The read-back after an UPDATE (a site's: also its first read, before it signs).
     ReadBack(Label),
     /// A register read on the node's `HeadChanged` hint, or the idle
     /// backstop ([`HEAD_BACKSTOP_MS`]): is there a head this page has not
     /// adopted?
-    Hint,
+    Hint(Tree),
     /// An app's PUT of this contract key ([`Op::PutApp`]).
     PutApp(String),
     /// A page-io request ([`Op::Ext`]).
@@ -377,6 +403,50 @@ enum Waiting {
 pub enum Label {
     Head,
     Site(String),
+    /// The person's OBSERVATION tree's head (sdk#399, OBSERVABILITY §1): a second engine's head, published by the
+    /// same read, sign, write, read-back and land as [`Label::Head`].
+    Obs,
+}
+
+impl Label {
+    /// The TREE whose head this label publishes, or `None` for a site (a single signed value, no engine).
+    pub fn tree(&self) -> Option<Tree> {
+        match self {
+            Label::Head => Some(Tree::Data),
+            Label::Obs => Some(Tree::Obs),
+            Label::Site(_) => None,
+        }
+    }
+}
+
+/// WHICH TREE (sdk#399 step 4): the person's DATA tree, or their OBSERVATION tree. Each is its own engine, blocks and
+/// head ([`TreeState`]); every wait of a tree's op names its tree, so an answer is the right tree's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tree {
+    Data,
+    Obs,
+}
+
+impl Tree {
+    /// The label its head is published under.
+    pub fn label(self) -> Label {
+        match self {
+            Tree::Data => Label::Head,
+            Tree::Obs => Label::Obs,
+        }
+    }
+}
+
+impl Waiting {
+    /// The tree this wait belongs to (`None`: a site's, an app PUT, a page-io request).
+    fn tree(&self) -> Option<Tree> {
+        match self {
+            Waiting::Put(t, _) | Waiting::Held(t, _) | Waiting::Get(t, _) => Some(*t),
+            Waiting::Warm(t) | Waiting::RecoverHead(t) | Waiting::Verify(t) | Waiting::Hint(t) => Some(*t),
+            Waiting::Sign(l) | Waiting::Update(l) | Waiting::ReadBack(l) => l.tree(),
+            Waiting::PutApp(_) | Waiting::Ext(_) => None,
+        }
+    }
 }
 
 /// One label's publication in flight: what it owes, its sign in flight, and its sign's backoff.
@@ -569,20 +639,16 @@ pub fn beats(a: &[u8], b: &[u8]) -> bool {
     blake3::hash(a).as_bytes() < blake3::hash(b).as_bytes()
 }
 
-/// One page's writes: the engine, the executor state, and what to send.
-pub struct Page {
-    path: PutPath,
-    /// This page's id in heads' `through` (COMMIT-LIFE ⁵): set once, from
-    /// its first session; zeros until then.
-    device: [u8; 16],
-    /// Hold the engine's cut when a head displaces this page's published one
-    /// at the SAME seq (review §1 on sdk#295): the Server may merge the
-    /// displaced group, which must go at the front. Only a Server that
-    /// releases the hold sets this.
-    hold_on_displace: bool,
-    /// The next signer request id this page issues: from 1, as `0` is
-    /// `signer_proto::UNATTRIBUTED`.
-    next_request: u32,
+/// ONE TREE's state (sdk#399 step 4): the engine that owns it, the page's memory of its blocks, and every fact of its
+/// HEAD's publication -- read, sign, write, read back, land. The data tree has one; the observation tree has its own,
+/// so nothing of one tree's head can be read as the other's.
+struct TreeState {
+    /// The page FOLLOWS this tree's register (its reads subscribe; a hint or a push says it moved; an idle page reads
+    /// it at the backstop): the data tree. The observation tree is not followed -- a newer head there is learned from
+    /// the signer's `NotNext` when this page next commits -- so it has no backstop read and no reconnect read.
+    follows: bool,
+    /// Repair PUTs the node's Block contract rejected (sdk#433): dropped, counted.
+    repairs_rejected: u64,
     engine: Engine<PageBlocks>,
     blocks: PageBlocks,
     /// Blocks whose PUT was answered ok (an effect's `after` is judged here).
@@ -594,10 +660,6 @@ pub struct Page {
     /// something else, a superseded ask included), and a retryable refusal's
     /// backoff. The SAME type, and the same functions, as each site's.
     head: Pub,
-    /// Each SITE's publication in flight, by app id (builder#117).
-    sites: BTreeMap<String, Pub>,
-    /// How each site's publication ended, or that it has not: the one owner.
-    publications: BTreeMap<String, Publication>,
     /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
@@ -607,8 +669,6 @@ pub struct Page {
     /// Landings started, and the most UPDATEs one landing needed.
     landings: u32,
     most_landing_updates: u32,
-    /// Repair PUTs the node's Block contract rejected (sdk#433): dropped, counted.
-    repairs_rejected: u64,
     /// An OLD signer refused on a same-seq record while this page already
     /// stood on the register's head at that seq: the sign waits until a head
     /// read shows the register past it (sdk#225's S1b).
@@ -626,6 +686,64 @@ pub struct Page {
     /// Blocks rebuilt from their group and PUT back (sdk#303): sent like a commit's PUT, but answered for NO
     /// commit -- an answer confirms nothing a commit or a head waits on. Left when a commit puts the same block.
     repair_puts: BTreeSet<Cid>,
+    /// The engine's own head read has been ANSWERED (a head, or certainly
+    /// none): until then its tree is the empty one it started on, and a read
+    /// answered from it would say "empty" about data that exists.
+    recovered: bool,
+    /// Has the engine been told its head (`HeadRead` / `HeadMissing`)?
+    engine_has_head: bool,
+    /// Every record the signer returned — invariant 2's evidence.
+    signer_records: BTreeSet<Vec<u8>>,
+}
+
+impl TreeState {
+    /// A tree with a fresh engine over its own, empty blocks: not started, no head read.
+    fn new(params: Params, follows: bool) -> TreeState {
+        let blocks = PageBlocks::default();
+        let engine = Engine::new(params, blocks.clone());
+        TreeState {
+            follows,
+            engine,
+            blocks,
+            confirmed: BTreeSet::new(),
+            held: Vec::new(),
+            head: Pub::default(),
+            held_again: BTreeMap::new(),
+            verify: None,
+            landings: 0,
+            most_landing_updates: 0,
+            old_signer_fork_at: None,
+            my_records: BTreeMap::new(),
+            last_head_at: 0,
+            last_head: None,
+            put_again: BTreeMap::new(),
+            repair_puts: BTreeSet::new(),
+            recovered: false,
+            engine_has_head: false,
+            signer_records: BTreeSet::new(),
+            repairs_rejected: 0,
+        }
+    }
+}
+
+/// One page's writes: the engine, the executor state, and what to send.
+pub struct Page {
+    path: PutPath,
+    /// This page's id in heads' `through` (COMMIT-LIFE ⁵): set once, from
+    /// its first session; zeros until then.
+    device: [u8; 16],
+    /// Hold the engine's cut when a head displaces this page's published one
+    /// at the SAME seq (review §1 on sdk#295): the Server may merge the
+    /// displaced group, which must go at the front. Only a Server that
+    /// releases the hold sets this.
+    hold_on_displace: bool,
+    /// The next signer request id this page issues: from 1, as `0` is
+    /// `signer_proto::UNATTRIBUTED`.
+    next_request: u32,
+    /// Each SITE's publication in flight, by app id (builder#117).
+    sites: BTreeMap<String, Pub>,
+    /// How each site's publication ended, or that it has not: the one owner.
+    publications: BTreeMap<String, Publication>,
     /// Deadlines of the ops in flight, and each op to re-send.
     /// Every op in flight: when it is due again, the op to re-send, when it
     /// went out and on which attempt (Karn: only an attempt-1 answer samples).
@@ -637,18 +755,12 @@ pub struct Page {
     rto: rto::Rto,
     window: rto::Window,
     /// GETs waiting for a place in the window, in the order asked.
-    get_queue: std::collections::VecDeque<Cid>,
+    get_queue: std::collections::VecDeque<(Tree, Cid)>,
     /// The attempt a re-send continues from (set when an op times out).
     attempt_of: BTreeMap<Waiting, u32>,
     /// When each op still unanswered was FIRST sent: what "not answering for
     /// N s" counts from. Never a deadline (rule 8).
     first_of: BTreeMap<Waiting, u64>,
-    /// The engine's own head read has been ANSWERED (a head, or certainly
-    /// none): until then its tree is the empty one it started on, and a read
-    /// answered from it would say "empty" about data that exists.
-    recovered: bool,
-    /// Has the engine been told its head (`HeadRead` / `HeadMissing`)?
-    engine_has_head: bool,
     out: Vec<Op>,
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
@@ -690,8 +802,34 @@ pub struct Page {
     rec_from: u32,
     /// The send order outran what a label carries, and the recording was told (once).
     rec_overflowed: std::cell::Cell<bool>,
-    /// Every record the signer returned — invariant 2's evidence.
-    signer_records: BTreeSet<Vec<u8>>,
+    /// THE PERSON'S DATA TREE: its engine, its blocks and its head's publication, all in ONE [`TreeState`]
+    /// (sdk#399 step 4, the architect: every per-head field under the tree, never parallel fields).
+    data: TreeState,
+    /// The engine's parameters: what a tree's engine is made with (the observation tree's, when it opens).
+    params: Params,
+    /// THE PERSON'S OBSERVATION TREE (sdk#399 step 4): its own engine, its OWN blocks (an observation never evicts a
+    /// data block, the architect) and its own head. `None` until the page is given one.
+    obs: Option<TreeState>,
+    /// THE SITE THIS PAGE WAS SERVED FROM (sdk#399 step 4): the detail records' app. The ONLY input to the
+    /// observation tree -- `None` (a dev build, a test page): no observation tree, the recording stays local.
+    obs_site: Option<[u8; 32]>,
+    /// The minute of the observation window now open (unix minutes), once the page has an observation tree.
+    obs_minute: Option<u64>,
+    /// Closed windows' records waiting for a save to ride (at most [`obs::PENDING_MAX`]).
+    obs_pending: std::collections::VecDeque<obs::Pending>,
+    /// Events lost with dropped records, counted into the next record ([`instrument::publish::Window::lost_before`]).
+    obs_lost: u64,
+    /// When the last observation commit started (W_ride counts from it).
+    last_obs_commit: Option<u64>,
+    /// Has the observation engine been started (its first, cold, head read made)?
+    obs_started: bool,
+    /// The observation tree's ops waiting for its ONE op in flight (OBSERVABILITY §3: a data write arriving
+    /// mid-commit waits behind at most one observation op on the node's one queue).
+    obs_queue: std::collections::VecDeque<(Waiting, Op)>,
+    /// Observation commits started: the write ids of the observation tree's writes.
+    obs_writes: u64,
+    /// The most observation ops ever on the wire at once (its bound is one: a harness reads it).
+    obs_most_on_wire: usize,
 }
 
 impl Page {
@@ -714,7 +852,7 @@ impl Page {
     pub fn start(&mut self) {
         // The key is in the SIGNER's secret store; the engine only states
         // where its authority comes from.
-        self.step(Event::Start { key: KeySource::SecretStore, epochs: vec![EPOCH] });
+        self.step(Tree::Data, Event::Start { key: KeySource::SecretStore, epochs: vec![EPOCH] });
     }
 
     /// A page whose engine has not been STARTED: [`crate::server::Server`]
@@ -725,30 +863,13 @@ impl Page {
     /// their answers as a round trip of ~1.8e12 ms -- an SRTT no later sample could bring down, the RTO pinned at
     /// its 60 s ceiling for the page's life, so a lost PUT waited a minute (V's first save, Phase 4 realnet).
     pub fn unstarted(params: Params, path: PutPath, now: Ms) -> Page {
-        let blocks = PageBlocks::default();
-        let engine = Engine::new(params, blocks.clone());
         Page {
+            params,
             path,
             device: [0; 16],
             hold_on_displace: false,
-            engine,
-            blocks,
-            confirmed: BTreeSet::new(),
-            held: Vec::new(),
-            head: Pub::default(),
             sites: BTreeMap::new(),
             publications: BTreeMap::new(),
-            held_again: BTreeMap::new(),
-            verify: None,
-            landings: 0,
-            most_landing_updates: 0,
-            repairs_rejected: 0,
-            old_signer_fork_at: None,
-            my_records: BTreeMap::new(),
-            last_head_at: 0,
-            last_head: None,
-            put_again: BTreeMap::new(),
-            repair_puts: BTreeSet::new(),
             deadlines: BTreeMap::new(),
             app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -756,8 +877,6 @@ impl Page {
             get_queue: Default::default(),
             attempt_of: BTreeMap::new(),
             first_of: BTreeMap::new(),
-            recovered: false,
-            engine_has_head: false,
             out: Vec::new(),
             client_fx: Vec::new(),
             unusable: Vec::new(),
@@ -772,8 +891,155 @@ impl Page {
             sends: 0,
             rec_from: 1,
             rec_overflowed: std::cell::Cell::new(false),
-            signer_records: BTreeSet::new(),
             next_request: 1,
+            obs: None,
+            obs_site: None,
+            obs_minute: None,
+            obs_pending: Default::default(),
+            obs_lost: 0,
+            last_obs_commit: None,
+            obs_started: false,
+            obs_queue: Default::default(),
+            obs_writes: 0,
+            obs_most_on_wire: 0,
+            data: TreeState::new(params, true),
+        }
+    }
+
+    /// OPEN THE OBSERVATION TREE (sdk#399 step 4): its own engine over its own blocks. Not started here: its first
+    /// head read is a cold lookup of a register maybe never written, so it is made only once a data head has landed
+    /// (never on the data path). Once; a view never has one.
+    pub fn open_obs(&mut self) {
+        if self.obs.is_none() && !self.read_only && self.obs_site.is_some() && self.rec.is_some() {
+            self.obs = Some(TreeState::new(self.params, false));
+        }
+    }
+
+    /// THE OBSERVATION WINDOWS CLOSE ON THE CLOCK (sdk#399 step 4): once the page's minute passes the open window's,
+    /// that window's record is made and kept for a save to ride -- a LOCAL step: no op, no write. Kept at most
+    /// [`obs::PENDING_MAX`]: past it the oldest is dropped, and what it held (a lower bound) goes into the next record.
+    fn close_obs_windows(&mut self) {
+        let Some(site) = self.obs_site.filter(|_| self.obs.is_some()) else { return };
+        let minute = self.now / instrument::publish::WINDOW_MS;
+        match self.obs_minute {
+            None => self.obs_minute = Some(minute),
+            Some(open) if minute > open => {
+                if let Some((key, value)) = self.close_obs_window(&site, open, None) {
+                    if self.obs_pending.len() >= obs::PENDING_MAX {
+                        let dropped = self.obs_pending.pop_front().expect("full");
+                        self.obs_lost = self.obs_lost.saturating_add(dropped.lost_if_dropped());
+                    }
+                    self.obs_pending.push_back(obs::Pending { key, value });
+                }
+                self.obs_minute = Some(minute);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// THE RIDE-ALONG (OBSERVABILITY §3): the DATA head has just landed, so the pending records go as the observation
+    /// tree's own commit -- after the landing, never ahead of it, so it holds no data write's SAVED or BACKED_UP; its
+    /// own engine, groups and race. At most one per [`obs::W_RIDE_MS`], and only while the last is done. Nothing else
+    /// starts one here: a read, a tick or a timer never does.
+    fn ride_along(&mut self) {
+        if self.obs.is_none() || self.obs_pending.is_empty() {
+            return;
+        }
+        if self.last_obs_commit.is_some_and(|at| self.now.saturating_sub(at) < obs::W_RIDE_MS) {
+            return;
+        }
+        let tr = self.tree(Tree::Obs);
+        if tr.engine.committing_seq().is_some() || tr.head.owed.is_some() || tr.engine.unsaved_writes() > 0 {
+            return;
+        }
+        // THE BUDGET: an idle observation tree past its bytes starts over (its next commit re-reads its head).
+        let idle = !self.deadlines.keys().any(|w| w.tree() == Some(Tree::Obs)) && self.obs_queue.is_empty();
+        if idle && tr.blocks.bytes() > obs::BLOCK_BUDGET {
+            self.obs = Some(TreeState::new(self.params, false));
+            self.obs_started = false;
+        }
+        // Its FIRST head read happens now, after a data head landed: a cold lookup of a register maybe never
+        // written (NotFound after the node's GET bound is its genesis), never on the data path.
+        if !std::mem::replace(&mut self.obs_started, true) {
+            self.step(Tree::Obs, Event::Start { key: KeySource::SecretStore, epochs: vec![EPOCH] });
+        }
+        let pending: Vec<obs::Pending> = self.obs_pending.drain(..).collect();
+        let reads = pending.iter().map(|p| (p.key.clone(), engine::Expect::Any)).collect();
+        let ops = pending.into_iter().map(|p| (p.key, WriteOp::Put(p.value))).collect();
+        self.obs_writes += 1;
+        self.last_obs_commit = Some(self.now);
+        self.step(Tree::Obs, Event::Write { client: obs::CLIENT, write_id: WriteId(self.obs_writes), ops, reads, deferred: false });
+    }
+
+    /// The observation tree's next op goes out when none of its ops is on the wire (ONE in flight).
+    fn pump_obs(&mut self) {
+        let on_wire = self.deadlines.iter().any(|(w, d)| d.sent && w.tree() == Some(Tree::Obs));
+        if !on_wire {
+            if let Some((w, op)) = self.obs_queue.pop_front() {
+                self.send(w, op);
+            }
+        }
+    }
+
+    /// THE SITE THIS PAGE WAS SERVED FROM (`page_io::site_id_of_path`): the one input that gives it an observation
+    /// tree ([`Page::open_obs`]). Once.
+    pub fn set_obs_site(&mut self, site: [u8; 32]) {
+        if self.obs_site.is_none() {
+            self.obs_site = Some(site);
+        }
+    }
+
+    /// Records waiting for a save, observation commits started, and the most observation ops ever on the wire at
+    /// once: what a harness reads.
+    pub fn obs_counts(&self) -> (usize, u64, usize) {
+        (self.obs_pending.len(), self.obs_writes, self.obs_most_on_wire)
+    }
+
+    /// The observation tree's published head seq, or `None` with no observation tree.
+    pub fn obs_published(&self) -> Option<u64> {
+        self.obs.as_ref().map(|o| o.engine.published_seq())
+    }
+
+    /// Does this page have an observation tree?
+    pub fn has_obs(&self) -> bool {
+        self.obs.is_some()
+    }
+
+    /// A tree's state. The observation tree's exists once the page has one; an op of it exists only then.
+    fn tree(&self, t: Tree) -> &TreeState {
+        match t {
+            Tree::Data => &self.data,
+            Tree::Obs => self.obs.as_ref().expect("an observation-tree op on a page with no observation tree"),
+        }
+    }
+
+    /// A tree's state, or `None` for an observation tree the page does not have.
+    fn tree_opt(&self, t: Tree) -> Option<&TreeState> {
+        match t {
+            Tree::Data => Some(&self.data),
+            Tree::Obs => self.obs.as_ref(),
+        }
+    }
+
+    fn tree_mut(&mut self, t: Tree) -> &mut TreeState {
+        match t {
+            Tree::Data => &mut self.data,
+            Tree::Obs => self.obs.as_mut().expect("an observation-tree op on a page with no observation tree"),
+        }
+    }
+
+    /// The trees this page has: the data tree, and the observation tree once it has one.
+    fn trees(&self) -> Vec<Tree> {
+        std::iter::once(Tree::Data).chain(self.obs.as_ref().map(|_| Tree::Obs)).collect()
+    }
+
+    /// Which tree waits on block `id` under `wait` (the answer carries the block, never the tree). Blocks never
+    /// overlap between the trees; a block no tree waits on is the data tree's (as every answer was before).
+    fn block_tree(&self, id: Cid, wait: fn(Tree, Cid) -> Waiting) -> Tree {
+        if self.obs.is_some() && (self.deadlines.contains_key(&wait(Tree::Obs, id)) || self.get_queue.contains(&(Tree::Obs, id))) {
+            Tree::Obs
+        } else {
+            Tree::Data
         }
     }
 
@@ -816,7 +1082,7 @@ impl Page {
     /// hold, it ANSWERS: a held write was invisible to the client's outbox,
     /// so nothing re-sent it and nothing reported it.
     fn client_event(&mut self, ev: Event) {
-        self.step(ev);
+        self.step(Tree::Data, ev);
     }
 
     /// The page's clock: the engine's tick, and every op past its deadline
@@ -825,6 +1091,7 @@ impl Page {
         let clock = now;
         let now = now.0;
         self.now = now;
+        self.close_obs_windows();
         let late: Vec<Waiting> =
             self.deadlines.iter().filter(|(_, d)| now >= d.at).map(|(w, _)| w.clone()).collect();
         // RFC 6298 §5.5 — ONCE per tick, however many timed out. A PARKED GET
@@ -836,7 +1103,7 @@ impl Page {
         // Every GET that timed out is LOST; the window decides whether that
         // begins a loss episode (`rto::Window::lost`).
         for w in &late {
-            if let (Waiting::Get(_), Some(d)) = (w, self.deadlines.get(w).filter(|d| d.sent)) {
+            if let (Waiting::Get(..), Some(d)) = (w, self.deadlines.get(w).filter(|d| d.sent)) {
                 self.window.lost(d.sent_at, d.attempt, now);
             }
         }
@@ -844,9 +1111,9 @@ impl Page {
             let d = self.end(&w, End::TimedOut).expect("listed");
             // A parked GET the engine no longer needs, or that the page now
             // holds (a repair rebuilt it), ends here.
-            if let Waiting::Get(id) = w {
-                if !d.sent && (self.blocks.get(&id).is_some() || !self.engine.awaits_block(&id)) {
-                    self.drop_get(id);
+            if let Waiting::Get(t, id) = w {
+                if !d.sent && (self.tree(t).blocks.get(&id).is_some() || !self.tree(t).engine.awaits_block(&id)) {
+                    self.drop_get(t, id);
                     continue;
                 }
             }
@@ -863,22 +1130,26 @@ impl Page {
                 // was removed, and its re-send QUEUES for a place like any
                 // new ask (sdk#345) -- behind the GETs already waiting, and
                 // never outside the window (rule 9: every byte is paced).
-                Waiting::Get(id) => {
-                    if !self.get_queue.contains(&id) {
-                        self.get_queue.push_back(id);
+                Waiting::Get(t, id) => {
+                    if !self.get_queue.contains(&(t, id)) {
+                        self.get_queue.push_back((t, id));
                     }
                 }
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
                 // A landing's request, or this commit's.
-                Waiting::Sign(Label::Head) if self.verify.as_ref().is_some_and(|v| v.landing) => self.ask_land(),
-                Waiting::Sign(Label::Head) => self.ask_sign(),
+                Waiting::Sign(ref l) if l.tree().is_some_and(|t| self.tree(t).verify.as_ref().is_some_and(|v| v.landing)) => {
+                    self.ask_land(l.tree().expect("a tree's"))
+                }
+                Waiting::Sign(ref l) if l.tree().is_some() => self.ask_sign(l.tree().expect("a tree's")),
                 Waiting::PutApp(key) => self.send(Waiting::PutApp(key), op),
                 _ => {
-                    if w == Waiting::Update(Label::Head) {
-                        if let Some(v) = self.verify.as_mut().filter(|v| v.landing) {
-                            v.updates += 1;
-                            self.most_landing_updates = self.most_landing_updates.max(v.updates);
+                    if let Waiting::Update(l) = &w {
+                        if let Some(tr) = l.tree().map(|t| self.tree_mut(t)) {
+                            if let Some(v) = tr.verify.as_mut().filter(|v| v.landing) {
+                                v.updates += 1;
+                                tr.most_landing_updates = tr.most_landing_updates.max(v.updates);
+                            }
                         }
                     }
                     self.send(w, op)
@@ -887,41 +1158,23 @@ impl Page {
         }
         // The lost GETs queued above take free places, in queue order.
         self.fill_gets();
-        for (id, bytes) in std::mem::take(&mut self.put_again) {
-            self.send(Waiting::Put(id), Op::Put { id, bytes });
-        }
-        if self.head.sign_again.is_some_and(|at| now >= at) {
-            self.head.sign_again = None;
-            self.ask_sign();
+        // In the order a data-only page always sent them: each tree's PUTs and sign, the sites' signs, each tree's
+        // register timers, then every stale read-back.
+        for t in self.trees() {
+            self.tick_sends(t, now);
         }
         let due: Vec<String> = self.sites.iter().filter(|(_, p)| p.sign_again.is_some_and(|at| now >= at)).map(|(a, _)| a.clone()).collect();
         for app in due {
             self.pub_mut(&Label::Site(app.clone())).sign_again = None;
             self.ask_sign_for(Label::Site(app));
         }
-        if self.verify.as_ref().is_some_and(|v| v.again_at.is_some_and(|at| now >= at)) {
-            if let Some(v) = self.verify.as_mut() {
-                v.again_at = None;
-            }
-            self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
+        for t in self.trees() {
+            self.tick_register(t, now);
         }
-        // THE BACKSTOP: a hint can be dropped, so an idle page reads the
-        // register at least every HEAD_BACKSTOP_MS.
-        if self.engine_has_head && self.verify.is_none() && !self.reading_head() && now.saturating_sub(self.last_head_at) >= HEAD_BACKSTOP_MS {
-            self.last_head_at = now;
-            self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
-        }
-        // A register that does not answer is asked again on the RTO for as
-        // long as it takes (rules 7, 8) — the engine's own recovery read, and
-        // the read that decides what a `NotNext` means — and `not_answering`
-        // says for how long. Never turned into `HeadMissing` (that would open
-        // an empty tree over a register merely unreachable, sdk#175), and
-        // never given up.
-        let due: Vec<Cid> = self.held_again.iter().filter(|(_, (at, _))| now >= *at).map(|(id, _)| *id).collect();
-        for id in due {
-            self.send(Waiting::Held(id), Op::AskHeld { id });
-        }
-        let stale: Vec<Label> = std::iter::once((Label::Head, &self.head))
+        let trees = self.trees();
+        let stale: Vec<Label> = trees
+            .iter()
+            .map(|t| (t.label(), &self.tree(*t).head))
             .chain(self.sites.iter().map(|(a, p)| (Label::Site(a.clone()), p)))
             .filter(|(l, p)| p.owed.as_ref().is_some_and(|o| o.record.is_some() && o.stale_reads > 0) && !self.deadlines.contains_key(&Waiting::ReadBack(l.clone())))
             .map(|(l, _)| l)
@@ -934,7 +1187,48 @@ impl Page {
         // page's clock is milliseconds; passed through as it was (#215), every
         // engine timer ran a thousand times fast — a put re-asked after 16 ms
         // instead of 16 s.
-        self.step(Event::Tick(engine_seconds(clock)));
+        for t in self.trees() {
+            self.step(t, Event::Tick(engine_seconds(clock)));
+        }
+    }
+
+    /// One tree's sends on the page's tick: its PUTs to repeat and its sign's backoff.
+    fn tick_sends(&mut self, t: Tree, now: u64) {
+        for (id, bytes) in std::mem::take(&mut self.tree_mut(t).put_again) {
+            self.send(Waiting::Put(t, id), Op::Put { id, bytes });
+        }
+        if self.tree(t).head.sign_again.is_some_and(|at| now >= at) {
+            self.tree_mut(t).head.sign_again = None;
+            self.ask_sign(t);
+        }
+    }
+
+    /// One tree's register timers on the page's tick: its pending verify, its idle backstop and its `Held` re-asks.
+    fn tick_register(&mut self, t: Tree, now: u64) {
+        let label = t.label();
+        if self.tree(t).verify.as_ref().is_some_and(|v| v.again_at.is_some_and(|at| now >= at)) {
+            if let Some(v) = self.tree_mut(t).verify.as_mut() {
+                v.again_at = None;
+            }
+            self.send(Waiting::Verify(t), Op::ReadHead { label: label.clone() });
+        }
+        // THE BACKSTOP: a hint can be dropped, so an idle page reads the
+        // register at least every HEAD_BACKSTOP_MS.
+        let tr = self.tree(t);
+        if tr.follows && tr.engine_has_head && tr.verify.is_none() && !self.reading_head(t) && now.saturating_sub(tr.last_head_at) >= HEAD_BACKSTOP_MS {
+            self.tree_mut(t).last_head_at = now;
+            self.send(Waiting::Hint(t), Op::ReadHead { label });
+        }
+        // A register that does not answer is asked again on the RTO for as
+        // long as it takes (rules 7, 8) — the engine's own recovery read, and
+        // the read that decides what a `NotNext` means — and `not_answering`
+        // says for how long. Never turned into `HeadMissing` (that would open
+        // an empty tree over a register merely unreachable, sdk#175), and
+        // never given up.
+        let due: Vec<Cid> = self.tree(t).held_again.iter().filter(|(_, (at, _))| now >= *at).map(|(id, _)| *id).collect();
+        for id in due {
+            self.send(Waiting::Held(t, id), Op::AskHeld { id });
+        }
     }
 
     /// Something arrived.
@@ -979,73 +1273,78 @@ impl Page {
                 }
             }
             Answer::PutOk(id) => {
-                if self.answered(&Waiting::Put(id)).is_none() && self.confirmed.contains(&id) {
+                let t = self.block_tree(id, Waiting::Put);
+                if self.answered(&Waiting::Put(t, id)).is_none() && self.tree(t).confirmed.contains(&id) {
                     return; // a second answer to a re-sent PUT
                 }
-                self.put_again.remove(&id);
+                self.tree_mut(t).put_again.remove(&id);
                 // A repaired block's PUT is done: it confirms nothing (the architect's (b)).
-                if self.repair_puts.contains(&id) {
+                if self.tree(t).repair_puts.contains(&id) {
                     return;
                 }
                 match self.path {
-                    PutPath::Page => self.confirm(id),
+                    PutPath::Page => self.confirm(t, id),
                     // An answer is not a confirmation on this path: ask.
-                    PutPath::Wrapper => self.send(Waiting::Held(id), Op::AskHeld { id }),
+                    PutPath::Wrapper => self.send(Waiting::Held(t, id), Op::AskHeld { id }),
                 }
             }
             Answer::Held { id, present } => {
-                let Some(_) = self.answered(&Waiting::Held(id)) else { return };
+                let t = self.block_tree(id, Waiting::Held);
+                let Some(_) = self.answered(&Waiting::Held(t, id)) else { return };
                 if present {
-                    self.held_again.remove(&id);
-                    self.confirm(id);
+                    self.tree_mut(t).held_again.remove(&id);
+                    self.confirm(t, id);
                     return;
                 }
                 // Not there YET is the ordinary answer to an early ask: ask
                 // again on a doubling backoff, and only after HELD_ABSENTS in
                 // a row put it again — never at the speed of the answers.
-                let absents = self.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
-                let bytes = self.blocks.get(&id).map(<[u8]>::to_vec);
+                let absents = self.tree(t).held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
+                let bytes = self.tree(t).blocks.get(&id).map(<[u8]>::to_vec);
                 if let (true, Some(bytes)) = (absents >= HELD_ABSENTS, bytes) {
-                    self.held_again.remove(&id);
-                    self.put_again.insert(id, bytes);
+                    self.tree_mut(t).held_again.remove(&id);
+                    self.tree_mut(t).put_again.insert(id, bytes);
                 } else {
                     // A block this page has no bytes for (a FOREIGN member it only asks about, safety gap class 2)
                     // is never put from here: it is asked again, for as long as it takes (rule 7).
                     let wait = (BACKOFF_MS << absents.min(16)).min(rto::RTO_MAX_MS as u64);
-                    self.held_again.insert(id, (now + wait, absents));
+                    self.tree_mut(t).held_again.insert(id, (now + wait, absents));
                 }
             }
             Answer::PutRefused { id, transient } => {
-                let Some(op) = self.answered(&Waiting::Put(id)) else { return };
+                let t = self.block_tree(id, Waiting::Put);
+                let Some(op) = self.answered(&Waiting::Put(t, id)) else { return };
                 if transient {
                     if let Op::Put { bytes, .. } = op {
-                        self.put_again.insert(id, bytes);
+                        self.tree_mut(t).put_again.insert(id, bytes);
                     }
-                } else if self.repair_puts.remove(&id) {
+                } else if self.tree_mut(t).repair_puts.remove(&id) {
                     // A REPAIR's PUT rejected (sdk#433): dropped, and counted -- never silently.
-                    self.repairs_rejected += 1;
+                    self.tree_mut(t).repairs_rejected += 1;
                 } else {
                     // FINAL (sdk#433): the node's Block contract refused these bytes; never put again.
-                    self.step(Event::PutRejected(id));
+                    self.step(t, Event::PutRejected(id));
                 }
             }
             Answer::Got { id, bytes } => {
-                let Some(attempt) = self.answered_get(id) else { return };
+                let t = self.block_tree(id, Waiting::Get);
+                let Some(attempt) = self.answered_get(t, id) else { return };
                 // Verified BEFORE it joins the page's memory: a block that is
                 // not its id is not kept, and the engine hears a miss.
                 let good = engine::read::matches_id(&id, &bytes);
                 if good {
-                    self.blocks.insert(id, &bytes);
+                    self.tree_mut(t).blocks.insert(id, &bytes);
                 } else {
                     // Parked BEFORE the engine hears it: the engine re-asks
                     // inside that step, and must already see the GET pending,
                     // or the re-ask goes out at once.
-                    self.park_get(id, attempt);
+                    self.park_get(t, id, attempt);
                 }
-                self.step(Event::BlockArrived { id, bytes });
+                self.step(t, Event::BlockArrived { id, bytes });
             }
             Answer::GetMissed(id) => {
-                if let Some(attempt) = self.answered_get(id) {
+                let t = self.block_tree(id, Waiting::Get);
+                if let Some(attempt) = self.answered_get(t, id) {
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
                     // asked again on a backoff -- a node that has not got it
@@ -1055,8 +1354,8 @@ impl Page {
                     // inside that step, and must already see the GET pending,
                     // or the re-ask goes out at the speed of the answers
                     // (3,001 GETs in 5 min, measured).
-                    self.park_get(id, attempt);
-                    self.step(Event::BlockMissed(id));
+                    self.park_get(t, id, attempt);
+                    self.step(t, Event::BlockMissed(id));
                 }
             }
             Answer::Signer { id, answer: s } => {
@@ -1072,8 +1371,8 @@ impl Page {
                     return;
                 }
                 // Which label's sign it answers: the one whose sign in flight has this id.
-                let label = if self.head.sign_id == Some(id) {
-                    Label::Head
+                let label = if let Some(t) = self.trees().into_iter().find(|t| self.tree(*t).head.sign_id == Some(id)) {
+                    t.label()
                 } else if let Some(app) = self.sites.iter().find(|(_, p)| p.sign_id == Some(id)).map(|(a, _)| a.clone()) {
                     Label::Site(app)
                 } else {
@@ -1084,8 +1383,8 @@ impl Page {
                 }
                 self.pub_mut(&label).sign_id = None;
                 match label {
-                    Label::Head => self.on_signer(s),
                     Label::Site(app) => self.on_site_signer(&app, s),
+                    tree => self.on_signer(tree.tree().expect("a tree's label"), s),
                 }
             }
             Answer::Updated { label: Label::Site(app) } => {
@@ -1094,17 +1393,18 @@ impl Page {
                     self.send(Waiting::ReadBack(Label::Site(app.clone())), Op::ReadHead { label: Label::Site(app) });
                 }
             }
-            Answer::Updated { label: Label::Head } => {
+            Answer::Updated { label } => {
+                let t = label.tree().expect("a site's arm is above");
                 // Its read-back already done by the pushed state (sdk#378 P3): the
                 // UPDATE's wait ended there, so this answer asks nothing more.
-                if self.answered(&Waiting::Update(Label::Head)).is_some() {
+                if self.answered(&Waiting::Update(label.clone())).is_some() {
                     // A LANDING's UPDATE is judged by its own read — does the
                     // register now hold the head the signer named — never by
                     // this commit's read-back.
-                    if self.verify.as_ref().is_some_and(|v| v.landing) {
-                        self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
+                    if self.tree(t).verify.as_ref().is_some_and(|v| v.landing) {
+                        self.send(Waiting::Verify(t), Op::ReadHead { label });
                     } else {
-                        self.send(Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head });
+                        self.send(Waiting::ReadBack(label.clone()), Op::ReadHead { label });
                     }
                 }
             }
@@ -1116,99 +1416,106 @@ impl Page {
                     self.on_site_read(&app, read);
                 }
             }
-            Answer::Head { label: Label::Head, read } => {
+            Answer::Head { label, read } => {
+                let t = label.tree().expect("a site's arm is above");
                 // Below the published-head floor: not yet. A REAL answer (the
                 // node is answering, with a copy from before the publish), so
                 // it ends each head read it answers -- and adopts nothing:
                 // each is PARKED at the one backoff and asked again (a GET with
                 // subscribe), as a GET answered without its block is.
-                if self.head_floor > 0 && read.as_ref().is_none_or(|r| r.seq < self.head_floor) {
+                // The floor is the DATA head's (a published app's version); the observation tree has none.
+                if t == Tree::Data && self.head_floor > 0 && read.as_ref().is_none_or(|r| r.seq < self.head_floor) {
                     let seen = read.as_ref().map(|r| r.seq);
                     let n = self.below_floor.map_or(0, |(_, n)| n);
                     self.below_floor = Some((seen, n + 1));
-                    let reads = [Waiting::Warm, Waiting::RecoverHead, Waiting::ReadBack(Label::Head), Waiting::Verify, Waiting::Hint];
-                    for w in reads {
+                    for w in Self::head_reads(t) {
                         let Some(attempt) = self.deadlines.get(&w).filter(|d| d.sent).map(|d| d.attempt) else { continue };
                         self.answered(&w);
-                        self.park(w, Op::ReadHead { label: Label::Head }, attempt);
+                        self.park(w, Op::ReadHead { label: label.clone() }, attempt);
                     }
                     return;
                 }
-                self.last_head_at = self.now;
+                let now = self.now;
+                let tr = self.tree_mut(t);
+                tr.last_head_at = now;
                 let h = read.as_ref().map(|r| (r.seq, r.root()));
-                self.last_head = read;
-                self.answered(&Waiting::Warm);
+                tr.last_head = read;
+                self.answered(&Waiting::Warm(t));
                 // S1b: the register moved past an old signer's same-seq
                 // record, so it signs again.
-                if let (Some(at), Some((seq, _))) = (self.old_signer_fork_at, h) {
+                let tr = self.tree_mut(t);
+                if let (Some(at), Some((seq, _))) = (tr.old_signer_fork_at, h) {
                     if seq > at {
-                        self.old_signer_fork_at = None;
-                        if self.head.owed.is_some() {
-                            self.head.sign_again = Some(self.now);
+                        tr.old_signer_fork_at = None;
+                        if tr.head.owed.is_some() {
+                            tr.head.sign_again = Some(now);
                         }
                     }
                 }
                 // THE ONE JUDGEMENT (sdk#396): every head read this answer ends acts on this verdict, never on `h`.
-                let j = judge(self.last_head.as_ref(), &self.my_records);
-                let recover_attempt = self.deadlines.get(&Waiting::RecoverHead).map(|d| d.attempt);
-                if self.answered(&Waiting::RecoverHead).is_some() {
+                let j = judge(self.tree(t).last_head.as_ref(), &self.tree(t).my_records);
+                let recover_attempt = self.deadlines.get(&Waiting::RecoverHead(t)).map(|d| d.attempt);
+                if self.answered(&Waiting::RecoverHead(t)).is_some() {
                     match &j {
+                        // No head: this tree's GENESIS (the observation tree's first read of a register never written
+                        // is the node's NotFound, after its GET bound: the obs commit then starts from the empty tree).
                         Judged::NoHead => {
-                            self.step(Event::HeadMissing);
-                            self.recovered = true;
+                            self.step(t, Event::HeadMissing);
+                            self.tree_mut(t).recovered = true;
                         }
                         Judged::Head(heard) => {
-                            self.adopt(*heard, Adopt::Recovery);
-                            self.recovered = true;
+                            self.adopt(t, *heard, Adopt::Recovery);
+                            self.tree_mut(t).recovered = true;
                         }
                         // The engine's own re-read, mid-commit, shows a head THIS page's record beats: my UPDATE has
                         // not merged there yet. Not adopted (the commit would die for a head about to lose): the
                         // engine's read is asked again at the one backoff, and the read-back owns the landing.
-                        Judged::MineWins { .. } => self.park(Waiting::RecoverHead, Op::ReadHead { label: Label::Head }, recover_attempt.unwrap_or(1)),
+                        Judged::MineWins { .. } => self.park(Waiting::RecoverHead(t), Op::ReadHead { label: label.clone() }, recover_attempt.unwrap_or(1)),
                     }
                 }
-                if self.answered(&Waiting::ReadBack(Label::Head)).is_some() {
-                    self.on_read_back(&j);
+                if self.answered(&Waiting::ReadBack(label)).is_some() {
+                    self.on_read_back(t, &j);
                 }
-                if self.answered(&Waiting::Verify).is_some() {
-                    self.on_verify(&j);
+                if self.answered(&Waiting::Verify(t)).is_some() {
+                    self.on_verify(t, &j);
                 }
-                if self.answered(&Waiting::Hint).is_some() {
-                    self.on_hint(&j);
+                if self.answered(&Waiting::Hint(t)).is_some() {
+                    self.on_hint(t, &j);
                 }
             }
         }
     }
 
         /// A block is on the node: the one place `PutConfirmed` comes from.
-    fn confirm(&mut self, id: Cid) {
-        if self.confirmed.insert(id) {
-            self.step(Event::PutConfirmed(id));
-            self.release();
+    fn confirm(&mut self, t: Tree, id: Cid) {
+        if self.tree_mut(t).confirmed.insert(id) {
+            self.step(t, Event::PutConfirmed(id));
+            self.release(t);
         }
     }
 
-    fn on_signer(&mut self, s: signer_proto::Answer) {
+    fn on_signer(&mut self, t: Tree, s: signer_proto::Answer) {
         use signer_proto::{Answer as A, Why};
         // A LANDING's answer (see `on_verify`): the record's bytes, UPDATEd as
         // they are, then read — the same deadline and backoff as a publish of
         // this page's own.
-        if self.verify.as_ref().is_some_and(|v| v.landing) {
+        if self.tree_mut(t).verify.as_ref().is_some_and(|v| v.landing) {
             let backoff = |v: &mut Verify, now: u64| {
                 v.tries += 1;
                 v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
             };
             match s {
                 A::Signed(state) | A::AlreadySigned(state) => {
-                    self.note_record(&state);
-                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-                    let v = self.verify.as_mut().expect("checked");
+                    self.note_record(t, &state);
+                    self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state });
+                    let tr = self.tree_mut(t);
+                    let v = tr.verify.as_mut().expect("checked");
                     v.updates += 1;
-                    self.most_landing_updates = self.most_landing_updates.max(v.updates);
+                    tr.most_landing_updates = tr.most_landing_updates.max(v.updates);
                 }
                 A::NotNext { current } => {
                     let now = self.now;
-                    let v = self.verify.as_mut().expect("checked");
+                    let v = self.tree_mut(t).verify.as_mut().expect("checked");
                     v.seq = v.seq.max(current.seq);
                     v.root = current.root;
                     v.landing = false;
@@ -1216,7 +1523,7 @@ impl Page {
                 }
                 A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved | Why::NotSuccessor) => {
                     let now = self.now;
-                    let v = self.verify.as_mut().expect("checked");
+                    let v = self.tree_mut(t).verify.as_mut().expect("checked");
                     v.landing = false;
                     backoff(v, now);
                 }
@@ -1226,34 +1533,41 @@ impl Page {
                 // mutant that dropped such an arm survived, as dead weight.)
                 A::Refused(why) => {
                     self.unusable.push(format!("the signer refused a landing: {why:?}"));
-                    self.verify = None;
+                    self.tree_mut(t).verify = None;
                 }
                 other => self.unusable.push(format!("the signer answered a landing with {other:?}")),
             }
             return;
         }
-        let Some(owed) = self.head.owed.as_mut() else { return };
-        self.head.sign_refusals = match &s {
-            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved) => self.head.sign_refusals,
+        let tr = self.tree_mut(t);
+        if tr.head.owed.is_none() {
+            return;
+        }
+        tr.head.sign_refusals = match &s {
+            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved) => tr.head.sign_refusals,
             _ => 0,
         };
         match s {
             A::Signed(state) => {
-                self.signer_records.insert(state.clone());
+                let tr = self.tree_mut(t);
+                tr.signer_records.insert(state.clone());
                 if let Some(h) = HeadRead::from_record(&state) {
-                    self.my_records.insert(h.seq, (h.root(), state.clone()));
+                    tr.my_records.insert(h.seq, (h.root(), state.clone()));
                 }
+                let owed = tr.head.owed.as_mut().expect("checked");
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
+                self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state });
             }
             A::AlreadySigned(state) => {
                 // Requirement 2: ONE signature per prev, and it is landed as
                 // it is — its blocks were stored before it was signed.
-                self.signer_records.insert(state.clone());
+                let tr = self.tree_mut(t);
+                tr.signer_records.insert(state.clone());
                 if let Some(h) = HeadRead::from_record(&state) {
-                    self.my_records.insert(h.seq, (h.root(), state.clone()));
+                    tr.my_records.insert(h.seq, (h.root(), state.clone()));
                 }
+                let owed = tr.head.owed.as_mut().expect("checked");
                 owed.record = Some(state.clone());
                 owed.stale_reads = 0;
                 // Its root may not be this commit's (a record another page
@@ -1262,7 +1576,7 @@ impl Page {
                 // record reads back as the same seq under another root — a
                 // conflict, never Published (the model's mutant M5: a second
                 // mechanism for this was dead weight).
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
+                self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state });
             }
             // NOT ADOPTED YET (invariant 1b). The signer's truth is the later
             // of its RECORD and the register, and the record can be AHEAD:
@@ -1270,8 +1584,8 @@ impl Page {
             // it was, a later write was told Published at a head no reader
             // can see (the model, seed 10). So the register is read first.
             A::NotNext { current } => {
-                self.verify = Some(Verify { seq: current.seq, root: current.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
-                self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
+                self.tree_mut(t).verify = Some(Verify { seq: current.seq, root: current.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
+                self.send(Waiting::Verify(t), Op::ReadHead { label: t.label() });
             }
             // RETRYABLE, on a doubling backoff (engineer2's table):
             // RootNotHeld — the root's PUT is still landing; HeadUnknown — the
@@ -1281,11 +1595,11 @@ impl Page {
             // not a signer answer: it is re-asked by the deadline.
             A::Refused(why @ (Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved)) => {
                 if why == Why::HeadUnknown {
-                    self.send(Waiting::Warm, Op::ReadHead { label: Label::Head });
+                    self.send(Waiting::Warm(t), Op::ReadHead { label: t.label() });
                 }
-                self.head.sign_refusals += 1;
-                let wait = (BACKOFF_MS << self.head.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
-                self.head.sign_again = Some(self.now + wait);
+                self.tree_mut(t).head.sign_refusals += 1;
+                let wait = (BACKOFF_MS << self.tree_mut(t).head.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
+                self.tree_mut(t).head.sign_again = Some(self.now + wait);
             }
             // THE SAME IDENTITY NEVER FORKS (owner, sdk#225). Only an OLD
             // signer says this (the new one answers `NotNext{read}`): another
@@ -1295,17 +1609,17 @@ impl Page {
             // every ask until the Register passes this seq, so the sign is NOT
             // re-asked (a loop otherwise) and that is named, once.
             A::Refused(Why::Forked { read, .. }) => {
-                if self.engine.published_seq() == read.seq && self.engine.published_root() == read.root {
-                    if self.old_signer_fork_at != Some(read.seq) {
-                        self.old_signer_fork_at = Some(read.seq);
+                if self.tree_mut(t).engine.published_seq() == read.seq && self.tree_mut(t).engine.published_root() == read.root {
+                    if self.tree_mut(t).old_signer_fork_at != Some(read.seq) {
+                        self.tree_mut(t).old_signer_fork_at = Some(read.seq);
                         self.unusable.push(format!(
                             "SIGNER UPGRADE NEEDED: this signer predates the same-identity rule (sdk#225) and refuses every sign while its record and the register differ at seq {}; load the current version (its signer ships with the page). It signs again once the register moves past that seq",
                             read.seq
                         ));
                     }
                 } else {
-                    self.verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
-                    self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
+                    self.tree_mut(t).verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
+                    self.send(Waiting::Verify(t), Op::ReadHead { label: t.label() });
                 }
             }
             // Permanent: not provisioned, not a successor, cannot sign,
@@ -1341,8 +1655,8 @@ impl Page {
     /// On a peered node the register is read through the head SUBSCRIPTION
     /// (F55: a delegate-created register is not served to a bare client GET);
     /// the web layer frames `Op::ReadHead { label: Label::Head }` as that.
-    fn on_verify(&mut self, j: &Judged) {
-        let Some(v) = self.verify.clone() else { return };
+    fn on_verify(&mut self, t: Tree, j: &Judged) {
+        let Some(v) = self.tree_mut(t).verify.clone() else { return };
         let h = j.shown();
         let reg_seq = h.map_or(0, |(s, _)| s);
         // THIS page's own record at the register's seq is another root that
@@ -1352,25 +1666,26 @@ impl Page {
         // REGISTER's head (rule c), so `v.root` is theirs.
         if let Judged::MineWins { seq, record, .. } = j {
             if *seq >= v.seq {
-                if let Some(v) = self.verify.as_mut() {
+                let tr = self.tree_mut(t);
+                if let Some(v) = tr.verify.as_mut() {
                     v.landing = true;
                     v.updates += 1;
-                    self.most_landing_updates = self.most_landing_updates.max(v.updates);
+                    tr.most_landing_updates = tr.most_landing_updates.max(v.updates);
                 }
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() });
+                self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state: record.clone() });
                 return;
             }
         }
         if let Judged::Head(heard) = j {
             if heard.seq() >= v.seq {
-                self.verify = None;
-                self.head.owed = None;
-                self.adopt(*heard, Adopt::Conflict);
+                self.tree_mut(t).verify = None;
+                self.tree_mut(t).head.owed = None;
+                self.adopt(t, *heard, Adopt::Conflict);
                 return;
             }
         }
         if v.seq > reg_seq + 1 {
-            self.verify = None;
+            self.tree_mut(t).verify = None;
             self.unusable.push(format!(
                 "the signer's record (seq {}) is {} ahead of the register (seq {reg_seq}): unrecoverable, and 1b says unreachable",
                 v.seq,
@@ -1382,23 +1697,24 @@ impl Page {
             Some(h) => h,
             // No head at all: the record's prev is the genesis (the empty
             // tree), which is where this engine stands if it has adopted none.
-            None if self.engine.published_seq() == 0 => (0, self.engine.published_root()),
+            None if self.tree_mut(t).engine.published_seq() == 0 => (0, self.tree_mut(t).engine.published_root()),
             None => {
                 let now = self.now;
-                let v = self.verify.as_mut().expect("present");
+                let v = self.tree_mut(t).verify.as_mut().expect("present");
                 v.tries += 1;
                 v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
                 return;
             }
         };
-        if let Some(v) = self.verify.as_mut() {
+        let tr = self.tree_mut(t);
+        if let Some(v) = tr.verify.as_mut() {
             if !v.landing {
-                self.landings += 1;
+                tr.landings += 1;
             }
             v.landing = true;
             v.from = Some((prev_seq, prev_root));
         }
-        self.ask_land();
+        self.ask_land(t);
     }
 
     /// A register read on a hint (the node's `HeadChanged`, or the idle
@@ -1414,24 +1730,24 @@ impl Page {
     ///   UPDATE has not merged here), never displaced.
     /// * Otherwise a newer head, or a same-seq winner: ADOPTED
     ///   (`HeadConflict`). A commit in flight dies `Lost`, as in any conflict.
-    fn on_hint(&mut self, j: &Judged) {
+    fn on_hint(&mut self, t: Tree, j: &Judged) {
         let Some((seq, root)) = j.shown() else { return };
-        if !self.engine_has_head || self.verify.is_some() {
+        if !self.tree_mut(t).engine_has_head || self.tree_mut(t).verify.is_some() {
             return;
         }
-        let (pseq, proot) = (self.engine.published_seq(), self.engine.published_root());
+        let (pseq, proot) = (self.tree_mut(t).engine.published_seq(), self.tree_mut(t).engine.published_root());
         if (seq, root) == (pseq, proot) || seq < pseq {
             return;
         }
-        if self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && o.seq == seq) {
-            self.on_read_back(j);
+        if self.tree_mut(t).head.owed.as_ref().is_some_and(|o| o.record.is_some() && o.seq == seq) {
+            self.on_read_back(t, j);
             return;
         }
         match j {
-            Judged::MineWins { record, .. } => self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() }),
+            Judged::MineWins { record, .. } => self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state: record.clone() }),
             Judged::Head(heard) => {
-                self.head.owed = None;
-                self.adopt(*heard, Adopt::Conflict);
+                self.tree_mut(t).head.owed = None;
+                self.adopt(t, *heard, Adopt::Conflict);
             }
             Judged::NoHead => {}
         }
@@ -1452,7 +1768,7 @@ impl Page {
         // Re-sent in the order they first queued, and queued anew in it (sdk#390).
         let mut on_wire: Vec<(u32, Waiting)> = self.deadlines.iter().filter(|(_, d)| d.sent).map(|(w, d)| (d.seq, w.clone())).collect();
         on_wire.sort_unstable();
-        let mut head_read = false;
+        let mut head_read = BTreeSet::new();
         for (_, w) in on_wire {
             let at = self.now + self.backoff(self.deadlines[&w].attempt);
             // The send on the old socket is WITHDRAWN (its answer cannot come), and the re-send is a new send.
@@ -1466,13 +1782,18 @@ impl Page {
             d.seq = seq;
             // Every label's in-flight read is re-sent (each re-subscribes its own register);
             // only an in-flight HEAD read stands in for the fallback below.
-            head_read |= matches!(d.op, Op::ReadHead { label: Label::Head });
+            if let Op::ReadHead { label } = &d.op {
+                head_read.extend(label.tree());
+            }
             self.out.push(d.op.clone());
             self.record_send(&w, &self.deadlines[&w]);
         }
-        if !head_read && self.engine_has_head {
-            self.last_head_at = self.now;
-            self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
+        for t in self.trees() {
+            if !head_read.contains(&t) && self.tree(t).follows && self.tree(t).engine_has_head {
+                let now = self.now;
+                self.tree_mut(t).last_head_at = now;
+                self.send(Waiting::Hint(t), Op::ReadHead { label: t.label() });
+            }
         }
     }
 
@@ -1485,14 +1806,22 @@ impl Page {
     /// this page's head, a newer one, a same-seq winner — so a second read
     /// adds nothing but a node op on the node's one queue, F61).
     pub fn head_hint(&mut self) {
-        if self.verify.is_none() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
-            self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
+        self.head_hint_for(Tree::Data);
+    }
+
+    /// [`Page::head_hint`] for tree `t`'s register (a hint names its register).
+    pub fn head_hint_for(&mut self, t: Tree) {
+        if self.obs.is_none() && t == Tree::Obs {
+            return;
+        }
+        if self.tree(t).verify.is_none() && !self.read_back_owed(t) && !self.deadlines.contains_key(&Waiting::Hint(t)) {
+            self.send(Waiting::Hint(t), Op::ReadHead { label: t.label() });
         }
     }
 
     /// Is this page's own read-back owed: a head signed, its UPDATE sent, not yet confirmed (sdk#378)?
-    fn read_back_owed(&self) -> bool {
-        self.head.owed.as_ref().is_some_and(|o| o.record.is_some())
+    fn read_back_owed(&self, t: Tree) -> bool {
+        self.tree(t).head.owed.as_ref().is_some_and(|o| o.record.is_some())
     }
 
     /// The node pushed the head register's FULL state (sdk#378 P3, the
@@ -1504,41 +1833,57 @@ impl Page {
     /// push changes nothing: the read-back GET after the UPDATE's answer does
     /// the job on its deadline. Nothing is ever ADOPTED from a push.
     pub fn head_pushed(&mut self, read: HeadRead) {
-        let confirms = self.verify.is_none() && self.confirms(&read);
+        self.head_pushed_for(Tree::Data, read);
+    }
+
+    /// [`Page::head_pushed`] for tree `t`'s register.
+    pub fn head_pushed_for(&mut self, t: Tree, read: HeadRead) {
+        if self.obs.is_none() && t == Tree::Obs {
+            return;
+        }
+        let confirms = self.tree(t).verify.is_none() && self.confirms(t, &read);
         if !confirms {
             // ALREADY KNOWN (the architect's done x E1 cell, #378): a full state that IS the head this page last
             // read -- the whole value, not only (seq, root) -- and the engine stands on, is news to nobody. No
             // read (one op on the node's one queue, F61); the backstop's clock restarts, as for a read. A DELTA
             // push carries no state and never gets here (`head_hint`, one read), nor does any other head.
-            let known = self.last_head.as_ref().is_some_and(|h| h.seq == read.seq && h.value() == read.value());
-            if known && (read.seq, read.root()) == self.published() {
-                self.last_head_at = self.now;
+            let known = self.tree(t).last_head.as_ref().is_some_and(|h| h.seq == read.seq && h.value() == read.value());
+            if known && (read.seq, read.root()) == self.engine_published(t) {
+                let now = self.now;
+                self.tree_mut(t).last_head_at = now;
                 return;
             }
-            return self.head_hint();
+            return self.head_hint_for(t);
         }
-        self.last_head_at = self.now;
-        self.last_head = Some(read);
+        let now = self.now;
+        let tr = self.tree_mut(t);
+        tr.last_head_at = now;
+        tr.last_head = Some(read);
         // Whatever is still on the wire for the read-back this push stands in for -- the UPDATE whose answer would
         // ask it, or the GET itself -- ends with the owed head, in `drop_dead_head`, once the engine has published
         // its seq (COMMIT-LIFE ⁹): no RTT sample (a push is not an answer to either request).
-        let j = judge(self.last_head.as_ref(), &self.my_records);
-        self.on_read_back(&j);
+        let j = judge(self.tree(t).last_head.as_ref(), &self.tree(t).my_records);
+        self.on_read_back(t, &j);
     }
 
     /// A record the signer returned (`Signed`, or `AlreadySigned`: the one it
     /// already made for that prev, under THIS page's key): kept whole for
     /// invariant 2, and by the head it names for the tie-break.
-    fn note_record(&mut self, state: &[u8]) {
-        self.signer_records.insert(state.to_vec());
+    fn note_record(&mut self, t: Tree, state: &[u8]) {
+        self.tree_mut(t).signer_records.insert(state.to_vec());
         if let Some(h) = HeadRead::from_record(state) {
-            self.my_records.insert(h.seq, (h.root(), state.to_vec()));
+            self.tree_mut(t).my_records.insert(h.seq, (h.root(), state.to_vec()));
         }
     }
 
+    /// Every register read of tree `t`'s head, in the one order a below-floor answer parks them.
+    fn head_reads(t: Tree) -> [Waiting; 5] {
+        [Waiting::Warm(t), Waiting::RecoverHead(t), Waiting::ReadBack(t.label()), Waiting::Verify(t), Waiting::Hint(t)]
+    }
+
     /// Is a register read already in flight?
-    fn reading_head(&self) -> bool {
-        [Waiting::Warm, Waiting::RecoverHead, Waiting::Verify, Waiting::ReadBack(Label::Head), Waiting::Hint]
+    fn reading_head(&self, t: Tree) -> bool {
+        [Waiting::Warm(t), Waiting::RecoverHead(t), Waiting::Verify(t), Waiting::ReadBack(t.label()), Waiting::Hint(t)]
             .iter()
             .any(|w| self.deadlines.contains_key(w))
     }
@@ -1549,27 +1894,33 @@ impl Page {
     /// confirmations (E1 and E4, either order). Both go to the engine, which alone decides (COMMIT-LIFE ⁹, sdk#414):
     /// its `pending` take makes the second a no-op. The root is part of it: a record another page of this key made at
     /// the same seq is not this commit (`AlreadySigned`), and the engine's take checks the seq only.
-    fn confirms(&self, read: &HeadRead) -> bool {
+    fn confirms(&self, t: Tree, read: &HeadRead) -> bool {
         let pair = (read.seq, read.root());
-        match self.head.owed.as_ref() {
+        match self.tree(t).head.owed.as_ref() {
             Some(o) => o.record.is_some() && (o.seq, o.root) == pair,
             None => {
-                pair == self.engine_published()
-                    && self.my_records.get(&read.seq).and_then(|(_, record)| HeadRead::from_record(record)).is_some_and(|mine| mine.value() == read.value())
+                pair == self.engine_published(t)
+                    && self.tree(t).my_records.get(&read.seq).and_then(|(_, record)| HeadRead::from_record(record)).is_some_and(|mine| mine.value() == read.value())
             }
         }
     }
 
     /// The register read back after an UPDATE: the only way a commit is
     /// Published (F56: the UPDATE's answer says nothing).
-    fn on_read_back(&mut self, j: &Judged) {
+    fn on_read_back(&mut self, t: Tree, j: &Judged) {
         // `last_head` is the read `j` was judged from (both callers judge it just before).
-        if let (Judged::Head(heard), Some(read)) = (j, self.last_head.as_ref()) {
-            if self.confirms(read) {
-                return self.step(Event::HeadConfirmed(heard.seq()));
+        if let (Judged::Head(heard), Some(read)) = (j, self.tree(t).last_head.as_ref()) {
+            if self.confirms(t, read) {
+                let from = self.tree(t).engine.published_seq();
+                self.step(t, Event::HeadConfirmed(heard.seq()));
+                // The DATA head LANDED (its published seq moved): the ride-along's only trigger (OBSERVABILITY §3).
+                if t == Tree::Data && self.tree(t).engine.published_seq() > from {
+                    self.ride_along();
+                }
+                return;
             }
         }
-        let Some(owed) = self.head.owed.as_mut() else { return };
+        let Some(owed) = self.tree_mut(t).head.owed.as_mut() else { return };
         if owed.record.is_none() {
             return; // a read-back outlived its commit
         }
@@ -1585,7 +1936,7 @@ impl Page {
                 if owed.stale_reads >= HEAD_READS {
                     owed.stale_reads = 0;
                     let state = owed.record.clone().expect("an UPDATE was sent");
-                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
+                    self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state });
                 }
             }
             Judged::MineWins { .. } => {
@@ -1593,16 +1944,16 @@ impl Page {
                 if owed.stale_reads >= HEAD_READS {
                     owed.stale_reads = 0;
                     let state = owed.record.clone().expect("an UPDATE was sent");
-                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
+                    self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state });
                 }
             }
             Judged::Head(heard) => {
-                self.head.owed = None;
-                self.adopt(*heard, Adopt::Conflict);
+                self.tree_mut(t).head.owed = None;
+                self.adopt(t, *heard, Adopt::Conflict);
             }
             Judged::NoHead => {
                 let state = owed.record.clone().expect("an UPDATE was sent");
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
+                self.send(Waiting::Update(t.label()), Op::Update { label: t.label(), state });
             }
         }
     }
@@ -1610,19 +1961,19 @@ impl Page {
     /// A LANDING's sign request, under a fresh id (SG02): from the register's
     /// own head, with `next.seq = register.seq + 1` — the signer checks the
     /// successor FIRST — and any root.
-    fn ask_land(&mut self) {
-        let Some((prev_seq, prev_root, root)) = self.verify.as_ref().and_then(|v| v.from.map(|(s, r)| (s, r, v.root))) else {
+    fn ask_land(&mut self, t: Tree) {
+        let Some((prev_seq, prev_root, root)) = self.tree_mut(t).verify.as_ref().and_then(|v| v.from.map(|(s, r)| (s, r, v.root))) else {
             return;
         };
         let id = self.next_request;
         self.next_request = self.next_request.checked_add(1).unwrap_or(1);
-        self.head.sign_id = Some(id);
+        self.tree_mut(t).head.sign_id = Some(id);
         let ledger = self.sign_ledger_of(prev_seq, prev_root, prev_seq + 1, root);
-        self.send(Waiting::Sign(Label::Head), Op::Sign { id, prev_seq, prev_root, seq: prev_seq + 1, root, ledger, label: Label::Head });
+        self.send(Waiting::Sign(t.label()), Op::Sign { id, prev_seq, prev_root, seq: prev_seq + 1, root, ledger, label: t.label() });
     }
 
-    fn ask_sign(&mut self) {
-        self.ask_sign_for(Label::Head);
+    fn ask_sign(&mut self, t: Tree) {
+        self.ask_sign_for(t.label());
     }
 
     /// THE sign request, for any label: from the owed's prev `(seq - 1, base)`, under a fresh id (SG02). A head's
@@ -1637,9 +1988,9 @@ impl Page {
         // would name the winner as prev of a root built without it, and the
         // winner's rows would be lost from every later head.
         let (prev_seq, prev_root, seq, root) = (o.seq - 1, o.base, o.seq, o.root);
-        let ledger = match label {
-            Label::Head => self.sign_ledger_of(prev_seq, prev_root, seq, root),
-            Label::Site(_) => Vec::new(),
+        let ledger = match label.tree() {
+            Some(t) => self.ledger_of(t, prev_seq, prev_root, seq, root),
+            None => Vec::new(),
         };
         let op = Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label: label.clone() };
         self.send(Waiting::Sign(label), op);
@@ -1647,16 +1998,16 @@ impl Page {
 
     /// A label's publication: the head's, or a site's (made on first use).
     fn pub_mut(&mut self, label: &Label) -> &mut Pub {
-        match label {
-            Label::Head => &mut self.head,
-            Label::Site(app) => self.sites.entry(app.clone()).or_default(),
+        match (label, label.tree()) {
+            (Label::Site(app), _) => self.sites.entry(app.clone()).or_default(),
+            (_, t) => &mut self.tree_mut(t.expect("a tree's label")).head,
         }
     }
 
     fn pub_ref(&self, label: &Label) -> Option<&Pub> {
-        match label {
-            Label::Head => Some(&self.head),
-            Label::Site(app) => self.sites.get(app),
+        match (label, label.tree()) {
+            (Label::Site(app), _) => self.sites.get(app),
+            (_, t) => t.and_then(|t| self.tree_opt(t)).map(|tr| &tr.head),
         }
     }
 
@@ -1797,13 +2148,20 @@ impl Page {
     /// An op goes out, due again one RTO from now. A GET waits for a place
     /// in the window.
     fn send(&mut self, w: Waiting, op: Op) {
-        if let Waiting::Get(id) = w {
+        if let Waiting::Get(t, id) = w {
             if self.gets_in_flight() >= self.window.size() && !self.deadlines.contains_key(&w) {
-                if !self.get_queue.contains(&id) {
-                    self.get_queue.push_back(id);
+                if !self.get_queue.contains(&(t, id)) {
+                    self.get_queue.push_back((t, id));
                 }
                 return;
             }
+        }
+        // THE OBSERVATION TREE's ONE OP IN FLIGHT: behind the one on the wire, in order.
+        if w.tree() == Some(Tree::Obs) && !self.deadlines.contains_key(&w) && self.deadlines.iter().any(|(k, d)| d.sent && k.tree() == Some(Tree::Obs)) {
+            if !self.obs_queue.iter().any(|(q, _)| *q == w) {
+                self.obs_queue.push_back((w, op));
+            }
+            return;
         }
         let attempt = self.attempt_of.remove(&w).map_or(1, |a| a + 1);
         self.first_of.entry(w.clone()).or_insert(self.now);
@@ -1823,6 +2181,10 @@ impl Page {
         // A send still on the wire for the same op is SUPERSEDED by this one: its end is said, never overwritten.
         if let Some(old) = self.deadlines.insert(w.clone(), d) {
             self.record_end(&w, &old, End::Withdrawn);
+        }
+        if w.tree() == Some(Tree::Obs) {
+            let n = self.deadlines.iter().filter(|(k, d)| d.sent && k.tree() == Some(Tree::Obs)).count();
+            self.obs_most_on_wire = self.obs_most_on_wire.max(n);
         }
         self.out.push(op);
     }
@@ -1852,6 +2214,10 @@ impl Page {
     /// AN OP ENDS: THE one way a deadline leaves (a control counts this crate's removals). What the recording
     /// says of it is decided here, once: answered, timed out, or withdrawn.
     fn end(&mut self, w: &Waiting, how: End) -> Option<Deadline> {
+        // A queued observation op that ends never goes out.
+        if w.tree() == Some(Tree::Obs) {
+            self.obs_queue.retain(|(q, _)| q != w);
+        }
         let d = self.deadlines.remove(w)?;
         self.record_end(w, &d, how);
         Some(d)
@@ -1905,24 +2271,24 @@ impl Page {
 
     /// GETs on the wire (parked ones are not).
     fn gets_in_flight(&self) -> usize {
-        self.deadlines.iter().filter(|(k, d)| matches!(k, Waiting::Get(_)) && d.sent).count()
+        self.deadlines.iter().filter(|(k, d)| matches!(k, Waiting::Get(..)) && d.sent).count()
     }
 
     /// A GET's answer: [`Page::answered`], and which attempt it answered.
     /// A LOST GET (timed out, its re-send queued for a place: sdk#345) is
     /// still asked: a late answer to an earlier send answers it, and its
     /// queued re-send is dropped. It held no place and is no RTO sample.
-    fn answered_get(&mut self, id: Cid) -> Option<u32> {
-        if let Some(d) = self.deadlines.get(&Waiting::Get(id)) {
+    fn answered_get(&mut self, t: Tree, id: Cid) -> Option<u32> {
+        if let Some(d) = self.deadlines.get(&Waiting::Get(t, id)) {
             // On the wire: `answered` takes the Karn sample and opens the
             // window, which a queued GET must not do.
             let attempt = d.attempt;
-            self.answered(&Waiting::Get(id))?;
-            self.drop_get(id);
+            self.answered(&Waiting::Get(t, id))?;
+            self.drop_get(t, id);
             return Some(attempt);
         }
-        let attempt = self.get_queue.contains(&id).then(|| self.attempt_of.get(&Waiting::Get(id)).copied()).flatten()?;
-        self.drop_get(id);
+        let attempt = self.get_queue.contains(&(t, id)).then(|| self.attempt_of.get(&Waiting::Get(t, id)).copied()).flatten()?;
+        self.drop_get(t, id);
         Some(attempt)
     }
 
@@ -1930,10 +2296,10 @@ impl Page {
     /// has -- its deadline (on the wire or parked), the attempt its re-send
     /// would continue from, and its place in the window's queue. An answer,
     /// a withdrawal and a block the page already holds all end a GET here.
-    fn drop_get(&mut self, id: Cid) {
-        let ended = self.end(&Waiting::Get(id), End::Withdrawn);
-        self.attempt_of.remove(&Waiting::Get(id));
-        self.get_queue.retain(|q| *q != id);
+    fn drop_get(&mut self, t: Tree, id: Cid) {
+        let ended = self.end(&Waiting::Get(t, id), End::Withdrawn);
+        self.attempt_of.remove(&Waiting::Get(t, id));
+        self.get_queue.retain(|q| *q != (t, id));
         // A GET ended while ON THE WIRE held a place in the window: the next
         // queued GET takes it. Only an ANSWER grows the window (`answered`);
         // an end frees the place it held. Without this a read whose silent
@@ -1949,8 +2315,8 @@ impl Page {
     /// not its id): the GET stays pending on its own deadline, sent again at
     /// the same backoff a silent one would be (rule 7: retry until answered),
     /// never at the speed of the answers.
-    fn park_get(&mut self, id: Cid, attempt: u32) {
-        self.park(Waiting::Get(id), Op::Get { id }, attempt);
+    fn park_get(&mut self, t: Tree, id: Cid, attempt: u32) {
+        self.park(Waiting::Get(t, id), Op::Get { id }, attempt);
     }
 
     /// The node ANSWERED `w`, but not with what it waits for (a GET without
@@ -2001,7 +2367,7 @@ impl Page {
         if d.sent {
             self.rearm_first_sends();
         }
-        if d.sent && matches!(w, Waiting::Get(_)) {
+        if d.sent && matches!(w, Waiting::Get(..)) {
             self.window.opened();
             self.fill_gets();
         }
@@ -2053,25 +2419,25 @@ impl Page {
 
     /// GETs waiting on the window take the places that are free.
     fn fill_gets(&mut self) {
-        while let Some(id) = self.get_queue.front().copied() {
+        while let Some((t, id)) = self.get_queue.front().copied() {
             if self.gets_in_flight() >= self.window.size() {
                 break;
             }
             self.get_queue.pop_front();
-            self.send(Waiting::Get(id), Op::Get { id });
+            self.send(Waiting::Get(t, id), Op::Get { id });
         }
     }
 
     /// The register as this page last READ it (any head answer), whole —
     /// what a merge reads a winner's `prev` from (sdk#225b).
     pub fn last_read(&self) -> Option<&HeadRead> {
-        self.last_head.as_ref()
+        self.data.last_head.as_ref()
     }
 
     /// Has the engine recovered its head (its own head read answered)? A read
     /// before this would be answered from the empty tree it started on.
     pub fn recovered(&self) -> bool {
-        self.recovered
+        self.data.recovered
     }
 
     /// When the next deadline falls (a host sets a one-shot timer for it, as
@@ -2082,12 +2448,17 @@ impl Page {
         // the next tick. A host that armed only for deadlines would sleep
         // through a back-off (the differential's RecordNotSaved case did).
         let deadlines = self.deadlines.values().map(|d| d.at);
-        let sign = self.head.sign_again.into_iter().chain(self.sites.values().filter_map(|p| p.sign_again)).min();
-        let held = self.held_again.values().map(|(at, _)| *at);
-        let verify = self.verify.as_ref().and_then(|v| v.again_at);
-        let puts = (!self.put_again.is_empty()).then_some(self.now);
-        let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
-        deadlines.chain(sign).chain(held).chain(verify).chain(puts).chain(backstop).min().map(Ms)
+        let sites = self.sites.values().filter_map(|p| p.sign_again);
+        // Every TREE's timers, the observation tree's with the data tree's.
+        let trees = self.trees().into_iter().map(|t| self.tree(t)).flat_map(|tr| {
+            let sign = tr.head.sign_again;
+            let held = tr.held_again.values().map(|(at, _)| *at).min();
+            let verify = tr.verify.as_ref().and_then(|v| v.again_at);
+            let puts = (!tr.put_again.is_empty()).then_some(self.now);
+            let backstop = (tr.follows && tr.engine_has_head).then_some(tr.last_head_at + HEAD_BACKSTOP_MS);
+            [sign, held, verify, puts, backstop].into_iter().flatten()
+        });
+        deadlines.chain(sites).chain(trees).min().map(Ms)
     }
 
     /// The page's clock: the last time it was told.
@@ -2141,9 +2512,15 @@ impl Page {
     pub fn close_obs_window(&mut self, site: &[u8; 32], minute: u64, header: Option<instrument::publish::Header>) -> Option<(Vec<u8>, Vec<u8>)> {
         let rec = self.rec.as_ref()?;
         let taken = rec.take_window();
-        let window = instrument::publish::Window { minute, start_ms: self.obs_start.saturating_sub(self.rec_start), dropped_at_start: 0, lost_before: 0 };
+        // Events lost with records this page could not keep ride in the next record's drop count (a lower bound).
+        let lost_before = std::mem::take(&mut self.obs_lost);
+        let window = instrument::publish::Window { minute, start_ms: self.obs_start.saturating_sub(self.rec_start), dropped_at_start: 0, lost_before };
         let record = instrument::publish::publish(&taken.recording(), window, header);
         self.obs_start = self.now;
+        // An EMPTY window -- nothing publishable, nothing lost -- makes no record (nothing to write, no key).
+        if record.events.is_empty() && record.domains.is_empty() && record.dropped == instrument::vocab::Bucket::Zero && record.header.is_none() {
+            return None;
+        }
         Some((obs::detail_key(site, minute), record.encode()))
     }
 
@@ -2167,17 +2544,23 @@ impl Page {
     /// head built on another page's commit still WITNESSES that it landed --
     /// with this page's own entry set to the last arrival its commit carries.
     pub fn sign_ledger_of(&self, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> Vec<u8> {
+        self.ledger_of(Tree::Data, prev_seq, prev_root, seq, root)
+    }
+
+    /// [`Page::sign_ledger_of`] for tree `t`'s head: its own last read, its own engine.
+    fn ledger_of(&self, t: Tree, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) -> Vec<u8> {
         use signer_proto::head::{value, Ledger, Through};
+        let tr = self.tree(t);
         let prev = (prev_seq > 0).then_some(signer_proto::Head { seq: prev_seq, root: prev_root });
         let mut through: Vec<Through> =
-            self.last_read().filter(|r| (r.seq, r.root()) == (prev_seq, prev_root)).map(|r| r.through()).unwrap_or_default();
+            tr.last_head.as_ref().filter(|r| (r.seq, r.root()) == (prev_seq, prev_root)).map(|r| r.through()).unwrap_or_default();
         if self.device != [0; 16] {
-            if let Some(t) = self.engine.committing_through() {
+            if let Some(c) = tr.engine.committing_through() {
                 through.retain(|e| e.device != self.device);
-                through.push(Through { device: self.device, seq: t, last: seq });
+                through.push(Through { device: self.device, seq: c, last: seq });
             }
         }
-        value(&root, &Ledger { prev, through, parity: Some(mark(&self.engine.root_parity_of(&root))) })[32..].to_vec()
+        value(&root, &Ledger { prev, through, parity: Some(mark(&tr.engine.root_parity_of(&root))) })[32..].to_vec()
     }
 
     /// This page's device id in heads' `through` (COMMIT-LIFE ⁵). Zeros:
@@ -2195,48 +2578,53 @@ impl Page {
 
     /// THE ONLY WAY a head read from the register is adopted (sdk#396): from a [`Heard`], which only the one
     /// judgement makes -- so no answer path can adopt a head this page's own record beats.
-    fn adopt(&mut self, heard: Heard, how: Adopt) {
+    fn adopt(&mut self, t: Tree, heard: Heard, how: Adopt) {
         let (seq, root) = heard.pair();
         match how {
-            Adopt::Recovery => self.step(Event::HeadRead { epoch: EPOCH, seq, root }),
-            Adopt::Conflict => self.step(Event::HeadConflict { seq, root }),
+            Adopt::Recovery => self.step(t, Event::HeadRead { epoch: EPOCH, seq, root }),
+            Adopt::Conflict => self.step(t, Event::HeadConflict { seq, root }),
         }
     }
 
-    fn step(&mut self, ev: Event) {
+    fn step(&mut self, t: Tree, ev: Event) {
         // THE WITNESS (COMMIT-LIFE ⁵): a head about to be adopted says, in its
         // ledger, how far THIS page's writes are in it -- whether a commit
         // the engine is about to call dead in fact landed unheard.
         if let Event::HeadConflict { seq, root } | Event::HeadRead { seq, root, .. } = &ev {
             // No read of that head (it came some other way): nothing is
             // witnessed, which is the old rule -- not landed.
+            let tr = self.tree(t);
             let witness = (self.device != [0; 16])
-                .then(|| self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, self.engine.committing_seq())))
+                .then(|| tr.last_head.as_ref().filter(|r| (r.seq, r.root()) == (*seq, *root)).map(|r| r.witness_of(&self.device, tr.engine.committing_seq())))
                 .flatten();
-            self.engine.set_witness(witness);
             // The §P MARK of the head about to be adopted: the engine's parity
             // scan is Done for a marked head, NotScanned for an unmarked one,
             // and the root's parity the mark lists makes it a group of one.
-            let mark = self.last_read().filter(|r| (r.seq, r.root()) == (*seq, *root)).and_then(HeadRead::mark);
-            self.engine.set_head_mark(mark);
+            let mark = tr.last_head.as_ref().filter(|r| (r.seq, r.root()) == (*seq, *root)).and_then(HeadRead::mark);
+            let tr = self.tree_mut(t);
+            tr.engine.set_witness(witness);
+            tr.engine.set_head_mark(mark);
         }
         // A SAME-SEQ DISPLACEMENT of this page's head: the Server may merge
         // the displaced group, so no cut is made until it has placed it (or
         // decided not to) -- set BEFORE the step that re-derives the queue.
+        // The DATA tree's only: the Server merges data groups, never observations.
         if let Event::HeadConflict { seq, root } = &ev {
-            if self.hold_on_displace && (*seq, *root) != self.published() && *seq == self.published().0 {
-                self.engine.hold_cut();
+            if t == Tree::Data && self.hold_on_displace && (*seq, *root) != self.published() && *seq == self.published().0 {
+                self.data.engine.hold_cut();
             }
         }
         // The engine has a head once it is TOLD one, whoever tells it: the
         // held writes go the moment it is, onto the tree it now stands on.
         let recovery = matches!(ev, Event::HeadRead { .. } | Event::HeadMissing);
-        let fx = self.engine.step(ev);
-        self.carry_out(fx);
-        self.drop_dead_head();
-        if recovery && !self.engine_has_head {
-            self.engine_has_head = true;
-            self.last_head_at = self.now;
+        let fx = self.tree_mut(t).engine.step(ev);
+        self.carry_out(t, fx);
+        self.drop_dead_head(t);
+        let now = self.now;
+        let tr = self.tree_mut(t);
+        if recovery && !tr.engine_has_head {
+            tr.engine_has_head = true;
+            tr.last_head_at = now;
         }
     }
 
@@ -2244,7 +2632,7 @@ impl Page {
     /// ([`engine::Engine::supersede_read`]); the GETs only it needed end with
     /// it. Whether it was.
     pub fn supersede_read(&mut self, req: engine::read::ReqId) -> bool {
-        let done = self.engine.supersede_read(req);
+        let done = self.data.engine.supersede_read(req);
         if done {
             self.end_unneeded_gets();
         }
@@ -2259,25 +2647,28 @@ impl Page {
     /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
     /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
     fn end_unneeded_gets(&mut self) {
-        let mut ended = self.engine.take_all_withdrawn();
-        ended.extend(
-            self.deadlines
-                .keys()
-                .filter_map(|w| match w {
-                    Waiting::Get(id) => Some(*id),
-                    _ => None,
-                })
-                .chain(self.get_queue.iter().copied())
-                .filter(|id| self.blocks.get(id).is_some()),
-        );
-        for id in ended {
-            self.drop_get(id);
+        for t in self.trees() {
+            let mut ended = self.tree_mut(t).engine.take_all_withdrawn();
+            let tr = self.tree(t);
+            ended.extend(
+                self.deadlines
+                    .keys()
+                    .filter_map(|w| match w {
+                        Waiting::Get(g, id) if *g == t => Some(*id),
+                        _ => None,
+                    })
+                    .chain(self.get_queue.iter().filter(|(g, _)| *g == t).map(|(_, id)| *id))
+                    .filter(|id| tr.blocks.get(id).is_some()),
+            );
+            for id in ended {
+                self.drop_get(t, id);
+            }
         }
     }
 
     /// What the engine publishes now, as a head.
-    fn engine_published(&self) -> (u64, Cid) {
-        (self.engine.published_seq(), self.engine.published_root())
+    fn engine_published(&self, t: Tree) -> (u64, Cid) {
+        (self.tree(t).engine.published_seq(), self.tree(t).engine.published_root())
     }
 
     /// An owed head is LIVE only while it is ahead of what the engine has
@@ -2290,22 +2681,22 @@ impl Page {
     /// and nothing more is asked or sent for it. Without this the page went on
     /// asking the signer for a dead commit from a stale prev (the model found
     /// it: `NotSuccessor`, hidden behind the retries that got round it).
-    fn drop_dead_head(&mut self) {
+    fn drop_dead_head(&mut self, t: Tree) {
         // Also dead: a head whose commit was built on a root the engine no
         // longer publishes (a foreign winner adopted under it).
-        let published = self.engine_published();
-        if self.head.owed.as_ref().is_some_and(|o| o.seq <= published.0 || (o.seq - 1, o.base) != published) {
-            self.head.owed = None;
-            self.head.sign_again = None;
-            self.head.sign_refusals = 0;
-            self.head.sign_id = None;
-            for w in [Waiting::Sign(Label::Head), Waiting::Update(Label::Head), Waiting::ReadBack(Label::Head)] {
+        let published = self.engine_published(t);
+        if self.tree_mut(t).head.owed.as_ref().is_some_and(|o| o.seq <= published.0 || (o.seq - 1, o.base) != published) {
+            self.tree_mut(t).head.owed = None;
+            self.tree_mut(t).head.sign_again = None;
+            self.tree_mut(t).head.sign_refusals = 0;
+            self.tree_mut(t).head.sign_id = None;
+            for w in [Waiting::Sign(t.label()), Waiting::Update(t.label()), Waiting::ReadBack(t.label())] {
                 self.end(&w, End::Withdrawn);
             }
         }
     }
 
-    fn carry_out(&mut self, fx: Vec<Effect>) {
+    fn carry_out(&mut self, t: Tree, fx: Vec<Effect>) {
         for f in fx {
             match f {
                 // A VIEW makes no commit op: nothing of it is held, sent or
@@ -2321,66 +2712,66 @@ impl Page {
                 }
                 Effect::PutBlock { id, ref bytes, ref after } => {
                     // The page is the memory now: the engine keeps no bytes.
-                    self.blocks.insert(id, bytes);
+                    self.tree_mut(t).blocks.insert(id, bytes);
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
-                    self.held.push((after, f.clone()));
+                    self.tree_mut(t).held.push((after, f.clone()));
                 }
                 Effect::UpdateHead { ref after, .. } => {
                     let after: BTreeSet<Cid> = after.iter().copied().collect();
-                    self.held.push((after, f.clone()));
+                    self.tree_mut(t).held.push((after, f.clone()));
                 }
                 // A queued write's warm-apply block (R-b): kept for reads of
                 // the warm root, never put -- its commit puts the same bytes.
-                Effect::Keep { id, ref bytes } => self.blocks.insert(id, bytes),
+                Effect::Keep { id, ref bytes } => self.tree_mut(t).blocks.insert(id, bytes),
                 // SUPERSEDED (COMMIT-LIFE §P): a later root move re-coded the
                 // group this block was in. Its PUT is WITHDRAWN -- no more
                 // re-sends, not sent at all if still held back -- because
                 // nobody needs it; that is not a cut-off of one somebody does.
                 Effect::Withdraw { id } => {
-                    self.end(&Waiting::Put(id), End::Withdrawn);
-                    self.attempt_of.remove(&Waiting::Put(id));
-                    self.end(&Waiting::Held(id), End::Withdrawn);
-                    self.attempt_of.remove(&Waiting::Held(id));
-                    self.held_again.remove(&id);
-                    self.put_again.remove(&id);
-                    self.held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
+                    self.end(&Waiting::Put(t, id), End::Withdrawn);
+                    self.attempt_of.remove(&Waiting::Put(t, id));
+                    self.end(&Waiting::Held(t, id), End::Withdrawn);
+                    self.attempt_of.remove(&Waiting::Held(t, id));
+                    self.tree_mut(t).held_again.remove(&id);
+                    self.tree_mut(t).put_again.remove(&id);
+                    self.tree_mut(t).held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
                 }
                 // A FOREIGN member of a changed group (safety gap class 2): the node answers for it before BACKED_UP.
                 // Known here already (a PUT answered, a Held answered): told at once, no op. Else asked, once.
                 Effect::ConfirmHeld { id } => {
-                    if self.confirmed.contains(&id) {
-                        let more = self.engine.step(Event::PutConfirmed(id));
-                        self.carry_out(more);
+                    if self.tree(t).confirmed.contains(&id) {
+                        let more = self.tree_mut(t).engine.step(Event::PutConfirmed(id));
+                        self.carry_out(t, more);
                     } else {
-                        if !self.deadlines.contains_key(&Waiting::Held(id)) && !self.held_again.contains_key(&id) {
-                            self.send(Waiting::Held(id), Op::AskHeld { id });
+                        if !self.deadlines.contains_key(&Waiting::Held(t, id)) && !self.tree(t).held_again.contains_key(&id) {
+                            self.send(Waiting::Held(t, id), Op::AskHeld { id });
                         }
                         // Not known here: the engine counts it absent and sends more of its group's parity (sdk#416).
-                        let more = self.engine.step(Event::HeldUnknown(id));
-                        self.carry_out(more);
+                        let more = self.tree_mut(t).engine.step(Event::HeldUnknown(id));
+                        self.carry_out(t, more);
                     }
                 }
                 // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
                 // op, deadline and re-send), unless it is on its way or there already.
                 Effect::PutRepaired { id, ref bytes } => {
-                    self.blocks.insert(id, bytes);
-                    if !self.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.put_again.contains_key(&id) {
-                        self.repair_puts.insert(id);
-                        self.send(Waiting::Put(id), Op::Put { id, bytes: bytes.clone() });
+                    self.tree_mut(t).blocks.insert(id, bytes);
+                    if !self.tree(t).confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(t, id)) && !self.tree(t).put_again.contains_key(&id) {
+                        self.tree_mut(t).repair_puts.insert(id);
+                        self.send(Waiting::Put(t, id), Op::Put { id, bytes: bytes.clone() });
                     }
                 }
                 Effect::PutPack { id, .. } => {
                     // No packs in this phase, as the shell refuses them.
                     self.unusable.push("a pack was emitted; packs are off in this phase".into());
-                    let more = self.engine.step(Event::PutFailed(id));
-                    self.carry_out(more);
+                    let more = self.tree_mut(t).engine.step(Event::PutFailed(id));
+                    self.carry_out(t, more);
                 }
                 Effect::FetchBlock { id, .. } => {
-                    if self.blocks.get(&id).is_some() {
-                        let bytes = self.blocks.get(&id).expect("held").to_vec();
-                        let more = self.engine.step(Event::BlockArrived { id, bytes });
-                        self.carry_out(more);
-                    } else if self.deadlines.contains_key(&Waiting::Get(id)) || self.get_queue.contains(&id) {
+                    if self.tree(t).blocks.get(&id).is_some() {
+                        let bytes = self.tree(t).blocks.get(&id).expect("held").to_vec();
+                        let more = self.tree_mut(t).engine.step(Event::BlockArrived { id, bytes });
+                        self.carry_out(t, more);
+                    } else if self.deadlines.contains_key(&Waiting::Get(t, id)) || self.get_queue.contains(&(t, id)) {
                         // ONE GET per block while one is out: its answer
                         // serves every reader, and its re-send is the RTO's
                         // (with its backoff). A second send here would reset
@@ -2388,53 +2779,57 @@ impl Page {
                         // re-descent, so a silent block was re-sent on every
                         // one of them (2,001 GETs in 5 min, measured).
                     } else {
-                        self.send(Waiting::Get(id), Op::Get { id });
+                        self.send(Waiting::Get(t, id), Op::Get { id });
                     }
                 }
-                Effect::ReadHead { .. } => self.send(Waiting::RecoverHead, Op::ReadHead { label: Label::Head }),
-                client => self.client_fx.push(client),
+                Effect::ReadHead { .. } => self.send(Waiting::RecoverHead(t), Op::ReadHead { label: t.label() }),
+                // A CLIENT's effect (a write's state, a read's answer): the data tree's clients only. The observation
+                // tree has none -- its states are its own, and nothing shows them to the person (OBSERVABILITY §3).
+                client if t == Tree::Data => self.client_fx.push(client),
+                _ => {}
             }
         }
-        self.release();
+        self.release(t);
         // Every engine step's effects come through here, so no GET the engine stopped needing outlives the call
         // that stopped needing it (sdk#303).
         self.end_unneeded_gets();
+        self.pump_obs();
     }
 
     /// Effects whose `after` set is now confirmed go out, in emitted order.
-    fn release(&mut self) {
+    fn release(&mut self, t: Tree) {
         let mut i = 0;
-        while i < self.held.len() {
-            if self.held[i].0.iter().all(|c| self.confirmed.contains(c)) {
-                let (_, f) = self.held.remove(i);
+        while i < self.tree(t).held.len() {
+            if self.tree(t).held[i].0.iter().all(|c| self.tree(t).confirmed.contains(c)) {
+                let (_, f) = self.tree_mut(t).held.remove(i);
                 match f {
                     Effect::PutBlock { id, bytes, .. } => {
-                        if self.confirmed.contains(&id) {
+                        if self.tree(t).confirmed.contains(&id) {
                             // Already on the node: the engine hears it again.
-                            let more = self.engine.step(Event::PutConfirmed(id));
-                            self.carry_out(more);
+                            let more = self.tree_mut(t).engine.step(Event::PutConfirmed(id));
+                            self.carry_out(t, more);
                         } else {
                             // A commit's own now: its answer is the commit's.
-                            self.repair_puts.remove(&id);
-                            self.send(Waiting::Put(id), Op::Put { id, bytes });
+                            self.tree_mut(t).repair_puts.remove(&id);
+                            self.send(Waiting::Put(t, id), Op::Put { id, bytes });
                         }
                     }
                     // A head held across an adopt belongs to a DEAD commit
                     // (its writes were told `Lost`): it is at or behind what
                     // the engine now publishes, and asking for it would name a
                     // prev it does not follow (the model: `NotSuccessor`).
-                    Effect::UpdateHead { seq, .. } if seq <= self.engine.published_seq() => {}
+                    Effect::UpdateHead { seq, .. } if seq <= self.tree(t).engine.published_seq() => {}
                     // A head whose commit was built on a root the engine no
                     // longer publishes is DEAD: a foreign winner was adopted
                     // under it. The engine re-derives the commit on the new
                     // root and emits a new head.
-                    Effect::UpdateHead { seq, base, .. } if (seq - 1, base) != self.engine_published() => {}
+                    Effect::UpdateHead { seq, base, .. } if (seq - 1, base) != self.engine_published(t) => {}
                     Effect::UpdateHead { seq, root, base, .. } => {
                         // The owed head this one replaces is dead (the engine published it, or adopted over it):
                         // its waits end with it, before this head's own go out under the same labels.
-                        self.drop_dead_head();
-                        self.head.owed = Some(Owed { seq, root, base, record: None, stale_reads: 0 });
-                        self.ask_sign();
+                        self.drop_dead_head(t);
+                        self.tree_mut(t).head.owed = Some(Owed { seq, root, base, record: None, stale_reads: 0 });
+                        self.ask_sign(t);
                     }
                     _ => unreachable!("only puts and heads are held"),
                 }
@@ -2451,31 +2846,31 @@ impl Page {
     /// sdk#235): shown to a person, so the transitional form is a number
     /// someone can act on.
     pub fn forced_writes(&self) -> u64 {
-        self.engine.forced_writes()
+        self.data.engine.forced_writes()
     }
 
     /// The engine's asks so far, `(wanted, raced)` (sdk#303): a read's cap counts the wanted.
     pub fn fetch_counts(&self) -> (usize, usize) {
-        self.engine.fetch_counts()
+        self.data.engine.fetch_counts()
     }
 
     /// Read repairs through parity: `(started, rebuilt, given up)`.
     pub fn repair_counts(&self) -> (u64, u64, u64) {
-        self.engine.repair_counts()
+        self.data.engine.repair_counts()
     }
 
     /// Why the last read repair was given up, if one was.
     pub fn repair_failed(&self) -> Option<&str> {
-        self.engine.repair_failed()
+        self.data.engine.repair_failed()
     }
 
     pub fn owed_groups(&self) -> usize {
-        self.engine.owed_groups()
+        self.data.engine.owed_groups()
     }
 
     /// GETs the engine withdrew that this page has not ended yet (sdk#303): 0 after every step.
     pub fn withdrawn(&self) -> usize {
-        self.engine.withdrawn_count()
+        self.data.engine.withdrawn_count()
     }
 
     /// Is anything still owed an answer or a re-send — an op in flight, a
@@ -2483,10 +2878,8 @@ impl Page {
     /// new arrives.
     pub fn waiting(&self) -> bool {
         !self.deadlines.is_empty()
-            || !self.put_again.is_empty()
-            || self.head.sign_again.is_some()
             || self.sites.values().any(|p| p.sign_again.is_some())
-            || !self.held_again.is_empty()
+            || self.trees().into_iter().map(|t| self.tree(t)).any(|tr| !tr.put_again.is_empty() || tr.head.sign_again.is_some() || !tr.held_again.is_empty())
     }
 
     /// Ops to send, in order.
@@ -2546,9 +2939,10 @@ impl Page {
     /// slow ("not answering for N s", rule 8). Never an end: the request is
     /// still being re-sent. `None` when nothing waits.
     pub fn not_answering(&self) -> Option<(String, u64)> {
+        // What a PERSON is shown: never the observation tree's ops (OBSERVABILITY §3: nothing shows its states).
         self.first_of
             .iter()
-            .filter(|(w, _)| self.deadlines.contains_key(*w))
+            .filter(|(w, _)| self.deadlines.contains_key(*w) && w.tree() != Some(Tree::Obs))
             .min_by_key(|(_, at)| **at)
             .map(|(w, at)| (waiting_name(w), self.now.saturating_sub(*at)))
     }
@@ -2600,7 +2994,7 @@ impl Page {
     }
 
     fn published_seq_at_least(&self, seq: u64) -> bool {
-        self.recovered && self.engine.published_seq() >= seq
+        self.data.recovered && self.data.engine.published_seq() >= seq
     }
 
     /// Is this page a VIEW: it makes no commit op, only repair PUTs.
@@ -2614,7 +3008,7 @@ impl Page {
 
     /// The head the engine last saw published.
     pub fn published(&self) -> (u64, Cid) {
-        (self.engine.published_seq(), self.engine.published_root())
+        (self.data.engine.published_seq(), self.data.engine.published_root())
     }
 
     /// Whether this page's owed parity covers the whole published tree
@@ -2622,85 +3016,85 @@ impl Page {
     /// page that opened on a non-empty head says `NotScanned` — its "0 owed"
     /// means it never looked — until sdk#119's probe re-derives it.
     pub fn parity_scan(&self) -> &engine::ParityScan {
-        self.engine.parity_scan()
+        self.data.engine.parity_scan()
     }
 
     /// Is this page's PUT of `id` on the wire, or waiting to be sent again (sdk#433: what a node's text-named
     /// refusal may be attributed to)?
     pub fn put_waiting(&self, id: &Cid) -> bool {
-        self.deadlines.contains_key(&Waiting::Put(*id)) || self.put_again.contains_key(id)
+        self.trees().into_iter().any(|t| self.deadlines.contains_key(&Waiting::Put(t, *id)) || self.tree(t).put_again.contains_key(id))
     }
 
     /// Repair PUTs the node's Block contract rejected (sdk#433), dropped.
     pub fn repairs_rejected(&self) -> u64 {
-        self.repairs_rejected
+        self.data.repairs_rejected
     }
 
     /// Blocks the node's Block contract rejected (sdk#433): damaged, for the assets dashboard.
     pub fn rejected_blocks(&self) -> &std::collections::BTreeSet<Cid> {
-        self.engine.rejected_blocks()
+        self.data.engine.rejected_blocks()
     }
 
     /// Landings of a signer's record this page started, and the most UPDATEs
     /// one of them needed (a lost UPDATE is re-sent at its deadline).
     pub fn landings(&self) -> (u32, u32) {
-        (self.landings, self.most_landing_updates)
+        (self.data.landings, self.data.most_landing_updates)
     }
 
 
     /// Every record the signer returned (invariant 2's evidence).
     pub fn signer_records(&self) -> &BTreeSet<Vec<u8>> {
-        &self.signer_records
+        &self.data.signer_records
     }
 
     /// Every write in the engine's queue with its stage (R-b).
     pub fn queue_stages(&self) -> Vec<(engine::ClientId, engine::WriteId, engine::Stage)> {
-        self.engine.queue_stages().collect()
+        self.data.engine.queue_stages().collect()
     }
 
     /// Does a write still applying write a key in `[lo, hi)`?
     pub fn applying_touches(&self, lo: &[u8], hi: &[u8]) -> bool {
-        self.engine.applying_touches(lo, hi)
+        self.data.engine.applying_touches(lo, hi)
     }
 
     /// The stage of the last queued write that writes `key`.
     pub fn stage_of_key(&self, key: &[u8]) -> Option<engine::Stage> {
-        self.engine.stage_of_key(key)
+        self.data.engine.stage_of_key(key)
     }
 
     /// Writes queued and their bytes (what `QueueFull` measures; a held
     /// deferred write takes room like any other).
     pub fn queue_load(&self) -> (usize, usize) {
-        self.engine.queue_load()
+        self.data.engine.queue_load()
     }
 
     /// WHAT IS UNSAVED (sdk#350), its one owner the engine: writes taken
     /// and not published, a held DEFERRED write not among them. What a
     /// session's "unsaved changes" is derived from, never a tally of its own.
     pub fn unsaved_writes(&self) -> usize {
-        self.engine.unsaved_writes()
+        self.data.engine.unsaved_writes()
     }
 
     /// The client of every unsaved write (the engine's rule, per write).
     pub fn unsaved_clients(&self) -> Vec<engine::ClientId> {
-        self.engine.unsaved_clients().collect()
+        self.data.engine.unsaved_clients().collect()
     }
 
     /// Own commits published and the queued writes they carried (K9: writes
     /// per commit, what group commit is measured by).
     pub fn commits_and_writes(&self) -> (u64, u64) {
-        self.engine.commits_and_writes()
+        self.data.engine.commits_and_writes()
     }
 
     /// Writes told `Published` because a head's ledger witnessed their group
     /// landed unheard (COMMIT-LIFE ⁵).
     pub fn landed_by_witness(&self) -> u64 {
-        self.engine.landed_by_witness()
+        self.data.engine.landed_by_witness()
     }
 
     /// Writes told `Published` by a no-op group: the tree already held them.
     pub fn noop_published(&self) -> u64 {
-        self.engine.noop_published()
+        self.data.engine.noop_published()
     }
 
     /// See `hold_on_displace`: the Server that merges turns it on.
@@ -2709,60 +3103,60 @@ impl Page {
     }
 
     pub fn cut_held(&self) -> bool {
-        self.engine.cut_held()
+        self.data.engine.cut_held()
     }
 
     /// The hold ends with nothing to merge.
     pub fn release_cut(&mut self) {
-        let fx = self.engine.release_cut();
-        self.carry_out(fx);
+        let fx = self.data.engine.release_cut();
+        self.carry_out(Tree::Data, fx);
     }
 
     /// A merge's writes, at the FRONT of the queue (review §1 on sdk#295).
     pub fn merge_front(&mut self, client: ClientId, writes: Vec<engine::MergeWrite>) {
-        let fx = self.engine.merge_front(client, writes);
-        self.carry_out(fx);
+        let fx = self.data.engine.merge_front(client, writes);
+        self.carry_out(Tree::Data, fx);
     }
 
     /// The next write taken is a re-run that spent `tries` (ONE budget).
     pub fn carry_tries(&mut self, tries: u32) {
-        self.engine.carry_tries(tries);
+        self.data.engine.carry_tries(tries);
     }
 
     pub fn clear_carried_tries(&mut self) {
-        self.engine.clear_carried_tries();
+        self.data.engine.clear_carried_tries();
     }
 
     pub fn max_write_tries(&self) -> u32 {
-        self.engine.max_write_tries()
+        self.data.engine.max_write_tries()
     }
 
     /// The seq the commit in flight would land at (`None`: none in flight).
     pub fn committing_seq(&self) -> Option<u64> {
-        self.engine.committing_seq()
+        self.data.engine.committing_seq()
     }
 
     /// The engine's own counts the model reads (R-b): K9 rebuilds that
     /// differed, re-derivations on own publish, impossible stage moves.
     pub fn queue_counts(&self) -> (u64, u64, u64) {
-        (self.engine.rebuild_differs(), self.engine.own_publish_rederived(), self.engine.impossible_transitions())
+        (self.data.engine.rebuild_differs(), self.data.engine.own_publish_rederived(), self.data.engine.impossible_transitions())
     }
 
     /// The WARM root: this page's accepted writes applied, published or not
     /// (READ-STATE, design B). What an own-tree walk reads.
     pub fn warm_root(&self) -> Cid {
-        self.engine.root()
+        self.data.engine.root()
     }
 
     /// Walk the tree at `root` over the blocks this page holds, now
     /// (`engine::Engine::walk`).
     pub fn walk(&self, root: &Cid, walk: &engine::read::Walk) -> engine::read::Walked {
-        self.engine.walk(root, walk)
+        self.data.engine.walk(root, walk)
     }
 
     /// The blocks the page holds.
     pub fn blocks(&self) -> &PageBlocks {
-        &self.blocks
+        &self.data.blocks
     }
 }
 
@@ -2793,11 +3187,11 @@ mod unneeded_gets {
     fn a_queued_get_nobody_needs_is_ended() {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let (held, wanted) = ([1u8; 32], [2u8; 32]);
-        p.blocks.insert(held, b"held");
-        p.get_queue.push_back(held);
-        p.get_queue.push_back(wanted);
+        p.data.blocks.insert(held, b"held");
+        p.get_queue.push_back((Tree::Data, held));
+        p.get_queue.push_back((Tree::Data, wanted));
         p.end_unneeded_gets();
-        assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![wanted], "the held block's queued GET was not ended, or the wanted one was");
+        assert_eq!(p.get_queue.iter().map(|(_, q)| *q).collect::<Vec<_>>(), vec![wanted], "the held block's queued GET was not ended, or the wanted one was");
     }
 }
 
@@ -2812,18 +3206,18 @@ mod repair_put {
     fn a_repair_puts_answer_confirms_nothing() {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let (id, bytes) = ([7u8; 32], b"rebuilt".to_vec());
-        p.carry_out(vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
+        p.carry_out(Tree::Data, vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
         let puts: Vec<Op> = p.take_ops().into_iter().filter(|o| matches!(o, Op::Put { .. })).collect();
         assert_eq!(puts, vec![Op::Put { id, bytes: bytes.clone() }], "the repair was not PUT through the sender");
-        assert!(p.deadlines.contains_key(&Waiting::Put(id)), "the repair PUT has no deadline: it would not be re-sent");
+        assert!(p.deadlines.contains_key(&Waiting::Put(Tree::Data, id)), "the repair PUT has no deadline: it would not be re-sent");
         p.answer(Answer::PutOk(id), Ms(1));
-        assert!(!p.confirmed.contains(&id), "a repair PUT's answer confirmed the block for the commits");
-        assert!(!p.deadlines.contains_key(&Waiting::Put(id)), "the answered repair PUT is still waiting");
+        assert!(!p.data.confirmed.contains(&id), "a repair PUT's answer confirmed the block for the commits");
+        assert!(!p.deadlines.contains_key(&Waiting::Put(Tree::Data, id)), "the answered repair PUT is still waiting");
 
         // The same block, then put by a commit: its answer is the commit's.
-        p.carry_out(vec![Effect::PutBlock { id, bytes: bytes.clone(), after: Vec::new() }]);
+        p.carry_out(Tree::Data, vec![Effect::PutBlock { id, bytes: bytes.clone(), after: Vec::new() }]);
         p.answer(Answer::PutOk(id), Ms(2));
-        assert!(p.confirmed.contains(&id), "a commit's PUT of a once-repaired block was not confirmed");
+        assert!(p.data.confirmed.contains(&id), "a commit's PUT of a once-repaired block was not confirmed");
     }
 
     /// RACE PUT's condition (a) (COMMIT-LIFE §P, the architect): a repair
@@ -2837,15 +3231,15 @@ mod repair_put {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let _ = p.take_ops();
         let (id, bytes) = ([7u8; 32], b"rebuilt".to_vec());
-        p.carry_out(vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
+        p.carry_out(Tree::Data, vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
         p.answer(Answer::PutOk(id), Ms(1));
         let _ = p.take_ops();
-        let (pseq, base) = p.engine_published();
-        p.held.push((BTreeSet::from([id]), Effect::UpdateHead { seq: pseq + 1, root: [3u8; 32], base, after: vec![id] }));
-        p.release();
+        let (pseq, base) = p.engine_published(Tree::Data);
+        p.data.held.push((BTreeSet::from([id]), Effect::UpdateHead { seq: pseq + 1, root: [3u8; 32], base, after: vec![id] }));
+        p.release(Tree::Data);
         assert!(!p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "a head was released by a REPAIR PUT's answer");
         // The commit's own PUT of the block is answered: the head goes.
-        p.carry_out(vec![Effect::PutBlock { id, bytes, after: Vec::new() }]);
+        p.carry_out(Tree::Data, vec![Effect::PutBlock { id, bytes, after: Vec::new() }]);
         p.answer(Answer::PutOk(id), Ms(2));
         assert!(p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "the commit's own PUT answer did not release the head to be signed");
     }
@@ -2867,14 +3261,14 @@ mod confirm_held {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let _ = p.take_ops();
         let (put, rebuilt) = ([7u8; 32], [8u8; 32]);
-        p.confirmed.insert(put);
-        p.carry_out(vec![Effect::ConfirmHeld { id: put }]);
+        p.data.confirmed.insert(put);
+        p.carry_out(Tree::Data, vec![Effect::ConfirmHeld { id: put }]);
         assert_eq!(asks(&mut p), 0, "a block the node confirmed was asked about again");
-        p.blocks.insert(rebuilt, b"rebuilt from its group");
-        p.carry_out(vec![Effect::ConfirmHeld { id: rebuilt }]);
+        p.data.blocks.insert(rebuilt, b"rebuilt from its group");
+        p.carry_out(Tree::Data, vec![Effect::ConfirmHeld { id: rebuilt }]);
         assert_eq!(asks(&mut p), 1, "a block only in page memory was taken as on the node");
         p.answer(Answer::Held { id: rebuilt, present: true }, Ms(1));
-        assert!(p.confirmed.contains(&rebuilt), "the node's Held answer did not confirm it");
+        assert!(p.data.confirmed.contains(&rebuilt), "the node's Held answer did not confirm it");
     }
 
     /// RULE 7 for a block the page has NO bytes for (a foreign member it only asks about): absent, it is asked
@@ -2885,7 +3279,7 @@ mod confirm_held {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let _ = p.take_ops();
         let id = [9u8; 32];
-        p.carry_out(vec![Effect::ConfirmHeld { id }]);
+        p.carry_out(Tree::Data, vec![Effect::ConfirmHeld { id }]);
         assert_eq!(asks(&mut p), 1);
         let mut now = 0u64;
         for n in 0..(HELD_ABSENTS + 3) {
@@ -2895,9 +3289,9 @@ mod confirm_held {
             p.tick(Ms(now));
             assert_eq!(asks(&mut p), 1, "absent answer {}: the block was not asked again", n + 1);
         }
-        assert!(p.put_again.is_empty(), "a block the page has no bytes for was queued to be PUT");
+        assert!(p.data.put_again.is_empty(), "a block the page has no bytes for was queued to be PUT");
         p.answer(Answer::Held { id, present: true }, Ms(now + 1));
-        assert!(p.confirmed.contains(&id));
+        assert!(p.data.confirmed.contains(&id));
     }
 }
 
@@ -2914,14 +3308,14 @@ mod parked_get {
         // The page's OPENING head read answered first, through the real path: the GET goes into an EMPTY queue,
         // so its answer is a sample (sdk#390), and the tick below tests only the parked GET.
         p.now = 5;
-        p.answered(&Waiting::RecoverHead);
+        p.answered(&Waiting::RecoverHead(Tree::Data));
         let id = [9u8; 32];
-        p.send(Waiting::Get(id), Op::Get { id });
+        p.send(Waiting::Get(Tree::Data, id), Op::Get { id });
         assert!(p.take_ops().contains(&Op::Get { id }), "the GET did not go out");
         p.answer(Answer::GetMissed(id), Ms(10));
         // After the answer: an attempt-1 answer is an RTO sample, and it opens the window.
         let (rto_before, window_before) = (p.rto.rto_ms(), p.window.size());
-        let (sent, due) = p.deadlines.get(&Waiting::Get(id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
+        let (sent, due) = p.deadlines.get(&Waiting::Get(Tree::Data, id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
         assert!(!sent, "a parked GET counts as on the wire");
         assert_eq!(due, 10 + p.backoff(1), "parked at a backoff other than send()'s");
         assert_eq!(p.gets_in_flight(), 0, "a parked GET holds a window place");
@@ -2930,7 +3324,7 @@ mod parked_get {
         assert_eq!(p.rto.rto_ms(), rto_before, "a parked GET coming due was counted as a timeout");
         assert_eq!(p.window.size(), window_before, "a parked GET coming due halved the window");
         // The engine here waits on nothing: the parked GET ends rather than going out.
-        assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
+        assert!(!p.deadlines.contains_key(&Waiting::Get(Tree::Data, id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
     }
 }
@@ -2986,7 +3380,7 @@ mod recording {
         p.now = EPOCH_MS + 5_000;
         p.record_into(1024);
         let id = [7u8; 32];
-        p.send(Waiting::Put(id), Op::Put { id, bytes: vec![1] });
+        p.send(Waiting::Put(Tree::Data, id), Op::Put { id, bytes: vec![1] });
         let r = p.recording().expect("attached");
         let reqs: Vec<u32> = r.events().into_iter().filter_map(|e| match e { Event::Edge { dir: Dir::Request, id, .. } => Some(id.ordinal()), _ => None }).collect();
         assert_eq!(reqs, vec![1], "the send is not req#1");
@@ -2997,12 +3391,12 @@ mod recording {
         // Unanswered: it times out and is sent again -- a new send.
         p.tick(Ms(EPOCH_MS + 6_000));
         let r = p.recording().expect("attached");
-        assert!(r.events().contains(&Event::Exit { site: op_site(&Waiting::Put(id)), op: instrument::Label::new(Kind::Request, 1).expect("1").op(), outcome: Outcome::Timeout }), "the timeout was not recorded");
+        assert!(r.events().contains(&Event::Exit { site: op_site(&Waiting::Put(Tree::Data, id)), op: instrument::Label::new(Kind::Request, 1).expect("1").op(), outcome: Outcome::Timeout }), "the timeout was not recorded");
         assert_eq!(counters(&r, 2, Key::Attempts), vec![2], "the re-send is not req#2 on its second attempt");
         // An op answered on its first send, into an EMPTY queue (sdk#390: a queued answer is no sample): the PUT's
         // re-send is answered first, then its sample as computed, and the RTO after it.
         p.now = EPOCH_MS + 6_050;
-        p.answered(&Waiting::Put(id));
+        p.answered(&Waiting::Put(Tree::Data, id));
         p.now = EPOCH_MS + 6_100;
         p.send_ext(Ext::SignerFirst, Ms(EPOCH_MS + 6_100));
         p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 6_140));
@@ -3028,12 +3422,12 @@ mod recording {
         p.now = EPOCH_MS;
         p.record_into(1024);
         let (a, b) = ([7u8; 32], [8u8; 32]);
-        p.send(Waiting::Put(a), Op::Put { id: a, bytes: vec![1] });
+        p.send(Waiting::Put(Tree::Data, a), Op::Put { id: a, bytes: vec![1] });
         p.tick(Ms(EPOCH_MS + 1_500));
         let (k1, v1) = p.close_obs_window(&site, 100, None).expect("a recording");
         p.answer(Answer::PutOk(a), Ms(EPOCH_MS + 2_000));
         p.now = EPOCH_MS + 2_000;
-        p.send(Waiting::Put(b), Op::Put { id: b, bytes: vec![2] });
+        p.send(Waiting::Put(Tree::Data, b), Op::Put { id: b, bytes: vec![2] });
         p.tick(Ms(EPOCH_MS + 9_000));
         let (k2, v2) = p.close_obs_window(&site, 101, None).expect("a recording");
         assert_eq!((k1, k2), (obs::detail_key(&site, 100), obs::detail_key(&site, 101)));
@@ -3077,10 +3471,10 @@ mod recording {
             }
             p.sends = MAX_ORDINAL + 5;
             for i in 1..=3u8 {
-                p.send(Waiting::Get([i; 32]), Op::Get { id: [i; 32] });
+                p.send(Waiting::Get(Tree::Data, [i; 32]), Op::Get { id: [i; 32] });
             }
             p.now = EPOCH_MS + 40;
-            p.answered(&Waiting::Get([1; 32]));
+            p.answered(&Waiting::Get(Tree::Data, [1; 32]));
             let ats: Vec<u64> = p.deadlines.values().map(|d| d.at).collect();
             (ats, p.window.size(), p.rto.rto_ms())
         };
@@ -3099,7 +3493,7 @@ mod recording {
         p.rec_from = 0;
         for i in 1..=4u8 {
             let id = [i; 32];
-            p.send(Waiting::Put(id), Op::Put { id, bytes: vec![i] });
+            p.send(Waiting::Put(Tree::Data, id), Op::Put { id, bytes: vec![i] });
         }
         assert_eq!(p.take_ops().len(), 4, "a send the recording could not label did not go out");
         let r = p.recording().expect("attached");
@@ -3113,7 +3507,7 @@ mod recording {
         p.sends = u32::MAX - 1;
         for i in 5..=7u8 {
             let id = [i; 32];
-            p.send(Waiting::Put(id), Op::Put { id, bytes: vec![i] });
+            p.send(Waiting::Put(Tree::Data, id), Op::Put { id, bytes: vec![i] });
         }
         let r = p.recording().expect("attached");
         let reqs: Vec<u32> = r.events().into_iter().filter_map(|e| match e { Event::Edge { dir: Dir::Request, id, .. } => Some(id.ordinal()), _ => None }).collect();
@@ -3196,7 +3590,7 @@ mod rto_rearm {
         // The opening head read answered through the real path: the first PUT goes into an EMPTY queue, so its
         // answer is a sample (sdk#390).
         p.now = 5;
-        p.answered(&Waiting::RecoverHead);
+        p.answered(&Waiting::RecoverHead(Tree::Data));
         // A cold phase timed out tick after tick: the shared RTO at its ceiling.
         for _ in 0..10 {
             p.rto.timed_out();
@@ -3204,23 +3598,23 @@ mod rto_rearm {
         assert_eq!(p.rto.rto_ms(), rto::RTO_MAX_MS as u64, "THE SETUP: the RTO is not at its ceiling");
         let (answered, lost, resend) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         p.now = 1_000;
-        p.send(Waiting::Put(answered), Op::Put { id: answered, bytes: vec![1] });
-        p.send(Waiting::Put(lost), Op::Put { id: lost, bytes: vec![2] });
+        p.send(Waiting::Put(Tree::Data, answered), Op::Put { id: answered, bytes: vec![1] });
+        p.send(Waiting::Put(Tree::Data, lost), Op::Put { id: lost, bytes: vec![2] });
         // A re-send: its first send went unanswered.
-        p.attempt_of.insert(Waiting::Put(resend), 1);
-        p.send(Waiting::Put(resend), Op::Put { id: resend, bytes: vec![3] });
+        p.attempt_of.insert(Waiting::Put(Tree::Data, resend), 1);
+        p.send(Waiting::Put(Tree::Data, resend), Op::Put { id: resend, bytes: vec![3] });
         let _ = p.take_ops();
-        let resend_at = p.deadlines[&Waiting::Put(resend)].at;
-        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_000 + rto::RTO_MAX_MS as u64, "THE SETUP: the lost PUT was not given the ceiling");
-        assert_eq!(p.deadlines[&Waiting::Put(resend)].attempt, 2, "THE SETUP: the re-send is not a second attempt");
+        let resend_at = p.deadlines[&Waiting::Put(Tree::Data, resend)].at;
+        assert_eq!(p.deadlines[&Waiting::Put(Tree::Data, lost)].at, 1_000 + rto::RTO_MAX_MS as u64, "THE SETUP: the lost PUT was not given the ceiling");
+        assert_eq!(p.deadlines[&Waiting::Put(Tree::Data, resend)].attempt, 2, "THE SETUP: the re-send is not a second attempt");
 
         // Its sibling is answered on its first send after 100 ms: a sample, and the RTO falls.
         p.now = 1_100;
-        p.answered(&Waiting::Put(answered));
+        p.answered(&Waiting::Put(Tree::Data, answered));
         let rto = p.rto.rto_ms();
         assert!(rto < 1_000, "THE SETUP: the sample did not lower the RTO ({rto} ms)");
-        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_100 + rto, "the lost PUT is not due one new RTO after its sibling's answer");
-        assert_eq!(p.deadlines[&Waiting::Put(resend)].at, resend_at, "a RE-SEND was pulled in: it keeps its backoff");
+        assert_eq!(p.deadlines[&Waiting::Put(Tree::Data, lost)].at, 1_100 + rto, "the lost PUT is not due one new RTO after its sibling's answer");
+        assert_eq!(p.deadlines[&Waiting::Put(Tree::Data, resend)].at, resend_at, "a RE-SEND was pulled in: it keeps its backoff");
 
         // And it is re-sent one RTO after that answer, not after a minute.
         p.tick(Ms(1_100 + rto));
@@ -3246,18 +3640,18 @@ mod rto_rearm_queue {
         // THE COLD OPEN, through the real path: the opening head read times out until the RTO is at its
         // ceiling, then is answered on a RE-send -- no sample (Karn), so the batch meets the ceiling.
         while p.rto.rto_ms() < rto::RTO_MAX_MS as u64 {
-            let due = p.deadlines[&Waiting::RecoverHead].at;
+            let due = p.deadlines[&Waiting::RecoverHead(Tree::Data)].at;
             p.tick(Ms(due));
             let _ = p.take_ops();
         }
         let start = p.now;
-        p.answered(&Waiting::RecoverHead);
+        p.answered(&Waiting::RecoverHead(Tree::Data));
         assert_eq!(p.rto.rto_ms(), rto::RTO_MAX_MS as u64, "THE SETUP: the RTO is not at its ceiling");
         assert!(p.rto.srtt_ms().is_none(), "THE SETUP: a sample was taken before the batch");
         let ids: Vec<[u8; 32]> = (1..=13u8).map(|i| [i; 32]).collect();
         let lost = ids[12];
         for id in &ids {
-            p.send(Waiting::Put(*id), Op::Put { id: *id, bytes: vec![id[0]] });
+            p.send(Waiting::Put(Tree::Data, *id), Op::Put { id: *id, bytes: vec![id[0]] });
         }
         let _ = p.take_ops();
         let mut resent: Vec<u8> = Vec::new();
@@ -3267,13 +3661,13 @@ mod rto_rearm_queue {
             p.tick(Ms(t));
             resent.extend(p.take_ops().iter().filter_map(|o| match o { Op::Put { id, .. } => Some(id[0]), _ => None }));
             p.now = t;
-            p.answered(&Waiting::Put(*id));
+            p.answered(&Waiting::Put(Tree::Data, *id));
             last = t;
         }
         assert!(resent.is_empty(), "answered siblings were declared lost and re-sent: {resent:?}");
         let rto = p.rto.rto_ms();
-        println!("  12 answered 175 ms apart, last at {last}; rto {rto}; the lost PUT due at {}", p.deadlines[&Waiting::Put(lost)].at);
-        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, last + rto, "the lost PUT is not due one RTO after the last answer");
+        println!("  12 answered 175 ms apart, last at {last}; rto {rto}; the lost PUT due at {}", p.deadlines[&Waiting::Put(Tree::Data, lost)].at);
+        assert_eq!(p.deadlines[&Waiting::Put(Tree::Data, lost)].at, last + rto, "the lost PUT is not due one RTO after the last answer");
         p.tick(Ms(last + rto));
         assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at last answer + RTO");
     }
@@ -3289,7 +3683,7 @@ mod rto_rearm_queue {
     fn after_a_fast_sample_a_serialised_batch_re_sends_only_the_lost_put() {
         let mut p = Page::new(Params::default(), PutPath::Page);
         p.now = 5;
-        p.answered(&Waiting::RecoverHead);
+        p.answered(&Waiting::RecoverHead(Tree::Data));
         assert_eq!(p.rto.srtt_ms(), Some(5.0), "THE SETUP: the opening head read was not a 5 ms sample");
         println!("  after the fast sample: rto {} ms", p.rto.rto_ms());
         let ids: Vec<[u8; 32]> = (1..=13u8).map(|i| [i; 32]).collect();
@@ -3297,7 +3691,7 @@ mod rto_rearm_queue {
         let start = 1_000;
         p.now = start;
         for id in &ids {
-            p.send(Waiting::Put(*id), Op::Put { id: *id, bytes: vec![id[0]] });
+            p.send(Waiting::Put(Tree::Data, *id), Op::Put { id: *id, bytes: vec![id[0]] });
         }
         let _ = p.take_ops();
         let mut resent: Vec<(u64, u8)> = Vec::new();
@@ -3310,7 +3704,7 @@ mod rto_rearm_queue {
                 resent.extend(p.take_ops().iter().filter_map(|o| match o { Op::Put { id, .. } => Some((ms, id[0])), _ => None }));
             }
             p.now = t;
-            p.answered(&Waiting::Put(*id));
+            p.answered(&Waiting::Put(Tree::Data, *id));
             last = t;
         }
         println!("  12 answered 37 ms apart, last at {last}; rto {}; re-sent (ms, put): {resent:?}", p.rto.rto_ms());
@@ -3318,7 +3712,7 @@ mod rto_rearm_queue {
         let rto = p.rto.rto_ms();
         // Only an answer to an op sent into an EMPTY queue is a sample: a queued one times its wait too.
         assert!(rto < 200, "the batch's queue waits were taken as RTT samples: rto {rto} ms");
-        let due = p.deadlines[&Waiting::Put(lost)].at;
+        let due = p.deadlines[&Waiting::Put(Tree::Data, lost)].at;
         assert!(due <= last + rto, "the lost PUT is due at {due}, later than an RTO ({rto} ms) after the last answer ({last})");
         p.tick(Ms(due));
         assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at {due}");
@@ -3339,7 +3733,7 @@ mod rto_queue {
     fn fast_at(origin: u64) -> Page {
         let mut p = Page::new_at(Params::default(), PutPath::Page, Ms(origin));
         p.now = origin + 5;
-        p.answered(&Waiting::RecoverHead);
+        p.answered(&Waiting::RecoverHead(Tree::Data));
         assert_eq!(p.rto.rto_ms(), rto::RTO_FLOOR_MS as u64, "THE SETUP: the RTO is not at its floor");
         p
     }
@@ -3363,13 +3757,13 @@ mod rto_queue {
         }
         // The SECOND put is answered: it was queued behind the first, so it is no sample -- but the back-off ends.
         p.now = EPOCH_MS + 1_074;
-        p.answered(&Waiting::Put([2; 32]));
+        p.answered(&Waiting::Put(Tree::Data, [2; 32]));
         assert_eq!(p.rto.srtt_ms(), None, "a queued answer was taken as an RTT sample");
         assert_eq!(p.rto.rto_ms(), rto::RTO_INITIAL_MS as u64, "the back-off did not end on a queued first-send answer");
     }
 
     fn put(p: &mut Page, i: u8) {
-        p.send(Waiting::Put([i; 32]), Op::Put { id: [i; 32], bytes: vec![i] });
+        p.send(Waiting::Put(Tree::Data, [i; 32]), Op::Put { id: [i; 32], bytes: vec![i] });
     }
 
     /// sdk#390 (b): ANY answer re-arms the first sends, a RE-SEND's too -- no
@@ -3393,12 +3787,12 @@ mod rto_queue {
             put(&mut p, i);
         }
         let _ = p.take_ops();
-        let armed: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put([i; 32])].at).collect();
+        let armed: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put(Tree::Data, [i; 32])].at).collect();
         assert_eq!(armed, vec![1_100 + 2 * rto, 1_100 + 3 * rto, 1_100 + 4 * rto], "THE SETUP: the batch is not armed an RTO per place behind the re-send");
         p.now = 1_110;
-        p.answered(&Waiting::Put([9; 32]));
+        p.answered(&Waiting::Put(Tree::Data, [9; 32]));
         assert_eq!(p.rto.rto_ms(), rto, "a re-send's answer was taken as a sample");
-        let at: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put([i; 32])].at).collect();
+        let at: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put(Tree::Data, [i; 32])].at).collect();
         println!("  rto {rto}; batch armed {armed:?}; after the re-send's answer {at:?}");
         assert_eq!(at, vec![1_110 + rto, 1_110 + 2 * rto, 1_110 + 3 * rto], "the batch did not move up one place on the re-send's answer");
     }
@@ -3428,7 +3822,7 @@ mod rto_queue {
                 let answer = match ms { 1_037 => Some(1u8), 1_187 => Some(2), 1_224 => Some(3), _ => None };
                 if let Some(i) = answer {
                     p.now = o + ms;
-                    p.answered(&Waiting::Put([i; 32]));
+                    p.answered(&Waiting::Put(Tree::Data, [i; 32]));
                     if i == 1 {
                         rto_after_first = p.rto.rto_ms();
                     }
@@ -3476,16 +3870,16 @@ mod reconnect {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let ids: Vec<[u8; 32]> = (1..=3u8).map(|i| [i; 32]).collect();
         for id in &ids {
-            p.send(Waiting::Get(*id), Op::Get { id: *id });
+            p.send(Waiting::Get(Tree::Data, *id), Op::Get { id: *id });
         }
         let parked = [9u8; 32];
-        p.send(Waiting::Get(parked), Op::Get { id: parked });
+        p.send(Waiting::Get(Tree::Data, parked), Op::Get { id: parked });
         let first = p.take_ops();
         assert_eq!(first.iter().filter(|o| matches!(o, Op::Get { .. })).count(), 4, "THE SETUP: the GETs did not go out (within the window)");
         p.answer(Answer::GetMissed(parked), Ms(10));
-        let parked_at = p.deadlines[&Waiting::Get(parked)].at;
+        let parked_at = p.deadlines[&Waiting::Get(Tree::Data, parked)].at;
         let (rto, window) = (p.rto.rto_ms(), p.window.size());
-        let attempts: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(*id)].attempt).collect();
+        let attempts: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(Tree::Data, *id)].attempt).collect();
 
         p.reconnected(Ms(50));
         let again = p.take_ops();
@@ -3493,15 +3887,15 @@ mod reconnect {
             assert!(again.contains(&Op::Get { id: *id }), "a GET on the wire was not re-sent on the reconnect: {again:?}");
         }
         assert!(!again.contains(&Op::Get { id: parked }), "a PARKED GET (not on the wire) was re-sent");
-        assert_eq!(p.deadlines[&Waiting::Get(parked)].at, parked_at, "a parked GET lost its backoff");
+        assert_eq!(p.deadlines[&Waiting::Get(Tree::Data, parked)].at, parked_at, "a parked GET lost its backoff");
         assert_eq!(p.window.size(), window, "the reconnect halved the window, as if the path were congested");
         assert_eq!(p.rto.rto_ms(), rto, "the reconnect backed the RTO off");
-        let after: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(*id)].attempt).collect();
+        let after: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(Tree::Data, *id)].attempt).collect();
         assert_eq!(after, attempts, "a re-send on the new socket was counted as another attempt");
 
         // KARN: the re-send's answer, however late, is no RTT sample.
         p.now = 50_000;
-        p.answered(&Waiting::Get(ids[0]));
+        p.answered(&Waiting::Get(Tree::Data, ids[0]));
         assert_eq!(p.rto.rto_ms(), rto, "a re-sent op's answer was taken as an RTT sample");
     }
 }
@@ -3520,17 +3914,17 @@ mod not_sent {
         let id = [9u8; 32];
         let sign = Op::Sign { id: 1, prev_seq: 0, prev_root: [0u8; 32], seq: 1, root: id, ledger: Vec::new(), label: Label::Head };
         let cases = vec![
-            (Waiting::Put(id), Op::Put { id, bytes: b"x".to_vec() }),
-            (Waiting::Get(id), Op::Get { id }),
-            (Waiting::Held(id), Op::AskHeld { id }),
+            (Waiting::Put(Tree::Data, id), Op::Put { id, bytes: b"x".to_vec() }),
+            (Waiting::Get(Tree::Data, id), Op::Get { id }),
+            (Waiting::Held(Tree::Data, id), Op::AskHeld { id }),
             (Waiting::Sign(Label::Head), sign),
             (Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: b"s".to_vec() }),
             (Waiting::PutApp("k".into()), Op::PutApp { key: "k".into() }),
-            (Waiting::Warm, Op::ReadHead { label: Label::Head }),
-            (Waiting::RecoverHead, Op::ReadHead { label: Label::Head }),
-            (Waiting::Verify, Op::ReadHead { label: Label::Head }),
+            (Waiting::Warm(Tree::Data), Op::ReadHead { label: Label::Head }),
+            (Waiting::RecoverHead(Tree::Data), Op::ReadHead { label: Label::Head }),
+            (Waiting::Verify(Tree::Data), Op::ReadHead { label: Label::Head }),
             (Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head }),
-            (Waiting::Hint, Op::ReadHead { label: Label::Head }),
+            (Waiting::Hint(Tree::Data), Op::ReadHead { label: Label::Head }),
         ];
         for (w, op) in cases {
             let mut p = Page::new(Params::default(), PutPath::Page);
@@ -3618,7 +4012,7 @@ mod window_loss {
     /// not ticked yet thinks it is 0, and would date the GET long past due).
     fn ask(p: &mut Page, now: u64, id: Cid) {
         p.now = now;
-        p.send(Waiting::Get(id), Op::Get { id });
+        p.send(Waiting::Get(Tree::Data, id), Op::Get { id });
     }
 
     /// ONE BLOCK SILENT FOR EVER, 20 AVAILABLE, asked one at a time while the
@@ -3650,11 +4044,11 @@ mod window_loss {
             let asked = now;
             ask(&mut p, now, *id);
             let mut t = 0;
-            while p.blocks.get(id).is_none() && t < 120_000 {
+            while p.data.blocks.get(id).is_none() && t < 120_000 {
                 node.run(&mut p, &mut now, 100);
                 t += 100;
             }
-            assert!(p.blocks.get(id).is_some(), "a block the node serves was not read in 120 s behind one silent block (window {})", p.window.size());
+            assert!(p.data.blocks.get(id).is_some(), "a block the node serves was not read in 120 s behind one silent block (window {})", p.window.size());
             waited.push(now - asked);
             node.run(&mut p, &mut now, 5_000);
         }
@@ -3683,9 +4077,9 @@ mod window_loss {
         ask(&mut p, now, all[1].0);
         ask(&mut p, now, all[2].0);
         assert_eq!(p.gets_in_flight(), 2);
-        assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![all[2].0], "THE CONTROL: the third ask did not wait");
+        assert_eq!(p.get_queue.iter().map(|(_, q)| *q).collect::<Vec<_>>(), vec![all[2].0], "THE CONTROL: the third ask did not wait");
         node.run(&mut p, &mut now, 5_000);
-        assert!(p.blocks.get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
+        assert!(p.data.blocks.get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
         let first_resend = node.sent.iter().filter(|(_, id)| *id == all[0].0 || *id == all[1].0).nth(2).map(|(t, _)| *t).expect("a re-send");
         let third = node.sent.iter().find(|(_, id)| *id == all[2].0).map(|(t, _)| *t).expect("the third ask went out");
         assert!(third <= first_resend, "a lost GET was re-sent ({first_resend}) before the ask already waiting ({third})");
@@ -3717,15 +4111,15 @@ mod window_loss {
         }
         let mut queued_when_answered = false;
         for _ in 0..7_500 {
-            let was_queued: Vec<Cid> = p.get_queue.iter().copied().filter(|q| p.attempt_of.contains_key(&Waiting::Get(*q))).collect();
+            let was_queued: Vec<Cid> = p.get_queue.iter().map(|(_, q)| *q).filter(|q| p.attempt_of.contains_key(&Waiting::Get(Tree::Data, *q))).collect();
             node.run(&mut p, &mut now, 1);
-            queued_when_answered |= was_queued.iter().any(|id| p.blocks.get(id).is_some());
+            queued_when_answered |= was_queued.iter().any(|id| p.data.blocks.get(id).is_some());
         }
         let sends: Vec<usize> = all.iter().map(|(id, _)| node.sent.iter().filter(|(_, s)| s == id).count()).collect();
         println!("sends per block {sends:?}; a queued lost GET answered: {queued_when_answered}");
         assert!(queued_when_answered, "THE CONTROL: no lost GET was still queued when its late answer landed");
-        assert!(all.iter().all(|(id, _)| p.blocks.get(id).is_some()), "not every block was read in 7.5 s: sends {sends:?}");
-        assert!(!p.get_queue.iter().any(|q| p.blocks.get(q).is_some()), "a block already read is still queued to be asked again");
+        assert!(all.iter().all(|(id, _)| p.data.blocks.get(id).is_some()), "not every block was read in 7.5 s: sends {sends:?}");
+        assert!(!p.get_queue.iter().any(|(_, q)| p.data.blocks.get(q).is_some()), "a block already read is still queued to be asked again");
     }
 
     /// ENDING A GET LEAVES NO TRACE, however it ends (`drop_get`, the one
@@ -3753,22 +4147,22 @@ mod window_loss {
         }
         node.run(&mut p, &mut now, 3_100);
         let holders = |p: &Page, id: Cid| {
-            (p.deadlines.contains_key(&Waiting::Get(id)), p.attempt_of.contains_key(&Waiting::Get(id)), p.get_queue.contains(&id))
+            (p.deadlines.contains_key(&Waiting::Get(Tree::Data, id)), p.attempt_of.contains_key(&Waiting::Get(Tree::Data, id)), p.get_queue.contains(&(Tree::Data, id)))
         };
         for id in [late, withdrawn] {
-            assert!(p.get_queue.contains(&id) && p.attempt_of.contains_key(&Waiting::Get(id)) && !p.deadlines.contains_key(&Waiting::Get(id)), "THE CONTROL: {:?} is not a queued lost GET: {:?}", &id[..2], holders(&p, id));
+            assert!(p.get_queue.contains(&(Tree::Data, id)) && p.attempt_of.contains_key(&Waiting::Get(Tree::Data, id)) && !p.deadlines.contains_key(&Waiting::Get(Tree::Data, id)), "THE CONTROL: {:?} is not a queued lost GET: {:?}", &id[..2], holders(&p, id));
         }
         // The late answer to `late`'s first send.
         let bytes = all[0].1.clone();
         p.answer(Answer::Got { id: late, bytes }, Ms(now));
-        assert!(p.blocks.get(&late).is_some(), "the late answer was not taken");
+        assert!(p.data.blocks.get(&late).is_some(), "the late answer was not taken");
         assert_eq!(holders(&p, late), (false, false, false), "a GET ended by its late answer left a trace (deadline, attempt, queue)");
         // `withdrawn` (queued) and one ON THE WIRE: their blocks are held now
         // (a repair rebuilt them), so nobody needs either GET.
         let on_wire = all[2].0;
-        assert!(p.deadlines.get(&Waiting::Get(on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
-        p.blocks.insert(withdrawn, &all[1].1);
-        p.blocks.insert(on_wire, &all[2].1);
+        assert!(p.deadlines.get(&Waiting::Get(Tree::Data, on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
+        p.data.blocks.insert(withdrawn, &all[1].1);
+        p.data.blocks.insert(on_wire, &all[2].1);
         p.end_unneeded_gets();
         assert_eq!(holders(&p, withdrawn), (false, false, false), "a withdrawn queued GET left a trace (deadline, attempt, queue)");
         assert_eq!(holders(&p, on_wire), (false, false, false), "a withdrawn GET on the wire left a trace (deadline, attempt, queue)");
@@ -3845,7 +4239,7 @@ mod window_loss {
             ask(&mut p, now, *id);
         }
         node.run(&mut p, &mut now, 2 * rto::RTO_MAX_MS as u64 + 600_000);
-        let read = all.iter().filter(|(id, _)| p.blocks.get(id).is_some()).count();
+        let read = all.iter().filter(|(id, _)| p.data.blocks.get(id).is_some()).count();
         let lost = node.sent.len() - 200;
         println!("200 blocks through a silent node: {read} read, {} GETs sent ({lost} re-sends), most past the window when one was sent {}", node.sent.len(), node.sent_past_window);
         assert!(lost > 0, "THE CONTROL: nothing was lost and re-sent");
@@ -3871,11 +4265,11 @@ mod head_floor {
         let mut p = Page::new(Params::default(), PutPath::Page);
         p.set_head_floor(2);
         assert!(p.take_ops().contains(&Op::ReadHead { label: Label::Head }), "THE CONTROL: the page did not read its head");
-        let sent = p.deadlines.get(&Waiting::RecoverHead).map(|d| d.sent);
+        let sent = p.deadlines.get(&Waiting::RecoverHead(Tree::Data)).map(|d| d.sent);
         assert_eq!(sent, Some(true), "THE CONTROL: the head read is not on the wire");
 
         p.answer(Answer::Head { label: Label::Head, read: Some(HeadRead::from((1, [1u8; 32]))) }, Ms(10));
-        let parked = p.deadlines.get(&Waiting::RecoverHead).map(|d| (d.sent, d.at));
+        let parked = p.deadlines.get(&Waiting::RecoverHead(Tree::Data)).map(|d| (d.sent, d.at));
         let (sent, due) = parked.expect("a head below the floor dropped the head read instead of parking it");
         assert!(!sent, "a head below the floor left the read on the wire, to time out as silence");
         assert!(!p.recovered(), "a head below the floor was adopted");
@@ -3919,7 +4313,7 @@ mod head_judgement_cells {
     /// A page whose opening head read is answered away (so an answer reaches only the path under test).
     fn page() -> Page {
         let mut p = Page::new(Params::default(), PutPath::Page);
-        p.answered(&Waiting::RecoverHead);
+        p.answered(&Waiting::RecoverHead(Tree::Data));
         let _ = p.take_ops();
         p
     }
@@ -3932,10 +4326,10 @@ mod head_judgement_cells {
     fn a_verify_above_the_signers_seq_lands_a_head_my_record_beats_and_adopts_nothing() {
         let mut p = page();
         let (record, mine) = my_record(1, &[0xAA; 32]);
-        p.my_records.insert(1, (mine.root(), record.clone()));
+        p.data.my_records.insert(1, (mine.root(), record.clone()));
         let theirs = a_losing_head(&mine);
-        p.verify = Some(Verify { seq: 0, root: [0u8; 32], landing: false, again_at: None, tries: 0, updates: 0, from: None });
-        p.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
+        p.data.verify = Some(Verify { seq: 0, root: [0u8; 32], landing: false, again_at: None, tries: 0, updates: 0, from: None });
+        p.send(Waiting::Verify(Tree::Data), Op::ReadHead { label: Label::Head });
         let _ = p.take_ops();
         let before = p.published();
         p.answer(Answer::Head { label: Label::Head, read: Some(theirs.clone()) }, Ms(10));
@@ -3954,15 +4348,15 @@ mod head_judgement_cells {
         let mut p = page();
         let (record1, owed) = my_record(1, &[0xAA; 32]);
         let (record2, mine2) = my_record(2, &[0xBB; 32]);
-        p.my_records.insert(1, (owed.root(), record1.clone()));
-        p.my_records.insert(2, (mine2.root(), record2));
-        p.head.owed = Some(Owed { seq: 1, root: owed.root(), base: [0u8; 32], record: Some(record1), stale_reads: 0 });
+        p.data.my_records.insert(1, (owed.root(), record1.clone()));
+        p.data.my_records.insert(2, (mine2.root(), record2));
+        p.data.head.owed = Some(Owed { seq: 1, root: owed.root(), base: [0u8; 32], record: Some(record1), stale_reads: 0 });
         let theirs = a_losing_head(&mine2);
         p.send(Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head });
         let _ = p.take_ops();
         p.answer(Answer::Head { label: Label::Head, read: Some(theirs.clone()) }, Ms(10));
         assert_ne!(p.published(), (theirs.seq, theirs.root()), "the read-back adopted a head this page's own record beats");
-        let o = p.head.owed.as_ref().expect("the owed commit was dropped for a head this page's own record beats");
+        let o = p.data.head.owed.as_ref().expect("the owed commit was dropped for a head this page's own record beats");
         assert_eq!((o.seq, o.stale_reads), (1, 1), "the read-back did not read again (one stale read counted)");
     }
 }
@@ -4148,13 +4542,13 @@ mod confirmed_once {
         let (mut p, mine, _) = at_update(true);
         read_back_out(&mut p);
         // The second commit's blocks are on the node already (answered earlier): its head waits on nothing.
-        p.confirmed.extend(next.iter().copied());
+        p.data.confirmed.extend(next.iter().copied());
         if by_push {
             p.head_pushed(mine.clone());
         } else {
             p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
         }
-        let o = p.head.owed.as_ref().expect("the next commit's owed head was dropped by the confirming step");
+        let o = p.data.head.owed.as_ref().expect("the next commit's owed head was dropped by the confirming step");
         assert_eq!(o.seq, mine.seq + 1, "THE SETUP: the confirming step did not release the next commit's head");
         assert!(p.deadlines.contains_key(&Waiting::Sign(Label::Head)), "the next commit's sign wait was ended with the confirmed head");
         assert!(!p.deadlines.contains_key(&Waiting::ReadBack(Label::Head)), "the confirmed head's read-back wait outlived it");
@@ -4163,7 +4557,7 @@ mod confirmed_once {
             p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(13));
         }
         settle(&mut p);
-        assert_eq!(p.engine_published().0, mine.seq + 1, "the next commit did not publish");
+        assert_eq!(p.engine_published(Tree::Data).0, mine.seq + 1, "the next commit did not publish");
         assert_eq!(published(&mut p), BTreeMap::from([(WriteId(1), 1), (WriteId(2), 1)]), "each write was not published exactly once");
     }
 

@@ -97,12 +97,15 @@ export async function openSession(Session, {
   removeEventListener: offWindow = (typeof removeEventListener === "function" ? removeEventListener : null),
   // What a page reads to know it is being hidden rather than shown.
   documentOf = (typeof document === "object" ? document : null),
+  // The page's own location path (the site it was served from), injected like the rest.
+  pagePath = (typeof location === "object" && location !== null ? String(location.pathname ?? "") : ""),
 } = {}) {
   const session = new Session(port);
   // THE LOADER'S RECORDING (sdk#386's instrument work): its fetch rounds open this session's page recording, once --
   // the ring stops recording when taken. Numbers only; the page validates each.
   const seg = loaderRing.take();
-  session.adopt_loader(seg.startMs, Float64Array.from(seg.events), seg.dropped);
+  // The page's own path: the site it was served from is the app this person ran (sdk#399; Rust decodes it strictly).
+  session.adopt_loader(seg.startMs, Float64Array.from(seg.events), seg.dropped, pagePath);
   if (app !== null) session.set_app(app);
   // A tree reader's stream-id range, 1..=255 and never reused while open.
   let rangeCursor = 0;
