@@ -2086,12 +2086,13 @@ impl Page {
             engine::read::ReadResult::Nodes { nodes, next } => {
                 // THE ROOT's group of one (sdk#335): its parity ids are a function of its bytes, which the walk read.
                 let root = a.root;
+                let rejected = self.engine.rejected_blocks();
                 if nodes.iter().any(|n| n.id == root) {
                     if let Some(parity) = self.blocks.get(&root).and_then(engine::repair::root_parity) {
-                        a.add_group(vec![root], parity.into_iter().map(|(id, _)| id).collect());
+                        a.add_group(vec![root], parity.into_iter().map(|(id, _)| id).collect(), rejected);
                     }
                 }
-                a.walked_page(nodes, next)
+                a.walked_page(nodes, next, rejected)
             }
             // The walk could not be served (a tree the engine gave up on): what was walked is measured, and said.
             other => {
@@ -3444,7 +3445,7 @@ mod audit_held {
         p.blocks.insert(x, b"bytes the page holds");
         let mut a = audit::Audit::new(p.published().1);
         a.walked = true;
-        a.add_group(vec![x], Vec::new());
+        a.add_group(vec![x], Vec::new(), &BTreeSet::new());
         p.audit = Some(a);
         let ops = p.take_ops();
         let Some(Op::AskHeld { batch, ids }) = ops.into_iter().find(|o| matches!(o, Op::AskHeld { .. })) else { panic!("THE SETUP: the audit asked no Held") };
