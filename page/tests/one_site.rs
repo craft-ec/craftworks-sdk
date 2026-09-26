@@ -1,6 +1,6 @@
-//! ONE SITE (the architect's check 2 on sdk#407), held by the source: a deadline leaves only through `Page::end`,
-//! arrives only through `send` and `park`, and an op reaches the wire only from `send` and `reconnected` -- each of
-//! which records. A new path that bypassed them would be an op the page's recording never saw.
+//! ONE SITE (the architect's check 2 on sdk#407), held by the source: the op record (OP-LIFE.md) is written only by its
+//! transition functions in `op_life.rs`, and an op reaches the wire only from `put_on_wire` and `reconnect_ops` -- each
+//! of which records. A new path that bypassed them would be an op the page's recording never saw.
 //!
 //! The cut between production and tests is the ONE shared `production_of` (sdk#419): this scan once cut at the first
 //! `#[cfg(test)]` anywhere, and #401's test-only field cut it early -- every count below read 0 over nothing.
@@ -9,26 +9,65 @@ mod common;
 use common::{items_after_the_cut, production_of};
 
 const LIB: &str = include_str!("../src/lib.rs");
+const OP_LIFE: &str = include_str!("../src/op_life.rs");
 
-/// The counts a scan of production code makes, one owner for the three patterns.
-fn counts(production: &str) -> [usize; 3] {
-    [
-        production.matches(concat!("deadlines", ".remove(")).count(),
-        production.matches(concat!("deadlines", ".insert(")).count(),
-        production.matches(concat!("self.out", ".push(")).count(),
-    ]
+/// The counts a scan of production code makes, one owner for the patterns the cut controls below read.
+fn counts(production: &str) -> [usize; 1] {
+    [production.matches(concat!("deadlines", ".remove(")).count()]
 }
 
+/// Each production line of `src` with the name of the fn it lies in (the last `fn name(` opened above it).
+fn lines_in_fns(src: &str) -> Vec<(String, &str)> {
+    let mut current = String::new();
+    let mut out = Vec::new();
+    for l in src.lines() {
+        if let Some(i) = l.find("fn ") {
+            let rest = &l[i + 3..];
+            if let Some(end) = rest.find(['(', '<']) {
+                if rest[..end].chars().all(|c| c.is_alphanumeric() || c == '_') && !l.trim_start().starts_with("//") {
+                    current = rest[..end].to_string();
+                }
+            }
+        }
+        out.push((current.clone(), l));
+    }
+    out
+}
+
+/// The ways lib.rs could replace the WHOLE op record past its transitions.
+const WHOLE_RECORD: [&str; 4] = ["self.ops = ", "&mut self.ops", "mem::take(&mut self.ops", "mem::replace(&mut self.ops"];
+
+/// ONE WRITER, BY TYPE (CLAUDE.md "Structure before code"): the op record's fields are private to `op_life`, so the
+/// COMPILER already refuses a write of them from lib.rs, and `Ops` has no `Default` (so no `mem::take`). What a type
+/// cannot hold -- `Page.ops` is a field of `Page`, which lives in lib.rs -- is scanned here: lib.rs never assigns,
+/// replaces or `&mut`-borrows the whole record. And `Page.out` is lib.rs's too: an op reaches the wire only from
+/// op_life's two doors, each of which records its send first.
 #[test]
-fn a_deadline_ends_only_through_end_and_an_op_goes_out_only_from_send_or_reconnected() {
+fn the_whole_op_record_is_never_replaced_and_an_op_goes_out_only_from_its_two_wire_doors() {
     let lib = production_of(LIB);
-    assert!(lib.contains("fn end(") && lib.contains("fn send(") && lib.len() * 2 > LIB.len(), "THE CONTROL: the production cut of lib.rs lost the code it scans ({} of {} bytes)", lib.len(), LIB.len());
-    let stray = items_after_the_cut(LIB);
-    assert!(stray.is_empty(), "page/src/lib.rs: production items after the production cut, where this scan does not look: {stray:?}");
-    let [removes, inserts, pushes] = counts(lib);
-    assert_eq!(removes, 1, "a deadline is removed outside `end`: its end is not recorded");
-    assert_eq!(inserts, 2, "a deadline is made outside `send`/`park`");
-    assert_eq!(pushes, 2, "an op is put on the wire outside `send`/`reconnected`: it is not recorded");
+    let op_life = production_of(OP_LIFE);
+    assert!(lib.contains("fn send(") && lib.len() * 2 > LIB.len(), "THE CONTROL: the production cut of lib.rs lost the code it scans ({} of {} bytes)", lib.len(), LIB.len());
+    assert!(op_life.contains("fn on(") && op_life.contains("fn put_on_wire(") && !op_life.contains("mod test_view"), "THE CONTROL: the production cut of op_life.rs is wrong");
+    for (file, src) in [("lib.rs", LIB), ("op_life.rs", OP_LIFE)] {
+        let stray = items_after_the_cut(src);
+        assert!(stray.is_empty(), "page/src/{file}: production items after the production cut, where this scan does not look: {stray:?}");
+    }
+    assert!(lib.contains("ops: op_life::Ops::new()"), "THE CONTROL: the record is not made where this scan expects");
+    for pat in WHOLE_RECORD {
+        assert_eq!(lib.matches(pat).count(), 0, "lib.rs replaces or borrows the whole op record (`{pat}`): only op_life's transitions may change it");
+    }
+    assert_eq!(lib.matches(concat!("self.out", ".push(")).count(), 0, "lib.rs puts an op on the wire: only op_life's two doors may");
+    let pushes: Vec<String> = lines_in_fns(op_life).into_iter().filter(|(_, l)| l.contains(concat!("self.out", ".push("))).map(|(f, _)| f).collect();
+    assert_eq!(pushes, vec!["put_on_wire".to_string(), "reconnect_ops".to_string()], "an op is put on the wire outside put_on_wire/reconnect_ops: it is not recorded");
+}
+
+/// THE CONTROL of the door scan: a push outside the two doors, and a whole-record replacement, are named.
+#[test]
+fn the_door_scan_names_a_push_outside_the_doors_and_a_record_replacement() {
+    let bad = "impl Page {\n    fn put_on_wire(&mut self) {\n        self.out.push(op);\n    }\n    fn helper(&mut self) {\n        self.out.push(op);\n        self.ops = Ops::new();\n    }\n}\n";
+    let pushes: Vec<String> = lines_in_fns(bad).into_iter().filter(|(_, l)| l.contains(concat!("self.out", ".push("))).map(|(f, _)| f).collect();
+    assert_eq!(pushes, vec!["put_on_wire".to_string(), "helper".to_string()], "the scan does not name a push outside the doors");
+    assert!(WHOLE_RECORD.iter().any(|p| bad.contains(p)), "the scan does not see a whole-record replacement");
 }
 
 /// THE CONTROLS of the one cut (sdk#419's acceptance): a `#[cfg(test)]` FIELD before the cut -- indented, or a test-only
