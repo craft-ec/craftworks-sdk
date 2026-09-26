@@ -61,6 +61,29 @@ pub fn assets_json(own: &[u8; 32], records: &[([u8; 32], Keep)], name: impl Fn(&
     Value::Array(out)
 }
 
+/// A pass as the tab sees it: ONE list of its states (the "Structure before code" rule), each with the words the
+/// contract carries -- matched exhaustively, never a string written in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassState {
+    /// A pass is running on the asset (`audit_progress()` is `Some`).
+    Running,
+    /// A pass finished with no signer to ask: nothing measured.
+    Unmeasured,
+    /// A pass finished and measured.
+    Done,
+}
+
+impl PassState {
+    /// The contract's word for it (builder#164 reads exactly these).
+    pub fn word(self) -> &'static str {
+        match self {
+            PassState::Running => "running",
+            PassState::Unmeasured => "unmeasured",
+            PassState::Done => "done",
+        }
+    }
+}
+
 /// The warning a pass's margins give under `warn_below` (the count is `keep::warning`'s, the one derivation): the
 /// words the tab shows, or null.
 pub fn warning_text(margins: &std::collections::BTreeMap<i64, usize>, warn_below: u8) -> Option<String> {
@@ -75,10 +98,10 @@ pub fn report_json(report: Option<&Report>, progress: Option<(usize, usize)>, po
     let hex = |id: &[u8; 32]| core_types::hex::encode(id);
     match (report, progress) {
         // A RUNNING pass is newer than any finished one (through Page it cannot coexist: `audit()` clears the report).
-        (_, Some((asked, of))) => json!({ "state": "running", "pass": "full", "asked": asked, "of": of }),
-        (Some(r), _) if !r.measured => json!({ "state": "unmeasured", "pass": "full", "health": health_word(r.health), "started_at": r.started_at, "finished_at": r.finished_at }),
+        (_, Some((asked, of))) => json!({ "state": PassState::Running.word(), "pass": "full", "asked": asked, "of": of }),
+        (Some(r), _) if !r.measured => json!({ "state": PassState::Unmeasured.word(), "pass": "full", "health": health_word(r.health), "started_at": r.started_at, "finished_at": r.finished_at }),
         (Some(r), _) => json!({
-            "state": "done",
+            "state": PassState::Done.word(),
             "pass": "full",
             "health": health_word(r.health),
             "groups": r.groups,
