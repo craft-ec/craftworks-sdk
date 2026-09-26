@@ -385,7 +385,7 @@ fn a_race_whose_block_is_missed_asks_its_dropped_slots_again() {
     // The block itself: NotFound. Now a repair: the dropped slot is asked again.
     let out = e.step(Event::BlockMissed(a));
     assert!(out.iter().any(|f| matches!(f, Effect::FetchBlock { id, .. } if *id == p)), "the repair did not ask the slot its race dropped");
-    assert!(e.awaits_block(&p), "the repair does not wait on the slot");
+    assert!(e.readers_of(&p).any(), "the repair does not wait on the slot");
 }
 
 /// THE CONTROL: racing off (today's one-at-a-time), the same silent member -- the read is never answered, and the
@@ -413,7 +413,7 @@ fn control_with_racing_off_a_silent_member_holds_its_read() {
         "with racing off a read on a silent member was answered: {:?}",
         run.answers.len()
     );
-    assert!(run.e.awaits_block(&silent));
+    assert!(run.e.readers_of(&silent).any());
     assert_eq!(
         run.e.repair_counts(),
         (0, 0, 0),
@@ -441,11 +441,11 @@ fn a_finished_race_withdraws_what_it_no_longer_wants() {
         "the silent parity block is still wanted after its group resolved"
     );
     assert!(
-        !run.e.awaits_block(&parity[0]),
+        !run.e.readers_of(&parity[0]).any(),
         "the engine still awaits a block nobody needs"
     );
     // And it STAYS resolved: N more ticks ask nothing of the group, and what the engine awaits of it does not grow.
-    let awaited = |e: &Engine<Store>| members.iter().chain(&parity).filter(|s| e.awaits_block(s)).count();
+    let awaited = |e: &Engine<Store>| members.iter().chain(&parity).filter(|s| e.readers_of(s).any()).count();
     let mut e = run.e;
     let before = awaited(&e);
     let mut asked_after = 0;
@@ -462,7 +462,7 @@ fn a_finished_race_withdraws_what_it_no_longer_wants() {
     );
     for s in members.iter().chain(&parity) {
         assert!(
-            !(run.e.is_withdrawn(s) && run.e.awaits_block(s)),
+            !(run.e.is_withdrawn(s) && run.e.readers_of(s).any()),
             "{} is both withdrawn and awaited",
             hex(s)
         );
@@ -505,7 +505,7 @@ fn a_forged_slot_does_not_count_toward_k() {
         (0, 0),
         "a forged slot counted toward k"
     );
-    assert!(run.e.awaits_block(&silent), "the read stopped waiting");
+    assert!(run.e.readers_of(&silent).any(), "the read stopped waiting");
 }
 
 fn hex(c: &Cid) -> String {

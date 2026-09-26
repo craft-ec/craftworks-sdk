@@ -169,7 +169,7 @@ fn parity_plus_one_lost_blocks_of_a_group_wait_and_are_never_answered_unavailabl
     let keys = keys_in(&all, &members[..1]);
     let (answers, e) = read_cold(root, &all, &lost, &keys, Params::default());
     assert!(answers.is_empty(), "past the group's reach a read ended: {answers:?}");
-    assert!(e.awaits_block(&members[0]), "the engine stopped waiting on the lost block: nothing would ask for it again");
+    assert!(e.readers_of(&members[0]).any(), "the engine stopped waiting on the lost block: nothing would ask for it again");
     assert_eq!(e.repair_counts().1, 0, "a group short of k rebuilt something");
     println!("  {} lost: {} read(s) waiting, block still awaited, repairs {:?}", PARITY + 1, keys.len(), e.repair_counts());
 }
@@ -186,7 +186,7 @@ fn control_with_repair_off_one_lost_block_is_not_read() {
     let keys = keys_in(&all, &members[..1]);
     let (answers, e) = read_cold(root, &all, &lost, &keys, Params { repair_reads: false, ..Params::default() });
     assert!(answers.is_empty(), "with repair off a lost block was answered: {answers:?}");
-    assert!(e.awaits_block(&members[0]));
+    assert!(e.readers_of(&members[0]).any());
     assert_eq!(e.repair_counts(), (0, 0, 0));
 }
 
@@ -231,7 +231,7 @@ fn a_group_block_that_does_not_hash_to_its_slot_is_not_used() {
     let (answers, e) = read_cold(root, &forged, &lost, &keys, Params::default());
     assert!(answers.is_empty(), "forged parity answered a read: {answers:?}");
     assert_eq!(e.repair_counts().1, 0, "a block was rebuilt from forged parity");
-    assert!(e.awaits_block(&members[0]), "the lost block is no longer awaited");
+    assert!(e.readers_of(&members[0]).any(), "the lost block is no longer awaited");
 }
 
 /// sdk#405, RULE 11 FOR A WRITE (rule 4: one read path): a write whose path needs a block the network LOST is
