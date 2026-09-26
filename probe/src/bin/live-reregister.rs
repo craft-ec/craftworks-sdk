@@ -28,9 +28,9 @@ async fn main() {
 fn ports(base: u16) -> Result<[u16; 4]> {
     let mut out = [0u16; 4];
     for (i, p) in out.iter_mut().enumerate() {
-        let port = base.checked_add(i as u16).with_context(|| format!("port {base}+{i} is past 65535"))?;
-        *p = probe::node::allowed_port(&format!("ws://127.0.0.1:{port}")).with_context(|| format!("port {port} (SIGNER_PORT {base} + {i})"))?;
+        *p = base.checked_add(i as u16).with_context(|| format!("port {base}+{i} is past 65535"))?;
     }
+    probe::node::allowed_ports(&out).with_context(|| format!("a port derived from SIGNER_PORT {base}"))?;
     Ok(out)
 }
 

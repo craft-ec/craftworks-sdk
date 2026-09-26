@@ -7,7 +7,7 @@
 //! peer is signalled only by the handle it was spawned with ([`Node::pid`]); and [`SilentNet::finish`] resumes, kills
 //! and reaps every peer and CHECKS it gone -- a paused node never outlives the probe (dropping it without `finish`
 //! still resumes and kills them).
-use crate::node::{allowed_port, Node};
+use crate::node::{allowed_ports, Node};
 use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::{ClientRequest, HostResponse, NodeQuery, QueryResponse, WebApi};
 use std::path::Path;
@@ -75,9 +75,7 @@ impl SilentNet {
     /// Start the nodes under `root` (each in its own dir). Every derived port is refused first.
     pub fn start(root: &Path, base: u16, silent_peers: u16) -> Result<SilentNet> {
         let ports = ports(base, silent_peers.max(1))?;
-        for port in &ports {
-            allowed_port(&format!("ws://127.0.0.1:{port}"))?;
-        }
+        allowed_ports(&ports)?;
         let mut secret = [0u8; 32];
         getrandom::getrandom(&mut secret).expect("random");
         let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(secret).to_bytes();

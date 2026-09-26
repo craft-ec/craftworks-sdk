@@ -30,6 +30,16 @@ pub fn allowed_port(url: &str) -> Result<u16> {
     Ok(port)
 }
 
+/// EVERY port a run derives, refused BEFORE anything starts if one is someone else's (the architect's review of
+/// sdk#444: a base a few below 7509 derives 7509). Each probe keeps its own layout (its offsets, and their overflow);
+/// this is the one rule, through [`allowed_port`], so a refusal names the port the same way everywhere.
+pub fn allowed_ports(ports: &[u16]) -> Result<()> {
+    for port in ports {
+        allowed_port(&format!("ws://127.0.0.1:{port}"))?;
+    }
+    Ok(())
+}
+
 const BOOT: Duration = Duration::from_secs(45);
 
 /// How the node is run.

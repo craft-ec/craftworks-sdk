@@ -166,3 +166,15 @@ fn a_node_url_is_refused_by_its_parsed_port_whatever_its_text() {
     }
     assert_eq!(RESERVED, &[7509, 7609]);
 }
+
+/// EVERY DERIVED PORT, refused before anything starts (`allowed_ports`, the one rule the probes' layouts go through):
+/// a run whose LAST derived port is the owner's is refused by name, and one clear of both is allowed. Mutant "only the
+/// first port is checked" -> red.
+#[test]
+fn every_derived_port_is_refused_up_front_by_name() {
+    let e = probe::node::allowed_ports(&[7500, 7501, 7509]).expect_err("a run deriving 7509 was allowed");
+    assert!(e.to_string().contains("7509") && e.to_string().contains("owner's node"), "{e}");
+    assert!(probe::node::allowed_ports(&[7599, 7609]).is_err(), "a run deriving 7609 was allowed");
+    probe::node::allowed_ports(&[17500, 17501, 17509]).expect("ports clear of the owner's were refused");
+    probe::silent::ports(7499, 1).map(|p| assert!(probe::node::allowed_ports(&p).is_err(), "silent's layout on base 7499 (b's ws 7509) was allowed")).expect("a layout");
+}
