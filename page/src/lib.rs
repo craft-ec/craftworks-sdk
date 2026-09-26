@@ -1001,14 +1001,16 @@ impl Page {
                 // was removed, and its re-send QUEUES for a place like any
                 // new ask (sdk#345) -- behind the GETs already waiting, and
                 // never outside the window (rule 9: every byte is paced).
-                // A BACKGROUND GET's re-send goes back through its lane (the slot, or behind it), never the window.
-                Waiting::Get(_) if d.lane == Lane::Background => self.send_in(w, op, Lane::Background),
                 Waiting::Get(id) => {
-                    // A node GET LOST (past its bound): the one re-asked beside it may overlap it (sdk#447).
+                    // A node GET LOST (past its bound): the one re-asked beside it may overlap it (sdk#447) -- in
+                    // either lane.
                     if d.sent {
                         self.reasked.insert(id, (now, false));
                     }
-                    if !self.get_queue.contains(&id) {
+                    // A BACKGROUND GET's re-send goes back through its lane (the slot, or behind it), never the window.
+                    if d.lane == Lane::Background {
+                        self.send_in(w, op, Lane::Background);
+                    } else if !self.get_queue.contains(&id) {
                         self.get_queue.push_back(id);
                     }
                 }
@@ -5329,6 +5331,7 @@ mod background_lane {
         assert_eq!(p.window.size(), size, "a Background GET's loss shrank the interactive window");
         assert!(p.deadlines.get(&get(2).0).is_some_and(|d| d.lane == Lane::Background), "the lost Background GET's re-send left its lane");
         assert!(!p.get_queue.contains(&[2; 32]), "the lost Background GET's re-send queued for the interactive window");
+        assert!(p.reasked.contains_key(&[2; 32]), "a lost Background GET's re-ask was not recorded (sdk#447's one overlap rule)");
     }
 
     /// (d) **A queued Background op that is withdrawn never goes out.**
