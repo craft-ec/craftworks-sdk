@@ -2141,7 +2141,7 @@ impl Page {
     pub fn close_obs_window(&mut self, site: &[u8; 32], minute: u64, header: Option<instrument::publish::Header>) -> Option<(Vec<u8>, Vec<u8>)> {
         let rec = self.rec.as_ref()?;
         let taken = rec.take_window();
-        let window = instrument::publish::Window { minute, start_ms: self.obs_start.saturating_sub(self.rec_start), dropped_at_start: 0 };
+        let window = instrument::publish::Window { minute, start_ms: self.obs_start.saturating_sub(self.rec_start), dropped_at_start: 0, lost_before: 0 };
         let record = instrument::publish::publish(&taken.recording(), window, header);
         self.obs_start = self.now;
         Some((obs::detail_key(site, minute), record.encode()))
