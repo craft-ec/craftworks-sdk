@@ -53,9 +53,12 @@ export function connect(engine, { url, delegateKey, onEvent = () => {} } = {}) {
     } finally { pumping = false; }
   };
 
+  // Messages from a replaced socket, dropped (see `onmessage`).
+  let staleDropped = 0;
   const open = () => {
     if (closed) return;
-    ws = new WebSocket(url);
+    const sock = new WebSocket(url);
+    ws = sock;
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
       backoff = 250;
@@ -64,6 +67,16 @@ export function connect(engine, { url, delegateKey, onEvent = () => {} } = {}) {
     };
 
     ws.onmessage = e => {
+      // THE CURRENT CONNECTION'S FRAMES ONLY (sdk#490, OPENING.md Machine 3's S2): a frame read from a socket that has
+      // been REPLACED is never handed to the engine. The node dropped that connection's subscriptions when it closed,
+      // so a head move it carried must not "prove" the new connection's subscription. Counted and named, not used.
+      // (The platform already orders a socket's messages before its close, and a new socket opens only from the old
+      // one's onclose; this is the drop point OUR code owns, and a test holds it.)
+      if (sock !== ws) {
+        staleDropped += 1;
+        onEvent({ kind: "stale" });
+        return;
+      }
       const bytes = new Uint8Array(e.data);
       engine.on_inbound(bytes);
       onEvent({ kind: "message" });
@@ -84,6 +97,8 @@ export function connect(engine, { url, delegateKey, onEvent = () => {} } = {}) {
   return {
     pump,
     get connected() { return ws?.readyState === 1; },
+    /** Frames that arrived on a socket already replaced, and were dropped (sdk#490). */
+    get staleDropped() { return staleDropped; },
     close() { closed = true; ws?.close(); },
   };
 }
