@@ -4,6 +4,10 @@
 //! (`want`, `drop_reader`, `served`, `release_write`); everything else reads them through [`Wanted::readers_of`] and
 //! the read accessors. The compiler is the one-writer gate: a source scan of spellings could be walked around (the
 //! architect on #504).
+//!
+//! A machine's module: no catch-all over an enum here (CLAUDE.md), so a new `Reader` fails to compile -- under clippy
+//! -- until every match handles it, a `_` over several variants and over one alike.
+#![deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)]
 
 use crate::read::ReqId;
 use crate::Readers;
