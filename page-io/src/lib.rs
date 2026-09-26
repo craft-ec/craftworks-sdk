@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 use wire::{DelegateKey, Incoming};
 
 mod opening;
-use opening::{Cell, First, HeadEffect, HeadEvent, HeadKnown, OpenEffect, OpenEvent, Opening, Via};
+use opening::{Cell, First, HeadEffect, HeadEvent, HeadKnownState, OpenEffect, OpenEvent, Opening, OpeningState, Via};
 
 /// What the page needs to know about the platform: the Block contract's code
 /// (a page PUT carries it), the head Register's code and params, and the
@@ -254,7 +254,7 @@ pub struct PageIo {
     register_key: String,
     /// DOES THE HEAD EXIST (OPENING.md, Machine 2): read, "no head" said, the signer's record, or named. Changed
     /// only by [`PageIo::head`].
-    head_known: HeadKnown,
+    head_known: HeadKnownState,
     /// THE HEAD SUBSCRIPTION, as page-io can honestly report it (sdk#259):
     /// whether the GET-with-subscribe has been SENT, whether the node has
     /// ANSWERED it, and how many head moves it has delivered. A page that
@@ -284,7 +284,7 @@ pub struct PageIo {
     node_errors: BTreeMap<&'static str, u64>,
     /// THE PAGE'S STANDING WITH ITS NODE'S SIGNER (OPENING.md, Machine 1): new, asking, an owner registering /
     /// querying / needing a key / provisioning / open / refused, or a reader. Changed only by [`PageIo::open`].
-    opening: Opening,
+    opening: OpeningState,
     /// Events that landed in an IMPOSSIBLE cell of either machine (an answer to a request that state never sent):
     /// a diagnostic, never a panic (#450); the model test holds it at 0.
     impossible_cells: u64,
@@ -346,12 +346,12 @@ impl page::server::Host for PageIo {
 
 impl PageIo {
     pub fn new(server: Server, art: Artefacts) -> PageIo {
-        PageIo::build(server, art, Opening::New, HeadKnown::Unknown)
+        PageIo::build(server, art, OpeningState::owner(), HeadKnownState::unknown())
     }
 
     /// The ONE constructor: each machine starts in the state its kind of page starts in (an owner's page `New` /
     /// `Unknown`, a reader `Reader` / `Named`), and from then on only its transition function changes it.
-    fn build(server: Server, art: Artefacts, opening: Opening, head_known: HeadKnown) -> PageIo {
+    fn build(server: Server, art: Artefacts, opening: OpeningState, head_known: HeadKnownState) -> PageIo {
         let register = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
             std::sync::Arc::new(ContractCode::from(art.register_code.clone())),
             Parameters::from(art.register_params.clone()),
@@ -417,8 +417,8 @@ impl PageIo {
         let mut io = PageIo::build(
             server,
             Artefacts { block_code, register_code: Vec::new(), register_params: Vec::new(), signer: no_signer },
-            Opening::Reader,
-            HeadKnown::Named,
+            OpeningState::reader(),
+            HeadKnownState::named(),
         );
         io.register_id = register_id;
         io.register_key = wire::contract_id(register_id).to_string();
@@ -441,12 +441,15 @@ impl PageIo {
 
     /// [`PageIo::ask`]'s answer, once there is one -- and after a claim, still the answer it was.
     pub fn asked(&self) -> Option<&Asked> {
-        match &self.opening {
+        match self.opening.get() {
             Opening::Asking { answer } => answer.as_ref(),
-            other => match other.via() {
-                Some(Via::Claimed(a)) => Some(a),
-                Some(Via::Begun) | None => None,
-            },
+            Opening::New | Opening::Reader => None,
+            owner @ (Opening::Registering { .. } | Opening::Querying { .. } | Opening::NeedsKey { .. } | Opening::Provisioning { .. } | Opening::Open { .. } | Opening::Refused { .. }) => {
+                match owner.via() {
+                    Some(Via::Claimed(a)) => Some(a),
+                    Some(Via::Begun) | None => None,
+                }
+            }
         }
     }
 
@@ -461,7 +464,7 @@ impl PageIo {
     /// (a device key among an identity's keys) is Phase 6.
     pub fn may_write(&self, head: Option<[u8; 32]>) -> MayWrite {
         let other = |r: &[u8; 32]| MayWrite::No(format!("this node signs for another head ({})", hex(r)));
-        match &self.opening {
+        match self.opening.get() {
             Opening::Reader => MayWrite::No(READ_ONLY.into()),
             Opening::Asking { answer } => match (answer, head) {
                 (None, _) => MayWrite::Undecided("asking this node's signer whose node it is".into()),
@@ -499,7 +502,7 @@ impl PageIo {
 
     /// Was this page only asked (`ask`), and not (yet) claimed?
     pub fn asking(&self) -> bool {
-        matches!(self.opening, Opening::Asking { .. })
+        matches!(self.opening.get(), Opening::Asking { .. })
     }
 
     /// THE USER HAS NO TREE HERE YET (DATA-SOURCE `mine`: made on the first
@@ -510,7 +513,7 @@ impl PageIo {
     /// provisions it ([`PageIo::claim`], then the existing provision path).
     pub fn no_tree_yet(&self) -> bool {
         let none_here = |a: &Asked| matches!(a, Asked::NoKey | Asked::NoSigner(_));
-        match &self.opening {
+        match self.opening.get() {
             Opening::Asking { answer } => answer.as_ref().is_some_and(none_here),
             Opening::Open { .. } | Opening::Reader | Opening::New => false,
             Opening::Registering { via, .. } | Opening::Querying { via } | Opening::NeedsKey { via } | Opening::Provisioning { via, .. } | Opening::Refused { via, .. } => {
@@ -547,7 +550,7 @@ impl PageIo {
 
     /// The signer holds no key (`begin`'s answer): mint one and `provision_with` it.
     pub fn needs_key(&self) -> bool {
-        matches!(self.opening, Opening::NeedsKey { .. })
+        matches!(self.opening.get(), Opening::NeedsKey { .. })
     }
 
     /// Provision a signer that holds no key, for the Register `register_params`
@@ -563,9 +566,6 @@ impl PageIo {
         let step = self.opening.step(ev);
         if step.cell == Cell::Impossible {
             self.impossible_cells += 1;
-        }
-        if let Some(next) = step.next {
-            self.opening = next;
         }
         for effect in step.effects {
             match effect {
@@ -591,11 +591,10 @@ impl PageIo {
 
     /// THE ONE WRITER OF [`HeadKnown`] (a source test holds it).
     fn head(&mut self, ev: HeadEvent, now: Ms) {
-        let (next, effects, cell) = self.head_known.step(ev);
+        let (effects, cell) = self.head_known.step(ev);
         if cell == Cell::Impossible {
             self.impossible_cells += 1;
         }
-        self.head_known = next;
         for effect in effects {
             match effect {
                 HeadEffect::AskRecord => self.ask_record(now),
@@ -758,7 +757,7 @@ impl PageIo {
 
     /// The signer said it holds the key and the naming (or this is a reader: nothing of its own to open).
     pub fn provisioned(&self) -> bool {
-        matches!(self.opening, Opening::Open { .. } | Opening::Reader)
+        matches!(self.opening.get(), Opening::Open { .. } | Opening::Reader)
     }
 
     /// THE SOCKET WAS REPLACED (sdk#376). Everything that belonged to the old
@@ -1124,7 +1123,7 @@ impl PageIo {
 
     /// Opening was REFUSED — by the signer or the node, in its words.
     pub fn refused(&self) -> Option<&str> {
-        match &self.opening {
+        match self.opening.get() {
             Opening::Refused { why, .. } => Some(why),
             Opening::New | Opening::Registering { .. } | Opening::Querying { .. } | Opening::NeedsKey { .. } | Opening::Provisioning { .. } | Opening::Open { .. } | Opening::Asking { .. } | Opening::Reader => None,
         }
@@ -1266,7 +1265,7 @@ impl PageIo {
                     None => Err(format!("a PUT of {app}'s site, which is not being published")),
                 },
                 Op::Update { label: Label::Head, state } => {
-                    if self.head_known.seen() {
+                    if self.head_known.get().seen() {
                         wire::frame_update(self.register.key(), state, stream)
                     } else {
                         // The first head: the Register does not exist yet, and
@@ -1300,7 +1299,7 @@ impl PageIo {
                     Some(c) => wire::frame_register_delegate(c, stream),
                     None => Err("the signer's registration, with no signer to register".into()),
                 },
-                Op::Ext(Ext::SignerFirst) => match self.opening.first() {
+                Op::Ext(Ext::SignerFirst) => match self.opening.get().first() {
                     Some(First::Query) => wire::signer::frame_register_query(&self.art.signer, REGISTER_QUERY_ID, stream),
                     Some(First::Provision(key)) => wire::signer::frame_provision(
                         &self.art.signer,
@@ -1448,7 +1447,8 @@ mod held_batch {
     }
 }
 
-/// THE OPENING TABLES' WIRING (sdk#484): each machine has ONE writer, a reader starts where its provenance says, and
+/// THE OPENING TABLES' WIRING (sdk#484): a reader starts where its provenance says (each machine's ONE writer is by TYPE,
+/// in opening.rs: a private field whose only `&mut` method is `step`), and
 /// the Reconnected column holds through PageIo (its live gate is the probe live-reconnect, sdk#491).
 #[cfg(test)]
 mod opening_wiring {
@@ -1471,25 +1471,12 @@ mod opening_wiring {
             .count()
     }
 
-    /// ONE WRITER per machine: only `open` assigns the opening and only `head` the head's state; `build` is the one
-    /// place either starts. THE CONTROL: the reader finds both writers.
-    #[test]
-    fn each_opening_machine_has_one_writer() {
-        let src = include_str!("lib.rs");
-        let code = &src[..src.find("#[cfg(test)]\nmod held_batch").expect("the first tests module")];
-        let code: String = code.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
-        assert_eq!(code.matches("self.opening = ").count(), 1, "a second writer of the opening");
-        assert_eq!(code.matches("self.head_known = ").count(), 1, "a second writer of the head's state");
-        assert_eq!(code.matches(".opening = ").count() + code.matches(".head_known = ").count(), 2, "a machine written from outside its writer");
-        assert!(code.contains("fn open(&mut self, ev: OpenEvent)") && code.contains("fn head(&mut self, ev: HeadEvent"), "THE CONTROL: the writers were not found");
-    }
-
     /// A READER's head is NAMED (someone published it), never "the signer has a record" (nobody said so).
     #[test]
     fn a_reader_starts_named_and_reader() {
         let io = PageIo::reader(page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Page, Ms(0)), page::server::SignerFacts::default()), b"b".to_vec(), [4; 32], 1);
-        assert_eq!(io.head_known, HeadKnown::Named);
-        assert_eq!(io.opening, Opening::Reader);
+        assert_eq!(io.head_known.get(), opening::HeadKnown::Named);
+        assert_eq!(*io.opening.get(), Opening::Reader);
         assert!(io.provisioned() && io.read_only());
     }
 
@@ -1502,7 +1489,7 @@ mod opening_wiring {
         let (c, _) = wire::delegate_from_code(b"opening wiring signer");
         io.begin(c);
         io.open(OpenEvent::EmptyAck("registered".into()));
-        assert!(matches!(io.opening, Opening::Querying { .. }), "THE SETUP: the registration's answer did not move to Querying");
+        assert!(matches!(io.opening.get(), Opening::Querying { .. }), "THE SETUP: the registration's answer did not move to Querying");
         let mut querying = owner();
         let (c2, _) = wire::delegate_from_code(b"opening wiring signer");
         querying.begin(c2);
@@ -1515,10 +1502,10 @@ mod opening_wiring {
         querying.take_frames();
         io.reconnected(Ms(5_000));
         let frames = io.take_frames();
-        assert!(io.provisioned() && matches!(io.opening, Opening::Open { .. }), "a reconnect changed an open page's opening");
+        assert!(io.provisioned() && matches!(io.opening.get(), Opening::Open { .. }), "a reconnect changed an open page's opening");
         assert_eq!(signer_frames(&frames), 0, "an open page re-registered or asked the signer on a reconnect");
         assert_eq!(io.impossible_cells(), 0);
         querying.reconnected(Ms(5_000));
-        assert!(matches!(querying.opening, Opening::Querying { .. }) && !querying.provisioned(), "THE CONTROL: a querying page's opening moved on a reconnect");
+        assert!(matches!(querying.opening.get(), Opening::Querying { .. }) && !querying.provisioned(), "THE CONTROL: a querying page's opening moved on a reconnect");
     }
 }

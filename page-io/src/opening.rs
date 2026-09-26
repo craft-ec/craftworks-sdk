@@ -11,6 +11,11 @@
 //! An impossible cell (a) is never a panic (#450): the state is unchanged and the cell is COUNTED, so the model test
 //! asserts the count stays 0 over sequences a real node could produce.
 
+// NO CATCH-ALL over a state or an event (CLAUDE.md, engineer2's #485): a new case must fail to compile until its row or
+// column is written. The two lints catch `_ =>`, a named catch-all (`other =>`), and a `_` standing for ONE remaining
+// variant (only the second catches that); the control plants each.
+#![deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)]
+
 use crate::Asked;
 use freenet_stdlib::prelude::DelegateContainer;
 
@@ -429,6 +434,58 @@ impl HeadKnown {
     }
 }
 
+/// ONE WRITER, BY TYPE (CLAUDE.md "One writer, by type"; the architect on sdk#499): the page's opening lives in this
+/// struct's PRIVATE field. It starts only as an owner's (`owner`) or a reader's (`reader`), and its one `&mut` method
+/// is [`OpeningState::step`], which applies the table. No code outside this module can assign, clear or swap the
+/// state: the compiler holds the rule a source scan could only approximate.
+pub(crate) struct OpeningState(Opening);
+
+impl OpeningState {
+    /// A person's own page: `New`.
+    pub(crate) fn owner() -> Self {
+        OpeningState(Opening::New)
+    }
+    /// A view of someone else's head: `Reader`, for good.
+    pub(crate) fn reader() -> Self {
+        OpeningState(Opening::Reader)
+    }
+    /// The state, to read.
+    pub(crate) fn get(&self) -> &Opening {
+        &self.0
+    }
+    /// THE ONE WRITER: the table's step for `ev`, applied. Returns the step (its effects, its cell, `claim`'s answer).
+    pub(crate) fn step(&mut self, ev: OpenEvent) -> Step {
+        let mut step = self.0.step(ev);
+        if let Some(next) = step.next.take() {
+            self.0 = next;
+        }
+        step
+    }
+}
+
+/// ONE WRITER, BY TYPE, for Machine 2 (as [`OpeningState`]).
+pub(crate) struct HeadKnownState(HeadKnown);
+
+impl HeadKnownState {
+    /// An owner's head: `Unknown` until read or answered.
+    pub(crate) fn unknown() -> Self {
+        HeadKnownState(HeadKnown::Unknown)
+    }
+    /// A reader's head: `Named` (someone published it; nobody said it exists).
+    pub(crate) fn named() -> Self {
+        HeadKnownState(HeadKnown::Named)
+    }
+    pub(crate) fn get(&self) -> HeadKnown {
+        self.0
+    }
+    /// THE ONE WRITER: the table's step for `ev`, applied. Returns its effects and its cell.
+    pub(crate) fn step(&mut self, ev: HeadEvent) -> (Vec<HeadEffect>, Cell) {
+        let (next, effects, cell) = self.0.step(ev);
+        self.0 = next;
+        (effects, cell)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,14 +780,4 @@ mod tests {
         assert!(contradicted > 0 && stale_reads > 0, "the model never reached the cells its H1 and contradiction checks are about");
     }
 
-    /// NO CATCH-ALL over a state or an event in the two machines (a new case must fail to compile), read from the
-    /// source; THE CONTROL: the reader finds the transition functions.
-    #[test]
-    fn the_machines_have_no_catch_all() {
-        let src = include_str!("opening.rs");
-        let code = &src[..src.find("#[cfg(test)]\nmod tests").expect("the tests module")];
-        let code: String = code.lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
-        assert!(code.contains("fn step(&self, ev: OpenEvent)") && code.contains("fn step(self, ev: HeadEvent)"), "the reader found no transition function");
-        assert!(!code.contains("_ =>"), "a catch-all arm in a machine");
-    }
 }
