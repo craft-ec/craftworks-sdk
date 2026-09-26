@@ -257,6 +257,7 @@ pub struct Refused {
     pub code: &'static str,
 }
 
+// WORKAROUND(freenet-core#none filed (owner's call)): the validation refusal is recognised by its text (W9, sdk#464)
 /// THE NODE'S WORDS WHEN A CONTRACT'S OWN VALIDATION REFUSES A PUT (sdk#433): a final answer, not a transient one --
 /// the same bytes are refused again, for ever. Read on freenet [`VALIDATION_REFUSED_READ_ON`] (freenet-core
 /// 7fa2c6605b99) with freenet-stdlib 0.10.0:
