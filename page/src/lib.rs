@@ -3360,7 +3360,9 @@ mod confirm_held {
         let mut healed = false;
         for _ in 0..(HELD_ABSENTS + 3) {
             now += 1;
-            p.answer(Answer::Held { id, present: false }, Ms(now));
+            // The absent path itself (an injected ConfirmHeld: the engine waits on no such id, sdk#459).
+            p.answered(&Waiting::Held(p.next_held_batch));
+            p.held_absent(id, now);
             now += rto::RTO_MAX_MS as u64 + 1;
             p.tick(Ms(now));
             healed |= p.take_ops().iter().any(|o| matches!(o, Op::Put { id: x, bytes: b } if *x == id && *b == bytes));

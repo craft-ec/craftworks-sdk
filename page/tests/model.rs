@@ -1626,7 +1626,7 @@ fn a_foreign_member_absent_is_put_again_from_page_memory_at_a_one_byte_budget() 
                         Some(Answer::Updated { label: page::Label::Head })
                     }
                     Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
-                    Op::AskHeld { id } => Some(Answer::Held { id, present: !absent && node.blocks.contains_key(&id) }),
+                    Op::AskHeld { batch, ids } => Some(Answer::Held { batch, present: ids.iter().map(|id| !absent && node.blocks.contains_key(id)).collect() }),
                     Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                     Op::Ext(_) => None,
                 };
