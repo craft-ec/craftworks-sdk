@@ -81,6 +81,8 @@ enum Net {
 }
 
 struct Run {
+    /// Blocks the engine told `Unwanted` (WANTED-LIFE), over the whole run.
+    unwanted: BTreeSet<Cid>,
     answers: BTreeMap<Vec<u8>, ReadResult>,
     /// FetchBlock effects per block id, over the whole run.
     asked: BTreeMap<Cid, usize>,
@@ -112,6 +114,7 @@ fn read_cold_as(
     let mut answers = BTreeMap::new();
     let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
     let mut forged: BTreeSet<Cid> = BTreeSet::new();
+    let mut unwanted: BTreeSet<Cid> = BTreeSet::new();
     let rounds: Vec<Vec<usize>> = if together {
         vec![(0..keys.len()).collect()]
     } else {
@@ -133,8 +136,9 @@ fn read_cold_as(
             match f {
                 Effect::FetchBlock { id, .. } => {
                     *asked.entry(id).or_insert(0) += 1;
-                    // As the page does: a GET the engine withdrew meanwhile has ended, and is not answered.
-                    if e.is_withdrawn(&id) {
+                    // As the page does: a GET the engine told `Unwanted` has ended, and is not answered -- unless it is
+                    // wanted again since (a new ask).
+                    if unwanted.contains(&id) && !e.readers_of(&id).any() {
                         continue;
                     }
                     match (net.get(&id).copied().unwrap_or(Net::Serve), all.get(&id)) {
@@ -157,6 +161,9 @@ fn read_cold_as(
                     }
                 }
                 Effect::Keep { id, bytes } => store.put(id, &bytes),
+                Effect::Unwanted { id } => {
+                    unwanted.insert(id);
+                }
                 Effect::Reply { req_id, result, .. } if round.contains(&(req_id.0 as usize)) => {
                     answers.insert(keys[req_id.0 as usize].clone(), result);
                 }
@@ -164,7 +171,7 @@ fn read_cold_as(
             }
         }
     }
-    Run { answers, asked, e }
+    Run { unwanted, answers, asked, e }
 }
 
 fn wrong(
@@ -437,8 +444,8 @@ fn a_finished_race_withdraws_what_it_no_longer_wants() {
     assert_eq!(run.answers.len(), keys.len(), "the read was not answered");
     assert!(wrong(&run.answers, &records).is_empty());
     assert!(
-        run.e.is_withdrawn(&parity[0]),
-        "the silent parity block is still wanted after its group resolved"
+        run.unwanted.contains(&parity[0]),
+        "the silent parity block was not told Unwanted after its group resolved"
     );
     assert!(
         !run.e.readers_of(&parity[0]).any(),
@@ -457,12 +464,12 @@ fn a_finished_race_withdraws_what_it_no_longer_wants() {
     let run = Run { e, ..run };
     // Withdrawn means NOT WANTED: never a block the engine still awaits, and never the member the read needed.
     assert!(
-        !run.e.is_withdrawn(&silent),
-        "the rebuilt member is withdrawn"
+        !run.unwanted.contains(&silent),
+        "the rebuilt member was told Unwanted"
     );
     for s in members.iter().chain(&parity) {
         assert!(
-            !(run.e.is_withdrawn(s) && run.e.readers_of(s).any()),
+            !(run.unwanted.contains(s) && run.e.readers_of(s).any()),
             "{} is both withdrawn and awaited",
             hex(s)
         );

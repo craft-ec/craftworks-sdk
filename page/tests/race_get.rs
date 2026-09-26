@@ -361,15 +361,15 @@ fn withdrawn_gets(busy: bool) {
     // The rebuilt member is not asked again either, and nothing is left waiting or withdrawn.
     let member_late = gets.iter().filter(|(t, id)| *id == member && *t > answered_at + 1_000).count();
     assert_eq!(member_late, 0, "the rebuilt member was still asked for after its reads were answered");
+    // (No "withdrawn left over" count: the engine stores no withdrawn set -- the withdrawal is an `Unwanted` effect,
+    // carried in the step that made it, WANTED-LIFE.)
     assert!(!r.waiting(), "the reader still waits, with every read answered (a withdrawn GET kept its deadline?)");
-    assert_eq!(r.withdrawn(), 0, "withdrawn GETs the page never ended");
 
     // A LATE answer to the withdrawn GET, with bytes that are not its id: nothing re-sent, nothing left over.
     let before = gets.len();
     r.answer(Answer::Got { id: spare, bytes: b"not the block".to_vec() }, Ms(now));
     drive(&mut r, &mut node, &silent, &mut now, 30_000, &mut gets);
     assert_eq!(gets.len(), before, "a late wrong answer to a withdrawn GET was asked again: {:?}", &gets[before..]);
-    assert_eq!(r.withdrawn(), 0);
     assert!(!r.waiting());
 }
 

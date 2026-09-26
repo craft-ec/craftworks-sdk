@@ -63,3 +63,31 @@ fn a_confirmation_is_routed_from_one_place_and_the_page_holds_no_guard() {
         assert_eq!(lib.matches(&format!("Waiting::{w}(Label::Head), End::Withdrawn")).count(), 0, "the head's {w} wait is ended by name outside drop_dead_head");
     }
 }
+
+/// W6 (WANTED-LIFE; the architect): EVERY EFFECT A CALL INTO THE ENGINE RETURNS IS CARRIED OUT. The engine's GET
+/// withdrawal is an effect (`Effect::Unwanted`), not state it keeps, so an effect dropped on the floor is a GET no one
+/// ends. Held by the source: each production call of `self.engine.step(` binds its result and the next line hands that
+/// binding to `self.carry_out(`; `self.engine.supersede_read(` is matched and its `Some(fx)` carried. The CONTROL: the
+/// scan finds the calls it exists for (a floor), so it cannot pass over none.
+#[test]
+fn every_effect_the_engine_returns_is_carried_out() {
+    let lib = production_of(LIB);
+    let lines: Vec<&str> = lib.lines().map(str::trim).collect();
+    let mut steps = 0;
+    for (i, l) in lines.iter().enumerate() {
+        if !l.contains(concat!("self.engine", ".step(")) {
+            continue;
+        }
+        steps += 1;
+        let bound = l.strip_prefix("let ").and_then(|r| r.split(" = ").next()).unwrap_or_else(|| panic!("an engine step whose effects are not bound: `{l}`"));
+        let next = lines[i + 1..].iter().find(|n| !n.is_empty() && !n.starts_with("//")).copied().unwrap_or_default();
+        assert_eq!(next, format!("self.carry_out({bound});"), "an engine step's effects `{bound}` are not carried out next: `{l}` then `{next}`");
+    }
+    assert!(steps >= 6, "THE CONTROL: the scan found {steps} engine steps in page/src/lib.rs, not the calls it exists for");
+    let supersede = lines.iter().position(|l| l.contains(concat!("self.engine", ".supersede_read("))).expect("THE CONTROL: no supersede_read call found");
+    assert!(
+        lines[supersede..supersede + 4].iter().any(|l| l.starts_with("Some(fx)")) && lines[supersede..supersede + 6].contains(&"self.carry_out(fx);"),
+        "supersede_read's effects are not carried out: {:?}",
+        &lines[supersede..supersede + 6]
+    );
+}

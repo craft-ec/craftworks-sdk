@@ -2682,24 +2682,27 @@ impl Page {
     /// ([`engine::Engine::supersede_read`]); the GETs only it needed end with
     /// it. Whether it was.
     pub fn supersede_read(&mut self, req: engine::read::ReqId) -> bool {
-        let done = self.engine.supersede_read(req);
-        if done {
-            self.end_unneeded_gets();
+        match self.engine.supersede_read(req) {
+            // Its effects are the engine's net withdrawal (`Effect::Unwanted`), carried like any step's (W6).
+            Some(fx) => {
+                self.carry_out(fx);
+                self.end_unneeded_gets();
+                true
+            }
+            None => false,
         }
-        done
     }
 
-    /// A GET nobody needs ENDS at once -- its deadline, its re-ask backoff and the engine's entry go together --
-    /// rather than being re-sent at its next timeout for ever (sdk#303):
-    /// * one the engine WITHDREW: a raced group block no read needs once its group resolved;
-    /// * one for a block the page HOLDS: a member rebuilt from its group, which the node never answered.
+    /// A GET for a block the page now HOLDS ends at once -- its deadline, its re-ask backoff and the engine's entry go
+    /// together -- rather than being re-sent at its next timeout for ever (sdk#303): a member rebuilt from its group,
+    /// which the node never answered. (A GET the engine WITHDREW ends where its `Effect::Unwanted` is carried out:
+    /// OP-LIFE's engine-withdraw, door 1; this is door 2.)
     ///
     /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
     /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
     fn end_unneeded_gets(&mut self) {
-        let mut ended = self.engine.take_all_withdrawn();
-        ended.extend(
-            self.deadlines
+        let ended: Vec<Cid> = self
+            .deadlines
                 .keys()
                 .filter_map(|w| match w {
                     Waiting::Get(id) => Some(*id),
@@ -2710,8 +2713,8 @@ impl Page {
                     Waiting::Get(id) => Some(*id),
                     _ => None,
                 }))
-                .filter(|id| self.engine.blocks().get(id).is_some()),
-        );
+                .filter(|id| self.engine.blocks().get(id).is_some())
+            .collect();
         for id in ended {
             self.drop_get(id);
         }
@@ -2781,6 +2784,9 @@ impl Page {
                 // group this block was in. Its PUT is WITHDRAWN -- no more
                 // re-sends, not sent at all if still held back -- because
                 // nobody needs it; that is not a cut-off of one somebody does.
+                // NOBODY WANTS this block any more (WANTED-LIFE, OP-LIFE's engine-withdraw door 1): its GET ends --
+                // queued, on the wire or waiting to re-ask -- and a late answer is not kept.
+                Effect::Unwanted { id } => self.drop_get(id),
                 Effect::Withdraw { id } => {
                     self.end(&Waiting::Put(id), End::Withdrawn);
                     self.attempt_of.remove(&Waiting::Put(id));
@@ -2919,11 +2925,6 @@ impl Page {
 
     pub fn owed_groups(&self) -> usize {
         self.engine.owed_groups()
-    }
-
-    /// GETs the engine withdrew that this page has not ended yet (sdk#303): 0 after every step.
-    pub fn withdrawn(&self) -> usize {
-        self.engine.withdrawn_count()
     }
 
     /// Is anything still owed an answer or a re-send — an op in flight, a

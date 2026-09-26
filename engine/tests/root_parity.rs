@@ -176,6 +176,7 @@ fn read_with_silent_root(mark: Option<Vec<Cid>>) -> (Option<ReadResult>, BTreeMa
     let mut q = e.step(Event::HeadRead { epoch: Epoch(1), seq: 1, root });
     q.extend(e.step(Event::Get { client: ClientId(1), req_id: ReqId(7), key: b"k/000100".to_vec() }));
     let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
+    let mut unwanted: std::collections::BTreeSet<Cid> = std::collections::BTreeSet::new();
     let mut answer = None;
     let mut steps = 0;
     while let Some(f) = q.pop() {
@@ -184,7 +185,7 @@ fn read_with_silent_root(mark: Option<Vec<Cid>>) -> (Option<ReadResult>, BTreeMa
         match f {
             Effect::FetchBlock { id, .. } => {
                 *asked.entry(id).or_insert(0) += 1;
-                if id == root || e.is_withdrawn(&id) {
+                if id == root || (unwanted.contains(&id) && !e.readers_of(&id).any()) {
                     continue; // the root is SILENT
                 }
                 if let Some(b) = net.get(&id) {
@@ -193,6 +194,9 @@ fn read_with_silent_root(mark: Option<Vec<Cid>>) -> (Option<ReadResult>, BTreeMa
                 }
             }
             Effect::Keep { id, bytes } => e.blocks().put(id, &bytes),
+            Effect::Unwanted { id } => {
+                unwanted.insert(id);
+            }
             Effect::Reply { req_id: ReqId(7), result, .. } => answer = Some(result),
             other => common::no_answer_owed(&other),
         }

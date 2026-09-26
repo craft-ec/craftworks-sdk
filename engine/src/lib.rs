@@ -537,6 +537,13 @@ pub enum Effect {
     Withdraw {
         id: Cid,
     },
+    /// Stop FETCHING this block: it was asked, and nobody wants it any more (WANTED-LIFE; sdk#303's withdrawal). The
+    /// page ends its GET (`drop_get`) and does not keep it if it arrives late. Computed NET at the end of the call that
+    /// dropped its last reader -- never at the drop, so a block dropped and wanted again in one call is not told
+    /// unwanted (the architect's T3). Not [`Effect::Withdraw`]: that is a superseded PUT, a different fact.
+    Unwanted {
+        id: Cid,
+    },
     UpdateHead {
         seq: u64,
         root: Cid,
@@ -1428,10 +1435,10 @@ pub struct Engine<B: Blocks> {
     repairs: BTreeMap<Cid, Repair>,
     /// Which repairs a group block is being fetched for.
     repair_slots: BTreeMap<Cid, BTreeSet<Cid>>,
-    /// Group blocks a finished repair or race asked for and nobody wants any more (sdk#303): the page WITHDRAWS
-    /// their GETs (a requester dropping what it no longer needs, not a cut-off) and does not keep them if they
-    /// arrive late ([`Engine::take_all_withdrawn`]).
-    withdrawn: BTreeSet<Cid>,
+    /// Blocks whose LAST reader dropped during THIS call (WANTED-LIFE): settled at the call's end into
+    /// [`Effect::Unwanted`] for those still unwanted and not held ([`Engine::settle_unwanted`]), and empty between
+    /// calls -- the withdrawal is an effect, never stored state.
+    dropped: BTreeSet<Cid>,
     /// Asks that went out, by why (sdk#303): `.0` WANTED (a read waits on the block), `.1` RACED (only a race or a
     /// repair asks it). A read's cap counts the wanted; its race rides inside its one fetch.
     fetch_counts: (usize, usize),
@@ -1681,7 +1688,7 @@ impl<B: Blocks> Engine<B> {
             carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
-            withdrawn: BTreeSet::new(),
+            dropped: BTreeSet::new(),
             fetch_counts: (0, 0),
             step_asks: BTreeMap::new(),
             landing: Vec::new(),
@@ -2038,6 +2045,7 @@ impl<B: Blocks> Engine<B> {
             out.extend(self.step_inner(event));
             out.extend(self.land_rebuilt());
             out.extend(self.keep_saveable());
+            out.extend(self.settle_unwanted());
             self.cascade.clear();
             self.arrived.clear();
             self.one_ask_each(&mut out);
@@ -2046,6 +2054,7 @@ impl<B: Blocks> Engine<B> {
         let mut out = self.step_inner(event);
         out.extend(self.land_rebuilt());
         out.extend(self.keep_saveable());
+        out.extend(self.settle_unwanted());
         self.cascade.clear();
         self.arrived.clear();
         self.one_ask_each(&mut out);
@@ -2892,8 +2901,6 @@ impl<B: Blocks> Engine<B> {
                             q.delta.cycle_new = true;
                         }
                     }
-                    // Wanted again: no longer withdrawn (sdk#303).
-                    self.withdrawn.remove(&id);
                     // A race for a sibling asked this block already (sdk#303): that GET answers this read too.
                     let raced = self.params.dedupe_in_flight && self.repair_slots.contains_key(&id);
                     if raced {
@@ -2930,11 +2937,11 @@ impl<B: Blocks> Engine<B> {
     /// it for ever. `false`: it is not parked, or it is making progress — it
     /// finishes on its own tree (READ-STATE inv. 2). An answer-driven end:
     /// the head moved; no clock is read (rule 8).
-    pub fn supersede_read(&mut self, req_id: read::ReqId) -> bool {
-        let Some(p) = self.reads.parked.get(&req_id) else { return false };
+    pub fn supersede_read(&mut self, req_id: read::ReqId) -> Option<Vec<Effect>> {
+        let p = self.reads.parked.get(&req_id)?;
         let blocks: Vec<Cid> = self.reads.waiting.iter().filter(|(_, reqs)| reqs.contains(&req_id)).map(|(id, _)| *id).collect();
         if p.arrived > 0 || blocks.is_empty() {
-            return false;
+            return None;
         }
         self.reads.parked.remove(&req_id);
         self.forget_waiting(req_id);
@@ -2948,7 +2955,8 @@ impl<B: Blocks> Engine<B> {
             }
             self.withdraw_if_unwanted(id);
         }
-        true
+        // Its own call's end: the withdrawal, net (WANTED-LIFE; a call outside `step`, so it settles here).
+        Some(self.settle_unwanted())
     }
 
     fn forget_waiting(&mut self, req_id: read::ReqId) {
@@ -4900,7 +4908,6 @@ impl<B: Blocks> Engine<B> {
                     // is not asked twice -- racing every member of a group would otherwise ask each slot k times.
                     let in_flight = self.readers_of(&slot).any();
                     self.repair_slots.entry(slot).or_default().insert(missing);
-                    self.withdrawn.remove(&slot);
                     if !in_flight {
                         self.reads.fetches += 1;
                         self.step_asks.entry(slot).or_insert(false);
@@ -5014,13 +5021,18 @@ impl<B: Blocks> Engine<B> {
         }
     }
 
-    /// A block NOBODY wants ([`readers_of`](Self::readers_of): no read, no repair slot, not the parked write) and the
-    /// page does not hold is WITHDRAWN: its GET ends instead of being re-asked for ever (sdk#303). For a freed repair
-    /// slot and a superseded read's blocks alike.
+    /// A reader of `id` DROPPED (a freed repair slot, a superseded read): a candidate for [`Effect::Unwanted`] at the
+    /// end of this call -- decided then, net, never here (WANTED-LIFE, the architect's T3).
     fn withdraw_if_unwanted(&mut self, id: Cid) {
-        if !self.readers_of(&id).any() && self.blocks.get(&id).is_none() {
-            self.withdrawn.insert(id);
-        }
+        self.dropped.insert(id);
+    }
+
+    /// THE WITHDRAWAL, NET, at the end of a call (WANTED-LIFE): every block whose last reader dropped during the call
+    /// and that is STILL unwanted ([`readers_of`](Self::readers_of)) and not held is one [`Effect::Unwanted`]. A block
+    /// dropped and wanted again within the call (a race frees a slot the parked write then parks on) is not told.
+    fn settle_unwanted(&mut self) -> Vec<Effect> {
+        let dropped = std::mem::take(&mut self.dropped);
+        dropped.into_iter().filter(|id| !self.readers_of(id).any() && self.blocks.get(id).is_none()).map(|id| Effect::Unwanted { id }).collect()
     }
 
     /// Rule 7: preload is advisory and budgeted.
