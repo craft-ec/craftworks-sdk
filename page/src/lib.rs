@@ -5326,8 +5326,13 @@ mod background_lane {
         p.answered(&get(1).0);
         assert_eq!(p.window.size(), size, "a Background GET's answer grew the interactive window");
         background(&mut p, get(2));
+        // Its first deadline only makes it SILENT (sdk#447: the node's own GET is not over); the moved deadline, past
+        // that node GET's bound, is the LOSS.
         let due = p.deadlines[&get(2).0].at;
         p.tick(Ms(due));
+        assert!(p.deadlines[&get(2).0].silent, "THE SETUP: the first deadline did not make it silent");
+        let lost_at = p.deadlines[&get(2).0].at;
+        p.tick(Ms(lost_at));
         assert_eq!(p.window.size(), size, "a Background GET's loss shrank the interactive window");
         assert!(p.deadlines.get(&get(2).0).is_some_and(|d| d.lane == Lane::Background), "the lost Background GET's re-send left its lane");
         assert!(!p.get_queue.contains(&[2; 32]), "the lost Background GET's re-send queued for the interactive window");
