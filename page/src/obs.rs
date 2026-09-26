@@ -57,3 +57,64 @@ impl Probe for Rec {
         }
     }
 }
+
+/// W_ride (OBSERVABILITY §3): at most ONE observation commit per this long of saving. A save lands its data head;
+/// the pending window records ride after it only if the last observation commit was at least this long ago.
+pub const W_RIDE_MS: u64 = 60_000;
+
+/// The window records a page keeps waiting for a save (rule 9: never an unbounded queue): one roll-up hour's worth.
+/// Past it the OLDEST is dropped, and what it held is counted into the next record's drop count
+/// (`Window::lost_before`). To be derived from the roll-up's constants when step 5 makes them.
+pub const PENDING_MAX: usize = 60;
+
+/// The observation tree's own block store, in bytes: past it, the tree is re-opened fresh (its next commit re-reads
+/// its head) once idle. Its store is its OWN, so an observation never evicts a data block (the architect); this bounds
+/// the page's memory for diagnostics.
+pub const BLOCK_BUDGET: usize = 4 << 20;
+
+/// The engine client the observation tree's writes are made under: no person's (nothing shows its states).
+pub const CLIENT: engine::ClientId = engine::ClientId(u64::MAX);
+
+/// A closed window's record, waiting for a save to ride: its key and its value (the filter's output).
+pub(crate) struct Pending {
+    pub(crate) key: Vec<u8>,
+    pub(crate) value: Vec<u8>,
+}
+
+impl Pending {
+    /// What dropping this record loses, as the next record's `lost_before`: its encoded event count plus its drop
+    /// bucket's LOWER bound (the architect) -- a lower bound, never exact, as a bucket is all the record keeps.
+    pub(crate) fn lost_if_dropped(&self) -> u64 {
+        instrument::publish::Published::decode(&self.value, &[]).map_or(0, |p| p.events.len() as u64 + lower_bound(p.dropped))
+    }
+}
+
+/// A bucket's LOWER bound: the least count [`instrument::vocab::Bucket::of`] puts in it -- derived from `of` itself
+/// (it is monotone), so the bucket's edges have one owner, the instrument.
+pub(crate) fn lower_bound(b: instrument::vocab::Bucket) -> u64 {
+    let (mut lo, mut hi) = (0u64, u64::MAX);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if instrument::vocab::Bucket::of(mid) >= b {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
+mod bounds {
+    use instrument::vocab::Bucket;
+
+    /// Each bucket's lower bound is in it, and the count below it is not (the edges come from `Bucket::of` alone).
+    #[test]
+    fn a_buckets_lower_bound_is_its_least_count() {
+        for b in [Bucket::Zero, Bucket::One, Bucket::UpTo9, Bucket::UpTo99, Bucket::UpTo999, Bucket::Over999] {
+            let lo = super::lower_bound(b);
+            assert_eq!(Bucket::of(lo), b, "{b:?}'s lower bound {lo} is not in it");
+            assert!(lo == 0 || Bucket::of(lo - 1) < b, "{b:?}'s lower bound {lo} is not its least count");
+        }
+    }
+}

@@ -64,6 +64,10 @@ pub struct Session {
     provision_told: bool,
     /// The loader's recording, until this session's first page takes it (`adopt_loader`).
     loader: Option<page::loader::Segment>,
+    /// The site this page was served from (`adopt_loader`), for the page's observation tree; `None`: no tree.
+    obs_site: Option<[u8; 32]>,
+    /// The observation tree is open (once, after the signer named the Register).
+    obs_opened: bool,
     /// THE APP this session is (the forest ruling): a person has ONE tree,
     /// divided by app. Every domain name crossing into this session is
     /// app-relative and gains `<app>.` here, so an app has no name for
@@ -110,6 +114,8 @@ impl Session {
             page_identity_sent: false,
             provision_told: false,
             loader: None,
+            obs_site: None,
+            obs_opened: false,
         })
     }
 
@@ -117,8 +123,12 @@ impl Session {
     /// numbers, and what its ring lost. It opens the recording of this session's first page, on the loader's
     /// origin; every number is validated there against closed lists and anything unknown is refused and counted
     /// (`page::loader`). Numbers only cross: nothing here is a string.
-    pub fn adopt_loader(&mut self, start_ms: f64, events: Vec<f64>, dropped: f64) {
+    /// `path`: the page's own location path. The site it names (`/v1/contract/web/<link>/`, decoded STRICTLY by
+    /// `page_io::site_id_of_path`) is the app this person ran: the observation tree's one input (sdk#399 step 4).
+    /// Anything else -- a dev server, a test -- gives no observation tree; the recording stays local.
+    pub fn adopt_loader(&mut self, start_ms: f64, events: Vec<f64>, dropped: f64, path: &str) {
         self.loader = Some(page::loader::Segment::from_numbers(start_ms, &events, dropped));
+        self.obs_site = page_io::site_id_of_path(path);
     }
 
     /// The websocket URL to open. Built in Rust; see the constructor.
@@ -350,6 +360,9 @@ impl Session {
             Some(seg) => p.record_into_after(PAGE_RECORDING, &seg),
             None => p.record_into(PAGE_RECORDING),
         }
+        if let Some(site) = self.obs_site {
+            p.set_obs_site(site);
+        }
         p
     }
 
@@ -408,6 +421,13 @@ impl Session {
             self.page_identity_sent = true;
             self.db.store_mut().writes.client.send(&protocol::Request::Identity);
             self.pump_page();
+        }
+        // THE OBSERVATION TREE, once the signer has named the Register (its params derive the obs register) and only
+        // for a page served from a site. Opening sends nothing: its first op follows the first data head's landing.
+        if self.page_identity_sent && !self.obs_opened && self.obs_site.is_some() {
+            if let Some(p) = self.page_mut().filter(|p| p.register_params_known() && !p.read_only()) {
+                self.obs_opened = p.open_obs().is_ok();
+            }
         }
     }
 

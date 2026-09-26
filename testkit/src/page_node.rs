@@ -52,6 +52,10 @@ pub enum Served {
     ReadHead,
     /// A signer request.
     Sign,
+    /// The OBSERVATION register's (sdk#399): an UPDATE, a read, a sign.
+    ObsHead,
+    ObsReadHead,
+    ObsSign,
 }
 
 /// The node: its blocks, the head Register, the signer's secrets.
@@ -69,6 +73,10 @@ pub struct PageNode {
     register: Rc<RefCell<Option<Vec<u8>>>>,
     register_id: [u8; 32],
     register_params: Vec<u8>,
+    /// THE OBSERVATION REGISTER (sdk#399): the person's params relabelled `obs`, as the signer derives it.
+    obs_register: Rc<RefCell<Option<Vec<u8>>>>,
+    obs_register_id: [u8; 32],
+    obs_register_params: Vec<u8>,
     secrets: Rc<RefCell<BTreeMap<Vec<u8>, Vec<u8>>>>,
     /// The signer fails to save its record on the next sign (once).
     record_fails: Rc<Cell<bool>>,
@@ -102,6 +110,9 @@ impl signer::Host for Host<'_> {
         if *id == self.0.register_id {
             return self.0.register.borrow().clone();
         }
+        if *id == self.0.obs_register_id {
+            return self.0.obs_register.borrow().clone();
+        }
         let cid = *self.0.contracts.borrow().get(id)?;
         self.0.blocks.borrow().get(&cid).map(|b| state_of(&cid, b))
     }
@@ -130,6 +141,7 @@ impl PageNode {
     pub fn new() -> PageNode {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
         let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
+        let obs_params = contract_keys::site::obs_params(&params).expect("mode 0 params");
         let n = PageNode {
             blocks: Rc::default(),
             network: None,
@@ -137,6 +149,9 @@ impl PageNode {
             register: Rc::default(),
             register_id: signer::register_id(REGISTER_CODE, &params),
             register_params: params.clone(),
+            obs_register: Rc::default(),
+            obs_register_id: signer::register_id(REGISTER_CODE, &obs_params),
+            obs_register_params: obs_params,
             secrets: Rc::default(),
             record_fails: Rc::default(),
             network_fetches: Rc::default(),
@@ -223,6 +238,11 @@ impl PageNode {
         page::HeadRead::from_record(self.register.borrow().as_deref()?)
     }
 
+    /// The OBSERVATION head the obs register holds: its seq and root (sdk#399).
+    pub fn obs_head(&self) -> Option<(u64, Cid)> {
+        contract_keys::register::head_of(self.obs_register.borrow().as_deref()?)
+    }
+
     /// The signer fails to save its record on the next sign, once.
     pub fn fail_record_once(&self) {
         self.record_fails.set(true);
@@ -250,12 +270,16 @@ impl PageNode {
         }
     }
 
-    fn update(&self, state: &[u8]) {
+    fn update(&self, label: &Label, state: &[u8]) {
         use freenet_stdlib::prelude::*;
-        let next = match self.register.borrow().as_ref() {
+        let (register, params) = match label {
+            Label::Obs => (&self.obs_register, &self.obs_register_params),
+            _ => (&self.register, &self.register_params),
+        };
+        let next = match register.borrow().as_ref() {
             None => state.to_vec(),
             Some(cur) => <craftec_register_contract::Register as ContractInterface>::update_state(
-                Parameters::from(self.register_params.clone()),
+                Parameters::from(params.clone()),
                 State::from(cur.clone()),
                 vec![UpdateData::State(State::from(state.to_vec()))],
             )
@@ -265,14 +289,15 @@ impl PageNode {
             .as_ref()
             .to_vec(),
         };
-        *self.register.borrow_mut() = Some(next);
+        *register.borrow_mut() = Some(next);
     }
 
-    fn sign(&self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid, ledger: Vec<u8>) -> (u32, signer_proto::Answer) {
+    #[allow(clippy::too_many_arguments)]
+    fn sign(&self, id: u32, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid, ledger: Vec<u8>, label: &Label) -> (u32, signer_proto::Answer) {
         let req = signer::Request::Sign {
             prev: signer::Head { seq: prev_seq, root: prev_root },
             next: signer::Next { seq, root, ledger },
-            label: signer::Label::Head,
+            label: if *label == Label::Obs { signer::Label::Obs } else { signer::Label::Head },
         };
         let served = signer::serve_full(&mut Host(self), &signer::encode_request(id, &req), signer::Origin::Local);
         wire::signer::read_answer(&signer::reply(&served)).expect("a signer answer reads back")
@@ -620,22 +645,28 @@ impl ConnState {
                     None => Answer::GetMissed(id),
                 }
             }
-            // This node serves the person's HEAD; a site (builder#117) is not its to answer.
+            // This node serves the person's HEAD and OBSERVATION registers; a site (builder#117) is not its to answer.
             Op::Sign { label: Label::Site(_), .. } | Op::Update { label: Label::Site(_), .. } | Op::ReadHead { label: Label::Site(_) } => return None,
-            Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label: Label::Head } => {
-                self.count(Served::Sign);
-                let (id, answer) = self.node.sign(id, prev_seq, prev_root, seq, root, ledger);
+            Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } => {
+                self.count(if label == Label::Obs { Served::ObsSign } else { Served::Sign });
+                let (id, answer) = self.node.sign(id, prev_seq, prev_root, seq, root, ledger, &label);
                 self.node.record_fails.set(false);
                 Answer::Signer { id, answer }
             }
-            Op::Update { label: Label::Head, state } => {
-                self.count(Served::Head);
-                self.node.update(&state);
-                Answer::Updated { label: Label::Head }
+            Op::Update { label, state } => {
+                self.count(if label == Label::Obs { Served::ObsHead } else { Served::Head });
+                self.node.update(&label, &state);
+                Answer::Updated { label }
             }
-            Op::ReadHead { label: Label::Head } => {
+            Op::ReadHead { label: Label::Obs } => {
+                self.count(Served::ObsReadHead);
+                // A register never written is the node's NotFound (after its GET bound, on a real node): `None`.
+                let read = self.node.obs_register.borrow().as_deref().and_then(page::HeadRead::from_record);
+                Answer::Head { label: Label::Obs, read }
+            }
+            Op::ReadHead { label } => {
                 self.count(Served::ReadHead);
-                Answer::Head { label: Label::Head, read: self.node.head_read() }
+                Answer::Head { label, read: self.node.head_read() }
             }
             Op::AskHeld { id } => Answer::Held { id, present: self.node.holds(&id) },
             // A node that takes every app PUT (a web container) it is sent.

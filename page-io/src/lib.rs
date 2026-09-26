@@ -174,8 +174,47 @@ pub fn site_contract(site_code: &[u8], register_params: &[u8], app: &str) -> Opt
     ))))
 }
 
+/// THE OBSERVATION TREE's head register (sdk#399): the person's Register params relabelled `obs`
+/// (`contract_keys::site::obs_params`, the ONE derivation the signer uses too), under the same register code.
+struct ObsRegister {
+    contract: ContractContainer,
+    id: [u8; 32],
+    key: String,
+    /// The register exists on the node (read, or its PUT answered): a head then goes out as an UPDATE.
+    seen: bool,
+}
+
+/// The observation register's contract for Register params `register_params`: `None` when they are not mode 0.
+fn obs_register(register_code: &[u8], register_params: &[u8]) -> Option<ObsRegister> {
+    let params = contract_keys::site::obs_params(register_params)?;
+    let contract = ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(register_code.to_vec())),
+        Parameters::from(params),
+    )));
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&contract.key().id().as_bytes()[..32]);
+    let key = contract.key().to_string();
+    Some(ObsRegister { contract, id, key, seen: false })
+}
+
+/// WHICH SITE A PAGE WAS SERVED FROM (sdk#399 step 4, the architect): the site contract's instance id in the page's
+/// own path, `/v1/contract/web/<link>/...` -- the inverse of [`PageIo::site_link`], and the one owner of "which app
+/// ran" (a person running someone else's app runs THAT publisher's site, which no derivation from their own params
+/// names). STRICT: the link must decode to the 32-byte id AND encode back to itself (`from_base58` zero-pads a short
+/// text into a well-formed wrong id); anything else is `None`, never a guess.
+pub fn site_id_of_path(path: &str) -> Option<[u8; 32]> {
+    let link = path.strip_prefix("/v1/contract/web/")?.split('/').next()?;
+    if link.is_empty() {
+        return None;
+    }
+    let id = freenet_stdlib::prelude::ContractInstanceId::from_base58(link).ok()?;
+    (id.encode() == link).then(|| *id)
+}
+
 pub struct PageIo {
     pub server: Server,
+    /// The person's observation register, once this page has an observation tree ([`PageIo::open_obs`]).
+    obs: Option<ObsRegister>,
     art: Artefacts,
     register: ContractContainer,
     register_id: [u8; 32],
@@ -331,6 +370,7 @@ impl PageIo {
             register_id,
             register_key,
             register_seen: false,
+            obs: None,
             head_asked: false,
             head_answered: false,
             head_changes: 0,
@@ -641,6 +681,32 @@ impl PageIo {
         !self.art.register_params.is_empty()
     }
 
+    /// OPEN THE PERSON'S OBSERVATION TREE (sdk#399 step 4): its register is derived from the Register params (the
+    /// one relabelling), and the page starts its own engine over it. Only the person's own page, never a reader
+    /// (rule 13); once, and only after the signer has named the Register.
+    pub fn open_obs(&mut self) -> Result<(), String> {
+        if self.read_only() {
+            return Err("read-only: a reader has no observation tree".into());
+        }
+        if self.obs.is_some() {
+            return Ok(());
+        }
+        if self.art.register_params.is_empty() {
+            return Err(NO_REGISTER_YET.into());
+        }
+        let Some(obs) = obs_register(&self.art.register_code, &self.art.register_params) else {
+            return Err("no observation tree: this head has no single key to sign it".into());
+        };
+        // The PAGE decides (its one input is the site it was served from, and a recording to publish from).
+        self.server.page.open_obs();
+        if !self.server.page.has_obs() {
+            return Err("no observation tree: this page was not served from a site, or records nothing".into());
+        }
+        self.obs = Some(obs);
+        self.pump();
+        Ok(())
+    }
+
     /// How `app`'s site publication stands: the page's, the one owner. `None`: never published here.
     pub fn publication(&self, app: &str) -> Option<&Publication> {
         self.server.page.publication(app)
@@ -786,6 +852,9 @@ impl PageIo {
                     // The head WHOLE (root ‖ ledger), tolerantly: the root is
                     // the value's first 32 bytes whatever ledger follows.
                     self.server.node(Answer::Head { label: Label::Head, read: page::HeadRead::from_record(&state) }, now);
+                } else if self.obs.as_ref().is_some_and(|o| o.id == id) {
+                    self.obs.as_mut().expect("matched").seen = true;
+                    self.server.node(Answer::Head { label: Label::Obs, read: page::HeadRead::from_record(&state) }, now);
                 } else if let Some(app) = self.site_by_id(&id) {
                     // A site's record is its framing's META. A state that does not frame is no answer (the site
                     // contract admits none): named, and the read stays silent, re-asked on the RTO.
@@ -815,7 +884,13 @@ impl PageIo {
                 }
             }
             Incoming::GetFailed { id, why: wire::GetFail::NotFound } => {
-                if let Some(app) = self.site_by_id(&id) {
+                if self.obs.as_ref().is_some_and(|o| o.id == id && !o.seen) {
+                    // The observation register never written: its GENESIS (the architect on #399 step 4). Only the
+                    // node's NotFound says so -- a COLD lookup, answered after the node's GET bound, and asked only
+                    // after the first data land, so never on the data path. A false NotFound (F55) costs at most a
+                    // genesis record the register's merge then orders behind the real head: diagnostics, never data.
+                    self.server.node(Answer::Head { label: Label::Obs, read: None }, now);
+                } else if let Some(app) = self.site_by_id(&id) {
                     // No site at this address: the genesis (only a NotFound says so).
                     self.server.node(Answer::Head { label: Label::Site(app), read: None }, now);
                 } else if id == self.register_id {
@@ -838,6 +913,10 @@ impl PageIo {
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
                     self.server.node(Answer::GetMissed(cid), now);
                 }
+            }
+            Incoming::Ack(wire::AckKind::Put(key)) | Incoming::Ack(wire::AckKind::Updated(key)) if self.obs.as_ref().is_some_and(|o| o.key == key) => {
+                self.obs.as_mut().expect("matched").seen = true;
+                self.server.node(Answer::Updated { label: Label::Obs }, now);
             }
             Incoming::Ack(wire::AckKind::Put(key)) | Incoming::Ack(wire::AckKind::Updated(key))
                 if key == self.register_key || self.by_key.contains_key(&key) =>
@@ -926,7 +1005,7 @@ impl PageIo {
             }
             // Any other refusal of our own register or block is not known to be final: reported, and the op stays
             // waiting -- re-sent on its RTO (sdk#431's pin), shown "not answering", the safe side.
-            Incoming::PutFailed { key, said } if key == self.register_key || self.by_key.contains_key(&key) => {
+            Incoming::PutFailed { key, said } if key == self.register_key || self.by_key.contains_key(&key) || self.obs.as_ref().is_some_and(|o| o.key == key) => {
                 self.unusable.push(format!("the node refused: {said}"))
             }
             Incoming::PutFailed { key, said } if self.app_contracts.contains_key(&key) => {
@@ -1069,15 +1148,17 @@ impl PageIo {
     /// its blocks; a writer also owns its signer's answers, answers that name
     /// nothing, and PUT answers for the app's own contracts (handed back).
     fn owns(&self, incoming: &Incoming) -> bool {
-        let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id) || self.sites.values().any(|s| s.id == *id);
-        let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k) || self.sites.values().any(|s| s.key == *k);
+        let obs_id = |id: &[u8; 32]| self.obs.as_ref().is_some_and(|o| o.id == *id);
+        let obs_key = |k: &String| self.obs.as_ref().is_some_and(|o| o.key == *k);
+        let mine = |id: &[u8; 32]| *id == self.register_id || obs_id(id) || self.by_contract.contains_key(id) || self.sites.values().any(|s| s.id == *id);
+        let my_key = |k: &String| *k == self.register_key || obs_key(k) || self.by_key.contains_key(k) || self.sites.values().any(|s| s.key == *k);
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id, .. } => mine(id),
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::PutFailedByText { key, .. } => my_key(key) || !self.read_only(),
             Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
             // A site's change is its own (taken, and read by nobody: the page does not follow a site).
-            Incoming::HeadChanged { key, .. } => *key == self.register_key || self.sites.values().any(|s| s.key == *key),
+            Incoming::HeadChanged { key, .. } => *key == self.register_key || obs_key(key) || self.sites.values().any(|s| s.key == *key),
             Incoming::Partial => true,
             Incoming::DelegateMissing { key } => *key == self.art.signer.to_string() || !self.read_only(),
             Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::DelegateThrottled { .. } | Incoming::Refused(_) | Incoming::Unusable(_) => {
@@ -1236,6 +1317,18 @@ impl PageIo {
                     self.head_asked = true;
                     wire::frame_get(wire::contract_id(self.register_id), true, stream)
                 }
+                // The observation register: read WITHOUT a subscription -- nothing on this page follows it; its own
+                // commits learn a newer head from the signer's NotNext.
+                Op::ReadHead { label: Label::Obs } => match self.obs.as_ref() {
+                    Some(o) => wire::frame_get(wire::contract_id(o.id), false, stream),
+                    None => Err("a read of the observation head on a page with no observation tree".into()),
+                },
+                Op::Update { label: Label::Obs, state } => match self.obs.as_ref() {
+                    Some(o) if o.seen => wire::frame_update(o.contract.key(), state, stream),
+                    // The first observation head: a PUT creates the register (as the data head's first does).
+                    Some(o) => wire::frame_put(o.contract.clone(), WrappedState::new(state), stream),
+                    None => Err("an observation head on a page with no observation tree".into()),
+                },
                 Op::ReadHead { label: Label::Site(app) } => match self.sites.get(&app) {
                     Some(site) => wire::frame_get(wire::contract_id(site.id), true, stream),
                     None => Err(format!("a read of {app}'s site, which is not being published")),
@@ -1258,6 +1351,7 @@ impl PageIo {
                 Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } => {
                     let label = match label {
                         Label::Head => Ok(signer_proto::Label::Head),
+                        Label::Obs => Ok(signer_proto::Label::Obs),
                         Label::Site(app) => match self.sites.get(&app) {
                             Some(site) => Ok(signer_proto::Label::Site { app, contract: site.id }),
                             None => Err(format!("a sign for {app}'s site, which is not being published")),
