@@ -359,6 +359,10 @@ fn waiting_name(w: &Waiting) -> String {
 struct Deadline {
     /// Its LANE, classed once when it went out ([`Page::lane_of`]); only ever PROMOTED to Interactive after.
     lane: Lane,
+    /// A BACKGROUND op WITHDRAWN while on the wire (the architect, engineer2's finding on step 2): the page no longer
+    /// waits on it, but the node still holds it, so it keeps the lane's ONE slot until its answer comes (dropped) or
+    /// its deadline comes due, whichever is first. Never re-sent; its end was recorded once, at withdraw.
+    withdrawn: bool,
     at: u64,
     /// The deadline it was given when SENT: a re-arm never moves it past this
     /// (sdk#378).
@@ -438,7 +442,7 @@ fn op_site(w: &Waiting) -> instrument::Site {
 /// window, so interactive work waits behind at most one background op. One lane for all background work: two lanes
 /// would put two background ops on the node's queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Lane {
+pub enum Lane {
     Interactive,
     Background,
 }
@@ -951,6 +955,11 @@ impl Page {
         self.now = now;
         let late: Vec<Waiting> =
             self.deadlines.iter().filter(|(_, d)| now >= d.at).map(|(w, _)| w.clone()).collect();
+        // A WITHDRAWN Background op whose deadline came due: its slot frees; nothing is re-sent or recorded.
+        let (expired, late): (Vec<Waiting>, Vec<Waiting>) = late.into_iter().partition(|w| self.deadlines.get(w).is_some_and(|d| d.withdrawn));
+        for w in expired {
+            self.deadlines.remove(&w);
+        }
         // A GET ON THE WIRE whose node GET is not over is SILENT, not lost (sdk#447): nothing is sent, the RTO does not
         // back off, the window does not halve -- the loopback lost nothing and the node is still fetching. Its deadline
         // moves to where that node GET is certainly over; only then is it a timeout (below), re-sent as a NEW node GET.
@@ -1606,7 +1615,7 @@ impl Page {
     pub fn reconnected(&mut self, now: Ms) {
         self.now = now.0;
         // Re-sent in the order they first queued, and queued anew in it (sdk#390).
-        let mut on_wire: Vec<(u32, Waiting)> = self.deadlines.iter().filter(|(_, d)| d.sent).map(|(w, d)| (d.seq, w.clone())).collect();
+        let mut on_wire: Vec<(u32, Waiting)> = self.deadlines.iter().filter(|(_, d)| d.sent && !d.withdrawn).map(|(w, d)| (d.seq, w.clone())).collect();
         on_wire.sort_unstable();
         let mut head_read = false;
         for (_, w) in on_wire {
@@ -2003,6 +2012,12 @@ impl Page {
     ///
     /// A stated consequence (the architect): an ON-WIRE GET promoted while the interactive window is full puts the
     /// interactive count one over the window for its lifetime. Accepted: it is a GET the person is now waiting on.
+    ///
+    /// A WITHDRAWN op, by lane (the architect's ruling): a Background op withdrawn on the wire KEEPS the slot until its
+    /// answer or deadline -- the slot is a hard bound promised to the node, which still holds it. The interactive window
+    /// does NOT do this: a withdrawn interactive GET frees its window place at once -- the window is the page's
+    /// congestion estimate, and every race withdraws its losers at k; holding their places would cut read concurrency,
+    /// which is a measurement's decision, not this lane's.
     fn lane_of(&self, w: &Waiting) -> Lane {
         #[cfg(test)]
         if self.test_background.contains(w) {
@@ -2020,7 +2035,7 @@ impl Page {
             .bg_queue
             .iter()
             .map(|(w, _)| w.clone())
-            .chain(self.deadlines.iter().filter(|(_, d)| d.sent && d.lane == Lane::Background).map(|(w, _)| w.clone()))
+            .chain(self.deadlines.iter().filter(|(_, d)| d.sent && d.lane == Lane::Background && !d.withdrawn).map(|(w, _)| w.clone()))
             .filter(|w| self.lane_of(w) == Lane::Interactive)
             .collect();
         for w in joined {
@@ -2058,6 +2073,11 @@ impl Page {
 
     /// Send `w` in `lane`.
     fn send_in(&mut self, w: Waiting, op: Op, lane: Lane) {
+        // A WITHDRAWN op wanted again: it is still on the wire, so it is waited on again -- its answer serves.
+        if let Some(d) = self.deadlines.get_mut(&w).filter(|d| d.withdrawn) {
+            d.withdrawn = false;
+            return;
+        }
         // PROMOTION (the one exception to "classed once"): an interactive waiter joining a Background op. Queued, it
         // leaves the background queue and is sent below as interactive work; on the wire, it moves to the
         // interactive count and frees the background slot -- its answer serves the new waiter too.
@@ -2112,7 +2132,7 @@ impl Page {
         let ahead = self.deadlines.iter().filter(|(k, d)| d.sent && !d.silent && **k != w).count() as u64;
         let at = self.now + if attempt == 1 { queued_wait(self.rto.rto_ms(), ahead) } else { self.backoff(attempt) };
         let seq = self.next_send();
-        let d = Deadline { lane, at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq, alone: ahead == 0, silent: false };
+        let d = Deadline { lane, withdrawn: false, at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq, alone: ahead == 0, silent: false };
         self.record_send(&w, &d);
         // A send still on the wire for the same op is SUPERSEDED by this one: its end is said, never overwritten.
         if let Some(old) = self.deadlines.insert(w.clone(), d) {
@@ -2148,6 +2168,20 @@ impl Page {
     fn end(&mut self, w: &Waiting, how: End) -> Option<Deadline> {
         // A queued Background op that ends never goes out.
         self.bg_queue.retain(|(q, _)| q != w);
+        // An op already WITHDRAWN said its end then: its entry leaves now, recording nothing.
+        if self.deadlines.get(w).is_some_and(|d| d.withdrawn) {
+            return self.deadlines.remove(w);
+        }
+        // A BACKGROUND op withdrawn ON THE WIRE keeps the lane's slot: the node still holds it (the architect). It stays
+        // in its ONE record, marked withdrawn, until its answer or its deadline; its end is recorded ONCE, here.
+        if how == End::Withdrawn {
+            if let Some(d) = self.deadlines.get_mut(w).filter(|d| d.sent && d.lane == Lane::Background) {
+                d.withdrawn = true;
+                let d = d.clone();
+                self.record_end(w, &d, how);
+                return Some(d);
+            }
+        }
         let d = self.deadlines.remove(w)?;
         self.record_end(w, &d, how);
         Some(d)
@@ -2295,7 +2329,7 @@ impl Page {
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
         let lane = self.deadlines.get(&w).map_or_else(|| self.lane_of(&w), |d| d.lane);
-        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { lane, at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0, alone: false, silent: false }) {
+        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { lane, withdrawn: false, at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0, alone: false, silent: false }) {
             self.record_end(&w, &old, End::Withdrawn);
         }
     }
@@ -2305,6 +2339,12 @@ impl Page {
     /// back-off without sampling; every first send still on the wire is re-armed; and a GET opens the window.
     /// `None`: nothing was waiting on it.
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
+        // The answer to a WITHDRAWN Background op: nobody waits on it -- dropped; its slot frees for the next.
+        if self.deadlines.get(w).is_some_and(|d| d.withdrawn) {
+            self.deadlines.remove(w);
+            self.pump_background();
+            return None;
+        }
         let d = self.end(w, End::Answered)?;
         self.attempt_of.remove(w);
         self.first_of.remove(w);
@@ -2780,7 +2820,7 @@ impl Page {
                         let bytes = self.engine.blocks().get(&id).expect("held").to_vec();
                         let more = self.engine.step(Event::BlockArrived { id, bytes });
                         self.carry_out(more);
-                    } else if self.deadlines.contains_key(&Waiting::Get(id)) || self.get_queue.contains(&id) {
+                    } else if self.deadlines.get(&Waiting::Get(id)).is_some_and(|d| !d.withdrawn) || self.get_queue.contains(&id) {
                         // ONE GET per block while one is out: its answer
                         // serves every reader, and its re-send is the RTO's
                         // (with its backoff). A second send here would reset
@@ -2949,13 +2989,20 @@ impl Page {
     /// slow ("not answering for N s", rule 8). Never an end: the request is
     /// still being re-sent. `None` when nothing waits.
     pub fn not_answering(&self) -> Option<(String, u64)> {
+        self.not_answering_in(Lane::Interactive)
+    }
+
+    /// [`Page::not_answering`] for one LANE: the person's interactive work (what an app shows), or the background
+    /// work's (sdk#472's Assets tab: "not answering the assets audit for N s"). ONE derivation of the waits; a
+    /// withdrawn op waits on nobody and is never named.
+    pub fn not_answering_in(&self, lane: Lane) -> Option<(String, u64)> {
         self.first_of
             .iter()
-            // What a PERSON is shown: never background work (an audit, an observation commit).
-            .filter(|(w, _)| self.deadlines.get(*w).is_some_and(|d| d.lane == Lane::Interactive))
+            .filter(|(w, _)| self.deadlines.get(*w).is_some_and(|d| d.lane == lane && !d.withdrawn))
             .min_by_key(|(_, at)| **at)
             .map(|(w, at)| (waiting_name(w), self.now.saturating_sub(*at)))
     }
+
 
     /// Ops to send, in order. `Held` asks are batched HERE (sdk#455): the one place every op leaves, so all asked in
     /// the step go out together, one op per up to MAX_HELD ids.
@@ -5380,6 +5427,53 @@ mod background_lane {
         assert!(d.sent && d.lane == Lane::Interactive, "X did not go out as interactive work");
         assert_eq!(p.gets_in_flight(), before + 1, "the promoted GET is not counted in the interactive window");
         assert_eq!(p.background_in_flight(), 1, "THE CONTROL: the other Background op lost its slot");
+    }
+
+    /// (g) **A WITHDRAWN on-wire Background op KEEPS the slot** (engineer2's finding, the architect's fix): the node still
+    /// holds it, so the queued Background op does not go out until its answer comes (dropped) -- and, in a second run,
+    /// until its deadline comes due. An interactive withdrawn GET is not held (the window's own meaning).
+    #[test]
+    fn a_withdrawn_background_op_on_the_wire_keeps_the_slot_until_its_answer_or_deadline() {
+        for by_answer in [true, false] {
+            let mut p = page();
+            background(&mut p, get(7));
+            background(&mut p, put(2));
+            let _ = p.take_ops();
+            assert!(p.bg_queue.iter().any(|(w, _)| *w == put(2).0), "THE SETUP: the second op is not queued");
+            p.end(&get(7).0, End::Withdrawn);
+            assert_eq!(p.background_in_flight(), 1, "the withdrawn on-wire op freed the slot");
+            let now = p.now;
+            p.tick(Ms(now));
+            assert!(p.take_ops().is_empty(), "a second Background op went out beside the withdrawn one");
+            if by_answer {
+                assert_eq!(p.answered(&get(7).0), None, "the withdrawn op's answer was taken as an answer");
+            } else {
+                let due = p.deadlines[&get(7).0].at;
+                p.tick(Ms(due));
+            }
+            let _ = p.take_ops();
+            assert!(!p.deadlines.contains_key(&get(7).0), "the withdrawn op outlived its {}", if by_answer { "answer" } else { "deadline" });
+            assert!(p.deadlines.get(&put(2).0).is_some_and(|d| d.sent), "the slot did not go to the queued op after the {}", if by_answer { "answer" } else { "deadline" });
+        }
+        // THE CONTROL: an INTERACTIVE GET withdrawn on the wire frees its place at once (the window, unchanged).
+        let mut p = page();
+        let (w, op) = get(9);
+        p.send(w.clone(), op);
+        p.end(&w, End::Withdrawn);
+        assert!(!p.deadlines.contains_key(&w), "an interactive withdrawn GET was held");
+    }
+
+    /// **not_answering_in(lane)**: a Background wait shows ONLY through the Background lane; the plain
+    /// `not_answering` (what an app shows) is the Interactive lane's.
+    #[test]
+    fn a_lanes_longest_wait_is_named_only_in_that_lane() {
+        let mut p = page();
+        background(&mut p, put(1));
+        assert_eq!(p.not_answering(), None);
+        assert!(p.not_answering_in(Lane::Background).is_some_and(|(what, _)| what == "a block's save"), "the Background wait was not named in its lane");
+        let (w, op) = put(2);
+        p.send(w, op);
+        assert!(p.not_answering().is_some() && p.not_answering_in(Lane::Interactive) == p.not_answering(), "the plain form is not the Interactive lane's");
     }
 
     /// (f) **PROMOTION, on the wire**: the joined op moves to the interactive count and FREES the slot, which the
