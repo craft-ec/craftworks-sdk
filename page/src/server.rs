@@ -1561,7 +1561,8 @@ pub enum KeyState {
     Saving,
     /// Published.
     Saved,
-    /// Published, and no parity is owed over a tree known in full.
+    /// Published, and the commit of the key's last write is BACKED_UP (`ParityComplete`), the tree still holding
+    /// its value (sdk#415).
     SavedAndBackedUp,
 }
 
