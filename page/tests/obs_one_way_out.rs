@@ -79,7 +79,9 @@ fn publish_path_breaches(file: &str, src: &str) -> Vec<String> {
         let pos = at + i;
         let full = prod[..pos].ends_with("instrument::");
         let rest = &prod[pos + "publish::".len()..];
-        let named = ["publish(", "Header", "Window", "Published"].iter().any(|t| {
+        // `WINDOW_MS`: the instrument's window length, a constant the ride-along keys windows by (the architect on
+        // sdk#399 step 4: one owner; a local 60_000 would be the copy). EXACT names, never a prefix.
+        let named = ["publish(", "Header", "Window", "Published", "WINDOW_MS"].iter().any(|t| {
             rest.starts_with(t) && (t.ends_with('(') || !rest[t.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'))
         });
         if !(full && named) {
@@ -142,6 +144,11 @@ fn the_scan_flags_each_way_out_and_passes_the_allowed_ones() {
         assert!(!breaches(&[("x.rs".into(), src.into())]).is_empty(), "{name} was not flagged");
     }
     // Test code is not production: a test module's `.events()` is fine.
+    // The window length is a constant, not a way out: named in full it passes; a longer name that starts with it
+    // is not it (the allow-list is exact, never a prefix).
+    assert!(publish_path_breaches("w.rs", "fn tick() { let m = now / instrument::publish::WINDOW_MS; }\n").is_empty(), "the window length was flagged");
+    assert!(!publish_path_breaches("w.rs", "fn tick() { let m = instrument::publish::WINDOW_MS_X(); }\n").is_empty(), "a name that only starts with WINDOW_MS passed");
+    assert!(!publish_path_breaches("w.rs", "fn tick() { let m = instrument::publish::WindowOpen; }\n").is_empty(), "a name that only starts with Window passed");
     // A comment naming the module is not an import.
     assert!(publish_path_breaches("c.rs", "//! the record is `instrument::publish`'s output\nfn f() {}\n").is_empty(), "a comment was taken for an import");
     let test_only = "fn dump() {}\n#[cfg(test)]\nmod tests {\n    fn t() { let e = r.events(); }\n}\n";
