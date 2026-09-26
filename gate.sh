@@ -135,6 +135,7 @@ CONTROLS=(
   "fixture-gate|./fixture-gate.sh"
   "dup-gate|node tools/dup-gate.mjs"
   "owners|node tools/owners.mjs"
+  "js_tests_registered|node tools/js-tests-registered.mjs"
 )
 # BATCH-ONLY TESTS (the owner: a PR runs what is relevant to it): test targets too slow for every PR, as
 # `member@target`, each with its measured time. `--pr` skips them BY NAME and prints them ("batch-only, skipped");
