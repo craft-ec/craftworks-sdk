@@ -5,7 +5,7 @@
 //!
 //! A pass is TWO state machines (KEEPER §5 "A pass's life", the tables this file implements): each block's [`Seen`]
 //! and the pass's [`Phase`], one enum each whose cases carry their data, changed ONLY by [`Audit::on`] -- the one
-//! method here that takes `&mut self` (a source test holds it). Everything else is DERIVED from them: the blocks to ask
+//! `&mut` method outside the nested `state` module, which owns the fields (the compiler holds it). Everything else is DERIVED from them: the blocks to ask
 //! (no state yet), the blocks to GET (`NotHeld`), a group's margin, the groups to repair, and the report's counts.
 //!
 //! REPAIR (KEEPER §5; the architect's D1/D2): a group is repaired only when the policy names it and it has k blocks to
@@ -179,349 +179,379 @@ pub(crate) struct Ctx<'a> {
     pub max_held: usize,
 }
 
-/// A pass in progress.
-pub(crate) struct Audit {
-    root: Cid,
-    /// `None`: a FULL pass (every node); `Some(old)`: an INCREMENTAL pass over the nodes `root` has that `old` does not
-    /// (KEEPER §5: on a head move). Only a full pass's report is written back (K5).
-    since: Option<Cid>,
-    policy: Repair,
-    started_at: u64,
-    groups: Vec<Grp>,
-    seen: BTreeMap<Cid, Seen>,
-    phase: Phase,
-    /// The walk's request ids, allocated in order.
-    reqs: u64,
-    /// Events that arrived in a cell the table calls impossible: 0 in a correct run (a model test asserts it).
-    impossible: usize,
-}
+/// THE PASS'S STATE (KEEPER §5), in its own module: ONE WRITER, BY TYPE. Its fields are private to `state`, and the only
+/// `&mut` method any code outside `state` can reach is [`Audit::on`], the transition function (its helpers `step`,
+/// `set` and `add_group` are private to `state` too). Everything else in this file reads the pass through the
+/// read-only accessors at the end of `state`: the compiler holds the rule, no source scan.
+mod state {
+    use super::*;
 
-impl Audit {
-    /// A pass at `root`, walking (KEEPER §5: a page WITH a signer; one without never starts one).
-    pub fn new(root: Cid, since: Option<Cid>, policy: Repair, now: u64) -> Audit {
-        Audit {
-            root,
-            since,
-            policy,
-            started_at: now,
-            groups: Vec::new(),
-            seen: BTreeMap::new(),
-            phase: Phase::Walking { at: None, reading: None },
-            reqs: 0,
-            impossible: 0,
-        }
+    /// A pass in progress.
+    pub(crate) struct Audit {
+        root: Cid,
+        /// `None`: a FULL pass (every node); `Some(old)`: an INCREMENTAL pass over the nodes `root` has that `old` does not
+        /// (KEEPER §5: on a head move). Only a full pass's report is written back (K5).
+        since: Option<Cid>,
+        policy: Repair,
+        started_at: u64,
+        groups: Vec<Grp>,
+        seen: BTreeMap<Cid, Seen>,
+        phase: Phase,
+        /// The walk's request ids, allocated in order.
+        reqs: u64,
+        /// Events that arrived in a cell the table calls impossible: 0 in a correct run (a model test asserts it).
+        impossible: usize,
     }
 
-    /// THE TRANSITION FUNCTION (KEEPER §5): with [`Audit::step`], the only writer of this pass's state. Returns what the
-    /// page must do.
-    pub fn on(&mut self, ev: Ev, cx: &Ctx) -> Vec<Act> {
-        let phase = std::mem::replace(&mut self.phase, Phase::Asking);
-        let (phase, mut acts, again) = self.step(phase, ev, cx);
-        self.phase = phase;
-        // A phase that changed on `Free` takes its own first `Free` at once (an empty phase passes straight through).
-        if again {
-            acts.extend(self.on(Ev::Free, cx));
-        }
-        acts
-    }
-
-    /// One cell of the phase table (and the block table's, through [`Audit::set`]): (the next phase, the acts, whether
-    /// the next phase takes a `Free` now).
-    fn step(&mut self, phase: Phase, ev: Ev, cx: &Ctx) -> (Phase, Vec<Act>, bool) {
-        let mut acts = Vec::new();
-        let next = match (phase, ev) {
-            // ---- Walking
-            (Phase::Walking { reading: None, at }, Ev::Free) => {
-                self.reqs += 1;
-                acts.push(Act::Walk { req: self.reqs, at: at.clone(), since: self.since });
-                Phase::Walking { at, reading: Some(self.reqs) }
+    impl Audit {
+        /// A pass at `root`, walking (KEEPER §5: a page WITH a signer; one without never starts one).
+        pub fn new(root: Cid, since: Option<Cid>, policy: Repair, now: u64) -> Audit {
+            Audit {
+                root,
+                since,
+                policy,
+                started_at: now,
+                groups: Vec::new(),
+                seen: BTreeMap::new(),
+                phase: Phase::Walking { at: None, reading: None },
+                reqs: 0,
+                impossible: 0,
             }
-            (p @ Phase::Walking { reading: Some(_), .. }, Ev::Free) => p,
-            (Phase::Walking { reading: Some(r), at }, Ev::WalkPage { req, nodes, next, root_parity }) => {
-                if r != req {
-                    self.impossible += 1;
-                    return (Phase::Walking { reading: Some(r), at }, acts, false);
+        }
+
+        /// THE TRANSITION FUNCTION (KEEPER §5): with [`Audit::step`], the only writer of this pass's state. Returns what the
+        /// page must do.
+        pub fn on(&mut self, ev: Ev, cx: &Ctx) -> Vec<Act> {
+            let phase = std::mem::replace(&mut self.phase, Phase::Asking);
+            let (phase, mut acts, again) = self.step(phase, ev, cx);
+            self.phase = phase;
+            // A phase that changed on `Free` takes its own first `Free` at once (an empty phase passes straight through).
+            if again {
+                acts.extend(self.on(Ev::Free, cx));
+            }
+            acts
+        }
+
+        /// One cell of the phase table (and the block table's, through [`Audit::set`]): (the next phase, the acts, whether
+        /// the next phase takes a `Free` now).
+        fn step(&mut self, phase: Phase, ev: Ev, cx: &Ctx) -> (Phase, Vec<Act>, bool) {
+            let mut acts = Vec::new();
+            let next = match (phase, ev) {
+                // ---- Walking
+                (Phase::Walking { reading: None, at }, Ev::Free) => {
+                    self.reqs += 1;
+                    acts.push(Act::Walk { req: self.reqs, at: at.clone(), since: self.since });
+                    Phase::Walking { at, reading: Some(self.reqs) }
                 }
-                // A node already walked is not walked again (an incremental walk's resumed page may name one twice).
-                let walked: BTreeSet<Cid> = self.groups.iter().map(|g| g.node).collect();
-                if let Some(parity) = root_parity.filter(|_| !walked.contains(&self.root)) {
-                    self.add_group(self.root, vec![self.root], parity, false, cx.rejected);
-                }
-                for n in nodes.into_iter().filter(|n| !walked.contains(&n.id)) {
-                    for (members, parity) in n.groups {
-                        self.add_group(n.id, members, parity, n.level == 0, cx.rejected);
+                (p @ Phase::Walking { reading: Some(_), .. }, Ev::Free) => p,
+                (Phase::Walking { reading: Some(r), at }, Ev::WalkPage { req, nodes, next, root_parity }) => {
+                    if r != req {
+                        self.impossible += 1;
+                        return (Phase::Walking { reading: Some(r), at }, acts, false);
                     }
+                    // A node already walked is not walked again (an incremental walk's resumed page may name one twice).
+                    let walked: BTreeSet<Cid> = self.groups.iter().map(|g| g.node).collect();
+                    if let Some(parity) = root_parity.filter(|_| !walked.contains(&self.root)) {
+                        self.add_group(self.root, vec![self.root], parity, false, cx.rejected);
+                    }
+                    for n in nodes.into_iter().filter(|n| !walked.contains(&n.id)) {
+                        for (members, parity) in n.groups {
+                            self.add_group(n.id, members, parity, n.level == 0, cx.rejected);
+                        }
+                    }
+                    let next = match next {
+                        Some(at) => Phase::Walking { at: Some(at), reading: None },
+                        None => Phase::Asking,
+                    };
+                    return (next, acts, true);
                 }
-                let next = match next {
-                    Some(at) => Phase::Walking { at: Some(at), reading: None },
-                    None => Phase::Asking,
-                };
-                return (next, acts, true);
-            }
-            (Phase::Walking { reading: Some(r), at }, Ev::WalkUnusable { req, said }) => {
-                if r != req {
+                (Phase::Walking { reading: Some(r), at }, Ev::WalkUnusable { req, said }) => {
+                    if r != req {
+                        self.impossible += 1;
+                        return (Phase::Walking { reading: Some(r), at }, acts, false);
+                    }
+                    acts.push(Act::Say(format!("the assets audit's walk ended without its nodes: {said}")));
+                    return (Phase::Asking, acts, true);
+                }
+                // ---- Asking
+                (Phase::Asking, Ev::Free) => {
+                    let ask: Vec<Cid> = self.to_ask().into_iter().take(cx.max_held).collect();
+                    if ask.is_empty() {
+                        return (Phase::Getting, acts, true);
+                    }
+                    acts.push(Act::AskHeld(ask));
+                    Phase::Asking
+                }
+                (Phase::Asking, Ev::Held(answers)) => {
+                    for (id, present) in answers {
+                        match present {
+                            Some(true) => self.set(id, Seen::Held),
+                            Some(false) => self.set(id, Seen::NotHeld),
+                            // Past a short answer: no state, so it is asked again (derived).
+                            None => {}
+                        }
+                    }
+                    Phase::Asking
+                }
+                // ---- Getting
+                (Phase::Getting, Ev::Free) => match self.seen.iter().find(|(_, s)| **s == Seen::NotHeld) {
+                    Some((id, _)) => {
+                        acts.push(Act::Get(*id));
+                        Phase::Getting
+                    }
+                    None => return (Phase::Repairing { next: 0, job: None }, acts, true),
+                },
+                (Phase::Getting, Ev::Got { id, good, .. }) if self.seen.get(&id) == Some(&Seen::NotHeld) => {
+                    self.set(id, if good { Seen::Fetched } else { Seen::Absent });
+                    Phase::Getting
+                }
+                (Phase::Getting, Ev::Missed(id)) if self.seen.get(&id) == Some(&Seen::NotHeld) => {
+                    self.set(id, Seen::Absent);
+                    Phase::Getting
+                }
+                (Phase::Getting, Ev::Silent(id)) if self.seen.get(&id) == Some(&Seen::NotHeld) => {
+                    self.set(id, Seen::Pending);
+                    Phase::Getting
+                }
+                // ---- Repairing: no job -> the next group the policy names, or the pass is over.
+                (Phase::Repairing { next, job: None }, Ev::Free) => match (next..self.groups.len()).find(|&g| self.names(g)) {
+                    None => {
+                        acts.push(Act::Finish);
+                        Phase::Repairing { next, job: None }
+                    }
+                    Some(group) => {
+                        let have = self.groups[group].slots().filter_map(|id| (cx.stored)(id).map(|b| (*id, b))).collect();
+                        return (Phase::Repairing { next: group + 1, job: Some(Job::Gathering { group, have }) }, acts, true);
+                    }
+                },
+                // Gathering: a held slot's bytes still needed -> GET it; else build the group's PUTs.
+                (Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }, Ev::Free) => match self.slot_to_fetch(group, &have) {
+                    Some(id) => {
+                        acts.push(Act::Get(id));
+                        Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
+                    }
+                    None => {
+                        let (puts, said) = self.build(group, &have);
+                        acts.extend(said.into_iter().map(Act::Say));
+                        return (Phase::Repairing { next, job: Some(Job::Putting { group, puts }) }, acts, true);
+                    }
+                },
+                (Phase::Repairing { next, job: Some(Job::Gathering { group, mut have }) }, Ev::Got { id, good, bytes }) if self.slot_of(group, &id) => {
+                    if good {
+                        have.insert(id, bytes);
+                    } else {
+                        self.set(id, Seen::Absent);
+                    }
+                    Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
+                }
+                (Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }, Ev::Missed(id)) if self.slot_of(group, &id) => {
+                    self.set(id, Seen::Absent);
+                    Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
+                }
+                (Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }, Ev::Silent(id)) if self.slot_of(group, &id) => {
+                    self.set(id, Seen::Pending);
+                    Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
+                }
+                // Putting: the next block out; none left -> the next group.
+                (Phase::Repairing { next, job: Some(Job::Putting { group, mut puts }) }, Ev::Free) => match puts.pop_front() {
+                    Some((id, bytes)) => {
+                        self.set(id, Seen::Putting { bytes: bytes.len() as u32 });
+                        acts.push(Act::Put(id, bytes));
+                        Phase::Repairing { next, job: Some(Job::Putting { group, puts }) }
+                    }
+                    None => return (Phase::Repairing { next, job: None }, acts, true),
+                },
+                // ---- The block table's PUT columns (a withdrawn PUT's answer never reaches a pass: KEEPER §5 ⁹).
+                (p, Ev::PutOk(id)) if self.is_putting(&id) => {
+                    let bytes = match self.seen[&id] {
+                        Seen::Putting { bytes } => bytes,
+                        Seen::NotHeld | Seen::Held | Seen::Fetched | Seen::Absent | Seen::Pending | Seen::Rejected | Seen::Repaired { .. } => 0,
+                    };
+                    self.set(id, Seen::Repaired { bytes });
+                    p
+                }
+                (p, Ev::PutRefused { id, transient: false, .. }) if self.is_putting(&id) => {
+                    self.set(id, Seen::Rejected);
+                    acts.push(Act::Rejected(id));
+                    p
+                }
+                // Transient refusal, or its deadline: the same PUT again (rule 7), while the pass lives.
+                (p, Ev::PutRefused { id, transient: true, bytes } | Ev::PutDeadline { id, bytes }) if self.is_putting(&id) => {
+                    acts.push(Act::Put(id, bytes));
+                    p
+                }
+                // ---- Every other cell is one the tables call impossible: counted, never acted on. Every phase and every
+                // event but `Free` (placed in every phase above) is NAMED here, so a new case of either does not compile
+                // until the tables place it.
+                (
+                    p @ (Phase::Walking { .. } | Phase::Asking | Phase::Getting | Phase::Repairing { .. }),
+                    Ev::WalkPage { .. }
+                    | Ev::WalkUnusable { .. }
+                    | Ev::Held(_)
+                    | Ev::HeldUnasked
+                    | Ev::Got { .. }
+                    | Ev::Missed(_)
+                    | Ev::Silent(_)
+                    | Ev::PutOk(_)
+                    | Ev::PutRefused { .. }
+                    | Ev::PutDeadline { .. },
+                ) => {
                     self.impossible += 1;
-                    return (Phase::Walking { reading: Some(r), at }, acts, false);
+                    p
                 }
-                acts.push(Act::Say(format!("the assets audit's walk ended without its nodes: {said}")));
-                return (Phase::Asking, acts, true);
-            }
-            // ---- Asking
-            (Phase::Asking, Ev::Free) => {
-                let ask: Vec<Cid> = self.to_ask().into_iter().take(cx.max_held).collect();
-                if ask.is_empty() {
-                    return (Phase::Getting, acts, true);
+            };
+            (next, acts, false)
+        }
+
+        // ---- The one writer's helpers: called only from `on` (they are not `&mut self` methods of their own).
+
+        fn set(&mut self, id: Cid, s: Seen) {
+            self.seen.insert(id, s);
+        }
+
+        fn add_group(&mut self, node: Cid, members: Vec<Cid>, parity: Vec<Cid>, leaf: bool, rejected: &BTreeSet<Cid>) {
+            for id in members.iter().chain(parity.iter()) {
+                if rejected.contains(id) {
+                    self.seen.insert(*id, Seen::Rejected);
                 }
-                acts.push(Act::AskHeld(ask));
-                Phase::Asking
             }
-            (Phase::Asking, Ev::Held(answers)) => {
-                for (id, present) in answers {
-                    match present {
-                        Some(true) => self.set(id, Seen::Held),
-                        Some(false) => self.set(id, Seen::NotHeld),
-                        // Past a short answer: no state, so it is asked again (derived).
+            self.groups.push(Grp { node, members, parity, leaf });
+        }
+
+        // ---- DERIVED (KEEPER §5): read the two states, write nothing.
+
+        /// The blocks walked and not yet asked, in walk order, each once.
+        fn to_ask(&self) -> Vec<Cid> {
+            let mut seen_now = BTreeSet::new();
+            self.groups.iter().flat_map(Grp::slots).filter(|id| !self.seen.contains_key(*id) && seen_now.insert(**id)).copied().collect()
+        }
+
+        /// Does the policy name group `g`? At least one block known ABSENT, k to rebuild from, and the policy's margin.
+        fn names(&self, g: usize) -> bool {
+            let grp = &self.groups[g];
+            let margin = self.margin(grp);
+            margin >= 0 && grp.slots().any(|id| self.seen.get(id) == Some(&Seen::Absent)) && self.policy.repairs(margin, grp.parity.len())
+        }
+
+        /// The next held slot of `group` whose bytes a rebuild still needs, if any: none once every absent block is one the
+        /// page holds, or the job has k.
+        fn slot_to_fetch(&self, group: usize, have: &BTreeMap<Cid, Vec<u8>>) -> Option<Cid> {
+            let g = &self.groups[group];
+            let absent_all_held_here = g.slots().filter(|id| self.seen.get(*id) == Some(&Seen::Absent)).all(|id| have.contains_key(id));
+            if absent_all_held_here || g.slots().filter(|id| have.contains_key(*id)).count() >= g.members.len() {
+                return None;
+            }
+            g.slots().find(|id| !have.contains_key(*id) && self.seen.get(*id).is_some_and(|s| matches!(s, Seen::Held | Seen::Fetched))).copied()
+        }
+
+        /// The PUTs for `group`'s ABSENT blocks: the page's own bytes when it holds them, else a member REBUILT
+        /// (`repair::rebuild`, hash-checked) or a parity RECOMPUTED (id-checked). With fewer than k slots nothing is rebuilt
+        /// (the group is below k, and the report says damaged).
+        fn build(&self, group: usize, have: &BTreeMap<Cid, Vec<u8>>) -> (VecDeque<(Cid, Vec<u8>)>, Vec<String>) {
+            let g = &self.groups[group];
+            let rg = g.as_repair(0);
+            let can_solve = g.slots().filter(|id| have.contains_key(*id)).count() >= rg.k;
+            let slots: Vec<Option<Vec<u8>>> = rg.slots.iter().enumerate().map(|(i, id)| have.get(id).map(|b| rg.stored(i, b))).collect();
+            let (mut puts, mut said) = (VecDeque::new(), Vec::new());
+            let mut parity_blocks: Option<Vec<Vec<u8>>> = None;
+            for (i, id) in rg.slots.iter().enumerate() {
+                if self.seen.get(id) != Some(&Seen::Absent) {
+                    continue;
+                }
+                if let Some(b) = have.get(id) {
+                    puts.push_back((*id, b.clone()));
+                } else if !can_solve {
+                } else if !rg.is_parity(i) {
+                    match engine::repair::rebuild(&g.as_repair(i), &slots) {
+                        Ok(body) => puts.push_back((*id, body)),
+                        Err(e) => said.push(format!("the assets audit could not rebuild member {}: {e}", engine::short_id(id))),
+                    }
+                } else {
+                    let p = parity_blocks.get_or_insert_with(|| match parity::repair_group(rg.k, &slots, rg.max_len).map(|st| parity::encode_group(&st)) {
+                        Ok(Ok(p)) => p,
+                        other => {
+                            said.push(format!("the assets audit could not recompute group parity: {:?}", other.err()));
+                            Vec::new()
+                        }
+                    });
+                    match p.get(i - rg.k) {
+                        Some(p) if block_id(kind::PARITY, p) == *id => puts.push_back((*id, p.clone())),
+                        Some(_) => said.push(format!("the assets audit's recomputed parity is not {}: never PUT", engine::short_id(id))),
                         None => {}
                     }
                 }
-                Phase::Asking
             }
-            // ---- Getting
-            (Phase::Getting, Ev::Free) => match self.seen.iter().find(|(_, s)| **s == Seen::NotHeld) {
-                Some((id, _)) => {
-                    acts.push(Act::Get(*id));
-                    Phase::Getting
-                }
-                None => return (Phase::Repairing { next: 0, job: None }, acts, true),
-            },
-            (Phase::Getting, Ev::Got { id, good, .. }) if self.seen.get(&id) == Some(&Seen::NotHeld) => {
-                self.set(id, if good { Seen::Fetched } else { Seen::Absent });
-                Phase::Getting
-            }
-            (Phase::Getting, Ev::Missed(id)) if self.seen.get(&id) == Some(&Seen::NotHeld) => {
-                self.set(id, Seen::Absent);
-                Phase::Getting
-            }
-            (Phase::Getting, Ev::Silent(id)) if self.seen.get(&id) == Some(&Seen::NotHeld) => {
-                self.set(id, Seen::Pending);
-                Phase::Getting
-            }
-            // ---- Repairing: no job -> the next group the policy names, or the pass is over.
-            (Phase::Repairing { next, job: None }, Ev::Free) => match (next..self.groups.len()).find(|&g| self.names(g)) {
-                None => {
-                    acts.push(Act::Finish);
-                    Phase::Repairing { next, job: None }
-                }
-                Some(group) => {
-                    let have = self.groups[group].slots().filter_map(|id| (cx.stored)(id).map(|b| (*id, b))).collect();
-                    return (Phase::Repairing { next: group + 1, job: Some(Job::Gathering { group, have }) }, acts, true);
-                }
-            },
-            // Gathering: a held slot's bytes still needed -> GET it; else build the group's PUTs.
-            (Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }, Ev::Free) => match self.slot_to_fetch(group, &have) {
-                Some(id) => {
-                    acts.push(Act::Get(id));
-                    Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
-                }
-                None => {
-                    let (puts, said) = self.build(group, &have);
-                    acts.extend(said.into_iter().map(Act::Say));
-                    return (Phase::Repairing { next, job: Some(Job::Putting { group, puts }) }, acts, true);
-                }
-            },
-            (Phase::Repairing { next, job: Some(Job::Gathering { group, mut have }) }, Ev::Got { id, good, bytes }) if self.slot_of(group, &id) => {
-                if good {
-                    have.insert(id, bytes);
-                } else {
-                    self.set(id, Seen::Absent);
-                }
-                Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
-            }
-            (Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }, Ev::Missed(id)) if self.slot_of(group, &id) => {
-                self.set(id, Seen::Absent);
-                Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
-            }
-            (Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }, Ev::Silent(id)) if self.slot_of(group, &id) => {
-                self.set(id, Seen::Pending);
-                Phase::Repairing { next, job: Some(Job::Gathering { group, have }) }
-            }
-            // Putting: the next block out; none left -> the next group.
-            (Phase::Repairing { next, job: Some(Job::Putting { group, mut puts }) }, Ev::Free) => match puts.pop_front() {
-                Some((id, bytes)) => {
-                    self.set(id, Seen::Putting { bytes: bytes.len() as u32 });
-                    acts.push(Act::Put(id, bytes));
-                    Phase::Repairing { next, job: Some(Job::Putting { group, puts }) }
-                }
-                None => return (Phase::Repairing { next, job: None }, acts, true),
-            },
-            // ---- The block table's PUT columns (a withdrawn PUT's answer never reaches a pass: KEEPER §5 ⁹).
-            (p, Ev::PutOk(id)) if self.is_putting(&id) => {
-                let bytes = match self.seen[&id] {
-                    Seen::Putting { bytes } => bytes,
-                    Seen::NotHeld | Seen::Held | Seen::Fetched | Seen::Absent | Seen::Pending | Seen::Rejected | Seen::Repaired { .. } => 0,
-                };
-                self.set(id, Seen::Repaired { bytes });
-                p
-            }
-            (p, Ev::PutRefused { id, transient: false, .. }) if self.is_putting(&id) => {
-                self.set(id, Seen::Rejected);
-                acts.push(Act::Rejected(id));
-                p
-            }
-            // Transient refusal, or its deadline: the same PUT again (rule 7), while the pass lives.
-            (p, Ev::PutRefused { id, transient: true, bytes } | Ev::PutDeadline { id, bytes }) if self.is_putting(&id) => {
-                acts.push(Act::Put(id, bytes));
-                p
-            }
-            // ---- Every other cell is one the tables call impossible: counted, never acted on. Every phase and every
-            // event but `Free` (placed in every phase above) is NAMED here, so a new case of either does not compile
-            // until the tables place it.
-            (
-                p @ (Phase::Walking { .. } | Phase::Asking | Phase::Getting | Phase::Repairing { .. }),
-                Ev::WalkPage { .. }
-                | Ev::WalkUnusable { .. }
-                | Ev::Held(_)
-                | Ev::HeldUnasked
-                | Ev::Got { .. }
-                | Ev::Missed(_)
-                | Ev::Silent(_)
-                | Ev::PutOk(_)
-                | Ev::PutRefused { .. }
-                | Ev::PutDeadline { .. },
-            ) => {
-                self.impossible += 1;
-                p
-            }
-        };
-        (next, acts, false)
-    }
-
-    // ---- The one writer's helpers: called only from `on` (they are not `&mut self` methods of their own).
-
-    fn set(&mut self, id: Cid, s: Seen) {
-        self.seen.insert(id, s);
-    }
-
-    fn add_group(&mut self, node: Cid, members: Vec<Cid>, parity: Vec<Cid>, leaf: bool, rejected: &BTreeSet<Cid>) {
-        for id in members.iter().chain(parity.iter()) {
-            if rejected.contains(id) {
-                self.seen.insert(*id, Seen::Rejected);
-            }
+            (puts, said)
         }
-        self.groups.push(Grp { node, members, parity, leaf });
-    }
 
-    // ---- DERIVED (KEEPER §5): read the two states, write nothing.
-
-    /// The blocks walked and not yet asked, in walk order, each once.
-    fn to_ask(&self) -> Vec<Cid> {
-        let mut seen_now = BTreeSet::new();
-        self.groups.iter().flat_map(Grp::slots).filter(|id| !self.seen.contains_key(*id) && seen_now.insert(**id)).copied().collect()
-    }
-
-    /// A group's blocks to spare: held (or fetched, or repaired) minus k.
-    fn margin(&self, g: &Grp) -> i64 {
-        g.slots().filter(|id| self.seen.get(*id).is_some_and(|s| s.held())).count() as i64 - g.members.len() as i64
-    }
-
-    /// Does the policy name group `g`? At least one block known ABSENT, k to rebuild from, and the policy's margin.
-    fn names(&self, g: usize) -> bool {
-        let grp = &self.groups[g];
-        let margin = self.margin(grp);
-        margin >= 0 && grp.slots().any(|id| self.seen.get(id) == Some(&Seen::Absent)) && self.policy.repairs(margin, grp.parity.len())
-    }
-
-    /// The next held slot of `group` whose bytes a rebuild still needs, if any: none once every absent block is one the
-    /// page holds, or the job has k.
-    fn slot_to_fetch(&self, group: usize, have: &BTreeMap<Cid, Vec<u8>>) -> Option<Cid> {
-        let g = &self.groups[group];
-        let absent_all_held_here = g.slots().filter(|id| self.seen.get(*id) == Some(&Seen::Absent)).all(|id| have.contains_key(id));
-        if absent_all_held_here || g.slots().filter(|id| have.contains_key(*id)).count() >= g.members.len() {
-            return None;
+        /// Is `id` a slot of group `group`?
+        fn slot_of(&self, group: usize, id: &Cid) -> bool {
+            self.groups[group].slots().any(|s| s == id)
         }
-        g.slots().find(|id| !have.contains_key(*id) && self.seen.get(*id).is_some_and(|s| matches!(s, Seen::Held | Seen::Fetched))).copied()
-    }
 
-    /// The PUTs for `group`'s ABSENT blocks: the page's own bytes when it holds them, else a member REBUILT
-    /// (`repair::rebuild`, hash-checked) or a parity RECOMPUTED (id-checked). With fewer than k slots nothing is rebuilt
-    /// (the group is below k, and the report says damaged).
-    fn build(&self, group: usize, have: &BTreeMap<Cid, Vec<u8>>) -> (VecDeque<(Cid, Vec<u8>)>, Vec<String>) {
-        let g = &self.groups[group];
-        let rg = g.as_repair(0);
-        let can_solve = g.slots().filter(|id| have.contains_key(*id)).count() >= rg.k;
-        let slots: Vec<Option<Vec<u8>>> = rg.slots.iter().enumerate().map(|(i, id)| have.get(id).map(|b| rg.stored(i, b))).collect();
-        let (mut puts, mut said) = (VecDeque::new(), Vec::new());
-        let mut parity_blocks: Option<Vec<Vec<u8>>> = None;
-        for (i, id) in rg.slots.iter().enumerate() {
-            if self.seen.get(id) != Some(&Seen::Absent) {
-                continue;
-            }
-            if let Some(b) = have.get(id) {
-                puts.push_back((*id, b.clone()));
-            } else if !can_solve {
-            } else if !rg.is_parity(i) {
-                match engine::repair::rebuild(&g.as_repair(i), &slots) {
-                    Ok(body) => puts.push_back((*id, body)),
-                    Err(e) => said.push(format!("the assets audit could not rebuild member {}: {e}", engine::short_id(id))),
-                }
-            } else {
-                let p = parity_blocks.get_or_insert_with(|| match parity::repair_group(rg.k, &slots, rg.max_len).map(|st| parity::encode_group(&st)) {
-                    Ok(Ok(p)) => p,
-                    other => {
-                        said.push(format!("the assets audit could not recompute group parity: {:?}", other.err()));
-                        Vec::new()
-                    }
-                });
-                match p.get(i - rg.k) {
-                    Some(p) if block_id(kind::PARITY, p) == *id => puts.push_back((*id, p.clone())),
-                    Some(_) => said.push(format!("the assets audit's recomputed parity is not {}: never PUT", engine::short_id(id))),
-                    None => {}
-                }
-            }
+        /// Is `id`'s repair PUT out?
+        fn is_putting(&self, id: &Cid) -> bool {
+            matches!(self.seen.get(id), Some(Seen::Putting { .. }))
         }
-        (puts, said)
-    }
 
-    /// Is `id` a slot of group `group`?
-    fn slot_of(&self, group: usize, id: &Cid) -> bool {
-        self.groups[group].slots().any(|s| s == id)
-    }
+        // ---- What the readers outside this module see: every field, READ-ONLY.
 
-    /// Is `id`'s repair PUT out?
-    fn is_putting(&self, id: &Cid) -> bool {
-        matches!(self.seen.get(id), Some(Seen::Putting { .. }))
-    }
+        /// The root this pass walks (the page's published root when it began).
+        pub fn root(&self) -> Cid {
+            self.root
+        }
 
+        /// Events that arrived in an impossible cell.
+        pub fn impossible(&self) -> usize {
+            self.impossible
+        }
+
+        pub(super) fn since(&self) -> Option<Cid> {
+            self.since
+        }
+
+        pub(super) fn started_at(&self) -> u64 {
+            self.started_at
+        }
+
+        pub(super) fn groups(&self) -> &[Grp] {
+            &self.groups
+        }
+
+        pub(super) fn seen(&self) -> &BTreeMap<Cid, Seen> {
+            &self.seen
+        }
+
+        /// A group's blocks to spare: held (or fetched, or repaired) minus k.
+        pub(super) fn margin(&self, g: &Grp) -> i64 {
+            g.slots().filter(|id| self.seen.get(*id).is_some_and(|s| s.held())).count() as i64 - g.members.len() as i64
+        }
+    }
+}
+
+pub(crate) use state::Audit;
+
+impl Audit {
     /// Are `bytes` the block `id` names? Checked by its SLOT's kind (`repair::Group::fits`).
     pub fn fits(&self, id: &Cid, bytes: &[u8]) -> bool {
-        self.groups.iter().find_map(|g| g.slots().position(|s| s == id).map(|i| g.as_repair(i).fits(i, bytes))).unwrap_or(false)
+        self.groups().iter().find_map(|g| g.slots().position(|s| s == id).map(|i| g.as_repair(i).fits(i, bytes))).unwrap_or(false)
     }
 
     /// Progress: (blocks settled so far, blocks the walk has reached).
     pub fn progress(&self) -> (usize, usize) {
-        let reached: BTreeSet<&Cid> = self.groups.iter().flat_map(Grp::slots).collect();
-        (self.seen.len(), reached.len())
-    }
-
-    /// The root this pass walks (the page's published root when it began).
-    pub fn root(&self) -> Cid {
-        self.root
-    }
-
-    /// Events that arrived in an impossible cell.
-    pub fn impossible(&self) -> usize {
-        self.impossible
+        let reached: BTreeSet<&Cid> = self.groups().iter().flat_map(Grp::slots).collect();
+        (self.seen().len(), reached.len())
     }
 
     /// The report, from the two states, as of `now` (the page's clock). `pending` = `Pending` + `Putting` (a repair PUT
     /// has no deadline: it is pending only when the pass was cancelled or replaced).
     pub fn report(&self, now: u64) -> Report {
         let mut r = Report {
-            root: self.root,
-            full: self.since.is_none(),
+            root: self.root(),
+            full: self.since().is_none(),
             measured: true,
             health: Health::Unmeasured,
-            groups: self.groups.len(),
+            groups: self.groups().len(),
             whole: 0,
             degraded: 0,
             damaged: Vec::new(),
@@ -530,10 +560,10 @@ impl Audit {
             rejected: Vec::new(),
             repaired: 0,
             bytes: 0,
-            started_at: self.started_at,
+            started_at: self.started_at(),
             finished_at: now,
         };
-        for g in &self.groups {
+        for g in self.groups() {
             let margin = self.margin(g);
             *r.margins.entry(margin).or_default() += 1;
             if margin >= g.parity.len() as i64 {
@@ -544,7 +574,7 @@ impl Audit {
                 r.damaged.push(g.parity.first().or(g.members.first()).copied().unwrap_or([0; 32]));
             }
         }
-        for (id, s) in &self.seen {
+        for (id, s) in self.seen() {
             match s {
                 Seen::Pending | Seen::Putting { .. } => r.pending += 1,
                 Seen::Rejected => r.rejected.push(*id),
@@ -724,20 +754,6 @@ mod tests {
             let _ = a.on(Ev::WalkPage { req: 2, nodes: vec![node(second)], next: None, root_parity: None }, &cx);
             assert_eq!((a.report(0).groups, a.impossible()), (want, 0), "node {second} named after node 1: groups");
         }
-    }
-
-    /// **ONE WRITER** (KEEPER §5; "Structure before code"): in this file only the transition function and its own
-    /// helpers take `&mut self` -- every other method reads the two states. (The fields are private, so nothing outside
-    /// this file can write them at all.)
-    #[test]
-    fn only_the_transition_function_writes_the_pass() {
-        let src = include_str!("audit.rs");
-        let writers: Vec<&str> = src
-            .lines()
-            .filter(|l| l.contains("(&mut self") && (l.trim_start().starts_with("fn ") || l.trim_start().starts_with("pub fn ")))
-            .filter_map(|l| l.split("fn ").nth(1).and_then(|r| r.split('(').next()))
-            .collect();
-        assert_eq!(writers, vec!["on", "step", "set", "add_group"], "a method other than the transition function writes the pass");
     }
 
     /// **The word from counts**: one damaged group outranks any number degraded; none of either is whole.
