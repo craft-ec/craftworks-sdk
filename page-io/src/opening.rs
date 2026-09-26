@@ -486,6 +486,83 @@ impl HeadKnownState {
     }
 }
 
+/// Machine 3: is THIS CONNECTION told of head moves? (sdk#490, OPENING.md Machine 3.) S1: `live_mode` says subscribed
+/// exactly in `Subscribed`. S2: a head move DELIVERED ON THIS CONNECTION proves its subscription -- only this
+/// connection's frames reach page-io (js/connection.js drops a replaced socket's, and a test holds it). S3: a replaced
+/// socket ends the old subscription; the re-read with subscribe goes at once, so a reconnect lands in `Asked`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadSub {
+    /// No head read with subscribe sent on this page yet.
+    Unasked,
+    /// Sent, not yet answered or proven.
+    Asked,
+    /// Answered (the read's `Got`, the node's `Subscribed` ack) or proven (a move delivered, S2).
+    Subscribed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubEvent {
+    /// The head read WITH subscribe was framed.
+    ReadSent,
+    Got,
+    NotFound,
+    Refused,
+    /// `Ack(Subscribed(register))`.
+    SubscribedAck,
+    /// A head move delivered on this connection.
+    HeadChanged,
+    Reconnected,
+}
+
+impl SubEvent {
+    #[cfg(test)]
+    pub(crate) const ALL: [SubEvent; 7] =
+        [SubEvent::ReadSent, SubEvent::Got, SubEvent::NotFound, SubEvent::Refused, SubEvent::SubscribedAck, SubEvent::HeadChanged, SubEvent::Reconnected];
+}
+
+impl HeadSub {
+    #[cfg(test)]
+    pub(crate) const ALL: [HeadSub; 3] = [HeadSub::Unasked, HeadSub::Asked, HeadSub::Subscribed];
+
+    /// THE TRANSITION FUNCTION (OPENING.md, Machine 3). Pure. The counters (moves delivered, failed reads) are counted
+    /// by the caller; they decide nothing.
+    pub(crate) fn step(self, ev: SubEvent) -> (HeadSub, Cell) {
+        use HeadSub as S;
+        use SubEvent as E;
+        match (self, ev) {
+            (S::Unasked, E::ReadSent) => (S::Asked, Cell::Transition),
+            // Nothing was asked: no answer, and no subscription to deliver a move.
+            (S::Unasked, E::Got | E::NotFound | E::Refused | E::SubscribedAck | E::HeadChanged) => (self, Cell::Impossible),
+            (S::Unasked, E::Reconnected) => (self, Cell::Stays),
+            (S::Asked, E::ReadSent | E::NotFound | E::Refused | E::Reconnected) => (self, Cell::Stays),
+            // S2 (sdk#490's defect cell): a delivered move proves the subscription, as the read's answer does.
+            (S::Asked, E::Got | E::SubscribedAck | E::HeadChanged) => (S::Subscribed, Cell::Transition),
+            (S::Subscribed, E::ReadSent | E::Got | E::NotFound | E::Refused | E::SubscribedAck | E::HeadChanged) => (self, Cell::Stays),
+            // S3: the node dropped this connection's subscription; the re-read is on its way.
+            (S::Subscribed, E::Reconnected) => (S::Asked, Cell::Transition),
+        }
+    }
+}
+
+/// ONE WRITER, BY TYPE, for Machine 3 (as [`OpeningState`]).
+pub(crate) struct HeadSubState(HeadSub);
+
+impl HeadSubState {
+    /// No head read sent yet.
+    pub(crate) fn unasked() -> Self {
+        HeadSubState(HeadSub::Unasked)
+    }
+    pub(crate) fn get(&self) -> HeadSub {
+        self.0
+    }
+    /// THE ONE WRITER: the table's step for `ev`, applied. Returns its cell.
+    pub(crate) fn step(&mut self, ev: SubEvent) -> Cell {
+        let (next, cell) = self.0.step(ev);
+        self.0 = next;
+        cell
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +855,72 @@ mod tests {
         }
         println!("reached: NoRecord x Record(true) {contradicted} times; a read in NoRecord after another device created the Register {stale_reads} times");
         assert!(contradicted > 0 && stale_reads > 0, "the model never reached the cells its H1 and contradiction checks are about");
+    }
+
+    /// Machine 3's table, printed, its counts pinned.
+    #[test]
+    fn every_head_sub_cell_is_decided_and_the_counts_are_the_documents() {
+        let mut counts = std::collections::BTreeMap::new();
+        for s in HeadSub::ALL {
+            let row: Vec<String> = SubEvent::ALL.iter().map(|e| {
+                let (next, cell) = s.step(*e);
+                *counts.entry(cell).or_insert(0usize) += 1;
+                if next == s { format!("{cell:?}") } else { format!("→ {next:?}") }
+            }).collect();
+            println!("| **{s:?}** | {} |", row.join(" | "));
+        }
+        let n = |c| counts.get(&c).copied().unwrap_or(0);
+        assert_eq!([n(Cell::Transition), n(Cell::Stays), n(Cell::Impossible)], [5, 11, 5], "a cell changed: OPENING.md table 3 changes with it");
+    }
+
+    /// THE MODEL (Machine 3), over a node that is the REFERENCE: whether it holds this connection's subscription. A read
+    /// answered `Got` subscribes; a NotFound may or may not (measured: the page that created its own head WAS told,
+    /// sdk#490); a reconnect drops it (S3); a move or a `Subscribed` ack is sent only by a node that holds it. After every
+    /// step: S1 (never "subscribed" where the node holds none) and S2 (a delivered move leaves the page subscribed).
+    #[test]
+    fn the_head_sub_model_holds_s1_to_s3_on_every_step() {
+        let (mut proven_by_move, mut dropped_by_reconnect) = (0usize, 0usize);
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
+            let (mut s, mut node_holds, mut read_out) = (HeadSub::Unasked, false, false);
+            for i in 0..200 {
+                let ev = match rng.pick(7) {
+                    0 => SubEvent::ReadSent,
+                    1 if read_out => SubEvent::Got,
+                    2 if read_out => SubEvent::NotFound,
+                    3 if read_out => SubEvent::Refused,
+                    4 if node_holds => SubEvent::SubscribedAck,
+                    5 if node_holds => SubEvent::HeadChanged,
+                    6 => SubEvent::Reconnected,
+                    _ => continue,
+                };
+                match ev {
+                    SubEvent::ReadSent => read_out = true,
+                    SubEvent::Got => node_holds = true,
+                    SubEvent::NotFound => node_holds |= rng.pick(2) == 0,
+                    SubEvent::Refused | SubEvent::SubscribedAck | SubEvent::HeadChanged => {}
+                    // S3: the node drops the connection's subscription; the page re-reads at once.
+                    SubEvent::Reconnected => {
+                        node_holds = false;
+                        read_out = s != HeadSub::Unasked;
+                    }
+                }
+                let (next, cell) = s.step(ev);
+                let at = format!("seed {seed} step {i}: {s:?} x {ev:?}");
+                assert_ne!(cell, Cell::Impossible, "{at}: a real node's frame landed in an impossible cell");
+                assert!(next != HeadSub::Subscribed || node_holds, "{at}: S1 -- 'subscribed' where the node holds no subscription");
+                if ev == SubEvent::HeadChanged {
+                    proven_by_move += usize::from(s == HeadSub::Asked);
+                    assert_eq!(next, HeadSub::Subscribed, "{at}: S2 -- a delivered move did not prove the subscription");
+                }
+                if ev == SubEvent::Reconnected && s == HeadSub::Subscribed {
+                    dropped_by_reconnect += 1;
+                }
+                s = next;
+            }
+        }
+        println!("reached: Asked x HeadChanged {proven_by_move}; Subscribed x Reconnected {dropped_by_reconnect}");
+        assert!(proven_by_move > 0 && dropped_by_reconnect > 0, "the model never reached the cells S2 and S3 are about");
     }
 
 }

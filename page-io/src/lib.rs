@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 use wire::{DelegateKey, Incoming};
 
 mod opening;
-use opening::{Cell, First, HeadEffect, HeadEvent, HeadKnownState, OpenEffect, OpenEvent, Opening, OpeningState, Via};
+use opening::{Cell, First, HeadEffect, HeadEvent, HeadKnownState, HeadSub, HeadSubState, OpenEffect, OpenEvent, Opening, OpeningState, SubEvent, Via};
 
 /// What the page needs to know about the platform: the Block contract's code
 /// (a page PUT carries it), the head Register's code and params, and the
@@ -261,8 +261,8 @@ pub struct PageIo {
     /// believed it was being notified while it was polling is the failure
     /// `LiveMode` exists to make impossible, and on the page path the
     /// subscription is page-io's, not the Session's.
-    head_asked: bool,
-    head_answered: bool,
+    /// Machine 3 (sdk#490): asked, and answered or proven. Its one writer is its own `step` (by type).
+    head_sub: HeadSubState,
     head_changes: usize,
     /// Head reads the node answered with a FAILURE: no head yet, a refusal,
     /// or a peered node's false NotFound (F55) — page-io cannot tell which,
@@ -366,8 +366,7 @@ impl PageIo {
             register_id,
             register_key,
             head_known,
-            head_asked: false,
-            head_answered: false,
+            head_sub: HeadSubState::unasked(),
             head_changes: 0,
             head_failed: 0,
             by_contract: BTreeMap::new(),
@@ -604,6 +603,13 @@ impl PageIo {
         }
     }
 
+    /// Machine 3's step, applied, its impossible cells counted (sdk#490).
+    fn sub(&mut self, ev: SubEvent) {
+        if self.head_sub.step(ev) == Cell::Impossible {
+            self.impossible_cells += 1;
+        }
+    }
+
     /// Events that landed in an impossible cell of the opening tables (a diagnostic; 0 on any real node's answers).
     pub fn impossible_cells(&self) -> u64 {
         self.impossible_cells
@@ -771,7 +777,7 @@ impl PageIo {
     ///   (`Page::reconnected` re-sends it: a GET with subscribe, the one path).
     pub fn reconnected(&mut self, now: Ms) {
         self.frames = wire::Reassembler::default();
-        self.head_answered = false;
+        self.sub(SubEvent::Reconnected);
         // Both tables' Reconnected columns: nothing of the opening is lost (the signer's install survives; what is
         // out is re-sent on the RTO), and the head exists or not whatever the socket did.
         self.open(OpenEvent::Reconnected);
@@ -788,8 +794,8 @@ impl PageIo {
     /// "Polled" on a page that was subscribed the whole time.
     pub fn head_subscription(&self) -> HeadSubscription {
         HeadSubscription {
-            asked: self.head_asked,
-            answered: self.head_answered,
+            asked: self.head_sub.get() != HeadSub::Unasked,
+            answered: self.head_sub.get() == HeadSub::Subscribed,
             changes: self.head_changes,
             failed: self.head_failed,
             // Opening ended — refused in someone's words, or its re-asks spent:
@@ -850,7 +856,7 @@ impl PageIo {
                     self.head(HeadEvent::Got, now);
                     // The GET that carried `subscribe` was answered: the node
                     // holds this page's subscription to the head (sdk#259).
-                    self.head_answered = true;
+                    self.sub(SubEvent::Got);
                     // The head WHOLE (root ‖ ledger), tolerantly: the root is
                     // the value's first 32 bytes whatever ledger follows.
                     self.server.node(Answer::Head { label: Label::Head, read: page::HeadRead::from_record(&state) }, now);
@@ -880,6 +886,7 @@ impl PageIo {
             Incoming::GetFailed { id, why: wire::GetFail::Refused(_) } => {
                 if id == self.register_id {
                     self.head_failed += 1;
+                    self.sub(SubEvent::Refused);
                 }
             }
             Incoming::GetFailed { id, why: wire::GetFail::NotFound } => {
@@ -888,6 +895,7 @@ impl PageIo {
                     self.server.node(Answer::Head { label: Label::Site(app), read: None }, now);
                 } else if id == self.register_id {
                     self.head_failed += 1;
+                    self.sub(SubEvent::NotFound);
                     // The node's explicit NotFound for the head — which a
                     // PEERED node can answer falsely (F55) — is "no head" ONLY if the signer holds no
                     // record for this register. Otherwise the head exists and
@@ -1054,6 +1062,8 @@ impl PageIo {
                 // What the subscription DELIVERED: counted, so "subscribed"
                 // can be told from "subscribed and being told" (sdk#259).
                 self.head_changes += 1;
+                // S2: a move delivered on this connection proves the subscription (sdk#490).
+                self.sub(SubEvent::HeadChanged);
                 match state.as_deref().and_then(page::HeadRead::from_record) {
                     Some(read) => self.server.head_pushed(read),
                     None => self.server.head_hint(),
@@ -1079,7 +1089,7 @@ impl PageIo {
             Incoming::Ack(wire::AckKind::Updated(key)) => self.unusable.push(format!("an UPDATE answer this page has no update out for: {key}")),
             // The node confirms the HEAD subscription (the GET-with-subscribe's own answer already says so): the same
             // fact, recorded where `head_subscription()` reads it (sdk#259).
-            Incoming::Ack(wire::AckKind::Subscribed(key)) if key == self.register_key => self.head_answered = true,
+            Incoming::Ack(wire::AckKind::Subscribed(key)) if key == self.register_key => self.sub(SubEvent::SubscribedAck),
             // A SITE's subscription answer: the page does not follow a site (owns() takes it; read by nobody).
             Incoming::Ack(wire::AckKind::Subscribed(_)) => {}
             // `Ok` names nothing and answers nothing (wire: "a step must not rely on this one"); every op this page
@@ -1252,7 +1262,7 @@ impl PageIo {
                     wire::frame_get(wire::contract_id(contract), false, stream)
                 }
                 Op::ReadHead { label: Label::Head } => {
-                    self.head_asked = true;
+                    self.sub(SubEvent::ReadSent);
                     wire::frame_get(wire::contract_id(self.register_id), true, stream)
                 }
                 Op::ReadHead { label: Label::Site(app) } => match self.sites.get(&app) {

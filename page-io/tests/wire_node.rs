@@ -2845,9 +2845,12 @@ fn every_frame_kind_the_page_claims_is_decided_never_dropped() {
     let node = WireNode::new(&[4u8; 32]);
     let register = ContractKey::from_id_and_code(ContractInstanceId::new(node.register_id), CodeHash::new([0u8; 32]));
 
-    // The node confirms the HEAD subscription: recorded as answered, where `head_subscription()` reads it.
+    // The node confirms the HEAD subscription: recorded as answered, where `head_subscription()` reads it. The page
+    // has SENT its head read with subscribe (an ack to a page that asked nothing is impossible, sdk#490's table).
     let mut io = page_io(&node);
-    assert!(!io.head_subscription().answered, "THE SETUP: the head was answered before the ack");
+    io.client(&protocol::encode_session_request(4, 9, &Request::Identity).expect("encodes"));
+    io.take_frames();
+    assert!(io.head_subscription().asked && !io.head_subscription().answered, "THE SETUP: the head read is not out, unanswered: {:?}", io.head_subscription());
     assert!(io.inbound(&ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse { key: register, subscribed: true })), Ms(1)), "the head's subscription answer was not claimed");
     assert!(io.head_subscription().answered, "the node's Subscribed for the head was dropped");
 
