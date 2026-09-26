@@ -1362,8 +1362,8 @@ fn op_name(op: &Op) -> &'static str {
 use core_types::hex::encode as hex;
 
 /// THE BATCHED `Held` ON THE WIRE (sdk#455), through `pump` (rule 5: the one place an op is framed). Batching is per
-/// page STEP: asks made in separate steps go one per op; the re-asks that come due in ONE tick go as ONE signer `Held`
-/// request of every id's contract, and its answer reaches the page under the op's batch.
+/// page STEP: the asks one step makes go as ONE signer `Held` request of every id's contract, in the op's order, and
+/// its answer reaches the page under the op's batch.
 #[cfg(test)]
 mod held_batch {
     use super::*;
@@ -1372,17 +1372,19 @@ mod held_batch {
 
     fn io() -> PageIo {
         let (_, signer) = wire::delegate_from_code(b"held batch signer code");
-        PageIo::new(
+        let mut io = PageIo::new(
             page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Wrapper, Ms(0)), page::server::SignerFacts { head_writable: true, head_id: [0; 32] }),
             Artefacts { block_code: b"held batch block code".to_vec(), register_code: b"held batch register code".to_vec(), register_params: wire::register_params(&[1u8; 32], wire::HEAD_NAME), signer },
-        )
+        );
+        io.signer_provisioned();
+        io
     }
 
     /// The signer `Held` requests in page-io's frames, as the node reads them: (signer id, contracts).
-    fn helds(io: &mut PageIo) -> Vec<(u32, Vec<[u8; 32]>)> {
+    fn helds_of(frames: &[Vec<u8>]) -> Vec<(u32, Vec<[u8; 32]>)> {
         let mut out = Vec::new();
-        for f in io.take_frames() {
-            let Ok(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. })) = bincode::deserialize::<ClientRequest>(&f) else { continue };
+        for f in frames {
+            let Ok(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. })) = bincode::deserialize::<ClientRequest>(f) else { continue };
             for m in inbound {
                 if let InboundDelegateMsg::ApplicationMessage(am) = m {
                     if let Some((id, signer_proto::Request::Held { contracts })) = signer_proto::decode_request(&am.payload) {
@@ -1405,33 +1407,23 @@ mod held_batch {
     }
 
     #[test]
-    fn the_re_asks_due_in_one_tick_are_one_held_request_of_every_id() {
+    fn the_asks_of_one_page_step_are_one_held_request_of_every_id() {
         let mut io = io();
         let ids: Vec<Cid> = (0..signer_proto::MAX_HELD).map(|i| { let mut c = [0u8; 32]; c[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes()); c }).collect();
-        // Each PUT answered in its own step: each asks alone (a wrapper-path PutOk, as before).
+        // 128 PUT answers in ONE page step (the page's own `answer`, no flush between them): each asks Held
+        // (a wrapper-path PutOk), and the asks leave together when page-io pumps.
         for id in &ids {
-            io.server.node(Answer::PutOk(*id), Ms(0));
+            io.server.page.answer(Answer::PutOk(*id), Ms(1));
         }
         io.pump();
-        let singles = helds(&mut io);
-        assert_eq!(singles.len(), ids.len(), "THE SETUP: the PUT answers did not each ask Held");
-        // Every one answered ABSENT at the same time: all come due again together.
-        for (hid, _) in &singles {
-            let bytes = held_answer(&io, *hid, vec![false]);
-            assert!(io.inbound(&bytes, Ms(1)), "a Held answer was not taken");
-        }
-        io.tick(Ms(page::rto::RTO_MAX_MS as u64 + 10));
-        let batch = helds(&mut io);
-        println!("{} ids due in one tick: {} Held request(s) of {:?} contract(s)", ids.len(), batch.len(), batch.iter().map(|(_, c)| c.len()).collect::<Vec<_>>());
-        assert_eq!(batch.len(), 1, "the re-asks due in one tick were not ONE Held request");
-        let mut want: Vec<[u8; 32]> = ids.iter().map(|id| wire::block::contract_for(&io.art.block_code, id)).collect();
-        let mut got = batch[0].1.clone();
-        want.sort();
-        got.sort();
-        assert_eq!(got, want, "the one request does not carry every id's contract");
-        // Its answer, all present: every block confirmed, nothing left to ask.
+        let batch = helds_of(&io.take_frames());
+        println!("{} ids asked in one step: {} Held request(s) of {:?} contract(s)", ids.len(), batch.len(), batch.iter().map(|(_, c)| c.len()).collect::<Vec<_>>());
+        assert_eq!(batch.len(), 1, "the asks of one step were not ONE Held request");
+        let want: Vec<[u8; 32]> = ids.iter().map(|id| wire::block::contract_for(&io.art.block_code, id)).collect();
+        assert_eq!(batch[0].1, want, "the one request does not carry every id's contract in the op's order");
+        // Its answer reaches the page under the op's batch, mapped by id: all present, every block confirmed.
         let bytes = held_answer(&io, batch[0].0, vec![true; ids.len()]);
-        assert!(io.inbound(&bytes, Ms(page::rto::RTO_MAX_MS as u64 + 20)));
+        assert!(io.inbound(&bytes, Ms(2)), "the signer's Held answer was not taken");
         assert!(io.held.is_empty(), "the answered batch is still mapped");
         assert!(!io.server.page.waiting(), "a block of the answered batch is still owed an ask");
     }
