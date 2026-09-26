@@ -49,3 +49,17 @@ fn the_cut_is_the_first_test_module_and_nothing_else_hides_after_it() {
     let hidden = "fn end() {}\n#[cfg(test)]\nmod tests {}\nfn escaped() { deadlines.remove(9); }\n";
     assert_eq!(items_after_the_cut(hidden), vec![(4, "fn escaped() { deadlines.remove(9); }".to_string())], "a production item after the cut was not refused by name");
 }
+
+/// ONE OWNER OF "CONFIRMED" (sdk#414, COMMIT-LIFE ⁹), held by the source: the page ROUTES a confirmation to the engine
+/// from one place, and holds no guard of its own -- no take of the owed head, and no end of the head's read-back or
+/// UPDATE by name (they end with the owed head, in `drop_dead_head`). A second site is how #401's four arose.
+#[test]
+fn a_confirmation_is_routed_from_one_place_and_the_page_holds_no_guard() {
+    let lib = production_of(LIB);
+    assert!(lib.contains("fn drop_dead_head(") && lib.contains("fn on_read_back("), "THE CONTROL: the production cut lost the code it scans");
+    assert_eq!(lib.matches(concat!("Event::", "HeadConfirmed(")).count(), 1, "a confirmation reaches the engine from more than one place");
+    assert_eq!(lib.matches(concat!("head.owed", ".take()")).count(), 0, "the page takes the owed head itself: a second decision of 'confirmed'");
+    for w in ["ReadBack", "Update"] {
+        assert_eq!(lib.matches(&format!("Waiting::{w}(Label::Head), End::Withdrawn")).count(), 0, "the head's {w} wait is ended by name outside drop_dead_head");
+    }
+}
