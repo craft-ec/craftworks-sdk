@@ -117,3 +117,33 @@ fn keep_set_answers_ok_or_names_its_refusal() {
     assert_eq!(set_answer(Err(SetRefused::BadAddress("NotASiteLink".into()))), json!({ "refused": "BAD_ADDRESS", "said": "NotASiteLink" }));
     assert_eq!(set_answer(Err(SetRefused::BadPolicy("x".into()))), json!({ "refused": "BAD_POLICY", "said": "x" }));
 }
+
+/// THE CONTRACT WITH THE BUILDER'S TAB (the architect): each shape's EXACT field names and value vocabulary, golden. A
+/// rename or a new word breaks this test, not builder#164's view (assets.js reads exactly these).
+#[test]
+fn the_tabs_contract_shapes_are_golden() {
+    let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    let policy = keep(Repair::Always, 0, 0, 0, 0);
+    // keepAssets: one element's fields, and its health's.
+    let a = assets_json(&OWN, &[(OWN, keep(Repair::Always, 9, 1, 0, 0))], name);
+    assert_eq!(keys(&a[0]), ["audited_at", "health", "kind", "policy", "target", "warning"]);
+    assert_eq!(keys(&a[0]["policy"]), ["repair", "warn_below"]);
+    assert_eq!(keys(&a[0]["health"]), ["damaged", "degraded", "groups", "whole", "word"]);
+    // The vocabularies: kind, repair, the health word.
+    assert_eq!(a[0]["kind"], "identity");
+    assert_eq!(assets_json(&OWN, &[(APP, policy)], name)[1]["kind"], "app");
+    assert_eq!([repair_json(Repair::Off), repair_json(Repair::Always), repair_json(Repair::Below(3))], [json!("off"), json!("always"), json!({ "below": 3 })]);
+    assert_eq!([Health::Unmeasured, Health::Damaged, Health::Degraded, Health::Whole].map(health_word), ["unmeasured", "damaged", "degraded", "whole"]);
+    // keepReport: the three states and each one's exact fields.
+    let running = report_json(None, Some((1, 2)), &policy);
+    assert_eq!(keys(&running), ["asked", "of", "pass", "state"]);
+    let unmeasured = report_json(Some(&report(false, &[], 0, 0, vec![], Health::Unmeasured)), None, &policy);
+    assert_eq!(keys(&unmeasured), ["finished_at", "health", "pass", "started_at", "state"]);
+    let done = report_json(Some(&report(true, &[(8, 1)], 1, 0, vec![], Health::Whole)), None, &policy);
+    assert_eq!(keys(&done), ["damaged", "degraded", "finished_at", "groups", "health", "min_margin", "pass", "pending", "rejected", "started_at", "state", "warning", "whole"]);
+    assert_eq!([&running, &unmeasured, &done].map(|v| v["state"].clone()), [json!("running"), json!("unmeasured"), json!("done")]);
+    assert_eq!([&running, &unmeasured, &done].map(|v| v["pass"].clone()), [json!("full"), json!("full"), json!("full")]);
+    // keepSet's answers.
+    assert_eq!(keys(&set_answer(Ok(()))), ["ok"]);
+    assert_eq!(keys(&set_answer(Err(SetRefused::BadAddress("x".into())))), ["refused", "said"]);
+}
