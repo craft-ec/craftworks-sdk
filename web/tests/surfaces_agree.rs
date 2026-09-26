@@ -75,6 +75,18 @@ const TRANSPORT_ONLY: &[&str] = &[
     // connection mechanics, not data.
     "take_loads",
     "resume",
+    // THE KEEP API (sdk#472): an audit pass walks this page's tree ON THE NODE and its records live in the own tree's
+    // blocks there -- an in-memory store has no node to audit and no Register to name a target by.
+    "keep_assets",
+    "keep_set",
+    "keep_warn_below",
+    "keep_write_back",
+    "keep_audit",
+    "keep_progress",
+    "keep_take_audit",
+    "keep_report",
+    // A LANE's waits (`not_answering` for one lane): the page's ops on the wire; the in-memory store sends none.
+    "not_answering_in",
     // A LIVE binding's read COMPLETED: its RenderedAt is the root that read
     // answered at. An in-memory store has no head to diff against.
     "rendered",
