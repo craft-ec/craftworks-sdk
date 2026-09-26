@@ -87,6 +87,13 @@ pub mod subs;
 )]
 pub struct ClientId(pub u64);
 
+impl ClientId {
+    /// BACKGROUND work's reads (the assets dashboard's audit, KEEPER §7): a block only such reads wait on is a
+    /// background fetch ([`Engine::fetch_is_background`]), which the page runs in a window of its own, never in the
+    /// interactive one.
+    pub const BACKGROUND: ClientId = ClientId(u64::MAX);
+}
+
 /// The client's own id for a write. Echoed in every state change, so a caller
 /// never has to guess which of its writes a notification is about.
 #[derive(
@@ -316,6 +323,13 @@ pub enum Event {
         client: ClientId,
         req_id: read::ReqId,
         range: Box<freenet_prolly::range::Range>,
+    },
+    /// A page of the tree's NODES and their groups ([`read::NodesSpec`]; the assets dashboard's audit walk, KEEPER
+    /// §4): a read like `Scan`, through the same parked-read path. Answered by a `Reply` of `ReadResult::Nodes`.
+    Nodes {
+        client: ClientId,
+        req_id: read::ReqId,
+        spec: read::NodesSpec,
     },
     /// A scan AT A GIVEN ROOT (READ-STATE open item 3): the root a reader's
     /// walk stopped at, so the blocks it fetches are that tree's. The page's
@@ -2164,6 +2178,7 @@ impl<B: Blocks> Engine<B> {
                 req_id,
                 read::Want::Scan(Box::new(range.as_ref().into())),
             ),
+            Event::Nodes { client, req_id, spec } => self.read_or_wait(client, req_id, read::Want::Nodes(spec)),
             Event::ScanAt {
                 client,
                 req_id,
@@ -4847,6 +4862,24 @@ impl<B: Blocks> Engine<B> {
             })
     }
 
+    /// Is fetching `id` BACKGROUND work only (KEEPER §7)? True when every read waiting on it is
+    /// [`ClientId::BACKGROUND`]'s, directly or through a repair slot of a block only such reads wait on, and no
+    /// parked write needs it. A block an app's read also waits on is interactive. Read from the waits themselves.
+    pub fn fetch_is_background(&self, id: &Cid) -> bool {
+        let background_read = |b: &Cid| {
+            self.reads.waiting.get(b).is_some_and(|reqs| !reqs.is_empty() && reqs.iter().all(|r| self.reads.parked.get(r).is_some_and(|p| p.client == ClientId::BACKGROUND)))
+        };
+        let direct = self.reads.waiting.get(id).is_some_and(|reqs| !reqs.is_empty());
+        let slot = self.repair_slots.get(id).is_some_and(|m| !m.is_empty());
+        if !direct && !slot {
+            return false;
+        }
+        if self.parked_write.as_ref().is_some_and(|p| p.needs.contains(id)) {
+            return false;
+        }
+        (!direct || background_read(id)) && (!slot || self.repair_slots[id].iter().all(|m| background_read(m) && !self.parked_write.as_ref().is_some_and(|p| p.needs.contains(m))))
+    }
+
     /// Does this engine still wait on block `id` -- a parked read, a repair
     /// slot, or a parked write? The page re-asks a NotFound block only while
     /// this is true, so a block nobody needs any more is not asked for ever.
@@ -5193,6 +5226,7 @@ impl<B: Blocks> Engine<B> {
         let want = match walk {
             read::Walk::Get(k) => read::Want::Get(k.clone()),
             read::Walk::Scan(s) => read::Want::Scan(s.clone()),
+            read::Walk::Nodes(n) => read::Want::Nodes(n.clone()),
             read::Walk::Delta(d) => read::Want::Delta(d.clone()),
         };
         let mut parsed = 0;
