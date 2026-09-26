@@ -2073,10 +2073,14 @@ impl Page {
 
     /// Send `w` in `lane`.
     fn send_in(&mut self, w: Waiting, op: Op, lane: Lane) {
-        // A WITHDRAWN op wanted again: it is still on the wire, so it is waited on again -- its answer serves.
+        // A WITHDRAWN op wanted again: it is still on the wire, so it is waited on again -- its answer serves. Wanted
+        // by an INTERACTIVE waiter, it falls through to PROMOTION below, exactly as a fresh interactive join does (the
+        // architect: else an app's read waits behind background work, the case promotion exists for).
         if let Some(d) = self.deadlines.get_mut(&w).filter(|d| d.withdrawn) {
             d.withdrawn = false;
-            return;
+            if lane != Lane::Interactive {
+                return;
+            }
         }
         // PROMOTION (the one exception to "classed once"): an interactive waiter joining a Background op. Queued, it
         // leaves the background queue and is sent below as interactive work; on the wire, it moves to the
@@ -2169,20 +2173,18 @@ impl Page {
         // A queued Background op that ends never goes out.
         self.bg_queue.retain(|(q, _)| q != w);
         // A BACKGROUND op withdrawn ON THE WIRE keeps the lane's slot: the node still holds it (the architect). It stays
-        // in its ONE record, marked withdrawn, until its answer or its deadline; its end is recorded ONCE, here.
+        // in its ONE record, marked withdrawn, until its answer or its deadline. Nothing is recorded yet: it may be
+        // wanted again, and then its real end is its end.
         if how == End::Withdrawn {
             if let Some(d) = self.deadlines.get_mut(w).filter(|d| d.sent && d.lane == Lane::Background && !d.withdrawn) {
                 d.withdrawn = true;
-                let d = d.clone();
-                self.record_end(w, &d, how);
-                return Some(d);
+                return Some(d.clone());
             }
         }
         let d = self.deadlines.remove(w)?;
-        // An op already WITHDRAWN said its end then: its entry leaves now (its answer, or its deadline), recording nothing.
-        if !d.withdrawn {
-            self.record_end(w, &d, how);
-        }
+        // ONE END PER OP, recorded when its entry LEAVES: a still-withdrawn op's (its answer, or its deadline) is the
+        // withdrawal; any other op's is how it ended.
+        self.record_end(w, &d, if d.withdrawn { End::Withdrawn } else { how });
         Some(d)
     }
 
@@ -5460,6 +5462,58 @@ mod background_lane {
         p.send(w.clone(), op);
         p.end(&w, End::Withdrawn);
         assert!(!p.deadlines.contains_key(&w), "an interactive withdrawn GET was held");
+    }
+
+    /// **UN-WITHDRAWN BY AN INTERACTIVE WAITER, PROMOTED** (the architect on c3a298a): a Background GET of X withdrawn
+    /// on the wire, then an app's read needs X -- X is waited on again as INTERACTIVE work, the slot frees, and the next
+    /// queued Background op goes out.
+    #[test]
+    fn a_withdrawn_background_get_an_app_read_wants_again_is_promoted() {
+        let mut p = page();
+        background(&mut p, get(7));
+        background(&mut p, put(2));
+        let _ = p.take_ops();
+        p.end(&get(7).0, End::Withdrawn);
+        assert!(p.deadlines[&get(7).0].withdrawn, "THE SETUP: X is not withdrawn");
+        // The app's read of X: its class is Interactive now.
+        p.test_background.remove(&get(7).0);
+        let (w, op) = get(7);
+        p.send(w, op);
+        let d = &p.deadlines[&get(7).0];
+        assert!(!d.withdrawn && d.lane == Lane::Interactive, "X wanted by an app was not promoted (withdrawn {}, lane {:?})", d.withdrawn, d.lane);
+        assert!(p.deadlines.get(&put(2).0).is_some_and(|d| d.sent), "the freed slot did not take the next Background op");
+    }
+
+    /// **ONE END PER OP** (the architect): recorded when the entry LEAVES -- withdrawn, wanted again, answered: exactly
+    /// one end, the answer; withdrawn, then its deadline: exactly one end, Withdrawn.
+    #[test]
+    fn a_withdrawn_op_records_exactly_one_end() {
+        use instrument::{Dir, Event, Outcome, Record};
+        let ends = |p: &Page| -> Vec<Event> {
+            p.recording().expect("recording").events().into_iter().filter(|e| matches!(e, Event::Exit { .. } | Event::Edge { dir: Dir::Response, .. })).collect()
+        };
+        // withdraw -> wanted again (Background) -> answer
+        let mut p = page();
+        p.record_into(256);
+        background(&mut p, get(7));
+        p.end(&get(7).0, End::Withdrawn);
+        let (w, op) = get(7);
+        p.send(w, op);
+        p.answered(&get(7).0);
+        let e = ends(&p);
+        assert_eq!(e.len(), 1, "withdrawn, wanted again, answered: {} ends recorded: {e:?}", e.len());
+        assert!(matches!(e[0], Event::Edge { dir: Dir::Response, .. }), "the one end is not the answer: {e:?}");
+        // withdraw -> deadline
+        let mut p = page();
+        p.record_into(256);
+        background(&mut p, get(8));
+        p.end(&get(8).0, End::Withdrawn);
+        assert!(ends(&p).is_empty(), "an end was recorded at withdraw, before the entry left");
+        let due = p.deadlines[&get(8).0].at;
+        p.tick(Ms(due));
+        let e = ends(&p);
+        assert_eq!(e.len(), 1, "withdrawn, then due: {} ends: {e:?}", e.len());
+        assert!(matches!(e[0], Event::Exit { outcome: Outcome::Withdrawn, .. }), "the one end is not Withdrawn: {e:?}");
     }
 
     /// **not_answering_in(lane)**: a Background wait shows ONLY through the Background lane; the plain
