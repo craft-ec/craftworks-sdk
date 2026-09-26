@@ -27,6 +27,7 @@
 //! of 2026-09-23 was one of them going stale. The one head-shaped fact kept
 //! here is each LIVE binding's `RenderedAt`, which only the binding can know.
 
+use craftworks_sdk::status::{AskedState, CanWrite, PutStatus, SiteStatus};
 use craftworks_sdk::{DbError, Outcome, PageStore, SystemEnv};
 use page_io::PageIo;
 use wasm_bindgen::prelude::*;
@@ -518,13 +519,13 @@ impl Session {
     pub fn asked(&self) -> String {
         use page_io::Asked;
         let (state, register, said) = match self.page().and_then(|p| p.asked()) {
-            None => ("pending", String::new(), String::new()),
-            Some(Asked::Register(id)) => ("register", craftworks_sdk::hex(id), String::new()),
-            Some(Asked::NoKey) => ("nokey", String::new(), String::new()),
-            Some(Asked::NoSigner(w)) => ("nosigner", String::new(), w.clone()),
-            Some(Asked::Refused(w)) => ("refused", String::new(), w.clone()),
+            None => (AskedState::Pending, String::new(), String::new()),
+            Some(Asked::Register(id)) => (AskedState::Register, craftworks_sdk::hex(id), String::new()),
+            Some(Asked::NoKey) => (AskedState::NoKey, String::new(), String::new()),
+            Some(Asked::NoSigner(w)) => (AskedState::NoSigner, String::new(), w.clone()),
+            Some(Asked::Refused(w)) => (AskedState::Refused, String::new(), w.clone()),
         };
-        serde_json::json!({ "state": state, "register": register, "said": said }).to_string()
+        serde_json::json!({ "state": state.code(), "register": register, "said": said }).to_string()
     }
 
     /// The provisioning: a TEST key minted here and FORGOTTEN (as the
@@ -661,14 +662,14 @@ impl Session {
         use page::Publication as P;
         let publication = self.page().and_then(|p| p.publication(app));
         let (state, version, said) = match &publication {
-            None => ("none", 0, ""),
-            Some(P::Publishing { waiting_for }) => ("publishing", 0, waiting_for.unwrap_or("")),
-            Some(P::Published { version }) => ("published", *version, ""),
-            Some(P::Superseded { version }) => ("superseded", *version, ""),
-            Some(P::Refused(w)) => ("refused", 0, w.as_str()),
-            Some(P::Cancelled) => ("cancelled", 0, ""),
+            None => (SiteStatus::None, 0, ""),
+            Some(P::Publishing { waiting_for }) => (SiteStatus::Publishing, 0, waiting_for.unwrap_or("")),
+            Some(P::Published { version }) => (SiteStatus::Published, *version, ""),
+            Some(P::Superseded { version }) => (SiteStatus::Superseded, *version, ""),
+            Some(P::Refused(w)) => (SiteStatus::Refused, 0, w.as_str()),
+            Some(P::Cancelled) => (SiteStatus::Cancelled, 0, ""),
         };
-        serde_json::json!({ "state": state, "version": version, "said": said }).to_string()
+        serde_json::json!({ "state": state.code(), "version": version, "said": said }).to_string()
     }
 
     /// A PERSON cancels `app`'s site publication (named `cancelled`).
@@ -741,11 +742,11 @@ impl Session {
     /// cached nowhere -- not here, not in JS.
     pub fn can_write(&self, head: &str) -> String {
         let (answer, why) = match self.may_write(head) {
-            page_io::MayWrite::Yes => ("yes", String::new()),
-            page_io::MayWrite::No(w) => ("no", w),
-            page_io::MayWrite::Unknown(w) | page_io::MayWrite::Undecided(w) => ("unknown", w),
+            page_io::MayWrite::Yes => (CanWrite::Yes, String::new()),
+            page_io::MayWrite::No(w) => (CanWrite::No, w),
+            page_io::MayWrite::Unknown(w) | page_io::MayWrite::Undecided(w) => (CanWrite::Unknown, w),
         };
-        serde_json::json!({ "answer": answer, "why": why }).to_string()
+        serde_json::json!({ "answer": answer.code(), "why": why }).to_string()
     }
 
     /// OPEN THE USER'S OWN TREE on an asked session (DATA-SOURCE `mine`),
@@ -827,13 +828,13 @@ impl Session {
     pub fn put_status(&self, key: &str) -> String {
         use page::AppPut;
         let (state, said) = match self.page().and_then(|p| p.app_put(key)) {
-            None => ("none", ""),
-            Some(AppPut::Pending) => ("pending", ""),
-            Some(AppPut::Put) => ("put", ""),
-            Some(AppPut::Refused(w)) => ("refused", w.as_str()),
-            Some(AppPut::Cancelled) => ("cancelled", ""),
+            None => (PutStatus::None, ""),
+            Some(AppPut::Pending) => (PutStatus::Pending, ""),
+            Some(AppPut::Put) => (PutStatus::Put, ""),
+            Some(AppPut::Refused(w)) => (PutStatus::Refused, w.as_str()),
+            Some(AppPut::Cancelled) => (PutStatus::Cancelled, ""),
         };
-        serde_json::json!({ "state": state, "said": said }).to_string()
+        serde_json::json!({ "state": state.code(), "said": said }).to_string()
     }
 
     // ---- the data surface -------------------------------------------

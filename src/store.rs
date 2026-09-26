@@ -140,6 +140,12 @@ impl RowState {
         self == RowState::BackedUp
     }
 
+    /// Lost: the write was rolled back -- it failed, or nothing ever answered it -- and its value is not in the tree
+    /// (sdk#518).
+    pub fn is_lost(self) -> bool {
+        self == RowState::RolledBack
+    }
+
     /// Every state a row can report, in one list: what an app that labels
     /// states checks itself against, so a state added here cannot reach a
     /// person unlabelled (the builder's publish stalled on `BACKED_UP`, which

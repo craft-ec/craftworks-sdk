@@ -49,6 +49,22 @@ pub fn row_states() -> Vec<String> {
     craftworks_sdk::store::RowState::ALL.iter().map(|s| s.code().to_string()).collect()
 }
 
+/// LOST: the row's own write was rolled back -- it failed, or nothing ever answered it -- so the value it showed is
+/// not in the tree (sdk#518). From the one owner, beside [`row_saved`] and [`row_backed_up`]; an app asks this, never
+/// the literal `"ROLLED_BACK"`.
+#[wasm_bindgen]
+pub fn row_lost(code: &str) -> bool {
+    craftworks_sdk::store::RowState::from_code(code).is_some_and(|s| s.is_lost())
+}
+
+/// THE SDK'S STATUS VOCABULARY, as ONE list (sdk#518): every word each status method can answer, from the enum that
+/// method emits through (`craftworks_sdk::status`) -- so an app imports these (`sdk.status`), never a copy of its
+/// own. JSON: `{"rowState":[..], "putStatus":[..], "siteStatus":[..], "canWrite":[..], "asked":[..]}`.
+#[wasm_bindgen]
+pub fn status_words() -> String {
+    craftworks_sdk::status::words().to_string()
+}
+
 #[wasm_bindgen]
 pub fn version() -> String {
     craftworks_sdk::VERSION.to_string()
