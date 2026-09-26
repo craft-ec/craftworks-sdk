@@ -630,9 +630,12 @@ fn past_the_queue_byte_bound_a_write_waits_and_another_session_is_still_taken() 
     seen.absorb(&out);
     assert_eq!(seen.of(1, 1).first(), Some(&State::Accepted), "a write under the bound was not taken");
     let root_before = e.root();
+    // What the queue holds (sdk#450): write 1's ops AND the warm-apply blocks it pins -- the ONE sum.
+    let (_, held) = e.queue_load();
+    assert!(held > 2 + 3000 + 2 + 33, "THE SETUP: the queue's bytes do not count write 1's warm blocks");
     let out = stepped!(e, write(1, 2, vec![(b"a2".to_vec(), Op::Put(vec![2u8; 3000]))]));
     seen.absorb(&out);
-    assert_eq!(seen.of(1, 2), &[State::QueueFull { bytes: 2 + 3000 + 2 + 33, limit: 4000 }], "past the byte bound the write was not told QueueFull, with the bytes");
+    assert_eq!(seen.of(1, 2), &[State::QueueFull { bytes: held, limit: 4000 }], "past the byte bound the write was not told QueueFull, with the bytes the queue holds");
     assert_eq!(e.root(), root_before, "a write past the bound changed the warm root");
     assert!(ids(&out).is_empty(), "a write past the bound put blocks on the network");
     // ANOTHER session, nothing queued: taken, over the bound or not.
