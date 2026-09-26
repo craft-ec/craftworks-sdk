@@ -9,7 +9,7 @@
 //! reach it is exercised here.
 
 use freenet_prolly::Cid;
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse};
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, DelegateError, DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::*;
 use page::server::{Server, SignerFacts};
 use page::{Ms, Page, PutPath};
@@ -53,6 +53,12 @@ struct WireNode {
     /// answered EMPTY (as 0.2.136 answers a delegate it does not have), and
     /// a registration makes it present.
     empty_until_registered: bool,
+    /// The node is 0.2.137+ (#5729, sdk#439): where 0.2.136 answers a delegate request EMPTY (above), it answers
+    /// the TYPED `DelegateError::Missing(key)` -- the bytes wire/tests/node_0_2_138.rs holds as captured.
+    answers_as_0_2_138: bool,
+    /// The next this many signer requests are answered with the 0.2.137+ node's delegate BACKOFF (its
+    /// `ExecutionError("delegate … is rate limited after repeated failures; retry in … ms")`, as captured).
+    throttle_signer_answers: usize,
     /// The next this many GETs of the Register are answered with THIS older
     /// state: a node serving its cached copy from before a publish (sdk#349).
     stale_register: Option<(Vec<u8>, usize)>,
@@ -132,6 +138,13 @@ fn ok(r: HostResponse) -> Vec<u8> {
     bincode::serialize(&Ok::<HostResponse, Err>(r)).expect("encodes")
 }
 
+/// A node's delegate error, encoded as the node encodes it (wire/tests/node_0_2_138.rs checks the stdlib encoding
+/// against bytes captured from a 0.2.138 node).
+fn delegate_error(e: DelegateError) -> Vec<u8> {
+    use freenet_stdlib::client_api::{ErrorKind, RequestError};
+    bincode::serialize(&Err::<HostResponse, Err>(ErrorKind::RequestError(RequestError::DelegateError(e)).into())).expect("encodes")
+}
+
 /// The node's answer to a PUT it failed on its own side (sdk#431, seen live on 0.2.136): "No such file or directory
 /// (os error 2)", naming the contract (`ContractError::Put`) or naming nothing (`ErrorKind::OperationError`).
 fn put_error(key: ContractKey, keyed: bool) -> Vec<u8> {
@@ -161,6 +174,8 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            answers_as_0_2_138: false,
+            throttle_signer_answers: 0,
             stale_register: None,
             refuse_gets: 0,
             refuse_block_gets: 0,
@@ -205,6 +220,8 @@ impl WireNode {
             drop_signer_answers: 0,
             delegate_absent: false,
             empty_until_registered: false,
+            answers_as_0_2_138: false,
+            throttle_signer_answers: 0,
             stale_register: None,
             refuse_gets: 0,
             refuse_block_gets: 0,
@@ -409,8 +426,19 @@ impl WireNode {
                     *self.served.entry("signer answer lost").or_default() += 1;
                     return None;
                 }
+                if self.throttle_signer_answers > 0 {
+                    self.throttle_signer_answers -= 1;
+                    *self.served.entry("signer throttled").or_default() += 1;
+                    return Some(delegate_error(DelegateError::ExecutionError(
+                        format!("delegate {key} is rate limited after repeated failures; retry in 47 ms").into(),
+                    )));
+                }
                 if self.empty_until_registered || self.empty_signer_answers > 0 {
                     self.empty_signer_answers = self.empty_signer_answers.saturating_sub(1);
+                    if self.answers_as_0_2_138 {
+                        *self.served.entry("signer missing").or_default() += 1;
+                        return Some(delegate_error(DelegateError::Missing(key)));
+                    }
                     return Some(ok(HostResponse::DelegateResponse { key, values: Vec::new() }));
                 }
                 self.site_hidden = self.site_blind_signs > 0;
@@ -1390,6 +1418,59 @@ fn the_signers_first_request_waits_for_its_registration_to_be_answered() {
         io.inbound(&answer, Ms(1_000));
     }
     assert_eq!(kinds(&io.take_frames()), ["signer"], "the registration's answer did not release the Register query");
+}
+
+/// ON A 0.2.137+ NODE (sdk#439, freenet-core #5729): a visitor's node without the signer answers the asking page's
+/// query with the TYPED Missing, not EMPTY -- and that is the same answer: "no signer here", one query, then the
+/// visitor claims its own tree (the signer registered, a key minted), and its first write publishes. On 0.2.138
+/// before this, the Missing was flattened into a keyless refusal and the visitor's page hung "Reading…" (realnet
+/// step 12). THE CONTROL: the same node answering EMPTY (0.2.136) opens the same way.
+#[test]
+fn on_a_0_2_138_node_a_missing_signer_is_the_asking_pages_answer_and_the_visitor_opens_its_own_tree() {
+    for as_0_2_138 in [true, false] {
+        let label = if as_0_2_138 { "0.2.138 (typed Missing)" } else { "0.2.136 (EMPTY, THE CONTROL)" };
+        let key = [32u8; 32];
+        let mut node = WireNode::unprovisioned(&key);
+        node.empty_until_registered = true;
+        node.answers_as_0_2_138 = as_0_2_138;
+        let mut now = 1_000;
+        let mut io = asker();
+        settle(&mut io, &mut node, &mut now);
+        assert!(matches!(io.asked(), Some(page_io::Asked::NoSigner(_))), "{label}: the node without the signer was not named as one: {:?}", io.asked());
+        assert_eq!(node.served.get("signer").copied(), Some(1), "{label}: the answer was not taken as one: {:?}", node.served);
+        if as_0_2_138 {
+            assert_eq!(node.served.get("signer missing").copied(), Some(1), "{label}: THE SETUP: the node never answered Missing");
+        }
+        assert!(io.claim(wire::delegate_from_code(SIGNER_CODE).0), "{label}: the visitor's claim was refused");
+        settle(&mut io, &mut node, &mut now);
+        if io.needs_key() {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+            io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+            settle(&mut io, &mut node, &mut now);
+        }
+        assert!(io.provisioned(), "{label}: the visitor's own tree never opened: {:?}", io.unusable());
+        client(&mut io, &mut node, &mut now, &Request::Identity);
+        let rs = client(&mut io, &mut node, &mut now, &write(1, "mine", "1"));
+        assert!(states(&rs, 1).contains(&WriteState::Published), "{label}: the visitor's first write did not publish: {:?}", states(&rs, 1));
+    }
+}
+
+/// ON A 0.2.137+ NODE, a page that REGISTERED the signer itself (`begin`) reads a Missing -- its request arrived
+/// before the registration took (#260's case, answered EMPTY on 0.2.136) -- and the node's delegate BACKOFF after
+/// it as NO ANSWER: it asks again on the RTO and opens. Neither is a refusal.
+#[test]
+fn on_a_0_2_138_node_a_missing_or_throttled_reply_after_registering_is_no_answer_and_the_page_opens() {
+    let key = [33u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    node.answers_as_0_2_138 = true;
+    node.empty_signer_answers = 2;
+    node.throttle_signer_answers = 1;
+    let mut now = 1_000;
+    let (io, minted) = opening(&mut node, &mut now, &key, false);
+    assert!(io.provisioned(), "a Missing or a backoff after registering ended the open ({:?}): {:?}", node.served, io.unusable());
+    assert!(io.unusable().iter().all(|u| !u.contains("refused")), "a Missing or a backoff was read as a refusal: {:?}", io.unusable());
+    assert_eq!(minted, 1, "the page never learnt the signer holds no key");
+    assert_eq!((node.served.get("signer missing").copied(), node.served.get("signer throttled").copied()), (Some(2), Some(1)), "THE SETUP: {:?}", node.served);
 }
 
 /// THE AMBIGUITY (main's ruling on #260): `wire::unframe` maps ANY empty

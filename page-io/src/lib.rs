@@ -864,14 +864,21 @@ impl PageIo {
                     self.signer_registered = true;
                     self.server.page.ext_answered(Ext::RegisterSigner, now);
                     self.server.page.send_ext(Ext::SignerFirst, now);
-                } else if self.asking() && self.first.is_some() && self.server.page.ext_waiting(Ext::SignerFirst) {
-                    self.first = None;
-                    self.server.page.ext_answered(Ext::SignerFirst, now);
-                    self.asked = Some(Asked::NoSigner("no signer on this node: it answered EMPTY".into()));
-                    // What the engine may do now depends on it (#342: no tree yet → writes wait, unput).
-                    self.step_can_sign();
+                } else {
+                    self.no_signer_here("no signer on this node: it answered EMPTY", now);
                 }
             }
+            // "NO SUCH DELEGATE HERE", naming it: what 0.2.137+ answers where 0.2.136 answered EMPTY (#5729, sdk#439).
+            // The same two readings as the EMPTY above: to a page only ASKING, the answer; to a page that registered
+            // the signer itself, a request that arrived before the registration took -- not an answer, re-sent on
+            // the RTO.
+            Incoming::DelegateMissing { key } if key == self.art.signer.to_string() => {
+                self.no_signer_here("no signer on this node: it answered Missing", now);
+            }
+            Incoming::DelegateMissing { key } => self.unusable.push(format!("the node has no delegate {key}")),
+            // The node's delegate BACKOFF after a failure: not an answer to anything; the request it throttled is
+            // re-sent on the page's clock. Never a refusal (sdk#439).
+            Incoming::DelegateThrottled { .. } => {}
             // A site's PUT was answered: the page reads it back (it says nothing about which record was kept).
             Incoming::Ack(wire::AckKind::Put(key)) | Incoming::Ack(wire::AckKind::Updated(key)) if self.site_by_key(&key).is_some() => {
                 let app = self.site_by_key(&key).expect("matched");
@@ -1038,7 +1045,23 @@ impl PageIo {
             // A site's change is its own (taken, and read by nobody: the page does not follow a site).
             Incoming::HeadChanged { key, .. } => *key == self.register_key || self.sites.values().any(|s| s.key == *key),
             Incoming::Partial => true,
-            Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::Refused(_) | Incoming::Unusable(_) => !self.read_only(),
+            Incoming::DelegateMissing { key } => *key == self.art.signer.to_string() || !self.read_only(),
+            Incoming::EngineBytes(_) | Incoming::Ack(_) | Incoming::DelegateThrottled { .. } | Incoming::Refused(_) | Incoming::Unusable(_) => {
+                !self.read_only()
+            }
+        }
+    }
+
+    /// THE NODE SAYS IT HAS NO SIGNER (EMPTY on 0.2.136, Missing on 0.2.137+). Only an ASKING page's outstanding
+    /// first request is answered by it -- the definite "no signer here" that lets a visitor make their own tree.
+    /// Anywhere else it is not an answer, and the page's sender re-sends on its RTO.
+    fn no_signer_here(&mut self, said: &str, now: Ms) {
+        if self.asking() && self.first.is_some() && self.server.page.ext_waiting(Ext::SignerFirst) {
+            self.first = None;
+            self.server.page.ext_answered(Ext::SignerFirst, now);
+            self.asked = Some(Asked::NoSigner(said.into()));
+            // What the engine may do now depends on it (#342: no tree yet → writes wait, unput).
+            self.step_can_sign();
         }
     }
 
