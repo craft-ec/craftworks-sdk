@@ -178,6 +178,10 @@ pub enum Incoming {
     /// accepted — so a refusal is attributed to its PUT by key, never by
     /// position. `said` is the node's `cause`: display only.
     PutFailed { key: String, said: String },
+    /// A node error that names NO contract in its KIND but whose TEXT is the pinned PUT-refusal format
+    /// ([`PUT_ERROR_FORMAT`], sdk#433): `key` and `said` (the reason) parsed from it. The node's words, so it is
+    /// attributed only to a PUT the caller has on the wire, and final only for a pinned validation reason.
+    PutFailedByText { key: String, said: String },
     /// The node accepted a request, and WHICH.
     ///
     /// **An ack is not durability.** A write becomes published by being READ
@@ -248,6 +252,76 @@ pub struct Refused {
     /// The node's own words. For display and logs. Never matched on to decide
     /// anything security-relevant.
     pub said: String,
+    /// Which of the node's errors it was, as a stable code (its `ErrorKind`): what an unattributed node error is
+    /// COUNTED under (sdk#433). `"unreadable"` when the error does not decode.
+    pub code: &'static str,
+}
+
+/// THE NODE'S WORDS WHEN A CONTRACT'S OWN VALIDATION REFUSES A PUT (sdk#433): a final answer, not a transient one --
+/// the same bytes are refused again, for ever. Read on freenet [`VALIDATION_REFUSED_READ_ON`] (freenet-core
+/// 7fa2c6605b99) with freenet-stdlib 0.10.0:
+/// * `"not valid"` -- `contract_ops.rs` (a fresh PUT whose `validate_state` is not Valid);
+/// * `"invalid put"` -- `ContractError::invalid_put` (stdlib `INVALID_PUT`), from `executor_impl.rs`'s upsert.
+///
+/// EXACT match only: an unrecognised refusal stays transient (re-sent, shown "not answering"), the safe side. A
+/// freenet version bump re-runs `probe live-refusal-text` (WORKAROUNDS, the detect check), which fails if a real
+/// validation refusal no longer says one of these. The node reports it keyless, in [`PUT_ERROR_FORMAT`].
+pub const VALIDATION_REFUSED: [&str; 2] = ["not valid", "invalid put"];
+
+/// The freenet versions [`VALIDATION_REFUSED`] and [`PUT_ERROR_FORMAT`] were read on (the detect probe, each).
+pub const VALIDATION_REFUSED_READ_ON: &[&str] = &["0.2.136", "0.2.138"];
+
+/// HOW THE NODE REPORTS A PUT ITS EXECUTOR REFUSED (sdk#433, probed on each of [`VALIDATION_REFUSED_READ_ON`]): a
+/// KEYLESS `ErrorKind::OperationError` whose cause is exactly `put error for contract {key}, reason: {reason}` --
+/// e.g. `put error for contract 7UHV…G1xY, reason: invalid put` for a Block PUT the contract refuses. The prefix and
+/// the separator, as pinned.
+pub const PUT_ERROR_FORMAT: (&str, &str) = ("put error for contract ", ", reason: ");
+
+/// `(key, reason)` if `cause` is exactly the pinned PUT-refusal format; the key is non-empty and has no spaces.
+pub fn parse_put_error(cause: &str) -> Option<(String, String)> {
+    let rest = cause.strip_prefix(PUT_ERROR_FORMAT.0)?;
+    let (key, reason) = rest.split_once(PUT_ERROR_FORMAT.1)?;
+    (!key.is_empty() && !key.contains(char::is_whitespace)).then(|| (key.to_string(), reason.to_string()))
+}
+
+/// Is `said` (a keyed PUT refusal's cause) a contract's own VALIDATION refusal -- final?
+pub fn is_validation_refusal(said: &str) -> bool {
+    VALIDATION_REFUSED.contains(&said)
+}
+
+/// A keyless `OperationError` in the pinned PUT-refusal format: `(key, reason)`.
+fn put_error_text(bytes: &[u8]) -> Option<(String, String)> {
+    use freenet_stdlib::client_api::{ClientError, ErrorKind};
+    let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else { return None };
+    match e.kind() {
+        ErrorKind::OperationError { cause } => parse_put_error(cause),
+        _ => None,
+    }
+}
+
+/// The stable code of a node error that names no contract (`Refused::code`).
+fn node_error_code(bytes: &[u8]) -> &'static str {
+    use freenet_stdlib::client_api::{ClientError, ErrorKind};
+    let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
+        return "unreadable";
+    };
+    match e.kind() {
+        ErrorKind::ChannelClosed => "channel_closed",
+        ErrorKind::DeserializationError { .. } => "deserialization_error",
+        ErrorKind::Disconnect => "disconnect",
+        ErrorKind::IncorrectState(_) => "incorrect_state",
+        ErrorKind::NodeUnavailable => "node_unavailable",
+        ErrorKind::TransportProtocolDisconnect => "transport_protocol_disconnect",
+        ErrorKind::Unhandled { .. } => "unhandled",
+        ErrorKind::UnknownClient(_) => "unknown_client",
+        ErrorKind::RequestError(_) => "request_error",
+        ErrorKind::OperationError { .. } => "operation_error",
+        ErrorKind::FailedOperation => "failed_operation",
+        ErrorKind::Shutdown => "shutdown",
+        ErrorKind::EmptyRing => "empty_ring",
+        ErrorKind::PeerNotJoined => "peer_not_joined",
+        _ => "other",
+    }
 }
 
 impl Refused {
@@ -510,9 +584,15 @@ fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
         Err(Unusable::NodeSaidNo) if delegate_throttled(bytes).is_some() => {
             Err(Incoming::DelegateThrottled { said: delegate_throttled(bytes).expect("just checked") })
         }
+        // A keyless error whose TEXT is the pinned PUT-refusal format (sdk#433): parsed, attributed by the caller.
+        Err(Unusable::NodeSaidNo) if put_error_text(bytes).is_some() => {
+            let (key, said) = put_error_text(bytes).expect("just checked");
+            Err(Incoming::PutFailedByText { key, said })
+        }
         // A node's own error reply is a MESSAGE, not a failure to read one.
         Err(Unusable::NodeSaidNo) => Err(Incoming::Refused(Refused {
             said: "the node refused the request".into(),
+            code: node_error_code(bytes),
         })),
         Err(why) => Err(Incoming::Unusable(why)),
     }

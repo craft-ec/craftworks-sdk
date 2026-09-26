@@ -579,3 +579,58 @@ fn the_largest_pre_race_put_write_still_publishes_with_its_parity() {
     assert!(states(&all, 1).contains(&State::Published), "{:?}", states(&all, 1));
     assert!(states(&all, 1).contains(&State::ParityComplete), "{:?}", states(&all, 1));
 }
+
+/// A DATA BLOCK REJECTED AFTER THE HEAD IS SENT (sdk#433, the architect's gap): with the head sent before the blocks
+/// are in (`head_before_packs`), a rejection does not end the commit, and the commit is not ready, so `settle_by_fact`
+/// re-derives its missing blocks from the ops -- whose "missing" set carried no rejected filter, so the REJECTED block
+/// was put again. The settle rounds re-put the others and never it; the commit ends by the existing rules (here its
+/// head lands: Published), never a loop.
+#[test]
+fn a_data_block_rejected_after_the_head_is_sent_is_never_put_again_by_settle() {
+    let mut r = Rig::base_with(Params { head_before_packs: true, ..Params::default() });
+    let t0 = 1_000_000;
+    let _ = r.step(Event::Tick(t0));
+    let first = r.step(Event::forced_write(ClientId(1), WriteId(4), vec![put("k/000300", b"four")]));
+    let victim = leaf_with(&first, b"k/000300");
+    let (seq, _) = head(&first).expect("THE SETUP: head_before_packs did not send the head at once");
+    // Nothing is answered: the commit is not ready. The new leaf is rejected.
+    let fx = r.step(Event::PutRejected(victim));
+    assert!(states(&fx, 4).is_empty(), "a rejection after the head was sent ended the write: {:?}", states(&fx, 4));
+    // Settle rounds come due, again and again: one tick at a time (a jump past CLOCK_RESET_TICKS is a clock reset,
+    // which re-anchors the settle clock), long past every round (reask 16 ticks, doubling; 3 rounds, then Lost).
+    let mut later = Vec::new();
+    for k in 1..=600u64 {
+        later.extend(r.step(Event::Tick(t0 + k)));
+    }
+    assert!(!puts(&later).is_empty(), "THE SETUP: no settle round re-put anything (the path is not reached)");
+    assert!(!puts(&later).contains_key(&victim), "a settle round put the REJECTED block again");
+    assert!(r.e.rejected_blocks().contains(&victim));
+    let landed = r.step(Event::HeadConfirmed(seq));
+    assert!(states(&landed, 4).contains(&State::Published) || states(&later, 4).contains(&State::Lost), "the commit neither published nor was lost: {:?} / {:?}", states(&later, 4), states(&landed, 4));
+}
+
+/// A BLOCK THE NODE'S CONTRACT REJECTS (sdk#433; the architect's rulings): `PutRejected` is a REAL END, never a
+/// re-put. A commit in flight needing it (its head not sent) ends: its write is `Failed` -- never `Lost`, whose
+/// re-send would re-derive the same block -- and the block is never put again, even on a later `PutFailed`. A
+/// published commit's straggler rejected stays owed: never BACKED_UP, recorded as damaged, never put again.
+#[test]
+fn a_rejected_block_ends_its_commit_failed_and_is_never_put_again() {
+    // In flight.
+    let mut r = Rig::base();
+    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let victim = *puts(&first).keys().next().expect("a block PUT");
+    let fx = r.step(Event::PutRejected(victim));
+    assert_eq!(states(&fx, 2), vec![State::Failed], "the write needing a rejected block was not told Failed (and only that)");
+    assert!(!puts(&fx).contains_key(&victim), "the rejected block was put again");
+    assert!(!puts(&r.step(Event::PutFailed(victim))).contains_key(&victim), "a later PutFailed put the rejected block again");
+    assert!(r.e.rejected_blocks().contains(&victim));
+    // A published commit's straggler.
+    let mut r = Rig::base();
+    let all = r.commit(3, vec![put("k/000200", b"three")], |id, b| !is_parity(id, b));
+    assert!(states(&all, 3).contains(&State::Published), "THE SETUP: not published with its parity held");
+    let straggler = puts(&all).into_iter().find(|(id, b)| is_parity(id, b)).expect("a parity straggler").0;
+    let fx = r.step(Event::PutRejected(straggler));
+    assert!(fx.is_empty(), "a rejected straggler produced {:?}", fx);
+    assert!(!puts(&r.step(Event::PutFailed(straggler))).contains_key(&straggler), "a rejected straggler was put again");
+    assert!(r.e.rejected_blocks().contains(&straggler), "the rejected straggler is not recorded for the dashboard");
+}
