@@ -946,6 +946,22 @@ impl Default for Params {
 }
 
 
+/// Who wants a block, as [`Engine::readers_of`] derives it: a parked read waits on it, a repair needs it as a slot,
+/// or the parked write needs it. Nothing wants it when none does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Readers {
+    pub reads: bool,
+    pub repairs: bool,
+    pub parked_write: bool,
+}
+
+impl Readers {
+    /// Somebody wants it.
+    pub fn any(self) -> bool {
+        self.reads || self.repairs || self.parked_write
+    }
+}
+
 /// What an engine shed to keep its context saveable (sdk#162), per call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Shed {
@@ -2923,7 +2939,8 @@ impl<B: Blocks> Engine<B> {
         self.reads.parked.remove(&req_id);
         self.forget_waiting(req_id);
         for id in blocks {
-            if self.reads.waiting.contains_key(&id) {
+            // Still wanted by another read, a repair, or the parked write: its fetch -- and its repair -- stand.
+            if self.readers_of(&id).any() {
                 continue;
             }
             if self.repairs.contains_key(&id) {
@@ -4847,13 +4864,17 @@ impl<B: Blocks> Engine<B> {
             })
     }
 
-    /// Does this engine still wait on block `id` -- a parked read, a repair
-    /// slot, or a parked write? The page re-asks a NotFound block only while
-    /// this is true, so a block nobody needs any more is not asked for ever.
-    pub fn awaits_block(&self, id: &Cid) -> bool {
-        self.reads.waiting.contains_key(id)
-            || self.repair_slots.contains_key(id)
-            || self.parked_write.as_ref().is_some_and(|p| p.needs.contains(id))
+    /// WHO WANTS a block (sdk#480, the structure sweep's Tier-1 #1): derived from the engine's own indexes, never
+    /// stored, and THE one answer to "is this block still wanted" -- a withdrawal, a superseded read, a repair's
+    /// "already in flight", a rebuild's PUT-back and the page's parked GET all read it. Before it, two definitions
+    /// disagreed (`awaits_block` counted all three; `withdraw_if_unwanted` only reads), so a block the parked write
+    /// needed could be withdrawn when a read on it was superseded.
+    pub fn readers_of(&self, id: &Cid) -> Readers {
+        Readers {
+            reads: self.reads.waiting.contains_key(id),
+            repairs: self.repair_slots.contains_key(id),
+            parked_write: self.parked_write.as_ref().is_some_and(|p| p.needs.contains(id)),
+        }
     }
 
     /// Start rebuilding `group.missing`: what is held already counts, and
@@ -4877,7 +4898,7 @@ impl<B: Blocks> Engine<B> {
                     r.asked.insert(i, 0);
                     // ONE ask per block (sdk#303): a slot another member's race, or a read, has in flight already
                     // is not asked twice -- racing every member of a group would otherwise ask each slot k times.
-                    let in_flight = self.repair_slots.contains_key(&slot) || self.reads.waiting.contains_key(&slot);
+                    let in_flight = self.readers_of(&slot).any();
                     self.repair_slots.entry(slot).or_default().insert(missing);
                     self.withdrawn.remove(&slot);
                     if !in_flight {
@@ -4994,10 +5015,11 @@ impl<B: Blocks> Engine<B> {
         }
     }
 
-    /// A block no read waits on and the page does not hold is WITHDRAWN: its GET ends instead of being re-asked for
-    /// ever (sdk#303). The one statement of "unwanted", for a freed repair slot and a superseded read's blocks alike.
+    /// A block NOBODY wants ([`readers_of`](Self::readers_of): no read, no repair slot, not the parked write) and the
+    /// page does not hold is WITHDRAWN: its GET ends instead of being re-asked for ever (sdk#303). For a freed repair
+    /// slot and a superseded read's blocks alike.
     fn withdraw_if_unwanted(&mut self, id: Cid) {
-        if !self.reads.waiting.contains_key(&id) && self.blocks.get(&id).is_none() {
+        if !self.readers_of(&id).any() && self.blocks.get(&id).is_none() {
             self.withdrawn.insert(id);
         }
     }

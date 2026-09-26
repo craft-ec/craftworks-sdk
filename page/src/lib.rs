@@ -992,7 +992,7 @@ impl Page {
             // A parked GET the engine no longer needs, or that the page now
             // holds (a repair rebuilt it), ends here.
             if let Waiting::Get(id) = w {
-                if !d.sent && (self.engine.blocks().get(&id).is_some() || !self.engine.awaits_block(&id)) {
+                if !d.sent && (self.engine.blocks().get(&id).is_some() || !self.engine.readers_of(&id).any()) {
                     self.drop_get(id);
                     continue;
                 }
