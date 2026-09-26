@@ -32,6 +32,7 @@ function engineRaw() {
   const session = {
     url: () => "ws://127.0.0.1:17509/",
     set_app() {}, // the app a session is (the forest ruling); a fake needs no namespace
+    adopt_loader() {}, // the loader's recording (sdk#386's instrument work); a fake records nothing
     outbound: () => [], sent() {}, reconnected() {}, provision() {},
     take_progress: () => "[]", take_loads: () => "[]", resume() {},
     provisioned: () => true, refused: () => "", exhausted: () => false, unusable: () => "[]",
