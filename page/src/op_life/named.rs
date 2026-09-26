@@ -6,9 +6,7 @@ use crate::*;
 use instrument::{Dir, Event as IE, Outcome, Record};
 
 fn page() -> Page {
-    let mut p = Page::new(Params::default(), PutPath::Page);
-    p.answered(&Waiting::RecoverHead);
-    let _ = p.take_ops();
+    let mut p = super::scenarios::page();
     p.record_into(1024);
     p
 }

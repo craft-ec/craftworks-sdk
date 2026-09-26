@@ -3,7 +3,8 @@
 use crate::op_life::UNTRACKED_KEYS_MAX;
 use crate::*;
 
-fn page() -> Page {
+/// A fresh page past its head recovery, nothing on the wire: the OP-LIFE tests' one fixture.
+pub(super) fn page() -> Page {
     let mut p = Page::new(Params::default(), PutPath::Page);
     p.answered(&Waiting::RecoverHead);
     let _ = p.take_ops();
