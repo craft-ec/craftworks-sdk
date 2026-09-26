@@ -391,7 +391,7 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
                 head = Some((seq, root));
                 break;
             }
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     let (_, root) = head.expect("the control must offer a head early, or it is no control");
@@ -567,7 +567,7 @@ fn a_stalled_write_is_reported_once_and_the_writes_queued_behind_it_publish() {
                 absorb(&mut seen, &out);
                 queue.extend(out);
             }
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
 
@@ -924,7 +924,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
                     head = Some((seq, root));
                     // Deliberately NOT confirmed: this is the window.
                 }
-                _ => {}
+                other => common::no_answer_owed(&other),
             }
         }
         let (seq, root) = head.expect("the commit never emitted a head");

@@ -54,3 +54,12 @@ pub fn items_after_the_cut(src: &str) -> Vec<(usize, String)> {
     }
     out
 }
+
+/// A HAND-WRITTEN DRIVER'S CATCH-ALL over the page's ops (the architect on #413 x #424): every op waits on an answer,
+/// so a driver that drops one stalls the page silently. A driver lists the ops it answers or means to leave
+/// unanswered BY NAME; anything else ends here, loudly.
+#[allow(dead_code)]
+#[track_caller]
+pub fn unanswered_op(op: &page::Op) -> ! {
+    panic!("a test driver dropped an op the page waits on (a silent stall): {op:?}")
+}

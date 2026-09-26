@@ -9,6 +9,7 @@
 //! rows, the tree. Where the page differs from the Shell by design (a restart
 //! mid-commit, a same-key displacement), the page's behaviour is asserted.
 
+mod common;
 use engine::Params;
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
@@ -811,7 +812,7 @@ fn sibling_root(node: &mut Node, salt: u32) -> Cid {
                 }
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(1)),
                 Op::Sign { root, .. } => return root,
-                _ => {}
+                other => common::unanswered_op(&other),
             }
         }
     }
@@ -1121,7 +1122,7 @@ fn device_tree(node: &mut Node, entries: &[(Vec<u8>, Vec<u8>)]) -> Cid {
                 }
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(1)),
                 Op::Sign { root, .. } => return root,
-                _ => {}
+                other => common::unanswered_op(&other),
             }
         }
     }

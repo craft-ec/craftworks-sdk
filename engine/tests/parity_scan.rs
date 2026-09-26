@@ -80,7 +80,7 @@ fn drive(e: &mut Engine<Store>, net: &mut Network, first: Vec<Effect>, told: &mu
                 }
             }
             Effect::Notify { write_id, state, .. } => told.entry(write_id.0).or_default().push(state),
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
 }

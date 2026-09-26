@@ -108,7 +108,7 @@ fn read_cold(root: Cid, all: &MemBlocks, lost: &BTreeSet<Cid>, keys: &[Vec<u8>],
                 Effect::Reply { req_id, result, .. } if req_id == ReqId(n as u64) => {
                     answers.insert(key.clone(), result);
                 }
-                _ => {}
+                other => common::no_answer_owed(&other),
             }
         }
     }
@@ -280,9 +280,15 @@ fn a_write_whose_path_lost_a_block_is_applied_from_its_group() {
                     queue.extend(e.step(Event::PutConfirmed(id)));
                 }
                 Effect::PutRepaired { id, bytes } => store.put(id, &bytes),
+                // #424's question, answered as the PAGE does (the architect on #413 x #424): held when the node holds it
+                // (a confirmed or Held-present block counts toward k), else unknown (its group's deferred parity goes).
+                Effect::ConfirmHeld { id } => {
+                    let held = store.node_holds(&id) || (all.get(&id).is_some() && !lost.contains(&id));
+                    queue.extend(e.step(if held { Event::PutConfirmed(id) } else { Event::HeldUnknown(id) }));
+                }
                 Effect::UpdateHead { seq, .. } => queue.extend(e.step(Event::HeadConfirmed(seq))),
                 Effect::Notify { state: engine::State::Published, .. } => published = true,
-                _ => {}
+                other => common::no_answer_owed(&other),
             }
         }
         let (started, rebuilt, _) = e.repair_counts();
@@ -294,5 +300,98 @@ fn a_write_whose_path_lost_a_block_is_applied_from_its_group() {
         } else {
             assert!(!published, "THE CONTROL: with repair off the write published without the lost leaf");
         }
+    }
+}
+
+/// THE TABLE CELL (the architect on #413 x #424): a changed group's member THIS page rebuilt and re-put is ABSENT until a
+/// Held says present -- its repair PUT's answer confirms nothing (ruling (b)) -- and counts toward k from then. Cold
+/// reads of keys in two lost leaves rebuild them from their group (`PutRepaired`); then a write in a SIBLING leaf of the
+/// same group changes the group and keeps the rebuilt leaves as UNCHANGED other members, which the commit asks the node
+/// about (`ConfirmHeld`), answered as the page does.
+/// * (i) the repair PUTs landed: the node holds them -> Held present -> they count -> Published;
+/// * (ii) they did not land: Held unknown -> the group's deferred parity is released instead -> still Published (#424's
+///   no-deadlock property), and the rebuilt leaves were counted absent.
+///
+/// In both, ConfirmHeld named the rebuilt leaves (non-vacuity: a write OVER a lost leaf replaces it, and never asks).
+#[test]
+fn a_member_this_page_rebuilt_counts_toward_k_once_the_node_says_it_holds_it() {
+    let records = records();
+    let (root, mut all) = tree(&records);
+    let (members, _) = a_leaf_group(&mut all, root);
+    // TWO lost leaves: with one absent member the write's first wave (its new leaf + one parity) already reaches k, so
+    // the released parity would not be needed (measured: the no-release mutant survived); two absent needs it.
+    let lost: BTreeSet<Cid> = BTreeSet::from([members[0], members[2]]);
+    let rebuilt = [members[0], members[2]];
+    let read_keys: Vec<Vec<u8>> = rebuilt.iter().map(|m| keys_in(&all, &[*m]).into_iter().next().expect("a key in a lost leaf")).collect();
+    let write_key = keys_in(&all, &members[1..2]).into_iter().next().expect("a key in a sibling leaf");
+    for landed in [true, false] {
+        let (mut e, store) = common::cold_reader(root, Params { repair_reads: true, ..Params::default() });
+        let answer = |id: &Cid, store: &Store| match all.get(id).filter(|_| !lost.contains(id)) {
+            Some(b) => {
+                store.put(*id, b);
+                Event::BlockArrived { id: *id, bytes: b.to_vec() }
+            }
+            None => Event::BlockMissed(*id),
+        };
+        // 1. The reads: each lost leaf is rebuilt from its group and re-put (landing on the node only in case (i)).
+        let mut repaired = Vec::new();
+        for (n, read_key) in read_keys.iter().enumerate() {
+        let req = ReqId(n as u64 + 1);
+        let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
+        let mut got = None;
+        let mut queue = e.step(Event::Get { client: ClientId(1), req_id: req, key: read_key.clone() });
+        while let Some(f) = queue.pop() {
+            match f {
+                Effect::FetchBlock { id, .. } => {
+                    let times = asked.entry(id).or_insert(0);
+                    *times += 1;
+                    if *times <= PACED {
+                        queue.extend(e.step(answer(&id, &store)));
+                    }
+                }
+                Effect::Keep { id, bytes } => store.put(id, &bytes),
+                // The repair's re-put reaches the NODE only in case (i). (The engine's own store is this `store` too, so
+                // the node is modelled apart: `node` below.)
+                Effect::PutRepaired { id, .. } => repaired.push(id),
+                Effect::Reply { req_id, result, .. } if req_id == req => got = Some(result),
+                other => common::no_answer_owed(&other),
+            }
+        }
+        assert!(matches!(got, Some(ReadResult::Value(Some(_)))), "landed={landed}: THE SETUP: the read of a lost leaf was not answered from its group: {got:?}");
+        }
+        assert!(rebuilt.iter().all(|m| repaired.contains(m)), "landed={landed}: THE SETUP: a lost leaf was not rebuilt and re-put");
+        // What the NODE holds: the network less the lost leaf, plus whatever this page put since, plus the rebuilt leaf
+        // only if its repair PUT landed.
+        let mut put_since: BTreeSet<Cid> = BTreeSet::new();
+        let node = |id: &Cid, put_since: &BTreeSet<Cid>| (all.get(id).is_some() && !lost.contains(id)) || put_since.contains(id) || (landed && rebuilt.contains(id));
+        // 2. The write in a sibling leaf; the commit asks the node about the group's other members.
+        let mut named = Vec::new();
+        let mut published = false;
+        let mut queue = e.step(Event::forced_write(ClientId(1), engine::WriteId(1), vec![(write_key.clone(), engine::Op::Put(b"written beside a rebuilt leaf".to_vec()))]));
+        let mut steps = 0;
+        while let Some(f) = queue.pop() {
+            steps += 1;
+            assert!(steps < 50_000, "landed={landed}: the write did not settle");
+            match f {
+                Effect::FetchBlock { id, .. } => queue.extend(e.step(answer(&id, &store))),
+                Effect::Keep { id, bytes } => store.put(id, &bytes),
+                Effect::PutBlock { id, bytes, .. } => {
+                    store.put(id, &bytes);
+                    put_since.insert(id);
+                    queue.extend(e.step(Event::PutConfirmed(id)));
+                }
+                // As the page answers: held when the node holds it, else unknown.
+                Effect::ConfirmHeld { id } => {
+                    named.push(id);
+                    let held = node(&id, &put_since);
+                    queue.extend(e.step(if held { Event::PutConfirmed(id) } else { Event::HeldUnknown(id) }));
+                }
+                Effect::UpdateHead { seq, .. } => queue.extend(e.step(Event::HeadConfirmed(seq))),
+                Effect::Notify { state: engine::State::Published, .. } => published = true,
+                other => common::no_answer_owed(&other),
+            }
+        }
+        assert!(rebuilt.iter().all(|m| named.contains(m)), "landed={landed}: VACUOUS: the commit never asked about a rebuilt leaf (asked {} others)", named.len());
+        assert!(published, "landed={landed}: a write beside a rebuilt leaf never published");
     }
 }

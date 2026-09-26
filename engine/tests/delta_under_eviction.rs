@@ -6,6 +6,7 @@
 //!
 //! The node here is the issue's probe: it answers every block of the two trees, answers any other id (race GET's
 //! parity asks) NotFound, and RETAINS at most `cap` blocks FIFO -- roots included, as a real node does.
+mod common;
 use engine::read::{ReadResult, ReqId};
 use engine::subs::SubRange;
 use engine::{ClientId, Effect, Engine, Event, Params};
@@ -154,7 +155,7 @@ fn run(all: &MemBlocks, ra: Cid, rb: Cid, truth: &Changes, cap: usize, params: P
                 replied_while_held |= !held_back.is_empty();
                 answer = Some(result);
             }
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     Run { answer, fetched, missed, prefix_ok, asked, replied_while_held }
@@ -333,7 +334,7 @@ fn controls_warm_answers_in_one_step_an_unobtainable_old_root_reloads_promptly_a
                 reply = Some(result);
                 break;
             }
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     match reply {

@@ -116,6 +116,29 @@ pub fn answer_held(e: &mut Engine<Store>, out: &mut Vec<Effect>) {
     }
 }
 
+/// A HAND-WRITTEN DRIVER'S CATCH-ALL (the architect on #413 x #424): an effect that owes the engine no answer may be
+/// ignored; one the engine WAITS on (a fetch, a put, a head, a held question) may not -- dropping it is a silent stall,
+/// which is how #424's `ConfirmHeld` stalled #413's read_repair driver without an error. Every driver over `Effect`
+/// ends in `other => common::no_answer_owed(&other)`, and `drivers_have_no_silent_catch_all` holds that by source.
+#[allow(dead_code)]
+#[track_caller]
+pub fn no_answer_owed(f: &Effect) {
+    match f {
+        Effect::Notify { .. }
+        | Effect::Progress { .. }
+        | Effect::Subscribed { .. }
+        | Effect::Changed { .. }
+        | Effect::Conflicted { .. }
+        | Effect::Unread { .. }
+        | Effect::Reply { .. }
+        | Effect::Withdraw { .. }
+        | Effect::Keep { .. }
+        // A repair's re-put: its answer confirms nothing (the architect's (b)), so nothing in the engine waits on it.
+        | Effect::PutRepaired { .. } => {}
+        owed => panic!("a test driver dropped an effect the engine waits on (a silent stall): {owed:?}"),
+    }
+}
+
 /// `Engine::new` with the thread's store, so a converted test reads as it did.
 ///
 /// The engine is told the tree is NEW (`HeadMissing`), because a write made
@@ -212,19 +235,18 @@ impl Store {
     /// A pack is unpacked: what the node ends up holding is the blocks inside
     /// it, under their own ids, which is the whole point of the format.
     pub fn absorb(&self, effects: &[Effect]) {
+        // Not a driver: it only STORES what was put (the driver answers every effect), so it picks out the puts and has no
+        // catch-all to drop anything with.
         for f in effects {
-            match f {
-                Effect::PutPack { id, bytes, .. } => {
-                    for (mid, mbytes) in engine::pack::members(bytes) {
-                        self.put(mid, &mbytes);
-                    }
-                    self.put(*id, bytes);
+            if let Effect::PutPack { id, bytes, .. } = f {
+                for (mid, mbytes) in engine::pack::members(bytes) {
+                    self.put(mid, &mbytes);
                 }
-                // A queued write's warm-apply block (R-b): the page keeps it.
-                Effect::PutBlock { id, bytes, .. } | Effect::Keep { id, bytes } => {
-                    self.put(*id, bytes);
-                }
-                _ => {}
+                self.put(*id, bytes);
+            }
+            // A queued write's warm-apply block (R-b): the page keeps it.
+            if let Effect::PutBlock { id, bytes, .. } | Effect::Keep { id, bytes } = f {
+                self.put(*id, bytes);
             }
         }
     }
@@ -400,7 +422,7 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
                 state: State::Published,
                 ..
             } => {}
-            _ => {}
+            other => no_answer_owed(&other),
         }
     }
     (w.published_root(), all)

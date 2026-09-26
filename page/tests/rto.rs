@@ -6,6 +6,7 @@
 //! * KARN: an answer to a re-sent call is never a sample;
 //! * §5.5: a timeout doubles the RTO until a clean answer.
 
+mod common;
 use engine::{ClientId, Op as WriteOp, Params, WriteId};
 use page::rto::{RTO_FLOOR_MS, RTO_INITIAL_MS};
 use page::{Answer, Ms, Op, Page, PutPath};
@@ -174,7 +175,7 @@ fn an_unanswered_head_read_is_never_an_empty_tree() {
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
                 Op::Sign { .. } => panic!("a write was signed onto a tree nobody read"),
-                _ => {}
+                other => common::unanswered_op(&other),
             }
         }
     }

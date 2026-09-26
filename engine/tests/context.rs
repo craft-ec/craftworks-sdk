@@ -6,6 +6,7 @@
 //! The context CARRY (`to_context` / `from_context`, a delegate rebuilt from
 //! its bytes each call) was deleted in #305: the engine lives in the page.
 
+mod common;
 use engine::{ClientId, Effect, Engine, Event, Op, Params, WriteId};
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
@@ -37,7 +38,7 @@ impl Store {
                 Effect::PutBlock { id, bytes, .. } => {
                     self.put(*id, bytes)
                 }
-                _ => {}
+                other => common::no_answer_owed(other),
             }
         }
     }

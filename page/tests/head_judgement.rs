@@ -87,7 +87,7 @@ fn a_mid_commit_recovery_read_never_adopts_a_head_this_pages_record_beats() {
                 Op::Update { label: Label::Head, .. } => p.answer(Answer::Updated { label: Label::Head }, Ms(now)),
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
                 Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
-                _ => {}
+                other => common::unanswered_op(&other),
             }
         }
         if p.published() == (mine.seq, mine.root()) {

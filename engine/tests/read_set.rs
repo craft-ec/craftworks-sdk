@@ -70,7 +70,9 @@ fn settle(h: &mut Harness, mut fx: Vec<Effect>) -> Vec<Effect> {
                     next.extend(h.step(Event::PutConfirmed(*id)))
                 }
                 Effect::UpdateHead { seq, .. } => next.extend(h.step(Event::HeadConfirmed(*seq))),
-                _ => {}
+                // Answered inside `Harness::step` (`common::answer_held`) for every member the node holds, as the page does.
+                Effect::ConfirmHeld { .. } => {}
+                other => common::no_answer_owed(other),
             }
         }
         if next.is_empty() {

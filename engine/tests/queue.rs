@@ -230,7 +230,7 @@ fn publish_one(e: &mut engine::Engine<Store>, fx: Vec<Effect>) -> Vec<Effect> {
         match f {
             Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => queue.extend(stepped!(e, Event::PutConfirmed(id))),
             Effect::UpdateHead { seq, .. } => return stepped!(e, Event::HeadConfirmed(seq)),
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     panic!("no head was sent");

@@ -88,7 +88,7 @@ fn parity_complete_fires_once_per_write() {
                 state: State::ParityComplete,
                 ..
             } => pc += 1,
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     println!("PROBE2 ParityComplete notifications for ONE write: {pc}");

@@ -4,6 +4,7 @@
 //! fork, a register the signer's node does not hold, and the pace of a
 //! wrapper-path `Held` that keeps answering absent.
 
+mod common;
 use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
 use page::{Ms, Answer, Op, Page, PutPath, BACKOFF_MS, HELD_ABSENTS};
 use signer_proto::{Answer as A, Head, Why};
@@ -135,7 +136,7 @@ fn a_held_absent_is_asked_again_and_re_put_only_after_several() {
                     asks += 1;
                     p.answer(Answer::Held { id, present: false }, Ms(now));
                 }
-                _ => {}
+                other => common::unanswered_op(&other),
             }
         }
         now += 50;
@@ -207,7 +208,7 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
                     assert_eq!((prev_seq, prev_root), (theirs.seq, theirs.root), "not built on the adopted head");
                     id2 = Some(id);
                 }
-                _ => {}
+                other => common::unanswered_op(&other),
             }
         }
         if id2.is_some() {
