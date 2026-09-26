@@ -20,7 +20,8 @@ const gate = (cwd, args, env = {}) => spawnSync("./gate.sh", args, { cwd, encodi
 // against 25 before build.sh wrote more) had this suite's child gate refuse the disk and fail "ENGINE only", and npm's
 // chain lost 42 tests behind it. So the plan tests pass a guard that always admits: the disk decides whether a gate
 // may BUILD, never what a plan says. (The guard's own behaviour is disk-guard.test.mjs's.)
-const ADMIT = join(mkdtempSync(join(tmpdir(), "gate-pr-admit-")), "admit.sh");
+const ADMIT_DIR = mkdtempSync(join(tmpdir(), "gate-pr-admit-"));
+const ADMIT = join(ADMIT_DIR, "admit.sh");
 writeFileSync(ADMIT, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 const plan = (cwd, changed, env = {}) => gate(cwd, ["--pr", "--dry-run"], { DISK_GUARD: ADMIT, GATE_PR_CHANGED: changed, ...env });
 const planLine = (out, what) => (out.split("\n").find(l => l.startsWith(`gate --pr: ${what}:`)) ?? "").split(": ").slice(2).join(": ").trim();
@@ -36,6 +37,8 @@ await t("**a change to ENGINE tests ENGINE only** (the owner: dependents run at 
 });
 
 await t("**THE PLAN IS A PURE FUNCTION OF GATE_PR_CHANGED** (sdk#461): a tree with a stray untracked file and modified files plans exactly what a clean one does; the disk is not its input either", async () => {
+  // A killed earlier run leaves its scratch worktree registered: drop the stale entries first.
+  execFileSync("git", ["-C", root, "worktree", "prune"], { stdio: "ignore" });
   const scratch = mkdtempSync(join(tmpdir(), "gate-pr-dirty-"));
   const wt = join(scratch, "wt");
   execFileSync("git", ["-C", root, "worktree", "add", "--detach", wt, "HEAD"], { stdio: "ignore" });
@@ -161,5 +164,6 @@ await t("**GATE_OWNERS_PER_PR is read once and UNSET before the gate starts anyt
   assert.ok(uses >= 3, `the scan found ${uses} mentions: it read nothing`);
 });
 
+rmSync(ADMIT_DIR, { recursive: true, force: true });
 if (failures) { process.stdout.write(`gate-pr: ${failures} FAILED\n`); process.exit(1); }
 process.stdout.write("gate-pr: all ok\n");
