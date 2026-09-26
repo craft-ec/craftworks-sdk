@@ -21,7 +21,7 @@ fn at_sign(path: PutPath) -> (Page, u64, u32) {
             match op {
                 Op::ReadHead { label: page::Label::Head } => p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(now)),
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now)),
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(now)),
                 Op::Sign { id, .. } => return (p, now, id),
                 other => panic!("unexpected before the sign: {other:?}"),
             }
@@ -132,9 +132,10 @@ fn a_held_absent_is_asked_again_and_re_put_only_after_several() {
                     blocks.insert(id);
                     p.answer(Answer::PutOk(id), Ms(now));
                 }
-                Op::AskHeld { id } => {
-                    asks += 1;
-                    p.answer(Answer::Held { id, present: false }, Ms(now));
+                // Asks counted per BLOCK asked (sdk#455: many ride one op).
+                Op::AskHeld { batch, ids } => {
+                    asks += ids.len();
+                    p.answer(Answer::Held { batch, present: vec![false; ids.len()] }, Ms(now));
                 }
                 other => common::unanswered_op(&other),
             }
@@ -203,7 +204,7 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
         for op in p.take_ops() {
             match op {
                 Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(now + 3)),
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(now + 3)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(now + 3)),
                 Op::Sign { id, prev_seq, prev_root, .. } => {
                     assert_eq!((prev_seq, prev_root), (theirs.seq, theirs.root), "not built on the adopted head");
                     id2 = Some(id);

@@ -13,7 +13,7 @@
 //! | `ReadHead` | GET **with subscribe** of the head Register: on a peered node a delegate-created register is not served to a bare GET (F55), and the subscription is how a head move reaches the page |
 //! | `Update { state }` | the first head this page has never seen a register for → PUT of the Register contract (it CREATES it); after that, UPDATE |
 //! | `Sign { id, .. }` | `wire::signer::frame_sign` under the request's own id (SG02) |
-//! | `AskHeld { id }` | `wire::signer::frame_held` of the block's contract |
+//! | `AskHeld { batch, ids }` | ONE `wire::signer::frame_held` of the blocks' contracts (1..=MAX_HELD, sdk#455) |
 //!
 //! | answer | becomes |
 //! |---|---|
@@ -200,8 +200,8 @@ pub struct PageIo {
     /// names the key).
     by_contract: BTreeMap<[u8; 32], Cid>,
     by_key: BTreeMap<String, Cid>,
-    /// `Held` asks in flight, by signer request id: the blocks, in order.
-    held: BTreeMap<u32, Vec<Cid>>,
+    /// `Held` asks in flight, by signer request id: the page's batch it answers (the ids are the batch's op's, sdk#455).
+    held: BTreeMap<u32, u32>,
     next_held_id: u32,
     frames: wire::Reassembler,
     stream: u32,
@@ -1018,9 +1018,10 @@ impl PageIo {
                             }
                         }
                         Some((id, signer_proto::Answer::Held { present })) => {
-                            let asked = self.held.remove(&id).unwrap_or_default();
-                            for (cid, p) in asked.into_iter().zip(present) {
-                                self.server.node(Answer::Held { id: cid, present: p }, now);
+                            // As the signer said it: `present[i]` answers the op's `ids[i]`; a short one is the page's
+                            // to see (sdk#455). An answer to no batch of ours is not ours.
+                            if let Some(batch) = self.held.remove(&id) {
+                                self.server.node(Answer::Held { batch, present }, now);
                             }
                         }
                         Some((id, answer)) => self.server.node(Answer::Signer { id, answer }, now),
@@ -1199,8 +1200,8 @@ impl PageIo {
             }
             if self.read_only() {
                 match op {
-                    Op::AskHeld { id } => {
-                        not_held.push(id);
+                    Op::AskHeld { batch, ids } => {
+                        not_held.push((batch, ids.len()));
                         continue;
                     }
                     // A view's page makes no commit op; one that arrives is
@@ -1305,11 +1306,13 @@ impl PageIo {
                     Some((c, st)) => wire::frame_put(c.clone(), st.clone(), stream),
                     None => Err(format!("an app PUT of {key}, whose contract this page does not hold")),
                 },
-                Op::AskHeld { id } => {
+                // ONE `Held` request of every id's contract, in the op's order (sdk#455).
+                Op::AskHeld { batch, ids } => {
                     let hid = self.next_held_id;
                     self.next_held_id = self.next_held_id.wrapping_add(1).max(1 << 31);
-                    self.held.insert(hid, vec![id]);
-                    wire::signer::frame_held(&self.art.signer, hid, vec![wire::block::contract_for(&self.art.block_code, &id)], stream)
+                    self.held.insert(hid, batch);
+                    let contracts = ids.iter().map(|id| wire::block::contract_for(&self.art.block_code, id)).collect();
+                    wire::signer::frame_held(&self.art.signer, hid, contracts, stream)
                 }
             };
             match framed {
@@ -1320,8 +1323,8 @@ impl PageIo {
         if !not_held.is_empty() || !not_sent.is_empty() || no_head {
             // THE PAGE'S clock: page-io keeps no copy of it (one owner; a copy with another origin was sdk#397).
             let now = self.server.page.now();
-            for id in not_held {
-                self.server.node(Answer::Held { id, present: false }, now);
+            for (batch, n) in not_held {
+                self.server.node(Answer::Held { batch, present: vec![false; n] }, now);
             }
             for (op, why) in not_sent {
                 // An app's PUT has its refusal already (`AppPutRefused`); the
@@ -1357,3 +1360,71 @@ fn op_name(op: &Op) -> &'static str {
 }
 
 use core_types::hex::encode as hex;
+
+/// THE BATCHED `Held` ON THE WIRE (sdk#455), through `pump` (rule 5: the one place an op is framed). Batching is per
+/// page STEP: the asks one step makes go as ONE signer `Held` request of every id's contract, in the op's order, and
+/// its answer reaches the page under the op's batch.
+#[cfg(test)]
+mod held_batch {
+    use super::*;
+    use freenet_stdlib::client_api::{ClientError, ClientRequest, DelegateRequest, HostResponse};
+    use freenet_stdlib::prelude::{ApplicationMessage, InboundDelegateMsg, OutboundDelegateMsg};
+
+    fn io() -> PageIo {
+        let (_, signer) = wire::delegate_from_code(b"held batch signer code");
+        let mut io = PageIo::new(
+            page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Wrapper, Ms(0)), page::server::SignerFacts { head_writable: true, head_id: [0; 32] }),
+            Artefacts { block_code: b"held batch block code".to_vec(), register_code: b"held batch register code".to_vec(), register_params: wire::register_params(&[1u8; 32], wire::HEAD_NAME), signer },
+        );
+        io.signer_provisioned();
+        io
+    }
+
+    /// The signer `Held` requests in page-io's frames, as the node reads them: (signer id, contracts).
+    fn helds_of(frames: &[Vec<u8>]) -> Vec<(u32, Vec<[u8; 32]>)> {
+        let mut out = Vec::new();
+        for f in frames {
+            let Ok(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages { inbound, .. })) = bincode::deserialize::<ClientRequest>(f) else { continue };
+            for m in inbound {
+                if let InboundDelegateMsg::ApplicationMessage(am) = m {
+                    if let Some((id, signer_proto::Request::Held { contracts })) = signer_proto::decode_request(&am.payload) {
+                        out.push((id, contracts));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The signer's `Held` answer, as a node delivers it.
+    fn held_answer(io: &PageIo, hid: u32, present: Vec<bool>) -> Vec<u8> {
+        let answer = signer_proto::encode_answer(hid, &signer_proto::Answer::Held { present });
+        bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse {
+            key: io.art.signer.clone(),
+            values: vec![OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(answer))],
+        }))
+        .expect("encodes")
+    }
+
+    #[test]
+    fn the_asks_of_one_page_step_are_one_held_request_of_every_id() {
+        let mut io = io();
+        let ids: Vec<Cid> = (0..signer_proto::MAX_HELD).map(|i| { let mut c = [0u8; 32]; c[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes()); c }).collect();
+        // 128 PUT answers in ONE page step (the page's own `answer`, no flush between them): each asks Held
+        // (a wrapper-path PutOk), and the asks leave together when page-io pumps.
+        for id in &ids {
+            io.server.page.answer(Answer::PutOk(*id), Ms(1));
+        }
+        io.pump();
+        let batch = helds_of(&io.take_frames());
+        println!("{} ids asked in one step: {} Held request(s) of {:?} contract(s)", ids.len(), batch.len(), batch.iter().map(|(_, c)| c.len()).collect::<Vec<_>>());
+        assert_eq!(batch.len(), 1, "the asks of one step were not ONE Held request");
+        let want: Vec<[u8; 32]> = ids.iter().map(|id| wire::block::contract_for(&io.art.block_code, id)).collect();
+        assert_eq!(batch[0].1, want, "the one request does not carry every id's contract in the op's order");
+        // Its answer reaches the page under the op's batch, mapped by id: all present, every block confirmed.
+        let bytes = held_answer(&io, batch[0].0, vec![true; ids.len()]);
+        assert!(io.inbound(&bytes, Ms(2)), "the signer's Held answer was not taken");
+        assert!(io.held.is_empty(), "the answered batch is still mapped");
+        assert!(!io.server.page.waiting(), "a block of the answered batch is still owed an ask");
+    }
+}
