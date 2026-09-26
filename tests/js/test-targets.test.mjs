@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addedTests, silentTargets, targetsRun, unranTests } from "../../tools/test-targets.mjs";
+import { addedTests, addedWasmTests, ignoredTests, silentTargets, targetsRun, unranTests } from "../../tools/test-targets.mjs";
 
 let failures = 0;
 const t = (name, fn) => {
@@ -106,6 +106,19 @@ t("**an added test cargo never listed is UNRAN**; ok / FAILED / ignored and path
   assert.deepEqual(u, [{ file: "web/src/keep.rs", name: "shapes" }]);
   // THE CONTROL: the same test listed as run is not flagged.
   assert.deepEqual(unranTests(diff, `${WEB_OUT}\ntest keep::t::shapes ... ok\n`), []);
+});
+
+t("**an added test cargo lists as IGNORED is named** (it executes nothing); control: one that ran is not", () => {
+  const diff = ["+++ b/web/tests/node_path_rules.rs", "@@", "+#[test]", "+#[ignore]", "+fn nested_case() {}", "+#[test]", "+fn the_rules_hold() {}"].join("\n");
+  assert.deepEqual(unranTests(diff, WEB_OUT), [], "an ignored test is listed, so it is not unran");
+  assert.deepEqual(ignoredTests(diff, WEB_OUT), [{ file: "web/tests/node_path_rules.rs", name: "nested_case" }]);
+});
+
+t("**an added #[wasm_bindgen_test] fails: no runner** (#475's class); control: a native #[test] is not one", () => {
+  const diff = (attr) => `+++ b/web/src/a.rs\n@@\n+${attr}\n+fn in_browser() {}\n`;
+  assert.deepEqual(addedWasmTests(diff("#[wasm_bindgen_test]")), [{ file: "web/src/a.rs", name: "in_browser" }]);
+  assert.equal(addedWasmTests(diff("#[wasm_bindgen_test::wasm_bindgen_test]")).length, 1);
+  assert.deepEqual(addedWasmTests(diff("#[test]")), [], "THE CONTROL");
 });
 
 if (failures) { process.stdout.write(`test-targets: ${failures} FAILED\n`); process.exit(1); }
