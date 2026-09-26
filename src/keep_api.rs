@@ -151,7 +151,7 @@ pub fn write_back(existing: Option<Keep>, own: bool, r: &Report) -> Option<Keep>
         return None;
     }
     let now_s = r.finished_at / 1000;
-    let base = existing.unwrap_or(if own { Keep::OWN_DEFAULT } else { Keep::APP_DEFAULT });
+    let base = record_or_default(existing, own);
     let n = |x: usize| u32::try_from(x).unwrap_or(u32::MAX);
     Some(Keep { audited_at: now_s, health: Counts { groups: n(r.groups), whole: n(r.whole), degraded: n(r.degraded), damaged: n(r.damaged.len()) }, ..base })
 }
@@ -178,12 +178,17 @@ pub enum SetRefused {
     BadPolicy(String),
 }
 
+/// An asset's record, or -- when it has none -- its default: the own tree's, or an app's. The ONE place that choice
+/// is made (the record writes and the policy the tab reads all start from it).
+pub fn record_or_default(existing: Option<Keep>, own: bool) -> Keep {
+    existing.unwrap_or(if own { Keep::OWN_DEFAULT } else { Keep::APP_DEFAULT })
+}
+
 /// `keepSet`'s decision once the address is parsed (the parser is page-io's, `site_id_of_address`): the target's
 /// record, or its default when it has none (the OWN tree's own default, an app's the app default), with the edit
 /// applied. A bad edit is `BAD_POLICY` by name, and nothing is written.
 pub fn set_policy(own: &[u8; 32], target: &[u8; 32], existing: Option<Keep>, policy: &str) -> Result<Keep, SetRefused> {
-    let base = existing.unwrap_or(if target == own { Keep::OWN_DEFAULT } else { Keep::APP_DEFAULT });
-    apply_policy(base, policy).map_err(SetRefused::BadPolicy)
+    apply_policy(record_or_default(existing, target == own), policy).map_err(SetRefused::BadPolicy)
 }
 
 /// The FULL pass's write-back from its report AS THE TAB READ IT (`report_json`'s shape, the golden contract): a
@@ -197,7 +202,7 @@ pub fn write_back_json(existing: Option<Keep>, own: bool, report: &Value) -> Opt
     let n = |k: &str| report.get(k).and_then(Value::as_u64).and_then(|x| u32::try_from(x).ok());
     let damaged = u32::try_from(report.get("damaged")?.as_array()?.len()).ok()?;
     let finished_at = report.get("finished_at").and_then(Value::as_u64)?;
-    let base = existing.unwrap_or(if own { Keep::OWN_DEFAULT } else { Keep::APP_DEFAULT });
+    let base = record_or_default(existing, own);
     Some(Keep { audited_at: finished_at / 1000, health: Counts { groups: n("groups")?, whole: n("whole")?, degraded: n("degraded")?, damaged }, ..base })
 }
 

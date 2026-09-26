@@ -64,6 +64,9 @@ pub struct Session {
     provision_told: bool,
     /// The loader's recording, until this session's first page takes it (`adopt_loader`).
     loader: Option<page::loader::Segment>,
+    /// This page's last FINISHED audit pass (sdk#472): the page hands its report over ONCE (`take_audit`), and from
+    /// then on it is this session's, read by `keep_report` until the next pass starts (one owner at a time).
+    audit_report: Option<page::audit::Report>,
     /// THE APP this session is (the forest ruling): a person has ONE tree,
     /// divided by app. Every domain name crossing into this session is
     /// app-relative and gains `<app>.` here, so an app has no name for
@@ -110,6 +113,7 @@ impl Session {
             page_identity_sent: false,
             provision_told: false,
             loader: None,
+            audit_report: None,
         })
     }
 
@@ -817,6 +821,109 @@ impl Session {
         }
     }
 
+    /// [`Session::not_answering`] for one LANE by its name (`"interactive"`, `"background"`: `keep_api::lane_name`,
+    /// the one list): the Assets tab's "not answering the audit for N s" is the background lane's (sdk#472).
+    pub fn not_answering_in(&self, lane: &str) -> Result<String, JsValue> {
+        let lane = craftworks_sdk::keep_api::lane_of(lane).ok_or_else(|| JsValue::from_str(&format!("not_answering_in: no lane is named {lane:?} (interactive, background)")))?;
+        Ok(match self.page().and_then(|p| p.server.page.not_answering_in(lane)) {
+            Some((what, ms)) => serde_json::json!({ "what": what, "ms": ms }).to_string(),
+            None => "null".into(),
+        })
+    }
+
+    // THE KEEP API (sdk#472; KEEPER.md §1-§5). Every answer's shape is `craftworks_sdk::keep_api`'s (native, tested
+    // there); these are only its wasm names. A pass runs on the page of the asset's own tree (`Page::audit`: a kept
+    // app's is its `tree()` reader's session), so the pass calls act on THIS session's page and JS routes a target to
+    // its session; the records live in the OWN tree, so the record calls act on the own session.
+
+    /// `keepAssets()`: the own tree first, then every `keep` record; targets named by their site text.
+    pub fn keep_assets(&mut self) -> Result<String, JsValue> {
+        let own = self.own_register()?;
+        let r = self.db.keep_list();
+        let records = self.decided(r)?;
+        json_of(craftworks_sdk::keep_api::assets_json(&own, &records, page_io::site_text))
+    }
+
+    /// `keepSet(address, policy)`: THE ONE WRITE of a record's policy. The address is read by page-io's one parser
+    /// (`site_id_of_address`); a bad address or policy is refused by name and nothing is written.
+    pub fn keep_set(&mut self, address: &str, policy: &str) -> Result<String, JsValue> {
+        use craftworks_sdk::keep_api::{set_answer, set_policy, SetRefused};
+        let own = self.own_register()?;
+        let target = match page_io::site_id_of_address(address) {
+            Ok(t) => t,
+            Err(why) => return json_of(set_answer(Err(SetRefused::BadAddress(format!("{why:?}"))))),
+        };
+        self.writable()?;
+        let r = self.db.keep_get(&target);
+        let existing = self.decided(r)?;
+        let keep = match set_policy(&own, &target, existing, policy) {
+            Ok(k) => k,
+            Err(refused) => return json_of(set_answer(Err(refused))),
+        };
+        let r = self.db.keep_set(&target, &keep);
+        self.decided(r)?;
+        json_of(set_answer(Ok(())))
+    }
+
+    /// The `target`'s `warn_below` (its record's, or its default's): what `keep_report` on the asset's session takes.
+    pub fn keep_warn_below(&mut self, target: &str) -> Result<u8, JsValue> {
+        let own = self.own_register()?;
+        let target = page_io::site_id_of_address(target).map_err(|why| JsValue::from_str(&format!("keep_warn_below: the target {target:?} is not a site id ({why:?})")))?;
+        let r = self.db.keep_get(&target);
+        let existing = self.decided(r)?;
+        Ok(craftworks_sdk::keep_api::record_or_default(existing, target == own).warn_below)
+    }
+
+    /// A FULL pass's write-back into the `target`'s record (the own session's), from the report as the tab read it
+    /// (`keep_take_audit`'s answer on the asset's session). `false`: nothing to write (not a `done` pass).
+    pub fn keep_write_back(&mut self, target: &str, report: &str) -> Result<bool, JsValue> {
+        let own = self.own_register()?;
+        let target = page_io::site_id_of_address(target).map_err(|why| JsValue::from_str(&format!("keep_write_back: the target {target:?} is not a site id ({why:?})")))?;
+        let report: serde_json::Value = serde_json::from_str(report).map_err(|e| JsValue::from_str(&format!("keep_write_back: the report is not JSON: {e}")))?;
+        let r = self.db.keep_get(&target);
+        let existing = self.decided(r)?;
+        let Some(keep) = craftworks_sdk::keep_api::write_back_json(existing, target == own, &report) else { return Ok(false) };
+        self.writable()?;
+        let r = self.db.keep_set(&target, &keep);
+        self.decided(r)?;
+        Ok(true)
+    }
+
+    /// Start a FULL pass on THIS session's page (the driver's `audit`); the frames leave with the next pump.
+    pub fn keep_audit(&mut self) {
+        self.audit_report = None;
+        if let Some(p) = self.page_mut() {
+            p.server.page.audit();
+        }
+        self.pump_page();
+    }
+
+    /// The driver's `auditProgress`: `{"asked","of"}` while a pass runs on this page, else `null`.
+    pub fn keep_progress(&self) -> String {
+        match self.page().and_then(|p| p.server.page.audit_progress()) {
+            Some((asked, of)) => serde_json::json!({ "asked": asked, "of": of }).to_string(),
+            None => "null".into(),
+        }
+    }
+
+    /// The driver's `takeAudit`: this page's finished pass, handed over ONCE and kept here for `keep_report`; its
+    /// answer is the report as the tab reads it (what `keep_write_back` takes), or `null`. `warn_below` as for
+    /// `keep_report`.
+    pub fn keep_take_audit(&mut self, warn_below: u8) -> String {
+        if let Some(r) = self.page_mut().and_then(|p| p.server.page.take_audit()) {
+            self.audit_report = Some(r);
+        }
+        self.keep_report(warn_below)
+    }
+
+    /// `keepReport`: the pass running on this page, or its last finished one, or `null`; `warn_below` is the asset's
+    /// policy's (its record is the own session's).
+    pub fn keep_report(&self, warn_below: u8) -> String {
+        let policy = craftworks_sdk::keep::Keep { warn_below, ..craftworks_sdk::keep::Keep::APP_DEFAULT };
+        let progress = self.page().and_then(|p| p.server.page.audit_progress());
+        craftworks_sdk::keep_api::report_json(self.audit_report.as_ref(), progress, &policy).to_string()
+    }
+
     /// Where the PUT of `key` (`put_contract`'s return) stands, as JSON:
     /// `{"state":"none"|"pending"|"put"|"refused"|"cancelled","said":"…"}`.
     /// It ends only on an answer (rule 8: no budget): `put` the node's ack,
@@ -1438,6 +1545,15 @@ impl Session {
     /// (`can_write("")`), before it reaches the store. An asked session's
     /// first write opens the user's own tree (`open_own`): the head is
     /// created on first write.
+    /// The own tree's Register: the target a record of the identity's own tree is kept under. Not named until
+    /// `Identity` has opened the page: a keep call before then waits, as a write does.
+    fn own_register(&self) -> Result<[u8; 32], JsValue> {
+        match self.page().map(|p| p.register_id()) {
+            Some(id) if id != [0u8; 32] => Ok(id),
+            _ => Err(db_err(&DbError::NotDecided("the identity's own tree is not open yet".into()))),
+        }
+    }
+
     fn writable(&mut self) -> Result<(), JsValue> {
         self.claim_own();
         match self.may_write("") {

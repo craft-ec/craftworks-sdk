@@ -219,6 +219,8 @@ export async function openSession(Session, {
   // frame is whose is decided in Rust (`on_inbound`).
   let lastBatch = [];
   const members = () => [session, ...[...trees].map(t => t.session)];
+  // Is `target` the identity's own tree? The SDK's answer (keepAssets' `identity` entry), never a second derivation.
+  const keepIsOwn = target => JSON.parse(session.keep_assets()).some(a => a.kind === "identity" && a.target === target);
   const socketEngine = {
     outbound() {
       lastBatch = [];
@@ -514,16 +516,28 @@ export async function openSession(Session, {
     // door: every answer is the wasm's JSON, parsed; nothing here derives a health, a warning or a list.
     /** The assets this identity keeps: its own tree + every keep record (KEEPER §2), each with its policy and last full pass. */
     keepAssets: () => JSON.parse(session.keep_assets()),
-    /** The live pass on `target`, or null when none ran this session: progress (`asked`/`of`), the counts, `health`. */
-    keepReport: target => JSON.parse(session.keep_report(target)),
+    /**
+     * The pass on `target`: running (`asked`/`of`), its last finished report, or null. A pass runs on the page of the
+     * asset's own TREE: the identity's own tree is this session's page. An app is audited by its PIECES (KEEPER §2),
+     * which no page stands on and which is not built yet, so an app's report is null.
+     */
+    keepReport: target => (keepIsOwn(target) ? JSON.parse(session.keep_report(session.keep_warn_below(target))) : null),
     /**
      * THE ONE WRITE of a keep record's policy -- editing a policy and "keep this" alike. `address` as the person typed
      * it: the SDK parses it (its one address parser) and refuses an unreadable one by name. `{ ok: true }` or
-     * `{ refused: "BAD_ADDRESS", said }`.
+     * `{ refused: "BAD_ADDRESS" | "BAD_POLICY", said }`.
      */
     keepSet: (address, policy) => JSON.parse(session.keep_set(address, JSON.stringify(policy))),
-    /** Start a FULL pass on `target`; its progress is `keepReport(target)`. */
-    keepAudit: target => session.keep_audit(target),
+    /**
+     * Start a FULL pass on `target`; its progress is `keepReport(target)`. `{ ok: true }`, or `{ refused:
+     * "NOT_AUDITABLE", said }` for an app (its pieces audit is not built). Until the tab's driver (js/keep-driver.js)
+     * is wired, this starts the own tree's pass directly: one asset, so the tab's one slot holds by itself.
+     */
+    keepAudit: target => {
+      if (!keepIsOwn(target)) return { refused: "NOT_AUDITABLE", said: "an app is audited by its pieces (k + m), and the pieces audit is not built yet (KEEPER §2)" };
+      session.keep_audit();
+      return { ok: true };
+    },
     /// Ship what is waiting, now. Wired to the page lifecycle above; exposed
     /// because an app that knows it is finishing can say so sooner.
     flush,
