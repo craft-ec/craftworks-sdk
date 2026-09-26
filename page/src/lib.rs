@@ -3254,6 +3254,24 @@ mod deadline_table {
         assert_eq!(p.deadlines[&Waiting::Put([3; 32])].at, at3.min(T0 + 40 + queued_wait(p.rto.rto_ms(), 0)), "the next answer did not re-arm put 3 at its place now");
     }
 
+    /// **withdraw × queued:** a QUEUED op withdrawn: its deadline ends, nothing is sent, the RTO stands, and the op
+    /// behind it keeps its deadline -- the node still holds the withdrawn request ahead of it. Mutant "a withdrawal
+    /// re-arms" -> red.
+    #[test]
+    fn a_withdrawn_queued_op_moves_nothing_behind_it() {
+        let mut p = page();
+        for i in 1..=3u8 {
+            put(&mut p, i);
+        }
+        let _ = p.take_ops();
+        assert!(!p.deadlines[&Waiting::Put([2; 32])].alone, "THE SETUP: put 2 is not queued");
+        let (rto, at3) = (p.rto.rto_ms(), p.deadlines[&Waiting::Put([3; 32])].at);
+        p.now = T0 + 20;
+        p.carry_out(vec![Effect::Withdraw { id: [2; 32] }]);
+        assert!(!p.deadlines.contains_key(&Waiting::Put([2; 32])) && p.take_ops().is_empty(), "the queued PUT was not withdrawn quietly");
+        assert_eq!((p.rto.rto_ms(), p.deadlines[&Waiting::Put([3; 32])].at), (rto, at3), "withdrawing a queued op moved the RTO or the op behind it");
+    }
+
     /// **withdraw × re-send:** the same end for an op on its second attempt: no sample, no back-off change.
     #[test]
     fn a_withdrawn_re_send_ends_with_no_clock_change() {
