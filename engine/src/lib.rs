@@ -3811,7 +3811,15 @@ impl<B: Blocks> Engine<B> {
         c.settle_rounds += 1;
         // The parity held back behind the Sign (#378 P1-hybrid) is not re-put ahead of it: until the head lands it
         // was never sent, and after, the commit is Backing and a straggler is re-put like any block.
-        let missing: BTreeSet<Cid> = c.data.difference(&c.confirmed).filter(|id| !c.deferred.iter().any(|(d, _)| d == *id)).copied().collect();
+        // A block the node's contract REJECTED (sdk#433) is never put again, the head sent or not (the architect's gap:
+        // on_rejected ends the commit only before the head; after it the block stays in `data`, unconfirmed).
+        let rejected = &self.rejected;
+        let missing: BTreeSet<Cid> = c
+            .data
+            .difference(&c.confirmed)
+            .filter(|id| !c.deferred.iter().any(|(d, _)| d == *id) && !rejected.contains(*id))
+            .copied()
+            .collect();
         if missing.is_empty() || c.ready(self.params.race_put, &unacked) {
             if c.head_sent {
                 out.push(Effect::ReadHead {
