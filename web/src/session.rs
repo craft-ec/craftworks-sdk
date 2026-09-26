@@ -659,7 +659,8 @@ impl Session {
     /// person's act. It ends only on an answer or a cancel (rule 8). `said` is display only.
     pub fn site_status(&self, app: &str) -> String {
         use page::Publication as P;
-        let (state, version, said) = match self.page().and_then(|p| p.publication(app)) {
+        let publication = self.page().and_then(|p| p.publication(app));
+        let (state, version, said) = match &publication {
             None => ("none", 0, ""),
             Some(P::Publishing { waiting_for }) => ("publishing", 0, waiting_for.unwrap_or("")),
             Some(P::Published { version }) => ("published", *version, ""),

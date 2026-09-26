@@ -274,7 +274,6 @@ impl Life {
 
     /// The head's table. `None`: the state stays as it is.
     fn head(&self, ev: Ev<'_>, cx: &Cx, acts: &mut Vec<Act>) -> Option<Life> {
-        let now = cx.now;
         match ev {
             // E1: a newer commit's head replaces the owed one (P1, ³): its waits end with it.
             Ev::Owe(owed) => {
@@ -283,18 +282,7 @@ impl Life {
             }
             Ev::Publish(_) | Ev::SiteRead(_) | Ev::Cancel | Ev::NodeRefused(_) => None, // a site's events: never the head's
             Ev::Signer(s) => self.head_signer(s, cx, acts),
-            Ev::Updated => match self {
-                Life::Written { .. } => {
-                    acts.push(Act::Read(ReadWait::ReadBack));
-                    None
-                }
-                // A LANDING's UPDATE is judged by its own read, never by a commit's read-back.
-                Life::Landing { .. } => {
-                    acts.push(Act::Read(ReadWait::Verify));
-                    None
-                }
-                Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Ended(_) => None,
-            },
+            Ev::Updated => self.updated(acts),
             Ev::UpdateResent => match self {
                 Life::Landing { owed, named, from, updates, tries } => {
                     acts.push(Act::LandingUpdates(updates + 1));
@@ -302,24 +290,7 @@ impl Life {
                 }
                 Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => None,
             },
-            Ev::SignLost => match self {
-                Life::Signing { owed, .. } => {
-                    Self::sign(owed, acts);
-                    None
-                }
-                Life::Landing { named, from: Some((prev_seq, prev_root)), .. } => {
-                    acts.push(Act::Sign { prev_seq: *prev_seq, prev_root: *prev_root, seq: prev_seq + 1, root: named.1 });
-                    None
-                }
-                Life::Landing { from: None, .. }
-                | Life::Idle
-                | Life::Reading { .. }
-                | Life::BackingOff { .. }
-                | Life::OldSigner { .. }
-                | Life::Written { .. }
-                | Life::Verifying { .. }
-                | Life::Ended(_) => None,
-            },
+            Ev::SignLost => self.sign_lost(acts),
             Ev::Read { from, j, confirms } => self.head_read(from, j, confirms, cx, acts),
             // ⁴: the register moved past the old signer's fork: it signs again.
             Ev::HeadSeen(seq) => match self {
@@ -334,30 +305,7 @@ impl Life {
                 | Life::Landing { .. }
                 | Life::Ended(_) => None,
             },
-            Ev::Due => match self {
-                Life::BackingOff { owed, at, refusals, why } if *at <= now => {
-                    Self::sign(owed, acts);
-                    Some(Life::Signing { owed: *owed, refusals: *refusals, why: Some(why.clone()) })
-                }
-                Life::Verifying { owed, named, tries, at: Some(at) } if *at <= now => {
-                    acts.push(Act::Read(ReadWait::Verify));
-                    Some(Life::Verifying { owed: *owed, named: *named, tries: *tries, at: None })
-                }
-                // A written record read stale is read again at the tick (no read-back on the wire).
-                Life::Written { stale, .. } if *stale > 0 => {
-                    acts.push(Act::ReadIfIdle(ReadWait::ReadBack));
-                    None
-                }
-                Life::BackingOff { .. }
-                | Life::Verifying { .. }
-                | Life::Written { .. }
-                | Life::Idle
-                | Life::Reading { .. }
-                | Life::Signing { .. }
-                | Life::OldSigner { .. }
-                | Life::Landing { .. }
-                | Life::Ended(_) => None,
-            },
+            Ev::Due => self.due(cx, acts),
             // E11: a head whose seq the engine published, or whose base it no longer stands on, is dead.
             Ev::Dead => match self.owed() {
                 Some(o) if o.seq <= cx.published.0 || (o.seq - 1, o.base) != cx.published => {
@@ -366,6 +314,52 @@ impl Life {
                 }
                 Some(_) | None => None,
             },
+        }
+    }
+
+    // ---- Cells the head's and a site's tables share: a site is never in a head-only state (Verifying, Landing,
+    // OldSigner), so one function serves both.
+
+    /// The UPDATE's answer: a written record is read back; a LANDING's UPDATE is judged by its own read, never by a
+    /// commit's read-back.
+    fn updated(&self, acts: &mut Vec<Act>) -> Option<Life> {
+        match self {
+            Life::Written { .. } => acts.push(Act::Read(ReadWait::ReadBack)),
+            Life::Landing { .. } => acts.push(Act::Read(ReadWait::Verify)),
+            Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Ended(_) => {}
+        }
+        None
+    }
+
+    /// A lost Sign, rebuilt under a fresh id from the state: the commit's (or site's) own, or the landing's.
+    fn sign_lost(&self, acts: &mut Vec<Act>) -> Option<Life> {
+        match self {
+            Life::Signing { owed, .. } => Self::sign(owed, acts),
+            Life::Landing { named, from: Some((prev_seq, prev_root)), .. } => {
+                acts.push(Act::Sign { prev_seq: *prev_seq, prev_root: *prev_root, seq: prev_seq + 1, root: named.1 })
+            }
+            Life::Landing { from: None, .. } | Life::Idle | Life::Reading { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => {}
+        }
+        None
+    }
+
+    /// E10: a backoff come due signs again; a verify come due reads; a written record read stale reads again (no
+    /// read-back on the wire).
+    fn due(&self, cx: &Cx, acts: &mut Vec<Act>) -> Option<Life> {
+        match self {
+            Life::BackingOff { owed, at, refusals, why } if *at <= cx.now => {
+                Self::sign(owed, acts);
+                Some(Life::Signing { owed: *owed, refusals: *refusals, why: Some(why.clone()) })
+            }
+            Life::Verifying { owed, named, tries, at: Some(at) } if *at <= cx.now => {
+                acts.push(Act::Read(ReadWait::Verify));
+                Some(Life::Verifying { owed: *owed, named: *named, tries: *tries, at: None })
+            }
+            Life::Written { stale, .. } if *stale > 0 => {
+                acts.push(Act::ReadIfIdle(ReadWait::ReadBack));
+                None
+            }
+            Life::BackingOff { .. } | Life::Verifying { .. } | Life::Written { .. } | Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::OldSigner { .. } | Life::Landing { .. } | Life::Ended(_) => None,
         }
     }
 
@@ -586,32 +580,10 @@ impl Life {
             }
             Ev::Owe(_) | Ev::Read { .. } | Ev::HeadSeen(_) | Ev::Dead | Ev::UpdateResent => None, // the head's events
             Ev::Signer(s) => self.site_signer(s, cx, acts),
-            Ev::Updated => match self {
-                Life::Written { .. } => {
-                    acts.push(Act::Read(ReadWait::ReadBack));
-                    None
-                }
-                Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => None,
-            },
-            Ev::SignLost => match self {
-                Life::Signing { owed, .. } => {
-                    Self::sign(owed, acts);
-                    None
-                }
-                Life::Idle | Life::Reading { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => None,
-            },
+            Ev::Updated => self.updated(acts),
+            Ev::SignLost => self.sign_lost(acts),
             Ev::SiteRead(read) => self.site_read(read, acts),
-            Ev::Due => match self {
-                Life::BackingOff { owed, at, refusals, why } if *at <= cx.now => {
-                    Self::sign(owed, acts);
-                    Some(Life::Signing { owed: *owed, refusals: *refusals, why: Some(why.clone()) })
-                }
-                Life::Written { stale, .. } if *stale > 0 => {
-                    acts.push(Act::ReadIfIdle(ReadWait::ReadBack));
-                    None
-                }
-                Life::BackingOff { .. } | Life::Written { .. } | Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => None,
-            },
+            Ev::Due => self.due(cx, acts),
             Ev::NodeRefused(why) => match self {
                 Life::Idle | Life::Ended(_) => None,
                 Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => {
