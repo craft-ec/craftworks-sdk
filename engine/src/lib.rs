@@ -805,6 +805,10 @@ pub struct Params {
     /// published. No count cap. Past it a session that already has a write
     /// queued is told `QueueFull` and its SDK waits for room.
     pub max_queue_bytes: usize,
+    /// The page's block store budget, in bytes (sdk#411; the architect: a Param, default 64 MiB). Past it, at the
+    /// end of a page step, the least recently used UNPINNED blocks are evicted ([`Engine::pinned`]). Pinned blocks
+    /// are outside it by construction. It bounds the PEAK: wasm memory never shrinks.
+    pub max_page_block_bytes: usize,
     /// Times a write whose commit died (a foreign move) goes again at the
     /// front before it falls `Lost` (COMMIT-LIFE footnote 5; the client's
     /// `WRITE_TRIES`, moved into the engine with go-back-N).
@@ -926,6 +930,7 @@ impl Default for Params {
             max_apply_rounds: 256,
             // 32 MiB: page memory, beside the warm blocks it makes.
             max_queue_bytes: 32 * 1024 * 1024,
+            max_page_block_bytes: 64 * 1024 * 1024,
             max_write_tries: 3,
             max_parked_reads: 1000,
             max_commit_blocks: 128,
@@ -998,6 +1003,37 @@ struct Repair {
     missed: bool,
     /// Slots a race dropped: asked again the moment it becomes a repair.
     dropped: BTreeSet<usize>,
+}
+
+/// Why a block's page copy may not be dropped (sdk#411's table): each names the code that needs the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pin {
+    /// W: a queued write's warm-apply block (`Effect::Keep`), in no commit yet -- the only copy.
+    Warm,
+    /// C: the pending commit's block, not yet acked: `on_failed` re-puts it FROM the store.
+    InFlight,
+    /// B: a published commit's block not yet acked (`backing.remaining`): the straggler's re-put reads the store.
+    Backing,
+    /// P: a parked read holds it (`Parked::held`) or waits on it (`reads.waiting`).
+    ParkedRead,
+    /// PW: the parked write's fetched path (`ParkedWrite::held`) or what it waits on.
+    ParkedWrite,
+    /// HF: a FOREIGN member of a group this page's commit changed, whose bytes this page holds and whose `Held` ask
+    /// (#402's ConfirmHeld) is still out: after `HELD_ABSENTS` the page re-puts it FROM THE STORE -- its self-heal
+    /// of another page's straggler (the architect, sdk#411). Released at `Held { present }` or when the ask ends.
+    HeldForeign,
+}
+
+/// The page's fact for [`Engine::pins`]: its warm-apply blocks (`Effect::Keep`).
+///
+/// One class the design proposed is NOT a pin (sdk#411, measured): R, a repaired block whose PUT is out -- its
+/// re-send carries its own bytes (`Op::Put`, `put_again`), no reader takes them from the store, so its "unpinned"
+/// mutant could never go red. H is kept only as HF (a foreign member with bytes and an ask out): for this page's
+/// own block C or B already pins it, and a foreign one with no bytes is simply asked again.
+pub struct PagePins<'a> {
+    pub kept: &'a BTreeSet<Cid>,
+    /// Ids with a `Held` ask out (a deadline or a backed-off re-ask): HF, for those this page holds bytes of.
+    pub held_asks: &'a BTreeSet<Cid>,
 }
 
 /// One of a merge's writes for [`Engine::merge_front`]: its id, ops and reads.
@@ -1085,6 +1121,17 @@ struct ParkedWrite {
     /// second count once.
     #[serde(default)]
     idle_at: u64,
+    /// Every block that has LANDED for this write while parked, PINNED until it leaves the park (sdk#411): its
+    /// re-apply walks the path it already fetched, and a block evicted from under it would be fetched again,
+    /// successfully, for ever -- the livelock `read::Parked::held` guards against, for a write.
+    ///
+    /// BOUNDED by construction, with no count cap of its own: it grows only by blocks fetched for this CHAIN,
+    /// which `max_gets_per_request` caps (the same bound as a read's `held`); a new chain (`on_ask`) clears it.
+    /// GONE ON EVERY EXIT, because it lives in the `ParkedWrite` and every exit drops that: applied
+    /// (`warm_apply`), ended in the queue (`end_queued`: Conflict, Failed, TooLarge, ...), its rounds spent
+    /// (`park_write`), idle past its bound (`Failed`), or no longer the first `Applying` write (a queue re-cut).
+    #[serde(default)]
+    held: BTreeSet<Cid>,
 }
 
 /// A commit in flight: one apply, one head bump.
@@ -1350,6 +1397,9 @@ pub struct Engine<B: Blocks> {
     backing: Vec<Backing>,
     /// Blocks the node's Block contract rejected (`Event::PutRejected`, sdk#433): never put again.
     rejected: BTreeSet<Cid>,
+    /// Re-puts that found the block's bytes GONE from the store (sdk#411): a commit or a straggler that can never be
+    /// put again. The pin rule's model property: always 0.
+    reput_missing: u64,
     /// Writes whose group a later root move RE-CODED (COMMIT-LIFE §P,
     /// superseded stragglers): their data now lives in the newer version of
     /// the group, so they wait for the NEXT own commit's `Backing`, which
@@ -1608,6 +1658,7 @@ impl<B: Blocks> Engine<B> {
             arrived: BTreeMap::new(),
             backing: Vec::new(),
             rejected: BTreeSet::new(),
+            reput_missing: 0,
             carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
@@ -2316,6 +2367,8 @@ impl<B: Blocks> Engine<B> {
         if let Some(p) = self.parked_write.as_mut() {
             if p.client == client && p.write_id == write_id {
                 p.gets = 0;
+                // A new chain holds only what IT fetches: `held` stays within one chain's GETs (sdk#411).
+                p.held.clear();
                 p.idle_ticks = 0;
                 if !p.needs.is_empty() {
                     // ITS ROUND IS STILL OUT -- and cannot be: the node runs
@@ -3479,6 +3532,7 @@ impl<B: Blocks> Engine<B> {
             .filter(|p| p.write_id == write_id)
             .map_or(0, |p| p.gets);
         let room = self.params.max_gets_per_request.saturating_sub(gets) as usize;
+        let held = self.parked_write.as_ref().filter(|p| p.write_id == write_id).map(|p| p.held.clone()).unwrap_or_default();
         let needs: BTreeSet<Cid> = need
             .iter()
             .copied()
@@ -3500,6 +3554,7 @@ impl<B: Blocks> Engine<B> {
             needs,
             idle_ticks: 0,
             idle_at: self.now,
+            held,
         });
         out
     }
@@ -3517,6 +3572,7 @@ impl<B: Blocks> Engine<B> {
         if !p.needs.remove(&id) {
             return Vec::new();
         }
+        p.held.insert(id);
         p.idle_ticks = 0;
         if !p.needs.is_empty() {
             // Still waiting on the rest of this round's blocks. Running now
@@ -4135,6 +4191,8 @@ impl<B: Blocks> Engine<B> {
             if let Some(bytes) = self.blocks.get(&id) {
                 return vec![Effect::PutBlock { id, bytes: bytes.to_vec(), after: Vec::new() }];
             }
+            // Its bytes are gone: the straggler can never be put again (sdk#411's B pin exists to make this 0).
+            self.reput_missing += 1;
             return Vec::new();
         }
         // Re-emit exactly what is missing, and nothing else. A retry that
@@ -4164,6 +4222,8 @@ impl<B: Blocks> Engine<B> {
                 after: Vec::new(),
             }];
         }
+        // Its bytes are gone: the commit waits for ever on it (sdk#411's C pin exists to make this 0).
+        self.reput_missing += 1;
         Vec::new()
     }
 
@@ -5006,6 +5066,73 @@ impl<B: Blocks> Engine<B> {
     /// The block source this engine reads through.
     pub fn blocks(&self) -> &B {
         &self.blocks
+    }
+
+    /// The block store, to add to or evict from BETWEEN steps (sdk#411): the engine holds no borrow of it across
+    /// calls, and with an owned store that is the borrow checker's fact, not a comment's.
+    /// Re-puts that found their block's bytes gone from the store (sdk#411): always 0 when the pin rule holds.
+    pub fn reput_missing(&self) -> u64 {
+        self.reput_missing
+    }
+
+    /// The parked write's owner is LIVE: it is still the first `Applying` write in the queue (sdk#411, the
+    /// architect's twin property "no pin outlives its owner": `ParkedWrite::held` pins only while this holds).
+    pub fn parked_write_is_live(&self) -> bool {
+        let Some(p) = self.parked_write.as_ref() else { return true };
+        self.queue.iter().find(|q| q.warm_after.is_none()).is_some_and(|q| (q.client, q.write_id) == (p.client, p.write_id))
+    }
+
+    /// Is a write queued or a commit pending? (The page's warm-apply blocks are the only copy while one is.)
+    pub fn has_writes_in_flight(&self) -> bool {
+        self.pending.is_some() || !self.queue.is_empty()
+    }
+
+    pub fn blocks_mut(&mut self) -> &mut B {
+        &mut self.blocks
+    }
+
+    /// THE ONE PIN RULE (sdk#411): every block whose page copy may NOT be dropped, and why -- the engine's own facts
+    /// and the page's (`page`). Everything else in the store may be: its bytes are on the node, or nothing
+    /// references them, and a later need fetches it. The states are the design's table (sdk#411): W, C, B, P, PW,
+    /// HF (R was measured to need no pin: [`PagePins`]). Listed once per eviction pass, never per block.
+    pub fn pins(&self, page: &PagePins<'_>) -> BTreeMap<Cid, Pin> {
+        let mut out = BTreeMap::new();
+        // The later a class is listed, the more it says: a block in two classes keeps the first reason.
+        let mut pin = |id: &Cid, why: Pin| {
+            out.entry(*id).or_insert(why);
+        };
+        if let Some(c) = self.pending.as_ref() {
+            for id in c.data.difference(&c.confirmed) {
+                pin(id, Pin::InFlight);
+            }
+        }
+        for b in &self.backing {
+            for id in &b.remaining {
+                pin(id, Pin::Backing);
+            }
+        }
+        for id in self.reads.waiting.keys().chain(self.reads.parked.values().flat_map(|p| p.held.iter())) {
+            pin(id, Pin::ParkedRead);
+        }
+        if let Some(p) = self.parked_write.as_ref() {
+            for id in p.held.iter().chain(p.needs.iter()) {
+                pin(id, Pin::ParkedWrite);
+            }
+        }
+        if self.has_writes_in_flight() {
+            for id in page.kept {
+                pin(id, Pin::Warm);
+            }
+        }
+        for id in page.held_asks {
+            pin(id, Pin::HeldForeign);
+        }
+        out
+    }
+
+    /// [`Engine::pins`] for one block.
+    pub fn pinned(&self, id: &Cid, page: &PagePins<'_>) -> Option<Pin> {
+        self.pins(page).get(id).copied()
     }
 
     /// What the engine reads through: the node, plus the one constant it can

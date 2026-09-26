@@ -336,7 +336,7 @@ impl WireNode {
         match req {
             ClientRequest::ContractOp(ContractRequest::Put { contract, state, .. }) => {
                 let key = contract.key();
-                let id = id_of(&key);
+                let id: [u8; 32] = key.as_bytes()[..32].try_into().expect("32");
                 if id == self.register_id {
                     *self.served.entry("put register").or_default() += 1;
                     self.register_puts += 1;
@@ -2685,4 +2685,154 @@ fn an_errored_parity_superseded_by_a_later_commit_is_withdrawn_and_backed_up_onl
             }
         }
     }
+}
+
+/// A reader page with `params` (sdk#411's budget).
+fn reader_with(node: &WireNode, params: engine::Params) -> PageIo {
+    PageIo::reader(Server::new(Page::unstarted(params, PutPath::Page, Ms(0)), SignerFacts::default()), BLOCK_CODE.to_vec(), node.register_id, 1)
+}
+
+/// Ask `key` of `io` and serve its frames until it is answered (bounded), counting every block GET by id.
+fn get_counting(io: &mut PageIo, node: &mut WireNode, now: &mut u64, req_id: u64, key: &[u8], gets: &mut BTreeMap<[u8; 32], usize>) -> Option<Vec<u8>> {
+    io.client(&protocol::encode_session_request(4, 9, &Request::Get { req_id, key: key.to_vec() }).expect("encodes"));
+    for _ in 0..2_000 {
+        let frames = io.take_frames();
+        for r in io.take_replies() {
+            if let Reply::Value { req_id: q, value } = protocol::decode_reply(&r).expect("a reply") {
+                if q == req_id {
+                    return value;
+                }
+            }
+        }
+        if frames.is_empty() {
+            *now = io.next_due().map_or(*now + 1, |Ms(t)| t.max(*now + 1));
+            io.tick(Ms(*now));
+            continue;
+        }
+        *now += 1;
+        for f in frames {
+            if let ClientRequest::ContractOp(ContractRequest::Get { key, .. }) = bincode::deserialize::<ClientRequest>(&f).expect("a request") {
+                let id: [u8; 32] = key.as_bytes()[..32].try_into().expect("32");
+                if id != node.register_id {
+                    *gets.entry(id).or_default() += 1;
+                }
+            }
+            let answer = node.serve(&f);
+            if let Some(a) = answer {
+                io.inbound(&a, Ms(*now));
+            }
+        }
+    }
+    panic!("read {req_id} of {:?} was never answered", String::from_utf8_lossy(key));
+}
+
+/// **THE THRASH TEST (sdk#411, the architect): LRU, not FIFO.** A reader whose store budget is a third of the tree
+/// reads keys across every leaf, five passes over. Every read is answered (it terminates), and the ROOT -- which
+/// every read walks, so it is always the most recently used -- is fetched ONCE: eviction takes the cold leaves,
+/// never the hot upper tree. Mutant FIFO (a read does not move its block to the back): the root is the oldest
+/// block, evicted first, fetched again and again -> red.
+#[test]
+fn a_read_loop_over_more_than_the_budget_terminates_and_never_refetches_the_root() {
+    let mut node = WireNode::new(&[31u8; 32]);
+    let mut a = page_io(&node);
+    let mut now = 1_000;
+    client(&mut a, &mut node, &mut now, &Request::Identity);
+    // Enough rows that one read's race-get group is a SMALL part of the tree: a budget below one read's own
+    // fetch thrashes under any policy (measured at 400 rows: the tree was one group).
+    for (w, lo) in (0..4_000u32).step_by(500).enumerate() {
+        let ops: Vec<protocol::Op> = (lo..lo + 500).map(|i| protocol::Op::Put(format!("t/{i:05}").into_bytes(), vec![(i % 251) as u8; 60])).collect();
+        assert!(states(&client(&mut a, &mut node, &mut now, &Request::forced_write(w as u64 + 1, ops)), w as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
+    }
+    // A block's GET names its CONTRACT (the Block code over its id), not the id itself.
+    let root = wire::block::contract_for(BLOCK_CODE, &node.head().expect("a head").1);
+    let keys: Vec<Vec<u8>> = (0..4_000u32).step_by(50).map(|i| format!("t/{i:05}").into_bytes()).collect();
+
+    // CALIBRATE: what the whole working set costs, read once with room for all of it.
+    let mut cal = reader_with(&node, engine::Params::default());
+    client(&mut cal, &mut node, &mut now, &Request::Identity);
+    let mut ignore = BTreeMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        get_counting(&mut cal, &mut node, &mut now, 100 + i as u64, k, &mut ignore);
+    }
+    let working = cal.server.page.blocks().bytes();
+
+    let budget = working / 3;
+    let mut v = reader_with(&node, engine::Params { max_page_block_bytes: budget, ..engine::Params::default() });
+    client(&mut v, &mut node, &mut now, &Request::Identity);
+    let mut gets = BTreeMap::new();
+    for pass in 0..5u64 {
+        for (i, k) in keys.iter().enumerate() {
+            let got = get_counting(&mut v, &mut node, &mut now, 1_000 * (pass + 1) + i as u64, k, &mut gets);
+            let n: u32 = std::str::from_utf8(&k[2..]).expect("utf8").parse().expect("n");
+            assert_eq!(got, Some(vec![(n % 251) as u8; 60]), "pass {pass}: a read under eviction answered wrong");
+        }
+    }
+    let stats = v.server.page.blocks().stats();
+    println!("thrash: working set {working} B, budget {budget} B, evicted {} blocks / {} B, block GETs {} ({} distinct), root GETs {}", stats.evicted, stats.evicted_bytes, gets.values().sum::<usize>(), gets.len(), gets.get(&root).copied().unwrap_or(0));
+    assert!(stats.evicted > 0, "THE SETUP: nothing was evicted, so this measured no thrash");
+    assert_eq!(gets.get(&root).copied(), Some(1), "the ROOT was fetched more than once: eviction took the hot upper tree (not LRU)");
+}
+
+/// A writer page with `params` (sdk#411's budget).
+fn page_io_with(node: &WireNode, params: engine::Params) -> PageIo {
+    let (_, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(params, PutPath::Page, Ms(0)), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: node.register_params.clone(), signer },
+    );
+    io.signer_provisioned();
+    io
+}
+
+/// **THE LONG RUN (the architect's guard on the tiered order):** tier 2 is by KIND, so the internal nodes of every
+/// SUPERSEDED root a page committed stay in tier 2 and could outlive the CURRENT tree's leaves. A writer under a
+/// budget commits ~200 heads, then reads the current tree: the current root is fetched at most once, and its block
+/// GETs stay within the bound of a FRESH page with the same budget reading the same keys.
+#[test]
+fn after_two_hundred_heads_the_current_tree_reads_like_a_fresh_pages() {
+    let mut node = WireNode::new(&[33u8; 32]);
+    let mut now = 1_000;
+    // The budget: a third of the CURRENT tree's working set for these reads (calibrated, as the thrash test).
+    let rows = |lo: u32, hi: u32, tag: u8| -> Vec<protocol::Op> { (lo..hi).map(|i| protocol::Op::Put(format!("t/{i:05}").into_bytes(), vec![tag; 60])).collect() };
+    let mut seed = page_io(&node);
+    client(&mut seed, &mut node, &mut now, &Request::Identity);
+    for (w, lo) in (0..4_000u32).step_by(500).enumerate() {
+        assert!(states(&client(&mut seed, &mut node, &mut now, &Request::forced_write(w as u64 + 1, rows(lo, lo + 500, 1))), w as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
+    }
+    let keys: Vec<Vec<u8>> = (0..4_000u32).step_by(50).map(|i| format!("t/{i:05}").into_bytes()).collect();
+    let mut cal = reader_with(&node, engine::Params::default());
+    client(&mut cal, &mut node, &mut now, &Request::Identity);
+    let mut ignore = BTreeMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        get_counting(&mut cal, &mut node, &mut now, 100 + i as u64, k, &mut ignore);
+    }
+    let budget = cal.server.page.blocks().bytes() / 3;
+    let params = engine::Params { max_page_block_bytes: budget, ..engine::Params::default() };
+
+    // THE LONG RUN: a writer under the budget commits 200 more heads, one row each, spread over the tree.
+    let mut w = page_io_with(&node, params);
+    client(&mut w, &mut node, &mut now, &Request::Identity);
+    for n in 0..200u64 {
+        let i = (n as u32 * 397) % 4_000;
+        assert!(states(&client(&mut w, &mut node, &mut now, &Request::forced_write(100 + n, rows(i, i + 1, 2))), 100 + n).contains(&WriteState::Published), "THE SETUP: head {n} did not publish");
+    }
+    let root = wire::block::contract_for(BLOCK_CODE, &node.head().expect("a head").1);
+    let read = |io: &mut PageIo, node: &mut WireNode, now: &mut u64, base: u64| -> BTreeMap<[u8; 32], usize> {
+        let mut gets = BTreeMap::new();
+        for pass in 0..2u64 {
+            for (i, k) in keys.iter().enumerate() {
+                assert!(get_counting(io, node, now, base + 1_000 * pass + i as u64, k, &mut gets).is_some(), "a read of the current tree found nothing");
+            }
+        }
+        gets
+    };
+    let long = read(&mut w, &mut node, &mut now, 10_000);
+    let mut fresh = reader_with(&node, params);
+    client(&mut fresh, &mut node, &mut now, &Request::Identity);
+    let fresh_gets = read(&mut fresh, &mut node, &mut now, 20_000);
+    let (l, f) = (long.values().sum::<usize>(), fresh_gets.values().sum::<usize>());
+    let st = w.server.page.blocks().stats();
+    println!("long run: budget {budget} B; after 200 heads the writer's reads cost {l} block GETs (root {}); a fresh page's {f} (root {}); writer evicted {} blocks, store {} B", long.get(&root).copied().unwrap_or(0), fresh_gets.get(&root).copied().unwrap_or(0), st.evicted, w.server.page.blocks().bytes());
+    assert!(long.get(&root).copied().unwrap_or(0) <= 1, "after 200 heads the CURRENT root was fetched more than once: superseded internal nodes crowded it out");
+    assert!(l <= f + f / 4, "after 200 heads the writer's reads cost {l} GETs against a fresh page's {f}: superseded internal nodes crowd the current tree");
 }

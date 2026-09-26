@@ -597,7 +597,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         .map(|i| App {
             page: {
                 // Recording from before the first op (the architect's check 2 counts every one).
-                let mut p = Page::unstarted(Params::default(), path, Ms(origin));
+                let mut p = Page::unstarted(model_params(), path, Ms(origin));
                 if cfg.record {
                     p.record_into(1 << 20);
                 }
@@ -1030,7 +1030,26 @@ fn a_recording_page_sends_exactly_what_a_silent_one_does_and_records_every_op() 
     }
 }
 
+/// The model's page Params: the defaults, and `CRAFTWORKS_MODEL_BLOCK_BUDGET` (bytes) as the page's block-store
+/// budget when set -- a tiny one (1) makes eviction run at the end of every step, in every schedule (sdk#411).
+fn model_params() -> Params {
+    let mut p = Params::default();
+    if let Some(b) = std::env::var("CRAFTWORKS_MODEL_BLOCK_BUDGET").ok().and_then(|v| v.trim().parse().ok()) {
+        p.max_page_block_bytes = b;
+    }
+    p
+}
+
 fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64, held: Option<Cid>, edges: &BTreeMap<(u64, Cid), (u64, Cid)>) -> Result<(), String> {
+    // THE PIN RULE HOLDS (sdk#411): no re-put ever found its block's bytes evicted, and no parked write's pins
+    // outlive the write that owns them.
+    let missing = apps[i].page.reput_missing();
+    if missing > 0 {
+        return Err(format!("page {i}: {missing} re-put(s) found their block's bytes EVICTED (a pinned block was dropped)"));
+    }
+    if !apps[i].page.parked_write_is_live() {
+        return Err(format!("page {i}: a parked write outlived its owner (its pins would outlive it)"));
+    }
     // THE REGISTER IS NEVER 2+ BEHIND THE SIGNER'S RECORD (1b on the sign
     // side, the architect's attack): past one, the record for the seq between
     // is overwritten and no page could land it.
