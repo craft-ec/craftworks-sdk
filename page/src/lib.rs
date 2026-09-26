@@ -68,6 +68,7 @@
 //!   fresh page on the same key is answered `AlreadySigned` and lands it);
 //! * the web Session over [`server::Server`], and provisioning the signer (B2);
 
+pub mod audit;
 pub mod fates;
 mod judge;
 pub mod loader;
@@ -99,6 +100,9 @@ pub const HEAD_READS: u32 = 3;
 /// `Putting`, so an early absent can be honest (engineer2's review of
 /// sdk#215); a re-PUT is harmless but re-sends the block.
 pub const HELD_ABSENTS: u32 = 3;
+
+/// Nodes per page of the audit's walk (KEEPER §4): one engine read each.
+const AUDIT_NODES_PER_PAGE: usize = 64;
 
 /// The first wait before a backed-off re-ask (a `Held` absent, a retryable
 /// signer refusal); it doubles each time, capped by [`rto::RTO_MAX_MS`].
@@ -348,6 +352,7 @@ fn waiting_name(w: &Waiting) -> String {
         Waiting::Update(Label::Site(app)) => format!("site {app}'s publication"),
         Waiting::ReadBack(Label::Site(app)) => format!("site {app}'s read"),
         Waiting::PutApp(_) => "the app's publication".into(),
+        Waiting::AuditHeld(_) | Waiting::AuditGet(_) => "the assets audit".into(),
         Waiting::Ext(Ext::RegisterSigner) => "the signer's registration".into(),
         Waiting::Ext(Ext::SignerFirst) => "the signer".into(),
         Waiting::Ext(Ext::AskRecord) => "the signer's record".into(),
@@ -429,6 +434,8 @@ fn op_site(w: &Waiting) -> instrument::Site {
         Waiting::ReadBack(_) => Site::of("page::op::read-back"),
         Waiting::Hint => Site::of("page::op::hint"),
         Waiting::PutApp(_) => Site::of("page::op::put-app"),
+        Waiting::AuditHeld(_) => Site::of("page::op::audit-held"),
+        Waiting::AuditGet(_) => Site::of("page::op::audit-get"),
         Waiting::Ext(_) => Site::of("page::op::ext"),
     }
 }
@@ -468,6 +475,11 @@ enum Waiting {
     Hint,
     /// An app's PUT of this contract key ([`Op::PutApp`]).
     PutApp(String),
+    /// The assets dashboard's audit (KEEPER §4): a `Held` batch it asked, on the same [`Op::AskHeld`] -- its answer is
+    /// the audit's, never the commit path's.
+    AuditHeld(u32),
+    /// The audit's GET of a block its node did not hold: fetched, NotFound, or pending (silent at its deadline).
+    AuditGet(Cid),
     /// A page-io request ([`Op::Ext`]).
     Ext(Ext),
 }
@@ -757,6 +769,10 @@ pub struct Page {
     /// Waits the in-crate tests class as Background (nothing on main is Background yet).
     #[cfg(test)]
     test_background: BTreeSet<Waiting>,
+    /// The assets dashboard's pass in progress, if any ([`Page::audit`]).
+    audit: Option<audit::Audit>,
+    /// A finished pass's report, until taken ([`Page::take_audit`]).
+    audit_report: Option<audit::Report>,
     /// The attempt a re-send continues from (set when an op times out).
     attempt_of: BTreeMap<Waiting, u32>,
     /// When each op still unanswered was FIRST sent: what "not answering for
@@ -878,6 +894,8 @@ impl Page {
             bg_queue: Default::default(),
             #[cfg(test)]
             test_background: BTreeSet::new(),
+            audit: None,
+            audit_report: None,
             attempt_of: BTreeMap::new(),
             first_of: BTreeMap::new(),
             recovered: false,
@@ -1014,6 +1032,14 @@ impl Page {
                         self.get_queue.push_back(id);
                     }
                 }
+                // Silent at its deadline: PENDING for this pass, which moves on -- the pass never waits on one block,
+                // and its one place is not held by a silent one. The next pass asks it again.
+                Waiting::AuditGet(id) => {
+                    if let Some(a) = self.audit.as_mut() {
+                        a.seen.insert(id, audit::Seen::Pending);
+                    }
+                    self.attempt_of.remove(&w);
+                }
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
                 // A landing's request, or this commit's.
@@ -1144,6 +1170,26 @@ impl Page {
                     PutPath::Wrapper => self.ask_held(id),
                 }
             }
+            // THE AUDIT's batch (KEEPER §4): measured only -- no backoff, no re-PUT, nothing confirmed.
+            Answer::Held { batch, present } if self.deadlines.contains_key(&Waiting::AuditHeld(batch)) => {
+                let Some(Op::AskHeld { ids, .. }) = self.answered(&Waiting::AuditHeld(batch)) else { return };
+                let short = ids.len().saturating_sub(present.len());
+                if let Some(a) = self.audit.as_mut() {
+                    for (i, id) in ids.into_iter().enumerate() {
+                        match present.get(i) {
+                            Some(true) => {
+                                a.seen.insert(id, audit::Seen::Held);
+                            }
+                            Some(false) => a.to_get.push_back(id),
+                            None => a.to_hold.push_back(id),
+                        }
+                    }
+                }
+                if short > 0 {
+                    self.record_short_held(short);
+                    debug_assert!(false, "an audit Held answer for batch {batch} was {short} short of its op");
+                }
+            }
             Answer::Held { batch, present } => {
                 let Some(Op::AskHeld { ids, .. }) = self.answered(&Waiting::Held(batch)) else { return };
                 // Past the end of a SHORT answer: UNKNOWN, asked again -- never taken for absent or present. The
@@ -1186,6 +1232,12 @@ impl Page {
                 }
             }
             Answer::Got { id, bytes } => {
+                if self.answered(&Waiting::AuditGet(id)).is_some() {
+                    let seen = if engine::read::matches_id(&id, &bytes) { audit::Seen::Fetched } else { audit::Seen::Absent };
+                    if let Some(a) = self.audit.as_mut() {
+                        a.seen.insert(id, seen);
+                    }
+                }
                 let Some(attempt) = self.answered_get(id) else { return };
                 // Verified BEFORE it joins the page's memory: a block that is
                 // not its id is not kept, and the engine hears a miss.
@@ -1201,6 +1253,12 @@ impl Page {
                 self.step(Event::BlockArrived { id, bytes });
             }
             Answer::GetMissed(id) => {
+                // NotFound is an ANSWER (KEEPER §4.2): the audit counts it absent.
+                if self.answered(&Waiting::AuditGet(id)).is_some() {
+                    if let Some(a) = self.audit.as_mut() {
+                        a.seen.insert(id, audit::Seen::Absent);
+                    }
+                }
                 if let Some(attempt) = self.answered_get(id) {
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
@@ -1952,6 +2010,82 @@ impl Page {
         }
     }
 
+    /// START an audit pass over THIS page's tree at its published root (KEEPER §4; the assets dashboard, step 2): the
+    /// asset is the tree the page stands on (a kept asset is audited on its own `tree()` reader's page). It runs as
+    /// the ops leave ([`Page::take_ops`]), ONE audit op at a time, and its report is [`Page::take_audit`]'s. A pass
+    /// already running is replaced.
+    pub fn audit(&mut self) {
+        self.audit = Some(audit::Audit::new(self.published().1));
+        self.audit_report = None;
+    }
+
+    /// A finished pass's report, once.
+    pub fn take_audit(&mut self) -> Option<audit::Report> {
+        self.audit_report.take()
+    }
+
+    /// The pass's next op, if none is in flight (KEEPER §7): the walk's next page, a Held batch, or one GET -- each
+    /// op in the Background lane ([`Page::lane_of`]). With nothing left, the pass ends and its report is kept.
+    fn drive_audit(&mut self) {
+        // ONE audit op at a time: the pass's next waits on the lane's one Background op, sent or queued (sdk#468).
+        if self.audit.is_none() || self.background_in_flight() > 0 || !self.bg_queue.is_empty() {
+            return;
+        }
+        let Some(a) = self.audit.as_mut() else { return };
+        if a.walk_req.is_some() {
+            return; // parked on a fetch that is not on the wire yet (a NotFound's backoff): it is re-sent on its deadline
+        }
+        if !a.walked {
+            a.reqs += 1;
+            let req = a.reqs;
+            a.walk_req = Some(req);
+            let spec = engine::read::NodesSpec { at: a.next.clone(), max_nodes: AUDIT_NODES_PER_PAGE };
+            self.step(Event::Nodes { client: ClientId::BACKGROUND, req_id: engine::read::ReqId(req), spec });
+            // Answered from memory at once: the next op goes now.
+            if self.audit.as_ref().is_some_and(|a| a.walk_req.is_none()) {
+                self.drive_audit();
+            }
+            return;
+        }
+        if !a.to_hold.is_empty() {
+            let n = a.to_hold.len().min(signer_proto::MAX_HELD);
+            let ids: Vec<Cid> = a.to_hold.drain(..n).collect();
+            self.next_held_batch = self.next_held_batch.wrapping_add(1);
+            let batch = self.next_held_batch;
+            self.send(Waiting::AuditHeld(batch), Op::AskHeld { batch, ids });
+            return;
+        }
+        if let Some(id) = a.to_get.pop_front() {
+            self.send(Waiting::AuditGet(id), Op::Get { id });
+            return;
+        }
+        let a = self.audit.take().expect("checked");
+        self.audit_report = Some(a.report());
+    }
+
+    /// The walk's page arrived (its read, `ClientId::BACKGROUND`).
+    fn audit_walked(&mut self, req: u64, result: engine::read::ReadResult) {
+        let Some(a) = self.audit.as_mut().filter(|a| a.walk_req == Some(req)) else { return };
+        match result {
+            engine::read::ReadResult::Nodes { nodes, next } => {
+                // THE ROOT's group of one (sdk#335): its parity ids are a function of its bytes, which the walk read.
+                let root = a.root;
+                if nodes.iter().any(|n| n.id == root) {
+                    if let Some(parity) = self.blocks.get(&root).and_then(engine::repair::root_parity) {
+                        a.add_group(vec![root], parity.into_iter().map(|(id, _)| id).collect());
+                    }
+                }
+                a.walked_page(nodes, next)
+            }
+            // The walk could not be served (a tree the engine gave up on): what was walked is measured, and said.
+            other => {
+                self.unusable.push(format!("the assets audit's walk ended without its nodes: {other:?}"));
+                a.walked = true;
+                a.walk_req = None;
+            }
+        }
+    }
+
     /// Ask `Held` about `id` at the next flush (sdk#455). One already in a batch in flight joins it there.
     fn ask_held(&mut self, id: Cid) {
         self.held_asks.insert(id);
@@ -2008,8 +2142,13 @@ impl Page {
         if self.test_background.contains(w) {
             return Lane::Background;
         }
-        let _ = w;
-        Lane::Interactive
+        match w {
+            // The assets dashboard's audit (KEEPER §7): its Held batches and GETs, and the fetches of its walk -- a
+            // block only `ClientId::BACKGROUND`'s reads wait on. An app read joining one makes it Interactive here.
+            Waiting::AuditHeld(_) | Waiting::AuditGet(_) => Lane::Background,
+            Waiting::Get(id) if self.engine.fetch_is_background(id) => Lane::Background,
+            _ => Lane::Interactive,
+        }
     }
 
     /// PROMOTION where waiters change: every Background op -- queued, or on the wire -- whose class is now
@@ -2792,6 +2931,9 @@ impl Page {
                     }
                 }
                 Effect::ReadHead { .. } => self.send(Waiting::RecoverHead, Op::ReadHead { label: Label::Head }),
+                // THE AUDIT's walk (ClientId::BACKGROUND): its page of nodes is the audit's, never a client's.
+                Effect::Reply { client, req_id, result } if client == ClientId::BACKGROUND => self.audit_walked(req_id.0, result),
+                Effect::Progress { client, .. } if client == ClientId::BACKGROUND => {}
                 client => self.client_fx.push(client),
             }
         }
@@ -2890,6 +3032,7 @@ impl Page {
             || self.sites.values().any(|p| p.sign_again.is_some())
             || !self.held_again.is_empty()
             || !self.held_asks.is_empty()
+            || self.audit.is_some()
     }
 
     /// Ops to send, in order.
@@ -2960,6 +3103,7 @@ impl Page {
     /// Ops to send, in order. `Held` asks are batched HERE (sdk#455): the one place every op leaves, so all asked in
     /// the step go out together, one op per up to MAX_HELD ids.
     pub fn take_ops(&mut self) -> Vec<Op> {
+        self.drive_audit();
         self.flush_held();
         std::mem::take(&mut self.out)
     }
@@ -3265,6 +3409,37 @@ mod repair_put {
         p.carry_out(vec![Effect::PutBlock { id, bytes, after: Vec::new() }]);
         p.answer(Answer::PutOk(id), Ms(2));
         assert!(p.take_ops().iter().any(|o| matches!(o, Op::Sign { .. })), "the commit's own PUT answer did not release the head to be signed");
+    }
+}
+
+/// THE AUDIT's `Held` never touches the commit path (the architect, step 2): one op, two waits, two consumers.
+#[cfg(test)]
+mod audit_held {
+    use super::*;
+
+    /// **An audit batch answered ABSENT leaves the commit path's records untouched**: no `held_again` backoff, no
+    /// re-PUT, nothing confirmed -- the absent id goes to the audit's own GET queue. Mutant "the audit's answer taken
+    /// by the commit path" -> red.
+    #[test]
+    fn an_audit_batch_answered_absent_touches_no_commit_record() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let _ = p.take_ops();
+        let x = [7u8; 32];
+        p.blocks.insert(x, b"bytes the page holds");
+        let mut a = audit::Audit::new(p.published().1);
+        a.walked = true;
+        a.add_group(vec![x], Vec::new());
+        p.audit = Some(a);
+        let ops = p.take_ops();
+        let Some(Op::AskHeld { batch, ids }) = ops.into_iter().find(|o| matches!(o, Op::AskHeld { .. })) else { panic!("THE SETUP: the audit asked no Held") };
+        assert_eq!(ids, vec![x]);
+        for _ in 0..HELD_ABSENTS {
+            p.answer(Answer::Held { batch, present: vec![false] }, Ms(1));
+        }
+        assert!(p.held_again.is_empty(), "an audit's absent answer started the commit path's backoff");
+        assert!(p.put_again.is_empty(), "an audit's absent answer queued a re-PUT");
+        assert!(p.confirmed.is_empty(), "an audit's answer confirmed a block");
+        assert_eq!(p.audit.as_ref().map(|a| a.to_get.iter().copied().collect::<Vec<_>>()), Some(vec![x]), "the absent id did not go to the audit's GET");
     }
 }
 
