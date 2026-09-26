@@ -174,6 +174,69 @@ pub fn site_contract(site_code: &[u8], register_params: &[u8], app: &str) -> Opt
     ))))
 }
 
+/// WHICH SITE A PAGE WAS SERVED FROM (sdk#399 step 4, the architect): the site contract's instance id in the page's
+/// own path, `/v1/contract/web/<link>/...` -- the inverse of [`PageIo::site_link`], and the one owner of "which site"
+/// a path or an address names (a person running someone else's app runs THAT publisher's site, which no derivation
+/// from their own params names). STRICT: the link must decode to the 32-byte id AND encode back to itself
+/// (`from_base58` zero-pads a short text into a well-formed wrong id); anything else is `None`, never a guess.
+pub fn site_id_of_path(path: &str) -> Option<[u8; 32]> {
+    let link = path.strip_prefix("/v1/contract/web/")?.split(['/', '?', '#']).next()?;
+    site_id_of_link(link)
+}
+
+/// A site ADDRESS as a person gives one (sdk#472's keepSet; the loader handover uses [`site_id_of_path`]): a bare link
+/// (`<id>`), a node URL (`http(s)://<host:port>/v1/contract/web/<id>/...`, its scheme and authority stripped), or the
+/// path itself -- with the same strict round-trip. Anything else is REFUSED BY NAME ([`AddressRefused`]); a caller
+/// shows or maps the name, never guesses.
+pub fn site_id_of_address(text: &str) -> Result<[u8; 32], AddressRefused> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(AddressRefused::Empty);
+    }
+    if let Some(rest) = text.strip_prefix("http://").or_else(|| text.strip_prefix("https://")) {
+        let path = rest.find('/').map(|at| &rest[at..]).ok_or(AddressRefused::NotASitePath)?;
+        return site_path(path);
+    }
+    if text.contains("://") {
+        // `craftec://` among them: nothing defines one, so nothing reads one.
+        return Err(AddressRefused::UnknownScheme);
+    }
+    if text.starts_with('/') {
+        return site_path(text);
+    }
+    if text.contains(['/', '?', '#']) {
+        return Err(AddressRefused::NotASitePath);
+    }
+    site_id_of_link(text).ok_or(AddressRefused::NotASiteLink)
+}
+
+fn site_path(path: &str) -> Result<[u8; 32], AddressRefused> {
+    let link = path.strip_prefix("/v1/contract/web/").ok_or(AddressRefused::NotASitePath)?.split(['/', '?', '#']).next().unwrap_or("");
+    site_id_of_link(link).ok_or(AddressRefused::NotASiteLink)
+}
+
+/// Why a text is not a site address, by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressRefused {
+    /// Nothing given.
+    Empty,
+    /// A scheme other than http(s) -- `craftec://` included: nothing defines it.
+    UnknownScheme,
+    /// A URL or path that is not `/v1/contract/web/<link>/...`, or a bare text with a path in it.
+    NotASitePath,
+    /// The link is not exactly a site's 32-byte id: not base58, or a short text that decodes (the round-trip trap).
+    NotASiteLink,
+}
+
+/// A bare link: exactly the 32-byte id that encodes back to it.
+fn site_id_of_link(link: &str) -> Option<[u8; 32]> {
+    if link.is_empty() {
+        return None;
+    }
+    let id = freenet_stdlib::prelude::ContractInstanceId::from_base58(link).ok()?;
+    (id.encode() == link).then(|| *id)
+}
+
 pub struct PageIo {
     pub server: Server,
     art: Artefacts,
