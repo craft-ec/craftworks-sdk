@@ -277,6 +277,12 @@ pub enum Event {
     /// `Lost`: re-sent, they would re-derive the same block); a published commit's straggler stays owed (never
     /// BACKED_UP) and is recorded ([`Engine::rejected_blocks`]). [`Event::PutFailed`] keeps its meaning: put again.
     PutRejected(Cid),
+    /// The SIGNER finally refused the head of commit `seq` (PUBLISH-LIFE ⁵, E8; COMMIT-LIFE's Heading x head refused).
+    /// A real answer (rule 8), so it ENDS the commit: every write of its cut `Failed`, the tree back to the published
+    /// root, the writes behind it re-derived there. Any other seq is a stale answer and does nothing (the head it named
+    /// is already dead). The engine carries no reason: it sits below signer-proto, and the page -- which holds the
+    /// signer's `Why` -- names it on these writes' `Failed` (one owner of the reason).
+    HeadRefused { seq: u64 },
     Write {
         client: ClientId,
         write_id: WriteId,
@@ -2147,6 +2153,7 @@ impl<B: Blocks> Engine<B> {
             Event::HeldUnknown(id) => self.on_held_unknown(id),
             Event::PutFailed(id) => self.on_failed(id),
             Event::PutRejected(id) => self.on_rejected(id),
+            Event::HeadRefused { seq } => self.on_head_refused(seq),
             Event::HeadConfirmed(seq) => self.on_head(seq),
             Event::Tick(now) => self.on_tick(now),
             Event::Flush => self.on_flush(),
@@ -4160,15 +4167,30 @@ impl<B: Blocks> Engine<B> {
             // BACKED_UP never lies; nothing is put again.
             return Vec::new();
         }
-        let c = self.pending.take().expect("checked");
+        self.fail_commit()
+    }
+
+    /// The signer finally refused commit `seq`'s head (PUBLISH-LIFE ⁵): if `seq` is the commit in flight, it ends
+    /// `Failed`; any other seq is stale -- that head is already dead -- and nothing happens.
+    fn on_head_refused(&mut self, seq: u64) -> Vec<Effect> {
+        if !self.pending.as_ref().is_some_and(|c| c.seq == seq) {
+            return Vec::new();
+        }
+        self.fail_commit()
+    }
+
+    /// A REAL END of the commit in flight (rule 8), shared by a block the node REJECTED and a head the signer REFUSED:
+    /// its writes are `Failed` and leave the queue -- re-applied they would meet the same refusal -- the tree goes back
+    /// to the published root, and the writes behind them go again there. (One of COMMIT-LIFE's teardowns; sdk#481
+    /// makes them one.)
+    fn fail_commit(&mut self) -> Vec<Effect> {
+        let Some(c) = self.pending.take() else { return Vec::new() };
         self.in_flight_since = None;
         self.unpublished.clear();
         self.next_seq = self.published_seq + 1;
         for w in &c.writes {
             self.told_stalled.remove(w);
         }
-        // A REAL END (rule 8): the commit's writes are Failed and leave the queue -- re-applied they would
-        // re-derive the same block and be rejected again. The writes behind them go again on the published root.
         self.queue.retain(|q| !(q.committing && c.writes.contains(&(q.client, q.write_id))));
         let mut out: Vec<Effect> = c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed }).collect();
         self.root = self.published_root;
