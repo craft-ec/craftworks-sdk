@@ -1884,3 +1884,42 @@ fn a_silent_block_is_pending_and_the_pass_ends() {
     assert_eq!(r.pending, 1, "the silent block is not pending");
     assert_eq!(r.degraded, 1, "the silent block's group is not degraded (it is not held)");
 }
+
+/// **NO SIGNER TO ASK: the asset is UNMEASURED, never all-absent** (the architect): every `Held` batch is answered
+/// `HeldUnasked` (a reader's page has no signer). The pass reports `measured: false`, sends no GET, and names nothing
+/// absent or damaged.
+#[test]
+fn a_page_with_no_signer_reports_its_asset_unmeasured() {
+    let (mut node, mut b, now) = audited_tree(30);
+    b.audit();
+    let (mut asked_held, mut gets_after) = (false, 0);
+    for _ in 0..2_000 {
+        let ops = b.take_ops();
+        if ops.is_empty() && !b.waiting() {
+            break;
+        }
+        for op in ops {
+            match op {
+                Op::AskHeld { batch, .. } => {
+                    asked_held = true;
+                    b.answer(Answer::HeldUnasked { batch }, Ms(now));
+                }
+                Op::Get { id } => {
+                    gets_after += usize::from(asked_held);
+                    let a = match node.blocks.get(&id) {
+                        Some(bytes) => Answer::Got { id, bytes: bytes.clone() },
+                        None => Answer::GetMissed(id),
+                    };
+                    b.answer(a, Ms(now));
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = &mut node;
+    let r = b.take_audit().expect("the pass did not end");
+    println!("unmeasured: measured {}, groups {}, damaged {:?}, GETs after the first Held {gets_after}", r.measured, r.groups, r.damaged);
+    assert!(asked_held, "THE SETUP: the audit asked no Held");
+    assert!(!r.measured, "an asset the page could not ask about was reported measured");
+    assert_eq!((gets_after, r.whole, r.degraded, r.damaged.len()), (0, 0, 0, 0), "an unmeasured asset was GET or counted");
+}

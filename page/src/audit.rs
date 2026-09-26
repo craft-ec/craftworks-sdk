@@ -39,11 +39,13 @@ pub(crate) struct Audit {
     /// Blocks still to ask `Held` about, and blocks the node did not hold, still to GET.
     pub to_hold: VecDeque<Cid>,
     pub to_get: VecDeque<Cid>,
+    /// The page had no signer to ask `Held` (a reader's page): nothing was measured.
+    pub unmeasured: bool,
 }
 
 impl Audit {
     pub fn new(root: Cid) -> Audit {
-        Audit { root, next: None, walked: false, walk_req: None, reqs: 0, groups: Vec::new(), seen: BTreeMap::new(), to_hold: VecDeque::new(), to_get: VecDeque::new() }
+        Audit { root, next: None, walked: false, walk_req: None, reqs: 0, groups: Vec::new(), seen: BTreeMap::new(), to_hold: VecDeque::new(), to_get: VecDeque::new(), unmeasured: false }
     }
 
     /// A group to measure: joined, each of its blocks queued to be asked once.
@@ -70,7 +72,10 @@ impl Audit {
 
     /// The report, from what was seen.
     pub fn report(&self) -> Report {
-        let mut r = Report { root: self.root, groups: self.groups.len(), whole: 0, degraded: 0, damaged: Vec::new(), pending: 0 };
+        let mut r = Report { root: self.root, measured: !self.unmeasured, groups: self.groups.len(), whole: 0, degraded: 0, damaged: Vec::new(), pending: 0 };
+        if self.unmeasured {
+            return r;
+        }
         for (members, parity) in &self.groups {
             let have = members.iter().chain(parity.iter()).filter(|id| matches!(self.seen.get(*id), Some(Seen::Held | Seen::Fetched))).count() as i64;
             let margin = have - members.len() as i64;
@@ -92,6 +97,9 @@ impl Audit {
 pub struct Report {
     /// The root the pass measured (the page's published root when it began).
     pub root: Cid,
+    /// `false`: the page had no signer to ask (a reader's page) -- the asset is UNMEASURED, and its counts say
+    /// nothing (never all-absent).
+    pub measured: bool,
     pub groups: usize,
     pub whole: usize,
     pub degraded: usize,
