@@ -97,45 +97,12 @@ fn a_mid_commit_recovery_read_never_adopts_a_head_this_pages_record_beats() {
     assert_eq!(p.published(), (mine.seq, mine.root()), "the write was not Published on this page's own head once the register held it");
 }
 
+mod common;
+use common::{items_after_the_cut, production_of};
+
 const LIB: &str = include_str!("../src/lib.rs");
 const JUDGE: &str = include_str!("../src/judge.rs");
 const OTHERS: [(&str, &str); 3] = [("fates.rs", include_str!("../src/fates.rs")), ("rto.rs", include_str!("../src/rto.rs")), ("server.rs", include_str!("../src/server.rs"))];
-
-/// The PRODUCTION part of a source file: everything before its first `#[cfg(test)]` (test modules sit at the end
-/// and may use the tie-break to BUILD inputs; the rule is about what the page does, not how a test makes a head).
-fn production(src: &str) -> &str {
-    src.split("\n#[cfg(test)]").next().expect("a first part")
-}
-
-/// The TOP-LEVEL items of `src` after its production cut that are NOT a `#[cfg(test)]` module: each `(line, text)`.
-/// A top-level item is a line in column 0 that is not a comment, an attribute, a closing brace or blank; its
-/// attributes are the `#[...]` lines right above it. Rust allows production items after a test module, and one
-/// there would escape `production()` -- so the part after the cut may hold test modules and nothing else.
-fn items_after_the_cut(src: &str) -> Vec<(usize, String)> {
-    let cut = production(src).lines().count();
-    let lines: Vec<&str> = src.lines().collect();
-    let mut attrs: Vec<&str> = Vec::new();
-    let mut out = Vec::new();
-    for (i, l) in lines.iter().enumerate().skip(cut) {
-        let top = !l.is_empty() && !l.starts_with(char::is_whitespace);
-        if !top || l.starts_with('}') || l.starts_with("//") {
-            if !l.trim().is_empty() && !l.trim_start().starts_with("//") && top {
-                attrs.clear();
-            }
-            continue;
-        }
-        if l.starts_with("#[") || l.starts_with("#![") {
-            attrs.push(l);
-            continue;
-        }
-        let test_mod = l.starts_with("mod ") && attrs.iter().any(|a| a.trim() == "#[cfg(test)]");
-        if !test_mod {
-            out.push((i + 1, l.to_string()));
-        }
-        attrs.clear();
-    }
-    out
-}
 
 /// The body of `fn <name>(` in `src`, by brace matching from the signature: `None` if there is no such fn.
 fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
@@ -169,20 +136,20 @@ fn builds(src: &str, variant: &str) -> usize {
 /// Each assertion has its control: the reader finds the real bodies, or the counts could be zero over nothing.
 #[test]
 fn every_register_answer_is_judged_in_one_place_and_adopted_through_one_door() {
-    let lib = production(LIB);
+    let lib = production_of(LIB);
     assert!(lib.contains("fn adopt(") && lib.contains("fn step(") && lib.len() * 2 > LIB.len(), "THE CONTROL: the production cut of lib.rs lost the code it judges ({} of {} bytes)", lib.len(), LIB.len());
     // Nothing of production hides AFTER the cut (the architect): past it, only `#[cfg(test)]` modules.
     for (name, src) in [("lib.rs", LIB)].into_iter().chain(OTHERS) {
         let stray = items_after_the_cut(src);
-        assert!(stray.is_empty(), "page/src/{name}: production items after the first #[cfg(test)], where the one-door control does not look: {stray:?}");
+        assert!(stray.is_empty(), "page/src/{name}: production items after the production cut (the first top-level test module), where the one-door control does not look: {stray:?}");
     }
-    assert!(LIB.lines().skip(production(LIB).lines().count()).filter(|l| l.starts_with("mod ")).count() >= 3, "THE CONTROL: the scan after the cut found no test modules in lib.rs (it read nothing)");
+    assert!(LIB.lines().skip(production_of(LIB).lines().count()).filter(|l| l.starts_with("mod ")).count() >= 3, "THE CONTROL: the scan after the cut found no test modules in lib.rs (it read nothing)");
     let adopt = body_of(lib, "adopt").expect("THE CONTROL: the reader found no `fn adopt` in page/src/lib.rs");
     for v in ["HeadRead", "HeadConflict"] {
         assert_eq!(builds(adopt, v), 1, "THE CONTROL: `fn adopt` does not build Event::{v} exactly once (the reader read no real body)");
         assert_eq!(builds(lib, v), 1, "Event::{v} is built outside `fn adopt`: a head can be adopted without the one judgement");
         for (name, src) in OTHERS {
-            assert_eq!(builds(production(src), v), 0, "page/src/{name} builds Event::{v}: a head adopted outside `fn adopt`");
+            assert_eq!(builds(production_of(src), v), 0, "page/src/{name} builds Event::{v}: a head adopted outside `fn adopt`");
         }
     }
     // The `Heard` a head is adopted from: built only by the judgement.
@@ -194,7 +161,7 @@ fn every_register_answer_is_judged_in_one_place_and_adopted_through_one_door() {
     assert!(calls(JUDGE) >= 2, "THE CONTROL: judge.rs calls the tie-break {} time(s); it is where the head's and the site's are judged", calls(JUDGE));
     assert_eq!(calls(lib), 0, "page/src/lib.rs calls the tie-break itself: a second judgement");
     for (name, src) in OTHERS {
-        assert_eq!(calls(production(src)), 0, "page/src/{name} calls the tie-break itself: a second judgement");
+        assert_eq!(calls(production_of(src)), 0, "page/src/{name} calls the tie-break itself: a second judgement");
     }
     assert!(!lib.contains("fn my_winning_record"), "the per-site tie-break check is back in lib.rs");
 }

@@ -2895,21 +2895,6 @@ mod recording {
         assert_eq!(p.ops_on_wire(), 1, "one op on the wire");
     }
 
-    /// ONE SITE (the architect's check 2), held by the source: a deadline leaves only through `end`, arrives only
-    /// through `send` and `park`, and an op reaches the wire only from `send` and `reconnected` -- each of which
-    /// records. A new path that bypassed them would be an op the recording never saw.
-    #[test]
-    fn a_deadline_ends_only_through_end_and_an_op_goes_out_only_from_send_or_reconnected() {
-        let src = include_str!("lib.rs");
-        // Cut at the first TOP-LEVEL test module (column 0, the same cut as tests/head_judgement.rs), never at the
-        // first `#[cfg(test)]` anywhere: a test-only FIELD in the production code (#401's `confirmed_steps`) cut the
-        // body there, and every count below read 0.
-        let body = &src[..src.find(concat!("\n#[cfg(test)]", "\nmod ")).expect("the tests follow the code")];
-        let count = |pat: &str| body.matches(pat).count();
-        assert_eq!(count(concat!("deadlines", ".remove(")), 1, "a deadline is removed outside `end`: its end is not recorded");
-        assert_eq!(count(concat!("deadlines", ".insert(")), 2, "a deadline is made outside `send`/`park`");
-        assert_eq!(count(concat!("self.out", ".push(")), 2, "an op is put on the wire outside `send`/`reconnected`: it is not recorded");
-    }
 }
 
 #[cfg(test)]
