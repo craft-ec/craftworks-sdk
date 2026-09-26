@@ -771,11 +771,11 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
                         Some(Answer::Updated { label: page::Label::Head })
                     }
                 }
-                Op::AskHeld { id } => {
+                Op::AskHeld { batch, ids } => {
                     if s_head.chance(faults.head_lost) {
                         None
                     } else {
-                        Some(Answer::Held { id, present: node.blocks.contains_key(&id) })
+                        Some(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() })
                     }
                 }
                 // The engine never makes an app PUT; this model sends none.
@@ -1341,7 +1341,7 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
                     p.answer(Answer::Updated { label: page::Label::Head }, Ms(0));
                 }
                 Op::Get { id } => p.answer(Answer::GetMissed(id), Ms(0)),
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, Ms(0)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() }, Ms(0)),
                 Op::PutApp { key } => p.answer(Answer::AppPutOk(key), Ms(0)),
                 Op::Ext(_) => {}
             }
@@ -1384,7 +1384,7 @@ fn drive_one(p: &mut Page, node: &mut Node, edges: &mut BTreeMap<(u64, Cid), (u6
                     Some(b) => p.answer(Answer::Got { id, bytes: b.clone() }, Ms(0)),
                     None => p.answer(Answer::GetMissed(id), Ms(0)),
                 },
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: node.blocks.contains_key(&id) }, Ms(0)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() }, Ms(0)),
                 Op::PutApp { key } => p.answer(Answer::AppPutOk(key), Ms(0)),
                 Op::Ext(_) => {}
             }
@@ -1473,7 +1473,7 @@ fn serve(p: &mut Page, node: &mut Node, now: &mut u64, drop_updates: &mut u32) {
                     }
                 }
                 Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
-                Op::AskHeld { id } => Some(Answer::Held { id, present: node.blocks.contains_key(&id) }),
+                Op::AskHeld { batch, ids } => Some(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() }),
                 Op::PutApp { key } => Some(Answer::AppPutOk(key)),
                 Op::Ext(_) => None,
             };

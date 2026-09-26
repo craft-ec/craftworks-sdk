@@ -83,9 +83,9 @@ fn drive_slow(
                     })
                 }
                 Op::Update { .. } => Some(Answer::Updated { label: page::Label::Head }),
-                Op::AskHeld { id } => Some(Answer::Held {
-                    id,
-                    present: node.blocks.contains_key(&id),
+                Op::AskHeld { batch, ids } => Some(Answer::Held {
+                    batch,
+                    present: ids.iter().map(|id| node.blocks.contains_key(id)).collect(),
                 }),
                 Op::PutApp { key } => Some(Answer::AppPutOk(key)),
             };

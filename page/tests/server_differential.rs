@@ -347,7 +347,7 @@ impl PageRig {
                 Answer::Updated { label: page::Label::Head }
             }
             Op::ReadHead { .. } => Answer::Head { label: page::Label::Head, read: node.head_read() },
-            Op::AskHeld { id } => Answer::Held { id, present: node.blocks.contains_key(&id) },
+            Op::AskHeld { batch, ids } => Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() },
             Op::PutApp { key } => Answer::AppPutOk(key),
             Op::Ext(_) => return None,
         })
@@ -810,7 +810,7 @@ fn sibling_root(node: &mut Node, salt: u32) -> Cid {
                     node.put(id, &bytes);
                     p.answer(Answer::PutOk(id), Ms(1));
                 }
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(1)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(1)),
                 Op::Sign { root, .. } => return root,
                 other => common::unanswered_op(&other),
             }
@@ -1120,7 +1120,7 @@ fn device_tree(node: &mut Node, entries: &[(Vec<u8>, Vec<u8>)]) -> Cid {
                     node.put(id, &bytes);
                     p.answer(Answer::PutOk(id), Ms(1));
                 }
-                Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(1)),
+                Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(1)),
                 Op::Sign { root, .. } => return root,
                 other => common::unanswered_op(&other),
             }
