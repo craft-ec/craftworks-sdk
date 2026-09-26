@@ -87,8 +87,9 @@ fn ids(effects: &[Effect]) -> Vec<Cid> {
     effects
         .iter()
         .filter_map(|e| match e {
-            // A changed group's other member the node is asked about (class 2) is answered like a PUT: held.
-            Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } | Effect::ConfirmHeld { id } => Some(*id),
+            // (A changed group's other member the node is asked about is answered by the harness at once, sdk#416:
+            // never a PUT this sweep may fail.)
+            Effect::PutPack { id, .. } | Effect::PutBlock { id, .. } => Some(*id),
             _ => None,
         })
         .collect()

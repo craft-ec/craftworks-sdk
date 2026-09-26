@@ -1209,10 +1209,12 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
     let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
     let mut most = 0;
     let mut landings = 0;
-    // 3/2 of the seeds (60 at the full count), not 1/2: race put signs a head as soon as its groups are
-    // recoverable, so heads land sooner and a twice-lost UPDATE is rarer per seed (20 seeds reached at most 2).
-    // The coverage floor below is unchanged; a small count runs on until it is reached.
-    let (min, cap) = seed_range(3, 2);
+    // 5/2 of the seeds (100 at the full count): race put signs a head as soon as its groups are recoverable, so
+    // heads land sooner and a twice-lost UPDATE is rarer per seed (20 seeds reached at most 2); and sdk#416's Held
+    // asks shift which schedule loses one (the same 14 landings in 60 seeds; the most UPDATEs 2 by seed 80, 3 at
+    // seed 83). The coverage floor below is unchanged; a small count runs on until it is reached. It is schedule
+    // luck all the same: a scripted double loss would force it.
+    let (min, cap) = seed_range(5, 2);
     let mut seed = 0;
     while seed < min || (seed < cap && (most < 3 || landings == 0)) {
         seed += 1;

@@ -52,6 +52,8 @@ fn states(fx: &[Effect], id: u64) -> Vec<State> {
 fn ack_all_but(e: &mut Engine<Store>, fx: &[Effect], skip: &BTreeSet<Cid>) -> Vec<Effect> {
     let mut all = fx.to_vec();
     let mut queue: Vec<Cid> = puts(fx).into_keys().collect();
+    // A changed group's other members the node is asked about (sdk#416): all held here.
+    queue.extend(fx.iter().filter_map(|f| if let Effect::ConfirmHeld { id } = f { Some(*id) } else { None }));
     let mut done: BTreeSet<Cid> = BTreeSet::new();
     let mut landed = false;
     loop {
@@ -61,6 +63,7 @@ fn ack_all_but(e: &mut Engine<Store>, fx: &[Effect], skip: &BTreeSet<Cid>) -> Ve
             }
             let more = e.step(Event::PutConfirmed(id));
             queue.extend(puts(&more).into_keys());
+            queue.extend(more.iter().filter_map(|f| if let Effect::ConfirmHeld { id } = f { Some(*id) } else { None }));
             all.extend(more);
         }
         match head(&all) {

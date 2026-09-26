@@ -21,7 +21,7 @@
 //! | `PutOk` | [`PutPath::Page`]: `PutConfirmed` on the PUT's answer (a page-PUT block is served, measured 20/20; no per-block read-back). [`PutPath::Wrapper`]: [`Op::AskHeld`], and `PutConfirmed` only on `Held { present: true }`; absent → asked again on a doubling backoff, the PUT again only after [`HELD_ABSENTS`] absents in a row |
 //! | `PutRefused { transient }` | transient (F51's queue): the same PUT again at the next tick; permanent: `PutFailed` |
 //! | `PutPack` | refused as the shell refuses it (no packs in this phase): `PutFailed` |
-//! | `ConfirmHeld { id }` (a FOREIGN member of a changed group, safety gap class 2) | already confirmed here: `PutConfirmed` at once, no op. Else [`Op::AskHeld`]; `Held { present: true }` → `PutConfirmed`; absent → asked again on a doubling backoff for as long as it takes (rule 7), put from here only if the page holds its bytes |
+//! | `ConfirmHeld { id }` (another member of a changed group, asked at the commit's start: SAVED and BACKED_UP need the node's word, sdk#416 / class 2) | already confirmed here: `PutConfirmed` at once, no op. Else `HeldUnknown` (the engine counts it absent and sends one more of its group's parity) and [`Op::AskHeld`]; `Held { present: true }` → `PutConfirmed`; absent → asked again on a doubling backoff for as long as it takes (rule 7), put from here only if the page holds its bytes |
 //! | `UpdateHead { seq, root }` | held until its `after` is confirmed, then [`Op::Sign`] from the engine's PUBLISHED head |
 //! | `Signed(state)` (`signer_proto::Answer` under the in-flight sign's id, as `wire::signer::read_answer` decodes it; any other id is ignored) | [`Op::Update`] with exactly those bytes |
 //! | `AlreadySigned(state)` | [`Op::Update`] with exactly those bytes (the signer's requirement 2: at most one signature per prev). If its root is another page's, the read-back shows this seq under that root: `HeadConflict` |
@@ -2280,8 +2280,13 @@ impl Page {
                     if self.confirmed.contains(&id) {
                         let more = self.engine.step(Event::PutConfirmed(id));
                         self.carry_out(more);
-                    } else if !self.deadlines.contains_key(&Waiting::Held(id)) && !self.held_again.contains_key(&id) {
-                        self.send(Waiting::Held(id), Op::AskHeld { id });
+                    } else {
+                        if !self.deadlines.contains_key(&Waiting::Held(id)) && !self.held_again.contains_key(&id) {
+                            self.send(Waiting::Held(id), Op::AskHeld { id });
+                        }
+                        // Not known here: the engine counts it absent and sends more of its group's parity (sdk#416).
+                        let more = self.engine.step(Event::HeldUnknown(id));
+                        self.carry_out(more);
                     }
                 }
                 // A block rebuilt from its group goes back to the network by the commit's own PUT (send: the same
