@@ -146,3 +146,35 @@ await withGlobalSocket(async () => {
   console.log("ok connection CONTROL: the take-and-break shape loses the whole queue");
 }
 
+
+// ---------------------------------------------------------------------------
+// A REPLACED socket's frames never reach the engine (sdk#490, OPENING.md Machine 3's S2): a head move the old
+// connection carried must not "prove" the new connection's subscription (the node dropped the old one's at close).
+// THE CONTROL: the current socket's frame does reach it.
+// ---------------------------------------------------------------------------
+await withGlobalSocket(async () => {
+  const engine = fakeEngine();
+  const inbound = [];
+  engine.on_inbound = bytes => inbound.push([...bytes]);
+  const events = [];
+  const conn = connect(engine, { url: "ws://x", onEvent: e => events.push(e.kind) });
+  const old = FakeSocket.last;
+  old.open();
+  old.onmessage({ data: new Uint8Array([1]).buffer });
+  assert.deepEqual(inbound, [[1]], "THE SETUP: the open socket's frame did not arrive");
+  old.drop();
+  await new Promise(r => setTimeout(r, 400)); // the reconnect's backoff
+  const fresh = FakeSocket.last;
+  assert.notEqual(fresh, old, "THE SETUP: no new socket was opened");
+  fresh.open();
+  // The OLD socket's frame, arriving after the replacement: dropped, counted, named.
+  old.onmessage({ data: new Uint8Array([2]).buffer });
+  assert.deepEqual(inbound, [[1]], "a replaced socket's frame reached the engine");
+  assert.equal(conn.staleDropped, 1);
+  assert.ok(events.includes("stale"), "the drop was not named");
+  // THE CONTROL: the current socket's frame arrives.
+  fresh.onmessage({ data: new Uint8Array([3]).buffer });
+  assert.deepEqual(inbound, [[1], [3]], "the current socket's frame did not arrive");
+  conn.close();
+  console.log("ok connection: a replaced socket's frames never reach the engine; the current one's do");
+});
