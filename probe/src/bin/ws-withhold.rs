@@ -8,7 +8,7 @@
 //! Requests are read through the probes' one decoder (probe::frames). A connection that is not a WebSocket upgrade (the
 //! node's HTTP: web containers, pieces) is piped through unchanged. Every withheld answer is counted on stderr.
 //!
-//! usage: ws-withhold <listen-port> <node-ws-port>          (both on 127.0.0.1; 7509/7609 refused)
+//! usage: ws-withhold <listen-port> <node-ws-port>          (both on 127.0.0.1; `probe::node::RESERVED` refused)
 use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -101,12 +101,9 @@ async fn websocket(client: TcpStream, node_port: u16, conn: u64) -> Result<()> {
 async fn main() -> Result<()> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let [listen, node] = a.as_slice() else { bail!("usage: ws-withhold <listen-port> <node-ws-port>") };
-    let (listen, node): (u16, u16) = (listen.parse()?, node.parse()?);
-    for p in [listen, node] {
-        if [7509, 7609].contains(&p) {
-            bail!("{p} is somebody else's node: refused");
-        }
-    }
+    // Both ports go through the probes' one guard against the owner's nodes.
+    let listen = probe::node::allowed_port(&format!("ws://127.0.0.1:{listen}"))?;
+    let node = probe::node::allowed_port(&format!("ws://127.0.0.1:{node}"))?;
     let l = TcpListener::bind(("127.0.0.1", listen)).await.with_context(|| format!("binding {listen}"))?;
     eprintln!("{}", serde_json::json!({ "listening": listen, "node": node, "withholding": "answers to PARITY-block PUTs" }));
     let conns = AtomicU64::new(0);
