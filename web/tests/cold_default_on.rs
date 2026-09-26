@@ -29,7 +29,7 @@ fn the_sessions_own_cold_reads_are_gone_and_turning_them_on_is_refused() {
         assert!(!src.contains(gone), "the Session's own cold reader is still here: `{gone}`");
     }
     let set = body_of(&src, "set_cold_reads");
-    assert!(set.contains("self.unusable.push(") && set.contains("sdk#258"), "turning cold reads on is not refused by name:\n{set}");
+    assert!(set.contains("self.say(") && set.contains("sdk#258"), "turning cold reads on is not refused by name:\n{set}");
 }
 
 /// The one-shot timer's entry drives page-io's clock and carries out what it
@@ -47,5 +47,5 @@ fn the_cold_timer_entry_ticks_page_io_and_pumps() {
 fn control_the_reader_finds_the_bodies() {
     let src = session_src();
     assert!(body_of(&src, "provision_page").contains("io.begin(container)"));
-    assert!(body_of(&src, "set_cold_reads").contains("self.unusable.push("));
+    assert!(body_of(&src, "set_cold_reads").contains("self.say("));
 }

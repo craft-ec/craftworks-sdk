@@ -70,7 +70,7 @@ await t("**a view installs NOTHING on the node: its only frames are GETs, the he
   assert.ok(frames.length > 0, "THE CONTROL: the view sent nothing at all, so 'only GETs' would be vacuous");
   assert.deepEqual([...new Set(frames.map(f => f.op))], ["get"], `a view sent ${JSON.stringify(frames)}`);
   assert.ok(frames.some(f => f.subscribe), "the head was not read with a subscription (F55)");
-  assert.match(s.unusable(), /read-only: .*provisioning refused/);
+  assert.match(s.take_unusable(), /read-only: .*provisioning refused/);
 });
 
 await t("THE CONTROL: an ordinary session DOES register with the node — the check above can see it", async () => {
