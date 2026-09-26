@@ -1,11 +1,11 @@
-//! sdk#150 E1/E2: a commit that hears nothing is SETTLED FROM FACT -- never
-//! left in flight for ever with every later write `Busy`.
+//! A commit that hears nothing (COMMIT-LIFE rev 5, C5; rule 8 "No time cut-offs"): SILENCE NEVER ENDS IT. A Racing
+//! commit's PUTs re-send in `Page::send` until answered -- the engine re-puts nothing on a clock and ends nothing on
+//! one -- and a Heading commit's head is ASKED about on its pace (E12), a question whose answer is E6, E7 or E8. The
+//! later writes QUEUE behind it (K1: never `Busy`).
 //!
-//! The engine keeps no bytes of a commit's data puts across calls. Past its
-//! pace it looks at what is true: a block the node holds is confirmed; every
-//! block in and the head sent -> the head is READ; blocks missing -> re-put
-//! from the carried ops (<= 16 KiB), or the commit is `Lost` and the engine
-//! released. Every test rebuilds the engine from its context between steps.
+//! (Before sdk#481 a silent Racing commit was re-put from its carried ops and, past three settle rounds or with ops
+//! too large to carry, ended `Lost`: sdk#150 E1/E2, delegate-era. The two tests that pinned it are rewritten below to
+//! the C5 cell.)
 use engine::{ClientId, Effect, Event, Op, Params, State, WriteId};
 use freenet_prolly::Cid;
 use std::collections::BTreeSet;
@@ -94,11 +94,11 @@ fn tick_until(h: &mut Harness, from: u64, n: u64, id: u64) -> (u64, Vec<Effect>)
     (from + n, out)
 }
 
-/// CARRIED OPS: every data put DROPPED. Past the pace the engine re-derives
-/// the same blocks from the ops it carried and puts them again -- the same
-/// ids -- and the write publishes without ever being told `Lost`.
+/// **Racing x E12, small ops** (was: "a dropped commit with carried ops is re-put and publishes"). Every data put
+/// DROPPED, and the engine hears nothing for many paces: it re-puts NOTHING on the clock (the page's `send` owns the
+/// retry) and ends nothing -- no `Lost`, no try spent. When the blocks land, it publishes.
 #[test]
-fn a_dropped_commit_with_carried_ops_is_re_put_and_publishes() {
+fn a_silent_racing_commit_is_not_re_put_on_a_clock_and_publishes_when_its_puts_land() {
     let p = Params::default();
     let mut h = harness();
     let first = h.step(write(1, small()));
@@ -108,33 +108,32 @@ fn a_dropped_commit_with_carried_ops_is_re_put_and_publishes() {
     for id in &sent {
         h.store.forget(*id); // the puts never arrived
     }
-    let (at, fx) = tick_until(&mut h, 0, 2 * p.reask_after, 1);
-    let again: BTreeSet<Cid> = puts(&fx).into_iter().collect();
-    assert_eq!(again, sent, "not the same blocks re-put (at tick {at})");
-    assert!(at <= p.reask_after + 1, "re-put at tick {at}, past the pace");
-    assert!(!told(&fx, 1).contains(&State::Lost), "a carried commit was told Lost");
-    let all = answer(&mut h, fx);
+    let (_, fx) = tick_until(&mut h, 0, 20 * p.reask_after, 1);
+    assert!(puts(&fx).is_empty(), "the engine re-put on a clock: {} PUTs", puts(&fx).len());
+    assert!(!told(&fx, 1).iter().any(|s| matches!(s, State::Lost | State::Failed)), "silence ended the write: {:?}", told(&fx, 1));
+    let resent: Vec<Effect> = sent.iter().map(|id| Effect::PutBlock { id: *id, bytes: Vec::new(), after: Vec::new() }).collect();
+    let all = answer(&mut h, resent);
     assert!(told(&all, 1).contains(&State::Published), "{:?}", told(&all, 1));
 }
 
-/// NOT CARRIED: the same silence, ops too large to carry. The commit is
-/// `Lost` within its pace, the engine is RELEASED -- the next write is
-/// accepted, not `Busy` -- and the tree is the published one.
+/// **Racing x E12, large ops** (was: "a dropped commit too large to carry is Lost and the engine released"). The same
+/// silence with ops that were too large to carry: nothing is carried any more, and nothing ends on time -- the write
+/// is never `Lost`, and the next write QUEUES behind the commit (`Accepted`, never `Busy`, K1).
 #[test]
-fn a_dropped_commit_too_large_to_carry_is_lost_and_the_engine_released() {
+fn a_silent_racing_commit_of_large_ops_is_never_lost_and_the_next_write_queues() {
     let p = Params::default();
     let mut h = harness();
-    let root = h.published_root();
     let first = h.step(write(1, large()));
     for id in puts(&first) {
         h.store.forget(id);
     }
-    let (at, fx) = tick_until(&mut h, 0, 2 * p.reask_after, 1);
-    assert_eq!(told(&fx, 1), vec![State::Lost], "at tick {at}");
-    assert!(at <= p.reask_after + 1, "Lost at tick {at}, past the pace");
-    assert_eq!(h.published_root(), root);
+    let (_, fx) = tick_until(&mut h, 0, 20 * p.reask_after, 1);
+    assert!(!told(&fx, 1).contains(&State::Lost), "silence ended the write Lost");
+    // Taken into the queue (its path may be cold -- the commit's blocks never reached the node -- so it may wait
+    // `Applying`): never refused.
     let next = h.step(write(2, small()));
-    assert_eq!(told(&next, 2), vec![State::Accepted], "the engine was not released");
+    assert!(!told(&next, 2).iter().any(|s| matches!(s, State::Busy | State::Failed | State::Lost)), "the next write was refused: {:?}", told(&next, 2));
+    assert_eq!(h.engine().queued_writes(), 2, "the next write was not taken into the queue");
 }
 
 

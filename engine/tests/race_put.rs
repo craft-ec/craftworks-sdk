@@ -527,15 +527,12 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     assert!(head(&all).is_none(), "the head was signed with a changed group at k-1 of k+m");
 }
 
-/// NOTHING HELD BACK IS RE-DERIVED (#378 P1-hybrid, rule 7): a commit whose ops are too large to carry has nothing
-/// to re-derive its held-back parity from, and still puts every one of them as its head lands, from the bytes it
-/// held since the first send -- and is BACKED_UP when they are acked.
+/// NOTHING HELD BACK IS RE-DERIVED (#378 P1-hybrid, rule 7): a large commit puts every one of its held-back
+/// parity as its head lands, from the bytes it held since the first send -- and is BACKED_UP when they are acked.
 #[test]
 fn the_held_back_parity_of_a_commit_too_large_to_carry_is_sent_from_its_own_bytes() {
     let mut r = Rig::base();
     let big = vec![put("k/000100", &[7u8; 30 * 1024])];
-    let size: usize = big.iter().map(|(k, op)| k.len() + if let Op::Put(v) = op { v.len() } else { 0 }).sum();
-    assert!(size > Params::default().max_carried_ops_bytes, "THE SETUP: {size} B of ops is carried");
     let first = r.step(Event::forced_write(ClientId(1), WriteId(2), big));
     let mut all = first.clone();
     for id in puts(&first).keys() {
@@ -608,12 +605,12 @@ fn the_largest_pre_race_put_write_still_publishes_with_its_parity() {
 }
 
 /// A DATA BLOCK REJECTED AFTER THE HEAD IS SENT (sdk#433, the architect's gap): with the head sent before the blocks
-/// are in (`head_before_packs`), a rejection does not end the commit, and the commit is not ready, so `settle_by_fact`
-/// re-derives its missing blocks from the ops -- whose "missing" set carried no rejected filter, so the REJECTED block
-/// was put again. The settle rounds re-put the others and never it; the commit ends by the existing rules (here its
-/// head lands: Published), never a loop.
+/// are in (`head_before_packs`), a rejection that leaves every group reachable does not end the commit, and the
+/// REJECTED block is never put again. Since sdk#481 (COMMIT-LIFE C5) the engine re-puts nothing on a clock at all --
+/// the page's `send` owns every retry -- so no tick puts it (or anything); the commit ends by an answer (here its
+/// head lands: Published), never a loop. (Was: "never put again by settle", when settle re-derived from carried ops.)
 #[test]
-fn a_data_block_rejected_after_the_head_is_sent_is_never_put_again_by_settle() {
+fn a_data_block_rejected_after_the_head_is_sent_is_never_put_again() {
     let mut r = Rig::base_with(Params { head_before_packs: true, ..Params::default() });
     let t0 = 1_000_000;
     let _ = r.step(Event::Tick(t0));
@@ -623,17 +620,18 @@ fn a_data_block_rejected_after_the_head_is_sent_is_never_put_again_by_settle() {
     // Nothing is answered: the commit is not ready. The new leaf is rejected.
     let fx = r.step(Event::PutRejected(victim));
     assert!(states(&fx, 4).is_empty(), "a rejection after the head was sent ended the write: {:?}", states(&fx, 4));
-    // Settle rounds come due, again and again: one tick at a time (a jump past CLOCK_RESET_TICKS is a clock reset,
-    // which re-anchors the settle clock), long past every round (reask 16 ticks, doubling; 3 rounds, then Lost).
+    // Paces come due, again and again: one tick at a time (a jump past CLOCK_RESET_TICKS is a clock reset), long
+    // past every head question's round.
     let mut later = Vec::new();
     for k in 1..=600u64 {
         later.extend(r.step(Event::Tick(t0 + k)));
     }
-    assert!(!puts(&later).is_empty(), "THE SETUP: no settle round re-put anything (the path is not reached)");
-    assert!(!puts(&later).contains_key(&victim), "a settle round put the REJECTED block again");
+    assert!(!puts(&later).contains_key(&victim), "a tick put the REJECTED block again");
+    assert!(puts(&later).is_empty(), "the engine re-put on a clock (C5: the page's send owns retries)");
     assert!(r.e.rejected_blocks().contains(&victim));
     let landed = r.step(Event::HeadConfirmed(seq));
-    assert!(states(&landed, 4).contains(&State::Published) || states(&later, 4).contains(&State::Lost), "the commit neither published nor was lost: {:?} / {:?}", states(&later, 4), states(&landed, 4));
+    assert!(!states(&later, 4).contains(&State::Lost), "silence ended the write Lost");
+    assert!(states(&landed, 4).contains(&State::Published), "the commit did not publish when its head landed: {:?}", states(&landed, 4));
 }
 
 /// A BLOCK THE NODE'S CONTRACT REJECTS (sdk#433; the architect's rulings): `PutRejected` is a REAL END, never a

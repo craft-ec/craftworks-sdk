@@ -694,15 +694,6 @@ pub struct Params {
     /// one already made. Checked at construction against
     /// `asks::CONTEXT_SHARE` of `max_context_bytes`.
     pub max_asks: usize,
-    /// The most a commit's OPS may take in the context, serialized, so a
-    /// data put lost in flight can be re-derived and re-put (sdk#150 E2).
-    /// A commit's BYTES are never carried -- up to 128 blocks of 16 KiB
-    /// against a 400 KiB context -- but the ops that made them are usually
-    /// small, and the apply is a pure function of (base root, ops). A write
-    /// over this is released `Lost` instead, and its client re-sends.
-    pub max_carried_ops_bytes: usize,
-    /// How many settle rounds a commit gets before it is released `Lost`.
-    pub max_settle_rounds: u32,
     /// What of `max_context_bytes` the SHELL's own state may take beside the
     /// engine's: its read-backs (up to one commit's blocks), the head, the
     /// tracing flags, and the wrapper. Checked by the shell's tests.
@@ -920,8 +911,6 @@ impl Default for Params {
             max_write_bytes: 8 * 1024 * 1024,
             reask_after: 16,
             max_asks: 132,
-            max_carried_ops_bytes: 16 * 1024,
-            max_settle_rounds: 3,
             shell_context_reserve: 12 * 1024,
             min_parked_read_bytes: 32 * 1024,
             max_fetch_per_round: 4,
@@ -1209,16 +1198,8 @@ struct Commit {
     /// Bytes of the accepted-but-not-durable writes, for the backlog bound.
     bytes: usize,
     /// The root the commit's ops were applied to: the published root when it
-    /// started. Re-applying `ops` to it re-derives the same blocks.
+    /// started (the head's `prev`).
     base: Cid,
-    /// The ops that made this commit, when they fit `max_carried_ops_bytes`:
-    /// what a lost data put is re-derived from (sdk#150 E2).
-    ops: Option<Vec<(Vec<u8>, Op)>>,
-    /// When this commit was last settled from fact, and how many times --
-    /// its OWN pace, doubling like an ask's. Per commit rather than per
-    /// block: a commit's data puts would fill the asks table's slots.
-    settle_at: u64,
-    settle_rounds: u32,
     /// The last arrival number in this commit's group (K9): the `through`
     /// its head's ledger records for this page.
     #[serde(default)]
@@ -2435,7 +2416,7 @@ impl<B: Blocks> Engine<B> {
             return out;
         }
         // A FOREIGN MOVE (R-b) ends the commit in flight: E8, one teardown.
-        self.end_commit(End::Dead { witness, head: Some((seq, root)) })
+        self.end_commit(End::Dead { witness, head: (seq, root) })
     }
 
     /// A client asking after a write this engine has never heard of.
@@ -3310,7 +3291,6 @@ impl<B: Blocks> Engine<B> {
         let mut taken = 0usize;
         let mut dropped = false;
         let mut stopped_cold: Option<Vec<Cid>> = None;
-        let mut ops_all: Vec<(Vec<u8>, Op)> = Vec::new();
         let mut blocks = 0usize;
         let mut last_warm = None;
         let mut through = 0u64;
@@ -3378,7 +3358,6 @@ impl<B: Blocks> Engine<B> {
             if q.reads.iter().any(|(_, e)| *e == Expect::Any) {
                 self.forced_writes += 1;
             }
-            ops_all.extend(q.ops.iter().cloned());
             writes.push((q.client, q.write_id));
             bytes += q.size;
             through = through.max(q.arrival);
@@ -3440,7 +3419,7 @@ impl<B: Blocks> Engine<B> {
         let listed: BTreeSet<Cid> = to_ship.iter().filter_map(|(_, b)| Node::parse(b).ok()).flat_map(|n| n.parity().collect::<Vec<_>>()).collect();
         let mut seen_parity = BTreeSet::new();
         let parity: Vec<(Cid, Vec<u8>)> = cut_parity.into_iter().filter(|(c, _)| listed.contains(c) && seen_parity.insert(*c)).collect();
-        out.extend(self.start_commit(to_ship, parity, Some(ops_all), writes, bytes));
+        out.extend(self.start_commit(to_ship, parity, writes, bytes));
         if let Some(c) = self.life.commit_mut() {
             c.through = through;
         }
@@ -3727,7 +3706,6 @@ impl<B: Blocks> Engine<B> {
         &mut self,
         emitted: Vec<(Cid, Vec<u8>)>,
         parity: Vec<(Cid, Vec<u8>)>,
-        ops: Option<Vec<(Vec<u8>, Op)>>,
         writes: Vec<(ClientId, WriteId)>,
         bytes: usize,
     ) -> Vec<Effect> {
@@ -3870,11 +3848,6 @@ impl<B: Blocks> Engine<B> {
             writes,
             bytes,
             base: self.published_root,
-            ops: ops.filter(|o| {
-                bincode::serialized_size(o).is_ok_and(|n| n as usize <= self.params.max_carried_ops_bytes)
-            }),
-            settle_at: self.now,
-            settle_rounds: 0,
             through: 0,
             race,
             deferred,
@@ -3910,134 +3883,16 @@ impl<B: Blocks> Engine<B> {
         vec![Effect::PutBlock { id, bytes, after: Vec::new() }]
     }
 
-    /// SETTLE A SILENT COMMIT FROM FACT (sdk#150 E1/E2).
-    ///
-    /// An effect the engine emitted can be stranded, cut or never answered,
-    /// and nothing reports that: "asked, therefore it happened" left a commit
-    /// in flight for ever and every later write `Busy`. So once a commit has
-    /// heard nothing for its pace (`reask_after`, doubling per round), the
-    /// engine looks at what is TRUE:
-    ///   1. a data block the node HOLDS is confirmed, whoever did or did not
-    ///      say so (a sync read of what is held here, F14);
-    ///   2. every block confirmed and the head sent: READ the head -- its
-    ///      seq and root are in the context, so nothing is re-sent blind;
-    ///   3. blocks still missing: re-apply the carried ops to the commit's
-    ///      base and re-put the missing ones (the same ops on the same root
-    ///      make the same blocks); with no ops carried, or after
-    ///      `max_settle_rounds`, the commit is `Lost` and the engine is
-    ///      RELEASED -- the client still holds the ops, and re-sends.
-    fn settle_by_fact(&mut self, now: u64) -> Vec<Effect> {
-        let heading = self.life.stage() == CommitStage::Heading;
-        let Some(c) = self.life.commit() else {
-            return Vec::new();
-        };
-        let wait = self
-            .params
-            .reask_after
-            .saturating_mul(1 << c.settle_rounds.min(asks::MAX_DOUBLINGS));
-        if now.saturating_sub(c.settle_at) < wait {
+    /// THE HEAD QUESTION (COMMIT-LIFE Heading x E12): a Heading commit that has heard nothing for its pace
+    /// (`reask_after`, doubling per round) READS the head -- its seq and root are known, so nothing is re-sent blind --
+    /// and the answer is E6, E7 or E8. A QUESTION, never an end (C5, rule 8). A Racing commit has no such round: its
+    /// PUTs re-send in `Page::send` until answered, and silence never ends it (A6); only answers do.
+    fn ask_head(&mut self, now: u64) -> Vec<Effect> {
+        if !self.life.head_question_due(now, self.params.reask_after) {
             return Vec::new();
         }
-        // A block is CONFIRMED only by the node's answer. "Held here" is not
-        // one on the page path: `self.blocks` is the PAGE's own memory, so
-        // every block the page made read as held, and a head could be signed
-        // over blocks the node never took (engineer1, on sdk#296's terminal).
-        // Under race put (§P) that would count toward k.
-        let mut out = Vec::new();
-        let unacked = self.unacked();
-        let Some(c) = self.life.commit_mut() else {
-            return out;
-        };
-        c.settle_at = now;
-        c.settle_rounds += 1;
-        // The parity held back behind the Sign (#378 P1-hybrid) is not re-put ahead of it: until the head lands it
-        // was never sent, and after, the commit is Backing and a straggler is re-put like any block.
-        // A block the node's contract REJECTED (sdk#433) is never put again, the head sent or not (the architect's gap:
-        // on_rejected ends the commit only before the head; after it the block stays in `data`, unconfirmed).
-        let rejected = &self.rejected;
-        let missing: BTreeSet<Cid> = c
-            .owed()
-            .filter(|id| !c.deferred.iter().any(|(d, _)| d == *id) && !rejected.contains(*id))
-            .copied()
-            .collect();
-        if missing.is_empty() || c.ready(self.params.race_put, &unacked) {
-            if heading {
-                out.push(Effect::ReadHead {
-                    epoch: self.head_epoch.unwrap_or(Epoch(1)),
-                });
-            }
-            return out;
-        }
-        if c.settle_rounds <= self.params.max_settle_rounds {
-            if let Some(fx) = self.reput_from_ops(&missing) {
-                out.extend(fx);
-                return out;
-            }
-        }
-        out.extend(self.release_lost());
-        out
+        vec![Effect::ReadHead { epoch: self.head_epoch.unwrap_or(Epoch(1)) }]
     }
-
-    /// Re-derive the commit's missing blocks from its carried ops, and put
-    /// them again. `None` when no ops are carried, or they no longer make
-    /// the commit's root (nothing to re-put that would be the same commit).
-    fn reput_from_ops(&mut self, missing: &BTreeSet<Cid>) -> Option<Vec<Effect>> {
-        let c = self.life.commit()?;
-        let batch = batch_of(c.ops.as_ref()?);
-        let (base, root) = (c.base, c.root);
-        let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
-        let applied = apply_with(
-            ApplyOptions::default(),
-            &self.source(),
-            &base,
-            &batch,
-            |id, b: &[u8]| emitted.push((id, b.to_vec())),
-        );
-        match applied {
-            // The commit's PARITY is its blocks too (§P: put in the same
-            // round as the data), so a re-put from the carried ops re-derives
-            // it from the same apply -- or the commit could never be
-            // recoverable again after its puts were lost.
-            // The ROOT's parity (sdk#335) is re-derived the same way.
-            Ok(a) if a.root == root => Some(
-                root_parity_blocks(root, &emitted)
-                    .into_iter()
-                    .chain(emitted)
-                    .chain(a.parity.iter().cloned())
-                    .filter(|(id, _)| missing.contains(id))
-                    .map(|(id, bytes)| Effect::PutBlock {
-                        id,
-                        bytes,
-                        after: Vec::new(),
-                    })
-                    .collect(),
-            ),
-            // The path went cold since (F33): fetch it, and re-derive on the
-            // next round.
-            Err(ApplyError::Read(ReadError::Need(need))) => Some(
-                need.into_iter()
-                    .map(|id| Effect::FetchBlock {
-                        id,
-                        via: read::Via::Direct,
-                        attempt: 1,
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        }
-    }
-
-    /// Give up the commit in flight: its writes are `Lost` (their edits are
-    /// not in any published tree; each client still holds its ops and
-    /// re-sends), the tree goes back to the published one, the groups it
-    /// coded stop being owed -- they describe a tree that never published --
-    /// and the engine is open for the next write.
-    fn release_lost(&mut self) -> Vec<Effect> {
-        // `Lost` is a foreign move (R-b): go-back-N happens in the one teardown. No head is adopted: the tree goes
-        // back to the published one.
-        self.end_commit(End::Dead { witness: None, head: None })
-    }
-
 
     /// The head read back shows the commit's head is NOT there (an older seq,
     /// or none): the write of it never landed. Re-issue it -- the same seq and
@@ -4195,7 +4050,7 @@ impl<B: Blocks> Engine<B> {
         // the head is the journal and `published` is the first state that
         // survives a restart.
         // Racing -> Heading (the one forward move, C2).
-        self.life.send_head();
+        self.life.send_head(self.now);
         if let Some(c) = self.life.commit() {
             out.push(self.head_of(c));
         }
@@ -4276,13 +4131,7 @@ impl<B: Blocks> Engine<B> {
                         self.life.back(c.writes.clone(), remaining);
                     }
                 }
-                match head {
-                    Some((seq, root)) => out.extend(self.adopt(seq, root)),
-                    None => {
-                        self.root = self.published_root;
-                        self.next_seq = self.published_seq + 1;
-                    }
-                }
+                out.extend(self.adopt(head.0, head.1));
                 // A head that never left reads no witness and spends no try (A8).
                 let witness = if headed { witness } else { None };
                 out.extend(self.rederive_after_foreign_move(&c.writes, c.through, witness, headed));
@@ -4507,7 +4356,7 @@ impl<B: Blocks> Engine<B> {
         // sign there is nothing here to ship.
         if self.life.commit().is_none() && !self.unpublished.is_empty() {
             let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship, Vec::new(), None, Vec::new(), 0));
+            out.extend(self.start_commit(to_ship, Vec::new(), Vec::new(), 0));
         }
         out
     }
@@ -4534,11 +4383,6 @@ impl<B: Blocks> Engine<B> {
         if self.now == 0 {
             self.life.anchor(now, false);
             self.asks.anchor(now);
-            if let Some(c) = self.life.commit_mut() {
-                if c.settle_at == 0 {
-                    c.settle_at = now;
-                }
-            }
         } else if now < self.now || now - self.now > CLOCK_RESET_TICKS {
             // A CLOCK RESET (sdk#150 review B). `now` is whatever the client
             // sends, and every deadline is measured against it: one tick ten
@@ -4550,9 +4394,6 @@ impl<B: Blocks> Engine<B> {
             // gone.
             self.life.anchor(now, true);
             self.asks.reanchor(now);
-            if let Some(c) = self.life.commit_mut() {
-                c.settle_at = now;
-            }
             if let Some(p) = self.parked_write.as_mut() {
                 p.idle_at = now;
             }
@@ -4560,7 +4401,7 @@ impl<B: Blocks> Engine<B> {
         self.now = now;
         let mut out = self.age_out_accepted(now);
         out.extend(self.release_silent_parked_write(now));
-        out.extend(self.settle_by_fact(now));
+        out.extend(self.ask_head(now));
         out
     }
 
@@ -4690,11 +4531,10 @@ pub(crate) fn worst_case_fixed_bytes(params: &Params) -> usize {
     let group: ParityIds = [cid; PARITY];
 
     // The commit in flight, at its caps: data and confirmed ids, one group per
-    // block at most, the carried ops, and its few writes and scalars.
+    // block at most, and its few writes and scalars.
     let m = |a: usize, b: usize| a.saturating_mul(b);
     let commit = m(m(2, params.max_commit_blocks), enc(o().serialized_size(&cid)))
         .saturating_add(m(params.max_commit_blocks, enc(o().serialized_size(&group))))
-        .saturating_add(params.max_carried_ops_bytes)
         .saturating_add(512);
     // The parked write: the path it waits on (its ops are in the page's
     // queue, R-b).
