@@ -30,6 +30,13 @@ pub fn allowed_port(url: &str) -> Result<u16> {
     Ok(port)
 }
 
+/// The `freenet` on PATH, as it names itself (`freenet --version`'s first line): what every live probe prints first, so
+/// its result names the release it ran against.
+pub fn freenet_version() -> Result<String> {
+    let v = Command::new("freenet").arg("--version").output().context("freenet --version")?;
+    Ok(String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or_default().to_string())
+}
+
 /// EVERY port a run derives, refused BEFORE anything starts if one is someone else's (the architect's review of
 /// sdk#444: a base a few below 7509 derives 7509). Each probe keeps its own layout (its offsets, and their overflow);
 /// this is the one rule, through [`allowed_port`], so a refusal names the port the same way everywhere.
