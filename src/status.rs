@@ -4,98 +4,80 @@
 
 use crate::store::RowState;
 
-/// Where an app's contract PUT stands (`Session::put_status`'s `state`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PutStatus {
-    None,
-    Pending,
-    Put,
-    Refused,
-    Cancelled,
-}
-
-impl PutStatus {
-    pub const ALL: [PutStatus; 5] = [PutStatus::None, PutStatus::Pending, PutStatus::Put, PutStatus::Refused, PutStatus::Cancelled];
-
-    pub fn code(self) -> &'static str {
-        match self {
-            PutStatus::None => "none",
-            PutStatus::Pending => "pending",
-            PutStatus::Put => "put",
-            PutStatus::Refused => "refused",
-            PutStatus::Cancelled => "cancelled",
+/// ONE LIST PER VOCABULARY, BY CONSTRUCTION (the architect on #523): the enum, its `code()` and its `ALL` are all
+/// declared from ONE `Variant => "word"` list, so a variant cannot be left out of `ALL` (or `from_code`) -- there is
+/// no second list to forget. Attributes (docs, `#[default]`, derives) pass through.
+macro_rules! vocabulary {
+    ($(#[$m:meta])* $vis:vis enum $name:ident { $($(#[$vm:meta])* $v:ident => $code:literal),+ $(,)? }) => {
+        $(#[$m])*
+        $vis enum $name {
+            $($(#[$vm])* $v),+
         }
+
+        impl $name {
+            /// Every word, in declaration order: the same token list as the enum.
+            pub const ALL: [$name; [$(stringify!($v)),+].len()] = [$($name::$v),+];
+
+            /// The stable code that crosses the boundary.
+            pub fn code(self) -> &'static str {
+                match self {
+                    $($name::$v => $code),+
+                }
+            }
+
+            /// The word a code names; `None` for a code this build does not know.
+            pub fn from_code(code: &str) -> Option<$name> {
+                $name::ALL.into_iter().find(|w| w.code() == code)
+            }
+        }
+    };
+}
+pub(crate) use vocabulary;
+
+vocabulary! {
+    /// Where an app's contract PUT stands (`Session::put_status`'s `state`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PutStatus {
+        None => "none",
+        Pending => "pending",
+        Put => "put",
+        Refused => "refused",
+        Cancelled => "cancelled",
     }
 }
 
-/// How an app's site publication stands (`Session::site_status`'s `state`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SiteStatus {
-    None,
-    Publishing,
-    Published,
-    Superseded,
-    Refused,
-    Cancelled,
-}
-
-impl SiteStatus {
-    pub const ALL: [SiteStatus; 6] =
-        [SiteStatus::None, SiteStatus::Publishing, SiteStatus::Published, SiteStatus::Superseded, SiteStatus::Refused, SiteStatus::Cancelled];
-
-    pub fn code(self) -> &'static str {
-        match self {
-            SiteStatus::None => "none",
-            SiteStatus::Publishing => "publishing",
-            SiteStatus::Published => "published",
-            SiteStatus::Superseded => "superseded",
-            SiteStatus::Refused => "refused",
-            SiteStatus::Cancelled => "cancelled",
-        }
+vocabulary! {
+    /// How an app's site publication stands (`Session::site_status`'s `state`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SiteStatus {
+        None => "none",
+        Publishing => "publishing",
+        Published => "published",
+        Superseded => "superseded",
+        Refused => "refused",
+        Cancelled => "cancelled",
     }
 }
 
-/// May this session write a head (`Session::can_write`'s `answer`)?
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CanWrite {
-    Yes,
-    No,
-    Unknown,
-}
-
-impl CanWrite {
-    pub const ALL: [CanWrite; 3] = [CanWrite::Yes, CanWrite::No, CanWrite::Unknown];
-
-    pub fn code(self) -> &'static str {
-        match self {
-            CanWrite::Yes => "yes",
-            CanWrite::No => "no",
-            CanWrite::Unknown => "unknown",
-        }
+vocabulary! {
+    /// May this session write a head (`Session::can_write`'s `answer`)?
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CanWrite {
+        Yes => "yes",
+        No => "no",
+        Unknown => "unknown",
     }
 }
 
-/// What the node's signer answered when asked which head it signs for (`Session::asked`'s `state`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AskedState {
-    Pending,
-    Register,
-    NoKey,
-    NoSigner,
-    Refused,
-}
-
-impl AskedState {
-    pub const ALL: [AskedState; 5] = [AskedState::Pending, AskedState::Register, AskedState::NoKey, AskedState::NoSigner, AskedState::Refused];
-
-    pub fn code(self) -> &'static str {
-        match self {
-            AskedState::Pending => "pending",
-            AskedState::Register => "register",
-            AskedState::NoKey => "nokey",
-            AskedState::NoSigner => "nosigner",
-            AskedState::Refused => "refused",
-        }
+vocabulary! {
+    /// What the node's signer answered when asked which head it signs for (`Session::asked`'s `state`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AskedState {
+        Pending => "pending",
+        Register => "register",
+        NoKey => "nokey",
+        NoSigner => "nosigner",
+        Refused => "refused",
     }
 }
 
@@ -136,6 +118,23 @@ mod tests {
             assert_eq!(got, list, "{name} is not its enum's ALL");
             assert_eq!(list.iter().collect::<BTreeSet<_>>().len(), list.len(), "{name} says a word twice");
         }
+    }
+
+    /// Every word names its own variant back (`vocabulary!` builds `code`, `ALL` and `from_code` from one list, so
+    /// no variant can be missing from `ALL`: a variant added to the list is in all three at once).
+    #[test]
+    fn every_word_names_its_variant_back() {
+        fn round<T: Copy + PartialEq + std::fmt::Debug>(all: &[T], code: fn(T) -> &'static str, from: fn(&str) -> Option<T>) {
+            for w in all {
+                assert_eq!(from(code(*w)), Some(*w), "{w:?}");
+            }
+            assert_eq!(from("NOT_A_WORD"), None);
+        }
+        round(&RowState::ALL, RowState::code, RowState::from_code);
+        round(&PutStatus::ALL, PutStatus::code, PutStatus::from_code);
+        round(&SiteStatus::ALL, SiteStatus::code, SiteStatus::from_code);
+        round(&CanWrite::ALL, CanWrite::code, CanWrite::from_code);
+        round(&AskedState::ALL, AskedState::code, AskedState::from_code);
     }
 
     /// Lost is the rolled-back state, and nothing else.
