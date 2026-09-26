@@ -152,3 +152,59 @@ fn the_tabs_contract_shapes_are_golden() {
     assert_eq!(keys(&set_answer(Ok(()))), ["ok"]);
     assert_eq!(keys(&set_answer(Err(SetRefused::BadAddress("x".into())))), ["refused", "said"]);
 }
+
+/// keepSet's decision: an asset with no record starts from ITS default (own vs app), a record's other fields are kept,
+/// and a bad edit is BAD_POLICY by name with nothing produced.
+#[test]
+fn keep_set_starts_from_the_right_default_keeps_the_rest_and_refuses_a_bad_edit_by_name() {
+    let own = set_policy(&OWN, &OWN, None, r#"{"warn_below": 3}"#).expect("an own edit");
+    assert_eq!(own, Keep { warn_below: 3, ..Keep::OWN_DEFAULT });
+    let app = set_policy(&OWN, &APP, None, r#"{"repair": "off"}"#).expect("an app edit");
+    assert_eq!(app, Keep { repair: Repair::Off, ..Keep::APP_DEFAULT });
+    let audited = keep(Repair::Always, 1_790_000_000, 12, 1, 0);
+    assert_eq!(set_policy(&OWN, &APP, Some(audited), r#"{"repair": {"below": 2}}"#), Ok(Keep { repair: Repair::Below(2), ..audited }), "an edit lost the record's last pass");
+    assert!(matches!(set_policy(&OWN, &APP, None, r#"{"warn_below": 200}"#), Err(SetRefused::BadPolicy(_))), "an out-of-range warn_below was taken");
+    assert!(matches!(set_policy(&OWN, &APP, None, "not json"), Err(SetRefused::BadPolicy(_))));
+}
+
+/// The write-back from the report AS THE TAB READS IT equals the write-back from the Report itself (one meaning, two
+/// doors: rule "every public door gets the same tests"); unmeasured, running and absent reports write nothing.
+#[test]
+fn the_write_back_from_the_tabs_report_equals_the_write_back_from_the_report() {
+    let done = report(true, &[(3, 2), (8, 10)], 10, 1, vec![[9; 32]], Health::Damaged);
+    let v = report_json(Some(&done), None, &Keep::APP_DEFAULT);
+    for (existing, own) in [(None, false), (None, true), (Some(keep(Repair::Below(2), 5, 1, 1, 1)), false)] {
+        assert_eq!(write_back_json(existing, own, &v), write_back(existing, own, &done), "the two doors disagree ({existing:?}, own {own})");
+    }
+    assert!(write_back_json(None, false, &v).is_some(), "THE CONTROL: a done report writes");
+    let unmeasured = report_json(Some(&report(false, &[], 0, 0, vec![], Health::Unmeasured)), None, &Keep::APP_DEFAULT);
+    assert_eq!(write_back_json(None, false, &unmeasured), None, "an unmeasured pass wrote a record");
+    let running = report_json(None, Some((3, 9)), &Keep::APP_DEFAULT);
+    assert_eq!(write_back_json(None, false, &running), None, "a running pass wrote a record");
+    assert_eq!(write_back_json(None, false, &serde_json::Value::Null), None);
+    // The STATE decides, not the fields' presence: a done report's fields under another state write nothing.
+    for state in [PassState::Unmeasured, PassState::Running] {
+        let mut forged = v.clone();
+        forged["state"] = state.word().into();
+        assert_eq!(write_back_json(None, false, &forged), None, "a {} report with every field wrote a record", state.word());
+    }
+}
+
+/// Every lane has a name that reads back as itself. The match below has no `_`: a new lane fails to compile HERE
+/// until it is named and listed.
+#[test]
+fn every_lane_has_one_name_that_reads_back() {
+    fn every(l: page::Lane) -> page::Lane {
+        match l {
+            page::Lane::Interactive | page::Lane::Background => l,
+        }
+    }
+    for l in [page::Lane::Interactive, page::Lane::Background].map(every) {
+        assert_eq!(lane_of(lane_name(l)), Some(l), "{l:?} does not read back from its name");
+    }
+    // The names ARE the JS contract (`notAnswering({ lane: "background" })`, js/session.js): pinned, not only consistent.
+    assert_eq!(lane_of("background"), Some(page::Lane::Background));
+    assert_eq!(lane_of("interactive"), Some(page::Lane::Interactive));
+    assert_eq!(lane_of("Background"), None, "names are exact");
+    assert_eq!(lane_of(""), None);
+}

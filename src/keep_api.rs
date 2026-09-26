@@ -177,3 +177,40 @@ pub enum SetRefused {
     BadAddress(String),
     BadPolicy(String),
 }
+
+/// `keepSet`'s decision once the address is parsed (the parser is page-io's, `site_id_of_address`): the target's
+/// record, or its default when it has none (the OWN tree's own default, an app's the app default), with the edit
+/// applied. A bad edit is `BAD_POLICY` by name, and nothing is written.
+pub fn set_policy(own: &[u8; 32], target: &[u8; 32], existing: Option<Keep>, policy: &str) -> Result<Keep, SetRefused> {
+    let base = existing.unwrap_or(if target == own { Keep::OWN_DEFAULT } else { Keep::APP_DEFAULT });
+    apply_policy(base, policy).map_err(SetRefused::BadPolicy)
+}
+
+/// The FULL pass's write-back from its report AS THE TAB READ IT (`report_json`'s shape, the golden contract): a
+/// report crosses from the asset's page (its `tree()` session) to the own tree's session only in that form, so this
+/// reads the one shape rather than a second encoding. Only a `done` pass writes (an `unmeasured` one measured nothing,
+/// a running one has not ended); a report that does not read as `done` writes nothing.
+pub fn write_back_json(existing: Option<Keep>, own: bool, report: &Value) -> Option<Keep> {
+    if report.get("state").and_then(Value::as_str) != Some(PassState::Done.word()) {
+        return None;
+    }
+    let n = |k: &str| report.get(k).and_then(Value::as_u64).and_then(|x| u32::try_from(x).ok());
+    let damaged = u32::try_from(report.get("damaged")?.as_array()?.len()).ok()?;
+    let finished_at = report.get("finished_at").and_then(Value::as_u64)?;
+    let base = existing.unwrap_or(if own { Keep::OWN_DEFAULT } else { Keep::APP_DEFAULT });
+    Some(Keep { audited_at: finished_at / 1000, health: Counts { groups: n("groups")?, whole: n("whole")?, degraded: n("degraded")?, damaged }, ..base })
+}
+
+/// A lane by the name `notAnswering({ lane })` takes. The names are [`lane_name`]'s, the one list: every lane there
+/// is, matched exhaustively, so a new lane has no name until one is written.
+pub fn lane_of(name: &str) -> Option<page::Lane> {
+    [page::Lane::Interactive, page::Lane::Background].into_iter().find(|l| lane_name(*l) == name)
+}
+
+/// A lane's name, as JavaScript says it.
+pub fn lane_name(lane: page::Lane) -> &'static str {
+    match lane {
+        page::Lane::Interactive => "interactive",
+        page::Lane::Background => "background",
+    }
+}
