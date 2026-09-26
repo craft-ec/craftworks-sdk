@@ -1379,7 +1379,9 @@ impl Page {
                     v.landing = false;
                     backoff(v, now);
                 }
-                A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved | Why::NotSuccessor) => {
+                // The one retryable set (`Why::retryable`), and NotSuccessor: a landing asks from the register's own
+                // head, which may have moved by the time it lands.
+                A::Refused(why) if why.retryable() || why == Why::NotSuccessor => {
                     let now = self.now;
                     let v = self.verify.as_mut().expect("checked");
                     v.landing = false;
@@ -1399,7 +1401,7 @@ impl Page {
         }
         let Some(owed) = self.head.owed.as_mut() else { return };
         self.head.sign_refusals = match &s {
-            A::Refused(Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved) => self.head.sign_refusals,
+            A::Refused(why) if why.retryable() => self.head.sign_refusals,
             _ => 0,
         };
         match s {
@@ -1444,7 +1446,7 @@ impl Page {
             // first to make it held; RecordNotSaved — the signer could not
             // write its record and signed nothing. A node's "queue full" is
             // not a signer answer: it is re-asked by the deadline.
-            A::Refused(why @ (Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved)) => {
+            A::Refused(why) if why.retryable() => {
                 if why == Why::HeadUnknown {
                     self.send(Waiting::Warm, Op::ReadHead { label: Label::Head });
                 }
@@ -1876,7 +1878,7 @@ impl Page {
         use signer_proto::{Answer as A, Why};
         let label = Label::Site(app.to_string());
         let Some(owed) = self.sites.get(app).and_then(|p| p.owed.clone()) else { return };
-        if !matches!(s, A::Refused(Why::HeadUnknown | Why::RecordNotSaved)) {
+        if !matches!(&s, A::Refused(why) if why.retryable()) {
             self.pub_mut(&label).sign_refusals = 0;
         }
         // What the publication waits on, stated (not "not answering": the signer answered).
@@ -1895,7 +1897,8 @@ impl Page {
                 None => self.end_site(app, Publication::Refused("the signer's record does not read".into())),
             },
             A::NotNext { current } => self.rebase_site(app, current.seq, current.root),
-            A::Refused(Why::HeadUnknown | Why::RecordNotSaved) => {
+            // The one retryable set (`Why::retryable`), the head's backoff.
+            A::Refused(why) if why.retryable() => {
                 let now = self.now;
                 let p = self.pub_mut(&label);
                 p.sign_refusals += 1;
