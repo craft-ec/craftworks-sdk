@@ -1912,7 +1912,7 @@ fn a_page_with_no_signer_reports_its_asset_unmeasured() {
                     };
                     b.answer(a, Ms(now));
                 }
-                _ => {}
+                other => panic!("an audit on a settled page sent {other:?}"),
             }
         }
     }
@@ -1938,7 +1938,6 @@ fn a_rejected_block_is_absent_listed_and_never_asked() {
     a.write(ClientId(1), WriteId(1), rows);
     // The node rejects the first 2,000-byte value block it is asked to PUT; everything else is served.
     let mut rejected = None;
-    let mut asked_after = 0usize;
     for _ in 0..3_000 {
         let ops = a.take_ops();
         if ops.is_empty() {
@@ -1961,7 +1960,6 @@ fn a_rejected_block_is_absent_listed_and_never_asked() {
                     Some(Answer::PutOk(id))
                 }
                 Op::Get { id } => {
-                    asked_after += usize::from(Some(id) == rejected);
                     Some(match node.blocks.get(&id) {
                         Some(b) => Answer::Got { id, bytes: b.clone() },
                         None => Answer::GetMissed(id),
@@ -1977,7 +1975,6 @@ fn a_rejected_block_is_absent_listed_and_never_asked() {
                 }
                 Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
                 Op::AskHeld { batch, ids } => {
-                    asked_after += ids.iter().filter(|id| Some(**id) == rejected).count();
                     Some(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() })
                 }
                 Op::PutApp { key } => Some(Answer::AppPutOk(key)),
@@ -1992,14 +1989,12 @@ fn a_rejected_block_is_absent_listed_and_never_asked() {
     let rejected = rejected.expect("THE SETUP: no follow-up parity block was rejected");
     assert!(a.published().0 >= 1, "THE SETUP: A did not publish (a rejected block ends nothing past the head)");
     a.audit();
-    asked_after = 0;
     let asks = audit_asks(&mut a, &mut node, &mut now, rejected);
     let r = a.take_audit().expect("the pass did not end");
     println!("rejected: {} of {} groups: whole {}, degraded {}, damaged {}; asks of the rejected block {asks}", r.rejected.len(), r.groups, r.whole, r.degraded, r.damaged.len());
     assert_eq!(r.rejected, vec![rejected], "the rejected block is not listed in `rejected`");
     assert_eq!((r.degraded, r.damaged.len()), (1, 0), "a group missing one rejected block is not degraded (it is still whole enough to rebuild)");
     assert_eq!(asks, 0, "the audit asked Held or GET about a block the node rejected");
-    let _ = asked_after;
 }
 
 /// Serve `p`'s audit as `audit_serve` does, counting the Held asks and GETs that name `id`.

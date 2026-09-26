@@ -112,7 +112,8 @@ fn a_cold_nodes_walk_fetches_through_the_read_path_as_background_work() {
                         next.push(Event::BlockArrived { id: *id, bytes });
                     }
                     Effect::Reply { client, result: ReadResult::Nodes { nodes, next }, .. } if *client == ClientId::BACKGROUND => done = Some((nodes.len(), next.clone())),
-                    _ => {}
+                    Effect::Progress { .. } => {}
+                    other => panic!("a nodes walk emitted {other:?}"),
                 }
             }
             if done.is_some() || next.is_empty() {
