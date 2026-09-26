@@ -2060,9 +2060,12 @@ fn value_group(node: &Node) -> (Vec<Cid>, Vec<Cid>) {
     (members, parity)
 }
 
-/// Drop `gone` from the node, run one pass under `policy`, and return its report, the PUTs it sent, and the bytes the
-/// node held for each dropped id before (the PUBLISHED blocks).
-fn repair_pass(mut node: Node, mut b: Page, mut now: u64, gone: &[Cid], policy: page::audit::Repair) -> (page::audit::Report, Vec<(Cid, Vec<u8>)>, BTreeMap<Cid, Vec<u8>>, Node) {
+/// What one repair pass left: its report, the PUTs it sent, the bytes the node held for each dropped id before (the
+/// PUBLISHED blocks), and the node after.
+type RepairRun = (page::audit::Report, Vec<(Cid, Vec<u8>)>, BTreeMap<Cid, Vec<u8>>, Node);
+
+/// Drop `gone` from the node, run one pass under `policy`, and return what it left ([`RepairRun`]).
+fn repair_pass(mut node: Node, mut b: Page, mut now: u64, gone: &[Cid], policy: page::audit::Repair) -> RepairRun {
     let originals: BTreeMap<Cid, Vec<u8>> = gone.iter().map(|id| (*id, node.blocks.remove(id).expect("THE SETUP: a block to drop"))).collect();
     b.audit(policy, true);
     let mut puts = Vec::new();

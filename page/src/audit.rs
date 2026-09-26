@@ -13,6 +13,10 @@
 //! `repair::rebuild` (hash-checked); parity is recomputed per group (`parity::repair_group` states ->
 //! `parity::encode_group`) and goes out only under its listed id. A repair PUT is re-sent until ANSWERED (rules 7/8).
 
+// No catch-all over a state or an event: a new case fails the build until it is handled (clippy, run by the gate
+// with -D warnings).
+#![deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)]
+
 use engine::read::{NodeGroups, NodesAt};
 use engine::repair::Group;
 use freenet_prolly::{block_id, kind, parity, Cid};

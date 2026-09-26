@@ -161,10 +161,10 @@ fn an_incremental_walk_names_every_node_the_new_root_added_and_only_nodes_of_bot
     let want: BTreeMap<Cid, Groups> = has.iter().filter(|(id, _)| !had.contains_key(*id)).map(|(k, v)| (*k, v.clone())).collect();
     assert!(!want.is_empty() && want.len() < has.len(), "THE SETUP: the move added {} of {} nodes", want.len(), has.len());
     let e = started(new);
-    for (id, _) in had.iter() {
+    for id in had.keys() {
         e.blocks().put(*id, old_blocks.get(id).expect("held"));
     }
-    for (id, _) in has.iter() {
+    for id in has.keys() {
         e.blocks().put(*id, new_blocks.get(id).expect("held"));
     }
     let walk_since = |since: Cid| {
