@@ -159,4 +159,19 @@ await t("THE MEASUREMENT: one open tree reader's wasm memory, before any rows", 
   for (const s of readers) s.free();
 });
 
+// A TREE'S RECORDING HAS ITS OWN READER (builder#160): a visitor's reads run on the tree's own Session, its own
+// page, so the handle's `pageTrace()` (sdk#434) records the OTHER page. The tree handle reads its own.
+await t("**a tree reads ITS OWN page's recording: `pageTrace()` on the tree is its Session's, not the handle's**", async () => {
+  const { h, sock } = await own();
+  const tr = await h.tree(HEAD_A);
+  assert.equal(typeof tr.pageTrace, "function", "the tree has no pageTrace(): a visitor's reads have no reader");
+  const handles = h.pageTrace(), mine = tr.pageTrace();
+  assert.equal(typeof mine, "string");
+  assert.ok(frames(sock).length > 0, "THE CONTROL: the tree sent nothing, so its recording could be empty");
+  assert.notEqual(mine, handles, "the tree's pageTrace() is the handle's page's recording");
+  // The tree's page reads its head (`recover-head`); the handle's page sent none: each dump is its own page's.
+  assert.match(mine, /page::op::recover-head/, "the tree's recording does not name the head read its page sent");
+  assert.doesNotMatch(handles, /page::op::recover-head/, "THE CONTROL: the handle's page also read that head, so the dumps are not told apart");
+});
+
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }

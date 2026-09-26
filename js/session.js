@@ -452,6 +452,10 @@ export async function openSession(Session, {
         headId: () => reader.head_id(),
         // What the view waits on because of its floor, in words; "" when not.
         waitingFor: () => reader.head_floor_wait(),
+        /// THIS TREE'S PAGE OPS (builder#160): the tree is its own Session, its own page, so its recording is its
+        /// own -- the handle's `pageTrace()` is the OTHER page's. The same reader as the handle's (sdk#434), on this
+        /// tree's Session, read when asked; nothing else of the reader is reachable from here.
+        pageTrace: () => reader.page_trace(),
         close: () => {
           if (!trees.delete(t)) return;
           reader.free();
