@@ -1,5 +1,6 @@
 //! Checks a delegate's wasm against the host functions a pinned node defines.
 
+pub mod frames;
 pub mod node;
 pub mod page;
 pub mod signer;
