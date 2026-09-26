@@ -62,6 +62,8 @@ pub struct Session {
     page_identity_sent: bool,
     /// The signer's provisioning was reported by `take_progress`.
     provision_told: bool,
+    /// The loader's recording, until this session's first page takes it (`adopt_loader`).
+    loader: Option<page::loader::Segment>,
     /// THE APP this session is (the forest ruling): a person has ONE tree,
     /// divided by app. Every domain name crossing into this session is
     /// app-relative and gains `<app>.` here, so an app has no name for
@@ -76,13 +78,6 @@ const PAGE_RECORDING: usize = 4096;
 /// Events `page_trace` renders.
 const PAGE_TRACE_LAST: usize = 200;
 
-/// A page for this session, RECORDING from before its first op (sdk#386's instrument work): its clock starts now
-/// (sdk#397), and the recorder is attached before anything can be sent.
-fn recorded_page() -> page::Page {
-    let mut p = page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms()));
-    p.record_into(PAGE_RECORDING);
-    p
-}
 
 #[wasm_bindgen]
 impl Session {
@@ -114,7 +109,16 @@ impl Session {
             signer_code: Vec::new(),
             page_identity_sent: false,
             provision_told: false,
+            loader: None,
         })
+    }
+
+    /// THE LOADER'S RECORDING, handed over ONCE (sdk#386's instrument work): when the loader started, its events as
+    /// numbers, and what its ring lost. It opens the recording of this session's first page, on the loader's
+    /// origin; every number is validated there against closed lists and anything unknown is refused and counted
+    /// (`page::loader`). Numbers only cross: nothing here is a string.
+    pub fn adopt_loader(&mut self, start_ms: f64, events: Vec<f64>, dropped: f64) {
+        self.loader = Some(page::loader::Segment::from_numbers(start_ms, &events, dropped));
     }
 
     /// The websocket URL to open. Built in Rust; see the constructor.
@@ -337,6 +341,18 @@ impl Session {
 
     /// The page, once provisioning (or `open_named`) has made one. It lives
     /// in the store: the store reads by walking its engine.
+    /// A page for this session, RECORDING from before its first op (sdk#386's instrument work): its clock starts now
+    /// (sdk#397), and the recorder is attached before anything can be sent -- opened by the loader's segment, if the
+    /// loader handed one over and no page has taken it yet.
+    fn recorded_page(&mut self) -> page::Page {
+        let mut p = page::Page::unstarted(engine::Params::default(), page::PutPath::Page, page::Ms(crate::js_now_ms()));
+        match self.loader.take() {
+            Some(seg) => p.record_into_after(PAGE_RECORDING, &seg),
+            None => p.record_into(PAGE_RECORDING),
+        }
+        p
+    }
+
     fn page(&self) -> Option<&PageIo> {
         self.db.store().host()
     }
@@ -484,7 +500,7 @@ impl Session {
         self.signer_code = signer;
         let art = page_io::Artefacts { block_code: block, register_code: register, register_params: Vec::new(), signer: key };
         let server = page::server::Server::new(
-            recorded_page(),
+            self.recorded_page(),
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
@@ -533,7 +549,7 @@ impl Session {
             signer,
         };
         let server = page::server::Server::new(
-            recorded_page(),
+            self.recorded_page(),
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
@@ -684,7 +700,7 @@ impl Session {
             return Err(JsValue::from_str("open_named: this session is already open on its own head"));
         }
         let server = page::server::Server::new(
-            recorded_page(),
+            self.recorded_page(),
             page::server::SignerFacts::default(),
         );
         self.db.store_mut().set_view();
@@ -1495,3 +1511,4 @@ fn loc_of(id: &str) -> Result<craftworks_sdk::id::Loc, JsValue> {
     craftworks_sdk::id::loc_from_hex(id)
         .ok_or_else(|| db_err(&DbError::Refused(format!("`{id}` is not a record id"))))
 }
+

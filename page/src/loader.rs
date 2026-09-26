@@ -48,6 +48,23 @@ pub struct Segment {
     pub dropped: u64,
 }
 
+/// A number from JS, as a code: a WHOLE, non-negative, exactly representable number, or `u64::MAX` -- which no closed
+/// list holds, so it is refused and counted rather than rounded onto a real code.
+pub fn code_of(f: f64) -> u64 {
+    if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= 9_007_199_254_740_991.0 {
+        f as u64
+    } else {
+        u64::MAX
+    }
+}
+
+impl Segment {
+    /// The segment as the JS loader hands it over: numbers only (`Session.adopt_loader`), each made a code here.
+    pub fn from_numbers(start_ms: f64, events: &[f64], dropped: f64) -> Segment {
+        Segment { start_ms: code_of(start_ms), events: events.iter().copied().map(code_of).collect(), dropped: code_of(dropped) }
+    }
+}
+
 /// One coded event, VALIDATED: `Some` only if every number names something in the closed lists above. Offsets are
 /// re-coarsened here whatever the JS did.
 pub fn decode(ev: &[u64]) -> Option<Event> {
@@ -96,4 +113,24 @@ pub fn events(seg: &Segment) -> Vec<Event> {
         out.push(Event::Counter { site: RING, op: OpId::NONE, entry: Entry { key: Key::DroppedMsgs, value: seg.dropped } });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A number the loader handed over becomes a code only if it IS one; anything else is `u64::MAX`, which every
+    /// closed list refuses -- never a rounded guess that could land on a real code.
+    #[test]
+    fn only_a_whole_safe_number_is_a_code() {
+        assert_eq!(code_of(0.0), 0);
+        assert_eq!(code_of(3.0), 3);
+        assert_eq!(code_of(1_790_253_181_367.0), 1_790_253_181_367);
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.5, 2.0f64.powi(60)] {
+            assert_eq!(code_of(bad), u64::MAX, "{bad} became a code");
+        }
+        // And such a number in an event is REFUSED at decode, not recorded.
+        let seg = Segment::from_numbers(0.0, &[0.0, 0.5, 0.0, 1.0, 0.0], 0.0);
+        assert!(decode(&seg.events).is_none(), "an event with a fractional site code was decoded");
+    }
 }

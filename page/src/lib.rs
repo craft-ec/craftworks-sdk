@@ -1828,7 +1828,7 @@ impl Page {
 
     /// A SEND: its Request edge, labelled by its place in the send order, and the retry clock it went out on.
     fn record_send(&self, w: &Waiting, d: &Deadline) {
-        use instrument::{vocab::coarsen_ms, Dir, Entry, Event, Key, Kind, Probe};
+        use instrument::{vocab::coarsen_ms, Dir, Entry, Event, Key, Probe};
         let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
         let Some(id) = self.send_label(d.seq) else { return };
         let site = op_site(w);
@@ -1845,7 +1845,7 @@ impl Page {
 
     /// An END of an op on the wire (a parked one is not on the wire: its answer was recorded when it came).
     fn record_end(&self, w: &Waiting, d: &Deadline, how: End) {
-        use instrument::{Dir, Event, Kind, Outcome, Probe};
+        use instrument::{Dir, Event, Outcome, Probe};
         let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
         if !d.sent {
             return;
@@ -1944,7 +1944,7 @@ impl Page {
             self.rto.sample(r);
             // The sample AS COMPUTED, before anything clamps it (the architect): a wrong clock shows here.
             if let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) {
-                use instrument::{vocab::coarsen_ms, Entry, Event, Key, Kind, Probe};
+                use instrument::{vocab::coarsen_ms, Entry, Event, Key, Probe};
                 let Some(id) = self.send_label(d.seq) else { return Some(d.op) };
                 let (site, op) = (op_site(w), id.op());
                 rec.event(Event::Counter { site, op, entry: Entry { key: Key::SampleMs, value: coarsen_ms(r) } });
