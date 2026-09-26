@@ -86,7 +86,7 @@ fn every_effect_the_engine_returns_is_carried_out() {
     assert!(steps >= 6, "THE CONTROL: the scan found {steps} engine steps in page/src/lib.rs, not the calls it exists for");
     let supersede = lines.iter().position(|l| l.contains(concat!("self.engine", ".supersede_read("))).expect("THE CONTROL: no supersede_read call found");
     assert!(
-        lines[supersede..supersede + 4].iter().any(|l| l.starts_with("Some(fx)")) && lines[supersede..supersede + 6].iter().any(|l| *l == "self.carry_out(fx);"),
+        lines[supersede..supersede + 4].iter().any(|l| l.starts_with("Some(fx)")) && lines[supersede..supersede + 6].contains(&"self.carry_out(fx);"),
         "supersede_read's effects are not carried out: {:?}",
         &lines[supersede..supersede + 6]
     );
