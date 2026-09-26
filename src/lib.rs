@@ -12,6 +12,7 @@ pub mod engine_client;
 pub mod expected;
 pub mod id;
 pub mod keep;
+pub mod keep_api;
 pub mod live_bindings;
 pub mod page_store;
 pub mod read_token;
