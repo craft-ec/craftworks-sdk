@@ -99,6 +99,12 @@ impl SilentNet {
         Ok(SilentNet { peers, b, paused: Vec::new() })
     }
 
+    /// The GATEWAY's ws URL: a page publishes through it while `b` reads (site_probe: what a page on one node
+    /// publishes, read on ANOTHER node).
+    pub fn a_ws(&self) -> String {
+        self.peers[0].ws()
+    }
+
     /// Wait (up to 90 s) until b, through `c`, is connected to every peer; the addresses it names. Refused if it is
     /// not: a run that paused fewer peers than it says measures something else.
     pub async fn wait_connected(&self, c: &mut WebApi) -> Result<Vec<String>> {
