@@ -245,3 +245,24 @@ fn a_hint_is_read_while_a_commit_is_owed() {
     p.head_hint();
     assert!(p.take_ops().contains(&Op::ReadHead { label: page::Label::Head }), "a hint was dropped because a commit is owed");
 }
+
+/// **PUBLISH-LIFE ⁵ (sdk#485 E8): a FINAL refusal ENDS the commit, at once.** The signer's answer is a real end (rule
+/// 8): the engine hears `HeadRefused { seq }` and every write of the commit is told `Failed` in the SAME step -- no
+/// tick, so no stall bound is involved -- and the signer's why is said ONCE, naming each failed write. Mutant "→ Idle
+/// without the event" (the owed head silently dropped) -> the write is never told Failed -> red.
+#[test]
+fn a_final_sign_refusal_fails_the_commits_writes_at_once_and_names_the_why() {
+    for refusal in [Why::NotProvisioned, Why::CannotSign, Why::FromApp] {
+        let (mut p, now, id) = at_sign(PutPath::Page);
+        let _ = p.take_notices();
+        p.answer(Answer::Signer { id, answer: A::Refused(refusal.clone()) }, Ms(now + 1));
+        let told: Vec<State> = p.take_notices().into_iter().filter(|(_, w, _)| *w == WriteId(1)).map(|(_, _, s)| s).collect();
+        assert_eq!(told, vec![State::Failed], "{refusal:?}: the write was not told Failed in the refusal's own step");
+        let said = p.unusable();
+        assert_eq!(said.len(), 1, "{refusal:?}: the refusal was not said exactly once: {said:?}");
+        assert!(said[0].contains(&format!("{refusal:?}")) && said[0].contains("writes 1"), "{refusal:?}: the said line does not name the why and the failed write: {said:?}");
+        // Nothing more is asked for the refused commit.
+        p.tick(Ms(now + 10 * page::rto::RTO_INITIAL_MS as u64));
+        assert_eq!(signs(&p.take_ops()), 0, "{refusal:?}: a refused commit was signed again");
+    }
+}

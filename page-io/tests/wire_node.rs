@@ -2468,7 +2468,7 @@ fn web(n: u8) -> Vec<u8> {
 fn publish(io: &mut PageIo, node: &mut WireNode, now: &mut u64, n: u8) -> Option<page::Publication> {
     io.publish_site(APP, SITE_CODE, web(n), Ms(*now)).expect("publishes");
     settle(io, node, now);
-    io.publication(APP).cloned()
+    io.publication(APP)
 }
 
 /// **One address, each publish the next version.** The node holds the signer's record framed around exactly the

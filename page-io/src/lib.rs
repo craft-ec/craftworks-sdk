@@ -715,7 +715,7 @@ impl PageIo {
     }
 
     /// How `app`'s site publication stands: the page's, the one owner. `None`: never published here.
-    pub fn publication(&self, app: &str) -> Option<&Publication> {
+    pub fn publication(&self, app: &str) -> Option<Publication> {
         self.server.page.publication(app)
     }
 
