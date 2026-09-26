@@ -85,6 +85,10 @@ pub struct Writes {
     /// Writes refused at make time, returned to their caller (and kept here
     /// for a caller that did not look).
     pub refused: Vec<(u64, Refused)>,
+    /// `QueueFull` fates that reached `on_fate` for a still-OPEN write (sdk#450): the door's verdict arriving after
+    /// the door, which `hand_over` rules out. Loud in debug; in release ignored and COUNTED here, never a panic (a
+    /// panic is a dead wasm page).
+    pub late_door_verdicts: u64,
     conflicts: Vec<Conflicted>,
     unread: Vec<Unread>,
     ended: Vec<(u64, Ended)>,
@@ -107,6 +111,7 @@ impl Writes {
             forced: BTreeSet::new(),
             rolled_back: BTreeSet::new(),
             refused: Vec::new(),
+            late_door_verdicts: 0,
             conflicts: Vec::new(),
             unread: Vec::new(),
             ended: Vec::new(),
@@ -209,6 +214,15 @@ impl Writes {
         if !fate.terminal() || !self.keys_of.contains_key(&write_id) {
             return;
         }
+        // THE DOOR'S VERDICT ONLY (sdk#450): the engine says `QueueFull` at admission, in the step that took the
+        // write's frame, and `hand_over` takes it in that same call (`refused_at_door` closes the write), so an open
+        // write never meets it here. Not an end: the SDK waits for room and makes the write again. If one ever does
+        // arrive: loud in debug, and in release nothing is ended or named -- it is counted.
+        if matches!(fate, Fate::QueueFull { .. }) {
+            debug_assert!(false, "QueueFull reached on_fate for open write {write_id}: the door's verdict after the door");
+            self.late_door_verdicts += 1;
+            return;
+        }
         let keys = self.keys_of.remove(&write_id).unwrap_or_default();
         let forced = self.forced.remove(&write_id);
         self.state_changed.extend(keys.iter().cloned());
@@ -228,10 +242,6 @@ impl Writes {
                 return;
             }
             Fate::TooLarge { bound, limit, got } => Ended::TooLarge { bound, limit, got },
-            // THE DOOR'S VERDICT ONLY (sdk#450): the engine says `QueueFull` at admission, in the step that took the
-            // write's frame, and `hand_over` takes it in that same call (`refused_at_door` closes the write, so an
-            // open write never reaches here with it). Not an end: the SDK waits for room and makes the write again.
-            Fate::QueueFull { .. } => unreachable!("QueueFull is the door's verdict, taken by hand_over"),
             Fate::Failed => Ended::Failed,
             Fate::Lost if forced => Ended::ForcedLost,
             Fate::Lost => Ended::Lost,
@@ -240,7 +250,8 @@ impl Writes {
                 self.ended.push((write_id, Ended::Unknown));
                 return;
             }
-            Fate::Applying | Fate::Queued | Fate::Committing => unreachable!("terminal checked"),
+            // Returned above, before anything was taken (not terminal; the door's QueueFull): never a panic.
+            Fate::Applying | Fate::Queued | Fate::Committing | Fate::QueueFull { .. } => return,
         };
         self.rolled_back.extend(keys);
         self.ended.push((write_id, ended));

@@ -166,6 +166,21 @@ fn a_write_refused_queue_full_at_the_door_is_closed_by_the_refusal() {
     assert!(s.take_ended().is_empty() && s.take_state_changed().is_empty(), "a door-refused write was told again as an end");
 }
 
+/// **A QueueFull fate for a still-OPEN write is loud in debug and a counted no-op in release** (sdk#450, the
+/// architect: a panic is a dead wasm page). `hand_over` rules it out; if it ever arrives it ends and names nothing.
+#[test]
+fn a_late_queue_full_for_an_open_write_ends_nothing_and_is_counted() {
+    let mut s = writes();
+    let id = s.make(&[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), Edit::Put(b"v".to_vec()))]).expect("made");
+    let late = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.on_fate(id, Fate::QueueFull { bytes: 1, limit: 1 })));
+    assert_eq!(late.is_err(), cfg!(debug_assertions), "debug is not loud (or release panics: a dead wasm page)");
+    if !cfg!(debug_assertions) {
+        assert_eq!(s.late_door_verdicts, 1, "the late door verdict was not counted");
+    }
+    assert!(s.is_open(id), "a late QueueFull ended the write");
+    assert!(s.take_ended().is_empty() && s.take_state_changed().is_empty(), "a late QueueFull was told as an end");
+}
+
 /// sdk#264 / builder#107: a SUPERSEDED write names its keys, so a plain
 /// binding on them re-reads the winner's value. The control: a `Superseded`
 /// for another session names none.
