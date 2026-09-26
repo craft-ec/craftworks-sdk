@@ -672,7 +672,8 @@ fn delegate_missing(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// THE NODE'S DELEGATE BACKOFF, by its words: freenet-core 0.2.138
+// WORKAROUND(freenet-core#5729): the per-key delegate backoff is recognised by its text
+/// THE NODE'S DELEGATE BACKOFF, by its words (WORKAROUNDS.md W8, until freenet-core types it): freenet-core 0.2.138
 /// crates/core/src/client_events/websocket.rs:1970 sends `ExecutionError("delegate {key} is rate limited after
 /// repeated failures; retry in {ms} ms")` -- an ExecutionError carries no key, so the words are all there is.
 /// Any OTHER ExecutionError stays a refusal.
