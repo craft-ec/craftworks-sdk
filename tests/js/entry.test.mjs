@@ -574,5 +574,30 @@ await t("**the session handle reads the page's recording: `pageTrace()` is the s
   handle.close();
 });
 
+// THE KEEP API'S JS DOOR (sdk#472): each call is the session's own answer, parsed -- nothing derived here. And the
+// lane: the default `notAnswering()` is what a person's apps show; `{ lane: "background" }` asks the lane call.
+await t("**the handle's keep calls are the session's answers, parsed; keepSet sends the policy as the SDK's JSON; the lane routes**", async () => {
+  const raw = fakeRaw();
+  const s = raw.__session, seen = [];
+  s.keep_assets = () => JSON.stringify([{ target: "t1", kind: "identity" }]);
+  s.keep_report = target => (seen.push(["report", target]), JSON.stringify(target === "t1" ? { state: "running", asked: 3, of: 9 } : null));
+  s.keep_set = (address, policy) => (seen.push(["set", address, JSON.parse(policy)]), JSON.stringify(address === "?" ? { refused: "BAD_ADDRESS", said: "?" } : { ok: true }));
+  s.keep_audit = target => seen.push(["audit", target]);
+  s.not_answering = () => JSON.stringify(null);
+  s.not_answering_in = lane => JSON.stringify({ what: `the ${lane} lane`, ms: 1 });
+  const page = pageOf(raw);
+  const h = await wrap(raw).open(page.opts);
+  assert.deepEqual(h.keepAssets(), [{ target: "t1", kind: "identity" }]);
+  assert.deepEqual(h.keepReport("t1"), { state: "running", asked: 3, of: 9 });
+  assert.equal(h.keepReport("t2"), null);
+  assert.deepEqual(h.keepSet("t1", { repair: { below: 2 } }), { ok: true });
+  assert.deepEqual(h.keepSet("?", { repair: "always" }), { refused: "BAD_ADDRESS", said: "?" });
+  h.keepAudit("t1");
+  assert.deepEqual(seen, [["report", "t1"], ["report", "t2"], ["set", "t1", { repair: { below: 2 } }], ["set", "?", { repair: "always" }], ["audit", "t1"]]);
+  assert.equal(h.notAnswering(), null, "the default asked the background lane");
+  assert.deepEqual(h.notAnswering({ lane: "background" }), { what: "the background lane", ms: 1 });
+  h.close();
+});
+
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");
 process.exit(failures ? 1 : 0);

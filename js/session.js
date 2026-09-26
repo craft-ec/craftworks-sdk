@@ -470,7 +470,9 @@ export async function openSession(Session, {
      * `{ what, ms }`, or null. What a page shows while the node is slow (rule
      * 8); it ends nothing — the page's sender keeps re-sending.
      */
-    notAnswering: () => JSON.parse(session.not_answering()),
+    // `lane: "background"` gives the waits the page's BACKGROUND work has (the assets audit), which the default -- what
+    // a person's apps show -- skips. SEAM (sdk#472): the lane filter is engineer4's #468; its wasm name is fixed there.
+    notAnswering: ({ lane } = {}) => JSON.parse(lane ? session.not_answering_in(lane) : session.not_answering()),
     /** A person cancels the pending PUT of `key` (named `cancelled`). */
     cancelPut: key => session.cancel_put(key),
     /**
@@ -507,6 +509,21 @@ export async function openSession(Session, {
     /// the page's first op (sdk#407); this is its one local reader, for a person or a harness. Nothing is published,
     /// and no user content is in it (sites, send-order labels and numbers only).
     pageTrace: () => session.page_trace(),
+    // THE KEEP API (sdk#472; KEEPER.md §1, §3): what the Assets tab and the health widget read and write. The facts are
+    // the SDK's own -- the keep record (src/keep.rs) and the audit's report (page::audit) -- and this is only their JS
+    // door: every answer is the wasm's JSON, parsed; nothing here derives a health, a warning or a list.
+    /** The assets this identity keeps: its own tree + every keep record (KEEPER §2), each with its policy and last full pass. */
+    keepAssets: () => JSON.parse(session.keep_assets()),
+    /** The live pass on `target`, or null when none ran this session: progress (`asked`/`of`), the counts, `health`. */
+    keepReport: target => JSON.parse(session.keep_report(target)),
+    /**
+     * THE ONE WRITE of a keep record's policy -- editing a policy and "keep this" alike. `address` as the person typed
+     * it: the SDK parses it (its one address parser) and refuses an unreadable one by name. `{ ok: true }` or
+     * `{ refused: "BAD_ADDRESS", said }`.
+     */
+    keepSet: (address, policy) => JSON.parse(session.keep_set(address, JSON.stringify(policy))),
+    /** Start a FULL pass on `target`; its progress is `keepReport(target)`. */
+    keepAudit: target => session.keep_audit(target),
     /// Ship what is waiting, now. Wired to the page lifecycle above; exposed
     /// because an app that knows it is finishing can say so sooner.
     flush,
