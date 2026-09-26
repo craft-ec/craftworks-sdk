@@ -71,6 +71,7 @@
 pub mod fates;
 mod judge;
 pub mod loader;
+pub mod obs;
 pub mod rto;
 pub mod server;
 
@@ -677,9 +678,11 @@ pub struct Page {
     /// THE PAGE'S RECORDING (sdk#386's instrument work), `None` until a host attaches one: every op it sends, how it
     /// ended, and the retry clock it used. Bounded (it drops and counts, never grows), and never an input: the page
     /// holds it only as a `Probe`, which returns nothing.
-    rec: Option<instrument::Recorder>,
+    rec: Option<obs::Rec>,
     /// The page's clock when the recorder was attached: where the recording's offsets count from.
     rec_start: u64,
+    /// The page's clock when the current observation WINDOW began (sdk#399): its record's offsets count from here.
+    obs_start: u64,
     /// Sends so far: the last send's label ordinal.
     sends: u32,
     /// The first send the recording saw: an op sent before the recorder was attached is not in it, and neither is
@@ -765,6 +768,7 @@ impl Page {
             born: now.0,
             rec: None,
             rec_start: now.0,
+            obs_start: now.0,
             sends: 0,
             rec_from: 1,
             rec_overflowed: std::cell::Cell::new(false),
@@ -2101,8 +2105,9 @@ impl Page {
     /// Attach the page's recording: `capacity` events, then it DROPS and counts (never grows, never panics). Its
     /// offsets count from now. Ops sent before this are not in it.
     pub fn record_into(&mut self, capacity: usize) {
-        self.rec = Some(instrument::Recorder::with_capacity(capacity));
+        self.rec = Some(obs::Rec::new(capacity));
         self.rec_start = self.now;
+        self.obs_start = self.now;
         self.rec_from = self.sends.wrapping_add(1);
     }
 
@@ -2114,6 +2119,8 @@ impl Page {
         use instrument::Probe;
         self.record_into(capacity);
         self.rec_start = seg.start_ms;
+        // The loader's rounds are in the page's first window.
+        self.obs_start = seg.start_ms;
         if let Some(rec) = &self.rec {
             for e in loader::events(seg) {
                 rec.event(e);
@@ -2124,6 +2131,20 @@ impl Page {
     /// The recording, for a test or a local dump: a SEPARATE read handle -- the page itself only ever writes.
     pub fn recording(&self) -> Option<instrument::Recording<'_>> {
         self.rec.as_ref().map(|r| r.recording())
+    }
+
+    /// CLOSE THE OBSERVATION WINDOW (sdk#399, craftworks-docs OBSERVABILITY §1-§2): this window's detail record for app
+    /// `site` at `minute`, as `(key, value)` for the observation tree -- the key [`obs::detail_key`], the value the ONE
+    /// publish filter's output over THIS window's events alone (the window recorder is taken and a fresh one takes its
+    /// place: the drain). `header` is the build header, for the page's first window. `None` with no recording attached.
+    /// The next window starts now.
+    pub fn close_obs_window(&mut self, site: &[u8; 32], minute: u64, header: Option<instrument::publish::Header>) -> Option<(Vec<u8>, Vec<u8>)> {
+        let rec = self.rec.as_ref()?;
+        let taken = rec.take_window();
+        let window = instrument::publish::Window { minute, start_ms: self.obs_start.saturating_sub(self.rec_start), dropped_at_start: 0 };
+        let record = instrument::publish::publish(&taken.recording(), window, header);
+        self.obs_start = self.now;
+        Some((obs::detail_key(site, minute), record.encode()))
     }
 
     /// The tail of the recording, rendered in the instrument's vocabulary (no user content can be in it: the
@@ -2992,6 +3013,49 @@ mod recording {
         let dump = p.dump(40);
         assert!(!dump.contains("0707"), "the block id leaked into the dump:\n{dump}");
         println!("{dump}");
+    }
+
+    /// PER WINDOW (sdk#399, the architect's carry-over from instrument#18): the page's observation records are drained
+    /// per window, so the second holds none of the first's operations -- an Exit carries no offset, so only the drain
+    /// keeps an old one out. Window 1: a PUT times out (a failure: it leaves) and its re-send is left unanswered (a
+    /// stall: it leaves). Window 2: that re-send is answered (Ok: stays local) and a second PUT times out. Window 2's
+    /// record holds exactly ONE timeout, the second PUT's. Mutant "publish the whole recording" -> red.
+    #[test]
+    fn each_observation_window_holds_only_its_own_operations() {
+        use instrument::publish::{PubEvent, Published};
+        let site = [9u8; 32];
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        p.now = EPOCH_MS;
+        p.record_into(1024);
+        let (a, b) = ([7u8; 32], [8u8; 32]);
+        p.send(Waiting::Put(a), Op::Put { id: a, bytes: vec![1] });
+        p.tick(Ms(EPOCH_MS + 1_500));
+        let (k1, v1) = p.close_obs_window(&site, 100, None).expect("a recording");
+        p.answer(Answer::PutOk(a), Ms(EPOCH_MS + 2_000));
+        p.now = EPOCH_MS + 2_000;
+        p.send(Waiting::Put(b), Op::Put { id: b, bytes: vec![2] });
+        p.tick(Ms(EPOCH_MS + 9_000));
+        let (k2, v2) = p.close_obs_window(&site, 101, None).expect("a recording");
+        assert_eq!((k1, k2), (obs::detail_key(&site, 100), obs::detail_key(&site, 101)));
+        let exits = |v: &[u8]| -> Vec<Outcome> {
+            Published::decode(v, &[]).expect("a record").events.iter().filter_map(|e| match e { PubEvent::Exit { outcome, .. } => Some(*outcome), _ => None }).collect()
+        };
+        let (w1, w2) = (exits(&v1), exits(&v2));
+        println!("window 1 exits {w1:?}; window 2 exits {w2:?}");
+        assert_eq!(w1, vec![Outcome::Timeout], "THE SETUP: window 1's record is not its one timeout");
+        assert_eq!(w2.iter().filter(|o| **o == Outcome::Timeout).count(), 1, "window 2's record holds another window's operation, or lost its own: {w2:?}");
+        assert!(!w2.contains(&Outcome::Ok), "an Ok operation left the device");
+    }
+
+    /// The observation detail key: `w/ ‖ site ‖ minute BE` -- one app's windows sort by time, and the site id is the
+    /// only name of the app in it.
+    #[test]
+    fn the_detail_key_is_the_site_then_the_minute() {
+        let k = obs::detail_key(&[3u8; 32], 0x0102);
+        assert_eq!(&k[..2], b"w/");
+        assert_eq!(&k[2..34], &[3u8; 32]);
+        assert_eq!(&k[34..], &0x0102u64.to_be_bytes());
+        assert!(obs::detail_key(&[3u8; 32], 1) < obs::detail_key(&[3u8; 32], 256), "windows do not sort by time");
     }
 
     fn coarse(ms: u64) -> u64 {

@@ -825,7 +825,7 @@ checksum = "8e04e2fd2b8188ea827b32ef11de88377086d690286ab35747ef7f9bf3ccb590"
 [[package]]
 name = "instrument"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/craftworks-instrument?rev=13a418e#13a418ed2d4abfb8b16601451e1ec29dbaa874ff"
+source = "git+https://github.com/craft-ec/craftworks-instrument?rev=b4f066b#b4f066bf517f6e2cd4b306a5baf565876f4381ac"
 
 [[package]]
 name = "itoa"

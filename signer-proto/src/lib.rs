@@ -102,6 +102,10 @@ pub enum Label {
     /// the signer READS it only after verifying what it holds under the site's own params, so a wrong id can do no
     /// more than raise the version it signs from (architect, builder#117 Q1).
     Site { app: String, contract: [u8; 32] },
+    /// The person's OBSERVATION tree's head (craftworks-docs OBSERVABILITY §1, sdk#399): the same authority as `Head`,
+    /// under the fixed name `obs` (`wire::OBS_NAME`), so anyone who knows an identity can compute where its recordings
+    /// are. Signed by the same rule as `Head`, into its own record.
+    Obs,
 }
 
 /// What the signer answers. See `signer::decide` for the rule behind `Signed` / `NotNext` / `AlreadySigned`.

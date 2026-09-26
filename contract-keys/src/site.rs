@@ -32,6 +32,16 @@ pub fn site_params(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
     relabel(register_params, &label)
 }
 
+/// The observation tree's head label (OBSERVABILITY §1, sdk#399): the SAME bytes as `wire::OBS_NAME` (pinned equal by
+/// signer-proto/tests/obs_one_home.rs; this crate can't depend on wire).
+pub const OBS_LABEL: &[u8] = b"obs";
+
+/// The person's observation-tree head params, from their Register params: the same authority, the label `obs`.
+/// `None` when the params are not mode 0.
+pub fn obs_params(register_params: &[u8]) -> Option<Vec<u8>> {
+    relabel(register_params, OBS_LABEL)
+}
+
 /// The node's web framing `[meta length u64 BE][meta][web length u64 BE][web]`, parsed exactly: `(meta, web)`.
 pub fn framing(state: &[u8]) -> Option<(&[u8], &[u8])> {
     let (m, rest) = state.split_at_checked(8)?;

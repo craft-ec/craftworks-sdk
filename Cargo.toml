@@ -81,7 +81,7 @@ strip = true
 [workspace.dependencies]
 # THE RECORDING SPINE, pinned ONCE: the SDK core records its engine calls, the page its ops (sdk#386's instrument
 # work). Never in a delegate's closure (probe/src/lib.rs `no_delegate_reaches_the_instrument`).
-instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "13a418e" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "b4f066b" }
 craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "0fbb5c7", default-features = false, features = ["library"] }
 
 [profile.release]
