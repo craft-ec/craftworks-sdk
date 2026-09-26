@@ -4923,8 +4923,7 @@ impl<B: Blocks> Engine<B> {
         for missing in for_ {
             // A repair nobody wants any more ENDS here, rather than asking its group for ever: a write that started
             // it (sdk#405) applied or was refused, and nothing else waits on the block.
-            let wanted = self.reads.waiting.contains_key(&missing) || self.parked_write.as_ref().is_some_and(|p| p.needs.contains(&missing));
-            if !wanted && self.repairs.contains_key(&missing) {
+            if !self.readers_of(&missing).any() && self.repairs.contains_key(&missing) {
                 self.end_repair(missing);
                 continue;
             }
