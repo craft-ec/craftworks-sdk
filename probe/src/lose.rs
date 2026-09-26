@@ -128,6 +128,22 @@ impl Lose {
     }
 }
 
+/// A block id as the log names it: its first 8 bytes in hex.
+pub fn short(id: &Cid) -> String {
+    id.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// THE LOG LINE for a group chosen (`group`: `"data"` or `"root"`). LOAD-BEARING: the realnet step's VOID check reads
+/// `lost` against the `not_found` lines ([`not_found_line`]); the shape is pinned by a test.
+pub fn chosen_line(group: &str, c: &Chosen) -> serde_json::Value {
+    serde_json::json!({ "chosen": group, "k": c.k, "slots": c.slots.len(), "lost": c.lost.iter().map(short).collect::<Vec<_>>() })
+}
+
+/// THE LOG LINE for one GET answered NotFound. LOAD-BEARING (see [`chosen_line`]).
+pub fn not_found_line(id: &Cid, total: u64) -> serde_json::Value {
+    serde_json::json!({ "not_found": short(id), "not_found_total": total })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +254,19 @@ mod tests {
         assert!(c.lost.contains(&root) && c.lost.len() == PARITY);
         assert_eq!(l.block(root, b"\x01anything"), Verdict::NotFound(root));
         assert_eq!(l.block(par[PARITY - 1], b"\x03p"), Verdict::Relay, "the one parity left is relayed");
+    }
+
+    /// THE LOG LINES' SHAPE, which the realnet step reads (builder#179's VOID check: the distinct `not_found` ids equal
+    /// the chosen `lost`): renamed keys or a different id form would make every arm VOID, silently.
+    #[test]
+    fn the_log_lines_keep_their_shape() {
+        let c = Chosen { slots: vec![[1; 32], [2; 32], [3; 32]], k: 2, lost: [[1; 32], [3; 32]].into_iter().collect() };
+        let chosen = chosen_line("data", &c);
+        assert_eq!(chosen, serde_json::json!({ "chosen": "data", "k": 2, "slots": 3, "lost": ["0101010101010101", "0303030303030303"] }));
+        let nf = not_found_line(&[3; 32], 7);
+        assert_eq!(nf, serde_json::json!({ "not_found": "0303030303030303", "not_found_total": 7 }));
+        // The ids the two lines name for one block are the SAME string.
+        assert!(chosen["lost"].as_array().unwrap().contains(&nf["not_found"]));
     }
 
     #[test]

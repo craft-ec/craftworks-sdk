@@ -15,7 +15,7 @@
 use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
 use futures::{SinkExt, StreamExt};
-use probe::lose::{parse_lose, Lose, Target, Verdict};
+use probe::lose::{chosen_line, not_found_line, parse_lose, Lose, Target, Verdict};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
@@ -61,7 +61,7 @@ fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
         lose.head(state.as_ref());
         if !had {
             if let Some(c) = lose.chosen() {
-                eprintln!("{}", serde_json::json!({ "chosen": "root", "k": c.k, "lost": c.lost.iter().map(hex).collect::<Vec<_>>() }));
+                eprintln!("{}", chosen_line("root", c));
             }
         }
         return m;
@@ -70,21 +70,17 @@ fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
     let verdict = lose.block(cid, state.as_ref());
     if !had {
         if let Some(c) = lose.chosen() {
-            eprintln!("{}", serde_json::json!({ "chosen": "data", "k": c.k, "slots": c.slots.len(), "lost": c.lost.iter().map(hex).collect::<Vec<_>>() }));
+            eprintln!("{}", chosen_line("data", c));
         }
     }
     match verdict {
         Verdict::Relay => m,
         Verdict::NotFound(id) => {
-            eprintln!("{}", serde_json::json!({ "not_found": hex(&id), "not_found_total": lose.not_found }));
+            eprintln!("{}", not_found_line(&id, lose.not_found));
             let nf: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id: *key.id() }));
             Message::Binary(bincode::serialize(&nf).expect("a NotFound encodes").into())
         }
     }
-}
-
-fn hex(id: &[u8; 32]) -> String {
-    id.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 // The handshake callback's `Result<Response, ErrorResponse>` is tungstenite's signature, not ours to shrink.
