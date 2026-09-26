@@ -32,12 +32,12 @@ async fn main() -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while said.is_none() && tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), sock.next()).await {
-            Ok(Some(Ok(Message::Binary(b)))) => match {
+            Ok(Some(Ok(Message::Binary(b)))) => {
                 if let Ok(Err(e)) = bincode::deserialize::<Result<freenet_stdlib::client_api::HostResponse, freenet_stdlib::client_api::ClientError>>(&b) {
                     println!("(the node's error, whole: {:?})", e.kind());
                 }
-                wire::unframe(&mut seen, &b)
-            } {
+                let incoming = wire::unframe(&mut seen, &b);
+                match incoming {
                 wire::Incoming::PutFailed { said: s, .. } => said = Some(s),
                 // The keyless form 0.2.136/0.2.138 use (sdk#433): the FORMAT is pinned too, and the key it names
                 // must be the one page-io keys this PUT by.
@@ -51,7 +51,8 @@ async fn main() -> Result<()> {
                 }
                 wire::Incoming::Ack(_) => bail!("the node ACCEPTED a Block PUT whose state does not hash to its id"),
                 other => println!("(another answer: {other:?})"),
-            },
+                }
+            }
             Ok(Some(Ok(_))) | Err(_) => {}
             Ok(Some(Err(e))) => bail!("the socket: {e}"),
             Ok(None) => bail!("the node closed the socket"),
