@@ -422,7 +422,7 @@ impl PageIo {
 
     /// Start an INCREMENTAL pass (KEEPER §5, on a head move from `old`): see [`page::Page::audit_since`].
     pub fn audit_since(&mut self, repair: page::audit::Repair, old: [u8; 32]) {
-        self.server.page.audit_since(repair, self.has_signer, old);
+        self.server.page.audit_since(repair, self.can_ask_held(), old);
     }
 
     /// A READER of somebody's published head (sdk#239): the page reads the

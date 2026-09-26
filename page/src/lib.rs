@@ -2044,8 +2044,8 @@ impl Page {
     /// asset is the tree the page stands on -- a kept TREE asset on its own `tree()` reader's page; an app's or the
     /// SDK's PIECES need the pieces audit (KEEPER §2, not built). Repaired by `repair`. It runs as the ops leave
     /// ([`Page::take_ops`]), ONE audit op at a time, and its report is [`Page::take_audit`]'s. A pass already running is
-    /// replaced (its waits WITHDRAWN). `signer`: can this page ask `Held` (page-io's `has_signer`, fixed when the
-    /// PageIo is built)? Without one the pass is over at once, UNMEASURED, with no op at all (KEEPER §5 ¹⁰).
+    /// replaced (its waits WITHDRAWN). `signer`: can this page ask `Held` (page-io's `can_ask_held`: a plain reader's
+    /// page cannot)? Without one the pass is over at once, UNMEASURED, with no op at all (KEEPER §5 ¹⁰).
     pub fn audit(&mut self, repair: audit::Repair, signer: bool) {
         self.start_audit(repair, signer, None);
     }
