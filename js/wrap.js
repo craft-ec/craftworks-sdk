@@ -1,4 +1,4 @@
-import { openSession, open as openWith, openAsked as openAskedWith, SHIPPED_ARTEFACTS } from "./session.js";
+import { openSession, open as openWith, openAsked as openAskedWith, reopen as reopenWith, SHIPPED_ARTEFACTS } from "./session.js";
 import { engineDb, sameRows, BINDING } from "./engine-db.js";
 
 // Plain-object API over the wasm surface. `raw` is the wasm-bindgen module.
@@ -242,6 +242,9 @@ export function wrap(raw) {
     // for — nothing registered, minted or provisioned — and STAYS OPEN, its
     // `asked()` the identity (`openAsked`).
     openAsked: (opts = {}) => openAskedWith(raw.Session, { artefacts: SHIPPED_ARTEFACTS, ...opts }),
+    // REOPEN A PUBLISHED PROJECT (sdk#520): `open` plus the site FOLLOWED, publishing nothing. `siteStatus(app)` says
+    // `reading`, then `published` at the version the node shows.
+    reopen: (opts = {}) => reopenWith(raw.Session, { artefacts: SHIPPED_ARTEFACTS, ...opts }),
     // WHAT A ROW STATE MEANS, from the SDK's one owner (`RowState`): saved,
     // backed up, and every code there is. Never a string literal in an app.
     rowSaved: code => raw.row_saved(String(code ?? "")),

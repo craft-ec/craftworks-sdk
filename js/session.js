@@ -480,6 +480,11 @@ export async function openSession(Session, {
     publishSite: (app, code, web) => session.publish_site(app, code, web),
     /** `{ state, version, said }`: none | publishing | published | superseded | refused | cancelled. */
     siteStatus: app => JSON.parse(session.site_status(app)),
+    /**
+     * FOLLOW `app`'s site (sdk#520): read what is live, publishing NOTHING (no handoff, Sign, UPDATE or PUT); returns
+     * its LINK. `siteStatus(app)` says `reading` until the node answers, then `published` at its version.
+     */
+    followSite: (app, code) => session.follow_site(app, code),
     /** `app`'s site link under `code`, published or not. */
     siteLink: (app, code) => session.site_link(app, code),
     /** A person cancels `app`'s publication (named `cancelled`). */
@@ -614,6 +619,28 @@ export async function open(Session, opts = {}) {
     }
   }
   return { ...handle, db };
+}
+
+/**
+ * REOPEN A PUBLISHED PROJECT (sdk#520): `open()` -- the one provisioning wait, and the app tree's live head -- then
+ * its site FOLLOWED under `siteCode` (the site contract's code). Pure composition: nothing else, and NOTHING is
+ * published -- no handoff, no Sign, no UPDATE, no PUT; a page that reopens is connected, never re-publishing.
+ * Returns once the tree is open, ALONGSIDE the site's read: `siteStatus(app)` says `reading` until the node
+ * answers, then `published` at the version it shows (and a newer one from another device), never "absent" for a
+ * NotFound. A refusal of the follow (e.g. a bad app id) closes the session and is thrown, in its words.
+ */
+export async function reopen(Session, { siteCode, ...opts } = {}) {
+  if (!(siteCode instanceof Uint8Array) || siteCode.length === 0) {
+    throw new Error("reopen() needs { siteCode }: the site contract's code names which site is followed");
+  }
+  const handle = await open(Session, opts);
+  try {
+    handle.followSite(opts.app, siteCode);
+  } catch (e) {
+    handle.close();
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+  return handle;
 }
 
 /**

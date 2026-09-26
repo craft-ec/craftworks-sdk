@@ -99,6 +99,7 @@ const TRANSPORT_ONLY: &[&str] = &[
     // PUBLISHING A SITE (builder#117): the app's stable link, signed through the node's signer. An in-memory
     // store has no node and no signer.
     "publish_site",
+    "follow_site",
     "site_link",
     "site_status",
     "cancel_site",

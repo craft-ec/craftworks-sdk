@@ -651,6 +651,19 @@ impl Session {
         Ok(link)
     }
 
+    /// FOLLOW `app`'s SITE (sdk#520): a REOPEN of a published project reads what is live and publishes NOTHING --
+    /// no handoff, no Sign, no UPDATE, no PUT (PUBLISH-LIFE P7). Returns its LINK. [`Session::site_status`] says
+    /// `reading` until the node answers, then `published` at the version the node shows (a newer one from another
+    /// device moves it); a NotFound is read again, never "absent". `code` is the site contract's.
+    pub fn follow_site(&mut self, app: &str, code: Vec<u8>) -> Result<String, JsValue> {
+        let Some(p) = self.page_mut() else {
+            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
+        };
+        let link = p.follow_site(app, &code, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
+        self.pump_page();
+        Ok(link)
+    }
+
     /// `app`'s site LINK under the site contract `code`, published or not: `null`-like error when there is no
     /// page yet or `app` is not an app id.
     pub fn site_link(&self, app: &str, code: Vec<u8>) -> Result<String, JsValue> {
@@ -663,7 +676,9 @@ impl Session {
     }
 
     /// How `app`'s site publication stands, as JSON
-    /// `{"state":"none"|"publishing"|"published"|"superseded"|"refused"|"cancelled","version":N,"said":"…"}`.
+    /// `{"state":"none"|"reading"|"publishing"|"published"|"superseded"|"refused"|"cancelled","version":N,"said":"…"}`.
+    /// `reading`: a reopen (`follow_site`) has not had the node's answer yet -- nothing is known, and it is never
+    /// "absent". One owner: a reopened page and a publishing page report the site through this same call.
     /// `published`: the read-back shows this publication at `version`. `superseded`: another publication is live
     /// at `version` (another device, or a later one): reported, never overwritten; publishing again is the
     /// person's act. It ends only on an answer or a cancel (rule 8). `said` is display only.
@@ -672,6 +687,7 @@ impl Session {
         let publication = self.page().and_then(|p| p.publication(app));
         let (state, version, said) = match &publication {
             None => (SiteStatus::None, 0, ""),
+            Some(P::Reading) => (SiteStatus::Reading, 0, ""),
             Some(P::Publishing { waiting_for }) => (SiteStatus::Publishing, 0, waiting_for.unwrap_or("")),
             Some(P::Published { version }) => (SiteStatus::Published, *version, ""),
             Some(P::Superseded { version }) => (SiteStatus::Superseded, *version, ""),

@@ -499,6 +499,8 @@ pub const WAITING_FOR_SITE: &str = "waiting for this node to fetch the site";
 /// A SITE's publication (builder#117): how it ended, or that it has not -- the ONE owner of that fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Publication {
+    /// A REOPEN is reading the site (sdk#520): nothing is known yet. Not "absent": a NotFound is read again (P7).
+    Reading,
     /// In flight. `waiting_for`: what it waits on when that is not the node's silence -- the signer said
     /// `HeadUnknown` (a record ahead of anything its node holds: this node has not fetched the site yet), re-asked
     /// on the backoff with no end (rule 8). `None` while it is simply out.
@@ -698,8 +700,9 @@ pub struct Page {
     /// What an equal-seq sighting is judged against — this page's claim at
     /// that seq, whose bytes it can land again if they win the tie-break.
     my_records: BTreeMap<u64, (Cid, Vec<u8>)>,
-    /// When the register was last read (any head answer), for the backstop.
-    last_head_at: u64,
+    /// When each FOLLOWED register was last read (any answer), for the ONE backstop (sdk#520): the head's, and each
+    /// site a reopen follows. One path for "follow a register" -- never a site copy beside the head's.
+    last_read_at: BTreeMap<Label, u64>,
     /// That read, whole: what an equal-seq tie-break hashes.
     last_head: Option<HeadRead>,
     /// A PUT to repeat at the next tick (a transient refusal).
@@ -835,7 +838,7 @@ impl Page {
             repairs_rejected: 0,
             old_signer_fork_at: None,
             my_records: BTreeMap::new(),
-            last_head_at: 0,
+            last_read_at: BTreeMap::new(),
             last_head: None,
             put_again: BTreeMap::new(),
             repair_puts: BTreeSet::new(),
@@ -1015,11 +1018,13 @@ impl Page {
         for label in self.pubs.labels() {
             self.life_on(&label, Ev::Due);
         }
-        // THE BACKSTOP: a hint can be dropped, so an idle page reads the
-        // register at least every HEAD_BACKSTOP_MS.
-        if self.engine_has_head && !self.pubs.head().verifying() && !self.reading_head() && now.saturating_sub(self.last_head_at) >= HEAD_BACKSTOP_MS {
-            self.last_head_at = now;
-            self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
+        // THE BACKSTOP: a hint can be dropped, so an idle page reads every
+        // register it FOLLOWS at least every HEAD_BACKSTOP_MS -- the head's,
+        // and each site a reopen follows (sdk#520), by the one path.
+        for label in self.followed() {
+            if self.register_idle(&label) && now.saturating_sub(self.read_at(&label)) >= HEAD_BACKSTOP_MS {
+                self.follow_read(&label);
+            }
         }
         // A register that does not answer is asked again on the RTO for as
         // long as it takes (rules 7, 8) — the engine's own recovery read, and
@@ -1208,6 +1213,7 @@ impl Page {
             // A SITE's read answers only its own read-back: the engine never hears a site (architect).
             Answer::Head { label: Label::Site(app), read } => {
                 if self.answered(&Waiting::ReadBack(Label::Site(app.clone()))).is_some() {
+                    self.last_read_at.insert(Label::Site(app.clone()), self.now);
                     self.life_on(&Label::Site(app), Ev::SiteRead(read.as_ref()));
                 }
             }
@@ -1229,7 +1235,7 @@ impl Page {
                     }
                     return;
                 }
-                self.last_head_at = self.now;
+                self.last_read_at.insert(Label::Head, self.now);
                 let h = read.as_ref().map(|r| (r.seq, r.root()));
                 self.last_head = read;
                 self.answered(&Waiting::Warm);
@@ -1380,7 +1386,7 @@ impl Page {
         // Re-sent in the order they first queued, and queued anew in it (sdk#390).
         let mut on_wire: Vec<(u32, Waiting)> = self.deadlines.iter().filter(|(_, d)| d.sent && !d.withdrawn).map(|(w, d)| (d.seq, w.clone())).collect();
         on_wire.sort_unstable();
-        let mut head_read = false;
+        let mut reread: BTreeSet<Label> = BTreeSet::new();
         for (_, w) in on_wire {
             let at = self.now + self.backoff(self.deadlines[&w].attempt);
             // The send on the old socket is WITHDRAWN (its answer cannot come), and the re-send is a new send.
@@ -1394,15 +1400,20 @@ impl Page {
             // A new node GET on the new socket: its bound starts again.
             d.silent = false;
             d.seq = seq;
-            // Every label's in-flight read is re-sent (each re-subscribes its own register);
-            // only an in-flight HEAD read stands in for the fallback below.
-            head_read |= matches!(d.op, Op::ReadHead { label: Label::Head });
+            // Every label's in-flight read is re-sent (each re-subscribes its own register), and stands in for
+            // that register's renewal below.
+            if let Op::ReadHead { label } = &d.op {
+                reread.insert(label.clone());
+            }
             self.out.push(d.op.clone());
             self.record_send(&w, &self.deadlines[&w]);
         }
-        if !head_read && self.engine_has_head {
-            self.last_head_at = self.now;
-            self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
+        // THE RENEWAL (a subscription lives on a socket): every register this page FOLLOWS -- the head, and each
+        // followed site (sdk#520) -- with no read re-sent above is read now, a GET with subscribe, the one path.
+        for label in self.followed() {
+            if !reread.contains(&label) {
+                self.follow_read(&label);
+            }
         }
     }
 
@@ -1442,12 +1453,12 @@ impl Page {
             // push carries no state and never gets here (`head_hint`, one read), nor does any other head.
             let known = self.last_head.as_ref().is_some_and(|h| h.seq == read.seq && h.value() == read.value());
             if known && (read.seq, read.root()) == self.published() {
-                self.last_head_at = self.now;
+                self.last_read_at.insert(Label::Head, self.now);
                 return;
             }
             return self.head_hint();
         }
-        self.last_head_at = self.now;
+        self.last_read_at.insert(Label::Head, self.now);
         self.last_head = Some(read);
         // Whatever is still on the wire for the read-back this push stands in for -- the UPDATE whose answer would
         // ask it, or the GET itself -- ends with the owed head, in `drop_dead_head`, once the engine has published
@@ -1523,6 +1534,64 @@ impl Page {
     /// The person CANCELS a site's publication: every wait of it ends, and it says so.
     pub fn cancel_site(&mut self, app: &str) {
         self.life_on(&Label::Site(app.to_string()), Ev::Cancel);
+    }
+
+    /// FOLLOW A SITE (sdk#520, PUBLISH-LIFE E13): a REOPEN reads what is live and publishes NOTHING (P7) -- no Sign,
+    /// no UPDATE, no PUT. `publication(app)` says `Reading` until the node answers, then `Published` at the version it
+    /// shows; a NotFound is read again on the backoff, never "absent". While it follows, the site is read by the one
+    /// path the head is: its subscription's pushes, the backstop, and the renewal after a reconnect.
+    pub fn follow_site(&mut self, app: &str, now: Ms) {
+        self.now = now.0;
+        self.last_read_at.insert(Label::Site(app.to_string()), self.now);
+        self.life_on(&Label::Site(app.to_string()), Ev::Follow);
+    }
+
+    /// The node said a FOLLOWED site's register changed, WITH its full state: an ordinary E9 read (the node's word).
+    /// A site this page is not following takes nothing from a push (a publisher's own read-back decides for it).
+    pub fn site_pushed(&mut self, app: &str, read: HeadRead) {
+        let label = Label::Site(app.to_string());
+        if matches!(self.pubs.site(app), Some(Life::Following { .. })) {
+            self.last_read_at.insert(label.clone(), self.now);
+            self.life_on(&label, Ev::SiteRead(Some(&read)));
+        }
+    }
+
+    /// The node said a FOLLOWED site's register changed, with no state (a hint): read it, unless a read is out.
+    pub fn site_hint(&mut self, app: &str) {
+        let label = Label::Site(app.to_string());
+        if matches!(self.pubs.site(app), Some(Life::Following { .. })) && self.register_idle(&label) {
+            self.follow_read(&label);
+        }
+    }
+
+    /// Every register this page FOLLOWS (sdk#520): the head once there is one, and each site a reopen follows.
+    fn followed(&self) -> Vec<Label> {
+        let head = self.engine_has_head.then_some(Label::Head);
+        let sites = self.pubs.labels().into_iter().filter(|l| matches!(l, Label::Site(app) if matches!(self.pubs.site(app), Some(Life::Following { .. }))));
+        head.into_iter().chain(sites).collect()
+    }
+
+    /// When `label`'s register was last read (0: never).
+    fn read_at(&self, label: &Label) -> u64 {
+        self.last_read_at.get(label).copied().unwrap_or(0)
+    }
+
+    /// No read of `label`'s register is out, nor owed by its life (the head: a verify).
+    fn register_idle(&self, label: &Label) -> bool {
+        match label {
+            Label::Head => !self.pubs.head().verifying() && !self.reading_head(),
+            Label::Site(_) => !self.deadlines.contains_key(&Waiting::ReadBack(label.clone())),
+        }
+    }
+
+    /// Read a followed register now (a GET with subscribe): the head's as a hint, a site's as its own read.
+    fn follow_read(&mut self, label: &Label) {
+        self.last_read_at.insert(label.clone(), self.now);
+        let wait = match label {
+            Label::Head => Waiting::Hint,
+            Label::Site(_) => Waiting::ReadBack(label.clone()),
+        };
+        self.send(wait, Op::ReadHead { label: label.clone() });
     }
 
     /// Ask `Held` about `id` at the next flush (sdk#455). One already in a batch in flight joins it there.
@@ -2030,7 +2099,7 @@ impl Page {
         let sign = self.pubs.lives().filter_map(Life::due_at).min();
         let held = self.held_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
         let puts = (!self.put_again.is_empty()).then_some(self.now);
-        let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
+        let backstop = self.followed().iter().map(|l| self.read_at(l) + HEAD_BACKSTOP_MS).min();
         deadlines.chain(sign).chain(held).chain(puts).chain(backstop).min().map(Ms)
     }
 
@@ -2228,7 +2297,7 @@ impl Page {
         self.evict();
         if recovery && !self.engine_has_head {
             self.engine_has_head = true;
-            self.last_head_at = self.now;
+            self.last_read_at.insert(Label::Head, self.now);
         }
     }
 
