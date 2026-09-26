@@ -1066,6 +1066,12 @@ impl PageIo {
             && self.server.page.not_answering().is_some_and(|(_, ms)| ms >= page::rto::RTO_INITIAL_MS as u64)
     }
 
+    /// Is anything still owed an answer or a re-send (`page::Page::waiting`)? `false`: at rest until something
+    /// new arrives -- only the idle page's backstop read is left on its clock.
+    pub fn waiting(&self) -> bool {
+        self.server.page.waiting()
+    }
+
     /// When the page's next timer falls (a host arms a one-shot for it): the
     /// page's own deadlines, which the signer's requests are among.
     pub fn next_due(&self) -> Option<Ms> {
