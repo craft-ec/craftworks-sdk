@@ -1945,10 +1945,12 @@ impl Page {
             // The sample AS COMPUTED, before anything clamps it (the architect): a wrong clock shows here.
             if let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) {
                 use instrument::{vocab::coarsen_ms, Entry, Event, Key, Probe};
-                let Some(id) = self.send_label(d.seq) else { return Some(d.op) };
-                let (site, op) = (op_site(w), id.op());
-                rec.event(Event::Counter { site, op, entry: Entry { key: Key::SampleMs, value: coarsen_ms(r) } });
-                rec.event(Event::Counter { site, op, entry: Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) } });
+                // Past the last label nothing is recorded -- and nothing else changes: the recording never steers.
+                if let Some(id) = self.send_label(d.seq) {
+                    let (site, op) = (op_site(w), id.op());
+                    rec.event(Event::Counter { site, op, entry: Entry { key: Key::SampleMs, value: coarsen_ms(r) } });
+                    rec.event(Event::Counter { site, op, entry: Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) } });
+                }
             }
             self.rearm_first_sends(self.rto.rto_ms());
         }
@@ -1983,9 +1985,11 @@ impl Page {
                 let at = d.armed.min(now + rto);
                 if at != d.at && d.seq >= from {
                     if let Some(rec) = rec {
-                        let Some(op) = instrument::Label::new(Kind::Request, d.seq).map(|l| l.op()) else { continue };
-                        let value = instrument::vocab::coarsen_ms(at.saturating_sub(start));
-                        rec.event(Event::Counter { site: op_site(w), op, entry: Entry { key: Key::ReArmedAtMs, value } });
+                        // Past the last label nothing is recorded; the re-arm below happens regardless.
+                        if let Some(op) = instrument::Label::new(Kind::Request, d.seq).map(|l| l.op()) {
+                            let value = instrument::vocab::coarsen_ms(at.saturating_sub(start));
+                            rec.event(Event::Counter { site: op_site(w), op, entry: Entry { key: Key::ReArmedAtMs, value } });
+                        }
                     }
                 }
                 d.at = at;
@@ -2913,6 +2917,31 @@ mod recording {
 
     fn coarse(ms: u64) -> u64 {
         instrument::vocab::coarsen_ms(ms)
+    }
+
+    /// PAST THE LAST LABEL THE RECORDING STILL NEVER STEERS: two pages at the label limit, one recording and one
+    /// not, send and answer the same ops -- their deadlines, window and RTO end identical. An unlabellable send once
+    /// made `answered` return before its re-arm and window step on the recording page only. Mutant "leave `answered`
+    /// when no label can be made" -> red.
+    #[test]
+    fn past_the_last_label_recording_changes_nothing_the_page_does() {
+        use instrument::label::MAX_ORDINAL;
+        let run = |record: bool| {
+            let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+            if record {
+                p.record_into(64);
+                p.rec_from = 0;
+            }
+            p.sends = MAX_ORDINAL + 5;
+            for i in 1..=3u8 {
+                p.send(Waiting::Get([i; 32]), Op::Get { id: [i; 32] });
+            }
+            p.now = EPOCH_MS + 40;
+            p.answered(&Waiting::Get([1; 32]));
+            let ats: Vec<u64> = p.deadlines.values().map(|d| d.at).collect();
+            (ats, p.window.size(), p.rto.rto_ms())
+        };
+        assert_eq!(run(true), run(false), "past the last label, recording changed what the page did");
     }
 
     /// THE SEND ORDER OUTRUNS A LABEL (the architect on instrument v2): past `MAX_ORDINAL` the page stops labelling
