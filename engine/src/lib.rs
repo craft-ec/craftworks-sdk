@@ -268,6 +268,9 @@ pub enum WriteBound {
 // what an event PRODUCES, which is what matters.
 #[derive(Clone, Debug)]
 pub enum Event {
+    /// The page cannot confirm a changed group's other member at once (sdk#416): it is asking the node
+    /// (`Held`), and the engine releases one more of that group's parity meanwhile. See [`Effect::ConfirmHeld`].
+    HeldUnknown(Cid),
     Write {
         client: ClientId,
         write_id: WriteId,
@@ -1132,6 +1135,13 @@ struct Commit {
     /// be counted as bookkeeping; their ids are in `data`, which the walk covers, and each id is its bytes' hash.
     #[serde(skip)]
     deferred: Vec<Block>,
+    /// The changed groups' other members the NODE confirmed (sdk#416): counted toward k.
+    #[serde(default)]
+    held: BTreeSet<Cid>,
+    /// Other members the page could not confirm at once (`Event::HeldUnknown`), each having released one more of
+    /// its group's parity into the first wave.
+    #[serde(default)]
+    unknown: BTreeSet<Cid>,
     /// Each pack's member ids: a pack's ack is its members' ack (the node
     /// holds a pack's members under their own ids), so they count toward k.
     #[serde(default)]
@@ -1159,9 +1169,12 @@ struct Race {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct RaceGroup {
     k: usize,
-    /// Members this commit did not change and an earlier commit's acks put
-    /// on the network: present.
-    present: usize,
+    /// Members this commit did not change that are not an own straggler: on the network only once the NODE has
+    /// said so (sdk#416, the architect's ruling: SAVED at k needs the node's word too). They count toward k only
+    /// when confirmed (`Commit::held`), asked at `start_commit` (`Effect::ConfirmHeld`) and answered by the page
+    /// from what it confirmed, at once when it knows. One entry per SLOT.
+    #[serde(default)]
+    others: Vec<Cid>,
     /// Members this commit did not change but an EARLIER commit is still
     /// putting (its stragglers): not known to be on the network until acked
     /// (the architect, rule 10's count). One entry per SLOT.
@@ -1197,16 +1210,16 @@ impl Race {
                 }
                 let k = members.len();
                 let earlier: Vec<Cid> = members.iter().copied().filter(|m| !new_ids.contains(m) && unacked.contains(m)).collect();
-                let present = members.iter().filter(|m| !new_ids.contains(*m) && !unacked.contains(*m)).count();
+                let others: Vec<Cid> = members.iter().copied().filter(|m| !new_ids.contains(m) && !unacked.contains(m)).collect();
                 covered.extend(new.iter().copied());
-                groups.push(RaceGroup { k, present, earlier, new });
+                groups.push(RaceGroup { k, others, earlier, new });
             }
         }
         let (root, root_parity) = root;
         if !root_parity.is_empty() && new_ids.contains(&root) {
             let new: Vec<Cid> = std::iter::once(root).chain(root_parity.iter().copied()).collect();
             covered.extend(new.iter().copied());
-            groups.push(RaceGroup { k: 1, present: 0, earlier: Vec::new(), new });
+            groups.push(RaceGroup { k: 1, others: Vec::new(), earlier: Vec::new(), new });
         }
         let must = new_ids.into_iter().filter(|c| !covered.contains(c)).collect();
         Race { must, groups }
@@ -1216,11 +1229,19 @@ impl Race {
     /// present members, what of this commit is acked, and what of an earlier
     /// commit's stragglers has been acked since (`unacked` is what still is
     /// not).
-    fn recoverable(&self, confirmed: &BTreeSet<Cid>, unacked: &BTreeSet<Cid>) -> bool {
+    fn recoverable(&self, confirmed: &BTreeSet<Cid>, unacked: &BTreeSet<Cid>, held: &BTreeSet<Cid>) -> bool {
         self.must.is_subset(confirmed)
             && self.groups.iter().all(|g| {
-                g.present + g.new.iter().filter(|c| confirmed.contains(*c)).count() + g.earlier.iter().filter(|c| !unacked.contains(*c)).count() >= g.k
+                g.others.iter().filter(|c| held.contains(*c)).count()
+                    + g.new.iter().filter(|c| confirmed.contains(*c)).count()
+                    + g.earlier.iter().filter(|c| !unacked.contains(*c)).count()
+                    >= g.k
             })
+    }
+
+    /// Every changed group's other members (`RaceGroup::others`), each once.
+    fn others(&self) -> BTreeSet<Cid> {
+        self.groups.iter().flat_map(|g| g.others.iter().copied()).collect()
     }
 
 }
@@ -1239,7 +1260,7 @@ impl Commit {
     /// May the head be signed? (§P: race put; `all` is the control.)
     fn ready(&self, race: bool, unacked: &BTreeSet<Cid>) -> bool {
         if race {
-            self.race.recoverable(&self.confirmed, unacked)
+            self.race.recoverable(&self.confirmed, unacked, &self.held)
         } else {
             self.confirmed.len() >= self.data.len()
         }
@@ -2060,6 +2081,7 @@ impl<B: Blocks> Engine<B> {
                 deferred,
             } => self.on_write(client, write_id, ops, reads, deferred),
             Event::PutConfirmed(id) => self.on_confirmed(id),
+            Event::HeldUnknown(id) => self.on_held_unknown(id),
             Event::PutFailed(id) => self.on_failed(id),
             Event::HeadConfirmed(seq) => self.on_head(seq),
             Event::Tick(now) => self.on_tick(now),
@@ -3710,10 +3732,32 @@ impl<B: Blocks> Engine<B> {
             through: 0,
             race,
             deferred,
+            held: BTreeSet::new(),
+            unknown: BTreeSet::new(),
             pack_members,
             root_parity,
         });
+        // SAVED NEEDS THE NODE'S WORD (sdk#416): every other member of a changed group is asked about. The page
+        // answers at once for what it confirmed (`PutConfirmed`), and says `HeldUnknown` for the rest while it asks
+        // the node -- each of those releases one more of its group's parity, so k stays reachable from this page's
+        // own PUTs whatever the other page's block does.
+        let others = self.pending.as_ref().map(|c| c.race.others()).unwrap_or_default();
+        out.extend(others.into_iter().map(|id| Effect::ConfirmHeld { id }));
         out
+    }
+
+    /// The page cannot confirm `id`, another member of a changed group, at once (sdk#416): it counts ABSENT toward
+    /// k until the node says it holds it, and ONE more of its group's parity goes now, from the parity held back
+    /// for after the head (#378). Once per member.
+    fn on_held_unknown(&mut self, id: Cid) -> Vec<Effect> {
+        let Some(c) = self.pending.as_mut() else { return Vec::new() };
+        if c.held.contains(&id) || !c.unknown.insert(id) {
+            return Vec::new();
+        }
+        let Some(g) = c.race.groups.iter().find(|g| g.others.contains(&id)) else { return Vec::new() };
+        let Some(at) = c.deferred.iter().position(|(d, _)| g.new.contains(d)) else { return Vec::new() };
+        let (id, bytes) = c.deferred.remove(at);
+        vec![Effect::PutBlock { id, bytes, after: Vec::new() }]
     }
 
     /// SETTLE A SILENT COMMIT FROM FACT (sdk#150 E1/E2).
@@ -3999,7 +4043,9 @@ impl<B: Blocks> Engine<B> {
             }
         }
         let earlier = c.race.groups.iter().any(|g| g.earlier.contains(&id));
-        if !mine && !earlier {
+        // Another member of a changed group, confirmed by the node (sdk#416): it counts toward k now.
+        let other = c.race.groups.iter().any(|g| g.others.contains(&id)) && c.held.insert(id);
+        if !mine && !earlier && !other {
             return out;
         }
         if c.head_sent || (!head_early && !c.ready(self.params.race_put, &unacked)) {
@@ -4084,25 +4130,6 @@ impl<B: Blocks> Engine<B> {
         out
     }
 
-    /// The members of the groups commit `c` changed that are neither its own blocks nor an own straggler still
-    /// out (`still_out`, counted in `earlier`). Read off the commit's new nodes (the format states the grouping).
-    fn foreign_members(&self, c: &Commit, still_out: &BTreeSet<Cid>) -> BTreeSet<Cid> {
-        let src = self.source();
-        let mut foreign = BTreeSet::new();
-        for id in &c.data {
-            let Some(Ok(node)) = src.get(id).map(Node::parse) else { continue };
-            let ids: Vec<Cid> = node.parity().collect();
-            for (g, (_, members)) in freenet_prolly::parity::group_members(&node).into_iter().enumerate() {
-                let Some(par) = ids.get(PARITY * g..PARITY * (g + 1)) else { continue };
-                if !members.iter().chain(par).any(|m| c.data.contains(m)) {
-                    continue;
-                }
-                foreign.extend(members.into_iter().filter(|m| !c.data.contains(m) && !still_out.contains(m)));
-            }
-        }
-        foreign
-    }
-
     fn on_head(&mut self, seq: u64) -> Vec<Effect> {
         let mut out = Vec::new();
         let Some(c) = self.pending.as_ref() else {
@@ -4152,14 +4179,9 @@ impl<B: Blocks> Engine<B> {
         let still_out = self.unacked();
         let mut remaining: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
         remaining.extend(c.race.groups.iter().flat_map(|g| g.earlier.iter()).filter(|m| still_out.contains(*m)).copied());
-        // THE OTHER MEMBERS of the groups this commit changed (safety gap class 2): counted `present` toward k,
-        // but in page memory is not on the node. BACKED_UP waits for the node to hold each one; the page answers
-        // at once for what it has confirmed.
-        let foreign = self.foreign_members(&c, &still_out);
-        for id in &foreign {
-            out.push(Effect::ConfirmHeld { id: *id });
-        }
-        remaining.extend(foreign);
+        // THE OTHER MEMBERS of the groups this commit changed (class 2): asked at `start_commit` (sdk#416), and
+        // BACKED_UP waits for the node's word on each one not confirmed yet; the page is still asking.
+        remaining.extend(c.race.others().into_iter().filter(|m| !c.held.contains(m) && !still_out.contains(m)));
         let mut writes = c.writes.clone();
         for w in std::mem::take(&mut self.carry) {
             if !writes.contains(&w) {

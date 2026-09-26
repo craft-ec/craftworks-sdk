@@ -72,12 +72,15 @@ fn withdrawn(fx: &[Effect]) -> BTreeSet<Cid> {
 struct Rig {
     e: Engine<Store>,
     known: BTreeMap<Cid, Vec<u8>>,
+    /// Leave `ConfirmHeld` unanswered (a test that plays the page itself); else the node, which holds every
+    /// block, answers each at once, as the page does for one it confirmed (sdk#416).
+    withhold_held: bool,
 }
 
 impl Rig {
     /// A published base tree of 600 small rows, every block acked.
     fn base() -> Rig {
-        let mut r = Rig { e: common::new_store_params(Params::default()), known: BTreeMap::new() };
+        let mut r = Rig { e: common::new_store_params(Params::default()), known: BTreeMap::new(), withhold_held: false };
         let ops: Vec<(Vec<u8>, Op)> = (0..600u32).map(|i| put(&format!("k/{i:06}"), &[(i % 251) as u8; 20])).collect();
         let all = r.commit(1, ops, |_, _| true);
         assert!(states(&all, 1).contains(&State::Published), "the base write did not publish");
@@ -85,8 +88,11 @@ impl Rig {
     }
 
     fn step(&mut self, ev: Event) -> Vec<Effect> {
-        let fx = self.e.step(ev);
+        let mut fx = self.e.step(ev);
         self.e.blocks().absorb(&fx);
+        if !self.withhold_held {
+            common::answer_held(&mut self.e, &mut fx);
+        }
         self.known.extend(puts(&fx));
         fx
     }
@@ -254,13 +260,17 @@ fn an_earlier_straggler_is_never_counted_present_and_after_names_only_this_commi
     assert!(!after.is_empty(), "after is empty: the check above is vacuous");
 }
 
-/// SAFETY GAP CLASS 2 (the architect's ruling): a commit over a FOREIGN tree -- another engine's commit, adopted --
-/// changes a group whose other members include a block another engine put. Its own blocks all acked and its head
-/// landed, it is SAVED, and NOT BACKED_UP until the node answers for EVERY other member of the groups it changed
-/// (`ConfirmHeld` -> `PutConfirmed`; the page answers at once from what it confirmed, else asks the node): one
-/// unanswered holds it back. The engine keeps no copy of what the node confirmed (rule 3).
+/// SAVED AND BACKED_UP NEED THE NODE'S WORD (class 2, sdk#416; the architect's rulings): a commit over a FOREIGN
+/// tree -- another engine's commit, adopted -- changes a group whose other members include the leaf the other
+/// engine put. Every other member is asked about at the commit's START (`ConfirmHeld`); the page answers at once for
+/// what it confirmed, and says `HeldUnknown` for the foreign leaf, which counts ABSENT toward k and releases one
+/// more of the group's parity into the first wave. Here this page's own new leaf in that group also STALLS, so the
+/// group is at k - 1 on the node until that extra parity lands:
+/// * no head before it (a foreign member presumed held would sign at k - 1 really there: seed 7's shape);
+/// * the head once it lands -- the foreign PUT never landing does not deadlock the commit;
+/// * BACKED_UP only when the node has answered for the foreign leaf too.
 #[test]
-fn a_foreign_member_of_a_changed_group_holds_back_backed_up_until_the_node_holds_it() {
+fn a_changed_groups_unconfirmed_member_counts_absent_until_the_node_holds_it() {
     let (foreign, foreign_leaf) = {
         let mut p = Rig::base();
         let all = p.commit(2, vec![put("k/000100", b"foreign")], |_, _| true);
@@ -268,32 +278,40 @@ fn a_foreign_member_of_a_changed_group_holds_back_backed_up_until_the_node_holds
         (p.e.published_root(), leaf_with(&all, b"k/000100"))
     };
     let mut r = Rig::base();
+    r.withhold_held = true;
     let _ = r.step(Event::HeadRead { epoch: engine::Epoch(1), seq: 2, root: foreign });
     assert_eq!(r.e.published_root(), foreign, "THE SETUP: the foreign head was not adopted");
-    // A commit in a SIBLING leaf of the foreign change's, in the same parent group: that group changes, and the
-    // foreign leaf (k/000100's, put by the other engine) is one of its members.
+    // A commit in a SIBLING leaf of the foreign change's, in the same parent group.
     let first = r.step(Event::forced_write(ClientId(1), WriteId(3), vec![put("k/000160", b"three")]));
+    let asked: BTreeSet<Cid> = asked_held(&first);
+    assert!(asked.contains(&foreign_leaf), "the leaf the other engine put, a member of a changed group, was not asked about at the commit's start");
+    let own_leaf = leaf_with(&first, b"k/000160");
+    // The page: every other member it confirmed, at once; the foreign leaf it cannot.
     let mut all = first.clone();
-    for id in puts(&first).keys() {
+    for id in asked.iter().filter(|id| **id != foreign_leaf) {
         all.extend(r.step(Event::PutConfirmed(*id)));
     }
-    let (seq, _) = head(&all).expect("every own block acked, and no head");
-    let landed = r.step(Event::HeadConfirmed(seq));
-    let mut fx = landed.clone();
-    for id in puts(&landed).keys() {
-        fx.extend(r.step(Event::PutConfirmed(*id)));
+    let extra_fx = r.step(Event::HeldUnknown(foreign_leaf));
+    let extra: Vec<Cid> = puts(&extra_fx).into_keys().collect();
+    assert_eq!(extra.len(), 1, "HeldUnknown did not release exactly one more of the group's parity");
+    all.extend(extra_fx);
+    // Every PUT acked but the stalled own leaf and the extra parity: k - 1 of the group on the node.
+    let held_back: BTreeSet<Cid> = [own_leaf, extra[0]].into_iter().collect();
+    for id in puts(&all).into_keys().filter(|id| !held_back.contains(id)).collect::<Vec<_>>() {
+        all.extend(r.step(Event::PutConfirmed(id)));
     }
-    let asked: Vec<Cid> = asked_held(&landed).into_iter().collect();
-    println!("other members of the changed groups asked about: {}", asked.len());
-    assert!(asked.contains(&foreign_leaf), "the leaf the other engine put, a member of a changed group, was not asked about");
-    assert!(states(&landed, 3).contains(&State::Published), "not SAVED");
-    assert!(!states(&fx, 3).contains(&State::ParityComplete), "BACKED_UP with {} member(s) never confirmed on the node", asked.len());
-    // Every one but the last answered: still not.
-    for id in &asked[..asked.len() - 1] {
-        fx.extend(r.step(Event::PutConfirmed(*id)));
+    assert!(head(&all).is_none(), "the head signed with k - 1 of the group on the node: the unconfirmed foreign leaf was counted");
+    // The extra parity lands: k, from this page's own PUTs.
+    let signed = r.step(Event::PutConfirmed(extra[0]));
+    let (seq, _) = head(&signed).expect("the extra first-wave parity brought the group to k, and no head: the commit deadlocks on a foreign PUT");
+    let mut fx = r.step(Event::HeadConfirmed(seq));
+    assert!(states(&fx, 3).contains(&State::Published), "not SAVED");
+    for id in puts(&fx).into_keys().filter(|id| *id != own_leaf).collect::<Vec<_>>() {
+        fx.extend(r.step(Event::PutConfirmed(id)));
     }
-    assert!(!states(&fx, 3).contains(&State::ParityComplete), "BACKED_UP with one member unanswered");
-    let last = r.step(Event::PutConfirmed(asked[asked.len() - 1]));
+    fx.extend(r.step(Event::PutConfirmed(own_leaf)));
+    assert!(!states(&fx, 3).contains(&State::ParityComplete), "BACKED_UP with the foreign leaf never confirmed on the node");
+    let last = r.step(Event::PutConfirmed(foreign_leaf));
     assert!(states(&last, 3).contains(&State::ParityComplete), "every member held, and not BACKED_UP");
 }
 
@@ -352,7 +370,7 @@ fn is_parity(id: &Cid, bytes: &[u8]) -> bool {
 
 impl Rig {
     fn base_with(params: Params) -> Rig {
-        let mut r = Rig { e: common::new_store_params(params), known: BTreeMap::new() };
+        let mut r = Rig { e: common::new_store_params(params), known: BTreeMap::new(), withhold_held: false };
         let ops: Vec<(Vec<u8>, Op)> = (0..600u32).map(|i| put(&format!("k/{i:06}"), &[(i % 251) as u8; 20])).collect();
         let _ = r.commit(1, ops, |_, _| true);
         r
@@ -547,7 +565,7 @@ fn a_single_stall_per_group_is_still_raced_by_its_first_wave_parity() {
 #[test]
 fn the_largest_pre_race_put_write_still_publishes_with_its_parity() {
     let p = Params::default();
-    let mut r = Rig { e: common::new_store_params(p), known: BTreeMap::new() };
+    let mut r = Rig { e: common::new_store_params(p), known: BTreeMap::new(), withhold_held: false };
     // Values by reference: one block each, so the data blocks approach the cap.
     let n = (p.max_commit_blocks as u32).saturating_sub(12);
     let ops: Vec<(Vec<u8>, Op)> = (0..n).map(|i| put(&format!("v/{i:06}"), &vec![(i % 251) as u8; 2000])).collect();

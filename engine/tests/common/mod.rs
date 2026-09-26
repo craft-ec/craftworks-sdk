@@ -74,13 +74,46 @@ impl Default for Store {
 #[macro_export]
 macro_rules! stepped {
     ($e:expr, $ev:expr) => {{
-        let out = $e.step($ev);
+        let mut out = $e.step($ev);
         // Into the engine's OWN store: a test that builds an engine over an
         // isolated store would otherwise absorb into the thread's, and every
         // block it emitted would be unreadable to the engine that emitted it.
         $e.blocks().absorb(&out);
+        {
+            use common::AnswerHeld as _;
+            $e.answer_held(&mut out);
+        }
         out
     }};
+}
+
+/// Answer every `ConfirmHeld` in `out` for a block the store holds, as the page answers one it confirmed: at once,
+/// with `PutConfirmed` (sdk#416). The store is these tests' node. A test that withholds an answer steps the engine
+/// itself.
+#[allow(dead_code)]
+pub trait AnswerHeld {
+    fn answer_held(&mut self, out: &mut Vec<Effect>);
+}
+
+impl AnswerHeld for Engine<Store> {
+    fn answer_held(&mut self, out: &mut Vec<Effect>) {
+        answer_held(self, out)
+    }
+}
+
+#[allow(dead_code)]
+pub fn answer_held(e: &mut Engine<Store>, out: &mut Vec<Effect>) {
+    let mut i = 0;
+    while i < out.len() {
+        if let Effect::ConfirmHeld { id } = out[i] {
+            if e.blocks().node_holds(&id) {
+                let more = e.step(Event::PutConfirmed(id));
+                e.blocks().absorb(&more);
+                out.extend(more);
+            }
+        }
+        i += 1;
+    }
 }
 
 /// `Engine::new` with the thread's store, so a converted test reads as it did.
@@ -208,6 +241,13 @@ impl Store {
     pub fn remember(&self, cid: &Cid) {
         self.forgotten.borrow_mut().remove(cid);
     }
+
+    /// Does the NODE hold `cid`? A block `forget` hid is still the node's (it models the page's memory losing it),
+    /// and is not counted as a read.
+    #[allow(dead_code)]
+    pub fn node_holds(&self, cid: &Cid) -> bool {
+        self.inner.borrow().contains_key(cid)
+    }
 }
 
 /// One long-lived engine, driven step by step as the page drives it (the
@@ -231,11 +271,13 @@ impl Harness {
     }
 
     pub fn step(&mut self, ev: Event) -> Vec<Effect> {
-        let out = self.engine.step(ev);
+        let mut out = self.engine.step(ev);
         let s = self.engine.take_shed();
         add(&mut self.shed, s);
         // The node holds what the commit put.
         self.store.absorb(&out);
+        // And answers for a changed group's other members it holds (sdk#416), as the page does.
+        answer_held(&mut self.engine, &mut out);
         out
     }
 
