@@ -12,7 +12,7 @@ use common::Store;
 fn caps_that_cannot_fit_the_bound_are_refused_at_construction() {
     let _ = engine::Engine::new(
         Params {
-            max_carried_ops_bytes: 400 * 1024,
+            max_commit_blocks: 16 * 1024,
             ..Params::default()
         },
         Store::fresh(),

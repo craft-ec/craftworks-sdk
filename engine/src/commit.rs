@@ -22,9 +22,9 @@ use std::collections::BTreeSet;
 pub(crate) enum End {
     /// Its head showed (E6).
     Published,
-    /// A foreign head (E8), adopted here when `head` is given; the WITNESS decides a Heading commit's group (⁵). A
-    /// Racing commit's head never left: the witness is not read and no try is spent (A8).
-    Dead { witness: Option<Witness>, head: Option<(u64, Cid)> },
+    /// A foreign head (E8), adopted; the WITNESS decides a Heading commit's group (⁵). A Racing commit's head never
+    /// left: the witness is not read and no try is spent (A8).
+    Dead { witness: Option<Witness>, head: (u64, Cid) },
     /// A final refusal: the head refused by the signer (E9), or a block the commit needs rejected (E4).
     Failed,
 }
@@ -41,6 +41,9 @@ enum Stage {
     Heading {
         commit: Commit,
         started: u64,
+        /// When the head was last asked about (E12), and how many times: its pace doubles.
+        asked_at: u64,
+        rounds: u32,
     },
 }
 
@@ -93,9 +96,17 @@ impl CommitLife {
     pub(crate) fn anchor(&mut self, now: u64, reset: bool) {
         match &mut self.stage {
             Stage::Idle => {}
-            Stage::Racing { started, .. } | Stage::Heading { started, .. } => {
+            Stage::Racing { started, .. } => {
                 if reset || *started == 0 {
                     *started = now;
+                }
+            }
+            Stage::Heading { started, asked_at, .. } => {
+                if reset || *started == 0 {
+                    *started = now;
+                }
+                if reset || *asked_at == 0 {
+                    *asked_at = now;
                 }
             }
         }
@@ -112,17 +123,35 @@ impl CommitLife {
         }
     }
 
-    /// Racing → Heading: the head is sent. `false` in any other stage (a Heading commit re-issues without moving).
-    pub(crate) fn send_head(&mut self) -> bool {
+    /// Racing → Heading: the head is sent at `now`. `false` in any other stage (a Heading commit re-issues without
+    /// moving).
+    pub(crate) fn send_head(&mut self, now: u64) -> bool {
         match std::mem::take(&mut self.stage) {
             Stage::Racing { commit, started } => {
-                self.stage = Stage::Heading { commit, started };
+                self.stage = Stage::Heading { commit, started, asked_at: now, rounds: 0 };
                 true
             }
             other @ (Stage::Idle | Stage::Heading { .. }) => {
                 self.stage = other;
                 false
             }
+        }
+    }
+
+    /// Heading x E12: is the head question due at `now` (the pace `reask`, doubling per round)? When it is, the round
+    /// is counted. Never an end (C5); in any other stage, never due.
+    pub(crate) fn head_question_due(&mut self, now: u64, reask: u64) -> bool {
+        match &mut self.stage {
+            Stage::Heading { asked_at, rounds, .. } => {
+                let wait = reask.saturating_mul(1 << (*rounds).min(crate::asks::MAX_DOUBLINGS));
+                if now.saturating_sub(*asked_at) < wait {
+                    return false;
+                }
+                *asked_at = now;
+                *rounds += 1;
+                true
+            }
+            Stage::Idle | Stage::Racing { .. } => false,
         }
     }
 
