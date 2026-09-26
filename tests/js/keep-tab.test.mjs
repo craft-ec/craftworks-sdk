@@ -3,7 +3,7 @@
 // impossible-cell count checked after every step. Each known-broken version (the §12 list) is a tools/mutant.sh
 // mutant, and the test that turns it red is named in its failure.
 import assert from "node:assert/strict";
-import { slotFree, step, tab } from "../../js/keep-tab.js";
+import { EVENTS, STATES, slotFree, step, tab } from "../../js/keep-tab.js";
 
 let failures = 0;
 const t = async (name, f) => {
@@ -98,6 +98,44 @@ await t("**Removed**: a running pass is cancelled and released; an asking asset'
   ({ tab: tb, effects } = run(tab(["a"], 0), [{ e: "due", now: 0 }, { e: "removed", target: "a" }, { e: "granted", target: "a" }]));
   assert.equal(tb.impossible, 1);
   assert.equal(effects.some(e => e.do === "audit"), false, "a late grant started a pass on a removed asset");
+});
+
+await t("**EXHAUSTIVE AT TEST TIME: every STATES × EVENTS cell reaches a defined branch** (a transition or a counted impossible)", () => {
+  // One sample of each state's data. A state added to STATES without one here, or without a branch in step(), fails.
+  const sample = {
+    idle: { k: "idle", nextFullAt: 0, seenRoot: "r0" },
+    queued: { k: "queued", kind: { incremental: "r0" }, since: 1, nextFullAt: 0, seenRoot: "r0" },
+    asking: { k: "asking", kind: { incremental: "r0" }, nextFullAt: 0, seenRoot: "r0" },
+    running: { k: "running", kind: { full: true }, nextFullAt: 0, seenRoot: "r0", headMoved: null },
+  };
+  const eventOf = { due: { now: 1 }, head: { root: "r1" }, auditNow: {}, granted: {}, heldElsewhere: { now: 1 }, ended: { report: {}, now: 1 }, cancel: {}, removed: {}, added: { now: 1 }, poke: {} };
+  const errors = console.error;
+  let said = 0;
+  console.error = () => { said += 1; };
+  try {
+    for (const st of STATES) {
+      assert.ok(sample[st], `no sample for state ${st}: the cross product cannot reach it`);
+      for (const e of EVENTS) {
+        assert.ok(eventOf[e], `no sample for event ${e}`);
+        const t0 = { ...tab([], 0), assets: new Map([["a", sample[st]]]), order: ["a"] };
+        const { tab: t1 } = step(t0, { e, target: "a", ...eventOf[e] }, world(1));
+        assert.equal(t1.unhandled, 0, `${st} × ${e} reached no branch`);
+      }
+    }
+  } finally { console.error = errors; }
+  assert.equal(said, 0, "a defined cell was reported as unhandled");
+});
+
+await t("THE CONTROL: an event step() has no branch for is COUNTED and named, never thrown, and the tab keeps working", () => {
+  const errors = console.error;
+  const said = [];
+  console.error = m => said.push(m);
+  try {
+    const { tab: tb } = run(tab(["a"], 0), [{ e: "nonsense", target: "a" }, { e: "due", now: 0 }]);
+    assert.equal(tb.unhandled, 1);
+    assert.match(said[0], /no branch for the unknown event nonsense/);
+    assert.equal(tb.assets.get("a").k, "asking", "the tab stopped handling events after an unhandled one");
+  } finally { console.error = errors; }
 });
 
 await t("**ONE WRITER: only `step` changes a tab's asset states** (no other function in js/ writes `.assets`)", async () => {

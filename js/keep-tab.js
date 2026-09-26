@@ -15,11 +15,13 @@
 
 /** An asset's states: ONE list (KEEPER §12). Each case's data lives on the object; no parallel flags. */
 export const STATES = Object.freeze(["idle", "queued", "asking", "running"]);
+/** The events: ONE list, the one `step` switches over. A test drives every STATES × EVENTS cell. */
+export const EVENTS = Object.freeze(["due", "head", "auditNow", "granted", "heldElsewhere", "ended", "cancel", "removed", "added", "poke"]);
 
 /** A fresh tab: its assets, all idle, first full pass due at `now`. `order` breaks the scheduler's ties. */
 export function tab(targets, now) {
   const assets = new Map(targets.map(t => [t, { k: "idle", nextFullAt: now, seenRoot: null }]));
-  return { assets, order: [...targets], seq: 0, impossible: 0 };
+  return { assets, order: [...targets], seq: 0, impossible: 0, unhandled: 0 };
 }
 
 const FULL = Object.freeze({ full: true });
@@ -41,6 +43,11 @@ export function step(t, event, world) {
   const effects = [];
   const assets = new Map(t.assets);
   let impossible = t.impossible;
+  // NO THROW IN THE BROWSER (the architect; #450's unreachable! argument): a state or event step() has no branch for is
+  // COUNTED and named, and the state is returned unchanged -- one asset's gap never stops the tab's event handling.
+  // Exhaustiveness is proved at TEST time (every STATES × EVENTS cell reaches a defined branch).
+  let unhandled = t.unhandled ?? 0;
+  const unknown = (s, what) => { unhandled += 1; console.error(`keep-tab: no branch for ${what} in state ${s?.k} (event ${event.e})`); return s; };
   let seq = t.seq;
   const want = (s, kind) => ({ k: "queued", kind, since: ++seq, nextFullAt: s.nextFullAt, seenRoot: s.seenRoot });
   const impossibleCell = s => { impossible += 1; return s; };
@@ -65,7 +72,7 @@ export function step(t, event, world) {
           case "queued": if (!isFull(s.kind)) assets.set(target, { ...s, kind: FULL }); break;
           case "asking": if (!isFull(s.kind)) assets.set(target, { ...s, kind: FULL }); break;
           case "running": break; // I3: the cadence never touches a running pass
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: unknown(s, "due");
         }
       }
       break;
@@ -76,7 +83,7 @@ export function step(t, event, world) {
           case "queued":
           case "asking": return s; // Full: starts from the current root anyway; Incremental: keeps its (OLDEST) old root
           case "running": return { ...s, headMoved: oldest(s.headMoved, s.seenRoot) };
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: return unknown(s, event.e);
         }
       });
       break;
@@ -87,7 +94,7 @@ export function step(t, event, world) {
           case "queued":
           case "asking": return isFull(s.kind) ? s : { ...s, kind: FULL }; // never lose the person's full request
           case "running": return s; // the button is disabled
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: return unknown(s, event.e);
         }
       });
       break;
@@ -102,7 +109,7 @@ export function step(t, event, world) {
           case "idle":
           case "queued":
           case "running": return impossibleCell(s); // (a)
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: return unknown(s, event.e);
         }
       });
       break;
@@ -114,7 +121,7 @@ export function step(t, event, world) {
           case "idle":
           case "queued":
           case "running": return impossibleCell(s); // (a)
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: return unknown(s, event.e);
         }
       });
       break;
@@ -131,7 +138,7 @@ export function step(t, event, world) {
           case "idle":
           case "queued":
           case "asking": return impossibleCell(s); // (b)
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: return unknown(s, event.e);
         }
       });
       break;
@@ -142,7 +149,7 @@ export function step(t, event, world) {
           case "queued": return { k: "idle", nextFullAt: s.nextFullAt, seenRoot: s.seenRoot };
           case "idle":
           case "asking": return s; // a person cancels a RUNNING pass; an ask's answer must still arrive in asking (a)
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: return unknown(s, event.e);
         }
       });
       break;
@@ -153,7 +160,7 @@ export function step(t, event, world) {
           case "idle":
           case "queued":
           case "asking": return null; // an asking asset's lock answer then arrives to nothing: counted as (a)
-          default: throw new Error(`keep-tab: unknown state ${s.k}`);
+          default: return unknown(s, event.e);
         }
       });
       break;
@@ -163,10 +170,10 @@ export function step(t, event, world) {
     case "poke":
       break; // a page answered (maybe a background op ended): only the scheduler below runs
     default:
-      throw new Error(`keep-tab: unknown event ${event.e}`);
+      unknown(null, `the unknown event ${event.e}`);
   }
   const order = event.e === "added" && !t.order.includes(event.target) ? [...t.order, event.target] : t.order.filter(x => assets.has(x));
-  let next = { assets, order, seq, impossible };
+  let next = { assets, order, seq, impossible, unhandled };
   // THE SCHEDULER (one function, not a state): the free slot goes to the OLDEST queued asset (ties: list order).
   if (slotFree(next, world)) {
     const queued = order.filter(x => assets.get(x)?.k === "queued").sort((a, b) => assets.get(a).since - assets.get(b).since);
