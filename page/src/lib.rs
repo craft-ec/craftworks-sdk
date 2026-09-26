@@ -1793,6 +1793,14 @@ impl Page {
     /// An op goes out, due again one RTO from now. A GET waits for a place
     /// in the window.
     fn send(&mut self, w: Waiting, op: Op) {
+        // A send of an op that is PARKED JOINS its wait (the deadline table's (d), the architect and main): the parked
+        // deadline and back-off stand, and it goes out, as this op, when that deadline comes due. The rule a GET already
+        // follows (`FetchBlock` sends nothing while one is pending); a parked head read waits BECAUSE the register
+        // lagged, and sending again at once would make the park's back-off a loop under a lagging register.
+        if let Some(d) = self.deadlines.get_mut(&w).filter(|d| !d.sent) {
+            d.op = op;
+            return;
+        }
         if let Waiting::Get(id) = w {
             if self.gets_in_flight() >= self.window.size() && !self.deadlines.contains_key(&w) {
                 if !self.get_queue.contains(&id) {
@@ -1955,6 +1963,9 @@ impl Page {
     /// not on the wire, so coming due is no timeout: the RTO does not back
     /// off and the window does not halve, because the node IS answering.
     fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
+        // THE IMPOSSIBLE CELL (park × parked): only an op on the wire is answered, so only it is parked; a parked
+        // deadline here would be an answer to something never asked (the deadline table).
+        debug_assert!(self.deadlines.get(&w).is_none_or(|d| d.sent), "park of an op that is already parked: {w:?}");
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
         if let Some(old) = self.deadlines.insert(w.clone(), Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0, alone: false }) {
@@ -3117,6 +3128,203 @@ mod recording {
         assert_eq!(p.ops_on_wire(), 1, "one op on the wire");
     }
 
+}
+
+#[cfg(test)]
+mod deadline_table {
+    //! The pins of the deadline/RTO table's cells that no other test held (stock-take proposal 1): each names its
+    //! cell as `row × column`. Pages are `unstarted` so nothing else is on the wire unless a test puts it there.
+    use super::*;
+
+    const T0: u64 = 1_790_253_181_367;
+
+    fn page() -> Page {
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(T0));
+        p.now = T0;
+        p
+    }
+
+    fn get(p: &mut Page, i: u8) {
+        p.send(Waiting::Get([i; 32]), Op::Get { id: [i; 32] });
+    }
+
+    fn put(p: &mut Page, i: u8) {
+        p.send(Waiting::Put([i; 32]), Op::Put { id: [i; 32], bytes: vec![i] });
+    }
+
+    /// **send × parked (d), RULED: a send of a parked op JOINS its wait.** The head read is parked below the floor;
+    /// the engine asks for the head again: nothing goes out, the parked deadline and back-off stand, and the read
+    /// goes out when that deadline comes due. Mutant "supersede at once" -> red.
+    #[test]
+    fn send_of_a_parked_op_joins_its_wait() {
+        let mut p = Page::new_at(Params::default(), PutPath::Page, Ms(T0));
+        p.set_head_floor(2);
+        let _ = p.take_ops();
+        p.answer(Answer::Head { label: Label::Head, read: Some(HeadRead::from((1, [1u8; 32]))) }, Ms(T0 + 10));
+        let (sent, due) = p.deadlines.get(&Waiting::RecoverHead).map(|d| (d.sent, d.at)).expect("THE SETUP: the head read was not parked");
+        assert!(!sent, "THE SETUP: the head read is still on the wire");
+        let _ = p.take_ops();
+        p.carry_out(vec![Effect::ReadHead { epoch: EPOCH }]);
+        assert!(p.take_ops().is_empty(), "a send of a PARKED op went out at once instead of joining its wait");
+        assert_eq!(p.deadlines[&Waiting::RecoverHead].at, due, "the parked deadline moved");
+        p.tick(Ms(due));
+        assert!(p.take_ops().contains(&Op::ReadHead { label: Label::Head }), "the head read did not go out when its parked deadline came due");
+    }
+
+    /// **answer × parked (a):** an answer for a parked op ends (or re-parks) its wait with no RTT sample, no window
+    /// step (it held no place) and no re-arm. A GET answered NotFound is parked; a second NotFound for it comes.
+    /// Mutant "a parked op's answer opens the window" -> red.
+    #[test]
+    fn an_answer_for_a_parked_op_samples_nothing_and_opens_no_window() {
+        let mut p = page();
+        get(&mut p, 1);
+        p.answer(Answer::GetMissed([1; 32]), Ms(T0 + 10));
+        assert!(p.deadlines.get(&Waiting::Get([1; 32])).is_some_and(|d| !d.sent), "THE SETUP: the GET was not parked");
+        let (srtt, rto, window) = (p.rto.srtt_ms(), p.rto.rto_ms(), p.window.size());
+        p.answer(Answer::GetMissed([1; 32]), Ms(T0 + 20));
+        assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms(), p.window.size()), (srtt, rto, window), "an answer for a PARKED op moved the clock or the window");
+        assert!(p.deadlines.get(&Waiting::Get([1; 32])).is_some_and(|d| !d.sent), "the re-answered parked GET is not parked again");
+    }
+
+    /// **park × first send, queued (b):** the answer comes first -- no sample (it was queued), the back-off ENDS --
+    /// then the op is parked at `backoff(1)` of the RTO after it. Mutant "a queued answer does not end the back-off"
+    /// -> red.
+    #[test]
+    fn park_of_a_queued_first_send_samples_nothing_and_ends_the_back_off() {
+        let mut p = page();
+        for _ in 0..10 {
+            p.rto.timed_out();
+        }
+        get(&mut p, 1);
+        get(&mut p, 2);
+        assert!(!p.deadlines[&Waiting::Get([2; 32])].alone, "THE SETUP: the second GET was not queued");
+        p.answer(Answer::GetMissed([2; 32]), Ms(T0 + 74));
+        assert_eq!(p.rto.srtt_ms(), None, "a queued answer was a sample");
+        assert_eq!(p.rto.rto_ms(), rto::RTO_INITIAL_MS as u64, "the back-off did not end");
+        let d = &p.deadlines[&Waiting::Get([2; 32])];
+        assert_eq!((d.sent, d.at), (false, T0 + 74 + rto::RTO_INITIAL_MS as u64), "not parked at backoff(1) of the RTO after the answer");
+    }
+
+    /// **park × re-send (c):** a re-send's answer is no sample and leaves the back-off; the op is parked at
+    /// `backoff(attempt)` -- its own attempt, not a first send's. Mutant "park at backoff(1)" -> red.
+    #[test]
+    fn park_of_a_re_send_keeps_its_attempts_back_off() {
+        let mut p = page();
+        get(&mut p, 1);
+        p.tick(Ms(T0 + rto::RTO_INITIAL_MS as u64));
+        assert_eq!(p.deadlines.get(&Waiting::Get([1; 32])).map(|d| (d.sent, d.attempt)), Some((true, 2)), "THE SETUP: the GET was not re-sent as attempt 2");
+        let rto = p.rto.rto_ms();
+        let now = T0 + rto::RTO_INITIAL_MS as u64 + 30;
+        p.answer(Answer::GetMissed([1; 32]), Ms(now));
+        assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms()), (None, rto), "a re-send's answer moved the RTO");
+        let d = &p.deadlines[&Waiting::Get([1; 32])];
+        assert_eq!((d.sent, d.attempt, d.at), (false, 2, now + p.backoff(2)), "not parked at its own attempt's back-off");
+    }
+
+    /// **park × parked: IMPOSSIBLE, asserted.** Only an op on the wire is answered, so only it is parked.
+    #[test]
+    #[should_panic(expected = "park of an op that is already parked")]
+    fn parking_a_parked_op_is_refused_loudly() {
+        let mut p = page();
+        p.park(Waiting::Get([1; 32]), Op::Get { id: [1; 32] }, 1);
+        p.park(Waiting::Get([1; 32]), Op::Get { id: [1; 32] }, 1);
+    }
+
+    /// **withdraw × first send (alone, queued) and re-send:** a withdrawn op's deadline ends -- no sample, no
+    /// back-off, nothing sent -- and the ops BEHIND it keep their deadlines: the node still holds the withdrawn one in
+    /// its queue (nothing recalls a request already sent), so their place moves up only at the NEXT answer's re-arm,
+    /// when the withdrawn op no longer counts. Mutant "a withdrawal re-arms" -> red.
+    #[test]
+    fn a_withdrawn_op_leaves_the_ops_behind_it_where_they_were_until_the_next_answer() {
+        let mut p = page();
+        for i in 1..=3u8 {
+            put(&mut p, i);
+        }
+        let _ = p.take_ops();
+        let (rto, at2, at3) = (p.rto.rto_ms(), p.deadlines[&Waiting::Put([2; 32])].at, p.deadlines[&Waiting::Put([3; 32])].at);
+        p.now = T0 + 20;
+        p.carry_out(vec![Effect::Withdraw { id: [1; 32] }]);
+        assert!(!p.deadlines.contains_key(&Waiting::Put([1; 32])), "the withdrawn PUT still waits");
+        assert!(p.take_ops().is_empty(), "a withdrawal sent something");
+        assert_eq!(p.rto.rto_ms(), rto, "a withdrawal moved the RTO");
+        assert_eq!((p.deadlines[&Waiting::Put([2; 32])].at, p.deadlines[&Waiting::Put([3; 32])].at), (at2, at3), "the ops behind a withdrawn one moved at the withdrawal");
+        // The next answer re-arms by the place NOW: put 3 has one op ahead (put 2 was answered, put 1 is gone).
+        p.now = T0 + 40;
+        p.answered(&Waiting::Put([2; 32]));
+        assert_eq!(p.deadlines[&Waiting::Put([3; 32])].at, at3.min(T0 + 40 + queued_wait(p.rto.rto_ms(), 0)), "the next answer did not re-arm put 3 at its place now");
+    }
+
+    /// **withdraw × re-send:** the same end for an op on its second attempt: no sample, no back-off change.
+    #[test]
+    fn a_withdrawn_re_send_ends_with_no_clock_change() {
+        let mut p = page();
+        put(&mut p, 1);
+        p.tick(Ms(T0 + rto::RTO_INITIAL_MS as u64));
+        let _ = p.take_ops();
+        assert_eq!(p.deadlines[&Waiting::Put([1; 32])].attempt, 2, "THE SETUP: not a re-send");
+        let (srtt, rto) = (p.rto.srtt_ms(), p.rto.rto_ms());
+        p.carry_out(vec![Effect::Withdraw { id: [1; 32] }]);
+        assert!(!p.deadlines.contains_key(&Waiting::Put([1; 32])) && p.take_ops().is_empty());
+        assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms()), (srtt, rto), "withdrawing a re-send moved the clock");
+    }
+
+    /// **withdraw × parked:** a parked GET nobody needs any more ends: its deadline and attempt go, nothing is sent,
+    /// the clock and the window stand.
+    #[test]
+    fn a_parked_get_nobody_needs_ends_with_nothing_sent() {
+        let mut p = page();
+        get(&mut p, 1);
+        p.answer(Answer::GetMissed([1; 32]), Ms(T0 + 10));
+        let _ = p.take_ops();
+        let (rto, window) = (p.rto.rto_ms(), p.window.size());
+        // Nobody needs it: its block is held now (a repair rebuilt it).
+        p.blocks.insert([1; 32], &[1u8]);
+        p.end_unneeded_gets();
+        assert!(!p.deadlines.contains_key(&Waiting::Get([1; 32])) && !p.attempt_of.contains_key(&Waiting::Get([1; 32])), "the unneeded parked GET is still held");
+        assert!(p.take_ops().is_empty(), "ending a parked GET sent something");
+        assert_eq!((p.rto.rto_ms(), p.window.size()), (rto, window));
+    }
+
+    /// **send × window-queued:** a GET past the window is ENQUEUED, not armed: no deadline, not sent.
+    /// **reconnect × window-queued:** untouched -- a reconnect re-sends only what was on the wire.
+    #[test]
+    fn a_get_past_the_window_is_enqueued_not_armed_and_a_reconnect_leaves_it() {
+        let mut p = page();
+        let w = p.window.size() as u8;
+        for i in 1..=w + 1 {
+            get(&mut p, i);
+        }
+        let first = p.take_ops();
+        assert_eq!(first.len(), w as usize, "THE SETUP: not exactly the window's GETs went out");
+        let q = [w + 1; 32];
+        assert!(!p.deadlines.contains_key(&Waiting::Get(q)) && p.get_queue.contains(&q), "a GET past the window was armed or dropped");
+        p.reconnected(Ms(T0 + 50));
+        let again = p.take_ops();
+        assert!(!again.contains(&Op::Get { id: q }), "a reconnect sent a window-queued GET");
+        assert!(p.get_queue.contains(&q) && !p.deadlines.contains_key(&Waiting::Get(q)), "a reconnect moved a window-queued GET");
+    }
+
+    /// **park × window-queued:** a LOST GET waiting in the window's queue (its attempt kept) is answered NotFound:
+    /// it leaves the queue and is parked at its attempt's back-off.
+    #[test]
+    fn a_lost_get_answered_notfound_while_queued_is_parked() {
+        let mut p = page();
+        p.window.halved();
+        p.window.halved();
+        let w = p.window.size() as u8;
+        for i in 1..=w + 1 {
+            get(&mut p, i);
+        }
+        let _ = p.take_ops();
+        // The first GET times out: LOST, queued behind the waiting ask (which takes its place), its attempt kept.
+        p.tick(Ms(p.deadlines[&Waiting::Get([1; 32])].at));
+        assert!(p.get_queue.contains(&[1; 32]) && p.attempt_of.contains_key(&Waiting::Get([1; 32])), "THE SETUP: the lost GET is not waiting in the window's queue");
+        let now = p.now + 5;
+        p.answer(Answer::GetMissed([1; 32]), Ms(now));
+        assert!(!p.get_queue.contains(&[1; 32]), "the answered GET is still in the window's queue");
+        let d = &p.deadlines[&Waiting::Get([1; 32])];
+        assert_eq!((d.sent, d.at), (false, now + p.backoff(1)), "not parked at its attempt's back-off");
+    }
 }
 
 #[cfg(test)]
