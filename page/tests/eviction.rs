@@ -4,7 +4,9 @@
 //! "unpinned") loses its bytes and the test goes red.
 
 use engine::{ClientId, Op as WriteOp, Params, WriteId};
-use page::{Answer, Label, Ms, Op, Page, PutPath};
+use page::{Answer, Label, Ms, Op, Page, PutPath, HELD_ABSENTS};
+
+mod common;
 
 const KEY: [u8; 32] = [7u8; 32];
 
@@ -18,7 +20,11 @@ fn tiny() -> Params {
 /// A page (1-byte budget) with one write, driven until its Sign is answered: every block PUT is sent and NONE is
 /// answered, the head read found no head. The page, and the block PUTs on the wire (id, bytes).
 fn with_puts_out() -> (Page, Vec<Put>) {
-    let mut p = Page::new(tiny(), PutPath::Page);
+    with_puts_out_on(PutPath::Page)
+}
+
+fn with_puts_out_on(path: PutPath) -> (Page, Vec<Put>) {
+    let mut p = Page::new(tiny(), path);
     p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
     let mut puts = Vec::new();
     for _ in 0..20 {
@@ -38,19 +44,30 @@ fn with_puts_out() -> (Page, Vec<Put>) {
     (p, puts)
 }
 
-/// **C, in flight:** the pending commit's blocks, none acked, at a 1-byte budget. The node REFUSES one PARITY block
-/// (permanently): the engine re-puts it FROM THE STORE (`on_failed`), so it must still be there. Mutant "C
-/// unpinned" -> the bytes were evicted -> no re-put, `reput_missing` 1 -> red.
-#[test]
-fn an_in_flight_block_refused_is_put_again_from_the_store_after_eviction_passes() {
-    let (mut p, puts) = with_puts_out();
-    // A PARITY block: data blocks are also the warm apply's (W pins them too); parity is only ever C.
-    let (id, bytes) = puts.iter().find(|(id, b)| freenet_prolly::block_id(freenet_prolly::kind::PARITY, b) == *id).cloned().expect("THE SETUP: no parity PUT in the first wave");
-    p.answer(Answer::PutRefused { id, transient: false }, Ms(20));
-    let again: Vec<Vec<u8>> = p.take_ops().into_iter().filter_map(|o| match o { Op::Put { id: x, bytes } if x == id => Some(bytes), _ => None }).collect();
-    assert_eq!(p.reput_missing(), 0, "a pending commit's refused block had its bytes evicted: it can never be put again");
-    assert_eq!(again, vec![bytes], "the refused block was not put again, with its bytes, from the store");
-    assert!(p.blocks().stats().peak_pinned_bytes > 0, "THE SETUP: no eviction pass ran over pinned blocks, so this tested nothing");
+/// The one re-PUT FROM PAGE MEMORY (after sdk#433 a rejected block is never put again): on the Wrapper path an acked
+/// PUT is confirmed only by `Held`; after HELD_ABSENTS absents in a row the page puts the block AGAIN, with the bytes it
+/// holds. Answer `id`'s Held asks absent that many times (a tick past each backoff); the ops that follow.
+fn absent_until_put_again(p: &mut Page, id: [u8; 32], mut now: u64) -> Vec<Op> {
+    let mut absents = 0;
+    let mut after = Vec::new();
+    for _ in 0..100 {
+        for op in p.take_ops() {
+            match op {
+                Op::AskHeld { id: x } if x == id && absents < HELD_ABSENTS => {
+                    absents += 1;
+                    p.answer(Answer::Held { id, present: false }, Ms(now));
+                }
+                other => after.push(other),
+            }
+        }
+        if absents >= HELD_ABSENTS && after.iter().any(|o| matches!(o, Op::Put { id: x, .. } if *x == id)) {
+            break;
+        }
+        now += page::rto::RTO_MAX_MS as u64 + 1;
+        p.tick(Ms(now));
+    }
+    assert_eq!(absents, HELD_ABSENTS, "THE SETUP: the block was not asked Held HELD_ABSENTS times");
+    after
 }
 
 fn is_parity(id: &[u8; 32], bytes: &[u8]) -> bool {
@@ -60,7 +77,7 @@ fn is_parity(id: &[u8; 32], bytes: &[u8]) -> bool {
 /// A page (1-byte budget) whose one write is PUBLISHED with ONE first-wave parity block never acked (the
 /// straggler): every other PUT acked, signed, landed, read back. The page and the straggler (id, bytes).
 fn published_with_a_straggler() -> (Page, Put) {
-    let (mut p, puts) = with_puts_out();
+    let (mut p, puts) = with_puts_out_on(PutPath::Wrapper);
     let straggler = puts.iter().find(|(id, b)| is_parity(id, b)).cloned().expect("THE SETUP: no first-wave parity");
     for (id, _) in &puts {
         if *id != straggler.0 {
@@ -82,7 +99,11 @@ fn published_with_a_straggler() -> (Page, Put) {
                 Op::Update { label: Label::Head, .. } => p.answer(Answer::Updated { label: Label::Head }, Ms(31)),
                 Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: mine.clone() }, Ms(32)),
                 Op::Put { id, .. } if id != straggler.0 => p.answer(Answer::PutOk(id), Ms(33)),
-                _ => {}
+                // The straggler's re-sends: never answered (it is the straggler).
+                Op::Put { .. } => {}
+                // The Wrapper path confirms an acked PUT by `Held`: every block but the straggler is there.
+                Op::AskHeld { id } if id != straggler.0 => p.answer(Answer::Held { id, present: true }, Ms(34)),
+                other => common::unanswered_op(&other),
             }
         }
     }
@@ -91,17 +112,18 @@ fn published_with_a_straggler() -> (Page, Put) {
     (p, straggler)
 }
 
-/// **B, backing:** a PUBLISHED commit whose straggler is not yet acked (`backing.remaining`), at a 1-byte budget.
-/// The node refuses the straggler: the engine re-puts it FROM THE STORE, so it must still be there -- only B holds
-/// it now (no commit is pending, no write queued). Mutant "B unpinned" -> evicted -> no re-put -> red.
+/// **B, backing:** a PUBLISHED commit whose straggler is not yet confirmed (`backing.remaining`), at a 1-byte budget,
+/// on the Wrapper path. The straggler's PUT is acked and `Held` answers absent HELD_ABSENTS times: the page puts it
+/// AGAIN with the bytes it holds -- only B holds it now (no commit is pending, no write queued). Mutant "B unpinned"
+/// -> evicted -> never put again -> red.
 #[test]
-fn a_published_commits_straggler_refused_is_put_again_from_the_store_after_eviction_passes() {
+fn a_published_commits_straggler_absent_is_put_again_from_page_memory_after_eviction_passes() {
     let (mut p, (id, bytes)) = published_with_a_straggler();
     let _ = p.take_ops();
-    p.answer(Answer::PutRefused { id, transient: false }, Ms(40));
-    let again: Vec<Vec<u8>> = p.take_ops().into_iter().filter_map(|o| match o { Op::Put { id: x, bytes } if x == id => Some(bytes), _ => None }).collect();
-    assert_eq!(p.reput_missing(), 0, "a backing straggler had its bytes evicted: it can never be put again");
-    assert_eq!(again, vec![bytes], "the refused straggler was not put again, with its bytes, from the store");
+    p.answer(Answer::PutOk(id), Ms(40));
+    let after = absent_until_put_again(&mut p, id, 41);
+    let again: Vec<Vec<u8>> = after.into_iter().filter_map(|o| match o { Op::Put { id: x, bytes } if x == id => Some(bytes), _ => None }).collect();
+    assert_eq!(again.first(), Some(&bytes), "a backing straggler, absent on the node, was not put again with its bytes: evicted");
     assert!(p.blocks().stats().evicted > 0, "THE SETUP: nothing was evicted, so no pass ran over unpinned blocks here");
 }
 

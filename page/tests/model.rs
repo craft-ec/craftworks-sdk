@@ -1581,3 +1581,76 @@ fn a_stale_pages_landing_whose_update_is_lost_twice_still_lands() {
     }
     assert!(b.unusable().is_empty(), "{:?}", b.unusable());
 }
+
+/// **HF, a foreign member's Held re-put, on real engine state at a 1-byte budget** (sdk#411): page A publishes a
+/// value group of 30; page B changes one value, so its commit asks the node about the group's OTHER members (A's,
+/// ConfirmHeld) -- B fetched them to re-code the group, so it HOLDS their bytes. Answered ABSENT HELD_ABSENTS times,
+/// B puts each AGAIN with those bytes (its self-heal of another page's straggler): only HF holds them while the ask is
+/// out. Mutant "HF unpinned" -> evicted -> never put again -> red.
+#[test]
+fn a_foreign_member_absent_is_put_again_from_page_memory_at_a_one_byte_budget() {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(Params::default(), PutPath::Page);
+    let mut b = Page::new(Params { max_page_block_bytes: 1, ..Params::default() }, PutPath::Page);
+    let mut now = 1_000u64;
+    /// Serve `p` as the node does; `absent`: every Held is answered absent. Returns the PUTs (id, bytes) it sent.
+    fn serve(p: &mut Page, node: &mut Node, now: &mut u64, absent: bool, rounds: usize) -> Vec<(Cid, Vec<u8>)> {
+        let mut puts = Vec::new();
+        for _ in 0..rounds {
+            let ops = p.take_ops();
+            if ops.is_empty() {
+                if !p.waiting() {
+                    break;
+                }
+                *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
+                p.tick(Ms(*now));
+                continue;
+            }
+            for op in ops {
+                let ans = match op {
+                    Op::Put { id, bytes } => {
+                        puts.push((id, bytes.clone()));
+                        node.put(id, &bytes);
+                        Some(Answer::PutOk(id))
+                    }
+                    Op::Get { id } => Some(match node.blocks.get(&id) {
+                        Some(b) => Answer::Got { id, bytes: b.clone() },
+                        None => Answer::GetMissed(id),
+                    }),
+                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                        let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                        Some(Answer::Signer { id, answer })
+                    }
+                    Op::Update { state, .. } => {
+                        node.update(&state);
+                        Some(Answer::Updated { label: page::Label::Head })
+                    }
+                    Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
+                    Op::AskHeld { id } => Some(Answer::Held { id, present: !absent && node.blocks.contains_key(&id) }),
+                    Op::PutApp { key } => Some(Answer::AppPutOk(key)),
+                    Op::Ext(_) => None,
+                };
+                if let Some(ans) = ans {
+                    p.answer(ans, Ms(*now));
+                }
+            }
+        }
+        puts
+    }
+    serve(&mut a, &mut node, &mut now, false, 400);
+    serve(&mut b, &mut node, &mut now, false, 400);
+    let rows: Vec<(Vec<u8>, WriteOp)> = (0..30).map(|i| (format!("v/{i:02}").into_bytes(), WriteOp::Put(vec![i as u8; 2_000]))).collect();
+    a.write(ClientId(1), WriteId(1), rows);
+    serve(&mut a, &mut node, &mut now, false, 2_000);
+    assert_eq!(node.head().map(|h| h.0), Some(1), "THE SETUP: A did not publish");
+    let a_values: BTreeMap<Cid, Vec<u8>> = node.blocks.iter().filter(|(_, v)| v.len() == 2_000).map(|(k, v)| (*k, v.clone())).collect();
+    b.head_hint();
+    serve(&mut b, &mut node, &mut now, false, 400);
+    b.write(ClientId(2), WriteId(1), vec![(b"v/05".to_vec(), WriteOp::Put(vec![99u8; 2_000]))]);
+    let puts = serve(&mut b, &mut node, &mut now, true, 5_000);
+    let again: Vec<&(Cid, Vec<u8>)> = puts.iter().filter(|(id, _)| a_values.contains_key(id)).collect();
+    println!("B put {} of A's {} value blocks again from its memory (1-byte budget); B's store peak pinned {} B", again.len(), a_values.len(), b.blocks().stats().peak_pinned_bytes);
+    assert!(!again.is_empty(), "no foreign member absent on the node was put again from page memory: HF did not hold its bytes");
+    assert!(again.iter().all(|(id, bytes)| a_values.get(id) == Some(bytes)), "a foreign member was put again with other bytes");
+    assert_eq!(b.reput_missing(), 0);
+}

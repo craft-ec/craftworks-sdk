@@ -1116,7 +1116,8 @@ impl Page {
                 // again on a doubling backoff, and only after HELD_ABSENTS in
                 // a row put it again — never at the speed of the answers.
                 let absents = self.held_again.get(&id).map_or(0, |(_, n)| *n) + 1;
-                let bytes = self.engine.blocks().get(&id).map(<[u8]>::to_vec);
+                // Read (and, gone, counted) only when it is due to be put again: the one re-PUT from page memory.
+                let bytes = if absents >= HELD_ABSENTS { self.engine.reput_bytes(&id) } else { None };
                 if let (true, Some(bytes)) = (absents >= HELD_ABSENTS, bytes) {
                     self.held_again.remove(&id);
                     self.put_again.insert(id, bytes);

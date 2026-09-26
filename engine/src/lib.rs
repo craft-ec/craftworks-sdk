@@ -1010,9 +1010,12 @@ struct Repair {
 pub enum Pin {
     /// W: a queued write's warm-apply block (`Effect::Keep`), in no commit yet -- the only copy.
     Warm,
-    /// C: the pending commit's block, not yet acked: `on_failed` re-puts it FROM the store.
+    /// C: the pending commit's block, not yet confirmed: on the Wrapper path its `Held` re-put (after HELD_ABSENTS
+    /// absents, [`Engine::reput_bytes`]) reads it from page memory -- and a block whose PUT is not yet acked when the
+    /// commit publishes becomes a straggler (B) whose re-put needs the SAME bytes. No `Held` ask is out for it yet,
+    /// so HF does not hold it.
     InFlight,
-    /// B: a published commit's block not yet acked (`backing.remaining`): the straggler's re-put reads the store.
+    /// B: a published commit's block not yet acked (`backing.remaining`): its re-put reads page memory.
     Backing,
     /// P: a parked read holds it (`Parked::held`) or waits on it (`reads.waiting`).
     ParkedRead,
@@ -4222,9 +4225,25 @@ impl<B: Blocks> Engine<B> {
                 after: Vec::new(),
             }];
         }
-        // Its bytes are gone: the commit waits for ever on it (sdk#411's C pin exists to make this 0).
+        // Its bytes are gone: the commit waits for ever on it (the pack path's; off in this phase).
         self.reput_missing += 1;
         Vec::new()
+    }
+
+    /// THE RE-PUT FROM PAGE MEMORY (sdk#411): the bytes of `id` for a PUT again -- the Wrapper path's `Held` rule,
+    /// after HELD_ABSENTS absents in a row. `None` if the page does not hold them; and when the block is one this
+    /// engine's commits PUT (the pending commit's, or a published one's straggler) its bytes were the page's, so
+    /// their absence is COUNTED ([`Engine::reput_missing`]: the pin rule's model property, always 0). A foreign member
+    /// the page never held is not counted.
+    pub fn reput_bytes(&mut self, id: &Cid) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.blocks.get(id) {
+            return Some(bytes.to_vec());
+        }
+        let own = self.pending.as_ref().is_some_and(|c| c.data.contains(id)) || self.backing.iter().any(|b| b.remaining.contains(id));
+        if own {
+            self.reput_missing += 1;
+        }
+        None
     }
 
 
@@ -5094,7 +5113,8 @@ impl<B: Blocks> Engine<B> {
     /// THE ONE PIN RULE (sdk#411): every block whose page copy may NOT be dropped, and why -- the engine's own facts
     /// and the page's (`page`). Everything else in the store may be: its bytes are on the node, or nothing
     /// references them, and a later need fetches it. The states are the design's table (sdk#411): W, C, B, P, PW,
-    /// HF (R was measured to need no pin: [`PagePins`]). Listed once per eviction pass, never per block.
+    /// HF (R was measured to need no pin: [`PagePins`]). Each class's reader, and the mutant that proves it, are
+    /// named on [`Pin`]. Listed once per eviction pass, never per block.
     pub fn pins(&self, page: &PagePins<'_>) -> BTreeMap<Cid, Pin> {
         let mut out = BTreeMap::new();
         // The later a class is listed, the more it says: a block in two classes keeps the first reason.
