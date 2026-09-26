@@ -33,7 +33,6 @@
 //! usage: classify-frames --block-code <block.wasm> [--pieces <pieces.json> --webapp-code <webapp.wasm>] < frames.jsonl > classified.jsonl
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use freenet_stdlib::client_api::streaming::ReassemblyBuffer;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, DelegateRequest};
 use freenet_stdlib::prelude::*;
 use std::collections::BTreeMap;
@@ -153,7 +152,7 @@ fn main() -> Result<()> {
         _ => bail!("--pieces and --webapp-code go together: a piece is proved by its address under the webapp code; {usage}"),
     };
     let known = Known { block, pieces, webapp };
-    let mut streams: BTreeMap<String, ReassemblyBuffer> = BTreeMap::new();
+    let mut reqs = probe::frames::Requests::default();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     let (mut frames, mut requests) = (0usize, 0usize);
@@ -181,32 +180,15 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        let req: ClientRequest<'_> = match bincode::deserialize(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                emit(&mut out, vec![serde_json::json!({ "op": "undecodable", "bytes": bytes.len(), "head": hex(&bytes[..bytes.len().min(16)]), "verdict": "fail", "why": format!("not a ClientRequest: {e}") })])?;
-                continue;
+        // Through the probes' ONE decoder (probe::frames): a chunked request is reassembled per socket.
+        match reqs.push(&f.socket, &bytes) {
+            Ok(probe::frames::Frame::Partial) => continue,
+            Ok(probe::frames::Frame::Whole(req)) => {
+                requests += 1;
+                emit(&mut out, classify(&req, &known))?;
             }
-        };
-        // A CHUNK of a request the SDK split (stdlib's own rule): reassembled
-        // per socket; classified once whole.
-        if let ClientRequest::StreamChunk { stream_id, index, total, data } = &req {
-            let buf = streams.entry(f.socket.clone()).or_default();
-            match buf.receive_chunk(*stream_id, *index, *total, data.clone()) {
-                Ok(None) => continue,
-                Ok(Some(whole)) => match bincode::deserialize::<ClientRequest<'_>>(&whole) {
-                    Ok(inner) => {
-                        requests += 1;
-                        emit(&mut out, classify(&inner, &known))?;
-                    }
-                    Err(e) => emit(&mut out, vec![serde_json::json!({ "op": "undecodable", "verdict": "fail", "why": format!("a reassembled stream is not a ClientRequest: {e}") })])?,
-                },
-                Err(e) => emit(&mut out, vec![serde_json::json!({ "op": "undecodable", "verdict": "fail", "why": format!("a stream chunk did not reassemble: {e:?}") })])?,
-            }
-            continue;
+            Err(why) => emit(&mut out, vec![serde_json::json!({ "op": "undecodable", "bytes": bytes.len(), "head": hex(&bytes[..bytes.len().min(16)]), "verdict": "fail", "why": why })])?,
         }
-        requests += 1;
-        emit(&mut out, classify(&req, &known))?;
     }
     eprintln!("classify-frames: {frames} frame(s), {requests} whole request(s)");
     Ok(())
