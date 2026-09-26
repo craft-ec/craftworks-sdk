@@ -58,7 +58,7 @@ await t("THE CONTROLS: an unmarked spread is flagged; a marked control, the help
 
 await t("**the helper drops the outer run's GATE_* and DISK_GUARD* and keeps the rest; a test's own values win**", async () => {
   const { childEnv } = await import("./common/child-env.mjs");
-  const saved = { ...process.env };
+  const saved = Object.fromEntries(Object.entries(process.env));
   try {
     Object.assign(process.env, { GATE_PR_BASE: "FETCH_HEAD", DISK_GUARD: "/refuse", DISK_GUARD_JOBS: "/x", CARGO_TARGET_DIR: "/t" });
     const env = childEnv({ DISK_GUARD: "/admit" });
