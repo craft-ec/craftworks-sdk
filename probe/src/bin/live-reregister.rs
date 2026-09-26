@@ -22,14 +22,27 @@ async fn main() {
     });
 }
 
+/// The four ports this probe uses, all derived from `SIGNER_PORT`: its node's WS and network ports, then the fresh
+/// node's. EVERY one goes through the probes' one guard (`allowed_port`) BEFORE any node starts: a base of 7506-7508
+/// or 7606-7608 would otherwise land a DERIVED port on the owner's 7509/7609 (the architect's review of sdk#444).
+fn ports(base: u16) -> Result<[u16; 4]> {
+    let mut out = [0u16; 4];
+    for (i, p) in out.iter_mut().enumerate() {
+        let port = base.checked_add(i as u16).with_context(|| format!("port {base}+{i} is past 65535"))?;
+        *p = probe::node::allowed_port(&format!("ws://127.0.0.1:{port}")).with_context(|| format!("port {port} (SIGNER_PORT {base} + {i})"))?;
+    }
+    Ok(out)
+}
+
 async fn run() -> Result<bool> {
     let v = std::process::Command::new("freenet").arg("--version").output().context("freenet --version")?;
     let version = String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or_default().to_string();
-    let port: u16 = std::env::var("SIGNER_PORT").ok().and_then(|p| p.parse().ok()).context("SIGNER_PORT=<port> is required; there is no default")?;
+    let base: u16 = std::env::var("SIGNER_PORT").ok().and_then(|p| p.parse().ok()).context("SIGNER_PORT=<port> is required; there is no default")?;
+    let [port, net, fresh_port, fresh_net] = ports(base)?;
     let wasm = std::fs::read(std::env::args().nth(1).context("usage: live-reregister <signer.wasm>")?)?;
     let dir = std::env::temp_dir().join(format!("live-reregister-{}", std::process::id()));
     let _tree = TempTree(dir.clone());
-    let mut node = Node::spawn_in(port, &dir, Mode::IsolatedNetwork { network_port: port + 1 })?;
+    let mut node = Node::spawn_in(port, &dir, Mode::IsolatedNetwork { network_port: net })?;
     let mut c = connect(&node.ws()).await?;
     let key = register_delegate(&mut c, &wasm).await?;
     // THE CONTROL: registered, it answers. Without this, "lost" below could be a signer that never answered.
@@ -43,7 +56,7 @@ async fn run() -> Result<bool> {
     // node's delegate error. Without it, "kept" could be an ask that never sees an absent delegate at all.
     let fresh_dir = dir.join("fresh");
     let _fresh_tree = TempTree(fresh_dir.clone());
-    let fresh = Node::spawn_in(port + 2, &fresh_dir, Mode::IsolatedNetwork { network_port: port + 3 })?;
+    let fresh = Node::spawn_in(fresh_port, &fresh_dir, Mode::IsolatedNetwork { network_port: fresh_net })?;
     let mut f = connect(&fresh.ws()).await?;
     let absent = ask(&mut f, &key, &signer::Request::Register).await;
     anyhow::ensure!(absent.is_err(), "THE NEGATIVE CONTROL: an unregistered signer on a fresh node answered ({absent:?}): this ask cannot see a lost registration");
@@ -58,4 +71,21 @@ async fn run() -> Result<bool> {
         })
     );
     Ok(kept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ports;
+
+    /// A base whose DERIVED port is the owner's is refused before any node starts, naming that port; THE CONTROL: a
+    /// base whose four ports all miss 7509/7609 is allowed.
+    #[test]
+    fn a_base_that_derives_onto_the_owners_ports_is_refused_before_any_node_starts() {
+        for (base, owners) in [(7506u16, 7509u16), (7508, 7509), (7606, 7609)] {
+            let e = format!("{:#}", ports(base).expect_err("a derived port lands on the owner's node"));
+            assert!(e.contains(&owners.to_string()), "base {base}: the refusal does not name {owners}: {e}");
+        }
+        assert_eq!(ports(7505).expect("THE CONTROL: 7505..7508 miss the owner's ports"), [7505, 7506, 7507, 7508]);
+        assert!(ports(u16::MAX - 1).is_err(), "a port past 65535 was not refused");
+    }
 }
