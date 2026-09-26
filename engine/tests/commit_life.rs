@@ -442,7 +442,6 @@ impl Model {
 }
 
 #[test]
-#[should_panic(expected = "(K6, A8)")] // PINNED: known defect A8, the model's first red cell, flipped by #509
 fn the_engine_follows_the_commit_table() {
     let mut reach: BTreeMap<(String, Col), u64> = BTreeMap::new();
     for seed in 1..=48u64 {
@@ -514,7 +513,6 @@ fn a6_a_silent_racing_commit_is_never_ended_on_time() {
 /// `Unknown` would say "may have been saved" of a group that cannot have landed) and spends NO try: ten foreign moves
 /// in a row, and the write is never `Lost` or `Unknown`, and publishes. Mutant "spend a try" -> red.
 #[test]
-#[should_panic(expected = "whose head never left was told")] // PINNED: known defect A8, flipped by #509
 fn a8_foreign_moves_while_racing_read_no_witness_and_spend_no_try() {
     let mut h = harness(Params::default());
     let empty = h.published_root();
@@ -543,7 +541,6 @@ fn a8_foreign_moves_while_racing_read_no_witness_and_spend_no_try() {
 /// the root itself un-acked. The signer refuses a head whose root is not on the node (`RootNotHeld`, retryable), and a
 /// REJECTED root never will be: the commit must end `Failed`, never sit in Heading re-asked for ever.
 #[test]
-#[should_panic(expected = "whose root was rejected did not end Failed")] // PINNED: known defect A9 (root), flipped by #509
 fn a9_a_rejected_root_ends_a_heading_commit_failed() {
     let mut h = harness(Params::default());
     let fx = h.step(write(1));
@@ -558,7 +555,6 @@ fn a9_a_rejected_root_ends_a_heading_commit_failed() {
 /// **A2, Heading × E7 (the `head_before_packs` control arm):** a head read older than the commit RE-ISSUES the head;
 /// Heading never goes back to Racing (C2).
 #[test]
-#[should_panic(expected = "Heading went back to Racing on an older head")] // PINNED: known defect A2, flipped by #509
 fn a2_heading_never_goes_back_to_racing() {
     let mut h = harness(Params { head_before_packs: true, ..Params::default() });
     let first = h.step(big_write(1));
@@ -576,7 +572,6 @@ fn a2_heading_never_goes_back_to_racing() {
 /// **A5, Heading × E6 (and the witness's landed end):** a write told `Stalled` that then publishes leaves no stalled
 /// record behind (C4): the record goes with the write.
 #[test]
-#[should_panic(expected = "a published write is still recorded as told Stalled")] // PINNED: known defect A5, flipped by #509
 fn a5_a_stalled_write_that_publishes_leaves_no_stalled_record() {
     let mut h = harness(Params::default());
     let first = h.step(write(1));
@@ -594,7 +589,6 @@ fn a5_a_stalled_write_that_publishes_leaves_no_stalled_record() {
 /// **A1, Racing × E8 (and every non-Published end):** the dead commit's PUTs still on the way are WITHDRAWN (C3), as
 /// `fail_commit` does -- not left re-sending for a commit that no longer exists.
 #[test]
-#[should_panic(expected = "left un-withdrawn by its foreign end")] // PINNED: known defect A1, flipped by #509
 fn a1_a_dead_commits_puts_are_withdrawn() {
     let mut h = harness(Params::default());
     // A published base, so the dead commit's blocks differ from its re-application's on the foreign (empty) root.
@@ -623,7 +617,6 @@ fn a1_a_dead_commits_puts_are_withdrawn() {
 /// (C3 withdraws only what did not land): what it still owes goes on toward BACKED_UP as a Backing. Mutant "withdraw on
 /// every Dead end" -> red.
 #[test]
-#[should_panic(expected = "tracked by no Backing")] // PINNED: known defect C3 (a landed group's blocks), flipped by #509
 fn a_landed_groups_blocks_are_kept_not_withdrawn() {
     let mut h = harness(Params::default());
     let fx = h.step(big_write(1));
@@ -644,7 +637,6 @@ fn a_landed_groups_blocks_are_kept_not_withdrawn() {
 /// reach k ends the commit `Failed` at that rejection; before it, each rejection leaves it in flight (the head may
 /// land at k). Mutant "only the root ends it" -> red.
 #[test]
-#[should_panic(expected = "no group fell below k")] // PINNED: known defect A9 (below k), flipped by #509
 fn a9_a_group_rejected_below_k_ends_a_heading_commit_failed() {
     let mut h = harness(Params { head_before_packs: true, ..Params::default() });
     let first = h.step(wide_write(1));
