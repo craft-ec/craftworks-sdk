@@ -84,8 +84,12 @@ fi
 # GATE_OWNERS_PER_PR is the BATCH's flag (craftworks-docs scripts/batch-merge.sh, sdk#420), honoured ONLY by the
 # batch gate (full + --accept). Anywhere else a stray export would switch off the one check that catches an
 # undeclared crossing on a single PR, while the gate printed a plausible line. Checked before any work.
-if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
-  case "$GATE_OWNERS_PER_PR" in (*[!0-9]*|0) echo "gate: GATE_OWNERS_PER_PR must be a PR count, got '$GATE_OWNERS_PER_PR'" >&2; exit 1 ;; esac
+OWNERS_PER_PR=${GATE_OWNERS_PER_PR:-}
+# Read ONCE, then removed from the environment: the gate runs tests that start ./gate.sh themselves, and a child
+# that inherited the batch's flag refused to start (batch 3, 2026-09-26: npm lost 39 tests behind one such refusal).
+unset GATE_OWNERS_PER_PR
+if [ -n "$OWNERS_PER_PR" ]; then
+  case "$OWNERS_PER_PR" in (*[!0-9]*|0) echo "gate: GATE_OWNERS_PER_PR must be a PR count, got '$OWNERS_PER_PR'" >&2; exit 1 ;; esac
   if [ "$MODE" != full ] || [ $ACCEPT -ne 1 ]; then
     echo "gate: GATE_OWNERS_PER_PR is only for the batch gate (./gate.sh --accept from batch-merge.sh); unset it" >&2; exit 1
   fi
@@ -432,8 +436,8 @@ echo "$dup_line"
 step "owners"
 # A BATCH tree mixes several PRs' commits, so one owners verdict over it says nothing: craftworks-docs
 # scripts/batch-merge.sh judges each PR on its own commits first and says so here (sdk#420). Never a commit message.
-if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
-  owners_line="owners: judged per PR ($GATE_OWNERS_PER_PR PRs)"
+if [ -n "$OWNERS_PER_PR" ]; then
+  owners_line="owners: judged per PR ($OWNERS_PER_PR PRs)"
   echo "$owners_line"
 else
   owners_out=$(node tools/owners.mjs 2>&1)

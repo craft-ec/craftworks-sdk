@@ -107,5 +107,18 @@ await t("**GATE_OWNERS_PER_PR is the batch gate's alone** (sdk#420): refused in 
   assert.match(bad.stderr, /must be a PR count, got 'x'/);
 });
 
+await t("**GATE_OWNERS_PER_PR is read once and UNSET before the gate starts anything** (batch 3: an inner gate.sh inherited it, refused, and npm lost 39 tests)", async () => {
+  const src = readFileSync(new URL("../../gate.sh", import.meta.url), "utf8");
+  const read = src.indexOf("OWNERS_PER_PR=${GATE_OWNERS_PER_PR:-}");
+  const unset = src.indexOf("unset GATE_OWNERS_PER_PR");
+  const firstChild = Math.min(...["cargo ", "npm ", "node "].map(w => { const i = src.indexOf("\n" + w); return i < 0 ? Infinity : i; }), src.indexOf("$guard"));
+  assert.ok(read > 0, "the flag is not read into a local");
+  assert.ok(unset > read, "the flag is not unset after it is read: a child gate.sh would inherit it");
+  assert.ok(unset < firstChild, "the flag is unset only after the gate has started a child");
+  const uses = [...src.matchAll(/GATE_OWNERS_PER_PR/g)].length;
+  assert.ok(!/\$\{?GATE_OWNERS_PER_PR/.test(src.slice(unset)), "the environment variable is read again after it was unset");
+  assert.ok(uses >= 3, `the scan found ${uses} mentions: it read nothing`);
+});
+
 if (failures) { process.stdout.write(`gate-pr: ${failures} FAILED\n`); process.exit(1); }
 process.stdout.write("gate-pr: all ok\n");
