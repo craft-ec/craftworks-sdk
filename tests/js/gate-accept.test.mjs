@@ -12,6 +12,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { childEnv } from "./common/child-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const helper = join(root, "tools", "gate-accept.sh");
@@ -52,7 +53,7 @@ t("**free space is checked again RIGHT BEFORE writing: under the floor, refused,
   const dir = mkdtempSync(join(tmpdir(), "gate-accept-"));
   const b = join(dir, "gate.baseline"), c = join(dir, "counts");
   writeFileSync(b, BASE); writeFileSync(c, "craftworks-sdk=222\nengine=78\nnpm=146\n");
-  const r = spawnSync("/bin/bash", [helper, b, "0", c], { encoding: "utf8", env: { ...process.env, GATE_MIN_GIB: "5", GATE_FREE_GIB_FOR_TEST: "2" } });
+  const r = spawnSync("/bin/bash", [helper, b, "0", c], { encoding: "utf8", env: childEnv({ GATE_MIN_GIB: "5", GATE_FREE_GIB_FOR_TEST: "2" }) });
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /2 GiB free, under 5 GiB, right before writing/);
   assert.equal(readFileSync(b, "utf8"), BASE);
@@ -125,7 +126,7 @@ t("**gate.sh refuses to START when the disk guard refuses, and when there is no 
   writeFileSync(pass, "#!/bin/sh\necho \"stub guard: $1 may run\"\nexit 0\n"); chmodSync(pass, 0o755);
   // PATH without cargo: a gate the guard lets through stops at its own "no cargo" step, so no
   // build or suite runs in any case here -- and reaching that step is the proof it got past the guard.
-  const run = guard => spawnSync("/bin/bash", ["./gate.sh"], { cwd: root, encoding: "utf8", env: { ...process.env, PATH: "/usr/bin:/bin", DISK_GUARD: guard }, timeout: 60000 });
+  const run = guard => spawnSync("/bin/bash", ["./gate.sh"], { cwd: root, encoding: "utf8", env: childEnv({ PATH: "/usr/bin:/bin", DISK_GUARD: guard }), timeout: 60000 });
   const refused = run(refuse);
   assert.notEqual(refused.status, 0, "the gate started although the disk guard refused");
   assert.match(refused.stdout + refused.stderr, /stub guard: REFUSED/, "the guard was not asked");
@@ -170,7 +171,7 @@ function acceptDir(members, counts, failed = 0, extra = []) {
   writeFileSync(c, counts);
   const snap = () => readdirSync(d).sort().map(f => `${f}=${readFileSync(join(d, f), "utf8")}`).join("|");
   const before = snap();
-  const r = spawnSync("/bin/bash", [helper, d, String(failed), c, ...extra], { encoding: "utf8", env: { ...process.env, GATE_FREE_GIB_FOR_TEST: "100" } });
+  const r = spawnSync("/bin/bash", [helper, d, String(failed), c, ...extra], { encoding: "utf8", env: childEnv({ GATE_FREE_GIB_FOR_TEST: "100" }) });
   const now = Object.fromEntries(readdirSync(d).sort().map(f => [f, readFileSync(join(d, f), "utf8").trim()]));
   return { rc: r.status, out: r.stdout, err: r.stderr, unchanged: snap() === before, now };
 }

@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { generateKeyPairSync } from "node:crypto";
+import { childEnv } from "./common/child-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const { Session } = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
@@ -37,7 +38,7 @@ const flush = s => {
 /** Everything `node_answers` says for `frames`, with the signer's answer `signerAnswer` encoded. */
 function stdlib(frames = [], signerAnswer = null) {
   const r = spawnSync("cargo", ["run", "-q", "-p", "wire", "--example", "node_answers", "--", "00", "00", "00", "x", ...frames.map(hex)],
-    { cwd: root, encoding: "utf8", maxBuffer: 1 << 26, env: { ...process.env, SIGNER_CODE: hex(enc("signer code")), ...(signerAnswer ? { SIGNER_ANSWER: signerAnswer } : {}) } });
+    { cwd: root, encoding: "utf8", maxBuffer: 1 << 26, env: childEnv({ SIGNER_CODE: hex(enc("signer code")), ...(signerAnswer ? { SIGNER_ANSWER: signerAnswer } : {}) }) });
   assert.equal(r.status, 0, r.stderr);
   return JSON.parse(r.stdout);
 }

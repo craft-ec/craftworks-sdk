@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { childEnv } from "./common/child-env.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const helper = process.env.MUTANT_UNDER_TEST ?? join(root, "tools", "mutant.sh");
@@ -41,7 +42,7 @@ mkdirSync(join(crate, "src"), { recursive: true });
 writeFileSync(join(crate, "Cargo.toml"), `[package]\nname = "mutfix"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n`);
 writeFileSync(lib, ORIGINAL);
 // Its own target, and never the SDK's toolchain file: a crate in a temp dir of its own.
-const env = { ...process.env, CARGO_TARGET_DIR: join(fx, "target") };
+const env = childEnv({ CARGO_TARGET_DIR: join(fx, "target") });
 delete env.MUTANT_CHECK;
 const cargoTest = ["cargo", "test", "-q", "--manifest-path", join(crate, "Cargo.toml")];
 const mutant = (search, replace, cmd, extra = {}) =>

@@ -7,6 +7,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { count } from "../../tools/pr-scope.mjs";
+import { childEnv } from "./common/child-env.mjs";
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -14,7 +15,8 @@ const t = async (name, fn) => {
   catch (e) { failures += 1; process.stdout.write(`  FAIL ${name}\n    ${e.message}\n`); }
 };
 const root = new URL("../../", import.meta.url).pathname;
-const gate = (cwd, args, env = {}) => spawnSync("./gate.sh", args, { cwd, encoding: "utf8", env: { ...process.env, ...env } });
+// The outer run's GATE_* never reaches a child gate (sdk#469): tests/js/common/child-env.mjs.
+const gate = (cwd, args, env = {}) => spawnSync("./gate.sh", args, { cwd, encoding: "utf8", env: childEnv(env) });
 // THE PLAN'S INPUT IS `GATE_PR_CHANGED` ALONE (sdk#461): a `--pr --dry-run` plan must not depend on the machine it runs
 // on. The one other thing a dry run reads is the disk guard, and a gate run near the floor (engineer3's, 26 GiB
 // against 25 before build.sh wrote more) had this suite's child gate refuse the disk and fail "ENGINE only", and npm's
@@ -66,6 +68,29 @@ await t("**THE PLAN IS A PURE FUNCTION OF GATE_PR_CHANGED** (sdk#461): a tree wi
     const atFloor = gate(wt, ["--pr", "--dry-run"], { DISK_GUARD: refuse, GATE_PR_CHANGED: "engine/src/lib.rs" });
     assert.notEqual(atFloor.status, 0, "THE CONTROL: a refusing guard did not stop the gate: ADMIT isolates nothing");
   } finally {
+    execFileSync("git", ["-C", root, "worktree", "remove", "--force", wt], { stdio: "ignore" });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+await t("**the OUTER run's GATE_* never reaches a child gate** (sdk#469): a stray GATE_PR_BASE=FETCH_HEAD leaves a scratch worktree's plan as it is", async () => {
+  execFileSync("git", ["-C", root, "worktree", "prune"], { stdio: "ignore" });
+  const scratch = mkdtempSync(join(tmpdir(), "gate-pr-env-"));
+  const wt = join(scratch, "wt");
+  execFileSync("git", ["-C", root, "worktree", "add", "--detach", wt, "HEAD"], { stdio: "ignore" });
+  const saved = process.env.GATE_PR_BASE;
+  try {
+    for (const f of ["gate.sh", "tools/pr-scope.mjs"]) writeFileSync(join(wt, f), readFileSync(join(root, f)));
+    process.env.GATE_PR_BASE = "FETCH_HEAD";
+    // THE CONTROL: the stray value, passed through, breaks the child (the leak is real, not assumed).
+    const leaked = spawnSync("./gate.sh", ["--pr", "--dry-run"], { cwd: wt, encoding: "utf8", env: { ...process.env, DISK_GUARD: ADMIT, GATE_PR_CHANGED: "engine/src/lib.rs" } }); // LEAK CONTROL
+    assert.notEqual(leaked.status, 0, "THE CONTROL: a stray GATE_PR_BASE=FETCH_HEAD did not break a scratch worktree's gate");
+    const r = plan(wt, "engine/src/lib.rs");
+    assert.equal(r.status, 0, `the outer run's GATE_PR_BASE reached the child:\n${r.stderr}`);
+    assert.equal(planLine(r.stdout, "members tested (changed only; dependents run at the batch gate)"), "engine");
+  } finally {
+    if (saved === undefined) delete process.env.GATE_PR_BASE;
+    else process.env.GATE_PR_BASE = saved;
     execFileSync("git", ["-C", root, "worktree", "remove", "--force", wt], { stdio: "ignore" });
     rmSync(scratch, { recursive: true, force: true });
   }

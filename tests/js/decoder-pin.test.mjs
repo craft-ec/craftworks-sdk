@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { childEnv } from "./common/child-env.mjs";
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -16,7 +17,7 @@ const script = join(root, "tools/optimise-decoder.sh");
 const input = join(root, "pkg/web/decoder.wasm");
 const run = env => {
   const out = join(mkdtempSync(join(tmpdir(), "decoder-pin-")), "d.wasm");
-  const r = spawnSync("/bin/bash", [script, input, out], { encoding: "utf8", env: { ...process.env, ...env } });
+  const r = spawnSync("/bin/bash", [script, input, out], { encoding: "utf8", env: childEnv(env) });
   return { ...r, out };
 };
 
