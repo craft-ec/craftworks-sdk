@@ -83,17 +83,20 @@ fn control_a_winner_that_leaves_the_key_alone_conflicts_nothing() {
 }
 
 /// **A DEAD COMMIT'S WRITE GOES AGAIN AT THE FRONT, AND FALLS NAMED AT ITS
-/// BOUND** (footnote 5): each foreign move that kills its commit spends one
-/// try; with `max_write_tries` spent, the next falls `Lost`, counted -- never
+/// BOUND** (footnote 5): each foreign move that kills its commit AFTER ITS HEAD
+/// WAS SENT spends one try (a try counts an attempt to publish: COMMIT-LIFE A8);
+/// with `max_write_tries` spent, the next falls `Lost`, counted -- never
 /// silently, and never before.
 #[test]
 fn a_dead_commit_goes_again_at_the_front_and_falls_named_at_its_bound() {
     let tries = Params::default().max_write_tries as u64;
     let mut e = common::new_store_params(Params::default());
-    let _ = stepped!(e, w(1, 1, b"k", b"mine", Expect::Absent));
+    let mut fx = stepped!(e, w(1, 1, b"k", b"mine", Expect::Absent));
     for round in 1..=tries + 1 {
+        heading(&mut e, fx);
         let winner = their_head(&e, &[(format!("other{round}").as_bytes(), b"x")]);
         let out = stepped!(e, Event::HeadConflict { seq: 10 * round, root: winner });
+        fx = out.clone();
         if round <= tries {
             assert!(told(&out, 1).is_empty(), "round {round}: the write was told {:?} while it had tries left", told(&out, 1));
             assert_eq!(e.queued_writes(), 1, "round {round}: the write left the queue");
@@ -160,7 +163,8 @@ fn a_cold_write_that_fails_its_fetch_lets_the_next_one_go() {
 fn a_dead_commits_fate_is_read_from_the_witness_never_from_values() {
     for (case, landed, winner_has_value) in [("landed, then overwritten", true, false), ("not there, values coincide", false, true), ("not there", false, false)] {
         let mut e = common::new_store_params(Params::default());
-        let _ = stepped!(e, Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(b"mine".to_vec()))]));
+        let fx = stepped!(e, Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(b"mine".to_vec()))]));
+        heading(&mut e, fx);
         let through = e.committing_through().expect("the commit in flight carries an arrival number");
         let winner = if winner_has_value { their_head(&e, &[(b"k", b"mine"), (b"theirs", b"x")]) } else { their_head(&e, &[(b"k", b"newer"), (b"theirs", b"x")]) };
         e.set_witness(Some(if landed { Witness::Through(through) } else { Witness::NotThere }));
@@ -184,7 +188,8 @@ fn a_dead_commits_fate_is_read_from_the_witness_never_from_values() {
 fn an_evicted_witness_is_unknown_never_lost_or_conflict() {
     for holds in [true, false] {
         let mut e = common::new_store_params(Params::default());
-        let _ = stepped!(e, w(1, 1, b"k", b"mine", Expect::Absent));
+        let fx = stepped!(e, w(1, 1, b"k", b"mine", Expect::Absent));
+        heading(&mut e, fx);
         let _ = stepped!(e, Event::forced_write(ClientId(1), WriteId(2), vec![(b"j".to_vec(), Op::Put(b"forced".to_vec()))]));
         let winner = if holds { their_head(&e, &[(b"k", b"mine")]) } else { their_head(&e, &[(b"k", b"newer")]) };
         e.set_witness(Some(Witness::Unknown));
@@ -220,6 +225,24 @@ fn drive(e: &mut engine::Engine<Store>, first: Vec<Effect>) -> Vec<Effect> {
         queue.extend(out);
     }
     all
+}
+
+/// Confirm a commit's PUTs until its head is SENT (Heading) and stop there. A foreign head then meets a head that
+/// LEFT -- COMMIT-LIFE's Heading x E8, the one stage whose witness is read and whose try is spent; a Racing commit's
+/// head never left, so nothing of it can have landed (A8, the architect on rev 5).
+fn heading(e: &mut engine::Engine<Store>, fx: Vec<Effect>) {
+    let mut queue = fx;
+    let mut guard = 0;
+    while let Some(f) = queue.pop() {
+        guard += 1;
+        assert!(guard < 10_000, "the commit never sent its head");
+        match f {
+            Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } => queue.extend(stepped!(e, Event::PutConfirmed(id))),
+            Effect::UpdateHead { .. } => return,
+            other => common::no_answer_owed(&other),
+        }
+    }
+    panic!("THE SETUP: no head was sent");
 }
 
 /// Publish ONE commit (its puts, then its head) and stop: what its head's
@@ -280,7 +303,8 @@ fn a_group_that_landed_unheard_is_published_and_not_committed_twice() {
     for (id, k) in [(1u64, b"a"), (2, b"b"), (3, b"c")] {
         let _ = stepped!(e, w(1, id, k, b"v", Expect::Absent));
     }
-    let _ = publish_one(&mut e, first);
+    let next = publish_one(&mut e, first);
+    heading(&mut e, next);
     let through = e.committing_through().expect("the group is in flight");
     let (commits_before, _) = e.commits_and_writes();
     // Their head built on ours: it holds our group and more.
