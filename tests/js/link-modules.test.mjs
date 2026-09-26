@@ -59,8 +59,12 @@ await t("the SDK's REAL modules (pkg/web), linked from a bundle, import and load
   // that computes one at its top level (`new URL("./signer.wasm", import.meta.url)`) throws before the app runs.
   const { readFileSync } = await import("node:fs");
   const web = new URL("../../pkg/web/", import.meta.url);
-  const starter = ["served.js", "pieces.js", "rto.js"];
-  const inBundle = ["index.js", "wrap.js", "session.js", "engine-db.js", "connection.js", "craftworks_sdk.js", "artefacts.js"];
+  // The starter's modules, from the SDK's own manifest: the one owner of the list (never a copy here).
+  const manifest = JSON.parse(readFileSync(new URL("artefacts.json", web), "utf8"));
+  const starter = manifest.starter;
+  assert.ok(Array.isArray(starter) && starter.length > 0, "artefacts.json names no `starter`");
+  // The bundle is every module the SDK's entry reaches that the starter does not carry: both from the manifest.
+  const inBundle = manifest.modules.filter(m => !starter.includes(m));
   const f = new Map(inBundle.map(m => [`sdk/${m}`, readFileSync(new URL(m, web))]));
   const ext = Object.fromEntries(starter.map(m => [`sdk/${m}`, new URL(m, web).href]));
   const urls = linkModules(f, { external: p => ext[p] ?? null, toUrl: dataUrl });

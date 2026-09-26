@@ -3,7 +3,8 @@
 // home of both); this file only MOVES BYTES in and out of it over its ABI (decoder/src/lib.rs). It parses nothing
 // of the format.
 //
-// Carried in a published app's STARTER (with served.js and rto.js): it runs before the SDK exists.
+// Carried in a published app's STARTER: it runs before the SDK exists. A starter ENTRY (build.sh
+// STARTER_ENTRIES): the starter is what the entries reach, named in artefacts.json `starter`.
 
 /** An instantiated decoder from its wasm bytes. */
 export async function decoder(wasmBytes) {
@@ -88,7 +89,7 @@ export async function repairPieces({ spec, bundle, raced, sdk, session, webappCo
  * order, with its relative specifiers rewritten to the URLs of what they name:
  * - a path in the bundle -> that module's URL (one URL per path, so every importer shares ONE instance: the
  *   wasm-bindgen glue must be one module, whoever imports it);
- * - a path the STARTER serves (`external(path)` returns its URL: served.js, pieces.js, rto.js) -> that URL;
+ * - a path the STARTER serves (`external(path)` returns its URL: the modules artefacts.json `starter` names) -> that URL;
  * - anything else is left as written (a specifier in a comment, e.g.), and a real import of a missing file fails
  *   loudly in the browser when it is imported.
  * A cycle is refused: the build keeps the graph acyclic, and a cycle has no bottom to link from.
