@@ -335,6 +335,8 @@ enum Refused {
     Block(Cid),
     /// An app contract's PUT (`put_contract`: a load piece, a container), by its key.
     App(String),
+    /// A site's PUT (its publication, builder#117), by its app.
+    Site(String),
 }
 
 /// The counter part of a reader's stream id; the top byte is its range.
@@ -1034,7 +1036,7 @@ impl PageIo {
             }
             Incoming::PutFailed { key, said } if self.site_by_key(&key).is_some() => {
                 let app = self.site_by_key(&key).expect("matched");
-                self.server.node(Answer::SiteRefused { app, said }, now)
+                self.put_refused(Refused::Site(app), said, now)
             }
             // The app's PUT: the page ends its deadline.
             Incoming::Ack(wire::AckKind::Put(key)) if self.app_contracts.contains_key(&key) => {
@@ -1055,8 +1057,10 @@ impl PageIo {
                 // It never names an op this page does not have: counted, ends nothing.
                 None => *self.node_errors.entry("put_error_unattributed").or_insert(0) += 1,
             },
-            // A refusal of our own register is not known to be final: reported, and the op stays waiting -- re-sent on
-            // its RTO (sdk#431's pin), shown "not answering", the safe side.
+            // OUR OWN REGISTER never takes the finality rule: a head update's fate is decided by its READ-BACK (sdk#225:
+            // the page reads the register and adopts only what it shows -- Published, or Lost to a writer that won),
+            // never by the PUT's answer. A refusal, validation words included (a stale seq another writer beat), is
+            // reported, and the op stays waiting -- re-sent on its RTO (sdk#431's pin) -- until the read-back decides.
             Incoming::PutFailed { key, said } if key == self.register_key => self.unusable.push(format!("the node refused: {said}")),
             answer @ Incoming::PutFailed { .. } => self.others.push(answer),
             Incoming::EngineBytes(msgs) => {
@@ -1177,12 +1181,16 @@ impl PageIo {
         if let Some(cid) = self.by_key.get(key).copied().filter(|cid| self.server.page.put_waiting(cid)) {
             return Some(Refused::Block(cid));
         }
-        (self.app_contracts.contains_key(key) && matches!(self.server.page.app_put(key), Some(page::AppPut::Pending))).then(|| Refused::App(key.to_string()))
+        if self.app_contracts.contains_key(key) && matches!(self.server.page.app_put(key), Some(page::AppPut::Pending)) {
+            return Some(Refused::App(key.to_string()));
+        }
+        // A site whose publication is still in flight (its PUT is the page's `Update` of that site).
+        self.site_by_key(key).filter(|app| matches!(self.server.page.publication(app), Some(Publication::Publishing { .. }))).map(Refused::Site)
     }
 
     /// THE ONE FINALITY RULE for a refusal of a PUT of ours (sdk#516; #433 for blocks): FINAL only in a contract's
-    /// own VALIDATION words (`wire::is_validation_refusal`), for a block and an app contract (a piece) alike, keyed or
-    /// keyless. A final one ends the PUT (a block: `PutRefused`, never put again; an app contract: `AppPutRefused`).
+    /// own VALIDATION words (`wire::is_validation_refusal`), for a block, an app contract (a piece) and a site alike,
+    /// keyed or keyless (the register's head update is decided by its read-back instead; see its arm). A final one ends the PUT (a block: `PutRefused`, never put again; an app contract: `AppPutRefused`).
     /// Any other words are TRANSIENT: reported, and the op stays waiting, re-sent on its RTO (rule 7).
     fn put_refused(&mut self, whose: Refused, said: String, now: Ms) {
         let fin = wire::is_validation_refusal(&said);
@@ -1197,6 +1205,10 @@ impl PageIo {
             (Refused::Block(cid), false) => self.unusable.push(format!("the node refused block {}: {said}", engine::short_id(&cid))),
             (Refused::App(key), true) => self.server.node(Answer::AppPutRefused { key, said }, now),
             (Refused::App(key), false) => self.unusable.push(format!("the node refused app contract {key} (not final; re-sent): {said}")),
+            // A site's FINAL refusal ends its publication (the page's consequence, `Publication::Refused`); a transient
+            // one is reported, and the site's PUT is re-sent on its RTO.
+            (Refused::Site(app), true) => self.server.node(Answer::SiteRefused { app, said }, now),
+            (Refused::Site(app), false) => self.unusable.push(format!("the node refused site {app}'s PUT (not final; re-sent): {said}")),
         }
     }
 
