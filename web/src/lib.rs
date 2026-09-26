@@ -397,6 +397,14 @@ pub fn webapp_address(code: &[u8], state: &[u8]) -> String {
     wire::webapp::address(code, state)
 }
 
+/// WHERE A NODE SERVES `file` OF THE WEB CONTAINER AT `address` (sdk#520): `page_io::web_path`, the one composer of
+/// `/v1/contract/web/<address>/<file>` (the builder's hand-built copies are deleted). Refused by name when `address`
+/// is not exactly a contract id or `file` would leave the container.
+#[wasm_bindgen]
+pub fn web_path(address: &str, file: &str) -> Result<String, JsError> {
+    page_io::web_path(address, file).map_err(|why| JsError::new(&format!("not a web path: {why:?} ({address:?}, {file:?})")))
+}
+
 /// A LOAD PIECE's web container state (sdk#347): `wire::webapp::piece_container`, the one owner, for the loader's
 /// repair after load and the keeper's repair (sdk#493).
 #[wasm_bindgen]

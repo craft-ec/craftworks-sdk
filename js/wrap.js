@@ -258,7 +258,9 @@ export function wrap(raw) {
     // compute), `address(code, state)` the key the node serves it under, and
     // `AppContainer` builds an app's container in the page. The PUT itself is
     // the session's `put_contract`.
-    webapp: { params: raw.webapp_params, address: raw.webapp_address, AppContainer: raw.AppContainer },
+    // `webapp.path(address, file)`: where a node serves a web container's file -- the ONE composer of
+    // `/v1/contract/web/<address>/<file>` (page-io's `web_path`, sdk#520).
+    webapp: { params: raw.webapp_params, address: raw.webapp_address, path: raw.web_path, AppContainer: raw.AppContainer },
     // THE LOAD PIECES (sdk#347): `load(bundle, payload, m, i)` re-derives piece i of a rebuilt bundle, for the
     // loader's repair after load (`repairPieces`); `container(piece)` is its web container state, from the one owner
     // (`wire::webapp::piece_container`, sdk#493).

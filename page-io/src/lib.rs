@@ -206,7 +206,7 @@ pub fn site_contract(site_code: &[u8], register_params: &[u8], app: &str) -> Opt
 /// from their own params names). STRICT: the link must decode to the 32-byte id AND encode back to itself
 /// (`from_base58` zero-pads a short text into a well-formed wrong id); anything else is `None`, never a guess.
 pub fn site_id_of_path(path: &str) -> Option<[u8; 32]> {
-    site_path(path).ok()
+    parse_site_path(path).ok()
 }
 
 /// A site ADDRESS as a person gives one (sdk#472's keepSet; the loader handover uses [`site_id_of_path`]): a bare link
@@ -220,14 +220,14 @@ pub fn site_id_of_address(text: &str) -> Result<[u8; 32], AddressRefused> {
     }
     if let Some(rest) = text.strip_prefix("http://").or_else(|| text.strip_prefix("https://")) {
         let path = rest.find('/').map(|at| &rest[at..]).ok_or(AddressRefused::NotASitePath)?;
-        return site_path(path);
+        return parse_site_path(path);
     }
     if text.contains("://") {
         // `craftec://` among them: nothing defines one, so nothing reads one.
         return Err(AddressRefused::UnknownScheme);
     }
     if text.starts_with('/') {
-        return site_path(text);
+        return parse_site_path(text);
     }
     if text.contains(['/', '?', '#']) {
         return Err(AddressRefused::NotASitePath);
@@ -235,10 +235,27 @@ pub fn site_id_of_address(text: &str) -> Result<[u8; 32], AddressRefused> {
     site_id_of_link(text).ok_or(AddressRefused::NotASiteLink)
 }
 
+/// THE NODE'S WEB PATH (sdk#520): every web container -- an app's site, a load piece -- is served under it. The one
+/// spelling: [`web_path`] composes it and [`parse_site_path`] strips it.
+const WEB_PATH: &str = "/v1/contract/web/";
+
 /// THE path form, parsed in ONE place (both [`site_id_of_path`] and [`site_id_of_address`] come through here).
-fn site_path(path: &str) -> Result<[u8; 32], AddressRefused> {
-    let link = path.strip_prefix("/v1/contract/web/").ok_or(AddressRefused::NotASitePath)?.split(['/', '?', '#']).next().unwrap_or("");
+fn parse_site_path(path: &str) -> Result<[u8; 32], AddressRefused> {
+    let link = path.strip_prefix(WEB_PATH).ok_or(AddressRefused::NotASitePath)?.split(['/', '?', '#']).next().unwrap_or("");
     site_id_of_link(link).ok_or(AddressRefused::NotASiteLink)
+}
+
+/// WHERE A NODE SERVES `file` OF THE WEB CONTAINER AT `address` (sdk#520): `/v1/contract/web/<address>/<file>`, the
+/// inverse of [`site_id_of_path`] and the ONE composer of the path (the builder's hand-built copies are deleted). `file`
+/// is empty for the container's own page. STRICT, like the parser: `address` must be exactly a 32-byte id that
+/// encodes back to itself ([`AddressRefused::NotASiteLink`]), and `file` must stay inside the container -- no leading
+/// `/`, no `..` segment, no query or fragment ([`AddressRefused::NotASitePath`]).
+pub fn web_path(address: &str, file: &str) -> Result<String, AddressRefused> {
+    site_id_of_link(address).ok_or(AddressRefused::NotASiteLink)?;
+    if file.starts_with('/') || file.contains(['?', '#', '\\']) || file.split('/').any(|seg| seg == "..") {
+        return Err(AddressRefused::NotASitePath);
+    }
+    Ok(format!("{WEB_PATH}{address}/{file}"))
 }
 
 /// Why a text is not a site address, by name.
