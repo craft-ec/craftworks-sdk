@@ -2835,6 +2835,8 @@ fn after_two_hundred_heads_the_current_tree_reads_like_a_fresh_pages() {
     println!("long run: budget {budget} B; after 200 heads the writer's reads cost {l} block GETs (root {}); a fresh page's {f} (root {}); writer evicted {} blocks, store {} B", long.get(&root).copied().unwrap_or(0), fresh_gets.get(&root).copied().unwrap_or(0), st.evicted, w.server.page.blocks().bytes());
     assert!(long.get(&root).copied().unwrap_or(0) <= 1, "after 200 heads the CURRENT root was fetched more than once: superseded internal nodes crowded it out");
     assert!(l <= f + f / 4, "after 200 heads the writer's reads cost {l} GETs against a fresh page's {f}: superseded internal nodes crowd the current tree");
+}
+
 /// EVERY FRAME KIND `owns()` CLAIMS IS DECIDED (sdk#483): the ones that fell into `inbound`'s `_ => {}` and vanished
 /// now each have an arm, and each arm's decision is visible. (That no new kind can vanish is the COMPILER's: the match
 /// has no catch-all.)
