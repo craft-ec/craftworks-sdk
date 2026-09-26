@@ -113,7 +113,7 @@ impl Publisher {
         Publisher { page: Page::new(Params::default(), PutPath::Page), host, origin: signer::Origin::Local, stale_read: None, signs: 0, head_ops: 0, blind_signs: 0, root_not_held: 0 }
     }
     fn publication(&self) -> Option<Publication> {
-        self.page.publication(APP).cloned()
+        self.page.publication(APP)
     }
     /// One round: every op the page has out is served against `node` (the signer's local view of the site is
     /// the node's own), `fate` deciding per op.

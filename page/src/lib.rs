@@ -70,6 +70,7 @@
 
 pub mod fates;
 mod judge;
+mod publication;
 pub mod loader;
 pub mod obs;
 pub mod rto;
@@ -79,7 +80,8 @@ use engine::{ClientId, Effect, Engine, Epoch, Event, KeySource, Op as WriteOp, P
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
-use judge::{judge, judge_site, Heard, Judged, SiteJudged};
+use judge::{judge, Heard, Judged};
+use publication::{Act, Cx, Ev, Life, Owed, Pubs, ReadFrom, ReadWait};
 
 /// How a judged head is told to the engine: the answer to its own recovery read (`HeadRead`), or another writer's
 /// head found on a read (`HeadConflict`).
@@ -490,15 +492,6 @@ pub enum Label {
     Site(String),
 }
 
-/// One label's publication in flight: what it owes, its sign in flight, and its sign's backoff.
-#[derive(Debug, Clone, Default)]
-struct Pub {
-    owed: Option<Owed>,
-    sign_id: Option<u32>,
-    sign_again: Option<u64>,
-    sign_refusals: u32,
-}
-
 /// What a site publication waits on while the signer answers `HeadUnknown` (builder#117).
 pub const WAITING_FOR_SITE: &str = "waiting for this node to fetch the site";
 
@@ -518,36 +511,6 @@ pub enum Publication {
     Refused(String),
     /// The person cancelled it (the one end that is not an answer: rule 8).
     Cancelled,
-}
-
-/// The head this page owes the network: a commit's `(seq, root)` from the
-/// engine's `UpdateHead`, and how far it got.
-#[derive(Debug, Clone)]
-struct Owed {
-    seq: u64,
-    root: Cid,
-    /// The root the commit was built on: its head's prev is `(seq - 1, base)`.
-    base: Cid,
-    /// The exact record to UPDATE, once the signer returned it.
-    record: Option<Vec<u8>>,
-    /// Register reads since the last UPDATE that still showed an older head.
-    stale_reads: u32,
-}
-
-/// A head the signer named that the register has not been read to hold.
-#[derive(Debug, Clone)]
-struct Verify {
-    seq: u64,
-    root: Cid,
-    /// The register was behind: this page is LANDING the signer's record.
-    landing: bool,
-    /// Read or land again at this time (a backoff).
-    again_at: Option<u64>,
-    tries: u32,
-    /// UPDATEs this landing has sent (a lost one is re-sent at its deadline).
-    updates: u32,
-    /// The register head a landing asks FROM (its prev).
-    from: Option<(u64, Cid)>,
 }
 
 /// With nothing else reading the register, a head read at least this often:
@@ -702,15 +665,10 @@ pub struct Page {
     confirmed: BTreeSet<Cid>,
     /// Effects held until their `after` set is confirmed, in emitted order.
     held: Vec<(BTreeSet<Cid>, Effect)>,
-    /// THE HEAD's publication in flight ([`Pub`]): the head it owes, the id of
-    /// the sign request in flight (SG02: an answer under any other id answers
-    /// something else, a superseded ask included), and a retryable refusal's
-    /// backoff. The SAME type, and the same functions, as each site's.
-    head: Pub,
-    /// Each SITE's publication in flight, by app id (builder#117).
-    sites: BTreeMap<String, Pub>,
-    /// How each site's publication ended, or that it has not: the one owner.
-    publications: BTreeMap<String, Publication>,
+    /// Every label's publication (PUBLISH-LIFE, sdk#485): the head's and each SITE's `Life` (builder#117), written
+    /// only by [`Pubs::on`] (private fields: the compiler holds it). A site's [`Publication`] is derived from its
+    /// state; a Sign's id is never stored -- it is the one on its op on the wire.
+    pubs: Pubs,
     /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
@@ -719,9 +677,6 @@ pub struct Page {
     held_asks: BTreeSet<Cid>,
     /// The next `Held` batch's number.
     next_held_batch: u32,
-    /// A `NotNext{current}` not yet ADOPTED: the register must be read to hold
-    /// it first (invariant 1b).
-    verify: Option<Verify>,
     /// Landings started, and the most UPDATEs one landing needed.
     landings: u32,
     most_landing_updates: u32,
@@ -862,13 +817,10 @@ impl Page {
             kept: BTreeSet::new(),
             confirmed: BTreeSet::new(),
             held: Vec::new(),
-            head: Pub::default(),
-            sites: BTreeMap::new(),
-            publications: BTreeMap::new(),
+            pubs: Pubs::default(),
             held_again: BTreeMap::new(),
             held_asks: BTreeSet::new(),
             next_held_batch: 0,
-            verify: None,
             landings: 0,
             most_landing_updates: 0,
             repairs_rejected: 0,
@@ -1030,18 +982,15 @@ impl Page {
                 }
                 // Rebuilt, not replayed: the published head it names as prev
                 // may have moved since it was first sent.
-                // A landing's request, or this commit's.
-                Waiting::Sign(Label::Head) if self.verify.as_ref().is_some_and(|v| v.landing) => self.ask_land(),
-                Waiting::Sign(Label::Head) => self.ask_sign(),
+                // A landing's request, or this commit's (or a site's): the state decides which (PUBLISH-LIFE).
+                Waiting::Sign(label) => self.life_on(&label, Ev::SignLost),
                 Waiting::PutApp(key) => self.send(Waiting::PutApp(key), op),
                 _ => {
-                    if w == Waiting::Update(Label::Head) {
-                        if let Some(v) = self.verify.as_mut().filter(|v| v.landing) {
-                            v.updates += 1;
-                            self.most_landing_updates = self.most_landing_updates.max(v.updates);
-                        }
+                    let resent = if let Waiting::Update(label) = &w { Some(label.clone()) } else { None };
+                    self.send(w, op);
+                    if let Some(label) = resent {
+                        self.life_on(&label, Ev::UpdateResent);
                     }
-                    self.send(w, op)
                 }
             }
         }
@@ -1050,24 +999,13 @@ impl Page {
         for (id, bytes) in std::mem::take(&mut self.put_again) {
             self.send(Waiting::Put(id), Op::Put { id, bytes });
         }
-        if self.head.sign_again.is_some_and(|at| now >= at) {
-            self.head.sign_again = None;
-            self.ask_sign();
-        }
-        let due: Vec<String> = self.sites.iter().filter(|(_, p)| p.sign_again.is_some_and(|at| now >= at)).map(|(a, _)| a.clone()).collect();
-        for app in due {
-            self.pub_mut(&Label::Site(app.clone())).sign_again = None;
-            self.ask_sign_for(Label::Site(app));
-        }
-        if self.verify.as_ref().is_some_and(|v| v.again_at.is_some_and(|at| now >= at)) {
-            if let Some(v) = self.verify.as_mut() {
-                v.again_at = None;
-            }
-            self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
+        // E10: the clock, to every label (its state decides: a backoff due, a verify due, a stale read-back).
+        for label in self.pubs.labels() {
+            self.life_on(&label, Ev::Due);
         }
         // THE BACKSTOP: a hint can be dropped, so an idle page reads the
         // register at least every HEAD_BACKSTOP_MS.
-        if self.engine_has_head && self.verify.is_none() && !self.reading_head() && now.saturating_sub(self.last_head_at) >= HEAD_BACKSTOP_MS {
+        if self.engine_has_head && !self.pubs.head().verifying() && !self.reading_head() && now.saturating_sub(self.last_head_at) >= HEAD_BACKSTOP_MS {
             self.last_head_at = now;
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
@@ -1085,14 +1023,6 @@ impl Page {
                 e.0 = u64::MAX;
             }
             self.ask_held(id);
-        }
-        let stale: Vec<Label> = std::iter::once((Label::Head, &self.head))
-            .chain(self.sites.iter().map(|(a, p)| (Label::Site(a.clone()), p)))
-            .filter(|(l, p)| p.owed.as_ref().is_some_and(|o| o.record.is_some() && o.stale_reads > 0) && !self.deadlines.contains_key(&Waiting::ReadBack(l.clone())))
-            .map(|(l, _)| l)
-            .collect();
-        for label in stale {
-            self.send(Waiting::ReadBack(label.clone()), Op::ReadHead { label });
         }
         // ENGINE TIME IS SECONDS: its `Tick` is the protocol's whole seconds
         // (`parity_age`, `reask_after` and the stall timer count them). The
@@ -1119,14 +1049,14 @@ impl Page {
                 // A site's publication waits on nothing else: it ENDS, named (every publication ends).
                 for w in &ended {
                     if let Waiting::Sign(Label::Site(app)) | Waiting::Update(Label::Site(app)) | Waiting::ReadBack(Label::Site(app)) = w {
-                        self.end_site(app, Publication::Refused(format!("not sent: {why}")));
+                        self.life_on(&Label::Site(app.clone()), Ev::NodeRefused(format!("not sent: {why}")));
                     }
                 }
                 self.unusable.push(format!("not sent: {why}"));
             }
             Answer::SiteRefused { app, said } => {
                 if self.answered(&Waiting::Update(Label::Site(app.clone()))).is_some() {
-                    self.end_site(&app, Publication::Refused(format!("the node refused the site's PUT: {said}")));
+                    self.life_on(&Label::Site(app), Ev::NodeRefused(format!("the node refused the site's PUT: {said}")));
                 }
             }
             Answer::AppPutOk(key) => {
@@ -1241,41 +1171,24 @@ impl Page {
                 if !answers_a_sign(&s) {
                     return;
                 }
-                // Which label's sign it answers: the one whose sign in flight has this id.
-                let label = if self.head.sign_id == Some(id) {
-                    Label::Head
-                } else if let Some(app) = self.sites.iter().find(|(_, p)| p.sign_id == Some(id)).map(|(a, _)| a.clone()) {
-                    Label::Site(app)
-                } else {
+                // Which label's sign it answers: the one whose Sign op on the wire carries this id -- DERIVED from
+                // the op, the one record of it (never a stored copy).
+                let Some(label) = self.deadlines.iter().find_map(|(w, d)| match (w, &d.op) {
+                    (Waiting::Sign(label), Op::Sign { id: sent, .. }) if *sent == id => Some(label.clone()),
+                    _ => None,
+                }) else {
                     return;
                 };
                 if self.answered(&Waiting::Sign(label.clone())).is_none() {
                     return; // an answer to a sign request already answered
                 }
-                self.pub_mut(&label).sign_id = None;
-                match label {
-                    Label::Head => self.on_signer(s),
-                    Label::Site(app) => self.on_site_signer(&app, s),
-                }
+                self.life_on(&label, Ev::Signer(s));
             }
-            Answer::Updated { label: Label::Site(app) } => {
-                // A site's PUT answered: its record is read back, the one way it is Published.
-                if self.answered(&Waiting::Update(Label::Site(app.clone()))).is_some() {
-                    self.send(Waiting::ReadBack(Label::Site(app.clone())), Op::ReadHead { label: Label::Site(app) });
-                }
-            }
-            Answer::Updated { label: Label::Head } => {
-                // Its read-back already done by the pushed state (sdk#378 P3): the
-                // UPDATE's wait ended there, so this answer asks nothing more.
-                if self.answered(&Waiting::Update(Label::Head)).is_some() {
-                    // A LANDING's UPDATE is judged by its own read — does the
-                    // register now hold the head the signer named — never by
-                    // this commit's read-back.
-                    if self.verify.as_ref().is_some_and(|v| v.landing) {
-                        self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
-                    } else {
-                        self.send(Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head });
-                    }
+            // An UPDATE answered: the read that follows decides (F56). Its read-back already done by the pushed state
+            // (sdk#378 P3): the UPDATE's wait ended there, so this answer asks nothing more.
+            Answer::Updated { label } => {
+                if self.answered(&Waiting::Update(label.clone())).is_some() {
+                    self.life_on(&label, Ev::Updated);
                 }
             }
             // One register read can answer both a recovery read and a
@@ -1283,7 +1196,7 @@ impl Page {
             // A SITE's read answers only its own read-back: the engine never hears a site (architect).
             Answer::Head { label: Label::Site(app), read } => {
                 if self.answered(&Waiting::ReadBack(Label::Site(app.clone()))).is_some() {
-                    self.on_site_read(&app, read);
+                    self.life_on(&Label::Site(app), Ev::SiteRead(read.as_ref()));
                 }
             }
             Answer::Head { label: Label::Head, read } => {
@@ -1313,10 +1226,10 @@ impl Page {
                 if let (Some(at), Some((seq, _))) = (self.old_signer_fork_at, h) {
                     if seq > at {
                         self.old_signer_fork_at = None;
-                        if self.head.owed.is_some() {
-                            self.head.sign_again = Some(self.now);
-                        }
                     }
+                }
+                if let Some((seq, _)) = h {
+                    self.life_on(&Label::Head, Ev::HeadSeen(seq));
                 }
                 // THE ONE JUDGEMENT (sdk#396): every head read this answer ends acts on this verdict, never on `h`.
                 let j = judge(self.last_head.as_ref(), &self.my_records);
@@ -1338,13 +1251,13 @@ impl Page {
                     }
                 }
                 if self.answered(&Waiting::ReadBack(Label::Head)).is_some() {
-                    self.on_read_back(&j);
+                    self.head_read(ReadFrom::ReadBack, &j);
                 }
                 if self.answered(&Waiting::Verify).is_some() {
-                    self.on_verify(&j);
+                    self.head_read(ReadFrom::Verify, &j);
                 }
                 if self.answered(&Waiting::Hint).is_some() {
-                    self.on_hint(&j);
+                    self.head_read(ReadFrom::Hint, &j);
                 }
             }
         }
@@ -1358,255 +1271,86 @@ impl Page {
         }
     }
 
-    fn on_signer(&mut self, s: signer_proto::Answer) {
-        use signer_proto::{Answer as A, Why};
-        // A LANDING's answer (see `on_verify`): the record's bytes, UPDATEd as
-        // they are, then read — the same deadline and backoff as a publish of
-        // this page's own.
-        if self.verify.as_ref().is_some_and(|v| v.landing) {
-            let backoff = |v: &mut Verify, now: u64| {
-                v.tries += 1;
-                v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
-            };
-            match s {
-                A::Signed(state) | A::AlreadySigned(state) => {
-                    self.note_record(&state);
-                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-                    let v = self.verify.as_mut().expect("checked");
-                    v.updates += 1;
-                    self.most_landing_updates = self.most_landing_updates.max(v.updates);
-                }
-                A::NotNext { current } => {
-                    let now = self.now;
-                    let v = self.verify.as_mut().expect("checked");
-                    v.seq = v.seq.max(current.seq);
-                    v.root = current.root;
-                    v.landing = false;
-                    backoff(v, now);
-                }
-                // The one retryable set (`Why::retryable`), and NotSuccessor: a landing asks from the register's own
-                // head, which may have moved by the time it lands.
-                A::Refused(why) if why.retryable() || why == Why::NotSuccessor => {
-                    let now = self.now;
-                    let v = self.verify.as_mut().expect("checked");
-                    v.landing = false;
-                    backoff(v, now);
-                }
-                // Every other refusal, named. (No FORKED arm: a landing asks
-                // from the register's own head, one seq behind the record, so
-                // the signer's equal-seq fork check cannot fire on it — the
-                // mutant that dropped such an arm survived, as dead weight.)
-                A::Refused(why) => {
-                    self.unusable.push(format!("the signer refused a landing: {why:?}"));
-                    self.verify = None;
-                }
-                other => self.unusable.push(format!("the signer answered a landing with {other:?}")),
-            }
-            return;
-        }
-        let Some(owed) = self.head.owed.as_mut() else { return };
-        self.head.sign_refusals = match &s {
-            A::Refused(why) if why.retryable() => self.head.sign_refusals,
-            _ => 0,
-        };
-        match s {
-            A::Signed(state) => {
-                self.signer_records.insert(state.clone());
-                if let Some(h) = HeadRead::from_record(&state) {
-                    self.my_records.insert(h.seq, (h.root(), state.clone()));
-                }
-                owed.record = Some(state.clone());
-                owed.stale_reads = 0;
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-            }
-            A::AlreadySigned(state) => {
-                // Requirement 2: ONE signature per prev, and it is landed as
-                // it is — its blocks were stored before it was signed.
-                self.signer_records.insert(state.clone());
-                if let Some(h) = HeadRead::from_record(&state) {
-                    self.my_records.insert(h.seq, (h.root(), state.clone()));
-                }
-                owed.record = Some(state.clone());
-                owed.stale_reads = 0;
-                // Its root may not be this commit's (a record another page
-                // of this key made at this seq). Nothing more is needed here:
-                // the read-back judges by THIS commit's (seq, root), so that
-                // record reads back as the same seq under another root — a
-                // conflict, never Published (the model's mutant M5: a second
-                // mechanism for this was dead weight).
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-            }
-            // NOT ADOPTED YET (invariant 1b). The signer's truth is the later
-            // of its RECORD and the register, and the record can be AHEAD:
-            // signed, its UPDATE not landed (ENGINE-SHAPE §5 3b). Adopted as
-            // it was, a later write was told Published at a head no reader
-            // can see (the model, seed 10). So the register is read first.
-            A::NotNext { current } => {
-                self.verify = Some(Verify { seq: current.seq, root: current.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
-                self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
-            }
-            // RETRYABLE, on a doubling backoff (engineer2's table):
-            // RootNotHeld — the root's PUT is still landing; HeadUnknown — the
-            // node does not hold the register, so a page read of it is sent
-            // first to make it held; RecordNotSaved — the signer could not
-            // write its record and signed nothing. A node's "queue full" is
-            // not a signer answer: it is re-asked by the deadline.
-            A::Refused(why) if why.retryable() => {
-                if why == Why::HeadUnknown {
-                    self.send(Waiting::Warm, Op::ReadHead { label: Label::Head });
-                }
-                self.head.sign_refusals += 1;
-                let wait = (BACKOFF_MS << self.head.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
-                self.head.sign_again = Some(self.now + wait);
-            }
-            // THE SAME IDENTITY NEVER FORKS (owner, sdk#225). Only an OLD
-            // signer says this (the new one answers `NotNext{read}`): another
-            // device's head won the Register's tie-break at this seq. It is
-            // recovered as that `NotNext` is — read, then adopt (1b) — unless
-            // the page already stands on `read`: then the old rule will refuse
-            // every ask until the Register passes this seq, so the sign is NOT
-            // re-asked (a loop otherwise) and that is named, once.
-            A::Refused(Why::Forked { read, .. }) => {
-                if self.engine.published_seq() == read.seq && self.engine.published_root() == read.root {
-                    if self.old_signer_fork_at != Some(read.seq) {
-                        self.old_signer_fork_at = Some(read.seq);
-                        self.unusable.push(format!(
-                            "SIGNER UPGRADE NEEDED: this signer predates the same-identity rule (sdk#225) and refuses every sign while its record and the register differ at seq {}; load the current version (its signer ships with the page). It signs again once the register moves past that seq",
-                            read.seq
-                        ));
-                    }
-                } else {
-                    self.verify = Some(Verify { seq: read.seq, root: read.root, landing: false, again_at: None, tries: 0, updates: 0, from: None });
-                    self.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
-                }
-            }
-            // Permanent: not provisioned, not a successor, cannot sign,
-            // unreadable.
-            A::Refused(why) => self.unusable.push(format!("the signer refused: {why:?}")),
-            other => self.unusable.push(format!("the signer answered a sign with {other:?}")),
+    /// THE ONE DOOR to a label's publication (PUBLISH-LIFE, sdk#485): the event goes to [`Pubs::on`], the one
+    /// writer, and what it returns is carried out here, in order.
+    fn life_on(&mut self, label: &Label, ev: Ev<'_>) {
+        let cx = Cx { now: self.now, published: self.engine_published(), engine_has_head: self.engine_has_head };
+        let acts = self.pubs.on(label, ev, &cx);
+        for act in acts {
+            self.carry_act(label, act);
         }
     }
 
-    /// The register read that decides a `NotNext` (invariant 1b).
-    ///
-    /// * The register holds the named head, or a later one → that is the head:
-    ///   adopted (`HeadConflict`).
-    /// * It is ONE behind → the signer's record is ahead, its UPDATE unlanded:
-    ///   this page LANDS it. It asks the signer from the register's own head
-    ///   with `next.seq = register.seq + 1` (the signer checks the successor
-    ///   FIRST — `next: this commit` would be `NotSuccessor`; any root). The
-    ///   signer signed from that prev already, so it answers `AlreadySigned`
-    ///   with the record for the named head WHATEVER the root asked (fact a:
-    ///   `signer::decide`'s `r.prev == *prev` arm; pinned by signer/tests/
-    ///   sign.rs `two_requests_from_one_prev_in_sequence_get_one_signature`),
-    ///   and those exact bytes are UPDATEd. Two pages landing the same record
-    ///   is idempotent: the register holds an equal decision, held bytes win.
-    ///   SAFE because a record exists only after its blocks were put and
-    ///   confirmed (invariant 0: [`Page::release`] lets an `UpdateHead` leave
-    ///   only when its whole `after` set is confirmed). RESIDUAL, named: a
-    ///   page whose signer answered before ITS blocks were stored leaves a
-    ///   head with holes, and they surface here, on the landing page.
-    /// * It is 2+ behind → UNRECOVERABLE (the signer keeps one record) and, by
-    ///   1b on the sign side (a page signs only from a head the register was
-    ///   read to hold), unreachable: a named failure, never a loop.
-    ///
-    /// On a peered node the register is read through the head SUBSCRIPTION
-    /// (F55: a delegate-created register is not served to a bare client GET);
-    /// the web layer frames `Op::ReadHead { label: Label::Head }` as that.
-    fn on_verify(&mut self, j: &Judged) {
-        let Some(v) = self.verify.clone() else { return };
-        let h = j.shown();
-        let reg_seq = h.map_or(0, |(s, _)| s);
-        // THIS page's own record at the register's seq is another root that
-        // wins the tie-break: LAND it (its UPDATE has not merged here yet)
-        // rather than adopt a head about to lose. Judged by the record, never
-        // by what the signer named: at an equal seq the signer names the
-        // REGISTER's head (rule c), so `v.root` is theirs.
-        if let Judged::MineWins { seq, record, .. } = j {
-            if *seq >= v.seq {
-                if let Some(v) = self.verify.as_mut() {
-                    v.landing = true;
-                    v.updates += 1;
-                    self.most_landing_updates = self.most_landing_updates.max(v.updates);
+    /// One [`Act`] of a label's transition.
+    fn carry_act(&mut self, label: &Label, act: Act) {
+        match act {
+            Act::Sign { prev_seq, prev_root, seq, root } => self.ask_sign(label, prev_seq, prev_root, seq, root),
+            Act::Update(state) => self.send(Waiting::Update(label.clone()), Op::Update { label: label.clone(), state }),
+            Act::Read(wait) => {
+                let w = self.read_wait(label, wait);
+                self.send(w, Op::ReadHead { label: label.clone() });
+            }
+            Act::ReadIfIdle(wait) => {
+                let w = self.read_wait(label, wait);
+                if !self.deadlines.contains_key(&w) {
+                    self.send(w, Op::ReadHead { label: label.clone() });
                 }
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() });
-                return;
             }
-        }
-        if let Judged::Head(heard) = j {
-            if heard.seq() >= v.seq {
-                self.verify = None;
-                self.head.owed = None;
-                self.adopt(*heard, Adopt::Conflict);
-                return;
+            Act::EndWaits => {
+                let reads = match label {
+                    Label::Head => vec![Waiting::ReadBack(Label::Head), Waiting::Verify],
+                    Label::Site(_) => vec![Waiting::ReadBack(label.clone())],
+                };
+                for w in [Waiting::Sign(label.clone()), Waiting::Update(label.clone())].into_iter().chain(reads) {
+                    self.end(&w, End::Withdrawn);
+                    self.attempt_of.remove(&w);
+                }
             }
-        }
-        if v.seq > reg_seq + 1 {
-            self.verify = None;
-            self.unusable.push(format!(
-                "the signer's record (seq {}) is {} ahead of the register (seq {reg_seq}): unrecoverable, and 1b says unreachable",
-                v.seq,
-                v.seq - reg_seq
-            ));
-            return;
-        }
-        let (prev_seq, prev_root) = match h {
-            Some(h) => h,
-            // No head at all: the record's prev is the genesis (the empty
-            // tree), which is where this engine stands if it has adopted none.
-            None if self.engine.published_seq() == 0 => (0, self.engine.published_root()),
-            None => {
-                let now = self.now;
-                let v = self.verify.as_mut().expect("present");
-                v.tries += 1;
-                v.again_at = Some(now + (BACKOFF_MS << v.tries.min(5)).min(rto::RTO_MAX_MS as u64));
-                return;
+            Act::Adopt(heard) => self.adopt(heard, Adopt::Conflict),
+            Act::Confirmed(seq) => self.step(Event::HeadConfirmed(seq)),
+            // ⁵: a FINAL end of the owed commit. The engine fails its writes at once; the signer's why is said ONCE,
+            // naming them, here -- never stored (until sdk#500 carries it on the notice).
+            Act::Refused { seq, why } => {
+                let from = self.client_fx.len();
+                self.step(Event::HeadRefused { seq });
+                let failed: Vec<String> = self.client_fx[from.min(self.client_fx.len())..]
+                    .iter()
+                    .filter_map(|f| match f {
+                        Effect::Notify { write_id, state: State::Failed, .. } => Some(write_id.0.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                self.unusable.push(format!("the signer refused commit seq {seq} (writes {}): {why}", failed.join(", ")));
             }
-        };
-        if let Some(v) = self.verify.as_mut() {
-            if !v.landing {
-                self.landings += 1;
+            Act::Note(state) => self.note_record(&state),
+            Act::Forked(seq) => {
+                if self.old_signer_fork_at != Some(seq) {
+                    self.old_signer_fork_at = Some(seq);
+                    self.unusable.push(format!(
+                        "SIGNER UPGRADE NEEDED: this signer predates the same-identity rule (sdk#225) and refuses every sign while its record and the register differ at seq {seq}; load the current version (its signer ships with the page). It signs again once the register moves past that seq"
+                    ));
+                }
             }
-            v.landing = true;
-            v.from = Some((prev_seq, prev_root));
+            Act::Landing => self.landings += 1,
+            Act::LandingUpdates(n) => self.most_landing_updates = self.most_landing_updates.max(n),
         }
-        self.ask_land();
     }
 
-    /// A register read on a hint (the node's `HeadChanged`, or the idle
-    /// backstop): the RELOAD TRIGGER (sdk#225). This read IS the register read
-    /// 1b asks for, so what it shows may be adopted as it is.
-    ///
-    /// * No head, or the head the engine stands on, or an older one: nothing
-    ///   (a hint never opens an empty tree).
-    /// * This page's owed head, or another root at its seq: the read-back's
-    ///   judgement, which knows this page's claim there.
-    /// * The SAME seq as the published head under another root, and this
-    ///   page's record there wins the tie-break: it is landed again (its
-    ///   UPDATE has not merged here), never displaced.
-    /// * Otherwise a newer head, or a same-seq winner: ADOPTED
-    ///   (`HeadConflict`). A commit in flight dies `Lost`, as in any conflict.
-    fn on_hint(&mut self, j: &Judged) {
-        let Some((seq, root)) = j.shown() else { return };
-        if !self.engine_has_head || self.verify.is_some() {
-            return;
+    /// The wait a label's register read is for.
+    fn read_wait(&self, label: &Label, wait: ReadWait) -> Waiting {
+        match (label, wait) {
+            (_, ReadWait::ReadBack) => Waiting::ReadBack(label.clone()),
+            (Label::Head, ReadWait::Verify) => Waiting::Verify,
+            (Label::Head, ReadWait::Warm) => Waiting::Warm,
+            // A site has no verify and no warm read: its reads are its own read-back (⁸).
+            (Label::Site(_), ReadWait::Verify | ReadWait::Warm) => Waiting::ReadBack(label.clone()),
         }
-        let (pseq, proot) = (self.engine.published_seq(), self.engine.published_root());
-        if (seq, root) == (pseq, proot) || seq < pseq {
-            return;
-        }
-        if self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && o.seq == seq) {
-            self.on_read_back(j);
-            return;
-        }
-        match j {
-            Judged::MineWins { record, .. } => self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: record.clone() }),
-            Judged::Head(heard) => {
-                self.head.owed = None;
-                self.adopt(*heard, Adopt::Conflict);
-            }
-            Judged::NoHead => {}
-        }
+    }
+
+    /// E9 for the head: a register read, judged by the ONE judgement, with whether it CONFIRMS this page's commit.
+    fn head_read(&mut self, from: ReadFrom, j: &Judged) {
+        let confirms = self.last_head.as_ref().is_some_and(|read| self.confirms(read));
+        self.life_on(&Label::Head, Ev::Read { from, j, confirms });
     }
 
     /// The socket was REPLACED (sdk#376): EVERY op on the wire went out on the
@@ -1659,14 +1403,14 @@ impl Page {
     /// this page's head, a newer one, a same-seq winner — so a second read
     /// adds nothing but a node op on the node's one queue, F61).
     pub fn head_hint(&mut self) {
-        if self.verify.is_none() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
+        if !self.pubs.head().verifying() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
     }
 
     /// Is this page's own read-back owed: a head signed, its UPDATE sent, not yet confirmed (sdk#378)?
     fn read_back_owed(&self) -> bool {
-        self.head.owed.as_ref().is_some_and(|o| o.record.is_some())
+        matches!(self.pubs.head(), Life::Written { .. })
     }
 
     /// The node pushed the head register's FULL state (sdk#378 P3, the
@@ -1678,7 +1422,7 @@ impl Page {
     /// push changes nothing: the read-back GET after the UPDATE's answer does
     /// the job on its deadline. Nothing is ever ADOPTED from a push.
     pub fn head_pushed(&mut self, read: HeadRead) {
-        let confirms = self.verify.is_none() && self.confirms(&read);
+        let confirms = !self.pubs.head().verifying() && self.confirms(&read);
         if !confirms {
             // ALREADY KNOWN (the architect's done x E1 cell, #378): a full state that IS the head this page last
             // read -- the whole value, not only (seq, root) -- and the engine stands on, is news to nobody. No
@@ -1697,7 +1441,7 @@ impl Page {
         // ask it, or the GET itself -- ends with the owed head, in `drop_dead_head`, once the engine has published
         // its seq (COMMIT-LIFE ⁹): no RTT sample (a push is not an answer to either request).
         let j = judge(self.last_head.as_ref(), &self.my_records);
-        self.on_read_back(&j);
+        self.head_read(ReadFrom::ReadBack, &j);
     }
 
     /// A record the signer returned (`Signed`, or `AlreadySigned`: the one it
@@ -1725,113 +1469,29 @@ impl Page {
     /// the same seq is not this commit (`AlreadySigned`), and the engine's take checks the seq only.
     fn confirms(&self, read: &HeadRead) -> bool {
         let pair = (read.seq, read.root());
-        match self.head.owed.as_ref() {
-            Some(o) => o.record.is_some() && (o.seq, o.root) == pair,
-            None => {
+        match (self.pubs.head(), self.pubs.head().owed()) {
+            (Life::Written { owed, .. }, _) => (owed.seq, owed.root) == pair,
+            (_, Some(_)) => false,
+            (_, None) => {
                 pair == self.engine_published()
                     && self.my_records.get(&read.seq).and_then(|(_, record)| HeadRead::from_record(record)).is_some_and(|mine| mine.value() == read.value())
             }
         }
     }
 
-    /// The register read back after an UPDATE: the only way a commit is
-    /// Published (F56: the UPDATE's answer says nothing).
-    fn on_read_back(&mut self, j: &Judged) {
-        // `last_head` is the read `j` was judged from (both callers judge it just before).
-        if let (Judged::Head(heard), Some(read)) = (j, self.last_head.as_ref()) {
-            if self.confirms(read) {
-                return self.step(Event::HeadConfirmed(heard.seq()));
-            }
-        }
-        let Some(owed) = self.head.owed.as_mut() else { return };
-        if owed.record.is_none() {
-            return; // a read-back outlived its commit
-        }
-        let want = (owed.seq, owed.root);
-        match j {
-            // Not visible yet -- or THIS page's record wins the tie-break
-            // against what the register shows (the node has not merged my
-            // UPDATE; adopting theirs would drop a head that is about to win,
-            // the architect's attack on sdk#225, case 1): read again; after
-            // HEAD_READS, UPDATE again.
-            Judged::Head(heard) if heard.seq() < want.0 => {
-                owed.stale_reads += 1;
-                if owed.stale_reads >= HEAD_READS {
-                    owed.stale_reads = 0;
-                    let state = owed.record.clone().expect("an UPDATE was sent");
-                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-                }
-            }
-            Judged::MineWins { .. } => {
-                owed.stale_reads += 1;
-                if owed.stale_reads >= HEAD_READS {
-                    owed.stale_reads = 0;
-                    let state = owed.record.clone().expect("an UPDATE was sent");
-                    self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-                }
-            }
-            Judged::Head(heard) => {
-                self.head.owed = None;
-                self.adopt(*heard, Adopt::Conflict);
-            }
-            Judged::NoHead => {
-                let state = owed.record.clone().expect("an UPDATE was sent");
-                self.send(Waiting::Update(Label::Head), Op::Update { label: Label::Head, state });
-            }
-        }
-    }
-
-    /// A LANDING's sign request, under a fresh id (SG02): from the register's
-    /// own head, with `next.seq = register.seq + 1` — the signer checks the
-    /// successor FIRST — and any root.
-    fn ask_land(&mut self) {
-        let Some((prev_seq, prev_root, root)) = self.verify.as_ref().and_then(|v| v.from.map(|(s, r)| (s, r, v.root))) else {
-            return;
-        };
+    /// THE sign request, for any label, under a fresh id (SG02). A head's value carries its ledger; a site's is the
+    /// bundle hash alone. The prev is the one the transition names (P2: a commit's BASE, never "whatever the engine
+    /// publishes now" -- signed after a foreign winner was adopted, that would name the winner as prev of a root
+    /// built without it; a landing's is the register's own head, `next.seq = register.seq + 1`).
+    fn ask_sign(&mut self, label: &Label, prev_seq: u64, prev_root: Cid, seq: u64, root: Cid) {
         let id = self.next_request;
         self.next_request = self.next_request.checked_add(1).unwrap_or(1);
-        self.head.sign_id = Some(id);
-        let ledger = self.sign_ledger_of(prev_seq, prev_root, prev_seq + 1, root);
-        self.send(Waiting::Sign(Label::Head), Op::Sign { id, prev_seq, prev_root, seq: prev_seq + 1, root, ledger, label: Label::Head });
-    }
-
-    fn ask_sign(&mut self) {
-        self.ask_sign_for(Label::Head);
-    }
-
-    /// THE sign request, for any label: from the owed's prev `(seq - 1, base)`, under a fresh id (SG02). A head's
-    /// value carries its ledger; a site's is the bundle hash alone.
-    fn ask_sign_for(&mut self, label: Label) {
-        let Some(o) = self.pub_ref(&label).and_then(|p| p.owed.clone()) else { return };
-        let id = self.next_request;
-        self.next_request = self.next_request.checked_add(1).unwrap_or(1);
-        self.pub_mut(&label).sign_id = Some(id);
-        // The prev is the commit's BASE, never "whatever the engine
-        // publishes now": signed after a foreign winner was adopted, that
-        // would name the winner as prev of a root built without it, and the
-        // winner's rows would be lost from every later head.
-        let (prev_seq, prev_root, seq, root) = (o.seq - 1, o.base, o.seq, o.root);
         let ledger = match label {
             Label::Head => self.sign_ledger_of(prev_seq, prev_root, seq, root),
             Label::Site(_) => Vec::new(),
         };
         let op = Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label: label.clone() };
-        self.send(Waiting::Sign(label), op);
-    }
-
-    /// A label's publication: the head's, or a site's (made on first use).
-    fn pub_mut(&mut self, label: &Label) -> &mut Pub {
-        match label {
-            Label::Head => &mut self.head,
-            Label::Site(app) => self.sites.entry(app.clone()).or_default(),
-        }
-    }
-
-    fn pub_ref(&self, label: &Label) -> Option<&Pub> {
-        match label {
-            Label::Head => Some(&self.head),
-            Label::Site(app) => self.sites.get(app),
-        }
+        self.send(Waiting::Sign(label.clone()), op);
     }
 
     /// PUBLISH A SITE (builder#117): `value` is blake3 of its web part, which page-io holds and frames. First the
@@ -1840,133 +1500,17 @@ impl Page {
     /// Publishing again while one is in flight starts over with the new bundle.
     pub fn publish_site(&mut self, app: &str, value: Cid, now: Ms) {
         self.now = now.0;
-        let label = Label::Site(app.to_string());
-        for w in [Waiting::Sign(label.clone()), Waiting::Update(label.clone()), Waiting::ReadBack(label.clone())] {
-            self.end(&w, End::Withdrawn);
-            self.attempt_of.remove(&w);
-        }
-        // `seq == 0`: the site's version is not read yet (its first read decides it).
-        self.sites.insert(app.to_string(), Pub { owed: Some(Owed { seq: 0, root: value, base: [0u8; 32], record: None, stale_reads: 0 }), ..Pub::default() });
-        self.publications.insert(app.to_string(), Publication::Publishing { waiting_for: None });
-        self.send(Waiting::ReadBack(label.clone()), Op::ReadHead { label });
+        self.life_on(&Label::Site(app.to_string()), Ev::Publish(value));
     }
 
-    /// How a site's publication stands (builder#117): the one owner of that fact. `None`: never asked.
-    pub fn publication(&self, app: &str) -> Option<&Publication> {
-        self.publications.get(app)
+    /// How a site's publication stands (builder#117), DERIVED from its `Life`, the one owner. `None`: never asked.
+    pub fn publication(&self, app: &str) -> Option<Publication> {
+        self.pubs.site(app).and_then(Life::publication)
     }
 
     /// The person CANCELS a site's publication: every wait of it ends, and it says so.
     pub fn cancel_site(&mut self, app: &str) {
-        let label = Label::Site(app.to_string());
-        for w in [Waiting::Sign(label.clone()), Waiting::Update(label.clone()), Waiting::ReadBack(label.clone())] {
-            self.end(&w, End::Withdrawn);
-            self.attempt_of.remove(&w);
-        }
-        if self.sites.remove(app).is_some() {
-            self.publications.insert(app.to_string(), Publication::Cancelled);
-        }
-    }
-
-    /// A site's publication ENDS (published, superseded, refused): its state and waits go.
-    fn end_site(&mut self, app: &str, how: Publication) {
-        self.cancel_site(app);
-        self.publications.insert(app.to_string(), how);
-    }
-
-    /// A SITE's signer answer (the module table's Site column): Signed -> the site's write; AlreadySigned with THIS
-    /// bundle -> the same; with another -> ask FROM that record (a site record cannot be landed without its web
-    /// bytes, which this page does not hold: the livelock ends here); NotNext -> ask from `current` (nothing is
-    /// adopted, so 1b's read-first is not needed: the architect's Q1); a retryable refusal -> the head's backoff;
-    /// any other refusal -> named, and the publication ends.
-    fn on_site_signer(&mut self, app: &str, s: signer_proto::Answer) {
-        use signer_proto::{Answer as A, Why};
-        let label = Label::Site(app.to_string());
-        let Some(owed) = self.sites.get(app).and_then(|p| p.owed.clone()) else { return };
-        if !matches!(&s, A::Refused(why) if why.retryable()) {
-            self.pub_mut(&label).sign_refusals = 0;
-        }
-        // What the publication waits on, stated (not "not answering": the signer answered).
-        let waiting_for = matches!(s, A::Refused(Why::HeadUnknown)).then_some(WAITING_FOR_SITE);
-        if let Some(Publication::Publishing { waiting_for: w }) = self.publications.get_mut(app) {
-            *w = waiting_for;
-        }
-        match s {
-            A::Signed(state) => self.site_write(app, state),
-            A::AlreadySigned(state) => match HeadRead::from_record(&state) {
-                Some(h) if h.value() == owed.root.as_slice() => self.site_write(app, state),
-                Some(h) => {
-                    let Ok(v) = <[u8; 32]>::try_from(h.value()) else { return self.end_site(app, Publication::Refused("the signer's record is not a site's".into())) };
-                    self.rebase_site(app, h.seq, v);
-                }
-                None => self.end_site(app, Publication::Refused("the signer's record does not read".into())),
-            },
-            A::NotNext { current } => self.rebase_site(app, current.seq, current.root),
-            // The one retryable set (`Why::retryable`), the head's backoff.
-            A::Refused(why) if why.retryable() => {
-                let now = self.now;
-                let p = self.pub_mut(&label);
-                p.sign_refusals += 1;
-                let wait = (BACKOFF_MS << p.sign_refusals.min(5)).min(rto::RTO_MAX_MS as u64);
-                p.sign_again = Some(now + wait);
-            }
-            A::Refused(why) => self.end_site(app, Publication::Refused(format!("{why:?}"))),
-            other => self.end_site(app, Publication::Refused(format!("the signer answered a site's sign with {other:?}"))),
-        }
-    }
-
-    /// Sign the site's bundle as the version after `(seq, value)`.
-    fn rebase_site(&mut self, app: &str, seq: u64, value: Cid) {
-        if let Some(o) = self.sites.get_mut(app).and_then(|p| p.owed.as_mut()) {
-            o.seq = seq + 1;
-            o.base = value;
-            o.record = None;
-            o.stale_reads = 0;
-        }
-        self.ask_sign_for(Label::Site(app.to_string()));
-    }
-
-    /// The site's write: the signer's exact bytes (invariant 2), PUT in the site's framing by page-io.
-    fn site_write(&mut self, app: &str, state: Vec<u8>) {
-        if let Some(o) = self.sites.get_mut(app).and_then(|p| p.owed.as_mut()) {
-            o.record = Some(state.clone());
-            o.stale_reads = 0;
-        }
-        let label = Label::Site(app.to_string());
-        self.send(Waiting::Update(label.clone()), Op::Update { label, state });
-    }
-
-    /// A SITE's read (the module table's Site column). Before it signs: where the next version follows from
-    /// (NotFound = the genesis). After its write: its record = Published; older or none = read again, and after
-    /// HEAD_READS write again; the same version with another bundle that MY record beats = read again (the merge
-    /// keeps mine); newer, or the same version won by another = Superseded, reported and never overwritten.
-    /// Never the engine's: a site adopts nothing.
-    fn on_site_read(&mut self, app: &str, read: Option<HeadRead>) {
-        let Some(owed) = self.sites.get(app).and_then(|p| p.owed.clone()) else { return };
-        let label = Label::Site(app.to_string());
-        if owed.seq == 0 {
-            let (seq, value) = match &read {
-                None => (0, [0u8; 32]),
-                Some(h) => match <[u8; 32]>::try_from(h.value()) {
-                    Ok(v) => (h.seq, v),
-                    Err(_) => return self.end_site(app, Publication::Refused("the site holds a record that is not a site's".into())),
-                },
-            };
-            return self.rebase_site(app, seq, value);
-        }
-        let Some(record) = owed.record.clone() else { return };
-        match judge_site(owed.seq, owed.root.as_slice(), read.as_ref()) {
-            SiteJudged::Mine => self.end_site(app, Publication::Published { version: owed.seq }),
-            SiteJudged::Superseded(version) => self.end_site(app, Publication::Superseded { version }),
-            SiteJudged::NotYet => {
-                let o = self.pub_mut(&label).owed.as_mut().expect("owed");
-                o.stale_reads += 1;
-                if o.stale_reads >= HEAD_READS {
-                    o.stale_reads = 0;
-                    self.send(Waiting::Update(label.clone()), Op::Update { label, state: record });
-                }
-            }
-        }
+        self.life_on(&Label::Site(app.to_string()), Ev::Cancel);
     }
 
     /// Ask `Held` about `id` at the next flush (sdk#455). One already in a batch in flight joins it there.
@@ -2471,12 +2015,11 @@ impl Page {
         // the next tick. A host that armed only for deadlines would sleep
         // through a back-off (the differential's RecordNotSaved case did).
         let deadlines = self.deadlines.values().map(|d| d.at);
-        let sign = self.head.sign_again.into_iter().chain(self.sites.values().filter_map(|p| p.sign_again)).min();
+        let sign = self.pubs.lives().filter_map(Life::due_at).min();
         let held = self.held_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
-        let verify = self.verify.as_ref().and_then(|v| v.again_at);
         let puts = (!self.put_again.is_empty()).then_some(self.now);
         let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
-        deadlines.chain(sign).chain(held).chain(verify).chain(puts).chain(backstop).min().map(Ms)
+        deadlines.chain(sign).chain(held).chain(puts).chain(backstop).min().map(Ms)
     }
 
     /// The page's clock: the last time it was told.
@@ -2740,17 +2283,8 @@ impl Page {
     /// it: `NotSuccessor`, hidden behind the retries that got round it).
     fn drop_dead_head(&mut self) {
         // Also dead: a head whose commit was built on a root the engine no
-        // longer publishes (a foreign winner adopted under it).
-        let published = self.engine_published();
-        if self.head.owed.as_ref().is_some_and(|o| o.seq <= published.0 || (o.seq - 1, o.base) != published) {
-            self.head.owed = None;
-            self.head.sign_again = None;
-            self.head.sign_refusals = 0;
-            self.head.sign_id = None;
-            for w in [Waiting::Sign(Label::Head), Waiting::Update(Label::Head), Waiting::ReadBack(Label::Head)] {
-                self.end(&w, End::Withdrawn);
-            }
-        }
+        // longer publishes (a foreign winner adopted under it). E11: the table decides.
+        self.life_on(&Label::Head, Ev::Dead);
     }
 
     fn carry_out(&mut self, fx: Vec<Effect>) {
@@ -2889,9 +2423,7 @@ impl Page {
                     Effect::UpdateHead { seq, root, base, .. } => {
                         // The owed head this one replaces is dead (the engine published it, or adopted over it):
                         // its waits end with it, before this head's own go out under the same labels.
-                        self.drop_dead_head();
-                        self.head.owed = Some(Owed { seq, root, base, record: None, stale_reads: 0 });
-                        self.ask_sign();
+                        self.life_on(&Label::Head, Ev::Owe(Owed { seq, root, base }));
                     }
                     _ => unreachable!("only puts and heads are held"),
                 }
@@ -2936,8 +2468,7 @@ impl Page {
     pub fn waiting(&self) -> bool {
         !self.deadlines.is_empty()
             || !self.put_again.is_empty()
-            || self.head.sign_again.is_some()
-            || self.sites.values().any(|p| p.sign_again.is_some())
+            || self.pubs.lives().any(|l| l.due_at().is_some())
             || !self.held_again.is_empty()
             || !self.held_asks.is_empty()
     }
@@ -5086,7 +4617,8 @@ mod head_judgement_cells {
         let (record, mine) = my_record(1, &[0xAA; 32]);
         p.my_records.insert(1, (mine.root(), record.clone()));
         let theirs = a_losing_head(&mine);
-        p.verify = Some(Verify { seq: 0, root: [0u8; 32], landing: false, again_at: None, tries: 0, updates: 0, from: None });
+        let base = p.published().1;
+        p.pubs.set_head_for_test(Life::Verifying { owed: Owed { seq: 1, root: [0x11; 32], base }, named: (0, [0u8; 32]), tries: 0, at: None });
         p.send(Waiting::Verify, Op::ReadHead { label: Label::Head });
         let _ = p.take_ops();
         let before = p.published();
@@ -5108,14 +4640,14 @@ mod head_judgement_cells {
         let (record2, mine2) = my_record(2, &[0xBB; 32]);
         p.my_records.insert(1, (owed.root(), record1.clone()));
         p.my_records.insert(2, (mine2.root(), record2));
-        p.head.owed = Some(Owed { seq: 1, root: owed.root(), base: [0u8; 32], record: Some(record1), stale_reads: 0 });
+        p.pubs.set_head_for_test(Life::Written { owed: Owed { seq: 1, root: owed.root(), base: [0u8; 32] }, record: record1, stale: 0 });
         let theirs = a_losing_head(&mine2);
         p.send(Waiting::ReadBack(Label::Head), Op::ReadHead { label: Label::Head });
         let _ = p.take_ops();
         p.answer(Answer::Head { label: Label::Head, read: Some(theirs.clone()) }, Ms(10));
         assert_ne!(p.published(), (theirs.seq, theirs.root()), "the read-back adopted a head this page's own record beats");
-        let o = p.head.owed.as_ref().expect("the owed commit was dropped for a head this page's own record beats");
-        assert_eq!((o.seq, o.stale_reads), (1, 1), "the read-back did not read again (one stale read counted)");
+        let Life::Written { owed: o, stale, .. } = p.pubs.head() else { panic!("the owed commit was dropped for a head this page's own record beats: {:?}", p.pubs.head()) };
+        assert_eq!((o.seq, *stale), (1, 1), "the read-back did not read again (one stale read counted)");
     }
 }
 
@@ -5306,7 +4838,7 @@ mod confirmed_once {
         } else {
             p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
         }
-        let o = p.head.owed.as_ref().expect("the next commit's owed head was dropped by the confirming step");
+        let o = p.pubs.head().owed().expect("the next commit's owed head was dropped by the confirming step");
         assert_eq!(o.seq, mine.seq + 1, "THE SETUP: the confirming step did not release the next commit's head");
         assert!(p.deadlines.contains_key(&Waiting::Sign(Label::Head)), "the next commit's sign wait was ended with the confirmed head");
         assert!(!p.deadlines.contains_key(&Waiting::ReadBack(Label::Head)), "the confirmed head's read-back wait outlived it");

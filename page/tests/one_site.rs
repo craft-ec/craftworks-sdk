@@ -56,7 +56,7 @@ fn the_cut_is_the_first_test_module_and_nothing_else_hides_after_it() {
 #[test]
 fn a_confirmation_is_routed_from_one_place_and_the_page_holds_no_guard() {
     let lib = production_of(LIB);
-    assert!(lib.contains("fn drop_dead_head(") && lib.contains("fn on_read_back("), "THE CONTROL: the production cut lost the code it scans");
+    assert!(lib.contains("fn drop_dead_head(") && lib.contains("fn head_read("), "THE CONTROL: the production cut lost the code it scans");
     assert_eq!(lib.matches(concat!("Event::", "HeadConfirmed(")).count(), 1, "a confirmation reaches the engine from more than one place");
     assert_eq!(lib.matches(concat!("head.owed", ".take()")).count(), 0, "the page takes the owed head itself: a second decision of 'confirmed'");
     for w in ["ReadBack", "Update"] {
