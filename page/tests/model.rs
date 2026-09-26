@@ -1654,3 +1654,100 @@ fn a_foreign_member_absent_is_put_again_from_page_memory_at_a_one_byte_budget() 
     assert!(again.iter().all(|(id, bytes)| a_values.get(id) == Some(bytes)), "a foreign member was put again with other bytes");
     assert_eq!(b.reput_missing(), 0);
 }
+
+/// THE FOREIGN MEMBERS' HELD ASK, ON REAL ENGINE STATE (sdk#416's class 2; sdk#455): page A publishes a value group
+/// of 30; page B, which never PUT those values, changes ONE of them. B's commit asks the node about the group's OTHER
+/// members (ConfirmHeld) in ONE batched op. Answered ABSENT, each is asked again on the backoff -- the engine still
+/// waits on it (rule 7) -- and PUT from here only after HELD_ABSENTS absents in a row, and only with the bytes B holds
+/// (it fetched them to re-code the group).
+#[test]
+fn a_foreign_members_absent_are_asked_again_and_put_only_after_held_absents() {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(Params::default(), PutPath::Page);
+    let mut b = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000u64;
+    /// What `p` sent, in order: a Held ask (its ids) or a PUT (its id, and whether the page held its bytes).
+    enum Sent {
+        Held(Vec<Cid>),
+        Put(Cid),
+    }
+    // Serve `p` as the node does; `absent`: every Held is answered absent.
+    fn serve(p: &mut Page, node: &mut Node, now: &mut u64, absent: bool, rounds: usize) -> Vec<Sent> {
+        let mut sent = Vec::new();
+        for _ in 0..rounds {
+            let ops = p.take_ops();
+            if ops.is_empty() {
+                if !p.waiting() {
+                    break;
+                }
+                *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
+                p.tick(Ms(*now));
+                continue;
+            }
+            for op in ops {
+                let ans = match op {
+                    Op::Put { id, bytes } => {
+                        sent.push(Sent::Put(id));
+                        node.put(id, &bytes);
+                        Some(Answer::PutOk(id))
+                    }
+                    Op::Get { id } => Some(match node.blocks.get(&id) {
+                        Some(b) => Answer::Got { id, bytes: b.clone() },
+                        None => Answer::GetMissed(id),
+                    }),
+                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                        let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                        Some(Answer::Signer { id, answer })
+                    }
+                    Op::Update { state, .. } => {
+                        node.update(&state);
+                        Some(Answer::Updated { label: page::Label::Head })
+                    }
+                    Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
+                    Op::AskHeld { batch, ids } => {
+                        sent.push(Sent::Held(ids.clone()));
+                        Some(Answer::Held { batch, present: ids.iter().map(|id| !absent && node.blocks.contains_key(id)).collect() })
+                    }
+                    Op::PutApp { key } => Some(Answer::AppPutOk(key)),
+                    Op::Ext(_) => None,
+                };
+                if let Some(ans) = ans {
+                    p.answer(ans, Ms(*now));
+                }
+            }
+        }
+        sent
+    }
+    serve(&mut a, &mut node, &mut now, false, 400);
+    serve(&mut b, &mut node, &mut now, false, 400);
+    let rows: Vec<(Vec<u8>, WriteOp)> = (0..30).map(|i| (format!("v/{i:02}").into_bytes(), WriteOp::Put(vec![i as u8; 2_000]))).collect();
+    a.write(ClientId(1), WriteId(1), rows);
+    serve(&mut a, &mut node, &mut now, false, 400);
+    assert_eq!(node.head().map(|h| h.0), Some(1), "THE SETUP: A did not publish");
+    let a_blocks: std::collections::BTreeSet<Cid> = node.blocks.keys().copied().collect();
+    b.head_hint();
+    serve(&mut b, &mut node, &mut now, false, 400);
+    b.write(ClientId(2), WriteId(1), vec![(b"v/05".to_vec(), WriteOp::Put(vec![99u8; 2_000]))]);
+    let sent = serve(&mut b, &mut node, &mut now, true, 3_000);
+    let helds: Vec<&Vec<Cid>> = sent.iter().filter_map(|s| if let Sent::Held(ids) = s { Some(ids) } else { None }).collect();
+    let foreign: std::collections::BTreeSet<Cid> = helds.iter().flat_map(|ids| ids.iter()).copied().filter(|id| a_blocks.contains(id)).collect();
+    let first = helds.first().map_or(0, |ids| ids.len());
+    println!("B: {} Held op(s), the first of {} ids; {} foreign members asked", helds.len(), first, foreign.len());
+    assert!(first >= 20, "THE SETUP: B's commit did not ask about the group's other members in ONE op ({first} ids)");
+    for id in &foreign {
+        // How many times it was asked before its first PUT from here (all of them if never PUT).
+        let mut asks = 0;
+        let mut put_after = None;
+        for s in &sent {
+            match s {
+                Sent::Held(ids) if ids.contains(id) => asks += 1,
+                Sent::Put(p) if p == id && put_after.is_none() => put_after = Some(asks),
+                _ => {}
+            }
+        }
+        assert!(asks >= 2, "a foreign member answered absent was not asked again (rule 7)");
+        if let Some(n) = put_after {
+            assert!(n >= page::HELD_ABSENTS as usize, "a foreign member was PUT after only {n} absent(s), not HELD_ABSENTS");
+        }
+    }
+}

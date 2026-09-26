@@ -698,8 +698,6 @@ pub struct Page {
     held_asks: BTreeSet<Cid>,
     /// The next `Held` batch's number.
     next_held_batch: u32,
-    /// `Held` answers SHORTER than their op (the signer broke its own frame): the ids past the end were asked again.
-    short_held_answers: u64,
     /// A `NotNext{current}` not yet ADOPTED: the register must be read to hold
     /// it first (invariant 1b).
     verify: Option<Verify>,
@@ -844,7 +842,6 @@ impl Page {
             held_again: BTreeMap::new(),
             held_asks: BTreeSet::new(),
             next_held_batch: 0,
-            short_held_answers: 0,
             verify: None,
             landings: 0,
             most_landing_updates: 0,
@@ -1134,15 +1131,19 @@ impl Page {
                             self.held_again.remove(&id);
                             self.confirm(id);
                         }
-                        Some(false) => self.held_absent(id, now),
+                        // Absent, and still waited on: asked again (the backoff). Nobody waits on it any more (a
+                        // withdrawn block a batch in flight still carried): the ask ends here.
+                        Some(false) if self.engine.awaits_confirmation(&id) => self.held_absent(id, now),
+                        Some(false) => {
+                            self.held_again.remove(&id);
+                        }
                         None => {
                             self.held_asks.insert(id);
                         }
                     }
                 }
                 if short > 0 {
-                    self.short_held_answers += short as u64;
-                    self.record_short_held(batch, short);
+                    self.record_short_held(short);
                     debug_assert!(false, "a Held answer for batch {batch} was {short} short of its op");
                 }
             }
@@ -1968,11 +1969,6 @@ impl Page {
         }
     }
 
-    /// `Held` answers short of their op, in ids (see the field).
-    pub fn short_held_answers(&self) -> u64 {
-        self.short_held_answers
-    }
-
     fn send(&mut self, w: Waiting, op: Op) {
         // A send of an op that is PARKED JOINS its wait (the deadline table's (d), the architect and main): the parked
         // deadline and back-off stand, and it goes out, as this op, when that deadline comes due. The rule a GET already
@@ -2087,18 +2083,16 @@ impl Page {
         });
     }
 
-    /// A `Held` answer SHORT of its op (sdk#455): the signer broke its own frame, so it is recorded -- never silent.
-    /// The instrument's reasons are a closed list with no "short held answer" yet: the nearest, `Unparseable` (a frame
-    /// that does not read as its contract), at the Held op's own site, once per id left unanswered.
-    fn record_short_held(&self, batch: u32, short: usize) {
+    /// A `Held` answer SHORT of its op (sdk#455): the signer broke its own frame, so it is recorded -- never silent
+    /// (the recording is its one record): `ShortAnswer` at the Held op's site, once per id left unanswered.
+    fn record_short_held(&self, short: usize) {
         use instrument::{
             vocab::{DropReason, Key},
             Entry, Event, OpId, Probe,
         };
-        let _ = batch;
         let Some(rec) = self.rec.as_ref() else { return };
         for _ in 0..short {
-            rec.event(Event::Counter { site: op_site(&Waiting::Held(0)), op: OpId::NONE, entry: Entry { key: Key::DroppedMsgs, value: DropReason::Unparseable.code() } });
+            rec.event(Event::Counter { site: op_site(&Waiting::Held(0)), op: OpId::NONE, entry: Entry { key: Key::DroppedMsgs, value: DropReason::ShortAnswer.code() } });
         }
     }
 
@@ -3170,9 +3164,10 @@ mod held_batch {
         p.carry_out(ids.iter().map(|id| Effect::ConfirmHeld { id: *id }).collect());
     }
 
-    /// **200 ids -> 2 ops (128 + 72), and each id's answer is its own.** ConfirmHeld for 200 foreign members in one
-    /// step. Answered: present confirms, absent backs off alone (its batch-mates are not touched). Mutant "one op per
-    /// id" -> 200 ops -> red on the COUNT.
+    /// **200 ids -> 2 ops (128 + 72), and each id's answer is its own.** ConfirmHeld for 200 ids in one step (injected:
+    /// the engine waits on none of them). Answered: present confirms; absent ENDS the ask of an id nobody waits on,
+    /// and touches no batch-mate. (An absent id the engine DOES wait on backs off alone: `model.rs`
+    /// `a_foreign_members_absent_...`, on real engine state.) Mutant "one op per id" -> 200 ops -> red on the COUNT.
     #[test]
     fn two_hundred_ids_are_two_ops_and_answers_map_by_id() {
         let mut p = Page::new(Params::default(), PutPath::Page);
@@ -3195,9 +3190,56 @@ mod held_batch {
                 assert!(!p.held_again.contains_key(id));
             } else {
                 assert!(!p.confirmed.contains(id), "an id answered absent was confirmed (another id's answer)");
-                assert_eq!(p.held_again.get(id).map(|(_, n)| *n), Some(1), "an absent id did not back off on its own");
+                assert!(!p.held_again.contains_key(id), "an absent id nobody waits on is still asked");
             }
         }
+        assert!(held_ops(&mut p).is_empty(), "an id nobody waits on was asked again");
+    }
+
+    /// **An id the engine DOES wait on backs off when absent** (real engine state): a Wrapper-path page's own pending
+    /// commit block, its PUT answered, asked `Held`, answered ABSENT -> one absent counted and asked again on the
+    /// backoff, never ended. Mutant "the engine waits on nothing" -> the ask ends -> red.
+    #[test]
+    fn an_awaited_block_answered_absent_backs_off() {
+        let mut p = Page::new(Params::default(), PutPath::Wrapper);
+        p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+        let mut put = None;
+        for _ in 0..20 {
+            for op in p.take_ops() {
+                match op {
+                    Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: None }, Ms(10)),
+                    Op::Put { id, .. } if put.is_none() => put = Some(id),
+                    _ => {}
+                }
+            }
+        }
+        let id = put.expect("THE SETUP: no block PUT went out");
+        assert!(p.engine.awaits_confirmation(&id), "THE SETUP: the engine does not wait on its own pending block");
+        p.answer(Answer::PutOk(id), Ms(20));
+        let ops = held_ops(&mut p);
+        assert_eq!(ops.iter().map(|(_, i)| i.clone()).collect::<Vec<_>>(), vec![vec![id]], "THE SETUP: the answered PUT was not asked Held");
+        p.answer(Answer::Held { batch: ops[0].0, present: vec![false] }, Ms(21));
+        assert_eq!(p.held_again.get(&id).map(|(_, n)| *n), Some(1), "an absent block the engine waits on did not back off");
+        p.tick(Ms(21 + rto::RTO_MAX_MS as u64 + 1));
+        assert!(held_ops(&mut p).iter().any(|(_, i)| i.contains(&id)), "an absent block the engine waits on was not asked again");
+    }
+
+    /// **A WITHDRAWN id a batch in flight still carries is not asked again** (the architect, on #459): ConfirmHeld x,
+    /// its batch sent, x withdrawn, then the batch answers ABSENT for x -- nobody waits on x (the engine's own record,
+    /// `awaits_confirmation`), so no backoff entry and no later ask. Mutant "absent always backs off" -> red.
+    #[test]
+    fn a_withdrawn_id_answered_absent_is_not_asked_again() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        let _ = p.take_ops();
+        let x = ids(1)[0];
+        asked(&mut p, &[x]);
+        let ops = held_ops(&mut p);
+        assert_eq!(ops.len(), 1, "THE SETUP: x was not asked");
+        p.carry_out(vec![Effect::Withdraw { id: x }]);
+        p.answer(Answer::Held { batch: ops[0].0, present: vec![false] }, Ms(1));
+        assert!(!p.held_again.contains_key(&x), "a withdrawn id answered absent was queued to be asked again");
+        p.tick(Ms(rto::RTO_MAX_MS as u64 * 4));
+        assert!(held_ops(&mut p).is_empty(), "a withdrawn id was asked again");
     }
 
     /// **A silent batch is sent AGAIN as the SAME op** (rule 7): same batch, same ids, one op -- never re-split.
@@ -3234,12 +3276,15 @@ mod held_batch {
     fn a_short_answer_asks_the_rest_again_and_is_counted() {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let _ = p.take_ops();
+        p.record_into(256);
         let five = ids(5);
         asked(&mut p, &five);
         let ops = held_ops(&mut p);
         let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.answer(Answer::Held { batch: ops[0].0, present: vec![true, false, true] }, Ms(1))));
         assert_eq!(loud.is_err(), cfg!(debug_assertions), "a short answer is not loud in debug (or panics in release)");
-        assert_eq!(p.short_held_answers(), 2, "the 2 unanswered ids were not counted");
+        use instrument::Record;
+        let short = p.recording().expect("recording").events().into_iter().filter(|e| matches!(e, instrument::Event::Counter { entry: instrument::Entry { key: instrument::vocab::Key::DroppedMsgs, value }, .. } if *value == instrument::vocab::DropReason::ShortAnswer.code())).count();
+        assert_eq!(short, 2, "the 2 unanswered ids were not recorded as ShortAnswer");
         assert!(p.confirmed.contains(&five[0]) && p.confirmed.contains(&five[2]));
         assert!(!p.confirmed.contains(&five[3]) && !p.held_again.contains_key(&five[3]), "an unknown id was taken as present or absent");
         let again = held_ops(&mut p);
@@ -3275,7 +3320,9 @@ mod confirm_held {
 
     /// RULE 7 for a block the page has NO bytes for (a foreign member it only asks about): absent, it is asked
     /// again on the backoff for as long as it takes -- past HELD_ABSENTS, where a block with bytes would be PUT --
-    /// and never dropped.
+    /// and never dropped. The absent path (`held_absent`) is driven directly: this engine waits on no injected id,
+    /// and an absent answer for an id nobody waits on ends its ask (sdk#459). The same, through the answer, on real
+    /// engine state: `model.rs` `a_foreign_members_absent_...`.
     #[test]
     fn a_foreign_block_absent_is_asked_again_for_as_long_as_it_takes() {
         let mut p = Page::new(Params::default(), PutPath::Page);
@@ -3286,7 +3333,8 @@ mod confirm_held {
         let mut now = 0u64;
         for n in 0..(HELD_ABSENTS + 3) {
             now += 1;
-            p.answer(Answer::Held { batch: p.next_held_batch, present: vec![false] }, Ms(now));
+            p.answered(&Waiting::Held(p.next_held_batch));
+            p.held_absent(id, now);
             now += rto::RTO_MAX_MS as u64 + 1;
             p.tick(Ms(now));
             assert_eq!(asks(&mut p), 1, "absent answer {}: the block was not asked again", n + 1);
