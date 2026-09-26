@@ -1133,7 +1133,26 @@ impl PageIo {
                 self.unusable.push(format!("the node refused: {}", r.said))
             }
             Incoming::Unusable(u) => self.unusable.push(format!("{u:?}")),
-            _ => {}
+            // EVERY KIND owns() claims is DECIDED here, with no catch-all (sdk#483, "Structure before code"): a new
+            // wire answer fails to compile until it is handled, never falls into `_` and vanishes.
+            // A registration of a delegate that is not this page's signer: this page registered no other, so it is
+            // named, and it answers nothing here.
+            Incoming::Ack(wire::AckKind::Registered(key)) => self.unusable.push(format!("the node registered a delegate this page did not register: {key}")),
+            // An UPDATE answer for a contract this page did not update (owns() claims only its own keys, so this is a
+            // key of its own it has no update out for): named.
+            Incoming::Ack(wire::AckKind::Updated(key)) => self.unusable.push(format!("an UPDATE answer this page has no update out for: {key}")),
+            // The node confirms the HEAD subscription (the GET-with-subscribe's own answer already says so): the same
+            // fact, recorded where `head_subscription()` reads it (sdk#259).
+            Incoming::Ack(wire::AckKind::Subscribed(key)) if key == self.register_key => self.head_answered = true,
+            // A SITE's subscription answer: the page does not follow a site (owns() takes it; read by nobody).
+            Incoming::Ack(wire::AckKind::Subscribed(_)) => {}
+            // `Ok` names nothing and answers nothing (wire: "a step must not rely on this one"); every op this page
+            // sent ends by its own named answer or is re-sent on the RTO.
+            Incoming::Ack(wire::AckKind::Ok) => {}
+            // A SITE's change (owns() takes it): the page does not follow a site.
+            Incoming::HeadChanged { .. } => {}
+            // A chunk of a larger message: the reassembler holds it; nothing to hand on yet.
+            Incoming::Partial => {}
         }
         self.pump();
         true
