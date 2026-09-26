@@ -74,8 +74,9 @@ pub fn warning_text(margins: &std::collections::BTreeMap<i64, usize>, warn_below
 pub fn report_json(report: Option<&Report>, progress: Option<(usize, usize)>, policy: &Keep) -> Value {
     let hex = |id: &[u8; 32]| core_types::hex::encode(id);
     match (report, progress) {
-        (None, Some((asked, of))) => json!({ "state": "running", "pass": "full", "asked": asked, "of": of }),
-        (Some(r), _) if !r.measured => json!({ "state": "unmeasured", "pass": "full", "health": "unmeasured", "started_at": r.started_at, "finished_at": r.finished_at }),
+        // A RUNNING pass is newer than any finished one (through Page it cannot coexist: `audit()` clears the report).
+        (_, Some((asked, of))) => json!({ "state": "running", "pass": "full", "asked": asked, "of": of }),
+        (Some(r), _) if !r.measured => json!({ "state": "unmeasured", "pass": "full", "health": health_word(r.health), "started_at": r.started_at, "finished_at": r.finished_at }),
         (Some(r), _) => json!({
             "state": "done",
             "pass": "full",
@@ -112,18 +113,22 @@ pub fn apply_policy(base: Keep, policy: &str) -> Result<Keep, String> {
         };
     }
     if let Some(w) = v.get("warn_below") {
-        k.warn_below = w.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or_else(|| format!("warn_below {w} is not 0 ..= 255"))?;
+        k.warn_below = w.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or_else(|| format!("warn_below {w} is not a small whole number"))?;
     }
+    // The range (0 ..= m for `below N` and `warn_below`, KEEPER §3) is the record's own rule: `Keep::check`.
+    k.check()?;
     Ok(k)
 }
 
 /// A FULL pass's write-back into the target's record (KEEPER §3/§5): its time and counts, the policy kept. An
-/// UNMEASURED pass writes nothing -- it measured nothing (engineer2). `now_s`: whole seconds.
-pub fn write_back(existing: Option<Keep>, own: bool, r: &Report, now_s: u64) -> Option<Keep> {
+/// UNMEASURED pass writes nothing -- it measured nothing (engineer2). The time is the pass's own (`finished_at`, the
+/// page's clock in ms), so the record and the report cannot disagree.
+pub fn write_back(existing: Option<Keep>, own: bool, r: &Report) -> Option<Keep> {
     if !r.measured {
         return None;
     }
-    let base = existing.unwrap_or(if own { Keep::OWN_DEFAULT } else { Keep { repair: Repair::Always, warn_below: 2, audited_at: 0, health: Counts::default() } });
+    let now_s = r.finished_at / 1000;
+    let base = existing.unwrap_or(if own { Keep::OWN_DEFAULT } else { Keep::APP_DEFAULT });
     let n = |x: usize| u32::try_from(x).unwrap_or(u32::MAX);
     Some(Keep { audited_at: now_s, health: Counts { groups: n(r.groups), whole: n(r.whole), degraded: n(r.degraded), damaged: n(r.damaged.len()) }, ..base })
 }
@@ -131,7 +136,7 @@ pub fn write_back(existing: Option<Keep>, own: bool, r: &Report, now_s: u64) -> 
 /// A FIRST publish's record for the app (KEEPER §2: the one way an app enters the list): `always`, warn below 2 --
 /// written only when there is none, so a later publish never overwrites the person's policy.
 pub fn first_publish(existing: Option<Keep>) -> Option<Keep> {
-    existing.is_none().then_some(Keep { repair: Repair::Always, warn_below: 2, audited_at: 0, health: Counts::default() })
+    existing.is_none().then_some(Keep::APP_DEFAULT)
 }
 
 /// `keepSet`'s answer: `{ ok: true }`, or the address parser's refusal as `{ refused: "BAD_ADDRESS", said }`.

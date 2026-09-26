@@ -88,7 +88,10 @@ fn a_policy_edit_applies_what_it_names_and_refuses_what_it_cannot_read() {
     assert_eq!(apply_policy(base, r#"{"repair":{"below":3}}"#).unwrap(), Keep { repair: Repair::Below(3), ..base });
     assert_eq!(apply_policy(base, r#"{"warn_below":4}"#).unwrap(), Keep { warn_below: 4, ..base });
     assert_eq!(apply_policy(base, r#"{"repair":"off","warn_below":0}"#).unwrap(), Keep { repair: Repair::Off, warn_below: 0, ..base });
-    for bad in [r#"{"repair":"sometimes"}"#, r#"{"repair":{"below":-1}}"#, r#"{"warn_below":300}"#, "not json"] {
+    // Past m (KEEPER §3: 0 ..= m) is the record's own refusal (`Keep::check`), m + 1 included.
+    let past_m = u32::from(craftworks_sdk::keep::M) + 1;
+    let (below_past_m, warn_past_m) = (format!(r#"{{"repair":{{"below":{past_m}}}}}"#), format!(r#"{{"warn_below":{past_m}}}"#));
+    for bad in [r#"{"repair":"sometimes"}"#, r#"{"repair":{"below":-1}}"#, r#"{"repair":{"below":300}}"#, r#"{"warn_below":300}"#, "not json", &below_past_m, &warn_past_m] {
         assert!(apply_policy(base, bad).is_err(), "{bad} was applied");
     }
 }
@@ -98,15 +101,17 @@ fn a_policy_edit_applies_what_it_names_and_refuses_what_it_cannot_read() {
 fn a_full_pass_writes_back_and_an_unmeasured_one_writes_nothing() {
     let existing = keep(Repair::Below(2), 5, 0, 0, 0);
     let r = report(true, &[(8, 9)], 9, 0, vec![[3; 32]], Health::Damaged);
-    assert_eq!(write_back(Some(existing), false, &r, 1_790_000_123), Some(Keep { audited_at: 1_790_000_123, health: Counts { groups: 10, whole: 9, degraded: 0, damaged: 1 }, ..existing }));
-    assert_eq!(write_back(None, true, &r, 9).map(|k| k.repair), Some(Repair::Always), "the own tree's defaults were not the base");
-    assert_eq!(write_back(Some(existing), false, &report(false, &[], 0, 0, vec![], Health::Unmeasured), 9), None, "an unmeasured pass wrote a record");
+    let r = Report { finished_at: 1_790_000_123_456, ..r };
+    assert_eq!(write_back(Some(existing), false, &r), Some(Keep { audited_at: 1_790_000_123, health: Counts { groups: 10, whole: 9, degraded: 0, damaged: 1 }, ..existing }), "the record's time is not the pass's own finished_at");
+    assert_eq!(write_back(None, true, &r).map(|k| k.repair), Some(Repair::Always), "the own tree's defaults were not the base");
+    assert_eq!(write_back(None, false, &r).map(|k| (k.repair, k.warn_below)), Some((Keep::APP_DEFAULT.repair, Keep::APP_DEFAULT.warn_below)), "an app's base is not APP_DEFAULT");
+    assert_eq!(write_back(Some(existing), false, &report(false, &[], 0, 0, vec![], Health::Unmeasured)), None, "an unmeasured pass wrote a record");
 }
 
 /// A FIRST publish writes the app's record (always, warn below 2); a later publish never overwrites the policy.
 #[test]
 fn a_first_publish_writes_the_apps_record_once() {
-    assert_eq!(first_publish(None), Some(Keep { repair: Repair::Always, warn_below: 2, audited_at: 0, health: Counts::default() }));
+    assert_eq!(first_publish(None), Some(Keep::APP_DEFAULT));
     assert_eq!(first_publish(Some(keep(Repair::Off, 0, 0, 0, 0))), None);
 }
 
