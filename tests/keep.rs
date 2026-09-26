@@ -56,3 +56,12 @@ fn a_keep_record_is_set_read_back_and_listed_by_its_target() {
     assert_eq!(keep::key(&a)[0], 0x00, "the keep record is not under the SYSTEM tag");
     assert!(d.domains().unwrap().is_empty(), "a keep record was read as a domain");
 }
+
+/// **The warning is derived once, from the margins**: groups with fewer than `warn_below` blocks to spare.
+#[test]
+fn the_warning_counts_the_groups_below_warn_below() {
+    let margins: std::collections::BTreeMap<i64, usize> = [(-1, 1), (1, 2), (2, 3), (8, 10)].into_iter().collect();
+    assert_eq!(keep::warning(&margins, 2), 3, "groups with margin -1 and 1 are below 2");
+    assert_eq!(keep::warning(&margins, 0), 1, "only the damaged group is below 0");
+    assert_eq!(keep::warning(&margins, 9), 16);
+}

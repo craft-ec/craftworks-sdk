@@ -44,11 +44,13 @@ pub(crate) struct Audit {
     pub to_get: VecDeque<Cid>,
     /// The page had no signer to ask `Held` (a reader's page): nothing was measured.
     pub unmeasured: bool,
+    /// When the pass began (the page's clock, ms).
+    pub started_at: u64,
 }
 
 impl Audit {
     pub fn new(root: Cid) -> Audit {
-        Audit { root, next: None, walked: false, walk_req: None, reqs: 0, groups: Vec::new(), seen: BTreeMap::new(), to_hold: VecDeque::new(), to_get: VecDeque::new(), unmeasured: false }
+        Audit { root, next: None, walked: false, walk_req: None, reqs: 0, groups: Vec::new(), seen: BTreeMap::new(), to_hold: VecDeque::new(), to_get: VecDeque::new(), unmeasured: false, started_at: 0 }
     }
 
     /// A group to measure: joined, each of its blocks queued to be asked once -- except one the node REJECTED
@@ -76,15 +78,35 @@ impl Audit {
         self.walk_req = None;
     }
 
-    /// The report, from what was seen.
-    pub fn report(&self) -> Report {
-        let mut r = Report { root: self.root, measured: !self.unmeasured, groups: self.groups.len(), whole: 0, degraded: 0, damaged: Vec::new(), pending: 0, rejected: Vec::new() };
+    /// Progress: (blocks asked so far, blocks the walk has reached). `of` grows while the walk runs.
+    pub fn progress(&self) -> (usize, usize) {
+        let of = self.seen.len() + self.to_hold.len();
+        (self.seen.len() + self.to_get.len(), of)
+    }
+
+    /// The report, from what was seen, as of `now` (the page's clock).
+    pub fn report(&self, now: u64) -> Report {
+        let mut r = Report {
+            root: self.root,
+            measured: !self.unmeasured,
+            health: Health::Unmeasured,
+            groups: self.groups.len(),
+            whole: 0,
+            degraded: 0,
+            damaged: Vec::new(),
+            margins: BTreeMap::new(),
+            pending: 0,
+            rejected: Vec::new(),
+            started_at: self.started_at,
+            finished_at: now,
+        };
         if self.unmeasured {
             return r;
         }
         for (members, parity) in &self.groups {
             let have = members.iter().chain(parity.iter()).filter(|id| matches!(self.seen.get(*id), Some(Seen::Held | Seen::Fetched))).count() as i64;
             let margin = have - members.len() as i64;
+            *r.margins.entry(margin).or_default() += 1;
             if margin >= parity.len() as i64 {
                 r.whole += 1;
             } else if margin >= 0 {
@@ -95,13 +117,40 @@ impl Audit {
         }
         r.pending = self.seen.values().filter(|s| **s == Seen::Pending).count();
         r.rejected = self.seen.iter().filter(|(_, s)| **s == Seen::Rejected).map(|(id, _)| *id).collect();
+        r.health = if !r.damaged.is_empty() {
+            Health::Damaged
+        } else if r.degraded > 0 {
+            Health::Degraded
+        } else {
+            Health::Whole
+        };
         r
     }
+}
+
+/// An asset's health in ONE word, derived here and nowhere else (the Assets tab shows it; KEEPER §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// No signer to ask: nothing measured (never all-absent).
+    Unmeasured,
+    /// A group below k.
+    Damaged,
+    /// Every group at or above k, one below k + m.
+    Degraded,
+    /// Every group whole.
+    Whole,
 }
 
 /// A pass's result (KEEPER §5's report, measured part): groups by health, the damaged named, blocks pending.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
+    /// The asset's health word (see [`Health`]).
+    pub health: Health,
+    /// How many groups have each margin (blocks to spare): what a `warn_below` is judged against.
+    pub margins: BTreeMap<i64, usize>,
+    /// When the pass began and ended (the page's clock, ms).
+    pub started_at: u64,
+    pub finished_at: u64,
     /// The root the pass measured (the page's published root when it began).
     pub root: Cid,
     /// `false`: the page had no signer to ask (a reader's page) -- the asset is UNMEASURED, and its counts say

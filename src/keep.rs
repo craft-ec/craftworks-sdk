@@ -96,3 +96,9 @@ pub fn decode(v: &[u8]) -> Option<Keep> {
         health: Health { groups: u32_at(11), whole: u32_at(15), degraded: u32_at(19), damaged: u32_at(23) },
     })
 }
+
+/// How many groups are below `warn_below` blocks to spare (KEEPER §3: warn once any group's margin is below N), from a
+/// pass's `margins` (margin -> groups). The one place the warning is derived; 0 = no warning.
+pub fn warning(margins: &std::collections::BTreeMap<i64, usize>, warn_below: u8) -> usize {
+    margins.range(..i64::from(warn_below)).map(|(_, n)| *n).sum()
+}

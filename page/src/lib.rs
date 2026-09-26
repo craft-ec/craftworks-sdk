@@ -2040,13 +2040,20 @@ impl Page {
     /// the ops leave ([`Page::take_ops`]), ONE audit op at a time, and its report is [`Page::take_audit`]'s. A pass
     /// already running is replaced.
     pub fn audit(&mut self) {
-        self.audit = Some(audit::Audit::new(self.published().1));
+        let mut a = audit::Audit::new(self.published().1);
+        a.started_at = self.now;
+        self.audit = Some(a);
         self.audit_report = None;
     }
 
     /// A finished pass's report, once.
     pub fn take_audit(&mut self) -> Option<audit::Report> {
         self.audit_report.take()
+    }
+
+    /// A pass in progress: (blocks asked so far, blocks the walk has reached), or `None` when none runs.
+    pub fn audit_progress(&self) -> Option<(usize, usize)> {
+        self.audit.as_ref().map(audit::Audit::progress)
     }
 
     /// The pass's next op, if none is in flight (KEEPER §7): the walk's next page, a Held batch, or one GET -- each
@@ -2085,7 +2092,7 @@ impl Page {
             return;
         }
         let a = self.audit.take().expect("checked");
-        self.audit_report = Some(a.report());
+        self.audit_report = Some(a.report(self.now));
     }
 
     /// The walk's page arrived (its read, `ClientId::BACKGROUND`).

@@ -1843,6 +1843,9 @@ fn a_whole_tree_audits_whole_one_op_at_a_time() {
     assert_eq!((r.whole, r.degraded, r.damaged.len(), r.pending), (r.groups, 0, 0, 0), "a whole tree did not audit whole");
     assert_eq!(r.root, node.head().expect("a head").1, "the pass did not measure the published root");
     assert!(most <= 1, "{most} audit ops were in flight at once (KEEPER §7: one)");
+    assert_eq!(r.health, page::audit::Health::Whole);
+    assert_eq!(r.margins.values().sum::<usize>(), r.groups, "the margins do not account for every group");
+    assert!(r.finished_at >= r.started_at);
 }
 
 /// **Health per group, from its margin** (KEEPER §4.3): members removed from the node's store are absent (Held says
@@ -1863,8 +1866,16 @@ fn a_groups_health_is_its_margin() {
         let r = b.take_audit().expect("the pass did not end");
         println!("{removed} removed: {} groups, {} whole, {} degraded, {} damaged", r.groups, r.whole, r.degraded, r.damaged.len());
         match want {
-            "degraded" => assert_eq!((r.degraded, r.damaged.len()), (1, 0), "3 of 38 missing is not degraded"),
-            _ => assert_eq!((r.degraded, r.damaged.len()), (0, 1), "9 of 38 missing (below k) is not damaged"),
+            "degraded" => {
+                assert_eq!((r.degraded, r.damaged.len()), (1, 0), "3 of 38 missing is not degraded");
+                assert_eq!(r.health, page::audit::Health::Degraded);
+                assert_eq!(r.margins.get(&5), Some(&1), "the degraded group's margin is not 8 - 3");
+            }
+            _ => {
+                assert_eq!((r.degraded, r.damaged.len()), (0, 1), "9 of 38 missing (below k) is not damaged");
+                assert_eq!(r.health, page::audit::Health::Damaged);
+                assert_eq!(r.margins.get(&-1), Some(&1), "the damaged group's margin is not 8 - 9");
+            }
         }
         assert_eq!(r.whole, r.groups - 1, "another group's health moved");
     }
@@ -1921,6 +1932,8 @@ fn a_page_with_no_signer_reports_its_asset_unmeasured() {
     println!("unmeasured: measured {}, groups {}, damaged {:?}, GETs after the first Held {gets_after}", r.measured, r.groups, r.damaged);
     assert!(asked_held, "THE SETUP: the audit asked no Held");
     assert!(!r.measured, "an asset the page could not ask about was reported measured");
+    assert_eq!(r.health, page::audit::Health::Unmeasured);
+    assert!(r.margins.is_empty(), "an unmeasured asset has margins");
     assert_eq!((gets_after, r.whole, r.degraded, r.damaged.len()), (0, 0, 0, 0), "an unmeasured asset was GET or counted");
 }
 
