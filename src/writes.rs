@@ -87,7 +87,8 @@ pub struct Writes {
     pub refused: Vec<(u64, Refused)>,
     /// `QueueFull` fates that reached `on_fate` for a still-OPEN write (sdk#450): the door's verdict arriving after
     /// the door, which `hand_over` rules out. Loud in debug; in release ignored and COUNTED here, never a panic (a
-    /// panic is a dead wasm page).
+    /// panic is a dead wasm page). TEMPORARY: outside the recording spine until the recorder reaches Writes
+    /// (sdk#457), when this becomes a recorded diagnostic and the field is deleted.
     pub late_door_verdicts: u64,
     conflicts: Vec<Conflicted>,
     unread: Vec<Unread>,
