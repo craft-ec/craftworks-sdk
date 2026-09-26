@@ -2041,7 +2041,7 @@ impl Page {
     }
 
     /// START an audit pass over THIS page's tree at its published root (KEEPER §4, §5): the asset is the tree the page
-    /// stands on (a kept asset is audited on its own `tree()` reader's page), repaired by `repair`. It runs as the ops
+    /// stands on (a kept TREE asset on its own `tree()` reader's page; an app's or the SDK's PIECES need the pieces audit, KEEPER §2, not built), repaired by `repair`. It runs as the ops
     /// leave ([`Page::take_ops`]), ONE audit op at a time, and its report is [`Page::take_audit`]'s. A pass already
     /// running is replaced (its waits WITHDRAWN). `signer`: can this page ask `Held` (page-io's `has_signer`, fixed when
     /// the PageIo is built)? Without one the pass is over at once, UNMEASURED, with no op at all (KEEPER §5 ¹⁰).
