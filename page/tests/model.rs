@@ -1201,22 +1201,19 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
     assert!(total.landings > 0, "no page ever landed a signer's record: the cell is unexercised");
 }
 
-/// LANDING UNDER LOSS: UPDATEs lost three times as often. At least one
-/// landing's UPDATE is lost twice and re-sent, and everything still publishes
-/// with every invariant (main's condition 2).
+/// LANDING UNDER LOSS: UPDATEs lost three times as often, at random. Everything still publishes with every
+/// invariant, and a landing happens. The twice-lost UPDATE is the forced case above, by construction (sdk#425):
+/// a seed reaching it was schedule luck, which a change to the op sequence moved (sdk#424). See
+/// `a_stale_pages_landing_whose_update_is_lost_twice_still_lands`.
 #[test]
 fn a_landing_whose_update_is_lost_twice_still_lands() {
     let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
     let mut most = 0;
     let mut landings = 0;
-    // 5/2 of the seeds (100 at the full count): race put signs a head as soon as its groups are recoverable, so
-    // heads land sooner and a twice-lost UPDATE is rarer per seed (20 seeds reached at most 2); and sdk#416's Held
-    // asks shift which schedule loses one (the same 14 landings in 60 seeds; the most UPDATEs 2 by seed 80, 3 at
-    // seed 83). The coverage floor below is unchanged; a small count runs on until it is reached. It is schedule
-    // luck all the same: a scripted double loss would force it.
-    let (min, cap) = seed_range(5, 2);
+    // 1/2 of the seeds: the random run only has to reach A landing (the twice-lost UPDATE is forced, sdk#425).
+    let (min, cap) = seed_range(1, 2);
     let mut seed = 0;
-    while seed < min || (seed < cap && (most < 3 || landings == 0)) {
+    while seed < min || (seed < cap && landings == 0) {
         seed += 1;
         let s = run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write published");
@@ -1225,7 +1222,6 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
     }
     println!("harsh: {seed} seeds, {landings} landings, most UPDATEs one landing needed: {most}");
     assert!(landings > 0, "nothing landed");
-    assert!(most >= 3, "no landing's UPDATE was lost twice (most: {most})");
 }
 
 /// TWO DEVICES OF ONE IDENTITY (sdk#225): two signers, one key, one
@@ -1413,69 +1409,60 @@ fn on_the_wrapper_path_a_put_is_confirmed_by_held_and_the_invariants_hold() {
     assert_eq!(published, min as usize * 2 * WRITES);
 }
 
-/// THE LAND CELL, where it is needed: page A signs its commit, its UPDATE
-/// never lands, and A is GONE. Page B is stale (it never saw A's first head),
-/// so the signer answers it NotNext naming A's unlanded record. The register is
-/// one behind, so B LANDS A's record itself (asking from the register's head
-/// with next = register + 1: `AlreadySigned`), adopts it once the register
-/// shows it, and B's own write — told Lost by that rebase — publishes on top.
-#[test]
-fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
-    let (mut node, _) = Node::new();
-    let mut a = Page::new(Params::default(), PutPath::Page);
-    let mut b = Page::new(Params::default(), PutPath::Page);
-    let mut now = 1_000u64;
-    // Serve every op of `p`, dropping UPDATEs when `drop_updates`.
-    fn serve(p: &mut Page, node: &mut Node, now: &mut u64, drop_updates: bool) {
-        for _ in 0..400 {
-            let ops = p.take_ops();
-            if ops.is_empty() {
-                if !p.waiting() {
-                    return;
-                }
-                *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
-                p.tick(Ms(*now));
-                continue;
+/// Serve every op of `p` until it idles, LOSING the next `drop_updates` UPDATEs (each unanswered, not applied).
+fn serve(p: &mut Page, node: &mut Node, now: &mut u64, drop_updates: &mut u32) {
+    for _ in 0..400 {
+        let ops = p.take_ops();
+        if ops.is_empty() {
+            if !p.waiting() {
+                return;
             }
-            for op in ops {
-                let ans = match op {
-                    Op::Put { id, bytes } => {
-                        node.put(id, &bytes);
-                        Some(Answer::PutOk(id))
-                    }
-                    Op::Get { id } => Some(match node.blocks.get(&id) {
-                        Some(b) => Answer::Got { id, bytes: b.clone() },
-                        None => Answer::GetMissed(id),
-                    }),
-                    Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
-                        let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
-                        Some(Answer::Signer { id, answer })
-                    }
-                    Op::Update { state, .. } => {
-                        if drop_updates {
-                            None
-                        } else {
-                            node.update(&state);
-                            Some(Answer::Updated { label: page::Label::Head })
-                        }
-                    }
-                    Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
-                    Op::AskHeld { id } => Some(Answer::Held { id, present: node.blocks.contains_key(&id) }),
-                    Op::PutApp { key } => Some(Answer::AppPutOk(key)),
-                    Op::Ext(_) => None,
-                };
-                if let Some(ans) = ans {
-                    p.answer(ans, Ms(*now));
+            *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
+            p.tick(Ms(*now));
+            continue;
+        }
+        for op in ops {
+            let ans = match op {
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    Some(Answer::PutOk(id))
                 }
+                Op::Get { id } => Some(match node.blocks.get(&id) {
+                    Some(b) => Answer::Got { id, bytes: b.clone() },
+                    None => Answer::GetMissed(id),
+                }),
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                    let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                    Some(Answer::Signer { id, answer })
+                }
+                Op::Update { state, .. } => {
+                    if *drop_updates > 0 {
+                        *drop_updates -= 1;
+                        None
+                    } else {
+                        node.update(&state);
+                        Some(Answer::Updated { label: page::Label::Head })
+                    }
+                }
+                Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
+                Op::AskHeld { id } => Some(Answer::Held { id, present: node.blocks.contains_key(&id) }),
+                Op::PutApp { key } => Some(Answer::AppPutOk(key)),
+                Op::Ext(_) => None,
+            };
+            if let Some(ans) = ans {
+                p.answer(ans, Ms(*now));
             }
         }
     }
-    // Both start on the empty tree.
-    serve(&mut a, &mut node, &mut now, false);
-    serve(&mut b, &mut node, &mut now, false);
+}
+
+/// Page A publishes seq 1, then SIGNS its second commit (the signer's record is seq 2), its UPDATE never lands,
+/// and A is GONE: the register one behind the record, for a stale page to land (the LAND cell).
+fn a_gone_with_its_record_unlanded(mut a: Page, node: &mut Node, now: &mut u64) {
+    let (node, now) = (node, now);
     // A publishes seq 1.
     a.write(ClientId(1), WriteId(1), vec![(b"a1".to_vec(), WriteOp::Put(b"x".to_vec()))]);
-    serve(&mut a, &mut node, &mut now, false);
+    serve(&mut a, node, now, &mut 0);
     assert_eq!(node.head().map(|h| h.0), Some(1));
     // A's second commit is SIGNED (record seq 2), its UPDATE never lands, and A is gone.
     a.write(ClientId(1), WriteId(2), vec![(b"a2".to_vec(), WriteOp::Put(b"y".to_vec()))]);
@@ -1494,22 +1481,71 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
                 _ => None,
             };
             if let Some(ans) = ans {
-                a.answer(ans, Ms(now));
+                a.answer(ans, Ms(*now));
             }
         }
     }
     let rec: signer::Record = bincode::deserialize(node.secrets[0].get(signer::RECORD).expect("a record")).expect("decodes");
     assert_eq!((rec.next.seq, node.head().map(|h| h.0)), (2, Some(1)), "the record is not one ahead of the register");
     drop(a);
+}
+
+/// THE LAND CELL, where it is needed: page A signs its commit, its UPDATE
+/// never lands, and A is GONE. Page B is stale (it never saw A's first head),
+/// so the signer answers it NotNext naming A's unlanded record. The register is
+/// one behind, so B LANDS A's record itself (asking from the register's head
+/// with next = register + 1: `AlreadySigned`), adopts it once the register
+/// shows it, and B's own write — told Lost by that rebase — publishes on top.
+#[test]
+fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(Params::default(), PutPath::Page);
+    let mut b = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000u64;
+    // Both start on the empty tree.
+    serve(&mut a, &mut node, &mut now, &mut 0);
+    serve(&mut b, &mut node, &mut now, &mut 0);
+    a_gone_with_its_record_unlanded(a, &mut node, &mut now);
     // B, stale at seq 0, writes: NotNext names record 2; B lands it.
     b.write(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
-    serve(&mut b, &mut node, &mut now, false);
+    serve(&mut b, &mut node, &mut now, &mut 0);
     let lost = b.take_notices().iter().any(|(_, w, s)| w.0 == 1 && *s == State::Lost);
     assert!(lost, "B's write was not told Lost by the rebase onto the landed record");
     assert!(b.landings().0 > 0, "B never landed the record");
     assert_eq!(node.head().map(|h| h.0), Some(2), "A's record was never landed");
     b.write(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
-    serve(&mut b, &mut node, &mut now, false);
+    serve(&mut b, &mut node, &mut now, &mut 0);
+    let (_, root) = node.head().expect("a head");
+    let tree = node.tree(&root).expect("whole");
+    for (k, v) in [(&b"a1"[..], &b"x"[..]), (b"a2", b"y"), (b"b1", b"z")] {
+        assert_eq!(tree.get(k).map(Vec::as_slice), Some(v), "{:?} missing from the final tree", String::from_utf8_lossy(k));
+    }
+    assert!(b.unusable().is_empty(), "{:?}", b.unusable());
+}
+
+/// A LANDING WHOSE UPDATE IS LOST TWICE, BY CONSTRUCTION (sdk#425; main's condition 2): the LAND cell above, with
+/// B's first TWO landing UPDATEs lost. B re-sends, the third lands A's record, and B's own write publishes on top.
+/// No seed: the random run's twice-lost floor was schedule luck (sdk#424).
+#[test]
+fn a_stale_pages_landing_whose_update_is_lost_twice_still_lands() {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(Params::default(), PutPath::Page);
+    let mut b = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000u64;
+    serve(&mut a, &mut node, &mut now, &mut 0);
+    serve(&mut b, &mut node, &mut now, &mut 0);
+    a_gone_with_its_record_unlanded(a, &mut node, &mut now);
+    b.write(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    let mut lose = 2u32;
+    serve(&mut b, &mut node, &mut now, &mut lose);
+    assert_eq!(lose, 0, "B did not re-send its landing's UPDATE after losing it: {} of the 2 losses were used", 2 - lose);
+    let (landings, most) = b.landings();
+    println!("B: {landings} landing(s), most UPDATEs one landing needed: {most}");
+    assert_eq!(landings, 1, "B did not land A's record exactly once");
+    assert!(most >= 3, "the landing's UPDATE was not lost twice and re-sent (most: {most})");
+    assert_eq!(node.head().map(|h| h.0), Some(2), "A's record was never landed");
+    b.write(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    serve(&mut b, &mut node, &mut now, &mut 0);
     let (_, root) = node.head().expect("a head");
     let tree = node.tree(&root).expect("whole");
     for (k, v) in [(&b"a1"[..], &b"x"[..]), (b"a2", b"y"), (b"b1", b"z")] {
