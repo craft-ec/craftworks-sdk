@@ -326,6 +326,7 @@ pub fn record_name(label: &Label) -> Vec<u8> {
     match label {
         Label::Head => RECORD.to_vec(),
         Label::Site { app, .. } => [RECORD, b"/site:", app.as_bytes()].concat(),
+        Label::Obs => [RECORD, b"/obs"].concat(),
     }
 }
 
@@ -346,6 +347,12 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next, label: Label, origin: Ori
             None => return Answer::Refused(Why::BadLabel),
         },
         (Label::Site { .. }, None) => None,
+        // The observation tree's head: the same authority under the name `obs` (sdk#399).
+        (Label::Obs, Some(p)) => match contract_keys::site::obs_params(p) {
+            Some(op) => Some(op),
+            None => return Answer::Refused(Why::BadLabel),
+        },
+        (Label::Obs, None) => None,
     };
     // FAIL CLOSED: a record that is there and does not decode is not "no record" -- read as none, any seq could be
     // signed again from a prev already signed from (sdk#332's review).
@@ -357,7 +364,8 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next, label: Label, origin: Ori
         },
     };
     let head_read = match &label {
-        Label::Head => match (&prov, &params) {
+        // The observation tree's head is read exactly as the data head, from ITS register (sdk#399).
+        Label::Head | Label::Obs => match (&prov, &params) {
             (Some(pv), Some(p)) => host
                 .contract_state(&contract_keys::instance(&pv.register_code_hash, p))
                 // TOLERANT (signer_proto::head): the root is the value's first 32
@@ -381,7 +389,8 @@ fn sign<H: Host>(host: &mut H, prev: Head, next: Next, label: Label, origin: Ori
     // entry.rs::block_state names a block), not merely be present. A HEAD fact: a site's value is blake3(web), and
     // no block holds it.
     let root_held = match &label {
-        Label::Head => prov.as_ref().is_some_and(|p| {
+        // The observation tree is a prolly tree like the data's: its root is a block too.
+        Label::Head | Label::Obs => prov.as_ref().is_some_and(|p| {
             host.contract_state(&contract_keys::block::contract_deriver_of_hash(p.block_code_hash)(&next.root))
                 .is_some_and(|s| matches!(s.split_first(), Some((&k, body)) if freenet_prolly::block_id(k, body) == next.root))
         }),
