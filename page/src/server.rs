@@ -88,7 +88,10 @@ pub struct Server {
     tracing_of: Option<protocol::TraceOf>,
     out: Vec<Vec<u8>>,
     /// sdk#225b: each write handed to the engine, by (client, write id), as the
-    /// FINAL value it leaves at each key (`None`: deleted), until it ends.
+    /// FINAL value it leaves at each key (`None`: deleted), until it ends --
+    /// refused at the door (`QueueFull`) included: that write id is over, and
+    /// the SDK makes the write again as a new one (sdk#450: 75k refusals held
+    /// 96 MB here).
     sent: BTreeMap<WriteKey, Sent>,
     /// The writes of this page's LATEST Published commit and the head it was
     /// built on: what a same-identity displacement can take (only the tip can
@@ -256,6 +259,12 @@ impl Server {
     /// How many `Busy` verdicts this server has told (see the field).
     pub fn busy_told(&self) -> u64 {
         self.busy_told.get()
+    }
+
+    /// Writes whose final values this server holds (`sent`, sdk#225b): each
+    /// until its write ends -- any terminal fate, `QueueFull` included.
+    pub fn writes_held(&self) -> usize {
+        self.sent.len()
     }
 
     /// Merge writes that published (see the field).
@@ -523,7 +532,7 @@ impl Server {
                             }
                         }
                     }
-                    State::Failed | State::Lost | State::Conflict | State::Unread | State::TooLarge { .. } | State::Unknown => {
+                    State::Failed | State::Lost | State::Conflict | State::Unread | State::TooLarge { .. } | State::Unknown | State::QueueFull { .. } => {
                         self.sent.remove(&id);
                     }
                     _ => {}
