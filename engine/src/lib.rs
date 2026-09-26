@@ -82,6 +82,8 @@ pub mod repair;
 pub mod subs;
 mod wanted;
 use wanted::{Reader, Wanted};
+mod commit;
+use commit::{CommitLife, End};
 
 /// Which client a write came from. Two tabs are two clients.
 #[derive(
@@ -1100,8 +1102,9 @@ struct Queued {
     /// or an earlier write is still applying: arrival order is apply order).
     /// `Some(r)`: QUEUED — the warm root just after it was applied.
     warm_after: Option<Cid>,
-    /// The commit in flight carries it (the front of the queue, its cut).
-    committing: bool,
+    /// Already told `Stalled` (once per stay; reset when it joins a cut). It leaves with the write (COMMIT-LIFE C4,
+    /// A5): no engine-level set to forget to clear.
+    stalled_told: bool,
     /// Its place in arrival order, numbered by this engine (K9): what a head's
     /// ledger records as this page's `through`, the witness that a group
     /// landed.
@@ -1113,8 +1116,9 @@ struct Queued {
 impl Queued {
     /// UNSAVED: taken and not yet published, except a DEFERRED write no cut
     /// has taken (sdk#350) -- THE one statement of it.
-    fn is_unsaved(&self) -> bool {
-        !(self.deferred && !self.committing)
+    /// `committing`: the commit in flight carries it ([`Engine::carries`]).
+    fn is_unsaved(&self, committing: bool) -> bool {
+        !(self.deferred && !committing)
     }
 }
 
@@ -1202,7 +1206,6 @@ struct Commit {
     confirmed: BTreeSet<Cid>,
     /// The writes folded into it, in arrival order.
     writes: Vec<(ClientId, WriteId)>,
-    head_sent: bool,
     /// Bytes of the accepted-but-not-durable writes, for the backlog bound.
     bytes: usize,
     /// The root the commit's ops were applied to: the published root when it
@@ -1334,6 +1337,13 @@ impl Race {
             })
     }
 
+    /// Can every changed group still reach k, and every must-have block land, with `rejected` never on the network?
+    /// (COMMIT-LIFE Heading x E4: a group fallen below k can never be recoverable.)
+    fn reachable(&self, rejected: &BTreeSet<Cid>) -> bool {
+        self.must.is_disjoint(rejected)
+            && self.groups.iter().all(|g| g.others.len() + g.earlier.len() + g.new.iter().filter(|c| !rejected.contains(*c)).count() >= g.k)
+    }
+
     /// Every changed group's other members (`RaceGroup::others`), each once.
     fn others(&self) -> BTreeSet<Cid> {
         self.groups.iter().flat_map(|g| g.others.iter().copied()).collect()
@@ -1342,6 +1352,17 @@ impl Race {
 }
 
 impl Commit {
+    /// THE ONE "still owed" (COMMIT-LIFE C4, A4): this commit's blocks not yet confirmed. A rejected one stays owed
+    /// (never BACKED_UP) and is never put again: the callers that put filter `rejected`.
+    fn owed(&self) -> impl Iterator<Item = &Cid> + '_ {
+        self.data.difference(&self.confirmed)
+    }
+
+    /// Is `id` one of [`Commit::owed`]?
+    fn owes(&self, id: &Cid) -> bool {
+        self.data.contains(id) && !self.confirmed.contains(id)
+    }
+
     /// What the page holds the head for (`UpdateHead::after`): the blocks the
     /// engine COUNTED when it judged the head ready -- this commit's acked
     /// blocks -- and nothing else. Handing the page every data block instead
@@ -1434,9 +1455,6 @@ pub struct Engine<B: Blocks> {
     /// Blocks handed to this engine during the CURRENT call, and dropped when
     /// it ends (sdk#34). Never in the context — see [`WithEmptyLeaf::arrived`].
     arrived: BTreeMap<Cid, Vec<u8>>,
-    /// Published commits whose blocks are still being put (§P): BACKED_UP
-    /// when a commit's `remaining` is empty.
-    backing: Vec<Backing>,
     /// Blocks the node's Block contract rejected (`Event::PutRejected`, sdk#433): never put again.
     rejected: BTreeSet<Cid>,
     /// Re-puts that found the block's bytes GONE from the store (sdk#411): a commit or a straggler that can never be
@@ -1448,11 +1466,6 @@ pub struct Engine<B: Blocks> {
     /// it (then the node holds it) and all of it is forgotten at the end of a step with no write in flight.
     kept: BTreeMap<Cid, usize>,
     kept_bytes: usize,
-    /// Writes whose group a later root move RE-CODED (COMMIT-LIFE §P,
-    /// superseded stragglers): their data now lives in the newer version of
-    /// the group, so they wait for the NEXT own commit's `Backing`, which
-    /// takes them. Never BACKED_UP while here.
-    carry: BTreeSet<(ClientId, WriteId)>,
     /// Blocks being REBUILT from their groups, by the block's id (`repair`).
     repairs: BTreeMap<Cid, Repair>,
     /// WHO WANTS each block (WANTED-LIFE): the parked reads, the repair slots and the parked write's needs, in one type
@@ -1487,14 +1500,9 @@ pub struct Engine<B: Blocks> {
     published_seq: u64,
     published_root: Cid,
     next_seq: u64,
-    /// The commit in flight. One at a time: a second head bump before the
-    /// first is confirmed is a fork of a single-writer tree.
-    pending: Option<Commit>,
-    /// Writes that arrived during a commit. They are already applied to the
-    /// warm tree — folding is about which COMMIT carries them, not about
-    /// whether they took effect.
-    folded: Vec<(ClientId, WriteId)>,
-    folded_bytes: usize,
+    /// THE COMMIT'S LIFE (COMMIT-LIFE rev 5): the one commit in flight, as one stage, and the published commits
+    /// still putting toward BACKED_UP. Its transitions are its only mutators ([`commit`]).
+    life: CommitLife,
     /// Whether every group of the published tree is known recoverable
     /// (sdk#119): an engine that tracked the tree from empty, through its own
     /// race-put commits (§P). Not carried in the context.
@@ -1510,16 +1518,6 @@ pub struct Engine<B: Blocks> {
     /// a queue of parked writes would put an unbounded number of client values
     /// in a 400 KiB context.
     parked_write: Option<ParkedWrite>,
-    /// When the commit now in flight was started.
-    ///
-    /// It used to be "when the oldest write not yet in a commit was
-    /// accepted", back when writes folded behind an open commit. Under one
-    /// commit at a time nothing waits outside a commit — a write arriving
-    /// behind one is refused — so the write left sitting `Accepted` is the
-    /// in-flight commit's own, and this is the clock for it.
-    in_flight_since: Option<u64>,
-    /// Writes already told they are stalled, so the notice is sent once.
-    told_stalled: BTreeSet<(ClientId, WriteId)>,
     /// Where this engine's authority came from, as STATED at `Start`.
     key: Option<KeySource>,
     /// Epochs still to try when looking for this device's head.
@@ -1705,12 +1703,10 @@ impl<B: Blocks> Engine<B> {
             empty,
             blocks,
             arrived: BTreeMap::new(),
-            backing: Vec::new(),
             rejected: BTreeSet::new(),
             reput_missing: 0,
             kept: BTreeMap::new(),
             kept_bytes: 0,
-            carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
             wanted: Wanted::default(),
             dropped: BTreeSet::new(),
@@ -1723,15 +1719,11 @@ impl<B: Blocks> Engine<B> {
             published_seq: 0,
             published_root: root,
             next_seq: 1,
-            pending: None,
-            folded: Vec::new(),
-            folded_bytes: 0,
+            life: CommitLife::default(),
             parity_scan: ParityScan::NotScanned,
             asks: asks::Asks::default(),
             shed: Shed::default(),
-            in_flight_since: None,
             parked_write: None,
-            told_stalled: BTreeSet::new(),
             key: None,
             epochs: Vec::new(),
             head_epoch: None,
@@ -1816,7 +1808,7 @@ impl<B: Blocks> Engine<B> {
     /// no commit has taken is nothing the person made; it is unsaved only
     /// once a cut carries it).
     pub fn unsaved_writes(&self) -> usize {
-        self.queue.iter().filter(|q| q.is_unsaved()).count()
+        self.queue.iter().filter(|q| q.is_unsaved(self.carries(q))).count()
     }
 
     /// The client of every UNSAVED write ([`Engine::unsaved_writes`]'s rule,
@@ -1824,7 +1816,7 @@ impl<B: Blocks> Engine<B> {
     /// unsaved-changes guard and "saving N…" -- so a held define never makes
     /// a viewer's close say "unsaved changes" (sdk#350).
     pub fn unsaved_clients(&self) -> impl Iterator<Item = ClientId> + '_ {
-        self.queue.iter().filter(|q| q.is_unsaved()).map(|q| q.client)
+        self.queue.iter().filter(|q| q.is_unsaved(self.carries(q))).map(|q| q.client)
     }
 
     /// May a commit be cut (sdk#350)? Only with a NON-deferred write applied
@@ -1839,7 +1831,7 @@ impl<B: Blocks> Engine<B> {
     /// Every write in the queue, in order, with its stage (R-b).
     pub fn queue_stages(&self) -> impl Iterator<Item = (ClientId, WriteId, Stage)> + '_ {
         self.queue.iter().map(|q| {
-            let stage = match (q.warm_after, q.committing) {
+            let stage = match (q.warm_after, self.carries(q)) {
                 (None, _) => Stage::Applying,
                 (Some(_), false) => Stage::Queued,
                 (Some(_), true) => Stage::Committing,
@@ -1891,17 +1883,13 @@ impl<B: Blocks> Engine<B> {
 
     /// THE COMMIT'S STAGE (COMMIT-LIFE rev 5, C1): what the commit table's rows name, read by its model.
     pub fn commit_stage(&self) -> CommitStage {
-        match self.pending.as_ref() {
-            None => CommitStage::Idle,
-            Some(c) if c.head_sent => CommitStage::Heading,
-            Some(_) => CommitStage::Racing,
-        }
+        self.life.stage()
     }
 
     /// Writes recorded as already told `Stalled` (COMMIT-LIFE C4, A5): a write that has LEFT the queue must not be
     /// among them.
     pub fn stalled_told(&self) -> usize {
-        self.told_stalled.len()
+        self.queue.iter().filter(|q| q.stalled_told).count()
     }
 
     /// Own commits published and the queued writes they carried (K9).
@@ -1932,12 +1920,12 @@ impl<B: Blocks> Engine<B> {
 
     /// Published commits still putting blocks toward BACKED_UP (§P).
     pub fn backing(&self) -> usize {
-        self.backing.len()
+        self.life.backing_len()
     }
 
     /// Blocks published commits are still putting (not yet acked).
     fn unacked(&self) -> BTreeSet<Cid> {
-        self.backing.iter().flat_map(|b| b.remaining.iter().copied()).collect()
+        self.life.unacked()
     }
 
 
@@ -1975,7 +1963,7 @@ impl<B: Blocks> Engine<B> {
     /// reader of that head learns them. The commit in flight's, or a known
     /// root's; empty for a root this engine did not code or learn.
     pub fn root_parity_of(&self, root: &Cid) -> Vec<Cid> {
-        match &self.pending {
+        match self.life.commit() {
             Some(c) if c.root == *root => c.root_parity.clone(),
             _ => self.root_parity.get(root).cloned().unwrap_or_default(),
         }
@@ -1984,7 +1972,7 @@ impl<B: Blocks> Engine<B> {
     /// The last arrival number of the commit in flight: what its head's
     /// ledger records as this page's `through`.
     pub fn committing_through(&self) -> Option<u64> {
-        self.pending.as_ref().map(|c| c.through).filter(|t| *t > 0)
+        self.life.commit().map(|c| c.through).filter(|t| *t > 0)
     }
 
     /// HOLD THE QUEUE (review §1 on sdk#295): until [`Engine::merge_front`]
@@ -2015,7 +2003,7 @@ impl<B: Blocks> Engine<B> {
     /// apply order and the witness's `through` stays one number.
     pub fn merge_front(&mut self, client: ClientId, writes: Vec<MergeWrite>) -> Vec<Effect> {
         self.cut_held = false;
-        let at = self.queue.iter().take_while(|q| q.committing).count();
+        let at = self.queue.iter().take_while(|q| self.carries(q)).count();
         if at > 0 {
             // The hold was not in place when the cut was made.
             self.impossible_transitions += 1;
@@ -2025,7 +2013,7 @@ impl<B: Blocks> Engine<B> {
                 + reads.iter().map(|(k, _)| k.len() + 33).sum::<usize>();
             // Never deferred (sdk#350): a displaced group was cut, so it was
             // already in company, and it must land again on its own.
-            self.queue.insert(at + n, Queued { client, write_id, ops, reads, size, tries: 0, told_accepted: true, warm_after: None, committing: false, arrival: 0, deferred: false });
+            self.queue.insert(at + n, Queued { client, write_id, ops, reads, size, tries: 0, told_accepted: true, warm_after: None, stalled_told: false, arrival: 0, deferred: false });
         }
         for q in self.queue.iter_mut().skip(at) {
             q.arrival = self.next_arrival;
@@ -2043,7 +2031,17 @@ impl<B: Blocks> Engine<B> {
     /// list is compared against to tell an evicted entry from one never
     /// there (review §3 on sdk#295).
     pub fn committing_seq(&self) -> Option<u64> {
-        self.pending.as_ref().map(|c| c.seq)
+        self.life.commit().map(|c| c.seq)
+    }
+
+    /// Does the commit in flight carry `q`? DERIVED from its cut (COMMIT-LIFE C4, A3): no per-write flag to disagree.
+    fn carries(&self, q: &Queued) -> bool {
+        self.life.commit().is_some_and(|c| c.writes.contains(&(q.client, q.write_id)))
+    }
+
+    /// Writes recorded as told `Stalled` -- the state walk's form of the per-write flag.
+    fn stalled_told_writes(&self) -> BTreeSet<(ClientId, WriteId)> {
+        self.queue.iter().filter(|q| q.stalled_told).map(|q| (q.client, q.write_id)).collect()
     }
 
     /// Writes that fell `Lost` in the engine: `(forced, tries spent)`.
@@ -2055,7 +2053,7 @@ impl<B: Blocks> Engine<B> {
     /// commit's parity goes with it and nothing is owed, so what is left is
     /// the published commits still putting toward BACKED_UP.
     pub fn owed_groups(&self) -> usize {
-        self.backing.len()
+        self.life.backing_len()
     }
 
     /// Nodes parsed on the write path since the last [`Engine::reset_cost`].
@@ -2366,7 +2364,7 @@ impl<B: Blocks> Engine<B> {
         // its own head is the confirmation, an older one says its head never
         // landed, and anything newer is another writer's. Adopting whatever
         // came back would move the tree out from under the commit.
-        if let Some(c) = self.pending.as_ref() {
+        if let Some(c) = self.life.commit() {
             return if seq == c.seq && root == c.root {
                 self.on_head(seq)
             } else if seq < c.seq {
@@ -2392,7 +2390,7 @@ impl<B: Blocks> Engine<B> {
     /// they are exhausted is this a device that has never written.
     fn on_head_missing(&mut self) -> Vec<Effect> {
         // A commit in flight whose head is not there: it never landed.
-        if self.pending.is_some() {
+        if self.life.commit().is_some() {
             return self.head_not_landed();
         }
         if !self.epochs.is_empty() {
@@ -2425,22 +2423,19 @@ impl<B: Blocks> Engine<B> {
         // root: that head was displaced (another device of the same identity
         // won the Register's tie-break, sdk#225), so the commit is dead.
         let displaced = seq == self.published_seq() && root != self.published_root();
-        if self.pending.as_ref().is_some_and(|c| seq < c.seq) && !displaced {
+        if self.life.commit().is_some_and(|c| seq < c.seq) && !displaced {
             return self.head_not_landed();
         }
-        let dead = self.pending.take();
-        let group_through = dead.as_ref().map_or(0, |c| c.through);
-        let dead_writes: Vec<(ClientId, WriteId)> = dead.map(|c| c.writes).unwrap_or_default();
-        self.folded.clear();
-        self.folded_bytes = 0;
-        self.in_flight_since = None;
-        self.unpublished.clear();
-        let mut out = self.adopt(seq, root);
-        // A FOREIGN MOVE (R-b): the dead commit's write goes again at the
-        // front with a try spent (or falls `Lost`, named), and the whole queue
-        // is re-applied, in order, onto the head that won -- re-judged there.
-        out.extend(self.rederive_after_foreign_move(&dead_writes, group_through));
-        out
+        let witness = self.witness.take();
+        if self.life.commit().is_none() {
+            // Idle (COMMIT-LIFE Idle x E8): adopt, and the queue is re-derived on it.
+            self.unpublished.clear();
+            let mut out = self.adopt(seq, root);
+            out.extend(self.rederive_after_foreign_move(&[], 0, witness, true));
+            return out;
+        }
+        // A FOREIGN MOVE (R-b) ends the commit in flight: E8, one teardown.
+        self.end_commit(End::Dead { witness, head: Some((seq, root)) })
     }
 
     /// A client asking after a write this engine has never heard of.
@@ -2665,7 +2660,8 @@ impl<B: Blocks> Engine<B> {
     /// flight): the queue is re-derived on the root now published -- the
     /// writes that waited for recovery apply onto it, in arrival order.
     fn release_before_head_write(&mut self) -> Vec<Effect> {
-        self.rederive_after_foreign_move(&[], 0)
+        let witness = self.witness.take();
+        self.rederive_after_foreign_move(&[], 0, witness, true)
     }
 
     /// The head is recovered: answer every read that waited for it, in the
@@ -3100,7 +3096,7 @@ impl<B: Blocks> Engine<B> {
             tries,
             told_accepted: false,
             warm_after: None,
-            committing: false,
+            stalled_told: false,
             arrival: self.next_arrival,
             deferred,
         });
@@ -3171,7 +3167,6 @@ impl<B: Blocks> Engine<B> {
         if self.parked_write.as_ref().is_some_and(|p| (p.client, p.write_id) == (q.client, q.write_id)) {
             self.release_write();
         }
-        self.told_stalled.remove(&(q.client, q.write_id));
         self.cascade.push((q.client, q.write_id, Self::written_keys(&q.ops)));
         vec![Effect::Notify { client: q.client, write_id: q.write_id, state }]
     }
@@ -3288,7 +3283,7 @@ impl<B: Blocks> Engine<B> {
     /// ended without a commit (a no-op group is `Published` at once, #164),
     /// so the next may go.
     fn commit_front(&mut self) -> (Vec<Effect>, bool) {
-        if self.pending.is_some() || self.cut_held {
+        if self.life.commit().is_some() || self.cut_held {
             return (Vec::new(), false);
         }
         // A dead cut's writes can leave the queue while being re-applied (a
@@ -3303,10 +3298,6 @@ impl<B: Blocks> Engine<B> {
             .map(|q| (q.client, q.write_id))
             .collect();
         if cut.is_empty() {
-            return (Vec::new(), false);
-        }
-        if self.queue.iter().take(cut.len()).any(|q| q.committing) {
-            self.impossible_transitions += 1;
             return (Vec::new(), false);
         }
         if self.cut_until.is_none() {
@@ -3324,6 +3315,10 @@ impl<B: Blocks> Engine<B> {
         let mut last_warm = None;
         let mut through = 0u64;
         let mut cut_parity: Vec<(Cid, Vec<u8>)> = Vec::new();
+        // The cut's writes as they are taken, and their bytes: handed to `start_commit` (the old `folded` field held
+        // them for the length of this call only, COMMIT-LIFE A7).
+        let mut writes: Vec<(ClientId, WriteId)> = Vec::new();
+        let mut bytes = 0usize;
         for id in cut {
             // Its index now: every earlier write of the cut is either taken
             // (in front) or dropped (gone).
@@ -3384,11 +3379,10 @@ impl<B: Blocks> Engine<B> {
                 self.forced_writes += 1;
             }
             ops_all.extend(q.ops.iter().cloned());
-            self.folded.push((q.client, q.write_id));
-            self.folded_bytes += q.size;
+            writes.push((q.client, q.write_id));
+            bytes += q.size;
             through = through.max(q.arrival);
             last_warm = q.warm_after;
-            self.queue[idx].committing = true;
             taken += 1;
         }
         // A write whose path on the published root was evicted: it and every
@@ -3399,8 +3393,6 @@ impl<B: Blocks> Engine<B> {
             e.park_write(q.client, q.write_id, need)
         };
         if taken == 0 {
-            self.folded.clear();
-            self.folded_bytes = 0;
             self.root = base;
             if let Some(need) = stopped_cold {
                 out.extend(cold(self, need));
@@ -3412,8 +3404,6 @@ impl<B: Blocks> Engine<B> {
         }
         // A NO-OP GROUP (#164): the tree it asks for IS the published one.
         if self.root == base && self.unpublished.is_empty() {
-            let writes = std::mem::take(&mut self.folded);
-            self.folded_bytes = 0;
             self.noop_published += writes.len() as u64;
             // Nothing new was put: the tree it asks for is the published one,
             // so SAVED at once. BACKED_UP only when that tree IS: while a
@@ -3423,14 +3413,8 @@ impl<B: Blocks> Engine<B> {
             // race put.
             for w in &writes {
                 out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::Published });
-                if self.backing.is_empty() {
+                if !self.life.join_open(*w) {
                     out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
-                } else {
-                    for b in self.backing.iter_mut() {
-                        if !b.writes.contains(w) {
-                            b.writes.push(*w);
-                        }
-                    }
                 }
             }
             for _ in 0..taken {
@@ -3456,8 +3440,8 @@ impl<B: Blocks> Engine<B> {
         let listed: BTreeSet<Cid> = to_ship.iter().filter_map(|(_, b)| Node::parse(b).ok()).flat_map(|n| n.parity().collect::<Vec<_>>()).collect();
         let mut seen_parity = BTreeSet::new();
         let parity: Vec<(Cid, Vec<u8>)> = cut_parity.into_iter().filter(|(c, _)| listed.contains(c) && seen_parity.insert(*c)).collect();
-        out.extend(self.start_commit(to_ship, parity, Some(ops_all)));
-        if let Some(c) = self.pending.as_mut() {
+        out.extend(self.start_commit(to_ship, parity, Some(ops_all), writes, bytes));
+        if let Some(c) = self.life.commit_mut() {
             c.through = through;
         }
         if !dropped && stopped_cold.is_none() {
@@ -3505,7 +3489,6 @@ impl<B: Blocks> Engine<B> {
         }
         for q in self.queue.iter_mut().skip(from) {
             q.warm_after = None;
-            q.committing = false;
         }
         // A fetch for a write that is no longer the FIRST `Applying` one is
         // moot: that write re-parks when its turn comes.
@@ -3524,8 +3507,10 @@ impl<B: Blocks> Engine<B> {
     /// `Queued` again and re-applied first, one try spent each (go-back-N, in
     /// the engine, once); a write out of tries, or forced (`Expect::Any`),
     /// falls `Lost`, named, never re-applied (WRITE-PATH ⁷).
-    fn dead_front(&mut self, witness: Option<Witness>, group_through: u64) -> Vec<Effect> {
-        let n = self.queue.iter().take_while(|q| q.committing).count();
+    /// `dead` is the dead commit's cut; `spend` is false for a commit whose head never left (COMMIT-LIFE A8: a try
+    /// counts an attempt to PUBLISH), whose witness the caller does not pass.
+    fn dead_front(&mut self, witness: Option<Witness>, group_through: u64, dead: &[(ClientId, WriteId)], spend: bool) -> Vec<Effect> {
+        let n = self.queue.iter().take_while(|q| dead.contains(&(q.client, q.write_id))).count();
         if n == 0 {
             return Vec::new();
         }
@@ -3554,8 +3539,9 @@ impl<B: Blocks> Engine<B> {
         let mut i = 0;
         for _ in 0..n {
             let q = &mut self.queue[i];
-            q.committing = false;
-            q.tries += 1;
+            if spend {
+                q.tries += 1;
+            }
             let forced = q.reads.iter().any(|(_, e)| *e == Expect::Any);
             if !forced && q.tries <= self.params.max_write_tries {
                 i += 1;
@@ -3578,15 +3564,14 @@ impl<B: Blocks> Engine<B> {
     /// in the queue (a commit this engine did not queue -- restored from a
     /// context) cannot go again from here, so it is told `Lost`, as before
     /// the queue: its client still holds it.
-    fn rederive_after_foreign_move(&mut self, dead: &[(ClientId, WriteId)], group_through: u64) -> Vec<Effect> {
-        let witness = self.witness.take();
-        let queued: Vec<(ClientId, WriteId)> = self.queue.iter().take_while(|q| q.committing).map(|q| (q.client, q.write_id)).collect();
+    fn rederive_after_foreign_move(&mut self, dead: &[(ClientId, WriteId)], group_through: u64, witness: Option<Witness>, spend: bool) -> Vec<Effect> {
+        let queued: Vec<(ClientId, WriteId)> = self.queue.iter().take_while(|q| dead.contains(&(q.client, q.write_id))).map(|q| (q.client, q.write_id)).collect();
         let mut out: Vec<Effect> = dead
             .iter()
             .filter(|w| !queued.contains(w))
             .map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Lost })
             .collect();
-        out.extend(self.dead_front(witness, group_through));
+        out.extend(self.dead_front(witness, group_through, dead, spend));
         self.root = self.published_root;
         self.requeue_from(0);
         out.extend(self.advance());
@@ -3743,6 +3728,8 @@ impl<B: Blocks> Engine<B> {
         emitted: Vec<(Cid, Vec<u8>)>,
         parity: Vec<(Cid, Vec<u8>)>,
         ops: Option<Vec<(Vec<u8>, Op)>>,
+        writes: Vec<(ClientId, WriteId)>,
+        bytes: usize,
     ) -> Vec<Effect> {
         // THE ROOT IS A GROUP OF ONE (sdk#335): its parity is coded here, put
         // in the same round as everything else, counted by the race like any
@@ -3763,13 +3750,12 @@ impl<B: Blocks> Engine<B> {
             (parity, Vec::new())
         };
         let seq = self.next_seq;
-        let writes = std::mem::take(&mut self.folded);
-        let bytes = std::mem::take(&mut self.folded_bytes);
-        self.in_flight_since = Some(self.now);
         // In a commit now, so no longer stalled: if it stalls again later that
         // is a new fact and deserves a new notice.
-        for w in &writes {
-            self.told_stalled.remove(w);
+        for q in self.queue.iter_mut() {
+            if writes.contains(&(q.client, q.write_id)) {
+                q.stalled_told = false;
+            }
         }
 
         // PHASE 3 WRITES MEMBERS, NOT PACKS.
@@ -3875,14 +3861,13 @@ impl<B: Blocks> Engine<B> {
         }
 
         self.next_seq += 1;
-        self.pending = Some(Commit {
+        let commit = Commit {
             seq,
             root: self.root,
             data,
             packs: pack_bodies,
             confirmed: BTreeSet::new(),
             writes,
-            head_sent: false,
             bytes,
             base: self.published_root,
             ops: ops.filter(|o| {
@@ -3897,12 +3882,16 @@ impl<B: Blocks> Engine<B> {
             unknown: BTreeSet::new(),
             pack_members,
             root_parity,
-        });
+        };
+        // Idle -> Racing (E1). The cut is taken only in Idle (`commit_front`), so a refusal here is an impossible cell.
+        if !self.life.start(commit, self.now) {
+            self.impossible_transitions += 1;
+        }
         // SAVED NEEDS THE NODE'S WORD (sdk#416): every other member of a changed group is asked about. The page
         // answers at once for what it confirmed (`PutConfirmed`), and says `HeldUnknown` for the rest while it asks
         // the node -- each of those releases one more of its group's parity, so k stays reachable from this page's
         // own PUTs whatever the other page's block does.
-        let others = self.pending.as_ref().map(|c| c.race.others()).unwrap_or_default();
+        let others = self.life.commit().map(|c| c.race.others()).unwrap_or_default();
         out.extend(others.into_iter().map(|id| Effect::ConfirmHeld { id }));
         out
     }
@@ -3911,7 +3900,7 @@ impl<B: Blocks> Engine<B> {
     /// k until the node says it holds it, and ONE more of its group's parity goes now, from the parity held back
     /// for after the head (#378). Once per member.
     fn on_held_unknown(&mut self, id: Cid) -> Vec<Effect> {
-        let Some(c) = self.pending.as_mut() else { return Vec::new() };
+        let Some(c) = self.life.commit_mut() else { return Vec::new() };
         if c.held.contains(&id) || !c.unknown.insert(id) {
             return Vec::new();
         }
@@ -3938,7 +3927,8 @@ impl<B: Blocks> Engine<B> {
     ///      `max_settle_rounds`, the commit is `Lost` and the engine is
     ///      RELEASED -- the client still holds the ops, and re-sends.
     fn settle_by_fact(&mut self, now: u64) -> Vec<Effect> {
-        let Some(c) = self.pending.as_ref() else {
+        let heading = self.life.stage() == CommitStage::Heading;
+        let Some(c) = self.life.commit() else {
             return Vec::new();
         };
         let wait = self
@@ -3955,7 +3945,7 @@ impl<B: Blocks> Engine<B> {
         // Under race put (§P) that would count toward k.
         let mut out = Vec::new();
         let unacked = self.unacked();
-        let Some(c) = self.pending.as_mut() else {
+        let Some(c) = self.life.commit_mut() else {
             return out;
         };
         c.settle_at = now;
@@ -3966,13 +3956,12 @@ impl<B: Blocks> Engine<B> {
         // on_rejected ends the commit only before the head; after it the block stays in `data`, unconfirmed).
         let rejected = &self.rejected;
         let missing: BTreeSet<Cid> = c
-            .data
-            .difference(&c.confirmed)
+            .owed()
             .filter(|id| !c.deferred.iter().any(|(d, _)| d == *id) && !rejected.contains(*id))
             .copied()
             .collect();
         if missing.is_empty() || c.ready(self.params.race_put, &unacked) {
-            if c.head_sent {
+            if heading {
                 out.push(Effect::ReadHead {
                     epoch: self.head_epoch.unwrap_or(Epoch(1)),
                 });
@@ -3993,7 +3982,7 @@ impl<B: Blocks> Engine<B> {
     /// them again. `None` when no ops are carried, or they no longer make
     /// the commit's root (nothing to re-put that would be the same commit).
     fn reput_from_ops(&mut self, missing: &BTreeSet<Cid>) -> Option<Vec<Effect>> {
-        let c = self.pending.as_ref()?;
+        let c = self.life.commit()?;
         let batch = batch_of(c.ops.as_ref()?);
         let (base, root) = (c.base, c.root);
         let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
@@ -4044,18 +4033,9 @@ impl<B: Blocks> Engine<B> {
     /// coded stop being owed -- they describe a tree that never published --
     /// and the engine is open for the next write.
     fn release_lost(&mut self) -> Vec<Effect> {
-        let Some(c) = self.pending.take() else {
-            return Vec::new();
-        };
-        self.in_flight_since = None;
-        self.unpublished.clear();
-        self.root = self.published_root;
-        self.next_seq = self.published_seq + 1;
-        for w in &c.writes {
-            self.told_stalled.remove(w);
-        }
-        // `Lost` is a foreign move (R-b): go-back-N happens HERE, once.
-        self.rederive_after_foreign_move(&c.writes, c.through)
+        // `Lost` is a foreign move (R-b): go-back-N happens in the one teardown. No head is adopted: the tree goes
+        // back to the published one.
+        self.end_commit(End::Dead { witness: None, head: None })
     }
 
 
@@ -4063,21 +4043,24 @@ impl<B: Blocks> Engine<B> {
     /// or none): the write of it never landed. Re-issue it -- the same seq and
     /// root, which the Register takes or refuses on its own terms.
     fn head_not_landed(&mut self) -> Vec<Effect> {
-        let unacked = self.unacked();
-        let Some(c) = self.pending.as_mut() else {
-            return Vec::new();
-        };
-        if !c.ready(self.params.race_put, &unacked) {
-            c.head_sent = false;
-            return Vec::new();
+        // Heading x E7: RE-ISSUE, never back to Racing (COMMIT-LIFE C2, A2). Race-ready only grows while the commit is
+        // in flight (held evidence is not retracted), so the same head is still one the race rule signs. Racing x E7:
+        // its head is not out; nothing.
+        match self.life.stage() {
+            CommitStage::Heading => self.life.commit().map(|c| vec![self.head_of(c)]).unwrap_or_default(),
+            CommitStage::Racing | CommitStage::Idle => Vec::new(),
         }
-        c.head_sent = true;
-        vec![Effect::UpdateHead {
+    }
+
+    /// The commit's `UpdateHead`: what the page holds it for is the race set (the blocks counted), or -- in the
+    /// `head_before_packs` control arm, which sends it before race-ready -- every data block.
+    fn head_of(&self, c: &Commit) -> Effect {
+        Effect::UpdateHead {
             seq: c.seq,
             root: c.root,
             base: c.base,
-            after: c.race_set(),
-        }]
+            after: if self.params.head_before_packs { c.data.iter().copied().collect() } else { c.race_set() },
+        }
     }
 
     /// These writes' Backing drained: each is BACKED_UP unless it still sits
@@ -4087,7 +4070,7 @@ impl<B: Blocks> Engine<B> {
         let mut out = Vec::new();
         let mut told = BTreeSet::new();
         for w in writes {
-            if !told.insert(w) || self.carry.contains(&w) || self.backing.iter().any(|b| b.writes.contains(&w)) {
+            if !told.insert(w) || self.life.waits_for(&w) {
                 continue;
             }
             out.push(Effect::Notify { client: w.0, write_id: w.1, state: State::ParityComplete });
@@ -4132,7 +4115,7 @@ impl<B: Blocks> Engine<B> {
     /// telling it apart would need a whole-tree scan -- they retry until acked
     /// (the architect's ruling).
     fn supersede(&mut self, was: Cid, now: Cid) -> Vec<Effect> {
-        if was == now || self.backing.is_empty() {
+        if was == now || self.life.backing_len() == 0 {
             return Vec::new();
         }
         let Some(removed) = self.removed_nodes(was, now) else {
@@ -4156,27 +4139,7 @@ impl<B: Blocks> Engine<B> {
                 }
             }
         }
-        let mut withdrawn: BTreeSet<Cid> = BTreeSet::new();
-        for b in self.backing.iter_mut() {
-            let hit: Vec<Cid> = b.remaining.intersection(&gone).copied().collect();
-            if hit.is_empty() {
-                continue;
-            }
-            for id in hit {
-                b.remaining.remove(&id);
-                withdrawn.insert(id);
-            }
-            self.carry.extend(b.writes.iter().copied());
-        }
-        let mut drained = Vec::new();
-        self.backing.retain(|b| {
-            if b.remaining.is_empty() {
-                drained.extend(b.writes.iter().copied());
-                false
-            } else {
-                true
-            }
-        });
+        let (withdrawn, drained) = self.life.supersede(&gone);
         let mut out: Vec<Effect> = withdrawn.into_iter().map(|id| Effect::Withdraw { id }).collect();
         out.extend(self.backed_up(drained));
         out
@@ -4192,18 +4155,13 @@ impl<B: Blocks> Engine<B> {
         let head_early = self.params.head_before_packs;
         let mut out = Vec::new();
         // A published commit's straggler landing: one closer to BACKED_UP.
-        let mut backed = Vec::new();
-        self.backing.retain_mut(|b| {
-            if b.remaining.remove(&id) && b.remaining.is_empty() {
-                backed.extend(b.writes.iter().copied());
-                return false;
-            }
-            true
-        });
+        let backed = self.life.acked(&id);
         out.extend(self.backed_up(backed));
 
         let unacked = self.unacked();
-        let Some(c) = self.pending.as_mut() else {
+        let heading = self.life.stage() == CommitStage::Heading;
+        let race_put = self.params.race_put;
+        let Some(c) = self.life.commit_mut() else {
             // A confirmation for something no commit is waiting on. Duplicates
             // and stragglers are normal on a network; they are not errors and
             // they are not events.
@@ -4223,7 +4181,7 @@ impl<B: Blocks> Engine<B> {
         if !mine && !earlier && !other {
             return out;
         }
-        if c.head_sent || (!head_early && !c.ready(self.params.race_put, &unacked)) {
+        if heading || (!head_early && !c.ready(race_put, &unacked)) {
             return out;
         }
         // Every block of this commit has been READ BACK from our own node.
@@ -4236,67 +4194,100 @@ impl<B: Blocks> Engine<B> {
         // its head does not name. Only the HEAD makes anything findable, so
         // the head is the journal and `published` is the first state that
         // survives a restart.
-        c.head_sent = true;
-        out.push(Effect::UpdateHead {
-            seq: c.seq,
-            root: c.root,
-            base: c.base,
-            // head_before_packs (off by default) is the one mode that sends
-            // the head BEFORE the race rule holds, so the page must still hold
-            // it until every block is in.
-            after: if head_early { c.data.iter().copied().collect() } else { c.race_set() },
-        });
+        // Racing -> Heading (the one forward move, C2).
+        self.life.send_head();
+        if let Some(c) = self.life.commit() {
+            out.push(self.head_of(c));
+        }
         out
     }
 
     /// `id` was REJECTED by the node's Block contract (`Event::PutRejected`, sdk#433; the architect's rulings).
     fn on_rejected(&mut self, id: Cid) -> Vec<Effect> {
         self.rejected.insert(id);
-        let ends = self.pending.as_ref().is_some_and(|c| !c.head_sent && (c.data.contains(&id) || c.packs.contains_key(&id)));
+        let Some(c) = self.life.commit() else { return Vec::new() };
+        let own = c.data.contains(&id) || c.packs.contains_key(&id);
+        let ends = match self.life.stage() {
+            // Racing x E4: any block of its own -- re-sent, the writes would re-derive the same block.
+            CommitStage::Racing => own,
+            // Heading x E4 (the architect on rev 5, A9): the ROOT -- the signer refuses a head whose root is not on
+            // the node (`RootNotHeld`, retryable), and a rejected root never will be -- or a block without which a
+            // group falls below k. Any other block: the commit stays (the head may land at k); its Backing is never
+            // BACKED_UP.
+            CommitStage::Heading => own && (id == c.root || !c.race.reachable(&self.rejected)),
+            CommitStage::Idle => false,
+        };
         if !ends {
-            // A published commit's straggler (or one whose head is out: it may land at k): the Backing stays, so
+            // A published commit's straggler (or one whose head is out and may land): the Backing stays, so
             // BACKED_UP never lies; nothing is put again.
             return Vec::new();
         }
-        self.fail_commit()
+        // A REAL END (rule 8): the commit's writes are Failed.
+        self.end_commit(End::Failed)
     }
 
     /// The signer finally refused commit `seq`'s head (PUBLISH-LIFE ⁵): if `seq` is the commit in flight, it ends
     /// `Failed`; any other seq is stale -- that head is already dead -- and nothing happens.
     fn on_head_refused(&mut self, seq: u64) -> Vec<Effect> {
-        if !self.pending.as_ref().is_some_and(|c| c.seq == seq) {
+        if !self.life.commit().is_some_and(|c| c.seq == seq) {
             return Vec::new();
         }
-        self.fail_commit()
+        self.end_commit(End::Failed)
     }
 
-    /// A REAL END of the commit in flight (rule 8), shared by a block the node REJECTED and a head the signer REFUSED:
-    /// its writes are `Failed` and leave the queue -- re-applied they would meet the same refusal -- the tree goes back
-    /// to the published root, and the writes behind them go again there. (One of COMMIT-LIFE's teardowns; sdk#481
-    /// makes them one.)
-    fn fail_commit(&mut self) -> Vec<Effect> {
+    /// THE ONE TEARDOWN (COMMIT-LIFE rev 5, C3): every end of the commit in flight -- its head showed, a foreign head,
+    /// a final refusal -- comes here, in one order: what the dead commit still has on the way is withdrawn, its writes
+    /// are told, the published root moves (own, or the foreign head adopted), `next_seq` follows it, the queue is
+    /// re-derived (never on own publish, ⁴), and the next cut is taken (K1). The per-end part is one exhaustive match.
+    fn end_commit(&mut self, end: End) -> Vec<Effect> {
         let unacked = self.unacked();
-        let Some(c) = self.pending.take() else { return Vec::new() };
-        // WHAT THE DEAD COMMIT STILL HAS ON THE WAY is WITHDRAWN (the architect on #502): its blocks not yet confirmed
-        // (PUTs the page is still retrying; the held-back parity dies with the commit, never sent) and the other
-        // members it asked the node about (`ConfirmHeld`, sdk#416) -- a PUT or a Held for a commit that no longer
-        // exists is the dead commit's op the page withdraws. Never a block an earlier commit's Backing still needs.
-        let mut gone: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
-        gone.extend(c.race.others().into_iter().filter(|m| !c.held.contains(m)));
-        gone.retain(|id| !unacked.contains(id));
-        let withdrawn: Vec<Effect> = gone.into_iter().map(|id| Effect::Withdraw { id }).collect();
-        self.in_flight_since = None;
+        let Some((c, headed)) = self.life.end() else { return Vec::new() };
+        let mut out = Vec::new();
         self.unpublished.clear();
-        self.next_seq = self.published_seq + 1;
-        for w in &c.writes {
-            self.told_stalled.remove(w);
+        // Did a dead commit's group LAND unheard (⁵)? Then its blocks are in the published tree: never withdrawn, they
+        // are owed toward BACKED_UP like any published commit's. An `Unknown` witness may have landed: not withdrawn.
+        let landed = |w: &Option<Witness>| matches!(w, Some(Witness::Through(t)) if c.through > 0 && *t >= c.through);
+        let withdraw = match &end {
+            End::Published => false,
+            End::Failed => true,
+            End::Dead { witness, .. } => !headed || !(landed(witness) || *witness == Some(Witness::Unknown)),
+        };
+        if withdraw {
+            let mut gone: BTreeSet<Cid> = c.owed().copied().collect();
+            gone.extend(c.race.others().into_iter().filter(|m| !c.held.contains(m)));
+            gone.retain(|id| !unacked.contains(id));
+            out.extend(gone.into_iter().map(|id| Effect::Withdraw { id }));
         }
-        self.queue.retain(|q| !(q.committing && c.writes.contains(&(q.client, q.write_id))));
-        let mut out = withdrawn;
-        out.extend(c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed }));
-        self.root = self.published_root;
-        self.requeue_from(0);
-        out.extend(self.advance());
+        match end {
+            End::Published => out.extend(self.publish(c)),
+            End::Failed => {
+                self.next_seq = self.published_seq + 1;
+                // Re-applied they would meet the same refusal: they leave the queue.
+                self.queue.retain(|q| !c.writes.contains(&(q.client, q.write_id)));
+                out.extend(c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed }));
+                self.root = self.published_root;
+                self.requeue_from(0);
+                out.extend(self.advance());
+            }
+            End::Dead { witness, head } => {
+                if headed && landed(&witness) {
+                    let remaining: BTreeSet<Cid> = c.owed().copied().collect();
+                    if !remaining.is_empty() {
+                        self.life.back(c.writes.clone(), remaining);
+                    }
+                }
+                match head {
+                    Some((seq, root)) => out.extend(self.adopt(seq, root)),
+                    None => {
+                        self.root = self.published_root;
+                        self.next_seq = self.published_seq + 1;
+                    }
+                }
+                // A head that never left reads no witness and spends no try (A8).
+                let witness = if headed { witness } else { None };
+                out.extend(self.rederive_after_foreign_move(&c.writes, c.through, witness, headed));
+            }
+        }
         out
     }
 
@@ -4313,7 +4304,7 @@ impl<B: Blocks> Engine<B> {
         }
         // A published commit's straggler the node refused: put it again from
         // the page's blocks (the page keeps them until BACKED_UP).
-        if self.backing.iter().any(|b| b.remaining.contains(&id)) {
+        if self.life.backing_owes(&id) {
             if let Some(bytes) = self.blocks.get(&id) {
                 return vec![Effect::PutBlock { id, bytes: bytes.to_vec(), after: Vec::new() }];
             }
@@ -4324,10 +4315,10 @@ impl<B: Blocks> Engine<B> {
         // Re-emit exactly what is missing, and nothing else. A retry that
         // re-sends the whole commit pays for every block again, and a retry
         // that re-sends nothing stalls it for ever.
-        let Some(c) = self.pending.as_ref() else {
+        let Some(c) = self.life.commit() else {
             return Vec::new();
         };
-        if !c.data.contains(&id) || c.confirmed.contains(&id) {
+        if !c.owes(&id) {
             return Vec::new();
         }
         // A pack first: its body exists only here, so if this does not send it
@@ -4362,7 +4353,7 @@ impl<B: Blocks> Engine<B> {
         if let Some(bytes) = self.blocks.get(id) {
             return Some(bytes.to_vec());
         }
-        let own = self.pending.as_ref().is_some_and(|c| c.data.contains(id)) || self.backing.iter().any(|b| b.remaining.contains(id));
+        let own = self.life.commit().is_some_and(|c| c.data.contains(id)) || self.life.backing_owes(id);
         if own {
             self.reput_missing += 1;
         }
@@ -4375,11 +4366,11 @@ impl<B: Blocks> Engine<B> {
     /// seven PUTs back). Each is put and retried until acked like any PUT; the commit is BACKED_UP only when they are.
     fn follow_ups(&mut self) -> Vec<Effect> {
         let mut out = Vec::new();
-        let Some(c) = self.pending.as_mut() else {
+        let Some(c) = self.life.commit_mut() else {
             return out;
         };
         for (id, bytes) in std::mem::take(&mut c.deferred) {
-            if !c.confirmed.contains(&id) {
+            if c.owes(&id) {
                 out.push(Effect::PutBlock { id, bytes, after: Vec::new() });
             }
         }
@@ -4387,15 +4378,23 @@ impl<B: Blocks> Engine<B> {
     }
 
     fn on_head(&mut self, seq: u64) -> Vec<Effect> {
-        let mut out = Vec::new();
-        let Some(c) = self.pending.as_ref() else {
-            return out;
-        };
-        if c.seq != seq {
-            return out;
+        if !self.life.commit().is_some_and(|c| c.seq == seq) {
+            return Vec::new();
         }
-        out.extend(self.follow_ups());
-        let c = self.pending.take().expect("checked");
+        // Racing x E6 is impossible: no head was sent for this seq. The head showing it is a fact, so it publishes;
+        // the cell is counted.
+        if self.life.stage() == CommitStage::Racing {
+            self.impossible_transitions += 1;
+        }
+        let mut out = self.follow_ups();
+        out.extend(self.end_commit(End::Published));
+        out
+    }
+
+    /// OWN PUBLISH, `end_commit`'s Published part: the published root moves to `c`'s, its writes are `Published`,
+    /// its Backing opens (or BACKED_UP now), the front leaves the queue and the next cut goes, with nothing re-derived.
+    fn publish(&mut self, c: Commit) -> Vec<Effect> {
+        let mut out = Vec::new();
         let was = self.published_root;
         self.published_seq = c.seq;
         self.published_root = c.root;
@@ -4439,7 +4438,7 @@ impl<B: Blocks> Engine<B> {
         // BACKED_UP waits for the node's word on each one not confirmed yet; the page is still asking.
         remaining.extend(c.race.others().into_iter().filter(|m| !c.held.contains(m) && !still_out.contains(m)));
         let mut writes = c.writes.clone();
-        for w in std::mem::take(&mut self.carry) {
+        for w in self.life.take_carry() {
             if !writes.contains(&w) {
                 writes.push(w);
             }
@@ -4447,15 +4446,14 @@ impl<B: Blocks> Engine<B> {
         if remaining.is_empty() {
             out.extend(self.backed_up(writes));
         } else {
-            self.backing.push(Backing { writes, remaining });
+            self.life.back(writes, remaining);
         }
-        debug_assert!(self.folded.is_empty());
         // OWN PUBLISH (R-b, footnote 4): the front leaves the queue
         // `Published`; the warm root is UNCHANGED -- it already is the
         // published root plus the rest -- so nothing is re-derived here, and
         // the next front commits, rebuilt on the root just published.
         let mut popped = 0;
-        while self.queue.front().is_some_and(|f| f.committing && c.writes.contains(&(f.client, f.write_id))) {
+        while self.queue.front().is_some_and(|f| c.writes.contains(&(f.client, f.write_id))) {
             self.queue.pop_front();
             popped += 1;
         }
@@ -4507,9 +4505,9 @@ impl<B: Blocks> Engine<B> {
         // No `can_sign` check here: `unpublished` is filled only by the cut in
         // `advance`, the ONE place the gate is read, so while the page cannot
         // sign there is nothing here to ship.
-        if self.pending.is_none() && !self.unpublished.is_empty() {
+        if self.life.commit().is_none() && !self.unpublished.is_empty() {
             let to_ship = self.take_unpublished();
-            out.extend(self.start_commit(to_ship, Vec::new(), None));
+            out.extend(self.start_commit(to_ship, Vec::new(), None, Vec::new(), 0));
         }
         out
     }
@@ -4534,13 +4532,9 @@ impl<B: Blocks> Engine<B> {
             now
         };
         if self.now == 0 {
-            if let Some(since) = self.in_flight_since.as_mut() {
-                if *since == 0 {
-                    *since = now;
-                }
-            }
+            self.life.anchor(now, false);
             self.asks.anchor(now);
-            if let Some(c) = self.pending.as_mut() {
+            if let Some(c) = self.life.commit_mut() {
                 if c.settle_at == 0 {
                     c.settle_at = now;
                 }
@@ -4554,11 +4548,9 @@ impl<B: Blocks> Engine<B> {
             // same clock: every date is re-anchored to it. Nothing
             // becomes due early for it, and nothing waits on a clock that is
             // gone.
-            if let Some(since) = self.in_flight_since.as_mut() {
-                *since = now;
-            }
+            self.life.anchor(now, true);
             self.asks.reanchor(now);
-            if let Some(c) = self.pending.as_mut() {
+            if let Some(c) = self.life.commit_mut() {
                 c.settle_at = now;
             }
             if let Some(p) = self.parked_write.as_mut() {
@@ -4636,28 +4628,21 @@ impl<B: Blocks> Engine<B> {
         if !self.params.bound_accept_age {
             return Vec::new();
         }
-        let Some(since) = self.in_flight_since else {
+        let Some(since) = self.life.started() else {
             return Vec::new();
         };
         if now.saturating_sub(since) < self.params.max_accept_age {
             return Vec::new();
         }
-        let Some(commit) = self.pending.as_ref() else {
-            return Vec::new();
-        };
-        // Once per write: a notice repeated every tick is noise a caller
-        // learns to ignore, and this one matters. Every write QUEUED behind
-        // the stuck commit too (R-b): taken, not saved, and not moving either.
-        let mut writes = commit.writes.clone();
-        writes.extend(
-            self.queue
-                .iter()
-                .filter(|q| q.told_accepted && !commit.writes.contains(&(q.client, q.write_id)))
-                .map(|q| (q.client, q.write_id)),
-        );
+        // Once per write, its flag on the write itself (C4): a notice repeated every tick is noise a caller learns to
+        // ignore, and this one matters. Every write of the commit, and every write QUEUED behind the stuck commit too
+        // (R-b): taken, not saved, and not moving either.
+        let cut: Vec<(ClientId, WriteId)> = self.life.commit().map(|c| c.writes.clone()).unwrap_or_default();
         let mut out = Vec::new();
-        for w in writes {
-            if self.told_stalled.insert(w) {
+        for q in self.queue.iter_mut() {
+            let w = (q.client, q.write_id);
+            if (cut.contains(&w) || q.told_accepted) && !q.stalled_told {
+                q.stalled_told = true;
                 out.push(Effect::Notify {
                     client: w.0,
                     write_id: w.1,
@@ -4964,9 +4949,9 @@ impl<B: Blocks> Engine<B> {
     /// (sdk#416), or a published commit's block still owed for BACKED_UP -- read from those records, the ones
     /// `on_confirmed` reads. The page stops asking `Held` about a block nobody waits on.
     pub fn awaits_confirmation(&self, id: &Cid) -> bool {
-        self.backing.iter().any(|b| b.remaining.contains(id))
-            || self.pending.as_ref().is_some_and(|c| {
-                (c.data.contains(id) && !c.confirmed.contains(id))
+        self.life.backing_owes(id)
+            || self.life.commit().is_some_and(|c| {
+                c.owes(id)
                     || c.race.groups.iter().any(|g| g.earlier.contains(id) || (g.others.contains(id) && !c.held.contains(id)))
             })
     }
@@ -5270,7 +5255,7 @@ impl<B: Blocks> Engine<B> {
 
     /// Is a write queued or a commit pending? (The page's warm-apply blocks are the only copy while one is.)
     pub fn has_writes_in_flight(&self) -> bool {
-        self.pending.is_some() || !self.queue.is_empty()
+        self.life.commit().is_some() || !self.queue.is_empty()
     }
 
     pub fn blocks_mut(&mut self) -> &mut B {
@@ -5288,15 +5273,13 @@ impl<B: Blocks> Engine<B> {
         let mut pin = |id: &Cid, why: Pin| {
             out.entry(*id).or_insert(why);
         };
-        if let Some(c) = self.pending.as_ref() {
-            for id in c.data.difference(&c.confirmed) {
+        if let Some(c) = self.life.commit() {
+            for id in c.owed() {
                 pin(id, Pin::InFlight);
             }
         }
-        for b in &self.backing {
-            for id in &b.remaining {
-                pin(id, Pin::Backing);
-            }
+        for id in &self.life.unacked() {
+            pin(id, Pin::Backing);
         }
         for id in self.wanted.read_blocks().chain(self.reads.parked.values().flat_map(|p| p.held.iter())) {
             pin(id, Pin::ParkedRead);
@@ -5450,7 +5433,7 @@ impl<B: Blocks> Engine<B> {
         let carries = self.params.context_carries_pending;
         v.field(&(self.published_seq, self.published_root, self.root, self.next_seq));
         if carries {
-            v.field(&self.pending);
+            v.field(&self.life.commit());
         } else {
             v.field(&None::<Commit>);
         }
@@ -5463,8 +5446,8 @@ impl<B: Blocks> Engine<B> {
         v.field(self.wanted.write_needs());
         v.field(&self.subs);
         if carries {
-            v.field(&self.in_flight_since);
-            v.field(&self.told_stalled);
+            v.field(&self.life.started());
+            v.field(&self.stalled_told_writes());
         } else {
             v.field(&None::<u64>);
             v.field(&Vec::<(ClientId, WriteId)>::new());
