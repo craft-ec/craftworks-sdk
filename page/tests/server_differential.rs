@@ -2511,3 +2511,80 @@ fn a_read_with_slow_blocks_still_answers_under_fast_heads() {
     assert_eq!(v, Some(Some(b"value 321".to_vec())), "the read did not answer in 60 steps ({superseded} superseded)");
     println!("  slow blocks, a head per step: answered after {superseded} supersede(s)");
 }
+
+/// sdk#415, THE BACKED-UP TIMELINE (engineer1's live run, forced): two rows saved and BACKED UP, then a third
+/// written. A row's state is its OWN last write's fate (ruling A, rule 10: BACKED_UP is per commit): the first two
+/// never regress while the third saves, and the third reaches BACKED UP once every PUT of its commit is acked.
+/// The engine's bookkeeping settles too: no group owed, the parity scan Done.
+#[test]
+fn a_row_is_backed_up_by_its_own_write_and_a_later_save_never_demotes_it() {
+    for case in ["no faults", "first parity answers lost", "first put answers lost", "first gets lost", "record not saved once"] {
+        let faults = Faults {
+            lose_first_parity_answers: case == "first parity answers lost",
+            lose_first_put_answers: case == "first put answers lost",
+            lose_first_gets: case == "first gets lost",
+            record_not_saved_once: case == "record not saved once",
+            ..Faults::default()
+        };
+        backed_up_timeline(case, faults);
+    }
+}
+
+fn backed_up_timeline(case: &str, faults: Faults) {
+    use craftworks_sdk::store::{Reads, RowState};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.faults = faults;
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let row = |tab: &mut Tab, rig: &mut PageRig, node: &mut Node, title: &str| {
+        let rec = tab.call(rig, node, |db| db.put("t", &serde_json::json!({ "title": title }).as_object().unwrap().clone())).expect("put");
+        tab.pump(rig, node);
+        craftworks_sdk::db::record_key("t", craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id"))
+    };
+    let state = |tab: &mut Tab, rig: &mut PageRig, node: &mut Node, key: &[u8]| tab.lend(rig, node, |db| Reads::row_state(db.store_mut(), key));
+    let settle = |tab: &mut Tab, rig: &mut PageRig, node: &mut Node| {
+        rig.run_for(node, 5_000);
+        tab.pump(rig, node);
+    };
+    let alpha = row(&mut tab, &mut rig, &mut node, "alpha");
+    let beta = row(&mut tab, &mut rig, &mut node, "beta");
+    settle(&mut tab, &mut rig, &mut node);
+    for (name, k) in [("alpha", &alpha), ("beta", &beta)] {
+        assert_eq!(state(&mut tab, &mut rig, &mut node, k), RowState::BackedUp, "{case}: THE SETUP: {name} is not backed up before gamma");
+    }
+    // gamma's save RETURNS before its commit is backed up (its parity follows the head): alpha and beta are
+    // looked at in that window, before anything settles -- the moment engineer1 saw all three read "saved".
+    let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "gamma" }).as_object().unwrap().clone())).expect("put");
+    let gamma = craftworks_sdk::db::record_key("t", craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id"));
+    let owed_mid = rig.server.page.owed_groups();
+    for (name, k) in [("alpha", &alpha), ("beta", &beta)] {
+        let s = state(&mut tab, &mut rig, &mut node, k);
+        assert_eq!(s, RowState::BackedUp, "{case}: {name} REGRESSED to {s:?} as gamma saved ({owed_mid} group(s) owed by gamma's commit): a later save demoted a row its own commit backed up");
+    }
+    tab.pump(&mut rig, &mut node);
+    // Watched for engineer1's 600 s, and PAST backing up: the idle page's backstop head reads (every
+    // HEAD_BACKSTOP_MS) come after the save, and a row must stay backed up through them.
+    let mut gamma_backed_at = None;
+    for step in 0..120u64 {
+        for (name, k) in [("alpha", &alpha), ("beta", &beta)] {
+            let s = state(&mut tab, &mut rig, &mut node, k);
+            assert_eq!(s, RowState::BackedUp, "{case}: {name} REGRESSED to {s:?} {} ms after gamma was written: a later save demoted a row its own commit backed up", step * 5_000);
+        }
+        let g = state(&mut tab, &mut rig, &mut node, &gamma);
+        match (g == RowState::BackedUp, gamma_backed_at) {
+            (true, None) => gamma_backed_at = Some(step),
+            (false, Some(at)) => panic!("{case}: gamma REGRESSED to {g:?} at {} ms, after reading backed up at {} ms", step * 5_000, at * 5_000),
+            _ => {}
+        }
+        settle(&mut tab, &mut rig, &mut node);
+    }
+    let gamma_backed = gamma_backed_at.is_some();
+    let owed = rig.server.page.owed_groups();
+    let scan = rig.server.page.parity_scan();
+    println!("{case}: gamma backed up: {gamma_backed}; owed groups {owed}; parity scan {}", if matches!(scan, engine::ParityScan::Done { .. }) { "Done" } else { "not Done" });
+    assert!(gamma_backed, "{case}: gamma never reached BACKED UP though every PUT of its commit was acked");
+    assert_eq!(owed, 0, "{case}: every parity PUT acked, and groups are still owed");
+    assert!(matches!(scan, engine::ParityScan::Done { .. }), "{case}: every parity PUT acked, and the parity scan is {scan:?}");
+}
