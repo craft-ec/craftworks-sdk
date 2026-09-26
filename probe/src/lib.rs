@@ -2,6 +2,7 @@
 
 pub mod frames;
 pub mod live;
+pub mod lose;
 pub mod node;
 pub mod page;
 pub mod signer;

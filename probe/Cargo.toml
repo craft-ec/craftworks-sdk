@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 # The Register record and the Block contract's id, as the signer and the page
 # derive them. A dependency of the DRIVER only: nothing here reaches a wasm.
 contract-keys = { path = "../contract-keys" }
+# ws-lose reads the head's ledger (the root's parity, sdk#335) with the one head codec.
+signer-proto = { path = "../signer-proto" }
 protocol = { path = "../protocol" }
 # The PAGE PATH live run (ruling B): the in-page engine and its client-API I/O.
 page = { path = "../page" }
