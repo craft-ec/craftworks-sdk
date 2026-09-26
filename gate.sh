@@ -273,7 +273,7 @@ if [ "$MODE" = pr ]; then
     step "build.sh + npm test (JS or pkg/ changed)"
     if ! ./build.sh > /tmp/gate-build.$$ 2>&1; then step_fail "build.sh failed"; tail -5 /tmp/gate-build.$$ >&2
     else
-      npm test > /tmp/gate-npm.$$ 2>&1 || { step_fail "npm test failed"; grep -E "FAIL|Error" /tmp/gate-npm.$$ | head -8 >&2; }
+      npm test > /tmp/gate-npm.$$ 2>&1 || { step_fail "npm test failed"; grep -E -A1 "FAIL|Error" /tmp/gate-npm.$$ | head -12 >&2; }
       js=$(grep -c "^  ok " /tmp/gate-npm.$$ || true)
       [ "$js" -eq 0 ] && step_fail "npm test reported ZERO passing tests"
       b=$(base_count npm); [ -z "$b" ] && b=-
