@@ -88,6 +88,39 @@ pub fn frame_held(
     frame(key, id, &SignerRequest::Held { contracts }, stream_id)
 }
 
+/// A SIGNER A PAGE MAY ASK ONE THING: `Held` (sdk#493; the owner's rule 13, "One writer, by type"). A keeper auditing
+/// SOMEONE ELSE's app needs its OWN node's presence answers, and a signer on a reader page is exactly the capability
+/// that could write another identity's tree. So the reader holds this, never the signer's key: its ONE method frames
+/// `Held`, the key is private, and a Sign, a Provision or a query cannot be framed through it.
+///
+/// ```compile_fail
+/// let (_, key) = wire::delegate_from_code(b"signer");
+/// let held = wire::signer::HeldSigner::of(key);
+/// // THE CONTROL's forbidden line: the key is not reachable through a HeldSigner.
+/// let _ = wire::signer::frame_sign(&held.0, 1, signer_proto::Head { seq: 0, root: [0; 32] }, signer_proto::Next { seq: 1, root: [1; 32], ledger: Vec::new() }, signer_proto::Label::Head, 1);
+/// ```
+///
+/// The same lines WITHOUT the forbidden reach compile and frame a `Held` (the positive control):
+///
+/// ```
+/// let (_, key) = wire::delegate_from_code(b"signer");
+/// let held = wire::signer::HeldSigner::of(key);
+/// assert!(!held.frame_held(1 << 31, vec![[7; 32]], 1).expect("frames").is_empty());
+/// ```
+pub struct HeldSigner(DelegateKey);
+
+impl HeldSigner {
+    /// The signer delegate `key`, for `Held` only.
+    pub fn of(key: DelegateKey) -> HeldSigner {
+        HeldSigner(key)
+    }
+
+    /// Its ONE request: [`frame_held`].
+    pub fn frame_held(&self, id: u32, contracts: Vec<[u8; 32]>, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
+        frame_held(&self.0, id, contracts, stream_id)
+    }
+}
+
 /// Ask the signer which Register it signs for ([`SignerRequest::Register`]): how a page reopens the person's own tree
 /// instead of minting a new identity on every load.
 pub fn frame_register_query(key: &DelegateKey, id: u32, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
