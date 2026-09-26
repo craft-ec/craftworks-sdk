@@ -301,10 +301,13 @@ impl Node {
         Ok(())
     }
 
-    /// The node process's id while it runs: a probe that pauses its OWN node (SIGSTOP, a silent peer) names it by
-    /// this handle, never by a search.
-    pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(|c| c.id())
+    /// The node process's id WHILE IT IS OURS AND ALIVE, else `None` (after `stop`, or once it exited): a probe that
+    /// pauses its OWN node (SIGSTOP, a silent peer) names it by this handle, never by a search. While this handle holds
+    /// the child unreaped the pid cannot be reused by another process, so a signal sent by it reaches this node only;
+    /// `try_wait` reaps a child that exited, and from then on there is no pid to signal.
+    pub fn pid(&mut self) -> Option<u32> {
+        let c = self.child.as_mut()?;
+        matches!(c.try_wait(), Ok(None)).then(|| c.id())
     }
 
     pub fn ws(&self) -> String {

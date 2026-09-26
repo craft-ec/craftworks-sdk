@@ -66,6 +66,15 @@ async fn main() -> Result<()> {
     let base: u16 = arg(&a, "--base").map(|v| v.parse()).transpose()?.unwrap_or(47_500);
     let watch = Duration::from_secs(arg(&a, "--watch").map(|v| v.parse()).transpose()?.unwrap_or(90));
     let silent_peers: u16 = arg(&a, "--silent-peers").map(|v| v.parse()).transpose()?.unwrap_or(1).max(1);
+    // EVERY port this run derives, refused up front -- before anything starts -- if one is someone else's (the
+    // architect on #444: a base a few below 7509 derives 7509).
+    let mut ports = vec![base, base + 1, base + 10, base + 11];
+    for i in 1..silent_peers {
+        ports.extend([base + 20 + 10 * i, base + 21 + 10 * i]);
+    }
+    for port in &ports {
+        probe::node::allowed_port(&format!("ws://127.0.0.1:{port}"))?;
+    }
     let bcode = std::fs::read(bw).with_context(|| format!("reading {bw}"))?;
     let root = std::path::PathBuf::from(dir);
     let _tree = TempTree(root.clone());
@@ -84,7 +93,7 @@ async fn main() -> Result<()> {
         "--public-network-port".into(),
         (base + 1).to_string(),
     ];
-    let node_a = Node::spawn_private_network(base, base + 1, &root.join("a"), &a_extra)?;
+    let mut node_a = Node::spawn_private_network(base, base + 1, &root.join("a"), &a_extra)?;
     let b_extra = ["--gateway".to_string(), format!("127.0.0.1:{},{}", base + 1, hex(&public))];
     // The other silent peers: private nodes joined to A, as b is.
     let mut others = Vec::new();
@@ -122,7 +131,7 @@ async fn main() -> Result<()> {
 
     // A goes SILENT.
     let mut _resume = Vec::new();
-    for n in std::iter::once(&node_a).chain(others.iter()) {
+    for n in std::iter::once(&mut node_a).chain(others.iter_mut()) {
         let pid = n.pid().context("a peer is not running")?;
         signal(pid, "-STOP")?;
         _resume.push(Resume(pid));
@@ -183,5 +192,16 @@ async fn main() -> Result<()> {
         "held_get_answered_while_the_silent_get_was_unanswered": before(at("held-get")),
         "later_put_answered_while_the_silent_get_was_unanswered": before(at("later-put")),
     }}));
+    // A PAUSED NODE NEVER OUTLIVES THE PROBE: resumed, then killed and reaped by its own handle -- and checked gone.
+    let paused: Vec<u32> = _resume.iter().map(|r| r.0).collect();
+    drop(_resume);
+    drop(others);
+    drop(node_a);
+    drop(node_b);
+    let alive: Vec<u32> = paused.iter().copied().filter(|pid| std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())).collect();
+    println!("{}", serde_json::json!({ "paused_peers_gone": alive.is_empty(), "still_alive": alive }));
+    if !alive.is_empty() {
+        bail!("a paused peer outlived the probe: {alive:?}");
+    }
     Ok(())
 }
