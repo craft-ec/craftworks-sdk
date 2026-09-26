@@ -649,6 +649,13 @@ pub struct Page {
     window: rto::Window,
     /// GETs waiting for a place in the window, in the order asked.
     get_queue: std::collections::VecDeque<Cid>,
+    /// GETs LOST past the node's bound and asked again (sdk#447): when, and whether one answer has come since. The node
+    /// does not dedupe, so the stalled earlier GET can still answer; a SECOND answer, arriving when nothing waits on the
+    /// key, is the known overlap (the architect) -- dropped, counted, and recorded as
+    /// `DroppedMsgs = DropReason::AnsweredAfterReask`. Forgotten once no earlier node GET can still be running.
+    reasked: BTreeMap<Cid, (u64, bool)>,
+    /// How many such second answers came (the recording holds each; this counts them whether or not one is attached).
+    answered_after_reask: u64,
     /// The attempt a re-send continues from (set when an op times out).
     attempt_of: BTreeMap<Waiting, u32>,
     /// When each op still unanswered was FIRST sent: what "not answering for
@@ -763,6 +770,8 @@ impl Page {
             rto: rto::Rto::default(),
             window: rto::Window::default(),
             get_queue: Default::default(),
+            reasked: BTreeMap::new(),
+            answered_after_reask: 0,
             attempt_of: BTreeMap::new(),
             first_of: BTreeMap::new(),
             recovered: false,
@@ -839,6 +848,8 @@ impl Page {
         // back off, the window does not halve -- the loopback lost nothing and the node is still fetching. Its deadline
         // moves to where that node GET is certainly over; only then is it a timeout (below), re-sent as a NEW node GET.
         let rto_now = self.rto.rto_ms();
+        // A re-asked key's earlier node GET cannot answer once its own bound has passed again since the re-ask.
+        self.reasked.retain(|_, (at, _)| now < node_get_over_at(*at, rto::RTO_MAX_MS as u64));
         let (silent, late): (Vec<Waiting>, Vec<Waiting>) = late.into_iter().partition(|w| {
             matches!(w, Waiting::Get(_)) && self.deadlines.get(w).is_some_and(|d| d.sent && now < node_get_over_at(d.sent_at, rto_now))
         });
@@ -884,6 +895,10 @@ impl Page {
                 // new ask (sdk#345) -- behind the GETs already waiting, and
                 // never outside the window (rule 9: every byte is paced).
                 Waiting::Get(id) => {
+                    // A node GET LOST (past its bound): the one re-asked beside it may overlap it (sdk#447).
+                    if d.sent {
+                        self.reasked.insert(id, (now, false));
+                    }
                     if !self.get_queue.contains(&id) {
                         self.get_queue.push_back(id);
                     }
@@ -1949,6 +1964,17 @@ impl Page {
     /// still asked: a late answer to an earlier send answers it, and its
     /// queued re-send is dropped. It held no place and is no RTO sample.
     fn answered_get(&mut self, id: Cid) -> Option<u32> {
+        // The key's first answer since a re-ask past B: a later one, when nothing waits, is the overlap's.
+        let waited = self.deadlines.contains_key(&Waiting::Get(id)) || self.get_queue.contains(&id);
+        match self.reasked.get_mut(&id) {
+            Some((_, once)) if waited => *once = true,
+            Some((_, true)) => {
+                self.reasked.remove(&id);
+                self.answer_after_reask(id);
+                return None;
+            }
+            _ => {}
+        }
         if let Some(d) = self.deadlines.get(&Waiting::Get(id)) {
             // On the wire: `answered` takes the Karn sample and opens the
             // window, which a queued GET must not do.
@@ -1960,6 +1986,17 @@ impl Page {
         let attempt = self.get_queue.contains(&id).then(|| self.attempt_of.get(&Waiting::Get(id)).copied()).flatten()?;
         self.drop_get(id);
         Some(attempt)
+    }
+
+    /// A SECOND answer for a GET re-asked past the node's bound, when nothing waits on its key (sdk#447): the stalled
+    /// earlier node GET answered too. Dropped, and counted -- the observable that moves B if it is ever non-trivial.
+    fn answer_after_reask(&mut self, id: Cid) {
+        self.answered_after_reask += 1;
+        if let Some(rec) = &self.rec {
+            use instrument::{vocab::DropReason, Entry, Event, Key, OpId, Probe};
+            let entry = Entry { key: Key::DroppedMsgs, value: DropReason::AnsweredAfterReask.code() };
+            rec.event(Event::Counter { site: op_site(&Waiting::Get(id)), op: OpId::NONE, entry });
+        }
     }
 
     /// A GET ENDS: THE one definition of that. It leaves every holder a GET
@@ -3569,6 +3606,43 @@ mod node_get_silent {
         assert!(p.take_ops().is_empty(), "a withdrawn silent GET sent something");
         assert!(!p.deadlines.contains_key(&Waiting::Get(a)), "a withdrawn silent GET still waits");
         assert_eq!((p.rto.rto_ms(), p.window.size()), (rto, window), "a withdrawal moved the clock or the window");
+    }
+
+    /// **THE OVERLAP, OBSERVABLE (the architect on B = 240 s):** a GET lost past B is asked again as a NEW node GET
+    /// while the stalled earlier one may still run (the node does not dedupe). The first answer ends the GET; a SECOND,
+    /// arriving when nothing waits on the key, is dropped -- nothing sent, nothing re-read -- and COUNTED, recorded as
+    /// `DroppedMsgs = DropReason::AnsweredAfterReask`. The control: a key never re-asked answered twice counts nothing.
+    /// Mutant "not counted" -> red.
+    #[test]
+    fn a_second_answer_after_a_re_ask_past_b_is_dropped_and_counted() {
+        use instrument::{vocab::DropReason, Entry, Event, Key, Record};
+        let mut p = page();
+        p.record_into(256);
+        let (a, bytes) = block(1);
+        get(&mut p, a);
+        let _ = p.take_ops();
+        silence(&mut p, a);
+        let over = p.deadlines[&Waiting::Get(a)].at;
+        p.tick(Ms(over));
+        assert_eq!(gets_of(&p.take_ops(), a), 1, "THE SETUP: the GET was not asked again past B");
+        p.answer(Answer::Got { id: a, bytes: bytes.clone() }, Ms(over + 10));
+        assert!(p.blocks.get(&a).is_some(), "THE SETUP: the first answer was not taken");
+        assert_eq!(p.answered_after_reask, 0, "the FIRST answer after a re-ask was counted");
+        p.answer(Answer::Got { id: a, bytes }, Ms(over + 20));
+        assert_eq!(p.answered_after_reask, 1, "the second answer after a re-ask past B was not counted");
+        assert!(p.take_ops().is_empty(), "the second answer made the page send something");
+        let site = op_site(&Waiting::Get(a));
+        let recorded = p.recording().expect("recording").events().into_iter().filter(|e| {
+            *e == Event::Counter { site, op: instrument::OpId::NONE, entry: Entry { key: Key::DroppedMsgs, value: DropReason::AnsweredAfterReask.code() } }
+        });
+        assert_eq!(recorded.count(), 1, "the second answer was not recorded as DroppedMsgs = AnsweredAfterReask");
+
+        // THE CONTROL: a key never re-asked, answered twice, is no overlap.
+        let (b, bytes_b) = block(2);
+        get(&mut p, b);
+        p.answer(Answer::Got { id: b, bytes: bytes_b.clone() }, Ms(over + 30));
+        p.answer(Answer::Got { id: b, bytes: bytes_b }, Ms(over + 40));
+        assert_eq!(p.answered_after_reask, 1, "a duplicate answer of a key never re-asked was counted as the overlap");
     }
 
     /// **(2), RULED: a silent GET KEEPS ITS WINDOW PLACE** (rule 9's backpressure: it is still taking the path's
