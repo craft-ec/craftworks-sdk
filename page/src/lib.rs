@@ -5000,7 +5000,7 @@ mod confirmed_once {
             for op in ops {
                 match op {
                     Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(20)),
-                    Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(20)),
+                    Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(20)),
                     Op::Sign { id, seq, root, ledger, .. } => {
                         let record = sign(seq, &root, &ledger);
                         last = Some(record.clone());
@@ -5036,7 +5036,7 @@ mod confirmed_once {
                         next.insert(id);
                         twin.answer(Answer::PutOk(id), Ms(13));
                     }
-                    Op::AskHeld { id } => twin.answer(Answer::Held { id, present: true }, Ms(13)),
+                    Op::AskHeld { batch, ids } => twin.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(13)),
                     _ => {}
                 }
             }
