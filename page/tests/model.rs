@@ -1923,3 +1923,115 @@ fn a_page_with_no_signer_reports_its_asset_unmeasured() {
     assert!(!r.measured, "an asset the page could not ask about was reported measured");
     assert_eq!((gets_after, r.whole, r.degraded, r.damaged.len()), (0, 0, 0, 0), "an unmeasured asset was GET or counted");
 }
+
+/// **A block the node REJECTED is ABSENT for its group, listed in `rejected`, and never asked or fetched** (KEEPER §5;
+/// sdk#433): once A's write has published, the node rejects one of its follow-up PARITY blocks; A's own audit counts it
+/// absent (its group degraded, NOT damaged -- the group is still whole enough), names it in `rejected`, and sends
+/// neither a Held ask nor a GET for it.
+#[test]
+fn a_rejected_block_is_absent_listed_and_never_asked() {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000u64;
+    audit_serve(&mut a, &mut node, &mut now, &Default::default(), 400);
+    let rows: Vec<(Vec<u8>, WriteOp)> = (0..30).map(|i| (format!("v/{i:02}").into_bytes(), WriteOp::Put(vec![i as u8; 2_000]))).collect();
+    a.write(ClientId(1), WriteId(1), rows);
+    // The node rejects the first 2,000-byte value block it is asked to PUT; everything else is served.
+    let mut rejected = None;
+    let mut asked_after = 0usize;
+    for _ in 0..3_000 {
+        let ops = a.take_ops();
+        if ops.is_empty() {
+            if !a.waiting() {
+                break;
+            }
+            now = a.next_due().map_or(now + 1, |d| d.0.max(now + 1));
+            a.tick(Ms(now));
+            continue;
+        }
+        for op in ops {
+            let ans = match op {
+                // A follow-up PARITY put once the head has landed (a rejection before the head ends the commit).
+                Op::Put { id, bytes } if rejected.is_none() && a.published().0 >= 1 && freenet_prolly::block_id(freenet_prolly::kind::PARITY, &bytes) == id => {
+                    rejected = Some(id);
+                    Some(Answer::PutRefused { id, transient: false })
+                }
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    Some(Answer::PutOk(id))
+                }
+                Op::Get { id } => {
+                    asked_after += usize::from(Some(id) == rejected);
+                    Some(match node.blocks.get(&id) {
+                        Some(b) => Answer::Got { id, bytes: b.clone() },
+                        None => Answer::GetMissed(id),
+                    })
+                }
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                    let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                    Some(Answer::Signer { id, answer })
+                }
+                Op::Update { state, .. } => {
+                    node.update(&state);
+                    Some(Answer::Updated { label: page::Label::Head })
+                }
+                Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
+                Op::AskHeld { batch, ids } => {
+                    asked_after += ids.iter().filter(|id| Some(**id) == rejected).count();
+                    Some(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() })
+                }
+                Op::PutApp { key } => Some(Answer::AppPutOk(key)),
+                Op::Ext(_) => None,
+            };
+            if let Some(ans) = ans {
+                a.answer(ans, Ms(now));
+            }
+        }
+    }
+    let _ = &mut node;
+    let rejected = rejected.expect("THE SETUP: no follow-up parity block was rejected");
+    assert!(a.published().0 >= 1, "THE SETUP: A did not publish (a rejected block ends nothing past the head)");
+    a.audit();
+    asked_after = 0;
+    let asks = audit_asks(&mut a, &mut node, &mut now, rejected);
+    let r = a.take_audit().expect("the pass did not end");
+    println!("rejected: {} of {} groups: whole {}, degraded {}, damaged {}; asks of the rejected block {asks}", r.rejected.len(), r.groups, r.whole, r.degraded, r.damaged.len());
+    assert_eq!(r.rejected, vec![rejected], "the rejected block is not listed in `rejected`");
+    assert_eq!((r.degraded, r.damaged.len()), (1, 0), "a group missing one rejected block is not degraded (it is still whole enough to rebuild)");
+    assert_eq!(asks, 0, "the audit asked Held or GET about a block the node rejected");
+    let _ = asked_after;
+}
+
+/// Serve `p`'s audit as `audit_serve` does, counting the Held asks and GETs that name `id`.
+fn audit_asks(p: &mut Page, node: &mut Node, now: &mut u64, id: Cid) -> usize {
+    let mut asks = 0;
+    for _ in 0..5_000 {
+        let ops = p.take_ops();
+        if ops.is_empty() {
+            if !p.waiting() {
+                break;
+            }
+            *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
+            p.tick(Ms(*now));
+            continue;
+        }
+        for op in ops {
+            match op {
+                Op::AskHeld { batch, ids } => {
+                    asks += ids.iter().filter(|x| **x == id).count();
+                    p.answer(Answer::Held { batch, present: ids.iter().map(|x| node.blocks.contains_key(x)).collect() }, Ms(*now));
+                }
+                Op::Get { id: g } => {
+                    asks += usize::from(g == id);
+                    let a = match node.blocks.get(&g) {
+                        Some(b) => Answer::Got { id: g, bytes: b.clone() },
+                        None => Answer::GetMissed(g),
+                    };
+                    p.answer(a, Ms(*now));
+                }
+                other => panic!("an audit sent {other:?}"),
+            }
+        }
+    }
+    asks
+}

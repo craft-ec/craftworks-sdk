@@ -9,7 +9,7 @@
 
 use engine::read::{NodeGroups, NodesAt};
 use freenet_prolly::Cid;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// What the pass knows of one block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,9 @@ pub(crate) enum Seen {
     Absent,
     /// Its GET was silent at its deadline.
     Pending,
+    /// The node's Block contract REJECTED it (sdk#433, `Engine::rejected_blocks`): ABSENT toward its group's margin,
+    /// never asked, never fetched, never repaired, and listed in the report's `rejected` (KEEPER §5).
+    Rejected,
 }
 
 /// A pass in progress.
@@ -48,10 +51,13 @@ impl Audit {
         Audit { root, next: None, walked: false, walk_req: None, reqs: 0, groups: Vec::new(), seen: BTreeMap::new(), to_hold: VecDeque::new(), to_get: VecDeque::new(), unmeasured: false }
     }
 
-    /// A group to measure: joined, each of its blocks queued to be asked once.
-    pub fn add_group(&mut self, members: Vec<Cid>, parity: Vec<Cid>) {
+    /// A group to measure: joined, each of its blocks queued to be asked once -- except one the node REJECTED
+    /// (`rejected`, the engine's record): absent, and never asked.
+    pub fn add_group(&mut self, members: Vec<Cid>, parity: Vec<Cid>, rejected: &BTreeSet<Cid>) {
         for id in members.iter().chain(parity.iter()) {
-            if !self.to_hold.contains(id) && !self.seen.contains_key(id) {
+            if rejected.contains(id) {
+                self.seen.insert(*id, Seen::Rejected);
+            } else if !self.to_hold.contains(id) && !self.seen.contains_key(id) {
                 self.to_hold.push_back(*id);
             }
         }
@@ -59,10 +65,10 @@ impl Audit {
     }
 
     /// A page of the walk: its groups joined.
-    pub fn walked_page(&mut self, nodes: Vec<NodeGroups>, next: Option<NodesAt>) {
+    pub fn walked_page(&mut self, nodes: Vec<NodeGroups>, next: Option<NodesAt>, rejected: &BTreeSet<Cid>) {
         for n in nodes {
             for (members, parity) in n.groups {
-                self.add_group(members, parity);
+                self.add_group(members, parity, rejected);
             }
         }
         self.walked = next.is_none();
@@ -72,7 +78,7 @@ impl Audit {
 
     /// The report, from what was seen.
     pub fn report(&self) -> Report {
-        let mut r = Report { root: self.root, measured: !self.unmeasured, groups: self.groups.len(), whole: 0, degraded: 0, damaged: Vec::new(), pending: 0 };
+        let mut r = Report { root: self.root, measured: !self.unmeasured, groups: self.groups.len(), whole: 0, degraded: 0, damaged: Vec::new(), pending: 0, rejected: Vec::new() };
         if self.unmeasured {
             return r;
         }
@@ -88,6 +94,7 @@ impl Audit {
             }
         }
         r.pending = self.seen.values().filter(|s| **s == Seen::Pending).count();
+        r.rejected = self.seen.iter().filter(|(_, s)| **s == Seen::Rejected).map(|(id, _)| *id).collect();
         r
     }
 }
@@ -107,4 +114,7 @@ pub struct Report {
     pub damaged: Vec<Cid>,
     /// Blocks whose GET was silent at its deadline.
     pub pending: usize,
+    /// Blocks the node REJECTED (sdk#433): each counted absent in its group, never repaired (KEEPER §5). `damaged`
+    /// keeps its one meaning -- groups whose margin is below 0.
+    pub rejected: Vec<Cid>,
 }
