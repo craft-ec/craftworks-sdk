@@ -218,7 +218,9 @@ impl Pub {
     }
 }
 
-/// A contract's state as `b` serves it to a GET (None: nothing within 10 s).
+/// A contract's state as `b` serves it to a GET. `None`: no answer within 10 s (not served YET; the caller asks
+/// again). A SOCKET ERROR is not an absence: it is an error, with its reason (a could-not-check never reads as
+/// "nothing served").
 async fn read(c: &mut WebApi, id: ContractInstanceId, subscribe: bool) -> Result<Option<Vec<u8>>> {
     c.send(ClientRequest::ContractOp(ContractRequest::Get { key: id, return_contract_code: false, subscribe, blocking_subscribe: false })).await?;
     let by = Instant::now() + Duration::from_secs(10);
@@ -226,7 +228,8 @@ async fn read(c: &mut WebApi, id: ContractInstanceId, subscribe: bool) -> Result
         match tokio::time::timeout(Duration::from_secs(10), c.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }))) if *key.id() == id => return Ok(Some(state.as_ref().to_vec())),
             Ok(Ok(_)) => continue,
-            Ok(Err(_)) | Err(_) => return Ok(None),
+            Ok(Err(e)) => bail!("b's socket, reading {id}: {e}"),
+            Err(_) => return Ok(None),
         }
     }
     Ok(None)

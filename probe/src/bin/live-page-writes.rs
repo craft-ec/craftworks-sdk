@@ -21,6 +21,7 @@ use futures::{SinkExt, StreamExt};
 use page::server::{Server, SignerFacts};
 use page::{Ms, Page, PutPath};
 use page_io::{Artefacts, PageIo};
+use probe::live::now_ms;
 use probe::node::{Mode, Node, TempTree};
 use protocol::{Reply, Request};
 use std::time::{Duration, Instant};
@@ -58,9 +59,6 @@ fn op_letter(frame: &[u8]) -> char {
 }
 const SESSION: u64 = 11;
 
-fn now_ms(t0: Instant) -> u64 {
-    1_000 + t0.elapsed().as_millis() as u64
-}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
