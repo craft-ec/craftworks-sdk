@@ -145,5 +145,7 @@ fn a_dropped_message_is_recorded_by_reason() {
         r.total(Key::DroppedMsgs) < 8,
         "a reason is a small stable code, never a length or a hash"
     );
-    assert!(!c.dropped.is_empty(), "and the client still reports it");
+    // The ring is its one record now (the client's own drop list had no reader, sdk#482): ONE DroppedMsgs entry.
+    let drops = r.events().iter().filter(|e| matches!(e, instrument::Event::Counter { entry, .. } if entry.key == Key::DroppedMsgs)).count();
+    assert_eq!(drops, 1, "the drop was not recorded once");
 }

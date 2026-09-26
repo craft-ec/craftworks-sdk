@@ -22,13 +22,13 @@
 //!
 //! # What a host has to do
 //!
-//! Three things, and no decisions:
+//! Two things, and no decisions:
 //!
 //! 1. Send whatever the client has waiting — [`Client::take_outbound`] where
 //!    a send cannot fail, or [`Client::outbound`] + [`Client::sent`] where it
 //!    can, which is any socket.
-//! 2. Feed every message that arrives to [`Client::on_inbound`].
-//! 3. Look at [`Client::drain_replies`] for answers.
+//! 2. Feed every message that arrives to [`Client::on_inbound`]: it is RECORDED (the diagnostics ring) and kept
+//!    nowhere else -- no reply queue, event list or drop list grows here (sdk#482: none had a reader).
 //!
 //! Retry, ordering, what to do with a `Lost` write, when to reload — all of it
 //! stays here, where it is tested against a transport that reorders,
@@ -36,37 +36,6 @@
 
 use crate::trace::{Trace, Traces};
 use protocol::{Dropped, Reply, Request};
-
-/// What happened that an app might want to know about.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
-    /// A write from before a restart was not applied, because someone else
-    /// changed a key it touched. The newer value stands.
-    ///
-    /// Surfaced, never a prompt: the decision is already made.
-    Conflict { write_id: u64, keys: Vec<Vec<u8>> },
-    /// A write will never be applied and re-submitting would not help.
-    Failed { write_id: u64 },
-    /// Refused at the door: the SDK wrote a key it did not read (sdk#235,
-    /// W8). Our bug, not the person's; never re-sent.
-    Unread { write_id: u64 },
-    /// A FORCED write (`Expect::Any`) told `Lost`: fallen, NOT re-sent — it
-    /// has no premise to re-check, so a re-send is a blind overwrite
-    /// (sdk#235, WRITE-PATH ⁷).
-    ForcedLost { write_id: u64 },
-    /// Something in a subscribed range changed. An ACCELERATOR: a binding
-    /// that never heard this would still be correct, on its backstop.
-    Changed {
-        sub_id: u64,
-        new_root: [u8; 32],
-        why: protocol::Why,
-    },
-    /// The engine has stopped comparing a range. Reload it to retry.
-    ///
-    /// Surfaced rather than swallowed: a binding whose notifications quietly
-    /// stopped looks exactly like one whose data quietly stopped changing.
-    Stale { sub_id: u64 },
-}
 
 /// The kinds of frame that go at most one at a time.
 #[derive(Clone, Copy)]
@@ -79,17 +48,6 @@ enum OneKind {
 pub struct Client {
     /// Requests encoded and waiting for the host to send them.
     outbound: Vec<Vec<u8>>,
-    /// Replies that arrived and are not pushes.
-    replies: Vec<Reply>,
-    /// Things the app may want to hear about. Drained, never dropped.
-    pub events: Vec<Event>,
-    /// Messages this build could not use, BY REASON.
-    ///
-    /// Counted and not silent, exactly as the delegate counts them. A client
-    /// talking to a node in a format it cannot read would otherwise wait for
-    /// ever for an answer to a message nobody understood, and the only symptom
-    /// would be a UI that never settles.
-    pub dropped: Vec<Dropped>,
     /// The diagnostics ring. THE CLIENT HOLDS IT.
     ///
     /// Never the delegate's context — that budget belongs to the commit in
@@ -146,9 +104,6 @@ impl Client {
     pub fn from_random(random: Option<[u8; 8]>) -> Client {
         Client {
             outbound: Vec::new(),
-            replies: Vec::new(),
-            events: Vec::new(),
-            dropped: Vec::new(),
             traces: Traces::default(),
             now_ms: None,
             rec: None,
@@ -376,8 +331,9 @@ impl Client {
         let reply = match protocol::decode_reply(bytes) {
             Ok(r) => r,
             Err(why) => {
+                // Counted BY REASON in the ring, not silent: a client talking to a node in a format it cannot read
+                // would otherwise wait for ever, and the only symptom would be a UI that never settles.
                 self.record_drop(why);
-                self.dropped.push(why);
                 return;
             }
         };
@@ -390,21 +346,8 @@ impl Client {
             self.frames.answered();
         }
         match reply {
-            Reply::Changed {
-                sub_id,
-                new_root,
-                why,
-                ..
-            } => {
-                if why == protocol::Why::Stale {
-                    self.events.push(Event::Stale { sub_id });
-                }
-                self.events.push(Event::Changed {
-                    sub_id,
-                    new_root,
-                    why,
-                });
-            }
+            // A push: recorded above; nothing here waits on it (its events list had no reader, sdk#482).
+            Reply::Changed { .. } => {}
             Reply::Step { of, depth, what, n } => {
                 // Stamped as it LANDS. There is no other honest moment: the
                 // engine has no clock, so the only time anyone can measure is
@@ -421,11 +364,26 @@ impl Client {
             Reply::CallBytes { .. } => {}
             // A version this build does not serve. Counted, and the client is
             // told: a silence here is a UI that waits for ever.
-            Reply::Unsupported { .. } => {
-                self.record_drop(Dropped::NotForUs);
-                self.dropped.push(Dropped::NotForUs)
-            }
-            other => self.replies.push(other),
+            Reply::Unsupported { .. } => self.record_drop(Dropped::NotForUs),
+            // An ANSWER: recorded above (`record_reply`). The client keeps no queue of them -- its reply queue had no
+            // reader, and its doc named a `drain_replies` that never existed (sdk#482). Every variant NAMED, so a new
+            // reply does not compile until it is placed.
+            Reply::Identity { .. }
+            | Reply::AlreadyInstalled
+            | Reply::Value { .. }
+            | Reply::Page { .. }
+            | Reply::WriteState { .. }
+            | Reply::Unavailable { .. }
+            | Reply::Dropped { .. }
+            | Reply::Call { .. }
+            | Reply::Delta { .. }
+            | Reply::FullReloadRequired { .. }
+            | Reply::Subscribed { .. }
+            | Reply::SessionWriteState { .. }
+            | Reply::Acked { .. }
+            | Reply::Conflicted { .. }
+            | Reply::Unread { .. }
+            | Reply::Superseded { .. } => {}
         }
     }
 

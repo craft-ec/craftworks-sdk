@@ -82,9 +82,6 @@ pub struct Writes {
     /// told "saved" about a write that never landed. Cleared when the key is
     /// written again.
     rolled_back: BTreeSet<Vec<u8>>,
-    /// Writes refused at make time, returned to their caller (and kept here
-    /// for a caller that did not look).
-    pub refused: Vec<(u64, Refused)>,
     /// `QueueFull` fates that reached `on_fate` for a still-OPEN write (sdk#450): the door's verdict arriving after
     /// the door, which `hand_over` rules out. Loud in debug; in release ignored and COUNTED here, never a panic (a
     /// panic is a dead wasm page). TEMPORARY: outside the recording spine until the recorder reaches Writes
@@ -111,7 +108,6 @@ impl Writes {
             keys_of: BTreeMap::new(),
             forced: BTreeSet::new(),
             rolled_back: BTreeSet::new(),
-            refused: Vec::new(),
             late_door_verdicts: 0,
             conflicts: Vec::new(),
             unread: Vec::new(),
@@ -185,8 +181,8 @@ impl Writes {
         Ok(write_id)
     }
 
-    fn refuse(&mut self, write_id: u64, why: Refused) -> Refused {
-        self.refused.push((write_id, why));
+    /// A refusal at make time: RETURNED to its caller, its one reader (a copy kept here had none, sdk#482).
+    fn refuse(&mut self, _write_id: u64, why: Refused) -> Refused {
         why
     }
 
@@ -195,7 +191,7 @@ impl Writes {
     pub fn refused_at_door(&mut self, write_id: u64, why: Refused) {
         self.keys_of.remove(&write_id);
         self.forced.remove(&write_id);
-        self.refused.push((write_id, why));
+        let _ = why;
     }
 
     /// Is this one of this client's writes that has not ended?
