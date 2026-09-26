@@ -153,7 +153,8 @@ mod tests {
     /// here -- are lost and answered NotFound, every other block relayed. `m + 1` loses one more.
     #[test]
     fn a_data_group_loses_its_first_n_slots_data_members_first() {
-        let (root, b, _) = tree();
+        let (root, b, parity) = tree();
+        let parity: std::collections::HashMap<Cid, Vec<u8>> = parity.into_iter().collect();
         let root_bytes = b.get(&root).expect("the root").to_vec();
         let node = Node::parse(&root_bytes).expect("a node");
         assert!(!node.is_leaf(), "THE SETUP: the root is a leaf, so no group of children");
@@ -172,6 +173,39 @@ mod tests {
                 assert_eq!(v == Verdict::NotFound(child), c.lost.contains(&child), "child {i}");
             }
             assert_eq!(l.not_found as usize, data_lost);
+            // THE GROUP IS THE TREE'S OWN (the architect on #525): its parity slots are parity this tree's apply made,
+            // and the engine's own decoder rebuilds every lost member from the slots left when m are lost -- and has
+            // fewer than k to work with when m + 1 are.
+            assert!(c.slots[c.k..].iter().all(|p| parity.contains_key(p)), "a chosen parity slot is not this tree's parity");
+            let group = |ix: usize| engine::repair::Group {
+                missing: c.slots[ix],
+                missing_ix: ix,
+                kind: kind::TREE_NODE,
+                slots: c.slots.clone(),
+                k: c.k,
+                max_len: freenet_prolly::parity::MAX_MEMBER_NODE,
+            };
+            let probe = group(0);
+            let have: Vec<Option<Vec<u8>>> = c
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let raw = if i < c.k { b.get(id).map(<[u8]>::to_vec) } else { parity.get(id).cloned() };
+                    (!c.lost.contains(id)).then(|| probe.stored(i, &raw.expect("every slot's bytes are held")))
+                })
+                .collect();
+            let left = have.iter().filter(|h| h.is_some()).count();
+            if n == PARITY {
+                assert!(left >= c.k, "m lost left {left} of k = {}", c.k);
+                for ix in (0..c.k).filter(|ix| c.lost.contains(&c.slots[*ix])) {
+                    let rebuilt = engine::repair::rebuild(&group(ix), &have).expect("m lost: the lost member decodes");
+                    assert_eq!(Some(rebuilt.as_slice()), b.get(&c.slots[ix]), "member {ix} rebuilt to other bytes");
+                }
+            } else {
+                assert!(left < c.k, "m + 1 lost still left {left} of k = {}: the control would pass by luck", c.k);
+                assert!(engine::repair::rebuild(&group(0), &have).is_err(), "m + 1 lost, and a member still decoded");
+            }
         }
     }
 
