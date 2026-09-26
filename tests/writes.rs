@@ -139,7 +139,7 @@ fn a_conflicted_write_leaves_none_of_its_own_keys_pending() {
 #[test]
 fn an_own_writes_end_names_its_keys_once() {
     let both = vec![b"a/1".to_vec(), b"a/2".to_vec()];
-    for fate in [Fate::Published { seq: 1, backed_up: false }, Fate::Lost, Fate::Failed, Fate::QueueFull { bytes: 1, limit: 1 }] {
+    for fate in [Fate::Published { seq: 1, backed_up: false }, Fate::Lost, Fate::Failed] {
         let mut s = writes();
         let edits = vec![(b"a/1".to_vec(), Edit::Put(b"v1".to_vec())), (b"a/2".to_vec(), Edit::Put(b"v2".to_vec()))];
         let id = s.make(&[(b"a/1".to_vec(), protocol::Expect::Absent), (b"a/2".to_vec(), protocol::Expect::Absent)], &edits).expect("made");
@@ -150,6 +150,35 @@ fn an_own_writes_end_names_its_keys_once() {
         s.on_fate(id, fate.clone());
         assert!(s.take_state_changed().is_empty(), "{fate:?}: a repeated fate named the keys again");
     }
+}
+
+/// **QueueFull is the door's, never an end** (sdk#450): the call that made the write returns it, and the write is
+/// closed there (`refused_at_door`), so a QueueFull fate for it later ends nothing and names nothing -- no second
+/// telling. The SDK makes the write again as a new one.
+#[test]
+fn a_write_refused_queue_full_at_the_door_is_closed_by_the_refusal() {
+    let mut s = writes();
+    let id = s.make(&[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), Edit::Put(b"v".to_vec()))]).expect("made");
+    assert!(s.is_open(id), "THE SETUP: the made write is not open");
+    s.refused_at_door(id, craftworks_sdk::Refused::QueueFull { bytes: 1, limit: 1 });
+    assert!(!s.is_open(id), "a write refused at the door is still open");
+    s.on_fate(id, Fate::QueueFull { bytes: 1, limit: 1 });
+    assert!(s.take_ended().is_empty() && s.take_state_changed().is_empty(), "a door-refused write was told again as an end");
+}
+
+/// **A QueueFull fate for a still-OPEN write is loud in debug and a counted no-op in release** (sdk#450, the
+/// architect: a panic is a dead wasm page). `hand_over` rules it out; if it ever arrives it ends and names nothing.
+#[test]
+fn a_late_queue_full_for_an_open_write_ends_nothing_and_is_counted() {
+    let mut s = writes();
+    let id = s.make(&[(b"a/1".to_vec(), protocol::Expect::Absent)], &[(b"a/1".to_vec(), Edit::Put(b"v".to_vec()))]).expect("made");
+    let late = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.on_fate(id, Fate::QueueFull { bytes: 1, limit: 1 })));
+    assert_eq!(late.is_err(), cfg!(debug_assertions), "debug is not loud (or release panics: a dead wasm page)");
+    if !cfg!(debug_assertions) {
+        assert_eq!(s.late_door_verdicts, 1, "the late door verdict was not counted");
+    }
+    assert!(s.is_open(id), "a late QueueFull ended the write");
+    assert!(s.take_ended().is_empty() && s.take_state_changed().is_empty(), "a late QueueFull was told as an end");
 }
 
 /// sdk#264 / builder#107: a SUPERSEDED write names its keys, so a plain

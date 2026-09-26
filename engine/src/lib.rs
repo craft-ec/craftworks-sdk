@@ -1027,14 +1027,14 @@ pub enum Pin {
     HeldForeign,
 }
 
-/// The page's fact for [`Engine::pins`]: its warm-apply blocks (`Effect::Keep`).
+/// The page's fact for [`Engine::pins`]: its outstanding `Held` asks (HF). W, the warm-apply blocks, is the
+/// engine's own record since sdk#450 (one owner of "the bytes the queue pins").
 ///
 /// One class the design proposed is NOT a pin (sdk#411, measured): R, a repaired block whose PUT is out -- its
 /// re-send carries its own bytes (`Op::Put`, `put_again`), no reader takes them from the store, so its "unpinned"
 /// mutant could never go red. H is kept only as HF (a foreign member with bytes and an ask out): for this page's
 /// own block C or B already pins it, and a foreign one with no bytes is simply asked again.
 pub struct PagePins<'a> {
-    pub kept: &'a BTreeSet<Cid>,
     /// Ids with a `Held` ask out (a deadline or a backed-off re-ask): HF, for those this page holds bytes of.
     pub held_asks: &'a BTreeSet<Cid>,
 }
@@ -1403,6 +1403,12 @@ pub struct Engine<B: Blocks> {
     /// Re-puts that found the block's bytes GONE from the store (sdk#411): a commit or a straggler that can never be
     /// put again. The pin rule's model property: always 0.
     reput_missing: u64,
+    /// THE W PIN's one record (sdk#450, the architect): every block a queued write's warm apply emitted
+    /// (`Effect::Keep`) that the node has NOT confirmed, with its bytes -- each id ONCE (a content-addressed block
+    /// two writes emit is held once). The only copy while any write is in flight: it leaves when the node confirms
+    /// it (then the node holds it) and all of it is forgotten at the end of a step with no write in flight.
+    kept: BTreeMap<Cid, usize>,
+    kept_bytes: usize,
     /// Writes whose group a later root move RE-CODED (COMMIT-LIFE §P,
     /// superseded stragglers): their data now lives in the newer version of
     /// the group, so they wait for the NEXT own commit's `Backing`, which
@@ -1662,6 +1668,8 @@ impl<B: Blocks> Engine<B> {
             backing: Vec::new(),
             rejected: BTreeSet::new(),
             reput_missing: 0,
+            kept: BTreeMap::new(),
+            kept_bytes: 0,
             carry: BTreeSet::new(),
             repairs: BTreeMap::new(),
             repair_slots: BTreeMap::new(),
@@ -1822,7 +1830,7 @@ impl<B: Blocks> Engine<B> {
 
     /// Writes queued and bytes of them: what `QueueFull` is measured against.
     pub fn queue_load(&self) -> (usize, usize) {
-        (self.queue.len(), self.queue.iter().map(|q| q.size).sum())
+        (self.queue.len(), self.queued_bytes())
     }
 
     /// K9 (COMMIT-LIFE footnote 2): rebuilt commits whose root differed from
@@ -2024,6 +2032,7 @@ impl<B: Blocks> Engine<B> {
             out.extend(self.keep_saveable());
             self.cascade.clear();
             self.arrived.clear();
+            self.forget_kept_if_idle();
             self.one_ask_each(&mut out);
             return out;
         }
@@ -2032,8 +2041,24 @@ impl<B: Blocks> Engine<B> {
         out.extend(self.keep_saveable());
         self.cascade.clear();
         self.arrived.clear();
+        self.forget_kept_if_idle();
         self.one_ask_each(&mut out);
         out
+    }
+
+    /// W is the only copy only while a write is queued or a commit pending: with neither, forgotten.
+    fn forget_kept_if_idle(&mut self) {
+        if !self.has_writes_in_flight() {
+            self.kept.clear();
+            self.kept_bytes = 0;
+        }
+    }
+
+    /// THE ONE SUM of what the write queue holds (sdk#450, rule 9): its writes' OPS bytes plus the bytes the W pin
+    /// holds for them (their warm-apply blocks, each once). `QueueFull` is measured against it, and so is
+    /// `queue_load`: no second form of "queued bytes".
+    pub fn queued_bytes(&self) -> usize {
+        self.queue.iter().map(|q| q.size).sum::<usize>() + if self.has_writes_in_flight() { self.kept_bytes } else { 0 }
     }
 
     /// ONE ask per block per step (sdk#303). A block can be wanted for several reasons in one step -- a read, a
@@ -2999,7 +3024,7 @@ impl<B: Blocks> Engine<B> {
         // would fit, until the session has nothing queued: a smaller later
         // write never lands before the older one it followed. With nothing
         // queued the session is taken (its fair share) and unblocked.
-        let bytes = self.queue.iter().map(|q| q.size).sum::<usize>();
+        let bytes = self.queued_bytes();
         let has_one = self.queue.iter().any(|q| q.client == client);
         if has_one && (self.queue_blocked.contains(&client) || bytes + size > self.params.max_queue_bytes) {
             self.queue_blocked.insert(client);
@@ -3146,6 +3171,10 @@ impl<B: Blocks> Engine<B> {
         // something nobody has put (`arrived` is cleared when the step ends).
         for (id, bytes) in &emitted {
             self.arrived.insert(*id, bytes.clone());
+            if !self.kept.contains_key(id) {
+                self.kept.insert(*id, bytes.len());
+                self.kept_bytes += bytes.len();
+            }
         }
         let mut out: Vec<Effect> = emitted.into_iter().map(|(id, bytes)| Effect::Keep { id, bytes }).collect();
         if !e.told_accepted {
@@ -4091,6 +4120,12 @@ impl<B: Blocks> Engine<B> {
     }
 
     fn on_confirmed(&mut self, id: Cid) -> Vec<Effect> {
+        // The node holds it now: a warm-apply block leaves the W pin, and its bytes the queue's sum (sdk#450).
+        // (A block a LATER warm apply re-emits after the node confirmed it stays counted until the queue idles --
+        // an over-count, never an under-count: the confirmation is not repeated.)
+        if let Some(n) = self.kept.remove(&id) {
+            self.kept_bytes -= n;
+        }
         let head_early = self.params.head_before_packs;
         let mut out = Vec::new();
         // A published commit's straggler landing: one closer to BACKED_UP.
@@ -5152,7 +5187,7 @@ impl<B: Blocks> Engine<B> {
             }
         }
         if self.has_writes_in_flight() {
-            for id in page.kept {
+            for id in self.kept.keys() {
                 pin(id, Pin::Warm);
             }
         }

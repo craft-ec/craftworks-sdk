@@ -302,11 +302,20 @@ fn a_group_that_landed_unheard_is_published_and_not_committed_twice() {
 /// fair share: the hold is per session).
 #[test]
 fn a_write_told_queue_full_is_not_overtaken_by_a_smaller_later_one() {
-    let params = Params { max_queue_bytes: 155, ..Params::default() };
+    // The bound counts what the queue HOLDS (sdk#450): its writes' ops AND the warm-apply blocks they pin. So it is
+    // set from the first write's held bytes, measured on a twin: A's ops (115) do not fit behind the first, B's (40)
+    // do. The first write's value is large (400) so that, once the queue drains, A's held bytes (its ops and its
+    // warm leaf) still leave room for B -- the setup asserts both.
+    let held_first = {
+        let mut t = common::new_store_params(Params::default());
+        let _ = stepped!(t, w(1, 0, b"z", &[0u8; 400], Expect::Absent));
+        t.queue_load().1
+    };
+    let params = Params { max_queue_bytes: held_first + 60, ..Params::default() };
     let mut e = common::new_store_params(params);
     let put = |id: u64, client: u64, k: &[u8], v: &[u8]| Event::forced_write(ClientId(client), WriteId(id), vec![(k.to_vec(), Op::Put(v.to_vec()))]);
-    // Sizes (ops + 34 per read; a forced write reads `Any`): the first 45, A 115, B 40. A fits with B (155), not behind the first (160); B fits behind the first (85).
-    let first = stepped!(e, w(1, 0, b"z", &[0u8; 10], Expect::Absent));
+    let first = stepped!(e, w(1, 0, b"z", &[0u8; 400], Expect::Absent));
+    assert_eq!(e.queue_load().1, held_first, "THE SETUP: the twin measured another first write");
     let a = stepped!(e, put(1, 1, b"k", &[b'a'; 80]));
     assert!(matches!(told(&a, 1)[..], [State::QueueFull { .. }]), "the large write was not held back: {:?}", told(&a, 1));
     let b = stepped!(e, put(2, 1, b"k", b"bbbbb"));
@@ -319,6 +328,7 @@ fn a_write_told_queue_full_is_not_overtaken_by_a_smaller_later_one() {
     // Made again, in order: A, then B.
     let a2 = stepped!(e, put(3, 1, b"k", &[b'a'; 80]));
     assert!(!told(&a2, 3).iter().any(|s| matches!(s, State::QueueFull { .. })), "the held write was not taken with its session's queue empty");
+    assert!(e.queue_load().1 + 40 <= params.max_queue_bytes, "THE SETUP: B does not fit behind A made again ({} held, bound {})", e.queue_load().1, params.max_queue_bytes);
     let b2 = stepped!(e, put(4, 1, b"k", b"bbbbb"));
     assert!(!told(&b2, 4).iter().any(|s| matches!(s, State::QueueFull { .. })), "the hold outlived the write it held for: {:?} queued {}", told(&b2, 4), e.queued_writes());
     let mut fx = a2;
@@ -326,7 +336,7 @@ fn a_write_told_queue_full_is_not_overtaken_by_a_smaller_later_one() {
     let out = drive(&mut e, fx);
     let _ = drive(&mut e, out);
     let mut want = BTreeMap::new();
-    want.insert(b"z".to_vec(), vec![0u8; 10]);
+    want.insert(b"z".to_vec(), vec![0u8; 400]);
     want.insert(b"o".to_vec(), b"x".to_vec());
     want.insert(b"k".to_vec(), b"bbbbb".to_vec());
     assert_eq!(e.root(), common::rebuild(&want), "the older value landed over the later one");

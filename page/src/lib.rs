@@ -690,9 +690,6 @@ pub struct Page {
     /// `signer_proto::UNATTRIBUTED`.
     next_request: u32,
     engine: Engine<PageBlocks>,
-    /// Blocks a queued write's warm apply made (`Effect::Keep`): the only copy while any write is queued or a commit
-    /// is pending (the W pin, sdk#411); forgotten once neither is.
-    kept: BTreeSet<Cid>,
     /// Blocks whose PUT was answered ok (an effect's `after` is judged here).
     confirmed: BTreeSet<Cid>,
     /// Effects held until their `after` set is confirmed, in emitted order.
@@ -854,7 +851,6 @@ impl Page {
             device: [0; 16],
             hold_on_displace: false,
             engine,
-            kept: BTreeSet::new(),
             confirmed: BTreeSet::new(),
             held: Vec::new(),
             head: Pub::default(),
@@ -2595,10 +2591,6 @@ impl Page {
         if bytes <= budget.max(self.engine.blocks().rearm_at) {
             return;
         }
-        // W is the only copy only while a write is queued or a commit pending: past that, forgotten.
-        if !self.engine.has_writes_in_flight() {
-            self.kept.clear();
-        }
         let order = self.engine.blocks_mut().eviction_order();
         self.engine.blocks_mut().stats.scanned += order.len() as u64;
         // HF: every block a `Held` ask is out for -- backing off, queued for the next batch, or in a batch on the wire
@@ -2613,7 +2605,7 @@ impl Page {
             }).flatten())
             .copied()
             .collect();
-        let pins = self.engine.pins(&engine::PagePins { kept: &self.kept, held_asks: &asked });
+        let pins = self.engine.pins(&engine::PagePins { held_asks: &asked });
         let store = self.engine.blocks();
         let mut over = bytes - budget;
         let mut drop = Vec::new();
@@ -2770,7 +2762,6 @@ impl Page {
                 // the warm root, never put -- its commit puts the same bytes.
                 Effect::Keep { id, ref bytes } => {
                     self.engine.blocks_mut().insert(id, bytes);
-                    self.kept.insert(id);
                 }
                 // SUPERSEDED (COMMIT-LIFE §P): a later root move re-coded the
                 // group this block was in. Its PUT is WITHDRAWN -- no more

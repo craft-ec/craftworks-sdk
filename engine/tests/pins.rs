@@ -42,7 +42,7 @@ fn a_parked_reads_waited_and_held_blocks_are_pinned() {
     let first = fetches(&out);
     assert_eq!(first, vec![root], "THE SETUP: the cold read did not ask for the root first");
     let k = no_page_facts();
-    let pins = |e: &Engine<Store>| e.pins(&PagePins { kept: &k, held_asks: &k });
+    let pins = |e: &Engine<Store>| e.pins(&PagePins { held_asks: &k });
     assert_eq!(pins(&e).get(&root), Some(&Pin::ParkedRead), "the block a parked read WAITS on is not pinned");
     // The root lands: the read holds it and parks on the next level.
     let bytes = all.get(&root).expect("the root");
@@ -65,7 +65,7 @@ fn a_parked_writes_waited_and_held_blocks_are_pinned_until_it_applies() {
     let mut e = started(root);
     e.blocks().put(root, all.get(&root).expect("the root"));
     let k = no_page_facts();
-    let pins = |e: &Engine<Store>| e.pins(&PagePins { kept: &k, held_asks: &k });
+    let pins = |e: &Engine<Store>| e.pins(&PagePins { held_asks: &k });
     let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"cold".to_vec()))]));
     let mut queue = fetches(&out);
     assert!(!queue.is_empty(), "THE SETUP: the write onto a cold path asked for nothing");

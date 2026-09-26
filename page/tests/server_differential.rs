@@ -613,6 +613,29 @@ fn a_full_queue_is_told_by_name() {
     assert_eq!(rig.server.queue_load().0, 1, "the refused write joined the queue");
 }
 
+/// **A write refused at the door leaves nothing held** (sdk#450): `QueueFull`
+/// ends that write id (the SDK makes the write again as a new one), so the
+/// server drops its final values like any other ended write. 200 refusals
+/// behind one held commit: only the taken write is held. Mutant "QueueFull not
+/// an end" -> 201 held -> red (probe B: 75k refusals held 96 MB).
+#[test]
+fn a_write_refused_queue_full_leaves_nothing_held() {
+    let mut node = Node::new();
+    let mut rig = PageRig::with(Params { max_queue_bytes: 64, ..Params::default() });
+    rig.client_as(&mut node, &Request::Identity);
+    rig.faults.hold = true;
+    let p = rig.client_as(&mut node, &write(1, &[("k1", Some("v"))]));
+    assert_eq!(states(&p, 1), vec![WriteState::Accepted], "THE SETUP: the session's first write was not taken");
+    let mut refused = 0;
+    for w in 2..202u64 {
+        let p = rig.client_as(&mut node, &write(w, &[("k2", Some(&"v".repeat(64)))]));
+        refused += usize::from(matches!(states(&p, w).as_slice(), [WriteState::QueueFull { .. }]));
+    }
+    println!("{refused} writes refused QueueFull; writes held {}", rig.server.writes_held());
+    assert_eq!(refused, 200, "THE SETUP: not every write was refused");
+    assert_eq!(rig.server.writes_held(), 1, "writes refused at the door are still held");
+}
+
 /// A commit that cannot finish is told `Stalled` once `max_accept_age`
 /// SECONDS have passed, from the client's protocol ticks — and not before.
 #[test]
