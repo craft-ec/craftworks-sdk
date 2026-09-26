@@ -96,5 +96,16 @@ await t("**a control violation PLANTED in a crate the PR does not touch fails th
   }
 });
 
+await t("**GATE_OWNERS_PER_PR is the batch gate's alone** (sdk#420): refused in --pr and a bare full run (both as --dry-run, so a mutant that HONOURS the flag ends fast instead of running a gate), before any work, naming the flag; a non-count refused even with --accept", async () => {
+  for (const args of [["--pr", "--dry-run"], ["--dry-run"]]) {
+    const r = gate(root, args, { GATE_OWNERS_PER_PR: "1" });
+    assert.notEqual(r.status, 0, `honoured with ${JSON.stringify(args)}: a stray export would switch the owners control off`);
+    assert.match(r.stderr, /GATE_OWNERS_PER_PR is only for the batch gate/);
+  }
+  const bad = gate(root, ["--accept"], { GATE_OWNERS_PER_PR: "x" });
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.stderr, /must be a PR count, got 'x'/);
+});
+
 if (failures) { process.stdout.write(`gate-pr: ${failures} FAILED\n`); process.exit(1); }
 process.stdout.write("gate-pr: all ok\n");

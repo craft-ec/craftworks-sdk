@@ -81,6 +81,15 @@ fi
 if [ "$MODE" != full ] && [ $ACCEPT -eq 1 ]; then
   echo "gate: --accept is the batch gate's (the full run); a PR never records counts" >&2; exit 2
 fi
+# GATE_OWNERS_PER_PR is the BATCH's flag (craftworks-docs scripts/batch-merge.sh, sdk#420), honoured ONLY by the
+# batch gate (full + --accept). Anywhere else a stray export would switch off the one check that catches an
+# undeclared crossing on a single PR, while the gate printed a plausible line. Checked before any work.
+if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
+  case "$GATE_OWNERS_PER_PR" in (*[!0-9]*|0) echo "gate: GATE_OWNERS_PER_PR must be a PR count, got '$GATE_OWNERS_PER_PR'" >&2; exit 1 ;; esac
+  if [ "$MODE" != full ] || [ $ACCEPT -ne 1 ]; then
+    echo "gate: GATE_OWNERS_PER_PR is only for the batch gate (./gate.sh --accept from batch-merge.sh); unset it" >&2; exit 1
+  fi
+fi
 
 # THE OLD FORM IS REFUSED, not merged with the new (sdk#279). A branch made
 # before the split still carries `gate.baseline`; reading one form and writing
@@ -421,11 +430,18 @@ echo "$dup_line"
 [ $dup_rc -ne 0 ] && step_fail "dup-gate: $dup_line"
 
 step "owners"
-owners_out=$(node tools/owners.mjs 2>&1)
-owners_rc=$?
-echo "$owners_out"
-owners_line=$(echo "$owners_out" | tail -1)
-[ $owners_rc -ne 0 ] && step_fail "owners: $owners_line"
+# A BATCH tree mixes several PRs' commits, so one owners verdict over it says nothing: craftworks-docs
+# scripts/batch-merge.sh judges each PR on its own commits first and says so here (sdk#420). Never a commit message.
+if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
+  owners_line="owners: judged per PR ($GATE_OWNERS_PER_PR PRs)"
+  echo "$owners_line"
+else
+  owners_out=$(node tools/owners.mjs 2>&1)
+  owners_rc=$?
+  echo "$owners_out"
+  owners_line=$(echo "$owners_out" | tail -1)
+  [ $owners_rc -ne 0 ] && step_fail "owners: $owners_line"
+fi
 
 # ----------------------------------------------------------- summary ----
 # WHAT IT RAN and the COUNTS, not a verdict on its own.
