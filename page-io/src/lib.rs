@@ -1572,6 +1572,41 @@ mod opening_wiring {
             .count()
     }
 
+    /// THE MACHINES START ONLY AT CONSTRUCTION (the architect on #499/#503: what the type cannot say). Each machine's
+    /// state is private and only its `step` writes it, but its INITIAL constructors are crate-visible, so a mid-life
+    /// `self.head_sub = HeadSubState::unasked()` would reset it past `step`. This is a source check, the rule's allowed
+    /// case, with its reason: no `.opening =` / `.head_known =` / `.head_sub =` anywhere, and the constructors are
+    /// called only inside `new`, `build` or `reader`. THE CONTROL: a planted mid-life reset is caught.
+    #[test]
+    fn the_machines_are_started_only_at_construction() {
+        fn violations(src: &str) -> Vec<String> {
+            let code = &src[..src.find("#[cfg(test)]\nmod held_batch").expect("the first tests module")];
+            let mut fn_name = String::new();
+            let mut out = Vec::new();
+            for (i, raw) in code.lines().enumerate() {
+                let line = raw.split("//").next().unwrap_or_default();
+                if let Some(rest) = line.trim_start().strip_prefix("pub fn ").or_else(|| line.trim_start().strip_prefix("fn ")) {
+                    if raw.starts_with("    ") && !raw.starts_with("        ") {
+                        fn_name = rest.split(['(', '<']).next().unwrap_or_default().to_string();
+                    }
+                }
+                let reassigns = [".opening =", ".head_known =", ".head_sub ="].iter().any(|w| line.contains(w));
+                let constructs = ["OpeningState::", "HeadKnownState::", "HeadSubState::"].iter().any(|w| line.contains(w));
+                if reassigns || (constructs && !matches!(fn_name.as_str(), "new" | "build" | "reader")) {
+                    out.push(format!("{}: in fn {fn_name}: {}", i + 1, raw.trim()));
+                }
+            }
+            out
+        }
+        let src = include_str!("lib.rs");
+        assert_eq!(violations(src), Vec::<String>::new(), "a machine started or reset outside construction");
+        // THE CONTROL: a mid-life reset, planted in `reconnected`, is caught (so the reader finds real bodies).
+        let planted = src.replacen("        self.frames = wire::Reassembler::default();", "        self.frames = wire::Reassembler::default();\n        self.head_sub = HeadSubState::unasked();", 1);
+        assert_ne!(planted, src, "the control planted nothing");
+        let caught = violations(&planted);
+        assert!(caught.len() == 1 && caught[0].contains("in fn reconnected"), "a planted mid-life reset was not caught: {caught:?}");
+    }
+
     /// A READER's head is NAMED (someone published it), never "the signer has a record" (nobody said so).
     #[test]
     fn a_reader_starts_named_and_reader() {
