@@ -36,7 +36,7 @@ t("**a red file does not hide the files after it**: all run, exit 1, each named;
     assert.equal(r.status, 1);
     assert.ok(r.stdout.includes("second ran") && r.stdout.includes("third ran"), r.stdout);
     assert.match(r.stdout, /3 test files: 2 passed, 1 failed/);
-    assert.match(r.stdout, /^FAIL .*1\.test\.mjs/m);
+    assert.match(r.stdout, /^FAILED .*1\.test\.mjs/m, "a red file's line must match the review grep FAILED|panicked|REFUSED");
     assert.equal(run(ok).status, 0, "THE CONTROL");
   } finally { rmSync(d, { recursive: true }); rmSync(ok, { recursive: true }); }
 });

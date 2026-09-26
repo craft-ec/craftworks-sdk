@@ -9,7 +9,8 @@
 // Sequential on purpose: several tests start nodes or browsers, and side by side on a loaded machine their timing
 // waits would become the thing under test.
 //
-// The tally prints PASS/FAIL, never "  ok ": gate.sh counts `^  ok ` lines as the tests that passed.
+// The tally prints PASS/FAILED, never "  ok ": gate.sh counts `^  ok ` lines as the tests that passed, and every
+// review grep is `FAILED|panicked|REFUSED`, which a bare "FAIL" would slip past.
 import { spawnSync } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -45,6 +46,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
   const failed = results.filter(r => r.rc !== 0);
   console.log(`\n── ${files.length} test files: ${files.length - failed.length} passed, ${failed.length} failed ──`);
-  for (const r of results) console.log(`${r.rc === 0 ? "PASS" : "FAIL"} ${r.f}  (${r.s} s${r.rc === 0 ? "" : `, rc ${r.rc}`})`);
+  for (const r of results) console.log(`${r.rc === 0 ? "PASS" : "FAILED"} ${r.f}  (${r.s} s${r.rc === 0 ? "" : `, rc ${r.rc}`})`);
   process.exit(failed.length ? 1 : 0);
 }
