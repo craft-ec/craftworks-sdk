@@ -128,24 +128,7 @@ async fn main() -> Result<()> {
 
     // ---- connection A registers the delegate and calls it N times ----
     let mut a = connect(&node.ws()).await?;
-    let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
-        &DelegateCode::from(wasm.clone()),
-        &Parameters::from(vec![]),
-    ))));
-    let key = delegate.key().clone();
-    timeout(
-        STEP,
-        a.send(ClientRequest::DelegateOp(
-            DelegateRequest::RegisterDelegate {
-                delegate,
-                cipher: [0u8; 32],
-                nonce: [0u8; 24],
-            },
-        )),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("register: the node stopped accepting requests"))??;
-    let _ = timeout(STEP, a.recv()).await;
+    let key = probe::signer::register_delegate(&mut a, &wasm).await?;
     println!("delegate: registered, key {key}");
 
     const N: u32 = 5;

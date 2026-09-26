@@ -10,15 +10,9 @@
   },
   {
    "key": "c0910e95c2f5e4ce",
-   "a": "probe/src/bin/live-page-writes.rs:32-38",
-   "b": "probe/src/bin/live-signer.rs:154-169",
+   "a": "probe/src/bin/live-page-writes.rs:63-69",
+   "b": "probe/src/bin/live-signer.rs:34-49",
    "lines": 7
-  },
-  {
-   "key": "5ca0629cd797fd44",
-   "a": "probe/src/bin/live-signer.rs:39-48",
-   "b": "probe/src/bin/two-connections.rs:138-147",
-   "lines": 10
   },
   {
    "key": "e2a3750844311d55",
@@ -33,18 +27,6 @@
    "lines": 6
   },
   {
-   "key": "9a5db9857ec324fc",
-   "a": "probe/src/bin/platform-probe.rs:264-273",
-   "b": "probe/src/bin/two-connections.rs:130-138",
-   "lines": 10
-  },
-  {
-   "key": "14e8a560d331cfc6",
-   "a": "probe/src/bin/platform-probe.rs:273-283",
-   "b": "probe/src/bin/two-connections.rs:138-148",
-   "lines": 11
-  },
-  {
    "key": "c7e499dd221049a7",
    "a": "probe/src/bin/platform-probe.rs:46-64",
    "b": "probe/src/bin/two-connections.rs:37-55",
@@ -52,14 +34,14 @@
   },
   {
    "key": "03266b223c232e32",
-   "a": "probe/src/bin/platform-probe.rs:606-621",
-   "b": "probe/src/bin/platform-probe.rs:355-370",
+   "a": "probe/src/bin/platform-probe.rs:588-603",
+   "b": "probe/src/bin/platform-probe.rs:337-352",
    "lines": 16
   },
   {
    "key": "e22c301b465b18ab",
-   "a": "probe/src/lib.rs:498-508",
-   "b": "probe/src/lib.rs:470-480",
+   "a": "probe/src/lib.rs:499-509",
+   "b": "probe/src/lib.rs:471-481",
    "lines": 11
   },
   {
@@ -79,12 +61,6 @@
    "a": "src/tree_store.rs:263-272",
    "b": "testkit/src/mem_store.rs:34-42",
    "lines": 10
-  },
-  {
-   "key": "891197a8a0f41647",
-   "a": "src/tree_store.rs:333-339",
-   "b": "engine/src/read.rs:393-398",
-   "lines": 7
   },
   {
    "key": "2b71955a529be7ad",

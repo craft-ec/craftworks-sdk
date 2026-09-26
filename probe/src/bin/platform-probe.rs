@@ -263,25 +263,7 @@ async fn main() -> Result<()> {
         .context("connecting to the node")?;
     let mut client = WebApi::start(stream);
 
-    let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
-        &DelegateCode::from(wasm.clone()),
-        &Parameters::from(vec![]),
-    ))));
-    let key = delegate.key().clone();
-    timeout(
-        STEP,
-        client.send(ClientRequest::DelegateOp(
-            DelegateRequest::RegisterDelegate {
-                delegate,
-                cipher: [0u8; 32],
-                nonce: [0u8; 24],
-            },
-        )),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("register: the node stopped accepting requests"))??;
-    // The register response is an Ok with nothing in it; drain one message.
-    let _ = timeout(STEP, client.recv()).await;
+    let key = probe::signer::register_delegate(&mut client, &wasm).await?;
     println!("node: probe delegate registered, key {key}");
 
     // ---- (4) what a call costs ----
