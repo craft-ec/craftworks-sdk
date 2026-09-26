@@ -7,6 +7,10 @@
 //! parity). Degraded: 0 <= margin < m. Damaged: margin < 0, named by its first parity id. A block silent at its GET's
 //! deadline is PENDING: counted, never guessed present or absent; the next pass asks it again.
 
+// No catch-all over a state or an event: a new case fails the build until it is handled (clippy, run by the gate
+// with -D warnings).
+#![deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)]
+
 use engine::read::{NodeGroups, NodesAt};
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -27,30 +31,124 @@ pub(crate) enum Seen {
     Rejected,
 }
 
-/// A pass in progress.
+/// A pass in progress. ONE WRITER, BY TYPE (CLAUDE.md): every field is private to this module, and the pass
+/// changes only through its `&mut` methods below -- the page reads it through accessors and can write nothing else.
 pub(crate) struct Audit {
-    pub root: Cid,
+    root: Cid,
     /// Where the walk's next page starts; `None` with `walked` once every level is walked.
-    pub next: Option<NodesAt>,
-    pub walked: bool,
+    next: Option<NodesAt>,
+    walked: bool,
     /// The walk's read in flight (its engine request id), if any.
-    pub walk_req: Option<u64>,
-    pub reqs: u64,
+    walk_req: Option<u64>,
+    reqs: u64,
     /// Every group the walk found: (members, parity ids).
-    pub groups: Vec<(Vec<Cid>, Vec<Cid>)>,
-    pub seen: BTreeMap<Cid, Seen>,
+    groups: Vec<(Vec<Cid>, Vec<Cid>)>,
+    seen: BTreeMap<Cid, Seen>,
     /// Blocks still to ask `Held` about, and blocks the node did not hold, still to GET.
-    pub to_hold: VecDeque<Cid>,
-    pub to_get: VecDeque<Cid>,
+    to_hold: VecDeque<Cid>,
+    to_get: VecDeque<Cid>,
     /// The page had no signer to ask `Held` (a reader's page): nothing was measured.
-    pub unmeasured: bool,
+    unmeasured: bool,
     /// When the pass began (the page's clock, ms).
-    pub started_at: u64,
+    started_at: u64,
+}
+
+/// The pass's next op, as [`Audit::next`] decides it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Next {
+    /// The walk's read is out (or parked on its fetch): nothing new.
+    Walking,
+    /// Walk the next page from `at`, as engine read `req`.
+    Walk { req: u64, at: Option<NodesAt> },
+    /// Ask `Held` about these.
+    AskHeld(Vec<Cid>),
+    /// GET this one.
+    Get(Cid),
+    /// Nothing left: the pass is done.
+    Done,
 }
 
 impl Audit {
-    pub fn new(root: Cid) -> Audit {
-        Audit { root, next: None, walked: false, walk_req: None, reqs: 0, groups: Vec::new(), seen: BTreeMap::new(), to_hold: VecDeque::new(), to_get: VecDeque::new(), unmeasured: false, started_at: 0 }
+    pub fn new(root: Cid, started_at: u64) -> Audit {
+        Audit { root, next: None, walked: false, walk_req: None, reqs: 0, groups: Vec::new(), seen: BTreeMap::new(), to_hold: VecDeque::new(), to_get: VecDeque::new(), unmeasured: false, started_at }
+    }
+
+    /// The root the pass audits.
+    pub fn root(&self) -> Cid {
+        self.root
+    }
+
+    /// Is `req` the walk's read in flight?
+    pub fn walks(&self, req: u64) -> bool {
+        self.walk_req == Some(req)
+    }
+
+    /// Is the walk's read still out?
+    pub fn walking(&self) -> bool {
+        self.walk_req.is_some()
+    }
+
+    /// What the pass learned of one block (its GET's answer, or its silence).
+    pub fn saw(&mut self, id: Cid, seen: Seen) {
+        self.seen.insert(id, seen);
+    }
+
+    /// NO SIGNER TO ASK: UNMEASURED -- nothing more is asked, nothing is absent.
+    pub fn unasked(&mut self) {
+        self.unmeasured = true;
+        self.to_hold.clear();
+        self.to_get.clear();
+    }
+
+    /// A `Held` batch's answer for `ids`: held, or queued for a GET; past a short answer's end, asked again.
+    pub fn held(&mut self, ids: Vec<Cid>, present: &[bool]) {
+        for (i, id) in ids.into_iter().enumerate() {
+            match present.get(i) {
+                Some(true) => {
+                    self.seen.insert(id, Seen::Held);
+                }
+                Some(false) => self.to_get.push_back(id),
+                None => self.to_hold.push_back(id),
+            }
+        }
+    }
+
+    /// The pass's next op (KEEPER §7), taken: the walk's next page, a Held batch of at most `max_held`, or one GET.
+    pub fn next(&mut self, max_held: usize) -> Next {
+        if self.walk_req.is_some() {
+            return Next::Walking;
+        }
+        if !self.walked {
+            self.reqs += 1;
+            self.walk_req = Some(self.reqs);
+            return Next::Walk { req: self.reqs, at: self.next.clone() };
+        }
+        if !self.to_hold.is_empty() {
+            let n = self.to_hold.len().min(max_held);
+            return Next::AskHeld(self.to_hold.drain(..n).collect());
+        }
+        match self.to_get.pop_front() {
+            Some(id) => Next::Get(id),
+            None => Next::Done,
+        }
+    }
+
+    /// The walk could not be served: what was walked is measured.
+    pub fn walk_failed(&mut self) {
+        self.walked = true;
+        self.walk_req = None;
+    }
+
+    /// For a unit test of one cell: the walk done, so the pass goes straight to its asks.
+    #[cfg(test)]
+    pub fn walked_for_test(&mut self) {
+        self.walked = true;
+    }
+
+    /// The blocks queued for a GET (a test reads them).
+    #[cfg(test)]
+    pub fn to_get(&self) -> Vec<Cid> {
+        self.to_get.iter().copied().collect()
     }
 
     /// A group to measure: joined, each of its blocks queued to be asked once -- except one the node REJECTED
