@@ -122,11 +122,18 @@ pub struct Server {
     backed_up_keys: BTreeMap<u64, Vec<Vec<u8>>>,
 }
 
-/// A key's last write here (`Server::last_write`).
-struct LastWrite {
+/// A key's last write here (`Server::last_write`). FIXED-SIZE (the architect on #437): the value's DIGEST, never
+/// the value -- a copy of the data would be a second holder of it (rule 3), and page memory growing with every
+/// key written, beside #411's bound. `None`: the write deleted the key.
+pub struct LastWrite {
     write: WriteKey,
-    value: Option<Vec<u8>>,
+    digest: Option<[u8; 32]>,
     backed_up: bool,
+}
+
+/// What `LastWrite` keeps of a value.
+fn digest_of(v: &Option<Vec<u8>>) -> Option<[u8; 32]> {
+    v.as_ref().map(|b| *blake3::hash(b).as_bytes())
 }
 
 /// THE MERGE of a same-seq race (sdk#225b part 2, cell B; COMMIT-LIFE K9 §2):
@@ -504,7 +511,7 @@ impl Server {
                             // Its keys' last write is this one now (sdk#415).
                             let keys: Vec<Vec<u8>> = sent.finals.iter().map(|(k, _)| k.clone()).collect();
                             for (k, v) in &sent.finals {
-                                self.last_write.insert(k.clone(), LastWrite { write: id, value: v.clone(), backed_up: false });
+                                self.last_write.insert(k.clone(), LastWrite { write: id, digest: digest_of(v), backed_up: false });
                             }
                             self.last_keys.insert(id, keys);
                             match self.tip.as_mut() {
@@ -621,6 +628,11 @@ impl Server {
         self.fates.take_session(session)
     }
 
+    /// The bytes the per-key last-write record holds (#437: keys and fixed-size entries, never values).
+    pub fn last_write_bytes(&self) -> usize {
+        self.last_write.keys().map(|k| k.len() + std::mem::size_of::<LastWrite>()).sum()
+    }
+
     /// `session`'s keys whose last write became BACKED_UP since this was last asked (sdk#415). Drains. The write
     /// itself ended at `Published` (its fate is read and gone), so this is the one way its row's move to "backed
     /// up" -- which moves no root -- reaches the client's bindings.
@@ -677,7 +689,7 @@ impl Server {
         if warm != published && get(&warm)? != now {
             return Some(KeyState::Saving);
         }
-        let backed = self.last_write.get(key).is_some_and(|l| l.backed_up && l.value == now);
+        let backed = self.last_write.get(key).is_some_and(|l| l.backed_up && l.digest == digest_of(&now));
         Some(if backed { KeyState::SavedAndBackedUp } else { KeyState::Saved })
     }
 

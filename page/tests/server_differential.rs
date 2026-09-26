@@ -2601,4 +2601,34 @@ fn backed_up_timeline(case: &str, faults: Faults) {
     assert!(gamma_backed, "{case}: gamma never reached BACKED UP though every PUT of its commit was acked");
     assert_eq!(owed, 0, "{case}: every parity PUT acked, and groups are still owed");
     assert!(matches!(scan, engine::ParityScan::Done { .. }), "{case}: every parity PUT acked, and the parity scan is {scan:?}");
+    // ANOTHER DEVICE then writes DIFFERENT bytes at gamma's key (#437): the row is no longer this page's write's --
+    // it reads saved, not backed up, until that write's own fate is known here; alpha, untouched, stays backed up.
+    elsewhere(&mut rig, &mut node, 99, vec![protocol::Op::Put(gamma.clone(), b"another device's bytes".to_vec())]);
+    rig.server.head_hint();
+    settle(&mut tab, &mut rig, &mut node);
+    // Read as a binding re-reads: the other device's tree is cold here until fetched (a key the page cannot read
+    // has no state yet, as before the fetch of any row).
+    assert_eq!(tab.get(&mut rig, &mut node, &gamma).as_deref(), Some(b"another device's bytes".as_slice()), "{case}: THE SETUP: the other device's write is not what gamma's key holds");
+    let _ = tab.get(&mut rig, &mut node, &alpha);
+    let g = state(&mut tab, &mut rig, &mut node, &gamma);
+    assert_ne!(g, RowState::BackedUp, "{case}: gamma's key holds another device's bytes, and still reads backed up by this page's write");
+    assert_eq!(state(&mut tab, &mut rig, &mut node, &alpha), RowState::BackedUp, "{case}: a foreign write to gamma's key demoted alpha");
+}
+
+/// #437: the per-key last-write record is FIXED-SIZE -- a digest of the value, never the value (a copy would be a
+/// second holder of the data, rule 3, and page memory growing with it). A 50 KB row costs it no more than a small one.
+#[test]
+fn the_last_write_record_keeps_a_digest_never_the_value() {
+    assert!(std::mem::size_of::<page::server::LastWrite>() <= 64, "LastWrite is {} bytes", std::mem::size_of::<page::server::LastWrite>());
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let big = "x".repeat(50_000);
+    tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": big }).as_object().unwrap().clone())).expect("put");
+    tab.pump(&mut rig, &mut node);
+    let bytes = rig.server.last_write_bytes();
+    println!("last-write record after a 50 KB row: {bytes} B");
+    assert!(bytes < 1_024, "the last-write record holds {bytes} B after a 50 KB row: it keeps the value");
 }
