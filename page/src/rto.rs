@@ -69,6 +69,12 @@ impl Rto {
         self.backoff = 0;
     }
 
+    /// A call answered on its FIRST send, but QUEUED behind others (sdk#390): its time is its wait in the node's
+    /// queue too, so it is no sample -- but the path answered a call sent once, and the back-off ends (§5.7).
+    pub fn answered_queued(&mut self) {
+        self.backoff = 0;
+    }
+
     /// Something timed out this tick: back the timer off (§5.5).
     pub fn timed_out(&mut self) {
         self.backoff = (self.backoff + 1).min(10);

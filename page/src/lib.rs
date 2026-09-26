@@ -297,7 +297,18 @@ struct Deadline {
     resent: bool,
     /// The send this deadline is for, in the page's own SEND ORDER: the recording's label for it
     /// (`Label { Request, ordinal }`). A re-send is a new send. Never the op's block id (a foreign id).
+    /// Also its place in the node's ONE queue for this client (F61, sdk#390): the order it went on the wire.
     seq: u32,
+    /// Sent into an EMPTY queue: nothing was on the wire ahead of it, so its answer times the node's service plus the
+    /// path -- the only answer that is an RTT sample (sdk#390). A queued op's answer also times its wait.
+    alone: bool,
+}
+
+/// The wait of a FIRST send with `ahead` ops on the wire before it, at an RTO of `rto`: the node answers one client's
+/// ops in one sequence (F61), so each op ahead is one more RTO, capped at the RTO's ceiling (sdk#390, the architect).
+/// THE one arming formula: at the send, and at every re-arm.
+fn queued_wait(rto: u64, ahead: u64) -> u64 {
+    rto.saturating_mul(1 + ahead).min(rto::RTO_MAX_MS as u64)
 }
 
 /// How an op on the wire ENDED, as the page's recording says it (sdk#386's instrument work).
@@ -1427,9 +1438,11 @@ impl Page {
     /// once and not at the 120 s backstop.
     pub fn reconnected(&mut self, now: Ms) {
         self.now = now.0;
-        let on_wire: Vec<Waiting> = self.deadlines.iter().filter(|(_, d)| d.sent).map(|(w, _)| w.clone()).collect();
+        // Re-sent in the order they first queued, and queued anew in it (sdk#390).
+        let mut on_wire: Vec<(u32, Waiting)> = self.deadlines.iter().filter(|(_, d)| d.sent).map(|(w, d)| (d.seq, w.clone())).collect();
+        on_wire.sort_unstable();
         let mut head_read = false;
-        for w in on_wire {
+        for (_, w) in on_wire {
             let at = self.now + self.backoff(self.deadlines[&w].attempt);
             // The send on the old socket is WITHDRAWN (its answer cannot come), and the re-send is a new send.
             self.record_end(&w, &self.deadlines[&w], End::Withdrawn);
@@ -1789,9 +1802,12 @@ impl Page {
         // other op's answers, so an op nobody answers was re-sent at that
         // small RTO for ever -- thousands of GETs in five minutes (measured
         // on a silent node once silence stopped ending a read).
-        let at = self.now + self.backoff(attempt);
+        // A FIRST send waits its place in the node's one queue (sdk#390, F61): an RTO for each op on the wire ahead of
+        // it, and one for itself. A re-send keeps its backoff.
+        let ahead = self.deadlines.iter().filter(|(k, d)| d.sent && **k != w).count() as u64;
+        let at = self.now + if attempt == 1 { queued_wait(self.rto.rto_ms(), ahead) } else { self.backoff(attempt) };
         let seq = self.next_send();
-        let d = Deadline { at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq };
+        let d = Deadline { at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq, alone: ahead == 0 };
         self.record_send(&w, &d);
         // A send still on the wire for the same op is SUPERSEDED by this one: its end is said, never overwritten.
         if let Some(old) = self.deadlines.insert(w.clone(), d) {
@@ -1934,19 +1950,26 @@ impl Page {
     fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
         let at = self.now + self.backoff(attempt);
         self.attempt_of.insert(w.clone(), attempt);
-        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0 }) {
+        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0, alone: false }) {
             self.record_end(&w, &old, End::Withdrawn);
         }
     }
 
-    /// An ANSWER for `w`: its deadline ends, an attempt-1 answer is a sample
-    /// (Karn: a re-sent call never is), and a GET opens the window. `None`:
-    /// nothing was waiting on it.
+    /// An ANSWER for `w`: its deadline ends; the answer to a first send into an EMPTY queue is an RTT sample (Karn: a
+    /// re-sent call never is; sdk#390: a queued one also times its wait), and a queued first send's answer ends the
+    /// back-off without sampling; every first send still on the wire is re-armed; and a GET opens the window.
+    /// `None`: nothing was waiting on it.
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
         let d = self.end(w, End::Answered)?;
         self.attempt_of.remove(w);
         self.first_of.remove(w);
-        if d.sent && d.attempt == 1 && !d.resent {
+        // A QUEUED first send answered: the path answered a call sent once, so the back-off ends (RFC 6298 §5.7) --
+        // but its time is its wait in the queue too, so it is no sample (the architect's amendment to sdk#390's (a):
+        // under load no op is sent alone, and without this nothing would ever clear the back-off).
+        if d.sent && d.attempt == 1 && !d.resent && !d.alone {
+            self.rto.answered_queued();
+        }
+        if d.sent && d.attempt == 1 && !d.resent && d.alone {
             let r = self.now.saturating_sub(d.sent_at);
             // IMPOSSIBLE, so loud: a round trip longer than the page has existed was dated against another clock's
             // origin -- the defect that pinned the RTO at its ceiling for a page's life (sdk#397).
@@ -1962,7 +1985,10 @@ impl Page {
                     rec.event(Event::Counter { site, op, entry: Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) } });
                 }
             }
-            self.rearm_first_sends(self.rto.rto_ms());
+        }
+        // ANY answer re-arms (sdk#390 (b)): the queue is one shorter and the path is alive; the `min` never extends.
+        if d.sent {
+            self.rearm_first_sends();
         }
         if d.sent && matches!(w, Waiting::Get(_)) {
             self.window.opened();
@@ -1986,13 +2012,20 @@ impl Page {
     /// while its siblings keep answering within one RTO of each other; a
     /// re-arm may move a deadline later than a previous one, never past
     /// `armed`. A RE-SEND keeps its backoff, and so does a reconnect re-send.
-    fn rearm_first_sends(&mut self, rto: u64) {
+    ///
+    /// sdk#390: timed at the op's PLACE in the node's one queue now -- an RTO for each op still ahead of it, and one
+    /// for itself (`queued_wait`) -- in one pass over the ops on the wire in send order: the place is counted from the
+    /// deadlines, never kept.
+    fn rearm_first_sends(&mut self) {
         use instrument::{Entry, Event, Key, Kind, Probe};
         let now = self.now;
+        let rto = self.rto.rto_ms();
         let (rec, start, from) = (&self.rec, self.rec_start, self.rec_from);
-        for (w, d) in self.deadlines.iter_mut() {
-            if d.sent && d.attempt == 1 && !d.resent {
-                let at = d.armed.min(now + rto);
+        let mut wire: Vec<(&Waiting, &mut Deadline)> = self.deadlines.iter_mut().filter(|(_, d)| d.sent).collect();
+        wire.sort_unstable_by_key(|(_, d)| d.seq);
+        for (ahead, (w, d)) in wire.into_iter().enumerate() {
+            if d.attempt == 1 && !d.resent {
+                let at = d.armed.min(now + queued_wait(rto, ahead as u64));
                 if at != d.at && d.seq >= from {
                     if let Some(rec) = rec {
                         // Past the last label nothing is recorded; the re-arm below happens regardless.
@@ -2834,13 +2867,14 @@ mod parked_get {
     #[test]
     fn a_get_answered_notfound_waits_on_its_own_deadline() {
         let mut p = Page::new(Params::default(), PutPath::Page);
+        // The page's OPENING head read answered first, through the real path: the GET goes into an EMPTY queue,
+        // so its answer is a sample (sdk#390), and the tick below tests only the parked GET.
+        p.now = 5;
+        p.answered(&Waiting::RecoverHead);
         let id = [9u8; 32];
         p.send(Waiting::Get(id), Op::Get { id });
         assert!(p.take_ops().contains(&Op::Get { id }), "the GET did not go out");
         p.answer(Answer::GetMissed(id), Ms(10));
-        // The page's OPENING head read is on the wire too; answered here, through the real path, so the tick
-        // below tests only the parked GET (a first-send sample re-arms every first send, sdk#378).
-        p.answered(&Waiting::RecoverHead);
         // After the answer: an attempt-1 answer is an RTO sample, and it opens the window.
         let (rto_before, window_before) = (p.rto.rto_ms(), p.window.size());
         let (sent, due) = p.deadlines.get(&Waiting::Get(id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
@@ -2869,7 +2903,8 @@ mod clock_origin {
     #[test]
     #[should_panic(expected = "dated against another clock's origin")]
     fn a_sample_longer_than_the_page_has_existed_is_refused_loudly() {
-        let mut p = Page::new_at(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        // Unstarted: nothing else on the wire, so the request goes into an EMPTY queue and its answer is a sample.
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
         p.send_ext(Ext::SignerFirst, Ms(0));
         p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 10));
     }
@@ -2877,7 +2912,7 @@ mod clock_origin {
     /// THE CONTROL: the same request dated by the page's own clock is a 10 ms sample.
     #[test]
     fn a_request_dated_by_the_pages_clock_is_its_round_trip() {
-        let mut p = Page::new_at(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
         p.send_ext(Ext::SignerFirst, Ms(EPOCH_MS + 100));
         p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 110));
         assert_eq!(p.rto.srtt_ms(), Some(10.0), "the sample was not the 10 ms round trip");
@@ -2920,7 +2955,10 @@ mod recording {
         let r = p.recording().expect("attached");
         assert!(r.events().contains(&Event::Exit { site: op_site(&Waiting::Put(id)), op: instrument::Label::new(Kind::Request, 1).expect("1").op(), outcome: Outcome::Timeout }), "the timeout was not recorded");
         assert_eq!(counters(&r, 2, Key::Attempts), vec![2], "the re-send is not req#2 on its second attempt");
-        // An op answered on its first send: its sample as computed, and the RTO after it.
+        // An op answered on its first send, into an EMPTY queue (sdk#390: a queued answer is no sample): the PUT's
+        // re-send is answered first, then its sample as computed, and the RTO after it.
+        p.now = EPOCH_MS + 6_050;
+        p.answered(&Waiting::Put(id));
         p.now = EPOCH_MS + 6_100;
         p.send_ext(Ext::SignerFirst, Ms(EPOCH_MS + 6_100));
         p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 6_140));
@@ -3068,6 +3106,10 @@ mod rto_rearm {
     #[test]
     fn a_first_send_is_rearmed_when_a_sample_lowers_the_rto_and_a_resend_is_not() {
         let mut p = Page::new(Params::default(), PutPath::Page);
+        // The opening head read answered through the real path: the first PUT goes into an EMPTY queue, so its
+        // answer is a sample (sdk#390).
+        p.now = 5;
+        p.answered(&Waiting::RecoverHead);
         // A cold phase timed out tick after tick: the shared RTO at its ceiling.
         for _ in 0..10 {
             p.rto.timed_out();
@@ -3147,6 +3189,188 @@ mod rto_rearm_queue {
         assert_eq!(p.deadlines[&Waiting::Put(lost)].at, last + rto, "the lost PUT is not due one RTO after the last answer");
         p.tick(Ms(last + rto));
         assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at last answer + RTO");
+    }
+
+    /// sdk#390: the node answers one client's ops in ONE sequence, ~37 ms
+    /// each (F61), so an op's wait is its place in that queue. After a FAST
+    /// sample (the opening head read, 5 ms) the RTO is at its floor; a batch
+    /// of 13 PUTs sent at once is answered one every 37 ms, one never is. No
+    /// answered sibling is re-sent -- each was still in the node's queue --
+    /// and the lost one is still re-sent within an RTO of the last answer
+    /// (#386's guarantee).
+    #[test]
+    fn after_a_fast_sample_a_serialised_batch_re_sends_only_the_lost_put() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.now = 5;
+        p.answered(&Waiting::RecoverHead);
+        assert_eq!(p.rto.srtt_ms(), Some(5.0), "THE SETUP: the opening head read was not a 5 ms sample");
+        println!("  after the fast sample: rto {} ms", p.rto.rto_ms());
+        let ids: Vec<[u8; 32]> = (1..=13u8).map(|i| [i; 32]).collect();
+        let lost = ids[12];
+        let start = 1_000;
+        p.now = start;
+        for id in &ids {
+            p.send(Waiting::Put(*id), Op::Put { id: *id, bytes: vec![id[0]] });
+        }
+        let _ = p.take_ops();
+        let mut resent: Vec<(u64, u8)> = Vec::new();
+        let mut last = 0;
+        for (i, id) in ids[..12].iter().enumerate() {
+            let t = start + 37 * (i as u64 + 1);
+            // Every ms between answers: a deadline due inside the gap fires in it.
+            for ms in last.max(start) + 1..=t {
+                p.tick(Ms(ms));
+                resent.extend(p.take_ops().iter().filter_map(|o| match o { Op::Put { id, .. } => Some((ms, id[0])), _ => None }));
+            }
+            p.now = t;
+            p.answered(&Waiting::Put(*id));
+            last = t;
+        }
+        println!("  12 answered 37 ms apart, last at {last}; rto {}; re-sent (ms, put): {resent:?}", p.rto.rto_ms());
+        assert!(resent.is_empty(), "siblings still in the node's queue were re-sent: {resent:?}");
+        let rto = p.rto.rto_ms();
+        // Only an answer to an op sent into an EMPTY queue is a sample: a queued one times its wait too.
+        assert!(rto < 200, "the batch's queue waits were taken as RTT samples: rto {rto} ms");
+        let due = p.deadlines[&Waiting::Put(lost)].at;
+        assert!(due <= last + rto, "the lost PUT is due at {due}, later than an RTO ({rto} ms) after the last answer ({last})");
+        p.tick(Ms(due));
+        assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at {due}");
+    }
+}
+
+#[cfg(test)]
+mod rto_queue {
+    use super::*;
+
+    /// A page whose opening head read was answered on its first send after
+    /// 5 ms: the RTO at its floor, nothing on the wire.
+    fn fast() -> Page {
+        fast_at(0)
+    }
+
+    /// [`fast`] on a page whose clock starts at `origin` (the browser's is `Date.now()`, EPOCH ms: #397's lesson).
+    fn fast_at(origin: u64) -> Page {
+        let mut p = Page::new_at(Params::default(), PutPath::Page, Ms(origin));
+        p.now = origin + 5;
+        p.answered(&Waiting::RecoverHead);
+        assert_eq!(p.rto.rto_ms(), rto::RTO_FLOOR_MS as u64, "THE SETUP: the RTO is not at its floor");
+        p
+    }
+
+    const EPOCH_MS: u64 = 1_790_253_181_367;
+
+    /// sdk#390 (i), the architect's amendment: UNDER LOAD no op is sent into an empty queue, so nothing samples -- and
+    /// a sample was the only thing that ended the back-off (seed 39's shape: a page sat at the 60 s ceiling for 38 s
+    /// while answers kept arriving). A QUEUED first send's answer ends the back-off, and is still no sample. Mutant
+    /// "a queued answer does not clear" -> red.
+    #[test]
+    fn under_load_a_queued_answer_ends_the_back_off_without_sampling() {
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        for _ in 0..10 {
+            p.rto.timed_out();
+        }
+        assert_eq!(p.rto.rto_ms(), rto::RTO_MAX_MS as u64, "THE SETUP: the RTO is not at its ceiling");
+        p.now = EPOCH_MS + 1_000;
+        for i in 1..=3u8 {
+            put(&mut p, i);
+        }
+        // The SECOND put is answered: it was queued behind the first, so it is no sample -- but the back-off ends.
+        p.now = EPOCH_MS + 1_074;
+        p.answered(&Waiting::Put([2; 32]));
+        assert_eq!(p.rto.srtt_ms(), None, "a queued answer was taken as an RTT sample");
+        assert_eq!(p.rto.rto_ms(), rto::RTO_INITIAL_MS as u64, "the back-off did not end on a queued first-send answer");
+    }
+
+    fn put(p: &mut Page, i: u8) {
+        p.send(Waiting::Put([i; 32]), Op::Put { id: [i; 32], bytes: vec![i] });
+    }
+
+    /// sdk#390 (b): ANY answer re-arms the first sends, a RE-SEND's too -- no
+    /// sample, but the queue is one shorter. A PUT is lost and re-sent; a
+    /// batch of 3 goes out behind it, each armed an RTO per place. The
+    /// re-send is answered: every op of the batch moves up one place, timed
+    /// from that answer. Mutant "re-arm only on a sample" -> red.
+    ///
+    /// (A whole batch the node DROPS cannot show it: the head's timeout
+    /// doubles the RTO, so from the head's re-send answer each op's place is
+    /// timed at twice the RTO it was armed at -- never earlier than `armed`.)
+    #[test]
+    fn a_resends_answer_moves_the_batch_behind_it_up_one_place() {
+        let mut p = fast();
+        p.now = 1_000;
+        put(&mut p, 9);
+        p.tick(Ms(1_100));
+        assert!(p.take_ops().contains(&Op::Put { id: [9; 32], bytes: vec![9] }), "THE SETUP: the lost PUT was not re-sent");
+        let rto = p.rto.rto_ms();
+        for i in 1..=3u8 {
+            put(&mut p, i);
+        }
+        let _ = p.take_ops();
+        let armed: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put([i; 32])].at).collect();
+        assert_eq!(armed, vec![1_100 + 2 * rto, 1_100 + 3 * rto, 1_100 + 4 * rto], "THE SETUP: the batch is not armed an RTO per place behind the re-send");
+        p.now = 1_110;
+        p.answered(&Waiting::Put([9; 32]));
+        assert_eq!(p.rto.rto_ms(), rto, "a re-send's answer was taken as a sample");
+        let at: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put([i; 32])].at).collect();
+        println!("  rto {rto}; batch armed {armed:?}; after the re-send's answer {at:?}");
+        assert_eq!(at, vec![1_110 + rto, 1_110 + 2 * rto, 1_110 + 3 * rto], "the batch did not move up one place on the re-send's answer");
+    }
+
+    /// sdk#390: A SLOW OP AT THE HEAD costs ITS re-send, not the queue's. A
+    /// batch of 3 after a fast sample; the first is answered at 37 ms, the
+    /// second takes 187 ms -- past an RTO from that answer, so it times out
+    /// and is re-sent (it is the head: nothing can tell slow from lost). The
+    /// third, one place behind it, keeps an RTO for its place and is answered
+    /// on its first send. Mutant "re-arm at one RTO whatever the place" ->
+    /// red: the third is re-sent with the head.
+    #[test]
+    fn a_slow_head_is_re_sent_alone_and_the_op_behind_it_is_not() {
+        // At a small clock AND at the browser's epoch clock (#397's lesson): the same rounds, the same re-sends.
+        for o in [0, EPOCH_MS] {
+            let mut p = fast_at(o);
+            p.now = o + 1_000;
+            for i in 1..=3u8 {
+                put(&mut p, i);
+            }
+            let _ = p.take_ops();
+            let mut resent: Vec<(u64, u8)> = Vec::new();
+            let mut rto_after_first = 0;
+            for ms in 1_001..=1_300u64 {
+                p.tick(Ms(o + ms));
+                resent.extend(p.take_ops().iter().filter_map(|op| match op { Op::Put { id, .. } => Some((ms, id[0])), _ => None }));
+                let answer = match ms { 1_037 => Some(1u8), 1_187 => Some(2), 1_224 => Some(3), _ => None };
+                if let Some(i) = answer {
+                    p.now = o + ms;
+                    p.answered(&Waiting::Put([i; 32]));
+                    if i == 1 {
+                        rto_after_first = p.rto.rto_ms();
+                    }
+                }
+            }
+            println!("  origin {o}: rto after the first answer {rto_after_first}; re-sent (ms, put): {resent:?}");
+            assert_eq!(resent, vec![(1_037 + rto_after_first, 2)], "origin {o}: not the slow head alone was re-sent");
+        }
+    }
+
+    /// sdk#390: a DEAD PATH is still found at one RTO. Position arming waits
+    /// longer only for ops BEHIND another; the head of the queue times out at
+    /// one RTO, and only it.
+    #[test]
+    fn the_head_of_the_queue_still_times_out_at_one_rto() {
+        let mut p = fast();
+        let rto = p.rto.rto_ms();
+        p.now = 1_000;
+        for i in 1..=13u8 {
+            put(&mut p, i);
+        }
+        let _ = p.take_ops();
+        let mut resent: Vec<(u64, u8)> = Vec::new();
+        for ms in 1_001..=1_000 + rto {
+            p.tick(Ms(ms));
+            resent.extend(p.take_ops().iter().filter_map(|o| match o { Op::Put { id, .. } => Some((ms, id[0])), _ => None }));
+        }
+        println!("  rto {rto}; re-sent by 1000 + rto: {resent:?}");
+        assert_eq!(resent, vec![(1_000 + rto, 1)], "the head of the queue did not time out alone at one RTO");
     }
 }
 
@@ -3264,18 +3488,24 @@ mod window_loss {
         slow: BTreeMap<Cid, u64>,
         due: Vec<(u64, Answer)>,
         sent: Vec<(u64, Cid)>,
-        over_window: usize,
+        /// Most GETs on the wire past the window in a ms that SENT one: rule 9
+        /// paces SENDS (a halving never recalls a GET already on the wire).
+        sent_past_window: usize,
     }
 
     impl Node_ {
         fn new(held: &[(Cid, Vec<u8>)]) -> Node_ {
-            Node_ { held: held.iter().cloned().collect(), silent: BTreeSet::new(), quiet_until: 0, slow: BTreeMap::new(), due: Vec::new(), sent: Vec::new(), over_window: 0 }
+            Node_ { held: held.iter().cloned().collect(), silent: BTreeSet::new(), quiet_until: 0, slow: BTreeMap::new(), due: Vec::new(), sent: Vec::new(), sent_past_window: 0 }
         }
 
         /// Run `p` for `ms`, one ms at a time.
         fn run(&mut self, p: &mut Page, now: &mut u64, ms: u64) {
             for _ in 0..ms {
-                for op in p.take_ops() {
+                let ops = p.take_ops();
+                if ops.iter().any(|o| matches!(o, Op::Get { .. })) {
+                    self.sent_past_window = self.sent_past_window.max(p.gets_in_flight().saturating_sub(p.window.size()));
+                }
+                for op in ops {
                     if let Op::Get { id } = op {
                         self.sent.push((*now, id));
                         if !self.silent.contains(&id) && *now >= self.quiet_until {
@@ -3293,7 +3523,6 @@ mod window_loss {
                     p.answer(a, Ms(*now));
                 }
                 p.tick(Ms(*now));
-                self.over_window = self.over_window.max(p.gets_in_flight().saturating_sub(p.window.size()));
             }
         }
     }
@@ -3375,8 +3604,12 @@ mod window_loss {
         assert!(third <= first_resend, "a lost GET was re-sent ({first_resend}) before the ask already waiting ({third})");
     }
 
-    /// A LOST GET'S LATE ANSWER STILL ANSWERS IT. Three blocks the node
-    /// answers only after 1.5 s (past the 1 s first RTO) on a window of 2:
+    /// A LOST GET'S LATE ANSWER STILL ANSWERS IT. Three slow blocks on a
+    /// window of 2, each GET armed at its place (sdk#390) behind the page's
+    /// opening head read: the first times out at 3 s and the third takes its
+    /// place; the second at 4 s, and the first's re-send takes its place. The
+    /// second's first-send answer (3.5 s after it went, at 4.5 s) lands while
+    /// it is QUEUED behind the first's re-send and the third (5 s each):
     /// the first two time out and queue behind the third, and one of them is
     /// still QUEUED when its first send's answer lands. That answer is taken,
     /// and the queued re-send is dropped: each block is sent at most twice
@@ -3386,8 +3619,8 @@ mod window_loss {
     fn a_lost_gets_late_answer_is_taken_while_its_resend_waits() {
         let all = blocks(3);
         let mut node = Node_::new(&all);
-        for (id, _) in &all {
-            node.slow.insert(*id, 1_500);
+        for ((id, _), ms) in all.iter().zip([5_000, 3_500, 5_000]) {
+            node.slow.insert(*id, ms);
         }
         let mut p = Page::new(Params::default(), PutPath::Page);
         p.window.halved();
@@ -3396,7 +3629,7 @@ mod window_loss {
             ask(&mut p, now, *id);
         }
         let mut queued_when_answered = false;
-        for _ in 0..3_000 {
+        for _ in 0..7_500 {
             let was_queued: Vec<Cid> = p.get_queue.iter().copied().filter(|q| p.attempt_of.contains_key(&Waiting::Get(*q))).collect();
             node.run(&mut p, &mut now, 1);
             queued_when_answered |= was_queued.iter().any(|id| p.blocks.get(id).is_some());
@@ -3404,7 +3637,7 @@ mod window_loss {
         let sends: Vec<usize> = all.iter().map(|(id, _)| node.sent.iter().filter(|(_, s)| s == id).count()).collect();
         println!("sends per block {sends:?}; a queued lost GET answered: {queued_when_answered}");
         assert!(queued_when_answered, "THE CONTROL: no lost GET was still queued when its late answer landed");
-        assert!(all.iter().all(|(id, _)| p.blocks.get(id).is_some()), "not every block was read in 3 s: sends {sends:?}");
+        assert!(all.iter().all(|(id, _)| p.blocks.get(id).is_some()), "not every block was read in 7.5 s: sends {sends:?}");
         assert!(!p.get_queue.iter().any(|q| p.blocks.get(q).is_some()), "a block already read is still queued to be asked again");
     }
 
@@ -3426,11 +3659,12 @@ mod window_loss {
         let mut now = 1_000u64;
         // `late` and `withdrawn` take the floor's two places, time out, and
         // queue behind the two asks that were waiting (which now hold the
-        // places, silent too).
+        // places, silent too). Each is armed at its place behind the page's
+        // opening head read (sdk#390): `late` at 3 s, `withdrawn` at 4 s.
         for id in [late, withdrawn, all[2].0, all[3].0] {
             ask(&mut p, now, id);
         }
-        node.run(&mut p, &mut now, 1_100);
+        node.run(&mut p, &mut now, 3_100);
         let holders = |p: &Page, id: Cid| {
             (p.deadlines.contains_key(&Waiting::Get(id)), p.attempt_of.contains_key(&Waiting::Get(id)), p.get_queue.contains(&id))
         };
@@ -3507,9 +3741,12 @@ mod window_loss {
     }
 
     /// A 200-BLOCK SCAN WITH THE NODE SILENT FOR TWO RTO CEILINGS, then back:
-    /// the GETs on the wire never exceed the window, however many were lost
-    /// and re-sent, and every block is read once the node answers. Mutant
-    /// "re-send outside the window" -> red.
+    /// no GET is SENT while the window is full, however many were lost and
+    /// re-sent, and every block is read once the node answers. A halving never
+    /// recalls a GET already on the wire (TCP's rule): with each GET armed at
+    /// its place in the queue (sdk#390) they time out one at a time, so the
+    /// first loss halves the window under its siblings. Mutants "re-send
+    /// outside the window" and "send a new GET ignoring the window" -> red.
     #[test]
     fn a_scan_through_a_silent_node_never_sends_past_the_window() {
         let all = blocks(200);
@@ -3523,9 +3760,9 @@ mod window_loss {
         node.run(&mut p, &mut now, 2 * rto::RTO_MAX_MS as u64 + 600_000);
         let read = all.iter().filter(|(id, _)| p.blocks.get(id).is_some()).count();
         let lost = node.sent.len() - 200;
-        println!("200 blocks through a silent node: {read} read, {} GETs sent ({lost} re-sends), most over the window {}", node.sent.len(), node.over_window);
+        println!("200 blocks through a silent node: {read} read, {} GETs sent ({lost} re-sends), most past the window when one was sent {}", node.sent.len(), node.sent_past_window);
         assert!(lost > 0, "THE CONTROL: nothing was lost and re-sent");
-        assert_eq!(node.over_window, 0, "GETs on the wire exceeded the window by {}", node.over_window);
+        assert_eq!(node.sent_past_window, 0, "a GET was SENT with the window full: {} past it", node.sent_past_window);
         assert_eq!(read, 200, "not every block was read after the node came back");
         assert!(p.window.size() >= rto::WINDOW_FLOOR as usize);
     }
