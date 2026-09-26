@@ -121,9 +121,10 @@ impl Rig {
                     landed = true;
                     let more = self.step(Event::HeadConfirmed(seq));
                     queue.extend(puts(&more));
-                    // The node holds every block in these rigs: a changed group's other member it is asked about is held.
+                    // A changed group's other member asked about as the head lands: answered as the page does (sdk#454).
                     for id in asked_held(&more) {
-                        all.extend(self.step(Event::PutConfirmed(id)));
+                        let held = self.e.blocks().node_holds(&id);
+                        all.extend(self.step(if held { Event::PutConfirmed(id) } else { Event::HeldUnknown(id) }));
                     }
                     all.extend(more);
                 }
@@ -313,6 +314,32 @@ fn a_changed_groups_unconfirmed_member_counts_absent_until_the_node_holds_it() {
     assert!(!states(&fx, 3).contains(&State::ParityComplete), "BACKED_UP with the foreign leaf never confirmed on the node");
     let last = r.step(Event::PutConfirmed(foreign_leaf));
     assert!(states(&last, 3).contains(&State::ParityComplete), "every member held, and not BACKED_UP");
+}
+
+/// THE HARNESS ANSWERS AS THE PAGE DOES (sdk#454, the architect): a changed group's other member the NODE does not hold
+/// is answered `HeldUnknown` at once by `common::answer_held` -- as the page's `AskHeld` would be -- so the group's
+/// deferred parity is released into the first wave, exactly as when a test answers it by hand. It was once left
+/// unanswered "by design", a harness quietly different from production. Measured as one extra first-wave PUT against the
+/// same commit with the answer withheld (`withhold_held`, the named form).
+#[test]
+fn the_harness_answers_a_member_the_node_does_not_hold_with_held_unknown() {
+    let (foreign, foreign_leaf) = {
+        let mut p = Rig::base();
+        let all = p.commit(2, vec![put("k/000100", b"foreign")], |_, _| true);
+        (p.e.published_root(), leaf_with(&all, b"k/000100"))
+    };
+    let first_wave = |withhold: bool| {
+        let mut r = Rig::base();
+        r.withhold_held = withhold;
+        let _ = r.step(Event::HeadRead { epoch: engine::Epoch(1), seq: 2, root: foreign });
+        assert_eq!(r.e.published_root(), foreign, "THE SETUP: the foreign head was not adopted");
+        r.e.blocks().lose(&foreign_leaf);
+        let first = r.step(Event::forced_write(ClientId(1), WriteId(3), vec![put("k/000160", b"three")]));
+        assert!(asked_held(&first).contains(&foreign_leaf), "THE SETUP: the foreign leaf was not asked about");
+        puts(&first).len()
+    };
+    let (answered, withheld) = (first_wave(false), first_wave(true));
+    assert_eq!(answered, withheld + 1, "the harness did not answer the member the node lost with HeldUnknown (one released parity): {answered} first-wave PUTs answered vs {withheld} withheld");
 }
 
 /// SUPERSESSION ON A FOREIGN MOVE (the architect: "every published-root

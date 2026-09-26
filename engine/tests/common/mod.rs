@@ -87,9 +87,10 @@ macro_rules! stepped {
     }};
 }
 
-/// Answer every `ConfirmHeld` in `out` for a block the store holds, as the page answers one it confirmed: at once,
-/// with `PutConfirmed` (sdk#416). The store is these tests' node. A test that withholds an answer steps the engine
-/// itself.
+/// Answer every `ConfirmHeld` in `out` AS THE PAGE DOES (sdk#416, sdk#454): a block the node holds with
+/// `PutConfirmed`, one it does not with `HeldUnknown` (the page's `AskHeld` answered absent), at once -- never left
+/// unanswered, which production never does. The store is these tests' node. A test that plays the page itself says so
+/// by name (`Rig::withhold_held` in race_put) and answers each `ConfirmHeld` itself.
 #[allow(dead_code)]
 pub trait AnswerHeld {
     fn answer_held(&mut self, out: &mut Vec<Effect>);
@@ -106,11 +107,10 @@ pub fn answer_held(e: &mut Engine<Store>, out: &mut Vec<Effect>) {
     let mut i = 0;
     while i < out.len() {
         if let Effect::ConfirmHeld { id } = out[i] {
-            if e.blocks().node_holds(&id) {
-                let more = e.step(Event::PutConfirmed(id));
-                e.blocks().absorb(&more);
-                out.extend(more);
-            }
+            let held = e.blocks().node_holds(&id);
+            let more = e.step(if held { Event::PutConfirmed(id) } else { Event::HeldUnknown(id) });
+            e.blocks().absorb(&more);
+            out.extend(more);
         }
         i += 1;
     }
@@ -262,6 +262,13 @@ impl Store {
 
     pub fn remember(&self, cid: &Cid) {
         self.forgotten.borrow_mut().remove(cid);
+    }
+
+    /// The NODE loses a block (unlike `forget`, which models only the page's memory): `node_holds` says no after this,
+    /// so the harness answers a `ConfirmHeld` for it as the page would -- `HeldUnknown` (sdk#454).
+    #[allow(dead_code)]
+    pub fn lose(&self, cid: &Cid) {
+        self.inner.borrow_mut().remove(cid);
     }
 
     /// Does the NODE hold `cid`? A block `forget` hid is still the node's (it models the page's memory losing it),
