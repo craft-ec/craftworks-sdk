@@ -23,6 +23,26 @@ pub const RTO_INITIAL_MS: f64 = 1_000.0;
 pub const RTO_FLOOR_MS: f64 = 100.0;
 /// RFC 6298 §2.5 allows a ceiling of at least 60 s.
 pub const RTO_MAX_MS: f64 = 60_000.0;
+/// THE NODE'S OWN BOUNDS on a GET (freenet 0.2.138; FREENET-CONSTRAINTS F64, re-read at every bump): what a node
+/// does while a GET is still fetching, so a caller re-asks the NODE, not the network, only when that GET is over.
+///
+/// The node's web path waits this long for a GET, then answers 503 (the "transient contract-fetch error" retry page)
+/// while the GET GOES ON: it only disconnects its own transient client (`server/path_handlers.rs:1500`,
+/// `ensure_contract_cached`). Measured: V20 `latency=30002 ms` (the stall review, 2026-09-26).
+pub const NODE_WEB_BOUND_MS: f64 = 30_000.0;
+/// The node's attempts at one GET: the first and `MAX_RETRIES = 3` more (`operations/get/op_ctx_task.rs:2305`); a
+/// stream failure spends the same budget (1455-1457).
+pub const GET_ATTEMPTS: f64 = 4.0;
+/// How long the node waits on one attempt: `OPERATION_TTL`, 60 s (`config.rs:59`; `operations/op_ctx.rs:466-468`,
+/// applied at 781).
+pub const GET_ATTEMPT_MS: f64 = 60_000.0;
+/// B: the longest one node GET runs against SILENT peers (the architect's ruling on sdk#447). The stream claim runs
+/// only after a header (`op_ctx_task.rs:1495-1503`, 2151), so it does not add to this; a trickling stream has NO
+/// bound (`transport/peer_connection/streaming.rs:55`, reset per fragment at 399-401). Nothing caps the op
+/// (`node/op_state_manager.rs:2536-2541`). Measured (probe `get-in-flight`, F64): with one and with two silent peers the
+/// node answered NotFound at ~120 s, inside B; B stays the source's upper bound (main), since an earlier answer
+/// re-arms the page at once and B governs only a node still silent.
+pub const NODE_GET_BOUND_MS: f64 = GET_ATTEMPTS * GET_ATTEMPT_MS;
 /// Block GETs in flight to start with.
 pub const WINDOW_INITIAL: f64 = 4.0;
 /// Block GETs the window always allows (sdk#345): one silent block never
