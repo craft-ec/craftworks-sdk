@@ -408,8 +408,10 @@ impl HeadKnown {
             (S::AskingRecord, E::NotFound) => stay(Cell::Stays),
             // The head exists (or someone named it, or the signer holds a record): F55's false NotFound, silence.
             (S::Seen | S::HasRecord | S::Named, E::NotFound) => stay(Cell::Stays),
-            // The signer holds none: "no head", as often as the head is read (each read is owed an answer).
-            (S::NoRecord, E::NotFound) => (S::NoRecord, vec![F::NoHead], Cell::Stays),
+            // "None" was a SNAPSHOT: another tab or device may have created the Register since. Ask the signer again
+            // (a cheap local answer) rather than repeat a stale "no head" and create over an existing Register (H1;
+            // the architect on sdk#499). The read is still answered: AskingRecord answers on the record's reply.
+            (S::NoRecord, E::NotFound) => (S::AskingRecord, vec![F::AskRecord], Cell::Transition),
             (S::AskingRecord, E::Record(Some(false))) => (S::NoRecord, vec![F::NoHead], Cell::Transition),
             // D1: the record exists, so the NotFound was silence; nothing is pending.
             (S::AskingRecord, E::Record(Some(true))) => (S::HasRecord, vec![], Cell::Transition),
@@ -512,7 +514,7 @@ mod tests {
         }
         println!("{counts:?}");
         let n = |c| counts.get(&c).copied().unwrap_or(0);
-        assert_eq!([n(Cell::Transition), n(Cell::Stays), n(Cell::Late), n(Cell::Impossible)], [14, 13, 11, 4], "a cell changed: OPENING.md table 2 and its counts change with it");
+        assert_eq!([n(Cell::Transition), n(Cell::Stays), n(Cell::Late), n(Cell::Impossible)], [15, 12, 11, 4], "a cell changed: OPENING.md table 2 and its counts change with it");
     }
 
     /// A tiny seeded generator (no dependency).
@@ -600,6 +602,8 @@ mod tests {
     #[test]
     fn the_opening_model_holds_its_invariants_on_every_step() {
         let mut steps = 0usize;
+        // The cells each check is about, and how often the model reached them (a check never reached is decoration).
+        let mut reached: std::collections::BTreeMap<(String, &'static str), usize> = std::collections::BTreeMap::new();
         for seed in 1..=300u64 {
             for start in [Opening::New, Opening::Reader] {
                 let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -608,6 +612,8 @@ mod tests {
                 for i in 0..200 {
                     let ev = if rng.pick(3) == 0 { api_event(&mut rng) } else { node_event(&s, &mut rng, &mut said) };
                     let k = kind(&ev);
+                    let row = format!("{s:?}").split([' ', '{']).next().unwrap_or_default().to_string();
+                    *reached.entry((row, k)).or_insert(0) += 1;
                     let st = s.step(ev);
                     let at = format!("seed {seed} step {i}: {s:?} x {k}");
                     assert_ne!(st.cell, Cell::Impossible, "{at}: a real node's answer landed in an impossible cell");
@@ -640,31 +646,53 @@ mod tests {
             }
         }
         println!("{steps} steps checked");
+        for cell in [("Querying", "EmptyAck"), ("Provisioning", "DelegateMissing"), ("NeedsKey", "ProvisionWith"), ("Querying", "ProvisionWith"), ("Open", "Reconnected"), ("Provisioning", "KeyAlreadyHere"), ("Asking", "EmptyAck"), ("Reader", "Begin"), ("Asking", "Claim")] {
+            let n = reached.get(&(cell.0.to_string(), cell.1)).copied().unwrap_or(0);
+            println!("reached {} x {}: {n}", cell.0, cell.1);
+            assert!(n > 0, "the model never reached {} x {}, a cell one of its checks is about", cell.0, cell.1);
+        }
     }
 
     /// THE MODEL (Machine 2): 300 seeded runs x 200 steps; the record query is answered only when asked (or its twin
     /// later). H1, H2 and the counted contradiction after every step.
     #[test]
     fn the_head_model_holds_h1_and_h2_on_every_step() {
+        // How often the model reached the cells its checks are about: a check on a cell never reached is decoration.
+        let (mut contradicted, mut stale_reads) = (0usize, 0usize);
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
             let mut s = HeadKnown::Unknown;
             let mut asked = false;
-            // THE REFERENCE for H1: what the signer last said about a record (only its answer says "none").
-            let mut signer_said: Option<bool> = None;
+            // THE WORLD: does the signer hold a record? Another tab or device may create one at any step.
+            let mut world_has_record = rng.pick(2) == 0;
+            // THE REFERENCE for H1: the signer said "none" SINCE the world last changed (a stale "none" is no word).
+            let mut fresh_none = false;
             for i in 0..200 {
-                let ev = match rng.pick(6) {
+                if !world_has_record && rng.pick(10) == 0 {
+                    world_has_record = true; // another device signed first
+                    fresh_none = false;
+                }
+                // Seen is where a page's head question ends: the model goes on with a FRESH page and world, so every run
+                // keeps visiting the undecided states its checks are about.
+                if s == HeadKnown::Seen {
+                    s = HeadKnown::Unknown;
+                    asked = false;
+                    world_has_record = rng.pick(2) == 0;
+                    fresh_none = false;
+                }
+                let ev = match rng.pick(12) {
                     0 => HeadEvent::Got,
                     1 => HeadEvent::PutAcked,
                     2 => HeadEvent::Reconnected,
-                    _ if asked || rng.pick(2) == 0 => HeadEvent::Record([Some(false), Some(true), None][rng.pick(3)]),
+                    // The signer answers what the world holds, or neither.
+                    3..=6 if asked => HeadEvent::Record(if rng.pick(4) == 0 { None } else { Some(world_has_record) }),
                     _ => HeadEvent::NotFound,
                 };
                 if matches!(ev, HeadEvent::Record(_)) && !asked {
                     continue; // a real node answers only a record query this page sent
                 }
                 if let HeadEvent::Record(Some(h)) = ev {
-                    signer_said = Some(h);
+                    fresh_none = !h;
                 }
                 let (next, effects, cell) = s.step(ev);
                 let at = format!("seed {seed} step {i}: {s:?} x {ev:?}");
@@ -674,19 +702,25 @@ mod tests {
                 }
                 // H1: "no head" is said only where the signer said it holds no record.
                 if effects.contains(&HeadEffect::NoHead) {
-                    assert_eq!(signer_said, Some(false), "{at}: 'no head' said without the signer's word that it holds no record");
+                    assert!(fresh_none, "{at}: 'no head' said without the signer's FRESH word that it holds no record (a stale one, after another device created the Register, would fork it)");
                     assert_eq!(next, HeadKnown::NoRecord, "{at}: 'no head' said outside NoRecord");
                 }
                 // H2: an answered record query never leaves the head read waiting on it.
                 if s == HeadKnown::AskingRecord && matches!(ev, HeadEvent::Record(_)) {
                     assert_ne!(next, HeadKnown::AskingRecord, "{at}: the record's answer left the head pending");
                 }
+                if s == HeadKnown::NoRecord && ev == HeadEvent::NotFound && world_has_record {
+                    stale_reads += 1;
+                }
                 if s == HeadKnown::NoRecord && next == HeadKnown::HasRecord {
+                    contradicted += 1;
                     assert!(effects.contains(&HeadEffect::Contradicted), "{at}: 'no head' contradicted and not counted");
                 }
                 s = next;
             }
         }
+        println!("reached: NoRecord x Record(true) {contradicted} times; a read in NoRecord after another device created the Register {stale_reads} times");
+        assert!(contradicted > 0 && stale_reads > 0, "the model never reached the cells its H1 and contradiction checks are about");
     }
 
     /// NO CATCH-ALL over a state or an event in the two machines (a new case must fail to compile), read from the
