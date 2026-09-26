@@ -22,7 +22,10 @@ fn fixture() -> (Cid, MemBlocks) {
 }
 
 /// Every node the root reaches, found independently (a plain descent over the fixture's own store): id -> its groups.
-fn all_nodes(blocks: &MemBlocks, root: Cid) -> BTreeMap<Cid, Vec<(Vec<Cid>, Vec<Cid>)>> {
+/// A node's groups: (members, parity ids).
+type Groups = Vec<(Vec<Cid>, Vec<Cid>)>;
+
+fn all_nodes(blocks: &MemBlocks, root: Cid) -> BTreeMap<Cid, Groups> {
     let mut out = BTreeMap::new();
     let mut todo = vec![root];
     while let Some(id) = todo.pop() {
