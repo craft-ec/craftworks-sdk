@@ -21,7 +21,8 @@ use crate::silent::SilentNet;
 use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse, WebApi};
 use freenet_stdlib::prelude::{ContractInstanceId, InboundDelegateMsg};
-use futures::{SinkExt, StreamExt};
+use crate::live::{now_ms, Sock};
+use futures::SinkExt;
 use page::{Ms, Publication};
 use page_io::PageIo;
 use protocol::{Reply, Request};
@@ -30,8 +31,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 const APP: &str = "notes";
 const SESSION: u64 = 11;
-
-type Sock = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// The probe's inputs: the four contracts, and where its nodes go.
 pub struct Inputs {
@@ -94,12 +93,8 @@ pub async fn run_both(name: &str, with_data: bool) -> Result<()> {
     verdict
 }
 
-fn now_ms(t0: Instant) -> u64 {
-    1_000 + t0.elapsed().as_millis() as u64
-}
-
 fn hex8(b: &[u8]) -> String {
-    b.iter().take(4).map(|x| format!("{x:02x}")).collect()
+    core_types::hex::encode(&b[..b.len().min(4)])
 }
 
 /// A site's web part for version `n` (4000 bytes, distinct per version).
@@ -197,15 +192,8 @@ impl Pub {
                 }
                 bail!("not within {budget:?}; publication {:?}", self.io.publication(APP));
             }
-            let wait = self.io.next_due().map_or(50, |d| d.0.saturating_sub(now_ms(self.t0)).clamp(1, 50));
-            match tokio::time::timeout(Duration::from_millis(wait), self.sock.next()).await {
-                Ok(Some(Ok(Message::Binary(b)))) => {
-                    self.io.inbound(&b, Ms(now_ms(self.t0)));
-                }
-                Ok(Some(Ok(_))) => {}
-                Ok(Some(Err(e))) => bail!("the socket: {e}"),
-                Ok(None) => bail!("the node closed the socket"),
-                Err(_) => self.io.tick(Ms(now_ms(self.t0))),
+            if let Some(b) = crate::live::next_frame(&mut self.sock, &mut self.io, self.t0).await? {
+                self.io.inbound(&b, Ms(now_ms(self.t0)));
             }
         }
     }
