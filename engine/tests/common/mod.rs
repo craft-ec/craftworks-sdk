@@ -337,6 +337,18 @@ impl Harness {
     pub fn published_root(&self) -> Cid {
         self.engine.published_root()
     }
+
+    /// The engine, for what a test reads of it.
+    #[allow(dead_code)]
+    pub fn engine(&self) -> &Engine<Store> {
+        &self.engine
+    }
+
+    /// The engine, for what a test tells it before a step (the witness, as the page does).
+    #[allow(dead_code)]
+    pub fn engine_mut(&mut self) -> &mut Engine<Store> {
+        &mut self.engine
+    }
 }
 
 /// A writer engine holding everything, and the blocks it produced.

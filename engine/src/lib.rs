@@ -1006,6 +1006,15 @@ pub enum Witness {
     Unknown,
 }
 
+/// A commit's stage (COMMIT-LIFE rev 5): `Idle`, `Racing` (its PUTs out, the head not yet signed) or `Heading` (its
+/// `UpdateHead` sent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitStage {
+    Idle,
+    Racing,
+    Heading,
+}
+
 /// A queued write's stage (R-b; COMMIT-LIFE § A write's stage in the page's
 /// queue): the non-terminal half of a fate. Terminal fates are the verdicts
 /// the engine emits (`Effect::Notify`), kept by the page's Server.
@@ -1878,6 +1887,21 @@ impl<B: Blocks> Engine<B> {
     /// Stage moves the table calls impossible (footnote 1). Must be 0.
     pub fn impossible_transitions(&self) -> u64 {
         self.impossible_transitions
+    }
+
+    /// THE COMMIT'S STAGE (COMMIT-LIFE rev 5, C1): what the commit table's rows name, read by its model.
+    pub fn commit_stage(&self) -> CommitStage {
+        match self.pending.as_ref() {
+            None => CommitStage::Idle,
+            Some(c) if c.head_sent => CommitStage::Heading,
+            Some(_) => CommitStage::Racing,
+        }
+    }
+
+    /// Writes recorded as already told `Stalled` (COMMIT-LIFE C4, A5): a write that has LEFT the queue must not be
+    /// among them.
+    pub fn stalled_told(&self) -> usize {
+        self.told_stalled.len()
     }
 
     /// Own commits published and the queued writes they carried (K9).
