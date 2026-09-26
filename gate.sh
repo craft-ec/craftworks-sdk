@@ -47,6 +47,10 @@ fail() { echo "${RED}gate: $*${OFF}" >&2; FAILED=1; }
 step_fail() { STEP_FAILED=1; fail "$@"; }
 step() { echo; echo "── $* ──"; }
 FAILED=0
+# Checked HERE, before any work: a mistyped batch flag must not cost a full gate to find out.
+if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
+  case "$GATE_OWNERS_PER_PR" in (*[!0-9]*|0) echo "gate: GATE_OWNERS_PER_PR must be a PR count, got '$GATE_OWNERS_PER_PR'" >&2; exit 1 ;; esac
+fi
 STEP_FAILED=0
 # ONE FILE PER MEMBER (sdk#279): `gate.baseline.d/<member>` holds that
 # member's recorded count and nothing else. A single counts file conflicted on
@@ -421,11 +425,18 @@ echo "$dup_line"
 [ $dup_rc -ne 0 ] && step_fail "dup-gate: $dup_line"
 
 step "owners"
-owners_out=$(node tools/owners.mjs 2>&1)
-owners_rc=$?
-echo "$owners_out"
-owners_line=$(echo "$owners_out" | tail -1)
-[ $owners_rc -ne 0 ] && step_fail "owners: $owners_line"
+# A BATCH tree mixes several PRs' commits, so one owners verdict over it says nothing: craftworks-docs
+# scripts/batch-merge.sh judges each PR on its own commits first and says so here (sdk#420). Never a commit message.
+if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
+  owners_line="owners: judged per PR ($GATE_OWNERS_PER_PR PRs)"
+  echo "$owners_line"
+else
+  owners_out=$(node tools/owners.mjs 2>&1)
+  owners_rc=$?
+  echo "$owners_out"
+  owners_line=$(echo "$owners_out" | tail -1)
+  [ $owners_rc -ne 0 ] && step_fail "owners: $owners_line"
+fi
 
 # ----------------------------------------------------------- summary ----
 # WHAT IT RAN and the COUNTS, not a verdict on its own.
