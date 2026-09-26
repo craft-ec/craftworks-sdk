@@ -21,11 +21,11 @@ const TEST_ATTR = /#\[\s*(?:[A-Za-z_][\w]*::)*test\s*(?:\(|\])/;
 /** `#[wasm_bindgen_test]`: never run natively, and this gate has no wasm test runner, so an added one never runs. */
 const WASM_TEST_ATTR = /#\[\s*(?:wasm_bindgen_test::)?wasm_bindgen_test\s*(?:\(|\])/;
 
-/** Every `.rs` file under `p` (a file or a directory). */
-function rustFiles(p) {
-  if (!existsSync(p)) return [];
+/** Every `.rs` file under `p` (a file or a directory), skipping the directories named in `except`. */
+function rustFiles(p, except = []) {
+  if (!existsSync(p) || except.includes(p)) return [];
   if (statSync(p).isFile()) return p.endsWith(".rs") ? [p] : [];
-  return readdirSync(p).flatMap(f => rustFiles(join(p, f)));
+  return readdirSync(p).flatMap(f => rustFiles(join(p, f), except));
 }
 
 /** The targets cargo ran for one member and how many tests each ran: `Running <src> (…)` then `running N tests`. */
@@ -42,10 +42,11 @@ export function targetsRun(out) {
   return targets;
 }
 
-/** The source a target's tests live in: a lib/bin unit-test target is the member's whole src/; `tests/x.rs` is that
- * file plus `tests/x/` (its modules). */
+/** The source a target's tests live in: the lib (or `src/main.rs`) is the member's src/ WITHOUT src/bin/, whose
+ * files are each their own bin target; any other target (`src/bin/x.rs`, `tests/x.rs`) is that file plus the
+ * directory of the same name (its modules). */
 function sourcesOf(memberDir, src) {
-  if (/^src\//.test(src)) return rustFiles(join(memberDir, "src"));
+  if (src === "src/lib.rs" || src === "src/main.rs") return rustFiles(join(memberDir, "src"), [join(memberDir, "src", "bin")]);
   const file = join(memberDir, src);
   return [...rustFiles(file), ...rustFiles(file.replace(/\.rs$/, ""))];
 }

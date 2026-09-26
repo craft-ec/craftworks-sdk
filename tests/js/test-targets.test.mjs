@@ -77,6 +77,25 @@ t("**a tests/x.rs (or tests/x/) that declares a test and ran 0 is silent**; a ta
   } finally { rmSync(d, { recursive: true }); }
 });
 
+t("**a bin target is its own file, not the whole src/** (probe's case: 14 bins wrongly blamed for one bin's test); the lib excludes src/bin/", () => {
+  const out = [
+    "     Running unittests src/lib.rs (target/debug/deps/probe-1)", "running 3 tests",
+    "     Running unittests src/bin/live-reregister.rs (target/debug/deps/live_reregister-1)", "running 1 test",
+    "     Running unittests src/bin/put-acks.rs (target/debug/deps/put_acks-1)", "running 0 tests",
+    "     Running unittests src/bin/silent-bin.rs (target/debug/deps/silent_bin-1)", "running 0 tests",
+  ].join("\n");
+  const d = member({ "src/lib.rs": "#[test]\nfn a() {}\n", "src/bin/live-reregister.rs": "#[test]\nfn b() {}\n",
+    "src/bin/put-acks.rs": "fn main() {}\n", "src/bin/silent-bin.rs": "fn main() {}\n", "src/bin/silent-bin/m.rs": "#[test]\nfn c() {}\n" });
+  try {
+    assert.deepEqual(silentTargets(out, d).map(x => x.src), ["src/bin/silent-bin.rs"], "only the bin whose OWN source declares a test");
+  } finally { rmSync(d, { recursive: true }); }
+  // The lib does not own src/bin/: a lib that ran 0 is not blamed for a bin's test.
+  const lib = member({ "src/lib.rs": "pub fn x() {}\n", "src/bin/t.rs": "#[test]\nfn b() {}\n" });
+  try {
+    assert.deepEqual(silentTargets("     Running unittests src/lib.rs (x)\nrunning 0 tests\n", lib), []);
+  } finally { rmSync(lib, { recursive: true }); }
+});
+
 t("what counts as a test attribute: #[test], #[tokio::test(...)]; NOT #[cfg(test)], #[test_case], wasm_bindgen_test", () => {
   const diff = (attr) => `+++ b/x/src/a.rs\n@@\n+${attr}\n+fn f() {}\n`;
   assert.equal(addedTests(diff("#[test]")).length, 1);
