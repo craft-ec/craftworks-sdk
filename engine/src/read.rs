@@ -42,6 +42,12 @@ pub enum Via {
 pub enum ReadResult {
     /// The value, or its absence. Absence is an answer.
     Value(Option<Vec<u8>>),
+    /// A page of the tree's nodes and their groups ([`NodesSpec`]). `next`: where the next page starts; `None` when
+    /// every level has been walked.
+    Nodes {
+        nodes: Vec<NodeGroups>,
+        next: Option<NodesAt>,
+    },
     Page {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         /// Pass back as `after` to continue. `None` means the scan reached the
@@ -94,6 +100,8 @@ pub enum ReadResult {
 pub enum Walk {
     Get(Vec<u8>),
     Scan(Box<ScanSpec>),
+    /// A page of the tree's NODES with their groups (the assets dashboard's audit, KEEPER §4).
+    Nodes(NodesSpec),
     /// What changed in a range between `from` and the walk's root: a LIVE
     /// binding's diff from the root it rendered at (READ-STATE inv. 5).
     Delta(Box<DeltaSpec>),
@@ -114,6 +122,9 @@ pub enum Walked {
 pub(crate) enum Want {
     Get(Vec<u8>),
     Scan(Box<ScanSpec>),
+    /// A page of the tree's nodes and their groups ([`NodesSpec`]): a READ like the others -- it descends, parks on a
+    /// cold node and resumes when it lands (rule 4: the one read path).
+    Nodes(NodesSpec),
     /// What changed in a range between a root the reader last saw and the
     /// root now.
     ///
@@ -143,6 +154,32 @@ pub struct DeltaSpec {
     pub lo: std::ops::Bound<Vec<u8>>,
     pub hi: std::ops::Bound<Vec<u8>>,
     pub max_entries: usize,
+}
+
+/// A page of a tree's NODES, LEVEL BY LEVEL from the root down, left to right within a level: `at` names where the
+/// page starts (`None`: the root's level, its first node), `max_nodes` how many it holds. What the assets dashboard's
+/// audit walks (KEEPER §4): every group a node carries, and its parity ids.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodesSpec {
+    pub at: Option<NodesAt>,
+    pub max_nodes: usize,
+}
+
+/// Where a [`NodesSpec`] page starts: the first node of `level` that can hold `from` (a level's smallest key, as its
+/// parent records it).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodesAt {
+    pub level: u8,
+    pub from: Vec<u8>,
+}
+
+/// One node and its GROUPS: each group's members (children for a branch, referenced values for a leaf) and its
+/// `freenet_prolly::parity::PARITY` parity ids, in the node's group order.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodeGroups {
+    pub id: Cid,
+    pub level: u8,
+    pub groups: Vec<(Vec<Cid>, Vec<Cid>)>,
 }
 
 /// A scan, in the engine's OWN representation.
@@ -341,6 +378,50 @@ pub(crate) enum Attempt {
     Broken(Cid),
 }
 
+/// One page of [`NodesSpec`]: from `spec.at` (or the root's level), up to `max_nodes` nodes, level by level down to the
+/// leaves. A cold node is a `Need` (the parked read fetches it and walks the page again from the same start).
+fn nodes_page<B: Blocks>(blocks: &B, root: &Cid, spec: &NodesSpec) -> Result<(Vec<NodeGroups>, Option<NodesAt>), ReadError> {
+    use freenet_prolly::cursor::LevelCursor;
+    use freenet_prolly::parity::{group_members, PARITY};
+    let top = freenet_prolly::store::Held::root(blocks, root)?.level();
+    let (mut level, mut from) = match &spec.at {
+        Some(at) => (at.level, at.from.clone()),
+        None => (top, Vec::new()),
+    };
+    let mut nodes = Vec::new();
+    loop {
+        let Some(mut c) = LevelCursor::seek(blocks, root, level, &from)? else { return Ok((nodes, None)) };
+        loop {
+            let node = c.node();
+            let parity: Vec<Cid> = node.parity().collect();
+            let groups = group_members(node)
+                .into_iter()
+                .enumerate()
+                .map(|(g, (_, members))| (members, parity.iter().skip(g * PARITY).take(PARITY).copied().collect()))
+                .collect();
+            nodes.push(NodeGroups { id: c.id(), level, groups });
+            let next = c.next_min_key();
+            if nodes.len() >= spec.max_nodes.max(1) {
+                let at = match next {
+                    Some(key) => Some(NodesAt { level, from: key }),
+                    None => level.checked_sub(1).map(|l| NodesAt { level: l, from: Vec::new() }),
+                };
+                return Ok((nodes, at));
+            }
+            if next.is_none() || !c.advance()? {
+                break;
+            }
+        }
+        match level.checked_sub(1) {
+            Some(l) => {
+                level = l;
+                from = Vec::new();
+            }
+            None => return Ok((nodes, None)),
+        }
+    }
+}
+
 pub(crate) fn attempt<B: Blocks>(
     blocks: &B,
     params: &Params,
@@ -384,6 +465,11 @@ pub(crate) fn attempt<B: Blocks>(
             DeltaStep::Prefix { need, .. } | DeltaStep::Need(need) => Attempt::Need(need),
             DeltaStep::Broken(cid) => Attempt::Broken(cid),
             DeltaStep::Reload => Attempt::Done(ReadResult::FullReloadRequired { new_root: *root }),
+        },
+        Want::Nodes(spec) => match nodes_page(blocks, root, spec) {
+            Ok((nodes, next)) => Attempt::Done(ReadResult::Nodes { nodes, next }),
+            Err(ReadError::Need(ids)) => Attempt::Need(ids.into_iter().take(params.max_fetch_per_round).collect()),
+            Err(ReadError::Corrupt(cid, _)) | Err(ReadError::Mismatch(cid)) => Attempt::Broken(cid),
         },
         Want::Scan(spec) => {
             let opts = RangeOptions::default();

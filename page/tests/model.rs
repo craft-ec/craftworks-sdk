@@ -1751,3 +1751,295 @@ fn a_foreign_members_absent_are_asked_again_and_put_only_after_held_absents() {
         }
     }
 }
+
+// ---------------- THE ASSETS DASHBOARD'S AUDIT (KEEPER §4, §7; step 2) ----------------
+
+/// Page A publishes `rows` rows of 2,000-byte values (30: one leaf, a value group of 30 with its 8 parity, and the
+/// root's group of one; 300: several leaves under a branch); page B, fresh on the same node, reads A's head. Returns
+/// (node, B, now).
+fn audited_tree(rows: usize) -> (Node, Page, u64) {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(Params::default(), PutPath::Page);
+    let mut b = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000u64;
+    audit_serve(&mut a, &mut node, &mut now, &Default::default(), 400);
+    audit_serve(&mut b, &mut node, &mut now, &Default::default(), 400);
+    // In writes of 30 (one write's bound).
+    for (w, lo) in (0..rows).step_by(30).enumerate() {
+        let written: Vec<(Vec<u8>, WriteOp)> = (lo..(lo + 30).min(rows)).map(|i| (format!("v/{i:03}").into_bytes(), WriteOp::Put(vec![(i % 251) as u8; 2_000]))).collect();
+        a.write(ClientId(1), WriteId(w as u64 + 1), written);
+        audit_serve(&mut a, &mut node, &mut now, &Default::default(), 5_000);
+    }
+    let seq = rows.div_ceil(30) as u64;
+    assert_eq!(node.head().map(|h| h.0), Some(seq), "THE SETUP: A did not publish every write");
+    b.head_hint();
+    audit_serve(&mut b, &mut node, &mut now, &Default::default(), 400);
+    assert_eq!(b.published().0, seq, "THE SETUP: B did not adopt A's head");
+    (node, b, now)
+}
+
+/// Serve `p` as the node does, ONE ROUND BEHIND: the ops a `take_ops` returns are answered at the next round, so an
+/// op that is not answered yet is IN FLIGHT when the page is asked for more. Returns the most audit ops (Held + GET)
+/// ever in flight at once. `silent`: GETs of these blocks are never answered.
+fn audit_serve(p: &mut Page, node: &mut Node, now: &mut u64, silent: &std::collections::BTreeSet<Cid>, rounds: usize) -> usize {
+    let mut held_back: Vec<Op> = Vec::new();
+    let mut most = 0;
+    for _ in 0..rounds {
+        let ops = p.take_ops();
+        let in_flight = held_back.iter().chain(ops.iter()).filter(|o| matches!(o, Op::AskHeld { .. } | Op::Get { .. })).count();
+        most = most.max(in_flight);
+        let answering = std::mem::replace(&mut held_back, ops);
+        if answering.is_empty() && held_back.is_empty() {
+            if !p.waiting() {
+                break;
+            }
+            *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
+            p.tick(Ms(*now));
+            continue;
+        }
+        for op in answering {
+            let ans = match op {
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    Some(Answer::PutOk(id))
+                }
+                Op::Get { id } if silent.contains(&id) => None,
+                Op::Get { id } => Some(match node.blocks.get(&id) {
+                    Some(b) => Answer::Got { id, bytes: b.clone() },
+                    None => Answer::GetMissed(id),
+                }),
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                    let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                    Some(Answer::Signer { id, answer })
+                }
+                Op::Update { state, .. } => {
+                    node.update(&state);
+                    Some(Answer::Updated { label: page::Label::Head })
+                }
+                Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
+                Op::AskHeld { batch, ids } => Some(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() }),
+                Op::PutApp { key } => Some(Answer::AppPutOk(key)),
+                Op::Ext(_) => None,
+            };
+            if let Some(ans) = ans {
+                p.answer(ans, Ms(*now));
+            }
+        }
+    }
+    most
+}
+
+/// **A WHOLE tree audits whole, ONE audit op at a time** (KEEPER §4, §7): B, cold on A's tree, walks every node
+/// (background fetches), asks every group's blocks `Held`, and reports every group whole -- with never more than one
+/// audit op in flight at any round. Mutant "the walk's fetches take the interactive window" -> several at once -> red.
+#[test]
+fn a_whole_tree_audits_whole_one_op_at_a_time() {
+    let (mut node, mut b, mut now) = audited_tree(300);
+    b.audit();
+    let most = audit_serve(&mut b, &mut node, &mut now, &Default::default(), 5_000);
+    let r = b.take_audit().expect("the pass did not end");
+    println!("audit: {} groups, {} whole, {} degraded, damaged {:?}, pending {}; most audit ops in flight at once: {most}", r.groups, r.whole, r.degraded, r.damaged, r.pending);
+    assert!(r.groups >= 4, "THE SETUP: the walk found {} group(s): not a tree of several levels", r.groups);
+    assert_eq!((r.whole, r.degraded, r.damaged.len(), r.pending), (r.groups, 0, 0, 0), "a whole tree did not audit whole");
+    assert_eq!(r.root, node.head().expect("a head").1, "the pass did not measure the published root");
+    assert!(most <= 1, "{most} audit ops were in flight at once (KEEPER §7: one)");
+    assert_eq!(r.health, page::audit::Health::Whole);
+    assert_eq!(r.margins.values().sum::<usize>(), r.groups, "the margins do not account for every group");
+    assert!(r.finished_at >= r.started_at);
+}
+
+/// **Health per group, from its margin** (KEEPER §4.3): members removed from the node's store are absent (Held says
+/// no; their GET says NotFound), and the value group's margin falls -- 3 removed: degraded; 9 removed (below k):
+/// damaged, named by its first parity id. The other groups stay whole.
+#[test]
+fn a_groups_health_is_its_margin() {
+    for (removed, want) in [(3usize, "degraded"), (9, "damaged")] {
+        let (mut node, mut b, mut now) = audited_tree(30);
+        // The value group: the 30 values A wrote (2,000 bytes each).
+        let values: Vec<Cid> = node.blocks.iter().filter(|(_, v)| v.len() == 2_000).map(|(k, _)| *k).take(removed).collect();
+        assert_eq!(values.len(), removed, "THE SETUP: not enough value blocks");
+        for v in &values {
+            node.blocks.remove(v);
+        }
+        b.audit();
+        audit_serve(&mut b, &mut node, &mut now, &Default::default(), 5_000);
+        let r = b.take_audit().expect("the pass did not end");
+        println!("{removed} removed: {} groups, {} whole, {} degraded, {} damaged", r.groups, r.whole, r.degraded, r.damaged.len());
+        match want {
+            "degraded" => {
+                assert_eq!((r.degraded, r.damaged.len()), (1, 0), "3 of 38 missing is not degraded");
+                assert_eq!(r.health, page::audit::Health::Degraded);
+                assert_eq!(r.margins.get(&5), Some(&1), "the degraded group's margin is not 8 - 3");
+            }
+            _ => {
+                assert_eq!((r.degraded, r.damaged.len()), (0, 1), "9 of 38 missing (below k) is not damaged");
+                assert_eq!(r.health, page::audit::Health::Damaged);
+                assert_eq!(r.margins.get(&-1), Some(&1), "the damaged group's margin is not 8 - 9");
+            }
+        }
+        assert_eq!(r.whole, r.groups - 1, "another group's health moved");
+    }
+}
+
+/// **A block SILENT at its GET's deadline is PENDING, and the pass ends** (KEEPER §4.2: a pass never waits on one
+/// block): the removed block's GET is never answered; the report counts it pending, never absent or present.
+#[test]
+fn a_silent_block_is_pending_and_the_pass_ends() {
+    let (mut node, mut b, mut now) = audited_tree(30);
+    let gone: Cid = node.blocks.iter().find(|(_, v)| v.len() == 2_000).map(|(k, _)| *k).expect("a value");
+    node.blocks.remove(&gone);
+    b.audit();
+    let silent = [gone].into_iter().collect();
+    audit_serve(&mut b, &mut node, &mut now, &silent, 5_000);
+    let r = b.take_audit().expect("the pass waited on a silent block");
+    assert_eq!(r.pending, 1, "the silent block is not pending");
+    assert_eq!(r.degraded, 1, "the silent block's group is not degraded (it is not held)");
+}
+
+/// **NO SIGNER TO ASK: the asset is UNMEASURED, never all-absent** (the architect): every `Held` batch is answered
+/// `HeldUnasked` (a reader's page has no signer). The pass reports `measured: false`, sends no GET, and names nothing
+/// absent or damaged.
+#[test]
+fn a_page_with_no_signer_reports_its_asset_unmeasured() {
+    let (mut node, mut b, now) = audited_tree(30);
+    b.audit();
+    let (mut asked_held, mut gets_after) = (false, 0);
+    for _ in 0..2_000 {
+        let ops = b.take_ops();
+        if ops.is_empty() && !b.waiting() {
+            break;
+        }
+        for op in ops {
+            match op {
+                Op::AskHeld { batch, .. } => {
+                    asked_held = true;
+                    b.answer(Answer::HeldUnasked { batch }, Ms(now));
+                }
+                Op::Get { id } => {
+                    gets_after += usize::from(asked_held);
+                    let a = match node.blocks.get(&id) {
+                        Some(bytes) => Answer::Got { id, bytes: bytes.clone() },
+                        None => Answer::GetMissed(id),
+                    };
+                    b.answer(a, Ms(now));
+                }
+                other => panic!("an audit on a settled page sent {other:?}"),
+            }
+        }
+    }
+    let _ = &mut node;
+    let r = b.take_audit().expect("the pass did not end");
+    println!("unmeasured: measured {}, groups {}, damaged {:?}, GETs after the first Held {gets_after}", r.measured, r.groups, r.damaged);
+    assert!(asked_held, "THE SETUP: the audit asked no Held");
+    assert!(!r.measured, "an asset the page could not ask about was reported measured");
+    assert_eq!(r.health, page::audit::Health::Unmeasured);
+    assert!(r.margins.is_empty(), "an unmeasured asset has margins");
+    assert_eq!((gets_after, r.whole, r.degraded, r.damaged.len()), (0, 0, 0, 0), "an unmeasured asset was GET or counted");
+}
+
+/// **A block the node REJECTED is ABSENT for its group, listed in `rejected`, and never asked or fetched** (KEEPER §5;
+/// sdk#433): once A's write has published, the node rejects one of its follow-up PARITY blocks; A's own audit counts it
+/// absent (its group degraded, NOT damaged -- the group is still whole enough), names it in `rejected`, and sends
+/// neither a Held ask nor a GET for it.
+#[test]
+fn a_rejected_block_is_absent_listed_and_never_asked() {
+    let (mut node, _) = Node::new();
+    let mut a = Page::new(Params::default(), PutPath::Page);
+    let mut now = 1_000u64;
+    audit_serve(&mut a, &mut node, &mut now, &Default::default(), 400);
+    let rows: Vec<(Vec<u8>, WriteOp)> = (0..30).map(|i| (format!("v/{i:02}").into_bytes(), WriteOp::Put(vec![i as u8; 2_000]))).collect();
+    a.write(ClientId(1), WriteId(1), rows);
+    // The node rejects the first 2,000-byte value block it is asked to PUT; everything else is served.
+    let mut rejected = None;
+    for _ in 0..3_000 {
+        let ops = a.take_ops();
+        if ops.is_empty() {
+            if !a.waiting() {
+                break;
+            }
+            now = a.next_due().map_or(now + 1, |d| d.0.max(now + 1));
+            a.tick(Ms(now));
+            continue;
+        }
+        for op in ops {
+            let ans = match op {
+                // A follow-up PARITY put once the head has landed (a rejection before the head ends the commit).
+                Op::Put { id, bytes } if rejected.is_none() && a.published().0 >= 1 && freenet_prolly::block_id(freenet_prolly::kind::PARITY, &bytes) == id => {
+                    rejected = Some(id);
+                    Some(Answer::PutRefused { id, transient: false })
+                }
+                Op::Put { id, bytes } => {
+                    node.put(id, &bytes);
+                    Some(Answer::PutOk(id))
+                }
+                Op::Get { id } => {
+                    Some(match node.blocks.get(&id) {
+                        Some(b) => Answer::Got { id, bytes: b.clone() },
+                        None => Answer::GetMissed(id),
+                    })
+                }
+                Op::Sign { id, prev_seq, prev_root, seq, root, ledger, .. } => {
+                    let (id, answer) = node.sign(id, prev_seq, prev_root, seq, root, ledger);
+                    Some(Answer::Signer { id, answer })
+                }
+                Op::Update { state, .. } => {
+                    node.update(&state);
+                    Some(Answer::Updated { label: page::Label::Head })
+                }
+                Op::ReadHead { .. } => Some(Answer::Head { label: page::Label::Head, read: node.head_read() }),
+                Op::AskHeld { batch, ids } => {
+                    Some(Answer::Held { batch, present: ids.iter().map(|id| node.blocks.contains_key(id)).collect() })
+                }
+                Op::PutApp { key } => Some(Answer::AppPutOk(key)),
+                Op::Ext(_) => None,
+            };
+            if let Some(ans) = ans {
+                a.answer(ans, Ms(now));
+            }
+        }
+    }
+    let _ = &mut node;
+    let rejected = rejected.expect("THE SETUP: no follow-up parity block was rejected");
+    assert!(a.published().0 >= 1, "THE SETUP: A did not publish (a rejected block ends nothing past the head)");
+    a.audit();
+    let asks = audit_asks(&mut a, &mut node, &mut now, rejected);
+    let r = a.take_audit().expect("the pass did not end");
+    println!("rejected: {} of {} groups: whole {}, degraded {}, damaged {}; asks of the rejected block {asks}", r.rejected.len(), r.groups, r.whole, r.degraded, r.damaged.len());
+    assert_eq!(r.rejected, vec![rejected], "the rejected block is not listed in `rejected`");
+    assert_eq!((r.degraded, r.damaged.len()), (1, 0), "a group missing one rejected block is not degraded (it is still whole enough to rebuild)");
+    assert_eq!(asks, 0, "the audit asked Held or GET about a block the node rejected");
+}
+
+/// Serve `p`'s audit as `audit_serve` does, counting the Held asks and GETs that name `id`.
+fn audit_asks(p: &mut Page, node: &mut Node, now: &mut u64, id: Cid) -> usize {
+    let mut asks = 0;
+    for _ in 0..5_000 {
+        let ops = p.take_ops();
+        if ops.is_empty() {
+            if !p.waiting() {
+                break;
+            }
+            *now = p.next_due().map_or(*now + 1, |d| d.0.max(*now + 1));
+            p.tick(Ms(*now));
+            continue;
+        }
+        for op in ops {
+            match op {
+                Op::AskHeld { batch, ids } => {
+                    asks += ids.iter().filter(|x| **x == id).count();
+                    p.answer(Answer::Held { batch, present: ids.iter().map(|x| node.blocks.contains_key(x)).collect() }, Ms(*now));
+                }
+                Op::Get { id: g } => {
+                    asks += usize::from(g == id);
+                    let a = match node.blocks.get(&g) {
+                        Some(b) => Answer::Got { id: g, bytes: b.clone() },
+                        None => Answer::GetMissed(g),
+                    };
+                    p.answer(a, Ms(*now));
+                }
+                other => panic!("an audit sent {other:?}"),
+            }
+        }
+    }
+    asks
+}
