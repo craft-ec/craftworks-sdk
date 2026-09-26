@@ -16,6 +16,109 @@
 // (`signal`).
 
 import { RTO_SCHEDULE_MS, WINDOW_AFTER_ANSWERS } from "./rto.js";
+import { COARSEN_BANDS, COARSEN_LAST_GRAIN, EVENT, HTTP_CLASSES, KEY, OUTCOME, SITE, STATUS, STRIDE } from "./instrument-vocab.js";
+
+/** A time, coarsened by the recording vocabulary's own rule (generated from craftworks-instrument's bands). */
+export const coarsenMs = ms => {
+  for (const [below, grain] of COARSEN_BANDS) if (ms < below) return Math.floor(ms / grain) * grain;
+  return Math.floor(ms / COARSEN_LAST_GRAIN) * COARSEN_LAST_GRAIN;
+};
+
+/** An HTTP status's class (generated from craftworks-instrument's table). */
+export const statusClassOf = status => {
+  for (const [lo, hi, cls] of HTTP_CLASSES) if (status >= lo && status <= hi) return cls;
+  return STATUS.OtherHttp;
+};
+
+/**
+ * THE LOADER'S RECORDING (sdk#386's instrument work, the architect's design): every fetch round the loader makes
+ * before the SDK exists, as NUMBERS from the generated vocabulary -- `[kind, site, a, b, c]` per event, never a URL,
+ * a hash or a key. The spine's rules: BOUNDED (the last `capacity` events kept; older ones overwritten and COUNTED),
+ * a per-ring SEQUENCE (the fetch's ordinal), times only as COARSENED offsets from the ring's start, and no read-back
+ * into the loader's logic -- the loader only writes. When the SDK exists, `take()` hands the ring to the page
+ * ONCE (`Session.adopt_loader`), where Rust validates every number; after it, the ring records nothing.
+ */
+export class LoaderRing {
+  constructor(capacity = 1024, now = () => Date.now()) {
+    this.cap = capacity;
+    this.buf = new Array(capacity * STRIDE).fill(0);
+    this.n = 0;
+    this.at = 0;
+    this.dropped = 0;
+    this.fetches = 0;
+    this.now = now;
+    this.startMs = now();
+    this.taken = false;
+  }
+
+  push(kind, a, b, c) {
+    if (this.taken) return;
+    this.buf.splice(this.at * STRIDE, STRIDE, kind, SITE["loader::fetch"], a, b, c);
+    this.at = (this.at + 1) % this.cap;
+    if (this.n < this.cap) this.n += 1;
+    else this.dropped += 1;
+  }
+
+  /** A fetch round ASKED: its ordinal (the ring's own sequence), its attempt, and when. */
+  asked(round) {
+    this.fetches += 1;
+    const o = this.fetches;
+    this.push(EVENT.EDGE, 0, o, 0);
+    this.push(EVENT.COUNTER, o, KEY.Attempts, round + 1);
+    this.push(EVENT.COUNTER, o, KEY.OffsetMs, coarsenMs(this.now() - this.startMs));
+    return o;
+  }
+
+  /** An HTTP ANSWER, any status: the class of it. */
+  answered(o, status) {
+    this.push(EVENT.EDGE, 1, o, 0);
+    this.push(EVENT.COUNTER, o, KEY.StatusClass, statusClassOf(status));
+  }
+
+  /** No HTTP answer: withdrawn on this side (a cancel), or none at all (a network error). */
+  ended(o, cancelled) {
+    this.push(EVENT.EXIT, o, cancelled ? OUTCOME.Withdrawn : OUTCOME.Timeout, 0);
+    this.push(EVENT.COUNTER, o, KEY.StatusClass, cancelled ? STATUS.Abort : STATUS.NetworkError);
+  }
+
+  /** The events, oldest first. */
+  events() {
+    const full = this.n === this.cap;
+    const out = [];
+    for (let k = 0; k < this.n; k += 1) {
+      const i = ((full ? this.at : 0) + k) % this.cap;
+      out.push(...this.buf.slice(i * STRIDE, i * STRIDE + STRIDE));
+    }
+    return out;
+  }
+
+  /** The handover, ONCE: when the loader started, its events, and how many the ring lost. It records nothing after. */
+  take() {
+    const seg = { startMs: this.startMs, events: this.events(), dropped: this.dropped };
+    this.taken = true;
+    return seg;
+  }
+}
+
+/** The loader's one ring: every `served()` records into it unless handed another. */
+export const loaderRing = new LoaderRing();
+
+/**
+ * The loader's rounds, rendered for a person -- ONLY for when the SDK never loaded (otherwise they are in the page's
+ * recording, `Session.page_trace`). Names from the generated vocabulary; nothing else is in the ring to name.
+ */
+export function loaderTrace(ring = loaderRing) {
+  const name = (table, v) => Object.keys(table).find(k => table[k] === v) ?? `#${v}`;
+  const ev = ring.events();
+  const lines = [`loader: ${ev.length / STRIDE} events, ${ring.dropped} dropped`];
+  for (let i = 0; i < ev.length; i += STRIDE) {
+    const [kind, , a, b, c] = ev.slice(i, i + STRIDE);
+    if (kind === EVENT.EDGE) lines.push(`  fetch#${b} ${a === 0 ? "asked" : "answered"}`);
+    else if (kind === EVENT.EXIT) lines.push(`  fetch#${a} ${name(OUTCOME, b)}`);
+    else lines.push(`  fetch#${a} ${name(KEY, b)}=${b === KEY.StatusClass ? name(STATUS, c) : c}`);
+  }
+  return lines.join("\n");
+}
 
 const hex = bytes =>
   [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, "0")).join("");
@@ -66,6 +169,8 @@ export async function served(
     signal = null,
     sleep = sleepFor,
     now = () => Date.now(),
+    // The loader's recording (above): every round asked and how it ended, as codes.
+    rec = loaderRing,
     check = null,
     name = null,
     refusal = "a refusal",
@@ -90,12 +195,16 @@ export async function served(
     let answered = 0;
     for (const from of sources) {
       let res;
+      // THE ONE SITE of the loader's recording: every request this fetch makes, and its end.
+      const asked = rec?.asked(round);
       try {
         res = await (init ? fetchWith(from, init) : fetchWith(from));
       } catch (e) {
+        rec?.ended(asked, signal?.aborted === true);
         failures.push(`${from}: ${e?.message ?? e}`);
         continue;
       }
+      rec?.answered(asked, res.status);
       if (!res.ok) {
         // NOT AN ANSWER about the file: the node does not hold it yet.
         failures.push(`${from}: ${res.status}`);

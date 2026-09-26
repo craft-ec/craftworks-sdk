@@ -47,6 +47,7 @@ function fakeSession({ deliverAfterMs = null } = {}) {
     // The real one says whether the frame was its own (sdk#239); a fake's
     // delivery always is.
     set_app() {}, // the app a session is (sdk forest ruling); a fake needs no namespace
+    adopt_loader() {}, // the loader's recording (sdk#386's instrument work); a fake records nothing
     on_inbound() { if (self.pendingDelivery) { loaded = true; ended.push({ id: ticket, ok: true, code: "LOADED" }); self.pendingDelivery = false; } return true; },
     unowned() {},
     reconnected() {},

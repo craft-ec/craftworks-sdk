@@ -9,6 +9,7 @@
 import { connect } from "./connection.js";
 import { engineDb } from "./engine-db.js";
 import { allArtefactBytes, artefactBytes } from "./artefacts.js";
+import { loaderRing } from "./served.js";
 
 /**
  * The artefacts as `build.sh` ships them, beside this file.
@@ -98,6 +99,10 @@ export async function openSession(Session, {
   documentOf = (typeof document === "object" ? document : null),
 } = {}) {
   const session = new Session(port);
+  // THE LOADER'S RECORDING (sdk#386's instrument work): its fetch rounds open this session's page recording, once --
+  // the ring stops recording when taken. Numbers only; the page validates each.
+  const seg = loaderRing.take();
+  session.adopt_loader(seg.startMs, Float64Array.from(seg.events), seg.dropped);
   if (app !== null) session.set_app(app);
   // A tree reader's stream-id range, 1..=255 and never reused while open.
   let rangeCursor = 0;

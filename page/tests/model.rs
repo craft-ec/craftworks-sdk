@@ -980,12 +980,15 @@ fn recording_accounts_for_every_op(p: &Page, sent: usize) -> Result<(), String> 
     let (mut requests, mut responses, mut exits) = (Vec::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
     for e in r.events() {
         match e {
-            Event::Edge { dir: Dir::Request, id, .. } => requests.push(id.ordinal),
+            Event::Edge { dir: Dir::Request, id, .. } => requests.push(id.ordinal()),
             Event::Edge { dir: Dir::Response, id, .. } => {
-                responses.insert(id.ordinal);
+                responses.insert(id.ordinal());
             }
             Event::Exit { op, .. } => {
-                exits.insert(op.0);
+                // The op decoded back to its label (instrument v2 carries the kind): only a SEND's end counts here.
+                if let Some(l) = instrument::Label::of_op(op).filter(|l| l.kind() == instrument::Kind::Request) {
+                    exits.insert(l.ordinal());
+                }
             }
             _ => {}
         }

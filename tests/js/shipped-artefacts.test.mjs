@@ -91,7 +91,7 @@ await t("**`starter` names the SDK's pre-SDK modules: what its starter ENTRIES r
   const want = [...new Set(["served.js", "pieces.js"].flatMap(e => [...reachable(join(web, e), web)]))].sort();
   assert.ok(Array.isArray(manifest.starter), "artefacts.json has no `starter` list");
   assert.deepEqual([...manifest.starter].sort(), want, "`starter` is not what the starter entries reach");
-  assert.deepEqual([...manifest.starter].sort(), ["pieces.js", "rto.js", "served.js"], "THE CONTROL: the starter is not the three modules it is today");
+  assert.deepEqual([...manifest.starter].sort(), ["instrument-vocab.js", "pieces.js", "rto.js", "served.js"], "THE CONTROL: the starter is not the four modules it is today");
   for (const m of manifest.starter) assert.ok(existsSync(join(web, m)), `${m} is named in starter but not in pkg/web`);
 });
 

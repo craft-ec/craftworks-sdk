@@ -19,7 +19,7 @@ function FakeSession({ after = 3, refuse = "" } = {}) {
   let polls = 0;
   return function () {
     return {
-      url: () => "ws://127.0.0.1:1/", outbound: () => [], sent() {}, on_inbound: () => true, unowned() {}, set_app() {},
+      url: () => "ws://127.0.0.1:1/", outbound: () => [], sent() {}, on_inbound: () => true, unowned() {}, set_app() {}, adopt_loader() {},
       reconnected() {}, take_progress: () => "[]", take_loads: () => "[]", tick_ms: () => 1000, tick: () => "{}",
       unsaved_writes: () => 0, cold_due_ms: () => -1, cold_tick() {}, flush() {}, provision() {},
       provisioned: () => (polls += 1) > after && !refuse, refused: () => refuse,

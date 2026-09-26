@@ -66,6 +66,8 @@ const TRANSPORT_ONLY: &[&str] = &[
     "trace",
     // The page's own recording (sdk#386's instrument work): there are no ops sent behind the in-memory surface.
     "page_trace",
+    // The LOADER's recording, handed to the page (sdk#386's instrument work): no loader behind the in-memory surface.
+    "adopt_loader",
     "trace_on",
     // How a parked read learns the blocks its walk needed arrived, and how it
     // RESUMES at that ticket's root (READ-STATE). An in-memory store holds

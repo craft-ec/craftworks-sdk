@@ -70,6 +70,7 @@
 
 pub mod fates;
 mod judge;
+pub mod loader;
 pub mod rto;
 pub mod server;
 
@@ -674,6 +675,8 @@ pub struct Page {
     /// The first send the recording saw: an op sent before the recorder was attached is not in it, and neither is
     /// its end (it would be an answer to a request the recording never made).
     rec_from: u32,
+    /// The send order outran what a label carries, and the recording was told (once).
+    rec_overflowed: std::cell::Cell<bool>,
     /// Every record the signer returned — invariant 2's evidence.
     signer_records: BTreeSet<Vec<u8>>,
 }
@@ -755,6 +758,7 @@ impl Page {
             rec_start: now.0,
             sends: 0,
             rec_from: 1,
+            rec_overflowed: std::cell::Cell::new(false),
             signer_records: BTreeSet::new(),
             next_request: 1,
         }
@@ -1788,8 +1792,24 @@ impl Page {
 
     /// The next send's place in the page's send order (the recording's label ordinal).
     fn next_send(&mut self) -> u32 {
-        self.sends = self.sends.wrapping_add(1);
+        // SATURATES, never wraps: a wrapped send order would reuse early ordinals (instrument v2, the architect).
+        self.sends = self.sends.saturating_add(1);
         self.sends
+    }
+
+    /// The recording's label for a send, or `None` once the send order has outrun what a label can carry
+    /// (`instrument::label::MAX_ORDINAL`): the page then stops labelling, and says so ONCE -- never wraps into
+    /// another kind's range.
+    fn send_label(&self, seq: u32) -> Option<instrument::Label> {
+        let label = instrument::Label::new(instrument::Kind::Request, seq);
+        if label.is_none() && !self.rec_overflowed.replace(true) {
+            if let Some(rec) = &self.rec {
+                use instrument::{vocab::DropReason, Entry, Event, Key, OpId, Probe};
+                let entry = Entry { key: Key::DroppedMsgs, value: DropReason::TooLarge.code() };
+                rec.event(Event::Counter { site: instrument::Site::of("page::recording"), op: OpId::NONE, entry });
+            }
+        }
+        label
     }
 
     /// AN OP ENDS: THE one way a deadline leaves (a control counts this crate's removals). What the recording
@@ -1808,9 +1828,10 @@ impl Page {
 
     /// A SEND: its Request edge, labelled by its place in the send order, and the retry clock it went out on.
     fn record_send(&self, w: &Waiting, d: &Deadline) {
-        use instrument::{vocab::coarsen_ms, Dir, Entry, Event, Key, Kind, Probe};
+        use instrument::{vocab::coarsen_ms, Dir, Entry, Event, Key, Probe};
         let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
-        let (site, id) = (op_site(w), instrument::Label { kind: Kind::Request, ordinal: d.seq });
+        let Some(id) = self.send_label(d.seq) else { return };
+        let site = op_site(w);
         rec.event(Event::Edge { site, dir: Dir::Request, id });
         for entry in [
             Entry { key: Key::Attempts, value: u64::from(d.attempt) },
@@ -1824,12 +1845,13 @@ impl Page {
 
     /// An END of an op on the wire (a parked one is not on the wire: its answer was recorded when it came).
     fn record_end(&self, w: &Waiting, d: &Deadline, how: End) {
-        use instrument::{Dir, Event, Kind, Outcome, Probe};
+        use instrument::{Dir, Event, Outcome, Probe};
         let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
         if !d.sent {
             return;
         }
-        let (site, id) = (op_site(w), instrument::Label { kind: Kind::Request, ordinal: d.seq });
+        let Some(id) = self.send_label(d.seq) else { return };
+        let site = op_site(w);
         rec.event(match how {
             End::Answered => Event::Edge { site, dir: Dir::Response, id },
             End::TimedOut => Event::Exit { site, op: id.op(), outcome: Outcome::Timeout },
@@ -1922,10 +1944,13 @@ impl Page {
             self.rto.sample(r);
             // The sample AS COMPUTED, before anything clamps it (the architect): a wrong clock shows here.
             if let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) {
-                use instrument::{vocab::coarsen_ms, Entry, Event, Key, Kind, Probe};
-                let (site, op) = (op_site(w), instrument::Label { kind: Kind::Request, ordinal: d.seq }.op());
-                rec.event(Event::Counter { site, op, entry: Entry { key: Key::SampleMs, value: coarsen_ms(r) } });
-                rec.event(Event::Counter { site, op, entry: Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) } });
+                use instrument::{vocab::coarsen_ms, Entry, Event, Key, Probe};
+                // Past the last label nothing is recorded -- and nothing else changes: the recording never steers.
+                if let Some(id) = self.send_label(d.seq) {
+                    let (site, op) = (op_site(w), id.op());
+                    rec.event(Event::Counter { site, op, entry: Entry { key: Key::SampleMs, value: coarsen_ms(r) } });
+                    rec.event(Event::Counter { site, op, entry: Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) } });
+                }
             }
             self.rearm_first_sends(self.rto.rto_ms());
         }
@@ -1960,9 +1985,11 @@ impl Page {
                 let at = d.armed.min(now + rto);
                 if at != d.at && d.seq >= from {
                     if let Some(rec) = rec {
-                        let op = instrument::Label { kind: Kind::Request, ordinal: d.seq }.op();
-                        let value = instrument::vocab::coarsen_ms(at.saturating_sub(start));
-                        rec.event(Event::Counter { site: op_site(w), op, entry: Entry { key: Key::ReArmedAtMs, value } });
+                        // Past the last label nothing is recorded; the re-arm below happens regardless.
+                        if let Some(op) = instrument::Label::new(Kind::Request, d.seq).map(|l| l.op()) {
+                            let value = instrument::vocab::coarsen_ms(at.saturating_sub(start));
+                            rec.event(Event::Counter { site: op_site(w), op, entry: Entry { key: Key::ReArmedAtMs, value } });
+                        }
                     }
                 }
                 d.at = at;
@@ -2027,6 +2054,21 @@ impl Page {
         self.rec = Some(instrument::Recorder::with_capacity(capacity));
         self.rec_start = self.now;
         self.rec_from = self.sends.wrapping_add(1);
+    }
+
+    /// Attach the page's recording with the LOADER's segment as its opening (sdk#386's instrument work): the fetch
+    /// rounds that loaded the SDK, then this page's ops, in one recording with ONE origin -- the loader's start (the
+    /// same `Date.now()` clock), so both segments' offsets count from one zero. Every loader event is validated
+    /// against closed code lists and re-coarsened ([`loader::decode`]); anything unknown is refused and counted.
+    pub fn record_into_after(&mut self, capacity: usize, seg: &loader::Segment) {
+        use instrument::Probe;
+        self.record_into(capacity);
+        self.rec_start = seg.start_ms;
+        if let Some(rec) = &self.rec {
+            for e in loader::events(seg) {
+                rec.event(e);
+            }
+        }
     }
 
     /// The recording, for a test or a local dump: a SEPARATE read handle -- the page itself only ever writes.
@@ -2832,7 +2874,7 @@ mod recording {
     const EPOCH_MS: u64 = 1_790_253_181_367;
 
     fn counters(r: &instrument::Recording<'_>, ordinal: u32, key: Key) -> Vec<u64> {
-        let op = instrument::Label { kind: Kind::Request, ordinal }.op();
+        let op = instrument::Label::new(Kind::Request, ordinal).expect("a small ordinal").op();
         r.events().into_iter().filter_map(|e| match e { Event::Counter { op: o, entry: Entry { key: k, value }, .. } if o == op && k == key => Some(value), _ => None }).collect()
     }
 
@@ -2849,7 +2891,7 @@ mod recording {
         let id = [7u8; 32];
         p.send(Waiting::Put(id), Op::Put { id, bytes: vec![1] });
         let r = p.recording().expect("attached");
-        let reqs: Vec<u32> = r.events().into_iter().filter_map(|e| match e { Event::Edge { dir: Dir::Request, id, .. } => Some(id.ordinal), _ => None }).collect();
+        let reqs: Vec<u32> = r.events().into_iter().filter_map(|e| match e { Event::Edge { dir: Dir::Request, id, .. } => Some(id.ordinal()), _ => None }).collect();
         assert_eq!(reqs, vec![1], "the send is not req#1");
         assert_eq!(counters(&r, 1, Key::OffsetMs), vec![0], "the send's offset does not count from the attach");
         assert_eq!(counters(&r, 1, Key::ArmedAtMs), vec![1_000], "armed at the initial RTO after the attach");
@@ -2858,7 +2900,7 @@ mod recording {
         // Unanswered: it times out and is sent again -- a new send.
         p.tick(Ms(EPOCH_MS + 6_000));
         let r = p.recording().expect("attached");
-        assert!(r.events().contains(&Event::Exit { site: op_site(&Waiting::Put(id)), op: instrument::OpId(1), outcome: Outcome::Timeout }), "the timeout was not recorded");
+        assert!(r.events().contains(&Event::Exit { site: op_site(&Waiting::Put(id)), op: instrument::Label::new(Kind::Request, 1).expect("1").op(), outcome: Outcome::Timeout }), "the timeout was not recorded");
         assert_eq!(counters(&r, 2, Key::Attempts), vec![2], "the re-send is not req#2 on its second attempt");
         // An op answered on its first send: its sample as computed, and the RTO after it.
         p.now = EPOCH_MS + 6_100;
@@ -2867,7 +2909,7 @@ mod recording {
         let r = p.recording().expect("attached");
         assert_eq!(counters(&r, 3, Key::SampleMs), vec![40], "the sample is not the 40 ms round trip");
         assert_eq!(counters(&r, 3, Key::RtoMs).last(), Some(&coarse(p.rto.rto_ms())));
-        assert!(r.events().contains(&Event::Edge { site: op_site(&Waiting::Ext(Ext::SignerFirst)), dir: Dir::Response, id: instrument::Label { kind: Kind::Request, ordinal: 3 } }));
+        assert!(r.events().contains(&Event::Edge { site: op_site(&Waiting::Ext(Ext::SignerFirst)), dir: Dir::Response, id: instrument::Label::new(Kind::Request, 3).expect("3") }));
         let dump = p.dump(40);
         assert!(!dump.contains("0707"), "the block id leaked into the dump:\n{dump}");
         println!("{dump}");
@@ -2875,6 +2917,107 @@ mod recording {
 
     fn coarse(ms: u64) -> u64 {
         instrument::vocab::coarsen_ms(ms)
+    }
+
+    /// PAST THE LAST LABEL THE RECORDING STILL NEVER STEERS: two pages at the label limit, one recording and one
+    /// not, send and answer the same ops -- their deadlines, window and RTO end identical. An unlabellable send once
+    /// made `answered` return before its re-arm and window step on the recording page only. Mutant "leave `answered`
+    /// when no label can be made" -> red.
+    #[test]
+    fn past_the_last_label_recording_changes_nothing_the_page_does() {
+        use instrument::label::MAX_ORDINAL;
+        let run = |record: bool| {
+            let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+            if record {
+                p.record_into(64);
+                p.rec_from = 0;
+            }
+            p.sends = MAX_ORDINAL + 5;
+            for i in 1..=3u8 {
+                p.send(Waiting::Get([i; 32]), Op::Get { id: [i; 32] });
+            }
+            p.now = EPOCH_MS + 40;
+            p.answered(&Waiting::Get([1; 32]));
+            let ats: Vec<u64> = p.deadlines.values().map(|d| d.at).collect();
+            (ats, p.window.size(), p.rto.rto_ms())
+        };
+        assert_eq!(run(true), run(false), "past the last label, recording changed what the page did");
+    }
+
+    /// THE SEND ORDER OUTRUNS A LABEL (the architect on instrument v2): past `MAX_ORDINAL` the page stops labelling
+    /// and says so ONCE -- it never wraps into another kind's range or reuses an early ordinal. The ops themselves
+    /// still go out: recording is never an input. Mutant "wrap the send order" -> red.
+    #[test]
+    fn past_the_last_label_the_page_stops_labelling_and_says_so_once() {
+        use instrument::label::MAX_ORDINAL;
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
+        p.record_into(64);
+        p.sends = MAX_ORDINAL - 1;
+        p.rec_from = 0;
+        for i in 1..=4u8 {
+            let id = [i; 32];
+            p.send(Waiting::Put(id), Op::Put { id, bytes: vec![i] });
+        }
+        assert_eq!(p.take_ops().len(), 4, "a send the recording could not label did not go out");
+        let r = p.recording().expect("attached");
+        let reqs: Vec<u32> = r.events().into_iter().filter_map(|e| match e { Event::Edge { dir: Dir::Request, id, .. } => Some(id.ordinal()), _ => None }).collect();
+        assert_eq!(reqs, vec![MAX_ORDINAL], "only the last labellable send is labelled: {reqs:?}");
+        let overflow = r.events().into_iter().filter(|e| e.site().name() == "page::recording").count();
+        assert_eq!(overflow, 1, "the overflow was not said exactly once");
+        assert_eq!(p.sends, MAX_ORDINAL + 3);
+        // At the END of u32: a wrapped order would come round to 0, 1 -- small ordinals a label carries -- and reuse
+        // them. Saturated, nothing past here is ever labelled.
+        p.sends = u32::MAX - 1;
+        for i in 5..=7u8 {
+            let id = [i; 32];
+            p.send(Waiting::Put(id), Op::Put { id, bytes: vec![i] });
+        }
+        let r = p.recording().expect("attached");
+        let reqs: Vec<u32> = r.events().into_iter().filter_map(|e| match e { Event::Edge { dir: Dir::Request, id, .. } => Some(id.ordinal()), _ => None }).collect();
+        assert_eq!(reqs, vec![MAX_ORDINAL], "the send order wrapped and reused an early ordinal: {reqs:?}");
+        assert_eq!(p.sends, u32::MAX, "the send order did not saturate");
+    }
+
+    /// THE LOADER'S SEGMENT OPENS THE RECORDING (the architect's three conditions): valid fetch rounds are kept as
+    /// `fetch#n` beside the page's `req#n`; an unknown site, an unknown key and an impossible StatusClass are each
+    /// REFUSED and counted (`DroppedMsgs` at `loader::handover`), never passed through; an uncoarsened offset is
+    /// re-coarsened; the ring's own losses are counted; and the page's first send, 1.4 s after the loader started,
+    /// is at offset 1400 in the SAME recording -- one origin. Mutant "pass an unknown site through" -> red.
+    #[test]
+    fn the_loaders_segment_opens_the_recording_validated_on_one_origin() {
+        use loader::{Segment, COUNTER, EDGE, EXIT};
+        let start = EPOCH_MS;
+        let seg = Segment {
+            start_ms: start,
+            events: vec![
+                EDGE, 0, 0, 1, 0, // fetch#1 asked
+                COUNTER, 0, 1, 1, 45, // its OffsetMs, uncoarsened: 45 -> 40
+                EDGE, 0, 1, 1, 0, // answered
+                COUNTER, 0, 1, 2, 1, // StatusClass NotFound
+                EDGE, 0, 0, 2, 0, // fetch#2 asked
+                EXIT, 0, 2, 1, 0, // withdrawn (the race had enough)
+                EDGE, 7, 0, 3, 0, // an UNKNOWN site
+                COUNTER, 0, 3, 9, 1, // an UNKNOWN key
+                COUNTER, 0, 3, 2, 99, // an impossible StatusClass
+            ],
+            dropped: 3,
+        };
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(start + 1_400));
+        p.record_into_after(1024, &seg);
+        p.send(Waiting::Ext(Ext::SignerFirst), Op::Ext(Ext::SignerFirst));
+        let r = p.recording().expect("attached");
+        let ev = r.events();
+        let fetch = |n| instrument::Label::new(Kind::Fetch, n).expect("a small ordinal");
+        let site = instrument::vocab::Site::of("loader::fetch");
+        assert_eq!(ev[0], Event::Edge { site, dir: Dir::Request, id: fetch(1) });
+        assert_eq!(ev[1], Event::Counter { site, op: fetch(1).op(), entry: Entry { key: Key::OffsetMs, value: 40 } }, "the offset was not re-coarsened");
+        assert_eq!(ev[5], Event::Exit { site, op: fetch(2).op(), outcome: Outcome::Withdrawn });
+        let refused = ev.iter().filter(|e| matches!(e, Event::Counter { site, entry: Entry { key: Key::DroppedMsgs, .. }, .. } if site.name() == "loader::handover")).count();
+        assert_eq!(refused, 3, "not every unknown code was refused and counted: {ev:?}");
+        assert!(ev.iter().any(|e| matches!(e, Event::Counter { site, entry: Entry { key: Key::DroppedMsgs, value: 3 }, .. } if site.name() == "loader::ring")), "the ring's losses were not counted");
+        assert!(!ev.iter().any(|e| e.site().name() == "loader::fetch" && matches!(e, Event::Edge { id, .. } if id.ordinal() == 3)), "an event with an unknown site was recorded");
+        assert_eq!(counters(&r, 1, Key::OffsetMs), vec![1_400], "the page's send is not on the loader's origin");
+        println!("{}", p.dump(40));
     }
 
     /// A send that SUPERSEDES one still on the wire (the same op sent again before its answer) ENDS the old one,
@@ -2889,8 +3032,8 @@ mod recording {
         p.send(Waiting::Ext(Ext::SignerFirst), Op::Ext(Ext::SignerFirst));
         let r = p.recording().expect("attached");
         let site = op_site(&Waiting::Ext(Ext::SignerFirst));
-        assert!(r.events().contains(&Event::Exit { site, op: instrument::OpId(1), outcome: Outcome::Withdrawn }), "the superseded send req#1 was not closed");
-        let open: Vec<_> = r.answers().into_iter().filter(|(_, a)| *a == instrument::Answered::Never).map(|(l, _)| l.ordinal).collect();
+        assert!(r.events().contains(&Event::Exit { site, op: instrument::Label::new(Kind::Request, 1).expect("1").op(), outcome: Outcome::Withdrawn }), "the superseded send req#1 was not closed");
+        let open: Vec<_> = r.answers().into_iter().filter(|(_, a)| *a == instrument::Answered::Never).map(|(l, _)| l.ordinal()).collect();
         assert_eq!(open, vec![1, 2], "req#1 closed-unanswered and req#2 on the wire");
         assert_eq!(p.ops_on_wire(), 1, "one op on the wire");
     }
