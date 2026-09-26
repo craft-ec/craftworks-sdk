@@ -16,43 +16,17 @@
 //!
 //! usage: page-get-silent <block.wasm> <dir> <keep> [--base PORT] [--watch SECS] [--silent-peers N]
 use anyhow::{bail, Context, Result};
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, NodeQuery, QueryResponse, WebApi};
+use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::*;
 use page::{Answer, Ms, Op, Page, PutPath};
-use probe::node::{Node, TempTree};
-use probe::signer::{connect, container};
+use probe::silent::arg;
+use probe::signer::container;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
-fn arg(a: &[String], name: &str) -> Option<String> {
-    a.iter().position(|x| x == name).and_then(|i| a.get(i + 1)).cloned()
-}
-
 fn hex(b: &[u8]) -> String {
     core_types::hex::encode(b)
-}
-
-fn signal(pid: u32, sig: &str) -> Result<()> {
-    if !std::process::Command::new("kill").args([sig, &pid.to_string()]).status()?.success() {
-        bail!("kill {sig} {pid} failed");
-    }
-    Ok(())
-}
-
-struct Resume(u32);
-impl Drop for Resume {
-    fn drop(&mut self) {
-        let _ = signal(self.0, "-CONT");
-    }
-}
-
-/// Copies b's logs out before the temp tree is removed (declared after it, so dropped first).
-struct Keep(std::path::PathBuf, std::path::PathBuf);
-impl Drop for Keep {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("cp").arg("-R").arg(&self.0).arg(&self.1).status();
-    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -60,70 +34,13 @@ async fn main() -> Result<()> {
     let usage = "usage: page-get-silent <block.wasm> <dir> <keep> [--base PORT] [--watch SECS] [--silent-peers N]";
     let a: Vec<String> = std::env::args().skip(1).collect();
     let (Some(bw), Some(dir), Some(keep)) = (a.first(), a.get(1), a.get(2)) else { bail!("{usage}") };
-    let base: u16 = arg(&a, "--base").map(|v| v.parse()).transpose()?.unwrap_or(47_600);
     let bound = page::rto::NODE_GET_BOUND_MS as u64;
     let watch = Duration::from_secs(arg(&a, "--watch").map(|v| v.parse()).transpose()?.unwrap_or(bound / 1000 + 90));
-    let silent_peers: u16 = arg(&a, "--silent-peers").map(|v| v.parse()).transpose()?.unwrap_or(1).max(1);
-    // EVERY port this run derives, refused up front -- before anything starts -- if one is someone else's (the
-    // architect on #444: a base a few below 7509 derives 7509).
-    let mut ports = vec![base, base + 1, base + 10, base + 11];
-    for i in 1..silent_peers {
-        ports.extend([base + 20 + 10 * i, base + 21 + 10 * i]);
-    }
-    for port in &ports {
-        probe::node::allowed_port(&format!("ws://127.0.0.1:{port}"))?;
-    }
     let bcode = std::fs::read(bw).with_context(|| format!("reading {bw}"))?;
-    let root = std::path::PathBuf::from(dir);
-    let _tree = TempTree(root.clone());
-    let _keep = Keep(root.join("b"), std::path::PathBuf::from(keep));
-
-    let mut secret = [0u8; 32];
-    getrandom::getrandom(&mut secret).expect("random");
-    let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(secret).to_bytes();
-    std::fs::create_dir_all(root.join("a"))?;
-    std::fs::write(root.join("a/transport.key"), hex(&secret))?;
-    let a_extra = [
-        "--is-gateway".to_string(),
-        "--transport-keypair".into(),
-        root.join("a/transport.key").to_string_lossy().into_owned(),
-        "--public-network-address".into(),
-        "127.0.0.1".into(),
-        "--public-network-port".into(),
-        (base + 1).to_string(),
-    ];
-    let mut node_a = Node::spawn_private_network(base, base + 1, &root.join("a"), &a_extra)?;
-    let joined = ["--gateway".to_string(), format!("127.0.0.1:{},{}", base + 1, hex(&public))];
-    let mut others = Vec::new();
-    for i in 1..silent_peers {
-        others.push(Node::spawn_private_network(base + 20 + 10 * i, base + 21 + 10 * i, &root.join(format!("c{i}")), &joined)?);
-    }
-    let node_b = Node::spawn_private_network(base + 10, base + 11, &root.join("b"), &joined)?;
-    let mut c: WebApi = connect(&node_b.ws()).await?;
-    let wanted = usize::from(silent_peers);
-    let by = tokio::time::Instant::now() + Duration::from_secs(90);
-    let mut peers: Vec<String> = Vec::new();
-    loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        c.send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers)).await?;
-        if let Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers: p }))) = timeout(Duration::from_secs(5), c.recv()).await {
-            peers = p.iter().map(|(_, addr)| addr.to_string()).collect();
-        }
-        if peers.len() >= wanted || tokio::time::Instant::now() > by {
-            break;
-        }
-    }
-    println!("{}", serde_json::json!({ "b": node_b.ws(), "b_connected_to": peers, "B_ms": bound }));
-    if peers.len() < wanted {
-        bail!("SETUP: b is connected to {} peers, not the {wanted} this run pauses", peers.len());
-    }
-    let mut _resume = Vec::new();
-    for n in std::iter::once(&mut node_a).chain(others.iter_mut()) {
-        let pid = n.pid().context("a peer is not running")?;
-        signal(pid, "-STOP")?;
-        _resume.push(Resume(pid));
-    }
-    println!("{}", serde_json::json!({ "paused": _resume.len() }));
+    let (_tree, mut net, mut c, peers) = probe::silent::open(&a, dir, 47_600, Some(keep.as_str())).await?;
+    let n_peers = peers.len();
+    println!("{}", serde_json::json!({ "b": net.b.ws(), "b_connected_to": peers, "B_ms": bound }));
+    println!("{}", serde_json::json!({ "paused": net.pause()? }));
 
     // THE PAGE: a head whose root nobody holds, and a read that needs it.
     let t0 = Instant::now();
@@ -195,21 +112,11 @@ async fn main() -> Result<()> {
         .map(|(id, s)| (hex(&id[..4]), serde_json::json!({ "sent_ms": s, "answers": answers.get(id).cloned().unwrap_or_default() })))
         .collect();
     println!("{}", serde_json::json!({ "verdict": {
-        "watched_s": watch.as_secs(), "B_ms": bound, "silent_peers": silent_peers, "per_key": per_key,
+        "watched_s": watch.as_secs(), "B_ms": bound, "silent_peers": n_peers, "per_key": per_key,
         "other_ops_not_sent": other_ops, "violations": violations, "one_node_get_per_key_while_silent": violations.is_empty() && !sends.is_empty(),
         "b_logs_kept_at": keep,
     }}));
     drop(c);
-    // A PAUSED NODE NEVER OUTLIVES THE PROBE: resumed, then killed and reaped by its own handle -- and checked gone.
-    let paused: Vec<u32> = _resume.iter().map(|r| r.0).collect();
-    drop(_resume);
-    drop(others);
-    drop(node_a);
-    drop(node_b);
-    let alive: Vec<u32> = paused.iter().copied().filter(|pid| std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())).collect();
-    println!("{}", serde_json::json!({ "paused_peers_gone": alive.is_empty(), "still_alive": alive }));
-    if !alive.is_empty() {
-        bail!("a paused peer outlived the probe: {alive:?}");
-    }
+    net.finish()?;
     Ok(())
 }
