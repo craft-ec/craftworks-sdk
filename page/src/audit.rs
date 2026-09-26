@@ -117,13 +117,7 @@ impl Audit {
         }
         r.pending = self.seen.values().filter(|s| **s == Seen::Pending).count();
         r.rejected = self.seen.iter().filter(|(_, s)| **s == Seen::Rejected).map(|(id, _)| *id).collect();
-        r.health = if !r.damaged.is_empty() {
-            Health::Damaged
-        } else if r.degraded > 0 {
-            Health::Degraded
-        } else {
-            Health::Whole
-        };
+        r.health = Health::of(r.damaged.len(), r.degraded);
         r
     }
 }
@@ -139,6 +133,20 @@ pub enum Health {
     Degraded,
     /// Every group whole.
     Whole,
+}
+
+impl Health {
+    /// THE word from a pass's counts -- a report's, or a keep record's stored ones (the Assets tab): one derivation.
+    /// `Unmeasured` is never derived from counts; it is a pass with nothing measured.
+    pub fn of(damaged: usize, degraded: usize) -> Health {
+        if damaged > 0 {
+            Health::Damaged
+        } else if degraded > 0 {
+            Health::Degraded
+        } else {
+            Health::Whole
+        }
+    }
 }
 
 /// A pass's result (KEEPER §5's report, measured part): groups by health, the damaged named, blocks pending.
@@ -166,4 +174,17 @@ pub struct Report {
     /// Blocks the node REJECTED (sdk#433): each counted absent in its group, never repaired (KEEPER §5). `damaged`
     /// keeps its one meaning -- groups whose margin is below 0.
     pub rejected: Vec<Cid>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Health;
+
+    /// **The word from counts**: one damaged group outranks any number degraded; none of either is whole.
+    #[test]
+    fn a_damaged_group_outranks_degraded_ones_and_none_is_whole() {
+        assert_eq!(Health::of(1, 5), Health::Damaged);
+        assert_eq!(Health::of(0, 1), Health::Degraded);
+        assert_eq!(Health::of(0, 0), Health::Whole);
+    }
 }
