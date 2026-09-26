@@ -172,9 +172,14 @@ impl PageBlocks {
         if self.map.contains_key(&id) {
             return;
         }
-        let internal = freenet_prolly::block_id(freenet_prolly::kind::TREE_NODE, bytes) == id
-            && freenet_prolly::node::Node::parse(bytes).is_ok_and(|n| !n.is_leaf());
-        let tier = if internal { 2 } else { 0 };
+        // The eviction tier by KIND, exhaustively over the one list (core_types::kind): a new kind does not compile
+        // until its tier is stated. An internal node (tier 2) is the costliest to lose: a walk needs it to reach
+        // anything below it.
+        use engine::read::BlockKind;
+        let tier = match engine::read::kind_of(&id, bytes) {
+            Some(BlockKind::TreeNode) if freenet_prolly::node::Node::parse(bytes).is_ok_and(|n| !n.is_leaf()) => 2,
+            Some(BlockKind::TreeNode | BlockKind::Raw | BlockKind::Parity | BlockKind::Pack) | None => 0,
+        };
         self.stamp += 1;
         self.tiers[tier].insert(self.stamp, id);
         self.bytes += bytes.len();

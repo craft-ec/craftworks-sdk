@@ -308,6 +308,9 @@ pub fn matches_id(id: &Cid, bytes: &[u8]) -> bool {
     kind_of(id, bytes).is_some()
 }
 
+/// The one list of block kinds, re-exported for the engine's callers (the page), which read it through the engine.
+pub use core_types::kind::BlockKind;
+
 /// The kind under which `bytes` ARE the block `id`, or `None` when they are not it under any kind.
 pub fn kind_of(id: &Cid, bytes: &[u8]) -> Option<core_types::kind::BlockKind> {
     core_types::kind::BlockKind::ALL.into_iter().find(|k| block_id(k.byte(), bytes) == *id)
