@@ -12,7 +12,7 @@
 //! - whichever comes first ends it: the member itself (`on_arrived` ends its repair), or any `k` of the group
 //!   (rebuilt and verified);
 //! - each block is asked ONCE however many members race it (`start_repair` does not re-ask a slot in flight);
-//! - what a finished race no longer wants is WITHDRAWN (`Engine::take_withdrawn`): the page drops its GET instead
+//! - what a finished race no longer wants is WITHDRAWN (`Effect::Unwanted`, net at the call's end): the page drops its GET instead
 //!   of re-asking it for ever, and does not keep it if it arrives late;
 //! - the group is found in the parent held under the read's OWN pinned root (another root's parity would not
 //!   match); the root is a group of ONE (sdk#335) when its head listed its parity -- the first of its `1 + m` to
@@ -72,7 +72,6 @@ impl<B: Blocks> Engine<B> {
         for (_, slot) in slots {
             let in_flight = self.readers_of(&slot).any();
             self.repair_slots.entry(slot).or_default().insert(id);
-            self.withdrawn.remove(&slot);
             if !in_flight {
                 self.reads.fetches += 1;
                 self.step_asks.entry(slot).or_insert(false);
@@ -99,22 +98,6 @@ impl<B: Blocks> Engine<B> {
             }
         }
         out
-    }
-
-    /// Was `id` asked for by a race or repair that has finished, with nobody wanting it any more?
-    pub fn is_withdrawn(&self, id: &Cid) -> bool {
-        self.withdrawn.contains(id)
-    }
-
-    /// Every block withdrawn since the last call, handed to the page, which ENDS their GETs (queued, in flight or
-    /// waiting to re-ask): the engine keeps no entry after.
-    pub fn take_all_withdrawn(&mut self) -> BTreeSet<Cid> {
-        std::mem::take(&mut self.withdrawn)
-    }
-
-    /// Withdrawn blocks the page has not taken yet (0 after every page call).
-    pub fn withdrawn_count(&self) -> usize {
-        self.withdrawn.len()
     }
 }
 

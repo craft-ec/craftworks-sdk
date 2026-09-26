@@ -132,6 +132,8 @@ pub fn no_answer_owed(f: &Effect) {
         | Effect::Unread { .. }
         | Effect::Reply { .. }
         | Effect::Withdraw { .. }
+        // Nobody wants the block any more: the page ends its GET; no engine wait hangs on it (WANTED-LIFE).
+        | Effect::Unwanted { .. }
         | Effect::Keep { .. }
         // A repair's re-put: its answer confirms nothing (the architect's (b)), so nothing in the engine waits on it.
         | Effect::PutRepaired { .. } => {}
