@@ -104,10 +104,13 @@ struct Publisher {
     /// Sign asks this device's OWN node answers before it holds the site (the signer's local read lags: a new
     /// device's node fetches the site with the page's first read, and serves it locally only after that).
     blind_signs: usize,
+    /// Sign asks answered `Refused(RootNotHeld)` before the signer is asked (a signer that says it of a site: today's
+    /// never does, but the ONE retryable set, sdk#486, decides what a page does if one does).
+    root_not_held: usize,
 }
 impl Publisher {
     fn new(host: Mem) -> Publisher {
-        Publisher { page: Page::new(Params::default(), PutPath::Page), host, origin: signer::Origin::Local, stale_read: None, signs: 0, head_ops: 0, blind_signs: 0 }
+        Publisher { page: Page::new(Params::default(), PutPath::Page), host, origin: signer::Origin::Local, stale_read: None, signs: 0, head_ops: 0, blind_signs: 0, root_not_held: 0 }
     }
     fn publication(&self) -> Option<Publication> {
         self.page.publication(APP).cloned()
@@ -125,6 +128,11 @@ impl Publisher {
                         None => node.read(),
                     };
                     Answer::Head { label: site, read }
+                }
+                Op::Sign { id, .. } if *label_of(&op) == site && self.root_not_held > 0 => {
+                    self.signs += 1;
+                    self.root_not_held -= 1;
+                    Answer::Signer { id: *id, answer: signer_proto::Answer::Refused(signer_proto::Why::RootNotHeld) }
                 }
                 Op::Sign { id, prev_seq, prev_root, seq, root, ledger, label } if *label == site => {
                     self.signs += 1;
@@ -161,6 +169,14 @@ impl Publisher {
                 self.page.answer(a, Ms(now));
             }
         }
+    }
+}
+
+/// A Sign op's label.
+fn label_of(op: &Op) -> &Label {
+    match op {
+        Op::Sign { label, .. } => label,
+        other => panic!("not a sign: {other:?}"),
     }
 }
 
@@ -337,6 +353,23 @@ fn a_publish_behind_the_network_is_superseded_by_it() {
     run(&mut [&mut a], &mut node, &mut now, 200, &mut always);
     assert_eq!(a.publication(), Some(Publication::Superseded { version: 7 }));
     assert_eq!(node.seq(), Some(7), "the stale publish overwrote the live site");
+}
+
+/// **`RootNotHeld` for a SITE is "not yet", like the head's** (sdk#486, the ONE retryable set, `Why::retryable`): a
+/// signer that refuses a site's sign so twice is asked again on the backoff, and the site is then published -- never
+/// ended as refused. (Before, the site's set lacked RootNotHeld and the head's had it.) CONTROL: a FINAL refusal
+/// (`FromApp`, next test) ends the publication.
+#[test]
+fn a_site_refused_root_not_held_is_asked_again_and_published() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut a = Publisher::new(device());
+    a.root_not_held = 2;
+    a.page.publish_site(APP, bundle(1), Ms(now));
+    run(&mut [&mut a], &mut node, &mut now, 400, &mut always);
+    println!("sign asks {}, publication {:?}", a.signs, a.publication());
+    assert_eq!(a.root_not_held, 0, "THE SETUP: the refusals were not all given");
+    assert_eq!(a.publication(), Some(Publication::Published { version: 1 }), "a site refused RootNotHeld was not asked again to the end");
+    assert_eq!(a.signs, 3, "not exactly two refused asks and one signed");
 }
 
 /// **A served app's site request is refused and the publication ENDS, named** (the signer's `FromApp`).

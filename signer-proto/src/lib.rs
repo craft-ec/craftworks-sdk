@@ -92,6 +92,32 @@ pub enum Why {
     BadLabel,
 }
 
+impl Why {
+    /// Is this refusal "NOT YET" -- the same ask can succeed later, so it is asked again on a backoff -- rather than
+    /// final? THE ONE retryable set (sdk#486), read by every label's answer (head, landing, site): exhaustive, so a new
+    /// refusal does not compile until it is placed.
+    /// * `RootNotHeld`: the root's PUT is still landing. (The signer says it only for a label whose root is a block --
+    ///   a site's is not, so it never refuses a site so -- but "not yet held" is retryable for any label.)
+    /// * `HeadUnknown`: the node does not hold the Register yet; a read of it makes it held.
+    /// * `RecordNotSaved`: the signer could not write its record, and signed nothing.
+    pub fn retryable(&self) -> bool {
+        match self {
+            Why::RootNotHeld | Why::HeadUnknown | Why::RecordNotSaved => true,
+            Why::NotSuccessor
+            | Why::NotProvisioned
+            | Why::KeyAlreadyProvisioned
+            | Why::CannotSign
+            | Why::Unreadable
+            | Why::Forked { .. }
+            | Why::RegisterChanged
+            | Why::BlockCount { .. }
+            | Why::BadLedger
+            | Why::FromApp
+            | Why::BadLabel => false,
+        }
+    }
+}
+
 /// WHICH record a signature is for (builder#117): the person's data HEAD, or one of their SITES -- a published app's
 /// one stable address. ONE sign verb and ONE rule (`signer::decide`) for both; the label chooses the params, the
 /// record kept, and the contract read as the truth.
