@@ -602,9 +602,6 @@ pub struct Page {
     /// What an equal-seq sighting is judged against — this page's claim at
     /// that seq, whose bytes it can land again if they win the tie-break.
     my_records: BTreeMap<u64, (Cid, Vec<u8>)>,
-    /// Every `HeadConfirmed` this page stepped, in order (tests only: a commit is confirmed ONCE, #378).
-    #[cfg(test)]
-    confirmed_steps: Vec<u64>,
     /// When the register was last read (any head answer), for the backstop.
     last_head_at: u64,
     /// That read, whole: what an equal-seq tie-break hashes.
@@ -728,8 +725,6 @@ impl Page {
             most_landing_updates: 0,
             old_signer_fork_at: None,
             my_records: BTreeMap::new(),
-            #[cfg(test)]
-            confirmed_steps: Vec::new(),
             last_head_at: 0,
             last_head: None,
             put_again: BTreeMap::new(),
@@ -1481,8 +1476,7 @@ impl Page {
     /// push changes nothing: the read-back GET after the UPDATE's answer does
     /// the job on its deadline. Nothing is ever ADOPTED from a push.
     pub fn head_pushed(&mut self, read: HeadRead) {
-        let confirms = self.verify.is_none()
-            && self.head.owed.as_ref().is_some_and(|o| o.record.is_some() && (o.seq, o.root) == (read.seq, read.root()));
+        let confirms = self.verify.is_none() && self.confirms(&read);
         if !confirms {
             // ALREADY KNOWN (the architect's done x E1 cell, #378): a full state that IS the head this page last
             // read -- the whole value, not only (seq, root) -- and the engine stands on, is news to nobody. No
@@ -1497,12 +1491,9 @@ impl Page {
         }
         self.last_head_at = self.now;
         self.last_head = Some(read);
-        // The read-back this push stands in for is no longer owed: whatever
-        // is on the wire for it -- the UPDATE whose answer would ask it, or the
-        // GET itself -- ends here, with no RTT sample (a push is not an answer
-        // to either request).
-        self.end(&Waiting::Update(Label::Head), End::Withdrawn);
-        self.end(&Waiting::ReadBack(Label::Head), End::Withdrawn);
+        // Whatever is still on the wire for the read-back this push stands in for -- the UPDATE whose answer would
+        // ask it, or the GET itself -- ends with the owed head, in `drop_dead_head`, once the engine has published
+        // its seq (COMMIT-LIFE ⁹): no RTT sample (a push is not an answer to either request).
         let j = judge(self.last_head.as_ref(), &self.my_records);
         self.on_read_back(&j);
     }
@@ -1524,19 +1515,38 @@ impl Page {
             .any(|w| self.deadlines.contains_key(w))
     }
 
+    /// Does `read` CONFIRM this page's commit? Exactly the owed head's (seq, root), once signed -- or, the owed head
+    /// gone, exactly the head the engine already published, as THIS page's own record, whole (the Register's
+    /// tie-break is over values: the same (seq, root) under another ledger is not it): the SECOND of a commit's two
+    /// confirmations (E1 and E4, either order). Both go to the engine, which alone decides (COMMIT-LIFE ⁹, sdk#414):
+    /// its `pending` take makes the second a no-op. The root is part of it: a record another page of this key made at
+    /// the same seq is not this commit (`AlreadySigned`), and the engine's take checks the seq only.
+    fn confirms(&self, read: &HeadRead) -> bool {
+        let pair = (read.seq, read.root());
+        match self.head.owed.as_ref() {
+            Some(o) => o.record.is_some() && (o.seq, o.root) == pair,
+            None => {
+                pair == self.engine_published()
+                    && self.my_records.get(&read.seq).and_then(|(_, record)| HeadRead::from_record(record)).is_some_and(|mine| mine.value() == read.value())
+            }
+        }
+    }
+
     /// The register read back after an UPDATE: the only way a commit is
     /// Published (F56: the UPDATE's answer says nothing).
     fn on_read_back(&mut self, j: &Judged) {
+        // `last_head` is the read `j` was judged from (both callers judge it just before).
+        if let (Judged::Head(heard), Some(read)) = (j, self.last_head.as_ref()) {
+            if self.confirms(read) {
+                return self.step(Event::HeadConfirmed(heard.seq()));
+            }
+        }
         let Some(owed) = self.head.owed.as_mut() else { return };
         if owed.record.is_none() {
             return; // a read-back outlived its commit
         }
         let want = (owed.seq, owed.root);
         match j {
-            Judged::Head(heard) if heard.pair() == want => {
-                let owed = self.head.owed.take().expect("owed");
-                self.step(Event::HeadConfirmed(owed.seq));
-            }
             // Not visible yet -- or THIS page's record wins the tie-break
             // against what the register shows (the node has not merged my
             // UPDATE; adopting theirs would drop a head that is about to win,
@@ -2091,10 +2101,6 @@ impl Page {
     }
 
     fn step(&mut self, ev: Event) {
-        #[cfg(test)]
-        if let Event::HeadConfirmed(seq) = ev {
-            self.confirmed_steps.push(seq);
-        }
         // THE WITNESS (COMMIT-LIFE ⁵): a head about to be adopted says, in its
         // ledger, how far THIS page's writes are in it -- whether a commit
         // the engine is about to call dead in fact landed unheard.
@@ -2172,7 +2178,11 @@ impl Page {
     }
 
     /// An owed head is LIVE only while it is ahead of what the engine has
-    /// published. Once the engine adopts another head (a conflict, a recovery
+    /// published. The ONE consequence of the engine's decisions on the page's
+    /// owed head (COMMIT-LIFE ⁹): once the engine publishes its seq (it was
+    /// CONFIRMED -- the engine's `pending` take decided that, not the page), it
+    /// is owed no more, and its sign, UPDATE and read-back waits end here. Once
+    /// the engine adopts another head (a conflict, a recovery
     /// read), the commit that owed it is dead — its writes were told `Lost` —
     /// and nothing more is asked or sent for it. Without this the page went on
     /// asking the signer for a dead commit from a stale prev (the model found
@@ -2312,6 +2322,9 @@ impl Page {
                     // root and emits a new head.
                     Effect::UpdateHead { seq, base, .. } if (seq - 1, base) != self.engine_published() => {}
                     Effect::UpdateHead { seq, root, base, .. } => {
+                        // The owed head this one replaces is dead (the engine published it, or adopted over it):
+                        // its waits end with it, before this head's own go out under the same labels.
+                        self.drop_dead_head();
                         self.head.owed = Some(Owed { seq, root, base, record: None, stale_reads: 0 });
                         self.ask_sign();
                     }
@@ -3486,33 +3499,63 @@ mod head_judgement_cells {
 mod confirmed_once {
     //! A commit is confirmed ONCE, whichever of its two confirmations lands first (#378, after #393): its read-back
     //! GET's answer (E4) or the node's push of exactly its head (E1, P3). #393 emits the held-back parity at the
-    //! confirmation, so a second `HeadConfirmed` would send it twice. FOUR guards hold it, three on the page: (A) the
-    //! read-back takes the owed head (`on_read_back`), (B) the push ends the read-back's deadline (`head_pushed`),
-    //! (C) `drop_dead_head` clears the owed head and its deadlines once the engine has published its seq -- and the
-    //! engine's `on_head` takes `pending`. This counts the page's own steps. MEASURED, every combination of A/B/C off
-    //! (#378 PR body): each alone, A+B and B+C -> both tests pass (masked); A+C -> E4-then-E1 red; A+B+C -> both red.
+    //! confirmation, so a second confirmation would send it twice. ONE owner decides it (COMMIT-LIFE ⁹, sdk#414): the
+    //! engine's `pending` take in `on_head`; a second `HeadConfirmed` of the same seq is a no-op there. The page holds
+    //! no guard: its owed head FOLLOWS the engine's published seq (`drop_dead_head`). So these tests count what the
+    //! ENGINE emits for the commit -- its write's `Published` notices -- never the page's steps.
     use super::*;
 
     const KEY: [u8; 32] = [7u8; 32];
 
-    /// A page whose one write's UPDATE is out; its record, read as a head.
-    fn at_update() -> (Page, HeadRead) {
-        let mut p = Page::new(Params::default(), PutPath::Page);
-        p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    fn signer() -> (ed25519_dalek::SigningKey, Vec<u8>) {
         let sk = ed25519_dalek::SigningKey::from_bytes(&KEY);
         let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);
+        (sk, params)
+    }
+
+    /// Sign `seq` over `root` and `ledger` under the test key.
+    fn sign(seq: u64, root: &Cid, ledger: &[u8]) -> Vec<u8> {
+        let (sk, params) = signer();
+        let value = [root.as_slice(), ledger].concat();
+        contract_keys::register::head_state(&params, &sk.to_bytes(), seq, &value).expect("signs")
+    }
+
+    /// A page whose first write's UPDATE is out (and `second`, when given, queued behind that commit); its record,
+    /// read as a head; and the ids of every block the page put.
+    fn at_update(second: bool) -> (Page, HeadRead, BTreeSet<Cid>) {
+        at_update_signed(second, None)
+    }
+
+    /// As [`at_update`]; with `other_root`, the signer answers `AlreadySigned` with a record ANOTHER page of this key
+    /// made at the same seq, under that root.
+    fn at_update_signed(second: bool, other_root: Option<Cid>) -> (Page, HeadRead, BTreeSet<Cid>) {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+        let mut put = BTreeSet::new();
         for _ in 0..20 {
             for op in p.take_ops() {
                 match op {
                     Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: None }, Ms(10)),
-                    Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(10)),
+                    Op::Put { id, .. } => {
+                        put.insert(id);
+                        p.answer(Answer::PutOk(id), Ms(10));
+                    }
                     Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(10)),
                     Op::Sign { id, seq, root, ledger, .. } => {
-                        let value = [root.as_slice(), &ledger].concat();
-                        let record = contract_keys::register::head_state(&params, &sk.to_bytes(), seq, &value).expect("signs");
-                        p.answer(Answer::Signer { id, answer: signer_proto::Answer::Signed(record.clone()) }, Ms(10));
+                        if second {
+                            p.write(ClientId(1), WriteId(2), vec![(b"j".to_vec(), WriteOp::Put(b"w".to_vec()))]);
+                        }
+                        let answer = match other_root {
+                            None => signer_proto::Answer::Signed(sign(seq, &root, &ledger)),
+                            Some(other) => signer_proto::Answer::AlreadySigned(sign(seq, &other, &ledger)),
+                        };
+                        let record = match &answer {
+                            signer_proto::Answer::Signed(r) | signer_proto::Answer::AlreadySigned(r) => r.clone(),
+                            _ => unreachable!(),
+                        };
+                        p.answer(Answer::Signer { id, answer }, Ms(10));
                         let _ = p.take_ops();
-                        return (p, HeadRead::from_record(&record).expect("reads"));
+                        return (p, HeadRead::from_record(&record).expect("reads"), put);
                     }
                     other => panic!("unexpected before the sign: {other:?}"),
                 }
@@ -3527,25 +3570,138 @@ mod confirmed_once {
         assert!(p.take_ops().contains(&Op::ReadHead { label: Label::Head }), "THE SETUP: the read-back GET did not go out");
     }
 
-    /// **E1 then E4:** the push confirms; the read-back GET, already on the wire, answers after. One step.
-    /// Red only with A, B and C all off: each alone is enough here.
-    #[test]
-    fn a_push_then_the_read_backs_answer_confirm_once() {
-        let (mut p, mine) = at_update();
-        read_back_out(&mut p);
-        p.head_pushed(mine.clone());
-        p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
-        assert_eq!(p.confirmed_steps, vec![mine.seq], "the commit was not confirmed exactly once (E1 then E4)");
+    /// How many times the engine told each write `Published`.
+    fn published(p: &mut Page) -> BTreeMap<WriteId, usize> {
+        let mut n = BTreeMap::new();
+        for (_, w, s) in p.take_notices() {
+            if s == State::Published {
+                *n.entry(w).or_default() += 1;
+            }
+        }
+        n
     }
 
-    /// **E4 then E1:** the read-back's answer confirms; the node's push of the same head arrives after. One step.
-    /// Red with A and C off (B does not act on this order): either alone is enough here.
+    /// **E1 then E4:** the push confirms; the read-back GET, already on the wire, answers after. Published once. The
+    /// ORDER pin (the architect on sdk#414): the confirmation withdrew the read-back GET, and its late answer is
+    /// DROPPED, as any withdrawn request's is (the deadline table: answer x withdrawn -> no end, no sample, no re-arm)
+    /// -- so here the engine hears ONE confirmation, and its take is pinned by the other order.
+    #[test]
+    fn a_push_then_the_read_backs_answer_confirm_once() {
+        let (mut p, mine, _) = at_update(false);
+        read_back_out(&mut p);
+        p.head_pushed(mine.clone());
+        assert!(!p.deadlines.contains_key(&Waiting::ReadBack(Label::Head)), "the confirmation did not withdraw the read-back GET");
+        p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
+        assert_eq!(published(&mut p), BTreeMap::from([(WriteId(1), 1)]), "the commit was not confirmed exactly once (E1 then E4)");
+    }
+
+    /// **E4 then E1:** the read-back's answer confirms; the node's push of the same head arrives after. Published once.
     #[test]
     fn a_read_backs_answer_then_the_push_confirm_once() {
-        let (mut p, mine) = at_update();
+        let (mut p, mine, _) = at_update(false);
         read_back_out(&mut p);
         p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
         p.head_pushed(mine.clone());
-        assert_eq!(p.confirmed_steps, vec![mine.seq], "the commit was not confirmed exactly once (E4 then E1)");
+        assert_eq!(published(&mut p), BTreeMap::from([(WriteId(1), 1)]), "the commit was not confirmed exactly once (E4 then E1)");
+    }
+
+    /// THE ROOT IS PART OF A CONFIRMATION: the signer answers `AlreadySigned` with a record ANOTHER page of this key
+    /// made at the same seq under another root, and the read-back shows it. That is not this commit (the engine's
+    /// take checks the seq only): no `Published`.
+    #[test]
+    fn the_same_seq_under_another_root_is_not_a_confirmation() {
+        let (mut p, theirs, _) = at_update_signed(false, Some([9u8; 32]));
+        read_back_out(&mut p);
+        p.answer(Answer::Head { label: Label::Head, read: Some(theirs.clone()) }, Ms(12));
+        p.head_pushed(theirs.clone());
+        assert_eq!(published(&mut p), BTreeMap::new(), "a head under another root was taken as this commit's confirmation");
+    }
+
+    /// Answer every op until the page is quiet, signing heads with the test key; the head a read-back sees is the
+    /// last one signed.
+    fn settle(p: &mut Page) {
+        let mut last: Option<Vec<u8>> = None;
+        for _ in 0..40 {
+            let ops = p.take_ops();
+            if ops.is_empty() {
+                return;
+            }
+            for op in ops {
+                match op {
+                    Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(20)),
+                    Op::AskHeld { id } => p.answer(Answer::Held { id, present: true }, Ms(20)),
+                    Op::Sign { id, seq, root, ledger, .. } => {
+                        let record = sign(seq, &root, &ledger);
+                        last = Some(record.clone());
+                        p.answer(Answer::Signer { id, answer: signer_proto::Answer::Signed(record) }, Ms(20));
+                    }
+                    Op::Update { label: Label::Head, .. } => p.answer(Answer::Updated { label: Label::Head }, Ms(20)),
+                    Op::ReadHead { label: Label::Head } => {
+                        let read = last.as_deref().and_then(HeadRead::from_record);
+                        p.answer(Answer::Head { label: Label::Head, read }, Ms(20));
+                    }
+                    other => panic!("unexpected while settling: {other:?}"),
+                }
+            }
+        }
+        panic!("the page did not settle");
+    }
+
+    /// THE CROSS-COMMIT CELL (the architect's pin on sdk#414): the confirming step itself releases the NEXT commit's
+    /// head (a write queued behind the first; its blocks already on the node, so nothing holds its head back) --
+    /// the owed head is replaced inside the step, before `drop_dead_head` runs after it. The new owed head and its
+    /// sign wait survive; the confirmed one's waits end with it (the push path: its read-back GET was still out); the
+    /// next commit publishes.
+    fn the_next_head_survives_the_confirming_step(by_push: bool) {
+        // The twin learns the second commit's blocks: the same writes, driven to the second commit's sign.
+        let (mut twin, first, before) = at_update(true);
+        read_back_out(&mut twin);
+        twin.answer(Answer::Head { label: Label::Head, read: Some(first.clone()) }, Ms(12));
+        let mut next = BTreeSet::new();
+        for _ in 0..20 {
+            for op in twin.take_ops() {
+                match op {
+                    Op::Put { id, .. } => {
+                        next.insert(id);
+                        twin.answer(Answer::PutOk(id), Ms(13));
+                    }
+                    Op::AskHeld { id } => twin.answer(Answer::Held { id, present: true }, Ms(13)),
+                    _ => {}
+                }
+            }
+        }
+        let next: BTreeSet<Cid> = next.difference(&before).copied().collect();
+        assert!(!next.is_empty(), "THE SETUP: the twin's second commit put no block of its own");
+
+        let (mut p, mine, _) = at_update(true);
+        read_back_out(&mut p);
+        // The second commit's blocks are on the node already (answered earlier): its head waits on nothing.
+        p.confirmed.extend(next.iter().copied());
+        if by_push {
+            p.head_pushed(mine.clone());
+        } else {
+            p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
+        }
+        let o = p.head.owed.as_ref().expect("the next commit's owed head was dropped by the confirming step");
+        assert_eq!(o.seq, mine.seq + 1, "THE SETUP: the confirming step did not release the next commit's head");
+        assert!(p.deadlines.contains_key(&Waiting::Sign(Label::Head)), "the next commit's sign wait was ended with the confirmed head");
+        assert!(!p.deadlines.contains_key(&Waiting::ReadBack(Label::Head)), "the confirmed head's read-back wait outlived it");
+        if by_push {
+            // The first head's read-back GET answers late: nothing to confirm, nothing to count.
+            p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(13));
+        }
+        settle(&mut p);
+        assert_eq!(p.engine_published().0, mine.seq + 1, "the next commit did not publish");
+        assert_eq!(published(&mut p), BTreeMap::from([(WriteId(1), 1), (WriteId(2), 1)]), "each write was not published exactly once");
+    }
+
+    #[test]
+    fn the_next_commits_head_survives_a_read_back_confirming_the_one_before() {
+        the_next_head_survives_the_confirming_step(false);
+    }
+
+    #[test]
+    fn the_next_commits_head_survives_a_push_confirming_the_one_before() {
+        the_next_head_survives_the_confirming_step(true);
     }
 }
