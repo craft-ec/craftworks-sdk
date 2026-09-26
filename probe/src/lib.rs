@@ -1,10 +1,12 @@
 //! Checks a delegate's wasm against the host functions a pinned node defines.
 
 pub mod frames;
+pub mod live;
 pub mod node;
 pub mod page;
 pub mod signer;
 pub mod silent;
+pub mod site_probe;
 pub mod verdict;
 
 /// Every delegate host function freenet 0.2.135 registers in its linker.

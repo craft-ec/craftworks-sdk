@@ -19,16 +19,14 @@
 //! 1 = a defect (named); 2 = could not judge.
 //! usage: PAGE_PORT=<port> PAGE_TMP=<dir> live-reconnect <signer.wasm> <block.wasm> <register.wasm>
 use anyhow::{bail, Context, Result};
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
 use page::Ms;
 use page_io::PageIo;
+use probe::live::{now_ms, Sock};
 use probe::node::{Mode, Node, TempTree};
 use protocol::{Reply, Request};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
-
-type Sock =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// How long a page is given to see the other client's write. The page's own backstop re-read of the head is 120 s, so
 /// a window well under it separates "the subscription delivered" from "the backstop found it".
@@ -41,9 +39,6 @@ struct Client {
     next_id: u64,
 }
 
-fn now_ms(t0: Instant) -> u64 {
-    1_000 + t0.elapsed().as_millis() as u64
-}
 
 impl Client {
     /// Drive until `done`, or `budget` passes (then `Ok(None)`: not within it, a data point, not an error).
@@ -74,18 +69,8 @@ impl Client {
             if start.elapsed() > budget {
                 return Ok(None);
             }
-            let wait = self
-                .io
-                .next_due()
-                .map_or(50, |d| d.0.saturating_sub(now_ms(t0)).clamp(1, 50));
-            match tokio::time::timeout(Duration::from_millis(wait), self.sock.next()).await {
-                Ok(Some(Ok(Message::Binary(b)))) => {
-                    self.io.inbound(&b, Ms(now_ms(t0)));
-                }
-                Ok(Some(Ok(_))) => {}
-                Ok(Some(Err(e))) => bail!("the socket: {e}"),
-                Ok(None) => bail!("the node closed the socket"),
-                Err(_) => self.io.tick(Ms(now_ms(t0))),
+            if let Some(b) = probe::live::next_frame(&mut self.sock, &mut self.io, t0).await? {
+                self.io.inbound(&b, Ms(now_ms(t0)));
             }
         }
     }
