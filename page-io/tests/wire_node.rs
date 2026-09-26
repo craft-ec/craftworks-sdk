@@ -74,6 +74,13 @@ struct WireNode {
     refuse_site_gets: usize,
     /// The next this many BLOCK PUTs are LOST: not stored, never answered -- only the page's RTO re-sends them.
     lose_block_puts: usize,
+    /// The next this many PUTs of ONE PARITY block (the first parity-block PUT after it is set) are answered with an ERROR, not
+    /// stored: the node's "No such file or directory (os error 2)" (sdk#431, seen live) -- naming the contract
+    /// (`ContractError::Put`) when `err_keyed`, or naming nothing (`ErrorKind::OperationError`, the live bytes).
+    err_block_puts: usize,
+    err_keyed: bool,
+    /// The block whose PUTs are answered with the error.
+    err_block: Option<[u8; 32]>,
     /// Every block PUT that reached the node: (the clock when it did, the block contract's id).
     block_puts: Vec<(u64, [u8; 32])>,
     /// The clock the harness serves at (set before each frame).
@@ -125,6 +132,19 @@ fn ok(r: HostResponse) -> Vec<u8> {
     bincode::serialize(&Ok::<HostResponse, Err>(r)).expect("encodes")
 }
 
+/// The node's answer to a PUT it failed on its own side (sdk#431, seen live on 0.2.136): "No such file or directory
+/// (os error 2)", naming the contract (`ContractError::Put`) or naming nothing (`ErrorKind::OperationError`).
+fn put_error(key: ContractKey, keyed: bool) -> Vec<u8> {
+    use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
+    let cause = "No such file or directory (os error 2)";
+    let kind = if keyed {
+        ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key, cause: cause.into() }))
+    } else {
+        ErrorKind::OperationError { cause: cause.into() }
+    };
+    bincode::serialize(&Err::<HostResponse, Err>(kind.into())).expect("encodes")
+}
+
 impl WireNode {
     fn new(signing_key: &[u8; 32]) -> WireNode {
         let sk = ed25519_dalek::SigningKey::from_bytes(signing_key);
@@ -149,6 +169,9 @@ impl WireNode {
             site_hidden: false,
             refuse_site_gets: 0,
             lose_block_puts: 0,
+            err_block_puts: 0,
+            err_keyed: false,
+            err_block: None,
             block_puts: Vec::new(),
             now: 0,
             push_updates: false,
@@ -190,6 +213,9 @@ impl WireNode {
             site_hidden: false,
             refuse_site_gets: 0,
             lose_block_puts: 0,
+            err_block_puts: 0,
+            err_keyed: false,
+            err_block: None,
             block_puts: Vec::new(),
             now: 0,
             push_updates: false,
@@ -282,6 +308,13 @@ impl WireNode {
                     if self.lose_block_puts > 0 {
                         self.lose_block_puts -= 1;
                         return None;
+                    }
+                    let parity = state.as_ref().first() == Some(&freenet_prolly::kind::PARITY);
+                    if self.err_block_puts > 0 && parity && self.err_block.is_none_or(|b| b == id) {
+                        self.err_block = Some(id);
+                        self.err_block_puts -= 1;
+                        *self.served.entry("put block answered with an error").or_default() += 1;
+                        return Some(put_error(key, self.err_keyed));
                     }
                     *self.served.entry("put block").or_default() += 1;
                     self.contracts.insert(id, state.as_ref().to_vec());
@@ -1146,37 +1179,44 @@ fn row_count(io: &mut PageIo, node: &mut WireNode, now: &mut u64, req_id: u64) -
 /// first block PUT: it is re-sent once its siblings' answers have set the RTO, within a second or two, at the
 /// epoch clock as at a small one (THE CONTROL). Measured live (Phase 4 realnet, V's first save): four of five
 /// PUTs answered on their first send, the fifth re-sent 59,999 ms after it went.
+/// A browser page's life: every frame answered 1 ms later, the clock in 100 ms ticks, for `ms`.
+fn live(io: &mut PageIo, node: &mut WireNode, now: &mut u64, ms: u64) -> Vec<Reply> {
+    let mut replies = pump(io, node, now);
+    for _ in 0..ms / 100 {
+        *now += 100;
+        io.tick(Ms(*now));
+        replies.extend(pump(io, node, now));
+    }
+    replies
+}
+
+/// A page opened at clock `start` on a fresh node, provisioned, and asked its identity: ready to write.
+fn opened_at(start: u64, label: &str) -> (PageIo, WireNode, u64) {
+    let key = [31u8; 32];
+    let mut node = WireNode::unprovisioned(&key);
+    let mut now = start;
+    let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
+    let mut io = PageIo::new(
+        Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(now)), SignerFacts::default()),
+        Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
+    );
+    io.begin(container);
+    live(&mut io, &mut node, &mut now, 1_000);
+    if io.needs_key() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&key);
+        io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
+        live(&mut io, &mut node, &mut now, 1_000);
+    }
+    assert!(io.provisioned(), "{label}: THE SETUP: the page did not provision");
+    io.client(&protocol::encode_session_request(4, 9, &Request::Identity).expect("encodes"));
+    live(&mut io, &mut node, &mut now, 1_000);
+    (io, node, now)
+}
+
 #[test]
 fn a_lost_put_is_re_sent_on_the_rto_when_the_page_opened_at_an_epoch_clock() {
     for (label, start) in [("small clock (THE CONTROL)", 1_000u64), ("epoch clock (the browser's)", 1_790_253_181_367)] {
-        let key = [31u8; 32];
-        let mut node = WireNode::unprovisioned(&key);
-        let mut now = start;
-        let (container, signer) = wire::delegate_from_code(SIGNER_CODE);
-        let mut io = PageIo::new(
-            Server::new(Page::unstarted(engine::Params::default(), PutPath::Page, Ms(now)), SignerFacts::default()),
-            Artefacts { block_code: BLOCK_CODE.to_vec(), register_code: REGISTER_CODE.to_vec(), register_params: Vec::new(), signer },
-        );
-        io.begin(container);
-        // A browser page's life: every frame answered 1 ms later, the clock in 100 ms ticks.
-        let live = |io: &mut PageIo, node: &mut WireNode, now: &mut u64, ms: u64| {
-            let mut replies = pump(io, node, now);
-            for _ in 0..ms / 100 {
-                *now += 100;
-                io.tick(Ms(*now));
-                replies.extend(pump(io, node, now));
-            }
-            replies
-        };
-        live(&mut io, &mut node, &mut now, 1_000);
-        if io.needs_key() {
-            let sk = ed25519_dalek::SigningKey::from_bytes(&key);
-            io.provision_with(sk.to_bytes().to_vec(), wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME));
-            live(&mut io, &mut node, &mut now, 1_000);
-        }
-        assert!(io.provisioned(), "{label}: THE SETUP: the page did not provision");
-        io.client(&protocol::encode_session_request(4, 9, &Request::Identity).expect("encodes"));
-        live(&mut io, &mut node, &mut now, 1_000);
+        let (mut io, mut node, mut now) = opened_at(start, label);
         let before = node.block_puts.len();
         node.lose_block_puts = 1;
         io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
@@ -1189,6 +1229,42 @@ fn a_lost_put_is_re_sent_on_the_rto_when_the_page_opened_at_an_epoch_clock() {
         println!("  {label}: {} block PUTs; the lost one reached the node {:?} ms after its first send; page clock rto {rto} ms, srtt {srtt:?}", puts.len(), sends.iter().map(|t| t - sends[0]).collect::<Vec<_>>());
         assert!(sends.len() >= 2, "{label}: THE SETUP: the lost PUT was never re-sent");
         assert!(sends[1] - sends[0] < 5_000, "{label}: the lost PUT waited {} ms for its re-send (rto {rto} ms, srtt {srtt:?})", sends[1] - sends[0]);
+    }
+}
+
+/// A BLOCK PUT THE NODE ANSWERS ONLY WITH AN ERROR (sdk#431, seen live on 0.2.136: a parity PUT answered three times
+/// with "No such file or directory (os error 2)", never re-sent, and the publish's rows read backed up). An error that
+/// is not the contract's own refusal ENDS NOTHING (rule 7): the PUT is not acked, the write never reaches
+/// ParityComplete, and the page re-sends it on the RTO -- whether the node's error names the contract (a keyed
+/// `ContractError::Put`) or names nothing (the live bytes, `OperationError`). The page's recording shows the PUT's
+/// sends and no Withdrawn among them. THE CONTROL: the same errors, then the node takes the PUT -- the write is
+/// ParityComplete, so the setup can reach it.
+#[test]
+fn a_block_put_answered_only_with_an_error_is_re_sent_and_never_backed_up() {
+    for keyed in [true, false] {
+        for (label, errors) in [("2 errors, then taken (THE CONTROL)", 2usize), ("errors only", usize::MAX)] {
+            let label = format!("{} error, {label}", if keyed { "keyed" } else { "keyless (the live bytes)" });
+            let (mut io, mut node, mut now) = opened_at(1_790_253_181_367, &label);
+            io.server.page.record_into(1 << 16);
+            let before = node.block_puts.len();
+            node.err_block_puts = errors;
+            node.err_keyed = keyed;
+            io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
+            let r = live(&mut io, &mut node, &mut now, 70_000);
+            let failed = node.err_block.unwrap_or_else(|| panic!("{label}: THE SETUP: no block PUT was answered with an error"));
+            let sends = node.block_puts[before..].iter().filter(|(_, id)| *id == failed).count();
+            let errored = node.served.get("put block answered with an error").copied().unwrap_or(0);
+            let dump = io.server.page.dump(usize::MAX);
+            let withdrawn = dump.lines().filter(|l| l.contains("page::op::put") && l.contains("Withdrawn")).count();
+            println!("  {label}: the errored block reached the node {sends} time(s), {errored} answered with the error; states {:?}; put Withdrawn in the recording: {withdrawn}", states(&r, 1));
+            assert_eq!(withdrawn, 0, "{label}: a block PUT was WITHDRAWN:\n{dump}");
+            if errors == usize::MAX {
+                assert!(!states(&r, 1).contains(&WriteState::ParityComplete), "{label}: BACKED UP (ParityComplete) with a block the node only ever answered with an error");
+                assert!(sends >= 3, "{label}: the errored PUT was not re-sent on the RTO after the error ({sends} send(s) in 70 s)");
+            } else {
+                assert!(states(&r, 1).contains(&WriteState::ParityComplete), "{label}: THE CONTROL: the write never reached ParityComplete once the node took the PUT: {:?}", states(&r, 1));
+            }
+        }
     }
 }
 
@@ -2384,4 +2460,45 @@ fn control_settle_panics_on_a_page_that_never_settles() {
     let mut io = asker();
     let mut now = 1_000;
     settle(&mut io, &mut node, &mut now);
+}
+
+/// THE LIVE SHAPE of sdk#431 (a parity PUT answered only with errors, sent 3 times and never again, yet the rows
+/// backed up): a LATER commit re-codes the errored parity's group, and its PUT is WITHDRAWN (Effect::Withdraw,
+/// COMMIT-LIFE §P) -- nobody needs it any more. BACKED_UP then rests on the RE-CODED group's parity: the node takes
+/// it -> both writes ParityComplete; one of those errors too -> neither is. Keyed and keyless errors alike.
+#[test]
+fn an_errored_parity_superseded_by_a_later_commit_is_withdrawn_and_backed_up_only_by_the_re_coded_group() {
+    for keyed in [true, false] {
+        for (case, new_group_errors) in [("the re-coded group is taken", false), ("a re-coded parity errors too", true)] {
+            let label = format!("{} error, {case}", if keyed { "keyed" } else { "keyless" });
+            let (mut io, mut node, mut now) = opened_at(1_790_253_181_367, &label);
+            io.server.page.record_into(1 << 16);
+            let before = node.block_puts.len();
+            node.err_block_puts = usize::MAX;
+            node.err_keyed = keyed;
+            io.client(&protocol::encode_session_request(4, 9, &write(1, "a", "1")).expect("encodes"));
+            let mut r = live(&mut io, &mut node, &mut now, 2_000);
+            let failed = node.err_block.unwrap_or_else(|| panic!("{label}: THE SETUP: no parity PUT was answered with an error"));
+            if new_group_errors {
+                node.err_block = None;
+            }
+            io.client(&protocol::encode_session_request(4, 9, &write(2, "b", "2")).expect("encodes"));
+            r.extend(live(&mut io, &mut node, &mut now, 70_000));
+            if new_group_errors {
+                assert!(node.err_block.is_some_and(|b| b != failed), "{label}: THE SETUP: no parity of the re-coded group was answered with an error");
+            }
+            let sends: Vec<u64> = node.block_puts[before..].iter().filter(|(_, id)| *id == failed).map(|(t, _)| *t).collect();
+            let dump = io.server.page.dump(usize::MAX);
+            let withdrawn = dump.lines().filter(|l| l.contains("exit   page::op::put") && l.contains("Withdrawn")).count();
+            println!("  {label}: the errored parity reached the node at +{:?} ms; write 1 {:?}; write 2 {:?}; put Withdrawn {withdrawn}", sends.iter().map(|t| t - sends[0]).collect::<Vec<_>>(), states(&r, 1), states(&r, 2));
+            assert!(withdrawn >= 1, "{label}: the superseded parity PUT was not WITHDRAWN:\n{dump}");
+            assert!(sends.last().expect("sent") - sends[0] < 2_000, "{label}: the superseded parity PUT was still re-sent after the later commit: {sends:?}");
+            let backed = |w| states(&r, w).contains(&WriteState::ParityComplete);
+            if new_group_errors {
+                assert!(!backed(1) && !backed(2), "{label}: BACKED UP with a parity of the re-coded group answered only with errors");
+            } else {
+                assert!(backed(1) && backed(2), "{label}: THE CONTROL: the writes did not back up on the re-coded group: {:?} / {:?}", states(&r, 1), states(&r, 2));
+            }
+        }
+    }
 }
