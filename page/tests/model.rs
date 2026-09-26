@@ -513,6 +513,9 @@ struct Seen {
     record_not_saved: usize,
     landings: u32,
     most_landing_updates: u32,
+    /// N2's memory: the most keys any page remembered at once, and the keys evicted at the cap (a normal run: none).
+    untracked_peak: usize,
+    untracked_evicted: u64,
     /// (page, write, the head it was told Published at).
     published_at: Vec<PublishedAt>,
     /// Published writes whose head a same-seq WINNER later displaced, and
@@ -810,6 +813,8 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         let (l, m) = a.page.landings();
         seen.landings += l;
         seen.most_landing_updates = seen.most_landing_updates.max(m);
+        seen.untracked_peak = seen.untracked_peak.max(a.page.untracked_peak());
+        seen.untracked_evicted += a.page.untracked_evicted();
     }
     // RACES: seqs the register held under two roots (non-vacuity for the
     // two-device runs).
@@ -1218,6 +1223,8 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
         total.record_not_saved += s.record_not_saved;
         total.landings += s.landings;
         total.most_landing_updates = total.most_landing_updates.max(s.most_landing_updates);
+        total.untracked_peak = total.untracked_peak.max(s.untracked_peak);
+        total.untracked_evicted += s.untracked_evicted;
     }
     println!("{seed} seeds (CRAFTWORKS_MODEL_SEEDS={}) × 2 pages × {WRITES} writes: {total:?}", seeds());
     // The model is not vacuous: the race and the faults were reached.
