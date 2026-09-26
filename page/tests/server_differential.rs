@@ -2511,3 +2511,124 @@ fn a_read_with_slow_blocks_still_answers_under_fast_heads() {
     assert_eq!(v, Some(Some(b"value 321".to_vec())), "the read did not answer in 60 steps ({superseded} superseded)");
     println!("  slow blocks, a head per step: answered after {superseded} supersede(s)");
 }
+
+/// sdk#415, THE BACKED-UP TIMELINE (engineer1's live run, forced): two rows saved and BACKED UP, then a third
+/// written. A row's state is its OWN last write's fate (ruling A, rule 10: BACKED_UP is per commit): the first two
+/// never regress while the third saves, and the third reaches BACKED UP once every PUT of its commit is acked.
+/// The engine's bookkeeping settles too: no group owed, the parity scan Done.
+#[test]
+fn a_row_is_backed_up_by_its_own_write_and_a_later_save_never_demotes_it() {
+    for case in ["no faults", "first parity answers lost", "first put answers lost", "first gets lost", "record not saved once"] {
+        let faults = Faults {
+            lose_first_parity_answers: case == "first parity answers lost",
+            lose_first_put_answers: case == "first put answers lost",
+            lose_first_gets: case == "first gets lost",
+            record_not_saved_once: case == "record not saved once",
+            ..Faults::default()
+        };
+        backed_up_timeline(case, faults);
+    }
+}
+
+fn backed_up_timeline(case: &str, faults: Faults) {
+    use craftworks_sdk::store::{Reads, RowState};
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    rig.faults = faults;
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let row = |tab: &mut Tab, rig: &mut PageRig, node: &mut Node, title: &str| {
+        let rec = tab.call(rig, node, |db| db.put("t", &serde_json::json!({ "title": title }).as_object().unwrap().clone())).expect("put");
+        tab.pump(rig, node);
+        craftworks_sdk::db::record_key("t", craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id"))
+    };
+    let state = |tab: &mut Tab, rig: &mut PageRig, node: &mut Node, key: &[u8]| tab.lend(rig, node, |db| Reads::row_state(db.store_mut(), key));
+    let settle = |tab: &mut Tab, rig: &mut PageRig, node: &mut Node| {
+        rig.run_for(node, 5_000);
+        tab.pump(rig, node);
+    };
+    let alpha = row(&mut tab, &mut rig, &mut node, "alpha");
+    let beta = row(&mut tab, &mut rig, &mut node, "beta");
+    settle(&mut tab, &mut rig, &mut node);
+    for (name, k) in [("alpha", &alpha), ("beta", &beta)] {
+        assert_eq!(state(&mut tab, &mut rig, &mut node, k), RowState::BackedUp, "{case}: THE SETUP: {name} is not backed up before gamma");
+    }
+    // gamma's save RETURNS before its commit is backed up (its parity follows the head): alpha and beta are
+    // looked at in that window, before anything settles -- the moment engineer1 saw all three read "saved".
+    let rec = tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": "gamma" }).as_object().unwrap().clone())).expect("put");
+    let gamma = craftworks_sdk::db::record_key("t", craftworks_sdk::id::loc_from_hex(&rec.id).expect("an id"));
+    let owed_mid = rig.server.page.owed_groups();
+    // gamma's row, watched from here: its save returned, its own state change so far told and drained. From now
+    // on every change of it must reach its bindings (`state_changed`), the move to backed up included.
+    let _ = tab.db.store_mut().writes.take_state_changed();
+    let mut gamma_seen = state(&mut tab, &mut rig, &mut node, &gamma);
+    if case == "first parity answers lost" {
+        assert_ne!(gamma_seen, RowState::BackedUp, "THE SETUP: gamma was backed up the moment it saved: the move to backed up is not watched");
+    }
+    for (name, k) in [("alpha", &alpha), ("beta", &beta)] {
+        let s = state(&mut tab, &mut rig, &mut node, k);
+        assert_eq!(s, RowState::BackedUp, "{case}: {name} REGRESSED to {s:?} as gamma saved ({owed_mid} group(s) owed by gamma's commit): a later save demoted a row its own commit backed up");
+    }
+    tab.pump(&mut rig, &mut node);
+    // Watched for engineer1's 600 s, and PAST backing up: the idle page's backstop head reads (every
+    // HEAD_BACKSTOP_MS) come after the save, and a row must stay backed up through them.
+    let mut gamma_backed_at = None;
+    for step in 0..120u64 {
+        for (name, k) in [("alpha", &alpha), ("beta", &beta)] {
+            let s = state(&mut tab, &mut rig, &mut node, k);
+            assert_eq!(s, RowState::BackedUp, "{case}: {name} REGRESSED to {s:?} {} ms after gamma was written: a later save demoted a row its own commit backed up", step * 5_000);
+        }
+        let told = tab.db.store_mut().writes.take_state_changed();
+        let g = state(&mut tab, &mut rig, &mut node, &gamma);
+        // A row whose state CHANGED is told to its bindings (they re-read on it; builder#107): the move to backed
+        // up moves no root, so without this the table shows "saved" for ever (engineer1's live run on sdk#415).
+        if g != gamma_seen {
+            assert!(told.contains(&gamma), "{case}: gamma moved {gamma_seen:?} -> {g:?} and its binding was not told (state_changed: {} key(s))", told.len());
+            gamma_seen = g;
+        }
+        match (g == RowState::BackedUp, gamma_backed_at) {
+            (true, None) => gamma_backed_at = Some(step),
+            (false, Some(at)) => panic!("{case}: gamma REGRESSED to {g:?} at {} ms, after reading backed up at {} ms", step * 5_000, at * 5_000),
+            _ => {}
+        }
+        settle(&mut tab, &mut rig, &mut node);
+    }
+    let gamma_backed = gamma_backed_at.is_some();
+    let owed = rig.server.page.owed_groups();
+    let scan = rig.server.page.parity_scan();
+    println!("{case}: gamma backed up: {gamma_backed}; owed groups {owed}; parity scan {}", if matches!(scan, engine::ParityScan::Done { .. }) { "Done" } else { "not Done" });
+    assert!(gamma_backed, "{case}: gamma never reached BACKED UP though every PUT of its commit was acked");
+    assert_eq!(owed, 0, "{case}: every parity PUT acked, and groups are still owed");
+    assert!(matches!(scan, engine::ParityScan::Done { .. }), "{case}: every parity PUT acked, and the parity scan is {scan:?}");
+    // ANOTHER DEVICE then writes DIFFERENT bytes at gamma's key (#437): the row is no longer this page's write's --
+    // it reads saved, not backed up, until that write's own fate is known here; alpha, untouched, stays backed up.
+    elsewhere(&mut rig, &mut node, 99, vec![protocol::Op::Put(gamma.clone(), b"another device's bytes".to_vec())]);
+    rig.server.head_hint();
+    settle(&mut tab, &mut rig, &mut node);
+    // Read as a binding re-reads: the other device's tree is cold here until fetched (a key the page cannot read
+    // has no state yet, as before the fetch of any row).
+    assert_eq!(tab.get(&mut rig, &mut node, &gamma).as_deref(), Some(b"another device's bytes".as_slice()), "{case}: THE SETUP: the other device's write is not what gamma's key holds");
+    let _ = tab.get(&mut rig, &mut node, &alpha);
+    let g = state(&mut tab, &mut rig, &mut node, &gamma);
+    assert_ne!(g, RowState::BackedUp, "{case}: gamma's key holds another device's bytes, and still reads backed up by this page's write");
+    assert_eq!(state(&mut tab, &mut rig, &mut node, &alpha), RowState::BackedUp, "{case}: a foreign write to gamma's key demoted alpha");
+}
+
+/// #437: the per-key last-write record is FIXED-SIZE -- a digest of the value, never the value (a copy would be a
+/// second holder of the data, rule 3, and page memory growing with it). A 50 KB row costs it no more than a small one.
+#[test]
+fn the_last_write_record_keeps_a_digest_never_the_value() {
+    assert!(std::mem::size_of::<page::server::LastWrite>() <= 64, "LastWrite is {} bytes", std::mem::size_of::<page::server::LastWrite>());
+    let mut node = Node::new();
+    let mut rig = PageRig::new();
+    let mut tab = Tab::open(&mut rig, &mut node);
+    tab.call(&mut rig, &mut node, |db| db.define("t", &tab_schema())).expect("define");
+    tab.pump(&mut rig, &mut node);
+    let big = "x".repeat(50_000);
+    tab.call(&mut rig, &mut node, |db| db.put("t", &serde_json::json!({ "title": big }).as_object().unwrap().clone())).expect("put");
+    tab.pump(&mut rig, &mut node);
+    let bytes = rig.server.last_write_bytes();
+    println!("last-write record after a 50 KB row: {bytes} B");
+    assert!(bytes < 1_024, "the last-write record holds {bytes} B after a 50 KB row: it keeps the value");
+}

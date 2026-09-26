@@ -110,6 +110,30 @@ pub struct Server {
     next_probe: u64,
     /// A same-seq race being MERGED (cell B).
     merge: Option<Merge>,
+    /// EACH KEY'S LAST WRITE here (sdk#415): the Published write that last wrote it, the final value it left
+    /// there, and whether its commit is BACKED_UP (`ParityComplete`). A row's state is its own last write's fate
+    /// (rule 10, ruling A: BACKED_UP is per commit) -- never the tree's, which a later commit's owed parity would
+    /// demote. A key no write of this page wrote has no entry: it reads Saved.
+    last_write: BTreeMap<Vec<u8>, LastWrite>,
+    /// The keys whose last write each Published write is, until its `ParityComplete`.
+    last_keys: BTreeMap<WriteKey, Vec<Vec<u8>>>,
+    /// Per session, keys whose last write just became BACKED_UP, until the client pulls them
+    /// ([`Server::take_backed_up`]): a row's state changed with no root moving, so its binding must be told.
+    backed_up_keys: BTreeMap<u64, Vec<Vec<u8>>>,
+}
+
+/// A key's last write here (`Server::last_write`). FIXED-SIZE (the architect on #437): the value's DIGEST, never
+/// the value -- a copy of the data would be a second holder of it (rule 3), and page memory growing with every
+/// key written, beside #411's bound. `None`: the write deleted the key.
+pub struct LastWrite {
+    write: WriteKey,
+    digest: Option<[u8; 32]>,
+    backed_up: bool,
+}
+
+/// What `LastWrite` keeps of a value.
+fn digest_of(v: &Option<Vec<u8>>) -> Option<[u8; 32]> {
+    v.as_ref().map(|b| *blake3::hash(b).as_bytes())
 }
 
 /// THE MERGE of a same-seq race (sdk#225b part 2, cell B; COMMIT-LIFE K9 §2):
@@ -277,6 +301,9 @@ impl Server {
             probe: None,
             next_probe: 1,
             merge: None,
+            last_write: BTreeMap::new(),
+            last_keys: BTreeMap::new(),
+            backed_up_keys: BTreeMap::new(),
         }
     }
 
@@ -481,6 +508,12 @@ impl Server {
                     State::Published => {
                         if let Some(sent) = self.sent.remove(&id) {
                             published_here = true;
+                            // Its keys' last write is this one now (sdk#415).
+                            let keys: Vec<Vec<u8>> = sent.finals.iter().map(|(k, _)| k.clone()).collect();
+                            for (k, v) in &sent.finals {
+                                self.last_write.insert(k.clone(), LastWrite { write: id, digest: digest_of(v), backed_up: false });
+                            }
+                            self.last_keys.insert(id, keys);
                             match self.tip.as_mut() {
                                 Some(t) if t.head == now => t.writes.push((id, sent)),
                                 _ => {
@@ -554,6 +587,15 @@ impl Server {
             match f {
                 Effect::Notify { client, write_id, state } => {
                     self.fates.told((session_of(*client), write_id.0), state, seq);
+                    // BACKED_UP: the keys whose last write this is (sdk#415).
+                    if *state == State::ParityComplete {
+                        for k in self.last_keys.remove(&(client.0, write_id.0)).unwrap_or_default() {
+                            if let Some(l) = self.last_write.get_mut(&k).filter(|l| l.write == (client.0, write_id.0)) {
+                                l.backed_up = true;
+                                self.backed_up_keys.entry(session_of(*client)).or_default().push(k);
+                            }
+                        }
+                    }
                 }
                 Effect::Conflicted { client, write_id, key, current, after, tries } => self.fates.conflicted(
                     (session_of(*client), write_id.0),
@@ -584,6 +626,18 @@ impl Server {
     /// Every unread terminal fate of `session`, in the order they ended. READ.
     pub fn take_fates(&mut self, session: u64) -> Vec<(u64, crate::fates::Fate)> {
         self.fates.take_session(session)
+    }
+
+    /// The bytes the per-key last-write record holds (#437: keys and fixed-size entries, never values).
+    pub fn last_write_bytes(&self) -> usize {
+        self.last_write.keys().map(|k| k.len() + std::mem::size_of::<LastWrite>()).sum()
+    }
+
+    /// `session`'s keys whose last write became BACKED_UP since this was last asked (sdk#415). Drains. The write
+    /// itself ended at `Published` (its fate is read and gone), so this is the one way its row's move to "backed
+    /// up" -- which moves no root -- reaches the client's bindings.
+    pub fn take_backed_up(&mut self, session: u64) -> Vec<Vec<u8>> {
+        self.backed_up_keys.remove(&session).unwrap_or_default()
     }
 
     /// `session`'s writes in the queue, in order, with their stages.
@@ -617,20 +671,26 @@ impl Server {
     }
 
     /// Where `key` stands (R-b): `Saving` while the warm and published roots
-    /// differ at it; else `Saved`, or `SavedAndBackedUp` when no parity is
-    /// owed over a tree whose parity is known in full. `None` when a block
-    /// either walk needs is not held.
+    /// differ at it; else its LAST WRITE's fate (sdk#415; rule 10, ruling A):
+    /// `SavedAndBackedUp` once that write's commit is BACKED_UP
+    /// (`ParityComplete`) and the published tree still holds what it left,
+    /// else `Saved`. Never the tree's parity state (`parity_scan`,
+    /// `owed_groups`): that is the engine's bookkeeping and the assets
+    /// dashboard's input, and a later commit's owed parity would demote a row
+    /// its own commit backed up. `None` when a block either walk needs is not
+    /// held.
     pub fn key_state(&self, key: &[u8]) -> Option<KeyState> {
         let (warm, published) = self.heads()?;
         let get = |root: &freenet_prolly::Cid| match self.page.walk(root, &engine::read::Walk::Get(key.to_vec())) {
             engine::read::Walked::Done(engine::read::ReadResult::Value(v)) => Some(v),
             _ => None,
         };
-        if warm != published && get(&warm)? != get(&published)? {
+        let now = get(&published)?;
+        if warm != published && get(&warm)? != now {
             return Some(KeyState::Saving);
         }
-        let known = matches!(self.page.parity_scan(), engine::ParityScan::Done { .. });
-        Some(if known && self.page.owed_groups() == 0 { KeyState::SavedAndBackedUp } else { KeyState::Saved })
+        let backed = self.last_write.get(key).is_some_and(|l| l.backed_up && l.digest == digest_of(&now));
+        Some(if backed { KeyState::SavedAndBackedUp } else { KeyState::Saved })
     }
 
     /// The (warm, published) roots: warm for this page's own editing,
@@ -1525,7 +1585,8 @@ pub enum KeyState {
     Saving,
     /// Published.
     Saved,
-    /// Published, and no parity is owed over a tree known in full.
+    /// Published, and the commit of the key's last write is BACKED_UP (`ParityComplete`), the tree still holding
+    /// its value (sdk#415).
     SavedAndBackedUp,
 }
 

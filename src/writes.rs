@@ -244,6 +244,12 @@ impl Writes {
         self.ended.push((write_id, ended));
     }
 
+    /// Keys whose last write of this client's became BACKED_UP (sdk#415): its fate ended at `Published`, so this
+    /// is its row's state changing -- its bindings re-read, as for every own-write state change (builder#107).
+    pub fn on_backed_up(&mut self, keys: Vec<Vec<u8>>) {
+        self.state_changed.extend(keys);
+    }
+
     /// Conflict chains the Server named for this client (`Db`'s re-run).
     pub fn on_conflicted(&mut self, chains: Vec<(Vec<u64>, Vec<Vec<u8>>, u32)>) {
         self.chains.extend(chains.into_iter().map(|(write_ids, keys, tries)| crate::store::ConflictChain { write_ids, keys, tries }));

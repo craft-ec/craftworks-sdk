@@ -108,10 +108,10 @@ pub enum RowState {
     Pending,
     /// A write that was rolled back: it failed, or nothing ever answered it.
     RolledBack,
-    /// Saved, AND its redundancy is on the network: no parity is owed over a
-    /// tree whose parity is known in full (sdk#294; READ-STATE `key_state`'s
-    /// `SavedAndBackedUp`, the one owner). What the builder's "saved + backed
-    /// up" chip shows.
+    /// Saved, AND its redundancy is on the network: the commit of the key's
+    /// last write is BACKED_UP -- every group it changed whole (sdk#415, rule
+    /// 10; READ-STATE `key_state`'s `SavedAndBackedUp`, the one owner). What
+    /// the builder's "saved + backed up" chip shows.
     BackedUp,
 }
 
