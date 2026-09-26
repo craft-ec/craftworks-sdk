@@ -11,14 +11,21 @@ pub fn production_of(src: &str) -> &str {
     let mut at = 0usize;
     for (i, l) in lines.iter().enumerate() {
         if *l == "#[cfg(test)]" {
-            let item = lines[i + 1..].iter().find(|n| !n.starts_with("#[") && !n.trim().is_empty());
-            if item.is_some_and(|n| n.starts_with("mod ")) {
+            // The item: past further attributes, doc comments and blank lines.
+            let item = lines[i + 1..].iter().find(|n| !n.starts_with("#[") && !n.trim_start().starts_with("//") && !n.trim().is_empty());
+            if item.is_some_and(|n| is_mod(n)) {
                 return &src[..at];
             }
         }
         at += l.len() + 1;
     }
     src
+}
+
+/// A module item line, whatever its visibility: `mod`, `pub mod`, `pub(crate) mod`, `pub(super) mod`.
+fn is_mod(line: &str) -> bool {
+    let rest = line.strip_prefix("pub").map_or(line, |r| r.strip_prefix(|c: char| c == '(').map_or(r, |r| r.split_once(')').map_or(r, |(_, t)| t)));
+    rest.trim_start().starts_with("mod ")
 }
 
 /// The TOP-LEVEL items of `src` after its production cut that are NOT a `#[cfg(test)]` module: each `(line, text)`.
@@ -39,7 +46,7 @@ pub fn items_after_the_cut(src: &str) -> Vec<(usize, String)> {
             attrs.push(l);
             continue;
         }
-        let test_mod = l.starts_with("mod ") && attrs.iter().any(|a| a.trim() == "#[cfg(test)]");
+        let test_mod = is_mod(l) && attrs.iter().any(|a| a.trim() == "#[cfg(test)]");
         if !test_mod {
             out.push((i + 1, l.to_string()));
         }

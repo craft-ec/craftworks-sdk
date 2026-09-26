@@ -39,7 +39,10 @@ fn the_cut_is_the_first_test_module_and_nothing_else_hides_after_it() {
     let plain = "struct Page {\n    x: u8,\n}\nfn end() { deadlines.remove(1); }\n#[cfg(test)]\nmod tests {\n    fn t() { deadlines.remove(2); }\n}\n";
     let field = "struct Page {\n    #[cfg(test)]\n    confirmed_steps: u8,\n    x: u8,\n}\nfn end() { deadlines.remove(1); }\n#[cfg(test)]\nmod tests {\n    fn t() { deadlines.remove(2); }\n}\n";
     let test_fn = "#[cfg(test)]\nfn helper() {}\nfn end() { deadlines.remove(1); }\n#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    fn t() { deadlines.remove(2); }\n}\n";
-    for (name, src) in [("plain", plain), ("a test-only field", field), ("a test-only fn", test_fn)] {
+    // The architect on #423: the cut looks past DOC COMMENTS to the item, and a `pub` / `pub(crate)` module is a module.
+    let doc = "fn end() { deadlines.remove(1); }\n#[cfg(test)]\n/// The tests.\nmod tests {\n    fn t() { deadlines.remove(2); }\n}\n";
+    let public = "fn end() { deadlines.remove(1); }\n#[cfg(test)]\npub(crate) mod tests {\n    fn t() { deadlines.remove(2); }\n}\n";
+    for (name, src) in [("plain", plain), ("a test-only field", field), ("a test-only fn", test_fn), ("a doc comment before the mod", doc), ("a pub(crate) mod", public)] {
         assert_eq!(counts(production_of(src))[0], 1, "{name}: the cut moved (the test module's removal counted, or production's lost)");
         assert!(items_after_the_cut(src).is_empty(), "{name}: a test module after the cut was taken for production");
     }
