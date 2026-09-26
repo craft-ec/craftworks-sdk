@@ -555,5 +555,22 @@ await t("closing a page with writes unsaved removes the guard with the page", as
   assert.equal(page.win.has("beforeunload"), false, "the guard outlived the page");
 });
 
+// THE PAGE'S RECORDING HAS A READER (sdk#434). The page records every op from its first (sdk#407), but no JS
+// surface exposed `page_trace`, so neither a harness nor anyone supporting a person could read which End an op took
+// (sdk#431 had to be reproduced instead of read). The handle's `pageTrace()` is that reader: the session's own dump,
+// read when asked -- never a copy taken at open.
+await t("**the session handle reads the page's recording: `pageTrace()` is the session's `page_trace()`, read when asked**", async () => {
+  const raw = fakeRaw();
+  raw.__session.page_trace = () => raw.__session.dump;
+  raw.__session.dump = "── instrument dump: page ops (stream v1) ──\n   exit   page::op::put#3 Withdrawn\n";
+  const page = pageOf(raw);
+  const handle = await wrap(raw).open(page.opts);
+  assert.equal(typeof handle.pageTrace, "function", "the handle has no pageTrace(): the recording has no reader");
+  assert.equal(handle.pageTrace(), raw.__session.dump);
+  raw.__session.dump = "── instrument dump: page ops (stream v1) ──\n   exit   page::op::put#4 Response\n";
+  assert.equal(handle.pageTrace(), raw.__session.dump, "pageTrace() answered an old dump: a copy, not the session's recording");
+  handle.close();
+});
+
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");
 process.exit(failures ? 1 : 0);
