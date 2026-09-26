@@ -47,10 +47,6 @@ fail() { echo "${RED}gate: $*${OFF}" >&2; FAILED=1; }
 step_fail() { STEP_FAILED=1; fail "$@"; }
 step() { echo; echo "── $* ──"; }
 FAILED=0
-# Checked HERE, before any work: a mistyped batch flag must not cost a full gate to find out.
-if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
-  case "$GATE_OWNERS_PER_PR" in (*[!0-9]*|0) echo "gate: GATE_OWNERS_PER_PR must be a PR count, got '$GATE_OWNERS_PER_PR'" >&2; exit 1 ;; esac
-fi
 STEP_FAILED=0
 # ONE FILE PER MEMBER (sdk#279): `gate.baseline.d/<member>` holds that
 # member's recorded count and nothing else. A single counts file conflicted on
@@ -84,6 +80,15 @@ if [ ${#ACCEPT_ARGS[@]} -gt 0 ] && [ $ACCEPT -eq 0 ] && [ "$MODE" != pr ]; then
 fi
 if [ "$MODE" != full ] && [ $ACCEPT -eq 1 ]; then
   echo "gate: --accept is the batch gate's (the full run); a PR never records counts" >&2; exit 2
+fi
+# GATE_OWNERS_PER_PR is the BATCH's flag (craftworks-docs scripts/batch-merge.sh, sdk#420), honoured ONLY by the
+# batch gate (full + --accept). Anywhere else a stray export would switch off the one check that catches an
+# undeclared crossing on a single PR, while the gate printed a plausible line. Checked before any work.
+if [ -n "${GATE_OWNERS_PER_PR:-}" ]; then
+  case "$GATE_OWNERS_PER_PR" in (*[!0-9]*|0) echo "gate: GATE_OWNERS_PER_PR must be a PR count, got '$GATE_OWNERS_PER_PR'" >&2; exit 1 ;; esac
+  if [ "$MODE" != full ] || [ $ACCEPT -ne 1 ]; then
+    echo "gate: GATE_OWNERS_PER_PR is only for the batch gate (./gate.sh --accept from batch-merge.sh); unset it" >&2; exit 1
+  fi
 fi
 
 # THE OLD FORM IS REFUSED, not merged with the new (sdk#279). A branch made
