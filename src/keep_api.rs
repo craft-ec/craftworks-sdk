@@ -30,17 +30,9 @@ pub fn health_word(h: Health) -> &'static str {
     }
 }
 
-/// SEAM (sdk#472 → engineer2): the word for a RECORD's stored counts must come from the same one function as the
-/// report's (`page::audit`), `Health::of(damaged, degraded)`, once it is factored there. Until then this is the only
-/// other place, and it mirrors `Report::report()`'s rule exactly; the PR is not opened with it.
+/// The word for a RECORD's stored counts: the SAME one derivation as a report's (`page::audit::Health::of`).
 fn record_health(c: &Counts) -> Health {
-    if c.damaged > 0 {
-        Health::Damaged
-    } else if c.degraded > 0 {
-        Health::Degraded
-    } else {
-        Health::Whole
-    }
+    Health::of(c.damaged as usize, c.degraded as usize)
 }
 
 /// One asset as the tab lists it. `audited_at == 0` is "never": no health.
