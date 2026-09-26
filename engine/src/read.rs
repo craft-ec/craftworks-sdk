@@ -286,10 +286,7 @@ pub(crate) struct Parked {
 #[derive(Default)]
 pub(crate) struct Reads {
     pub parked: BTreeMap<ReqId, Parked>,
-    /// Who is waiting on each outstanding block. Two requests needing one
-    /// block share its fetch: the second does not pay for the first's round
-    /// trip, and a popular branch is fetched once however many readers want it.
-    pub waiting: BTreeMap<Cid, BTreeSet<ReqId>>,
+    // Who waits on each block is in `Engine::wanted` (WANTED-LIFE: one writer, by type).
     /// Attempts already made per block, for the bounded re-issue.
     pub attempts: BTreeMap<Cid, u32>,
     /// Which pack is known to carry a block, newest first.
@@ -314,19 +311,6 @@ pub use core_types::kind::BlockKind;
 /// The kind under which `bytes` ARE the block `id`, or `None` when they are not it under any kind.
 pub fn kind_of(id: &Cid, bytes: &[u8]) -> Option<core_types::kind::BlockKind> {
     core_types::kind::BlockKind::ALL.into_iter().find(|k| block_id(k.byte(), bytes) == *id)
-}
-
-impl Reads {
-    /// Record who is waiting, and say whether a fetch must be emitted.
-    ///
-    /// Returns false when someone else is already waiting on this block — the
-    /// caller then emits nothing and both requests resume on the one arrival.
-    pub fn want(&mut self, id: Cid, req: ReqId, share: bool) -> bool {
-        let waiters = self.waiting.entry(id).or_default();
-        let first = waiters.is_empty();
-        waiters.insert(req);
-        first || !share
-    }
 }
 
 /// Try a request against what is warm, and say what it still needs.

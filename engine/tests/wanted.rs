@@ -147,3 +147,29 @@ fn a_slot_freed_and_parked_on_in_one_step_is_not_unwanted() {
     assert!(fetches(&out).contains(&y), "THE SETUP: the write did not park on Y in the same step: {:?}", fetches(&out));
     assert!(!unwanted(&out, y), "Y, freed and parked on in one step, was told Unwanted: the page would end the write's GET");
 }
+
+/// **A RELEASED parked write's needs are told Unwanted** (WANTED-LIFE part 3: `release_write` drops each need, and a
+/// block nobody else wants is `Unwanted` at the call's end). The write parks on a cold block X that no read wants;
+/// it hears nothing for its idle bound and is released `Failed` -- and X, now wanted by nobody, is `Unwanted` in that
+/// same step, so the page ends its GET rather than re-asking it until its own due-time check. Mutant "release does not
+/// drop the write's needs" -> red.
+#[test]
+fn a_released_parked_writes_needs_are_unwanted() {
+    let records: BTreeMap<Vec<u8>, Vec<u8>> = (0..400u32).map(|i| (format!("k/{i:05}").into_bytes(), vec![(i % 251) as u8; 40])).collect();
+    let (root, all) = tree(&records);
+    let (mut e, store) = cold_reader(root, Params::default());
+    store.put(root, all.get(&root).expect("the root"));
+    let _ = e.step(Event::Tick(1_000));
+    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"new".to_vec()))]));
+    let x = *fetches(&out).first().expect("THE SETUP: the write did not park on a cold block");
+    let mut released = Vec::new();
+    for t in 1..=10_000u64 {
+        let out = e.step(Event::Tick(1_000 + t));
+        if out.iter().any(|f| matches!(f, Effect::Notify { state: engine::State::Failed, .. })) {
+            released = out;
+            break;
+        }
+    }
+    assert!(!released.is_empty(), "THE SETUP: the silent parked write was never released");
+    assert!(unwanted(&released, x), "a released parked write's need, wanted by nobody now, was not told Unwanted: its GET runs on");
+}

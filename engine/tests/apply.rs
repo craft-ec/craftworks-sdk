@@ -361,14 +361,20 @@ fn one_arrival_answers_both_a_parked_read_and_a_parked_write() {
         key: b"k/00100".to_vec(),
     });
     let w = h.step(write_one("k/00100", b"both"));
+    // ONE ask per block (W5, WANTED-LIFE): the write stopping on a block the read already asked rides that GET --
+    // it asks nothing of its own for it -- and the block has BOTH as readers.
     let shared: Vec<Cid> = fetches(&r)
         .into_iter()
-        .filter(|i| fetches(&w).contains(i))
+        .filter(|i| h.readers_of(i).reads && h.readers_of(i).parked_write)
         .collect();
     assert!(
         !shared.is_empty(),
         "the read and the write stopped on different blocks, so this test is \
          not about one arrival answering two waiters"
+    );
+    assert!(
+        shared.iter().all(|i| !fetches(&w).contains(i)),
+        "the write asked again for a block the read already has in flight (W5: one ask per block)"
     );
 
     let mut queue = shared;

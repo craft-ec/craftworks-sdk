@@ -70,8 +70,7 @@ impl<B: Blocks> Engine<B> {
         }
         let mut out = Vec::new();
         for (_, slot) in slots {
-            let in_flight = self.readers_of(&slot).any();
-            self.repair_slots.entry(slot).or_default().insert(id);
+            let in_flight = self.want(slot, crate::Reader::Repair(id)).any();
             if !in_flight {
                 self.reads.fetches += 1;
                 self.step_asks.entry(slot).or_insert(false);
@@ -121,7 +120,7 @@ mod put_back {
         let body = b"a rebuilt block".to_vec();
         let id = block_id(kind::RAW, &body);
         assert_eq!(put(&e.rebuilt(id, &body)), 0, "(c) a rebuild nobody waited on was put");
-        e.reads.want(id, ReqId(1), true);
+        e.want(id, crate::Reader::Read(ReqId(1)));
         assert_eq!(put(&e.rebuilt(id, &body)), 1, "a wanted, verified rebuild was not put");
         assert_eq!(put(&e.rebuilt(id, b"not its bytes")), 0, "(a) an unverified rebuild was put");
         assert!(e.rebuilt(id, b"not its bytes").is_empty(), "(a) an unverified rebuild was KEPT: the page would hold bytes under a wrong id");

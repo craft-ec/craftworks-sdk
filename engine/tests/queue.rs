@@ -138,7 +138,10 @@ fn a_cold_write_that_fails_its_fetch_lets_the_next_one_go() {
         }
     }
     assert_eq!(told(&exit, 1), vec![State::Failed], "the cold write never failed its fetch");
-    assert!(!fetch(&exit).is_empty() || told(&exit, 2).contains(&State::Accepted), "the write behind the failed one was not tried in the same step");
+    // Tried = accepted, or parked on its path: asking for it, or riding a GET already in flight for it (W5, one ask
+    // per block -- the failed write's group repair may still hold a shared block's ask).
+    let parked_now = all.0.keys().any(|id| e.readers_of(id).parked_write);
+    assert!(!fetch(&exit).is_empty() || told(&exit, 2).contains(&State::Accepted) || parked_now, "the write behind the failed one was not tried in the same step");
     assert_eq!(e.queued_writes(), 1, "the failed write is still queued, or the next one left too");
 }
 
