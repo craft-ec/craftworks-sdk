@@ -56,5 +56,21 @@ await t("THE CONTROLS: an unmarked spread is flagged; a marked control, the help
   assert.equal(breaches("x.test.mjs", "const c = process.env.CRAFTWORKS_CONTRACTS;").length, 0, "a plain read was flagged");
 });
 
+await t("**the helper drops the outer run's GATE_* and DISK_GUARD* and keeps the rest; a test's own values win**", async () => {
+  const { childEnv } = await import("./common/child-env.mjs");
+  const saved = { ...process.env };
+  try {
+    Object.assign(process.env, { GATE_PR_BASE: "FETCH_HEAD", DISK_GUARD: "/refuse", DISK_GUARD_JOBS: "/x", CARGO_TARGET_DIR: "/t" });
+    const env = childEnv({ DISK_GUARD: "/admit" });
+    assert.equal(env.GATE_PR_BASE, undefined, "the outer GATE_PR_BASE reached the child");
+    assert.equal(env.DISK_GUARD_JOBS, undefined, "the outer DISK_GUARD_JOBS reached the child");
+    assert.equal(env.DISK_GUARD, "/admit", "the test's own DISK_GUARD did not win");
+    assert.equal(env.CARGO_TARGET_DIR, "/t", "THE CONTROL: a variable the helper must keep was dropped");
+  } finally {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+});
+
 if (failures) { process.stdout.write(`child-env: ${failures} FAILED\n`); process.exit(1); }
 process.stdout.write("child-env: all ok\n");
