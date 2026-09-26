@@ -654,8 +654,6 @@ pub struct Page {
     /// key, is the known overlap (the architect) -- dropped, counted, and recorded as
     /// `DroppedMsgs = DropReason::AnsweredAfterReask`. Forgotten once no earlier node GET can still be running.
     reasked: BTreeMap<Cid, (u64, bool)>,
-    /// How many such second answers came (the recording holds each; this counts them whether or not one is attached).
-    answered_after_reask: u64,
     /// The attempt a re-send continues from (set when an op times out).
     attempt_of: BTreeMap<Waiting, u32>,
     /// When each op still unanswered was FIRST sent: what "not answering for
@@ -771,7 +769,6 @@ impl Page {
             window: rto::Window::default(),
             get_queue: Default::default(),
             reasked: BTreeMap::new(),
-            answered_after_reask: 0,
             attempt_of: BTreeMap::new(),
             first_of: BTreeMap::new(),
             recovered: false,
@@ -1990,8 +1987,7 @@ impl Page {
 
     /// A SECOND answer for a GET re-asked past the node's bound, when nothing waits on its key (sdk#447): the stalled
     /// earlier node GET answered too. Dropped, and counted -- the observable that moves B if it is ever non-trivial.
-    fn answer_after_reask(&mut self, id: Cid) {
-        self.answered_after_reask += 1;
+    fn answer_after_reask(&self, id: Cid) {
         if let Some(rec) = &self.rec {
             use instrument::{vocab::DropReason, Entry, Event, Key, OpId, Probe};
             let entry = Entry { key: Key::DroppedMsgs, value: DropReason::AnsweredAfterReask.code() };
@@ -3616,6 +3612,11 @@ mod node_get_silent {
     #[test]
     fn a_second_answer_after_a_re_ask_past_b_is_dropped_and_counted() {
         use instrument::{vocab::DropReason, Entry, Event, Key, Record};
+        // THE ONE RECORD (rule 3): the recording's DroppedMsgs = AnsweredAfterReask events (at the GETs' one site).
+        let overlaps = |p: &Page| {
+            let want = Event::Counter { site: op_site(&Waiting::Get([0; 32])), op: instrument::OpId::NONE, entry: Entry { key: Key::DroppedMsgs, value: DropReason::AnsweredAfterReask.code() } };
+            p.recording().expect("recording").events().into_iter().filter(|e| *e == want).count()
+        };
         let mut p = page();
         p.record_into(256);
         let (a, bytes) = block(1);
@@ -3627,22 +3628,17 @@ mod node_get_silent {
         assert_eq!(gets_of(&p.take_ops(), a), 1, "THE SETUP: the GET was not asked again past B");
         p.answer(Answer::Got { id: a, bytes: bytes.clone() }, Ms(over + 10));
         assert!(p.blocks.get(&a).is_some(), "THE SETUP: the first answer was not taken");
-        assert_eq!(p.answered_after_reask, 0, "the FIRST answer after a re-ask was counted");
+        assert_eq!(overlaps(&p), 0, "the FIRST answer after a re-ask was recorded as the overlap");
         p.answer(Answer::Got { id: a, bytes }, Ms(over + 20));
-        assert_eq!(p.answered_after_reask, 1, "the second answer after a re-ask past B was not counted");
+        assert_eq!(overlaps(&p), 1, "the second answer after a re-ask past B was not recorded as DroppedMsgs = AnsweredAfterReask");
         assert!(p.take_ops().is_empty(), "the second answer made the page send something");
-        let site = op_site(&Waiting::Get(a));
-        let recorded = p.recording().expect("recording").events().into_iter().filter(|e| {
-            *e == Event::Counter { site, op: instrument::OpId::NONE, entry: Entry { key: Key::DroppedMsgs, value: DropReason::AnsweredAfterReask.code() } }
-        });
-        assert_eq!(recorded.count(), 1, "the second answer was not recorded as DroppedMsgs = AnsweredAfterReask");
 
         // THE CONTROL: a key never re-asked, answered twice, is no overlap.
         let (b, bytes_b) = block(2);
         get(&mut p, b);
         p.answer(Answer::Got { id: b, bytes: bytes_b.clone() }, Ms(over + 30));
         p.answer(Answer::Got { id: b, bytes: bytes_b }, Ms(over + 40));
-        assert_eq!(p.answered_after_reask, 1, "a duplicate answer of a key never re-asked was counted as the overlap");
+        assert_eq!(overlaps(&p), 1, "a duplicate answer of a key never re-asked was recorded as the overlap");
     }
 
     /// **(2), RULED: a silent GET KEEPS ITS WINDOW PLACE** (rule 9's backpressure: it is still taking the path's
