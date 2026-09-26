@@ -4184,7 +4184,16 @@ impl<B: Blocks> Engine<B> {
     /// to the published root, and the writes behind them go again there. (One of COMMIT-LIFE's teardowns; sdk#481
     /// makes them one.)
     fn fail_commit(&mut self) -> Vec<Effect> {
+        let unacked = self.unacked();
         let Some(c) = self.pending.take() else { return Vec::new() };
+        // WHAT THE DEAD COMMIT STILL HAS ON THE WAY is WITHDRAWN (the architect on #502): its blocks not yet confirmed
+        // (PUTs the page is still retrying; the held-back parity dies with the commit, never sent) and the other
+        // members it asked the node about (`ConfirmHeld`, sdk#416) -- a PUT or a Held for a commit that no longer
+        // exists is the dead commit's op the page withdraws. Never a block an earlier commit's Backing still needs.
+        let mut gone: BTreeSet<Cid> = c.data.difference(&c.confirmed).copied().collect();
+        gone.extend(c.race.others().into_iter().filter(|m| !c.held.contains(m)));
+        gone.retain(|id| !unacked.contains(id));
+        let withdrawn: Vec<Effect> = gone.into_iter().map(|id| Effect::Withdraw { id }).collect();
         self.in_flight_since = None;
         self.unpublished.clear();
         self.next_seq = self.published_seq + 1;
@@ -4192,7 +4201,8 @@ impl<B: Blocks> Engine<B> {
             self.told_stalled.remove(w);
         }
         self.queue.retain(|q| !(q.committing && c.writes.contains(&(q.client, q.write_id))));
-        let mut out: Vec<Effect> = c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed }).collect();
+        let mut out = withdrawn;
+        out.extend(c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed }));
         self.root = self.published_root;
         self.requeue_from(0);
         out.extend(self.advance());
