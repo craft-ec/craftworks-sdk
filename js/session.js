@@ -491,7 +491,10 @@ export async function openSession(Session, {
     refusedBeforeOpen: () => refusedBeforeOpen,
     /** Which node this session is for, as the page named it. */
     url: () => session.url(),
-    unusable: () => JSON.parse(session.unusable()),
+    /** Every line the SDK said to the app since the last call, and it DRAINS them (sdk#482): a caller that wants a
+     *  history keeps its own list. Lines past the newest 256 between calls are dropped, and the first line says how
+     *  many. */
+    unusable: () => JSON.parse(session.take_unusable()),
     // `engineDb` registers its drain here, so a completed load reaches the
     // reads waiting on it. Without this every read that missed the cache
     // waits for ever — which is why `open()` exists and why a page should

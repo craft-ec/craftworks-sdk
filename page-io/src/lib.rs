@@ -301,7 +301,8 @@ pub struct PageIo {
     stream: u32,
     out: Vec<Vec<u8>>,
     replies: Vec<Vec<u8>>,
-    unusable: Vec<String>,
+    /// The lines said to the app (sdk#482): capped, drained by [`PageIo::take_unusable`], each recorded where said.
+    unusable: page::unusable::Unusable,
     /// Node errors that named no op (sdk#433), counted by reason code ([`wire::Refused::code`]).
     node_errors: BTreeMap<&'static str, u64>,
     /// THE PAGE'S STANDING WITH ITS NODE'S SIGNER (OPENING.md, Machine 1): new, asking, an owner registering /
@@ -410,7 +411,7 @@ impl PageIo {
             stream: 0,
             out: Vec::new(),
             replies: Vec::new(),
-            unusable: Vec::new(),
+            unusable: Default::default(),
             node_errors: BTreeMap::new(),
             opening,
             impossible_cells: 0,
@@ -952,13 +953,13 @@ impl PageIo {
                             let read = page::HeadRead::from_record(meta);
                             self.server.node(Answer::Head { label: Label::Site(app), read }, now)
                         }
-                        None => self.unusable.push(format!("a site state for {app} that is not a web framing")),
+                        None => self.say(page::unusable::Site::of("page-io::said::site-not-web"), format!("a site state for {app} that is not a web framing")),
                     }
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
                     let body = wire::block::block_of_state(&state).map(|(_, b)| b.to_vec()).unwrap_or_default();
                     self.server.node(Answer::Got { id: cid, bytes: body }, now);
                 } else {
-                    self.unusable.push("a GET answer for a contract this page never asked".into());
+                    self.say(page::unusable::Site::of("page-io::said::get-unasked"), "a GET answer for a contract this page never asked".into());
                 }
             }
             // A REFUSAL is not an answer about the contract: only the node's
@@ -1025,7 +1026,7 @@ impl PageIo {
             Incoming::DelegateMissing { key } if key == self.art.signer.to_string() => {
                 self.open(OpenEvent::DelegateMissing("no signer on this node: it answered Missing".into()));
             }
-            Incoming::DelegateMissing { key } => self.unusable.push(format!("the node has no delegate {key}")),
+            Incoming::DelegateMissing { key } => self.say(page::unusable::Site::of("page-io::said::delegate-missing"), format!("the node has no delegate {key}")),
             // The node's delegate BACKOFF after a failure: not an answer to anything; the request it throttled is
             // re-sent on the page's clock. Never a refusal (sdk#439).
             Incoming::DelegateThrottled { .. } => {}
@@ -1120,7 +1121,7 @@ impl PageIo {
                             }
                         }
                         Some((id, answer)) => self.server.node(Answer::Signer { id, answer }, now),
-                        None => self.unusable.push("a delegate message that is not the signer's".into()),
+                        None => self.say(page::unusable::Site::of("page-io::said::delegate-not-signer"), "a delegate message that is not the signer's".into()),
                     }
                 }
             }
@@ -1297,8 +1298,24 @@ impl PageIo {
         &self.node_errors
     }
 
-        pub fn unusable(&self) -> &[String] {
-        &self.unusable
+    /// A look at page-io's own lines said and not yet taken, for TESTS only (the app's one reader is
+    /// [`PageIo::take_unusable`]).
+    #[doc(hidden)]
+    pub fn unusable(&self) -> Vec<String> {
+        self.unusable.peek()
+    }
+
+    /// THE ONE READ of the lines said to the app (sdk#482), draining: page-io's own, then its page's.
+    pub fn take_unusable(&mut self) -> Vec<String> {
+        let mut all = self.unusable.take();
+        all.extend(self.server.page.take_unusable());
+        all
+    }
+
+    /// SAY `line` to the app at `site`: recorded as one `Key::Said` in the page's recording (no text), and kept.
+    fn say(&mut self, site: page::unusable::Site, line: String) {
+        self.server.page.record_said(site);
+        self.unusable.push(line);
     }
 
     /// Ask the signer whether it holds a record for this register, WITHOUT
@@ -1354,7 +1371,7 @@ impl PageIo {
                     // loud, and ended: nothing waits on a frame never sent.
                     Op::Update { .. } | Op::Sign { .. } | Op::PutApp { .. } | Op::Ext(_) => {
                         let why = format!("read-only: a {} is never sent from a view", op_name(&op));
-                        self.unusable.push(why.clone());
+                        self.say(page::unusable::Site::of("page-io::said::read-only-op"), why.clone());
                         not_sent.push((op, why));
                         continue;
                     }
@@ -1461,7 +1478,7 @@ impl PageIo {
             };
             match framed {
                 Ok(f) => self.out.extend(f),
-                Err(e) => self.unusable.push(format!("could not frame an op: {e}")),
+                Err(e) => self.say(page::unusable::Site::of("page-io::said::frame-failed"), format!("could not frame an op: {e}")),
             }
         }
         if !not_held.is_empty() || !not_sent.is_empty() || no_head {
@@ -1808,3 +1825,30 @@ mod site_audit {
     }
 }
 
+
+/// THE LINES SAID TO THE APP ARE BOUNDED with NO reader (sdk#482; the architect): page-io's list, driven through its
+/// own inbound -- 10,000 frames it cannot read, and nothing ever reads the list -- holds the newest
+/// `KEEP` and counts the rest; the one read drains it and says how many were dropped.
+#[cfg(test)]
+mod said_bounded {
+    use super::*;
+
+    #[test]
+    fn ten_thousand_unusable_frames_with_no_reader_stay_bounded() {
+        let (_, signer) = wire::delegate_from_code(b"said signer code");
+        let mut io = PageIo::new(
+            page::server::Server::new(page::Page::unstarted(engine::Params::default(), page::PutPath::Page, Ms(0)), page::server::SignerFacts::default()),
+            Artefacts { block_code: b"said block code".to_vec(), register_code: b"said register code".to_vec(), register_params: wire::register_params(&[1u8; 32], wire::HEAD_NAME), signer },
+        );
+        // Frames the node could send that page-io cannot read (`Incoming::Unusable`): a writer's page owns them.
+        for i in 0..10_000u32 {
+            io.inbound(&[0xff, 0xfe, (i & 0xff) as u8], Ms(1 + u64::from(i)));
+        }
+        let kept = io.unusable().len();
+        println!("10,000 unusable frames: {kept} kept");
+        assert_eq!(kept, page::unusable::KEEP, "page-io's list is not capped at KEEP (or the answers never reached it)");
+        let read = io.take_unusable();
+        assert!(read[0].starts_with(&format!("{} earlier line(s) dropped", 10_000 - page::unusable::KEEP)), "{:?}", read.first());
+        assert!(io.unusable().is_empty(), "the one read did not drain");
+    }
+}
