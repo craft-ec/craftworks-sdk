@@ -414,6 +414,12 @@ impl PageIo {
         }
     }
 
+    /// Start an assets-dashboard pass over this page's tree (KEEPER §5), with THIS PageIo's one fact of whether it can
+    /// ask `Held` ([`PageIo::can_ask_held`]): a plain reader's pass is UNMEASURED at once, with no op at all.
+    pub fn audit(&mut self, repair: page::audit::Repair) {
+        self.server.page.audit(repair, self.can_ask_held());
+    }
+
     /// A READER of somebody's published head (sdk#239): the page reads the
     /// Register `register_id` names and the blocks under it, and can do
     /// nothing else. Published data is readable by default; writing is access
@@ -1754,8 +1760,8 @@ mod site_audit {
     }
 }
 
-/// A READER's page has no signer: its `Held` is not asked and not made up (the architect, dashboard step 2) -- the page
-/// is told `HeldUnasked`, and its audit reports the asset UNMEASURED.
+/// A READER's page has no signer: its `Held` is not asked and not made up (the architect, dashboard step 2) -- and a pass
+/// knows that at its START (KEEPER §5 ¹⁰): UNMEASURED at once, with ZERO ops (no walk GET, no signer request).
 #[cfg(test)]
 mod plain_reader_held {
     use super::*;
@@ -1800,14 +1806,15 @@ mod plain_reader_held {
         assert_eq!(io.server.page.published(), (1, root), "THE SETUP: the reader did not adopt the head");
         let _ = io.take_frames();
         // An audit of that tree: its blocks served as the node serves a GET; any signer request counted.
-        io.server.page.audit();
-        let mut helds = 0;
+        io.audit(page::audit::Repair::Off);
+        let (mut helds, mut gets) = (0, 0);
         for round in 0..50 {
             io.pump();
             for f in io.take_frames() {
                 match bincode::deserialize::<freenet_stdlib::client_api::ClientRequest>(&f) {
                     Ok(freenet_stdlib::client_api::ClientRequest::DelegateOp(_)) => helds += 1,
                     Ok(freenet_stdlib::client_api::ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Get { key, .. })) => {
+                        gets += 1;
                         let id = *key.as_bytes().first_chunk::<32>().expect("32");
                         let cid = self::by_contract_of(&io, &id);
                         let resp = match cid.and_then(|c| blocks.get(&c).map(|b| (c, b))) {
@@ -1825,11 +1832,11 @@ mod plain_reader_held {
             }
         }
         let r = io.server.page.take_audit().expect("the pass did not end");
-        println!("reader audit: {helds} signer frame(s), measured {}, groups {}", r.measured, r.groups);
+        println!("reader audit: {helds} signer frame(s), {gets} GET(s), measured {}, groups {}", r.measured, r.groups);
         assert_eq!(helds, 0, "a reader's page sent a signer request");
+        assert_eq!(gets, 0, "a reader's unmeasured pass still walked the tree (GETs)");
         assert!(!r.measured, "a reader's page reported its asset measured: its Held was made up");
         assert_eq!((r.whole, r.degraded, r.damaged.len()), (0, 0, 0));
-        assert!(r.groups >= 1, "THE SETUP: the audit found no group to ask about");
     }
 
     /// The block a GET's contract id names, as page-io recorded it when framing the GET.

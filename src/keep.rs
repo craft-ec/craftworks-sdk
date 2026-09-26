@@ -14,16 +14,8 @@ pub const VERSION: u8 = 1;
 /// The value's length: version, repair, warn_below, audited_at, four counts.
 pub const LEN: usize = 1 + 1 + 1 + 8 + 4 * 4;
 
-/// What a pass may repair (KEEPER §3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Repair {
-    /// Watch only.
-    Off,
-    /// Keep BACKED_UP: repair anything missing.
-    Always,
-    /// Repair a group once its margin is below N.
-    Below(u8),
-}
+/// What a pass may repair (KEEPER §3): the page acts on it, so `page::audit` owns it -- this is that type.
+pub use page::audit::Repair;
 
 /// A FULL pass's result, as counts (KEEPER §4, §5).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
