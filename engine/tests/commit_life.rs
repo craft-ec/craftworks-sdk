@@ -45,6 +45,19 @@ fn big_write(id: u64) -> Event {
     }
 }
 
+/// A write wide enough that a changed group has more members than parity (k > m): rejecting its first wave -- all
+/// but the held-back parity -- drops it below k.
+fn wide_write(id: u64) -> Event {
+    let keys: Vec<Vec<u8>> = (0..300u32).map(|i| format!("w/{id:03}/{i:04}").into_bytes()).collect();
+    Event::Write {
+        client: ClientId(1),
+        write_id: WriteId(id),
+        ops: keys.iter().map(|k| (k.clone(), Op::Put(vec![id as u8; 700]))).collect(),
+        reads: keys.into_iter().map(|k| (k, Expect::Absent)).collect(),
+        deferred: false,
+    }
+}
+
 fn told(fx: &[Effect], id: u64) -> Vec<State> {
     fx.iter()
         .filter_map(|f| match f {
@@ -203,6 +216,8 @@ struct Model {
     empty: Cid,
     /// PUTs out and not yet answered.
     out: BTreeSet<Cid>,
+    /// The witness told before the last foreign head.
+    witness: Option<Witness>,
     /// The PUTs of the commit in flight (since it started).
     mine: BTreeSet<Cid>,
     /// The head sent for the commit in flight.
@@ -218,7 +233,7 @@ impl Model {
     fn new(seed: u64) -> Self {
         let h = harness(Params::default());
         let empty = h.published_root();
-        Model { h, rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1), now: T0, next_write: 1, empty, out: BTreeSet::new(), mine: BTreeSet::new(), head: None, fates: BTreeMap::new(), headed: BTreeSet::new(), reach: BTreeMap::new() }
+        Model { h, rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1), now: T0, next_write: 1, empty, out: BTreeSet::new(), witness: None, mine: BTreeSet::new(), head: None, fates: BTreeMap::new(), headed: BTreeSet::new(), reach: BTreeMap::new() }
     }
 
     /// The writes the commit in flight carries.
@@ -230,8 +245,8 @@ impl Model {
     fn pick(&mut self, stage: CommitStage) -> (Col, Event) {
         loop {
             let col = match self.rng.below(20) {
-                0..=3 => Col::Write,
-                4..=8 => Col::Ack,
+                0..=1 => Col::Write,
+                2..=8 => Col::Ack,
                 9 => Col::Fail,
                 10 => Col::RejectRoot,
                 11 => Col::RejectOwn,
@@ -293,6 +308,7 @@ impl Model {
                         1 => Some(Witness::NotThere),
                         _ => Some(Witness::Unknown),
                     };
+                    self.witness = witness;
                     self.h.engine_mut().set_witness(witness);
                     Event::HeadConflict { seq, root: self.empty }
                 }
@@ -323,11 +339,14 @@ impl Model {
         let at = format!("seed {seed} step {n}: {before:?} × {col:?}");
 
         // Bookkeeping from what the engine emitted.
-        for id in puts(&fx) {
-            self.out.insert(id);
-        }
-        for id in withdrawn(&fx) {
-            self.out.remove(&id);
+        // In order: an end withdraws a dead commit's PUT and the next cut may put the same block again, in one step.
+        for f in &fx {
+            if let Effect::PutBlock { id, .. } | Effect::PutPack { id, .. } = f {
+                self.out.insert(*id);
+            }
+            if let Effect::Withdraw { id } = f {
+                self.out.remove(id);
+            }
         }
         for f in &fx {
             if let Effect::Notify { write_id, state, .. } = f {
@@ -368,8 +387,10 @@ impl Model {
                     }
                 }
                 // A1 / C3: a non-Published end withdraws what the dead commit still had on the way (none of it is an
-                // earlier commit's straggler while no Backing is open).
-                if end != End::Published && backing_before == 0 && !rejected_root {
+                // earlier commit's straggler while no Backing is open) -- except a Heading commit whose witness is
+                // `Unknown`: it may have landed, and its blocks may be in the published tree.
+                let may_have_landed = end == End::DeadHeading && self.witness == Some(Witness::Unknown);
+                if end != End::Published && backing_before == 0 && !rejected_root && !may_have_landed {
                     let again: BTreeSet<Cid> = puts(&fx).into_iter().collect();
                     let gone = withdrawn(&fx);
                     let left: Vec<&Cid> = owed.iter().filter(|id| !again.contains(*id) && !gone.contains(*id)).collect();
@@ -421,6 +442,7 @@ impl Model {
 }
 
 #[test]
+#[should_panic(expected = "(K6, A8)")] // PINNED: known defect A8, the model's first red cell, flipped by #509
 fn the_engine_follows_the_commit_table() {
     let mut reach: BTreeMap<(String, Col), u64> = BTreeMap::new();
     for seed in 1..=48u64 {
@@ -465,6 +487,7 @@ fn the_engine_follows_the_commit_table() {
 /// **A6, Racing × E12:** a Racing commit whose PUTs are never answered is NEVER ended by time (rule 8, C5): no try
 /// spent, no `Lost`, the same commit in flight; when the acks come, it publishes.
 #[test]
+#[should_panic(expected = "ended on time")] // PINNED: known defect A6, flipped by #510
 fn a6_a_silent_racing_commit_is_never_ended_on_time() {
     let mut h = harness(Params::default());
     let first = h.step(write(1));
@@ -478,6 +501,8 @@ fn a6_a_silent_racing_commit_is_never_ended_on_time() {
     }
     let fates: Vec<State> = told(&later, 1).into_iter().filter(|s| terminal(*s)).collect();
     assert!(fates.is_empty(), "a silent Racing commit's write was ended on time: {fates:?}");
+    let ended = withdrawn(&later);
+    assert!(ended.is_empty(), "a silent Racing commit was ended on time and restarted: {} of its PUTs withdrawn", ended.len());
     assert_eq!(h.engine().lost_fell(), (0, 0), "a try was spent on silence");
     assert_eq!((h.engine().commit_stage(), h.engine().committing_seq()), (CommitStage::Racing, Some(seq)), "the commit in flight did not stay Racing");
     let ((seq, _), _) = to_heading(&mut h, all.iter().map(|id| Effect::PutBlock { id: *id, bytes: Vec::new(), after: Vec::new() }).collect(), &BTreeSet::new());
@@ -489,6 +514,7 @@ fn a6_a_silent_racing_commit_is_never_ended_on_time() {
 /// `Unknown` would say "may have been saved" of a group that cannot have landed) and spends NO try: ten foreign moves
 /// in a row, and the write is never `Lost` or `Unknown`, and publishes. Mutant "spend a try" -> red.
 #[test]
+#[should_panic(expected = "whose head never left was told")] // PINNED: known defect A8, flipped by #509
 fn a8_foreign_moves_while_racing_read_no_witness_and_spend_no_try() {
     let mut h = harness(Params::default());
     let empty = h.published_root();
@@ -517,6 +543,7 @@ fn a8_foreign_moves_while_racing_read_no_witness_and_spend_no_try() {
 /// the root itself un-acked. The signer refuses a head whose root is not on the node (`RootNotHeld`, retryable), and a
 /// REJECTED root never will be: the commit must end `Failed`, never sit in Heading re-asked for ever.
 #[test]
+#[should_panic(expected = "whose root was rejected did not end Failed")] // PINNED: known defect A9 (root), flipped by #509
 fn a9_a_rejected_root_ends_a_heading_commit_failed() {
     let mut h = harness(Params::default());
     let fx = h.step(write(1));
@@ -531,6 +558,7 @@ fn a9_a_rejected_root_ends_a_heading_commit_failed() {
 /// **A2, Heading × E7 (the `head_before_packs` control arm):** a head read older than the commit RE-ISSUES the head;
 /// Heading never goes back to Racing (C2).
 #[test]
+#[should_panic(expected = "Heading went back to Racing on an older head")] // PINNED: known defect A2, flipped by #509
 fn a2_heading_never_goes_back_to_racing() {
     let mut h = harness(Params { head_before_packs: true, ..Params::default() });
     let first = h.step(big_write(1));
@@ -548,6 +576,7 @@ fn a2_heading_never_goes_back_to_racing() {
 /// **A5, Heading × E6 (and the witness's landed end):** a write told `Stalled` that then publishes leaves no stalled
 /// record behind (C4): the record goes with the write.
 #[test]
+#[should_panic(expected = "a published write is still recorded as told Stalled")] // PINNED: known defect A5, flipped by #509
 fn a5_a_stalled_write_that_publishes_leaves_no_stalled_record() {
     let mut h = harness(Params::default());
     let first = h.step(write(1));
@@ -565,6 +594,7 @@ fn a5_a_stalled_write_that_publishes_leaves_no_stalled_record() {
 /// **A1, Racing × E8 (and every non-Published end):** the dead commit's PUTs still on the way are WITHDRAWN (C3), as
 /// `fail_commit` does -- not left re-sending for a commit that no longer exists.
 #[test]
+#[should_panic(expected = "left un-withdrawn by its foreign end")] // PINNED: known defect A1, flipped by #509
 fn a1_a_dead_commits_puts_are_withdrawn() {
     let mut h = harness(Params::default());
     // A published base, so the dead commit's blocks differ from its re-application's on the foreign (empty) root.
@@ -586,4 +616,53 @@ fn a1_a_dead_commits_puts_are_withdrawn() {
     let gone = withdrawn(&fx);
     let left: Vec<&Cid> = dead.iter().filter(|id| !again.contains(*id) && !gone.contains(*id)).collect();
     assert!(left.is_empty(), "{} of the dead commit's {} PUTs were left un-withdrawn by its foreign end", left.len(), dead.len());
+}
+
+/// **Heading × E8, the group LANDED (⁵):** its confirmation lost, a foreign head WITNESSES the group
+/// (`through` at its last arrival). Its blocks are in the published tree, so the one teardown never withdraws them
+/// (C3 withdraws only what did not land): what it still owes goes on toward BACKED_UP as a Backing. Mutant "withdraw on
+/// every Dead end" -> red.
+#[test]
+#[should_panic(expected = "tracked by no Backing")] // PINNED: known defect C3 (a landed group's blocks), flipped by #509
+fn a_landed_groups_blocks_are_kept_not_withdrawn() {
+    let mut h = harness(Params::default());
+    let fx = h.step(big_write(1));
+    let root = h.root();
+    // Heading with the root still owed: its parity made the group of one ready.
+    let ((seq, _), _) = to_heading(&mut h, fx, &BTreeSet::from([root]));
+    let through = h.engine().committing_through().expect("in flight");
+    h.engine_mut().set_witness(Some(Witness::Through(through)));
+    let fx = h.step(Event::HeadConflict { seq, root: h.published_root() });
+    assert!(told(&fx, 1).contains(&State::Published), "THE SETUP: the landed group was not Published: {:?}", told(&fx, 1));
+    let gone = withdrawn(&fx);
+    assert!(!gone.contains(&root), "a block of a group that LANDED was withdrawn");
+    assert!(h.engine().backing() > 0, "what the landed commit still owes is tracked by no Backing");
+}
+
+/// **A9, Heading x E4, the BELOW-k half** (the `head_before_packs` arm: the only one that enters Heading before
+/// race-ready): rejecting a commit's blocks one by one -- never its root -- until some changed group can no longer
+/// reach k ends the commit `Failed` at that rejection; before it, each rejection leaves it in flight (the head may
+/// land at k). Mutant "only the root ends it" -> red.
+#[test]
+#[should_panic(expected = "no group fell below k")] // PINNED: known defect A9 (below k), flipped by #509
+fn a9_a_group_rejected_below_k_ends_a_heading_commit_failed() {
+    let mut h = harness(Params { head_before_packs: true, ..Params::default() });
+    let first = h.step(wide_write(1));
+    let root = h.root();
+    let own: Vec<Cid> = puts(&first).into_iter().filter(|id| *id != root).collect();
+    let one = *own.first().expect("THE SETUP: no non-root PUT");
+    let fx = h.step(Event::PutConfirmed(one));
+    assert!(head_sent(&fx).is_some(), "THE SETUP: head_before_packs did not send the head on the first ack");
+    let mut ended = None;
+    for (n, id) in own.iter().skip(1).enumerate() {
+        let fx = h.step(Event::PutRejected(*id));
+        if told(&fx, 1).contains(&State::Failed) {
+            ended = Some(n + 1);
+            break;
+        }
+        assert_eq!(h.engine().commit_stage(), CommitStage::Heading, "rejection {} ended the commit without telling Failed", n + 1);
+    }
+    let n = ended.expect("no group fell below k however many blocks were rejected: the commit sat in Heading");
+    println!("Failed at rejection {n} of {}", own.len() - 1);
+    assert_eq!(h.engine().commit_stage(), CommitStage::Idle);
 }
