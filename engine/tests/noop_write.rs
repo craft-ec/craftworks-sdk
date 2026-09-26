@@ -49,7 +49,7 @@ fn settle(h: &mut Harness, mut fx: Vec<Effect>) -> Vec<Effect> {
                     next.extend(h.step(Event::PutConfirmed(*id)))
                 }
                 Effect::UpdateHead { seq, .. } => next.extend(h.step(Event::HeadConfirmed(*seq))),
-                _ => {}
+                other => common::no_answer_owed(other),
             }
         }
         if next.is_empty() {

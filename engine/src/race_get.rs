@@ -48,7 +48,8 @@ impl<B: Blocks> Engine<B> {
             return Vec::new();
         }
         let mut out = vec![Effect::Keep { id, bytes: body.to_vec() }];
-        if self.reads.waiting.contains_key(&id) {
+        // PUT back for whoever needed it: a read, or a parked write (sdk#405) -- the network is whole again.
+        if self.reads.waiting.contains_key(&id) || self.parked_write.as_ref().is_some_and(|p| p.needs.contains(&id)) {
             out.push(Effect::PutRepaired { id, bytes: body.to_vec() });
         }
         out

@@ -4625,6 +4625,10 @@ impl<B: Blocks> Engine<B> {
             if p.needs.contains(&id) {
                 out.extend(self.park_write(p.client, p.write_id, p.needs.into_iter().collect()));
                 out.extend(self.after_park(p.client, p.write_id));
+                // RULE 11 FOR A WRITE (sdk#405; rule 4, one read path): the group is an alternative source here as
+                // for a read -- a write never waits on a straggler its group can rebuild. The rebuilt block lands
+                // like an arrival, and the write resumes on it (`resume_parked_write`).
+                out.extend(self.repair_for_write(id));
             }
         }
         // ...and the read path still gets the miss: one block can be the one a
@@ -4632,6 +4636,16 @@ impl<B: Blocks> Engine<B> {
         // that read waiting on an attempt that already came back.
         out.extend(self.on_missed_read(id));
         out
+    }
+
+    /// Start rebuilding `id`, a block a parked WRITE needs, from its group under the tree the write lands on (the
+    /// warm root, else the published one) -- the same repair a read starts on a NotFound.
+    fn repair_for_write(&mut self, id: Cid) -> Vec<Effect> {
+        if !self.params.repair_reads || self.repairs.contains_key(&id) {
+            return Vec::new();
+        }
+        let group = [self.root, self.published_root].into_iter().find_map(|root| self.group_for(root, id));
+        group.map(|g| self.start_repair(g, true)).unwrap_or_default()
     }
 
     fn on_missed_read(&mut self, id: Cid) -> Vec<Effect> {
@@ -4741,6 +4755,13 @@ impl<B: Blocks> Engine<B> {
         let for_: Vec<Cid> = self.repair_slots.get(&slot).map(|s| s.iter().copied().collect()).unwrap_or_default();
         let mut still_asked = false;
         for missing in for_ {
+            // A repair nobody wants any more ENDS here, rather than asking its group for ever: a write that started
+            // it (sdk#405) applied or was refused, and nothing else waits on the block.
+            let wanted = self.reads.waiting.contains_key(&missing) || self.parked_write.as_ref().is_some_and(|p| p.needs.contains(&missing));
+            if !wanted && self.repairs.contains_key(&missing) {
+                self.end_repair(missing);
+                continue;
+            }
             let Some(r) = self.repairs.get_mut(&missing) else { continue };
             let Some(i) = r.group.slots.iter().position(|s| *s == slot) else { continue };
             match bytes {

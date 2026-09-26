@@ -1048,7 +1048,7 @@ fn a_delta_across_a_vanished_root_asks_for_a_reload_and_a_get_still_does_not() {
                 continue;
             }
             Effect::Reply { result, .. } => answer = Some(result.clone()),
-            _ => {}
+            other => common::no_answer_owed(other),
         }
         i += 1;
     }

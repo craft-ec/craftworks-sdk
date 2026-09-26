@@ -157,7 +157,7 @@ fn cold_reads_answer_what_a_fully_held_tree_answers() {
                 Effect::Reply { req_id, result, .. } => {
                     answered.insert(req_id, result);
                 }
-                _ => {}
+                other => common::no_answer_owed(&other),
             }
             if r().is_multiple_of(9) {
                 // A block nobody asked for.
@@ -263,7 +263,7 @@ fn settle(
                 queue.extend(stepped!(e, ev));
             }
             Effect::Reply { req_id, result, .. } => out.push((req_id, result)),
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     out
@@ -987,7 +987,7 @@ fn no_read_sequence_panics_and_every_read_answers() {
                 Effect::Reply { req_id, .. } => {
                     outstanding.remove(&req_id);
                 }
-                _ => {}
+                other => common::no_answer_owed(&other),
             }
         }
         assert!(
@@ -1132,7 +1132,7 @@ fn forgetful(records_in_tree: u32, evict_root: bool) {
                             other => panic!("a Get was answered with {other:?}"),
                         }
                     }
-                    _ => {}
+                    other => common::no_answer_owed(&other),
                 }
             }
             if !replied {
@@ -1353,7 +1353,7 @@ fn a_read_whose_block_keeps_missing_waits_then_answers_and_leaves_no_attempts_be
                 queue.extend(stepped!(e, Event::BlockArrived { id, bytes }));
             }
             Effect::Reply { req_id: ReqId(1), .. } => answered = true,
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     assert!(answered, "the block came back and the read never answered");
@@ -1385,7 +1385,7 @@ fn settle_by_request(e: &mut Engine<Store>, store: &Store, all: &MemBlocks, firs
             Effect::Reply { req_id, result, .. } => {
                 answered.insert(req_id, result);
             }
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     answered

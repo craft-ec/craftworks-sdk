@@ -159,7 +159,9 @@ fn a_write_onto_a_cold_path_is_parked_and_then_applies() {
 ///
 /// The bound is on ROUNDS, not on misses: this drives it with misses, and the
 /// sibling assertion is that nothing was applied — `Failed` is only honest
-/// when the edit really is not in the tree.
+/// when the edit really is not in the tree. Repair is OFF here so every fetch
+/// is the write's own round (sdk#405: with it on, a miss also asks the lost
+/// block's group, which is not a round -- that case is the next test).
 #[test]
 fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
     // Two different bounds. One run stopping at its bound could be a
@@ -168,6 +170,7 @@ fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
     for rounds_allowed in [8u32, 3] {
         let params = Params {
             max_apply_rounds: rounds_allowed,
+            repair_reads: false,
             ..Params::default()
         };
         let (_, root, all) = fixture(400);
@@ -215,6 +218,36 @@ fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
         );
         println!("  bound {rounds_allowed}: refused after {asked} rounds, tree unchanged");
     }
+}
+
+/// The same, with REPAIR ON (sdk#405): a miss also asks the lost block's group, whose members never arrive either.
+/// The write is still refused exactly once and changes nothing -- the repair is an alternative source, never a
+/// way round the round bound.
+#[test]
+fn with_repair_on_a_write_whose_blocks_never_arrive_is_still_refused_once() {
+    let params = Params { max_apply_rounds: 3, ..Params::default() };
+    assert!(params.repair_reads, "THE SETUP: repair is off by default");
+    let (_, root, all) = fixture(400);
+    let cold = Store::fresh();
+    cold.put(root, all.get(&root).expect("the root"));
+    let mut h = started(params, cold, root);
+    let before = h.root();
+    // FIFO, as a paced page answers: every ask takes its turn, so the group's re-asks never starve the write's own.
+    let mut queue: std::collections::VecDeque<Cid> = fetches(&h.step(write_one("k/00100", b"never"))).into_iter().collect();
+    let mut failed = 0usize;
+    let mut steps = 0;
+    while let Some(id) = queue.pop_front() {
+        steps += 1;
+        assert!(steps < 10_000, "the write never ended");
+        let out = h.step(Event::BlockMissed(id));
+        failed += states(&out).iter().filter(|s| **s == State::Failed).count();
+        queue.extend(fetches(&out));
+    }
+    assert_eq!(failed, 1, "a write that could never apply was reported Failed {failed} times");
+    assert_eq!(h.root(), before, "the write was reported Failed and changed the tree anyway");
+    let (started, _, _) = h.repair_counts();
+    println!("  repair on: refused once after {steps} misses; repairs started {started}");
+    assert!(started > 0, "no repair was started: the case is the previous test's");
 }
 
 /// A second write while one is parked WAITS ITS TURN (R-b; COMMIT-LIFE

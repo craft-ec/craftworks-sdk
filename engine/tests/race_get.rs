@@ -160,7 +160,7 @@ fn read_cold_as(
                 Effect::Reply { req_id, result, .. } if round.contains(&(req_id.0 as usize)) => {
                     answers.insert(keys[req_id.0 as usize].clone(), result);
                 }
-                _ => {}
+                other => common::no_answer_owed(&other),
             }
         }
     }
@@ -292,7 +292,7 @@ fn a_block_raced_and_read_in_different_steps_is_asked_once() {
                 }
                 Effect::Keep { id, bytes } => store.put(id, &bytes),
                 Effect::Reply { .. } => *answered += 1,
-                _ => {}
+                other => common::no_answer_owed(&other),
             }
         }
         asked.clone()
@@ -375,7 +375,7 @@ fn a_race_whose_block_is_missed_asks_its_dropped_slots_again() {
                 store.put(id, &bytes);
                 queue.extend(e.step(Event::BlockArrived { id, bytes }));
             }
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     assert!(held.contains(&p) && held.contains(&a), "the race did not ask the group");

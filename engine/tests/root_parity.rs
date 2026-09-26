@@ -194,7 +194,7 @@ fn read_with_silent_root(mark: Option<Vec<Cid>>) -> (Option<ReadResult>, BTreeMa
             }
             Effect::Keep { id, bytes } => e.blocks().put(id, &bytes),
             Effect::Reply { req_id: ReqId(7), result, .. } => answer = Some(result),
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     // Row 100's value, as `first_commit` wrote it.
