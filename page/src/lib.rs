@@ -2095,7 +2095,7 @@ impl Page {
                 let root = a.root;
                 let rejected = self.engine.rejected_blocks();
                 if nodes.iter().any(|n| n.id == root) {
-                    if let Some(parity) = self.blocks.get(&root).and_then(engine::repair::root_parity) {
+                    if let Some(parity) = self.engine.blocks().get(&root).and_then(engine::repair::root_parity) {
                         a.add_group(vec![root], parity.into_iter().map(|(id, _)| id).collect(), rejected);
                     }
                 }
@@ -3449,7 +3449,7 @@ mod audit_held {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let _ = p.take_ops();
         let x = [7u8; 32];
-        p.blocks.insert(x, b"bytes the page holds");
+        p.engine.blocks_mut().insert(x, b"bytes the page holds");
         let mut a = audit::Audit::new(p.published().1);
         a.walked = true;
         a.add_group(vec![x], Vec::new(), &BTreeSet::new());
