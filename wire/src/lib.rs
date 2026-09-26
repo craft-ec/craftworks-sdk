@@ -623,13 +623,19 @@ fn frames(req: &ClientRequest<'static>, stream_id: u32) -> Result<Vec<Vec<u8>>, 
 
 /// The node's `ContractError`, if the bytes are one: the one decode both
 /// refusals below read.
-fn contract_error(bytes: &[u8]) -> Option<freenet_stdlib::client_api::ContractError> {
-    use freenet_stdlib::client_api::{ClientError, ErrorKind, RequestError};
+/// The node's error, if the bytes are one: what it says, by kind.
+fn node_error(bytes: &[u8]) -> Option<freenet_stdlib::client_api::ErrorKind> {
+    use freenet_stdlib::client_api::ClientError;
     let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
         return None;
     };
-    match e.kind() {
-        ErrorKind::RequestError(RequestError::ContractError(c)) => Some(c.clone()),
+    Some(e.kind().clone())
+}
+
+fn contract_error(bytes: &[u8]) -> Option<freenet_stdlib::client_api::ContractError> {
+    use freenet_stdlib::client_api::{ErrorKind, RequestError};
+    match node_error(bytes)? {
+        ErrorKind::RequestError(RequestError::ContractError(c)) => Some(c),
         _ => None,
     }
 }
@@ -651,12 +657,9 @@ fn get_refused(bytes: &[u8]) -> Option<([u8; 32], String)> {
 /// the bytes are a PUT refusal.
 /// The node's delegate error, if the bytes are one.
 fn delegate_error(bytes: &[u8]) -> Option<freenet_stdlib::client_api::DelegateError> {
-    use freenet_stdlib::client_api::{ClientError, ErrorKind, RequestError};
-    let Ok(Err(e)) = bincode::deserialize::<Result<HostResponse, ClientError>>(bytes) else {
-        return None;
-    };
-    match e.kind() {
-        ErrorKind::RequestError(RequestError::DelegateError(d)) => Some(d.clone()),
+    use freenet_stdlib::client_api::{ErrorKind, RequestError};
+    match node_error(bytes)? {
+        ErrorKind::RequestError(RequestError::DelegateError(d)) => Some(d),
         _ => None,
     }
 }
