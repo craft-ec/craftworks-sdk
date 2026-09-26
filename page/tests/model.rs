@@ -1251,6 +1251,24 @@ fn a_landing_whose_update_is_lost_twice_still_lands() {
     assert!(most >= 4, "no seed lost the landing's UPDATE three times: the harshest case was not reached");
 }
 
+/// TWO LIVE PAGES UNDER HEAVY UPDATE LOSS (UPDATEs lost three times as often, at random): every write still
+/// publishes, with every invariant the run checks. Its landing count is PRINTED, not floored: a landing here was
+/// schedule luck (the LAND cell is owned by `a_landing_whose_update_is_lost_twice_still_lands`, by construction),
+/// but a drop to zero stays visible in the output.
+#[test]
+fn two_live_pages_under_heavy_update_loss_publish_every_write() {
+    let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
+    let (min, _) = seed_range(1, 2);
+    let (mut landings, mut most) = (0, 0);
+    for seed in 1..=min {
+        let s = run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write published");
+        landings += s.landings;
+        most = most.max(s.most_landing_updates);
+    }
+    println!("harsh, two live pages: {min} seeds, every write published; {landings} landings (information, not a floor), most UPDATEs one needed: {most}");
+}
+
 /// The stale-page landing on the model's params, B's landing UPDATE lost `lose` times: (B's landings, the most
 /// UPDATEs one needed).
 fn a_stale_page_lands_losing(lose: u32) -> (u32, u32) {
