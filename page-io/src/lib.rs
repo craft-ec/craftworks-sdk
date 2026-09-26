@@ -228,6 +228,12 @@ pub enum AddressRefused {
     NotASiteLink,
 }
 
+/// A site id as TEXT (base58, as the node serves it at `/v1/contract/web/<text>/`): the inverse of
+/// [`site_id_of_address`], so the text form of a site id has one owner in both directions (sdk#472 names targets by it).
+pub fn site_text(id: &[u8; 32]) -> String {
+    freenet_stdlib::prelude::ContractInstanceId::new(*id).encode()
+}
+
 /// A bare link: exactly the 32-byte id that encodes back to it.
 fn site_id_of_link(link: &str) -> Option<[u8; 32]> {
     if link.is_empty() {

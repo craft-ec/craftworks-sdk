@@ -1,7 +1,7 @@
 //! WHICH SITE A PATH OR AN ADDRESS NAMES (sdk#399 step 4's loader handover; sdk#472's keepSet): exactly the 32-byte
 //! id of `/v1/contract/web/<link>/`, a bare `<link>`, or a node URL around it -- or a refusal by name. The controls are
 //! the forms a lenient decode turns into a well-formed WRONG id.
-use page_io::{site_id_of_address, site_id_of_path, AddressRefused as R};
+use page_io::{site_id_of_address, site_id_of_path, site_text, AddressRefused as R};
 
 fn link(id: [u8; 32]) -> String {
     freenet_stdlib::prelude::ContractInstanceId::new(id).encode()
@@ -61,5 +61,15 @@ fn anything_else_is_refused_by_name() {
         ("/index.html".to_string(), R::NotASitePath),
     ] {
         assert_eq!(site_id_of_address(&addr), Err(why), "{addr:?}");
+    }
+}
+
+#[test]
+fn site_text_is_the_parsers_inverse() {
+    for id in [[0u8; 32], [9u8; 32], [255u8; 32]] {
+        let text = site_text(&id);
+        assert_eq!(text, link(id), "not the node's own encoding");
+        assert_eq!(site_id_of_address(&text), Ok(id), "{text} does not parse back");
+        assert_eq!(site_id_of_path(&format!("/v1/contract/web/{text}/")), Some(id));
     }
 }
