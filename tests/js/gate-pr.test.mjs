@@ -15,16 +15,60 @@ const t = async (name, fn) => {
 };
 const root = new URL("../../", import.meta.url).pathname;
 const gate = (cwd, args, env = {}) => spawnSync("./gate.sh", args, { cwd, encoding: "utf8", env: { ...process.env, ...env } });
+// THE PLAN'S INPUT IS `GATE_PR_CHANGED` ALONE (sdk#461): a `--pr --dry-run` plan must not depend on the machine it runs
+// on. The one other thing a dry run reads is the disk guard, and a gate run near the floor (engineer3's, 26 GiB
+// against 25 before build.sh wrote more) had this suite's child gate refuse the disk and fail "ENGINE only", and npm's
+// chain lost 42 tests behind it. So the plan tests pass a guard that always admits: the disk decides whether a gate
+// may BUILD, never what a plan says. (The guard's own behaviour is disk-guard.test.mjs's.)
+const ADMIT_DIR = mkdtempSync(join(tmpdir(), "gate-pr-admit-"));
+const ADMIT = join(ADMIT_DIR, "admit.sh");
+writeFileSync(ADMIT, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+const plan = (cwd, changed, env = {}) => gate(cwd, ["--pr", "--dry-run"], { DISK_GUARD: ADMIT, GATE_PR_CHANGED: changed, ...env });
 const planLine = (out, what) => (out.split("\n").find(l => l.startsWith(`gate --pr: ${what}:`)) ?? "").split(": ").slice(2).join(": ").trim();
 
 await t("**a change to ENGINE tests ENGINE only** (the owner: dependents run at the batch gate), and no npm", async () => {
-  const r = gate(root, ["--pr", "--dry-run"], { GATE_PR_CHANGED: "engine/src/lib.rs" });
+  const r = plan(root, "engine/src/lib.rs");
   assert.equal(r.status, 0, r.stderr);
   assert.equal(planLine(r.stdout, "members tested (changed only; dependents run at the batch gate)"), "engine");
   assert.equal(planLine(r.stdout, "npm"), "false", "no JS changed, so no npm");
-  const two = gate(root, ["--pr", "--dry-run"], { GATE_PR_CHANGED: "page-io/src/lib.rs page/src/lib.rs" });
+  const two = plan(root, "page-io/src/lib.rs page/src/lib.rs");
   assert.equal(planLine(two.stdout, "members tested (changed only; dependents run at the batch gate)"), "page page-io",
     "page-io/x was taken for page's, or a member was missed");
+});
+
+await t("**THE PLAN IS A PURE FUNCTION OF GATE_PR_CHANGED** (sdk#461): a tree with a stray untracked file and modified files plans exactly what a clean one does; the disk is not its input either", async () => {
+  // A killed earlier run leaves its scratch worktree registered: drop the stale entries first.
+  execFileSync("git", ["-C", root, "worktree", "prune"], { stdio: "ignore" });
+  const scratch = mkdtempSync(join(tmpdir(), "gate-pr-dirty-"));
+  const wt = join(scratch, "wt");
+  execFileSync("git", ["-C", root, "worktree", "add", "--detach", wt, "HEAD"], { stdio: "ignore" });
+  try {
+    // The gate AS IT IS in this tree (a PR runs the gate on its own branch, committed or not).
+    for (const f of ["gate.sh", "tools/pr-scope.mjs"]) writeFileSync(join(wt, f), readFileSync(join(root, f)));
+    const clean = plan(wt, "engine/src/lib.rs");
+    assert.equal(clean.status, 0, `THE CONTROL: the clean tree failed:\n${clean.stderr}`);
+    // Dirt a git-status reader WOULD see: an untracked file in page/, a modified file in JS (npm), in page-io.
+    writeFileSync(join(wt, "page/src/stray.rs"), "// not committed\n");
+    writeFileSync(join(wt, "js/served.js"), `${readFileSync(join(wt, "js/served.js"), "utf8")}\n// modified\n`);
+    writeFileSync(join(wt, "page-io/src/lib.rs"), `${readFileSync(join(wt, "page-io/src/lib.rs"), "utf8")}\n// modified\n`);
+    const st = execFileSync("git", ["-C", wt, "status", "--porcelain"], { encoding: "utf8" });
+    assert.ok(st.includes("page/src/stray.rs") && st.includes("js/served.js"), `THE CONTROL: the tree is not dirty:\n${st}`);
+    const dirty = plan(wt, "engine/src/lib.rs");
+    assert.equal(dirty.status, 0, `the dirty tree's plan failed:\n${dirty.stderr}`);
+    for (const what of ["changed members", "members tested (changed only; dependents run at the batch gate)", "npm"]) {
+      assert.equal(planLine(dirty.stdout, what), planLine(clean.stdout, what), `\`${what}\` read the working tree`);
+    }
+    assert.equal(planLine(dirty.stdout, "npm"), "false", "a modified JS file outside GATE_PR_CHANGED ran npm");
+    // The disk: a guard that REFUSES stops an unstubbed dry run (so the guard is really consulted, and ADMIT is what
+    // keeps the plan tests off the disk), and never changes a plan that runs.
+    const refuse = join(scratch, "refuse.sh");
+    writeFileSync(refuse, "#!/bin/sh\necho 'disk-guard: under the floor' >&2\nexit 1\n", { mode: 0o755 });
+    const atFloor = gate(wt, ["--pr", "--dry-run"], { DISK_GUARD: refuse, GATE_PR_CHANGED: "engine/src/lib.rs" });
+    assert.notEqual(atFloor.status, 0, "THE CONTROL: a refusing guard did not stop the gate: ADMIT isolates nothing");
+  } finally {
+    execFileSync("git", ["-C", root, "worktree", "remove", "--force", wt], { stdio: "ignore" });
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
 
 await t("**a SLOW test is batch-only: --pr skips it BY NAME and says so; the batch gate runs it with the full model seeds**", async () => {
@@ -35,7 +79,7 @@ await t("**a SLOW test is batch-only: --pr skips it BY NAME and says so; the bat
   assert.ok(page.args.includes("--lib") && page.args.includes("race_get"), `page's other tests were dropped: ${page.args}`);
   assert.equal(page.doc, true, "page's doc-tests would not be counted");
   assert.deepEqual(testArgs(meta, "engine", ["model"]), { args: null, doc: false }, "nothing to skip in engine, yet flags");
-  const pr = gate(root, ["--pr", "--dry-run"], { GATE_PR_CHANGED: "page/src/lib.rs" });
+  const pr = plan(root, "page/src/lib.rs");
   assert.equal(planLine(pr.stdout, "batch-only (skipped here, run by the batch gate)"), "page@model");
   const batch = gate(root, ["--dry-run"], { CRAFTWORKS_MODEL_SEEDS: "" });
   assert.match(batch.stdout, /gate: model seeds 40 \(CRAFTWORKS_MODEL_SEEDS\)/, "the batch gate does not state the full seed count");
@@ -43,14 +87,14 @@ await t("**a SLOW test is batch-only: --pr skips it BY NAME and says so; the bat
 });
 
 await t("**EVERY control is in the plan whatever the PR touches; a README-only PR tests no member and runs no npm**", async () => {
-  const r = gate(root, ["--pr", "--dry-run"], { GATE_PR_CHANGED: "README.md" });
+  const r = plan(root, "README.md");
   const gateSrc = readFileSync(join(root, "gate.sh"), "utf8");
   const listed = [...gateSrc.matchAll(/^ {2}"([a-z0-9_-]+)\|/gm)].map(m => m[1]);
   assert.ok(listed.length >= 7, `the CONTROLS list read nothing: ${listed}`);
   assert.deepEqual(planLine(r.stdout, "controls").split(" "), listed);
   assert.equal(planLine(r.stdout, "members tested (changed only; dependents run at the batch gate)"), "(none)");
   assert.equal(planLine(r.stdout, "npm"), "false");
-  const js = gate(root, ["--pr", "--dry-run"], { GATE_PR_CHANGED: "js/session.js" });
+  const js = plan(root, "js/session.js");
   assert.equal(planLine(js.stdout, "npm"), "true", "a JS change did not run npm");
 });
 
@@ -120,5 +164,6 @@ await t("**GATE_OWNERS_PER_PR is read once and UNSET before the gate starts anyt
   assert.ok(uses >= 3, `the scan found ${uses} mentions: it read nothing`);
 });
 
+rmSync(ADMIT_DIR, { recursive: true, force: true });
 if (failures) { process.stdout.write(`gate-pr: ${failures} FAILED\n`); process.exit(1); }
 process.stdout.write("gate-pr: all ok\n");
