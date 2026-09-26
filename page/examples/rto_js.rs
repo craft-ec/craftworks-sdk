@@ -47,4 +47,11 @@ fn main() {
     println!("// NODE_WEB_BOUND_MS and leaves its GET running; one node GET against silent peers runs at most NODE_GET_BOUND_MS (B).");
     println!("export const NODE_WEB_BOUND_MS = {};", page::rto::NODE_WEB_BOUND_MS);
     println!("export const NODE_GET_BOUND_MS = {};", page::rto::NODE_GET_BOUND_MS);
+    // served() re-asks a source whose answer took the web bound (the node's GET is still fetching) on its own
+    // schedule, not the RTO's (sdk#447, main's re-rule).
+    println!("// A non-200 that took STILL_FETCHING_AFTER_MS or more means the node is still fetching; served() re-asks such a");
+    println!("// source STILL_FETCHING_REASK_MS[n] after its n-th such answer, the last repeating (sdk#447).");
+    println!("export const STILL_FETCHING_AFTER_MS = {};", page::rto::STILL_FETCHING_AFTER_MS);
+    let reask: Vec<String> = page::rto::still_fetching_reask_ms().iter().map(|ms| format!("{ms}")).collect();
+    println!("export const STILL_FETCHING_REASK_MS = Object.freeze([{}]);", reask.join(", "));
 }

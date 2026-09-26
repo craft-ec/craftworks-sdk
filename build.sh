@@ -53,6 +53,7 @@ cargo run -q -p page --example rto_js > js/rto.js.tmp
 grep -q '^export const RTO_SCHEDULE_MS = ' js/rto.js.tmp || { echo "the rto_js example wrote no schedule" >&2; exit 1; }
 grep -q '^export const WINDOW_AFTER_ANSWERS = ' js/rto.js.tmp || { echo "the rto_js example wrote no window" >&2; exit 1; }
 grep -q '^export const NODE_GET_BOUND_MS = ' js/rto.js.tmp || { echo "the rto_js example wrote no node bounds" >&2; exit 1; }
+grep -q '^export const STILL_FETCHING_REASK_MS = ' js/rto.js.tmp || { echo "the rto_js example wrote no still-fetching schedule" >&2; exit 1; }
 mv js/rto.js.tmp js/rto.js
 # THE LOADER'S RECORDING VOCABULARY (sdk#386's instrument work): the codes the loader records in, generated from
 # their one owner (page/src/loader.rs's closed lists and craftworks-instrument's tables). The page validates every
