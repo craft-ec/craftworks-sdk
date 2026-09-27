@@ -1355,10 +1355,24 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         self.read(&schema, &loc, &k, &bytes).map(CreateAt::Created)
     }
 
-    /// Is `domain` marked live ([`Db::mark_published`])? Reads only.
-    pub fn is_published(&mut self, app: Option<&str>, domain: &str) -> Result<bool> {
+    /// `domain`'s marker ([`Db::mark_published`]) as a RECORD with its write state -- `None` when unmarked. What a
+    /// caller that must know the marker is SAVED reads (builder#88: a publish is not done over a marker still in
+    /// flight): [`Db::is_published`] says only that one EXISTS, pending included. Reads only.
+    pub fn published_state(&mut self, app: Option<&str>, domain: &str) -> Result<Option<Record>> {
+        crate::app::check_name(domain)?;
         let name = system_name(app, SystemDomain::Published);
-        Ok(self.get_key(&record_key(&name, Loc::bare(published_slot(domain))))?.is_some())
+        let loc = Loc::bare(published_slot(domain));
+        let k = record_key(&name, loc);
+        match self.get_key(&k)? {
+            Some(held) => self.read(&published_schema(), &loc, &k, &held).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Is `domain` marked live ([`Db::mark_published`])? Its marker EXISTS -- pending included (for "saved", read
+    /// [`Db::published_state`]). Reads only.
+    pub fn is_published(&mut self, app: Option<&str>, domain: &str) -> Result<bool> {
+        Ok(self.published_state(app, domain)?.is_some())
     }
 }
 

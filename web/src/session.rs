@@ -1096,6 +1096,13 @@ impl Session {
         json_of(self.decided(r)?)
     }
 
+    /// `domain`'s marker as its record, WITH its write state (`null` when unmarked): whether it is SAVED. Reads only.
+    pub fn published_state(&mut self, domain: &str) -> Result<String, JsValue> {
+        let app = self.door_app()?;
+        let r = self.db.published_state(Some(&app), domain);
+        json_of(self.decided(r)?)
+    }
+
     /// Is `domain` marked live? Reads only.
     pub fn is_published(&mut self, domain: &str) -> Result<bool, JsValue> {
         let app = self.door_app()?;

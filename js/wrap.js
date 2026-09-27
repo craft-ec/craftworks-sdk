@@ -70,6 +70,7 @@ export function wrap(raw) {
     async definition(which, app) { return JSON.parse(this.#db.definition(which, app ?? undefined)); }
     async markPublished(domain) { return JSON.parse(this.#db.mark_published(domain)); }
     async isPublished(domain) { return this.#db.is_published(domain); }
+    async publishedState(domain) { return JSON.parse(this.#db.published_state(domain)); }
     async scan(domain, { reverse = false, limit = 0, after = "" } = {}) {
       return JSON.parse(this.#db.scan(domain, reverse, limit, after));
     }

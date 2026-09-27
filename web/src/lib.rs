@@ -322,6 +322,9 @@ impl Db {
     pub fn mark_published(&mut self, domain: &str) -> Result<String, JsError> {
         json(&self.0.mark_published(None, domain).map_err(err)?)
     }
+    pub fn published_state(&mut self, domain: &str) -> Result<String, JsError> {
+        json(&self.0.published_state(None, domain).map_err(err)?)
+    }
     pub fn is_published(&mut self, domain: &str) -> Result<bool, JsError> {
         self.0.is_published(None, domain).map_err(err)
     }

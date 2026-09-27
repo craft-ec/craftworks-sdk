@@ -35,7 +35,10 @@ await t("**the doors**: draft edited, published in one write, both definitions r
   assert.equal(await db.publishDefinition(), 0, "an unchanged draft published something");
   await assert.rejects(() => db.draftPut("x/y", {}), /not a definition key/);
   assert.equal(await db.isPublished("rows"), false);
+  assert.equal(await db.publishedState("rows"), null, "an unmarked domain has a marker record");
   assert.equal((await db.markPublished("rows")).outcome, "created");
+  const marker = await db.publishedState("rows");
+  assert.ok(marker && typeof marker.state === "string", `the marker's record carries no write state: ${JSON.stringify(marker)}`);
   assert.equal((await db.markPublished("rows")).outcome, "exists");
   assert.equal(await db.isPublished("rows"), true);
 });
