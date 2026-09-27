@@ -323,7 +323,9 @@ fn succ(k: &[u8]) -> Vec<u8> {
     out
 }
 
-fn prefix(domain: &str) -> Vec<u8> {
+/// `T_RECORD | domain | 0`: the head every one of `domain`'s record keys starts with ([`record_key`]'s own). The ONE
+/// form of it: whatever recognises a domain's records by key (ws-lose `--domain`) takes it from here.
+pub fn record_prefix(domain: &str) -> Vec<u8> {
     let mut k = vec![T_RECORD];
     k.extend_from_slice(domain.as_bytes());
     k.push(0);
@@ -337,7 +339,7 @@ fn prefix(domain: &str) -> Vec<u8> {
 /// a field (craftworks-sdk#122).
 pub fn record_key(domain: &str, at: impl Into<Loc>) -> Vec<u8> {
     let loc = at.into();
-    let mut k = prefix(domain);
+    let mut k = record_prefix(domain);
     if let Some(parent) = &loc.parent {
         k.extend_from_slice(parent);
     }
@@ -347,7 +349,7 @@ pub fn record_key(domain: &str, at: impl Into<Loc>) -> Vec<u8> {
 
 /// Every key under `parent` in `domain`, as a half-open range.
 fn parent_span(domain: &str, parent: &RKey) -> (Vec<u8>, Vec<u8>) {
-    let mut lo = prefix(domain);
+    let mut lo = record_prefix(domain);
     lo.extend_from_slice(parent);
     // The band is exactly the 16-byte rkeys following this prefix, so the end
     // is the prefix with a 16-byte all-ones tail exceeded -- simplest correct
@@ -443,7 +445,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     }
 
     pub fn domain_range(domain: &str) -> (Vec<u8>, Vec<u8>) {
-        let lo = prefix(domain);
+        let lo = record_prefix(domain);
         let hi = upper(&lo);
         (lo, hi)
     }
@@ -1016,7 +1018,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
 
     pub fn scan(&mut self, domain: &str, opts: Scan) -> Result<Vec<Record>> {
         let schema = self.need_schema(domain)?;
-        let p = prefix(domain);
+        let p = record_prefix(domain);
         let (mut lo, mut hi) = (p.clone(), upper(&p));
         if let Some(a) = opts.after {
             let k = record_key(domain, Loc::bare(a));
@@ -1058,7 +1060,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             ))
         })?;
         let _ = pf;
-        let p = prefix(domain);
+        let p = record_prefix(domain);
         let (mut lo, mut hi) = parent_span(domain, parent);
         if let Some(a) = opts.after {
             let k = record_key(domain, Loc::under(*parent, a));
@@ -1102,7 +1104,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// number every node already carries.
     pub fn count(&mut self, domain: &str) -> Result<usize> {
         check_domain(domain)?;
-        let p = prefix(domain);
+        let p = record_prefix(domain);
         let hi = upper(&p);
         let n = self
             .store

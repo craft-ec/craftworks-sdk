@@ -69,23 +69,26 @@ pub struct Lose {
     n: usize,
     /// [`Target::Data`] BY IDENTITY (7c's realnet: "the first group of k >= 2" is the tree's SHAPE, and chose the root's
     /// children, k = 2, instead of the bulk rows): only a leaf's group of referenced values whose EVERY member's key
-    /// holds `domain ‖ 0` -- the record key's own form (`T_RECORD | domain | 0 | rkey`, src/db.rs `record_key`).
+    /// starts with the domain's record prefix -- from the SDK's ONE record-key encoder (`craftworks_sdk::db::record_prefix`,
+    /// `T_RECORD | domain | 0`), never a form written here.
     domain: Option<Vec<u8>>,
     chosen: Option<Chosen>,
     /// GETs answered `NotFound` so far (the reader re-asks a lost block on its backoff, so this keeps growing).
     pub not_found: u64,
+    /// The chosen group's slots the reader has ASKED for since the choice: answered with bytes or with `NotFound`. The
+    /// `m + 1` control is void unless the reader asked `>= k` of them (the architect on builder#179: a reader that never
+    /// reached for the group's parity has not been refused a decode).
+    pub asked: BTreeSet<Cid>,
 }
 
 impl Lose {
     pub fn new(target: Target, n: usize) -> Lose {
-        Lose { target, n, domain: None, chosen: None, not_found: 0 }
+        Lose { target, n, domain: None, chosen: None, not_found: 0, asked: BTreeSet::new() }
     }
 
     /// [`Target::Data`], choosing the group of `domain`'s records by identity (see the field).
     pub fn with_domain(mut self, domain: &str) -> Lose {
-        let mut marker = domain.as_bytes().to_vec();
-        marker.push(0);
-        self.domain = Some(marker);
+        self.domain = Some(craftworks_sdk::db::record_prefix(domain));
         self
     }
 
@@ -97,6 +100,9 @@ impl Lose {
     /// [`Target::Data`] with no group yet, a tree node with a group of `k >= 2` becomes THE group (its members are
     /// fetched after it, so none of them has been relayed yet).
     pub fn block(&mut self, id: Cid, state: &[u8]) -> Verdict {
+        if self.chosen.as_ref().is_some_and(|c| c.slots.contains(&id)) {
+            self.asked.insert(id);
+        }
         if self.chosen.as_ref().is_some_and(|c| c.lost.contains(&id)) {
             self.not_found += 1;
             return Verdict::NotFound(id);
@@ -116,7 +122,7 @@ impl Lose {
                     let fits = |m: &Vec<Cid>| match &domain {
                         None => m.len() >= 2,
                         Some(marker) => {
-                            node.is_leaf() && !m.is_empty() && m.iter().all(|c| key_of.get(c).is_some_and(|k| k.windows(marker.len()).any(|w| w == marker.as_slice())))
+                            node.is_leaf() && !m.is_empty() && m.iter().all(|c| key_of.get(c).is_some_and(|k| k.starts_with(marker)))
                         }
                     };
                     let group = group_members(&node).into_iter().enumerate().find(|(_, (_, m))| fits(m));
@@ -176,6 +182,12 @@ pub fn not_found_line(id: &Cid, total: u64) -> serde_json::Value {
     serde_json::json!({ "not_found": short(id), "not_found_total": total })
 }
 
+/// THE LOG LINE for a chosen slot the reader asked for the first time (bytes or NotFound). LOAD-BEARING: the `m + 1`
+/// control reads `asked_total >= k` (see [`chosen_line`]).
+pub fn asked_line(id: &Cid, total: usize) -> serde_json::Value {
+    serde_json::json!({ "asked": short(id), "asked_total": total })
+}
+
 /// The answer this proxy sends in place of `m`: the node's own `NotFound` for a lost block, or `m` itself.
 pub fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
     let Message::Binary(b) = &m else { return m };
@@ -202,11 +214,15 @@ pub fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
         return m;
     };
     let had = lose.chosen().is_some();
+    let asked = lose.asked.len();
     let verdict = lose.block(cid, state.as_ref());
     if !had {
         if let Some(c) = lose.chosen() {
             eprintln!("{}", chosen_line("data", c));
         }
+    }
+    if lose.asked.len() > asked {
+        eprintln!("{}", asked_line(&cid, lose.asked.len()));
     }
     match verdict {
         Verdict::Relay => m,
@@ -272,6 +288,13 @@ mod tests {
                 assert_eq!(v == Verdict::NotFound(child), c.lost.contains(&child), "child {i}");
             }
             assert_eq!(l.not_found as usize, data_lost);
+            // ASKED: every member fetched is a slot asked (bytes or NotFound); a parity slot fetched is one more; a
+            // re-ask is not.
+            assert_eq!(l.asked.len(), c.k, "the reader fetched the k members");
+            let p0 = c.slots[c.k];
+            let _ = l.block(p0, &state(kind::PARITY, parity.get(&p0).expect("the parity block")));
+            let _ = l.block(p0, &state(kind::PARITY, parity.get(&p0).expect("the parity block")));
+            assert_eq!(l.asked.len(), c.k + 1, "a parity slot asked (twice) counts once");
             // THE GROUP IS THE TREE'S OWN (the architect on #525): its parity slots are parity this tree's apply made,
             // and the engine's own decoder rebuilds every lost member from the slots left when m are lost -- and has
             // fewer than k to work with when m + 1 are.
@@ -315,7 +338,12 @@ mod tests {
     fn a_domain_chooses_its_records_group_whatever_the_trees_shape() {
         let mut b = MemBlocks::default();
         let empty = freenet_prolly::build::init(&mut b);
-        let key = |domain: &str, i: u32| [&[1u8][..], domain.as_bytes(), &[0], format!("{i:08}").as_bytes()].concat();
+        // Keys from the SDK's ONE record-key encoder: what a page's Db writes.
+        let key = |domain: &str, i: u32| {
+            let mut rkey = [0u8; 16];
+            rkey[12..].copy_from_slice(&i.to_be_bytes());
+            craftworks_sdk::db::record_key(domain, rkey)
+        };
         let mut edits: Vec<(Vec<u8>, Edit)> = (0..3000u32).map(|i| (key("notes", i), Edit::Put(vec![7u8; 40]))).collect();
         edits.extend((0..3u32).map(|i| (key("bulk", i), Edit::Put(vec![b'x' + i as u8; 1400]))));
         edits.sort_by(|a, b| a.0.cmp(&b.0));
@@ -386,6 +414,8 @@ mod tests {
         assert_eq!(nf, serde_json::json!({ "not_found": "0303030303030303", "not_found_total": 7 }));
         // The ids the two lines name for one block are the SAME string.
         assert!(chosen["lost"].as_array().unwrap().contains(&nf["not_found"]));
+        let asked = asked_line(&[2; 32], 2);
+        assert_eq!(asked, serde_json::json!({ "asked": "0202020202020202", "asked_total": 2 }));
     }
 
     #[test]

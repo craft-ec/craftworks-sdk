@@ -7,8 +7,9 @@
 //!
 //! A connection that is not a WebSocket upgrade (the node's HTTP: the app's web containers and pieces) is piped through
 //! unchanged, and the node is dialled only when a client connects (a harness guard fails on a client connected before
-//! the reader's page opens). Every choice and every NotFound is a JSON line on stderr: the evidence that the loss
-//! happened.
+//! the reader's page opens). Every choice, every chosen slot the reader first asks for
+//! (`asked`) and every NotFound is a JSON line on stderr: the evidence that the loss happened, and that the reader
+//! reached for the group.
 //!
 //! usage: ws-lose <listen-port> <node-ws-port> --group data|root --lose m|m+1
 //!        (both ports on 127.0.0.1; `probe::node::RESERVED` refused)

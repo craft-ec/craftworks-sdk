@@ -3,6 +3,7 @@
 //! * ws-withhold: the node's answer to a PARITY PUT never reaches the page; a DATA PUT's does.
 //! * ws-lose: once the head names the root's group, the node's answer to a GET of the root reaches the page as the
 //!   node's own NotFound for that contract.
+//!
 //! And both evidence lines, pinned byte for byte.
 use freenet_prolly::kind;
 use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
