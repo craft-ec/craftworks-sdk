@@ -321,6 +321,10 @@ impl Db {
     pub fn publish_definition(&mut self) -> Result<u32, JsError> {
         self.0.publish_definition(None).map(|n| n as u32).map_err(err)
     }
+    /// SDK version `rev` as this store's platform app publishes it (as a Session's): a read.
+    pub fn platform_sdk(&mut self, rev: &str) -> Result<String, JsError> {
+        json(&self.0.platform_sdk(rev).map_err(err)?)
+    }
     /// The apps of this store that hold a draft (as a Session's): a read.
     pub fn definition_apps(&mut self) -> Result<String, JsError> {
         json(&self.0.definition_apps().map_err(err)?)

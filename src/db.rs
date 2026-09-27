@@ -1266,6 +1266,10 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         if let DefKey::File(path) = key {
             return Err(DbError::Refused(format!("`f/{path}` is a file: its bytes are written by the file door")));
         }
+        // `meta.sdk`, if named, is the one shape (§19: the SDK is data): refused at the write, never found at a load.
+        if *key == DefKey::Meta {
+            crate::platform::check_meta_sdk(body)?;
+        }
         self.draft_record(app, key, body.to_string(), None)
     }
 
@@ -1380,6 +1384,14 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             Some(Ok(k @ DefKey::File(_))) if keys.contains(&k.to_string()) => Ok(()),
             _ => Err(DbError::Refused(format!("meta.entry is {entry}: it must name an `f/<path>` file of the draft, and the draft holds none such -- a published app's entry must load"))),
         }
+    }
+
+    /// SDK VERSION `rev`, as this tree publishes it (§19, the SDK as data): the platform app's published definition,
+    /// its `f/sdk/<rev>` record, read by the one reader ([`crate::platform::sdk_version`]). A READ of the platform
+    /// app, whatever this Db's own app is.
+    pub fn platform_sdk(&mut self, rev: &str) -> Result<crate::platform::SdkVersion> {
+        let rows = self.definition(Some(crate::platform::PLATFORM_APP), SystemDomain::App)?;
+        crate::platform::sdk_version(&rows, rev)
     }
 
     /// The definition `which` holds (`Draft` or `App`): each record's key and body, in slot order. `app` names whose:

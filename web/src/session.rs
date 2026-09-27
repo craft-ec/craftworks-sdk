@@ -1188,6 +1188,14 @@ impl Session {
         definition_js(self.decided(r)?)
     }
 
+    /// SDK VERSION `rev` as this tree's platform app publishes it (§19, the SDK as data): `{ rev, name, format_tag,
+    /// set: { name, k, m, pieces: [{ address, sha256 }] } }`. A read, for any session of the tree -- a loader reads
+    /// it from a read-only session of the platform tree (`tree(registerId)`).
+    pub fn platform_sdk(&mut self, rev: &str) -> Result<String, JsValue> {
+        let r = self.db.platform_sdk(rev);
+        self.answer(r)
+    }
+
     /// The apps of this tree that hold a draft, by id: a READ (§19 P3b: the builder's project list), for any session
     /// of the tree, whatever its own app.
     pub fn definition_apps(&mut self) -> Result<String, JsValue> {
@@ -1741,32 +1749,19 @@ impl Session {
     }
 }
 
-/// `publish_app`'s sets, as the build's pieces.json names them: each `{name, k, m, pieces: [{address, sha256}]}`, a
-/// sha256 in hex. Refused by name when a field is missing or a set is not `k + m` pieces (`PieceSet::check`).
-/// The build's ONE piece set, from its JSON (the build's pieces.json entry).
+/// `publish_app`'s set, as the build's pieces.json names it: parsed by the SDK's ONE reader of a piece set
+/// (`craftworks_sdk::platform::parse_piece_set`, which an SDK version record's set also goes through), then as the
+/// `pieces` crate holds it, and checked there too.
 fn parse_piece_set(json: &str) -> Result<pieces::PieceSet, String> {
-    let s: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("publish_app: the set is not JSON: {e}"))?;
-    if !s.is_object() {
-        return Err("publish_app: the set is not an object: a site carries the build's ONE piece set".into());
-    }
-    std::iter::once(&s)
-        .map(|s| {
-            let name = s.get("name").and_then(serde_json::Value::as_str).ok_or("publish_app: a set with no name")?.to_string();
-            let num = |f: &str| s.get(f).and_then(serde_json::Value::as_u64).map(|n| n as usize).ok_or(format!("publish_app: set {name} has no {f}"));
-            let (k, m) = (num("k")?, num("m")?);
-            let pieces = s.get("pieces").and_then(serde_json::Value::as_array).ok_or(format!("publish_app: set {name} has no pieces"))?
-                .iter()
-                .map(|p| {
-                    let address = p.get("address").and_then(serde_json::Value::as_str).ok_or(format!("publish_app: a piece of {name} has no address"))?.to_string();
-                    let sha256 = p.get("sha256").and_then(serde_json::Value::as_str).and_then(core_types::hex::decode_array).ok_or(format!("publish_app: a piece of {name} has no 32-byte sha256"))?;
-                    Ok(pieces::NamedPiece { address, sha256 })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let set = pieces::PieceSet { name, k, m, pieces };
-            set.check()?;
-            Ok(set)
-        })
-        .next().expect("one set in, one out")
+    let spec = craftworks_sdk::platform::parse_piece_set("publish_app", json)?;
+    let set = pieces::PieceSet {
+        name: spec.name,
+        k: spec.k,
+        m: spec.m,
+        pieces: spec.pieces.into_iter().map(|p| pieces::NamedPiece { address: p.address, sha256: p.sha256 }).collect(),
+    };
+    set.check()?;
+    Ok(set)
 }
 
 /// A head id as `head_id()` gives it: 64 hex characters.
