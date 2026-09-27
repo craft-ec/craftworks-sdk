@@ -406,6 +406,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       return once(() => JSON.parse(session.mark_published(domain)));
     },
     isPublished: domain => once(() => session.is_published(domain)),
+    // The marker as its record WITH its write state, or null: whether it is SAVED (isPublished says only EXISTS).
+    publishedState: domain => once(() => JSON.parse(session.published_state(domain))),
 
     /**
      * ANOTHER APP'S DATA in this person's tree, READ-ONLY (the forest ruling):

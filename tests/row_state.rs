@@ -169,3 +169,26 @@ fn every_row_state_has_a_distinct_stable_code() {
         );
     }
 }
+
+/// A MARKER still in flight reads PENDING through `published_state`, never saved -- though `is_published` already
+/// says it EXISTS (builder#88: a publish is not reported done over a marker the node has not acknowledged). Both
+/// arms: once the node answers, the same marker reads saved.
+#[test]
+fn a_marker_in_flight_reads_pending_not_saved_and_saved_once_it_lands() {
+    let node = PageNode::new();
+    let (mut d, mut conn) = engine_db(&node);
+    conn.hold_answers();
+    d.mark_published(None, "rows").expect("mark");
+    assert!(d.is_published(None, "rows").expect("is"), "THE SETUP: the marker does not exist, so its state says nothing");
+    let pending = d.published_state(None, "rows").expect("state").expect("a marker");
+    assert!(!pending.state.is_settled(), "a marker the node has not acknowledged reads saved: {:?}", pending.state);
+    conn.stop_holding();
+    while conn.held() > 0 {
+        let _ = conn.release_one();
+        d.store_mut().sync();
+    }
+    d.store_mut().sync();
+    let saved = d.published_state(None, "rows").expect("state").expect("a marker");
+    assert!(saved.state.is_settled(), "a marker the node acknowledged still reads in flight: {:?}", saved.state);
+    assert_eq!(d.published_state(None, "other").expect("state"), None, "an unmarked domain has a marker record");
+}
