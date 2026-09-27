@@ -460,6 +460,9 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     // `app`: ANOTHER app's definition in this tree, read-only (§19 P3: the builder's project list); absent, this one's.
     // The apps of this tree that hold a draft (§19 P3b: the builder's project list), by id. A read.
     definitionApps: () => once(() => JSON.parse(session.definition_apps())),
+    // SDK version `rev` as this tree's platform app publishes it (§19, the SDK as data): `{ rev, name, format_tag,
+    // set }`, `set` the version's piece set. A read (a loader asks it of the platform tree's read-only session).
+    platformSdk: rev => once(() => JSON.parse(session.platform_sdk(rev))),
     // `[{ key, body, bytes? }]`: a file's bytes a Uint8Array, as the SDK hands them over (never text decoded here).
     definition: (which, app) => once(() => session.definition(which, app ?? undefined)),
     async markPublished(domain, ...extra) {
