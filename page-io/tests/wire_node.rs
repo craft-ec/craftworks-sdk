@@ -3446,6 +3446,7 @@ fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_
         }
         // REPAIR: a cold reader reads the whole tree.
         let mut r = reader_with(&node, engine::Params::default());
+        r.server.page.set_repair_pass(true);
         client(&mut r, &mut node, &mut now, &Request::Identity);
         assert_eq!(read_all(&mut r, &mut node, &mut now, 100), 2_000, "the repairing read did not read every row");
         let report = r.server.page.repair_report();

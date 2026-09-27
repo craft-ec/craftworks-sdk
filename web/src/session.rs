@@ -666,6 +666,10 @@ impl Session {
     /// `after` (`null` when the tree is read). A NOT_LOADED is a ticket like every read (`once` in js/engine-db.js).
     pub fn scan_all(&mut self, after: &str, limit: usize) -> Result<String, JsValue> {
         let after = if after.is_empty() { None } else { Some(core_types::hex::decode(after).ok_or_else(|| JsValue::from_str("after is not hex"))?) };
+        // The whole-tree read IS the repair: its reads keep each parity GET out until the node answers.
+        if let Some(p) = self.page_mut() {
+            p.server.page.set_repair_pass(true);
+        }
         let r = self.db.scan_all(after, limit).map(|(rows, next)| serde_json::json!({ "rows": rows, "next": next.map(|k| core_types::hex::encode(&k)) }));
         self.answer(r)
     }

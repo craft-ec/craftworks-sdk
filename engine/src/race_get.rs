@@ -34,7 +34,22 @@ impl<B: Blocks> Engine<B> {
             return Vec::new();
         }
         match self.group_for(root, id) {
-            Some(group) => self.start_repair(group, false),
+            Some(group) => {
+                let mut out = self.start_repair(group.clone(), false);
+                // REPAIR mode (sdk#479): each parity slot's GET stays out until the NODE answers it (an audit reader,
+                // served only by the node), so a parity block it lacks is learned even when it answers with silence.
+                if self.repair_pass {
+                    for i in group.k..group.slots.len() {
+                        let slot = group.slots[i];
+                        if self.blocks.get(&slot).is_some() || self.parity_watch.contains_key(&slot) || self.parity_owed.contains_key(&slot) {
+                            continue;
+                        }
+                        self.parity_watch.insert(slot, group.clone());
+                        out.extend(self.on_audit_want(slot, crate::REPAIR_PASS));
+                    }
+                }
+                out
+            }
             None => Vec::new(),
         }
     }

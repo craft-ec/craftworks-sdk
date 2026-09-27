@@ -1008,6 +1008,11 @@ pub enum AuditVerdict {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PassId(pub u64);
 
+/// REPAIR's own pass (sdk#479): while [`Engine::set_repair_pass`] is on, every race keeps each parity slot's GET out
+/// until the NODE answers, under this audit reader -- a real node answers a block it lacks with silence as often as
+/// NotFound, and a race that withdrew its parity GETs once the member arrived never learned a parity block was gone.
+pub const REPAIR_PASS: PassId = PassId(u64::MAX);
+
 
 /// What an engine shed to keep its context saveable (sdk#162), per call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1547,6 +1552,10 @@ pub struct Engine<B: Blocks> {
     /// replaced erodes to its last copy), with its group: re-encoded and PUT back once the page holds all `k` members
     /// ([`Engine::put_owed_parity`]). Bounded by the NotFounds seen.
     parity_owed: BTreeMap<Cid, repair::Group>,
+    /// REPAIR mode ([`Engine::set_repair_pass`]): each parity slot a race asked, with its group, until the node answers
+    /// it -- NotFound makes it owed ([`Engine::parity_owed`]).
+    repair_pass: bool,
+    parity_watch: BTreeMap<Cid, repair::Group>,
     /// Parity found missing, put back (re-encoded, id-verified), and re-encoded to a DIFFERENT id (never put).
     parity_counts: (u64, u64, u64),
     /// Why the last repair was given up, in words (the read is answered
@@ -1776,6 +1785,8 @@ impl<B: Blocks> Engine<B> {
             landing: Vec::new(),
             repair_counts: (0, 0, 0),
             parity_owed: BTreeMap::new(),
+            repair_pass: false,
+            parity_watch: BTreeMap::new(),
             parity_counts: (0, 0, 0),
             repair_failed: None,
             root,
@@ -2016,6 +2027,13 @@ impl<B: Blocks> Engine<B> {
                 (repair::GroupHealth::of(j, r.group.k, m) == repair::GroupHealth::Damaged).then_some(Damaged { block: r.group.missing, j, k: r.group.k })
             })
             .collect()
+    }
+
+    /// REPAIR mode on or off (sdk#479): on, every race keeps its group's parity GETs out until the NODE answers each
+    /// ([`REPAIR_PASS`]), so a parity block the node lacks is learned even when it answers with silence. Off (every
+    /// normal read): a race withdraws what it no longer needs.
+    pub fn set_repair_pass(&mut self, on: bool) {
+        self.repair_pass = on;
     }
 
     /// Parity the reads found missing, put back, and re-encoded to a different id (sdk#479): `(missing, put, mismatched)`.
@@ -4712,6 +4730,9 @@ impl<B: Blocks> Engine<B> {
         // A block of a group being repaired (a parity block among them, which
         // no read asks for by itself).
         let mut out = Vec::new();
+        if by_node {
+            self.parity_watch.remove(&id); // the node HAS it
+        }
         if self.wanted.is_slot(&id) {
             out.extend(self.on_repair_block(id, Some(&bytes)));
             if !self.wanted.read_waits_on(&id) && !(by_node && self.wanted.audit_waits_on(&id)) {
@@ -4813,6 +4834,13 @@ impl<B: Blocks> Engine<B> {
     /// can do nothing about either.
     fn on_missed(&mut self, id: Cid) -> Vec<Effect> {
         let mut out = Vec::new();
+        // REPAIR mode: a watched parity slot the node answered NotFound is owed back (sdk#479).
+        if let Some(g) = self.parity_watch.remove(&id) {
+            if !self.parity_owed.contains_key(&id) {
+                self.parity_counts.0 += 1;
+                self.parity_owed.insert(id, g);
+            }
+        }
         // E3 BY READER KIND: the audits are ANSWERED (absent: their verdict) and taken; every other reader keeps
         // waiting (rule 8).
         let passes = self.wanted.missed_audits(id);
