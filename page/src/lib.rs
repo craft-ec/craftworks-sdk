@@ -3191,6 +3191,38 @@ mod parked_get {
         assert_eq!(p.take_audit_answers(), vec![AuditAnswer { id, passes: vec![engine::PassId(2)], verdict: engine::AuditVerdict::Present }]);
     }
 
+    /// **sdk#530 C1 AT THE PAGE: an app READ's GET and an AUDIT on the SAME block; the READ's bytes arrive another way
+    /// (a repair rebuilt the block: HELD) -- the audit's GET stays OUT until the node answers it.** One (block, GET) key,
+    /// two holders (W1): the read's GET went out, the audit JOINED it (no second GET), then the page came to HOLD the
+    /// block while the GET was still out. The held sweep that follows every engine step (`end_unneeded_gets`) must spare
+    /// the key while an audit waits on it (W7): only the node's answer serves an audit. Mutant: drop the sweep's readers
+    /// term -> the GET ends as soon as the block is held, and the audit waits for an answer that never comes -> red.
+    #[test]
+    fn a_read_and_an_audit_on_one_block_the_reads_bytes_held_the_audits_get_stays_out() {
+        use freenet_prolly::{block_id, kind};
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.now = 5;
+        p.answered(&Waiting::RecoverHead);
+        let bytes = vec![5u8; 8];
+        let id = block_id(kind::RAW, &bytes);
+        // The READ's GET goes out.
+        p.send(Waiting::Get(id), Op::Get { id });
+        assert!(p.take_ops().contains(&Op::Get { id }), "THE SETUP: the read's GET did not go out");
+        // The AUDIT joins the same key: no second GET.
+        p.audit_want(id, engine::PassId(3));
+        assert!(p.take_ops().iter().all(|o| *o != Op::Get { id }), "the audit sent a second GET beside the read's");
+        // The READ's bytes arrive another way: the page now HOLDS the block (a repair rebuilt it) ...
+        p.engine.blocks_mut().insert(id, &bytes);
+        // ... and the held sweep runs, as it does after every engine step (here: an unrelated audit's).
+        let other = block_id(kind::RAW, &[6u8; 8]);
+        p.audit_want(other, engine::PassId(4));
+        assert!(p.deadlines.contains_key(&Waiting::Get(id)), "the held sweep ENDED the GET an audit waits on: the page holds the block");
+        assert!(p.take_audit_answers().is_empty(), "the page's held bytes answered the audit");
+        // Only the NODE's answer answers the audit.
+        p.answer(Answer::Got { id, bytes }, Ms(20));
+        assert_eq!(p.take_audit_answers(), vec![AuditAnswer { id, passes: vec![engine::PassId(3)], verdict: engine::AuditVerdict::Present }], "the node's answer did not reach the audit");
+    }
+
     /// **The due-time backstop's HELD arm spares an audit** (the architect on #538; W7, OP-LIFE E2): a GET parked after
     /// a NotFound, the page then HOLDING the block (a repair rebuilt it), and an audit joining the parked GET -- at the
     /// due time the GET is SENT, never ended, and the audit is answered by the NODE. Mutant: drop the audits clause at
