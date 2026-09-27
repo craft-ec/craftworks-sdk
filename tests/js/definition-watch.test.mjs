@@ -43,6 +43,20 @@ await t("**a head move that changed the draft re-reads it, records rendered in t
   for (const w of seen) assert.deepEqual(w, [[{ key: "meta", body: { name: "B, from the other device" } }]]);
 });
 
+await t("**a re-read that FAILS reaches every watcher as `cb(null, { error })`**, named; it is not rendered", async () => {
+  const s = recordingSession();
+  s.definition = w => { s.calls.push(["read", w]); throw Object.assign(new Error("the draft's block could not be loaded"), { code: "UNAVAILABLE" }); };
+  const db = engineDb(s);
+  const told = [];
+  db.watchDefinition("draft", (rows, fail) => told.push([rows, fail?.error?.message]));
+  db.watchDefinition("draft", (rows, fail) => told.push([rows, fail?.error?.message]));
+  s.stale = ["opaque-draft"];
+  db.drain();
+  await settle();
+  assert.deepEqual(told, [[null, "the draft's block could not be loaded"], [null, "the draft's block could not be loaded"]], "a failed re-read was swallowed");
+  assert.ok(!s.calls.some(c => c[0] === "rendered"), "a failed re-read was recorded as rendered: its change would never be named again");
+});
+
 await t("THE CONTROL: a head move that named another key re-reads nothing", async () => {
   const s = recordingSession();
   const db = engineDb(s);

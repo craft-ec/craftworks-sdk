@@ -221,13 +221,15 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
   // THE DEFINITION WATCHES (§19 P3, `watchDefinition`): per watch key (opaque, from `bind_definition`), which
   // definition it is and who is told. Re-read when `take_stale` names the key: the read and its `rendered_definition`
   // in ONE synchronous call, as a binding's (so no change between them is missed), then every watcher gets the rows.
+  // A re-read that FAILS is handed to every watcher as `cb(null, { error })` (the architect on sdk#557): swallowed,
+  // the watcher learned nothing until the next head move. It is not `rendered`, so the key is named again.
   const definitions = new Map();
   const rereadDefinition = def =>
     once(() => {
       const rows = JSON.parse(session.definition(def.which));
       session.rendered_definition(def.which);
       return rows;
-    }).then(rows => { for (const cb of def.cbs) cb(rows); }, () => { /* named again at the next head move */ });
+    }).then(rows => { for (const cb of def.cbs) cb(rows); }, error => { for (const cb of def.cbs) cb(null, { error }); });
 
   /**
    * This client's OWN writes changed state (published, backed up, lost,
@@ -768,7 +770,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     /**
      * WATCH A DEFINITION (§19 P3): `cb(rows)` — `definition(which)` read afresh — each time a head move changes the
      * draft ("draft") or the published definition ("app") of this session's app: another tab or device of this
-     * identity edited it, or this tab lost a tie-break (rule 15). Bound by the session from its `SystemDomain`, so
+     * identity edited it, or this tab lost a tie-break (rule 15). A re-read that failed is `cb(null, { error })`, and
+     * the change is named again at the next head move. Bound by the session from its `SystemDomain`, so
      * the reserved name is never spelled here; refused by name when it cannot be watched. Returns the unwatch.
      */
     watchDefinition(which, cb) {
