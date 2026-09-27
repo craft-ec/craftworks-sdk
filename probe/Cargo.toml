@@ -7,6 +7,8 @@ description = "Platform probes against a pinned Freenet: the import gate, and th
 
 [dependencies]
 core-types = { path = "../core-types" }
+# node-forget opens a STOPPED private node's store: freenet-core v0.2.138's own redb (4.2), so the file format matches.
+redb = "=4.2.0"
 anyhow = "1"
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 tokio = { version = "1", features = ["full"] }

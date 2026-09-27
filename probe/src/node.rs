@@ -192,6 +192,34 @@ fn refuse(port: u16, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// THE PRIVATE-NODE MARK: a file every data dir this crate creates carries (holding its spawner's nonce), and the
+/// only dirs a store-editing tool (`node-forget`) opens. An ALLOWLIST: the owner's node -- or any node, stopped --
+/// passes any list of paths to refuse; it never carries this file.
+pub const PRIVATE_MARKER: &str = ".craftworks-private-node";
+
+/// Mark `data_dir` as a private node's: `PRIVATE_MARKER`, holding a nonce (this process, this instant).
+pub fn mark_private(data_dir: &Path) -> Result<()> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    std::fs::write(data_dir.join(PRIVATE_MARKER), format!("{}-{nanos}\n", std::process::id()))
+        .with_context(|| format!("marking {} private", data_dir.display()))
+}
+
+/// Refuse, BY NAME, any `data_dir` that is not a private node's: first the owner's places (a path under /Library, the
+/// freenet default dirs) as a second guard, then -- the rule -- a dir without `PRIVATE_MARKER`. Called before
+/// anything under it is opened.
+pub fn require_private(data_dir: &Path) -> Result<()> {
+    let s = data_dir.to_string_lossy();
+    if s.contains("/Library/") || s.ends_with("/.local/share/freenet") || s.ends_with("/.cache/freenet") {
+        bail!("{s}: not a private node's data dir (the owner's node is never touched)");
+    }
+    let marker = data_dir.join(PRIVATE_MARKER);
+    match std::fs::read_to_string(&marker) {
+        Ok(nonce) if !nonce.trim().is_empty() => Ok(()),
+        Ok(_) => bail!("{s}: its {PRIVATE_MARKER} is empty -- not a mark this crate wrote; refused"),
+        Err(_) => bail!("{s}: no {PRIVATE_MARKER} -- not a data dir a private node was spawned with; refused"),
+    }
+}
+
 impl Node {
     pub fn spawn(port: u16, dir: &Path) -> Result<Self> {
         Self::spawn_in(port, dir, Mode::Local)
@@ -235,6 +263,7 @@ impl Node {
         for sub in ["data", "config", "log", "webapp_cache"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
+        mark_private(&dir.join("data"))?;
         let child = Command::new("freenet")
             .args(&args)
             .envs(node_env(dir))
@@ -347,5 +376,33 @@ pub struct TempTree(pub PathBuf);
 impl Drop for TempTree {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod private_mark {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("probe-private-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The allowlist: a dir outside /Library and the default dirs, WITHOUT the mark, is refused by name; marked, it
+    /// passes. The /Library refusal holds even for a marked dir (the second guard).
+    #[test]
+    fn only_a_marked_dir_is_a_private_nodes() {
+        let d = scratch("unmarked");
+        let e = require_private(&d).unwrap_err().to_string();
+        assert!(e.contains(PRIVATE_MARKER), "refused, but not by the mark's name: {e}");
+        mark_private(&d).unwrap();
+        require_private(&d).expect("a marked dir is a private node's");
+        std::fs::write(d.join(PRIVATE_MARKER), "").unwrap();
+        assert!(require_private(&d).is_err(), "an empty mark passed");
+        let lib = Path::new("/Users/x/Library/Application Support/freenet");
+        assert!(require_private(lib).unwrap_err().to_string().contains("owner's node"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
