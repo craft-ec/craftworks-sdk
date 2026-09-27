@@ -34,7 +34,7 @@ function node(code, params, state, cause = "invalid put", frames = []) {
     hex(code), hex(params), hex(state), cause, ...frames.map(hex)], { cwd: root, encoding: "utf8", maxBuffer: 1 << 26 });
   assert.equal(r.status, 0, `node_answers failed: ${r.stderr}`);
   const o = JSON.parse(r.stdout);
-  return { key: o.key, ack: bytes(o.ack), refusal: bytes(o.refusal), frames: o.frames };
+  return { key: o.key, ack: bytes(o.ack), refusal: bytes(o.refusal), keyless: bytes(o.keyless), frames: o.frames };
 }
 
 const status = (s, k) => JSON.parse(s.put_status(k));
@@ -77,18 +77,43 @@ await t("**the node's ack settles it: none → pending → put**", async () => {
   assert.deepEqual(status(s, key), { state: "put", said: "" });
 });
 
-await t("**a refusal naming the contract: → refused, in the node's words, and not blamed on provisioning**", async () => {
-  const s = provisioned();
-  const key = s.put_contract(CODE, PARAMS, STATE);
-  flush(s);
-  s.on_inbound(node(OTHER, PARAMS, STATE, "not ours").refusal);
-  assert.deepEqual(status(s, key), { state: "pending", said: "" }, "a refusal of somebody else's contract settled ours");
-  s.on_inbound(node(CODE, PARAMS, STATE, "the state does not hash to its params").refusal);
-  assert.deepEqual(status(s, key), { state: "refused", said: "the state does not hash to its params" });
-  assert.equal(s.refused(), "", "the app's refused PUT was reported as provisioning's");
-  s.on_inbound(us.ack);
-  assert.equal(status(s, key).state, "refused", "a late answer flipped a settled PUT");
-});
+// THE ONE FINALITY RULE (sdk#522; the Rust four-form test's mirror): an app PUT's refusal ENDS it only in the node's
+// VALIDATION words (wire::VALIDATION_REFUSED), keyed or keyless -- the same bytes would be refused for ever. Any other
+// words are TRANSIENT: the PUT stays pending, the page sends it again on its deadline, and an ack then settles it.
+const VALIDATION = "invalid put";
+const TRANSIENT = "the node is busy: try again";
+for (const form of ["keyed", "keyless"]) {
+  await t(`**a ${form} refusal in the node's VALIDATION words ends the PUT: refused, in its words, not blamed on provisioning**`, async () => {
+    const s = provisioned();
+    const key = s.put_contract(CODE, PARAMS, STATE);
+    flush(s);
+    s.on_inbound(node(OTHER, PARAMS, STATE, VALIDATION)[form === "keyed" ? "refusal" : "keyless"]);
+    assert.deepEqual(status(s, key), { state: "pending", said: "" }, "a refusal of somebody else's contract settled ours");
+    s.on_inbound(node(CODE, PARAMS, STATE, VALIDATION)[form === "keyed" ? "refusal" : "keyless"]);
+    assert.deepEqual(status(s, key), { state: "refused", said: VALIDATION });
+    assert.equal(s.refused(), "", "the app's refused PUT was reported as provisioning's");
+    s.on_inbound(us.ack);
+    assert.equal(status(s, key).state, "refused", "a late answer flipped a settled PUT");
+  });
+
+  await t(`**a ${form} refusal in OTHER words is transient: pending, sent again on its deadline, and the ack settles it**`, async () => {
+    const s = provisioned();
+    const key = s.put_contract(CODE, PARAMS, STATE);
+    flush(s);
+    s.on_inbound(node(CODE, PARAMS, STATE, TRANSIENT)[form === "keyed" ? "refusal" : "keyless"]);
+    assert.deepEqual(status(s, key), { state: "pending", said: "" }, "a transient refusal ENDED the PUT");
+    let again = [];
+    const end = Date.now() + 15_000;
+    while (Date.now() < end && again.length === 0) {
+      await new Promise(r => setTimeout(r, 200));
+      s.tick();
+      again = flush(s, "puts").filter(f => f.op === "put" && f.key === key);
+    }
+    assert.equal(again.length, 1, "a transiently refused PUT was never sent again");
+    s.on_inbound(us.ack);
+    assert.deepEqual(status(s, key), { state: "put", said: "" });
+  });
+}
 
 await t("**a dropped socket: the PUT stays pending and the PAGE sends it again at its deadline; the new answer settles it; a settled one stays**", async () => {
   const s = provisioned();
@@ -123,8 +148,8 @@ await t("**the PUT goes through page-io, and its ack and refusal come back to pu
   assert.deepEqual(status(s, key), { state: "put", said: "" }, "page-io's handed-back ack never reached put_status");
   const other = s.put_contract(OTHER, PARAMS, STATE);
   flush(s);
-  s.on_inbound(node(OTHER, PARAMS, STATE, "too big").refusal);
-  assert.deepEqual(status(s, other), { state: "refused", said: "too big" });
+  s.on_inbound(node(OTHER, PARAMS, STATE, VALIDATION).refusal);
+  assert.deepEqual(status(s, other), { state: "refused", said: VALIDATION });
 });
 
 await t("an answer for a contract this session never put is counted unusable, not dropped", async () => {

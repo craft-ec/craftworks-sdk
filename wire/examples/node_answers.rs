@@ -31,6 +31,10 @@ fn main() {
     }))
     .into();
     let refusal = bincode::serialize(&Err::<HostResponse, ClientError>(refusal)).expect("encodes");
+    // The KEYLESS form the node sends for a PUT its executor refused (sdk#433): the pinned `PUT_ERROR_FORMAT`.
+    let (prefix, sep) = wire::PUT_ERROR_FORMAT;
+    let keyless: ClientError = ErrorKind::OperationError { cause: format!("{prefix}{}{sep}{}", c.key(), a[3]).into() }.into();
+    let keyless = bincode::serialize(&Err::<HostResponse, ClientError>(keyless)).expect("encodes");
     // A GET answer for this contract: what a page that never asked for it
     // must leave to whoever did.
     let got = bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::ContractResponse(
@@ -97,9 +101,10 @@ fn main() {
         hex(&bincode::serialize(&Ok::<HostResponse, ClientError>(HostResponse::DelegateResponse { key: dkey, values: vec![] })).expect("encodes"))
     });
     println!(
-        r#"{{"key":"{key}","ack":"{}","refusal":"{}","got":"{}","signer_answer":"{}","registered":"{}","frames":[{}]}}"#,
+        r#"{{"key":"{key}","ack":"{}","refusal":"{}","keyless":"{}","got":"{}","signer_answer":"{}","registered":"{}","frames":[{}]}}"#,
         hex(&ack),
         hex(&refusal),
+        hex(&keyless),
         hex(&got),
         signer_answer.unwrap_or_default(),
         registered.unwrap_or_default(),
