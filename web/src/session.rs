@@ -754,7 +754,8 @@ impl Session {
     }
 
     /// How `app`'s publish stands, as JSON `{"state","version","sets":[{"name","acked","refused","of","k"}],"said"}`.
-    /// `state` is sdk#523's `AppPublishStatus` word (`sdk.status.appPublish`): `none`, `pieces`, `siting`, `published`
+    /// `state` is sdk#523's `AppPublishStatus` word (`sdk.status.appPublish`): `none`, `checking` (the site is read
+    /// first, APP-PUBLISH P6), `pieces`, `siting`, `published`
     /// (the site read back: the app is up), `backed_up` (every piece acked), `backup_abandoned`, `refused`,
     /// `superseded`, `cancelled`. `said`: a refusal's words -- and, PUBLISHED with a piece finally refused, that
     /// BACKED_UP will not come.
@@ -764,6 +765,7 @@ impl Session {
         // Each case to its word, EXHAUSTIVELY (sdk#523's one vocabulary; a new case fails to compile here).
         let state = match publish {
             None => AppPublishStatus::None,
+            Some(A::Checking { .. }) => AppPublishStatus::Checking,
             Some(A::Pieces { .. }) => AppPublishStatus::Pieces,
             Some(A::Siting { .. }) => AppPublishStatus::Siting,
             Some(A::Published { .. }) => AppPublishStatus::Published,

@@ -3066,7 +3066,8 @@ fn an_app_publish_sends_its_site_only_at_k_and_is_published_before_every_piece_i
     let withheld: Vec<ContractKey> = containers[3..].iter().map(|(c, _)| c.key()).collect();
     let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
     io.publish_app(APP, (set, containers), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
-    assert_eq!(stage(&io, APP).as_deref(), Some("Pieces"));
+    // P6: the site is read first; nothing is sent until it answers.
+    assert_eq!(stage(&io, APP).as_deref(), Some("Checking"));
     let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
     let (held, site_after) = drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("Published"));
     assert_eq!(site_after, Some(3), "P1: the site's PUT did not leave exactly when the set reached k (it left after {site_after:?} piece acks)");
@@ -3078,6 +3079,74 @@ fn an_app_publish_sends_its_site_only_at_k_and_is_published_before_every_piece_i
     release(&mut io, &mut node, now, &held[..2]);
     assert_eq!(stage(&io, APP).as_deref(), Some("BackedUp"), "P3: every piece acked and not BACKED_UP: {:?}", io.app_publish(APP));
     assert_eq!(io.impossible_cells(), 0);
+}
+
+/// **APP-PUBLISH P6, A BRAND-NEW APP (the architect on #573):** no site yet -- the pre-read answers NotFound, and the
+/// publish goes on to its pieces, then the site as v1; it never stays `Checking`.
+#[test]
+fn a_brand_new_apps_pre_read_finds_no_site_and_goes_on_to_pieces_then_site_v1() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 5, 3, 2);
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    let serve = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
+    io.publish_app(APP, (set, containers), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
+    assert_eq!(stage(&io, APP).as_deref(), Some("Checking"), "THE SETUP: the site is not read first");
+    drive(&mut io, &mut node, &mut now, &serve, false, &|io| stage(io, APP).as_deref() != Some("Checking"));
+    assert_eq!(stage(&io, APP).as_deref(), Some("Pieces"), "NotFound did not send the pieces: {:?}", io.app_publish(APP));
+    drive(&mut io, &mut node, &mut now, &serve, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
+    assert_eq!(io.app_publish(APP), Some(&page_io::AppPublish::BackedUp { version: 1 }), "a brand-new app was not published as v1");
+    assert_eq!(io.impossible_cells(), 0);
+}
+
+/// **APP-PUBLISH P6: A SITE THAT ALREADY HOLDS THIS BUNDLE IS PUBLISHED, AND NOTHING IS SENT.** An app is published
+/// (its pieces and its site, v1); then a RELOADED page (a new PageIo on the same node, remembering nothing) publishes
+/// the SAME starter: the site is read first, holds this bundle, and the publish is `Published` at v1 with ZERO piece
+/// PUTs and no site PUT (backing is the repair pass's). CONTROL: the reloaded page publishes ANOTHER starter -- the
+/// pieces go and the site is written as v2. Mutant "the check skipped" (start in Pieces) -> the pieces are re-PUT -> red.
+#[test]
+fn a_reloaded_publish_of_the_same_bundle_sends_no_piece_and_no_site() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 5, 3, 2);
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    let serve = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
+    let mut first = page_io(&node);
+    first.publish_app(APP, (set.clone(), containers.clone()), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
+    drive(&mut first, &mut node, &mut now, &serve, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
+    assert_eq!(first.app_publish(APP).and_then(page_io::AppPublish::version), Some(1), "THE SETUP: the first publish is not v1");
+    // THE RELOAD: a new page on the same node; the same starter.
+    let mut reloaded = page_io(&node);
+    reloaded.publish_app(APP, (set.clone(), containers.clone()), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
+    let site = page_io::site_contract(SITE_CODE, &node.register_params, APP).expect("site").key();
+    let (mut piece_puts, mut site_puts) = (0usize, 0usize);
+    for _ in 0..200 {
+        now += 250;
+        reloaded.tick(Ms(now));
+        for f in reloaded.take_frames() {
+            if let ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) = bincode::deserialize::<ClientRequest>(&f).expect("a request") {
+                if contract.key() == site {
+                    site_puts += 1;
+                } else if keys.contains(&contract.key()) {
+                    piece_puts += 1;
+                }
+            }
+            if let Some(a) = node.serve(&f) {
+                reloaded.inbound(&a, Ms(now));
+            }
+        }
+        if stage(&reloaded, APP).as_deref() == Some("Published") {
+            break;
+        }
+    }
+    assert_eq!(reloaded.app_publish(APP), Some(&page_io::AppPublish::Published { version: 1, sets: Vec::new() }), "P6: the current site was not published at its version");
+    assert_eq!((piece_puts, site_puts), (0, 0), "P6: a publish of the bundle the site holds sent {piece_puts} piece PUT(s) and {site_puts} site PUT(s)");
+    // THE CONTROL: another starter on the reloaded page -> the pieces go, the site is written as v2.
+    reloaded.publish_app(APP, (set, containers), &starter(2), SITE_CODE, Ms(now)).expect("publishes");
+    drive(&mut reloaded, &mut node, &mut now, &serve, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
+    assert_eq!(reloaded.app_publish(APP).and_then(page_io::AppPublish::version), Some(2), "THE CONTROL: another bundle was not published as v2: {:?}", reloaded.app_publish(APP));
+    assert_eq!(reloaded.impossible_cells(), 0);
 }
 
 /// **A SHARED piece is withdrawn only when NO publish owes it (the architect's R1).** Two apps of one build publish
@@ -3135,7 +3204,8 @@ fn the_two_app_model_never_withdraws_a_shared_piece_the_other_owes() {
         let at = ["Pieces", "Siting", "Published", "never"][next(4)];
         let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
         let (held, _) = if at == "Pieces" {
-            (Vec::new(), None)
+            // P6: the site's read answers first (no site yet); cancelled as soon as the pieces are on their way.
+            drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("Pieces"))
         } else {
             drive(&mut io, &mut node, &mut now, &fate, at == "Siting", &|io| stage(io, APP).as_deref() == Some(if at == "never" { "Published" } else { at }))
         };
