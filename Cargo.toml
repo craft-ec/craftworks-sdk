@@ -61,7 +61,7 @@ bincode = "1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 
 [workspace]
-members = ["contract-keys", "core-types", "decoder", "engine", "page", "page-io", "pieces", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "testkit", "web", "wire"]
+members = ["contract-keys", "core-types", "decoder", "engine", "page", "page-io", "pieces", "probe-delegate", "probe", "protocol", "signer", "signer-proto", "tail", "testkit", "web", "wire"]
 
 # The decoder a published app's starter carries (sdk#347): its size is per-app storage, so it is built for size
 # alone, and apart from the SDK's own release build (whose wasm hash must not move with it).
@@ -82,7 +82,10 @@ strip = true
 # THE RECORDING SPINE, pinned ONCE: the SDK core records its engine calls, the page its ops (sdk#386's instrument
 # work). Never in a delegate's closure (probe/src/lib.rs `no_delegate_reaches_the_instrument`).
 instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "3ad6f3d" }
-craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "0fbb5c7", default-features = false, features = ["library"] }
+craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "689ca61", default-features = false, features = ["library"] }
+# THE TAIL (ARCHITECTURE §1, Tail), pinned with the Register it is built on: the same repo revision, so both are one
+# crate source and a tail's Signed/Params are the Register's own types.
+craftec-tail-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "689ca61", default-features = false }
 
 [profile.release]
 opt-level = "s"
