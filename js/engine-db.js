@@ -523,7 +523,14 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       let after = "";
       let rows = 0;
       while (!repairCancelled) {
-        const page = await once(() => JSON.parse(session.scan_all(after, limit, putBack)));
+        let page;
+        try {
+          page = await once(() => JSON.parse(session.scan_all(after, limit, putBack)));
+        } catch (e) {
+          // A group past repair ENDS its read (UNAVAILABLE, the engine's answer): the pass ends, and says DAMAGED.
+          if (e && e.code === "UNAVAILABLE") break;
+          throw e;
+        }
         rows += page.rows;
         if (page.next == null) break;
         after = page.next;

@@ -1578,6 +1578,12 @@ pub struct Engine<B: Blocks> {
     lost: BTreeSet<Cid>,
     /// `repair_counts` when the pass began: the pass's own given-up count is the difference.
     repair_base: (u64, u64, u64),
+    /// This pass's groups past repair (fewer than `k` slots the node could ever give), each given up with its reads
+    /// answered; every parity slot of a group this pass raced (the report's parity split); and each member this pass
+    /// rebuilt, by its bytes (an owed parity is re-encoded from them before the page has kept them).
+    pass_damaged: Vec<Damaged>,
+    pass_parity: BTreeSet<Cid>,
+    pass_rebuilt: BTreeMap<Cid, Vec<u8>>,
     /// Parity found missing, put back (re-encoded, id-verified), and re-encoded to a DIFFERENT id (never put).
     parity_counts: (u64, u64, u64),
     /// Why the last repair was given up, in words (the read is answered
@@ -1812,6 +1818,9 @@ impl<B: Blocks> Engine<B> {
             put_back: true,
             lost: BTreeSet::new(),
             repair_base: (0, 0, 0),
+            pass_damaged: Vec::new(),
+            pass_parity: BTreeSet::new(),
+            pass_rebuilt: BTreeMap::new(),
             parity_counts: (0, 0, 0),
             repair_failed: None,
             root,
@@ -2064,6 +2073,9 @@ impl<B: Blocks> Engine<B> {
             self.lost.clear();
             self.parity_counts = (0, 0, 0);
             self.repair_base = self.repair_counts;
+            self.pass_damaged.clear();
+            self.pass_parity.clear();
+            self.pass_rebuilt.clear();
         }
         self.repair_pass = true;
         self.put_back = put_back;
@@ -2076,7 +2088,46 @@ impl<B: Blocks> Engine<B> {
         self.repair_pass = false;
         self.put_back = true;
         self.parity_owed.clear();
+        self.pass_rebuilt.clear();
         std::mem::take(&mut self.parity_watch).into_keys().collect()
+    }
+
+    /// This pass's groups past repair (their reads answered `Unavailable`): the report's DAMAGED.
+    pub fn pass_damaged(&self) -> &[Damaged] {
+        &self.pass_damaged
+    }
+
+    /// Every parity slot of a group this pass raced: the report's parity split.
+    pub fn pass_parity(&self) -> &BTreeSet<Cid> {
+        &self.pass_parity
+    }
+
+    /// A PASS's group PAST REPAIR (core dev, engineer2's m+1 run: the pass never ended): a missed repair whose group has
+    /// fewer than `k` slots the node could ever give -- the rest answered NotFound, or silent past its bound (the page
+    /// tells the engine that miss) -- can be rebuilt by no decode. That is an ANSWER, not a time cut-off (rule 8): the
+    /// repair is given up and recorded DAMAGED, and every read waiting on the member is answered `Unavailable`, so the
+    /// pass's scan ends. Outside a pass nothing changes: the reads wait (a late answer may still land).
+    fn pass_give_up_damaged(&mut self, missing: Cid) -> Vec<Effect> {
+        let Some(r) = self.repairs.get(&missing) else { return Vec::new() };
+        let slots = r.group.slots.len();
+        let (j, k) = (slots - r.absent.len().min(slots), r.group.k);
+        if !(self.repair_pass && r.missed && j < k) {
+            return Vec::new();
+        }
+        self.repair_counts.2 += 1;
+        self.repair_failed = Some(format!("the group of {} has {j} of the {k} blocks a rebuild needs", short_id(&missing)));
+        self.pass_damaged.push(Damaged { block: missing, j, k });
+        self.end_repair(missing);
+        let reqs: Vec<read::ReqId> = self.wanted.waiting().get(&missing).map(|s| s.iter().copied().collect()).unwrap_or_default();
+        let mut out = Vec::new();
+        for req_id in reqs {
+            if let Some(p) = self.reads.parked.remove(&req_id) {
+                let result = self.gave_up(&p.want, missing);
+                self.forget_waiting(req_id);
+                out.push(Effect::Reply { client: p.client, req_id, result });
+            }
+        }
+        out
     }
 
     /// Is a REPAIR PASS on?
@@ -5132,6 +5183,12 @@ impl<B: Blocks> Engine<B> {
                     }
                 }
             }
+            // A PASS's group past repair ends here, answered (the reads end, the pass can end: core dev).
+            let damaged = self.pass_give_up_damaged(missing);
+            if !damaged.is_empty() || !self.repairs.contains_key(&missing) {
+                out.extend(damaged);
+                continue;
+            }
             out.extend(self.try_repair(missing));
         }
         if still_asked && self.wanted.is_slot(&slot) {
@@ -5170,6 +5227,7 @@ impl<B: Blocks> Engine<B> {
                     // -- the existing read repair -- but keeps no record of it; putting back PARITY is the pass's job.
                     if self.repair_pass {
                         self.lost.insert(missing);
+                        self.pass_rebuilt.insert(missing, body.clone());
                     }
                     // The page KEEPS it (the node lost it; reads go on from
                     // the page's blocks), PUTs it back, and it lands like any

@@ -1854,6 +1854,7 @@ fn report_json(page: &page::Page, r: &page::RepairReport, cancelled: bool, check
     let damaged: Vec<serde_json::Value> = page
         .damaged()
         .iter()
+        .chain(page.pass_damaged().iter())
         .map(|d| serde_json::json!({ "block": engine::short_id(&d.block), "present": d.j, "k": d.k, "health": engine::repair::GroupHealth::Damaged.code() }))
         .collect();
     let outcome = PassOutcome::of(check, r.missing, r.unanswered, r.put_back, r.rejected, r.given_up + damaged.len() as u64, cancelled);
@@ -1863,6 +1864,8 @@ fn report_json(page: &page::Page, r: &page::RepairReport, cancelled: bool, check
         "missing": r.missing,
         "unanswered": r.unanswered,
         "putBack": r.put_back,
+        "missingParity": r.missing_parity,
+        "putBackParity": r.put_back_parity,
         "reput": r.reput,
         "rejected": r.rejected,
         "givenUp": r.given_up,
@@ -1880,5 +1883,5 @@ fn empty_report_json(cancelled: bool, check: bool) -> String {
 }
 
 fn report_json_counts(o: PassOutcome) -> String {
-    serde_json::json!({ "outcome": o.code(), "outcomeList": o.list(), "missing": 0, "unanswered": 0, "putBack": 0, "reput": 0, "rejected": 0, "givenUp": 0, "parityMismatched": 0, "pending": 0, "damaged": [], "why": null }).to_string()
+    serde_json::json!({ "outcome": o.code(), "outcomeList": o.list(), "missing": 0, "unanswered": 0, "putBack": 0, "missingParity": 0, "putBackParity": 0, "reput": 0, "rejected": 0, "givenUp": 0, "parityMismatched": 0, "pending": 0, "damaged": [], "why": null }).to_string()
 }

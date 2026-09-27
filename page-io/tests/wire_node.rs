@@ -3480,11 +3480,19 @@ fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_
         assert_eq!(back, lost.len(), "the node does not hold every lost block again, byte for byte: {back} of {}", lost.len());
         assert_eq!((report.given_up, report.rejected, report.parity_mismatched), (0, 0, 0), "a repair failed: {:?}", report.why);
         assert_eq!((report.missing, report.put_back), (lost.len() as u64, lost.len() as u64), "the report does not count exactly what was lost and put back: {report:?}");
-        // A FRESH reader reads it all from the node, and nothing is missing.
+        // PARITY counted and put back too (engineer2's run showed only the data members): the report splits them.
+        let lost_parity = lost.values().filter(|st| st.first() == Some(&freenet_prolly::kind::PARITY)).count() as u64;
+        assert_eq!((report.missing_parity, report.put_back_parity), (lost_parity, lost_parity), "the parity lost is not counted and put back: {report:?}");
+        if lose {
+            assert!(lost_parity > 0, "THE SETUP: no parity block was lost");
+        }
+        // A FRESH reader CHECKS it all from the node (a check pass: only a pass counts), and nothing is missing.
         let mut f = reader_with(&node, engine::Params::default());
         client(&mut f, &mut node, &mut now, &Request::Identity);
+        f.server.page.begin_repair_pass(false);
         assert_eq!(read_all(&mut f, &mut node, &mut now, 200), 2_000, "the fresh reader did not read every row");
-        assert_eq!(f.server.page.repair_report().missing, 0, "the fresh reader still found blocks missing on the node");
+        let fresh = f.server.page.end_repair_pass();
+        assert_eq!((fresh.missing, fresh.unanswered), (0, 0), "the fresh CHECK still found blocks missing on the node: {fresh:?}");
         if !lose {
             // A race's rebuild of a block the node HAS is HELD for the node's word and dropped when it serves: never
             // re-PUT (before the node's-bound rule, 15 such re-puts on this tree).
@@ -3733,4 +3741,53 @@ fn a_block_silent_past_its_bound_is_missing_and_put_back() {
     println!("absent: {} members lost, silent; missing {}, unanswered {}, put back {}; the node holds {back} again", gone.len(), rep.missing, rep.unanswered, rep.put_back);
     assert!(rep.missing >= gone.len() as u64 && rep.put_back == rep.missing, "silent-past-bound blocks were not counted missing and put back: {rep:?}");
     assert_eq!(back, gone.len(), "a lost silent block is not back on the node");
+}
+
+/// **A GROUP PAST REPAIR ENDS THE PASS, DAMAGED** (core dev, engineer2's m+1 run: the check never ended). The node
+/// LOSES `m + 1` blocks of one group (answering NotFound): no decode can rebuild its member. A pass's read of it is
+/// answered `Unavailable` once the group is known past repair, so the pass ENDS -- within one node bound -- and says
+/// DAMAGED (given up, the group named with `j < k`).
+#[test]
+fn a_group_past_repair_ends_the_pass_damaged_within_one_bound() {
+    let Lossy { mut node, mut now, .. } = lossy_tree(57, None);
+    // One group of the root: its members, then its parity (the node's own group listing).
+    let root = node.head().expect("a head").1;
+    let root_state = node.contracts[&wire::block::contract_for(BLOCK_CODE, &root)].clone();
+    let n = freenet_prolly::node::Node::parse(&root_state[1..]).expect("the root is a node");
+    let groups = freenet_prolly::parity::group_members(&n);
+    let ids: Vec<freenet_prolly::Cid> = n.parity().collect();
+    let m = ids.len() / groups.len();
+    let (g, (_, members)) = groups.into_iter().enumerate().max_by_key(|(_, (_, ms))| ms.len()).expect("a group");
+    let slots: Vec<freenet_prolly::Cid> = members.iter().copied().chain(ids[m * g..m * g + m].iter().copied()).collect();
+    let k = members.len();
+    let gone: Vec<[u8; 32]> = slots.iter().take(m + 1).map(|c| wire::block::contract_for(BLOCK_CODE, c)).collect();
+    for id in &gone {
+        node.contracts.remove(id);
+    }
+    let mut r = reader_with(&node, engine::Params::default());
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    r.server.page.begin_repair_pass(true);
+    let start = now;
+    let mut ended_unavailable = false;
+    let mut after = None;
+    for n in 1u64..200 {
+        let req_id = 1_200 + n;
+        let got = client(&mut r, &mut node, &mut now, &Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: after.clone(), max_entries: 500 });
+        if got.iter().any(|x| matches!(x, Reply::Unavailable { req_id: q, .. } if *q == req_id)) {
+            ended_unavailable = true;
+            break;
+        }
+        match got.iter().find_map(|x| if let Reply::Page { req_id: q, cursor, .. } = x { (*q == req_id).then(|| cursor.clone()) } else { None }) {
+            Some(Some(c)) => after = Some(c),
+            Some(None) => break,
+            None => panic!("page {n} was answered neither with rows nor Unavailable"),
+        }
+    }
+    let rep = r.server.page.end_repair_pass();
+    let damaged: Vec<(usize, usize)> = r.server.page.pass_damaged().iter().map(|d| (d.j, d.k)).collect();
+    let took = now - start;
+    println!("m+1: {} of a {k}+{m} group lost; the scan ended Unavailable {ended_unavailable} after {took} ms; given up {}, damaged {damaged:?}; {rep:?}", gone.len(), rep.given_up);
+    assert!(ended_unavailable, "the pass's read of a group past repair was never answered: the pass cannot end");
+    assert!(took < page::rto::NODE_GET_BOUND_MS as u64 + page::rto::RTO_MAX_MS as u64, "the pass took {took} ms, more than one node bound");
+    assert!(rep.given_up >= 1 && damaged.iter().any(|(j, k)| j < k), "the pass did not say DAMAGED: given up {}, damaged {damaged:?}", rep.given_up);
 }

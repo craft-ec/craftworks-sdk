@@ -41,6 +41,7 @@ impl<B: Blocks> Engine<B> {
                 if self.repair_pass {
                     for i in group.k..group.slots.len() {
                         let slot = group.slots[i];
+                        self.pass_parity.insert(slot);
                         if self.blocks.get(&slot).is_some() || self.parity_watch.contains_key(&slot) || self.parity_owed.contains_key(&slot) {
                             continue;
                         }
@@ -113,7 +114,9 @@ impl<B: Blocks> Engine<B> {
             let states: Option<Vec<Vec<u8>>> = g.slots[..g.k]
                 .iter()
                 .map(|m| {
-                    self.blocks.get(m).map(|b| {
+                    // Held by the page, or rebuilt this pass (its bytes not yet kept: the page keeps them after the step).
+                    let b: Option<&[u8]> = self.blocks.get(m).or_else(|| self.pass_rebuilt.get(m).map(Vec::as_slice));
+                    b.map(|b| {
                         let mut st = Vec::with_capacity(1 + b.len());
                         st.push(g.kind);
                         st.extend_from_slice(b);

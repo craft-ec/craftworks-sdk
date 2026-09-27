@@ -537,6 +537,9 @@ pub struct RepairReport {
     /// Blocks the node never served and then ACKED a repair PUT of: members rebuilt from their group, parity
     /// re-encoded (each block once). Only what was LOST counts here.
     pub put_back: u64,
+    /// Of `missing` and `put_back`, the PARITY blocks (the rest are data: the tree's own nodes and values).
+    pub missing_parity: u64,
+    pub put_back_parity: u64,
     /// Repair PUTs acked of blocks the node DID serve (verified bytes): a race rebuilt a member before its own answer
     /// came. Counted apart, so a rebuild never passes for a repair.
     pub reput: u64,
@@ -1239,11 +1242,19 @@ impl Page {
                 self.step(Event::BlockArrived { id, bytes });
             }
             Answer::GetMissed(id) => {
-                if let Some(attempt) = self.answered_get(id) {
-                    if self.engine.in_repair_pass() {
-                        self.missing_seen.insert(id);
-                        self.release_held(id);
-                    }
+                // In a PASS the node's NotFound is RECORDED whether or not a GET still waits on it -- a race withdraws
+                // its parity GETs when the member arrives, and a parity NotFound answering one was lost uncounted,
+                // never owed, never put back (engineer2's run: 6 of 8 lost were parity). The engine hears it too.
+                let first_in_pass = self.engine.in_repair_pass() && self.missing_seen.insert(id);
+                if first_in_pass {
+                    self.release_held(id);
+                }
+                let answered = self.answered_get(id);
+                if answered.is_none() && first_in_pass {
+                    let more = self.engine.step(Event::BlockMissed(id));
+                    self.carry_out(more);
+                }
+                if let Some(attempt) = answered {
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
                     // asked again on a backoff -- a node that has not got it
@@ -2836,6 +2847,12 @@ impl Page {
         self.deadlines.get(&Waiting::Get(*id)).is_some_and(|d| !d.withdrawn) || self.get_queue.contains(id) || self.bg_queue.iter().any(|(w, _)| *w == Waiting::Get(*id))
     }
 
+    /// This pass's groups past repair (their reads answered `Unavailable`): with [`Page::damaged`]'s live ones, the
+    /// report's DAMAGED.
+    pub fn pass_damaged(&self) -> &[engine::Damaged] {
+        self.engine.pass_damaged()
+    }
+
     /// Who wants block `id` now (the engine's readers: reads, repairs, a parked write, audits).
     pub fn block_readers(&self, id: &Cid) -> engine::Readers {
         self.engine.readers_of(id)
@@ -2944,12 +2961,17 @@ impl Page {
     /// (members rebuilt from their group, parity re-encoded) and the node acked, what the node refused, and the groups
     /// no read could solve. Derived, never stored twice: the page's two sets and the engine's counts.
     pub fn repair_report(&self) -> RepairReport {
+        let missing: BTreeSet<Cid> = self.missing_seen.iter().chain(self.pass_absent.iter()).filter(|id| !self.served_seen.contains(*id)).copied().collect();
+        let put_back: BTreeSet<Cid> = self.repairs_acked.difference(&self.served_seen).copied().collect();
+        let parity = self.engine.pass_parity();
         RepairReport {
             // MISSING = what the node answered NotFound, or left unanswered past its node GET bound (core dev on #555's
             // follow-up: a block still inside its bound is UNANSWERED, never a loss), less what it served.
-            missing: self.missing_seen.iter().chain(self.pass_absent.iter()).filter(|id| !self.served_seen.contains(*id)).collect::<BTreeSet<_>>().len() as u64,
+            missing: missing.len() as u64,
+            missing_parity: missing.intersection(parity).count() as u64,
             unanswered: self.pass_undecided().len() as u64,
-            put_back: self.repairs_acked.difference(&self.served_seen).count() as u64,
+            put_back: put_back.len() as u64,
+            put_back_parity: put_back.intersection(parity).count() as u64,
             reput: self.repairs_acked.intersection(&self.served_seen).count() as u64,
             rejected: self.repairs_rejected - self.rejected_base,
             given_up: self.engine.pass_given_up(),
