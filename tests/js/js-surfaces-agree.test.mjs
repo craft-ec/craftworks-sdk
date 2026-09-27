@@ -90,8 +90,9 @@ const surfaceOf = o => {
 /** On the engine side only: there is no engine behind the in-memory one. */
 // `waitingForRoom`: writes waiting on the page queue's byte bound (QUEUE_FULL),
 // which only the engine-backed db has -- the in-memory one never fills.
-// repairAll / repairAllCancel (sdk#479): REPAIR puts back what the NODE lost; an unpublished project has no node.
-const ENGINE_ONLY = new Set(["preload", "trace", "traceOn", "watch", "liveMode", "drain", "waitingForRoom", "damaged", "repairAll", "repairAllCancel"]);
+// repairAll / repairAllCancel / checkAll (sdk#479): REPAIR puts back (CHECK counts) what the NODE lost; an
+// unpublished project has no node.
+const ENGINE_ONLY = new Set(["preload", "trace", "traceOn", "watch", "liveMode", "drain", "waitingForRoom", "damaged", "repairAll", "repairAllCancel", "checkAll"]);
 
 await t("**the engine-backed db offers every method the in-memory one does**", () => {
   const memory = surfaceOf(wrap(fakeRaw()).Db.prototype ?? new (wrap(fakeRaw()).Db)());

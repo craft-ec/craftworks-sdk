@@ -3446,7 +3446,7 @@ fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_
         }
         // REPAIR: a cold reader reads the whole tree.
         let mut r = reader_with(&node, engine::Params::default());
-        r.server.page.set_repair_pass(true);
+        r.server.page.set_repair_pass(true, true);
         client(&mut r, &mut node, &mut now, &Request::Identity);
         assert_eq!(read_all(&mut r, &mut node, &mut now, 100), 2_000, "the repairing read did not read every row");
         let report = r.server.page.repair_report();
@@ -3464,4 +3464,62 @@ fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_
             assert_eq!((report.missing, report.put_back), (0, 0), "THE CONTROL: a whole tree was found missing or put back");
         }
     }
+}
+
+/// **A CHECK PUTS NOTHING, AND COUNTS WHAT IS LOST** (sdk#479; the tab shows DEGRADED before "Repair now"). The node
+/// loses every 7th block of a published tree's current blocks; a cold reader in CHECK mode (`put_back` false) reads
+/// every row and counts each lost block missing, and the node receives ZERO block PUTs -- the lost blocks are still
+/// lost after it. Then a REPAIR reader puts every one back. (The control that the check really suppresses the puts is
+/// the mutant "the engine ignores put_back", which turns this red.)
+#[test]
+fn a_check_reads_the_whole_tree_counts_every_lost_block_and_puts_nothing_then_a_repair_puts_them_back() {
+    let rows = |lo: u32, hi: u32| -> Vec<protocol::Op> { (lo..hi).map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), vec![i as u8; 90])).collect() };
+    let mut node = WireNode::new(&[43u8; 32]);
+    let mut now = 1_000;
+    let mut w = page_io(&node);
+    client(&mut w, &mut node, &mut now, &Request::Identity);
+    for (n, lo) in (0..2_000u32).step_by(500).enumerate() {
+        assert!(states(&client(&mut w, &mut node, &mut now, &Request::forced_write(n as u64 + 1, rows(lo, lo + 500))), n as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
+    }
+    let (_, root) = node.head().expect("a head");
+    let mut tree: std::collections::BTreeSet<freenet_prolly::Cid> = std::collections::BTreeSet::from([root]);
+    let mut at = vec![root];
+    while let Some(id) = at.pop() {
+        let bytes = freenet_prolly::store::Blocks::get(w.server.page.blocks(), &id).expect("the writer holds its tree").to_vec();
+        let n = freenet_prolly::node::Node::parse(&bytes).expect("a node");
+        tree.extend(n.parity());
+        for (_, members) in freenet_prolly::parity::group_members(&n) {
+            tree.extend(members.iter().copied());
+        }
+        if !n.is_leaf() {
+            at.extend((0..n.len()).map(|i| n.child(i).0));
+        }
+    }
+    let blocks: Vec<[u8; 32]> = tree.iter().map(|c| wire::block::contract_for(BLOCK_CODE, c)).filter(|id| node.contracts.contains_key(id)).collect();
+    let lost: Vec<[u8; 32]> = blocks.iter().step_by(7).copied().collect();
+    for id in &lost {
+        node.contracts.remove(id);
+    }
+    // THE CHECK.
+    let puts_before = node.served.get("put block").copied().unwrap_or(0);
+    let mut c = reader_with(&node, engine::Params::default());
+    c.server.page.set_repair_pass(true, false);
+    client(&mut c, &mut node, &mut now, &Request::Identity);
+    assert_eq!(read_all(&mut c, &mut node, &mut now, 300), 2_000, "the check did not read every row");
+    let check = c.server.page.repair_report();
+    let puts = node.served.get("put block").copied().unwrap_or(0) - puts_before;
+    println!("check: {} of {} current-tree blocks lost; missing {}, put back {}, given up {}; block PUTs on the wire {puts}", lost.len(), blocks.len(), check.missing, check.put_back, check.given_up);
+    assert_eq!(puts, 0, "a CHECK sent {puts} block PUTs");
+    assert_eq!(check.missing, lost.len() as u64, "the check did not count exactly the lost blocks: {check:?}");
+    assert_eq!((check.put_back, check.given_up), (0, 0), "the check put back or gave up: {check:?}");
+    assert!(lost.iter().all(|id| !node.contracts.contains_key(id)), "a lost block is back after a CHECK");
+    // THE REPAIR afterwards.
+    let mut r = reader_with(&node, engine::Params::default());
+    r.server.page.set_repair_pass(true, true);
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    assert_eq!(read_all(&mut r, &mut node, &mut now, 400), 2_000, "the repair did not read every row");
+    let rep = r.server.page.repair_report();
+    println!("repair after: missing {}, put back {}", rep.missing, rep.put_back);
+    assert_eq!((rep.missing, rep.put_back, rep.given_up), (lost.len() as u64, lost.len() as u64, 0), "the repair after the check: {rep:?}");
+    assert!(lost.iter().all(|id| node.contracts.contains_key(id)), "a lost block is not back after the repair");
 }

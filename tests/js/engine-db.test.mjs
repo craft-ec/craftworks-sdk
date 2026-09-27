@@ -501,8 +501,10 @@ const repairSession = ({ pages = 3, pending = 2 } = {}) => {
   let owed = pending;
   const s = {
     asked: [],
-    scan_all(after, limit) {
+    putBack: [],
+    scan_all(after, limit, putBack) {
       s.asked.push(after);
+      s.putBack.push(putBack);
       if (!loaded) {
         setTimeout(() => { loaded = true; ended.push({ id: 1, ok: true, code: "LOADED" }); s.wake(); }, 5);
         const e = new Error("not loaded");
@@ -512,8 +514,8 @@ const repairSession = ({ pages = 3, pending = 2 } = {}) => {
       const n = after === "" ? 0 : Number(after);
       return JSON.stringify({ rows: 10, next: n + 1 < pages ? String(n + 1) : null });
     },
-    repair_report(cancelled) {
-      return JSON.stringify({ outcome: cancelled ? "cancelled" : owed ? "partial" : "repaired", missing: 2, putBack: pending - owed, rejected: 0, givenUp: 0, parityMismatched: 0, pending: owed, damaged: [], why: null });
+    repair_report(cancelled, check) {
+      return JSON.stringify({ outcome: cancelled ? "cancelled" : check ? "DEGRADED" : owed ? "partial" : "repaired", missing: 2, putBack: pending - owed, rejected: 0, givenUp: 0, parityMismatched: 0, pending: owed, damaged: [], why: null });
     },
     answerPuts() { owed = 0; s.wake(); },
     take_loads() { const out = ended; ended = []; return JSON.stringify(out); },
@@ -537,6 +539,15 @@ await t("repairAll reads every page of the tree, waits for its put-backs' answer
   assert.equal(r.rows, 30);
   assert.equal(r.outcome, "repaired", "the outcome is not the session's word");
   assert.equal(r.putBack, 2);
+});
+
+await t("checkAll reads every page with putBack false, waits for no put-back, and returns the session's check word", async () => {
+  const s = repairSession({ pages: 2, pending: 2 });
+  const db = engineDb(s);
+  const r = await db.checkAll({ limit: 10 });
+  assert.deepEqual(s.putBack.filter((_, i) => i > 0), [false, false], "a check page asked the session to put back");
+  assert.equal(r.rows, 20);
+  assert.equal(r.outcome, "DEGRADED", "the outcome is not the session's check word");
 });
 
 await t("repairAllCancel stops a running pass: it resolves CANCELLED with the counts so far", async () => {

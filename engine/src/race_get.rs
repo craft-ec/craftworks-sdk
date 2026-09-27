@@ -65,7 +65,8 @@ impl<B: Blocks> Engine<B> {
         let mut out = vec![Effect::Keep { id, bytes: body.to_vec() }];
         // PUT back for whoever needed it: a read, or a parked write (sdk#405) -- the network is whole again.
         let wants = self.readers_of(&id);
-        if wants.reads || wants.parked_write {
+        // A CHECK pass (sdk#479) puts nothing: it only counts.
+        if self.put_back && (wants.reads || wants.parked_write) {
             out.push(Effect::PutRepaired { id, bytes: body.to_vec() });
         }
         out
@@ -103,6 +104,10 @@ impl<B: Blocks> Engine<B> {
     /// under a listed id). A member not held yet leaves it owed: the scan that reads the group brings it.
     pub(crate) fn put_owed_parity(&mut self) -> Vec<Effect> {
         let mut out = Vec::new();
+        // A CHECK pass (sdk#479) puts nothing: an owed parity stays owed, counted lost.
+        if !self.put_back {
+            return out;
+        }
         let owed: Vec<(Cid, crate::repair::Group)> = self.parity_owed.iter().map(|(c, g)| (*c, g.clone())).collect();
         for (id, g) in owed {
             let states: Option<Vec<Vec<u8>>> = g.slots[..g.k]

@@ -528,8 +528,8 @@ pub const HEAD_BACKSTOP_MS: u64 = 120_000;
 /// REPAIR's numbers (sdk#479): [`Page::repair_report`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepairReport {
-    /// Distinct blocks the node did not serve: answered NotFound, or never served and put back (a real node answers a
-    /// block it lacks with silence as often as NotFound). Members and parity.
+    /// Distinct blocks the node did not serve: answered NotFound, or never served and rebuilt or put back (a real node
+    /// answers a block it lacks with silence as often as NotFound). Members and parity. A CHECK pass counts the same.
     pub missing: u64,
     /// Blocks the node never served and then ACKED a repair PUT of: members rebuilt from their group, parity
     /// re-encoded (each block once). Only what was LOST counts here.
@@ -2755,9 +2755,11 @@ impl Page {
         self.repairs_rejected
     }
 
-    /// REPAIR mode (sdk#479, [`engine::Engine::set_repair_pass`]): a whole-tree repair read turns it on.
-    pub fn set_repair_pass(&mut self, on: bool) {
+    /// REPAIR mode (sdk#479, [`engine::Engine::set_repair_pass`]): a whole-tree read turns it on; `put_back` false makes
+    /// it a CHECK -- everything counted, nothing PUT ([`engine::Engine::set_put_back`]).
+    pub fn set_repair_pass(&mut self, on: bool, put_back: bool) {
         self.engine.set_repair_pass(on);
+        self.engine.set_put_back(put_back);
     }
 
     /// REPAIR's numbers (sdk#479), since this page opened: what its reads found missing on the node, what it put back
@@ -2767,7 +2769,16 @@ impl Page {
         RepairReport {
             // A real node answers a block it lacks with SILENCE as often as NotFound (measured live, sdk#479): what the
             // node never SERVED and a repair had to put back is missing too.
-            missing: self.missing_seen.iter().chain(self.repair_puts.iter()).chain(self.repairs_acked.iter()).filter(|id| !self.served_seen.contains(*id)).collect::<BTreeSet<_>>().len() as u64,
+            // And what a CHECK pass found lost without putting it back (the engine's `lost`: rebuilt, or parity NotFound).
+            missing: self
+                .missing_seen
+                .iter()
+                .chain(self.repair_puts.iter())
+                .chain(self.repairs_acked.iter())
+                .chain(self.engine.lost().iter())
+                .filter(|id| !self.served_seen.contains(*id))
+                .collect::<BTreeSet<_>>()
+                .len() as u64,
             put_back: self.repairs_acked.difference(&self.served_seen).count() as u64,
             reput: self.repairs_acked.intersection(&self.served_seen).count() as u64,
             rejected: self.repairs_rejected,

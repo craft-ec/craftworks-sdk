@@ -27,7 +27,7 @@
 //! of 2026-09-23 was one of them going stale. The one head-shaped fact kept
 //! here is each LIVE binding's `RenderedAt`, which only the binding can know.
 
-use craftworks_sdk::status::{AppPublishStatus, AskedState, CanWrite, PutStatus, RepairOutcome, SiteStatus};
+use craftworks_sdk::status::{AppPublishStatus, AskedState, CanWrite, PassOutcome, PutStatus, SiteStatus};
 use craftworks_sdk::{DbError, Outcome, PageStore, SystemEnv};
 use page_io::PageIo;
 use wasm_bindgen::prelude::*;
@@ -664,24 +664,27 @@ impl Session {
 
     /// ONE PAGE of a whole-tree read for REPAIR (sdk#479): `{"rows", "next"}`, `next` the hex key to pass back as
     /// `after` (`null` when the tree is read). A NOT_LOADED is a ticket like every read (`once` in js/engine-db.js).
-    pub fn scan_all(&mut self, after: &str, limit: usize) -> Result<String, JsValue> {
+    /// `put_back` false makes it a CHECK: everything lost is counted, nothing is PUT.
+    pub fn scan_all(&mut self, after: &str, limit: usize, put_back: bool) -> Result<String, JsValue> {
         let after = if after.is_empty() { None } else { Some(core_types::hex::decode(after).ok_or_else(|| JsValue::from_str("after is not hex"))?) };
         // The whole-tree read IS the repair: its reads keep each parity GET out until the node answers.
         if let Some(p) = self.page_mut() {
-            p.server.page.set_repair_pass(true);
+            p.server.page.set_repair_pass(true, put_back);
         }
         let r = self.db.scan_all(after, limit).map(|(rows, next)| serde_json::json!({ "rows": rows, "next": next.map(|k| core_types::hex::encode(&k)) }));
         self.answer(r)
     }
 
     /// REPAIR's report (sdk#479), as JSON: what this session's reads found missing on the node and put back since it
-    /// opened -- `{"outcome", "missing", "putBack", "reput", "rejected", "givenUp", "parityMismatched", "pending", "damaged":[{"block",
-    /// "present", "k", "health"}], "why"}`. `outcome` is a word of `sdk.status.repairOutcome` (`RepairOutcome::of`,
-    /// the one derivation; `cancelled` says the pass was stopped), each `health` one of `sdk.status.groupHealth`.
-    /// `repairAll` (js/engine-db.js) reads the whole tree through the normal read, then asks this.
-    pub fn repair_report(&self, cancelled: bool) -> String {
+    /// opened -- `{"outcome", "outcomeList", "missing", "putBack", "reput", "rejected", "givenUp", "parityMismatched",
+    /// "pending", "damaged":[{"block", "present", "k", "health"}], "why"}`. `outcome` is a word of the `sdk.status` list
+    /// `outcomeList` names (`PassOutcome::of`, the one derivation: the tree's `groupHealth`, or `repairOutcome` for what
+    /// a repair did; `cancelled` says the pass was stopped, `check` that it put nothing back), each `health` one of
+    /// `sdk.status.groupHealth`. `repairAll` / `checkAll` (js/engine-db.js) read the whole tree, then ask this.
+    pub fn repair_report(&self, cancelled: bool, check: bool) -> String {
         let Some(p) = self.page() else {
-            return serde_json::json!({ "outcome": RepairOutcome::of(0, 0, 0, 0, cancelled).code(), "missing": 0, "putBack": 0, "reput": 0, "rejected": 0, "givenUp": 0, "parityMismatched": 0, "pending": 0, "damaged": [], "why": null }).to_string();
+            let o = PassOutcome::of(check, 0, 0, 0, 0, cancelled);
+            return serde_json::json!({ "outcome": o.code(), "outcomeList": o.list(), "missing": 0, "putBack": 0, "reput": 0, "rejected": 0, "givenUp": 0, "parityMismatched": 0, "pending": 0, "damaged": [], "why": null }).to_string();
         };
         let r = p.server.page.repair_report();
         let damaged: Vec<serde_json::Value> = p
@@ -691,9 +694,10 @@ impl Session {
             .iter()
             .map(|d| serde_json::json!({ "block": engine::short_id(&d.block), "present": d.j, "k": d.k, "health": engine::repair::GroupHealth::Damaged.code() }))
             .collect();
-        let outcome = RepairOutcome::of(r.missing, r.put_back, r.rejected, r.given_up + damaged.len() as u64, cancelled);
+        let outcome = PassOutcome::of(check, r.missing, r.put_back, r.rejected, r.given_up + damaged.len() as u64, cancelled);
         serde_json::json!({
             "outcome": outcome.code(),
+            "outcomeList": outcome.list(),
             "missing": r.missing,
             "putBack": r.put_back,
             "reput": r.reput,
