@@ -98,16 +98,20 @@ export function misnamedModels(metadata, read) {
  * other test target, by name. `null` when nothing is skipped (plain `cargo test -p`). Doc-tests cannot be mixed with
  * target flags, so `doc` says whether a separate `--doc` run is needed to count the same tests as the baseline.
  */
+/** A library target, whatever crate type it declares: `lib`, `rlib`, `cdylib`, ... (the root crate is an `rlib`: a
+ * test for `lib` alone dropped its 14 unit tests from every PR's count). */
+const isLib = t => t.kind.some(k => k === "lib" || k === "rlib" || k === "dylib" || k === "cdylib" || k === "staticlib" || k === "proc-macro");
+
 export function testArgs(metadata, member, skip) {
   const pkg = metadata.packages.find(p => p.name === member);
   if (!pkg) throw new Error(`no workspace member ${member}`);
   const tests = pkg.targets.filter(t => t.kind.includes("test"));
   if (!tests.some(t => skip.includes(t.name))) return { args: null, doc: false };
   const args = [];
-  if (pkg.targets.some(t => t.kind.includes("lib"))) args.push("--lib");
+  if (pkg.targets.some(isLib)) args.push("--lib");
   if (pkg.targets.some(t => t.kind.includes("bin"))) args.push("--bins");
   for (const t of tests) if (!skip.includes(t.name)) args.push("--test", t.name);
-  return { args, doc: pkg.targets.some(t => t.kind.includes("lib") && t.doctest !== false) };
+  return { args, doc: pkg.targets.some(t => isLib(t) && t.doctest !== false) };
 }
 
 /** One member's line: `before -> after`, and whether it is a DROP (a test that stopped running). */

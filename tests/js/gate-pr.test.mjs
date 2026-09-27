@@ -110,6 +110,10 @@ await t("**the MODEL targets are DERIVED (never listed): both gates run them in 
   assert.ok(!page.args.includes("model"), `model ran in DEBUG beside --profile model: ${page.args}`);
   assert.ok(page.args.includes("--lib") && page.args.includes("race_get"), `page's other tests were dropped: ${page.args}`);
   assert.equal(page.doc, true, "page's doc-tests would not be counted");
+  // The root crate's library is an `rlib`: its unit tests and doc-tests run beside its model target too.
+  const sdk = testArgs(meta, "craftworks-sdk", modelTargets(meta, "craftworks-sdk"));
+  assert.ok(sdk.args.includes("--lib") && !sdk.args.includes("write_path_model"), `craftworks-sdk's lib tests were dropped: ${sdk.args}`);
+  assert.equal(sdk.doc, true, "craftworks-sdk's doc-tests would not be counted");
   const pr = plan(root, "page/src/lib.rs");
   assert.equal(planLine(pr.stdout, "model seeds"), "4 of 40 (GATE_PR_MODEL_SEEDS), --profile model", "--pr does not state its model seeds");
   const batch = gate(root, ["--dry-run"], { CRAFTWORKS_MODEL_SEEDS: "" });
