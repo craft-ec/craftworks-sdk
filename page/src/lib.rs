@@ -72,6 +72,7 @@ pub mod fates;
 pub mod unusable;
 mod judge;
 mod publication;
+mod follow;
 pub mod loader;
 pub mod obs;
 pub mod rto;
@@ -677,6 +678,11 @@ pub struct Page {
     /// only by [`Pubs::on`] (private fields: the compiler holds it). A site's [`Publication`] is derived from its
     /// state; a Sign's id is never stored -- it is the one on its op on the wire.
     pubs: Pubs,
+    /// Each FOLLOWED site's follow (sdk#520; H4 sdk#533): a machine of its own beside the site's `Life`, written only
+    /// by [`follow::Follows::on`]. Its only act is a read (P7); it outlives any publish (P8).
+    follows: follow::Follows,
+    /// Follow events that landed in an impossible cell (counted, never a panic; a test asserts 0).
+    impossible_follow_cells: u64,
     /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
@@ -829,6 +835,8 @@ impl Page {
             confirmed: BTreeSet::new(),
             held: Vec::new(),
             pubs: Pubs::default(),
+            follows: follow::Follows::default(),
+            impossible_follow_cells: 0,
             held_again: BTreeMap::new(),
             audit_answers: Vec::new(),
             held_asks: BTreeSet::new(),
@@ -1017,6 +1025,11 @@ impl Page {
         // E10: the clock, to every label (its state decides: a backoff due, a verify due, a stale read-back).
         for label in self.pubs.labels() {
             self.life_on(&label, Ev::Due);
+        }
+        // E10 for each follow whose NotFound backoff came due.
+        let due: Vec<String> = self.follows.due().filter(|(_, at)| *at <= now).map(|(a, _)| a.clone()).collect();
+        for app in due {
+            self.follow_on(&app, follow::FollowEv::Due);
         }
         // THE BACKSTOP: a hint can be dropped, so an idle page reads every
         // register it FOLLOWS at least every HEAD_BACKSTOP_MS -- the head's,
@@ -1212,9 +1225,14 @@ impl Page {
             // read-back: a head is a head, whoever asked.
             // A SITE's read answers only its own read-back: the engine never hears a site (architect).
             Answer::Head { label: Label::Site(app), read } => {
+                // ONE read, TWO holders (joins any): the life and the follow each take the answer.
                 if self.answered(&Waiting::ReadBack(Label::Site(app.clone()))).is_some() {
                     self.last_read_at.insert(Label::Site(app.clone()), self.now);
-                    self.life_on(&Label::Site(app), Ev::SiteRead(read.as_ref()));
+                    self.life_on(&Label::Site(app.clone()), Ev::SiteRead(read.as_ref()));
+                    // Only a follow that HOLDS the read takes it (Reading, Showing): a Refused one holds none (¹³).
+                    if self.follow_reads(&app) {
+                        self.follow_on(&app, follow::FollowEv::Read(read.as_ref()));
+                    }
                 }
             }
             Answer::Head { label: Label::Head, read } => {
@@ -1293,10 +1311,61 @@ impl Page {
     /// writer, and what it returns is carried out here, in order.
     fn life_on(&mut self, label: &Label, ev: Ev<'_>) {
         let cx = Cx { now: self.now, published: self.engine_published(), engine_has_head: self.engine_has_head };
+        let ended_before = self.site_ended_at(label);
         let acts = self.pubs.on(label, ev, &cx);
         for act in acts {
             self.carry_act(label, act);
         }
+        // E14 (H4): THIS page's publish of a site ended at v -- the node's word -- goes to the site's follow.
+        if let (Label::Site(app), None, Some(v)) = (label, ended_before, self.site_ended_at(label)) {
+            self.follow_on(app, follow::FollowEv::Published(v));
+        }
+    }
+
+    /// The version a site's publish ENDED at (Published or Superseded), or `None`.
+    fn site_ended_at(&self, label: &Label) -> Option<u64> {
+        match label {
+            Label::Site(app) => match self.pubs.site(app) {
+                Some(Life::Ended(Publication::Published { version } | Publication::Superseded { version })) => Some(*version),
+                Some(_) | None => None,
+            },
+            Label::Head => None,
+        }
+    }
+
+    /// ONE event of `app`'s FOLLOW, through its one writer, and its acts carried: a read (joining one already out), or
+    /// the follow leaving ITS read -- the life's read-back, if one is owed, still completes (two holders, one read).
+    fn follow_on(&mut self, app: &str, ev: follow::FollowEv<'_>) {
+        let (acts, cell) = self.follows.on(app, ev, self.now);
+        if cell == follow::FollowCell::Impossible {
+            self.impossible_follow_cells += 1;
+        }
+        let label = Label::Site(app.to_string());
+        for act in acts {
+            match act {
+                follow::FollowAct::Read => {
+                    if self.register_idle(&label) {
+                        self.follow_read(&label);
+                    }
+                }
+                follow::FollowAct::EndRead => {
+                    if !self.life_reads(app) {
+                        self.end(&Waiting::ReadBack(label.clone()), End::Withdrawn);
+                        self.attempt_of.remove(&Waiting::ReadBack(label.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Does the site's LIFE hold its read (Reading, or a written record read back)?
+    fn life_reads(&self, app: &str) -> bool {
+        matches!(self.pubs.site(app), Some(Life::Reading { .. } | Life::Written { .. }))
+    }
+
+    /// Does the site's FOLLOW hold its read (Reading, or Showing: its subscription)?
+    fn follow_reads(&self, app: &str) -> bool {
+        matches!(self.follows.get(app), Some(follow::Follow::Reading { .. } | follow::Follow::Showing { .. }))
     }
 
     /// One [`Act`] of a label's transition.
@@ -1317,6 +1386,8 @@ impl Page {
             Act::EndWaits => {
                 let reads = match label {
                     Label::Head => vec![Waiting::ReadBack(Label::Head), Waiting::Verify],
+                    // TWO HOLDERS OF ONE READ (the architect on H4): a site's read the FOLLOW still holds stays.
+                    Label::Site(app) if self.follow_reads(app) => Vec::new(),
                     Label::Site(_) => vec![Waiting::ReadBack(label.clone())],
                 };
                 for w in [Waiting::Sign(label.clone()), Waiting::Update(label.clone())].into_iter().chain(reads) {
@@ -1527,8 +1598,46 @@ impl Page {
     }
 
     /// How a site's publication stands (builder#117), DERIVED from its `Life`, the one owner. `None`: never asked.
+    ///
+    /// ONE derivation over the site's LIFE and its FOLLOW (PUBLISH-LIFE, H4): a publish in flight is `Publishing`; a
+    /// publish's end is that end -- except Published/Superseded at v when the follow shows a NEWER w (another device
+    /// published after: the node's word) -> `Published{w}`; with no publish, the follow's word (`Reading`,
+    /// `Published{v}`, `Refused`), or `None`.
     pub fn publication(&self, app: &str) -> Option<Publication> {
-        self.pubs.site(app).and_then(Life::publication)
+        let showing = match self.follows.get(app) {
+            Some(follow::Follow::Showing { version }) => Some(*version),
+            Some(follow::Follow::Reading { .. } | follow::Follow::Refused { .. }) | None => None,
+        };
+        match self.pubs.site(app).and_then(Life::publication) {
+            Some(Publication::Published { version } | Publication::Superseded { version }) if showing.is_some_and(|w| w > version) => {
+                showing.map(|version| Publication::Published { version })
+            }
+            Some(p) => Some(p),
+            None => self.follows.get(app).map(|f| match f {
+                follow::Follow::Reading { .. } => Publication::Reading,
+                follow::Follow::Showing { version } => Publication::Published { version: *version },
+                follow::Follow::Refused { why } => Publication::Refused(why.clone()),
+            }),
+        }
+    }
+
+    /// The version `app`'s FOLLOW shows live (the node's word), whatever this page's publish says; `None` while it reads,
+    /// is refused, or does not follow.
+    pub fn follow_version(&self, app: &str) -> Option<u64> {
+        match self.follows.get(app) {
+            Some(follow::Follow::Showing { version }) => Some(*version),
+            Some(follow::Follow::Reading { .. } | follow::Follow::Refused { .. }) | None => None,
+        }
+    }
+
+    /// Follow events that landed in an impossible cell (PUBLISH-LIFE's FOLLOW ¹³ / ²): a test asserts 0.
+    pub fn impossible_follow_cells(&self) -> u64 {
+        self.impossible_follow_cells
+    }
+
+    /// Does this page FOLLOW `app`'s site (a reopen asked, whatever its state)? page-io keeps the site's read for it.
+    pub fn follows(&self, app: &str) -> bool {
+        self.follows.get(app).is_some()
     }
 
     /// The person CANCELS a site's publication: every wait of it ends, and it says so.
@@ -1543,23 +1652,23 @@ impl Page {
     pub fn follow_site(&mut self, app: &str, now: Ms) {
         self.now = now.0;
         self.last_read_at.insert(Label::Site(app.to_string()), self.now);
-        self.life_on(&Label::Site(app.to_string()), Ev::Follow);
+        self.follow_on(app, follow::FollowEv::Follow);
     }
 
     /// The node said a FOLLOWED site's register changed, WITH its full state: an ordinary E9 read (the node's word).
     /// A site this page is not following takes nothing from a push (a publisher's own read-back decides for it).
     pub fn site_pushed(&mut self, app: &str, read: HeadRead) {
         let label = Label::Site(app.to_string());
-        if matches!(self.pubs.site(app), Some(Life::Following { .. })) {
-            self.last_read_at.insert(label.clone(), self.now);
-            self.life_on(&label, Ev::SiteRead(Some(&read)));
+        if matches!(self.follows.get(app), Some(follow::Follow::Showing { .. })) {
+            self.last_read_at.insert(label, self.now);
+            self.follow_on(app, follow::FollowEv::Read(Some(&read)));
         }
     }
 
     /// The node said a FOLLOWED site's register changed, with no state (a hint): read it, unless a read is out.
     pub fn site_hint(&mut self, app: &str) {
         let label = Label::Site(app.to_string());
-        if matches!(self.pubs.site(app), Some(Life::Following { .. })) && self.register_idle(&label) {
+        if matches!(self.follows.get(app), Some(follow::Follow::Showing { .. })) && self.register_idle(&label) {
             self.follow_read(&label);
         }
     }
@@ -1567,7 +1676,7 @@ impl Page {
     /// Every register this page FOLLOWS (sdk#520): the head once there is one, and each site a reopen follows.
     fn followed(&self) -> Vec<Label> {
         let head = self.engine_has_head.then_some(Label::Head);
-        let sites = self.pubs.labels().into_iter().filter(|l| matches!(l, Label::Site(app) if matches!(self.pubs.site(app), Some(Life::Following { .. }))));
+        let sites = self.follows.showing().map(|app| Label::Site(app.clone()));
         head.into_iter().chain(sites).collect()
     }
 
@@ -2096,7 +2205,7 @@ impl Page {
         // the next tick. A host that armed only for deadlines would sleep
         // through a back-off (the differential's RecordNotSaved case did).
         let deadlines = self.deadlines.values().map(|d| d.at);
-        let sign = self.pubs.lives().filter_map(Life::due_at).min();
+        let sign = self.pubs.lives().filter_map(Life::due_at).chain(self.follows.due().map(|(_, at)| at)).min();
         let held = self.held_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
         let puts = (!self.put_again.is_empty()).then_some(self.now);
         let backstop = self.followed().iter().map(|l| self.read_at(l) + HEAD_BACKSTOP_MS).min();
