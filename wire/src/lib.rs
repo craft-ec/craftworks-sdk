@@ -128,7 +128,8 @@ pub const MAX_SITE_WEB: usize = MAX_READ_STATE - 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GetFail {
     /// The node's explicit NotFound: no such contract. The only answer that
-    /// says the contract is absent.
+    /// says the contract is absent -- from a network node `ContractResponse::NotFound`, from a LOCAL node
+    /// (`freenet local`) the `ContractError::MissingContract` naming it (see `decode_one`).
     NotFound,
     /// The node refused the GET, in its cause's words. Says nothing about
     /// whether the contract exists: re-asked, never read as absent.
@@ -616,6 +617,13 @@ fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
     match Reassembler::decode(bytes) {
         Ok(d) => Ok(d),
         Err(Unusable::TooLarge) => Err(too_large(bytes)),
+        // A LOCAL node's "no such contract" (`freenet local`; freenet-core 0.2.138 contract/executor/runtime.rs: the
+        // GET and the SUBSCRIBE of a contract it never stored answer `ContractError::MissingContract { key }`): the
+        // same fact as a network node's explicit NotFound, so the same message. Seen live 2026-09-27: without it a
+        // page on a local node never opened (its head's first read, before the first PUT, was a refusal).
+        Err(Unusable::NodeSaidNo) if missing_contract(bytes).is_some() => {
+            Err(Incoming::GetFailed { id: missing_contract(bytes).expect("just checked"), why: GetFail::NotFound })
+        }
         // A GET refusal that names its contract: which GET it answers.
         Err(Unusable::NodeSaidNo) if get_refused(bytes).is_some() => {
             let (id, cause) = get_refused(bytes).expect("just checked");
@@ -766,6 +774,14 @@ fn contract_error(bytes: &[u8]) -> Option<freenet_stdlib::client_api::ContractEr
     use freenet_stdlib::client_api::{ErrorKind, RequestError};
     match node_error(bytes)? {
         ErrorKind::RequestError(RequestError::ContractError(c)) => Some(c),
+        _ => None,
+    }
+}
+
+/// The contract a local node says it does not have (`ContractError::MissingContract`), if the bytes are that.
+fn missing_contract(bytes: &[u8]) -> Option<[u8; 32]> {
+    match contract_error(bytes)? {
+        freenet_stdlib::client_api::ContractError::MissingContract { key } => key.as_bytes().get(..32)?.try_into().ok(),
         _ => None,
     }
 }
