@@ -185,6 +185,13 @@ impl Site {
     }
 }
 
+/// A SITE's register read from its contract STATE -- the web framing's META as a Register record -- in ONE place, for
+/// a GET's answer and a subscription's push alike (Codex on #543, 3). `None`: the state is not a web framing (the site
+/// contract admits none); `Some(None)`: a framing whose record does not read.
+fn site_read_of(state: &[u8]) -> Option<Option<page::HeadRead>> {
+    contract_keys::site::framing(state).map(|(meta, _)| page::HeadRead::from_record(meta))
+}
+
 /// Why a page holds a site. ONE read (rule 4): a site is read by the same GET whether it is published or audited;
 /// only a publisher PUTs, signs and follows it.
 enum SiteRole {
@@ -1172,11 +1179,8 @@ impl PageIo {
                 } else if let Some(app) = self.site_by_id(&id) {
                     // A site's record is its framing's META. A state that does not frame is no answer (the site
                     // contract admits none): named, and the read stays silent, re-asked on the RTO.
-                    match contract_keys::site::framing(&state) {
-                        Some((meta, _)) => {
-                            let read = page::HeadRead::from_record(meta);
-                            self.server.node(Answer::Head { label: Label::Site(app), read }, now)
-                        }
+                    match site_read_of(&state) {
+                        Some(read) => self.server.node(Answer::Head { label: Label::Site(app), read }, now),
                         None => self.say(page::unusable::Site::of("page-io::said::site-not-web"), format!("a site state for {app} that is not a web framing")),
                     }
                 } else if let Some(cid) = self.by_contract.get(&id).copied() {
@@ -1397,7 +1401,9 @@ impl PageIo {
             // unknown key is nobody's.
             Incoming::HeadChanged { key, state } => {
                 if let Some(app) = self.sites.iter().find(|(_, s)| s.subscribed_key() == Some(key.as_str())).map(|(a, _)| a.clone()) {
-                    match state.as_deref().and_then(page::HeadRead::from_record) {
+                    // THE ONE SITE DECODER (Codex on #543, 3): a pushed state is the site's web framing, exactly as a
+                    // GET's answer; a framed record is the node's word, anything else (a delta, no state) a hint.
+                    match state.as_deref().and_then(site_read_of).flatten() {
                         Some(read) => self.server.site_pushed(&app, read),
                         None => self.server.site_hint(&app),
                     }
@@ -1456,13 +1462,17 @@ impl PageIo {
     fn owns(&self, incoming: &Incoming) -> bool {
         let mine = |id: &[u8; 32]| *id == self.register_id || self.by_contract.contains_key(id) || self.sites.values().any(|s| s.id == *id);
         let my_key = |k: &String| *k == self.register_key || self.by_key.contains_key(k) || self.sites.values().any(|s| s.published_key() == Some(k.as_str()));
+        // A site this page SUBSCRIBES to (a publisher, or a reopen following it): its changes and its subscription ack
+        // are this page's (Codex on #543: a Following site's pushes were not taken).
+        let subscribed = |k: &String| self.sites.values().any(|s| s.subscribed_key() == Some(k.as_str()));
         match incoming {
             Incoming::Got { id, .. } | Incoming::GetFailed { id, .. } => mine(id),
             Incoming::Ack(wire::AckKind::Put(k)) | Incoming::PutFailed { key: k, .. } => my_key(k) || !self.read_only(),
             Incoming::PutFailedByText { key, .. } => my_key(key) || !self.read_only(),
-            Incoming::Ack(wire::AckKind::Updated(k)) | Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k),
-            // A site's change is its own (taken, and read by nobody: the page does not follow a site).
-            Incoming::HeadChanged { key, .. } => *key == self.register_key || self.sites.values().any(|s| s.published_key() == Some(key.as_str())),
+            Incoming::Ack(wire::AckKind::Updated(k)) => my_key(k),
+            Incoming::Ack(wire::AckKind::Subscribed(k)) => my_key(k) || subscribed(k),
+            // The head's change, or a subscribed site's (read by its follow; a publisher's own read-back decides for it).
+            Incoming::HeadChanged { key, .. } => *key == self.register_key || subscribed(key),
             Incoming::Partial => true,
             Incoming::DelegateMissing { key } => *key == self.art.signer.to_string() || !self.read_only(),
             // A reader takes a signer message only if it answers a `Held` it asked (its HeldSigner, sdk#493): the

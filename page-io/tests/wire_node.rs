@@ -2525,6 +2525,34 @@ fn a_reopen_follows_the_site_and_sends_nothing_but_reads() {
     assert!(node.served.get("put site") > before.get("put site") && node.served.get("signer") > before.get("signer"), "THE CONTROL: a publish was not counted: {:?}", node.served);
 }
 
+/// **A FOLLOWED SITE'S PUSH IS TAKEN, AND DECODED AS A SITE (Codex on #543, 2 and 3).** A reopen follows the site at
+/// v2; another device publishes v3 and the node PUSHES the site's new state (an `UpdateNotification` of the whole web
+/// framing, as a subscription delivers it). The follow shows v3 AT ONCE -- no read -- because (2) a Following site is a
+/// push target and (3) the push is unwrapped by the ONE site decoder (`contract_keys::site::framing`), exactly as a
+/// GET's answer is. Before: the push was not even taken (owns() matched `published_key`), and a taken one was decoded
+/// as a bare record (a hint at best), so the follow waited for the backstop.
+#[test]
+fn a_followed_sites_push_shows_the_new_version_at_once() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut now = 1_000;
+    let mut first = page_io(&node);
+    for v in 1..=2u8 {
+        publish(&mut first, &mut node, &mut now, v);
+    }
+    let mut io = page_io(&node);
+    client(&mut io, &mut node, &mut now, &Request::Identity);
+    io.follow_site(APP, SITE_CODE, Ms(now)).expect("follows");
+    settle(&mut io, &mut node, &mut now);
+    assert_eq!(io.publication(APP), Some(page::Publication::Published { version: 2 }), "THE SETUP: the follow is not at v2");
+    assert_eq!(publish(&mut first, &mut node, &mut now, 3), Some(page::Publication::Published { version: 3 }), "THE SETUP: another device's v3");
+    let key = page_io::site_contract(SITE_CODE, &node.register_params, APP).expect("site").key();
+    let state = node.contracts.get(&node.site_id()).cloned().expect("the site's state");
+    let push = ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, update: UpdateData::State(State::from(state)) }));
+    let _ = io.take_frames();
+    assert!(io.inbound(&push, Ms(now)), "(2) the followed site's push was not taken");
+    assert_eq!(io.publication(APP), Some(page::Publication::Published { version: 3 }), "(3) the push did not show v3 at once: {:?}", io.unusable());
+}
+
 /// **P8 ON THE WIRE (H4): a followed site stays READ through and after this page's own publish.** A reopen follows the
 /// site at v2, publishes v3 itself, and another device publishes v4: at the backstop the page still frames the site's
 /// read (its role returns to Following when the publish ends) and shows v4. Mutant "an ended publish drops the site"
