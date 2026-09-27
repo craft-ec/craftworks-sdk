@@ -664,6 +664,10 @@ impl Life {
         match self {
             Life::Reading { value } => match read {
                 None => Some(Self::rebase_site(0, *value, [0u8; 32], acts)),
+                // THE SITE IS CURRENT: it already holds this exact bundle (its value is the bundle's hash), so it is
+                // PUBLISHED at that version -- nothing is signed or written again (a publish after a reload had no
+                // record of it and wrote the same bytes as the next version).
+                Some(h) if h.value() == value.as_slice() => Some(Self::end_site(Publication::Published { version: h.seq }, acts)),
                 Some(h) => match <[u8; 32]>::try_from(h.value()) {
                     Ok(v) => Some(Self::rebase_site(h.seq, *value, v, acts)),
                     Err(_) => Some(Self::end_site(Publication::Refused("the site holds a record that is not a site's".into()), acts)),

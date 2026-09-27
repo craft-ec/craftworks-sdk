@@ -459,3 +459,30 @@ fn a_new_device_follows_the_site_it_reads() {
     assert!(saw_wait, "the HeadUnknown wait was never stated");
     assert_eq!(a.publication(), Some(Publication::Published { version: 4 }));
 }
+
+/// **A SITE THAT ALREADY HOLDS THIS EXACT BUNDLE IS PUBLISHED AT ITS VERSION, WRITTEN NOT AGAIN** (the builder's
+/// first Publish after a reload: the tab had no record of its site, and the same bytes went out as the next version).
+/// A reloaded page (a fresh `Page`, the device's signer kept) publishes the bundle the site holds: `Published` at
+/// that version, NO sign, the node's site unmoved. CONTROL: the same reloaded page with ANOTHER bundle signs and
+/// writes the next version. Mutant "the current-site cell removed" -> it signs v2 of the same bytes -> red.
+#[test]
+fn a_site_that_holds_this_exact_bundle_is_published_and_not_written_again() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let host = device();
+    let mut first = Publisher::new(host);
+    first.page.publish_site(APP, bundle(1), Ms(now));
+    run(&mut [&mut first], &mut node, &mut now, 100, &mut always);
+    assert_eq!(first.publication(), Some(Publication::Published { version: 1 }), "THE SETUP: the first publish");
+    // The reload: a new page, the same device.
+    let mut reloaded = Publisher::new(first.host.clone());
+    reloaded.page.publish_site(APP, bundle(1), Ms(now));
+    run(&mut [&mut reloaded], &mut node, &mut now, 100, &mut always);
+    assert_eq!(reloaded.publication(), Some(Publication::Published { version: 1 }), "the current site was not taken as published at its version");
+    assert_eq!(reloaded.signs, 0, "the same bundle was signed again");
+    assert_eq!(node.seq(), Some(1), "the same bundle was written again as the next version");
+    // THE CONTROL: the reloaded page, another bundle -> signed and written as v2.
+    reloaded.page.publish_site(APP, bundle(2), Ms(now));
+    run(&mut [&mut reloaded], &mut node, &mut now, 100, &mut always);
+    assert_eq!(reloaded.publication(), Some(Publication::Published { version: 2 }));
+    assert_eq!((reloaded.signs, node.seq()), (1, Some(2)), "another bundle was not signed and written once");
+}
