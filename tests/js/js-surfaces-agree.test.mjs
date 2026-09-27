@@ -155,7 +155,7 @@ const ARGS = {
   children: ["d", "x"],
   root: [], stats: [], bind: ["d"],
   // The definition doors (app-as-data P2).
-  draftPut: ["meta", {}], draftFile: ["app.js", new Uint8Array([1])], draftDelete: ["meta"], publishDefinition: [], definition: ["draft"], definitionApps: [], platformSdk: ["0123456789abcdef0123456789abcdef01234567"],
+  draftPut: ["meta", {}], draftFile: ["app.js", new Uint8Array([1])], draftDelete: ["meta"], publishDefinition: [], definition: ["draft"], definitionApps: [], sdkVersion: ["0123456789abcdef0123456789abcdef01234567"],
   markPublished: ["d"], isPublished: ["d"], publishedState: ["d"],
   // Another app's data, read-only: the handle itself is a VALUE on both surfaces.
   other: ["some-app"],

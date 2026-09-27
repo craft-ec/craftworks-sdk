@@ -423,6 +423,13 @@ export async function openSession(Session, {
      * BOUNDED, and a refusal past either bound says which: MAX_OPEN_TREES
      * engines at once (memory), and MAX_TREE_SUBSCRIPTIONS per socket (F57).
      */
+    /**
+     * AN SDK VERSION FROM ITS PLATFORM TREE (§19, the SDK as data): `tree` is the platform's Register id (an app's
+     * `meta.sdk.tree`), `rev` the version. Read through the ONE open-another's-tree path (`tree()`: a read-only
+     * reader, the head named), never this session's own tree -- a reader of an SDK is almost never the platform.
+     * `{ rev, name, format_tag, set }`; refused by name when the platform publishes no such version.
+     */
+    async platformSdk(tree, rev) { return platformSdkOf(this, tree, rev); },
     tree: async (registerId, { app: treeApp = app, seq = 0 } = {}) => {
       if (closed) throw new Error("tree(): this session is closed");
       if (trees.size >= MAX_OPEN_TREES) {
@@ -535,6 +542,20 @@ export async function openSession(Session, {
  * So the SDK does it. `engineDb(session)` stays exported for tests, where
  * driving the parts separately is the whole point.
  */
+/**
+ * `handle.platformSdk(tree, rev)`: the platform tree `tree` opened READ-ONLY through the handle's `tree()` (no app of
+ * its own: the version is the platform app's, which the read names), asked for version `rev`, and closed -- whatever
+ * the answer. Never the handle's own tree.
+ */
+export async function platformSdkOf(handle, tree, rev) {
+  const t = await handle.tree(tree, { app: null });
+  try {
+    return await t.db.sdkVersion(rev);
+  } finally {
+    t.close();
+  }
+}
+
 /**
  * OPEN A SESSION THAT ASKS WHOSE NODE THIS IS: the node's existing signer is
  * asked which Register (head) it signs for — registering, minting and

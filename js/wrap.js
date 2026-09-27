@@ -78,7 +78,7 @@ export function wrap(raw) {
       return this.#db.publish_definition();
     }
     async definitionApps() { return JSON.parse(this.#db.definition_apps()); }
-    async platformSdk(rev) { return JSON.parse(this.#db.platform_sdk(rev)); }
+    async sdkVersion(rev) { return JSON.parse(this.#db.platform_sdk(rev)); }
     // `[{ key, body, bytes? }]`: a file's bytes a Uint8Array, as the SDK hands them over.
     async definition(which, app) { return this.#db.definition(which, app ?? undefined); }
     async markPublished(domain, ...extra) { noAppForAWrite("markPublished", extra); return JSON.parse(this.#db.mark_published(domain)); }
