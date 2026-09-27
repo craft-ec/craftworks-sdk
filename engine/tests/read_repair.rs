@@ -456,7 +456,10 @@ fn m_plus_one_lost_is_named_damaged_even_when_every_slot_misses_before_the_block
 /// A tree that is ONE leaf of referenced values (1400 bytes each; the records in `same` all hold the SAME value, so
 /// one id fills several slots of the leaf's group), with the leaf's parity put on the network: the records, the root,
 /// every block, and the group's `k` data slots then its parity.
-fn a_value_group(same: &[u32]) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks, Vec<Cid>, usize) {
+/// The records, the root, every block, the group's slots (k data, then parity), and k.
+type ValueGroup = (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks, Vec<Cid>, usize);
+
+fn a_value_group(same: &[u32]) -> ValueGroup {
     let records: BTreeMap<Vec<u8>, Vec<u8>> = (0..12u32)
         .map(|i| {
             let mut v = vec![b'a' + (i % 20) as u8; 1400];
@@ -555,7 +558,7 @@ fn an_id_in_two_slots_missing_is_absent_in_both() {
     assert_eq!(slots[..k].iter().filter(|s| **s == own).count(), 2, "THE SETUP: the read's own value is not in two slots");
     for (n, want) in [(PARITY, false), (PARITY + 1, true)] {
         let lost = lose_slots(&slots, &[own], n);
-        let e = reads_holding_their_own(root, &all, &lost, &BTreeSet::new(), &[key.clone()], &[own]);
+        let e = reads_holding_their_own(root, &all, &lost, &BTreeSet::new(), std::slice::from_ref(&key), &[own]);
         let damaged = e.damaged();
         if want {
             assert_eq!(damaged.len(), 1, "m + 1 slots lost with one id in two of them: not named damaged: {damaged:?}");
@@ -581,7 +584,7 @@ fn an_id_in_two_slots_arriving_fills_both() {
     lost.extend(others.iter().take(PARITY - 1));
     let left = slots.iter().filter(|s| !lost.contains(*s)).count();
     assert_eq!((left, slots.iter().filter(|s| !lost.contains(*s) && **s == twice).count()), (k, 2), "THE SETUP: not exactly k left with the repeated id twice");
-    let (answers, _) = read_cold(root, &all, &lost, &[key.clone()], Params::default());
+    let (answers, _) = read_cold(root, &all, &lost, std::slice::from_ref(&key), Params::default());
     assert!(answers.contains_key(&key) && right(&answers, &records).is_empty(), "a repeated id counted once: {answers:?}");
 }
 
@@ -617,7 +620,7 @@ fn m_lost_with_every_survivor_pending_is_not_damaged() {
     for (n, want) in [(PARITY, false), (PARITY + 1, true)] {
         let lost = lose_slots(&slots, &[own], n);
         let pending: BTreeSet<Cid> = slots.iter().filter(|s| !lost.contains(*s)).copied().collect();
-        let e = reads_holding_their_own(root, &all, &lost, &pending, &[key.clone()], &[own]);
+        let e = reads_holding_their_own(root, &all, &lost, &pending, std::slice::from_ref(&key), &[own]);
         let damaged = e.damaged();
         if want {
             assert_eq!(damaged.iter().map(|d| (d.block, d.j, d.k)).collect::<Vec<_>>(), vec![(own, k - 1, k)], "m + 1 lost, survivors pending");
