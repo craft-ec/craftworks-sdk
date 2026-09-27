@@ -798,15 +798,16 @@ impl PageIo {
     /// FOLLOW `app`'s site (sdk#520, PUBLISH-LIFE E13): a REOPEN of a published project reads what is live and
     /// publishes NOTHING (P7) -- no Sign, no UPDATE, no PUT. The read carries `subscribe`; a change the node pushes is
     /// read ([`Page::site_pushed`] / [`Page::site_hint`]), as the head's is. [`PageIo::publication`] says `Reading`
-    /// until the node answers, then `Published` at the version it shows. Returns the site's LINK. A publish of it in
-    /// flight already reads it: nothing more is asked (PUBLISH-LIFE ¹¹).
+    /// until the node answers, then `Published` at the version it shows. Returns the site's LINK. The follow is its own
+    /// machine beside the publish (H4): a site being published is followed too, and stays followed after (P8).
     pub fn follow_site(&mut self, app: &str, site_code: &[u8], now: Ms) -> Result<String, String> {
         let (_, id, key) = self.site_of(site_code, app)?;
+        // A site being PUBLISHED keeps that role (it is read with subscribe already); any other is followed.
         if !matches!(self.sites.get(app).map(|s| &s.role), Some(SiteRole::Publishing { .. })) {
             self.sites.insert(app.to_string(), Site { id, role: SiteRole::Following { key } });
-            self.server.page.follow_site(app, now);
-            self.pump();
         }
+        self.server.page.follow_site(app, now);
+        self.pump();
         Ok(site_text(&id))
     }
 
@@ -1559,14 +1560,21 @@ impl PageIo {
             }
             self.pump();
         }
-        // A site's bytes are page-io's only while its publication is in flight.
+        // A site's bytes are page-io's only while its publication is in flight; a FOLLOWED site (H4, P8) keeps its
+        // read -- a publish that ended returns it to `Following` -- for as long as the page follows it.
         let page = &self.server.page;
-        self.sites.retain(|app, site| match site.role {
-            SiteRole::Publishing { .. } => matches!(page.publication(app), Some(Publication::Publishing { .. })),
-            // An audit ends by `end_site_audit`, not by a publication.
-            SiteRole::Auditing => true,
-            // A follow lasts while its life follows (reading, or published at a version); an end drops it.
-            SiteRole::Following { .. } => matches!(page.publication(app), Some(Publication::Reading | Publication::Published { .. })),
+        self.sites.retain(|app, site| {
+            match &site.role {
+                SiteRole::Publishing { .. } if matches!(page.publication(app), Some(Publication::Publishing { .. })) => true,
+                SiteRole::Publishing { key, .. } if page.follows(app) => {
+                    site.role = SiteRole::Following { key: key.clone() };
+                    true
+                }
+                SiteRole::Publishing { .. } => false,
+                // An audit ends by `end_site_audit`, not by a publication.
+                SiteRole::Auditing => true,
+                SiteRole::Following { .. } => page.follows(app),
+            }
         });
     }
 }

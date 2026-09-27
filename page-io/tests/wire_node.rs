@@ -2525,6 +2525,31 @@ fn a_reopen_follows_the_site_and_sends_nothing_but_reads() {
     assert!(node.served.get("put site") > before.get("put site") && node.served.get("signer") > before.get("signer"), "THE CONTROL: a publish was not counted: {:?}", node.served);
 }
 
+/// **P8 ON THE WIRE (H4): a followed site stays READ through and after this page's own publish.** A reopen follows the
+/// site at v2, publishes v3 itself, and another device publishes v4: at the backstop the page still frames the site's
+/// read (its role returns to Following when the publish ends) and shows v4. Mutant "an ended publish drops the site"
+/// -> the read is refused as "not being published or audited" -> the page stays at v3 -> red.
+#[test]
+fn a_followed_site_is_still_read_after_this_pages_own_publish() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut now = 1_000;
+    let mut first = page_io(&node);
+    for v in 1..=2u8 {
+        publish(&mut first, &mut node, &mut now, v);
+    }
+    let mut io = page_io(&node);
+    client(&mut io, &mut node, &mut now, &Request::Identity);
+    io.follow_site(APP, SITE_CODE, Ms(now)).expect("follows");
+    settle(&mut io, &mut node, &mut now);
+    assert_eq!(io.publication(APP), Some(page::Publication::Published { version: 2 }));
+    assert_eq!(publish(&mut io, &mut node, &mut now, 3), Some(page::Publication::Published { version: 3 }), "THE SETUP: this page's own publish");
+    assert_eq!(publish(&mut first, &mut node, &mut now, 4), Some(page::Publication::Published { version: 4 }), "THE SETUP: another device's");
+    now += page::HEAD_BACKSTOP_MS;
+    io.tick(Ms(now));
+    settle(&mut io, &mut node, &mut now);
+    assert_eq!(io.publication(APP), Some(page::Publication::Published { version: 4 }), "P8: after its own publish, the page no longer read the site it follows: {:?}", io.unusable());
+}
+
 /// **A REFUSED site read is silence, never "no site"** (the GetFail split): a new device whose node does not hold
 /// the site yet has its read refused once; the re-ask reads v2 and it publishes v3. Mutant "a refused site read is
 /// NotFound" -> it signs v1 from the genesis, the merge keeps v2 -> Superseded -> red.
