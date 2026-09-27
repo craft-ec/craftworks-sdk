@@ -156,3 +156,38 @@ fn a_reader_between_commits_never_sees_a_mixed_definition() {
         assert_ne!(a, b, "THE SETUP: two consecutive versions were equal");
     }
 }
+
+/// A definition is READ by whose app it is (§19 P3: the builder lists its projects by each one's `meta`): one tree,
+/// two apps, each app's records only under its own name; a bad app id is refused by the one app rule.
+#[test]
+fn a_definition_is_read_by_app_and_only_that_apps() {
+    let mut db = fresh();
+    db.draft_put(Some("proj-a"), &key("meta"), &json!({ "name": "A" })).unwrap();
+    db.draft_put(Some("proj-b"), &key("meta"), &json!({ "name": "B" })).unwrap();
+    db.draft_put(Some("proj-b"), &key("c/list"), &json!({ "type": "table" })).unwrap();
+    let names = |db: &mut Db<MemStore, SystemEnv>, app| {
+        db.definition(Some(app), SystemDomain::Draft).unwrap().into_iter().map(|(k, v)| (k.to_string(), v)).collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(names(&mut db, "proj-a"), BTreeMap::from([("meta".to_string(), json!({ "name": "A" }))]));
+    assert_eq!(names(&mut db, "proj-b").get("meta"), Some(&json!({ "name": "B" })));
+    assert_eq!(names(&mut db, "proj-b").len(), 2, "B's draft read another app's records, or lost its own");
+    assert!(names(&mut db, "proj-c").is_empty(), "an app with no draft read as someone else's");
+    for bad in ["Proj", "a.b", "@b", "a/b", ""] {
+        assert!(db.definition(Some(bad), SystemDomain::Draft).is_err(), "`{bad}` was read as an app id");
+    }
+}
+
+/// The apps that hold a draft (§19 P3b: the builder's project list): each app once, sorted; an app with only
+/// ordinary data is not one, and the unnamed app's own draft is not an app of the tree.
+#[test]
+fn the_apps_with_a_draft_are_listed_and_only_those() {
+    let mut db = fresh();
+    assert!(db.definition_apps().unwrap().is_empty(), "an empty tree lists an app");
+    db.draft_put(Some("proj-b"), &key("meta"), &json!({ "name": "B" })).unwrap();
+    db.draft_put(Some("proj-a"), &key("meta"), &json!({ "name": "A" })).unwrap();
+    db.draft_put(Some("proj-a"), &key("c/x"), &json!({ "type": "t" })).unwrap();
+    db.draft_put(None, &key("meta"), &json!({ "name": "unnamed" })).unwrap();
+    let schema: craftworks_sdk::Schema = serde_json::from_value(json!({ "type": "Row", "fields": [{ "name": "x", "kind": "text" }] })).unwrap();
+    db.define("proj-c.rows", &schema).unwrap();
+    assert_eq!(db.definition_apps().unwrap(), vec!["proj-a".to_string(), "proj-b".to_string()]);
+}

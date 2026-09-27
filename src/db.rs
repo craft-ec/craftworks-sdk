@@ -1296,8 +1296,13 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         Ok(changed)
     }
 
-    /// The definition `which` holds (`Draft` or `App`): each record's key and body, in slot order.
+    /// The definition `which` holds (`Draft` or `App`): each record's key and body, in slot order. `app` names whose:
+    /// a READ, so it may be any app of this tree (the builder's project list reads each project's `meta`, §19 P3);
+    /// the writing doors take only the caller's own. An app id is checked here, the one place both surfaces ask.
     pub fn definition(&mut self, app: Option<&str>, which: SystemDomain) -> Result<Vec<(DefKey, Value)>> {
+        if let Some(a) = app {
+            crate::app::check(a)?;
+        }
         if which == SystemDomain::Published {
             return Err(DbError::Refused(format!("`{}` holds markers, not a definition", which.code())));
         }
@@ -1311,6 +1316,22 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                 Ok((key, body))
             })
             .collect()
+    }
+
+    /// THE APPS OF THIS TREE THAT HOLD A DRAFT, by id, sorted: a READ (§19 P3b: the builder's project list is these,
+    /// each named by its own `meta`). From the tree's domain names, so it never reads a record; the unnamed (in-tab)
+    /// app's own draft is not an app of the tree and is not listed.
+    pub fn definition_apps(&mut self) -> Result<Vec<String>> {
+        let tail = format!(".{}", SystemDomain::Draft.code());
+        let mut apps: Vec<String> = self
+            .domains()?
+            .into_iter()
+            .filter_map(|d| d.strip_suffix(tail.as_str()).map(str::to_string))
+            .filter(|a| core_types::name::app_ok(a))
+            .collect();
+        apps.sort();
+        apps.dedup();
+        Ok(apps)
     }
 
     /// MARK `domain` LIVE (the builder's marker, until app-as-data P5 derives liveness from `craftworks.app`): its

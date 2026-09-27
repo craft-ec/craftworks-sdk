@@ -1068,11 +1068,23 @@ impl Session {
         self.decided(r)
     }
 
-    /// The definition `which` holds -- `"draft"` or `"app"` -- as `[{ key, body }]`.
-    pub fn definition(&mut self, which: &str) -> Result<String, JsValue> {
-        let app = self.door_app()?;
+    /// The definition `which` holds -- `"draft"` or `"app"` -- as `[{ key, body }]`. `app`: ANOTHER app of this
+    /// tree, READ-only (the builder lists its projects by each one's `meta`, §19 P3); absent, this session's own. The
+    /// writing doors never take one.
+    pub fn definition(&mut self, which: &str, app: Option<String>) -> Result<String, JsValue> {
+        let app = match app {
+            Some(a) => a,
+            None => self.door_app()?,
+        };
         let which = definition_of(which).map_err(|e| db_err(&e))?;
         let r = self.db.definition(Some(&app), which).map(definition_json);
+        self.answer(r)
+    }
+
+    /// The apps of this tree that hold a draft, by id: a READ (§19 P3b: the builder's project list), for any session
+    /// of the tree, whatever its own app.
+    pub fn definition_apps(&mut self) -> Result<String, JsValue> {
+        let r = self.db.definition_apps();
         self.answer(r)
     }
 
