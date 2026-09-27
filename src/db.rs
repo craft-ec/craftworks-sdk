@@ -4,7 +4,9 @@
 //! `0x01 ‖ domain ‖ 0x00 ‖ rkey(16)` for records, `0x00 "schema" 0x00 domain` for
 //! a domain's schema — so the schema travels with the data it types.
 
+use crate::definition::DefKey;
 use crate::id::{self, Env, IdGen, Loc, RKey};
+use core_types::name::SystemDomain;
 use crate::record;
 use crate::schema::Schema;
 use crate::store::{sorted_edits, Edit, IdWidth, Reads, Store, StoreError};
@@ -360,6 +362,15 @@ fn parent_span(domain: &str, parent: &RKey) -> (Vec<u8>, Vec<u8>) {
     }
     (lo, hi)
 }
+/// An ORDINARY write's domain: never under the reserved prefix (ARCHITECTURE §19). The definition doors below reach
+/// the one commit path (`Db::write`) without this; every other write goes through it, whichever door it came in by.
+fn ordinary(domain: &str) -> Result<()> {
+    if core_types::name::reserved(domain) {
+        return Err(crate::app::reserved_refusal(domain));
+    }
+    Ok(())
+}
+
 fn schema_key(domain: &str) -> Vec<u8> {
     let mut k = vec![T_SYSTEM];
     k.extend_from_slice(b"schema\0");
@@ -791,6 +802,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
 
     /// Declare (or extend) a domain's schema. Extending may only append optional fields.
     pub fn define(&mut self, domain: &str, schema: &Schema) -> Result<()> {
+        ordinary(domain)?;
         check_domain(domain)?;
         schema.check()?;
         let base = self.schema(domain)?;
@@ -843,6 +855,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     }
 
     pub fn put(&mut self, domain: &str, fields: &Map<String, Value>) -> Result<Record> {
+        ordinary(domain)?;
         let schema = self.need_schema(domain)?;
         let rkey = self.ids.next(&mut self.env);
         // The rkey stays SDK-minted. The caller chooses only the PARENT, which
@@ -898,6 +911,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         slot: RKey,
         fields: &Map<String, Value>,
     ) -> Result<CreateAt> {
+        ordinary(domain)?;
         let schema = self.need_schema(domain)?;
         let loc = Loc { parent: parent_of(&schema, fields)?, rkey: slot };
         let key = record_key(domain, loc);
@@ -929,6 +943,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         at: impl Into<Loc>,
         patch: &Map<String, Value>,
     ) -> Result<Record> {
+        ordinary(domain)?;
         let schema = self.need_schema(domain)?;
         let loc = self.locate(&schema, domain, at)?;
         let key = record_key(domain, loc);
@@ -1003,6 +1018,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     }
 
     pub fn delete(&mut self, domain: &str, at: impl Into<Loc>) -> Result<bool> {
+        ordinary(domain)?;
         check_domain(domain)?;
         let schema = self.need_schema(domain)?;
         let loc = self.locate(&schema, domain, at)?;
@@ -1152,6 +1168,176 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
             fields: d.fields,
             state: self.store.row_state(key),
         })
+    }
+}
+
+/// A reserved domain's name as this db holds it: behind the app's id (the tree's form), or -- with none, the in-tab
+/// db -- as an app writes it. The one place a [`SystemDomain`] becomes a stored name.
+fn system_name(app: Option<&str>, d: SystemDomain) -> String {
+    match app {
+        Some(a) => format!("{a}.{}", d.code()),
+        None => d.code().to_string(),
+    }
+}
+
+/// A definition record's schema: its key and its body (the record's JSON, as text).
+fn definition_schema() -> Schema {
+    let field = |name: &str| crate::schema::Field { name: name.into(), kind: crate::schema::Kind::Text, required: true };
+    Schema { type_name: "Definition".into(), fields: vec![field("key"), field("body")], parent: None }
+}
+
+/// The builder's per-domain "live" markers' schema: the one `handoff.js` defines (`{ type: "Published", fields: [] }`).
+fn published_schema() -> Schema {
+    Schema { type_name: "Published".into(), fields: vec![], parent: None }
+}
+
+/// A definition record's slot: a function of its key alone, so the draft's and the app's records of one key share it
+/// and a publish copies record for record.
+fn definition_slot(key: &DefKey) -> RKey {
+    id::slot_from(0, "definition", &key.to_string())
+}
+
+/// A published marker's slot: `handoff.js`'s `markerSlot` (`slotFrom(0, "domain", d)`), so the markers the builder
+/// wrote before this door are the ones it reads.
+fn published_slot(domain: &str) -> RKey {
+    id::slot_from(0, "domain", domain)
+}
+
+/// THE DEFINITION DOORS (ARCHITECTURE §19; app-as-data P2): the ONLY writes of an app's reserved domains. Each takes a
+/// [`SystemDomain`] (never a name a caller spelled) and reaches the one commit path, [`Db::write`], directly -- the
+/// ordinary writes refuse the reserved prefix (`ordinary`). `app` is the tree's app id, `None` for the in-tab db.
+impl<S: Store + Reads, E: Env> Db<S, E> {
+    /// `domain`'s schema as THIS write needs it: read (so it must stand), and PUT in the same write when absent. A
+    /// different schema standing under a reserved name is refused: nothing but these doors writes one.
+    fn system_schema(&mut self, domain: &str, schema: &Schema, reads: &mut Vec<(Vec<u8>, Expect)>, edits: &mut Vec<(Vec<u8>, Edit)>) -> Result<()> {
+        reads.push(self.read_of(&schema_key(domain))?);
+        match self.schema(domain)? {
+            Some(s) if &s == schema => Ok(()),
+            Some(_) => Err(DbError::Refused(format!("`{domain}` holds another schema than its definition door writes"))),
+            None => {
+                edits.push((schema_key(domain), Edit::Put(serde_json::to_vec(schema).map_err(|e| e.to_string())?)));
+                Ok(())
+            }
+        }
+    }
+
+    /// Every record of a domain, by its key AFTER the domain's record prefix (the part a draft and an app share).
+    fn records_of(&mut self, domain: &str) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>> {
+        let p = record_prefix(domain);
+        Ok(self.scan_keys(&p, &upper(&p), false, usize::MAX)?.into_iter().map(|(k, v)| (k[p.len()..].to_vec(), v)).collect())
+    }
+
+    /// EDIT THE DRAFT: `key`'s record in `craftworks.draft` holds `body`, created or replaced. The same body again is
+    /// nothing to write.
+    pub fn draft_put(&mut self, app: Option<&str>, key: &DefKey, body: &Value) -> Result<()> {
+        let domain = system_name(app, SystemDomain::Draft);
+        let schema = definition_schema();
+        let (mut reads, mut edits) = (Vec::new(), Vec::new());
+        self.system_schema(&domain, &schema, &mut reads, &mut edits)?;
+        let k = record_key(&domain, Loc::bare(definition_slot(key)));
+        let old = self.get_key(&k)?.map(|o| record::decode(&schema, &o)).transpose()?;
+        let body = body.to_string();
+        if old.as_ref().is_some_and(|o| o.fields.get("body").and_then(Value::as_str) == Some(body.as_str())) {
+            return Ok(());
+        }
+        let now = self.env.now_ms();
+        let created = old.as_ref().map_or(now, |o| o.created);
+        let mut fields = Map::new();
+        fields.insert("key".into(), Value::from(key.to_string()));
+        fields.insert("body".into(), Value::from(body));
+        let bytes = record::encode(&schema, &fields, created, now.max(created), &self.author)?;
+        reads.push(self.read_of(&k)?);
+        edits.push((k, Edit::Put(bytes)));
+        self.write(reads, edits)
+    }
+
+    /// Remove `key`'s record from the draft; `false` when there was none (nothing written).
+    pub fn draft_delete(&mut self, app: Option<&str>, key: &DefKey) -> Result<bool> {
+        let domain = system_name(app, SystemDomain::Draft);
+        let k = record_key(&domain, Loc::bare(definition_slot(key)));
+        let read = self.read_of(&k)?;
+        if read.1 == Expect::Absent {
+            return Ok(false);
+        }
+        self.write(vec![read], vec![(k, Edit::Delete)])?;
+        Ok(true)
+    }
+
+    /// PUBLISH: make `craftworks.app` EQUAL `craftworks.draft` in ONE write -- every changed record put, every app
+    /// record with no draft counterpart deleted -- so the head moves once and no reader sees a mixed definition. The
+    /// write reads every draft record it copies, so a publish racing a draft edit is refused, never half-applied.
+    /// Answers how many records changed; 0 (nothing written) when they are equal.
+    pub fn publish_definition(&mut self, app: Option<&str>) -> Result<usize> {
+        let (draft_name, app_name) = (system_name(app, SystemDomain::Draft), system_name(app, SystemDomain::App));
+        let draft = self.records_of(&draft_name)?;
+        let published = self.records_of(&app_name)?;
+        let (mut reads, mut edits) = (Vec::new(), Vec::new());
+        for (tail, bytes) in &draft {
+            if published.get(tail) != Some(bytes) {
+                let k = [record_prefix(&app_name), tail.clone()].concat();
+                reads.push(self.read_of(&k)?);
+                edits.push((k, Edit::Put(bytes.clone())));
+            }
+        }
+        for tail in published.keys().filter(|t| !draft.contains_key(*t)) {
+            let k = [record_prefix(&app_name), tail.clone()].concat();
+            reads.push(self.read_of(&k)?);
+            edits.push((k, Edit::Delete));
+        }
+        let changed = edits.len();
+        if changed == 0 {
+            return Ok(0);
+        }
+        for tail in draft.keys() {
+            reads.push(self.read_of(&[record_prefix(&draft_name), tail.clone()].concat())?);
+        }
+        self.system_schema(&app_name, &definition_schema(), &mut reads, &mut edits)?;
+        self.write(reads, edits)?;
+        Ok(changed)
+    }
+
+    /// The definition `which` holds (`Draft` or `App`): each record's key and body, in slot order.
+    pub fn definition(&mut self, app: Option<&str>, which: SystemDomain) -> Result<Vec<(DefKey, Value)>> {
+        if which == SystemDomain::Published {
+            return Err(DbError::Refused(format!("`{}` holds markers, not a definition", which.code())));
+        }
+        let schema = definition_schema();
+        self.records_of(&system_name(app, which))?
+            .values()
+            .map(|b| {
+                let d = record::decode(&schema, b)?;
+                let key = DefKey::parse(d.fields.get("key").and_then(Value::as_str).unwrap_or(""))?;
+                let body = serde_json::from_str(d.fields.get("body").and_then(Value::as_str).unwrap_or("null")).map_err(|e| DbError::Refused(e.to_string()))?;
+                Ok((key, body))
+            })
+            .collect()
+    }
+
+    /// MARK `domain` LIVE (the builder's marker, until app-as-data P5 derives liveness from `craftworks.app`): its
+    /// record in `craftworks.published`, created at its slot, or the one already there -- `create_at`'s answer.
+    pub fn mark_published(&mut self, app: Option<&str>, domain: &str) -> Result<CreateAt> {
+        crate::app::check_name(domain)?;
+        let name = system_name(app, SystemDomain::Published);
+        let schema = published_schema();
+        let loc = Loc::bare(published_slot(domain));
+        let k = record_key(&name, loc);
+        if let Some(held) = self.get_key(&k)? {
+            return self.read(&schema, &loc, &k, &held).map(CreateAt::Exists);
+        }
+        let (mut reads, mut edits) = (Vec::new(), Vec::new());
+        self.system_schema(&name, &schema, &mut reads, &mut edits)?;
+        let now = self.env.now_ms();
+        let bytes = record::encode(&schema, &Map::new(), 0, now, &self.author)?;
+        reads.push((k.clone(), Expect::Absent));
+        edits.push((k.clone(), Edit::Put(bytes.clone())));
+        self.write(reads, edits)?;
+        self.read(&schema, &loc, &k, &bytes).map(CreateAt::Created)
+    }
+
+    /// Is `domain` marked live ([`Db::mark_published`])? Reads only.
+    pub fn is_published(&mut self, app: Option<&str>, domain: &str) -> Result<bool> {
+        let name = system_name(app, SystemDomain::Published);
+        Ok(self.get_key(&record_key(&name, Loc::bare(published_slot(domain))))?.is_some())
     }
 }
 

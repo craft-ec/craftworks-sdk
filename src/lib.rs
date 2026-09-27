@@ -8,6 +8,7 @@
 pub mod app;
 pub mod blockid;
 pub mod db;
+pub mod definition;
 pub mod engine_client;
 pub mod expected;
 pub mod id;

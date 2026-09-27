@@ -65,6 +65,11 @@ pub fn write(app: Option<&str>, name: &str) -> Result<StoredName, DbError> {
     if name.starts_with('@') {
         return Err(DbError::Refused(format!("`{name}` is another app's: an app writes only its own")));
     }
+    // THE RESERVED PREFIX (ARCHITECTURE §19): an app's definition domains are written only by the SDK's definition
+    // doors (`Db::draft_put` / `draft_delete` / `publish_definition` / `mark_published`), never by an ordinary write.
+    if core_types::name::reserved(name) {
+        return Err(reserved_refusal(name));
+    }
     match app {
         Some(a) => {
             check_name(name)?;
@@ -158,4 +163,12 @@ impl AppName {
 /// name here is a compile error (see [`StoredName`]).
 pub fn to_js(names: &[AppName]) -> String {
     serde_json::to_string(&names.iter().map(AppName::as_str).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into())
+}
+
+/// The refusal of an ordinary write under the reserved prefix: ONE wording, here and at the `Db`.
+pub fn reserved_refusal(name: &str) -> DbError {
+    DbError::Refused(format!(
+        "`{name}` is under the reserved `{}.` prefix: an app's definition, written only by the SDK's definition doors (ARCHITECTURE §19)",
+        core_types::name::RESERVED
+    ))
 }

@@ -298,6 +298,28 @@ impl Db {
     pub fn delete(&mut self, domain: &str, id: &str) -> Result<bool, JsError> {
         self.0.delete(name(domain)?, loc(id)?).map_err(err)
     }
+    // THE DEFINITION DOORS (app-as-data P2): the engine Session's, over this tab's one app (names as it wrote them).
+    pub fn draft_put(&mut self, key: &str, body: &str) -> Result<(), JsError> {
+        let key = craftworks_sdk::definition::DefKey::parse(key).map_err(err)?;
+        self.0.draft_put(None, &key, &serde_json::from_str(body).map_err(err)?).map_err(err)
+    }
+    pub fn draft_delete(&mut self, key: &str) -> Result<bool, JsError> {
+        let key = craftworks_sdk::definition::DefKey::parse(key).map_err(err)?;
+        self.0.draft_delete(None, &key).map_err(err)
+    }
+    pub fn publish_definition(&mut self) -> Result<u32, JsError> {
+        self.0.publish_definition(None).map(|n| n as u32).map_err(err)
+    }
+    pub fn definition(&mut self, which: &str) -> Result<String, JsError> {
+        let which = session::definition_of(which).map_err(err)?;
+        json(&session::definition_json(self.0.definition(None, which).map_err(err)?))
+    }
+    pub fn mark_published(&mut self, domain: &str) -> Result<String, JsError> {
+        json(&self.0.mark_published(None, domain).map_err(err)?)
+    }
+    pub fn is_published(&mut self, domain: &str) -> Result<bool, JsError> {
+        self.0.is_published(None, domain).map_err(err)
+    }
     /// The children of one parent, as a bounded read.
     ///
     /// The app names the PARENT; it never builds a key range. That is the same
