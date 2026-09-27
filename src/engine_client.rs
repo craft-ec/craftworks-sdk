@@ -214,7 +214,7 @@ impl Client {
     /// A request that cannot be encoded is NOT queued as an empty frame —
     /// which is what `encode_request` used to hand back, and the engine
     /// answered "Unparseable" with no id to hang it on (craftworks-sdk#136).
-    /// It is counted, and `CachedStore` refuses a write that will not fit
+    /// It is counted, and `Writes::make` refuses a write that will not fit
     /// before it ever gets here.
     pub fn send(&mut self, r: &Request) {
         let Some(session) = self.session else {

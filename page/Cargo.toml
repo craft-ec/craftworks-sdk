@@ -22,7 +22,7 @@ instrument = { workspace = true }
 [dev-dependencies]
 # The OLD side of the differential: the Shell over a scripted node.
 testkit = { path = "../testkit" }
-# The client a page::Server answers: `Db` over `CachedStore`, driven end to end (M2).
+# The client a page::Server answers: `Db` over `PageStore`, driven end to end (M2).
 craftworks-sdk = { path = ".." }
 serde_json = "1"
 # The far side of the scripted client API runs the REAL signer rule and the

@@ -1,7 +1,7 @@
 //! # The page's protocol SERVER (sdk wiring, main's ruling B)
 //!
-//! The web Session's `Db` → `CachedStore` → `sdk::Client` speak the page ↔
-//! engine protocol. Until now the engine delegate's Shell answered it; here
+//! The web Session's `Db` → `PageStore` → `Writes` → `sdk::Client` speak the
+//! page ↔ engine protocol. Until now the engine delegate's Shell answered it; here
 //! the PAGE does, over [`crate::Page`] (#215): the real engine, whose node
 //! work is the client-API executor and whose head the SIGNER signs. Nothing
 //! above it changes, so every client-side model still judges it.
@@ -1076,11 +1076,12 @@ impl Server {
             P::Commit { write_id, reads, ops } => write_event(self.speaker, write_id, reads, ops, false),
             // sdk#350: the same write, committed only IN COMPANY.
             P::DeferredCommit { write_id, reads, ops } => write_event(self.speaker, write_id, reads, ops, true),
-            // UNUSED BY ANY CLIENT (sdk#146): `src/`, `web/src/` and `js/` send
-            // no `AskWrite` (read at all three, against 3 `Request::Write`
-            // senders as the control). Served, and keyed by the asking
-            // session like every request, so a reader of `on_ask`'s `known`
-            // test knows it is exercised by tests alone.
+            // LIVE (sdk#174, #257): `Session::tick` → `Writes::ask_after` sends
+            // it for the client's oldest `Applying` write, at most once a
+            // second. `on_ask` re-asks a parked write's missing blocks and
+            // resets its idle count, which is what keeps
+            // `release_silent_parked_write` from failing a write whose GET is
+            // merely slow. Keyed by the asking session like every request.
             P::AskWrite { write_id } => Event::AskWrite {
                 client: self.speaker,
                 write_id: as_write_id(write_id),
