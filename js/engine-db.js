@@ -511,7 +511,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
      * block the node lost from any `k` of its group, re-encodes a lost parity block with the save's own code, and PUTs
      * both back; then wait for those PUTs' answers, and resolve with the session's report: `outcome` a word of
      * the `sdk.status` list `outcomeList` names (`repairOutcome` for what a repair did, `groupHealth` for the tree's
-     * health), the counts (`missing`, `putBack` -- of those -- `reput`, `rejected`, `givenUp`, `parityMismatched`,
+     * health), the counts (`missing` -- NotFound, or silent past the node's GET bound -- `unanswered` -- silent, still inside it: never a loss, never put back -- `putBack` of the missing, `reput`, `rejected`, `givenUp`, `parityMismatched`,
      * `pending`), each `damaged` group with its `sdk.status.groupHealth` word, `why`, and the `rows` read.
      *
      * Run it on a session whose store is COLD for the tree (a fresh reader of it): a page that already holds a block

@@ -108,6 +108,9 @@ struct WireNode {
     push_kind: PushKind,
     /// Frames the node sends unasked (pushes), delivered before the answer to the request that caused them.
     pushes: Vec<Vec<u8>>,
+    /// Contracts whose GETs the node answers with SILENCE -- no state, no NotFound (a real node's answer for a block it
+    /// lacks, or is slow on; sdk#479).
+    silent_gets: std::collections::BTreeSet<[u8; 32]>,
 }
 
 /// How the node's push carries the new state (see `WireNode::push_kind`).
@@ -212,6 +215,7 @@ impl WireNode {
             push_updates: false,
             push_kind: PushKind::State,
             pushes: Vec::new(),
+            silent_gets: std::collections::BTreeSet::new(),
         };
         let req = signer::Request::Provision {
             signing_key: sk.to_bytes().to_vec(),
@@ -262,6 +266,7 @@ impl WireNode {
             push_updates: false,
             push_kind: PushKind::State,
             pushes: Vec::new(),
+            silent_gets: std::collections::BTreeSet::new(),
         }
     }
 
@@ -387,6 +392,9 @@ impl WireNode {
             }
             ClientRequest::ContractOp(ContractRequest::Get { key, subscribe, .. }) => {
                 let id: [u8; 32] = key.as_bytes()[..32].try_into().expect("32");
+                if self.silent_gets.contains(&id) {
+                    return None;
+                }
                 let failing = id == self.register_id && self.fail_register_gets > 0;
                 if failing {
                     self.fail_register_gets -= 1;
@@ -3478,7 +3486,9 @@ fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_
         assert_eq!(read_all(&mut f, &mut node, &mut now, 200), 2_000, "the fresh reader did not read every row");
         assert_eq!(f.server.page.repair_report().missing, 0, "the fresh reader still found blocks missing on the node");
         if !lose {
-            assert_eq!((report.missing, report.put_back), (0, 0), "THE CONTROL: a whole tree was found missing or put back");
+            // A race's rebuild of a block the node HAS is HELD for the node's word and dropped when it serves: never
+            // re-PUT (before the node's-bound rule, 15 such re-puts on this tree).
+            assert_eq!((report.missing, report.put_back, report.reput), (0, 0, 0), "THE CONTROL: a whole tree was found missing, put back or re-PUT");
         }
     }
 }
@@ -3624,4 +3634,103 @@ fn the_held_sweep_reentered_from_a_landing_leaves_no_held_block_asked_and_every_
     assert!(r.server.page.sweeps_nested() > 0, "THE SETUP: the sweep was never re-entered: the test proves nothing about re-entry");
     assert_eq!((keys.len(), unique.len()), (2_000, 2_000), "a row was lost or read twice through the re-entered sweep");
     assert!(asked.is_empty(), "a HELD block still has a GET owed: {asked:?}");
+}
+
+/// Every row, each page driven only until IT is answered -- never to quiescence, so the clock stays inside the node
+/// bounds of anything still silent (a pass ended "early", as a person's check ends when its read is done).
+fn read_all_prompt(io: &mut PageIo, node: &mut WireNode, now: &mut u64, base: u64) -> usize {
+    let (mut rows, mut after, mut n) = (0, None, 0u64);
+    loop {
+        n += 1;
+        let req_id = base + n;
+        io.client(&protocol::encode_session_request(4, 9, &Request::Range { req_id, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: after.clone(), max_entries: 500 }).expect("encodes"));
+        let mut got = None;
+        for _ in 0..5_000 {
+            let frames = io.take_frames();
+            for r in io.take_replies() {
+                if let Reply::Page { req_id: q, entries, cursor, .. } = protocol::decode_reply(&r).expect("a reply") {
+                    if q == req_id {
+                        got = Some((entries.len(), cursor));
+                    }
+                }
+            }
+            if got.is_some() {
+                break;
+            }
+            if frames.is_empty() {
+                *now = io.next_due().map_or(*now + 1, |Ms(t)| t.max(*now + 1));
+                io.tick(Ms(*now));
+                continue;
+            }
+            *now += 1;
+            for f in frames {
+                if let Some(a) = node.serve(&f) {
+                    io.inbound(&a, Ms(*now));
+                }
+            }
+        }
+        let (entries, cursor) = got.unwrap_or_else(|| panic!("page {n} of the scan was never answered"));
+        rows += entries;
+        match cursor {
+            Some(c) => after = Some(c),
+            None => return rows,
+        }
+    }
+}
+
+/// Some of the current tree's tree-node blocks (never the root): the members a read races.
+fn some_members(node: &WireNode, tree: &[freenet_prolly::Cid], every: usize) -> Vec<([u8; 32], freenet_prolly::Cid)> {
+    let root = node.head().expect("a head").1;
+    tree.iter()
+        .filter(|c| **c != root)
+        .map(|c| (wire::block::contract_for(BLOCK_CODE, c), *c))
+        .filter(|(id, _)| node.contracts.get(id).is_some_and(|st| st.first() == Some(&freenet_prolly::kind::TREE_NODE)))
+        .step_by(every)
+        .collect()
+}
+
+/// **A SLOW BLOCK IS UNANSWERED, NOT MISSING, AND NEVER RE-PUT** (core dev on #555's follow-up: engineer2's network
+/// run counted timeouts as losses). The node HAS every block, but is SILENT on some members; a pass reads the tree
+/// (their races rebuild them from their groups) and ENDS inside their node bounds: they are UNANSWERED -- not missing,
+/// nothing put back, zero block PUTs on the wire.
+#[test]
+fn a_block_silent_inside_its_bound_is_unanswered_not_missing_and_gets_no_put() {
+    let Lossy { mut node, mut now, tree, .. } = lossy_tree(53, None);
+    let slow = some_members(&node, &tree, 5);
+    assert!(!slow.is_empty(), "THE SETUP: no member to slow down");
+    node.silent_gets.extend(slow.iter().map(|(id, _)| *id));
+    let puts_before = node.served.get("put block").copied().unwrap_or(0);
+    let mut r = reader_with(&node, engine::Params::default());
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    r.server.page.begin_repair_pass(true);
+    assert_eq!(read_all_prompt(&mut r, &mut node, &mut now, 1_000), 2_000, "the pass did not read every row");
+    let rep = r.server.page.end_repair_pass();
+    let puts = node.served.get("put block").copied().unwrap_or(0) - puts_before;
+    println!("slow: {} members silent; missing {}, unanswered {}, put back {}; block PUTs {puts}", slow.len(), rep.missing, rep.unanswered, rep.put_back);
+    assert_eq!((rep.missing, rep.put_back), (0, 0), "a block the node HAS was counted missing or put back: {rep:?}");
+    assert!(rep.unanswered > 0, "THE SETUP: nothing was left unanswered (the silence was never met): {rep:?}");
+    assert_eq!(puts, 0, "a slow block was re-PUT {puts} times");
+}
+
+/// **A BLOCK SILENT PAST ITS NODE BOUND IS MISSING, AND PUT BACK** (the other half of the rule): the node LACKS some
+/// members and answers them with SILENCE, never NotFound; a pass that waits out their node bound counts each MISSING
+/// and puts it back -- the node holds it again.
+#[test]
+fn a_block_silent_past_its_bound_is_missing_and_put_back() {
+    let Lossy { mut node, mut now, tree, .. } = lossy_tree(55, None);
+    let gone = some_members(&node, &tree, 5);
+    assert!(!gone.is_empty(), "THE SETUP: no member to lose");
+    for (id, _) in &gone {
+        node.contracts.remove(id);
+        node.silent_gets.insert(*id);
+    }
+    let mut r = reader_with(&node, engine::Params::default());
+    client(&mut r, &mut node, &mut now, &Request::Identity);
+    r.server.page.begin_repair_pass(true);
+    assert_eq!(read_all(&mut r, &mut node, &mut now, 1_100), 2_000, "the pass did not read every row");
+    let rep = r.server.page.end_repair_pass();
+    let back = gone.iter().filter(|(id, _)| node.contracts.contains_key(id)).count();
+    println!("absent: {} members lost, silent; missing {}, unanswered {}, put back {}; the node holds {back} again", gone.len(), rep.missing, rep.unanswered, rep.put_back);
+    assert!(rep.missing >= gone.len() as u64 && rep.put_back == rep.missing, "silent-past-bound blocks were not counted missing and put back: {rep:?}");
+    assert_eq!(back, gone.len(), "a lost silent block is not back on the node");
 }

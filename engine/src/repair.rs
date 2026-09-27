@@ -99,6 +99,18 @@ core_types::vocabulary! {
     }
 }
 
+core_types::vocabulary! {
+    /// What the node said of ONE block a whole-tree pass asked (sdk#479, core dev on #555's follow-up): SERVED (its
+    /// bytes), MISSING (NotFound, or silent past its node GET bound: the node's op is surely over), UNANSWERED (silent,
+    /// still inside its bound -- never counted as a loss, never put back).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BlockState {
+        Served => "SERVED",
+        Missing => "MISSING",
+        Unanswered => "UNANSWERED",
+    }
+}
+
 impl GroupHealth {
     /// `present` of a group of `k` members + `m` parity.
     pub fn of(present: usize, k: usize, m: usize) -> GroupHealth {

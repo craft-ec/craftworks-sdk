@@ -23,6 +23,7 @@ export function wrap(raw) {
       asked: group(said.asked),
       groupHealth: group(said.groupHealth),
       repairOutcome: group(said.repairOutcome),
+      blockState: group(said.blockState),
       failWhy: group(said.failWhy),
       binding: BINDING,
     });
