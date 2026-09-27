@@ -424,6 +424,13 @@ pub fn webapp_address(code: &[u8], state: &[u8]) -> String {
     wire::webapp::address(code, state)
 }
 
+impl AppContainer {
+    /// Its files, as added: what a site's STARTER is (`Session::publish_app`, which adds the pointer).
+    pub(crate) fn files(&self) -> &[(String, Vec<u8>)] {
+        &self.0
+    }
+}
+
 /// A LOAD PIECE's web container state (sdk#347): `wire::webapp::piece_container`, the one owner, for the loader's
 /// repair after load and the keeper's repair (sdk#493).
 #[wasm_bindgen]

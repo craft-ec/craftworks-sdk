@@ -133,6 +133,20 @@ pub fn piece_container(piece: &[u8]) -> Result<Vec<u8>, String> {
     app_container(&[(PIECE_FILE, piece)])
 }
 
+/// The path of a site's POINTER (ARCHITECTURE §19, the bootstrap): the one file of a site that names whose tree the
+/// app is in -- the loader reads it, checks it against its own link, and reads the app from that tree.
+pub const POINTER_PATH: &str = "pointer.json";
+
+/// A site's POINTER, the ONE owner of its bytes (app-as-data P4): `{"app":"<app id>","register_params":"<hex>"}` --
+/// no version, head or seq, so a platform upgrade writes it byte for byte the same. `None` for an app id that is not
+/// one (`core_types::name::app_ok`: nothing in it needs escaping) or no register params.
+pub fn site_pointer(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
+    if register_params.is_empty() || !core_types::name::app_ok(app) {
+        return None;
+    }
+    Some(format!(r#"{{"app":"{app}","register_params":"{}"}}"#, core_types::hex::encode(register_params)).into_bytes())
+}
+
 /// An app's WEB part: `files` as a deterministic tar in stored-chunk xz -- what the node unpacks and serves, and
 /// what a SITE carries under its record (builder#117). `app_container` frames exactly this.
 pub fn app_web(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
@@ -233,5 +247,17 @@ mod tests {
         assert_eq!(a, address(b"code", &s), "the address is not a function of its inputs");
         assert_ne!(a, address(b"other code", &s));
         assert_ne!(a, address(b"code", &container(b"{}", b"wEb")));
+    }
+}
+
+#[cfg(test)]
+mod pointer {
+    use super::*;
+
+    #[test]
+    fn a_pointer_is_its_app_and_register_params_and_nothing_else() {
+        assert_eq!(site_pointer(&[0xab, 0x01], "notes").unwrap(), br#"{"app":"notes","register_params":"ab01"}"#.to_vec());
+        assert_eq!(site_pointer(&[0xab, 0x01], "notes"), site_pointer(&[0xab, 0x01], "notes"), "not byte-identical twice");
+        assert!(site_pointer(&[], "notes").is_none() && site_pointer(&[1], "No\"tes").is_none() && site_pointer(&[1], "").is_none());
     }
 }
