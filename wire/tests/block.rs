@@ -93,6 +93,23 @@ fn get_and_update_frame_to_the_requests_they_name() {
     }
 }
 
+/// A LOCAL node's "missing contract" (`freenet local` answers the GET of a contract it never stored with
+/// `ContractError::MissingContract`) is the explicit NotFound, with the contract's id -- the fact a network node's
+/// `ContractResponse::NotFound` states. Control: a GET refusal of the same contract stays `Refused`.
+#[test]
+fn a_local_nodes_missing_contract_is_not_found_with_its_id() {
+    use freenet_stdlib::client_api::{ClientError, ContractError, ErrorKind, RequestError};
+    let key = block_contract(CODE, &cid(7)).key();
+    let missing: ClientError = ErrorKind::RequestError(RequestError::ContractError(ContractError::MissingContract { key: *key.id() })).into();
+    let bytes = bincode::serialize(&Err::<HostResponse, ClientError>(missing)).expect("encodes");
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&key.id().as_bytes()[..32]);
+    assert_eq!(unframe(&mut Reassembler::new(), &bytes), Incoming::GetFailed { id, why: wire::GetFail::NotFound });
+    let refused: ClientError = ErrorKind::RequestError(RequestError::ContractError(ContractError::Get { key, cause: "busy".into() })).into();
+    let bytes = bincode::serialize(&Err::<HostResponse, ClientError>(refused)).expect("encodes");
+    assert_eq!(unframe(&mut Reassembler::new(), &bytes), Incoming::GetFailed { id, why: wire::GetFail::Refused("busy".into()) });
+}
+
 /// A GET the node refuses, NAMING the contract, is `GetFailed` with its
 /// instance id — how a cold read learns its root is this node's own (F55). A
 /// refusal that names nothing is still `Refused`.
