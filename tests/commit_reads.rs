@@ -87,7 +87,7 @@ fn a_stale_update_is_refused_and_rolled_back_however_often_it_goes() {
             // engine judged it on its own older view — lost to A's newer head
             // (`Lost`, R0: re-judged if ever re-sent). Either way NOT applied.
             assert!(
-                matches!(b.told(w).last(), Some(protocol::WriteState::Failed | protocol::WriteState::Lost | protocol::WriteState::Conflict)),
+                matches!(b.told(w).last(), Some(protocol::WriteState::Failed | protocol::WriteState::FailedWhy { .. } | protocol::WriteState::Lost | protocol::WriteState::Conflict)),
                 "a stale update was not refused: {:?}",
                 b.told(w)
             );

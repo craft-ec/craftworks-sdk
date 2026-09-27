@@ -9,7 +9,7 @@
 //! [`MAX_UNREAD`] the oldest is dropped and COUNTED -- never kept for ever,
 //! never dropped silently.
 
-use engine::{State, WriteBound};
+use engine::{FailWhy, State, WriteBound};
 use std::collections::{BTreeMap, VecDeque};
 
 /// Unread terminal fates kept, across every session of the page.
@@ -41,8 +41,9 @@ pub enum Fate {
     /// this session already had a write in it. Backpressure (COMMIT-LIFE K1):
     /// the SDK waits for room and makes it again.
     QueueFull { bytes: usize, limit: usize },
-    /// TERMINAL, nothing applied.
-    Failed,
+    /// TERMINAL, nothing applied, for the cause named (sdk#500). `signer`:
+    /// the signer's own why, beside a `SignerRefused` (`Page`'s refusal).
+    Failed { why: FailWhy, signer: Option<String> },
     /// TERMINAL: its commit died and it fell -- forced, or its tries spent.
     Lost,
     /// TERMINAL: whether it landed cannot be known (the head's ledger no
@@ -67,7 +68,7 @@ impl Fate {
             Fate::Unread { .. } => "UNREAD",
             Fate::TooLarge { .. } => "TOO_LARGE",
             Fate::QueueFull { .. } => "QUEUE_FULL",
-            Fate::Failed => "FAILED",
+            Fate::Failed { .. } => "FAILED",
             Fate::Lost => "LOST",
             Fate::Unknown => "UNKNOWN",
         }
@@ -106,7 +107,7 @@ impl Fates {
             State::Unread => Fate::Unread { key: Vec::new() },
             State::TooLarge { bound, limit, got } => Fate::TooLarge { bound, limit, got },
             State::QueueFull { bytes, limit } => Fate::QueueFull { bytes, limit },
-            State::Failed => Fate::Failed,
+            State::Failed { why } => Fate::Failed { why, signer: None },
             State::Lost => Fate::Lost,
             State::Unknown => Fate::Unknown,
         };
@@ -133,6 +134,13 @@ impl Fates {
             *kk = k;
             *c = current;
             *a = after;
+        }
+    }
+
+    /// The signer's why beside a `Failed { SignerRefused }` (the page's refusal, sdk#500).
+    pub fn signer_refused(&mut self, key: FateKey, why: String) {
+        if let Some(Fate::Failed { why: FailWhy::SignerRefused, signer }) = self.kept.get_mut(&key) {
+            *signer = Some(why);
         }
     }
 
@@ -208,12 +216,12 @@ mod tests {
     fn unread_fates_are_bounded_oldest_first_and_every_drop_counted() {
         let mut f = Fates::default();
         for w in 0..(MAX_UNREAD as u64 + 5) {
-            f.told((1, w), &State::Failed, 0);
+            f.told((1, w), &State::Failed { why: FailWhy::TreeDamaged }, 0);
         }
         assert_eq!(f.unread_count(), MAX_UNREAD);
         assert_eq!(f.dropped, 5, "drops were not counted one for one");
         assert_eq!(f.take((1, 0)), None, "the oldest was not the one dropped");
-        assert_eq!(f.take((1, 5)), Some(Fate::Failed), "a fate inside the bound was lost");
+        assert_eq!(f.take((1, 5)), Some(Fate::Failed { why: FailWhy::TreeDamaged, signer: None }), "a fate inside the bound was lost");
         assert_eq!(f.take((1, 5)), None, "a fate outlived being read");
     }
 

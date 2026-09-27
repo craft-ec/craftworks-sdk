@@ -531,7 +531,7 @@ fn a_stalled_write_is_reported_once_and_the_writes_queued_behind_it_publish() {
          tick is one a caller learns to ignore"
     );
     assert!(
-        !one.contains(&State::Failed),
+        !one.iter().any(|s| matches!(s, State::Failed { .. })),
         "write 1 was reported Failed while its edit is still in the tree"
     );
     // Queued behind the stuck commit: taken, and not moving either -- told
@@ -659,7 +659,7 @@ fn valid_sequence(states: &[State]) -> bool {
     ];
     let mut at = 0usize;
     for (i, s) in states.iter().enumerate() {
-        if matches!(s, State::Failed | State::Lost | State::Busy) {
+        if matches!(s, State::Failed { .. } | State::Lost | State::Busy) {
             // Terminal: nothing may follow it.
             return i + 1 == states.len();
         }
@@ -860,7 +860,7 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
         for f in stepped!(e, Event::Tick(t)) {
             if let Effect::Notify {
                 write_id: WriteId(2),
-                state: State::Failed,
+                state: State::Failed { .. },
                 ..
             } = f
             {

@@ -645,7 +645,7 @@ fn a_rejected_block_ends_its_commit_failed_and_is_never_put_again() {
     let first = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     let victim = *puts(&first).keys().next().expect("a block PUT");
     let fx = r.step(Event::PutRejected(victim));
-    assert_eq!(states(&fx, 2), vec![State::Failed], "the write needing a rejected block was not told Failed (and only that)");
+    assert_eq!(states(&fx, 2), vec![State::Failed { why: engine::FailWhy::BlockRejected }], "the write needing a rejected block was not told Failed (and only that)");
     assert!(!puts(&fx).contains_key(&victim), "the rejected block was put again");
     assert!(!puts(&r.step(Event::PutFailed(victim))).contains_key(&victim), "a later PutFailed put the rejected block again");
     assert!(r.e.rejected_blocks().contains(&victim));

@@ -13,8 +13,13 @@ use signer_proto::{Answer as A, Head, Why};
 /// time, and the id the sign was asked under. Every PUT is answered ok; the
 /// first head read finds no head.
 fn at_sign(path: PutPath) -> (Page, u64, u32) {
+    at_sign_as(path, ClientId(1))
+}
+
+/// [`at_sign`], its write made by `client`.
+fn at_sign_as(path: PutPath, client: ClientId) -> (Page, u64, u32) {
     let mut p = Page::new(Params::default(), path);
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.write(client, WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
     let now = 10;
     for _ in 0..20 {
         for op in p.take_ops() {
@@ -257,7 +262,7 @@ fn a_final_sign_refusal_fails_the_commits_writes_at_once_and_names_the_why() {
         let _ = p.take_notices();
         p.answer(Answer::Signer { id, answer: A::Refused(refusal.clone()) }, Ms(now + 1));
         let told: Vec<State> = p.take_notices().into_iter().filter(|(_, w, _)| *w == WriteId(1)).map(|(_, _, s)| s).collect();
-        assert_eq!(told, vec![State::Failed], "{refusal:?}: the write was not told Failed in the refusal's own step");
+        assert_eq!(told, vec![State::Failed { why: engine::FailWhy::SignerRefused }], "{refusal:?}: the write was not told Failed, as SIGNER_REFUSED, in the refusal's own step");
         let said = p.unusable();
         assert_eq!(said.len(), 1, "{refusal:?}: the refusal was not said exactly once: {said:?}");
         assert!(said[0].contains(&format!("{refusal:?}")) && said[0].contains("writes 1"), "{refusal:?}: the said line does not name the why and the failed write: {said:?}");
@@ -265,4 +270,23 @@ fn a_final_sign_refusal_fails_the_commits_writes_at_once_and_names_the_why() {
         p.tick(Ms(now + 10 * page::rto::RTO_INITIAL_MS as u64));
         assert_eq!(signs(&p.take_ops()), 0, "{refusal:?}: a refused commit was signed again");
     }
+}
+
+/// **sdk#500: a write the signer's final refusal failed names its cause, and the signer's own why, on the fate the
+/// app PULLS** -- not only in a said line beside it. Through the `Server`, which keeps fates: the fate is
+/// `Failed { SignerRefused }` with the signer's why, and `SIGNER_REFUSED` is the code the app is told. Mutant "the
+/// page records no why" (`signer_why` never filled) -> `signer: None` -> red.
+#[test]
+fn a_signer_refusal_names_its_cause_and_the_signers_why_on_the_pulled_fate() {
+    const SESSION: u64 = 7;
+    // A client id is its session over its protocol version (`page::server`'s `session_of`).
+    let (p, now, id) = at_sign_as(PutPath::Page, ClientId((SESSION << 16) | u64::from(protocol::CURRENT)));
+    let mut s = page::server::Server::new(p, page::server::SignerFacts::default());
+    s.node(Answer::Signer { id, answer: A::Refused(Why::CannotSign) }, Ms(now + 1));
+    let fate = s.fate(SESSION, 1).expect("the refused write has no fate");
+    let page::fates::Fate::Failed { why, signer } = fate else { panic!("the refused write's fate is not Failed: {fate:?}") };
+    assert_eq!(why, engine::FailWhy::SignerRefused);
+    assert_eq!(why.code(), "SIGNER_REFUSED");
+    let signer = signer.expect("the signer's own why did not ride beside the refusal");
+    assert!(signer.contains("CannotSign"), "the why beside the refusal is not the signer's: {signer}");
 }

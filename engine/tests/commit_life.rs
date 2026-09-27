@@ -68,7 +68,7 @@ fn told(fx: &[Effect], id: u64) -> Vec<State> {
 }
 
 fn terminal(s: State) -> bool {
-    matches!(s, State::Published | State::Failed | State::Lost | State::Unknown | State::Conflict)
+    matches!(s, State::Published | State::Failed { .. } | State::Lost | State::Unknown | State::Conflict)
 }
 
 fn puts(fx: &[Effect]) -> Vec<Cid> {
@@ -381,7 +381,7 @@ impl Model {
                     let t = told(&fx, *w);
                     match end {
                         End::Published => assert!(t.contains(&State::Published), "{at}: write {w} not Published: {t:?}"),
-                        End::Failed => assert!(t.contains(&State::Failed), "{at}: write {w} not Failed: {t:?}"),
+                        End::Failed => assert!(t.iter().any(|s| matches!(s, State::Failed { .. })), "{at}: write {w} not Failed: {t:?}"),
                         End::DeadRacing => assert!(!t.iter().any(|s| terminal(*s)), "{at}: write {w} of a never-headed commit was told {t:?} (A8: it goes again)"),
                         End::DeadHeading => {}
                     }
@@ -547,7 +547,7 @@ fn a9_a_rejected_root_ends_a_heading_commit_failed() {
     let ((_, sent_root), _) = to_heading(&mut h, fx, &BTreeSet::from([root]));
     assert_eq!(sent_root, root, "THE SETUP: the head names another root");
     let fx = h.step(Event::PutRejected(root));
-    assert!(told(&fx, 1).contains(&State::Failed), "a Heading commit whose root was rejected did not end Failed: {:?}", told(&fx, 1));
+    assert!(told(&fx, 1).contains(&State::Failed { why: engine::FailWhy::BlockRejected }), "a Heading commit whose root was rejected did not end Failed: {:?}", told(&fx, 1));
     assert_eq!(h.engine().commit_stage(), CommitStage::Idle, "the commit whose root can never land stayed in flight");
 }
 
@@ -647,7 +647,7 @@ fn a9_a_group_rejected_below_k_ends_a_heading_commit_failed() {
     let mut ended = None;
     for (n, id) in own.iter().skip(1).enumerate() {
         let fx = h.step(Event::PutRejected(*id));
-        if told(&fx, 1).contains(&State::Failed) {
+        if told(&fx, 1).contains(&State::Failed { why: engine::FailWhy::BlockRejected }) {
             ended = Some(n + 1);
             break;
         }

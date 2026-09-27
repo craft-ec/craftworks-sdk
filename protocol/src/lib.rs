@@ -915,7 +915,13 @@ pub enum WriteState {
     /// told to CHECK. From `page::Server` at v4; an older client is told
     /// `Stalled` (nothing claimed).
     Unknown,
+    /// TERMINAL, as [`WriteState::Failed`], with its cause named: the ONE
+    /// list, [`FailWhy`] (sdk#500). From `page::Server` at v4; an older client
+    /// is told `Failed`, which is true to it without a cause it could not read.
+    FailedWhy { why: FailWhy },
 }
+
+pub use core_types::fail::FailWhy;
 
 /// Which of the engine's bounds a [`WriteState::TooLarge`] write is over.
 /// APPEND ONLY: a variant's position is its wire tag.
@@ -950,6 +956,7 @@ impl WriteState {
                 | WriteState::Unread
                 | WriteState::QueueFull { .. }
                 | WriteState::Unknown
+                | WriteState::FailedWhy { .. }
         )
     }
 
@@ -980,7 +987,11 @@ impl WriteState {
             | WriteState::Failed
             | WriteState::Lost => 1,
             WriteState::TooLarge { .. } => 3,
-            WriteState::Conflict | WriteState::Unread | WriteState::QueueFull { .. } | WriteState::Unknown => SESSION_SINCE,
+            WriteState::Conflict
+            | WriteState::Unread
+            | WriteState::QueueFull { .. }
+            | WriteState::Unknown
+            | WriteState::FailedWhy { .. } => SESSION_SINCE,
             WriteState::Duplicate | WriteState::OutOfOrder { .. } => FLOOR_SINCE,
         }
     }
@@ -1023,6 +1034,8 @@ impl WriteState {
             // Claims nothing: `Stalled` (never `Lost`, which would roll back
             // a write that may have landed).
             WriteState::Unknown => WriteState::Stalled,
+            // The same end without its cause: what `Failed` always told.
+            WriteState::FailedWhy { .. } => WriteState::Failed,
             // The order rule's verdicts exist only on v5, whose writes carry a
             // floor; a pre-v5 client never meets them. If one ever did, it is
             // told the TRUE v4 equivalent — never `Failed`, which would roll
@@ -1061,6 +1074,7 @@ impl WriteState {
         WriteState::Unread,
         WriteState::QueueFull { bytes: 4096, limit: 4096 },
         WriteState::Unknown,
+        WriteState::FailedWhy { why: FailWhy::SignerRefused },
     ];
 
     /// The order rule's verdicts (v5): never sent below v5, so their

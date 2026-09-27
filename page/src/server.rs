@@ -532,7 +532,7 @@ impl Server {
                             }
                         }
                     }
-                    State::Failed | State::Lost | State::Conflict | State::Unread | State::TooLarge { .. } | State::Unknown | State::QueueFull { .. } => {
+                    State::Failed { .. } | State::Lost | State::Conflict | State::Unread | State::TooLarge { .. } | State::Unknown | State::QueueFull { .. } => {
                         self.sent.remove(&id);
                     }
                     _ => {}
@@ -592,10 +592,19 @@ impl Server {
     /// Every verdict to a client, kept as its write's fate (R-b).
     fn keep_fates(&mut self, effects: &[Effect]) {
         let seq = self.page.published().0;
+        // Said in the step that emitted these notices, and read HERE only: taken whole, so none outlives its batch.
+        let mut signer_why = std::mem::take(&mut self.page.signer_why);
         for f in effects {
             match f {
                 Effect::Notify { client, write_id, state } => {
                     self.fates.told((session_of(*client), write_id.0), state, seq);
+                    // The signer's own why beside its refusal (sdk#500), said by the page in the same step -- read at
+                    // the refusal's notice, never an earlier one of the same write (its `Accepted` is in this batch too).
+                    if *state == (State::Failed { why: engine::FailWhy::SignerRefused }) {
+                        if let Some(why) = signer_why.remove(&(*client, *write_id)) {
+                            self.fates.signer_refused((session_of(*client), write_id.0), why);
+                        }
+                    }
                     // BACKED_UP: the keys whose last write this is (sdk#415).
                     if *state == State::ParityComplete {
                         for k in self.last_keys.remove(&(client.0, write_id.0)).unwrap_or_default() {
@@ -916,7 +925,7 @@ impl Server {
             // known): its keys are superseded, told -- never blind. Never
             // `QueueFull`: a merge write goes in at the front, past the bound
             // (its bytes were counted when first taken).
-            State::Lost | State::Conflict | State::Unread | State::Failed | State::TooLarge { .. } | State::Unknown => {
+            State::Lost | State::Conflict | State::Unread | State::Failed { .. } | State::TooLarge { .. } | State::Unknown => {
                 m.landed.insert(i, false);
                 false
             }
@@ -1035,7 +1044,7 @@ impl Server {
             if let P::Write { write_id, .. } | P::Commit { write_id, .. } | P::DeferredCommit { write_id, .. } = &r {
                 let id = *write_id;
                 self.page.say(instrument::Site::of("page::said::read-only-write"), format!("read-only: write {id} refused at the door (a view writes nothing)"));
-                self.page.client_fx.push(Effect::Notify { client: self.speaker, write_id: as_write_id(id), state: State::Failed });
+                self.page.client_fx.push(Effect::Notify { client: self.speaker, write_id: as_write_id(id), state: State::Failed { why: engine::FailWhy::ReadOnly } });
                 return Vec::new();
             }
         }
@@ -1239,7 +1248,8 @@ impl Server {
                             self.busy_told.set(self.busy_told.get() + 1);
                             W::Busy
                         }
-                        State::Failed => W::Failed,
+                        // sdk#500: the cause named; `for_client` tells a pre-v4 client `Failed`.
+                        State::Failed { why } => W::FailedWhy { why: *why },
                         State::Lost => W::Lost,
                         // ⁵: may have landed; the app is told to check.
                         State::Unknown => W::Unknown,
@@ -1529,7 +1539,7 @@ fn state_tag(s: State) -> u64 {
         State::Published => 2,
         State::ParityComplete => 3,
         State::Busy => 4,
-        State::Failed => 5,
+        State::Failed { .. } => 5,
         State::Lost => 6,
         State::TooLarge { .. } => 7,
         // Never reached on this path: the delegate's writes carry no reads

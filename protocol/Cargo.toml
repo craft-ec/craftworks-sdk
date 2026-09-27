@@ -9,9 +9,8 @@ description = "The SDK <-> engine protocol. Versioned from its first message, an
 # Nothing else. This crate is shared by a delegate's wasm and the browser
 # SDK's wasm, and a dependency here is one BOTH of them carry — which is why
 # a gate asserts neither the freenet client stack nor tokio is reachable
-# from it.
+# from it. core-types is layer 0 (serde only): `FailWhy`, the ONE list of why a
+# write `Failed`, crosses the wire as itself (sdk#500).
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 bincode = "1"
-
-[dev-dependencies]
 core-types = { path = "../core-types" }

@@ -207,8 +207,11 @@ pub enum State {
     Stalled,
     Published,
     ParityComplete,
-    /// TERMINAL: this edit is not in the tree and never will be.
-    Failed,
+    /// TERMINAL: this edit is not in the tree and never will be, for the cause
+    /// named (sdk#500: one list, [`FailWhy`]).
+    Failed {
+        why: FailWhy,
+    },
     /// TERMINAL: this engine has never heard of that write.
     ///
     /// After a restart, what the head does not name was never published and
@@ -520,6 +523,17 @@ pub type ParityIds = [Cid; PARITY];
 /// one owner. Never written by hand here -- `tests/one_parity.rs` fails the build
 /// on a hand-written count.
 pub use freenet_prolly::parity::PARITY;
+/// Why a write ended `Failed` (sdk#500): the ONE list, from layer 0.
+pub use core_types::fail::FailWhy;
+
+/// An apply that stopped for anything but a missing block: the tree's own
+/// damage, or the edit itself refused.
+fn apply_failed(e: &ApplyError) -> FailWhy {
+    match e {
+        ApplyError::Read(_) => FailWhy::TreeDamaged,
+        ApplyError::NotSorted | ApplyError::KeyTooLong | ApplyError::ValueTooLong | ApplyError::Node(_) => FailWhy::EditRefused,
+    }
+}
 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2330,8 +2344,8 @@ impl<B: Blocks> Engine<B> {
                 );
                 self.shed.writes += 1;
                 match self.queue.iter().position(|q| (q.client, q.write_id) == (pw.client, pw.write_id)) {
-                    Some(i) => out.extend(self.end_queued(i, State::Failed)),
-                    None => out.push(Effect::Notify { client: pw.client, write_id: pw.write_id, state: State::Failed }),
+                    Some(i) => out.extend(self.end_queued(i, State::Failed { why: FailWhy::ContextFull })),
+                    None => out.push(Effect::Notify { client: pw.client, write_id: pw.write_id, state: State::Failed { why: FailWhy::ContextFull } }),
                 }
                 out.extend(self.advance());
             } else {
@@ -3332,7 +3346,7 @@ impl<B: Blocks> Engine<B> {
                 out.push(Effect::Conflicted { client: q.client, write_id: q.write_id, key, current, after, tries: q.tries });
                 return (out, true);
             }
-            Err(ReadsCheck::Unreadable) => return (self.end_queued(i, State::Failed), true),
+            Err(ReadsCheck::Unreadable) => return (self.end_queued(i, State::Failed { why: FailWhy::TreeDamaged }), true),
         }
         let batch = batch_of(&q.ops);
         let mut emitted: Vec<(Cid, Vec<u8>)> = Vec::new();
@@ -3341,7 +3355,7 @@ impl<B: Blocks> Engine<B> {
         }) {
             Ok(a) => a,
             Err(ApplyError::Read(ReadError::Need(need))) => return self.park_applying(i, need),
-            Err(_) => return (self.end_queued(i, State::Failed), true),
+            Err(e) => return (self.end_queued(i, State::Failed { why: apply_failed(&e) }), true),
         };
         if emitted.len() > self.params.max_commit_blocks {
             let got = emitted.len();
@@ -3472,7 +3486,7 @@ impl<B: Blocks> Engine<B> {
                     continue;
                 }
                 Err(ReadsCheck::Unreadable) => {
-                    out.extend(self.end_queued(idx, State::Failed));
+                    out.extend(self.end_queued(idx, State::Failed { why: FailWhy::TreeDamaged }));
                     dropped = true;
                     continue;
                 }
@@ -3487,8 +3501,8 @@ impl<B: Blocks> Engine<B> {
                     stopped_cold = Some(need);
                     break;
                 }
-                Err(_) => {
-                    out.extend(self.end_queued(idx, State::Failed));
+                Err(e) => {
+                    out.extend(self.end_queued(idx, State::Failed { why: apply_failed(&e) }));
                     dropped = true;
                     continue;
                 }
@@ -3726,7 +3740,7 @@ impl<B: Blocks> Engine<B> {
             return vec![Effect::Notify {
                 client,
                 write_id,
-                state: State::Failed,
+                state: State::Failed { why: FailWhy::FetchBudget },
             }];
         }
         // ONE ROUND AT A TIME, AND NO MORE THAN THE CHAIN HAS LEFT (sdk#174).
@@ -4231,7 +4245,7 @@ impl<B: Blocks> Engine<B> {
             return Vec::new();
         }
         // A REAL END (rule 8): the commit's writes are Failed.
-        self.end_commit(End::Failed)
+        self.end_commit(End::Failed(FailWhy::BlockRejected))
     }
 
     /// The signer finally refused commit `seq`'s head (PUBLISH-LIFE ⁵): if `seq` is the commit in flight, it ends
@@ -4240,7 +4254,7 @@ impl<B: Blocks> Engine<B> {
         if !self.life.commit().is_some_and(|c| c.seq == seq) {
             return Vec::new();
         }
-        self.end_commit(End::Failed)
+        self.end_commit(End::Failed(FailWhy::SignerRefused))
     }
 
     /// THE ONE TEARDOWN (COMMIT-LIFE rev 5, C3): every end of the commit in flight -- its head showed, a foreign head,
@@ -4257,7 +4271,7 @@ impl<B: Blocks> Engine<B> {
         let landed = |w: &Option<Witness>| matches!(w, Some(Witness::Through(t)) if c.through > 0 && *t >= c.through);
         let withdraw = match &end {
             End::Published => false,
-            End::Failed => true,
+            End::Failed(_) => true,
             End::Dead { witness, .. } => !headed || !(landed(witness) || *witness == Some(Witness::Unknown)),
         };
         if withdraw {
@@ -4268,11 +4282,11 @@ impl<B: Blocks> Engine<B> {
         }
         match end {
             End::Published => out.extend(self.publish(c)),
-            End::Failed => {
+            End::Failed(why) => {
                 self.next_seq = self.published_seq + 1;
                 // Re-applied they would meet the same refusal: they leave the queue.
                 self.queue.retain(|q| !c.writes.contains(&(q.client, q.write_id)));
-                out.extend(c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed }));
+                out.extend(c.writes.iter().map(|w| Effect::Notify { client: w.0, write_id: w.1, state: State::Failed { why } }));
                 self.root = self.published_root;
                 self.requeue_from(0);
                 out.extend(self.advance());
@@ -4587,8 +4601,8 @@ impl<B: Blocks> Engine<B> {
         // `Busy`; and the next `Applying` write is tried (footnote 8).
         let p = self.release_write().expect("checked");
         let mut out = match self.queue.iter().position(|q| (q.client, q.write_id) == (p.client, p.write_id)) {
-            Some(i) => self.end_queued(i, State::Failed),
-            None => vec![Effect::Notify { client: p.client, write_id: p.write_id, state: State::Failed }],
+            Some(i) => self.end_queued(i, State::Failed { why: FailWhy::SilentRelease }),
+            None => vec![Effect::Notify { client: p.client, write_id: p.write_id, state: State::Failed { why: FailWhy::SilentRelease } }],
         };
         out.extend(self.advance());
         out

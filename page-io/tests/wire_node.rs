@@ -1344,7 +1344,7 @@ fn a_block_the_nodes_contract_rejects_is_sent_once_and_its_write_fails() {
         let sends = node.block_puts[before..].iter().filter(|(_, id)| *id == rejected).count();
         println!("  {cause:?}: the rejected block reached the node {sends} time(s); states {:?}; unusable {:?}", states(&r, 1), io.unusable());
         assert_eq!(sends, 1, "{cause:?}: a block the node's contract rejected was sent again ({sends} sends in 70 s)");
-        assert!(states(&r, 1).contains(&WriteState::Failed), "{cause:?}: the write needing a rejected block was not told Failed: {:?}", states(&r, 1));
+        assert!(states(&r, 1).contains(&WriteState::FailedWhy { why: protocol::FailWhy::BlockRejected }), "{cause:?}: the write needing a rejected block was not told Failed, as BLOCK_REJECTED: {:?}", states(&r, 1));
         assert!(!states(&r, 1).iter().any(|s| matches!(s, WriteState::Lost | WriteState::Published)), "{cause:?}: told {:?}", states(&r, 1));
         assert!(io.unusable().iter().any(|u| u.contains("refused block") && u.contains(cause)), "{cause:?}: the rejection was not named: {:?}", io.unusable());
     }
@@ -1380,7 +1380,7 @@ fn a_text_named_refusal_is_attributed_only_to_our_put_and_final_only_for_a_pinne
     let sends = node.block_puts[before..].iter().filter(|(_, id)| *id == errored).count();
     println!("  (b) our key, i/o reason: {sends} send(s); states {:?}", states(&r, 1));
     assert!(sends >= 3, "a transient text-named refusal was not re-sent on the RTO ({sends} send(s) in 70 s)");
-    assert!(!states(&r, 1).contains(&WriteState::Failed), "a refusal with a reason that is not pinned ended the write Failed");
+    assert!(!states(&r, 1).iter().any(|s| matches!(s, WriteState::Failed | WriteState::FailedWhy { .. })), "a refusal with a reason that is not pinned ended the write Failed");
 }
 
 /// A NODE ERROR NAMING NO OP (sdk#433): COUNTED by its reason code, and it ends nothing and re-arms nothing -- with
@@ -2194,7 +2194,7 @@ fn a_views_door_refusal_and_its_pages_filter_agree() {
         v.tick(Ms(now));
         settle(&mut v, &mut node, &mut now);
     }
-    assert!(states(&wr, 2).contains(&WriteState::Failed), "a view's write was not refused at the door: {wr:?}");
+    assert!(states(&wr, 2).contains(&WriteState::FailedWhy { why: protocol::FailWhy::ReadOnly }), "a view's write was not refused at the door, as READ_ONLY: {wr:?}");
     assert!(v.server.page.unusable().iter().any(|u| u.starts_with("read-only: write 2 refused at the door")), "the view's refusal was not named: {:?}", v.server.page.unusable());
     for k in ["put block", "put register", "update", "signer"] {
         assert_eq!(node.served.get(k), before.get(k), "a view's write reached the node as a {k}");
@@ -2217,7 +2217,7 @@ fn a_views_define_is_refused_at_the_door_and_nothing_is_queued() {
     client(&mut v, &mut node, &mut now, &Request::Identity);
     assert_eq!(v.server.page.queue_load().0, 0, "THE CONTROL: the view's queue was not empty before");
     let r = client(&mut v, &mut node, &mut now, &write(2, "schema/notes", "{}"));
-    assert!(states(&r, 2).contains(&WriteState::Failed), "a view's define was not refused at the door: {r:?}");
+    assert!(states(&r, 2).contains(&WriteState::FailedWhy { why: protocol::FailWhy::ReadOnly }), "a view's define was not refused at the door, as READ_ONLY: {r:?}");
     assert!(v.server.page.unusable().iter().any(|u| u.starts_with("read-only: write 2 refused at the door")), "not named: {:?}", v.server.page.unusable());
     assert_eq!(v.server.page.queue_load().0, 0, "a view's define was queued on the engine");
 }

@@ -778,6 +778,9 @@ pub struct Page {
     /// Every effect for a CLIENT (a write's state, a read's answer, a
     /// subscription's news), in the order the engine emitted them.
     client_fx: Vec<Effect>,
+    /// The signer's why for each write its final refusal failed (sdk#500), said in the step that failed them and
+    /// read by the `Server` with those notices ([`server::Server`]'s `keep_fates` takes it whole).
+    signer_why: BTreeMap<(ClientId, WriteId), String>,
     /// Effects this executor does not act on (the read path's replies,
     /// subscriptions), for the caller.
     /// The lines said to the app (sdk#482): capped, drained by [`Page::take_unusable`], each recorded where said.
@@ -891,6 +894,7 @@ impl Page {
             engine_has_head: false,
             out: Vec::new(),
             client_fx: Vec::new(),
+            signer_why: BTreeMap::new(),
             unusable: Default::default(),
             read_only: false,
             head_floor: 0,
@@ -1371,18 +1375,22 @@ impl Page {
             }
             Act::Adopt(heard) => self.adopt(heard, Adopt::Conflict),
             Act::Confirmed(seq) => self.step(Event::HeadConfirmed(seq)),
-            // ⁵: a FINAL end of the owed commit. The engine fails its writes at once; the signer's why is said ONCE,
-            // naming them, here -- never stored (until sdk#500 carries it on the notice).
+            // ⁵: a FINAL end of the owed commit. The engine fails its writes at once (`SignerRefused`); the signer's
+            // why is said ONCE, naming them, here, and rides beside each write's notice (sdk#500).
             Act::Refused { seq, why } => {
                 let from = self.client_fx.len();
                 self.step(Event::HeadRefused { seq });
-                let failed: Vec<String> = self.client_fx[from.min(self.client_fx.len())..]
+                let failed: Vec<(ClientId, WriteId)> = self.client_fx[from.min(self.client_fx.len())..]
                     .iter()
                     .filter_map(|f| match f {
-                        Effect::Notify { write_id, state: State::Failed, .. } => Some(write_id.0.to_string()),
+                        Effect::Notify { client, write_id, state: State::Failed { why: engine::FailWhy::SignerRefused } } => Some((*client, *write_id)),
                         _ => None,
                     })
                     .collect();
+                for w in &failed {
+                    self.signer_why.insert(*w, why.clone());
+                }
+                let failed: Vec<String> = failed.iter().map(|(_, w)| w.0.to_string()).collect();
                 self.say(instrument::Site::of("page::said::head-refused"), format!("the signer refused commit seq {seq} (writes {}): {why}", failed.join(", ")));
             }
             Act::Note(state) => self.note_record(&state),
@@ -5381,8 +5389,8 @@ mod head_refused_order {
         assert!(held_back.iter().all(|id| !p.confirmed.contains(id) && p.deadlines.contains_key(&Waiting::Put(*id))) && !held_back.is_empty(), "THE SETUP: no first-wave PUT is unconfirmed on the wire at the sign (nothing for the withdraw to name)");
         p.answer(Answer::Signer { id, answer: signer_proto::Answer::Refused(signer_proto::Why::CannotSign) }, Ms(11));
         let told: Vec<(WriteId, State)> = p.take_notices().into_iter().map(|(_, w, s)| (w, s)).collect();
-        assert!(told.contains(&(WriteId(1), State::Failed)), "THE SETUP: write 1 was not Failed by the refusal: {told:?}");
-        assert!(!told.contains(&(WriteId(2), State::Failed)), "write 2 was failed with the refused commit: {told:?}");
+        assert!(told.contains(&(WriteId(1), State::Failed { why: engine::FailWhy::SignerRefused })), "THE SETUP: write 1 was not Failed by the refusal: {told:?}");
+        assert!(!told.iter().any(|(w, s)| *w == WriteId(2) && matches!(s, State::Failed { .. })), "write 2 was failed with the refused commit: {told:?}");
         assert!(p.engine.has_writes_in_flight(), "THE SETUP: write 2 did not go again");
         let lost: Vec<String> = held_back.iter().filter(|id| !owed(&p, id)).map(engine::short_id).collect();
         assert!(lost.is_empty(), "the withdraw ate the re-derived commit's PUT of {} of {} shared blocks: {lost:?}", lost.len(), held_back.len());

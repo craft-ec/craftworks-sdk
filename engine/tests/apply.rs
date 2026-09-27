@@ -185,7 +185,7 @@ fn a_write_whose_blocks_never_arrive_is_refused_and_applies_nothing() {
         let mut failed = 0usize;
         while let Some(id) = queue.pop() {
             let out = h.step(Event::BlockMissed(id));
-            failed += states(&out).iter().filter(|s| **s == State::Failed).count();
+            failed += states(&out).iter().filter(|s| matches!(s, State::Failed { .. })).count();
             let next = fetches(&out);
             if next.is_empty() {
                 break;
@@ -240,7 +240,7 @@ fn with_repair_on_a_write_whose_blocks_never_arrive_is_still_refused_once() {
         steps += 1;
         assert!(steps < 10_000, "the write never ended");
         let out = h.step(Event::BlockMissed(id));
-        failed += states(&out).iter().filter(|s| **s == State::Failed).count();
+        failed += states(&out).iter().filter(|s| matches!(s, State::Failed { .. })).count();
         queue.extend(fetches(&out));
     }
     assert_eq!(failed, 1, "a write that could never apply was reported Failed {failed} times");
@@ -331,7 +331,7 @@ fn a_cold_write_of_any_size_parks_and_applies() {
             let bytes = all.get(&id).expect("held");
             cold.put(id, bytes);
             let out = h.step(Event::BlockArrived { id, bytes: bytes.to_vec() });
-            assert!(!states(&out).contains(&State::Failed), "{name}: a parked write was refused");
+            assert!(!states(&out).iter().any(|s| matches!(s, State::Failed { .. })), "{name}: a parked write was refused");
             queue.extend(fetches(&out));
             if states(&out).contains(&State::Accepted) {
                 accepted = true;

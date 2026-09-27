@@ -25,8 +25,9 @@ pub(crate) enum End {
     /// A foreign head (E8), adopted; the WITNESS decides a Heading commit's group (⁵). A Racing commit's head never
     /// left: the witness is not read and no try is spent (A8).
     Dead { witness: Option<Witness>, head: (u64, Cid) },
-    /// A final refusal: the head refused by the signer (E9), or a block the commit needs rejected (E4).
-    Failed,
+    /// A final refusal: the head refused by the signer (E9, `SignerRefused`), or a block the commit needs rejected
+    /// (E4, `BlockRejected`). Its writes are told `Failed` with this cause (sdk#500).
+    Failed(core_types::fail::FailWhy),
 }
 
 #[derive(Debug, Default)]
