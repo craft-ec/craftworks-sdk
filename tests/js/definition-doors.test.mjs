@@ -53,6 +53,7 @@ await t("**another app's definition is read, never written**: the in-tab Db read
   // wrote THIS tab's draft under the caller's belief that it wrote another's.
   for (const [door, call] of [
     ["draftPut", () => db.draftPut("meta", { name: "Planted" }, "someone-else")],
+    ["draftFile", () => db.draftFile("app.js", new Uint8Array([1]), {}, "someone-else")],
     ["draftDelete", () => db.draftDelete("meta", "someone-else")],
     ["publishDefinition", () => db.publishDefinition("someone-else")],
     ["markPublished", () => db.markPublished("rows", "someone-else")],

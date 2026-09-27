@@ -226,7 +226,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
   const definitions = new Map();
   const rereadDefinition = def =>
     once(() => {
-      const rows = JSON.parse(session.definition(def.which));
+      const rows = session.definition(def.which);
       session.rendered_definition(def.which);
       return rows;
     }).then(rows => { for (const cb of def.cbs) cb(rows); }, error => { for (const cb of def.cbs) cb(null, { error }); });

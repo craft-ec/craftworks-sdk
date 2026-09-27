@@ -20,7 +20,7 @@ const recordingSession = () => {
     bind_definition: w => { s.calls.push(["bind", w]); return `opaque-${w}`; },
     unbind_definition: w => s.calls.push(["unbind", w]),
     rendered_definition: w => s.calls.push(["rendered", w]),
-    definition: w => { s.calls.push(["read", w]); return JSON.stringify(w === "draft" ? s.draft : []); },
+    definition: w => { s.calls.push(["read", w]); return w === "draft" ? s.draft : []; },
     take_stale: () => { const out = s.stale; s.stale = []; return JSON.stringify(out); },
     take_loads: () => "[]", root: () => "r",
   };
