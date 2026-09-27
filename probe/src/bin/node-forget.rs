@@ -9,8 +9,8 @@
 //!       On the RESTARTED node: GET each block, and say what the node answers -- `found` or `not_found` -- so a run
 //!       shows the loss is the node's (a forgotten block answers NotFound, a kept one still answers).
 //!
-//! Private nodes only: the data dir must not be the owner's (a path under ~/Library or the freenet default is
-//! refused), and the ws URL's port must pass `probe::node::allowed_port`. One JSON line per fact, on stdout.
+//! Private nodes only: the data dir must carry `probe::node::PRIVATE_MARKER` (written by whatever spawned the node;
+//! an allowlist -- a path under ~/Library or the freenet default is refused too, as a second guard), and the ws URL's port must pass `probe::node::allowed_port`. One JSON line per fact, on stdout.
 use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId};
@@ -39,10 +39,9 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 
 /// The node's store, found under its data dir; refused for anything that is not a private node's own dir.
 fn store_of(data_dir: &Path) -> Result<PathBuf> {
+    // The allowlist, before anything is opened: only a dir a private node was spawned with (its PRIVATE_MARKER).
+    probe::node::require_private(data_dir)?;
     let s = data_dir.to_string_lossy();
-    if s.contains("/Library/") || s.ends_with("/.local/share/freenet") || s.ends_with("/.cache/freenet") {
-        bail!("{s}: not a private node's data dir (the owner's node is never touched)");
-    }
     // freenet-core v0.2.138 redb.rs `new(data_dir)`: the store is `<data-dir>/db` (the dir) joined with "db" (the file);
     // a LOCAL node (`freenet local`) keeps it one level down, `<data-dir>/db/local/db` (seen 2026-09-27).
     for p in [data_dir.join("db").join("db"), data_dir.join("db").join("local").join("db"), data_dir.join("data").join("db").join("db")] {
