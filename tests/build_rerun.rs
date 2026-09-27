@@ -49,7 +49,7 @@ impl Probe {
         // A different mtime from any earlier write, whatever the filesystem's
         // resolution: cargo compares mtimes.
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        std::fs::write(dir.join("build/hashes.toml"), format!("block = \"{block}\"\nregister = \"r\"\nrev = \"v\"\n")).unwrap();
+        std::fs::write(dir.join("build/hashes.toml"), format!("block = \"{block}\"\nregister = \"r\"\nwebapp = \"w\"\nrev = \"v\"\n")).unwrap();
     }
 
     /// A build that must FAIL — no contracts to name (craftworks-sdk#252):
