@@ -67,7 +67,11 @@ export function wrap(raw) {
     // A FILE of the app's code (app-as-data P5): `f/<path>`'s bytes (a Uint8Array) and meta -- one form per kind.
     async draftFile(path, bytes, meta = {}) { this.#db.draft_file(path, bytes, JSON.stringify(meta)); }
     async draftDelete(key) { return this.#db.draft_delete(key); }
-    async publishDefinition() { return this.#db.publish_definition(); }
+    // An in-tab db has no node: a SITE is published only through a session (`publishDefinition({ site })` there).
+    async publishDefinition({ site } = {}) {
+      if (site) throw Object.assign(new Error("an in-tab database has no node: a site is published through a session's publishDefinition({ site })"), { code: "REFUSED" });
+      return this.#db.publish_definition();
+    }
     async definitionApps() { return JSON.parse(this.#db.definition_apps()); }
     // `[{ key, body, bytes? }]`: a file's bytes a Uint8Array, as the SDK hands them over.
     async definition(which, app) { return this.#db.definition(which, app ?? undefined); }

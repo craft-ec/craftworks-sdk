@@ -400,8 +400,14 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     async draftDelete(key) {
       return once(() => session.draft_delete(key));
     },
-    async publishDefinition() {
-      return once(() => session.publish_definition());
+    // `publishDefinition()`: the definition's ONE write, the records changed. `publishDefinition({ site })`: that, then
+    // -- the app's first publish, or a platform upgrade -- its SITE (P4's creation path) in the same call, answering
+    // `{ changed, link }`; `site = { set, webappCode, pieceStates, siteCode, starter }` (set: the build's pieces.json
+    // set, JSON or object; starter: an AppContainer). `appPublishStatus`/the session's `app_publish_status` reads it.
+    async publishDefinition({ site } = {}) {
+      if (!site) return once(() => session.publish_definition());
+      const set = typeof site.set === "string" ? site.set : JSON.stringify(site.set);
+      return once(() => JSON.parse(session.publish_definition_site(set, site.webappCode, site.pieceStates, site.siteCode, site.starter)));
     },
     // `app`: ANOTHER app's definition in this tree, read-only (§19 P3: the builder's project list); absent, this one's.
     // The apps of this tree that hold a draft (§19 P3b: the builder's project list), by id. A read.
