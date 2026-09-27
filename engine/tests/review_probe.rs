@@ -23,7 +23,7 @@ fn a_failed_pack_put_is_re_emitted() {
     let _ = e.step(Event::HeadMissing);
     let fx = stepped!(
         e,
-        Event::forced_write(ClientId(1), WriteId(1), vec![put("a".into(), b"x".to_vec())])
+        Event::create(ClientId(1), WriteId(1), vec![put("a".into(), b"x".to_vec())])
     );
     let pack = fx
         .iter()
@@ -63,7 +63,7 @@ fn parity_complete_fires_once_per_write() {
         .collect();
     let mut q = stepped!(
         e,
-        Event::forced_write(ClientId(1), WriteId(1), ops)
+        Event::create(ClientId(1), WriteId(1), ops)
     );
     let mut pc = 0;
     let mut guard = 0;

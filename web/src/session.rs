@@ -1328,7 +1328,6 @@ impl Session {
         self.db.store_mut().sync();
         let ended = self.db.store_mut().writes.take_ended();
         let mut lost_gave_up = Vec::new();
-        let mut forced_lost = Vec::new();
         let ended: Vec<serde_json::Value> = ended
             .into_iter()
             .map(|(id, how)| {
@@ -1337,10 +1336,6 @@ impl Session {
                     E::Lost => {
                         lost_gave_up.push(id);
                         ("LOST", format!("write {id} was told Lost with its tries spent and was not saved"), serde_json::json!({}))
-                    }
-                    E::ForcedLost => {
-                        forced_lost.push(id);
-                        ("LOST", format!("write {id} was forced past its reads and was lost; it was not sent again, because a forced write cannot be re-checked"), serde_json::json!({}))
                     }
                     E::Failed => ("FAILED", format!("write {id} could not be saved"), serde_json::json!({})),
                     E::Unknown => ("UNKNOWN", format!("write {id} may or may not have been saved (its confirmation was lost); check it"), serde_json::json!({})),
@@ -1371,10 +1366,6 @@ impl Session {
                 serde_json::json!({ "writeIds": u.write_ids, "key": key, "line": line })
             })
             .collect();
-        // How many writes the engine took forced past their reads: the
-        // transitional form, as a number a person can see (sdk#281 removes
-        // `Any` at zero). Only the SDK's store-level batches build one.
-        let forced_writes = self.page().map(|p| p.forced_writes()).unwrap_or(0);
         // A rolled-back write's keys reach its bindings through
         // `take_state_changed`, as every own-write state change does.
         if let Some(p) = self.page_mut() {
@@ -1453,11 +1444,6 @@ impl Session {
             "ended": ended,
             "lostGaveUp": lost_gave_up,
             "unread": unread,
-            "forcedLost": forced_lost,
-            "forcedWrites": {
-                "count": forced_writes,
-                "line": format!("{forced_writes} write{} forced past their reads (by the SDK's store-level batches)", if forced_writes == 1 { "" } else { "s" }),
-            },
             "loadsInFlight": self.db.store().open_tickets(),
             "conflicts": conflicts,
             "superseded": superseded,

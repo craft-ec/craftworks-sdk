@@ -10,7 +10,7 @@
 //! mid-commit, a same-key displacement), the page's behaviour is asserted.
 
 mod common;
-use engine::Params;
+use engine::{Event, Params};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use page::server::{Server, SignerFacts};
@@ -360,7 +360,7 @@ fn decode(frames: Vec<Vec<u8>>) -> Vec<Reply> {
 
 
 fn write(id: u64, ops: &[(&str, Option<&str>)]) -> Request {
-    Request::forced_write(id, ops
+    Request::create(id, ops
             .iter()
             .map(|(k, v)| match v {
                 Some(v) => protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec()),
@@ -824,7 +824,7 @@ fn a_tie_break_search_that_runs_out_fails_naming_its_case() {
 fn sibling_root(node: &mut Node, salt: u32) -> Cid {
     use engine::{ClientId, Op as WriteOp, WriteId};
     let mut p = Page::new(Params::default(), PutPath::Page);
-    p.write(ClientId(9), WriteId(1), vec![(format!("sib/{salt}").into_bytes(), WriteOp::Put(vec![salt as u8; 64]))]);
+    p.event(Event::create(ClientId(9), WriteId(1), vec![(format!("sib/{salt}").into_bytes(), WriteOp::Put(vec![salt as u8; 64]))]));
     for _ in 0..50 {
         for op in p.take_ops() {
             match op {
@@ -1134,7 +1134,7 @@ fn a_schema_changed_elsewhere_conflicts_on_the_schema_key() {
 fn device_tree(node: &mut Node, entries: &[(Vec<u8>, Vec<u8>)]) -> Cid {
     use engine::{ClientId, Op as WriteOp, WriteId};
     let mut p = Page::new(Params::default(), PutPath::Page);
-    p.write(ClientId(9), WriteId(1), entries.iter().map(|(k, v)| (k.clone(), WriteOp::Put(v.clone()))).collect());
+    p.event(Event::create(ClientId(9), WriteId(1), entries.iter().map(|(k, v)| (k.clone(), WriteOp::Put(v.clone()))).collect()));
     for _ in 0..50 {
         for op in p.take_ops() {
             match op {
@@ -1531,7 +1531,7 @@ fn elsewhere(_rig: &mut PageRig, node: &mut Node, _write_id: u64, ops: Vec<proto
 /// the node's answers HELD, so the engine is busy until [`release`].
 fn commit_in_flight(rig: &mut PageRig, node: &mut Node, write_id: u64) {
     rig.faults.hold = true;
-    let filler = protocol::encode_session_request(VERSION, SESSION + 1, &Request::forced_write(write_id, vec![protocol::Op::Put(b"\x00filler".to_vec(), write_id.to_be_bytes().to_vec())])).expect("encodes");
+    let filler = protocol::encode_session_request(VERSION, SESSION + 1, &Request::create(write_id, vec![protocol::Op::Put(b"\x00filler".to_vec(), write_id.to_be_bytes().to_vec())])).expect("encodes");
     rig.server.client(&filler);
     let _ = rig.run(node);
     assert!(!rig.held.is_empty(), "the filler's commit went nowhere: nothing is in flight");

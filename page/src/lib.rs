@@ -877,16 +877,6 @@ impl Page {
         self.client_event(ev);
     }
 
-    /// A FORCED write (sdk#235, W8): every op key is read as `Expect::Any` — "I write
-    /// this key whatever it holds" — so the engine takes it, counts it, and a
-    /// `Lost` one is not re-sent. A write that depends on what was there says
-    /// so with [`Page::write_reading`]; a reads-less write is refused as
-    /// `Unread`, so there is no third way.
-    pub fn write(&mut self, client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, WriteOp)>) {
-        let reads = ops.iter().map(|(k, _)| (k.clone(), engine::Expect::Any)).collect();
-        self.write_reading(client, write_id, ops, reads);
-    }
-
     /// A write that states what it READ (sdk#148): the engine checks each
     /// expectation against the tree the ops land on, and a read that no longer
     /// holds applies nothing and ends `Conflict`.
@@ -2450,13 +2440,6 @@ impl Page {
 
     /// How many parity groups the engine owes right now (what a Tick past
     /// `parity_age`, or a Flush, is for).
-    /// Writes the engine took forced past their reads (`Expect::Any`,
-    /// sdk#235): shown to a person, so the transitional form is a number
-    /// someone can act on.
-    pub fn forced_writes(&self) -> u64 {
-        self.engine.forced_writes()
-    }
-
     /// The engine's asks so far, `(wanted, raced)` (sdk#303): a read's cap counts the wanted.
     pub fn fetch_counts(&self) -> (usize, usize) {
         self.engine.fetch_counts()
@@ -2969,7 +2952,7 @@ mod held_batch {
     #[test]
     fn an_awaited_block_answered_absent_backs_off() {
         let mut p = Page::new(Params::default(), PutPath::Wrapper);
-        p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+        p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
         let mut put = None;
         for _ in 0..20 {
             for op in p.take_ops() {
@@ -4792,7 +4775,7 @@ mod confirmed_once {
     /// made at the same seq, under that root.
     fn at_update_signed(second: bool, other_root: Option<Cid>) -> (Page, HeadRead, BTreeSet<Cid>) {
         let mut p = Page::new(Params::default(), PutPath::Page);
-        p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+        p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
         let mut put = BTreeSet::new();
         for _ in 0..20 {
             for op in p.take_ops() {
@@ -4805,7 +4788,7 @@ mod confirmed_once {
                     Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(10)),
                     Op::Sign { id, seq, root, ledger, .. } => {
                         if second {
-                            p.write(ClientId(1), WriteId(2), vec![(b"j".to_vec(), WriteOp::Put(b"w".to_vec()))]);
+                            p.event(Event::create(ClientId(1), WriteId(2), vec![(b"j".to_vec(), WriteOp::Put(b"w".to_vec()))]));
                         }
                         let answer = match other_root {
                             None => signer_proto::Answer::Signed(sign(seq, &root, &ledger)),
@@ -5246,7 +5229,7 @@ mod head_refused_order {
     #[test]
     fn a_refused_heads_withdraw_does_not_eat_the_next_commits_put_of_the_same_block() {
         let mut p = Page::new(Params::default(), PutPath::Page);
-        p.write(ClientId(1), WriteId(1), kv());
+        p.event(Event::create(ClientId(1), WriteId(1), kv()));
         let mut sign = None;
         // ONE first-wave PUT left unanswered (the last of the first batch with two or more): the group still has k acked
         // (race put, rule 10), so the head is signed with that block unconfirmed -- what the refusal withdraws.
@@ -5274,7 +5257,7 @@ mod head_refused_order {
             }
         }
         let id = sign.expect("THE SETUP: the page never asked the signer");
-        p.write(ClientId(1), WriteId(2), kv());
+        p.event(Event::create(ClientId(1), WriteId(2), kv()));
         let _ = p.take_ops();
         let _ = p.take_notices();
         let held_back: BTreeSet<Cid> = unanswered.into_iter().collect();

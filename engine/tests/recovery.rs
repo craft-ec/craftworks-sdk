@@ -9,7 +9,7 @@
 //! precise moment is an ordinary value being dropped here; against a live
 //! node it is a race nobody can schedule.
 
-use engine::{ClientId, Effect, Engine, Epoch, Event, Expect, KeySource, Op, Params, State, WriteId};
+use engine::{ClientId, Effect, Engine, Epoch, Event, KeySource, Op, Params, State, WriteId};
 use freenet_prolly::build::TreeBuilder;
 use freenet_prolly::store::{Blocks, MemBlocks};
 use freenet_prolly::Cid;
@@ -148,7 +148,7 @@ fn the_engine_survives_being_dropped_at_every_commit_boundary() {
             let wid = WriteId(next_write);
             let mut queue = stepped!(
                 e,
-                Event::forced_write(ClientId(1), wid, ops)
+                Event::create(ClientId(1), wid, ops)
             );
             accepted_only.insert(wid);
 
@@ -369,7 +369,7 @@ fn a_head_written_before_its_packs_names_blocks_nobody_has() {
         .collect();
     let mut queue = stepped!(
         e,
-        Event::forced_write(ClientId(1), WriteId(1), ops)
+        Event::create(ClientId(1), WriteId(1), ops)
     );
 
     // Confirm ONE put, then take whatever head the engine offers.
@@ -457,7 +457,7 @@ fn a_stalled_write_is_reported_once_and_the_writes_queued_behind_it_publish() {
     // Write 1 opens a commit. Its puts are held back, so it cannot publish.
     let first = stepped!(
         e,
-        Event::forced_write(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
+        Event::create(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
     );
     let held: Vec<(Cid, Vec<u8>)> = first
         .iter()
@@ -489,7 +489,7 @@ fn a_stalled_write_is_reported_once_and_the_writes_queued_behind_it_publish() {
     for n in 2..=6u64 {
         let out = stepped!(
             e,
-            Event::forced_write(ClientId(1), WriteId(n), vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))])
+            Event::create(ClientId(1), WriteId(n), vec![(format!("k{n}").into_bytes(), Op::Put(vec![2u8; 40]))])
         );
         absorb(&mut seen, &out);
     }
@@ -619,7 +619,7 @@ fn a_stalled_write_is_reported_once_and_the_writes_queued_behind_it_publish() {
     let mut stalled = 0;
     let _ = stepped!(
         e2,
-        Event::forced_write(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
+        Event::create(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
     );
     for tick in 1..=(t * 3) {
         for f in stepped!(e2, Event::Tick(tick)) {
@@ -758,73 +758,59 @@ fn recovery_finds_a_head_left_under_the_previous_epoch() {
 ///
 /// A FOREIGN MOVE (R-b; COMMIT-LIFE § A write's stage): the dead commit's
 /// write goes again at the FRONT, re-judged on the head that won, with one
-/// try spent -- unless it is FORCED (`Expect::Any`), which falls `Lost`,
-/// named, and is never re-applied (WRITE-PATH ⁷). Every write queued behind
-/// it is re-applied in order onto the winner. Nothing is told twice.
+/// try spent. Every write queued behind it is re-applied in order onto the
+/// winner. Nothing is told twice.
 #[test]
 fn the_loser_of_a_head_conflict_rebases_and_never_forks() {
-    for forced in [true, false] {
-        let net = Network::default();
-        let mut e = boot(&net, Params::default());
-        let before = e.published_root();
+    let net = Network::default();
+    let mut e = boot(&net, Params::default());
+    let before = e.published_root();
 
-        let mut answers: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
-        for (n, key) in [(1u64, &b"mine"[..]), (2, &b"also-mine"[..])] {
-            let ops = vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))];
-            // Write 1 (the commit) is the forced one, or a checked one that
-            // read its key absent; write 2 is checked the same way.
-            let ev = if forced && n == 1 {
-                Event::forced_write(ClientId(1), WriteId(n), ops)
-            } else {
-                Event::Write { client: ClientId(1), write_id: WriteId(n), ops, reads: vec![(key.to_vec(), Expect::Absent)], deferred: false }
-            };
-            for f in stepped!(e, ev) {
-                if let Effect::Notify { write_id, state, .. } = f {
-                    answers.entry(write_id).or_default().push(state);
-                }
-            }
-        }
-        assert_ne!(e.root(), before, "the writes did not reach the warm tree");
-        for n in 1..=2 {
-            assert_eq!(answers[&WriteId(n)], vec![State::Accepted], "write {n} was not taken");
-        }
-
-        // The other engine got there first.
-        let mut theirs: BTreeMap<Vec<u8>, Vec<u8>> = (0..30u32)
-            .map(|i| (format!("theirs{i:02}").into_bytes(), vec![9u8; 30]))
-            .collect();
-        // The winner's tree is on the node (it published it), so re-applying
-        // onto it reads blocks the node holds rather than parking.
-        let (winner, their_blocks) = common::tree(&theirs);
-        for (id, bytes) in their_blocks.0.iter() {
-            e.blocks().put(*id, bytes);
-        }
-        let out = stepped!(e, Event::HeadConflict { seq: 99, root: winner });
-        for f in &out {
+    let mut answers: BTreeMap<WriteId, Vec<State>> = BTreeMap::new();
+    for (n, key) in [(1u64, &b"mine"[..]), (2, &b"also-mine"[..])] {
+        let ops = vec![(key.to_vec(), Op::Put(vec![n as u8; 40]))];
+        // Both read their key absent: write 1 is the commit, write 2
+        // queued behind it.
+        let ev = Event::create(ClientId(1), WriteId(n), ops);
+        for f in stepped!(e, ev) {
             if let Effect::Notify { write_id, state, .. } = f {
-                answers.entry(*write_id).or_default().push(*state);
+                answers.entry(write_id).or_default().push(state);
             }
         }
-
-        assert_eq!(e.published_root(), winner, "the loser did not take the winner's head");
-        // The warm root is the WINNER plus what goes again -- never the
-        // loser's own history beside it.
-        if !forced {
-            theirs.insert(b"mine".to_vec(), vec![1u8; 40]);
-        }
-        theirs.insert(b"also-mine".to_vec(), vec![2u8; 40]);
-        assert_eq!(e.root(), rebuild(&theirs), "forced={forced}: the queue was not re-applied onto the winner, in order");
-        let lost: Vec<WriteId> = answers.iter().filter(|(_, st)| st.contains(&State::Lost)).map(|(w, _)| *w).collect();
-        if forced {
-            assert_eq!(lost, vec![WriteId(1)], "the forced write in the dead commit did not fall Lost, alone");
-            assert_eq!(e.lost_fell(), (1, 0), "the forced Lost was not counted");
-        } else {
-            assert!(lost.is_empty(), "a checked write fell Lost on its first dead commit: {lost:?}");
-        }
-        assert_eq!(answers[&WriteId(2)], vec![State::Accepted], "the queued write was told something twice");
-        assert_eq!(e.queued_writes(), if forced { 1 } else { 2 }, "forced={forced}: the queue is not what goes again");
-        println!("  conflict (forced={forced}): loser adopts the winner's head; lost {lost:?}; the rest re-applied on it");
     }
+    assert_ne!(e.root(), before, "the writes did not reach the warm tree");
+    for n in 1..=2 {
+        assert_eq!(answers[&WriteId(n)], vec![State::Accepted], "write {n} was not taken");
+    }
+
+    // The other engine got there first.
+    let mut theirs: BTreeMap<Vec<u8>, Vec<u8>> = (0..30u32)
+        .map(|i| (format!("theirs{i:02}").into_bytes(), vec![9u8; 30]))
+        .collect();
+    // The winner's tree is on the node (it published it), so re-applying
+    // onto it reads blocks the node holds rather than parking.
+    let (winner, their_blocks) = common::tree(&theirs);
+    for (id, bytes) in their_blocks.0.iter() {
+        e.blocks().put(*id, bytes);
+    }
+    let out = stepped!(e, Event::HeadConflict { seq: 99, root: winner });
+    for f in &out {
+        if let Effect::Notify { write_id, state, .. } = f {
+            answers.entry(*write_id).or_default().push(*state);
+        }
+    }
+
+    assert_eq!(e.published_root(), winner, "the loser did not take the winner's head");
+    // The warm root is the WINNER plus what goes again -- never the
+    // loser's own history beside it.
+    theirs.insert(b"mine".to_vec(), vec![1u8; 40]);
+    theirs.insert(b"also-mine".to_vec(), vec![2u8; 40]);
+    assert_eq!(e.root(), rebuild(&theirs), "the queue was not re-applied onto the winner, in order");
+    let lost: Vec<WriteId> = answers.iter().filter(|(_, st)| st.contains(&State::Lost)).map(|(w, _)| *w).collect();
+    assert!(lost.is_empty(), "a checked write fell Lost on its first dead commit: {lost:?}");
+    assert_eq!(answers[&WriteId(2)], vec![State::Accepted], "the queued write was told something twice");
+    assert_eq!(e.queued_writes(), 2, "the queue is not what goes again");
+    println!("  conflict: loser adopts the winner's head; lost {lost:?}; the rest re-applied on it");
 }
 
 /// A write whose edit is still in the tree is never reported `Failed`.
@@ -848,12 +834,12 @@ fn a_write_still_in_the_tree_is_never_reported_failed() {
     // Write 1 opens a commit the network never confirms.
     let _ = stepped!(
         e,
-        Event::forced_write(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
+        Event::create(ClientId(1), WriteId(1), vec![(b"a".to_vec(), Op::Put(vec![1u8; 40]))])
     );
     // Write 2 folds behind it.
     let _ = stepped!(
         e,
-        Event::forced_write(ClientId(1), WriteId(2), vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))])
+        Event::create(ClientId(1), WriteId(2), vec![(b"b".to_vec(), Op::Put(vec![2u8; 40]))])
     );
     let mut failed = false;
     for t in 1..=20u64 {
@@ -906,7 +892,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
         // A write, driven until the head is emitted but no further.
         let out = stepped!(
             e,
-            Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))])
+            Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))])
         );
         let mut queue = out;
         let mut head = None;
@@ -974,7 +960,7 @@ fn a_context_lost_with_a_head_in_flight_leaves_the_write_recoverable() {
         warm_from(&mut e, &net);
         let _ = stepped!(
             e,
-            Event::forced_write(ClientId(1), WriteId(2), vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))])
+            Event::create(ClientId(1), WriteId(2), vec![(b"k".to_vec(), Op::Put(vec![3u8; 40]))])
         );
         assert_eq!(
             e.root(),

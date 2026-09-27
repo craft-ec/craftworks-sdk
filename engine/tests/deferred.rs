@@ -20,11 +20,11 @@ fn put(k: &str, v: &[u8]) -> (Vec<u8>, Op) {
 }
 
 fn define(id: u64, k: &str) -> Event {
-    Event::forced_write(ClientId(1), WriteId(id), vec![put(k, b"schema")]).deferred()
+    Event::create(ClientId(1), WriteId(id), vec![put(k, b"schema")]).deferred()
 }
 
 fn data(id: u64, k: &str) -> Event {
-    Event::forced_write(ClientId(1), WriteId(id), vec![put(k, b"row")])
+    Event::create(ClientId(1), WriteId(id), vec![put(k, b"row")])
 }
 
 fn heads(fx: &[Effect]) -> Vec<u64> {
@@ -113,7 +113,7 @@ fn the_first_data_write_takes_the_defines_in_one_cut() {
 #[test]
 fn a_define_not_deferred_commits_alone() {
     let mut e = engine();
-    let fx = settle(&mut e, Event::forced_write(ClientId(1), WriteId(1), vec![put("s/notes", b"schema")]));
+    let fx = settle(&mut e, Event::create(ClientId(1), WriteId(1), vec![put("s/notes", b"schema")]));
     assert_eq!(heads(&fx), vec![1], "a builder define did not commit");
     assert!(told(&fx, 1).contains(&State::Published));
 }

@@ -5,14 +5,14 @@
 //! - P3: a pushed FULL state showing EXACTLY this page's owed head is the read-back (judged by the one read-back
 //!   rule); anything else is the hint it always was, and a dropped push leaves the read-back GET to its deadline.
 
-use engine::{ClientId, Op as WriteOp, Params, WriteId};
+use engine::{ClientId, Event, Op as WriteOp, Params, WriteId};
 use page::{Answer, HeadRead, Label, Ms, Op, Page, PutPath};
 
 /// A page with one write, driven until its UPDATE is out (not yet answered): the page, the time, and the record
 /// the signer returned (the UPDATE's exact bytes). Every PUT is answered ok and the first head read finds no head.
 fn at_update() -> (Page, u64, Vec<u8>) {
     let mut p = Page::new(Params::default(), PutPath::Page);
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     let now = 10;
     let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
     let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);

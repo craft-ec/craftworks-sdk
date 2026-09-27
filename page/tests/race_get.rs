@@ -149,7 +149,7 @@ fn written_with(per_batch: u64, value_of: impl Fn(u64) -> Vec<u8>) -> (Node_, Ci
                 )
             })
             .collect();
-        w.write(ClientId(1), WriteId(batch + 1), ops);
+        w.event(Event::create(ClientId(1), WriteId(batch + 1), ops));
         drive(
             &mut w,
             &mut node,

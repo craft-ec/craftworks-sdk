@@ -15,7 +15,7 @@ use testkit::{PageConn, PageNode};
 /// what puts trios on a node. GENERATED: the point is to reach a structural
 /// condition, not to pin a particular tree.
 fn write(n: u64) -> protocol::Request {
-    protocol::Request::forced_write(n, vec![protocol::Op::Put(format!("k/{n:06}").into_bytes(), vec![(n % 251) as u8; 512])])
+    protocol::Request::create(n, vec![protocol::Op::Put(format!("k/{n:06}").into_bytes(), vec![(n % 251) as u8; 512])])
 }
 
 fn puts(c: &PageConn) -> usize {

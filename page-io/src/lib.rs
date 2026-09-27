@@ -1466,11 +1466,6 @@ impl PageIo {
         std::mem::take(&mut self.replies)
     }
 
-    /// Writes the engine took forced past their reads (sdk#235).
-    pub fn forced_writes(&self) -> u64 {
-        self.server.forced_writes()
-    }
-
     /// Node errors that named no op, by reason code (sdk#433): the unattributed-node-error diagnostic.
     pub fn node_errors(&self) -> &BTreeMap<&'static str, u64> {
         &self.node_errors

@@ -600,7 +600,7 @@ fn client(io: &mut PageIo, node: &mut WireNode, now: &mut u64, r: &Request) -> V
 }
 
 fn write(id: u64, k: &str, v: &str) -> Request {
-    Request::forced_write(id, vec![protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec())])
+    Request::create(id, vec![protocol::Op::Put(k.as_bytes().to_vec(), v.as_bytes().to_vec())])
 }
 
 fn states(rs: &[Reply], id: u64) -> Vec<WriteState> {
@@ -2128,7 +2128,7 @@ fn a_view_puts_back_a_block_it_rebuilt_and_waits_on_nothing() {
     client(&mut a, &mut node, &mut now, &Request::Identity);
     let big = "v".repeat(900);
     let ops: Vec<protocol::Op> = (0..60).map(|i| protocol::Op::Put(format!("row/{i:03}").into_bytes(), big.clone().into_bytes())).collect();
-    let rs = client(&mut a, &mut node, &mut now, &Request::forced_write(1, ops));
+    let rs = client(&mut a, &mut node, &mut now, &Request::create(1, ops));
     assert!(states(&rs, 1).contains(&WriteState::Published), "the publisher's tree did not publish");
     let (_, root) = node.head().expect("a head");
     let root_bytes = freenet_prolly::store::Blocks::get(a.server.page.blocks(), &root).expect("the writer holds its root").to_vec();
@@ -2741,7 +2741,7 @@ fn a_read_loop_over_more_than_the_budget_terminates_and_never_refetches_the_root
     // fetch thrashes under any policy (measured at 400 rows: the tree was one group).
     for (w, lo) in (0..4_000u32).step_by(500).enumerate() {
         let ops: Vec<protocol::Op> = (lo..lo + 500).map(|i| protocol::Op::Put(format!("t/{i:05}").into_bytes(), vec![(i % 251) as u8; 60])).collect();
-        assert!(states(&client(&mut a, &mut node, &mut now, &Request::forced_write(w as u64 + 1, ops)), w as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
+        assert!(states(&client(&mut a, &mut node, &mut now, &Request::create(w as u64 + 1, ops)), w as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
     }
     // A block's GET names its CONTRACT (the Block code over its id), not the id itself.
     let root = wire::block::contract_for(BLOCK_CODE, &node.head().expect("a head").1);
@@ -2797,7 +2797,7 @@ fn after_two_hundred_heads_the_current_tree_reads_like_a_fresh_pages() {
     let mut seed = page_io(&node);
     client(&mut seed, &mut node, &mut now, &Request::Identity);
     for (w, lo) in (0..4_000u32).step_by(500).enumerate() {
-        assert!(states(&client(&mut seed, &mut node, &mut now, &Request::forced_write(w as u64 + 1, rows(lo, lo + 500, 1))), w as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
+        assert!(states(&client(&mut seed, &mut node, &mut now, &Request::create(w as u64 + 1, rows(lo, lo + 500, 1))), w as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
     }
     let keys: Vec<Vec<u8>> = (0..4_000u32).step_by(50).map(|i| format!("t/{i:05}").into_bytes()).collect();
     let mut cal = reader_with(&node, engine::Params::default());
@@ -2814,7 +2814,7 @@ fn after_two_hundred_heads_the_current_tree_reads_like_a_fresh_pages() {
     client(&mut w, &mut node, &mut now, &Request::Identity);
     for n in 0..200u64 {
         let i = (n as u32 * 397) % 4_000;
-        assert!(states(&client(&mut w, &mut node, &mut now, &Request::forced_write(100 + n, rows(i, i + 1, 2))), 100 + n).contains(&WriteState::Published), "THE SETUP: head {n} did not publish");
+        assert!(states(&client(&mut w, &mut node, &mut now, &Request::create(100 + n, rows(i, i + 1, 2))), 100 + n).contains(&WriteState::Published), "THE SETUP: head {n} did not publish");
     }
     let root = wire::block::contract_for(BLOCK_CODE, &node.head().expect("a head").1);
     let read = |io: &mut PageIo, node: &mut WireNode, now: &mut u64, base: u64| -> BTreeMap<[u8; 32], usize> {

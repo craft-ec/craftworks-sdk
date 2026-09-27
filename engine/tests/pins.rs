@@ -66,7 +66,7 @@ fn a_parked_writes_waited_and_held_blocks_are_pinned_until_it_applies() {
     e.blocks().put(root, all.get(&root).expect("the root"));
     let k = no_page_facts();
     let pins = |e: &Engine<Store>| e.pins(&PagePins { held_asks: &k });
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"cold".to_vec()))]));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"cold".to_vec()))]));
     let mut queue = fetches(&out);
     assert!(!queue.is_empty(), "THE SETUP: the write onto a cold path asked for nothing");
     assert!(queue.iter().all(|id| pins(&e).get(id) == Some(&Pin::ParkedWrite)), "a block a parked write WAITS on is not pinned");

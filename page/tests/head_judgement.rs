@@ -4,7 +4,7 @@
 //! record's seq, under another root that this page's record BEATS in the Register's tie-break, is never adopted --
 //! the register will hold mine once my UPDATE merges (the architect's attack on sdk#225, case 1).
 
-use engine::{ClientId, Op as WriteOp, Params, WriteId};
+use engine::{ClientId, Event, Op as WriteOp, Params, WriteId};
 use page::{Answer, HeadRead, Label, Ms, Op, Page, PutPath};
 
 const KEY: [u8; 32] = [7u8; 32];
@@ -13,7 +13,7 @@ const KEY: [u8; 32] = [7u8; 32];
 /// signer returned. Every PUT is answered ok and the first head read finds no head.
 fn at_update() -> (Page, u64, Vec<u8>) {
     let mut p = Page::new(Params::default(), PutPath::Page);
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     let now = 10;
     let sk = ed25519_dalek::SigningKey::from_bytes(&KEY);
     let params = wire::register_params(&sk.verifying_key().to_bytes(), wire::HEAD_NAME);

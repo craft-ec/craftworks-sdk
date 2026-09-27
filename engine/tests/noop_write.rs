@@ -13,7 +13,7 @@ mod common;
 use common::{Harness, Store};
 
 fn write(id: u64, key: &[u8], value: &[u8]) -> Event {
-    Event::forced_write(ClientId(1), WriteId(id), vec![(key.to_vec(), Op::Put(value.to_vec()))])
+    Event::create(ClientId(1), WriteId(id), vec![(key.to_vec(), Op::Put(value.to_vec()))])
 }
 
 fn states(fx: &[Effect], id: u64) -> Vec<State> {

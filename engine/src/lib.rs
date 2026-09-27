@@ -123,12 +123,6 @@ pub enum Expect {
     /// The key holds exactly this value: [`leaf_hash`] of the bytes read
     /// (`update` over the record it patched, a delete of what was read).
     Value([u8; 32]),
-    /// "I write this key whatever it holds": the FORCED form, named so it can
-    /// be counted (sdk#235, W8). TRANSITIONAL — only a store-level batch that
-    /// genuinely cannot read first builds one, an app's write never does, and
-    /// sdk#281 removes it once the count is zero. It holds against any tree,
-    /// so it reads nothing.
-    Any,
 }
 
 /// The first key a write changes without having read it, if any (sdk#235,
@@ -293,8 +287,8 @@ pub enum Event {
         ops: Vec<(Vec<u8>, Op)>,
         /// What it read: checked against the tree the ops land on, in the same
         /// apply. Every op key must be here (W8, sdk#235) — a write with an op
-        /// key outside its reads is refused at the door as `Unread`; a forced
-        /// write says so per key with [`Expect::Any`] ([`Event::forced_write`]).
+        /// key outside its reads is refused at the door as `Unread`. There is
+        /// no forced form (sdk#281): every write states what it read.
         reads: Vec<(Vec<u8>, Expect)>,
         /// Commit only IN COMPANY (sdk#350): held, `Accepted`, until the queue
         /// holds a non-deferred write that is applied; then it rides that
@@ -447,12 +441,12 @@ pub enum Event {
 }
 
 impl Event {
-    /// A FORCED write: every op key read as [`Expect::Any`] — "I write this
-    /// key whatever it holds" (sdk#235, W8). The ONE way a write that does not
-    /// depend on what was there is built, so it is named and counted, never
-    /// an implicit reads-less write (which the engine refuses as `Unread`).
-    pub fn forced_write(client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, Op)>) -> Event {
-        let reads = ops.iter().map(|(k, _)| (k.clone(), Expect::Any)).collect();
+    /// A write of keys NOT in the tree: every op key read as
+    /// [`Expect::Absent`]. The engine checks each where the ops land, so a
+    /// key that is there already ends the write `Conflict` -- never written
+    /// over blind (sdk#281).
+    pub fn create(client: ClientId, write_id: WriteId, ops: Vec<(Vec<u8>, Op)>) -> Event {
+        let reads = ops.iter().map(|(k, _)| (k.clone(), Expect::Absent)).collect();
         Event::Write { client, write_id, ops, reads, deferred: false }
     }
 
@@ -1645,9 +1639,7 @@ pub struct Engine<B: Blocks> {
     /// a later write's conflict on one of those keys names it as `after`
     /// (footnote 3). Cleared at the end of every step, like `arrived`.
     cascade: Vec<(ClientId, WriteId, BTreeSet<Vec<u8>>)>,
-    /// Writes that fell `Lost` in the engine: forced (`Expect::Any`, never
-    /// re-applied, WRITE-PATH ⁷) and tries spent.
-    forced_lost: u64,
+    /// Writes that fell `Lost` in the engine: tries spent.
     tries_spent_lost: u64,
     /// Stage moves the table calls impossible (footnote 1). Must stay 0.
     impossible_transitions: u64,
@@ -1659,10 +1651,6 @@ pub struct Engine<B: Blocks> {
     /// commit, what group commit is measured by (K9).
     commits_published: u64,
     writes_published: u64,
-    /// Writes TAKEN with at least one `Expect::Any` read: forced past their
-    /// reads (sdk#235). Shown to a person, so the transitional form is a
-    /// number someone can act on (sdk#281 removes `Any` at zero).
-    forced_writes: u64,
     /// Blocks written since the last commit shipped. Accumulated as each
     /// write emits them rather than recovered later by comparing two trees:
     /// the emitting is where the answer is already known, and walking for it
@@ -1799,14 +1787,12 @@ impl<B: Blocks> Engine<B> {
             head_mark: None,
             root_parity: BTreeMap::new(),
             cascade: Vec::new(),
-            forced_lost: 0,
             tries_spent_lost: 0,
             impossible_transitions: 0,
             landed_by_witness: 0,
             unknown_fates: 0,
             commits_published: 0,
             writes_published: 0,
-            forced_writes: 0,
             unpublished: Vec::new(),
             reads: read::Reads::default(),
             subs: subs::Subs::default(),
@@ -1846,11 +1832,6 @@ impl<B: Blocks> Engine<B> {
     /// every surface that reports redundancy must say so, never "0 owed".
     pub fn parity_scan(&self) -> &ParityScan {
         &self.parity_scan
-    }
-
-    /// Writes taken with an `Expect::Any` read: forced past their reads.
-    pub fn forced_writes(&self) -> u64 {
-        self.forced_writes
     }
 
     /// Writes in the page's queue (R-b): `Applying`, `Queued` or `Committing`.
@@ -2120,9 +2101,9 @@ impl<B: Blocks> Engine<B> {
         self.queue.iter().filter(|q| q.stalled_told).map(|q| (q.client, q.write_id)).collect()
     }
 
-    /// Writes that fell `Lost` in the engine: `(forced, tries spent)`.
-    pub fn lost_fell(&self) -> (u64, u64) {
-        (self.forced_lost, self.tries_spent_lost)
+    /// Writes that fell `Lost` in the engine: tries spent.
+    pub fn lost_fell(&self) -> u64 {
+        self.tries_spent_lost
     }
 
     /// Groups with parity not yet on the network: under race put (§P) a
@@ -3456,9 +3437,6 @@ impl<B: Blocks> Engine<B> {
             for (id, bytes) in &emitted {
                 self.arrived.insert(*id, bytes.clone());
             }
-            if q.reads.iter().any(|(_, e)| *e == Expect::Any) {
-                self.forced_writes += 1;
-            }
             writes.push((q.client, q.write_id));
             bytes += q.size;
             through = through.max(q.arrival);
@@ -3585,8 +3563,8 @@ impl<B: Blocks> Engine<B> {
     /// `Published`, never `Lost` (told `Lost`, the app rolls back a write
     /// that happened: sdk#293). Otherwise it did not land: back to the FRONT,
     /// `Queued` again and re-applied first, one try spent each (go-back-N, in
-    /// the engine, once); a write out of tries, or forced (`Expect::Any`),
-    /// falls `Lost`, named, never re-applied (WRITE-PATH ⁷).
+    /// the engine, once); a write out of tries falls `Lost`, named, never
+    /// re-applied.
     /// `dead` is the dead commit's cut; `spend` is false for a commit whose head never left (COMMIT-LIFE A8: a try
     /// counts an attempt to PUBLISH), whose witness the caller does not pass.
     fn dead_front(&mut self, witness: Option<Witness>, group_through: u64, dead: &[(ClientId, WriteId)], spend: bool) -> Vec<Effect> {
@@ -3622,16 +3600,11 @@ impl<B: Blocks> Engine<B> {
             if spend {
                 q.tries += 1;
             }
-            let forced = q.reads.iter().any(|(_, e)| *e == Expect::Any);
-            if !forced && q.tries <= self.params.max_write_tries {
+            if q.tries <= self.params.max_write_tries {
                 i += 1;
                 continue;
             }
-            if forced {
-                self.forced_lost += 1;
-            } else {
-                self.tries_spent_lost += 1;
-            }
+            self.tries_spent_lost += 1;
             out.extend(self.end_queued(i, State::Lost));
         }
         self.close_cut();
@@ -3762,9 +3735,6 @@ impl<B: Blocks> Engine<B> {
         };
         let mut need = Vec::new();
         for (key, want) in reads {
-            if *want == Expect::Any {
-                continue; // holds against any tree, so it reads nothing
-            }
             let found = match freenet_prolly::read::get(&source, &self.root, key) {
                 Ok(v) => v.map(LeafForm::of),
                 Err(ReadError::Need(n)) => {

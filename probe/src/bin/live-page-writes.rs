@@ -191,9 +191,9 @@ async fn one_run(ws: &str, signer_wasm: &[u8], block_code: &[u8], register_code:
         let ops = chunk.iter().map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), format!("value {i} of run {run}").into_bytes())).collect();
         let t = Instant::now();
         OPS.with(|o| o.borrow_mut().clear());
-        // A write that does not read what it changes is sent FORCED
-        // (sdk#283): a reads-less `Request::Write` is refused `Unread`.
-        io.client(&protocol::encode_session_request(4, SESSION, &Request::forced_write(id, ops)).expect("encodes"));
+        // Fresh keys on a fresh Register: each is read `Absent` (sdk#281); a
+        // reads-less `Request::Write` is refused `Unread`.
+        io.client(&protocol::encode_session_request(4, SESSION, &Request::create(id, ops)).expect("encodes"));
         let got = drive(&mut sock, &mut io, t0, Duration::from_secs(120), &mut 0, |r, _| probe::verdict::write_outcome(id, r).is_some())
             .await
             .with_context(|| format!("write {id}"))?;

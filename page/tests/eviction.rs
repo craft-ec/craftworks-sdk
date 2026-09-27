@@ -3,7 +3,7 @@
 //! eviction pass runs after every step and only pins keep anything: a class whose pin is removed (its mutant,
 //! "unpinned") loses its bytes and the test goes red.
 
-use engine::{ClientId, Op as WriteOp, Params, WriteId};
+use engine::{ClientId, Event, Op as WriteOp, Params, WriteId};
 use page::{Answer, Label, Ms, Op, Page, PutPath, HELD_ABSENTS};
 
 mod common;
@@ -25,7 +25,7 @@ fn with_puts_out() -> (Page, Vec<Put>) {
 
 fn with_puts_out_on(path: PutPath) -> (Page, Vec<Put>) {
     let mut p = Page::new(tiny(), path);
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     let mut puts = Vec::new();
     for _ in 0..20 {
         let ops = p.take_ops();
@@ -135,7 +135,7 @@ fn a_published_commits_straggler_absent_is_put_again_from_page_memory_after_evic
 #[test]
 fn a_queued_writes_warm_blocks_still_answer_the_warm_walk_after_eviction_passes() {
     let (mut p, _) = with_puts_out();
-    p.write(ClientId(1), WriteId(2), vec![(b"k2".to_vec(), WriteOp::Put(b"v2".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(2), vec![(b"k2".to_vec(), WriteOp::Put(b"v2".to_vec()))]));
     let _ = p.take_ops();
     let warm = p.warm_root();
     assert_ne!(warm, p.published().1, "THE SETUP: the warm root is the published one (write 2 did not warm-apply)");
@@ -152,7 +152,7 @@ fn a_queued_writes_warm_blocks_still_answer_the_warm_walk_after_eviction_passes(
 fn a_fully_pinned_store_over_budget_is_not_rescanned_every_step() {
     let (mut p, _) = with_puts_out();
     for w in 2..=6u64 {
-        p.write(ClientId(1), WriteId(w), vec![(format!("k{w}").into_bytes(), WriteOp::Put(vec![w as u8; 2_000]))]);
+        p.event(Event::create(ClientId(1), WriteId(w), vec![(format!("k{w}").into_bytes(), WriteOp::Put(vec![w as u8; 2_000]))]));
     }
     let _ = p.take_ops();
     let blocks = p.blocks().len() as u64;

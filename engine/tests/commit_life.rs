@@ -20,8 +20,7 @@ use common::{Harness, Store};
 
 const T0: u64 = 1_790_000_000;
 
-/// A write of one NEW key: it reads the key absent, so it is not forced (a forced write is `Lost` at its first dead
-/// commit by WRITE-PATH ⁷, which would hide the try count A8 is about) and no two of them conflict.
+/// A write of one NEW key: it reads the key absent, so no two of them conflict.
 fn write(id: u64) -> Event {
     let key = format!("m/{id:05}").into_bytes();
     Event::Write {
@@ -501,7 +500,7 @@ fn a6_a_silent_racing_commit_is_never_ended_on_time() {
     assert!(fates.is_empty(), "a silent Racing commit's write was ended on time: {fates:?}");
     let ended = withdrawn(&later);
     assert!(ended.is_empty(), "a silent Racing commit was ended on time and restarted: {} of its PUTs withdrawn", ended.len());
-    assert_eq!(h.engine().lost_fell(), (0, 0), "a try was spent on silence");
+    assert_eq!(h.engine().lost_fell(), 0, "a try was spent on silence");
     assert_eq!((h.engine().commit_stage(), h.engine().committing_seq()), (CommitStage::Racing, Some(seq)), "the commit in flight did not stay Racing");
     let ((seq, _), _) = to_heading(&mut h, all.iter().map(|id| Effect::PutBlock { id: *id, bytes: Vec::new(), after: Vec::new() }).collect(), &BTreeSet::new());
     let fx = h.step(Event::HeadConfirmed(seq));

@@ -86,7 +86,7 @@ fn drive(e: &mut Engine<Store>, net: &mut Network, first: Vec<Effect>, told: &mu
 }
 
 fn write(e: &mut Engine<Store>, net: &mut Network, id: u64, ops: Vec<(Vec<u8>, Op)>, told: &mut BTreeMap<u64, Vec<State>>) {
-    let out = stepped!(e, Event::forced_write(ClientId(1), WriteId(id), ops));
+    let out = stepped!(e, Event::create(ClientId(1), WriteId(id), ops));
     drive(e, net, out, told);
 }
 
@@ -125,7 +125,7 @@ fn editing_the_leftmost_key_of_a_big_tree_reaches_parity_complete() {
     for (label, k) in [("RIGHTMOST", n - 1), ("LEFTMOST", 0)] {
         let w = id;
         id += 1;
-        let out = stepped!(e, Event::forced_write(ClientId(1), WriteId(w), vec![(key(k), Op::Put(b"edited".to_vec()))]));
+        let out = stepped!(e, Event::create(ClientId(1), WriteId(w), vec![(key(k), Op::Put(b"edited".to_vec()))]));
         drive(&mut e, &mut net, out, &mut told);
         ticks(&mut e, &mut net, t, 5, &mut told);
         t += 1_000;

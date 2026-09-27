@@ -343,22 +343,6 @@ pub enum Request {
     },
 }
 
-impl Request {
-    /// A FORCED write: a [`Request::Commit`] reading every op key as
-    /// [`Expect::Any`] — "I write this key whatever it holds" (sdk#235, W8).
-    /// The ONE way a write that does not depend on what was there is sent, so
-    /// the engine can count it; a reads-less [`Request::Write`] is refused as
-    /// [`WriteState::Unread`].
-    pub fn forced_write(write_id: u64, ops: Vec<Op>) -> Request {
-        let reads = ops
-            .iter()
-            .map(|o| match o {
-                Op::Put(k, _) | Op::Delete(k) => (k.clone(), Expect::Any),
-            })
-            .collect();
-        Request::Commit { write_id, reads, ops }
-    }
-}
 
 /// What a [`Request::Commit`] READ at a key, as the engine checks it
 /// (`engine::Expect`, the same four cases).
@@ -372,11 +356,21 @@ pub enum Expect {
     /// bytes read — the LEAF form, inline or by reference, never a hash the
     /// client made up of its own.
     Value([u8; 32]),
-    /// "I write this key whatever it holds" — the FORCED form, named so it is
-    /// countable (sdk#235, W8). TRANSITIONAL: only a store-level batch that
-    /// cannot read first sends it; `Db` refuses to build one; sdk#281 removes
-    /// it once the count is zero.
-    Any,
+}
+
+impl Request {
+    /// A write of keys NOT in the tree: a [`Request::Commit`] reading every op
+    /// key as [`Expect::Absent`], so a key already there ends it `Conflict`
+    /// rather than being written over blind (sdk#281).
+    pub fn create(write_id: u64, ops: Vec<Op>) -> Request {
+        let reads = ops
+            .iter()
+            .map(|o| match o {
+                Op::Put(k, _) | Op::Delete(k) => (k.clone(), Expect::Absent),
+            })
+            .collect();
+        Request::Commit { write_id, reads, ops }
+    }
 }
 
 /// Which id space a trace question is in.

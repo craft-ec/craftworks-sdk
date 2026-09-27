@@ -23,7 +23,7 @@ fn session_frame(r: &Request) -> Vec<u8> {
 }
 
 fn write_k() -> Request {
-    Request::forced_write(1, vec![protocol::Op::Put(b"k".to_vec(), b"v".to_vec())])
+    Request::create(1, vec![protocol::Op::Put(b"k".to_vec(), b"v".to_vec())])
 }
 
 /// A request with TRAILING bytes is refused, never read as its prefix — which

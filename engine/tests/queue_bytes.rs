@@ -8,7 +8,7 @@ mod common;
 use common::new_store_params;
 
 fn write(id: u64, key: &str, value: &[u8]) -> Event {
-    Event::forced_write(ClientId(1), WriteId(id), vec![(key.as_bytes().to_vec(), Op::Put(value.to_vec()))])
+    Event::create(ClientId(1), WriteId(id), vec![(key.as_bytes().to_vec(), Op::Put(value.to_vec()))])
 }
 
 /// Step `e` and keep what it emitted, as the page does (its store IS the page's memory): a queued write's warm

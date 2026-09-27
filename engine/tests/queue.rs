@@ -105,7 +105,7 @@ fn a_dead_commit_goes_again_at_the_front_and_falls_named_at_its_bound() {
             assert_eq!(e.queued_writes(), 0);
         }
     }
-    assert_eq!(e.lost_fell(), (0, 1), "the fall was not counted as tries spent");
+    assert_eq!(e.lost_fell(), 1, "the fall was not counted as tries spent");
 }
 
 /// **EVERY EXIT OF THE FIRST `Applying` WRITE TRIES THE NEXT** (footnote 8):
@@ -122,8 +122,8 @@ fn a_cold_write_that_fails_its_fetch_lets_the_next_one_go() {
     let (root, all) = common::tree(&map);
     e.blocks().put(root, all.0.get(&root).expect("the root"));
     let _ = stepped!(e, Event::HeadConflict { seq: 5, root });
-    let first = stepped!(e, Event::forced_write(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"a".to_vec()))]));
-    let second = stepped!(e, Event::forced_write(ClientId(1), WriteId(2), vec![(b"k/00300".to_vec(), Op::Put(b"b".to_vec()))]));
+    let first = stepped!(e, Event::create(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"a".to_vec()))]));
+    let second = stepped!(e, Event::create(ClientId(1), WriteId(2), vec![(b"k/00300".to_vec(), Op::Put(b"b".to_vec()))]));
     assert!(told(&first, 1).is_empty() && told(&second, 2).is_empty(), "a cold write was answered before its path came");
     let fetch = |fx: &[Effect]| fx.iter().filter_map(|f| if let Effect::FetchBlock { id, .. } = f { Some(*id) } else { None }).collect::<Vec<_>>();
     assert!(fetch(&second).is_empty(), "the second write fetched before its turn: arrival order is apply order");
@@ -155,23 +155,24 @@ fn a_cold_write_that_fails_its_fetch_lets_the_next_one_go() {
 ///   write of it is `Published`, even when a later head changed its key
 ///   (landed-then-overwritten: told `Lost`, the app would roll back a write
 ///   that happened, and might write it again over newer data);
-/// * below, or absent -> it did not land: a forced write falls `Lost`, even
-///   when the tree happens to hold its values (another writer wrote the same
-///   thing: told `Published`, the app would believe a commit that does not
-///   carry it).
+/// * below, or absent -> it did not land: it goes again, RE-JUDGED on the
+///   winner, even when the tree happens to hold its values (another writer
+///   wrote the same thing: told `Published`, the app would believe a commit
+///   that does not carry it). Its `Absent` read of `k` no longer holds there,
+///   so it ends `Conflict`, named -- never `Published`, never `Lost`.
 #[test]
 fn a_dead_commits_fate_is_read_from_the_witness_never_from_values() {
     for (case, landed, winner_has_value) in [("landed, then overwritten", true, false), ("not there, values coincide", false, true), ("not there", false, false)] {
         let mut e = common::new_store_params(Params::default());
-        let fx = stepped!(e, Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(b"mine".to_vec()))]));
+        let fx = stepped!(e, Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(b"mine".to_vec()))]));
         heading(&mut e, fx);
         let through = e.committing_through().expect("the commit in flight carries an arrival number");
         let winner = if winner_has_value { their_head(&e, &[(b"k", b"mine"), (b"theirs", b"x")]) } else { their_head(&e, &[(b"k", b"newer"), (b"theirs", b"x")]) };
         e.set_witness(Some(if landed { Witness::Through(through) } else { Witness::NotThere }));
         let out = stepped!(e, Event::HeadConflict { seq: 9, root: winner });
-        let want = if landed { State::Published } else { State::Lost };
+        let want = if landed { State::Published } else { State::Conflict };
         assert_eq!(told(&out, 1), vec![want], "{case}: told {:?}", told(&out, 1));
-        assert_eq!(e.lost_fell(), (u64::from(!landed), 0), "{case}: the fall count");
+        assert_eq!(e.lost_fell(), 0, "{case}: the fall count");
         assert_eq!(e.landed_by_witness(), u64::from(landed), "{case}: the witness count");
         assert_eq!(e.root(), winner, "{case}: the dead write was applied on the winner");
     }
@@ -190,18 +191,18 @@ fn an_evicted_witness_is_unknown_never_lost_or_conflict() {
         let mut e = common::new_store_params(Params::default());
         let fx = stepped!(e, w(1, 1, b"k", b"mine", Expect::Absent));
         heading(&mut e, fx);
-        let _ = stepped!(e, Event::forced_write(ClientId(1), WriteId(2), vec![(b"j".to_vec(), Op::Put(b"forced".to_vec()))]));
+        let _ = stepped!(e, Event::create(ClientId(1), WriteId(2), vec![(b"j".to_vec(), Op::Put(b"queued".to_vec()))]));
         let winner = if holds { their_head(&e, &[(b"k", b"mine")]) } else { their_head(&e, &[(b"k", b"newer")]) };
         e.set_witness(Some(Witness::Unknown));
         let out = stepped!(e, Event::HeadConflict { seq: 9, root: winner });
         assert_eq!(told(&out, 1), vec![State::Unknown], "holds={holds}: the checked write of the dead commit");
         assert!(!out.iter().any(|f| matches!(f, Effect::Conflicted { write_id, .. } if write_id.0 == 1)), "holds={holds}: a write that may have landed was re-judged");
-        assert_eq!(e.lost_fell(), (0, 0), "holds={holds}: a write that may have landed fell Lost");
+        assert_eq!(e.lost_fell(), 0, "holds={holds}: a write that may have landed fell Lost");
         let mut want = BTreeMap::new();
         want.insert(b"k".to_vec(), if holds { b"mine".to_vec() } else { b"newer".to_vec() });
-        want.insert(b"j".to_vec(), b"forced".to_vec());
+        want.insert(b"j".to_vec(), b"queued".to_vec());
         assert_eq!(e.root(), common::rebuild(&want), "holds={holds}: the warm root is not the winner plus the write queued behind (an Unknown write re-applied?)");
-        // The forced write QUEUED behind the commit was never in it: it goes
+        // The write QUEUED behind the commit was never in it: it goes
         // on, re-applied on the winner.
         assert!(!told(&out, 2).contains(&State::Lost), "holds={holds}: the queued write behind fell");
     }
@@ -340,7 +341,7 @@ fn a_write_told_queue_full_is_not_overtaken_by_a_smaller_later_one() {
     };
     let params = Params { max_queue_bytes: held_first + 60, ..Params::default() };
     let mut e = common::new_store_params(params);
-    let put = |id: u64, client: u64, k: &[u8], v: &[u8]| Event::forced_write(ClientId(client), WriteId(id), vec![(k.to_vec(), Op::Put(v.to_vec()))]);
+    let put = |id: u64, client: u64, k: &[u8], v: &[u8]| Event::create(ClientId(client), WriteId(id), vec![(k.to_vec(), Op::Put(v.to_vec()))]);
     let first = stepped!(e, w(1, 0, b"z", &[0u8; 400], Expect::Absent));
     assert_eq!(e.queue_load().1, held_first, "THE SETUP: the twin measured another first write");
     let a = stepped!(e, put(1, 1, b"k", &[b'a'; 80]));

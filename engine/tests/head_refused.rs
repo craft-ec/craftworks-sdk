@@ -10,7 +10,7 @@ use common::{Harness, Store};
 const T0: u64 = 1_790_000_000;
 
 fn write(id: u64, ops: Vec<(Vec<u8>, Op)>) -> Event {
-    Event::forced_write(ClientId(1), WriteId(id), ops)
+    Event::create(ClientId(1), WriteId(id), ops)
 }
 
 fn told(fx: &[Effect], id: u64) -> Vec<State> {
@@ -135,7 +135,7 @@ fn a_refused_commits_unconfirmed_members_and_parity_are_withdrawn() {
         store.put(*id, bytes);
     }
     let _ = e.step(Event::Tick(T0));
-    let mut fx = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k/003000".to_vec(), Op::Put(b"changed".to_vec()))]));
+    let mut fx = e.step(Event::create(ClientId(1), WriteId(1), vec![(b"k/003000".to_vec(), Op::Put(b"changed".to_vec()))]));
     let (mut asked, mut seq) = (Vec::new(), None);
     for _ in 0..200 {
         if let Some(s) = fx.iter().find_map(|f| if let Effect::UpdateHead { seq, .. } = f { Some(*seq) } else { None }) {

@@ -91,7 +91,7 @@ fn coded(root_bytes: &[u8]) -> Vec<Cid> {
 fn first_commit(n: u32) -> (Engine<Store>, Vec<Effect>) {
     let mut e = common::new_store_params(Params::default());
     let ops: Vec<(Vec<u8>, Op)> = (0..n).map(|i| put(&format!("k/{i:06}"), &[(i % 251) as u8; 20])).collect();
-    let fx = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
+    let fx = e.step(Event::create(ClientId(1), WriteId(1), ops));
     e.blocks().absorb(&fx);
     (e, fx)
 }
@@ -148,7 +148,7 @@ fn a_root_move_withdraws_the_old_roots_parity() {
     let rp1 = e.root_parity_of(&r1);
     let straggler = rp1[0];
     ack_all_but(&mut e, &fx, &BTreeSet::from([straggler]));
-    let fx2 = e.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let fx2 = e.step(Event::create(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     e.blocks().absorb(&fx2);
     let all2 = ack_all_but(&mut e, &fx2, &BTreeSet::new());
     assert_ne!(e.root(), r1);

@@ -7,7 +7,7 @@
 //! * §5.5: a timeout doubles the RTO until a clean answer.
 
 mod common;
-use engine::{ClientId, Op as WriteOp, Params, WriteId};
+use engine::{ClientId, Event, Op as WriteOp, Params, WriteId};
 use page::rto::{RTO_FLOOR_MS, RTO_INITIAL_MS};
 use page::{Answer, Ms, Op, Page, PutPath};
 
@@ -21,7 +21,7 @@ fn warmed(writes: u64, delay: u64) -> (Page, u64) {
     let mut state: Option<Vec<u8>> = None;
     for w in 0..=writes {
         if w > 0 {
-            p.write(ClientId(1), WriteId(w), vec![(format!("k{w}").into_bytes(), WriteOp::Put(b"v".to_vec()))]);
+            p.event(Event::create(ClientId(1), WriteId(w), vec![(format!("k{w}").into_bytes(), WriteOp::Put(b"v".to_vec()))]));
         }
         for _ in 0..400 {
             for op in p.take_ops() {
@@ -76,7 +76,7 @@ fn a_fast_node_teaches_a_short_rto() {
 fn a_lost_answer_is_asked_again_after_about_one_rto() {
     let (mut p, mut now) = warmed(10, 5);
     let (rto, _, _) = p.clock();
-    p.write(ClientId(1), WriteId(100), vec![(b"stall".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(100), vec![(b"stall".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     let sent_at = now;
     let first: Vec<_> = p.take_ops().into_iter().filter(|o| matches!(o, Op::Put { .. })).collect();
     assert!(!first.is_empty(), "the write put nothing");
@@ -102,7 +102,7 @@ fn a_lost_answer_is_asked_again_after_about_one_rto() {
 fn a_re_sent_calls_answer_is_not_a_sample() {
     let (mut p, mut now) = warmed(10, 5);
     let (_, srtt_before, _) = p.clock();
-    p.write(ClientId(1), WriteId(100), vec![(b"karn".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(100), vec![(b"karn".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     let puts: Vec<[u8; 32]> = p.take_ops().into_iter().filter_map(|o| if let Op::Put { id, .. } = o { Some(id) } else { None }).collect();
     // Let every PUT time out once and be re-sent...
     let mut resent = false;
@@ -166,7 +166,7 @@ fn an_unanswered_head_read_is_never_an_empty_tree() {
     // sign is reachable (a check with its puts unanswered could never see one:
     // main's M2 survived it) — and it must not be asked. Only the head read
     // stays silent.
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     for _ in 0..100 {
         now += 10;
         p.tick(Ms(now));

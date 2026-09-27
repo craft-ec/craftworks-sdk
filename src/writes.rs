@@ -61,7 +61,6 @@ pub struct Conflicted {
 pub enum Ended {
     Failed,
     Lost,
-    ForcedLost,
     TooLarge { bound: engine::WriteBound, limit: usize, got: usize },
     /// It may have landed: the app is told to check (COMMIT-LIFE ⁵).
     Unknown,
@@ -74,9 +73,6 @@ pub struct Writes {
     now_ms: Box<dyn Fn() -> u64>,
     /// Keys each of this client's writes touched, until the write ends.
     keys_of: BTreeMap<u64, Vec<Vec<u8>>>,
-    /// Writes made with an `Expect::Any` read (sdk#235): a `Lost` one is a
-    /// forced write that fell, named as such.
-    forced: BTreeSet<u64>,
     /// Keys whose last write of this client's ended unpublished. Kept because
     /// the fact outlives the write: a row asking afterwards would otherwise be
     /// told "saved" about a write that never landed. Cleared when the key is
@@ -106,7 +102,6 @@ impl Writes {
             next_write_id: 1,
             now_ms,
             keys_of: BTreeMap::new(),
-            forced: BTreeSet::new(),
             rolled_back: BTreeSet::new(),
             late_door_verdicts: 0,
             conflicts: Vec::new(),
@@ -174,9 +169,6 @@ impl Writes {
             self.rolled_back.remove(k);
         }
         self.keys_of.insert(write_id, keys);
-        if reads.iter().any(|(_, e)| *e == protocol::Expect::Any) {
-            self.forced.insert(write_id);
-        }
         self.client.send(&request);
         Ok(write_id)
     }
@@ -190,7 +182,6 @@ impl Writes {
     /// the refusal, so the write leaves no notice behind.
     pub fn refused_at_door(&mut self, write_id: u64, why: Refused) {
         self.keys_of.remove(&write_id);
-        self.forced.remove(&write_id);
         let _ = why;
     }
 
@@ -221,7 +212,6 @@ impl Writes {
             return;
         }
         let keys = self.keys_of.remove(&write_id).unwrap_or_default();
-        let forced = self.forced.remove(&write_id);
         self.state_changed.extend(keys.iter().cloned());
         let ended = match fate {
             Fate::Published { .. } => {
@@ -240,7 +230,6 @@ impl Writes {
             }
             Fate::TooLarge { bound, limit, got } => Ended::TooLarge { bound, limit, got },
             Fate::Failed => Ended::Failed,
-            Fate::Lost if forced => Ended::ForcedLost,
             Fate::Lost => Ended::Lost,
             // May have landed: NOT rolled back (its row still shows it).
             Fate::Unknown => {

@@ -57,7 +57,7 @@ fn states(fx: &[Effect]) -> Vec<State> {
 }
 
 fn write_one(key: &str, val: &[u8]) -> Event {
-    Event::forced_write(ClientId(1), WriteId(1), vec![(key.as_bytes().to_vec(), Op::Put(val.to_vec()))])
+    Event::create(ClientId(1), WriteId(1), vec![(key.as_bytes().to_vec(), Op::Put(val.to_vec()))])
 }
 
 /// A write onto a cold path is parked, fetched for, and applies.
@@ -267,7 +267,7 @@ fn a_second_write_while_one_is_parked_waits_its_turn_and_applies_after_it() {
     let mut queue = fetches(&out);
     assert!(!queue.is_empty(), "the first write did not park");
 
-    let out = h.step(Event::forced_write(ClientId(2), WriteId(2), vec![(b"k/00200".to_vec(), Op::Put(b"second".to_vec()))]));
+    let out = h.step(Event::create(ClientId(2), WriteId(2), vec![(b"k/00200".to_vec(), Op::Put(b"second".to_vec()))]));
     assert_eq!(states(&out), Vec::<State>::new(), "a write behind a parked one was answered before its turn");
     assert_eq!(h.root(), rebuild(&records), "a write behind a parked one joined the warm root before it");
 
@@ -316,7 +316,7 @@ fn a_cold_write_of_any_size_parks_and_applies() {
         let cold = Store::fresh();
         cold.put(root, all.get(&root).expect("the root"));
         let mut h = started(Params::default(), cold.clone(), root);
-        let out = h.step(Event::forced_write(ClientId(1), WriteId(1), ops));
+        let out = h.step(Event::create(ClientId(1), WriteId(1), ops));
         assert!(
             states(&out).is_empty() && !fetches(&out).is_empty(),
             "{name}: a cold write did not park: {:?}",

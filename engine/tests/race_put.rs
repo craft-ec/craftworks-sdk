@@ -100,7 +100,7 @@ impl Rig {
     /// Commit `ops` as write `id`, acking every block `ack` allows; land the
     /// head once it is asked for. Every effect, in order.
     fn commit(&mut self, id: u64, ops: Vec<(Vec<u8>, Op)>, ack: impl Fn(&Cid, &[u8]) -> bool) -> Vec<Effect> {
-        let fx = self.step(Event::forced_write(ClientId(1), WriteId(id), ops));
+        let fx = self.step(Event::create(ClientId(1), WriteId(id), ops));
         let mut all = fx.clone();
         // Every PUT any step emits, answered by `ack` -- the first wave AND the parity that follows the head
         // (#378 P1-hybrid), which is emitted as the head lands.
@@ -147,7 +147,7 @@ fn leaf_with(fx: &[Effect], key: &[u8]) -> Cid {
 /// the tree is deterministic, so a fresh engine puts the same block.
 fn l2() -> Cid {
     let mut p = Rig::base();
-    let fx = p.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let fx = p.step(Event::create(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     leaf_with(&fx, b"k/000100")
 }
 
@@ -177,7 +177,7 @@ fn a_later_commit_re_coding_the_group_withdraws_the_straggler_and_backs_up_the_e
 #[test]
 fn an_earlier_write_is_not_backed_up_while_its_current_group_has_a_hole() {
     let (mut probe, _) = with_straggler();
-    let l3 = leaf_with(&probe.step(Event::forced_write(ClientId(1), WriteId(3), vec![put("k/000100", b"three")])), b"k/000100");
+    let l3 = leaf_with(&probe.step(Event::create(ClientId(1), WriteId(3), vec![put("k/000100", b"three")])), b"k/000100");
     let (mut r, l2) = with_straggler();
     // Write 3 re-codes the group, but ITS new leaf is the straggler now.
     let all = r.commit(3, vec![put("k/000100", b"three")], |id, _| *id != l3);
@@ -226,7 +226,7 @@ fn an_earlier_straggler_is_never_counted_present_and_after_names_only_this_commi
     // so l2 is an unchanged member of a group write 3 changes -- un-acked.
     let sibling = *members.iter().find(|m| **m != l2).unwrap();
     let key = Node::parse(&r.known[&sibling]).unwrap().key(0);
-    let fx3 = r.step(Event::forced_write(ClientId(1), WriteId(3), vec![(key, Op::Put(b"three".to_vec()))]));
+    let fx3 = r.step(Event::create(ClientId(1), WriteId(3), vec![(key, Op::Put(b"three".to_vec()))]));
     let new3 = puts(&fx3);
     let pn = new3
         .values()
@@ -283,7 +283,7 @@ fn a_changed_groups_unconfirmed_member_counts_absent_until_the_node_holds_it() {
     let _ = r.step(Event::HeadRead { epoch: engine::Epoch(1), seq: 2, root: foreign });
     assert_eq!(r.e.published_root(), foreign, "THE SETUP: the foreign head was not adopted");
     // A commit in a SIBLING leaf of the foreign change's, in the same parent group.
-    let first = r.step(Event::forced_write(ClientId(1), WriteId(3), vec![put("k/000160", b"three")]));
+    let first = r.step(Event::create(ClientId(1), WriteId(3), vec![put("k/000160", b"three")]));
     let asked: BTreeSet<Cid> = asked_held(&first);
     assert!(asked.contains(&foreign_leaf), "the leaf the other engine put, a member of a changed group, was not asked about at the commit's start");
     let own_leaf = leaf_with(&first, b"k/000160");
@@ -334,7 +334,7 @@ fn the_harness_answers_a_member_the_node_does_not_hold_with_held_unknown() {
         let _ = r.step(Event::HeadRead { epoch: engine::Epoch(1), seq: 2, root: foreign });
         assert_eq!(r.e.published_root(), foreign, "THE SETUP: the foreign head was not adopted");
         r.e.blocks().lose(&foreign_leaf);
-        let first = r.step(Event::forced_write(ClientId(1), WriteId(3), vec![put("k/000160", b"three")]));
+        let first = r.step(Event::create(ClientId(1), WriteId(3), vec![put("k/000160", b"three")]));
         assert!(asked_held(&first).contains(&foreign_leaf), "THE SETUP: the foreign leaf was not asked about");
         puts(&first).len()
     };
@@ -432,7 +432,7 @@ fn a_commit_whose_slowest_puts_never_answer_still_publishes_saved_not_backed_up(
 #[test]
 fn the_first_wave_is_the_data_and_one_parity_per_changed_group_and_the_rest_follow_the_sign() {
     let mut r = Rig::base();
-    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two"), put("k/000400", b"four")]));
+    let first = r.step(Event::create(ClientId(1), WriteId(2), vec![put("k/000100", b"two"), put("k/000400", b"four")]));
     let sent = puts(&first);
     let root = r.e.root();
     // Every changed group, as the new nodes list them: its parity ids (the root: its own group of one).
@@ -499,7 +499,7 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     // The root group (sdk#335: the root and its PARITY parity): everything
     // acked but all 1 + PARITY of it.
     let mut r = Rig::base();
-    let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let fx = r.step(Event::create(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     let root = r.e.root();
     let group: BTreeSet<Cid> = std::iter::once(root).chain(r.e.root_parity_of(&root)).collect();
     assert_eq!(group.len(), 1 + PARITY);
@@ -514,7 +514,7 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
     // A group below k: its new leaf and all PARITY of its parity held.
     let l2 = l2();
     let mut r = Rig::base();
-    let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let fx = r.step(Event::create(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     let sent = puts(&fx);
     let parent = sent.values().filter_map(|b| Node::parse(b).ok()).find(|n| !n.is_leaf() && parity::group_members(n).iter().any(|(_, m)| m.contains(&l2))).expect("the leaf's parent");
     let g = parity::group_members(&parent).into_iter().position(|(_, m)| m.contains(&l2)).unwrap();
@@ -533,7 +533,7 @@ fn neither_an_unacked_root_nor_a_group_below_k_signs() {
 fn the_held_back_parity_of_a_commit_too_large_to_carry_is_sent_from_its_own_bytes() {
     let mut r = Rig::base();
     let big = vec![put("k/000100", &[7u8; 30 * 1024])];
-    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), big));
+    let first = r.step(Event::create(ClientId(1), WriteId(2), big));
     let mut all = first.clone();
     for id in puts(&first).keys() {
         all.extend(r.step(Event::PutConfirmed(*id)));
@@ -560,7 +560,7 @@ fn a_single_stall_per_group_is_still_raced_by_its_first_wave_parity() {
     let l2 = l2();
     for hold_parity in [false, true] {
         let mut r = Rig::base();
-        let fx = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+        let fx = r.step(Event::create(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
         let sent = puts(&fx);
         let parent = sent.values().filter_map(|b| Node::parse(b).ok()).find(|n| !n.is_leaf() && parity::group_members(n).iter().any(|(_, m)| m.contains(&l2))).expect("the leaf's parent");
         let groups = parity::group_members(&parent);
@@ -614,7 +614,7 @@ fn a_data_block_rejected_after_the_head_is_sent_is_never_put_again() {
     let mut r = Rig::base_with(Params { head_before_packs: true, ..Params::default() });
     let t0 = 1_000_000;
     let _ = r.step(Event::Tick(t0));
-    let first = r.step(Event::forced_write(ClientId(1), WriteId(4), vec![put("k/000300", b"four")]));
+    let first = r.step(Event::create(ClientId(1), WriteId(4), vec![put("k/000300", b"four")]));
     let victim = leaf_with(&first, b"k/000300");
     let (seq, _) = head(&first).expect("THE SETUP: head_before_packs did not send the head at once");
     // Nothing is answered: the commit is not ready. The new leaf is rejected.
@@ -642,7 +642,7 @@ fn a_data_block_rejected_after_the_head_is_sent_is_never_put_again() {
 fn a_rejected_block_ends_its_commit_failed_and_is_never_put_again() {
     // In flight.
     let mut r = Rig::base();
-    let first = r.step(Event::forced_write(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
+    let first = r.step(Event::create(ClientId(1), WriteId(2), vec![put("k/000100", b"two")]));
     let victim = *puts(&first).keys().next().expect("a block PUT");
     let fx = r.step(Event::PutRejected(victim));
     assert_eq!(states(&fx, 2), vec![State::Failed], "the write needing a rejected block was not told Failed (and only that)");

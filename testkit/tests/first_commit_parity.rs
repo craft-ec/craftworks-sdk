@@ -41,7 +41,7 @@ fn first_commit(ticks_in_flight: bool) -> (Vec<WriteState>, (usize, usize), bool
     let mut c = node.connect();
     c.client(&Request::Identity);
     c.hold_answers();
-    let mut all = c.client(&Request::forced_write(1, vec![
+    let mut all = c.client(&Request::create(1, vec![
             Op::Put(b"k/big".to_vec(), value(7, 30 * 1024)),
             Op::Put(b"k/small".to_vec(), b"small".to_vec()),
         ]));

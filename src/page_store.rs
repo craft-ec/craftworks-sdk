@@ -665,13 +665,13 @@ impl<H: Host> Reads for PageStore<H> {
 }
 
 impl<H: Host> Store for PageStore<H> {
-    /// A store-level batch that cannot read first: it says so, key by key,
-    /// as `Expect::Any` (sdk#235, W8) -- counted by the engine and shown.
-    /// Only store-level callers build `Any`; `Db` refuses to.
+    /// A batch that states no reads. This store holds writes for a page's
+    /// ENGINE, where every write says what it read (W8), so it goes as a
+    /// reads-less write and the engine's door refuses it `Unread`: the one
+    /// place that decides. There is no forced form (sdk#281); a caller that
+    /// writes here uses [`Store::apply_commit`].
     fn apply_batch(&mut self, edits: &[(Vec<u8>, Edit)]) -> Result<(), Refused> {
-        let reads: Vec<(Vec<u8>, protocol::Expect)> = edits.iter().map(|(k, _)| (k.clone(), protocol::Expect::Any)).collect();
-        let made = self.writes.make(&reads, edits);
-        self.hand_over(made)
+        self.apply_commit(&[], edits)
     }
 
     fn last_write_id(&self) -> Option<u64> {

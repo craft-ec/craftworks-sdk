@@ -32,7 +32,7 @@ fn a_block_the_parked_write_needs_is_not_withdrawn_when_a_read_on_it_is_supersed
     let (root, all) = tree(&records);
     let (mut e, store) = cold_reader(root, Params::default());
     store.put(root, all.get(&root).expect("the root"));
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"new".to_vec()))]));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"new".to_vec()))]));
     let asked = fetches(&out);
     assert!(!asked.is_empty(), "THE SETUP: the write did not park on a cold block");
     let needed = asked[0];
@@ -76,7 +76,7 @@ fn a_repair_the_parked_write_needs_stands_when_the_read_that_raced_it_is_superse
         }
     }
     let key = Node::parse(all.get(&member).expect("held")).expect("a leaf").key(0);
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(key.clone(), Op::Put(b"new".to_vec()))]));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), vec![(key.clone(), Op::Put(b"new".to_vec()))]));
     assert!(fetches(&out).contains(&member), "THE SETUP: the write did not park on the cold member");
     let _ = e.step(Event::Get { client: ClientId(2), req_id: ReqId(7), key });
     assert!(parity.iter().all(|p| e.readers_of(p).repairs), "THE SETUP: the read did not race the member's group");
@@ -102,7 +102,7 @@ fn a_freed_repair_slot_the_parked_write_needs_is_not_withdrawn() {
         }
     }
     let key_of = |m: &Cid| Node::parse(all.get(m).expect("held")).expect("a leaf").key(0);
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(key_of(&a), Op::Put(b"new".to_vec()))]));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), vec![(key_of(&a), Op::Put(b"new".to_vec()))]));
     assert!(fetches(&out).contains(&a), "THE SETUP: the write did not park on A");
     let _ = e.step(Event::Get { client: ClientId(2), req_id: ReqId(7), key: key_of(&b) });
     // The write's own need of A is shown by its FetchBlock above, never read back through `readers_of` here: the
@@ -136,7 +136,7 @@ fn a_slot_freed_and_parked_on_in_one_step_is_not_unwanted() {
     }
     let leaf = |m: &Cid| Node::parse(all.get(m).expect("held")).expect("a leaf");
     let x_last = leaf(&x).key(leaf(&x).len() - 1);
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(x_last, Op::Delete)]));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), vec![(x_last, Op::Delete)]));
     assert!(fetches(&out).contains(&x) && !fetches(&out).contains(&y), "THE SETUP: the write did not park on X alone first: {:?}", fetches(&out));
     let _ = e.step(Event::Get { client: ClientId(2), req_id: ReqId(7), key: leaf(&x).key(0) });
     assert!(e.readers_of(&y).repairs, "THE SETUP: Y is not a slot of X's race");
@@ -160,7 +160,7 @@ fn a_released_parked_writes_needs_are_unwanted() {
     let (mut e, store) = cold_reader(root, Params::default());
     store.put(root, all.get(&root).expect("the root"));
     let _ = e.step(Event::Tick(1_000));
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"new".to_vec()))]));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), vec![(b"k/00100".to_vec(), Op::Put(b"new".to_vec()))]));
     let x = *fetches(&out).first().expect("THE SETUP: the write did not park on a cold block");
     let mut released = Vec::new();
     for t in 1..=10_000u64 {

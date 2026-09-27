@@ -137,7 +137,7 @@ fn the_context_costs_what_it_is_budgeted() {
         .collect();
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), ops));
     store.absorb(&out);
     let in_flight = e.context_len();
     let blocks = out
@@ -276,7 +276,7 @@ fn the_budget_holds_with_every_shape_at_its_cap() {
         .collect();
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e2.step(Event::HeadMissing);
-    let out = e2.step(Event::forced_write(ClientId(1), WriteId(1), ops));
+    let out = e2.step(Event::create(ClientId(1), WriteId(1), ops));
     let commit_blocks = out
         .iter()
         .filter(|f| matches!(f, Effect::PutPack { .. } | Effect::PutBlock { .. }))
@@ -354,7 +354,7 @@ fn a_commit_over_the_block_cap_is_refused_and_a_smaller_one_is_not() {
         let before = e.root();
         // A new tree: nothing to recover. A write before recovery waits (sdk#223).
         let _ = e.step(Event::HeadMissing);
-        let out = e.step(Event::forced_write(ClientId(1), WriteId(1), ops));
+        let out = e.step(Event::create(ClientId(1), WriteId(1), ops));
         let after = e.root();
         (out, before, after)
     };
@@ -534,7 +534,7 @@ fn a_fresh_engine_recovers_from_the_head_and_gives_the_unknown_write_no_verdict(
     let mut e: Engine<Store> = Engine::new(Params::default(), store.clone());
     // A new tree: nothing to recover. A write before recovery waits (sdk#223).
     let _ = e.step(Event::HeadMissing);
-    let out = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![5u8; 40]))]));
+    let out = e.step(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), Op::Put(vec![5u8; 40]))]));
     store.absorb(&out);
     let published = e.published_root();
 

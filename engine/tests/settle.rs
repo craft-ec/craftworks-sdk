@@ -16,7 +16,7 @@ use common::{Harness, Store};
 const T0: u64 = 1_790_000_000;
 
 fn write(id: u64, ops: Vec<(Vec<u8>, Op)>) -> Event {
-    Event::forced_write(ClientId(1), WriteId(id), ops)
+    Event::create(ClientId(1), WriteId(id), ops)
 }
 
 fn told(fx: &[Effect], id: u64) -> Vec<State> {

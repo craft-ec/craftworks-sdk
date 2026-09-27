@@ -354,7 +354,7 @@ fn run(seed: u64, mutant: Option<Mutant>, steps: usize, fast: usize) -> Vec<Find
             let o = ops(&mut rng, step, "x");
             let o = if fast_phase { widen(o) } else { o };
             let ops = o.into_iter().map(|(k, v)| v.map_or(protocol::Op::Delete(k.clone()), |v| protocol::Op::Put(k, v))).collect();
-            x.client(&Request::forced_write(x_write, ops));
+            x.client(&Request::create(x_write, ops));
             x.tick_at(now);
             if fast_phase {
                 y.hint(now);
@@ -395,7 +395,7 @@ fn run(seed: u64, mutant: Option<Mutant>, steps: usize, fast: usize) -> Vec<Find
                 x_write += 1;
                 let o = widen(ops(&mut rng, step, "x"));
                 let ops = o.into_iter().map(|(k, v)| v.map_or(protocol::Op::Delete(k.clone()), |v| protocol::Op::Put(k, v))).collect();
-                x.client(&Request::forced_write(x_write, ops));
+                x.client(&Request::create(x_write, ops));
                 x.tick_at(now);
                 // Adopted WITHOUT the LIVE re-run: that runs after the drain,
                 // and here it would fetch the new head's blocks for the read

@@ -150,13 +150,12 @@ fn digest_of(v: &Option<Vec<u8>>) -> Option<[u8; 32]> {
 /// LATER write of its own group overwrote (it lost to its own app's order).
 /// The merge writes are queued like any other and ride the next cut.
 ///
-/// A FORCED write (`Expect::Any`, sdk#235) states no premise, so the engine
-/// cannot refuse it where it lands: re-applied as it is, it would write over
-/// the winner blind. So the COMPLETE delta P→winner is read first (resumed
-/// until done -- a cut delta is unknown, never "not theirs"), and a forced
-/// write goes again WITHOUT the keys the winner changed: those are
-/// superseded, told, unless the winner already holds exactly this page's
-/// value there.
+/// The COMPLETE delta P→winner is read first (resumed until done -- a cut
+/// delta is unknown, never "not theirs"). It was read for the FORCED write
+/// (`Expect::Any`), which states no premise and so went again without the
+/// keys the winner changed; sdk#281 removed that form, so nothing reads the
+/// delta now. Its removal changes the merge's flow (the probe fallback when
+/// the base's blocks are gone), so it is left for its own change.
 struct Merge {
     winner: (u64, freenet_prolly::Cid),
     writes: TipWrites,
@@ -164,9 +163,6 @@ struct Merge {
     from: freenet_prolly::Cid,
     req: u64,
     theirs: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    /// Per tip write, the keys it did NOT write again because the winner
-    /// changed them (a forced write's, above).
-    dropped: BTreeMap<usize, Vec<Vec<u8>>>,
     /// Each merge write's id and the tip write it re-applies (its index).
     sent: Vec<(u64, usize)>,
     /// What became of each: `true` Published again.
@@ -270,11 +266,6 @@ impl Server {
     /// Merge writes that published (see the field).
     pub fn merge_published(&self) -> u64 {
         self.merge_published
-    }
-
-    /// Writes taken forced past their reads (sdk#235).
-    pub fn forced_writes(&self) -> u64 {
-        self.page.forced_writes()
     }
 
     pub fn new(page: Page, facts: SignerFacts) -> Server {
@@ -842,7 +833,7 @@ impl Server {
     fn start_merge(&mut self, winner: (u64, freenet_prolly::Cid), writes: TipWrites, from: freenet_prolly::Cid) {
         let rid = self.next_probe;
         self.next_probe += 1;
-        self.merge = Some(Merge { winner, writes, from, req: rid, theirs: BTreeMap::new(), dropped: BTreeMap::new(), sent: Vec::new(), landed: BTreeMap::new(), published_at: None });
+        self.merge = Some(Merge { winner, writes, from, req: rid, theirs: BTreeMap::new(), sent: Vec::new(), landed: BTreeMap::new(), published_at: None });
         self.page.event(Event::ChangesSince {
             client: PROBE_CLIENT,
             req_id: as_req_id(rid),
@@ -853,36 +844,18 @@ impl Server {
     }
 
     /// Their COMPLETE delta is in: the group goes again, in order, each
-    /// write as its own engine write -- a forced one without the keys the
-    /// winner changed.
+    /// write as its own engine write.
     fn send_merge(&mut self) {
         let Some(m) = self.merge.as_mut() else { return };
         let mut events = Vec::new();
         for (i, (_, w)) in m.writes.iter().enumerate() {
-            let forced = |k: &Vec<u8>| w.reads.iter().any(|(rk, e)| rk == k && *e == engine::Expect::Any);
-            let mut dropped = Vec::new();
-            let ops: Vec<(Vec<u8>, engine::Op)> = w
-                .finals
-                .iter()
-                .filter(|(k, _)| {
-                    let keep = !(forced(k) && m.theirs.contains_key(k));
-                    if !keep {
-                        dropped.push(k.clone());
-                    }
-                    keep
-                })
-                .map(|(k, v)| (k.clone(), v.clone().map_or(engine::Op::Delete, engine::Op::Put)))
-                .collect();
-            if !dropped.is_empty() {
-                m.dropped.insert(i, dropped);
-            }
+            let ops: Vec<(Vec<u8>, engine::Op)> = w.finals.iter().map(|(k, v)| (k.clone(), v.clone().map_or(engine::Op::Delete, engine::Op::Put))).collect();
             if ops.is_empty() {
-                // Nothing of it goes again: it "landed" as far as the merge
-                // goes, and its dropped keys speak for themselves.
+                // Nothing of it goes again: it "landed" as far as the merge goes.
                 m.landed.insert(i, true);
                 continue;
             }
-            let reads: Vec<(Vec<u8>, engine::Expect)> = w.reads.iter().filter(|(k, _)| ops.iter().any(|(ok, _)| ok == k) || !forced(k)).cloned().collect();
+            let reads = w.reads.clone();
             let wid = self.next_probe;
             self.next_probe += 1;
             m.sent.push((wid, i));
@@ -930,14 +903,9 @@ impl Server {
     fn finish_merge(&mut self, out: &mut Outbound) {
         let Some(m) = self.merge.take() else { return };
         let last = last_writers(&m.writes);
-        let left = left_of(&m.writes);
         let superseded: std::collections::BTreeSet<Vec<u8>> = last
             .iter()
-            .filter(|(k, i)| {
-                let fell = !m.landed.get(*i).copied().unwrap_or(false);
-                let dropped = m.dropped.get(*i).is_some_and(|d| d.contains(*k)) && m.theirs.get(*k) != left.get(*k);
-                fell || dropped
-            })
+            .filter(|(_, i)| !m.landed.get(*i).copied().unwrap_or(false))
             .map(|(k, _)| k.clone())
             .collect();
         if let Some(head) = m.published_at {
@@ -1451,7 +1419,6 @@ fn write_event(speaker: engine::ClientId, write_id: u64, reads: Vec<(Vec<u8>, pr
                         protocol::Expect::Absent => engine::Expect::Absent,
                         protocol::Expect::Present => engine::Expect::Present,
                         protocol::Expect::Value(h) => engine::Expect::Value(h),
-                        protocol::Expect::Any => engine::Expect::Any,
                     },
                 )
             })

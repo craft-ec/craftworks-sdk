@@ -166,7 +166,7 @@ pub fn fingerprint(e: &Engine<Store>) -> impl PartialEq + std::fmt::Debug {
         e.committing_seq(),
         e.queue_stages().collect::<Vec<_>>(),
         (e.queue_load(), e.queued_writes(), e.unsaved_writes()),
-        (e.owed_groups(), e.commits_and_writes(), e.forced_writes()),
+        (e.owed_groups(), e.commits_and_writes()),
     )
 }
 
@@ -413,7 +413,7 @@ pub fn tree(records: &BTreeMap<Vec<u8>, Vec<u8>>) -> (Cid, MemBlocks) {
     // write before recovery waits for it (sdk#223), so this writer says it.
     let _ = w.step(Event::HeadMissing);
     let mut queue = {
-        let out = w.step(Event::forced_write(ClientId(1), WriteId(1), ops));
+        let out = w.step(Event::create(ClientId(1), WriteId(1), ops));
         ws.absorb(&out);
         out
     };

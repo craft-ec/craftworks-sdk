@@ -17,7 +17,7 @@ use protocol::{Reply, Request, MAX_PAGE_ENTRIES};
 use testkit::PageNode;
 
 fn write(n: u64) -> Request {
-    Request::forced_write(n, vec![protocol::Op::Put(
+    Request::create(n, vec![protocol::Op::Put(
             format!("k/{n:06}").into_bytes(),
             vec![(n % 251) as u8; 64],
         )])

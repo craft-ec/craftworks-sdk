@@ -36,7 +36,7 @@ fn nothing_is_cut_while_it_cannot_sign_and_one_commit_carries_the_queue_when_it_
 
     let mut held = Vec::new();
     for n in 1..=3u64 {
-        let fx = e.step(Event::forced_write(ClientId(1), WriteId(n), vec![put(&format!("k/{n}"), &format!("v{n}"))]));
+        let fx = e.step(Event::create(ClientId(1), WriteId(n), vec![put(&format!("k/{n}"), &format!("v{n}"))]));
         e.blocks().absorb(&fx);
         held.extend(fx);
     }
@@ -94,7 +94,7 @@ fn nothing_is_cut_while_it_cannot_sign_and_one_commit_carries_the_queue_when_it_
 fn with_no_can_sign_stepped_a_write_is_cut_at_once() {
     let mut e = common::new_store_params(Params::default());
     let _ = e.step(Event::HeadMissing);
-    let fx = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![put("k/1", "v1")]));
+    let fx = e.step(Event::create(ClientId(1), WriteId(1), vec![put("k/1", "v1")]));
     assert!(to_node(&fx) > 0, "the default does not cut: every existing path would change");
 }
 
@@ -105,7 +105,7 @@ fn a_flush_cuts_nothing_while_it_cannot_sign() {
     let mut e = common::new_store_params(Params::default());
     let _ = e.step(Event::HeadMissing);
     let _ = e.step(Event::CanSign(false));
-    let mut fx = e.step(Event::forced_write(ClientId(1), WriteId(1), vec![put("k/1", "v1")]));
+    let mut fx = e.step(Event::create(ClientId(1), WriteId(1), vec![put("k/1", "v1")]));
     fx.extend(e.step(Event::Flush));
     assert_eq!(to_node(&fx), 0, "a Flush cut a commit while the page cannot sign");
 }

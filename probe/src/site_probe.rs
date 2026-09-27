@@ -201,7 +201,7 @@ impl Pub {
     /// Write one record (a head commit) and drive to its outcome.
     async fn write(&mut self, id: u64) -> Result<()> {
         let ops = vec![protocol::Op::Put(format!("r/{id}").into_bytes(), vec![7u8; 600])];
-        self.io.client(&protocol::encode_session_request(4, SESSION, &Request::forced_write(id, ops)).expect("encodes"));
+        self.io.client(&protocol::encode_session_request(4, SESSION, &Request::create(id, ops)).expect("encodes"));
         self.drive(Duration::from_secs(90), false, |_, r| crate::verdict::write_outcome(id, r).is_some()).await.with_context(|| format!("write {id}"))?;
         match crate::verdict::write_outcome(id, &self.replies) {
             Some(Ok(())) => Ok(()),

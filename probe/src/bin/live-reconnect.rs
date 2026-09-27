@@ -95,12 +95,12 @@ impl Client {
             .client(&protocol::encode_session_request(4, self.session, r).expect("encodes"));
     }
 
-    /// A forced one-row write, waited on until its outcome. `Ok(ms)` = Published.
+    /// A one-row write of a new key (read `Absent`), waited on until its outcome. `Ok(ms)` = Published.
     async fn write(&mut self, t0: Instant, key: &str) -> Result<std::result::Result<u128, String>> {
         self.next_id += 1;
         let id = self.next_id;
         let t = Instant::now();
-        self.send(&Request::forced_write(
+        self.send(&Request::create(
             id,
             vec![protocol::Op::Put(
                 key.as_bytes().to_vec(),

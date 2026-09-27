@@ -18,11 +18,10 @@ use std::collections::BTreeMap;
 mod common;
 use common::{Harness, Store};
 
-/// A write with these reads. Every op key the test does NOT read is FORCED
-/// (`Expect::Any`, sdk#235 W8): these tests are about the reads they declare —
-/// often of a key the write does not touch — and a write must name every key
-/// it changes, so the rest are named as "whatever it holds". The declared
-/// reads are checked exactly as before.
+/// A write with these reads. Every op key the test does NOT read is read
+/// ABSENT (a new key): these tests are about the reads they declare — often of
+/// a key the write does not touch — and a write must name every key it
+/// changes (W8). A test that writes over a key names that read itself.
 fn write(id: u64, ops: &[(&[u8], Option<&[u8]>)], reads: Vec<(Vec<u8>, Expect)>) -> Event {
     let ops: Vec<(Vec<u8>, Op)> = ops
         .iter()
@@ -31,7 +30,7 @@ fn write(id: u64, ops: &[(&[u8], Option<&[u8]>)], reads: Vec<(Vec<u8>, Expect)>)
     let mut reads = reads;
     for (k, _) in &ops {
         if !reads.iter().any(|(r, _)| r == k) {
-            reads.push((k.clone(), Expect::Any));
+            reads.push((k.clone(), Expect::Absent));
         }
     }
     Event::Write {
@@ -95,13 +94,14 @@ fn value_at(store: &Store, root: &Cid, k: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[test]
-fn a_write_whose_reads_hold_applies_exactly_as_a_blind_one() {
+fn a_write_whose_reads_hold_applies_exactly_as_one_with_weaker_reads() {
     let (mut a, mut b) = (fresh(), fresh());
     for h in [&mut a, &mut b] {
         let fx = h.step(write(1, &[(b"k", Some(b"v1"))], vec![]));
         settle(h, fx);
     }
-    let fx = a.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], vec![]));
+    // The weakest premise that holds: `k` is there, whatever it holds.
+    let fx = a.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], vec![(b"k".to_vec(), Expect::Present)]));
     settle(&mut a, fx);
     let reads = vec![(b"k".to_vec(), Expect::Value(leaf_hash(b"v1"))), (b"j".to_vec(), Expect::Absent)];
     let fx = b.step(write(2, &[(b"k", Some(b"v2")), (b"j", Some(b"x"))], reads));
@@ -156,7 +156,7 @@ fn present_holds_for_any_value_and_fails_on_an_absent_key() {
     let mut h = fresh();
     let fx = h.step(write(1, &[(b"parent", Some(b"p"))], vec![]));
     settle(&mut h, fx);
-    let fx = h.step(write(2, &[(b"parent", Some(b"edited"))], vec![]));
+    let fx = h.step(write(2, &[(b"parent", Some(b"edited"))], vec![(b"parent".to_vec(), Expect::Value(leaf_hash(b"p")))]));
     settle(&mut h, fx);
     // A child needs its parent to EXIST, not to be unchanged.
     let fx = h.step(write(3, &[(b"parent/child", Some(b"c"))], vec![(b"parent".to_vec(), Expect::Present)]));

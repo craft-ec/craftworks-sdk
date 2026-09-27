@@ -5,7 +5,7 @@
 //! wrapper-path `Held` that keeps answering absent.
 
 mod common;
-use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
+use engine::{ClientId, Event, Op as WriteOp, Params, State, WriteId};
 use page::{Ms, Answer, Op, Page, PutPath, BACKOFF_MS, HELD_ABSENTS};
 use signer_proto::{Answer as A, Head, Why};
 
@@ -14,7 +14,7 @@ use signer_proto::{Answer as A, Head, Why};
 /// first head read finds no head.
 fn at_sign(path: PutPath) -> (Page, u64, u32) {
     let mut p = Page::new(Params::default(), path);
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     let now = 10;
     for _ in 0..20 {
         for op in p.take_ops() {
@@ -119,7 +119,7 @@ fn record_not_saved_and_root_not_held_are_asked_again_after_a_backoff() {
 #[test]
 fn a_held_absent_is_asked_again_and_re_put_only_after_several() {
     let mut p = Page::new(Params::default(), PutPath::Wrapper);
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     let mut now = 10;
     let (mut puts, mut asks) = (0usize, 0usize);
     let mut blocks = std::collections::BTreeSet::new();
@@ -169,7 +169,7 @@ fn the_engine_hears_the_page_clock_in_seconds() {
             p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(now));
         }
     }
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]));
     assert!(p.take_ops().iter().any(|o| matches!(o, Op::Put { .. })), "the write put nothing");
     for _ in 0..20 {
         now += 50;
@@ -198,7 +198,7 @@ fn an_old_signers_fork_on_the_head_the_page_stands_on_is_not_re_asked_until_the_
     let _ = p.take_ops();
     p.answer(Answer::Head { label: page::Label::Head, read: Some((theirs.seq, theirs.root).into()) }, Ms(now + 2));
     let _ = p.take_notices();
-    p.write(ClientId(1), WriteId(2), vec![(b"k2".to_vec(), WriteOp::Put(b"v2".to_vec()))]);
+    p.event(Event::create(ClientId(1), WriteId(2), vec![(b"k2".to_vec(), WriteOp::Put(b"v2".to_vec()))]));
     let mut id2 = None;
     for _ in 0..20 {
         for op in p.take_ops() {

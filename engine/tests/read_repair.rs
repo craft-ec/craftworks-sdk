@@ -252,7 +252,7 @@ fn a_write_whose_path_lost_a_block_is_applied_from_its_group() {
         let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
         let mut published = false;
         let mut arrived_lost = false;
-        let mut queue = e.step(Event::forced_write(ClientId(1), engine::WriteId(1), vec![(key.clone(), engine::Op::Put(b"written over a lost leaf".to_vec()))]));
+        let mut queue = e.step(Event::create(ClientId(1), engine::WriteId(1), vec![(key.clone(), engine::Op::Put(b"written over a lost leaf".to_vec()))]));
         let mut steps = 0;
         while let Some(f) = queue.pop() {
             steps += 1;
@@ -367,7 +367,7 @@ fn a_member_this_page_rebuilt_counts_toward_k_once_the_node_says_it_holds_it() {
         // 2. The write in a sibling leaf; the commit asks the node about the group's other members.
         let mut named = Vec::new();
         let mut published = false;
-        let mut queue = e.step(Event::forced_write(ClientId(1), engine::WriteId(1), vec![(write_key.clone(), engine::Op::Put(b"written beside a rebuilt leaf".to_vec()))]));
+        let mut queue = e.step(Event::create(ClientId(1), engine::WriteId(1), vec![(write_key.clone(), engine::Op::Put(b"written beside a rebuilt leaf".to_vec()))]));
         let mut steps = 0;
         while let Some(f) = queue.pop() {
             steps += 1;

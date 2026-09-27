@@ -30,7 +30,7 @@
 //! 4. Once the faults stop, every write is published, and the final tree
 //!    holds every key both pages wrote.
 
-use engine::{ClientId, Op as WriteOp, Params, State, WriteId};
+use engine::{ClientId, Event, Op as WriteOp, Params, State, WriteId};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use page::{Answer, Ms, Op, Page, PutPath};
@@ -492,7 +492,7 @@ impl App {
             self.next_id += 1;
             self.inflight.insert(self.next_id, (k.clone(), v.clone()));
             self.submitted.insert(self.next_id, now);
-            self.page.write(self.client, WriteId(self.next_id), vec![(k, WriteOp::Put(v))]);
+            self.page.event(Event::create(self.client, WriteId(self.next_id), vec![(k, WriteOp::Put(v))]));
         }
     }
 }
@@ -1281,12 +1281,12 @@ fn a_stale_page_lands_losing(lose: u32) -> (u32, u32) {
     serve(&mut a, &mut node, &mut now, &mut 0);
     serve(&mut b, &mut node, &mut now, &mut 0);
     a_gone_with_its_record_unlanded(a, &mut node, &mut now);
-    b.write(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    b.event(Event::create(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]));
     let mut left = lose;
     serve(&mut b, &mut node, &mut now, &mut left);
     assert_eq!(left, 0, "B did not re-send its landing's UPDATE: {} of {lose} losses unused", left);
     assert_eq!(node.head().map(|h| h.0), Some(2), "A's record was never landed");
-    b.write(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    b.event(Event::create(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]));
     serve(&mut b, &mut node, &mut now, &mut 0);
     let (_, root) = node.head().expect("a head");
     let tree = node.tree(&root).expect("whole");
@@ -1366,7 +1366,7 @@ fn with_every_hint_lost_an_idle_device_still_learns_by_the_backstop() {
 fn control_the_whole_tree_check_fails_on_a_missing_block() {
     let (mut node, _) = Node::new();
     let mut p = Page::new(Params::default(), PutPath::Page);
-    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(vec![7u8; 5_000]))]);
+    p.event(Event::create(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(vec![7u8; 5_000]))]));
     let mut puts = Vec::new();
     for _ in 0..20 {
         for op in p.take_ops() {
@@ -1404,7 +1404,7 @@ fn control_the_whole_tree_check_fails_on_a_missing_block() {
 /// One page's write, driven to a standstill against the node with every op answered; the signer's record edge
 /// (next -> prev) recorded as the model's `edges`. The head it ends on.
 fn drive_one(p: &mut Page, node: &mut Node, edges: &mut BTreeMap<(u64, Cid), (u64, Cid)>, w: u64, key: &str, value: Vec<u8>) -> (u64, Cid) {
-    p.write(ClientId(1), WriteId(w), vec![(key.as_bytes().to_vec(), WriteOp::Put(value))]);
+    p.event(Event::create(ClientId(1), WriteId(w), vec![(key.as_bytes().to_vec(), WriteOp::Put(value))]));
     for _ in 0..40 {
         for op in p.take_ops() {
             match op {
@@ -1534,11 +1534,11 @@ fn serve(p: &mut Page, node: &mut Node, now: &mut u64, drop_updates: &mut u32) {
 fn a_gone_with_its_record_unlanded(mut a: Page, node: &mut Node, now: &mut u64) {
     let (node, now) = (node, now);
     // A publishes seq 1.
-    a.write(ClientId(1), WriteId(1), vec![(b"a1".to_vec(), WriteOp::Put(b"x".to_vec()))]);
+    a.event(Event::create(ClientId(1), WriteId(1), vec![(b"a1".to_vec(), WriteOp::Put(b"x".to_vec()))]));
     serve(&mut a, node, now, &mut 0);
     assert_eq!(node.head().map(|h| h.0), Some(1));
     // A's second commit is SIGNED (record seq 2), its UPDATE never lands, and A is gone.
-    a.write(ClientId(1), WriteId(2), vec![(b"a2".to_vec(), WriteOp::Put(b"y".to_vec()))]);
+    a.event(Event::create(ClientId(1), WriteId(2), vec![(b"a2".to_vec(), WriteOp::Put(b"y".to_vec()))]));
     for _ in 0..30 {
         let ops = a.take_ops();
         for op in ops {
@@ -1588,13 +1588,13 @@ fn a_stale_page_lands_a_gone_pages_record_then_publishes() {
     serve(&mut b, &mut node, &mut now, &mut 0);
     a_gone_with_its_record_unlanded(a, &mut node, &mut now);
     // B, stale at seq 0, writes: NotNext names record 2; B lands it.
-    b.write(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    b.event(Event::create(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]));
     serve(&mut b, &mut node, &mut now, &mut 0);
     let lost = b.take_notices().iter().any(|(_, w, s)| w.0 == 1 && *s == State::Lost);
     assert!(lost, "B's write was not told Lost by the rebase onto the landed record");
     assert!(b.landings().0 > 0, "B never landed the record");
     assert_eq!(node.head().map(|h| h.0), Some(2), "A's record was never landed");
-    b.write(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    b.event(Event::create(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]));
     serve(&mut b, &mut node, &mut now, &mut 0);
     let (_, root) = node.head().expect("a head");
     let tree = node.tree(&root).expect("whole");
@@ -1616,7 +1616,7 @@ fn a_stale_pages_landing_whose_update_is_lost_twice_still_lands() {
     serve(&mut a, &mut node, &mut now, &mut 0);
     serve(&mut b, &mut node, &mut now, &mut 0);
     a_gone_with_its_record_unlanded(a, &mut node, &mut now);
-    b.write(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    b.event(Event::create(ClientId(2), WriteId(1), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]));
     let mut lose = 2u32;
     serve(&mut b, &mut node, &mut now, &mut lose);
     assert_eq!(lose, 0, "B did not re-send its landing's UPDATE after losing it: {} of the 2 losses were used", 2 - lose);
@@ -1625,7 +1625,7 @@ fn a_stale_pages_landing_whose_update_is_lost_twice_still_lands() {
     assert_eq!(landings, 1, "B did not land A's record exactly once");
     assert!(most >= 3, "the landing's UPDATE was not lost twice and re-sent (most: {most})");
     assert_eq!(node.head().map(|h| h.0), Some(2), "A's record was never landed");
-    b.write(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]);
+    b.event(Event::create(ClientId(2), WriteId(2), vec![(b"b1".to_vec(), WriteOp::Put(b"z".to_vec()))]));
     serve(&mut b, &mut node, &mut now, &mut 0);
     let (_, root) = node.head().expect("a head");
     let tree = node.tree(&root).expect("whole");
@@ -1693,13 +1693,13 @@ fn a_foreign_member_absent_is_put_again_from_page_memory_at_a_one_byte_budget() 
     serve(&mut a, &mut node, &mut now, false, 400);
     serve(&mut b, &mut node, &mut now, false, 400);
     let rows: Vec<(Vec<u8>, WriteOp)> = (0..30).map(|i| (format!("v/{i:02}").into_bytes(), WriteOp::Put(vec![i as u8; 2_000]))).collect();
-    a.write(ClientId(1), WriteId(1), rows);
+    a.event(Event::create(ClientId(1), WriteId(1), rows));
     serve(&mut a, &mut node, &mut now, false, 2_000);
     assert_eq!(node.head().map(|h| h.0), Some(1), "THE SETUP: A did not publish");
     let a_values: BTreeMap<Cid, Vec<u8>> = node.blocks.iter().filter(|(_, v)| v.len() == 2_000).map(|(k, v)| (*k, v.clone())).collect();
     b.head_hint();
     serve(&mut b, &mut node, &mut now, false, 400);
-    b.write(ClientId(2), WriteId(1), vec![(b"v/05".to_vec(), WriteOp::Put(vec![99u8; 2_000]))]);
+    b.event(Event::create(ClientId(2), WriteId(1), vec![(b"v/05".to_vec(), WriteOp::Put(vec![99u8; 2_000]))]));
     let puts = serve(&mut b, &mut node, &mut now, true, 5_000);
     let again: Vec<&(Cid, Vec<u8>)> = puts.iter().filter(|(id, _)| a_values.contains_key(id)).collect();
     println!("B put {} of A's {} value blocks again from its memory (1-byte budget); B's store peak pinned {} B", again.len(), a_values.len(), b.blocks().stats().peak_pinned_bytes);
@@ -1774,13 +1774,13 @@ fn a_foreign_members_absent_are_asked_again_and_put_only_after_held_absents() {
     serve(&mut a, &mut node, &mut now, false, 400);
     serve(&mut b, &mut node, &mut now, false, 400);
     let rows: Vec<(Vec<u8>, WriteOp)> = (0..30).map(|i| (format!("v/{i:02}").into_bytes(), WriteOp::Put(vec![i as u8; 2_000]))).collect();
-    a.write(ClientId(1), WriteId(1), rows);
+    a.event(Event::create(ClientId(1), WriteId(1), rows));
     serve(&mut a, &mut node, &mut now, false, 400);
     assert_eq!(node.head().map(|h| h.0), Some(1), "THE SETUP: A did not publish");
     let a_blocks: std::collections::BTreeSet<Cid> = node.blocks.keys().copied().collect();
     b.head_hint();
     serve(&mut b, &mut node, &mut now, false, 400);
-    b.write(ClientId(2), WriteId(1), vec![(b"v/05".to_vec(), WriteOp::Put(vec![99u8; 2_000]))]);
+    b.event(Event::create(ClientId(2), WriteId(1), vec![(b"v/05".to_vec(), WriteOp::Put(vec![99u8; 2_000]))]));
     let sent = serve(&mut b, &mut node, &mut now, true, 3_000);
     let helds: Vec<&Vec<Cid>> = sent.iter().filter_map(|s| if let Sent::Held(ids) = s { Some(ids) } else { None }).collect();
     let foreign: std::collections::BTreeSet<Cid> = helds.iter().flat_map(|ids| ids.iter()).copied().filter(|id| a_blocks.contains(id)).collect();
