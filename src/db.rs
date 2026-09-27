@@ -829,6 +829,31 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         })
     }
 
+    /// Set the asset `target`'s `keep` record (KEEPER §3): an ordinary write that reads its key first.
+    pub fn keep_set(&mut self, target: &[u8; 32], keep: &crate::keep::Keep) -> Result<()> {
+        let key = crate::keep::key(target);
+        let read = self.read_of(&key)?;
+        self.write(vec![read], vec![(key, Edit::Put(crate::keep::encode(keep)))])
+    }
+
+    /// The asset `target`'s `keep` record, or `None` (no record, or not one this build reads).
+    pub fn keep_get(&mut self, target: &[u8; 32]) -> Result<Option<crate::keep::Keep>> {
+        Ok(self.get_key(&crate::keep::key(target))?.as_deref().and_then(crate::keep::decode))
+    }
+
+    /// Every asset with a `keep` record, by its Register id: the derived asset list (KEEPER §2), with the own tree
+    /// added by the caller. A record this build cannot read is left out.
+    pub fn keep_list(&mut self) -> Result<Vec<([u8; 32], crate::keep::Keep)>> {
+        let lo = crate::keep::PREFIX.to_vec();
+        let mut hi = lo.clone();
+        *hi.last_mut().expect("non-empty") = 1;
+        Ok(self
+            .scan_keys(&lo, &hi, false, usize::MAX)?
+            .into_iter()
+            .filter_map(|(k, v)| Some((crate::keep::target_of(&k)?, crate::keep::decode(&v)?)))
+            .collect())
+    }
+
     pub fn domains(&mut self) -> Result<Vec<String>> {
         let lo = schema_key("");
         let mut hi = lo.clone();
