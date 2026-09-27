@@ -269,6 +269,21 @@ fn site_id_of_link(link: &str) -> Option<[u8; 32]> {
     (site_text(&id) == link).then(|| *id)
 }
 
+/// A site this page could READ BACK (the TooLargeToSend of a site, src/writes.rs's kind): its web within
+/// `wire::MAX_SITE_WEB`, so the state the node answers -- the web behind the site's signed record -- is within the
+/// one bound a page reads. A larger one is refused by name, before anything is sent: its publication could never
+/// be read back, and would wait for ever.
+fn site_fits(app: &str, web: &[u8]) -> Result<(), String> {
+    if web.len() > wire::MAX_SITE_WEB {
+        return Err(format!(
+            "{app}'s site is {} bytes, over the {} a site's read-back can carry (wire::MAX_SITE_WEB): it could never be read back",
+            web.len(),
+            wire::MAX_SITE_WEB
+        ));
+    }
+    Ok(())
+}
+
 pub struct PageIo {
     pub server: Server,
     art: Artefacts,
@@ -760,6 +775,7 @@ impl PageIo {
         if self.read_only() {
             return Err("read-only: a reader publishes nothing".into());
         }
+        site_fits(app, &web)?;
         if self.art.register_params.is_empty() {
             return Err(NO_REGISTER_YET.into());
         }
@@ -791,6 +807,8 @@ impl PageIo {
         if self.publishes.get(app).is_some_and(|p| p.get().in_flight()) {
             return Err(format!("{app} is being published already"));
         }
+        // Refused BEFORE any piece is PUT: a site it could never read back would publish nothing.
+        site_fits(app, &web)?;
         // Nothing to PUT means no ack could ever send the site (Codex on #527, A): refused, never a publish stuck at
         // `pieces` that blocks every later one.
         if sets.is_empty() {
@@ -1146,6 +1164,22 @@ impl PageIo {
                 if id == self.register_id {
                     self.head_failed += 1;
                     self.sub(SubEvent::Refused);
+                }
+            }
+            // TOO LARGE TO READ IS AN ANSWER (rule 8; the builder's site re-asked for ever): a site's read-back ENDS its
+            // publication, named; any other GET is named (a head or a block is never near the bound).
+            Incoming::GetFailed { id, why: wire::GetFail::TooLarge { bytes } } => {
+                let said = |what: &str| format!("the node answered {what} with {bytes} bytes, over the {} this page reads (wire::MAX_REASSEMBLED)", wire::MAX_REASSEMBLED);
+                if let Some(app) = self.site_by_id(&id) {
+                    let said = said(&format!("{app}'s site read"));
+                    self.say(page::unusable::Site::of("page-io::said::site-too-large"), said.clone());
+                    self.server.node(Answer::SiteUnreadable { app, said }, now);
+                } else if id == self.register_id {
+                    self.say(page::unusable::Site::of("page-io::said::head-too-large"), said("the head's read"));
+                } else if self.by_contract.contains_key(&id) {
+                    self.say(page::unusable::Site::of("page-io::said::block-too-large"), said("a block's read"));
+                } else {
+                    self.say(page::unusable::Site::of("page-io::said::get-unasked"), "a GET answer for a contract this page never asked".into());
                 }
             }
             Incoming::GetFailed { id, why: wire::GetFail::NotFound } => {

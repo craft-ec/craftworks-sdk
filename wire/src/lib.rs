@@ -102,22 +102,27 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// single stream, let one sender hold about a gigabyte in a browser tab.
 pub const MAX_CHUNK: usize = freenet_stdlib::client_api::streaming::CHUNK_SIZE;
 
-/// The largest message this build will REASSEMBLE.
+/// The largest message this build will REASSEMBLE -- and DECODE, once reassembled: ONE bound for a whole message.
 ///
-/// Chosen from the largest legitimate reply rather than from what the format
-/// allows, which is the difference between a bound and a formality.
-///
-/// The biggest thing this client actually receives is an engine reply, and
-/// those are bounded by `protocol::MAX_MESSAGE` — 4 MiB — before the engine
-/// will encode one. Doubling it leaves room for the client-API envelope and
-/// for an engine that grows its own ceiling once without this becoming the
-/// thing that breaks.
-///
-/// stdlib's cap is 256 chunks ≈ 64 MiB, sized for a 50 MiB contract STATE.
-/// This client never asks for one: it talks to a delegate, and contract state
-/// reaches it as engine replies. So the tighter number is the true one, and
-/// using theirs would be accepting a bound for a case we do not have.
-pub const MAX_REASSEMBLED: usize = 8 * 1024 * 1024;
+/// stdlib's own cap, 256 chunks of its chunk size (64 MiB), sized for freenet's 50 MiB `MAX_STATE_SIZE`: a node
+/// never sends more, so a message it may send is one this page reads. It used to be 8 MiB ("this client never asks
+/// for a contract state"), and a reassembled message was then refused by the 4 MiB FRAME bound on decode -- but a
+/// page GETs contract states now: the builder's 5.9 MB site read back as `TooLarge`, discarded, and re-asked for ever
+/// (engineer1, from the page's own lines). A single FRAME keeps its own door ([`MAX_FRAME`]): a node chunks anything
+/// larger.
+pub const MAX_REASSEMBLED: usize = freenet_stdlib::client_api::streaming::MAX_TOTAL_CHUNKS as usize * MAX_CHUNK;
+
+/// Room in a whole message for a GET answer's envelope: its tags, its key and the state's length prefix (a GET's
+/// answer carries no contract code). Pinned against the stdlib's encoding by a test.
+pub const READ_ENVELOPE: usize = 64 * 1024;
+
+/// The largest contract STATE a GET's answer can carry and still be read ([`MAX_REASSEMBLED`] less the envelope). A
+/// writer refuses a state it could not read back (a site: [`MAX_SITE_WEB`]).
+pub const MAX_READ_STATE: usize = MAX_REASSEMBLED - READ_ENVELOPE;
+
+/// The largest site WEB part a publish may write: its read-back state is the web framed behind the site's signed
+/// record (`contract_keys::site::frame`), for which this leaves 64 KiB.
+pub const MAX_SITE_WEB: usize = MAX_READ_STATE - 64 * 1024;
 
 /// Why a GET that names its contract was not answered with a state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +133,9 @@ pub enum GetFail {
     /// The node refused the GET, in its cause's words. Says nothing about
     /// whether the contract exists: re-asked, never read as absent.
     Refused(String),
+    /// The node ANSWERED -- with a message of `bytes`, bigger than this page reads (rule 8: an answer, never a
+    /// silence re-asked for ever). The GET it answers is read from the message's HEAD ([`get_key_prefix`]).
+    TooLarge { bytes: usize },
 }
 
 /// What arrived, once it has been understood.
@@ -533,7 +541,7 @@ pub fn ws_url(host: &str, port: u16) -> Result<String, String> {
 /// not a message. `Partial` is that case, and it is not an error.
 pub fn unframe(r: &mut Reassembler, bytes: &[u8]) -> Incoming {
     if bytes.len() > MAX_FRAME {
-        return Incoming::Unusable(Unusable::TooLarge);
+        return too_large(bytes);
     }
     // A chunk first: a `StreamChunk` is a valid `HostResponse`, so decoding
     // has to happen before the shape is known.
@@ -565,6 +573,40 @@ pub fn unframe(r: &mut Reassembler, bytes: &[u8]) -> Incoming {
     classify(whole)
 }
 
+/// A message too large to read: the GET it answers, named from the message's head, or -- when its head names no
+/// GET -- unusable.
+fn too_large(bytes: &[u8]) -> Incoming {
+    match get_key_prefix(bytes) {
+        Some(id) => Incoming::GetFailed { id, why: GetFail::TooLarge { bytes: bytes.len() } },
+        None => Incoming::Unusable(Unusable::TooLarge),
+    }
+}
+
+/// The contract a GET's answer names, read from its HEAD: `Result::Ok`, `HostResponse::ContractResponse`,
+/// `ContractResponse::GetResponse`, its key, its contract option and its state's LENGTH -- everything the stdlib
+/// encodes before the state, never the state itself, however large. It names a GET only if that state length fills
+/// the rest of the message EXACTLY: a message of zeros (every first variant, a key of zeros) names nothing. `None` for
+/// anything else.
+pub fn get_key_prefix(bytes: &[u8]) -> Option<[u8; 32]> {
+    // The stdlib's own variant ORDER, first variant each (a test pins it against a real encoding).
+    #[derive(serde::Deserialize)]
+    enum Head {
+        Ok(Host),
+    }
+    #[derive(serde::Deserialize)]
+    enum Host {
+        ContractResponse(Contract),
+    }
+    #[derive(serde::Deserialize)]
+    enum Contract {
+        GetResponse { key: freenet_stdlib::prelude::ContractKey, _contract: Option<freenet_stdlib::prelude::ContractContainer>, state_len: u64 },
+    }
+    let mut at = std::io::Cursor::new(bytes);
+    let Head::Ok(Host::ContractResponse(Contract::GetResponse { key, _contract: _, state_len })) = bincode::deserialize_from::<_, Head>(&mut at).ok()?;
+    let head = usize::try_from(at.position()).ok()?;
+    (usize::try_from(state_len).ok()?.checked_add(head)? == bytes.len()).then(|| key.id().as_bytes().try_into().ok()).flatten()
+}
+
 /// Decode one complete message, turning a node's own error into the message
 /// it is.
 ///
@@ -573,6 +615,7 @@ pub fn unframe(r: &mut Reassembler, bytes: &[u8]) -> Incoming {
 fn decode_one(bytes: &[u8]) -> Result<HostResponse, Incoming> {
     match Reassembler::decode(bytes) {
         Ok(d) => Ok(d),
+        Err(Unusable::TooLarge) => Err(too_large(bytes)),
         // A GET refusal that names its contract: which GET it answers.
         Err(Unusable::NodeSaidNo) if get_refused(bytes).is_some() => {
             let (id, cause) = get_refused(bytes).expect("just checked");

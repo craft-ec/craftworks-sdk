@@ -315,6 +315,10 @@ pub enum Answer {
     NotSent { op: Op, why: String },
     /// The node refused a site's PUT, in its words (builder#117): the publication ENDS `Refused`.
     SiteRefused { app: String, said: String },
+    /// The node ANSWERED a site's read-back with a state this page cannot read (bigger than it reads, `wire`'s one
+    /// bound), in words: an answer (rule 8), so the publication ENDS `Refused` and the read is not asked again --
+    /// never a silence re-asked for ever.
+    SiteUnreadable { app: String, said: String },
 }
 
 /// Where an app's PUT ([`Op::PutApp`]) stands. It is re-sent on the RTO
@@ -1069,6 +1073,11 @@ impl Page {
             Answer::SiteRefused { app, said } => {
                 if self.answered(&Waiting::Update(Label::Site(app.clone()))).is_some() {
                     self.life_on(&Label::Site(app), Ev::NodeRefused(format!("the node refused the site's PUT: {said}")));
+                }
+            }
+            Answer::SiteUnreadable { app, said } => {
+                if self.answered(&Waiting::ReadBack(Label::Site(app.clone()))).is_some() {
+                    self.life_on(&Label::Site(app), Ev::NodeRefused(said));
                 }
             }
             Answer::AppPutOk(key) => {
