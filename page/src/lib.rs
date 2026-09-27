@@ -521,6 +521,23 @@ pub enum Publication {
 /// (the architect's attack on sdk#225).
 pub const HEAD_BACKSTOP_MS: u64 = 120_000;
 
+/// REPAIR's numbers (sdk#479): [`Page::repair_report`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Distinct blocks the node answered NotFound (members and parity).
+    pub missing: u64,
+    /// Repair PUTs the node ACKED: members rebuilt from their group, parity re-encoded (each block once).
+    pub put_back: u64,
+    /// Repair PUTs the node's Block contract refused, finally.
+    pub rejected: u64,
+    /// Groups a read could not solve (fewer than `k` anywhere).
+    pub given_up: u64,
+    /// Parity re-encoded to an id its parent does not list: never PUT.
+    pub parity_mismatched: u64,
+    /// Why the last group was given up.
+    pub why: Option<String>,
+}
+
 /// The NODE's answer to a block an audit pass asked (sdk#530): which passes it answers, and its verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditAnswer {
@@ -707,6 +724,10 @@ pub struct Page {
     /// Blocks rebuilt from their group and PUT back (sdk#303): sent like a commit's PUT, but answered for NO
     /// commit -- an answer confirms nothing a commit or a head waits on. Left when a commit puts the same block.
     repair_puts: BTreeSet<Cid>,
+    /// REPAIR's report (sdk#479): the blocks the node answered NotFound, and the repair PUTs it ACKED, each counted
+    /// once. [`Page::repair_report`] derives every number from these and the engine's counts.
+    missing_seen: BTreeSet<Cid>,
+    repairs_acked: BTreeSet<Cid>,
     /// Deadlines of the ops in flight, and each op to re-send.
     /// Every op in flight: when it is due again, the op to re-send, when it
     /// went out and on which attempt (Karn: only an attempt-1 answer samples).
@@ -839,6 +860,8 @@ impl Page {
             last_head: None,
             put_again: BTreeMap::new(),
             repair_puts: BTreeSet::new(),
+            missing_seen: BTreeSet::new(),
+            repairs_acked: BTreeSet::new(),
             deadlines: BTreeMap::new(),
             app_puts: BTreeMap::new(),
             rto: rto::Rto::default(),
@@ -1090,8 +1113,9 @@ impl Page {
                     return; // a second answer to a re-sent PUT
                 }
                 self.put_again.remove(&id);
-                // A repaired block's PUT is done: it confirms nothing (the architect's (b)).
+                // A repaired block's PUT is done: it confirms nothing (the architect's (b)); it is counted put back.
                 if self.repair_puts.contains(&id) {
+                    self.repairs_acked.insert(id);
                     return;
                 }
                 match self.path {
@@ -1158,6 +1182,7 @@ impl Page {
             }
             Answer::GetMissed(id) => {
                 if let Some(attempt) = self.answered_get(id) {
+                    self.missing_seen.insert(id);
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
                     // asked again on a backoff -- a node that has not got it
@@ -2272,6 +2297,15 @@ impl Page {
             .collect();
         for id in ended {
             self.drop_get(id);
+            // Its readers are SERVED from the held bytes, as the FetchBlock arm serves them (a LOCAL landing): ending the
+            // GET alone left a read that began waiting on the block after it was rebuilt parked for ever (sdk#479: a
+            // whole-tree read over a tree with lost blocks stalled on the member it had just rebuilt).
+            if self.engine.readers_of(&id).any() {
+                if let Some(bytes) = self.engine.blocks().get(&id).map(<[u8]>::to_vec) {
+                    let more = self.engine.step(Event::BlockLanded { id, bytes });
+                    self.carry_out(more);
+                }
+            }
         }
     }
 
@@ -2687,6 +2721,20 @@ impl Page {
     /// Repair PUTs the node's Block contract rejected (sdk#433), dropped.
     pub fn repairs_rejected(&self) -> u64 {
         self.repairs_rejected
+    }
+
+    /// REPAIR's numbers (sdk#479), since this page opened: what its reads found missing on the node, what it put back
+    /// (members rebuilt from their group, parity re-encoded) and the node acked, what the node refused, and the groups
+    /// no read could solve. Derived, never stored twice: the page's two sets and the engine's counts.
+    pub fn repair_report(&self) -> RepairReport {
+        RepairReport {
+            missing: self.missing_seen.len() as u64,
+            put_back: self.repairs_acked.len() as u64,
+            rejected: self.repairs_rejected,
+            given_up: self.engine.repair_counts().2,
+            parity_mismatched: self.engine.parity_counts().2,
+            why: self.engine.repair_failed().map(str::to_string),
+        }
     }
 
     /// Blocks the node's Block contract rejected (sdk#433): damaged, for the assets dashboard.

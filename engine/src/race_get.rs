@@ -23,7 +23,7 @@
 
 use crate::{Effect, Engine};
 use freenet_prolly::store::Blocks;
-use freenet_prolly::Cid;
+use freenet_prolly::{block_id, kind, Cid};
 use std::collections::BTreeSet;
 
 impl<B: Blocks> Engine<B> {
@@ -77,6 +77,40 @@ impl<B: Blocks> Engine<B> {
                 self.reads.fetches += 1;
                 self.step_asks.entry(slot).or_insert(false);
                 out.push(Effect::FetchBlock { id: slot, via: crate::read::Via::Direct, attempt: 0 });
+            }
+        }
+        out
+    }
+
+    /// PARITY PUT BACK (sdk#479, the owner via core dev): a parity block the node answered NotFound is re-encoded from
+    /// its group's `k` members, with the code the save uses (`parity::encode_group` over each member's `kind ‖ body`),
+    /// once the page holds them all -- and PUT only if it hashes to the id its parent lists (never a different block
+    /// under a listed id). A member not held yet leaves it owed: the scan that reads the group brings it.
+    pub(crate) fn put_owed_parity(&mut self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let owed: Vec<(Cid, crate::repair::Group)> = self.parity_owed.iter().map(|(c, g)| (*c, g.clone())).collect();
+        for (id, g) in owed {
+            let states: Option<Vec<Vec<u8>>> = g.slots[..g.k]
+                .iter()
+                .map(|m| {
+                    self.blocks.get(m).map(|b| {
+                        let mut st = Vec::with_capacity(1 + b.len());
+                        st.push(g.kind);
+                        st.extend_from_slice(b);
+                        st
+                    })
+                })
+                .collect();
+            let Some(states) = states else { continue };
+            self.parity_owed.remove(&id);
+            let Some(ix) = g.slots.iter().position(|s| *s == id) else { continue };
+            let encoded = freenet_prolly::parity::encode_group(&states).ok().and_then(|p| p.into_iter().nth(ix - g.k));
+            match encoded {
+                Some(bytes) if block_id(kind::PARITY, &bytes) == id => {
+                    self.parity_counts.1 += 1;
+                    out.push(Effect::PutRepaired { id, bytes });
+                }
+                _ => self.parity_counts.2 += 1,
             }
         }
         out
