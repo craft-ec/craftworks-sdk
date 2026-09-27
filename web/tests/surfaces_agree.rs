@@ -102,6 +102,11 @@ const TRANSPORT_ONLY: &[&str] = &[
     "site_link",
     "site_status",
     "cancel_site",
+    // AN APP PUBLISH (sdk#516): its load pieces PUT to the node and its site sent once every set is at k -- nothing an
+    // in-memory store has.
+    "publish_app",
+    "app_publish_status",
+    "cancel_app_publish",
     // WHOSE NODE: ask the node's signer which head it signs for, registering
     // nothing (a published app opens writable for its publisher). An
     // in-memory store has no node and no signer to ask.

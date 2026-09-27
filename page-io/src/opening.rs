@@ -651,19 +651,7 @@ mod tests {
         assert_eq!([n(Cell::Transition), n(Cell::Stays), n(Cell::Late), n(Cell::Impossible)], [15, 12, 11, 4], "a cell changed: OPENING.md table 2 and its counts change with it");
     }
 
-    /// A tiny seeded generator (no dependency).
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn pick(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-    }
+    use crate::seeded::Rng;
 
     /// What a REAL node may answer a page in `s`: only what is out (the first request, or the registration), a twin of
     /// an answer already given, a keyless refusal, or the socket's replacement. Never an answer to nothing.

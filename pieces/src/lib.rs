@@ -478,3 +478,33 @@ mod tests {
         );
     }
 }
+
+/// A PIECE SET as a published app names it (sdk#516's APP-PUBLISH, sdk#493's KEEPER §5 "Walk sources"): `k` data and
+/// `m` parity pieces, each by the ADDRESS its web container is served at and the sha256 of its bytes. ANY `k` of the
+/// `k + m` rebuild the bundle ([`join`]), so a set is REBUILDABLE once `k` of its pieces are on the network. The ONE
+/// type the publisher and the keeper read. Plain data: this crate stays hash-free, so the sha256 is the caller's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PieceSet {
+    /// Its name in the app's starter (`core`, `provisioning`).
+    pub name: String,
+    pub k: usize,
+    pub m: usize,
+    pub pieces: Vec<NamedPiece>,
+}
+
+/// One piece of a [`PieceSet`]: where it is served and what its bytes hash to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedPiece {
+    pub address: String,
+    pub sha256: [u8; 32],
+}
+
+impl PieceSet {
+    /// A set names exactly `k + m` pieces, with `k` at least 1: anything else is not a set a bundle rebuilds from.
+    pub fn check(&self) -> Result<(), String> {
+        if self.k == 0 || self.pieces.len() != self.k + self.m {
+            return Err(format!("piece set {}: {} pieces for k {} + m {}", self.name, self.pieces.len(), self.k, self.m));
+        }
+        Ok(())
+    }
+}

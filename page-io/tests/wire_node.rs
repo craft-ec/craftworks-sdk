@@ -2962,3 +2962,297 @@ fn a_sites_put_refusal_is_final_only_in_validation_words_keyed_or_keyless() {
         assert!(io.take_others().is_empty(), "{form}: the site's refusal was handed back as somebody else's");
     }
 }
+
+// ---- AN APP PUBLISH ON THE WIRE (sdk#516, APP-PUBLISH.md) ------------------------------------------------------------
+
+/// A piece set `tag` of `n` pieces (k, m), and its containers in the set's order.
+fn piece_set(tag: &str, n: usize, k: usize, m: usize) -> (pieces::PieceSet, Vec<(ContractContainer, WrappedState)>) {
+    let pieces: Vec<_> = (0..n).map(|i| wire::puts::contract(b"a piece's webapp code", format!("{tag} piece {i}").as_bytes(), format!("{tag} piece {i}'s state").as_bytes())).collect();
+    let set = pieces::PieceSet { name: tag.into(), k, m, pieces: pieces.iter().map(|(_, c, _)| pieces::NamedPiece { address: c.key().id().encode(), sha256: [0; 32] }).collect() };
+    (set, pieces.into_iter().map(|(_, c, s)| (c, s)).collect())
+}
+
+/// What the node does with one piece's PUT.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PieceFate {
+    Serve,
+    Withhold,
+    /// A FINAL refusal (the node's validation words, keyless).
+    Refuse,
+}
+
+/// Where an app's publish stands, by its case's name (`None`: never published).
+fn stage(io: &PageIo, app: &str) -> Option<String> {
+    io.app_publish(app).map(|a| format!("{a:?}").split([' ', '{']).next().unwrap_or_default().to_string())
+}
+
+/// Serve `io`'s frames until `done` or 400 rounds, each piece PUT by `fate` (a withheld one is kept and returned; a
+/// refused one refused once, finally), a site PUT withheld when `hold_site`. Returns the withheld piece frames and the
+/// piece acks served when the FIRST site PUT left.
+fn drive(io: &mut PageIo, node: &mut WireNode, now: &mut u64, fate: &dyn Fn(&ContractKey) -> Option<PieceFate>, hold_site: bool, done: &dyn Fn(&PageIo) -> bool) -> (Vec<Vec<u8>>, Option<usize>) {
+    let site = page_io::site_contract(SITE_CODE, &node.register_params, APP).expect("site").key();
+    let (mut acked, mut site_after, mut held, mut refused) = (0usize, None, Vec::new(), std::collections::HashSet::new());
+    for _ in 0..400 {
+        *now += 250;
+        io.tick(Ms(*now));
+        for f in io.take_frames() {
+            let req: ClientRequest = bincode::deserialize(&f).expect("a request");
+            if let ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) = &req {
+                let key = contract.key();
+                if key == site {
+                    site_after.get_or_insert(acked);
+                    if hold_site {
+                        continue;
+                    }
+                }
+                match fate(&key) {
+                    Some(PieceFate::Withhold) => {
+                        held.push(f);
+                        continue;
+                    }
+                    Some(PieceFate::Refuse) if refused.insert(key) => {
+                        io.inbound(&put_error_text(key.to_string(), wire::VALIDATION_REFUSED[1]), Ms(*now));
+                        continue;
+                    }
+                    Some(PieceFate::Serve | PieceFate::Refuse) => acked += 1,
+                    None => {}
+                }
+            }
+            if let Some(a) = node.serve(&f) {
+                io.inbound(&a, Ms(*now));
+            }
+        }
+        if done(io) {
+            break;
+        }
+    }
+    (held, site_after)
+}
+
+/// Serve the withheld frames now.
+fn release(io: &mut PageIo, node: &mut WireNode, now: u64, held: &[Vec<u8>]) {
+    for f in held {
+        if let Some(a) = node.serve(f) {
+            io.inbound(&a, Ms(now));
+        }
+    }
+}
+
+/// AN APP PUBLISH, P1 AND P2 ON THE WIRE: a set of k 3 + m 2 pieces whose node WITHHOLDS two piece acks (batch 7a's
+/// shape: the node held 2 of 50 piece PUTs ~118 s). The SITE's PUT is framed only after k acks (P1); the publish is
+/// PUBLISHED with pieces still owed (P2, the builder no longer waits for all of them); the withheld acks then make it
+/// BACKED_UP (P3). THE CONTROL: before k acks, no site PUT has left.
+#[test]
+fn an_app_publish_sends_its_site_only_at_k_and_is_published_before_every_piece_is_acked() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 5, 3, 2);
+    let withheld: Vec<ContractKey> = containers[3..].iter().map(|(c, _)| c.key()).collect();
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    assert_eq!(stage(&io, APP).as_deref(), Some("Pieces"));
+    let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
+    let (held, site_after) = drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("Published"));
+    assert_eq!(site_after, Some(3), "P1: the site's PUT did not leave exactly when the set reached k (it left after {site_after:?} piece acks)");
+    assert_eq!(stage(&io, APP).as_deref(), Some("Published"), "P2: not PUBLISHED with two pieces withheld: {:?}", io.app_publish(APP));
+    let lines = |io: &PageIo| io.app_publish(APP).map(|a| a.set_lines().into_iter().map(|l| (l.name, l.acked, l.refused, l.of, l.k)).collect::<Vec<_>>());
+    assert_eq!(lines(&io), Some(vec![("core".to_string(), 3, 0, 5, 3)]), "the set's acked/refused/of/k is not what the node answered");
+    assert_eq!(io.app_publish(APP).and_then(page_io::AppPublish::said), None, "a publish with nothing refused says something");
+    // The withheld acks arrive: BACKED_UP (P3).
+    release(&mut io, &mut node, now, &held[..2]);
+    assert_eq!(stage(&io, APP).as_deref(), Some("BackedUp"), "P3: every piece acked and not BACKED_UP: {:?}", io.app_publish(APP));
+    assert_eq!(io.impossible_cells(), 0);
+}
+
+/// **A SHARED piece is withdrawn only when NO publish owes it (the architect's R1).** Two apps of one build publish
+/// the SAME set; two of its pieces' PUTs are LOST (the node never answers those sends); one app's publish is
+/// CANCELLED -- its pieces must not be withdrawn from under the other, whose re-sends (rule 7) then land, and it
+/// reaches BACKED_UP. Mutant "withdraw every pending key" -> the lost PUTs are never sent again -> red.
+#[test]
+fn a_cancelled_publish_never_withdraws_a_piece_another_publish_owes() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 5, 3, 2);
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    let withheld: Vec<ContractKey> = keys[3..].to_vec();
+    const OTHER: &str = "tasks";
+    io.publish_app(APP, vec![(set.clone(), containers.clone())], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    io.publish_app(OTHER, vec![(set, containers)], SITE_CODE, web(2), Ms(now)).expect("the other app publishes");
+    let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
+    let (held, _) = drive(&mut io, &mut node, &mut now, &fate, false, &|io| [APP, OTHER].iter().all(|a| stage(io, a).as_deref() == Some("Published")));
+    assert_eq!((stage(&io, APP).as_deref(), stage(&io, OTHER).as_deref()), (Some("Published"), Some("Published")), "THE SETUP: both publishes were not PUBLISHED with pieces owed");
+    io.cancel_app_publish(APP);
+    assert_eq!(stage(&io, APP).as_deref(), Some("BackupAbandoned"));
+    // The withheld sends are LOST (never answered): only a re-send can land them.
+    drop(held);
+    let (_, _) = drive(&mut io, &mut node, &mut now, &|k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve), false, &|io| stage(io, OTHER).as_deref() == Some("BackedUp"));
+    assert_eq!(stage(&io, OTHER).as_deref(), Some("BackedUp"), "R1: the other app's publish lost its shared pieces to a cancel: {:?}", io.app_publish(OTHER));
+    assert_eq!(io.impossible_cells(), 0);
+}
+
+/// **THE TWO-APP MODEL (R1's gate)**: 60 seeded runs of two apps publishing ONE shared set, with a random pair of its
+/// pieces' sends LOST and the first app CANCELLED at a random stage (in Pieces, in Siting, once Published, or never).
+/// Served from then on, the second app is BACKED_UP in every run -- its re-sends land, because a cancel never
+/// withdraws a piece another publish owes. Reach floored on each cancel stage.
+#[test]
+fn the_two_app_model_never_withdraws_a_shared_piece_the_other_owes() {
+    const OTHER: &str = "tasks";
+    let mut reach = std::collections::BTreeMap::<&str, usize>::new();
+    for seed in 1..=60u64 {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n) as usize
+        };
+        let mut node = WireNode::new(&[3u8; 32]);
+        let mut io = page_io(&node);
+        let mut now = 1_000;
+        let (set, containers) = piece_set("core", 5, 3, 2);
+        let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+        let (w1, w2) = (next(5), next(5));
+        let withheld: Vec<ContractKey> = [keys[w1], keys[w2]].to_vec();
+        io.publish_app(APP, vec![(set.clone(), containers.clone())], SITE_CODE, web(1), Ms(now)).expect("publishes");
+        io.publish_app(OTHER, vec![(set, containers)], SITE_CODE, web(2), Ms(now)).expect("the other app publishes");
+        let at = ["Pieces", "Siting", "Published", "never"][next(4)];
+        let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
+        let (held, _) = if at == "Pieces" {
+            (Vec::new(), None)
+        } else {
+            drive(&mut io, &mut node, &mut now, &fate, at == "Siting", &|io| stage(io, APP).as_deref() == Some(if at == "never" { "Published" } else { at }))
+        };
+        let reached = at == "never" || stage(&io, APP).as_deref() == Some(at);
+        if at != "never" && reached {
+            io.cancel_app_publish(APP);
+            *reach.entry(at).or_default() += 1;
+        }
+        drop(held);
+        drive(&mut io, &mut node, &mut now, &|k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve), false, &|io| stage(io, OTHER).as_deref() == Some("BackedUp"));
+        assert_eq!(stage(&io, OTHER).as_deref(), Some("BackedUp"), "seed {seed} (cancel at {at}, reached {reached}): the other app's publish did not back up: {:?}", io.app_publish(OTHER));
+        assert_eq!(io.impossible_cells(), 0, "seed {seed}");
+    }
+    println!("two-app model: cancels by stage {reach:?}");
+    assert!(["Pieces", "Siting", "Published"].iter().all(|s| reach.get(s).copied().unwrap_or(0) >= 8), "the model's reach is below its floor: {reach:?}");
+}
+
+/// **A cancel of the SITE ends the publish too (the architect's R2)**: the site's PUT withheld, the Session's
+/// cancel_site -- the publish is `Cancelled`, never left `Siting` for an answer that cannot come.
+#[test]
+fn a_cancelled_site_ends_the_app_publish() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 3, 2, 1);
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    let fate = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
+    drive(&mut io, &mut node, &mut now, &fate, true, &|io| stage(io, APP).as_deref() == Some("Siting"));
+    assert_eq!(stage(&io, APP).as_deref(), Some("Siting"), "THE SETUP: the publish is not waiting on its site");
+    io.cancel_site(APP);
+    drive(&mut io, &mut node, &mut now, &fate, true, &|io| stage(io, APP).as_deref() != Some("Siting"));
+    assert_eq!(stage(&io, APP).as_deref(), Some("Cancelled"), "R2: a cancelled site left the publish {:?}", io.app_publish(APP));
+}
+
+/// **PUBLISHED with a piece FINALLY refused after k SAYS that BACKED_UP will not come (the architect's R4)**: its set
+/// line counts the refusal, and its words name it; the other pieces still ack. THE CONTROL: the same publish with
+/// nothing refused says nothing (the first test).
+#[test]
+fn a_refusal_after_k_says_backed_up_will_not_come() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 5, 3, 2);
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    let last = keys[4];
+    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    let fate = |k: &ContractKey| keys.contains(k).then(|| if *k == last { PieceFate::Refuse } else { PieceFate::Serve });
+    drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("Published") && io.app_publish(APP).is_some_and(|a| a.set_lines().iter().any(|l| l.acked == 4 && l.refused == 1)));
+    let a = io.app_publish(APP).expect("a publish");
+    assert_eq!(stage(&io, APP).as_deref(), Some("Published"), "a refusal after k ended the publish: {a:?}");
+    assert_eq!(a.set_lines().into_iter().map(|l| (l.acked, l.refused, l.of)).collect::<Vec<_>>(), vec![(4, 1, 5)]);
+    assert!(a.said().is_some_and(|w| w.contains("BACKED_UP will not come") && w.contains("core")), "R4: a PUBLISHED publish with a refused piece does not say BACKED_UP won't come: {:?}", a.said());
+}
+
+/// **A publish with NO piece set is refused by name** (Codex on #527, A): with nothing to PUT, no ack could ever send
+/// its site, and it would sit at `pieces` for ever, blocking every later publish of the app.
+#[test]
+fn a_publish_with_no_piece_set_is_refused() {
+    let node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let e = io.publish_app(APP, Vec::new(), SITE_CODE, web(1), Ms(1)).expect_err("a publish with no set was taken");
+    assert!(e.contains("names no piece set"), "{e}");
+    assert!(io.app_publish(APP).is_none(), "a refused publish left a state behind");
+}
+
+/// **While an app publish is in flight, the site's DIRECT door refuses** (Codex on #527, B): a `publish_site` through
+/// the old door would replace the publication the machine is waiting on, and the machine -- matching by app -- would
+/// report ITS publish at the other one's version. The machine's own SendSite is not that door.
+#[test]
+fn a_direct_site_publish_is_refused_while_an_app_publish_is_in_flight() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 3, 2, 1);
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    let e = io.publish_site(APP, SITE_CODE, web(7), Ms(now)).expect_err("a direct publish_site was taken while the app publish was in Pieces");
+    assert!(e.contains("being published"), "{e}");
+    let fate = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
+    drive(&mut io, &mut node, &mut now, &fate, true, &|io| stage(io, APP).as_deref() == Some("Siting"));
+    assert_eq!(stage(&io, APP).as_deref(), Some("Siting"), "THE SETUP: the publish is not waiting on its site");
+    assert!(io.publish_site(APP, SITE_CODE, web(7), Ms(now)).is_err(), "a direct publish_site replaced the site the machine waits on");
+    drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
+    assert_eq!(stage(&io, APP).as_deref(), Some("BackedUp"));
+    assert_eq!(node.site().map(|(_, value, _)| value), Some(blake3::hash(&web(1)).as_bytes().to_vec()), "the live site is not the app publish's own");
+}
+
+/// **A REPUBLISH does not leave the last publish's owed pieces retrying for ever** (Codex on #527, C): v1 is PUBLISHED
+/// with a piece whose send was LOST; v2 names other pieces. v1's owed piece, needed by no publish now, is withdrawn:
+/// it is never sent again. Mutant "a replaced publish's owed pieces are left alone" -> it is re-sent on its RTO -> red.
+#[test]
+fn a_republish_withdraws_the_last_publishs_pieces_nobody_owes() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set1, c1) = piece_set("v1", 3, 2, 1);
+    let lost = c1[2].0.key();
+    let k1: Vec<ContractKey> = c1.iter().map(|(c, _)| c.key()).collect();
+    io.publish_app(APP, vec![(set1, c1)], SITE_CODE, web(1), Ms(now)).expect("v1 publishes");
+    let fate1 = |k: &ContractKey| k1.contains(k).then(|| if *k == lost { PieceFate::Withhold } else { PieceFate::Serve });
+    let (held, _) = drive(&mut io, &mut node, &mut now, &fate1, false, &|io| stage(io, APP).as_deref() == Some("Published"));
+    assert_eq!(stage(&io, APP).as_deref(), Some("Published"), "THE SETUP: v1 is not PUBLISHED with a piece owed");
+    assert!(!held.is_empty(), "THE SETUP: v1's piece was never sent");
+    let (set2, c2) = piece_set("v2", 3, 2, 1);
+    let k2: Vec<ContractKey> = c2.iter().map(|(c, _)| c.key()).collect();
+    io.publish_app(APP, vec![(set2, c2)], SITE_CODE, web(2), Ms(now)).expect("v2 publishes");
+    let resent = std::cell::Cell::new(0usize);
+    let fate2 = |k: &ContractKey| {
+        if *k == lost {
+            resent.set(resent.get() + 1);
+            return Some(PieceFate::Withhold);
+        }
+        k2.contains(k).then_some(PieceFate::Serve)
+    };
+    drive(&mut io, &mut node, &mut now, &fate2, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
+    assert_eq!(stage(&io, APP).as_deref(), Some("BackedUp"), "THE SETUP: v2 did not back up");
+    now += 600_000;
+    drive(&mut io, &mut node, &mut now, &fate2, false, &|_| false);
+    assert_eq!(resent.get(), 0, "v1's owed piece, needed by nobody, kept being re-sent after the republish");
+}
+
+/// **A publish names each piece ONCE**: a set naming an address another piece of the publish names is refused by
+/// name (an answer is marked in one set only, so the other would never be).
+#[test]
+fn a_publish_naming_a_piece_twice_is_refused() {
+    let node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let (a, ca) = piece_set("core", 3, 2, 1);
+    let (mut b, mut cb) = piece_set("prov", 3, 2, 1);
+    b.pieces[0] = a.pieces[0].clone();
+    cb[0] = ca[0].clone();
+    let e = io.publish_app(APP, vec![(a, ca), (b, cb)], SITE_CODE, web(1), Ms(1)).expect_err("a duplicate address was taken");
+    assert!(e.contains("another piece of this publish names too"), "{e}");
+}

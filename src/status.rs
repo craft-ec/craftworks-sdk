@@ -60,6 +60,23 @@ vocabulary! {
 }
 
 vocabulary! {
+    /// Where an app's PUBLISH stands (`Session::app_publish_status`'s `state`, sdk#516; APP-PUBLISH.md): PUBLISHED at
+    /// the site's read-back, BACKED_UP at every piece.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AppPublishStatus {
+        None => "none",
+        Pieces => "pieces",
+        Siting => "siting",
+        Published => "published",
+        BackedUp => "backed_up",
+        BackupAbandoned => "backup_abandoned",
+        Refused => "refused",
+        Superseded => "superseded",
+        Cancelled => "cancelled",
+    }
+}
+
+vocabulary! {
     /// May this session write a head (`Session::can_write`'s `answer`)?
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum CanWrite {
@@ -81,7 +98,7 @@ vocabulary! {
     }
 }
 
-/// Every list, as the JSON `status_words` exports: `{"rowState":[..], "putStatus":[..], "siteStatus":[..],
+/// Every list, as the JSON `status_words` exports: `{"rowState":[..], "putStatus":[..], "siteStatus":[..], "appPublishStatus":[..],
 /// "canWrite":[..], "asked":[..]}`.
 pub fn words() -> serde_json::Value {
     fn list<T: Copy>(all: &[T], code: fn(T) -> &'static str) -> Vec<&'static str> {
@@ -91,6 +108,7 @@ pub fn words() -> serde_json::Value {
         "rowState": list(&RowState::ALL, RowState::code),
         "putStatus": list(&PutStatus::ALL, PutStatus::code),
         "siteStatus": list(&SiteStatus::ALL, SiteStatus::code),
+        "appPublishStatus": list(&AppPublishStatus::ALL, AppPublishStatus::code),
         "canWrite": list(&CanWrite::ALL, CanWrite::code),
         "asked": list(&AskedState::ALL, AskedState::code),
     })
@@ -105,10 +123,11 @@ mod tests {
     #[test]
     fn words_is_every_enum_s_all_each_word_once() {
         let v = words();
-        let want: [(&str, Vec<&str>); 5] = [
+        let want: [(&str, Vec<&str>); 6] = [
             ("rowState", RowState::ALL.iter().map(|w| w.code()).collect()),
             ("putStatus", PutStatus::ALL.iter().map(|w| w.code()).collect()),
             ("siteStatus", SiteStatus::ALL.iter().map(|w| w.code()).collect()),
+            ("appPublishStatus", AppPublishStatus::ALL.iter().map(|w| w.code()).collect()),
             ("canWrite", CanWrite::ALL.iter().map(|w| w.code()).collect()),
             ("asked", AskedState::ALL.iter().map(|w| w.code()).collect()),
         ];
