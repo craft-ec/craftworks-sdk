@@ -100,6 +100,7 @@ const TRANSPORT_ONLY: &[&str] = &[
     // store has no node and no signer.
     "publish_site",
     "follow_site",
+    "set_head_floor",
     "site_link",
     "site_status",
     "cancel_site",

@@ -752,6 +752,16 @@ impl PageIo {
     /// read from the network. A commit signed or in flight, or one that is
     /// later Lost, never moves it -- so a publisher that records it (an app's
     /// published-head floor, sdk#349) names a head that exists. 0: none.
+    /// A REOPENED PUBLISHED project's head FLOOR (sdk#543, the architect): its head exists at `seq` or later.
+    ///
+    /// By TYPE (OPENING.md Machine 2's `Floored`): a head NotFound is then "not yet", re-read on the backoff -- the signer's
+    /// record query (framed as a Sign) is never asked, so a reopen sends no Sign (P7). Set BEFORE the page opens.
+    pub fn set_head_floor(&mut self, seq: u64) {
+        self.server.page.set_head_floor(seq);
+        let now = self.server.page.now();
+        self.head(HeadEvent::Floor, now);
+    }
+
     pub fn published_seq(&self) -> u64 {
         self.server.page.published().0
     }

@@ -473,6 +473,11 @@ impl WireNode {
                 let mut values = Vec::new();
                 for m in inbound {
                     if let InboundDelegateMsg::ApplicationMessage(am) = m {
+                        // A SIGN request (a real sign, or the record query framed as one): counted by kind, so a
+                        // test can tell a page's setup (a Register query) from anything that signs.
+                        if matches!(signer_proto::decode_request(&am.payload), Some((_, signer_proto::Request::Sign { .. }))) {
+                            *self.served.entry("sign request").or_default() += 1;
+                        }
                         let served = signer::serve_full(&mut Host(self), &am.payload, signer::Origin::Local);
                         values.push(OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(signer::reply(&served))));
                     }
@@ -2523,6 +2528,42 @@ fn a_reopen_follows_the_site_and_sends_nothing_but_reads() {
     let before = node.served.clone();
     assert_eq!(publish(&mut io, &mut node, &mut now, 3), Some(page::Publication::Published { version: 3 }));
     assert!(node.served.get("put site") > before.get("put site") && node.served.get("signer") > before.get("signer"), "THE CONTROL: a publish was not counted: {:?}", node.served);
+}
+
+/// **A REOPEN SENDS NO SIGN, COUNTED FROM PAGE OPEN, OVER A NODE THAT ANSWERS THE HEAD NotFound FIRST** (Codex on
+/// #543, 1; the architect: a reopened PUBLISHED project knows its head exists, so a head NotFound is "not yet" --
+/// re-read on the backoff, never the signer's record query, which is framed as a Sign). The person's head exists (a
+/// row written); a lagging node answers the reopening page's head GETs NotFound twice; the page opens with its head
+/// FLOOR (the published seq) and follows the site. From BEFORE the open to the follow's answer, the node is asked for
+/// no Sign of any kind. THE CONTROL: the same reopen WITHOUT the floor is exactly Codex's defect -- a Sign goes out.
+#[test]
+fn a_reopen_sends_no_sign_even_when_the_node_answers_its_head_not_found_first() {
+    let reopen = |floor: bool| {
+        let mut node = WireNode::new(&[3u8; 32]);
+        let mut now = 1_000;
+        let mut first = page_io(&node);
+        client(&mut first, &mut node, &mut now, &Request::Identity);
+        assert!(states(&client(&mut first, &mut node, &mut now, &write(1, "k1", "v")), 1).contains(&WriteState::Published), "THE SETUP: the head was not written");
+        publish(&mut first, &mut node, &mut now, 1);
+        let seq = first.published_seq();
+        let signs = node.served.get("sign request").copied().unwrap_or(0);
+        // A LAGGING node: the reopening page's first head reads are answered NotFound.
+        node.fail_register_gets = 2;
+        let mut io = page_io(&node);
+        if floor {
+            io.set_head_floor(seq);
+        }
+        client(&mut io, &mut node, &mut now, &Request::Identity);
+        io.follow_site(APP, SITE_CODE, Ms(now)).expect("follows");
+        settle(&mut io, &mut node, &mut now);
+        (node.served.get("sign request").copied().unwrap_or(0) - signs, io.publication(APP), node.fail_register_gets)
+    };
+    let (signs, publication, left) = reopen(true);
+    assert_eq!(left, 0, "THE SETUP: the node never answered the head NotFound");
+    assert_eq!(signs, 0, "P7: a reopen asked the signer to sign (the record query) over a head NotFound");
+    assert_eq!(publication, Some(page::Publication::Published { version: 1 }), "the reopen did not follow the site");
+    let (without, _, _) = reopen(false);
+    assert!(without > 0, "THE CONTROL: without its floor the reopen sent no Sign either, so this proves nothing");
 }
 
 /// **A FOLLOWED SITE'S PUSH IS TAKEN, AND DECODED AS A SITE (Codex on #543, 2 and 3).** A reopen follows the site at

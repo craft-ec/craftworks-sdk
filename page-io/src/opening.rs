@@ -354,6 +354,10 @@ pub(crate) enum HeadKnown {
     HasRecord,
     /// A READER's head: assumed to exist because someone named it; nobody said so.
     Named,
+    /// A REOPENED PUBLISHED project's head (sdk#543, the architect): it exists at a published floor, so a NotFound is
+    /// "not yet" (the page re-reads it on the backoff) and the signer's record query -- framed as a Sign -- is never
+    /// asked: no cell from here emits `AskRecord` (P7, by type).
+    Floored,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,12 +371,22 @@ pub(crate) enum HeadEvent {
     /// The record query's answer: has a record, has none, or neither.
     Record(Option<bool>),
     Reconnected,
+    /// The page is told its head exists at a published floor (a reopen, `PageIo::set_head_floor`).
+    Floor,
 }
 
 impl HeadEvent {
     #[cfg(test)]
-    pub(crate) const ALL: [HeadEvent; 7] =
-        [HeadEvent::Got, HeadEvent::PutAcked, HeadEvent::NotFound, HeadEvent::Record(Some(false)), HeadEvent::Record(Some(true)), HeadEvent::Record(None), HeadEvent::Reconnected];
+    pub(crate) const ALL: [HeadEvent; 8] = [
+        HeadEvent::Got,
+        HeadEvent::PutAcked,
+        HeadEvent::NotFound,
+        HeadEvent::Record(Some(false)),
+        HeadEvent::Record(Some(true)),
+        HeadEvent::Record(None),
+        HeadEvent::Reconnected,
+        HeadEvent::Floor,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,13 +401,13 @@ pub(crate) enum HeadEffect {
 
 impl HeadKnown {
     #[cfg(test)]
-    pub(crate) const ALL: [HeadKnown; 6] = [HeadKnown::Unknown, HeadKnown::AskingRecord, HeadKnown::Seen, HeadKnown::NoRecord, HeadKnown::HasRecord, HeadKnown::Named];
+    pub(crate) const ALL: [HeadKnown; 7] = [HeadKnown::Unknown, HeadKnown::AskingRecord, HeadKnown::Seen, HeadKnown::NoRecord, HeadKnown::HasRecord, HeadKnown::Named, HeadKnown::Floored];
 
     /// Does the Register exist on the node (a head goes out as an UPDATE, not the PUT that creates it)?
     pub(crate) fn seen(self) -> bool {
         match self {
             HeadKnown::Seen => true,
-            HeadKnown::Unknown | HeadKnown::AskingRecord | HeadKnown::NoRecord | HeadKnown::HasRecord | HeadKnown::Named => false,
+            HeadKnown::Unknown | HeadKnown::AskingRecord | HeadKnown::NoRecord | HeadKnown::HasRecord | HeadKnown::Named | HeadKnown::Floored => false,
         }
     }
 
@@ -405,14 +419,17 @@ impl HeadKnown {
         let stay = |c| (self, Vec::new(), c);
         match (self, ev) {
             (S::Seen, E::Got | E::PutAcked) => stay(Cell::Stays),
-            (S::Unknown | S::AskingRecord | S::NoRecord | S::HasRecord | S::Named, E::Got) => (S::Seen, vec![], Cell::Transition),
-            (S::Unknown | S::AskingRecord | S::NoRecord | S::HasRecord, E::PutAcked) => (S::Seen, vec![], Cell::Transition),
+            (S::Unknown | S::AskingRecord | S::NoRecord | S::HasRecord | S::Named | S::Floored, E::Got) => (S::Seen, vec![], Cell::Transition),
+            (S::Unknown | S::AskingRecord | S::NoRecord | S::HasRecord | S::Floored, E::PutAcked) => (S::Seen, vec![], Cell::Transition),
             (S::Named, E::PutAcked) => stay(Cell::Impossible),
             (S::Unknown, E::NotFound) => (S::AskingRecord, vec![F::AskRecord], Cell::Transition),
             // One record ask is out; the head read is re-sent on its RTO.
             (S::AskingRecord, E::NotFound) => stay(Cell::Stays),
             // The head exists (or someone named it, or the signer holds a record): F55's false NotFound, silence.
             (S::Seen | S::HasRecord | S::Named, E::NotFound) => stay(Cell::Stays),
+            // A reopened project's head exists at its floor: a NotFound is a lagging node's, "not yet" -- the head read
+            // is re-sent on its RTO (the page's floor rule parks it), and the record query is NEVER asked.
+            (S::Floored, E::NotFound) => stay(Cell::Stays),
             // "None" was a SNAPSHOT: another tab or device may have created the Register since. Ask the signer again
             // (a cheap local answer) rather than repeat a stale "no head" and create over an existing Register (H1;
             // the architect on sdk#499). The read is still answered: AskingRecord answers on the record's reply.
@@ -424,12 +441,18 @@ impl HeadKnown {
             (S::AskingRecord, E::Record(None)) => (S::Unknown, vec![], Cell::Transition),
             (S::NoRecord, E::Record(Some(true))) => (S::HasRecord, vec![F::Contradicted], Cell::Transition),
             (S::Seen | S::HasRecord, E::Record(_)) | (S::NoRecord, E::Record(Some(false) | None)) => stay(Cell::Late),
+            // A record query sent before the floor was known: its answer is late.
+            (S::Floored, E::Record(_)) => stay(Cell::Late),
             // Asked once, then undecided (D2's cell): the first ask's twin may still arrive.
             (S::Unknown, E::Record(_)) => stay(Cell::Late),
             // A reader never asks the signer anything.
             (S::Named, E::Record(_)) => stay(Cell::Impossible),
             // The record query, if out, is re-sent on its RTO; the head exists or not whatever the socket did.
-            (S::Unknown | S::AskingRecord | S::Seen | S::NoRecord | S::HasRecord | S::Named, E::Reconnected) => stay(Cell::Stays),
+            (S::Unknown | S::AskingRecord | S::Seen | S::NoRecord | S::HasRecord | S::Named | S::Floored, E::Reconnected) => stay(Cell::Stays),
+            // THE FLOOR: a head not yet known to exist becomes Floored (a record query out is answered late); one known
+            // to exist, or a reader's, stays as it is.
+            (S::Unknown | S::AskingRecord | S::NoRecord, E::Floor) => (S::Floored, vec![], Cell::Transition),
+            (S::Seen | S::HasRecord | S::Named | S::Floored, E::Floor) => stay(Cell::Stays),
         }
     }
 }
@@ -648,7 +671,13 @@ mod tests {
         }
         println!("{counts:?}");
         let n = |c| counts.get(&c).copied().unwrap_or(0);
-        assert_eq!([n(Cell::Transition), n(Cell::Stays), n(Cell::Late), n(Cell::Impossible)], [15, 12, 11, 4], "a cell changed: OPENING.md table 2 and its counts change with it");
+        assert_eq!([n(Cell::Transition), n(Cell::Stays), n(Cell::Late), n(Cell::Impossible)], [20, 18, 14, 4], "a cell changed: OPENING.md table 2 and its counts change with it");
+        // P7 BY TYPE (sdk#543, the architect): no cell of a FLOORED head -- a reopened published project's -- asks the
+        // signer's record query (framed as a Sign), whatever the event.
+        for ev in HeadEvent::ALL {
+            let (_, effects, _) = HeadKnown::Floored.step(ev);
+            assert!(!effects.contains(&HeadEffect::AskRecord), "Floored x {ev:?} asks the signer's record query");
+        }
     }
 
     use crate::seeded::Rng;

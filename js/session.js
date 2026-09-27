@@ -67,6 +67,9 @@ export async function openSession(Session, {
   // their own tree is not created until they have something to write
   // (builder#104). The artefacts are still used — `tree` needs the Block code.
   provision = true,
+  // A REOPEN's head floor (sdk#543): the published head's seq, given to the session BEFORE provisioning. Only
+  // `reopen()` passes it (and requires it); `undefined` is an ordinary open.
+  headFloor = undefined,
   // THE APP this session is (the forest ruling): a person's one tree is
   // divided by app, and every domain name here is relative to this app — it
   // has no name for another app's data and cannot write it. `open()` requires
@@ -162,6 +165,8 @@ export async function openSession(Session, {
     blockCode = block;
     // "ask": only ASK this node's signer whose it is (`openAsked`) —
     // nothing registered, minted or provisioned.
+    // A REOPEN's head floor (sdk#543), BEFORE the page is built: it then never asks the signer's record query.
+    if (provision !== "ask" && headFloor !== undefined) session.set_head_floor(headFloor);
     if (provision === "ask") session.ask_signer(signer, block, register);
     else session.provision(signer, block, register);
   }
@@ -629,11 +634,16 @@ export async function open(Session, opts = {}) {
  * answers, then `published` at the version it shows (and a newer one from another device), never "absent" for a
  * NotFound. A refusal of the follow (e.g. a bad app id) closes the session and is thrown, in its words.
  */
-export async function reopen(Session, { siteCode, ...opts } = {}) {
+export async function reopen(Session, { siteCode, headFloor, ...opts } = {}) {
   if (!(siteCode instanceof Uint8Array) || siteCode.length === 0) {
     throw new Error("reopen() needs { siteCode }: the site contract's code names which site is followed");
   }
-  const handle = await open(Session, opts);
+  // NO DEFAULT (builder#73): a reopened PUBLISHED project knows its head exists -- its published head's seq -- and
+  // without it a lagging node's head NotFound would send the signer's record query, a Sign (P7; Codex on sdk#543).
+  if (!Number.isInteger(headFloor) || headFloor < 1) {
+    throw new Error("reopen() needs { headFloor }: the published head's seq -- a reopen knows its head exists, and must never sign");
+  }
+  const handle = await open(Session, { ...opts, headFloor });
   try {
     handle.followSite(opts.app, siteCode);
   } catch (e) {

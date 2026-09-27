@@ -60,6 +60,9 @@ pub struct Session {
     bound: craftworks_sdk::LiveBindings,
     /// The SIGNER delegate's wasm, handed in with [`Session::provision`].
     signer_code: Vec<u8>,
+    /// A REOPEN's head floor (sdk#543), handed in BEFORE provisioning and TAKEN by it: the page it builds starts
+    /// knowing its head exists (`PageIo::set_head_floor`). A pending input, never a second copy.
+    head_floor: Option<u64>,
     /// `Identity` sent to the in-page server once the signer is provisioned.
     page_identity_sent: bool,
     /// The signer's provisioning was reported by `take_progress`.
@@ -109,6 +112,7 @@ impl Session {
             bound: craftworks_sdk::LiveBindings::default(),
             app: None,
             signer_code: Vec::new(),
+            head_floor: None,
             page_identity_sent: false,
             provision_told: false,
             loader: None,
@@ -523,6 +527,21 @@ impl Session {
         self.pump_page();
     }
 
+    /// A REOPENED PUBLISHED project's head FLOOR (sdk#543, the architect): its head exists at `seq` (the published
+    /// head's seq, a whole number a JS number holds) or later. Given BEFORE `provision`, so the page it builds treats a
+    /// head NotFound as a lagging node's "not yet" -- re-read on the backoff -- and never asks the signer's record query
+    /// (framed as a Sign): a reopen sends no Sign (P7). Refused by name after the page exists, or for a floor of 0.
+    pub fn set_head_floor(&mut self, seq: f64) -> Result<(), JsValue> {
+        if self.page().is_some() {
+            return Err(JsValue::from_str("set_head_floor: give the floor BEFORE provisioning -- the page is already open"));
+        }
+        if !(seq >= 1.0 && seq.fract() == 0.0 && seq <= u64::MAX as f64) {
+            return Err(JsValue::from_str(&format!("set_head_floor: a published head's seq is a whole number >= 1, not {seq}")));
+        }
+        self.head_floor = Some(seq as u64);
+        Ok(())
+    }
+
     /// [`Session::ask_signer`]'s answer, as JSON:
     /// `{"state":"pending"|"register"|"nokey"|"nosigner"|"refused","register":"<hex>","said":"…"}`.
     pub fn asked(&self) -> String {
@@ -563,6 +582,10 @@ impl Session {
             page::server::SignerFacts::default(),
         );
         let mut io = page_io::PageIo::new(server, art);
+        // A REOPEN's floor, before the page opens: a head NotFound is then "not yet", never the record query (P7).
+        if let Some(seq) = self.head_floor.take() {
+            io.set_head_floor(seq);
+        }
         io.begin(container);
         self.db.store_mut().set_host(io);
         self.pump_page();

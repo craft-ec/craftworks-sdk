@@ -15,7 +15,7 @@ const t = async (name, fn) => {
 const tick = (r, ms) => setTimeout(r, 0);
 
 /** A session that is provisioned after `after` polls, or refuses, or never is. */
-function FakeSession({ after = 3, refuse = "", follows = [], followRefuses = "" } = {}) {
+function FakeSession({ after = 3, refuse = "", follows = [], followRefuses = "", floors = [] } = {}) {
   let polls = 0;
   return function () {
     return {
@@ -26,6 +26,7 @@ function FakeSession({ after = 3, refuse = "", follows = [], followRefuses = "" 
       not_answering: () => JSON.stringify({ what: "the signer", ms: polls * 100 }),
       polls: () => polls,
       // sdk#520: the follow, recorded with how many provisioning polls had passed when it was asked.
+      set_head_floor: seq => { floors.push({ seq, atPoll: polls }); },
       follow_site: (app, code) => {
         if (followRefuses) throw new Error(followRefuses);
         follows.push({ app, code: [...code], atPoll: polls });
@@ -130,7 +131,9 @@ const SITE_CODE = new Uint8Array([5, 6, 7]);
 
 await t("**reopen() follows the app's site ONCE, only after open() says provisioned**, and hands back the session", async () => {
   const follows = [];
-  const h = await reopen(FakeSession({ after: 3, follows }), deps({ siteCode: SITE_CODE }));
+  const floors = [];
+  const h = await reopen(FakeSession({ after: 3, follows, floors }), deps({ siteCode: SITE_CODE, headFloor: 4 }));
+  assert.deepEqual(floors, [{ seq: 4, atPoll: 0 }], "the head floor was not given to the session BEFORE provisioning (it must precede the page)");
   assert.deepEqual(follows.map(f => [f.app, f.code]), [["test-app", [5, 6, 7]]], "not exactly one follow of this app's site under its code");
   assert.ok(follows[0].atPoll > 3, `the follow was asked at poll ${follows[0].atPoll}, before the node was provisioned`);
   assert.ok(h.db && h.session, "reopen did not hand back the opened session");
@@ -143,9 +146,15 @@ await t("**reopen() with no siteCode is refused BY NAME before anything opens**"
   assert.equal(connected, 0, "reopen() connected before refusing a missing siteCode");
 });
 
+await t("**reopen() with no headFloor is refused BY NAME before anything opens** (Codex on sdk#543: without it a lagging node's head NotFound would send a Sign)", async () => {
+  let connected = 0;
+  await assert.rejects(() => reopen(FakeSession(), deps({ siteCode: SITE_CODE, connect: () => { connected += 1; return { pump() {}, close() {} }; } })), /needs \{ headFloor \}/);
+  assert.equal(connected, 0, "reopen() connected before refusing a missing headFloor");
+});
+
 await t("**a refused follow CLOSES the session and is thrown in its words** (never a half-open reopen)", async () => {
   deps.closed = 0;
-  await assert.rejects(() => reopen(FakeSession({ after: 0, followRefuses: "no site for \"x\": not an app id" }), deps({ siteCode: SITE_CODE })), /not an app id/);
+  await assert.rejects(() => reopen(FakeSession({ after: 0, followRefuses: "no site for \"x\": not an app id" }), deps({ siteCode: SITE_CODE, headFloor: 1 })), /not an app id/);
   assert.equal(deps.closed, 1, "the session of a refused follow was left open");
 });
 
