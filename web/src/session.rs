@@ -306,6 +306,42 @@ impl Session {
         Ok(craftworks_sdk::Db::<Store, SystemEnv>::watch_key(domain, Some(&p)))
     }
 
+    /// THE DEFINITION'S LIVE WATCH (§19 P3): the reserved domain `which` ("draft" | "app") of this session's app,
+    /// bound as a LIVE watch key, so a head move that changes it is named by [`Session::take_stale`] like any bound
+    /// domain. The name rule refuses a READ of the reserved name (`bind` would silently bind nothing, or the wrong
+    /// key), so the key is built here from the `SystemDomain`, by type. Returns the key as `take_stale` names it --
+    /// opaque to JavaScript, which never spells the name. Refused by name when it cannot be watched.
+    pub fn bind_definition(&mut self, which: &str) -> Result<String, JsValue> {
+        let key = self.definition_watch(which)?;
+        let named = self
+            .own_name(key.stored())
+            .map(|n| n.as_str().to_string())
+            .ok_or_else(|| db_err(&DbError::Refused(format!("the `{which}` definition of this session's app cannot be watched"))))?;
+        self.bound.bind(key);
+        Ok(named)
+    }
+
+    /// The definition watch `which` has just SHOWN what the `definition(which)` read in this same call answered (as
+    /// [`Session::rendered`] for a domain).
+    pub fn rendered_definition(&mut self, which: &str) -> Result<(), JsValue> {
+        let key = self.definition_watch(which)?;
+        let root = self.db.store().answered_at();
+        self.bound.rendered(&key, root);
+        Ok(())
+    }
+
+    pub fn unbind_definition(&mut self, which: &str) -> Result<(), JsValue> {
+        let key = self.definition_watch(which)?;
+        self.bound.unbind(&key);
+        Ok(())
+    }
+
+    fn definition_watch(&self, which: &str) -> Result<craftworks_sdk::live_bindings::WatchKey, JsValue> {
+        let which = definition_of(which).map_err(|e| db_err(&e))?;
+        let name = craftworks_sdk::Db::<Store, SystemEnv>::definition_domain(self.app.as_deref(), which);
+        Ok(craftworks_sdk::live_bindings::WatchKey::of(craftworks_sdk::app::StoredName::of_tree(name)))
+    }
+
     pub fn unbind(&mut self, domain: &str) {
         if let Ok(key) = self.read_name(domain) {
             self.bound.unbind(&craftworks_sdk::live_bindings::WatchKey::of(key));

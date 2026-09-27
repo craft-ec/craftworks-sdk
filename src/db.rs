@@ -433,6 +433,13 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     /// parent's band of it (craftworks-sdk#137). A string, so it can cross to
     /// JavaScript and back as an opaque name; its layout is known only here
     /// and in [`Db::watch_range`]. `#` cannot occur in a domain name.
+    /// The domain a definition is held in, as the tree stores it (`<app>.craftworks.<which>`, or unprefixed with no
+    /// app): for a session to WATCH it (§19, `Session::bind_definition`), the one statement of the name, never spelled
+    /// by a caller.
+    pub fn definition_domain(app: Option<&str>, which: SystemDomain) -> String {
+        system_name(app, which)
+    }
+
     pub fn watch_key(domain: &str, parent: Option<&RKey>) -> String {
         match parent {
             Some(p) => format!("{domain}#{}", id::to_hex(p)),

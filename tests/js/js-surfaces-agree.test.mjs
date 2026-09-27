@@ -91,8 +91,9 @@ const surfaceOf = o => {
 // `waitingForRoom`: writes waiting on the page queue's byte bound (QUEUE_FULL),
 // which only the engine-backed db has -- the in-memory one never fills.
 // repairAll / repairAllCancel / checkAll (sdk#479): REPAIR puts back (CHECK counts) what the NODE lost; an
-// unpublished project has no node.
-const ENGINE_ONLY = new Set(["preload", "trace", "traceOn", "watch", "liveMode", "drain", "waitingForRoom", "damaged", "repairAll", "repairAllCancel", "checkAll"]);
+// unpublished project has no node. `watchDefinition`, like `watch`: a head move is a session's; the in-tab db's tree
+// moves only by its own writes.
+const ENGINE_ONLY = new Set(["preload", "trace", "traceOn", "watch", "watchDefinition", "liveMode", "drain", "waitingForRoom", "damaged", "repairAll", "repairAllCancel", "checkAll"]);
 
 await t("**the engine-backed db offers every method the in-memory one does**", () => {
   const memory = surfaceOf(wrap(fakeRaw()).Db.prototype ?? new (wrap(fakeRaw()).Db)());

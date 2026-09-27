@@ -49,9 +49,19 @@ await t("**another app's definition is read, never written**: the in-tab Db read
   const db = new sdk.Db();
   await db.draftPut("meta", { name: "Mine" });
   assert.deepEqual(await db.definition("draft", "someone-else"), [], "another app's (empty) draft read this tab's records");
-  await db.draftPut("meta", { name: "Planted" }, "someone-else");
-  assert.deepEqual(await db.definition("draft", "someone-else"), [], "a write door wrote into another app's draft");
-  assert.deepEqual((await db.definition("draft")).map(r => r.body.name), ["Planted"], "THE CONTROL: the write landed in this tab's own draft");
+  // A WRITE DOOR TAKES NO APP (the architect on sdk#551): handed one, it is refused by name -- never dropped, which
+  // wrote THIS tab's draft under the caller's belief that it wrote another's.
+  for (const [door, call] of [
+    ["draftPut", () => db.draftPut("meta", { name: "Planted" }, "someone-else")],
+    ["draftFile", () => db.draftFile("app.js", new Uint8Array([1]), {}, "someone-else")],
+    ["draftDelete", () => db.draftDelete("meta", "someone-else")],
+    ["publishDefinition", () => db.publishDefinition("someone-else")],
+    ["markPublished", () => db.markPublished("rows", "someone-else")],
+  ]) {
+    await assert.rejects(call, e => e.code === "REFUSED" && e.message.includes(`\`${door}\` takes no app`), `${door} took an app`);
+  }
+  assert.deepEqual(await db.definition("draft", "someone-else"), [], "a refused write door wrote into another app's draft");
+  assert.deepEqual((await db.definition("draft")).map(r => r.body.name), ["Mine"], "a refused write door wrote this tab's draft");
   await assert.rejects(() => db.definition("draft", "Not An App"), /app id/);
   assert.deepEqual(await db.definitionApps(), [], "the tab's own (unnamed) draft was listed as an app of a tree");
 });

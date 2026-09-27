@@ -42,6 +42,17 @@ export class DbError extends Error {
   }
 }
 
+/**
+ * A WRITE DOOR TAKES NO APP (§19; the architect on sdk#551). The definition doors write only the session's own app's
+ * definition; `definition(which, app)` READS another's. An app handed to a write door was silently dropped, so
+ * `draftPut(key, body, "someone-else")` wrote THIS app's draft. Refused by name on both surfaces instead.
+ */
+export const noAppForAWrite = (door, extra) => {
+  if (extra.length) {
+    throw new DbError({ code: "REFUSED", message: `\`${door}\` takes no app: a write door writes only its own draft (another app's definition is read with definition(which, app))`, transient: false });
+  }
+};
+
 const rethrow = e => {
   // A thrown value carrying a `code` is one Rust built deliberately. Anything
   // else is a bug in this layer or in wasm-bindgen, and is passed through
@@ -200,8 +211,25 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
   const reloadStale = () => {
     let changed;
     try { changed = JSON.parse(session.take_stale()); } catch (_) { return; }
-    for (const domain of changed) for (const cb of bound.get(domain) ?? []) cb();
+    for (const domain of changed) {
+      for (const cb of bound.get(domain) ?? []) cb();
+      const def = definitions.get(domain);
+      if (def) rereadDefinition(def);
+    }
   };
+
+  // THE DEFINITION WATCHES (§19 P3, `watchDefinition`): per watch key (opaque, from `bind_definition`), which
+  // definition it is and who is told. Re-read when `take_stale` names the key: the read and its `rendered_definition`
+  // in ONE synchronous call, as a binding's (so no change between them is missed), then every watcher gets the rows.
+  // A re-read that FAILS is handed to every watcher as `cb(null, { error })` (the architect on sdk#557): swallowed,
+  // the watcher learned nothing until the next head move. It is not `rendered`, so the key is named again.
+  const definitions = new Map();
+  const rereadDefinition = def =>
+    once(() => {
+      const rows = session.definition(def.which);
+      session.rendered_definition(def.which);
+      return rows;
+    }).then(rows => { for (const cb of def.cbs) cb(rows); }, error => { for (const cb of def.cbs) cb(null, { error }); });
 
   /**
    * This client's OWN writes changed state (published, backed up, lost,
@@ -391,22 +419,28 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     // domains, written ONLY here (an ordinary write naming one is refused). `key`: `meta`, `c/<id>` or `d/<domain>`.
     // `publishDefinition` makes the published definition equal the draft in ONE write; `definition("draft" | "app")`
     // reads `[{ key, body }]` (of another app too, read-only). `markPublished` / `isPublished`: the builder's per-domain live marker, until P5.
-    async draftPut(key, body) {
+    async draftPut(key, body, ...extra) {
+      noAppForAWrite("draftPut", extra);
       return once(() => session.draft_put(key, JSON.stringify(body)));
     },
     // A FILE of the app's code (app-as-data P5): `f/<path>`'s bytes (a Uint8Array) and meta -- one form per kind, so
     // `draftPut` stays JSON-only. A file over a record's bound is refused, naming its path and both sizes.
-    async draftFile(path, bytes, meta = {}) {
+    async draftFile(path, bytes, meta = {}, ...extra) {
+      noAppForAWrite("draftFile", extra);
       return once(() => session.draft_file(path, bytes, JSON.stringify(meta)));
     },
-    async draftDelete(key) {
+    async draftDelete(key, ...extra) {
+      noAppForAWrite("draftDelete", extra);
       return once(() => session.draft_delete(key));
     },
     // `publishDefinition()`: the definition's ONE write, the records changed. `publishDefinition({ site })`: that, then
     // -- the app's first publish, or a platform upgrade -- its SITE (P4's creation path) in the same call, answering
     // `{ changed, link }`; `site = { set, webappCode, pieceStates, siteCode, starter }` (set: the build's pieces.json
     // set, JSON or object; starter: an AppContainer). `appPublishStatus`/the session's `app_publish_status` reads it.
-    async publishDefinition({ site } = {}) {
+    // Its one argument is those OPTIONS, never an app: a string there, or anything after, is refused (`noAppForAWrite`).
+    async publishDefinition(opts = {}, ...extra) {
+      noAppForAWrite("publishDefinition", typeof opts === "string" ? [opts, ...extra] : extra);
+      const { site } = opts ?? {};
       if (!site) return once(() => session.publish_definition());
       const set = typeof site.set === "string" ? site.set : JSON.stringify(site.set);
       return once(() => JSON.parse(session.publish_definition_site(set, site.webappCode, site.pieceStates, site.siteCode, site.starter)));
@@ -416,7 +450,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     definitionApps: () => once(() => JSON.parse(session.definition_apps())),
     // `[{ key, body, bytes? }]`: a file's bytes a Uint8Array, as the SDK hands them over (never text decoded here).
     definition: (which, app) => once(() => session.definition(which, app ?? undefined)),
-    async markPublished(domain) {
+    async markPublished(domain, ...extra) {
+      noAppForAWrite("markPublished", extra);
       return once(() => JSON.parse(session.mark_published(domain)));
     },
     isPublished: domain => once(() => session.is_published(domain)),
@@ -732,6 +767,28 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
      * The session is TOLD which domains are bound, because it is the thing
      * that decides what a head move makes stale.
      */
+    /**
+     * WATCH A DEFINITION (§19 P3): `cb(rows)` — `definition(which)` read afresh — each time a head move changes the
+     * draft ("draft") or the published definition ("app") of this session's app: another tab or device of this
+     * identity edited it, or this tab lost a tie-break (rule 15). A re-read that failed is `cb(null, { error })`, and
+     * the change is named again at the next head move. `cb` is called once at the start with the current rows. Bound by the session from its `SystemDomain`, so
+     * the reserved name is never spelled here; refused by name when it cannot be watched. Returns the unwatch.
+     */
+    watchDefinition(which, cb) {
+      const key = session.bind_definition(which);
+      let def = definitions.get(key);
+      if (!def) { def = { which, cbs: new Set() }; definitions.set(key, def); }
+      def.cbs.add(cb);
+      // THE FIRST READ, for this watcher alone (engineer1's loader: the current rows without waiting for a head
+      // move). It records `rendered_definition`, as a binding's first read does, so the watch's RenderedAt starts
+      // at the root it read.
+      rereadDefinition({ which, cbs: [cb] });
+      return () => {
+        def.cbs.delete(cb);
+        if (def.cbs.size === 0 && definitions.get(key) === def) { definitions.delete(key); session.unbind_definition(which); }
+      };
+    },
+
     watch(domain, cb) {
       if (!bound.has(domain)) { bound.set(domain, new Set()); session.bind(domain); }
       bound.get(domain).add(cb);

@@ -150,6 +150,14 @@ const TRANSPORT_ONLY: &[&str] = &[
     "take_state_changed",
     "bind",
     "unbind",
+    // The DEFINITION's live watch (§19 P3, `watchDefinition`): `bind` / `rendered` / `unbind` for the reserved
+    // domain, keyed by type. The same reason: an in-memory store has no head to be notified by.
+    "bind_definition",
+    "rendered_definition",
+    "unbind_definition",
+    // The definition's write AND the app's SITE in one call (#560, `publishDefinition({ site })`): the site is PUT to a
+    // node. An in-tab db has no node, and its `publishDefinition` refuses a site by name.
+    "publish_definition_site",
     // The NAME of what a binding watches — a domain, or one parent's band
     // (sdk#137). Session bookkeeping for `bind`, not a read of data.
     "watch_key",
