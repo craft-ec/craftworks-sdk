@@ -452,3 +452,177 @@ fn m_plus_one_lost_is_named_damaged_even_when_every_slot_misses_before_the_block
         println!("  {lost_n} lost of k = {k} + {PARITY}: damaged {damaged:?}");
     }
 }
+
+/// A tree that is ONE leaf of referenced values (1400 bytes each; the records in `same` all hold the SAME value, so
+/// one id fills several slots of the leaf's group), with the leaf's parity put on the network: the records, the root,
+/// every block, and the group's `k` data slots then its parity.
+fn a_value_group(same: &[u32]) -> (BTreeMap<Vec<u8>, Vec<u8>>, Cid, MemBlocks, Vec<Cid>, usize) {
+    let records: BTreeMap<Vec<u8>, Vec<u8>> = (0..12u32)
+        .map(|i| {
+            let mut v = vec![b'a' + (i % 20) as u8; 1400];
+            if same.contains(&i) {
+                v = vec![b'z'; 1400];
+            } else {
+                v[..4].copy_from_slice(&i.to_be_bytes());
+            }
+            (format!("v/{i:04}").into_bytes(), v)
+        })
+        .collect();
+    let (root, mut all) = tree(&records);
+    let bytes = all.get(&root).expect("held").to_vec();
+    let n = Node::parse(&bytes).expect("a node");
+    assert!(n.is_leaf(), "THE SETUP: the tree is not one leaf");
+    let ids: Vec<Cid> = n.parity().collect();
+    for (id, b) in freenet_prolly::parity::blocks_of(&n, &all).expect("every member held") {
+        all.insert(id, &b);
+    }
+    let (g, (_, members)) = freenet_prolly::parity::group_members(&n).into_iter().enumerate().max_by_key(|(_, (_, m))| m.len()).expect("a group");
+    let k = members.len();
+    let mut slots = members;
+    slots.extend_from_slice(&ids[PARITY * g..PARITY * (g + 1)]);
+    (records, root, all, slots, k)
+}
+
+/// Reads of `keys` (one each, `ReqId` = its index) on a cold reader that already holds the root (so no read has had a
+/// block arrive): every block asked is answered from `all` -- NotFound when in `lost` -- except each read's OWN block
+/// (`owns`), held until nothing else is left, and the blocks in `pending`, never answered (still in flight). Then each
+/// own block is answered NotFound, one step each, nothing after. The engine, as it stands then.
+fn reads_holding_their_own(root: Cid, all: &MemBlocks, lost: &BTreeSet<Cid>, pending: &BTreeSet<Cid>, keys: &[Vec<u8>], owns: &[Cid]) -> Engine<Store> {
+    let (mut e, store) = cold_reader(root, Params::default());
+    store.put(root, all.get(&root).expect("the root"));
+    let mut queue: Vec<Effect> = Vec::new();
+    for (n, key) in keys.iter().enumerate() {
+        queue.extend(e.step(Event::Get { client: ClientId(1), req_id: ReqId(n as u64), key: key.clone() }));
+    }
+    let mut asked = BTreeSet::new();
+    let mut steps = 0;
+    while let Some(f) = queue.pop() {
+        steps += 1;
+        assert!(steps < 20_000, "the reads did not settle");
+        match f {
+            Effect::FetchBlock { id, .. } if owns.contains(&id) || pending.contains(&id) => {
+                asked.insert(id);
+            }
+            Effect::FetchBlock { id, .. } => {
+                // A lost block is answered NotFound ONCE (its re-ask is paced: held here, as a page holds it).
+                if !asked.insert(id) && lost.contains(&id) {
+                    continue;
+                }
+                let ev = match all.get(&id).filter(|_| !lost.contains(&id)) {
+                    Some(b) => {
+                        store.put(id, b);
+                        Event::BlockArrived { id, bytes: b.to_vec() }
+                    }
+                    None => Event::BlockMissed(id),
+                };
+                queue.extend(e.step(ev));
+            }
+            Effect::Keep { id, bytes } => store.put(id, &bytes),
+            other => common::no_answer_owed(&other),
+        }
+    }
+    for own in owns {
+        assert!(asked.contains(own), "THE SETUP: a read never asked its own block");
+        let _ = e.step(Event::BlockMissed(*own));
+    }
+    e
+}
+
+/// The first `n` SLOTS' ids, taking `first` first: every slot holding a taken id counts.
+fn lose_slots(slots: &[Cid], first: &[Cid], n: usize) -> BTreeSet<Cid> {
+    let mut lost = BTreeSet::new();
+    let mut taken = 0;
+    for id in first.iter().chain(slots.iter()) {
+        let holds = slots.iter().filter(|s| *s == id).count();
+        if !lost.contains(id) && taken + holds <= n {
+            lost.insert(*id);
+            taken += holds;
+        }
+    }
+    assert_eq!(taken, n, "THE SETUP: {n} slots could not be lost");
+    lost
+}
+
+/// ONE ID IN TWO SLOTS, ABSENT (Codex on sdk#542): identical values are one block, so a group can list the same id in
+/// two slots, and a NotFound for it answers BOTH. m + 1 SLOTS lost with the read's own block the repeated one: DAMAGED
+/// at j = k - 1 the moment the own block misses; m slots lost: nothing named.
+#[test]
+#[should_panic(expected = "m + 1 slots lost with one id in two of them: not named damaged")] // PINNED: flipped by the fix
+fn an_id_in_two_slots_missing_is_absent_in_both() {
+    let (records, root, all, slots, k) = a_value_group(&[0, 5]);
+    let key = b"v/0000".to_vec();
+    let own = freenet_prolly::block_id(freenet_prolly::kind::RAW, &records[&key]);
+    assert_eq!(slots[..k].iter().filter(|s| **s == own).count(), 2, "THE SETUP: the read's own value is not in two slots");
+    for (n, want) in [(PARITY, false), (PARITY + 1, true)] {
+        let lost = lose_slots(&slots, &[own], n);
+        let e = reads_holding_their_own(root, &all, &lost, &BTreeSet::new(), &[key.clone()], &[own]);
+        let damaged = e.damaged();
+        if want {
+            assert_eq!(damaged.len(), 1, "m + 1 slots lost with one id in two of them: not named damaged: {damaged:?}");
+            assert_eq!((damaged[0].block, damaged[0].j, damaged[0].k), (own, k - 1, k));
+        } else {
+            assert!(damaged.is_empty(), "m slots lost is recoverable, yet named damaged: {damaged:?}");
+        }
+    }
+}
+
+/// ONE ID IN TWO SLOTS, HELD: a block that arrives fills EVERY slot of its id. Exactly `k` slots survive, two of them
+/// the repeated id: the lost member is rebuilt and read right -- counted once, the group would stay one short for ever.
+#[test]
+#[should_panic(expected = "a repeated id counted once")] // PINNED: flipped by the fix
+fn an_id_in_two_slots_arriving_fills_both() {
+    let (records, root, all, slots, k) = a_value_group(&[0, 5]);
+    let twice = freenet_prolly::block_id(freenet_prolly::kind::RAW, &records[&b"v/0000".to_vec()]);
+    let key = b"v/0001".to_vec();
+    let own = freenet_prolly::block_id(freenet_prolly::kind::RAW, &records[&key]);
+    assert!(own != twice && slots[..k].contains(&own), "THE SETUP: the read's own value is not a member");
+    let others: Vec<Cid> = slots.iter().filter(|s| **s != twice && **s != own).copied().collect();
+    let mut lost = BTreeSet::from([own]);
+    lost.extend(others.iter().take(PARITY - 1));
+    let left = slots.iter().filter(|s| !lost.contains(*s)).count();
+    assert_eq!((left, slots.iter().filter(|s| !lost.contains(*s) && **s == twice).count()), (k, 2), "THE SETUP: not exactly k left with the repeated id twice");
+    let (answers, _) = read_cold(root, &all, &lost, &[key.clone()], Params::default());
+    assert!(answers.contains_key(&key) && right(&answers, &records).is_empty(), "a repeated id counted once: {answers:?}");
+}
+
+/// A REPAIR NOBODY READS IS NOT NAMED (Codex on sdk#542): two sibling reads, each own block lost with m + 1 of the
+/// group, each repair asking the other's block -- so after both reads are superseded, each repair still "wants" a
+/// block of the other's and neither ends. `damaged()` names only a repair a live READ waits on.
+#[test]
+#[should_panic(expected = "named damaged with no read")] // PINNED: flipped by the fix
+fn a_repair_with_no_read_left_is_not_named_damaged() {
+    let (records, root, all, slots, k) = a_value_group(&[]);
+    let keys = [b"v/0001".to_vec(), b"v/0002".to_vec()];
+    let owns: Vec<Cid> = keys.iter().map(|key| freenet_prolly::block_id(freenet_prolly::kind::RAW, &records[key])).collect();
+    assert!(owns.iter().all(|o| slots[..k].contains(o)), "THE SETUP: the two values are not members of the group");
+    let lost = lose_slots(&slots, &owns, PARITY + 1);
+    let mut e = reads_holding_their_own(root, &all, &lost, &BTreeSet::new(), &keys, &owns);
+    assert_eq!(e.damaged().len(), 2, "THE SETUP: both reads' groups are not named damaged: {:?}", e.damaged());
+    for r in 0..2 {
+        assert!(e.supersede_read(ReqId(r)).is_some(), "THE SETUP: read {r} was not superseded");
+    }
+    let damaged = e.damaged();
+    assert!(damaged.is_empty(), "named damaged with no read left: {damaged:?}");
+}
+
+/// THE RECOVERABLE BOUNDARY WHILE SURVIVORS ARE STILL PENDING (Codex on sdk#542): m slots answered NotFound, the k
+/// survivors not yet answered at all -- `present` (not answered NotFound) is exactly k, margin 0: DEGRADED, never
+/// DAMAGED. (The other test answers the survivors first, so its repair has already rebuilt; this one has not.)
+/// Mutant "margin 0 is DAMAGED" -> red here. m + 1 with the survivors pending: DAMAGED at j = k - 1.
+#[test]
+fn m_lost_with_every_survivor_pending_is_not_damaged() {
+    let (records, root, all, slots, k) = a_value_group(&[]);
+    let key = b"v/0003".to_vec();
+    let own = freenet_prolly::block_id(freenet_prolly::kind::RAW, &records[&key]);
+    for (n, want) in [(PARITY, false), (PARITY + 1, true)] {
+        let lost = lose_slots(&slots, &[own], n);
+        let pending: BTreeSet<Cid> = slots.iter().filter(|s| !lost.contains(*s)).copied().collect();
+        let e = reads_holding_their_own(root, &all, &lost, &pending, &[key.clone()], &[own]);
+        let damaged = e.damaged();
+        if want {
+            assert_eq!(damaged.iter().map(|d| (d.block, d.j, d.k)).collect::<Vec<_>>(), vec![(own, k - 1, k)], "m + 1 lost, survivors pending");
+        } else {
+            assert!(damaged.is_empty(), "m lost, the k survivors pending (margin 0): named damaged: {damaged:?}");
+        }
+    }
+}
