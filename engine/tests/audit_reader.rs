@@ -1,7 +1,7 @@
 //! THE AUDIT IS A READER (sdk#530; the architect's H1; WANTED-LIFE W1, W7, W8, A1-A3): the assets audit's pass is one
 //! more holder of a block's (block, GET) key, so no other reader's end can end the GET it waits on; only the NODE's
 //! answer serves it -- never bytes the page holds or rebuilt; and it pins nothing.
-use engine::{ClientId, Effect, Event, PagePins, PassId, Params};
+use engine::{AuditVerdict, ClientId, Effect, Event, PagePins, PassId, Params};
 use freenet_prolly::store::Blocks;
 use freenet_prolly::Cid;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,9 +21,9 @@ fn unwanted(fx: &[Effect], id: Cid) -> bool {
     fx.iter().any(|f| matches!(f, Effect::Unwanted { id: x } if *x == id))
 }
 
-fn answered(fx: &[Effect]) -> Vec<(Cid, Vec<PassId>, bool)> {
+fn answered(fx: &[Effect]) -> Vec<(Cid, Vec<PassId>, AuditVerdict)> {
     fx.iter()
-        .filter_map(|f| if let Effect::AuditAnswered { id, passes, found } = f { Some((*id, passes.clone(), *found)) } else { None })
+        .filter_map(|f| if let Effect::AuditAnswered { id, passes, verdict } = f { Some((*id, passes.clone(), *verdict)) } else { None })
         .collect()
 }
 
@@ -64,7 +64,7 @@ fn the_nodes_answer_answers_the_audit_found() {
     assert_eq!(fetched(&fx), vec![root], "the audit's want asked no GET");
     let bytes = all.get(&root).expect("the root").to_vec();
     let fx = e.step(Event::BlockArrived { id: root, bytes });
-    assert_eq!(answered(&fx), vec![(root, vec![PassId(3)], true)], "the node's answer did not answer the audit");
+    assert_eq!(answered(&fx), vec![(root, vec![PassId(3)], AuditVerdict::Present)], "the node's answer did not answer the audit");
     assert!(!e.readers_of(&root).audits, "the answered audit is still a reader");
 }
 
@@ -74,7 +74,7 @@ fn a_not_found_answers_the_audit_absent_and_the_read_keeps_waiting() {
     let (mut e, b, _) = a_parked_read();
     let _ = e.step(Event::AuditWant { id: b, pass: PassId(4) });
     let fx = e.step(Event::BlockMissed(b));
-    assert_eq!(answered(&fx), vec![(b, vec![PassId(4)], false)], "the NotFound did not answer the audit absent");
+    assert_eq!(answered(&fx), vec![(b, vec![PassId(4)], AuditVerdict::Absent)], "the NotFound did not answer the audit absent");
     assert!(!e.readers_of(&b).audits);
     assert!(e.readers_of(&b).reads, "the read stopped waiting on a NotFound");
 }
@@ -93,7 +93,7 @@ fn only_the_nodes_answer_serves_an_audit_never_held_bytes() {
     assert!(answered(&local).is_empty(), "a LOCAL landing answered the audit: {:?}", answered(&local));
     assert!(e.readers_of(&root).audits, "the audit stopped waiting on a local landing");
     let node = e.step(Event::BlockArrived { id: root, bytes });
-    assert_eq!(answered(&node), vec![(root, vec![PassId(5)], true)], "the node's answer did not answer the audit");
+    assert_eq!(answered(&node), vec![(root, vec![PassId(5)], AuditVerdict::Present)], "the node's answer did not answer the audit");
 }
 
 /// W8: an audit pins nothing -- an audit of N blocks leaves the engine's pins as they were.

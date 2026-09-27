@@ -572,13 +572,13 @@ pub enum Effect {
     Unwanted {
         id: Cid,
     },
-    /// The NODE answered block `id`'s GET for the audit passes `passes` (sdk#530, WANTED-LIFE A2/A3): `found` -- its
-    /// bytes (the page holds them) -- or NotFound. Only the node's answer: a rebuild from parity, or bytes the page
-    /// already holds, never answer an audit (W7). The audit's readers are taken with it.
+    /// The NODE answered block `id`'s GET for the audit passes `passes` (sdk#530, WANTED-LIFE A2/A3), with its
+    /// [`AuditVerdict`]. Only the node's answer: a rebuild from parity, or bytes the page already holds, never answer
+    /// an audit (W7). The audit's readers are taken with it.
     AuditAnswered {
         id: Cid,
         passes: Vec<PassId>,
-        found: bool,
+        verdict: AuditVerdict,
     },
     UpdateHead {
         seq: u64,
@@ -994,6 +994,14 @@ impl Readers {
     pub fn any(self) -> bool {
         self.reads || self.repairs || self.parked_write || self.audits
     }
+}
+
+/// What the NODE said of a block an audit asked (sdk#530; KEEPER's C2): its bytes (the audit's Fetched), or its
+/// NotFound (the audit's Absent). Never a bool: the audit matches on it exhaustively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditVerdict {
+    Present,
+    Absent,
 }
 
 /// An assets-audit PASS, by its number (sdk#530, sdk#532): a replaced pass drops only ITS readers.
@@ -4691,7 +4699,7 @@ impl<B: Blocks> Engine<B> {
             }
             let served = self.served(*l, by_node);
             if !served.audits.is_empty() {
-                audited.push(Effect::AuditAnswered { id: *l, passes: served.audits.into_iter().collect(), found: true });
+                audited.push(Effect::AuditAnswered { id: *l, passes: served.audits.into_iter().collect(), verdict: AuditVerdict::Present });
             }
             if let Some(reqs) = served.reads {
                 for r in &reqs {
@@ -4740,7 +4748,7 @@ impl<B: Blocks> Engine<B> {
             if !self.wanted.readers_of(&id).any() {
                 self.dropped.insert(id);
             }
-            out.push(Effect::AuditAnswered { id, passes: passes.into_iter().collect(), found: false });
+            out.push(Effect::AuditAnswered { id, passes: passes.into_iter().collect(), verdict: AuditVerdict::Absent });
         }
         if self.wanted.is_slot(&id) {
             out.extend(self.on_repair_block(id, None));

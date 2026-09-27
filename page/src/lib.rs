@@ -520,6 +520,14 @@ pub enum Publication {
 /// (the architect's attack on sdk#225).
 pub const HEAD_BACKSTOP_MS: u64 = 120_000;
 
+/// The NODE's answer to a block an audit pass asked (sdk#530): which passes it answers, and its verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditAnswer {
+    pub id: Cid,
+    pub passes: Vec<engine::PassId>,
+    pub verdict: engine::AuditVerdict,
+}
+
 /// F56's equal-seq rule as the Register decides it: of two heads at ONE seq,
 /// the one whose VALUE has the lower BLAKE3 wins (`(terminal, seq,
 /// Reverse(BLAKE3(value)))`). A head's value today is its bare root; the
@@ -670,7 +678,7 @@ pub struct Page {
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
     /// The node's answers for the assets audit's passes (`Effect::AuditAnswered`, sdk#530), until the audit takes them.
-    audit_answers: Vec<(Cid, Vec<engine::PassId>, bool)>,
+    audit_answers: Vec<AuditAnswer>,
     /// Blocks to ask `Held` about at the next flush (sdk#455): asked in BATCHES of up to MAX_HELD, one op each, when
     /// the ops leave ([`Page::take_ops`]). An id already in a batch in flight joins it there.
     held_asks: BTreeSet<Cid>,
@@ -946,9 +954,12 @@ impl Page {
         for w in late {
             let d = self.end(&w, End::TimedOut).expect("listed");
             // A parked GET the engine no longer needs, or that the page now
-            // holds (a repair rebuilt it), ends here.
+            // holds (a repair rebuilt it), ends here -- held, unless an AUDIT
+            // waits on it: only the node's answer serves an audit (W7, OP-LIFE
+            // E2; the architect on #538).
             if let Waiting::Get(id) = w {
-                if !d.sent && (self.engine.blocks().get(&id).is_some() || !self.engine.readers_of(&id).any()) {
+                let held = self.engine.blocks().get(&id).is_some();
+                if !d.sent && ((held && !self.engine.readers_of(&id).audits) || !self.engine.readers_of(&id).any()) {
                     self.drop_get(id);
                     continue;
                 }
@@ -2381,7 +2392,7 @@ impl Page {
                 }
                 Effect::ReadHead { .. } => self.send(Waiting::RecoverHead, Op::ReadHead { label: Label::Head }),
                 // The node's answer for audit passes (sdk#530): held for the audit to take ([`Page::take_audit_answers`]).
-                Effect::AuditAnswered { id, passes, found } => self.audit_answers.push((id, passes, found)),
+                Effect::AuditAnswered { id, passes, verdict } => self.audit_answers.push(AuditAnswer { id, passes, verdict }),
                 client => self.client_fx.push(client),
             }
         }
@@ -2462,8 +2473,8 @@ impl Page {
         self.carry_out(fx);
     }
 
-    /// The node's answers for audit passes since the last take: `(block, passes, found)`.
-    pub fn take_audit_answers(&mut self) -> Vec<(Cid, Vec<engine::PassId>, bool)> {
+    /// The node's answers for audit passes since the last take.
+    pub fn take_audit_answers(&mut self) -> Vec<AuditAnswer> {
         std::mem::take(&mut self.audit_answers)
     }
 
@@ -3134,6 +3145,33 @@ mod parked_get {
         // The engine here waits on nothing: the parked GET ends rather than going out.
         assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
+    }
+
+    /// **The due-time backstop's HELD arm spares an audit** (the architect on #538; W7, OP-LIFE E2): a GET parked after
+    /// a NotFound, the page then HOLDING the block (a repair rebuilt it), and an audit joining the parked GET -- at the
+    /// due time the GET is SENT, never ended, and the audit is answered by the NODE. Mutant: drop the audits clause at
+    /// the held arm -> red (the key ends, and the pass waits for an answer that never comes).
+    #[test]
+    fn a_parked_get_an_audit_joined_goes_out_at_its_due_time_though_the_block_is_held() {
+        use freenet_prolly::{block_id, kind};
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.now = 5;
+        p.answered(&Waiting::RecoverHead);
+        let bytes = vec![7u8; 8];
+        let id = block_id(kind::RAW, &bytes);
+        p.send(Waiting::Get(id), Op::Get { id });
+        let _ = p.take_ops();
+        p.answer(Answer::GetMissed(id), Ms(10));
+        assert!(p.deadlines.get(&Waiting::Get(id)).is_some_and(|d| !d.sent), "THE SETUP: the NotFound GET is not parked");
+        // The page now holds it (a repair rebuilt it), and an audit joins the parked GET.
+        p.engine.blocks_mut().insert(id, &bytes);
+        p.audit_want(id, engine::PassId(1));
+        assert!(p.take_ops().iter().all(|o| *o != Op::Get { id }), "the audit sent a second GET beside the parked one");
+        let due = p.deadlines.get(&Waiting::Get(id)).map(|d| d.at).expect("the parked GET is still there after the audit joined");
+        p.tick(Ms(due));
+        assert!(p.take_ops().contains(&Op::Get { id }), "the parked GET an audit waits on was ended at its due time: the page holds the block");
+        p.answer(Answer::Got { id, bytes }, Ms(due + 5));
+        assert_eq!(p.take_audit_answers(), vec![AuditAnswer { id, passes: vec![engine::PassId(1)], verdict: engine::AuditVerdict::Present }], "the node's answer did not reach the audit");
     }
 }
 
