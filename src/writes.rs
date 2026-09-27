@@ -141,12 +141,14 @@ impl Writes {
     /// `DeferredCommit`, the wire's form of the one flag -- same id, same
     /// refusals, same fate bookkeeping.
     pub fn make_as(&mut self, reads: &[(Vec<u8>, protocol::Expect)], edits: &[(Vec<u8>, Edit)], deferred: bool) -> Result<u64, Refused> {
+        // The id this write WILL carry, taken only once it is sent: a write
+        // refused here never reaches the wire, so it uses up no id and the
+        // ids a node sees have no gap (sdk#251).
         let write_id = self.next_write_id;
-        self.next_write_id += 1;
         // NO SESSION, NO WRITE (sdk#146): refused by name, rather than sent
         // under a number another tab shares.
         if self.client.session().is_none() {
-            return Err(self.refuse(write_id, Refused::NoSession));
+            return Err(Refused::NoSession);
         }
         let ops: Vec<protocol::Op> = edits
             .iter()
@@ -165,7 +167,7 @@ impl Writes {
         // WILL IT FIT ON THE WIRE? (craftworks-sdk#136)
         let bytes = protocol::request_len(protocol::CURRENT, &request);
         if bytes > protocol::MAX_MESSAGE as u64 {
-            return Err(self.refuse(write_id, Refused::TooLargeToSend { bytes, limit: protocol::MAX_MESSAGE }));
+            return Err(Refused::TooLargeToSend { bytes, limit: protocol::MAX_MESSAGE });
         }
         let keys: Vec<Vec<u8>> = edits.iter().map(|(k, _)| k.clone()).collect();
         for k in &keys {
@@ -173,17 +175,13 @@ impl Writes {
             // failure.
             self.rolled_back.remove(k);
         }
+        self.next_write_id += 1;
         self.keys_of.insert(write_id, keys);
         if reads.iter().any(|(_, e)| *e == protocol::Expect::Any) {
             self.forced.insert(write_id);
         }
         self.client.send(&request);
         Ok(write_id)
-    }
-
-    /// A refusal at make time: RETURNED to its caller, its one reader (a copy kept here had none, sdk#482).
-    fn refuse(&mut self, _write_id: u64, why: Refused) -> Refused {
-        why
     }
 
     /// The door refused `write_id` in the call that made it: the caller gets
