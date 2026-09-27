@@ -386,6 +386,9 @@ pub struct PageIo {
     publishes: BTreeMap<String, AppPublishState>,
     publish_of_key: BTreeMap<String, std::collections::BTreeSet<String>>,
     publish_sites: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+    /// An app publish's piece PUTs, held while its site is CHECKED (APP-PUBLISH P6): sent only if the site does not
+    /// already hold this bundle (`PublishEffect::SendPieces`).
+    publish_pieces: BTreeMap<String, Vec<(ContractContainer, WrappedState)>>,
     /// A reader's stream-id range (`reader`), in the top byte; 0 for the
     /// person's own page, which keeps the whole space below it.
     stream_base: u32,
@@ -485,6 +488,7 @@ impl PageIo {
             publishes: BTreeMap::new(),
             publish_of_key: BTreeMap::new(),
             publish_sites: BTreeMap::new(),
+            publish_pieces: BTreeMap::new(),
             stream_base: 0,
             signer_container: None,
         }
@@ -852,6 +856,10 @@ impl PageIo {
         if self.publishes.get(app).is_some_and(|p| p.get().in_flight()) {
             return Err(format!("{app} is being published already"));
         }
+        // PUBLISH-LIFE ¹²: the check reads a site no publication of which is in flight (the direct door's).
+        if matches!(self.server.page.publication(app), Some(Publication::Publishing { .. })) {
+            return Err(format!("{app}'s site is being published: its publish is that one"));
+        }
         // Nothing to PUT means no ack could ever send the site (Codex on #527, A): refused, never a publish stuck at
         // `pieces` that blocks every later one.
         if set.0.pieces.is_empty() {
@@ -901,13 +909,20 @@ impl PageIo {
             }
         }
         self.unroute(app);
-        for (c, st) in puts {
-            let key = c.key().to_string();
-            self.publish_of_key.entry(key).or_default().insert(app.to_string());
-            self.put_contract(c, st, now)?;
+        for (c, _) in &puts {
+            self.publish_of_key.entry(c.key().to_string()).or_default().insert(app.to_string());
         }
+        // P6: the SITE is read first; the pieces wait for its answer (sent at `SendPieces`, never if it is current).
+        let contract = site_contract(site_code, &self.art.register_params, app).expect("checked above");
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&contract.key().id().as_bytes()[..32]);
+        let key = contract.key().to_string();
+        let value = *blake3::hash(&web).as_bytes();
+        self.sites.insert(app.to_string(), Site { id, role: SiteRole::Publishing { contract, key, web: web.clone() } });
+        self.publish_pieces.insert(app.to_string(), puts);
         self.publish_sites.insert(app.to_string(), (site_code.to_vec(), web));
         self.publishes.insert(app.to_string(), AppPublishState::start(progress));
+        self.server.page.check_site(app, value, now);
         self.pump();
         Ok(())
     }
@@ -930,6 +945,7 @@ impl PageIo {
             !apps.is_empty()
         });
         self.publish_sites.remove(app);
+        self.publish_pieces.remove(app);
     }
 
     /// A PERSON cancels `app`'s publish: before PUBLISHED it ends `cancelled` (the site and the pieces withdrawn);
@@ -949,6 +965,20 @@ impl PageIo {
 
     /// The site's answers, for a publish whose site is in flight: the page's `Publication` says how it ended.
     fn observe_publishes(&mut self) {
+        // P6: a publish's CHECK read ended: this bundle at `v`, or not current (a read the node could not serve ends
+        // `Refused`: not current either; the site's own publication, after the pieces, reads it again and says so).
+        let checking: Vec<String> = self.publishes.iter().filter(|(_, p)| p.get().checking()).map(|(a, _)| a.clone()).collect();
+        for app in checking {
+            let ev = match self.server.page.publication(&app) {
+                Some(Publication::Published { version }) => Some(PublishEvent::SiteRead(Some(version))),
+                Some(Publication::NotCurrent | Publication::Refused(_) | Publication::Superseded { .. }) => Some(PublishEvent::SiteRead(None)),
+                Some(Publication::Cancelled) => Some(PublishEvent::Cancel),
+                Some(Publication::Publishing { .. }) | None => None,
+            };
+            if let Some(ev) = ev {
+                self.publish_step(&app, ev);
+            }
+        }
         let siting: Vec<String> = self.publishes.iter().filter(|(_, p)| p.get().siting()).map(|(a, _)| a.clone()).collect();
         for app in siting {
             let ev = match self.server.page.publication(&app) {
@@ -958,7 +988,8 @@ impl PageIo {
                 // A cancel of the SITE (the Session's cancel_site) ends the publish too (the architect's R2): the
                 // table's own Siting x Cancel cell, never a Siting left waiting for an answer that cannot come.
                 Some(Publication::Cancelled) => Some(PublishEvent::Cancel),
-                Some(Publication::Publishing { .. }) | None => None,
+                // A check's end: never while Siting (the site's publication replaced it).
+                Some(Publication::NotCurrent) | Some(Publication::Publishing { .. }) | None => None,
             };
             if let Some(ev) = ev {
                 self.publish_step(&app, ev);
@@ -976,6 +1007,13 @@ impl PageIo {
         }
         for effect in effects {
             match effect {
+                PublishEffect::SendPieces => {
+                    for (c, st) in self.publish_pieces.remove(app).unwrap_or_default() {
+                        if let Err(w) = self.put_contract(c, st, now) {
+                            self.say(page::unusable::Site::of("page-io::said::piece-unsent"), format!("{app}: a piece could not be sent: {w}"));
+                        }
+                    }
+                }
                 PublishEffect::SendSite => {
                     let Some((code, web)) = self.publish_sites.get(app).cloned() else { continue };
                     if let Err(w) = self.send_site(app, &code, web, now) {

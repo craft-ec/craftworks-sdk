@@ -9,7 +9,8 @@
 //! until the table has a cell for it.
 //!
 //! The doc's cells, by state (head table / site table):
-//! * `Idle` -- nothing owed. `Reading` -- a site whose version is not read yet.
+//! * `Idle` -- nothing owed. `Reading` -- a site whose version is not read yet. `Checking` -- a site read ONLY, never
+//!   signed: an app publish's first step (APP-PUBLISH P6), before any piece.
 //! * `Signing` -- a Sign out (its id is DERIVED from the op on the wire, never stored).
 //! * `BackingOff` -- a retryable refusal; the next Sign at `at` (P6: [`backoff`]).
 //! * `OldSigner` -- an OLD signer refuses `Forked` on the head this page stands on: not re-asked until a head read
@@ -62,7 +63,7 @@ impl Pubs {
             crate::Label::Head => self.head.on(Kind::Head, ev, cx),
             crate::Label::Site(app) => match self.sites.get_mut(app) {
                 Some(life) => life.on(Kind::Site, ev, cx),
-                None if matches!(ev, Ev::Publish(_)) => self.sites.entry(app.clone()).or_default().on(Kind::Site, ev, cx),
+                None if matches!(ev, Ev::Publish(_) | Ev::Check(_)) => self.sites.entry(app.clone()).or_default().on(Kind::Site, ev, cx),
                 None => Vec::new(),
             },
         }
@@ -102,6 +103,8 @@ pub(crate) enum Life {
     #[default]
     Idle,
     Reading { value: Cid },
+    /// A SITE only: READ ONLY, never signed (APP-PUBLISH P6, E13): does the site already hold this bundle?
+    Checking { value: Cid },
     /// `refusals`: retryable refusals in a row before this ask; `why`: the last of them (a site shows
     /// `HeadUnknown` as what it waits for).
     Signing { owed: Owed, refusals: u32, why: Option<Why> },
@@ -133,6 +136,8 @@ pub(crate) enum Ev<'a> {
     Owe(Owed),
     /// E2: `publish_site(app, value)`.
     Publish(Cid),
+    /// E13: `check_site(app, value)`: an app publish's read-first (APP-PUBLISH P6).
+    Check(Cid),
     /// E3–E8: the signer's answer to THIS label's Sign in flight.
     Signer(A),
     /// The UPDATE's answer (F56: it decides nothing; the read that follows does).
@@ -217,7 +222,7 @@ impl Life {
             | Life::Written { owed, .. }
             | Life::Verifying { owed, .. }
             | Life::Landing { owed, .. } => Some(owed),
-            Life::Idle | Life::Reading { .. } | Life::Ended(_) => None,
+            Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::Ended(_) => None,
         }
     }
 
@@ -227,7 +232,7 @@ impl Life {
             Life::BackingOff { at, .. } => Some(*at),
             Life::Verifying { at, .. } => *at,
             Life::Idle
-            | Life::Reading { .. }
+            | Life::Reading { .. } | Life::Checking { .. }
             | Life::Signing { .. }
             | Life::OldSigner { .. }
             | Life::Written { .. }
@@ -249,7 +254,7 @@ impl Life {
             Life::Ended(p) => Some(p.clone()),
             Life::Signing { why, .. } => Some(waiting(why.as_ref())),
             Life::BackingOff { why, .. } => Some(waiting(Some(why))),
-            Life::Reading { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => Some(waiting(None)),
+            Life::Reading { .. } | Life::Checking { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => Some(waiting(None)),
         }
     }
 
@@ -284,7 +289,7 @@ impl Life {
                 acts.push(Act::EndWaits);
                 Some(Self::signing(owed, acts))
             }
-            Ev::Publish(_) | Ev::SiteRead(_) | Ev::Cancel | Ev::NodeRefused(_) => None, // a site's events: never the head's
+            Ev::Publish(_) | Ev::Check(_) | Ev::SiteRead(_) | Ev::Cancel | Ev::NodeRefused(_) => None, // a site's events: never the head's
             Ev::Signer(s) => self.head_signer(s, cx, acts),
             Ev::Updated => self.updated(acts),
             Ev::UpdateResent => match self {
@@ -292,7 +297,7 @@ impl Life {
                     acts.push(Act::LandingUpdates(updates + 1));
                     Some(Life::Landing { owed: *owed, named: *named, from: *from, updates: updates + 1, tries: *tries })
                 }
-                Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => None,
+                Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => None,
             },
             Ev::SignLost => self.sign_lost(acts),
             Ev::Read { from, j, confirms } => self.head_read(from, j, confirms, cx, acts),
@@ -301,7 +306,7 @@ impl Life {
                 Life::OldSigner { owed, at } if seq > *at => Some(Self::signing(*owed, acts)),
                 Life::OldSigner { .. }
                 | Life::Idle
-                | Life::Reading { .. }
+                | Life::Reading { .. } | Life::Checking { .. }
                 | Life::Signing { .. }
                 | Life::BackingOff { .. }
                 | Life::Written { .. }
@@ -330,7 +335,7 @@ impl Life {
         match self {
             Life::Written { .. } => acts.push(Act::Read(ReadWait::ReadBack)),
             Life::Landing { .. } => acts.push(Act::Read(ReadWait::Verify)),
-            Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Ended(_) => {}
+            Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Ended(_) => {}
         }
         None
     }
@@ -342,7 +347,7 @@ impl Life {
             Life::Landing { named, from: Some((prev_seq, prev_root)), .. } => {
                 acts.push(Act::Sign { prev_seq: *prev_seq, prev_root: *prev_root, seq: prev_seq + 1, root: named.1 })
             }
-            Life::Landing { from: None, .. } | Life::Idle | Life::Reading { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => {}
+            Life::Landing { from: None, .. } | Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => {}
         }
         None
     }
@@ -363,7 +368,7 @@ impl Life {
                 acts.push(Act::ReadIfIdle(ReadWait::ReadBack));
                 None
             }
-            Life::BackingOff { .. } | Life::Verifying { .. } | Life::Written { .. } | Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::OldSigner { .. } | Life::Landing { .. } | Life::Ended(_) => None,
+            Life::BackingOff { .. } | Life::Verifying { .. } | Life::Written { .. } | Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::Signing { .. } | Life::OldSigner { .. } | Life::Landing { .. } | Life::Ended(_) => None,
         }
     }
 
@@ -443,7 +448,7 @@ impl Life {
                 }
             }
             // ¹/⁶: nothing is out to answer (the page takes only the answer under a Sign op's own id).
-            Life::Idle | Life::Reading { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => None,
+            Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Ended(_) => None,
         }
     }
 
@@ -472,7 +477,7 @@ impl Life {
         let (owed, record, stale) = match self {
             Life::Written { owed, record, stale } => (owed, record, stale),
             // A read-back that outlived its commit.
-            Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => return None,
+            Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => return None,
         };
         match j {
             // Not visible yet -- or THIS page's record wins the tie-break (the node has not merged my UPDATE): read
@@ -507,7 +512,7 @@ impl Life {
             Life::Verifying { owed, named, tries, .. } => (*owed, *named, None, 0, *tries),
             Life::Landing { owed, named, from, updates, tries } => (*owed, *named, Some(*from), *updates, *tries),
             // A verify read that outlived its state.
-            Life::Idle | Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Ended(_) => return None,
+            Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Ended(_) => return None,
         };
         let h = j.shown();
         let reg_seq = h.map_or(0, |(s, _)| s);
@@ -588,6 +593,15 @@ impl Life {
                 acts.push(Act::Read(ReadWait::ReadBack));
                 Some(Life::Reading { value })
             }
+            // E13: a READ ONLY (APP-PUBLISH P6), never while a publication is in flight (¹²: page-io refuses one).
+            Ev::Check(value) => match self {
+                Life::Idle | Life::Ended(_) | Life::Checking { .. } => {
+                    acts.push(Act::EndWaits);
+                    acts.push(Act::Read(ReadWait::ReadBack));
+                    Some(Life::Checking { value })
+                }
+                Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => None,
+            },
             Ev::Owe(_) | Ev::Read { .. } | Ev::HeadSeen(_) | Ev::Dead | Ev::UpdateResent => None, // the head's events
             Ev::Signer(s) => self.site_signer(s, cx, acts),
             Ev::Updated => self.updated(acts),
@@ -596,14 +610,14 @@ impl Life {
             Ev::Due => self.due(cx, acts),
             Ev::NodeRefused(why) => match self {
                 Life::Idle | Life::Ended(_) => None,
-                Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => {
+                Life::Reading { .. } | Life::Checking { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => {
                     Some(Self::end_site(Publication::Refused(why), acts))
                 }
             },
             // E12: every wait ends, and it says so. Idle and Ended: nothing to cancel.
             Ev::Cancel => match self {
                 Life::Idle | Life::Ended(_) => None,
-                Life::Reading { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => {
+                Life::Reading { .. } | Life::Checking { .. } | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } => {
                     Some(Self::end_site(Publication::Cancelled, acts))
                 }
             },
@@ -625,7 +639,7 @@ impl Life {
         let (owed, refusals) = match self {
             Life::Signing { owed, refusals, .. } => (owed, refusals),
             // ¹/⁶/⁹: nothing out to answer.
-            Life::Idle | Life::Reading { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => return None,
+            Life::Idle | Life::Reading { .. } | Life::Checking { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Written { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => return None,
         };
         let owed = *owed;
         match s {
@@ -673,12 +687,18 @@ impl Life {
                     Err(_) => Some(Self::end_site(Publication::Refused("the site holds a record that is not a site's".into()), acts)),
                 },
             },
+            // E13's read (APP-PUBLISH P6): THIS bundle -> Published at its version; anything else -> NotCurrent. Never a
+            // sign or a write: the pieces go first, and the publish's site comes after them (P1).
+            Life::Checking { value } => match read {
+                Some(h) if h.value() == value.as_slice() => Some(Self::end_site(Publication::Published { version: h.seq }, acts)),
+                None | Some(_) => Some(Self::end_site(Publication::NotCurrent, acts)),
+            },
             Life::Written { owed, record, stale } => match judge_site(owed.seq, owed.root.as_slice(), read) {
                 SiteJudged::Mine => Some(Self::end_site(Publication::Published { version: owed.seq }, acts)),
                 SiteJudged::Superseded(version) => Some(Self::end_site(Publication::Superseded { version }, acts)),
                 SiteJudged::NotYet => Some(Self::stale(*owed, record, *stale, acts)),
             },
-            // ⁸: a site is read only while Reading or Written.
+            // ⁸: a site is read only while Reading, Checking or Written.
             Life::Idle | Life::Signing { .. } | Life::BackingOff { .. } | Life::OldSigner { .. } | Life::Verifying { .. } | Life::Landing { .. } | Life::Ended(_) => None,
         }
     }

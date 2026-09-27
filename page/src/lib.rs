@@ -516,6 +516,9 @@ pub enum Publication {
     Refused(String),
     /// The person cancelled it (the one end that is not an answer: rule 8).
     Cancelled,
+    /// A CHECK's end (APP-PUBLISH P6, `check_site`): the site was read and does not hold this bundle (no site yet,
+    /// another bundle, or a record that is not a site's). Nothing was signed or written; the app publish's pieces go.
+    NotCurrent,
 }
 
 /// With nothing else reading the register, a head read at least this often:
@@ -1589,6 +1592,14 @@ impl Page {
     pub fn publish_site(&mut self, app: &str, value: Cid, now: Ms) {
         self.now = now.0;
         self.life_on(&Label::Site(app.to_string()), Ev::Publish(value));
+    }
+
+    /// CHECK a site (APP-PUBLISH P6, E13): READ it only, never sign or write. It ends `Published` at its version when
+    /// it already holds `value` (the bundle's hash), else `NotCurrent`. Never while a publication of it is in flight
+    /// (page-io's `publish_app` refuses one): that cell is impossible.
+    pub fn check_site(&mut self, app: &str, value: Cid, now: Ms) {
+        self.now = now.0;
+        self.life_on(&Label::Site(app.to_string()), Ev::Check(value));
     }
 
     /// How a site's publication stands (builder#117), DERIVED from its `Life`, the one owner. `None`: never asked.

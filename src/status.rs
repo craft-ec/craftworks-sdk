@@ -37,6 +37,7 @@ vocabulary! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum AppPublishStatus {
         None => "none",
+        Checking => "checking",
         Pieces => "pieces",
         Siting => "siting",
         Published => "published",

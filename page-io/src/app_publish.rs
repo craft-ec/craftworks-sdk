@@ -4,6 +4,8 @@
 //! - P1 (ordering): the site record is sent only once EVERY set it names has at least `k` pieces acked;
 //! - P2: PUBLISHED = the site read back at this version;
 //! - P3: BACKED_UP = PUBLISHED and every piece of every set acked;
+//! - P6 (the site is read first): before any piece, the site is READ; if it already holds this exact bundle the app is
+//!   PUBLISHED at that version, and no piece and no site is sent (backing is the repair pass's, not this page's);
 //! - P5: a set that cannot reach `k` (more than `m` finally refused) ends the publish REFUSED before any site; a final
 //!   refusal after the set has `k` is recorded and ends nothing (BACKED_UP never comes).
 //!
@@ -62,11 +64,14 @@ pub struct SetLine {
 /// status word, sdk#523's vocabulary, exhaustively); only [`AppPublishState::step`] writes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppPublish {
+    /// The site is being READ (P6); nothing is sent yet.
+    Checking { sets: Vec<SetProgress> },
     /// Pieces in flight; at least one set is below `k`; the site is NOT sent (P1).
     Pieces { sets: Vec<SetProgress> },
     /// Every set is at `k` or more; the site's publication is in flight (the page's `Publication`).
     Siting { sets: Vec<SetProgress> },
-    /// The site is read back at `version`; some piece is still owed.
+    /// The site is read back at `version`; some piece is still owed. From `Checking` (P6) `sets` is EMPTY: nothing
+    /// was sent, nothing is owed, and BACKED_UP never comes from this publish.
     Published { version: u64, sets: Vec<SetProgress> },
     /// Every piece of every set is acked.
     BackedUp { version: u64 },
@@ -84,6 +89,8 @@ pub enum AppPublish {
 /// What moves it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PublishEvent {
+    /// The site's check read (P6): `Some(v)` it holds THIS bundle at `v`; `None` it does not (no site, another bundle).
+    SiteRead(Option<u64>),
     /// A piece's PUT acked, by its node key.
     PieceAcked(String),
     /// A piece's PUT FINALLY refused (page-io's one rule), by its node key.
@@ -97,6 +104,8 @@ pub(crate) enum PublishEvent {
 /// What page-io carries out, after the state is set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PublishEffect {
+    /// PUT the pieces (P6: the site does not hold this bundle).
+    SendPieces,
     /// Send the site (P1: every set is rebuildable).
     SendSite,
     /// Withdraw these pieces' PUTs (a cancel).
@@ -165,6 +174,12 @@ impl AppPublish {
         use PublishEffect as F;
         use PublishEvent as E;
         match (self, ev) {
+            // ---- Checking: the site is read first; nothing is sent (P6) ----
+            (S::Checking { .. }, E::SiteRead(Some(v))) => go(S::Published { version: *v, sets: Vec::new() }, vec![]),
+            (S::Checking { sets }, E::SiteRead(None)) => go(S::Pieces { sets: sets.clone() }, vec![F::SendPieces]),
+            (S::Checking { .. }, E::PieceAcked(_) | E::PieceRefused(_) | E::SitePublished(_) | E::SiteSuperseded(_) | E::SiteRefused(_)) => stay(Cell::Impossible),
+            (S::Checking { .. }, E::Cancel) => go(S::Cancelled, vec![F::CancelSite]),
+            (S::Pieces { .. } | S::Siting { .. } | S::Published { .. }, E::SiteRead(_)) => stay(Cell::Late),
             // ---- Pieces: the site is not sent (P1) ----
             (S::Pieces { sets }, E::PieceAcked(key)) => match mark(sets, key, true) {
                 Some(sets) if sets.iter().all(SetProgress::rebuildable) => go(S::Siting { sets }, vec![F::SendSite]),
@@ -215,7 +230,7 @@ impl AppPublish {
             // ---- the ends ----
             (
                 S::BackedUp { .. } | S::BackupAbandoned { .. } | S::Refused { .. } | S::Superseded { .. } | S::Cancelled,
-                E::PieceAcked(_) | E::PieceRefused(_) | E::SitePublished(_) | E::SiteSuperseded(_) | E::SiteRefused(_),
+                E::SiteRead(_) | E::PieceAcked(_) | E::PieceRefused(_) | E::SitePublished(_) | E::SiteSuperseded(_) | E::SiteRefused(_),
             ) => stay(Cell::Late),
             (S::BackedUp { .. } | S::BackupAbandoned { .. } | S::Refused { .. } | S::Superseded { .. } | S::Cancelled, E::Cancel) => stay(Cell::Nothing),
         }
@@ -225,7 +240,7 @@ impl AppPublish {
     pub fn version(&self) -> Option<u64> {
         match self {
             AppPublish::Published { version, .. } | AppPublish::BackedUp { version } | AppPublish::BackupAbandoned { version, .. } | AppPublish::Superseded { version } => Some(*version),
-            AppPublish::Pieces { .. } | AppPublish::Siting { .. } | AppPublish::Refused { .. } | AppPublish::Cancelled => None,
+            AppPublish::Checking { .. } | AppPublish::Pieces { .. } | AppPublish::Siting { .. } | AppPublish::Refused { .. } | AppPublish::Cancelled => None,
         }
     }
 
@@ -236,7 +251,7 @@ impl AppPublish {
 
     fn sets(&self) -> &[SetProgress] {
         match self {
-            AppPublish::Pieces { sets } | AppPublish::Siting { sets } | AppPublish::Published { sets, .. } | AppPublish::BackupAbandoned { sets, .. } => sets,
+            AppPublish::Checking { sets } | AppPublish::Pieces { sets } | AppPublish::Siting { sets } | AppPublish::Published { sets, .. } | AppPublish::BackupAbandoned { sets, .. } => sets,
             AppPublish::BackedUp { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => &[],
         }
     }
@@ -250,7 +265,7 @@ impl AppPublish {
                 let short: Vec<String> = sets.iter().filter(|s| s.refused() > 0).map(|s| format!("set {}: {} of {} pieces refused", s.set.name, s.refused(), s.keys.len())).collect();
                 (!short.is_empty()).then(|| format!("published, and BACKED_UP will not come: {}", short.join("; ")))
             }
-            AppPublish::Pieces { .. } | AppPublish::Siting { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => None,
+            AppPublish::Checking { .. } | AppPublish::Pieces { .. } | AppPublish::Siting { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => None,
         }
     }
 
@@ -259,7 +274,8 @@ impl AppPublish {
     pub(crate) fn owes(&self, key: &str) -> bool {
         match self {
             AppPublish::Pieces { sets } | AppPublish::Siting { sets } | AppPublish::Published { sets, .. } => sets.iter().any(|s| s.pending().any(|k| k == key)),
-            AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => false,
+            // Checking: nothing is sent yet, so nothing is owed an answer.
+            AppPublish::Checking { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => false,
         }
     }
 
@@ -272,15 +288,23 @@ impl AppPublish {
     pub(crate) fn ended(&self) -> bool {
         match self {
             AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => true,
-            AppPublish::Pieces { .. } | AppPublish::Siting { .. } | AppPublish::Published { .. } => false,
+            AppPublish::Checking { .. } | AppPublish::Pieces { .. } | AppPublish::Siting { .. } | AppPublish::Published { .. } => false,
         }
     }
 
     /// Is this publish still going (pieces or site in flight)? A second publish of the app is refused meanwhile.
     pub(crate) fn in_flight(&self) -> bool {
         match self {
-            AppPublish::Pieces { .. } | AppPublish::Siting { .. } => true,
+            AppPublish::Checking { .. } | AppPublish::Pieces { .. } | AppPublish::Siting { .. } => true,
             AppPublish::Published { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => false,
+        }
+    }
+
+    /// Is the site's CHECK read in flight (P6)?
+    pub(crate) fn checking(&self) -> bool {
+        match self {
+            AppPublish::Checking { .. } => true,
+            AppPublish::Pieces { .. } | AppPublish::Siting { .. } | AppPublish::Published { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => false,
         }
     }
 
@@ -288,7 +312,7 @@ impl AppPublish {
     pub(crate) fn siting(&self) -> bool {
         match self {
             AppPublish::Siting { .. } => true,
-            AppPublish::Pieces { .. } | AppPublish::Published { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => false,
+            AppPublish::Checking { .. } | AppPublish::Pieces { .. } | AppPublish::Published { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled => false,
         }
     }
 }
@@ -298,9 +322,9 @@ impl AppPublish {
 pub(crate) struct AppPublishState(AppPublish);
 
 impl AppPublishState {
-    /// A new publish: its sets' pieces are about to be PUT.
+    /// A new publish: the site is read first (P6); its sets' pieces are PUT only if it does not hold this bundle.
     pub(crate) fn start(sets: Vec<SetProgress>) -> Self {
-        AppPublishState(AppPublish::Pieces { sets })
+        AppPublishState(AppPublish::Checking { sets })
     }
     pub(crate) fn get(&self) -> &AppPublish {
         &self.0
@@ -360,6 +384,7 @@ mod tests {
         let near = || vec![with(set("core", 3, 2), 2, 2)];
         let whole_but_one = || vec![with(set("core", 3, 2), 4, 0)];
         vec![
+            ("Checking", AppPublish::Checking { sets: near() }),
             ("Pieces", AppPublish::Pieces { sets: near() }),
             ("Siting", AppPublish::Siting { sets: whole_but_one() }),
             ("Published", AppPublish::Published { version: 2, sets: whole_but_one() }),
@@ -379,6 +404,7 @@ mod tests {
             _ => ("core-4", "core-4"),
         };
         vec![
+            PublishEvent::SiteRead(Some(2)),
             PublishEvent::PieceAcked(ack.into()),
             PublishEvent::PieceRefused(refuse.into()),
             PublishEvent::SitePublished(2),
@@ -388,12 +414,12 @@ mod tests {
         ]
     }
 
-    /// EVERY CELL IS DECIDED, and the counts are APP-PUBLISH.md draft 2's (8 × 6 = 48): transitions 9, record-only 3,
-    /// impossible 3, late 28, nothing 5. The test prints the table, row by row.
+    /// EVERY CELL IS DECIDED, and the counts are APP-PUBLISH.md's (docs 5d43310, P6: 9 × 7 = 63): transitions 11,
+    /// record-only 3, impossible 8, late 36, nothing 5. The test prints the table, row by row.
     #[test]
     fn every_publish_cell_is_decided_and_the_counts_are_the_documents() {
         let mut counts = std::collections::BTreeMap::new();
-        println!("| state \\ event | PieceAcked | PieceRefused | SitePublished | SiteSuperseded | SiteRefused | Cancel |");
+        println!("| state \\ event | SiteRead | PieceAcked | PieceRefused | SitePublished | SiteSuperseded | SiteRefused | Cancel |");
         for (name, state) in rows() {
             let cells: Vec<String> = events(name)
                 .iter()
@@ -410,7 +436,7 @@ mod tests {
         }
         println!("{counts:?}");
         let n = |c| counts.get(&c).copied().unwrap_or(0);
-        assert_eq!([n(Cell::Transition), n(Cell::Record), n(Cell::Impossible), n(Cell::Late), n(Cell::Nothing)], [9, 3, 3, 28, 5], "a cell changed: APP-PUBLISH.md's table changes with it");
+        assert_eq!([n(Cell::Transition), n(Cell::Record), n(Cell::Impossible), n(Cell::Late), n(Cell::Nothing)], [11, 3, 8, 36, 5], "a cell changed: APP-PUBLISH.md's table changes with it");
     }
 
     use crate::seeded::Rng;
@@ -422,12 +448,23 @@ mod tests {
     /// after is recorded only), and no impossible cell. Its reach is floored on the cells its checks are about.
     #[test]
     fn the_publish_model_holds_p1_p3_p5_on_every_step() {
-        let (mut sent_sites, mut lost_before, mut refused_after, mut backed, mut abandoned) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut sent_sites, mut lost_before, mut refused_after, mut backed, mut abandoned, mut current) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let sets = vec![set("core", 3, 2), set("prov", 2, 2)];
             let mut owed: Vec<String> = sets.iter().flat_map(|s| s.keys.clone()).collect();
             let mut st = AppPublishState::start(sets);
+            // P6: the site is read first. A site already holding this bundle -> Published, NOTHING sent or owed.
+            let holds = rng.pick(5) == 0;
+            let (effects, cell) = st.step(&PublishEvent::SiteRead(holds.then_some(1)));
+            assert_eq!(cell, Cell::Transition, "seed {seed}: the check read did not move the publish");
+            if holds {
+                assert_eq!(st.get(), &AppPublish::Published { version: 1, sets: Vec::new() }, "seed {seed}: P6 -- a current site was not published at its version");
+                assert!(effects.is_empty() && st.get().owed_keys().is_empty(), "seed {seed}: P6 -- a current site sent or owed something: {effects:?}");
+                current += 1;
+                continue;
+            }
+            assert_eq!(effects, vec![PublishEffect::SendPieces], "seed {seed}: P6 -- a site that does not hold this bundle did not send its pieces");
             let (mut site_sent, mut site_answered) = (false, false);
             for i in 0..60 {
                 let before = st.get().clone();
@@ -461,8 +498,8 @@ mod tests {
                 if matches!(now, AppPublish::BackedUp { .. }) && !matches!(before, AppPublish::BackedUp { .. }) {
                     backed += 1;
                     let all: Vec<SetProgress> = match &before {
-                        AppPublish::Siting { sets } | AppPublish::Published { sets, .. } => mark(sets, match &ev { PublishEvent::PieceAcked(k) => k, PublishEvent::PieceRefused(_) | PublishEvent::SitePublished(_) | PublishEvent::SiteSuperseded(_) | PublishEvent::SiteRefused(_) | PublishEvent::Cancel => "" }, true).unwrap_or_else(|| sets.clone()),
-                        other @ (AppPublish::Pieces { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled) => panic!("{at}: BACKED_UP from {other:?}"),
+                        AppPublish::Siting { sets } | AppPublish::Published { sets, .. } => mark(sets, match &ev { PublishEvent::PieceAcked(k) => k, PublishEvent::SiteRead(_) | PublishEvent::PieceRefused(_) | PublishEvent::SitePublished(_) | PublishEvent::SiteSuperseded(_) | PublishEvent::SiteRefused(_) | PublishEvent::Cancel => "" }, true).unwrap_or_else(|| sets.clone()),
+                        other @ (AppPublish::Checking { .. } | AppPublish::Pieces { .. } | AppPublish::BackedUp { .. } | AppPublish::BackupAbandoned { .. } | AppPublish::Refused { .. } | AppPublish::Superseded { .. } | AppPublish::Cancelled) => panic!("{at}: BACKED_UP from {other:?}"),
                     };
                     assert!(all.iter().all(SetProgress::whole), "{at}: P3 -- BACKED_UP with a piece owed");
                 }
@@ -485,7 +522,7 @@ mod tests {
                 }
             }
         }
-        println!("reached: sites sent {sent_sites}, lost before the site {lost_before}, refused after k {refused_after}, backed up {backed}, backup abandoned {abandoned}");
-        assert!(sent_sites > 0 && lost_before > 0 && refused_after > 0 && backed > 0 && abandoned > 0, "the model never reached a cell its checks are about");
+        println!("reached: current (nothing sent) {current}, sites sent {sent_sites}, lost before the site {lost_before}, refused after k {refused_after}, backed up {backed}, backup abandoned {abandoned}");
+        assert!(current > 0 && sent_sites > 0 && lost_before > 0 && refused_after > 0 && backed > 0 && abandoned > 0, "the model never reached a cell its checks are about");
     }
 }
