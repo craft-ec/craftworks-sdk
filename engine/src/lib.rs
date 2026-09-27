@@ -1998,7 +1998,9 @@ impl<B: Blocks> Engine<B> {
     pub fn damaged(&self) -> Vec<Damaged> {
         self.repairs
             .values()
-            .filter(|r| r.missed)
+            // Named only for a block a live READ waits on (Codex on sdk#542): two sibling repairs each wanting the
+            // other's block outlive their superseded reads, and nobody is waiting on them.
+            .filter(|r| r.missed && self.readers_of(&r.group.missing).reads)
             .filter_map(|r| {
                 let slots = r.group.slots.len();
                 let j = slots - r.absent.len().min(slots);
@@ -4931,12 +4933,15 @@ impl<B: Blocks> Engine<B> {
         self.repair_counts.0 += 1;
         let missing = group.missing;
         let mut r = Repair { group, have: BTreeMap::new(), asked: BTreeMap::new(), missed, dropped: BTreeSet::new(), absent: BTreeSet::new() };
+        // The missing block's OWN slots -- every one holding its id -- are not asked as group slots, and a miss marks
+        // them all absent.
+        let own: BTreeSet<usize> = r.group.slots_of(&missing).collect();
         if missed {
-            r.absent.insert(r.group.missing_ix);
+            r.absent.extend(&own);
         }
         let mut out = Vec::new();
         for i in 0..r.group.slots.len() {
-            if i == r.group.missing_ix {
+            if own.contains(&i) {
                 continue;
             }
             let slot = r.group.slots[i];
@@ -4976,28 +4981,31 @@ impl<B: Blocks> Engine<B> {
                 continue;
             }
             let Some(r) = self.repairs.get_mut(&missing) else { continue };
-            let Some(i) = r.group.slots.iter().position(|s| *s == slot) else { continue };
-            match bytes {
-                Some(b) if r.group.fits(i, b) => {
-                    let st = r.group.stored(i, b);
-                    r.have.insert(i, st);
-                    r.asked.remove(&i);
-                    r.absent.remove(&i);
-                }
-                // A RACE drops a slot the node does not have (or answered wrong): the read's own block is
-                // still asked, and re-asking parity beside a healthy read is GETs for nothing (sdk#303).
-                _ if !r.missed => {
-                    r.asked.remove(&i);
-                    r.dropped.insert(i);
-                    r.absent.insert(i);
-                }
-                _ => {
-                    r.absent.insert(i);
-                    // Still asked, and asked AGAIN: a group block that is slow
-                    // is not a group block that is gone, so no count here
-                    // ever gives up on it (the page paces the re-ask).
-                    *r.asked.entry(i).or_insert(0) += 1;
-                    still_asked = true;
+            // EVERY slot holding this id: one block fills (or misses) them all (sdk#542).
+            let ixs: Vec<usize> = r.group.slots_of(&slot).collect();
+            for i in ixs {
+                match bytes {
+                    Some(b) if r.group.fits(i, b) => {
+                        let st = r.group.stored(i, b);
+                        r.have.insert(i, st);
+                        r.asked.remove(&i);
+                        r.absent.remove(&i);
+                    }
+                    // A RACE drops a slot the node does not have (or answered wrong): the read's own block is
+                    // still asked, and re-asking parity beside a healthy read is GETs for nothing (sdk#303).
+                    _ if !r.missed => {
+                        r.asked.remove(&i);
+                        r.dropped.insert(i);
+                        r.absent.insert(i);
+                    }
+                    _ => {
+                        r.absent.insert(i);
+                        // Still asked, and asked AGAIN: a group block that is slow
+                        // is not a group block that is gone, so no count here
+                        // ever gives up on it (the page paces the re-ask).
+                        *r.asked.entry(i).or_insert(0) += 1;
+                        still_asked = true;
+                    }
                 }
             }
             out.extend(self.try_repair(missing));

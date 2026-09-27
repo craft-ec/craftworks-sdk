@@ -119,6 +119,19 @@ await t("and the engine side's extras are declared, not accidental", () => {
     "project would not have. Add them to the in-memory one, or to ENGINE_ONLY with a reason.");
 });
 
+await t("**every ENGINE_ONLY method EXISTS on the engine db** -- declared is not offered (Codex on sdk#542)", () => {
+  const engine = surfaceOf(engineDb(fakeSession()));
+  const absent = [...ENGINE_ONLY].filter(m => !engine.has(m));
+  assert.deepEqual(absent, [], `declared engine-only, but the engine db does not offer: ${absent.join(", ")}`);
+});
+
+await t("**damaged() forwards what the session names** (sdk#524): a DAMAGED group, not an empty list", () => {
+  const named = [{ block: "ab".repeat(32), j: 20, k: 21, health: "DAMAGED", why: "lost past the group's reach" }];
+  const fake = fakeSession();
+  const db = engineDb({ ...fake, session: { ...fake.session, damaged: () => JSON.stringify(named) } });
+  assert.deepEqual(db.damaged(), named);
+});
+
 // ---------------------------------------------------------------------------
 // SHAPE, not just name.
 // ---------------------------------------------------------------------------

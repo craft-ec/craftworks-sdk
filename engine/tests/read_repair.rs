@@ -550,7 +550,6 @@ fn lose_slots(slots: &[Cid], first: &[Cid], n: usize) -> BTreeSet<Cid> {
 /// two slots, and a NotFound for it answers BOTH. m + 1 SLOTS lost with the read's own block the repeated one: DAMAGED
 /// at j = k - 1 the moment the own block misses; m slots lost: nothing named.
 #[test]
-#[should_panic(expected = "m + 1 slots lost with one id in two of them: not named damaged")] // PINNED: flipped by the fix
 fn an_id_in_two_slots_missing_is_absent_in_both() {
     let (records, root, all, slots, k) = a_value_group(&[0, 5]);
     let key = b"v/0000".to_vec();
@@ -572,7 +571,6 @@ fn an_id_in_two_slots_missing_is_absent_in_both() {
 /// ONE ID IN TWO SLOTS, HELD: a block that arrives fills EVERY slot of its id. Exactly `k` slots survive, two of them
 /// the repeated id: the lost member is rebuilt and read right -- counted once, the group would stay one short for ever.
 #[test]
-#[should_panic(expected = "a repeated id counted once")] // PINNED: flipped by the fix
 fn an_id_in_two_slots_arriving_fills_both() {
     let (records, root, all, slots, k) = a_value_group(&[0, 5]);
     let twice = freenet_prolly::block_id(freenet_prolly::kind::RAW, &records[&b"v/0000".to_vec()]);
@@ -592,7 +590,6 @@ fn an_id_in_two_slots_arriving_fills_both() {
 /// group, each repair asking the other's block -- so after both reads are superseded, each repair still "wants" a
 /// block of the other's and neither ends. `damaged()` names only a repair a live READ waits on.
 #[test]
-#[should_panic(expected = "named damaged with no read")] // PINNED: flipped by the fix
 fn a_repair_with_no_read_left_is_not_named_damaged() {
     let (records, root, all, slots, k) = a_value_group(&[]);
     let keys = [b"v/0001".to_vec(), b"v/0002".to_vec()];
