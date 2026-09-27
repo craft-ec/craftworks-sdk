@@ -152,7 +152,7 @@ const ARGS = {
   children: ["d", "x"],
   root: [], stats: [], bind: ["d"],
   // The definition doors (app-as-data P2).
-  draftPut: ["meta", {}], draftDelete: ["meta"], publishDefinition: [], definition: ["draft"],
+  draftPut: ["meta", {}], draftDelete: ["meta"], publishDefinition: [], definition: ["draft"], definitionApps: [],
   markPublished: ["d"], isPublished: ["d"],
   // Another app's data, read-only: the handle itself is a VALUE on both surfaces.
   other: ["some-app"],
