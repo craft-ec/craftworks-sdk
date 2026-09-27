@@ -3256,3 +3256,54 @@ fn a_publish_naming_a_piece_twice_is_refused() {
     let e = io.publish_app(APP, vec![(a, ca), (b, cb)], SITE_CODE, web(1), Ms(1)).expect_err("a duplicate address was taken");
     assert!(e.contains("another piece of this publish names too"), "{e}");
 }
+
+/// Is frame `f` a GET of `key`?
+fn is_get_of(f: &[u8], key: &ContractKey) -> bool {
+    matches!(bincode::deserialize::<ClientRequest>(f), Ok(ClientRequest::ContractOp(ContractRequest::Get { key: k, .. })) if k == *key.id())
+}
+
+/// A READ ANSWERED TOO LARGE ENDS, NAMED (rule 8; engineer1 on the builder's 5.9 MB site, whose read-back re-asked for
+/// ever as "site craftworks-builder's read"): a site's read-back answered with a state bigger than this page reads
+/// (one frame over `wire::MAX_FRAME`) IS an answer -- the publication ends REFUSED naming the size, and the read is
+/// not asked again.
+#[test]
+#[should_panic(expected = "a too-large read-back did not end the publication")] // PINNED: flipped by the fix
+fn a_site_read_back_answered_too_large_ends_named_and_is_not_asked_again() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let site = page_io::site_contract(SITE_CODE, &node.register_params, APP).expect("site").key();
+    let big = ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key: site, contract: None, state: WrappedState::new(vec![1u8; wire::MAX_FRAME + 1]) }));
+    io.publish_site(APP, SITE_CODE, web(1), Ms(now)).expect("publishes");
+    let (mut site_gets, mut after_end) = (0, 0);
+    for _ in 0..400 {
+        let frames = io.take_frames();
+        if frames.is_empty() {
+            match io.next_due() {
+                Some(Ms(t)) => {
+                    now = now.max(t);
+                    io.tick(Ms(now));
+                    continue;
+                }
+                None => break,
+            }
+        }
+        now += 1;
+        let ended = matches!(io.publication(APP), Some(page::Publication::Refused(_)));
+        for f in frames {
+            if is_get_of(&f, &site) {
+                site_gets += 1;
+                after_end += usize::from(ended);
+                io.inbound(&big, Ms(now));
+            } else if let Some(a) = node.serve(&f) {
+                io.inbound(&a, Ms(now));
+            }
+        }
+    }
+    assert!(site_gets > 0, "THE SETUP: the site was never read back");
+    match io.publication(APP) {
+        Some(page::Publication::Refused(w)) => assert!(w.contains("bytes") && w.contains("read"), "the refusal does not name the size: {w}"),
+        other => panic!("a too-large read-back did not end the publication: {other:?}, {site_gets} site reads"),
+    }
+    assert_eq!(after_end, 0, "the site was read again after its read-back ended");
+}
