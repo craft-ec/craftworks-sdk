@@ -185,12 +185,12 @@ fn a_host_fed_only_deltas_answers_like_a_map_through_many_flushes() {
                 let mut ops = Vec::new();
                 for _ in 0..(1 + r() % 3) {
                     let k = keys[(r() % keys.len() as u64) as usize].clone();
-                    if r() % 4 == 0 {
+                    if r().is_multiple_of(4) {
                         model.remove(&k);
                         ops.push(Op::Delete { key: k });
                     } else {
                         // Some values past the tree's inline limit, so they live in blocks of their own.
-                        let len = if r() % 5 == 0 {
+                        let len = if r().is_multiple_of(5) {
                             1500
                         } else {
                             1 + (r() % 40) as usize
