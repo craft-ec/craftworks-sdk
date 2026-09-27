@@ -372,6 +372,37 @@ mod tests {
         assert_eq!(bulk.slots[..bulk.k].iter().copied().collect::<BTreeSet<_>>(), bulk_values, "--domain chose other members");
     }
 
+    /// `--domain` keeps a group by its ENTRIES' keys, never by the value's id (Codex on #541): a value stored under a
+    /// record of ANOTHER domain has the same id as an identical bulk value, so a membership keyed by id passes it.
+    /// Here one leaf's group holds `aaa`'s record and the three bulk records, `aaa`'s value identical to bulk's first:
+    /// the group is not bulk's alone, so `--domain bulk` chooses NOTHING.
+    #[test]
+    #[should_panic(expected = "--domain bulk chose a group holding aaa's record")] // PINNED: flipped by the fix
+    fn a_group_holding_another_domains_record_is_not_the_domains_even_with_an_identical_value() {
+        let mut b = MemBlocks::default();
+        let empty = freenet_prolly::build::init(&mut b);
+        let key = |domain: &str, i: u32| {
+            let mut rkey = [0u8; 16];
+            rkey[12..].copy_from_slice(&i.to_be_bytes());
+            craftworks_sdk::db::record_key(domain, rkey)
+        };
+        let value = |i: u8| vec![b'x' + i; 1400];
+        let mut edits: Vec<(Vec<u8>, Edit)> = vec![(key("aaa", 0), Edit::Put(value(0)))];
+        edits.extend((0..3u32).map(|i| (key("bulk", i), Edit::Put(value(i as u8)))));
+        edits.sort_by(|a, b| a.0.cmp(&b.0));
+        let applied = apply_into(&mut b, &empty, &edits).expect("the tree");
+        let root = b.get(&applied.root).expect("held").to_vec();
+        let node = Node::parse(&root).expect("a node");
+        // THE SETUP: the root is one leaf whose one group of referenced values holds all four records.
+        assert!(node.is_leaf(), "THE SETUP: the root is not a leaf");
+        let groups = group_members(&node);
+        assert_eq!(groups.len(), 1, "THE SETUP: the four records are not one group");
+        assert_eq!(groups[0].1.len(), 4, "THE SETUP: the group is not the four records");
+        let mut l = Lose::new(Target::Data, PARITY).with_domain("bulk");
+        let _ = l.block(applied.root, &state(kind::TREE_NODE, &root));
+        assert_eq!(l.chosen(), None, "--domain bulk chose a group holding aaa's record");
+    }
+
     /// A leaf (no referenced values: no group) and a value block are never chosen as the data group.
     #[test]
     fn nothing_without_a_group_of_two_is_chosen() {
