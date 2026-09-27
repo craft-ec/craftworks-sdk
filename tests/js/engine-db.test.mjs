@@ -491,5 +491,75 @@ await t("nothing in the wrapper branches on a message, or waits on a timer", () 
   assert.ok(/\.code\s*!==\s*"NOT_LOADED"/.test(src), "the wrapper does not branch on a code at all");
 });
 
+// ---- REPAIR (sdk#479): the whole tree through the normal read, then the put-backs' answers ----------------------
+// A session whose whole-tree pages ARRIVE LATER (the first a NOT_LOADED with a ticket, as the Rust side answers), and
+// whose repair PUTs are answered on a later wake. `outcome` comes from the session (the SDK's one derivation), never
+// from the wrapper.
+const repairSession = ({ pages = 3, pending = 2 } = {}) => {
+  let ended = [];
+  let loaded = false;
+  let owed = pending;
+  const s = {
+    asked: [],
+    putBack: [],
+    scan_all(after, limit, putBack) {
+      s.asked.push(after);
+      s.putBack.push(putBack);
+      if (!loaded) {
+        setTimeout(() => { loaded = true; ended.push({ id: 1, ok: true, code: "LOADED" }); s.wake(); }, 5);
+        const e = new Error("not loaded");
+        e.code = "NOT_LOADED"; e.transient = true; e.wait = 1;
+        throw e;
+      }
+      const n = after === "" ? 0 : Number(after);
+      return JSON.stringify({ rows: 10, next: n + 1 < pages ? String(n + 1) : null });
+    },
+    repair_report(cancelled, check) {
+      return JSON.stringify({ outcome: cancelled ? "cancelled" : check ? "DEGRADED" : owed ? "partial" : "repaired", missing: 2, putBack: pending - owed, rejected: 0, givenUp: 0, parityMismatched: 0, pending: owed, damaged: [], why: null });
+    },
+    answerPuts() { owed = 0; s.wake(); },
+    take_loads() { const out = ended; ended = []; return JSON.stringify(out); },
+    resume() {},
+    onReadsWake(cb) { s.wake = cb; },
+    wake: () => {},
+  };
+  return s;
+};
+
+await t("repairAll reads every page of the tree, waits for its put-backs' answers, and returns the session's report", async () => {
+  const s = repairSession({ pages: 3, pending: 2 });
+  const db = engineDb(s);
+  let done = false;
+  const run = db.repairAll({ limit: 10 }).then(r => { done = true; return r; });
+  await new Promise(r => setTimeout(r, 30));
+  assert.deepEqual(s.asked, ["", "", "1", "2"], "the pages were not read in order, the first after its load");
+  assert.equal(done, false, "repairAll resolved before its put-backs were answered");
+  s.answerPuts();
+  const r = await run;
+  assert.equal(r.rows, 30);
+  assert.equal(r.outcome, "repaired", "the outcome is not the session's word");
+  assert.equal(r.putBack, 2);
+});
+
+await t("checkAll reads every page with putBack false, waits for no put-back, and returns the session's check word", async () => {
+  const s = repairSession({ pages: 2, pending: 2 });
+  const db = engineDb(s);
+  const r = await db.checkAll({ limit: 10 });
+  assert.deepEqual(s.putBack.filter((_, i) => i > 0), [false, false], "a check page asked the session to put back");
+  assert.equal(r.rows, 20);
+  assert.equal(r.outcome, "DEGRADED", "the outcome is not the session's check word");
+});
+
+await t("repairAllCancel stops a running pass: it resolves CANCELLED with the counts so far", async () => {
+  const s = repairSession({ pages: 2, pending: 2 });
+  const db = engineDb(s);
+  const run = db.repairAll({ limit: 10 });
+  await new Promise(r => setTimeout(r, 30));
+  db.repairAllCancel();
+  const r = await run;
+  assert.equal(r.outcome, "cancelled");
+  assert.equal(r.pending, 2, "the counts so far were not reported");
+});
+
 process.stdout.write(failures ? `\n${failures} failing\n` : "\nall passing\n");
 process.exit(failures ? 1 : 0);

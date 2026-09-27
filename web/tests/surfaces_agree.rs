@@ -107,6 +107,12 @@ const TRANSPORT_ONLY: &[&str] = &[
     "publish_app",
     "app_publish_status",
     "cancel_app_publish",
+    // An app's DEFINITION published with its SITE in one call (#560, app-as-data P5): a node operation, as publish_app.
+    "publish_definition_site",
+    // REPAIR (sdk#479): a whole-tree read that puts back what the NODE lost, and its report. An in-memory store has
+    // no node to have lost anything.
+    "scan_all",
+    "repair_report",
     // WHOSE NODE: ask the node's signer which head it signs for, registering
     // nothing (a published app opens writable for its publisher). An
     // in-memory store has no node and no signer to ask.

@@ -78,12 +78,16 @@ enum Net {
     /// Answers ONCE with bytes that do not hash to the id, then is silent (a re-ask is paced by the page's RTO;
     /// answering every re-ask at once would only spin this loop).
     Forged,
+    /// The node does not have it: NotFound.
+    Lost,
 }
 
 struct Run {
     /// Blocks the engine told `Unwanted` (WANTED-LIFE), over the whole run.
     unwanted: BTreeSet<Cid>,
     answers: BTreeMap<Vec<u8>, ReadResult>,
+    /// Blocks the engine put back (`PutRepaired`), in order.
+    repaired: Vec<(Cid, Vec<u8>)>,
     /// FetchBlock effects per block id, over the whole run.
     asked: BTreeMap<Cid, usize>,
     e: Engine<Store>,
@@ -115,6 +119,7 @@ fn read_cold_as(
     let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
     let mut forged: BTreeSet<Cid> = BTreeSet::new();
     let mut unwanted: BTreeSet<Cid> = BTreeSet::new();
+    let mut repaired = Vec::new();
     let rounds: Vec<Vec<usize>> = if together {
         vec![(0..keys.len()).collect()]
     } else {
@@ -143,6 +148,7 @@ fn read_cold_as(
                     }
                     match (net.get(&id).copied().unwrap_or(Net::Serve), all.get(&id)) {
                         (Net::Silent, _) => {}
+                        (Net::Lost, _) => queue.extend(e.step(Event::BlockMissed(id))),
                         (Net::Forged, _) if !forged.insert(id) => {}
                         (Net::Forged, Some(b)) => {
                             let mut bad = b.to_vec();
@@ -161,6 +167,7 @@ fn read_cold_as(
                     }
                 }
                 Effect::Keep { id, bytes } => store.put(id, &bytes),
+                Effect::PutRepaired { id, bytes } => repaired.push((id, bytes)),
                 Effect::Unwanted { id } => {
                     unwanted.insert(id);
                 }
@@ -171,7 +178,7 @@ fn read_cold_as(
             }
         }
     }
-    Run { unwanted, answers, asked, e }
+    Run { unwanted, answers, repaired, asked, e }
 }
 
 fn wrong(
@@ -517,4 +524,33 @@ fn a_forged_slot_does_not_count_toward_k() {
 
 fn hex(c: &Cid) -> String {
     core_types::hex::encode(&c[..6])
+}
+
+/// **A MISSING PARITY BLOCK IS PUT BACK** (sdk#479; the owner via core dev: a group whose parity is never replaced
+/// erodes to its last copy). The node has lost one parity block of a group; reading the group's keys races the group,
+/// sees that parity NotFound, and -- once every member is held -- re-encodes it with the save's own code and PUTs it
+/// back, byte for byte the block the save made. THE CONTROL: nothing lost, nothing put back.
+#[test]
+fn a_parity_block_the_reads_find_missing_is_re_encoded_and_put_back_byte_for_byte() {
+    let records = records();
+    let (root, mut all) = tree(&records);
+    let (members, parity) = a_leaf_group(&mut all, root);
+    let keys = keys_in(&all, &members);
+    let lost = parity[1];
+    let net: BTreeMap<Cid, Net> = [(lost, Net::Lost)].into_iter().collect();
+    let run = read_cold(root, &all, &net, &keys, Params::default());
+    assert!(wrong(&run.answers, &records).is_empty(), "THE SETUP: a read of the group went wrong");
+    let original = all.get(&lost).expect("the save made it").to_vec();
+    let back: Vec<&(Cid, Vec<u8>)> = run.repaired.iter().filter(|(id, _)| *id == lost).collect();
+    assert_eq!(back.len(), 1, "the lost parity was not put back exactly once: {} times", back.len());
+    assert_eq!(back[0].1, original, "the parity put back is not the block the save made");
+    // THE CONTROL: the same reads with the parity on the network. (The fixture puts only THIS node's parity on the
+    // network, so other groups' parity is missing in both runs: the difference is this one block.)
+    let clean = read_cold(root, &all, &BTreeMap::new(), &keys, Params::default());
+    // (A MEMBER may be put back in either run: when `k` of its group answer before it, the race rebuilds it -- main's
+    // race get, not this change.)
+    assert!(clean.repaired.iter().all(|(id, _)| !parity.contains(id)), "THE CONTROL: a whole group put one of its parity blocks back");
+    let (m, p) = (run.e.parity_counts(), clean.e.parity_counts());
+    println!("parity (missing, put back, mismatched): lost one {m:?}, whole {p:?}");
+    assert_eq!((m.0 - p.0, m.1 - p.1, m.2 - p.2), (1, 1, 0), "the lost parity is not the one difference in (missing, put back, mismatched)");
 }

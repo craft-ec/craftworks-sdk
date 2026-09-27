@@ -1008,6 +1008,11 @@ pub enum AuditVerdict {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PassId(pub u64);
 
+/// REPAIR's own pass (sdk#479): while [`Engine::set_repair_pass`] is on, every race keeps each parity slot's GET out
+/// until the NODE answers, under this audit reader -- a real node answers a block it lacks with silence as often as
+/// NotFound, and a race that withdrew its parity GETs once the member arrived never learned a parity block was gone.
+pub const REPAIR_PASS: PassId = PassId(u64::MAX);
+
 
 /// What an engine shed to keep its context saveable (sdk#162), per call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1543,6 +1548,22 @@ pub struct Engine<B: Blocks> {
     landing: Vec<(Cid, Vec<u8>)>,
     /// Repairs started, finished (verified, kept), and given up.
     repair_counts: (u64, u64, u64),
+    /// PARITY the node answered NotFound in a race or repair (sdk#479, the owner: a group whose parity is never
+    /// replaced erodes to its last copy), with its group: re-encoded and PUT back once the page holds all `k` members
+    /// ([`Engine::put_owed_parity`]). Bounded by the NotFounds seen.
+    parity_owed: BTreeMap<Cid, repair::Group>,
+    /// REPAIR mode ([`Engine::set_repair_pass`]): each parity slot a race asked, with its group, until the node answers
+    /// it -- NotFound makes it owed ([`Engine::parity_owed`]).
+    repair_pass: bool,
+    parity_watch: BTreeMap<Cid, repair::Group>,
+    /// Put back what a read rebuilds (true, every read and REPAIR) or only COUNT it (false: a CHECK pass, sdk#479 --
+    /// nothing a read rebuilds or re-encodes is PUT; [`Engine::set_put_back`]).
+    put_back: bool,
+    /// Every block a read found LOST: a member rebuilt from its group, a parity block the node answered NotFound
+    /// (sdk#479). The page's report counts it missing unless the node served it before any repair.
+    lost: BTreeSet<Cid>,
+    /// Parity found missing, put back (re-encoded, id-verified), and re-encoded to a DIFFERENT id (never put).
+    parity_counts: (u64, u64, u64),
     /// Why the last repair was given up, in words (the read is answered
     /// `Unavailable` naming the block; this says why the group could not).
     repair_failed: Option<String>,
@@ -1769,6 +1790,12 @@ impl<B: Blocks> Engine<B> {
             step_asks: BTreeMap::new(),
             landing: Vec::new(),
             repair_counts: (0, 0, 0),
+            parity_owed: BTreeMap::new(),
+            repair_pass: false,
+            parity_watch: BTreeMap::new(),
+            put_back: true,
+            lost: BTreeSet::new(),
+            parity_counts: (0, 0, 0),
             repair_failed: None,
             root,
             published_seq: 0,
@@ -2010,6 +2037,29 @@ impl<B: Blocks> Engine<B> {
             .collect()
     }
 
+    /// REPAIR mode on or off (sdk#479): on, every race keeps its group's parity GETs out until the NODE answers each
+    /// ([`REPAIR_PASS`]), so a parity block the node lacks is learned even when it answers with silence. Off (every
+    /// normal read): a race withdraws what it no longer needs.
+    pub fn set_repair_pass(&mut self, on: bool) {
+        self.repair_pass = on;
+    }
+
+    /// PUT back what reads rebuild (true: every read, and REPAIR) or only count it (false: a CHECK pass, sdk#479).
+    /// Gates BOTH put paths at their source: a rebuilt member's [`Effect::PutRepaired`] and an owed parity's.
+    pub fn set_put_back(&mut self, on: bool) {
+        self.put_back = on;
+    }
+
+    /// Every block a read found lost: members rebuilt, parity answered NotFound (sdk#479).
+    pub fn lost(&self) -> &BTreeSet<Cid> {
+        &self.lost
+    }
+
+    /// Parity the reads found missing, put back, and re-encoded to a different id (sdk#479): `(missing, put, mismatched)`.
+    pub fn parity_counts(&self) -> (u64, u64, u64) {
+        self.parity_counts
+    }
+
     /// Why the last read repair was given up, if one was.
     pub fn repair_failed(&self) -> Option<&str> {
         self.repair_failed.as_deref()
@@ -2158,6 +2208,7 @@ impl<B: Blocks> Engine<B> {
             }
             out.extend(self.step_inner(event));
             out.extend(self.land_rebuilt());
+            out.extend(self.put_owed_parity());
             out.extend(self.keep_saveable());
             out.extend(self.settle_unwanted());
             self.cascade.clear();
@@ -2168,6 +2219,7 @@ impl<B: Blocks> Engine<B> {
         }
         let mut out = self.step_inner(event);
         out.extend(self.land_rebuilt());
+        out.extend(self.put_owed_parity());
         out.extend(self.keep_saveable());
         out.extend(self.settle_unwanted());
         self.cascade.clear();
@@ -4697,6 +4749,9 @@ impl<B: Blocks> Engine<B> {
         // A block of a group being repaired (a parity block among them, which
         // no read asks for by itself).
         let mut out = Vec::new();
+        if by_node {
+            self.parity_watch.remove(&id); // the node HAS it
+        }
         if self.wanted.is_slot(&id) {
             out.extend(self.on_repair_block(id, Some(&bytes)));
             if !self.wanted.read_waits_on(&id) && !(by_node && self.wanted.audit_waits_on(&id)) {
@@ -4798,6 +4853,14 @@ impl<B: Blocks> Engine<B> {
     /// can do nothing about either.
     fn on_missed(&mut self, id: Cid) -> Vec<Effect> {
         let mut out = Vec::new();
+        // REPAIR mode: a watched parity slot the node answered NotFound is owed back (sdk#479).
+        if let Some(g) = self.parity_watch.remove(&id) {
+            if !self.parity_owed.contains_key(&id) {
+                self.parity_counts.0 += 1;
+                self.parity_owed.insert(id, g);
+                self.lost.insert(id);
+            }
+        }
         // E3 BY READER KIND: the audits are ANSWERED (absent: their verdict) and taken; every other reader keeps
         // waiting (rule 8).
         let passes = self.wanted.missed_audits(id);
@@ -4997,6 +5060,12 @@ impl<B: Blocks> Engine<B> {
                         r.asked.remove(&i);
                         r.dropped.insert(i);
                         r.absent.insert(i);
+                        // A PARITY slot the node does NOT HAVE is owed back (sdk#479): the read saw it gone.
+                        if bytes.is_none() && r.group.is_parity(i) && !self.parity_owed.contains_key(&slot) {
+                            self.parity_counts.0 += 1;
+                            self.parity_owed.insert(slot, r.group.clone());
+                            self.lost.insert(slot);
+                        }
                     }
                     _ => {
                         r.absent.insert(i);
@@ -5005,6 +5074,12 @@ impl<B: Blocks> Engine<B> {
                         // ever gives up on it (the page paces the re-ask).
                         *r.asked.entry(i).or_insert(0) += 1;
                         still_asked = true;
+                        // A PARITY slot answered NotFound in a repair is owed back too (sdk#479).
+                        if bytes.is_none() && r.group.is_parity(i) && !self.parity_owed.contains_key(&slot) {
+                            self.parity_counts.0 += 1;
+                            self.parity_owed.insert(slot, r.group.clone());
+                            self.lost.insert(slot);
+                        }
                     }
                 }
             }
@@ -5042,6 +5117,7 @@ impl<B: Blocks> Engine<B> {
             return match rebuilt {
                 Ok(body) => {
                     self.repair_counts.1 += 1;
+                    self.lost.insert(missing);
                     // The page KEEPS it (the node lost it; reads go on from
                     // the page's blocks), PUTs it back, and it lands like any
                     // arrival -- asked BEFORE the arrival, which ends the wait.
