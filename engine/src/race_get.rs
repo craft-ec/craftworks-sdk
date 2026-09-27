@@ -93,7 +93,7 @@ impl<B: Blocks> Engine<B> {
         while !self.landing.is_empty() {
             let (id, body) = self.landing.remove(0);
             if landed.insert(id) {
-                out.extend(self.on_arrived(id, body));
+                out.extend(self.on_arrived(id, body, false));
             }
         }
         out

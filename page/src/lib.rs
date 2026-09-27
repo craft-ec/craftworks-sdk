@@ -669,6 +669,8 @@ pub struct Page {
     /// [`PutPath::Wrapper`]: blocks to ask `Held` about again, when, and how
     /// many absents in a row.
     held_again: BTreeMap<Cid, (u64, u32)>,
+    /// The node's answers for the assets audit's passes (`Effect::AuditAnswered`, sdk#530), until the audit takes them.
+    audit_answers: Vec<(Cid, Vec<engine::PassId>, bool)>,
     /// Blocks to ask `Held` about at the next flush (sdk#455): asked in BATCHES of up to MAX_HELD, one op each, when
     /// the ops leave ([`Page::take_ops`]). An id already in a batch in flight joins it there.
     held_asks: BTreeSet<Cid>,
@@ -815,6 +817,7 @@ impl Page {
             held: Vec::new(),
             pubs: Pubs::default(),
             held_again: BTreeMap::new(),
+            audit_answers: Vec::new(),
             held_asks: BTreeSet::new(),
             next_held_batch: 0,
             landings: 0,
@@ -2251,7 +2254,8 @@ impl Page {
                     Waiting::Get(id) => Some(*id),
                     _ => None,
                 }))
-                .filter(|id| self.engine.blocks().get(id).is_some())
+                // A held block's GET ends -- unless an AUDIT waits on it: only the node's answer serves an audit (W7).
+                .filter(|id| self.engine.blocks().get(id).is_some() && !self.engine.readers_of(id).audits)
             .collect();
         for id in ended {
             self.drop_get(id);
@@ -2356,22 +2360,28 @@ impl Page {
                     self.carry_out(more);
                 }
                 Effect::FetchBlock { id, .. } => {
-                    if self.engine.blocks().get(&id).is_some() {
-                        let bytes = self.engine.blocks().get(&id).expect("held").to_vec();
-                        let more = self.engine.step(Event::BlockArrived { id, bytes });
+                    let held = self.engine.blocks().get(&id).map(<[u8]>::to_vec);
+                    if let Some(bytes) = held.clone() {
+                        // Held here: served from memory -- a LOCAL landing (WANTED-LIFE E2r), never the node's answer.
+                        let more = self.engine.step(Event::BlockLanded { id, bytes });
                         self.carry_out(more);
-                    } else if self.deadlines.get(&Waiting::Get(id)).is_some_and(|d| !d.withdrawn) || self.get_queue.contains(&id) {
-                        // ONE GET per block while one is out: its answer
-                        // serves every reader, and its re-send is the RTO's
-                        // (with its backoff). A second send here would reset
-                        // that clock -- the engine re-asks on every tick and
-                        // re-descent, so a silent block was re-sent on every
-                        // one of them (2,001 GETs in 5 min, measured).
-                    } else {
+                    }
+                    // An AUDIT waits for the NODE's answer, held or not (W7, OP-LIFE E2): its GET still goes.
+                    let node_needed = held.is_none() || self.engine.readers_of(&id).audits;
+                    // ONE GET per block while one is out: its answer
+                    // serves every reader, and its re-send is the RTO's
+                    // (with its backoff). A second send here would reset
+                    // that clock -- the engine re-asks on every tick and
+                    // re-descent, so a silent block was re-sent on every
+                    // one of them (2,001 GETs in 5 min, measured).
+                    let out_already = self.deadlines.get(&Waiting::Get(id)).is_some_and(|d| !d.withdrawn) || self.get_queue.contains(&id);
+                    if node_needed && !out_already {
                         self.send(Waiting::Get(id), Op::Get { id });
                     }
                 }
                 Effect::ReadHead { .. } => self.send(Waiting::RecoverHead, Op::ReadHead { label: Label::Head }),
+                // The node's answer for audit passes (sdk#530): held for the audit to take ([`Page::take_audit_answers`]).
+                Effect::AuditAnswered { id, passes, found } => self.audit_answers.push((id, passes, found)),
                 client => self.client_fx.push(client),
             }
         }
@@ -2437,6 +2447,24 @@ impl Page {
     /// The engine's asks so far, `(wanted, raced)` (sdk#303): a read's cap counts the wanted.
     pub fn fetch_counts(&self) -> (usize, usize) {
         self.engine.fetch_counts()
+    }
+
+    /// THE AUDIT AS A READER (sdk#530, WANTED-LIFE W1/W7): pass `pass` wants block `id` from the NODE -- a reader of
+    /// the one (block, GET) key, so no other reader's end can end the GET it waits on.
+    pub fn audit_want(&mut self, id: Cid, pass: engine::PassId) {
+        let fx = self.engine.step(Event::AuditWant { id, pass });
+        self.carry_out(fx);
+    }
+
+    /// Pass `pass` no longer waits on `id` (replaced or ended, sdk#532): only its reader drops.
+    pub fn audit_drop(&mut self, id: Cid, pass: engine::PassId) {
+        let fx = self.engine.step(Event::AuditDrop { id, pass });
+        self.carry_out(fx);
+    }
+
+    /// The node's answers for audit passes since the last take: `(block, passes, found)`.
+    pub fn take_audit_answers(&mut self) -> Vec<(Cid, Vec<engine::PassId>, bool)> {
+        std::mem::take(&mut self.audit_answers)
     }
 
     /// Read repairs through parity: `(started, rebuilt, given up)`.

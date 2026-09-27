@@ -186,10 +186,22 @@ impl CommitLife {
 
     /// Stragglers a root move made garbage (`gone`): withdrawn from every Backing, whose writes are carried onto the
     /// next own commit's. The ids withdrawn, and the writes of every Backing that drained.
+    ///
+    /// Correct whatever the caller does (the architect on C1): a block the commit IN FLIGHT still owes is never
+    /// withdrawn, even when a root move made it garbage for a Backing -- its PUT is that commit's too. Every call site
+    /// runs with no commit in flight today (publish and adopt, after `end`); the assert makes a future one loud.
     pub(crate) fn supersede(&mut self, gone: &BTreeSet<Cid>) -> (BTreeSet<Cid>, Vec<(ClientId, WriteId)>) {
+        debug_assert!(self.commit().is_none(), "supersede with a commit in flight: its owed blocks are excluded, but no caller should reach this");
+        let owed: BTreeSet<Cid> = self.commit().map(|c| c.owed().copied().collect()).unwrap_or_default();
+        self.supersede_excluding(gone, &owed)
+    }
+
+    /// [`CommitLife::supersede`]'s body: every Backing loses the ids of `gone` -- except those `owed` by a commit in
+    /// flight.
+    fn supersede_excluding(&mut self, gone: &BTreeSet<Cid>, owed: &BTreeSet<Cid>) -> (BTreeSet<Cid>, Vec<(ClientId, WriteId)>) {
         let mut withdrawn = BTreeSet::new();
         for b in self.backing.iter_mut() {
-            let hit: Vec<Cid> = b.remaining.intersection(gone).copied().collect();
+            let hit: Vec<Cid> = b.remaining.intersection(gone).filter(|id| !owed.contains(*id)).copied().collect();
             if hit.is_empty() {
                 continue;
             }
@@ -249,5 +261,39 @@ impl CommitLife {
 
     pub(crate) fn backing_len(&self) -> usize {
         self.backing.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(n: &[u8]) -> BTreeSet<Cid> {
+        n.iter().map(|b| [*b; 32]).collect()
+    }
+
+    /// A block the commit IN FLIGHT owes is never withdrawn by a supersede, even when the root move made it garbage for
+    /// a Backing (the architect's C1 residual). Mutant: drop the `owed` exclusion -> red.
+    #[test]
+    fn a_block_the_commit_in_flight_owes_is_never_withdrawn() {
+        let mut life = CommitLife::default();
+        life.back(vec![(ClientId(1), WriteId(1))], ids(&[1, 2, 3]));
+        // 2 and 3 are garbage for the Backing; 2 is also owed by the commit in flight.
+        let (withdrawn, _) = life.supersede_excluding(&ids(&[2, 3]), &ids(&[2]));
+        assert_eq!(withdrawn, ids(&[3]), "a block the commit in flight owes was withdrawn");
+        assert!(life.backing_owes(&[2; 32]), "the in-flight commit's block left the Backing");
+        assert!(!life.backing_owes(&[3; 32]));
+    }
+
+    /// With nothing in flight, every garbage block is withdrawn from every Backing (a block two published commits share
+    /// leaves both).
+    #[test]
+    fn with_nothing_in_flight_every_backing_loses_the_garbage() {
+        let mut life = CommitLife::default();
+        life.back(vec![(ClientId(1), WriteId(1))], ids(&[1, 2]));
+        life.back(vec![(ClientId(1), WriteId(2))], ids(&[2, 4]));
+        let (withdrawn, _) = life.supersede(&ids(&[2]));
+        assert_eq!(withdrawn, ids(&[2]));
+        assert!(!life.backing_owes(&[2; 32]), "a Backing still owes a garbage block");
     }
 }
