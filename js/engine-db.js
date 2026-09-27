@@ -200,8 +200,23 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
   const reloadStale = () => {
     let changed;
     try { changed = JSON.parse(session.take_stale()); } catch (_) { return; }
-    for (const domain of changed) for (const cb of bound.get(domain) ?? []) cb();
+    for (const domain of changed) {
+      for (const cb of bound.get(domain) ?? []) cb();
+      const def = definitions.get(domain);
+      if (def) rereadDefinition(def);
+    }
   };
+
+  // THE DEFINITION WATCHES (§19 P3, `watchDefinition`): per watch key (opaque, from `bind_definition`), which
+  // definition it is and who is told. Re-read when `take_stale` names the key: the read and its `rendered_definition`
+  // in ONE synchronous call, as a binding's (so no change between them is missed), then every watcher gets the rows.
+  const definitions = new Map();
+  const rereadDefinition = def =>
+    once(() => {
+      const rows = JSON.parse(session.definition(def.which));
+      session.rendered_definition(def.which);
+      return rows;
+    }).then(rows => { for (const cb of def.cbs) cb(rows); }, () => { /* named again at the next head move */ });
 
   /**
    * This client's OWN writes changed state (published, backed up, lost,
@@ -732,6 +747,23 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
      * The session is TOLD which domains are bound, because it is the thing
      * that decides what a head move makes stale.
      */
+    /**
+     * WATCH A DEFINITION (§19 P3): `cb(rows)` — `definition(which)` read afresh — each time a head move changes the
+     * draft ("draft") or the published definition ("app") of this session's app: another tab or device of this
+     * identity edited it, or this tab lost a tie-break (rule 15). Bound by the session from its `SystemDomain`, so
+     * the reserved name is never spelled here; refused by name when it cannot be watched. Returns the unwatch.
+     */
+    watchDefinition(which, cb) {
+      const key = session.bind_definition(which);
+      let def = definitions.get(key);
+      if (!def) { def = { which, cbs: new Set() }; definitions.set(key, def); }
+      def.cbs.add(cb);
+      return () => {
+        def.cbs.delete(cb);
+        if (def.cbs.size === 0 && definitions.get(key) === def) { definitions.delete(key); session.unbind_definition(which); }
+      };
+    },
+
     watch(domain, cb) {
       if (!bound.has(domain)) { bound.set(domain, new Set()); session.bind(domain); }
       bound.get(domain).add(cb);
