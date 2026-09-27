@@ -103,7 +103,8 @@ impl<B: Blocks> Engine<B> {
                 .collect();
             let Some(states) = states else { continue };
             self.parity_owed.remove(&id);
-            let Some(ix) = g.slots.iter().position(|s| *s == id) else { continue };
+            // Its PARITY slot, through the one lookup (`repair::slots_of`: the build fails on a first match).
+            let Some(ix) = g.slots_of(&id).find(|&i| g.is_parity(i)) else { continue };
             let encoded = freenet_prolly::parity::encode_group(&states).ok().and_then(|p| p.into_iter().nth(ix - g.k));
             match encoded {
                 Some(bytes) if block_id(kind::PARITY, &bytes) == id => {
@@ -160,5 +161,33 @@ mod put_back {
         assert_eq!(put(&e.rebuilt(id, &body)), 1, "a wanted, verified rebuild was not put");
         assert_eq!(put(&e.rebuilt(id, b"not its bytes")), 0, "(a) an unverified rebuild was put");
         assert!(e.rebuilt(id, b"not its bytes").is_empty(), "(a) an unverified rebuild was KEPT: the page would hold bytes under a wrong id");
+    }
+
+    /// OWED PARITY IS PUT ONLY UNDER ITS OWN ID (engineer3 for sdk#479): a group whose parent lists one TRUE parity id
+    /// and one that is not what its members encode to (a wrong or forged listing). With every member held, the true
+    /// one is re-encoded and PUT, byte for byte; the other is never PUT under that id, and is counted mismatched.
+    /// Mutant "skip the id check" -> red.
+    #[test]
+    fn owed_parity_is_put_only_under_the_id_its_bytes_hash_to() {
+        let mut e = Engine::new(Params::default(), MemBlocks::default());
+        let members: Vec<Vec<u8>> = (0..3u8).map(|i| vec![b'm' + i; 700]).collect();
+        let ids: Vec<freenet_prolly::Cid> = members.iter().map(|m| block_id(kind::RAW, m)).collect();
+        for (id, m) in ids.iter().zip(&members) {
+            e.blocks.insert(*id, m);
+        }
+        let states: Vec<Vec<u8>> = members.iter().map(|m| [vec![kind::RAW], m.clone()].concat()).collect();
+        let parity = freenet_prolly::parity::encode_group(&states).expect("the group encodes");
+        let truth = block_id(kind::PARITY, &parity[0]);
+        let forged: freenet_prolly::Cid = [0xee; 32];
+        let mut slots = ids.clone();
+        slots.extend([truth, forged]);
+        let g = crate::repair::Group { missing: ids[0], missing_ix: 0, kind: kind::RAW, slots, k: 3, max_len: freenet_prolly::parity::MAX_MEMBER_VALUE };
+        e.parity_owed.insert(truth, g.clone());
+        e.parity_owed.insert(forged, g);
+        let out = e.put_owed_parity();
+        let put: Vec<(freenet_prolly::Cid, Vec<u8>)> = out.iter().filter_map(|f| if let Effect::PutRepaired { id, bytes } = f { Some((*id, bytes.clone())) } else { None }).collect();
+        assert_eq!(put, vec![(truth, parity[0].clone())], "owed parity PUT under an id its bytes do not hash to, or not PUT byte for byte");
+        assert_eq!((e.parity_counts.1, e.parity_counts.2), (1, 1), "the true parity not counted put, or the forged one not counted mismatched");
+        assert!(e.parity_owed.is_empty(), "owed parity left owed with every member held");
     }
 }

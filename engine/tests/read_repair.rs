@@ -626,3 +626,66 @@ fn m_lost_with_every_survivor_pending_is_not_damaged() {
         }
     }
 }
+
+/// PARITY LOST, EVERY MEMBER THERE (engineer3 for sdk#479): the node lost 2 of a group's parity blocks and none of its
+/// members. A cold reader reading every key the group's members hold races the group, sees the two parity blocks
+/// answered NotFound, and -- once it holds all k members -- re-encodes and PUTs both back, byte for byte what the save
+/// wrote. No other parity block is PUT; any other PUT is a racing read's rebuild of a member (the race's own: a read
+/// whose k other slots land before its own block rebuilds it), byte for byte the block the save wrote. `parity_counts`
+/// = (2 missing, 2 put, 0 mismatched). Mutants: the owed record dropped, or `put_owed_parity` never called -> red.
+#[test]
+fn two_parity_lost_with_every_member_there_are_put_back_byte_for_byte() {
+    let records = records();
+    let (root, mut all) = tree(&records);
+    let (members, parity) = a_leaf_group(&mut all, root);
+    let lost: BTreeSet<Cid> = parity.iter().take(2).copied().collect();
+    let keys = keys_in(&all, &members);
+    let (mut e, store) = cold_reader(root, Params::default());
+    let mut put: BTreeMap<Cid, Vec<u8>> = BTreeMap::new();
+    let mut seen: BTreeSet<Cid> = BTreeSet::new();
+    for (n, key) in keys.iter().enumerate() {
+        // Paced per read, as `read_cold` paces: each read is its own stretch of time.
+        let mut asked: BTreeMap<Cid, usize> = BTreeMap::new();
+        let mut queue = e.step(Event::Get { client: ClientId(1), req_id: ReqId(n as u64), key: key.clone() });
+        let mut steps = 0;
+        while let Some(f) = queue.pop() {
+            steps += 1;
+            assert!(steps < 20_000, "a read did not settle");
+            match f {
+                Effect::FetchBlock { id, .. } => {
+                    seen.insert(id);
+                    let times = asked.entry(id).or_insert(0);
+                    *times += 1;
+                    if *times > PACED {
+                        continue;
+                    }
+                    let ev = match all.get(&id).filter(|_| !lost.contains(&id)) {
+                        Some(b) => {
+                            store.put(id, b);
+                            Event::BlockArrived { id, bytes: b.to_vec() }
+                        }
+                        None => Event::BlockMissed(id),
+                    };
+                    queue.extend(e.step(ev));
+                }
+                Effect::Keep { id, bytes } => store.put(id, &bytes),
+                Effect::PutRepaired { id, bytes } => {
+                    assert!(put.insert(id, bytes).is_none(), "block {:?} PUT back twice", &id[..4]);
+                }
+                Effect::Reply { .. } => {}
+                other => common::no_answer_owed(&other),
+            }
+        }
+    }
+    assert!(lost.iter().all(|p| seen.contains(p)), "THE SETUP: the reads never asked the lost parity");
+    let want: BTreeMap<Cid, Vec<u8>> = lost.iter().map(|p| (*p, all.get(p).expect("the save wrote it").to_vec())).collect();
+    let short = |c: &Cid| format!("{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3]);
+    for (id, bytes) in &want {
+        assert_eq!(put.get(id), Some(bytes), "lost parity {} was not PUT back byte for byte; counts {:?}", short(id), e.parity_counts());
+    }
+    for (id, bytes) in put.iter().filter(|(id, _)| !lost.contains(*id)) {
+        assert!(!parity.contains(id), "parity {} the node HOLDS was PUT back", short(id));
+        assert_eq!(Some(bytes.as_slice()), all.get(id), "{} was PUT back with other bytes than the save wrote", short(id));
+    }
+    assert_eq!(e.parity_counts(), (2, 2, 0));
+}
