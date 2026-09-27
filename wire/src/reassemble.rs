@@ -57,7 +57,8 @@ impl Reassembler {
         Reassembler {
             streams: Vec::new(),
             bytes: 0,
-            max_bytes: 16 * 1024 * 1024,
+            // ONE whole message may be held (the one bound): a lone large answer is never evicted mid-stream.
+            max_bytes: crate::MAX_REASSEMBLED,
         }
     }
 
@@ -172,7 +173,8 @@ impl Reassembler {
 
     /// Decode a complete message. Never panics on anything.
     pub fn decode(bytes: &[u8]) -> Result<HostResponse, Unusable> {
-        if bytes.len() > crate::MAX_FRAME {
+        // A WHOLE message's bound, reassembled or not (a single frame met MAX_FRAME at its door already).
+        if bytes.len() > crate::MAX_REASSEMBLED {
             return Err(Unusable::TooLarge);
         }
         let decoded: Result<Result<HostResponse, freenet_stdlib::client_api::ClientError>, _> =
