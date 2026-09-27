@@ -148,13 +148,7 @@ async fn main() -> Result<()> {
 
     // The writer's key and the tail's params: the Register's params, single key.
     let sk = SigningKey::from_bytes(blake3::hash(b"live-tail writer key").as_bytes());
-    let params = [
-        &b"RG01"[..],
-        &[0u8],
-        &sk.verifying_key().to_bytes(),
-        b"tail",
-    ]
-    .concat();
+    let params = wire::register_params(&sk.verifying_key().to_bytes(), b"tail");
     let p = Params::parse(&params).context("params")?;
     let mut w = Writer::new(&params).context("writer")?;
 
@@ -349,5 +343,5 @@ async fn main() -> Result<()> {
 }
 
 fn hex(b: &[u8]) -> String {
-    b.iter().take(8).map(|x| format!("{x:02x}")).collect()
+    core_types::hex::encode(&b[..b.len().min(8)])
 }
