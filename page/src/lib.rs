@@ -76,6 +76,7 @@ pub mod loader;
 pub mod obs;
 pub mod rto;
 pub mod server;
+mod op_life;
 
 use engine::{ClientId, Effect, Engine, Epoch, Event, KeySource, Op as WriteOp, Params, State, WriteId};
 use freenet_prolly::store::Blocks;
@@ -317,6 +318,15 @@ pub enum Answer {
     SiteRefused { app: String, said: String },
 }
 
+/// WHO ASKED for an app's PUT ([`Op::PutApp`]): a TYPE page-io builds, never a string from JS (the architect, sdk#531
+/// E1): an app publish naming the container, or a direct `put_contract` of the session's app. A mistyped ask would be a
+/// waiter that never leaves; a cancel with an ask the key does not have is counted and named.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Ask {
+    Publish(String),
+    Direct(String),
+}
+
 /// Where an app's PUT ([`Op::PutApp`]) stands. It is re-sent on the RTO
 /// until the node ANSWERS (rule 7) — acknowledged, or refused in the node's
 /// words — or a person CANCELS it: no time ends it (rule 8). While it waits,
@@ -355,50 +365,12 @@ fn waiting_name(w: &Waiting) -> String {
         Waiting::Sign(Label::Site(app)) => format!("the signer (site {app})"),
         Waiting::Update(Label::Site(app)) => format!("site {app}'s publication"),
         Waiting::ReadBack(Label::Site(app)) => format!("site {app}'s read"),
-        Waiting::PutApp(_) => "the app's publication".into(),
+        Waiting::PutApp(..) => "the app's publication".into(),
+        Waiting::Repair(_) => "a block's repair".into(),
         Waiting::Ext(Ext::RegisterSigner) => "the signer's registration".into(),
         Waiting::Ext(Ext::SignerFirst) => "the signer".into(),
         Waiting::Ext(Ext::AskRecord) => "the signer's record".into(),
     }
-}
-
-/// An op in flight.
-#[derive(Debug, Clone)]
-struct Deadline {
-    /// Its LANE, classed once when it went out ([`Page::lane_of`]); only ever PROMOTED to Interactive after.
-    lane: Lane,
-    /// A BACKGROUND op WITHDRAWN while on the wire (the architect, engineer2's finding on step 2): the page no longer
-    /// waits on it, but the node still holds it, so it keeps the lane's ONE slot until its answer comes (dropped) or
-    /// its deadline comes due, whichever is first. Never re-sent; its end was recorded once, at withdraw.
-    withdrawn: bool,
-    at: u64,
-    /// The deadline it was given when SENT: a re-arm never moves it past this
-    /// (sdk#378).
-    armed: u64,
-    op: Op,
-    sent_at: u64,
-    attempt: u32,
-    /// `false`: PARKED -- a GET the node answered NotFound (or with bytes
-    /// that are not its id), due to be sent again at `at` on the same
-    /// per-op backoff as a silent one. Not on the wire: it holds no window
-    /// place, and coming due is not a timeout.
-    sent: bool,
-    /// Re-sent on a NEW socket after a reconnect (sdk#376): its answer can only
-    /// be to that re-send, but it is still not a first send, so (Karn) its
-    /// answer is no RTT sample.
-    resent: bool,
-    /// The send this deadline is for, in the page's own SEND ORDER: the recording's label for it
-    /// (`Label { Request, ordinal }`). A re-send is a new send. Never the op's block id (a foreign id).
-    /// Also its place in the node's ONE queue for this client (F61, sdk#390): the order it went on the wire.
-    seq: u32,
-    /// Sent into an EMPTY queue: nothing was on the wire ahead of it, so its answer times the node's service plus the
-    /// path -- the only answer that is an RTT sample (sdk#390). A queued op's answer also times its wait.
-    alone: bool,
-    /// A GET whose deadline passed while the node's OWN GET for it may still be running (sdk#447, the architect): the
-    /// page→node socket is loopback and the node does not dedupe client GETs, so a re-send would only add another
-    /// network GET of the same key. It stays on the wire and keeps its window place (rule 9's backpressure), but it has
-    /// left the node's one client queue: it is no place in `ahead`, never re-armed, and its answer is no sample.
-    silent: bool,
 }
 
 /// When the node's own GET for a send made at `sent_at` is certainly over: its bound on a GET against silent peers
@@ -440,7 +412,9 @@ fn op_site(w: &Waiting) -> instrument::Site {
         Waiting::Verify => Site::of("page::op::verify"),
         Waiting::ReadBack(_) => Site::of("page::op::read-back"),
         Waiting::Hint => Site::of("page::op::hint"),
-        Waiting::PutApp(_) => Site::of("page::op::put-app"),
+        Waiting::PutApp(..) => Site::of("page::op::put-app"),
+        // A repair's PUT is a PUT: the same op kind, the same site.
+        Waiting::Repair(_) => Site::of("page::op::put"),
         Waiting::Ext(_) => Site::of("page::op::ext"),
     }
 }
@@ -478,8 +452,12 @@ enum Waiting {
     /// backstop ([`HEAD_BACKSTOP_MS`]): is there a head this page has not
     /// adopted?
     Hint,
-    /// An app's PUT of this contract key ([`Op::PutApp`]).
-    PutApp(String),
+    /// One ASK of an app's PUT of this contract key ([`Op::PutApp`]): the key's send serves every ask on it, and a
+    /// cancel is one ask leaving (OP-LIFE sdk#531).
+    PutApp(String, Ask),
+    /// A READ REPAIR's re-PUT of a block rebuilt from parity (not a Backing): its own waiter on the block's PUT key, so
+    /// the engine's withdraw of ITS waiter leaves the repair's PUT going (OP-LIFE sdk#531).
+    Repair(Cid),
     /// A page-io request ([`Op::Ext`]).
     Ext(Ext),
 }
@@ -702,38 +680,23 @@ pub struct Page {
     last_head_at: u64,
     /// That read, whole: what an equal-seq tie-break hashes.
     last_head: Option<HeadRead>,
-    /// A PUT to repeat at the next tick (a transient refusal).
-    put_again: BTreeMap<Cid, Vec<u8>>,
     /// Blocks rebuilt from their group and PUT back (sdk#303): sent like a commit's PUT, but answered for NO
     /// commit -- an answer confirms nothing a commit or a head waits on. Left when a commit puts the same block.
-    repair_puts: BTreeSet<Cid>,
-    /// Deadlines of the ops in flight, and each op to re-send.
-    /// Every op in flight: when it is due again, the op to re-send, when it
-    /// went out and on which attempt (Karn: only an attempt-1 answer samples).
-    deadlines: BTreeMap<Waiting, Deadline>,
+    /// THE OP RECORD (OP-LIFE.md): every op's need and the one held background send. Written only by
+    /// [`Page::on`] and the clock's part of it (`op_life`, whose fields are private to it).
+    ops: op_life::Ops,
     /// The app's PUTs: where each stands, and when it was first sent (its
     /// budget runs from there).
-    app_puts: BTreeMap<String, (AppPut, u64)>,
+    app_puts: BTreeMap<(String, Ask), (AppPut, u64)>,
+    /// Cancels of an ask no pending PUT has (counted and named: a mistyped ask never leaves silently).
+    unknown_ask_cancels: u64,
     /// The retry clock of every node call (`rto`), and the GET window.
     rto: rto::Rto,
     window: rto::Window,
-    /// GETs waiting for a place in the window, in the order asked.
-    get_queue: std::collections::VecDeque<Cid>,
-    /// GETs LOST past the node's bound and asked again (sdk#447): when, and whether one answer has come since. The node
-    /// does not dedupe, so the stalled earlier GET can still answer; a SECOND answer, arriving when nothing waits on the
-    /// key, is the known overlap (the architect) -- dropped, counted, and recorded as
-    /// `DroppedMsgs = DropReason::AnsweredAfterReask`. Forgotten once no earlier node GET can still be running.
-    reasked: BTreeMap<Cid, (u64, bool)>,
-    /// BACKGROUND ops waiting for the one background slot ([`Lane`]), in the order asked.
-    bg_queue: std::collections::VecDeque<(Waiting, Op)>,
-    /// Waits the in-crate tests class as Background (nothing on main is Background yet).
+    /// Waits the in-crate tests class as Background (the stand-in for `lane_of`'s background arms, which arrive with
+    /// the audit and the observation tree).
     #[cfg(test)]
     test_background: BTreeSet<Waiting>,
-    /// The attempt a re-send continues from (set when an op times out).
-    attempt_of: BTreeMap<Waiting, u32>,
-    /// When each op still unanswered was FIRST sent: what "not answering for
-    /// N s" counts from. Never a deadline (rule 8).
-    first_of: BTreeMap<Waiting, u64>,
     /// The engine's own head read has been ANSWERED (a head, or certainly
     /// none): until then its tree is the empty one it started on, and a read
     /// answered from it would say "empty" about data that exists.
@@ -837,19 +800,13 @@ impl Page {
             my_records: BTreeMap::new(),
             last_head_at: 0,
             last_head: None,
-            put_again: BTreeMap::new(),
-            repair_puts: BTreeSet::new(),
-            deadlines: BTreeMap::new(),
+            ops: op_life::Ops::new(),
             app_puts: BTreeMap::new(),
+            unknown_ask_cancels: 0,
             rto: rto::Rto::default(),
             window: rto::Window::default(),
-            get_queue: Default::default(),
-            reasked: BTreeMap::new(),
-            bg_queue: Default::default(),
             #[cfg(test)]
             test_background: BTreeSet::new(),
-            attempt_of: BTreeMap::new(),
-            first_of: BTreeMap::new(),
             recovered: false,
             engine_has_head: false,
             out: Vec::new(),
@@ -919,97 +876,34 @@ impl Page {
         let clock = now;
         let now = now.0;
         self.now = now;
-        let late: Vec<Waiting> =
-            self.deadlines.iter().filter(|(_, d)| now >= d.at).map(|(w, _)| w.clone()).collect();
-        // A WITHDRAWN Background op whose deadline came due: its slot frees; nothing is re-sent or recorded.
-        let (expired, late): (Vec<Waiting>, Vec<Waiting>) = late.into_iter().partition(|w| self.deadlines.get(w).is_some_and(|d| d.withdrawn));
-        for w in expired {
-            self.end(&w, End::TimedOut);
-        }
-        // A GET ON THE WIRE whose node GET is not over is SILENT, not lost (sdk#447): nothing is sent, the RTO does not
-        // back off, the window does not halve -- the loopback lost nothing and the node is still fetching. Its deadline
-        // moves to where that node GET is certainly over; only then is it a timeout (below), re-sent as a NEW node GET.
-        let rto_now = self.rto.rto_ms();
-        // A re-asked key's earlier node GET cannot answer once its own bound has passed again since the re-ask.
-        self.reasked.retain(|_, (at, _)| now < node_get_over_at(*at, rto::RTO_MAX_MS as u64));
-        let (silent, late): (Vec<Waiting>, Vec<Waiting>) = late.into_iter().partition(|w| {
-            matches!(w, Waiting::Get(_)) && self.deadlines.get(w).is_some_and(|d| d.sent && now < node_get_over_at(d.sent_at, rto_now))
-        });
-        for w in silent {
-            let d = self.deadlines.get_mut(&w).expect("listed");
-            d.silent = true;
-            d.at = node_get_over_at(d.sent_at, rto_now);
-        }
-        // RFC 6298 §5.5 — ONCE per tick, however many timed out. A PARKED GET
-        // coming due timed nothing out: the node answered it.
-        let timed_out = |w: &Waiting| self.deadlines.get(w).is_some_and(|d| d.sent);
-        if late.iter().any(timed_out) {
-            self.rto.timed_out();
-        }
-        // Every GET that timed out is LOST; the window decides whether that
-        // begins a loss episode (`rto::Window::lost`).
-        for w in &late {
-            if let (Waiting::Get(_), Some(d)) = (w, self.deadlines.get(w).filter(|d| d.sent && d.lane == Lane::Interactive)) {
-                self.window.lost(d.sent_at, d.attempt, now);
-            }
-        }
-        for w in late {
-            let d = self.end(&w, End::TimedOut).expect("listed");
-            // A parked GET the engine no longer needs, or that the page now
-            // holds (a repair rebuilt it), ends here -- held, unless an AUDIT
-            // waits on it: only the node's answer serves an audit (W7, OP-LIFE
-            // E2; the architect on #538).
-            if let Waiting::Get(id) = w {
-                let held = self.engine.blocks().get(&id).is_some();
-                if !d.sent && ((held && !self.engine.readers_of(&id).audits) || !self.engine.readers_of(&id).any()) {
-                    self.drop_get(id);
-                    continue;
-                }
-            }
-            let op = d.op.clone();
-            self.attempt_of.insert(w.clone(), d.attempt);
-            match w {
-                // A GET nobody answered is SENT AGAIN on the RTO (rule 7),
-                // never turned into a miss: silence is not an answer, and a
-                // miss is what the engine used to count down to
-                // `Unavailable` ("block … could not be had"). The attempt
-                // count carries over, so "not answering for N s" counts
-                // from the first send.
-                // It is LOST: it left the in-flight count when its deadline
-                // was removed, and its re-send QUEUES for a place like any
-                // new ask (sdk#345) -- behind the GETs already waiting, and
-                // never outside the window (rule 9: every byte is paced).
-                Waiting::Get(id) => {
-                    // A node GET LOST (past its bound): the one re-asked beside it may overlap it (sdk#447) -- in
-                    // either lane.
-                    if d.sent {
-                        self.reasked.insert(id, (now, false));
-                    }
-                    // A BACKGROUND GET's re-send goes back through its lane (the slot, or behind it), never the window.
-                    if d.lane == Lane::Background {
-                        self.send_in(w, op, Lane::Background);
-                    } else if !self.get_queue.contains(&id) {
-                        self.get_queue.push_back(id);
-                    }
-                }
-                // Rebuilt, not replayed: the published head it names as prev
-                // may have moved since it was first sent.
+        // THE RECORD's clock (OP-LIFE.md): the held send's deadline, silent GETs, the RTO's one back-off and the
+        // window's losses; then each need now due. A GET nobody answered is SENT AGAIN (rule 7), never turned into a
+        // miss; a lost one QUEUES for a window place (sdk#345), a background one YIELDS the slot (OP-LIFE defect 4).
+        for w in self.tick_ops(now) {
+            let op_life::Due::ReSend { op, .. } = self.on_due(&w) else { continue };
+            // An interactive non-GET timed out: its owner re-sends it now.
+            match &w {
+                // Rebuilt, not replayed: the published head it names as prev may have moved since it was first sent.
                 // A landing's request, or this commit's (or a site's): the state decides which (PUBLISH-LIFE).
-                Waiting::Sign(label) => self.life_on(&label, Ev::SignLost),
-                Waiting::PutApp(key) => self.send(Waiting::PutApp(key), op),
-                _ => {
-                    let resent = if let Waiting::Update(label) = &w { Some(label.clone()) } else { None };
-                    self.send(w, op);
-                    if let Some(label) = resent {
-                        self.life_on(&label, Ev::UpdateResent);
-                    }
+                Waiting::Sign(label) => self.life_on(label, Ev::SignLost),
+                Waiting::Update(label) => {
+                    self.send(w.clone(), op);
+                    self.life_on(label, Ev::UpdateResent);
                 }
+                Waiting::Put(_)
+                | Waiting::Held(_)
+                | Waiting::Get(_)
+                | Waiting::Warm
+                | Waiting::RecoverHead
+                | Waiting::Verify
+                | Waiting::ReadBack(_)
+                | Waiting::Hint
+                | Waiting::PutApp(..)
+                | Waiting::Repair(_)
+                | Waiting::Ext(_) => self.send(w.clone(), op),
             }
-        }
-        // The lost GETs queued above take free places, in queue order.
-        self.fill_gets();
-        for (id, bytes) in std::mem::take(&mut self.put_again) {
-            self.send(Waiting::Put(id), Op::Put { id, bytes });
+            // What its owner did not send again ends (a sign no longer owed).
+            self.end_unsent(&w);
         }
         // E10: the clock, to every label (its state decides: a backoff due, a verify due, a stale read-back).
         for label in self.pubs.labels() {
@@ -1017,7 +911,7 @@ impl Page {
         }
         // THE BACKSTOP: a hint can be dropped, so an idle page reads the
         // register at least every HEAD_BACKSTOP_MS.
-        if self.engine_has_head && !self.pubs.head().verifying() && !self.reading_head() && now.saturating_sub(self.last_head_at) >= HEAD_BACKSTOP_MS {
+        if self.backstop_due().is_some_and(|at| now >= at) {
             self.last_head_at = now;
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
@@ -1054,9 +948,22 @@ impl Page {
                 // recorded for it (an op alone does not say -- a head read
                 // is sent for five different waits). Every wait on this op
                 // ends; there is no kind for which nothing does.
-                let ended: Vec<Waiting> = self.deadlines.iter().filter(|(_, d)| d.op == op).map(|(w, _)| w.clone()).collect();
+                let ended: Vec<Waiting> = self.ops.needs().filter(|(_, n)| *n.op() == op).map(|(w, _)| w.clone()).collect();
+                // NotSent names its op, which is its KEY's one send (L0): it answers that key once, for all its waits;
+                // a Sign's is checked by its request id.
+                let mut keys = BTreeSet::new();
                 for w in &ended {
-                    self.answered(w);
+                    if !keys.insert(op_life::key_of(w)) {
+                        continue;
+                    }
+                    match op_life::request_of(&op) {
+                        Some(request) => {
+                            self.on(w, op_life::OpEvent::AnswerNamed { request });
+                        }
+                        None => {
+                            self.answered(w);
+                        }
+                    }
                 }
                 // A site's publication waits on nothing else: it ENDS, named (every publication ends).
                 for w in &ended {
@@ -1071,27 +978,27 @@ impl Page {
                     self.life_on(&Label::Site(app), Ev::NodeRefused(format!("the node refused the site's PUT: {said}")));
                 }
             }
+            // ONE answer of the container's PUT serves EVERY ask on it (OP-LIFE sdk#531).
             Answer::AppPutOk(key) => {
-                if self.answered(&Waiting::PutApp(key.clone())).is_some() {
-                    if let Some(p) = self.app_puts.get_mut(&key) {
+                for ask in self.app_put_answered(&key) {
+                    if let Some(p) = self.app_puts.get_mut(&(key.clone(), ask)) {
                         p.0 = AppPut::Put;
                     }
                 }
             }
             Answer::AppPutRefused { key, said } => {
-                if self.answered(&Waiting::PutApp(key.clone())).is_some() {
-                    if let Some(p) = self.app_puts.get_mut(&key) {
-                        p.0 = AppPut::Refused(said);
+                for ask in self.app_put_answered(&key) {
+                    if let Some(p) = self.app_puts.get_mut(&(key.clone(), ask)) {
+                        p.0 = AppPut::Refused(said.clone());
                     }
                 }
             }
             Answer::PutOk(id) => {
-                if self.answered(&Waiting::Put(id)).is_none() && self.confirmed.contains(&id) {
-                    return; // a second answer to a re-sent PUT
-                }
-                self.put_again.remove(&id);
-                // A repaired block's PUT is done: it confirms nothing (the architect's (b)).
-                if self.repair_puts.contains(&id) {
+                // The block's ONE PUT key serves its waiters: the engine's (its commits) and a read repair's (OP-LIFE
+                // sdk#531). Only the ENGINE's waiter's answer is a confirmation; a repair's PUT confirms nothing (the
+                // architect's (b)).
+                let served = self.put_answered(id, op_life::OpEvent::Answer);
+                if !served.contains(&Waiting::Put(id)) {
                     return;
                 }
                 match self.path {
@@ -1128,36 +1035,43 @@ impl Page {
                 }
             }
             Answer::PutRefused { id, transient } => {
-                let Some(op) = self.answered(&Waiting::Put(id)) else { return };
+                // TRANSIENT: answer-without (OP-LIFE Q4): parked, asked again on its back-off.
                 if transient {
-                    if let Op::Put { bytes, .. } = op {
-                        self.put_again.insert(id, bytes);
-                    }
-                } else if self.repair_puts.remove(&id) {
+                    // Routed by C1 even when only a LOST send of the key may be answering (N2): the op parks a need,
+                    // if there is one; with none, the answer only releases what it belongs to.
+                    let w = Waiting::Put(id);
+                    let op = self.ops.op_of(&w).cloned().unwrap_or(Op::Put { id, bytes: Vec::new() });
+                    self.put_answered(id, op_life::OpEvent::AnswerWithout { op });
+                    return;
+                }
+                let served = self.put_answered(id, op_life::OpEvent::Answer);
+                if served.contains(&Waiting::Repair(id)) {
                     // A REPAIR's PUT rejected (sdk#433): dropped, and counted -- never silently.
                     self.repairs_rejected += 1;
-                } else {
+                }
+                if served.contains(&Waiting::Put(id)) {
                     // FINAL (sdk#433): the node's Block contract refused these bytes; never put again.
                     self.step(Event::PutRejected(id));
                 }
             }
             Answer::Got { id, bytes } => {
-                let Some(attempt) = self.answered_get(id) else { return };
                 // Verified BEFORE it joins the page's memory: a block that is
                 // not its id is not kept, and the engine hears a miss.
                 let good = engine::read::matches_id(&id, &bytes);
                 if good {
+                    if self.answered_get(id).is_none() {
+                        return;
+                    }
                     self.engine.blocks_mut().insert(id, &bytes);
-                } else {
-                    // Parked BEFORE the engine hears it: the engine re-asks
-                    // inside that step, and must already see the GET pending,
-                    // or the re-ask goes out at once.
-                    self.park_get(id, attempt);
+                } else if self.answered_without(&Waiting::Get(id), Op::Get { id }).is_none() {
+                    // Parked (answer-without, OP-LIFE Q3) BEFORE the engine hears it: the engine re-asks inside that
+                    // step, and must already see the GET pending, or the re-ask goes out at once.
+                    return;
                 }
                 self.step(Event::BlockArrived { id, bytes });
             }
             Answer::GetMissed(id) => {
-                if let Some(attempt) = self.answered_get(id) {
+                if self.answered_without(&Waiting::Get(id), Op::Get { id }).is_some() {
                     // A real answer: the engine hears it (a NotFound starts a
                     // repair from the block's group), and the block itself is
                     // asked again on a backoff -- a node that has not got it
@@ -1167,7 +1081,6 @@ impl Page {
                     // inside that step, and must already see the GET pending,
                     // or the re-ask goes out at the speed of the answers
                     // (3,001 GETs in 5 min, measured).
-                    self.park_get(id, attempt);
                     self.step(Event::BlockMissed(id));
                 }
             }
@@ -1183,15 +1096,15 @@ impl Page {
                 if !answers_a_sign(&s) {
                     return;
                 }
-                // Which label's sign it answers: the one whose Sign op on the wire carries this id -- DERIVED from
-                // the op, the one record of it (never a stored copy).
-                let Some(label) = self.deadlines.iter().find_map(|(w, d)| match (w, &d.op) {
-                    (Waiting::Sign(label), Op::Sign { id: sent, .. }) if *sent == id => Some(label.clone()),
-                    _ => None,
-                }) else {
+                // Which label's sign it answers: the one with a send carrying this id that the node may still answer
+                // -- DERIVED from the op record (OP-LIFE's sends), the one record of it (never a stored copy).
+                let Some(Waiting::Sign(label)) = self.ops.named(id).cloned() else {
+                    // THE CHECK (OP-LIFE L0): no send in flight carries this id -- an old id's late answer: counted.
+                    self.on(&Waiting::Sign(Label::Head), op_life::OpEvent::AnswerNamed { request: id });
                     return;
                 };
-                if self.answered(&Waiting::Sign(label.clone())).is_none() {
+                // The answer NAMES its send (SG02): the id is CHECKED against the one Sign in flight for the label.
+                if !matches!(self.on(&Waiting::Sign(label.clone()), op_life::OpEvent::AnswerNamed { request: id }), op_life::Did::Answered { .. }) {
                     return; // an answer to a sign request already answered
                 }
                 self.life_on(&label, Ev::Signer(s));
@@ -1207,32 +1120,30 @@ impl Page {
             // read-back: a head is a head, whoever asked.
             // A SITE's read answers only its own read-back: the engine never hears a site (architect).
             Answer::Head { label: Label::Site(app), read } => {
-                if self.answered(&Waiting::ReadBack(Label::Site(app.clone()))).is_some() {
-                    self.life_on(&Label::Site(app), Ev::SiteRead(read.as_ref()));
+                let w = Waiting::ReadBack(Label::Site(app.clone()));
+                if let op_life::Did::Answered { served, .. } = self.on(&w, op_life::OpEvent::AnswerRead { park: BTreeSet::new() }) {
+                    if served.contains(&w) {
+                        self.life_on(&Label::Site(app), Ev::SiteRead(read.as_ref()));
+                    }
                 }
             }
             Answer::Head { label: Label::Head, read } => {
-                // Below the published-head floor: not yet. A REAL answer (the
-                // node is answering, with a copy from before the publish), so
-                // it ends each head read it answers -- and adopts nothing:
-                // each is PARKED at the one backoff and asked again (a GET with
-                // subscribe), as a GET answered without its block is.
+                // THE REGISTER'S ONE READ (OP-LIFE L0: every head wait rides one key): its riders are what this answer
+                // serves. Below the published-head floor: not yet -- a REAL answer (the node is answering, with a copy
+                // from before the publish), so it ends the read and adopts nothing: every rider PARKS at the one
+                // backoff and is asked again (a GET with subscribe), as a GET answered without its block is.
+                let riders = self.ops.riders(&Label::Head);
+                let rider = Waiting::RecoverHead;
                 if self.head_floor > 0 && read.as_ref().is_none_or(|r| r.seq < self.head_floor) {
                     let seen = read.as_ref().map(|r| r.seq);
                     let n = self.below_floor.map_or(0, |(_, n)| n);
                     self.below_floor = Some((seen, n + 1));
-                    let reads = [Waiting::Warm, Waiting::RecoverHead, Waiting::ReadBack(Label::Head), Waiting::Verify, Waiting::Hint];
-                    for w in reads {
-                        let Some(attempt) = self.deadlines.get(&w).filter(|d| d.sent).map(|d| d.attempt) else { continue };
-                        self.answered(&w);
-                        self.park(w, Op::ReadHead { label: Label::Head }, attempt);
-                    }
+                    self.on(&rider, op_life::OpEvent::AnswerRead { park: riders });
                     return;
                 }
                 self.last_head_at = self.now;
                 let h = read.as_ref().map(|r| (r.seq, r.root()));
                 self.last_head = read;
-                self.answered(&Waiting::Warm);
                 // S1b: the register moved past an old signer's same-seq
                 // record, so it signs again.
                 if let (Some(at), Some((seq, _))) = (self.old_signer_fork_at, h) {
@@ -1245,8 +1156,15 @@ impl Page {
                 }
                 // THE ONE JUDGEMENT (sdk#396): every head read this answer ends acts on this verdict, never on `h`.
                 let j = judge(self.last_head.as_ref(), &self.my_records);
-                let recover_attempt = self.deadlines.get(&Waiting::RecoverHead).map(|d| d.attempt);
-                if self.answered(&Waiting::RecoverHead).is_some() {
+                // The engine's own re-read, mid-commit, shows a head THIS page's record beats: my UPDATE has not merged
+                // there yet. Not adopted (the commit would die for a head about to lose): the engine's read PARKS --
+                // asked again at the one backoff -- and the read-back owns the landing.
+                let park: BTreeSet<Waiting> = if matches!(j, Judged::MineWins { .. }) { BTreeSet::from([Waiting::RecoverHead]) } else { BTreeSet::new() };
+                let served = match self.on(&rider, op_life::OpEvent::AnswerRead { park }) {
+                    op_life::Did::Answered { served, .. } => served,
+                    op_life::Did::Nothing => Vec::new(),
+                };
+                if served.contains(&Waiting::RecoverHead) {
                     match &j {
                         Judged::NoHead => {
                             self.step(Event::HeadMissing);
@@ -1256,19 +1174,16 @@ impl Page {
                             self.adopt(*heard, Adopt::Recovery);
                             self.recovered = true;
                         }
-                        // The engine's own re-read, mid-commit, shows a head THIS page's record beats: my UPDATE has
-                        // not merged there yet. Not adopted (the commit would die for a head about to lose): the
-                        // engine's read is asked again at the one backoff, and the read-back owns the landing.
-                        Judged::MineWins { .. } => self.park(Waiting::RecoverHead, Op::ReadHead { label: Label::Head }, recover_attempt.unwrap_or(1)),
+                        Judged::MineWins { .. } => {}
                     }
                 }
-                if self.answered(&Waiting::ReadBack(Label::Head)).is_some() {
+                if served.contains(&Waiting::ReadBack(Label::Head)) {
                     self.head_read(ReadFrom::ReadBack, &j);
                 }
-                if self.answered(&Waiting::Verify).is_some() {
+                if served.contains(&Waiting::Verify) {
                     self.head_read(ReadFrom::Verify, &j);
                 }
-                if self.answered(&Waiting::Hint).is_some() {
+                if served.contains(&Waiting::Hint) {
                     self.head_read(ReadFrom::Hint, &j);
                 }
             }
@@ -1304,7 +1219,7 @@ impl Page {
             }
             Act::ReadIfIdle(wait) => {
                 let w = self.read_wait(label, wait);
-                if !self.deadlines.contains_key(&w) {
+                if !self.ops.contains(&w) {
                     self.send(w, Op::ReadHead { label: label.clone() });
                 }
             }
@@ -1314,8 +1229,8 @@ impl Page {
                     Label::Site(_) => vec![Waiting::ReadBack(label.clone())],
                 };
                 for w in [Waiting::Sign(label.clone()), Waiting::Update(label.clone())].into_iter().chain(reads) {
-                    self.end(&w, End::Withdrawn);
-                    self.attempt_of.remove(&w);
+                    // Out of every state, its attempt with it (OP-LIFE's withdraw row).
+                    self.on(&w, op_life::OpEvent::Withdraw);
                 }
             }
             Act::Adopt(heard) => self.adopt(heard, Adopt::Conflict),
@@ -1377,29 +1292,10 @@ impl Page {
     /// once and not at the 120 s backstop.
     pub fn reconnected(&mut self, now: Ms) {
         self.now = now.0;
-        // Re-sent in the order they first queued, and queued anew in it (sdk#390).
-        let mut on_wire: Vec<(u32, Waiting)> = self.deadlines.iter().filter(|(_, d)| d.sent && !d.withdrawn).map(|(w, d)| (d.seq, w.clone())).collect();
-        on_wire.sort_unstable();
-        let mut head_read = false;
-        for (_, w) in on_wire {
-            let at = self.now + self.backoff(self.deadlines[&w].attempt);
-            // The send on the old socket is WITHDRAWN (its answer cannot come), and the re-send is a new send.
-            self.record_end(&w, &self.deadlines[&w], End::Withdrawn);
-            let seq = self.next_send();
-            let d = self.deadlines.get_mut(&w).expect("listed");
-            d.at = at;
-            d.armed = at;
-            d.sent_at = self.now;
-            d.resent = true;
-            // A new node GET on the new socket: its bound starts again.
-            d.silent = false;
-            d.seq = seq;
-            // Every label's in-flight read is re-sent (each re-subscribes its own register);
-            // only an in-flight HEAD read stands in for the fallback below.
-            head_read |= matches!(d.op, Op::ReadHead { label: Label::Head });
-            self.out.push(d.op.clone());
-            self.record_send(&w, &self.deadlines[&w]);
-        }
+        // Re-sent in the order they first queued, and queued anew in it (sdk#390); a background send is HELD
+        // instead, its need queued as its successor (OP-LIFE.md's reconnect row). Every label's in-flight read is re-sent
+        // (each re-subscribes its own register); only an in-flight HEAD read stands in for the fallback below.
+        let head_read = self.reconnect_ops();
         if !head_read && self.engine_has_head {
             self.last_head_at = self.now;
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
@@ -1415,7 +1311,7 @@ impl Page {
     /// this page's head, a newer one, a same-seq winner — so a second read
     /// adds nothing but a node op on the node's one queue, F61).
     pub fn head_hint(&mut self) {
-        if !self.pubs.head().verifying() && !self.read_back_owed() && !self.deadlines.contains_key(&Waiting::Hint) {
+        if !self.pubs.head().verifying() && !self.read_back_owed() && !self.ops.contains(&Waiting::Hint) {
             self.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
         }
     }
@@ -1467,10 +1363,17 @@ impl Page {
     }
 
     /// Is a register read already in flight?
+    /// WHEN THE IDLE BACKSTOP READ IS DUE, if it can be sent at all: ONE answer, read by both `tick` (which sends it)
+    /// and `next_due` (which a host arms its one-shot from). A head read in flight or a verify holds it back; were
+    /// `next_due` to offer it then, it would return a past time `tick` never acts on, and the host would spin (sdk#534).
+    fn backstop_due(&self) -> Option<u64> {
+        (self.engine_has_head && !self.pubs.head().verifying() && !self.reading_head()).then(|| self.last_head_at.saturating_add(HEAD_BACKSTOP_MS))
+    }
+
     fn reading_head(&self) -> bool {
         [Waiting::Warm, Waiting::RecoverHead, Waiting::Verify, Waiting::ReadBack(Label::Head), Waiting::Hint]
             .iter()
-            .any(|w| self.deadlines.contains_key(w))
+            .any(|w| self.ops.contains(w))
     }
 
     /// Does `read` CONFIRM this page's commit? Exactly the owed head's (seq, root), once signed -- or, the owed head
@@ -1532,7 +1435,7 @@ impl Page {
 
     /// Is `id` in a `Held` batch on the wire? Read from the batches' own ops: the one record of their ids.
     fn held_in_flight(&self, id: &Cid) -> bool {
-        self.deadlines.iter().any(|(w, d)| matches!(w, Waiting::Held(_)) && matches!(&d.op, Op::AskHeld { ids, .. } if ids.contains(id)))
+        self.ops.needs().any(|(w, n)| matches!(w, Waiting::Held(_)) && matches!(n.op(), Op::AskHeld { ids, .. } if ids.contains(id)))
     }
 
     /// THE HELD FLUSH (sdk#455): every id asked since the last one goes out in batches of up to
@@ -1555,7 +1458,7 @@ impl Page {
         let bytes = if absents >= HELD_ABSENTS { self.engine.reput_bytes(&id) } else { None };
         if let (true, Some(bytes)) = (absents >= HELD_ABSENTS, bytes) {
             self.held_again.remove(&id);
-            self.put_again.insert(id, bytes);
+            self.send(Waiting::Put(id), Op::Put { id, bytes });
         } else {
             // A block this page has no bytes for (a FOREIGN member it only asks about, safety gap class 2)
             // is never put from here: it is asked again, for as long as it takes (rule 7).
@@ -1591,122 +1494,34 @@ impl Page {
         Lane::Interactive
     }
 
-    /// PROMOTION where waiters change: every Background op -- queued, or on the wire -- whose class is now
-    /// Interactive is re-classed, once: a queued one is sent now as interactive work, an on-wire one moves to the
-    /// interactive count and frees the slot. Then the slot takes the next queued Background op.
+    /// PROMOTION where waiters change (OP-LIFE.md's join·I): every background need whose waiters now class it
+    /// Interactive is re-classed, once -- queued, it is sent now as interactive work; on the wire, it moves to the
+    /// interactive count and frees the slot; parked, it will be asked again as interactive work.
     fn promote_joined(&mut self) {
-        let joined: Vec<Waiting> = self
-            .bg_queue
-            .iter()
-            .map(|(w, _)| w.clone())
-            .chain(self.deadlines.iter().filter(|(_, d)| d.sent && d.lane == Lane::Background && !d.withdrawn).map(|(w, _)| w.clone()))
-            .filter(|w| self.lane_of(w) == Lane::Interactive)
-            .collect();
+        let joined: Vec<Waiting> =
+            self.ops.needs().filter(|(w, n)| n.lane() == Lane::Background && self.lane_of(w) == Lane::Interactive).map(|(w, _)| w.clone()).collect();
         for w in joined {
-            if let Some(at) = self.bg_queue.iter().position(|(q, _)| *q == w) {
-                let (w, op) = self.bg_queue.remove(at).expect("found");
-                self.send_in(w, op, Lane::Interactive);
-            } else if let Some(d) = self.deadlines.get_mut(&w) {
-                d.lane = Lane::Interactive;
-            }
+            self.on(&w, op_life::OpEvent::Join);
         }
-        self.pump_background();
     }
 
-    /// An op goes out, due again one RTO from now. A GET waits for a place
-    /// in the window.
+    /// An op goes out (OP-LIFE.md's send·I / send·B), in the lane its waiters class it.
     fn send(&mut self, w: Waiting, op: Op) {
         let lane = self.lane_of(&w);
-        self.send_in(w, op, lane);
+        self.on(&w, op_life::OpEvent::Send { op, lane });
     }
 
-    /// Background ops on the wire (parked ones hold no slot): at most one.
-    pub(crate) fn background_in_flight(&self) -> usize {
-        self.deadlines.values().filter(|d| d.sent && d.lane == Lane::Background).count()
+    /// Answers that arrived after their send's node bound, or as duplicates, in the BACKGROUND lane (OP-LIFE.md's one
+    /// counter): L1's detector -- the overlaps F1 predicts at the bound, served or dropped.
+    pub fn background_answers_after_bound(&self) -> u64 {
+        use op_life::Resend;
+        [Resend::Duplicates, Resend::AfterBound, Resend::OnlyOne].into_iter().flat_map(|r| [true, false].map(|served| self.ops.late(r, Lane::Background, served))).sum()
     }
 
-    /// The next queued Background op goes out when the slot is free; one that has meanwhile turned Interactive (a
-    /// waiter joined it) goes out as that.
-    fn pump_background(&mut self) {
-        while self.background_in_flight() == 0 {
-            let Some((w, op)) = self.bg_queue.pop_front() else { return };
-            let lane = self.lane_of(&w);
-            self.send_in(w, op, lane);
-        }
-    }
-
-    /// Send `w` in `lane`.
-    fn send_in(&mut self, w: Waiting, op: Op, lane: Lane) {
-        // A WITHDRAWN op wanted again: it is still on the wire, so it is waited on again -- its answer serves. Wanted
-        // by an INTERACTIVE waiter, it falls through to PROMOTION below, exactly as a fresh interactive join does (the
-        // architect: else an app's read waits behind background work, the case promotion exists for).
-        if let Some(d) = self.deadlines.get_mut(&w).filter(|d| d.withdrawn) {
-            d.withdrawn = false;
-            if lane != Lane::Interactive {
-                return;
-            }
-        }
-        // PROMOTION (the one exception to "classed once"): an interactive waiter joining a Background op. Queued, it
-        // leaves the background queue and is sent below as interactive work; on the wire, it moves to the
-        // interactive count and frees the background slot -- its answer serves the new waiter too.
-        if lane == Lane::Interactive {
-            self.bg_queue.retain(|(q, _)| *q != w);
-            if let Some(d) = self.deadlines.get_mut(&w).filter(|d| d.sent && d.lane == Lane::Background) {
-                d.lane = Lane::Interactive;
-                self.pump_background();
-                return;
-            }
-        }
-        // A send of an op that is PARKED JOINS its wait (the deadline table's (d), the architect and main): the parked
-        // deadline and back-off stand, and it goes out, as this op, when that deadline comes due. The rule a GET already
-        // follows (`FetchBlock` sends nothing while one is pending); a parked head read waits BECAUSE the register
-        // lagged, and sending again at once would make the park's back-off a loop under a lagging register.
-        if let Some(d) = self.deadlines.get_mut(&w).filter(|d| !d.sent) {
-            d.op = op;
-            return;
-        }
-        // ONE node GET per key (sdk#447): a GET already on the wire -- answered or not, silent or not -- is JOINED, never
-        // sent again beside itself. The node does not dedupe client GETs; a second would be a second network fetch.
-        if matches!(w, Waiting::Get(_)) && self.deadlines.contains_key(&w) {
-            return;
-        }
-        // ONE BACKGROUND OP ON THE WIRE: behind it, in order. Never in the interactive GET window below.
-        if lane == Lane::Background {
-            if self.background_in_flight() >= 1 && !self.deadlines.get(&w).is_some_and(|d| d.sent) {
-                if !self.bg_queue.iter().any(|(q, _)| *q == w) {
-                    self.bg_queue.push_back((w, op));
-                }
-                return;
-            }
-        } else if let Waiting::Get(id) = w {
-            if self.gets_in_flight() >= self.window.size() && !self.deadlines.contains_key(&w) {
-                if !self.get_queue.contains(&id) {
-                    self.get_queue.push_back(id);
-                }
-                return;
-            }
-        }
-        let attempt = self.attempt_of.remove(&w).map_or(1, |a| a + 1);
-        self.first_of.entry(w.clone()).or_insert(self.now);
-        // PER-OP backoff on top of the shared RTO (TCP backs off per
-        // segment): the n-th send of one op waits RTO x 2^(n-1), capped at
-        // the RTO's ceiling. The shared RTO alone is pulled back down by every
-        // other op's answers, so an op nobody answers was re-sent at that
-        // small RTO for ever -- thousands of GETs in five minutes (measured
-        // on a silent node once silence stopped ending a read).
-        // A FIRST send waits its place in the node's one queue (sdk#390, F61): an RTO for each op on the wire ahead of
-        // it, and one for itself. A re-send keeps its backoff.
-        // A SILENT GET is no place: the node took it off its client queue when it dispatched it (sdk#447, measured).
-        let ahead = self.deadlines.iter().filter(|(k, d)| d.sent && !d.silent && **k != w).count() as u64;
-        let at = self.now + if attempt == 1 { queued_wait(self.rto.rto_ms(), ahead) } else { self.backoff(attempt) };
-        let seq = self.next_send();
-        let d = Deadline { lane, withdrawn: false, at, armed: at, op: op.clone(), sent_at: self.now, attempt, sent: true, resent: false, seq, alone: ahead == 0, silent: false };
-        self.record_send(&w, &d);
-        // A send still on the wire for the same op is SUPERSEDED by this one: its end is said, never overwritten.
-        if let Some(old) = self.deadlines.insert(w.clone(), d) {
-            self.record_end(&w, &old, End::Withdrawn);
-        }
-        self.out.push(op);
+    /// Background sends the node holds, 0 or 1 (OP-LIFE.md L1): a background key's send, or a reconnect's orphan owed.
+    /// DERIVED from the record's one `place()`. The tab's pass scheduler reads it (KEEPER §12 I6).
+    pub fn background_in_flight(&self) -> usize {
+        self.ops.in_slot()
     }
 
     /// The next send's place in the page's send order (the recording's label ordinal).
@@ -1731,27 +1546,6 @@ impl Page {
         label
     }
 
-    /// AN OP ENDS: THE one way a deadline leaves (a control counts this crate's removals). What the recording
-    /// says of it is decided here, once: answered, timed out, or withdrawn.
-    fn end(&mut self, w: &Waiting, how: End) -> Option<Deadline> {
-        // A queued Background op that ends never goes out.
-        self.bg_queue.retain(|(q, _)| q != w);
-        // A BACKGROUND op withdrawn ON THE WIRE keeps the lane's slot: the node still holds it (the architect). It stays
-        // in its ONE record, marked withdrawn, until its answer or its deadline. Nothing is recorded yet: it may be
-        // wanted again, and then its real end is its end.
-        if how == End::Withdrawn {
-            if let Some(d) = self.deadlines.get_mut(w).filter(|d| d.sent && d.lane == Lane::Background && !d.withdrawn) {
-                d.withdrawn = true;
-                return Some(d.clone());
-            }
-        }
-        let d = self.deadlines.remove(w)?;
-        // ONE END PER OP, recorded when its entry LEAVES: a still-withdrawn op's (its answer, or its deadline) is the
-        // withdrawal; any other op's is how it ended.
-        self.record_end(w, &d, if d.withdrawn { End::Withdrawn } else { how });
-        Some(d)
-    }
-
     /// Where the recording's offsets count from: the page's clock when the recorder was attached, never 0 and
     /// never the page's own origin (the architect on instrument#14). Coarsened by the vocabulary's rule.
     fn offset(&self, t: u64) -> u64 {
@@ -1759,7 +1553,7 @@ impl Page {
     }
 
     /// A SEND: its Request edge, labelled by its place in the send order, and the retry clock it went out on.
-    fn record_send(&self, w: &Waiting, d: &Deadline) {
+    fn record_send(&self, w: &Waiting, d: &op_life::Send) {
         use instrument::{vocab::coarsen_ms, Dir, Entry, Event, Key, Probe};
         let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
         let Some(id) = self.send_label(d.seq) else { return };
@@ -1775,14 +1569,16 @@ impl Page {
         }
     }
 
-    /// An END of an op on the wire (a parked one is not on the wire: its answer was recorded when it came).
-    fn record_end(&self, w: &Waiting, d: &Deadline, how: End) {
+    /// A SEND's END (OP-LIFE.md L4: once, when it leaves the node's hands in the page's accounting).
+    fn record_end(&self, w: &Waiting, d: &op_life::Send, how: End) {
+        self.record_end_seq(w, d.seq, how);
+    }
+
+    /// A send's END, by its send ordinal.
+    fn record_end_seq(&self, w: &Waiting, seq: u32, how: End) {
         use instrument::{Dir, Event, Outcome, Probe};
-        let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) else { return };
-        if !d.sent {
-            return;
-        }
-        let Some(id) = self.send_label(d.seq) else { return };
+        let Some(rec) = self.rec.as_ref().filter(|_| seq >= self.rec_from) else { return };
+        let Some(id) = self.send_label(seq) else { return };
         let site = op_site(w);
         rec.event(match how {
             End::Answered => Event::Edge { site, dir: Dir::Response, id },
@@ -1811,199 +1607,35 @@ impl Page {
         (self.rto.rto_ms() << (attempt - 1).min(16)).min(rto::RTO_MAX_MS as u64)
     }
 
-    /// GETs on the wire (parked ones are not).
-    fn gets_in_flight(&self) -> usize {
-        self.deadlines.iter().filter(|(k, d)| matches!(k, Waiting::Get(_)) && d.sent && d.lane == Lane::Interactive).count()
-    }
-
-    /// A GET's answer: [`Page::answered`], and which attempt it answered.
-    /// A LOST GET (timed out, its re-send queued for a place: sdk#345) is
-    /// still asked: a late answer to an earlier send answers it, and its
-    /// queued re-send is dropped. It held no place and is no RTO sample.
+    /// A GET's answer (OP-LIFE.md's answer row): which attempt it answered, or `None` when nothing waited on it. A
+    /// LOST GET (timed out, its re-send queued for a place: sdk#345) is still asked: a late answer to an earlier send
+    /// answers it, and its queued re-send is dropped.
     fn answered_get(&mut self, id: Cid) -> Option<u32> {
-        // The key's first answer since a re-ask past B: a later one, when nothing waits, is the overlap's.
-        let waited = self.deadlines.contains_key(&Waiting::Get(id)) || self.get_queue.contains(&id);
-        match self.reasked.get_mut(&id) {
-            Some((_, once)) if waited => *once = true,
-            Some((_, true)) => {
-                self.reasked.remove(&id);
-                self.answer_after_reask(id);
-                return None;
-            }
-            _ => {}
-        }
-        if let Some(d) = self.deadlines.get(&Waiting::Get(id)) {
-            // On the wire: `answered` takes the Karn sample and opens the
-            // window, which a queued GET must not do.
-            let attempt = d.attempt;
-            self.answered(&Waiting::Get(id))?;
-            self.drop_get(id);
-            return Some(attempt);
-        }
-        let attempt = self.get_queue.contains(&id).then(|| self.attempt_of.get(&Waiting::Get(id)).copied()).flatten()?;
-        self.drop_get(id);
-        Some(attempt)
-    }
-
-    /// A SECOND answer for a GET re-asked past the node's bound, when nothing waits on its key (sdk#447): the stalled
-    /// earlier node GET answered too. Dropped, and counted -- the observable that moves B if it is ever non-trivial.
-    fn answer_after_reask(&self, id: Cid) {
-        if let Some(rec) = &self.rec {
-            use instrument::{vocab::DropReason, Entry, Event, Key, OpId, Probe};
-            let entry = Entry { key: Key::DroppedMsgs, value: DropReason::AnsweredAfterReask.code() };
-            rec.event(Event::Counter { site: op_site(&Waiting::Get(id)), op: OpId::NONE, entry });
+        match self.on(&Waiting::Get(id), op_life::OpEvent::Answer) {
+            op_life::Did::Answered { attempt, .. } => Some(attempt),
+            op_life::Did::Nothing => None,
         }
     }
 
-    /// A GET ENDS: THE one definition of that. It leaves every holder a GET
-    /// has -- its deadline (on the wire or parked), the attempt its re-send
-    /// would continue from, and its place in the window's queue. An answer,
-    /// a withdrawal and a block the page already holds all end a GET here.
+    /// A GET ENDS (withdrawn, or its block held): out of every state (OP-LIFE.md's withdraw row).
     fn drop_get(&mut self, id: Cid) {
-        let ended = self.end(&Waiting::Get(id), End::Withdrawn);
-        self.attempt_of.remove(&Waiting::Get(id));
-        self.get_queue.retain(|q| *q != id);
-        // A GET ended while ON THE WIRE held a place in the window: the next
-        // queued GET takes it. Only an ANSWER grows the window (`answered`);
-        // an end frees the place it held. Without this a read whose silent
-        // block was rebuilt from its group ended that GET and left the GETs
-        // queued behind it stranded, with nothing in flight to free a place
-        // (sdk#321: at m = 8 a race queues past the window).
-        if ended.is_some_and(|d| d.sent) {
-            self.fill_gets();
-        }
+        self.on(&Waiting::Get(id), op_life::OpEvent::Withdraw);
     }
 
-    /// The node ANSWERED a GET without the block (NotFound, or bytes that are
-    /// not its id): the GET stays pending on its own deadline, sent again at
-    /// the same backoff a silent one would be (rule 7: retry until answered),
-    /// never at the speed of the answers.
-    fn park_get(&mut self, id: Cid, attempt: u32) {
-        self.park(Waiting::Get(id), Op::Get { id }, attempt);
-    }
-
-    /// The node ANSWERED `w`, but not with what it waits for (a GET without
-    /// its block; a head below the published-head floor, sdk#349): it stays
-    /// pending on its own deadline, sent again at the one backoff. PARKED --
-    /// not on the wire, so coming due is no timeout: the RTO does not back
-    /// off and the window does not halve, because the node IS answering.
-    fn park(&mut self, w: Waiting, op: Op, attempt: u32) {
-        // THE IMPOSSIBLE CELL (park × parked): only an op on the wire is answered, so only it is parked; a parked
-        // deadline here would be an answer to something never asked (the deadline table).
-        debug_assert!(self.deadlines.get(&w).is_none_or(|d| d.sent), "park of an op that is already parked: {w:?}");
-        let at = self.now + self.backoff(attempt);
-        self.attempt_of.insert(w.clone(), attempt);
-        let lane = self.deadlines.get(&w).map_or_else(|| self.lane_of(&w), |d| d.lane);
-        if let Some(old) = self.deadlines.insert(w.clone(), Deadline { lane, withdrawn: false, at, armed: at, op, sent_at: self.now, attempt, sent: false, resent: false, seq: 0, alone: false, silent: false }) {
-            self.record_end(&w, &old, End::Withdrawn);
-        }
-    }
-
-    /// An ANSWER for `w`: its deadline ends; the answer to a first send into an EMPTY queue is an RTT sample (Karn: a
-    /// re-sent call never is; sdk#390: a queued one also times its wait), and a queued first send's answer ends the
-    /// back-off without sampling; every first send still on the wire is re-armed; and a GET opens the window.
-    /// `None`: nothing was waiting on it.
+    /// The node answered `w` with what it waits for: the answered op, or `None` when nothing waited on it.
     fn answered(&mut self, w: &Waiting) -> Option<Op> {
-        // The answer to a WITHDRAWN Background op: nobody waits on it -- dropped; its slot frees for the next.
-        if self.deadlines.get(w).is_some_and(|d| d.withdrawn) {
-            self.end(w, End::Answered);
-            self.pump_background();
-            return None;
-        }
-        let d = self.end(w, End::Answered)?;
-        self.attempt_of.remove(w);
-        self.first_of.remove(w);
-        // A QUEUED first send answered: the path answered a call sent once, so the back-off ends (RFC 6298 §5.7) --
-        // but its time is its wait in the queue too, so it is no sample (the architect's amendment to sdk#390's (a):
-        // under load no op is sent alone, and without this nothing would ever clear the back-off).
-        if d.sent && d.attempt == 1 && !d.resent && !d.alone && !d.silent {
-            self.rto.answered_queued();
-        }
-        // A SILENT GET's time is the node's network fetch, not the path: never a sample (sdk#447).
-        if d.sent && d.attempt == 1 && !d.resent && d.alone && !d.silent {
-            let r = self.now.saturating_sub(d.sent_at);
-            // IMPOSSIBLE, so loud: a round trip longer than the page has existed was dated against another clock's
-            // origin -- the defect that pinned the RTO at its ceiling for a page's life (sdk#397).
-            debug_assert!(r <= self.now.saturating_sub(self.born), "an RTT sample of {r} ms on a page {} ms old: a request was dated against another clock's origin", self.now.saturating_sub(self.born));
-            self.rto.sample(r);
-            // The sample AS COMPUTED, before anything clamps it (the architect): a wrong clock shows here.
-            if let Some(rec) = self.rec.as_ref().filter(|_| d.seq >= self.rec_from) {
-                use instrument::{vocab::coarsen_ms, Entry, Event, Key, Probe};
-                // Past the last label nothing is recorded -- and nothing else changes: the recording never steers.
-                if let Some(id) = self.send_label(d.seq) {
-                    let (site, op) = (op_site(w), id.op());
-                    rec.event(Event::Counter { site, op, entry: Entry { key: Key::SampleMs, value: coarsen_ms(r) } });
-                    rec.event(Event::Counter { site, op, entry: Entry { key: Key::RtoMs, value: coarsen_ms(self.rto.rto_ms()) } });
-                }
-            }
-        }
-        // ANY answer re-arms (sdk#390 (b)): the queue is one shorter and the path is alive; the `min` never extends.
-        if d.sent {
-            self.rearm_first_sends();
-        }
-        if d.sent && d.lane == Lane::Interactive && matches!(w, Waiting::Get(_)) {
-            self.window.opened();
-            self.fill_gets();
-        }
-        // A Background op answered frees the slot for the next.
-        if d.lane == Lane::Background {
-            self.pump_background();
-        }
-        Some(d.op)
-    }
-
-    /// EVERY first-send sample restarts the timer of every op still on its
-    /// FIRST send from THIS answer, never later than the deadline it was sent
-    /// with: `min(armed, now + rto)` (sdk#378; RFC 6298 §5.3, the architect).
-    ///
-    /// A deadline fixed at send let an op sent while a cold phase had backed
-    /// the shared RTO to its 60 s ceiling wait out the full minute though its
-    /// siblings kept answering (measured: V's first save, one lost PUT re-sent
-    /// at +59,999 ms, 12 siblings answered on first send within 2.1 s). Timed
-    /// from the SEND instead (`sent_at + rto`), the first -- fastest -- answer
-    /// of a batch the node serialises (F61, ~37 ms an op) would declare every
-    /// sibling queued past a few places lost while still being answered:
-    /// duplicate PUTs into the same queue. From the ANSWER, nothing is lost
-    /// while its siblings keep answering within one RTO of each other; a
-    /// re-arm may move a deadline later than a previous one, never past
-    /// `armed`. A RE-SEND keeps its backoff, and so does a reconnect re-send.
-    ///
-    /// sdk#390: timed at the op's PLACE in the node's one queue now -- an RTO for each op still ahead of it, and one
-    /// for itself (`queued_wait`) -- in one pass over the ops on the wire in send order: the place is counted from the
-    /// deadlines, never kept.
-    fn rearm_first_sends(&mut self) {
-        use instrument::{Entry, Event, Key, Kind, Probe};
-        let now = self.now;
-        let rto = self.rto.rto_ms();
-        let (rec, start, from) = (&self.rec, self.rec_start, self.rec_from);
-        // A SILENT GET is neither re-armed nor a place ahead of the others (sdk#447).
-        let mut wire: Vec<(&Waiting, &mut Deadline)> = self.deadlines.iter_mut().filter(|(_, d)| d.sent && !d.silent).collect();
-        wire.sort_unstable_by_key(|(_, d)| d.seq);
-        for (ahead, (w, d)) in wire.into_iter().enumerate() {
-            if d.attempt == 1 && !d.resent {
-                let at = d.armed.min(now + queued_wait(rto, ahead as u64));
-                if at != d.at && d.seq >= from {
-                    if let Some(rec) = rec {
-                        // Past the last label nothing is recorded; the re-arm below happens regardless.
-                        if let Some(op) = instrument::Label::new(Kind::Request, d.seq).map(|l| l.op()) {
-                            let value = instrument::vocab::coarsen_ms(at.saturating_sub(start));
-                            rec.event(Event::Counter { site: op_site(w), op, entry: Entry { key: Key::ReArmedAtMs, value } });
-                        }
-                    }
-                }
-                d.at = at;
-            }
+        match self.on(w, op_life::OpEvent::Answer) {
+            op_life::Did::Answered { op, .. } => Some(op),
+            op_life::Did::Nothing => None,
         }
     }
 
-    /// GETs waiting on the window take the places that are free.
-    fn fill_gets(&mut self) {
-        while let Some(id) = self.get_queue.front().copied() {
-            if self.gets_in_flight() >= self.window.size() {
-                break;
-            }
-            self.get_queue.pop_front();
-            self.send(Waiting::Get(id), Op::Get { id });
+    /// The node answered `w` WITHOUT what it waits for (OP-LIFE.md's answer-without): it parks with `op`, asked again
+    /// on its back-off. The answered attempt, or `None` when nothing waited on it.
+    fn answered_without(&mut self, w: &Waiting, op: Op) -> Option<u32> {
+        match self.on(w, op_life::OpEvent::AnswerWithout { op }) {
+            op_life::Did::Answered { attempt, .. } => Some(attempt),
+            op_life::Did::Nothing => None,
         }
     }
 
@@ -2022,16 +1654,14 @@ impl Page {
     /// When the next deadline falls (a host sets a one-shot timer for it, as
     /// the cold reads do), or `None`.
     pub fn next_due(&self) -> Option<Ms> {
-        // EVERY timer the page keeps: an op's deadline, a refused sign's
-        // back-off, a `Held` re-ask, a pending verify, and a PUT to repeat at
-        // the next tick. A host that armed only for deadlines would sleep
-        // through a back-off (the differential's RecordNotSaved case did).
-        let deadlines = self.deadlines.values().map(|d| d.at);
+        // EVERY timer the page keeps: an op's deadline (on the wire, parked, or the held send's), a label's
+        // publication timer (a refused sign's back-off, a pending verify: PUBLISH-LIFE), and a `Held` re-ask. A host
+        // that armed only for deadlines would sleep through a back-off (the differential's RecordNotSaved case did).
+        let deadlines = self.ops.next_due();
         let sign = self.pubs.lives().filter_map(Life::due_at).min();
         let held = self.held_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
-        let puts = (!self.put_again.is_empty()).then_some(self.now);
-        let backstop = self.engine_has_head.then_some(self.last_head_at + HEAD_BACKSTOP_MS);
-        deadlines.chain(sign).chain(held).chain(puts).chain(backstop).min().map(Ms)
+        let backstop = self.backstop_due();
+        deadlines.into_iter().chain(sign).chain(held).chain(backstop).min().map(Ms)
     }
 
     /// The page's clock: the last time it was told.
@@ -2043,7 +1673,8 @@ impl Page {
     /// its open Requests must equal.
     #[doc(hidden)]
     pub fn ops_on_wire(&self) -> usize {
-        self.deadlines.values().filter(|d| d.sent && d.seq >= self.rec_from).count()
+        // Every send the recording still holds open: one per key in flight (OP-LIFE L0).
+        self.ops.at_node().filter(|(_, d, ..)| d.seq >= self.rec_from).count()
     }
 
     /// Attach the page's recording: `capacity` events, then it DROPS and counts (never grows, never panics). Its
@@ -2166,10 +1797,7 @@ impl Page {
             .held_again
             .keys()
             .chain(self.held_asks.iter())
-            .chain(self.deadlines.iter().filter_map(|(w, d)| match (w, &d.op) {
-                (Waiting::Held(_), Op::AskHeld { ids, .. }) => Some(ids),
-                _ => None,
-            }).flatten())
+            .chain(self.ops.needs().filter(|(w, _)| matches!(w, Waiting::Held(_))).filter_map(|(_, n)| if let Op::AskHeld { ids, .. } = n.op() { Some(ids) } else { None }).flatten())
             .copied()
             .collect();
         let pins = self.engine.pins(&engine::PagePins { held_asks: &asked });
@@ -2255,20 +1883,13 @@ impl Page {
     /// A GET still in `deadlines` would also keep `waiting()` true and count as "not answering". An answer that
     /// comes later answers no GET and is ignored, like any answer to a wait that has ended.
     fn end_unneeded_gets(&mut self) {
+        // The key ENDS only when no reader is left (the architect, sdk#531 E2): held bytes serve the reads, repairs and the
+        // parked write, which leave; an Audit reader is served only by the node's answer.
         let ended: Vec<Cid> = self
-            .deadlines
-                .keys()
-                .filter_map(|w| match w {
-                    Waiting::Get(id) => Some(*id),
-                    _ => None,
-                })
-                .chain(self.get_queue.iter().copied())
-                .chain(self.bg_queue.iter().filter_map(|(w, _)| match w {
-                    Waiting::Get(id) => Some(*id),
-                    _ => None,
-                }))
-                // A held block's GET ends -- unless an AUDIT waits on it: only the node's answer serves an audit (W7).
-                .filter(|id| self.engine.blocks().get(id).is_some() && !self.engine.readers_of(id).audits)
+            .ops
+            .needs()
+            .filter_map(|(w, _)| if let Waiting::Get(id) = w { Some(*id) } else { None })
+            .filter(|id| self.engine.blocks().get(id).is_some() && !self.engine.readers_of(id).any())
             .collect();
         for id in ended {
             self.drop_get(id);
@@ -2333,13 +1954,11 @@ impl Page {
                 // queued, on the wire or waiting to re-ask -- and a late answer is not kept.
                 Effect::Unwanted { id } => self.drop_get(id),
                 Effect::Withdraw { id } => {
-                    self.end(&Waiting::Put(id), End::Withdrawn);
-                    self.attempt_of.remove(&Waiting::Put(id));
+                    self.on(&Waiting::Put(id), op_life::OpEvent::Withdraw);
                     // Not asked again; a batch in flight still carrying it asks for its batch-mates too, and its
                     // answer for this id confirms a block nobody waits on (a no-op in the engine).
                     self.held_asks.remove(&id);
                     self.held_again.remove(&id);
-                    self.put_again.remove(&id);
                     self.held.retain(|(_, f)| !matches!(f, Effect::PutBlock { id: x, .. } if *x == id));
                 }
                 // A FOREIGN member of a changed group (safety gap class 2): the node answers for it before BACKED_UP.
@@ -2361,9 +1980,10 @@ impl Page {
                 // op, deadline and re-send), unless it is on its way or there already.
                 Effect::PutRepaired { id, ref bytes } => {
                     self.engine.blocks_mut().insert(id, bytes);
-                    if !self.confirmed.contains(&id) && !self.deadlines.contains_key(&Waiting::Put(id)) && !self.put_again.contains_key(&id) {
-                        self.repair_puts.insert(id);
-                        self.send(Waiting::Put(id), Op::Put { id, bytes: bytes.clone() });
+                    // The REPAIR's own waiter on the block's PUT key: it joins a send of the same bytes in flight (L0),
+                    // or sends; the engine's withdraw of its own waiter leaves it going (OP-LIFE sdk#531).
+                    if !self.confirmed.contains(&id) {
+                        self.send(Waiting::Repair(id), Op::Put { id, bytes: bytes.clone() });
                     }
                 }
                 Effect::PutPack { id, .. } => {
@@ -2387,8 +2007,7 @@ impl Page {
                     // that clock -- the engine re-asks on every tick and
                     // re-descent, so a silent block was re-sent on every
                     // one of them (2,001 GETs in 5 min, measured).
-                    let out_already = self.deadlines.get(&Waiting::Get(id)).is_some_and(|d| !d.withdrawn) || self.get_queue.contains(&id);
-                    if node_needed && !out_already {
+                    if node_needed && !self.ops.contains(&Waiting::Get(id)) {
                         self.send(Waiting::Get(id), Op::Get { id });
                     }
                 }
@@ -2419,8 +2038,8 @@ impl Page {
                             let more = self.engine.step(Event::PutConfirmed(id));
                             self.carry_out(more);
                         } else {
-                            // A commit's own now: its answer is the commit's.
-                            self.repair_puts.remove(&id);
+                            // A commit's own now: the engine's waiter joins the key (a repair's send of the same bytes
+                            // in flight serves both).
                             self.send(Waiting::Put(id), Op::Put { id, bytes });
                         }
                     }
@@ -2498,9 +2117,7 @@ impl Page {
     /// backed-off retry? `false` means this page is at rest until something
     /// new arrives.
     pub fn waiting(&self) -> bool {
-        !self.deadlines.is_empty()
-            || !self.put_again.is_empty()
-            || self.pubs.lives().any(|l| l.due_at().is_some())
+        !self.ops.is_empty() || self.pubs.lives().any(|l| l.due_at().is_some())
             || !self.held_again.is_empty()
             || !self.held_asks.is_empty()
     }
@@ -2510,31 +2127,62 @@ impl Page {
     /// until the node answers or a person cancels ([`Page::cancel_app_put`]).
     /// Asking again for a key that ENDED starts it over; one still pending is
     /// left alone.
-    pub fn put_app(&mut self, key: String, now: Ms) {
+    pub fn put_app(&mut self, key: String, ask: Ask, now: Ms) {
         self.now = now.0;
-        if matches!(self.app_puts.get(&key), Some((AppPut::Pending, _))) {
+        if matches!(self.app_puts.get(&(key.clone(), ask.clone())), Some((AppPut::Pending, _))) {
             return;
         }
-        self.app_puts.insert(key.clone(), (AppPut::Pending, self.now));
-        self.send(Waiting::PutApp(key.clone()), Op::PutApp { key });
+        self.app_puts.insert((key.clone(), ask.clone()), (AppPut::Pending, self.now));
+        // This ask joins the container's one send if one is in flight (L0); one that ENDED acked is sent again: a real
+        // re-PUT, by design (the architect).
+        self.send(Waiting::PutApp(key.clone(), ask), Op::PutApp { key });
     }
 
-    /// Where the app's PUT of `key` stands; `None` if it was never asked.
-    pub fn app_put(&self, key: &str) -> Option<&AppPut> {
-        self.app_puts.get(key).map(|(p, _)| p)
+    /// Where `ask`'s PUT of `key` stands; `None` if it was never asked.
+    pub fn app_put(&self, key: &str, ask: &Ask) -> Option<&AppPut> {
+        self.app_puts.get(&(key.to_string(), ask.clone())).map(|(p, _)| p)
     }
 
-    /// A PERSON cancels a pending app PUT — the one end that is not the
-    /// node's answer (rule 8), and it is named. Nothing more is sent for it.
-    pub fn cancel_app_put(&mut self, key: &str) {
-        if matches!(self.app_puts.get(key), Some((AppPut::Pending, _))) {
-            let w = Waiting::PutApp(key.to_string());
-            self.end(&w, End::Withdrawn);
-            self.attempt_of.remove(&w);
-            self.first_of.remove(&w);
-            if let Some(p) = self.app_puts.get_mut(key) {
+    /// Is ANY ask's PUT of the container `key` still pending (a direct ask, or any publish's)? Derived from the asks.
+    pub fn app_put_pending(&self, key: &str) -> bool {
+        self.app_puts.iter().any(|((k, _), (p, _))| k == key && matches!(p, AppPut::Pending))
+    }
+
+    /// A PERSON cancels THEIR ask of a pending app PUT -- the one end that is not the node's answer (rule 8), named. It
+    /// is ONE ASK LEAVING (OP-LIFE sdk#531): another ask of the same container still waits, and its PUT goes on. A cancel
+    /// of an ask the key does not have is COUNTED and NAMED, never silent.
+    pub fn cancel_app_put(&mut self, key: &str, ask: &Ask) {
+        let k = (key.to_string(), ask.clone());
+        if matches!(self.app_puts.get(&k), Some((AppPut::Pending, _))) {
+            self.on(&Waiting::PutApp(key.to_string(), ask.clone()), op_life::OpEvent::Withdraw);
+            if let Some(p) = self.app_puts.get_mut(&k) {
                 p.0 = AppPut::Cancelled;
             }
+        } else {
+            self.unknown_ask_cancels += 1;
+            self.unusable.push(format!("a cancel of an ask that is not pending: {ask:?} on {key}"));
+        }
+    }
+
+    /// The block's one PUT key answered (`ev`: with or without): the waits it SERVED -- the engine's, a repair's, or both.
+    fn put_answered(&mut self, id: Cid, ev: op_life::OpEvent) -> Vec<Waiting> {
+        let w = if self.ops.contains(&Waiting::Put(id)) { Waiting::Put(id) } else { Waiting::Repair(id) };
+        match self.on(&w, ev) {
+            op_life::Did::Answered { served, .. } => served,
+            op_life::Did::Nothing => Vec::new(),
+        }
+    }
+
+    /// The container's one send answered: the asks it SERVED (each ask on the key, OP-LIFE sdk#531).
+    fn app_put_answered(&mut self, key: &str) -> Vec<Ask> {
+        let Some(w) = self.ops.needs().find_map(|(w, _)| matches!(w, Waiting::PutApp(k, _) if k == key).then(|| w.clone())) else {
+            // Nothing waits: a late or duplicate answer, counted by the record.
+            self.on(&Waiting::PutApp(key.to_string(), Ask::Direct(String::new())), op_life::OpEvent::Answer);
+            return Vec::new();
+        };
+        match self.on(&w, op_life::OpEvent::Answer) {
+            op_life::Did::Answered { served, .. } => served.into_iter().filter_map(|w| if let Waiting::PutApp(_, a) = w { Some(a) } else { None }).collect(),
+            op_life::Did::Nothing => Vec::new(),
         }
     }
 
@@ -2554,7 +2202,7 @@ impl Page {
 
     /// Is this request still waiting on an answer?
     pub fn ext_waiting(&self, e: Ext) -> bool {
-        self.deadlines.contains_key(&Waiting::Ext(e))
+        self.ops.contains(&Waiting::Ext(e))
     }
 
     /// NOT ANSWERING FOR N s: the request that has waited longest for an
@@ -2569,11 +2217,7 @@ impl Page {
     /// work's (sdk#472's Assets tab: "not answering the assets audit for N s"). ONE derivation of the waits; a
     /// withdrawn op waits on nobody and is never named.
     pub fn not_answering_in(&self, lane: Lane) -> Option<(String, u64)> {
-        self.first_of
-            .iter()
-            .filter(|(w, _)| self.deadlines.get(*w).is_some_and(|d| d.lane == lane && !d.withdrawn))
-            .min_by_key(|(_, at)| **at)
-            .map(|(w, at)| (waiting_name(w), self.now.saturating_sub(*at)))
+        self.ops.oldest_waiting(lane).map(|(w, at)| (waiting_name(w), self.now.saturating_sub(at)))
     }
 
 
@@ -2676,7 +2320,7 @@ impl Page {
     /// Is this page's PUT of `id` on the wire, or waiting to be sent again (sdk#433: what a node's text-named
     /// refusal may be attributed to)?
     pub fn put_waiting(&self, id: &Cid) -> bool {
-        self.deadlines.contains_key(&Waiting::Put(*id)) || self.put_again.contains_key(id)
+        self.ops.contains(&Waiting::Put(*id))
     }
 
     /// Repair PUTs the node's Block contract rejected (sdk#433), dropped.
@@ -2758,6 +2402,13 @@ impl Page {
 
     pub fn cut_held(&self) -> bool {
         self.engine.cut_held()
+    }
+
+    /// TESTS ONLY (page-io's Held wiring): the engine's `ConfirmHeld` for `ids`, carried out as one step -- the real
+    /// door to a `Held` ask. (A `PutOk` with no PUT in flight is a late answer: inert, it asks nothing.)
+    #[doc(hidden)]
+    pub fn confirm_held_for_test(&mut self, ids: &[Cid]) {
+        self.carry_out(ids.iter().map(|id| Effect::ConfirmHeld { id: *id }).collect());
     }
 
     /// The hold ends with nothing to merge.
@@ -2851,11 +2502,16 @@ mod unneeded_gets {
     fn a_queued_get_nobody_needs_is_ended() {
         let mut p = Page::new(Params::default(), PutPath::Page);
         let (held, wanted) = ([1u8; 32], [2u8; 32]);
+        // The window full, so both GETs QUEUE for a place.
+        for i in 0..p.window.size() as u8 {
+            p.send(Waiting::Get([100 + i; 32]), Op::Get { id: [100 + i; 32] });
+        }
+        p.send(Waiting::Get(held), Op::Get { id: held });
+        p.send(Waiting::Get(wanted), Op::Get { id: wanted });
+        assert_eq!(p.get_queued(), vec![held, wanted], "THE SETUP: both GETs are not queued for the window");
         p.engine.blocks_mut().insert(held, b"held");
-        p.get_queue.push_back(held);
-        p.get_queue.push_back(wanted);
         p.end_unneeded_gets();
-        assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![wanted], "the held block's queued GET was not ended, or the wanted one was");
+        assert_eq!(p.get_queued(), vec![wanted], "the held block's queued GET was not ended, or the wanted one was");
     }
 }
 
@@ -2873,10 +2529,10 @@ mod repair_put {
         p.carry_out(vec![Effect::PutRepaired { id, bytes: bytes.clone() }]);
         let puts: Vec<Op> = p.take_ops().into_iter().filter(|o| matches!(o, Op::Put { .. })).collect();
         assert_eq!(puts, vec![Op::Put { id, bytes: bytes.clone() }], "the repair was not PUT through the sender");
-        assert!(p.deadlines.contains_key(&Waiting::Put(id)), "the repair PUT has no deadline: it would not be re-sent");
+        assert!(p.dl().contains_key(&Waiting::Repair(id)), "the repair PUT has no deadline: it would not be re-sent");
         p.answer(Answer::PutOk(id), Ms(1));
         assert!(!p.confirmed.contains(&id), "a repair PUT's answer confirmed the block for the commits");
-        assert!(!p.deadlines.contains_key(&Waiting::Put(id)), "the answered repair PUT is still waiting");
+        assert!(!p.dl().contains_key(&Waiting::Repair(id)), "the answered repair PUT is still waiting");
 
         // The same block, then put by a commit: its answer is the commit's.
         p.carry_out(vec![Effect::PutBlock { id, bytes: bytes.clone(), after: Vec::new() }]);
@@ -3012,8 +2668,13 @@ mod held_batch {
         asked(&mut p, &ids(3));
         let first = held_ops(&mut p);
         assert_eq!(first.len(), 1);
-        p.tick(Ms(rto::RTO_MAX_MS as u64 + 1));
-        let again = held_ops(&mut p);
+        // Silent at its RTO, re-sent at its node BOUND (OP-LIFE L0: one Held batch in flight).
+        let mut again = Vec::new();
+        while again.is_empty() {
+            let t = p.next_due().expect("the batch is due").0;
+            p.tick(Ms(t));
+            again = held_ops(&mut p);
+        }
         assert_eq!(again, first, "the silent batch was not re-sent as the same op");
     }
 
@@ -3101,7 +2762,7 @@ mod confirm_held {
             p.tick(Ms(now));
             assert_eq!(asks(&mut p), 1, "absent answer {}: the block was not asked again", n + 1);
         }
-        assert!(p.put_again.is_empty(), "a block the page has no bytes for was queued to be PUT");
+        assert!(!p.dl().contains_key(&Waiting::Put(id)), "a block the page has no bytes for was PUT");
         p.answer(Answer::Held { batch: p.next_held_batch, present: vec![true] }, Ms(now + 1));
         assert!(p.confirmed.contains(&id));
     }
@@ -3157,7 +2818,7 @@ mod parked_get {
         p.answer(Answer::GetMissed(id), Ms(10));
         // After the answer: an attempt-1 answer is an RTO sample, and it opens the window.
         let (rto_before, window_before) = (p.rto.rto_ms(), p.window.size());
-        let (sent, due) = p.deadlines.get(&Waiting::Get(id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
+        let (sent, due) = p.dl().get(&Waiting::Get(id)).map(|d| (d.sent, d.at)).expect("a NotFound GET is parked on its deadline, not dropped");
         assert!(!sent, "a parked GET counts as on the wire");
         assert_eq!(due, 10 + p.backoff(1), "parked at a backoff other than send()'s");
         assert_eq!(p.gets_in_flight(), 0, "a parked GET holds a window place");
@@ -3166,7 +2827,7 @@ mod parked_get {
         assert_eq!(p.rto.rto_ms(), rto_before, "a parked GET coming due was counted as a timeout");
         assert_eq!(p.window.size(), window_before, "a parked GET coming due halved the window");
         // The engine here waits on nothing: the parked GET ends rather than going out.
-        assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
+        assert!(!p.dl().contains_key(&Waiting::Get(id)), "an unneeded parked GET was kept");
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
     }
 
@@ -3186,7 +2847,7 @@ mod parked_get {
         p.audit_want(id, engine::PassId(2));
         assert!(p.take_audit_answers().is_empty(), "the page's held bytes answered the audit");
         assert!(p.take_ops().contains(&Op::Get { id }), "a held block's audit sent no GET to the node");
-        assert!(p.deadlines.contains_key(&Waiting::Get(id)), "the held sweep ended the GET the audit waits on");
+        assert!(p.dl().contains_key(&Waiting::Get(id)), "the held sweep ended the GET the audit waits on");
         p.answer(Answer::Got { id, bytes }, Ms(20));
         assert_eq!(p.take_audit_answers(), vec![AuditAnswer { id, passes: vec![engine::PassId(2)], verdict: engine::AuditVerdict::Present }]);
     }
@@ -3206,12 +2867,12 @@ mod parked_get {
         p.send(Waiting::Get(id), Op::Get { id });
         let _ = p.take_ops();
         p.answer(Answer::GetMissed(id), Ms(10));
-        assert!(p.deadlines.get(&Waiting::Get(id)).is_some_and(|d| !d.sent), "THE SETUP: the NotFound GET is not parked");
+        assert!(p.dl().get(&Waiting::Get(id)).is_some_and(|d| !d.sent), "THE SETUP: the NotFound GET is not parked");
         // The page now holds it (a repair rebuilt it), and an audit joins the parked GET.
         p.engine.blocks_mut().insert(id, &bytes);
         p.audit_want(id, engine::PassId(1));
         assert!(p.take_ops().iter().all(|o| *o != Op::Get { id }), "the audit sent a second GET beside the parked one");
-        let due = p.deadlines.get(&Waiting::Get(id)).map(|d| d.at).expect("the parked GET is still there after the audit joined");
+        let due = p.dl().get(&Waiting::Get(id)).map(|d| d.at).expect("the parked GET is still there after the audit joined");
         p.tick(Ms(due));
         assert!(p.take_ops().contains(&Op::Get { id }), "the parked GET an audit waits on was ended at its due time: the page holds the block");
         p.answer(Answer::Got { id, bytes }, Ms(due + 5));
@@ -3365,7 +3026,7 @@ mod recording {
             }
             p.now = EPOCH_MS + 40;
             p.answered(&Waiting::Get([1; 32]));
-            let ats: Vec<u64> = p.deadlines.values().map(|d| d.at).collect();
+            let ats: Vec<u64> = p.dl().values().map(|d| d.at).collect();
             (ats, p.window.size(), p.rto.rto_ms())
         };
         assert_eq!(run(true), run(false), "past the last label, recording changed what the page did");
@@ -3447,22 +3108,30 @@ mod recording {
         println!("{}", p.dump(40));
     }
 
-    /// A send that SUPERSEDES one still on the wire (the same op sent again before its answer) ENDS the old one,
-    /// Withdrawn: the recording never holds a request that nothing closed and nothing will answer. Found by the
-    /// page model's accounting; pinned here, where no seed decides whether the path is reached. Mutant "the
-    /// superseded send's end not recorded" -> red.
+    /// The same op sent again while its send is on the wire JOINS it (OP-LIFE L0: one send in flight per key): no
+    /// second request, nothing left open that nothing will close, and the one answer closes the one request. Mutant
+    /// "a same-op send while one is on the wire sends again" -> red.
     #[test]
-    fn a_send_superseding_one_on_the_wire_closes_it_withdrawn() {
+    fn a_same_op_sent_again_while_on_the_wire_joins_the_one_send() {
         let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(EPOCH_MS));
         p.record_into(64);
         p.send(Waiting::Ext(Ext::SignerFirst), Op::Ext(Ext::SignerFirst));
         p.send(Waiting::Ext(Ext::SignerFirst), Op::Ext(Ext::SignerFirst));
-        let r = p.recording().expect("attached");
         let site = op_site(&Waiting::Ext(Ext::SignerFirst));
-        assert!(r.events().contains(&Event::Exit { site, op: instrument::Label::new(Kind::Request, 1).expect("1").op(), outcome: Outcome::Withdrawn }), "the superseded send req#1 was not closed");
+        let req = |n: u32| instrument::Label::new(Kind::Request, n).expect("n");
+        assert_eq!(p.ops_on_wire(), 1, "a second send of one key is on the wire (L0)");
+        assert_eq!(p.take_ops().len(), 1, "the same op went out twice");
+        let r = p.recording().expect("attached");
         let open: Vec<_> = r.answers().into_iter().filter(|(_, a)| *a == instrument::Answered::Never).map(|(l, _)| l.ordinal()).collect();
-        assert_eq!(open, vec![1, 2], "req#1 closed-unanswered and req#2 on the wire");
-        assert_eq!(p.ops_on_wire(), 1, "one op on the wire");
+        assert_eq!(open, vec![1], "not exactly req#1 is open");
+        p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 10));
+        assert!(!p.ext_waiting(Ext::SignerFirst), "the one answer did not end the wait");
+        let r = p.recording().expect("attached");
+        assert!(r.events().contains(&Event::Edge { site, dir: Dir::Response, id: req(1) }), "req#1 was not answered");
+        assert_eq!(p.ops_on_wire(), 0);
+        // A SECOND answer finds nothing in flight: a counted duplicate, nothing changed.
+        p.ext_answered(Ext::SignerFirst, Ms(EPOCH_MS + 20));
+        assert_eq!(p.ops.late(op_life::Resend::OnlyOne, Lane::Interactive, false), 1, "the duplicate was not counted");
     }
 
 }
@@ -3476,10 +3145,10 @@ mod deadline_table {
     /// A GET is LOST only when its deadline passes TWICE (sdk#447): the first time it goes SILENT (the node's own GET
     /// may still be running), and at that node GET's bound it times out.
     fn lose_get(p: &mut Page, i: u8) {
-        let at = p.deadlines[&Waiting::Get([i; 32])].at;
+        let at = p.dl()[&Waiting::Get([i; 32])].at;
         p.tick(Ms(at));
-        assert!(p.deadlines[&Waiting::Get([i; 32])].silent, "THE SETUP: the GET did not go silent at its deadline");
-        let at = p.deadlines[&Waiting::Get([i; 32])].at;
+        assert!(p.dl()[&Waiting::Get([i; 32])].silent, "THE SETUP: the GET did not go silent at its deadline");
+        let at = p.dl()[&Waiting::Get([i; 32])].at;
         p.tick(Ms(at));
     }
 
@@ -3508,12 +3177,12 @@ mod deadline_table {
         p.set_head_floor(2);
         let _ = p.take_ops();
         p.answer(Answer::Head { label: Label::Head, read: Some(HeadRead::from((1, [1u8; 32]))) }, Ms(T0 + 10));
-        let (sent, due) = p.deadlines.get(&Waiting::RecoverHead).map(|d| (d.sent, d.at)).expect("THE SETUP: the head read was not parked");
+        let (sent, due) = p.dl().get(&Waiting::RecoverHead).map(|d| (d.sent, d.at)).expect("THE SETUP: the head read was not parked");
         assert!(!sent, "THE SETUP: the head read is still on the wire");
         let _ = p.take_ops();
         p.carry_out(vec![Effect::ReadHead { epoch: EPOCH }]);
         assert!(p.take_ops().is_empty(), "a send of a PARKED op went out at once instead of joining its wait");
-        assert_eq!(p.deadlines[&Waiting::RecoverHead].at, due, "the parked deadline moved");
+        assert_eq!(p.dl()[&Waiting::RecoverHead].at, due, "the parked deadline moved");
         p.tick(Ms(due));
         assert!(p.take_ops().contains(&Op::ReadHead { label: Label::Head }), "the head read did not go out when its parked deadline came due");
     }
@@ -3526,11 +3195,11 @@ mod deadline_table {
         let mut p = page();
         get(&mut p, 1);
         p.answer(Answer::GetMissed([1; 32]), Ms(T0 + 10));
-        assert!(p.deadlines.get(&Waiting::Get([1; 32])).is_some_and(|d| !d.sent), "THE SETUP: the GET was not parked");
+        assert!(p.dl().get(&Waiting::Get([1; 32])).is_some_and(|d| !d.sent), "THE SETUP: the GET was not parked");
         let (srtt, rto, window) = (p.rto.srtt_ms(), p.rto.rto_ms(), p.window.size());
         p.answer(Answer::GetMissed([1; 32]), Ms(T0 + 20));
         assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms(), p.window.size()), (srtt, rto, window), "an answer for a PARKED op moved the clock or the window");
-        assert!(p.deadlines.get(&Waiting::Get([1; 32])).is_some_and(|d| !d.sent), "the re-answered parked GET is not parked again");
+        assert!(p.dl().get(&Waiting::Get([1; 32])).is_some_and(|d| !d.sent), "the re-answered parked GET is not parked again");
     }
 
     /// **park × first send, queued (b):** the answer comes first -- no sample (it was queued), the back-off ENDS --
@@ -3544,11 +3213,11 @@ mod deadline_table {
         }
         get(&mut p, 1);
         get(&mut p, 2);
-        assert!(!p.deadlines[&Waiting::Get([2; 32])].alone, "THE SETUP: the second GET was not queued");
+        assert!(!p.dl()[&Waiting::Get([2; 32])].alone, "THE SETUP: the second GET was not queued");
         p.answer(Answer::GetMissed([2; 32]), Ms(T0 + 74));
         assert_eq!(p.rto.srtt_ms(), None, "a queued answer was a sample");
         assert_eq!(p.rto.rto_ms(), rto::RTO_INITIAL_MS as u64, "the back-off did not end");
-        let d = &p.deadlines[&Waiting::Get([2; 32])];
+        let d = &p.dl()[&Waiting::Get([2; 32])];
         assert_eq!((d.sent, d.at), (false, T0 + 74 + rto::RTO_INITIAL_MS as u64), "not parked at backoff(1) of the RTO after the answer");
     }
 
@@ -3559,22 +3228,13 @@ mod deadline_table {
         let mut p = page();
         get(&mut p, 1);
         lose_get(&mut p, 1);
-        assert_eq!(p.deadlines.get(&Waiting::Get([1; 32])).map(|d| (d.sent, d.attempt)), Some((true, 2)), "THE SETUP: the GET was not re-sent as attempt 2");
+        assert_eq!(p.dl().get(&Waiting::Get([1; 32])).map(|d| (d.sent, d.attempt)), Some((true, 2)), "THE SETUP: the GET was not re-sent as attempt 2");
         let rto = p.rto.rto_ms();
         let now = p.now + 30;
         p.answer(Answer::GetMissed([1; 32]), Ms(now));
         assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms()), (None, rto), "a re-send's answer moved the RTO");
-        let d = &p.deadlines[&Waiting::Get([1; 32])];
+        let d = &p.dl()[&Waiting::Get([1; 32])];
         assert_eq!((d.sent, d.attempt, d.at), (false, 2, now + p.backoff(2)), "not parked at its own attempt's back-off");
-    }
-
-    /// **park × parked: IMPOSSIBLE, asserted.** Only an op on the wire is answered, so only it is parked.
-    #[test]
-    #[should_panic(expected = "park of an op that is already parked")]
-    fn parking_a_parked_op_is_refused_loudly() {
-        let mut p = page();
-        p.park(Waiting::Get([1; 32]), Op::Get { id: [1; 32] }, 1);
-        p.park(Waiting::Get([1; 32]), Op::Get { id: [1; 32] }, 1);
     }
 
     /// **withdraw × first send (alone, queued) and re-send:** a withdrawn op's deadline ends -- no sample, no
@@ -3588,17 +3248,17 @@ mod deadline_table {
             put(&mut p, i);
         }
         let _ = p.take_ops();
-        let (rto, at2, at3) = (p.rto.rto_ms(), p.deadlines[&Waiting::Put([2; 32])].at, p.deadlines[&Waiting::Put([3; 32])].at);
+        let (rto, at2, at3) = (p.rto.rto_ms(), p.dl()[&Waiting::Put([2; 32])].at, p.dl()[&Waiting::Put([3; 32])].at);
         p.now = T0 + 20;
         p.carry_out(vec![Effect::Withdraw { id: [1; 32] }]);
-        assert!(!p.deadlines.contains_key(&Waiting::Put([1; 32])), "the withdrawn PUT still waits");
+        assert!(!p.dl().contains_key(&Waiting::Put([1; 32])), "the withdrawn PUT still waits");
         assert!(p.take_ops().is_empty(), "a withdrawal sent something");
         assert_eq!(p.rto.rto_ms(), rto, "a withdrawal moved the RTO");
-        assert_eq!((p.deadlines[&Waiting::Put([2; 32])].at, p.deadlines[&Waiting::Put([3; 32])].at), (at2, at3), "the ops behind a withdrawn one moved at the withdrawal");
+        assert_eq!((p.dl()[&Waiting::Put([2; 32])].at, p.dl()[&Waiting::Put([3; 32])].at), (at2, at3), "the ops behind a withdrawn one moved at the withdrawal");
         // The next answer re-arms by the place NOW: put 3 has one op ahead (put 2 was answered, put 1 is gone).
         p.now = T0 + 40;
         p.answered(&Waiting::Put([2; 32]));
-        assert_eq!(p.deadlines[&Waiting::Put([3; 32])].at, at3.min(T0 + 40 + queued_wait(p.rto.rto_ms(), 0)), "the next answer did not re-arm put 3 at its place now");
+        assert_eq!(p.dl()[&Waiting::Put([3; 32])].at, at3.min(T0 + 40 + queued_wait(p.rto.rto_ms(), 0)), "the next answer did not re-arm put 3 at its place now");
     }
 
     /// **withdraw × queued:** a QUEUED op withdrawn: its deadline ends, nothing is sent, the RTO stands, and the op
@@ -3611,12 +3271,12 @@ mod deadline_table {
             put(&mut p, i);
         }
         let _ = p.take_ops();
-        assert!(!p.deadlines[&Waiting::Put([2; 32])].alone, "THE SETUP: put 2 is not queued");
-        let (rto, at3) = (p.rto.rto_ms(), p.deadlines[&Waiting::Put([3; 32])].at);
+        assert!(!p.dl()[&Waiting::Put([2; 32])].alone, "THE SETUP: put 2 is not queued");
+        let (rto, at3) = (p.rto.rto_ms(), p.dl()[&Waiting::Put([3; 32])].at);
         p.now = T0 + 20;
         p.carry_out(vec![Effect::Withdraw { id: [2; 32] }]);
-        assert!(!p.deadlines.contains_key(&Waiting::Put([2; 32])) && p.take_ops().is_empty(), "the queued PUT was not withdrawn quietly");
-        assert_eq!((p.rto.rto_ms(), p.deadlines[&Waiting::Put([3; 32])].at), (rto, at3), "withdrawing a queued op moved the RTO or the op behind it");
+        assert!(!p.dl().contains_key(&Waiting::Put([2; 32])) && p.take_ops().is_empty(), "the queued PUT was not withdrawn quietly");
+        assert_eq!((p.rto.rto_ms(), p.dl()[&Waiting::Put([3; 32])].at), (rto, at3), "withdrawing a queued op moved the RTO or the op behind it");
     }
 
     /// **withdraw × re-send:** the same end for an op on its second attempt: no sample, no back-off change.
@@ -3626,10 +3286,10 @@ mod deadline_table {
         put(&mut p, 1);
         p.tick(Ms(T0 + rto::RTO_INITIAL_MS as u64));
         let _ = p.take_ops();
-        assert_eq!(p.deadlines[&Waiting::Put([1; 32])].attempt, 2, "THE SETUP: not a re-send");
+        assert_eq!(p.dl()[&Waiting::Put([1; 32])].attempt, 2, "THE SETUP: not a re-send");
         let (srtt, rto) = (p.rto.srtt_ms(), p.rto.rto_ms());
         p.carry_out(vec![Effect::Withdraw { id: [1; 32] }]);
-        assert!(!p.deadlines.contains_key(&Waiting::Put([1; 32])) && p.take_ops().is_empty());
+        assert!(!p.dl().contains_key(&Waiting::Put([1; 32])) && p.take_ops().is_empty());
         assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms()), (srtt, rto), "withdrawing a re-send moved the clock");
     }
 
@@ -3645,7 +3305,7 @@ mod deadline_table {
         // Nobody needs it: its block is held now (a repair rebuilt it).
         p.engine.blocks_mut().insert([1; 32], &[1u8]);
         p.end_unneeded_gets();
-        assert!(!p.deadlines.contains_key(&Waiting::Get([1; 32])) && !p.attempt_of.contains_key(&Waiting::Get([1; 32])), "the unneeded parked GET is still held");
+        assert!(!p.dl().contains_key(&Waiting::Get([1; 32])) && !p.ops.contains(&Waiting::Get([1; 32])), "the unneeded parked GET is still held");
         assert!(p.take_ops().is_empty(), "ending a parked GET sent something");
         assert_eq!((p.rto.rto_ms(), p.window.size()), (rto, window));
     }
@@ -3662,11 +3322,11 @@ mod deadline_table {
         let first = p.take_ops();
         assert_eq!(first.len(), w as usize, "THE SETUP: not exactly the window's GETs went out");
         let q = [w + 1; 32];
-        assert!(!p.deadlines.contains_key(&Waiting::Get(q)) && p.get_queue.contains(&q), "a GET past the window was armed or dropped");
+        assert!(!p.dl().contains_key(&Waiting::Get(q)) && p.get_queued().contains(&q), "a GET past the window was armed or dropped");
         p.reconnected(Ms(T0 + 50));
         let again = p.take_ops();
         assert!(!again.contains(&Op::Get { id: q }), "a reconnect sent a window-queued GET");
-        assert!(p.get_queue.contains(&q) && !p.deadlines.contains_key(&Waiting::Get(q)), "a reconnect moved a window-queued GET");
+        assert!(p.get_queued().contains(&q) && !p.dl().contains_key(&Waiting::Get(q)), "a reconnect moved a window-queued GET");
     }
 
     /// **park × window-queued:** a LOST GET waiting in the window's queue (its attempt kept) is answered NotFound:
@@ -3687,11 +3347,11 @@ mod deadline_table {
         let _ = p.take_ops();
         // The first GET times out: LOST, queued behind the waiting ask (which takes its place), its attempt kept.
         lose_get(&mut p, 1);
-        assert!(p.get_queue.contains(&[1; 32]) && p.attempt_of.contains_key(&Waiting::Get([1; 32])), "THE SETUP: the lost GET is not waiting in the window's queue");
+        assert!(p.get_queued().contains(&[1; 32]) && p.attempt_kept(&Waiting::Get([1; 32])), "THE SETUP: the lost GET is not waiting in the window's queue");
         let now = p.now + 5;
         p.answer(Answer::GetMissed([1; 32]), Ms(now));
-        assert!(!p.get_queue.contains(&[1; 32]), "the answered GET is still in the window's queue");
-        let d = &p.deadlines[&Waiting::Get([1; 32])];
+        assert!(!p.get_queued().contains(&[1; 32]), "the answered GET is still in the window's queue");
+        let d = &p.dl()[&Waiting::Get([1; 32])];
         assert_eq!((d.sent, d.at), (false, now + p.backoff(1)), "not parked at its attempt's back-off");
     }
 }
@@ -3743,7 +3403,7 @@ mod node_get_silent {
         assert_eq!(gets_of(&p.take_ops(), id), 1, "THE SETUP: the GET did not go out");
         p.answer(Answer::Got { id, bytes: bytes.clone() }, Ms(T0 + 5));
         assert_eq!(freenet_prolly::store::Blocks::get(p.blocks(), &id), Some(&bytes[..]), "the parity block was not kept");
-        assert!(!p.deadlines.contains_key(&Waiting::Get(id)), "the parity GET still waits (taken for a miss)");
+        assert!(!p.ops.contains(&Waiting::Get(id)), "the parity GET still waits (taken for a miss)");
 
         // CONTROL: bytes that are not the id -> a miss, parked.
         let mut p = page();
@@ -3752,14 +3412,14 @@ mod node_get_silent {
         let _ = p.take_ops();
         p.answer(Answer::Got { id: other, bytes: bytes.clone() }, Ms(T0 + 5));
         assert!(freenet_prolly::store::Blocks::get(p.blocks(), &other).is_none(), "THE CONTROL: bytes that are not the id were kept");
-        assert!(p.deadlines.contains_key(&Waiting::Get(other)), "THE CONTROL: a wrong answer ended the GET");
+        assert!(p.ops.contains(&Waiting::Get(other)), "THE CONTROL: a wrong answer ended the GET");
     }
 
     /// Tick to the GET's deadline: it goes SILENT.
     fn silence(p: &mut Page, id: Cid) {
-        let at = p.deadlines[&Waiting::Get(id)].at;
+        let at = p.dl()[&Waiting::Get(id)].at;
         p.tick(Ms(at));
-        assert!(p.deadlines[&Waiting::Get(id)].silent, "THE SETUP: the GET did not go silent at its deadline");
+        assert!(p.dl()[&Waiting::Get(id)].silent, "THE SETUP: the GET did not go silent at its deadline");
     }
 
     /// **timeout < B, then timeout > B: THE FORCED TEST.** A GET the node never answers is sent ONCE for as long as
@@ -3782,10 +3442,10 @@ mod node_get_silent {
             assert_eq!(gets_of(&p.take_ops(), id), 0, "the GET was sent again at +{} ms, inside B", now - T0);
         }
         assert_eq!((p.rto.rto_ms(), p.window.size()), (rto, window), "silence inside B backed off the RTO or halved the window");
-        assert!(p.deadlines[&Waiting::Get(id)].silent, "THE CONTROL: the GET is not silent");
+        assert!(p.dl()[&Waiting::Get(id)].silent, "THE CONTROL: the GET is not silent");
         p.tick(Ms(over));
         assert_eq!(gets_of(&p.take_ops(), id), 1, "past B the GET was not sent again");
-        let d = &p.deadlines[&Waiting::Get(id)];
+        let d = &p.dl()[&Waiting::Get(id)];
         assert_eq!((d.attempt, d.silent, d.sent_at), (2, false, over), "the second GET is not attempt 2 on a new node GET");
     }
 
@@ -3798,10 +3458,10 @@ mod node_get_silent {
         get(&mut p, id);
         let _ = p.take_ops();
         silence(&mut p, id);
-        let before = p.deadlines[&Waiting::Get(id)].clone();
+        let before = p.dl()[&Waiting::Get(id)].clone();
         get(&mut p, id);
         assert_eq!(gets_of(&p.take_ops(), id), 0, "a second ask sent a second GET of the same key");
-        let d = &p.deadlines[&Waiting::Get(id)];
+        let d = &p.dl()[&Waiting::Get(id)];
         assert_eq!((d.at, d.seq, d.attempt, d.silent), (before.at, before.seq, before.attempt, true), "a second ask moved the silent GET");
     }
 
@@ -3814,7 +3474,7 @@ mod node_get_silent {
         get(&mut p, id);
         silence(&mut p, id);
         put(&mut p, 9);
-        let d = &p.deadlines[&Waiting::Put([9; 32])];
+        let d = &p.dl()[&Waiting::Put([9; 32])];
         assert!(d.alone, "a PUT sent behind only a silent GET was not alone");
         assert_eq!(d.at, p.now + p.rto.rto_ms(), "a PUT behind only a silent GET was armed for a place behind it");
     }
@@ -3827,10 +3487,10 @@ mod node_get_silent {
         let (a, _) = block(1);
         get(&mut p, a);
         silence(&mut p, a);
-        let over = p.deadlines[&Waiting::Get(a)].at;
+        let over = p.dl()[&Waiting::Get(a)].at;
         put(&mut p, 9);
         p.answer(Answer::PutOk([9; 32]), Ms(p.now + 20));
-        assert_eq!(p.deadlines[&Waiting::Get(a)].at, over, "an answer to another op re-armed the silent GET");
+        assert_eq!(p.dl()[&Waiting::Get(a)].at, over, "an answer to another op re-armed the silent GET");
     }
 
     /// **answer × silent:** the node's answer at last (its network fetch) is NO SAMPLE -- its time is the fetch, not
@@ -3846,7 +3506,7 @@ mod node_get_silent {
         assert!(p.engine.blocks().get(&a).is_some(), "THE SETUP: the answer was not taken");
         assert_eq!((p.rto.srtt_ms(), p.rto.rto_ms()), (None, rto), "a silent GET's answer moved the RTO");
         assert!(p.window.size() > window, "a silent GET's answer did not open the window");
-        assert!(!p.deadlines.contains_key(&Waiting::Get(a)), "the answered GET still waits");
+        assert!(!p.dl().contains_key(&Waiting::Get(a)), "the answered GET still waits");
     }
 
     /// **answer (NotFound) × silent:** parked at its attempt's back-off, as any GET's NotFound; no sample.
@@ -3858,7 +3518,7 @@ mod node_get_silent {
         silence(&mut p, a);
         let now = p.now + 5_000;
         p.answer(Answer::GetMissed(a), Ms(now));
-        let d = &p.deadlines[&Waiting::Get(a)];
+        let d = &p.dl()[&Waiting::Get(a)];
         assert_eq!((d.sent, d.silent, d.at), (false, false, now + p.backoff(1)), "a silent GET's NotFound was not parked at its back-off");
         assert_eq!(p.rto.srtt_ms(), None, "a silent GET's NotFound was a sample");
     }
@@ -3875,12 +3535,12 @@ mod node_get_silent {
         let now = p.now + 7_000;
         p.reconnected(Ms(now));
         assert_eq!(gets_of(&p.take_ops(), a), 1, "a reconnect did not re-send the silent GET");
-        let d = &p.deadlines[&Waiting::Get(a)];
+        let d = &p.dl()[&Waiting::Get(a)];
         assert_eq!((d.silent, d.sent_at, d.resent), (false, now, true), "the re-send is not a new node GET");
         // Silent again at its deadline, and over only B + rto after the RE-SEND.
         let rto = p.rto.rto_ms();
         silence(&mut p, a);
-        assert_eq!(p.deadlines[&Waiting::Get(a)].at, node_get_over_at(now, rto), "the bound did not restart at the re-send");
+        assert_eq!(p.dl()[&Waiting::Get(a)].at, node_get_over_at(now, rto), "the bound did not restart at the re-send");
     }
 
     /// **withdraw × silent:** nobody needs it: it ends, nothing is sent, the clock and window stand (the node's GET
@@ -3895,7 +3555,7 @@ mod node_get_silent {
         let (rto, window) = (p.rto.rto_ms(), p.window.size());
         p.drop_get(a);
         assert!(p.take_ops().is_empty(), "a withdrawn silent GET sent something");
-        assert!(!p.deadlines.contains_key(&Waiting::Get(a)), "a withdrawn silent GET still waits");
+        assert!(!p.dl().contains_key(&Waiting::Get(a)), "a withdrawn silent GET still waits");
         assert_eq!((p.rto.rto_ms(), p.window.size()), (rto, window), "a withdrawal moved the clock or the window");
     }
 
@@ -3918,7 +3578,7 @@ mod node_get_silent {
         get(&mut p, a);
         let _ = p.take_ops();
         silence(&mut p, a);
-        let over = p.deadlines[&Waiting::Get(a)].at;
+        let over = p.dl()[&Waiting::Get(a)].at;
         p.tick(Ms(over));
         assert_eq!(gets_of(&p.take_ops(), a), 1, "THE SETUP: the GET was not asked again past B");
         p.answer(Answer::Got { id: a, bytes: bytes.clone() }, Ms(over + 10));
@@ -3928,12 +3588,14 @@ mod node_get_silent {
         assert_eq!(overlaps(&p), 1, "the second answer after a re-ask past B was not recorded as DroppedMsgs = AnsweredAfterReask");
         assert!(p.take_ops().is_empty(), "the second answer made the page send something");
 
-        // THE CONTROL: a key never re-asked, answered twice, is no overlap.
+        // The first answer after the re-ask is the one counter's SERVED outcome (either send's: F1's overlap).
+        assert_eq!(p.ops.late(op_life::Resend::AfterBound, Lane::Interactive, true), 1, "the answer to the re-ask past B was not counted served");
+        // THE ONE COUNTER (OP-LIFE.md): a key never re-asked, answered twice, is a DUPLICATE -- counted too, dropped.
         let (b, bytes_b) = block(2);
         get(&mut p, b);
         p.answer(Answer::Got { id: b, bytes: bytes_b.clone() }, Ms(over + 30));
         p.answer(Answer::Got { id: b, bytes: bytes_b }, Ms(over + 40));
-        assert_eq!(overlaps(&p), 1, "a duplicate answer of a key never re-asked was recorded as the overlap");
+        assert_eq!(overlaps(&p), 2, "a duplicate answer of a key never re-asked was not counted");
     }
 
     /// **(2), RULED: a silent GET KEEPS ITS WINDOW PLACE** (rule 9's backpressure: it is still taking the path's
@@ -3949,12 +3611,12 @@ mod node_get_silent {
         get(&mut p, a);
         get(&mut p, b);
         let _ = p.take_ops();
-        let later = p.deadlines[&Waiting::Get(a)].at.max(p.deadlines[&Waiting::Get(b)].at);
+        let later = p.dl()[&Waiting::Get(a)].at.max(p.dl()[&Waiting::Get(b)].at);
         p.tick(Ms(later));
-        assert!(p.deadlines[&Waiting::Get(a)].silent && p.deadlines[&Waiting::Get(b)].silent, "THE SETUP: not both silent");
+        assert!(p.dl()[&Waiting::Get(a)].silent && p.dl()[&Waiting::Get(b)].silent, "THE SETUP: not both silent");
         get(&mut p, c);
         assert_eq!(gets_of(&p.take_ops(), c), 0, "a GET went out past a window full of silent GETs");
-        assert!(p.get_queue.contains(&c), "the third ask is not waiting for a place");
+        assert!(p.get_queued().contains(&c), "the third ask is not waiting for a place");
     }
 }
 
@@ -3982,20 +3644,19 @@ mod rto_rearm {
         p.send(Waiting::Put(answered), Op::Put { id: answered, bytes: vec![1] });
         p.send(Waiting::Put(lost), Op::Put { id: lost, bytes: vec![2] });
         // A re-send: its first send went unanswered.
-        p.attempt_of.insert(Waiting::Put(resend), 1);
-        p.send(Waiting::Put(resend), Op::Put { id: resend, bytes: vec![3] });
+        p.send_attempt(Waiting::Put(resend), Op::Put { id: resend, bytes: vec![3] }, 2);
         let _ = p.take_ops();
-        let resend_at = p.deadlines[&Waiting::Put(resend)].at;
-        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_000 + rto::RTO_MAX_MS as u64, "THE SETUP: the lost PUT was not given the ceiling");
-        assert_eq!(p.deadlines[&Waiting::Put(resend)].attempt, 2, "THE SETUP: the re-send is not a second attempt");
+        let resend_at = p.dl()[&Waiting::Put(resend)].at;
+        assert_eq!(p.dl()[&Waiting::Put(lost)].at, 1_000 + rto::RTO_MAX_MS as u64, "THE SETUP: the lost PUT was not given the ceiling");
+        assert_eq!(p.dl()[&Waiting::Put(resend)].attempt, 2, "THE SETUP: the re-send is not a second attempt");
 
         // Its sibling is answered on its first send after 100 ms: a sample, and the RTO falls.
         p.now = 1_100;
         p.answered(&Waiting::Put(answered));
         let rto = p.rto.rto_ms();
         assert!(rto < 1_000, "THE SETUP: the sample did not lower the RTO ({rto} ms)");
-        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, 1_100 + rto, "the lost PUT is not due one new RTO after its sibling's answer");
-        assert_eq!(p.deadlines[&Waiting::Put(resend)].at, resend_at, "a RE-SEND was pulled in: it keeps its backoff");
+        assert_eq!(p.dl()[&Waiting::Put(lost)].at, 1_100 + rto, "the lost PUT is not due one new RTO after its sibling's answer");
+        assert_eq!(p.dl()[&Waiting::Put(resend)].at, resend_at, "a RE-SEND was pulled in: it keeps its backoff");
 
         // And it is re-sent one RTO after that answer, not after a minute.
         p.tick(Ms(1_100 + rto));
@@ -4021,7 +3682,7 @@ mod rto_rearm_queue {
         // THE COLD OPEN, through the real path: the opening head read times out until the RTO is at its
         // ceiling, then is answered on a RE-send -- no sample (Karn), so the batch meets the ceiling.
         while p.rto.rto_ms() < rto::RTO_MAX_MS as u64 {
-            let due = p.deadlines[&Waiting::RecoverHead].at;
+            let due = p.dl()[&Waiting::RecoverHead].at;
             p.tick(Ms(due));
             let _ = p.take_ops();
         }
@@ -4047,8 +3708,8 @@ mod rto_rearm_queue {
         }
         assert!(resent.is_empty(), "answered siblings were declared lost and re-sent: {resent:?}");
         let rto = p.rto.rto_ms();
-        println!("  12 answered 175 ms apart, last at {last}; rto {rto}; the lost PUT due at {}", p.deadlines[&Waiting::Put(lost)].at);
-        assert_eq!(p.deadlines[&Waiting::Put(lost)].at, last + rto, "the lost PUT is not due one RTO after the last answer");
+        println!("  12 answered 175 ms apart, last at {last}; rto {rto}; the lost PUT due at {}", p.dl()[&Waiting::Put(lost)].at);
+        assert_eq!(p.dl()[&Waiting::Put(lost)].at, last + rto, "the lost PUT is not due one RTO after the last answer");
         p.tick(Ms(last + rto));
         assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at last answer + RTO");
     }
@@ -4093,7 +3754,7 @@ mod rto_rearm_queue {
         let rto = p.rto.rto_ms();
         // Only an answer to an op sent into an EMPTY queue is a sample: a queued one times its wait too.
         assert!(rto < 200, "the batch's queue waits were taken as RTT samples: rto {rto} ms");
-        let due = p.deadlines[&Waiting::Put(lost)].at;
+        let due = p.dl()[&Waiting::Put(lost)].at;
         assert!(due <= last + rto, "the lost PUT is due at {due}, later than an RTO ({rto} ms) after the last answer ({last})");
         p.tick(Ms(due));
         assert!(p.take_ops().contains(&Op::Put { id: lost, bytes: vec![13] }), "the lost PUT was not re-sent at {due}");
@@ -4168,12 +3829,12 @@ mod rto_queue {
             put(&mut p, i);
         }
         let _ = p.take_ops();
-        let armed: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put([i; 32])].at).collect();
+        let armed: Vec<u64> = (1..=3u8).map(|i| p.dl()[&Waiting::Put([i; 32])].at).collect();
         assert_eq!(armed, vec![1_100 + 2 * rto, 1_100 + 3 * rto, 1_100 + 4 * rto], "THE SETUP: the batch is not armed an RTO per place behind the re-send");
         p.now = 1_110;
         p.answered(&Waiting::Put([9; 32]));
         assert_eq!(p.rto.rto_ms(), rto, "a re-send's answer was taken as a sample");
-        let at: Vec<u64> = (1..=3u8).map(|i| p.deadlines[&Waiting::Put([i; 32])].at).collect();
+        let at: Vec<u64> = (1..=3u8).map(|i| p.dl()[&Waiting::Put([i; 32])].at).collect();
         println!("  rto {rto}; batch armed {armed:?}; after the re-send's answer {at:?}");
         assert_eq!(at, vec![1_110 + rto, 1_110 + 2 * rto, 1_110 + 3 * rto], "the batch did not move up one place on the re-send's answer");
     }
@@ -4258,9 +3919,9 @@ mod reconnect {
         let first = p.take_ops();
         assert_eq!(first.iter().filter(|o| matches!(o, Op::Get { .. })).count(), 4, "THE SETUP: the GETs did not go out (within the window)");
         p.answer(Answer::GetMissed(parked), Ms(10));
-        let parked_at = p.deadlines[&Waiting::Get(parked)].at;
+        let parked_at = p.dl()[&Waiting::Get(parked)].at;
         let (rto, window) = (p.rto.rto_ms(), p.window.size());
-        let attempts: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(*id)].attempt).collect();
+        let attempts: Vec<u32> = ids.iter().map(|id| p.dl()[&Waiting::Get(*id)].attempt).collect();
 
         p.reconnected(Ms(50));
         let again = p.take_ops();
@@ -4268,10 +3929,10 @@ mod reconnect {
             assert!(again.contains(&Op::Get { id: *id }), "a GET on the wire was not re-sent on the reconnect: {again:?}");
         }
         assert!(!again.contains(&Op::Get { id: parked }), "a PARKED GET (not on the wire) was re-sent");
-        assert_eq!(p.deadlines[&Waiting::Get(parked)].at, parked_at, "a parked GET lost its backoff");
+        assert_eq!(p.dl()[&Waiting::Get(parked)].at, parked_at, "a parked GET lost its backoff");
         assert_eq!(p.window.size(), window, "the reconnect halved the window, as if the path were congested");
         assert_eq!(p.rto.rto_ms(), rto, "the reconnect backed the RTO off");
-        let after: Vec<u32> = ids.iter().map(|id| p.deadlines[&Waiting::Get(*id)].attempt).collect();
+        let after: Vec<u32> = ids.iter().map(|id| p.dl()[&Waiting::Get(*id)].attempt).collect();
         assert_eq!(after, attempts, "a re-send on the new socket was counted as another attempt");
 
         // KARN: the re-send's answer, however late, is no RTT sample.
@@ -4300,7 +3961,7 @@ mod not_sent {
             (Waiting::Held(1), Op::AskHeld { batch: 1, ids: vec![id] }),
             (Waiting::Sign(Label::Head), sign),
             (Waiting::Update(Label::Head), Op::Update { label: Label::Head, state: b"s".to_vec() }),
-            (Waiting::PutApp("k".into()), Op::PutApp { key: "k".into() }),
+            (Waiting::PutApp("k".into(), Ask::Direct("app".into())), Op::PutApp { key: "k".into() }),
             (Waiting::Warm, Op::ReadHead { label: Label::Head }),
             (Waiting::RecoverHead, Op::ReadHead { label: Label::Head }),
             (Waiting::Verify, Op::ReadHead { label: Label::Head }),
@@ -4308,12 +3969,15 @@ mod not_sent {
             (Waiting::Hint, Op::ReadHead { label: Label::Head }),
         ];
         for (w, op) in cases {
+            // A page whose opening head read is answered: nothing in flight, so each wait rides its own send.
             let mut p = Page::new(Params::default(), PutPath::Page);
+            p.answered(&Waiting::RecoverHead);
+            let _ = p.take_ops();
             p.send(w.clone(), op.clone());
             let _ = p.take_ops();
-            assert!(p.deadlines.contains_key(&w), "THE CONTROL: {w:?} was not waiting after its send");
+            assert!(p.dl().contains_key(&w), "THE CONTROL: {w:?} was not waiting after its send");
             p.answer(Answer::NotSent { op: op.clone(), why: "refused".into() }, Ms(1));
-            assert!(!p.deadlines.contains_key(&w), "a NotSent for {op:?} left {w:?} waiting");
+            assert!(!p.dl().contains_key(&w), "a NotSent for {op:?} left {w:?} waiting");
         }
     }
 }
@@ -4441,7 +4105,7 @@ mod window_loss {
         println!("20 reads behind one silent block: waited {waited:?} ms, window {}", p.window.size());
         assert!(worst <= 2_000, "a read waited {worst} ms behind one silent block: {waited:?}");
         assert!(node.sent.iter().filter(|(_, id)| *id == silent).count() >= 2, "THE CONTROL: the silent block was not lost and re-sent");
-        assert!(p.deadlines.get(&Waiting::Get(silent)).is_some_and(|d| d.sent), "THE CONTROL: the silent block does not hold a window place");
+        assert!(p.dl().get(&Waiting::Get(silent)).is_some_and(|d| d.sent), "THE CONTROL: the silent block does not hold a window place");
     }
 
     /// A LOST GET'S RE-SEND QUEUES BEHIND THE ASKS ALREADY WAITING, and a lost
@@ -4463,7 +4127,7 @@ mod window_loss {
         ask(&mut p, now, all[1].0);
         ask(&mut p, now, all[2].0);
         assert_eq!(p.gets_in_flight(), 2);
-        assert_eq!(p.get_queue.iter().copied().collect::<Vec<_>>(), vec![all[2].0], "THE CONTROL: the third ask did not wait");
+        assert_eq!(p.get_queued(), vec![all[2].0], "THE CONTROL: the third ask did not wait");
         node.run(&mut p, &mut now, PAST_B + 5_000);
         assert!(p.engine.blocks().get(&all[2].0).is_some(), "the waiting ask was starved by the lost GETs' re-sends");
         let first_resend = node.sent.iter().filter(|(_, id)| *id == all[0].0 || *id == all[1].0).nth(2).map(|(t, _)| *t).expect("a re-send");
@@ -4496,7 +4160,7 @@ mod window_loss {
         }
         let mut queued_when_answered = false;
         for _ in 0..2 * PAST_B + 20_000 {
-            let was_queued: Vec<Cid> = p.get_queue.iter().copied().filter(|q| p.attempt_of.contains_key(&Waiting::Get(*q))).collect();
+            let was_queued: Vec<Cid> = p.get_queued().iter().copied().filter(|q| p.attempt_kept(&Waiting::Get(*q))).collect();
             node.run(&mut p, &mut now, 1);
             queued_when_answered |= was_queued.iter().any(|id| p.engine.blocks().get(id).is_some());
         }
@@ -4504,7 +4168,7 @@ mod window_loss {
         println!("sends per block {sends:?}; a queued lost GET answered: {queued_when_answered}");
         assert!(queued_when_answered, "THE CONTROL: no lost GET was still queued when its late answer landed");
         assert!(all.iter().all(|(id, _)| p.engine.blocks().get(id).is_some()), "not every block was read: sends {sends:?}");
-        assert!(!p.get_queue.iter().any(|q| p.engine.blocks().get(q).is_some()), "a block already read is still queued to be asked again");
+        assert!(!p.get_queued().iter().any(|q| p.engine.blocks().get(q).is_some()), "a block already read is still queued to be asked again");
     }
 
     /// ENDING A GET LEAVES NO TRACE, however it ends (`drop_get`, the one
@@ -4532,15 +4196,15 @@ mod window_loss {
         }
         // Until both are LOST (past their node GET's bound, sdk#447) and queued.
         let mut t = 0;
-        while !(p.get_queue.contains(&late) && p.get_queue.contains(&withdrawn)) && t < PAST_B + 10_000 {
+        while !(p.get_queued().contains(&late) && p.get_queued().contains(&withdrawn)) && t < PAST_B + 10_000 {
             node.run(&mut p, &mut now, 1);
             t += 1;
         }
         let holders = |p: &Page, id: Cid| {
-            (p.deadlines.contains_key(&Waiting::Get(id)), p.attempt_of.contains_key(&Waiting::Get(id)), p.get_queue.contains(&id))
+            (p.dl().contains_key(&Waiting::Get(id)), p.attempt_kept(&Waiting::Get(id)), p.get_queued().contains(&id))
         };
         for id in [late, withdrawn] {
-            assert!(p.get_queue.contains(&id) && p.attempt_of.contains_key(&Waiting::Get(id)) && !p.deadlines.contains_key(&Waiting::Get(id)), "THE CONTROL: {:?} is not a queued lost GET: {:?}", &id[..2], holders(&p, id));
+            assert!(p.get_queued().contains(&id) && p.attempt_kept(&Waiting::Get(id)) && !p.dl().contains_key(&Waiting::Get(id)), "THE CONTROL: {:?} is not a queued lost GET: {:?}", &id[..2], holders(&p, id));
         }
         // The late answer to `late`'s first send.
         let bytes = all[0].1.clone();
@@ -4550,7 +4214,7 @@ mod window_loss {
         // `withdrawn` (queued) and one ON THE WIRE: their blocks are held now
         // (a repair rebuilt them), so nobody needs either GET.
         let on_wire = all[2].0;
-        assert!(p.deadlines.get(&Waiting::Get(on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
+        assert!(p.dl().get(&Waiting::Get(on_wire)).is_some_and(|d| d.sent), "THE CONTROL: {:?} is not on the wire", &on_wire[..2]);
         p.engine.blocks_mut().insert(withdrawn, &all[1].1);
         p.engine.blocks_mut().insert(on_wire, &all[2].1);
         p.end_unneeded_gets();
@@ -4655,11 +4319,11 @@ mod head_floor {
         let mut p = Page::new(Params::default(), PutPath::Page);
         p.set_head_floor(2);
         assert!(p.take_ops().contains(&Op::ReadHead { label: Label::Head }), "THE CONTROL: the page did not read its head");
-        let sent = p.deadlines.get(&Waiting::RecoverHead).map(|d| d.sent);
+        let sent = p.dl().get(&Waiting::RecoverHead).map(|d| d.sent);
         assert_eq!(sent, Some(true), "THE CONTROL: the head read is not on the wire");
 
         p.answer(Answer::Head { label: Label::Head, read: Some(HeadRead::from((1, [1u8; 32]))) }, Ms(10));
-        let parked = p.deadlines.get(&Waiting::RecoverHead).map(|d| (d.sent, d.at));
+        let parked = p.dl().get(&Waiting::RecoverHead).map(|d| (d.sent, d.at));
         let (sent, due) = parked.expect("a head below the floor dropped the head read instead of parking it");
         assert!(!sent, "a head below the floor left the read on the wire, to time out as silence");
         assert!(!p.recovered(), "a head below the floor was adopted");
@@ -4847,7 +4511,7 @@ mod confirmed_once {
         let (mut p, mine, _) = at_update(false);
         read_back_out(&mut p);
         p.head_pushed(mine.clone());
-        assert!(!p.deadlines.contains_key(&Waiting::ReadBack(Label::Head)), "the confirmation did not withdraw the read-back GET");
+        assert!(!p.dl().contains_key(&Waiting::ReadBack(Label::Head)), "the confirmation did not withdraw the read-back GET");
         p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(12));
         assert_eq!(published(&mut p), BTreeMap::from([(WriteId(1), 1)]), "the commit was not confirmed exactly once (E1 then E4)");
     }
@@ -4941,8 +4605,8 @@ mod confirmed_once {
         }
         let o = p.pubs.head().owed().expect("the next commit's owed head was dropped by the confirming step");
         assert_eq!(o.seq, mine.seq + 1, "THE SETUP: the confirming step did not release the next commit's head");
-        assert!(p.deadlines.contains_key(&Waiting::Sign(Label::Head)), "the next commit's sign wait was ended with the confirmed head");
-        assert!(!p.deadlines.contains_key(&Waiting::ReadBack(Label::Head)), "the confirmed head's read-back wait outlived it");
+        assert!(p.dl().contains_key(&Waiting::Sign(Label::Head)), "the next commit's sign wait was ended with the confirmed head");
+        assert!(!p.dl().contains_key(&Waiting::ReadBack(Label::Head)), "the confirmed head's read-back wait outlived it");
         if by_push {
             // The first head's read-back GET answers late: nothing to confirm, nothing to count.
             p.answer(Answer::Head { label: Label::Head, read: Some(mine.clone()) }, Ms(13));
@@ -4964,259 +4628,6 @@ mod confirmed_once {
 }
 
 #[cfg(test)]
-mod background_lane {
-    //! THE ONE BACKGROUND LANE (KEEPER §7, OBSERVABILITY §3; the architect's design): one Background op on the node's
-    //! one queue at a time, outside the interactive GET window, and PROMOTED -- once, never back -- when an
-    //! interactive waiter joins it. Nothing on main is Background yet, so these tests class waits Background through
-    //! `test_background`, the stand-in for the audit's and the observation tree's arms of `lane_of`.
-    use super::*;
-
-    /// A page whose opening head read is answered: nothing on the wire.
-    fn page() -> Page {
-        let mut p = Page::new(Params::default(), PutPath::Page);
-        p.answered(&Waiting::RecoverHead);
-        let _ = p.take_ops();
-        p
-    }
-
-    fn put(i: u8) -> (Waiting, Op) {
-        (Waiting::Put([i; 32]), Op::Put { id: [i; 32], bytes: vec![i] })
-    }
-
-    fn get(i: u8) -> (Waiting, Op) {
-        (Waiting::Get([i; 32]), Op::Get { id: [i; 32] })
-    }
-
-    fn background(p: &mut Page, (w, op): (Waiting, Op)) {
-        p.test_background.insert(w.clone());
-        p.send(w, op);
-    }
-
-    /// (a) **ONE Background op on the wire**, across a burst of ten, in order: each answer lets the next out.
-    #[test]
-    fn a_burst_of_background_ops_goes_one_at_a_time_in_order() {
-        let mut p = page();
-        for i in 1..=10 {
-            background(&mut p, put(i));
-        }
-        let mut sent = Vec::new();
-        for i in 1..=10u8 {
-            let ops = p.take_ops();
-            assert_eq!(p.background_in_flight(), 1, "{} Background ops on the wire", p.background_in_flight());
-            assert_eq!(ops, vec![put(i).1], "the {i}th Background op did not go out alone and in order");
-            sent.push(i);
-            p.answered(&put(i).0);
-        }
-        assert_eq!(sent, (1..=10).collect::<Vec<_>>());
-        assert_eq!((p.background_in_flight(), p.bg_queue.len()), (0, 0));
-    }
-
-    /// (b) **A Background GET never takes the interactive window**: with the window full and an interactive GET
-    /// queued behind it, a Background GET goes out on its own slot, and the window's next place goes to the
-    /// interactive GET.
-    #[test]
-    fn a_background_get_never_takes_an_interactive_place() {
-        let mut p = page();
-        let n = p.window.size();
-        for i in 1..=(n as u8 + 1) {
-            let (w, op) = get(i);
-            p.send(w, op);
-        }
-        assert_eq!((p.gets_in_flight(), p.get_queue.len()), (n, 1), "THE SETUP: the window is not full with one queued");
-        background(&mut p, get(200));
-        assert!(p.deadlines.get(&get(200).0).is_some_and(|d| d.sent), "the Background GET waited on the interactive window");
-        assert_eq!(p.gets_in_flight(), n, "the Background GET counts in the interactive window");
-        let _ = p.take_ops();
-        p.answered(&get(1).0);
-        let queued = get(n as u8 + 1).0;
-        assert!(p.deadlines.get(&queued).is_some_and(|d| d.sent && d.lane == Lane::Interactive), "the freed place did not go to the queued interactive GET");
-    }
-
-    /// (c) **A Background GET neither grows nor shrinks the interactive window**: answered, or timed out.
-    #[test]
-    fn a_background_gets_answer_and_loss_leave_the_window_alone() {
-        let mut p = page();
-        let size = p.window.size();
-        background(&mut p, get(1));
-        p.answered(&get(1).0);
-        assert_eq!(p.window.size(), size, "a Background GET's answer grew the interactive window");
-        background(&mut p, get(2));
-        // Its first deadline only makes it SILENT (sdk#447: the node's own GET is not over); the moved deadline, past
-        // that node GET's bound, is the LOSS.
-        let due = p.deadlines[&get(2).0].at;
-        p.tick(Ms(due));
-        assert!(p.deadlines[&get(2).0].silent, "THE SETUP: the first deadline did not make it silent");
-        let lost_at = p.deadlines[&get(2).0].at;
-        p.tick(Ms(lost_at));
-        assert_eq!(p.window.size(), size, "a Background GET's loss shrank the interactive window");
-        assert!(p.deadlines.get(&get(2).0).is_some_and(|d| d.lane == Lane::Background), "the lost Background GET's re-send left its lane");
-        assert!(!p.get_queue.contains(&[2; 32]), "the lost Background GET's re-send queued for the interactive window");
-        assert!(p.reasked.contains_key(&[2; 32]), "a lost Background GET's re-ask was not recorded (sdk#447's one overlap rule)");
-    }
-
-    /// (d) **A queued Background op that is withdrawn never goes out.**
-    #[test]
-    fn a_withdrawn_queued_background_op_is_never_sent() {
-        let mut p = page();
-        background(&mut p, put(1));
-        background(&mut p, put(2));
-        let _ = p.take_ops();
-        p.end(&put(2).0, End::Withdrawn);
-        p.answered(&put(1).0);
-        assert!(p.take_ops().is_empty(), "the withdrawn queued Background op went out");
-    }
-
-    /// (e) **The person is never shown background work waiting.**
-    #[test]
-    fn not_answering_never_names_background_work() {
-        let mut p = page();
-        background(&mut p, put(1));
-        assert_eq!(p.not_answering(), None, "a Background op was shown as not answering");
-        let (w, op) = put(2);
-        p.send(w, op);
-        assert!(p.not_answering().is_some(), "THE CONTROL: an interactive op was not shown");
-    }
-
-    /// (f) **PROMOTION, queued**: a Background GET of X waits behind another Background op; an interactive waiter
-    /// joins X (the engine may emit no new fetch for it) -- at the next engine step X goes out NOW, as interactive
-    /// work, counted in the interactive window.
-    #[test]
-    fn a_queued_background_get_an_interactive_waiter_joins_goes_out_now() {
-        let mut p = page();
-        background(&mut p, put(1));
-        background(&mut p, get(7));
-        assert!(p.bg_queue.iter().any(|(w, _)| *w == get(7).0), "THE SETUP: X is not queued behind the slot");
-        let before = p.gets_in_flight();
-        // An app read joins X: its class is now Interactive.
-        p.test_background.remove(&get(7).0);
-        let now = p.now;
-        p.tick(Ms(now));
-        let d = p.deadlines.get(&get(7).0).expect("X was not sent");
-        assert!(d.sent && d.lane == Lane::Interactive, "X did not go out as interactive work");
-        assert_eq!(p.gets_in_flight(), before + 1, "the promoted GET is not counted in the interactive window");
-        assert_eq!(p.background_in_flight(), 1, "THE CONTROL: the other Background op lost its slot");
-    }
-
-    /// (g) **A WITHDRAWN on-wire Background op KEEPS the slot** (engineer2's finding, the architect's fix): the node still
-    /// holds it, so the queued Background op does not go out until its answer comes (dropped) -- and, in a second run,
-    /// until its deadline comes due. An interactive withdrawn GET is not held (the window's own meaning).
-    #[test]
-    fn a_withdrawn_background_op_on_the_wire_keeps_the_slot_until_its_answer_or_deadline() {
-        for by_answer in [true, false] {
-            let mut p = page();
-            background(&mut p, get(7));
-            background(&mut p, put(2));
-            let _ = p.take_ops();
-            assert!(p.bg_queue.iter().any(|(w, _)| *w == put(2).0), "THE SETUP: the second op is not queued");
-            p.end(&get(7).0, End::Withdrawn);
-            assert_eq!(p.background_in_flight(), 1, "the withdrawn on-wire op freed the slot");
-            let now = p.now;
-            p.tick(Ms(now));
-            assert!(p.take_ops().is_empty(), "a second Background op went out beside the withdrawn one");
-            if by_answer {
-                assert_eq!(p.answered(&get(7).0), None, "the withdrawn op's answer was taken as an answer");
-            } else {
-                let due = p.deadlines[&get(7).0].at;
-                p.tick(Ms(due));
-            }
-            let _ = p.take_ops();
-            assert!(!p.deadlines.contains_key(&get(7).0), "the withdrawn op outlived its {}", if by_answer { "answer" } else { "deadline" });
-            assert!(p.deadlines.get(&put(2).0).is_some_and(|d| d.sent), "the slot did not go to the queued op after the {}", if by_answer { "answer" } else { "deadline" });
-        }
-        // THE CONTROL: an INTERACTIVE GET withdrawn on the wire frees its place at once (the window, unchanged).
-        let mut p = page();
-        let (w, op) = get(9);
-        p.send(w.clone(), op);
-        p.end(&w, End::Withdrawn);
-        assert!(!p.deadlines.contains_key(&w), "an interactive withdrawn GET was held");
-    }
-
-    /// **UN-WITHDRAWN BY AN INTERACTIVE WAITER, PROMOTED** (the architect on c3a298a): a Background GET of X withdrawn
-    /// on the wire, then an app's read needs X -- X is waited on again as INTERACTIVE work, the slot frees, and the next
-    /// queued Background op goes out.
-    #[test]
-    fn a_withdrawn_background_get_an_app_read_wants_again_is_promoted() {
-        let mut p = page();
-        background(&mut p, get(7));
-        background(&mut p, put(2));
-        let _ = p.take_ops();
-        p.end(&get(7).0, End::Withdrawn);
-        assert!(p.deadlines[&get(7).0].withdrawn, "THE SETUP: X is not withdrawn");
-        // The app's read of X: its class is Interactive now.
-        p.test_background.remove(&get(7).0);
-        let (w, op) = get(7);
-        p.send(w, op);
-        let d = &p.deadlines[&get(7).0];
-        assert!(!d.withdrawn && d.lane == Lane::Interactive, "X wanted by an app was not promoted (withdrawn {}, lane {:?})", d.withdrawn, d.lane);
-        assert!(p.deadlines.get(&put(2).0).is_some_and(|d| d.sent), "the freed slot did not take the next Background op");
-    }
-
-    /// **ONE END PER OP** (the architect): recorded when the entry LEAVES -- withdrawn, wanted again, answered: exactly
-    /// one end, the answer; withdrawn, then its deadline: exactly one end, Withdrawn.
-    #[test]
-    fn a_withdrawn_op_records_exactly_one_end() {
-        use instrument::{Dir, Event, Outcome, Record};
-        let ends = |p: &Page| -> Vec<Event> {
-            p.recording().expect("recording").events().into_iter().filter(|e| matches!(e, Event::Exit { .. } | Event::Edge { dir: Dir::Response, .. })).collect()
-        };
-        // withdraw -> wanted again (Background) -> answer
-        let mut p = page();
-        p.record_into(256);
-        background(&mut p, get(7));
-        p.end(&get(7).0, End::Withdrawn);
-        let (w, op) = get(7);
-        p.send(w, op);
-        p.answered(&get(7).0);
-        let e = ends(&p);
-        assert_eq!(e.len(), 1, "withdrawn, wanted again, answered: {} ends recorded: {e:?}", e.len());
-        assert!(matches!(e[0], Event::Edge { dir: Dir::Response, .. }), "the one end is not the answer: {e:?}");
-        // withdraw -> deadline
-        let mut p = page();
-        p.record_into(256);
-        background(&mut p, get(8));
-        p.end(&get(8).0, End::Withdrawn);
-        assert!(ends(&p).is_empty(), "an end was recorded at withdraw, before the entry left");
-        let due = p.deadlines[&get(8).0].at;
-        p.tick(Ms(due));
-        let e = ends(&p);
-        assert_eq!(e.len(), 1, "withdrawn, then due: {} ends: {e:?}", e.len());
-        assert!(matches!(e[0], Event::Exit { outcome: Outcome::Withdrawn, .. }), "the one end is not Withdrawn: {e:?}");
-    }
-
-    /// **not_answering_in(lane)**: a Background wait shows ONLY through the Background lane; the plain
-    /// `not_answering` (what an app shows) is the Interactive lane's.
-    #[test]
-    fn a_lanes_longest_wait_is_named_only_in_that_lane() {
-        let mut p = page();
-        background(&mut p, put(1));
-        assert_eq!(p.not_answering(), None);
-        assert!(p.not_answering_in(Lane::Background).is_some_and(|(what, _)| what == "a block's save"), "the Background wait was not named in its lane");
-        let (w, op) = put(2);
-        p.send(w, op);
-        assert!(p.not_answering().is_some() && p.not_answering_in(Lane::Interactive) == p.not_answering(), "the plain form is not the Interactive lane's");
-    }
-
-    /// (f) **PROMOTION, on the wire**: the joined op moves to the interactive count and FREES the slot, which the
-    /// next queued Background op takes; it is never demoted back.
-    #[test]
-    fn an_on_wire_background_op_an_interactive_waiter_joins_frees_the_slot() {
-        let mut p = page();
-        background(&mut p, get(7));
-        background(&mut p, put(2));
-        let _ = p.take_ops();
-        p.test_background.remove(&get(7).0);
-        let now = p.now;
-        p.tick(Ms(now));
-        assert_eq!(p.deadlines[&get(7).0].lane, Lane::Interactive, "the joined on-wire op was not promoted");
-        assert!(p.deadlines.get(&put(2).0).is_some_and(|d| d.sent), "the freed slot did not take the next Background op");
-        // Never demoted: classing it Background again changes nothing.
-        p.test_background.insert(get(7).0);
-        p.tick(Ms(now));
-        assert_eq!(p.deadlines[&get(7).0].lane, Lane::Interactive, "a promoted op was demoted back");
-    }
-}
-
-#[cfg(test)]
 mod head_refused_order {
     //! PUBLISH-LIFE ⁵ with sdk#502: a refused head's `fail_commit` WITHDRAWS the dead commit's unconfirmed blocks (its
     //! held-back parity), and the writes behind it re-derive a new commit IN THE SAME STEP -- one that, over the same
@@ -5230,7 +4641,7 @@ mod head_refused_order {
 
     /// Is `id` still on its way: held back for its commit, or a PUT on the wire?
     fn owed(p: &Page, id: &Cid) -> bool {
-        p.held.iter().any(|(_, f)| matches!(f, Effect::PutBlock { id: x, .. } if x == id)) || p.deadlines.contains_key(&Waiting::Put(*id))
+        p.held.iter().any(|(_, f)| matches!(f, Effect::PutBlock { id: x, .. } if x == id)) || p.ops.contains(&Waiting::Put(*id))
     }
 
     /// **A refused head's withdraw does not eat the re-derived commit's PUT of the same block.** Write 1 is at its Sign
@@ -5273,7 +4684,7 @@ mod head_refused_order {
         let _ = p.take_ops();
         let _ = p.take_notices();
         let held_back: BTreeSet<Cid> = unanswered.into_iter().collect();
-        assert!(held_back.iter().all(|id| !p.confirmed.contains(id) && p.deadlines.contains_key(&Waiting::Put(*id))) && !held_back.is_empty(), "THE SETUP: no first-wave PUT is unconfirmed on the wire at the sign (nothing for the withdraw to name)");
+        assert!(held_back.iter().all(|id| !p.confirmed.contains(id) && p.ops.contains(&Waiting::Put(*id))) && !held_back.is_empty(), "THE SETUP: no first-wave PUT is unconfirmed on the wire at the sign (nothing for the withdraw to name)");
         p.answer(Answer::Signer { id, answer: signer_proto::Answer::Refused(signer_proto::Why::CannotSign) }, Ms(11));
         let told: Vec<(WriteId, State)> = p.take_notices().into_iter().map(|(_, w, s)| (w, s)).collect();
         assert!(told.contains(&(WriteId(1), State::Failed)), "THE SETUP: write 1 was not Failed by the refusal: {told:?}");
@@ -5303,5 +4714,35 @@ mod said {
         assert!(matches!(&said[0], instrument::Event::Counter { site: s, entry, .. } if *s == site && entry.value == 1));
         assert!(!format!("{:?}", r.events()).contains("abcdef"), "the line's text entered the recording");
         assert_eq!(p.take_unusable(), vec!["a secret key abcdef named in a line".to_string()], "the line was not kept for the app");
+    }
+}
+
+#[cfg(test)]
+mod backstop_spin {
+    //! sdk#534: `next_due` and `tick` read ONE `backstop_due()`. With a head read in flight past the backstop's time, the
+    //! backstop is held back in `tick` -- so `next_due` must not offer it either, or a host arming its one-shot from
+    //! `next_due` re-fires at a past time `tick` never acts on, for ever. Mutant "next_due offers the backstop whatever
+    //! is in flight" -> red.
+    use super::*;
+
+    #[test]
+    fn next_due_never_offers_a_time_tick_will_not_act_on() {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.answered(&Waiting::RecoverHead);
+        let _ = p.take_ops();
+        p.engine_has_head = true;
+        p.last_head_at = p.now;
+        // A head read in flight, never answered: silent past its RTO, re-sent only at its node bound.
+        p.send(Waiting::Hint, Op::ReadHead { label: Label::Head });
+        let _ = p.take_ops();
+        let mut last = p.now;
+        for step in 0..50 {
+            let t = p.next_due().expect("the read is due").0;
+            assert!(t > last || step == 0 && t >= last, "step {step}: next_due offered {t}, not after the last tick at {last}: a host would spin");
+            p.tick(Ms(t));
+            let _ = p.take_ops();
+            last = t;
+        }
+        assert!(last > p.last_head_at + HEAD_BACKSTOP_MS, "THE SETUP: the run never passed the backstop's time");
     }
 }

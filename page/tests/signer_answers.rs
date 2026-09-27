@@ -51,8 +51,17 @@ fn a_misrouted_answer_does_not_stop_the_sign_being_asked_again() {
         let (mut p, now, id) = at_sign(PutPath::Page);
         let under = if other_id { id.wrapping_add(1000) } else { id };
         p.answer(Answer::Signer { id: under, answer: misrouted.clone() }, Ms(now + 1));
-        p.tick(Ms(now + page::rto::RTO_INITIAL_MS as u64));
-        assert_eq!(signs(&p.take_ops()), 1, "after a misrouted {misrouted:?} (id {under}) the sign was never asked again");
+        // The sign is SILENT past its RTO and asked again at its node BOUND (OP-LIFE L0: one Sign in flight per label).
+        let mut asked = 0;
+        for _ in 0..200 {
+            let Some(t) = p.next_due() else { break };
+            p.tick(t);
+            asked += signs(&p.take_ops());
+            if asked > 0 {
+                break;
+            }
+        }
+        assert_eq!(asked, 1, "after a misrouted {misrouted:?} (id {under}) the sign was never asked again");
         assert!(p.unusable().is_empty(), "a misrouted answer was taken as the sign's: {:?}", p.unusable());
     }
 }

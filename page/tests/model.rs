@@ -513,6 +513,8 @@ struct Seen {
     record_not_saved: usize,
     landings: u32,
     most_landing_updates: u32,
+    /// Background answers after their send's bound (OP-LIFE's one counter, L1's detector of F1's overlaps).
+    late_background: u64,
     /// (page, write, the head it was told Published at).
     published_at: Vec<PublishedAt>,
     /// Published writes whose head a same-seq WINNER later displaced, and
@@ -810,6 +812,7 @@ fn run_with(seed: u64, writes_per_page: usize, path: PutPath, cfg: Cfg) -> Resul
         let (l, m) = a.page.landings();
         seen.landings += l;
         seen.most_landing_updates = seen.most_landing_updates.max(m);
+        seen.late_background += a.page.background_answers_after_bound();
     }
     // RACES: seqs the register held under two roots (non-vacuity for the
     // two-device runs).
@@ -1218,6 +1221,7 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
         total.record_not_saved += s.record_not_saved;
         total.landings += s.landings;
         total.most_landing_updates = total.most_landing_updates.max(s.most_landing_updates);
+        total.late_background += s.late_background;
     }
     println!("{seed} seeds (CRAFTWORKS_MODEL_SEEDS={}) × 2 pages × {WRITES} writes: {total:?}", seeds());
     // The model is not vacuous: the race and the faults were reached.

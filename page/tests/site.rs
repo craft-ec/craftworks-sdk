@@ -257,7 +257,8 @@ fn a_silent_site_read_signs_nothing_until_answered() {
         }
         _ => Fate::Answer,
     };
-    run(&mut [&mut a], &mut node, &mut now, 4_000, &mut silent_first_three);
+    // A silent read is asked again at its node BOUND (OP-LIFE L0), so three silences take three bounds.
+    run(&mut [&mut a], &mut node, &mut now, 40_000, &mut silent_first_three);
     assert!(reads >= 4, "the silent read was not re-asked ({reads} reads)");
     assert_eq!(a.publication(), Some(Publication::Published { version: 1 }));
     assert_eq!(a.signs, 1, "a silent read was signed from ({} signs)", a.signs);
@@ -282,7 +283,8 @@ fn a_record_whose_put_was_lost_is_passed_from_the_record() {
     // Bundle B: the node reads v1, the signer holds v2 (A).
     let signs_before = a.signs;
     a.page.publish_site(APP, bundle(3), Ms(now));
-    run(&mut [&mut a], &mut node, &mut now, 200, &mut always);
+    // The cancelled write's send is still in flight (L0): the new one waits for its answer or its bound.
+    run(&mut [&mut a], &mut node, &mut now, 20_000, &mut always);
     assert_eq!(a.publication(), Some(Publication::Published { version: 3 }), "the lost record was not passed (livelock)");
     assert_eq!(a.signs - signs_before, 2, "the livelock took other than two asks (AlreadySigned, then Signed)");
 }
@@ -415,7 +417,7 @@ fn every_publication_ends_once_faults_stop() {
         if faults > 0 {
             faulted += 1;
         }
-        run(&mut [&mut a, &mut b], &mut node, &mut now, 2_000, &mut always);
+        run(&mut [&mut a, &mut b], &mut node, &mut now, 40_000, &mut always);
         for (who, p) in [("a", &a), ("b", &b)] {
             assert!(!matches!(p.publication(), Some(Publication::Publishing { .. }) | None), "seed {seed}: {who}'s publication never ended");
         }

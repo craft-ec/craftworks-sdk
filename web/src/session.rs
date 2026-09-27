@@ -628,10 +628,12 @@ impl Session {
     /// **An ack is not durability:** a publisher that must know reads it back.
     pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
         let (key, contract, state) = wire::puts::contract(&code, &params, &state);
+        // The ask is the SESSION's app (page-io builds `Ask::Direct` from it): never a value the caller passes.
+        let app = self.app.clone().unwrap_or_default();
         let Some(p) = self.page_mut() else {
             return Err(JsValue::from_str("provision first — there is no path to the node before it"));
         };
-        p.put_contract(contract, state, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
+        p.put_contract(contract, state, &app, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
         self.pump_page();
         Ok(key)
     }
@@ -881,8 +883,9 @@ impl Session {
     /// A PERSON cancels a pending PUT of `key` (a publish they stopped): the
     /// one end that is not the node's answer, named `cancelled` (rule 8).
     pub fn cancel_put(&mut self, key: &str) {
+        let app = self.app.clone().unwrap_or_default();
         if let Some(p) = self.page_mut() {
-            p.cancel_app_put(key);
+            p.cancel_app_put(key, &app);
         }
     }
 
@@ -904,7 +907,8 @@ impl Session {
     /// `said` is display only.
     pub fn put_status(&self, key: &str) -> String {
         use page::AppPut;
-        let (state, said) = match self.page().and_then(|p| p.app_put(key)) {
+        let app = self.app.clone().unwrap_or_default();
+        let (state, said) = match self.page().and_then(|p| p.app_put(key, &app)) {
             None => (PutStatus::None, ""),
             Some(AppPut::Pending) => (PutStatus::Pending, ""),
             Some(AppPut::Put) => (PutStatus::Put, ""),

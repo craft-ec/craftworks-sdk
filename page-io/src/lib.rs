@@ -731,14 +731,22 @@ impl PageIo {
     /// the node (main's condition 3) and two chunked requests on one stream id
     /// would be reassembled into each other. The answer comes back through
     /// [`PageIo::take_others`], named by the contract's key.
-    pub fn put_contract(&mut self, contract: ContractContainer, state: WrappedState, now: Ms) -> Result<(), String> {
+    /// `app`: the session's app, whose DIRECT ask this is (`page::Ask::Direct`, built here, never from JS: OP-LIFE
+    /// sdk#531 E1).
+    pub fn put_contract(&mut self, contract: ContractContainer, state: WrappedState, app: &str, now: Ms) -> Result<(), String> {
+        self.put_asked(contract, state, page::Ask::Direct(app.to_string()), now)
+    }
+
+    /// A container's PUT for ONE ask (OP-LIFE sdk#531: a direct ask, or a publish's piece): the page holds one waiter
+    /// per ask on the container's one PUT, so a withdraw of one ask never withdraws another's.
+    fn put_asked(&mut self, contract: ContractContainer, state: WrappedState, ask: page::Ask, now: Ms) -> Result<(), String> {
         if self.read_only() {
             return Err("read-only: a reader PUTs nothing".into());
         }
         let key = contract.key().to_string();
         self.app_contracts.insert(key.clone(), (contract, state));
         // THE PAGE SENDS IT (its deadline, re-send and end), like every op.
-        self.server.page.put_app(key, now);
+        self.server.page.put_app(key, ask, now);
         self.pump();
         Ok(())
     }
@@ -820,19 +828,20 @@ impl PageIo {
             progress.push(SetProgress::new(set, keys));
         }
         // A publish of `app` that ended, or is PUBLISHED and still owed pieces, is REPLACED (Codex on #527, C): its owed
-        // pieces that neither this publish nor any other owes are withdrawn (R1's one rule), then its routing goes.
+        // pieces this publish does not owe again are withdrawn -- ITS ask only (R1: another publish's ask on a shared
+        // piece is its own waiter, sdk#531), then its routing goes.
         let new_keys: std::collections::BTreeSet<String> = progress.iter().flat_map(|p| p.keys.iter().cloned()).collect();
         let left: Vec<String> = self.publishes.get(app).map(|p| p.get().owed_keys()).unwrap_or_default();
         for k in left {
-            if !new_keys.contains(&k) && !self.owed_elsewhere(&k, app) {
-                self.server.page.cancel_app_put(&k);
+            if !new_keys.contains(&k) {
+                self.server.page.cancel_app_put(&k, &page::Ask::Publish(app.to_string()));
             }
         }
         self.unroute(app);
         for (c, st) in puts {
             let key = c.key().to_string();
             self.publish_of_key.entry(key).or_default().insert(app.to_string());
-            self.put_contract(c, st, now)?;
+            self.put_asked(c, st, page::Ask::Publish(app.to_string()), now)?;
         }
         self.publish_sites.insert(app.to_string(), (site_code.to_vec(), web));
         self.publishes.insert(app.to_string(), AppPublishState::start(progress));
@@ -844,11 +853,6 @@ impl PageIo {
     /// version, each set's line and its words). `None`: never published here.
     pub fn app_publish(&self, app: &str) -> Option<&AppPublish> {
         self.publishes.get(app).map(AppPublishState::get)
-    }
-
-    /// Does a publish OTHER than `app`'s still owe the piece `key`? (R1: a shared piece is withdrawn only when none does.)
-    fn owed_elsewhere(&self, key: &str, app: &str) -> bool {
-        self.publish_of_key.get(key).is_some_and(|apps| apps.iter().any(|a| a != app && self.publishes.get(a).is_some_and(|p| p.get().owes(key))))
     }
 
     /// `app`'s piece routing and site bytes go (an end that owes nothing, or a publish replaced).
@@ -910,13 +914,11 @@ impl PageIo {
                         self.publish_step(app, PublishEvent::SiteRefused(w));
                     }
                 }
-                // A SHARED piece (every app of one build carries the same sets) is withdrawn only when NO other
-                // publish still owes it (the architect's R1): derived from the routing and each publish's own state.
+                // A SHARED piece (every app of one build carries the same sets) is withdrawn for THIS publish only: its
+                // ask is its own waiter on the piece's one PUT (sdk#531), so another publish's ask keeps it going (R1).
                 PublishEffect::WithdrawPieces(keys) => {
                     for k in keys {
-                        if !self.owed_elsewhere(&k, app) {
-                            self.server.page.cancel_app_put(&k);
-                        }
+                        self.server.page.cancel_app_put(&k, &page::Ask::Publish(app.to_string()));
                     }
                 }
                 PublishEffect::CancelSite => self.server.page.cancel_site(app),
@@ -995,14 +997,14 @@ impl PageIo {
         }
     }
 
-    /// A person cancels the pending PUT of `key` (the page's, named).
-    pub fn cancel_app_put(&mut self, key: &str) {
-        self.server.page.cancel_app_put(key);
+    /// A person cancels `app`'s DIRECT ask of the pending PUT of `key` (the page's, named): one ask leaving.
+    pub fn cancel_app_put(&mut self, key: &str, app: &str) {
+        self.server.page.cancel_app_put(key, &page::Ask::Direct(app.to_string()));
     }
 
-    /// Where the app's PUT of `key` stands (the page's [`page::AppPut`]).
-    pub fn app_put(&self, key: &str) -> Option<&page::AppPut> {
-        self.server.page.app_put(key)
+    /// Where `app`'s direct PUT of `key` stands (the page's [`page::AppPut`]).
+    pub fn app_put(&self, key: &str, app: &str) -> Option<&page::AppPut> {
+        self.server.page.app_put(key, &page::Ask::Direct(app.to_string()))
     }
 
     /// Node answers this page did not own (see `others`), oldest first.
@@ -1357,7 +1359,7 @@ impl PageIo {
         if let Some(cid) = self.by_key.get(key).copied().filter(|cid| self.server.page.put_waiting(cid)) {
             return Some(Refused::Block(cid));
         }
-        if self.app_contracts.contains_key(key) && matches!(self.server.page.app_put(key), Some(page::AppPut::Pending)) {
+        if self.app_contracts.contains_key(key) && self.server.page.app_put_pending(key) {
             return Some(Refused::App(key.to_string()));
         }
         // A site whose publication is still in flight (its PUT is the page's `Update` of that site).
@@ -1755,11 +1757,9 @@ mod held_batch {
     fn the_asks_of_one_page_step_are_one_held_request_of_every_id() {
         let mut io = io();
         let ids: Vec<Cid> = (0..signer_proto::MAX_HELD).map(|i| { let mut c = [0u8; 32]; c[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes()); c }).collect();
-        // 128 PUT answers in ONE page step (the page's own `answer`, no flush between them): each asks Held
-        // (a wrapper-path PutOk), and the asks leave together when page-io pumps.
-        for id in &ids {
-            io.server.page.answer(Answer::PutOk(*id), Ms(1));
-        }
+        // 128 ids asked Held in ONE page step (the engine's ConfirmHeld, no flush between them): the asks leave
+        // together when page-io pumps.
+        io.server.page.confirm_held_for_test(&ids);
         io.pump();
         let batch = helds_of(&io.take_frames());
         println!("{} ids asked in one step: {} Held request(s) of {:?} contract(s)", ids.len(), batch.len(), batch.iter().map(|(_, c)| c.len()).collect::<Vec<_>>());
@@ -1928,11 +1928,8 @@ mod reader_held {
     }
 
     fn ask(io: &mut PageIo, n: u64) {
-        for i in 0..n {
-            let mut c = [0u8; 32];
-            c[..8].copy_from_slice(&(i + 1).to_be_bytes());
-            io.server.page.answer(Answer::PutOk(c), Ms(1));
-        }
+        let ids: Vec<Cid> = (0..n).map(|i| { let mut c = [0u8; 32]; c[..8].copy_from_slice(&(i + 1).to_be_bytes()); c }).collect();
+        io.server.page.confirm_held_for_test(&ids);
         io.pump();
     }
 
@@ -1941,7 +1938,7 @@ mod reader_held {
     #[test]
     fn a_reader_with_a_held_signer_asks_held_and_nothing_else() {
         let mut io = reader(true);
-        io.server.page.answer(Answer::PutOk([9; 32]), Ms(1));
+        io.server.page.confirm_held_for_test(&[[9; 32]]);
         io.pump();
         let asked = requests(&io.take_frames());
         assert_eq!(asked.len(), 1, "one Held request: {asked:?}");
@@ -1950,7 +1947,7 @@ mod reader_held {
         assert!(io.inbound(&answer(asked[0].0, &signer_proto::Answer::Held { present: vec![true] }), Ms(2)), "its own Held answer was not taken");
         assert!(io.held.is_empty(), "the answered batch is still mapped");
         let mut plain = reader(false);
-        plain.server.page.answer(Answer::PutOk([9; 32]), Ms(1));
+        plain.server.page.confirm_held_for_test(&[[9; 32]]);
         plain.pump();
         assert!(requests(&plain.take_frames()).is_empty(), "THE CONTROL: a plain reader asked a signer");
     }

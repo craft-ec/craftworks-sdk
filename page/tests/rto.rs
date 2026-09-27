@@ -124,26 +124,33 @@ fn a_re_sent_calls_answer_is_not_a_sample() {
     assert_eq!(srtt_after, srtt_before, "a re-sent call's answer was taken as a sample");
 }
 
-/// §5.5: with no answers at all, each timeout doubles the RTO.
+/// §5.5: with no answers at all, each timeout doubles the RTO. The ops that time out on the RTO are the ones that
+/// re-send on it (OP-LIFE L0: an Interactive content PUT, `RtoResend`); a head read is silent until its node bound.
 #[test]
 fn with_no_answers_the_rto_backs_off() {
     let mut p = Page::new(Params::default(), PutPath::Page);
     let (start, _, _) = p.clock();
     assert_eq!(start as f64, RTO_INITIAL_MS);
     let mut now = 1_000u64;
-    let _ = p.take_ops(); // the first head read, never answered
+    // The opening head read, answered (no head yet): then a write whose PUTs are never answered.
+    let _ = p.take_ops();
+    p.answer(Answer::Head { label: page::Label::Head, read: None }, Ms(now));
+    p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+    assert!(p.take_ops().iter().any(|o| matches!(o, Op::Put { .. })), "THE SETUP: the write's PUTs did not go out");
+    // The head read's answer was an RTT sample: the RTO in force before any timeout.
+    let r0 = p.clock().0;
     let mut seen = Vec::new();
     for _ in 0..20_000 {
         now += 10;
         p.tick(Ms(now));
-        if !p.take_ops().is_empty() {
+        if p.take_ops().iter().any(|o| matches!(o, Op::Put { .. })) {
             seen.push(p.clock().0);
             if seen.len() == 3 {
                 break;
             }
         }
     }
-    assert_eq!(seen, vec![2_000, 4_000, 8_000], "the RTO did not double per timeout");
+    assert_eq!(seen, vec![2 * r0, 4 * r0, 8 * r0], "the RTO did not double per timeout (from {r0})");
 }
 
 /// sdk#175 at the executor: the engine's own head read that is never
@@ -155,8 +162,9 @@ fn an_unanswered_head_read_is_never_an_empty_tree() {
     let mut p = Page::new(Params::default(), PutPath::Page);
     let mut now = 1_000u64;
     let mut asked = 0;
-    for _ in 0..40_000 {
-        now += 1;
+    // Asked again at each node BOUND (OP-LIFE L0: one head read in flight, silent before it): 3 bounds' worth.
+    for _ in 0..20_000 {
+        now += 100;
         p.tick(Ms(now));
         asked += p.take_ops().iter().filter(|o| **o == Op::ReadHead { label: page::Label::Head }).count();
     }

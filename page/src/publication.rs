@@ -73,6 +73,12 @@ impl Pubs {
     pub(crate) fn set_head_for_test(&mut self, life: Life) {
         self.head = life;
     }
+
+    /// A site's state set directly, for a test that drives the op record under a live publication (OP-LIFE's model).
+    #[cfg(test)]
+    pub(crate) fn set_site_for_test(&mut self, app: &str, life: Life) {
+        self.sites.insert(app.to_string(), life);
+    }
 }
 
 /// P6: THE backoff of a publication's retry, after `tries` refusals (or silent reads) in a row.
