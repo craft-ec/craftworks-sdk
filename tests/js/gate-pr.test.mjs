@@ -28,11 +28,11 @@ writeFileSync(ADMIT, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 const plan = (cwd, changed, env = {}) => gate(cwd, ["--pr", "--dry-run"], { DISK_GUARD: ADMIT, GATE_PR_CHANGED: changed, ...env });
 const planLine = (out, what) => (out.split("\n").find(l => l.startsWith(`gate --pr: ${what}:`)) ?? "").split(": ").slice(2).join(": ").trim();
 
-await t("**a change to ENGINE tests ENGINE only** (the owner: dependents run at the batch gate), and no npm", async () => {
+await t("**a change to ENGINE tests ENGINE only** (the owner: dependents run at the batch gate), and npm, since engine is in the wasm package (sdk#537)", async () => {
   const r = plan(root, "engine/src/lib.rs");
   assert.equal(r.status, 0, r.stderr);
   assert.equal(planLine(r.stdout, "members tested (changed only; dependents run at the batch gate)"), "engine");
-  assert.equal(planLine(r.stdout, "npm"), "false", "no JS changed, so no npm");
+  assert.equal(planLine(r.stdout, "npm"), "true", "engine compiles into the package the JS tests load, yet npm was skipped");
   const two = plan(root, "page-io/src/lib.rs page/src/lib.rs");
   assert.equal(planLine(two.stdout, "members tested (changed only; dependents run at the batch gate)"), "page page-io",
     "page-io/x was taken for page's, or a member was missed");
@@ -47,7 +47,8 @@ await t("**THE PLAN IS A PURE FUNCTION OF GATE_PR_CHANGED** (sdk#461): a tree wi
   try {
     // The gate AS IT IS in this tree (a PR runs the gate on its own branch, committed or not).
     for (const f of ["gate.sh", "tools/pr-scope.mjs"]) writeFileSync(join(wt, f), readFileSync(join(root, f)));
-    const clean = plan(wt, "engine/src/lib.rs");
+    // probe: a member OUTSIDE the wasm package, so npm is false unless the dirt leaks in (sdk#537 made engine ship).
+    const clean = plan(wt, "probe/src/lib.rs");
     assert.equal(clean.status, 0, `THE CONTROL: the clean tree failed:\n${clean.stderr}`);
     // Dirt a git-status reader WOULD see: an untracked file in page/, a modified file in JS (npm), in page-io.
     writeFileSync(join(wt, "page/src/stray.rs"), "// not committed\n");
@@ -55,7 +56,7 @@ await t("**THE PLAN IS A PURE FUNCTION OF GATE_PR_CHANGED** (sdk#461): a tree wi
     writeFileSync(join(wt, "page-io/src/lib.rs"), `${readFileSync(join(wt, "page-io/src/lib.rs"), "utf8")}\n// modified\n`);
     const st = execFileSync("git", ["-C", wt, "status", "--porcelain"], { encoding: "utf8" });
     assert.ok(st.includes("page/src/stray.rs") && st.includes("js/served.js"), `THE CONTROL: the tree is not dirty:\n${st}`);
-    const dirty = plan(wt, "engine/src/lib.rs");
+    const dirty = plan(wt, "probe/src/lib.rs");
     assert.equal(dirty.status, 0, `the dirty tree's plan failed:\n${dirty.stderr}`);
     for (const what of ["changed members", "members tested (changed only; dependents run at the batch gate)", "npm"]) {
       assert.equal(planLine(dirty.stdout, what), planLine(clean.stdout, what), `\`${what}\` read the working tree`);
@@ -65,7 +66,7 @@ await t("**THE PLAN IS A PURE FUNCTION OF GATE_PR_CHANGED** (sdk#461): a tree wi
     // keeps the plan tests off the disk), and never changes a plan that runs.
     const refuse = join(scratch, "refuse.sh");
     writeFileSync(refuse, "#!/bin/sh\necho 'disk-guard: under the floor' >&2\nexit 1\n", { mode: 0o755 });
-    const atFloor = gate(wt, ["--pr", "--dry-run"], { DISK_GUARD: refuse, GATE_PR_CHANGED: "engine/src/lib.rs" });
+    const atFloor = gate(wt, ["--pr", "--dry-run"], { DISK_GUARD: refuse, GATE_PR_CHANGED: "probe/src/lib.rs" });
     assert.notEqual(atFloor.status, 0, "THE CONTROL: a refusing guard did not stop the gate: ADMIT isolates nothing");
   } finally {
     execFileSync("git", ["-C", root, "worktree", "remove", "--force", wt], { stdio: "ignore" });
@@ -96,19 +97,61 @@ await t("**the OUTER run's GATE_* never reaches a child gate** (sdk#469): a stra
   }
 });
 
-await t("**a SLOW test is batch-only: --pr skips it BY NAME and says so; the batch gate runs it with the full model seeds**", async () => {
-  const { testArgs } = await import("../../tools/pr-scope.mjs");
+await t("**the MODEL targets are DERIVED (never listed): both gates run them in --profile model, --pr at a share of the seeds, the batch at the full count**", async () => {
+  const { testArgs, modelTargets } = await import("../../tools/pr-scope.mjs");
   const meta = JSON.parse(execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
-  const page = testArgs(meta, "page", ["model"]);
-  assert.ok(!page.args.includes("model"), `model was not skipped: ${page.args}`);
+  // Every seeded model main has, found by its name, with nobody writing a list.
+  assert.deepEqual(modelTargets(meta, "page"), ["model"]);
+  assert.deepEqual(modelTargets(meta, "testkit"), ["read_state_model"]);
+  assert.deepEqual(modelTargets(meta, "craftworks-sdk"), ["write_path_model"]);
+  assert.deepEqual(modelTargets(meta, "signer"), ["provision_model"]);
+  assert.deepEqual(modelTargets(meta, "engine"), [], "engine has no model target, yet one was found");
+  const page = testArgs(meta, "page", modelTargets(meta, "page"));
+  assert.ok(!page.args.includes("model"), `model ran in DEBUG beside --profile model: ${page.args}`);
   assert.ok(page.args.includes("--lib") && page.args.includes("race_get"), `page's other tests were dropped: ${page.args}`);
   assert.equal(page.doc, true, "page's doc-tests would not be counted");
-  assert.deepEqual(testArgs(meta, "engine", ["model"]), { args: null, doc: false }, "nothing to skip in engine, yet flags");
   const pr = plan(root, "page/src/lib.rs");
-  assert.equal(planLine(pr.stdout, "batch-only (skipped here, run by the batch gate)"), "page@model");
+  assert.equal(planLine(pr.stdout, "model seeds"), "4 of 40 (GATE_PR_MODEL_SEEDS), --profile model", "--pr does not state its model seeds");
   const batch = gate(root, ["--dry-run"], { CRAFTWORKS_MODEL_SEEDS: "" });
   assert.match(batch.stdout, /gate: model seeds 40 \(CRAFTWORKS_MODEL_SEEDS\)/, "the batch gate does not state the full seed count");
-  assert.match(batch.stdout, /gate: batch-only targets, run here: page@model/);
+  assert.match(batch.stdout, /gate: model targets, --profile model, derived per member/);
+});
+
+await t("**a SEEDED model not named a model FAILS the model_targets control (it would run in DEBUG on every PR)**", async () => {
+  const { misnamedModels } = await import("../../tools/pr-scope.mjs");
+  const meta = { packages: [{ name: "page", targets: [
+    { kind: ["test"], name: "model", src_path: "page/tests/model.rs" },
+    { kind: ["test"], name: "race_get", src_path: "page/tests/race_get.rs" },
+    { kind: ["test"], name: "sweep", src_path: "page/tests/sweep.rs" },
+    { kind: ["lib"], name: "page", src_path: "page/src/lib.rs" },
+  ] }] };
+  const src = { "page/tests/model.rs": "use testkit::model;", "page/tests/race_get.rs": "fn plain() {}", "page/tests/sweep.rs": "", "page/src/lib.rs": "CRAFTWORKS_MODEL_SEEDS" };
+  assert.deepEqual(misnamedModels(meta, f => src[f]), [], "a clean tree was flagged");
+  // PLANTED, three ways a model hides under another name: the runner, a share, the knob read by hand.
+  for (const planted of ["let r = testkit::model::run(0..9, f);", "let n = model::share(200);", "std::env::var(\"CRAFTWORKS_MODEL_SEEDS\")"]) {
+    const bad = misnamedModels(meta, f => (f === "page/tests/sweep.rs" ? planted : src[f]));
+    assert.equal(bad.length, 1, `not caught: ${planted}`);
+    assert.match(bad[0], /page: test target `sweep`/);
+  }
+  const r = spawnSync("node", ["tools/pr-scope.mjs", "model-check"], { cwd: root, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /4 model target\(s\)/, r.stdout);
+});
+
+await t("**npm runs when a changed member is IN the wasm package the JS tests load (sdk#537): page-io yes, probe no**", async () => {
+  const { wasmRoots, closure } = await import("../../tools/pr-scope.mjs");
+  // The roots are READ from build.sh: its wasm builds, whatever else it compiles.
+  assert.deepEqual(wasmRoots("cargo build --release -p web --target wasm32-unknown-unknown\ncargo build -q --release -p wire --bin x\ncargo build --profile decoder -p decoder --target wasm32-unknown-unknown\n"), ["web", "decoder"]);
+  assert.deepEqual(wasmRoots(readFileSync(join(root, "build.sh"), "utf8")).sort(), ["decoder", "web"]);
+  const meta = JSON.parse(execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+  const shipped = closure(meta, ["web"]);
+  assert.ok(shipped.has("page-io") && shipped.has("engine") && shipped.has("web"), `web's closure misses what it links: ${[...shipped]}`);
+  assert.ok(!shipped.has("probe") && !shipped.has("testkit"), `a crate web does not link counts as shipped: ${[...shipped]}`);
+  // The plan, end to end through gate.sh: a Rust-only change to a shipped member runs npm, and says why.
+  const pio = plan(root, "page-io/src/lib.rs");
+  assert.equal(planLine(pio.stdout, "npm"), "true", "a page-io-only PR skipped npm: #522's red JS tests went unseen that way");
+  // THE CONTROL: a member outside the package does not.
+  assert.equal(planLine(plan(root, "probe/src/lib.rs").stdout, "npm"), "false", "a probe-only PR ran npm");
 });
 
 await t("**EVERY control is in the plan whatever the PR touches; a README-only PR tests no member and runs no npm**", async () => {

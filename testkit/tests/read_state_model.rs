@@ -564,11 +564,16 @@ fn show(k: &[u8]) -> String {
 
 type Classes = BTreeMap<&'static str, (usize, String)>;
 
+/// Every seed's findings, by class: the seeds run on every core (`testkit::model`), folded in seed order.
 fn sweep(seeds: std::ops::Range<u64>, mutant: Option<Mutant>, steps: usize, fast: usize) -> Classes {
+    fold(testkit::model::run(seeds, |seed| run(seed, mutant, steps, fast)))
+}
+
+fn fold(runs: Vec<(u64, Vec<Finding>)>) -> Classes {
     let mut by: Classes = BTreeMap::new();
-    for seed in seeds {
+    for (_, found) in runs {
         let mut seen = std::collections::BTreeSet::new();
-        for f in run(seed, mutant, steps, fast) {
+        for f in found {
             if seen.insert(f.class) {
                 let e = by.entry(f.class).or_insert((0, f.detail.clone()));
                 e.0 += 1;
@@ -597,13 +602,14 @@ fn wide_sweep() {
 }
 
 /// SLICE R'S READER IS GREEN on the model that was red on the row copy: the
-/// same 40 seeds, and 160 more.
+/// same 40 seeds, and 160 more (the full count; `CRAFTWORKS_MODEL_SEEDS` takes a share).
 #[test]
 fn slice_r_reader_is_green() {
-    let found = sweep(0..200, None, 120, 40);
-    print(&found, 200);
+    let n = testkit::model::share(200);
+    let found = sweep(0..n, None, 120, 40);
+    print(&found, n);
     assert!(found.is_empty(), "the walking reader failed the model: {found:?}");
-    println!("  200 seeds × (120 steps + 40 fast): nothing found");
+    println!("  {n} seeds × (120 steps + 40 fast): nothing found");
 }
 
 /// THE CONTROLS: each mutation re-plants a defect in the walking reader, and
@@ -611,9 +617,12 @@ fn slice_r_reader_is_green() {
 #[test]
 fn the_model_sees_each_planted_defect() {
     for m in [Mutant::HeadCopy, Mutant::NoResume, Mutant::NoWaitOnApplying, Mutant::DeafLive] {
-        let found = sweep(0..40, Some(m), 120, 40);
+        // A share of the 40 first, then on until the defect is seen, never past the 40 it always ran.
+        let runs = testkit::model::until(0, testkit::model::share(40), 40, |seed| run(seed, Some(m), 120, 40), |all| all.iter().any(|(_, f)| !f.is_empty()));
+        let n = runs.len() as u64;
+        let found = fold(runs);
         println!("{m:?}:");
-        print(&found, 40);
-        assert!(!found.is_empty(), "the model did not see the planted {m:?}: it is blind to it");
+        print(&found, n);
+        assert!(testkit::model::alone().is_some() || !found.is_empty(), "the model did not see the planted {m:?}: it is blind to it");
     }
 }

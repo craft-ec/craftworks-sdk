@@ -51,7 +51,7 @@ t("THE CONTROL: a passing member keeps nothing, and reports its count", () => {
   assert.deepEqual(files, [], "a passing member's output was kept");
 });
 
-t("**--keep: a member gate.sh ran its own way (batch-only targets apart) is kept by the SAME rule, from stdin**", () => {
+t("**--keep: a member gate.sh ran its own way (its model targets in --profile model) is kept by the SAME rule, from stdin**", () => {
   const marker = "MARKER-7c1e the release-run model test's panic";
   const kept = join(d, "kept-stdin");
   const r = spawnSync("/bin/bash", [helper, "--keep", "page", kept, "101"], { encoding: "utf8", input: `test result: FAILED. 4 passed; 1 failed\n---- m stdout ----\n${marker}\n` });

@@ -18,6 +18,7 @@
 //!   rebuilt the Shell from its context on every call, went with the Shell.)
 
 pub mod mem_store;
+pub mod model;
 pub mod page_node;
 pub use mem_store::MemStore;
 pub use page_node::{PageConn, PageNode};

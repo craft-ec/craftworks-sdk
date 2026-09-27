@@ -36,6 +36,7 @@ use freenet_prolly::Cid;
 use page::{Answer, Ms, Op, Page, PutPath};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use testkit::model;
 
 const BLOCK_CODE: &[u8] = b"model block code";
 const REGISTER_CODE: &[u8] = b"model register code";
@@ -1021,9 +1022,11 @@ fn recording_accounts_for_every_op(p: &Page, sent: usize) -> Result<(), String> 
 #[test]
 fn a_recording_page_sends_exactly_what_a_silent_one_does_and_records_every_op() {
     let (min, _) = seed_range(4, FULL_SEEDS);
-    for seed in 1..=min.max(2) {
+    for (seed, (off, on)) in model::run(1..min.max(2) + 1, |seed| {
         let off = run_with(seed, WRITES, PutPath::Page, NORMAL).unwrap_or_else(|e| panic!("seed {seed}, off: {e}"));
         let on = run_with(seed, WRITES, PutPath::Page, Cfg { record: true, ..NORMAL }).unwrap_or_else(|e| panic!("seed {seed}, on: {e}"));
+        (off, on)
+    }) {
         println!("seed {seed}: ops sent {:?}, digest off {:x} on {:x}", on.ops_sent, off.ops_digest, on.ops_digest);
         assert_eq!(off.ops_sent, on.ops_sent, "seed {seed}: recording changed how many ops the pages sent");
         assert_eq!(off.ops_digest, on.ops_digest, "seed {seed}: recording changed what the pages sent, or when");
@@ -1171,19 +1174,15 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64, hel
     Ok(())
 }
 
-/// THE ONE KNOB for how many random fault schedules the model runs: `CRAFTWORKS_MODEL_SEEDS` (the batch gate runs
-/// FULL_SEEDS and prints it; `gate.sh --pr` runs a few). Every loop below derives its seeds from it, as a SHARE of
-/// the count ([`seed_range`]).
-const FULL_SEEDS: u64 = 40;
+/// THE ONE KNOB for how many random fault schedules the model runs: `CRAFTWORKS_MODEL_SEEDS`, read by
+/// `testkit::model` for every model test (sdk#536; the batch gate runs the full count, `gate.sh --pr` a share). The
+/// page model's full count IS the knob's unit. Every loop below derives its seeds from it ([`seed_range`]) and runs
+/// them on every core (`model::run` / `model::until`); `CRAFTWORKS_MODEL_SEED=<n>` runs one seed alone.
+const FULL_SEEDS: u64 = model::REFERENCE;
 const WRITES: usize = 12;
 
-/// The knob's value: a positive integer, else the full count.
-fn seeds_from(v: Option<&str>) -> u64 {
-    v.and_then(|s| s.trim().parse().ok()).filter(|&n: &u64| n > 0).unwrap_or(FULL_SEEDS)
-}
-
 fn seeds() -> u64 {
-    seeds_from(std::env::var("CRAFTWORKS_MODEL_SEEDS").ok().as_deref())
+    model::knob()
 }
 
 /// One loop's seeds, as `num/den` of the knob: AT LEAST that many (`min`), then on while the loop's coverage floor
@@ -1191,26 +1190,28 @@ fn seeds() -> u64 {
 /// every floor is still reached, or the loop runs to what it always ran and the floor assert says so -- and the full
 /// count runs exactly what it always ran.
 fn seed_range(num: u64, den: u64) -> (u64, u64) {
-    let min = (seeds() * num / den).max(1);
+    let min = model::share(FULL_SEEDS * num / den);
     (min, (FULL_SEEDS * num / den).max(min))
 }
 
-#[test]
-fn the_seed_knob_is_a_positive_count_or_the_full_one() {
-    assert_eq!(seeds_from(None), FULL_SEEDS);
-    assert_eq!(seeds_from(Some("4")), 4);
-    assert_eq!(seeds_from(Some("0")), FULL_SEEDS);
-    assert_eq!(seeds_from(Some("many")), FULL_SEEDS);
+/// A floor (the sweep reached what it is about) is asserted over a whole sweep, never over one seed run alone.
+fn whole_sweep() -> bool {
+    model::alone().is_none()
 }
 
 #[test]
 fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_hold() {
     let mut total = Seen::default();
     let (min, cap) = seed_range(1, 1);
-    let mut seed = 0;
-    while seed < min || (seed < cap && (total.lost == 0 || total.record_not_saved == 0)) {
-        seed += 1;
-        let s = run(seed, WRITES, PutPath::Page).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    let all = model::until(
+        1,
+        min,
+        cap,
+        |seed| run(seed, WRITES, PutPath::Page).unwrap_or_else(|e| panic!("seed {seed}: {e}")),
+        |all| all.iter().any(|(_, s)| s.lost > 0) && all.iter().any(|(_, s)| s.record_not_saved > 0),
+    );
+    let seed = all.len() as u64;
+    for (_, s) in all {
         total.published += s.published;
         total.lost += s.lost;
         total.busy += s.busy;
@@ -1222,9 +1223,11 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
     println!("{seed} seeds (CRAFTWORKS_MODEL_SEEDS={}) × 2 pages × {WRITES} writes: {total:?}", seeds());
     // The model is not vacuous: the race and the faults were reached.
     assert_eq!(total.published, seed as usize * 2 * WRITES, "not every write was published once");
-    assert!(total.lost > 0, "no rebase was ever reached: the two pages never raced");
-    assert!(total.updates > total.published / 2, "too few UPDATEs for the writes published");
-    assert!(total.record_not_saved > 0, "the signer never failed to save its record: RecordNotSaved unexercised");
+    if whole_sweep() {
+        assert!(total.lost > 0, "no rebase was ever reached: the two pages never raced");
+        assert!(total.updates > total.published / 2, "too few UPDATEs for the writes published");
+        assert!(total.record_not_saved > 0, "the signer never failed to save its record: RecordNotSaved unexercised");
+    }
     // The LAND cell is NOT floored here: a random run reached it only by schedule luck (1 landing in 80 seeds at
     // budget 1 on main, lost entirely to a correct back-off change). It is reached BY CONSTRUCTION, at every seed
     // and budget, in `a_landing_whose_update_is_lost_twice_still_lands` (the architect, 2026-09-26).
@@ -1238,17 +1241,17 @@ fn two_pages_on_one_key_publish_every_write_through_faults_and_the_invariants_ho
 /// its own write on top.
 #[test]
 fn a_landing_whose_update_is_lost_twice_still_lands() {
-    let (min, _) = seed_range(1, 2);
+    // `seed % 4` UPDATEs lost: every loss count 0..=3 needs four seeds, whatever share the knob gives.
+    let min = seed_range(1, 2).0.max(4);
     let mut most = 0;
-    for seed in 1..=min {
+    for (seed, (landings, needed)) in model::run(1..min + 1, |seed| a_stale_page_lands_losing((seed % 4) as u32)) {
         let lose = (seed % 4) as u32;
-        let (landings, needed) = a_stale_page_lands_losing(lose);
         assert_eq!(landings, 1, "seed {seed}: B did not land A's record exactly once (losing {lose})");
         assert!(needed > lose, "seed {seed}: the landing needed {needed} UPDATEs, but {lose} were lost");
         most = most.max(needed);
     }
     println!("forced landing: {min} seeds, each landed; most UPDATEs one landing needed: {most}");
-    assert!(most >= 4, "no seed lost the landing's UPDATE three times: the harshest case was not reached");
+    assert!(!whole_sweep() || most >= 4, "no seed lost the landing's UPDATE three times: the harshest case was not reached");
 }
 
 /// TWO LIVE PAGES UNDER HEAVY UPDATE LOSS (UPDATEs lost three times as often, at random): every write still
@@ -1260,8 +1263,7 @@ fn two_live_pages_under_heavy_update_loss_publish_every_write() {
     let harsh = Cfg { faults: Faults { update_lost: 300, ..FAULTS }, ..NORMAL };
     let (min, _) = seed_range(1, 2);
     let (mut landings, mut most) = (0, 0);
-    for seed in 1..=min {
-        let s = run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    for (seed, s) in model::run(1..min + 1, |seed| run_with(seed, WRITES, PutPath::Page, harsh).unwrap_or_else(|e| panic!("seed {seed}: {e}"))) {
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write published");
         landings += s.landings;
         most = most.max(s.most_landing_updates);
@@ -1307,17 +1309,18 @@ fn two_devices_on_one_key_race_and_no_page_is_ever_unusable() {
     let cfg = Cfg { devices: 2, ..NORMAL };
     let (mut races, mut displaced, mut lost) = (0, 0, 0);
     let (min, cap) = seed_range(1, 2);
-    let mut seed = 0;
-    while seed < min || (seed < cap && races == 0) {
-        seed += 1;
-        let s = run_with(seed, WRITES, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    let all = model::until(1, min, cap, |seed| run_with(seed, WRITES, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}")), |all| {
+        all.iter().any(|(_, s)| s.races > 0)
+    });
+    let seeds_run = all.len();
+    for (seed, s) in all {
         assert_eq!(s.published, 2 * WRITES, "seed {seed}: not every write was published once");
         races += s.races;
         displaced += s.displaced;
         lost += s.lost;
     }
-    println!("two devices: {seed} seeds, {races} raced seqs, {lost} Lost and re-sent, {displaced} Published writes displaced by a winner (#225b keeps them)");
-    assert!(races > 0, "the two devices never raced at a seq: the test is vacuous");
+    println!("two devices: {seeds_run} seeds, {races} raced seqs, {lost} Lost and re-sent, {displaced} Published writes displaced by a winner (#225b keeps them)");
+    assert!(!whole_sweep() || races > 0, "the two devices never raced at a seq: the test is vacuous");
 }
 
 /// SAFETY GAP CLASS 2, FORCED (the architect's ruling; engineer3 found it by the model under #390's timing): a
@@ -1332,8 +1335,7 @@ fn a_foreign_straggler_in_flight_holds_back_the_other_pages_backed_up() {
     let writes = WRITES;
     let (mut drops, mut over) = (0, 0);
     let (min, _) = seed_range(4, FULL_SEEDS);
-    for seed in 1..=min {
-        let s = run_with(seed, writes, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    for (seed, s) in model::run(1..min + 1, |seed| run_with(seed, writes, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"))) {
         assert_eq!(s.published, 2 * writes, "seed {seed}: not every write was published once");
         drops += s.held_drops;
         over += s.over_the_hole;
@@ -1351,9 +1353,9 @@ fn a_foreign_straggler_in_flight_holds_back_the_other_pages_backed_up() {
 fn with_every_hint_lost_an_idle_device_still_learns_by_the_backstop() {
     let cfg = Cfg { devices: 2, no_hints: true, ..NORMAL };
     let (min, _) = seed_range(6, FULL_SEEDS);
-    for seed in 1..=min {
+    model::run(1..min + 1, |seed| {
         run_with(seed, WRITES, PutPath::Page, cfg).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-    }
+    });
 }
 
 /// THE CONTROL for invariant 3: the whole-tree check FAILS on a root with a
@@ -1473,11 +1475,11 @@ fn a_later_commit_in_another_group_does_not_carry_a_broken_write() {
 fn on_the_wrapper_path_a_put_is_confirmed_by_held_and_the_invariants_hold() {
     let mut published = 0;
     let (min, _) = seed_range(1, 2);
-    for seed in 1..=min {
-        let s = run(seed, WRITES, PutPath::Wrapper).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    let all = model::run(1..min + 1, |seed| run(seed, WRITES, PutPath::Wrapper).unwrap_or_else(|e| panic!("seed {seed}: {e}")));
+    for (_, s) in &all {
         published += s.published;
     }
-    assert_eq!(published, min as usize * 2 * WRITES);
+    assert_eq!(published, all.len() * 2 * WRITES);
 }
 
 /// Serve every op of `p` until it idles, LOSING the next `drop_updates` UPDATEs (each unanswered, not applied).
