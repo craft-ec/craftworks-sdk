@@ -238,6 +238,9 @@ export function wrap(raw) {
     parseBlockId,
     // The deterministic slot for a record copied from a source (sdk#149).
     slotFrom: raw.slotFrom,
+    // THE LOADER'S POINTER CHECK (ARCHITECTURE §19): a site's pointer.json -> `{ app, registerId }`, refused unless it
+    // names the site the page was served from.
+    openPointer: (pointer, pagePath, siteCode, registerCode) => JSON.parse(raw.open_pointer(pointer, pagePath, siteCode, registerCode)),
     Db,
     // THE ONE CALL AN APP MAKES.
     //
