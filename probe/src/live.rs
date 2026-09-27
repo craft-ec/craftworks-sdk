@@ -2,7 +2,7 @@
 //! on that socket. One home, so a probe adds only what it measures.
 
 use anyhow::{bail, Result};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use page::Ms;
 use page_io::PageIo;
 use std::time::{Duration, Instant};
@@ -30,4 +30,15 @@ pub async fn next_frame(sock: &mut Sock, io: &mut PageIo, t0: Instant) -> Result
             Ok(None)
         }
     }
+}
+
+/// One turn of a live probe's loop: every frame the page has, sent; every reply it has, decoded onto `replies`.
+pub async fn flush(sock: &mut Sock, io: &mut PageIo, replies: &mut Vec<protocol::Reply>) -> Result<()> {
+    for f in io.take_frames() {
+        sock.send(Message::Binary(f.into())).await.map_err(|e| anyhow::anyhow!("send: {e}"))?;
+    }
+    for r in io.take_replies() {
+        replies.push(protocol::decode_reply(&r).map_err(|d| anyhow::anyhow!("a reply that does not decode: {d:?}"))?);
+    }
+    Ok(())
 }

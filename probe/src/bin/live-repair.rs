@@ -17,7 +17,6 @@
 use anyhow::{bail, Context, Result};
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi};
 use freenet_stdlib::prelude::ContractInstanceId;
-use futures::SinkExt;
 use page::{Ms, PutPath};
 use page_io::PageIo;
 use probe::live::{next_frame, now_ms, Sock};
@@ -25,7 +24,6 @@ use probe::silent::SilentNet;
 use protocol::{Reply, Request};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio_tungstenite::tungstenite::Message;
 
 const SESSION: u64 = 11;
 const WRITES: u64 = 3;
@@ -43,12 +41,7 @@ impl Io {
     async fn drive(&mut self, budget: Duration, mut done: impl FnMut(&mut PageIo, &[Reply]) -> bool) -> Result<()> {
         let start = Instant::now();
         loop {
-            for f in self.io.take_frames() {
-                self.sock.send(Message::Binary(f.into())).await.context("send")?;
-            }
-            for r in self.io.take_replies() {
-                self.replies.push(protocol::decode_reply(&r).map_err(|d| anyhow::anyhow!("a reply that does not decode: {d:?}"))?);
-            }
+            probe::live::flush(&mut self.sock, &mut self.io, &mut self.replies).await?;
             if done(&mut self.io, &self.replies) {
                 return Ok(());
             }
