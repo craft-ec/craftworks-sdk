@@ -512,7 +512,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
      * both back; then wait for those PUTs' answers, and resolve with the session's report: `outcome` a word of
      * the `sdk.status` list `outcomeList` names (`repairOutcome` for what a repair did, `groupHealth` for the tree's
      * health), the counts (`missing`, `putBack` -- of those -- `reput`, `rejected`, `givenUp`, `parityMismatched`,
-     * `pending`), each `damaged` group with its `sdk.status.groupHealth` word, `why`, and the `rows` read.
+     * `pending`), each `damaged` group with its `sdk.status.groupHealth` word, `why`, the `rows` read, and `dataRows`, those of them that are the person's data (not an app's definition records).
      *
      * Run it on a session whose store is COLD for the tree (a fresh reader of it): a page that already holds a block
      * serves it from memory and never asks the node, so a warm page finds nothing missing. `repairAllCancel()` stops
@@ -521,10 +521,11 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     async repairAll({ limit = 500, putBack = true } = {}) {
       repairCancelled = false;
       let after = "";
-      let rows = 0;
+      let rows = 0, dataRows = 0;
       while (!repairCancelled) {
         const page = await once(() => JSON.parse(session.scan_all(after, limit, putBack)));
         rows += page.rows;
+        dataRows += page.dataRows;
         if (page.next == null) break;
         after = page.next;
       }
@@ -532,7 +533,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       while (putBack && !repairCancelled && JSON.parse(session.repair_report(false, false)).pending > 0) {
         await new Promise(resolve => roomWaiters.push(resolve));
       }
-      return { rows, ...JSON.parse(session.repair_report(repairCancelled, !putBack)) };
+      return { rows, dataRows, ...JSON.parse(session.repair_report(repairCancelled, !putBack)) };
     },
     /**
      * CHECK (sdk#479): the same whole-tree read and report as `repairAll`, and NOTHING is PUT -- what the node lacks is

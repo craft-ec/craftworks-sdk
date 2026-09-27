@@ -512,7 +512,7 @@ const repairSession = ({ pages = 3, pending = 2 } = {}) => {
         throw e;
       }
       const n = after === "" ? 0 : Number(after);
-      return JSON.stringify({ rows: 10, next: n + 1 < pages ? String(n + 1) : null });
+      return JSON.stringify({ rows: 10, dataRows: 7, next: n + 1 < pages ? String(n + 1) : null });
     },
     repair_report(cancelled, check) {
       return JSON.stringify({ outcome: cancelled ? "cancelled" : check ? "DEGRADED" : owed ? "partial" : "repaired", missing: 2, putBack: pending - owed, rejected: 0, givenUp: 0, parityMismatched: 0, pending: owed, damaged: [], why: null });
@@ -537,6 +537,7 @@ await t("repairAll reads every page of the tree, waits for its put-backs' answer
   s.answerPuts();
   const r = await run;
   assert.equal(r.rows, 30);
+  assert.equal(r.dataRows, 21, "the data rows were not summed over the pages");
   assert.equal(r.outcome, "repaired", "the outcome is not the session's word");
   assert.equal(r.putBack, 2);
 });

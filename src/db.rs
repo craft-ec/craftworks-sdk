@@ -468,6 +468,13 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         (lo, hi)
     }
 
+    /// Is `key` one of the person's DATA records: a record in a domain outside the reserved prefix (ARCHITECTURE §19:
+    /// an app's definition, drafts and markers live under `craftworks.`, `core_types::name::reserved`)? A schema or an
+    /// index entry is no record, so not data either. What the Assets tab counts as "in your data".
+    pub fn is_data_key(key: &[u8]) -> bool {
+        Self::domain_of_key(key).is_some_and(|d| !core_types::name::reserved(&d))
+    }
+
     /// The domain a RECORD key is in, or `None` for any other key (a schema,
     /// an index entry).
     pub fn domain_of_key(key: &[u8]) -> Option<String> {
@@ -1067,16 +1074,18 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
 
     /// ONE PAGE OF THE WHOLE TREE, every key of every app (sdk#479, REPAIR): up to `limit` rows after `after`, read
     /// through the normal read -- which races each block's group and puts back what the node lost. Returns how many
-    /// rows it read and where the next page starts (`None`: the tree is read). Rows are counted, never decoded: a
-    /// repair pass needs every block walked, not the records.
-    pub fn scan_all(&mut self, after: Option<Vec<u8>>, limit: usize) -> Result<(usize, Option<Vec<u8>>)> {
+    /// rows it read, how many of them are the person's DATA ([`Db::is_data_key`]: a record outside every app's
+    /// reserved definition domains), and where the next page starts (`None`: the tree is read). Rows are counted,
+    /// never decoded: a repair pass needs every block walked, not the records.
+    pub fn scan_all(&mut self, after: Option<Vec<u8>>, limit: usize) -> Result<(usize, usize, Option<Vec<u8>>)> {
         let lo = after.map(|k| [k, vec![0]].concat()).unwrap_or_default();
         // Past every key: a key is at most MAX_KEY bytes, so MAX_KEY + 1 of 0xff sorts after all of them.
         let hi = vec![0xff; MAX_KEY + 1];
         let limit = limit.max(1);
         let rows = self.scan_keys(&lo, &hi, false, limit)?;
         let next = (rows.len() == limit).then(|| rows.last().map(|(k, _)| k.clone())).flatten();
-        Ok((rows.len(), next))
+        let data = rows.iter().filter(|(k, _)| Self::is_data_key(k)).count();
+        Ok((rows.len(), data, next))
     }
 
     /// THE CHILDREN OF ONE PARENT, as a bounded read.

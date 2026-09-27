@@ -704,7 +704,8 @@ impl Session {
         })
     }
 
-    /// ONE PAGE of a whole-tree read for REPAIR (sdk#479): `{"rows", "next"}`, `next` the hex key to pass back as
+    /// ONE PAGE of a whole-tree read for REPAIR (sdk#479): `{"rows", "dataRows", "next"}` (`dataRows`: the rows that are
+    /// the person's data, `Db::is_data_key`), `next` the hex key to pass back as
     /// `after` (`null` when the tree is read). A NOT_LOADED is a ticket like every read (`once` in js/engine-db.js).
     /// `put_back` false makes it a CHECK: everything lost is counted, nothing is PUT.
     pub fn scan_all(&mut self, after: &str, limit: usize, put_back: bool) -> Result<String, JsValue> {
@@ -713,7 +714,7 @@ impl Session {
         if let Some(p) = self.page_mut() {
             p.server.page.set_repair_pass(true, put_back);
         }
-        let r = self.db.scan_all(after, limit).map(|(rows, next)| serde_json::json!({ "rows": rows, "next": next.map(|k| core_types::hex::encode(&k)) }));
+        let r = self.db.scan_all(after, limit).map(|(rows, data, next)| serde_json::json!({ "rows": rows, "dataRows": data, "next": next.map(|k| core_types::hex::encode(&k)) }));
         self.answer(r)
     }
 
