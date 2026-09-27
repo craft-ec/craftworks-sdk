@@ -42,8 +42,9 @@ fn main() {
     // wasm stay byte-identical to the one script that builds them, and shows
     // an authoritative-looking number that matches nothing when they drift.
     // `hashes.toml` says so itself, and this obeys it.
-    let (block, register, rev) = contract_hashes();
+    let (block, register, webapp, rev) = contract_hashes();
     println!("cargo:rustc-env=SDK_BLOCK_HASH={block}");
+    println!("cargo:rustc-env=SDK_WEBAPP_HASH={webapp}");
     println!("cargo:rustc-env=SDK_REGISTER_HASH={register}");
     println!("cargo:rustc-env=SDK_CONTRACTS_REV={rev}");
 }
@@ -52,7 +53,7 @@ fn main() {
 /// build FAILS, naming CRAFTWORKS_CONTRACTS and the path it looked at
 /// (craftworks-sdk#252; `build_support::contracts_repo`). It used to bake
 /// `unknown` and exit 0.
-fn contract_hashes() -> (String, String, String) {
+fn contract_hashes() -> (String, String, String, String) {
     let beside = Path::new(env!("CARGO_MANIFEST_DIR")).join("../freenet-contracts");
     let env = std::env::var("CRAFTWORKS_CONTRACTS").ok();
     let repo = match build_support::contracts_repo(env.as_deref(), &beside, |p| p.is_file()) {
@@ -74,7 +75,7 @@ fn contract_hashes() -> (String, String, String) {
             })
             .unwrap_or_else(|| panic!("{} names no `{name}`", path.display()))
     };
-    (field("block"), field("register"), field("rev"))
+    (field("block"), field("register"), field("webapp"), field("rev"))
 }
 
 /// Watch the file this script read. Named explicitly (`CRAFTWORKS_CONTRACTS`)

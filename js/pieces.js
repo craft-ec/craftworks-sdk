@@ -53,8 +53,8 @@ const text = (dec, ptr, len) => new TextDecoder().decode(new Uint8Array(dec.memo
  * restored by the next app that loads it -- never one the race merely cancelled at k.
  * Only those (never a piece this load did not wait on); each re-derived from the rebuilt bundle by the SDK
  * (`load_piece`), checked against the manifest's sha256 AND its container's address before it goes anywhere, and
- * PUT by `session.put_piece` (a content-addressed container: its params derived from its state; the page's one
- * app-PUT path: its deadline and re-send). Never a user write.
+ * PUT by `session.put_piece` (the SDK frames the container around the piece and PUTs it under its own webapp code:
+ * content-addressed, never a page; the page's one app-PUT path: its deadline and re-send). Never a user write.
  *
  * `spec` is the manifest's `{ k, m, payload, bundle_len, pieces: [{ address, sha256 }] }`, `raced` what `raceK`
  * resolved, `sdk` the SDK as an app has it (`load()`'s: `sdk.pieces`, `sdk.webapp`). Returns one entry per piece considered: `{ piece, put: key }` or `{ piece, refused: why }`.
@@ -77,7 +77,7 @@ export async function repairPieces({ spec, bundle, raced, sdk, session, webappCo
       out.push({ piece: i, refused: "the re-derived container is not at the manifest's address" });
       continue;
     }
-    out.push({ piece: i, put: session.put_piece(webappCode, state) });
+    out.push({ piece: i, put: session.put_piece(webappCode, piece) });
   }
   return out;
 }

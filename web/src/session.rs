@@ -674,11 +674,21 @@ impl Session {
         Ok(key)
     }
 
-    /// PUT ONE LOAD PIECE back (the loader's repair, js/pieces.js `repairPieces`; sdk#347): a web container under
-    /// `webapp_code` whose params are DERIVED from its state (`wire::webapp::params`) -- content-addressed, so this door
-    /// PUTs a piece at the address its bytes name, never an arbitrary contract (§19 P5: the only piece-PUT door).
+    /// PUT ONE LOAD PIECE back (the loader's repair, js/pieces.js `repairPieces`; sdk#347) -- the only piece-PUT door
+    /// (§19 P5), and it can publish NOTHING else:
+    /// * the CODE must be this build's `webapp` contract (its sha256, `craftworks_sdk::WEBAPP_HASH`), refused by name
+    ///   otherwise -- never a caller's contract;
+    /// * the CONTAINER is framed HERE around the raw `piece` (`wire::webapp::piece_container`, the one owner): it holds
+    ///   exactly one file, `piece`, so no page (`index.html`) can ever go up through this door, whatever the bytes;
+    /// * its params are derived from that container (`wire::webapp::params`): content-addressed.
     /// [`Session::put_status`] says where it stands, matched by the key it returns.
-    pub fn put_piece(&mut self, webapp_code: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
+    pub fn put_piece(&mut self, webapp_code: Vec<u8>, piece: Vec<u8>) -> Result<String, JsValue> {
+        use sha2::Digest;
+        let got = format!("sha256:{}", core_types::hex::encode(&sha2::Sha256::digest(&webapp_code)));
+        if got != craftworks_sdk::WEBAPP_HASH {
+            return Err(JsValue::from_str(&format!("put_piece: not this build's webapp code ({got}, not {}): a piece is PUT under the SDK's own webapp contract only", craftworks_sdk::WEBAPP_HASH)));
+        }
+        let state = wire::webapp::piece_container(&piece).map_err(|e| JsValue::from_str(&e))?;
         let params = wire::webapp::params(&state).to_vec();
         self.put_contract(webapp_code, params, state)
     }

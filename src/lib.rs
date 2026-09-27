@@ -33,6 +33,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The contract hashes this build provisions with — COPIED from the contracts
 /// build, never re-hashed. See `build.rs`.
 pub const BLOCK_HASH: &str = env!("SDK_BLOCK_HASH");
+/// The `webapp` contract code this build ships (`hashes.toml`, `sha256:<hex>`): the only code a load piece is PUT under
+/// (`put_piece`, app-as-data P5 -- never a caller's code).
+pub const WEBAPP_HASH: &str = env!("SDK_WEBAPP_HASH");
 pub const REGISTER_HASH: &str = env!("SDK_REGISTER_HASH");
 pub const CONTRACTS_REV: &str = env!("SDK_CONTRACTS_REV");
 
