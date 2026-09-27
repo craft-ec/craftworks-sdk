@@ -34,12 +34,14 @@ await t("**a head move that changed the draft re-reads it, records rendered in t
   const seen = [[], []];
   db.watchDefinition("draft", rows => seen[0].push(rows));
   db.watchDefinition("draft", rows => seen[1].push(rows));
-  assert.deepEqual(s.calls, [["bind", "draft"], ["bind", "draft"]]);
+  await settle();
+  for (const w of seen) w.length = 0;          // each watcher's first read (tested on its own below)
+  s.calls.length = 0;
   s.draft = [{ key: "meta", body: { name: "B, from the other device" } }];
   s.stale = ["opaque-draft"];
   db.drain();
   await settle();
-  assert.deepEqual(s.calls.slice(2), [["read", "draft"], ["rendered", "draft"]], "the read and its rendered were not one call, in order");
+  assert.deepEqual(s.calls, [["read", "draft"], ["rendered", "draft"]], "the read and its rendered were not one call, in order");
   for (const w of seen) assert.deepEqual(w, [[{ key: "meta", body: { name: "B, from the other device" } }]]);
 });
 
@@ -50,6 +52,8 @@ await t("**a re-read that FAILS reaches every watcher as `cb(null, { error })`**
   const told = [];
   db.watchDefinition("draft", (rows, fail) => told.push([rows, fail?.error?.message]));
   db.watchDefinition("draft", (rows, fail) => told.push([rows, fail?.error?.message]));
+  await settle();
+  told.length = 0;                             // the first reads failed too; the head move's re-read is the subject
   s.stale = ["opaque-draft"];
   db.drain();
   await settle();
@@ -57,11 +61,27 @@ await t("**a re-read that FAILS reaches every watcher as `cb(null, { error })`**
   assert.ok(!s.calls.some(c => c[0] === "rendered"), "a failed re-read was recorded as rendered: its change would never be named again");
 });
 
+await t("**each watcher gets the CURRENT rows once at the start**, with no head move, and rendered is recorded", async () => {
+  const s = recordingSession();
+  const db = engineDb(s);
+  const first = [], second = [];
+  db.watchDefinition("draft", rows => first.push(rows));
+  await settle();
+  assert.deepEqual(first, [[{ key: "meta", body: { name: "A" } }]], "no first read");
+  assert.deepEqual(s.calls, [["bind", "draft"], ["read", "draft"], ["rendered", "draft"]]);
+  db.watchDefinition("draft", rows => second.push(rows));
+  await settle();
+  assert.equal(first.length, 1, "a later watcher's first read told the earlier one again");
+  assert.equal(second.length, 1);
+});
+
 await t("THE CONTROL: a head move that named another key re-reads nothing", async () => {
   const s = recordingSession();
   const db = engineDb(s);
   let told = 0;
   db.watchDefinition("draft", () => { told += 1; });
+  await settle();
+  told = 0; s.calls.length = 0;               // the first read, not the subject here
   s.stale = ["opaque-app", "tasks"];
   db.drain();
   await settle();
@@ -74,10 +94,13 @@ await t("**unwatch unbinds once the last watcher of that definition is gone**", 
   const db = engineDb(s);
   const a = db.watchDefinition("draft", () => {});
   const b = db.watchDefinition("draft", () => {});
+  await settle();
+  s.calls.length = 0;                          // the first reads, not the subject here
   a();
   assert.ok(!s.calls.some(c => c[0] === "unbind"), "unbound while a watcher remained");
   b();
   assert.deepEqual(s.calls.at(-1), ["unbind", "draft"]);
+  s.calls.length = 0;
   s.stale = ["opaque-draft"];
   db.drain();
   await settle();

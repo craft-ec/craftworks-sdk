@@ -771,7 +771,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
      * WATCH A DEFINITION (§19 P3): `cb(rows)` — `definition(which)` read afresh — each time a head move changes the
      * draft ("draft") or the published definition ("app") of this session's app: another tab or device of this
      * identity edited it, or this tab lost a tie-break (rule 15). A re-read that failed is `cb(null, { error })`, and
-     * the change is named again at the next head move. Bound by the session from its `SystemDomain`, so
+     * the change is named again at the next head move. `cb` is called once at the start with the current rows. Bound by the session from its `SystemDomain`, so
      * the reserved name is never spelled here; refused by name when it cannot be watched. Returns the unwatch.
      */
     watchDefinition(which, cb) {
@@ -779,6 +779,10 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       let def = definitions.get(key);
       if (!def) { def = { which, cbs: new Set() }; definitions.set(key, def); }
       def.cbs.add(cb);
+      // THE FIRST READ, for this watcher alone (engineer1's loader: the current rows without waiting for a head
+      // move). It records `rendered_definition`, as a binding's first read does, so the watch's RenderedAt starts
+      // at the root it read.
+      rereadDefinition({ which, cbs: [cb] });
       return () => {
         def.cbs.delete(cb);
         if (def.cbs.size === 0 && definitions.get(key) === def) { definitions.delete(key); session.unbind_definition(which); }
