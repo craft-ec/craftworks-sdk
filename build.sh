@@ -200,6 +200,9 @@ if [ ! -f "$contracts/build/site.wasm" ]; then
   exit 1
 fi
 cp "$contracts/build/site.wasm" pkg/web/
+# THE PUBLISHING DOORS, DERIVED from this tree's sources (tools/doors.mjs; app-as-data P5): shipped beside the SDK so
+# a consumer (the builder) scans its own code against the SAME list, never a copy of it.
+node tools/doors.mjs > pkg/web/doors.json || { echo "tools/doors.mjs could not derive the publishing doors" >&2; exit 1; }
 
 # The signer's hash cannot be inside the SDK's own wasm — a build cannot
 # contain its own digest — and the CONTRACT hashes are in `buildInfo()`,

@@ -98,16 +98,12 @@ const TRANSPORT_ONLY: &[&str] = &[
     "put_status",
     // PUBLISHING A SITE (builder#117): the app's stable link, signed through the node's signer. An in-memory
     // store has no node and no signer.
-    "publish_site",
     "site_link",
-    "site_status",
-    "cancel_site",
     // AN APP PUBLISH (sdk#516): its load pieces PUT to the node and its site sent once every set is at k -- nothing an
     // in-memory store has.
-    "publish_app",
     "app_publish_status",
     "cancel_app_publish",
-    // An app's DEFINITION published with its SITE in one call (#560, app-as-data P5): a node operation, as publish_app.
+    // An app's DEFINITION published with its SITE in one call (#560, app-as-data P5): THE one site write, a node operation.
     "publish_definition_site",
     // REPAIR (sdk#479): a whole-tree read that puts back what the NODE lost, and its report. An in-memory store has
     // no node to have lost anything.
