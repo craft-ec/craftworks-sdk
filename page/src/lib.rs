@@ -3147,6 +3147,27 @@ mod parked_get {
         assert!(p.take_ops().iter().all(|o| !matches!(o, Op::Get { .. })), "an unneeded parked GET was sent");
     }
 
+    /// **A HELD block's audit goes to the NODE, through the page** (the second reviewer on #538): the page holds `b`,
+    /// an audit wants it -- the FetchBlock arm serves the held bytes as a LOCAL landing (no audit answered), SENDS the
+    /// GET, and the held sweep leaves that GET alone; only the node's answer answers the audit. Mutants: the arm stepping
+    /// `BlockArrived` for held bytes, and the sweep's audit guard removed -> red.
+    #[test]
+    fn a_held_blocks_audit_is_answered_only_by_the_node() {
+        use freenet_prolly::{block_id, kind};
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.now = 5;
+        p.answered(&Waiting::RecoverHead);
+        let bytes = vec![3u8; 8];
+        let id = block_id(kind::RAW, &bytes);
+        p.engine.blocks_mut().insert(id, &bytes);
+        p.audit_want(id, engine::PassId(2));
+        assert!(p.take_audit_answers().is_empty(), "the page's held bytes answered the audit");
+        assert!(p.take_ops().contains(&Op::Get { id }), "a held block's audit sent no GET to the node");
+        assert!(p.deadlines.contains_key(&Waiting::Get(id)), "the held sweep ended the GET the audit waits on");
+        p.answer(Answer::Got { id, bytes }, Ms(20));
+        assert_eq!(p.take_audit_answers(), vec![AuditAnswer { id, passes: vec![engine::PassId(2)], verdict: engine::AuditVerdict::Present }]);
+    }
+
     /// **The due-time backstop's HELD arm spares an audit** (the architect on #538; W7, OP-LIFE E2): a GET parked after
     /// a NotFound, the page then HOLDING the block (a repair rebuilt it), and an audit joining the parked GET -- at the
     /// due time the GET is SENT, never ended, and the audit is answered by the NODE. Mutant: drop the audits clause at

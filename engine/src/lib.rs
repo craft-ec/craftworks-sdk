@@ -1373,6 +1373,28 @@ impl Race {
 }
 
 impl Commit {
+    /// A commit owing `data` (none confirmed), for CommitLife's own tests.
+    #[cfg(test)]
+    fn for_test(data: BTreeSet<Cid>) -> Commit {
+        Commit {
+            seq: 1,
+            root: [0; 32],
+            data,
+            root_parity: Vec::new(),
+            packs: BTreeMap::new(),
+            confirmed: BTreeSet::new(),
+            writes: Vec::new(),
+            bytes: 0,
+            base: [0; 32],
+            through: 0,
+            race: Race::default(),
+            deferred: Vec::new(),
+            held: BTreeSet::new(),
+            unknown: BTreeSet::new(),
+            pack_members: BTreeMap::new(),
+        }
+    }
+
     /// THE ONE "still owed" (COMMIT-LIFE C4, A4): this commit's blocks not yet confirmed. A rejected one stays owed
     /// (never BACKED_UP) and is never put again: the callers that put filter `rejected`.
     fn owed(&self) -> impl Iterator<Item = &Cid> + '_ {
@@ -1899,7 +1921,7 @@ impl<B: Blocks> Engine<B> {
 
     /// Stage moves the table calls impossible (footnote 1). Must be 0.
     pub fn impossible_transitions(&self) -> u64 {
-        self.impossible_transitions
+        self.impossible_transitions + self.life.in_flight_supersedes()
     }
 
     /// THE COMMIT'S STAGE (COMMIT-LIFE rev 5, C1): what the commit table's rows name, read by its model.
@@ -4697,7 +4719,9 @@ impl<B: Blocks> Engine<B> {
             if self.repairs.contains_key(l) {
                 self.end_repair(*l);
             }
-            let served = self.served(*l, by_node);
+            // Only the id the node ANSWERED carries its authority: a member expanded from a pack landed locally (E2r) --
+            // the node's answer was for the pack, not for it (the second reviewer on #538).
+            let served = self.served(*l, by_node && *l == id);
             if !served.audits.is_empty() {
                 audited.push(Effect::AuditAnswered { id: *l, passes: served.audits.into_iter().collect(), verdict: AuditVerdict::Present });
             }
