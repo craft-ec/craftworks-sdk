@@ -392,6 +392,11 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     async draftPut(key, body) {
       return once(() => session.draft_put(key, JSON.stringify(body)));
     },
+    // A FILE of the app's code (app-as-data P5): `f/<path>`'s bytes (a Uint8Array) and meta -- one form per kind, so
+    // `draftPut` stays JSON-only. A file over a record's bound is refused, naming its path and both sizes.
+    async draftFile(path, bytes, meta = {}) {
+      return once(() => session.draft_file(path, bytes, JSON.stringify(meta)));
+    },
     async draftDelete(key) {
       return once(() => session.draft_delete(key));
     },
@@ -401,7 +406,8 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     // `app`: ANOTHER app's definition in this tree, read-only (§19 P3: the builder's project list); absent, this one's.
     // The apps of this tree that hold a draft (§19 P3b: the builder's project list), by id. A read.
     definitionApps: () => once(() => JSON.parse(session.definition_apps())),
-    definition: (which, app) => once(() => JSON.parse(session.definition(which, app ?? undefined))),
+    // `[{ key, body, bytes? }]`: a file's bytes a Uint8Array, as the SDK hands them over (never text decoded here).
+    definition: (which, app) => once(() => session.definition(which, app ?? undefined)),
     async markPublished(domain) {
       return once(() => JSON.parse(session.mark_published(domain)));
     },

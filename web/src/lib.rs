@@ -315,6 +315,9 @@ impl Db {
         let key = craftworks_sdk::definition::DefKey::parse(key).map_err(err)?;
         self.0.draft_delete(None, &key).map_err(err)
     }
+    pub fn draft_file(&mut self, path: &str, bytes: Vec<u8>, meta: &str) -> Result<(), JsError> {
+        self.0.draft_file(None, path, &bytes, &serde_json::from_str(meta).map_err(err)?).map_err(err)
+    }
     pub fn publish_definition(&mut self) -> Result<u32, JsError> {
         self.0.publish_definition(None).map(|n| n as u32).map_err(err)
     }
@@ -323,9 +326,9 @@ impl Db {
         json(&self.0.definition_apps().map_err(err)?)
     }
     /// `app`: another app's definition, READ-only (as a Session's); absent, this tab's own.
-    pub fn definition(&mut self, which: &str, app: Option<String>) -> Result<String, JsError> {
+    pub fn definition(&mut self, which: &str, app: Option<String>) -> Result<js_sys::Array, JsError> {
         let which = session::definition_of(which).map_err(err)?;
-        json(&session::definition_json(self.0.definition(app.as_deref(), which).map_err(err)?))
+        session::definition_js(self.0.definition(app.as_deref(), which).map_err(err)?).map_err(|e| JsError::new(&format!("{e:?}")))
     }
     pub fn mark_published(&mut self, domain: &str) -> Result<String, JsError> {
         json(&self.0.mark_published(None, domain).map_err(err)?)
