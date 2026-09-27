@@ -746,3 +746,34 @@ fn a_refused_follow_resumes_on_this_pages_own_publish() {
     assert_eq!(f.publication(), Some(Publication::Published { version: 3 }), "P8: after a refusal and its own publish, the page missed another device's");
     assert_eq!(f.page.impossible_follow_cells(), 0, "a read reached a follow that holds none");
 }
+
+/// **NEXT_DUE NEVER OFFERS A PAST DEADLINE (Codex on #543, 5; sdk#534's defect, second of its kind).** A followed site
+/// (and the page's head) with its reads SILENT -- out on the wire, never answered -- past the backstop: time is
+/// advanced BY `next_due` itself, as a host's one-shot timer does, and every deadline it offers must lie in the future.
+/// Before: `next_due` offered the backstop while the register's read was out, `tick` (rightly) did not act on it, and
+/// the host re-armed a past time for ever. One predicate, `backstop_due`, is now read by both.
+#[test]
+fn next_due_never_offers_a_past_deadline_while_a_followed_read_is_out() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    follow_rounds(&mut f, &mut node, &mut now, 5);
+    assert_eq!(f.page.follow_version(APP), Some(1), "THE SETUP: the follow does not show v1");
+    // From here every read is SILENT: out, and never answered.
+    let mut silent = |op: &Op| if matches!(op, Op::ReadHead { .. }) { Fate::Silence } else { Fate::Answer };
+    let (mut steps, mut past_backstop) = (0usize, false);
+    while steps < 400 {
+        let due = f.page.next_due().map(|m| m.0).expect("a followed register always has a deadline");
+        assert!(due > now, "step {steps}: next_due offered {due}, not after now {now} -- a host timer would spin");
+        now = due;
+        f.step(&mut node, now, &mut silent);
+        past_backstop |= now > 1_000 + 2 * page::HEAD_BACKSTOP_MS;
+        steps += 1;
+        if past_backstop && steps > 50 {
+            break;
+        }
+    }
+    assert!(past_backstop, "THE SETUP: time never passed the backstop, so this proved nothing ({steps} steps, now {now})");
+}

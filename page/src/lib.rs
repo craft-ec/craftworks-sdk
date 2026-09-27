@@ -1035,7 +1035,7 @@ impl Page {
         // register it FOLLOWS at least every HEAD_BACKSTOP_MS -- the head's,
         // and each site a reopen follows (sdk#520), by the one path.
         for label in self.followed() {
-            if self.register_idle(&label) && now.saturating_sub(self.read_at(&label)) >= HEAD_BACKSTOP_MS {
+            if self.backstop_due(&label).is_some_and(|at| at <= now) {
                 self.follow_read(&label);
             }
         }
@@ -1680,6 +1680,13 @@ impl Page {
         head.into_iter().chain(sites).collect()
     }
 
+    /// THE BACKSTOP'S ONE PREDICATE (sdk#534; Codex on #543, the second defect of its kind): when `label`'s backstop
+    /// read is due -- `None` while a read of it is out (or owed: a head verify), so it cannot fire. `tick` acts on it and
+    /// `next_due` offers it: one function, so a host timer is never armed for a deadline `tick` will not act on.
+    fn backstop_due(&self, label: &Label) -> Option<u64> {
+        self.register_idle(label).then(|| self.read_at(label) + HEAD_BACKSTOP_MS)
+    }
+
     /// When `label`'s register was last read (0: never).
     fn read_at(&self, label: &Label) -> u64 {
         self.last_read_at.get(label).copied().unwrap_or(0)
@@ -2208,7 +2215,8 @@ impl Page {
         let sign = self.pubs.lives().filter_map(Life::due_at).chain(self.follows.due().map(|(_, at)| at)).min();
         let held = self.held_again.values().map(|(at, _)| *at).filter(|at| *at != u64::MAX);
         let puts = (!self.put_again.is_empty()).then_some(self.now);
-        let backstop = self.followed().iter().map(|l| self.read_at(l) + HEAD_BACKSTOP_MS).min();
+        // The SAME predicate `tick` acts on (sdk#534, Codex on #543): a backstop is offered only while it can fire.
+        let backstop = self.followed().iter().filter_map(|l| self.backstop_due(l)).min();
         deadlines.chain(sign).chain(held).chain(puts).chain(backstop).min().map(Ms)
     }
 
