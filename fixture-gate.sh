@@ -44,7 +44,7 @@ allow() {
   esac
 }
 
-BARE='CachedStore::new\(|Shell::resume_with\(|Engine::new\('
+BARE='Engine::new\('
 scanned=0; through_fixture=0; bare_files=()
 
 while IFS= read -r f; do

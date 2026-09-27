@@ -10,7 +10,7 @@
 //! The chain is proved in two halves, each against the real parts:
 //!   - `Db::get` → the store's `wrong_width` hook, over a store that forwards
 //!     into a real instrument `Client`;
-//!   - `CachedStore` — what the browser session reads through — forwarding
+//!   - `PageStore` — what the browser session reads through — forwarding
 //!     that hook into its own client's recording.
 use craftworks_sdk::engine_client::Client;
 use craftworks_sdk::id::{loc_from_hex, Loc};

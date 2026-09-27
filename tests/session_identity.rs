@@ -1,11 +1,11 @@
 //! Every tab, and every page load, is its OWN session (craftworks-sdk#146).
 //!
-//! The engine keys writes by `(ClientId, WriteId)`. `CachedStore::new` starts
-//! write ids at 1 and the shell named every client `ClientId(1)`, so the first
-//! write of EVERY tab and EVERY reload was `(1, 1)` — a collision by default,
-//! not a race. Everything the engine keys on the pair (parity waiting, stalls,
-//! pending writes, "have I seen this write") took one session's write for
-//! another's.
+//! The engine keys writes by `(ClientId, WriteId)`. The old outbox
+//! (`CachedStore`, gone with R-b) started write ids at 1 and the shell named
+//! every client `ClientId(1)`, so the first write of EVERY tab and EVERY
+//! reload was `(1, 1)` — a collision by default, not a race. Everything the
+//! engine keys on the pair (parity waiting, stalls, pending writes, "have I
+//! seen this write") took one session's write for another's.
 
 use craftworks_sdk::Writes;
 

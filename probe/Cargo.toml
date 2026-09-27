@@ -36,8 +36,8 @@ engine = { path = "../engine" }
 signer = { path = "../signer" }
 # live-signer PUTs real blocks (kind + block_id): the SAME rev as every other freenet-prolly pin here.
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
-# live-handoff drives the SDK's own `CachedStore`, so the run measures the
-# outbox's pacing (sdk#176), not a hand-written send loop.
+# ws-lose names its keys by the SDK's ONE record-key encoder
+# (`craftworks_sdk::db::record_prefix` / `record_key`), never a copy of it.
 craftworks-sdk = { path = ".." }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 # live-cold-read derives a throwaway X25519 transport key for a second private node.
