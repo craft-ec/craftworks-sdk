@@ -403,6 +403,24 @@ mod tests {
         assert_eq!(l.chosen(), None, "--domain bulk chose a group holding aaa's record");
     }
 
+    /// LOST IS COUNTED IN SLOTS: a NotFound answers an ID, so every slot holding a lost id is lost. A group whose
+    /// members repeat an id (identical values) past the first `n` slots must not lose more than `n` slots -- `m` lost
+    /// would then be `m + 1`, and the margin arm would read as the control.
+    #[test]
+    #[should_panic(expected = "slots lost")] // PINNED: flipped by the fix
+    fn a_repeated_id_never_loses_more_slots_than_asked() {
+        let a: Cid = [1; 32];
+        let mut members: Vec<Cid> = (2..=(PARITY as u8 + 3)).map(|i| [i; 32]).collect();
+        members.insert(0, a);
+        members.push(a); // `a` again, past the first PARITY slots
+        let parity: Vec<Cid> = (0..PARITY as u8).map(|i| [100 + i; 32]).collect();
+        let mut l = Lose::new(Target::Data, PARITY);
+        l.choose(members, &parity);
+        let c = l.chosen().expect("chosen").clone();
+        let lost_slots = c.slots.iter().filter(|s| c.lost.contains(*s)).count();
+        assert_eq!(lost_slots, PARITY, "{lost_slots} slots lost, not m = {PARITY}");
+    }
+
     /// A leaf (no referenced values: no group) and a value block are never chosen as the data group.
     #[test]
     fn nothing_without_a_group_of_two_is_chosen() {
