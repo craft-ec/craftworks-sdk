@@ -1543,6 +1543,12 @@ pub struct Engine<B: Blocks> {
     landing: Vec<(Cid, Vec<u8>)>,
     /// Repairs started, finished (verified, kept), and given up.
     repair_counts: (u64, u64, u64),
+    /// PARITY the node answered NotFound in a race or repair (sdk#479, the owner: a group whose parity is never
+    /// replaced erodes to its last copy), with its group: re-encoded and PUT back once the page holds all `k` members
+    /// ([`Engine::put_owed_parity`]). Bounded by the NotFounds seen.
+    parity_owed: BTreeMap<Cid, repair::Group>,
+    /// Parity found missing, put back (re-encoded, id-verified), and re-encoded to a DIFFERENT id (never put).
+    parity_counts: (u64, u64, u64),
     /// Why the last repair was given up, in words (the read is answered
     /// `Unavailable` naming the block; this says why the group could not).
     repair_failed: Option<String>,
@@ -1769,6 +1775,8 @@ impl<B: Blocks> Engine<B> {
             step_asks: BTreeMap::new(),
             landing: Vec::new(),
             repair_counts: (0, 0, 0),
+            parity_owed: BTreeMap::new(),
+            parity_counts: (0, 0, 0),
             repair_failed: None,
             root,
             published_seq: 0,
@@ -2010,6 +2018,11 @@ impl<B: Blocks> Engine<B> {
             .collect()
     }
 
+    /// Parity the reads found missing, put back, and re-encoded to a different id (sdk#479): `(missing, put, mismatched)`.
+    pub fn parity_counts(&self) -> (u64, u64, u64) {
+        self.parity_counts
+    }
+
     /// Why the last read repair was given up, if one was.
     pub fn repair_failed(&self) -> Option<&str> {
         self.repair_failed.as_deref()
@@ -2158,6 +2171,7 @@ impl<B: Blocks> Engine<B> {
             }
             out.extend(self.step_inner(event));
             out.extend(self.land_rebuilt());
+            out.extend(self.put_owed_parity());
             out.extend(self.keep_saveable());
             out.extend(self.settle_unwanted());
             self.cascade.clear();
@@ -2168,6 +2182,7 @@ impl<B: Blocks> Engine<B> {
         }
         let mut out = self.step_inner(event);
         out.extend(self.land_rebuilt());
+        out.extend(self.put_owed_parity());
         out.extend(self.keep_saveable());
         out.extend(self.settle_unwanted());
         self.cascade.clear();
@@ -4997,6 +5012,11 @@ impl<B: Blocks> Engine<B> {
                         r.asked.remove(&i);
                         r.dropped.insert(i);
                         r.absent.insert(i);
+                        // A PARITY slot the node does NOT HAVE is owed back (sdk#479): the read saw it gone.
+                        if bytes.is_none() && r.group.is_parity(i) && !self.parity_owed.contains_key(&slot) {
+                            self.parity_counts.0 += 1;
+                            self.parity_owed.insert(slot, r.group.clone());
+                        }
                     }
                     _ => {
                         r.absent.insert(i);
@@ -5005,6 +5025,11 @@ impl<B: Blocks> Engine<B> {
                         // ever gives up on it (the page paces the re-ask).
                         *r.asked.entry(i).or_insert(0) += 1;
                         still_asked = true;
+                        // A PARITY slot answered NotFound in a repair is owed back too (sdk#479).
+                        if bytes.is_none() && r.group.is_parity(i) && !self.parity_owed.contains_key(&slot) {
+                            self.parity_counts.0 += 1;
+                            self.parity_owed.insert(slot, r.group.clone());
+                        }
                     }
                 }
             }

@@ -3386,4 +3386,81 @@ fn an_upgrade_keeps_the_link_and_the_pointer_byte_for_byte() {
         webs.push(node.site().expect("live").2);
     }
     assert_eq!(webs, vec![site_web(&node, APP, 1), site_web(&node, APP, 2)], "an upgrade's site is not its starter and the SAME pointer");
+
+/// Every row of `io`'s tree, read through the normal read: a full range, page by page (the engine's scan).
+fn read_all(io: &mut PageIo, node: &mut WireNode, now: &mut u64, base: u64) -> usize {
+    let (mut rows, mut after, mut n) = (0, None, 0u64);
+    loop {
+        n += 1;
+        let range = Request::Range { req_id: base + n, lo: protocol::Bound::Unbounded, hi: protocol::Bound::Unbounded, reverse: false, after: after.clone(), max_entries: 500 };
+        let r = client(io, node, now, &range);
+        let Some((entries, cursor)) = r.iter().find_map(|x| if let Reply::Page { req_id, entries, cursor, .. } = x { (*req_id == base + n).then(|| (entries.len(), cursor.clone())) } else { None }) else {
+            panic!("page {n} of the scan was never answered: replies {r:?}; unusable {:?}; repair {:?}", io.unusable(), io.server.page.repair_report());
+        };
+        rows += entries;
+        match cursor {
+            Some(c) => after = Some(c),
+            None => return rows,
+        }
+        assert!(n < 1_000, "the scan did not end");
+    }
+}
+
+/// **REPAIR IS THE READ, OVER THE WHOLE TREE** (sdk#479; the owner via core dev). The node LOSES blocks of a published
+/// tree -- tree nodes, values and parity alike, every 7th block of its CURRENT tree; a COLD reader reads every row through the normal
+/// read, which races each block's group, rebuilds a lost member from any `k` and re-encodes a lost parity with the
+/// save's own code, and PUTs them back. Then the node holds every lost block again, byte for byte, and a FRESH reader
+/// reads the whole tree from the node without one NotFound. THE CONTROL: nothing lost, nothing found missing, nothing
+/// put back.
+#[test]
+fn a_whole_tree_read_puts_back_what_the_node_lost_and_a_fresh_reader_then_finds_nothing_missing() {
+    let rows = |lo: u32, hi: u32| -> Vec<protocol::Op> { (lo..hi).map(|i| protocol::Op::Put(format!("r/{i:05}").into_bytes(), vec![i as u8; 90])).collect() };
+    for lose in [true, false] {
+        let mut node = WireNode::new(&[41u8; 32]);
+        let mut now = 1_000;
+        let mut w = page_io(&node);
+        client(&mut w, &mut node, &mut now, &Request::Identity);
+        for (n, lo) in (0..2_000u32).step_by(500).enumerate() {
+            assert!(states(&client(&mut w, &mut node, &mut now, &Request::forced_write(n as u64 + 1, rows(lo, lo + 500))), n as u64 + 1).contains(&WriteState::Published), "THE SETUP: rows {lo}.. did not publish");
+        }
+        // The CURRENT tree's blocks (the node also holds superseded heads' blocks, which no read of this tree asks):
+        // walked from the head's root in the writer's store -- every node, its groups' members and their parity.
+        let (_, root) = node.head().expect("a head");
+        let mut tree: std::collections::BTreeSet<freenet_prolly::Cid> = std::collections::BTreeSet::from([root]);
+        let mut at = vec![root];
+        while let Some(id) = at.pop() {
+            let bytes = freenet_prolly::store::Blocks::get(w.server.page.blocks(), &id).expect("the writer holds its tree").to_vec();
+            let n = freenet_prolly::node::Node::parse(&bytes).expect("a node");
+            tree.extend(n.parity());
+            for (_, members) in freenet_prolly::parity::group_members(&n) {
+                tree.extend(members.iter().copied());
+            }
+            if !n.is_leaf() {
+                at.extend((0..n.len()).map(|i| n.child(i).0));
+            }
+        }
+        let blocks: Vec<[u8; 32]> = tree.iter().map(|c| wire::block::contract_for(BLOCK_CODE, c)).filter(|id| node.contracts.contains_key(id)).collect();
+        let lost: BTreeMap<[u8; 32], Vec<u8>> = if lose { blocks.iter().step_by(7).map(|id| (*id, node.contracts[id].clone())).collect() } else { BTreeMap::new() };
+        for id in lost.keys() {
+            node.contracts.remove(id);
+        }
+        // REPAIR: a cold reader reads the whole tree.
+        let mut r = reader_with(&node, engine::Params::default());
+        client(&mut r, &mut node, &mut now, &Request::Identity);
+        assert_eq!(read_all(&mut r, &mut node, &mut now, 100), 2_000, "the repairing read did not read every row");
+        let report = r.server.page.repair_report();
+        let back = lost.iter().filter(|(id, st)| node.contracts.get(*id) == Some(*st)).count();
+        println!("lose={lose}: {} of {} blocks lost; the read found {} missing, put back {} (acked), rejected {}, gave up {}, parity mismatched {}; the node holds {back} of the lost again", lost.len(), blocks.len(), report.missing, report.put_back, report.rejected, report.given_up, report.parity_mismatched);
+        assert_eq!(back, lost.len(), "the node does not hold every lost block again, byte for byte: {back} of {}", lost.len());
+        assert_eq!((report.given_up, report.rejected, report.parity_mismatched), (0, 0, 0), "a repair failed: {:?}", report.why);
+        assert!(report.missing >= lost.len() as u64 && report.put_back >= lost.len() as u64, "the report does not count what was lost and put back: {report:?}");
+        // A FRESH reader reads it all from the node, and nothing is missing.
+        let mut f = reader_with(&node, engine::Params::default());
+        client(&mut f, &mut node, &mut now, &Request::Identity);
+        assert_eq!(read_all(&mut f, &mut node, &mut now, 200), 2_000, "the fresh reader did not read every row");
+        assert_eq!(f.server.page.repair_report().missing, 0, "the fresh reader still found blocks missing on the node");
+        if !lose {
+            assert_eq!((report.missing, report.put_back), (0, 0), "THE CONTROL: a whole tree was found missing or put back");
+        }
+    }
 }
