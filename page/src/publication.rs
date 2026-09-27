@@ -189,6 +189,10 @@ pub(crate) enum Act {
     Note(Vec<u8>),
     /// The old signer's fork at `seq`: named once (the page keeps which seq it named).
     Forked(u64),
+    /// PUT this block again from page memory: the signer said the node does not hold the commit's ROOT
+    /// (`RootNotHeld`, E6). An acked root the node then lost is otherwise never put again, and the sign is re-asked
+    /// for ever against a node that cannot hold it (the live-repair writer stall).
+    Reput(Cid),
     /// A landing began (counted), or sent its `n`th UPDATE.
     Landing,
     LandingUpdates(u32),
@@ -387,6 +391,9 @@ impl Life {
                         if why == Why::HeadUnknown {
                             acts.push(Act::Read(ReadWait::Warm));
                         }
+                        if why == Why::RootNotHeld {
+                            acts.push(Act::Reput(owed.root));
+                        }
                         let refusals = refusals + 1;
                         Some(Life::BackingOff { owed, at: now + backoff(refusals), refusals, why })
                     }
@@ -423,6 +430,9 @@ impl Life {
                     // The one retryable set, and NotSuccessor: a landing asks from the register's own head, which
                     // may have moved by the time it lands.
                     A::Refused(why) if why.retryable() || why == Why::NotSuccessor => {
+                        if why == Why::RootNotHeld {
+                            acts.push(Act::Reput(owed.root));
+                        }
                         let tries = tries + 1;
                         Some(Life::Verifying { owed, named: *named, tries, at: Some(now + backoff(tries)) })
                     }

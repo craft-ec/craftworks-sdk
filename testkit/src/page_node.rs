@@ -186,6 +186,8 @@ impl PageNode {
             replies: Vec::new(),
             inbox: Vec::new(),
             asked: BTreeMap::new(),
+            lost_puts: BTreeMap::new(),
+            lost_sent: BTreeMap::new(),
         })))
     }
 
@@ -303,6 +305,11 @@ struct ConnState {
     inbox: Vec<Vec<u8>>,
     /// Requests sent and whether each has been answered, by `w<id>`/`r<id>`.
     asked: BTreeMap<String, bool>,
+    /// Blocks whose next PUTs are ACKED AND NOT STORED, and how many sends each has left to lose: a node that
+    /// acked a block and lost it (ws-drop's case on a real network, sdk#555's live step).
+    lost_puts: BTreeMap<Cid, u32>,
+    /// PUTs of each block this node acked and did NOT store (`lost_puts`).
+    lost_sent: BTreeMap<Cid, u32>,
 }
 
 impl PageConn {
@@ -361,6 +368,17 @@ impl PageConn {
     /// How many node answers are queued.
     pub fn held(&self) -> usize {
         self.0.borrow().held()
+    }
+
+    /// The next `times` PUTs of block `id` are acked and NOT stored (`u32::MAX`: every one), as a node that acked
+    /// the block and lost it.
+    pub fn lose_puts_of(&mut self, id: Cid, times: u32) {
+        self.0.borrow_mut().lost_puts.insert(id, times);
+    }
+
+    /// PUTs of `id` acked and lost (`lose_puts_of`).
+    pub fn lost_sends(&self, id: &Cid) -> u32 {
+        self.0.borrow().lost_sent.get(id).copied().unwrap_or(0)
     }
 
     /// LOSE the oldest queued answer. `false` if nothing was queued.
@@ -601,7 +619,13 @@ impl ConnState {
             Op::Put { id, bytes } => {
                 self.count(Served::Put);
                 self.put_bytes += bytes.len() as u64;
-                self.node.put_block(id, &bytes);
+                match self.lost_puts.get_mut(&id) {
+                    Some(left) if *left > 0 => {
+                        *left = left.saturating_sub(u32::from(*left != u32::MAX));
+                        *self.lost_sent.entry(id).or_insert(0) += 1;
+                    }
+                    _ => self.node.put_block(id, &bytes),
+                }
                 Answer::PutOk(id)
             }
             Op::Get { id } => {

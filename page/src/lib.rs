@@ -1353,6 +1353,15 @@ impl Page {
         match act {
             Act::Sign { prev_seq, prev_root, seq, root } => self.ask_sign(label, prev_seq, prev_root, seq, root),
             Act::Update(state) => self.send(Waiting::Update(label.clone()), Op::Update { label: label.clone(), state }),
+            // RootNotHeld (E6): the ROOT again, from page memory, unless its PUT is already on its way -- the one
+            // re-PUT path (`reput_bytes`, sdk#411), as `held_absent` takes it.
+            Act::Reput(id) => {
+                if !self.put_waiting(&id) {
+                    if let Some(bytes) = self.engine.reput_bytes(&id) {
+                        self.put_again.insert(id, bytes);
+                    }
+                }
+            }
             Act::Read(wait) => {
                 let w = self.read_wait(label, wait);
                 self.send(w, Op::ReadHead { label: label.clone() });
