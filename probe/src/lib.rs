@@ -10,6 +10,7 @@ pub mod signer;
 pub mod silent;
 pub mod site_probe;
 pub mod verdict;
+pub mod withhold;
 
 /// Every delegate host function freenet 0.2.135 registers in its linker.
 ///
