@@ -32,6 +32,14 @@ use wasm_bindgen::prelude::*;
 /// a code this build does not know included. An app asks this, never a
 /// string literal of its own (the builder's `=== "CLEAN"` stalled every
 /// publish once the SDK reported `BACKED_UP`).
+/// THE LOADER'S POINTER CHECK (`page_io::open_pointer`): `{ "app", "registerId" }` for the site's own pointer, or
+/// refused by name -- a swapped pointer, a look-alike, a page not on a site's path.
+#[wasm_bindgen]
+pub fn open_pointer(pointer: &[u8], page_path: &str, site_code: &[u8], register_code: &[u8]) -> Result<String, JsError> {
+    let (app, id) = page_io::open_pointer(pointer, page_path, site_code, register_code).map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(serde_json::json!({ "app": app, "registerId": core_types::hex::encode(&id) }).to_string())
+}
+
 #[wasm_bindgen]
 pub fn row_saved(code: &str) -> bool {
     craftworks_sdk::store::RowState::from_code(code).is_some_and(|s| s.is_settled())

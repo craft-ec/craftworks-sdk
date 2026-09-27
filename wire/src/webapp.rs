@@ -152,6 +152,17 @@ pub fn site_pointer(register_params: &[u8], app: &str) -> Option<Vec<u8>> {
     Some(format!(r#"{{"app":"{app}","register_params":"{}"}}"#, core_types::hex::encode(register_params)).into_bytes())
 }
 
+/// A site's POINTER, READ: its register params and app id -- the inverse of [`site_pointer`], and the second half of
+/// the ONE owner of its bytes. STRICT: only the exact bytes [`site_pointer`] composes are a pointer (re-composed and
+/// compared), so a pointer has one spelling and a look-alike -- spacing, key order, an extra field -- is `None`.
+pub fn read_site_pointer(bytes: &[u8]) -> Option<(Vec<u8>, String)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let rest = text.strip_prefix(r#"{"app":""#)?;
+    let (app, rest) = rest.split_once(r#"","register_params":""#)?;
+    let params = core_types::hex::decode(rest.strip_suffix(r#""}"#)?)?;
+    (site_pointer(&params, app)? == bytes).then(|| (params, app.to_string()))
+}
+
 /// An app's WEB part: `files` as a deterministic tar in stored-chunk xz -- what the node unpacks and serves, and
 /// what a SITE carries under its record (builder#117). `app_container` frames exactly this.
 pub fn app_web(files: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {

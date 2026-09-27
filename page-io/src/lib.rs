@@ -241,6 +241,44 @@ fn site_path(path: &str) -> Result<[u8; 32], AddressRefused> {
     site_id_of_link(link).ok_or(AddressRefused::NotASiteLink)
 }
 
+/// THE LOADER'S POINTER CHECK (ARCHITECTURE §19, the bootstrap): a site's `pointer.json`, read by its one owner
+/// (`wire::webapp::read_site_pointer`), its site link RECOMPUTED -- `site_contract(site_code, register_params, app)`,
+/// the one relabelling -- and REFUSED unless that is the link the page was served from (`site_id_of_path`): a
+/// swapped pointer names another link. Returns the app id and the owner's Register id (`contract_keys::instance` over the code hash of
+/// `register_code`), whose tree the app is in. Pure: the loader runs it before any node is asked.
+pub fn open_pointer(pointer: &[u8], page_path: &str, site_code: &[u8], register_code: &[u8]) -> Result<(String, [u8; 32]), PointerRefused> {
+    let (params, app) = wire::webapp::read_site_pointer(pointer).ok_or(PointerRefused::NotAPointer)?;
+    let page = site_id_of_path(page_path).ok_or(PointerRefused::NotASitePath)?;
+    let site = site_contract(site_code, &params, &app).ok_or(PointerRefused::NotAPointer)?;
+    let mut names = [0u8; 32];
+    names.copy_from_slice(&site.key().id().as_bytes()[..32]);
+    if names != page {
+        return Err(PointerRefused::NotThisSite { names, page });
+    }
+    Ok((app, contract_keys::instance(&contract_keys::code_hash(register_code), &params)))
+}
+
+/// Why a page's pointer is refused, by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerRefused {
+    /// Not the bytes a site's pointer is (`wire::webapp::site_pointer`), or it names no site.
+    NotAPointer,
+    /// The page's own path is not a site's (`/v1/contract/web/<link>/`).
+    NotASitePath,
+    /// The pointer names ANOTHER site's link than the page was served from: never read.
+    NotThisSite { names: [u8; 32], page: [u8; 32] },
+}
+
+impl std::fmt::Display for PointerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PointerRefused::NotAPointer => write!(f, "this site's pointer.json is not a site pointer"),
+            PointerRefused::NotASitePath => write!(f, "this page is not served from a site's path (/v1/contract/web/<link>/)"),
+            PointerRefused::NotThisSite { .. } => write!(f, "this site's pointer names another site: it is not this page's own, and is not read"),
+        }
+    }
+}
+
 /// Why a text is not a site address, by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressRefused {
