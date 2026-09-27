@@ -152,6 +152,9 @@ const TRANSPORT_ONLY: &[&str] = &[
     // nothing "not yet published", only everything, lost with the tab — a
     // different fact the page states differently ("in this tab only").
     "unsaved_writes",
+    // Reads waiting on a block of a DAMAGED group (sdk#524): a block answered NotFound by the node, its group below k.
+    // An in-memory store holds every block: nothing is ever answered NotFound, so no group is ever damaged there.
+    "damaged",
 ];
 
 #[test]
