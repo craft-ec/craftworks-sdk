@@ -54,6 +54,10 @@ pub(crate) struct CommitLife {
     backing: Vec<Backing>,
     /// Writes whose Backing a later commit superseded: they join the next own commit's Backing.
     carry: BTreeSet<(ClientId, WriteId)>,
+    /// Supersedes made with a commit IN FLIGHT: an impossible cell today (every caller runs after `end`), counted into
+    /// `Engine::impossible_transitions` -- which the COMMIT-LIFE model asserts is 0 at every step -- rather than a
+    /// debug_assert, so a test can drive the real in-flight case and see the exclusion hold (the second reviewer).
+    in_flight_supersedes: u64,
 }
 
 impl CommitLife {
@@ -186,10 +190,24 @@ impl CommitLife {
 
     /// Stragglers a root move made garbage (`gone`): withdrawn from every Backing, whose writes are carried onto the
     /// next own commit's. The ids withdrawn, and the writes of every Backing that drained.
+    ///
+    /// Correct whatever the caller does (the architect on C1): a block the commit IN FLIGHT still owes is never
+    /// withdrawn, even when a root move made it garbage for a Backing -- its PUT is that commit's too. Every call site
+    /// runs with no commit in flight today (publish and adopt, after `end`); the assert makes a future one loud.
     pub(crate) fn supersede(&mut self, gone: &BTreeSet<Cid>) -> (BTreeSet<Cid>, Vec<(ClientId, WriteId)>) {
+        if self.commit().is_some() {
+            self.in_flight_supersedes += 1;
+        }
+        let owed: BTreeSet<Cid> = self.commit().map(|c| c.owed().copied().collect()).unwrap_or_default();
+        self.supersede_excluding(gone, &owed)
+    }
+
+    /// [`CommitLife::supersede`]'s body: every Backing loses the ids of `gone` -- except those `owed` by a commit in
+    /// flight.
+    fn supersede_excluding(&mut self, gone: &BTreeSet<Cid>, owed: &BTreeSet<Cid>) -> (BTreeSet<Cid>, Vec<(ClientId, WriteId)>) {
         let mut withdrawn = BTreeSet::new();
         for b in self.backing.iter_mut() {
-            let hit: Vec<Cid> = b.remaining.intersection(gone).copied().collect();
+            let hit: Vec<Cid> = b.remaining.intersection(gone).filter(|id| !owed.contains(*id)).copied().collect();
             if hit.is_empty() {
                 continue;
             }
@@ -247,7 +265,61 @@ impl CommitLife {
         self.backing.iter().flat_map(|b| b.remaining.iter().copied()).collect()
     }
 
+    /// Supersedes made with a commit in flight (an impossible cell, counted).
+    pub(crate) fn in_flight_supersedes(&self) -> u64 {
+        self.in_flight_supersedes
+    }
+
     pub(crate) fn backing_len(&self) -> usize {
         self.backing.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(n: &[u8]) -> BTreeSet<Cid> {
+        n.iter().map(|b| [*b; 32]).collect()
+    }
+
+    /// A block the commit IN FLIGHT owes is never withdrawn by a supersede, even when the root move made it garbage for
+    /// a Backing (the architect's C1 residual). Mutant: drop the `owed` exclusion -> red.
+    #[test]
+    fn a_block_the_commit_in_flight_owes_is_never_withdrawn() {
+        let mut life = CommitLife::default();
+        life.back(vec![(ClientId(1), WriteId(1))], ids(&[1, 2, 3]));
+        // 2 and 3 are garbage for the Backing; 2 is also owed by the commit in flight.
+        let (withdrawn, _) = life.supersede_excluding(&ids(&[2, 3]), &ids(&[2]));
+        assert_eq!(withdrawn, ids(&[3]), "a block the commit in flight owes was withdrawn");
+        assert!(life.backing_owes(&[2; 32]), "the in-flight commit's block left the Backing");
+        assert!(!life.backing_owes(&[3; 32]));
+    }
+
+    /// THE PRODUCTION PATH, with a REAL commit in flight (the second reviewer on #538: a hand-made set on an idle life
+    /// left the owed-set derivation untested): the in-flight commit's owed block is not withdrawn from a Backing that a
+    /// root move made it garbage for, and the impossible cell is counted. Mutant: an empty owed set in `supersede` ->
+    /// red.
+    #[test]
+    fn a_real_in_flight_commits_owed_block_survives_a_supersede() {
+        let mut life = CommitLife::default();
+        life.back(vec![(ClientId(1), WriteId(1))], ids(&[1, 2, 3]));
+        assert!(life.start(Commit::for_test(ids(&[2, 9])), 0), "THE SETUP: the commit did not start");
+        let (withdrawn, _) = life.supersede(&ids(&[2, 3]));
+        assert_eq!(withdrawn, ids(&[3]), "the in-flight commit's owed block was withdrawn");
+        assert!(life.backing_owes(&[2; 32]));
+        assert_eq!(life.in_flight_supersedes(), 1, "the impossible cell was not counted");
+    }
+
+    /// With nothing in flight, every garbage block is withdrawn from every Backing (a block two published commits share
+    /// leaves both).
+    #[test]
+    fn with_nothing_in_flight_every_backing_loses_the_garbage() {
+        let mut life = CommitLife::default();
+        life.back(vec![(ClientId(1), WriteId(1))], ids(&[1, 2]));
+        life.back(vec![(ClientId(1), WriteId(2))], ids(&[2, 4]));
+        let (withdrawn, _) = life.supersede(&ids(&[2]));
+        assert_eq!(withdrawn, ids(&[2]));
+        assert!(!life.backing_owes(&[2; 32]), "a Backing still owes a garbage block");
     }
 }

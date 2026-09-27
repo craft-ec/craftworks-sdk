@@ -407,6 +407,24 @@ pub enum Event {
         client: ClientId,
         write_id: WriteId,
     },
+    /// Block `id`'s bytes LANDED LOCALLY: the page already holds them (a rebuild it kept, its own write), so it serves a
+    /// fetch from memory, not from the node (WANTED-LIFE E2r). It serves the reads, repairs and the parked write like
+    /// `BlockArrived` -- and NO audit: an audit waits for the node's answer (W7).
+    BlockLanded {
+        id: Cid,
+        bytes: Vec<u8>,
+    },
+    /// The assets audit's pass `pass` wants block `id` from the NODE (sdk#530, WANTED-LIFE E1): a reader of the one
+    /// (block, GET) key. Asked even when `id` is held (W7): the audit measures the node, not the page.
+    AuditWant {
+        id: Cid,
+        pass: PassId,
+    },
+    /// Pass `pass` no longer waits on `id` (replaced, or ended: sdk#532) -- only ITS reader drops (WANTED-LIFE E4).
+    AuditDrop {
+        id: Cid,
+        pass: PassId,
+    },
 
     // ---- subscriptions ----
     /// Tell me when anything between these keys changes.
@@ -553,6 +571,14 @@ pub enum Effect {
     /// unwanted (the architect's T3). Not [`Effect::Withdraw`]: that is a superseded PUT, a different fact.
     Unwanted {
         id: Cid,
+    },
+    /// The NODE answered block `id`'s GET for the audit passes `passes` (sdk#530, WANTED-LIFE A2/A3), with its
+    /// [`AuditVerdict`]. Only the node's answer: a rebuild from parity, or bytes the page already holds, never answer
+    /// an audit (W7). The audit's readers are taken with it.
+    AuditAnswered {
+        id: Cid,
+        passes: Vec<PassId>,
+        verdict: AuditVerdict,
     },
     UpdateHead {
         seq: u64,
@@ -953,20 +979,34 @@ impl Default for Params {
 
 
 /// Who wants a block, as [`Engine::readers_of`] derives it: a parked read waits on it, a repair needs it as a slot,
-/// or the parked write needs it. Nothing wants it when none does.
+/// the parked write needs it, or an assets-audit pass waits on its GET (sdk#530). Nothing wants it when none does:
+/// the ONE holder set of the (block, GET) key (WANTED-LIFE W1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Readers {
     pub reads: bool,
     pub repairs: bool,
     pub parked_write: bool,
+    pub audits: bool,
 }
 
 impl Readers {
     /// Somebody wants it.
     pub fn any(self) -> bool {
-        self.reads || self.repairs || self.parked_write
+        self.reads || self.repairs || self.parked_write || self.audits
     }
 }
+
+/// What the NODE said of a block an audit asked (sdk#530; KEEPER's C2): its bytes (the audit's Fetched), or its
+/// NotFound (the audit's Absent). Never a bool: the audit matches on it exhaustively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditVerdict {
+    Present,
+    Absent,
+}
+
+/// An assets-audit PASS, by its number (sdk#530, sdk#532): a replaced pass drops only ITS readers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub struct PassId(pub u64);
 
 
 /// What an engine shed to keep its context saveable (sdk#162), per call.
@@ -1333,6 +1373,28 @@ impl Race {
 }
 
 impl Commit {
+    /// A commit owing `data` (none confirmed), for CommitLife's own tests.
+    #[cfg(test)]
+    fn for_test(data: BTreeSet<Cid>) -> Commit {
+        Commit {
+            seq: 1,
+            root: [0; 32],
+            data,
+            root_parity: Vec::new(),
+            packs: BTreeMap::new(),
+            confirmed: BTreeSet::new(),
+            writes: Vec::new(),
+            bytes: 0,
+            base: [0; 32],
+            through: 0,
+            race: Race::default(),
+            deferred: Vec::new(),
+            held: BTreeSet::new(),
+            unknown: BTreeSet::new(),
+            pack_members: BTreeMap::new(),
+        }
+    }
+
     /// THE ONE "still owed" (COMMIT-LIFE C4, A4): this commit's blocks not yet confirmed. A rejected one stays owed
     /// (never BACKED_UP) and is never put again: the callers that put filter `rejected`.
     fn owed(&self) -> impl Iterator<Item = &Cid> + '_ {
@@ -1859,7 +1921,7 @@ impl<B: Blocks> Engine<B> {
 
     /// Stage moves the table calls impossible (footnote 1). Must be 0.
     pub fn impossible_transitions(&self) -> u64 {
-        self.impossible_transitions
+        self.impossible_transitions + self.life.in_flight_supersedes()
     }
 
     /// THE COMMIT'S STAGE (COMMIT-LIFE rev 5, C1): what the commit table's rows name, read by its model.
@@ -2299,7 +2361,8 @@ impl<B: Blocks> Engine<B> {
                 self.subs.drop_client(client);
                 Vec::new()
             }
-            Event::BlockArrived { id, bytes } => self.on_arrived(id, bytes),
+            Event::BlockArrived { id, bytes } => self.on_arrived(id, bytes, true),
+            Event::BlockLanded { id, bytes } => self.on_arrived(id, bytes, false),
             Event::BlockMissed(id) => self.on_missed(id),
             Event::Start { key, epochs } => self.on_start(key, epochs),
             Event::HeadRead { epoch, seq, root } => self.on_head_read(epoch, seq, root),
@@ -2315,6 +2378,11 @@ impl<B: Blocks> Engine<B> {
             }
             Event::HeadConflict { seq, root } => self.on_head_conflict(seq, root),
             Event::AskWrite { client, write_id } => self.on_ask(client, write_id),
+            Event::AuditWant { id, pass } => self.on_audit_want(id, pass),
+            Event::AuditDrop { id, pass } => {
+                self.drop_reader(id, Reader::Audit(pass));
+                Vec::new()
+            }
         }
     }
 
@@ -4590,13 +4658,15 @@ impl<B: Blocks> Engine<B> {
     /// not cached, not parsed, and not an error the caller sees, because a
     /// node that sends rubbish must not be able to break a reader that asked
     /// for something real.
-    fn on_arrived(&mut self, id: Cid, bytes: Vec<u8>) -> Vec<Effect> {
+    /// `by_node`: the NODE's answer to the GET (`Event::BlockArrived`, WANTED-LIFE E2n); `false` for a LOCAL landing
+    /// (a rebuild from parity, `land_rebuilt`: E2r), which serves no audit (W7).
+    fn on_arrived(&mut self, id: Cid, bytes: Vec<u8>, by_node: bool) -> Vec<Effect> {
         // A block of a group being repaired (a parity block among them, which
         // no read asks for by itself).
         let mut out = Vec::new();
         if self.wanted.is_slot(&id) {
             out.extend(self.on_repair_block(id, Some(&bytes)));
-            if !self.wanted.read_waits_on(&id) {
+            if !self.wanted.read_waits_on(&id) && !(by_node && self.wanted.audit_waits_on(&id)) {
                 return out;
             }
         }
@@ -4638,6 +4708,8 @@ impl<B: Blocks> Engine<B> {
         }
 
         let mut woken: BTreeSet<read::ReqId> = BTreeSet::new();
+        // The audit passes this arrival answers (the node's answer only, A2).
+        let mut audited: Vec<Effect> = Vec::new();
         for l in &landed {
             self.reads.attempts.remove(l);
             // The block itself came: a repair rebuilding it is no longer
@@ -4647,7 +4719,13 @@ impl<B: Blocks> Engine<B> {
             if self.repairs.contains_key(l) {
                 self.end_repair(*l);
             }
-            if let Some(reqs) = self.served(*l) {
+            // Only the id the node ANSWERED carries its authority: a member expanded from a pack landed locally (E2r) --
+            // the node's answer was for the pack, not for it (the second reviewer on #538).
+            let served = self.served(*l, by_node && *l == id);
+            if !served.audits.is_empty() {
+                audited.push(Effect::AuditAnswered { id: *l, passes: served.audits.into_iter().collect(), verdict: AuditVerdict::Present });
+            }
+            if let Some(reqs) = served.reads {
                 for r in &reqs {
                     // Pinned for as long as this read is parked: it will
                     // re-descend through this block on its next attempt.
@@ -4662,6 +4740,7 @@ impl<B: Blocks> Engine<B> {
                 woken.extend(reqs);
             }
         }
+        out.extend(audited);
         for req in woken {
             // A read answered by eviction above is gone; driving it is a no-op.
             out.extend(self.drive(req));
@@ -4686,6 +4765,15 @@ impl<B: Blocks> Engine<B> {
     /// can do nothing about either.
     fn on_missed(&mut self, id: Cid) -> Vec<Effect> {
         let mut out = Vec::new();
+        // E3 BY READER KIND: the audits are ANSWERED (absent: their verdict) and taken; every other reader keeps
+        // waiting (rule 8).
+        let passes = self.wanted.missed_audits(id);
+        if !passes.is_empty() {
+            if !self.wanted.readers_of(&id).any() {
+                self.dropped.insert(id);
+            }
+            out.push(Effect::AuditAnswered { id, passes: passes.into_iter().collect(), verdict: AuditVerdict::Absent });
+        }
         if self.wanted.is_slot(&id) {
             out.extend(self.on_repair_block(id, None));
         }
@@ -4960,10 +5048,21 @@ impl<B: Blocks> Engine<B> {
         }
     }
 
-    /// `id` ARRIVED: the reads waiting on it are SERVED (they re-descend) -- the readers it had, taken. Not a drop: the
-    /// block is here, so it is never `Unwanted`.
-    fn served(&mut self, id: Cid) -> Option<BTreeSet<read::ReqId>> {
-        self.wanted.served(id)
+    /// `id` ARRIVED: the readers it serves are TAKEN (WANTED-LIFE A2) -- the reads (they re-descend) and, when the NODE
+    /// answered (`by_node`), the audit passes. Not a drop: the block is here, so it is never `Unwanted`.
+    fn served(&mut self, id: Cid, by_node: bool) -> wanted::Served {
+        self.wanted.served(id, by_node)
+    }
+
+    /// An audit pass wants `id` (WANTED-LIFE A1): its reader joins the one (block, GET) key, and the ONE `FetchBlock`
+    /// goes when no GET of it is in flight -- EVEN IF `id` is held (W7: the audit measures the node).
+    fn on_audit_want(&mut self, id: Cid, pass: PassId) -> Vec<Effect> {
+        if self.want(id, Reader::Audit(pass)).any() {
+            return Vec::new();
+        }
+        self.reads.fetches += 1;
+        self.step_asks.entry(id).or_insert(false);
+        vec![Effect::FetchBlock { id, via: read::Via::Direct, attempt: 0 }]
     }
 
     /// The parked write is RELEASED (applied, refused, re-queued, out of rounds or room): its needs lose their reader,
