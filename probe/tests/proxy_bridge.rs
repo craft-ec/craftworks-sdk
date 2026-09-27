@@ -76,10 +76,33 @@ async fn page_through(hooks: Arc<dyn Hooks>, replies: Vec<Vec<u8>>) -> tokio_tun
     panic!("THE SETUP: the proxy never listened");
 }
 
-async fn next_answer(ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> Option<HostResponse> {
+/// What the page hears next: an answer, SILENCE (nothing at all within the wait), or something else -- a malformed or
+/// non-binary frame, an error, a closed socket -- which is never taken for either (Codex on #541: "no answer" had
+/// folded all of them into silence).
+#[derive(Debug)]
+enum Heard {
+    Answer(Box<HostResponse>),
+    Silence,
+    Other(String),
+}
+
+async fn next_answer(ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> Heard {
     match tokio::time::timeout(Duration::from_millis(700), ws.next()).await {
-        Ok(Some(Ok(Message::Binary(b)))) => bincode::deserialize::<Result<HostResponse, ClientError>>(&b).ok()?.ok(),
-        _ => None,
+        Err(_) => Heard::Silence,
+        Ok(Some(Ok(Message::Binary(b)))) => match bincode::deserialize::<Result<HostResponse, ClientError>>(&b) {
+            Ok(Ok(r)) => Heard::Answer(Box::new(r)),
+            other => Heard::Other(format!("an undecodable or error frame: {other:?}")),
+        },
+        Ok(other) => Heard::Other(format!("{other:?}")),
+    }
+}
+
+/// The answer the page heard next, or the test fails naming what it heard instead.
+async fn answer(ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> HostResponse {
+    match next_answer(ws).await {
+        Heard::Answer(r) => *r,
+        Heard::Silence => panic!("the page heard no answer: silence"),
+        Heard::Other(what) => panic!("the page heard no answer: {what}"),
     }
 }
 
@@ -97,12 +120,13 @@ async fn ws_withhold_drops_only_the_parity_puts_answer() {
     for f in wire::frame_put(parity, WrappedState::new([vec![kind::PARITY], b"p".to_vec()].concat()), 1).unwrap() {
         ws.send(Message::Binary(f.into())).await.unwrap();
     }
-    assert!(next_answer(&mut ws).await.is_none(), "the parity PUT's answer reached the page");
+    let heard = next_answer(&mut ws).await;
+    assert!(matches!(heard, Heard::Silence), "the parity PUT's answer was not withheld as SILENCE: {heard:?}");
     for f in wire::frame_put(data, WrappedState::new([vec![kind::RAW], b"d".to_vec()].concat()), 2).unwrap() {
         ws.send(Message::Binary(f.into())).await.unwrap();
     }
-    match next_answer(&mut ws).await {
-        Some(HostResponse::ContractResponse(ContractResponse::PutResponse { key })) => assert_eq!(key, dkey),
+    match answer(&mut ws).await {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => assert_eq!(key, dkey),
         other => panic!("the data PUT's answer did not reach the page: {other:?}"),
     }
     assert_eq!(hooks.withheld.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -136,7 +160,7 @@ async fn ws_lose_answers_the_lost_blocks_get_with_the_nodes_not_found() {
         for f in wire::frame_get(id, false, 1).unwrap() {
             ws.send(Message::Binary(f.into())).await.unwrap();
         }
-        let a = next_answer(&mut ws).await.expect("an answer reached the page");
+        let a = answer(&mut ws).await;
         if id == *root_key.id() {
             match a {
                 HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => assert_eq!(instance_id, id),
@@ -159,4 +183,83 @@ async fn ws_lose_answers_the_lost_blocks_get_with_the_nodes_not_found() {
             format!(r#"{{"not_found":"{}","not_found_total":1}}"#, short(&root)),
         ]
     );
+}
+
+/// A DATA GROUP'S CHOICE, A LOSS AND A SURVIVOR, THROUGH THE BRIDGE (Codex on #541: the fixture above never sends a
+/// survivor or a data group, so those emissions were never driven). A real tree: the root's answer makes ws-lose choose
+/// the root's group of children; a lost member's GET reaches the page as the node's NotFound; a SURVIVOR's reaches it
+/// as its bytes, and is logged `answered`. The lines the hook says, byte for byte, are the three a run logs.
+#[tokio::test]
+async fn ws_lose_chooses_a_data_group_and_logs_a_loss_and_a_survivor_through_the_bridge() {
+    use freenet_prolly::apply::{apply_into, Edit};
+    use freenet_prolly::store::{Blocks, MemBlocks};
+    let p = freenet_prolly::parity::PARITY;
+    let mut b = MemBlocks::default();
+    let empty = freenet_prolly::build::init(&mut b);
+    let edits: Vec<(Vec<u8>, Edit)> = (0..3000u32).map(|i| (format!("row/{i:06}").into_bytes(), Edit::Put(vec![7u8; 40]))).collect();
+    let applied = apply_into(&mut b, &empty, &edits).expect("the tree");
+    let parity: std::collections::HashMap<[u8; 32], Vec<u8>> = applied.parity.into_iter().collect();
+    let state_of = |id: &[u8; 32]| -> Vec<u8> {
+        match b.get(id) {
+            Some(n) => [vec![kind::TREE_NODE], n.to_vec()].concat(),
+            None => [vec![kind::PARITY], parity.get(id).expect("a parity block").clone()].concat(),
+        }
+    };
+    let root_state = state_of(&applied.root);
+    // THE CHOICE ws-lose will make, made here on the same bytes (its rule is lose.rs's tests'): the lost member and a
+    // survivor to ask for.
+    let mut expect = Lose::new(Target::Data, p);
+    let _ = expect.block(applied.root, &root_state);
+    let c = expect.chosen().expect("THE SETUP: the root's answer chooses no group").clone();
+    let lost = c.slots[0];
+    let survivor = *c.slots.iter().find(|s| !c.lost.contains(*s)).expect("THE SETUP: no survivor");
+    let get = |id: &[u8; 32]| {
+        let (_, key) = contract(b"block code", id);
+        ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, contract: None, state: WrappedState::new(state_of(id)) }))
+    };
+    let (log, said) = captured();
+    let hooks = Arc::new(LoseHooks { log, ..LoseHooks::new(Lose::new(Target::Data, p)) });
+    let mut ws = page_through(hooks, vec![get(&applied.root), get(&lost), get(&survivor)]).await;
+    for (id, want_lost) in [(applied.root, false), (lost, true), (survivor, false)] {
+        let (_, key) = contract(b"block code", &id);
+        for f in wire::frame_get(*key.id(), false, 1).unwrap() {
+            ws.send(Message::Binary(f.into())).await.unwrap();
+        }
+        match answer(&mut ws).await {
+            HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) if want_lost => assert_eq!(instance_id, *key.id()),
+            HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) if !want_lost => assert_eq!(state.as_ref(), state_of(&id).as_slice()),
+            other => panic!("block {} (lost: {want_lost}) was answered {other:?}", short(&id)),
+        }
+    }
+    assert_eq!(
+        *said.lock().unwrap(),
+        vec![
+            probe::lose::chosen_line("data", &c).to_string(),
+            format!(r#"{{"not_found":"{}","not_found_total":1}}"#, short(&lost)),
+            format!(r#"{{"answered":"{}","answered_total":1}}"#, short(&survivor)),
+        ]
+    );
+}
+
+/// THE REAL SINK (Codex on #541: every test above swaps the logger, so the default's stderr write was never run): the
+/// default `Log` writes each line to STDERR, one JSON value per line -- run in a child of this test binary, whose
+/// stderr is read here.
+#[test]
+fn the_default_log_writes_each_line_to_stderr() {
+    const CHILD: &str = "PROBE_LOG_CHILD";
+    let line = serde_json::json!({ "answered": "0102030405060708", "answered_total": 1 });
+    if std::env::var(CHILD).is_ok() {
+        Log::default().say(&line);
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "the_default_log_writes_each_line_to_stderr", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .expect("the child ran");
+    assert!(out.status.success(), "the child failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let want = line.to_string();
+    assert!(stderr.lines().any(|l| l == want), "the default Log did not write the line to stderr:\n{stderr}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&line.to_string()), "the default Log wrote to stdout");
 }

@@ -122,10 +122,11 @@ impl Lose {
                         None => groups[g].1.len() >= 2,
                         Some(marker) => node.is_leaf() && entries[g].as_ref().is_some_and(|e| !e.is_empty() && e.iter().all(|&i| node.key(i).starts_with(marker))),
                     };
-                    let group = (0..groups.len()).find(|&g| fits(g)).map(|g| (g, groups[g].clone()));
-                    if let Some((g, (_, members))) = group {
-                        if let Some(par) = parity.get(PARITY * g..PARITY * (g + 1)) {
-                            self.choose(members, par);
+                    // The first group that fits AND whose loss can be met exactly.
+                    for g in (0..groups.len()).filter(|&g| fits(g)) {
+                        let Some(par) = parity.get(PARITY * g..PARITY * (g + 1)) else { continue };
+                        if self.choose(groups[g].1.clone(), par) {
+                            break;
                         }
                     }
                 }
@@ -147,12 +148,15 @@ impl Lose {
         if par.is_empty() {
             return;
         }
-        self.choose(vec![head.root], &par);
+        let _ = self.choose(vec![head.root], &par);
     }
 
     /// `n` SLOTS are lost, DATA members first, then parity. A NotFound answers an ID, so losing an id loses EVERY slot
-    /// holding it: ids are taken in slot order, each only while the slots it takes keep the count `<= n`.
-    fn choose(&mut self, members: Vec<Cid>, parity: &[Cid]) {
+    /// holding it: ids are taken in slot order, each only while the slots it takes keep the count `<= n`. The group is
+    /// CHOSEN only when that meets the loss EXACTLY -- `n` slots, at least `min(n, k)` of them data (Codex on #541: ten
+    /// identical values under `m + 1` lost only the `m` parity and no data, and the log said the control ran). `false`:
+    /// not chosen, and another group may be.
+    fn choose(&mut self, members: Vec<Cid>, parity: &[Cid]) -> bool {
         let k = members.len();
         let mut slots = members;
         slots.extend_from_slice(parity);
@@ -165,7 +169,12 @@ impl Lose {
                 taken += holds;
             }
         }
+        let lost_data = slots[..k].iter().filter(|s| lost.contains(*s)).count();
+        if taken != self.n || lost_data < self.n.min(k) {
+            return false;
+        }
         self.chosen = Some(Chosen { slots, k, lost });
+        true
     }
 }
 
@@ -471,6 +480,32 @@ mod tests {
         let c = l.chosen().expect("chosen").clone();
         let lost_slots = c.slots.iter().filter(|s| c.lost.contains(*s)).count();
         assert_eq!(lost_slots, PARITY, "{lost_slots} slots lost, not m = {PARITY}");
+    }
+
+    /// A LOSS THAT CANNOT BE MET IS NO CHOICE (Codex on #541): ten identical values fill ten member slots with ONE id,
+    /// which cannot be lost without losing ten -- so `m + 1` would take only the `m` parity: m lost, not m + 1, and no
+    /// data lost at all, while the log said the control ran. A group where exactly `n` slots, data first, cannot be
+    /// lost is NOT chosen.
+    #[test]
+    fn a_group_whose_loss_cannot_be_met_exactly_is_never_chosen() {
+        let value = vec![b'v'; 1400];
+        let edits: Vec<(Vec<u8>, Edit)> = (0..10u32).map(|i| (record("bulk", i), Edit::Put(value.clone()))).collect();
+        let (root_id, b) = tree_of(edits);
+        let root = b.get(&root_id).expect("held").to_vec();
+        let node = Node::parse(&root).expect("a node");
+        let groups = group_members(&node);
+        assert!(node.is_leaf() && groups.len() == 1 && groups[0].1.len() == 10, "THE SETUP: not one leaf group of the ten values");
+        assert!(groups[0].1.iter().all(|m| *m == groups[0].1[0]), "THE SETUP: the ten values are not one id");
+        for domain in [None, Some("bulk")] {
+            let mut l = Lose::new(Target::Data, PARITY + 1);
+            if let Some(d) = domain {
+                l = l.with_domain(d);
+            }
+            let _ = l.block(root_id, &state(kind::TREE_NODE, &root));
+            let c = l.chosen().cloned();
+            let lost = c.as_ref().map(|c| c.slots.iter().filter(|s| c.lost.contains(*s)).count());
+            assert!(c.is_none(), "a group whose loss cannot be met was chosen (domain {domain:?}): {lost:?} slots lost of m + 1 = {}", PARITY + 1);
+        }
     }
 
     /// A leaf (no referenced values: no group) and a value block are never chosen as the data group.
