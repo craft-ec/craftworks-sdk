@@ -40,5 +40,18 @@ await t("**the doors**: draft edited, published in one write, both definitions r
   assert.equal(await db.isPublished("rows"), true);
 });
 
+// §19 P3: a definition is READ by app (the builder's project list), and only read: a write door takes no app, so an
+// app argument handed to one does not reach another app's draft.
+await t("**another app's definition is read, never written**: the in-tab Db reads by app id; a write door ignores one", async () => {
+  const db = new sdk.Db();
+  await db.draftPut("meta", { name: "Mine" });
+  assert.deepEqual(await db.definition("draft", "someone-else"), [], "another app's (empty) draft read this tab's records");
+  await db.draftPut("meta", { name: "Planted" }, "someone-else");
+  assert.deepEqual(await db.definition("draft", "someone-else"), [], "a write door wrote into another app's draft");
+  assert.deepEqual((await db.definition("draft")).map(r => r.body.name), ["Planted"], "THE CONTROL: the write landed in this tab's own draft");
+  await assert.rejects(() => db.definition("draft", "Not An App"), /app id/);
+  assert.deepEqual(await db.definitionApps(), [], "the tab's own (unnamed) draft was listed as an app of a tree");
+});
+
 if (failures) { process.stdout.write(`\n${failures} failing\n`); process.exit(1); }
 process.stdout.write("\nall passing\n");

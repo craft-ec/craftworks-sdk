@@ -66,7 +66,8 @@ export function wrap(raw) {
     async draftPut(key, body) { this.#db.draft_put(key, JSON.stringify(body)); }
     async draftDelete(key) { return this.#db.draft_delete(key); }
     async publishDefinition() { return this.#db.publish_definition(); }
-    async definition(which) { return JSON.parse(this.#db.definition(which)); }
+    async definitionApps() { return JSON.parse(this.#db.definition_apps()); }
+    async definition(which, app) { return JSON.parse(this.#db.definition(which, app ?? undefined)); }
     async markPublished(domain) { return JSON.parse(this.#db.mark_published(domain)); }
     async isPublished(domain) { return this.#db.is_published(domain); }
     async scan(domain, { reverse = false, limit = 0, after = "" } = {}) {

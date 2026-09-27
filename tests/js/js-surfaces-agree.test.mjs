@@ -53,7 +53,7 @@ const fakeRaw = () => ({
       define() {}, schema: () => "null", domains: () => "[]",
       put: () => "{}", create_at: () => "{}", update: () => "{}", get: () => "null", delete: () => false,
       scan: () => "[]", count: () => 0, root: () => "", stats: () => "{}",
-      draft_put() {}, draft_delete: () => false, publish_definition: () => 0, definition: () => "[]",
+      draft_put() {}, draft_delete: () => false, publish_definition: () => 0, definition: () => "[]", definition_apps: () => "[]",
       mark_published: () => "{}", is_published: () => false,
     };
   },
@@ -65,7 +65,7 @@ const fakeSession = () => ({
     schema: () => "null", domains: () => "[]", put: () => "{}", create_at: () => "{}", update: () => "{}",
     get: () => "null", delete: () => false, scan: () => "[]", count: () => 0,
     root: () => "", stats: () => "{}", define: () => undefined,
-    draft_put: () => undefined, draft_delete: () => false, publish_definition: () => 0, definition: () => "[]",
+    draft_put: () => undefined, draft_delete: () => false, publish_definition: () => 0, definition: () => "[]", definition_apps: () => "[]",
     mark_published: () => "{}", is_published: () => false,
     preload: () => 0, trace: () => "null", trace_on: () => undefined,
     take_loads: () => "[]", take_stale: () => "[]", live_mode: () => "{}",

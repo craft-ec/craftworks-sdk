@@ -388,7 +388,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     // THE DEFINITION DOORS (app-as-data P2, ARCHITECTURE §19): the app's definition, as data in its reserved
     // domains, written ONLY here (an ordinary write naming one is refused). `key`: `meta`, `c/<id>` or `d/<domain>`.
     // `publishDefinition` makes the published definition equal the draft in ONE write; `definition("draft" | "app")`
-    // reads `[{ key, body }]`. `markPublished` / `isPublished`: the builder's per-domain live marker, until P5.
+    // reads `[{ key, body }]` (of another app too, read-only). `markPublished` / `isPublished`: the builder's per-domain live marker, until P5.
     async draftPut(key, body) {
       return once(() => session.draft_put(key, JSON.stringify(body)));
     },
@@ -398,7 +398,10 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     async publishDefinition() {
       return once(() => session.publish_definition());
     },
-    definition: which => once(() => JSON.parse(session.definition(which))),
+    // `app`: ANOTHER app's definition in this tree, read-only (§19 P3: the builder's project list); absent, this one's.
+    // The apps of this tree that hold a draft (§19 P3b: the builder's project list), by id. A read.
+    definitionApps: () => once(() => JSON.parse(session.definition_apps())),
+    definition: (which, app) => once(() => JSON.parse(session.definition(which, app ?? undefined))),
     async markPublished(domain) {
       return once(() => JSON.parse(session.mark_published(domain)));
     },

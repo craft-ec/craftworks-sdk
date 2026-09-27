@@ -310,9 +310,14 @@ impl Db {
     pub fn publish_definition(&mut self) -> Result<u32, JsError> {
         self.0.publish_definition(None).map(|n| n as u32).map_err(err)
     }
-    pub fn definition(&mut self, which: &str) -> Result<String, JsError> {
+    /// The apps of this store that hold a draft (as a Session's): a read.
+    pub fn definition_apps(&mut self) -> Result<String, JsError> {
+        json(&self.0.definition_apps().map_err(err)?)
+    }
+    /// `app`: another app's definition, READ-only (as a Session's); absent, this tab's own.
+    pub fn definition(&mut self, which: &str, app: Option<String>) -> Result<String, JsError> {
         let which = session::definition_of(which).map_err(err)?;
-        json(&session::definition_json(self.0.definition(None, which).map_err(err)?))
+        json(&session::definition_json(self.0.definition(app.as_deref(), which).map_err(err)?))
     }
     pub fn mark_published(&mut self, domain: &str) -> Result<String, JsError> {
         json(&self.0.mark_published(None, domain).map_err(err)?)
