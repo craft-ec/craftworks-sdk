@@ -662,7 +662,9 @@ impl Session {
     /// it (rule 8).
     /// [`Session::put_status`] says where it stands, matched by this key.
     /// **An ack is not durability:** a publisher that must know reads it back.
-    pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
+    /// PRIVATE (§19 P5, the one-door control): an app holds the raw Session, so an exported PUT of ANY contract would
+    /// be a second publishing door; the one export that reaches it is [`Session::put_piece`].
+    fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
         let (key, contract, state) = wire::puts::contract(&code, &params, &state);
         let Some(p) = self.page_mut() else {
             return Err(JsValue::from_str("provision first — there is no path to the node before it"));
@@ -672,19 +674,23 @@ impl Session {
         Ok(key)
     }
 
-    /// PUBLISH `web` as `app`'s SITE (builder#117) and return its LINK: the site contract's instance id, the
-    /// same for every publish (`site_link`). The page reads the site, has the signer sign the next version
-    /// through the one head path, PUTs it and reads it back; [`Session::site_status`] says how it ends. `code`
-    /// is the site contract's (`pkg/web/site.wasm`). A reader, or a label that is no app id, is refused by name.
-    pub fn publish_site(&mut self, app: &str, code: Vec<u8>, web: Vec<u8>) -> Result<String, JsValue> {
-        let Some(p) = self.page_mut() else {
-            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
-        };
-        // The page-io refusals first (a reader, no Register named yet, a bad app id), each by name.
-        p.publish_site(app, &code, web, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
-        let link = p.site_link(&code, app).expect("a site page-io just published has a link");
-        self.pump_page();
-        Ok(link)
+    /// PUT ONE LOAD PIECE back (the loader's repair, js/pieces.js `repairPieces`; sdk#347) -- the only piece-PUT door
+    /// (§19 P5), and it can publish NOTHING else:
+    /// * the CODE must be this build's `webapp` contract (its sha256, `craftworks_sdk::WEBAPP_HASH`), refused by name
+    ///   otherwise -- never a caller's contract;
+    /// * the CONTAINER is framed HERE around the raw `piece` (`wire::webapp::piece_container`, the one owner): it holds
+    ///   exactly one file, `piece`, so no page (`index.html`) can ever go up through this door, whatever the bytes;
+    /// * its params are derived from that container (`wire::webapp::params`): content-addressed.
+    /// [`Session::put_status`] says where it stands, matched by the key it returns.
+    pub fn put_piece(&mut self, webapp_code: Vec<u8>, piece: Vec<u8>) -> Result<String, JsValue> {
+        use sha2::Digest;
+        let got = format!("sha256:{}", core_types::hex::encode(&sha2::Sha256::digest(&webapp_code)));
+        if got != craftworks_sdk::WEBAPP_HASH {
+            return Err(JsValue::from_str(&format!("put_piece: not this build's webapp code ({got}, not {}): a piece is PUT under the SDK's own webapp contract only", craftworks_sdk::WEBAPP_HASH)));
+        }
+        let state = wire::webapp::piece_container(&piece).map_err(|e| JsValue::from_str(&e))?;
+        let params = wire::webapp::params(&state).to_vec();
+        self.put_contract(webapp_code, params, state)
     }
 
     /// `app`'s site LINK under the site contract `code`, published or not: `null`-like error when there is no
@@ -747,55 +753,6 @@ impl Session {
         .to_string()
     }
 
-    /// How `app`'s site publication stands, as JSON
-    /// `{"state":"none"|"publishing"|"published"|"superseded"|"refused"|"cancelled","version":N,"said":"…"}`.
-    /// `published`: the read-back shows this publication at `version`. `superseded`: another publication is live
-    /// at `version` (another device, or a later one): reported, never overwritten; publishing again is the
-    /// person's act. It ends only on an answer or a cancel (rule 8). `said` is display only.
-    pub fn site_status(&self, app: &str) -> String {
-        use page::Publication as P;
-        let publication = self.page().and_then(|p| p.publication(app));
-        let (state, version, said) = match &publication {
-            None => (SiteStatus::None, 0, ""),
-            Some(P::Publishing { waiting_for }) => (SiteStatus::Publishing, 0, waiting_for.unwrap_or("")),
-            Some(P::Published { version }) => (SiteStatus::Published, *version, ""),
-            Some(P::Superseded { version }) => (SiteStatus::Superseded, *version, ""),
-            Some(P::Refused(w)) => (SiteStatus::Refused, 0, w.as_str()),
-            Some(P::Cancelled) => (SiteStatus::Cancelled, 0, ""),
-        };
-        serde_json::json!({ "state": state.code(), "version": version, "said": said }).to_string()
-    }
-
-    /// CREATE (OR UPGRADE) AN APP'S SITE and return its LINK (ARCHITECTURE §19's bootstrap; app-as-data P4): the
-    /// site holds the build's STARTER (`starter`: its loader, decoder and starter modules, as an `AppContainer`) and
-    /// the POINTER the SDK composes from this session's register params and `app` -- never an app version (the app is
-    /// data in the tree, through its definition doors). Written at an app's first Publish and on a platform upgrade
-    /// (the builder's decision). The build's ONE piece `set` is PUT first -- JSON `{"name","k","m","pieces":[{"address",
-    /// "sha256"}]}` (the build's pieces.json), `piece_states` its pieces' web container states in order, under
-    /// `webapp_code` -- and the site sent once the set has `k` acked. [`Session::app_publish_status`] says how it
-    /// stands; the builder waits for `published` (the site read back), never for every piece.
-    pub fn publish_app(&mut self, app: &str, set: &str, webapp_code: Vec<u8>, piece_states: js_sys::Array, site_code: Vec<u8>, starter: &crate::AppContainer) -> Result<String, JsValue> {
-        let set = parse_piece_set(set).map_err(|e| JsValue::from_str(&e))?;
-        let states: Vec<Vec<u8>> = piece_states.iter().map(|v| js_sys::Uint8Array::new(&v).to_vec()).collect();
-        if states.len() != set.pieces.len() {
-            return Err(JsValue::from_str(&format!("publish_app: {} piece states for the {} pieces set {} names", states.len(), set.pieces.len(), set.name)));
-        }
-        let containers = states
-            .iter()
-            .map(|state| {
-                let (_, contract, state) = wire::puts::contract(&webapp_code, &wire::webapp::params(state), state);
-                (contract, state)
-            })
-            .collect();
-        let Some(p) = self.page_mut() else {
-            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
-        };
-        p.publish_app(app, (set, containers), starter.files(), &site_code, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
-        let link = p.site_link(&site_code, app).expect("a site page-io just took for publishing has a link");
-        self.pump_page();
-        Ok(link)
-    }
-
     /// How `app`'s publish stands, as JSON `{"state","version","sets":[{"name","acked","refused","of","k"}],"said"}`.
     /// `state` is sdk#523's `AppPublishStatus` word (`sdk.status.appPublish`): `none`, `pieces`, `siting`, `published`
     /// (the site read back: the app is up), `backed_up` (every piece acked), `backup_abandoned`, `refused`,
@@ -831,13 +788,6 @@ impl Session {
             p.cancel_app_publish(app);
         }
         self.pump_page();
-    }
-
-    /// A PERSON cancels `app`'s site publication (named `cancelled`).
-    pub fn cancel_site(&mut self, app: &str) {
-        if let Some(p) = self.page_mut() {
-            p.cancel_site(app);
-        }
     }
 
     /// Open a VIEW of somebody's PUBLISHED head (sdk#239): the Register whose
@@ -1170,9 +1120,35 @@ impl Session {
     pub fn publish_definition_site(&mut self, set: &str, webapp_code: Vec<u8>, piece_states: js_sys::Array, site_code: Vec<u8>, starter: &crate::AppContainer) -> Result<String, JsValue> {
         let changed = self.publish_definition()?;
         let app = self.door_app()?;
-        let link = self.publish_app(&app, set, webapp_code, piece_states, site_code, starter)?;
+        let link = self.create_site(&app, set, webapp_code, piece_states, site_code, starter)?;
         Ok(serde_json::json!({ "changed": changed, "link": link }).to_string())
     }
+
+    /// CREATE (OR UPGRADE) `app`'s SITE (ARCHITECTURE §19's bootstrap; app-as-data P4): the build's ONE piece `set`
+    /// PUT, then the STARTER plus the SDK's pointer sent at `k`. PRIVATE: reached only through
+    /// [`Session::publish_definition_site`], the one site write (§19 P5) -- no other door writes a site.
+    fn create_site(&mut self, app: &str, set: &str, webapp_code: Vec<u8>, piece_states: js_sys::Array, site_code: Vec<u8>, starter: &crate::AppContainer) -> Result<String, JsValue> {
+        let set = parse_piece_set(set).map_err(|e| JsValue::from_str(&e))?;
+        let states: Vec<Vec<u8>> = piece_states.iter().map(|v| js_sys::Uint8Array::new(&v).to_vec()).collect();
+        if states.len() != set.pieces.len() {
+            return Err(JsValue::from_str(&format!("the site: {} piece states for the {} pieces set {} names", states.len(), set.pieces.len(), set.name)));
+        }
+        let containers = states
+            .iter()
+            .map(|state| {
+                let (_, contract, state) = wire::puts::contract(&webapp_code, &wire::webapp::params(state), state);
+                (contract, state)
+            })
+            .collect();
+        let Some(p) = self.page_mut() else {
+            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
+        };
+        p.publish_app(app, (set, containers), starter.files(), &site_code, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
+        let link = p.site_link(&site_code, app).expect("a site page-io just took for publishing has a link");
+        self.pump_page();
+        Ok(link)
+    }
+
 
     /// The definition `which` holds -- `"draft"` or `"app"` -- as `[{ key, body, bytes? }]` (a file's bytes a
     /// `Uint8Array`). `app`: ANOTHER app of this

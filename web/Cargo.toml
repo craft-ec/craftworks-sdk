@@ -12,6 +12,8 @@ crate-type = ["cdylib"]
 [dependencies]
 core-types = { path = "../core-types" }
 craftworks-sdk = { path = ".." }
+# put_piece checks the webapp code against the build's sha256 (hashes.toml).
+sha2 = { version = "0.10", default-features = false }
 wire = { path = "../wire" }
 # The load pieces (sdk#347): a loader that rebuilt the SDK re-derives a missing piece to PUT it back.
 pieces = { path = "../pieces" }

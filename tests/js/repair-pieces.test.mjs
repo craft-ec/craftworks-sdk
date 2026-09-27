@@ -46,7 +46,7 @@ await t("the native tool's pieces ARE the frozen vectors (one implementation, tw
 
 function session() {
   const puts = [];
-  return { puts, put_contract: (code, params, state) => { puts.push({ code, params, state }); return `key-${puts.length}`; } };
+  return { puts, put_piece: (code, piece) => { puts.push({ code, piece }); return `key-${puts.length}`; } };
 }
 
 await t("**only the pieces answered NOT HELD and not got are PUT back** — never one the race cancelled at k — each byte-identical to the tool's container", async () => {
@@ -60,8 +60,10 @@ await t("**only the pieces answered NOT HELD and not got are PUT back** — neve
   assert.ok(done.every(d => d.put), JSON.stringify(done));
   for (const [j, i] of [1, 5, 12].entries()) {
     const put = s.puts[j];
-    assert.ok(Buffer.from(put.state).equals(readFileSync(join(out, `piece-${i}.webapp`))), `piece ${i}: not the tool's container`);
-    assert.equal(sdk.webapp.address(webappCode, put.state), spec.pieces[i].address);
+    // put_piece takes the RAW piece and frames it itself (the SDK's one framing): framed the same way, it is the tool's.
+    const state = sdk.pieces.container(put.piece);
+    assert.ok(Buffer.from(state).equals(readFileSync(join(out, `piece-${i}.webapp`))), `piece ${i}: not the tool's container`);
+    assert.equal(sdk.webapp.address(webappCode, state), spec.pieces[i].address);
     assert.ok(Buffer.from(put.code).equals(webappCode));
   }
 });
