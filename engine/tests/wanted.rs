@@ -165,7 +165,7 @@ fn a_released_parked_writes_needs_are_unwanted() {
     let mut released = Vec::new();
     for t in 1..=10_000u64 {
         let out = e.step(Event::Tick(1_000 + t));
-        if out.iter().any(|f| matches!(f, Effect::Notify { state: engine::State::Failed, .. })) {
+        if out.iter().any(|f| matches!(f, Effect::Notify { state: engine::State::Failed { why: engine::FailWhy::SilentRelease }, .. })) {
             released = out;
             break;
         }

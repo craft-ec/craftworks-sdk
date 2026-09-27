@@ -21,6 +21,7 @@ fn every_terminal_state_ends_the_wait() {
     let terminal = [
         WriteState::Busy,
         WriteState::Failed,
+        WriteState::FailedWhy { why: protocol::FailWhy::SilentRelease },
         WriteState::Lost,
         WriteState::Conflict,
         WriteState::Unread,

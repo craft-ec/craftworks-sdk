@@ -60,7 +60,7 @@ fn a_final_head_refusal_ends_the_commit_failed_at_once() {
     let mut h = harness();
     let seq = heading(&mut h, 1);
     let fx = h.step(Event::HeadRefused { seq });
-    assert_eq!(told(&fx, 1), vec![State::Failed], "the refused commit's write was not Failed at once: {:?}", told(&fx, 1));
+    assert_eq!(told(&fx, 1), vec![State::Failed { why: engine::FailWhy::SignerRefused }], "the refused commit's write was not Failed at once, as the signer's refusal: {:?}", told(&fx, 1));
     let next = h.step(write(2, small(2)));
     assert!(next.iter().any(|f| matches!(f, Effect::PutBlock { .. } | Effect::PutPack { .. })), "the engine was not released: the next write did not commit");
 }
@@ -161,7 +161,7 @@ fn a_refused_commits_unconfirmed_members_and_parity_are_withdrawn() {
     let withdrawn: Vec<freenet_prolly::Cid> = out.iter().filter_map(|f| if let Effect::Withdraw { id } = f { Some(*id) } else { None }).collect();
     let missed: Vec<&freenet_prolly::Cid> = asked.iter().filter(|m| !withdrawn.contains(m)).collect();
     assert!(missed.is_empty(), "{} ConfirmHeld ask(s) of the refused commit were left out: {missed:?}", missed.len());
-    assert!(out.iter().any(|f| matches!(f, Effect::Notify { state: State::Failed, .. })), "THE SETUP: the refusal did not end the commit");
+    assert!(out.iter().any(|f| matches!(f, Effect::Notify { state: State::Failed { why: engine::FailWhy::SignerRefused }, .. })), "THE SETUP: the refusal did not end the commit");
     let mut later = Vec::new();
     for t in 1..=2_000u64 {
         later.extend(e.step(Event::Tick(T0 + t)));

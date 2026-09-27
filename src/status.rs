@@ -131,7 +131,8 @@ impl PassOutcome {
 }
 
 /// Every list, as the JSON `status_words` exports: `{"rowState":[..], "putStatus":[..], "siteStatus":[..],
-/// "appPublishStatus":[..], "canWrite":[..], "asked":[..], "groupHealth":[..], "repairOutcome":[..]}` (groupHealth the engine's, sdk#524).
+/// "appPublishStatus":[..], "canWrite":[..], "asked":[..], "groupHealth":[..], "repairOutcome":[..], "failWhy":[..]}`
+/// (groupHealth and failWhy the engine's: sdk#524, and why a write `Failed`, sdk#500).
 pub fn words() -> serde_json::Value {
     fn list<T: Copy>(all: &[T], code: fn(T) -> &'static str) -> Vec<&'static str> {
         all.iter().map(|w| code(*w)).collect()
@@ -145,6 +146,7 @@ pub fn words() -> serde_json::Value {
         "asked": list(&AskedState::ALL, AskedState::code),
         "groupHealth": list(&engine::repair::GroupHealth::ALL, engine::repair::GroupHealth::code),
         "repairOutcome": list(&RepairOutcome::ALL, RepairOutcome::code),
+        "failWhy": list(&engine::FailWhy::ALL, engine::FailWhy::code),
     })
 }
 
@@ -157,7 +159,7 @@ mod tests {
     #[test]
     fn words_is_every_enum_s_all_each_word_once() {
         let v = words();
-        let want: [(&str, Vec<&str>); 8] = [
+        let want: [(&str, Vec<&str>); 9] = [
             ("rowState", RowState::ALL.iter().map(|w| w.code()).collect()),
             ("putStatus", PutStatus::ALL.iter().map(|w| w.code()).collect()),
             ("siteStatus", SiteStatus::ALL.iter().map(|w| w.code()).collect()),
@@ -166,6 +168,7 @@ mod tests {
             ("asked", AskedState::ALL.iter().map(|w| w.code()).collect()),
             ("groupHealth", engine::repair::GroupHealth::ALL.iter().map(|w| w.code()).collect()),
             ("repairOutcome", RepairOutcome::ALL.iter().map(|w| w.code()).collect()),
+            ("failWhy", engine::FailWhy::ALL.iter().map(|w| w.code()).collect()),
         ];
         assert_eq!(v.as_object().map(|o| o.len()), Some(want.len()), "words() carries a list no enum owns: {v}");
         for (name, list) in want {

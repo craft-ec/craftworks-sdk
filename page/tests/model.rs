@@ -1114,7 +1114,7 @@ fn check(apps: &mut [App], i: usize, node: &Node, seen: &mut Seen, now: u64, hel
                     seen.published += 1;
                 }
             }
-            State::Lost | State::Busy | State::Failed | State::TooLarge { .. } => {
+            State::Lost | State::Busy | State::Failed { .. } | State::TooLarge { .. } => {
                 if state == State::Lost {
                     // ONLY A CONFIRMED WINNER IS ADOPTED (the architect's
                     // attack on sdk#225, case 1): the head this page now

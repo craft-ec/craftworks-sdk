@@ -100,7 +100,7 @@ fn a_write_is_one_frame_with_its_reads_and_is_never_sent_again() {
         },
         other => panic!("{other:?}"),
     }
-    for fate in [Fate::Lost, Fate::Failed] {
+    for fate in [Fate::Lost, Fate::Failed { why: engine::FailWhy::TreeDamaged, signer: None }] {
         s.on_fate(id, fate);
     }
     assert!(s.take_outbound().is_empty(), "an ended write went on the wire again");
@@ -139,7 +139,7 @@ fn a_conflicted_write_leaves_none_of_its_own_keys_pending() {
 #[test]
 fn an_own_writes_end_names_its_keys_once() {
     let both = vec![b"a/1".to_vec(), b"a/2".to_vec()];
-    for fate in [Fate::Published { seq: 1, backed_up: false }, Fate::Lost, Fate::Failed] {
+    for fate in [Fate::Published { seq: 1, backed_up: false }, Fate::Lost, Fate::Failed { why: engine::FailWhy::TreeDamaged, signer: None }] {
         let mut s = writes();
         let edits = vec![(b"a/1".to_vec(), Edit::Put(b"v1".to_vec())), (b"a/2".to_vec(), Edit::Put(b"v2".to_vec()))];
         let id = s.make(&[(b"a/1".to_vec(), protocol::Expect::Absent), (b"a/2".to_vec(), protocol::Expect::Absent)], &edits).expect("made");

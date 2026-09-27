@@ -97,7 +97,7 @@ fn a_record_reports_its_own_write_both_before_and_after_it_lands() {
 /// written again.
 #[test]
 fn a_write_that_ended_unpublished_is_not_reported_as_saved() {
-    for fate in [page::fates::Fate::Failed, page::fates::Fate::Lost, page::fates::Fate::Conflict { key: b"d\0note\0x".to_vec(), current: None, after: None }] {
+    for fate in [page::fates::Fate::Failed { why: engine::FailWhy::TreeDamaged, signer: None }, page::fates::Fate::Lost, page::fates::Fate::Conflict { key: b"d\0note\0x".to_vec(), current: None, after: None }] {
         let mut w = craftworks_sdk::Writes::new(Box::new(|| 0));
         let key = b"d\0note\0x".to_vec();
         let edit = [(key.clone(), craftworks_sdk::Edit::Put(b"v".to_vec()))];

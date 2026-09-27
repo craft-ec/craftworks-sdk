@@ -59,7 +59,9 @@ pub struct Conflicted {
 /// is told by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ended {
-    Failed,
+    /// Nothing of it is in the tree, for the cause named (sdk#500); `signer`:
+    /// the signer's own why beside `SignerRefused`.
+    Failed { why: engine::FailWhy, signer: Option<String> },
     Lost,
     ForcedLost,
     TooLarge { bound: engine::WriteBound, limit: usize, got: usize },
@@ -237,7 +239,7 @@ impl Writes {
                 return;
             }
             Fate::TooLarge { bound, limit, got } => Ended::TooLarge { bound, limit, got },
-            Fate::Failed => Ended::Failed,
+            Fate::Failed { why, signer } => Ended::Failed { why, signer },
             Fate::Lost if forced => Ended::ForcedLost,
             Fate::Lost => Ended::Lost,
             // May have landed: NOT rolled back (its row still shows it).

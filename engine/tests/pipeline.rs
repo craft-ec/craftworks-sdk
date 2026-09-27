@@ -72,7 +72,7 @@ pub fn valid_sequence(states: &[State]) -> bool {
     ];
     let mut at = 0usize;
     for (i, s) in states.iter().enumerate() {
-        if matches!(s, State::Failed | State::Lost | State::Busy) {
+        if matches!(s, State::Failed { .. } | State::Lost | State::Busy) {
             return i + 1 == states.len();
         }
         match HAPPY[at..].iter().position(|h| h == s) {

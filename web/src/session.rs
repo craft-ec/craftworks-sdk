@@ -1522,7 +1522,12 @@ impl Session {
                         forced_lost.push(id);
                         ("LOST", format!("write {id} was forced past its reads and was lost; it was not sent again, because a forced write cannot be re-checked"), serde_json::json!({}))
                     }
-                    E::Failed => ("FAILED", format!("write {id} could not be saved"), serde_json::json!({})),
+                    // sdk#500: the cause, in the ONE list's words (`status.failWhy`), and the signer's own why beside a refusal.
+                    E::Failed { why, signer } => (
+                        "FAILED",
+                        format!("write {id} could not be saved: {}{}", why.says(), signer.as_deref().map(|s| format!(" ({s})")).unwrap_or_default()),
+                        serde_json::json!({ "reason": why.code(), "signer": signer }),
+                    ),
                     E::Unknown => ("UNKNOWN", format!("write {id} may or may not have been saved (its confirmation was lost); check it"), serde_json::json!({})),
                     E::TooLarge { limit, got, .. } => ("TOO_LARGE", format!("write {id} is over the engine's limit ({got} against {limit}); split it into smaller writes"), serde_json::json!({ "limit": limit, "got": got })),
                 };

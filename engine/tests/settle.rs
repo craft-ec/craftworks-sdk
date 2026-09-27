@@ -110,7 +110,7 @@ fn a_silent_racing_commit_is_not_re_put_on_a_clock_and_publishes_when_its_puts_l
     }
     let (_, fx) = tick_until(&mut h, 0, 20 * p.reask_after, 1);
     assert!(puts(&fx).is_empty(), "the engine re-put on a clock: {} PUTs", puts(&fx).len());
-    assert!(!told(&fx, 1).iter().any(|s| matches!(s, State::Lost | State::Failed)), "silence ended the write: {:?}", told(&fx, 1));
+    assert!(!told(&fx, 1).iter().any(|s| matches!(s, State::Lost | State::Failed { .. })), "silence ended the write: {:?}", told(&fx, 1));
     let resent: Vec<Effect> = sent.iter().map(|id| Effect::PutBlock { id: *id, bytes: Vec::new(), after: Vec::new() }).collect();
     let all = answer(&mut h, resent);
     assert!(told(&all, 1).contains(&State::Published), "{:?}", told(&all, 1));
@@ -132,7 +132,7 @@ fn a_silent_racing_commit_of_large_ops_is_never_lost_and_the_next_write_queues()
     // Taken into the queue (its path may be cold -- the commit's blocks never reached the node -- so it may wait
     // `Applying`): never refused.
     let next = h.step(write(2, small()));
-    assert!(!told(&next, 2).iter().any(|s| matches!(s, State::Busy | State::Failed | State::Lost)), "the next write was refused: {:?}", told(&next, 2));
+    assert!(!told(&next, 2).iter().any(|s| matches!(s, State::Busy | State::Failed { .. } | State::Lost)), "the next write was refused: {:?}", told(&next, 2));
     assert_eq!(h.engine().queued_writes(), 2, "the next write was not taken into the queue");
 }
 
