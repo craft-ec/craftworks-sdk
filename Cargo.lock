@@ -238,11 +238,20 @@ dependencies = [
 [[package]]
 name = "craftec-register-contract"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-contracts?rev=0fbb5c7#0fbb5c7c96b1a84653ea9c2e09d16e870c2a4486"
+source = "git+https://github.com/craft-ec/freenet-contracts?rev=689ca61#689ca6190b810362ff30b1b293d9ca8f033b5312"
 dependencies = [
  "blake3",
  "ed25519-dalek",
  "freenet-stdlib",
+]
+
+[[package]]
+name = "craftec-tail-contract"
+version = "0.1.0"
+source = "git+https://github.com/craft-ec/freenet-contracts?rev=689ca61#689ca6190b810362ff30b1b293d9ca8f033b5312"
+dependencies = [
+ "blake3",
+ "craftec-register-contract",
 ]
 
 [[package]]
@@ -1134,6 +1143,8 @@ dependencies = [
  "blake3",
  "contract-keys",
  "core-types",
+ "craftec-register-contract",
+ "craftec-tail-contract",
  "craftworks-sdk",
  "curve25519-dalek",
  "ed25519-dalek",
@@ -1150,6 +1161,7 @@ dependencies = [
  "serde_json",
  "signer",
  "signer-proto",
+ "tail",
  "tokio",
  "tokio-tungstenite",
  "wire",
@@ -1590,6 +1602,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tail"
+version = "0.1.0"
+dependencies = [
+ "craftec-register-contract",
+ "craftec-tail-contract",
+ "ed25519-dalek",
+ "freenet-prolly",
 ]
 
 [[package]]
