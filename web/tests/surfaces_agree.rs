@@ -155,6 +155,9 @@ const TRANSPORT_ONLY: &[&str] = &[
     "bind_definition",
     "rendered_definition",
     "unbind_definition",
+    // The definition's write AND the app's SITE in one call (#560, `publishDefinition({ site })`): the site is PUT to a
+    // node. An in-tab db has no node, and its `publishDefinition` refuses a site by name.
+    "publish_definition_site",
     // The NAME of what a binding watches — a domain, or one parent's band
     // (sdk#137). Session bookkeeping for `bind`, not a read of data.
     "watch_key",
