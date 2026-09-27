@@ -318,6 +318,24 @@ mod tests {
         SetProgress::new(PieceSet { name: name.into(), k, m, pieces }, (0..k + m).map(|i| format!("{name}-{i}")).collect())
     }
 
+    /// ONE KEY IN TWO PLACES (the architect on sdk#542: first-match by id is the defect twice): identical pieces are
+    /// one node key, so a set can list it twice and two sets can share it -- an answer for that key answers EVERY
+    /// place. Acked: both of the set's slots and the other set's are acked; refused: likewise.
+    #[test]
+    #[should_panic(expected = "an answer for a repeated key marked")] // PINNED: flipped by the fix
+    fn an_answer_for_a_repeated_key_marks_every_place_it_is_listed() {
+        let mut a = set("a", 2, 1);
+        a.keys[2] = a.keys[0].clone();
+        let mut b = set("b", 2, 1);
+        b.keys[1] = a.keys[0].clone();
+        let key = a.keys[0].clone();
+        for acked in [true, false] {
+            let sets = mark(&[a.clone(), b.clone()], &key, acked).expect("a set names the key");
+            let marks = |s: &SetProgress| if acked { s.acked.clone() } else { s.refused.clone() };
+            assert_eq!((marks(&sets[0]), marks(&sets[1])), (vec![true, false, true], vec![false, true, false]), "an answer for a repeated key marked only its first place (acked = {acked})");
+        }
+    }
+
     /// `n` of `s`'s pieces acked, `r` refused (from the end).
     fn with(mut s: SetProgress, n: usize, r: usize) -> SetProgress {
         for i in 0..n {
