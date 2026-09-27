@@ -2871,3 +2871,94 @@ fn every_frame_kind_the_page_claims_is_decided_never_dropped() {
     assert!(io.inbound(&chunk, Ms(1)), "a chunk was not claimed");
     assert!(io.unusable().is_empty(), "a first chunk was reported: {:?}", io.unusable());
 }
+
+/// ONE FINALITY RULE for an app contract's PUT (a load piece, sdk#516), as for a block's (sdk#433): FINAL only in a
+/// contract's own validation words, KEYED or KEYLESS (the text form 0.2.136/0.2.138 send); any other words are
+/// transient -- reported, and the PUT stays pending, re-sent on its RTO. Before, a keyless refusal of an app PUT was
+/// never attributed (re-sent for ever) and a keyed one was final in ANY words. THE CONTROL: a keyless refusal naming
+/// a contract this page never PUT is counted unattributed and ends nothing.
+#[test]
+fn an_app_contracts_put_refusal_is_final_only_in_validation_words_keyed_or_keyless() {
+    use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
+    let node = WireNode::new(&[7u8; 32]);
+    let keyed = |key: ContractKey, cause: &str| {
+        let e: Err = ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key, cause: cause.to_string().into() })).into();
+        bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes")
+    };
+    let validation = wire::VALIDATION_REFUSED[1];
+    let other = "execution error: the contract's host is busy";
+    assert!(wire::is_validation_refusal(validation) && !wire::is_validation_refusal(other), "THE SETUP: the words are not the rule's two kinds");
+    for (form, words, fin) in [("keyed", validation, true), ("keyed", other, false), ("keyless", validation, true), ("keyless", other, false)] {
+        let mut io = page_io(&node);
+        let (key, c, s) = wire::puts::contract(b"a load piece", format!("{form} {words}").as_bytes(), b"s");
+        io.put_contract(c.clone(), s, Ms(1)).expect("frames");
+        let frame = if form == "keyed" { keyed(c.key(), words) } else { put_error_text(key.clone(), words) };
+        assert!(io.inbound(&frame, Ms(2)), "{form} {words:?}: the refusal of the page's own app PUT was not taken");
+        let now = io.app_put(&key).cloned();
+        if fin {
+            assert_eq!(now, Some(page::AppPut::Refused(words.into())), "{form}: a validation refusal did not END the app PUT");
+        } else {
+            assert_eq!(now, Some(page::AppPut::Pending), "{form}: a transient refusal ended the app PUT");
+            assert!(io.unusable().iter().any(|l| l.contains(other)), "{form}: a transient refusal was not reported: {:?}", io.unusable());
+        }
+        assert!(io.take_others().is_empty(), "{form}: the page's own refusal was handed back as somebody else's");
+    }
+    // THE CONTROL: a keyless refusal naming no PUT of this page is counted, and ends nothing.
+    let mut io = page_io(&node);
+    let (stranger, _, _) = wire::puts::contract(b"a load piece", b"never put here", b"s");
+    io.inbound(&put_error_text(stranger, validation), Ms(3));
+    assert_eq!(io.node_errors().get("put_error_unattributed"), Some(&1), "a refusal of nothing of ours was attributed");
+}
+
+/// THE SITE TAKES THE ONE FINALITY RULE (sdk#516, main): its FIRST PUT is refused, keyed or keyless, in validation
+/// words or other words. Validation words END the publication (`Refused`, in the node's words); other words are
+/// transient -- reported, and the site's PUT is re-sent on its RTO until the node takes it (`Published`). Before, a
+/// keyed site refusal ended the publication in ANY words, and a keyless one was never attributed. THE CONTROL: every
+/// case refused exactly one PUT (so a publication that never PUT cannot pass).
+#[test]
+fn a_sites_put_refusal_is_final_only_in_validation_words_keyed_or_keyless() {
+    use freenet_stdlib::client_api::{ContractError, ErrorKind, RequestError};
+    let validation = wire::VALIDATION_REFUSED[1];
+    let other = "execution error: the contract's host is busy";
+    for (form, words, fin) in [("keyed", validation, true), ("keyed", other, false), ("keyless", validation, true), ("keyless", other, false)] {
+        let mut node = WireNode::new(&[3u8; 32]);
+        let mut io = page_io(&node);
+        let mut now = 1_000;
+        io.publish_site(APP, SITE_CODE, web(1), Ms(now)).expect("publishes");
+        let site = page_io::site_contract(SITE_CODE, &node.register_params, APP).expect("site").key();
+        let mut refuses = 0;
+        for _ in 0..400 {
+            now += 250;
+            io.tick(Ms(now));
+            for f in io.take_frames() {
+                let req: ClientRequest = bincode::deserialize(&f).expect("a request");
+                let answer = match req {
+                    ClientRequest::ContractOp(ContractRequest::Put { contract, .. }) if contract.key() == site && refuses == 0 => {
+                        refuses += 1;
+                        Some(if form == "keyed" {
+                            let e: Err = ErrorKind::RequestError(RequestError::ContractError(ContractError::Put { key: site, cause: words.into() })).into();
+                            bincode::serialize(&Err::<HostResponse, Err>(e)).expect("encodes")
+                        } else {
+                            put_error_text(site.to_string(), words)
+                        })
+                    }
+                    _ => node.serve(&f),
+                };
+                if let Some(a) = answer {
+                    io.inbound(&a, Ms(now));
+                }
+            }
+            if matches!(io.publication(APP), Some(page::Publication::Refused(_) | page::Publication::Published { .. })) {
+                break;
+            }
+        }
+        assert_eq!(refuses, 1, "{form} {words:?}: THE CONTROL: not exactly one site PUT was refused");
+        if fin {
+            assert!(matches!(io.publication(APP), Some(page::Publication::Refused(w)) if w.contains(words)), "{form}: a validation refusal did not END the publication: {:?}", io.publication(APP));
+        } else {
+            assert!(matches!(io.publication(APP), Some(page::Publication::Published { .. })), "{form}: a transient refusal was not re-sent to Published: {:?}", io.publication(APP));
+            assert!(io.unusable().iter().any(|l| l.contains(other)), "{form}: a transient site refusal was not reported: {:?}", io.unusable());
+        }
+        assert!(io.take_others().is_empty(), "{form}: the site's refusal was handed back as somebody else's");
+    }
+}

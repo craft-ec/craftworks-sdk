@@ -330,6 +330,15 @@ pub struct PageIo {
     signer_container: Option<DelegateContainer>,
 }
 
+/// A PUT of ours a node refusal names (sdk#516): the one finality rule, [`PageIo::put_refused`], decides it.
+enum Refused {
+    Block(Cid),
+    /// An app contract's PUT (`put_contract`: a load piece, a container), by its key.
+    App(String),
+    /// A site's PUT (its publication, builder#117), by its app.
+    Site(String),
+}
+
 /// The counter part of a reader's stream id; the top byte is its range.
 const STREAM_COUNTER: u32 = 0x00FF_FFFF;
 
@@ -1027,7 +1036,7 @@ impl PageIo {
             }
             Incoming::PutFailed { key, said } if self.site_by_key(&key).is_some() => {
                 let app = self.site_by_key(&key).expect("matched");
-                self.server.node(Answer::SiteRefused { app, said }, now)
+                self.put_refused(Refused::Site(app), said, now)
             }
             // The app's PUT: the page ends its deadline.
             Incoming::Ack(wire::AckKind::Put(key)) if self.app_contracts.contains_key(&key) => {
@@ -1035,41 +1044,24 @@ impl PageIo {
             }
             // A PUT answer nobody here sent: handed back unread.
             answer @ Incoming::Ack(wire::AckKind::Put(_)) => self.others.push(answer),
-            // OUR OWN BLOCK REJECTED by the node's Block contract (sdk#433): its words match a pinned validation
-            // refusal EXACTLY, so it is final -- `PutRefused { transient: false }`, never put again (rule 8).
-            Incoming::PutFailed { key, said } if self.by_key.contains_key(&key) && wire::is_validation_refusal(&said) => {
+            // A REFUSAL OF A PUT OF OURS, keyed or by the node's text (the keyless form 0.2.136/0.2.138 use, sdk#433),
+            // a block's or an app contract's (a piece, sdk#516): ONE finality rule, `put_refused`.
+            Incoming::PutFailed { key, said } if self.by_key.contains_key(&key) => {
                 let cid = self.by_key[&key];
-                self.unusable.push(format!(
-                    "the node's Block contract refused block {} as invalid (\"{said}\"): an encoding defect, or a node on another contract epoch",
-                    engine::short_id(&cid)
-                ));
-                self.server.node(Answer::PutRefused { id: cid, transient: false }, now)
+                self.put_refused(Refused::Block(cid), said, now)
             }
-            // THE NODE'S TEXT names a PUT (sdk#433, the keyless form 0.2.136/0.2.138 use): attributed ONLY to a PUT of
-            // ours on the wire; FINAL only for a pinned validation reason, else transient (the op stays waiting).
-            Incoming::PutFailedByText { key, said } => {
-                let ours = self.by_key.get(&key).copied().filter(|cid| self.server.page.put_waiting(cid));
-                match ours {
-                    Some(cid) if wire::is_validation_refusal(&said) => {
-                        self.unusable.push(format!(
-                            "the node's Block contract refused block {} as invalid (\"{said}\"): an encoding defect, or a node on another contract epoch",
-                            engine::short_id(&cid)
-                        ));
-                        self.server.node(Answer::PutRefused { id: cid, transient: false }, now)
-                    }
-                    Some(cid) => self.unusable.push(format!("the node refused block {}: {said}", engine::short_id(&cid))),
-                    // A string from the node never names an op this page does not have: counted, ends nothing.
-                    None => *self.node_errors.entry("put_error_unattributed").or_insert(0) += 1,
-                }
-            }
-            // Any other refusal of our own register or block is not known to be final: reported, and the op stays
-            // waiting -- re-sent on its RTO (sdk#431's pin), shown "not answering", the safe side.
-            Incoming::PutFailed { key, said } if key == self.register_key || self.by_key.contains_key(&key) => {
-                self.unusable.push(format!("the node refused: {said}"))
-            }
-            Incoming::PutFailed { key, said } if self.app_contracts.contains_key(&key) => {
-                self.server.node(Answer::AppPutRefused { key, said }, now)
-            }
+            Incoming::PutFailed { key, said } if self.app_contracts.contains_key(&key) => self.put_refused(Refused::App(key), said, now),
+            // A string from the node is attributed ONLY to a PUT of ours still on the wire.
+            Incoming::PutFailedByText { key, said } => match self.refused_by_text(&key) {
+                Some(whose) => self.put_refused(whose, said, now),
+                // It never names an op this page does not have: counted, ends nothing.
+                None => *self.node_errors.entry("put_error_unattributed").or_insert(0) += 1,
+            },
+            // OUR OWN REGISTER never takes the finality rule: a head update's fate is decided by its READ-BACK (sdk#225:
+            // the page reads the register and adopts only what it shows -- Published, or Lost to a writer that won),
+            // never by the PUT's answer. A refusal, validation words included (a stale seq another writer beat), is
+            // reported, and the op stays waiting -- re-sent on its RTO (sdk#431's pin) -- until the read-back decides.
+            Incoming::PutFailed { key, said } if key == self.register_key => self.unusable.push(format!("the node refused: {said}")),
             answer @ Incoming::PutFailed { .. } => self.others.push(answer),
             Incoming::EngineBytes(msgs) => {
                 for m in msgs {
@@ -1181,6 +1173,43 @@ impl PageIo {
         }
         self.pump();
         true
+    }
+
+    /// Which PUT of ours ON THE WIRE the node's keyless refusal text names: a block still waiting, or an app contract
+    /// (a piece) still pending. `None`: not ours, or already answered.
+    fn refused_by_text(&self, key: &str) -> Option<Refused> {
+        if let Some(cid) = self.by_key.get(key).copied().filter(|cid| self.server.page.put_waiting(cid)) {
+            return Some(Refused::Block(cid));
+        }
+        if self.app_contracts.contains_key(key) && matches!(self.server.page.app_put(key), Some(page::AppPut::Pending)) {
+            return Some(Refused::App(key.to_string()));
+        }
+        // A site whose publication is still in flight (its PUT is the page's `Update` of that site).
+        self.site_by_key(key).filter(|app| matches!(self.server.page.publication(app), Some(Publication::Publishing { .. }))).map(Refused::Site)
+    }
+
+    /// THE ONE FINALITY RULE for a refusal of a PUT of ours (sdk#516; #433 for blocks): FINAL only in a contract's
+    /// own VALIDATION words (`wire::is_validation_refusal`), for a block, an app contract (a piece) and a site alike,
+    /// keyed or keyless (the register's head update is decided by its read-back instead; see its arm). A final one ends the PUT (a block: `PutRefused`, never put again; an app contract: `AppPutRefused`).
+    /// Any other words are TRANSIENT: reported, and the op stays waiting, re-sent on its RTO (rule 7).
+    fn put_refused(&mut self, whose: Refused, said: String, now: Ms) {
+        let fin = wire::is_validation_refusal(&said);
+        match (whose, fin) {
+            (Refused::Block(cid), true) => {
+                self.unusable.push(format!(
+                    "the node's Block contract refused block {} as invalid (\"{said}\"): an encoding defect, or a node on another contract epoch",
+                    engine::short_id(&cid)
+                ));
+                self.server.node(Answer::PutRefused { id: cid, transient: false }, now)
+            }
+            (Refused::Block(cid), false) => self.unusable.push(format!("the node refused block {}: {said}", engine::short_id(&cid))),
+            (Refused::App(key), true) => self.server.node(Answer::AppPutRefused { key, said }, now),
+            (Refused::App(key), false) => self.unusable.push(format!("the node refused app contract {key} (not final; re-sent): {said}")),
+            // A site's FINAL refusal ends its publication (the page's consequence, `Publication::Refused`); a transient
+            // one is reported, and the site's PUT is re-sent on its RTO.
+            (Refused::Site(app), true) => self.server.node(Answer::SiteRefused { app, said }, now),
+            (Refused::Site(app), false) => self.unusable.push(format!("the node refused site {app}'s PUT (not final; re-sent): {said}")),
+        }
     }
 
     /// Is this frame one this page asked for? A READER owns only its head and
