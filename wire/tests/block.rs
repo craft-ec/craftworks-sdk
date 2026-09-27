@@ -91,6 +91,15 @@ fn get_and_update_frame_to_the_requests_they_name() {
         }
         other => panic!("{other:?}"),
     }
+    // A DELTA goes as `UpdateData::Delta`: a node checks an incoming `State` as a whole state and refuses a delta sent
+    // as one ("invalid put").
+    let frames = wire::frame_update_delta(c.key(), b"step".to_vec(), 3).expect("frames");
+    match bincode::deserialize::<ClientRequest>(&frames[0]).expect("decodes") {
+        ClientRequest::ContractOp(ContractRequest::Update { key, data: UpdateData::Delta(d) }) => {
+            assert_eq!((key, d.as_ref()), (c.key(), b"step".as_slice()));
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// A LOCAL node's "missing contract" (`freenet local` answers the GET of a contract it never stored with

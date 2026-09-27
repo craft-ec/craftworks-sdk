@@ -444,6 +444,17 @@ pub fn frame_update(key: ContractKey, state: Vec<u8>, stream_id: u32) -> Result<
     frames(&req, stream_id)
 }
 
+/// Frame a contract UPDATE carrying one DELTA (a Tail's next step, say): `UpdateData::Delta`, which the contract's
+/// `update_state` applies to what it holds. Never sent as a `State`: a node checks an incoming `State` as a whole state
+/// before the contract sees it, and refuses one that is only a delta ("invalid put").
+pub fn frame_update_delta(key: ContractKey, delta: Vec<u8>, stream_id: u32) -> Result<Vec<Vec<u8>>, String> {
+    let req = ClientRequest::ContractOp(freenet_stdlib::client_api::ContractRequest::Update {
+        key,
+        data: UpdateData::Delta(StateDelta::from(delta)),
+    });
+    frames(&req, stream_id)
+}
+
 /// The delegate, and the key the node will know it by, from its wasm.
 ///
 /// Both come from the same bytes and the key is DERIVED — a caller that
