@@ -1357,8 +1357,16 @@ impl Page {
             // re-PUT path (`reput_bytes`, sdk#411), as `held_absent` takes it.
             Act::Reput(id) => {
                 if !self.put_waiting(&id) {
-                    if let Some(bytes) = self.engine.reput_bytes(&id) {
-                        self.put_again.insert(id, bytes);
+                    match self.engine.reput_bytes(&id) {
+                        Some(bytes) => {
+                            self.put_again.insert(id, bytes);
+                        }
+                        // The page no longer holds it (the pin rule says it must: `reput_missing` counts it): the
+                        // head can never be signed, so it is SAID, never silent (the architect on #566).
+                        None => self.say(
+                            instrument::Site::of("page::said::root-lost"),
+                            format!("the node lost this commit's root {} and this page no longer holds it: the commit cannot be signed", engine::short_id(&id)),
+                        ),
                     }
                 }
             }
@@ -5425,5 +5433,61 @@ mod said {
         assert!(matches!(&said[0], instrument::Event::Counter { site: s, entry, .. } if *s == site && entry.value == 1));
         assert!(!format!("{:?}", r.events()).contains("abcdef"), "the line's text entered the recording");
         assert_eq!(p.take_unusable(), vec!["a secret key abcdef named in a line".to_string()], "the line was not kept for the app");
+    }
+}
+
+/// sdk#564 follow-up (the architect on #566): `RootNotHeld` re-PUTs the commit's root from page memory. When the page
+/// no longer holds it (the pin rule says it must; `reput_missing` counts the breach), the head can never be signed,
+/// and that is SAID through the one `say` path -- never silent.
+#[cfg(test)]
+mod root_lost {
+    use super::*;
+
+    /// Write 1 at its Sign, every PUT answered; the Sign's id and the root it signs.
+    fn at_sign() -> (Page, u32, Cid) {
+        let mut p = Page::new(Params::default(), PutPath::Page);
+        p.write(ClientId(1), WriteId(1), vec![(b"k".to_vec(), WriteOp::Put(b"v".to_vec()))]);
+        for _ in 0..20 {
+            for op in p.take_ops() {
+                match op {
+                    Op::ReadHead { label: Label::Head } => p.answer(Answer::Head { label: Label::Head, read: None }, Ms(10)),
+                    Op::Put { id, .. } => p.answer(Answer::PutOk(id), Ms(10)),
+                    Op::AskHeld { batch, ids } => p.answer(Answer::Held { batch, present: vec![true; ids.len()] }, Ms(10)),
+                    Op::Sign { id, root, .. } => return (p, id, root),
+                    other => panic!("unexpected before the sign: {other:?}"),
+                }
+            }
+        }
+        panic!("THE SETUP: the page never asked the signer");
+    }
+
+    fn refuse_root_not_held(p: &mut Page, id: u32) {
+        p.answer(Answer::Signer { id, answer: signer_proto::Answer::Refused(signer_proto::Why::RootNotHeld) }, Ms(11));
+    }
+
+    /// The page no longer holds its root: nothing can be PUT, and the page SAYS so, naming the root.
+    /// Mutant "None does nothing" (the arm before this change) -> nothing said -> red.
+    #[test]
+    fn a_root_the_page_no_longer_holds_is_said_never_silent() {
+        let (mut p, id, root) = at_sign();
+        p.engine.blocks_mut().remove(&root);
+        let _ = p.take_unusable();
+        refuse_root_not_held(&mut p, id);
+        assert!(!p.put_waiting(&root), "a root the page does not hold was queued to be PUT");
+        let said = p.take_unusable();
+        assert!(
+            said.iter().any(|l| l.contains("no longer holds it") && l.contains(&engine::short_id(&root))),
+            "the lost root was not said, naming it: {said:?}"
+        );
+    }
+
+    /// THE CONTROL: the page still holds its root -- it is PUT again, and nothing is said.
+    #[test]
+    fn a_root_the_page_holds_is_put_again_and_nothing_is_said() {
+        let (mut p, id, root) = at_sign();
+        let _ = p.take_unusable();
+        refuse_root_not_held(&mut p, id);
+        assert!(p.put_waiting(&root), "the held root was not queued to be PUT again");
+        assert!(p.take_unusable().iter().all(|l| !l.contains("no longer holds it")), "a held root was said to be lost");
     }
 }
