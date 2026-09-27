@@ -22,6 +22,16 @@ use crate::PARITY;
 /// engine already holds, from the root the read stands on.
 pub const MAX_SEARCH_NODES: usize = 4096;
 
+/// EVERY slot position holding `id` (the architect on sdk#542: THE one lookup of an id among a group's slots). Identical
+/// values are one block, so one id can fill several slots, and an answer for it -- bytes or NotFound -- answers EVERY
+/// one. A first-match lookup (`position`) marked one and was the defect twice (sdk#527's mark, sdk#542's repair); the
+/// `slots_of` control (engine/tests/slots_of.rs) fails the build on one anywhere else.
+/// Generic over what a slot holds (a block's `Cid`, a piece's node key): page-io's publish marks its piece sets through
+/// it too.
+pub fn slots_of<'a, T: PartialEq<Q>, Q: ?Sized>(slots: &'a [T], id: &'a Q) -> impl Iterator<Item = usize> + 'a {
+    slots.iter().enumerate().filter(move |(_, s)| **s == *id).map(|(i, _)| i)
+}
+
 /// One sibling group, as a repair needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
@@ -40,6 +50,11 @@ pub struct Group {
 }
 
 impl Group {
+    /// Every slot holding `id` ([`slots_of`]).
+    pub fn slots_of<'a>(&'a self, id: &'a Cid) -> impl Iterator<Item = usize> + 'a {
+        slots_of(&self.slots, id)
+    }
+
     /// Is slot `i` a parity block?
     pub fn is_parity(&self, i: usize) -> bool {
         i >= self.k
@@ -61,6 +76,39 @@ impl Group {
             st.push(self.kind);
             st.extend_from_slice(bytes);
             parity::symbol(&st)
+        }
+    }
+}
+
+/// A GROUP'S MARGIN (sdk#524; one owner with the assets audit, engineer2's #478 port): of its `k` members and its
+/// parity, `present` are there -- margin = present - k. The CALLER says what "present" means, in its own doc: the audit
+/// counts what it VERIFIED (Held, Fetched); a reader counts what is NOT answered NotFound (a silent block may be there).
+pub fn margin(present: usize, k: usize) -> i64 {
+    present as i64 - k as i64
+}
+
+core_types::vocabulary! {
+    /// A group's health from its margin (KEEPER §4): WHOLE (all `k + m` there), DEGRADED (at least `k`: recoverable),
+    /// DAMAGED (below `k`: no decode can rebuild a member). THE one derivation and its words: the audit's DAMAGED and a
+    /// reader's damaged group are this (sdk#524).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum GroupHealth {
+        Whole => "WHOLE",
+        Degraded => "DEGRADED",
+        Damaged => "DAMAGED",
+    }
+}
+
+impl GroupHealth {
+    /// `present` of a group of `k` members + `m` parity.
+    pub fn of(present: usize, k: usize, m: usize) -> GroupHealth {
+        let margin = margin(present, k);
+        if margin >= m as i64 {
+            GroupHealth::Whole
+        } else if margin >= 0 {
+            GroupHealth::Degraded
+        } else {
+            GroupHealth::Damaged
         }
     }
 }
@@ -100,7 +148,7 @@ pub fn find_group(blocks: &dyn Blocks, root: Cid, missing: Cid) -> Option<Group>
         let Ok(node) = Node::parse(bytes) else { continue };
         let ids: Vec<Cid> = node.parity().collect();
         for (g, (_, members)) in parity::group_members(&node).into_iter().enumerate() {
-            let Some(missing_ix) = members.iter().position(|m| *m == missing) else { continue };
+            let Some(missing_ix) = slots_of(&members, &missing).next() else { continue };
             let par = ids.get(PARITY * g..PARITY * (g + 1))?;
             let leaf = node.is_leaf();
             let k = members.len();

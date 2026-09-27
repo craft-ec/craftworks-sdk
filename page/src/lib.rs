@@ -2485,6 +2485,11 @@ impl Page {
         self.engine.repair_counts()
     }
 
+    /// Reads waiting on a block of a DAMAGED group, as this reader sees it (sdk#524, `Engine::damaged`).
+    pub fn damaged(&self) -> Vec<engine::Damaged> {
+        self.engine.damaged()
+    }
+
     /// Why the last read repair was given up, if one was.
     pub fn repair_failed(&self) -> Option<&str> {
         self.engine.repair_failed()

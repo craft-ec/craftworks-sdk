@@ -134,17 +134,24 @@ fn stay(cell: Cell) -> Step {
     Step { next: None, effects: Vec::new(), cell }
 }
 
-/// Apply `f` to the (set, index) whose key is `key`; `None` if no set names it.
+/// Mark EVERY place `key` is listed -- in every set, at every position (identical pieces share a node key, and one
+/// answer answers them all; `engine::repair::slots_of`, the one lookup) -- acked or finally refused; `None` if no set
+/// names it.
 fn mark(sets: &[SetProgress], key: &str, acked: bool) -> Option<Vec<SetProgress>> {
     let mut sets = sets.to_vec();
-    let s = sets.iter_mut().find(|s| s.keys.iter().any(|k| k == key))?;
-    let i = s.keys.iter().position(|k| k == key)?;
-    if acked {
-        s.acked[i] = true;
-    } else {
-        s.refused[i] = true;
+    let mut any = false;
+    for s in &mut sets {
+        let ixs: Vec<usize> = engine::repair::slots_of(&s.keys, key).collect();
+        for i in ixs {
+            any = true;
+            if acked {
+                s.acked[i] = true;
+            } else {
+                s.refused[i] = true;
+            }
+        }
     }
-    Some(sets)
+    any.then_some(sets)
 }
 
 fn pending(sets: &[SetProgress]) -> Vec<String> {
@@ -316,6 +323,23 @@ mod tests {
     fn set(name: &str, k: usize, m: usize) -> SetProgress {
         let pieces = (0..k + m).map(|i| NamedPiece { address: format!("{name}-{i}"), sha256: [i as u8; 32] }).collect();
         SetProgress::new(PieceSet { name: name.into(), k, m, pieces }, (0..k + m).map(|i| format!("{name}-{i}")).collect())
+    }
+
+    /// ONE KEY IN TWO PLACES (the architect on sdk#542: first-match by id is the defect twice): identical pieces are
+    /// one node key, so a set can list it twice and two sets can share it -- an answer for that key answers EVERY
+    /// place. Acked: both of the set's slots and the other set's are acked; refused: likewise.
+    #[test]
+    fn an_answer_for_a_repeated_key_marks_every_place_it_is_listed() {
+        let mut a = set("a", 2, 1);
+        a.keys[2] = a.keys[0].clone();
+        let mut b = set("b", 2, 1);
+        b.keys[1] = a.keys[0].clone();
+        let key = a.keys[0].clone();
+        for acked in [true, false] {
+            let sets = mark(&[a.clone(), b.clone()], &key, acked).expect("a set names the key");
+            let marks = |s: &SetProgress| if acked { s.acked.clone() } else { s.refused.clone() };
+            assert_eq!((marks(&sets[0]), marks(&sets[1])), (vec![true, false, true], vec![false, true, false]), "an answer for a repeated key marked only its first place (acked = {acked})");
+        }
     }
 
     /// `n` of `s`'s pieces acked, `r` refused (from the end).

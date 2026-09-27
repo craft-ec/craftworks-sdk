@@ -692,6 +692,9 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     // blocks/bytes/height are NULL here — they are properties of the tree,
     // which lives on the node. Zero would render as a real empty database.
     stats: () => JSON.parse(session.stats()),
+    // Reads waiting on a block of a DAMAGED group (sdk#524): `[{block, j, k, health, why}]`, page-level -- no
+    // binding's status changes by it. A state, not an end (rule 8).
+    damaged: () => JSON.parse(session.damaged()),
     // Writes waiting for room in the page's queue (QUEUE_FULL, no deadline
     // unless the app passed one): what a save indicator shows while it waits.
     waitingForRoom: () => roomWaiters.length,

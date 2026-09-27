@@ -73,7 +73,7 @@ pub enum Delta {
     /// was away a while.
     FullReloadRequired { new_root: [u8; 32] },
 }
-crate::status::vocabulary! {
+core_types::vocabulary! {
     /// Reading, which for some stores is a ROUND TRIP.
     ///
     /// Separate from [`Store`], and taking `&mut self`, and both are the same
