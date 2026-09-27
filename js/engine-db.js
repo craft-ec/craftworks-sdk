@@ -197,6 +197,18 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
   };
 
   /**
+   * A DEFINITION DOOR wrote (draftPut / draftFile / draftDelete / publishDefinition / markPublished): the same
+   * "a write was made" as `touched`, so the unsaved-changes guard and the `saving` count move WITH the write. Without
+   * it the count caught up only at the next tick or message: measured, 0 for ~800 ms after four door writes had
+   * returned, then 4 -- a page (or a tool) reading it right after writing saw "nothing unsaved".
+   */
+  const doorWrote = async made => {
+    const r = await made;
+    handle.wrote?.();
+    return r;
+  };
+
+  /**
    * The head moved: re-run the bindings the SESSION says are stale.
    *
    * Which ones is Rust's decision, not this file's. Reloading "everything"
@@ -421,17 +433,17 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     // reads `[{ key, body }]` (of another app too, read-only). `markPublished` / `isPublished`: the builder's per-domain live marker, until P5.
     async draftPut(key, body, ...extra) {
       noAppForAWrite("draftPut", extra);
-      return once(() => session.draft_put(key, JSON.stringify(body)));
+      return doorWrote(once(() => session.draft_put(key, JSON.stringify(body))));
     },
     // A FILE of the app's code (app-as-data P5): `f/<path>`'s bytes (a Uint8Array) and meta -- one form per kind, so
     // `draftPut` stays JSON-only. A file over a record's bound is refused, naming its path and both sizes.
     async draftFile(path, bytes, meta = {}, ...extra) {
       noAppForAWrite("draftFile", extra);
-      return once(() => session.draft_file(path, bytes, JSON.stringify(meta)));
+      return doorWrote(once(() => session.draft_file(path, bytes, JSON.stringify(meta))));
     },
     async draftDelete(key, ...extra) {
       noAppForAWrite("draftDelete", extra);
-      return once(() => session.draft_delete(key));
+      return doorWrote(once(() => session.draft_delete(key)));
     },
     // `publishDefinition()`: the definition's ONE write, the records changed. `publishDefinition({ site })`: that, then
     // -- the app's first publish, or a platform upgrade -- its SITE (P4's creation path) in the same call, answering
@@ -441,9 +453,9 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     async publishDefinition(opts = {}, ...extra) {
       noAppForAWrite("publishDefinition", typeof opts === "string" ? [opts, ...extra] : extra);
       const { site } = opts ?? {};
-      if (!site) return once(() => session.publish_definition());
+      if (!site) return doorWrote(once(() => session.publish_definition()));
       const set = typeof site.set === "string" ? site.set : JSON.stringify(site.set);
-      return once(() => JSON.parse(session.publish_definition_site(set, site.webappCode, site.pieceStates, site.siteCode, site.starter)));
+      return doorWrote(once(() => JSON.parse(session.publish_definition_site(set, site.webappCode, site.pieceStates, site.siteCode, site.starter))));
     },
     // `app`: ANOTHER app's definition in this tree, read-only (§19 P3: the builder's project list); absent, this one's.
     // The apps of this tree that hold a draft (§19 P3b: the builder's project list), by id. A read.
@@ -452,7 +464,7 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
     definition: (which, app) => once(() => session.definition(which, app ?? undefined)),
     async markPublished(domain, ...extra) {
       noAppForAWrite("markPublished", extra);
-      return once(() => JSON.parse(session.mark_published(domain)));
+      return doorWrote(once(() => JSON.parse(session.mark_published(domain))));
     },
     isPublished: domain => once(() => session.is_published(domain)),
     // The marker as its record WITH its write state, or null: whether it is SAVED (isPublished says only EXISTS).
