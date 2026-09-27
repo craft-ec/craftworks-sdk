@@ -4,18 +4,26 @@
 //! * ws-lose: once the head names the root's group, the node's answer to a GET of the root reaches the page as the
 //!   node's own NotFound for that contract.
 //!
-//! And both evidence lines, pinned byte for byte.
+//! And the evidence lines each hook REALLY says, captured from its log and pinned byte for byte (Codex on #541: a test
+//! of the formatters alone stays green with the hooks' own lines removed).
 use freenet_prolly::kind;
 use freenet_stdlib::client_api::{ClientError, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::*;
 use futures::{SinkExt, StreamExt};
-use probe::lose::{Lose, LoseHooks, Target};
-use probe::proxy::{serve, Hooks};
-use probe::withhold::{withheld_line, Withhold};
+use probe::lose::{short, Lose, LoseHooks, Target};
+use probe::proxy::{serve, Hooks, Log};
+use probe::withhold::Withhold;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
+
+/// A log that keeps every line a hook says, as the harness would read it from stderr.
+fn captured() -> (Log, Arc<Mutex<Vec<String>>>) {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let keep = lines.clone();
+    (Log::to(move |l| keep.lock().unwrap().push(l.to_string())), lines)
+}
 
 /// A free loopback port (never one of the owner's: `serve` refuses those anyway).
 fn free_port() -> u16 {
@@ -79,7 +87,8 @@ async fn next_answer(ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungs
 async fn ws_withhold_drops_only_the_parity_puts_answer() {
     let (parity, pkey) = contract(b"block code", b"parity params");
     let (data, dkey) = contract(b"block code", b"data params");
-    let hooks = Arc::new(Withhold::default());
+    let (log, said) = captured();
+    let hooks = Arc::new(Withhold::with_log(log));
     let replies = vec![
         ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: pkey })),
         ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: dkey })),
@@ -98,6 +107,8 @@ async fn ws_withhold_drops_only_the_parity_puts_answer() {
     }
     assert_eq!(hooks.withheld.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(hooks.parity_puts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // THE EVIDENCE the hook said: one line, for the parity PUT's contract, byte for byte.
+    assert_eq!(*said.lock().unwrap(), vec![format!(r#"{{"parity_puts_seen":1,"withheld":"{}","withheld_total":1}}"#, pkey.id())]);
 }
 
 #[tokio::test]
@@ -114,7 +125,8 @@ async fn ws_lose_answers_the_lost_blocks_get_with_the_nodes_not_found() {
     let (_, head_key) = contract(b"register code", b"register params");
     // The root block's contract: the block code under the root's id, so its answer is recognised as a block.
     let (_, root_key) = contract(b"block code", &root);
-    let hooks = Arc::new(LoseHooks(Mutex::new(Lose::new(Target::Root, freenet_prolly::parity::PARITY))));
+    let (log, said) = captured();
+    let hooks = Arc::new(LoseHooks { log, ..LoseHooks::new(Lose::new(Target::Root, freenet_prolly::parity::PARITY)) });
     let replies = vec![
         ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key: head_key, contract: None, state: WrappedState::new(head_state) })),
         ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key: root_key, contract: None, state: WrappedState::new([vec![kind::TREE_NODE], body].concat()) })),
@@ -134,12 +146,17 @@ async fn ws_lose_answers_the_lost_blocks_get_with_the_nodes_not_found() {
             assert!(matches!(a, HostResponse::ContractResponse(ContractResponse::GetResponse { .. })), "the head's answer was changed");
         }
     }
-}
-
-/// Both probes' evidence lines, byte for byte (the harness reads them).
-#[test]
-fn the_evidence_lines_keep_their_bytes() {
-    let id = ContractInstanceId::new([1; 32]);
-    assert_eq!(withheld_line(&id, 2, 5).to_string(), format!(r#"{{"parity_puts_seen":5,"withheld":"{id}","withheld_total":2}}"#));
-    assert_eq!(probe::lose::not_found_line(&[3; 32], 7).to_string(), r#"{"not_found":"0303030303030303","not_found_total":7}"#);
+    // THE EVIDENCE the hook said, byte for byte: the root's group chosen from the head (the root and the first m - 1
+    // parity lost, the last parity the one survivor), then the root's GET answered NotFound.
+    let p = freenet_prolly::parity::PARITY;
+    let mut lost: Vec<String> = std::iter::once(&root).chain(&par[..p - 1]).map(short).collect();
+    lost.sort();
+    let q = |v: &[String]| v.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(",");
+    assert_eq!(
+        *said.lock().unwrap(),
+        vec![
+            format!(r#"{{"chosen":"root","k":1,"lost":[{}],"lost_data":["{}"],"slots":{},"survivors":["{}"]}}"#, q(&lost), short(&root), 1 + p, short(&par[p - 1])),
+            format!(r#"{{"not_found":"{}","not_found_total":1}}"#, short(&root)),
+        ]
+    );
 }

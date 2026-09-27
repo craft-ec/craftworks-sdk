@@ -7,8 +7,8 @@
 //!
 //! A connection that is not a WebSocket upgrade (the node's HTTP: the app's web containers and pieces) is piped through
 //! unchanged, and the node is dialled only when a client connects (a harness guard fails on a client connected before
-//! the reader's page opens). Every choice, every chosen slot the reader first asks for
-//! (`asked`) and every NotFound is a JSON line on stderr: the evidence that the loss happened, and that the reader
+//! the reader's page opens). Every choice, every surviving slot first answered with bytes
+//! (`answered`) and every NotFound is a JSON line on stderr: the evidence that the loss happened, and that the reader
 //! reached for the group.
 //!
 //! usage: ws-lose <listen-port> <node-ws-port> --group data|root --lose m|m+1
@@ -16,7 +16,7 @@
 use anyhow::{bail, Result};
 use probe::lose::{parse_lose, Lose, LoseHooks, Target};
 use probe::proxy::serve;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -36,5 +36,5 @@ async fn main() -> Result<()> {
     if let Some(d) = domain {
         l = l.with_domain(d);
     }
-    serve(listen.parse()?, node.parse()?, said, Arc::new(LoseHooks(Mutex::new(l)))).await
+    serve(listen.parse()?, node.parse()?, said, Arc::new(LoseHooks::new(l))).await
 }

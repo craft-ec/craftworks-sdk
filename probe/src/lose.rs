@@ -75,15 +75,15 @@ pub struct Lose {
     chosen: Option<Chosen>,
     /// GETs answered `NotFound` so far (the reader re-asks a lost block on its backoff, so this keeps growing).
     pub not_found: u64,
-    /// The chosen group's slots the reader has ASKED for since the choice: answered with bytes or with `NotFound`. The
-    /// `m + 1` control is void unless the reader asked `>= k` of them (the architect on builder#179: a reader that never
-    /// reached for the group's parity has not been refused a decode).
-    pub asked: BTreeSet<Cid>,
+    /// The chosen group's SURVIVING slots (not lost) the reader asked for and was answered with BYTES. The realnet arms
+    /// are VOID unless this covers every survivor (the architect on #541): then the reader held everything the network
+    /// has for the group, and not reading (`m + 1`) is the true outcome, not a repair that never reached for parity.
+    pub answered: BTreeSet<Cid>,
 }
 
 impl Lose {
     pub fn new(target: Target, n: usize) -> Lose {
-        Lose { target, n, domain: None, chosen: None, not_found: 0, asked: BTreeSet::new() }
+        Lose { target, n, domain: None, chosen: None, not_found: 0, answered: BTreeSet::new() }
     }
 
     /// [`Target::Data`], choosing the group of `domain`'s records by identity (see the field).
@@ -100,32 +100,29 @@ impl Lose {
     /// [`Target::Data`] with no group yet, a tree node with a group of `k >= 2` becomes THE group (its members are
     /// fetched after it, so none of them has been relayed yet).
     pub fn block(&mut self, id: Cid, state: &[u8]) -> Verdict {
-        if self.chosen.as_ref().is_some_and(|c| c.slots.contains(&id)) {
-            self.asked.insert(id);
-        }
-        if self.chosen.as_ref().is_some_and(|c| c.lost.contains(&id)) {
-            self.not_found += 1;
-            return Verdict::NotFound(id);
+        if let Some(c) = &self.chosen {
+            if c.lost.contains(&id) {
+                self.not_found += 1;
+                return Verdict::NotFound(id);
+            }
+            if c.slots.contains(&id) {
+                self.answered.insert(id);
+            }
         }
         if self.target == Target::Data && self.chosen.is_none() {
             if let Some((&kind::TREE_NODE, body)) = state.split_first() {
                 if let Ok(node) = Node::parse(body) {
                     let parity: Vec<Cid> = node.parity().collect();
-                    // Each referenced value's key (a leaf's): what `--domain` matches a group's members by.
-                    let key_of: std::collections::BTreeMap<Cid, Vec<u8>> = (0..if node.is_leaf() { node.len() } else { 0 })
-                        .filter_map(|i| match node.value(i) {
-                            freenet_prolly::node::Value::Ref { cid, .. } => Some((cid, node.key(i))),
-                            freenet_prolly::node::Value::Inline(_) => None,
-                        })
-                        .collect();
+                    let groups = group_members(&node);
+                    let entries = group_entries(&node, &groups);
                     let domain = self.domain.clone();
-                    let fits = |m: &Vec<Cid>| match &domain {
-                        None => m.len() >= 2,
-                        Some(marker) => {
-                            node.is_leaf() && !m.is_empty() && m.iter().all(|c| key_of.get(c).is_some_and(|k| k.starts_with(marker)))
-                        }
+                    // `--domain` matches a group by its ENTRIES' keys (Codex on #541): two entries with identical
+                    // values share an id, so a match by id would pass another domain's record.
+                    let fits = |g: usize| match &domain {
+                        None => groups[g].1.len() >= 2,
+                        Some(marker) => node.is_leaf() && entries[g].as_ref().is_some_and(|e| !e.is_empty() && e.iter().all(|&i| node.key(i).starts_with(marker))),
                     };
-                    let group = group_members(&node).into_iter().enumerate().find(|(_, (_, m))| fits(m));
+                    let group = (0..groups.len()).find(|&g| fits(g)).map(|g| (g, groups[g].clone()));
                     if let Some((g, (_, members))) = group {
                         if let Some(par) = parity.get(PARITY * g..PARITY * (g + 1)) {
                             self.choose(members, par);
@@ -153,14 +150,55 @@ impl Lose {
         self.choose(vec![head.root], &par);
     }
 
-    /// The first `n` slots are lost: DATA members first, then parity.
+    /// `n` SLOTS are lost, DATA members first, then parity. A NotFound answers an ID, so losing an id loses EVERY slot
+    /// holding it: ids are taken in slot order, each only while the slots it takes keep the count `<= n`.
     fn choose(&mut self, members: Vec<Cid>, parity: &[Cid]) {
         let k = members.len();
         let mut slots = members;
         slots.extend_from_slice(parity);
-        let lost = slots.iter().take(self.n).copied().collect();
+        let mut lost = BTreeSet::new();
+        let mut taken = 0;
+        for id in &slots {
+            let holds = slots.iter().filter(|s| *s == id).count();
+            if !lost.contains(id) && taken + holds <= self.n {
+                lost.insert(*id);
+                taken += holds;
+            }
+        }
         self.chosen = Some(Chosen { slots, k, lost });
     }
+}
+
+/// Each of `groups`' ENTRIES (`node`'s entry indices, in its members' order), as `group_members` makes them: a branch's
+/// one run of children, a leaf's referenced values per size class, each run cut into groups in order. `None` for a
+/// group whose members are not those entries' ids (a grouping this does not follow): never matched.
+fn group_entries(node: &Node<'_>, groups: &[(usize, Vec<Cid>)]) -> Vec<Option<Vec<usize>>> {
+    use freenet_prolly::node::Value;
+    let mut runs: std::collections::BTreeMap<usize, std::collections::VecDeque<usize>> = Default::default();
+    for i in 0..node.len() {
+        if !node.is_leaf() {
+            runs.entry(0).or_default().push_back(i);
+        } else if let Value::Ref { len, .. } = node.value(i) {
+            runs.entry(freenet_prolly::parity::class_of(len as usize)).or_default().push_back(i);
+        }
+    }
+    let id_of = |i: usize| {
+        if !node.is_leaf() {
+            return Some(node.child(i).0);
+        }
+        match node.value(i) {
+            Value::Ref { cid, .. } => Some(cid),
+            Value::Inline(_) => None,
+        }
+    };
+    groups
+        .iter()
+        .map(|(class, members)| {
+            let run = runs.get_mut(class)?;
+            let e: Vec<usize> = (0..members.len()).map_while(|_| run.pop_front()).collect();
+            (e.len() == members.len() && e.iter().zip(members).all(|(&i, m)| id_of(i) == Some(*m))).then_some(e)
+        })
+        .collect()
 }
 
 /// A block id as the log names it: its first 8 bytes in hex (core_types::hex, the one owner).
@@ -172,9 +210,11 @@ pub fn short(id: &Cid) -> String {
 /// `lost` against the `not_found` lines ([`not_found_line`]); the shape is pinned by a test.
 pub fn chosen_line(group: &str, c: &Chosen) -> serde_json::Value {
     // `lost_data`: the lost DATA members (the first `k` slots): a read of them is a decode (the realnet step's
-    // non-vacuity check reads these).
-    let lost_data: Vec<String> = c.slots[..c.k].iter().filter(|s| c.lost.contains(*s)).map(short).collect();
-    serde_json::json!({ "chosen": group, "k": c.k, "slots": c.slots.len(), "lost": c.lost.iter().map(short).collect::<Vec<_>>(), "lost_data": lost_data })
+    // non-vacuity check reads these). `survivors`: the ids of the slots NOT lost -- every one must be answered with
+    // bytes ([`answered_line`]) for the arm to count.
+    let lost_data: BTreeSet<String> = c.slots[..c.k].iter().filter(|s| c.lost.contains(*s)).map(short).collect();
+    let survivors: BTreeSet<String> = c.slots.iter().filter(|s| !c.lost.contains(*s)).map(short).collect();
+    serde_json::json!({ "chosen": group, "k": c.k, "slots": c.slots.len(), "lost": c.lost.iter().map(short).collect::<Vec<_>>(), "lost_data": lost_data, "survivors": survivors })
 }
 
 /// THE LOG LINE for one GET answered NotFound. LOAD-BEARING (see [`chosen_line`]).
@@ -182,14 +222,14 @@ pub fn not_found_line(id: &Cid, total: u64) -> serde_json::Value {
     serde_json::json!({ "not_found": short(id), "not_found_total": total })
 }
 
-/// THE LOG LINE for a chosen slot the reader asked for the first time (bytes or NotFound). LOAD-BEARING: the `m + 1`
-/// control reads `asked_total >= k` (see [`chosen_line`]).
-pub fn asked_line(id: &Cid, total: usize) -> serde_json::Value {
-    serde_json::json!({ "asked": short(id), "asked_total": total })
+/// THE LOG LINE for a surviving slot first answered with BYTES. LOAD-BEARING: every arm is VOID unless these cover the
+/// chosen line's `survivors`.
+pub fn answered_line(id: &Cid, total: usize) -> serde_json::Value {
+    serde_json::json!({ "answered": short(id), "answered_total": total })
 }
 
 /// The answer this proxy sends in place of `m`: the node's own `NotFound` for a lost block, or `m` itself.
-pub fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
+pub fn answer(lose: &Mutex<Lose>, log: &crate::proxy::Log, m: Message) -> Message {
     let Message::Binary(b) = &m else { return m };
     let Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }))) =
         bincode::deserialize::<Result<HostResponse, ClientError>>(b)
@@ -208,38 +248,48 @@ pub fn answer(lose: &Mutex<Lose>, m: Message) -> Message {
         lose.head(state.as_ref());
         if !had {
             if let Some(c) = lose.chosen() {
-                eprintln!("{}", chosen_line("root", c));
+                log.say(&chosen_line("root", c));
             }
         }
         return m;
     };
     let had = lose.chosen().is_some();
-    let asked = lose.asked.len();
+    let answered = lose.answered.len();
     let verdict = lose.block(cid, state.as_ref());
     if !had {
         if let Some(c) = lose.chosen() {
-            eprintln!("{}", chosen_line("data", c));
+            log.say(&chosen_line("data", c));
         }
     }
-    if lose.asked.len() > asked {
-        eprintln!("{}", asked_line(&cid, lose.asked.len()));
+    if lose.answered.len() > answered {
+        log.say(&answered_line(&cid, lose.answered.len()));
     }
     match verdict {
         Verdict::Relay => m,
         Verdict::NotFound(id) => {
-            eprintln!("{}", not_found_line(&id, lose.not_found));
+            log.say(&not_found_line(&id, lose.not_found));
             let nf: Result<HostResponse, ClientError> = Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id: *key.id() }));
             Message::Binary(bincode::serialize(&nf).expect("a NotFound encodes").into())
         }
     }
 }
 
-/// ws-lose's hooks on the one proxy ([`crate::proxy`]): every answer from the node through [`answer`].
-pub struct LoseHooks(pub Mutex<Lose>);
+/// ws-lose's hooks on the one proxy ([`crate::proxy`]): every answer from the node through [`answer`], its evidence
+/// lines to `log` (stderr in the binary).
+pub struct LoseHooks {
+    pub lose: Mutex<Lose>,
+    pub log: crate::proxy::Log,
+}
+
+impl LoseHooks {
+    pub fn new(lose: Lose) -> LoseHooks {
+        LoseHooks { lose: Mutex::new(lose), log: crate::proxy::Log::default() }
+    }
+}
 
 impl crate::proxy::Hooks for LoseHooks {
     fn down(&self, _conn: u64, m: Message) -> Option<Message> {
-        Some(answer(&self.0, m))
+        Some(answer(&self.lose, &self.log, m))
     }
 }
 
@@ -279,7 +329,7 @@ mod tests {
             let c = l.chosen().expect("a group of k >= 2 was chosen").clone();
             assert!(c.k >= 2, "k = {}", c.k);
             assert_eq!(c.slots.len(), c.k + PARITY);
-            assert_eq!(c.lost.len(), n);
+            assert_eq!(c.slots.iter().filter(|s| c.lost.contains(*s)).count(), n, "lost is counted in slots");
             let data_lost = c.slots[..c.k].iter().filter(|s| c.lost.contains(*s)).count();
             assert_eq!(data_lost, n.min(c.k), "data members are not lost first");
             for i in 0..node.len() {
@@ -288,13 +338,18 @@ mod tests {
                 assert_eq!(v == Verdict::NotFound(child), c.lost.contains(&child), "child {i}");
             }
             assert_eq!(l.not_found as usize, data_lost);
-            // ASKED: every member fetched is a slot asked (bytes or NotFound); a parity slot fetched is one more; a
-            // re-ask is not.
-            assert_eq!(l.asked.len(), c.k, "the reader fetched the k members");
-            let p0 = c.slots[c.k];
-            let _ = l.block(p0, &state(kind::PARITY, parity.get(&p0).expect("the parity block")));
-            let _ = l.block(p0, &state(kind::PARITY, parity.get(&p0).expect("the parity block")));
-            assert_eq!(l.asked.len(), c.k + 1, "a parity slot asked (twice) counts once");
+            // ANSWERED: only SURVIVING slots answered with bytes count -- the members not lost, then each surviving
+            // parity slot (twice asked, once counted); a lost slot re-asked never does.
+            let survivors: BTreeSet<Cid> = c.slots.iter().filter(|s| !c.lost.contains(*s)).copied().collect();
+            let members_left: BTreeSet<Cid> = c.slots[..c.k].iter().filter(|s| !c.lost.contains(*s)).copied().collect();
+            assert_eq!(l.answered, members_left, "the members answered with bytes");
+            for p in c.slots[c.k..].iter().filter(|s| !c.lost.contains(*s)) {
+                for _ in 0..2 {
+                    let _ = l.block(*p, &state(kind::PARITY, parity.get(p).expect("the parity block")));
+                }
+            }
+            let _ = l.block(c.slots[0], &state(kind::TREE_NODE, b.get(&c.slots[0]).expect("a child")));
+            assert_eq!(l.answered, survivors, "every survivor answered with bytes, and nothing else");
             // THE GROUP IS THE TREE'S OWN (the architect on #525): its parity slots are parity this tree's apply made,
             // and the engine's own decoder rebuilds every lost member from the slots left when m are lost -- and has
             // fewer than k to work with when m + 1 are.
@@ -377,7 +432,6 @@ mod tests {
     /// Here one leaf's group holds `aaa`'s record and the three bulk records, `aaa`'s value identical to bulk's first:
     /// the group is not bulk's alone, so `--domain bulk` chooses NOTHING.
     #[test]
-    #[should_panic(expected = "--domain bulk chose a group holding aaa's record")] // PINNED: flipped by the fix
     fn a_group_holding_another_domains_record_is_not_the_domains_even_with_an_identical_value() {
         let mut b = MemBlocks::default();
         let empty = freenet_prolly::build::init(&mut b);
@@ -407,7 +461,6 @@ mod tests {
     /// members repeat an id (identical values) past the first `n` slots must not lose more than `n` slots -- `m` lost
     /// would then be `m + 1`, and the margin arm would read as the control.
     #[test]
-    #[should_panic(expected = "slots lost")] // PINNED: flipped by the fix
     fn a_repeated_id_never_loses_more_slots_than_asked() {
         let a: Cid = [1; 32];
         let mut members: Vec<Cid> = (2..=(PARITY as u8 + 3)).map(|i| [i; 32]).collect();
@@ -458,13 +511,15 @@ mod tests {
     fn the_log_lines_keep_their_shape() {
         let c = Chosen { slots: vec![[1; 32], [2; 32], [3; 32]], k: 2, lost: [[1; 32], [3; 32]].into_iter().collect() };
         let chosen = chosen_line("data", &c);
-        assert_eq!(chosen, serde_json::json!({ "chosen": "data", "k": 2, "slots": 3, "lost": ["0101010101010101", "0303030303030303"], "lost_data": ["0101010101010101"] }));
+        assert_eq!(chosen, serde_json::json!({ "chosen": "data", "k": 2, "slots": 3, "lost": ["0101010101010101", "0303030303030303"], "lost_data": ["0101010101010101"], "survivors": ["0202020202020202"] }));
         let nf = not_found_line(&[3; 32], 7);
         assert_eq!(nf, serde_json::json!({ "not_found": "0303030303030303", "not_found_total": 7 }));
         // The ids the two lines name for one block are the SAME string.
         assert!(chosen["lost"].as_array().unwrap().contains(&nf["not_found"]));
-        let asked = asked_line(&[2; 32], 2);
-        assert_eq!(asked, serde_json::json!({ "asked": "0202020202020202", "asked_total": 2 }));
+        let answered = answered_line(&[2; 32], 1);
+        assert_eq!(answered, serde_json::json!({ "answered": "0202020202020202", "answered_total": 1 }));
+        // A survivor the answered line names is the SAME string as the chosen line's.
+        assert!(chosen["survivors"].as_array().unwrap().contains(&answered["answered"]));
     }
 
     #[test]

@@ -18,6 +18,26 @@ pub trait Hooks: Send + Sync + 'static {
     fn down(&self, conn: u64, m: Message) -> Option<Message>;
 }
 
+/// Where a probe's EVIDENCE lines go (one JSON value per line): stderr by default -- the harness reads them there --
+/// or a test's capture, so a test sees what the hooks really say, not what their formatters would.
+pub struct Log(Box<dyn Fn(&serde_json::Value) + Send + Sync>);
+
+impl Default for Log {
+    fn default() -> Log {
+        Log(Box::new(|l| eprintln!("{l}")))
+    }
+}
+
+impl Log {
+    pub fn to(f: impl Fn(&serde_json::Value) + Send + Sync + 'static) -> Log {
+        Log(Box::new(f))
+    }
+
+    pub fn say(&self, line: &serde_json::Value) {
+        (self.0)(line)
+    }
+}
+
 /// Is this the first packet of a WebSocket upgrade? (Peeked, not consumed.)
 async fn is_upgrade(s: &TcpStream) -> bool {
     let mut buf = [0u8; 2048];
