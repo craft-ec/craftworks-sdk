@@ -750,12 +750,12 @@ pub struct Page {
     /// Repair PUTs sent during THIS pass, and `repairs_rejected` when it began: the report is of the pass alone.
     pass_puts: BTreeSet<Cid>,
     rejected_base: u64,
-    /// THE NODE'S BOUND DECIDES a silent block (core dev on #555's follow-up): when each block was first asked this
-    /// pass; the asks left unanswered past their node GET bound (ABSENT: missing, as a NotFound); and each put-back a
-    /// race made of a block not yet known missing, HELD until a NotFound or the bound releases it, or the node serving
-    /// the block drops it (a race win is not a loss).
+    /// SILENCE IS NEVER A VERDICT (rule 8; the architect + core dev on #574): when each block was first asked this
+    /// pass; the asks left unanswered past their node GET bound (OVERDUE: the report stops waiting for them -- they stay
+    /// UNANSWERED and re-asked, never missed); and each put-back a race made of a block not yet known missing, HELD
+    /// until the node's NotFound releases it or its serving the block drops it (a race win is not a loss).
     pass_asked: BTreeMap<Cid, u64>,
-    pass_absent: BTreeSet<Cid>,
+    pass_overdue: BTreeSet<Cid>,
     pass_held: BTreeMap<Cid, Vec<u8>>,
     /// The held-block sweep's depth now, and how often it was entered from inside itself.
     sweep_depth: u32,
@@ -901,7 +901,7 @@ impl Page {
             pass_puts: BTreeSet::new(),
             rejected_base: 0,
             pass_asked: BTreeMap::new(),
-            pass_absent: BTreeSet::new(),
+            pass_overdue: BTreeSet::new(),
             pass_held: BTreeMap::new(),
             sweep_depth: 0,
             sweeps_nested: 0,
@@ -2504,7 +2504,7 @@ impl Page {
                     self.engine.blocks_mut().insert(id, bytes);
                     // In a PASS only a MISSING block (NotFound, or silent past its node bound) is put back: a race's
                     // rebuild of one not yet known missing is HELD for the node's word (core dev on #555's follow-up).
-                    if self.engine.in_repair_pass() && !self.missing_seen.contains(&id) && !self.pass_absent.contains(&id) {
+                    if self.engine.in_repair_pass() && !self.missing_seen.contains(&id) {
                         if !self.served_seen.contains(&id) {
                             self.pass_held.insert(id, bytes.clone());
                         }
@@ -2898,22 +2898,19 @@ impl Page {
         }
     }
 
-    /// THE NODE'S BOUND, for a pass: a block asked and neither served nor answered NotFound by the time its node GET is
-    /// certainly over (NODE_GET_BOUND + an RTO from its first ask) is ABSENT -- missing, exactly as a NotFound: the
-    /// engine hears the same miss (its race, owed parity and damaged groups follow), and a held put-back goes out.
-    /// Before the bound it is only UNANSWERED, never a loss.
+    /// THE NODE'S BOUND, for a pass: an ask neither served nor answered NotFound by the time its node GET is certainly
+    /// over (NODE_GET_BOUND + an RTO from its first ask) is OVERDUE -- the pass's REPORT stops waiting for it and may end
+    /// with it UNANSWERED ("N did not answer"). Nothing else: no miss is told to the engine, nothing is put back, no
+    /// read is ended; MISSING and DAMAGED come only from the node's NotFound.
     fn resolve_pass_bounds(&mut self) {
         if !self.engine.in_repair_pass() {
             return;
         }
         let now = self.now;
         let due: Vec<Cid> = self.pass_open_asks().filter(|(_, bound)| now >= *bound).map(|(id, _)| id).collect();
-        for id in due {
-            self.pass_absent.insert(id);
-            let more = self.engine.step(Event::BlockMissed(id));
-            self.carry_out(more);
-            self.release_held(id);
-        }
+        // OVERDUE ends only the REPORT's wait for it (the architect + core dev, rule 8: no verdict from a clock). The
+        // block stays UNANSWERED -- never missed, never put back, never DAMAGED -- and is re-asked as any GET is.
+        self.pass_overdue.extend(due);
     }
 
     /// This pass's asks the node has not answered yet (neither served nor NotFound, not yet absent), each with its node
@@ -2922,7 +2919,7 @@ impl Page {
         let rto = self.rto.rto_ms();
         self.pass_asked
             .iter()
-            .filter(|(id, _)| !self.served_seen.contains(*id) && !self.missing_seen.contains(*id) && !self.pass_absent.contains(*id))
+            .filter(|(id, _)| !self.served_seen.contains(*id) && !self.missing_seen.contains(*id) && !self.pass_overdue.contains(*id))
             .map(move |(id, at)| (*id, node_get_over_at(*at, rto)))
     }
 
@@ -2934,7 +2931,7 @@ impl Page {
             .copied()
             .chain(self.pass_held.keys().copied())
             .chain(self.engine.watched_parity())
-            .filter(|id| !self.served_seen.contains(id) && !self.missing_seen.contains(id) && !self.pass_absent.contains(id))
+            .filter(|id| !self.served_seen.contains(id) && !self.missing_seen.contains(id))
             .collect()
     }
 
@@ -2952,7 +2949,7 @@ impl Page {
         self.pass_puts.clear();
         // Still UNANSWERED at the end: counted in the report, never put back.
         self.pass_asked.clear();
-        self.pass_absent.clear();
+        self.pass_overdue.clear();
         self.pass_held.clear();
         report
     }
@@ -2961,7 +2958,7 @@ impl Page {
     /// (members rebuilt from their group, parity re-encoded) and the node acked, what the node refused, and the groups
     /// no read could solve. Derived, never stored twice: the page's two sets and the engine's counts.
     pub fn repair_report(&self) -> RepairReport {
-        let missing: BTreeSet<Cid> = self.missing_seen.iter().chain(self.pass_absent.iter()).filter(|id| !self.served_seen.contains(*id)).copied().collect();
+        let missing: BTreeSet<Cid> = self.missing_seen.iter().filter(|id| !self.served_seen.contains(*id)).copied().collect();
         let put_back: BTreeSet<Cid> = self.repairs_acked.difference(&self.served_seen).copied().collect();
         let parity = self.engine.pass_parity();
         RepairReport {
@@ -2978,7 +2975,9 @@ impl Page {
             parity_mismatched: self.engine.parity_counts().2,
             // Sent this pass, not yet answered (a finally refused one leaves `repair_puts`).
             // Put-backs sent and not answered, and blocks still undecided (inside their bound): a pass waits for both.
-            pending: (self.pass_puts.iter().filter(|id| self.repair_puts.contains(*id) && !self.repairs_acked.contains(*id)).count() + self.pass_undecided().len()) as u64,
+            // Undecided blocks count only while their ask is inside its bound: an OVERDUE one ends the report's wait.
+            pending: (self.pass_puts.iter().filter(|id| self.repair_puts.contains(*id) && !self.repairs_acked.contains(*id)).count()
+                + self.pass_undecided().iter().filter(|id| self.pass_asked.contains_key(*id) && !self.pass_overdue.contains(*id)).count()) as u64,
             why: self.engine.repair_failed().map(str::to_string),
         }
     }

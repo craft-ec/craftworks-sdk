@@ -3720,27 +3720,50 @@ fn a_block_silent_inside_its_bound_is_unanswered_not_missing_and_gets_no_put() {
     assert_eq!(puts, 0, "a slow block was re-PUT {puts} times");
 }
 
-/// **A BLOCK SILENT PAST ITS NODE BOUND IS MISSING, AND PUT BACK** (the other half of the rule): the node LACKS some
-/// members and answers them with SILENCE, never NotFound; a pass that waits out their node bound counts each MISSING
-/// and puts it back -- the node holds it again.
+/// **SILENCE PAST THE BOUND IS STILL NO VERDICT** (rule 8; the architect + core dev on #574): the node LACKS some
+/// blocks -- data members AND parity slots -- and answers them with SILENCE, never NotFound. A pass waits out their node
+/// bound and ENDS: they are UNANSWERED ("N did not answer") -- not missing, not put back, not DAMAGED, no read ended by
+/// time. The mutant "synthesize BlockMissed at the bound" (a clock's verdict) turns this red.
 #[test]
-fn a_block_silent_past_its_bound_is_missing_and_put_back() {
+fn a_block_silent_past_its_bound_ends_the_pass_unanswered_not_missing_not_put_back_not_damaged() {
     let Lossy { mut node, mut now, tree, .. } = lossy_tree(55, None);
-    let gone = some_members(&node, &tree, 5);
-    assert!(!gone.is_empty(), "THE SETUP: no member to lose");
-    for (id, _) in &gone {
+    let root = node.head().expect("a head").1;
+    let root_state = node.contracts[&wire::block::contract_for(BLOCK_CODE, &root)].clone();
+    let parity: Vec<[u8; 32]> = freenet_prolly::node::Node::parse(&root_state[1..]).expect("a node").parity().take(3).map(|c| wire::block::contract_for(BLOCK_CODE, &c)).collect();
+    let members: Vec<[u8; 32]> = some_members(&node, &tree, 5).into_iter().map(|(id, _)| id).collect();
+    let gone: Vec<[u8; 32]> = members.iter().chain(parity.iter()).copied().collect();
+    assert!(!members.is_empty() && !parity.is_empty(), "THE SETUP: no member or parity slot to silence");
+    for id in &gone {
         node.contracts.remove(id);
         node.silent_gets.insert(*id);
     }
+    let puts_before = node.served.get("put block").copied().unwrap_or(0);
     let mut r = reader_with(&node, engine::Params::default());
     client(&mut r, &mut node, &mut now, &Request::Identity);
     r.server.page.begin_repair_pass(true);
-    assert_eq!(read_all(&mut r, &mut node, &mut now, 1_100), 2_000, "the pass did not read every row");
+    let start = now;
+    assert_eq!(read_all_prompt(&mut r, &mut node, &mut now, 1_100), 2_000, "the pass did not read every row");
+    // Wait out every bound: the report stops waiting for an overdue ask (its `pending` ends), nothing else changes.
+    for _ in 0..200 {
+        if r.server.page.repair_report().pending == 0 {
+            break;
+        }
+        now = r.next_due().map_or(now + 1_000, |Ms(t)| t.max(now + 1));
+        r.tick(Ms(now));
+        for f in r.take_frames() {
+            if let Some(a) = node.serve(&f) {
+                r.inbound(&a, Ms(now));
+            }
+        }
+    }
     let rep = r.server.page.end_repair_pass();
-    let back = gone.iter().filter(|(id, _)| node.contracts.contains_key(id)).count();
-    println!("absent: {} members lost, silent; missing {}, unanswered {}, put back {}; the node holds {back} again", gone.len(), rep.missing, rep.unanswered, rep.put_back);
-    assert!(rep.missing >= gone.len() as u64 && rep.put_back == rep.missing, "silent-past-bound blocks were not counted missing and put back: {rep:?}");
-    assert_eq!(back, gone.len(), "a lost silent block is not back on the node");
+    let puts = node.served.get("put block").copied().unwrap_or(0) - puts_before;
+    println!("silent past the bound: {} members + {} parity silent; waited {} ms; missing {}, unanswered {}, put back {}, given up {}; block PUTs {puts}", members.len(), parity.len(), now - start, rep.missing, rep.unanswered, rep.put_back, rep.given_up);
+    assert!(now - start >= page::rto::NODE_GET_BOUND_MS as u64, "THE SETUP: the pass never waited out a node bound");
+    assert_eq!((rep.missing, rep.put_back, rep.given_up), (0, 0, 0), "a silent block got a clock's verdict: {rep:?}");
+    assert!(rep.unanswered > 0 && rep.pending == 0, "the pass did not END with its silent blocks UNANSWERED: {rep:?}");
+    assert_eq!(puts, 0, "a silent block was PUT {puts} times");
+    assert!(gone.iter().all(|id| !node.contracts.contains_key(id)), "a silent block was put back");
 }
 
 /// **A GROUP PAST REPAIR ENDS THE PASS, DAMAGED** (core dev, engineer2's m+1 run: the check never ended). The node
