@@ -136,19 +136,30 @@ CONTROLS=(
   "fixture-gate|./fixture-gate.sh"
   "dup-gate|node tools/dup-gate.mjs"
   "owners|node tools/owners.mjs"
+  "model_targets|node tools/pr-scope.mjs model-check"
 )
-# BATCH-ONLY TESTS (the owner: a PR runs what is relevant to it): test targets too slow for every PR, as
-# `member@target`, each with its measured time. `--pr` skips them BY NAME and prints them ("batch-only, skipped");
-# the batch gate (the full run) runs them, and records each one's own count as `gate.baseline.d/member@target`, so a
-# PR's count for that member compares against the baseline minus them.
-#
-# They run in RELEASE speed with debug assertions ON (`--profile model`, Cargo.toml: sdk#397's clock-origin guard is a
-# debug_assert). Release measured 2026-09-24, one model test at CRAFTWORKS_MODEL_SEEDS=2, the same result in both
-# profiles, at load ~106-110: debug 35.7 s wall / 13.5 s CPU, release 0.86 s wall / 0.54 s CPU.
-BATCH_ONLY=(
-  "page@model"
-)
-batch_only_of() { local e; for e in "${BATCH_ONLY[@]}"; do [ "${e%%@*}" = "$1" ] && echo "${e#*@}"; done; }
+# THE MODEL TESTS (sdk#536): DERIVED, never listed -- every test target named `model` or `*_model` (cargo metadata;
+# tools/pr-scope.mjs `model-targets`), and the `model_targets` control fails a seeded model test outside that name.
+# BOTH gates run them in `--profile model` (release speed WITH debug assertions, Cargo.toml: sdk#397's clock-origin
+# guard is a debug_assert), their seeds on every core (testkit::model): the batch gate the full count
+# (CRAFTWORKS_MODEL_SEEDS unset = 40, each model's full sweep), `--pr` a share (GATE_PR_MODEL_SEEDS, default 4 =
+# a tenth). One model test at CRAFTWORKS_MODEL_SEEDS=2, measured 2026-09-24 at load ~106-110: debug 35.7 s wall /
+# 13.5 s CPU, release 0.86 s wall / 0.54 s CPU.
+model_targets_of() { node tools/pr-scope.mjs model-targets "$1" "$2"; }
+
+# ONE member's tests, the ONE way both gates run them: its model targets (from `$3`) in `--profile model`, the rest
+# (lib, bins, other tests, doc-tests) as usual. Prints the whole output; its status is the member's.
+test_member() {
+  local m=$1 meta=$2 models=$3 rc=0 ta targs tdoc t
+  if [ -z "$models" ]; then cargo test -p "$m" --no-fail-fast 2>&1; return $?; fi
+  ta=$(node tools/pr-scope.mjs test-args "$meta" "$m" $models)
+  targs=$(echo "$ta" | sed -n 1p); tdoc=$(echo "$ta" | sed -n 2p)
+  # shellcheck disable=SC2086
+  if [ -n "$targs" ]; then cargo test -p "$m" --no-fail-fast $targs 2>&1 || rc=1; fi
+  if [ "$tdoc" = doc ]; then cargo test -p "$m" --doc 2>&1 || rc=1; fi
+  for t in $models; do cargo test --profile model -p "$m" --no-fail-fast --test "$t" 2>&1 || rc=1; done
+  return $rc
+}
 
 run_controls() {
   for c in "${CONTROLS[@]}"; do
@@ -245,7 +256,7 @@ if [ "$MODE" = pr ]; then
   echo "gate --pr: controls: $(for c in "${CONTROLS[@]}"; do printf '%s ' "${c%%|*}"; done)"
   echo "gate --pr: changed members: $(field changed)"
   echo "gate --pr: members tested (changed only; dependents run at the batch gate): ${scope:-(none)}"
-  echo "gate --pr: batch-only (skipped here, run by the batch gate): ${BATCH_ONLY[*]}"
+  echo "gate --pr: model seeds: ${GATE_PR_MODEL_SEEDS:-4} of 40 (GATE_PR_MODEL_SEEDS), --profile model"
   echo "gate --pr: npm: $npm_needed"
   [ "$DRY" -eq 1 ] && exit 0
   target_guard
@@ -268,25 +279,12 @@ if [ "$MODE" = pr ]; then
   if [ -n "$scope" ]; then
     step "cargo test, the PR's members (before -> after, against $base)"
     for m in $scope; do
-      skip=$(batch_only_of "$m" | tr '\n' ' ')
-      if [ -n "$skip" ]; then
-        ta=$(node tools/pr-scope.mjs test-args "$meta" "$m" $skip)
-        targs=$(echo "$ta" | sed -n 1p); tdoc=$(echo "$ta" | sed -n 2p)
-        echo "batch-only, skipped: $(for t in $skip; do printf '%s@%s ' "$m" "$t"; done)"
-        # shellcheck disable=SC2086
-        out=$(cargo test -p "$m" --no-fail-fast $targs 2>&1); rc=$?
-        if [ "$tdoc" = doc ]; then dout=$(cargo test -p "$m" --doc 2>&1) || rc=1; out="$out"$'\n'"$dout"; fi
-      else
-        out=$(cargo test -p "$m" --no-fail-fast 2>&1); rc=$?
-      fi
+      models=$(model_targets_of "$meta" "$m")
+      [ -n "$models" ] && echo "$m: model targets, --profile model: $models"
+      out=$(CRAFTWORKS_MODEL_SEEDS=${GATE_PR_MODEL_SEEDS:-4} test_member "$m" "$meta" "$models"); rc=$?
       n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
       [ $rc -ne 0 ] && { step_fail "cargo test -p $m FAILED"; echo "$out" | grep -E "^(error|test result: FAILED|---- )" | head -5 >&2; }
       b=$(base_count "$m"); [ -z "$b" ] && b=-
-      for t in $skip; do
-        bt=$(base_count "$m@$t")
-        if [ -z "$bt" ] || [ "$b" = - ]; then b="?"; break; fi
-        b=$((b - bt))
-      done
       if drop_ok "$m"; then l=$(node tools/pr-scope.mjs count "$m" "$b" "$n" --drop-ok); else l=$(node tools/pr-scope.mjs count "$m" "$b" "$n") || fail "$m: count DROPPED"; fi
       echo "$l"; lines+=("$l")
       [ "$n" -eq 0 ] && ! no_host_tests "$m" && step_fail "$m ran NO tests and is not in no_host_tests() (sdk#475)"
@@ -295,8 +293,6 @@ if [ "$MODE" = pr ]; then
       # Every test the PR ADDS in this member ran (sdk#475): also catches a test behind a cfg inside a target that runs
       # others. The diff is the branch's commits, what is not committed yet, and new untracked files.
       if [ "$mdir" = . ]; then paths=(src tests examples benches build.rs ':(exclude)tests/js'); else paths=("$mdir"); fi
-      # A batch-only target is not run here (the batch gate runs it), so the tests it gains are not asked for here.
-      for t in $skip; do paths+=(":(exclude)$mdir/tests/$t.rs" ":(exclude)$mdir/tests/$t"); done
       mb=$(git merge-base "$base" HEAD)
       outf=$(mktemp); printf '%s\n' "$out" > "$outf"
       if ! u=$({ git diff "$mb" -- "${paths[@]}"
@@ -349,7 +345,7 @@ if [ -z "$MEMBERS" ]; then
   exit 1
 fi
 echo "gate: $(echo "$MEMBERS" | wc -l | tr -d ' ') workspace members, from cargo metadata"
-# Only for the gate's OWN test (its batch-only path, run cheaply): never a way to skip members in a batch run, and
+# Only for the gate's OWN test (its model-target path, run cheaply): never a way to skip members in a batch run, and
 # said on every run that uses it.
 if [ -n "${GATE_ONLY_MEMBERS:-}" ]; then
   MEMBERS=$(printf '%s\n' $GATE_ONLY_MEMBERS)
@@ -358,10 +354,11 @@ fi
 
 
 # ------------------------------------------------------------- tests ----
-# THE MODEL'S SEEDS (page/tests/model.rs, CRAFTWORKS_MODEL_SEEDS): the batch gate runs the full count, stated.
+# THE MODEL TESTS' SEEDS (every model target, through testkit::model; CRAFTWORKS_MODEL_SEEDS): the batch gate runs the
+# full count, stated.
 export CRAFTWORKS_MODEL_SEEDS=${CRAFTWORKS_MODEL_SEEDS:-40}
 echo "gate: model seeds $CRAFTWORKS_MODEL_SEEDS (CRAFTWORKS_MODEL_SEEDS)"
-echo "gate: batch-only targets, run here: ${BATCH_ONLY[*]}"
+echo "gate: model targets, --profile model, derived per member (tools/pr-scope.mjs model-targets)"
 [ "$DRY" -eq 1 ] && { echo "gate: --dry-run, nothing run"; exit 0; }
 step "cargo test, per member"
 declare -a NAMES COUNTS
@@ -372,19 +369,10 @@ failures_dir=${GATE_FAILURES_DIR:-target/gate-failures}
 FULL_META=$(mktemp)
 cargo metadata --format-version 1 --no-deps > "$FULL_META" 2>/dev/null
 for m in $MEMBERS; do
-  skip=$(batch_only_of "$m" | tr '\n' ' ')
-  bo_counts=""
-  if [ -n "$skip" ]; then
-    # Its batch-only targets apart, in RELEASE (above); the rest of the member as usual.
-    ta=$(node tools/pr-scope.mjs test-args "$FULL_META" "$m" $skip)
-    # shellcheck disable=SC2086
-    out=$(cargo test -p "$m" --no-fail-fast $(echo "$ta" | sed -n 1p) 2>&1); rc=$?
-    if [ "$(echo "$ta" | sed -n 2p)" = doc ]; then dout=$(cargo test -p "$m" --doc 2>&1) || rc=1; out="$out"$'\n'"$dout"; fi
-    for t in $skip; do
-      rout=$(cargo test --profile model -p "$m" --no-fail-fast --test "$t" 2>&1) || rc=1
-      out="$out"$'\n'"$rout"
-      bo_counts="$bo_counts $t=$(echo "$rout" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')"
-    done
+  models=$(model_targets_of "$FULL_META" "$m")
+  if [ -n "$models" ]; then
+    echo "$m: model targets, --profile model: $models"
+    out=$(test_member "$m" "$FULL_META" "$models"); rc=$?
     n=$(echo "$out" | grep -E "^test result" | awk '{s+=$4} END {print s+0}')
     # (its exit is the member's status, already in rc)
     printf '%s\n' "$out" | ./tools/gate-member-tests.sh --keep "$m" "$failures_dir" "$rc" || true
@@ -404,12 +392,6 @@ no_host_tests() WITH its reason. An uncovered member is what this gate is for."
   silent_targets "$m" "$(member_dir "$FULL_META" "$m")" "$out"
   NAMES+=("$m"); COUNTS+=("$n")
   total=$((total + n))
-  # A batch-only target's OWN count, recorded beside its member's, so `--pr` (which skips it) compares like with like.
-  for t in $skip; do
-    nt=$(printf '%s\n' $bo_counts | grep "^$t=" | cut -d= -f2)
-    [ -n "$nt" ] && [ "$nt" -gt 0 ] || { step_fail "batch-only $m@$t ran no tests in the full run"; nt=0; }
-    NAMES+=("$m@$t"); COUNTS+=("$nt")
-  done
 done
 
 # ------------------------------------------------------------ clippy ----

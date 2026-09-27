@@ -7,7 +7,7 @@
 #   gate-member-tests.sh <member> <dir> [<out-file>]   (<out-file>: the whole output, for gate.sh's check that no
 #                                                       test target ran 0 tests while declaring some, sdk#475)
 #   gate-member-tests.sh --keep <member> <dir> <rc>    (the output on stdin: a member gate.sh ran its own way,
-#                                                       e.g. with batch-only targets apart -- the SAME keeping)
+#                                                       e.g. its model targets in --profile model -- the SAME keeping)
 set -uo pipefail
 
 # Keep `out` for member `m` in `dir` when `rc` is a failure: the ONE statement of the keeping.

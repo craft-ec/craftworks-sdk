@@ -311,8 +311,11 @@ fn run(seed: u64) -> (Vec<Finding>, Counts) {
 fn the_write_path_properties_hold_on_the_real_queue() {
     let mut classes: BTreeMap<&'static str, (usize, String)> = BTreeMap::new();
     let mut total = Counts::default();
-    for seed in 0..200 {
-        let (found, c) = run(seed);
+    // 200 seeds at the full count (`CRAFTWORKS_MODEL_SEEDS` takes a share, on every core: testkit::model); a share
+    // runs on until a commit was forced and a write ended named, never past the 200.
+    let runs = testkit::model::until(0, testkit::model::share(200), 200, run, |all| all.iter().any(|(_, (_, c))| c.forced > 0) && all.iter().any(|(_, (_, c))| !c.named.is_empty()));
+    let n = runs.len();
+    for (_, (found, c)) in runs {
         let mut seen: BTreeSet<&'static str> = BTreeSet::new();
         for f in found {
             if seen.insert(f.class) {
@@ -327,11 +330,14 @@ fn the_write_path_properties_hold_on_the_real_queue() {
             *total.named.entry(k).or_default() += v;
         }
     }
-    println!("  200 seeds: {} writes made, {} Published, ended named {:?}, {} refused at the door, {} forced", total.made, total.published, total.named, total.door, total.forced);
-    for (class, (n, first)) in &classes {
-        println!("  {class}: {n} of 200 seeds — first: {first}");
+    println!("  {n} seeds: {} writes made, {} Published, ended named {:?}, {} refused at the door, {} forced", total.made, total.published, total.named, total.door, total.forced);
+    for (class, (k, first)) in &classes {
+        println!("  {class}: {k} of {n} seeds — first: {first}");
     }
-    assert!(total.made > 5_000 && total.published > 0 && total.forced > 0, "the model made too little to check anything: {total:?}");
-    assert!(!total.named.is_empty(), "no write ever ended named: the races never killed a commit, so 'nothing vanishes untold' was never tested");
+    if testkit::model::alone().is_none() {
+        // 5,000 writes over the full 200 seeds: 25 a seed.
+        assert!(total.made > 25 * n && total.published > 0 && total.forced > 0, "the model made too little to check anything: {total:?}");
+        assert!(!total.named.is_empty(), "no write ever ended named: the races never killed a commit, so 'nothing vanishes untold' was never tested");
+    }
     assert!(classes.is_empty(), "the write path failed its model: {classes:?}");
 }
