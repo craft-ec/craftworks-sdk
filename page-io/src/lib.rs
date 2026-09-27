@@ -792,12 +792,19 @@ impl PageIo {
         Ok(())
     }
 
-    /// PUBLISH AN APP (sdk#516; APP-PUBLISH.md): PUT every piece of its `sets` (each set's containers in the set's
-    /// order), and send the SITE (`site_code`, `web`) only once EVERY set has `k` pieces acked (P1). PUBLISHED is the
-    /// site read back; BACKED_UP every piece acked; a set that cannot reach `k` ends it REFUSED before any site.
-    /// [`PageIo::app_publish_status`] says where it stands. Refused by name: a reader, a bad set, a piece that is not
-    /// at the address its set names, or a publish of `app` already in flight.
-    pub fn publish_app(&mut self, app: &str, sets: Vec<(pieces::PieceSet, Vec<(ContractContainer, WrappedState)>)>, site_code: &[u8], web: Vec<u8>, now: Ms) -> Result<(), String> {
+    /// CREATE (OR UPGRADE) AN APP'S SITE -- the ONE thing a site is written for (ARCHITECTURE §19, the bootstrap;
+    /// app-as-data P4): freenet serves a page only from a web container, so the site holds a fixed STARTER (the build's
+    /// loader, decoder and starter modules, naming its ONE piece set) plus the POINTER (`wire::webapp::site_pointer`,
+    /// composed HERE from this session's register params and `app`: it names whose tree the app is in). The app
+    /// itself is data in that tree (its definition doors), never in a site; so a site is written at the app's first
+    /// Publish and on a platform upgrade (the builder's decision), never per app version.
+    ///
+    /// The build's piece `set` is PUT (its containers in the set's order), and the site sent only once the set has
+    /// `k` pieces acked (P1). PUBLISHED is the site read back; BACKED_UP every piece acked; a set that cannot reach
+    /// `k` ends it REFUSED before any site. [`PageIo::app_publish_status`] says where it stands. Refused by name: a
+    /// reader, a bad set, a piece not at the address its set names, a starter carrying its own pointer or an
+    /// `app.json` (the app is in the tree), or a publish of `app` already in flight.
+    pub fn publish_app(&mut self, app: &str, set: (pieces::PieceSet, Vec<(ContractContainer, WrappedState)>), starter: &[(String, Vec<u8>)], site_code: &[u8], now: Ms) -> Result<(), String> {
         if self.read_only() {
             return Err("read-only: a reader publishes nothing".into());
         }
@@ -807,13 +814,22 @@ impl PageIo {
         if self.publishes.get(app).is_some_and(|p| p.get().in_flight()) {
             return Err(format!("{app} is being published already"));
         }
-        // Refused BEFORE any piece is PUT: a site it could never read back would publish nothing.
-        site_fits(app, &web)?;
         // Nothing to PUT means no ack could ever send the site (Codex on #527, A): refused, never a publish stuck at
         // `pieces` that blocks every later one.
-        if sets.is_empty() {
-            return Err(format!("{app}'s publish names no piece set: nothing could ever send its site"));
+        if set.0.pieces.is_empty() {
+            return Err(format!("{app}'s publish names no piece: nothing could ever send its site"));
         }
+        // THE SITE: the starter and the pointer, and nothing per version.
+        if let Some((path, _)) = starter.iter().find(|(p, _)| p == wire::webapp::POINTER_PATH || p == "app.json") {
+            return Err(format!("the starter carries its own `{path}`: a site holds the starter and the pointer page-io composes, and the app is in the tree"));
+        }
+        let pointer = wire::webapp::site_pointer(&self.art.register_params, app).ok_or_else(|| format!("no pointer for {app:?}: not an app id, or no register yet"))?;
+        let mut files: Vec<(&str, &[u8])> = starter.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+        files.push((wire::webapp::POINTER_PATH, &pointer));
+        let web = wire::webapp::app_web(&files)?;
+        // The site AS COMPOSED (starter + pointer) must be one this page can read back: refused BEFORE any piece is PUT.
+        site_fits(app, &web)?;
+        let sets = vec![set];
         let mut progress = Vec::new();
         let mut puts = Vec::new();
         let mut seen = std::collections::BTreeSet::new();

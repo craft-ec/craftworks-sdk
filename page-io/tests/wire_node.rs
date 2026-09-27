@@ -2465,6 +2465,21 @@ fn web(n: u8) -> Vec<u8> {
     vec![n; 300]
 }
 
+/// A site's STARTER (app-as-data P4): the build's files, without the pointer page-io adds.
+fn starter(n: u8) -> Vec<(String, Vec<u8>)> {
+    vec![("index.html".to_string(), vec![n; 300]), ("loader.js".to_string(), vec![n.wrapping_add(1); 50])]
+}
+
+/// The site `app`'s publish of [`starter`] `n` holds: the starter and the pointer to `node`'s register, as page-io
+/// composes it (`wire::webapp`'s one owners).
+fn site_web(node: &WireNode, app: &str, n: u8) -> Vec<u8> {
+    let pointer = wire::webapp::site_pointer(&node.register_params, app).expect("a pointer");
+    let st = starter(n);
+    let mut files: Vec<(&str, &[u8])> = st.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+    files.push((wire::webapp::POINTER_PATH, &pointer));
+    wire::webapp::app_web(&files).expect("a web")
+}
+
 fn publish(io: &mut PageIo, node: &mut WireNode, now: &mut u64, n: u8) -> Option<page::Publication> {
     io.publish_site(APP, SITE_CODE, web(n), Ms(*now)).expect("publishes");
     settle(io, node, now);
@@ -3050,7 +3065,7 @@ fn an_app_publish_sends_its_site_only_at_k_and_is_published_before_every_piece_i
     let (set, containers) = piece_set("core", 5, 3, 2);
     let withheld: Vec<ContractKey> = containers[3..].iter().map(|(c, _)| c.key()).collect();
     let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
-    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    io.publish_app(APP, (set, containers), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
     assert_eq!(stage(&io, APP).as_deref(), Some("Pieces"));
     let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
     let (held, site_after) = drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("Published"));
@@ -3078,8 +3093,8 @@ fn a_cancelled_publish_never_withdraws_a_piece_another_publish_owes() {
     let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
     let withheld: Vec<ContractKey> = keys[3..].to_vec();
     const OTHER: &str = "tasks";
-    io.publish_app(APP, vec![(set.clone(), containers.clone())], SITE_CODE, web(1), Ms(now)).expect("publishes");
-    io.publish_app(OTHER, vec![(set, containers)], SITE_CODE, web(2), Ms(now)).expect("the other app publishes");
+    io.publish_app(APP, (set.clone(), containers.clone()), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
+    io.publish_app(OTHER, (set, containers), &starter(2), SITE_CODE, Ms(now)).expect("the other app publishes");
     let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
     let (held, _) = drive(&mut io, &mut node, &mut now, &fate, false, &|io| [APP, OTHER].iter().all(|a| stage(io, a).as_deref() == Some("Published")));
     assert_eq!((stage(&io, APP).as_deref(), stage(&io, OTHER).as_deref()), (Some("Published"), Some("Published")), "THE SETUP: both publishes were not PUBLISHED with pieces owed");
@@ -3115,8 +3130,8 @@ fn the_two_app_model_never_withdraws_a_shared_piece_the_other_owes() {
         let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
         let (w1, w2) = (next(5), next(5));
         let withheld: Vec<ContractKey> = [keys[w1], keys[w2]].to_vec();
-        io.publish_app(APP, vec![(set.clone(), containers.clone())], SITE_CODE, web(1), Ms(now)).expect("publishes");
-        io.publish_app(OTHER, vec![(set, containers)], SITE_CODE, web(2), Ms(now)).expect("the other app publishes");
+        io.publish_app(APP, (set.clone(), containers.clone()), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
+        io.publish_app(OTHER, (set, containers), &starter(2), SITE_CODE, Ms(now)).expect("the other app publishes");
         let at = ["Pieces", "Siting", "Published", "never"][next(4)];
         let fate = |k: &ContractKey| keys.contains(k).then(|| if withheld.contains(k) { PieceFate::Withhold } else { PieceFate::Serve });
         let (held, _) = if at == "Pieces" {
@@ -3147,7 +3162,7 @@ fn a_cancelled_site_ends_the_app_publish() {
     let mut now = 1_000;
     let (set, containers) = piece_set("core", 3, 2, 1);
     let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
-    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    io.publish_app(APP, (set, containers), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
     let fate = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
     drive(&mut io, &mut node, &mut now, &fate, true, &|io| stage(io, APP).as_deref() == Some("Siting"));
     assert_eq!(stage(&io, APP).as_deref(), Some("Siting"), "THE SETUP: the publish is not waiting on its site");
@@ -3167,7 +3182,7 @@ fn a_refusal_after_k_says_backed_up_will_not_come() {
     let (set, containers) = piece_set("core", 5, 3, 2);
     let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
     let last = keys[4];
-    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    io.publish_app(APP, (set, containers), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
     let fate = |k: &ContractKey| keys.contains(k).then(|| if *k == last { PieceFate::Refuse } else { PieceFate::Serve });
     drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("Published") && io.app_publish(APP).is_some_and(|a| a.set_lines().iter().any(|l| l.acked == 4 && l.refused == 1)));
     let a = io.app_publish(APP).expect("a publish");
@@ -3182,8 +3197,10 @@ fn a_refusal_after_k_says_backed_up_will_not_come() {
 fn a_publish_with_no_piece_set_is_refused() {
     let node = WireNode::new(&[3u8; 32]);
     let mut io = page_io(&node);
-    let e = io.publish_app(APP, Vec::new(), SITE_CODE, web(1), Ms(1)).expect_err("a publish with no set was taken");
-    assert!(e.contains("names no piece set"), "{e}");
+    let (mut set, _) = piece_set("core", 3, 2, 1);
+    set.pieces.clear();
+    let e = io.publish_app(APP, (set, Vec::new()), &starter(1), SITE_CODE, Ms(1)).expect_err("a publish with no piece was taken");
+    assert!(e.contains("names no piece"), "{e}");
     assert!(io.app_publish(APP).is_none(), "a refused publish left a state behind");
 }
 
@@ -3197,7 +3214,7 @@ fn a_direct_site_publish_is_refused_while_an_app_publish_is_in_flight() {
     let mut now = 1_000;
     let (set, containers) = piece_set("core", 3, 2, 1);
     let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
-    io.publish_app(APP, vec![(set, containers)], SITE_CODE, web(1), Ms(now)).expect("publishes");
+    io.publish_app(APP, (set, containers), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
     let e = io.publish_site(APP, SITE_CODE, web(7), Ms(now)).expect_err("a direct publish_site was taken while the app publish was in Pieces");
     assert!(e.contains("being published"), "{e}");
     let fate = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
@@ -3206,7 +3223,7 @@ fn a_direct_site_publish_is_refused_while_an_app_publish_is_in_flight() {
     assert!(io.publish_site(APP, SITE_CODE, web(7), Ms(now)).is_err(), "a direct publish_site replaced the site the machine waits on");
     drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
     assert_eq!(stage(&io, APP).as_deref(), Some("BackedUp"));
-    assert_eq!(node.site().map(|(_, value, _)| value), Some(blake3::hash(&web(1)).as_bytes().to_vec()), "the live site is not the app publish's own");
+    assert_eq!(node.site().map(|(_, value, _)| value), Some(blake3::hash(&site_web(&node, APP, 1)).as_bytes().to_vec()), "the live site is not the app publish's own");
 }
 
 /// **A REPUBLISH does not leave the last publish's owed pieces retrying for ever** (Codex on #527, C): v1 is PUBLISHED
@@ -3220,14 +3237,14 @@ fn a_republish_withdraws_the_last_publishs_pieces_nobody_owes() {
     let (set1, c1) = piece_set("v1", 3, 2, 1);
     let lost = c1[2].0.key();
     let k1: Vec<ContractKey> = c1.iter().map(|(c, _)| c.key()).collect();
-    io.publish_app(APP, vec![(set1, c1)], SITE_CODE, web(1), Ms(now)).expect("v1 publishes");
+    io.publish_app(APP, (set1, c1), &starter(1), SITE_CODE, Ms(now)).expect("v1 publishes");
     let fate1 = |k: &ContractKey| k1.contains(k).then(|| if *k == lost { PieceFate::Withhold } else { PieceFate::Serve });
     let (held, _) = drive(&mut io, &mut node, &mut now, &fate1, false, &|io| stage(io, APP).as_deref() == Some("Published"));
     assert_eq!(stage(&io, APP).as_deref(), Some("Published"), "THE SETUP: v1 is not PUBLISHED with a piece owed");
     assert!(!held.is_empty(), "THE SETUP: v1's piece was never sent");
     let (set2, c2) = piece_set("v2", 3, 2, 1);
     let k2: Vec<ContractKey> = c2.iter().map(|(c, _)| c.key()).collect();
-    io.publish_app(APP, vec![(set2, c2)], SITE_CODE, web(2), Ms(now)).expect("v2 publishes");
+    io.publish_app(APP, (set2, c2), &starter(2), SITE_CODE, Ms(now)).expect("v2 publishes");
     let resent = std::cell::Cell::new(0usize);
     let fate2 = |k: &ContractKey| {
         if *k == lost {
@@ -3249,11 +3266,10 @@ fn a_republish_withdraws_the_last_publishs_pieces_nobody_owes() {
 fn a_publish_naming_a_piece_twice_is_refused() {
     let node = WireNode::new(&[3u8; 32]);
     let mut io = page_io(&node);
-    let (a, ca) = piece_set("core", 3, 2, 1);
-    let (mut b, mut cb) = piece_set("prov", 3, 2, 1);
-    b.pieces[0] = a.pieces[0].clone();
-    cb[0] = ca[0].clone();
-    let e = io.publish_app(APP, vec![(a, ca), (b, cb)], SITE_CODE, web(1), Ms(1)).expect_err("a duplicate address was taken");
+    let (mut a, mut ca) = piece_set("core", 3, 2, 1);
+    a.pieces[1] = a.pieces[0].clone();
+    ca[1] = ca[0].clone();
+    let e = io.publish_app(APP, (a, ca), &starter(1), SITE_CODE, Ms(1)).expect_err("a duplicate address was taken");
     assert!(e.contains("another piece of this publish names too"), "{e}");
 }
 
@@ -3319,9 +3335,55 @@ fn a_site_too_large_to_read_back_is_refused_before_it_is_sent() {
     let e = io.publish_site(APP, SITE_CODE, big.clone(), Ms(1)).expect_err("a site too large to read back was taken");
     assert!(e.contains(&big.len().to_string()) && e.contains("read back"), "the refusal does not name the size: {e}");
     let (set, containers) = piece_set("core", 3, 2, 1);
-    let e = io.publish_app(APP, vec![(set, containers)], SITE_CODE, big, Ms(1)).expect_err("an app publish of a site too large to read back was taken");
+    let e = io.publish_app(APP, (set, containers), &[("index.html".to_string(), big)], SITE_CODE, Ms(1)).expect_err("an app publish of a site too large to read back was taken");
     assert!(e.contains("read back"), "{e}");
     assert!(io.take_frames().is_empty(), "a frame left for a site that was refused");
     assert!(io.publication(APP).is_none() && io.app_publish(APP).is_none(), "a refused site left a publication behind");
     io.publish_site(APP, SITE_CODE, vec![5u8; 6_000_000], Ms(1)).expect("THE CONTROL: the builder's 6 MB site is taken");
+}
+
+/// **A SITE IS THE STARTER AND THE POINTER, NOTHING PER VERSION** (ARCHITECTURE §19's bootstrap; app-as-data P4): the
+/// live site's web is exactly the build's starter plus `pointer.json` -- `{"app","register_params"}`, composed by
+/// page-io from THIS session's register, the loader's way to the tree -- and a starter that brings its own pointer
+/// or an `app.json` (an app version in a site) is refused by name, before anything is PUT.
+#[test]
+fn a_site_is_the_starter_and_the_pointer_to_this_register() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let (set, containers) = piece_set("core", 3, 2, 1);
+    let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+    for extra in [wire::webapp::POINTER_PATH, "app.json"] {
+        let mut st = starter(1);
+        st.push((extra.to_string(), b"{}".to_vec()));
+        let e = io.publish_app(APP, (set.clone(), containers.clone()), &st, SITE_CODE, Ms(now)).expect_err("a starter with its own file was taken");
+        assert!(e.contains(extra), "the refusal does not name `{extra}`: {e}");
+        assert!(io.app_publish(APP).is_none(), "a refused publish left a state behind");
+    }
+    io.publish_app(APP, (set, containers), &starter(1), SITE_CODE, Ms(now)).expect("publishes");
+    let fate = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
+    drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
+    let (_, _, web) = node.site().expect("the site is live");
+    assert_eq!(web, site_web(&node, APP, 1), "the live site is not exactly the starter and this register's pointer");
+    let pointer = String::from_utf8(wire::webapp::site_pointer(&node.register_params, APP).unwrap()).unwrap();
+    assert_eq!(pointer, format!(r#"{{"app":"{APP}","register_params":"{}"}}"#, core_types::hex::encode(&node.register_params)));
+}
+
+/// **A PLATFORM UPGRADE writes the SAME pointer** (the Q3 ruling): a second publish of the app -- a new starter, the
+/// builder's decision -- goes to the same link with a byte-identical pointer; only the starter differs.
+#[test]
+fn an_upgrade_keeps_the_link_and_the_pointer_byte_for_byte() {
+    let mut node = WireNode::new(&[3u8; 32]);
+    let mut io = page_io(&node);
+    let mut now = 1_000;
+    let mut webs = Vec::new();
+    for build in [1u8, 2] {
+        let (set, containers) = piece_set(&format!("build{build}"), 3, 2, 1);
+        let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
+        io.publish_app(APP, (set, containers), &starter(build), SITE_CODE, Ms(now)).expect("publishes");
+        let fate = |k: &ContractKey| keys.contains(k).then_some(PieceFate::Serve);
+        drive(&mut io, &mut node, &mut now, &fate, false, &|io| stage(io, APP).as_deref() == Some("BackedUp"));
+        webs.push(node.site().expect("live").2);
+    }
+    assert_eq!(webs, vec![site_web(&node, APP, 1), site_web(&node, APP, 2)], "an upgrade's site is not its starter and the SAME pointer");
 }

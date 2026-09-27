@@ -681,32 +681,31 @@ impl Session {
         serde_json::json!({ "state": state.code(), "version": version, "said": said }).to_string()
     }
 
-    /// PUBLISH AN APP (sdk#516; APP-PUBLISH.md) and return its site LINK: PUT every load piece, and send the site only
-    /// once EVERY set has `k` pieces acked. `sets` is JSON `[{"name","k","m","pieces":[{"address","sha256"}]}]` (the
-    /// build's pieces.json, the publisher's input); `piece_states` are the pieces' web container states, the sets'
-    /// pieces in order; `webapp_code` is the `webapp` contract they are PUT under; `site_code` and `web` are the site's,
-    /// as for [`Session::publish_site`]. [`Session::app_publish_status`] says how it stands; the builder waits for
-    /// `published` (the site read back), never for every piece.
-    pub fn publish_app(&mut self, app: &str, sets: &str, webapp_code: Vec<u8>, piece_states: js_sys::Array, site_code: Vec<u8>, web: Vec<u8>) -> Result<String, JsValue> {
-        let sets = parse_piece_sets(sets).map_err(|e| JsValue::from_str(&e))?;
-        let mut states = piece_states.iter().map(|v| js_sys::Uint8Array::new(&v).to_vec());
-        let mut with = Vec::new();
-        for set in sets {
-            let mut containers = Vec::new();
-            for _ in 0..set.pieces.len() {
-                let state = states.next().ok_or_else(|| JsValue::from_str(&format!("publish_app: fewer piece states than the sets name (at set {})", set.name)))?;
-                let (_, contract, state) = wire::puts::contract(&webapp_code, &wire::webapp::params(&state), &state);
-                containers.push((contract, state));
-            }
-            with.push((set, containers));
+    /// CREATE (OR UPGRADE) AN APP'S SITE and return its LINK (ARCHITECTURE §19's bootstrap; app-as-data P4): the
+    /// site holds the build's STARTER (`starter`: its loader, decoder and starter modules, as an `AppContainer`) and
+    /// the POINTER the SDK composes from this session's register params and `app` -- never an app version (the app is
+    /// data in the tree, through its definition doors). Written at an app's first Publish and on a platform upgrade
+    /// (the builder's decision). The build's ONE piece `set` is PUT first -- JSON `{"name","k","m","pieces":[{"address",
+    /// "sha256"}]}` (the build's pieces.json), `piece_states` its pieces' web container states in order, under
+    /// `webapp_code` -- and the site sent once the set has `k` acked. [`Session::app_publish_status`] says how it
+    /// stands; the builder waits for `published` (the site read back), never for every piece.
+    pub fn publish_app(&mut self, app: &str, set: &str, webapp_code: Vec<u8>, piece_states: js_sys::Array, site_code: Vec<u8>, starter: &crate::AppContainer) -> Result<String, JsValue> {
+        let set = parse_piece_set(set).map_err(|e| JsValue::from_str(&e))?;
+        let states: Vec<Vec<u8>> = piece_states.iter().map(|v| js_sys::Uint8Array::new(&v).to_vec()).collect();
+        if states.len() != set.pieces.len() {
+            return Err(JsValue::from_str(&format!("publish_app: {} piece states for the {} pieces set {} names", states.len(), set.pieces.len(), set.name)));
         }
-        if states.next().is_some() {
-            return Err(JsValue::from_str("publish_app: more piece states than the sets name"));
-        }
+        let containers = states
+            .iter()
+            .map(|state| {
+                let (_, contract, state) = wire::puts::contract(&webapp_code, &wire::webapp::params(state), state);
+                (contract, state)
+            })
+            .collect();
         let Some(p) = self.page_mut() else {
             return Err(JsValue::from_str("provision first — there is no path to the node before it"));
         };
-        p.publish_app(app, with, &site_code, web, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
+        p.publish_app(app, (set, containers), starter.files(), &site_code, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
         let link = p.site_link(&site_code, app).expect("a site page-io just took for publishing has a link");
         self.pump_page();
         Ok(link)
@@ -1631,10 +1630,13 @@ impl Session {
 
 /// `publish_app`'s sets, as the build's pieces.json names them: each `{name, k, m, pieces: [{address, sha256}]}`, a
 /// sha256 in hex. Refused by name when a field is missing or a set is not `k + m` pieces (`PieceSet::check`).
-fn parse_piece_sets(json: &str) -> Result<Vec<pieces::PieceSet>, String> {
-    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("publish_app: the sets are not JSON: {e}"))?;
-    let sets = v.as_array().ok_or("publish_app: the sets are not a list")?;
-    sets.iter()
+/// The build's ONE piece set, from its JSON (the build's pieces.json entry).
+fn parse_piece_set(json: &str) -> Result<pieces::PieceSet, String> {
+    let s: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("publish_app: the set is not JSON: {e}"))?;
+    if !s.is_object() {
+        return Err("publish_app: the set is not an object: a site carries the build's ONE piece set".into());
+    }
+    std::iter::once(&s)
         .map(|s| {
             let name = s.get("name").and_then(serde_json::Value::as_str).ok_or("publish_app: a set with no name")?.to_string();
             let num = |f: &str| s.get(f).and_then(serde_json::Value::as_u64).map(|n| n as usize).ok_or(format!("publish_app: set {name} has no {f}"));
@@ -1651,7 +1653,7 @@ fn parse_piece_sets(json: &str) -> Result<Vec<pieces::PieceSet>, String> {
             set.check()?;
             Ok(set)
         })
-        .collect()
+        .next().expect("one set in, one out")
 }
 
 /// A head id as `head_id()` gives it: 64 hex characters.
