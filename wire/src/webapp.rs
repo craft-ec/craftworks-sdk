@@ -137,6 +137,11 @@ pub fn piece_container(piece: &[u8]) -> Result<Vec<u8>, String> {
 /// app is in -- the loader reads it, checks it against its own link, and reads the app from that tree.
 pub const POINTER_PATH: &str = "pointer.json";
 
+/// The path of the per-version app MANIFEST a site held before app-as-data (the builder's `app.json`): a site no
+/// longer carries one (the app is data in its tree), so a starter bringing it is refused. Named here, beside
+/// [`POINTER_PATH`], so the site's file names have one home; app-as-data P5 deletes it with `publish_site`.
+pub const LEGACY_APP_JSON: &str = "app.json";
+
 /// A site's POINTER, the ONE owner of its bytes (app-as-data P4): `{"app":"<app id>","register_params":"<hex>"}` --
 /// no version, head or seq, so a platform upgrade writes it byte for byte the same. `None` for an app id that is not
 /// one (`core_types::name::app_ok`: nothing in it needs escaping) or no register params.

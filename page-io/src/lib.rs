@@ -820,7 +820,7 @@ impl PageIo {
             return Err(format!("{app}'s publish names no piece: nothing could ever send its site"));
         }
         // THE SITE: the starter and the pointer, and nothing per version.
-        if let Some((path, _)) = starter.iter().find(|(p, _)| p == wire::webapp::POINTER_PATH || p == "app.json") {
+        if let Some((path, _)) = starter.iter().find(|(p, _)| p == wire::webapp::POINTER_PATH || p == wire::webapp::LEGACY_APP_JSON) {
             return Err(format!("the starter carries its own `{path}`: a site holds the starter and the pointer page-io composes, and the app is in the tree"));
         }
         let pointer = wire::webapp::site_pointer(&self.art.register_params, app).ok_or_else(|| format!("no pointer for {app:?}: not an app id, or no register yet"))?;

@@ -3353,7 +3353,7 @@ fn a_site_is_the_starter_and_the_pointer_to_this_register() {
     let mut now = 1_000;
     let (set, containers) = piece_set("core", 3, 2, 1);
     let keys: Vec<ContractKey> = containers.iter().map(|(c, _)| c.key()).collect();
-    for extra in [wire::webapp::POINTER_PATH, "app.json"] {
+    for extra in [wire::webapp::POINTER_PATH, wire::webapp::LEGACY_APP_JSON] {
         let mut st = starter(1);
         st.push((extra.to_string(), b"{}".to_vec()));
         let e = io.publish_app(APP, (set.clone(), containers.clone()), &st, SITE_CODE, Ms(now)).expect_err("a starter with its own file was taken");
