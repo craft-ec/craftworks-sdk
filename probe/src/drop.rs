@@ -60,7 +60,7 @@ impl DropEvery {
             return Some(key); // a re-send of a dropped block: dropped too
         }
         st.seen += 1;
-        if st.seen % self.every != 0 {
+        if !st.seen.is_multiple_of(self.every) {
             return None;
         }
         st.dropped.insert(*key.id());

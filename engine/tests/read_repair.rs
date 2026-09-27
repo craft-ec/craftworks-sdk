@@ -679,7 +679,7 @@ fn two_parity_lost_with_every_member_there_are_put_back_byte_for_byte() {
     }
     assert!(lost.iter().all(|p| seen.contains(p)), "THE SETUP: the reads never asked the lost parity");
     let want: BTreeMap<Cid, Vec<u8>> = lost.iter().map(|p| (*p, all.get(p).expect("the save wrote it").to_vec())).collect();
-    let short = |c: &Cid| format!("{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3]);
+    let short = |c: &Cid| core_types::hex::encode(&c[..4]);
     for (id, bytes) in &want {
         assert_eq!(put.get(id), Some(bytes), "lost parity {} was not PUT back byte for byte; counts {:?}", short(id), e.parity_counts());
     }
