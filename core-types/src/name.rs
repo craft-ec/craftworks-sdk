@@ -24,6 +24,20 @@ pub fn component_ok(id: &str) -> bool {
     (1..=MAX_COMPONENT).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
+/// The longest file path in an app's definition.
+pub const MAX_FILE_PATH: usize = 128;
+
+/// A FILE's path in an app's definition (`f/<path>`, app-as-data P5: the app's code as data): 1–[`MAX_FILE_PATH`]
+/// bytes of `/`-separated segments, each `[A-Za-z0-9_-][A-Za-z0-9_.-]*` -- so never empty, never `.` or `..`, never a
+/// leading `/`: a path inside the app, and nothing else.
+pub fn file_path_ok(path: &str) -> bool {
+    (1..=MAX_FILE_PATH).contains(&path.len())
+        && path.split('/').all(|seg| {
+            let mut b = seg.bytes();
+            b.next().is_some_and(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)) && b.all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+        })
+}
+
 /// THE RESERVED SEGMENT (ARCHITECTURE §19, "An app is DATA in its owner's tree"): an app's definition lives in
 /// reserved domains of the app, `craftworks.<…>`, which ONLY the SDK's definition doors write -- each named by a
 /// [`SystemDomain`], never spelled by hand. The one statement of the word.
@@ -84,6 +98,16 @@ mod tests {
     fn component_ids() {
         assert!(component_ok("header") && component_ok("C1-a_b") && component_ok(&"a".repeat(64)));
         assert!(!component_ok("") && !component_ok(&"a".repeat(65)) && !component_ok("a.b") && !component_ok("a b") && !component_ok("a/b"));
+    }
+
+    #[test]
+    fn file_paths() {
+        for ok in ["app.js", "components/header.js", "a/b/c.min.css", "_x-1.js", &"a".repeat(128)] {
+            assert!(file_path_ok(ok), "`{ok}` is a file path");
+        }
+        for no in ["", "/app.js", "app.js/", "a//b", ".hidden", "a/../b", "a/./b", "..", "a b.js", "a\\b", &"a".repeat(129)] {
+            assert!(!file_path_ok(no), "`{no}` is not a file path");
+        }
     }
 
     #[test]

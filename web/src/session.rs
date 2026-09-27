@@ -1059,6 +1059,16 @@ impl Session {
         self.decided(r)
     }
 
+    /// A FILE of the app's code (app-as-data P5): the draft's `f/<path>` record holds `bytes` and `meta` (JSON, may be
+    /// `{}`), through the same door and commit path as every definition record. Over a record's bound: refused, named.
+    pub fn draft_file(&mut self, path: &str, bytes: Vec<u8>, meta: &str) -> Result<(), JsValue> {
+        let app = self.door_app()?;
+        let meta: serde_json::Value = serde_json::from_str(meta).map_err(|e| db_err(&DbError::Refused(e.to_string())))?;
+        self.writable()?;
+        let r = self.db.draft_file(Some(&app), path, &bytes, &meta);
+        self.decided(r)
+    }
+
     /// PUBLISH: `craftworks.app` made equal to `craftworks.draft` in ONE write; how many records changed (0: none).
     pub fn publish_definition(&mut self) -> Result<u32, JsValue> {
         let app = self.door_app()?;
@@ -1067,17 +1077,18 @@ impl Session {
         self.decided(r)
     }
 
-    /// The definition `which` holds -- `"draft"` or `"app"` -- as `[{ key, body }]`. `app`: ANOTHER app of this
+    /// The definition `which` holds -- `"draft"` or `"app"` -- as `[{ key, body, bytes? }]` (a file's bytes a
+    /// `Uint8Array`). `app`: ANOTHER app of this
     /// tree, READ-only (the builder lists its projects by each one's `meta`, §19 P3); absent, this session's own. The
     /// writing doors never take one.
-    pub fn definition(&mut self, which: &str, app: Option<String>) -> Result<String, JsValue> {
+    pub fn definition(&mut self, which: &str, app: Option<String>) -> Result<js_sys::Array, JsValue> {
         let app = match app {
             Some(a) => a,
             None => self.door_app()?,
         };
         let which = definition_of(which).map_err(|e| db_err(&e))?;
-        let r = self.db.definition(Some(&app), which).map(definition_json);
-        self.answer(r)
+        let r = self.db.definition(Some(&app), which);
+        definition_js(self.decided(r)?)
     }
 
     /// The apps of this tree that hold a draft, by id: a READ (§19 P3b: the builder's project list), for any session
@@ -1689,9 +1700,20 @@ pub(crate) fn definition_of(which: &str) -> Result<core_types::name::SystemDomai
     }
 }
 
-/// A definition's records as JavaScript takes them: `[{ key, body }]`.
-pub(crate) fn definition_json(records: Vec<(craftworks_sdk::definition::DefKey, serde_json::Value)>) -> Vec<serde_json::Value> {
-    records.into_iter().map(|(k, body)| serde_json::json!({ "key": k.to_string(), "body": body })).collect()
+/// A definition's records as JavaScript takes them: `[{ key, body, bytes? }]` -- a file's bytes a `Uint8Array`, handed
+/// over as bytes (never text a page would decode). Both surfaces' one form.
+pub(crate) fn definition_js(records: Vec<craftworks_sdk::db::DefRecord>) -> Result<js_sys::Array, JsValue> {
+    let out = js_sys::Array::new();
+    for r in records {
+        let o = js_sys::Object::new();
+        js_sys::Reflect::set(&o, &"key".into(), &r.key.to_string().into())?;
+        js_sys::Reflect::set(&o, &"body".into(), &js_sys::JSON::parse(&r.body.to_string())?)?;
+        if let Some(b) = r.bytes {
+            js_sys::Reflect::set(&o, &"bytes".into(), &js_sys::Uint8Array::from(b.as_slice()).into())?;
+        }
+        out.push(&o);
+    }
+    Ok(out)
 }
 
 fn json_of<T: serde::Serialize>(v: T) -> Result<String, JsValue> {

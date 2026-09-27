@@ -64,10 +64,13 @@ export function wrap(raw) {
     // THE DEFINITION DOORS (app-as-data P2, ARCHITECTURE §19): the app's definition, as data in its reserved
     // domains -- the only writes of them. `key`: `meta`, `c/<id>` or `d/<domain>`.
     async draftPut(key, body) { this.#db.draft_put(key, JSON.stringify(body)); }
+    // A FILE of the app's code (app-as-data P5): `f/<path>`'s bytes (a Uint8Array) and meta -- one form per kind.
+    async draftFile(path, bytes, meta = {}) { this.#db.draft_file(path, bytes, JSON.stringify(meta)); }
     async draftDelete(key) { return this.#db.draft_delete(key); }
     async publishDefinition() { return this.#db.publish_definition(); }
     async definitionApps() { return JSON.parse(this.#db.definition_apps()); }
-    async definition(which, app) { return JSON.parse(this.#db.definition(which, app ?? undefined)); }
+    // `[{ key, body, bytes? }]`: a file's bytes a Uint8Array, as the SDK hands them over.
+    async definition(which, app) { return this.#db.definition(which, app ?? undefined); }
     async markPublished(domain) { return JSON.parse(this.#db.mark_published(domain)); }
     async isPublished(domain) { return this.#db.is_published(domain); }
     async publishedState(domain) { return JSON.parse(this.#db.published_state(domain)); }

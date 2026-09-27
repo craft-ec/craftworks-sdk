@@ -56,5 +56,23 @@ await t("**another app's definition is read, never written**: the in-tab Db read
   assert.deepEqual(await db.definitionApps(), [], "the tab's own (unnamed) draft was listed as an app of a tree");
 });
 
+// app-as-data P5: the app's CODE as data -- a file's bytes through `draftFile`, published by the one publish write,
+// read back as a Uint8Array byte for byte; `meta.entry` must name a file of the draft.
+await t("**a file of the app's code** round-trips as bytes, and the entry must be a file of the draft", async () => {
+  const db = new sdk.Db();
+  const js = new Uint8Array(38_006).map((_, i) => i % 251);
+  await db.draftPut("meta", { entry: "f/app.js" });
+  await assert.rejects(() => db.publishDefinition(), /meta\.entry/, "an entry naming no file was published");
+  await db.draftFile("app.js", js);
+  await db.draftFile("components/header.js", new TextEncoder().encode("export default 1;"), { type: "text/javascript" });
+  await assert.rejects(() => db.draftFile("../x.js", new Uint8Array([1])), /not a definition key/);
+  assert.equal(await db.publishDefinition(), 3);
+  const app = Object.fromEntries((await db.definition("app")).map(r => [r.key, r]));
+  assert.ok(app["f/app.js"].bytes instanceof Uint8Array, "a file's bytes are not a Uint8Array");
+  assert.deepEqual([...app["f/app.js"].bytes], [...js], "a file did not read back byte for byte");
+  assert.deepEqual(app["f/components/header.js"].body, { type: "text/javascript" });
+  assert.equal(app.meta.bytes, undefined, "a definition record came with bytes");
+});
+
 if (failures) { process.stdout.write(`\n${failures} failing\n`); process.exit(1); }
 process.stdout.write("\nall passing\n");

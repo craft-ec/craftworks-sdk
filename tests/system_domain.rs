@@ -65,14 +65,20 @@ fn the_definition_doors_edit_the_draft_and_publish_it() {
         assert!(db.draft_delete(app, &key("d/rows")).unwrap(), "a draft record was not deleted");
         assert!(!db.draft_delete(app, &key("d/rows")).unwrap(), "an absent record was deleted");
         let want = vec![(key("c/header"), json!({ "kind": "Heading" })), (key("meta"), json!({ "name": "Notes" }))];
-        let sorted = |mut v: Vec<(DefKey, Value)>| {
+        let sorted = |v: Vec<craftworks_sdk::db::DefRecord>| {
+            let mut v: Vec<(DefKey, Value)> = v.into_iter().map(|r| (r.key, r.body)).collect();
             v.sort_by(|a, b| a.0.cmp(&b.0));
             v
         };
-        assert_eq!(sorted(db.definition(app, SystemDomain::Draft).unwrap()), sorted(want.clone()));
+        let unsorted = |v: Vec<(DefKey, Value)>| {
+            let mut v = v;
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(sorted(db.definition(app, SystemDomain::Draft).unwrap()), unsorted(want.clone()));
         assert!(db.definition(app, SystemDomain::App).unwrap().is_empty(), "the app holds a definition before a publish");
         assert_eq!(db.publish_definition(app).unwrap(), 2);
-        assert_eq!(sorted(db.definition(app, SystemDomain::App).unwrap()), sorted(want));
+        assert_eq!(sorted(db.definition(app, SystemDomain::App).unwrap()), unsorted(want));
         assert_eq!(db.publish_definition(app).unwrap(), 0, "an unchanged draft published something");
         // The live marker: created, then found (create_at's answer), at the builder's slot.
         assert!(!db.is_published(app, "rows").unwrap());
@@ -166,7 +172,7 @@ fn a_definition_is_read_by_app_and_only_that_apps() {
     db.draft_put(Some("proj-b"), &key("meta"), &json!({ "name": "B" })).unwrap();
     db.draft_put(Some("proj-b"), &key("c/list"), &json!({ "type": "table" })).unwrap();
     let names = |db: &mut Db<MemStore, SystemEnv>, app| {
-        db.definition(Some(app), SystemDomain::Draft).unwrap().into_iter().map(|(k, v)| (k.to_string(), v)).collect::<BTreeMap<_, _>>()
+        db.definition(Some(app), SystemDomain::Draft).unwrap().into_iter().map(|r| (r.key.to_string(), r.body)).collect::<BTreeMap<_, _>>()
     };
     assert_eq!(names(&mut db, "proj-a"), BTreeMap::from([("meta".to_string(), json!({ "name": "A" }))]));
     assert_eq!(names(&mut db, "proj-b").get("meta"), Some(&json!({ "name": "B" })));
@@ -190,4 +196,60 @@ fn the_apps_with_a_draft_are_listed_and_only_those() {
     let schema: craftworks_sdk::Schema = serde_json::from_value(json!({ "type": "Row", "fields": [{ "name": "x", "kind": "text" }] })).unwrap();
     db.define("proj-c.rows", &schema).unwrap();
     assert_eq!(db.definition_apps().unwrap(), vec!["proj-a".to_string(), "proj-b".to_string()]);
+}
+
+/// THE APP'S CODE AS DATA (app-as-data P5): a file's BYTES through the file door -- drafted, replaced, published by
+/// the one publish write, and read back byte for byte by the one definition read -- in both name forms; `draftPut`
+/// cannot write a file (one form per kind), and a definition record's body is unaffected.
+#[test]
+fn a_file_is_drafted_published_and_read_back_byte_for_byte() {
+    for app in [Some("notes"), None] {
+        let mut db = fresh();
+        let js: Vec<u8> = (0..38_006u32).map(|i| (i % 251) as u8).collect(); // the builder's app.js, by size
+        db.draft_put(app, &key("meta"), &json!({ "entry": "f/app.js" })).unwrap();
+        db.draft_file(app, "app.js", b"old", &json!({})).unwrap();
+        db.draft_file(app, "app.js", &js, &json!({})).unwrap();
+        db.draft_file(app, "components/header.js", b"export default 1;", &json!({ "type": "text/javascript" })).unwrap();
+        assert!(db.draft_put(app, &key("f/x.js"), &json!({})).is_err(), "draftPut wrote a file");
+        assert_eq!(db.publish_definition(app).unwrap(), 3);
+        let recs = db.definition(app, SystemDomain::App).unwrap();
+        let get = |k: &str| recs.iter().find(|r| r.key.to_string() == k).cloned().unwrap_or_else(|| panic!("no {k}"));
+        assert_eq!(get("f/app.js").bytes.as_deref(), Some(js.as_slice()), "a file did not read back byte for byte");
+        assert_eq!(get("f/components/header.js").body, json!({ "type": "text/javascript" }));
+        assert_eq!(get("meta").bytes, None, "a definition record came back with bytes");
+        assert!(db.draft_file(app, "../x.js", b"x", &json!({})).is_err() && db.draft_file(app, "", b"x", &json!({})).is_err(), "a bad path was taken");
+    }
+}
+
+/// THE ENTRY LOADS (the SDK the one owner): `meta.entry` must name a file of the draft, or the publish is refused by
+/// name -- and nothing is published; a definition with no entry is a definition-only app and publishes.
+#[test]
+fn a_publish_whose_entry_is_not_a_file_of_the_draft_is_refused() {
+    let mut db = fresh();
+    let app = Some("notes");
+    db.draft_file(app, "main.js", b"1", &json!({})).unwrap();
+    for entry in [json!("f/app.js"), json!("c/app"), json!("app.js"), json!(7)] {
+        db.draft_put(app, &key("meta"), &json!({ "entry": entry })).unwrap();
+        let e = db.publish_definition(app).expect_err("an entry naming no file of the draft was published");
+        assert!(e.to_string().contains("meta.entry"), "the refusal does not name the entry: {e}");
+        assert!(db.definition(app, SystemDomain::App).unwrap().is_empty(), "a refused publish published something");
+    }
+    db.draft_put(app, &key("meta"), &json!({ "entry": "f/main.js" })).unwrap();
+    assert_eq!(db.publish_definition(app).unwrap(), 2, "THE CONTROL: an entry that is a file of the draft publishes");
+    let mut plain = fresh();
+    plain.draft_put(app, &key("meta"), &json!({ "name": "no code" })).unwrap();
+    assert_eq!(plain.publish_definition(app).unwrap(), 1, "a definition-only app (no entry) did not publish");
+}
+
+/// A FILE OVER A RECORD'S BOUND IS REFUSED BY NAME: its path and both sizes (the record's and the file's), and the
+/// limit -- nothing written. THE CONTROL: a file under it is taken.
+#[test]
+fn a_file_over_the_record_bound_is_refused_naming_its_path_and_sizes() {
+    let mut db = fresh();
+    let big = vec![7u8; freenet_prolly::node::MAX_VALUE];
+    let e = db.draft_file(Some("notes"), "vendor/big.js", &big, &json!({})).expect_err("a file over the bound was taken");
+    let said = e.to_string();
+    assert!(said.contains("f/vendor/big.js") && said.contains(&big.len().to_string()) && said.contains(&freenet_prolly::node::MAX_VALUE.to_string()), "the refusal does not name the path and sizes: {said}");
+    assert!(db.definition(Some("notes"), SystemDomain::Draft).unwrap().is_empty(), "a refused file was written");
+    db.draft_file(Some("notes"), "vendor/ok.js", &vec![7u8; 200_000], &json!({})).expect("THE CONTROL: a 200 KB file is taken");
 }

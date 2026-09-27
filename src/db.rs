@@ -1182,8 +1182,19 @@ fn system_name(app: Option<&str>, d: SystemDomain) -> String {
 
 /// A definition record's schema: its key and its body (the record's JSON, as text).
 fn definition_schema() -> Schema {
-    let field = |name: &str| crate::schema::Field { name: name.into(), kind: crate::schema::Kind::Text, required: true };
-    Schema { type_name: "Definition".into(), fields: vec![field("key"), field("body")], parent: None }
+    let field = |name: &str, kind, required| crate::schema::Field { name: name.into(), kind, required };
+    use crate::schema::Kind::{Bytes, Text};
+    // `bytes` (app-as-data P5): a FILE's contents, appended -- a tree whose draft P2 wrote goes on decoding, and its
+    // schema is extended by the next door that writes (`system_schema`).
+    Schema { type_name: "Definition".into(), fields: vec![field("key", Text, true), field("body", Text, true), field("bytes", Bytes, false)], parent: None }
+}
+
+/// One record of an app's definition: its key, its body (JSON), and -- a file's (`f/<path>`) -- its bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefRecord {
+    pub key: DefKey,
+    pub body: Value,
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// The builder's per-domain "live" markers' schema: the one `handoff.js` defines (`{ type: "Published", fields: [] }`).
@@ -1207,14 +1218,15 @@ fn published_slot(domain: &str) -> RKey {
 /// [`SystemDomain`] (never a name a caller spelled) and reaches the one commit path, [`Db::write`], directly -- the
 /// ordinary writes refuse the reserved prefix (`ordinary`). `app` is the tree's app id, `None` for the in-tab db.
 impl<S: Store + Reads, E: Env> Db<S, E> {
-    /// `domain`'s schema as THIS write needs it: read (so it must stand), and PUT in the same write when absent. A
-    /// different schema standing under a reserved name is refused: nothing but these doors writes one.
+    /// `domain`'s schema as THIS write needs it: read (so it must stand), and PUT in the same write when absent -- or
+    /// when the one standing is an earlier version of it (fields only appended: `Schema::allows`). Any other schema
+    /// under a reserved name is refused: nothing but these doors writes one.
     fn system_schema(&mut self, domain: &str, schema: &Schema, reads: &mut Vec<(Vec<u8>, Expect)>, edits: &mut Vec<(Vec<u8>, Edit)>) -> Result<()> {
         reads.push(self.read_of(&schema_key(domain))?);
         match self.schema(domain)? {
             Some(s) if &s == schema => Ok(()),
-            Some(_) => Err(DbError::Refused(format!("`{domain}` holds another schema than its definition door writes"))),
-            None => {
+            Some(s) if s.allows(schema).is_err() => Err(DbError::Refused(format!("`{domain}` holds another schema than its definition door writes"))),
+            Some(_) | None => {
                 edits.push((schema_key(domain), Edit::Put(serde_json::to_vec(schema).map_err(|e| e.to_string())?)));
                 Ok(())
             }
@@ -1228,16 +1240,34 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
     }
 
     /// EDIT THE DRAFT: `key`'s record in `craftworks.draft` holds `body`, created or replaced. The same body again is
-    /// nothing to write.
+    /// nothing to write. A FILE is written by [`Db::draft_file`], never here (one form per kind).
     pub fn draft_put(&mut self, app: Option<&str>, key: &DefKey, body: &Value) -> Result<()> {
+        if let DefKey::File(path) = key {
+            return Err(DbError::Refused(format!("`f/{path}` is a file: its bytes are written by the file door")));
+        }
+        self.draft_record(app, key, body.to_string(), None)
+    }
+
+    /// A FILE OF THE APP'S CODE (app-as-data P5): `f/<path>`'s record in the draft holds `bytes` (and `meta`, JSON:
+    /// may be `{}`), created or replaced -- the same door, the same one commit path, as every definition record. A
+    /// record is bounded (`MAX_VALUE`): a file whose record would be larger is refused naming its path and both sizes.
+    pub fn draft_file(&mut self, app: Option<&str>, path: &str, bytes: &[u8], meta: &Value) -> Result<()> {
+        let key = DefKey::parse(&format!("f/{path}"))?;
+        self.draft_record(app, &key, meta.to_string(), Some(bytes))
+    }
+
+    /// The draft's `key` record: `body`, and a file's `bytes`. Unchanged is nothing to write.
+    fn draft_record(&mut self, app: Option<&str>, key: &DefKey, body: String, file: Option<&[u8]>) -> Result<()> {
         let domain = system_name(app, SystemDomain::Draft);
         let schema = definition_schema();
         let (mut reads, mut edits) = (Vec::new(), Vec::new());
         self.system_schema(&domain, &schema, &mut reads, &mut edits)?;
         let k = record_key(&domain, Loc::bare(definition_slot(key)));
         let old = self.get_key(&k)?.map(|o| record::decode(&schema, &o)).transpose()?;
-        let body = body.to_string();
-        if old.as_ref().is_some_and(|o| o.fields.get("body").and_then(Value::as_str) == Some(body.as_str())) {
+        let file_hex = file.map(core_types::hex::encode);
+        if old.as_ref().is_some_and(|o| {
+            o.fields.get("body").and_then(Value::as_str) == Some(body.as_str()) && o.fields.get("bytes").and_then(Value::as_str) == file_hex.as_deref()
+        }) {
             return Ok(());
         }
         let now = self.env.now_ms();
@@ -1245,7 +1275,17 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let mut fields = Map::new();
         fields.insert("key".into(), Value::from(key.to_string()));
         fields.insert("body".into(), Value::from(body));
+        if let Some(h) = file_hex {
+            fields.insert("bytes".into(), Value::from(h));
+        }
         let bytes = record::encode(&schema, &fields, created, now.max(created), &self.author)?;
+        if bytes.len() > MAX_VALUE {
+            return Err(DbError::TooLarge(format!(
+                "`{key}` is {} bytes as a record ({} of file), over the {MAX_VALUE} a record may be",
+                bytes.len(),
+                file.map_or(0, <[u8]>::len)
+            )));
+        }
         reads.push(self.read_of(&k)?);
         edits.push((k, Edit::Put(bytes)));
         self.write(reads, edits)
@@ -1271,6 +1311,7 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         let (draft_name, app_name) = (system_name(app, SystemDomain::Draft), system_name(app, SystemDomain::App));
         let draft = self.records_of(&draft_name)?;
         let published = self.records_of(&app_name)?;
+        self.entry_loads(&draft)?;
         let (mut reads, mut edits) = (Vec::new(), Vec::new());
         for (tail, bytes) in &draft {
             if published.get(tail) != Some(bytes) {
@@ -1296,10 +1337,34 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
         Ok(changed)
     }
 
+    /// THE ENTRY LOADS (app-as-data P5, the SDK the one owner): a draft whose `meta` names an `entry` must hold that
+    /// file -- `"entry": "f/<path>"` naming an `f/` record of the draft -- or its publish is refused by name. A draft
+    /// with no `meta.entry` is a definition-only app (the loader mounts the runtime), and stays valid.
+    fn entry_loads(&self, draft: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>) -> Result<()> {
+        let schema = definition_schema();
+        let mut keys = std::collections::BTreeSet::new();
+        let mut entry = None;
+        for b in draft.values() {
+            let d = record::decode(&schema, b)?;
+            let key = d.fields.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+            if key == DefKey::Meta.to_string() {
+                let body: Value = serde_json::from_str(d.fields.get("body").and_then(Value::as_str).unwrap_or("null")).unwrap_or(Value::Null);
+                entry = body.get("entry").cloned();
+            }
+            keys.insert(key);
+        }
+        let Some(entry) = entry else { return Ok(()) };
+        let named = entry.as_str().map(DefKey::parse);
+        match named {
+            Some(Ok(k @ DefKey::File(_))) if keys.contains(&k.to_string()) => Ok(()),
+            _ => Err(DbError::Refused(format!("meta.entry is {entry}: it must name an `f/<path>` file of the draft, and the draft holds none such -- a published app's entry must load"))),
+        }
+    }
+
     /// The definition `which` holds (`Draft` or `App`): each record's key and body, in slot order. `app` names whose:
     /// a READ, so it may be any app of this tree (the builder's project list reads each project's `meta`, §19 P3);
     /// the writing doors take only the caller's own. An app id is checked here, the one place both surfaces ask.
-    pub fn definition(&mut self, app: Option<&str>, which: SystemDomain) -> Result<Vec<(DefKey, Value)>> {
+    pub fn definition(&mut self, app: Option<&str>, which: SystemDomain) -> Result<Vec<DefRecord>> {
         if let Some(a) = app {
             crate::app::check(a)?;
         }
@@ -1313,7 +1378,8 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
                 let d = record::decode(&schema, b)?;
                 let key = DefKey::parse(d.fields.get("key").and_then(Value::as_str).unwrap_or(""))?;
                 let body = serde_json::from_str(d.fields.get("body").and_then(Value::as_str).unwrap_or("null")).map_err(|e| DbError::Refused(e.to_string()))?;
-                Ok((key, body))
+                let bytes = d.fields.get("bytes").and_then(Value::as_str).map(|h| core_types::hex::decode(h).ok_or_else(|| DbError::Refused(format!("`{key}`'s bytes are not hex")))).transpose()?;
+                Ok(DefRecord { key, body, bytes })
             })
             .collect()
     }
@@ -1380,6 +1446,25 @@ impl<S: Store + Reads, E: Env> Db<S, E> {
 mod tests {
     use super::*;
     use crate::tree_store::TreeStore;
+
+    /// A DRAFT P2 WROTE is extended, never refused (app-as-data P5): its schema stored before `bytes` existed (key,
+    /// body) is an earlier version of the door's, so the next door write appends the field in the same write -- and
+    /// the old record decodes under it. A schema that is NOT an earlier version is still refused.
+    #[test]
+    fn a_draft_under_the_p2_schema_is_extended_by_the_next_door_write() {
+        let mut d = Db::new(TreeStore::new(), crate::id::SystemEnv, *b"dev1");
+        let domain = system_name(Some("notes"), SystemDomain::Draft);
+        let mut p2 = definition_schema();
+        p2.fields.truncate(2);
+        d.store.apply_batch(&[(schema_key(&domain), Edit::Put(serde_json::to_vec(&p2).unwrap()))]).unwrap();
+        d.draft_put(Some("notes"), &DefKey::Meta, &serde_json::json!({ "name": "old" })).expect("a door write over the P2 schema");
+        assert_eq!(d.schema(&domain).unwrap(), Some(definition_schema()), "the schema was not extended");
+        d.draft_file(Some("notes"), "app.js", b"x", &serde_json::json!({})).expect("a file over the extended schema");
+        assert_eq!(d.definition(Some("notes"), SystemDomain::Draft).unwrap().len(), 2);
+        let other = Schema { type_name: "Other".into(), fields: vec![], parent: None };
+        d.store.apply_batch(&[(schema_key(&domain), Edit::Put(serde_json::to_vec(&other).unwrap()))]).unwrap();
+        assert!(d.draft_put(Some("notes"), &DefKey::Meta, &serde_json::json!({})).is_err(), "a foreign schema was overwritten");
+    }
 
     /// **An app's write is never forced** (sdk#235 ruling 1): a `Db` write
     /// carrying `Expect::Any` is REFUSED by name — a real refusal, not a
