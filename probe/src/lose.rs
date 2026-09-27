@@ -473,6 +473,33 @@ mod tests {
         assert_eq!(lost_slots, PARITY, "{lost_slots} slots lost, not m = {PARITY}");
     }
 
+    /// A LOSS THAT CANNOT BE MET IS NO CHOICE (Codex on #541): ten identical values fill ten member slots with ONE id,
+    /// which cannot be lost without losing ten -- so `m + 1` would take only the `m` parity: m lost, not m + 1, and no
+    /// data lost at all, while the log said the control ran. A group where exactly `n` slots, data first, cannot be
+    /// lost is NOT chosen.
+    #[test]
+    #[should_panic(expected = "a group whose loss cannot be met was chosen")] // PINNED: flipped by the fix
+    fn a_group_whose_loss_cannot_be_met_exactly_is_never_chosen() {
+        let value = vec![b'v'; 1400];
+        let edits: Vec<(Vec<u8>, Edit)> = (0..10u32).map(|i| (record("bulk", i), Edit::Put(value.clone()))).collect();
+        let (root_id, b) = tree_of(edits);
+        let root = b.get(&root_id).expect("held").to_vec();
+        let node = Node::parse(&root).expect("a node");
+        let groups = group_members(&node);
+        assert!(node.is_leaf() && groups.len() == 1 && groups[0].1.len() == 10, "THE SETUP: not one leaf group of the ten values");
+        assert!(groups[0].1.iter().all(|m| *m == groups[0].1[0]), "THE SETUP: the ten values are not one id");
+        for domain in [None, Some("bulk")] {
+            let mut l = Lose::new(Target::Data, PARITY + 1);
+            if let Some(d) = domain {
+                l = l.with_domain(d);
+            }
+            let _ = l.block(root_id, &state(kind::TREE_NODE, &root));
+            let c = l.chosen().cloned();
+            let lost = c.as_ref().map(|c| c.slots.iter().filter(|s| c.lost.contains(*s)).count());
+            assert!(c.is_none(), "a group whose loss cannot be met was chosen (domain {domain:?}): {lost:?} slots lost of m + 1 = {}", PARITY + 1);
+        }
+    }
+
     /// A leaf (no referenced values: no group) and a value block are never chosen as the data group.
     #[test]
     fn nothing_without_a_group_of_two_is_chosen() {
