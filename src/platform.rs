@@ -15,10 +15,8 @@ use serde_json::Value;
 /// The platform app: the app of the platform tree whose published definition holds the SDK versions.
 pub const PLATFORM_APP: &str = "craftworks-platform";
 
-/// An SDK rev: the craftworks-sdk commit a build is made from, 40 lowercase hex.
-pub fn rev_ok(rev: &str) -> bool {
-    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
+/// An SDK rev: the craftworks-sdk commit a build is made from (the rule is core-types', `name::sdk_rev_ok`).
+pub use core_types::name::sdk_rev_ok as rev_ok;
 
 /// The record key of version `rev`: `f/sdk/<rev>`, refused by name for anything that is not a rev.
 pub fn sdk_key(rev: &str) -> Result<DefKey, DbError> {

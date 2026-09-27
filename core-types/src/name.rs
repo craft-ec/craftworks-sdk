@@ -16,6 +16,12 @@ pub fn domain_ok(name: &str, max: usize) -> bool {
     (1..=max).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b))
 }
 
+/// An SDK rev (§19, the SDK as data: a platform tree's `f/sdk/<rev>`, an app's `meta.sdk.rev`): the craftworks-sdk
+/// commit a build is made from, 40 lowercase hex.
+pub fn sdk_rev_ok(rev: &str) -> bool {
+    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// The longest component id.
 pub const MAX_COMPONENT: usize = 64;
 
