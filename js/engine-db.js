@@ -385,6 +385,25 @@ export function engineDb(handle, { writeDeadlineMs = Infinity, now = () => Date.
       return r;
     },
 
+    // THE DEFINITION DOORS (app-as-data P2, ARCHITECTURE §19): the app's definition, as data in its reserved
+    // domains, written ONLY here (an ordinary write naming one is refused). `key`: `meta`, `c/<id>` or `d/<domain>`.
+    // `publishDefinition` makes the published definition equal the draft in ONE write; `definition("draft" | "app")`
+    // reads `[{ key, body }]`. `markPublished` / `isPublished`: the builder's per-domain live marker, until P5.
+    async draftPut(key, body) {
+      return once(() => session.draft_put(key, JSON.stringify(body)));
+    },
+    async draftDelete(key) {
+      return once(() => session.draft_delete(key));
+    },
+    async publishDefinition() {
+      return once(() => session.publish_definition());
+    },
+    definition: which => once(() => JSON.parse(session.definition(which))),
+    async markPublished(domain) {
+      return once(() => JSON.parse(session.mark_published(domain)));
+    },
+    isPublished: domain => once(() => session.is_published(domain)),
+
     /**
      * ANOTHER APP'S DATA in this person's tree, READ-ONLY (the forest ruling):
      * public by default, and an app writes only its own. Reads take the

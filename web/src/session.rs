@@ -1037,6 +1037,60 @@ impl Session {
         self.decided(r)
     }
 
+    // THE DEFINITION DOORS (app-as-data P2, ARCHITECTURE §19): an app's definition is data in its reserved domains,
+    // written ONLY here -- through the core `Db`'s doors, which take a `SystemDomain` and reach the one commit path; an
+    // ordinary write naming `craftworks.<…>` is refused (`app::write`, and the `Db` itself). The session's own app.
+
+    /// The draft's `key` record (`meta`, `c/<id>`, `d/<domain>`) holds `body` (JSON), created or replaced.
+    pub fn draft_put(&mut self, key: &str, body: &str) -> Result<(), JsValue> {
+        let app = self.door_app()?;
+        let key = craftworks_sdk::definition::DefKey::parse(key).map_err(|e| db_err(&e))?;
+        let body: serde_json::Value = serde_json::from_str(body).map_err(|e| db_err(&DbError::Refused(e.to_string())))?;
+        self.writable()?;
+        let r = self.db.draft_put(Some(&app), &key, &body);
+        self.decided(r)
+    }
+
+    /// Remove the draft's `key` record: `false` when there was none.
+    pub fn draft_delete(&mut self, key: &str) -> Result<bool, JsValue> {
+        let app = self.door_app()?;
+        let key = craftworks_sdk::definition::DefKey::parse(key).map_err(|e| db_err(&e))?;
+        self.writable()?;
+        let r = self.db.draft_delete(Some(&app), &key);
+        self.decided(r)
+    }
+
+    /// PUBLISH: `craftworks.app` made equal to `craftworks.draft` in ONE write; how many records changed (0: none).
+    pub fn publish_definition(&mut self) -> Result<u32, JsValue> {
+        let app = self.door_app()?;
+        self.writable()?;
+        let r = self.db.publish_definition(Some(&app)).map(|n| n as u32);
+        self.decided(r)
+    }
+
+    /// The definition `which` holds -- `"draft"` or `"app"` -- as `[{ key, body }]`.
+    pub fn definition(&mut self, which: &str) -> Result<String, JsValue> {
+        let app = self.door_app()?;
+        let which = definition_of(which).map_err(|e| db_err(&e))?;
+        let r = self.db.definition(Some(&app), which).map(definition_json);
+        self.answer(r)
+    }
+
+    /// Mark `domain` live (the builder's marker, until app-as-data P5): `{ outcome: "created" | "exists", record }`.
+    pub fn mark_published(&mut self, domain: &str) -> Result<String, JsValue> {
+        let app = self.door_app()?;
+        self.writable()?;
+        let r = self.db.mark_published(Some(&app), domain);
+        json_of(self.decided(r)?)
+    }
+
+    /// Is `domain` marked live? Reads only.
+    pub fn is_published(&mut self, domain: &str) -> Result<bool, JsValue> {
+        let app = self.door_app()?;
+        let r = self.db.is_published(Some(&app), domain);
+        self.decided(r)
+    }
+
     /// The children of one parent, as a bounded read (craftworks-sdk#122).
     ///
     /// The app names the PARENT and never builds a key range, which is the
@@ -1540,6 +1594,11 @@ impl Session {
     /// (`can_write("")`), before it reaches the store. An asked session's
     /// first write opens the user's own tree (`open_own`): the head is
     /// created on first write.
+    /// The app a definition door writes: this session's own, or refused as every write with no app is.
+    fn door_app(&self) -> Result<String, JsValue> {
+        self.app.clone().ok_or_else(|| db_err(&DbError::Refused("no app: open the session with { app } before writing its definition".into())))
+    }
+
     fn writable(&mut self) -> Result<(), JsValue> {
         self.claim_own();
         match self.may_write("") {
@@ -1600,6 +1659,20 @@ fn db_err(e: &DbError) -> JsValue {
 ///
 /// `as_json` takes the `Result` and so decides what a failure MEANS; a write
 /// that reads has already had that decided by `decided`, which parks it.
+/// `"draft"` or `"app"`: which definition a read names.
+pub(crate) fn definition_of(which: &str) -> Result<core_types::name::SystemDomain, DbError> {
+    match which {
+        "draft" => Ok(core_types::name::SystemDomain::Draft),
+        "app" => Ok(core_types::name::SystemDomain::App),
+        _ => Err(DbError::Refused(format!("`{which}` is not a definition: `draft` or `app`"))),
+    }
+}
+
+/// A definition's records as JavaScript takes them: `[{ key, body }]`.
+pub(crate) fn definition_json(records: Vec<(craftworks_sdk::definition::DefKey, serde_json::Value)>) -> Vec<serde_json::Value> {
+    records.into_iter().map(|(k, body)| serde_json::json!({ "key": k.to_string(), "body": body })).collect()
+}
+
 fn json_of<T: serde::Serialize>(v: T) -> Result<String, JsValue> {
     serde_json::to_string(&v).map_err(|e| db_err(&DbError::Refused(e.to_string())))
 }

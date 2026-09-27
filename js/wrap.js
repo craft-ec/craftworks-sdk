@@ -61,6 +61,14 @@ export function wrap(raw) {
     async update(domain, id, patch) { return JSON.parse(this.#db.update(domain, id, JSON.stringify(patch))); }
     async get(domain, id) { return JSON.parse(this.#db.get(domain, id)); }
     async delete(domain, id) { return this.#db.delete(domain, id); }
+    // THE DEFINITION DOORS (app-as-data P2, ARCHITECTURE §19): the app's definition, as data in its reserved
+    // domains -- the only writes of them. `key`: `meta`, `c/<id>` or `d/<domain>`.
+    async draftPut(key, body) { this.#db.draft_put(key, JSON.stringify(body)); }
+    async draftDelete(key) { return this.#db.draft_delete(key); }
+    async publishDefinition() { return this.#db.publish_definition(); }
+    async definition(which) { return JSON.parse(this.#db.definition(which)); }
+    async markPublished(domain) { return JSON.parse(this.#db.mark_published(domain)); }
+    async isPublished(domain) { return this.#db.is_published(domain); }
     async scan(domain, { reverse = false, limit = 0, after = "" } = {}) {
       return JSON.parse(this.#db.scan(domain, reverse, limit, after));
     }

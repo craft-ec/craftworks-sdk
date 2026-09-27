@@ -88,9 +88,17 @@ fn round_trip(app: &str, name: &str) -> Result<usize, String> {
 
 /// **The builder's case** (sdk#276): a 17-character project id and its own
 /// 20-character bookkeeping domain. Refused before, as a 38-character domain.
+/// Since app-as-data P2 that domain is RESERVED (`SystemDomain::Published`):
+/// an ordinary write of it is refused, and its door writes it -- under the
+/// same project id, within the same budget.
 #[test]
 fn the_builders_project_id_and_its_domain_write() {
-    assert_eq!(round_trip("rmud6o02cnfqk0001", "craftworks.published"), Ok(1));
+    let (app, marker) = ("rmud6o02cnfqk0001", core_types::name::SystemDomain::Published.code());
+    assert!(round_trip(app, marker).is_err_and(|e| e.contains("reserved")), "an ordinary write of `{marker}` was not refused");
+    let mut d = Db::new(MemStore::default(), Clock(1_700_000_000_000, 7), *b"dev1");
+    assert!(matches!(d.mark_published(Some(app), "rows"), Ok(craftworks_sdk::CreateAt::Created(_))), "the marker door did not write under `{app}`");
+    assert!(d.is_published(Some(app), "rows").unwrap());
+    assert_eq!(round_trip(app, "rows"), Ok(1), "THE CONTROL: the project's own domain writes");
 }
 
 /// **An app at the longest id writes a name at the longest name**, and reads
