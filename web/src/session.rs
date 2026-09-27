@@ -1077,6 +1077,18 @@ impl Session {
         self.decided(r)
     }
 
+    /// PUBLISH WITH THE SITE (app-as-data P5; the builder's one publish): the definition's ONE write
+    /// ([`Session::publish_definition`]), then -- the app's first publish, or a platform upgrade the builder chose --
+    /// its SITE, through P4's one creation path ([`Session::publish_app`]: the build's piece set to k, then the starter
+    /// and the SDK's pointer), in this one call. `{"changed": <records>, "link": <the site's link>}`;
+    /// [`Session::app_publish_status`] says how the site stands. Without a site, `publishDefinition()` alone.
+    pub fn publish_definition_site(&mut self, set: &str, webapp_code: Vec<u8>, piece_states: js_sys::Array, site_code: Vec<u8>, starter: &crate::AppContainer) -> Result<String, JsValue> {
+        let changed = self.publish_definition()?;
+        let app = self.door_app()?;
+        let link = self.publish_app(&app, set, webapp_code, piece_states, site_code, starter)?;
+        Ok(serde_json::json!({ "changed": changed, "link": link }).to_string())
+    }
+
     /// The definition `which` holds -- `"draft"` or `"app"` -- as `[{ key, body, bytes? }]` (a file's bytes a
     /// `Uint8Array`). `app`: ANOTHER app of this
     /// tree, READ-only (the builder lists its projects by each one's `meta`, §19 P3); absent, this session's own. The
