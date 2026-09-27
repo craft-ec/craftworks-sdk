@@ -136,7 +136,9 @@ pub fn no_answer_owed(f: &Effect) {
         | Effect::Unwanted { .. }
         | Effect::Keep { .. }
         // A repair's re-put: its answer confirms nothing (the architect's (b)), so nothing in the engine waits on it.
-        | Effect::PutRepaired { .. } => {}
+        | Effect::PutRepaired { .. }
+        // The node's answer for audit passes (sdk#530): the audit's, and nothing in the engine waits on it.
+        | Effect::AuditAnswered { .. } => {}
         owed => panic!("a test driver dropped an effect the engine waits on (a silent stall): {owed:?}"),
     }
 }

@@ -210,7 +210,7 @@ fn a_rebuild_does_not_answer_an_audit() {
                 queue.extend(fx);
             }
             Effect::Keep { id, bytes } => store.put(id, &bytes),
-            _ => {}
+            other => common::no_answer_owed(&other),
         }
     }
     let lost = lost.expect("THE SETUP: the read asked no member of the group");
