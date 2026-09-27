@@ -213,14 +213,11 @@ fn a_page_with_no_session_refuses_its_writes_by_name_and_sends_nothing() {
     s.client = craftworks_sdk::engine_client::Client::from_random(None);
     let r = put(&mut s, b"k", b"v");
     assert!(matches!(r, Err(craftworks_sdk::Refused::NoSession)), "the refusal was not returned: {r:?}");
-    assert_eq!(s.refused.len(), 1);
-    assert!(matches!(s.refused[0].1, craftworks_sdk::Refused::NoSession), "{:?}", s.refused);
     assert_eq!(s.open_writes(), 0, "the write is held as if it could be sent");
     assert!(s.take_outbound().is_empty(), "it was sent under no session");
     // THE CONTROL: the same page with randomness writes.
     let mut ok = writes();
     put(&mut ok, b"k", b"v").expect("the store took the write");
-    assert!(ok.refused.is_empty());
     assert_eq!(ok.take_outbound().len(), 1);
 }
 

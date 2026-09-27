@@ -69,6 +69,7 @@
 //! * the web Session over [`server::Server`], and provisioning the signer (B2);
 
 pub mod fates;
+pub mod unusable;
 mod judge;
 mod publication;
 pub mod loader;
@@ -735,7 +736,8 @@ pub struct Page {
     client_fx: Vec<Effect>,
     /// Effects this executor does not act on (the read path's replies,
     /// subscriptions), for the caller.
-    unusable: Vec<String>,
+    /// The lines said to the app (sdk#482): capped, drained by [`Page::take_unusable`], each recorded where said.
+    unusable: unusable::Unusable,
     /// A VIEW (sdk#239): this page writes nothing of its own -- no commit op,
     /// ever -- and still puts back a block it REBUILT for a read (a repair
     /// restores existing content-addressed bytes: no key, no head moved).
@@ -841,7 +843,7 @@ impl Page {
             engine_has_head: false,
             out: Vec::new(),
             client_fx: Vec::new(),
-            unusable: Vec::new(),
+            unusable: Default::default(),
             read_only: false,
             head_floor: 0,
             below_floor: None,
@@ -1048,7 +1050,7 @@ impl Page {
                         self.life_on(&Label::Site(app.clone()), Ev::NodeRefused(format!("not sent: {why}")));
                     }
                 }
-                self.unusable.push(format!("not sent: {why}"));
+                self.say(instrument::Site::of("page::said::not-sent"), format!("not sent: {why}"));
             }
             Answer::SiteRefused { app, said } => {
                 if self.answered(&Waiting::Update(Label::Site(app.clone()))).is_some() {
@@ -1316,13 +1318,13 @@ impl Page {
                         _ => None,
                     })
                     .collect();
-                self.unusable.push(format!("the signer refused commit seq {seq} (writes {}): {why}", failed.join(", ")));
+                self.say(instrument::Site::of("page::said::head-refused"), format!("the signer refused commit seq {seq} (writes {}): {why}", failed.join(", ")));
             }
             Act::Note(state) => self.note_record(&state),
             Act::Forked(seq) => {
                 if self.old_signer_fork_at != Some(seq) {
                     self.old_signer_fork_at = Some(seq);
-                    self.unusable.push(format!(
+                    self.say(instrument::Site::of("page::said::old-signer-fork"), format!(
                         "SIGNER UPGRADE NEEDED: this signer predates the same-identity rule (sdk#225) and refuses every sign while its record and the register differ at seq {seq}; load the current version (its signer ships with the page). It signs again once the register moves past that seq"
                     ));
                 }
@@ -2291,7 +2293,7 @@ impl Page {
                         Effect::PutPack { .. } => "pack PUT",
                         _ => "head update",
                     };
-                    self.unusable.push(format!("read-only: a commit's {what} was not made (a view writes nothing but a repair)"));
+                    self.say(instrument::Site::of("page::said::read-only-commit"), format!("read-only: a commit's {what} was not made (a view writes nothing but a repair)"));
                 }
                 Effect::PutBlock { id, ref bytes, ref after } => {
                     // The page is the memory now: the engine keeps no bytes.
@@ -2351,7 +2353,7 @@ impl Page {
                 }
                 Effect::PutPack { id, .. } => {
                     // No packs in this phase, as the shell refuses them.
-                    self.unusable.push("a pack was emitted; packs are off in this phase".into());
+                    self.say(instrument::Site::of("page::said::pack-emitted"), "a pack was emitted; packs are off in this phase".into());
                     let more = self.engine.step(Event::PutFailed(id));
                     self.carry_out(more);
                 }
@@ -2594,8 +2596,29 @@ impl Page {
         self.read_only
     }
 
-    pub fn unusable(&self) -> &[String] {
-        &self.unusable
+    /// A look at the lines said and not yet taken, for TESTS only (the app's one reader is [`Page::take_unusable`]).
+    #[doc(hidden)]
+    pub fn unusable(&self) -> Vec<String> {
+        self.unusable.peek()
+    }
+
+    /// THE ONE READ of the lines said to the app (sdk#482): drains them (page-io's `take_unusable` reads it).
+    pub fn take_unusable(&mut self) -> Vec<String> {
+        self.unusable.take()
+    }
+
+    /// SAY `line` to the app at `site`: recorded as one `Key::Said` at the site (no text), and kept for the app.
+    fn say(&mut self, site: instrument::Site, line: String) {
+        self.record_said(site);
+        self.unusable.push(line);
+    }
+
+    /// Record one line said at `site` into the page's recording (page-io and the session say theirs through here).
+    pub fn record_said(&self, site: instrument::Site) {
+        if let Some(rec) = &self.rec {
+            use instrument::{Entry, Event, Key, OpId, Probe};
+            rec.event(Event::Counter { site, op: OpId::NONE, entry: Entry { key: Key::Said, value: 1 } });
+        }
     }
 
     /// The head the engine last saw published.
@@ -5171,5 +5194,27 @@ mod head_refused_order {
         assert!(p.engine.has_writes_in_flight(), "THE SETUP: write 2 did not go again");
         let lost: Vec<String> = held_back.iter().filter(|id| !owed(&p, id)).map(engine::short_id).collect();
         assert!(lost.is_empty(), "the withdraw ate the re-derived commit's PUT of {} of {} shared blocks: {lost:?}", lost.len(), held_back.len());
+    }
+}
+
+/// A LINE SAID IS RECORDED AT ITS SITE, WITH NO TEXT (sdk#482; the architect): `say` counts one `Key::Said` at the site
+/// and keeps the line for the app -- and nothing of the line enters the recording.
+#[cfg(test)]
+mod said {
+    use super::*;
+    use instrument::{vocab::Key, Record as _};
+
+    #[test]
+    fn a_line_said_is_one_counted_said_at_its_site_and_its_text_stays_out_of_the_recording() {
+        let mut p = Page::unstarted(Params::default(), PutPath::Page, Ms(0));
+        p.record_into(64);
+        let site = instrument::Site::of("page::said::test-site");
+        p.say(site, "a secret key abcdef named in a line".into());
+        let r = p.recording().expect("a recording");
+        let said: Vec<_> = r.events().into_iter().filter(|e| matches!(e, instrument::Event::Counter { entry, .. } if entry.key == Key::Said)).collect();
+        assert_eq!(said.len(), 1, "the line was not counted once");
+        assert!(matches!(&said[0], instrument::Event::Counter { site: s, entry, .. } if *s == site && entry.value == 1));
+        assert!(!format!("{:?}", r.events()).contains("abcdef"), "the line's text entered the recording");
+        assert_eq!(p.take_unusable(), vec!["a secret key abcdef named in a line".to_string()], "the line was not kept for the app");
     }
 }

@@ -39,7 +39,7 @@ pub use blockid::{BlockId, ContentHash, IdError};
 pub use writes::Writes;
 pub use db::{CreateAt, Db, DbError, Record, RerunEvent, RerunStep, Scan, SLOT_SKEW_MS};
 pub use id::slot_from;
-pub use engine_client::{Client, Event as EngineEvent};
+pub use engine_client::Client;
 pub use freenet_prolly::Cid;
 pub use id::{Env, RKey, SystemEnv};
 pub use live_bindings::LiveBindings;

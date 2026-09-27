@@ -156,10 +156,12 @@ await t("an answer for a contract this session never put is counted unusable, no
   const s = new Session(7999);
   s.provision(new TextEncoder().encode("signer code"), new TextEncoder().encode("block code"), new TextEncoder().encode("register code"));
   flush(s);
-  const before = s.unusable();
+  // The one read DRAINS (sdk#482): what was said before the answer is taken first.
+  s.take_unusable();
   s.on_inbound(them.ack);
-  assert.notEqual(s.unusable(), before);
-  assert.match(s.unusable(), /never put/);
+  const said = s.take_unusable();
+  assert.match(said, /never put/);
+  assert.deepEqual(JSON.parse(s.take_unusable()), [], "the read did not drain");
 });
 
 if (failures) { process.stdout.write(`${failures} failed\n`); process.exit(1); }

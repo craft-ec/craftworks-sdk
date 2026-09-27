@@ -47,8 +47,9 @@ pub struct Session {
     /// sends bytes and never learns what a `ClientRequest` is.
     out: Vec<Vec<u8>>,
     port: u16,
-    /// Messages this build could not use, by reason.
-    unusable: Vec<String>,
+    /// The session's own lines said to the app (sdk#482): capped, drained by [`Session::take_unusable`], each recorded
+    /// where said.
+    unusable: page::unusable::Unusable,
     /// Frames on this socket that NO session took (`unowned`). COUNTED, not
     /// described: the node chooses what it sends, and a count is the thing
     /// that says whether it is happening at all.
@@ -103,7 +104,7 @@ impl Session {
             ),
             out: Vec::new(),
             port,
-            unusable: Vec::new(),
+            unusable: Default::default(),
             foreign_notifications: 0,
             bound: craftworks_sdk::LiveBindings::default(),
             app: None,
@@ -371,7 +372,7 @@ impl Session {
         }
         let mut seed = [0u8; 32];
         if getrandom::getrandom(&mut seed).is_err() {
-            self.unusable.push("no randomness to mint a key".into());
+            self.say(page::unusable::Site::of("session::said::no-randomness"), "no randomness to mint a key".into());
             return;
         }
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
@@ -403,7 +404,7 @@ impl Session {
         // The app's own PUTs are the page's (`put_status`): what is left is
         // an answer about a contract this session never put.
         for answer in others {
-            self.unusable.push(format!("a PUT answer for a contract this session never put: {answer:?}"));
+            self.say(page::unusable::Site::of("session::said::put-unasked"), format!("a PUT answer for a contract this session never put: {answer:?}"));
         }
         if ready {
             self.page_identity_sent = true;
@@ -428,7 +429,7 @@ impl Session {
     pub fn set_cold_reads(&mut self, on: bool, block_code: Vec<u8>) {
         let _ = block_code;
         if on {
-            self.unusable.push("set_cold_reads(true): the in-page engine reads cold itself; the Session's own cold reads are gone (sdk#258)".into());
+            self.say(page::unusable::Site::of("session::said::cold-reads"), "set_cold_reads(true): the in-page engine reads cold itself; the Session's own cold reads are gone (sdk#258)".into());
         }
     }
 
@@ -454,17 +455,25 @@ impl Session {
         self.pump_page();
     }
 
-    /// Messages this build could not use, by reason.
-    pub fn unusable(&self) -> String {
-        // AND page-io's, in page mode: what the page's own I/O could not use
-        // (a refused provisioning, a frame it could not make, a mint it was
-        // stopped from) is this session's to report. Kept apart, it was
-        // invisible — core dev's M254 minted on every pump and nothing showed.
-        let mut all = self.unusable.clone();
-        if let Some(p) = self.page() {
-            all.extend(p.unusable().iter().cloned());
+    /// THE ONE READ of every line said to the app (sdk#482), and it DRAINS: the session's own, then page-io's and the
+    /// page's (in page mode: what the page's own I/O could not use is this session's to report -- kept apart, it was
+    /// invisible; core dev's M254 minted on every pump and nothing showed). Each list is capped, so a caller that
+    /// never reads still holds only the newest lines; a caller that polls keeps its own history.
+    pub fn take_unusable(&mut self) -> String {
+        let mut all = self.unusable.take();
+        if let Some(p) = self.page_mut() {
+            all.extend(p.take_unusable());
         }
         serde_json::to_string(&all).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// SAY `line` to the app at `site`: recorded as one `Key::Said` in the page's recording when there is a page (no
+    /// text), and kept.
+    fn say(&mut self, site: page::unusable::Site, line: String) {
+        if let Some(p) = self.page() {
+            p.server.page.record_said(site);
+        }
+        self.unusable.push(line);
     }
 
     /// Provision this session on the node: the SIGNER delegate's wasm, and
@@ -478,7 +487,7 @@ impl Session {
     pub fn provision(&mut self, signer: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
         // A VIEW installs nothing on the node it reads from (sdk#239).
         if self.page().is_some_and(|p| p.read_only()) {
-            self.unusable.push(format!("{READ_ONLY}: provisioning refused"));
+            self.say(page::unusable::Site::of("session::said::read-only-provision"), format!("{READ_ONLY}: provisioning refused"));
             return;
         }
         self.signer_code = signer;
@@ -493,7 +502,7 @@ impl Session {
     /// minted here. The answer: [`Session::asked`].
     pub fn ask_signer(&mut self, signer: Vec<u8>, block: Vec<u8>, register: Vec<u8>) {
         if self.page().is_some() {
-            self.unusable.push("ask_signer: this session already has a page".into());
+            self.say(page::unusable::Site::of("session::said::signer-asked-twice"), "ask_signer: this session already has a page".into());
             return;
         }
         let (_, key) = wire::delegate_from_code(&signer);
@@ -1245,7 +1254,7 @@ impl Session {
                     E::Unknown => ("UNKNOWN", format!("write {id} may or may not have been saved (its confirmation was lost); check it"), serde_json::json!({})),
                     E::TooLarge { limit, got, .. } => ("TOO_LARGE", format!("write {id} is over the engine's limit ({got} against {limit}); split it into smaller writes"), serde_json::json!({ "limit": limit, "got": got })),
                 };
-                self.unusable.push(line.clone());
+                self.say(page::unusable::Site::of("session::said::write-fate"), line.clone());
                 serde_json::json!({ "writeId": id, "fate": fate, "line": line, "detail": extra })
             })
             .collect();
@@ -1266,7 +1275,7 @@ impl Session {
                     if u.write_ids.len() == 1 { "" } else { "s" },
                     if u.write_ids.len() == 1 { "was" } else { "were" },
                 );
-                self.unusable.push(line.clone());
+                self.say(page::unusable::Site::of("session::said::write-unread"), line.clone());
                 serde_json::json!({ "writeIds": u.write_ids, "key": key, "line": line })
             })
             .collect();

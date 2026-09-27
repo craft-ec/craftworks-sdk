@@ -41,7 +41,7 @@ const page = () => {
   return s;
 };
 /** Several turns of the page's clock and pump; then what it had to call unusable. */
-const settled = s => { for (let i = 0; i < 4; i += 1) { s.tick(); s.sent(s.outbound().length); } return JSON.parse(s.unusable()); };
+const settled = s => { for (let i = 0; i < 4; i += 1) { s.tick(); s.sent(s.outbound().length); } return JSON.parse(s.take_unusable()); };
 const answer = (s, id, p) => { s.on_inbound(new Uint8Array(Buffer.from(stdlib([], `register:${id}:${p ? hex(p) : "none"}`).signer_answer, "hex"))); };
 
 await t("**a page ASKS the signer which Register first — nothing is minted or provisioned yet**", async () => {

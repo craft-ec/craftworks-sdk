@@ -45,7 +45,7 @@ const TRANSPORT_ONLY: &[&str] = &[
     "sent",
     "on_inbound",
     "take_progress",
-    "unusable",
+    "take_unusable",
     "provision",
     "provisioned",
     "not_answering",
