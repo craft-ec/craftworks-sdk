@@ -212,3 +212,16 @@ fn control_the_reader_notices_a_missing_method() {
         "the reader claims a method that is not there"
     );
 }
+
+/// DECLARED IS NOT OFFERED (Codex on sdk#542): every TRANSPORT_ONLY name is a method the engine-backed Session really
+/// has. A name left behind here -- a method deleted, or renamed -- would otherwise excuse nothing and be noticed by
+/// nobody, and `damaged` (sdk#524) is one of them.
+#[test]
+fn every_transport_only_name_is_a_real_session_method() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let session = std::fs::read_to_string(dir.join("src/session.rs")).expect("web/src/session.rs");
+    let engine = methods_in(&session, "impl Session {");
+    let absent: Vec<&&str> = TRANSPORT_ONLY.iter().filter(|m| !engine.contains(**m)).collect();
+    assert!(absent.is_empty(), "declared TRANSPORT_ONLY, but the Session has no such method: {absent:?}");
+    assert!(TRANSPORT_ONLY.contains(&"damaged"), "THE SETUP: damaged is not declared transport-only");
+}
