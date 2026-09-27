@@ -166,6 +166,15 @@ impl Site {
     fn published_key(&self) -> Option<&str> {
         match &self.role {
             SiteRole::Publishing { key, .. } => Some(key),
+            SiteRole::Following { .. } | SiteRole::Auditing => None,
+        }
+    }
+
+    /// Its contract key when this page SUBSCRIBES to it (a publisher, or a reopen following it): its read carries
+    /// `subscribe`, and the node's change of it is this page's to read. An audit never subscribes.
+    fn subscribed_key(&self) -> Option<&str> {
+        match &self.role {
+            SiteRole::Publishing { key, .. } | SiteRole::Following { key } => Some(key),
             SiteRole::Auditing => None,
         }
     }
@@ -178,6 +187,9 @@ enum SiteRole {
     Publishing { contract: ContractContainer, key: String, web: Vec<u8> },
     /// Being AUDITED (a keeper's pass, sdk#493): read only, never put, signed or followed.
     Auditing,
+    /// Being FOLLOWED by a reopen (sdk#520, PUBLISH-LIFE P7): read with subscribe, its changes read -- never PUT or
+    /// signed. `key`: its contract key, which the node's change names.
+    Following { key: String },
 }
 
 /// Why a site cannot be published or linked yet: the node's signer has not named the Register (the key) this
@@ -201,7 +213,7 @@ pub fn site_contract(site_code: &[u8], register_params: &[u8], app: &str) -> Opt
 /// from their own params names). STRICT: the link must decode to the 32-byte id AND encode back to itself
 /// (`from_base58` zero-pads a short text into a well-formed wrong id); anything else is `None`, never a guess.
 pub fn site_id_of_path(path: &str) -> Option<[u8; 32]> {
-    site_path(path).ok()
+    parse_site_path(path).ok()
 }
 
 /// A site ADDRESS as a person gives one (sdk#472's keepSet; the loader handover uses [`site_id_of_path`]): a bare link
@@ -215,14 +227,14 @@ pub fn site_id_of_address(text: &str) -> Result<[u8; 32], AddressRefused> {
     }
     if let Some(rest) = text.strip_prefix("http://").or_else(|| text.strip_prefix("https://")) {
         let path = rest.find('/').map(|at| &rest[at..]).ok_or(AddressRefused::NotASitePath)?;
-        return site_path(path);
+        return parse_site_path(path);
     }
     if text.contains("://") {
         // `craftec://` among them: nothing defines one, so nothing reads one.
         return Err(AddressRefused::UnknownScheme);
     }
     if text.starts_with('/') {
-        return site_path(text);
+        return parse_site_path(text);
     }
     if text.contains(['/', '?', '#']) {
         return Err(AddressRefused::NotASitePath);
@@ -230,10 +242,27 @@ pub fn site_id_of_address(text: &str) -> Result<[u8; 32], AddressRefused> {
     site_id_of_link(text).ok_or(AddressRefused::NotASiteLink)
 }
 
+/// THE NODE'S WEB PATH (sdk#520): every web container -- an app's site, a load piece -- is served under it. The one
+/// spelling: [`web_path`] composes it and [`parse_site_path`] strips it.
+const WEB_PATH: &str = "/v1/contract/web/";
+
 /// THE path form, parsed in ONE place (both [`site_id_of_path`] and [`site_id_of_address`] come through here).
-fn site_path(path: &str) -> Result<[u8; 32], AddressRefused> {
-    let link = path.strip_prefix("/v1/contract/web/").ok_or(AddressRefused::NotASitePath)?.split(['/', '?', '#']).next().unwrap_or("");
+fn parse_site_path(path: &str) -> Result<[u8; 32], AddressRefused> {
+    let link = path.strip_prefix(WEB_PATH).ok_or(AddressRefused::NotASitePath)?.split(['/', '?', '#']).next().unwrap_or("");
     site_id_of_link(link).ok_or(AddressRefused::NotASiteLink)
+}
+
+/// WHERE A NODE SERVES `file` OF THE WEB CONTAINER AT `address` (sdk#520): `/v1/contract/web/<address>/<file>`, the
+/// inverse of [`site_id_of_path`] and the ONE composer of the path (the builder's hand-built copies are deleted). `file`
+/// is empty for the container's own page. STRICT, like the parser: `address` must be exactly a 32-byte id that
+/// encodes back to itself ([`AddressRefused::NotASiteLink`]), and `file` must stay inside the container -- no leading
+/// `/`, no `..` segment, no query or fragment ([`AddressRefused::NotASitePath`]).
+pub fn web_path(address: &str, file: &str) -> Result<String, AddressRefused> {
+    site_id_of_link(address).ok_or(AddressRefused::NotASiteLink)?;
+    if file.starts_with('/') || file.contains(['?', '#', '\\']) || file.split('/').any(|seg| seg == "..") {
+        return Err(AddressRefused::NotASitePath);
+    }
+    Ok(format!("{WEB_PATH}{address}/{file}"))
 }
 
 /// Why a text is not a site address, by name.
@@ -737,15 +766,7 @@ impl PageIo {
         if self.read_only() {
             return Err("read-only: a reader publishes nothing".into());
         }
-        if self.art.register_params.is_empty() {
-            return Err(NO_REGISTER_YET.into());
-        }
-        let Some(contract) = site_contract(site_code, &self.art.register_params, app) else {
-            return Err(format!("no site for {app:?}: not an app id, or this head has no single key to sign it"));
-        };
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&contract.key().id().as_bytes()[..32]);
-        let key = contract.key().to_string();
+        let (contract, id, key) = self.site_of(site_code, app)?;
         let value = *blake3::hash(&web).as_bytes();
         self.sites.insert(app.to_string(), Site { id, role: SiteRole::Publishing { contract, key, web } });
         self.server.page.publish_site(app, value, now);
@@ -756,11 +777,38 @@ impl PageIo {
     /// `app`'s site LINK: its contract's instance id, as the node serves it (`/v1/contract/web/<link>/`). The same
     /// for every publish (builder#117). `None`: not an app id, or this head has no single key.
     pub fn site_link(&self, site_code: &[u8], app: &str) -> Option<String> {
-        site_contract(site_code, &self.art.register_params, app).map(|c| {
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&c.key().id().as_bytes()[..32]);
-            site_text(&id)
-        })
+        self.site_of(site_code, app).ok().map(|(_, id, _)| site_text(&id))
+    }
+
+    /// `app`'s site under `site_code`: its contract, instance id and key -- the ONE derivation publishing, following
+    /// and linking share. Refused by name before the signer has named the Register, or for a bad app id.
+    fn site_of(&self, site_code: &[u8], app: &str) -> Result<(ContractContainer, [u8; 32], String), String> {
+        if self.art.register_params.is_empty() {
+            return Err(NO_REGISTER_YET.into());
+        }
+        let Some(contract) = site_contract(site_code, &self.art.register_params, app) else {
+            return Err(format!("no site for {app:?}: not an app id, or this head has no single key to sign it"));
+        };
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&contract.key().id().as_bytes()[..32]);
+        let key = contract.key().to_string();
+        Ok((contract, id, key))
+    }
+
+    /// FOLLOW `app`'s site (sdk#520, PUBLISH-LIFE E13): a REOPEN of a published project reads what is live and
+    /// publishes NOTHING (P7) -- no Sign, no UPDATE, no PUT. The read carries `subscribe`; a change the node pushes is
+    /// read ([`Page::site_pushed`] / [`Page::site_hint`]), as the head's is. [`PageIo::publication`] says `Reading`
+    /// until the node answers, then `Published` at the version it shows. Returns the site's LINK. The follow is its own
+    /// machine beside the publish (H4): a site being published is followed too, and stays followed after (P8).
+    pub fn follow_site(&mut self, app: &str, site_code: &[u8], now: Ms) -> Result<String, String> {
+        let (_, id, key) = self.site_of(site_code, app)?;
+        // A site being PUBLISHED keeps that role (it is read with subscribe already); any other is followed.
+        if !matches!(self.sites.get(app).map(|s| &s.role), Some(SiteRole::Publishing { .. })) {
+            self.sites.insert(app.to_string(), Site { id, role: SiteRole::Following { key } });
+        }
+        self.server.page.follow_site(app, now);
+        self.pump();
+        Ok(site_text(&id))
     }
 
     /// Has the node's signer named the Register this page signs under (so a site has an authority)?
@@ -793,7 +841,7 @@ impl PageIo {
     /// publisher does). Refused, by name, for a site this page neither publishes nor audits. `pump` frames it.
     fn site_read(&self, app: &str) -> Result<([u8; 32], bool), String> {
         match self.sites.get(app) {
-            Some(site) => Ok((site.id, site.published_key().is_some())),
+            Some(site) => Ok((site.id, site.subscribed_key().is_some())),
             None => Err(format!("a read of {app}'s site, which is not being published or audited")),
         }
     }
@@ -803,6 +851,7 @@ impl PageIo {
         match self.sites.get(app).map(|s| &s.role) {
             Some(SiteRole::Publishing { contract, web, .. }) => Ok((contract.clone(), web.clone())),
             Some(SiteRole::Auditing) => Err(format!("a PUT of {app}'s site, which is only being audited")),
+            Some(SiteRole::Following { .. }) => Err(format!("a PUT of {app}'s site, which is only being followed")),
             None => Err(format!("a PUT of {app}'s site, which is not being published")),
         }
     }
@@ -1167,8 +1216,17 @@ impl PageIo {
             // `Ok` names nothing and answers nothing (wire: "a step must not rely on this one"); every op this page
             // sent ends by its own named answer or is re-sent on the RTO.
             Incoming::Ack(wire::AckKind::Ok) => {}
-            // A SITE's change (owns() takes it): the page does not follow a site.
-            Incoming::HeadChanged { .. } => {}
+            // A SITE's change (owns() takes it): read when this page FOLLOWS it (sdk#520) -- a full state is the node's
+            // word, an ordinary read; a delta a hint to read. A publisher's own read-back decides for it, and an
+            // unknown key is nobody's.
+            Incoming::HeadChanged { key, state } => {
+                if let Some(app) = self.sites.iter().find(|(_, s)| s.subscribed_key() == Some(key.as_str())).map(|(a, _)| a.clone()) {
+                    match state.as_deref().and_then(page::HeadRead::from_record) {
+                        Some(read) => self.server.site_pushed(&app, read),
+                        None => self.server.site_hint(&app),
+                    }
+                }
+            }
             // A chunk of a larger message: the reassembler holds it; nothing to hand on yet.
             Incoming::Partial => {}
         }
@@ -1419,6 +1477,7 @@ impl PageIo {
                         Label::Site(app) => match self.sites.get(&app) {
                             Some(Site { id, role: SiteRole::Publishing { .. } }) => Ok(signer_proto::Label::Site { contract: *id, app }),
                             Some(Site { role: SiteRole::Auditing, .. }) => Err(format!("a sign for {app}'s site, which is only being audited")),
+                            Some(Site { role: SiteRole::Following { .. }, .. }) => Err(format!("a sign for {app}'s site, which is only being followed")),
                             None => Err(format!("a sign for {app}'s site, which is not being published")),
                         },
                     };
@@ -1501,12 +1560,21 @@ impl PageIo {
             }
             self.pump();
         }
-        // A site's bytes are page-io's only while its publication is in flight.
+        // A site's bytes are page-io's only while its publication is in flight; a FOLLOWED site (H4, P8) keeps its
+        // read -- a publish that ended returns it to `Following` -- for as long as the page follows it.
         let page = &self.server.page;
-        self.sites.retain(|app, site| match site.role {
-            SiteRole::Publishing { .. } => matches!(page.publication(app), Some(Publication::Publishing { .. })),
-            // An audit ends by `end_site_audit`, not by a publication.
-            SiteRole::Auditing => true,
+        self.sites.retain(|app, site| {
+            match &site.role {
+                SiteRole::Publishing { .. } if matches!(page.publication(app), Some(Publication::Publishing { .. })) => true,
+                SiteRole::Publishing { key, .. } if page.follows(app) => {
+                    site.role = SiteRole::Following { key: key.clone() };
+                    true
+                }
+                SiteRole::Publishing { .. } => false,
+                // An audit ends by `end_site_audit`, not by a publication.
+                SiteRole::Auditing => true,
+                SiteRole::Following { .. } => page.follows(app),
+            }
         });
     }
 }

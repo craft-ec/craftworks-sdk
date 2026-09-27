@@ -394,6 +394,24 @@ impl Server {
         self.out.extend(out.replies);
     }
 
+    /// The node's change of a FOLLOWED site's register, WITH its full state (sdk#520): the page's ordinary read.
+    pub fn site_pushed(&mut self, app: &str, read: crate::HeadRead) {
+        let mut out = Outbound::default();
+        self.page.site_pushed(app, read);
+        self.drain(&mut out);
+        self.answer_call(&mut out);
+        self.out.extend(out.replies);
+    }
+
+    /// The node's change of a FOLLOWED site's register, with no state: the page reads it.
+    pub fn site_hint(&mut self, app: &str) {
+        let mut out = Outbound::default();
+        self.page.site_hint(app);
+        self.drain(&mut out);
+        self.answer_call(&mut out);
+        self.out.extend(out.replies);
+    }
+
     pub fn tick(&mut self, now_ms: Ms) {
         let mut out = Outbound::default();
         self.page.tick(now_ms);

@@ -100,6 +100,9 @@ struct Publisher {
     stale_read: Option<Option<Vec<u8>>>,
     /// Sign ops seen, and whether any op touched the head (the engine's).
     signs: usize,
+    /// The site's UPDATE ops seen (P7: a follow sends none), and its reads.
+    updates: usize,
+    reads: usize,
     head_ops: usize,
     /// Sign asks this device's OWN node answers before it holds the site (the signer's local read lags: a new
     /// device's node fetches the site with the page's first read, and serves it locally only after that).
@@ -110,7 +113,7 @@ struct Publisher {
 }
 impl Publisher {
     fn new(host: Mem) -> Publisher {
-        Publisher { page: Page::new(Params::default(), PutPath::Page), host, origin: signer::Origin::Local, stale_read: None, signs: 0, head_ops: 0, blind_signs: 0, root_not_held: 0 }
+        Publisher { page: Page::new(Params::default(), PutPath::Page), host, origin: signer::Origin::Local, stale_read: None, signs: 0, updates: 0, reads: 0, head_ops: 0, blind_signs: 0, root_not_held: 0 }
     }
     fn publication(&self) -> Option<Publication> {
         self.page.publication(APP)
@@ -123,6 +126,7 @@ impl Publisher {
             let site = Label::Site(APP.into());
             let a = match &op {
                 Op::ReadHead { label } if *label == site => {
+                    self.reads += 1;
                     let read = match self.stale_read.take() {
                         Some(stale) => stale.as_deref().and_then(HeadRead::from_record),
                         None => node.read(),
@@ -154,6 +158,7 @@ impl Publisher {
                     Answer::Signer { id: *id, answer: signer::serve(&mut self.host, &signer::encode_request(*id, &req), self.origin) }
                 }
                 Op::Update { label, state } if *label == site => {
+                    self.updates += 1;
                     if fate(&op) == Fate::Answer {
                         node.put(state);
                     }
@@ -458,4 +463,286 @@ fn a_new_device_follows_the_site_it_reads() {
     }
     assert!(saw_wait, "the HeadUnknown wait was never stated");
     assert_eq!(a.publication(), Some(Publication::Published { version: 4 }));
+}
+
+// ---- A REOPEN FOLLOWS THE SITE (sdk#520, PUBLISH-LIFE E13 / P7) ------------------------------------------------------
+
+/// Publish `n` on `node` from `other` (another device of the person), to its end.
+fn publish_on(other: &mut Publisher, node: &mut Node, now: &mut u64, n: u8) {
+    other.page.publish_site(APP, bundle(n), Ms(*now));
+    run(&mut [&mut *other], node, now, 100, &mut always);
+    assert!(matches!(other.publication(), Some(Publication::Published { .. })), "the other device's publish {n} did not land");
+}
+
+/// Step `f` for `rounds` rounds of 50 ms.
+fn follow_rounds(f: &mut Publisher, node: &mut Node, now: &mut u64, rounds: usize) {
+    for _ in 0..rounds {
+        *now += 50;
+        f.step(node, *now, &mut always);
+    }
+}
+
+/// **A REOPEN READS WHAT IS LIVE AND PUBLISHES NOTHING (P7), and follows a newer version -- by the node's push, and
+/// by the backstop when a push is dropped.** `Reading` until the node answers (a real state, never an empty one),
+/// then `Published` at the version the NODE shows. An older push never moves it back.
+#[test]
+fn a_reopen_reads_what_is_live_publishes_nothing_and_follows_newer_versions() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    assert_eq!(f.publication(), Some(Publication::Reading), "a follow is not `reading` before the node answers");
+    follow_rounds(&mut f, &mut node, &mut now, 5);
+    assert_eq!(f.publication(), Some(Publication::Published { version: 1 }));
+    // Another device publishes v2: the node's PUSH moves the follow (the node's word).
+    publish_on(&mut other, &mut node, &mut now, 2);
+    f.page.site_pushed(APP, node.read().expect("v2"));
+    assert_eq!(f.publication(), Some(Publication::Published { version: 2 }), "a push of a newer version did not move the follow");
+    // An OLDER push (a node behind) changes nothing.
+    let mut behind = Node::default();
+    let mut t = now;
+    let mut third = Publisher::new(device());
+    publish_on(&mut third, &mut behind, &mut t, 1);
+    f.page.site_pushed(APP, behind.read().expect("v1"));
+    assert_eq!(f.publication(), Some(Publication::Published { version: 2 }), "an older version moved the follow back");
+    // v3 with NO push (a dropped hint): the BACKSTOP reads the site within HEAD_BACKSTOP_MS.
+    publish_on(&mut other, &mut node, &mut now, 3);
+    let reads = f.reads;
+    now += page::HEAD_BACKSTOP_MS;
+    f.step(&mut node, now, &mut always);
+    follow_rounds(&mut f, &mut node, &mut now, 2);
+    assert!(f.reads > reads, "no backstop read of a followed site");
+    assert_eq!(f.publication(), Some(Publication::Published { version: 3 }), "the backstop's read did not move the follow");
+    // P7, counted from the OPS: a follow signed nothing and wrote nothing.
+    assert_eq!((f.signs, f.updates), (0, 0), "P7: a follow sent a Sign or an UPDATE");
+    // THE CONTROL: a publish from the same kind of page does send them (the counters see a publish).
+    f.page.publish_site(APP, bundle(4), Ms(now));
+    run(&mut [&mut f], &mut node, &mut now, 100, &mut always);
+    assert!(f.signs > 0 && f.updates > 0, "THE CONTROL: a publish sent no Sign or UPDATE, so the counters prove nothing");
+    assert_eq!(f.publication(), Some(Publication::Published { version: 4 }), "a publish from a follow (E2) is today's path");
+}
+
+/// **A follow that reads NOTHING says `reading`, and asks again on the backoff -- never "absent", never a publish.**
+/// Mutant "Reading{Follow} x NotFound -> Signing (v1)" (the Publish cell copied) -> a Sign goes out -> red.
+#[test]
+fn a_follow_that_reads_nothing_says_reading_and_asks_again() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    follow_rounds(&mut f, &mut node, &mut now, 200);
+    assert_eq!(f.publication(), Some(Publication::Reading), "a NotFound ended the follow's reading");
+    assert!(f.reads >= 3, "a NotFound was not read again on the backoff ({} reads in 10 s)", f.reads);
+    assert_eq!((f.signs, f.updates), (0, 0), "P7: a follow that read NotFound signed or wrote");
+    // The site appears: the next read shows it.
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    follow_rounds(&mut f, &mut node, &mut now, 400);
+    assert_eq!(f.publication(), Some(Publication::Published { version: 1 }), "the follow never read the site once it existed");
+}
+
+/// **A cancel on a follow is nothing (PUBLISH-LIFE ¹²)**: E12 cancels the person's OWN publish; a follow has none,
+/// and `cancelled` would be a false word about a site the node shows.
+#[test]
+fn a_cancel_on_a_follow_changes_nothing() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    f.page.cancel_site(APP);
+    assert_eq!(f.publication(), Some(Publication::Reading), "a cancel ended a follow while reading");
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    follow_rounds(&mut f, &mut node, &mut now, 5);
+    f.page.cancel_site(APP);
+    assert_eq!(f.publication(), Some(Publication::Published { version: 1 }), "a cancel ended a follow that was published");
+}
+
+/// **The follow is renewed after a reconnect** (a subscription lives on a socket): the one path the head's is.
+#[test]
+fn a_reconnect_reads_a_followed_site_again() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    follow_rounds(&mut f, &mut node, &mut now, 5);
+    let _ = f.page.take_ops();
+    f.page.reconnected(Ms(now));
+    let site = Label::Site(APP.into());
+    assert!(f.page.take_ops().iter().any(|op| matches!(op, Op::ReadHead { label } if *label == site)), "a reconnect did not read the followed site");
+}
+
+/// **THE FOLLOW MODEL (the architect's gate for P7)**: 200 seeded runs of a follower against a REFERENCE -- the
+/// node's own site, published to by another device -- over random events: the other device publishes, the node
+/// pushes the current state (or a hint), a read goes silent, the page reconnects, the clock jumps (a little, or past
+/// the backstop), a person cancels. After EVERY step: no Sign and no UPDATE ever left the follower (counted from its
+/// ops, not its state); its status is `reading` or `published` at a version the node has held, never moving back.
+/// At the end, with the backstop run, it shows exactly the node's version. Reach is floored on what the checks are
+/// about: runs that read NotFound first, versions moved by a push, and by the backstop.
+#[test]
+fn the_follow_model_never_publishes_and_converges_on_the_node() {
+    let (mut from_notfound, mut by_push, mut by_backstop, mut published_runs) = (0usize, 0usize, 0usize, 0usize);
+    for seed in 1..=200u64 {
+        let mut x = seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (mut node, mut now) = (Node::default(), 1_000u64);
+        let mut other = Publisher::new(device());
+        let mut n = 0u8;
+        if next(3) != 0 {
+            n += 1;
+            publish_on(&mut other, &mut node, &mut now, n);
+        } else {
+            from_notfound += 1;
+        }
+        let mut f = Publisher::new(device());
+        f.page.follow_site(APP, Ms(now));
+        let mut last = 0u64;
+        let mut silent = false;
+        for step in 0..40 {
+            let at = format!("seed {seed} step {step}");
+            match next(8) {
+                0 if n < 6 => {
+                    n += 1;
+                    publish_on(&mut other, &mut node, &mut now, n);
+                }
+                1 => {
+                    if let Some(read) = node.read() {
+                        let before = f.publication();
+                        f.page.site_pushed(APP, read);
+                        if f.publication() != before && matches!(before, Some(Publication::Published { .. })) {
+                            by_push += 1;
+                        }
+                    }
+                }
+                2 => f.page.site_hint(APP),
+                3 => silent = true,
+                4 => {
+                    f.page.reconnected(Ms(now));
+                }
+                5 => {
+                    let before = f.publication();
+                    now += page::HEAD_BACKSTOP_MS;
+                    f.step(&mut node, now, &mut always);
+                    follow_rounds(&mut f, &mut node, &mut now, 2);
+                    if f.publication() != before && matches!(before, Some(Publication::Published { .. })) {
+                        by_backstop += 1;
+                    }
+                }
+                6 => f.page.cancel_site(APP),
+                _ => {}
+            }
+            // One round, a read silent when asked to be.
+            now += 50;
+            let quiet = std::mem::take(&mut silent);
+            f.step(&mut node, now, &mut |op: &Op| if quiet && matches!(op, Op::ReadHead { .. }) { Fate::Silence } else { Fate::Answer });
+            // P7, from the OPS.
+            assert_eq!((f.signs, f.updates), (0, 0), "{at}: P7 -- a follow sent a Sign or an UPDATE");
+            match f.publication() {
+                Some(Publication::Reading) => assert_eq!(last, 0, "{at}: back to `reading` after a version was shown"),
+                Some(Publication::Published { version }) => {
+                    assert!(version >= last, "{at}: the version moved BACK ({last} -> {version})");
+                    assert!(version <= node.seq().unwrap_or(0), "{at}: a version the node never held ({version} > {:?})", node.seq());
+                    last = version;
+                }
+                other => panic!("{at}: a follow is {other:?}, not reading/published"),
+            }
+        }
+        // CONVERGENCE: the backstop reads the node; the follow shows exactly its version.
+        now += page::HEAD_BACKSTOP_MS;
+        f.step(&mut node, now, &mut always);
+        follow_rounds(&mut f, &mut node, &mut now, 400);
+        let want = node.seq().map(|version| Publication::Published { version }).unwrap_or(Publication::Reading);
+        assert_eq!(f.publication(), Some(want), "seed {seed}: the follow did not converge on the node");
+        published_runs += usize::from(node.seq().is_some());
+    }
+    println!("follow model: from NotFound {from_notfound}, moved by a push {by_push}, by the backstop {by_backstop}, published runs {published_runs}");
+    assert!(from_notfound >= 20 && by_push >= 20 && by_backstop >= 20 && published_runs >= 150, "the model's reach is below its floor");
+}
+
+/// **P8 (H4, sdk#533): A REOPENED PAGE THAT PUBLISHES STILL SHOWS ANOTHER DEVICE'S LATER PUBLISH.** The follow is its
+/// own machine beside the publish: this page's publish ends at v2 and the follow takes it (E14); another device then
+/// publishes v3 and the node's push shows it -- `Published{3}`, not the page's own v2. Mutant "the site's status is
+/// the publish's end alone" -> v2 -> red.
+#[test]
+fn a_reopened_page_that_publishes_still_shows_another_devices_later_publish() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    follow_rounds(&mut f, &mut node, &mut now, 5);
+    assert_eq!(f.publication(), Some(Publication::Published { version: 1 }));
+    // This page publishes: v2, its own.
+    f.page.publish_site(APP, bundle(9), Ms(now));
+    run(&mut [&mut f], &mut node, &mut now, 100, &mut always);
+    assert_eq!(f.publication(), Some(Publication::Published { version: 2 }), "THE SETUP: this page's publish did not land at v2");
+    // Another device publishes v3: the follow still holds the site, and shows it (by the push, then by the backstop).
+    publish_on(&mut other, &mut node, &mut now, 3);
+    f.page.site_pushed(APP, node.read().expect("v3"));
+    assert_eq!(f.publication(), Some(Publication::Published { version: 3 }), "P8: after its own publish, a reopened page missed another device's");
+    publish_on(&mut other, &mut node, &mut now, 4);
+    now += page::HEAD_BACKSTOP_MS;
+    f.step(&mut node, now, &mut always);
+    follow_rounds(&mut f, &mut node, &mut now, 2);
+    assert_eq!(f.publication(), Some(Publication::Published { version: 4 }), "P8: the backstop no longer reads a site the page published");
+    assert_eq!(f.page.impossible_follow_cells(), 0);
+}
+
+/// **TWO HOLDERS OF ONE READ (the architect on H4).** A reopen's follow and a publish's read are in flight on ONE site
+/// at once; the person CANCELS the publish (its life ends and leaves ITS waiter) -- the follow's read survives and is
+/// answered: the follow shows the node's version. Mutant "a site's end withdraws the read whoever holds it" -> the
+/// answer is dropped and the follow reads for ever -> red.
+#[test]
+fn a_cancelled_publish_leaves_the_follows_read_standing() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    f.page.publish_site(APP, bundle(9), Ms(now));
+    f.page.cancel_site(APP);
+    assert_eq!(f.publication(), Some(Publication::Cancelled), "THE SETUP: the publish did not end cancelled");
+    follow_rounds(&mut f, &mut node, &mut now, 5);
+    assert_eq!(f.publication(), Some(Publication::Cancelled), "the follow hid the person's cancel");
+    assert_eq!(f.page.follow_version(APP), Some(1), "the follow's read did not survive the publish's end: it was never answered");
+    // The follow shows v1 underneath: another device's newer publish shows through the cancel.
+    publish_on(&mut other, &mut node, &mut now, 2);
+    f.page.site_pushed(APP, node.read().expect("v2"));
+    assert_eq!(f.publication(), Some(Publication::Cancelled), "a cancel is the person's last act: it stays said");
+    assert_eq!(f.page.follow_version(APP), Some(2), "the follow no longer follows after the publish's cancel");
+    assert!((f.signs, f.updates) == (0, 0), "a cancelled publish signed or wrote");
+    assert_eq!(f.page.impossible_follow_cells(), 0, "the follow's answer landed in an impossible cell");
+}
+
+/// **E14 (H4, the architect's Refused x E14 cell): a follow gone REFUSED comes back on THIS page's own publish.** A
+/// record that is not a site's refuses the follow (it then holds no read); this page publishes v2 -- its own publish's
+/// end is the ONLY way back (E14 -> Showing{2}, its subscription read restarted) -- and another device's v3 then shows.
+/// Mutant "the publish's end is never sent to the follow" -> the follow stays Refused, v3 is never shown -> red.
+#[test]
+fn a_refused_follow_resumes_on_this_pages_own_publish() {
+    let (mut node, mut now) = (Node::default(), 1_000);
+    let mut other = Publisher::new(device());
+    publish_on(&mut other, &mut node, &mut now, 1);
+    let mut f = Publisher::new(device());
+    f.page.follow_site(APP, Ms(now));
+    follow_rounds(&mut f, &mut node, &mut now, 5);
+    assert_eq!(f.page.follow_version(APP), Some(1), "THE SETUP: the follow does not show v1");
+    // A record that is not a site's (a value longer than a bundle hash) refuses the follow.
+    f.page.site_pushed(APP, HeadRead::from_value(9, &[7u8; 40]).expect("a head value"));
+    assert!(matches!(f.publication(), Some(Publication::Refused(_))), "THE SETUP: the follow was not refused: {:?}", f.publication());
+    // THIS page publishes v2: its end is the follow's way back.
+    f.page.publish_site(APP, bundle(9), Ms(now));
+    run(&mut [&mut f], &mut node, &mut now, 100, &mut always);
+    assert_eq!(f.publication(), Some(Publication::Published { version: 2 }), "THE SETUP: this page's publish did not land at v2");
+    assert_eq!(f.page.follow_version(APP), Some(2), "E14: a Refused follow did not come back on this page's own publish");
+    // Another device publishes v3: the follow shows it (P8).
+    publish_on(&mut other, &mut node, &mut now, 3);
+    f.page.site_pushed(APP, node.read().expect("v3"));
+    assert_eq!(f.publication(), Some(Publication::Published { version: 3 }), "P8: after a refusal and its own publish, the page missed another device's");
+    assert_eq!(f.page.impossible_follow_cells(), 0, "a read reached a follow that holds none");
 }
