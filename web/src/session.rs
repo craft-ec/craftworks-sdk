@@ -27,7 +27,7 @@
 //! of 2026-09-23 was one of them going stale. The one head-shaped fact kept
 //! here is each LIVE binding's `RenderedAt`, which only the binding can know.
 
-use craftworks_sdk::status::{AskedState, CanWrite, PutStatus, SiteStatus};
+use craftworks_sdk::status::{AppPublishStatus, AskedState, CanWrite, PutStatus, SiteStatus};
 use craftworks_sdk::{DbError, Outcome, PageStore, SystemEnv};
 use page_io::PageIo;
 use wasm_bindgen::prelude::*;
@@ -679,6 +679,74 @@ impl Session {
             Some(P::Cancelled) => (SiteStatus::Cancelled, 0, ""),
         };
         serde_json::json!({ "state": state.code(), "version": version, "said": said }).to_string()
+    }
+
+    /// PUBLISH AN APP (sdk#516; APP-PUBLISH.md) and return its site LINK: PUT every load piece, and send the site only
+    /// once EVERY set has `k` pieces acked. `sets` is JSON `[{"name","k","m","pieces":[{"address","sha256"}]}]` (the
+    /// build's pieces.json, the publisher's input); `piece_states` are the pieces' web container states, the sets'
+    /// pieces in order; `webapp_code` is the `webapp` contract they are PUT under; `site_code` and `web` are the site's,
+    /// as for [`Session::publish_site`]. [`Session::app_publish_status`] says how it stands; the builder waits for
+    /// `published` (the site read back), never for every piece.
+    pub fn publish_app(&mut self, app: &str, sets: &str, webapp_code: Vec<u8>, piece_states: js_sys::Array, site_code: Vec<u8>, web: Vec<u8>) -> Result<String, JsValue> {
+        let sets = parse_piece_sets(sets).map_err(|e| JsValue::from_str(&e))?;
+        let mut states = piece_states.iter().map(|v| js_sys::Uint8Array::new(&v).to_vec());
+        let mut with = Vec::new();
+        for set in sets {
+            let mut containers = Vec::new();
+            for _ in 0..set.pieces.len() {
+                let state = states.next().ok_or_else(|| JsValue::from_str(&format!("publish_app: fewer piece states than the sets name (at set {})", set.name)))?;
+                let (_, contract, state) = wire::puts::contract(&webapp_code, &wire::webapp::params(&state), &state);
+                containers.push((contract, state));
+            }
+            with.push((set, containers));
+        }
+        if states.next().is_some() {
+            return Err(JsValue::from_str("publish_app: more piece states than the sets name"));
+        }
+        let Some(p) = self.page_mut() else {
+            return Err(JsValue::from_str("provision first — there is no path to the node before it"));
+        };
+        p.publish_app(app, with, &site_code, web, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
+        let link = p.site_link(&site_code, app).expect("a site page-io just took for publishing has a link");
+        self.pump_page();
+        Ok(link)
+    }
+
+    /// How `app`'s publish stands, as JSON `{"state","version","sets":[{"name","acked","refused","of","k"}],"said"}`.
+    /// `state` is sdk#523's `AppPublishStatus` word (`sdk.status.appPublish`): `none`, `pieces`, `siting`, `published`
+    /// (the site read back: the app is up), `backed_up` (every piece acked), `backup_abandoned`, `refused`,
+    /// `superseded`, `cancelled`. `said`: a refusal's words -- and, PUBLISHED with a piece finally refused, that
+    /// BACKED_UP will not come.
+    pub fn app_publish_status(&self, app: &str) -> String {
+        use page_io::AppPublish as A;
+        let publish = self.page().and_then(|p| p.app_publish(app));
+        // Each case to its word, EXHAUSTIVELY (sdk#523's one vocabulary; a new case fails to compile here).
+        let state = match publish {
+            None => AppPublishStatus::None,
+            Some(A::Pieces { .. }) => AppPublishStatus::Pieces,
+            Some(A::Siting { .. }) => AppPublishStatus::Siting,
+            Some(A::Published { .. }) => AppPublishStatus::Published,
+            Some(A::BackedUp { .. }) => AppPublishStatus::BackedUp,
+            Some(A::BackupAbandoned { .. }) => AppPublishStatus::BackupAbandoned,
+            Some(A::Refused { .. }) => AppPublishStatus::Refused,
+            Some(A::Superseded { .. }) => AppPublishStatus::Superseded,
+            Some(A::Cancelled) => AppPublishStatus::Cancelled,
+        };
+        serde_json::json!({
+            "state": state.code(),
+            "version": publish.and_then(A::version),
+            "sets": publish.map(A::set_lines).unwrap_or_default().into_iter().map(|l| serde_json::json!({ "name": l.name, "acked": l.acked, "refused": l.refused, "of": l.of, "k": l.k })).collect::<Vec<_>>(),
+            "said": publish.and_then(A::said),
+        })
+        .to_string()
+    }
+
+    /// A PERSON cancels `app`'s publish (before PUBLISHED: `cancelled`; after: the backup is abandoned).
+    pub fn cancel_app_publish(&mut self, app: &str) {
+        if let Some(p) = self.page_mut() {
+            p.cancel_app_publish(app);
+        }
+        self.pump_page();
     }
 
     /// A PERSON cancels `app`'s site publication (named `cancelled`).
@@ -1457,6 +1525,31 @@ impl Session {
             page_io::MayWrite::No(why) | page_io::MayWrite::Unknown(why) => Err(db_err(&DbError::Refused(why))),
         }
     }
+}
+
+/// `publish_app`'s sets, as the build's pieces.json names them: each `{name, k, m, pieces: [{address, sha256}]}`, a
+/// sha256 in hex. Refused by name when a field is missing or a set is not `k + m` pieces (`PieceSet::check`).
+fn parse_piece_sets(json: &str) -> Result<Vec<pieces::PieceSet>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("publish_app: the sets are not JSON: {e}"))?;
+    let sets = v.as_array().ok_or("publish_app: the sets are not a list")?;
+    sets.iter()
+        .map(|s| {
+            let name = s.get("name").and_then(serde_json::Value::as_str).ok_or("publish_app: a set with no name")?.to_string();
+            let num = |f: &str| s.get(f).and_then(serde_json::Value::as_u64).map(|n| n as usize).ok_or(format!("publish_app: set {name} has no {f}"));
+            let (k, m) = (num("k")?, num("m")?);
+            let pieces = s.get("pieces").and_then(serde_json::Value::as_array).ok_or(format!("publish_app: set {name} has no pieces"))?
+                .iter()
+                .map(|p| {
+                    let address = p.get("address").and_then(serde_json::Value::as_str).ok_or(format!("publish_app: a piece of {name} has no address"))?.to_string();
+                    let sha256 = p.get("sha256").and_then(serde_json::Value::as_str).and_then(core_types::hex::decode_array).ok_or(format!("publish_app: a piece of {name} has no 32-byte sha256"))?;
+                    Ok(pieces::NamedPiece { address, sha256 })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let set = pieces::PieceSet { name, k, m, pieces };
+            set.check()?;
+            Ok(set)
+        })
+        .collect()
 }
 
 /// A head id as `head_id()` gives it: 64 hex characters.

@@ -1031,6 +1031,7 @@ dependencies = [
  "freenet-prolly",
  "freenet-stdlib",
  "page",
+ "pieces",
  "protocol",
  "signer",
  "signer-proto",

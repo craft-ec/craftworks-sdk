@@ -18,6 +18,7 @@ export function wrap(raw) {
       row: group(said.rowState),
       put: group(said.putStatus),
       site: group(said.siteStatus),
+      appPublish: group(said.appPublishStatus),
       canWrite: group(said.canWrite),
       asked: group(said.asked),
       binding: BINDING,
