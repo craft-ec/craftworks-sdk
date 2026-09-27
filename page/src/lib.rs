@@ -1616,7 +1616,7 @@ impl Page {
             None => self.follows.get(app).map(|f| match f {
                 follow::Follow::Reading { .. } => Publication::Reading,
                 follow::Follow::Showing { version } => Publication::Published { version: *version },
-                follow::Follow::Refused { why } => Publication::Refused(why.clone()),
+                follow::Follow::Refused { why, .. } => Publication::Refused(why.clone()),
             }),
         }
     }
