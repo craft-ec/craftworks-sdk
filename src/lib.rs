@@ -14,6 +14,7 @@ pub mod expected;
 pub mod id;
 pub mod live_bindings;
 pub mod page_store;
+pub mod platform;
 pub mod read_token;
 pub mod record;
 pub mod schema;
