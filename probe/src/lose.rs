@@ -308,6 +308,22 @@ mod tests {
         (applied.root, b, applied.parity)
     }
 
+    /// Record `i` of `domain`'s key, from the SDK's ONE record-key encoder: what a page's Db writes.
+    fn record(domain: &str, i: u32) -> Vec<u8> {
+        let mut rkey = [0u8; 16];
+        rkey[12..].copy_from_slice(&i.to_be_bytes());
+        craftworks_sdk::db::record_key(domain, rkey)
+    }
+
+    /// A real tree of `edits` (sorted here): its root and its blocks.
+    fn tree_of(mut edits: Vec<(Vec<u8>, Edit)>) -> (Cid, MemBlocks) {
+        let mut b = MemBlocks::default();
+        let empty = freenet_prolly::build::init(&mut b);
+        edits.sort_by(|a, b| a.0.cmp(&b.0));
+        let applied = apply_into(&mut b, &empty, &edits).expect("the tree");
+        (applied.root, b)
+    }
+
     fn state(kind: u8, body: &[u8]) -> Vec<u8> {
         let mut s = vec![kind];
         s.extend_from_slice(body);
@@ -391,21 +407,12 @@ mod tests {
     /// one leaf. Without `--domain` the first `k >= 2` group is chosen -- not theirs; with it, exactly the bulk values'.
     #[test]
     fn a_domain_chooses_its_records_group_whatever_the_trees_shape() {
-        let mut b = MemBlocks::default();
-        let empty = freenet_prolly::build::init(&mut b);
-        // Keys from the SDK's ONE record-key encoder: what a page's Db writes.
-        let key = |domain: &str, i: u32| {
-            let mut rkey = [0u8; 16];
-            rkey[12..].copy_from_slice(&i.to_be_bytes());
-            craftworks_sdk::db::record_key(domain, rkey)
-        };
-        let mut edits: Vec<(Vec<u8>, Edit)> = (0..3000u32).map(|i| (key("notes", i), Edit::Put(vec![7u8; 40]))).collect();
-        edits.extend((0..3u32).map(|i| (key("bulk", i), Edit::Put(vec![b'x' + i as u8; 1400]))));
-        edits.sort_by(|a, b| a.0.cmp(&b.0));
-        let applied = apply_into(&mut b, &empty, &edits).expect("the tree");
+        let mut edits: Vec<(Vec<u8>, Edit)> = (0..3000u32).map(|i| (record("notes", i), Edit::Put(vec![7u8; 40]))).collect();
+        edits.extend((0..3u32).map(|i| (record("bulk", i), Edit::Put(vec![b'x' + i as u8; 1400]))));
+        let (root, b) = tree_of(edits);
         // Feed the reader's walk: every node, parents first.
         let walk = |mut l: Lose| -> Option<Chosen> {
-            let mut todo = vec![applied.root];
+            let mut todo = vec![root];
             while let Some(id) = todo.pop() {
                 let bytes = b.get(&id).expect("held").to_vec();
                 let _ = l.block(id, &state(kind::TREE_NODE, &bytes));
@@ -433,19 +440,11 @@ mod tests {
     /// the group is not bulk's alone, so `--domain bulk` chooses NOTHING.
     #[test]
     fn a_group_holding_another_domains_record_is_not_the_domains_even_with_an_identical_value() {
-        let mut b = MemBlocks::default();
-        let empty = freenet_prolly::build::init(&mut b);
-        let key = |domain: &str, i: u32| {
-            let mut rkey = [0u8; 16];
-            rkey[12..].copy_from_slice(&i.to_be_bytes());
-            craftworks_sdk::db::record_key(domain, rkey)
-        };
         let value = |i: u8| vec![b'x' + i; 1400];
-        let mut edits: Vec<(Vec<u8>, Edit)> = vec![(key("aaa", 0), Edit::Put(value(0)))];
-        edits.extend((0..3u32).map(|i| (key("bulk", i), Edit::Put(value(i as u8)))));
-        edits.sort_by(|a, b| a.0.cmp(&b.0));
-        let applied = apply_into(&mut b, &empty, &edits).expect("the tree");
-        let root = b.get(&applied.root).expect("held").to_vec();
+        let mut edits: Vec<(Vec<u8>, Edit)> = vec![(record("aaa", 0), Edit::Put(value(0)))];
+        edits.extend((0..3u32).map(|i| (record("bulk", i), Edit::Put(value(i as u8)))));
+        let (root_id, b) = tree_of(edits);
+        let root = b.get(&root_id).expect("held").to_vec();
         let node = Node::parse(&root).expect("a node");
         // THE SETUP: the root is one leaf whose one group of referenced values holds all four records.
         assert!(node.is_leaf(), "THE SETUP: the root is not a leaf");
@@ -453,7 +452,7 @@ mod tests {
         assert_eq!(groups.len(), 1, "THE SETUP: the four records are not one group");
         assert_eq!(groups[0].1.len(), 4, "THE SETUP: the group is not the four records");
         let mut l = Lose::new(Target::Data, PARITY).with_domain("bulk");
-        let _ = l.block(applied.root, &state(kind::TREE_NODE, &root));
+        let _ = l.block(root_id, &state(kind::TREE_NODE, &root));
         assert_eq!(l.chosen(), None, "--domain bulk chose a group holding aaa's record");
     }
 
