@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const { Session } = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
+const { Session, webapp_params } = createRequire(import.meta.url)("../../pkg/node/craftworks_sdk.js");
 
 let failures = 0;
 const t = async (name, fn) => {
@@ -24,8 +24,9 @@ const t = async (name, fn) => {
 const hex = b => Buffer.from(b).toString("hex");
 const bytes = h => new Uint8Array(Buffer.from(h, "hex"));
 const CODE = new TextEncoder().encode("an app's contract code");
-const PARAMS = new TextEncoder().encode("its params");
 const STATE = new TextEncoder().encode("a web container");
+// The one piece-PUT door derives a container's params from its state (put_piece, §19 P5): the SDK's own derivation.
+const PARAMS = new Uint8Array(webapp_params(STATE));
 const OTHER = new TextEncoder().encode("somebody else's code");
 
 /** The node's ack and refusal for (code, params, state), and `frames` decoded. */
@@ -57,11 +58,11 @@ const provisioned = () => {
 const us = node(CODE, PARAMS, STATE);
 const them = node(OTHER, PARAMS, STATE);
 
-await t("the PUT goes out as ONE frame: a Put of the app's contract with its state, under the key put_contract returned", async () => {
+await t("the PUT goes out as ONE frame: a Put of the app's contract with its state, under the key put_piece returned", async () => {
   const s = provisioned();
   assert.deepEqual(status(s, us.key), { state: "none", said: "" });
-  const key = s.put_contract(CODE, PARAMS, STATE);
-  assert.equal(key, us.key, "put_contract returned a key the node does not name the contract by");
+  const key = s.put_piece(CODE, STATE);
+  assert.equal(key, us.key, "put_piece returned a key the node does not name the contract by");
   assert.deepEqual(status(s, key), { state: "pending", said: "" });
   assert.deepEqual(flush(s, "puts"), [{ op: "put", key, state: hex(STATE) }], "the PUT frames sent are not exactly the PUT");
   assert.equal(s.outbound().length, 0, "the PUT was not given up once sent");
@@ -69,7 +70,7 @@ await t("the PUT goes out as ONE frame: a Put of the app's contract with its sta
 
 await t("**the node's ack settles it: none → pending → put**", async () => {
   const s = provisioned();
-  const key = s.put_contract(CODE, PARAMS, STATE);
+  const key = s.put_piece(CODE, STATE);
   flush(s);
   s.on_inbound(them.ack);
   assert.deepEqual(status(s, key), { state: "pending", said: "" }, "an ack for somebody else's contract settled ours");
@@ -85,7 +86,7 @@ const TRANSIENT = "the node is busy: try again";
 for (const form of ["keyed", "keyless"]) {
   await t(`**a ${form} refusal in the node's VALIDATION words ends the PUT: refused, in its words, not blamed on provisioning**`, async () => {
     const s = provisioned();
-    const key = s.put_contract(CODE, PARAMS, STATE);
+    const key = s.put_piece(CODE, STATE);
     flush(s);
     s.on_inbound(node(OTHER, PARAMS, STATE, VALIDATION)[form === "keyed" ? "refusal" : "keyless"]);
     assert.deepEqual(status(s, key), { state: "pending", said: "" }, "a refusal of somebody else's contract settled ours");
@@ -98,7 +99,7 @@ for (const form of ["keyed", "keyless"]) {
 
   await t(`**a ${form} refusal in OTHER words is transient: pending, sent again on its deadline, and the ack settles it**`, async () => {
     const s = provisioned();
-    const key = s.put_contract(CODE, PARAMS, STATE);
+    const key = s.put_piece(CODE, STATE);
     flush(s);
     s.on_inbound(node(CODE, PARAMS, STATE, TRANSIENT)[form === "keyed" ? "refusal" : "keyless"]);
     assert.deepEqual(status(s, key), { state: "pending", said: "" }, "a transient refusal ENDED the PUT");
@@ -117,8 +118,8 @@ for (const form of ["keyed", "keyless"]) {
 
 await t("**a dropped socket: the PUT stays pending and the PAGE sends it again at its deadline; the new answer settles it; a settled one stays**", async () => {
   const s = provisioned();
-  const done = s.put_contract(OTHER, PARAMS, STATE);
-  const key = s.put_contract(CODE, PARAMS, STATE);
+  const done = s.put_piece(OTHER, STATE);
+  const key = s.put_piece(CODE, STATE);
   flush(s);
   s.on_inbound(them.ack);
   s.reconnected();
@@ -139,14 +140,14 @@ await t("**a dropped socket: the PUT stays pending and the PAGE sends it again a
 
 await t("**the PUT goes through page-io, and its ack and refusal come back to put_status**", async () => {
   const s = new Session(7999);
-  assert.throws(() => s.put_contract(CODE, PARAMS, STATE), /provision first/, "a PUT before there is a path to the node");
+  assert.throws(() => s.put_piece(CODE, STATE), /provision first/, "a PUT before there is a path to the node");
   s.provision(new TextEncoder().encode("signer code"), new TextEncoder().encode("block code"), new TextEncoder().encode("register code"));
   flush(s);
-  const key = s.put_contract(CODE, PARAMS, STATE);
+  const key = s.put_piece(CODE, STATE);
   assert.deepEqual(flush(s, "puts"), [{ op: "put", key, state: hex(STATE) }], "the PUT did not go out");
   s.on_inbound(us.ack);
   assert.deepEqual(status(s, key), { state: "put", said: "" }, "page-io's handed-back ack never reached put_status");
-  const other = s.put_contract(OTHER, PARAMS, STATE);
+  const other = s.put_piece(OTHER, STATE);
   flush(s);
   s.on_inbound(node(OTHER, PARAMS, STATE, VALIDATION).refusal);
   assert.deepEqual(status(s, other), { state: "refused", said: VALIDATION });

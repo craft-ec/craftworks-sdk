@@ -662,7 +662,9 @@ impl Session {
     /// it (rule 8).
     /// [`Session::put_status`] says where it stands, matched by this key.
     /// **An ack is not durability:** a publisher that must know reads it back.
-    pub fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
+    /// PRIVATE (§19 P5, the one-door control): an app holds the raw Session, so an exported PUT of ANY contract would
+    /// be a second publishing door; the one export that reaches it is [`Session::put_piece`].
+    fn put_contract(&mut self, code: Vec<u8>, params: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
         let (key, contract, state) = wire::puts::contract(&code, &params, &state);
         let Some(p) = self.page_mut() else {
             return Err(JsValue::from_str("provision first — there is no path to the node before it"));
@@ -670,6 +672,15 @@ impl Session {
         p.put_contract(contract, state, page::Ms(crate::js_now_ms())).map_err(|e| JsValue::from_str(&e))?;
         self.pump_page();
         Ok(key)
+    }
+
+    /// PUT ONE LOAD PIECE back (the loader's repair, js/pieces.js `repairPieces`; sdk#347): a web container under
+    /// `webapp_code` whose params are DERIVED from its state (`wire::webapp::params`) -- content-addressed, so this door
+    /// PUTs a piece at the address its bytes name, never an arbitrary contract (§19 P5: the only piece-PUT door).
+    /// [`Session::put_status`] says where it stands, matched by the key it returns.
+    pub fn put_piece(&mut self, webapp_code: Vec<u8>, state: Vec<u8>) -> Result<String, JsValue> {
+        let params = wire::webapp::params(&state).to_vec();
+        self.put_contract(webapp_code, params, state)
     }
 
     /// `app`'s site LINK under the site contract `code`, published or not: `null`-like error when there is no

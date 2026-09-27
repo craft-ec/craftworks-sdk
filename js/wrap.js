@@ -283,7 +283,7 @@ export function wrap(raw) {
     // `webapp` contract's params (BLAKE3, which a page has no other way to
     // compute), `address(code, state)` the key the node serves it under, and
     // `AppContainer` builds an app's container in the page. The PUT itself is
-    // the session's `put_contract`.
+    // the session's `put_piece`.
     webapp: { params: raw.webapp_params, address: raw.webapp_address, AppContainer: raw.AppContainer },
     // THE LOAD PIECES (sdk#347): `load(bundle, payload, m, i)` re-derives piece i of a rebuilt bundle, for the
     // loader's repair after load (`repairPieces`); `container(piece)` is its web container state, from the one owner

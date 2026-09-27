@@ -46,7 +46,7 @@ await t("the native tool's pieces ARE the frozen vectors (one implementation, tw
 
 function session() {
   const puts = [];
-  return { puts, put_contract: (code, params, state) => { puts.push({ code, params, state }); return `key-${puts.length}`; } };
+  return { puts, put_piece: (code, state) => { puts.push({ code, state }); return `key-${puts.length}`; } };
 }
 
 await t("**only the pieces answered NOT HELD and not got are PUT back** — never one the race cancelled at k — each byte-identical to the tool's container", async () => {

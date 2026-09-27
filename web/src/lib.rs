@@ -422,7 +422,7 @@ impl Default for Db {
 
 /// `webapp`'s params for a web container's state: its blake3 (builder#104).
 /// With the `webapp` code (`pkg/web/webapp.wasm`) and the state, it is all
-/// `Session.put_contract` needs to publish a container — and the key that
+/// `Session.put_piece` needs to publish a container — and the key that
 /// returns is the address the node serves it under.
 #[wasm_bindgen]
 pub fn webapp_params(state: &[u8]) -> Vec<u8> {

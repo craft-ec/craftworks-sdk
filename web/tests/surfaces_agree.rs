@@ -94,7 +94,7 @@ const TRANSPORT_ONLY: &[&str] = &[
     // PUBLISHING a contract the app names (builder#104: its web container),
     // and what the node said. A node operation: an in-memory store has no
     // node to put anything on.
-    "put_contract",
+    "put_piece",
     "put_status",
     // PUBLISHING A SITE (builder#117): the app's stable link, signed through the node's signer. An in-memory
     // store has no node and no signer.
