@@ -122,10 +122,11 @@ impl Lose {
                         None => groups[g].1.len() >= 2,
                         Some(marker) => node.is_leaf() && entries[g].as_ref().is_some_and(|e| !e.is_empty() && e.iter().all(|&i| node.key(i).starts_with(marker))),
                     };
-                    let group = (0..groups.len()).find(|&g| fits(g)).map(|g| (g, groups[g].clone()));
-                    if let Some((g, (_, members))) = group {
-                        if let Some(par) = parity.get(PARITY * g..PARITY * (g + 1)) {
-                            self.choose(members, par);
+                    // The first group that fits AND whose loss can be met exactly.
+                    for g in (0..groups.len()).filter(|&g| fits(g)) {
+                        let Some(par) = parity.get(PARITY * g..PARITY * (g + 1)) else { continue };
+                        if self.choose(groups[g].1.clone(), par) {
+                            break;
                         }
                     }
                 }
@@ -147,12 +148,15 @@ impl Lose {
         if par.is_empty() {
             return;
         }
-        self.choose(vec![head.root], &par);
+        let _ = self.choose(vec![head.root], &par);
     }
 
     /// `n` SLOTS are lost, DATA members first, then parity. A NotFound answers an ID, so losing an id loses EVERY slot
-    /// holding it: ids are taken in slot order, each only while the slots it takes keep the count `<= n`.
-    fn choose(&mut self, members: Vec<Cid>, parity: &[Cid]) {
+    /// holding it: ids are taken in slot order, each only while the slots it takes keep the count `<= n`. The group is
+    /// CHOSEN only when that meets the loss EXACTLY -- `n` slots, at least `min(n, k)` of them data (Codex on #541: ten
+    /// identical values under `m + 1` lost only the `m` parity and no data, and the log said the control ran). `false`:
+    /// not chosen, and another group may be.
+    fn choose(&mut self, members: Vec<Cid>, parity: &[Cid]) -> bool {
         let k = members.len();
         let mut slots = members;
         slots.extend_from_slice(parity);
@@ -165,7 +169,12 @@ impl Lose {
                 taken += holds;
             }
         }
+        let lost_data = slots[..k].iter().filter(|s| lost.contains(*s)).count();
+        if taken != self.n || lost_data < self.n.min(k) {
+            return false;
+        }
         self.chosen = Some(Chosen { slots, k, lost });
+        true
     }
 }
 
@@ -478,7 +487,6 @@ mod tests {
     /// data lost at all, while the log said the control ran. A group where exactly `n` slots, data first, cannot be
     /// lost is NOT chosen.
     #[test]
-    #[should_panic(expected = "a group whose loss cannot be met was chosen")] // PINNED: flipped by the fix
     fn a_group_whose_loss_cannot_be_met_exactly_is_never_chosen() {
         let value = vec![b'v'; 1400];
         let edits: Vec<(Vec<u8>, Edit)> = (0..10u32).map(|i| (record("bulk", i), Edit::Put(value.clone()))).collect();
