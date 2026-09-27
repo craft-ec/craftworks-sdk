@@ -126,10 +126,11 @@ CONTRACTS_EPOCH=3
 node tools/contracts-released.mjs "$contracts" "$CONTRACTS_EPOCH" block register webapp site || exit 1
 # THE SIGNER: the one delegate (the engine runs in the page, ruling B). A
 # published app opened on another node fetches it from the artefacts
-# container like the other three (builder#104). Built and import-gated by its
-# own script.
-./signer/build.sh >/dev/null
-cp "$target/wasm32-unknown-unknown/release/signer.stripped.wasm" pkg/web/signer.wasm
+# container like the other three (builder#104). FROZEN: the committed bytes,
+# never a rebuild -- a different signer.wasm is a different delegate, and every
+# user a new identity (signer/frozen/signer.sha256 says why and who may bump it).
+node tools/signer-frozen.mjs signer/frozen/signer.wasm signer/frozen/signer.sha256 || exit 1
+cp signer/frozen/signer.wasm pkg/web/signer.wasm
 cp "$contracts/build/block.wasm" "$contracts/build/register.wasm" pkg/web/
 
 # THE ARTEFACTS CONTAINER (craftworks-builder#104): the artefacts in ONE
